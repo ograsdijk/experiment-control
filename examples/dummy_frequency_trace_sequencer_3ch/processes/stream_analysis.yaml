@@ -1,0 +1,15 @@
+﻿version: 1
+process_id: stream_analysis
+process:
+  file: src/experiment_control/processes/stream_analysis.py
+  class_name: StreamAnalysisProcess
+init_kwargs:
+  rpc_timeout_ms: 2000
+  max_payload_points: 200000
+  max_events_per_cycle: 12
+  rcvhwm: 20000
+  workspace_store_path: examples/dummy_frequency_trace_sequencer_3ch/stream_workspaces.yaml
+restart_policy: NEVER
+heartbeat_timeout_s: 3.0
+shutdown_timeout_s: 3.0
+

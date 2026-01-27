@@ -1,0 +1,45 @@
+version: 1
+device_id: trace1
+telemetry_period_s: 0.5
+driver:
+  module: experiment_control.drivers.dummy_resonance_trace_driver
+  class_name: DummyResonanceTraceDriver
+init_kwargs:
+  port: 23456
+  initial_frequency_hz: 1000000000.0
+  frequency_noise_sigma_hz: 150000.0
+  n_points: 5000
+  time_sigma_points: 300.0
+  resonance_center_hz: 1000000000.0
+  resonance_sigma_hz: 6000000.0
+  trace_offset_counts: 1200.0
+  amplitude_peak_counts: 2600.0
+  trace_noise_sigma_counts: 30.0
+telemetry_calls:
+  - method: read_frequency_setpoint_hz
+    outputs:
+      - signal: frequency_setpoint_hz
+        kind: scalar
+        units: Hz
+        dtype: float64
+  - method: read_frequency_hz
+    outputs:
+      - signal: frequency_hz
+        kind: scalar
+        units: Hz
+        dtype: float64
+stream_calls:
+  - method: acquire_trace
+    outputs:
+      - stream: trace
+        dtype: int16
+        shape: [5000]
+        units: counts
+        ring_slots: 512
+fixed_metadata:
+  trace:
+    channel_descriptions: [PMT]
+    channel_units: [counts]
+    x_axis: time_index
+    x_units: sample
+

@@ -1,0 +1,22 @@
+﻿version: 1
+process_id: hdf_writer
+process:
+  file: src/experiment_control/processes/hdf_writer.py
+  class_name: HdfWriter
+init_kwargs:
+  out_dir: data
+  filename: null
+  timezone: America/Chicago
+  rpc_timeout_ms: 2000
+  rcvhwm: 10000
+  write_every_s: 1.0
+  buffer_max_messages: 200000
+  flush_every_n: 200
+  flush_every_s: 2.0
+  disabled_devices: []
+  event_log_mode: failures_only
+  measurement_schema_path: examples/dummy_frequency_trace_sequencer_3ch/measurement.yaml
+restart_policy: NEVER
+heartbeat_timeout_s: 3.0
+shutdown_timeout_s: 3.0
+

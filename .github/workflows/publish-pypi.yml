@@ -1,0 +1,63 @@
+name: Publish PyPI
+
+on:
+  release:
+    types: [published]
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Build bundled UI assets
+        shell: pwsh
+        run: .\scripts\build_packaged_ui.ps1
+
+      - name: Build package artifacts
+        run: uv build
+
+      - name: Verify wheel contains bundled UI
+        shell: pwsh
+        run: |
+          @'
+          import pathlib
+          import zipfile
+
+          wheels = sorted(pathlib.Path("dist").glob("*.whl"))
+          if not wheels:
+              raise SystemExit("No wheel found in dist/")
+          wheel = wheels[-1]
+          required = "experiment_control/_ui_dist/index.html"
+          with zipfile.ZipFile(wheel) as zf:
+              names = set(zf.namelist())
+          if required not in names:
+              raise SystemExit(f"Missing bundled UI asset in wheel: {required}")
+          print(f"Verified bundled UI in {wheel.name}")
+          '@ | python -
+
+      - name: Publish to PyPI
+        env:
+          UV_PUBLISH_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+        run: uv publish dist/*

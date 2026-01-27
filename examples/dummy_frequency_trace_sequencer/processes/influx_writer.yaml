@@ -1,0 +1,40 @@
+version: 1
+process_id: influx_writer
+
+process:
+  module: experiment_control.processes.influx_writer
+  class_name: InfluxWriterProcess
+
+init_kwargs:
+  destinations:
+    default:
+      url: "http://127.0.0.1:8086"
+      token: "${INFLUX_TOKEN}"
+      org: "centrex"
+      bucket: "telemetry"
+      measurement: "telemetry_v1"
+      precision: "ns"
+      request_timeout_s: 5.0
+  default_destination: "default"
+  routes: {}
+  disabled_devices: []
+  enabled: true
+  write_batch_size: 500
+  write_flush_interval_ms: 1000
+  max_queue_points: 100000
+  overflow_policy: "drop_oldest"
+  include_device_type_tag: true
+  quantity_from_units:
+    Hz: frequency
+    GHz: frequency
+    THz: frequency
+    dBm: power
+    mW: power
+    C: temperature
+    mmHg: pressure
+  quantity_overrides: {}
+
+heartbeat_period_s: 1.0
+heartbeat_timeout_s: 3.0
+shutdown_timeout_s: 3.0
+restart_policy: NEVER

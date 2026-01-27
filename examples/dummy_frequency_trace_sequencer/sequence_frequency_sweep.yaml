@@ -1,0 +1,56 @@
+version: 1
+context_columns:
+  freq_hz: float64
+  freq_step_idx: int64
+vars:
+  freq_center_hz: 1000000000.0
+  sweep_step_hz: 1000000.0
+  n_steps: 30
+  n_traces_per_step: 20
+  trace_spacing_s: 0.02
+  freq_settle_s: 0.05
+  sweep_start_hz: ${freq_center_hz - 0.5 * sweep_step_hz * (n_steps - 1)}
+  sweep_stop_hz: ${freq_center_hz + 0.5 * sweep_step_hz * (n_steps - 1)}
+steps:
+  - for:
+      var: freq_hz
+      in:
+        gen:
+          linspace:
+            start: ${sweep_start_hz}
+            stop: ${sweep_stop_hz}
+            num: ${n_steps}
+      do:
+        - assign:
+            freq_step_idx: ${__loop_index}
+
+        - call:
+            device: freq1
+            action: set_frequency_hz
+            params:
+              frequency_hz: ${freq_hz}
+
+        - call:
+            device: trace1
+            action: set_frequency_hz
+            params:
+              frequency_hz: ${freq_hz}
+
+        - sleep: ${freq_settle_s}
+
+        - set_context:
+            streams:
+              - device: trace1
+                stream: trace
+            fields:
+              freq_hz: ${freq_hz}
+              freq_step_idx: ${freq_step_idx}
+
+        - repeat:
+            times: ${n_traces_per_step}
+            do:
+              - call:
+                  device: trace1
+                  action: stream__acquire_trace
+              - sleep: ${trace_spacing_s}
+

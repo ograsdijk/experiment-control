@@ -1,0 +1,53 @@
+version: 1
+process_id: laser_lock_freq_nltl_power
+process:
+  file: examples/linien_cli/processes/laser_lock_freq_nltl_power.py
+  class_name: LaserLockFreqNltlPowerFollower
+init_kwargs:
+  rpc_timeout_ms: 2000
+  rules:
+    - name: step_guard_laser_0
+      device_id: SynthHD
+      trigger_action: set_frequency_channel_0
+      trigger_param: freq_hz
+      max_step_hz: 5000000
+      current_freq_signal: frequency 0
+      telemetry_max_age_s: 2.0
+      csv_path: 2024_2_7_NLTL_powerscan_5MHzstep.csv
+      freq_col: 0
+      power_col: 1
+      effects: []
+    - name: power_setter_laser_0
+      device_id: SynthHD
+      trigger_action: set_frequency_channel_0
+      trigger_param: freq_hz
+      csv_path: 2024_2_7_NLTL_powerscan_5MHzstep.csv
+      freq_col: 0
+      power_col: 1
+      effects:
+        - action: set_power_channel_0
+          param: power_dbm
+    - name: step_guard_laser_1
+      device_id: SynthHD
+      trigger_action: set_frequency_channel_1
+      trigger_param: freq_hz
+      max_step_hz: 5000000
+      current_freq_signal: frequency 1
+      telemetry_max_age_s: 2.0
+      csv_path: 2024_2_15_NLTL2_powerscan_5MHzstep.csv
+      freq_col: 0
+      power_col: 1
+      effects: []
+    - name: power_setter_laser_1
+      device_id: SynthHD
+      trigger_action: set_frequency_channel_1
+      trigger_param: freq_hz
+      csv_path: 2024_2_15_NLTL2_powerscan_5MHzstep.csv
+      freq_col: 0
+      power_col: 1
+      effects:
+        - action: set_power_channel_1
+          param: power_dbm
+restart_policy: NEVER
+heartbeat_timeout_s: 3.0
+shutdown_timeout_s: 3.0

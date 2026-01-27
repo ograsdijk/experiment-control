@@ -1,0 +1,64 @@
+version: 1
+
+device_id: linien
+telemetry_period_s: 0.5
+
+driver:
+  module: experiment_control.drivers.linien_driver
+  class_name: LinienDriver
+
+init_kwargs:
+  host: 192.168.0.232
+  username: root
+  password: root
+  autostart_server: false
+
+telemetry_calls:
+  - method: get_lock
+    outputs:
+      - signal: lock_enabled
+        kind: scalar
+        units: ""
+        dtype: bool
+  - method: signal_stats
+    outputs:
+      - signal: error_signal_mean
+        kind: key
+        ref: error_signal_mean
+        units: V
+        dtype: float64
+      - signal: error_signal_std
+        kind: key
+        ref: error_signal_std
+        units: V
+        dtype: float64
+      - signal: monitor_signal_mean
+        kind: key
+        ref: monitor_signal_mean
+        units: V
+        dtype: float64
+      - signal: monitor_signal_std
+        kind: key
+        ref: monitor_signal_std
+        units: V
+        dtype: float64
+      - signal: control_signal_mean
+        kind: key
+        ref: control_signal_mean
+        units: V
+        dtype: float64
+      - signal: control_signal_std
+        kind: key
+        ref: control_signal_std
+        units: V
+        dtype: float64
+
+stream_calls:
+  - method: traces
+    outputs:
+      - stream: trace
+        dtype: float64
+        shape: [3, 2048]
+        attrs:
+          units: V
+          channel_names: ["error", "monitor", "control"]

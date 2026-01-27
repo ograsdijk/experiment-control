@@ -1,0 +1,30 @@
+version: 1
+instance_id: dummy-frequency-trace-sequencer
+
+manager:
+  auto_connect_on_register: true
+  interceptor_rpc_timeout_ms: 500
+
+devices:
+  dirs:
+    - devices
+  glob: "*.yaml"
+
+processes:
+  dirs:
+    - processes
+  glob: "*.yaml"
+
+tui:
+  enabled: true
+  rpc_timeout_ms: 2500
+  snapshot_period_s: 2.0
+  startup_delay_s: 1.0
+
+startup:
+  start_devices: true
+  start_processes: false
+  process_order: [sequencer, stream_analysis, hdf_writer]
+  wait_for_registered: true
+  wait_for_online: true
+  timeout_s: 20.0

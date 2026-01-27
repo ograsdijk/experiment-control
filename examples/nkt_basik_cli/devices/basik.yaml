@@ -1,0 +1,9 @@
+version: 1
+device_id: basik
+driver:
+  module: experiment_control.drivers.nkt_driver
+  class_name: NKTBasik
+init_kwargs:
+  port: COM3
+  devID: 1
+telemetry_calls: []

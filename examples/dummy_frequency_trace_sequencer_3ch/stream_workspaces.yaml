@@ -1,0 +1,74 @@
+version: 1
+workspaces:
+- workspace_id: workspace-1
+  name: Resonance Sweep
+  enabled: true
+  graph:
+    nodes:
+    - id: src
+      op: source.stream
+      params:
+        device_id: trace1
+        stream: trace
+        channel_mode: average
+        channel_index: 0
+        channel_indices: 0,1,2
+    - id: bg
+      op: trace.subtract_background
+      params:
+        bg_start_idx: 0
+        bg_stop_idx: 250
+      inputs:
+        trace: src
+    - id: integral
+      op: trace.integrate
+      params: {}
+      inputs:
+        trace: bg
+    - id: ctx_x
+      op: source.context_field
+      params:
+        field: freq_hz
+    - id: bin
+      op: aggregate.bin_stats
+      params:
+        auto_range: true
+        x_min: -15000000
+        x_max: 15000000
+        bin_count: 30
+      inputs:
+        x: ctx_x
+        y: integral
+    - id: node_6
+      op: fit.from_hist_agg
+      params:
+        y_source: mean
+        model: gaussian
+        baseline_mode: none
+        every_n: 10
+        chi2_sigma_source: sem
+        min_count: 1
+      inputs:
+        hist: bin
+    - id: node_7
+      op: fit.yhat
+      params: {}
+      inputs:
+        fit: node_6
+    - id: node_8
+      op: fit.params
+      params: {}
+      inputs:
+        fit: node_6
+  publish:
+    outputs:
+    - output_id: integral
+      node_id: integral
+    - output_id: bin_stats
+      node_id: bin
+    - output_id: out_3
+      node_id: bg
+    - output_id: out_4
+      node_id: node_7
+    - output_id: out_5
+      node_id: node_8

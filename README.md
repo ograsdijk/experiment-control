@@ -1,0 +1,204 @@
+## experiment-control
+
+Experiment control framework with:
+
+- a manager process (device/process lifecycle + routing)
+- device drivers and managed processes (for example HDF writer, sequencer, interlocks)
+- a terminal UI (TUI)
+- a FastAPI gateway and React web UI
+
+This README focuses on the current recommended workflow used in `examples/linien_cli`.
+
+## Requirements
+
+- Python `>=3.13`
+- Node.js `>=18` (for React UI development/build)
+- A virtual environment tool (`uv` recommended, `venv` + `pip` also works)
+
+## Install
+
+### Option A: `uv` (recommended)
+
+```powershell
+uv sync
+```
+
+Run commands with `uv run ...`, or activate `.venv` first.
+
+Convenience wrappers (from repo root):
+
+```powershell
+./scripts/sync.ps1       # uv sync
+./scripts/sync_ui.ps1    # npm ci for web/react_ui
+./scripts/sync_all.ps1   # uv sync + npm ci
+./scripts/build_packaged_ui.ps1   # build UI and copy to src/experiment_control/_ui_dist
+```
+
+### Option B: `venv` + `pip`
+
+```powershell
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+python -m pip install -U pip
+python -m pip install -e .
+```
+
+Install web dependencies:
+
+```powershell
+npm --prefix web/react_ui install
+```
+
+## Quick Start (Linien Example)
+
+### 1. Start manager + devices/processes (+ TUI)
+
+From repo root:
+
+```powershell
+python examples/linien_cli/run_linien_cli.py
+```
+
+This uses `examples/linien_cli/stack.yaml` and starts the stack through `experiment_control.cli.run_stack`.
+By default in that stack file, `tui.enabled: true`, so you get the TUI in this terminal.
+
+### 2. Start FastAPI gateway (and serve built web UI)
+
+In a second terminal:
+
+```powershell
+python examples/linien_cli/run_linien_fastapi.py --stack examples/linien_cli/stack.yaml --host 0.0.0.0 --port 8000
+```
+
+Then open:
+
+- `http://127.0.0.1:8000` (web UI, if built and UI serving enabled)
+- `http://127.0.0.1:8000/api/health` (health endpoint)
+
+Notes:
+
+- `run_linien_fastapi.py` reads manager endpoints from `stack.yaml`.
+- It always uses local loopback connects and also exports remote/public endpoint hints.
+
+## Web UI Development
+
+If you want hot-reload development instead of FastAPI-served static files:
+
+1. Start stack (`run_linien_cli.py`)
+2. Start FastAPI API only:
+
+```powershell
+python examples/linien_cli/run_linien_fastapi.py --stack examples/linien_cli/stack.yaml --no-ui --host 127.0.0.1 --port 8000
+```
+
+3. Start Vite dev server:
+
+```powershell
+$env:VITE_API_BASE="http://127.0.0.1:8000"
+npm --prefix web/react_ui run dev
+```
+
+Open `http://127.0.0.1:5173`.
+
+## Build Bundled UI (for package/wheel)
+
+```powershell
+./scripts/build_packaged_ui.ps1
+```
+
+This builds `web/react_ui/dist` and copies it into `src/experiment_control/_ui_dist`
+so installed packages can serve UI without a repo checkout.
+
+## Built-in vs Custom UI
+
+FastAPI serves UI only when `EXPERIMENT_CONTROL_SERVE_UI=1`.
+
+- Built-in packaged UI (default): do not set `EXPERIMENT_CONTROL_UI_DIST`.
+- Custom UI build: set `EXPERIMENT_CONTROL_UI_DIST` to your own dist folder.
+
+Examples:
+
+```powershell
+# Built-in packaged UI
+$env:EXPERIMENT_CONTROL_SERVE_UI = "1"
+Remove-Item Env:EXPERIMENT_CONTROL_UI_DIST -ErrorAction SilentlyContinue
+
+# Custom UI dist
+$env:EXPERIMENT_CONTROL_SERVE_UI = "1"
+$env:EXPERIMENT_CONTROL_UI_DIST = "C:\path\to\my-ui\dist"
+```
+
+## UI Profiles (Web UI)
+
+The web UI can export/import a profile from the **Settings** modal.
+
+- `Export UI profile` saves a JSON file to disk.
+- `Import UI profile` loads a previously saved JSON file.
+
+Current profile contents:
+
+- layout (`navWidth`, device order, telemetry collapse state)
+- plot panel configuration (panels/traces/active panel/time windows)
+- pinned commands
+
+Log filter settings are intentionally not included.
+
+## Running Directly With `run_stack`
+
+You can run any stack YAML directly:
+
+```powershell
+python -m experiment_control.cli.run_stack examples/linien_cli/stack.yaml
+```
+
+or with script entrypoint:
+
+```powershell
+experiment-control-stack examples/linien_cli/stack.yaml
+```
+
+See `docs/manager_start.md` for full stack schema and config details.
+
+## Ports and Networking
+
+In `stack.yaml`, manager networking is configured under `manager`:
+
+- `bind_host` (external listener host, for example `127.0.0.1`, `0.0.0.0`, or LAN IP)
+- `advertise_host` (optional host for remote/public endpoint hints)
+- `external.rpc_port` and `external.pub_port`
+- `internal_ports.registry`, `internal_ports.rpc`, `internal_ports.heartbeat_base`
+
+Common pattern:
+
+- Use `bind_host: 0.0.0.0` for LAN reachability.
+- Local TUI/processes/FastAPI connects stay on loopback and are derived automatically.
+- Set `advertise_host` to control what remote clients should use (for example `laser-lock-1.local`).
+
+Legacy endpoint keys remain supported for compatibility:
+`external_rpc_bind`, `external_pub_bind`, `registry_bind`, `internal_rpc_bind`,
+`process_hb_bind_base`, and `external_*_connect_local`.
+
+For FastAPI, the manager endpoints are taken from env:
+
+- `EXPERIMENT_CONTROL_ROUTER_RPC`
+- `EXPERIMENT_CONTROL_MANAGER_PUB`
+- `EXPERIMENT_CONTROL_ROUTER_RPC_HINT` (optional remote/public hint)
+- `EXPERIMENT_CONTROL_MANAGER_PUB_HINT` (optional remote/public hint)
+
+The helper script (`run_linien_fastapi.py`) sets these automatically from stack config.
+
+## Useful Docs
+
+- `docs/manager_start.md` - stack runner and YAML schema
+- `docs/protocol.md` - RPC and PUB/SUB protocol
+- `docs/sequencer_config.md` - sequencer configuration
+- `docs/state_machines.md` - state machine process base/template
+
+## Troubleshooting
+
+- If stack startup fails with `Address already in use`, another process is holding one of the configured ports.
+- If FastAPI shows healthy but UI is blank:
+  - ensure stack is running
+  - ensure FastAPI points to correct manager endpoints
+  - if using Vite dev server, set `VITE_API_BASE` to FastAPI origin
+- If using wildcard binds (`0.0.0.0`) in stack, do not use those literal values as connect endpoints; use loopback/LAN host for clients.

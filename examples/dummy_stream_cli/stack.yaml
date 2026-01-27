@@ -1,0 +1,24 @@
+version: 1
+instance_id: dummy-stream-cli
+
+manager:
+  auto_connect_on_register: true
+  interceptor_rpc_timeout_ms: 500
+
+devices:
+  dirs:
+    - devices
+  glob: "*.yaml"
+
+processes:
+  dirs:
+    - processes
+  glob: "*.yaml"
+
+startup:
+  start_devices: true
+  start_processes: true
+  process_order: [hdf_writer]
+  wait_for_registered: true
+  wait_for_online: true
+  timeout_s: 15.0

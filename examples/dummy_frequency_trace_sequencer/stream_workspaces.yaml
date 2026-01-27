@@ -1,0 +1,45 @@
+version: 1
+workspaces:
+- workspace_id: workspace-1
+  name: Resonance Sweep
+  enabled: true
+  graph:
+    nodes:
+    - id: src
+      op: source.stream
+      params:
+        device_id: trace1
+        stream: trace
+        channel_index: 0
+    - id: bg
+      op: trace.subtract_background
+      params:
+        bg_start_idx: 0
+        bg_stop_idx: 500
+      inputs:
+        trace: src
+    - id: integral
+      op: trace.integrate
+      params: {}
+      inputs:
+        trace: bg
+    - id: ctx_x
+      op: source.context_field
+      params:
+        field: freq_hz
+    - id: bin
+      op: aggregate.bin_stats
+      params:
+        auto_range: true
+        x_min: -15000000
+        x_max: 15000000
+        bin_count: 30
+      inputs:
+        x: ctx_x
+        y: integral
+  publish:
+    outputs:
+    - output_id: integral
+      node_id: integral
+    - output_id: bin_stats
+      node_id: bin

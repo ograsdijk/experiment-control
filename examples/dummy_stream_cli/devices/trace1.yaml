@@ -1,0 +1,20 @@
+version: 1
+device_id: trace1
+driver:
+  module: experiment_control.drivers.dummy_trace_driver
+  class_name: DummyTraceDriver
+init_kwargs:
+  port: 23456
+telemetry_calls: []
+stream_calls:
+  - method: acquire_trace
+    outputs:
+      - stream: trace
+        dtype: float64
+        shape: [5, 10000]
+        units: counts
+        ring_slots: 256
+fixed_metadata:
+  trace:
+    channel_descriptions: [PMT, PD, E, B, spare]
+    channel_units: [counts, counts, counts, counts, counts]

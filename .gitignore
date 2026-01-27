@@ -1,0 +1,18 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Frontend dependencies/builds
+node_modules/
+web/react_ui/dist/
+
+# data
+*.h5
+*.hdf5

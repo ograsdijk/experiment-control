@@ -1,0 +1,40 @@
+version: 1
+instance_id: linien-cli
+
+manager:
+  bind_host: 127.0.0.1
+  external:
+    rpc_port: 7000
+    pub_port: 7001
+  internal_ports:
+    registry: 5555
+    rpc: 6002
+    heartbeat_base: 7100
+  auto_connect_on_register: false
+  device_rpc_timeout_ms: 10_000
+  interceptor_rpc_timeout_ms: 500
+
+devices:
+  dirs:
+    - devices
+  glob: "*.yaml"
+
+processes:
+  dirs:
+    - processes
+  glob: "*.yaml"
+
+tui:
+  enabled: true
+  rpc_timeout_ms: 2_500
+  snapshot_period_s: 2.0
+  startup_delay_s: 1.0
+
+startup:
+  connect: false
+  start_devices: true
+  start_processes: true
+  process_order: [hdf_writer]
+  wait_for_registered: true
+  wait_for_online: true
+  timeout_s: 30.0
