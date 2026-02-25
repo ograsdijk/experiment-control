@@ -501,6 +501,7 @@ class _TelemetryOutPlan:
 @dataclass(frozen=True, slots=True)
 class _TelemetryCallPlan:
     func: Callable[..., Any] | None
+    attr_name: str | None
     kwargs: dict[str, Any]
     outputs: list[_TelemetryOutPlan]
 
@@ -898,7 +899,7 @@ class DeviceRunner:
         out: dict[str, dict[str, Any]] = {}
 
         for plan in self._telemetry_plan:
-            if plan.func is None:
+            if plan.func is None and plan.attr_name is None:
                 for o in plan.outputs:
                     out[o.signal] = {
                         "value": None,
@@ -909,7 +910,28 @@ class DeviceRunner:
                 continue
 
             try:
-                ret = plan.func(**plan.kwargs)
+                if plan.func is not None:
+                    ret = plan.func(**plan.kwargs)
+                else:
+                    try:
+                        member = getattr(self._device, cast(str, plan.attr_name))
+                    except AttributeError:
+                        for o in plan.outputs:
+                            out[o.signal] = {
+                                "value": None,
+                                "units": o.units,
+                                "quality": TelemetryQuality.MISSING,
+                                "ts": None,
+                            }
+                        continue
+                    if callable(member):
+                        ret = member(**plan.kwargs)
+                    else:
+                        if plan.kwargs:
+                            raise ValueError(
+                                f"Telemetry property {plan.attr_name!r} does not accept kwargs"
+                            )
+                        ret = member
                 for o in plan.outputs:
                     try:
                         val = o.extractor(ret)
@@ -1486,10 +1508,31 @@ class DeviceRunner:
 
     def _init_telemetry_plan(self) -> None:
         plan: list[_TelemetryCallPlan] = []
+        missing_member = object()
         for call in self._telemetry_calls:
-            func = getattr(self._device, call.method, None)
-            if func is not None and not callable(func):
-                func = None
+            member_static = inspect.getattr_static(
+                self._device, call.method, missing_member
+            )
+            func: Callable[..., Any] | None = None
+            attr_name: str | None = None
+            kwargs = dict(call.kwargs or {})
+            if member_static is missing_member:
+                # May still resolve via dynamic __getattr__ on the driver.
+                attr_name = call.method
+            elif callable(member_static):
+                bound = getattr(self._device, call.method, None)
+                if bound is not None and callable(bound):
+                    func = bound
+                else:
+                    attr_name = call.method
+            else:
+                if kwargs:
+                    raise ValueError(
+                        f"Telemetry property {call.method!r} does not accept kwargs"
+                    )
+                attr_name = call.method
+            if func is None and attr_name is None:
+                attr_name = call.method
             outs: list[_TelemetryOutPlan] = []
             for out in call.outputs or []:
                 extractor = self._make_telemetry_extractor(out.kind, out.ref)
@@ -1503,7 +1546,8 @@ class DeviceRunner:
             plan.append(
                 _TelemetryCallPlan(
                     func=func,
-                    kwargs=dict(call.kwargs or {}),
+                    attr_name=attr_name,
+                    kwargs=kwargs,
                     outputs=outs,
                 )
             )

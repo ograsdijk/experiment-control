@@ -90,7 +90,7 @@ class StreamCall:
 @dataclass(frozen=True, slots=True)
 class TelemetryCall:
     """
-    Call one device method and map its return value into one or more telemetry signals.
+    Read one device method/property/attribute and map its value into telemetry signals.
     """
 
     method: str
