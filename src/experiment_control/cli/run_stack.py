@@ -5,7 +5,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import zmq
 
@@ -18,7 +18,7 @@ from ..utils.config_parsing import (
 )
 from ..utils.manager_network import ManagerNetworkConfig, resolve_manager_network
 from ..utils.yaml_helpers import load_yaml_file
-from ..utils.zmq_helpers import json_dumps
+from ..utils.zmq_helpers import json_dumps, safe_json_loads
 from ..manager import Manager, device_spec_from_yaml, process_spec_from_yaml
 
 Json = dict[str, Any]
@@ -158,8 +158,106 @@ def _wait_for_exit(proc: subprocess.Popen[str], timeout_s: float) -> None:
         pass
 
 
+def _probe_manager_ready(
+    manager_rpc: str,
+    *,
+    timeout_ms: int = 250,
+    expected_instance_id: str | None = None,
+) -> bool:
+    ctx = zmq.Context.instance()
+    sock = ctx.socket(zmq.DEALER)
+    sock.setsockopt(zmq.LINGER, 0)
+    sock.connect(manager_rpc)
+    request_id = f"startup-{time.monotonic_ns()}"
+    try:
+        sock.send(json_dumps({"type": "manager.identity", "request_id": request_id}))
+        if not sock.poll(int(timeout_ms), zmq.POLLIN):
+            return False
+        raw = sock.recv()
+        resp = safe_json_loads(raw)
+        if not isinstance(resp, dict):
+            return False
+        if (
+            resp.get("request_id") is not None
+            and str(resp.get("request_id")) != request_id
+        ):
+            return False
+        if not resp.get("ok"):
+            return False
+        if expected_instance_id is None:
+            return True
+        result = resp.get("result", {})
+        if not isinstance(result, dict):
+            return False
+        return str(result.get("instance_id", "")) == expected_instance_id
+    except Exception:
+        return False
+    finally:
+        sock.close(0)
+
+
+def _wait_for_manager_ready(
+    *,
+    manager_rpc: str,
+    manager_proc: subprocess.Popen[str],
+    expected_instance_id: str | None,
+    startup_delay_s: float,
+    startup_timeout_s: float,
+    probe_timeout_ms: int,
+    poll_interval_s: float = 0.1,
+    probe_fn: Callable[..., bool] | None = None,
+    sleep_fn: Callable[[float], None] | None = None,
+    clock_fn: Callable[[], float] | None = None,
+) -> tuple[bool, str | None]:
+    probe = probe_fn or _probe_manager_ready
+    sleep = sleep_fn or time.sleep
+    clock = clock_fn or time.monotonic
+
+    def _exit_message(exit_code: int | None) -> str:
+        return (
+            "stack subprocess exited before manager became ready "
+            f"(exit code {exit_code})"
+        )
+
+    remaining_delay_s = max(0.0, float(startup_delay_s))
+    while remaining_delay_s > 0:
+        exit_code = manager_proc.poll()
+        if exit_code is not None:
+            return False, _exit_message(exit_code)
+        step_s = remaining_delay_s
+        if poll_interval_s > 0:
+            step_s = min(step_s, poll_interval_s)
+        sleep(step_s)
+        remaining_delay_s -= step_s
+
+    deadline = clock() + max(0.0, float(startup_timeout_s))
+    while True:
+        exit_code = manager_proc.poll()
+        if exit_code is not None:
+            return False, _exit_message(exit_code)
+        if probe(
+            manager_rpc,
+            timeout_ms=int(probe_timeout_ms),
+            expected_instance_id=expected_instance_id,
+        ):
+            return True, None
+        remaining_s = deadline - clock()
+        if remaining_s <= 0:
+            target = "manager"
+            if expected_instance_id:
+                target = f"manager for instance {expected_instance_id!r}"
+            return (
+                False,
+                f"{target} did not become ready at {manager_rpc!r} "
+                f"within {float(startup_timeout_s):.1f}s",
+            )
+        if poll_interval_s > 0:
+            sleep(min(poll_interval_s, remaining_s))
+
+
 def _run_with_tui(
     *,
+    instance_id: str,
     stack_path: Path,
     manager_network: ManagerNetworkConfig,
     tui_raw: Json,
@@ -169,6 +267,8 @@ def _run_with_tui(
     rpc_timeout_ms = int(tui_raw.get("rpc_timeout_ms", 1500))
     snapshot_period_s = float(tui_raw.get("snapshot_period_s", 2.0))
     startup_delay_s = float(tui_raw.get("startup_delay_s", 1.0))
+    startup_timeout_s = float(tui_raw.get("startup_timeout_s", 15.0))
+    probe_timeout_ms = min(500, max(100, rpc_timeout_ms))
 
     manager_proc = subprocess.Popen(
         [
@@ -179,10 +279,19 @@ def _run_with_tui(
             "--no-tui",
         ],
     )
+    manager_ready = False
 
     try:
-        if startup_delay_s > 0:
-            time.sleep(startup_delay_s)
+        manager_ready, startup_error = _wait_for_manager_ready(
+            manager_rpc=str(manager_rpc),
+            manager_proc=manager_proc,
+            expected_instance_id=instance_id,
+            startup_delay_s=startup_delay_s,
+            startup_timeout_s=startup_timeout_s,
+            probe_timeout_ms=probe_timeout_ms,
+        )
+        if not manager_ready:
+            raise SystemExit(f"[run_stack] startup error: {startup_error}")
         from ..tui_manager import ManagerTUI
 
         app = ManagerTUI(
@@ -193,8 +302,11 @@ def _run_with_tui(
         )
         app.run()
     finally:
-        _shutdown_manager(str(manager_rpc))
-        _wait_for_exit(manager_proc, 5.0)
+        if manager_ready:
+            _shutdown_manager(str(manager_rpc))
+            _wait_for_exit(manager_proc, 5.0)
+        else:
+            _wait_for_exit(manager_proc, 0.0)
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -209,6 +321,7 @@ def main(argv: list[str] | None = None) -> None:
         tui_raw = _parse_tui(raw)
         if tui_raw.get("enabled") and not ns.no_tui:
             _run_with_tui(
+                instance_id=instance_id,
                 stack_path=stack_path,
                 manager_network=manager_network,
                 tui_raw=tui_raw,

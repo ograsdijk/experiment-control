@@ -17,7 +17,7 @@ from textual.reactive import reactive
 from textual.screen import ModalScreen
 from textual.widgets import DataTable, Footer, Header, Input, Label, RichLog, Static
 
-from .utils.zmq_helpers import json_dumps, json_loads, safe_json_loads
+from .utils.zmq_helpers import json_dumps, safe_json_loads
 
 Json = dict[str, Any]
 
@@ -459,6 +459,7 @@ class ManagerTUI(App):
         ("enter", "member_primary", "Invoke/Get"),
         ("e", "member_set", "Set value"),
         ("R", "capabilities_refresh", "Refresh capabilities"),
+        ("f5", "reconnect_backend", "Reconnect"),
         ("p", "topics", "Topics"),
     ]
 
@@ -479,21 +480,16 @@ class ManagerTUI(App):
         self._snapshot_period_s = snapshot_period_s
 
         self._ctx = zmq.Context.instance()
-        self._rpc = self._ctx.socket(zmq.DEALER)
-        self._rpc.connect(self._manager_rpc)
-        self._rpc.setsockopt(zmq.RCVTIMEO, self._rpc_timeout_ms)
-        self._rpc.setsockopt(zmq.LINGER, 0)
+        self._rpc = self._new_rpc_socket()
+        self._rpc_seq = 0
 
-        self._sub = self._ctx.socket(zmq.SUB)
-        self._sub.setsockopt(zmq.SUBSCRIBE, b"manager.")
-        self._sub.setsockopt(zmq.RCVTIMEO, 200)
-        self._sub.setsockopt(zmq.LINGER, 0)
-        self._sub.connect(self._manager_pub)
+        self._sub = self._new_sub_socket()
 
         self._pub_queue: queue.Queue[tuple[str, Json]] = queue.Queue(maxsize=10_000)
         self._chunk_cache: dict[tuple[str, str], tuple[str, Json]] = {}
         self._chunk_lock = threading.Lock()
         self._stop_event = threading.Event()
+        self._sub_reconnect_event = threading.Event()
         self._pub_thread_handle: threading.Thread | None = None
 
         self._device_status: dict[str, DeviceStatus] = {}
@@ -560,6 +556,7 @@ class ManagerTUI(App):
         self._last_inspector_render = 0.0
         self._inspector_min_period_s = 0.2
         self._error_counts: dict[str, int] = {}
+        self._backend_status_text = "Backend: connecting"
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -585,6 +582,7 @@ class ManagerTUI(App):
         with Horizontal(id="status_row"):
             yield Static("Streaming: ON", id="streaming_status")
             yield Static("Dropped: 0", id="dropped_status")
+            yield Static(self._backend_status_text, id="backend_status")
         yield RichLog(id="event_log")
         yield Footer()
 
@@ -698,15 +696,91 @@ class ManagerTUI(App):
         table.scroll_target_x = table.scroll_x
         table.scroll_target_y = table.scroll_y
 
+    def _new_rpc_socket(self) -> zmq.Socket:
+        rpc = self._ctx.socket(zmq.DEALER)
+        rpc.setsockopt(zmq.LINGER, 0)
+        rpc.connect(self._manager_rpc)
+        return rpc
+
+    def _reset_rpc_socket(self) -> None:
+        try:
+            self._rpc.close(0)
+        except Exception:
+            pass
+        self._rpc = self._new_rpc_socket()
+
+    def _new_sub_socket(self) -> zmq.Socket:
+        sub = self._ctx.socket(zmq.SUB)
+        sub.setsockopt(zmq.SUBSCRIBE, b"manager.")
+        sub.setsockopt(zmq.RCVTIMEO, 200)
+        sub.setsockopt(zmq.LINGER, 0)
+        sub.connect(self._manager_pub)
+        return sub
+
+    def _reset_sub_socket(self) -> None:
+        try:
+            self._sub.close(0)
+        except Exception:
+            pass
+        self._sub = self._new_sub_socket()
+
+    def _request_sub_reconnect(self) -> None:
+        self._sub_reconnect_event.set()
+
+    def _set_backend_status(self, text: str) -> None:
+        self._backend_status_text = text
+        try:
+            self.query_one("#backend_status", Static).update(text)
+        except Exception:
+            pass
+
+    def _next_request_id(self) -> str:
+        self._rpc_seq += 1
+        return f"tui-{self._rpc_seq}"
+
     def _rpc_call(self, payload: Json) -> Json | None:
         try:
-            self._rpc.send(json_dumps(payload))
-            raw = self._rpc.recv()
-            resp = json_loads(raw)
-            if not isinstance(resp, dict):
-                return None
-            return resp
+            request = dict(payload)
+            expected_request_id = request.get("request_id")
+            if expected_request_id is None:
+                expected_request_id = self._next_request_id()
+                request["request_id"] = expected_request_id
+
+            # Drop late replies from previous timed-out requests.
+            while True:
+                if not self._rpc.poll(0, zmq.POLLIN):
+                    break
+                _ = self._rpc.recv(zmq.NOBLOCK)
+
+            self._rpc.send(json_dumps(request))
+            deadline = time.monotonic() + (self._rpc_timeout_ms / 1000.0)
+            while True:
+                remaining_s = deadline - time.monotonic()
+                if remaining_s <= 0:
+                    raise TimeoutError(
+                        f"manager rpc timed out after {self._rpc_timeout_ms} ms"
+                    )
+                remaining_ms = int(max(1.0, remaining_s * 1000.0))
+                if not self._rpc.poll(remaining_ms, zmq.POLLIN):
+                    raise TimeoutError(
+                        f"manager rpc timed out after {self._rpc_timeout_ms} ms"
+                    )
+                raw = self._rpc.recv()
+                resp = safe_json_loads(raw)
+                if not isinstance(resp, dict):
+                    continue
+                if (
+                    expected_request_id is not None
+                    and resp.get("request_id") is not None
+                    and resp.get("request_id") != expected_request_id
+                ):
+                    # Late/stale reply from an older request; keep waiting.
+                    continue
+                self._set_backend_status("Backend: connected")
+                return resp
         except Exception:
+            self._set_backend_status("Backend: unavailable")
+            self._reset_rpc_socket()
             return None
 
     @staticmethod
@@ -1669,6 +1743,15 @@ class ManagerTUI(App):
 
     def _pub_thread(self) -> None:
         while not self._stop_event.is_set():
+            if self._sub_reconnect_event.is_set():
+                self._sub_reconnect_event.clear()
+                try:
+                    self._reset_sub_socket()
+                except Exception:
+                    if self._stop_event.is_set():
+                        break
+                    self._bump_error("pub.reconnect")
+                    continue
             try:
                 topic_b, payload_b = self._sub.recv_multipart()
             except zmq.Again:
@@ -1822,6 +1905,22 @@ class ManagerTUI(App):
             log.write(message[:200])
         except Exception:
             pass
+
+    def _reconnect_backend(self) -> bool:
+        self._set_backend_status("Backend: reconnecting")
+        self._log_action_result("Reconnecting backend...")
+        self._reset_rpc_socket()
+        self._request_sub_reconnect()
+        ready = bool(self._rpc_call({"type": "manager.identity"}))
+        if not ready:
+            self._set_backend_status("Backend: unavailable")
+            self._log_action_result("Backend reconnect failed")
+            return False
+        self._load_manager_log_tail_bootstrap()
+        self._refresh_snapshot()
+        self._set_backend_status("Backend: connected")
+        self._log_action_result("Backend reconnected")
+        return True
 
     def _format_result(self, result: Any) -> str:
         if isinstance(result, dict) and "__enum__" in result and "name" in result:
@@ -1987,6 +2086,17 @@ class ManagerTUI(App):
         except Exception:
             pass
         self.exit()
+
+    def action_reconnect_backend(self) -> None:
+        try:
+            if self._reconnect_backend():
+                self.notify("Backend reconnected")
+                return
+            self.notify("Backend reconnect failed", severity="warning")
+        except Exception as exc:
+            self._set_backend_status("Backend: unavailable")
+            self._log_action_result(f"Backend reconnect error: {exc}")
+            self.notify(f"Backend reconnect error: {exc}", severity="error")
 
     def action_capabilities_refresh(self) -> None:
         if self._members_source == "process":
