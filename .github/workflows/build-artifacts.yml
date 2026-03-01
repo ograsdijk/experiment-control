@@ -1,21 +1,15 @@
-name: Publish PyPI
+name: Build Artifacts
 
 on:
-  push:
-    tags:
-      - "v*"
   workflow_dispatch:
 
 permissions:
   contents: read
 
-concurrency:
-  group: publish-${{ github.ref }}
-  cancel-in-progress: false
-
 jobs:
-  publish:
+  build:
     runs-on: windows-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -29,30 +23,11 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: "20"
+          cache: npm
+          cache-dependency-path: web/react_ui/package-lock.json
 
       - name: Set up uv
         uses: astral-sh/setup-uv@v5
-
-      - name: Validate tag matches project version
-        if: startsWith(github.ref, 'refs/tags/v')
-        shell: pwsh
-        run: |
-          @'
-          import os
-          import pathlib
-          import tomllib
-
-          pyproject = pathlib.Path("pyproject.toml")
-          data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
-          version = str(data["project"]["version"])
-          tag = os.environ["GITHUB_REF_NAME"]
-          expected = f"v{version}"
-          if tag != expected:
-              raise SystemExit(
-                  f"Tag/version mismatch: tag {tag!r} does not match project version {expected!r}"
-              )
-          print(f"Verified tag {tag} matches project version {version}")
-          '@ | python -
 
       - name: Build bundled UI assets
         shell: pwsh
@@ -80,7 +55,9 @@ jobs:
           print(f"Verified bundled UI in {wheel.name}")
           '@ | python -
 
-      - name: Publish to PyPI
-        env:
-          UV_PUBLISH_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
-        run: uv publish dist/*
+      - name: Upload distribution artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: experiment-control-dist-${{ github.run_number }}
+          path: dist/*
+          if-no-files-found: error
