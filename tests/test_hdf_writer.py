@@ -1,9 +1,13 @@
+import shutil
 import sys
 import tempfile
+import uuid
+from contextlib import contextmanager
 from pathlib import Path
 import unittest
 
 import h5py
+import numpy as np
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -11,13 +15,28 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from experiment_control.processes.hdf_writer import HdfWriter  # noqa: E402
+from experiment_control.processes.hdf_writer import HdfWriter, _create_device_dataset  # noqa: E402
 
 
 def _as_text(value: object) -> str:
     if isinstance(value, bytes):
         return value.decode("utf-8", errors="replace")
     return str(value)
+
+
+@contextmanager
+def _temp_dir() -> object:
+    root = ROOT / ".tmp_tests"
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / f"tmp_{uuid.uuid4().hex}"
+    path.mkdir()
+    try:
+        yield str(path)
+    finally:
+        shutil.rmtree(path, ignore_errors=True)
+
+
+tempfile.TemporaryDirectory = _temp_dir  # type: ignore[assignment]
 
 
 class HdfWriterEventModeTests(unittest.TestCase):
@@ -295,6 +314,309 @@ class HdfWriterMeasurementTests(unittest.TestCase):
                 assert isinstance(error_obj, dict)
                 self.assertEqual(error_obj.get("code"), "rotate_failed")
                 self.assertIn("measurement_profile is required", str(error_obj.get("message")))
+
+
+class HdfWriterStorageSafetyTests(unittest.TestCase):
+    def _make_writer(self, out_dir: str) -> HdfWriter:
+        return HdfWriter(
+            out_dir=out_dir,
+            filename=None,
+            manager_rpc="tcp://127.0.0.1:65531",
+            manager_pub="tcp://127.0.0.1:65532",
+            rpc_timeout_ms=2000,
+            timezone="America/Chicago",
+            rcvhwm=1000,
+            write_every_s=1.0,
+            buffer_max_messages=1000,
+            flush_every_n=10,
+            flush_every_s=1.0,
+            disabled_devices=[],
+            event_log_mode="all",
+        )
+
+    def test_rotate_rejects_existing_filename(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            current_path = root / "current.h5"
+            target_path = root / "existing.h5"
+            target_path.write_bytes(b"already here")
+            writer = self._make_writer(str(root))
+
+            with h5py.File(current_path, "w") as h5:
+                meta = writer._build_measurement_metadata(  # noqa: SLF001
+                    profile_id=None, values=None, require_profile=False
+                )
+                writer._configure_active_file(  # noqa: SLF001
+                    h5,
+                    write_every_s=1.0,
+                    load_manager_state=False,
+                    measurement_meta=meta,
+                )
+                resp = writer._handle_rpc(  # noqa: SLF001
+                    {
+                        "request_id": "r1",
+                        "type": "hdf.rotate",
+                        "params": {"filename": target_path.name},
+                    }
+                )
+                self.assertFalse(bool(resp.get("ok")))
+                error_obj = resp.get("error")
+                assert isinstance(error_obj, dict)
+                self.assertEqual(error_obj.get("code"), "file_exists")
+                self.assertEqual(str(writer._h5.filename), str(current_path))  # noqa: SLF001
+
+    def test_start_writing_rejects_existing_filename(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            target_path = root / "existing.h5"
+            target_path.write_bytes(b"already here")
+            writer = self._make_writer(str(root))
+
+            with self.assertRaises(FileExistsError):
+                writer._start_writing_file(  # noqa: SLF001
+                    filename=target_path.name,
+                    disabled_devices=None,
+                    measurement_profile=None,
+                    measurement_values=None,
+                )
+
+
+class HdfWriterStreamBufferTests(unittest.TestCase):
+    def _make_writer(self, out_dir: str) -> HdfWriter:
+        return HdfWriter(
+            out_dir=out_dir,
+            filename=None,
+            manager_rpc="tcp://127.0.0.1:65531",
+            manager_pub="tcp://127.0.0.1:65532",
+            rpc_timeout_ms=2000,
+            timezone="America/Chicago",
+            rcvhwm=1000,
+            write_every_s=1.0,
+            buffer_max_messages=1000,
+            flush_every_n=10,
+            flush_every_s=1.0,
+            disabled_devices=[],
+            event_log_mode="all",
+        )
+
+    def test_write_stream_buffers_clears_context_id_on_missing_schema(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            writer = self._make_writer(str(root))
+            h5_path = root / "stream_missing_schema.h5"
+            with h5py.File(h5_path, "w") as h5:
+                meta = writer._build_measurement_metadata(  # noqa: SLF001
+                    profile_id=None, values=None, require_profile=False
+                )
+                writer._configure_active_file(  # noqa: SLF001
+                    h5,
+                    write_every_s=1.0,
+                    load_manager_state=False,
+                    measurement_meta=meta,
+                )
+                key = ("cam1", "frames")
+                writer._stream_buffers[key] = {  # noqa: SLF001
+                    "data": [b"\x01\x02"],
+                    "seq": [1],
+                    "t0_mono_ns": [10],
+                    "t0_wall_ns": [20],
+                    "context_id": [30],
+                }
+                writer._write_stream_buffers()  # noqa: SLF001
+                buf = writer._stream_buffers[key]  # noqa: SLF001
+                self.assertEqual(buf["data"], [])
+                self.assertEqual(buf["seq"], [])
+                self.assertEqual(buf["t0_mono_ns"], [])
+                self.assertEqual(buf["t0_wall_ns"], [])
+                self.assertEqual(buf["context_id"], [])
+
+    def test_write_stream_buffers_clears_context_id_on_bad_payload_size(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            writer = self._make_writer(str(root))
+            h5_path = root / "stream_bad_payload.h5"
+            with h5py.File(h5_path, "w") as h5:
+                meta = writer._build_measurement_metadata(  # noqa: SLF001
+                    profile_id=None, values=None, require_profile=False
+                )
+                writer._configure_active_file(  # noqa: SLF001
+                    h5,
+                    write_every_s=1.0,
+                    load_manager_state=False,
+                    measurement_meta=meta,
+                )
+                key = ("cam1", "frames")
+                writer._stream_schema[key] = {"dtype": "uint16", "shape": (2,)}  # noqa: SLF001
+                writer._stream_buffers[key] = {  # noqa: SLF001
+                    "data": [b"\x01\x02\x03"],
+                    "seq": [1],
+                    "t0_mono_ns": [10],
+                    "t0_wall_ns": [20],
+                    "context_id": [30],
+                }
+                writer._write_stream_buffers()  # noqa: SLF001
+                buf = writer._stream_buffers[key]  # noqa: SLF001
+                self.assertEqual(buf["data"], [])
+                self.assertEqual(buf["seq"], [])
+                self.assertEqual(buf["t0_mono_ns"], [])
+                self.assertEqual(buf["t0_wall_ns"], [])
+                self.assertEqual(buf["context_id"], [])
+
+    def test_write_stream_buffers_repairs_misaligned_context_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            writer = self._make_writer(str(root))
+            h5_path = root / "stream_context_fix.h5"
+            with h5py.File(h5_path, "w") as h5:
+                meta = writer._build_measurement_metadata(  # noqa: SLF001
+                    profile_id=None, values=None, require_profile=False
+                )
+                writer._configure_active_file(  # noqa: SLF001
+                    h5,
+                    write_every_s=1.0,
+                    load_manager_state=False,
+                    measurement_meta=meta,
+                )
+                key = ("cam1", "frames")
+                writer._stream_schema[key] = {"dtype": "uint16", "shape": (1,)}  # noqa: SLF001
+                writer._stream_buffers[key] = {  # noqa: SLF001
+                    "data": [b"\x01\x00", b"\x02\x00"],
+                    "seq": [1, 2],
+                    "t0_mono_ns": [10, 11],
+                    "t0_wall_ns": [20, 21],
+                    "context_id": [30],
+                }
+                writer._write_stream_buffers()  # noqa: SLF001
+                datasets = writer._stream_datasets[("cam1", "frames", 1)]  # noqa: SLF001
+                self.assertEqual(list(datasets["context_id"][...]), [-1, -1])
+
+
+class HdfWriterContextColumnTests(unittest.TestCase):
+    def _make_writer(self, out_dir: str) -> HdfWriter:
+        return HdfWriter(
+            out_dir=out_dir,
+            filename=None,
+            manager_rpc="tcp://127.0.0.1:65531",
+            manager_pub="tcp://127.0.0.1:65532",
+            rpc_timeout_ms=2000,
+            timezone="America/Chicago",
+            rcvhwm=1000,
+            write_every_s=1.0,
+            buffer_max_messages=1000,
+            flush_every_n=10,
+            flush_every_s=1.0,
+            disabled_devices=[],
+            event_log_mode="all",
+        )
+
+    def test_bool_context_column_uses_uint8_encoding(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            writer = self._make_writer(str(root))
+            h5_path = root / "bool_context.h5"
+            with h5py.File(h5_path, "w") as h5:
+                meta = writer._build_measurement_metadata(  # noqa: SLF001
+                    profile_id=None, values=None, require_profile=False
+                )
+                writer._configure_active_file(  # noqa: SLF001
+                    h5,
+                    write_every_s=1.0,
+                    load_manager_state=False,
+                    measurement_meta=meta,
+                )
+                writer._init_context_columns_from_spec(  # noqa: SLF001
+                    {"flag": "bool"},
+                    source="explicit",
+                )
+                ds = writer._context_columns_datasets["flag"]  # noqa: SLF001
+                self.assertEqual(ds.dtype, np.dtype("uint8"))
+                self.assertEqual(_as_text(ds.attrs["dtype"]), "bool")
+                self.assertEqual(int(ds.attrs["missing"]), 255)
+
+    def test_infer_bool_context_column_as_bool(self) -> None:
+        writer = self._make_writer("data")
+        spec = writer._infer_context_columns_from_fields({"flag": True})  # noqa: SLF001
+        self.assertEqual(spec, {"flag": "bool"})
+
+    def test_coerce_bool_context_values(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            writer = self._make_writer(str(root))
+            h5_path = root / "bool_context_coerce.h5"
+            with h5py.File(h5_path, "w") as h5:
+                meta = writer._build_measurement_metadata(  # noqa: SLF001
+                    profile_id=None, values=None, require_profile=False
+                )
+                writer._configure_active_file(  # noqa: SLF001
+                    h5,
+                    write_every_s=1.0,
+                    load_manager_state=False,
+                    measurement_meta=meta,
+                )
+                writer._init_context_columns_from_spec(  # noqa: SLF001
+                    {"flag": "bool"},
+                    source="explicit",
+                )
+                self.assertEqual(int(writer._coerce_context_value("flag", True)), 1)  # noqa: SLF001
+                self.assertEqual(int(writer._coerce_context_value("flag", False)), 0)  # noqa: SLF001
+                self.assertEqual(int(writer._coerce_context_value("flag", None)), 255)  # noqa: SLF001
+
+
+class HdfWriterCompressionTests(unittest.TestCase):
+    def _make_writer(self, out_dir: str) -> HdfWriter:
+        return HdfWriter(
+            out_dir=out_dir,
+            filename=None,
+            manager_rpc="tcp://127.0.0.1:65531",
+            manager_pub="tcp://127.0.0.1:65532",
+            rpc_timeout_ms=2000,
+            timezone="America/Chicago",
+            rcvhwm=1000,
+            write_every_s=1.0,
+            buffer_max_messages=1000,
+            flush_every_n=10,
+            flush_every_s=1.0,
+            disabled_devices=[],
+            event_log_mode="all",
+        )
+
+    def test_telemetry_dataset_uses_lzf(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            h5_path = Path(td) / "telemetry_compression.h5"
+            with h5py.File(h5_path, "w") as h5:
+                telemetry_group = h5.require_group("telemetry")
+                ds = _create_device_dataset(
+                    telemetry_group,
+                    "dev1",
+                    ["signal_a"],
+                    ["float64"],
+                    [""],
+                )
+                self.assertEqual(ds.compression, "lzf")
+
+    def test_stream_data_dataset_uses_lzf(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            writer = self._make_writer(str(root))
+            h5_path = root / "stream_compression.h5"
+            with h5py.File(h5_path, "w") as h5:
+                meta = writer._build_measurement_metadata(  # noqa: SLF001
+                    profile_id=None, values=None, require_profile=False
+                )
+                writer._configure_active_file(  # noqa: SLF001
+                    h5,
+                    write_every_s=1.0,
+                    load_manager_state=False,
+                    measurement_meta=meta,
+                )
+                datasets = writer._ensure_stream_dataset(  # noqa: SLF001
+                    "cam1",
+                    "frames",
+                    "uint16",
+                    (2,),
+                    session=1,
+                )
+                self.assertEqual(datasets["data"].compression, "lzf")
 
 
 if __name__ == "__main__":

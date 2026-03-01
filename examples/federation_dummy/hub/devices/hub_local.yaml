@@ -1,0 +1,9 @@
+version: 1
+device_id: hub_local
+
+driver:
+  module: experiment_control.drivers.dummy_driver
+  class_name: DummyDriver
+
+init_kwargs:
+  port: 26001

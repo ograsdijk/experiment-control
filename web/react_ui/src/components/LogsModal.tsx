@@ -19,6 +19,7 @@ import {
   logSourceKindColor,
 } from "../features/logs/utils";
 import type { DeviceStatus, LogEntry, ProcessStatus } from "../types";
+import { DeviceNameInline } from "./DeviceNameInline";
 
 type Props = {
   opened: boolean;
@@ -77,6 +78,7 @@ export function LogsModal({
   onToggleExpanded,
   onCopyMessage,
 }: Props) {
+  const deviceById = new Map(devices.map((device) => [device.device_id, device]));
   return (
     <Modal
       opened={opened}
@@ -153,7 +155,11 @@ export function LogsModal({
               { value: "all", label: "All devices" },
               ...devices.map((device) => ({
                 value: device.device_id,
-                label: device.device_id,
+                label: `${
+                  device.is_remote || device.source_kind === "federated"
+                    ? "⇄ "
+                    : ""
+                }${device.device_id}`,
               })),
             ]}
           />
@@ -194,6 +200,10 @@ export function LogsModal({
                     : "gray";
               const sourceKindColor = logSourceKindColor(entry.source_kind);
               const source = entry.source_id ?? entry.device_id ?? entry.process_id ?? "-";
+              const sourceDevice =
+                typeof source === "string" && source !== "-"
+                  ? (deviceById.get(source) ?? null)
+                  : null;
               const entryKey = logEntryKey(entry);
               const fullMessage = entry.message ?? "";
               const messageLines = fullMessage.split(/\r?\n/);
@@ -223,7 +233,16 @@ export function LogsModal({
                           {entry.source_kind ?? "manager"}
                         </Badge>
                         <Text size="xs" c="dimmed">
-                          {source}
+                          {sourceDevice ? (
+                            <DeviceNameInline
+                              deviceId={source}
+                              device={sourceDevice}
+                              size="xs"
+                              c="dimmed"
+                            />
+                          ) : (
+                            source
+                          )}
                         </Text>
                       </Group>
                       <Group gap="xs">

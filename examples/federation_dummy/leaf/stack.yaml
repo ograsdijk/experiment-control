@@ -1,0 +1,25 @@
+version: 1
+instance_id: federation-dummy-leaf
+
+manager:
+  bind_host: 127.0.0.1
+  external:
+    rpc_port: 7300
+    pub_port: 7301
+  internal_ports:
+    registry: 7355
+    rpc: 7302
+    heartbeat_base: 7400
+    event_base: 7500
+  auto_connect_on_register: true
+
+devices:
+  dirs:
+    - devices
+  glob: "*.yaml"
+
+startup:
+  start_devices: true
+  wait_for_registered: true
+  wait_for_online: true
+  timeout_s: 15.0

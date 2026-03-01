@@ -2,7 +2,7 @@ version: 1
 vars:
 steps:
   - for:
-      var: temp_c
+      bind: temp_c
       in:
         gen:
           linspace: {start: 10.0, stop: 20.0, num: 11}

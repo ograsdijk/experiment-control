@@ -24,6 +24,7 @@ import {
   PinnedCommand,
   TelemetrySignal,
 } from "../types";
+import { DeviceNameInline } from "./DeviceNameInline";
 
 type CapabilityParamMeta = NonNullable<CapabilityMember["params"]>[number];
 
@@ -249,7 +250,9 @@ export function DeviceCard({
       <Stack gap="xs">
         <Group justify="space-between" align="center">
           <Stack gap={2}>
-            <Text fw={600}>{device.device_id}</Text>
+            <Text fw={600}>
+              <DeviceNameInline deviceId={device.device_id} device={device} fw={600} />
+            </Text>
             <Text size="xs" c="dimmed">
               hb age {device.hb_age_s?.toFixed(2) ?? "n/a"} s
             </Text>

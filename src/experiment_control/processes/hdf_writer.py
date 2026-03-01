@@ -47,6 +47,8 @@ DTYPE_MAP: dict[str, np.dtype[Any]] = {
     "uint32": np.dtype("uint32"),
     "bool": np.dtype("bool"),
 }
+DEFAULT_NUMERIC_COMPRESSION = "lzf"
+DEFAULT_NUMERIC_SHUFFLE = True
 
 
 def _default_filename() -> str:
@@ -252,6 +254,8 @@ def _create_device_dataset(
         maxshape=(None,),
         dtype=np.dtype(fields),
         chunks=(chunk_size,),
+        compression=DEFAULT_NUMERIC_COMPRESSION,
+        shuffle=DEFAULT_NUMERIC_SHUFFLE,
     )
 
     str_dt = h5py.string_dtype("utf-8")
@@ -528,6 +532,27 @@ class HdfWriter(ManagedProcessBase):
 
     def _bump_error(self, key: str) -> None:
         self._error_counts[key] = self._error_counts.get(key, 0) + 1
+
+    def _resolve_output_path(
+        self, filename: str | None, *, use_default_filename: bool
+    ) -> Path:
+        name: str | None = None
+        if filename is not None:
+            raw = str(filename).strip()
+            if not raw:
+                raise ValueError("filename must be a non-empty string")
+            name = raw
+        elif not use_default_filename and self._filename is not None:
+            raw = str(self._filename).strip()
+            if raw:
+                name = raw
+        if name is None:
+            name = _default_filename()
+        return self._out_dir / name
+
+    def _ensure_output_path_unused(self, path: Path) -> None:
+        if path.exists():
+            raise FileExistsError(f"target file already exists: {path}")
 
     def _fetch_schema_with_backoff(
         self,
@@ -975,6 +1000,12 @@ class HdfWriter(ManagedProcessBase):
         self._last_flush = now
         self._next_write = now + write_every_s
 
+    def _clear_stream_buffer(self, buf: dict[str, list[Any]]) -> None:
+        for key in ("data", "seq", "t0_mono_ns", "t0_wall_ns", "context_id"):
+            values = buf.get(key)
+            if isinstance(values, list):
+                values.clear()
+
     def _rotate_file(
         self,
         *,
@@ -1000,6 +1031,9 @@ class HdfWriter(ManagedProcessBase):
             if disabled_devices is not None
             else set(self._disabled_devices)
         )
+        self._out_dir.mkdir(parents=True, exist_ok=True)
+        path = self._resolve_output_path(filename, use_default_filename=True)
+        self._ensure_output_path_unused(path)
         measurement_meta = self._build_measurement_metadata(
             profile_id=measurement_profile,
             values=measurement_values,
@@ -1009,18 +1043,7 @@ class HdfWriter(ManagedProcessBase):
         old_state = self._snapshot_file_state()
         self._disabled_devices = new_disabled
         self._clear_buffered_for_disabled(new_disabled)
-
-        name = None
-        if filename is not None:
-            raw = str(filename).strip()
-            if not raw:
-                raise ValueError("filename must be a non-empty string")
-            name = raw
-        if name is None:
-            name = _default_filename()
-
-        self._out_dir.mkdir(parents=True, exist_ok=True)
-        new_h5 = h5py.File(self._out_dir / name, "w")
+        new_h5 = h5py.File(path, "w")
         try:
             self._configure_active_file(
                 new_h5,
@@ -1065,6 +1088,10 @@ class HdfWriter(ManagedProcessBase):
         if self._h5 is not None:
             raise RuntimeError("HDF writer is already writing")
 
+        self._out_dir.mkdir(parents=True, exist_ok=True)
+        path = self._resolve_output_path(filename, use_default_filename=False)
+        self._ensure_output_path_unused(path)
+
         new_disabled = (
             set(disabled_devices)
             if disabled_devices is not None
@@ -1078,18 +1105,7 @@ class HdfWriter(ManagedProcessBase):
             values=measurement_values,
             require_profile=self._measurement_schema is not None,
         )
-
-        name = None
-        if filename is not None:
-            raw = str(filename).strip()
-            if not raw:
-                raise ValueError("filename must be a non-empty string")
-            name = raw
-        if name is None:
-            name = self._filename or _default_filename()
-
-        self._out_dir.mkdir(parents=True, exist_ok=True)
-        h5 = h5py.File(self._out_dir / name, "w")
+        h5 = h5py.File(path, "w")
         try:
             self._configure_active_file(
                 h5,
@@ -1175,20 +1191,30 @@ class HdfWriter(ManagedProcessBase):
 
         try:
             if self._autostart_writing:
-                filename = self._filename or _default_filename()
-                h5 = h5py.File(self._out_dir / filename, "w")
-                measurement_meta = self._build_measurement_metadata(
-                    profile_id=None,
-                    values=None,
-                    require_profile=False,
-                )
-                self._configure_active_file(
-                    h5,
-                    write_every_s=write_every_s,
-                    load_manager_state=bool(self._process_id),
-                    measurement_meta=measurement_meta,
-                )
-                self._clear_buffered_for_disabled(self._disabled_devices)
+                try:
+                    path = self._resolve_output_path(None, use_default_filename=False)
+                    self._ensure_output_path_unused(path)
+                    h5 = h5py.File(path, "w")
+                    measurement_meta = self._build_measurement_metadata(
+                        profile_id=None,
+                        values=None,
+                        require_profile=False,
+                    )
+                    self._configure_active_file(
+                        h5,
+                        write_every_s=write_every_s,
+                        load_manager_state=bool(self._process_id),
+                        measurement_meta=measurement_meta,
+                    )
+                    self._clear_buffered_for_disabled(self._disabled_devices)
+                except FileExistsError:
+                    self._bump_error("autostart.file_exists")
+                    self._h5 = None
+                    self._reset_per_file_state()
+                    self._pending = 0
+                    now = time.monotonic()
+                    self._last_flush = now
+                    self._next_write = now + write_every_s
             else:
                 self._h5 = None
                 self._reset_per_file_state()
@@ -1938,6 +1964,15 @@ class HdfWriter(ManagedProcessBase):
                     measurement_profile=measurement_profile,
                     measurement_values=measurement_values,
                 )
+            except FileExistsError as e:
+                return {
+                    "request_id": request_id,
+                    "ok": False,
+                    "error": {
+                        "code": "file_exists",
+                        "message": str(e),
+                    },
+                }
             except Exception as e:
                 return {
                     "request_id": request_id,
@@ -2215,7 +2250,7 @@ class HdfWriter(ManagedProcessBase):
         spec: dict[str, str] = {}
         for key, value in fields.items():
             if isinstance(value, (bool, np.bool_)):
-                spec[str(key)] = "float64"
+                spec[str(key)] = "bool"
                 continue
             if isinstance(value, (int, float, np.integer, np.floating)):
                 spec[str(key)] = "float64"
@@ -2246,6 +2281,9 @@ class HdfWriter(ManagedProcessBase):
             if dtype == "int64":
                 ds_dtype = np.dtype("int64")
                 missing = -1
+            elif dtype == "bool":
+                ds_dtype = np.dtype("uint8")
+                missing = np.uint8(255)
             else:
                 ds_dtype = np.dtype("float64")
                 missing = np.nan
@@ -2259,7 +2297,9 @@ class HdfWriter(ManagedProcessBase):
             if current_len:
                 ds[...] = missing
             ds.attrs["dtype"] = dtype
-            ds.attrs["missing"] = missing
+            ds.attrs["missing"] = int(missing) if dtype == "bool" else missing
+            if dtype == "bool":
+                ds.attrs["encoding"] = "0=false,1=true,255=missing"
             self._context_columns_datasets[name] = ds
             self._context_columns_missing[name] = missing
 
@@ -2284,6 +2324,12 @@ class HdfWriter(ManagedProcessBase):
                     return int(value)
                 if isinstance(value, (float, np.floating)):
                     return int(value)
+                return missing
+            if dtype == "bool":
+                if isinstance(value, (bool, np.bool_)):
+                    return np.uint8(1 if bool(value) else 0)
+                if isinstance(value, (int, np.integer)) and int(value) in {0, 1}:
+                    return np.uint8(int(value))
                 return missing
             if isinstance(value, (bool, np.bool_)):
                 return float(bool(value))
@@ -2317,11 +2363,7 @@ class HdfWriter(ManagedProcessBase):
     def _write_stream_buffers(self) -> None:
         if self._h5 is None or self._streams_group is None:
             for _key, buf in self._stream_buffers.items():
-                buf["data"].clear()
-                buf["seq"].clear()
-                buf["t0_mono_ns"].clear()
-                buf["t0_wall_ns"].clear()
-                buf["context_id"].clear()
+                self._clear_stream_buffer(buf)
             return
         for key, buf in list(self._stream_buffers.items()):
             data_list = buf.get("data", [])
@@ -2330,11 +2372,7 @@ class HdfWriter(ManagedProcessBase):
 
             device_id, stream = key
             if not self._is_device_enabled(device_id):
-                buf["data"].clear()
-                buf["seq"].clear()
-                buf["t0_mono_ns"].clear()
-                buf["t0_wall_ns"].clear()
-                buf["context_id"].clear()
+                self._clear_stream_buffer(buf)
                 continue
             schema = self._stream_schema.get(key)
             reader = self._stream_readers.get(key)
@@ -2347,10 +2385,7 @@ class HdfWriter(ManagedProcessBase):
                 shape_raw = tuple(reader.layout.shape)
 
             if dtype_raw is None or shape_raw is None:
-                buf["data"].clear()
-                buf["seq"].clear()
-                buf["t0_mono_ns"].clear()
-                buf["t0_wall_ns"].clear()
+                self._clear_stream_buffer(buf)
                 continue
 
             dtype_str = str(dtype_raw)
@@ -2365,6 +2400,9 @@ class HdfWriter(ManagedProcessBase):
             t0_mono_list = list(buf["t0_mono_ns"])
             t0_wall_list = list(buf["t0_wall_ns"])
             context_list = list(buf.get("context_id", []))
+            if context_list and len(context_list) != n:
+                context_list = [-1] * n
+                self._bump_error("stream.context_alignment_repair")
 
             data_ds = datasets["data"]
             seq_ds = datasets["seq"]
@@ -2382,10 +2420,7 @@ class HdfWriter(ManagedProcessBase):
                 expected_nbytes = int(dtype_obj.itemsize * np.prod(shape_obj))
                 self._stream_expected_nbytes[key] = expected_nbytes
             if any(len(payload) != expected_nbytes for payload in data_list):
-                buf["data"].clear()
-                buf["seq"].clear()
-                buf["t0_mono_ns"].clear()
-                buf["t0_wall_ns"].clear()
+                self._clear_stream_buffer(buf)
                 continue
 
             if n == 1:
@@ -2421,11 +2456,7 @@ class HdfWriter(ManagedProcessBase):
             dropped = int(self._stream_dropped_total.get(key, 0))
             data_ds.attrs["dropped_total"] = dropped
 
-            buf["data"].clear()
-            buf["seq"].clear()
-            buf["t0_mono_ns"].clear()
-            buf["t0_wall_ns"].clear()
-            buf["context_id"].clear()
+            self._clear_stream_buffer(buf)
 
     def _active_stream_dataset_key(
         self, device_id: str, stream: str
@@ -2472,6 +2503,8 @@ class HdfWriter(ManagedProcessBase):
             maxshape=(None,) + tuple(shape),
             dtype=dtype_obj,
             chunks=data_chunks,
+            compression=DEFAULT_NUMERIC_COMPRESSION,
+            shuffle=DEFAULT_NUMERIC_SHUFFLE,
         )
         seq_ds = session_group.create_dataset(
             "seq",

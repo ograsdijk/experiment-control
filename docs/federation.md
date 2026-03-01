@@ -1,174 +1,103 @@
-# Manager Federation (Multi-Instance Device Access)
+# Manager Federation (Current Behavior)
 
 ## Summary
 
-This document defines a v1 federation design for running multiple manager instances on different hosts while exposing selected remote devices as if they were local on a "hub" instance.
+Federation lets one local manager instance mirror selected devices from one or more remote manager instances so they appear alongside local devices.
 
-Primary goal:
-- Let existing clients (web UI, sequencer, process RPC users) interact with selected remote devices through one local manager/router endpoint.
+Current implementation:
+- Host-to-host transport is ZMQ only.
+- Remote device commands are forwarded router-to-router (`device_router` to remote `device_router`).
+- Remote telemetry/status/log events are relayed manager-to-manager (remote manager PUB to local manager SUB).
+- Mirrored devices are surfaced as normal local-looking device IDs with explicit remote markers.
 
-Key v1 constraints:
-- Keep native ZMQ RPC + PUB/SUB architecture.
-- Preserve the existing local split of responsibilities:
-  - `device_router` remains the external command ingress for device RPC.
-  - `manager` remains the authority for device inventory, status, telemetry caches, and config/schema surfaces.
-- No stream/chunk forwarding in v1 (shared-memory descriptors are host-local).
-- Do not re-export federated devices to other peers (no daisy-chain).
-- Use existing manager PUB topic set; filter on receiving side.
-
----
-
-## Goals
-
-- Expose remote devices on the hub instance as mirrored local device IDs.
-- Forward device commands and capability calls to remote owner instance.
-- Relay remote telemetry/heartbeat/log/command-interceptor context for mirrored devices.
-- Preserve existing protocol and UI/process behavior as much as possible.
-- Enforce safe command policies for remote operations (deny dangerous actions by default).
-
-## Non-Goals (v1)
-
-- No `manager.chunk_ready` / stream data forwarding.
-- No cross-host shared-memory transport.
-- No automatic federation mesh routing.
-- No per-peer bandwidth-optimized telemetry exporter in v1.
+This file documents the behavior that is implemented now, not a future design.
 
 ---
 
 ## Terms
 
-- Leaf manager: remote instance that owns physical devices.
-- Hub manager: local instance that mirrors remote devices and serves local clients.
-- Mirrored device: a hub-side alias mapped to a leaf-side `device_id`.
-- Owner peer: the leaf manager responsible for a mirrored device.
+- Hub: the local manager/router instance you connect to.
+- Leaf: the remote manager/router instance that owns the physical device.
+- Mirrored device: a hub-side alias for a leaf-side `device_id`.
 
 ---
 
-## High-Level Architecture
+## What It Does
 
-For each configured peer, hub manager creates:
+Given a static config mapping:
+- The hub `device_router` detects mirrored `device_id`s.
+- Commands for mirrored devices are forwarded to the owning peer's `router_rpc`.
+- The hub manager subscribes to the owning peer's `manager_pub`.
+- Relayed remote events are rewritten to the mirrored local `device_id`.
+- The hub manager merges mirrored devices into:
+  - `list_devices`
+  - `device.list_status`
+  - `device.config.get`
+  - `device.config.list`
+  - `telemetry.schema.list`
 
-- A peer metadata client to the remote router/manager RPC endpoints (for initial config/schema fetches and lifecycle/admin requests that are allowed by policy).
-- A dedicated SUB connection to that peer's manager PUB endpoint.
+Mirrored devices are tagged with:
+- `source_kind: "federated"`
+- `is_remote: true`
+- `owner_peer_id`
+- `remote_device_id`
 
-For each mirrored device, hub router creates:
-
-- A dedicated command-forwarding lane (worker + outbound socket) for that mirrored device.
-- Forwarding stays serial per mirrored device, matching the current local "one command at a time per device" behavior.
-
-Hub manager keeps a mapping:
-- `local_device_id -> (peer_id, remote_device_id)`
-
-Hub router/manager behavior:
-- `device_router` detects mirrored `device_id`s for external `type: command` requests.
-- `device_router` forwards mirrored device commands through the dedicated mirrored-device lane to the owner peer's router RPC endpoint.
-- `manager` owns mirrored device inventory, status synthesis, telemetry caches, and config/schema surfaces.
-- Remote events are rewritten to local mirrored `device_id` when surfaced locally.
-
-Implementation note:
-- Do not use one shared blocking outbound lane for all mirrored devices on a peer. A slow remote device would otherwise stall unrelated mirrored devices.
-
----
-
-## Device Identity and Mapping
-
-Mirrored IDs must be explicit and collision-free.
-
-Recommended naming:
-- `peer_alias.device_id` (example: `lab2.psu`).
-
-Required behavior:
-- A mirrored ID cannot overlap a locally owned device ID.
-- One mirrored ID maps to exactly one owner peer and one remote device ID.
-- Mapping is static from config in v1.
+Local devices are tagged with:
+- `source_kind: "local"`
+- `is_remote: false`
 
 ---
 
-## Command Forwarding Rules
+## Command Path
 
-When hub receives `type: command`:
+For a mirrored `type: "command"` request:
 
-1. If `device_id` is local: current behavior (local handling).
-2. If `device_id` is mirrored:
-   - `device_router` resolves `(peer_id, remote_device_id)`.
-   - `device_router` uses the mirrored device's dedicated forwarding lane.
-   - Enforce outbound federation policy/ACL before forwarding.
-   - Forward to owner peer as normal `type: command` with remote `device_id`.
-   - Include federation context metadata (`origin_instance_id`, `hop_count`).
-   - Return peer response unchanged except optional metadata wrapping.
+1. A client sends the request to the local `device_router`.
+2. The local router matches the mirrored `device_id`.
+3. The local router uses a dedicated worker thread for that mirrored device.
+4. That worker forwards the request to the remote peer's `router_rpc`, rewriting:
+   - local mirrored `device_id` -> remote `device_id`
+   - adding `federation.origin_instance_id`
+   - incrementing `federation.hop_count`
+5. The remote router handles the request as a normal local device command.
+6. The response is returned unchanged to the original caller.
 
-Mirrored command behavior must preserve:
-- Interlock errors (`INTERCEPTOR_*`) from remote.
-- Interceptor modifications (if reflected in error/details/event payloads).
-
-Lifecycle/admin RPCs:
-- Requests such as `device.connect`, `device.disconnect`, `device.driver.start/stop/restart`, and `device.recover` are handled by hub manager for mirrored devices.
-- These are denied by default and only forwarded to the owner peer when federation policy explicitly allows them.
-
----
-
-## Remote Command Policy (ACL)
-
-Federation must support per-peer command restrictions.
-
-Default-safe posture:
-- Allow normal device actions only if explicitly permitted.
-- Deny lifecycle/admin operations by default.
-
-Policy categories:
-- Device actions (`type: command`, action-level allow/deny).
-- Device lifecycle (`device.connect`, `device.disconnect`, `device.driver.start/stop/restart`).
-- Manager/process admin (`manager.shutdown`, `process.*`, other management RPC).
-
-Recommended policy evaluation order:
-1. Explicit deny list.
-2. Explicit allow list.
-3. Category default.
-4. Global default deny for unmatched operations.
-
-Both sides should enforce policy:
-- Hub outbound policy (before forwarding).
-- Leaf inbound federation policy (defense in depth).
-
-Important distinction:
-- Hub federation policy is coarse routing policy ("may this remote operation be attempted?").
-- Normal device interlocks remain leaf-authoritative and should not be re-applied on the hub for mirrored devices.
+Current concurrency model:
+- One lazy worker thread per mirrored device.
+- Each worker owns one outbound DEALER socket to the remote peer.
+- Command execution is serial per mirrored device.
+- One slow mirrored device does not block another mirrored device.
 
 ---
 
-## Interlock, Follower, and Watchdog Semantics
+## Lifecycle Requests
 
-Authority model:
-- Leaf manager/interceptors are authoritative for leaf-owned devices.
+The hub manager also handles mirrored lifecycle requests:
+- `device.connect`
+- `device.disconnect`
+- `device.driver.start`
+- `device.driver.stop`
+- `device.driver.restart`
+- `device.recover`
 
-Implications:
-- If remote interlock blocks command, hub returns same failure (with code/details).
-- If remote rule transforms params, command executes with transformed params on leaf.
-- If remote follower/watchdog sends follow-up actions, those remain leaf-owned actions.
+These are forwarded to the leaf only if `allow_lifecycle_ops: true` for that peer.
 
-Observability at hub:
-- Hub relays remote event/log topics for mapped devices so operators can see:
-  - `manager.command`
-  - `manager.log`
-  - `manager.command_interceptor.error`
-  - `manager.command_interceptor.modified`
-
-Implementation note:
-- For mirrored devices, the hub should not run its normal local device command-interceptor chain and then let the leaf run the leaf chain again.
-- Double-applying interlocks would duplicate rewrites/rejections and create non-local behavior.
+By default:
+- Mirrored device commands are allowed.
+- Mirrored lifecycle operations are denied.
 
 ---
 
-## Event Relay and Local Re-Publish
+## Event Relay
 
-Hub subscribes to remote manager PUB and relays selected topics.
+For each configured peer:
+- The hub manager opens one dedicated SUB socket to that peer's `manager_pub`.
+- The hub subscribes only to the configured relay topics.
+- Incoming payloads are filtered to mapped mirrored devices.
+- Payloads are rewritten to the mirrored local `device_id`.
+- The rewritten events are published locally through the hub manager.
 
-For mirrored devices:
-- Rewrite remote `device_id` to local mirrored ID in relayed payloads.
-- Preserve original timing fields when present.
-- Include origin metadata (`peer_id`, `remote_device_id`) for diagnostics.
-
-Core topics to relay in v1:
+Currently relayed topics:
 - `manager.telemetry_update`
 - `manager.heartbeat`
 - `manager.log`
@@ -176,73 +105,39 @@ Core topics to relay in v1:
 - `manager.command_interceptor.error`
 - `manager.command_interceptor.modified`
 
-Implementation note:
-- Use one SUB socket per peer, not one SUB socket connected to multiple peers.
-- The relay path must always know which peer a message came from for correct metadata, health tracking, and diagnostics.
-- Payload rewriting must handle nested command/interceptor structures, not just top-level `device_id`.
+Implementation notes:
+- `manager.telemetry_update` is ingested into the hub manager's normal telemetry cache.
+- `manager.heartbeat` is ingested into the hub manager's normal heartbeat/liveness path.
+- `manager.log` is re-emitted through the manager log path.
+- Nested device references in interceptor payloads are rewritten, not just top-level `device_id`.
+
+Not forwarded:
+- `manager.chunk_ready`
+- stream/shared-memory payloads
 
 ---
 
-## Telemetry Filtering in v1
+## Capabilities Caching
 
-v1 uses existing manager PUB topic format (for example `manager.telemetry_update`).
+Mirrored device capabilities are cached on the hub manager.
 
-Consequence:
-- SUB filtering by `device_id` cannot reduce network traffic at transport level.
-- Hub receives all subscribed remote telemetry topic traffic, then filters locally.
+Current behavior:
+- If a mirrored `capabilities` command succeeds, the local router notifies the local manager to cache the returned payload.
+- `list_devices` then includes the cached `capabilities` for that mirrored device.
+- There is no TTL yet. The cache stays until overwritten by a later successful `capabilities` call or until restart.
 
-Still useful:
-- Config can limit which mirrored devices are accepted and re-published locally.
-- This reduces local processing and UI noise, but not wire bandwidth.
+Optional startup warm-up:
+- If `warm_capabilities_on_startup: true` is set for a peer, the hub manager issues a normal `capabilities` RPC to each mirrored device on that peer during federation activation.
+- This fills the cache before any client explicitly requests capabilities.
 
-Future (optional):
-- Add federation-specific filtered exporter topics (device-scoped prefixes) for network reduction.
-
----
-
-## Loop Prevention and Non-Redirection
-
-Hard rule for v1:
-- Federated (mirrored) devices are never re-exported to another peer.
-
-Enforcement:
-- Mark mirrored devices with `source_kind=federated`, `is_remote=true`, and `owner_peer_id`.
-- Exportable device list for federation includes local-owned devices only.
-- Forwarding logic rejects forwarding for devices whose `source_kind` is federated.
-
-Additional guard:
-- Include federation metadata (`origin_instance_id`, `hop_count`) in forwarded context.
-- Reject if hop count is non-zero for outbound federation operations.
+If `warm_capabilities_on_startup` is left at its default `false`:
+- Capabilities are cached lazily on first successful `capabilities` call.
 
 ---
 
-## Status and Failure Handling
+## Configuration
 
-Peer health should be tracked and exposed:
-- RPC connectivity status.
-- Last event receive timestamp.
-- Last error.
-
-Mirrored device behavior on peer outage:
-- Commands fail closed with explicit federation/peer-unavailable errors.
-- Device status becomes offline/unavailable with reason.
-- No automatic fallback to other peers.
-
-Surface contract for mirrored devices:
-- Mirrored devices must appear in:
-  - `device.list_status`
-  - `list_devices`
-  - `device.config.get`
-  - `device.config.list`
-  - `telemetry.schema.list`
-- This keeps FastAPI/UI/processes (for example HDF writer) behavior aligned with truly local devices.
-
-Timeouts/retries:
-- Per-peer RPC timeout and retry/backoff config.
-
----
-
-## Config Sketch (Draft)
+Minimal working example:
 
 ```yaml
 federation:
@@ -251,17 +146,37 @@ federation:
     - peer_id: lab2
       router_rpc: tcp://10.0.0.22:6000
       manager_pub: tcp://10.0.0.22:6001
-      allow_reexport: false
       mirror_devices:
         - local_id: lab2.psu
           remote_device_id: psu
         - local_id: lab2.hv
           remote_device_id: hv
+```
+
+Expanded example with active options:
+
+```yaml
+federation:
+  enabled: true
+  peers:
+    - peer_id: lab2
+      router_rpc: tcp://10.0.0.22:6000
+      manager_pub: tcp://10.0.0.22:6001
+      rpc_timeout_ms: 1500
+      event_stale_s: 3.0
+      warm_capabilities_on_startup: false
+
+      mirror_devices:
+        - local_id: lab2.psu
+          remote_device_id: psu
+        - local_id: lab2.hv
+          remote_device_id: hv
+
       policy:
-        allow_device_actions: ["set_*", "get", "capabilities"]
-        deny_device_actions: ["shutdown", "disconnect", "restart*"]
+        allow_device_actions: ["*"]
+        deny_device_actions: []
         allow_lifecycle_ops: false
-        allow_admin_ops: false
+
       relay:
         topics:
           - manager.telemetry_update
@@ -271,57 +186,68 @@ federation:
           - manager.command_interceptor.error
           - manager.command_interceptor.modified
         only_mirrored_devices: true
+        include_origin_meta: true
 ```
 
-Notes:
-- `instance_id` already provides the local runtime identity; a separate `federation.manager_id`
-  is usually unnecessary in this codebase.
-- Field names are draft and can be adjusted to match existing config schema style.
-- Action wildcard matching rules should be documented precisely in implementation.
+Defaults that currently affect runtime:
+- `enabled`: `false`
+- `rpc_timeout_ms`: inherits `manager.device_rpc_timeout_ms`
+- `event_stale_s`: inherits `manager.heartbeat_timeout_s`
+- `warm_capabilities_on_startup`: `false`
+- `policy.allow_device_actions`: `["*"]`
+- `policy.deny_device_actions`: `[]`
+- `policy.allow_lifecycle_ops`: `false`
+- `relay.topics`: the six topics listed above
+- `relay.only_mirrored_devices`: `true`
+- `relay.include_origin_meta`: `true`
+
+Pattern matching:
+- `allow_device_actions` and `deny_device_actions` use `fnmatch.fnmatchcase` semantics.
+
+Validation rules:
+- `peer_id` must be unique.
+- `local_id` must be unique across all mirrored devices.
+- `local_id` must not collide with a locally configured device ID.
+- Each `(peer_id, remote_device_id)` mapping must be unique.
+- `router_rpc` and `manager_pub` must be `tcp://...` endpoints.
+- `allow_reexport: true` is rejected.
+
+Accepted but currently reserved:
+- `reconnect_backoff_s`
+- `reconnect_backoff_max_s`
+- `policy.allow_admin_ops`
+
+These are parsed and validated but do not currently change runtime behavior.
+
+---
+
+## Re-Export Guard
+
+Mirrored devices are not re-exported.
+
+Current enforcement:
+- If a request arrives with `federation.hop_count > 0` and targets a mirrored device on that host, the router rejects it.
+
+This prevents mirrored-device-to-mirrored-device forwarding chains.
+
+---
+
+## Current Limits
+
+- No stream/shared-memory forwarding.
+- No `manager.chunk_ready` forwarding.
+- No separate leaf-side inbound federation ACL.
+  - The leaf accepts forwarded requests the same way it accepts normal router requests.
+  - Normal local driver checks and local command interceptors still apply.
+- No cross-host forwarding for `process.*` or `manager.*` admin RPC.
+- Reconnect backoff settings are not yet used by the runtime.
 
 ---
 
 ## Compatibility Notes
 
-- Existing UI and sequencer should work with mirrored devices once they appear in `device.list_status` and `capabilities`.
-- Existing UI/process helpers that depend on `device.config.list` and `telemetry.schema.list`
-  should also work once mirrored entries are included in those responses.
-- No stream-capable workflows should target mirrored devices in v1.
-- HDF writer behavior for mirrored telemetry/log events should be validated explicitly.
-
----
-
-## Phased Implementation Plan
-
-1. Federation config schema + validation.
-2. Hub manager peer links:
-   - per-peer metadata/RPC client
-   - per-peer PUB subscriber
-3. Mirrored device registry:
-   - static mapping
-   - explicit remote markers (`source_kind`, `is_remote`, `owner_peer_id`, `remote_device_id`)
-4. Metadata mirroring:
-   - `device.config.*`
-   - `telemetry.schema.list`
-   - optional capability cache
-5. Hub router mirrored-device forwarding lanes (serial per mirrored device).
-6. Event relay/rewrite for mapped devices.
-7. Lifecycle/admin forwarding with explicit ACLs.
-8. Non-redirection and hop guards.
-9. Tests + protocol/startup docs updates.
-
----
-
-## Test Matrix (Minimum)
-
-- Command forwarding success for mirrored device.
-- Independent mirrored-device queues: one slow mirrored device does not block another.
-- Blocked command by local ACL.
-- Blocked command by remote interlock; error propagated.
-- Remote interceptor transform reflected in command event/log context.
-- Peer outage -> mirrored command fails closed.
-- Mirrored devices not exported to downstream peers.
-- Relay filter only publishes mapped mirrored devices locally.
-- Mirrored devices appear in `device.config.list` and `telemetry.schema.list`.
-- No `manager.chunk_ready` forwarding for mirrored devices.
-
+- FastAPI is not part of the host-to-host transport path.
+  - FastAPI can be a client of the local hub.
+  - Federation itself runs underneath that, via ZMQ router/manager sockets.
+- Existing UI/processes that consume `device.list_status`, `device.config.list`, and `telemetry.schema.list` can see mirrored devices through the hub.
+- HDF/other process behavior for mirrored telemetry now depends on the same manager-side inventory/config/schema surfaces as local devices.

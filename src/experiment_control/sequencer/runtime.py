@@ -35,8 +35,8 @@ class _Frame:
 
 @dataclass
 class _ForFrame:
-    var: str
-    values: list[Any]
+    bind: dict[str, str]
+    records: list[dict[str, Any]]
     index: int
     body: list[Step]
 
@@ -254,6 +254,42 @@ class SequencerRuntime:
         env["vars"] = to_attrdict(self._vars)
         return env
 
+    def _record_index(self, record: dict[str, Any], fallback: int) -> int:
+        raw = record.get("index", fallback)
+        try:
+            return int(raw)
+        except Exception:
+            return fallback
+
+    def _assign_bound_record(self, bind: dict[str, str], record: dict[str, Any]) -> None:
+        if not isinstance(record, dict):
+            raise TypeError("for loop items must resolve to records")
+        for source, target in bind.items():
+            if source not in record:
+                raise KeyError(f"loop record is missing bound field {source!r}")
+            self._env[target] = record[source]
+
+    def _records_from_iterable(self, items: list[Any]) -> list[dict[str, Any]]:
+        total = len(items)
+        denom = max(1, total - 1)
+        records: list[dict[str, Any]] = []
+        for index, item in enumerate(items):
+            if isinstance(item, dict):
+                record = dict(item)
+                record.setdefault("index", index)
+                record.setdefault("count", total)
+                if "u" not in record:
+                    record["u"] = (index / denom) if total > 1 else 0.0
+            else:
+                record = {
+                    "value": item,
+                    "index": index,
+                    "u": (index / denom) if total > 1 else 0.0,
+                    "count": total,
+                }
+            records.append(record)
+        return records
+
     def _eval_condition_safe(self, cond: Any) -> bool:
         try:
             cond_val = self._resolve_value(cond)
@@ -417,7 +453,7 @@ class SequencerRuntime:
                 return None
             return 1 + (times * inner)
         if isinstance(step, ForStep):
-            values = self._estimate_iterable(
+            records = self._estimate_iterable(
                 step.in_expr,
                 env=env,
                 serpentine_index=(
@@ -427,10 +463,16 @@ class SequencerRuntime:
                 ),
             )
             total = 1
-            for index, value in enumerate(values):
+            for index, record in enumerate(records):
                 loop_env = dict(env)
-                loop_env[step.var] = value
-                loop_env["__loop_index"] = index
+                if not isinstance(record, dict):
+                    return None
+                loop_index = self._record_index(record, index)
+                for source, target in step.bind.items():
+                    if source not in record:
+                        return None
+                    loop_env[target] = record[source]
+                loop_env["__loop_index"] = loop_index
                 inner = self._estimate_step_list(step.body, loop_env)
                 if inner is None:
                     return None
@@ -466,7 +508,7 @@ class SequencerRuntime:
         *,
         env: dict[str, Any],
         serpentine_index: int | None,
-    ) -> list[Any]:
+    ) -> list[dict[str, Any]]:
         env_view = self._estimate_env_view(env)
         rendered = render_templates(value, env_view)
         if isinstance(rendered, dict) and "gen" in rendered:
@@ -478,8 +520,8 @@ class SequencerRuntime:
                     serpentine_index=serpentine_index,
                 )
         if isinstance(rendered, list):
-            return list(rendered)
-        return [rendered]
+            return self._records_from_iterable(rendered)
+        return self._records_from_iterable([rendered])
 
     def _next_step(self) -> Step | None:
         while self._stack:
@@ -494,13 +536,13 @@ class SequencerRuntime:
                 frame.index += 1
                 return step
             if isinstance(frame, _ForFrame):
-                if frame.index >= len(frame.values):
+                if frame.index >= len(frame.records):
                     self._stack.pop()
                     continue
-                value = frame.values[frame.index]
+                record = frame.records[frame.index]
                 frame.index += 1
-                self._env[frame.var] = value
-                self._env["__loop_index"] = frame.index - 1
+                self._assign_bound_record(frame.bind, record)
+                self._env["__loop_index"] = self._record_index(record, frame.index - 1)
                 self._stack.append(_Frame(frame.body))
                 continue
             if isinstance(frame, _RepeatFrame):
@@ -539,10 +581,10 @@ class SequencerRuntime:
         if isinstance(step, ForStep):
             parent_index = self._env.get("__loop_index")
             serpentine_index = int(parent_index) if parent_index is not None else None
-            values = self._resolve_iterable(
+            records = self._resolve_iterable(
                 step.in_expr, serpentine_index=serpentine_index
             )
-            self._stack.append(_ForFrame(step.var, values, 0, step.body))
+            self._stack.append(_ForFrame(dict(step.bind), records, 0, step.body))
             return False
         if isinstance(step, RepeatStep):
             times = int(render_templates(step.times, self._env_view()))
@@ -636,7 +678,9 @@ class SequencerRuntime:
                         out.append((dev, stream))
         return out
 
-    def _resolve_iterable(self, value: Any, *, serpentine_index: int | None) -> list[Any]:
+    def _resolve_iterable(
+        self, value: Any, *, serpentine_index: int | None
+    ) -> list[dict[str, Any]]:
         env = self._env_view()
         rendered = render_templates(value, env)
         if isinstance(rendered, dict) and "gen" in rendered:
@@ -644,8 +688,8 @@ class SequencerRuntime:
             if isinstance(gen, dict):
                 return generate_from_gen(gen, env=env, serpentine_index=serpentine_index)
         if isinstance(rendered, list):
-            return list(rendered)
-        return [rendered]
+            return self._records_from_iterable(rendered)
+        return self._records_from_iterable([rendered])
 
     def _resolve_value(self, value: Any) -> Any:
         env = self._env_view()

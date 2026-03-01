@@ -15,11 +15,14 @@
 import type { MutableRefObject } from "react";
 import { formatWallTimeSeconds, toPrettyJson } from "../features/logs/utils";
 import type { CommandHistoryEntry } from "../features/commands/types";
+import type { DeviceStatus } from "../types";
+import { DeviceNameInline } from "./DeviceNameInline";
 
 type Props = {
   opened: boolean;
   onClose: () => void;
   filteredRows: CommandHistoryEntry[];
+  devices: DeviceStatus[];
   totalRows: number;
   persistLimit: number;
   persistLimitMin: number;
@@ -45,6 +48,7 @@ export function CommandHistoryModal({
   opened,
   onClose,
   filteredRows,
+  devices,
   totalRows,
   persistLimit,
   persistLimitMin,
@@ -65,6 +69,7 @@ export function CommandHistoryModal({
   viewportRef,
   onCopyJson,
 }: Props) {
+  const deviceById = new Map(devices.map((device) => [device.device_id, device]));
   return (
     <Modal
       opened={opened}
@@ -197,7 +202,17 @@ export function CommandHistoryModal({
                           </Badge>
                         </Group>
                         <Text size="sm" fw={600}>
-                          {row.target_id}.{row.action}
+                          {row.target_kind === "device" ? (
+                            <DeviceNameInline
+                              deviceId={row.target_id}
+                              device={deviceById.get(row.target_id) ?? null}
+                              size="sm"
+                              fw={600}
+                              suffix={`.${row.action}`}
+                            />
+                          ) : (
+                            `${row.target_id}.${row.action}`
+                          )}
                         </Text>
                         {errorMessage && (
                           <Text size="xs" c="red">

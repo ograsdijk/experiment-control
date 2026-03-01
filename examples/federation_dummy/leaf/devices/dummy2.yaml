@@ -1,0 +1,9 @@
+version: 1
+device_id: dummy2
+
+driver:
+  module: experiment_control.drivers.dummy_driver
+  class_name: DummyDriver
+
+init_kwargs:
+  port: 23002

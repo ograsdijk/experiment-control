@@ -38,6 +38,7 @@ class DeviceStatus:
     driver_restart_count: int
     driver_last_exit_code: int | None
     driver_last_error: str | None
+    is_remote: bool = False
 
 
 class ConfirmScreen(ModalScreen[bool]):
@@ -1043,6 +1044,17 @@ class ManagerTUI(App):
                 return member
         return None
 
+    @staticmethod
+    def _row_key_str(row_key: Any) -> str:
+        key_value = row_key.value if hasattr(row_key, "value") else row_key
+        return str(key_value)
+
+    @staticmethod
+    def _device_label(status: DeviceStatus) -> str:
+        if status.is_remote:
+            return f"⇄ {status.device_id}"
+        return status.device_id
+
     def _refresh_snapshot(self) -> None:
         snapshot_changed = False
 
@@ -1079,6 +1091,9 @@ class ManagerTUI(App):
                         driver_restart_count=int(proc.get("restart_count", 0)),
                         driver_last_exit_code=proc.get("last_exit_code"),
                         driver_last_error=proc.get("last_error"),
+                        is_remote=bool(item.get("is_remote"))
+                        or str(item.get("source_kind", "")).strip().lower()
+                        == "federated",
                     )
                     next_status[status.device_id] = status
                     prev = old_status.get(status.device_id)
@@ -1119,9 +1134,9 @@ class ManagerTUI(App):
         try:
             row_index = devices.cursor_row
             if row_index is not None and row_index >= 0:
-                row = devices.get_row_at(row_index)
-                if row:
-                    cursor_device_id = str(row[0])
+                ordered_rows = devices.ordered_rows
+                if row_index < len(ordered_rows):
+                    cursor_device_id = self._row_key_str(ordered_rows[row_index].key)
         except Exception:
             cursor_device_id = None
 
@@ -1153,7 +1168,7 @@ class ManagerTUI(App):
                 status = self._device_status[device_id]
 
                 row_values = [
-                    status.device_id,
+                    self._device_label(status),
                     status.liveness or "",
                     status.driver_proc_state or "",
                     str(status.driver_pid) if status.driver_pid is not None else "",
@@ -1942,13 +1957,11 @@ class ManagerTUI(App):
             return
         if not self._is_table_focused(table):
             return
-        row = table.get_row(event.row_key)
-        if row:
-            self._selected_device_id = str(row[0])
-            self._has_user_selection = True
-            self._set_inspector_mode("device")
-            self._mark_inspector_dirty()
-            self._render_inspector_if_needed(force=True)
+        self._selected_device_id = self._row_key_str(event.row_key)
+        self._has_user_selection = True
+        self._set_inspector_mode("device")
+        self._mark_inspector_dirty()
+        self._render_inspector_if_needed(force=True)
 
     @on(DataTable.RowHighlighted, "#devices_table")
     def _on_device_cursor_moved(self, event: DataTable.RowHighlighted) -> None:
@@ -1957,15 +1970,10 @@ class ManagerTUI(App):
             return
         if not self._is_table_focused(table):
             return
-        try:
-            row = table.get_row(event.row_key)
-        except Exception:
-            return
-        if row:
-            self._selected_device_id = str(row[0])
-            self._set_inspector_mode("device")
-            self._mark_inspector_dirty()
-            self._render_inspector_if_needed(force=True)
+        self._selected_device_id = self._row_key_str(event.row_key)
+        self._set_inspector_mode("device")
+        self._mark_inspector_dirty()
+        self._render_inspector_if_needed(force=True)
 
     @on(DataTable.RowSelected, "#processes_table")
     def _on_process_selected(self, event: DataTable.RowSelected) -> None:

@@ -65,6 +65,7 @@ import {
   type GatewaySettingsInfo,
 } from "./api";
 import { DeviceCard } from "./components/DeviceCard";
+import { DeviceNameInline } from "./components/DeviceNameInline";
 import { CommandHistoryModal } from "./components/CommandHistoryModal";
 import { DaqWorkspacesModal } from "./components/DaqWorkspacesModal";
 import { DeviceCommandModal } from "./components/DeviceCommandModal";
@@ -6948,7 +6949,21 @@ export function App() {
       <DeviceCommandModal
         opened={commandOpen}
         onClose={() => setCommandOpen(false)}
-        title={`Command ${commandDevice ?? ""}`}
+        title={
+          commandDevice ? (
+            <>
+              Command{" "}
+              <DeviceNameInline
+                deviceId={commandDevice}
+                device={
+                  devices.find((device) => device.device_id === commandDevice) ?? null
+                }
+              />
+            </>
+          ) : (
+            "Command"
+          )
+        }
         capabilities={capabilitiesForActive}
         commandAction={commandAction}
         onActionChange={handleActionChange}
@@ -7127,6 +7142,7 @@ export function App() {
         opened={interlocksOpen}
         onClose={() => setInterlocksOpen(false)}
         onRefresh={refreshInterlocksModalData}
+        devices={devices}
         processes={interlocksPanelProcesses}
         followerRulesByProcessId={followerRulesByProcessId}
         interlockStatusByProcessId={interlockStatusByProcessId}
@@ -7196,6 +7212,7 @@ export function App() {
         opened={commandHistoryOpen}
         onClose={() => setCommandHistoryOpen(false)}
         filteredRows={filteredCommandHistoryRows}
+        devices={devices}
         totalRows={commandHistoryRows.length}
         persistLimit={commandHistoryLimit}
         persistLimitMin={MIN_COMMAND_HISTORY_LIMIT}

@@ -9,6 +9,7 @@ from typing import Any, Callable
 
 import zmq
 
+from ..federation import parse_federation_config
 from ..utils.config_parsing import (
     ConfigError,
     normalize_list,
@@ -328,8 +329,34 @@ def main(argv: list[str] | None = None) -> None:
             )
             return
 
+        base_dir = stack_path.parent
+        device_paths = _collect_config_paths(
+            raw.get("devices"), base=base_dir, label="devices"
+        )
+        process_paths = _collect_config_paths(
+            raw.get("processes"), base=base_dir, label="processes"
+        )
+
+        device_specs = []
+        seen_devices: set[str] = set()
+        for dev_path in device_paths:
+            spec = device_spec_from_yaml(dev_path)
+            if spec.device_id in seen_devices:
+                raise ConfigError(
+                    "devices", f"duplicate device_id {spec.device_id!r}"
+                )
+            seen_devices.add(spec.device_id)
+            device_specs.append(spec)
+
+        federation_config = parse_federation_config(
+            raw.get("federation"),
+            local_device_ids=seen_devices,
+            manager_raw=manager_raw,
+        )
+
         manager = Manager(
             instance_id=instance_id,
+            federation_config=federation_config,
             registry_bind=manager_network.registry_bind,
             internal_rpc_bind=manager_network.internal_rpc_bind,
             external_rpc_bind=manager_network.external_rpc_bind,
@@ -346,24 +373,10 @@ def main(argv: list[str] | None = None) -> None:
             ),
         )
 
-        base_dir = stack_path.parent
-        device_paths = _collect_config_paths(
-            raw.get("devices"), base=base_dir, label="devices"
-        )
-        process_paths = _collect_config_paths(
-            raw.get("processes"), base=base_dir, label="processes"
-        )
         process_manager_rpc = manager_network.local_rpc_connect
         process_manager_pub = manager_network.local_pub_connect
 
-        seen_devices: set[str] = set()
-        for dev_path in device_paths:
-            spec = device_spec_from_yaml(dev_path)
-            if spec.device_id in seen_devices:
-                raise ConfigError(
-                    "devices", f"duplicate device_id {spec.device_id!r}"
-                )
-            seen_devices.add(spec.device_id)
+        for spec in device_specs:
             manager.add_device(spec)
 
         seen_processes: set[str] = set()

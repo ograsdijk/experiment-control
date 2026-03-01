@@ -8,6 +8,7 @@ This document explains how the sequencer YAML is parsed and executed by
 - Variables are defined in `vars` and are visible to templates.
 - Templates use `${...}` with a restricted expression evaluator.
 - Control flow: `for`, `repeat`, `while`, `if`, `atomic`, `pause`, `assign`.
+- `for` loops iterate over records and bind selected fields into local names.
 - Timing: `sleep`, `wait_until`.
 - Device I/O: `set`, `call`.
 - Stream context: `set_context` (writes `context_id` + `context_fields`).
@@ -161,14 +162,43 @@ Implicit locals during wait:
 This step is interruptible by pause/stop.
 
 ### `for`
-Loop over a list or generator.
+Loop over a list or generator. All loop sources resolve to **records**.
+`bind` selects which record fields become local variables inside the loop body.
+
+String form:
 ```yaml
 - for:
-    var: hv_v
+    bind: hv_v
     in: [0, 200, 400]
     do:
       - set: {device: psu, name: voltage_v, value: ${hv_v}}
 ```
+
+The string form is shorthand for binding the record field `value`.
+
+Mapping form:
+```yaml
+- for:
+    bind:
+      value: freq_hz
+      index: freq_step_idx
+    in:
+      gen:
+        linspace: {start: -30e6, stop: 30e6, num: 301}
+    do:
+      - call:
+          device: freq1
+          action: set_frequency_hz
+          params:
+            frequency_hz: ${freq_hz}
+```
+
+Notes:
+- `bind` may map only the fields you need.
+- Missing bound fields are an error.
+- Plain lists/scalars are wrapped as records automatically.
+- 1D generators emit `value`, `index`, `u`, `count`.
+- `scan2d` emits `x`, `y`, `row`, `col`, `index`, `u`, `v`, `count`.
 
 ### `repeat`
 Repeat a block N times.
@@ -267,11 +297,66 @@ Supported generators (exactly one):
 - `logspace: {start, stop, num, base?}`
 - `geomspace: {start, stop, num}`
 - `values: [...]`
+- `scan2d: ...`
 
 Modifiers:
 - `offset`
 - `shuffle` + `seed`
 - `serpentine` (alternates direction based on parent loop index)
+
+### `scan2d`
+Generates 2D scan-point records for raster-like motion.
+
+Convenience shorthand:
+```yaml
+in:
+  gen:
+    scan2d:
+      center: {x: 0.0, y: 0.0}
+      width: 2.0
+      height: 1.0
+      steps: {x: 101, y: 51}
+      pattern: serpentine
+      order: row_major
+```
+
+Equivalent explicit form:
+```yaml
+in:
+  gen:
+    scan2d:
+      x:
+        linspace: {start: -1.0, stop: 1.0, num: 101}
+      y:
+        linspace: {start: -0.5, stop: 0.5, num: 51}
+      pattern: serpentine
+      order: row_major
+```
+
+Shorthand rules:
+- `center` is required and must provide `x`/`y`.
+- Use either `width` + `height`, or `size`.
+- `size` may be a scalar (square scan) or `{width, height}`.
+- Use exactly one of `steps` or `pitch`.
+- `steps` may be a scalar or `{x, y}`.
+- `pitch` may be a scalar or `{x, y}`.
+
+Patterns:
+- `serpentine` (default)
+- `raster`
+- `random` (requires optional `seed` for reproducibility)
+- `center_out`
+
+Orders:
+- `row_major` (default)
+- `col_major`
+
+Returned fields:
+- `x`, `y`
+- `row`, `col`
+- `index`
+- `u`, `v`
+- `count`
 
 ## Conditions
 Structured condition operators:
@@ -300,7 +385,7 @@ vars:
   hv_values_v: {gen: {values: [0, 200, 400]}}
 steps:
   - for:
-      var: hv_v
+      bind: hv_v
       in: ${vars.hv_values_v}
       do:
         - set: {device: psu, name: voltage_v, value: ${hv_v}}

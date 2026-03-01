@@ -13,7 +13,9 @@ vars:
   sweep_stop_hz: ${freq_center_hz + 0.5 * sweep_step_hz * (n_steps - 1)}
 steps:
   - for:
-      var: freq_hz
+      bind:
+        value: freq_hz
+        index: freq_step_idx
       in:
         gen:
           linspace:
@@ -21,9 +23,6 @@ steps:
             stop: ${sweep_stop_hz}
             num: ${n_steps}
       do:
-        - assign:
-            freq_step_idx: ${__loop_index}
-
         - call:
             device: freq1
             action: set_frequency_hz

@@ -6,6 +6,7 @@ import queue
 import threading
 import time
 from dataclasses import dataclass
+from fnmatch import fnmatchcase
 from typing import Any, Callable
 
 import zmq
@@ -66,6 +67,39 @@ class _ProcessTask:
 class _ManagerTask:
     identity: bytes
     request: Json
+
+
+@dataclass(frozen=True)
+class MirroredRoute:
+    local_id: str
+    peer_id: str
+    remote_device_id: str
+    peer_router_rpc: str
+    rpc_timeout_ms: int
+    allow_device_actions: tuple[str, ...]
+    deny_device_actions: tuple[str, ...]
+    allow_lifecycle_ops: bool
+    allow_admin_ops: bool
+    origin_instance_id: str
+
+    def allows_device_action(self, action: str) -> bool:
+        text = str(action or "").strip()
+        if not text:
+            return False
+        for pattern in self.deny_device_actions:
+            if fnmatchcase(text, pattern):
+                return False
+        for pattern in self.allow_device_actions:
+            if fnmatchcase(text, pattern):
+                return True
+        return False
+
+
+@dataclass(frozen=True)
+class _MirroredTask:
+    identity: bytes
+    request: Json
+    route: MirroredRoute
 
 
 class _BaseWorker(threading.Thread):
@@ -599,6 +633,126 @@ class _DeviceWorker(_BaseWorker):
                 pass
         self._process_socks.clear()
 
+
+class _MirroredDeviceWorker(_BaseWorker):
+    def __init__(
+        self,
+        *,
+        route: MirroredRoute,
+        ctx: zmq.Context,
+        reply_queue: queue.Queue,
+        manager_rpc: str,
+        manager_pub: str,
+        manager_timeout_ms: int,
+    ) -> None:
+        super().__init__(
+            name=f"mirrored-rpc-{route.local_id}", ctx=ctx, reply_queue=reply_queue
+        )
+        self._route = route
+        self._manager_rpc = manager_rpc
+        self._manager_pub = manager_pub
+        self._manager_timeout_ms = int(manager_timeout_ms)
+        self._manager: ManagerClient | None = None
+        self._sock: zmq.Socket | None = None
+
+    def _ensure_sock(self) -> zmq.Socket:
+        if self._sock is None:
+            sock = self._ctx.socket(zmq.DEALER)
+            sock.setsockopt(zmq.LINGER, 0)
+            sock.setsockopt(zmq.RCVTIMEO, int(self._route.rpc_timeout_ms))
+            sock.setsockopt(zmq.SNDTIMEO, int(self._route.rpc_timeout_ms))
+            sock.connect(self._route.peer_router_rpc)
+            self._sock = sock
+        return self._sock
+
+    def _close_sock(self) -> None:
+        if self._sock is None:
+            return
+        try:
+            self._sock.close(0)
+        except Exception:
+            pass
+        self._sock = None
+
+    def _next_federation_meta(self, raw: object) -> Json:
+        hop_count = 0
+        origin_instance_id = self._route.origin_instance_id
+        if isinstance(raw, dict):
+            try:
+                hop_count = int(raw.get("hop_count", 0))
+            except Exception:
+                hop_count = 0
+            if isinstance(raw.get("origin_instance_id"), str) and str(
+                raw.get("origin_instance_id")
+            ).strip():
+                origin_instance_id = str(raw.get("origin_instance_id")).strip()
+        return {
+            "origin_instance_id": origin_instance_id,
+            "hop_count": hop_count + 1,
+        }
+
+    def _forward(self, task: _MirroredTask) -> Json:
+        sock = self._ensure_sock()
+        outbound = dict(task.request)
+        outbound["device_id"] = task.route.remote_device_id
+        outbound["federation"] = self._next_federation_meta(
+            task.request.get("federation")
+        )
+        sock.send(json_dumps(outbound))
+        raw = sock.recv()
+        resp = safe_json_loads(raw)
+        if not isinstance(resp, dict):
+            raise RuntimeError("invalid mirrored device response")
+        return resp
+
+    def _maybe_cache_capabilities(self, task: _MirroredTask, response: Json) -> None:
+        action = str(task.request.get("action", ""))
+        if action != "capabilities":
+            return
+        if not bool(response.get("ok")):
+            return
+        result = response.get("result")
+        if not isinstance(result, dict):
+            return
+        if self._manager is None:
+            return
+        try:
+            self._manager.call(
+                {
+                    "type": "federation.capabilities.update",
+                    "device_id": task.route.local_id,
+                    "capabilities": result,
+                },
+                timeout_ms=self._manager_timeout_ms,
+            )
+        except Exception:
+            pass
+
+    def run(self) -> None:
+        self._manager = ManagerClient(
+            ctx=self._ctx,
+            manager_rpc=self._manager_rpc,
+            manager_pub=self._manager_pub,
+            rpc_timeout_ms=self._manager_timeout_ms,
+            subscribe_telemetry=False,
+        )
+        while not self._stop_evt.is_set():
+            task = self._queue.get()
+            if task is None:
+                break
+            if not isinstance(task, _MirroredTask):
+                continue
+            try:
+                resp = self._forward(task)
+                self._maybe_cache_capabilities(task, resp)
+            except Exception as e:
+                self._close_sock()
+                resp = {"ok": False, "error": str(e)}
+            self._reply_queue.put((task.identity, resp))
+        if self._manager is not None:
+            self._manager.close()
+        self._close_sock()
+
 class DeviceRouter(ManagedProcessBase):
     def __init__(
         self,
@@ -608,6 +762,8 @@ class DeviceRouter(ManagedProcessBase):
         manager_pub: str | None = None,
         device_rpc_timeout_ms: int = 1500,
         interceptor_rpc_timeout_ms: int = 500,
+        federation_mirrors: list[Json] | None = None,
+        origin_instance_id: str | None = None,
         process_id: str | None = None,
         heartbeat_endpoint: str | None = None,
         heartbeat_period_s: float = 1.0,
@@ -624,6 +780,9 @@ class DeviceRouter(ManagedProcessBase):
         self._manager_pub = manager_pub or "tcp://127.0.0.1:6001"
         self._device_rpc_timeout_ms = int(device_rpc_timeout_ms)
         self._interceptor_rpc_timeout_ms = int(interceptor_rpc_timeout_ms)
+        self._origin_instance_id = (
+            str(origin_instance_id or "").strip() or str(process_id or "unknown")
+        )
         self._manager_helper = ManagerClientHelper(
             manager_rpc=self._manager_rpc,
             manager_pub=self._manager_pub,
@@ -645,9 +804,12 @@ class DeviceRouter(ManagedProcessBase):
         self._route_order = 0
 
         self._device_workers: dict[str, _DeviceWorker] = {}
+        self._mirrored_routes: dict[str, MirroredRoute] = {}
+        self._mirrored_workers: dict[str, _MirroredDeviceWorker] = {}
         self._process_workers: dict[str, _ProcessWorker] = {}
         self._manager_worker: _ManagerWorker | None = None
         self._reply_queue: queue.Queue = queue.Queue()
+        self._load_federation_mirrors(federation_mirrors)
 
     def _close_external(self) -> None:
         if self._external_rpc is None:
@@ -670,6 +832,8 @@ class DeviceRouter(ManagedProcessBase):
     def close(self) -> None:
         for worker in self._device_workers.values():
             worker.stop()
+        for worker in self._mirrored_workers.values():
+            worker.stop()
         for worker in self._process_workers.values():
             worker.stop()
         if self._manager_worker is not None:
@@ -677,6 +841,51 @@ class DeviceRouter(ManagedProcessBase):
         super().close()
         self._close_external()
         self._close_manager_sub()
+
+    def _load_federation_mirrors(self, items: list[Json] | None) -> None:
+        if items is None:
+            return
+        if not isinstance(items, list):
+            raise TypeError("federation_mirrors must be a list")
+        for idx, item in enumerate(items):
+            if not isinstance(item, dict):
+                raise TypeError(f"federation_mirrors[{idx}] must be an object")
+            local_id = str(item.get("local_id", "")).strip()
+            peer_id = str(item.get("peer_id", "")).strip()
+            remote_device_id = str(item.get("remote_device_id", "")).strip()
+            peer_router_rpc = str(item.get("peer_router_rpc", "")).strip()
+            if not local_id or not peer_id or not remote_device_id or not peer_router_rpc:
+                raise ValueError(
+                    "federation_mirrors entries require local_id, peer_id, "
+                    "remote_device_id, and peer_router_rpc"
+                )
+            if local_id in self._mirrored_routes:
+                raise ValueError(f"duplicate mirrored route for {local_id!r}")
+            allow_raw = item.get("allow_device_actions", ["*"])
+            deny_raw = item.get("deny_device_actions", [])
+            if not isinstance(allow_raw, list) or not all(
+                isinstance(v, str) and str(v).strip() for v in allow_raw
+            ):
+                raise TypeError("allow_device_actions must be a list[str]")
+            if not isinstance(deny_raw, list) or not all(
+                isinstance(v, str) and str(v).strip() for v in deny_raw
+            ):
+                raise TypeError("deny_device_actions must be a list[str]")
+            self._mirrored_routes[local_id] = MirroredRoute(
+                local_id=local_id,
+                peer_id=peer_id,
+                remote_device_id=remote_device_id,
+                peer_router_rpc=peer_router_rpc,
+                rpc_timeout_ms=int(item.get("rpc_timeout_ms", self._device_rpc_timeout_ms)),
+                allow_device_actions=tuple(str(v).strip() for v in allow_raw),
+                deny_device_actions=tuple(str(v).strip() for v in deny_raw),
+                allow_lifecycle_ops=bool(item.get("allow_lifecycle_ops", False)),
+                allow_admin_ops=bool(item.get("allow_admin_ops", False)),
+                origin_instance_id=(
+                    str(item.get("origin_instance_id", "")).strip()
+                    or self._origin_instance_id
+                ),
+            )
 
     def _ensure_manager_worker(self) -> _ManagerWorker:
         if self._manager_worker is None or not self._manager_worker.is_alive():
@@ -705,6 +914,22 @@ class DeviceRouter(ManagedProcessBase):
             )
             worker.start()
             self._device_workers[device_id] = worker
+        return worker
+
+    def _ensure_mirrored_worker(self, device_id: str) -> _MirroredDeviceWorker:
+        route = self._mirrored_routes[device_id]
+        worker = self._mirrored_workers.get(device_id)
+        if worker is None or not worker.is_alive():
+            worker = _MirroredDeviceWorker(
+                route=route,
+                ctx=self._ctx,
+                reply_queue=self._reply_queue,
+                manager_rpc=self._manager_rpc,
+                manager_pub=self._manager_pub,
+                manager_timeout_ms=self._device_rpc_timeout_ms,
+            )
+            worker.start()
+            self._mirrored_workers[device_id] = worker
         return worker
 
     def _ensure_process_worker(self, process_id: str) -> _ProcessWorker:
@@ -898,14 +1123,74 @@ class DeviceRouter(ManagedProcessBase):
             except Exception:
                 pass
 
+    def _send_external_response(self, identity: bytes, resp: Json) -> None:
+        if self._external_rpc is None:
+            return
+        self._external_rpc.send_multipart([identity, json_dumps(resp)])
+
+    @staticmethod
+    def _federation_hop_count(raw: object) -> int:
+        if not isinstance(raw, dict):
+            return 0
+        try:
+            return max(0, int(raw.get("hop_count", 0)))
+        except Exception:
+            return 0
+
+    def _dispatch_mirrored_command(
+        self,
+        identity: bytes,
+        req: Json,
+        *,
+        route: MirroredRoute,
+        action: str,
+    ) -> None:
+        hop_count = self._federation_hop_count(req.get("federation"))
+        if hop_count > 0:
+            self._send_external_response(
+                identity,
+                {
+                    "ok": False,
+                    "error": {
+                        "code": "federation_reexport_blocked",
+                        "message": (
+                            "mirrored devices cannot be re-exported to another peer"
+                        ),
+                    },
+                },
+            )
+            return
+        if not route.allows_device_action(action):
+            self._send_external_response(
+                identity,
+                {
+                    "ok": False,
+                    "error": {
+                        "code": "federation_acl_denied",
+                        "message": (
+                            f"federation policy denied mirrored command "
+                            f"{route.local_id!r}.{action}"
+                        ),
+                    },
+                },
+            )
+            return
+        task = _MirroredTask(identity=identity, request=req, route=route)
+        self._ensure_mirrored_worker(route.local_id).submit(task)
+
     def _dispatch_device_command(self, identity: bytes, req: Json) -> None:
         device_id = str(req.get("device_id", ""))
         action = str(req.get("action", ""))
         params = req.get("params", {})
         if not device_id or not action or not isinstance(params, dict):
             resp = {"ok": False, "error": "invalid command"}
-            if self._external_rpc is not None:
-                self._external_rpc.send_multipart([identity, json_dumps(resp)])
+            self._send_external_response(identity, resp)
+            return
+        mirrored_route = self._mirrored_routes.get(device_id)
+        if mirrored_route is not None:
+            self._dispatch_mirrored_command(
+                identity, req, route=mirrored_route, action=action
+            )
             return
 
         chain: list[CommandInterceptorRoute]
@@ -939,8 +1224,7 @@ class DeviceRouter(ManagedProcessBase):
         request = req.get("request")
         if not process_id or not isinstance(request, dict):
             resp = {"ok": False, "error": {"code": "invalid_process_rpc"}}
-            if self._external_rpc is not None:
-                self._external_rpc.send_multipart([identity, json_dumps(resp)])
+            self._send_external_response(identity, resp)
             return
         task = _ProcessTask(
             identity=identity,
@@ -964,7 +1248,7 @@ class DeviceRouter(ManagedProcessBase):
         req = safe_json_loads(payload_b)
         if not isinstance(req, dict):
             resp = {"ok": False, "error": "invalid request"}
-            self._external_rpc.send_multipart([identity, json_dumps(resp)])
+            self._send_external_response(identity, resp)
             return
 
         rtype = req.get("type")
@@ -976,7 +1260,7 @@ class DeviceRouter(ManagedProcessBase):
             return
         if rtype in {"command_interceptor.register", "command_interceptor.list"}:
             resp = self._handle_command_interceptor(req)
-            self._external_rpc.send_multipart([identity, json_dumps(resp)])
+            self._send_external_response(identity, resp)
             return
         if rtype == "process.rpc.advertise":
             process_id = str(req.get("process_id", ""))
@@ -1005,6 +1289,7 @@ class DeviceRouter(ManagedProcessBase):
                 "ok": True,
                 "result": {
                     "devices": len(self._device_endpoints),
+                    "mirrored_devices": len(self._mirrored_routes),
                     "processes": len(self._process_endpoints),
                     "routes": len(self._routes),
                 },

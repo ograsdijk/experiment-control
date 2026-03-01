@@ -19,15 +19,18 @@ import {
 } from "../features/runtime/helpers";
 import type {
   CommandInterceptorRoute,
+  DeviceStatus,
   FollowerRuleStatus,
   InterlockInterceptorStatus,
   ProcessStatus,
 } from "../types";
+import { DeviceNameInline } from "./DeviceNameInline";
 
 type Props = {
   opened: boolean;
   onClose: () => void;
   onRefresh: () => Promise<unknown> | void;
+  devices: ReadonlyArray<DeviceStatus>;
   processes: ReadonlyArray<ProcessStatus>;
   followerRulesByProcessId: Record<string, FollowerRuleStatus[]>;
   interlockStatusByProcessId: Record<string, InterlockInterceptorStatus[]>;
@@ -55,6 +58,7 @@ export function InterlocksModal({
   opened,
   onClose,
   onRefresh,
+  devices,
   processes,
   followerRulesByProcessId,
   interlockStatusByProcessId,
@@ -70,6 +74,10 @@ export function InterlocksModal({
 }: Props) {
   const [chainDeviceId, setChainDeviceId] = useState("");
   const [chainAction, setChainAction] = useState("");
+  const deviceById = useMemo(
+    () => new Map(devices.map((device) => [device.device_id, device])),
+    [devices]
+  );
   const processById = useMemo(
     () => new Map(processes.map((process) => [process.process_id, process])),
     [processes]
@@ -90,9 +98,17 @@ export function InterlocksModal({
       .sort((a, b) => a.localeCompare(b))
       .map((deviceId) => ({
         value: deviceId,
-        label: deviceId === "*" ? "* (wildcard)" : deviceId,
+        label:
+          deviceId === "*"
+            ? "* (wildcard)"
+            : `${
+                deviceById.get(deviceId)?.is_remote ||
+                deviceById.get(deviceId)?.source_kind === "federated"
+                  ? "⇄ "
+                  : ""
+              }${deviceId}`,
       }));
-  }, [commandInterceptorRoutes]);
+  }, [commandInterceptorRoutes, deviceById]);
   const chainActionOptions = useMemo(() => {
     const selectedDevice = chainDeviceId.trim();
     if (!selectedDevice) {
@@ -349,7 +365,13 @@ export function InterlocksModal({
                           {route.process_id}
                         </Badge>
                         <Text size="xs" c="dimmed">
-                          {route.device_id}.{route.action}
+                          <DeviceNameInline
+                            deviceId={route.device_id}
+                            device={deviceById.get(route.device_id) ?? null}
+                            size="xs"
+                            c="dimmed"
+                            suffix={`.${route.action}`}
+                          />
                         </Text>
                       </Group>
                     );
@@ -420,8 +442,15 @@ export function InterlocksModal({
                               {entry.route.process_id}
                             </Badge>
                             <Text size="xs" c="dimmed">
-                              route #{entry.route.order} ({entry.route.device_id}.
-                              {entry.route.action})
+                              route #{entry.route.order} (
+                              <DeviceNameInline
+                                deviceId={entry.route.device_id}
+                                device={deviceById.get(entry.route.device_id) ?? null}
+                                size="xs"
+                                c="dimmed"
+                                suffix={`.${entry.route.action}`}
+                              />
+                              )
                             </Text>
                           </Group>
                           {entry.matchedFollowerRules.length > 0 && (
@@ -492,7 +521,15 @@ export function InterlocksModal({
                   </Stack>
                 ) : (
                   <Text size="xs" c="dimmed">
-                    No matching interceptors for {chainDeviceId.trim()}.{chainAction.trim()}.
+                    No matching interceptors for{" "}
+                    <DeviceNameInline
+                      deviceId={chainDeviceId.trim()}
+                      device={deviceById.get(chainDeviceId.trim()) ?? null}
+                      size="xs"
+                      c="dimmed"
+                      suffix={`.${chainAction.trim()}`}
+                    />
+                    .
                   </Text>
                 )
               ) : (
@@ -625,7 +662,15 @@ export function InterlocksModal({
                                 )}
                               </Group>
                               <Text size="xs" c="dimmed">
-                                Trigger: {rule.device_id}.{rule.trigger_action} (
+                                Trigger:{" "}
+                                <DeviceNameInline
+                                  deviceId={rule.device_id}
+                                  device={deviceById.get(rule.device_id) ?? null}
+                                  size="xs"
+                                  c="dimmed"
+                                  suffix={`.${rule.trigger_action}`}
+                                />{" "}
+                                (
                                 {rule.trigger_param})
                               </Text>
                               {hasRangeGuard && (
@@ -642,8 +687,14 @@ export function InterlocksModal({
                               )}
                               {hasStepGuard && (
                                 <Text size="xs" c="dimmed">
-                                  Current source: {rule.device_id}.
-                                  {rule.current_freq_signal || "telemetry"}
+                                  Current source:{" "}
+                                  <DeviceNameInline
+                                    deviceId={rule.device_id}
+                                    device={deviceById.get(rule.device_id) ?? null}
+                                    size="xs"
+                                    c="dimmed"
+                                    suffix={`.${rule.current_freq_signal || "telemetry"}`}
+                                  />
                                 </Text>
                               )}
                               {effects.length > 0 && (
@@ -754,7 +805,14 @@ export function InterlocksModal({
                                         </Badge>
                                       </Group>
                                       <Text size="xs" c="dimmed">
-                                        Match: {rule.match.device_id}.{rule.match.action}
+                                        Match:{" "}
+                                        <DeviceNameInline
+                                          deviceId={rule.match.device_id}
+                                          device={deviceById.get(rule.match.device_id) ?? null}
+                                          size="xs"
+                                          c="dimmed"
+                                          suffix={`.${rule.match.action}`}
+                                        />
                                       </Text>
                                       <Text size="xs" c="dimmed">
                                         Telemetry bindings: {rule.telemetry.length}

@@ -10,6 +10,7 @@
   Textarea,
 } from "@mantine/core";
 import { IconStar, IconStarFilled } from "@tabler/icons-react";
+import type { ReactNode } from "react";
 import { ParamInput } from "./ParamInput";
 import type { CapabilityMember } from "../types";
 
@@ -18,7 +19,7 @@ type CapabilityParam = NonNullable<CapabilityMember["params"]>[number];
 type Props = {
   opened: boolean;
   onClose: () => void;
-  title: string;
+  title: ReactNode;
   capabilities: ReadonlyArray<CapabilityMember>;
   commandAction: string;
   onActionChange: (value: string | null) => void;

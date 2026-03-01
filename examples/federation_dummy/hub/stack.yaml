@@ -1,0 +1,36 @@
+version: 1
+instance_id: federation-dummy-hub
+
+manager:
+  bind_host: 127.0.0.1
+  external:
+    rpc_port: 7600
+    pub_port: 7601
+  internal_ports:
+    registry: 7655
+    rpc: 7602
+    heartbeat_base: 7700
+    event_base: 7800
+  auto_connect_on_register: true
+
+devices:
+  dirs:
+    - devices
+  glob: "*.yaml"
+
+federation:
+  enabled: true
+  peers:
+    - peer_id: leaf
+      router_rpc: tcp://127.0.0.1:7300
+      manager_pub: tcp://127.0.0.1:7301
+      warm_capabilities_on_startup: true
+      mirror_devices:
+        - local_id: leaf.dummy1
+          remote_device_id: dummy1
+
+startup:
+  start_devices: true
+  wait_for_registered: true
+  wait_for_online: true
+  timeout_s: 15.0

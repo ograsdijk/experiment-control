@@ -18,6 +18,8 @@ from typing import Any, Callable
 
 import zmq
 
+from .federation import FederationConfig
+from .federation.hub import FederationHub
 from .utils.config_parsing import (
     ConfigError,
     normalize_list,
@@ -492,6 +494,7 @@ class Manager:
         self,
         *,
         instance_id: str | None = None,
+        federation_config: FederationConfig | None = None,
         registry_bind: str = "tcp://127.0.0.1:5555",
         internal_rpc_bind: str = "tcp://127.0.0.1:6002",
         external_rpc_bind: str = "tcp://127.0.0.1:6000",
@@ -554,6 +557,7 @@ class Manager:
         self._telemetry_stale_s = telemetry_stale_s
         self._device_rpc_timeout_ms = device_rpc_timeout_ms
         self._interceptor_rpc_timeout_ms = int(interceptor_rpc_timeout_ms)
+        self._federation_config = federation_config or FederationConfig()
 
         self._process_hb_bind_base = process_hb_bind_base
         self._process_hb_connected: set[str] = set()
@@ -598,6 +602,14 @@ class Manager:
         self._poller.register(self._internal_rpc, zmq.POLLIN)
         self._poller.register(self._process_hb_sub, zmq.POLLIN)
         self._poller.register(self._process_data_sub, zmq.POLLIN)
+
+        self._federation_hub = FederationHub(
+            ctx=self._ctx,
+            poller=self._poller,
+            manager=self,
+            config=self._federation_config,
+            instance_id=self._instance_id,
+        )
 
         self._router_process_id = "device_router"
         self._ensure_router_handle()
@@ -813,6 +825,8 @@ class Manager:
             "external_rpc_bind": self._external_rpc_bind,
             "device_rpc_timeout_ms": self._device_rpc_timeout_ms,
             "interceptor_rpc_timeout_ms": self._interceptor_rpc_timeout_ms,
+            "federation_mirrors": self._federation_hub.mirror_route_entries(),
+            "origin_instance_id": self._instance_id,
         }
         argv = [
             sys.executable,
@@ -1587,6 +1601,7 @@ class Manager:
         TimeoutError if registration/online wait exceeds timeout_s.
         """
         self._ensure_router_running(timeout_s=timeout_s, poll_ms=poll_ms)
+        self._federation_hub.activate()
         if wait_processes_running is None:
             wait_processes_running = start_processes
 
@@ -1712,6 +1727,7 @@ class Manager:
             self._handle_process_pub()
         if events.get(self._process_data_sub) == zmq.POLLIN:
             self._handle_process_data_pub()
+        self._federation_hub.handle_poll_events(events)
 
         if events.get(self._internal_rpc) == zmq.POLLIN:
             self._handle_internal_rpc()
@@ -1726,6 +1742,7 @@ class Manager:
         - broadcasts state updates to external PUB
         """
         self._ensure_router_running(timeout_s=5.0, poll_ms=poll_ms)
+        self._federation_hub.activate()
         while not self._stop:
             self._pump_once(poll_ms)
 
@@ -1739,6 +1756,7 @@ class Manager:
         self._shutdown_requested = True
 
     def _shutdown_cleanup(self) -> None:
+        self._federation_hub.close()
         for handle in self._devices.values():
             try:
                 self.stop_driver(handle.spec.device_id)
@@ -2732,6 +2750,9 @@ class Manager:
                 raise TypeError("params must be a dict")
             handle = self._devices.get(device_id)
             if handle is None:
+                fed_resp = self._federation_hub.forward_device_request(req)
+                if fed_resp is not None:
+                    return fed_resp
                 return {"ok": False, "error": f"Unknown device_id {device_id!r}"}
             if self._driver_is_stopped(handle) or handle.rpc_endpoint is None:
                 return {"ok": False, "error": "driver not running"}
@@ -2751,14 +2772,53 @@ class Manager:
                 params=new_cmd.get("params", params),
             )
 
+        if rtype == "federation.capabilities.update":
+            device_id = str(req.get("device_id", ""))
+            capabilities = req.get("capabilities")
+            if not device_id:
+                return {
+                    "ok": False,
+                    "error": {
+                        "code": "invalid_federation_update",
+                        "message": "missing device_id",
+                    },
+                }
+            if not isinstance(capabilities, dict):
+                return {
+                    "ok": False,
+                    "error": {
+                        "code": "invalid_federation_update",
+                        "message": "capabilities must be a dict",
+                    },
+                }
+            try:
+                self._federation_hub.update_capabilities(device_id, capabilities)
+            except KeyError:
+                return {
+                    "ok": False,
+                    "error": {
+                        "code": "unknown_device",
+                        "message": f"Unknown mirrored device_id {device_id!r}",
+                    },
+                }
+            return {"ok": True, "result": {"device_id": device_id}}
+
         if rtype == "device.get_status":
             device_id = str(req["device_id"])
+            if self._federation_hub.is_mirrored_device(device_id):
+                return {
+                    "ok": True,
+                    "result": self._federation_hub.device_status_snapshot(device_id),
+                }
             return {"ok": True, "result": self._device_status_snapshot(device_id)}
         if rtype == "device.list_status":
             return {"ok": True, "result": self._list_devices_status_snapshot()}
 
         if rtype == "device.driver.start":
             device_id = str(req["device_id"])
+            fed_resp = self._federation_hub.forward_device_request(req)
+            if fed_resp is not None:
+                return fed_resp
             handle = self._devices.get(device_id)
             if handle is None:
                 return {"ok": False, "error": f"Unknown device_id {device_id!r}"}
@@ -2769,6 +2829,9 @@ class Manager:
         if rtype == "device.driver.stop":
             device_id = str(req["device_id"])
             force = bool(req.get("force", False))
+            fed_resp = self._federation_hub.forward_device_request(req)
+            if fed_resp is not None:
+                return fed_resp
             handle = self._devices.get(device_id)
             if handle is None:
                 return {"ok": False, "error": f"Unknown device_id {device_id!r}"}
@@ -2779,17 +2842,26 @@ class Manager:
         if rtype == "device.driver.restart":
             device_id = str(req["device_id"])
             force = bool(req.get("force", False))
+            fed_resp = self._federation_hub.forward_device_request(req)
+            if fed_resp is not None:
+                return fed_resp
             self.restart_driver(device_id, force=force)
             return {"ok": True, "result": {"device_id": device_id}}
         if rtype == "device.recover":
             device_id = str(req["device_id"])
             reconnect = bool(req.get("reconnect", True))
             force = bool(req.get("force", False))
+            fed_resp = self._federation_hub.forward_device_request(req)
+            if fed_resp is not None:
+                return fed_resp
             self.recover_device(device_id, reconnect=reconnect, force=force)
             return {"ok": True, "result": {"device_id": device_id}}
 
         if rtype == "device.connect":
             device_id = str(req["device_id"])
+            fed_resp = self._federation_hub.forward_device_request(req)
+            if fed_resp is not None:
+                return fed_resp
             resp = self.connect_device(device_id)
             self._publish_manager_event(
                 "manager.device.connect_sent",
@@ -2802,6 +2874,9 @@ class Manager:
             return {"ok": True, "result": resp}
         if rtype == "device.disconnect":
             device_id = str(req["device_id"])
+            fed_resp = self._federation_hub.forward_device_request(req)
+            if fed_resp is not None:
+                return fed_resp
             resp = self.disconnect_device(device_id)
             self._publish_manager_event(
                 "manager.device.disconnect_sent",
@@ -2815,6 +2890,9 @@ class Manager:
 
         if rtype == "device.config.get":
             device_id = str(req["device_id"])
+            fed_cfg = self._federation_hub.device_config_get(device_id)
+            if fed_cfg is not None:
+                return {"ok": True, "result": fed_cfg}
             handle = self._devices.get(device_id)
             if handle is None:
                 return {"ok": False, "error": f"Unknown device_id {device_id!r}"}
@@ -2824,6 +2902,8 @@ class Manager:
                 self._device_config_payload(handle)
                 for handle in self._devices.values()
             ]
+            configs.extend(self._federation_hub.device_config_list())
+            configs.sort(key=lambda item: str(item.get("device_id", "")))
             return {"ok": True, "result": configs}
 
         if rtype == "process.list_status":
@@ -3213,6 +3293,7 @@ class Manager:
                     "manager.liveness",
                     {"device_id": dev_id, "liveness": liveness, "age_s": age},
                 )
+        self._federation_hub.check_timeouts(now_mono)
 
         # Telemetry staleness: driver emits OK/BAD/MISSING; manager derives STALE.
         # Mark staleness per-signal so partial updates do not mask old values.
@@ -3421,8 +3502,14 @@ class Manager:
                     "rpc_endpoint": h.rpc_endpoint,
                     "pub_endpoint": h.pub_endpoint,
                     "capabilities": h.capabilities,
+                    "source_kind": "local",
+                    "is_remote": False,
+                    "owner_peer_id": None,
+                    "remote_device_id": None,
                 }
             )
+        out.extend(self._federation_hub.list_devices_snapshot())
+        out.sort(key=lambda item: str(item.get("device_id", "")))
         return out
 
     def _get_device_telemetry_snapshot(self, device_id: str) -> Json:
@@ -3441,6 +3528,8 @@ class Manager:
         return snap
 
     def _device_status_snapshot(self, device_id: str) -> Json:
+        if self._federation_hub.is_mirrored_device(device_id):
+            return self._federation_hub.device_status_snapshot(device_id)
         handle = self._devices.get(device_id)
         if handle is None:
             raise KeyError(f"Unknown device_id {device_id!r}")
@@ -3490,10 +3579,15 @@ class Manager:
                 "last_exit_code": handle.driver_last_exit_code,
                 "last_error": handle.driver_last_error,
             },
+            "source_kind": "local",
+            "is_remote": False,
+            "owner_peer_id": None,
+            "remote_device_id": None,
         }
 
     def _list_devices_status_snapshot(self) -> list[Json]:
-        return [self._device_status_snapshot(did) for did in sorted(self._devices)]
+        device_ids = sorted(set(self._devices) | set(self._federation_hub.mirrored_device_ids()))
+        return [self._device_status_snapshot(did) for did in device_ids]
 
     def _telemetry_schema_list(self) -> Json:
         devices: list[Json] = []
@@ -3522,8 +3616,14 @@ class Manager:
                     "signals": signals,
                     "dtypes": dtypes,
                     "units": units,
+                    "source_kind": "local",
+                    "is_remote": False,
+                    "owner_peer_id": None,
+                    "remote_device_id": None,
                 }
             )
+        devices.extend(self._federation_hub.telemetry_schema_devices())
+        devices.sort(key=lambda item: str(item.get("device_id", "")))
 
         ts = {"t_wall": time.time(), "t_mono": time.monotonic()}
         return {"schema_version": 1, "generated_ts": ts, "devices": devices}
@@ -3916,6 +4016,10 @@ class Manager:
             "run_meta_calls": run_meta_calls_to_json(
                 list(handle.spec.run_meta_calls or [])
             ),
+            "source_kind": "local",
+            "is_remote": False,
+            "owner_peer_id": None,
+            "remote_device_id": None,
         }
 
     def _serialize_spec_yaml(self, spec: DeviceSpec) -> str:

@@ -43,7 +43,7 @@ class WaitUntilStep:
 
 @dataclass(frozen=True)
 class ForStep:
-    var: str
+    bind: dict[str, str]
     in_expr: Any
     body: list["Step"]
 
@@ -169,12 +169,27 @@ def _parse_step(raw: Any) -> Step:
         return WaitUntilStep(raw=w)
     if "for" in obj:
         f = _require_dict(obj["for"], name="for")
-        var = str(f.get("var", ""))
-        if not var:
-            raise TypeError("for.var is required")
+        bind_raw = f.get("bind")
+        bind: dict[str, str] = {}
+        if isinstance(bind_raw, str):
+            name = str(bind_raw).strip()
+            if not name:
+                raise TypeError("for.bind must not be empty")
+            bind["value"] = name
+        elif isinstance(bind_raw, dict):
+            for raw_key, raw_value in bind_raw.items():
+                key = str(raw_key).strip()
+                value = str(raw_value).strip()
+                if not key or not value:
+                    raise TypeError("for.bind entries must map non-empty names")
+                bind[key] = value
+        else:
+            raise TypeError("for.bind is required")
+        if not bind:
+            raise TypeError("for.bind must not be empty")
         in_expr = f.get("in")
         body = _parse_steps(f.get("do", []))
-        return ForStep(var=var, in_expr=in_expr, body=body)
+        return ForStep(bind=bind, in_expr=in_expr, body=body)
     if "repeat" in obj:
         rep = _require_dict(obj["repeat"], name="repeat")
         times = rep.get("times", 1)
