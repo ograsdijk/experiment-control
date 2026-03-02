@@ -17,7 +17,7 @@ type YamlToken = {
 type YamlPreviewProps = {
   text: string;
   colorScheme: "light" | "dark";
-  height?: number;
+  height?: number | string;
   scrollable?: boolean;
 };
 
@@ -194,5 +194,5 @@ export function YamlPreview({
   if (!scrollable) {
     return content;
   }
-  return <ScrollArea h={height}>{content}</ScrollArea>;
+  return <ScrollArea h={height as never}>{content}</ScrollArea>;
 }

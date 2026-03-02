@@ -1,12 +1,31 @@
-import { ActionIcon, Badge, Card, Group, ScrollArea, Stack, Text } from "@mantine/core";
-import { IconChevronDown, IconChevronRight } from "@tabler/icons-react";
+import { ActionIcon, Badge, Card, Group, Menu, ScrollArea, Stack, Text } from "@mantine/core";
+import {
+  IconArrowDownRight,
+  IconArrowDown,
+  IconArrowUp,
+  IconChevronDown,
+  IconChevronRight,
+  IconCopy,
+  IconPlus,
+  IconTrash,
+} from "@tabler/icons-react";
 import { useEffect, useMemo, useState } from "react";
 import {
   buildSequencerOutlineMetadata,
   buildSequencerStepOutline,
   flattenSequencerStepOutline,
 } from "../features/sequencer/outline";
-import { applyEditedVars } from "../features/sequencer/editing";
+import {
+  applyEditedVars,
+  deleteStep,
+  duplicateStep,
+  getChildInsertionLine,
+  insertStepBelow,
+  insertStepInside,
+  listChildInsertionTargets,
+  moveStepDown,
+  moveStepUp,
+} from "../features/sequencer/editing";
 import type { SequencerStepOutlineNode } from "../features/sequencer/types";
 import type { CapabilityMember } from "../types";
 import { AdaptiveStepInspector } from "./AdaptiveStepInspector";
@@ -47,7 +66,9 @@ function kindColor(kind: string): string {
 }
 
 function isEditableStep(node: SequencerStepOutlineNode): boolean {
-  return Boolean(node.callDetail || node.sleepDetail || node.repeatDetail);
+  return Boolean(
+    node.callDetail || node.sleepDetail || node.repeatDetail || node.forDetail
+  );
 }
 
 type OutlineRowProps = {
@@ -57,6 +78,23 @@ type OutlineRowProps = {
   onSelect: (id: string) => void;
   collapsedById: Record<string, boolean>;
   onToggleCollapse: (id: string) => void;
+  onDuplicate: (node: SequencerStepOutlineNode) => void;
+  onDelete: (node: SequencerStepOutlineNode) => void;
+  onInsertBelow: (
+    node: SequencerStepOutlineNode,
+    kind: "call" | "sleep" | "repeat"
+  ) => void;
+  onInsertChild: (
+    node: SequencerStepOutlineNode,
+    kind: "call" | "sleep" | "repeat",
+    containerKey: "do" | "then" | "else"
+  ) => void;
+  siblingInfoById: Record<
+    string,
+    { prev: SequencerStepOutlineNode | null; next: SequencerStepOutlineNode | null }
+  >;
+  onMoveUp: (node: SequencerStepOutlineNode) => void;
+  onMoveDown: (node: SequencerStepOutlineNode) => void;
 };
 
 function OutlineRow({
@@ -66,10 +104,19 @@ function OutlineRow({
   onSelect,
   collapsedById,
   onToggleCollapse,
+  onDuplicate,
+  onDelete,
+  onInsertBelow,
+  onInsertChild,
+  siblingInfoById,
+  onMoveUp,
+  onMoveDown,
 }: OutlineRowProps) {
   const selected = node.id === selectedId;
   const collapsible = node.children.length > 0;
   const collapsed = collapsible ? Boolean(collapsedById[node.id]) : false;
+  const childTargets = listChildInsertionTargets(node);
+  const siblingInfo = siblingInfoById[node.id] ?? { prev: null, next: null };
   return (
     <>
       <div
@@ -142,6 +189,116 @@ function OutlineRow({
             </Text>
           </Stack>
         </button>
+        <Group gap={4} wrap="nowrap" style={{ alignSelf: "center", flexShrink: 0 }}>
+          <ActionIcon
+            size="sm"
+            variant="subtle"
+            color="gray"
+            aria-label="Move step up"
+            disabled={!siblingInfo.prev}
+            onClick={(event) => {
+              event.stopPropagation();
+              onMoveUp(node);
+            }}
+          >
+            <IconArrowUp size={14} />
+          </ActionIcon>
+          <ActionIcon
+            size="sm"
+            variant="subtle"
+            color="gray"
+            aria-label="Move step down"
+            disabled={!siblingInfo.next}
+            onClick={(event) => {
+              event.stopPropagation();
+              onMoveDown(node);
+            }}
+          >
+            <IconArrowDown size={14} />
+          </ActionIcon>
+          <Menu withinPortal position="bottom-end" withArrow shadow="md" zIndex={1000}>
+            <Menu.Target>
+              <ActionIcon
+                size="sm"
+                variant="subtle"
+                color="gray"
+                aria-label="Insert step below"
+              >
+                <IconPlus size={14} />
+              </ActionIcon>
+            </Menu.Target>
+            <Menu.Dropdown>
+              <Menu.Item
+                onClick={() => onInsertBelow(node, "call")}
+              >
+                Insert call below
+              </Menu.Item>
+              <Menu.Item
+                onClick={() => onInsertBelow(node, "sleep")}
+              >
+                Insert sleep below
+              </Menu.Item>
+              <Menu.Item
+                onClick={() => onInsertBelow(node, "repeat")}
+              >
+                Insert repeat below
+              </Menu.Item>
+            </Menu.Dropdown>
+          </Menu>
+          {childTargets.length > 0 ? (
+            <Menu withinPortal position="bottom-end" withArrow shadow="md" zIndex={1000}>
+              <Menu.Target>
+                <ActionIcon
+                  size="sm"
+                  variant="subtle"
+                  color="blue"
+                  aria-label="Insert step inside"
+                >
+                  <IconArrowDownRight size={14} />
+                </ActionIcon>
+              </Menu.Target>
+              <Menu.Dropdown>
+                {childTargets.map((target) => (
+                  <div key={target.key}>
+                    <Menu.Item onClick={() => onInsertChild(node, "call", target.key)}>
+                      Insert call in {target.label}
+                    </Menu.Item>
+                    <Menu.Item onClick={() => onInsertChild(node, "sleep", target.key)}>
+                      Insert sleep in {target.label}
+                    </Menu.Item>
+                    <Menu.Item onClick={() => onInsertChild(node, "repeat", target.key)}>
+                      Insert repeat in {target.label}
+                    </Menu.Item>
+                  </div>
+                ))}
+              </Menu.Dropdown>
+            </Menu>
+          ) : null}
+          <ActionIcon
+            size="sm"
+            variant="subtle"
+            color="gray"
+            aria-label="Duplicate step"
+            onClick={(event) => {
+              event.stopPropagation();
+              onDuplicate(node);
+            }}
+          >
+            <IconCopy size={14} />
+          </ActionIcon>
+          <ActionIcon
+            size="sm"
+            variant="subtle"
+            color="red"
+            aria-label="Delete step"
+            onClick={(event) => {
+              event.stopPropagation();
+              onDelete(node);
+            }}
+          >
+            <IconTrash size={14} />
+          </ActionIcon>
+        </Group>
       </div>
       {!collapsed &&
         node.children.map((child) => (
@@ -153,6 +310,13 @@ function OutlineRow({
             onSelect={onSelect}
             collapsedById={collapsedById}
             onToggleCollapse={onToggleCollapse}
+            onDuplicate={onDuplicate}
+            onDelete={onDelete}
+            onInsertBelow={onInsertBelow}
+            onInsertChild={onInsertChild}
+            siblingInfoById={siblingInfoById}
+            onMoveUp={onMoveUp}
+            onMoveDown={onMoveDown}
           />
         ))}
     </>
@@ -233,6 +397,30 @@ function MetadataSection({
   );
 }
 
+function buildSiblingInfoMap(
+  nodes: SequencerStepOutlineNode[]
+): Record<string, { prev: SequencerStepOutlineNode | null; next: SequencerStepOutlineNode | null }> {
+  const out: Record<
+    string,
+    { prev: SequencerStepOutlineNode | null; next: SequencerStepOutlineNode | null }
+  > = {};
+
+  const visit = (siblings: SequencerStepOutlineNode[]) => {
+    siblings.forEach((node, index) => {
+      out[node.id] = {
+        prev: index > 0 ? siblings[index - 1] : null,
+        next: index < siblings.length - 1 ? siblings[index + 1] : null,
+      };
+      if (node.children.length > 0) {
+        visit(node.children);
+      }
+    });
+  };
+
+  visit(nodes);
+  return out;
+}
+
 export function SequencerOutlinePane({
   yamlText,
   onYamlTextChange,
@@ -248,22 +436,53 @@ export function SequencerOutlinePane({
     () => flattenSequencerStepOutline(outline),
     [outline]
   );
+  const siblingInfoById = useMemo(() => buildSiblingInfoMap(outline), [outline]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [collapsedById, setCollapsedById] = useState<Record<string, boolean>>({});
   const [outlineCollapsed, setOutlineCollapsed] = useState(false);
   const [metadataCollapsed, setMetadataCollapsed] = useState(false);
+  const [pendingSelection, setPendingSelection] = useState<{
+    line: number;
+    kind: string | null;
+    mode: "exact" | "closest";
+  } | null>(null);
 
   useEffect(() => {
     if (flatOutline.length <= 0) {
       if (selectedId !== null) {
         setSelectedId(null);
       }
+      if (pendingSelection !== null) {
+        setPendingSelection(null);
+      }
+      return;
+    }
+    if (pendingSelection) {
+      let nextNode: SequencerStepOutlineNode | null = null;
+      if (pendingSelection.mode === "exact") {
+        nextNode =
+          flatOutline.find(
+            (node) =>
+              node.line === pendingSelection.line &&
+              (!pendingSelection.kind || node.kind === pendingSelection.kind)
+          ) ?? null;
+      }
+      if (!nextNode) {
+        nextNode =
+          flatOutline.find((node) => node.line >= pendingSelection.line) ??
+          flatOutline[flatOutline.length - 1] ??
+          null;
+      }
+      if (nextNode && nextNode.id !== selectedId) {
+        setSelectedId(nextNode.id);
+      }
+      setPendingSelection(null);
       return;
     }
     if (!selectedId || !flatOutline.some((node) => node.id === selectedId)) {
       setSelectedId(flatOutline[0].id);
     }
-  }, [flatOutline, selectedId]);
+  }, [flatOutline, selectedId, pendingSelection]);
 
   useEffect(() => {
     if (flatOutline.length <= 0) {
@@ -286,9 +505,100 @@ export function SequencerOutlinePane({
       ? null
       : flatOutline.find((node) => node.id === selectedId) ?? null;
 
+  const handleDuplicateStep = (node: SequencerStepOutlineNode) => {
+    setPendingSelection({
+      line: node.endLine + 1,
+      kind: node.kind,
+      mode: "exact",
+    });
+    onYamlTextChange(duplicateStep(yamlText, node));
+  };
+
+  const handleDeleteStep = (node: SequencerStepOutlineNode) => {
+    setPendingSelection({
+      line: node.line,
+      kind: null,
+      mode: "closest",
+    });
+    onYamlTextChange(deleteStep(yamlText, node));
+  };
+
+  const handleInsertBelow = (
+    node: SequencerStepOutlineNode,
+    kind: "call" | "sleep" | "repeat"
+  ) => {
+    setPendingSelection({
+      line: node.endLine + 1,
+      kind,
+      mode: "exact",
+    });
+    onYamlTextChange(insertStepBelow(yamlText, node, kind));
+  };
+
+  const handleInsertChild = (
+    node: SequencerStepOutlineNode,
+    kind: "call" | "sleep" | "repeat",
+    containerKey: "do" | "then" | "else"
+  ) => {
+    const insertionLine = getChildInsertionLine(node, containerKey);
+    setPendingSelection({
+      line: insertionLine ?? node.line + 1,
+      kind,
+      mode: insertionLine ? "exact" : "closest",
+    });
+    setCollapsedById((prev) => ({
+      ...prev,
+      [node.id]: false,
+    }));
+    onYamlTextChange(insertStepInside(yamlText, node, kind, containerKey));
+  };
+
+  const handleMoveUp = (node: SequencerStepOutlineNode) => {
+    const previousSibling = siblingInfoById[node.id]?.prev;
+    if (!previousSibling) {
+      return;
+    }
+    setPendingSelection({
+      line: previousSibling.line,
+      kind: node.kind,
+      mode: "exact",
+    });
+    onYamlTextChange(moveStepUp(yamlText, node, previousSibling));
+  };
+
+  const handleMoveDown = (node: SequencerStepOutlineNode) => {
+    const nextSibling = siblingInfoById[node.id]?.next;
+    if (!nextSibling) {
+      return;
+    }
+    setPendingSelection({
+      line: nextSibling.line,
+      kind: node.kind,
+      mode: "exact",
+    });
+    onYamlTextChange(moveStepDown(yamlText, node, nextSibling));
+  };
+
   return (
-    <Card radius="md" p="sm" style={{ border: "1px solid var(--card-border)" }}>
-      <Stack gap="sm">
+    <Card
+      radius="md"
+      p="sm"
+      style={{
+        border: "1px solid var(--card-border)",
+        display: "flex",
+        flexDirection: "column",
+        flex: outlineCollapsed ? "0 0 auto" : "1 1 auto",
+        width: "100%",
+        minHeight: 0,
+      }}
+    >
+      <Stack
+        gap="sm"
+        style={{
+          flex: outlineCollapsed ? "0 0 auto" : "1 1 auto",
+          minHeight: 0,
+        }}
+      >
         <Group justify="space-between" align="center">
           <Stack gap={2}>
             <Text size="sm" fw={600}>
@@ -296,7 +606,7 @@ export function SequencerOutlinePane({
             </Text>
             <Text size="xs" c="dimmed">
               Visual view of the current YAML with basic editing for variables,
-              call, sleep, and repeat
+              call, sleep, repeat, and for
             </Text>
           </Stack>
           <ActionIcon
@@ -377,12 +687,20 @@ export function SequencerOutlinePane({
                 display: "grid",
                 gridTemplateColumns: "minmax(220px, 0.9fr) minmax(0, 1.1fr)",
                 gap: 12,
+                flex: 1,
+                minHeight: 0,
               }}
             >
               <Card
                 radius="sm"
                 p="xs"
-                style={{ border: "1px solid var(--card-border)", minHeight: 260 }}
+                style={{
+                  border: "1px solid var(--card-border)",
+                  minHeight: 0,
+                  height: "100%",
+                  display: "flex",
+                  flexDirection: "column",
+                }}
               >
                 {outline.length <= 0 ? (
                   <Text size="xs" c="dimmed">
@@ -390,7 +708,7 @@ export function SequencerOutlinePane({
                     outline.
                   </Text>
                 ) : (
-                  <ScrollArea h={260}>
+                  <ScrollArea style={{ flex: 1, minHeight: 0 }}>
                     <Stack gap={6}>
                       {outline.map((node) => (
                         <OutlineRow
@@ -406,6 +724,13 @@ export function SequencerOutlinePane({
                               [id]: !Boolean(prev[id]),
                             }))
                           }
+                          onDuplicate={handleDuplicateStep}
+                          onDelete={handleDeleteStep}
+                          onInsertBelow={handleInsertBelow}
+                          onInsertChild={handleInsertChild}
+                          siblingInfoById={siblingInfoById}
+                          onMoveUp={handleMoveUp}
+                          onMoveDown={handleMoveDown}
                         />
                       ))}
                     </Stack>
@@ -416,14 +741,20 @@ export function SequencerOutlinePane({
               <Card
                 radius="sm"
                 p="xs"
-                style={{ border: "1px solid var(--card-border)", minHeight: 260 }}
+                style={{
+                  border: "1px solid var(--card-border)",
+                  minHeight: 0,
+                  height: "100%",
+                  display: "flex",
+                  flexDirection: "column",
+                }}
               >
                 {!selectedStep ? (
                   <Text size="xs" c="dimmed">
                     Select a step to inspect it.
                   </Text>
                 ) : (
-                  <ScrollArea h={260}>
+                  <ScrollArea style={{ flex: 1, minHeight: 0 }}>
                     <Stack gap="sm">
                       <Group gap="xs" wrap="wrap">
                         <Badge

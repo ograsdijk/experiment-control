@@ -108,7 +108,7 @@ export function LoopStepInspector(props: Props) {
       <SectionCard title="Iterable">
         <Group gap={6} wrap="wrap">
           <Badge size="xs" variant="light" color="cyan">
-            kind
+            source
           </Badge>
           <Text
             size="xs"
@@ -117,9 +117,46 @@ export function LoopStepInspector(props: Props) {
                 "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
             }}
           >
-            {props.detail.iterableKind ?? "n/a"}
+            {props.detail.sourceMode}
           </Text>
         </Group>
+        {props.detail.sourceMode === "generator" ? (
+          <Group gap={6} wrap="wrap">
+            <Badge size="xs" variant="light" color="cyan">
+              kind
+            </Badge>
+            <Text
+              size="xs"
+              style={{
+                fontFamily:
+                  "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
+              }}
+            >
+              {props.detail.generatorKind ?? "n/a"}
+            </Text>
+          </Group>
+        ) : (
+          <Group gap={6} wrap="wrap">
+            <Badge size="xs" variant="light" color="cyan">
+              expression
+            </Badge>
+            <Text
+              size="xs"
+              style={{
+                fontFamily:
+                  "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
+              }}
+            >
+              {props.detail.directValue ?? "n/a"}
+            </Text>
+          </Group>
+        )}
+        {props.detail.generatorModifiers.length > 0 ? (
+          <EntryList
+            entries={props.detail.generatorModifiers}
+            emptyLabel="No generator modifiers."
+          />
+        ) : null}
         <EntryList
           entries={props.detail.iterableConfig}
           emptyLabel="No iterable settings."

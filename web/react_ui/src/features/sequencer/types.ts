@@ -138,7 +138,10 @@ export type SequencerParallelDetail = {
 
 export type SequencerForDetail = {
   bind: SequencerOutlineMetadataEntry[];
-  iterableKind: string | null;
+  sourceMode: "generator" | "direct";
+  generatorKind: string | null;
+  directValue: string | null;
+  generatorModifiers: SequencerOutlineMetadataEntry[];
   iterableConfig: SequencerOutlineMetadataEntry[];
 };
 

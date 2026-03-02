@@ -26,6 +26,21 @@ const STEP_ITEM_PATTERN = /^(\s*)-\s*([A-Za-z_][A-Za-z0-9_]*)\s*:(.*)$/;
 const CONTAINER_PATTERN = /^(\s*)([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(?:#.*)?$/;
 const TOP_LEVEL_KEY_PATTERN = /^([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(.*)$/;
 const CHILD_KEY_PATTERN = /^(\s*)([A-Za-z_][A-Za-z0-9_]*)\s*:/;
+const FOR_GENERATOR_KINDS = new Set([
+  "range",
+  "linspace",
+  "triangle",
+  "logspace",
+  "geomspace",
+  "values",
+  "scan2d",
+]);
+const FOR_GENERATOR_MODIFIER_KEYS = new Set([
+  "offset",
+  "shuffle",
+  "seed",
+  "serpentine",
+]);
 
 type FlatStepNode = {
   id: string;
@@ -186,6 +201,27 @@ function flattenSectionEntries(lines: readonly string[]): SequencerOutlineMetada
     stack.push({ indent: parsed.indent, key: parsed.key });
   }
 
+  return entries;
+}
+
+function parseScalarListEntries(lines: readonly string[]): SequencerOutlineMetadataEntry[] {
+  const entries: SequencerOutlineMetadataEntry[] = [];
+  let index = 0;
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) {
+      continue;
+    }
+    const itemMatch = line.match(/^\s*-\s*(.*)$/);
+    if (!itemMatch) {
+      continue;
+    }
+    entries.push({
+      name: String(index),
+      value: stripInlineComment(itemMatch[1] ?? "") || null,
+    });
+    index += 1;
+  }
   return entries;
 }
 
@@ -481,17 +517,39 @@ function parseForDetail(snippet: string): SequencerForDetail {
   const genLines = findSectionLines(inLines, "gen", inBase);
   const genBase = findSectionBaseIndent(genLines);
 
-  let iterableKind: string | null = null;
+  let sourceMode: "generator" | "direct" = "direct";
+  let generatorKind: string | null = null;
+  let directValue: string | null = null;
+  let generatorModifiers: SequencerOutlineMetadataEntry[] = [];
   let iterableConfig: SequencerOutlineMetadataEntry[] = [];
 
   if (genBase !== null) {
+    sourceMode = "generator";
     for (const line of genLines) {
       const parsed = parseKeyValueLine(line);
       if (!parsed || parsed.indent !== genBase) {
         continue;
       }
-      iterableKind = parsed.key;
-      if (parsed.value) {
+      if (FOR_GENERATOR_MODIFIER_KEYS.has(parsed.key)) {
+        generatorModifiers.push({
+          name: parsed.key,
+          value: parsed.value || null,
+        });
+        continue;
+      }
+      if (!FOR_GENERATOR_KINDS.has(parsed.key)) {
+        continue;
+      }
+      generatorKind = parsed.key;
+      if (parsed.key === "values") {
+        if (parsed.value) {
+          iterableConfig = [{ name: "inline", value: parsed.value }];
+        } else {
+          iterableConfig = parseScalarListEntries(
+            findSectionLines(genLines, parsed.key, genBase)
+          );
+        }
+      } else if (parsed.value) {
         iterableConfig = [{ name: "value", value: parsed.value }];
       } else {
         iterableConfig = flattenSectionEntries(
@@ -502,17 +560,20 @@ function parseForDetail(snippet: string): SequencerForDetail {
     }
   }
 
-  if (!iterableKind) {
+  if (!generatorKind) {
     const directIterable = findScalarValue(bodyLines, "in", baseIndent);
     if (directIterable) {
-      iterableKind = "value";
-      iterableConfig = [{ name: "value", value: directIterable }];
+      sourceMode = "direct";
+      directValue = directIterable;
     }
   }
 
   return {
     bind: flattenSectionEntries(bindLines),
-    iterableKind,
+    sourceMode,
+    generatorKind,
+    directValue,
+    generatorModifiers,
     iterableConfig,
   };
 }
@@ -745,8 +806,11 @@ function deriveSummary(
     const binds =
       forDetail?.bind.map((entry) => `${entry.name} -> ${entry.value ?? "n/a"}`) ??
       collectBindPairs();
-    const generatorKind = forDetail?.iterableKind ?? findFirstGeneratorKind();
     const bindSummary = binds.length > 0 ? binds.join(", ") : "bindings";
+    if (forDetail?.sourceMode === "direct") {
+      return `${bindSummary} over expression`;
+    }
+    const generatorKind = forDetail?.generatorKind ?? findFirstGeneratorKind();
     if (generatorKind) {
       return `${bindSummary} over ${generatorKind}`;
     }

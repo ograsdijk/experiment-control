@@ -130,10 +130,12 @@ export function SequencerModal({
   onJumpToDiagnostic,
 }: Props) {
   const [showFullYaml, setShowFullYaml] = useState(false);
+  const [diagnosticsCollapsed, setDiagnosticsCollapsed] = useState(false);
 
   useEffect(() => {
     if (opened) {
       setShowFullYaml(false);
+      setDiagnosticsCollapsed(false);
     }
   }, [opened]);
 
@@ -146,7 +148,7 @@ export function SequencerModal({
       centered
       zIndex={440}
     >
-      <Stack gap="sm">
+      <Stack gap="sm" style={{ height: "clamp(42rem, 88vh, 78rem)", minHeight: 0 }}>
         <Group justify="space-between" align="flex-start">
           <Stack gap={4}>
             <Group gap="xs" wrap="wrap">
@@ -389,8 +391,20 @@ export function SequencerModal({
           colorScheme={colorScheme}
         />
 
-        <Card radius="md" p="sm" style={{ border: "1px solid var(--card-border)" }}>
-          <Stack gap={6}>
+        <Card
+          radius="md"
+          p="sm"
+          style={{
+            border: "1px solid var(--card-border)",
+            flex: showFullYaml
+              ? "1 1 clamp(12rem, 24vh, 18rem)"
+              : "0 0 auto",
+            minHeight: showFullYaml ? "clamp(12rem, 24vh, 18rem)" : 0,
+            display: "flex",
+            flexDirection: "column",
+          }}
+        >
+          <Stack gap={6} style={{ flex: 1, minHeight: 0 }}>
             <Group justify="space-between" align="center">
               <Stack gap={2}>
                 <Text size="sm" fw={600}>
@@ -425,89 +439,126 @@ export function SequencerModal({
                   ref={editorRef}
                   label="Sequence YAML"
                   placeholder="Paste or upload sequence YAML"
-                  autosize
-                  minRows={14}
-                  maxRows={26}
+                  rows={12}
                   value={yamlText}
                   onChange={(event) => onYamlTextChange(event.currentTarget.value)}
+                  style={{ flex: 1, minHeight: 0 }}
+                  styles={{
+                    root: { display: "flex", flexDirection: "column", flex: 1, minHeight: 0 },
+                    input: {
+                      height: "100%",
+                      minHeight: "100%",
+                      overflowY: "auto",
+                    },
+                  }}
                 />
               ) : (
-                <YamlPreview text={yamlText} colorScheme={colorScheme} />
+                <YamlPreview
+                  text={yamlText}
+                  colorScheme={colorScheme}
+                  height="100%"
+                />
               ))}
           </Stack>
         </Card>
 
-        <Stack gap={6}>
-          <Group justify="space-between">
-            <Text size="sm" fw={600}>
-              Diagnostics
-            </Text>
-            <Text size="xs" c="dimmed">
-              {diagnostics.length} issue{diagnostics.length === 1 ? "" : "s"}
-            </Text>
-          </Group>
-          {diagnostics.length === 0 && (
-            <Text size="xs" c="dimmed">
-              No diagnostics yet. Click Validate to check the YAML.
-            </Text>
-          )}
-          {diagnostics.length > 0 && (
-            <ScrollArea h={180}>
-              <Stack gap={6}>
-                {diagnostics.map((diag, idx) => {
-                  const badgeColor =
-                    diag.severity === "error"
-                      ? "red"
-                      : diag.severity === "warning"
-                        ? "yellow"
-                        : "gray";
-                  const location =
-                    diag.line != null
-                      ? `L${diag.line}${diag.column != null ? `:C${diag.column}` : ""}`
-                      : "No line";
-                  return (
-                    <Card
-                      key={`${diag.source ?? "diag"}:${idx}`}
-                      p="xs"
-                      radius="sm"
-                      style={{ border: "1px solid var(--card-border)" }}
-                    >
-                      <Stack gap={4}>
-                        <Group justify="space-between" align="flex-start">
-                          <Group gap="xs">
-                            <Badge size="xs" variant="light" color={badgeColor}>
-                              {diag.severity}
-                            </Badge>
-                            <Text size="xs" c="dimmed">
-                              {diag.source ?? "sequencer"}
+        <Card
+          radius="md"
+          p="sm"
+          style={{ border: "1px solid var(--card-border)", flexShrink: 0 }}
+        >
+          <Stack gap={6}>
+            <Group justify="space-between" align="center">
+              <Group gap="xs" wrap="wrap">
+                <Text size="sm" fw={600}>
+                  Diagnostics
+                </Text>
+                <Text size="xs" c="dimmed">
+                  {diagnostics.length} issue{diagnostics.length === 1 ? "" : "s"}
+                </Text>
+              </Group>
+              <ActionIcon
+                size="sm"
+                variant="subtle"
+                color="gray"
+                aria-label={
+                  diagnosticsCollapsed ? "Expand diagnostics" : "Collapse diagnostics"
+                }
+                onClick={() => setDiagnosticsCollapsed((prev) => !prev)}
+              >
+                {diagnosticsCollapsed ? (
+                  <IconChevronRight size={16} />
+                ) : (
+                  <IconChevronDown size={16} />
+                )}
+              </ActionIcon>
+            </Group>
+            {!diagnosticsCollapsed &&
+              (diagnostics.length === 0 ? (
+                <Text size="xs" c="dimmed">
+                  No diagnostics yet. Click Validate to check the YAML.
+                </Text>
+              ) : (
+                <ScrollArea h={180}>
+                  <Stack gap={6}>
+                    {diagnostics.map((diag, idx) => {
+                      const badgeColor =
+                        diag.severity === "error"
+                          ? "red"
+                          : diag.severity === "warning"
+                            ? "yellow"
+                            : "gray";
+                      const location =
+                        diag.line != null
+                          ? `L${diag.line}${diag.column != null ? `:C${diag.column}` : ""}`
+                          : "No line";
+                      return (
+                        <Card
+                          key={`${diag.source ?? "diag"}:${idx}`}
+                          p="xs"
+                          radius="sm"
+                          style={{ border: "1px solid var(--card-border)" }}
+                        >
+                          <Stack gap={4}>
+                            <Group justify="space-between" align="flex-start">
+                              <Group gap="xs">
+                                <Badge size="xs" variant="light" color={badgeColor}>
+                                  {diag.severity}
+                                </Badge>
+                                <Text size="xs" c="dimmed">
+                                  {diag.source ?? "sequencer"}
+                                </Text>
+                              </Group>
+                              <Button
+                                size="compact-xs"
+                                variant="subtle"
+                                color="gray"
+                                disabled={diag.line == null}
+                                onClick={() => {
+                                  void onJumpToDiagnostic(
+                                    diag.line ?? null,
+                                    diag.column ?? null
+                                  );
+                                }}
+                              >
+                                {location}
+                              </Button>
+                            </Group>
+                            <Text
+                              size="sm"
+                              style={{ whiteSpace: "pre-wrap", wordBreak: "break-word" }}
+                            >
+                              {diag.message}
                             </Text>
-                          </Group>
-                          <Button
-                            size="compact-xs"
-                            variant="subtle"
-                            color="gray"
-                            disabled={diag.line == null}
-                            onClick={() => {
-                              void onJumpToDiagnostic(
-                                diag.line ?? null,
-                                diag.column ?? null
-                              );
-                            }}
-                          >
-                            {location}
-                          </Button>
-                        </Group>
-                        <Text size="sm" style={{ whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
-                          {diag.message}
-                        </Text>
-                      </Stack>
-                    </Card>
-                  );
-                })}
-              </Stack>
-            </ScrollArea>
-          )}
-        </Stack>
+                          </Stack>
+                        </Card>
+                      );
+                    })}
+                  </Stack>
+                </ScrollArea>
+              ))}
+          </Stack>
+        </Card>
       </Stack>
     </Modal>
   );

@@ -431,7 +431,9 @@ body::before {
 }
 
 .sequencer-var-value .mantine-TextInput-input,
-.sequencer-var-name .mantine-TextInput-input {
+.sequencer-var-name .mantine-TextInput-input,
+.sequencer-var-value .mantine-Input-input,
+.sequencer-var-name .mantine-Input-input {
   min-width: 0;
   font-size: 12px;
 }
