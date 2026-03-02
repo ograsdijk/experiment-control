@@ -94,6 +94,20 @@ class SetContextStep:
     fields: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class AdaptiveStep:
+    id: str
+    controller: dict[str, Any]
+    space: dict[str, Any]
+    bind: dict[str, str]
+    state: dict[str, Any] | None
+    body: list["Step"]
+    observe: dict[str, Any]
+    stopping: dict[str, Any] | None = None
+    constraints: list[Any] | None = None
+    fail_on_trial_error: bool = False
+
+
 Step = (
     CallStep
     | SetStep
@@ -108,6 +122,7 @@ Step = (
     | ParallelStep
     | AssignStep
     | SetContextStep
+    | AdaptiveStep
 )
 
 
@@ -236,8 +251,72 @@ def _parse_step(raw: Any) -> Step:
         if not isinstance(fields, dict):
             raise TypeError("set_context.fields must be a dict")
         return SetContextStep(streams=sc.get("streams", []), fields=fields)
+    if "adaptive" in obj:
+        raw_step = _require_dict(obj["adaptive"], name="adaptive")
+        step_id = str(raw_step.get("id", "")).strip()
+        if not step_id:
+            raise TypeError("adaptive.id is required")
+        controller = _require_dict(raw_step.get("controller"), name="adaptive.controller")
+        space = _require_dict(raw_step.get("space"), name="adaptive.space")
+        bind_raw = _require_dict(raw_step.get("bind"), name="adaptive.bind")
+        bind: dict[str, str] = {}
+        for raw_key, raw_value in bind_raw.items():
+            key = str(raw_key).strip()
+            value = str(raw_value).strip()
+            if not key or not value:
+                raise TypeError("adaptive.bind entries must map non-empty names")
+            bind[key] = value
+        if not bind:
+            raise TypeError("adaptive.bind must not be empty")
+        state = raw_step.get("state")
+        if state is not None and not isinstance(state, dict):
+            raise TypeError("adaptive.state must be a dict")
+        observe = _require_dict(raw_step.get("observe"), name="adaptive.observe")
+        stopping = raw_step.get("stopping")
+        if stopping is not None and not isinstance(stopping, dict):
+            raise TypeError("adaptive.stopping must be a dict")
+        constraints = raw_step.get("constraints")
+        if constraints is not None and not isinstance(constraints, list):
+            raise TypeError("adaptive.constraints must be a list")
+        body = _parse_steps(raw_step.get("do", []))
+        if not body:
+            raise TypeError("adaptive.do must not be empty")
+        return AdaptiveStep(
+            id=step_id,
+            controller=controller,
+            space=space,
+            bind=bind,
+            state=dict(state) if isinstance(state, dict) else None,
+            body=body,
+            observe=observe,
+            stopping=dict(stopping) if isinstance(stopping, dict) else None,
+            constraints=list(constraints) if isinstance(constraints, list) else None,
+            fail_on_trial_error=bool(raw_step.get("fail_on_trial_error", False)),
+        )
 
     raise TypeError(f"Unknown step type: {list(obj.keys())}")
+
+
+def _iter_adaptive_ids(steps: list[Step]) -> list[str]:
+    ids: list[str] = []
+    for step in steps:
+        if isinstance(step, AdaptiveStep):
+            ids.append(step.id)
+            ids.extend(_iter_adaptive_ids(step.body))
+        elif isinstance(step, ForStep):
+            ids.extend(_iter_adaptive_ids(step.body))
+        elif isinstance(step, RepeatStep):
+            ids.extend(_iter_adaptive_ids(step.body))
+        elif isinstance(step, IfStep):
+            ids.extend(_iter_adaptive_ids(step.then_steps))
+            ids.extend(_iter_adaptive_ids(step.else_steps or []))
+        elif isinstance(step, WhileStep):
+            ids.extend(_iter_adaptive_ids(step.body))
+        elif isinstance(step, AtomicStep):
+            ids.extend(_iter_adaptive_ids(step.body))
+        elif isinstance(step, ParallelStep):
+            ids.extend(_iter_adaptive_ids(step.body))
+    return ids
 
 
 def parse_sequence(raw: Any) -> SequenceSpec:
@@ -266,6 +345,11 @@ def parse_sequence(raw: Any) -> SequenceSpec:
                     f"context_columns[{name!r}] has unsupported dtype {dtype!r}"
                 )
             context_columns[name] = dtype
+    seen_ids: set[str] = set()
+    for adaptive_id in _iter_adaptive_ids(steps):
+        if adaptive_id in seen_ids:
+            raise TypeError(f"duplicate adaptive.id {adaptive_id!r}")
+        seen_ids.add(adaptive_id)
     return SequenceSpec(
         version=version,
         meta=meta,

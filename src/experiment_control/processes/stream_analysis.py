@@ -107,6 +107,7 @@ class BinStatsState:
     max_bin_count: int
     x_min: float | None
     x_max: float | None
+    centers: np.ndarray | None
     counts: np.ndarray
     sums: np.ndarray
     sums_sq: np.ndarray
@@ -127,6 +128,7 @@ class BinStatsState:
                 max_bin_count=int(bin_count),
                 x_min=None,
                 x_max=None,
+                centers=None,
                 counts=np.zeros(0, dtype=np.int64),
                 sums=np.zeros(0, dtype=np.float64),
                 sums_sq=np.zeros(0, dtype=np.float64),
@@ -144,6 +146,7 @@ class BinStatsState:
             max_bin_count=int(bin_count),
             x_min=float(x_min),
             x_max=float(x_max),
+            centers=None,
             counts=np.zeros(int(bin_count), dtype=np.int64),
             sums=np.zeros(int(bin_count), dtype=np.float64),
             sums_sq=np.zeros(int(bin_count), dtype=np.float64),
@@ -156,6 +159,7 @@ class BinStatsState:
     def reset(self) -> None:
         self.x_min = self.x_min if not self.auto_range else None
         self.x_max = self.x_max if not self.auto_range else None
+        self.centers = None
         self.counts.fill(0)
         self.sums.fill(0.0)
         self.sums_sq.fill(0.0)
@@ -219,6 +223,7 @@ class BinStatsState:
         if not self.samples_x:
             self.x_min = None
             self.x_max = None
+            self.centers = np.zeros(0, dtype=np.float64)
             self.counts = np.zeros(0, dtype=np.int64)
             self.sums = np.zeros(0, dtype=np.float64)
             self.sums_sq = np.zeros(0, dtype=np.float64)
@@ -227,7 +232,36 @@ class BinStatsState:
         ys = np.asarray(self.samples_y, dtype=np.float64)
         min_x = float(np.min(xs))
         max_x = float(np.max(xs))
-        unique_count = len({format(float(v), ".15g") for v in self.samples_x})
+        grouped: dict[str, tuple[float, list[float]]] = {}
+        for x_value, y_value in zip(self.samples_x, self.samples_y):
+            key = format(float(x_value), ".15g")
+            existing = grouped.get(key)
+            if existing is None:
+                grouped[key] = (float(x_value), [float(y_value)])
+            else:
+                grouped[key][1].append(float(y_value))
+        unique_count = len(grouped)
+        if unique_count <= int(self.max_bin_count):
+            sorted_items = sorted(grouped.values(), key=lambda item: item[0])
+            centers = np.asarray([item[0] for item in sorted_items], dtype=np.float64)
+            counts = np.asarray(
+                [len(item[1]) for item in sorted_items], dtype=np.int64
+            )
+            sums = np.asarray(
+                [float(sum(item[1])) for item in sorted_items], dtype=np.float64
+            )
+            sums_sq = np.asarray(
+                [float(sum((v * v) for v in item[1])) for item in sorted_items],
+                dtype=np.float64,
+            )
+            self.centers = centers
+            self.counts = counts
+            self.sums = sums
+            self.sums_sq = sums_sq
+            self.x_min = float(min_x)
+            self.x_max = float(max_x)
+            return
+
         active_bins = max(1, min(int(self.max_bin_count), int(unique_count)))
         min_use = min_x
         max_use = max_x
@@ -245,6 +279,8 @@ class BinStatsState:
         self.sums_sq = np.bincount(idx, weights=ys * ys, minlength=active_bins).astype(
             np.float64, copy=False
         )
+        edges = np.linspace(min_use, max_use, active_bins + 1, dtype=np.float64)
+        self.centers = (edges[:-1] + edges[1:]) * 0.5
         self.x_min = float(min_use)
         self.x_max = float(max_use)
 
@@ -252,11 +288,21 @@ class BinStatsState:
         if self.auto_range and self.auto_bins_dirty:
             self._recompute_auto_bins()
             self.auto_bins_dirty = False
-        if self.counts.size > 0 and self.x_min is not None and self.x_max is not None:
-            edges = np.linspace(
-                float(self.x_min), float(self.x_max), int(self.counts.size) + 1, dtype=np.float64
-            )
-            centers = (edges[:-1] + edges[1:]) * 0.5
+        centers_arr = self.centers
+        if centers_arr is None:
+            if self.counts.size > 0 and self.x_min is not None and self.x_max is not None:
+                edges = np.linspace(
+                    float(self.x_min),
+                    float(self.x_max),
+                    int(self.counts.size) + 1,
+                    dtype=np.float64,
+                )
+                centers = (edges[:-1] + edges[1:]) * 0.5
+            else:
+                centers = np.zeros(0, dtype=np.float64)
+        else:
+            centers = np.asarray(centers_arr, dtype=np.float64)
+        if self.counts.size > 0:
             counts_f = self.counts.astype(np.float64)
             with np.errstate(divide="ignore", invalid="ignore"):
                 mean = np.where(self.counts > 0, self.sums / counts_f, np.nan)
@@ -265,7 +311,6 @@ class BinStatsState:
                 std = np.sqrt(var)
                 sem = np.where(self.counts > 0, std / np.sqrt(counts_f), np.nan)
         else:
-            centers = np.zeros(0, dtype=np.float64)
             mean = np.zeros(0, dtype=np.float64)
             std = np.zeros(0, dtype=np.float64)
             sem = np.zeros(0, dtype=np.float64)
@@ -669,17 +714,21 @@ class FitCurve1DState:
     baseline_mode: str
     every_n: int
     sigma_y: float | None = None
+    dense_eval_points: int | None = None
     sample_count: int = 0
     last_fit: dict[str, Any] | None = None
 
     @classmethod
     def from_params(cls, params: Json) -> FitCurve1DState:
-        model, baseline_mode, every_n, sigma_y = _validate_fit_curve_params(params)
+        model, baseline_mode, every_n, sigma_y, dense_eval_points = (
+            _validate_fit_curve_params(params)
+        )
         return cls(
             model=model,
             baseline_mode=baseline_mode,
             every_n=every_n,
             sigma_y=sigma_y,
+            dense_eval_points=dense_eval_points,
         )
 
     def reset(self) -> None:
@@ -755,6 +804,15 @@ OPS: dict[str, OpSpec] = {
         stateful=True,
     ),
     "fit.yhat": OpSpec(
+        input_types={"fit": "fit_1d"}, output_type="trace", stateful=False
+    ),
+    "fit.xhat": OpSpec(
+        input_types={"fit": "fit_1d"}, output_type="trace", stateful=False
+    ),
+    "fit.yhat_dense": OpSpec(
+        input_types={"fit": "fit_1d"}, output_type="trace", stateful=False
+    ),
+    "fit.xhat_dense": OpSpec(
         input_types={"fit": "fit_1d"}, output_type="trace", stateful=False
     ),
     "fit.param": OpSpec(
@@ -839,7 +897,12 @@ OP_PARAM_SCHEMAS: dict[str, list[Json]] = {
         },
         {"name": "every_n", "kind": "integer", "required": False, "default": 1},
         {"name": "sigma_y", "kind": "number", "required": False},
+        {"name": "dense_eval_points", "kind": "integer", "required": False},
     ],
+    "fit.yhat": [],
+    "fit.xhat": [],
+    "fit.yhat_dense": [],
+    "fit.xhat_dense": [],
     "fit.param": [
         {"name": "name", "kind": "string", "required": False, "default": "center"},
         {"name": "field", "kind": "string", "required": False, "default": "value"},
@@ -856,6 +919,7 @@ OP_PARAM_SCHEMAS: dict[str, list[Json]] = {
         },
         {"name": "every_n", "kind": "integer", "required": False, "default": 1},
         {"name": "sigma_y", "kind": "number", "required": False},
+        {"name": "dense_eval_points", "kind": "integer", "required": False},
         {
             "name": "chi2_sigma_source",
             "kind": "string",
@@ -949,6 +1013,12 @@ def _normalize_bool(raw: Any, *, default: bool = False) -> bool:
 
 
 def _sanitize_json(value: Any) -> Any:
+    if isinstance(value, np.ndarray):
+        return [_sanitize_json(item) for item in value.tolist()]
+    if isinstance(value, np.floating):
+        value = float(value)
+    elif isinstance(value, np.integer):
+        return int(value)
     if isinstance(value, float):
         if math.isfinite(value):
             return value
@@ -1339,7 +1409,9 @@ def _parse_fit_baseline_mode(raw: Any) -> str:
     raise ValueError("fit.curve_1d baseline_mode must be one of none, constant, linear")
 
 
-def _validate_fit_curve_params(params: Json) -> tuple[str, str, int, float | None]:
+def _validate_fit_curve_params(
+    params: Json,
+) -> tuple[str, str, int, float | None, int | None]:
     model = _parse_fit_model(params.get("model"))
     baseline_mode = _parse_fit_baseline_mode(params.get("baseline_mode"))
     every_n = _normalize_int(params.get("every_n"))
@@ -1350,7 +1422,10 @@ def _validate_fit_curve_params(params: Json) -> tuple[str, str, int, float | Non
     sigma_y = _normalize_float(params.get("sigma_y"))
     if sigma_y is not None and sigma_y <= 0:
         raise ValueError("fit.curve_1d requires sigma_y > 0 when provided")
-    return model, baseline_mode, int(every_n), sigma_y
+    dense_eval_points = _normalize_int(params.get("dense_eval_points"))
+    if dense_eval_points is not None and dense_eval_points < 2:
+        raise ValueError("fit.curve_1d requires dense_eval_points >= 2 when provided")
+    return model, baseline_mode, int(every_n), sigma_y, dense_eval_points
 
 
 def _fit_curve_build_models(
@@ -1435,6 +1510,7 @@ def _fit_curve_run(
     baseline_mode: str,
     sigma_y: float | None = None,
     sigma_trace_raw: Any = None,
+    dense_eval_points: int | None = None,
 ) -> dict[str, Any] | None:
     x = _coerce_trace(x_raw)
     y = _coerce_trace(y_raw)
@@ -1471,6 +1547,16 @@ def _fit_curve_run(
     except Exception:
         return None
     yhat = np.asarray(eval_func(x, *popt), dtype=np.float64).reshape(-1)
+    x_dense: np.ndarray | None = None
+    yhat_dense: np.ndarray | None = None
+    if dense_eval_points is not None and dense_eval_points >= 2:
+        x_dense = np.linspace(
+            float(np.min(x)),
+            float(np.max(x)),
+            int(dense_eval_points),
+            dtype=np.float64,
+        )
+        yhat_dense = np.asarray(eval_func(x_dense, *popt), dtype=np.float64).reshape(-1)
     params = {name: float(val) for name, val in zip(param_names, popt.tolist())}
     stderr: dict[str, float] = {}
     if isinstance(pcov, np.ndarray) and pcov.ndim == 2:
@@ -1502,12 +1588,16 @@ def _fit_curve_run(
                             params["reduced_chi2"] = float(chi2 / float(dof))
     params["model"] = model
     params["baseline_mode"] = baseline_mode
-    return {
+    out: dict[str, Any] = {
         "x": x,
         "yhat": yhat,
         "params": params,
         "stderr": stderr,
     }
+    if x_dense is not None and yhat_dense is not None and x_dense.size == yhat_dense.size:
+        out["x_dense"] = x_dense
+        out["yhat_dense"] = yhat_dense
+    return out
 
 
 def execute_fit_curve_1d(
@@ -1530,6 +1620,7 @@ def execute_fit_curve_1d(
         model=state.model,
         baseline_mode=state.baseline_mode,
         sigma_y=state.sigma_y,
+        dense_eval_points=state.dense_eval_points,
     )
     if fit_result is not None:
         state.last_fit = fit_result
@@ -1540,6 +1631,24 @@ def execute_fit_yhat(fit_raw: Any) -> np.ndarray | None:
     if not isinstance(fit_raw, dict):
         return None
     return _coerce_trace(fit_raw.get("yhat"))
+
+
+def execute_fit_xhat(fit_raw: Any) -> np.ndarray | None:
+    if not isinstance(fit_raw, dict):
+        return None
+    return _coerce_trace(fit_raw.get("x"))
+
+
+def execute_fit_yhat_dense(fit_raw: Any) -> np.ndarray | None:
+    if not isinstance(fit_raw, dict):
+        return None
+    return _coerce_trace(fit_raw.get("yhat_dense"))
+
+
+def execute_fit_xhat_dense(fit_raw: Any) -> np.ndarray | None:
+    if not isinstance(fit_raw, dict):
+        return None
+    return _coerce_trace(fit_raw.get("x_dense"))
 
 
 def _normalize_fit_param_name(raw: Any) -> str:
@@ -1639,8 +1748,21 @@ def _parse_fit_hist_sigma_source(raw: Any) -> str:
 
 def _validate_fit_from_hist_params(
     params: Json,
-) -> tuple[str, str, int, float | None, str, str, int, float | None, float | None]:
-    model, baseline_mode, every_n, _sigma_y = _validate_fit_curve_params(params)
+) -> tuple[
+    str,
+    str,
+    int,
+    float | None,
+    int | None,
+    str,
+    str,
+    int,
+    float | None,
+    float | None,
+]:
+    model, baseline_mode, every_n, _sigma_y, dense_eval_points = (
+        _validate_fit_curve_params(params)
+    )
     y_source = _parse_fit_hist_y_source(params.get("y_source", "mean"))
     chi2_sigma_source = _parse_fit_hist_sigma_source(
         params.get("chi2_sigma_source", "sem")
@@ -1659,6 +1781,7 @@ def _validate_fit_from_hist_params(
         baseline_mode,
         every_n,
         _sigma_y,
+        dense_eval_points,
         y_source,
         chi2_sigma_source,
         int(min_count),
@@ -1763,6 +1886,7 @@ def execute_fit_from_hist_agg(
         baseline_mode=state.baseline_mode,
         sigma_y=state.sigma_y,
         sigma_trace_raw=sigma_arr,
+        dense_eval_points=state.dense_eval_points,
     )
     if fit_result is not None:
         state.last_fit = fit_result
@@ -1990,7 +2114,14 @@ def compile_workspace_graph(config: Json) -> CompiledWorkspace:
             raise ValueError(
                 f"publish.outputs[{idx}].node_id has no output type {node_id!r}"
             )
-        if kind not in {"scalar", "hist_agg", "hist2d", "trace", "params_map"}:
+        if kind not in {
+            "scalar",
+            "hist_agg",
+            "hist2d",
+            "trace",
+            "params_map",
+            "fit_1d",
+        }:
             raise ValueError(
                 f"publish.outputs[{idx}].node_id type {kind!r} is not publishable in v1"
             )
@@ -3025,6 +3156,21 @@ class StreamAnalysisProcess(ManagedProcessBase):
                 values[node_id] = execute_fit_yhat(fit_val)
                 continue
 
+            if op == "fit.xhat":
+                fit_val = values.get(node.inputs["fit"])
+                values[node_id] = execute_fit_xhat(fit_val)
+                continue
+
+            if op == "fit.yhat_dense":
+                fit_val = values.get(node.inputs["fit"])
+                values[node_id] = execute_fit_yhat_dense(fit_val)
+                continue
+
+            if op == "fit.xhat_dense":
+                fit_val = values.get(node.inputs["fit"])
+                values[node_id] = execute_fit_xhat_dense(fit_val)
+                continue
+
             if op == "fit.param":
                 fit_val = values.get(node.inputs["fit"])
                 values[node_id] = execute_fit_param(fit_val, node.params)
@@ -3046,6 +3192,7 @@ class StreamAnalysisProcess(ManagedProcessBase):
                     _baseline_mode,
                     _every_n,
                     _sigma_y,
+                    _dense_eval_points,
                     y_source,
                     chi2_sigma_source,
                     min_count,
@@ -3137,6 +3284,10 @@ class StreamAnalysisProcess(ManagedProcessBase):
                     continue
                 value = _sanitize_json(dict(raw_value))
             elif output.kind == "params_map":
+                if not isinstance(raw_value, dict):
+                    continue
+                value = _sanitize_json(dict(raw_value))
+            elif output.kind == "fit_1d":
                 if not isinstance(raw_value, dict):
                     continue
                 value = _sanitize_json(dict(raw_value))

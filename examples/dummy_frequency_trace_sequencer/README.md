@@ -84,3 +84,38 @@ Defaults:
 - `n_traces_per_step = 20`
 
 You can adjust these in the `vars` section of the sequence file.
+
+## Adaptive sequence
+
+Load and run:
+
+`examples/dummy_frequency_trace_sequencer/sequence_frequency_adaptive.yaml`
+
+This uses:
+
+- the `adaptive.adaptive_grid_1d` sequencer step
+- an explicit adaptive study id: `resonance_scan`
+- curvature loss with `min_loss: 0.2` as the adaptive convergence signal
+- the existing `workspace-1 / integral` scalar output from `stream_analysis`
+- `context_id` correlation so each adaptive trial waits for the matching
+  `manager.stream_analysis.output`
+- one adaptive score per suggested scan point computed from exactly
+  `n_traces_per_point` acquisitions at that point
+
+Notes:
+
+- this requires the optional Python package `adaptive` to be installed in the same
+  environment as the sequencer process
+- the `stream_analysis` process must be running with
+  `examples/dummy_frequency_trace_sequencer/stream_workspaces.yaml` loaded
+- `workspace-1` is the workspace id defined in
+  `examples/dummy_frequency_trace_sequencer/stream_workspaces.yaml`; in that
+  workspace, `integral` is the published scalar output used as the adaptive
+  objective
+- the example fit node in that workspace now sets `dense_eval_points: 200`, so if
+  you enable the published `fit_curve` output as a fit overlay in a stream
+  bin-stats panel, the fitted curve renders smoothly instead of only at the sparse
+  source x points
+- the Sequencer modal now shows per-study `Reset / Resume / Warm start` controls
+  before you press Start, so you can reuse or clear saved adaptive trials without
+  editing the YAML

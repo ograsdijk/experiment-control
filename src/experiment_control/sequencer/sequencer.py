@@ -105,7 +105,17 @@ class SequencerProcess(ManagedProcessBase):
         self._log_sub.setsockopt(zmq.RCVTIMEO, 100)
         self._log_sub.setsockopt(zmq.LINGER, 0)
         self._log_sub.connect(self._manager_pub)
-        self._init_poller(extra=[(self._log_sub, zmq.POLLIN)])
+        self._analysis_sub = self._ctx.socket(zmq.SUB)
+        self._analysis_sub.setsockopt(zmq.SUBSCRIBE, b"manager.stream_analysis.output")
+        self._analysis_sub.setsockopt(zmq.RCVTIMEO, 100)
+        self._analysis_sub.setsockopt(zmq.LINGER, 0)
+        self._analysis_sub.connect(self._manager_pub)
+        self._init_poller(
+            extra=[
+                (self._log_sub, zmq.POLLIN),
+                (self._analysis_sub, zmq.POLLIN),
+            ]
+        )
 
         self._runtime = SequencerRuntime(
             call_device=self._call_device,
@@ -289,11 +299,37 @@ class SequencerProcess(ManagedProcessBase):
                     ],
                     doc="Validate sequence YAML without loading it.",
                 ),
-                method("sequencer.start", params=None, doc="Start the loaded sequence."),
+                method(
+                    "sequencer.start",
+                    params=[
+                        param(
+                            "adaptive",
+                            required=False,
+                            default=None,
+                            annotation="dict",
+                        )
+                    ],
+                    doc="Start the loaded sequence.",
+                ),
                 method("sequencer.pause", params=None, doc="Pause sequence execution."),
                 method("sequencer.resume", params=None, doc="Resume sequence execution."),
                 method("sequencer.stop", params=None, doc="Stop sequence execution."),
                 method("sequencer.status", params=None, doc="Get sequencer status."),
+                method(
+                    "sequencer.adaptive.status",
+                    params=None,
+                    doc="Get saved adaptive study state.",
+                ),
+                method(
+                    "sequencer.adaptive.clear",
+                    params=[param("study_id", required=True, annotation="str")],
+                    doc="Clear saved adaptive study state for one study id.",
+                ),
+                method(
+                    "sequencer.adaptive.clear_all",
+                    params=None,
+                    doc="Clear all saved adaptive study state.",
+                ),
                 method(
                     "sequencer.loaded_yaml",
                     params=None,
@@ -415,7 +451,11 @@ class SequencerProcess(ManagedProcessBase):
 
         if rtype == "sequencer.start":
             try:
-                self._runtime.start()
+                adaptive = params.get("adaptive")
+                adaptive_overrides = adaptive if isinstance(adaptive, dict) else None
+                if adaptive is not None and adaptive_overrides is None:
+                    raise TypeError("sequencer.start params.adaptive must be a dict")
+                self._runtime.start(adaptive=adaptive_overrides)
             except Exception as e:
                 self._publish_lifecycle_event(
                     event="start",
@@ -515,6 +555,37 @@ class SequencerProcess(ManagedProcessBase):
             result["autoload_error_source"] = self._autoload_error_source
             return {"request_id": req.get("request_id"), "ok": True, "result": result}
 
+        if rtype == "sequencer.adaptive.status":
+            return {
+                "request_id": req.get("request_id"),
+                "ok": True,
+                "result": self._runtime.adaptive_status(),
+            }
+
+        if rtype == "sequencer.adaptive.clear":
+            study_id = str(params.get("study_id", "")).strip()
+            if not study_id:
+                return {
+                    "request_id": req.get("request_id"),
+                    "ok": False,
+                    "error": {"code": "missing_study_id"},
+                }
+            return {
+                "request_id": req.get("request_id"),
+                "ok": True,
+                "result": {
+                    "cleared": int(self._runtime.clear_adaptive_studies(study_id=study_id)),
+                    "study_id": study_id,
+                },
+            }
+
+        if rtype == "sequencer.adaptive.clear_all":
+            return {
+                "request_id": req.get("request_id"),
+                "ok": True,
+                "result": {"cleared": int(self._runtime.clear_adaptive_studies())},
+            }
+
         if rtype == "sequencer.loaded_yaml":
             return {
                 "request_id": req.get("request_id"),
@@ -537,6 +608,7 @@ class SequencerProcess(ManagedProcessBase):
             while True:
                 events = self._poll_and_drain(50)
                 self._drain_external_fault_logs(events)
+                self._drain_analysis_outputs(events)
                 self._flush_pending_logs(max_items=8)
                 self._runtime.tick()
                 if self._runtime.state == "ERROR" and not self._last_error_sent:
@@ -557,6 +629,10 @@ class SequencerProcess(ManagedProcessBase):
                 if self._runtime.state in {"IDLE", "RUNNING", "PAUSED", "STOPPED"}:
                     self._last_error_sent = False
         finally:
+            try:
+                self._analysis_sub.close(0)
+            except Exception:
+                pass
             try:
                 self._log_sub.close(0)
             except Exception:
@@ -602,6 +678,21 @@ class SequencerProcess(ManagedProcessBase):
             )
             self._last_error_sent = True
             break
+
+    def _drain_analysis_outputs(self, events: dict[Any, int]) -> None:
+        if not (int(events.get(self._analysis_sub, 0)) & zmq.POLLIN):
+            return
+        while True:
+            try:
+                _topic_b, payload_b = self._analysis_sub.recv_multipart(flags=zmq.NOBLOCK)
+            except zmq.Again:
+                break
+            except Exception:
+                break
+            payload = safe_json_loads(payload_b)
+            if not isinstance(payload, dict):
+                continue
+            self._runtime.record_analysis_output(payload)
 
     def _publish_log(self, *, severity: str, message: str) -> None:
         payload = {

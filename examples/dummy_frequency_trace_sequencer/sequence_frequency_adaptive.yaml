@@ -1,0 +1,78 @@
+version: 1
+context_columns:
+  freq_hz: float64
+  trial_idx: int64
+vars:
+  freq_center_hz: 1008000000.0
+  scan_half_span_hz: 80000000.0
+  initial_step_hz: 1000000.0
+  min_step_hz: 250000.0
+  n_traces_per_point: 3
+  trace_spacing_s: 0.02
+  freq_settle_s: 0.05
+steps:
+  - adaptive:
+      id: resonance_scan
+      controller:
+        kind: adaptive.adaptive_grid_1d
+        config:
+          loss:
+            kind: curvature
+          min_loss: 0.2
+      space:
+        x:
+          type: float
+          min: ${freq_center_hz - scan_half_span_hz}
+          max: ${freq_center_hz + scan_half_span_hz}
+          step: ${initial_step_hz}
+          min_step: ${min_step_hz}
+          snap: true
+          origin: ${freq_center_hz - scan_half_span_hz}
+      bind:
+        x: freq_hz
+        trial_index: trial_idx
+      do:
+        - call:
+            device: freq1
+            action: set_frequency_hz
+            params:
+              frequency_hz: ${freq_hz}
+
+        - call:
+            device: trace1
+            action: set_frequency_hz
+            params:
+              frequency_hz: ${freq_hz}
+
+        - sleep: ${freq_settle_s}
+
+        - set_context:
+            streams:
+              - device: trace1
+                stream: trace
+            fields:
+              freq_hz: ${freq_hz}
+              trial_idx: ${trial_idx}
+
+        - repeat:
+            times: ${n_traces_per_point}
+            do:
+              - call:
+                  device: trace1
+                  action: stream__acquire_trace
+              - sleep: ${trace_spacing_s}
+      observe:
+        repeats: ${n_traces_per_point}
+        metrics:
+          integral:
+            kind: analysis_output
+            config:
+              workspace_id: workspace-1
+              output_id: integral
+              require_current_context: true
+              timeout_s: 2.0
+        aggregate:
+          integral: [mean, std, n_ok]
+        score: ${integral_mean}
+      stopping:
+        max_trials: 25

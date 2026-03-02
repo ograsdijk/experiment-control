@@ -46,6 +46,7 @@ workspaces:
         model: gaussian
         baseline_mode: none
         every_n: 10
+        dense_eval_points: 200
         chi2_sigma_source: sem
         min_count: 1
       inputs:
@@ -66,6 +67,8 @@ workspaces:
       node_id: integral
     - output_id: bin_stats
       node_id: bin
+    - output_id: fit_curve
+      node_id: fit
     - output_id: out_3
       node_id: bg
     - output_id: out_4

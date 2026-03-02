@@ -1267,7 +1267,8 @@ async def ws_stream_workspace(ws: WebSocket, workspace_id: str) -> None:
         parsed = {
             part.strip()
             for part in kinds_raw.split(",")
-            if part.strip() in {"scalar", "hist_agg", "hist2d", "trace", "params_map"}
+            if part.strip()
+            in {"scalar", "hist_agg", "hist2d", "trace", "params_map", "fit_1d"}
         }
         if parsed:
             allowed_output_kinds = parsed

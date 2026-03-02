@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import math
+import statistics
 import time
 from dataclasses import dataclass
 from typing import Any, Callable
 
 from ..driver import extract_value
 from .ast import (
+    AdaptiveStep,
     AssignStep,
     AtomicStep,
     CallStep,
@@ -54,6 +57,31 @@ class _WhileFrame:
 
 
 @dataclass
+class _AdaptiveFrame:
+    step: AdaptiveStep
+    study_id: str
+    controller: Any
+    rendered_controller: dict[str, Any]
+    rendered_space: dict[str, Any]
+    started_t: float
+    proposal: dict[str, Any] | None = None
+    trials_completed: int = 0
+    best_score: float | None = None
+    no_improve_trials: int = 0
+
+
+@dataclass
+class _AdaptiveObserveState:
+    frame: _AdaptiveFrame
+    proposal: dict[str, Any]
+    trial: dict[str, Any]
+    repeats: int
+    metrics_spec: dict[str, Any]
+    current_repeat: int = 0
+    started_t: float = 0.0
+
+
+@dataclass
 class _WaitState:
     start_t: float
     timeout_s: float
@@ -65,6 +93,9 @@ class _WaitState:
     reduce_spec: dict[str, Any] | None
     samples: list[tuple[float, Any]]
     stable_since: float | None = None
+
+
+_NO_STEP_READY = object()
 
 
 class SequencerRuntime:
@@ -82,16 +113,20 @@ class SequencerRuntime:
         self._spec: SequenceSpec | None = None
         self._vars: dict[str, Any] = {}
         self._env: dict[str, Any] = {}
-        self._stack: list[_Frame | _ForFrame | _RepeatFrame | _WhileFrame] = []
+        self._stack: list[
+            _Frame | _ForFrame | _RepeatFrame | _WhileFrame | _AdaptiveFrame
+        ] = []
         self._state = "IDLE"
         self._pause_requested = False
         self._stop_requested = False
         self._last_error: str | None = None
         self._sleep_until: float | None = None
         self._wait_state: _WaitState | None = None
+        self._adaptive_observe_state: _AdaptiveObserveState | None = None
         self._atomic_depth = 0
         self._current_step: str | None = None
         self._context_id = -1
+        self._analysis_outputs: list[dict[str, Any]] = []
         self._estimated_total_steps: int | None = None
         self._completed_steps = 0
         self._step_ewma_s: float | None = None
@@ -104,6 +139,8 @@ class SequencerRuntime:
         self._paused_total_s = 0.0
         self._paused_started_mono: float | None = None
         self._active_step_started_elapsed_s: float | None = None
+        self._adaptive_studies: dict[str, dict[str, Any]] = {}
+        self._adaptive_start_modes: dict[str, str] = {}
 
     @property
     def state(self) -> str:
@@ -147,19 +184,23 @@ class SequencerRuntime:
         self._last_error = None
         self._sleep_until = None
         self._wait_state = None
+        self._adaptive_observe_state = None
         self._atomic_depth = 0
         self._current_step = None
         self._state = "IDLE"
+        self._adaptive_start_modes = {}
         self._reset_progress()
 
-    def start(self) -> None:
+    def start(self, adaptive: dict[str, Any] | None = None) -> None:
         if self._spec is None:
             raise RuntimeError("No sequence loaded")
         self._stack = [_Frame(self._spec.steps)]
+        self._adaptive_start_modes = self._normalize_adaptive_start_modes(adaptive)
         self._pause_requested = False
         self._stop_requested = False
         self._sleep_until = None
         self._wait_state = None
+        self._adaptive_observe_state = None
         self._atomic_depth = 0
         self._current_step = None
         self._reset_progress()
@@ -193,6 +234,7 @@ class SequencerRuntime:
         self._stop_requested = False
         self._sleep_until = None
         self._wait_state = None
+        self._adaptive_observe_state = None
 
     def status(self) -> dict[str, Any]:
         effective_state = self._state
@@ -207,7 +249,32 @@ class SequencerRuntime:
             "last_context_id": int(self._context_id),
             "next_context_id": int(self._context_id + 1),
             "progress": self._progress_snapshot(time.monotonic()),
+            "loaded_adaptive_ids": self._adaptive_step_ids(),
+            "adaptive_studies": self._adaptive_studies_snapshot(),
         }
+
+    def adaptive_status(self) -> dict[str, Any]:
+        return {
+            "loaded_adaptive_ids": self._adaptive_step_ids(),
+            "adaptive_studies": self._adaptive_studies_snapshot(),
+        }
+
+    def clear_adaptive_studies(self, study_id: str | None = None) -> int:
+        if study_id is None:
+            count = len(self._adaptive_studies)
+            self._adaptive_studies.clear()
+            return count
+        if study_id in self._adaptive_studies:
+            del self._adaptive_studies[study_id]
+            return 1
+        return 0
+
+    def record_analysis_output(self, payload: dict[str, Any]) -> None:
+        if not isinstance(payload, dict):
+            return
+        self._analysis_outputs.append(dict(payload))
+        if len(self._analysis_outputs) > 512:
+            del self._analysis_outputs[0 : len(self._analysis_outputs) - 512]
 
     def tick(self) -> None:
         if self._state != "RUNNING":
@@ -229,13 +296,20 @@ class SequencerRuntime:
                     return
                 self._finish_active_step(time.monotonic())
 
+            if self._adaptive_observe_state is not None:
+                if not self._step_adaptive_observation(now):
+                    return
+
             while self._state == "RUNNING":
                 if self._check_stop_pause():
                     return
                 step = self._next_step()
+                if step is _NO_STEP_READY:
+                    return
                 if step is None:
-                    self._state = "STOPPED"
-                    self._run_ended_mono = time.monotonic()
+                    if self._state == "RUNNING":
+                        self._state = "STOPPED"
+                        self._run_ended_mono = time.monotonic()
                     return
                 self._begin_active_step(time.monotonic())
                 if self._execute_step(step):
@@ -439,6 +513,8 @@ class SequencerRuntime:
             ),
         ):
             return 1
+        if isinstance(step, AdaptiveStep):
+            return None
         if isinstance(step, AtomicStep):
             inner = self._estimate_step_list(step.body, env)
             if inner is None:
@@ -531,6 +607,10 @@ class SequencerRuntime:
                     self._stack.pop()
                     if frame.on_exit:
                         frame.on_exit()
+                        if self._state != "RUNNING":
+                            return None
+                        if self._adaptive_observe_state is not None:
+                            return _NO_STEP_READY
                     continue
                 step = frame.steps[frame.index]
                 frame.index += 1
@@ -558,6 +638,26 @@ class SequencerRuntime:
                     self._stack.pop()
                     continue
                 self._stack.append(_Frame(frame.body))
+                continue
+            if isinstance(frame, _AdaptiveFrame):
+                if frame.proposal is not None:
+                    return _NO_STEP_READY
+                if self._adaptive_should_stop(frame):
+                    self._stack.pop()
+                    continue
+                should_stop = getattr(frame.controller, "should_stop", None)
+                if callable(should_stop) and bool(should_stop()):
+                    self._stack.pop()
+                    continue
+                proposal = self._prepare_adaptive_proposal(frame)
+                frame.proposal = proposal
+                self._bind_adaptive_proposal(frame.step, proposal)
+                self._stack.append(
+                    _Frame(
+                        frame.step.body,
+                        on_exit=(lambda frame=frame: self._after_adaptive_body(frame)),
+                    )
+                )
                 continue
         return None
 
@@ -617,6 +717,44 @@ class SequencerRuntime:
             for item in self._normalize_streams(step.streams):
                 device, stream = item
                 self._set_stream_context(device, stream, ctx_id, fields)
+            return False
+        if isinstance(step, AdaptiveStep):
+            if step.constraints:
+                self._last_error = "adaptive.constraints are not supported in v1"
+                self._state = "ERROR"
+                return True
+            rendered_controller = render_templates(step.controller, self._env_view())
+            if not isinstance(rendered_controller, dict):
+                self._last_error = "adaptive.controller must render to a dict"
+                self._state = "ERROR"
+                return True
+            rendered_space = render_templates(step.space, self._env_view())
+            if not isinstance(rendered_space, dict):
+                self._last_error = "adaptive.space must render to a dict"
+                self._state = "ERROR"
+                return True
+            controller = self._create_adaptive_controller(
+                step,
+                rendered_controller=rendered_controller,
+                rendered_space=rendered_space,
+            )
+            replayed_trials = self._prepare_adaptive_study(
+                step=step,
+                controller=controller,
+                rendered_controller=rendered_controller,
+                rendered_space=rendered_space,
+            )
+            self._stack.append(
+                _AdaptiveFrame(
+                    step=step,
+                    study_id=step.id,
+                    controller=controller,
+                    rendered_controller=rendered_controller,
+                    rendered_space=rendered_space,
+                    started_t=time.monotonic(),
+                    trials_completed=replayed_trials,
+                )
+            )
             return False
         if isinstance(step, SetStep):
             value = render_templates(step.value, self._env_view())
@@ -690,6 +828,884 @@ class SequencerRuntime:
         if isinstance(rendered, list):
             return self._records_from_iterable(rendered)
         return self._records_from_iterable([rendered])
+
+    def _create_adaptive_controller(
+        self,
+        step: AdaptiveStep,
+        *,
+        rendered_controller: dict[str, Any],
+        rendered_space: dict[str, Any],
+    ) -> Any:
+        from ..adaptive import create_adaptive_controller
+
+        repeats = self._coerce_positive_int(
+            step.observe.get("repeats", 1),
+            name="adaptive.observe.repeats",
+        )
+        return create_adaptive_controller(
+            controller_spec=rendered_controller,
+            space=rendered_space,
+            repeats=repeats,
+        )
+
+    def _adaptive_step_ids(self) -> list[str]:
+        if self._spec is None:
+            return []
+        return self._collect_adaptive_step_ids(self._spec.steps)
+
+    def _collect_adaptive_step_ids(self, steps: list[Step]) -> list[str]:
+        out: list[str] = []
+        for step in steps:
+            if isinstance(step, AdaptiveStep):
+                out.append(step.id)
+                out.extend(self._collect_adaptive_step_ids(step.body))
+            elif isinstance(step, ForStep):
+                out.extend(self._collect_adaptive_step_ids(step.body))
+            elif isinstance(step, RepeatStep):
+                out.extend(self._collect_adaptive_step_ids(step.body))
+            elif isinstance(step, IfStep):
+                out.extend(self._collect_adaptive_step_ids(step.then_steps))
+                out.extend(self._collect_adaptive_step_ids(step.else_steps or []))
+            elif isinstance(step, WhileStep):
+                out.extend(self._collect_adaptive_step_ids(step.body))
+            elif isinstance(step, AtomicStep):
+                out.extend(self._collect_adaptive_step_ids(step.body))
+            elif isinstance(step, ParallelStep):
+                out.extend(self._collect_adaptive_step_ids(step.body))
+        return out
+
+    def _normalize_adaptive_start_modes(
+        self, raw: dict[str, Any] | None
+    ) -> dict[str, str]:
+        if raw is None:
+            return {}
+        if not isinstance(raw, dict):
+            raise TypeError("sequencer.start adaptive override must be a dict")
+        out: dict[str, str] = {}
+        for raw_key, raw_value in raw.items():
+            study_id = str(raw_key).strip()
+            if not study_id:
+                raise TypeError("sequencer.start adaptive override keys must be non-empty")
+            if not isinstance(raw_value, dict):
+                raise TypeError(
+                    f"sequencer.start adaptive override for {study_id!r} must be a dict"
+                )
+            mode = str(raw_value.get("mode", "reset") or "reset").strip().lower()
+            if mode not in {"reset", "resume", "warm_start"}:
+                raise ValueError(
+                    f"unsupported adaptive start mode {mode!r} for {study_id!r}"
+                )
+            out[study_id] = mode
+        return out
+
+    def _adaptive_studies_snapshot(self) -> dict[str, Any]:
+        out: dict[str, Any] = {}
+        for study_id, raw in self._adaptive_studies.items():
+            if not isinstance(raw, dict):
+                continue
+            trials = raw.get("trials")
+            out[study_id] = {
+                "controller_kind": str(raw.get("controller_kind", "") or "") or None,
+                "trial_count": len(trials) if isinstance(trials, list) else 0,
+                "last_mode": str(raw.get("last_mode", "") or "") or None,
+            }
+        return out
+
+    def _prepare_adaptive_study(
+        self,
+        *,
+        step: AdaptiveStep,
+        controller: Any,
+        rendered_controller: dict[str, Any],
+        rendered_space: dict[str, Any],
+    ) -> int:
+        study_id = step.id
+        mode = self._adaptive_start_modes.get(study_id, "reset")
+        controller_kind = str(rendered_controller.get("kind", "") or "").strip()
+        reusable_trials: list[dict[str, Any]] = []
+        if mode in {"resume", "warm_start"}:
+            reusable_trials = self._select_reusable_adaptive_trials(
+                study_id=study_id,
+                controller_kind=controller_kind,
+                rendered_space=rendered_space,
+            )
+        self._adaptive_studies[study_id] = {
+            "controller_kind": controller_kind,
+            "space": self._clone_adaptive_value(rendered_space),
+            "trials": [self._clone_adaptive_trial(item) for item in reusable_trials],
+            "last_mode": mode,
+            "last_updated_mono": time.monotonic(),
+        }
+        replayed = 0
+        for trial in reusable_trials:
+            if self._replay_adaptive_trial(controller, trial):
+                replayed += 1
+        return replayed
+
+    def _select_reusable_adaptive_trials(
+        self,
+        *,
+        study_id: str,
+        controller_kind: str,
+        rendered_space: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        raw = self._adaptive_studies.get(study_id)
+        if not isinstance(raw, dict):
+            return []
+        if str(raw.get("controller_kind", "") or "").strip() != controller_kind:
+            return []
+        old_space = raw.get("space")
+        if not isinstance(old_space, dict):
+            return []
+        if set(old_space.keys()) != set(rendered_space.keys()):
+            return []
+        trials = raw.get("trials")
+        if not isinstance(trials, list):
+            return []
+        out: list[dict[str, Any]] = []
+        for raw_trial in trials:
+            if not isinstance(raw_trial, dict) or not bool(raw_trial.get("ok")):
+                continue
+            if self._trial_matches_adaptive_space(raw_trial, rendered_space):
+                out.append(self._clone_adaptive_trial(raw_trial))
+        return out
+
+    def _trial_matches_adaptive_space(
+        self, trial: dict[str, Any], rendered_space: dict[str, Any]
+    ) -> bool:
+        params = trial.get("params")
+        if not isinstance(params, dict):
+            return False
+        for name, spec in rendered_space.items():
+            if not isinstance(spec, dict) or name not in params:
+                return False
+            raw_value = params.get(name)
+            param_type = str(spec.get("type", "") or "").strip().lower()
+            if param_type == "categorical":
+                choices = spec.get("choices")
+                if not isinstance(choices, list) or raw_value not in choices:
+                    return False
+                continue
+            if param_type not in {"float", "int"}:
+                return False
+            try:
+                value = float(raw_value)
+                lower = float(spec.get("min"))
+                upper = float(spec.get("max"))
+            except Exception:
+                return False
+            if value < lower or value > upper or upper <= lower:
+                return False
+        return True
+
+    def _replay_adaptive_trial(self, controller: Any, trial: dict[str, Any]) -> bool:
+        params = trial.get("params")
+        if not isinstance(params, dict) or not params:
+            return False
+        proposal = {
+            "params_raw": dict(trial.get("params_raw") or params),
+            "params": dict(params),
+            "meta": dict(trial.get("proposal_meta") or {}),
+        }
+        try:
+            controller.tell(proposal, self._clone_adaptive_trial(trial))
+        except Exception:
+            return False
+        return True
+
+    def _clone_adaptive_trial(self, trial: dict[str, Any]) -> dict[str, Any]:
+        cloned = self._clone_adaptive_value(trial)
+        if isinstance(cloned, dict):
+            return cloned
+        return {}
+
+    def _clone_adaptive_value(self, value: Any) -> Any:
+        if isinstance(value, dict):
+            return {
+                str(key): self._clone_adaptive_value(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [self._clone_adaptive_value(item) for item in value]
+        return value
+
+    def _coerce_positive_int(self, raw: Any, *, name: str) -> int:
+        try:
+            value = int(render_templates(raw, self._env_view()))
+        except Exception as exc:
+            raise TypeError(f"{name} must be an integer") from exc
+        if value <= 0:
+            raise ValueError(f"{name} must be > 0")
+        return value
+
+    def _adaptive_should_stop(self, frame: _AdaptiveFrame) -> bool:
+        stopping = frame.step.stopping or {}
+        max_trials = stopping.get("max_trials")
+        if max_trials is not None:
+            try:
+                limit = int(render_templates(max_trials, self._env_view()))
+            except Exception as exc:
+                raise TypeError("adaptive.stopping.max_trials must be an integer") from exc
+            if limit >= 0 and frame.trials_completed >= limit:
+                return True
+
+        max_runtime_s = stopping.get("max_runtime_s")
+        if max_runtime_s is not None:
+            try:
+                limit_s = float(render_templates(max_runtime_s, self._env_view()))
+            except Exception as exc:
+                raise TypeError(
+                    "adaptive.stopping.max_runtime_s must be a number"
+                ) from exc
+            if limit_s >= 0 and (time.monotonic() - frame.started_t) >= limit_s:
+                return True
+
+        target_score = stopping.get("target_score")
+        if target_score is not None and frame.best_score is not None:
+            try:
+                target = float(render_templates(target_score, self._env_view()))
+            except Exception as exc:
+                raise TypeError(
+                    "adaptive.stopping.target_score must be a number"
+                ) from exc
+            direction = str(
+                frame.rendered_controller.get("direction", "maximize") or "maximize"
+            )
+            if direction == "minimize":
+                if frame.best_score <= target:
+                    return True
+            else:
+                if frame.best_score >= target:
+                    return True
+
+        patience = stopping.get("patience")
+        if patience is not None:
+            try:
+                limit = int(render_templates(patience, self._env_view()))
+            except Exception as exc:
+                raise TypeError("adaptive.stopping.patience must be an integer") from exc
+            if limit >= 0 and frame.no_improve_trials >= limit:
+                return True
+
+        return False
+
+    def _prepare_adaptive_proposal(self, frame: _AdaptiveFrame) -> dict[str, Any]:
+        raw = frame.controller.suggest()
+        if not isinstance(raw, dict):
+            raise TypeError("adaptive controller must return a dict proposal")
+        params_raw = raw.get("params_raw") or {}
+        if not isinstance(params_raw, dict) or not params_raw:
+            raise TypeError("adaptive controller proposal must include params_raw")
+        meta = raw.get("meta") or {}
+        if not isinstance(meta, dict):
+            raise TypeError("adaptive controller proposal meta must be a dict")
+        params = self._apply_adaptive_space(frame.rendered_space, params_raw)
+        return {
+            "params_raw": dict(params_raw),
+            "params": params,
+            "meta": dict(meta),
+        }
+
+    def _apply_adaptive_space(
+        self, space: dict[str, Any], params_raw: dict[str, Any]
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {}
+        for name, spec in space.items():
+            if not isinstance(spec, dict):
+                raise TypeError(f"adaptive.space.{name} must be a dict")
+            if name not in params_raw:
+                raise KeyError(f"adaptive controller proposal is missing parameter {name!r}")
+            params[name] = self._coerce_adaptive_param(
+                name=name,
+                spec=spec,
+                raw_value=params_raw[name],
+            )
+        return params
+
+    def _coerce_adaptive_param(
+        self,
+        *,
+        name: str,
+        spec: dict[str, Any],
+        raw_value: Any,
+    ) -> Any:
+        param_type = str(spec.get("type", "") or "").strip().lower()
+        if param_type == "categorical":
+            choices = spec.get("choices")
+            if not isinstance(choices, list) or not choices:
+                raise TypeError(
+                    f"adaptive.space.{name}.choices must be a non-empty list"
+                )
+            if raw_value not in choices:
+                raise ValueError(
+                    f"adaptive controller proposed invalid value {raw_value!r} for {name!r}"
+                )
+            return raw_value
+
+        if param_type not in {"float", "int"}:
+            raise ValueError(
+                f"adaptive.space.{name}.type {param_type!r} is not supported in v1"
+            )
+
+        try:
+            value = float(raw_value)
+            lower = float(spec.get("min"))
+            upper = float(spec.get("max"))
+        except Exception as exc:
+            raise TypeError(
+                f"adaptive.space.{name} requires numeric min/max and numeric values"
+            ) from exc
+        if upper <= lower:
+            raise ValueError(f"adaptive.space.{name} requires max > min")
+
+        snap = bool(spec.get("snap", False))
+        step = spec.get("step")
+        if snap and step is not None:
+            try:
+                step_size = float(step)
+            except Exception as exc:
+                raise TypeError(f"adaptive.space.{name}.step must be numeric") from exc
+            if step_size <= 0:
+                raise ValueError(f"adaptive.space.{name}.step must be > 0")
+            try:
+                origin = float(spec.get("origin", lower))
+            except Exception as exc:
+                raise TypeError(f"adaptive.space.{name}.origin must be numeric") from exc
+            value = origin + round((value - origin) / step_size) * step_size
+
+        value = max(lower, min(upper, value))
+
+        if param_type == "int":
+            return int(round(value))
+        return value
+
+    def _bind_adaptive_proposal(
+        self, step: AdaptiveStep, proposal: dict[str, Any]
+    ) -> None:
+        params = proposal.get("params") or {}
+        meta = proposal.get("meta") or {}
+        if not isinstance(params, dict) or not isinstance(meta, dict):
+            raise TypeError("adaptive proposal params/meta must be dicts")
+        source_values: dict[str, Any] = dict(params)
+        source_values.update(meta)
+        for source, target in step.bind.items():
+            if source not in source_values:
+                raise KeyError(f"adaptive proposal is missing bound field {source!r}")
+            self._env[target] = source_values[source]
+
+    def _after_adaptive_body(self, frame: _AdaptiveFrame) -> None:
+        proposal = frame.proposal
+        if proposal is None:
+            return
+        if self._adaptive_observe_uses_analysis(frame.step.observe):
+            self._start_adaptive_observation(frame, proposal)
+            return
+        trial = self._collect_adaptive_trial(frame.step, proposal)
+        self._finalize_adaptive_trial(frame, proposal, trial)
+
+    def _adaptive_observe_uses_analysis(self, observe: dict[str, Any]) -> bool:
+        metrics_spec = observe.get("metrics")
+        if not isinstance(metrics_spec, dict):
+            return False
+        for source_spec in metrics_spec.values():
+            if not isinstance(source_spec, dict):
+                continue
+            if str(source_spec.get("kind", "") or "").strip() == "analysis_output":
+                return True
+        return False
+
+    def _start_adaptive_observation(
+        self,
+        frame: _AdaptiveFrame,
+        proposal: dict[str, Any],
+    ) -> None:
+        trial: dict[str, Any] = {
+            "ok": True,
+            "context_id": int(self._context_id),
+            "params_raw": dict(proposal.get("params_raw") or {}),
+            "params": dict(proposal.get("params") or {}),
+            "proposal_meta": dict(proposal.get("meta") or {}),
+            "state": {},
+            "metrics": {},
+            "replicates": {},
+            "aggregates": {},
+            "score": None,
+        }
+        try:
+            if frame.step.state:
+                trial["state"] = self._collect_adaptive_state(frame.step.state)
+        except Exception as exc:
+            trial["ok"] = False
+            trial["error"] = {"message": str(exc)}
+            self._finalize_adaptive_trial(frame, proposal, trial)
+            return
+
+        metrics_spec = frame.step.observe.get("metrics")
+        if not isinstance(metrics_spec, dict) or not metrics_spec:
+            trial["ok"] = False
+            trial["error"] = {"message": "adaptive.observe.metrics must be a non-empty dict"}
+            self._finalize_adaptive_trial(frame, proposal, trial)
+            return
+
+        repeats = self._coerce_positive_int(
+            frame.step.observe.get("repeats", 1),
+            name="adaptive.observe.repeats",
+        )
+        trial["replicates"] = {str(name): [] for name in metrics_spec}
+        self._adaptive_observe_state = _AdaptiveObserveState(
+            frame=frame,
+            proposal=proposal,
+            trial=trial,
+            repeats=repeats,
+            metrics_spec={str(name): spec for name, spec in metrics_spec.items()},
+            current_repeat=0,
+            started_t=time.monotonic(),
+        )
+
+    def _step_adaptive_observation(self, now: float) -> bool:
+        state = self._adaptive_observe_state
+        if state is None:
+            return True
+        trial = state.trial
+        if not bool(trial.get("ok")):
+            self._adaptive_observe_state = None
+            self._finalize_adaptive_trial(state.frame, state.proposal, trial)
+            return True
+
+        if state.current_repeat < state.repeats:
+            try:
+                if not self._collect_adaptive_repeat(state, now):
+                    return False
+            except Exception as exc:
+                trial["ok"] = False
+                trial["error"] = {"message": str(exc)}
+                self._adaptive_observe_state = None
+                self._finalize_adaptive_trial(state.frame, state.proposal, trial)
+                return True
+            return False
+
+        try:
+            metrics, aggregates = self._finalize_adaptive_metrics_from_replicates(
+                trial.get("replicates") or {}
+            )
+            trial["metrics"] = metrics
+            trial["aggregates"] = aggregates
+            trial["score"] = self._compute_adaptive_score(
+                state.frame.step.observe,
+                metrics,
+                aggregates,
+            )
+            if trial["score"] is None:
+                raise RuntimeError("adaptive step requires a numeric score in v1")
+            trial["score"] = float(trial["score"])
+        except Exception as exc:
+            trial["ok"] = False
+            trial["error"] = {"message": str(exc)}
+
+        self._adaptive_observe_state = None
+        self._finalize_adaptive_trial(state.frame, state.proposal, trial)
+        return True
+
+    def _collect_adaptive_repeat(self, state: _AdaptiveObserveState, now: float) -> bool:
+        del now
+        repeat_values: dict[str, Any] = {}
+        pending_analysis = False
+        for name, source_spec in state.metrics_spec.items():
+            if not isinstance(source_spec, dict):
+                raise TypeError("adaptive source specs must be dicts")
+            kind = str(source_spec.get("kind", "") or "").strip()
+            if kind != "analysis_output":
+                continue
+            value = self._try_sample_analysis_output(source_spec, state.trial)
+            if value is _NO_STEP_READY:
+                pending_analysis = True
+                break
+            repeat_values[name] = value
+
+        if pending_analysis:
+            return False
+
+        for name, source_spec in state.metrics_spec.items():
+            if name in repeat_values:
+                continue
+            repeat_values[name] = self._sample_adaptive_source(source_spec)
+
+        replicates = state.trial.get("replicates") or {}
+        if not isinstance(replicates, dict):
+            raise TypeError("adaptive trial replicates must be a dict")
+        for name, value in repeat_values.items():
+            bucket = replicates.setdefault(name, [])
+            if not isinstance(bucket, list):
+                raise TypeError("adaptive trial replicate buckets must be lists")
+            bucket.append(value)
+        state.current_repeat += 1
+        return state.current_repeat >= state.repeats
+
+    def _try_sample_analysis_output(
+        self,
+        source_spec: dict[str, Any],
+        trial: dict[str, Any],
+    ) -> Any:
+        config = source_spec.get("config") or {}
+        if not isinstance(config, dict):
+            raise TypeError("adaptive analysis_output config must be a dict")
+        rendered = render_templates(config, self._env_view())
+        if not isinstance(rendered, dict):
+            raise TypeError("adaptive analysis_output config must render to a dict")
+        workspace_id = str(rendered.get("workspace_id", "") or "").strip()
+        output_id = str(rendered.get("output_id", "") or "").strip()
+        if not workspace_id or not output_id:
+            raise ValueError(
+                "adaptive analysis_output source requires workspace_id and output_id"
+            )
+        require_current_context = bool(rendered.get("require_current_context", True))
+        timeout_s = float(rendered.get("timeout_s", 5.0) or 0.0)
+        context_id = trial.get("context_id")
+        current_context = int(context_id) if context_id is not None else None
+
+        for index, payload in enumerate(list(self._analysis_outputs)):
+            if not isinstance(payload, dict):
+                continue
+            if str(payload.get("workspace_id", "") or "").strip() != workspace_id:
+                continue
+            if str(payload.get("output_id", "") or "").strip() != output_id:
+                continue
+
+            payload_context = payload.get("context_id")
+            if require_current_context:
+                if payload_context is None:
+                    continue
+                try:
+                    payload_context_i = int(payload_context)
+                except Exception:
+                    continue
+                if current_context is None:
+                    continue
+                if payload_context_i < current_context:
+                    try:
+                        del self._analysis_outputs[index]
+                    except Exception:
+                        pass
+                    return _NO_STEP_READY
+                if payload_context_i != current_context:
+                    continue
+
+            try:
+                matched = self._analysis_outputs[index]
+                del self._analysis_outputs[index]
+            except Exception:
+                matched = payload
+            return self._extract_analysis_output_value(matched, rendered)
+
+        if timeout_s > 0:
+            error = trial.get("error")
+            if error is None:
+                trial["error"] = {}
+            started_mono = trial.setdefault("_observe_started_mono", time.monotonic())
+            if (time.monotonic() - float(started_mono)) >= timeout_s:
+                raise RuntimeError(
+                    f"adaptive analysis_output timed out for {workspace_id}.{output_id}"
+                )
+        return _NO_STEP_READY
+
+    def _extract_analysis_output_value(
+        self,
+        payload: dict[str, Any],
+        config: dict[str, Any],
+    ) -> Any:
+        extract = config.get("extract")
+        value = payload.get("value")
+        if isinstance(extract, dict):
+            return extract_value(
+                value,
+                kind=extract.get("kind", "scalar"),
+                ref=extract.get("ref"),
+            )
+        if "value" in payload:
+            return value
+        return payload
+
+    def _finalize_adaptive_trial(
+        self,
+        frame: _AdaptiveFrame,
+        proposal: dict[str, Any],
+        trial: dict[str, Any],
+    ) -> None:
+        trial.pop("_observe_started_mono", None)
+        self._update_adaptive_tracking(frame, trial)
+        self._publish_adaptive_trial_env(trial)
+        try:
+            if bool(trial.get("ok")) or not frame.step.fail_on_trial_error:
+                frame.controller.tell(proposal, trial)
+            self._store_adaptive_trial(frame, trial)
+        finally:
+            frame.proposal = None
+            frame.trials_completed += 1
+
+        if not bool(trial.get("ok")) and frame.step.fail_on_trial_error:
+            error = trial.get("error") or {}
+            message = str(error.get("message") or "adaptive trial failed")
+            self._last_error = message
+            self._state = "ERROR"
+
+    def _collect_adaptive_trial(
+        self,
+        step: AdaptiveStep,
+        proposal: dict[str, Any],
+    ) -> dict[str, Any]:
+        trial: dict[str, Any] = {
+            "ok": True,
+            "context_id": int(self._context_id),
+            "params_raw": dict(proposal.get("params_raw") or {}),
+            "params": dict(proposal.get("params") or {}),
+            "proposal_meta": dict(proposal.get("meta") or {}),
+            "state": {},
+            "metrics": {},
+            "replicates": {},
+            "aggregates": {},
+            "score": None,
+        }
+        try:
+            if step.state:
+                trial["state"] = self._collect_adaptive_state(step.state)
+            metrics, replicates, aggregates = self._collect_adaptive_metrics(step.observe)
+            trial["metrics"] = metrics
+            trial["replicates"] = replicates
+            trial["aggregates"] = aggregates
+            trial["score"] = self._compute_adaptive_score(step.observe, metrics, aggregates)
+            if trial["score"] is None:
+                raise RuntimeError("adaptive step requires a numeric score in v1")
+            try:
+                trial["score"] = float(trial["score"])
+            except Exception as exc:
+                raise RuntimeError("adaptive score must be numeric") from exc
+        except Exception as exc:
+            trial["ok"] = False
+            trial["error"] = {
+                "message": str(exc),
+            }
+        return trial
+
+    def _store_adaptive_trial(self, frame: _AdaptiveFrame, trial: dict[str, Any]) -> None:
+        record = self._adaptive_studies.setdefault(
+            frame.study_id,
+            {
+                "controller_kind": str(
+                    frame.rendered_controller.get("kind", "") or ""
+                ).strip(),
+                "space": self._clone_adaptive_value(frame.rendered_space),
+                "trials": [],
+                "last_mode": self._adaptive_start_modes.get(frame.study_id, "reset"),
+                "last_updated_mono": time.monotonic(),
+            },
+        )
+        trials = record.get("trials")
+        if not isinstance(trials, list):
+            trials = []
+            record["trials"] = trials
+        trials.append(self._clone_adaptive_trial(trial))
+        record["last_updated_mono"] = time.monotonic()
+
+    def _collect_adaptive_state(self, state_spec: dict[str, Any]) -> dict[str, Any]:
+        out: dict[str, Any] = {}
+        for name, source_spec in state_spec.items():
+            out[str(name)] = self._sample_adaptive_source(source_spec)
+        return out
+
+    def _collect_adaptive_metrics(
+        self, observe: dict[str, Any]
+    ) -> tuple[dict[str, Any], dict[str, list[Any]], dict[str, dict[str, Any]]]:
+        metrics_spec = observe.get("metrics")
+        if not isinstance(metrics_spec, dict) or not metrics_spec:
+            raise TypeError("adaptive.observe.metrics must be a non-empty dict")
+        repeats = self._coerce_positive_int(
+            observe.get("repeats", 1),
+            name="adaptive.observe.repeats",
+        )
+        metrics: dict[str, Any] = {}
+        replicates: dict[str, list[Any]] = {str(name): [] for name in metrics_spec}
+        for _ in range(repeats):
+            for raw_name, source_spec in metrics_spec.items():
+                name = str(raw_name)
+                replicates[name].append(self._sample_adaptive_source(source_spec))
+
+        metrics, aggregates = self._finalize_adaptive_metrics_from_replicates(replicates)
+        return metrics, replicates, aggregates
+
+    def _finalize_adaptive_metrics_from_replicates(
+        self,
+        replicates: dict[str, list[Any]],
+    ) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
+        aggregates: dict[str, dict[str, Any]] = {}
+        metrics: dict[str, Any] = {}
+        for name, values in replicates.items():
+            stats = self._build_adaptive_aggregates(values)
+            aggregates[name] = stats
+            if "mean" in stats:
+                metrics[name] = stats["mean"]
+            elif values:
+                metrics[name] = values[-1]
+            else:
+                metrics[name] = None
+        return metrics, aggregates
+
+    def _build_adaptive_aggregates(self, values: list[Any]) -> dict[str, Any]:
+        numeric_values: list[float] = []
+        n_ok = 0
+        for item in values:
+            if item is None:
+                continue
+            n_ok += 1
+            try:
+                numeric_values.append(float(item))
+            except Exception:
+                continue
+
+        out: dict[str, Any] = {
+            "n": len(values),
+            "n_ok": n_ok,
+        }
+        if not numeric_values:
+            return out
+
+        count = len(numeric_values)
+        mean_value = statistics.fmean(numeric_values)
+        std_value = statistics.stdev(numeric_values) if count > 1 else 0.0
+        out.update(
+            {
+                "mean": mean_value,
+                "std": std_value,
+                "min": min(numeric_values),
+                "max": max(numeric_values),
+                "median": statistics.median(numeric_values),
+                "sem": (std_value / math.sqrt(count)) if count > 0 else None,
+            }
+        )
+        return out
+
+    def _compute_adaptive_score(
+        self,
+        observe: dict[str, Any],
+        metrics: dict[str, Any],
+        aggregates: dict[str, dict[str, Any]],
+    ) -> Any:
+        score_spec = observe.get("score")
+        env = self._env_view()
+        for name, value in metrics.items():
+            env[name] = value
+        for name, stats in aggregates.items():
+            for stat_name, stat_value in stats.items():
+                env[f"{name}_{stat_name}"] = stat_value
+        if score_spec is not None:
+            return render_templates(score_spec, env)
+        if len(metrics) == 1:
+            return next(iter(metrics.values()))
+        return None
+
+    def _publish_adaptive_trial_env(self, trial: dict[str, Any]) -> None:
+        metrics = trial.get("metrics") or {}
+        if isinstance(metrics, dict):
+            for name, value in metrics.items():
+                self._env[str(name)] = value
+        aggregates = trial.get("aggregates") or {}
+        if isinstance(aggregates, dict):
+            for name, stats in aggregates.items():
+                if not isinstance(stats, dict):
+                    continue
+                for stat_name, stat_value in stats.items():
+                    self._env[f"{name}_{stat_name}"] = stat_value
+        if "score" in trial:
+            self._env["score"] = trial.get("score")
+
+    def _update_adaptive_tracking(self, frame: _AdaptiveFrame, trial: dict[str, Any]) -> None:
+        score = trial.get("score")
+        if score is None:
+            frame.no_improve_trials += 1
+            return
+        try:
+            score_value = float(score)
+        except Exception:
+            frame.no_improve_trials += 1
+            return
+        if frame.best_score is None:
+            frame.best_score = score_value
+            frame.no_improve_trials = 0
+            return
+        direction = str(
+            frame.rendered_controller.get("direction", "maximize") or "maximize"
+        )
+        improved = (
+            score_value < frame.best_score if direction == "minimize" else score_value > frame.best_score
+        )
+        if improved:
+            frame.best_score = score_value
+            frame.no_improve_trials = 0
+        else:
+            frame.no_improve_trials += 1
+
+    def _sample_adaptive_source(self, source_spec: Any) -> Any:
+        if not isinstance(source_spec, dict):
+            raise TypeError("adaptive source specs must be dicts")
+        kind = str(source_spec.get("kind", "") or "").strip()
+        config = source_spec.get("config") or {}
+        if not isinstance(config, dict):
+            raise TypeError("adaptive source config must be a dict")
+        rendered = render_templates(config, self._env_view())
+        if not isinstance(rendered, dict):
+            raise TypeError("adaptive source config must render to a dict")
+
+        if kind == "analysis_output":
+            raise RuntimeError(
+                "adaptive analysis_output sources are asynchronous and must be sampled by the adaptive runtime"
+            )
+
+        if kind == "telemetry":
+            return self._sample_adaptive_telemetry(rendered)
+
+        if kind == "call":
+            return self._sample_adaptive_call(rendered)
+
+        raise ValueError(f"unsupported adaptive source kind {kind!r}")
+
+    def _sample_adaptive_telemetry(self, config: dict[str, Any]) -> Any:
+        device = str(config.get("device", "") or "").strip()
+        signal = str(config.get("signal", "") or "").strip()
+        if not device or not signal:
+            raise ValueError("adaptive telemetry source requires device and signal")
+        timeout_s = float(config.get("timeout_s", 0.0) or 0.0)
+        max_age_s = float(config.get("max_age_s", 0.0) or 0.0)
+        deadline = time.monotonic() + max(0.0, timeout_s)
+        while True:
+            sample = self._get_telemetry(device, signal)
+            if sample:
+                age = time.monotonic() - float(sample.get("t_mono", 0.0) or 0.0)
+                if (not max_age_s) or age <= max_age_s:
+                    return sample.get("value")
+            if timeout_s <= 0.0 or time.monotonic() >= deadline:
+                raise RuntimeError(
+                    f"adaptive telemetry source timed out for {device}.{signal}"
+                )
+            time.sleep(0.01)
+
+    def _sample_adaptive_call(self, config: dict[str, Any]) -> Any:
+        device = str(config.get("device", "") or "").strip()
+        action = str(config.get("action", "") or "").strip()
+        if not device or not action:
+            raise ValueError("adaptive call source requires device and action")
+        params = config.get("params", {}) or {}
+        if not isinstance(params, dict):
+            raise TypeError("adaptive call source params must be a dict")
+        resp = self._call_device(device, action, params)
+        if not resp.get("ok", False):
+            raise RuntimeError(str(resp.get("error", "adaptive call source failed")))
+        extract = config.get("extract")
+        if isinstance(extract, dict):
+            return extract_value(
+                resp.get("result"),
+                kind=extract.get("kind", "scalar"),
+                ref=extract.get("ref"),
+            )
+        return resp.get("result")
 
     def _resolve_value(self, value: Any) -> Any:
         env = self._env_view()
