@@ -1,5 +1,5 @@
-import { ActionIcon, Button, Card, Group, Select, Stack, Text, TextInput } from "@mantine/core";
-import { IconPlus, IconTrash } from "@tabler/icons-react";
+import { ActionIcon, Button, Card, Group, Menu, Select, Stack, Text, TextInput } from "@mantine/core";
+import { IconChevronDown, IconPlus, IconTrash } from "@tabler/icons-react";
 import { useEffect, useState } from "react";
 import {
   applyEditedCallStep,
@@ -501,6 +501,9 @@ export function EditableStepInspector({
       value: field,
       label: field,
     }));
+    const unusedBindFieldOptions = bindFieldOptions.filter(
+      (option) => !bind.some((entry) => entry.name === option.value)
+    );
     const scalarFieldNames =
       sourceMode === "generator" ? scalarGeneratorFieldNames(iterableKind) : null;
 
@@ -518,29 +521,70 @@ export function EditableStepInspector({
             <Text size="xs" fw={600}>
               Bind
             </Text>
-            <Button
-              size="compact-xs"
-              variant="light"
-              leftSection={<IconPlus size={14} />}
-              onClick={() =>
-                updateFor(
-                  [
-                    ...bind,
-                    {
-                      name: nextBindSourceField(sourceMode, iterableKind, bind),
-                      value: '""',
-                    },
-                  ],
-                  sourceMode,
-                  iterableKind,
-                  directValue,
-                  generatorModifiers,
-                  iterableConfig
-                )
-              }
-            >
-              Add
-            </Button>
+            {sourceMode === "generator" ? (
+              <Menu shadow="md" withArrow position="bottom-end" zIndex={1000}>
+                <Menu.Target>
+                  <Button
+                    size="compact-xs"
+                    variant="light"
+                    leftSection={<IconPlus size={14} />}
+                    rightSection={<IconChevronDown size={12} />}
+                    disabled={unusedBindFieldOptions.length <= 0}
+                  >
+                    Add
+                  </Button>
+                </Menu.Target>
+                <Menu.Dropdown>
+                  {unusedBindFieldOptions.map((option) => (
+                    <Menu.Item
+                      key={option.value}
+                      onClick={() =>
+                        updateFor(
+                          [
+                            ...bind,
+                            {
+                              name: option.value,
+                              value: '""',
+                            },
+                          ],
+                          sourceMode,
+                          iterableKind,
+                          directValue,
+                          generatorModifiers,
+                          iterableConfig
+                        )
+                      }
+                    >
+                      {option.label}
+                    </Menu.Item>
+                  ))}
+                </Menu.Dropdown>
+              </Menu>
+            ) : (
+              <Button
+                size="compact-xs"
+                variant="light"
+                leftSection={<IconPlus size={14} />}
+                onClick={() =>
+                  updateFor(
+                    [
+                      ...bind,
+                      {
+                        name: nextBindSourceField(sourceMode, iterableKind, bind),
+                        value: '""',
+                      },
+                    ],
+                    sourceMode,
+                    iterableKind,
+                    directValue,
+                    generatorModifiers,
+                    iterableConfig
+                  )
+                }
+              >
+                Add
+              </Button>
+            )}
           </Group>
           {bind.length <= 0 ? (
             <Text size="xs" c="dimmed">
@@ -555,7 +599,13 @@ export function EditableStepInspector({
                       <Select
                         size="xs"
                         aria-label="Bind source"
-                        data={bindFieldOptions}
+                        data={bindFieldOptions.map((option) => ({
+                          ...option,
+                          disabled: bind.some(
+                            (item, itemIndex) =>
+                              itemIndex !== index && item.name === option.value
+                          ),
+                        }))}
                         value={entry.name}
                         onChange={(value) => {
                           if (value === null) {
