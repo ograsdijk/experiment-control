@@ -48,7 +48,7 @@ export function SettingsModal({
       opened={opened}
       onClose={onClose}
       title="Settings"
-      size="lg"
+      size="clamp(42rem, 82vw, 64rem)"
       centered
       zIndex={425}
     >

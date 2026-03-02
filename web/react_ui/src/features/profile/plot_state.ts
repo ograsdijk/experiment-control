@@ -74,6 +74,7 @@ export function normalizePlotState(
       workspaceId?: unknown;
       outputId?: unknown;
       overlayOutputIds?: unknown;
+      fitOverlayOutputIds?: unknown;
       timeWindowS?: unknown;
       traces?: unknown;
       stream?: unknown;
@@ -89,6 +90,7 @@ export function normalizePlotState(
       reducer?: unknown;
       uncertaintyMode?: unknown;
       uncertaintyScale?: unknown;
+      showBinMarkers?: unknown;
       yScaleMode?: unknown;
       yMin?: unknown;
       yMax?: unknown;
@@ -340,6 +342,11 @@ export function normalizePlotState(
             .map((value) => String(value ?? "").trim())
             .filter((value) => value.length > 0)
         : [];
+      const fitOverlayOutputIds = Array.isArray(panel.fitOverlayOutputIds)
+        ? panel.fitOverlayOutputIds
+            .map((value) => String(value ?? "").trim())
+            .filter((value) => value.length > 0)
+        : [];
       panels.push({
         id,
         title,
@@ -347,6 +354,7 @@ export function normalizePlotState(
         workspaceId,
         outputId: outputIdRaw || null,
         overlayOutputIds,
+        fitOverlayOutputIds,
         stream: streamTarget,
         channelIndex,
         analysis: normalizeStreamAnalysisSettings(panel.analysis),
@@ -359,6 +367,7 @@ export function normalizePlotState(
           }
           return raw;
         })(),
+        showBinMarkers: panel.showBinMarkers === true,
         yScaleMode,
         yMin,
         yMax,

@@ -24,6 +24,7 @@ import {
   IconCheck,
   IconCpu,
   IconFileText,
+  IconArrowsMaximize,
   IconPlayerPause,
   IconPlayerPlay,
   IconShieldCheck,
@@ -64,25 +65,13 @@ import {
   validateStreamWorkspace,
   type GatewaySettingsInfo,
 } from "./api";
+import { AppModalsLayer } from "./components/AppModalsLayer";
+import { DashboardHeaderBar } from "./components/DashboardHeaderBar";
 import { DeviceCard } from "./components/DeviceCard";
 import { DeviceNameInline } from "./components/DeviceNameInline";
-import { CommandHistoryModal } from "./components/CommandHistoryModal";
-import { DaqWorkspacesModal } from "./components/DaqWorkspacesModal";
-import { DeviceCommandModal } from "./components/DeviceCommandModal";
-import { HdfMeasurementNoteModal } from "./components/HdfMeasurementNoteModal";
-import { HdfWriterModal } from "./components/HdfWriterModal";
-import { InterlocksModal } from "./components/InterlocksModal";
-import { LogsModal } from "./components/LogsModal";
 import { PlotPanel, computeTelemetryAutoYRange } from "./components/PlotPanel";
-import { ProcessCommandModal } from "./components/ProcessCommandModal";
-import { ProcessesModal } from "./components/ProcessesModal";
-import { SequencerModal } from "./components/SequencerModal";
-import { SettingsModal } from "./components/SettingsModal";
-import { StreamBin2dOptionsModal } from "./components/StreamBin2dOptionsModal";
-import { StreamBinStatsOptionsModal } from "./components/StreamBinStatsOptionsModal";
-import { StreamParamsOptionsModal } from "./components/StreamParamsOptionsModal";
+import { PlotModalsLayer } from "./components/PlotModalsLayer";
 import { StreamParamsPanel } from "./components/StreamParamsPanel";
-import { StreamTraceOptionsModal } from "./components/StreamTraceOptionsModal";
 import {
   StreamRawPanel,
   computeStreamRawAutoYRange,
@@ -104,8 +93,7 @@ import {
   type StreamBin2dSeries,
 } from "./components/StreamBin2dPanel";
 import { DagGraphPreview } from "./components/DagGraphPreview";
-import { YAxisModal } from "./components/YAxisModal";
-import { clampCommandHistoryLimit } from "./features/commands/utils";
+import { WorkspaceCommandLayer } from "./components/WorkspaceCommandLayer";
 import { useCommandHistoryController } from "./features/commands/useCommandHistoryController";
 import { sameStringArray, sameStringRecord } from "./features/common/compare";
 import {
@@ -169,6 +157,7 @@ import type {
   StreamBin2dSnapshot,
   StreamBinStatsSettings,
   StreamBinStatsSnapshot,
+  StreamFitCurveSnapshot,
   StreamDagNodeConfig,
   StreamDagOpId,
   StreamDagOutputConfig,
@@ -200,6 +189,7 @@ import {
   STREAM_DAG_OPS,
 } from "./features/stream/dag";
 import {
+  normalizeFitCurveValue,
   normalizeHistAggValue,
   normalizeHist2dValue,
   normalizeFitParamsMapValue,
@@ -305,14 +295,6 @@ const DEFAULT_NAV_WIDTH = 360;
 const NAV_MIN_WIDTH = 260;
 const NAV_MAX_WIDTH = 900;
 const MAX_LOG_ROWS = 2000;
-const DEFAULT_COMMAND_HISTORY_LIMIT = 200;
-const MIN_COMMAND_HISTORY_LIMIT = 20;
-const MAX_COMMAND_HISTORY_LIMIT = 2000;
-const COMMAND_HISTORY_LIMIT_BOUNDS = {
-  fallback: DEFAULT_COMMAND_HISTORY_LIMIT,
-  min: MIN_COMMAND_HISTORY_LIMIT,
-  max: MAX_COMMAND_HISTORY_LIMIT,
-} as const;
 const MAX_STREAM_FRAME_BUFFER = 240;
 const STREAM_ANALYSIS_PROCESS_ID = "stream_analysis";
 type LatestSignals = Record<string, Record<string, TelemetrySignal>>;
@@ -434,6 +416,7 @@ export function App() {
   const [daqFocusedNodeId, setDaqFocusedNodeId] = useState<string | null>(null);
   const [plotTick, setPlotTick] = useState(0);
   const [yAxisModalPanelId, setYAxisModalPanelId] = useState<string | null>(null);
+  const [expandedPlotPanelId, setExpandedPlotPanelId] = useState<string | null>(null);
   const [streamTraceOptionsPanelId, setStreamTraceOptionsPanelId] = useState<
     string | null
   >(null);
@@ -565,6 +548,10 @@ export function App() {
     () => new Map<string, Map<string, { seq: number; values: number[] }>>(),
     []
   );
+  const streamBinStatsFitOverlayRef = useMemo(
+    () => new Map<string, Map<string, StreamFitCurveSnapshot>>(),
+    []
+  );
   const streamParamsLatestRef = useMemo(
     () => new Map<string, Record<string, StreamParamsOutputValue>>(),
     []
@@ -595,6 +582,10 @@ export function App() {
     };
   }, []);
 
+  const processesController = useProcessesController({
+    callProcessFn: callProcess,
+  });
+
   const {
     processes,
     processOpen,
@@ -606,7 +597,10 @@ export function App() {
     refreshProcesses,
     ensureProcessCapabilitiesLoaded,
     invalidateProcessCapabilities,
-  } = useProcessesController({
+  } = processesController;
+
+  const commandHistoryController = useCommandHistoryController({
+    callDeviceFn: callDevice,
     callProcessFn: callProcess,
   });
 
@@ -631,10 +625,7 @@ export function App() {
     filteredCommandHistoryRows,
     sendDeviceCommand,
     sendProcessCommand,
-  } = useCommandHistoryController({
-    callDeviceFn: callDevice,
-    callProcessFn: callProcess,
-  });
+  } = commandHistoryController;
 
   const {
     capabilitiesByDevice,
@@ -739,6 +730,10 @@ export function App() {
     () => panels.find((panel) => panel.id === yAxisModalPanelId) ?? null,
     [panels, yAxisModalPanelId]
   );
+  const expandedPlotPanel = useMemo(
+    () => panels.find((panel) => panel.id === expandedPlotPanelId) ?? null,
+    [expandedPlotPanelId, panels]
+  );
   const streamTraceOptionsPanel = useMemo(() => {
     const panel = panels.find((entry) => entry.id === streamTraceOptionsPanelId) ?? null;
     if (!panel || !isStreamTracePanel(panel)) {
@@ -779,6 +774,9 @@ export function App() {
   }, [streamBinStatsOptionsWorkspace]);
   const streamBinStatsOptionsTraceOverlayOptions = useMemo(() => {
     return workspaceOutputOptionsByKind(streamBinStatsOptionsWorkspace, "trace");
+  }, [streamBinStatsOptionsWorkspace]);
+  const streamBinStatsOptionsFitOverlayOptions = useMemo(() => {
+    return workspaceOutputOptionsByKind(streamBinStatsOptionsWorkspace, "fit_1d");
   }, [streamBinStatsOptionsWorkspace]);
   const streamBinStatsOptionsXLabel = useMemo(() => {
     return workspaceXAxisLabel(
@@ -927,7 +925,7 @@ export function App() {
   >(() => {
     const outputKindsByWorkspace = new Map<
       string,
-      Set<"scalar" | "hist_agg" | "hist2d" | "params_map">
+      Set<"scalar" | "hist_agg" | "hist2d" | "params_map" | "fit_1d">
     >();
     const traceConfigsByWorkspace = new Map<
       string,
@@ -968,6 +966,9 @@ export function App() {
       if (isStreamBinStatsPanel(panel)) {
         const kinds = outputKindsByWorkspace.get(workspaceId) ?? new Set();
         kinds.add("hist_agg");
+        if ((panel.fitOverlayOutputIds ?? []).length > 0) {
+          kinds.add("fit_1d");
+        }
         outputKindsByWorkspace.set(workspaceId, kinds);
         if ((panel.overlayOutputIds ?? []).length > 0) {
           const configs = traceConfigsByWorkspace.get(workspaceId) ?? new Map();
@@ -1021,7 +1022,7 @@ export function App() {
       const outputKinds = outputKindsByWorkspace.get(workspaceId);
       if (outputKinds && outputKinds.size > 0) {
         const kinds = [...outputKinds].sort() as Array<
-          "scalar" | "hist_agg" | "hist2d" | "params_map"
+          "scalar" | "hist_agg" | "hist2d" | "params_map" | "fit_1d"
         >;
         out.push({
           workspaceId,
@@ -1634,16 +1635,26 @@ export function App() {
           const validTraceOutputIds = new Set(
             workspaceOutputOptionsByKind(workspace, "trace").map((item) => item.value)
           );
+          const validFitOutputIds = new Set(
+            workspaceOutputOptionsByKind(workspace, "fit_1d").map((item) => item.value)
+          );
           const overlayOutputIds = (panel.overlayOutputIds ?? []).filter((id) =>
             validTraceOutputIds.has(id)
           );
+          const fitOverlayOutputIds = (panel.fitOverlayOutputIds ?? []).filter((id) =>
+            validFitOutputIds.has(id)
+          );
           const outputChanged = panel.outputId !== outputId;
           const overlayChanged = !sameStringArray(panel.overlayOutputIds ?? [], overlayOutputIds);
-          if (!outputChanged && !overlayChanged) {
+          const fitOverlayChanged = !sameStringArray(
+            panel.fitOverlayOutputIds ?? [],
+            fitOverlayOutputIds
+          );
+          if (!outputChanged && !overlayChanged && !fitOverlayChanged) {
             return panel;
           }
           changed = true;
-          return { ...panel, outputId, overlayOutputIds };
+          return { ...panel, outputId, overlayOutputIds, fitOverlayOutputIds };
         }
         if (isStreamBin2dPanel(panel)) {
           if (panel.outputId) {
@@ -1742,6 +1753,11 @@ export function App() {
         streamBinStatsOverlayRef.delete(id);
       }
     }
+    for (const id of streamBinStatsFitOverlayRef.keys()) {
+      if (!ids.has(id)) {
+        streamBinStatsFitOverlayRef.delete(id);
+      }
+    }
     for (const id of streamParamsLatestRef.keys()) {
       if (!ids.has(id)) {
         streamParamsLatestRef.delete(id);
@@ -1762,6 +1778,7 @@ export function App() {
         streamFramesRef.delete(panel.id);
         streamTraceOverlayRef.delete(panel.id);
         streamBinStatsOverlayRef.delete(panel.id);
+        streamBinStatsFitOverlayRef.delete(panel.id);
         streamParamsLatestRef.delete(panel.id);
         streamBinStatsRef.delete(panel.id);
         streamBin2dRef.delete(panel.id);
@@ -1772,6 +1789,7 @@ export function App() {
         streamBinStatsRef.delete(panel.id);
         streamBin2dRef.delete(panel.id);
         streamBinStatsOverlayRef.delete(panel.id);
+        streamBinStatsFitOverlayRef.delete(panel.id);
         streamParamsLatestRef.delete(panel.id);
         buffersRef.delete(panel.id);
         if (!streamFramesRef.has(panel.id)) {
@@ -1787,12 +1805,16 @@ export function App() {
         if (!streamBinStatsOverlayRef.has(panel.id)) {
           streamBinStatsOverlayRef.set(panel.id, new Map());
         }
+        if (!streamBinStatsFitOverlayRef.has(panel.id)) {
+          streamBinStatsFitOverlayRef.set(panel.id, new Map());
+        }
         streamBin2dRef.delete(panel.id);
       } else if (isStreamParamsPanel(panel)) {
         buffersRef.delete(panel.id);
         streamFramesRef.delete(panel.id);
         streamTraceOverlayRef.delete(panel.id);
         streamBinStatsOverlayRef.delete(panel.id);
+        streamBinStatsFitOverlayRef.delete(panel.id);
         streamBinStatsRef.delete(panel.id);
         streamBin2dRef.delete(panel.id);
         if (!streamParamsLatestRef.has(panel.id)) {
@@ -1803,6 +1825,7 @@ export function App() {
         streamFramesRef.delete(panel.id);
         streamTraceOverlayRef.delete(panel.id);
         streamBinStatsOverlayRef.delete(panel.id);
+        streamBinStatsFitOverlayRef.delete(panel.id);
         streamParamsLatestRef.delete(panel.id);
         streamBinStatsRef.delete(panel.id);
       } else {
@@ -1810,6 +1833,7 @@ export function App() {
         streamFramesRef.delete(panel.id);
         streamTraceOverlayRef.delete(panel.id);
         streamBinStatsOverlayRef.delete(panel.id);
+        streamBinStatsFitOverlayRef.delete(panel.id);
         streamParamsLatestRef.delete(panel.id);
         streamBinStatsRef.delete(panel.id);
         streamBin2dRef.delete(panel.id);
@@ -1821,6 +1845,7 @@ export function App() {
     streamFramesRef,
     streamTraceOverlayRef,
     streamBinStatsOverlayRef,
+    streamBinStatsFitOverlayRef,
     streamParamsLatestRef,
     streamBinStatsRef,
     streamBin2dRef,
@@ -2158,6 +2183,29 @@ export function App() {
             }
           }
         }
+        if (output !== null && output.kind === "fit_1d") {
+          const fit = normalizeFitCurveValue(output.value);
+          if (fit) {
+            for (const panel of panelsRef.current) {
+              if (!isStreamBinStatsPanel(panel)) {
+                continue;
+              }
+              if (panel.workspaceId !== output.workspaceId) {
+                continue;
+              }
+              const overlayIds = new Set(
+                (panel.fitOverlayOutputIds ?? []).map((id) => String(id ?? "").trim())
+              );
+              if (!overlayIds.has(output.outputId)) {
+                continue;
+              }
+              const perPanel = streamBinStatsFitOverlayRef.get(panel.id) ?? new Map();
+              perPanel.set(output.outputId, fit);
+              streamBinStatsFitOverlayRef.set(panel.id, perPanel);
+              updated = true;
+            }
+          }
+        }
         if (output !== null && output.kind === "trace") {
           const values = normalizeTraceValues(output.value);
           if (values !== null) {
@@ -2315,12 +2363,13 @@ export function App() {
   }, [
     activeStreamAnalysisWorkspaceSubscriptions,
     buffersRef,
-    streamAnalysisRpcReady,
-    streamTraceOverlayRef,
-    streamBinStatsOverlayRef,
-    streamParamsLatestRef,
-    streamBinStatsRef,
-    streamBin2dRef,
+      streamAnalysisRpcReady,
+      streamTraceOverlayRef,
+      streamBinStatsOverlayRef,
+      streamBinStatsFitOverlayRef,
+      streamParamsLatestRef,
+      streamBinStatsRef,
+      streamBin2dRef,
   ]);
 
   useEffect(() => {
@@ -2489,6 +2538,21 @@ export function App() {
   const panelCapacity = (timeWindow: number) =>
     Math.max(DEFAULT_BUFFER_POINTS, Math.floor(timeWindow * 10));
 
+  const hdfController = useHdfController({
+    hdfWriterProcess,
+    capabilitiesByProcess,
+    processCapabilitiesErrorById,
+    latestByDevice: latestByDevice as Record<string, unknown>,
+    deviceOrder,
+    devices,
+    orderedDevices,
+    callProcessFn: callProcess,
+    sendProcessCommand,
+    refreshProcesses,
+    refreshDevices,
+    ensureProcessCapabilitiesLoaded,
+  });
+
   const {
     hdfModalOpen,
     setHdfModalOpen,
@@ -2556,19 +2620,14 @@ export function App() {
     setHdfRotateFieldUseCustom,
     setHdfNoteFieldValue,
     setHdfNoteFieldUseCustom,
-  } = useHdfController({
-    hdfWriterProcess,
+  } = hdfController;
+
+  const processCommandController = useProcessCommandController({
     capabilitiesByProcess,
-    processCapabilitiesErrorById,
-    latestByDevice: latestByDevice as Record<string, unknown>,
-    deviceOrder,
-    devices,
-    orderedDevices,
-    callProcessFn: callProcess,
     sendProcessCommand,
     refreshProcesses,
-    refreshDevices,
-    ensureProcessCapabilitiesLoaded,
+    refreshHdfWriterStatus,
+    hdfWriterProcessId,
   });
 
   const {
@@ -2587,12 +2646,13 @@ export function App() {
     handleProcessCommandActionChange,
     executeProcessCommand,
     processCommandTitle,
-  } = useProcessCommandController({
+  } = processCommandController;
+
+  const interlocksController = useInterlocksController({
+    processes,
     capabilitiesByProcess,
-    sendProcessCommand,
     refreshProcesses,
-    refreshHdfWriterStatus,
-    hdfWriterProcessId,
+    ensureProcessCapabilitiesLoaded,
   });
 
   const {
@@ -2612,11 +2672,13 @@ export function App() {
     refreshInterlocksModalData,
     toggleFollowerRule,
     toggleInterlockRule,
-  } = useInterlocksController({
-    processes,
-    capabilitiesByProcess,
+  } = interlocksController;
+
+  const sequencerController = useSequencerController({
+    sequencerProcess,
+    callProcessFn: callProcess,
+    sendProcessCommand,
     refreshProcesses,
-    ensureProcessCapabilitiesLoaded,
   });
 
   const {
@@ -2645,6 +2707,8 @@ export function App() {
     setSequencerYamlViewMode,
     sequencerDiagnostics,
     sequencerModalError,
+    sequencerAdaptiveModes,
+    sequencerAdaptiveClearBusy,
     sequencerEditorRef,
     sequencerFileInputRef,
     onSequencerYamlTextChange,
@@ -2652,16 +2716,13 @@ export function App() {
     fetchSequencerLoadedYaml,
     openSequencerModal,
     runSequencerAction,
+    setAdaptiveMode,
+    clearAdaptiveStudy,
     jumpToSequencerDiagnostic,
     handleSequencerFileInput,
     validateSequencerYaml,
     loadSequencerYaml,
-  } = useSequencerController({
-    sequencerProcess,
-    callProcessFn: callProcess,
-    sendProcessCommand,
-    refreshProcesses,
-  });
+  } = sequencerController;
 
   const { handleProcessAction } = useProcessLifecycleController({
     processBusyById,
@@ -3252,17 +3313,20 @@ export function App() {
         workspaceId: defaultWorkspaceId ?? id,
         outputId: binOutputId,
         overlayOutputIds: [],
+        fitOverlayOutputIds: [],
         stream: workspaceConfig?.stream ?? null,
         channelIndex: workspaceConfig?.channelIndex ?? 0,
         analysis: workspaceConfig?.analysis ?? defaultStreamAnalysisSettings(),
         binStats: workspaceConfig?.binStats ?? defaultStreamBinStatsSettings(),
         uncertaintyMode: "sem",
         uncertaintyScale: DEFAULT_UNCERTAINTY_SCALE,
+        showBinMarkers: false,
         yScaleMode: "auto",
         yMin: null,
         yMax: null,
       };
       streamBinStatsRef.delete(id);
+      streamBinStatsFitOverlayRef.delete(id);
     } else if (kind === "stream_bin2d") {
       const bin2dOutputId = defaultOutputForKind(workspaceConfig, "hist2d");
       panel = {
@@ -3306,6 +3370,7 @@ export function App() {
     streamFramesRef.delete(panelId);
     streamTraceOverlayRef.delete(panelId);
     streamBinStatsOverlayRef.delete(panelId);
+    streamBinStatsFitOverlayRef.delete(panelId);
     streamParamsLatestRef.delete(panelId);
     streamBinStatsRef.delete(panelId);
     streamBin2dRef.delete(panelId);
@@ -3324,6 +3389,9 @@ export function App() {
     }
     if (streamParamsOptionsPanelId === panelId) {
       setStreamParamsOptionsPanelId(null);
+    }
+    if (expandedPlotPanelId === panelId) {
+      setExpandedPlotPanelId(null);
     }
     setPanels((prev) => prev.filter((panel) => panel.id !== panelId));
     if (activePanelId === panelId && nextActive) {
@@ -3469,6 +3537,7 @@ export function App() {
     }
     streamBinStatsRef.delete(panelId);
     streamBinStatsOverlayRef.set(panelId, new Map());
+    streamBinStatsFitOverlayRef.set(panelId, new Map());
     setPlotTick((tick) => tick + 1);
   };
 
@@ -3698,14 +3767,15 @@ export function App() {
     }
     if (isStreamBinStatsPanel(panel)) {
       const snapshot = streamBinStatsRef.get(panel.id) ?? null;
-      return normalizeAutoRange(
-        computeStreamBinStatsAutoYRange(
-          snapshot?.series ?? null,
-          panel.uncertaintyMode,
-          panel.uncertaintyScale,
-          streamBinStatsOverlaySeries(panel)
-        )
-      );
+        return normalizeAutoRange(
+          computeStreamBinStatsAutoYRange(
+            snapshot?.series ?? null,
+            panel.uncertaintyMode,
+            panel.uncertaintyScale,
+            streamBinStatsOverlaySeries(panel),
+            streamBinStatsFitOverlayCurves(panel)
+          )
+        );
     }
     if (isStreamBin2dPanel(panel)) {
       const snapshot = streamBin2dRef.get(panel.id) ?? null;
@@ -3779,6 +3849,22 @@ export function App() {
 
   const closeStreamBin2dOptionsModal = () => {
     setStreamBin2dOptionsPanelId(null);
+  };
+
+  const isExpandablePlotPanel = (panel: (typeof panels)[number]) => {
+    return !isStreamParamsPanel(panel);
+  };
+
+  const openExpandedPlot = (panelId: string) => {
+    const panel = panels.find((entry) => entry.id === panelId);
+    if (!panel || !isExpandablePlotPanel(panel)) {
+      return;
+    }
+    setExpandedPlotPanelId(panelId);
+  };
+
+  const closeExpandedPlot = () => {
+    setExpandedPlotPanelId(null);
   };
 
   const openYAxisModal = (
@@ -3917,6 +4003,135 @@ export function App() {
       out.push({ label: outputId, values: entry.values });
     }
     return out;
+  };
+
+  const streamBinStatsFitOverlayCurves = (
+    panel: PlotStreamBinStatsPanelState
+  ) => {
+    const overlayMap = streamBinStatsFitOverlayRef.get(panel.id);
+    if (!overlayMap || overlayMap.size <= 0) {
+      return [];
+    }
+    const selected = panel.fitOverlayOutputIds ?? [];
+    const out: Array<{ label: string; x: number[]; y: number[] }> = [];
+    for (const outputId of selected) {
+      const entry = overlayMap.get(outputId);
+      if (!entry) {
+        continue;
+      }
+      const x = entry.xDense ?? entry.x;
+      const y = entry.yhatDense ?? entry.yhat;
+      if (!Array.isArray(x) || !Array.isArray(y) || x.length <= 1 || y.length <= 1) {
+        continue;
+      }
+      out.push({ label: outputId, x, y });
+    }
+    return out;
+  };
+
+  const renderExpandedPlot = (panel: (typeof panels)[number]) => {
+    const plotHeight = 640;
+    if (isTelemetryPanel(panel)) {
+      return (
+        <PlotPanel
+          traces={panel.traces}
+          buffers={buffersRef.get(panel.id) ?? new Map()}
+          tick={plotTick}
+          timeWindowS={panel.timeWindowS}
+          colorScheme={computedColorScheme}
+          plotHeight={plotHeight}
+          yScaleMode={panel.yScaleMode}
+          yMin={panel.yMin}
+          yMax={panel.yMax}
+          yDisplayMode={panel.yDisplayMode}
+          yOffset={resolveTelemetryPanelOffset(panel)}
+        />
+      );
+    }
+    if (isStreamTracePanel(panel)) {
+      if (isStreamRawPanel(panel)) {
+        return (
+          <StreamRawPanel
+            frames={streamFramesRef.get(panel.id) ?? []}
+            overlayCount={panel.overlayCount}
+            channelIndex={panel.sourceMode === "raw" ? panel.channelIndex : 0}
+            tick={plotTick}
+            colorScheme={computedColorScheme}
+            plotHeight={plotHeight}
+            units={panel.stream?.units ?? null}
+            extraSeries={
+              panel.sourceMode === "dag" ? streamTraceOverlaySeries(panel) : []
+            }
+            yScaleMode={panel.yScaleMode}
+            yMin={panel.yMin}
+            yMax={panel.yMax}
+          />
+        );
+      }
+      return (
+        <StreamWaterfallPanel
+          frames={streamFramesRef.get(panel.id) ?? []}
+          historyRows={panel.overlayCount}
+          channelIndex={panel.sourceMode === "raw" ? panel.channelIndex : 0}
+          tick={plotTick}
+          colorScheme={computedColorScheme}
+          plotHeight={plotHeight}
+          zScaleMode={panel.yScaleMode}
+          zMin={panel.yMin}
+          zMax={panel.yMax}
+        />
+      );
+    }
+    if (isStreamScalarPanel(panel)) {
+      return (
+        <PlotPanel
+          traces={[streamScalarTrace(panel)]}
+          buffers={buffersRef.get(panel.id) ?? new Map()}
+          tick={plotTick}
+          timeWindowS={panel.timeWindowS}
+          colorScheme={computedColorScheme}
+          plotHeight={plotHeight}
+          yScaleMode={panel.yScaleMode}
+          yMin={panel.yMin}
+          yMax={panel.yMax}
+        />
+      );
+    }
+    if (isStreamBinStatsPanel(panel)) {
+      const streamWorkspace = streamWorkspaces[panel.workspaceId] ?? null;
+      return (
+        <StreamBinStatsPanel
+          series={(streamBinStatsRef.get(panel.id) ?? null)?.series ?? null}
+          overlaySeries={streamBinStatsOverlaySeries(panel)}
+          fitOverlays={streamBinStatsFitOverlayCurves(panel)}
+          xLabel={workspaceXAxisLabel(streamWorkspace, panel.outputId)}
+          uncertaintyMode={panel.uncertaintyMode}
+          uncertaintyScale={panel.uncertaintyScale}
+          showBinMarkers={panel.showBinMarkers}
+          tick={plotTick}
+          colorScheme={computedColorScheme}
+          plotHeight={plotHeight}
+          yScaleMode={panel.yScaleMode}
+          yMin={panel.yMin}
+          yMax={panel.yMax}
+        />
+      );
+    }
+    if (isStreamBin2dPanel(panel)) {
+      return (
+        <StreamBin2dPanel
+          series={(streamBin2dRef.get(panel.id) ?? null)?.series ?? null}
+          reducer={panel.reducer}
+          tick={plotTick}
+          colorScheme={computedColorScheme}
+          plotHeight={plotHeight}
+          zScaleMode={panel.yScaleMode}
+          zMin={panel.yMin}
+          zMax={panel.yMax}
+        />
+      );
+    }
+    return null;
   };
 
   const setStreamPanelTargetFromKey = (
@@ -4251,6 +4466,7 @@ export function App() {
           workspaceId: nextWorkspaceId,
           outputId: nextOutputId,
           overlayOutputIds: [],
+          fitOverlayOutputIds: [],
           stream: nextWorkspace.stream,
           channelIndex: nextWorkspace.channelIndex,
           analysis: nextWorkspace.analysis,
@@ -4272,6 +4488,7 @@ export function App() {
     } else if (isStreamBinStatsPanel(panel)) {
       streamBinStatsRef.delete(panelId);
       streamBinStatsOverlayRef.set(panelId, new Map());
+      streamBinStatsFitOverlayRef.set(panelId, new Map());
       setPlotTick((tick) => tick + 1);
     } else {
       streamBin2dRef.delete(panelId);
@@ -4309,6 +4526,7 @@ export function App() {
     } else if (isStreamBinStatsPanel(panel)) {
       streamBinStatsRef.delete(panelId);
       streamBinStatsOverlayRef.set(panelId, new Map());
+      streamBinStatsFitOverlayRef.set(panelId, new Map());
       setPlotTick((tick) => tick + 1);
     } else {
       streamBin2dRef.delete(panelId);
@@ -4331,6 +4549,19 @@ export function App() {
                 ? Math.max(0, uncertaintyScale)
                 : panel.uncertaintyScale,
             }
+          : panel
+      )
+    );
+  };
+
+  const setStreamBinStatsShowBinMarkers = (
+    panelId: string,
+    showBinMarkers: boolean
+  ) => {
+    setPanels((prev) =>
+      prev.map((panel) =>
+        panel.id === panelId && isStreamBinStatsPanel(panel)
+          ? { ...panel, showBinMarkers }
           : panel
       )
     );
@@ -4363,6 +4594,24 @@ export function App() {
       )
     );
     streamBinStatsOverlayRef.set(panelId, new Map());
+    setPlotTick((tick) => tick + 1);
+  };
+
+  const setStreamBinStatsFitOverlayOutputs = (
+    panelId: string,
+    outputIds: string[]
+  ) => {
+    const next = outputIds
+      .map((value) => String(value ?? "").trim())
+      .filter((value) => value.length > 0);
+    setPanels((prev) =>
+      prev.map((panel) =>
+        panel.id === panelId && isStreamBinStatsPanel(panel)
+          ? { ...panel, fitOverlayOutputIds: next }
+          : panel
+      )
+    );
+    streamBinStatsFitOverlayRef.set(panelId, new Map());
     setPlotTick((tick) => tick + 1);
   };
 
@@ -4399,6 +4648,7 @@ export function App() {
       }
       if (isStreamBinStatsPanel(panel)) {
         streamBinStatsRef.delete(panel.id);
+        streamBinStatsFitOverlayRef.set(panel.id, new Map());
       } else {
         streamBin2dRef.delete(panel.id);
       }
@@ -4687,7 +4937,8 @@ export function App() {
         notifications.show({
           color: "yellow",
           title: "No publishable nodes",
-          message: "Add a scalar, trace, hist_agg, hist2d, or params_map node first.",
+          message:
+            "Add a scalar, trace, fit_1d, hist_agg, hist2d, or params_map node first.",
         });
         return;
       }
@@ -4813,6 +5064,9 @@ export function App() {
     const histOutputIds = new Set(
       workspaceOutputOptionsByKind(updated, "hist_agg").map((item) => item.value)
     );
+    const fitOutputIds = new Set(
+      workspaceOutputOptionsByKind(updated, "fit_1d").map((item) => item.value)
+    );
     const hist2dOutputIds = new Set(
       workspaceOutputOptionsByKind(updated, "hist2d").map((item) => item.value)
     );
@@ -4892,13 +5146,18 @@ export function App() {
             : defaultOutputForKind(updated, "hist_agg");
         streamBinStatsRef.delete(panel.id);
         streamBinStatsOverlayRef.set(panel.id, new Map());
+        streamBinStatsFitOverlayRef.set(panel.id, new Map());
         const nextOverlayOutputIds = (panel.overlayOutputIds ?? []).filter(
           (id) => traceOutputIds.has(id)
+        );
+        const nextFitOverlayOutputIds = (panel.fitOverlayOutputIds ?? []).filter(
+          (id) => fitOutputIds.has(id)
         );
         return {
           ...panel,
           outputId: nextOutputId,
           overlayOutputIds: nextOverlayOutputIds,
+          fitOverlayOutputIds: nextFitOverlayOutputIds,
           stream: updated.stream,
           channelIndex: updated.channelIndex,
           analysis: updated.analysis,
@@ -5393,193 +5652,78 @@ export function App() {
       header={{ height: 72 }}
       padding="lg"
     >
-      <AppShell.Header className="app-header">
-        <Group h="100%" px="lg" justify="space-between">
-          <Group gap="sm">
-            <div className="pulse" />
-            <Text className="brand" size="lg">
-              {instanceLabel}
-            </Text>
-            {hdfWriterProcess && (
-              <Button
-                size="xs"
-                variant="light"
-                color={hdfWriterChipColor}
-                loading={hdfWriterLoading}
-                onClick={async () => {
-                  await openHdfWriterCommands();
-                }}
-                title={hdfWriterStatus?.error ?? "Open HDF writer commands"}
-              >
-                HDF {hdfWriterState} | {hdfWriterFileLabel}
-              </Button>
-            )}
-            {hdfShowNoteChiplet && (
-              <Button
-                size="xs"
-                variant="light"
-                color="orange"
-                leftSection={<IconFileText size={14} />}
-                loading={hdfMeasurementSchemaLoading}
-                disabled={hdfCommandsBlocked || hdfMeasurementNoteBusy}
-                onClick={async () => {
-                  await openHdfMeasurementNoteModal();
-                }}
-                title={
-                  hdfMeasurementSchemaDisplayError ??
-                  "Add a measurement note to the active HDF file"
-                }
-              >
-                Note ({hdfWriterStatus?.measurementNotesRows ?? 0})
-              </Button>
-            )}
-            {sequencerProcess && (
-              <Button.Group>
-                <Button
-                  size="xs"
-                  variant="light"
-                  color={sequencerChipColor}
-                  loading={sequencerStatusLoading}
-                  onClick={async () => {
-                    await openSequencerModal();
-                  }}
-                  title={sequencerStatus?.error ?? sequencerChipTooltip}
-                  style={sequencerChipProgressStyle}
-                >
-                  Sequencer {sequencerRuntimeState}
-                  {sequencerChipSuffix}
-                </Button>
-                <Button
-                  size="xs"
-                  variant="light"
-                  color={sequencerPrimaryAction === "start" ? "teal" : "yellow"}
-                  leftSection={sequencerPrimaryIcon}
-                  disabled={sequencerPrimaryDisabled}
-                  loading={sequencerActionBusy}
-                  onClick={async () => {
-                    await runSequencerAction(sequencerPrimaryAction);
-                  }}
-                  title={
-                    sequencerPrimaryAction === "start" && !sequencerLoaded
-                      ? "Load a sequence before starting"
-                      : undefined
-                  }
-                >
-                  {sequencerPrimaryLabel}
-                </Button>
-              </Button.Group>
-            )}
-          </Group>
-          <Group gap="xs">
-            <Button
-              size="xs"
-              variant="light"
-              color="gray"
-              leftSection={<IconCpu size={14} />}
-              onClick={async () => {
-                setProcessOpen(true);
-                await refreshProcesses();
-              }}
-            >
-              Processes
-            </Button>
-            <Button
-              size="xs"
-              variant="light"
-              color={interlockButtonSummary.color}
-              leftSection={<IconShieldCheck size={14} />}
-              onClick={() => setInterlocksOpen(true)}
-              title={interlockButtonSummary.tooltip}
-            >
-              {interlockButtonSummary.label}
-            </Button>
-            {showDaqUi ? (
-              <Button
-                size="xs"
-                variant="light"
-                color="cyan"
-                leftSection={<IconPencil size={14} />}
-                onClick={() => {
-                  void openDaqModal();
-                }}
-                title="Open shared stream-analysis workspaces"
-              >
-                DAG ({Object.keys(streamWorkspaces).length})
-              </Button>
-            ) : null}
-            <Button
-              size="xs"
-              variant="light"
-              color={commandUnreadError ? "red" : "gray"}
-              leftSection={<IconTerminal2 size={14} />}
-              onClick={() => {
-                setCommandUnreadError(false);
-                setCommandHistoryOpen(true);
-              }}
-              title="Latest command requests and replies"
-            >
-              Commands ({commandHistoryRows.length})
-            </Button>
-            <Button
-              size="xs"
-              variant="light"
-              color={logsUnreadError ? "red" : "gray"}
-              leftSection={<IconFileText size={14} />}
-              onClick={() => {
-                setLogsUnreadError(false);
-                setLogsOpen(true);
-              }}
-            >
-              Logs
-            </Button>
-            <Button
-              size="xs"
-              variant="light"
-              color="gray"
-              leftSection={<IconSettings size={14} />}
-              onClick={() => setSettingsOpen(true)}
-            >
-              Settings
-            </Button>
-            <Button
-              size="xs"
-              variant="light"
-              leftSection={<IconRefresh size={14} />}
-              onClick={async () => {
-                const [, nextProcesses] = await Promise.all([
-                  refreshDevices(),
-                  refreshProcesses(),
-                ]);
-                const hdfProcess = nextProcesses.find(isHdfWriterProcess);
-                if (hdfProcess) {
-                  await refreshHdfWriterStatus(hdfProcess.process_id);
-                }
-                const seqProcess = nextProcesses.find(isSequencerProcess);
-                if (seqProcess) {
-                  await refreshSequencerStatus(seqProcess.process_id);
-                }
-              }}
-            >
-              Refresh status
-            </Button>
-            <SegmentedControl
-              size="xs"
-              value={colorScheme}
-              onChange={(value) =>
-                setColorScheme(value as "light" | "dark" | "auto")
-              }
-              data={[
-                { label: "Light", value: "light" },
-                { label: "Dark", value: "dark" },
-                { label: "Auto", value: "auto" },
-              ]}
-            />
-            <Badge variant="light" color={telemetryBadgeColor}>
-              {telemetryBadgeLabel}
-            </Badge>
-          </Group>
-        </Group>
-      </AppShell.Header>
+      <DashboardHeaderBar
+        instanceLabel={instanceLabel}
+        showHdfWriter={Boolean(hdfWriterProcess)}
+        hdfWriterChipColor={hdfWriterChipColor}
+        hdfWriterLoading={hdfWriterLoading}
+        onOpenHdfWriter={openHdfWriterCommands}
+        hdfWriterTitle={hdfWriterStatus?.error ?? "Open HDF writer commands"}
+        hdfWriterState={hdfWriterState}
+        hdfWriterFileLabel={hdfWriterFileLabel}
+        showHdfNoteChiplet={hdfShowNoteChiplet}
+        hdfMeasurementSchemaLoading={hdfMeasurementSchemaLoading}
+        hdfCommandsBlocked={hdfCommandsBlocked}
+        hdfMeasurementNoteBusy={hdfMeasurementNoteBusy}
+        onOpenHdfMeasurementNote={openHdfMeasurementNoteModal}
+        hdfMeasurementSchemaDisplayError={hdfMeasurementSchemaDisplayError}
+        hdfMeasurementNotesRows={hdfWriterStatus?.measurementNotesRows ?? 0}
+        showSequencer={Boolean(sequencerProcess)}
+        sequencerChipColor={sequencerChipColor}
+        sequencerStatusLoading={sequencerStatusLoading}
+        onOpenSequencer={openSequencerModal}
+        sequencerStatusError={sequencerStatus?.error ?? null}
+        sequencerChipTooltip={sequencerChipTooltip}
+        sequencerRuntimeState={sequencerRuntimeState}
+        sequencerChipSuffix={sequencerChipSuffix}
+        sequencerChipProgressStyle={sequencerChipProgressStyle}
+        sequencerPrimaryAction={sequencerPrimaryAction}
+        sequencerPrimaryLabel={sequencerPrimaryLabel}
+        sequencerPrimaryDisabled={sequencerPrimaryDisabled}
+        sequencerActionBusy={sequencerActionBusy}
+        sequencerPrimaryIcon={sequencerPrimaryIcon}
+        onRunSequencerPrimaryAction={() => runSequencerAction(sequencerPrimaryAction)}
+        sequencerLoaded={sequencerLoaded}
+        onOpenProcesses={async () => {
+          setProcessOpen(true);
+          await refreshProcesses();
+        }}
+        interlockButtonSummary={interlockButtonSummary}
+        onOpenInterlocks={() => setInterlocksOpen(true)}
+        showDaqUi={showDaqUi}
+        onOpenDaq={openDaqModal}
+        daqWorkspaceCount={Object.keys(streamWorkspaces).length}
+        commandUnreadError={commandUnreadError}
+        onOpenCommandHistory={() => {
+          setCommandUnreadError(false);
+          setCommandHistoryOpen(true);
+        }}
+        commandHistoryCount={commandHistoryRows.length}
+        logsUnreadError={logsUnreadError}
+        onOpenLogs={() => {
+          setLogsUnreadError(false);
+          setLogsOpen(true);
+        }}
+        onOpenSettings={() => setSettingsOpen(true)}
+        onRefreshStatus={async () => {
+          const [, nextProcesses] = await Promise.all([
+            refreshDevices(),
+            refreshProcesses(),
+          ]);
+          const hdfProcess = nextProcesses.find(isHdfWriterProcess);
+          if (hdfProcess) {
+            await refreshHdfWriterStatus(hdfProcess.process_id);
+          }
+          const seqProcess = nextProcesses.find(isSequencerProcess);
+          if (seqProcess) {
+            await refreshSequencerStatus(seqProcess.process_id);
+          }
+        }}
+        colorScheme={colorScheme}
+        onColorSchemeChange={setColorScheme}
+        telemetryBadgeColor={telemetryBadgeColor}
+        telemetryBadgeLabel={telemetryBadgeLabel}
+      />
       <AppShell.Main>
         <div className="app-layout">
           <section className="device-panel" style={{ width: navWidth }}>
@@ -6324,14 +6468,24 @@ export function App() {
                               }
                               clearStreamPanelFrames(panel.id);
                             }}
-                          >
-                            {isStreamBinStatsPanel(panel) || isStreamBin2dPanel(panel)
-                              ? "Clear binned data"
-                              : "Clear"}
-                          </Button>
-                          <ActionIcon
-                            variant="light"
-                            color="red"
+                            >
+                              {isStreamBinStatsPanel(panel) || isStreamBin2dPanel(panel)
+                                ? "Clear binned data"
+                                : "Clear"}
+                            </Button>
+                            {isExpandablePlotPanel(panel) ? (
+                              <ActionIcon
+                                variant="light"
+                                color="gray"
+                                onClick={() => openExpandedPlot(panel.id)}
+                                title="Enlarge plot"
+                              >
+                                <IconArrowsMaximize size={14} />
+                              </ActionIcon>
+                            ) : null}
+                            <ActionIcon
+                              variant="light"
+                              color="red"
                             onClick={() => removePanel(panel.id)}
                             disabled={panels.length <= 1}
                           >
@@ -6656,9 +6810,11 @@ export function App() {
                         <StreamBinStatsPanel
                           series={binStatsSnapshot?.series ?? null}
                           overlaySeries={streamBinStatsOverlaySeries(panel)}
+                          fitOverlays={streamBinStatsFitOverlayCurves(panel)}
                           xLabel={binStatsXLabel}
                           uncertaintyMode={panel.uncertaintyMode}
                           uncertaintyScale={panel.uncertaintyScale}
+                          showBinMarkers={panel.showBinMarkers}
                             tick={plotTick}
                             colorScheme={computedColorScheme}
                             yScaleMode={panel.yScaleMode}
@@ -6832,125 +6988,115 @@ export function App() {
         </div>
       </AppShell.Main>
 
-      <YAxisModal
-        opened={yAxisModalPanelId !== null}
-        onClose={closeYAxisModal}
-        title={`Y axis ${yAxisModalPanel?.title ?? ""}`}
-        autoRange={yAxisAutoRange}
-        draftMin={yAxisDraftMin}
-        onDraftMinChange={setYAxisDraftMin}
-        draftMax={yAxisDraftMax}
-        onDraftMaxChange={setYAxisDraftMax}
-        draftInvalid={yAxisDraftInvalid}
-        onApply={applyYAxisModal}
-      />
-
-      <StreamTraceOptionsModal
-        opened={streamTraceOptionsPanel !== null}
-        onClose={closeStreamTraceOptionsModal}
-        panel={streamTraceOptionsPanel}
+      <PlotModalsLayer
+        expandedPlotOpened={expandedPlotPanel !== null}
+        onCloseExpandedPlot={closeExpandedPlot}
+        expandedPlotTitle={expandedPlotPanel ? `Plot ${expandedPlotPanel.title}` : "Plot"}
+        expandedPlotContent={
+          expandedPlotPanel ? renderExpandedPlot(expandedPlotPanel) : null
+        }
+        yAxisOpened={yAxisModalPanelId !== null}
+        onCloseYAxis={closeYAxisModal}
+        yAxisTitle={`Y axis ${yAxisModalPanel?.title ?? ""}`}
+        yAxisAutoRange={yAxisAutoRange}
+        yAxisDraftMin={yAxisDraftMin}
+        onYAxisDraftMinChange={setYAxisDraftMin}
+        yAxisDraftMax={yAxisDraftMax}
+        onYAxisDraftMaxChange={setYAxisDraftMax}
+        yAxisDraftInvalid={yAxisDraftInvalid}
+        onApplyYAxis={applyYAxisModal}
+        streamTraceOpened={streamTraceOptionsPanel !== null}
+        onCloseStreamTrace={closeStreamTraceOptionsModal}
+        streamTracePanel={streamTraceOptionsPanel}
         streamTargetOptions={streamTargetOptions}
         streamWorkspaceOptions={streamWorkspaceOptions}
-        traceOutputOptions={streamTraceOptionsTraceOutputOptions}
-        overlayTraceOutputOptions={streamTraceOptionsOverlayOutputOptions}
-        onSetSourceMode={setStreamTracePanelSourceMode}
-        onSetOverlayCount={setStreamPanelOverlayCount}
-        onSetRollingWindow={setStreamPanelRollingWindow}
-        onSetAverageMode={setStreamPanelAverageMode}
-        onRawTargetKeyChange={setStreamPanelTargetFromKey}
-        onSetChannelIndex={setStreamPanelChannelIndex}
-        onSetWorkspace={setStreamTracePanelWorkspace}
-        onSetOutput={setStreamTracePanelOutput}
-        onSetOverlayOutputs={setStreamTracePanelOverlayOutputs}
-        onSetTraceDecimator={setStreamPanelTraceDecimator}
-        onSetTraceMaxPoints={setStreamPanelTraceMaxPoints}
-        onSetTraceMaxFps={setStreamPanelTraceMaxFps}
+        streamTraceOutputOptions={streamTraceOptionsTraceOutputOptions}
+        streamTraceOverlayOutputOptions={streamTraceOptionsOverlayOutputOptions}
+        onSetStreamTraceSourceMode={setStreamTracePanelSourceMode}
+        onSetStreamPanelOverlayCount={setStreamPanelOverlayCount}
+        onSetStreamPanelRollingWindow={setStreamPanelRollingWindow}
+        onSetStreamPanelAverageMode={setStreamPanelAverageMode}
+        onSetStreamPanelTargetFromKey={setStreamPanelTargetFromKey}
+        onSetStreamPanelChannelIndex={setStreamPanelChannelIndex}
+        onSetStreamTraceWorkspace={setStreamTracePanelWorkspace}
+        onSetStreamTraceOutput={setStreamTracePanelOutput}
+        onSetStreamTraceOverlayOutputs={setStreamTracePanelOverlayOutputs}
+        onSetStreamPanelTraceDecimator={setStreamPanelTraceDecimator}
+        onSetStreamPanelTraceMaxPoints={setStreamPanelTraceMaxPoints}
+        onSetStreamPanelTraceMaxFps={setStreamPanelTraceMaxFps}
+        streamBinStatsOpened={streamBinStatsOptionsPanel !== null}
+        onCloseStreamBinStats={closeStreamBinStatsOptionsModal}
+        streamBinStatsPanel={streamBinStatsOptionsPanel}
+        streamBinStatsOutputOptions={streamBinStatsOptionsOutputOptions}
+        streamBinStatsTraceOverlayOptions={streamBinStatsOptionsTraceOverlayOptions}
+        streamBinStatsFitOverlayOptions={streamBinStatsOptionsFitOverlayOptions}
+        streamBinStatsXAxisLabel={streamBinStatsOptionsXLabel}
+        onSetStreamAnalysisPanelWorkspace={setStreamAnalysisPanelWorkspace}
+        onSetStreamAnalysisPanelOutput={setStreamAnalysisPanelOutput}
+        onSetStreamBinStatsOverlayOutputs={setStreamBinStatsOverlayOutputs}
+        onSetStreamBinStatsFitOverlayOutputs={setStreamBinStatsFitOverlayOutputs}
+        onSetStreamBinStatsUncertainty={setStreamBinStatsUncertainty}
+        onSetStreamBinStatsShowBinMarkers={setStreamBinStatsShowBinMarkers}
+        streamParamsOpened={streamParamsOptionsPanel !== null}
+        onCloseStreamParams={closeStreamParamsOptionsModal}
+        streamParamsPanel={streamParamsOptionsPanel}
+        streamParamsOutputOptions={streamParamsOutputOptions}
+        onSetStreamParamsOutputs={setStreamParamsPanelOutputs}
+        streamBin2dOpened={streamBin2dOptionsPanel !== null}
+        onCloseStreamBin2d={closeStreamBin2dOptionsModal}
+        streamBin2dPanel={streamBin2dOptionsPanel}
+        streamBin2dOutputOptions={streamBin2dOptionsOutputOptions}
+        streamBin2dXAxisLabel={streamBin2dOptionsXLabel}
+        streamBin2dYAxisLabel={streamBin2dOptionsYLabel}
+        onSetStreamBin2dReducer={setStreamBin2dReducer}
       />
 
-      <StreamBinStatsOptionsModal
-        opened={streamBinStatsOptionsPanel !== null}
-        onClose={closeStreamBinStatsOptionsModal}
-        panel={streamBinStatsOptionsPanel}
-        streamWorkspaceOptions={streamWorkspaceOptions}
-        outputOptions={streamBinStatsOptionsOutputOptions}
-        overlayTraceOutputOptions={streamBinStatsOptionsTraceOverlayOptions}
-        xAxisLabel={streamBinStatsOptionsXLabel}
-        onSetWorkspace={setStreamAnalysisPanelWorkspace}
-        onSetOutput={setStreamAnalysisPanelOutput}
-        onSetOverlayOutputs={setStreamBinStatsOverlayOutputs}
-        onSetUncertainty={setStreamBinStatsUncertainty}
-      />
-
-      <StreamParamsOptionsModal
-        opened={streamParamsOptionsPanel !== null}
-        onClose={closeStreamParamsOptionsModal}
-        panel={streamParamsOptionsPanel}
-        streamWorkspaceOptions={streamWorkspaceOptions}
-        outputOptions={streamParamsOutputOptions}
-        onSetWorkspace={setStreamAnalysisPanelWorkspace}
-        onSetOutputs={setStreamParamsPanelOutputs}
-      />
-
-      <StreamBin2dOptionsModal
-        opened={streamBin2dOptionsPanel !== null}
-        onClose={closeStreamBin2dOptionsModal}
-        panel={streamBin2dOptionsPanel}
-        streamWorkspaceOptions={streamWorkspaceOptions}
-        outputOptions={streamBin2dOptionsOutputOptions}
-        xAxisLabel={streamBin2dOptionsXLabel}
-        yAxisLabel={streamBin2dOptionsYLabel}
-        onSetWorkspace={setStreamAnalysisPanelWorkspace}
-        onSetOutput={setStreamAnalysisPanelOutput}
-        onSetReducer={setStreamBin2dReducer}
-      />
-
-      <DaqWorkspacesModal
-        opened={daqOpen}
-        onClose={closeDaqModal}
-        streamWorkspaceOptions={streamWorkspaceOptions}
-        streamCatalogByKey={streamCatalogByKey}
-        daqWorkspaceId={daqWorkspaceId}
-        onWorkspaceChange={loadDaqWorkspaceDraft}
-        onCreateWorkspace={createStreamWorkspace}
-        workspaceStoreStatus={workspaceStoreStatus}
-        daqWorkspace={daqWorkspace}
-        daqDraftName={daqDraftName}
-        onDraftNameChange={setDaqDraftName}
-        daqDraftEnabled={daqDraftEnabled}
-        onDraftEnabledChange={setDaqDraftEnabled}
-        daqSectionCardStyle={daqSectionCardStyle}
-        daqNodeCardBaseStyle={daqNodeCardBaseStyle}
-        daqDraftNodes={daqDraftNodes}
-        daqDraftOutputs={daqDraftOutputs}
-        daqFocusedNodeId={daqFocusedNodeId}
-        daqNodeCardRefs={daqNodeCardRefs}
-        daqResetNodeBusyId={daqResetNodeBusyId}
-        streamAnalysisRpcReady={streamAnalysisRpcReady}
-        onResetDaqNodeAggregate={resetDaqNodeAggregate}
-        onAddNode={addDaqNode}
-        onRemoveNode={removeDaqNode}
-        onSetNodeId={setDaqNodeId}
-        onSetNodeOp={setDaqNodeOp}
-        onSetNodeInput={setDaqNodeInput}
-        onSetNodeParam={setDaqNodeParam}
-        onAddOutput={addDaqOutput}
-        onRemoveOutput={removeDaqOutput}
-        onSetOutputId={setDaqOutputId}
-        onSetOutputNode={setDaqOutputNode}
-        daqPublishableNodeOptions={daqPublishableNodeOptions}
-        daqResettableNodeIds={daqResettableNodeIds}
-        onFocusNodeCard={focusDaqNodeCard}
-        onReloadStore={reloadDaqWorkspaceStore}
-        onSaveStore={saveDaqWorkspaceStore}
-        workspaceStoreBusyAction={workspaceStoreBusyAction}
-        onApplyWorkspace={applyDaqWorkspace}
-      />
-
-      <DeviceCommandModal
-        opened={commandOpen}
-        onClose={() => setCommandOpen(false)}
-        title={
-          commandDevice ? (
+      <WorkspaceCommandLayer
+        daq={{
+          opened: daqOpen,
+          onClose: closeDaqModal,
+          streamWorkspaceOptions,
+          streamCatalogByKey,
+          daqWorkspaceId,
+          onWorkspaceChange: loadDaqWorkspaceDraft,
+          onCreateWorkspace: createStreamWorkspace,
+          workspaceStoreStatus,
+          daqWorkspace,
+          daqDraftName,
+          onDraftNameChange: setDaqDraftName,
+          daqDraftEnabled,
+          onDraftEnabledChange: setDaqDraftEnabled,
+          daqSectionCardStyle,
+          daqNodeCardBaseStyle,
+          daqDraftNodes,
+          daqDraftOutputs,
+          daqFocusedNodeId,
+          daqNodeCardRefs,
+          daqResetNodeBusyId,
+          streamAnalysisRpcReady,
+          onResetDaqNodeAggregate: resetDaqNodeAggregate,
+          onAddNode: addDaqNode,
+          onRemoveNode: removeDaqNode,
+          onSetNodeId: setDaqNodeId,
+          onSetNodeOp: setDaqNodeOp,
+          onSetNodeInput: setDaqNodeInput,
+          onSetNodeParam: setDaqNodeParam,
+          onAddOutput: addDaqOutput,
+          onRemoveOutput: removeDaqOutput,
+          onSetOutputId: setDaqOutputId,
+          onSetOutputNode: setDaqOutputNode,
+          daqPublishableNodeOptions,
+          daqResettableNodeIds,
+          onFocusNodeCard: focusDaqNodeCard,
+          onReloadStore: reloadDaqWorkspaceStore,
+          onSaveStore: saveDaqWorkspaceStore,
+          workspaceStoreBusyAction,
+          onApplyWorkspace: applyDaqWorkspace,
+        }}
+        deviceCommand={{
+          opened: commandOpen,
+          onClose: () => setCommandOpen(false),
+          title: commandDevice ? (
             <>
               Command{" "}
               <DeviceNameInline
@@ -6962,324 +7108,83 @@ export function App() {
             </>
           ) : (
             "Command"
-          )
-        }
-        capabilities={capabilitiesForActive}
-        commandAction={commandAction}
-        onActionChange={handleActionChange}
-        commandLabel={commandLabel}
-        onLabelChange={handleLabelChange}
-        showAdvancedParams={showAdvancedParams}
-        onShowAdvancedParamsChange={setShowAdvancedParams}
-        activeParams={activeParams}
-        commandParamValues={commandParamValues}
-        onParamValueChange={(name, value) =>
-          setCommandParamValues((prev) => ({
-            ...prev,
-            [name]: value,
-          }))
-        }
-        commandParams={commandParams}
-        onCommandParamsChange={setCommandParams}
-        isPinned={isPinned}
-        pinDisabled={!commandAction || !commandDevice}
-        onTogglePin={handlePinClick}
-        onExecute={executeCommand}
-      />
-
-      <HdfMeasurementNoteModal
-        opened={hdfNoteModalOpen}
-        onClose={() => setHdfNoteModalOpen(false)}
-        title={`Measurement Note ${hdfWriterProcessId ?? ""}`}
-        hdfWriterState={hdfWriterState}
-        measurementType={hdfWriterStatus?.measurementType ?? null}
-        measurementNotesRows={hdfWriterStatus?.measurementNotesRows ?? 0}
-        filePath={hdfWriterStatus?.filePath ?? null}
-        refreshLoading={hdfMeasurementSchemaLoading || hdfStatusBusy}
-        refreshDisabled={hdfCommandsBlocked || hdfAnyCommandBusy}
-        onRefresh={async () => {
-          if (!hdfWriterProcessId) {
-            return;
-          }
-          await Promise.all([
-            refreshHdfWriterStatus(hdfWriterProcessId),
-            fetchHdfMeasurementSchema(hdfWriterProcessId),
-          ]);
+          ),
+          capabilities: capabilitiesForActive,
+          commandAction,
+          onActionChange: handleActionChange,
+          commandLabel,
+          onLabelChange: handleLabelChange,
+          showAdvancedParams,
+          onShowAdvancedParamsChange: setShowAdvancedParams,
+          activeParams,
+          commandParamValues,
+          onParamValueChange: (name, value) =>
+            setCommandParamValues((prev) => ({
+              ...prev,
+              [name]: value,
+            })),
+          commandParams,
+          onCommandParamsChange: setCommandParams,
+          isPinned,
+          pinDisabled: !commandAction || !commandDevice,
+          onTogglePin: handlePinClick,
+          onExecute: executeCommand,
         }}
-        showMeasurementUi={hdfShowMeasurementUi}
-        supportsMeasurementNote={hdfSupportsMeasurementNote}
-        fields={hdfMeasurementSchema?.notes.fields ?? []}
+      />
+
+      <AppModalsLayer
+        hdf={hdfController}
         renderMeasurementFieldInput={renderMeasurementFieldInput}
-        noteValuesDraft={hdfNoteValuesDraft}
-        noteCustomByField={hdfNoteCustomByField}
-        onSetFieldValue={setHdfNoteFieldValue}
-        onSetFieldUseCustom={setHdfNoteFieldUseCustom}
-        measurementNoteBusy={hdfMeasurementNoteBusy}
-        addNoteDisabled={
-          !hdfShowMeasurementUi || hdfCommandsBlocked || !hdfSupportsMeasurementNote
-        }
-        onAddNote={executeHdfMeasurementNote}
-      />
-
-      <HdfWriterModal
-        opened={hdfModalOpen}
-        onClose={() => setHdfModalOpen(false)}
-        title={`HDF Writer ${hdfWriterProcessId ?? ""}`}
-        hdfWriterState={hdfWriterState}
-        hdfWriterProcessId={hdfWriterProcessId}
-        hdfWriterStatus={hdfWriterStatus ?? null}
-        hdfWriterLoading={hdfWriterLoading}
-        hdfStatusBusy={hdfStatusBusy}
-        hdfCommandsBlocked={hdfCommandsBlocked}
-        hdfSupportsStatus={hdfSupportsStatus}
-        hdfAnyCommandBusy={hdfAnyCommandBusy}
-        onRefreshStatus={executeHdfStatus}
-        hdfProcessCapabilitiesError={hdfProcessCapabilitiesError ?? null}
-        hdfMeasurementSchemaConfigured={hdfMeasurementSchemaConfigured}
-        hdfMeasurementSchemaAvailable={hdfMeasurementSchemaAvailable}
-        hdfSelectableDeviceIds={hdfSelectableDeviceIds}
-        hdfMeasurementSchemaDisplayPath={hdfMeasurementSchemaDisplayPath}
-        hdfMeasurementSchemaDisplayError={hdfMeasurementSchemaDisplayError}
-        hdfSupportsMeasurementSchemaGet={hdfSupportsMeasurementSchemaGet}
-        hdfMeasurementSchemaLoading={hdfMeasurementSchemaLoading}
-        onRefreshSchema={async () => {
-          if (!hdfWriterProcessId) {
-            return;
-          }
-          await fetchHdfMeasurementSchema(hdfWriterProcessId);
-        }}
-        hdfRotateFilenameDraft={hdfRotateFilenameDraft}
-        onRotateFilenameChange={setHdfRotateFilenameDraft}
-        hdfRotateDisabledDevicesDraft={hdfRotateDisabledDevicesDraft}
-        onRotateDisabledDevicesChange={setHdfRotateDisabledDevicesDraft}
-        hdfSelectableDeviceOptions={hdfSelectableDeviceOptions}
-        hdfShowMeasurementUi={hdfShowMeasurementUi}
-        hdfRotateMeasurementProfileDraft={hdfRotateMeasurementProfileDraft}
-        hdfRotateProfileOptions={hdfRotateProfileOptions}
-        onSelectRotateMeasurementProfile={selectHdfRotateMeasurementProfile}
-        hdfRotateSelectedProfile={hdfRotateSelectedProfile}
-        renderMeasurementFieldInput={renderMeasurementFieldInput}
-        hdfRotateMeasurementValuesDraft={hdfRotateMeasurementValuesDraft}
-        hdfRotateMeasurementCustomByField={hdfRotateMeasurementCustomByField}
-        onSetRotateFieldValue={setHdfRotateFieldValue}
-        onSetRotateFieldUseCustom={setHdfRotateFieldUseCustom}
-        hdfRotateBusy={hdfRotateBusy}
-        hdfSupportsRotate={hdfSupportsRotate}
-        onExecuteRotate={executeHdfRotate}
-        hdfSupportsMeasurementNote={hdfSupportsMeasurementNote}
-        hdfMeasurementSchema={hdfMeasurementSchema}
-        hdfNoteValuesDraft={hdfNoteValuesDraft}
-        hdfNoteCustomByField={hdfNoteCustomByField}
-        onSetNoteFieldValue={setHdfNoteFieldValue}
-        onSetNoteFieldUseCustom={setHdfNoteFieldUseCustom}
-        hdfMeasurementNoteBusy={hdfMeasurementNoteBusy}
-        onExecuteMeasurementNote={executeHdfMeasurementNote}
-        hdfDevicesGetBusy={hdfDevicesGetBusy}
-        hdfSupportsDevicesGet={hdfSupportsDevicesGet}
-        onExecuteDevicesGet={executeHdfDevicesGet}
-        hdfEnableDevicesDraft={hdfEnableDevicesDraft}
-        onEnableDevicesDraftChange={setHdfEnableDevicesDraft}
-        hdfDevicesEnableBusy={hdfDevicesEnableBusy}
-        hdfSupportsDevicesEnable={hdfSupportsDevicesEnable}
-        onExecuteDevicesEnable={executeHdfDevicesEnable}
-        hdfDisableDevicesDraft={hdfDisableDevicesDraft}
-        onDisableDevicesDraftChange={setHdfDisableDevicesDraft}
-        hdfDevicesDisableBusy={hdfDevicesDisableBusy}
-        hdfSupportsDevicesDisable={hdfSupportsDevicesDisable}
-        onExecuteDevicesDisable={executeHdfDevicesDisable}
-      />
-
-      <ProcessCommandModal
-        opened={processCommandOpen}
-        onClose={() => setProcessCommandOpen(false)}
-        title={processCommandTitle}
-        capabilities={capabilitiesForProcessCommand}
-        commandAction={processCommandAction}
-        onActionChange={handleProcessCommandActionChange}
-        showAdvancedParams={processShowAdvancedParams}
-        onShowAdvancedParamsChange={setProcessShowAdvancedParams}
-        activeParams={activeProcessParams}
-        commandParamValues={processCommandParamValues}
-        onParamValueChange={(name, value) =>
-          setProcessCommandParamValues((prev) => ({
-            ...prev,
-            [name]: value,
-          }))
-        }
-        commandParams={processCommandParams}
-        onCommandParamsChange={setProcessCommandParams}
-        onExecute={executeProcessCommand}
-      />
-
-      <ProcessesModal
-        opened={processOpen}
-        onClose={() => setProcessOpen(false)}
-        processes={processes}
-        capabilitiesByProcess={capabilitiesByProcess}
-        busyByProcess={processBusyById}
-        errorByProcess={processCapabilitiesErrorById}
-        onRefresh={refreshProcesses}
+        processesController={processesController}
+        processCommandController={processCommandController}
         onProcessAction={handleProcessAction}
-        onOpenCommand={openProcessCommand}
-      />
-
-      <SettingsModal
-        opened={settingsOpen}
-        onClose={() => setSettingsOpen(false)}
+        settingsOpen={settingsOpen}
+        setSettingsOpen={setSettingsOpen}
         settingsFileInputRef={settingsFileInputRef}
         onImportUiProfile={importUiProfile}
         onExportUiProfile={exportUiProfile}
-        onReload={loadGatewayRuntimeSettings}
-        loading={settingsLoading}
-        error={settingsError}
+        onReloadSettings={loadGatewayRuntimeSettings}
+        settingsLoading={settingsLoading}
+        settingsError={settingsError}
         gatewaySettings={gatewaySettings}
         resolvedApiBase={resolvedApiBase}
         resolvedWsBase={resolvedWsBase}
         telemetryStreamStatus={telemetryStreamStatus}
-      />
-
-      <InterlocksModal
-        opened={interlocksOpen}
-        onClose={() => setInterlocksOpen(false)}
-        onRefresh={refreshInterlocksModalData}
         devices={devices}
-        processes={interlocksPanelProcesses}
-        followerRulesByProcessId={followerRulesByProcessId}
-        interlockStatusByProcessId={interlockStatusByProcessId}
-        interlocksLoadingByProcessId={interlocksLoadingByProcessId}
-        interlocksErrorByProcessId={interlocksErrorByProcessId}
-        interlockRuleBusyByKey={interlockRuleBusyByKey}
-        commandInterceptorRoutes={commandInterceptorRoutes}
-        commandInterceptorRoutesLoading={commandInterceptorRoutesLoading}
-        commandInterceptorRoutesError={commandInterceptorRoutesError}
-        onRefreshProcess={(processId) =>
-          refreshInterlockProcessStatus(processId, undefined, {
-            showLoading: true,
-          })
-        }
-        onToggleFollowerRule={toggleFollowerRule}
-        onToggleInterlockRule={toggleInterlockRule}
-      />
-
-      <SequencerModal
-        opened={sequencerOpen}
-        onClose={() => setSequencerOpen(false)}
-        processState={sequencerProcessState}
-        runtimeState={sequencerRuntimeState}
-        loaded={sequencerLoaded}
-        currentStep={sequencerStatus?.currentStep ?? null}
-        progress={sequencerProgress}
-        progressPercent={sequencerProgressPercent}
-        totalSteps={sequencerTotalSteps}
-        completedSteps={sequencerCompletedSteps}
-        loadedSource={sequencerStatus?.loadedSource ?? null}
-        autoloadError={sequencerStatus?.autoloadError ?? null}
-        statusError={sequencerStatus?.error ?? null}
-        modalError={sequencerModalError}
-        primaryIcon={sequencerPrimaryIcon}
-        primaryAction={sequencerPrimaryAction}
-        primaryLabel={sequencerPrimaryLabel}
-        primaryDisabled={sequencerPrimaryDisabled}
-        actionBusy={sequencerActionBusy}
-        onRunAction={runSequencerAction}
-        fileInputRef={sequencerFileInputRef}
-        onFileInputChange={handleSequencerFileInput}
-        yamlViewMode={sequencerYamlViewMode}
-        onYamlViewModeChange={setSequencerYamlViewMode}
-        loadedYamlBusy={sequencerLoadedYamlBusy}
-        hasSequencerProcess={Boolean(sequencerProcess)}
-        onShowLoadedYaml={async () => {
-          if (!sequencerProcess) {
-            return;
-          }
-          await fetchSequencerLoadedYaml(sequencerProcess.process_id, {
-            applyToEditor: true,
-          });
-        }}
-        validateBusy={sequencerValidateBusy}
-        onValidate={validateSequencerYaml}
-        loadBusy={sequencerLoadBusy}
-        onLoad={loadSequencerYaml}
-        editorRef={sequencerEditorRef}
-        yamlText={sequencerYamlText}
-        onYamlTextChange={onSequencerYamlTextChange}
+        capabilitiesByDevice={capabilitiesByDevice}
+        interlocksController={interlocksController}
+        sequencerController={sequencerController}
+        sequencerPrimaryIcon={sequencerPrimaryIcon}
+        sequencerProcessId={sequencerProcess?.process_id ?? null}
         colorScheme={computedColorScheme}
-        diagnostics={sequencerDiagnostics}
-        onJumpToDiagnostic={jumpToSequencerDiagnostic}
-      />
-
-      <CommandHistoryModal
-        opened={commandHistoryOpen}
-        onClose={() => setCommandHistoryOpen(false)}
-        filteredRows={filteredCommandHistoryRows}
-        devices={devices}
-        totalRows={commandHistoryRows.length}
-        persistLimit={commandHistoryLimit}
-        persistLimitMin={MIN_COMMAND_HISTORY_LIMIT}
-        persistLimitMax={MAX_COMMAND_HISTORY_LIMIT}
-        onPersistLimitChange={(value) =>
-          setCommandHistoryLimit(
-            clampCommandHistoryLimit(value, COMMAND_HISTORY_LIMIT_BOUNDS)
-          )
-        }
-        autoScroll={commandHistoryAutoScroll}
-        onAutoScrollChange={setCommandHistoryAutoScroll}
-        onClear={() => setCommandHistoryRows([])}
-        targetFilter={commandHistoryTargetFilter}
-        onTargetFilterChange={setCommandHistoryTargetFilter}
-        statusFilter={commandHistoryStatusFilter}
-        onStatusFilterChange={setCommandHistoryStatusFilter}
-        sourceFilter={commandHistorySourceFilter}
-        onSourceFilterChange={setCommandHistorySourceFilter}
-        sourceOptions={commandHistorySourceOptions}
-        textFilter={commandHistoryTextFilter}
-        onTextFilterChange={setCommandHistoryTextFilter}
-        viewportRef={commandHistoryScrollRef}
-        onCopyJson={(label, payload) => {
-          void copyJsonToClipboard(label, payload);
-        }}
-      />
-
-      <LogsModal
-        opened={logsOpen}
-        onClose={() => setLogsOpen(false)}
-        connected={logsWsConnected}
-        filteredRows={filteredLogRows}
-        totalRows={logRows.length}
-        autoScroll={logAutoScroll}
-        onAutoScrollChange={setLogAutoScroll}
-        loading={logLoading}
-        onReload={() => {
-          void loadLogTail();
-        }}
-        onClear={() => {
-          logSeenRef.current = new Set();
-          setLogRows([]);
-          setExpandedLogByKey({});
-        }}
-        severityFilter={logSeverityFilter}
-        onSeverityFilterChange={setLogSeverityFilter}
-        sourceFilter={logSourceFilter}
-        onSourceFilterChange={setLogSourceFilter}
-        deviceFilter={logDeviceFilter}
-        onDeviceFilterChange={setLogDeviceFilter}
-        processFilter={logProcessFilter}
-        onProcessFilterChange={setLogProcessFilter}
-        textFilter={logTextFilter}
-        onTextFilterChange={setLogTextFilter}
-        devices={devices}
-        processes={processes}
-        viewportRef={logScrollRef}
-        expandedByKey={expandedLogByKey}
-        onToggleExpanded={(entryKey) =>
-          setExpandedLogByKey((prev) => ({
-            ...prev,
-            [entryKey]: !Boolean(prev[entryKey]),
-          }))
-        }
-        onCopyMessage={(message) => {
-          void copyTextToClipboard("Log message", message);
-        }}
+        commandHistoryController={commandHistoryController}
+        commandHistoryScrollRef={commandHistoryScrollRef}
+        copyJsonToClipboard={copyJsonToClipboard}
+        logsOpen={logsOpen}
+        setLogsOpen={setLogsOpen}
+        logsWsConnected={logsWsConnected}
+        filteredLogRows={filteredLogRows}
+        logRows={logRows}
+        logAutoScroll={logAutoScroll}
+        setLogAutoScroll={setLogAutoScroll}
+        logLoading={logLoading}
+        loadLogTail={loadLogTail}
+        logSeenRef={logSeenRef}
+        setLogRows={setLogRows}
+        setExpandedLogByKey={setExpandedLogByKey}
+        logSeverityFilter={logSeverityFilter}
+        setLogSeverityFilter={setLogSeverityFilter}
+        logSourceFilter={logSourceFilter}
+        setLogSourceFilter={setLogSourceFilter}
+        logDeviceFilter={logDeviceFilter}
+        setLogDeviceFilter={setLogDeviceFilter}
+        logProcessFilter={logProcessFilter}
+        setLogProcessFilter={setLogProcessFilter}
+        logTextFilter={logTextFilter}
+        setLogTextFilter={setLogTextFilter}
+        logScrollRef={logScrollRef}
+        expandedLogByKey={expandedLogByKey}
+        copyTextToClipboard={copyTextToClipboard}
       />
     </AppShell>
   );

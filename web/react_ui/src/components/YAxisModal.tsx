@@ -26,7 +26,7 @@ export function YAxisModal({
   onApply,
 }: Props) {
   return (
-    <Modal opened={opened} onClose={onClose} title={title} centered>
+    <Modal opened={opened} onClose={onClose} title={title} size="clamp(32rem, 72vw, 48rem)" centered>
       <Stack gap="md">
         {autoRange ? (
           <Text size="xs" c="dimmed">

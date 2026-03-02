@@ -47,7 +47,7 @@ export function ProcessCommandModal({
   onExecute,
 }: Props) {
   return (
-    <Modal opened={opened} onClose={onClose} title={title} size="lg" centered zIndex={450}>
+    <Modal opened={opened} onClose={onClose} title={title} size="clamp(42rem, 82vw, 64rem)" centered zIndex={450}>
       <Stack gap="md">
         <Group align="flex-end" justify="space-between">
           <Select

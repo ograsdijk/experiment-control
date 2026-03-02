@@ -23,7 +23,7 @@ export function StreamParamsOptionsModal({
   onSetOutputs,
 }: Props) {
   return (
-    <Modal opened={opened} onClose={onClose} title={`Params options ${panel?.title ?? ""}`} size="lg" centered>
+    <Modal opened={opened} onClose={onClose} title={`Params options ${panel?.title ?? ""}`} size="clamp(42rem, 82vw, 64rem)" centered>
       <Stack gap="md">
         {panel ? (
           <>

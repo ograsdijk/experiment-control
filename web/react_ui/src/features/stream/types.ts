@@ -26,6 +26,9 @@ export type StreamDagOpId =
   | "trace.integrate"
   | "fit.curve_1d"
   | "fit.yhat"
+  | "fit.xhat"
+  | "fit.yhat_dense"
+  | "fit.xhat_dense"
   | "fit.param"
   | "fit.params"
   | "fit.from_hist_agg"
@@ -231,12 +234,14 @@ export type PlotStreamBinStatsPanelState = {
   workspaceId: string;
   outputId: string | null;
   overlayOutputIds: string[];
+  fitOverlayOutputIds: string[];
   stream: StreamTarget | null;
   channelIndex: number;
   analysis: StreamAnalysisSettings;
   binStats: StreamBinStatsSettings;
   uncertaintyMode: UncertaintyMode;
   uncertaintyScale: number;
+  showBinMarkers: boolean;
   yScaleMode: YScaleMode;
   yMin: number | null;
   yMax: number | null;
@@ -271,7 +276,7 @@ export type StreamFrameSample = {
 
 export type StreamAnalysisWorkspaceSubscription = {
   workspaceId: string;
-  kinds: Array<"scalar" | "hist_agg" | "hist2d" | "trace" | "params_map">;
+  kinds: Array<"scalar" | "hist_agg" | "hist2d" | "trace" | "params_map" | "fit_1d">;
   traceDecimator?: StreamTraceDecimator;
   traceMaxPoints?: number;
   traceMaxFps?: number;
@@ -298,6 +303,13 @@ export type StreamBinStatsSnapshot = {
   xMin: number | null;
   xMax: number | null;
   autoRange: boolean | null;
+};
+
+export type StreamFitCurveSnapshot = {
+  x: number[];
+  yhat: number[];
+  xDense: number[] | null;
+  yhatDense: number[] | null;
 };
 
 export type StreamBin2dSnapshot = {

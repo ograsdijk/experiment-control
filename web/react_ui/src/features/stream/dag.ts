@@ -199,10 +199,34 @@ export const STREAM_DAG_OPS: Record<StreamDagOpId, StreamDagOpDef> = {
       },
       { name: "every_n", label: "every_n", kind: "integer", optional: true },
       { name: "sigma_y", label: "sigma_y", kind: "number", optional: true },
+      {
+        name: "dense_eval_points",
+        label: "dense_eval_points",
+        kind: "integer",
+        optional: true,
+      },
     ],
   },
   "fit.yhat": {
     label: "fit.yhat",
+    inputs: ["fit"],
+    outputKind: "trace",
+    params: [],
+  },
+  "fit.xhat": {
+    label: "fit.xhat",
+    inputs: ["fit"],
+    outputKind: "trace",
+    params: [],
+  },
+  "fit.yhat_dense": {
+    label: "fit.yhat_dense",
+    inputs: ["fit"],
+    outputKind: "trace",
+    params: [],
+  },
+  "fit.xhat_dense": {
+    label: "fit.xhat_dense",
     inputs: ["fit"],
     outputKind: "trace",
     params: [],
@@ -273,6 +297,12 @@ export const STREAM_DAG_OPS: Record<StreamDagOpId, StreamDagOpDef> = {
       { name: "every_n", label: "every_n", kind: "integer", optional: true },
       { name: "sigma_y", label: "sigma_y", kind: "number", optional: true },
       {
+        name: "dense_eval_points",
+        label: "dense_eval_points",
+        kind: "integer",
+        optional: true,
+      },
+      {
         name: "chi2_sigma_source",
         label: "chi2_sigma_source",
         kind: "string",
@@ -342,6 +372,9 @@ export const STREAM_DAG_INPUT_KINDS: Record<
   "trace.integrate": { trace: "trace" },
   "fit.curve_1d": { x: "trace", y: "trace", gate: "scalar" },
   "fit.yhat": { fit: "fit_1d" },
+  "fit.xhat": { fit: "fit_1d" },
+  "fit.yhat_dense": { fit: "fit_1d" },
+  "fit.xhat_dense": { fit: "fit_1d" },
   "fit.param": { fit: "fit_1d" },
   "fit.params": { fit: "fit_1d" },
   "fit.from_hist_agg": { hist: "hist_agg", gate: "scalar" },
@@ -388,7 +421,12 @@ export function defaultParamsForOp(op: StreamDagOpId): Record<string, unknown> {
     return { method: "minmax", target_points: DEFAULT_TRACE_MAX_POINTS };
   }
   if (op === "fit.curve_1d") {
-    return { model: "gaussian", baseline_mode: "none", every_n: 1 };
+    return {
+      model: "gaussian",
+      baseline_mode: "none",
+      every_n: 1,
+      dense_eval_points: 200,
+    };
   }
   if (op === "fit.param") {
     return { name: "center", field: "value" };
@@ -399,6 +437,7 @@ export function defaultParamsForOp(op: StreamDagOpId): Record<string, unknown> {
       model: "gaussian",
       baseline_mode: "none",
       every_n: 1,
+      dense_eval_points: 200,
       chi2_sigma_source: "sem",
       min_count: 1,
     };
@@ -447,13 +486,14 @@ export function nodeKindFromOp(op: string): StreamDagOutputKind | null {
 
 export function isPublishableNodeKind(
   kind: StreamDagOutputKind | null
-): kind is "scalar" | "hist_agg" | "hist2d" | "trace" | "params_map" {
+): kind is "scalar" | "hist_agg" | "hist2d" | "trace" | "params_map" | "fit_1d" {
   return (
     kind === "scalar" ||
     kind === "hist_agg" ||
     kind === "hist2d" ||
     kind === "trace" ||
-    kind === "params_map"
+    kind === "params_map" ||
+    kind === "fit_1d"
   );
 }
 

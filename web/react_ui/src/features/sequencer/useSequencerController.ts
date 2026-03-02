@@ -9,7 +9,11 @@ import {
 } from "react";
 import type { ApiResponse } from "../../api";
 import type { ProcessStatus } from "../../types";
-import type { SequencerDiagnostic, SequencerStatus } from "./types";
+import type {
+  SequencerAdaptiveStudyStatus,
+  SequencerDiagnostic,
+  SequencerStatus,
+} from "./types";
 import {
   formatDurationCompact,
   normalizeSequencerDiagnostics,
@@ -18,6 +22,7 @@ import {
 } from "./utils";
 
 type SequencerAction = "start" | "pause" | "resume" | "stop";
+type AdaptiveStartMode = "reset" | "resume" | "warm_start";
 
 type UseSequencerControllerArgs = {
   sequencerProcess: ProcessStatus | null;
@@ -61,6 +66,12 @@ export function useSequencerController({
   const [sequencerModalError, setSequencerModalError] = useState<string | null>(
     null
   );
+  const [sequencerAdaptiveModes, setSequencerAdaptiveModes] = useState<
+    Record<string, AdaptiveStartMode>
+  >({});
+  const [sequencerAdaptiveClearBusy, setSequencerAdaptiveClearBusy] = useState<
+    string | null
+  >(null);
   const sequencerEditorRef = useRef<HTMLTextAreaElement | null>(null);
   const sequencerFileInputRef = useRef<HTMLInputElement | null>(null);
   const sequencerStatusByProcessIdRef = useRef<Record<string, SequencerStatus>>(
@@ -107,6 +118,8 @@ export function useSequencerController({
               loadedSource: current?.loadedSource ?? null,
               autoloadError: current?.autoloadError ?? null,
               progress: current?.progress ?? null,
+              loadedAdaptiveIds: current?.loadedAdaptiveIds ?? [],
+              adaptiveStudies: current?.adaptiveStudies ?? {},
             };
             if (sameSequencerStatus(current, nextStatus)) {
               return prev;
@@ -124,6 +137,8 @@ export function useSequencerController({
           loaded_source?: unknown;
           autoload_error?: unknown;
           progress?: unknown;
+          loaded_adaptive_ids?: unknown;
+          adaptive_studies?: unknown;
         };
         const contextColumns =
           result.context_columns && typeof result.context_columns === "object"
@@ -144,6 +159,55 @@ export function useSequencerController({
             ? result.autoload_error
             : null;
         const progress = normalizeSequencerProgress(result.progress);
+        const loadedAdaptiveIds = Array.isArray(result.loaded_adaptive_ids)
+          ? result.loaded_adaptive_ids
+              .filter(
+                (item): item is string =>
+                  typeof item === "string" && item.trim().length > 0
+              )
+              .map((item) => item.trim())
+          : [];
+        const adaptiveStudiesRaw = result.adaptive_studies;
+        const adaptiveStudies: Record<string, SequencerAdaptiveStudyStatus> =
+          adaptiveStudiesRaw && typeof adaptiveStudiesRaw === "object"
+            ? Object.fromEntries(
+                Object.entries(
+                  adaptiveStudiesRaw as Record<string, unknown>
+                ).flatMap(([key, value]) => {
+                  if (typeof key !== "string" || !key.trim()) {
+                    return [];
+                  }
+                  if (!value || typeof value !== "object") {
+                    return [];
+                  }
+                  const rawStudy = value as Record<string, unknown>;
+                  const trialCountRaw = rawStudy.trial_count;
+                  const trialCount =
+                    typeof trialCountRaw === "number" &&
+                    Number.isFinite(trialCountRaw)
+                      ? Math.max(0, Math.trunc(trialCountRaw))
+                      : 0;
+                  return [
+                    [
+                      key,
+                      {
+                        controllerKind:
+                          typeof rawStudy.controller_kind === "string" &&
+                          rawStudy.controller_kind.trim()
+                            ? rawStudy.controller_kind
+                            : null,
+                        trialCount,
+                        lastMode:
+                          typeof rawStudy.last_mode === "string" &&
+                          rawStudy.last_mode.trim()
+                            ? rawStudy.last_mode
+                            : null,
+                      } satisfies SequencerAdaptiveStudyStatus,
+                    ],
+                  ];
+                })
+              )
+            : {};
         setSequencerStatusByProcessId((prev) => {
           const current = prev[processId];
           const nextStatus: SequencerStatus = {
@@ -159,6 +223,8 @@ export function useSequencerController({
             loadedSource,
             autoloadError,
             progress,
+            loadedAdaptiveIds,
+            adaptiveStudies,
           };
           if (sameSequencerStatus(current, nextStatus)) {
             return prev;
@@ -178,6 +244,8 @@ export function useSequencerController({
             loadedSource: current?.loadedSource ?? null,
             autoloadError: current?.autoloadError ?? null,
             progress: current?.progress ?? null,
+            loadedAdaptiveIds: current?.loadedAdaptiveIds ?? [],
+            adaptiveStudies: current?.adaptiveStudies ?? {},
           };
           if (sameSequencerStatus(current, nextStatus)) {
             return prev;
@@ -293,6 +361,69 @@ export function useSequencerController({
     });
   }, [fetchSequencerLoadedYaml, refreshSequencerStatus, sequencerProcess]);
 
+  const setAdaptiveMode = useCallback(
+    (studyId: string, mode: AdaptiveStartMode) => {
+      const normalizedId = studyId.trim();
+      if (!normalizedId) {
+        return;
+      }
+      setSequencerAdaptiveModes((prev) => {
+        if (prev[normalizedId] === mode) {
+          return prev;
+        }
+        return { ...prev, [normalizedId]: mode };
+      });
+    },
+    []
+  );
+
+  const clearAdaptiveStudy = useCallback(
+    async (studyId: string) => {
+      if (!sequencerProcess || sequencerAdaptiveClearBusy) {
+        return;
+      }
+      const normalizedId = studyId.trim();
+      if (!normalizedId) {
+        return;
+      }
+      setSequencerAdaptiveClearBusy(normalizedId);
+      setSequencerModalError(null);
+      try {
+        const resp = await sendProcessCommand(
+          sequencerProcess.process_id,
+          "sequencer.adaptive.clear",
+          { study_id: normalizedId },
+          "sequencer-adaptive-clear"
+        );
+        if (!resp.ok) {
+          const message = resp.error?.message ?? resp.error?.code ?? "Unknown error";
+          setSequencerModalError(message);
+          notifications.show({
+            color: "red",
+            title: "Failed to clear adaptive study",
+            message,
+          });
+          return;
+        }
+        notifications.show({
+          color: "teal",
+          title: "Adaptive study cleared",
+          message: normalizedId,
+        });
+        setSequencerAdaptiveModes((prev) => ({ ...prev, [normalizedId]: "reset" }));
+        await refreshSequencerStatus(sequencerProcess.process_id);
+      } finally {
+        setSequencerAdaptiveClearBusy(null);
+      }
+    },
+    [
+      refreshSequencerStatus,
+      sendProcessCommand,
+      sequencerAdaptiveClearBusy,
+      sequencerProcess,
+    ]
+  );
+
   const runSequencerAction = useCallback(
     async (action: SequencerAction) => {
       if (!sequencerProcess || sequencerActionBusy) {
@@ -302,10 +433,21 @@ export function useSequencerController({
       setSequencerActionBusy(true);
       setSequencerModalError(null);
       try {
+        const loadedAdaptiveIds =
+          sequencerStatusByProcessIdRef.current[processId]?.loadedAdaptiveIds ?? [];
+        const adaptiveParams =
+          action === "start" && loadedAdaptiveIds.length > 0
+            ? Object.fromEntries(
+                loadedAdaptiveIds.map((studyId) => [
+                  studyId,
+                  { mode: sequencerAdaptiveModes[studyId] ?? "reset" },
+                ])
+              )
+            : undefined;
         const resp = await sendProcessCommand(
           processId,
           `sequencer.${action}`,
-          {},
+          adaptiveParams ? { adaptive: adaptiveParams } : {},
           "sequencer-action"
         );
         if (!resp.ok) {
@@ -333,6 +475,7 @@ export function useSequencerController({
       refreshProcesses,
       refreshSequencerStatus,
       sendProcessCommand,
+      sequencerAdaptiveModes,
       sequencerActionBusy,
       sequencerProcess,
     ]
@@ -628,6 +771,23 @@ export function useSequencerController({
     sequencerActionBusy ||
     (sequencerPrimaryAction === "start" && sequencerStatus?.loaded === false);
 
+  useEffect(() => {
+    const loadedAdaptiveIds = sequencerStatus?.loadedAdaptiveIds ?? [];
+    setSequencerAdaptiveModes((prev) => {
+      const next: Record<string, AdaptiveStartMode> = {};
+      for (const studyId of loadedAdaptiveIds) {
+        next[studyId] = prev[studyId] ?? "reset";
+      }
+      const sameKeys =
+        Object.keys(prev).length === Object.keys(next).length &&
+        Object.keys(next).every((key) => prev[key] === next[key]);
+      if (sameKeys) {
+        return prev;
+      }
+      return next;
+    });
+  }, [sequencerStatus?.loadedAdaptiveIds]);
+
   return {
     sequencerOpen,
     setSequencerOpen,
@@ -654,6 +814,8 @@ export function useSequencerController({
     setSequencerYamlViewMode,
     sequencerDiagnostics,
     sequencerModalError,
+    sequencerAdaptiveModes,
+    sequencerAdaptiveClearBusy,
     sequencerEditorRef,
     sequencerFileInputRef,
     onSequencerYamlTextChange,
@@ -661,6 +823,8 @@ export function useSequencerController({
     fetchSequencerLoadedYaml,
     openSequencerModal,
     runSequencerAction,
+    setAdaptiveMode,
+    clearAdaptiveStudy,
     jumpToSequencerDiagnostic,
     handleSequencerFileInput,
     validateSequencerYaml,

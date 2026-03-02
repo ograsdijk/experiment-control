@@ -65,7 +65,7 @@ export function HdfMeasurementNoteModal({
   onAddNote,
 }: Props) {
   return (
-    <Modal opened={opened} onClose={onClose} title={title} size="lg" centered zIndex={455}>
+    <Modal opened={opened} onClose={onClose} title={title} size="clamp(42rem, 82vw, 64rem)" centered zIndex={455}>
       <Stack gap="md">
         <Group justify="space-between" align="flex-start" wrap="wrap">
           <Stack gap={2}>

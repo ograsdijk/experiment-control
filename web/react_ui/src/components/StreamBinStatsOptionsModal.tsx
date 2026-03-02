@@ -8,6 +8,7 @@
   SegmentedControl,
   Select,
   Stack,
+  Switch,
   Text,
 } from "@mantine/core";
 import type { UncertaintyMode } from "./StreamBinStatsPanel";
@@ -23,15 +24,18 @@ type Props = {
   streamWorkspaceOptions: ReadonlyArray<SelectOption>;
   outputOptions: ReadonlyArray<SelectOption>;
   overlayTraceOutputOptions: ReadonlyArray<SelectOption>;
+  fitOverlayOutputOptions: ReadonlyArray<SelectOption>;
   xAxisLabel: string;
   onSetWorkspace: (panelId: string, workspaceId: string | null) => void;
   onSetOutput: (panelId: string, outputId: string | null) => void;
   onSetOverlayOutputs: (panelId: string, outputIds: string[]) => void;
+  onSetFitOverlayOutputs: (panelId: string, outputIds: string[]) => void;
   onSetUncertainty: (
     panelId: string,
     mode: UncertaintyMode,
     scale: number
   ) => void;
+  onSetShowBinMarkers: (panelId: string, show: boolean) => void;
 };
 
 export function StreamBinStatsOptionsModal({
@@ -41,15 +45,18 @@ export function StreamBinStatsOptionsModal({
   streamWorkspaceOptions,
   outputOptions,
   overlayTraceOutputOptions,
+  fitOverlayOutputOptions,
   xAxisLabel,
   onSetWorkspace,
   onSetOutput,
   onSetOverlayOutputs,
+  onSetFitOverlayOutputs,
   onSetUncertainty,
+  onSetShowBinMarkers,
 }: Props) {
   const title = `Bin stats options ${panel?.title ?? ""}`;
   return (
-    <Modal opened={opened} onClose={onClose} title={title} size="lg" centered>
+    <Modal opened={opened} onClose={onClose} title={title} size="clamp(42rem, 82vw, 64rem)" centered>
       <Stack gap="md">
         {panel ? (
           <>
@@ -81,6 +88,16 @@ export function StreamBinStatsOptionsModal({
               data={overlayTraceOutputOptions}
               value={panel.overlayOutputIds}
               onChange={(value) => onSetOverlayOutputs(panel.id, value)}
+            />
+            <MultiSelect
+              size="sm"
+              searchable
+              clearable
+              placeholder="Optional overlay fit outputs"
+              comboboxProps={{ zIndex: 500 }}
+              data={fitOverlayOutputOptions}
+              value={panel.fitOverlayOutputIds}
+              onChange={(value) => onSetFitOverlayOutputs(panel.id, value)}
             />
             <Group gap="sm" align="center" wrap="wrap">
               <SegmentedControl
@@ -118,6 +135,14 @@ export function StreamBinStatsOptionsModal({
                 />
               </Group>
             </Group>
+            <Switch
+              size="sm"
+              label="Show sampled bins"
+              checked={panel.showBinMarkers}
+              onChange={(event) =>
+                onSetShowBinMarkers(panel.id, event.currentTarget.checked)
+              }
+            />
             <Badge variant="light" color="indigo">
               x-axis: {xAxisLabel}
             </Badge>

@@ -1,4 +1,10 @@
-﻿export type SequencerStatus = {
+export type SequencerAdaptiveStudyStatus = {
+  controllerKind: string | null;
+  trialCount: number;
+  lastMode: string | null;
+};
+
+export type SequencerStatus = {
   state: string | null;
   currentStep: string | null;
   error: string | null;
@@ -7,6 +13,8 @@
   loadedSource: string | null;
   autoloadError: string | null;
   progress: SequencerProgress | null;
+  loadedAdaptiveIds: string[];
+  adaptiveStudies: Record<string, SequencerAdaptiveStudyStatus>;
 };
 
 export type SequencerProgress = {
@@ -25,4 +33,134 @@ export type SequencerDiagnostic = {
   line: number | null;
   column: number | null;
   source: string | null;
+};
+
+export type SequencerStepOutlineNode = {
+  id: string;
+  kind: string;
+  line: number;
+  endLine: number;
+  indent: number;
+  branchLabel: "then" | "else" | null;
+  summary: string | null;
+  snippet: string;
+  children: SequencerStepOutlineNode[];
+  callDetail: SequencerCallDetail | null;
+  sleepDetail: SequencerSleepDetail | null;
+  setDetail: SequencerSetDetail | null;
+  assignDetail: SequencerAssignDetail | null;
+  waitUntilDetail: SequencerWaitUntilDetail | null;
+  setContextDetail: SequencerSetContextDetail | null;
+  ifDetail: SequencerIfDetail | null;
+  whileDetail: SequencerWhileDetail | null;
+  atomicDetail: SequencerAtomicDetail | null;
+  pauseDetail: SequencerPauseDetail | null;
+  parallelDetail: SequencerParallelDetail | null;
+  forDetail: SequencerForDetail | null;
+  repeatDetail: SequencerRepeatDetail | null;
+  adaptiveDetail: SequencerAdaptiveDetail | null;
+};
+
+export type SequencerOutlineMetadataEntry = {
+  name: string;
+  value: string | null;
+};
+
+export type SequencerAdaptiveFieldGroup = {
+  name: string;
+  entries: SequencerOutlineMetadataEntry[];
+};
+
+export type SequencerAdaptiveMetricDetail = {
+  name: string;
+  sourceKind: string | null;
+  config: SequencerOutlineMetadataEntry[];
+};
+
+export type SequencerCallDetail = {
+  device: string | null;
+  action: string | null;
+  params: SequencerOutlineMetadataEntry[];
+};
+
+export type SequencerSleepDetail = {
+  duration: string | null;
+};
+
+export type SequencerSetDetail = {
+  device: string | null;
+  name: string | null;
+  value: string | null;
+};
+
+export type SequencerAssignDetail = {
+  entries: SequencerOutlineMetadataEntry[];
+};
+
+export type SequencerWaitUntilDetail = {
+  timeoutS: string | null;
+  everyS: string | null;
+  sample: SequencerOutlineMetadataEntry[];
+  condition: SequencerOutlineMetadataEntry[];
+};
+
+export type SequencerSetContextStreamDetail = {
+  device: string | null;
+  stream: string | null;
+};
+
+export type SequencerSetContextDetail = {
+  streams: SequencerSetContextStreamDetail[];
+  fields: SequencerOutlineMetadataEntry[];
+};
+
+export type SequencerIfDetail = {
+  condition: SequencerOutlineMetadataEntry[];
+  thenCount: number;
+  elseCount: number;
+};
+
+export type SequencerWhileDetail = {
+  condition: SequencerOutlineMetadataEntry[];
+};
+
+export type SequencerAtomicDetail = {
+  name: string | null;
+};
+
+export type SequencerPauseDetail = {
+  reason: string | null;
+};
+
+export type SequencerParallelDetail = {
+  branchCount: number;
+};
+
+export type SequencerForDetail = {
+  bind: SequencerOutlineMetadataEntry[];
+  iterableKind: string | null;
+  iterableConfig: SequencerOutlineMetadataEntry[];
+};
+
+export type SequencerRepeatDetail = {
+  times: string | null;
+};
+
+export type SequencerAdaptiveDetail = {
+  id: string | null;
+  controllerKind: string | null;
+  controllerConfig: SequencerOutlineMetadataEntry[];
+  space: SequencerAdaptiveFieldGroup[];
+  bind: SequencerOutlineMetadataEntry[];
+  observeRepeats: string | null;
+  metrics: SequencerAdaptiveMetricDetail[];
+  aggregate: SequencerOutlineMetadataEntry[];
+  score: string | null;
+  stopping: SequencerOutlineMetadataEntry[];
+};
+
+export type SequencerOutlineMetadata = {
+  version: string | null;
+  vars: SequencerOutlineMetadataEntry[];
+  contextColumns: SequencerOutlineMetadataEntry[];
 };

@@ -153,7 +153,7 @@ export function DaqWorkspacesModal({
         </Group>
       }
       centered
-      size="xl"
+      size="clamp(56rem, 92vw, 96rem)"
     >
       <Stack gap="md">
         <Group align="end" gap="sm">

@@ -400,6 +400,52 @@ body::before {
   background: rgba(45, 185, 177, 0.12);
 }
 
+.sequencer-var-chip {
+  width: 100%;
+  border: 1px solid var(--card-border);
+  border-radius: 999px;
+  background: rgba(14, 159, 154, 0.06);
+  display: flex;
+  align-items: center;
+  gap: 0;
+  overflow: hidden;
+}
+
+.sequencer-var-segment {
+  display: flex;
+  align-items: center;
+  min-height: 34px;
+}
+
+.sequencer-var-name {
+  flex: 0 0 34%;
+  min-width: 120px;
+  padding: 2px 10px;
+  border-right: 1px solid var(--card-border);
+}
+
+.sequencer-var-value {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 2px 10px;
+}
+
+.sequencer-var-value .mantine-TextInput-input,
+.sequencer-var-name .mantine-TextInput-input {
+  min-width: 0;
+  font-size: 12px;
+}
+
+.sequencer-var-remove {
+  flex: 0 0 auto;
+  padding: 2px 6px;
+  border-left: 1px solid var(--card-border);
+}
+
+[data-mantine-color-scheme="dark"] .sequencer-var-chip {
+  background: rgba(45, 185, 177, 0.1);
+}
+
 .pulse {
   width: 8px;
   height: 8px;

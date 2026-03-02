@@ -11,14 +11,23 @@ export type StreamBinStatsSeries = {
   count: number[];
 };
 
+export type StreamBinStatsFitOverlay = {
+  label: string;
+  x: number[];
+  y: number[];
+};
+
 type StreamBinStatsPanelProps = {
   series: StreamBinStatsSeries | null;
   overlaySeries?: Array<{ label: string; values: number[] }>;
+  fitOverlays?: StreamBinStatsFitOverlay[];
   xLabel: string;
   uncertaintyMode: UncertaintyMode;
   uncertaintyScale: number;
+  showBinMarkers?: boolean;
   tick: number;
   colorScheme: "light" | "dark";
+  plotHeight?: number;
   yScaleMode?: "auto" | "manual";
   yMin?: number | null;
   yMax?: number | null;
@@ -149,17 +158,43 @@ function buildOverlayData(
   return out;
 }
 
+function buildFitOverlayData(
+  overlays: StreamBinStatsFitOverlay[]
+): StreamBinStatsFitOverlay[] {
+  if (overlays.length <= 0) {
+    return [];
+  }
+  const out: StreamBinStatsFitOverlay[] = [];
+  for (const overlay of overlays) {
+    const label = String(overlay.label ?? "").trim() || "fit";
+    const x = asFiniteList(overlay.x);
+    const y = asFiniteList(overlay.y);
+    const n = Math.min(x.length, y.length);
+    if (!Number.isFinite(n) || n <= 1) {
+      continue;
+    }
+    out.push({
+      label,
+      x: x.slice(0, n),
+      y: y.slice(0, n),
+    });
+  }
+  return out;
+}
+
 export function computeStreamBinStatsAutoYRange(
   input: StreamBinStatsSeries | null,
   mode: UncertaintyMode,
   scale: number,
-  overlays: Array<{ label: string; values: number[] }> = []
+  overlays: Array<{ label: string; values: number[] }> = [],
+  fitOverlays: StreamBinStatsFitOverlay[] = []
 ): { min: number; max: number } | null {
   const built = buildBandData(input, mode, scale);
   if (built[0].length <= 0) {
     return null;
   }
   const overlayBuilt = buildOverlayData(built[0], overlays);
+  const fitOverlayBuilt = buildFitOverlayData(fitOverlays);
   let minY = Number.POSITIVE_INFINITY;
   let maxY = Number.NEGATIVE_INFINITY;
   for (let si = 1; si < built.length; si += 1) {
@@ -189,6 +224,19 @@ export function computeStreamBinStatsAutoYRange(
       }
     }
   }
+  for (const overlay of fitOverlayBuilt) {
+    for (const value of overlay.y) {
+      if (!Number.isFinite(value)) {
+        continue;
+      }
+      if (value < minY) {
+        minY = value;
+      }
+      if (value > maxY) {
+        maxY = value;
+      }
+    }
+  }
   if (!Number.isFinite(minY) || !Number.isFinite(maxY)) {
     return null;
   }
@@ -202,17 +250,21 @@ export function computeStreamBinStatsAutoYRange(
 export function StreamBinStatsPanel({
   series,
   overlaySeries = [],
+  fitOverlays = [],
   xLabel,
   uncertaintyMode,
   uncertaintyScale,
+  showBinMarkers = false,
   tick,
   colorScheme,
+  plotHeight = 320,
   yScaleMode = "auto",
   yMin = null,
   yMax = null,
 }: StreamBinStatsPanelProps) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const plotRef = useRef<uPlot | null>(null);
+  const fitOverlayDataRef = useRef<StreamBinStatsFitOverlay[]>([]);
   const isDark = colorScheme === "dark";
 
   const formatNumber = useMemo(() => {
@@ -237,6 +289,11 @@ export function StreamBinStatsPanel({
     () => buildOverlayData(data[0] ?? [], overlaySeries),
     [data, overlaySeries, tick]
   );
+  const fitOverlayData = useMemo(
+    () => buildFitOverlayData(fitOverlays),
+    [fitOverlays, tick]
+  );
+  fitOverlayDataRef.current = fitOverlayData;
 
   const hasManualY = useMemo(() => {
     if (yScaleMode !== "manual") {
@@ -266,9 +323,11 @@ export function StreamBinStatsPanel({
     const bandFill = isDark ? "rgba(110, 183, 255, 0.22)" : "rgba(34, 108, 216, 0.16)";
     const bandStroke = isDark ? "rgba(110, 183, 255, 0.32)" : "rgba(34, 108, 216, 0.24)";
     const meanStroke = isDark ? "#86c1ff" : "#1f5bbf";
+    const meanPointFill = isDark ? "#d8ecff" : "#ffffff";
 
     const width = hostRef.current.clientWidth || 600;
     const overlayColors = ["#df6bff", "#4dc4ff", "#ff9f43", "#8bc34a", "#ff6b6b"];
+    const fitOverlayColors = ["#ff8a5b", "#7ed957", "#d36fff", "#3fc5ff", "#f4c542"];
     const overlaySeriesDefs = overlayData.map((entry, idx) => ({
       label: entry.label,
       stroke: overlayColors[idx % overlayColors.length],
@@ -276,9 +335,56 @@ export function StreamBinStatsPanel({
       points: { show: false },
       value: (_u: uPlot, v: number | Date | null) => formatNumber(v),
     }));
+    const fitOverlayPlugin: uPlot.Plugin = {
+      hooks: {
+        draw: [
+          (u) => {
+            const overlays = fitOverlayDataRef.current;
+            if (overlays.length <= 0) {
+              return;
+            }
+            const ctx = u.ctx;
+            const { left, top, width: boxWidth, height: boxHeight } = u.bbox;
+            ctx.save();
+            ctx.beginPath();
+            ctx.rect(left, top, boxWidth, boxHeight);
+            ctx.clip();
+            overlays.forEach((overlay, idx) => {
+              const stroke = fitOverlayColors[idx % fitOverlayColors.length];
+              ctx.beginPath();
+              ctx.lineWidth = 1.8;
+              ctx.strokeStyle = stroke;
+              let started = false;
+              for (let i = 0; i < overlay.x.length; i += 1) {
+                const xv = overlay.x[i];
+                const yv = overlay.y[i];
+                if (!Number.isFinite(xv) || !Number.isFinite(yv)) {
+                  continue;
+                }
+                const px = u.valToPos(xv, "x", true);
+                const py = u.valToPos(yv, "y", true);
+                if (!Number.isFinite(px) || !Number.isFinite(py)) {
+                  continue;
+                }
+                if (!started) {
+                  ctx.moveTo(px, py);
+                  started = true;
+                } else {
+                  ctx.lineTo(px, py);
+                }
+              }
+              if (started) {
+                ctx.stroke();
+              }
+            });
+            ctx.restore();
+          },
+        ],
+      },
+    };
     const opts: uPlot.Options = {
       width,
-      height: 320,
+      height: plotHeight,
       series: [
         { label: "x" },
         {
@@ -297,7 +403,13 @@ export function StreamBinStatsPanel({
           label: "mean",
           stroke: meanStroke,
           width: 2,
-          points: { show: false },
+          points: {
+            show: showBinMarkers,
+            size: 6,
+            width: 2,
+            stroke: meanStroke,
+            fill: meanPointFill,
+          },
           value: (_u: uPlot, v: number | Date | null) => formatNumber(v),
         },
         ...overlaySeriesDefs,
@@ -330,6 +442,7 @@ export function StreamBinStatsPanel({
           values: (_u, vals) => vals.map((v) => formatNumber(Number(v))),
         },
       ],
+      plugins: [fitOverlayPlugin],
     };
 
     const fullData = [
@@ -344,7 +457,10 @@ export function StreamBinStatsPanel({
       if (!hostRef.current || !plotRef.current) {
         return;
       }
-      plotRef.current.setSize({ width: hostRef.current.clientWidth, height: 320 });
+      plotRef.current.setSize({
+        width: hostRef.current.clientWidth,
+        height: plotHeight,
+      });
     });
     resize.observe(hostRef.current);
     return () => {
@@ -352,7 +468,18 @@ export function StreamBinStatsPanel({
       plotRef.current?.destroy();
       plotRef.current = null;
     };
-  }, [data, overlayData, formatNumber, hasManualY, isDark, xLabel, yMax, yMin]);
+  }, [
+    data,
+    overlayData,
+    formatNumber,
+    hasManualY,
+    isDark,
+    plotHeight,
+    showBinMarkers,
+    xLabel,
+    yMax,
+    yMin,
+  ]);
 
   useEffect(() => {
     if (!plotRef.current) {

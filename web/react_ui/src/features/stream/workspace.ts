@@ -135,7 +135,7 @@ export function workspaceOutputKind(
 
 export function workspaceOutputOptionsByKind(
   workspace: StreamAnalysisWorkspaceConfig | null,
-  kind: "scalar" | "hist_agg" | "hist2d" | "trace" | "params_map"
+  kind: "scalar" | "hist_agg" | "hist2d" | "trace" | "params_map" | "fit_1d"
 ): Array<{ value: string; label: string }> {
   if (!workspace) {
     return [];
@@ -293,7 +293,7 @@ export function workspaceStreamFromGraphNodes(
 
 export function defaultOutputForKind(
   workspace: StreamAnalysisWorkspaceConfig | null,
-  kind: "scalar" | "hist_agg" | "hist2d" | "trace" | "params_map"
+  kind: "scalar" | "hist_agg" | "hist2d" | "trace" | "params_map" | "fit_1d"
 ): string | null {
   const options = workspaceOutputOptionsByKind(workspace, kind);
   return options[0]?.value ?? null;

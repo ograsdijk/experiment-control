@@ -19,6 +19,7 @@ type StreamRawPanelProps = {
   channelIndex: number;
   tick: number;
   colorScheme: "light" | "dark";
+  plotHeight?: number;
   units?: string | null;
   extraSeries?: StreamExtraSeries[];
   yScaleMode?: "auto" | "manual";
@@ -211,6 +212,7 @@ export function StreamRawPanel({
   channelIndex,
   tick,
   colorScheme,
+  plotHeight = 320,
   units,
   extraSeries = [],
   yScaleMode = "auto",
@@ -280,7 +282,7 @@ export function StreamRawPanel({
     const width = hostRef.current.clientWidth || 600;
     const opts: uPlot.Options = {
       width,
-      height: 320,
+      height: plotHeight,
       series,
       scales: {
         x: { time: false },
@@ -317,7 +319,7 @@ export function StreamRawPanel({
       }
       plotRef.current.setSize({
         width: hostRef.current.clientWidth,
-        height: 320,
+        height: plotHeight,
       });
     });
     resize.observe(hostRef.current);
@@ -326,7 +328,17 @@ export function StreamRawPanel({
       plotRef.current?.destroy();
       plotRef.current = null;
     };
-  }, [series, built.data, isDark, units, formatNumber, hasManualY, yMin, yMax]);
+  }, [
+    series,
+    built.data,
+    isDark,
+    units,
+    formatNumber,
+    hasManualY,
+    plotHeight,
+    yMin,
+    yMax,
+  ]);
 
   useEffect(() => {
     if (!plotRef.current) {

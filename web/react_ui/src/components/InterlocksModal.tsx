@@ -296,7 +296,7 @@ export function InterlocksModal({
       opened={opened}
       onClose={onClose}
       title="Interlocks"
-      size="xl"
+      size="clamp(56rem, 92vw, 96rem)"
       centered
       zIndex={420}
     >

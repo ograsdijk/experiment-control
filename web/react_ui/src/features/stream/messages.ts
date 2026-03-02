@@ -7,6 +7,7 @@ import type {
   StreamFitParamsMap,
   StreamBin2dSnapshot,
   StreamBinStatsSnapshot,
+  StreamFitCurveSnapshot,
 } from "./types";
 
 export function normalizeTime(signal: TelemetrySignal, fallback?: number) {
@@ -194,6 +195,32 @@ export function normalizeHistAggValue(raw: unknown): StreamBinStatsSnapshot | nu
       typeof payload.auto_range === "boolean"
         ? payload.auto_range
         : null,
+  };
+}
+
+export function normalizeFitCurveValue(raw: unknown): StreamFitCurveSnapshot | null {
+  if (!raw || typeof raw !== "object") {
+    return null;
+  }
+  const payload = raw as Record<string, unknown>;
+  const x = Array.isArray(payload.x) ? payload.x.map((v) => Number(v)) : [];
+  const yhat = Array.isArray(payload.yhat) ? payload.yhat.map((v) => Number(v)) : [];
+  const n = Math.min(x.length, yhat.length);
+  if (!Number.isFinite(n) || n <= 0) {
+    return null;
+  }
+  const xDenseRaw = Array.isArray(payload.x_dense)
+    ? payload.x_dense.map((v) => Number(v))
+    : [];
+  const yhatDenseRaw = Array.isArray(payload.yhat_dense)
+    ? payload.yhat_dense.map((v) => Number(v))
+    : [];
+  const nDense = Math.min(xDenseRaw.length, yhatDenseRaw.length);
+  return {
+    x: x.slice(0, n),
+    yhat: yhat.slice(0, n),
+    xDense: nDense > 0 ? xDenseRaw.slice(0, nDense) : null,
+    yhatDense: nDense > 0 ? yhatDenseRaw.slice(0, nDense) : null,
   };
 }
 

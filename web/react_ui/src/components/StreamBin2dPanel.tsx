@@ -19,6 +19,7 @@ type StreamBin2dPanelProps = {
   reducer: Bin2dReducer;
   tick: number;
   colorScheme: "light" | "dark";
+  plotHeight?: number;
   zScaleMode?: "auto" | "manual";
   zMin?: number | null;
   zMax?: number | null;
@@ -216,6 +217,7 @@ export function StreamBin2dPanel({
   reducer,
   tick,
   colorScheme,
+  plotHeight = 340,
   zScaleMode = "auto",
   zMin = null,
   zMax = null,
@@ -252,7 +254,7 @@ export function StreamBin2dPanel({
         return;
       }
       const width = Math.max(320, Math.trunc(hostRef.current.clientWidth || 600));
-      const height = 340;
+        const height = Math.max(240, Math.trunc(plotHeight));
       const dpr = Math.max(1, Number(window.devicePixelRatio || 1));
       const canvas = canvasRef.current;
       canvas.width = Math.max(1, Math.trunc(width * dpr));
@@ -366,10 +368,10 @@ export function StreamBin2dPanel({
       resize.disconnect();
       cancelAnimationFrame(raf);
     };
-  }, [grid, zRange, isDark, reducer]);
+  }, [grid, zRange, isDark, plotHeight, reducer]);
 
   return (
-    <div className="plot-panel" ref={hostRef}>
+    <div className="plot-panel" ref={hostRef} style={{ minHeight: plotHeight }}>
       <canvas ref={canvasRef} />
     </div>
   );

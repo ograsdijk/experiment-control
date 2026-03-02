@@ -10,6 +10,7 @@ type PlotPanelProps = {
   tick: number;
   timeWindowS: number;
   colorScheme: "light" | "dark";
+  plotHeight?: number;
   yScaleMode?: "auto" | "manual";
   yMin?: number | null;
   yMax?: number | null;
@@ -192,6 +193,7 @@ export function PlotPanel({
   tick,
   timeWindowS,
   colorScheme,
+  plotHeight = 320,
   yScaleMode = "auto",
   yMin = null,
   yMax = null,
@@ -333,7 +335,7 @@ export function PlotPanel({
     const tickStroke = isDark ? "rgba(255, 255, 255, 0.35)" : "rgba(0, 0, 0, 0.25)";
     const opts: uPlot.Options = {
       width,
-      height: 320,
+      height: plotHeight,
       series,
       scales: {
         x: { time: true },
@@ -396,7 +398,7 @@ export function PlotPanel({
       }
       plotRef.current.setSize({
         width: hostRef.current.clientWidth,
-        height: 320,
+        height: plotHeight,
       });
     });
     resize.observe(hostRef.current);
@@ -413,9 +415,10 @@ export function PlotPanel({
     yAxisLabel,
     booleanOnly,
     timeFormatter,
-    formatNumber,
-    isDark,
-    hasManualY,
+      formatNumber,
+      isDark,
+      plotHeight,
+      hasManualY,
     yMin,
     yMax,
     yDisplayMode,

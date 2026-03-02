@@ -17,6 +17,8 @@ type YamlToken = {
 type YamlPreviewProps = {
   text: string;
   colorScheme: "light" | "dark";
+  height?: number;
+  scrollable?: boolean;
 };
 
 const VALUE_TOKEN_RE =
@@ -136,54 +138,61 @@ function yamlTokenColor(kind: YamlTokenKind, colorScheme: "light" | "dark"): str
   return "inherit";
 }
 
-export function YamlPreview({ text, colorScheme }: YamlPreviewProps) {
+export function YamlPreview({
+  text,
+  colorScheme,
+  height = 360,
+  scrollable = true,
+}: YamlPreviewProps) {
   const lines = text.length > 0 ? text.split("\n") : [""];
-  return (
-    <ScrollArea h={360}>
-      <div
-        style={{
-          fontFamily:
-            'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace',
-          fontSize: 12,
-          lineHeight: 1.5,
-        }}
-      >
-        {lines.map((line, lineIdx) => {
-          const tokens = tokenizeYamlLine(line);
-          return (
-            <div
-              key={`yaml-line-${lineIdx + 1}`}
+  const content = (
+    <div
+      style={{
+        fontFamily:
+          'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace',
+        fontSize: 12,
+        lineHeight: 1.5,
+      }}
+    >
+      {lines.map((line, lineIdx) => {
+        const tokens = tokenizeYamlLine(line);
+        return (
+          <div
+            key={`yaml-line-${lineIdx + 1}`}
+            style={{
+              display: "grid",
+              gridTemplateColumns: "56px 1fr",
+              columnGap: 10,
+              whiteSpace: "pre",
+            }}
+          >
+            <Text
+              size="xs"
+              c="dimmed"
               style={{
-                display: "grid",
-                gridTemplateColumns: "56px 1fr",
-                columnGap: 10,
-                whiteSpace: "pre",
+                textAlign: "right",
+                userSelect: "none",
               }}
             >
-              <Text
-                size="xs"
-                c="dimmed"
-                style={{
-                  textAlign: "right",
-                  userSelect: "none",
-                }}
-              >
-                {lineIdx + 1}
-              </Text>
-              <code style={{ whiteSpace: "pre" }}>
-                {tokens.map((token, tokenIdx) => (
-                  <span
-                    key={`yaml-token-${lineIdx + 1}-${tokenIdx}`}
-                    style={{ color: yamlTokenColor(token.kind, colorScheme) }}
-                  >
-                    {token.text}
-                  </span>
-                ))}
-              </code>
-            </div>
-          );
-        })}
-      </div>
-    </ScrollArea>
+              {lineIdx + 1}
+            </Text>
+            <code style={{ whiteSpace: "pre" }}>
+              {tokens.map((token, tokenIdx) => (
+                <span
+                  key={`yaml-token-${lineIdx + 1}-${tokenIdx}`}
+                  style={{ color: yamlTokenColor(token.kind, colorScheme) }}
+                >
+                  {token.text}
+                </span>
+              ))}
+            </code>
+          </div>
+        );
+      })}
+    </div>
   );
+  if (!scrollable) {
+    return content;
+  }
+  return <ScrollArea h={height}>{content}</ScrollArea>;
 }

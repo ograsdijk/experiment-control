@@ -77,7 +77,7 @@ export function StreamTraceOptionsModal({
       : null;
 
   return (
-    <Modal opened={opened} onClose={onClose} title={title} size="lg" centered>
+    <Modal opened={opened} onClose={onClose} title={title} size="clamp(42rem, 82vw, 64rem)" centered>
       <Stack gap="md">
         {panel ? (
           <>

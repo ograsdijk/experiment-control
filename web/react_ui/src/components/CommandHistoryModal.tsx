@@ -75,7 +75,7 @@ export function CommandHistoryModal({
       opened={opened}
       onClose={onClose}
       title="Commands & replies"
-      size="xl"
+      size="clamp(56rem, 92vw, 96rem)"
       centered
       zIndex={435}
     >

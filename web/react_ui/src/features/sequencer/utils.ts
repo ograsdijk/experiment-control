@@ -49,7 +49,11 @@ export function sameSequencerStatus(
       current.autoloadError === next.autoloadError &&
       JSON.stringify(current.contextColumns) ===
         JSON.stringify(next.contextColumns) &&
-      JSON.stringify(current.progress) === JSON.stringify(next.progress)
+      JSON.stringify(current.progress) === JSON.stringify(next.progress) &&
+      JSON.stringify(current.loadedAdaptiveIds) ===
+        JSON.stringify(next.loadedAdaptiveIds) &&
+      JSON.stringify(current.adaptiveStudies) ===
+        JSON.stringify(next.adaptiveStudies)
   );
 }
 

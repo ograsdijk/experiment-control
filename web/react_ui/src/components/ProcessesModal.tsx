@@ -42,7 +42,7 @@ export function ProcessesModal({
       opened={opened}
       onClose={onClose}
       title="Processes"
-      size="xl"
+      size="clamp(56rem, 92vw, 96rem)"
       centered
       zIndex={400}
     >

@@ -84,7 +84,7 @@ export function LogsModal({
       opened={opened}
       onClose={onClose}
       title="Logs"
-      size="xl"
+      size="clamp(56rem, 92vw, 96rem)"
       centered
       zIndex={430}
     >

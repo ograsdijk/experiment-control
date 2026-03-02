@@ -1,4 +1,5 @@
 ﻿import {
+  ActionIcon,
   Badge,
   Button,
   Card,
@@ -11,16 +12,20 @@
   Text,
   Textarea,
 } from "@mantine/core";
-import type { ChangeEvent, ReactNode, RefObject } from "react";
+import { IconChevronDown, IconChevronRight } from "@tabler/icons-react";
+import { useEffect, useState, type ChangeEvent, type ReactNode, type RefObject } from "react";
 import {
   processStateColor,
   sequencerRuntimeStateColor,
 } from "../features/runtime/helpers";
 import { formatDurationCompact } from "../features/sequencer/utils";
 import type {
+  SequencerAdaptiveStudyStatus,
   SequencerDiagnostic,
   SequencerProgress,
 } from "../features/sequencer/types";
+import type { CapabilityMember } from "../types";
+import { SequencerOutlinePane } from "./SequencerOutlinePane";
 import { YamlPreview } from "./YamlPreview";
 
 type Props = {
@@ -43,9 +48,18 @@ type Props = {
   primaryLabel: string;
   primaryDisabled: boolean;
   actionBusy: boolean;
+  adaptiveModes: Record<string, "reset" | "resume" | "warm_start">;
+  adaptiveStudies: Record<string, SequencerAdaptiveStudyStatus>;
+  loadedAdaptiveIds: readonly string[];
+  adaptiveClearBusyStudyId: string | null;
   onRunAction: (
     action: "start" | "pause" | "resume" | "stop"
   ) => Promise<unknown> | void;
+  onAdaptiveModeChange: (
+    studyId: string,
+    mode: "reset" | "resume" | "warm_start"
+  ) => void;
+  onClearAdaptiveStudy: (studyId: string) => Promise<unknown> | void;
   fileInputRef: RefObject<HTMLInputElement>;
   onFileInputChange: (event: ChangeEvent<HTMLInputElement>) => Promise<unknown> | void;
   yamlViewMode: "edit" | "preview";
@@ -60,6 +74,7 @@ type Props = {
   editorRef: RefObject<HTMLTextAreaElement>;
   yamlText: string;
   onYamlTextChange: (value: string) => void;
+  capabilitiesByDevice: Record<string, CapabilityMember[]>;
   colorScheme: "light" | "dark";
   diagnostics: ReadonlyArray<SequencerDiagnostic>;
   onJumpToDiagnostic: (
@@ -88,7 +103,13 @@ export function SequencerModal({
   primaryLabel,
   primaryDisabled,
   actionBusy,
+  adaptiveModes,
+  adaptiveStudies,
+  loadedAdaptiveIds,
+  adaptiveClearBusyStudyId,
   onRunAction,
+  onAdaptiveModeChange,
+  onClearAdaptiveStudy,
   fileInputRef,
   onFileInputChange,
   yamlViewMode,
@@ -103,16 +124,25 @@ export function SequencerModal({
   editorRef,
   yamlText,
   onYamlTextChange,
+  capabilitiesByDevice,
   colorScheme,
   diagnostics,
   onJumpToDiagnostic,
 }: Props) {
+  const [showFullYaml, setShowFullYaml] = useState(false);
+
+  useEffect(() => {
+    if (opened) {
+      setShowFullYaml(false);
+    }
+  }, [opened]);
+
   return (
     <Modal
       opened={opened}
       onClose={onClose}
       title="Sequencer"
-      size="xl"
+      size="clamp(56rem, 92vw, 96rem)"
       centered
       zIndex={440}
     >
@@ -211,6 +241,82 @@ export function SequencerModal({
           </Group>
         </Group>
 
+        {loadedAdaptiveIds.length > 0 && (
+          <Stack gap={6}>
+            <Group justify="space-between" align="center">
+              <Text size="sm" fw={600}>
+                Adaptive reuse
+              </Text>
+              <Text size="xs" c="dimmed">
+                Choose how each adaptive study starts when you press Start.
+              </Text>
+            </Group>
+            {loadedAdaptiveIds.map((studyId) => {
+              const status = adaptiveStudies[studyId];
+              const trialCount = status?.trialCount ?? 0;
+              const hasSaved = trialCount > 0;
+              return (
+                <Card
+                  key={studyId}
+                  p="xs"
+                  radius="sm"
+                  style={{ border: "1px solid var(--card-border)" }}
+                >
+                  <Stack gap={6}>
+                    <Group justify="space-between" align="center" wrap="wrap">
+                      <Group gap="xs" wrap="wrap">
+                        <Text size="sm" fw={600}>
+                          {studyId}
+                        </Text>
+                        <Badge
+                          size="xs"
+                          variant="light"
+                          color={hasSaved ? "teal" : "gray"}
+                        >
+                          {hasSaved ? `${trialCount} saved trial${trialCount === 1 ? "" : "s"}` : "No saved data"}
+                        </Badge>
+                        {status?.controllerKind && (
+                          <Badge size="xs" variant="outline" color="gray">
+                            {status.controllerKind}
+                          </Badge>
+                        )}
+                      </Group>
+                      <Button
+                        size="compact-xs"
+                        variant="subtle"
+                        color="red"
+                        disabled={!hasSaved}
+                        loading={adaptiveClearBusyStudyId === studyId}
+                        onClick={() => {
+                          void onClearAdaptiveStudy(studyId);
+                        }}
+                      >
+                        Clear saved
+                      </Button>
+                    </Group>
+                    <SegmentedControl
+                      size="xs"
+                      fullWidth
+                      value={adaptiveModes[studyId] ?? "reset"}
+                      onChange={(value) =>
+                        onAdaptiveModeChange(
+                          studyId,
+                          value as "reset" | "resume" | "warm_start"
+                        )
+                      }
+                      data={[
+                        { value: "reset", label: "Reset" },
+                        { value: "resume", label: "Resume" },
+                        { value: "warm_start", label: "Warm start" },
+                      ]}
+                    />
+                  </Stack>
+                </Card>
+              );
+            })}
+          </Stack>
+        )}
+
         <Group justify="space-between">
           <Group gap="xs">
             <input
@@ -276,32 +382,60 @@ export function SequencerModal({
           </Group>
         </Group>
 
-        {yamlViewMode === "edit" ? (
-          <Textarea
-            ref={editorRef}
-            label="Sequence YAML"
-            placeholder="Paste or upload sequence YAML"
-            autosize
-            minRows={14}
-            maxRows={26}
-            value={yamlText}
-            onChange={(event) => onYamlTextChange(event.currentTarget.value)}
-          />
-        ) : (
-          <Card radius="md" p="sm" style={{ border: "1px solid var(--card-border)" }}>
-            <Stack gap={6}>
-              <Group justify="space-between">
+        <SequencerOutlinePane
+          yamlText={yamlText}
+          onYamlTextChange={onYamlTextChange}
+          capabilitiesByDevice={capabilitiesByDevice}
+          colorScheme={colorScheme}
+        />
+
+        <Card radius="md" p="sm" style={{ border: "1px solid var(--card-border)" }}>
+          <Stack gap={6}>
+            <Group justify="space-between" align="center">
+              <Stack gap={2}>
                 <Text size="sm" fw={600}>
-                  Sequence YAML
+                  Full sequence YAML
                 </Text>
                 <Text size="xs" c="dimmed">
-                  Read-only preview with syntax highlighting
+                  {showFullYaml
+                    ? yamlViewMode === "edit"
+                      ? "Raw editable YAML"
+                      : "Read-only preview with syntax highlighting"
+                    : "Collapsed by default to keep the visual outline readable"}
                 </Text>
+              </Stack>
+                <ActionIcon
+                  size="sm"
+                  variant="subtle"
+                  color="gray"
+                  aria-label={showFullYaml ? "Hide full YAML" : "Show full YAML"}
+                  onClick={() => setShowFullYaml((prev) => !prev)}
+                >
+                  {showFullYaml ? (
+                    <IconChevronDown size={16} />
+                  ) : (
+                    <IconChevronRight size={16} />
+                  )}
+                </ActionIcon>
               </Group>
-              <YamlPreview text={yamlText} colorScheme={colorScheme} />
-            </Stack>
-          </Card>
-        )}
+
+            {showFullYaml &&
+              (yamlViewMode === "edit" ? (
+                <Textarea
+                  ref={editorRef}
+                  label="Sequence YAML"
+                  placeholder="Paste or upload sequence YAML"
+                  autosize
+                  minRows={14}
+                  maxRows={26}
+                  value={yamlText}
+                  onChange={(event) => onYamlTextChange(event.currentTarget.value)}
+                />
+              ) : (
+                <YamlPreview text={yamlText} colorScheme={colorScheme} />
+              ))}
+          </Stack>
+        </Card>
 
         <Stack gap={6}>
           <Group justify="space-between">
