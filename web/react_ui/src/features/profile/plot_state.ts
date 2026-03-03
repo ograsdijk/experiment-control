@@ -477,6 +477,75 @@ export function defaultPlotState(defaultWindowS = 60): PlotState {
   return normalizePlotState(null, { defaultWindowS });
 }
 
+export function serializePlotState(
+  state: Pick<PlotState, "panels" | "activePanelId">
+): Pick<PlotState, "panels" | "activePanelId"> {
+  const panels = state.panels.map((panel): PlotPanelState => {
+    if (panel.kind === "stream_raw" || panel.kind === "stream_waterfall") {
+      return {
+        ...panel,
+        stream: panel.stream
+          ? {
+              ...panel.stream,
+              shape: normalizeShape(panel.stream.shape),
+            }
+          : null,
+        overlayOutputIds: [...panel.overlayOutputIds],
+      };
+    }
+
+    if (panel.kind === "stream_scalar") {
+      return {
+        ...panel,
+        stream: panel.stream
+          ? {
+              ...panel.stream,
+              shape: normalizeShape(panel.stream.shape),
+            }
+          : null,
+        analysis: normalizeStreamAnalysisSettings(panel.analysis),
+      };
+    }
+
+    if (panel.kind === "stream_params") {
+      return {
+        ...panel,
+        outputIds: [...panel.outputIds],
+      };
+    }
+
+    if (panel.kind === "stream_bin_stats") {
+      return {
+        ...panel,
+        stream: panel.stream
+          ? {
+              ...panel.stream,
+              shape: normalizeShape(panel.stream.shape),
+            }
+          : null,
+        overlayOutputIds: [...panel.overlayOutputIds],
+        fitOverlayOutputIds: [...panel.fitOverlayOutputIds],
+        analysis: normalizeStreamAnalysisSettings(panel.analysis),
+        binStats: normalizeStreamBinStatsSettings(panel.binStats),
+      };
+    }
+
+    if (panel.kind === "stream_bin2d") {
+      return { ...panel };
+    }
+
+    return {
+      ...panel,
+      traces: panel.traces.map((trace) => ({ ...trace })),
+    };
+  });
+
+  return {
+    panels,
+    activePanelId: state.activePanelId,
+  };
+}
+
 export function defaultStreamAnalysisLegacySettings() {
   return defaultStreamAnalysisSettings();
 }

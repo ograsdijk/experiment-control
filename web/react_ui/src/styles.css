@@ -404,7 +404,7 @@ body::before {
   width: 100%;
   border: 1px solid var(--card-border);
   border-radius: 999px;
-  background: rgba(14, 159, 154, 0.06);
+  background: rgba(148, 163, 184, 0.06);
   display: flex;
   align-items: center;
   gap: 0;
@@ -445,7 +445,7 @@ body::before {
 }
 
 [data-mantine-color-scheme="dark"] .sequencer-var-chip {
-  background: rgba(45, 185, 177, 0.1);
+  background: rgba(148, 163, 184, 0.08);
 }
 
 .pulse {

@@ -126,7 +126,7 @@ import {
   normalizePinnedCommands,
   normalizeUiProfile,
 } from "./features/profile/utils";
-import { normalizePlotState } from "./features/profile/plot_state";
+import { normalizePlotState, serializePlotState } from "./features/profile/plot_state";
 import { useInterlocksController } from "./features/interlocks/useInterlocksController";
 import { useHdfController } from "./features/hdf/useHdfController";
 import { useDeviceCapabilitiesController } from "./features/devices/useDeviceCapabilitiesController";
@@ -372,13 +372,23 @@ export function App() {
       return normalizePlotState(null, { defaultWindowS: DEFAULT_WINDOW_S });
     }
   }, []);
-  const initialStreamWorkspaceState = useMemo(
-    () => ({
-      workspaces: {} as Record<string, StreamAnalysisWorkspaceConfig>,
-      nextId: 1,
-    }),
-    []
-  );
+  const initialStreamWorkspaceState = useMemo(() => {
+    try {
+      const raw = localStorage.getItem("ecui.streamWorkspaces");
+      const workspaces = normalizeStreamWorkspaceRecord(
+        raw ? JSON.parse(raw) : null
+      );
+      return {
+        workspaces,
+        nextId: nextWorkspaceCounter(workspaces),
+      };
+    } catch {
+      return {
+        workspaces: {} as Record<string, StreamAnalysisWorkspaceConfig>,
+        nextId: 1,
+      };
+    }
+  }, []);
   const [devices, setDevices] = useState<DeviceStatus[]>([]);
   const [latestByDevice, setLatestByDevice] = useState<LatestSignals>({});
   const { colorScheme, setColorScheme } = useMantineColorScheme();
@@ -1153,6 +1163,7 @@ export function App() {
 
   const exportUiProfile = () => {
     try {
+      const serializedPlotState = serializePlotState({ panels, activePanelId });
       const profile: UiProfileFile = {
         kind: "experiment-control-ui-profile",
         version: 1,
@@ -1163,10 +1174,7 @@ export function App() {
           telemetry_collapsed_by_device: { ...telemetryCollapsedByDevice },
         },
         plots: {
-          plot_state: {
-            panels: [...panels],
-            activePanelId,
-          },
+          plot_state: serializedPlotState,
         },
         commands: {
           pinned_commands: { ...pinnedCommands },
@@ -1517,14 +1525,26 @@ export function App() {
 
   useEffect(() => {
     try {
+      const serializedPlotState = serializePlotState({ panels, activePanelId });
       localStorage.setItem(
         "ecui.plotState",
-        JSON.stringify({ panels, activePanelId })
+        JSON.stringify(serializedPlotState)
       );
     } catch {
       // ignore storage errors
     }
   }, [panels, activePanelId]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(
+        "ecui.streamWorkspaces",
+        JSON.stringify(streamWorkspaces)
+      );
+    } catch {
+      // ignore storage errors
+    }
+  }, [streamWorkspaces]);
 
   useEffect(() => {
     panelsRef.current = panels;
@@ -2923,6 +2943,13 @@ export function App() {
         continue;
       }
       summaryById.set(workspaceId, obj);
+    }
+    if (
+      summaries.length === 0 &&
+      Object.keys(streamWorkspacesRef.current).length > 0
+    ) {
+      await refreshWorkspaceStoreStatus(source, { notifyOnError: false });
+      return true;
     }
     const rawRecord: Record<string, unknown> = {};
     await Promise.all(

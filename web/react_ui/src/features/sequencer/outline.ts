@@ -989,11 +989,11 @@ function buildFlatStepNodes(lines: string[]): FlatStepNode[] {
 
 function finalizeSummaries(
   nodes: readonly SequencerStepOutlineNode[],
-  flatMap: ReadonlyMap<string, FlatStepNode>
+  flatMap: ReadonlyMap<number, FlatStepNode>
 ): void {
   for (const node of nodes) {
     finalizeSummaries(node.children, flatMap);
-    const flatNode = flatMap.get(node.id);
+    const flatNode = flatMap.get(node.line);
     if (!flatNode) {
       continue;
     }
@@ -1056,6 +1056,16 @@ function finalizeSummaries(
   }
 }
 
+function buildStableStepId(
+  parentId: string | null,
+  containerKey: string,
+  siblingIndex: number,
+  kind: string
+): string {
+  const scope = parentId ?? "root";
+  return `${scope}/${containerKey}:${siblingIndex}:${kind}`;
+}
+
 export function buildSequencerStepOutline(
   yamlText: string
 ): SequencerStepOutlineNode[] {
@@ -1068,14 +1078,21 @@ export function buildSequencerStepOutline(
     return [];
   }
 
-  const flatMap = new Map<string, FlatStepNode>();
+  const flatMap = new Map<number, FlatStepNode>();
   const roots: SequencerStepOutlineNode[] = [];
   const stack: Array<{ indent: number; node: SequencerStepOutlineNode }> = [];
 
   for (const flatNode of flatNodes) {
-    flatMap.set(flatNode.id, flatNode);
+    flatMap.set(flatNode.line, flatNode);
+    const parentNode = stack.length > 0 ? stack[stack.length - 1].node : null;
+    const siblingIndex = parentNode ? parentNode.children.length : roots.length;
     const node: SequencerStepOutlineNode = {
-      id: flatNode.id,
+      id: buildStableStepId(
+        parentNode?.id ?? null,
+        flatNode.containerKey,
+        siblingIndex,
+        flatNode.kind
+      ),
       kind: flatNode.kind,
       line: flatNode.line,
       endLine: flatNode.endIndex + 1,

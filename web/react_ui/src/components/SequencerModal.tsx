@@ -342,15 +342,6 @@ export function SequencerModal({
             </Text>
           </Group>
           <Group gap="xs">
-            <SegmentedControl
-              size="xs"
-              value={yamlViewMode}
-              onChange={(value) => onYamlViewModeChange(value as "edit" | "preview")}
-              data={[
-                { value: "preview", label: "Preview" },
-                { value: "edit", label: "Edit" },
-              ]}
-            />
             <Button
               size="xs"
               variant="light"
@@ -418,6 +409,16 @@ export function SequencerModal({
                     : "Collapsed by default to keep the visual outline readable"}
                 </Text>
               </Stack>
+              <Group gap="xs" align="center">
+                <SegmentedControl
+                  size="xs"
+                  value={yamlViewMode}
+                  onChange={(value) => onYamlViewModeChange(value as "edit" | "preview")}
+                  data={[
+                    { value: "preview", label: "Preview" },
+                    { value: "edit", label: "Edit" },
+                  ]}
+                />
                 <ActionIcon
                   size="sm"
                   variant="subtle"
@@ -432,6 +433,7 @@ export function SequencerModal({
                   )}
                 </ActionIcon>
               </Group>
+            </Group>
 
             {showFullYaml &&
               (yamlViewMode === "edit" ? (

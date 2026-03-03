@@ -1,0 +1,86 @@
+import { ActionIcon, Badge, Card, Group, Stack, Text } from "@mantine/core";
+import { IconChevronDown, IconChevronRight } from "@tabler/icons-react";
+import { applyEditedContextColumns, applyEditedVars } from "../editing";
+import type { SequencerOutlineMetadata } from "../types";
+import { SequencerVarsEditor } from "../../../components/SequencerVarsEditor";
+
+type Props = {
+  metadata: SequencerOutlineMetadata;
+  metadataCollapsed: boolean;
+  onToggleCollapsed: () => void;
+  yamlText: string;
+  onYamlTextChange: (value: string) => void;
+};
+
+export function SequencerMetadataPanel({
+  metadata,
+  metadataCollapsed,
+  onToggleCollapsed,
+  yamlText,
+  onYamlTextChange,
+}: Props) {
+  return (
+    <Card radius="sm" p="xs" style={{ border: "1px solid var(--card-border)" }}>
+      <Stack gap={6}>
+        <Group justify="space-between" align="center">
+          <Group gap="xs" wrap="wrap" align="center">
+            <Badge size="xs" variant="light" color="gray">
+              version: {metadata.version ?? "n/a"}
+            </Badge>
+            <Text size="xs" c="dimmed">
+              Sequence metadata
+            </Text>
+          </Group>
+          <ActionIcon
+            size="sm"
+            variant="subtle"
+            color="gray"
+            aria-label={
+              metadataCollapsed ? "Expand sequence metadata" : "Collapse sequence metadata"
+            }
+            onClick={onToggleCollapsed}
+          >
+            {metadataCollapsed ? (
+              <IconChevronRight size={16} />
+            ) : (
+              <IconChevronDown size={16} />
+            )}
+          </ActionIcon>
+        </Group>
+        {!metadataCollapsed && (
+          <div
+            style={{
+              display: "grid",
+              gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))",
+              gap: 8,
+            }}
+          >
+            <SequencerVarsEditor
+              entries={metadata.vars}
+              onChange={(entries) => onYamlTextChange(applyEditedVars(yamlText, entries))}
+            />
+            <SequencerVarsEditor
+              title="Context columns"
+              addLabel="Add"
+              emptyLabel="No context columns."
+              addEmptyHint="Add one to create a top-level context_columns block."
+              nameLabel="Context column name"
+              valueLabel="Context column type"
+              removeLabel="Remove context column"
+              nextNamePrefix="context"
+              valueOptions={[
+                { value: "float64", label: "float64" },
+                { value: "int64", label: "int64" },
+                { value: "bool", label: "bool" },
+              ]}
+              entries={metadata.contextColumns}
+              onChange={(entries) =>
+                onYamlTextChange(applyEditedContextColumns(yamlText, entries))
+              }
+            />
+          </div>
+        )}
+      </Stack>
+    </Card>
+  );
+}
