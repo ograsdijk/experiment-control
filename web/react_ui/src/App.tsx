@@ -1631,6 +1631,9 @@ export function App() {
         }
         if (isStreamParamsPanel(panel)) {
           const workspace = streamWorkspaces[panel.workspaceId] ?? null;
+          if (!workspace) {
+            return panel;
+          }
           const validOutputIds = new Set(
             workspaceOutputOptionsByKind(workspace, "scalar").map((item) => item.value)
           );
@@ -1646,9 +1649,11 @@ export function App() {
         }
         if (isStreamBinStatsPanel(panel)) {
           const workspace = streamWorkspaces[panel.workspaceId] ?? null;
+          if (!workspace) {
+            return panel;
+          }
           const outputId =
             panel.outputId &&
-            workspace &&
             workspaceOutputKind(workspace, panel.outputId) === "hist_agg"
               ? panel.outputId
               : defaultOutputForKind(workspace, "hist_agg");
