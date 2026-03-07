@@ -549,6 +549,10 @@ class ManagerTUI(App):
         self._cap_cache_mono: dict[str, float] = {}
         self._cap_ttl_s: float = 5.0
         self._proc_cap_cache: dict[str, dict[str, Any]] = {}
+        self._proc_cap_retry_next_mono: dict[str, float] = {}
+        self._proc_cap_retry_delay_s: dict[str, float] = {}
+        self._proc_cap_retry_initial_s: float = 0.5
+        self._proc_cap_retry_max_s: float = 2.0
         self._members_last: dict[str, list[dict[str, Any]]] = {}
         self._proc_members_last: dict[str, list[dict[str, Any]]] = {}
         self._members_source: str = "device"
@@ -955,6 +959,8 @@ class ManagerTUI(App):
                 "device_id": device_id,
                 "action": action,
                 "params": params,
+                "source_kind": "tui",
+                "source_id": "manager_tui",
             }
         )
         if resp is None:
@@ -974,6 +980,8 @@ class ManagerTUI(App):
                 "type": "process.rpc",
                 "process_id": process_id,
                 "request": request,
+                "source_kind": "tui",
+                "source_id": "manager_tui",
             }
         )
         if resp is None:
@@ -981,6 +989,46 @@ class ManagerTUI(App):
         if "ok" in resp:
             return resp
         return resp
+
+    @staticmethod
+    def _process_is_registered(proc: Json | None) -> bool:
+        if not isinstance(proc, dict):
+            return False
+        if "registered" in proc:
+            return bool(proc.get("registered"))
+        rpc_endpoint = proc.get("rpc_endpoint")
+        return isinstance(rpc_endpoint, str) and bool(rpc_endpoint.strip())
+
+    def _process_capabilities_probe_ready(self, process_id: str) -> bool:
+        proc = self._process_status_map.get(process_id)
+        if not isinstance(proc, dict):
+            return False
+        state = str(proc.get("state", "") or "").strip().upper()
+        if state != "RUNNING":
+            return False
+        return self._process_is_registered(proc)
+
+    def _process_capabilities_retry_allowed(self, process_id: str) -> bool:
+        next_retry = self._proc_cap_retry_next_mono.get(process_id)
+        if next_retry is None:
+            return True
+        return time.monotonic() >= float(next_retry)
+
+    def _schedule_process_capabilities_retry(self, process_id: str) -> None:
+        current = float(
+            self._proc_cap_retry_delay_s.get(
+                process_id, self._proc_cap_retry_initial_s
+            )
+        )
+        delay = max(self._proc_cap_retry_initial_s, current)
+        self._proc_cap_retry_next_mono[process_id] = time.monotonic() + delay
+        self._proc_cap_retry_delay_s[process_id] = min(
+            self._proc_cap_retry_max_s, delay * 2.0
+        )
+
+    def _reset_process_capabilities_retry(self, process_id: str) -> None:
+        self._proc_cap_retry_next_mono.pop(process_id, None)
+        self._proc_cap_retry_delay_s.pop(process_id, None)
 
     def _get_device_capabilities(
         self, device_id: str, *, force: bool = False
@@ -1015,6 +1063,10 @@ class ManagerTUI(App):
     def _get_process_capabilities(
         self, process_id: str, *, force: bool = False
     ) -> dict[str, Any] | None:
+        if not self._process_capabilities_probe_ready(process_id):
+            return None
+        if not force and not self._process_capabilities_retry_allowed(process_id):
+            return None
         if not force and process_id in self._proc_cap_cache:
             return self._proc_cap_cache.get(process_id)
 
@@ -1023,12 +1075,15 @@ class ManagerTUI(App):
             {"type": "process.capabilities", "params": {}},
         )
         if not resp or not resp.get("ok"):
+            self._schedule_process_capabilities_retry(process_id)
             return None
         result = resp.get("result")
         if not isinstance(result, dict):
+            self._schedule_process_capabilities_retry(process_id)
             return None
 
         self._proc_cap_cache[process_id] = result
+        self._reset_process_capabilities_retry(process_id)
         members = result.get("members", [])
         if isinstance(members, list):
             self._proc_members_last[process_id] = [
@@ -1108,6 +1163,7 @@ class ManagerTUI(App):
         if proc_resp and proc_resp.get("ok"):
             raw = proc_resp.get("result", [])
             if isinstance(raw, list):
+                old_proc_map = self._process_status_map
                 next_proc_map: dict[str, Json] = {}
                 for proc in raw:
                     if not isinstance(proc, dict):
@@ -1116,11 +1172,27 @@ class ManagerTUI(App):
                     if not pid:
                         continue
                     next_proc_map[pid] = proc
+                    prev = old_proc_map.get(pid)
+                    if isinstance(prev, dict):
+                        prev_pid = prev.get("pid")
+                        next_pid = proc.get("pid")
+                        if prev_pid != next_pid:
+                            self._proc_cap_cache.pop(pid, None)
+                            self._proc_members_last.pop(pid, None)
+                            self._reset_process_capabilities_retry(pid)
+                    if not self._process_is_registered(proc):
+                        self._proc_cap_cache.pop(pid, None)
+                        self._proc_members_last.pop(pid, None)
                 self._process_status_map = next_proc_map
                 self._processes = [
                     self._process_status_map[pid]
                     for pid in sorted(self._process_status_map.keys())
                 ]
+                stale_retry_keys = set(self._proc_cap_retry_next_mono) - set(
+                    self._process_status_map
+                )
+                for pid in stale_retry_keys:
+                    self._reset_process_capabilities_retry(pid)
                 snapshot_changed = True
 
         if snapshot_changed:
@@ -1479,7 +1551,7 @@ class ManagerTUI(App):
                         proc = item
                         break
                 state = str(proc.get("state", "")) if proc else ""
-                if state in {"STARTING", "RUNNING", "STOPPING"}:
+                if state == "RUNNING":
                     self._get_process_capabilities(process_id)
             members = self._proc_members_last.get(process_id, [])
         else:

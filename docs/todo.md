@@ -25,6 +25,17 @@
     - Diagnostics line/column jump should focus editor at exact offset.
     - `Show loaded YAML` should still populate the editable buffer.
     - Preview mode can remain as a read-only formatted view.
+- Snapshot restore on reload:
+  - Add FastAPI snapshot endpoints for latest values so refresh does not start from empty plots.
+  - Scope:
+    - latest telemetry signals per device
+    - latest stream-analysis outputs per workspace/output (`scalar`, `hist_agg`, `hist2d`, optional latest `fit_1d`)
+    - latest trace sample for raw stream panels (single latest trace, not full history)
+  - UI boot flow:
+    - fetch snapshots first
+    - seed panel state/refs from snapshot payloads
+    - then attach WebSocket subscriptions for live deltas
+  - Keep this as latest-state restore only (no historical replay/backfill).
 
 ## Measurement schema TODO
 - Clarification: this is for measurement metadata fields (header/notes JSON), not telemetry/stream array payloads.

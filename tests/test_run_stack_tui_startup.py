@@ -145,6 +145,76 @@ class TuiStartupWaitTests(unittest.TestCase):
         self.assertEqual(probe_status["status"], "active")
         win_probe.assert_called()
 
+    def test_main_no_tui_passes_command_journal_settings_to_manager(self) -> None:
+        stack_raw = {
+            "instance_id": "vacuum",
+            "manager": {
+                "command_journal": {
+                    "enabled": True,
+                    "path": ".state/journal.sqlite3",
+                    "queue_max": 5000,
+                    "batch_size": 100,
+                    "flush_interval_ms": 50,
+                    "retention": {"max_rows": 20000, "max_age_days": 7},
+                }
+            },
+            "startup": {
+                "start_devices": False,
+                "start_processes": False,
+                "wait_for_registered": False,
+                "wait_for_online": False,
+            },
+        }
+        manager_network = resolve_manager_network({})
+        captured_kwargs: dict[str, object] = {}
+
+        class _FakeManager:
+            def __init__(self, **kwargs: object) -> None:
+                captured_kwargs.update(kwargs)
+
+            def add_device(self, spec: object) -> None:
+                return
+
+            def add_process(self, spec: object) -> None:
+                return
+
+            def startup_sequence(self, **kwargs: object) -> None:
+                return
+
+            def run_forever(self) -> None:
+                return
+
+        with (
+            mock.patch(
+                "experiment_control.cli.run_stack._load_yaml",
+                return_value=stack_raw,
+            ),
+            mock.patch(
+                "experiment_control.cli.run_stack.resolve_manager_network",
+                return_value=manager_network,
+            ),
+            mock.patch(
+                "experiment_control.cli.run_stack.parse_federation_config",
+                return_value={},
+            ),
+            mock.patch("experiment_control.cli.run_stack.Manager", _FakeManager),
+        ):
+            from experiment_control.cli.run_stack import main
+
+            main(["dummy_stack.yaml", "--no-tui"])
+
+        expected_base = Path("dummy_stack.yaml").expanduser().resolve().parent
+        self.assertTrue(bool(captured_kwargs.get("command_journal_enabled")))
+        self.assertEqual(
+            captured_kwargs.get("command_journal_path"),
+            (expected_base / ".state" / "journal.sqlite3").resolve(),
+        )
+        self.assertEqual(captured_kwargs.get("command_journal_queue_max"), 5000)
+        self.assertEqual(captured_kwargs.get("command_journal_batch_size"), 100)
+        self.assertEqual(captured_kwargs.get("command_journal_flush_interval_ms"), 50)
+        self.assertEqual(captured_kwargs.get("command_journal_retention_max_rows"), 20000)
+        self.assertEqual(captured_kwargs.get("command_journal_retention_max_age_days"), 7.0)
+
     def test_run_with_tui_spawns_child_without_opt_in_flags_by_default(self) -> None:
         manager_network = resolve_manager_network({})
         with (
@@ -261,6 +331,141 @@ class TuiStartupWaitTests(unittest.TestCase):
         self.assertEqual(run_kwargs.get("manager_network"), manager_network)
         self.assertEqual(run_kwargs.get("tui_raw"), {"enabled": True})
         self.assertTrue(bool(run_kwargs.get("instance_lock")))
+
+    def test_main_with_tui_emits_lifecycle_summary(self) -> None:
+        manager_network = resolve_manager_network({})
+        stack_raw = {
+            "instance_id": "vacuum",
+            "manager": {},
+            "tui": {"enabled": True},
+        }
+        with (
+            mock.patch(
+                "experiment_control.cli.run_stack._load_yaml",
+                return_value=stack_raw,
+            ),
+            mock.patch(
+                "experiment_control.cli.run_stack._preflight_instance_cleanup"
+            ) as preflight_mock,
+            mock.patch(
+                "experiment_control.cli.run_stack._run_with_tui",
+                side_effect=SystemExit(0),
+            ),
+        ):
+            buf = io.StringIO()
+            with self.assertRaises(SystemExit):
+                with redirect_stderr(buf):
+                    from experiment_control.cli.run_stack import main
+
+                    main(["dummy_stack.yaml", "--cleanup-orphans", "--instance-lock"])
+        preflight_mock.assert_called_once_with(
+            instance_id="vacuum",
+            manager_rpc=manager_network.local_rpc_connect,
+        )
+        text = buf.getvalue()
+        self.assertIn("[run_stack] lifecycle:", text)
+        self.assertIn("mode=tui", text)
+        self.assertIn("cleanup=on", text)
+        self.assertIn("lock=on", text)
+        self.assertIn("preflight=run", text)
+
+    def test_main_no_tui_emits_lifecycle_summary(self) -> None:
+        stack_raw = {
+            "instance_id": "vacuum",
+            "manager": {},
+            "startup": {
+                "start_devices": False,
+                "start_processes": False,
+                "wait_for_registered": False,
+                "wait_for_online": False,
+            },
+        }
+
+        class _FakeManager:
+            def __init__(self, **kwargs: object) -> None:
+                self.kwargs = kwargs
+
+            def add_device(self, spec: object) -> None:
+                return
+
+            def add_process(self, spec: object) -> None:
+                return
+
+            def startup_sequence(self, **kwargs: object) -> None:
+                return
+
+            def run_forever(self) -> None:
+                return
+
+        with (
+            mock.patch(
+                "experiment_control.cli.run_stack._load_yaml",
+                return_value=stack_raw,
+            ),
+            mock.patch(
+                "experiment_control.cli.run_stack.parse_federation_config",
+                return_value={},
+            ),
+            mock.patch("experiment_control.cli.run_stack.Manager", _FakeManager),
+        ):
+            buf = io.StringIO()
+            with redirect_stderr(buf):
+                from experiment_control.cli.run_stack import main
+
+                main(["dummy_stack.yaml", "--no-tui"])
+        text = buf.getvalue()
+        self.assertIn("[run_stack] lifecycle:", text)
+        self.assertIn("mode=headless", text)
+        self.assertIn("cleanup=off", text)
+        self.assertIn("lock=off", text)
+        self.assertIn("preflight=skip", text)
+
+    def test_main_no_tui_runs_preflight_once_when_enabled(self) -> None:
+        stack_raw = {
+            "instance_id": "vacuum",
+            "manager": {},
+            "startup": {
+                "start_devices": False,
+                "start_processes": False,
+                "wait_for_registered": False,
+                "wait_for_online": False,
+            },
+        }
+
+        class _FakeManager:
+            def __init__(self, **kwargs: object) -> None:
+                self.kwargs = kwargs
+
+            def add_device(self, spec: object) -> None:
+                return
+
+            def add_process(self, spec: object) -> None:
+                return
+
+            def startup_sequence(self, **kwargs: object) -> None:
+                return
+
+            def run_forever(self) -> None:
+                return
+
+        with (
+            mock.patch(
+                "experiment_control.cli.run_stack._load_yaml",
+                return_value=stack_raw,
+            ),
+            mock.patch(
+                "experiment_control.cli.run_stack._preflight_instance_cleanup"
+            ) as preflight_mock,
+            mock.patch(
+                "experiment_control.cli.run_stack.parse_federation_config",
+                return_value={},
+            ),
+            mock.patch("experiment_control.cli.run_stack.Manager", _FakeManager),
+        ):
+            from experiment_control.cli.run_stack import main
+
+            main(["dummy_stack.yaml", "--no-tui", "--cleanup-orphans"])
+        preflight_mock.assert_called_once()
 
     def test_wait_for_manager_ready_succeeds_after_probe(self) -> None:
         calls: list[tuple[str, int, str | None]] = []

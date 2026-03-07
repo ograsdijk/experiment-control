@@ -80,6 +80,84 @@ class DeviceRouterFederationTests(unittest.TestCase):
         finally:
             router.close()
 
+    def test_local_command_task_carries_source_fields(self) -> None:
+        router = DeviceRouter(
+            external_rpc_bind="tcp://127.0.0.1:*",
+            process_id="device_router",
+        )
+        try:
+            worker = _CaptureWorker()
+            responses = []
+            router._ensure_device_worker = lambda device_id: worker  # type: ignore[method-assign]
+            router._send_external_response = (  # type: ignore[method-assign]
+                lambda identity, resp: responses.append((identity, resp))
+            )
+            router._device_endpoints["dummy"] = "tcp://127.0.0.1:7001"
+
+            router._dispatch_device_command(
+                b"client-1",
+                {
+                    "type": "command",
+                    "device_id": "dummy",
+                    "action": "set_frequency_hz",
+                    "params": {"value": 10.0},
+                    "request_id": "req-123",
+                    "source_kind": "webui",
+                    "source_id": "fastapi",
+                },
+            )
+
+            self.assertEqual(responses, [])
+            self.assertEqual(len(worker.tasks), 1)
+            task = worker.tasks[0]
+            self.assertEqual(task.request_id, "req-123")
+            self.assertEqual(task.source_kind, "webui")
+            self.assertEqual(task.source_id, "fastapi")
+        finally:
+            router.close()
+
+    def test_process_rpc_task_carries_action_and_source_fields(self) -> None:
+        router = DeviceRouter(
+            external_rpc_bind="tcp://127.0.0.1:*",
+            process_id="device_router",
+        )
+        try:
+            worker = _CaptureWorker()
+            responses = []
+            router._ensure_process_worker = lambda process_id: worker  # type: ignore[method-assign]
+            router._send_external_response = (  # type: ignore[method-assign]
+                lambda identity, resp: responses.append((identity, resp))
+            )
+            router._process_endpoints["sequencer"] = "tcp://127.0.0.1:9901"
+
+            router._dispatch_process_rpc(
+                b"client-1",
+                {
+                    "type": "process.rpc",
+                    "process_id": "sequencer",
+                    "request_id": "req-outer",
+                    "source_kind": "webui",
+                    "source_id": "fastapi",
+                    "request": {
+                        "type": "sequencer.start",
+                        "params": {"sequence_id": "main"},
+                        "request_id": "req-inner",
+                    },
+                },
+            )
+
+            self.assertEqual(responses, [])
+            self.assertEqual(len(worker.tasks), 1)
+            task = worker.tasks[0]
+            self.assertEqual(task.process_id, "sequencer")
+            self.assertEqual(task.action, "sequencer.start")
+            self.assertEqual(task.params, {"sequence_id": "main"})
+            self.assertEqual(task.request_id, "req-outer")
+            self.assertEqual(task.source_kind, "webui")
+            self.assertEqual(task.source_id, "fastapi")
+        finally:
+            router.close()
+
     def test_reexport_of_mirrored_device_is_blocked(self) -> None:
         router = DeviceRouter(
             external_rpc_bind="tcp://127.0.0.1:*",

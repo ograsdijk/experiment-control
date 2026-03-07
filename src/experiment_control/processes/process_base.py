@@ -141,6 +141,8 @@ class ManagedProcessBase:
                     "pid": pid,
                     "ts": {"t_wall": time.time(), "t_mono": time.monotonic()},
                 }
+                if self._rpc_endpoint:
+                    msg["rpc_endpoint"] = self._rpc_endpoint
                 if state_provider is not None:
                     try:
                         state = state_provider()

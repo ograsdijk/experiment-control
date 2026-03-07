@@ -72,10 +72,19 @@ class ManagerClient:
             timeout_ms = self._rpc_timeout_ms
         else:
             timeout_ms = int(timeout_ms)
+        outbound: Json = payload
+        if isinstance(payload, dict) and payload.get("type") == "command" and self._process_id:
+            outbound = dict(payload)
+            if outbound.get("caller_process_id") is None:
+                outbound["caller_process_id"] = self._process_id
+            if outbound.get("source_kind") is None:
+                outbound["source_kind"] = "process"
+            if outbound.get("source_id") is None:
+                outbound["source_id"] = self._process_id
         self._rpc.setsockopt(zmq.RCVTIMEO, timeout_ms)
         self._rpc.setsockopt(zmq.SNDTIMEO, timeout_ms)
         try:
-            self._rpc.send(json_dumps(payload))
+            self._rpc.send(json_dumps(outbound))
             raw = self._rpc.recv()
             resp = json_loads(raw)
             return resp if isinstance(resp, dict) else None

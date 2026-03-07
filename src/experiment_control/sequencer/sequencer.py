@@ -568,7 +568,14 @@ class SequencerProcess(ManagedProcessBase):
                 ),
                 method(
                     "sequencer.library.load",
-                    params=[param("sequence_id", required=True, annotation="str")],
+                    params=[
+                        param(
+                            "sequence_id",
+                            required=True,
+                            default=None,
+                            annotation="str",
+                        )
+                    ],
                     doc="Load a sequence from the configured library by id.",
                 ),
                 method(
@@ -578,7 +585,14 @@ class SequencerProcess(ManagedProcessBase):
                 ),
                 method(
                     "sequencer.adaptive.clear",
-                    params=[param("study_id", required=True, annotation="str")],
+                    params=[
+                        param(
+                            "study_id",
+                            required=True,
+                            default=None,
+                            annotation="str",
+                        )
+                    ],
                     doc="Clear saved adaptive study state for one study id.",
                 ),
                 method(

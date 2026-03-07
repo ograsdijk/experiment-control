@@ -80,6 +80,15 @@ manager:
   device_rpc_timeout_ms: 1500
   interceptor_rpc_timeout_ms: 500
   auto_connect_on_register: true
+  command_journal:
+    enabled: false
+    path: .state/command_journal.sqlite3
+    queue_max: 10000
+    batch_size: 200
+    flush_interval_ms: 200
+    retention:
+      max_rows: 1000000
+      max_age_days: null
 
 devices:
   dirs: [devices]
@@ -123,6 +132,14 @@ Notes:
 - `bind_host` controls external bind/listen host and can be wildcard (`0.0.0.0`, `*`, `[::]`).
 - Local clients launched by `run_stack` (TUI + managed processes) always use loopback connect
   addresses (`tcp://127.0.0.1:<port>`) derived from the external ports.
+- `manager.command_journal` is optional and disabled by default. When enabled, command
+  execution records are written asynchronously to SQLite.
+- Journal scope includes:
+  - device commands (`type=command`)
+  - process control commands (`process.start`, `process.stop`, `process.restart`)
+  - process RPC commands (`process.rpc`, e.g. `sequencer.start`, `hdf.rotate`)
+- Command-journal action filter: `stream__*` and `telemetry__*` actions are skipped to
+  avoid high-volume acquisition noise.
 - Remote/public endpoint hints use `advertise_host` if set, otherwise:
   non-wildcard `bind_host`, otherwise first non-loopback host IP.
 - Legacy keys are still accepted:
@@ -206,6 +223,13 @@ def stream_metadata(self) -> dict[str, dict[str, object]]:
         }
     }
 ```
+
+Runtime override RPCs (manager-side, no YAML edit/restart):
+- `device.metadata.get`
+- `device.metadata.set` (`mode: merge|replace`)
+- `device.metadata.clear` (`scope: all|device|stream`)
+
+These publish updated `manager.device_config` immediately for local devices.
 
 ## Process config (example)
 
@@ -313,6 +337,8 @@ Behavior:
 
 - probes manager RPC for a live manager on the same `instance_id`
 - runs stale-child orphan cleanup before starting a new manager
+- prints a startup lifecycle summary line:
+  - `[run_stack] lifecycle: mode=<tui|headless> cleanup=<on|off> lock=<on|off> preflight=<run|skip>`
 
 When you suspect a stuck/stale instance, use these tools in order:
 

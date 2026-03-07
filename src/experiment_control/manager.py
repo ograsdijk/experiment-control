@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import importlib
 import importlib.util
 import json
@@ -29,6 +30,7 @@ from .utils.config_parsing import (
     require_str,
 )
 from .utils.manager_network import derive_local_connect_endpoint
+from .utils.command_journal import CommandJournal, CommandJournalSettings
 from .types import (
     DeviceState,
     DriverState,
@@ -549,6 +551,13 @@ class Manager:
         interceptor_rpc_timeout_ms: int = 500,
         auto_connect_on_register: bool = True,
         log_history_size: int = 10000,
+        command_journal_enabled: bool = False,
+        command_journal_path: str | Path | None = None,
+        command_journal_queue_max: int = 10_000,
+        command_journal_batch_size: int = 200,
+        command_journal_flush_interval_ms: int = 200,
+        command_journal_retention_max_rows: int | None = 1_000_000,
+        command_journal_retention_max_age_days: float | None = None,
     ) -> None:
         instance_id_text = str(
             instance_id or os.environ.get("EXPERIMENT_CONTROL_INSTANCE_ID", "")
@@ -625,12 +634,58 @@ class Manager:
         self._supervisor_log_threads: dict[tuple[str, str, int, str], threading.Thread] = {}
         self._supervisor_pending_blocks: dict[tuple[str, str, int, str], Json] = {}
         self._last_orphan_cleanup: Json | None = None
+        self._command_journal_enabled = bool(command_journal_enabled)
+        self._command_journal: CommandJournal | None = None
+        path_raw = (
+            str(command_journal_path).strip()
+            if command_journal_path is not None
+            else ""
+        )
+        if path_raw:
+            self._command_journal_path: Path | None = Path(path_raw).expanduser()
+        else:
+            self._command_journal_path = (
+                Path(".state") / self._instance_id / "command_journal.sqlite3"
+            )
+        self._command_journal_start_error: str | None = None
+        if self._command_journal_enabled:
+            try:
+                settings = CommandJournalSettings(
+                    path=self._command_journal_path,
+                    queue_max=int(command_journal_queue_max),
+                    batch_size=int(command_journal_batch_size),
+                    flush_interval_ms=int(command_journal_flush_interval_ms),
+                    retention_max_rows=(
+                        None
+                        if command_journal_retention_max_rows is None
+                        else int(command_journal_retention_max_rows)
+                    ),
+                    retention_max_age_days=(
+                        None
+                        if command_journal_retention_max_age_days is None
+                        else float(command_journal_retention_max_age_days)
+                    ),
+                )
+                self._command_journal = CommandJournal(
+                    settings=settings,
+                    instance_id=self._instance_id,
+                )
+                self._command_journal.start()
+            except Exception as e:
+                self._command_journal = None
+                self._command_journal_enabled = False
+                self._command_journal_start_error = str(e)
 
         # Latest fast-data descriptor cache: (device_id -> stream_name -> descriptor json)
         self._latest_chunk_desc: dict[str, dict[str, Json]] = {}
         self._command_interceptor_routes: list[CommandInterceptorRoute] = []
         self._command_interceptor_order = 0
         self._command_interceptor_cache: dict[tuple[str, str], list[CommandInterceptorRoute]] = {}
+        self._runtime_device_metadata_overrides: dict[str, dict[str, Any]] = {}
+        self._runtime_stream_metadata_overrides: dict[
+            str, dict[str, dict[str, Any]]
+        ] = {}
+        self._runtime_metadata_revision: dict[str, int] = {}
 
         # Optional hooks for in-process consumers (handy for unit tests / local GUI)
         self._event_hooks: list[Callable[[str, Json], None]] = []
@@ -1420,6 +1475,8 @@ class Manager:
             "last_error": handle.last_error,
             "heartbeat_endpoint": handle.heartbeat_endpoint,
             "process_data_endpoint": handle.process_data_endpoint,
+            "rpc_endpoint": handle.rpc_endpoint,
+            "registered": handle.rpc_endpoint is not None,
         }
 
     def _start_child_log_readers(
@@ -1828,8 +1885,10 @@ class Manager:
                     raise TimeoutError(f"Timed out waiting for registration: {missing}")
                 self._pump_once(poll_ms=poll_ms)
 
-        # Decide whether to connect: explicit arg wins; otherwise use policy flag.
-        do_connect = self._auto_connect_on_register if connect is None else connect
+        # Decide whether to connect:
+        # - explicit connect=True/False wins.
+        # - when connect is None, rely on registration-time auto-connect policy only.
+        do_connect = bool(connect) if connect is not None else False
         if do_connect:
             self.connect_all_devices()
 
@@ -1933,6 +1992,12 @@ class Manager:
                 pass
         self._drain_supervisor_logs(max_items=5000)
         self._flush_stale_supervisor_blocks(force=True)
+        journal = self._command_journal
+        if journal is not None:
+            try:
+                journal.close(timeout_s=2.0)
+            except Exception:
+                pass
         try:
             self._registry_rep.close(0)
         except Exception:
@@ -2500,6 +2565,19 @@ class Manager:
         if handle.state == ManagedProcessState.STARTING:
             handle.state = ManagedProcessState.RUNNING
             handle.startup_collision_retry_done = False
+        hb_rpc_endpoint = str(msg.get("rpc_endpoint") or "").strip()
+        if hb_rpc_endpoint:
+            if handle.rpc_endpoint != hb_rpc_endpoint:
+                self._close_process_rpc(handle)
+                handle.rpc_endpoint = hb_rpc_endpoint
+                self._publish_manager_event(
+                    "manager.process.rpc_update",
+                    {
+                        "process_id": process_id,
+                        "rpc_endpoint": hb_rpc_endpoint,
+                        "ts": {"t_wall": time.time(), "t_mono": time.monotonic()},
+                    },
+                )
 
         payload = {
             "process_id": process_id,
@@ -2905,6 +2983,8 @@ class Manager:
         rtype = req.get("type")
         if rtype == "list_devices":
             return {"ok": True, "devices": self._list_devices_snapshot()}
+        if rtype == "telemetry.snapshot":
+            return {"ok": True, "result": self._telemetry_snapshot()}
         if rtype == "get_telemetry":
             device_id = str(req["device_id"])
             return {
@@ -2915,6 +2995,13 @@ class Manager:
             device_id = str(req["device_id"])
             action = str(req["action"])
             params = req.get("params", {})
+            request_id = req.get("request_id")
+            caller_process_id = req.get("caller_process_id")
+            source_kind, source_id = self._normalize_command_source(
+                source_kind=req.get("source_kind"),
+                source_id=req.get("source_id"),
+                caller_process_id=caller_process_id,
+            )
             if not isinstance(params, dict):
                 raise TypeError("params must be a dict")
             handle = self._devices.get(device_id)
@@ -2928,8 +3015,8 @@ class Manager:
             cmd = {"device_id": device_id, "action": action, "params": params}
             ok, new_cmd, err = self._apply_command_interceptors(
                 cmd,
-                request_id=req.get("request_id"),
-                caller_process_id=req.get("caller_process_id"),
+                request_id=request_id,
+                caller_process_id=caller_process_id,
             )
             if not ok:
                 return {"ok": False, "error": err}
@@ -2939,6 +3026,11 @@ class Manager:
                 device_id=str(new_cmd.get("device_id", device_id)),
                 action=str(new_cmd.get("action", action)),
                 params=new_cmd.get("params", params),
+                request_id=request_id,
+                caller_process_id=caller_process_id,
+                source_kind=source_kind,
+                source_id=source_id,
+                is_remote_target=False,
             )
 
         if rtype == "federation.capabilities.update":
@@ -3074,6 +3166,209 @@ class Manager:
             configs.extend(self._federation_hub.device_config_list())
             configs.sort(key=lambda item: str(item.get("device_id", "")))
             return {"ok": True, "result": configs}
+        if rtype == "device.metadata.get":
+            device_id = str(req.get("device_id", "")).strip()
+            if not device_id:
+                return {
+                    "ok": False,
+                    "error": {
+                        "code": "invalid_device_id",
+                        "message": "device_id is required",
+                    },
+                }
+            if self._federation_hub.is_mirrored_device(device_id):
+                return {
+                    "ok": False,
+                    "error": {
+                        "code": "remote_device_unsupported",
+                        "message": "runtime metadata overrides only apply to local devices",
+                    },
+                }
+            handle = self._devices.get(device_id)
+            if handle is None:
+                return {"ok": False, "error": {"code": "unknown_device"}}
+            return {"ok": True, "result": self._runtime_metadata_state(device_id, handle)}
+        if rtype == "device.metadata.set":
+            device_id = str(req.get("device_id", "")).strip()
+            if not device_id:
+                return {
+                    "ok": False,
+                    "error": {
+                        "code": "invalid_device_id",
+                        "message": "device_id is required",
+                    },
+                }
+            if self._federation_hub.is_mirrored_device(device_id):
+                return {
+                    "ok": False,
+                    "error": {
+                        "code": "remote_device_unsupported",
+                        "message": "runtime metadata overrides only apply to local devices",
+                    },
+                }
+            handle = self._devices.get(device_id)
+            if handle is None:
+                return {"ok": False, "error": {"code": "unknown_device"}}
+            params = req.get("params", {})
+            if params is None:
+                params = {}
+            if not isinstance(params, dict):
+                return {
+                    "ok": False,
+                    "error": {"code": "invalid_params", "message": "params must be a dict"},
+                }
+            mode = str(params.get("mode", "merge")).strip().lower()
+            if mode not in {"merge", "replace"}:
+                return {
+                    "ok": False,
+                    "error": {
+                        "code": "invalid_params",
+                        "message": "mode must be 'merge' or 'replace'",
+                    },
+                }
+            has_device = "device_metadata" in params
+            has_stream = "stream_metadata" in params
+            if not has_device and not has_stream:
+                return {
+                    "ok": False,
+                    "error": {
+                        "code": "invalid_params",
+                        "message": "device_metadata and/or stream_metadata required",
+                    },
+                }
+            try:
+                parsed_device: dict[str, Any] | None = None
+                parsed_stream: dict[str, dict[str, Any]] | None = None
+                clear_device = False
+                clear_stream = False
+                if has_device:
+                    raw_device = params.get("device_metadata")
+                    if raw_device is None:
+                        clear_device = True
+                    else:
+                        parsed_device = self._normalize_runtime_metadata_dict(
+                            raw_device, label="device_metadata"
+                        )
+                if has_stream:
+                    raw_stream = params.get("stream_metadata")
+                    if raw_stream is None:
+                        clear_stream = True
+                    else:
+                        parsed_stream = self._normalize_runtime_stream_metadata_dict(
+                            raw_stream, label="stream_metadata"
+                        )
+            except Exception as e:
+                return {
+                    "ok": False,
+                    "error": {"code": "invalid_params", "message": str(e)},
+                }
+
+            changed = False
+            cur_device = copy.deepcopy(
+                self._runtime_device_metadata_overrides.get(device_id, {})
+            )
+            cur_stream = copy.deepcopy(
+                self._runtime_stream_metadata_overrides.get(device_id, {})
+            )
+            next_device = copy.deepcopy(cur_device)
+            next_stream = copy.deepcopy(cur_stream)
+
+            if has_device:
+                if clear_device:
+                    next_device = {}
+                elif parsed_device is not None:
+                    if mode == "replace":
+                        next_device = dict(parsed_device)
+                    else:
+                        next_device.update(parsed_device)
+
+            if has_stream:
+                if clear_stream:
+                    next_stream = {}
+                elif parsed_stream is not None:
+                    if mode == "replace":
+                        next_stream = dict(parsed_stream)
+                    else:
+                        next_stream = self._merge_stream_metadata_dicts(
+                            next_stream, parsed_stream
+                        )
+
+            if next_device != cur_device:
+                changed = True
+                if next_device:
+                    self._runtime_device_metadata_overrides[device_id] = next_device
+                else:
+                    self._runtime_device_metadata_overrides.pop(device_id, None)
+
+            if next_stream != cur_stream:
+                changed = True
+                if next_stream:
+                    self._runtime_stream_metadata_overrides[device_id] = next_stream
+                else:
+                    self._runtime_stream_metadata_overrides.pop(device_id, None)
+
+            if changed:
+                self._touch_runtime_metadata_revision(device_id)
+                self._publish_device_config(handle)
+
+            result = self._runtime_metadata_state(device_id, handle)
+            result["changed"] = changed
+            result["mode"] = mode
+            return {"ok": True, "result": result}
+        if rtype == "device.metadata.clear":
+            device_id = str(req.get("device_id", "")).strip()
+            if not device_id:
+                return {
+                    "ok": False,
+                    "error": {
+                        "code": "invalid_device_id",
+                        "message": "device_id is required",
+                    },
+                }
+            if self._federation_hub.is_mirrored_device(device_id):
+                return {
+                    "ok": False,
+                    "error": {
+                        "code": "remote_device_unsupported",
+                        "message": "runtime metadata overrides only apply to local devices",
+                    },
+                }
+            handle = self._devices.get(device_id)
+            if handle is None:
+                return {"ok": False, "error": {"code": "unknown_device"}}
+            params = req.get("params", {})
+            if params is None:
+                params = {}
+            if not isinstance(params, dict):
+                return {
+                    "ok": False,
+                    "error": {"code": "invalid_params", "message": "params must be a dict"},
+                }
+            scope = str(params.get("scope", "all")).strip().lower()
+            if scope not in {"all", "device", "stream"}:
+                return {
+                    "ok": False,
+                    "error": {
+                        "code": "invalid_params",
+                        "message": "scope must be 'all', 'device', or 'stream'",
+                    },
+                }
+
+            changed = False
+            if scope in {"all", "device"} and device_id in self._runtime_device_metadata_overrides:
+                self._runtime_device_metadata_overrides.pop(device_id, None)
+                changed = True
+            if scope in {"all", "stream"} and device_id in self._runtime_stream_metadata_overrides:
+                self._runtime_stream_metadata_overrides.pop(device_id, None)
+                changed = True
+            if changed:
+                self._touch_runtime_metadata_revision(device_id)
+                self._publish_device_config(handle)
+
+            result = self._runtime_metadata_state(device_id, handle)
+            result["changed"] = changed
+            result["scope"] = scope
+            return {"ok": True, "result": result}
 
         if rtype == "process.list_status":
             return {"ok": True, "result": self.list_processes()}
@@ -3082,16 +3377,70 @@ class Manager:
             return {"ok": True, "result": self.get_process(process_id)}
         if rtype == "process.start":
             process_id = str(req["process_id"])
+            request_id = req.get("request_id")
+            caller_process_id = req.get("caller_process_id")
+            source_kind, source_id = self._normalize_command_source(
+                source_kind=req.get("source_kind"),
+                source_id=req.get("source_id"),
+                caller_process_id=caller_process_id,
+            )
             self.start_process(process_id)
-            return {"ok": True, "result": {"process_id": process_id}}
+            resp = {"ok": True, "result": {"process_id": process_id}}
+            self._publish_process_command_event(
+                process_id=process_id,
+                action="process.start",
+                params={"process_id": process_id},
+                response=resp,
+                request_id=request_id,
+                caller_process_id=caller_process_id,
+                source_kind=source_kind,
+                source_id=source_id,
+            )
+            return resp
         if rtype == "process.stop":
             process_id = str(req["process_id"])
+            request_id = req.get("request_id")
+            caller_process_id = req.get("caller_process_id")
+            source_kind, source_id = self._normalize_command_source(
+                source_kind=req.get("source_kind"),
+                source_id=req.get("source_id"),
+                caller_process_id=caller_process_id,
+            )
             self.stop_process(process_id)
-            return {"ok": True, "result": {"process_id": process_id}}
+            resp = {"ok": True, "result": {"process_id": process_id}}
+            self._publish_process_command_event(
+                process_id=process_id,
+                action="process.stop",
+                params={"process_id": process_id},
+                response=resp,
+                request_id=request_id,
+                caller_process_id=caller_process_id,
+                source_kind=source_kind,
+                source_id=source_id,
+            )
+            return resp
         if rtype == "process.restart":
             process_id = str(req["process_id"])
+            request_id = req.get("request_id")
+            caller_process_id = req.get("caller_process_id")
+            source_kind, source_id = self._normalize_command_source(
+                source_kind=req.get("source_kind"),
+                source_id=req.get("source_id"),
+                caller_process_id=caller_process_id,
+            )
             self.restart_process(process_id)
-            return {"ok": True, "result": {"process_id": process_id}}
+            resp = {"ok": True, "result": {"process_id": process_id}}
+            self._publish_process_command_event(
+                process_id=process_id,
+                action="process.restart",
+                params={"process_id": process_id},
+                response=resp,
+                request_id=request_id,
+                caller_process_id=caller_process_id,
+                source_kind=source_kind,
+                source_id=source_id,
+            )
+            return resp
         if rtype == "process.add":
             spec_raw = req.get("spec")
             if not isinstance(spec_raw, dict):
@@ -3131,38 +3480,130 @@ class Manager:
         if rtype == "process.rpc":
             process_id = str(req.get("process_id", ""))
             request = req.get("request")
+            request_id = req.get("request_id")
+            caller_process_id = req.get("caller_process_id")
+            source_kind, source_id = self._normalize_command_source(
+                source_kind=req.get("source_kind"),
+                source_id=req.get("source_id"),
+                caller_process_id=caller_process_id,
+            )
+            process_action = "process.rpc"
+            process_params: Json = {}
+            if isinstance(request, dict):
+                process_action = str(request.get("type", "process.rpc") or "process.rpc")
+                raw_params = request.get("params", {})
+                if isinstance(raw_params, dict):
+                    process_params = raw_params
             if not process_id or not isinstance(request, dict):
-                return {
+                resp = {
                     "ok": False,
                     "error": {"code": "invalid_process_rpc", "message": "bad request"},
                 }
+                self._publish_process_command_event(
+                    process_id=process_id or "unknown",
+                    action=process_action,
+                    params=process_params,
+                    response=resp,
+                    request_id=request_id,
+                    caller_process_id=caller_process_id,
+                    source_kind=source_kind,
+                    source_id=source_id,
+                )
+                return resp
             handle = self._processes.get(process_id)
             if handle is None:
-                return {"ok": False, "error": {"code": "unknown_process"}}
+                resp = {"ok": False, "error": {"code": "unknown_process"}}
+                self._publish_process_command_event(
+                    process_id=process_id,
+                    action=process_action,
+                    params=process_params,
+                    response=resp,
+                    request_id=request_id,
+                    caller_process_id=caller_process_id,
+                    source_kind=source_kind,
+                    source_id=source_id,
+                )
+                return resp
             if handle.state not in {
                 ManagedProcessState.STARTING,
                 ManagedProcessState.RUNNING,
                 ManagedProcessState.STOPPING,
             }:
-                return {
+                resp = {
                     "ok": False,
                     "error": {"code": "process_not_running"},
                 }
+                self._publish_process_command_event(
+                    process_id=process_id,
+                    action=process_action,
+                    params=process_params,
+                    response=resp,
+                    request_id=request_id,
+                    caller_process_id=caller_process_id,
+                    source_kind=source_kind,
+                    source_id=source_id,
+                )
+                return resp
             if handle.rpc_endpoint is None:
-                return {
-                    "ok": False,
-                    "error": {"code": "process_rpc_not_ready"},
-                }
+                if (
+                    process_action == "process.capabilities"
+                    and handle.state == ManagedProcessState.STARTING
+                ):
+                    resp = {
+                        "ok": False,
+                        "error": {
+                            "code": "process_starting",
+                            "message": "process is starting; RPC endpoint not advertised yet",
+                            "retry_after_ms": 500,
+                        },
+                    }
+                else:
+                    resp = {
+                        "ok": False,
+                        "error": {"code": "process_rpc_not_ready"},
+                    }
+                self._publish_process_command_event(
+                    process_id=process_id,
+                    action=process_action,
+                    params=process_params,
+                    response=resp,
+                    request_id=request_id,
+                    caller_process_id=caller_process_id,
+                    source_kind=source_kind,
+                    source_id=source_id,
+                )
+                return resp
             try:
                 resp = self._call_process_rpc(
                     process_id=process_id,
                     request=request,
                 )
             except Exception as e:
-                return {
+                resp = {
                     "ok": False,
                     "error": {"code": "process_rpc_failed", "message": str(e)},
                 }
+                self._publish_process_command_event(
+                    process_id=process_id,
+                    action=process_action,
+                    params=process_params,
+                    response=resp,
+                    request_id=request_id,
+                    caller_process_id=caller_process_id,
+                    source_kind=source_kind,
+                    source_id=source_id,
+                )
+                return resp
+            self._publish_process_command_event(
+                process_id=process_id,
+                action=process_action,
+                params=process_params,
+                response=resp,
+                request_id=request_id,
+                caller_process_id=caller_process_id,
+                source_kind=source_kind,
+                source_id=source_id,
+            )
             return resp
 
         if rtype == "command_interceptor.register":
@@ -3278,6 +3719,36 @@ class Manager:
                 }
             return {"ok": True, "result": result}
 
+        if rtype == "manager.command_journal.status":
+            return {"ok": True, "result": self._command_journal_status_payload()}
+
+        if rtype == "manager.command_journal.tail":
+            params = req.get("params", {})
+            if params is None:
+                params = {}
+            if not isinstance(params, dict):
+                return {
+                    "ok": False,
+                    "error": {"code": "invalid_params", "message": "params must be a dict"},
+                }
+            journal = self._command_journal
+            if journal is None:
+                return {
+                    "ok": False,
+                    "error": {
+                        "code": "journal_disabled",
+                        "message": "command journal is disabled",
+                    },
+                }
+            try:
+                result = journal.tail(params)
+            except Exception as e:
+                return {
+                    "ok": False,
+                    "error": {"code": "invalid_params", "message": str(e)},
+                }
+            return {"ok": True, "result": result}
+
         if rtype == "manager.event.publish":
             topic = req.get("topic")
             payload = req.get("payload")
@@ -3301,6 +3772,11 @@ class Manager:
         action: str,
         params: Json,
         timeout_ms: int | None = None,
+        request_id: Any = None,
+        caller_process_id: Any = None,
+        source_kind: Any = None,
+        source_id: Any = None,
+        is_remote_target: bool = False,
     ) -> Json:
         """
         RPC semantics: strictly serial per device; blocking is allowed driver-side.
@@ -3321,6 +3797,13 @@ class Manager:
         effective_timeout = (
             self._device_rpc_timeout_ms if timeout_ms is None else timeout_ms
         )
+        caller_process_id_text = self._normalize_id(caller_process_id)
+        source_kind_text, source_id_text = self._normalize_command_source(
+            source_kind=source_kind,
+            source_id=source_id,
+            caller_process_id=caller_process_id_text,
+        )
+        is_remote_target_flag = bool(is_remote_target)
         sock.setsockopt(zmq.RCVTIMEO, int(effective_timeout))
         sock.setsockopt(zmq.SNDTIMEO, int(effective_timeout))
         try:
@@ -3366,8 +3849,15 @@ class Manager:
                 "status": status,
                 "error": resp.get("error"),
                 "result_json": self._safe_json(resp.get("result")),
+                "source_kind": source_kind_text,
+                "source_id": source_id_text,
+                "is_remote_target": is_remote_target_flag,
                 "ts": {"t_wall": time.time(), "t_mono": time.monotonic()},
             }
+            if request_id is not None:
+                cmd_payload["request_id"] = request_id
+            if caller_process_id_text is not None:
+                cmd_payload["caller_process_id"] = caller_process_id_text
             self._publish_manager_event("manager.command", cmd_payload)
             return resp
         except Exception as e:
@@ -3384,8 +3874,15 @@ class Manager:
                 "status": None,
                 "error": str(e),
                 "result_json": "",
+                "source_kind": source_kind_text,
+                "source_id": source_id_text,
+                "is_remote_target": is_remote_target_flag,
                 "ts": {"t_wall": time.time(), "t_mono": time.monotonic()},
             }
+            if request_id is not None:
+                cmd_payload["request_id"] = request_id
+            if caller_process_id_text is not None:
+                cmd_payload["caller_process_id"] = caller_process_id_text
             self._publish_manager_event("manager.command", cmd_payload)
             raise
 
@@ -3747,6 +4244,15 @@ class Manager:
             }
         return snap
 
+    def _telemetry_snapshot(self) -> Json:
+        devices: Json = {}
+        for device_id in sorted(self._telemetry_latest.keys()):
+            devices[device_id] = self._get_device_telemetry_snapshot(device_id)
+        return {
+            "generated_ts": {"t_wall": time.time(), "t_mono": time.monotonic()},
+            "devices": devices,
+        }
+
     def _device_status_snapshot(self, device_id: str) -> Json:
         if self._federation_hub.is_mirrored_device(device_id):
             return self._federation_hub.device_status_snapshot(device_id)
@@ -3857,6 +4363,8 @@ class Manager:
         self._external_pub.send_multipart(
             [topic.encode("utf-8"), json_dumps(payload)]
         )
+        if topic == "manager.command":
+            self._append_command_journal_entry(payload)
         for hook in self._event_hooks:
             hook(topic, payload)
         if topic != "manager.log":
@@ -3871,6 +4379,168 @@ class Manager:
         if len(text) > max_len:
             return text[:max_len] + "...(truncated)"
         return text
+
+    @staticmethod
+    def _should_journal_command_action(action: Any) -> bool:
+        text = str(action or "").strip().lower()
+        if not text:
+            return True
+        if text.startswith("stream__"):
+            return False
+        if text.startswith("telemetry__"):
+            return False
+        if text == "process.capabilities":
+            return False
+        return True
+
+    @staticmethod
+    def _normalize_command_source(
+        *,
+        source_kind: Any,
+        source_id: Any,
+        caller_process_id: Any,
+    ) -> tuple[str, str | None]:
+        source_kind_text = str(source_kind or "").strip().lower()
+        source_id_text = str(source_id or "").strip()
+        caller_text = str(caller_process_id or "").strip()
+
+        if not source_kind_text:
+            if caller_text:
+                source_kind_text = "process"
+                if not source_id_text:
+                    source_id_text = caller_text
+            else:
+                source_kind_text = "manager"
+                if not source_id_text:
+                    source_id_text = "rpc"
+
+        if not source_id_text and source_kind_text == "process" and caller_text:
+            source_id_text = caller_text
+
+        if not source_id_text:
+            return source_kind_text, None
+        return source_kind_text, source_id_text
+
+    def _append_command_journal_entry(self, payload: Json) -> None:
+        journal = self._command_journal
+        if journal is None:
+            return
+        action_text = str(payload.get("action", "") or "")
+        if not self._should_journal_command_action(action_text):
+            return
+
+        ts = payload.get("ts")
+        t_wall = time.time()
+        t_mono = time.monotonic()
+        if isinstance(ts, dict):
+            try:
+                t_wall = float(ts.get("t_wall", t_wall))
+            except Exception:
+                pass
+            try:
+                t_mono = float(ts.get("t_mono", t_mono))
+            except Exception:
+                pass
+
+        error_value = payload.get("error")
+        error_json = ""
+        if error_value is not None:
+            error_json = self._safe_json(error_value)
+
+        journal.append(
+            {
+                "t_wall": t_wall,
+                "t_mono": t_mono,
+                "instance_id": self._instance_id,
+                "device_id": str(payload.get("device_id", "") or ""),
+                "action": action_text,
+                "params_json": str(payload.get("params_json", "") or ""),
+                "ok": bool(payload.get("ok")),
+                "status": payload.get("status"),
+                "error_json": error_json,
+                "result_json": str(payload.get("result_json", "") or ""),
+                "request_id": payload.get("request_id"),
+                "caller_process_id": payload.get("caller_process_id"),
+                "source_kind": payload.get("source_kind"),
+                "source_id": payload.get("source_id"),
+                "is_remote_target": bool(payload.get("is_remote_target")),
+            }
+        )
+
+    def _command_journal_status_payload(self) -> Json:
+        journal = self._command_journal
+        if journal is None:
+            return {
+                "enabled": False,
+                "path": (
+                    str(self._command_journal_path)
+                    if self._command_journal_path is not None
+                    else None
+                ),
+                "start_error": self._command_journal_start_error,
+            }
+        return journal.status()
+
+    def _publish_process_command_event(
+        self,
+        *,
+        process_id: str,
+        action: str,
+        params: Json,
+        response: Json,
+        request_id: Any = None,
+        caller_process_id: Any = None,
+        source_kind: Any = None,
+        source_id: Any = None,
+    ) -> None:
+        caller_process_id_text = self._normalize_id(caller_process_id)
+        source_kind_text, source_id_text = self._normalize_command_source(
+            source_kind=source_kind,
+            source_id=source_id,
+            caller_process_id=caller_process_id_text,
+        )
+        status = response.get("status")
+        ok: bool | None
+        if status in {"OK", "ERROR"}:
+            ok = status == "OK"
+        elif "ok" in response:
+            ok = bool(response.get("ok"))
+        else:
+            ok = None
+
+        cmd_payload: Json = {
+            "version": 1,
+            "device_id": f"process:{process_id}",
+            "process_id": process_id,
+            "action": str(action or ""),
+            "params_json": self._safe_json(params),
+            "ok": ok,
+            "status": status,
+            "error": response.get("error"),
+            "result_json": self._safe_json(response.get("result")),
+            "source_kind": source_kind_text,
+            "source_id": source_id_text,
+            "is_remote_target": False,
+            "ts": {"t_wall": time.time(), "t_mono": time.monotonic()},
+        }
+        if request_id is not None:
+            cmd_payload["request_id"] = request_id
+        if caller_process_id_text is not None:
+            cmd_payload["caller_process_id"] = caller_process_id_text
+        error_obj = response.get("error")
+        error_code = (
+            str(error_obj.get("code", "")).strip()
+            if isinstance(error_obj, dict)
+            else ""
+        )
+        if (
+            str(action or "").strip() == "process.capabilities"
+            and error_code in {"process_rpc_not_ready", "process_starting"}
+        ):
+            handle = self._processes.get(str(process_id))
+            if handle is not None and handle.state == ManagedProcessState.STARTING:
+                return
+        self._publish_manager_event("manager.command", cmd_payload)
 
     @staticmethod
     def _normalize_log_severity(raw: Any) -> str:
@@ -4218,6 +4888,108 @@ class Manager:
         }
         self._publish_manager_event(topic, payload)
 
+    @staticmethod
+    def _normalize_runtime_metadata_dict(
+        raw: object,
+        *,
+        label: str,
+    ) -> dict[str, Any]:
+        if not isinstance(raw, dict):
+            raise TypeError(f"{label} must be an object/dict")
+        out: dict[str, Any] = {}
+        for key, value in raw.items():
+            name = str(key).strip()
+            if not name:
+                raise ValueError(f"{label} keys must be non-empty strings")
+            out[name] = copy.deepcopy(value)
+        return out
+
+    @classmethod
+    def _normalize_runtime_stream_metadata_dict(
+        cls,
+        raw: object,
+        *,
+        label: str,
+    ) -> dict[str, dict[str, Any]]:
+        if not isinstance(raw, dict):
+            raise TypeError(f"{label} must be an object/dict")
+        out: dict[str, dict[str, Any]] = {}
+        for stream_raw, attrs_raw in raw.items():
+            stream = str(stream_raw).strip()
+            if not stream:
+                raise ValueError(f"{label} stream names must be non-empty strings")
+            attrs = cls._normalize_runtime_metadata_dict(
+                attrs_raw,
+                label=f"{label}.{stream}",
+            )
+            out[stream] = attrs
+        return out
+
+    @staticmethod
+    def _merge_stream_metadata_dicts(
+        base: dict[str, dict[str, Any]],
+        overlay: dict[str, dict[str, Any]],
+    ) -> dict[str, dict[str, Any]]:
+        merged: dict[str, dict[str, Any]] = {}
+        for stream, attrs in base.items():
+            merged[stream] = dict(attrs)
+        for stream, attrs in overlay.items():
+            cur = dict(merged.get(stream, {}))
+            cur.update(attrs)
+            merged[stream] = cur
+        return merged
+
+    def _effective_metadata_for_device(
+        self, device_id: str, spec: DeviceSpec
+    ) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
+        base_device = copy.deepcopy(spec.device_metadata or {})
+        base_stream = copy.deepcopy(spec.stream_metadata or {})
+        override_device = copy.deepcopy(
+            self._runtime_device_metadata_overrides.get(device_id, {})
+        )
+        override_stream = copy.deepcopy(
+            self._runtime_stream_metadata_overrides.get(device_id, {})
+        )
+        effective_device = dict(base_device)
+        effective_device.update(override_device)
+        effective_stream = self._merge_stream_metadata_dicts(base_stream, override_stream)
+        return effective_device, effective_stream
+
+    def _runtime_metadata_state(self, device_id: str, handle: DeviceHandle) -> Json:
+        base_device = copy.deepcopy(handle.spec.device_metadata or {})
+        base_stream = copy.deepcopy(handle.spec.stream_metadata or {})
+        override_device = copy.deepcopy(
+            self._runtime_device_metadata_overrides.get(device_id, {})
+        )
+        override_stream = copy.deepcopy(
+            self._runtime_stream_metadata_overrides.get(device_id, {})
+        )
+        effective_device, effective_stream = self._effective_metadata_for_device(
+            device_id, handle.spec
+        )
+        return {
+            "device_id": device_id,
+            "revision": int(self._runtime_metadata_revision.get(device_id, 0)),
+            "base": {
+                "device_metadata": base_device,
+                "stream_metadata": base_stream,
+            },
+            "overrides": {
+                "device_metadata": override_device,
+                "stream_metadata": override_stream,
+            },
+            "effective": {
+                "device_metadata": effective_device,
+                "stream_metadata": effective_stream,
+            },
+        }
+
+    def _touch_runtime_metadata_revision(self, device_id: str) -> int:
+        current = int(self._runtime_metadata_revision.get(device_id, 0))
+        next_rev = current + 1
+        self._runtime_metadata_revision[device_id] = next_rev
+        return next_rev
+
     def _publish_device_config(self, handle: DeviceHandle) -> None:
         payload: Json = self._device_config_payload(handle)
         self._publish_manager_event("manager.device_config", payload)
@@ -4226,16 +4998,22 @@ class Manager:
         yaml_text = handle.spec.config_yaml_text
         if yaml_text is None:
             yaml_text = self._serialize_spec_yaml(handle.spec)
+        device_metadata, stream_metadata = self._effective_metadata_for_device(
+            handle.spec.device_id, handle.spec
+        )
         return {
             "version": 1,
             "device_id": handle.spec.device_id,
             "yaml_text": yaml_text,
-            "device_metadata": handle.spec.device_metadata or {},
-            "stream_metadata": handle.spec.stream_metadata or {},
+            "device_metadata": device_metadata,
+            "stream_metadata": stream_metadata,
             "telemetry_calls": telemetry_calls_to_json(handle.spec.telemetry_calls),
             "stream_calls": stream_calls_to_json(list(handle.spec.stream_calls or [])),
             "run_meta_calls": run_meta_calls_to_json(
                 list(handle.spec.run_meta_calls or [])
+            ),
+            "metadata_revision": int(
+                self._runtime_metadata_revision.get(handle.spec.device_id, 0)
             ),
             "source_kind": "local",
             "is_remote": False,

@@ -47,8 +47,10 @@ class _DeviceTask:
     device_id: str
     action: str
     params: Json
-    request_id: str | None
+    request_id: Any | None
     caller_process_id: str | None
+    source_kind: str | None
+    source_id: str | None
     device_endpoint: str | None
     chain: list[CommandInterceptorRoute]
     interceptor_endpoints: dict[str, str | None]
@@ -61,6 +63,13 @@ class _ProcessTask:
     process_id: str
     request: Json
     endpoint: str | None
+    action: str
+    params: Json
+    request_id: Any | None
+    caller_process_id: str | None
+    source_kind: str | None
+    source_id: str | None
+    process_state: str | None
 
 
 @dataclass(frozen=True)
@@ -125,11 +134,21 @@ class _ProcessWorker(_BaseWorker):
         process_id: str,
         ctx: zmq.Context,
         reply_queue: queue.Queue,
+        manager_rpc: str,
+        manager_pub: str,
         timeout_ms: int,
     ) -> None:
         super().__init__(name=f"process-rpc-{process_id}", ctx=ctx, reply_queue=reply_queue)
         self._process_id = process_id
+        self._manager_rpc = manager_rpc
+        self._manager_pub = manager_pub
         self._timeout_ms = int(timeout_ms)
+        self._manager_helper = ManagerClientHelper(
+            manager_rpc=manager_rpc,
+            manager_pub=manager_pub,
+            rpc_timeout_ms=self._timeout_ms,
+        )
+        self._manager: ManagerClient | None = None
         self._sock: zmq.Socket | None = None
         self._endpoint: str | None = None
 
@@ -192,7 +211,59 @@ class _ProcessWorker(_BaseWorker):
             self._close_sock()
             return None
 
+    def _publish_event(self, topic: str, payload: Json) -> None:
+        if self._manager is None:
+            return
+        self._manager_helper.publish_event(
+            self._manager,
+            topic=topic,
+            payload=payload,
+            include_process_id=False,
+            include_ts=True,
+        )
+
+    def _publish_process_command(self, task: _ProcessTask, response: Json) -> None:
+        error_obj = response.get("error")
+        error_code = (
+            str(error_obj.get("code", "")).strip()
+            if isinstance(error_obj, dict)
+            else ""
+        )
+        if (
+            task.action == "process.capabilities"
+            and str(task.process_state or "").strip().upper() == "STARTING"
+            and error_code in {"process_rpc_not_ready", "process_starting"}
+        ):
+            return
+        status = response.get("status")
+        ok = response.get("ok")
+        if status in {"OK", "ERROR"}:
+            ok = status == "OK"
+        payload: Json = {
+            "version": 1,
+            "device_id": f"process:{task.process_id}",
+            "process_id": task.process_id,
+            "action": task.action,
+            "params_json": _safe_json(task.params),
+            "ok": ok,
+            "status": status,
+            "error": response.get("error"),
+            "result_json": _safe_json(response.get("result")),
+            "request_id": task.request_id,
+            "caller_process_id": task.caller_process_id,
+            "source_kind": task.source_kind,
+            "source_id": task.source_id,
+            "is_remote_target": False,
+            "ts": {"t_wall": time.time(), "t_mono": time.monotonic()},
+        }
+        self._publish_event("manager.command", payload)
+
     def run(self) -> None:
+        self._manager = self._manager_helper.init_client(
+            ctx=self._ctx,
+            process_id=self._process_id,
+            subscribe_telemetry=False,
+        )
         while not self._stop_evt.is_set():
             task = self._queue.get()
             if task is None:
@@ -200,13 +271,30 @@ class _ProcessWorker(_BaseWorker):
             if not isinstance(task, _ProcessTask):
                 continue
             if not task.endpoint:
-                resp: Json = {"ok": False, "error": {"code": "process_rpc_not_ready"}}
+                if (
+                    task.action == "process.capabilities"
+                    and str(task.process_state or "").strip().upper() == "STARTING"
+                ):
+                    resp = {
+                        "ok": False,
+                        "error": {
+                            "code": "process_starting",
+                            "message": "process is starting; RPC endpoint not advertised yet",
+                            "retry_after_ms": 500,
+                        },
+                    }
+                else:
+                    resp = {"ok": False, "error": {"code": "process_rpc_not_ready"}}
+                self._publish_process_command(task, resp)
                 self._reply_queue.put((task.identity, resp))
                 continue
             resp = self._call(task.endpoint, task.request)
             if resp is None:
                 resp = {"ok": False, "error": "timeout"}
+            self._publish_process_command(task, resp)
             self._reply_queue.put((task.identity, resp))
+        if self._manager is not None:
+            self._manager.close()
         self._close_sock()
 
 class _ManagerWorker(_BaseWorker):
@@ -604,6 +692,11 @@ class _DeviceWorker(_BaseWorker):
                     "status": resp.get("status"),
                     "error": resp.get("error"),
                     "result_json": _safe_json(resp.get("result")),
+                    "request_id": task.request_id,
+                    "caller_process_id": task.caller_process_id,
+                    "source_kind": task.source_kind,
+                    "source_id": task.source_id,
+                    "is_remote_target": False,
                     "ts": {"t_wall": time.time(), "t_mono": time.monotonic()},
                 }
                 self._publish_event("manager.command", cmd_payload)
@@ -617,6 +710,11 @@ class _DeviceWorker(_BaseWorker):
                     "status": None,
                     "error": str(e),
                     "result_json": "",
+                    "request_id": task.request_id,
+                    "caller_process_id": task.caller_process_id,
+                    "source_kind": task.source_kind,
+                    "source_id": task.source_id,
+                    "is_remote_target": False,
                     "ts": {"t_wall": time.time(), "t_mono": time.monotonic()},
                 }
                 self._publish_event("manager.command", cmd_payload)
@@ -939,6 +1037,8 @@ class DeviceRouter(ManagedProcessBase):
                 process_id=process_id,
                 ctx=self._ctx,
                 reply_queue=self._reply_queue,
+                manager_rpc=self._manager_rpc,
+                manager_pub=self._manager_pub,
                 timeout_ms=self._device_rpc_timeout_ms,
             )
             worker.start()
@@ -1212,6 +1312,18 @@ class DeviceRouter(ManagedProcessBase):
             params=params,
             request_id=req.get("request_id"),
             caller_process_id=req.get("caller_process_id"),
+            source_kind=(
+                str(req.get("source_kind")).strip()
+                if req.get("source_kind") is not None
+                and str(req.get("source_kind")).strip()
+                else None
+            ),
+            source_id=(
+                str(req.get("source_id")).strip()
+                if req.get("source_id") is not None
+                and str(req.get("source_id")).strip()
+                else None
+            ),
             device_endpoint=self._device_endpoints.get(device_id),
             chain=chain,
             interceptor_endpoints=interceptor_endpoints,
@@ -1226,11 +1338,44 @@ class DeviceRouter(ManagedProcessBase):
             resp = {"ok": False, "error": {"code": "invalid_process_rpc"}}
             self._send_external_response(identity, resp)
             return
+        action = str(request.get("type", "process.rpc") or "process.rpc")
+        params_raw = request.get("params", {})
+        params = params_raw if isinstance(params_raw, dict) else {}
+        request_id = req.get("request_id")
+        if request_id is None:
+            request_id = request.get("request_id")
+        caller_process_id = (
+            str(req.get("caller_process_id", "")).strip() or None
+        )
+        source_kind = str(req.get("source_kind", "")).strip().lower() or None
+        source_id = str(req.get("source_id", "")).strip() or None
+        if source_kind is None:
+            if caller_process_id is not None:
+                source_kind = "process"
+                if source_id is None:
+                    source_id = caller_process_id
+            else:
+                source_kind = "manager"
+                if source_id is None:
+                    source_id = "rpc"
+        elif source_kind == "process" and source_id is None and caller_process_id is not None:
+            source_id = caller_process_id
+        endpoint = self._process_endpoints.get(process_id)
+        if endpoint is None and process_id == self._process_id and self._rpc_endpoint:
+            endpoint = self._rpc_endpoint
+            self._process_endpoints[process_id] = endpoint
         task = _ProcessTask(
             identity=identity,
             process_id=process_id,
             request=request,
-            endpoint=self._process_endpoints.get(process_id),
+            endpoint=endpoint,
+            action=action,
+            params=params,
+            request_id=request_id,
+            caller_process_id=caller_process_id,
+            source_kind=source_kind,
+            source_id=source_id,
+            process_state=self._process_states.get(process_id),
         )
         self._ensure_process_worker(process_id).submit(task)
 
@@ -1298,6 +1443,8 @@ class DeviceRouter(ManagedProcessBase):
 
     def run(self) -> None:
         self._init_rpc_router()
+        if self._process_id and self._rpc_endpoint:
+            self._process_endpoints[self._process_id] = self._rpc_endpoint
         self._manager = self._init_manager_client(
             manager_rpc=self._manager_rpc,
             manager_pub=self._manager_pub,

@@ -48,7 +48,14 @@ Response:
 
 ### `command`
 Request:
-- `{"type": "command", "device_id": "hv", "action": "enable_output", "params": {"enabled": true}, "request_id": "optional", "caller_process_id": "optional"}`
+- `{"type": "command", "device_id": "hv", "action": "enable_output", "params": {"enabled": true}, "request_id": "optional", "caller_process_id": "optional", "source_kind": "optional", "source_id": "optional"}`
+
+Notes:
+- `source_kind` / `source_id` are forwarded into `manager.command` events for provenance.
+- Built-in clients set defaults:
+  - FastAPI device endpoints: `source_kind=webui`, `source_id=fastapi` (overridable with `x-ec-source-kind` / `x-ec-source-id` headers)
+  - TUI device commands: `source_kind=tui`, `source_id=manager_tui`
+  - Managed processes using `ManagerClient.call` for `type=command`: `source_kind=process`, `source_id=<process_id>` plus `caller_process_id=<process_id>`
 
 Response (pass-through from driver):
 - `{"ok": true, "result": ...}` or `{"ok": false, "error": ...}`
@@ -108,12 +115,72 @@ Request:
 Response:
 - `{"ok": true, "result": {"entries": [...], "count": 200, "total_matched": 740, "limit": 200, "latest_t_mono": 123456.7}}`
 
+### `manager.command_journal.status`
+Request:
+- `{"type": "manager.command_journal.status"}`
+
+Response:
+- `{"ok": true, "result": {"enabled": false, "path": ".state/instance/command_journal.sqlite3", "start_error": null}}`
+- `{"ok": true, "result": {"enabled": true, "path": "...", "queue_depth": 0, "written": 42, "dropped": 0, "write_errors": 0, "...": "see status payload"}}`
+
+Notes:
+- Journaled command events skip high-volume acquisition actions with prefixes
+  `stream__` and `telemetry__`.
+- Journaled command events also skip `process.capabilities`.
+- Process commands are journaled with `device_id="process:<process_id>"`.
+
+### `manager.command_journal.tail`
+Request:
+- `{"type": "manager.command_journal.tail", "params": {"limit": 200}}`
+- Optional filters in `params`:
+  - `since_t_wall`: float
+  - `ok`: bool
+  - `device_ids`: str or list[str]
+  - `actions`: str or list[str]
+  - `source_kind`: str or list[str]
+  - `source_ids`: str or list[str]
+
+Response:
+- `{"ok": true, "result": {"entries": [...], "count": 200, "total_matched": 740, "limit": 200, "latest_id": 1234}}`
+- `{"ok": false, "error": {"code": "journal_disabled"}}`
+
 ### `manager.identity`
 Request:
 - `{"type": "manager.identity"}`
 
 Response:
 - `{"ok": true, "result": {"version": 1, "instance_id": "laser-lock-1", "started_ts": {"t_wall": 1700000000.0, "t_mono": 12345.6}}}`
+
+### `device.metadata.get`
+Request:
+- `{"type": "device.metadata.get", "device_id": "trace1"}`
+
+Response:
+- `{"ok": true, "result": {"device_id": "trace1", "revision": 2, "base": {"device_metadata": {...}, "stream_metadata": {...}}, "overrides": {"device_metadata": {...}, "stream_metadata": {...}}, "effective": {"device_metadata": {...}, "stream_metadata": {...}}}}`
+
+### `device.metadata.set`
+Request:
+- `{"type": "device.metadata.set", "device_id": "trace1", "params": {"mode": "merge", "device_metadata": {"location": "bench_b"}, "stream_metadata": {"trace": {"active_channels": ["A", "B"]}}}}`
+- `{"type": "device.metadata.set", "device_id": "trace1", "params": {"mode": "replace", "stream_metadata": {"trace": {"gain": 2.0}}}}`
+
+Notes:
+- `mode`: `merge` (default) or `replace`
+- runtime overrides apply only to local devices
+- successful updates republish `manager.device_config`
+
+Response:
+- `{"ok": true, "result": {"changed": true, "mode": "merge", "revision": 3, "...": "same shape as device.metadata.get"}}`
+
+### `device.metadata.clear`
+Request:
+- `{"type": "device.metadata.clear", "device_id": "trace1"}`
+- `{"type": "device.metadata.clear", "device_id": "trace1", "params": {"scope": "stream"}}`
+
+Notes:
+- `scope`: `all` (default), `device`, or `stream`
+
+Response:
+- `{"ok": true, "result": {"changed": true, "scope": "stream", "revision": 4, "...": "same shape as device.metadata.get"}}`
 
 ### `manager.cleanup_orphans`
 Request:
@@ -524,6 +591,7 @@ Response:
   - `version`: int
   - `device_id`: str
   - `yaml_text`: str | null
+  - `metadata_revision`: int
   - `device_metadata`: dict
   - `stream_metadata`: dict
   - `telemetry_calls`: list
@@ -590,6 +658,11 @@ Influx writer (wide mode) also consumes `manager.device_config`:
   - `status`: str | null
   - `error`: str | dict | null
   - `result_json`: str
+  - `request_id`: any | null (optional)
+  - `caller_process_id`: str | null (optional)
+  - `source_kind`: str
+  - `source_id`: str | null
+  - `is_remote_target`: bool
   - `ts`: {`t_wall`, `t_mono`}
 
 ### `manager.log`

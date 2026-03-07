@@ -4,6 +4,9 @@ instance_id: dummy-frequency-trace-sequencer
 manager:
   auto_connect_on_register: true
   interceptor_rpc_timeout_ms: 500
+  command_journal:
+    enabled: true
+    path: .state/command_journal.sqlite3
 
 devices:
   dirs:

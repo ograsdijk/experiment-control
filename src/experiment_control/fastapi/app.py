@@ -32,6 +32,8 @@ class DeviceCommandRequest(BaseModel):
     action: str
     params: dict[str, Any] = Field(default_factory=dict)
     request_id: str | None = None
+    source_kind: str | None = None
+    source_id: str | None = None
 
 
 class DeviceRestartRequest(BaseModel):
@@ -42,6 +44,8 @@ class ProcessCommandRequest(BaseModel):
     action: str
     params: dict[str, Any] = Field(default_factory=dict)
     request_id: str | None = None
+    source_kind: str | None = None
+    source_id: str | None = None
 
 
 class InstanceCleanupRequest(BaseModel):
@@ -110,6 +114,27 @@ def _ensure_error_shape(resp: Any) -> dict[str, Any]:
     return resp
 
 
+def _command_source_fields(
+    request: Request,
+    *,
+    source_kind: str | None = None,
+    source_id: str | None = None,
+) -> dict[str, str]:
+    kind = str(source_kind or "").strip()
+    if not kind:
+        kind = str(request.headers.get("x-ec-source-kind", "") or "").strip()
+    if not kind:
+        kind = "webui"
+
+    ident = str(source_id or "").strip()
+    if not ident:
+        ident = str(request.headers.get("x-ec-source-id", "") or "").strip()
+    if not ident:
+        ident = "fastapi"
+
+    return {"source_kind": kind, "source_id": ident}
+
+
 def _normalize_command_response(resp: Any) -> dict[str, Any]:
     resp = _ensure_error_shape(resp)
     if "ok" in resp:
@@ -168,6 +193,36 @@ async def _fetch_manager_identity(router: RouterRpcClient) -> dict[str, Any] | N
     if not isinstance(result, dict):
         return None
     return result
+
+
+async def _lookup_process_status(process_id: str) -> dict[str, Any] | None:
+    payload = {"type": "process.list_status"}
+    try:
+        resp = await asyncio.to_thread(app.state.router.request, payload)
+    except Exception:
+        return None
+    shaped = _ensure_error_shape(resp)
+    if not shaped.get("ok"):
+        return None
+    result = shaped.get("result")
+    if not isinstance(result, list):
+        return None
+    pid = str(process_id or "").strip()
+    if not pid:
+        return None
+    for item in result:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("process_id", "")).strip() == pid:
+            return item
+    return None
+
+
+def _process_rpc_registered(status: dict[str, Any]) -> bool:
+    if "registered" in status:
+        return bool(status.get("registered"))
+    rpc_endpoint = status.get("rpc_endpoint")
+    return isinstance(rpc_endpoint, str) and bool(rpc_endpoint.strip())
 
 
 async def _fetch_instance_runtime_status(
@@ -470,6 +525,14 @@ def _parse_trace_average_mode(raw: Any) -> str:
     if value == "rolling":
         return "rolling"
     return "block"
+
+
+def _parse_csv_query_list(raw: Any) -> list[str] | None:
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    values = [part.strip() for part in text.split(",") if part.strip()]
+    return values if values else None
 
 
 def _parse_channel_index(raw: Any) -> int:
@@ -816,6 +879,13 @@ async def list_devices() -> dict[str, Any]:
     return _ensure_error_shape(resp)
 
 
+@app.get("/api/snapshots/telemetry")
+async def telemetry_snapshot() -> dict[str, Any]:
+    payload = {"type": "telemetry.snapshot"}
+    resp = await asyncio.to_thread(app.state.router.request, payload)
+    return _ensure_error_shape(resp)
+
+
 @app.get("/api/streams")
 async def list_streams() -> dict[str, Any]:
     payload = {"type": "device.config.list"}
@@ -879,26 +949,34 @@ async def list_streams() -> dict[str, Any]:
 
 
 @app.get("/api/devices/{device_id}/capabilities")
-async def device_capabilities(device_id: str) -> dict[str, Any]:
+async def device_capabilities(device_id: str, request: Request) -> dict[str, Any]:
     payload = {
         "type": "command",
         "device_id": device_id,
         "action": "capabilities",
         "params": {},
         "request_id": uuid.uuid4().hex,
+        **_command_source_fields(request),
     }
     resp = await asyncio.to_thread(app.state.router.request, payload)
     return _normalize_command_response(resp)
 
 
 @app.post("/api/devices/{device_id}/call")
-async def device_call(device_id: str, req: DeviceCommandRequest) -> dict[str, Any]:
+async def device_call(
+    device_id: str, req: DeviceCommandRequest, request: Request
+) -> dict[str, Any]:
     payload = {
         "type": "command",
         "device_id": device_id,
         "action": req.action,
         "params": req.params,
         "request_id": req.request_id or uuid.uuid4().hex,
+        **_command_source_fields(
+            request,
+            source_kind=req.source_kind,
+            source_id=req.source_id,
+        ),
     }
     resp = await asyncio.to_thread(app.state.router.request, payload)
     return _normalize_command_response(resp)
@@ -946,28 +1024,43 @@ async def list_processes() -> dict[str, Any]:
 
 
 @app.post("/api/processes/{process_id}/start")
-async def process_start(process_id: str) -> dict[str, Any]:
-    payload = {"type": "process.start", "process_id": process_id}
+async def process_start(process_id: str, request: Request) -> dict[str, Any]:
+    payload = {
+        "type": "process.start",
+        "process_id": process_id,
+        **_command_source_fields(request),
+    }
     resp = await asyncio.to_thread(app.state.router.request, payload)
     return _ensure_error_shape(resp)
 
 
 @app.post("/api/processes/{process_id}/stop")
-async def process_stop(process_id: str) -> dict[str, Any]:
-    payload = {"type": "process.stop", "process_id": process_id}
+async def process_stop(process_id: str, request: Request) -> dict[str, Any]:
+    payload = {
+        "type": "process.stop",
+        "process_id": process_id,
+        **_command_source_fields(request),
+    }
     resp = await asyncio.to_thread(app.state.router.request, payload)
     return _ensure_error_shape(resp)
 
 
 @app.post("/api/processes/{process_id}/restart")
-async def process_restart(process_id: str) -> dict[str, Any]:
-    payload = {"type": "process.restart", "process_id": process_id}
+async def process_restart(process_id: str, request: Request) -> dict[str, Any]:
+    payload = {
+        "type": "process.restart",
+        "process_id": process_id,
+        **_command_source_fields(request),
+    }
     resp = await asyncio.to_thread(app.state.router.request, payload)
     return _ensure_error_shape(resp)
 
 
 @app.get("/api/processes/{process_id}/capabilities")
 async def process_capabilities(process_id: str) -> dict[str, Any]:
+    status = await _lookup_process_status(process_id)
+    if isinstance(status, dict) and not _process_rpc_registered(status):
+        return {"ok": False, "error": {"code": "process_rpc_not_ready"}}
     payload = {
         "type": "process.rpc",
         "process_id": process_id,
@@ -983,8 +1076,17 @@ async def process_capabilities(process_id: str) -> dict[str, Any]:
 
 @app.post("/api/processes/{process_id}/call")
 async def process_call(
-    process_id: str, req: ProcessCommandRequest
+    process_id: str, req: ProcessCommandRequest, request: Request
 ) -> dict[str, Any]:
+    if str(req.action or "").strip() == "process.capabilities":
+        status = await _lookup_process_status(process_id)
+        if isinstance(status, dict) and not _process_rpc_registered(status):
+            return {"ok": False, "error": {"code": "process_rpc_not_ready"}}
+    source_fields = _command_source_fields(
+        request,
+        source_kind=req.source_kind,
+        source_id=req.source_id,
+    )
     payload = {
         "type": "process.rpc",
         "process_id": process_id,
@@ -993,6 +1095,7 @@ async def process_call(
             "params": req.params,
             "request_id": req.request_id or uuid.uuid4().hex,
         },
+        **source_fields,
     }
     resp = await asyncio.to_thread(app.state.router.request, payload)
     return _ensure_error_shape(resp)
@@ -1030,6 +1133,28 @@ async def get_stream_workspace(workspace_id: str) -> dict[str, Any]:
     return await _stream_analysis_rpc(
         "stream_analysis.workspace.get",
         {"workspace_id": workspace_id},
+    )
+
+
+@app.get("/api/stream/workspaces/{workspace_id}/snapshot")
+async def get_stream_workspace_snapshot(
+    workspace_id: str, request: Request
+) -> dict[str, Any]:
+    params: dict[str, Any] = {"workspace_id": workspace_id}
+    kinds = _parse_csv_query_list(request.query_params.get("kinds"))
+    if kinds is not None:
+        params["kinds"] = kinds
+    output_ids = _parse_csv_query_list(request.query_params.get("output_ids"))
+    if output_ids is not None:
+        params["output_ids"] = output_ids
+    max_trace_points = _parse_trace_max_points(
+        request.query_params.get("max_trace_points")
+    )
+    if max_trace_points is not None:
+        params["max_trace_points"] = int(max_trace_points)
+    return await _stream_analysis_rpc(
+        "stream_analysis.workspace.snapshot",
+        params,
     )
 
 
@@ -1359,6 +1484,63 @@ async def ws_raw_stream(ws: WebSocket) -> None:
         pass
     finally:
         app.state.stream_hub.unsubscribe(q)
+
+
+@app.get("/api/streams/raw_snapshot")
+async def raw_stream_snapshot(request: Request) -> dict[str, Any]:
+    device_id = str(request.query_params.get("device_id") or "").strip()
+    stream = str(request.query_params.get("stream") or "").strip()
+    if not device_id or not stream:
+        return {
+            "ok": False,
+            "error": {
+                "code": "invalid_params",
+                "message": "device_id and stream are required",
+            },
+        }
+
+    channel_index = _parse_channel_index(request.query_params.get("channel_index"))
+    trace_decimator = _parse_trace_decimator(request.query_params.get("trace_decimator"))
+    trace_max_points = _parse_trace_max_points(request.query_params.get("trace_max_points"))
+
+    frame_msg = app.state.stream_hub.get_latest_frame(
+        device_id=device_id,
+        stream=stream,
+    )
+    if not isinstance(frame_msg, dict):
+        return {"ok": True, "result": None}
+    payload = frame_msg.get("payload")
+    if not isinstance(payload, dict):
+        return {"ok": True, "result": None}
+    shape = _normalize_shape(payload.get("shape"))
+    arr = _coerce_stream_values_array(payload.get("values"), shape)
+    if arr is None:
+        return {"ok": True, "result": None}
+    trace = _select_trace_from_array(arr, channel_index)
+    if trace_max_points is not None:
+        trace_values = _decimate_trace_values(
+            trace,
+            mode=trace_decimator,
+            max_points=trace_max_points,
+        )
+    else:
+        trace_values = trace.tolist()
+    if not isinstance(trace_values, list):
+        return {"ok": True, "result": None}
+    out_payload: dict[str, Any] = dict(payload)
+    out_payload["shape"] = [len(trace_values)]
+    out_payload["values"] = trace_values
+    out_payload["channel_index"] = int(channel_index)
+    out_payload["point_count"] = len(trace_values)
+    if trace_max_points is not None and len(trace_values) < int(trace.size):
+        out_payload["decimated"] = True
+    return {
+        "ok": True,
+        "result": {
+            "topic": str(frame_msg.get("topic") or "manager.stream_frame"),
+            "payload": out_payload,
+        },
+    }
 
 
 @app.websocket("/ws/stream/{workspace_id}")

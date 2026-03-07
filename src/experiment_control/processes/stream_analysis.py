@@ -2212,6 +2212,7 @@ class StreamAnalysisProcess(ManagedProcessBase):
         self._telemetry_history: dict[tuple[str, str], list[tuple[float, float]]] = {}
         self._telemetry_history_max_points = 4096
         self._telemetry_history_max_age_s = 300.0
+        self._latest_output_payloads: dict[tuple[str, str], Json] = {}
 
         self._processed_updates = 0
         self._dropped_updates = 0
@@ -2329,6 +2330,7 @@ class StreamAnalysisProcess(ManagedProcessBase):
     def _clear_workspaces(self, *, mark_dirty: bool, publish: bool) -> list[str]:
         removed = sorted(self._workspaces.keys())
         self._workspaces.clear()
+        self._latest_output_payloads.clear()
         for key in list(self._trace_writers.keys()):
             self._drop_trace_writer(key)
         self._trace_writers.clear()
@@ -2608,6 +2610,7 @@ class StreamAnalysisProcess(ManagedProcessBase):
                     runtime.node_state[node_id] = FitCurve1DState.from_params(node.params)
 
         self._workspaces[compiled.workspace_id] = runtime
+        self._prune_workspace_snapshot_outputs(runtime)
         self._rebuild_stream_index()
         self._reconcile_trace_writers()
         if mark_dirty and self._workspace_store_path is not None:
@@ -2640,6 +2643,7 @@ class StreamAnalysisProcess(ManagedProcessBase):
                     ),
                 )
         removed = self._workspaces.pop(workspace_id, None)
+        self._clear_workspace_snapshot_outputs(workspace_id)
         self._reconcile_trace_writers()
         self._hist_last_emit_mono.pop(workspace_id, None)
         self._trace_last_emit_mono.pop(workspace_id, None)
@@ -2683,6 +2687,151 @@ class StreamAnalysisProcess(ManagedProcessBase):
     @staticmethod
     def _trace_writer_key(workspace_id: str, output_id: str) -> tuple[str, str]:
         return (str(workspace_id).strip(), str(output_id).strip())
+
+    @staticmethod
+    def _snapshot_output_key(workspace_id: str, output_id: str) -> tuple[str, str]:
+        return (str(workspace_id).strip(), str(output_id).strip())
+
+    def _remember_latest_output(self, payload: Json) -> None:
+        workspace_id = _normalize_id(payload.get("workspace_id"))
+        output_id = _normalize_id(payload.get("output_id"))
+        if workspace_id is None or output_id is None:
+            return
+        self._latest_output_payloads[self._snapshot_output_key(workspace_id, output_id)] = (
+            _sanitize_json(dict(payload))
+        )
+
+    def _clear_workspace_snapshot_outputs(
+        self, workspace_id: str, *, node_id: str | None = None
+    ) -> None:
+        workspace_id_text = str(workspace_id).strip()
+        if not workspace_id_text:
+            return
+        if node_id is None:
+            keys = [
+                key
+                for key in self._latest_output_payloads.keys()
+                if key[0] == workspace_id_text
+            ]
+            for key in keys:
+                self._latest_output_payloads.pop(key, None)
+            return
+        node_id_text = str(node_id).strip()
+        if not node_id_text:
+            return
+        keys = []
+        for key, payload in self._latest_output_payloads.items():
+            if key[0] != workspace_id_text:
+                continue
+            if str(payload.get("node_id") or "").strip() != node_id_text:
+                continue
+            keys.append(key)
+        for key in keys:
+            self._latest_output_payloads.pop(key, None)
+
+    def _prune_workspace_snapshot_outputs(self, workspace: WorkspaceRuntime) -> None:
+        workspace_id = workspace.compiled.workspace_id
+        valid_ids = {str(out.output_id) for out in workspace.compiled.outputs}
+        keys = [
+            key
+            for key in self._latest_output_payloads.keys()
+            if key[0] == workspace_id and key[1] not in valid_ids
+        ]
+        for key in keys:
+            self._latest_output_payloads.pop(key, None)
+
+    @staticmethod
+    def _normalize_snapshot_filter_set(raw: Any) -> set[str] | None:
+        if raw is None:
+            return None
+        values: set[str] = set()
+        if isinstance(raw, str):
+            for part in raw.split(","):
+                text = part.strip()
+                if text:
+                    values.add(text)
+        elif isinstance(raw, list):
+            for item in raw:
+                text = str(item or "").strip()
+                if text:
+                    values.add(text)
+        else:
+            text = str(raw or "").strip()
+            if text:
+                values.add(text)
+        return values if values else None
+
+    @staticmethod
+    def _snapshot_trace_max_points(raw: Any) -> int | None:
+        if raw is None:
+            return None
+        parsed = _normalize_int(raw)
+        if parsed is None or parsed <= 0:
+            return None
+        return max(32, min(20000, int(parsed)))
+
+    @staticmethod
+    def _decimate_snapshot_trace(values_raw: Any, *, max_points: int) -> list[float] | None:
+        trace = _coerce_trace(values_raw)
+        if trace is None:
+            return None
+        if trace.size <= int(max_points):
+            return trace.astype(np.float64, copy=False).reshape(-1).tolist()
+        step = max(1, int(math.ceil(float(trace.size) / float(max_points))))
+        decimated = trace.reshape(-1)[::step]
+        if decimated.size > 0 and float(decimated[-1]) != float(trace.reshape(-1)[-1]):
+            decimated = np.concatenate([decimated, trace.reshape(-1)[-1:]])
+        if decimated.size > int(max_points):
+            decimated = decimated[: int(max_points)]
+        return decimated.astype(np.float64, copy=False).tolist()
+
+    def _workspace_snapshot_payload(self, params: Json) -> Json:
+        workspace_id = _normalize_id(params.get("workspace_id"))
+        if workspace_id is None:
+            raise ValueError("workspace_id is required")
+        workspace = self._workspaces.get(workspace_id)
+        if workspace is None:
+            raise KeyError(workspace_id)
+
+        kinds_filter = self._normalize_snapshot_filter_set(params.get("kinds"))
+        output_ids_filter = self._normalize_snapshot_filter_set(params.get("output_ids"))
+        max_trace_points = self._snapshot_trace_max_points(params.get("max_trace_points"))
+
+        outputs: list[Json] = []
+        for output in workspace.compiled.outputs:
+            if output_ids_filter is not None and output.output_id not in output_ids_filter:
+                continue
+            key = self._snapshot_output_key(workspace_id, output.output_id)
+            cached = self._latest_output_payloads.get(key)
+            if not isinstance(cached, dict):
+                continue
+            kind = str(cached.get("kind") or output.kind).strip()
+            if kinds_filter is not None and kind not in kinds_filter:
+                continue
+            item = _sanitize_json(dict(cached))
+            if kind == "trace" and max_trace_points is not None:
+                values = self._decimate_snapshot_trace(
+                    item.get("value"), max_points=max_trace_points
+                )
+                if values is None:
+                    continue
+                original_values = item.get("value")
+                original_len = (
+                    len(original_values) if isinstance(original_values, list) else len(values)
+                )
+                item["value"] = values
+                item["point_count"] = int(len(values))
+                if int(original_len) > int(len(values)):
+                    item["truncated"] = True
+            outputs.append(item)
+
+        return {
+            "workspace_id": workspace_id,
+            "revision": int(workspace.revision),
+            "etag": str(workspace.etag),
+            "outputs": outputs,
+            "generated_ts": {"t_wall": time.time(), "t_mono": time.monotonic()},
+        }
 
     def _active_trace_output_keys(self) -> set[tuple[str, str]]:
         active: set[tuple[str, str]] = set()
@@ -3391,6 +3540,29 @@ class StreamAnalysisProcess(ManagedProcessBase):
                 descriptor["context_id"] = int(context_id)
             if context_fields:
                 descriptor["context_fields"] = _sanitize_json(dict(context_fields))
+            snapshot_payload: Json = {
+                "version": 1,
+                "workspace_id": workspace_id,
+                "output_id": output_id,
+                "node_id": node_id,
+                "kind": "trace",
+                "device_id": device_id,
+                "stream": stream,
+                "seq": int(trace_seq),
+                "t0_mono_ns": t0_mono_out,
+                "t0_wall_ns": t0_wall_out,
+                "channel_index": int(output.get("channel_index", 0) or 0),
+                "channel_count": int(output.get("channel_count", 1) or 1),
+                "value": trace.astype(np.float64, copy=False).reshape(-1).tolist(),
+                "point_count": int(trace.size),
+            }
+            if bool(output.get("truncated")):
+                snapshot_payload["truncated"] = True
+            if context_id is not None:
+                snapshot_payload["context_id"] = int(context_id)
+            if context_fields:
+                snapshot_payload["context_fields"] = _sanitize_json(dict(context_fields))
+            self._remember_latest_output(snapshot_payload)
             self._publish_manager_event(
                 topic="manager.stream_analysis.trace_ready",
                 payload=descriptor,
@@ -3410,6 +3582,7 @@ class StreamAnalysisProcess(ManagedProcessBase):
             payload["context_id"] = int(context_id)
         if context_fields:
             payload["context_fields"] = _sanitize_json(dict(context_fields))
+        self._remember_latest_output(payload)
 
         self._publish_manager_event(
             topic="manager.stream_analysis.output",
@@ -3744,6 +3917,16 @@ class StreamAnalysisProcess(ManagedProcessBase):
                         doc="Get workspace config and summary.",
                     ),
                     method(
+                        "stream_analysis.workspace.snapshot",
+                        params=[
+                            param("workspace_id", required=True, default=None, annotation="str"),
+                            param("kinds", required=False, default=None, annotation="list[str]|str"),
+                            param("output_ids", required=False, default=None, annotation="list[str]|str"),
+                            param("max_trace_points", required=False, default=None, annotation="int"),
+                        ],
+                        doc="Get latest published outputs for a workspace (latest-state snapshot).",
+                    ),
+                    method(
                         "stream_analysis.workspace.put",
                         params=[
                             param(
@@ -3853,6 +4036,19 @@ class StreamAnalysisProcess(ManagedProcessBase):
                     },
                 }
 
+            if rtype == "stream_analysis.workspace.snapshot":
+                try:
+                    snapshot = self._workspace_snapshot_payload(params)
+                except ValueError as exc:
+                    return self._rpc_invalid_params(req, message=str(exc))
+                except KeyError:
+                    return self._rpc_err(req, code="unknown_workspace")
+                return {
+                    "request_id": request_id,
+                    "ok": True,
+                    "result": snapshot,
+                }
+
             if rtype == "stream_analysis.workspace.validate":
                 result = self._handle_workspace_validate(params)
                 if not result.get("ok"):
@@ -3910,6 +4106,7 @@ class StreamAnalysisProcess(ManagedProcessBase):
                         )
                     for workspace in self._workspaces.values():
                         self._reset_workspace_states(workspace)
+                    self._latest_output_payloads.clear()
                     return {
                         "request_id": request_id,
                         "ok": True,
@@ -3922,12 +4119,16 @@ class StreamAnalysisProcess(ManagedProcessBase):
                     ok = self._reset_workspace_node_state(workspace, node_id)
                     if not ok:
                         return self._rpc_err(req, code="unknown_or_non_stateful_node")
+                    self._clear_workspace_snapshot_outputs(
+                        workspace_id, node_id=node_id
+                    )
                     return {
                         "request_id": request_id,
                         "ok": True,
                         "result": {"reset": workspace_id, "node_id": node_id},
                     }
                 self._reset_workspace_states(workspace)
+                self._clear_workspace_snapshot_outputs(workspace_id)
                 return {
                     "request_id": request_id,
                     "ok": True,
@@ -4032,6 +4233,7 @@ class StreamAnalysisProcess(ManagedProcessBase):
         self._stream_context.clear()
         self._context_by_seq.clear()
         self._telemetry_history.clear()
+        self._latest_output_payloads.clear()
 
         try:
             self._sub.setsockopt(zmq.LINGER, 0)

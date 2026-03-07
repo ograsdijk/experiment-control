@@ -252,6 +252,7 @@ class StreamFrameHub:
             tuple[str, str], dict[int, tuple[int | None, dict[str, Any] | None]]
         ] = {}
         self._context_cache_limit = 8192
+        self._latest_frame: dict[tuple[str, str], dict[str, Any]] = {}
 
     def start(self, loop: asyncio.AbstractEventLoop) -> None:
         if self._thread is not None:
@@ -276,6 +277,7 @@ class StreamFrameHub:
         self._last_seq.clear()
         self._stream_context.clear()
         self._context_by_seq.clear()
+        self._latest_frame.clear()
 
     def subscribe(self, *, maxsize: int = 100) -> asyncio.Queue:
         q: asyncio.Queue = asyncio.Queue(maxsize=maxsize)
@@ -286,6 +288,16 @@ class StreamFrameHub:
     def unsubscribe(self, q: asyncio.Queue) -> None:
         with self._lock:
             self._queues.discard(q)
+
+    def get_latest_frame(self, *, device_id: str, stream: str) -> dict[str, Any] | None:
+        key = (str(device_id).strip(), str(stream).strip())
+        if not key[0] or not key[1]:
+            return None
+        with self._lock:
+            latest = self._latest_frame.get(key)
+            if latest is None:
+                return None
+            return _sanitize_json(dict(latest))
 
     def _fanout(self, msg: dict[str, Any]) -> None:
         with self._lock:
@@ -522,6 +534,13 @@ class StreamFrameHub:
                     context_fields=event_context_fields,
                 )
                 if msg is not None and self._loop is not None:
+                    payload_obj = msg.get("payload")
+                    if isinstance(payload_obj, dict):
+                        with self._lock:
+                            self._latest_frame[key] = {
+                                "topic": str(msg.get("topic") or "manager.stream_frame"),
+                                "payload": _sanitize_json(dict(payload_obj)),
+                            }
                     self._loop.call_soon_threadsafe(self._fanout, msg)
 
             self._last_seq[key] = latest_seq

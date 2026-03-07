@@ -123,6 +123,116 @@ def _parse_tui(raw: Json) -> Json:
     return tui
 
 
+def _parse_command_journal(
+    *,
+    manager_raw: Json,
+    base_dir: Path,
+    instance_id: str,
+) -> Json:
+    raw = manager_raw.get("command_journal")
+    if raw is None:
+        return {
+            "enabled": False,
+            "path": None,
+            "queue_max": 10_000,
+            "batch_size": 200,
+            "flush_interval_ms": 200,
+            "retention_max_rows": 1_000_000,
+            "retention_max_age_days": None,
+        }
+    if not isinstance(raw, dict):
+        raise ConfigError("manager.command_journal", "must be a dict")
+
+    enabled = raw.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise ConfigError("manager.command_journal.enabled", "must be a bool")
+
+    path_value = raw.get("path")
+    if path_value is None:
+        path = base_dir / ".state" / str(instance_id) / "command_journal.sqlite3"
+    else:
+        if not isinstance(path_value, str) or not path_value.strip():
+            raise ConfigError(
+                "manager.command_journal.path",
+                "must be a non-empty string",
+            )
+        path = Path(path_value.strip()).expanduser()
+        if not path.is_absolute():
+            path = base_dir / path
+
+    def parse_int(name: str, default: int, min_value: int) -> int:
+        value = raw.get(name, default)
+        try:
+            parsed = int(value)
+        except Exception as e:
+            raise ConfigError(
+                f"manager.command_journal.{name}",
+                f"must be an int: {e}",
+            ) from e
+        if parsed < min_value:
+            raise ConfigError(
+                f"manager.command_journal.{name}",
+                f"must be >= {min_value}",
+            )
+        return parsed
+
+    queue_max = parse_int("queue_max", 10_000, 100)
+    batch_size = parse_int("batch_size", 200, 1)
+    flush_interval_ms = parse_int("flush_interval_ms", 200, 10)
+
+    retention_raw = raw.get("retention", {})
+    if retention_raw is None:
+        retention_raw = {}
+    if not isinstance(retention_raw, dict):
+        raise ConfigError("manager.command_journal.retention", "must be a dict")
+
+    retention_max_rows_raw = retention_raw.get("max_rows", 1_000_000)
+    retention_max_rows: int | None
+    if retention_max_rows_raw is None:
+        retention_max_rows = None
+    else:
+        try:
+            retention_max_rows = int(retention_max_rows_raw)
+        except Exception as e:
+            raise ConfigError(
+                "manager.command_journal.retention.max_rows",
+                f"must be an int or null: {e}",
+            ) from e
+        if retention_max_rows < 1_000:
+            raise ConfigError(
+                "manager.command_journal.retention.max_rows",
+                "must be >= 1000",
+            )
+
+    retention_max_age_days_raw = retention_raw.get("max_age_days")
+    retention_max_age_days: float | None
+    if retention_max_age_days_raw is None:
+        retention_max_age_days = None
+    else:
+        try:
+            retention_max_age_days = float(retention_max_age_days_raw)
+        except Exception as e:
+            raise ConfigError(
+                "manager.command_journal.retention.max_age_days",
+                f"must be a float or null: {e}",
+            ) from e
+        if retention_max_age_days <= 0:
+            raise ConfigError(
+                "manager.command_journal.retention.max_age_days",
+                "must be > 0",
+            )
+
+    return {
+        "enabled": enabled,
+        "path": path.resolve(),
+        "queue_max": queue_max,
+        "batch_size": batch_size,
+        "flush_interval_ms": flush_interval_ms,
+        "retention_max_rows": retention_max_rows,
+        "retention_max_age_days": retention_max_age_days,
+    }
+
+
 def _order_processes(
     process_ids: list[str], order_list: list[str] | None
 ) -> list[str]:
@@ -179,6 +289,22 @@ def _wait_for_exit(proc: subprocess.Popen[str], timeout_s: float) -> None:
         proc.wait(timeout=3.0)
     except Exception:
         pass
+
+
+def _emit_lifecycle_startup_summary(
+    *,
+    mode: str,
+    cleanup_orphans: bool,
+    instance_lock: bool,
+    preflight_ran: bool,
+) -> None:
+    cleanup_mode = "on" if cleanup_orphans else "off"
+    lock_mode = "on" if instance_lock else "off"
+    preflight_mode = "run" if preflight_ran else "skip"
+    sys.stderr.write(
+        "[run_stack] lifecycle: "
+        f"mode={mode} cleanup={cleanup_mode} lock={lock_mode} preflight={preflight_mode}\n"
+    )
 
 
 def _probe_manager_ready(
@@ -381,12 +507,21 @@ def main(argv: list[str] | None = None) -> None:
         manager_raw = optional_dict(raw.get("manager"), path=["manager"])
         manager_network = resolve_manager_network(manager_raw)
         tui_raw = _parse_tui(raw)
-        if tui_raw.get("enabled") and not ns.no_tui:
+        run_tui_mode = bool(tui_raw.get("enabled")) and not bool(ns.no_tui)
+        preflight_ran = False
+        if run_tui_mode:
             if bool(ns.cleanup_orphans):
                 _preflight_instance_cleanup(
                     instance_id=instance_id,
                     manager_rpc=manager_network.local_rpc_connect,
                 )
+                preflight_ran = True
+            _emit_lifecycle_startup_summary(
+                mode="tui",
+                cleanup_orphans=bool(ns.cleanup_orphans),
+                instance_lock=bool(ns.instance_lock),
+                preflight_ran=preflight_ran,
+            )
             _run_with_tui(
                 instance_id=instance_id,
                 stack_path=stack_path,
@@ -401,6 +536,13 @@ def main(argv: list[str] | None = None) -> None:
                 instance_id=instance_id,
                 manager_rpc=manager_network.local_rpc_connect,
             )
+            preflight_ran = True
+        _emit_lifecycle_startup_summary(
+            mode="headless",
+            cleanup_orphans=bool(ns.cleanup_orphans),
+            instance_lock=bool(ns.instance_lock),
+            preflight_ran=preflight_ran,
+        )
         instance_lock: InstanceLock | _NoopInstanceLock
         if bool(ns.instance_lock):
             instance_lock = InstanceLock(
@@ -417,6 +559,11 @@ def main(argv: list[str] | None = None) -> None:
         try:
 
             base_dir = stack_path.parent
+            command_journal = _parse_command_journal(
+                manager_raw=manager_raw,
+                base_dir=base_dir,
+                instance_id=instance_id,
+            )
             device_paths = _collect_config_paths(
                 raw.get("devices"), base=base_dir, label="devices"
             )
@@ -458,6 +605,17 @@ def main(argv: list[str] | None = None) -> None:
                 auto_connect_on_register=bool(
                     manager_raw.get("auto_connect_on_register", True)
                 ),
+                command_journal_enabled=bool(command_journal["enabled"]),
+                command_journal_path=command_journal["path"],
+                command_journal_queue_max=int(command_journal["queue_max"]),
+                command_journal_batch_size=int(command_journal["batch_size"]),
+                command_journal_flush_interval_ms=int(
+                    command_journal["flush_interval_ms"]
+                ),
+                command_journal_retention_max_rows=command_journal["retention_max_rows"],
+                command_journal_retention_max_age_days=command_journal[
+                    "retention_max_age_days"
+                ],
             )
 
             process_manager_rpc = manager_network.local_rpc_connect
