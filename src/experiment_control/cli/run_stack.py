@@ -18,6 +18,11 @@ from ..utils.config_parsing import (
     require_dict,
     require_str,
 )
+from ..utils.logging_levels import (
+    LOG_SEVERITY_NAMES,
+    is_valid_log_severity,
+    normalize_log_severity,
+)
 from ..utils.instance_lock import InstanceLock, InstanceLockActiveError
 from ..utils.manager_network import ManagerNetworkConfig, resolve_manager_network
 from ..utils.process_lifecycle import cleanup_orphan_children
@@ -263,14 +268,12 @@ def _parse_manager_logging(
         text = str(min_level_value).strip().lower()
         if not text:
             raise ConfigError("manager.logging.min_level", "must be a non-empty string")
-        if text == "warn":
-            text = "warning"
-        if text not in {"debug", "info", "warning", "error", "critical"}:
+        if not is_valid_log_severity(text):
             raise ConfigError(
                 "manager.logging.min_level",
-                "must be one of: debug, info, warning, error, critical",
+                f"must be one of: {', '.join(LOG_SEVERITY_NAMES)}",
             )
-        min_level = text
+        min_level = normalize_log_severity(text, default="error")
 
     return {
         "stderr": stderr_value,

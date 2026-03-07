@@ -51,6 +51,11 @@ from .utils.instance_lock import (
     lock_effective_status_help,
     read_instance_lock_status,
 )
+from .utils.logging_levels import (
+    is_valid_log_severity,
+    normalize_log_severity,
+    severity_rank,
+)
 from .utils.yaml_helpers import load_yaml_file
 from .utils.zmq_helpers import json_dumps, safe_json_loads
 
@@ -4568,12 +4573,7 @@ class Manager:
 
     @staticmethod
     def _normalize_log_severity(raw: Any) -> str:
-        sev = str(raw or "info").strip().lower()
-        if sev == "warn":
-            return "warning"
-        if sev not in {"debug", "info", "warning", "error", "critical"}:
-            return "info"
-        return sev
+        return normalize_log_severity(raw, default="info")
 
     @staticmethod
     def _parse_boolish(raw: Any, *, default: bool) -> bool:
@@ -4615,22 +4615,13 @@ class Manager:
         text = str(value or "").strip().lower()
         if not text:
             return "error"
-        normalized = self._normalize_log_severity(text)
-        if normalized == "info" and text not in {"info"}:
+        if not is_valid_log_severity(text):
             return "error"
-        return normalized
+        return normalize_log_severity(text, default="error")
 
     @staticmethod
     def _severity_rank(raw: Any) -> int:
-        sev = Manager._normalize_log_severity(raw)
-        table = {
-            "debug": 10,
-            "info": 20,
-            "warning": 30,
-            "error": 40,
-            "critical": 50,
-        }
-        return table.get(sev, 20)
+        return severity_rank(raw, default="info")
 
     def _open_manager_log_sink_file(self) -> None:
         path = self._manager_log_file_path

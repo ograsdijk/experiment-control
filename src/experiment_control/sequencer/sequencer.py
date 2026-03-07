@@ -13,6 +13,7 @@ import zmq
 from ..capabilities import capabilities_payload, method, param
 from ..utils.yaml_helpers import load_yaml_text
 from ..utils.zmq_helpers import safe_json_loads
+from ..utils.logging_levels import normalize_log_severity as normalize_log_level
 from .eval import render_templates, to_attrdict
 from .ranges import generate_from_gen
 from ..utils.cli_args import (
@@ -64,10 +65,7 @@ _DRIVER_BUILTIN_ACTIONS = {
 
 
 def _normalize_log_severity(raw: Any) -> str:
-    severity = str(raw or "").strip().lower()
-    if severity in {"warn", "warning"}:
-        return "warning"
-    return severity
+    return normalize_log_level(raw, default="info")
 
 
 def _should_trigger_external_sequencer_fault(entry: Json) -> tuple[bool, str | None]:

@@ -18,6 +18,7 @@ from textual.reactive import reactive
 from textual.screen import ModalScreen
 from textual.widgets import DataTable, Footer, Header, Input, Label, RichLog, Static
 
+from .utils.logging_levels import normalize_log_severity, severity_rank
 from .utils.zmq_helpers import json_dumps, safe_json_loads
 
 Json = dict[str, Any]
@@ -791,24 +792,11 @@ class ManagerTUI(App):
 
     @staticmethod
     def _normalize_log_severity(raw: Any) -> str:
-        sev = str(raw or "info").strip().lower()
-        if sev == "warn":
-            return "warning"
-        if sev not in {"debug", "info", "warning", "error", "critical"}:
-            return "info"
-        return sev
+        return normalize_log_severity(raw, default="info")
 
     @staticmethod
     def _severity_rank(raw: Any) -> int:
-        sev = ManagerTUI._normalize_log_severity(raw)
-        table = {
-            "debug": 10,
-            "info": 20,
-            "warning": 30,
-            "error": 40,
-            "critical": 50,
-        }
-        return table.get(sev, 20)
+        return severity_rank(raw, default="info")
 
     def _remember_error_fingerprint(self, fingerprint: str) -> bool:
         if fingerprint in self._seen_error_fingerprints:

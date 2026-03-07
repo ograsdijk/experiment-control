@@ -29,6 +29,7 @@ from ..utils.cli_args import (
     add_rpc_timeout_arg,
 )
 from ..utils.value_coercion import coerce_scalar
+from ..utils.logging_levels import normalize_log_severity
 from ..utils.yaml_helpers import load_yaml_file
 from ..utils.zmq_helpers import json_dumps, json_loads, safe_json_loads
 from .process_base import ManagedProcessBase
@@ -513,12 +514,7 @@ class HdfWriter(ManagedProcessBase):
 
     @staticmethod
     def _normalize_log_severity(raw: Any) -> str:
-        sev = str(raw or "info").strip().lower()
-        if sev == "warn":
-            return "warning"
-        if sev not in {"debug", "info", "warning", "error", "critical"}:
-            return "info"
-        return sev
+        return normalize_log_severity(raw, default="info")
 
     def _known_devices(self) -> list[str]:
         known = set(self._device_map)
