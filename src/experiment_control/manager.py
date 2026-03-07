@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import datetime
 import importlib
 import importlib.util
 import json
@@ -15,7 +16,7 @@ from collections import deque
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, TextIO
 
 import zmq
 
@@ -558,6 +559,9 @@ class Manager:
         command_journal_flush_interval_ms: int = 200,
         command_journal_retention_max_rows: int | None = 1_000_000,
         command_journal_retention_max_age_days: float | None = None,
+        manager_log_stderr: bool | None = None,
+        manager_log_file: str | Path | None = None,
+        manager_log_min_level: str | None = None,
     ) -> None:
         instance_id_text = str(
             instance_id or os.environ.get("EXPERIMENT_CONTROL_INSTANCE_ID", "")
@@ -675,6 +679,24 @@ class Manager:
                 self._command_journal = None
                 self._command_journal_enabled = False
                 self._command_journal_start_error = str(e)
+
+        self._manager_log_stderr_enabled = self._resolve_manager_log_stderr_enabled(
+            manager_log_stderr
+        )
+        self._manager_log_min_level = self._resolve_manager_log_min_level(
+            manager_log_min_level
+        )
+        self._manager_log_min_level_rank = self._severity_rank(
+            self._manager_log_min_level
+        )
+        self._manager_log_file_path = self._resolve_manager_log_file_path(
+            manager_log_file
+        )
+        self._manager_log_file: TextIO | None = None
+        self._manager_log_sink_recent: dict[str, float] = {}
+        self._manager_log_sink_recent_window_s = 0.5
+        self._manager_log_sink_recent_max = 256
+        self._open_manager_log_sink_file()
 
         # Latest fast-data descriptor cache: (device_id -> stream_name -> descriptor json)
         self._latest_chunk_desc: dict[str, dict[str, Json]] = {}
@@ -1998,6 +2020,7 @@ class Manager:
                 journal.close(timeout_s=2.0)
             except Exception:
                 pass
+        self._close_manager_log_sink_file()
         try:
             self._registry_rep.close(0)
         except Exception:
@@ -4369,6 +4392,7 @@ class Manager:
             hook(topic, payload)
         if topic != "manager.log":
             self._maybe_publish_log_event(topic, payload)
+        self._maybe_emit_manager_log_sink(topic, payload)
 
     @staticmethod
     def _safe_json(value: Any, *, max_len: int = 4000) -> str:
@@ -4552,6 +4576,51 @@ class Manager:
         return sev
 
     @staticmethod
+    def _parse_boolish(raw: Any, *, default: bool) -> bool:
+        if raw is None:
+            return bool(default)
+        if isinstance(raw, bool):
+            return raw
+        text = str(raw).strip().lower()
+        if not text:
+            return bool(default)
+        if text in {"1", "true", "yes", "on"}:
+            return True
+        if text in {"0", "false", "no", "off"}:
+            return False
+        return bool(default)
+
+    def _resolve_manager_log_stderr_enabled(self, raw: Any) -> bool:
+        if raw is None:
+            return self._parse_boolish(
+                os.environ.get("MANAGER_LOG_STDERR"), default=True
+            )
+        return self._parse_boolish(raw, default=True)
+
+    def _resolve_manager_log_file_path(self, raw: Any) -> Path | None:
+        value = raw
+        if value is None:
+            value = os.environ.get("MANAGER_LOG_FILE")
+        if value is None:
+            return None
+        text = str(value).strip()
+        if not text:
+            return None
+        return Path(text).expanduser()
+
+    def _resolve_manager_log_min_level(self, raw: Any) -> str:
+        value = raw
+        if value is None:
+            value = os.environ.get("MANAGER_LOG_MIN_LEVEL")
+        text = str(value or "").strip().lower()
+        if not text:
+            return "error"
+        normalized = self._normalize_log_severity(text)
+        if normalized == "info" and text not in {"info"}:
+            return "error"
+        return normalized
+
+    @staticmethod
     def _severity_rank(raw: Any) -> int:
         sev = Manager._normalize_log_severity(raw)
         table = {
@@ -4562,6 +4631,128 @@ class Manager:
             "critical": 50,
         }
         return table.get(sev, 20)
+
+    def _open_manager_log_sink_file(self) -> None:
+        path = self._manager_log_file_path
+        if path is None:
+            return
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            self._manager_log_file = path.open("a", encoding="utf-8", buffering=1)
+        except Exception as e:
+            self._manager_log_file = None
+            if self._manager_log_stderr_enabled:
+                try:
+                    sys.stderr.write(
+                        f"[manager][warning] MANAGER_LOG_FILE open failed: {path} ({e})\n"
+                    )
+                    sys.stderr.flush()
+                except Exception:
+                    pass
+
+    def _close_manager_log_sink_file(self) -> None:
+        handle = self._manager_log_file
+        self._manager_log_file = None
+        if handle is None:
+            return
+        try:
+            handle.close()
+        except Exception:
+            pass
+
+    def _manager_log_sink_event(
+        self, topic: str, payload: Json
+    ) -> tuple[str, str, str, str | None, str]:
+        if topic == "manager.log":
+            severity = self._normalize_log_severity(payload.get("severity"))
+            line_topic = self._normalize_topic(str(payload.get("topic") or "manager.log"))
+        elif topic.startswith("manager.") and topic.endswith("_error"):
+            severity = "error"
+            line_topic = self._normalize_topic(topic)
+        else:
+            raise ValueError("not sink-eligible")
+
+        source_kind = self._normalize_id(payload.get("source_kind")) or "manager"
+        source_id = self._normalize_id(payload.get("source_id"))
+        message = payload.get("message")
+        if message is None:
+            message = payload.get("error")
+        text = str(message or "").strip()
+        if not text:
+            payload_json = payload.get("payload_json")
+            if isinstance(payload_json, str) and payload_json.strip():
+                text = payload_json.strip()
+            else:
+                text = self._safe_json(payload)
+        text = text.replace("\r\n", " ").replace("\n", " ").replace("\r", " ").strip()
+        if len(text) > 500:
+            text = text[:497] + "..."
+        return severity, line_topic, source_kind, source_id, text
+
+    def _manager_log_sink_is_duplicate(self, fingerprint: str) -> bool:
+        now = time.monotonic()
+        recent = getattr(self, "_manager_log_sink_recent", None)
+        if not isinstance(recent, dict):
+            recent = {}
+            self._manager_log_sink_recent = recent
+        window_s = float(getattr(self, "_manager_log_sink_recent_window_s", 0.5))
+        max_items = int(getattr(self, "_manager_log_sink_recent_max", 256))
+        prev = recent.get(fingerprint)
+        if prev is not None and (now - prev) <= window_s:
+            return True
+        recent[fingerprint] = now
+        if len(recent) > max_items:
+            cutoff = now - window_s
+            drop = [key for key, ts in recent.items() if ts < cutoff]
+            for key in drop:
+                recent.pop(key, None)
+            if len(recent) > max_items:
+                overflow = len(recent) - max_items
+                for key in list(recent.keys())[:overflow]:
+                    recent.pop(key, None)
+        return False
+
+    def _maybe_emit_manager_log_sink(self, topic: str, payload: Json) -> None:
+        try:
+            severity, line_topic, source_kind, source_id, message = self._manager_log_sink_event(
+                topic, payload
+            )
+        except Exception:
+            return
+        min_rank = int(
+            getattr(self, "_manager_log_min_level_rank", self._severity_rank("error"))
+        )
+        if self._severity_rank(severity) < min_rank:
+            return
+        fingerprint = f"{severity}|{line_topic}|{source_kind}|{source_id}|{message}"
+        if self._manager_log_sink_is_duplicate(fingerprint):
+            return
+        ts = payload.get("ts")
+        t_wall = time.time()
+        if isinstance(ts, dict):
+            try:
+                t_wall = float(ts.get("t_wall", t_wall))
+            except Exception:
+                pass
+        try:
+            dt = datetime.datetime.fromtimestamp(t_wall, tz=datetime.timezone.utc)
+            ts_text = dt.isoformat(timespec="milliseconds")
+        except Exception:
+            ts_text = str(t_wall)
+        source_text = f"{source_kind}:{source_id}" if source_id else source_kind
+        line = f"{ts_text} [{severity.upper()}] {line_topic} {source_text} {message}"
+        if bool(getattr(self, "_manager_log_stderr_enabled", False)):
+            try:
+                sys.stderr.write(line + "\n")
+                sys.stderr.flush()
+            except Exception:
+                pass
+        log_file = getattr(self, "_manager_log_file", None)
+        if log_file is not None:
+            try:
+                log_file.write(line + "\n")
+            except Exception:
+                self._close_manager_log_sink_file()
 
     @staticmethod
     def _normalize_id(raw: Any) -> str | None:

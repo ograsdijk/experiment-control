@@ -2,6 +2,7 @@
 
 import sys
 import io
+import os
 import unittest
 from pathlib import Path
 from contextlib import redirect_stderr
@@ -215,6 +216,69 @@ class TuiStartupWaitTests(unittest.TestCase):
         self.assertEqual(captured_kwargs.get("command_journal_retention_max_rows"), 20000)
         self.assertEqual(captured_kwargs.get("command_journal_retention_max_age_days"), 7.0)
 
+    def test_main_no_tui_passes_manager_logging_settings_to_manager(self) -> None:
+        stack_raw = {
+            "instance_id": "vacuum",
+            "manager": {
+                "logging": {
+                    "stderr": False,
+                    "file": ".state/manager_errors.log",
+                    "min_level": "warning",
+                }
+            },
+            "startup": {
+                "start_devices": False,
+                "start_processes": False,
+                "wait_for_registered": False,
+                "wait_for_online": False,
+            },
+        }
+        manager_network = resolve_manager_network({})
+        captured_kwargs: dict[str, object] = {}
+
+        class _FakeManager:
+            def __init__(self, **kwargs: object) -> None:
+                captured_kwargs.update(kwargs)
+
+            def add_device(self, spec: object) -> None:
+                return
+
+            def add_process(self, spec: object) -> None:
+                return
+
+            def startup_sequence(self, **kwargs: object) -> None:
+                return
+
+            def run_forever(self) -> None:
+                return
+
+        with (
+            mock.patch(
+                "experiment_control.cli.run_stack._load_yaml",
+                return_value=stack_raw,
+            ),
+            mock.patch(
+                "experiment_control.cli.run_stack.resolve_manager_network",
+                return_value=manager_network,
+            ),
+            mock.patch(
+                "experiment_control.cli.run_stack.parse_federation_config",
+                return_value={},
+            ),
+            mock.patch("experiment_control.cli.run_stack.Manager", _FakeManager),
+        ):
+            from experiment_control.cli.run_stack import main
+
+            main(["dummy_stack.yaml", "--no-tui"])
+
+        expected_base = Path("dummy_stack.yaml").expanduser().resolve().parent
+        self.assertEqual(captured_kwargs.get("manager_log_stderr"), False)
+        self.assertEqual(
+            captured_kwargs.get("manager_log_file"),
+            (expected_base / ".state" / "manager_errors.log").resolve(),
+        )
+        self.assertEqual(captured_kwargs.get("manager_log_min_level"), "warning")
+
     def test_run_with_tui_spawns_child_without_opt_in_flags_by_default(self) -> None:
         manager_network = resolve_manager_network({})
         with (
@@ -257,6 +321,34 @@ class TuiStartupWaitTests(unittest.TestCase):
                 )
         cmd = popen_mock.call_args.args[0]
         self.assertIn("--instance-lock", cmd)
+
+    def test_run_with_tui_forces_manager_log_stderr_off_in_child_env(self) -> None:
+        manager_network = resolve_manager_network({})
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"MANAGER_LOG_STDERR": "1", "MANAGER_LOG_FILE": "C:\\tmp\\manager.log"},
+                clear=False,
+            ),
+            mock.patch("experiment_control.cli.run_stack.subprocess.Popen") as popen_mock,
+            mock.patch(
+                "experiment_control.cli.run_stack._wait_for_manager_ready",
+                return_value=(False, "boom"),
+            ),
+            mock.patch("experiment_control.cli.run_stack._wait_for_exit"),
+        ):
+            with self.assertRaises(SystemExit):
+                _run_with_tui(
+                    instance_id="vacuum",
+                    stack_path=Path("dummy_stack.yaml"),
+                    manager_network=manager_network,
+                    tui_raw={},
+                )
+        env = popen_mock.call_args.kwargs.get("env")
+        self.assertIsInstance(env, dict)
+        assert isinstance(env, dict)
+        self.assertEqual(env.get("MANAGER_LOG_STDERR"), "0")
+        self.assertEqual(env.get("MANAGER_LOG_FILE"), "C:\\tmp\\manager.log")
 
     def test_main_with_tui_runs_cleanup_in_parent_before_spawn(self) -> None:
         manager_network = resolve_manager_network({})

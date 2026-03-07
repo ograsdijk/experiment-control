@@ -33,6 +33,12 @@ To serve the React UI from FastAPI:
 - `EXPERIMENT_CONTROL_SERVE_UI=1`
 - `EXPERIMENT_CONTROL_UI_DIST=<path to web/react_ui/dist>` (optional; defaults to repo `web/react_ui/dist`)
 
+Manager error sink env knobs:
+
+- `MANAGER_LOG_STDERR=1|0` (default `1`)
+- `MANAGER_LOG_FILE=<path>` (optional append-only sink)
+- `MANAGER_LOG_MIN_LEVEL=debug|info|warning|error|critical` (default `error`)
+
 For the Linien example, use the helper that reads endpoints from `stack.yaml`:
 
 ```bash
@@ -89,6 +95,10 @@ manager:
     retention:
       max_rows: 1000000
       max_age_days: null
+  logging:
+    stderr: null                       # optional bool override for MANAGER_LOG_STDERR
+    file: null                         # optional path override for MANAGER_LOG_FILE
+    min_level: null                    # optional override for MANAGER_LOG_MIN_LEVEL
 
 devices:
   dirs: [devices]
@@ -134,6 +144,16 @@ Notes:
   addresses (`tcp://127.0.0.1:<port>`) derived from the external ports.
 - `manager.command_journal` is optional and disabled by default. When enabled, command
   execution records are written asynchronously to SQLite.
+- `manager.logging` is optional. If set, these values override `MANAGER_LOG_*` env vars.
+- In TUI mode, the parent launcher forces child manager `MANAGER_LOG_STDERR=0` to avoid
+  terminal rendering conflicts. File sink remains available via `manager.logging.file`
+  or `MANAGER_LOG_FILE`.
+- Manager sink writes:
+  - `manager.log` events (filtered by `min_level`)
+  - `manager.*_error` events (treated as `error` severity)
+- Sink output line format is:
+  - `<utc-iso-timestamp> [<SEVERITY>] <topic> <source_kind[:source_id]> <message>`
+- Rapid duplicate sink lines are de-duplicated in a short window to reduce log spam.
 - Journal scope includes:
   - device commands (`type=command`)
   - process control commands (`process.start`, `process.stop`, `process.restart`)

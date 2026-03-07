@@ -233,6 +233,52 @@ def _parse_command_journal(
     }
 
 
+def _parse_manager_logging(
+    *,
+    manager_raw: Json,
+    base_dir: Path,
+) -> Json:
+    raw = manager_raw.get("logging")
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise ConfigError("manager.logging", "must be a dict")
+
+    stderr_value = raw.get("stderr")
+    if stderr_value is not None and not isinstance(stderr_value, bool):
+        raise ConfigError("manager.logging.stderr", "must be a bool")
+
+    file_value = raw.get("file")
+    file_path: Path | None = None
+    if file_value is not None:
+        if not isinstance(file_value, str) or not file_value.strip():
+            raise ConfigError("manager.logging.file", "must be a non-empty string")
+        file_path = Path(file_value.strip()).expanduser()
+        if not file_path.is_absolute():
+            file_path = base_dir / file_path
+
+    min_level_value = raw.get("min_level")
+    min_level: str | None = None
+    if min_level_value is not None:
+        text = str(min_level_value).strip().lower()
+        if not text:
+            raise ConfigError("manager.logging.min_level", "must be a non-empty string")
+        if text == "warn":
+            text = "warning"
+        if text not in {"debug", "info", "warning", "error", "critical"}:
+            raise ConfigError(
+                "manager.logging.min_level",
+                "must be one of: debug, info, warning, error, critical",
+            )
+        min_level = text
+
+    return {
+        "stderr": stderr_value,
+        "file": file_path.resolve() if file_path is not None else None,
+        "min_level": min_level,
+    }
+
+
 def _order_processes(
     process_ids: list[str], order_list: list[str] | None
 ) -> list[str]:
@@ -466,7 +512,9 @@ def _run_with_tui(
     ]
     if instance_lock:
         child_cmd.append("--instance-lock")
-    manager_proc = subprocess.Popen(child_cmd)
+    child_env = os.environ.copy()
+    child_env["MANAGER_LOG_STDERR"] = "0"
+    manager_proc = subprocess.Popen(child_cmd, env=child_env)
     manager_ready = False
 
     try:
@@ -564,6 +612,10 @@ def main(argv: list[str] | None = None) -> None:
                 base_dir=base_dir,
                 instance_id=instance_id,
             )
+            manager_logging = _parse_manager_logging(
+                manager_raw=manager_raw,
+                base_dir=base_dir,
+            )
             device_paths = _collect_config_paths(
                 raw.get("devices"), base=base_dir, label="devices"
             )
@@ -616,6 +668,9 @@ def main(argv: list[str] | None = None) -> None:
                 command_journal_retention_max_age_days=command_journal[
                     "retention_max_age_days"
                 ],
+                manager_log_stderr=manager_logging["stderr"],
+                manager_log_file=manager_logging["file"],
+                manager_log_min_level=manager_logging["min_level"],
             )
 
             process_manager_rpc = manager_network.local_rpc_connect
