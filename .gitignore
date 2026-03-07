@@ -16,3 +16,8 @@ web/react_ui/dist/
 # data
 *.h5
 *.hdf5
+
+# local runtime/test artifacts
+.tmp_local/
+.tmp_tests/
+examples/dummy_frequency_trace_sequencer/.state/
