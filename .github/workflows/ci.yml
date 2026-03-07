@@ -76,3 +76,28 @@ jobs:
               raise SystemExit(f"Missing bundled UI asset in wheel: {required}")
           print(f"Verified bundled UI in {wheel.name}")
           '@ | python -
+
+  windows_lifecycle_smoke:
+    needs: validate
+    runs-on: windows-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Sync Python dependencies
+        run: uv sync
+
+      - name: Run Windows lifecycle smoke test
+        env:
+          EC_ENABLE_WINDOWS_LIFECYCLE_SMOKE: "1"
+        run: uv run python -m unittest -q tests.test_windows_lifecycle_smoke
