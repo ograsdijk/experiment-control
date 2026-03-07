@@ -254,6 +254,8 @@ Response:
 
 ## Influx writer process RPC (process.rpc payload)
 
+For writer data model/config details, see `docs/influx_writer.md`.
+
 ### `influx.status`
 Request:
 - `{"type": "influx.status"}`

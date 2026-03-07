@@ -53,6 +53,12 @@ For combining multiple physical devices into one logical telemetry surface (for 
 
 - `docs/composite_devices.md`
 
+## Influx Writer Design
+
+For wide-mode Influx writer behavior and configuration, see:
+
+- `docs/influx_writer.md`
+
 ## Stack YAML schema (version 1)
 
 ```yaml
