@@ -28,6 +28,20 @@ class DummyTraceDriver:
     def disconnect(self) -> None:
         print(f"Disconnecting from dummy traced device on port {self.port}")
 
+    def device_metadata(self) -> dict[str, object]:
+        return {
+            "device_type": "dummy_trace",
+            "port": int(self.port),
+        }
+
+    def stream_metadata(self) -> dict[str, dict[str, object]]:
+        return {
+            "trace": {
+                "n_channels": 5,
+                "n_points": 10_000,
+            }
+        }
+
     def acquire_trace(self, n_batch: int | None = None) -> np.ndarray:
         _ = n_batch
         return np.random.randn(5, 10_000).astype(np.float64)

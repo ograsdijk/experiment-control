@@ -118,6 +118,22 @@ class DummyResonanceTraceDriver:
     def disconnect(self) -> None:
         print(f"Disconnecting from dummy resonance-trace device on port {self.port}")
 
+    def device_metadata(self) -> dict[str, object]:
+        return {
+            "device_type": "dummy_resonance_trace",
+            "port": int(self.port),
+            "n_channels": int(self.n_channels),
+            "n_points": int(self.n_points),
+        }
+
+    def stream_metadata(self) -> dict[str, dict[str, object]]:
+        return {
+            "trace": {
+                "n_channels": int(self.n_channels),
+                "n_points": int(self.n_points),
+            }
+        }
+
     def set_frequency_hz(self, frequency_hz: float) -> None:
         self.frequency_setpoint_hz = float(frequency_hz)
 

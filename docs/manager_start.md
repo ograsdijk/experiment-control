@@ -138,6 +138,15 @@ driver:
 init_kwargs:
   port: 12345
 
+device_metadata:
+  device_type: hipace700
+  location: rack_a
+
+stream_metadata:
+  trace:
+    counts_to_volt: 3.05e-4
+    adc_gain_db: 20.0
+
 telemetry_calls: []     # empty list disables defaults
 stream_calls: []        # empty list disables defaults
 
@@ -163,8 +172,34 @@ stream_calls:
 Notes:
 - `shape` is required and describes a single shot.
 - `attrs` is free-form metadata (useful for channel/axis labels) and is applied
-  to the HDF stream dataset attributes. If `fixed_metadata` also defines the
+  to the HDF stream dataset attributes. If `stream_metadata` also defines the
   same stream, its keys override `attrs`.
+- `device_metadata` is device-level metadata (for example device type, location,
+  and tags for sink processes such as Influx).
+- `stream_metadata` is stream-level metadata (for example calibration factors).
+- Optional driver runtime hooks (called when a new HDF measurement/file starts):
+  - `device_metadata()` -> `dict[str, object]`
+  - `stream_metadata()` -> `dict[str, dict[str, object]]`
+  - these are invoked by HDF writer on local devices only (not federated mirrors)
+  - merge precedence:
+    - `device_metadata`: YAML `device_metadata` then runtime `device_metadata()`
+    - stream attrs: `stream_calls.outputs[].attrs` then YAML `stream_metadata`
+      then runtime `stream_metadata()`
+
+Example driver hooks:
+
+```python
+def device_metadata(self) -> dict[str, object]:
+    return {"device_type": "hipace700", "location": "rack_a"}
+
+def stream_metadata(self) -> dict[str, dict[str, object]]:
+    return {
+        "trace": {
+            "adc_gain_db": 20.0,
+            "counts_to_volt": 3.05e-4,
+        }
+    }
+```
 
 ## Process config (example)
 

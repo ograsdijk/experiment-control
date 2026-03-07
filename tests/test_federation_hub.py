@@ -91,7 +91,8 @@ class FederationHubCapabilityTests(unittest.TestCase):
                         {
                             "device_id": "psu",
                             "yaml_text": "",
-                            "fixed_metadata": {},
+                            "device_metadata": {},
+                            "stream_metadata": {},
                             "telemetry_calls": [],
                             "stream_calls": [],
                             "run_meta_calls": [],

@@ -522,7 +522,8 @@ Response:
   - `version`: int
   - `device_id`: str
   - `yaml_text`: str | null
-  - `fixed_metadata`: dict
+  - `device_metadata`: dict
+  - `stream_metadata`: dict
   - `telemetry_calls`: list
   - `stream_calls`: list
   - `run_meta_calls`: list
@@ -539,7 +540,16 @@ Response:
   - `ring_slots`: int
   - `attrs`: dict | null (free-form metadata, e.g. channel names). These are
     applied to the HDF stream dataset attributes (unless overridden by
-    `fixed_metadata` for the same stream).
+    `stream_metadata` for the same stream).
+
+Runtime metadata hooks (HDF writer behavior at measurement/file start):
+- For local devices, HDF writer may call driver commands `device_metadata` and
+  `stream_metadata` and merge the returned dicts into config metadata.
+- These are optional driver methods; missing methods are ignored.
+- Merge precedence:
+  - `device_metadata`: YAML payload then runtime hook result
+  - stream attrs: `stream_calls[].outputs[].attrs` then YAML `stream_metadata`
+    then runtime `stream_metadata` hook result
 
 ### `manager.run_metadata`
 - Producer: manager

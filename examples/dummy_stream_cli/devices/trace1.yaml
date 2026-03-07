@@ -14,7 +14,7 @@ stream_calls:
         shape: [5, 10000]
         units: counts
         ring_slots: 256
-fixed_metadata:
+stream_metadata:
   trace:
     channel_descriptions: [PMT, PD, E, B, spare]
     channel_units: [counts, counts, counts, counts, counts]

@@ -186,9 +186,9 @@ def _timestamp_ns_from_payload(
 
 
 def _extract_device_type_from_config(payload: Json) -> str | None:
-    fixed_metadata = payload.get("fixed_metadata")
-    if isinstance(fixed_metadata, dict):
-        from_meta = fixed_metadata.get("device_type")
+    device_metadata = payload.get("device_metadata")
+    if isinstance(device_metadata, dict):
+        from_meta = device_metadata.get("device_type")
         if isinstance(from_meta, str) and from_meta.strip():
             return from_meta.strip()
 

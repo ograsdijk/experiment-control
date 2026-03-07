@@ -415,7 +415,7 @@ class HdfWriter(ManagedProcessBase):
         self._stream_schema: dict[tuple[str, str], dict[str, Any]] = {}
         self._stream_dropped_total: dict[tuple[str, str], int] = {}
         self._stream_expected_nbytes: dict[tuple[str, str], int] = {}
-        self._pending_fixed_metadata: dict[tuple[str, str], dict[str, Any]] = {}
+        self._pending_stream_metadata: dict[tuple[str, str], dict[str, Any]] = {}
         self._stream_sessions: dict[tuple[str, str], int] = {}
         self._stream_active_session: dict[tuple[str, str], int] = {}
 
@@ -597,6 +597,107 @@ class HdfWriter(ManagedProcessBase):
                     return None
                 time.sleep(delay)
                 delay = min(delay * 2.0, max_delay)
+
+    @staticmethod
+    def _normalize_metadata_dict(raw: Any) -> dict[str, Any]:
+        if not isinstance(raw, dict):
+            return {}
+        out: dict[str, Any] = {}
+        for key, value in raw.items():
+            name = str(key).strip()
+            if not name:
+                continue
+            out[name] = value
+        return out
+
+    @classmethod
+    def _normalize_stream_metadata_dict(
+        cls, raw: Any
+    ) -> dict[str, dict[str, Any]]:
+        if not isinstance(raw, dict):
+            return {}
+        out: dict[str, dict[str, Any]] = {}
+        for stream_raw, attrs_raw in raw.items():
+            stream = str(stream_raw).strip()
+            if not stream or not isinstance(attrs_raw, dict):
+                continue
+            out[stream] = cls._normalize_metadata_dict(attrs_raw)
+        return out
+
+    @staticmethod
+    def _merge_stream_metadata(
+        base: dict[str, dict[str, Any]],
+        overlay: dict[str, dict[str, Any]],
+    ) -> dict[str, dict[str, Any]]:
+        merged: dict[str, dict[str, Any]] = {}
+        for stream, attrs in base.items():
+            merged[stream] = dict(attrs)
+        for stream, attrs in overlay.items():
+            current = dict(merged.get(stream, {}))
+            current.update(attrs)
+            merged[stream] = current
+        return merged
+
+    def _call_optional_device_action(
+        self,
+        *,
+        device_id: str,
+        action: str,
+        timeout_ms: int = 1200,
+    ) -> Any | None:
+        try:
+            resp = _manager_rpc(
+                self._ctx,
+                self._manager_rpc,
+                {
+                    "type": "command",
+                    "device_id": str(device_id),
+                    "action": str(action),
+                    "params": {},
+                },
+                timeout_ms=max(200, int(timeout_ms)),
+            )
+        except Exception:
+            self._bump_error(f"metadata.rpc.{action}")
+            return None
+        if not isinstance(resp, dict):
+            return None
+        if not bool(resp.get("ok")):
+            return None
+        return resp.get("result")
+
+    def _merge_driver_metadata_into_config(self, config: Json) -> Json:
+        merged = copy.deepcopy(config)
+        device_id = self._normalize_device_id(merged.get("device_id"))
+        if device_id is None:
+            return merged
+        source_kind = str(merged.get("source_kind", "")).strip().lower()
+        if bool(merged.get("is_remote")) or source_kind == "federated":
+            return merged
+
+        base_device = self._normalize_metadata_dict(merged.get("device_metadata"))
+        base_stream = self._normalize_stream_metadata_dict(merged.get("stream_metadata"))
+
+        device_from_driver = self._normalize_metadata_dict(
+            self._call_optional_device_action(
+                device_id=device_id,
+                action="device_metadata",
+            )
+        )
+        stream_from_driver = self._normalize_stream_metadata_dict(
+            self._call_optional_device_action(
+                device_id=device_id,
+                action="stream_metadata",
+            )
+        )
+        if device_from_driver:
+            base_device.update(device_from_driver)
+        if stream_from_driver:
+            base_stream = self._merge_stream_metadata(base_stream, stream_from_driver)
+
+        merged["device_metadata"] = base_device
+        merged["stream_metadata"] = base_stream
+        return merged
 
     def _build_measurement_metadata(
         self,
@@ -820,7 +921,7 @@ class HdfWriter(ManagedProcessBase):
             "stream_schema": self._stream_schema,
             "stream_dropped_total": self._stream_dropped_total,
             "stream_expected_nbytes": self._stream_expected_nbytes,
-            "pending_fixed_metadata": self._pending_fixed_metadata,
+            "pending_stream_metadata": self._pending_stream_metadata,
             "stream_sessions": self._stream_sessions,
             "stream_active_session": self._stream_active_session,
             "pending": self._pending,
@@ -865,7 +966,7 @@ class HdfWriter(ManagedProcessBase):
         self._stream_schema = state["stream_schema"]
         self._stream_dropped_total = state["stream_dropped_total"]
         self._stream_expected_nbytes = state["stream_expected_nbytes"]
-        self._pending_fixed_metadata = state["pending_fixed_metadata"]
+        self._pending_stream_metadata = state["pending_stream_metadata"]
         self._stream_sessions = state["stream_sessions"]
         self._stream_active_session = state["stream_active_session"]
         self._pending = int(state["pending"])
@@ -908,7 +1009,7 @@ class HdfWriter(ManagedProcessBase):
         self._stream_schema = {}
         self._stream_dropped_total = {}
         self._stream_expected_nbytes = {}
-        self._pending_fixed_metadata = {}
+        self._pending_stream_metadata = {}
         self._stream_sessions = {}
         self._stream_active_session = {}
 
@@ -993,7 +1094,11 @@ class HdfWriter(ManagedProcessBase):
                 if fetched is not None:
                     configs = fetched
             for config in configs:
-                self._handle_device_config(config)
+                device_id = self._normalize_device_id(config.get("device_id"))
+                if device_id is not None:
+                    self._latest_device_config[device_id] = copy.deepcopy(config)
+                effective = self._merge_driver_metadata_into_config(config)
+                self._handle_device_config(effective, cache=False)
 
         self._pending = 0
         now = time.monotonic()
@@ -2543,11 +2648,11 @@ class HdfWriter(ManagedProcessBase):
             shuffle=True,
         )
 
-        pending = self._pending_fixed_metadata.get((device_id, stream), None)
+        pending = self._pending_stream_metadata.get((device_id, stream), None)
         if pending:
             for attr_key, value in pending.items():
                 data_ds.attrs[attr_key] = value
-            self._pending_fixed_metadata.pop((device_id, stream), None)
+            self._pending_stream_metadata.pop((device_id, stream), None)
         data_ds.attrs["session"] = int(session)
 
         datasets = {
@@ -2560,18 +2665,19 @@ class HdfWriter(ManagedProcessBase):
         self._stream_datasets[key] = datasets
         return datasets
 
-    def _handle_device_config(self, msg: Json) -> None:
+    def _handle_device_config(self, msg: Json, *, cache: bool = True) -> None:
         device_id = self._normalize_device_id(msg.get("device_id"))
         if device_id is None:
             return
-        self._latest_device_config[device_id] = copy.deepcopy(msg)
+        if cache:
+            self._latest_device_config[device_id] = copy.deepcopy(msg)
 
         can_write_device = self._is_device_enabled(device_id)
         if self._config_group is None and not can_write_device:
             return
 
         yaml_text = msg.get("yaml_text")
-        fixed_metadata = msg.get("fixed_metadata", {})
+        stream_metadata = msg.get("stream_metadata", {})
         stream_calls = msg.get("stream_calls", [])
 
         if can_write_device and self._config_group is not None:
@@ -2608,26 +2714,26 @@ class HdfWriter(ManagedProcessBase):
                         merged = stream_call_attrs.setdefault(stream, {})
                         merged.update(attrs)
 
-        combined_fixed: dict[str, dict[str, Any]] = {}
-        if isinstance(fixed_metadata, dict):
-            for stream, attrs in fixed_metadata.items():
+        combined_stream: dict[str, dict[str, Any]] = {}
+        if isinstance(stream_metadata, dict):
+            for stream, attrs in stream_metadata.items():
                 stream_name = str(stream)
                 if not isinstance(attrs, dict):
                     continue
-                combined_fixed[stream_name] = dict(attrs)
+                combined_stream[stream_name] = dict(attrs)
 
         for stream_name, attrs in stream_call_attrs.items():
-            if stream_name in combined_fixed:
+            if stream_name in combined_stream:
                 merged = dict(attrs)
-                merged.update(combined_fixed[stream_name])
-                combined_fixed[stream_name] = merged
+                merged.update(combined_stream[stream_name])
+                combined_stream[stream_name] = merged
             else:
-                combined_fixed[stream_name] = dict(attrs)
+                combined_stream[stream_name] = dict(attrs)
 
-        for stream_name, attrs in combined_fixed.items():
+        for stream_name, attrs in combined_stream.items():
             base_key = (device_id, stream_name)
             if not can_write_device:
-                self._pending_fixed_metadata[base_key] = dict(attrs)
+                self._pending_stream_metadata[base_key] = dict(attrs)
                 continue
             active_key = self._active_stream_dataset_key(device_id, stream_name)
             if active_key is not None:
@@ -2635,7 +2741,7 @@ class HdfWriter(ManagedProcessBase):
                 for attr_key, value in attrs.items():
                     data_ds.attrs[attr_key] = value
             else:
-                self._pending_fixed_metadata[base_key] = dict(attrs)
+                self._pending_stream_metadata[base_key] = dict(attrs)
 
     def _handle_run_metadata(self, msg: Json) -> None:
         if self._run_meta_group is None:

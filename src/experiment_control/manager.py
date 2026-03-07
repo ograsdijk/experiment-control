@@ -129,6 +129,38 @@ def _coerce_stream_calls(raw: object) -> list[StreamCall] | None:
     return stream_calls_from_json(raw)
 
 
+def _coerce_device_metadata(raw: object) -> dict[str, Any]:
+    meta = optional_dict(raw, path=["device_metadata"])
+    out: dict[str, Any] = {}
+    for key, value in meta.items():
+        name = str(key).strip()
+        if not name:
+            raise ConfigError("device_metadata", "keys must be non-empty strings")
+        out[name] = value
+    return out
+
+
+def _coerce_stream_metadata(raw: object) -> dict[str, dict[str, Any]]:
+    meta = optional_dict(raw, path=["stream_metadata"])
+    out: dict[str, dict[str, Any]] = {}
+    for stream_raw, attrs_raw in meta.items():
+        stream = str(stream_raw).strip()
+        if not stream:
+            raise ConfigError("stream_metadata", "stream names must be non-empty")
+        attrs = require_dict(attrs_raw, path=["stream_metadata", stream])
+        normalized_attrs: dict[str, Any] = {}
+        for attr_key, attr_value in attrs.items():
+            name = str(attr_key).strip()
+            if not name:
+                raise ConfigError(
+                    f"stream_metadata.{stream}",
+                    "attribute keys must be non-empty strings",
+                )
+            normalized_attrs[name] = attr_value
+        out[stream] = normalized_attrs
+    return out
+
+
 def _load_driver_defaults(
     *,
     module_name: str | None,
@@ -200,7 +232,8 @@ class DeviceSpec:
     telemetry_calls: list[TelemetryCall]
     stream_calls: list[StreamCall] | None = None
     run_meta_calls: list[RunMetaCall] | None = None
-    fixed_metadata: dict[str, Any] | None = None
+    device_metadata: dict[str, Any] | None = None
+    stream_metadata: dict[str, dict[str, Any]] | None = None
     config_yaml_text: str | None = None
     telemetry_period_s: float = 1.0
     heartbeat_period_s: float = 1.0
@@ -347,9 +380,8 @@ def device_spec_from_yaml(path: str | Path) -> DeviceSpec:
         else:
             stream_calls = _coerce_stream_calls(defaults.get("stream_calls"))
         run_meta_calls = run_meta_calls_from_json(raw_obj.get("run_meta_calls"))
-        fixed_metadata = optional_dict(
-            raw_obj.get("fixed_metadata"), path=["fixed_metadata"]
-        )
+        device_metadata = _coerce_device_metadata(raw_obj.get("device_metadata"))
+        stream_metadata = _coerce_stream_metadata(raw_obj.get("stream_metadata"))
         telemetry_period_s = float(raw_obj.get("telemetry_period_s", 1.0))
         heartbeat_period_s = float(raw_obj.get("heartbeat_period_s", 1.0))
         command_poll_period_s = float(raw_obj.get("command_poll_period_s", 0.01))
@@ -364,7 +396,8 @@ def device_spec_from_yaml(path: str | Path) -> DeviceSpec:
         telemetry_calls=telemetry_calls,
         stream_calls=stream_calls,
         run_meta_calls=run_meta_calls,
-        fixed_metadata=fixed_metadata,
+        device_metadata=device_metadata,
+        stream_metadata=stream_metadata,
         config_yaml_text=yaml_text,
         telemetry_period_s=telemetry_period_s,
         heartbeat_period_s=heartbeat_period_s,
@@ -4197,7 +4230,8 @@ class Manager:
             "version": 1,
             "device_id": handle.spec.device_id,
             "yaml_text": yaml_text,
-            "fixed_metadata": handle.spec.fixed_metadata or {},
+            "device_metadata": handle.spec.device_metadata or {},
+            "stream_metadata": handle.spec.stream_metadata or {},
             "telemetry_calls": telemetry_calls_to_json(handle.spec.telemetry_calls),
             "stream_calls": stream_calls_to_json(list(handle.spec.stream_calls or [])),
             "run_meta_calls": run_meta_calls_to_json(
@@ -4220,7 +4254,8 @@ class Manager:
             "telemetry_calls": telemetry_calls_to_json(spec.telemetry_calls),
             "stream_calls": stream_calls_to_json(list(spec.stream_calls or [])),
             "run_meta_calls": run_meta_calls_to_json(list(spec.run_meta_calls or [])),
-            "fixed_metadata": spec.fixed_metadata or {},
+            "device_metadata": spec.device_metadata or {},
+            "stream_metadata": spec.stream_metadata or {},
         }
         try:
             import yaml  # type: ignore[import-not-found]

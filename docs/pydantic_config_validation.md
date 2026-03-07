@@ -69,7 +69,8 @@ class DeviceYaml(BaseModel):
     telemetry_calls: Any = None
     stream_calls: Any = None
     run_meta_calls: Any = None
-    fixed_metadata: dict[str, Any] = Field(default_factory=dict)
+    device_metadata: dict[str, Any] = Field(default_factory=dict)
+    stream_metadata: dict[str, dict[str, Any]] = Field(default_factory=dict)
 
     @field_validator("device_id")
     def device_id_nonempty(cls, v: str) -> str:
