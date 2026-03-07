@@ -13,13 +13,34 @@ import zmq
 from ..capabilities import capabilities_payload, method, param
 from ..utils.yaml_helpers import load_yaml_text
 from ..utils.zmq_helpers import safe_json_loads
+from .eval import render_templates, to_attrdict
+from .ranges import generate_from_gen
 from ..utils.cli_args import (
     add_heartbeat_args,
     add_manager_args,
     add_process_id_arg,
     add_rpc_timeout_arg,
 )
-from .ast import parse_sequence
+from .ast import (
+    AdaptiveStep,
+    AssignStep,
+    AtomicStep,
+    CallStep,
+    ForStep,
+    IfStep,
+    ParallelStep,
+    PauseStep,
+    RepeatStep,
+    SequenceSpec,
+    SetContextStep,
+    SetStep,
+    SleepStep,
+    Step,
+    UseStep,
+    WaitUntilStep,
+    WhileStep,
+    parse_sequence,
+)
 from .condition_validation import has_error_diagnostics, validate_sequence_conditions
 from .library import SequenceLibrary, SequenceLibraryEntry
 from .runtime import SequencerRuntime
@@ -28,6 +49,18 @@ from ..processes.process_base import ManagedProcessBase
 Json = dict[str, Any]
 _EXTERNAL_FAULT_SEVERITIES = {"warning", "error", "critical"}
 _DEFAULT_PROGRESS_EVENT_PERIOD_S = 0.3
+_DRIVER_BUILTIN_ACTIONS = {
+    "capabilities",
+    "refresh_capabilities",
+    "get",
+    "set",
+    "status",
+    "collect_run_metadata",
+    "connect_device",
+    "disconnect_device",
+    "stream.context.set",
+    "stream.context.clear",
+}
 
 
 def _normalize_log_severity(raw: Any) -> str:
@@ -449,6 +482,1187 @@ class SequencerProcess(ManagedProcessBase):
 
         return True, spec, diagnostics
 
+    @staticmethod
+    def _preflight_diag(
+        *,
+        severity: str,
+        path: str,
+        message: str,
+        code: str | None = None,
+        details: Json | None = None,
+    ) -> Json:
+        item: Json = {
+            "severity": str(severity or "warning").lower(),
+            "path": path,
+            "message": message,
+            "source": "sequencer.preflight",
+            "line": None,
+            "column": None,
+        }
+        if code:
+            item["code"] = code
+        if isinstance(details, dict) and details:
+            item["details"] = details
+        return item
+
+    @staticmethod
+    def _preflight_has_errors(diagnostics: list[Json]) -> bool:
+        return any(str(item.get("severity", "")).lower() == "error" for item in diagnostics)
+
+    @staticmethod
+    def _preflight_summary(diagnostics: list[Json]) -> Json:
+        summary: Json = {"errors": 0, "warnings": 0, "infos": 0}
+        for item in diagnostics:
+            sev = str(item.get("severity", "")).strip().lower()
+            if sev == "error":
+                summary["errors"] = int(summary["errors"]) + 1
+            elif sev == "warning":
+                summary["warnings"] = int(summary["warnings"]) + 1
+            else:
+                summary["infos"] = int(summary["infos"]) + 1
+        return summary
+
+    @staticmethod
+    def _preflight_is_template_text(value: Any) -> bool:
+        return isinstance(value, str) and "${" in value
+
+    @staticmethod
+    def _preflight_member_name_from_params(raw_params: Any) -> str | None:
+        if not isinstance(raw_params, dict):
+            return None
+        raw_name = raw_params.get("name")
+        if SequencerProcess._preflight_is_template_text(raw_name):
+            return None
+        if not isinstance(raw_name, str):
+            return None
+        name = raw_name.strip()
+        return name if name else None
+
+    @staticmethod
+    def _preflight_parse_capabilities(result: Any) -> dict[str, Json] | None:
+        if not isinstance(result, dict):
+            return None
+        members_raw = result.get("members")
+        if not isinstance(members_raw, list):
+            return None
+        members: dict[str, Json] = {}
+        for item in members_raw:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name", "")).strip()
+            if name:
+                members[name] = item
+        return members
+
+    @staticmethod
+    def _preflight_render(
+        *,
+        value: Any,
+        env: dict[str, Any],
+        path: str,
+        diagnostics: list[Json],
+    ) -> Any:
+        try:
+            return render_templates(value, env)
+        except Exception as e:
+            diagnostics.append(
+                SequencerProcess._preflight_diag(
+                    severity="error",
+                    path=path,
+                    code="template_unresolved",
+                    message=f"template render failed during preflight: {e}",
+                )
+            )
+            return value
+
+    @staticmethod
+    def _preflight_load_devices(resp: Any) -> set[str]:
+        out: set[str] = set()
+        if not isinstance(resp, dict):
+            return out
+        devices = resp.get("devices")
+        if not isinstance(devices, list):
+            return out
+        for item in devices:
+            if not isinstance(item, dict):
+                continue
+            device_id = str(item.get("device_id", "")).strip()
+            if device_id:
+                out.add(device_id)
+        return out
+
+    @staticmethod
+    def _preflight_load_telemetry_signals(resp: Any) -> dict[str, set[str]]:
+        out: dict[str, set[str]] = {}
+        if not isinstance(resp, dict):
+            return out
+        result = resp.get("result")
+        if not isinstance(result, dict):
+            return out
+        devices = result.get("devices")
+        if not isinstance(devices, list):
+            return out
+        for item in devices:
+            if not isinstance(item, dict):
+                continue
+            device_id = str(item.get("device_id", "")).strip()
+            if not device_id:
+                continue
+            signals: set[str] = set()
+            raw_signals = item.get("signals")
+            if isinstance(raw_signals, list):
+                for raw_signal in raw_signals:
+                    signal = str(raw_signal).strip()
+                    if signal:
+                        signals.add(signal)
+            out[device_id] = signals
+        return out
+
+    @staticmethod
+    def _preflight_load_stream_names(resp: Any) -> dict[str, set[str]]:
+        out: dict[str, set[str]] = {}
+        if not isinstance(resp, dict) or not bool(resp.get("ok", False)):
+            return out
+        result = resp.get("result")
+        if not isinstance(result, list):
+            return out
+        for item in result:
+            if not isinstance(item, dict):
+                continue
+            device_id = str(item.get("device_id", "")).strip()
+            if not device_id:
+                continue
+            streams: set[str] = set()
+            stream_calls = item.get("stream_calls")
+            if isinstance(stream_calls, list):
+                for call in stream_calls:
+                    if not isinstance(call, dict):
+                        continue
+                    outputs = call.get("outputs")
+                    if not isinstance(outputs, list):
+                        continue
+                    for output in outputs:
+                        if not isinstance(output, dict):
+                            continue
+                        stream = str(output.get("stream", "")).strip()
+                        if stream:
+                            streams.add(stream)
+            out[device_id] = streams
+        return out
+
+    def _preflight_check_member_access(
+        self,
+        *,
+        device_id: str,
+        member_name: str,
+        path: str,
+        mode: str,
+        diagnostics: list[Json],
+        capabilities_by_device: dict[str, dict[str, Json] | None],
+    ) -> None:
+        members = capabilities_by_device.get(device_id)
+        if members is None:
+            diagnostics.append(
+                self._preflight_diag(
+                    severity="warning",
+                    path=path,
+                    code="capabilities_unavailable",
+                    message=f"could not verify member {member_name!r} on {device_id!r}",
+                    details={"device_id": device_id, "member": member_name},
+                )
+            )
+            return
+        spec = members.get(member_name)
+        if spec is None:
+            diagnostics.append(
+                self._preflight_diag(
+                    severity="error",
+                    path=path,
+                    code="unknown_member",
+                    message=f"unknown member {member_name!r} on {device_id!r}",
+                    details={"device_id": device_id, "member": member_name},
+                )
+            )
+            return
+        readable = bool(spec.get("readable"))
+        settable = bool(spec.get("settable"))
+        if mode == "read" and not readable:
+            diagnostics.append(
+                self._preflight_diag(
+                    severity="error",
+                    path=path,
+                    code="member_not_readable",
+                    message=f"member {member_name!r} is not readable on {device_id!r}",
+                    details={"device_id": device_id, "member": member_name},
+                )
+            )
+        if mode == "write" and not settable:
+            diagnostics.append(
+                self._preflight_diag(
+                    severity="error",
+                    path=path,
+                    code="member_not_settable",
+                    message=f"member {member_name!r} is not settable on {device_id!r}",
+                    details={"device_id": device_id, "member": member_name},
+                )
+            )
+
+    def _preflight_check_stream_name(
+        self,
+        *,
+        device_id: str,
+        stream_name: str,
+        path: str,
+        diagnostics: list[Json],
+        stream_names_by_device: dict[str, set[str]],
+    ) -> None:
+        streams = stream_names_by_device.get(device_id)
+        if streams is None:
+            diagnostics.append(
+                self._preflight_diag(
+                    severity="warning",
+                    path=path,
+                    code="stream_schema_unavailable",
+                    message=f"could not verify stream {stream_name!r} on {device_id!r}",
+                    details={"device_id": device_id, "stream": stream_name},
+                )
+            )
+            return
+        if stream_name not in streams:
+            diagnostics.append(
+                self._preflight_diag(
+                    severity="error",
+                    path=path,
+                    code="unknown_stream",
+                    message=f"unknown stream {stream_name!r} on {device_id!r}",
+                    details={"device_id": device_id, "stream": stream_name},
+                )
+            )
+
+    def _preflight_check_call_action(
+        self,
+        *,
+        device_id: str,
+        action: str,
+        path: str,
+        diagnostics: list[Json],
+        device_ids: set[str],
+        capabilities_by_device: dict[str, dict[str, Json] | None],
+    ) -> None:
+        if device_id not in device_ids:
+            diagnostics.append(
+                self._preflight_diag(
+                    severity="error",
+                    path=path,
+                    code="unknown_device",
+                    message=f"unknown device {device_id!r}",
+                    details={"device_id": device_id},
+                )
+            )
+            return
+        if action in _DRIVER_BUILTIN_ACTIONS:
+            return
+        members = capabilities_by_device.get(device_id)
+        if members is None:
+            diagnostics.append(
+                self._preflight_diag(
+                    severity="warning",
+                    path=path,
+                    code="capabilities_unavailable",
+                    message=f"could not verify action {action!r} on {device_id!r}",
+                    details={"device_id": device_id, "action": action},
+                )
+            )
+            return
+        if action not in members:
+            diagnostics.append(
+                self._preflight_diag(
+                    severity="error",
+                    path=path,
+                    code="unknown_action",
+                    message=f"unknown action {action!r} on {device_id!r}",
+                    details={"device_id": device_id, "action": action},
+                )
+            )
+
+    def _preflight_scan_value_sources(
+        self,
+        *,
+        value: Any,
+        path: str,
+        env: dict[str, Any],
+        diagnostics: list[Json],
+        device_ids: set[str],
+        telemetry_signals_by_device: dict[str, set[str]],
+        stream_names_by_device: dict[str, set[str]],
+        capabilities_by_device: dict[str, dict[str, Json] | None],
+    ) -> None:
+        rendered = self._preflight_render(
+            value=value,
+            env=env,
+            path=path,
+            diagnostics=diagnostics,
+        )
+        if isinstance(rendered, list):
+            for index, item in enumerate(rendered):
+                self._preflight_scan_value_sources(
+                    value=item,
+                    path=f"{path}[{index}]",
+                    env=env,
+                    diagnostics=diagnostics,
+                    device_ids=device_ids,
+                    telemetry_signals_by_device=telemetry_signals_by_device,
+                    stream_names_by_device=stream_names_by_device,
+                    capabilities_by_device=capabilities_by_device,
+                )
+            return
+        if not isinstance(rendered, dict):
+            return
+
+        telemetry_spec = rendered.get("telemetry")
+        if telemetry_spec is not None:
+            if not isinstance(telemetry_spec, dict):
+                diagnostics.append(
+                    self._preflight_diag(
+                        severity="error",
+                        path=f"{path}.telemetry",
+                        code="invalid_telemetry_source",
+                        message="telemetry source must be a dict",
+                    )
+                )
+            else:
+                device = telemetry_spec.get("device")
+                signal = telemetry_spec.get("signal")
+                if self._preflight_is_template_text(device) or self._preflight_is_template_text(
+                    signal
+                ):
+                    diagnostics.append(
+                        self._preflight_diag(
+                            severity="warning",
+                            path=f"{path}.telemetry",
+                            code="dynamic_telemetry_ref_unchecked",
+                            message="telemetry device/signal is dynamic and was not checked",
+                        )
+                    )
+                else:
+                    device_id = str(device or "").strip()
+                    signal_name = str(signal or "").strip()
+                    if not device_id or not signal_name:
+                        diagnostics.append(
+                            self._preflight_diag(
+                                severity="error",
+                                path=f"{path}.telemetry",
+                                code="invalid_telemetry_source",
+                                message="telemetry source requires non-empty device and signal",
+                            )
+                        )
+                    else:
+                        if device_id not in device_ids:
+                            diagnostics.append(
+                                self._preflight_diag(
+                                    severity="error",
+                                    path=f"{path}.telemetry.device",
+                                    code="unknown_device",
+                                    message=f"unknown device {device_id!r}",
+                                    details={"device_id": device_id},
+                                )
+                            )
+                        known_signals = telemetry_signals_by_device.get(device_id)
+                        if known_signals is None:
+                            diagnostics.append(
+                                self._preflight_diag(
+                                    severity="warning",
+                                    path=f"{path}.telemetry.signal",
+                                    code="telemetry_schema_unavailable",
+                                    message=f"could not verify signal {signal_name!r} on {device_id!r}",
+                                    details={"device_id": device_id, "signal": signal_name},
+                                )
+                            )
+                        elif signal_name not in known_signals:
+                            diagnostics.append(
+                                self._preflight_diag(
+                                    severity="error",
+                                    path=f"{path}.telemetry.signal",
+                                    code="unknown_signal",
+                                    message=f"unknown signal {signal_name!r} on {device_id!r}",
+                                    details={"device_id": device_id, "signal": signal_name},
+                                )
+                            )
+
+        call_spec = rendered.get("call")
+        if call_spec is not None:
+            if not isinstance(call_spec, dict):
+                diagnostics.append(
+                    self._preflight_diag(
+                        severity="error",
+                        path=f"{path}.call",
+                        code="invalid_call_source",
+                        message="call source must be a dict",
+                    )
+                )
+            else:
+                device = call_spec.get("device")
+                action = call_spec.get("action")
+                if self._preflight_is_template_text(device) or self._preflight_is_template_text(
+                    action
+                ):
+                    diagnostics.append(
+                        self._preflight_diag(
+                            severity="warning",
+                            path=f"{path}.call",
+                            code="dynamic_action_unchecked",
+                            message="call device/action is dynamic and was not checked",
+                        )
+                    )
+                else:
+                    device_id = str(device or "").strip()
+                    action_name = str(action or "").strip()
+                    if not device_id or not action_name:
+                        diagnostics.append(
+                            self._preflight_diag(
+                                severity="error",
+                                path=f"{path}.call",
+                                code="invalid_call_source",
+                                message="call source requires non-empty device and action",
+                            )
+                        )
+                    else:
+                        self._preflight_check_call_action(
+                            device_id=device_id,
+                            action=action_name,
+                            path=f"{path}.call.action",
+                            diagnostics=diagnostics,
+                            device_ids=device_ids,
+                            capabilities_by_device=capabilities_by_device,
+                        )
+                        member_name = self._preflight_member_name_from_params(
+                            call_spec.get("params")
+                        )
+                        if action_name in {"get", "set"}:
+                            if member_name:
+                                self._preflight_check_member_access(
+                                    device_id=device_id,
+                                    member_name=member_name,
+                                    path=f"{path}.call.params.name",
+                                    mode="read" if action_name == "get" else "write",
+                                    diagnostics=diagnostics,
+                                    capabilities_by_device=capabilities_by_device,
+                                )
+                            else:
+                                diagnostics.append(
+                                    self._preflight_diag(
+                                        severity="warning",
+                                        path=f"{path}.call.params.name",
+                                        code="dynamic_member_name_unchecked",
+                                        message=(
+                                            "member name for get/set is dynamic or missing and "
+                                            "was not checked"
+                                        ),
+                                    )
+                                )
+                        if action_name == "stream.context.set":
+                            params = call_spec.get("params")
+                            if isinstance(params, dict):
+                                stream = params.get("stream")
+                                if self._preflight_is_template_text(stream):
+                                    diagnostics.append(
+                                        self._preflight_diag(
+                                            severity="warning",
+                                            path=f"{path}.call.params.stream",
+                                            code="dynamic_stream_name_unchecked",
+                                            message="stream name is dynamic and was not checked",
+                                        )
+                                    )
+                                elif isinstance(stream, str) and stream.strip():
+                                    self._preflight_check_stream_name(
+                                        device_id=device_id,
+                                        stream_name=stream.strip(),
+                                        path=f"{path}.call.params.stream",
+                                        diagnostics=diagnostics,
+                                        stream_names_by_device=stream_names_by_device,
+                                    )
+
+        for key, nested in rendered.items():
+            self._preflight_scan_value_sources(
+                value=nested,
+                path=f"{path}.{key}",
+                env=env,
+                diagnostics=diagnostics,
+                device_ids=device_ids,
+                telemetry_signals_by_device=telemetry_signals_by_device,
+                stream_names_by_device=stream_names_by_device,
+                capabilities_by_device=capabilities_by_device,
+            )
+
+    def _preflight_steps(
+        self,
+        *,
+        steps: list[Step],
+        path: str,
+        env: dict[str, Any],
+        diagnostics: list[Json],
+        device_ids: set[str],
+        telemetry_signals_by_device: dict[str, set[str]],
+        stream_names_by_device: dict[str, set[str]],
+        capabilities_by_device: dict[str, dict[str, Json] | None],
+        use_stack: tuple[str, ...],
+    ) -> None:
+        for index, step in enumerate(steps):
+            step_path = f"{path}[{index}]"
+            if isinstance(step, CallStep):
+                device_id = str(step.device).strip()
+                action = str(step.action).strip()
+                if self._preflight_is_template_text(step.device) or self._preflight_is_template_text(
+                    step.action
+                ):
+                    diagnostics.append(
+                        self._preflight_diag(
+                            severity="warning",
+                            path=f"{step_path}.call",
+                            code="dynamic_action_unchecked",
+                            message="call device/action is dynamic and was not checked",
+                        )
+                    )
+                else:
+                    self._preflight_check_call_action(
+                        device_id=device_id,
+                        action=action,
+                        path=f"{step_path}.call.action",
+                        diagnostics=diagnostics,
+                        device_ids=device_ids,
+                        capabilities_by_device=capabilities_by_device,
+                    )
+                    if action in {"get", "set"}:
+                        member_name = self._preflight_member_name_from_params(step.params)
+                        if member_name:
+                            self._preflight_check_member_access(
+                                device_id=device_id,
+                                member_name=member_name,
+                                path=f"{step_path}.call.params.name",
+                                mode="read" if action == "get" else "write",
+                                diagnostics=diagnostics,
+                                capabilities_by_device=capabilities_by_device,
+                            )
+                        else:
+                            diagnostics.append(
+                                self._preflight_diag(
+                                    severity="warning",
+                                    path=f"{step_path}.call.params.name",
+                                    code="dynamic_member_name_unchecked",
+                                    message=(
+                                        "member name for get/set is dynamic or missing and was not checked"
+                                    ),
+                                )
+                            )
+                    if action == "stream.context.set":
+                        stream = step.params.get("stream")
+                        if self._preflight_is_template_text(stream):
+                            diagnostics.append(
+                                self._preflight_diag(
+                                    severity="warning",
+                                    path=f"{step_path}.call.params.stream",
+                                    code="dynamic_stream_name_unchecked",
+                                    message="stream name is dynamic and was not checked",
+                                )
+                            )
+                        elif isinstance(stream, str) and stream.strip():
+                            self._preflight_check_stream_name(
+                                device_id=device_id,
+                                stream_name=stream.strip(),
+                                path=f"{step_path}.call.params.stream",
+                                diagnostics=diagnostics,
+                                stream_names_by_device=stream_names_by_device,
+                            )
+                self._preflight_scan_value_sources(
+                    value=step.params,
+                    path=f"{step_path}.call.params",
+                    env=env,
+                    diagnostics=diagnostics,
+                    device_ids=device_ids,
+                    telemetry_signals_by_device=telemetry_signals_by_device,
+                    stream_names_by_device=stream_names_by_device,
+                    capabilities_by_device=capabilities_by_device,
+                )
+                if step.save_as:
+                    env[str(step.save_as)] = {}
+                if step.extract:
+                    env[str(step.save_as) if step.save_as else "value"] = 0
+                if isinstance(step.assign, dict):
+                    for key in step.assign:
+                        key_name = str(key).strip()
+                        if key_name:
+                            env[key_name] = 0
+                env["vars"] = to_attrdict(
+                    {
+                        key: value
+                        for key, value in env.items()
+                        if isinstance(key, str) and key != "vars"
+                    }
+                )
+                continue
+
+            if isinstance(step, SetStep):
+                device_id = str(step.device).strip()
+                member_name = str(step.name).strip()
+                if self._preflight_is_template_text(step.device):
+                    diagnostics.append(
+                        self._preflight_diag(
+                            severity="warning",
+                            path=f"{step_path}.set.device",
+                            code="dynamic_action_unchecked",
+                            message="set device is dynamic and was not checked",
+                        )
+                    )
+                else:
+                    if device_id not in device_ids:
+                        diagnostics.append(
+                            self._preflight_diag(
+                                severity="error",
+                                path=f"{step_path}.set.device",
+                                code="unknown_device",
+                                message=f"unknown device {device_id!r}",
+                                details={"device_id": device_id},
+                            )
+                        )
+                    else:
+                        self._preflight_check_member_access(
+                            device_id=device_id,
+                            member_name=member_name,
+                            path=f"{step_path}.set.name",
+                            mode="write",
+                            diagnostics=diagnostics,
+                            capabilities_by_device=capabilities_by_device,
+                        )
+                self._preflight_scan_value_sources(
+                    value=step.value,
+                    path=f"{step_path}.set.value",
+                    env=env,
+                    diagnostics=diagnostics,
+                    device_ids=device_ids,
+                    telemetry_signals_by_device=telemetry_signals_by_device,
+                    stream_names_by_device=stream_names_by_device,
+                    capabilities_by_device=capabilities_by_device,
+                )
+                continue
+
+            if isinstance(step, WaitUntilStep):
+                wait_env = dict(env)
+                wait_env.setdefault("sample", 0)
+                wait_env.setdefault("sample_reduced", 0)
+                wait_env.setdefault("samples", [])
+                wait_env["vars"] = to_attrdict(
+                    {
+                        key: value
+                        for key, value in wait_env.items()
+                        if isinstance(key, str) and key != "vars"
+                    }
+                )
+                self._preflight_scan_value_sources(
+                    value=step.raw,
+                    path=f"{step_path}.wait_until",
+                    env=wait_env,
+                    diagnostics=diagnostics,
+                    device_ids=device_ids,
+                    telemetry_signals_by_device=telemetry_signals_by_device,
+                    stream_names_by_device=stream_names_by_device,
+                    capabilities_by_device=capabilities_by_device,
+                )
+                env.setdefault("sample", 0)
+                env.setdefault("sample_reduced", 0)
+                env.setdefault("samples", [])
+                env["vars"] = to_attrdict(
+                    {
+                        key: value
+                        for key, value in env.items()
+                        if isinstance(key, str) and key != "vars"
+                    }
+                )
+                continue
+
+            if isinstance(step, SetContextStep):
+                streams_rendered = self._preflight_render(
+                    value=step.streams,
+                    env=env,
+                    path=f"{step_path}.set_context.streams",
+                    diagnostics=diagnostics,
+                )
+                if isinstance(streams_rendered, list):
+                    for stream_index, item in enumerate(streams_rendered):
+                        item_path = f"{step_path}.set_context.streams[{stream_index}]"
+                        device_id = ""
+                        stream_name = ""
+                        if isinstance(item, dict):
+                            device_raw = item.get("device")
+                            stream_raw = item.get("stream")
+                            if self._preflight_is_template_text(device_raw) or self._preflight_is_template_text(
+                                stream_raw
+                            ):
+                                diagnostics.append(
+                                    self._preflight_diag(
+                                        severity="warning",
+                                        path=item_path,
+                                        code="dynamic_stream_name_unchecked",
+                                        message="stream target is dynamic and was not checked",
+                                    )
+                                )
+                                continue
+                            device_id = str(device_raw or "").strip()
+                            stream_name = str(stream_raw or "").strip()
+                        elif isinstance(item, str):
+                            if self._preflight_is_template_text(item):
+                                diagnostics.append(
+                                    self._preflight_diag(
+                                        severity="warning",
+                                        path=item_path,
+                                        code="dynamic_stream_name_unchecked",
+                                        message="stream target is dynamic and was not checked",
+                                    )
+                                )
+                                continue
+                            raw = item.strip()
+                            if "." in raw:
+                                device_id, stream_name = raw.split(".", 1)
+                            elif "/" in raw:
+                                device_id, stream_name = raw.split("/", 1)
+                        if not device_id or not stream_name:
+                            diagnostics.append(
+                                self._preflight_diag(
+                                    severity="error",
+                                    path=item_path,
+                                    code="invalid_stream_target",
+                                    message="stream target must include non-empty device and stream",
+                                )
+                            )
+                            continue
+                        if device_id not in device_ids:
+                            diagnostics.append(
+                                self._preflight_diag(
+                                    severity="error",
+                                    path=item_path,
+                                    code="unknown_device",
+                                    message=f"unknown device {device_id!r}",
+                                    details={"device_id": device_id},
+                                )
+                            )
+                            continue
+                        self._preflight_check_stream_name(
+                            device_id=device_id,
+                            stream_name=stream_name,
+                            path=item_path,
+                            diagnostics=diagnostics,
+                            stream_names_by_device=stream_names_by_device,
+                        )
+                self._preflight_scan_value_sources(
+                    value=step.fields,
+                    path=f"{step_path}.set_context.fields",
+                    env=env,
+                    diagnostics=diagnostics,
+                    device_ids=device_ids,
+                    telemetry_signals_by_device=telemetry_signals_by_device,
+                    stream_names_by_device=stream_names_by_device,
+                    capabilities_by_device=capabilities_by_device,
+                )
+                continue
+
+            if isinstance(step, ForStep):
+                rendered_in = self._preflight_render(
+                    value=step.in_expr,
+                    env=env,
+                    path=f"{step_path}.for.in",
+                    diagnostics=diagnostics,
+                )
+                if isinstance(rendered_in, dict):
+                    raw_gen = rendered_in.get("gen")
+                    if isinstance(raw_gen, dict):
+                        try:
+                            _ = generate_from_gen(raw_gen, env=env, serpentine_index=None)
+                        except Exception as e:
+                            diagnostics.append(
+                                self._preflight_diag(
+                                    severity="error",
+                                    path=f"{step_path}.for.in.gen",
+                                    code="invalid_generator",
+                                    message=f"invalid generator config: {e}",
+                                )
+                            )
+                nested_env = dict(env)
+                for target in step.bind.values():
+                    target_name = str(target).strip()
+                    if target_name:
+                        nested_env[target_name] = 0
+                nested_env["vars"] = to_attrdict(
+                    {
+                        key: value
+                        for key, value in nested_env.items()
+                        if isinstance(key, str) and key != "vars"
+                    }
+                )
+                self._preflight_steps(
+                    steps=step.body,
+                    path=f"{step_path}.for.do",
+                    env=nested_env,
+                    diagnostics=diagnostics,
+                    device_ids=device_ids,
+                    telemetry_signals_by_device=telemetry_signals_by_device,
+                    stream_names_by_device=stream_names_by_device,
+                    capabilities_by_device=capabilities_by_device,
+                    use_stack=use_stack,
+                )
+                continue
+
+            if isinstance(step, RepeatStep):
+                self._preflight_steps(
+                    steps=step.body,
+                    path=f"{step_path}.repeat.do",
+                    env=env,
+                    diagnostics=diagnostics,
+                    device_ids=device_ids,
+                    telemetry_signals_by_device=telemetry_signals_by_device,
+                    stream_names_by_device=stream_names_by_device,
+                    capabilities_by_device=capabilities_by_device,
+                    use_stack=use_stack,
+                )
+                continue
+
+            if isinstance(step, IfStep):
+                self._preflight_scan_value_sources(
+                    value=step.condition,
+                    path=f"{step_path}.if.condition",
+                    env=env,
+                    diagnostics=diagnostics,
+                    device_ids=device_ids,
+                    telemetry_signals_by_device=telemetry_signals_by_device,
+                    stream_names_by_device=stream_names_by_device,
+                    capabilities_by_device=capabilities_by_device,
+                )
+                self._preflight_steps(
+                    steps=step.then_steps,
+                    path=f"{step_path}.if.then",
+                    env=env,
+                    diagnostics=diagnostics,
+                    device_ids=device_ids,
+                    telemetry_signals_by_device=telemetry_signals_by_device,
+                    stream_names_by_device=stream_names_by_device,
+                    capabilities_by_device=capabilities_by_device,
+                    use_stack=use_stack,
+                )
+                self._preflight_steps(
+                    steps=step.else_steps or [],
+                    path=f"{step_path}.if.else",
+                    env=env,
+                    diagnostics=diagnostics,
+                    device_ids=device_ids,
+                    telemetry_signals_by_device=telemetry_signals_by_device,
+                    stream_names_by_device=stream_names_by_device,
+                    capabilities_by_device=capabilities_by_device,
+                    use_stack=use_stack,
+                )
+                continue
+
+            if isinstance(step, WhileStep):
+                self._preflight_scan_value_sources(
+                    value=step.condition,
+                    path=f"{step_path}.while.condition",
+                    env=env,
+                    diagnostics=diagnostics,
+                    device_ids=device_ids,
+                    telemetry_signals_by_device=telemetry_signals_by_device,
+                    stream_names_by_device=stream_names_by_device,
+                    capabilities_by_device=capabilities_by_device,
+                )
+                self._preflight_steps(
+                    steps=step.body,
+                    path=f"{step_path}.while.do",
+                    env=env,
+                    diagnostics=diagnostics,
+                    device_ids=device_ids,
+                    telemetry_signals_by_device=telemetry_signals_by_device,
+                    stream_names_by_device=stream_names_by_device,
+                    capabilities_by_device=capabilities_by_device,
+                    use_stack=use_stack,
+                )
+                continue
+
+            if isinstance(step, AtomicStep):
+                self._preflight_steps(
+                    steps=step.body,
+                    path=f"{step_path}.atomic.do",
+                    env=env,
+                    diagnostics=diagnostics,
+                    device_ids=device_ids,
+                    telemetry_signals_by_device=telemetry_signals_by_device,
+                    stream_names_by_device=stream_names_by_device,
+                    capabilities_by_device=capabilities_by_device,
+                    use_stack=use_stack,
+                )
+                continue
+
+            if isinstance(step, ParallelStep):
+                self._preflight_steps(
+                    steps=step.body,
+                    path=f"{step_path}.parallel.do",
+                    env=env,
+                    diagnostics=diagnostics,
+                    device_ids=device_ids,
+                    telemetry_signals_by_device=telemetry_signals_by_device,
+                    stream_names_by_device=stream_names_by_device,
+                    capabilities_by_device=capabilities_by_device,
+                    use_stack=use_stack,
+                )
+                continue
+
+            if isinstance(step, AssignStep):
+                self._preflight_scan_value_sources(
+                    value=step.values,
+                    path=f"{step_path}.assign",
+                    env=env,
+                    diagnostics=diagnostics,
+                    device_ids=device_ids,
+                    telemetry_signals_by_device=telemetry_signals_by_device,
+                    stream_names_by_device=stream_names_by_device,
+                    capabilities_by_device=capabilities_by_device,
+                )
+                for key in step.values:
+                    key_name = str(key).strip()
+                    if key_name:
+                        env[key_name] = 0
+                env["vars"] = to_attrdict(
+                    {
+                        key: value
+                        for key, value in env.items()
+                        if isinstance(key, str) and key != "vars"
+                    }
+                )
+                continue
+
+            if isinstance(step, UseStep):
+                sequence_id = str(step.sequence_id).strip()
+                self._preflight_scan_value_sources(
+                    value=step.args or {},
+                    path=f"{step_path}.use.args",
+                    env=env,
+                    diagnostics=diagnostics,
+                    device_ids=device_ids,
+                    telemetry_signals_by_device=telemetry_signals_by_device,
+                    stream_names_by_device=stream_names_by_device,
+                    capabilities_by_device=capabilities_by_device,
+                )
+                if not self._sequence_library_path:
+                    diagnostics.append(
+                        self._preflight_diag(
+                            severity="error",
+                            path=f"{step_path}.use.id",
+                            code="library_not_configured",
+                            message="use step requires sequence_library_path",
+                        )
+                    )
+                    continue
+                if sequence_id in use_stack:
+                    cycle = " -> ".join([*use_stack, sequence_id])
+                    diagnostics.append(
+                        self._preflight_diag(
+                            severity="error",
+                            path=f"{step_path}.use.id",
+                            code="use_cycle",
+                            message=f"recursive use sequence detected: {cycle}",
+                        )
+                    )
+                    continue
+                try:
+                    nested_spec = self._resolve_use_sequence_spec(sequence_id)
+                except Exception as e:
+                    diagnostics.append(
+                        self._preflight_diag(
+                            severity="error",
+                            path=f"{step_path}.use.id",
+                            code="unknown_use_sequence",
+                            message=f"cannot resolve use.id {sequence_id!r}: {e}",
+                        )
+                    )
+                    continue
+                nested_env = dict(env)
+                for key, value in dict(nested_spec.vars).items():
+                    nested_env[str(key)] = value
+                nested_env["vars"] = to_attrdict(
+                    {
+                        key: value
+                        for key, value in nested_env.items()
+                        if isinstance(key, str) and key != "vars"
+                    }
+                )
+                self._preflight_steps(
+                    steps=nested_spec.steps,
+                    path=f"{step_path}.use.do",
+                    env=nested_env,
+                    diagnostics=diagnostics,
+                    device_ids=device_ids,
+                    telemetry_signals_by_device=telemetry_signals_by_device,
+                    stream_names_by_device=stream_names_by_device,
+                    capabilities_by_device=capabilities_by_device,
+                    use_stack=(*use_stack, sequence_id),
+                )
+                continue
+
+            if isinstance(step, AdaptiveStep):
+                adaptive_env = dict(env)
+                for target in step.bind.values():
+                    target_name = str(target).strip()
+                    if target_name:
+                        adaptive_env[target_name] = 0
+                adaptive_env["vars"] = to_attrdict(
+                    {
+                        key: value
+                        for key, value in adaptive_env.items()
+                        if isinstance(key, str) and key != "vars"
+                    }
+                )
+                rendered_controller = self._preflight_render(
+                    value=step.controller,
+                    env=adaptive_env,
+                    path=f"{step_path}.adaptive.controller",
+                    diagnostics=diagnostics,
+                )
+                rendered_space = self._preflight_render(
+                    value=step.space,
+                    env=adaptive_env,
+                    path=f"{step_path}.adaptive.space",
+                    diagnostics=diagnostics,
+                )
+                if not isinstance(rendered_controller, dict):
+                    diagnostics.append(
+                        self._preflight_diag(
+                            severity="error",
+                            path=f"{step_path}.adaptive.controller",
+                            code="invalid_controller",
+                            message="adaptive.controller must render to a dict",
+                        )
+                    )
+                if not isinstance(rendered_space, dict):
+                    diagnostics.append(
+                        self._preflight_diag(
+                            severity="error",
+                            path=f"{step_path}.adaptive.space",
+                            code="invalid_space",
+                            message="adaptive.space must render to a dict",
+                        )
+                    )
+                if isinstance(rendered_controller, dict) and isinstance(rendered_space, dict):
+                    repeats_raw = step.observe.get("repeats", 1)
+                    try:
+                        repeats = int(repeats_raw)
+                        if repeats <= 0:
+                            repeats = 1
+                    except Exception:
+                        repeats = 1
+                    try:
+                        from ..adaptive import create_adaptive_controller
+
+                        _ = create_adaptive_controller(
+                            controller_spec=rendered_controller,
+                            space=rendered_space,
+                            repeats=repeats,
+                        )
+                    except Exception as e:
+                        diagnostics.append(
+                            self._preflight_diag(
+                                severity="error",
+                                path=f"{step_path}.adaptive",
+                                code="invalid_adaptive_controller",
+                                message=f"adaptive controller setup failed: {e}",
+                            )
+                        )
+                self._preflight_scan_value_sources(
+                    value=step.observe,
+                    path=f"{step_path}.adaptive.observe",
+                    env=adaptive_env,
+                    diagnostics=diagnostics,
+                    device_ids=device_ids,
+                    telemetry_signals_by_device=telemetry_signals_by_device,
+                    stream_names_by_device=stream_names_by_device,
+                    capabilities_by_device=capabilities_by_device,
+                )
+                self._preflight_steps(
+                    steps=step.body,
+                    path=f"{step_path}.adaptive.do",
+                    env=adaptive_env,
+                    diagnostics=diagnostics,
+                    device_ids=device_ids,
+                    telemetry_signals_by_device=telemetry_signals_by_device,
+                    stream_names_by_device=stream_names_by_device,
+                    capabilities_by_device=capabilities_by_device,
+                    use_stack=use_stack,
+                )
+                continue
+
+            if isinstance(step, (SleepStep, PauseStep)):
+                continue
+
+    def _preflight_sequence_spec(self, spec: SequenceSpec) -> list[Json]:
+        diagnostics: list[Json] = []
+
+        list_devices_resp = self._manager.call({"type": "list_devices"})
+        device_ids = self._preflight_load_devices(list_devices_resp)
+        if not device_ids:
+            diagnostics.append(
+                self._preflight_diag(
+                    severity="warning",
+                    path="sequence",
+                    code="device_inventory_unavailable",
+                    message="device inventory unavailable; checks may be incomplete",
+                )
+            )
+
+        telemetry_schema_resp = self._manager.call({"action": "telemetry.schema.list"})
+        telemetry_signals_by_device = self._preflight_load_telemetry_signals(
+            telemetry_schema_resp
+        )
+        if not telemetry_signals_by_device:
+            diagnostics.append(
+                self._preflight_diag(
+                    severity="warning",
+                    path="sequence",
+                    code="telemetry_schema_unavailable",
+                    message="telemetry schema unavailable; signal checks may be incomplete",
+                )
+            )
+
+        device_config_resp = self._manager.call({"type": "device.config.list"})
+        stream_names_by_device = self._preflight_load_stream_names(device_config_resp)
+        if not stream_names_by_device:
+            diagnostics.append(
+                self._preflight_diag(
+                    severity="warning",
+                    path="sequence",
+                    code="stream_schema_unavailable",
+                    message="stream schema unavailable; stream checks may be incomplete",
+                )
+            )
+
+        capabilities_by_device: dict[str, dict[str, Json] | None] = {}
+        for device_id in sorted(device_ids):
+            cap_resp = self._call_device(device_id, "capabilities", {})
+            if not bool(cap_resp.get("ok", False)):
+                capabilities_by_device[device_id] = None
+                continue
+            capabilities_by_device[device_id] = self._preflight_parse_capabilities(
+                cap_resp.get("result")
+            )
+
+        env = dict(spec.vars)
+        env["vars"] = to_attrdict(dict(spec.vars))
+        self._preflight_steps(
+            steps=spec.steps,
+            path="steps",
+            env=env,
+            diagnostics=diagnostics,
+            device_ids=device_ids,
+            telemetry_signals_by_device=telemetry_signals_by_device,
+            stream_names_by_device=stream_names_by_device,
+            capabilities_by_device=capabilities_by_device,
+            use_stack=(),
+        )
+        return diagnostics
+
     def _call_device(self, device_id: str, action: str, params: dict[str, Any]) -> Json:
         req = {
             "type": "command",
@@ -515,6 +1729,14 @@ class SequencerProcess(ManagedProcessBase):
                         param("text", required=False, default=None, annotation="str"),
                     ],
                     doc="Validate sequence YAML without loading it.",
+                ),
+                method(
+                    "sequencer.preflight",
+                    params=[
+                        param("path", required=False, default=None, annotation="str"),
+                        param("text", required=False, default=None, annotation="str"),
+                    ],
+                    doc="Run runtime preflight checks on sequence YAML (without loading).",
                 ),
                 method(
                     "sequencer.start",
@@ -720,6 +1942,43 @@ class SequencerProcess(ManagedProcessBase):
                 "request_id": req.get("request_id"),
                 "ok": True,
                 "result": {"valid": bool(ok), "diagnostics": diagnostics},
+            }
+
+        if rtype == "sequencer.preflight":
+            path = params.get("path")
+            text = params.get("text")
+            source = "sequence_yaml"
+            if path:
+                source = str(path)
+                try:
+                    seq_text = Path(str(path)).read_text(encoding="utf-8")
+                except Exception as e:
+                    return {
+                        "request_id": req.get("request_id"),
+                        "ok": False,
+                        "error": {"code": "read_failed", "message": str(e)},
+                    }
+            elif text:
+                seq_text = str(text)
+            else:
+                return {
+                    "request_id": req.get("request_id"),
+                    "ok": False,
+                    "error": {"code": "missing_yaml"},
+                }
+            ok, spec, diagnostics = self._load_sequence_text(text=seq_text, source=source)
+            all_diagnostics = list(diagnostics)
+            if ok and isinstance(spec, SequenceSpec):
+                all_diagnostics.extend(self._preflight_sequence_spec(spec))
+            valid = bool(ok) and not self._preflight_has_errors(all_diagnostics)
+            return {
+                "request_id": req.get("request_id"),
+                "ok": True,
+                "result": {
+                    "valid": valid,
+                    "diagnostics": all_diagnostics,
+                    "summary": self._preflight_summary(all_diagnostics),
+                },
             }
 
         if rtype == "sequencer.library.list":

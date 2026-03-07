@@ -396,6 +396,10 @@ Validation rules used by `sequencer.validate`:
 - `and` / `or` require a list with at least one clause.
 - `and` / `or` with one clause are valid but produce a warning.
 
+`sequencer.validate` is intentionally structural only (YAML + AST + condition DSL).
+For runtime reachability checks (device/action/member/stream/signal references),
+use `sequencer.preflight`.
+
 Example:
 ```yaml
 condition:

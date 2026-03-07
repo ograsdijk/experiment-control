@@ -980,11 +980,11 @@ export function useSequencerController({
     try {
       const resp = await sendProcessCommand(
         sequencerProcess.process_id,
-        "sequencer.validate",
+        "sequencer.preflight",
         {
           text: sequencerYamlText,
         },
-        "sequencer-validate"
+        "sequencer-preflight"
       );
       if (!resp.ok) {
         const message = resp.error?.message ?? resp.error?.code ?? "Unknown error";
@@ -992,28 +992,38 @@ export function useSequencerController({
         setSequencerDiagnostics([]);
         notifications.show({
           color: "red",
-          title: "Validation failed",
+          title: "Validate + preflight failed",
           message,
         });
         return;
       }
       const result =
         resp.result && typeof resp.result === "object"
-          ? (resp.result as { valid?: unknown; diagnostics?: unknown })
+          ? (resp.result as {
+              valid?: unknown;
+              diagnostics?: unknown;
+              summary?: unknown;
+            })
           : null;
       const processDiagnostics = normalizeSequencerDiagnostics(result?.diagnostics);
       const localDiagnostics = buildLocalConditionDiagnostics(sequencerYamlText);
       const diagnostics = mergeDiagnostics(processDiagnostics, localDiagnostics);
       setSequencerDiagnostics(processDiagnostics);
+      const errorCount = diagnostics.filter(
+        (item) => item.severity === "error"
+      ).length;
+      const warningCount = diagnostics.filter(
+        (item) => item.severity === "warning"
+      ).length;
       const valid =
         result?.valid === true &&
         !diagnostics.some((item) => item.severity === "error");
       notifications.show({
         color: valid ? "teal" : "yellow",
-        title: valid ? "Sequence is valid" : "Sequence has issues",
+        title: valid ? "Sequence checks passed" : "Sequence has issues",
         message: valid
-          ? "No validation errors."
-          : `${diagnostics.length} diagnostic${diagnostics.length === 1 ? "" : "s"}`,
+          ? "No validation or preflight errors."
+          : `${diagnostics.length} diagnostic${diagnostics.length === 1 ? "" : "s"} (${errorCount} errors, ${warningCount} warnings)`,
       });
     } finally {
       setSequencerValidateBusy(false);

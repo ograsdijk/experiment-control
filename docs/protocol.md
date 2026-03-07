@@ -374,6 +374,23 @@ Response:
 - `{"ok": true, "result": {"valid": false, "diagnostics": [{"severity": "error", "message": "...", "line": 12, "column": 5, "source": "yaml"}]}}`
 - `{"ok": true, "result": {"valid": true, "diagnostics": [{"severity": "warning", "message": "steps[0].if.condition.and: 'and' has only one clause; consider removing the wrapper", "line": null, "column": null, "source": "sequencer.condition"}]}}`
 
+### `sequencer.preflight`
+Runs runtime-oriented checks without loading/executing the sequence.
+
+Request (from path):
+- `{"type": "sequencer.preflight", "params": {"path": "path/to/sequence.yaml"}}`
+
+Request (from text):
+- `{"type": "sequencer.preflight", "params": {"text": "...yaml..."}}`
+
+Response:
+- `{"ok": true, "result": {"valid": true, "diagnostics": [], "summary": {"errors": 0, "warnings": 0, "infos": 0}}}`
+- `{"ok": true, "result": {"valid": false, "diagnostics": [{"severity": "error", "code": "unknown_action", "path": "steps[0].call.action", "message": "...", "line": null, "column": null, "source": "sequencer.preflight", "details": {"device_id": "laser", "action": "set_frequency_hz"}}], "summary": {"errors": 1, "warnings": 0, "infos": 0}}}`
+
+Notes:
+- `sequencer.validate` remains structural/DSL validation only.
+- `sequencer.preflight` adds live manager/device checks (for example device existence, action/member/stream/signal references).
+
 ### `sequencer.load`
 Request:
 - `{"type": "sequencer.load", "params": {"path": "path/to/sequence.yaml"}}`

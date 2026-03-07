@@ -712,7 +712,7 @@ export function SequencerModal({
               Upload YAML
             </Button>
             <Text size="xs" c="dimmed">
-              Upload validates on demand and does not auto-run.
+              Upload runs checks on demand and does not auto-run.
             </Text>
           </Group>
           <Group gap="xs">
@@ -735,7 +735,7 @@ export function SequencerModal({
                 void onValidate();
               }}
             >
-              Validate
+              Validate + Preflight
             </Button>
             <Button
               size="xs"
@@ -885,7 +885,7 @@ export function SequencerModal({
             {!diagnosticsCollapsed &&
               (diagnostics.length === 0 ? (
                 <Text size="xs" c="dimmed">
-                  No diagnostics yet. Click Validate to check the YAML.
+                  No diagnostics yet. Click Validate + Preflight to check the YAML.
                 </Text>
               ) : (
                 <ScrollArea h={180}>
