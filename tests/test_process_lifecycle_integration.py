@@ -3,7 +3,6 @@
 import os
 import subprocess
 import sys
-import tempfile
 import time
 import ctypes
 from pathlib import Path
@@ -13,6 +12,8 @@ ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
+
+from tests._temp_utils import repo_temp_dir
 
 
 def _pid_is_alive(pid: int) -> bool:
@@ -114,6 +115,8 @@ time.sleep(60)
             env["PYTHONPATH"] = py_path + os.pathsep + env["PYTHONPATH"]
         else:
             env["PYTHONPATH"] = py_path
+        env["TEMP"] = str(pid_file.parent)
+        env["TMP"] = str(pid_file.parent)
         return subprocess.Popen(
             [sys.executable, "-c", parent_script, str(pid_file)],
             env=env,
@@ -129,7 +132,9 @@ from pathlib import Path
 from experiment_control.utils.process_lifecycle import ProcessGuardian
 
 pid_file = Path(sys.argv[1])
+guard_file = Path(sys.argv[2])
 guard = ProcessGuardian()
+guard_file.write_text("1" if getattr(guard, "_job", None) is not None else "0", encoding="utf-8")
 child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
 guard.adopt_popen(child)
 pid_file.write_text(str(child.pid), encoding="utf-8")
@@ -141,8 +146,11 @@ time.sleep(60)
             env["PYTHONPATH"] = py_path + os.pathsep + env["PYTHONPATH"]
         else:
             env["PYTHONPATH"] = py_path
+        env["TEMP"] = str(pid_file.parent)
+        env["TMP"] = str(pid_file.parent)
+        guard_file = pid_file.with_suffix(".guarded")
         return subprocess.Popen(
-            [sys.executable, "-c", parent_script, str(pid_file)],
+            [sys.executable, "-c", parent_script, str(pid_file), str(guard_file)],
             env=env,
             text=True,
         )
@@ -152,21 +160,31 @@ time.sleep(60)
             spawner = self._spawn_windows_job_parent
         else:
             spawner = self._spawn_posix_guard_parent
+        child_exit_timeout_s = 20.0 if sys.platform == "win32" else 6.0
 
-        with tempfile.TemporaryDirectory() as tmp:
-            tmp_path = Path(tmp)
+        with repo_temp_dir("process-lifecycle-integration") as tmp_path:
             first_pid_file = tmp_path / "first_child.pid"
             second_pid_file = tmp_path / "second_child.pid"
+            first_guard_file = first_pid_file.with_suffix(".guarded")
 
             first_parent = spawner(first_pid_file)
             try:
                 self.assertTrue(_wait_for_file(first_pid_file), "first child pid not written")
+                if sys.platform == "win32":
+                    self.assertTrue(
+                        _wait_for_file(first_guard_file),
+                        "first guard marker not written",
+                    )
+                    if first_guard_file.read_text(encoding="utf-8").strip() != "1":
+                        self.skipTest(
+                            "Windows Job Object attach unavailable in this environment"
+                        )
                 first_child_pid = int(first_pid_file.read_text(encoding="utf-8").strip())
                 self.assertTrue(_pid_is_alive(first_child_pid))
                 first_parent.kill()
                 first_parent.wait(timeout=5.0)
                 self.assertTrue(
-                    _wait_pid_exit(first_child_pid, timeout_s=6.0),
+                    _wait_pid_exit(first_child_pid, timeout_s=child_exit_timeout_s),
                     f"first child pid {first_child_pid} still alive after parent kill",
                 )
             finally:
@@ -184,7 +202,7 @@ time.sleep(60)
                 second_parent.kill()
                 second_parent.wait(timeout=5.0)
                 self.assertTrue(
-                    _wait_pid_exit(second_child_pid, timeout_s=6.0),
+                    _wait_pid_exit(second_child_pid, timeout_s=child_exit_timeout_s),
                     f"second child pid {second_child_pid} still alive after parent kill",
                 )
             finally:

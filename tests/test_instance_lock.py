@@ -2,7 +2,6 @@
 
 import sys
 import os
-import tempfile
 from pathlib import Path
 import unittest
 from unittest import mock
@@ -19,6 +18,7 @@ from experiment_control.utils.instance_lock import (
     lock_effective_status_help,
     read_instance_lock_status,
 )
+from tests._temp_utils import repo_temp_dir
 
 
 class InstanceLockTests(unittest.TestCase):
@@ -34,8 +34,7 @@ class InstanceLockTests(unittest.TestCase):
         win_probe.assert_called_once_with(123)
 
     def test_acquire_and_release(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with repo_temp_dir("instance-lock") as root:
             with mock.patch(
                 "experiment_control.utils.instance_lock._lock_root",
                 return_value=root,
@@ -50,8 +49,7 @@ class InstanceLockTests(unittest.TestCase):
                 self.assertFalse(lock.path.exists())
 
     def test_acquire_overwrites_stale_lock(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with repo_temp_dir("instance-lock") as root:
             lock_path = root / "vacuum.json"
             lock_path.parent.mkdir(parents=True, exist_ok=True)
             lock_path.write_text(
@@ -71,8 +69,7 @@ class InstanceLockTests(unittest.TestCase):
                 lock.release()
 
     def test_acquire_rejects_live_lock(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with repo_temp_dir("instance-lock") as root:
             with mock.patch(
                 "experiment_control.utils.instance_lock._lock_root",
                 return_value=root,
@@ -91,8 +88,7 @@ class InstanceLockTests(unittest.TestCase):
                 first.release()
 
     def test_read_instance_lock_status_reports_missing(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with repo_temp_dir("instance-lock") as root:
             with mock.patch(
                 "experiment_control.utils.instance_lock._lock_root",
                 return_value=root,
@@ -102,8 +98,7 @@ class InstanceLockTests(unittest.TestCase):
         self.assertEqual(status["status"], "missing")
 
     def test_read_instance_lock_status_reports_active(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with repo_temp_dir("instance-lock") as root:
             with mock.patch(
                 "experiment_control.utils.instance_lock._lock_root",
                 return_value=root,
