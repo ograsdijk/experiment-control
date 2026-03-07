@@ -92,6 +92,10 @@ export function normalizeUiProfile(
   const navWidthRaw = layout.nav_width ?? layout.navWidth ?? obj.navWidth;
   const deviceOrderRaw =
     layout.device_order ?? layout.deviceOrder ?? obj.deviceOrder;
+  const devicePanelCollapsedRaw =
+    layout.device_panel_collapsed ??
+    layout.devicePanelCollapsed ??
+    obj.devicePanelCollapsed;
   const collapsedRaw =
     layout.telemetry_collapsed_by_device ??
     layout.telemetryCollapsedByDevice ??
@@ -116,6 +120,7 @@ export function normalizeUiProfile(
 
   const hasKnownData =
     navWidthRaw !== undefined ||
+    devicePanelCollapsedRaw !== undefined ||
     deviceOrderRaw !== undefined ||
     collapsedRaw !== undefined ||
     pinnedCommandsRaw !== undefined ||
@@ -135,6 +140,7 @@ export function normalizeUiProfile(
 
   return {
     navWidth,
+    devicePanelCollapsed: Boolean(devicePanelCollapsedRaw),
     plotState: opts.normalizePlotState(plotStateRaw),
     deviceOrder: normalizeStringList(deviceOrderRaw),
     telemetryCollapsedByDevice: normalizeBooleanMap(collapsedRaw),

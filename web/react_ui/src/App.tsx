@@ -22,6 +22,8 @@
 import { notifications } from "@mantine/notifications";
 import {
   IconCheck,
+  IconChevronLeft,
+  IconChevronRight,
   IconCpu,
   IconFileText,
   IconArrowsMaximize,
@@ -54,7 +56,10 @@ import {
   fetchDevices,
   fetchGatewaySettings,
   fetchInstanceRuntimeStatus,
+  fetchRawStreamSnapshot,
   fetchStreams,
+  fetchStreamWorkspaceSnapshot,
+  fetchTelemetrySnapshot,
   callProcess,
   deleteStreamWorkspace,
   fetchStreamWorkspace,
@@ -360,6 +365,15 @@ export function App() {
       max: NAV_MAX_WIDTH,
     });
   });
+  const [isDevicePanelCollapsed, setIsDevicePanelCollapsed] = useState(() => {
+    try {
+      const raw = localStorage.getItem("ecui.devicePanelCollapsed");
+      return raw === "1" || raw === "true";
+    } catch {
+      // ignore storage errors
+    }
+    return false;
+  });
   const resizeRef = useRef<{ startX: number; startWidth: number } | null>(null);
   const [isResizing, setIsResizing] = useState(false);
   const initialPlotState = useMemo(() => {
@@ -590,6 +604,9 @@ export function App() {
   const streamWorkspaceRevisionsRef = useRef<Record<string, number>>({});
   const panelsRef = useRef<PlotPanelState[]>(initialPlotState.panels);
   const streamAnalysisReadyRef = useRef(false);
+  const telemetrySnapshotHydratedRef = useRef(false);
+  const rawSnapshotHydratedRef = useRef<Set<string>>(new Set());
+  const workspaceSnapshotHydratedRef = useRef<Set<string>>(new Set());
 
   useEffect(() => {
     return () => {
@@ -1256,6 +1273,7 @@ export function App() {
         exported_at: new Date().toISOString(),
         layout: {
           nav_width: navWidth,
+          device_panel_collapsed: isDevicePanelCollapsed,
           device_order: [...deviceOrder],
           telemetry_collapsed_by_device: { ...telemetryCollapsedByDevice },
         },
@@ -1324,6 +1342,7 @@ export function App() {
       }
       panelIdRef.current = profile.plotState.nextPanelId;
       setNavWidth(profile.navWidth);
+      setDevicePanelCollapsed(profile.devicePanelCollapsed);
       setPanels(profile.plotState.panels);
       setActivePanelId(profile.plotState.activePanelId);
       setDeviceOrder(profile.deviceOrder);
@@ -1611,6 +1630,17 @@ export function App() {
 
   useEffect(() => {
     try {
+      localStorage.setItem(
+        "ecui.devicePanelCollapsed",
+        isDevicePanelCollapsed ? "1" : "0"
+      );
+    } catch {
+      // ignore storage errors
+    }
+  }, [isDevicePanelCollapsed]);
+
+  useEffect(() => {
+    try {
       const serializedPlotState = serializePlotState({ panels, activePanelId });
       localStorage.setItem(
         "ecui.plotState",
@@ -1802,7 +1832,7 @@ export function App() {
   }, [streamAnalysisRpcReady]);
 
   useEffect(() => {
-    if (!isResizing) {
+    if (!isResizing || isDevicePanelCollapsed) {
       return;
     }
     const handleMove = (event: PointerEvent) => {
@@ -1830,7 +1860,7 @@ export function App() {
       document.body.style.cursor = "";
       document.body.style.userSelect = "";
     };
-  }, [isResizing]);
+  }, [isResizing, isDevicePanelCollapsed]);
 
   useEffect(() => {
     const handleResize = () => {
@@ -1963,6 +1993,238 @@ export function App() {
   ]);
 
   useEffect(() => {
+    if (telemetrySnapshotHydratedRef.current) {
+      return;
+    }
+    let cancelled = false;
+    const load = async () => {
+      try {
+        const snapshot = await fetchTelemetrySnapshot();
+        if (cancelled) {
+          return;
+        }
+        telemetrySnapshotHydratedRef.current = true;
+        const deviceEntries = Object.entries(snapshot);
+        if (deviceEntries.length <= 0) {
+          return;
+        }
+        const booleanSignalKeys = new Set<string>();
+        let pushedSamples = false;
+        setLatestByDevice((prev) => {
+          const next: LatestSignals = { ...prev };
+          for (const [deviceId, signals] of deviceEntries) {
+            const deviceSignals = { ...(next[deviceId] ?? {}) };
+            for (const [name, signal] of Object.entries(signals)) {
+              deviceSignals[name] = signal;
+              const traceKey = `${deviceId}:${name}`;
+              let plotValue: number | null = null;
+              if (typeof signal.value === "number" && Number.isFinite(signal.value)) {
+                plotValue = signal.value;
+              } else if (typeof signal.value === "boolean") {
+                plotValue = signal.value ? 1 : 0;
+                booleanSignalKeys.add(traceKey);
+              }
+              if (plotValue !== null) {
+                for (const panelBuffers of buffersRef.values()) {
+                  const buffer = panelBuffers.get(traceKey);
+                  if (buffer) {
+                    buffer.push(normalizeTime(signal), plotValue);
+                    pushedSamples = true;
+                  }
+                }
+              }
+            }
+            next[deviceId] = deviceSignals;
+          }
+          return next;
+        });
+        if (booleanSignalKeys.size > 0) {
+          setPanels((prev) => {
+            let changed = false;
+            const next = prev.map((panel) => {
+              if (!isTelemetryPanel(panel)) {
+                return panel;
+              }
+              let tracesChanged = false;
+              const nextTraces = panel.traces.map((trace) => {
+                const key = `${trace.deviceId}:${trace.signal}`;
+                if (!booleanSignalKeys.has(key) || trace.valueKind === "boolean") {
+                  return trace;
+                }
+                tracesChanged = true;
+                changed = true;
+                return { ...trace, valueKind: "boolean" as const };
+              });
+              return tracesChanged ? { ...panel, traces: nextTraces } : panel;
+            });
+            return changed ? next : prev;
+          });
+        }
+        if (pushedSamples) {
+          setPlotTick((tick) => tick + 1);
+        }
+      } catch {
+        telemetrySnapshotHydratedRef.current = true;
+      }
+    };
+    void load();
+    return () => {
+      cancelled = true;
+    };
+  }, [buffersRef]);
+
+  useEffect(() => {
+    if (activeRawStreamSubscriptions.length <= 0) {
+      return;
+    }
+    let cancelled = false;
+    const keyFor = (subscription: RawStreamSubscription) =>
+      `${subscription.deviceId}|${subscription.stream}|${subscription.channelIndex}|${subscription.traceDecimator}|${subscription.traceMaxPoints}|${subscription.traceMaxFps.toFixed(3)}|${subscription.rollingWindow}|${subscription.averageMode}`;
+    const activeKeys = new Set(activeRawStreamSubscriptions.map((sub) => keyFor(sub)));
+    rawSnapshotHydratedRef.current = new Set(
+      [...rawSnapshotHydratedRef.current].filter((key) => activeKeys.has(key))
+    );
+    const pending = activeRawStreamSubscriptions.filter(
+      (subscription) => !rawSnapshotHydratedRef.current.has(keyFor(subscription))
+    );
+    if (pending.length <= 0) {
+      return;
+    }
+    const load = async () => {
+      let updated = false;
+      for (const subscription of pending) {
+        const key = keyFor(subscription);
+        try {
+          const msg = await fetchRawStreamSnapshot({
+            deviceId: subscription.deviceId,
+            stream: subscription.stream,
+            channelIndex: subscription.channelIndex,
+            traceDecimator: subscription.traceDecimator,
+            traceMaxPoints: subscription.traceMaxPoints,
+            traceMaxFps: subscription.traceMaxFps,
+            rollingWindow: subscription.rollingWindow,
+            averageMode: subscription.averageMode,
+          });
+          if (cancelled) {
+            return;
+          }
+          rawSnapshotHydratedRef.current.add(key);
+          const frame = msg ? normalizeStreamFrameMessage(msg) : null;
+          if (frame === null) {
+            continue;
+          }
+          if (applyRawStreamFrameToPanels(subscription, frame)) {
+            updated = true;
+          }
+        } catch {
+          rawSnapshotHydratedRef.current.add(key);
+        }
+      }
+      if (!cancelled && updated) {
+        setPlotTick((tick) => tick + 1);
+      }
+    };
+    void load();
+    return () => {
+      cancelled = true;
+    };
+  }, [activeRawStreamSubscriptions]);
+
+  useEffect(() => {
+    if (!streamAnalysisRpcReady || activeStreamAnalysisWorkspaceSubscriptions.length <= 0) {
+      return;
+    }
+    let cancelled = false;
+    const kindsByWorkspace = new Map<string, Set<string>>();
+    const traceMaxPointsByWorkspace = new Map<string, number>();
+    for (const subscription of activeStreamAnalysisWorkspaceSubscriptions) {
+      const workspaceId = String(subscription.workspaceId ?? "").trim();
+      if (!workspaceId) {
+        continue;
+      }
+      const kinds = kindsByWorkspace.get(workspaceId) ?? new Set<string>();
+      for (const kind of subscription.kinds) {
+        kinds.add(String(kind));
+      }
+      kindsByWorkspace.set(workspaceId, kinds);
+      if (
+        subscription.kinds.includes("trace") &&
+        typeof subscription.traceMaxPoints === "number" &&
+        Number.isFinite(subscription.traceMaxPoints)
+      ) {
+        const current = traceMaxPointsByWorkspace.get(workspaceId) ?? 0;
+        traceMaxPointsByWorkspace.set(
+          workspaceId,
+          Math.max(current, Math.max(32, Math.trunc(subscription.traceMaxPoints)))
+        );
+      }
+    }
+    const snapshotTargets = [...kindsByWorkspace.entries()].map(([workspaceId, kindsSet]) => {
+      const kinds = [...kindsSet].sort();
+      const maxTracePoints = traceMaxPointsByWorkspace.get(workspaceId);
+      const key = `${workspaceId}|${kinds.join(",")}|${
+        typeof maxTracePoints === "number" ? String(maxTracePoints) : ""
+      }`;
+      return { workspaceId, kinds, maxTracePoints, key };
+    });
+    const activeKeys = new Set(snapshotTargets.map((entry) => entry.key));
+    workspaceSnapshotHydratedRef.current = new Set(
+      [...workspaceSnapshotHydratedRef.current].filter((key) => activeKeys.has(key))
+    );
+    const pending = snapshotTargets.filter(
+      (entry) => !workspaceSnapshotHydratedRef.current.has(entry.key)
+    );
+    if (pending.length <= 0) {
+      return;
+    }
+    const load = async () => {
+      let updated = false;
+      for (const target of pending) {
+        try {
+          const resp = await fetchStreamWorkspaceSnapshot(target.workspaceId, {
+            kinds: target.kinds,
+            maxTracePoints: target.maxTracePoints ?? null,
+          });
+          if (cancelled) {
+            return;
+          }
+          workspaceSnapshotHydratedRef.current.add(target.key);
+          if (!resp.ok || !resp.result || typeof resp.result !== "object") {
+            continue;
+          }
+          const outputsRaw = Array.isArray(resp.result.outputs)
+            ? resp.result.outputs
+            : [];
+          for (const outputRaw of outputsRaw) {
+            if (!outputRaw || typeof outputRaw !== "object") {
+              continue;
+            }
+            const normalized = normalizeStreamAnalysisOutputMessage({
+              topic: "manager.stream_analysis.output",
+              payload: outputRaw as StreamAnalysisMessage["payload"],
+            });
+            if (normalized === null) {
+              continue;
+            }
+            if (applyStreamAnalysisOutputToPanels(normalized)) {
+              updated = true;
+            }
+          }
+        } catch {
+          workspaceSnapshotHydratedRef.current.add(target.key);
+        }
+      }
+      if (!cancelled && updated) {
+        setPlotTick((tick) => tick + 1);
+      }
+    };
+    void load();
+    return () => {
+      cancelled = true;
+    };
+  }, [streamAnalysisRpcReady, activeStreamAnalysisWorkspaceSubscriptions]);
+
+  useEffect(() => {
     const ws = new WebSocket(buildWsUrl("/ws/telemetry"));
     ws.onopen = () => {
       setWsConnected(true);
@@ -2075,60 +2337,7 @@ export function App() {
         if (frame.deviceId !== subscription.deviceId || frame.stream !== subscription.stream) {
           return;
         }
-        let updated = false;
-        for (const panel of panelsRef.current) {
-          if (
-            !isStreamTracePanel(panel) ||
-            panel.sourceMode !== "raw" ||
-            panel.stream === null
-          ) {
-            continue;
-          }
-          if (
-            panel.stream.deviceId !== subscription.deviceId ||
-            panel.stream.stream !== subscription.stream
-          ) {
-            continue;
-          }
-          if (Math.max(0, Math.trunc(panel.channelIndex)) !== subscription.channelIndex) {
-            continue;
-          }
-          if (normalizeTraceDecimator(panel.traceDecimator) !== subscription.traceDecimator) {
-            continue;
-          }
-          if (normalizeTraceMaxPoints(panel.traceMaxPoints) !== subscription.traceMaxPoints) {
-            continue;
-          }
-          if (normalizeTraceMaxFps(panel.traceMaxFps) !== subscription.traceMaxFps) {
-            continue;
-          }
-          if (normalizeTraceRollingWindow(panel.rollingWindow) !== subscription.rollingWindow) {
-            continue;
-          }
-          if (normalizeTraceAverageMode(panel.averageMode) !== subscription.averageMode) {
-            continue;
-          }
-          const currentFrames = streamFramesRef.get(panel.id) ?? [];
-          if (
-            currentFrames.length > 0 &&
-            currentFrames[currentFrames.length - 1].seq === frame.seq
-          ) {
-            continue;
-          }
-          const appended = [
-            ...currentFrames,
-            {
-              seq: frame.seq,
-              shape: frame.shape,
-              values: frame.values,
-            },
-          ];
-          const keep = Math.max(MAX_STREAM_FRAME_BUFFER, panel.overlayCount * 4);
-          const nextFrames =
-            appended.length > keep ? appended.slice(appended.length - keep) : appended;
-          streamFramesRef.set(panel.id, nextFrames);
-          updated = true;
-        }
+        const updated = applyRawStreamFrameToPanels(subscription, frame);
         if (updated) {
           setPlotTick((tick) => tick + 1);
         }
@@ -2199,217 +2408,26 @@ export function App() {
     ) => (event: MessageEvent<string>) => {
       try {
         const msg = JSON.parse(event.data) as StreamAnalysisMessage;
-        let updated = false;
         const output = normalizeStreamAnalysisOutputMessage(msg);
-        if (output !== null && output.kind === "scalar") {
-          const scalar = Number(output.value);
-          if (Number.isFinite(scalar)) {
-            for (const panel of panelsRef.current) {
-              if (!isStreamScalarPanel(panel)) {
-                if (isStreamParamsPanel(panel)) {
-                  if (panel.workspaceId !== output.workspaceId) {
-                    continue;
-                  }
-                  if (!(panel.outputIds ?? []).includes(output.outputId)) {
-                    continue;
-                  }
-                  const latest = streamParamsLatestRef.get(panel.id) ?? {};
-                  latest[output.outputId] = scalar;
-                  streamParamsLatestRef.set(panel.id, latest);
-                  updated = true;
-                }
-                continue;
-              }
-              if (panel.workspaceId !== output.workspaceId) {
-                continue;
-              }
-              if ((panel.outputId ?? "") !== output.outputId) {
-                continue;
-              }
-              const panelBuffers = ensurePanelBuffers(panel.id);
-              const key = traceKeyId(streamScalarTrace(panel));
-              let buffer = panelBuffers.get(key);
-              if (!buffer) {
-                buffer = new RingBuffer(panelCapacity(panel.timeWindowS));
-                panelBuffers.set(key, buffer);
-              }
-              buffer.push(output.tWallS, scalar);
-              updated = true;
-            }
-          }
+        if (output === null) {
+          return;
         }
-        if (output !== null && output.kind === "params_map") {
-          const paramsMap = normalizeFitParamsMapValue(output.value);
-          if (paramsMap) {
-            for (const panel of panelsRef.current) {
-              if (!isStreamParamsPanel(panel)) {
-                continue;
+        const traceFilter =
+          subscription.kinds.includes("trace") &&
+          subscription.traceDecimator !== undefined &&
+          subscription.traceMaxPoints !== undefined &&
+          subscription.traceMaxFps !== undefined &&
+          subscription.traceRollingWindow !== undefined &&
+          subscription.traceAverageMode !== undefined
+            ? {
+                traceDecimator: subscription.traceDecimator,
+                traceMaxPoints: subscription.traceMaxPoints,
+                traceMaxFps: subscription.traceMaxFps,
+                traceRollingWindow: subscription.traceRollingWindow,
+                traceAverageMode: subscription.traceAverageMode,
               }
-              if (panel.workspaceId !== output.workspaceId) {
-                continue;
-              }
-              if (!(panel.outputIds ?? []).includes(output.outputId)) {
-                continue;
-              }
-              const latest = streamParamsLatestRef.get(panel.id) ?? {};
-              latest[output.outputId] = paramsMap;
-              streamParamsLatestRef.set(panel.id, latest);
-              updated = true;
-            }
-          }
-        }
-        if (output !== null && output.kind === "hist_agg") {
-          const series = normalizeHistAggValue(output.value);
-          if (series) {
-            for (const panel of panelsRef.current) {
-              if (!isStreamBinStatsPanel(panel)) {
-                continue;
-              }
-              if (panel.workspaceId !== output.workspaceId) {
-                continue;
-              }
-              if ((panel.outputId ?? "") !== output.outputId) {
-                continue;
-              }
-              streamBinStatsRef.set(panel.id, series);
-              updated = true;
-            }
-          }
-        }
-        if (output !== null && output.kind === "hist2d") {
-          const snapshot = normalizeHist2dValue(output.value);
-          if (snapshot) {
-            for (const panel of panelsRef.current) {
-              if (!isStreamBin2dPanel(panel)) {
-                continue;
-              }
-              if (panel.workspaceId !== output.workspaceId) {
-                continue;
-              }
-              if ((panel.outputId ?? "") !== output.outputId) {
-                continue;
-              }
-              streamBin2dRef.set(panel.id, snapshot);
-              updated = true;
-            }
-          }
-        }
-        if (output !== null && output.kind === "fit_1d") {
-          const fit = normalizeFitCurveValue(output.value);
-          if (fit) {
-            for (const panel of panelsRef.current) {
-              if (!isStreamBinStatsPanel(panel)) {
-                continue;
-              }
-              if (panel.workspaceId !== output.workspaceId) {
-                continue;
-              }
-              const overlayIds = new Set(
-                (panel.fitOverlayOutputIds ?? []).map((id) => String(id ?? "").trim())
-              );
-              if (!overlayIds.has(output.outputId)) {
-                continue;
-              }
-              const perPanel = streamBinStatsFitOverlayRef.get(panel.id) ?? new Map();
-              perPanel.set(output.outputId, fit);
-              streamBinStatsFitOverlayRef.set(panel.id, perPanel);
-              updated = true;
-            }
-          }
-        }
-        if (output !== null && output.kind === "trace") {
-          const values = normalizeTraceValues(output.value);
-          if (values !== null) {
-            for (const panel of panelsRef.current) {
-              if (
-                isStreamBinStatsPanel(panel) &&
-                panel.workspaceId === output.workspaceId
-              ) {
-                const overlayIds = new Set(
-                  (panel.overlayOutputIds ?? []).map((id) => String(id ?? "").trim())
-                );
-                if (overlayIds.has(output.outputId)) {
-                  const perPanel = streamBinStatsOverlayRef.get(panel.id) ?? new Map();
-                  const seq =
-                    output.seq ??
-                    (perPanel.get(output.outputId)?.seq ?? 0) + 1;
-                  perPanel.set(output.outputId, { seq, values });
-                  streamBinStatsOverlayRef.set(panel.id, perPanel);
-                  updated = true;
-                }
-              }
-              if (
-                !isStreamTracePanel(panel) ||
-                panel.sourceMode !== "dag" ||
-                panel.workspaceId !== output.workspaceId
-              ) {
-                continue;
-              }
-              if (
-                subscription.traceDecimator !== undefined &&
-                (normalizeTraceDecimator(panel.traceDecimator) !==
-                  subscription.traceDecimator ||
-                  normalizeTraceMaxPoints(panel.traceMaxPoints) !==
-                    subscription.traceMaxPoints ||
-                  normalizeTraceMaxFps(panel.traceMaxFps) !==
-                    subscription.traceMaxFps ||
-                  normalizeTraceRollingWindow(panel.rollingWindow) !==
-                    subscription.traceRollingWindow ||
-                  normalizeTraceAverageMode(panel.averageMode) !==
-                    subscription.traceAverageMode)
-              ) {
-                continue;
-              }
-              const primaryOutputId = String(panel.outputId ?? "").trim();
-              const overlayOutputIds = new Set(
-                (panel.overlayOutputIds ?? []).map((id) => String(id ?? "").trim())
-              );
-              const isPrimary = primaryOutputId.length > 0 && primaryOutputId === output.outputId;
-              const isOverlay = overlayOutputIds.has(output.outputId);
-              if (!isPrimary && !isOverlay) {
-                continue;
-              }
-              if (isOverlay) {
-                const perPanel = streamTraceOverlayRef.get(panel.id) ?? new Map();
-                const seq =
-                  output.seq ??
-                  (perPanel.get(output.outputId)?.seq ?? 0) + 1;
-                perPanel.set(output.outputId, { seq, values });
-                streamTraceOverlayRef.set(panel.id, perPanel);
-                updated = true;
-                continue;
-              }
-              const currentFrames = streamFramesRef.get(panel.id) ?? [];
-              const seq =
-                output.seq ??
-                (currentFrames.length > 0
-                  ? currentFrames[currentFrames.length - 1].seq + 1
-                  : 0);
-              if (
-                currentFrames.length > 0 &&
-                currentFrames[currentFrames.length - 1].seq === seq
-              ) {
-                continue;
-              }
-              const appended = [
-                ...currentFrames,
-                {
-                  seq,
-                  shape: [values.length],
-                  values,
-                },
-              ];
-              const keep = Math.max(MAX_STREAM_FRAME_BUFFER, panel.overlayCount * 4);
-              const nextFrames =
-                appended.length > keep
-                  ? appended.slice(appended.length - keep)
-                  : appended;
-              streamFramesRef.set(panel.id, nextFrames);
-              updated = true;
-            }
-          }
-        }
-        if (updated) {
+            : undefined;
+        if (applyStreamAnalysisOutputToPanels(output, traceFilter)) {
           setPlotTick((tick) => tick + 1);
         }
       } catch {
@@ -2561,6 +2579,15 @@ export function App() {
     : telemetryActive
     ? "Connected (live)"
     : "Connected (idle)";
+  const connectedDeviceCount = useMemo(
+    () =>
+      devices.reduce((count, device) => {
+        return String(device.liveness ?? "").toUpperCase() === "DISCONNECTED"
+          ? count
+          : count + 1;
+      }, 0),
+    [devices]
+  );
 
   useEffect(() => {
     if (!logsOpen) {
@@ -2973,6 +3000,290 @@ export function App() {
       buffersRef.set(panelId, panelBuffers);
     }
     return panelBuffers;
+  };
+
+  const applyRawStreamFrameToPanels = (
+    subscription: RawStreamSubscription,
+    frame: {
+      seq: number;
+      shape: number[];
+      values: unknown;
+    }
+  ) => {
+    let updated = false;
+    for (const panel of panelsRef.current) {
+      if (
+        !isStreamTracePanel(panel) ||
+        panel.sourceMode !== "raw" ||
+        panel.stream === null
+      ) {
+        continue;
+      }
+      if (
+        panel.stream.deviceId !== subscription.deviceId ||
+        panel.stream.stream !== subscription.stream
+      ) {
+        continue;
+      }
+      if (Math.max(0, Math.trunc(panel.channelIndex)) !== subscription.channelIndex) {
+        continue;
+      }
+      if (normalizeTraceDecimator(panel.traceDecimator) !== subscription.traceDecimator) {
+        continue;
+      }
+      if (normalizeTraceMaxPoints(panel.traceMaxPoints) !== subscription.traceMaxPoints) {
+        continue;
+      }
+      if (normalizeTraceMaxFps(panel.traceMaxFps) !== subscription.traceMaxFps) {
+        continue;
+      }
+      if (normalizeTraceRollingWindow(panel.rollingWindow) !== subscription.rollingWindow) {
+        continue;
+      }
+      if (normalizeTraceAverageMode(panel.averageMode) !== subscription.averageMode) {
+        continue;
+      }
+      const currentFrames = streamFramesRef.get(panel.id) ?? [];
+      if (
+        currentFrames.length > 0 &&
+        currentFrames[currentFrames.length - 1].seq === frame.seq
+      ) {
+        continue;
+      }
+      const appended = [
+        ...currentFrames,
+        {
+          seq: frame.seq,
+          shape: frame.shape,
+          values: frame.values,
+        },
+      ];
+      const keep = Math.max(MAX_STREAM_FRAME_BUFFER, panel.overlayCount * 4);
+      const nextFrames =
+        appended.length > keep ? appended.slice(appended.length - keep) : appended;
+      streamFramesRef.set(panel.id, nextFrames);
+      updated = true;
+    }
+    return updated;
+  };
+
+  const applyStreamAnalysisOutputToPanels = (
+    output: NonNullable<ReturnType<typeof normalizeStreamAnalysisOutputMessage>>,
+    traceFilter?:
+      | {
+          traceDecimator: StreamTraceDecimator;
+          traceMaxPoints: number;
+          traceMaxFps: number;
+          traceRollingWindow: number;
+          traceAverageMode: StreamTraceAverageMode;
+        }
+      | undefined
+  ) => {
+    let updated = false;
+    if (output.kind === "scalar") {
+      const scalar = Number(output.value);
+      if (Number.isFinite(scalar)) {
+        for (const panel of panelsRef.current) {
+          if (!isStreamScalarPanel(panel)) {
+            if (isStreamParamsPanel(panel)) {
+              if (panel.workspaceId !== output.workspaceId) {
+                continue;
+              }
+              if (!(panel.outputIds ?? []).includes(output.outputId)) {
+                continue;
+              }
+              const latest = streamParamsLatestRef.get(panel.id) ?? {};
+              latest[output.outputId] = scalar;
+              streamParamsLatestRef.set(panel.id, latest);
+              updated = true;
+            }
+            continue;
+          }
+          if (panel.workspaceId !== output.workspaceId) {
+            continue;
+          }
+          if ((panel.outputId ?? "") !== output.outputId) {
+            continue;
+          }
+          const panelBuffers = ensurePanelBuffers(panel.id);
+          const key = traceKeyId(streamScalarTrace(panel));
+          let buffer = panelBuffers.get(key);
+          if (!buffer) {
+            buffer = new RingBuffer(panelCapacity(panel.timeWindowS));
+            panelBuffers.set(key, buffer);
+          }
+          buffer.push(output.tWallS, scalar);
+          updated = true;
+        }
+      }
+    }
+    if (output.kind === "params_map") {
+      const paramsMap = normalizeFitParamsMapValue(output.value);
+      if (paramsMap) {
+        for (const panel of panelsRef.current) {
+          if (!isStreamParamsPanel(panel)) {
+            continue;
+          }
+          if (panel.workspaceId !== output.workspaceId) {
+            continue;
+          }
+          if (!(panel.outputIds ?? []).includes(output.outputId)) {
+            continue;
+          }
+          const latest = streamParamsLatestRef.get(panel.id) ?? {};
+          latest[output.outputId] = paramsMap;
+          streamParamsLatestRef.set(panel.id, latest);
+          updated = true;
+        }
+      }
+    }
+    if (output.kind === "hist_agg") {
+      const series = normalizeHistAggValue(output.value);
+      if (series) {
+        for (const panel of panelsRef.current) {
+          if (!isStreamBinStatsPanel(panel)) {
+            continue;
+          }
+          if (panel.workspaceId !== output.workspaceId) {
+            continue;
+          }
+          if ((panel.outputId ?? "") !== output.outputId) {
+            continue;
+          }
+          streamBinStatsRef.set(panel.id, series);
+          updated = true;
+        }
+      }
+    }
+    if (output.kind === "hist2d") {
+      const snapshot = normalizeHist2dValue(output.value);
+      if (snapshot) {
+        for (const panel of panelsRef.current) {
+          if (!isStreamBin2dPanel(panel)) {
+            continue;
+          }
+          if (panel.workspaceId !== output.workspaceId) {
+            continue;
+          }
+          if ((panel.outputId ?? "") !== output.outputId) {
+            continue;
+          }
+          streamBin2dRef.set(panel.id, snapshot);
+          updated = true;
+        }
+      }
+    }
+    if (output.kind === "fit_1d") {
+      const fit = normalizeFitCurveValue(output.value);
+      if (fit) {
+        for (const panel of panelsRef.current) {
+          if (!isStreamBinStatsPanel(panel)) {
+            continue;
+          }
+          if (panel.workspaceId !== output.workspaceId) {
+            continue;
+          }
+          const overlayIds = new Set(
+            (panel.fitOverlayOutputIds ?? []).map((id) => String(id ?? "").trim())
+          );
+          if (!overlayIds.has(output.outputId)) {
+            continue;
+          }
+          const perPanel = streamBinStatsFitOverlayRef.get(panel.id) ?? new Map();
+          perPanel.set(output.outputId, fit);
+          streamBinStatsFitOverlayRef.set(panel.id, perPanel);
+          updated = true;
+        }
+      }
+    }
+    if (output.kind === "trace") {
+      const values = normalizeTraceValues(output.value);
+      if (values !== null) {
+        for (const panel of panelsRef.current) {
+          if (
+            isStreamBinStatsPanel(panel) &&
+            panel.workspaceId === output.workspaceId
+          ) {
+            const overlayIds = new Set(
+              (panel.overlayOutputIds ?? []).map((id) => String(id ?? "").trim())
+            );
+            if (overlayIds.has(output.outputId)) {
+              const perPanel = streamBinStatsOverlayRef.get(panel.id) ?? new Map();
+              const seq =
+                output.seq ??
+                (perPanel.get(output.outputId)?.seq ?? 0) + 1;
+              perPanel.set(output.outputId, { seq, values });
+              streamBinStatsOverlayRef.set(panel.id, perPanel);
+              updated = true;
+            }
+          }
+          if (
+            !isStreamTracePanel(panel) ||
+            panel.sourceMode !== "dag" ||
+            panel.workspaceId !== output.workspaceId
+          ) {
+            continue;
+          }
+          if (traceFilter) {
+            if (
+              normalizeTraceDecimator(panel.traceDecimator) !== traceFilter.traceDecimator ||
+              normalizeTraceMaxPoints(panel.traceMaxPoints) !== traceFilter.traceMaxPoints ||
+              normalizeTraceMaxFps(panel.traceMaxFps) !== traceFilter.traceMaxFps ||
+              normalizeTraceRollingWindow(panel.rollingWindow) !==
+                traceFilter.traceRollingWindow ||
+              normalizeTraceAverageMode(panel.averageMode) !== traceFilter.traceAverageMode
+            ) {
+              continue;
+            }
+          }
+          const primaryOutputId = String(panel.outputId ?? "").trim();
+          const overlayOutputIds = new Set(
+            (panel.overlayOutputIds ?? []).map((id) => String(id ?? "").trim())
+          );
+          const isPrimary = primaryOutputId.length > 0 && primaryOutputId === output.outputId;
+          const isOverlay = overlayOutputIds.has(output.outputId);
+          if (!isPrimary && !isOverlay) {
+            continue;
+          }
+          if (isOverlay) {
+            const perPanel = streamTraceOverlayRef.get(panel.id) ?? new Map();
+            const seq = output.seq ?? (perPanel.get(output.outputId)?.seq ?? 0) + 1;
+            perPanel.set(output.outputId, { seq, values });
+            streamTraceOverlayRef.set(panel.id, perPanel);
+            updated = true;
+            continue;
+          }
+          const currentFrames = streamFramesRef.get(panel.id) ?? [];
+          const seq =
+            output.seq ??
+            (currentFrames.length > 0
+              ? currentFrames[currentFrames.length - 1].seq + 1
+              : 0);
+          if (
+            currentFrames.length > 0 &&
+            currentFrames[currentFrames.length - 1].seq === seq
+          ) {
+            continue;
+          }
+          const appended = [
+            ...currentFrames,
+            {
+              seq,
+              shape: [values.length],
+              values,
+            },
+          ];
+          const keep = Math.max(MAX_STREAM_FRAME_BUFFER, panel.overlayCount * 4);
+          const nextFrames =
+            appended.length > keep
+              ? appended.slice(appended.length - keep)
+              : appended;
+          streamFramesRef.set(panel.id, nextFrames);
+          updated = true;
+        }
+      }
+    }
+    return updated;
   };
 
   const refreshWorkspaceStoreStatus = async (
@@ -5629,9 +5940,26 @@ export function App() {
   const handleNavResizeStart = (
     event: React.PointerEvent<HTMLDivElement>
   ) => {
+    if (isDevicePanelCollapsed) {
+      return;
+    }
     event.preventDefault();
     resizeRef.current = { startX: event.clientX, startWidth: navWidth };
     setIsResizing(true);
+  };
+
+  const setDevicePanelCollapsed = (collapsed: boolean) => {
+    resizeRef.current = null;
+    setIsResizing(false);
+    setIsDevicePanelCollapsed(collapsed);
+  };
+
+  const collapseDevicePanel = () => {
+    setDevicePanelCollapsed(true);
+  };
+
+  const expandDevicePanel = () => {
+    setDevicePanelCollapsed(false);
   };
 
   const yAxisDraftMinNum = parseNumberInput(yAxisDraftMin);
@@ -5851,8 +6179,33 @@ export function App() {
         onRunInstanceCleanupApply={() => runInstanceCleanup(false)}
       />
       <AppShell.Main>
-        <div className="app-layout">
-          <section className="device-panel" style={{ width: navWidth }}>
+        <div
+          className={`app-layout${
+            isDevicePanelCollapsed ? " app-layout-device-collapsed" : ""
+          }`}
+        >
+          {isDevicePanelCollapsed ? (
+            <button
+              type="button"
+              className="device-panel-restore-tab"
+              onClick={expandDevicePanel}
+              aria-label={`Show device panel (${connectedDeviceCount} connected)`}
+              title={`Show devices (${connectedDeviceCount} connected / ${devices.length} total)`}
+            >
+              <span className="device-panel-restore-tab-count" aria-hidden="true">
+                <IconPlug size={12} />
+                <span>{connectedDeviceCount}</span>
+              </span>
+              <IconChevronRight size={14} />
+              <span className="device-panel-restore-tab-label">Devices</span>
+            </button>
+          ) : null}
+          <section
+            className={`device-panel${
+              isDevicePanelCollapsed ? " device-panel-collapsed" : ""
+            }`}
+            style={{ width: isDevicePanelCollapsed ? 0 : navWidth }}
+          >
             <Group mb="sm" justify="space-between">
               <Group gap={8}>
                 <Text fw={600}>Devices</Text>
@@ -5881,10 +6234,23 @@ export function App() {
                   Connect all
                 </Button>
               </Group>
-              <Group gap={6}>
+              <Group
+                gap={6}
+                title={`${connectedDeviceCount} connected / ${devices.length} total`}
+              >
+                <ActionIcon
+                  size="sm"
+                  variant="subtle"
+                  color="gray"
+                  onClick={collapseDevicePanel}
+                  aria-label="Collapse device panel"
+                  title="Collapse device panel"
+                >
+                  <IconChevronLeft size={16} />
+                </ActionIcon>
                 <IconPlug size={16} />
                 <Text size="xs" c="dimmed">
-                  {devices.length}
+                  {connectedDeviceCount}
                 </Text>
               </Group>
             </Group>
@@ -5988,13 +6354,19 @@ export function App() {
               </div>
             </ScrollArea>
           </section>
-          <div
-            className="layout-resizer"
-            onPointerDown={handleNavResizeStart}
-            role="separator"
-            aria-orientation="vertical"
-          />
-          <section className="plot-panel-area">
+          {isDevicePanelCollapsed ? null : (
+            <div
+              className="layout-resizer"
+              onPointerDown={handleNavResizeStart}
+              role="separator"
+              aria-orientation="vertical"
+            />
+          )}
+          <section
+            className={`plot-panel-area${
+              isDevicePanelCollapsed ? " plot-panel-area-expanded" : ""
+            }`}
+          >
             <Stack gap="lg">
               <Group justify="space-between">
                 <Text fw={600}>Plot workspace</Text>

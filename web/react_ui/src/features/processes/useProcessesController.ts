@@ -38,6 +38,14 @@ export function useProcessesController({ callProcessFn }: UseProcessesController
       if (existing.length > 0) {
         return existing;
       }
+      const process = processes.find((item) => item.process_id === processId);
+      if (process && process.registered !== true) {
+        setProcessCapabilitiesErrorById((prev) => ({
+          ...prev,
+          [processId]: "Process RPC endpoint is not ready.",
+        }));
+        return [];
+      }
       const resp = await callProcessFn(processId, "process.capabilities", {});
       const result =
         resp.result && typeof resp.result === "object"
@@ -63,7 +71,7 @@ export function useProcessesController({ callProcessFn }: UseProcessesController
       setProcessCapabilitiesErrorById((prev) => ({ ...prev, [processId]: message }));
       return [];
     },
-    [callProcessFn, capabilitiesByProcess]
+    [callProcessFn, capabilitiesByProcess, processes]
   );
 
   const invalidateProcessCapabilities = useCallback((processId: string) => {
@@ -120,6 +128,10 @@ export function useProcessesController({ callProcessFn }: UseProcessesController
         }
         if (!["RUNNING", "STARTING", "STOPPING"].includes(state)) {
           errors[processId] = "Process RPC is unavailable while process is stopped.";
+          continue;
+        }
+        if (process.registered !== true) {
+          errors[processId] = "Process RPC endpoint is not ready.";
           continue;
         }
         const resp = await callProcessFn(processId, "process.capabilities", {});

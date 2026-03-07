@@ -11,6 +11,7 @@ export type PlotState = {
 
 export type UiProfileState = {
   navWidth: number;
+  devicePanelCollapsed: boolean;
   plotState: PlotState;
   deviceOrder: string[];
   telemetryCollapsedByDevice: Record<string, boolean>;
@@ -24,6 +25,7 @@ export type UiProfileFile = {
   exported_at: string;
   layout: {
     nav_width: number;
+    device_panel_collapsed?: boolean;
     device_order: string[];
     telemetry_collapsed_by_device: Record<string, boolean>;
   };

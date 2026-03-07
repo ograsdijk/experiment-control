@@ -6,7 +6,9 @@ import {
   InterlockInterceptorStatus,
   LogEntry,
   ProcessStatus,
+  StreamFrameMessage,
   StreamCatalogEntry,
+  TelemetrySignal,
 } from "./types";
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? "";
@@ -272,6 +274,79 @@ export async function fetchDevices(): Promise<DeviceStatus[]> {
   return resp.result;
 }
 
+export type TelemetrySnapshotResult = {
+  generated_ts?: { t_wall?: number; t_mono?: number };
+  devices?: Record<string, Record<string, TelemetrySignal>>;
+};
+
+export async function fetchTelemetrySnapshot(): Promise<
+  Record<string, Record<string, TelemetrySignal>>
+> {
+  const resp = await apiFetch<TelemetrySnapshotResult>("/api/snapshots/telemetry");
+  if (!resp.ok || !resp.result || typeof resp.result !== "object") {
+    return {};
+  }
+  const rawDevices =
+    resp.result.devices && typeof resp.result.devices === "object"
+      ? resp.result.devices
+      : {};
+  const out: Record<string, Record<string, TelemetrySignal>> = {};
+  for (const [deviceIdRaw, signalsRaw] of Object.entries(rawDevices)) {
+    const deviceId = String(deviceIdRaw ?? "").trim();
+    if (!deviceId || !signalsRaw || typeof signalsRaw !== "object") {
+      continue;
+    }
+    const signalsOut: Record<string, TelemetrySignal> = {};
+    for (const [signalNameRaw, signalRaw] of Object.entries(
+      signalsRaw as Record<string, unknown>
+    )) {
+      const signalName = String(signalNameRaw ?? "").trim();
+      if (!signalName || !signalRaw || typeof signalRaw !== "object") {
+        continue;
+      }
+      const signalObj = signalRaw as Record<string, unknown>;
+      const tsRaw =
+        signalObj.ts && typeof signalObj.ts === "object"
+          ? (signalObj.ts as Record<string, unknown>)
+          : null;
+      const valueRaw = signalObj.value;
+      const value =
+        typeof valueRaw === "number" ||
+        typeof valueRaw === "string" ||
+        typeof valueRaw === "boolean" ||
+        valueRaw === null
+          ? valueRaw
+          : null;
+      signalsOut[signalName] = {
+        value,
+        units:
+          signalObj.units === null || typeof signalObj.units === "string"
+            ? (signalObj.units as string | null)
+            : null,
+        quality:
+          signalObj.quality === null || typeof signalObj.quality === "string"
+            ? (signalObj.quality as string | null)
+            : null,
+        ts: (() => {
+          if (!tsRaw) {
+            return undefined;
+          }
+          const tWallRaw = Number(tsRaw.t_wall);
+          const tMonoRaw = Number(tsRaw.t_mono);
+          const tWall = Number.isFinite(tWallRaw) ? tWallRaw : undefined;
+          const tMono = Number.isFinite(tMonoRaw) ? tMonoRaw : undefined;
+          if (tWall === undefined && tMono === undefined) {
+            return undefined;
+          }
+          return { t_wall: tWall, t_mono: tMono };
+        })(),
+      };
+    }
+    out[deviceId] = signalsOut;
+  }
+  return out;
+}
+
 export async function fetchStreams(): Promise<StreamCatalogEntry[]> {
   const resp = await apiFetch<StreamCatalogEntry[]>("/api/streams");
   if (!resp.ok || !resp.result) {
@@ -382,6 +457,63 @@ export async function fetchStreamWorkspace(workspaceId: string) {
     raw?: Record<string, unknown>;
   }>(`/api/stream/workspaces/${encodeURIComponent(workspaceId)}`);
   return rejectUnexpectedCapabilities(resp, `workspace ${workspaceId}`);
+}
+
+export async function fetchStreamWorkspaceSnapshot(
+  workspaceId: string,
+  opts?: {
+    kinds?: string[];
+    outputIds?: string[];
+    maxTracePoints?: number | null;
+  }
+) {
+  const params = new URLSearchParams();
+  if (opts?.kinds && opts.kinds.length > 0) {
+    params.set("kinds", opts.kinds.join(","));
+  }
+  if (opts?.outputIds && opts.outputIds.length > 0) {
+    params.set("output_ids", opts.outputIds.join(","));
+  }
+  if (
+    typeof opts?.maxTracePoints === "number" &&
+    Number.isFinite(opts.maxTracePoints)
+  ) {
+    params.set("max_trace_points", String(Math.max(1, Math.trunc(opts.maxTracePoints))));
+  }
+  const query = params.toString();
+  const path = `/api/stream/workspaces/${encodeURIComponent(workspaceId)}/snapshot${
+    query ? `?${query}` : ""
+  }`;
+  const resp = await apiFetch<Record<string, unknown>>(path);
+  return rejectUnexpectedCapabilities(resp, `workspace.snapshot(${workspaceId})`);
+}
+
+export async function fetchRawStreamSnapshot(opts: {
+  deviceId: string;
+  stream: string;
+  channelIndex: number;
+  traceDecimator: string;
+  traceMaxPoints: number;
+  traceMaxFps: number;
+  rollingWindow: number;
+  averageMode: string;
+}): Promise<StreamFrameMessage | null> {
+  const params = new URLSearchParams();
+  params.set("device_id", opts.deviceId);
+  params.set("stream", opts.stream);
+  params.set("channel_index", String(opts.channelIndex));
+  params.set("trace_decimator", opts.traceDecimator);
+  params.set("trace_max_points", String(opts.traceMaxPoints));
+  params.set("trace_max_fps", String(opts.traceMaxFps));
+  params.set("rolling_window", String(opts.rollingWindow));
+  params.set("trace_average_mode", opts.averageMode);
+  const resp = await apiFetch<StreamFrameMessage | null>(
+    `/api/streams/raw_snapshot?${params.toString()}`
+  );
+  if (!resp.ok || !resp.result || typeof resp.result !== "object") {
+    return null;
+  }
+  return resp.result as StreamFrameMessage;
 }
 
 export async function putStreamWorkspace(

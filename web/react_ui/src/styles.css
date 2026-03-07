@@ -126,6 +126,7 @@ body::before {
   align-items: stretch;
   width: 100%;
   min-width: 0;
+  position: relative;
 }
 
 .device-panel {
@@ -140,10 +141,90 @@ body::before {
   display: flex;
   flex-direction: column;
   flex: 0 0 auto;
+  transition:
+    width 140ms ease,
+    padding 140ms ease,
+    border-color 140ms ease,
+    box-shadow 140ms ease;
 }
 
 [data-mantine-color-scheme="dark"] .device-panel {
   background: rgba(23, 29, 37, 0.9);
+}
+
+.device-panel-collapsed {
+  min-width: 0 !important;
+  max-width: 0 !important;
+  width: 0 !important;
+  padding: 0;
+  border-width: 0;
+  border-color: transparent;
+  box-shadow: none;
+  overflow: hidden;
+}
+
+.device-panel-restore-tab {
+  position: relative;
+  align-self: flex-start;
+  flex: 0 0 30px;
+  width: 30px;
+  min-height: 148px;
+  margin-right: 8px;
+  border: 1px solid var(--card-border);
+  border-radius: 10px;
+  background: rgba(251, 249, 244, 0.92);
+  color: inherit;
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 8px 4px;
+  box-shadow: var(--shadow);
+}
+
+[data-mantine-color-scheme="dark"] .device-panel-restore-tab {
+  background: rgba(23, 29, 37, 0.92);
+}
+
+.device-panel-restore-tab:hover {
+  background: rgba(228, 238, 245, 0.95);
+}
+
+[data-mantine-color-scheme="dark"] .device-panel-restore-tab:hover {
+  background: rgba(37, 46, 58, 0.95);
+}
+
+.device-panel-restore-tab:focus-visible {
+  outline: 2px solid #0e9f9a;
+  outline-offset: 1px;
+}
+
+.device-panel-restore-tab-label {
+  writing-mode: vertical-rl;
+  text-orientation: mixed;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  opacity: 0.9;
+  user-select: none;
+}
+
+.device-panel-restore-tab-count {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  font-size: 10px;
+  line-height: 1;
+  gap: 2px;
+  color: rgba(89, 94, 102, 0.95);
+  user-select: none;
+}
+
+[data-mantine-color-scheme="dark"] .device-panel-restore-tab-count {
+  color: rgba(208, 214, 225, 0.9);
 }
 
 .layout-resizer {
@@ -172,6 +253,11 @@ body::before {
   padding-left: 20px;
   min-width: 0;
   overflow: auto;
+  transition: padding-left 140ms ease;
+}
+
+.plot-panel-area-expanded {
+  padding-left: 8px;
 }
 
 .plot-panel {

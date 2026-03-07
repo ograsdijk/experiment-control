@@ -115,6 +115,8 @@ export type ProcessStatus = {
   restart_policy?: string | null;
   restart_count?: number | null;
   last_exit_code?: number | null;
+  rpc_endpoint?: string | null;
+  registered?: boolean;
 };
 
 export type CapabilityParam = {
