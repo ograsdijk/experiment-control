@@ -224,6 +224,33 @@ Notes:
 - Sequencer lifecycle and loaded YAML snapshots are written under `/sequencer`.
 - For custom workflow-style managed processes, see `docs/state_machines.md`.
 
+## Instance lifecycle recovery (lock + orphan cleanup)
+
+`run_stack` now performs a startup preflight:
+
+- probes manager RPC for a live manager on the same `instance_id`
+- runs stale-child orphan cleanup before starting a new manager
+
+When you suspect a stuck/stale instance, use these tools in order:
+
+1. Web UI: click the instance title in the header, then use `Dry-run` in `Orphan cleanup`.
+2. Review `matched`/`candidates`, then use `Execute` to terminate stale child runners.
+3. TUI fallback: `o` runs cleanup preview (dry-run), `O` executes cleanup after confirmation.
+
+Lock status meanings shown in Web/TUI:
+
+- `active`: lock is owned by the running manager process.
+- `running_unlocked`: manager is reachable but no active lock is held.
+- `stale`: lock file exists but its owner process is not alive.
+- `missing`: no lock file exists for this instance.
+
+Windows liveness probe note:
+
+- On Windows, do not use `os.kill(pid, 0)` as a liveness probe.
+- In this stack it can terminate the target process instead of acting as a pure probe.
+- Use Win32 process-query APIs (`OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)` + `GetExitCodeProcess`) for PID liveness checks.
+- This applies to instance-lock status and orphan-cleanup stale-parent checks.
+
 ## Common issues
 
 - **Heartbeat bind failed: Address in use**

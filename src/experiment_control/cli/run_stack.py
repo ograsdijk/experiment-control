@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
 import time
@@ -17,7 +18,9 @@ from ..utils.config_parsing import (
     require_dict,
     require_str,
 )
+from ..utils.instance_lock import InstanceLock, InstanceLockActiveError
 from ..utils.manager_network import ManagerNetworkConfig, resolve_manager_network
+from ..utils.process_lifecycle import cleanup_orphan_children
 from ..utils.yaml_helpers import load_yaml_file
 from ..utils.zmq_helpers import json_dumps, safe_json_loads
 from ..manager import Manager, device_spec_from_yaml, process_spec_from_yaml
@@ -25,10 +28,28 @@ from ..manager import Manager, device_spec_from_yaml, process_spec_from_yaml
 Json = dict[str, Any]
 
 
+class _NoopInstanceLock:
+    def acquire(self) -> None:
+        return
+
+    def release(self) -> None:
+        return
+
+
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser("experiment_control.cli.run_stack")
     p.add_argument("path", help="Path to stack YAML")
     p.add_argument("--no-tui", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument(
+        "--cleanup-orphans",
+        action="store_true",
+        help="Run stale orphan child cleanup before stack startup.",
+    )
+    p.add_argument(
+        "--instance-lock",
+        action="store_true",
+        help="Acquire a per-instance startup lock while manager is running.",
+    )
     return p.parse_args(argv)
 
 
@@ -131,12 +152,13 @@ def _shutdown_manager(manager_rpc: str) -> None:
     ctx = zmq.Context.instance()
     sock = ctx.socket(zmq.DEALER)
     sock.setsockopt(zmq.LINGER, 0)
-    sock.setsockopt(zmq.RCVTIMEO, 1000)
+    sock.setsockopt(zmq.RCVTIMEO, 300)
     sock.connect(manager_rpc)
     try:
         sock.send(json_dumps({"type": "manager.shutdown"}))
-        sock.recv()
-    except Exception:
+        if sock.poll(300, zmq.POLLIN):
+            sock.recv()
+    except BaseException:
         pass
     sock.close(0)
 
@@ -195,6 +217,43 @@ def _probe_manager_ready(
         return False
     finally:
         sock.close(0)
+
+
+def _preflight_instance_cleanup(*, instance_id: str, manager_rpc: str) -> None:
+    _assert_instance_not_running(instance_id=instance_id, manager_rpc=manager_rpc)
+    summary = cleanup_orphan_children(
+        instance_id=str(instance_id),
+        exclude_pids={os.getpid()},
+        current_parent_pid=os.getpid(),
+        timeout_s=2.0,
+        stale_only=True,
+        dry_run=False,
+    )
+    matched = int(summary.get("matched", 0) or 0)
+    if matched <= 0:
+        return
+    terminated = summary.get("terminated", [])
+    failed = summary.get("failed", [])
+    sys.stderr.write(
+        "[run_stack] orphan cleanup: "
+        f"matched={matched}, terminated={len(terminated)}, failed={len(failed)}\n"
+    )
+    if failed:
+        sys.stderr.write(
+            f"[run_stack] orphan cleanup failed pids: {', '.join(str(pid) for pid in failed)}\n"
+        )
+
+
+def _assert_instance_not_running(*, instance_id: str, manager_rpc: str) -> None:
+    if _probe_manager_ready(
+        manager_rpc=str(manager_rpc),
+        timeout_ms=250,
+        expected_instance_id=str(instance_id),
+    ):
+        raise SystemExit(
+            "[run_stack] startup error: "
+            f"instance {instance_id!r} is already running at {manager_rpc!r}"
+        )
 
 
 def _wait_for_manager_ready(
@@ -262,6 +321,7 @@ def _run_with_tui(
     stack_path: Path,
     manager_network: ManagerNetworkConfig,
     tui_raw: Json,
+    instance_lock: bool = False,
 ) -> None:
     manager_rpc = manager_network.local_rpc_connect
     manager_pub = manager_network.local_pub_connect
@@ -271,15 +331,16 @@ def _run_with_tui(
     startup_timeout_s = float(tui_raw.get("startup_timeout_s", 15.0))
     probe_timeout_ms = min(500, max(100, rpc_timeout_ms))
 
-    manager_proc = subprocess.Popen(
-        [
-            sys.executable,
-            "-m",
-            "experiment_control.cli.run_stack",
-            str(stack_path),
-            "--no-tui",
-        ],
-    )
+    child_cmd = [
+        sys.executable,
+        "-m",
+        "experiment_control.cli.run_stack",
+        str(stack_path),
+        "--no-tui",
+    ]
+    if instance_lock:
+        child_cmd.append("--instance-lock")
+    manager_proc = subprocess.Popen(child_cmd)
     manager_ready = False
 
     try:
@@ -321,125 +382,153 @@ def main(argv: list[str] | None = None) -> None:
         manager_network = resolve_manager_network(manager_raw)
         tui_raw = _parse_tui(raw)
         if tui_raw.get("enabled") and not ns.no_tui:
+            if bool(ns.cleanup_orphans):
+                _preflight_instance_cleanup(
+                    instance_id=instance_id,
+                    manager_rpc=manager_network.local_rpc_connect,
+                )
             _run_with_tui(
                 instance_id=instance_id,
                 stack_path=stack_path,
                 manager_network=manager_network,
                 tui_raw=tui_raw,
+                instance_lock=bool(ns.instance_lock),
             )
             return
 
-        base_dir = stack_path.parent
-        device_paths = _collect_config_paths(
-            raw.get("devices"), base=base_dir, label="devices"
-        )
-        process_paths = _collect_config_paths(
-            raw.get("processes"), base=base_dir, label="processes"
-        )
-
-        device_specs = []
-        seen_devices: set[str] = set()
-        for dev_path in device_paths:
-            spec = device_spec_from_yaml(dev_path)
-            if spec.device_id in seen_devices:
-                raise ConfigError(
-                    "devices", f"duplicate device_id {spec.device_id!r}"
-                )
-            seen_devices.add(spec.device_id)
-            device_specs.append(spec)
-
-        federation_config = parse_federation_config(
-            raw.get("federation"),
-            local_device_ids=seen_devices,
-            manager_raw=manager_raw,
-        )
-
-        manager = Manager(
-            instance_id=instance_id,
-            federation_config=federation_config,
-            registry_bind=manager_network.registry_bind,
-            internal_rpc_bind=manager_network.internal_rpc_bind,
-            external_rpc_bind=manager_network.external_rpc_bind,
-            external_pub_bind=manager_network.external_pub_bind,
-            external_pub_connect_local=manager_network.local_pub_connect,
-            process_hb_bind_base=manager_network.process_hb_bind_base,
-            process_data_bind_base=manager_network.process_data_bind_base,
-            heartbeat_timeout_s=float(manager_raw.get("heartbeat_timeout_s", 3.0)),
-            telemetry_stale_s=float(manager_raw.get("telemetry_stale_s", 10.0)),
-            device_rpc_timeout_ms=int(manager_raw.get("device_rpc_timeout_ms", 1500)),
-            interceptor_rpc_timeout_ms=int(manager_raw.get("interceptor_rpc_timeout_ms", 500)),
-            auto_connect_on_register=bool(
-                manager_raw.get("auto_connect_on_register", True)
-            ),
-        )
-
-        process_manager_rpc = manager_network.local_rpc_connect
-        process_manager_pub = manager_network.local_pub_connect
-
-        for spec in device_specs:
-            manager.add_device(spec)
-
-        seen_processes: set[str] = set()
-        for proc_path in process_paths:
-            spec = process_spec_from_yaml(
-                proc_path,
-                manager_rpc=process_manager_rpc,
-                manager_pub=process_manager_pub,
+        if bool(ns.cleanup_orphans):
+            _preflight_instance_cleanup(
+                instance_id=instance_id,
+                manager_rpc=manager_network.local_rpc_connect,
             )
-            if spec.process_id in seen_processes:
-                raise ConfigError(
-                    "processes", f"duplicate process_id {spec.process_id!r}"
-                )
-            seen_processes.add(spec.process_id)
-            manager.add_process(spec)
-
-        startup = _parse_startup(raw)
-        start_devices = bool(startup.get("start_devices", True))
-        start_processes = bool(startup.get("start_processes", True))
-        process_order_raw = startup.get("process_order")
-        if process_order_raw is not None and not isinstance(process_order_raw, list):
-            raise ConfigError("startup.process_order", "must be a list[str]")
-        process_order = None
-        if process_order_raw is not None:
-            process_order = [str(pid) for pid in process_order_raw]
-
-        if start_processes and seen_processes:
-            ordered = _order_processes(sorted(seen_processes), process_order)
-            for pid in ordered:
-                manager.start_process(pid)
-
-        wait_processes_running = startup.get("wait_processes_running")
-        if wait_processes_running is None:
-            wait_processes_running = start_processes
-        connect = startup.get("connect", None)
-        wait_for_registered = bool(startup.get("wait_for_registered", True))
-        wait_for_online = bool(startup.get("wait_for_online", True))
-        if connect is False and wait_for_online:
-            sys.stderr.write(
-                "[run_stack] warning: wait_for_online ignored because connect is false.\n"
+        instance_lock: InstanceLock | _NoopInstanceLock
+        if bool(ns.instance_lock):
+            instance_lock = InstanceLock(
+                instance_id=instance_id,
+                manager_rpc=manager_network.local_rpc_connect,
             )
-            wait_for_online = False
-        timeout_s = float(startup.get("timeout_s", 10.0))
-        poll_ms = int(startup.get("poll_ms", 50))
+        else:
+            instance_lock = _NoopInstanceLock()
+        try:
+            instance_lock.acquire()
+        except InstanceLockActiveError as e:
+            raise SystemExit(f"[run_stack] startup error: {e}") from None
 
         try:
-            manager.startup_sequence(
-                start_drivers=start_devices,
-                start_processes=False,
-                wait_processes_running=bool(wait_processes_running),
-                connect=connect,
-                wait_for_registered=wait_for_registered,
-                wait_for_online=wait_for_online,
-                timeout_s=timeout_s,
-                poll_ms=poll_ms,
-            )
-        except TimeoutError as e:
-            sys.stderr.write(f"[run_stack] warning: {e}\n")
 
-        try:
-            manager.run_forever()
-        except KeyboardInterrupt:
-            manager._shutdown_cleanup()
+            base_dir = stack_path.parent
+            device_paths = _collect_config_paths(
+                raw.get("devices"), base=base_dir, label="devices"
+            )
+            process_paths = _collect_config_paths(
+                raw.get("processes"), base=base_dir, label="processes"
+            )
+
+            device_specs = []
+            seen_devices: set[str] = set()
+            for dev_path in device_paths:
+                spec = device_spec_from_yaml(dev_path)
+                if spec.device_id in seen_devices:
+                    raise ConfigError(
+                        "devices", f"duplicate device_id {spec.device_id!r}"
+                    )
+                seen_devices.add(spec.device_id)
+                device_specs.append(spec)
+
+            federation_config = parse_federation_config(
+                raw.get("federation"),
+                local_device_ids=seen_devices,
+                manager_raw=manager_raw,
+            )
+
+            manager = Manager(
+                instance_id=instance_id,
+                federation_config=federation_config,
+                registry_bind=manager_network.registry_bind,
+                internal_rpc_bind=manager_network.internal_rpc_bind,
+                external_rpc_bind=manager_network.external_rpc_bind,
+                external_pub_bind=manager_network.external_pub_bind,
+                external_pub_connect_local=manager_network.local_pub_connect,
+                process_hb_bind_base=manager_network.process_hb_bind_base,
+                process_data_bind_base=manager_network.process_data_bind_base,
+                heartbeat_timeout_s=float(manager_raw.get("heartbeat_timeout_s", 3.0)),
+                telemetry_stale_s=float(manager_raw.get("telemetry_stale_s", 10.0)),
+                device_rpc_timeout_ms=int(manager_raw.get("device_rpc_timeout_ms", 1500)),
+                interceptor_rpc_timeout_ms=int(manager_raw.get("interceptor_rpc_timeout_ms", 500)),
+                auto_connect_on_register=bool(
+                    manager_raw.get("auto_connect_on_register", True)
+                ),
+            )
+
+            process_manager_rpc = manager_network.local_rpc_connect
+            process_manager_pub = manager_network.local_pub_connect
+
+            for spec in device_specs:
+                manager.add_device(spec)
+
+            seen_processes: set[str] = set()
+            for proc_path in process_paths:
+                spec = process_spec_from_yaml(
+                    proc_path,
+                    manager_rpc=process_manager_rpc,
+                    manager_pub=process_manager_pub,
+                )
+                if spec.process_id in seen_processes:
+                    raise ConfigError(
+                        "processes", f"duplicate process_id {spec.process_id!r}"
+                    )
+                seen_processes.add(spec.process_id)
+                manager.add_process(spec)
+
+            startup = _parse_startup(raw)
+            start_devices = bool(startup.get("start_devices", True))
+            start_processes = bool(startup.get("start_processes", True))
+            process_order_raw = startup.get("process_order")
+            if process_order_raw is not None and not isinstance(process_order_raw, list):
+                raise ConfigError("startup.process_order", "must be a list[str]")
+            process_order = None
+            if process_order_raw is not None:
+                process_order = [str(pid) for pid in process_order_raw]
+
+            if start_processes and seen_processes:
+                ordered = _order_processes(sorted(seen_processes), process_order)
+                for pid in ordered:
+                    manager.start_process(pid)
+
+            wait_processes_running = startup.get("wait_processes_running")
+            if wait_processes_running is None:
+                wait_processes_running = start_processes
+            connect = startup.get("connect", None)
+            wait_for_registered = bool(startup.get("wait_for_registered", True))
+            wait_for_online = bool(startup.get("wait_for_online", True))
+            if connect is False and wait_for_online:
+                sys.stderr.write(
+                    "[run_stack] warning: wait_for_online ignored because connect is false.\n"
+                )
+                wait_for_online = False
+            timeout_s = float(startup.get("timeout_s", 10.0))
+            poll_ms = int(startup.get("poll_ms", 50))
+
+            try:
+                manager.startup_sequence(
+                    start_drivers=start_devices,
+                    start_processes=False,
+                    wait_processes_running=bool(wait_processes_running),
+                    connect=connect,
+                    wait_for_registered=wait_for_registered,
+                    wait_for_online=wait_for_online,
+                    timeout_s=timeout_s,
+                    poll_ms=poll_ms,
+                )
+            except TimeoutError as e:
+                sys.stderr.write(f"[run_stack] warning: {e}\n")
+
+            try:
+                manager.run_forever()
+            except KeyboardInterrupt:
+                manager._shutdown_cleanup()
+        finally:
+            instance_lock.release()
     except ConfigError as e:
         raise SystemExit(f"[run_stack] config error: {e}") from None
 

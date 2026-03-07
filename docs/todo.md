@@ -1,5 +1,10 @@
 # TODO
 
+## Process lifecycle / Windows TUI
+- Keep Windows PID liveness probes on Win32 APIs (`OpenProcess` + `GetExitCodeProcess`) and do not regress to `os.kill(pid, 0)`.
+- Add a higher-level Windows integration check for two-process TUI startup (`run_stack` parent + `--no-tui` child manager) with lifecycle flags enabled.
+- Verify TUI responsiveness (mouse + keyboard) remains stable under long-running sessions.
+
 ## Manager logging
 - Add env/config flags:
   - `MANAGER_LOG_STDERR=1|0` (default 1)
