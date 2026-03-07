@@ -4,11 +4,21 @@ export type SequencerAdaptiveStudyStatus = {
   lastMode: string | null;
 };
 
+export type SequencerYamlEditorHandle = {
+  focus: () => void;
+  focusAtOffset: (offset: number) => void;
+};
+
 export type SequencerStatus = {
+  runId: number | null;
   state: string | null;
   currentStep: string | null;
+  loopMode: string | null;
+  loopsCompleted: number | null;
+  loopsTarget: number | null;
   error: string | null;
   loaded: boolean | null;
+  activeSequenceId: string | null;
   contextColumns: Record<string, string> | null;
   loadedSource: string | null;
   autoloadError: string | null;
@@ -18,6 +28,7 @@ export type SequencerStatus = {
 };
 
 export type SequencerProgress = {
+  runId: number | null;
   elapsedS: number | null;
   completedSteps: number | null;
   totalSteps: number | null;
@@ -25,6 +36,9 @@ export type SequencerProgress = {
   etaS: number | null;
   stepEwmaS: number | null;
   currentStepElapsedS: number | null;
+  loopMode: string | null;
+  loopsCompleted: number | null;
+  loopsTarget: number | null;
 };
 
 export type SequencerDiagnostic = {

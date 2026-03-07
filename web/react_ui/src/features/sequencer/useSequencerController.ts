@@ -13,16 +13,41 @@ import type {
   SequencerAdaptiveStudyStatus,
   SequencerDiagnostic,
   SequencerStatus,
+  SequencerYamlEditorHandle,
 } from "./types";
+import {
+  computeSequencerDiagnosticJumpPlan,
+  focusSequencerDiagnosticOffset,
+} from "./diagnostics_jump";
 import {
   formatDurationCompact,
   normalizeSequencerDiagnostics,
   normalizeSequencerProgress,
   sameSequencerStatus,
 } from "./utils";
+import {
+  buildLocalConditionDiagnostics,
+  mergeDiagnostics,
+} from "./validation";
 
 type SequencerAction = "start" | "pause" | "resume" | "stop";
 type AdaptiveStartMode = "reset" | "resume" | "warm_start";
+type SequencerRunMode = "once" | "repeat" | "continuous";
+type SequencerOverrideValueType = "number" | "bool" | "string" | "json" | "null";
+type SequencerOverrideRow = {
+  id: string;
+  name: string;
+  valueType: SequencerOverrideValueType;
+  valueText: string;
+};
+type SequencerLibraryEntry = {
+  id: string;
+  label: string | null;
+  description: string | null;
+  path: string | null;
+  source: string | null;
+  vars: string[];
+};
 
 type UseSequencerControllerArgs = {
   sequencerProcess: ProcessStatus | null;
@@ -72,7 +97,28 @@ export function useSequencerController({
   const [sequencerAdaptiveClearBusy, setSequencerAdaptiveClearBusy] = useState<
     string | null
   >(null);
-  const sequencerEditorRef = useRef<HTMLTextAreaElement | null>(null);
+  const [sequencerRunMode, setSequencerRunMode] =
+    useState<SequencerRunMode>("once");
+  const [sequencerRepeatCount, setSequencerRepeatCount] = useState(1);
+  const [sequencerLibraryConfigured, setSequencerLibraryConfigured] =
+    useState(false);
+  const [sequencerLibraryEntries, setSequencerLibraryEntries] = useState<
+    SequencerLibraryEntry[]
+  >([]);
+  const [sequencerLibraryLoading, setSequencerLibraryLoading] = useState(false);
+  const [sequencerLibraryError, setSequencerLibraryError] = useState<string | null>(
+    null
+  );
+  const [sequencerSelectedSequenceId, setSequencerSelectedSequenceId] = useState<
+    string | null
+  >(null);
+  const [sequencerRuntimeVarNamesByProcessId, setSequencerRuntimeVarNamesByProcessId] =
+    useState<Record<string, string[]>>({});
+  const [sequencerOverrideRows, setSequencerOverrideRows] = useState<
+    SequencerOverrideRow[]
+  >([]);
+  const sequencerOverrideIdRef = useRef(1);
+  const sequencerEditorRef = useRef<SequencerYamlEditorHandle | null>(null);
   const sequencerFileInputRef = useRef<HTMLInputElement | null>(null);
   const sequencerStatusByProcessIdRef = useRef<Record<string, SequencerStatus>>(
     {}
@@ -110,10 +156,15 @@ export function useSequencerController({
           setSequencerStatusByProcessId((prev) => {
             const current = prev[processId];
             const nextStatus: SequencerStatus = {
+              runId: current?.runId ?? null,
               state: current?.state ?? null,
               currentStep: current?.currentStep ?? null,
+              loopMode: current?.loopMode ?? null,
+              loopsCompleted: current?.loopsCompleted ?? null,
+              loopsTarget: current?.loopsTarget ?? null,
               error: message ?? code ?? "sequencer.status failed",
               loaded: current?.loaded ?? null,
+              activeSequenceId: current?.activeSequenceId ?? null,
               contextColumns: current?.contextColumns ?? null,
               loadedSource: current?.loadedSource ?? null,
               autoloadError: current?.autoloadError ?? null,
@@ -129,16 +180,28 @@ export function useSequencerController({
           return;
         }
         const result = resp.result as {
+          run_id?: unknown;
           state?: unknown;
           current_step?: unknown;
+          loop_mode?: unknown;
+          loops_completed?: unknown;
+          loops_target?: unknown;
+          vars?: unknown;
           error?: unknown;
           loaded?: unknown;
+          active_sequence_id?: unknown;
           context_columns?: unknown;
           loaded_source?: unknown;
           autoload_error?: unknown;
           progress?: unknown;
           loaded_adaptive_ids?: unknown;
           adaptive_studies?: unknown;
+        };
+        const normalizeInt = (value: unknown): number | null => {
+          if (typeof value !== "number" || !Number.isFinite(value)) {
+            return null;
+          }
+          return Math.max(0, Math.trunc(value));
         };
         const contextColumns =
           result.context_columns && typeof result.context_columns === "object"
@@ -159,6 +222,22 @@ export function useSequencerController({
             ? result.autoload_error
             : null;
         const progress = normalizeSequencerProgress(result.progress);
+        const loopMode =
+          typeof result.loop_mode === "string" && result.loop_mode.trim().length > 0
+            ? result.loop_mode
+            : progress?.loopMode ?? null;
+        const loopsCompleted =
+          normalizeInt(result.loops_completed) ?? progress?.loopsCompleted ?? null;
+        const loopsTarget =
+          normalizeInt(result.loops_target) ?? progress?.loopsTarget ?? null;
+        const runId = normalizeInt(result.run_id) ?? progress?.runId ?? null;
+        const runtimeVarNames =
+          result.vars && typeof result.vars === "object"
+            ? Object.keys(result.vars as Record<string, unknown>)
+                .map((value) => value.trim())
+                .filter((value) => value.length > 0)
+                .sort()
+            : [];
         const loadedAdaptiveIds = Array.isArray(result.loaded_adaptive_ids)
           ? result.loaded_adaptive_ids
               .filter(
@@ -211,14 +290,23 @@ export function useSequencerController({
         setSequencerStatusByProcessId((prev) => {
           const current = prev[processId];
           const nextStatus: SequencerStatus = {
+            runId,
             state: typeof result.state === "string" ? result.state : null,
             currentStep:
               typeof result.current_step === "string" ? result.current_step : null,
+            loopMode,
+            loopsCompleted,
+            loopsTarget,
             error: typeof result.error === "string" ? result.error : null,
             loaded:
               typeof result.loaded === "boolean"
                 ? result.loaded
                 : current?.loaded ?? null,
+            activeSequenceId:
+              typeof result.active_sequence_id === "string" &&
+              result.active_sequence_id.trim().length > 0
+                ? result.active_sequence_id
+                : null,
             contextColumns,
             loadedSource,
             autoloadError,
@@ -231,15 +319,27 @@ export function useSequencerController({
           }
           return { ...prev, [processId]: nextStatus };
         });
+        setSequencerRuntimeVarNamesByProcessId((prev) => {
+          const current = prev[processId] ?? [];
+          if (JSON.stringify(current) === JSON.stringify(runtimeVarNames)) {
+            return prev;
+          }
+          return { ...prev, [processId]: runtimeVarNames };
+        });
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         setSequencerStatusByProcessId((prev) => {
           const current = prev[processId];
           const nextStatus: SequencerStatus = {
+            runId: current?.runId ?? null,
             state: current?.state ?? null,
             currentStep: current?.currentStep ?? null,
+            loopMode: current?.loopMode ?? null,
+            loopsCompleted: current?.loopsCompleted ?? null,
+            loopsTarget: current?.loopsTarget ?? null,
             error: message,
             loaded: current?.loaded ?? null,
+            activeSequenceId: current?.activeSequenceId ?? null,
             contextColumns: current?.contextColumns ?? null,
             loadedSource: current?.loadedSource ?? null,
             autoloadError: current?.autoloadError ?? null,
@@ -259,6 +359,112 @@ export function useSequencerController({
       }
     },
     [callProcessFn, setSequencerStatusLoading]
+  );
+
+  const refreshSequencerLibrary = useCallback(
+    async (processId: string, opts?: { silent?: boolean }) => {
+      const silent = opts?.silent === true;
+      if (sequencerLibraryLoading) {
+        return;
+      }
+      setSequencerLibraryLoading(true);
+      try {
+        const resp = await callProcessFn(processId, "sequencer.library.list", {});
+        if (!resp.ok || !resp.result || typeof resp.result !== "object") {
+          const message = resp.error?.message ?? resp.error?.code ?? "Unknown error";
+          setSequencerLibraryError(message);
+          if (!silent) {
+            notifications.show({
+              color: "red",
+              title: "Failed to fetch sequence library",
+              message,
+            });
+          }
+          return;
+        }
+        const result = resp.result as {
+          configured?: unknown;
+          entries?: unknown;
+          last_error?: unknown;
+          active_sequence_id?: unknown;
+        };
+        const entriesRaw = Array.isArray(result.entries) ? result.entries : [];
+        const entries: SequencerLibraryEntry[] = entriesRaw
+          .map((item) => {
+            if (!item || typeof item !== "object") {
+              return null;
+            }
+            const obj = item as Record<string, unknown>;
+            const id =
+              typeof obj.id === "string" && obj.id.trim().length > 0
+                ? obj.id.trim()
+                : "";
+            if (!id) {
+              return null;
+            }
+            const varsRaw = Array.isArray(obj.vars) ? obj.vars : [];
+            const vars = varsRaw
+              .filter((value): value is string => typeof value === "string")
+              .map((value) => value.trim())
+              .filter((value) => value.length > 0);
+            return {
+              id,
+              label:
+                typeof obj.label === "string" && obj.label.trim().length > 0
+                  ? obj.label
+                  : null,
+              description:
+                typeof obj.description === "string" && obj.description.trim().length > 0
+                  ? obj.description
+                  : null,
+              path:
+                typeof obj.path === "string" && obj.path.trim().length > 0
+                  ? obj.path
+                  : null,
+              source:
+                typeof obj.source === "string" && obj.source.trim().length > 0
+                  ? obj.source
+                  : null,
+              vars,
+            } satisfies SequencerLibraryEntry;
+          })
+          .filter((item): item is SequencerLibraryEntry => item !== null);
+        setSequencerLibraryConfigured(result.configured === true);
+        setSequencerLibraryEntries(entries);
+        const activeSequenceId =
+          typeof result.active_sequence_id === "string" &&
+          result.active_sequence_id.trim().length > 0
+            ? result.active_sequence_id
+            : null;
+        setSequencerSelectedSequenceId((prev) => {
+          if (activeSequenceId) {
+            return activeSequenceId;
+          }
+          if (prev && entries.some((entry) => entry.id === prev)) {
+            return prev;
+          }
+          return entries[0]?.id ?? null;
+        });
+        const lastError =
+          typeof result.last_error === "string" && result.last_error.trim().length > 0
+            ? result.last_error
+            : null;
+        setSequencerLibraryError(lastError);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        setSequencerLibraryError(message);
+        if (!silent) {
+          notifications.show({
+            color: "red",
+            title: "Failed to fetch sequence library",
+            message,
+          });
+        }
+      } finally {
+        setSequencerLibraryLoading(false);
+      }
+    },
+    [callProcessFn, sequencerLibraryLoading]
   );
 
   const fetchSequencerLoadedYaml = useCallback(
@@ -289,6 +495,7 @@ export function useSequencerController({
         const result = resp.result as {
           loaded?: unknown;
           source?: unknown;
+          active_sequence_id?: unknown;
           text?: unknown;
         };
         const loaded = result.loaded === true;
@@ -305,6 +512,11 @@ export function useSequencerController({
           const next: SequencerStatus = {
             ...current,
             loadedSource: source,
+            activeSequenceId:
+              typeof result.active_sequence_id === "string" &&
+              result.active_sequence_id.trim().length > 0
+                ? result.active_sequence_id
+                : null,
           };
           if (sameSequencerStatus(current, next)) {
             return prev;
@@ -359,7 +571,20 @@ export function useSequencerController({
       applyToEditor: true,
       silent: true,
     });
-  }, [fetchSequencerLoadedYaml, refreshSequencerStatus, sequencerProcess]);
+    await refreshSequencerLibrary(sequencerProcess.process_id, { silent: true });
+  }, [
+    fetchSequencerLoadedYaml,
+    refreshSequencerLibrary,
+    refreshSequencerStatus,
+    sequencerProcess,
+  ]);
+
+  const reloadSequencerLibrary = useCallback(async () => {
+    if (!sequencerProcess) {
+      return;
+    }
+    await refreshSequencerLibrary(sequencerProcess.process_id, { silent: false });
+  }, [refreshSequencerLibrary, sequencerProcess]);
 
   const setAdaptiveMode = useCallback(
     (studyId: string, mode: AdaptiveStartMode) => {
@@ -424,6 +649,171 @@ export function useSequencerController({
     ]
   );
 
+  const selectedLibraryEntryForOverrides = useMemo(() => {
+    if (!sequencerSelectedSequenceId) {
+      return null;
+    }
+    return (
+      sequencerLibraryEntries.find(
+        (entry) => entry.id === sequencerSelectedSequenceId
+      ) ?? null
+    );
+  }, [sequencerLibraryEntries, sequencerSelectedSequenceId]);
+
+  const sequencerRuntimeVarNames = useMemo(() => {
+    if (!sequencerProcess) {
+      return [] as string[];
+    }
+    return (
+      sequencerRuntimeVarNamesByProcessId[sequencerProcess.process_id] ?? []
+    );
+  }, [sequencerProcess, sequencerRuntimeVarNamesByProcessId]);
+
+  const sequencerOverrideVarOptions = useMemo(() => {
+    const base =
+      selectedLibraryEntryForOverrides?.vars &&
+      selectedLibraryEntryForOverrides.vars.length > 0
+        ? selectedLibraryEntryForOverrides.vars
+        : sequencerRuntimeVarNames;
+    return Array.from(
+      new Set(base.map((value) => value.trim()).filter((value) => value.length > 0))
+    ).sort();
+  }, [selectedLibraryEntryForOverrides, sequencerRuntimeVarNames]);
+
+  const addSequencerOverrideRow = useCallback(() => {
+    setSequencerOverrideRows((prev) => {
+      const used = new Set(prev.map((row) => row.name.trim()).filter(Boolean));
+      const suggested =
+        sequencerOverrideVarOptions.find((name) => !used.has(name)) ??
+        sequencerOverrideVarOptions[0] ??
+        "";
+      return [
+        ...prev,
+        {
+          id: `ovr-${sequencerOverrideIdRef.current++}`,
+          name: suggested,
+          valueType: "number",
+          valueText: "",
+        },
+      ];
+    });
+  }, [sequencerOverrideVarOptions]);
+
+  const removeSequencerOverrideRow = useCallback((rowId: string) => {
+    setSequencerOverrideRows((prev) => prev.filter((row) => row.id !== rowId));
+  }, []);
+
+  const clearSequencerOverrides = useCallback(() => {
+    setSequencerOverrideRows([]);
+  }, []);
+
+  const updateSequencerOverrideRow = useCallback(
+    (
+      rowId: string,
+      patch: Partial<Pick<SequencerOverrideRow, "name" | "valueType" | "valueText">>
+    ) => {
+      setSequencerOverrideRows((prev) =>
+        prev.map((row) => {
+          if (row.id !== rowId) {
+            return row;
+          }
+          const next = { ...row, ...patch };
+          if (patch.valueType === "bool" && !["true", "false"].includes(next.valueText)) {
+            next.valueText = "true";
+          }
+          if (patch.valueType === "null") {
+            next.valueText = "";
+          }
+          return next;
+        })
+      );
+    },
+    []
+  );
+
+  const sequencerOverrideEvaluation = useMemo(() => {
+    const errorsById: Record<string, string | null> = {};
+    const payload: Record<string, unknown> = {};
+    const normalizedNames = sequencerOverrideRows
+      .map((row) => row.name.trim())
+      .filter((name) => name.length > 0);
+    const nameCounts: Record<string, number> = {};
+    for (const name of normalizedNames) {
+      nameCounts[name] = (nameCounts[name] ?? 0) + 1;
+    }
+    const known = new Set(sequencerOverrideVarOptions);
+    let hasError = false;
+
+    for (const row of sequencerOverrideRows) {
+      const name = row.name.trim();
+      if (!name) {
+        errorsById[row.id] = "Variable name is required";
+        hasError = true;
+        continue;
+      }
+      if ((nameCounts[name] ?? 0) > 1) {
+        errorsById[row.id] = "Duplicate variable name";
+        hasError = true;
+        continue;
+      }
+      if (known.size > 0 && !known.has(name)) {
+        errorsById[row.id] = "Unknown variable for this sequence";
+        hasError = true;
+        continue;
+      }
+
+      try {
+        if (row.valueType === "number") {
+          const parsed = Number(row.valueText);
+          if (!Number.isFinite(parsed)) {
+            throw new Error("Value must be a finite number");
+          }
+          payload[name] = parsed;
+          errorsById[row.id] = null;
+          continue;
+        }
+        if (row.valueType === "bool") {
+          const text = row.valueText.trim().toLowerCase();
+          if (text !== "true" && text !== "false") {
+            throw new Error("Value must be true or false");
+          }
+          payload[name] = text === "true";
+          errorsById[row.id] = null;
+          continue;
+        }
+        if (row.valueType === "string") {
+          payload[name] = row.valueText;
+          errorsById[row.id] = null;
+          continue;
+        }
+        if (row.valueType === "json") {
+          payload[name] = JSON.parse(row.valueText || "null");
+          errorsById[row.id] = null;
+          continue;
+        }
+        if (row.valueType === "null") {
+          payload[name] = null;
+          errorsById[row.id] = null;
+          continue;
+        }
+        throw new Error("Unsupported value type");
+      } catch (error) {
+        errorsById[row.id] =
+          error instanceof Error ? error.message : "Invalid value";
+        hasError = true;
+      }
+    }
+
+    const preview = JSON.stringify(payload, null, 2);
+    return {
+      errorsById,
+      payload,
+      hasError,
+      isValid: !hasError,
+      preview,
+    };
+  }, [sequencerOverrideRows, sequencerOverrideVarOptions]);
+
   const runSequencerAction = useCallback(
     async (action: SequencerAction) => {
       if (!sequencerProcess || sequencerActionBusy) {
@@ -433,6 +823,16 @@ export function useSequencerController({
       setSequencerActionBusy(true);
       setSequencerModalError(null);
       try {
+        if (action === "start" && !sequencerOverrideEvaluation.isValid) {
+          const message = "Fix invalid run overrides before starting.";
+          setSequencerModalError(message);
+          notifications.show({
+            color: "red",
+            title: "Invalid run overrides",
+            message,
+          });
+          return;
+        }
         const loadedAdaptiveIds =
           sequencerStatusByProcessIdRef.current[processId]?.loadedAdaptiveIds ?? [];
         const adaptiveParams =
@@ -444,10 +844,30 @@ export function useSequencerController({
                 ])
               )
             : undefined;
+        const startParams: Record<string, unknown> = {};
+        if (action === "start") {
+          if (adaptiveParams) {
+            startParams.adaptive = adaptiveParams;
+          }
+          if (sequencerLibraryConfigured && sequencerSelectedSequenceId) {
+            startParams.sequence_id = sequencerSelectedSequenceId;
+          }
+          if (sequencerRunMode === "repeat") {
+            startParams.repeat_count = Math.max(
+              1,
+              Math.trunc(Number(sequencerRepeatCount) || 1)
+            );
+          } else if (sequencerRunMode === "continuous") {
+            startParams.continuous = true;
+          }
+          if (Object.keys(sequencerOverrideEvaluation.payload).length > 0) {
+            startParams.vars_override = sequencerOverrideEvaluation.payload;
+          }
+        }
         const resp = await sendProcessCommand(
           processId,
           `sequencer.${action}`,
-          adaptiveParams ? { adaptive: adaptiveParams } : {},
+          action === "start" ? startParams : {},
           "sequencer-action"
         );
         if (!resp.ok) {
@@ -466,6 +886,9 @@ export function useSequencerController({
           message: processId,
         });
         await refreshSequencerStatus(processId);
+        if (action === "start") {
+          await refreshSequencerLibrary(processId, { silent: true });
+        }
         await refreshProcesses();
       } finally {
         setSequencerActionBusy(false);
@@ -473,51 +896,50 @@ export function useSequencerController({
     },
     [
       refreshProcesses,
+      refreshSequencerLibrary,
       refreshSequencerStatus,
       sendProcessCommand,
+      sequencerLibraryConfigured,
+      sequencerOverrideEvaluation,
+      sequencerRepeatCount,
+      sequencerRunMode,
+      sequencerSelectedSequenceId,
       sequencerAdaptiveModes,
       sequencerActionBusy,
       sequencerProcess,
     ]
   );
 
-  const lineColumnToOffset = useCallback(
-    (text: string, line: number, column: number | null): number => {
-      const lines = text.split("\n");
-      const safeLine = Math.max(1, Math.min(line, lines.length || 1));
-      let offset = 0;
-      for (let idx = 0; idx < safeLine - 1; idx += 1) {
-        offset += lines[idx].length + 1;
-      }
-      const target = lines[safeLine - 1] ?? "";
-      const safeColumn = Math.max(1, column ?? 1);
-      offset += Math.min(target.length, safeColumn - 1);
-      return offset;
-    },
-    []
-  );
-
   const jumpToSequencerDiagnostic = useCallback(
     (line: number | null, column: number | null) => {
-      if (line == null) {
+      const jumpPlan = computeSequencerDiagnosticJumpPlan(
+        sequencerYamlText,
+        sequencerYamlViewMode,
+        line,
+        column
+      );
+      if (!jumpPlan) {
         return;
       }
-      const focusEditorAtLine = () => {
-        if (!sequencerEditorRef.current) {
-          return;
+      const focusEditorAtLine = (attempt = 0) => {
+        const applied = focusSequencerDiagnosticOffset(
+          sequencerEditorRef.current,
+          jumpPlan.offset
+        );
+        if (!applied) {
+          if (attempt < 5) {
+            window.setTimeout(() => focusEditorAtLine(attempt + 1), 0);
+          }
         }
-        const offset = lineColumnToOffset(sequencerYamlText, line, column);
-        sequencerEditorRef.current.focus();
-        sequencerEditorRef.current.setSelectionRange(offset, offset);
       };
-      if (sequencerYamlViewMode !== "edit") {
+      if (jumpPlan.requiresEditMode) {
         setSequencerYamlViewMode("edit");
         window.setTimeout(focusEditorAtLine, 0);
         return;
       }
       focusEditorAtLine();
     },
-    [lineColumnToOffset, sequencerYamlText, sequencerYamlViewMode]
+    [sequencerYamlText, sequencerYamlViewMode]
   );
 
   const handleSequencerFileInput = useCallback(
@@ -579,9 +1001,13 @@ export function useSequencerController({
         resp.result && typeof resp.result === "object"
           ? (resp.result as { valid?: unknown; diagnostics?: unknown })
           : null;
-      const diagnostics = normalizeSequencerDiagnostics(result?.diagnostics);
-      setSequencerDiagnostics(diagnostics);
-      const valid = result?.valid === true;
+      const processDiagnostics = normalizeSequencerDiagnostics(result?.diagnostics);
+      const localDiagnostics = buildLocalConditionDiagnostics(sequencerYamlText);
+      const diagnostics = mergeDiagnostics(processDiagnostics, localDiagnostics);
+      setSequencerDiagnostics(processDiagnostics);
+      const valid =
+        result?.valid === true &&
+        !diagnostics.some((item) => item.severity === "error");
       notifications.show({
         color: valid ? "teal" : "yellow",
         title: valid ? "Sequence is valid" : "Sequence has issues",
@@ -657,6 +1083,15 @@ export function useSequencerController({
     setSequencerYamlText(value);
     setSequencerModalError(null);
   }, []);
+
+  const sequencerLocalDiagnostics = useMemo(
+    () => buildLocalConditionDiagnostics(sequencerYamlText),
+    [sequencerYamlText]
+  );
+  const sequencerCombinedDiagnostics = useMemo(
+    () => mergeDiagnostics(sequencerDiagnostics, sequencerLocalDiagnostics),
+    [sequencerDiagnostics, sequencerLocalDiagnostics]
+  );
 
   useEffect(() => {
     if (!sequencerProcess) {
@@ -769,7 +1204,8 @@ export function useSequencerController({
       : "Start";
   const sequencerPrimaryDisabled =
     sequencerActionBusy ||
-    (sequencerPrimaryAction === "start" && sequencerStatus?.loaded === false);
+    (sequencerPrimaryAction === "start" &&
+      (sequencerStatus?.loaded === false || !sequencerOverrideEvaluation.isValid));
 
   useEffect(() => {
     const loadedAdaptiveIds = sequencerStatus?.loadedAdaptiveIds ?? [];
@@ -787,6 +1223,24 @@ export function useSequencerController({
       return next;
     });
   }, [sequencerStatus?.loadedAdaptiveIds]);
+
+  useEffect(() => {
+    const activeId =
+      typeof sequencerStatus?.activeSequenceId === "string" &&
+      sequencerStatus.activeSequenceId.trim().length > 0
+        ? sequencerStatus.activeSequenceId
+        : null;
+    if (activeId) {
+      setSequencerSelectedSequenceId(activeId);
+      return;
+    }
+    setSequencerSelectedSequenceId((prev) => {
+      if (prev && sequencerLibraryEntries.some((entry) => entry.id === prev)) {
+        return prev;
+      }
+      return sequencerLibraryEntries[0]?.id ?? null;
+    });
+  }, [sequencerLibraryEntries, sequencerStatus?.activeSequenceId]);
 
   return {
     sequencerOpen,
@@ -812,10 +1266,30 @@ export function useSequencerController({
     sequencerYamlText,
     sequencerYamlViewMode,
     setSequencerYamlViewMode,
-    sequencerDiagnostics,
+    sequencerDiagnostics: sequencerCombinedDiagnostics,
     sequencerModalError,
     sequencerAdaptiveModes,
     sequencerAdaptiveClearBusy,
+    sequencerRunMode,
+    setSequencerRunMode,
+    sequencerRepeatCount,
+    setSequencerRepeatCount,
+    sequencerLibraryConfigured,
+    sequencerLibraryEntries,
+    sequencerLibraryLoading,
+    sequencerLibraryError,
+    sequencerSelectedSequenceId,
+    setSequencerSelectedSequenceId,
+    reloadSequencerLibrary,
+    sequencerOverrideRows,
+    sequencerOverrideVarOptions,
+    sequencerOverrideErrors: sequencerOverrideEvaluation.errorsById,
+    sequencerOverridePreview: sequencerOverrideEvaluation.preview,
+    sequencerOverridesValid: sequencerOverrideEvaluation.isValid,
+    addSequencerOverrideRow,
+    removeSequencerOverrideRow,
+    updateSequencerOverrideRow,
+    clearSequencerOverrides,
     sequencerEditorRef,
     sequencerFileInputRef,
     onSequencerYamlTextChange,

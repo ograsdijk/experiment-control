@@ -3,8 +3,12 @@ import type {
   SequencerAdaptiveStudyStatus,
   SequencerDiagnostic,
   SequencerProgress,
+  SequencerYamlEditorHandle,
 } from "../features/sequencer/types";
+import type { StreamAnalysisWorkspaceConfig } from "../features/stream/types";
 import type { CapabilityMember } from "../types";
+import type { StreamCatalogEntry } from "../types";
+import type { TelemetrySignal } from "../types";
 import { SequencerModal } from "./SequencerModal";
 
 type Props = {
@@ -27,6 +31,45 @@ type Props = {
   primaryLabel: string;
   primaryDisabled: boolean;
   actionBusy: boolean;
+  runMode: "once" | "repeat" | "continuous";
+  repeatCount: number;
+  onRunModeChange: (mode: "once" | "repeat" | "continuous") => void;
+  onRepeatCountChange: (value: number) => void;
+  libraryConfigured: boolean;
+  libraryEntries: {
+    id: string;
+    label: string | null;
+    description: string | null;
+    path: string | null;
+    source: string | null;
+    vars: string[];
+  }[];
+  libraryLoading: boolean;
+  libraryError: string | null;
+  selectedSequenceId: string | null;
+  onSelectedSequenceIdChange: (sequenceId: string | null) => void;
+  onReloadLibrary: () => Promise<unknown> | void;
+  overrideRows: {
+    id: string;
+    name: string;
+    valueType: "number" | "bool" | "string" | "json" | "null";
+    valueText: string;
+  }[];
+  overrideVarOptions: string[];
+  overrideErrors: Record<string, string | null>;
+  overridePreview: string;
+  overridesValid: boolean;
+  onAddOverrideRow: () => void;
+  onRemoveOverrideRow: (rowId: string) => void;
+  onUpdateOverrideRow: (
+    rowId: string,
+    patch: Partial<{
+      name: string;
+      valueType: "number" | "bool" | "string" | "json" | "null";
+      valueText: string;
+    }>
+  ) => void;
+  onClearOverrides: () => void;
   adaptiveModes: Record<string, "reset" | "resume" | "warm_start">;
   adaptiveStudies: Record<string, SequencerAdaptiveStudyStatus>;
   loadedAdaptiveIds: readonly string[];
@@ -53,10 +96,13 @@ type Props = {
   onValidate: () => Promise<unknown> | void;
   loadBusy: boolean;
   onLoad: () => Promise<unknown> | void;
-  editorRef: RefObject<HTMLTextAreaElement>;
+  editorRef: RefObject<SequencerYamlEditorHandle>;
   yamlText: string;
   onYamlTextChange: (value: string) => void;
+  streamCatalog: StreamCatalogEntry[];
   capabilitiesByDevice: Record<string, CapabilityMember[]>;
+  streamWorkspaces: Record<string, StreamAnalysisWorkspaceConfig>;
+  latestSignalsByDevice: Record<string, Record<string, TelemetrySignal>>;
   colorScheme: "light" | "dark";
   diagnostics: ReadonlyArray<SequencerDiagnostic>;
   onJumpToDiagnostic: (

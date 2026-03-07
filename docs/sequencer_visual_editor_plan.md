@@ -1,193 +1,83 @@
-# Sequencer Visual Editor Plan
+# Sequencer Visual Editor
 
-## Goal
+## Purpose
 
-Add a visual editing experience for the sequencer UI while keeping YAML as the source-of-truth serialization format.
+The sequencer UI provides a visual editor on top of YAML while keeping YAML as the source-of-truth format for load/run/export.
 
-The visual editor should make sequences easier to understand and edit without turning the sequencer into a graph editor.
+The editor is block/tree based because sequencer execution is ordered and nested, not graph-first.
 
-## Recommended UI Model
+## Current Layout
 
-Use a nested block/tree editor as the main visual interface:
+The sequencer modal uses three working areas:
 
-1. Left: step tree
-2. Right: step inspector
-3. Bottom or tabbed section: YAML preview/edit and diagnostics
+1. Sequence outline (tree)
+2. Step inspector + sequence metadata
+3. Full sequence YAML + diagnostics
 
-This matches the actual sequencer model better than a node graph because the sequencer is primarily:
+## What You Can Edit Visually
 
-- ordered
-- nested
-- block-oriented
+Top-level metadata:
 
-rather than an arbitrary graph with free-form edges.
+- `vars`
+- `context_columns`
 
-## Why Not a Graph-First Editor
-
-A graph suggests:
-
-- arbitrary branching
-- explicit edges
-- multiple next steps
-- dataflow semantics
-
-The sequencer actually behaves more like:
-
-- do this
-- then do this
-- when a block owns a body, run the child steps in order
-
-So a graph would likely make the model harder to understand rather than easier.
-
-## Why Not a Table-Only Editor
-
-A simple table is not enough for the general sequencer because it breaks down once you have:
-
-- nested loops
-- adaptive steps
-- repeated blocks
-- condition/wait blocks
-
-Tables are still useful as specialized editors for some step internals (for example parameter maps), but not as the full sequence editor.
-
-## Phased Implementation
-
-### Phase 1: Read-Only Structured View
-
-Goal:
-
-- make the loaded YAML understandable visually without replacing YAML editing yet
-
-Add:
-
-- a parsed step tree
-- click-to-select a step
-- a read-only inspector for the selected step
-- YAML remains the only editable source
-
-This phase should support rendering all existing step types as an outline, including nested blocks like:
-
-- `for`
-- `repeat`
-- `adaptive`
-
-### Phase 2: Basic Visual Editing
-
-Goal:
-
-- allow common simple steps to be edited visually
-
-Start with:
+Step editing (inspector forms):
 
 - `call`
 - `sleep`
 - `repeat`
-
-Add:
-
-- add step
-- delete step
-- duplicate step
-- reorder within a valid scope
-- inspector forms for the selected step
-
-YAML remains available as preview and fallback raw editing.
-
-### Phase 3: Loop Editing
-
-Goal:
-
-- support common structured control flow visually
-
-Add visual editing for:
-
-- `for`
-
-Inspector support should include:
-
-- `bind`
-- generator configuration
-- nested `do` body navigation/editing
-
-### Phase 4: Adaptive Editing
-
-Goal:
-
-- make adaptive studies usable without hand-editing YAML
-
-Add visual editing for:
-
-- `adaptive`
-
-Inspector support should include:
-
-- study `id`
-- controller kind and config
-- search space
-- bind mapping
-- state/observe configuration
-- score expression
-- stopping
-- nested `do` body
-
-### Phase 5: Advanced Step Support
-
-Add visual editing for the remaining complex steps, such as:
-
+- `for` (generator and config)
+- `adaptive` (core + advanced config)
 - `wait_until`
-- `set_context`
-- `assign`
 - `set`
+- `assign`
+- `set_context`
+- `if` condition
+- `while` condition
 
-## Suggested Layout
+Tree operations:
 
-### Left Pane: Step Tree
+- add top-level step
+- insert below
+- insert into child body (`do` / `then` / `else` where valid)
+- duplicate
+- delete
+- move up/down among siblings
+- collapse/expand nested blocks
 
-Each step should show:
+## Nested Body Editing
 
-- step type
-- short human-readable summary
-- nesting/indentation
+Nested bodies are edited structurally from the tree controls (insert/move/delete child steps), not as an inline inspector table.
 
-Block steps should show child steps indented underneath.
+This applies to loop and branch bodies, including adaptive `do`.
 
-### Right Pane: Inspector
+## YAML Editing + Diagnostics
 
-For the selected step, show:
+Full YAML editing uses CodeMirror (edit mode) and a read-only formatted preview mode.
 
-- step type
-- location / line range
-- summary
-- detailed read-only view in Phase 1
-- editable form fields in later phases
+Diagnostics support line/column jump:
 
-### Bottom or Secondary Pane
+- selecting a diagnostic expands the YAML section if needed
+- switches to edit mode if needed
+- focuses the code editor at the exact offset
 
-Tabs or sections for:
+## Parsing Resilience
 
-- YAML
-- diagnostics
-- later: run status / live context
+If outline parsing fails for the current YAML text:
 
-## Internal Model
+- the modal remains usable
+- a parser error notice is shown in the outline area
+- full YAML editing remains available
 
-The visual UI should edit a structured representation of the sequence, not raw text.
+No UI blank-screen behavior is expected from outline parse errors.
 
-The long-term flow should be:
+## Known Limits
 
-1. parse YAML into structured step data
-2. edit structured step data visually
-3. serialize back to YAML for load/run/export
+- Complex YAML constructs outside the supported sequencer patterns may reduce outline fidelity.
+- Visual inspector editing is intentionally schema-driven for known step structures; raw YAML remains the fallback for anything unusual.
 
-For Phase 1, a read-only outline can be produced heuristically from the YAML text without requiring a full AST in the browser yet.
+## Notes
 
-## Best First Milestone
+- Preview and edit modes share the same YAML token color palette to avoid color drift.
+- The CodeMirror editor is loaded lazily when needed to reduce initial UI load cost.
 
-The first useful milestone is:
-
-1. read-only step tree for the current YAML
-2. click to inspect a step
-3. YAML still edited manually
-4. diagnostics remain visible
-
-That gives immediate usability value with low implementation risk.

@@ -10,21 +10,32 @@ import {
   deleteStep,
   duplicateStep,
   getChildInsertionLine,
+  insertStepAtTopLevel,
   insertStepBelow,
   insertStepInside,
   moveStepDown,
   moveStepUp,
+  type BasicSequencerStepTemplate,
 } from "../features/sequencer/editing";
-import type { SequencerStepOutlineNode } from "../features/sequencer/types";
+import type {
+  SequencerOutlineMetadata,
+  SequencerStepOutlineNode,
+} from "../features/sequencer/types";
 import { SequencerMetadataPanel } from "../features/sequencer/components/SequencerMetadataPanel";
 import { SequencerSelectionPanel } from "../features/sequencer/components/SequencerSelectionPanel";
 import { SequencerStepTree } from "../features/sequencer/components/SequencerStepTree";
+import type { StreamAnalysisWorkspaceConfig } from "../features/stream/types";
 import type { CapabilityMember } from "../types";
+import type { StreamCatalogEntry } from "../types";
+import type { TelemetrySignal } from "../types";
 
 type Props = {
   yamlText: string;
   onYamlTextChange: (value: string) => void;
+  streamCatalog: StreamCatalogEntry[];
   capabilitiesByDevice: Record<string, CapabilityMember[]>;
+  streamWorkspaces: Record<string, StreamAnalysisWorkspaceConfig>;
+  latestSignalsByDevice: Record<string, Record<string, TelemetrySignal>>;
   colorScheme: "light" | "dark";
 };
 
@@ -55,14 +66,36 @@ function buildSiblingInfoMap(
 export function SequencerOutlinePane({
   yamlText,
   onYamlTextChange,
+  streamCatalog,
   capabilitiesByDevice,
+  streamWorkspaces,
+  latestSignalsByDevice,
   colorScheme,
 }: Props) {
-  const metadata = useMemo(
-    () => buildSequencerOutlineMetadata(yamlText),
-    [yamlText]
-  );
-  const outline = useMemo(() => buildSequencerStepOutline(yamlText), [yamlText]);
+  const parsedOutline = useMemo(() => {
+    try {
+      return {
+        metadata: buildSequencerOutlineMetadata(yamlText),
+        outline: buildSequencerStepOutline(yamlText),
+        error: null as string | null,
+      };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const fallbackMetadata: SequencerOutlineMetadata = {
+        version: null,
+        vars: [],
+        contextColumns: [],
+      };
+      return {
+        metadata: fallbackMetadata,
+        outline: [] as SequencerStepOutlineNode[],
+        error: message,
+      };
+    }
+  }, [yamlText]);
+  const metadata = parsedOutline.metadata;
+  const outline = parsedOutline.outline;
+  const outlineParseError = parsedOutline.error;
   const flatOutline = useMemo(
     () => flattenSequencerStepOutline(outline),
     [outline]
@@ -156,7 +189,7 @@ export function SequencerOutlinePane({
 
   const handleInsertBelow = (
     node: SequencerStepOutlineNode,
-    kind: "call" | "sleep" | "repeat"
+    kind: BasicSequencerStepTemplate
   ) => {
     setPendingSelection({
       line: node.endLine + 1,
@@ -168,7 +201,7 @@ export function SequencerOutlinePane({
 
   const handleInsertChild = (
     node: SequencerStepOutlineNode,
-    kind: "call" | "sleep" | "repeat",
+    kind: BasicSequencerStepTemplate,
     containerKey: "do" | "then" | "else"
   ) => {
     const insertionLine = getChildInsertionLine(node, containerKey);
@@ -210,6 +243,16 @@ export function SequencerOutlinePane({
     onYamlTextChange(moveStepDown(yamlText, node, nextSibling));
   };
 
+  const handleInsertTopLevel = (kind: BasicSequencerStepTemplate) => {
+    const fallbackLine = outline.length > 0 ? outline[outline.length - 1]?.endLine ?? 1 : 1;
+    setPendingSelection({
+      line: fallbackLine,
+      kind,
+      mode: "closest",
+    });
+    onYamlTextChange(insertStepAtTopLevel(yamlText, kind));
+  };
+
   return (
     <Card
       radius="md"
@@ -236,8 +279,8 @@ export function SequencerOutlinePane({
               Sequence outline
             </Text>
             <Text size="xs" c="dimmed">
-              Visual view of the current YAML with basic editing for variables,
-              call, sleep, repeat, and for
+              Visual view of the current YAML with step-level editing, insertion,
+              and metadata controls
             </Text>
           </Stack>
           <ActionIcon
@@ -256,6 +299,29 @@ export function SequencerOutlinePane({
         </Group>
         {!outlineCollapsed && (
           <>
+            {outlineParseError ? (
+              <Card radius="sm" p="xs" style={{ border: "1px solid var(--card-border)" }}>
+                <Stack gap={4}>
+                  <Text size="xs" c="red" fw={600}>
+                    Outline parser error
+                  </Text>
+                  <Text size="xs" c="dimmed">
+                    Visual outline is temporarily disabled for this YAML text.
+                    You can continue editing in the full YAML editor.
+                  </Text>
+                  <Text
+                    size="xs"
+                    c="dimmed"
+                    style={{
+                      fontFamily:
+                        'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace',
+                    }}
+                  >
+                    {outlineParseError}
+                  </Text>
+                </Stack>
+              </Card>
+            ) : null}
             <SequencerMetadataPanel
               metadata={metadata}
               metadataCollapsed={metadataCollapsed}
@@ -290,12 +356,16 @@ export function SequencerOutlinePane({
                 siblingInfoById={siblingInfoById}
                 onMoveUp={handleMoveUp}
                 onMoveDown={handleMoveDown}
+                onInsertTopLevel={handleInsertTopLevel}
               />
               <SequencerSelectionPanel
                 selectedStep={selectedStep}
                 yamlText={yamlText}
                 onYamlTextChange={onYamlTextChange}
+                streamCatalog={streamCatalog}
                 capabilitiesByDevice={capabilitiesByDevice}
+                streamWorkspaces={streamWorkspaces}
+                latestSignalsByDevice={latestSignalsByDevice}
                 colorScheme={colorScheme}
                 onSelectStep={setSelectedId}
               />
