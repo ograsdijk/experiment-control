@@ -86,7 +86,11 @@ class ManagerTuiRpcTests(unittest.TestCase):
             self.assertTrue(resp.get("ok"))
             self.assertEqual(len(fake.sent), 1)
         finally:
-            app._sub.close(0)
+            try:
+                if app._sub is not None:
+                    app._sub.close(0)
+            except Exception:
+                pass
             try:
                 app._rpc.close(0)
             except Exception:
@@ -107,7 +111,11 @@ class ManagerTuiRpcTests(unittest.TestCase):
             self.assertTrue(timeout_sock.closed)
             self.assertIs(app._rpc, replacement)
         finally:
-            app._sub.close(0)
+            try:
+                if app._sub is not None:
+                    app._sub.close(0)
+            except Exception:
+                pass
             try:
                 app._rpc.close(0)
             except Exception:
@@ -122,7 +130,8 @@ class ManagerTuiRpcTests(unittest.TestCase):
             sub_reconnect_requested: list[bool] = []
 
             app._rpc.close(0)
-            app._sub.close(0)
+            if app._sub is not None:
+                app._sub.close(0)
             app._rpc = old_rpc
             app._sub = _ReplacementSocket()
             app._new_rpc_socket = lambda: new_rpc  # type: ignore[method-assign]
@@ -160,7 +169,8 @@ class ManagerTuiRpcTests(unittest.TestCase):
             except Exception:
                 pass
             try:
-                app._sub.close(0)
+                if app._sub is not None:
+                    app._sub.close(0)
             except Exception:
                 pass
 
@@ -168,7 +178,8 @@ class ManagerTuiRpcTests(unittest.TestCase):
         app = self._build_app()
         try:
             app._rpc.close(0)
-            app._sub.close(0)
+            if app._sub is not None:
+                app._sub.close(0)
             app._rpc = _ReplacementSocket()
             app._sub = _ReplacementSocket()
             app._new_rpc_socket = lambda: _ReplacementSocket()  # type: ignore[method-assign]
@@ -199,7 +210,8 @@ class ManagerTuiRpcTests(unittest.TestCase):
             except Exception:
                 pass
             try:
-                app._sub.close(0)
+                if app._sub is not None:
+                    app._sub.close(0)
             except Exception:
                 pass
 

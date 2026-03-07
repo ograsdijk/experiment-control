@@ -4,14 +4,20 @@ import { CommonStepInspector } from "../../../components/CommonStepInspector";
 import { EditableStepInspector } from "../../../components/EditableStepInspector";
 import { LoopStepInspector } from "../../../components/LoopStepInspector";
 import { YamlPreview } from "../../../components/YamlPreview";
+import type { StreamAnalysisWorkspaceConfig } from "../../stream/types";
 import type { CapabilityMember } from "../../../types";
+import type { StreamCatalogEntry } from "../../../types";
+import type { TelemetrySignal } from "../../../types";
 import type { SequencerStepOutlineNode } from "../types";
 
 type Props = {
   selectedStep: SequencerStepOutlineNode | null;
   yamlText: string;
   onYamlTextChange: (value: string) => void;
+  streamCatalog: StreamCatalogEntry[];
   capabilitiesByDevice: Record<string, CapabilityMember[]>;
+  streamWorkspaces: Record<string, StreamAnalysisWorkspaceConfig>;
+  latestSignalsByDevice: Record<string, Record<string, TelemetrySignal>>;
   colorScheme: "light" | "dark";
   onSelectStep: (id: string) => void;
 };
@@ -42,8 +48,11 @@ function kindColor(kind: string): string {
 function isEditableStep(node: SequencerStepOutlineNode): boolean {
   return Boolean(
     node.callDetail ||
+      node.setDetail ||
+      node.assignDetail ||
       node.sleepDetail ||
       node.waitUntilDetail ||
+      node.setContextDetail ||
       node.repeatDetail ||
       node.forDetail ||
       node.ifDetail ||
@@ -56,7 +65,10 @@ export function SequencerSelectionPanel({
   selectedStep,
   yamlText,
   onYamlTextChange,
+  streamCatalog,
   capabilitiesByDevice,
+  streamWorkspaces,
+  latestSignalsByDevice,
   colorScheme,
   onSelectStep,
 }: Props) {
@@ -104,7 +116,10 @@ export function SequencerSelectionPanel({
                 node={selectedStep}
                 yamlText={yamlText}
                 onYamlTextChange={onYamlTextChange}
+                streamCatalog={streamCatalog}
                 capabilitiesByDevice={capabilitiesByDevice}
+                streamWorkspaces={streamWorkspaces}
+                latestSignalsByDevice={latestSignalsByDevice}
                 onSelectStep={onSelectStep}
               />
             ) : selectedStep.adaptiveDetail ? (

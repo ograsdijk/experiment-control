@@ -20,11 +20,14 @@ from ..utils.cli_args import (
     add_rpc_timeout_arg,
 )
 from .ast import parse_sequence
+from .condition_validation import has_error_diagnostics, validate_sequence_conditions
+from .library import SequenceLibrary, SequenceLibraryEntry
 from .runtime import SequencerRuntime
 from ..processes.process_base import ManagedProcessBase
 
 Json = dict[str, Any]
 _EXTERNAL_FAULT_SEVERITIES = {"warning", "error", "critical"}
+_DEFAULT_PROGRESS_EVENT_PERIOD_S = 0.3
 
 
 def _normalize_log_severity(raw: Any) -> str:
@@ -78,6 +81,10 @@ class SequencerProcess(ManagedProcessBase):
         process_id: str,
         rpc_timeout_ms: int = 2000,
         autoload_path: str | None = None,
+        sequence_library_path: str | None = None,
+        autoload_sequence_id: str | None = None,
+        library_description_policy: str = "warn",
+        progress_event_period_s: float = _DEFAULT_PROGRESS_EVENT_PERIOD_S,
         heartbeat_endpoint: str | None = None,
         heartbeat_period_s: float = 1.0,
     ) -> None:
@@ -121,10 +128,32 @@ class SequencerProcess(ManagedProcessBase):
             call_device=self._call_device,
             get_telemetry=self._get_telemetry,
             set_stream_context=self._set_stream_context,
+            resolve_use=self._resolve_use_sequence_spec,
         )
         self._context_columns: dict[str, str] | None = None
         self._loaded_sequence_source: str | None = None
+        self._loaded_sequence_source_kind: str | None = None
         self._loaded_sequence_text: str | None = None
+        self._active_sequence_id: str | None = None
+        self._sequence_library_path = (
+            str(sequence_library_path).strip() if sequence_library_path else None
+        )
+        self._autoload_sequence_id = (
+            str(autoload_sequence_id).strip() if autoload_sequence_id else None
+        )
+        self._library_description_policy = str(library_description_policy or "warn").strip()
+        self._sequence_library: SequenceLibrary | None = None
+        self._sequence_library_error: str | None = None
+        self._sequence_library_warnings: list[str] = []
+        try:
+            period = float(progress_event_period_s)
+        except Exception:
+            period = _DEFAULT_PROGRESS_EVENT_PERIOD_S
+        if not (period > 0.0):
+            period = _DEFAULT_PROGRESS_EVENT_PERIOD_S
+        self._progress_event_period_s = period
+        self._last_progress_event_mono = 0.0
+        self._last_progress_event_signature: tuple[Any, ...] | None = None
         self._autoload_error: str | None = None
         self._autoload_error_ts_wall: float | None = None
         self._autoload_error_source: str | None = None
@@ -133,8 +162,121 @@ class SequencerProcess(ManagedProcessBase):
         self._advertise_process_rpc()
         self._start_heartbeat_thread(state_provider=lambda: self._runtime.state)
         self._last_error_sent = False
-        if autoload_path:
+        if self._sequence_library_path:
+            self._load_sequence_library(initial=True)
+            if self._autoload_sequence_id:
+                self._try_autoload_sequence_id(self._autoload_sequence_id)
+        if autoload_path and self._loaded_sequence_text is None:
             self._try_autoload_path(str(autoload_path))
+
+    def _resolve_use_sequence_spec(self, sequence_id: str):
+        if self._sequence_library is None:
+            raise RuntimeError(
+                f"use step {sequence_id!r} requires sequence_library_path to be configured"
+            )
+        return self._sequence_library.get_spec(sequence_id)
+
+    def _set_loaded_sequence(
+        self,
+        *,
+        spec: Any,
+        text: str,
+        source: str,
+        source_kind: str,
+        active_sequence_id: str | None,
+    ) -> None:
+        self._runtime.load(spec)
+        self._context_columns = spec.context_columns
+        self._loaded_sequence_source = source
+        self._loaded_sequence_source_kind = source_kind
+        self._loaded_sequence_text = text
+        self._active_sequence_id = active_sequence_id
+        self._clear_autoload_error()
+        self._last_progress_event_signature = None
+        self._last_progress_event_mono = 0.0
+
+    def _set_loaded_sequence_from_library_entry(
+        self, entry: SequenceLibraryEntry
+    ) -> None:
+        self._set_loaded_sequence(
+            spec=entry.spec,
+            text=entry.text,
+            source=entry.path,
+            source_kind="library",
+            active_sequence_id=entry.sequence_id,
+        )
+
+    def _load_sequence_library(self, *, initial: bool = False) -> bool:
+        if not self._sequence_library_path:
+            self._sequence_library = None
+            self._sequence_library_error = None
+            self._sequence_library_warnings = []
+            return False
+        try:
+            library = SequenceLibrary(
+                manifest_path=self._sequence_library_path,
+                description_policy=self._library_description_policy,
+            )
+            library.reload()
+        except Exception as e:
+            self._sequence_library_error = str(e)
+            if initial:
+                self._publish_log(
+                    severity="error",
+                    message=f"sequencer sequence library load failed: {e}",
+                )
+            return False
+        self._sequence_library = library
+        self._sequence_library_error = None
+        self._sequence_library_warnings = list(library.warnings)
+        for warning in self._sequence_library_warnings:
+            self._publish_log(
+                severity="warning",
+                message=f"sequencer sequence library warning: {warning}",
+            )
+        return True
+
+    def _try_autoload_sequence_id(self, sequence_id: str) -> None:
+        seq_id = str(sequence_id or "").strip()
+        if not seq_id:
+            return
+        if self._sequence_library is None:
+            self._set_autoload_error(
+                "sequencer autoload_sequence_id requires a loaded sequence library",
+                source=self._sequence_library_path,
+            )
+            return
+        try:
+            entry = self._sequence_library.get_entry(seq_id)
+            self._set_loaded_sequence_from_library_entry(entry)
+            self._publish_lifecycle_event(
+                event="load_ok",
+                ok=True,
+                source="autoload",
+                message="sequencer autoloaded library sequence",
+                payload={
+                    "loaded_source": entry.path,
+                    "active_sequence_id": seq_id,
+                    "context_columns": self._context_columns,
+                },
+            )
+            self._publish_log(
+                severity="info",
+                message=f"sequencer autoloaded library sequence: {seq_id}",
+            )
+        except Exception as e:
+            self._set_autoload_error(str(e), source=seq_id)
+            self._publish_lifecycle_event(
+                event="load_failed",
+                ok=False,
+                source="autoload",
+                message=str(e),
+                payload={"active_sequence_id": seq_id},
+            )
+            self._publish_log(
+                severity="error",
+                message=f"sequencer autoload sequence_id failed for {seq_id!r}: {e}",
+            )
 
     def _try_autoload_path(self, path: str) -> None:
         try:
@@ -156,11 +298,13 @@ class SequencerProcess(ManagedProcessBase):
                 )
                 self._publish_log(severity="error", message=f"sequencer autoload failed: {message}")
                 return
-            self._runtime.load(spec)
-            self._context_columns = spec.context_columns
-            self._loaded_sequence_source = source
-            self._loaded_sequence_text = seq_text
-            self._clear_autoload_error()
+            self._set_loaded_sequence(
+                spec=spec,
+                text=seq_text,
+                source=source,
+                source_kind="autoload_path",
+                active_sequence_id=None,
+            )
             self._publish_lifecycle_event(
                 event="load_ok",
                 ok=True,
@@ -196,6 +340,74 @@ class SequencerProcess(ManagedProcessBase):
         self._autoload_error_ts_wall = None
         self._autoload_error_source = None
 
+    def _library_list_payload(self) -> Json:
+        entries = self._sequence_library.list_entries() if self._sequence_library else []
+        return {
+            "configured": bool(self._sequence_library_path),
+            "manifest_path": self._sequence_library_path,
+            "description_policy": self._library_description_policy,
+            "active_sequence_id": self._active_sequence_id,
+            "autoload_sequence_id": self._autoload_sequence_id,
+            "entry_count": len(entries),
+            "warnings": list(self._sequence_library_warnings),
+            "last_error": self._sequence_library_error,
+            "entries": entries,
+        }
+
+    @staticmethod
+    def _progress_event_signature(status: Json) -> tuple[Any, ...]:
+        progress = status.get("progress")
+        if not isinstance(progress, dict):
+            progress = {}
+        return (
+            status.get("run_id"),
+            status.get("state"),
+            status.get("current_step"),
+            progress.get("completed_steps"),
+            progress.get("total_steps"),
+            progress.get("percent"),
+            progress.get("eta_s"),
+            progress.get("loop_mode"),
+            progress.get("loops_completed"),
+            progress.get("loops_target"),
+        )
+
+    def _maybe_publish_progress_event(self) -> None:
+        if self._manager is None:
+            return
+        status = self._runtime.status()
+        signature = self._progress_event_signature(status)
+        now = time.monotonic()
+        state = str(status.get("state") or "")
+        force = state in {"STOPPED", "ERROR"} and signature != self._last_progress_event_signature
+        if not force:
+            if signature == self._last_progress_event_signature:
+                return
+            if (now - self._last_progress_event_mono) < self._progress_event_period_s:
+                return
+        payload = {
+            "version": 1,
+            "process_id": self._process_id,
+            "run_id": status.get("run_id"),
+            "state": status.get("state"),
+            "current_step": status.get("current_step"),
+            "loop_mode": status.get("loop_mode"),
+            "loops_completed": status.get("loops_completed"),
+            "loops_target": status.get("loops_target"),
+            "progress": status.get("progress"),
+        }
+        try:
+            self._manager.publish_event(
+                topic="sequencer.progress",
+                payload=payload,
+                include_process_id=False,
+                include_ts=True,
+            )
+        except Exception:
+            return
+        self._last_progress_event_signature = signature
+        self._last_progress_event_mono = now
+
     def _load_sequence_text(
         self, *, text: str, source: str
     ) -> tuple[bool, Any | None, list[Json]]:
@@ -228,6 +440,11 @@ class SequencerProcess(ManagedProcessBase):
                     "source": "sequencer",
                 }
             )
+            return False, None, diagnostics
+
+        condition_diagnostics = validate_sequence_conditions(spec)
+        diagnostics.extend(condition_diagnostics)
+        if has_error_diagnostics(condition_diagnostics):
             return False, None, diagnostics
 
         return True, spec, diagnostics
@@ -303,6 +520,30 @@ class SequencerProcess(ManagedProcessBase):
                     "sequencer.start",
                     params=[
                         param(
+                            "sequence_id",
+                            required=False,
+                            default=None,
+                            annotation="str",
+                        ),
+                        param(
+                            "repeat_count",
+                            required=False,
+                            default=None,
+                            annotation="int",
+                        ),
+                        param(
+                            "continuous",
+                            required=False,
+                            default=False,
+                            annotation="bool",
+                        ),
+                        param(
+                            "vars_override",
+                            required=False,
+                            default=None,
+                            annotation="dict",
+                        ),
+                        param(
                             "adaptive",
                             required=False,
                             default=None,
@@ -315,6 +556,21 @@ class SequencerProcess(ManagedProcessBase):
                 method("sequencer.resume", params=None, doc="Resume sequence execution."),
                 method("sequencer.stop", params=None, doc="Stop sequence execution."),
                 method("sequencer.status", params=None, doc="Get sequencer status."),
+                method(
+                    "sequencer.library.list",
+                    params=None,
+                    doc="List configured sequence library entries.",
+                ),
+                method(
+                    "sequencer.library.reload",
+                    params=None,
+                    doc="Reload sequence library manifest and entries.",
+                ),
+                method(
+                    "sequencer.library.load",
+                    params=[param("sequence_id", required=True, annotation="str")],
+                    doc="Load a sequence from the configured library by id.",
+                ),
                 method(
                     "sequencer.adaptive.status",
                     params=None,
@@ -400,10 +656,13 @@ class SequencerProcess(ManagedProcessBase):
                     },
                 }
 
-            self._runtime.load(spec)
-            self._context_columns = spec.context_columns
-            self._loaded_sequence_source = source
-            self._loaded_sequence_text = seq_text
+            self._set_loaded_sequence(
+                spec=spec,
+                text=seq_text,
+                source=source,
+                source_kind="rpc",
+                active_sequence_id=None,
+            )
             self._publish_lifecycle_event(
                 event="load_ok",
                 ok=True,
@@ -449,13 +708,134 @@ class SequencerProcess(ManagedProcessBase):
                 "result": {"valid": bool(ok), "diagnostics": diagnostics},
             }
 
+        if rtype == "sequencer.library.list":
+            return {
+                "request_id": req.get("request_id"),
+                "ok": True,
+                "result": self._library_list_payload(),
+            }
+
+        if rtype == "sequencer.library.reload":
+            if not self._sequence_library_path:
+                return {
+                    "request_id": req.get("request_id"),
+                    "ok": False,
+                    "error": {
+                        "code": "library_not_configured",
+                        "message": "sequencer sequence_library_path is not configured",
+                    },
+                }
+            if not self._load_sequence_library(initial=False):
+                return {
+                    "request_id": req.get("request_id"),
+                    "ok": False,
+                    "error": {
+                        "code": "library_reload_failed",
+                        "message": self._sequence_library_error
+                        or "sequence library reload failed",
+                    },
+                }
+            return {
+                "request_id": req.get("request_id"),
+                "ok": True,
+                "result": self._library_list_payload(),
+            }
+
+        if rtype == "sequencer.library.load":
+            sequence_id = str(params.get("sequence_id", "")).strip()
+            if not sequence_id:
+                return {
+                    "request_id": req.get("request_id"),
+                    "ok": False,
+                    "error": {"code": "missing_sequence_id"},
+                }
+            if self._sequence_library is None:
+                return {
+                    "request_id": req.get("request_id"),
+                    "ok": False,
+                    "error": {
+                        "code": "library_not_configured",
+                        "message": "sequencer sequence library is not configured",
+                    },
+                }
+            try:
+                entry = self._sequence_library.get_entry(sequence_id)
+                self._set_loaded_sequence_from_library_entry(entry)
+            except KeyError as e:
+                return {
+                    "request_id": req.get("request_id"),
+                    "ok": False,
+                    "error": {"code": "unknown_sequence_id", "message": str(e)},
+                }
+            except Exception as e:
+                self._publish_lifecycle_event(
+                    event="load_failed",
+                    ok=False,
+                    source="rpc",
+                    message=str(e),
+                    payload={"active_sequence_id": sequence_id},
+                )
+                return {
+                    "request_id": req.get("request_id"),
+                    "ok": False,
+                    "error": {"code": "load_failed", "message": str(e)},
+                }
+            self._publish_lifecycle_event(
+                event="load_ok",
+                ok=True,
+                source="rpc",
+                message="sequence loaded from library",
+                payload={
+                    "active_sequence_id": sequence_id,
+                    "loaded_source": entry.path,
+                    "context_columns": self._context_columns,
+                },
+            )
+            return {
+                "request_id": req.get("request_id"),
+                "ok": True,
+                "result": {"status": "loaded", "active_sequence_id": sequence_id},
+            }
+
         if rtype == "sequencer.start":
             try:
                 adaptive = params.get("adaptive")
                 adaptive_overrides = adaptive if isinstance(adaptive, dict) else None
                 if adaptive is not None and adaptive_overrides is None:
                     raise TypeError("sequencer.start params.adaptive must be a dict")
-                self._runtime.start(adaptive=adaptive_overrides)
+                sequence_id = params.get("sequence_id")
+                sequence_id_text = (
+                    str(sequence_id).strip() if sequence_id is not None else ""
+                )
+                if sequence_id_text:
+                    if self._sequence_library is None:
+                        raise RuntimeError(
+                            "sequencer.start sequence_id requires configured sequence library"
+                        )
+                    entry = self._sequence_library.get_entry(sequence_id_text)
+                    self._set_loaded_sequence_from_library_entry(entry)
+                repeat_count = params.get("repeat_count")
+                continuous_raw = params.get("continuous", False)
+                if isinstance(continuous_raw, bool):
+                    continuous = continuous_raw
+                elif continuous_raw is None:
+                    continuous = False
+                else:
+                    raise TypeError("sequencer.start params.continuous must be a bool")
+                vars_override_raw = params.get("vars_override")
+                vars_override = (
+                    vars_override_raw if isinstance(vars_override_raw, dict) else None
+                )
+                if vars_override_raw is not None and vars_override is None:
+                    raise TypeError("sequencer.start params.vars_override must be a dict")
+                self._runtime.start(
+                    adaptive=adaptive_overrides,
+                    repeat_count=repeat_count,
+                    continuous=continuous,
+                    vars_override=vars_override,
+                )
+                self._last_progress_event_signature = None
+                self._last_progress_event_mono = 0.0
             except Exception as e:
                 self._publish_lifecycle_event(
                     event="start",
@@ -473,6 +853,11 @@ class SequencerProcess(ManagedProcessBase):
                 ok=True,
                 source="rpc",
                 message="sequencer started",
+                payload={
+                    "run_id": self._runtime.status().get("run_id"),
+                    "active_sequence_id": self._active_sequence_id,
+                    "loaded_source": self._loaded_sequence_source,
+                },
             )
             return {"request_id": req.get("request_id"), "ok": True, "result": {"status": "running"}}
 
@@ -550,6 +935,12 @@ class SequencerProcess(ManagedProcessBase):
             result["loaded"] = self._runtime.is_loaded
             result["context_columns"] = self._context_columns
             result["loaded_source"] = self._loaded_sequence_source
+            result["loaded_source_kind"] = self._loaded_sequence_source_kind
+            result["active_sequence_id"] = self._active_sequence_id
+            result["sequence_library_configured"] = bool(self._sequence_library_path)
+            result["sequence_library_path"] = self._sequence_library_path
+            result["sequence_library_error"] = self._sequence_library_error
+            result["sequence_library_warnings"] = list(self._sequence_library_warnings)
             result["autoload_error"] = self._autoload_error
             result["autoload_error_ts_wall"] = self._autoload_error_ts_wall
             result["autoload_error_source"] = self._autoload_error_source
@@ -593,6 +984,8 @@ class SequencerProcess(ManagedProcessBase):
                 "result": {
                     "loaded": self._runtime.is_loaded,
                     "source": self._loaded_sequence_source,
+                    "source_kind": self._loaded_sequence_source_kind,
+                    "active_sequence_id": self._active_sequence_id,
                     "text": self._loaded_sequence_text,
                 },
             }
@@ -611,6 +1004,7 @@ class SequencerProcess(ManagedProcessBase):
                 self._drain_analysis_outputs(events)
                 self._flush_pending_logs(max_items=8)
                 self._runtime.tick()
+                self._maybe_publish_progress_event()
                 if self._runtime.state == "ERROR" and not self._last_error_sent:
                     err_message = str(
                         self._runtime.status().get("error") or "sequencer error"

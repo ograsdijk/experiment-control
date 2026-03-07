@@ -115,6 +115,14 @@ Request:
 Response:
 - `{"ok": true, "result": {"version": 1, "instance_id": "laser-lock-1", "started_ts": {"t_wall": 1700000000.0, "t_mono": 12345.6}}}`
 
+### `manager.cleanup_orphans`
+Request:
+- `{"type": "manager.cleanup_orphans"}`
+- `{"type": "manager.cleanup_orphans", "params": {"dry_run": true, "stale_only": true, "timeout_s": 2.0}}`
+
+Response:
+- `{"ok": true, "result": {"instance_id": "laser-lock-1", "dry_run": true, "stale_only": true, "matched": 2, "terminated": [], "failed": [], "skipped_live_parent": [1234], "candidates": [4567]}}`
+
 ### `command_interceptor.register`
 Request:
 - `{"type": "command_interceptor.register", "process_id": "interlock", "routes": [{"device_id": "hv", "action": "enable_output"}], "replace": true}`
@@ -295,6 +303,7 @@ Request (from text):
 Response:
 - `{"ok": true, "result": {"valid": true, "diagnostics": []}}`
 - `{"ok": true, "result": {"valid": false, "diagnostics": [{"severity": "error", "message": "...", "line": 12, "column": 5, "source": "yaml"}]}}`
+- `{"ok": true, "result": {"valid": true, "diagnostics": [{"severity": "warning", "message": "steps[0].if.condition.and: 'and' has only one clause; consider removing the wrapper", "line": null, "column": null, "source": "sequencer.condition"}]}}`
 
 ### `sequencer.load`
 Request:
@@ -308,6 +317,7 @@ Response:
 ### `sequencer.start` / `sequencer.pause` / `sequencer.resume` / `sequencer.stop`
 Request:
 - `{"type": "sequencer.start"}`
+- `{"type": "sequencer.start", "params": {"sequence_id": "main", "repeat_count": 5, "continuous": false, "vars_override": {"port": 3}, "adaptive": {"scan_1": {"mode": "warm_start"}}}}`
 - `{"type": "sequencer.pause"}`
 - `{"type": "sequencer.resume"}`
 - `{"type": "sequencer.stop"}`
@@ -315,12 +325,42 @@ Request:
 Response:
 - `{"ok": true, "result": {"status": "running" | "pause_requested" | "stop_requested"}}`
 
+### `sequencer.library.list`
+Request:
+- `{"type": "sequencer.library.list"}`
+
+Response:
+- `{"ok": true, "result": {"configured": true, "manifest_path": "sequences/library.yaml", "description_policy": "warn", "active_sequence_id": "main", "entry_count": 3, "warnings": [], "last_error": null, "entries": [{"id": "main", "path": "sequences/main.yaml", "source": "explicit", "label": "Main", "description": "...", "tags": [], "editable_vars": [], "vars": ["port"], "use_ids": ["fragments.wait"]}]}}`
+
+### `sequencer.library.reload`
+Request:
+- `{"type": "sequencer.library.reload"}`
+
+Response:
+- `{"ok": true, "result": {...same shape as sequencer.library.list...}}`
+- `{"ok": false, "error": {"code": "library_not_configured" | "library_reload_failed", "message": "..."}}`
+
+### `sequencer.library.load`
+Request:
+- `{"type": "sequencer.library.load", "params": {"sequence_id": "main"}}`
+
+Response:
+- `{"ok": true, "result": {"status": "loaded", "active_sequence_id": "main"}}`
+- `{"ok": false, "error": {"code": "missing_sequence_id" | "unknown_sequence_id" | "load_failed", "message": "..."}}`
+
 ### `sequencer.status`
 Request:
 - `{"type": "sequencer.status"}`
 
 Response:
-- `{"ok": true, "result": {"state": "...", "current_step": "...", "vars": {...}, "env": {...}, "error": null, "loaded": true, "context_columns": {...} | null, "progress": {"elapsed_s": 12.3, "completed_steps": 42, "total_steps": 100 | null, "percent": 42.0 | null, "eta_s": 16.8 | null, "step_ewma_s": 0.4 | null}}}`
+- `{"ok": true, "result": {"run_id": 7, "state": "...", "current_step": "...", "loop_mode": "once" | "repeat" | "continuous", "loops_completed": 2, "loops_target": 5 | null, "vars": {...}, "vars_override": {...}, "env": {...}, "error": null, "loaded": true, "active_sequence_id": "main" | null, "loaded_source": "...", "loaded_source_kind": "rpc" | "library" | "autoload_path" | null, "context_columns": {...} | null, "sequence_library_configured": true | false, "sequence_library_path": "..." | null, "sequence_library_error": "..." | null, "sequence_library_warnings": [...], "progress": {"run_id": 7, "elapsed_s": 12.3, "completed_steps": 42, "total_steps": 100 | null, "percent": 42.0 | null, "eta_s": 16.8 | null, "step_ewma_s": 0.4 | null, "current_step_elapsed_s": 0.2 | null, "loop_mode": "repeat", "loops_completed": 2, "loops_target": 5}}}`
+
+### `sequencer.loaded_yaml`
+Request:
+- `{"type": "sequencer.loaded_yaml"}`
+
+Response:
+- `{"ok": true, "result": {"loaded": true, "source": "sequences/main.yaml", "source_kind": "library", "active_sequence_id": "main", "text": "...yaml..."}}`
 
 ## HDF writer process RPC (process.rpc payload)
 
@@ -547,6 +587,32 @@ Response:
   - `stream`: `event|stdout|stderr`
   - `message`: str
   - `payload_json`: str
+  - `ts`: {`t_wall`, `t_mono`}
+
+### `sequencer.lifecycle`
+- Producer: sequencer (via manager event bus)
+- Consumers: TUI/logs
+- Payload (version 1):
+  - `process_id`: str
+  - `event`: str
+  - `ok`: bool
+  - `source`: str
+  - `message`: str
+  - `payload`: dict (optional)
+  - `ts`: {`t_wall`, `t_mono`}
+
+### `sequencer.progress`
+- Producer: sequencer (via manager event bus)
+- Consumers: optional (dashboards/automation)
+- Payload (version 1):
+  - `process_id`: str
+  - `run_id`: int
+  - `state`: str
+  - `current_step`: str | null
+  - `loop_mode`: `once|repeat|continuous`
+  - `loops_completed`: int
+  - `loops_target`: int | null
+  - `progress`: dict (same shape as `sequencer.status.result.progress`)
   - `ts`: {`t_wall`, `t_mono`}
 
 ### `manager.command_interceptor.routes_updated`

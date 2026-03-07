@@ -99,6 +99,57 @@ export function insertStepBelow(
   );
 }
 
+export function insertStepAtTopLevel(
+  yamlText: string,
+  kind: BasicSequencerStepTemplate
+): string {
+  const { lines, hasTrailingNewline } = splitLines(yamlText);
+  const snippet = indentSnippet(buildTemplateSnippet(kind), 2);
+  const stepsIndex = lines.findIndex((line) => {
+    const match = line.match(/^(\s*)steps:\s*(.*)$/);
+    if (!match) {
+      return false;
+    }
+    const indent = match[1]?.length ?? 0;
+    return indent === 0;
+  });
+
+  if (stepsIndex >= 0) {
+    const stepsLine = lines[stepsIndex] ?? "";
+    const stepsMatch = stepsLine.match(/^(\s*)steps:\s*(.*)$/);
+    const remainder = (stepsMatch?.[2] ?? "").replace(/\s+#.*$/, "").trim();
+    if (remainder.length > 0) {
+      lines[stepsIndex] = "steps:";
+    }
+
+    let insertIndex = stepsIndex + 1;
+    for (let index = stepsIndex + 1; index < lines.length; index += 1) {
+      const line = lines[index] ?? "";
+      if (!line.trim()) {
+        insertIndex = index + 1;
+        continue;
+      }
+      const indent = line.match(/^\s*/)?.[0].length ?? 0;
+      if (indent === 0) {
+        break;
+      }
+      insertIndex = index + 1;
+    }
+    return joinLines(
+      [...lines.slice(0, insertIndex), ...snippet, ...lines.slice(insertIndex)],
+      hasTrailingNewline
+    );
+  }
+
+  const nextLines = [...lines];
+  if (nextLines.length > 0 && nextLines[nextLines.length - 1]?.trim().length > 0) {
+    nextLines.push("");
+  }
+  nextLines.push("steps:");
+  nextLines.push(...snippet);
+  return joinLines(nextLines, hasTrailingNewline);
+}
+
 export function insertStepInside(
   yamlText: string,
   node: SequencerStepOutlineNode,

@@ -1,6 +1,17 @@
 import type { SequencerOutlineMetadataEntry, SequencerStepOutlineNode } from "../types";
 
-export type BasicSequencerStepTemplate = "call" | "sleep" | "repeat";
+export type BasicSequencerStepTemplate =
+  | "call"
+  | "sleep"
+  | "repeat"
+  | "adaptive"
+  | "set"
+  | "assign"
+  | "wait_until"
+  | "set_context"
+  | "for"
+  | "if"
+  | "while";
 export type SequencerChildContainer = "do" | "then" | "else";
 
 export function splitLines(yamlText: string): {
@@ -175,6 +186,91 @@ export function buildTemplateSnippet(kind: BasicSequencerStepTemplate): string {
       return ["- repeat:", "    times: 2", "    do:", "      - sleep: 0.1"].join(
         "\n"
       );
+    case "adaptive":
+      return [
+        "- adaptive:",
+        '    id: ""',
+        "    controller:",
+        '      kind: "adaptive.adaptive_grid_1d"',
+        "    space:",
+        "      x:",
+        "        type: float",
+        "        min: 0",
+        "        max: 1",
+        "    bind:",
+        "      value: x",
+        "    observe:",
+        "      metrics:",
+        "        score:",
+        "          kind: analysis_output",
+        "          config:",
+        '            workspace_id: ""',
+        '            output_id: ""',
+        "      aggregate:",
+        "        score: [mean]",
+        "      score: ${metrics.score}",
+        "    stopping:",
+        "      max_trials: 20",
+        "    do:",
+        "      - sleep: 0.1",
+      ].join("\n");
+    case "set":
+      return [
+        "- set:",
+        '    device: ""',
+        '    name: ""',
+        '    value: ""',
+      ].join("\n");
+    case "assign":
+      return "- assign: {}";
+    case "wait_until":
+      return [
+        "- wait_until:",
+        "    timeout_s: 10",
+        "    every_s: 0.2",
+        "    sample:",
+        "      telemetry:",
+        '        device: ""',
+        '        signal: ""',
+        "    condition:",
+        "      gt: [${sample}, 0.0]",
+      ].join("\n");
+    case "set_context":
+      return [
+        "- set_context:",
+        "    streams:",
+        "      -",
+        '          device: ""',
+        '          stream: ""',
+        "    fields: {}",
+      ].join("\n");
+    case "for":
+      return [
+        "- for:",
+        "    bind: value",
+        "    in:",
+        "      gen:",
+        "        range: {start: 0, stop: 10, step: 1}",
+        "    do:",
+        "      - sleep: 0.1",
+      ].join("\n");
+    case "if":
+      return [
+        "- if:",
+        "    condition:",
+        "      gt: [${value}, 0.0]",
+        "    then:",
+        "      - sleep: 0.1",
+        "    else: []",
+      ].join("\n");
+    case "while":
+      return [
+        "- while:",
+        "    condition:",
+        "      lt: [${value}, 10]",
+        "    do:",
+        "      - sleep: 0.1",
+      ].join("\n");
     default:
       return "- sleep: 0.1";
   }

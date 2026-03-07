@@ -13,6 +13,7 @@ from rich.text import Text
 from textual import events, on
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
+from textual.driver import Driver
 from textual.reactive import reactive
 from textual.screen import ModalScreen
 from textual.widgets import DataTable, Footer, Header, Input, Label, RichLog, Static
@@ -473,8 +474,9 @@ class ManagerTUI(App):
         manager_pub: str = "tcp://127.0.0.1:6001",
         rpc_timeout_ms: int = 1500,
         snapshot_period_s: float = 2.0,
+        driver_class: type[Driver] | None = None,
     ) -> None:
-        super().__init__()
+        super().__init__(driver_class=driver_class)
         self._manager_rpc = manager_rpc
         self._manager_pub = manager_pub
         self._rpc_timeout_ms = rpc_timeout_ms
@@ -484,7 +486,7 @@ class ManagerTUI(App):
         self._rpc = self._new_rpc_socket()
         self._rpc_seq = 0
 
-        self._sub = self._new_sub_socket()
+        self._sub: zmq.Socket | None = None
 
         self._pub_queue: queue.Queue[tuple[str, Json]] = queue.Queue(maxsize=10_000)
         self._chunk_cache: dict[tuple[str, str], tuple[str, Json]] = {}
@@ -597,16 +599,14 @@ class ManagerTUI(App):
 
     def on_unmount(self) -> None:
         self._stop_event.set()
-        try:
-            self._sub.close(0)
-        except Exception:
-            pass
+        self._sub_reconnect_event.set()
+        thread = self._pub_thread_handle
+        if thread is not None:
+            thread.join(timeout=1.5)
         try:
             self._rpc.close(0)
         except Exception:
             pass
-        if self._pub_thread_handle is not None:
-            self._pub_thread_handle.join(timeout=1.0)
 
     def _setup_tables(self) -> None:
         devices = self.query_one("#devices_table", DataTable)
@@ -720,7 +720,8 @@ class ManagerTUI(App):
 
     def _reset_sub_socket(self) -> None:
         try:
-            self._sub.close(0)
+            if self._sub is not None:
+                self._sub.close(0)
         except Exception:
             pass
         self._sub = self._new_sub_socket()
@@ -1757,51 +1758,71 @@ class ManagerTUI(App):
             )
 
     def _pub_thread(self) -> None:
-        while not self._stop_event.is_set():
-            if self._sub_reconnect_event.is_set():
-                self._sub_reconnect_event.clear()
+        try:
+            while not self._stop_event.is_set():
+                if self._sub is None:
+                    try:
+                        self._sub = self._new_sub_socket()
+                    except Exception:
+                        if self._stop_event.is_set():
+                            break
+                        self._bump_error("pub.open")
+                        time.sleep(0.2)
+                        continue
+                if self._sub_reconnect_event.is_set():
+                    self._sub_reconnect_event.clear()
+                    try:
+                        self._reset_sub_socket()
+                    except Exception:
+                        if self._stop_event.is_set():
+                            break
+                        self._bump_error("pub.reconnect")
+                        continue
                 try:
-                    self._reset_sub_socket()
+                    sub = self._sub
+                    if sub is None:
+                        continue
+                    topic_b, payload_b = sub.recv_multipart()
+                except zmq.Again:
+                    continue
                 except Exception:
                     if self._stop_event.is_set():
                         break
-                    self._bump_error("pub.reconnect")
+                    self._bump_error("pub.recv")
                     continue
-            try:
-                topic_b, payload_b = self._sub.recv_multipart()
-            except zmq.Again:
-                continue
-            except Exception:
-                if self._stop_event.is_set():
-                    break
-                self._bump_error("pub.recv")
-                continue
 
-            topic = topic_b.decode("utf-8", errors="replace")
-            try:
-                payload = safe_json_loads(payload_b)
-            except Exception:
-                payload = None
-            if not isinstance(payload, dict):
-                self._bump_error("pub.decode")
-                continue
-
-            if topic == "manager.chunk_ready":
-                device_raw = payload.get("device_id")
-                stream_raw = payload.get("stream")
-                if device_raw is None or stream_raw is None:
+                topic = topic_b.decode("utf-8", errors="replace")
+                try:
+                    payload = safe_json_loads(payload_b)
+                except Exception:
+                    payload = None
+                if not isinstance(payload, dict):
+                    self._bump_error("pub.decode")
                     continue
-                device_id = str(device_raw)
-                stream = str(stream_raw)
-                if device_id and device_id != "None" and stream and stream != "None":
-                    with self._chunk_lock:
-                        self._chunk_cache[(device_id, stream)] = (topic, payload)
-                continue
 
+                if topic == "manager.chunk_ready":
+                    device_raw = payload.get("device_id")
+                    stream_raw = payload.get("stream")
+                    if device_raw is None or stream_raw is None:
+                        continue
+                    device_id = str(device_raw)
+                    stream = str(stream_raw)
+                    if device_id and device_id != "None" and stream and stream != "None":
+                        with self._chunk_lock:
+                            self._chunk_cache[(device_id, stream)] = (topic, payload)
+                    continue
+
+                try:
+                    self._pub_queue.put_nowait((topic, payload))
+                except queue.Full:
+                    self._dropped_pub_messages += 1
+        finally:
             try:
-                self._pub_queue.put_nowait((topic, payload))
-            except queue.Full:
-                self._dropped_pub_messages += 1
+                if self._sub is not None:
+                    self._sub.close(0)
+            except Exception:
+                pass
+            self._sub = None
 
     def _drain_pub_queue(self) -> None:
         if not self.streaming_enabled:

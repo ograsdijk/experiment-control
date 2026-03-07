@@ -6,13 +6,15 @@ import type {
   SetStateAction,
 } from "react";
 import type { GatewaySettingsInfo } from "../api";
+import type { StreamAnalysisWorkspaceConfig } from "../features/stream/types";
 import type { useCommandHistoryController } from "../features/commands/useCommandHistoryController";
 import type { useHdfController } from "../features/hdf/useHdfController";
 import type { useInterlocksController } from "../features/interlocks/useInterlocksController";
 import type { useProcessCommandController } from "../features/processes/useProcessCommandController";
 import type { useProcessesController } from "../features/processes/useProcessesController";
 import type { useSequencerController } from "../features/sequencer/useSequencerController";
-import type { CapabilityMember, DeviceStatus, LogEntry } from "../types";
+import type { CapabilityMember, DeviceStatus, LogEntry, StreamCatalogEntry } from "../types";
+import type { TelemetrySignal } from "../types";
 import { CommandHistoryModalContainer } from "./CommandHistoryModalContainer";
 import { HdfModalsLayer } from "./HdfModalsLayer";
 import { InterlocksModal } from "./InterlocksModal";
@@ -57,7 +59,10 @@ type Props = {
   resolvedWsBase: string;
   telemetryStreamStatus: string;
   devices: DeviceStatus[];
+  streamCatalog: StreamCatalogEntry[];
   capabilitiesByDevice: Record<string, CapabilityMember[]>;
+  streamWorkspaces: Record<string, StreamAnalysisWorkspaceConfig>;
+  latestSignalsByDevice: Record<string, Record<string, TelemetrySignal>>;
   interlocksController: InterlocksControllerState;
   sequencerController: SequencerControllerState;
   sequencerPrimaryIcon: ReactNode;
@@ -112,7 +117,10 @@ export function AppModalsLayer({
   resolvedWsBase,
   telemetryStreamStatus,
   devices,
+  streamCatalog,
   capabilitiesByDevice,
+  streamWorkspaces,
+  latestSignalsByDevice,
   interlocksController,
   sequencerController,
   sequencerPrimaryIcon,
@@ -254,6 +262,26 @@ export function AppModalsLayer({
         primaryLabel={sequencerController.sequencerPrimaryLabel}
         primaryDisabled={sequencerController.sequencerPrimaryDisabled}
         actionBusy={sequencerController.sequencerActionBusy}
+        runMode={sequencerController.sequencerRunMode}
+        repeatCount={sequencerController.sequencerRepeatCount}
+        onRunModeChange={sequencerController.setSequencerRunMode}
+        onRepeatCountChange={sequencerController.setSequencerRepeatCount}
+        libraryConfigured={sequencerController.sequencerLibraryConfigured}
+        libraryEntries={sequencerController.sequencerLibraryEntries}
+        libraryLoading={sequencerController.sequencerLibraryLoading}
+        libraryError={sequencerController.sequencerLibraryError}
+        selectedSequenceId={sequencerController.sequencerSelectedSequenceId}
+        onSelectedSequenceIdChange={sequencerController.setSequencerSelectedSequenceId}
+        onReloadLibrary={sequencerController.reloadSequencerLibrary}
+        overrideRows={sequencerController.sequencerOverrideRows}
+        overrideVarOptions={sequencerController.sequencerOverrideVarOptions}
+        overrideErrors={sequencerController.sequencerOverrideErrors}
+        overridePreview={sequencerController.sequencerOverridePreview}
+        overridesValid={sequencerController.sequencerOverridesValid}
+        onAddOverrideRow={sequencerController.addSequencerOverrideRow}
+        onRemoveOverrideRow={sequencerController.removeSequencerOverrideRow}
+        onUpdateOverrideRow={sequencerController.updateSequencerOverrideRow}
+        onClearOverrides={sequencerController.clearSequencerOverrides}
         adaptiveModes={sequencerController.sequencerAdaptiveModes}
         adaptiveStudies={sequencerController.sequencerStatus?.adaptiveStudies ?? {}}
         loadedAdaptiveIds={sequencerController.sequencerStatus?.loadedAdaptiveIds ?? []}
@@ -275,7 +303,10 @@ export function AppModalsLayer({
         editorRef={sequencerController.sequencerEditorRef}
         yamlText={sequencerController.sequencerYamlText}
         onYamlTextChange={sequencerController.onSequencerYamlTextChange}
+        streamCatalog={streamCatalog}
         capabilitiesByDevice={capabilitiesByDevice}
+        streamWorkspaces={streamWorkspaces}
+        latestSignalsByDevice={latestSignalsByDevice}
         colorScheme={colorScheme}
         diagnostics={sequencerController.sequencerDiagnostics}
         onJumpToDiagnostic={sequencerController.jumpToSequencerDiagnostic}

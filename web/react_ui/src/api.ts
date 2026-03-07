@@ -49,6 +49,20 @@ export type GatewaySettingsInfo = {
   loopback_warning_message?: string;
 };
 
+export type InstanceRuntimeStatus = {
+  instance_id: string;
+  started_ts?: {
+    t_wall?: number;
+    t_mono?: number;
+  } | null;
+  manager_pid?: number | null;
+  manager_reachable?: boolean;
+  lock_effective_status?: string;
+  lock_effective_help?: string;
+  lock_status?: Record<string, unknown> | null;
+  last_orphan_cleanup?: Record<string, unknown> | null;
+};
+
 function isCapabilitiesPayload(value: unknown): boolean {
   if (!value || typeof value !== "object") {
     return false;
@@ -554,6 +568,30 @@ export async function fetchGatewaySettings(): Promise<GatewaySettingsInfo | null
     return null;
   }
   return resp.result;
+}
+
+export async function fetchInstanceRuntimeStatus(): Promise<InstanceRuntimeStatus | null> {
+  const resp = await apiFetch<InstanceRuntimeStatus>("/api/instance/runtime");
+  if (!resp.ok || !resp.result) {
+    return null;
+  }
+  return resp.result;
+}
+
+export async function cleanupInstanceOrphans(params?: {
+  dry_run?: boolean;
+  stale_only?: boolean;
+  timeout_s?: number;
+}): Promise<ApiResponse<Record<string, unknown>>> {
+  return apiFetch<Record<string, unknown>>("/api/instance/cleanup_orphans", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      dry_run: params?.dry_run ?? true,
+      stale_only: params?.stale_only ?? true,
+      timeout_s: params?.timeout_s ?? 2.0,
+    }),
+  });
 }
 
 export function buildWsUrl(path: string) {

@@ -14,6 +14,8 @@ type Props = {
   removeLabel?: string;
   nextNamePrefix?: string;
   valueOptions?: ReadonlyArray<{ value: string; label: string }>;
+  issueCount?: number;
+  issueText?: string | null;
 };
 
 export function SequencerVarsEditor({
@@ -28,6 +30,8 @@ export function SequencerVarsEditor({
   removeLabel = "Remove variable",
   nextNamePrefix = "var",
   valueOptions,
+  issueCount = 0,
+  issueText = null,
 }: Props) {
   return (
     <Card radius="sm" p="xs" style={{ border: "1px solid var(--card-border)" }}>
@@ -43,6 +47,8 @@ export function SequencerVarsEditor({
         removeLabel={removeLabel}
         nextNamePrefix={nextNamePrefix}
         valueOptions={valueOptions}
+        issueCount={issueCount}
+        issueText={issueText}
       />
     </Card>
   );

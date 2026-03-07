@@ -9,8 +9,53 @@ import {
   IconPlus,
   IconTrash,
 } from "@tabler/icons-react";
-import { listChildInsertionTargets } from "../editing";
+import { listChildInsertionTargets, type BasicSequencerStepTemplate } from "../editing";
+import { countStepIssues } from "../editor_helpers";
 import type { SequencerStepOutlineNode } from "../types";
+
+const STEP_TEMPLATE_OPTIONS: Array<{ kind: BasicSequencerStepTemplate; label: string }> = [
+  { kind: "call", label: "Add call" },
+  { kind: "sleep", label: "Add sleep" },
+  { kind: "repeat", label: "Add repeat" },
+  { kind: "adaptive", label: "Add adaptive" },
+  { kind: "for", label: "Add for" },
+  { kind: "wait_until", label: "Add wait_until" },
+  { kind: "set", label: "Add set" },
+  { kind: "assign", label: "Add assign" },
+  { kind: "set_context", label: "Add set_context" },
+  { kind: "if", label: "Add if" },
+  { kind: "while", label: "Add while" },
+];
+
+function insertLabel(kind: BasicSequencerStepTemplate, scope: "below" | "child"): string {
+  const prefix = scope === "below" ? "Insert" : "Insert";
+  switch (kind) {
+    case "call":
+      return `${prefix} call${scope === "below" ? " below" : ""}`;
+    case "sleep":
+      return `${prefix} sleep${scope === "below" ? " below" : ""}`;
+    case "repeat":
+      return `${prefix} repeat${scope === "below" ? " below" : ""}`;
+    case "adaptive":
+      return `${prefix} adaptive${scope === "below" ? " below" : ""}`;
+    case "for":
+      return `${prefix} for${scope === "below" ? " below" : ""}`;
+    case "wait_until":
+      return `${prefix} wait_until${scope === "below" ? " below" : ""}`;
+    case "set":
+      return `${prefix} set${scope === "below" ? " below" : ""}`;
+    case "assign":
+      return `${prefix} assign${scope === "below" ? " below" : ""}`;
+    case "set_context":
+      return `${prefix} set_context${scope === "below" ? " below" : ""}`;
+    case "if":
+      return `${prefix} if${scope === "below" ? " below" : ""}`;
+    case "while":
+      return `${prefix} while${scope === "below" ? " below" : ""}`;
+    default:
+      return `${prefix} step${scope === "below" ? " below" : ""}`;
+  }
+}
 
 function kindColor(kind: string): string {
   switch (kind) {
@@ -49,10 +94,10 @@ type OutlineRowProps = {
   onToggleCollapse: (id: string) => void;
   onDuplicate: (node: SequencerStepOutlineNode) => void;
   onDelete: (node: SequencerStepOutlineNode) => void;
-  onInsertBelow: (node: SequencerStepOutlineNode, kind: "call" | "sleep" | "repeat") => void;
+  onInsertBelow: (node: SequencerStepOutlineNode, kind: BasicSequencerStepTemplate) => void;
   onInsertChild: (
     node: SequencerStepOutlineNode,
-    kind: "call" | "sleep" | "repeat",
+    kind: BasicSequencerStepTemplate,
     containerKey: "do" | "then" | "else"
   ) => void;
   siblingInfoById: SiblingInfoMap;
@@ -80,6 +125,7 @@ function OutlineRow({
   const collapsed = collapsible ? Boolean(collapsedById[node.id]) : false;
   const childTargets = listChildInsertionTargets(node);
   const siblingInfo = siblingInfoById[node.id] ?? { prev: null, next: null };
+  const issueCount = countStepIssues(node);
 
   return (
     <>
@@ -129,6 +175,11 @@ function OutlineRow({
                   {node.branchLabel}
                 </Badge>
               ) : null}
+              {issueCount > 0 ? (
+                <Badge size="xs" variant="light" color="red">
+                  {issueCount} issue{issueCount === 1 ? "" : "s"}
+                </Badge>
+              ) : null}
               <Text size="xs" c="dimmed">
                 L{node.line}
                 {node.endLine > node.line ? `-${node.endLine}` : ""}
@@ -158,9 +209,11 @@ function OutlineRow({
               </ActionIcon>
             </Menu.Target>
             <Menu.Dropdown>
-              <Menu.Item onClick={() => onInsertBelow(node, "call")}>Insert call below</Menu.Item>
-              <Menu.Item onClick={() => onInsertBelow(node, "sleep")}>Insert sleep below</Menu.Item>
-              <Menu.Item onClick={() => onInsertBelow(node, "repeat")}>Insert repeat below</Menu.Item>
+              {STEP_TEMPLATE_OPTIONS.map((option) => (
+                <Menu.Item key={`below-${option.kind}`} onClick={() => onInsertBelow(node, option.kind)}>
+                  {insertLabel(option.kind, "below")}
+                </Menu.Item>
+              ))}
             </Menu.Dropdown>
           </Menu>
           {childTargets.length > 0 ? (
@@ -177,9 +230,14 @@ function OutlineRow({
                       <Menu.Item>{`Insert into ${target.label}`}</Menu.Item>
                     </Menu.Target>
                     <Menu.Dropdown>
-                      <Menu.Item onClick={() => onInsertChild(node, "call", target.key)}>Insert call</Menu.Item>
-                      <Menu.Item onClick={() => onInsertChild(node, "sleep", target.key)}>Insert sleep</Menu.Item>
-                      <Menu.Item onClick={() => onInsertChild(node, "repeat", target.key)}>Insert repeat</Menu.Item>
+                      {STEP_TEMPLATE_OPTIONS.map((option) => (
+                        <Menu.Item
+                          key={`child-${target.key}-${option.kind}`}
+                          onClick={() => onInsertChild(node, option.kind, target.key)}
+                        >
+                          {insertLabel(option.kind, "child")}
+                        </Menu.Item>
+                      ))}
                     </Menu.Dropdown>
                   </Menu>
                 ))}
@@ -225,15 +283,16 @@ type Props = {
   onToggleCollapse: (id: string) => void;
   onDuplicate: (node: SequencerStepOutlineNode) => void;
   onDelete: (node: SequencerStepOutlineNode) => void;
-  onInsertBelow: (node: SequencerStepOutlineNode, kind: "call" | "sleep" | "repeat") => void;
+  onInsertBelow: (node: SequencerStepOutlineNode, kind: BasicSequencerStepTemplate) => void;
   onInsertChild: (
     node: SequencerStepOutlineNode,
-    kind: "call" | "sleep" | "repeat",
+    kind: BasicSequencerStepTemplate,
     containerKey: "do" | "then" | "else"
   ) => void;
   siblingInfoById: SiblingInfoMap;
   onMoveUp: (node: SequencerStepOutlineNode) => void;
   onMoveDown: (node: SequencerStepOutlineNode) => void;
+  onInsertTopLevel: (kind: BasicSequencerStepTemplate) => void;
 };
 
 export function SequencerStepTree({
@@ -249,6 +308,7 @@ export function SequencerStepTree({
   siblingInfoById,
   onMoveUp,
   onMoveDown,
+  onInsertTopLevel,
 }: Props) {
   return (
     <Card
@@ -262,9 +322,28 @@ export function SequencerStepTree({
         flexDirection: "column",
       }}
     >
+      <Group justify="space-between" align="center" mb={6}>
+        <Text size="xs" c="dimmed">
+          Steps
+        </Text>
+        <Menu withinPortal position="bottom-end" withArrow shadow="md" zIndex={1000}>
+          <Menu.Target>
+            <Button size="compact-xs" variant="light" leftSection={<IconPlus size={14} />}>
+              Quick add
+            </Button>
+          </Menu.Target>
+          <Menu.Dropdown>
+            {STEP_TEMPLATE_OPTIONS.map((option) => (
+              <Menu.Item key={option.kind} onClick={() => onInsertTopLevel(option.kind)}>
+                {option.label}
+              </Menu.Item>
+            ))}
+          </Menu.Dropdown>
+        </Menu>
+      </Group>
       {outline.length <= 0 ? (
         <Text size="xs" c="dimmed">
-          No sequencer steps detected yet. Add or load YAML to see a visual outline.
+          No sequencer steps detected yet. Use quick add or load YAML to see a visual outline.
         </Text>
       ) : (
         <ScrollArea style={{ flex: 1, minHeight: 0 }}>

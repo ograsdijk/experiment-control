@@ -25,6 +25,7 @@ export function normalizeSequencerProgress(raw: unknown): SequencerProgress | nu
   const percent =
     percentRaw === null ? null : Math.max(0, Math.min(100, percentRaw));
   return {
+    runId: normalizeInt(obj.run_id),
     elapsedS: normalizeFloat(obj.elapsed_s),
     completedSteps: normalizeInt(obj.completed_steps),
     totalSteps: normalizeInt(obj.total_steps),
@@ -32,6 +33,12 @@ export function normalizeSequencerProgress(raw: unknown): SequencerProgress | nu
     etaS: normalizeFloat(obj.eta_s),
     stepEwmaS: normalizeFloat(obj.step_ewma_s),
     currentStepElapsedS: normalizeFloat(obj.current_step_elapsed_s),
+    loopMode:
+      typeof obj.loop_mode === "string" && obj.loop_mode.trim().length > 0
+        ? obj.loop_mode
+        : null,
+    loopsCompleted: normalizeInt(obj.loops_completed),
+    loopsTarget: normalizeInt(obj.loops_target),
   };
 }
 
@@ -42,9 +49,14 @@ export function sameSequencerStatus(
   return Boolean(
     current &&
       current.state === next.state &&
+      current.runId === next.runId &&
       current.currentStep === next.currentStep &&
+      current.loopMode === next.loopMode &&
+      current.loopsCompleted === next.loopsCompleted &&
+      current.loopsTarget === next.loopsTarget &&
       current.error === next.error &&
       current.loaded === next.loaded &&
+      current.activeSequenceId === next.activeSequenceId &&
       current.loadedSource === next.loadedSource &&
       current.autoloadError === next.autoloadError &&
       JSON.stringify(current.contextColumns) ===

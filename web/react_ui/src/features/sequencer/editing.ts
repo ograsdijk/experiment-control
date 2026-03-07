@@ -5,8 +5,11 @@ export type {
 
 export { applyEditedCallStep } from "./editing/step_call";
 export {
+  applyEditedAssignStep,
   applyEditedIfStep,
   applyEditedRepeatStep,
+  applyEditedSetStep,
+  applyEditedSetContextStep,
   applyEditedSleepStep,
   applyEditedWaitUntilStep,
   applyEditedWhileStep,
@@ -18,6 +21,7 @@ export {
   deleteStep,
   duplicateStep,
   getChildInsertionLine,
+  insertStepAtTopLevel,
   insertStepBelow,
   insertStepInside,
   listChildInsertionTargets,

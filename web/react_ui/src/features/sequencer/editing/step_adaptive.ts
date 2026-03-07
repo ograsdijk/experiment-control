@@ -77,6 +77,7 @@ function renderAdaptiveSnippet(
   adaptiveId: string,
   controllerKind: string,
   minLoss: string,
+  controllerConfigExtra: ReadonlyArray<SequencerOutlineMetadataEntry>,
   space: ReadonlyArray<{
     name: string;
     entries: ReadonlyArray<SequencerOutlineMetadataEntry>;
@@ -90,7 +91,8 @@ function renderAdaptiveSnippet(
   aggregate: ReadonlyArray<SequencerOutlineMetadataEntry>,
   observeRepeats: string,
   score: string,
-  maxTrials: string
+  maxTrials: string,
+  stoppingExtra: ReadonlyArray<SequencerOutlineMetadataEntry>
 ): string {
   const detail = node.adaptiveDetail;
   if (!detail) {
@@ -108,7 +110,7 @@ function renderAdaptiveSnippet(
       controllerKind || detail.controllerKind || "adaptive.adaptive_grid_1d"
     )}`
   );
-  const controllerConfig = detail.controllerConfig
+  const controllerConfig = controllerConfigExtra
     .filter((entry) => entry.name !== "min_loss")
     .map((entry) => ({ ...entry }));
   if (minLoss.trim()) {
@@ -145,7 +147,7 @@ function renderAdaptiveSnippet(
     lines.push(`      score: ${sanitizeYamlScalar(score)}`);
   }
 
-  const stoppingEntries = detail.stopping
+  const stoppingEntries = stoppingExtra
     .filter((entry) => entry.name !== "max_trials")
     .map((entry) => ({ ...entry }));
   if (maxTrials.trim()) {
@@ -170,6 +172,7 @@ export function applyEditedAdaptiveStep(
   adaptiveId: string,
   controllerKind: string,
   minLoss: string,
+  controllerConfigExtra: ReadonlyArray<SequencerOutlineMetadataEntry>,
   space: ReadonlyArray<{
     name: string;
     entries: ReadonlyArray<SequencerOutlineMetadataEntry>;
@@ -183,7 +186,8 @@ export function applyEditedAdaptiveStep(
   aggregate: ReadonlyArray<SequencerOutlineMetadataEntry>,
   observeRepeats: string,
   score: string,
-  maxTrials: string
+  maxTrials: string,
+  stoppingExtra: ReadonlyArray<SequencerOutlineMetadataEntry>
 ): string {
   return replaceStepSnippet(
     yamlText,
@@ -193,13 +197,15 @@ export function applyEditedAdaptiveStep(
       adaptiveId,
       controllerKind,
       minLoss,
+      controllerConfigExtra,
       space,
       bind,
       metrics,
       aggregate,
       observeRepeats,
       score,
-      maxTrials
+      maxTrials,
+      stoppingExtra
     )
   );
 }

@@ -21,6 +21,11 @@ from pydantic import BaseModel, Field
 
 from .gateway import GatewaySettings, RouterRpcClient, StreamFrameHub, TelemetryHub
 from ..shm.shm_ring import ShmRingReader
+from ..utils.instance_lock import (
+    derive_lock_effective_status,
+    lock_effective_status_help,
+    read_instance_lock_status,
+)
 
 
 class DeviceCommandRequest(BaseModel):
@@ -37,6 +42,12 @@ class ProcessCommandRequest(BaseModel):
     action: str
     params: dict[str, Any] = Field(default_factory=dict)
     request_id: str | None = None
+
+
+class InstanceCleanupRequest(BaseModel):
+    dry_run: bool = True
+    stale_only: bool = True
+    timeout_s: float = 2.0
 
 
 class LogTailRequest(BaseModel):
@@ -157,6 +168,76 @@ async def _fetch_manager_identity(router: RouterRpcClient) -> dict[str, Any] | N
     if not isinstance(result, dict):
         return None
     return result
+
+
+async def _fetch_instance_runtime_status(
+    *,
+    requested_instance_id: str | None,
+    router: RouterRpcClient | None,
+) -> dict[str, Any]:
+    instance_id = str(requested_instance_id or "").strip() or "unknown"
+    manager_identity: dict[str, Any] | None = None
+    if router is not None:
+        manager_identity = await _fetch_manager_identity(router)
+        if isinstance(manager_identity, dict):
+            manager_instance_id = str(manager_identity.get("instance_id", "")).strip()
+            if manager_instance_id:
+                instance_id = manager_instance_id
+    started_ts = (
+        manager_identity.get("started_ts")
+        if isinstance(manager_identity, dict)
+        else None
+    )
+    if not isinstance(started_ts, dict):
+        started_ts = None
+    last_orphan_cleanup = (
+        manager_identity.get("last_orphan_cleanup")
+        if isinstance(manager_identity, dict)
+        else None
+    )
+    if not isinstance(last_orphan_cleanup, dict):
+        last_orphan_cleanup = None
+    manager_reachable = isinstance(manager_identity, dict)
+    if isinstance(manager_identity, dict):
+        identity_lock_status = manager_identity.get("lock_status")
+    else:
+        identity_lock_status = None
+    if isinstance(identity_lock_status, dict):
+        lock_status = identity_lock_status
+    else:
+        lock_status = read_instance_lock_status(instance_id)
+    manager_pid: int | None = None
+    if isinstance(manager_identity, dict):
+        manager_pid_raw = manager_identity.get("manager_pid")
+        try:
+            manager_pid_candidate = int(manager_pid_raw)
+            if manager_pid_candidate > 0:
+                manager_pid = manager_pid_candidate
+        except Exception:
+            manager_pid = None
+    identity_effective_raw: str | None = None
+    if isinstance(manager_identity, dict):
+        identity_effective_raw = manager_identity.get("lock_effective_status")
+        if isinstance(identity_effective_raw, str) and identity_effective_raw.strip():
+            identity_effective_raw = identity_effective_raw.strip().lower()
+        else:
+            identity_effective_raw = None
+    lock_effective_status = derive_lock_effective_status(
+        lock_status=lock_status,
+        manager_pid=manager_pid,
+        manager_reachable=manager_reachable,
+        reported_effective_status=identity_effective_raw,
+    )
+    return {
+        "instance_id": instance_id,
+        "started_ts": started_ts,
+        "manager_pid": manager_pid,
+        "manager_reachable": manager_reachable,
+        "lock_status": lock_status,
+        "lock_effective_status": lock_effective_status,
+        "lock_effective_help": lock_effective_status_help(lock_effective_status),
+        "last_orphan_cleanup": last_orphan_cleanup,
+    }
 
 
 async def _process_rpc(
@@ -701,6 +782,31 @@ async def settings_view(request: Request) -> dict[str, Any]:
             ),
         },
     }
+
+
+@app.get("/api/instance/runtime")
+async def instance_runtime_view() -> dict[str, Any]:
+    settings: GatewaySettings = app.state.settings
+    router: RouterRpcClient | None = getattr(app.state, "router", None)
+    status = await _fetch_instance_runtime_status(
+        requested_instance_id=settings.instance_id,
+        router=router,
+    )
+    return {"ok": True, "result": status}
+
+
+@app.post("/api/instance/cleanup_orphans")
+async def instance_cleanup_orphans(
+    req: InstanceCleanupRequest | None = None,
+) -> dict[str, Any]:
+    params = {
+        "dry_run": bool(req.dry_run) if req is not None else True,
+        "stale_only": bool(req.stale_only) if req is not None else True,
+        "timeout_s": float(req.timeout_s) if req is not None else 2.0,
+    }
+    payload = {"type": "manager.cleanup_orphans", "params": params}
+    resp = await asyncio.to_thread(app.state.router.request, payload)
+    return _ensure_error_shape(resp)
 
 
 @app.get("/api/devices")

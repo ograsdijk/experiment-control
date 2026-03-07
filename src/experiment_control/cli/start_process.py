@@ -10,6 +10,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from ..utils.process_lifecycle import configure_child_parent_guard
+
 
 _RESERVED_INIT_KEYS = {
     "process_id",
@@ -31,6 +33,8 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--heartbeat-endpoint", default=None)
     p.add_argument("--process-data-endpoint", default=None)
     p.add_argument("--heartbeat-period-s", type=float, default=None)
+    p.add_argument("--instance-id", default=None)
+    p.add_argument("--parent-pid", type=int, default=None)
     return p.parse_args(argv)
 
 
@@ -143,6 +147,11 @@ def _apply_injected_attrs(obj: Any, inject: dict[str, Any]) -> None:
 def main(argv: list[str] | None = None) -> None:
     try:
         ns = _parse_args(sys.argv[1:] if argv is None else argv)
+        configure_child_parent_guard(parent_pid=ns.parent_pid)
+        if ns.instance_id:
+            os.environ.setdefault(
+                "EXPERIMENT_CONTROL_INSTANCE_ID", str(ns.instance_id).strip()
+            )
 
         init_kwargs = json.loads(ns.process_init_json)
         if not isinstance(init_kwargs, dict):

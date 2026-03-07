@@ -67,7 +67,7 @@ export function RepeatStepEditor({
           }
         />
         <Text size="xs" c="dimmed">
-          The nested body remains unchanged in Phase 2.
+          Edit the repeat body from the step tree using insert/move/delete actions on child steps.
         </Text>
       </Stack>
     </Card>

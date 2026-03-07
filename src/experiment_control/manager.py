@@ -41,6 +41,13 @@ from .types import (
 from .schemas.run_meta import run_meta_calls_from_json, run_meta_calls_to_json
 from .schemas.stream import stream_calls_from_json, stream_calls_to_json
 from .schemas.telemetry import telemetry_calls_from_json, telemetry_calls_to_json
+from .utils.process_lifecycle import ProcessGuardian
+from .utils.process_lifecycle import cleanup_orphan_children
+from .utils.instance_lock import (
+    derive_lock_effective_status,
+    lock_effective_status_help,
+    read_instance_lock_status,
+)
 from .utils.yaml_helpers import load_yaml_file
 from .utils.zmq_helpers import json_dumps, safe_json_loads
 
@@ -288,6 +295,7 @@ class ProcessHandle:
     process_data_endpoint: str = ""
     stop_requested_t_mono: float | None = None
     next_restart_t_mono: float | None = None
+    startup_collision_retry_done: bool = False
 
 
 @dataclass(frozen=True)
@@ -583,6 +591,7 @@ class Manager:
         self._supervisor_log_dropped = 0
         self._supervisor_log_threads: dict[tuple[str, str, int, str], threading.Thread] = {}
         self._supervisor_pending_blocks: dict[tuple[str, str, int, str], Json] = {}
+        self._last_orphan_cleanup: Json | None = None
 
         # Latest fast-data descriptor cache: (device_id -> stream_name -> descriptor json)
         self._latest_chunk_desc: dict[str, dict[str, Json]] = {}
@@ -595,6 +604,7 @@ class Manager:
         self._rpc_seq = 0
         self._stop = False
         self._shutdown_requested = False
+        self._process_guard = ProcessGuardian()
 
         self._poller = zmq.Poller()
         self._poller.register(self._registry_rep, zmq.POLLIN)
@@ -670,6 +680,10 @@ class Manager:
                 payload={"device_id": device_id, "cmd": cmd},
             )
             raise
+        try:
+            self._process_guard.adopt_popen(handle.process)
+        except Exception:
+            pass
         handle.driver_pid = handle.process.pid
         handle.driver_process_state = ManagedProcessState.STARTING
         handle.driver_last_exit_code = None
@@ -929,6 +943,104 @@ class Manager:
             return f"{process_id} exited during startup"
         return f"{process_id} exited during startup ({'; '.join(details)})"
 
+    def _cleanup_orphans_summary(
+        self,
+        *,
+        dry_run: bool,
+        stale_only: bool = True,
+        timeout_s: float = 2.0,
+    ) -> Json:
+        summary = cleanup_orphan_children(
+            instance_id=self._instance_id,
+            exclude_pids={os.getpid()},
+            current_parent_pid=os.getpid(),
+            timeout_s=float(timeout_s),
+            stale_only=bool(stale_only),
+            dry_run=bool(dry_run),
+        )
+        return {
+            "instance_id": self._instance_id,
+            "dry_run": bool(summary.get("dry_run", dry_run)),
+            "stale_only": bool(summary.get("stale_only", stale_only)),
+            "matched": int(summary.get("matched", 0) or 0),
+            "terminated": list(summary.get("terminated", [])),
+            "failed": list(summary.get("failed", [])),
+            "skipped_live_parent": list(summary.get("skipped_live_parent", [])),
+            "candidates": list(summary.get("candidates", [])),
+        }
+
+    def _record_orphan_cleanup(self, *, source: str, summary: Json) -> None:
+        self._last_orphan_cleanup = {
+            "source": str(source),
+            "ts": {
+                "t_wall": float(time.time()),
+                "t_mono": float(time.monotonic()),
+            },
+            "result": summary,
+        }
+
+    @staticmethod
+    def _is_endpoint_collision_process_start_failure(handle: ProcessHandle) -> bool:
+        err = str(handle.last_error or "").lower()
+        if "already in use" in err or "bind failed" in err:
+            return True
+        return False
+
+    def _maybe_recover_process_start_collision(self, handle: ProcessHandle) -> bool:
+        if handle.state != ManagedProcessState.STARTING:
+            return False
+        if handle.startup_collision_retry_done:
+            return False
+        if not self._is_endpoint_collision_process_start_failure(handle):
+            recent = " ".join(
+                self._recent_process_logs(process_id=handle.spec.process_id, limit=8)
+            ).lower()
+            markers = (
+                "already in use",
+                "bind failed",
+                "endpoint is likely already in use",
+                "address already in use",
+            )
+            if not any(marker in recent for marker in markers):
+                return False
+        handle.startup_collision_retry_done = True
+        summary = self._cleanup_orphans_summary(dry_run=False, stale_only=True)
+        self._record_orphan_cleanup(
+            source="startup_collision_recovery",
+            summary=summary,
+        )
+        self._emit_log(
+            severity="warning",
+            topic="manager.process.collision_recover",
+            message=(
+                f"startup collision cleanup for {handle.spec.process_id}: "
+                f"matched={summary.get('matched', 0)} "
+                f"terminated={len(summary.get('terminated', []))} "
+                f"failed={len(summary.get('failed', []))}"
+            ),
+            source_kind="process",
+            source_id=handle.spec.process_id,
+            process_id=handle.spec.process_id,
+            stream="event",
+            payload=summary,
+        )
+        self._publish_manager_event(
+            "manager.process.collision_recover",
+            {
+                "process_id": handle.spec.process_id,
+                "summary": summary,
+                "ts": {"t_wall": time.time(), "t_mono": time.monotonic()},
+            },
+        )
+        try:
+            self._start_process_handle(handle, reset_collision_retry=False)
+            return True
+        except Exception as e:
+            handle.state = ManagedProcessState.FAILED
+            handle.last_error = f"collision cleanup retry failed: {e}"
+            self._publish_process_event("manager.process.failed", handle)
+            return False
+
     def remove_process(self, process_id: str) -> None:
         handle = self._require_process(process_id)
         if handle.popen is not None and handle.popen.poll() is None:
@@ -1007,6 +1119,10 @@ class Manager:
             stream_calls_json,
             "--run-meta-calls-json",
             run_meta_calls_json,
+            "--instance-id",
+            self._instance_id,
+            "--parent-pid",
+            str(os.getpid()),
         ]
 
     def _require_process(self, process_id: str) -> ProcessHandle:
@@ -1066,7 +1182,12 @@ class Manager:
             out.append(arg)
         return out
 
-    def _start_process_handle(self, handle: ProcessHandle) -> None:
+    def _start_process_handle(
+        self,
+        handle: ProcessHandle,
+        *,
+        reset_collision_retry: bool = True,
+    ) -> None:
         if handle.popen is not None and handle.popen.poll() is None:
             return
         if handle.state == ManagedProcessState.CRASHLOOP:
@@ -1091,6 +1212,10 @@ class Manager:
             handle.heartbeat_endpoint,
             "--process-data-endpoint",
             handle.process_data_endpoint,
+            "--instance-id",
+            self._instance_id,
+            "--parent-pid",
+            str(os.getpid()),
         ]
 
         env = os.environ.copy()
@@ -1128,6 +1253,10 @@ class Manager:
                 payload={"process_id": handle.spec.process_id, "argv": argv},
             )
             raise
+        try:
+            self._process_guard.adopt_popen(handle.popen)
+        except Exception:
+            pass
         handle.pid = handle.popen.pid
         handle.state = ManagedProcessState.STARTING
         handle.rpc_endpoint = None
@@ -1140,6 +1269,8 @@ class Manager:
         handle.stop_requested_t_mono = None
         handle.next_restart_t_mono = None
         handle.last_error = None
+        if reset_collision_retry:
+            handle.startup_collision_retry_done = False
         self._start_child_log_readers(
             popen=handle.popen,
             source_kind="process",
@@ -1797,6 +1928,10 @@ class Manager:
             self._ctx.term()
         except Exception:
             pass
+        try:
+            self._process_guard.close()
+        except Exception:
+            pass
 
     def add_event_hook(self, hook: Callable[[str, Json], None]) -> None:
         self._event_hooks.append(hook)
@@ -2331,6 +2466,7 @@ class Manager:
         handle.last_hb_t_mono = float(ts["t_mono"])
         if handle.state == ManagedProcessState.STARTING:
             handle.state = ManagedProcessState.RUNNING
+            handle.startup_collision_retry_done = False
 
         payload = {
             "process_id": process_id,
@@ -3020,17 +3156,66 @@ class Manager:
             self.shutdown()
             return {"ok": True, "result": {"status": "shutting_down"}}
         if rtype == "manager.identity":
+            manager_pid = int(os.getpid())
+            lock_status = read_instance_lock_status(self._instance_id)
+            lock_effective_status = derive_lock_effective_status(
+                lock_status=lock_status,
+                manager_pid=manager_pid,
+                manager_reachable=True,
+                reported_effective_status=None,
+            )
             return {
                 "ok": True,
                 "result": {
                     "version": 1,
                     "instance_id": self._instance_id,
+                    "manager_pid": manager_pid,
                     "started_ts": {
                         "t_wall": float(self._started_t_wall),
                         "t_mono": float(self._started_t_mono),
                     },
+                    "lock_status": lock_status,
+                    "lock_effective_status": lock_effective_status,
+                    "lock_effective_help": lock_effective_status_help(
+                        lock_effective_status
+                    ),
+                    "last_orphan_cleanup": self._last_orphan_cleanup,
                 },
             }
+        if rtype == "manager.cleanup_orphans":
+            params = req.get("params", {})
+            if params is None:
+                params = {}
+            if not isinstance(params, dict):
+                return {
+                    "ok": False,
+                    "error": {"code": "invalid_params", "message": "params must be a dict"},
+                }
+            try:
+                dry_run = bool(params.get("dry_run", False))
+                stale_only = bool(params.get("stale_only", True))
+                timeout_s = float(params.get("timeout_s", 2.0))
+                if timeout_s <= 0:
+                    raise ValueError("timeout_s must be > 0")
+            except Exception as e:
+                return {
+                    "ok": False,
+                    "error": {"code": "invalid_params", "message": str(e)},
+                }
+            result = self._cleanup_orphans_summary(
+                dry_run=dry_run,
+                stale_only=stale_only,
+                timeout_s=timeout_s,
+            )
+            self._record_orphan_cleanup(source="rpc", summary=result)
+            self._publish_manager_event(
+                "manager.orphan_cleanup",
+                {
+                    "result": result,
+                    "ts": {"t_wall": time.time(), "t_mono": time.monotonic()},
+                },
+            )
+            return {"ok": True, "result": result}
 
         if rtype == "manager.log.publish":
             payload = req.get("payload")
@@ -3428,6 +3613,8 @@ class Manager:
                                 "manager.process.exited", handle
                             )
                         else:
+                            if self._maybe_recover_process_start_collision(handle):
+                                continue
                             handle.state = ManagedProcessState.FAILED
                             handle.last_error = handle.last_error or "process exited"
                             self._publish_process_event(

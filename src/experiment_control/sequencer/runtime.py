@@ -22,6 +22,7 @@ from .ast import (
     SetStep,
     SleepStep,
     Step,
+    UseStep,
     WhileStep,
     WaitUntilStep,
 )
@@ -105,13 +106,16 @@ class SequencerRuntime:
         call_device: Callable[[str, str, dict[str, Any]], dict[str, Any]],
         get_telemetry: Callable[[str, str], dict[str, Any] | None],
         set_stream_context: Callable[[str, str, int, dict[str, Any]], None],
+        resolve_use: Callable[[str], SequenceSpec] | None = None,
     ) -> None:
         self._call_device = call_device
         self._get_telemetry = get_telemetry
         self._set_stream_context = set_stream_context
+        self._resolve_use = resolve_use
 
         self._spec: SequenceSpec | None = None
         self._vars: dict[str, Any] = {}
+        self._base_vars: dict[str, Any] = {}
         self._env: dict[str, Any] = {}
         self._stack: list[
             _Frame | _ForFrame | _RepeatFrame | _WhileFrame | _AdaptiveFrame
@@ -141,6 +145,13 @@ class SequencerRuntime:
         self._active_step_started_elapsed_s: float | None = None
         self._adaptive_studies: dict[str, dict[str, Any]] = {}
         self._adaptive_start_modes: dict[str, str] = {}
+        self._run_id = 0
+        self._next_run_id = 1
+        self._loop_mode = "once"
+        self._loops_target: int | None = None
+        self._loops_completed = 0
+        self._vars_override_active: dict[str, Any] = {}
+        self._use_stack: list[str] = []
 
     @property
     def state(self) -> str:
@@ -176,6 +187,7 @@ class SequencerRuntime:
         if self._state == "RUNNING":
             raise RuntimeError("Cannot load while running")
         self._spec = spec
+        self._base_vars = dict(spec.vars)
         self._vars = self._resolve_initial_vars(spec.vars)
         self._env = {}
         self._stack = []
@@ -189,15 +201,77 @@ class SequencerRuntime:
         self._current_step = None
         self._state = "IDLE"
         self._adaptive_start_modes = {}
+        self._loop_mode = "once"
+        self._loops_target = None
+        self._loops_completed = 0
+        self._vars_override_active = {}
+        self._use_stack = []
         self._reset_progress()
 
-    def start(self, adaptive: dict[str, Any] | None = None) -> None:
+    def start(
+        self,
+        adaptive: dict[str, Any] | None = None,
+        *,
+        repeat_count: int | None = None,
+        continuous: bool = False,
+        vars_override: dict[str, Any] | None = None,
+    ) -> None:
         if self._spec is None:
             raise RuntimeError("No sequence loaded")
+        if continuous:
+            loop_mode = "continuous"
+            loops_target = None
+        else:
+            if repeat_count is None:
+                loops_target = 1
+            else:
+                try:
+                    loops_target = int(repeat_count)
+                except Exception as exc:
+                    raise TypeError("sequencer.start repeat_count must be an integer") from exc
+                if loops_target <= 0:
+                    raise ValueError("sequencer.start repeat_count must be > 0")
+            loop_mode = "repeat" if loops_target > 1 else "once"
+
+        vars_override_map: dict[str, Any] = {}
+        if vars_override is not None:
+            if not isinstance(vars_override, dict):
+                raise TypeError("sequencer.start vars_override must be a dict")
+            for raw_key, raw_value in vars_override.items():
+                key = str(raw_key).strip()
+                if not key:
+                    raise ValueError("sequencer.start vars_override keys must be non-empty")
+                vars_override_map[key] = raw_value
+        if self._spec.vars:
+            unknown = sorted(key for key in vars_override_map if key not in self._spec.vars)
+            if unknown:
+                raise ValueError(
+                    "sequencer.start vars_override contains unknown keys: "
+                    + ", ".join(unknown)
+                )
+        elif vars_override_map:
+            raise ValueError(
+                "sequencer.start vars_override cannot be used when sequence.vars is empty"
+            )
+
+        merged_vars = dict(self._base_vars)
+        merged_vars.update(vars_override_map)
+        self._vars = self._resolve_initial_vars(merged_vars)
+        self._vars_override_active = dict(vars_override_map)
+
+        self._run_id = self._next_run_id
+        self._next_run_id += 1
+        self._loop_mode = loop_mode
+        self._loops_target = loops_target
+        self._loops_completed = 0
+        self._use_stack = []
+
         self._stack = [_Frame(self._spec.steps)]
         self._adaptive_start_modes = self._normalize_adaptive_start_modes(adaptive)
         self._pause_requested = False
         self._stop_requested = False
+        self._last_error = None
+        self._env = {}
         self._sleep_until = None
         self._wait_state = None
         self._adaptive_observe_state = None
@@ -207,7 +281,15 @@ class SequencerRuntime:
         now = time.monotonic()
         self._run_started_mono = now
         self._run_ended_mono = None
-        self._estimated_total_steps = self._estimate_total_steps()
+        total_per_loop = self._estimate_total_steps()
+        if (
+            total_per_loop is not None
+            and isinstance(self._loops_target, int)
+            and self._loops_target >= 0
+        ):
+            self._estimated_total_steps = int(total_per_loop) * int(self._loops_target)
+        else:
+            self._estimated_total_steps = None
         self._state = "RUNNING"
 
     def request_pause(self) -> None:
@@ -241,9 +323,14 @@ class SequencerRuntime:
         if self._state == "RUNNING" and self._stop_requested:
             effective_state = "STOP_REQUESTED"
         return {
+            "run_id": int(self._run_id),
             "state": effective_state,
             "current_step": self._current_step,
+            "loop_mode": self._loop_mode,
+            "loops_completed": int(self._loops_completed),
+            "loops_target": self._loops_target,
             "vars": dict(self._vars),
+            "vars_override": dict(self._vars_override_active),
             "env": dict(self._env),
             "error": self._last_error,
             "last_context_id": int(self._context_id),
@@ -308,6 +395,10 @@ class SequencerRuntime:
                     return
                 if step is None:
                     if self._state == "RUNNING":
+                        self._loops_completed += 1
+                        if self._should_continue_run_loops():
+                            self._prepare_next_run_loop()
+                            continue
                         self._state = "STOPPED"
                         self._run_ended_mono = time.monotonic()
                     return
@@ -383,6 +474,29 @@ class SequencerRuntime:
             self._state = "PAUSED"
             return True
         return False
+
+    def _should_continue_run_loops(self) -> bool:
+        if self._state != "RUNNING":
+            return False
+        if self._loop_mode == "continuous":
+            return True
+        if isinstance(self._loops_target, int):
+            return self._loops_completed < self._loops_target
+        return False
+
+    def _prepare_next_run_loop(self) -> None:
+        if self._spec is None:
+            self._state = "STOPPED"
+            self._run_ended_mono = time.monotonic()
+            return
+        self._stack = [_Frame(self._spec.steps)]
+        self._env = {}
+        self._sleep_until = None
+        self._wait_state = None
+        self._adaptive_observe_state = None
+        self._atomic_depth = 0
+        self._current_step = None
+        self._use_stack = []
 
     def _reset_progress(self) -> None:
         self._estimated_total_steps = None
@@ -468,6 +582,7 @@ class SequencerRuntime:
                 0.0, elapsed_s - self._active_step_started_elapsed_s
             )
         return {
+            "run_id": int(self._run_id),
             "elapsed_s": elapsed_s,
             "completed_steps": completed,
             "total_steps": total_out,
@@ -475,6 +590,9 @@ class SequencerRuntime:
             "eta_s": eta_s,
             "step_ewma_s": self._step_ewma_s,
             "current_step_elapsed_s": current_step_elapsed_s,
+            "loop_mode": self._loop_mode,
+            "loops_completed": int(self._loops_completed),
+            "loops_target": self._loops_target,
         }
 
     def _estimate_total_steps(self) -> int | None:
@@ -515,6 +633,16 @@ class SequencerRuntime:
             return 1
         if isinstance(step, AdaptiveStep):
             return None
+        if isinstance(step, UseStep):
+            spec = self._resolve_use_spec(step.sequence_id)
+            merged = self._merged_use_vars(spec, step.args, env=env)
+            nested_env = dict(env)
+            nested_env.update(merged)
+            nested_env["vars"] = to_attrdict(merged)
+            inner = self._estimate_step_list(spec.steps, nested_env)
+            if inner is None:
+                return None
+            return 1 + inner
         if isinstance(step, AtomicStep):
             inner = self._estimate_step_list(step.body, env)
             if inner is None:
@@ -718,6 +846,26 @@ class SequencerRuntime:
                 device, stream = item
                 self._set_stream_context(device, stream, ctx_id, fields)
             return False
+        if isinstance(step, UseStep):
+            sequence_name = str(step.sequence_id).strip()
+            if sequence_name in self._use_stack:
+                cycle = " -> ".join([*self._use_stack, sequence_name])
+                raise RuntimeError(f"recursive use sequence detected: {cycle}")
+            spec = self._resolve_use_spec(step.sequence_id)
+            merged_vars = self._merged_use_vars(spec, step.args)
+            previous_vars = dict(self._vars)
+            self._use_stack.append(sequence_name)
+
+            def _restore_vars() -> None:
+                self._vars = previous_vars
+                if self._use_stack and self._use_stack[-1] == sequence_name:
+                    self._use_stack.pop()
+                elif sequence_name in self._use_stack:
+                    self._use_stack.remove(sequence_name)
+
+            self._vars = merged_vars
+            self._stack.append(_Frame(spec.steps, on_exit=_restore_vars))
+            return False
         if isinstance(step, AdaptiveStep):
             if step.constraints:
                 self._last_error = "adaptive.constraints are not supported in v1"
@@ -829,6 +977,40 @@ class SequencerRuntime:
             return self._records_from_iterable(rendered)
         return self._records_from_iterable([rendered])
 
+    def _resolve_use_spec(self, sequence_id: str) -> SequenceSpec:
+        sequence_name = str(sequence_id or "").strip()
+        if not sequence_name:
+            raise ValueError("use.id must not be empty")
+        if self._resolve_use is None:
+            raise RuntimeError(
+                f"use step {sequence_name!r} requires a configured sequence library"
+            )
+        resolved = self._resolve_use(sequence_name)
+        if not isinstance(resolved, SequenceSpec):
+            raise TypeError(
+                f"use step {sequence_name!r} resolver returned invalid sequence spec"
+            )
+        return resolved
+
+    def _merged_use_vars(
+        self,
+        spec: SequenceSpec,
+        args: dict[str, Any] | None,
+        *,
+        env: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        merged = dict(self._vars)
+        merged.update(spec.vars)
+        if args:
+            if not isinstance(args, dict):
+                raise TypeError("use.args must be a dict")
+            source_env = dict(env) if isinstance(env, dict) else self._env_view()
+            rendered_args = render_templates(args, source_env)
+            if not isinstance(rendered_args, dict):
+                raise TypeError("use.args must render to a dict")
+            merged.update(rendered_args)
+        return self._resolve_initial_vars(merged)
+
     def _create_adaptive_controller(
         self,
         step: AdaptiveStep,
@@ -851,27 +1033,63 @@ class SequencerRuntime:
     def _adaptive_step_ids(self) -> list[str]:
         if self._spec is None:
             return []
-        return self._collect_adaptive_step_ids(self._spec.steps)
+        return self._collect_adaptive_step_ids(self._spec.steps, seen_use_ids=set())
 
-    def _collect_adaptive_step_ids(self, steps: list[Step]) -> list[str]:
+    def _collect_adaptive_step_ids(
+        self, steps: list[Step], *, seen_use_ids: set[str]
+    ) -> list[str]:
         out: list[str] = []
         for step in steps:
             if isinstance(step, AdaptiveStep):
                 out.append(step.id)
-                out.extend(self._collect_adaptive_step_ids(step.body))
+                out.extend(
+                    self._collect_adaptive_step_ids(step.body, seen_use_ids=seen_use_ids)
+                )
             elif isinstance(step, ForStep):
-                out.extend(self._collect_adaptive_step_ids(step.body))
+                out.extend(
+                    self._collect_adaptive_step_ids(step.body, seen_use_ids=seen_use_ids)
+                )
             elif isinstance(step, RepeatStep):
-                out.extend(self._collect_adaptive_step_ids(step.body))
+                out.extend(
+                    self._collect_adaptive_step_ids(step.body, seen_use_ids=seen_use_ids)
+                )
             elif isinstance(step, IfStep):
-                out.extend(self._collect_adaptive_step_ids(step.then_steps))
-                out.extend(self._collect_adaptive_step_ids(step.else_steps or []))
+                out.extend(
+                    self._collect_adaptive_step_ids(
+                        step.then_steps, seen_use_ids=seen_use_ids
+                    )
+                )
+                out.extend(
+                    self._collect_adaptive_step_ids(
+                        step.else_steps or [], seen_use_ids=seen_use_ids
+                    )
+                )
             elif isinstance(step, WhileStep):
-                out.extend(self._collect_adaptive_step_ids(step.body))
+                out.extend(
+                    self._collect_adaptive_step_ids(step.body, seen_use_ids=seen_use_ids)
+                )
             elif isinstance(step, AtomicStep):
-                out.extend(self._collect_adaptive_step_ids(step.body))
+                out.extend(
+                    self._collect_adaptive_step_ids(step.body, seen_use_ids=seen_use_ids)
+                )
             elif isinstance(step, ParallelStep):
-                out.extend(self._collect_adaptive_step_ids(step.body))
+                out.extend(
+                    self._collect_adaptive_step_ids(step.body, seen_use_ids=seen_use_ids)
+                )
+            elif isinstance(step, UseStep):
+                if step.sequence_id in seen_use_ids:
+                    continue
+                seen_use_ids.add(step.sequence_id)
+                try:
+                    spec = self._resolve_use_spec(step.sequence_id)
+                except Exception:
+                    continue
+                out.extend(
+                    self._collect_adaptive_step_ids(
+                        spec.steps,
+                        seen_use_ids=seen_use_ids,
+                    )
+                )
         return out
 
     def _normalize_adaptive_start_modes(

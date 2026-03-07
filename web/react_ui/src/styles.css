@@ -92,6 +92,18 @@ body::before {
   letter-spacing: -0.02em;
 }
 
+.instance-title-trigger {
+  border: none;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  padding: 0;
+}
+
+.instance-title-trigger:hover {
+  opacity: 0.86;
+}
+
 .device-card {
   background: var(--card);
   border: 1px solid var(--card-border);

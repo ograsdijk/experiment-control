@@ -204,6 +204,85 @@ function flattenSectionEntries(lines: readonly string[]): SequencerOutlineMetada
   return entries;
 }
 
+function parseConditionSectionEntries(
+  lines: readonly string[]
+): SequencerOutlineMetadataEntry[] {
+  const flattened = flattenSectionEntries(lines);
+  if (flattened.length > 0) {
+    return flattened;
+  }
+  const baseIndent = findSectionBaseIndent(lines);
+  if (baseIndent === null) {
+    return [];
+  }
+
+  let head: { key: string; value: string } | null = null;
+  let headIndex = -1;
+  for (let index = 0; index < lines.length; index += 1) {
+    const parsed = parseKeyValueLine(lines[index]);
+    if (!parsed || parsed.indent !== baseIndent) {
+      continue;
+    }
+    head = { key: parsed.key, value: parsed.value };
+    headIndex = index;
+    break;
+  }
+  if (!head) {
+    return [];
+  }
+  if (head.value) {
+    return [{ name: head.key, value: head.value }];
+  }
+  if (head.key !== "and" && head.key !== "or" && head.key !== "not") {
+    return [];
+  }
+
+  const childLines = lines.slice(Math.max(0, headIndex + 1));
+  const items: string[] = [];
+
+  for (let index = 0; index < childLines.length; index += 1) {
+    const line = childLines[index];
+    if (!line.trim() || line.trim().startsWith("#")) {
+      continue;
+    }
+    const match = line.match(/^(\s*)-\s*(.*)$/);
+    if (!match) {
+      continue;
+    }
+    const dashIndent = match[1].length;
+    const inline = stripInlineComment(match[2] ?? "").trim();
+    if (inline) {
+      items.push(inline.startsWith("{") ? inline : `{${inline}}`);
+      continue;
+    }
+
+    let firstNested: string | null = null;
+    for (let next = index + 1; next < childLines.length; next += 1) {
+      const nextLine = childLines[next];
+      if (!nextLine.trim() || nextLine.trim().startsWith("#")) {
+        continue;
+      }
+      const nextIndent = lineIndent(nextLine);
+      if (nextIndent <= dashIndent) {
+        break;
+      }
+      firstNested = stripInlineComment(nextLine.trim());
+      break;
+    }
+    if (firstNested) {
+      items.push(firstNested.startsWith("{") ? firstNested : `{${firstNested}}`);
+    }
+  }
+
+  if (head.key === "not") {
+    if (items.length <= 0) {
+      return [];
+    }
+    return [{ name: "not", value: items[0] }];
+  }
+  return [{ name: head.key, value: `[${items.join(", ")}]` }];
+}
+
 function parseScalarListEntries(lines: readonly string[]): SequencerOutlineMetadataEntry[] {
   const entries: SequencerOutlineMetadataEntry[] = [];
   let index = 0;
@@ -369,7 +448,7 @@ function parseWaitUntilDetail(snippet: string): SequencerWaitUntilDetail {
     timeoutS: findScalarValue(bodyLines, "timeout_s", baseIndent),
     everyS: findScalarValue(bodyLines, "every_s", baseIndent),
     sample: flattenSectionEntries(findSectionLines(bodyLines, "sample", baseIndent)),
-    condition: flattenSectionEntries(
+    condition: parseConditionSectionEntries(
       findSectionLines(bodyLines, "condition", baseIndent)
     ),
   };
@@ -461,7 +540,9 @@ function parseIfDetail(snippet: string): SequencerIfDetail {
   const thenLines = findSectionLines(bodyLines, "then", baseIndent);
   const elseLines = findSectionLines(bodyLines, "else", baseIndent);
   return {
-    condition: flattenSectionEntries(findSectionLines(bodyLines, "condition", baseIndent)),
+    condition: parseConditionSectionEntries(
+      findSectionLines(bodyLines, "condition", baseIndent)
+    ),
     thenCount: countDirectStepItems(thenLines),
     elseCount: countDirectStepItems(elseLines),
   };
@@ -472,7 +553,9 @@ function parseWhileDetail(snippet: string): SequencerWhileDetail {
   const bodyLines = snippetLines.slice(1);
   const baseIndent = findSectionBaseIndent(bodyLines);
   return {
-    condition: flattenSectionEntries(findSectionLines(bodyLines, "condition", baseIndent)),
+    condition: parseConditionSectionEntries(
+      findSectionLines(bodyLines, "condition", baseIndent)
+    ),
   };
 }
 

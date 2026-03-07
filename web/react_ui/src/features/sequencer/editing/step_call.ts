@@ -1,5 +1,6 @@
 import type { SequencerOutlineMetadataEntry, SequencerStepOutlineNode } from "../types";
 import {
+  buildNestedEntryLines,
   replaceStepSnippet,
   sanitizeYamlScalar,
   stepSiblingTailLines,
@@ -26,9 +27,7 @@ function renderCallSnippet(
     lines.push("    params: {}");
   } else {
     lines.push("    params:");
-    for (const entry of cleanParams) {
-      lines.push(`      ${entry.name}: ${entry.value}`);
-    }
+    lines.push(...buildNestedEntryLines(cleanParams, 6));
   }
   return [...lines, ...stepSiblingTailLines(node.snippet)].join("\n");
 }

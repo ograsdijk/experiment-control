@@ -1,5 +1,6 @@
 import {
   ActionIcon,
+  Badge,
   Button,
   Card,
   Group,
@@ -12,8 +13,10 @@ import {
 import { IconPlus, IconTrash } from "@tabler/icons-react";
 import { applyEditedCallStep } from "../editing";
 import {
+  duplicateNameSet,
   getCapabilityParamDefaultValue,
   getCapabilityParamPlaceholder,
+  isBlank,
   nextParamName,
   renderValue,
 } from "../editor_helpers";
@@ -46,7 +49,6 @@ export function CallStepEditor({
   }
 
   const params = node.callDetail.params;
-  const isSimpleParams = params.every((entry) => !entry.name.includes("."));
   const selectedDevice = node.callDetail.device ?? "";
   const actionOptions = (capabilitiesByDevice[selectedDevice] ?? []).map(
     (member) => member.name
@@ -75,19 +77,8 @@ export function CallStepEditor({
   const unusedParamNameOptions = paramNameOptions.filter(
     (name) => !params.some((param) => param.name === name)
   );
-
-  if (!isSimpleParams) {
-    return (
-      <Card radius="sm" p="xs" style={cardStyle}>
-        <Stack gap={6}>
-          <Text size="xs" c="dimmed">
-            This call uses nested parameter keys, so Phase 2 keeps it read-only for
-            now.
-          </Text>
-        </Stack>
-      </Card>
-    );
-  }
+  const actionError = isBlank(node.callDetail.action);
+  const duplicateParamNames = duplicateNameSet(params);
 
   const updateCall = (
     nextAction: string,
@@ -131,6 +122,7 @@ export function CallStepEditor({
             allowDeselect={false}
             searchable
             comboboxProps={{ withinPortal: false }}
+            error={actionError ? "Action is required." : undefined}
             onChange={(value) => {
               if (value === null) {
                 return;
@@ -143,13 +135,21 @@ export function CallStepEditor({
             size="xs"
             label="Action"
             value={node.callDetail.action ?? ""}
+            error={actionError ? "Action is required." : undefined}
             onChange={(event) => updateCall(event.currentTarget.value, params)}
           />
         )}
         <Group justify="space-between" align="center">
-          <Text size="xs" fw={600}>
-            Params
-          </Text>
+          <Group gap={6} align="center">
+            <Text size="xs" fw={600}>
+              Params
+            </Text>
+            {duplicateParamNames.size > 0 ? (
+              <Badge size="xs" color="red" variant="light">
+                {duplicateParamNames.size} issue{duplicateParamNames.size === 1 ? "" : "s"}
+              </Badge>
+            ) : null}
+          </Group>
           <Menu shadow="md" withArrow position="bottom-end" zIndex={1000}>
             <Menu.Target>
               <Button
@@ -194,86 +194,93 @@ export function CallStepEditor({
         ) : (
           <Stack gap={6}>
             {params.map((param, index) => (
-              <div key={`${param.name}:${index}`} className="sequencer-var-chip">
-                <div className="sequencer-var-segment sequencer-var-name">
-                  {paramNameSelectOptions.length > 0 ? (
-                    <Select
-                      size="xs"
-                      aria-label="Param name"
-                      data={paramNameSelectOptions}
-                      value={param.name}
-                      allowDeselect={false}
-                      searchable
-                      comboboxProps={{ withinPortal: false }}
-                      onChange={(value) => {
-                        if (value === null) {
-                          return;
-                        }
-                        const next = params.map((entry, entryIndex) =>
-                          entryIndex === index
-                            ? {
-                                ...entry,
-                                name: value,
-                                value:
-                                  entry.name === value
-                                    ? entry.value
-                                    : getCapabilityParamDefaultValue(paramSpecsByName.get(value)),
-                              }
-                            : entry
-                        );
-                        updateCall(node.callDetail?.action ?? "", next);
-                      }}
-                    />
-                  ) : (
+              <Stack key={`param-${index}`} gap={4}>
+                <div className="sequencer-var-chip">
+                  <div className="sequencer-var-segment sequencer-var-name">
+                    {paramNameSelectOptions.length > 0 ? (
+                      <Select
+                        size="xs"
+                        aria-label="Param name"
+                        data={paramNameSelectOptions}
+                        value={param.name}
+                        allowDeselect={false}
+                        searchable
+                        comboboxProps={{ withinPortal: false }}
+                        onChange={(value) => {
+                          if (value === null) {
+                            return;
+                          }
+                          const next = params.map((entry, entryIndex) =>
+                            entryIndex === index
+                              ? {
+                                  ...entry,
+                                  name: value,
+                                  value:
+                                    entry.name === value
+                                      ? entry.value
+                                      : getCapabilityParamDefaultValue(paramSpecsByName.get(value)),
+                                }
+                              : entry
+                          );
+                          updateCall(node.callDetail?.action ?? "", next);
+                        }}
+                      />
+                    ) : (
+                      <TextInput
+                        size="xs"
+                        aria-label="Param name"
+                        placeholder="param"
+                        variant="unstyled"
+                        value={param.name}
+                        onChange={(event) => {
+                          const next = params.map((entry, entryIndex) =>
+                            entryIndex === index
+                              ? { ...entry, name: event.currentTarget.value }
+                              : entry
+                          );
+                          updateCall(node.callDetail?.action ?? "", next);
+                        }}
+                      />
+                    )}
+                  </div>
+                  <div className="sequencer-var-segment sequencer-var-value">
                     <TextInput
                       size="xs"
-                      aria-label="Param name"
-                      placeholder="param"
+                      aria-label="Param value"
+                      placeholder={getCapabilityParamPlaceholder(paramSpecsByName.get(param.name))}
                       variant="unstyled"
-                      value={param.name}
+                      value={renderValue(param.value)}
                       onChange={(event) => {
                         const next = params.map((entry, entryIndex) =>
                           entryIndex === index
-                            ? { ...entry, name: event.currentTarget.value }
+                            ? { ...entry, value: event.currentTarget.value }
                             : entry
                         );
                         updateCall(node.callDetail?.action ?? "", next);
                       }}
                     />
-                  )}
+                  </div>
+                  <div className="sequencer-var-segment sequencer-var-remove">
+                    <ActionIcon
+                      size="sm"
+                      variant="subtle"
+                      color="red"
+                      aria-label="Remove param"
+                      onClick={() => {
+                        const next = params.filter((_, entryIndex) => entryIndex !== index);
+                        updateCall(node.callDetail?.action ?? "", next);
+                      }}
+                    >
+                      <IconTrash size={14} />
+                    </ActionIcon>
+                  </div>
                 </div>
-                <div className="sequencer-var-segment sequencer-var-value">
-                  <TextInput
-                    size="xs"
-                    aria-label="Param value"
-                    placeholder={getCapabilityParamPlaceholder(paramSpecsByName.get(param.name))}
-                    variant="unstyled"
-                    value={renderValue(param.value)}
-                    onChange={(event) => {
-                      const next = params.map((entry, entryIndex) =>
-                        entryIndex === index
-                          ? { ...entry, value: event.currentTarget.value }
-                          : entry
-                      );
-                      updateCall(node.callDetail?.action ?? "", next);
-                    }}
-                  />
-                </div>
-                <div className="sequencer-var-segment sequencer-var-remove">
-                  <ActionIcon
-                    size="sm"
-                    variant="subtle"
-                    color="red"
-                    aria-label="Remove param"
-                    onClick={() => {
-                      const next = params.filter((_, entryIndex) => entryIndex !== index);
-                      updateCall(node.callDetail?.action ?? "", next);
-                    }}
-                  >
-                    <IconTrash size={14} />
-                  </ActionIcon>
-                </div>
-              </div>
+                {duplicateParamNames.has(param.name.trim()) ? (
+                  <Text size="xs" c="red">
+                    Param names must be unique.
+                  </Text>
+                ) : null}
+              </Stack>
             ))}
           </Stack>
         )}

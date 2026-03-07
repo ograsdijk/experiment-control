@@ -11,6 +11,7 @@ from ..driver import DeviceRunner
 from ..schemas.run_meta import run_meta_calls_from_json
 from ..schemas.stream import stream_calls_from_json
 from ..schemas.telemetry import telemetry_calls_from_json
+from ..utils.process_lifecycle import configure_child_parent_guard
 
 
 def _parse_args(argv: list[str]) -> argparse.Namespace:
@@ -36,6 +37,8 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--telemetry-period-s", type=float, default=1.0)
     p.add_argument("--heartbeat-period-s", type=float, default=1.0)
     p.add_argument("--command-poll-period-s", type=float, default=0.01)
+    p.add_argument("--instance-id", default=None)
+    p.add_argument("--parent-pid", type=int, default=None)
 
     p.add_argument(
         "--telemetry-calls-json",
@@ -86,6 +89,11 @@ def _load_json_arg(json_arg: str | None, file_arg: str | None, *, name: str) -> 
 def main(argv: list[str] | None = None) -> None:
     try:
         ns = _parse_args(sys.argv[1:] if argv is None else argv)
+        configure_child_parent_guard(parent_pid=ns.parent_pid)
+        if ns.instance_id:
+            os.environ.setdefault(
+                "EXPERIMENT_CONTROL_INSTANCE_ID", str(ns.instance_id).strip()
+            )
 
         device_init_kwargs = json.loads(ns.device_init_json)
         if not isinstance(device_init_kwargs, dict):

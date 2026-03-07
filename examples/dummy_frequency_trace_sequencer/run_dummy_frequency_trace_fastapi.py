@@ -64,10 +64,22 @@ def _read_stack_config(stack_path: Path) -> tuple[ManagerNetworkConfig, str]:
     return resolve_manager_network(manager_raw), instance_id
 
 
+def _preferred_python(repo_root: Path) -> str:
+    candidates = [
+        repo_root / ".venv" / "Scripts" / "python.exe",
+        repo_root / ".venv" / "bin" / "python",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+    return sys.executable
+
+
 def main(argv: list[str] | None = None) -> int:
     ns = _parse_args(argv)
     repo_root = Path(__file__).resolve().parents[2]
     stack_path = Path(ns.stack).expanduser().resolve()
+    python_exe = _preferred_python(repo_root)
 
     manager_network, instance_id = _read_stack_config(stack_path)
     manager_rpc = manager_network.local_rpc_connect
@@ -84,7 +96,7 @@ def main(argv: list[str] | None = None) -> int:
         env["EXPERIMENT_CONTROL_UI_DIST"] = str(Path(ns.ui_dist).expanduser().resolve())
 
     cmd = [
-        sys.executable,
+        python_exe,
         "-m",
         "uvicorn",
         "experiment_control.fastapi.app:app",
@@ -103,6 +115,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"[fastapi-helper] router rpc hint: {manager_network.public_rpc_hint}")
     print(f"[fastapi-helper] manager pub hint: {manager_network.public_pub_hint}")
     print(f"[fastapi-helper] ui serving: {'off' if ns.no_ui else 'on'}")
+    print(f"[fastapi-helper] python: {python_exe}")
     print(f"[fastapi-helper] uvicorn: {' '.join(cmd)}")
 
     proc = subprocess.Popen(cmd, cwd=repo_root, env=env)

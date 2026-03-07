@@ -13,7 +13,7 @@ from experiment_control.sequencer.ast import parse_sequence
 from experiment_control.sequencer.runtime import SequencerRuntime
 
 
-def _build_runtime() -> SequencerRuntime:
+def _build_runtime(*, resolve_use=None) -> SequencerRuntime:
     def call_device(
         device_id: str, action: str, params: dict[str, object]
     ) -> dict[str, object]:
@@ -31,6 +31,7 @@ def _build_runtime() -> SequencerRuntime:
         call_device=call_device,
         get_telemetry=get_telemetry,
         set_stream_context=set_stream_context,
+        resolve_use=resolve_use,
     )
 
 
@@ -157,6 +158,65 @@ class SequencerLoopTests(unittest.TestCase):
         status = runtime.status()
         self.assertEqual(status["state"], "ERROR")
         self.assertIn("missing", str(status["error"]))
+
+    def test_use_step_applies_args_and_restores_parent_vars(self) -> None:
+        helper = parse_sequence(
+            {
+                "version": 1,
+                "vars": {"gain": 1},
+                "steps": [{"assign": {"seen_gain": "${gain}"}}],
+            }
+        )
+        main = parse_sequence(
+            {
+                "version": 1,
+                "vars": {"base_gain": 2},
+                "steps": [
+                    {
+                        "use": {
+                            "id": "helper",
+                            "args": {"gain": "${base_gain + 1}"},
+                        }
+                    },
+                    {"assign": {"after": "${base_gain}"}},
+                ],
+            }
+        )
+        runtime = _build_runtime(resolve_use=lambda sequence_id: {"helper": helper}[sequence_id])
+        runtime.load(main)
+        runtime.start()
+        while runtime.state == "RUNNING":
+            runtime.tick()
+        status = runtime.status()
+        self.assertEqual(status["state"], "STOPPED")
+        self.assertEqual(status["env"].get("seen_gain"), 3)
+        self.assertEqual(status["env"].get("after"), 2)
+        self.assertEqual(status["vars"].get("base_gain"), 2)
+
+    def test_use_step_recursion_sets_error(self) -> None:
+        main = parse_sequence(
+            {
+                "version": 1,
+                "steps": [{"use": "helper"}],
+            }
+        )
+        helper = parse_sequence(
+            {
+                "version": 1,
+                "steps": [{"use": "main"}],
+            }
+        )
+        library = {"main": main, "helper": helper}
+        runtime = _build_runtime(resolve_use=lambda sequence_id: library[sequence_id])
+        runtime.load(main)
+        runtime.start()
+        for _ in range(32):
+            runtime.tick()
+            if runtime.state != "RUNNING":
+                break
+        status = runtime.status()
+        self.assertEqual(status["state"], "ERROR")
+        self.assertIn("recursive use sequence detected", str(status["error"]))
 
 
 if __name__ == "__main__":

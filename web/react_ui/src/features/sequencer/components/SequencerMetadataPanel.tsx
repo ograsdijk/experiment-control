@@ -1,6 +1,10 @@
 import { ActionIcon, Badge, Card, Group, Stack, Text } from "@mantine/core";
 import { IconChevronDown, IconChevronRight } from "@tabler/icons-react";
 import { applyEditedContextColumns, applyEditedVars } from "../editing";
+import {
+  countContextColumnIssues,
+  countMetadataNameIssues,
+} from "../editor_helpers";
 import type { SequencerOutlineMetadata } from "../types";
 import { SequencerVarsEditor } from "../../../components/SequencerVarsEditor";
 
@@ -19,6 +23,9 @@ export function SequencerMetadataPanel({
   yamlText,
   onYamlTextChange,
 }: Props) {
+  const varsIssueCount = countMetadataNameIssues(metadata.vars);
+  const contextIssueCount = countContextColumnIssues(metadata.contextColumns);
+
   return (
     <Card radius="sm" p="xs" style={{ border: "1px solid var(--card-border)" }}>
       <Stack gap={6}>
@@ -57,6 +64,10 @@ export function SequencerMetadataPanel({
           >
             <SequencerVarsEditor
               entries={metadata.vars}
+              issueCount={varsIssueCount}
+              issueText={
+                varsIssueCount > 0 ? "Variable names must be unique and non-empty." : null
+              }
               onChange={(entries) => onYamlTextChange(applyEditedVars(yamlText, entries))}
             />
             <SequencerVarsEditor
@@ -74,6 +85,12 @@ export function SequencerMetadataPanel({
                 { value: "bool", label: "bool" },
               ]}
               entries={metadata.contextColumns}
+              issueCount={contextIssueCount}
+              issueText={
+                contextIssueCount > 0
+                  ? "Context column names must be unique/non-empty and types must be float64, int64, or bool."
+                  : null
+              }
               onChange={(entries) =>
                 onYamlTextChange(applyEditedContextColumns(yamlText, entries))
               }

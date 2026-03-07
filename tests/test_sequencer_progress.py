@@ -137,6 +137,29 @@ class SequencerProgressTests(unittest.TestCase):
 
         self.assertTrue(saw_eta_after_min)
 
+    def test_repeat_count_updates_loop_progress_fields(self) -> None:
+        runtime = _build_runtime()
+        runtime.load(
+            SequenceSpec(
+                version=1,
+                meta={},
+                vars={},
+                steps=[AssignStep(values={"x": 1})],
+                context_columns=None,
+            )
+        )
+        runtime.start(repeat_count=3)
+        while runtime.state == "RUNNING":
+            runtime.tick()
+        status = runtime.status()
+        progress = status.get("progress", {})
+        self.assertEqual(status.get("loop_mode"), "repeat")
+        self.assertEqual(status.get("loops_target"), 3)
+        self.assertEqual(status.get("loops_completed"), 3)
+        self.assertEqual(progress.get("loop_mode"), "repeat")
+        self.assertEqual(progress.get("loops_target"), 3)
+        self.assertEqual(progress.get("loops_completed"), 3)
+
 
 if __name__ == "__main__":
     unittest.main()

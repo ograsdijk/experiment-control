@@ -7,7 +7,7 @@ This document explains how the sequencer YAML is parsed and executed by
 - YAML describes a sequence of steps executed sequentially.
 - Variables are defined in `vars` and are visible to templates.
 - Templates use `${...}` with a restricted expression evaluator.
-- Control flow: `for`, `repeat`, `while`, `if`, `atomic`, `pause`, `assign`.
+- Control flow: `for`, `repeat`, `while`, `if`, `atomic`, `pause`, `assign`, `use`.
 - `for` loops iterate over records and bind selected fields into local names.
 - Timing: `sleep`, `wait_until`.
 - Device I/O: `set`, `call`.
@@ -149,7 +149,7 @@ Fields:
 - `every_s`: polling interval
 - `sample`: telemetry or call (see below)
 - `reduce`: optional windowed reduction of samples
-- `condition`: structured condition (see below)
+- `condition`: required structured condition (see below)
 - `stable_for_s`: require condition to hold for this duration
 
 Sample sources:
@@ -209,6 +209,29 @@ Repeat a block N times.
       - call: {device: yag, action: fire}
 ```
 
+### `use`
+Run another sequence from the configured sequence library.
+
+String form:
+```yaml
+- use: switch_and_wait
+```
+
+Mapping form (with argument overrides):
+```yaml
+- use:
+    id: switch_and_wait
+    args:
+      port: 3
+      settle_s: 0.5
+```
+
+Notes:
+- `use.id` resolves through the sequencer library (`sequence_library_path`).
+- `use.args` is optional and is rendered in the caller environment.
+- Called sequence vars are applied only for that call frame.
+- Recursive `use` chains are rejected.
+
 ### `while`
 Loop while a condition is true.
 ```yaml
@@ -223,6 +246,7 @@ Loop while a condition is true.
             - call: {device: trace1, action: stream__acquire_trace}
       - assign: {shots: ${shots + 1}}
 ```
+`condition` is required.
 
 ### `if`
 Conditional execution.
@@ -234,6 +258,7 @@ Conditional execution.
     else:
       - call: {device: foo, action: do_bad}
 ```
+`condition` is required.
 
 ### `atomic`
 Critical section. Pause/stop is deferred until atomic completes.
@@ -364,6 +389,13 @@ Structured condition operators:
 - `and`, `or`, `not`
 - `abs_lt: [x, tol]`
 
+Validation rules used by `sequencer.validate`:
+- A condition object must contain exactly one operator key.
+- `always` must be the only key when present.
+- Comparison operators require exactly two arguments.
+- `and` / `or` require a list with at least one clause.
+- `and` / `or` with one clause are valid but produce a warning.
+
 Example:
 ```yaml
 condition:
@@ -377,6 +409,47 @@ condition:
 - `sleep` and `wait_until` are interruptible by pause/stop.
 - Errors transition the sequencer to `ERROR`.
 - `pause` transitions to `PAUSED` at the next safe point.
+
+## Run orchestration (`sequencer.start`)
+`sequencer.start` supports run-level controls:
+- `sequence_id` (optional): load this library entry before start.
+- `repeat_count` (optional int >= 1): run N full loops.
+- `continuous` (optional bool): run forever until stopped.
+- `vars_override` (optional dict): run-scoped var overrides.
+- `adaptive` (optional dict): per-study adaptive start mode overrides.
+
+Semantics:
+- If `continuous=true`, `repeat_count` is ignored.
+- If `continuous=false` and `repeat_count` is omitted, one run executes.
+- `vars_override` keys must already exist in `vars`.
+- `vars_override` is not persisted to YAML.
+
+`sequencer.status` exposes:
+- `run_id`
+- `loop_mode`, `loops_completed`, `loops_target`
+- active `vars_override`
+- progress snapshot with loop/run fields.
+
+## Sequence library manifest
+Set these in `processes/sequencer.yaml` `init_kwargs`:
+- `sequence_library_path`: manifest path.
+- `autoload_sequence_id` (optional): load a library sequence on process start.
+- `library_description_policy`: `off | warn | error`.
+
+Manifest schema (`version: 1`):
+```yaml
+version: 1
+sequences:
+  main:
+    path: sequences/main.yaml
+    label: Main sequence
+    description: Main operator workflow
+    tags: [routine]
+autoload_dirs:
+  - dir: sequences/fragments
+    pattern: "*.yaml"
+    namespace: fragments
+```
 
 ## Minimal example
 ```yaml

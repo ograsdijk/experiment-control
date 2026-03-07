@@ -1,4 +1,4 @@
-import { Button, Group, Select, Stack, Text, TextInput } from "@mantine/core";
+import { Badge, Button, Group, Select, Stack, Text, TextInput } from "@mantine/core";
 import { IconPlus } from "@tabler/icons-react";
 import type { SequencerOutlineMetadataEntry } from "../types";
 import { KeyValueChipRow } from "./KeyValueChipRow";
@@ -21,6 +21,8 @@ type Props = {
   nextNamePrefix?: string;
   defaultNewValue?: string;
   valueOptions?: ReadonlyArray<SelectOption>;
+  issueCount?: number;
+  issueText?: string | null;
 };
 
 function nextEntryName(
@@ -48,6 +50,8 @@ export function KeyValueChipList({
   nextNamePrefix = "field",
   defaultNewValue = '""',
   valueOptions,
+  issueCount = 0,
+  issueText = null,
 }: Props) {
   const updateEntry = (index: number, patch: Partial<SequencerOutlineMetadataEntry>) => {
     onChange(
@@ -74,9 +78,16 @@ export function KeyValueChipList({
   return (
     <Stack gap={6}>
       <Group justify="space-between" align="center">
-        <Text size="xs" fw={600}>
-          {title}
-        </Text>
+        <Group gap={6} align="center">
+          <Text size="xs" fw={600}>
+            {title}
+          </Text>
+          {issueCount > 0 ? (
+            <Badge size="xs" color="red" variant="light">
+              {issueCount} issue{issueCount === 1 ? "" : "s"}
+            </Badge>
+          ) : null}
+        </Group>
         <Button
           size="compact-xs"
           variant="light"
@@ -155,6 +166,11 @@ export function KeyValueChipList({
           ))}
         </Stack>
       )}
+      {issueText ? (
+        <Text size="xs" c="red">
+          {issueText}
+        </Text>
+      ) : null}
     </Stack>
   );
 }

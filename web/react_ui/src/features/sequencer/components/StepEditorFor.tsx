@@ -1,5 +1,6 @@
 import {
   ActionIcon,
+  Badge,
   Button,
   Card,
   Group,
@@ -29,6 +30,9 @@ import {
   defaultForGeneratorModifiers,
   detectScan2dForm,
   detectScan2dResolutionMode,
+  duplicateNameSet,
+  isBlank,
+  isPositiveIntegerLiteral,
   modifierValue,
   nextBindSourceField,
   nextEntryName,
@@ -140,14 +144,38 @@ export function ForStepEditor({ node, yamlText, onYamlTextChange }: Props) {
   const scan2dResolutionMode = detectScan2dResolutionMode(iterableConfig);
   const scan2dPattern = valueByKey(iterableConfig, "pattern") || "serpentine";
   const scan2dOrder = valueByKey(iterableConfig, "order") || "row_major";
+  const duplicateBindNames = duplicateNameSet(bind);
+  const blankBindTargets = bind.filter((entry) => isBlank(entry.value)).length;
+  const bindIssueCount = duplicateBindNames.size + blankBindTargets;
+  const directValueError = sourceMode === "direct" && isBlank(directValue);
+  const scalarFieldError = (fieldName: string, value: string): string | undefined => {
+    if (isBlank(value)) {
+      return `${fieldName} is required.`;
+    }
+    if (
+      (fieldName === "num" || fieldName.endsWith(".num") || fieldName.startsWith("steps.")) &&
+      /^[\d.\-]+$/.test(value.trim()) &&
+      !isPositiveIntegerLiteral(value)
+    ) {
+      return `${fieldName} must be a positive integer.`;
+    }
+    return undefined;
+  };
 
   return (
     <Card radius="sm" p="xs" style={cardStyle}>
       <Stack gap={8}>
         <Group justify="space-between" align="center">
-          <Text size="xs" fw={600}>
-            Bind
-          </Text>
+          <Group gap={6} align="center">
+            <Text size="xs" fw={600}>
+              Bind
+            </Text>
+            {bindIssueCount > 0 ? (
+              <Badge size="xs" color="red" variant="light">
+                {bindIssueCount} issue{bindIssueCount === 1 ? "" : "s"}
+              </Badge>
+            ) : null}
+          </Group>
           {sourceMode === "generator" ? (
             <Menu shadow="md" withArrow position="bottom-end" zIndex={1000}>
               <Menu.Target>
@@ -214,8 +242,9 @@ export function ForStepEditor({ node, yamlText, onYamlTextChange }: Props) {
         ) : (
           <Stack gap={6}>
             {bind.map((entry, index) => (
-              <div key={`${entry.name}:${index}`} className="sequencer-var-chip">
-                <div className="sequencer-var-segment sequencer-var-name">
+              <Stack key={`bind-${index}`} gap={4}>
+                <div className="sequencer-var-chip">
+                  <div className="sequencer-var-segment sequencer-var-name">
                   {sourceMode === "generator" ? (
                     <Select
                       size="xs"
@@ -272,8 +301,8 @@ export function ForStepEditor({ node, yamlText, onYamlTextChange }: Props) {
                       }}
                     />
                   )}
-                </div>
-                <div className="sequencer-var-segment sequencer-var-value">
+                  </div>
+                  <div className="sequencer-var-segment sequencer-var-value">
                   <TextInput
                     size="xs"
                     aria-label="Bind target"
@@ -296,8 +325,8 @@ export function ForStepEditor({ node, yamlText, onYamlTextChange }: Props) {
                       );
                     }}
                   />
-                </div>
-                <div className="sequencer-var-segment sequencer-var-remove">
+                  </div>
+                  <div className="sequencer-var-segment sequencer-var-remove">
                   <ActionIcon
                     size="sm"
                     variant="subtle"
@@ -317,8 +346,19 @@ export function ForStepEditor({ node, yamlText, onYamlTextChange }: Props) {
                   >
                     <IconTrash size={14} />
                   </ActionIcon>
+                  </div>
                 </div>
-              </div>
+                {duplicateBindNames.has(entry.name.trim()) ? (
+                  <Text size="xs" c="red">
+                    Bind source fields must be unique.
+                  </Text>
+                ) : null}
+                {isBlank(entry.value) ? (
+                  <Text size="xs" c="red">
+                    Bind target is required.
+                  </Text>
+                ) : null}
+              </Stack>
             ))}
           </Stack>
         )}
@@ -364,6 +404,7 @@ export function ForStepEditor({ node, yamlText, onYamlTextChange }: Props) {
               size="xs"
               label="Iterable expression"
               value={directValue}
+              error={directValueError ? "Iterable expression is required." : undefined}
               onChange={(event) =>
                 updateFor(
                   bind,
@@ -504,6 +545,7 @@ export function ForStepEditor({ node, yamlText, onYamlTextChange }: Props) {
                     size="xs"
                     label={fieldName}
                     value={valueByKey(iterableConfig, fieldName)}
+                    error={scalarFieldError(fieldName, valueByKey(iterableConfig, fieldName))}
                     onChange={(event) =>
                       updateFor(
                         bind,
@@ -642,7 +684,8 @@ export function ForStepEditor({ node, yamlText, onYamlTextChange }: Props) {
                       <TextInput
                         size="xs"
                         label="Center x"
-                        value={valueByKey(iterableConfig, "center.x")}
+                          value={valueByKey(iterableConfig, "center.x")}
+                        error={scalarFieldError("center.x", valueByKey(iterableConfig, "center.x"))}
                         onChange={(event) =>
                           updateFor(
                             bind,
@@ -657,7 +700,8 @@ export function ForStepEditor({ node, yamlText, onYamlTextChange }: Props) {
                       <TextInput
                         size="xs"
                         label="Center y"
-                        value={valueByKey(iterableConfig, "center.y")}
+                          value={valueByKey(iterableConfig, "center.y")}
+                        error={scalarFieldError("center.y", valueByKey(iterableConfig, "center.y"))}
                         onChange={(event) =>
                           updateFor(
                             bind,
@@ -675,6 +719,7 @@ export function ForStepEditor({ node, yamlText, onYamlTextChange }: Props) {
                         size="xs"
                         label="Width"
                         value={valueByKey(iterableConfig, "width")}
+                        error={scalarFieldError("width", valueByKey(iterableConfig, "width"))}
                         onChange={(event) =>
                           updateFor(
                             bind,
@@ -690,6 +735,7 @@ export function ForStepEditor({ node, yamlText, onYamlTextChange }: Props) {
                         size="xs"
                         label="Height"
                         value={valueByKey(iterableConfig, "height")}
+                        error={scalarFieldError("height", valueByKey(iterableConfig, "height"))}
                         onChange={(event) =>
                           updateFor(
                             bind,
@@ -737,6 +783,13 @@ export function ForStepEditor({ node, yamlText, onYamlTextChange }: Props) {
                           iterableConfig,
                           scan2dResolutionMode === "pitch" ? "pitch.x" : "steps.x"
                         )}
+                        error={scalarFieldError(
+                          scan2dResolutionMode === "pitch" ? "pitch.x" : "steps.x",
+                          valueByKey(
+                            iterableConfig,
+                            scan2dResolutionMode === "pitch" ? "pitch.x" : "steps.x"
+                          )
+                        )}
                         onChange={(event) =>
                           updateFor(
                             bind,
@@ -759,6 +812,13 @@ export function ForStepEditor({ node, yamlText, onYamlTextChange }: Props) {
                           iterableConfig,
                           scan2dResolutionMode === "pitch" ? "pitch.y" : "steps.y"
                         )}
+                        error={scalarFieldError(
+                          scan2dResolutionMode === "pitch" ? "pitch.y" : "steps.y",
+                          valueByKey(
+                            iterableConfig,
+                            scan2dResolutionMode === "pitch" ? "pitch.y" : "steps.y"
+                          )
+                        )}
                         onChange={(event) =>
                           updateFor(
                             bind,
@@ -779,14 +839,14 @@ export function ForStepEditor({ node, yamlText, onYamlTextChange }: Props) {
                 ) : (
                   <>
                     <Group grow align="flex-end">
-                      <TextInput size="xs" label="x start" value={valueByKey(iterableConfig, "x.linspace.start")} onChange={(event) => updateFor(bind, sourceMode, iterableKind, directValue, generatorModifiers, setEntryValue(iterableConfig, "x.linspace.start", event.currentTarget.value))} />
-                      <TextInput size="xs" label="x stop" value={valueByKey(iterableConfig, "x.linspace.stop")} onChange={(event) => updateFor(bind, sourceMode, iterableKind, directValue, generatorModifiers, setEntryValue(iterableConfig, "x.linspace.stop", event.currentTarget.value))} />
-                      <TextInput size="xs" label="x num" value={valueByKey(iterableConfig, "x.linspace.num")} onChange={(event) => updateFor(bind, sourceMode, iterableKind, directValue, generatorModifiers, setEntryValue(iterableConfig, "x.linspace.num", event.currentTarget.value))} />
+                      <TextInput size="xs" label="x start" value={valueByKey(iterableConfig, "x.linspace.start")} error={scalarFieldError("x.linspace.start", valueByKey(iterableConfig, "x.linspace.start"))} onChange={(event) => updateFor(bind, sourceMode, iterableKind, directValue, generatorModifiers, setEntryValue(iterableConfig, "x.linspace.start", event.currentTarget.value))} />
+                      <TextInput size="xs" label="x stop" value={valueByKey(iterableConfig, "x.linspace.stop")} error={scalarFieldError("x.linspace.stop", valueByKey(iterableConfig, "x.linspace.stop"))} onChange={(event) => updateFor(bind, sourceMode, iterableKind, directValue, generatorModifiers, setEntryValue(iterableConfig, "x.linspace.stop", event.currentTarget.value))} />
+                      <TextInput size="xs" label="x num" value={valueByKey(iterableConfig, "x.linspace.num")} error={scalarFieldError("x.linspace.num", valueByKey(iterableConfig, "x.linspace.num"))} onChange={(event) => updateFor(bind, sourceMode, iterableKind, directValue, generatorModifiers, setEntryValue(iterableConfig, "x.linspace.num", event.currentTarget.value))} />
                     </Group>
                     <Group grow align="flex-end">
-                      <TextInput size="xs" label="y start" value={valueByKey(iterableConfig, "y.linspace.start")} onChange={(event) => updateFor(bind, sourceMode, iterableKind, directValue, generatorModifiers, setEntryValue(iterableConfig, "y.linspace.start", event.currentTarget.value))} />
-                      <TextInput size="xs" label="y stop" value={valueByKey(iterableConfig, "y.linspace.stop")} onChange={(event) => updateFor(bind, sourceMode, iterableKind, directValue, generatorModifiers, setEntryValue(iterableConfig, "y.linspace.stop", event.currentTarget.value))} />
-                      <TextInput size="xs" label="y num" value={valueByKey(iterableConfig, "y.linspace.num")} onChange={(event) => updateFor(bind, sourceMode, iterableKind, directValue, generatorModifiers, setEntryValue(iterableConfig, "y.linspace.num", event.currentTarget.value))} />
+                      <TextInput size="xs" label="y start" value={valueByKey(iterableConfig, "y.linspace.start")} error={scalarFieldError("y.linspace.start", valueByKey(iterableConfig, "y.linspace.start"))} onChange={(event) => updateFor(bind, sourceMode, iterableKind, directValue, generatorModifiers, setEntryValue(iterableConfig, "y.linspace.start", event.currentTarget.value))} />
+                      <TextInput size="xs" label="y stop" value={valueByKey(iterableConfig, "y.linspace.stop")} error={scalarFieldError("y.linspace.stop", valueByKey(iterableConfig, "y.linspace.stop"))} onChange={(event) => updateFor(bind, sourceMode, iterableKind, directValue, generatorModifiers, setEntryValue(iterableConfig, "y.linspace.stop", event.currentTarget.value))} />
+                      <TextInput size="xs" label="y num" value={valueByKey(iterableConfig, "y.linspace.num")} error={scalarFieldError("y.linspace.num", valueByKey(iterableConfig, "y.linspace.num"))} onChange={(event) => updateFor(bind, sourceMode, iterableKind, directValue, generatorModifiers, setEntryValue(iterableConfig, "y.linspace.num", event.currentTarget.value))} />
                     </Group>
                   </>
                 )}
@@ -840,7 +900,7 @@ export function ForStepEditor({ node, yamlText, onYamlTextChange }: Props) {
         )}
 
         <Text size="xs" c="dimmed">
-          The nested body remains unchanged in this phase.
+          Edit the loop body from the step tree using insert/move/delete actions on child steps.
         </Text>
       </Stack>
     </Card>

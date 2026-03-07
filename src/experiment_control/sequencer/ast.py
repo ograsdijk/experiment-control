@@ -95,6 +95,12 @@ class SetContextStep:
 
 
 @dataclass(frozen=True)
+class UseStep:
+    sequence_id: str
+    args: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
 class AdaptiveStep:
     id: str
     controller: dict[str, Any]
@@ -122,6 +128,7 @@ Step = (
     | ParallelStep
     | AssignStep
     | SetContextStep
+    | UseStep
     | AdaptiveStep
 )
 
@@ -251,6 +258,25 @@ def _parse_step(raw: Any) -> Step:
         if not isinstance(fields, dict):
             raise TypeError("set_context.fields must be a dict")
         return SetContextStep(streams=sc.get("streams", []), fields=fields)
+    if "use" in obj:
+        raw_use = obj.get("use")
+        if isinstance(raw_use, str):
+            sequence_id = raw_use.strip()
+            args = None
+        elif isinstance(raw_use, dict):
+            sequence_id = str(raw_use.get("id", "")).strip()
+            args_raw = raw_use.get("args")
+            if args_raw is None:
+                args = None
+            elif isinstance(args_raw, dict):
+                args = dict(args_raw)
+            else:
+                raise TypeError("use.args must be a dict")
+        else:
+            raise TypeError("use must be a string id or a dict")
+        if not sequence_id:
+            raise TypeError("use.id is required")
+        return UseStep(sequence_id=sequence_id, args=args)
     if "adaptive" in obj:
         raw_step = _require_dict(obj["adaptive"], name="adaptive")
         step_id = str(raw_step.get("id", "")).strip()
@@ -317,6 +343,29 @@ def _iter_adaptive_ids(steps: list[Step]) -> list[str]:
         elif isinstance(step, ParallelStep):
             ids.extend(_iter_adaptive_ids(step.body))
     return ids
+
+
+def iter_use_ids(steps: list[Step]) -> list[str]:
+    out: list[str] = []
+    for step in steps:
+        if isinstance(step, UseStep):
+            out.append(step.sequence_id)
+        elif isinstance(step, AdaptiveStep):
+            out.extend(iter_use_ids(step.body))
+        elif isinstance(step, ForStep):
+            out.extend(iter_use_ids(step.body))
+        elif isinstance(step, RepeatStep):
+            out.extend(iter_use_ids(step.body))
+        elif isinstance(step, IfStep):
+            out.extend(iter_use_ids(step.then_steps))
+            out.extend(iter_use_ids(step.else_steps or []))
+        elif isinstance(step, WhileStep):
+            out.extend(iter_use_ids(step.body))
+        elif isinstance(step, AtomicStep):
+            out.extend(iter_use_ids(step.body))
+        elif isinstance(step, ParallelStep):
+            out.extend(iter_use_ids(step.body))
+    return out
 
 
 def parse_sequence(raw: Any) -> SequenceSpec:

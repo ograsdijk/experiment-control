@@ -2,6 +2,7 @@ import type {
   SequencerAdaptiveFieldGroup,
   SequencerAdaptiveMetricDetail,
   SequencerOutlineMetadataEntry,
+  SequencerStepOutlineNode,
 } from "./types";
 import type { CapabilityParam } from "../../types";
 import {
@@ -41,6 +42,55 @@ export function nextEntryName(
     index += 1;
   }
   return `${prefix}_${index}`;
+}
+
+export function duplicateNameSet(
+  entries: ReadonlyArray<SequencerOutlineMetadataEntry>
+): Set<string> {
+  const seen = new Set<string>();
+  const duplicates = new Set<string>();
+  for (const entry of entries) {
+    const name = String(entry.name ?? "").trim();
+    if (!name) {
+      continue;
+    }
+    if (seen.has(name)) {
+      duplicates.add(name);
+      continue;
+    }
+    seen.add(name);
+  }
+  return duplicates;
+}
+
+export function isBlank(value: string | null | undefined): boolean {
+  return String(value ?? "").trim().length <= 0;
+}
+
+function parseStrictNumber(value: string | null | undefined): number | null {
+  const text = String(value ?? "").trim();
+  if (!text) {
+    return null;
+  }
+  if (!/^-?\d+(?:\.\d+)?$/.test(text)) {
+    return null;
+  }
+  const num = Number(text);
+  return Number.isFinite(num) ? num : null;
+}
+
+export function isNonNegativeNumberLiteral(
+  value: string | null | undefined
+): boolean {
+  const parsed = parseStrictNumber(value);
+  return parsed !== null && parsed >= 0;
+}
+
+export function isPositiveIntegerLiteral(
+  value: string | null | undefined
+): boolean {
+  const parsed = parseStrictNumber(value);
+  return parsed !== null && Number.isInteger(parsed) && parsed > 0;
 }
 
 export function renderUnknownValue(value: unknown): string {
@@ -451,6 +501,231 @@ export function withMetricCallParamEntries(
     .map((entry) => ({
       name: `params.${entry.name}`,
       value: entry.value,
-    }));
+  }));
   return [...nonParamEntries, ...paramEntries];
+}
+
+export function countMetadataNameIssues(
+  entries: ReadonlyArray<SequencerOutlineMetadataEntry>
+): number {
+  return (
+    duplicateNameSet(entries).size + entries.filter((entry) => isBlank(entry.name)).length
+  );
+}
+
+export function countContextColumnIssues(
+  entries: ReadonlyArray<SequencerOutlineMetadataEntry>
+): number {
+  const validTypes = new Set(["float64", "int64", "bool"]);
+  const invalidTypes = entries.filter(
+    (entry) => !isBlank(entry.name) && !isBlank(entry.value) && !validTypes.has(entry.value ?? "")
+  ).length;
+  return countMetadataNameIssues(entries) + invalidTypes;
+}
+
+function countCallIssues(node: SequencerStepOutlineNode): number {
+  if (!node.callDetail) {
+    return 0;
+  }
+  const blankParamNames = node.callDetail.params.filter((entry) => isBlank(entry.name)).length;
+  return (
+    (isBlank(node.callDetail.action) ? 1 : 0) +
+    duplicateNameSet(node.callDetail.params).size +
+    blankParamNames
+  );
+}
+
+function countSetIssues(node: SequencerStepOutlineNode): number {
+  if (!node.setDetail) {
+    return 0;
+  }
+  return (
+    (isBlank(node.setDetail.device) ? 1 : 0) +
+    (isBlank(node.setDetail.name) ? 1 : 0) +
+    (isBlank(node.setDetail.value) ? 1 : 0)
+  );
+}
+
+function countAssignIssues(node: SequencerStepOutlineNode): number {
+  if (!node.assignDetail) {
+    return 0;
+  }
+  return (
+    (node.assignDetail.entries.length <= 0 ? 1 : 0) +
+    duplicateNameSet(node.assignDetail.entries).size +
+    node.assignDetail.entries.filter((entry) => isBlank(entry.name)).length
+  );
+}
+
+function countForIssues(node: SequencerStepOutlineNode): number {
+  if (!node.forDetail) {
+    return 0;
+  }
+  const detail = node.forDetail;
+  let count =
+    duplicateNameSet(detail.bind).size +
+    detail.bind.filter((entry) => isBlank(entry.value)).length +
+    detail.bind.filter((entry) => isBlank(entry.name)).length;
+  if (detail.sourceMode === "direct") {
+    return count + (isBlank(detail.directValue) ? 1 : 0);
+  }
+  if (isBlank(detail.generatorKind)) {
+    count += 1;
+  }
+  const needsPositiveInt = (fieldName: string) =>
+    fieldName === "num" ||
+    fieldName.endsWith(".num") ||
+    fieldName.startsWith("steps.");
+  for (const entry of detail.iterableConfig) {
+    if (isBlank(entry.name)) {
+      count += 1;
+      continue;
+    }
+    if (isBlank(entry.value)) {
+      count += 1;
+      continue;
+    }
+    if (needsPositiveInt(entry.name) && /^-?\d+(?:\.\d+)?$/.test(entry.value?.trim() ?? "")) {
+      if (!isPositiveIntegerLiteral(entry.value)) {
+        count += 1;
+      }
+    }
+  }
+  return count;
+}
+
+function countSetContextIssues(node: SequencerStepOutlineNode): number {
+  if (!node.setContextDetail) {
+    return 0;
+  }
+  const invalidStreams = node.setContextDetail.streams.filter(
+    (stream) => isBlank(stream.device) !== isBlank(stream.stream)
+  ).length;
+  return (
+    invalidStreams +
+    duplicateNameSet(node.setContextDetail.fields).size +
+    node.setContextDetail.fields.filter((entry) => isBlank(entry.name)).length
+  );
+}
+
+function countWaitUntilIssues(node: SequencerStepOutlineNode): number {
+  if (!node.waitUntilDetail) {
+    return 0;
+  }
+  const sample = node.waitUntilDetail.sample;
+  const hasTelemetry = sample.some((entry) => entry.name.startsWith("telemetry."));
+  const hasCall = sample.some((entry) => entry.name.startsWith("call."));
+  const telemetryDevice = valueByKey(sample, "telemetry.device");
+  const telemetrySignal = valueByKey(sample, "telemetry.signal");
+  const callDevice = valueByKey(sample, "call.device");
+  const callAction = valueByKey(sample, "call.action");
+  return (
+    (sample.length <= 0 ? 1 : 0) +
+    (node.waitUntilDetail.condition.length <= 0 ? 1 : 0) +
+    duplicateNameSet(sample).size +
+    duplicateNameSet(node.waitUntilDetail.condition).size +
+    (hasTelemetry && isBlank(telemetryDevice) ? 1 : 0) +
+    (hasTelemetry && isBlank(telemetrySignal) ? 1 : 0) +
+    (hasCall && isBlank(callDevice) ? 1 : 0) +
+    (hasCall && isBlank(callAction) ? 1 : 0)
+  );
+}
+
+function countConditionIssues(
+  entries: ReadonlyArray<SequencerOutlineMetadataEntry>
+): number {
+  return (entries.length <= 0 ? 1 : 0) + duplicateNameSet(entries).size;
+}
+
+function countAdaptiveIssues(node: SequencerStepOutlineNode): number {
+  if (!node.adaptiveDetail) {
+    return 0;
+  }
+  const detail = node.adaptiveDetail;
+  let count =
+    (isBlank(detail.id) ? 1 : 0) +
+    (isBlank(detail.score) ? 1 : 0) +
+    (!isBlank(valueByKey(detail.controllerConfig, "min_loss")) &&
+    /^-?\d+(?:\.\d+)?$/.test(valueByKey(detail.controllerConfig, "min_loss").trim()) &&
+    !isNonNegativeNumberLiteral(valueByKey(detail.controllerConfig, "min_loss"))
+      ? 1
+      : 0) +
+    (!isBlank(valueByKey(detail.stopping, "max_trials")) &&
+    /^-?\d+(?:\.\d+)?$/.test(valueByKey(detail.stopping, "max_trials").trim()) &&
+    !isPositiveIntegerLiteral(valueByKey(detail.stopping, "max_trials"))
+      ? 1
+      : 0) +
+    (!isBlank(detail.observeRepeats) &&
+    /^-?\d+(?:\.\d+)?$/.test(detail.observeRepeats.trim()) &&
+    !isPositiveIntegerLiteral(detail.observeRepeats)
+      ? 1
+      : 0);
+
+  count +=
+    duplicateNameSet(detail.space.map((group) => ({ name: group.name, value: null }))).size +
+    detail.space.filter((group) => isBlank(group.name)).length;
+  for (const group of detail.space) {
+    count += duplicateNameSet(group.entries).size;
+    count += group.entries.filter((entry) => isBlank(entry.name)).length;
+  }
+
+  count += duplicateNameSet(detail.bind).size;
+  count += detail.bind.filter((entry) => isBlank(entry.name) || isBlank(entry.value)).length;
+
+  count += detail.metrics.length <= 0 ? 1 : 0;
+  const duplicateMetricNames = duplicateNameSet(
+    detail.metrics.map((metric) => ({ name: metric.name, value: null }))
+  );
+  for (const metric of detail.metrics) {
+    count += isBlank(metric.name) ? 1 : 0;
+    count += !isBlank(metric.name) && duplicateMetricNames.has(metric.name.trim()) ? 1 : 0;
+    if (metric.sourceKind === "analysis_output") {
+      count += isBlank(valueByKey(metric.config, "workspace_id")) ? 1 : 0;
+      count += isBlank(valueByKey(metric.config, "output_id")) ? 1 : 0;
+    } else if (metric.sourceKind === "telemetry") {
+      count += isBlank(valueByKey(metric.config, "device")) ? 1 : 0;
+      count += isBlank(valueByKey(metric.config, "signal")) ? 1 : 0;
+    } else if (metric.sourceKind === "call") {
+      count += isBlank(valueByKey(metric.config, "device")) ? 1 : 0;
+      count += isBlank(valueByKey(metric.config, "action")) ? 1 : 0;
+      const callParams = metricCallParamEntries(metric);
+      count += duplicateNameSet(callParams).size;
+      count += callParams.filter((entry) => isBlank(entry.name)).length;
+    }
+  }
+
+  count += duplicateNameSet(detail.aggregate).size;
+  count += detail.aggregate.filter((entry) => isBlank(entry.name)).length;
+  return count;
+}
+
+export function countStepIssues(node: SequencerStepOutlineNode): number {
+  if (node.callDetail) {
+    return countCallIssues(node);
+  }
+  if (node.setDetail) {
+    return countSetIssues(node);
+  }
+  if (node.assignDetail) {
+    return countAssignIssues(node);
+  }
+  if (node.forDetail) {
+    return countForIssues(node);
+  }
+  if (node.setContextDetail) {
+    return countSetContextIssues(node);
+  }
+  if (node.waitUntilDetail) {
+    return countWaitUntilIssues(node);
+  }
+  if (node.ifDetail) {
+    return countConditionIssues(node.ifDetail.condition);
+  }
+  if (node.whileDetail) {
+    return countConditionIssues(node.whileDetail.condition);
+  }
+  if (node.adaptiveDetail) {
+    return countAdaptiveIssues(node);
+  }
+  return 0;
 }

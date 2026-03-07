@@ -24,16 +24,21 @@ Or use the helper script:
 python examples/dummy_frequency_trace_sequencer/run_dummy_frequency_trace_stack.py
 ```
 
-This uses stack-configured TUI startup (`tui.enabled: true`), so the terminal UI opens automatically.
-The stack helper also auto-loads `sequence_frequency_sweep.yaml` into the sequencer process.
-The sequencer process itself is also configured with `autoload_path`, so loading does not depend on helper-script timing.
+By default, the helper uses stack-configured TUI startup (`tui.enabled: true`).
+Use `--no-tui` to disable terminal UI startup:
+
+```bash
+python examples/dummy_frequency_trace_sequencer/run_dummy_frequency_trace_stack.py --no-tui
+```
+
+The sequencer process is configured with `autoload_path` and loads
+`sequence_frequency_sweep.yaml` during process startup.
 `stream_analysis` autoloads DAG workspaces from:
 `examples/dummy_frequency_trace_sequencer/stream_workspaces.yaml`.
 `hdf_writer` loads measurement schema from:
 `examples/dummy_frequency_trace_sequencer/measurement.yaml`.
-Because `stack.yaml` sets `startup.start_processes: false`, the stack itself does not
-auto-start processes. The helper script starts `sequencer`, `stream_analysis`, and
-`hdf_writer` for you.
+`stack.yaml` sets `startup.start_processes: true`, so `sequencer`,
+`stream_analysis`, and `hdf_writer` are started automatically in configured order.
 `hdf_writer` starts in idle mode (no file open) when schema is configured; run
 `hdf.rotate` from the HDF modal and fill in `measurement_profile` + schema fields to
 begin writing.
