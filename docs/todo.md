@@ -1,41 +1,11 @@
 # TODO
 
 ## Process lifecycle / Windows TUI
-- Keep Windows PID liveness probes on Win32 APIs (`OpenProcess` + `GetExitCodeProcess`) and do not regress to `os.kill(pid, 0)`.
-- Add a higher-level Windows integration check for two-process TUI startup (`run_stack` parent + `--no-tui` child manager) with lifecycle flags enabled.
 - Verify TUI responsiveness (mouse + keyboard) remains stable under long-running sessions.
-
-## Manager logging
-- Add env/config flags:
-  - `MANAGER_LOG_STDERR=1|0` (default 1)
-  - `MANAGER_LOG_FILE=path` (optional)
-- Manager should log error events (e.g., `manager.*_error` and `manager.log` severity>=error) to stderr when enabled.
-- If `MANAGER_LOG_FILE` is set, append log lines there as well.
-- When the TUI launcher is used, pass `MANAGER_LOG_STDERR=0` and (optionally) `MANAGER_LOG_FILE=...` to the manager subprocess.
 
 ## GUI (React Web UI) design + implementation
 - Configuration:
   - Add YAML snippets (presets) in UI.
-
-## Web UI TODO
-- Sequencer YAML editor:
-  - Current `Textarea` only supports syntax highlighting in read-only Preview mode.
-  - Add true syntax highlighting while editing by replacing `Textarea` with a code editor component (prefer `CodeMirror 6`; `Monaco` as heavier alternative).
-  - Keep current behavior:
-    - Diagnostics line/column jump should focus editor at exact offset.
-    - `Show loaded YAML` should still populate the editable buffer.
-    - Preview mode can remain as a read-only formatted view.
-- Snapshot restore on reload:
-  - Add FastAPI snapshot endpoints for latest values so refresh does not start from empty plots.
-  - Scope:
-    - latest telemetry signals per device
-    - latest stream-analysis outputs per workspace/output (`scalar`, `hist_agg`, `hist2d`, optional latest `fit_1d`)
-    - latest trace sample for raw stream panels (single latest trace, not full history)
-  - UI boot flow:
-    - fetch snapshots first
-    - seed panel state/refs from snapshot payloads
-    - then attach WebSocket subscriptions for live deltas
-  - Keep this as latest-state restore only (no historical replay/backfill).
 
 ## Measurement schema TODO
 - Clarification: this is for measurement metadata fields (header/notes JSON), not telemetry/stream array payloads.
