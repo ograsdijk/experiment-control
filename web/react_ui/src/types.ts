@@ -149,6 +149,19 @@ export type PinnedCommand = {
   label?: string | null;
 };
 
+export type CommandDeckTargetKind = "device";
+
+export type CommandDeckEntry = {
+  id: string;
+  targetKind: CommandDeckTargetKind;
+  targetId: string;
+  action: string;
+  label?: string | null;
+  group?: string | null;
+  paramsDraft?: Record<string, string>;
+  createdAt?: number | null;
+};
+
 export type RouteMatch = {
   device_id: string;
   action: string;

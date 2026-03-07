@@ -4,6 +4,7 @@
   Button,
   Card,
   Group,
+  Menu,
   Stack,
   Text,
   TextInput,
@@ -13,7 +14,9 @@
 import { notifications } from "@mantine/notifications";
 import {
   IconChartLine,
+  IconDotsVertical,
   IconPlayerPlay,
+  IconPlaylistAdd,
   IconRefresh,
   IconTerminal2,
 } from "@tabler/icons-react";
@@ -49,6 +52,8 @@ type DeviceCardProps = {
   isDragging: boolean;
   pinnedCommands: PinnedCommand[];
   onPinnedCommand: (action: string) => void;
+  onAddPinnedToDeck: (action: string) => void;
+  onAddAllPinnedToDeck: () => void;
   capabilities: CapabilityMember[];
   pinnedParamValuesByAction: Record<string, Record<string, string>>;
   pinnedBusyByAction: Record<string, boolean>;
@@ -117,6 +122,8 @@ export function DeviceCard({
   isDragging,
   pinnedCommands,
   onPinnedCommand,
+  onAddPinnedToDeck,
+  onAddAllPinnedToDeck,
   capabilities,
   pinnedParamValuesByAction,
   pinnedBusyByAction,
@@ -369,9 +376,26 @@ export function DeviceCard({
         </Stack>
         {pinnedCommands.length > 0 && (
           <Stack gap={4}>
-            <Text size="xs" c="dimmed">
-              Pinned commands
-            </Text>
+            <Group justify="space-between" align="center">
+              <Text size="xs" c="dimmed">
+                Pinned commands
+              </Text>
+              <Menu shadow="md" width={220} position="bottom-end" withArrow withinPortal>
+                <Menu.Target>
+                  <ActionIcon size="xs" variant="subtle" color="gray">
+                    <IconDotsVertical size={14} />
+                  </ActionIcon>
+                </Menu.Target>
+                <Menu.Dropdown>
+                  <Menu.Item
+                    leftSection={<IconPlaylistAdd size={14} />}
+                    onClick={onAddAllPinnedToDeck}
+                  >
+                    Add all to command deck
+                  </Menu.Item>
+                </Menu.Dropdown>
+              </Menu>
+            </Group>
             <Stack gap={6}>
               {pinnedCommands.map((entry) => {
                 const label = entry.label?.trim();
@@ -406,6 +430,35 @@ export function DeviceCard({
                   <div key={entry.action} className="pinned-command-chip">
                     <div className="pinned-command-segment pinned-command-name">
                       {buttonWithTooltip}
+                    </div>
+                    <div className="pinned-command-segment pinned-command-more">
+                      <Menu
+                        shadow="md"
+                        width={220}
+                        position="bottom-end"
+                        withArrow
+                        withinPortal
+                      >
+                        <Menu.Target>
+                          <ActionIcon size="sm" variant="subtle" color="gray">
+                            <IconDotsVertical size={14} />
+                          </ActionIcon>
+                        </Menu.Target>
+                        <Menu.Dropdown>
+                          <Menu.Item
+                            leftSection={<IconTerminal2 size={14} />}
+                            onClick={() => onPinnedCommand(entry.action)}
+                          >
+                            Open command editor
+                          </Menu.Item>
+                          <Menu.Item
+                            leftSection={<IconPlaylistAdd size={14} />}
+                            onClick={() => onAddPinnedToDeck(entry.action)}
+                          >
+                            Add to command deck
+                          </Menu.Item>
+                        </Menu.Dropdown>
+                      </Menu>
                     </div>
                     <div className="pinned-command-segment pinned-command-inputs">
                       {params.map((param) => (

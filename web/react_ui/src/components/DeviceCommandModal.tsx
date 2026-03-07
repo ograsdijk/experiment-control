@@ -1,4 +1,4 @@
-﻿import {
+import {
   Button,
   Group,
   Modal,
@@ -9,7 +9,7 @@
   TextInput,
   Textarea,
 } from "@mantine/core";
-import { IconStar, IconStarFilled } from "@tabler/icons-react";
+import { IconPlaylistAdd, IconStar, IconStarFilled } from "@tabler/icons-react";
 import type { ReactNode } from "react";
 import { ParamInput } from "./ParamInput";
 import type { CapabilityMember } from "../types";
@@ -35,6 +35,8 @@ type Props = {
   isPinned: boolean;
   pinDisabled: boolean;
   onTogglePin: () => void;
+  deckDisabled?: boolean;
+  onAddToDeck?: () => void;
   onExecute: () => void;
 };
 
@@ -57,6 +59,8 @@ export function DeviceCommandModal({
   isPinned,
   pinDisabled,
   onTogglePin,
+  deckDisabled,
+  onAddToDeck,
   onExecute,
 }: Props) {
   return (
@@ -119,6 +123,14 @@ export function DeviceCommandModal({
           label="Advanced JSON params"
         />
         <Group justify="flex-end">
+          <Button
+            variant="light"
+            leftSection={<IconPlaylistAdd size={14} />}
+            onClick={onAddToDeck}
+            disabled={deckDisabled || !onAddToDeck}
+          >
+            Add to Deck
+          </Button>
           <Button
             variant="light"
             leftSection={isPinned ? <IconStarFilled size={14} /> : <IconStar size={14} />}

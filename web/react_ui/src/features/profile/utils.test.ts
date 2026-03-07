@@ -65,4 +65,52 @@ describe("profile normalizeUiProfile", () => {
     expect(profile).not.toBeNull();
     expect(profile?.devicePanelCollapsed).toBe(true);
   });
+
+  it("defaults devicePanelTab to devices", () => {
+    const profile = normalizeUiProfile(
+      {
+        layout: { nav_width: 380 },
+      },
+      {
+        defaultNavWidth: 360,
+        navMin: 260,
+        navMax: 900,
+        normalizePlotState,
+        normalizeStreamWorkspaceRecord: () => ({}),
+      }
+    );
+    expect(profile).not.toBeNull();
+    expect(profile?.devicePanelTab).toBe("devices");
+  });
+
+  it("reads command deck entries from commands.command_deck", () => {
+    const profile = normalizeUiProfile(
+      {
+        layout: { nav_width: 380 },
+        commands: {
+          command_deck: [
+            {
+              id: "deck-1",
+              target_kind: "device",
+              target_id: "laser",
+              action: "set_frequency_hz",
+              group: "Scan",
+              params_draft: { hz: "1.23" },
+            },
+          ],
+        },
+      },
+      {
+        defaultNavWidth: 360,
+        navMin: 260,
+        navMax: 900,
+        normalizePlotState,
+        normalizeStreamWorkspaceRecord: () => ({}),
+      }
+    );
+    expect(profile).not.toBeNull();
+    expect(profile?.commandDeck).toHaveLength(1);
+    expect(profile?.commandDeck[0].targetId).toBe("laser");
+    expect(profile?.commandDeck[0].action).toBe("set_frequency_hz");
+  });
 });

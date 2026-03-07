@@ -1,4 +1,4 @@
-﻿import type { PinnedCommand } from "../../types";
+import type { CommandDeckEntry, PinnedCommand } from "../../types";
 import type { PlotPanelState, StreamAnalysisWorkspaceConfig } from "../stream/types";
 
 export type PinnedCommandMap = Record<string, PinnedCommand[]>;
@@ -12,10 +12,12 @@ export type PlotState = {
 export type UiProfileState = {
   navWidth: number;
   devicePanelCollapsed: boolean;
+  devicePanelTab: "devices" | "deck";
   plotState: PlotState;
   deviceOrder: string[];
   telemetryCollapsedByDevice: Record<string, boolean>;
   pinnedCommands: PinnedCommandMap;
+  commandDeck: CommandDeckEntry[];
   streamWorkspaces: Record<string, StreamAnalysisWorkspaceConfig>;
 };
 
@@ -26,6 +28,7 @@ export type UiProfileFile = {
   layout: {
     nav_width: number;
     device_panel_collapsed?: boolean;
+    device_panel_tab?: "devices" | "deck";
     device_order: string[];
     telemetry_collapsed_by_device: Record<string, boolean>;
   };
@@ -37,6 +40,7 @@ export type UiProfileFile = {
   };
   commands: {
     pinned_commands: PinnedCommandMap;
+    command_deck?: CommandDeckEntry[];
   };
   analysis: {
     stream_workspaces: Record<string, StreamAnalysisWorkspaceConfig>;

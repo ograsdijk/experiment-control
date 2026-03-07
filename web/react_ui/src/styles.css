@@ -163,67 +163,86 @@ body::before {
   overflow: hidden;
 }
 
-.device-panel-restore-tab {
-  position: relative;
+.device-panel-collapsed-card {
   align-self: flex-start;
-  flex: 0 0 30px;
-  width: 30px;
-  min-height: 148px;
-  margin-right: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 42px;
+  margin-right: 10px;
+  padding: 6px;
   border: 1px solid var(--card-border);
-  border-radius: 10px;
+  border-radius: 12px;
   background: rgba(251, 249, 244, 0.92);
+  box-shadow: var(--shadow);
+}
+
+[data-mantine-color-scheme="dark"] .device-panel-collapsed-card {
+  background: rgba(23, 29, 37, 0.92);
+}
+
+.device-panel-collapsed-tab {
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
   color: inherit;
   cursor: pointer;
+  padding: 8px 2px;
   display: flex;
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 6px;
-  padding: 8px 4px;
-  box-shadow: var(--shadow);
+  gap: 5px;
+  min-height: 112px;
+  text-align: center;
 }
 
-[data-mantine-color-scheme="dark"] .device-panel-restore-tab {
-  background: rgba(23, 29, 37, 0.92);
-}
-
-.device-panel-restore-tab:hover {
+.device-panel-collapsed-tab:hover {
   background: rgba(228, 238, 245, 0.95);
 }
 
-[data-mantine-color-scheme="dark"] .device-panel-restore-tab:hover {
+[data-mantine-color-scheme="dark"] .device-panel-collapsed-tab:hover {
   background: rgba(37, 46, 58, 0.95);
 }
 
-.device-panel-restore-tab:focus-visible {
+.device-panel-collapsed-tab:focus-visible {
   outline: 2px solid #0e9f9a;
   outline-offset: 1px;
 }
 
-.device-panel-restore-tab-label {
+.device-panel-collapsed-tab-active {
+  border-color: rgba(14, 159, 154, 0.5);
+  background: rgba(14, 159, 154, 0.1);
+}
+
+[data-mantine-color-scheme="dark"] .device-panel-collapsed-tab-active {
+  border-color: rgba(45, 185, 177, 0.55);
+  background: rgba(45, 185, 177, 0.16);
+}
+
+.device-panel-collapsed-tab-label {
   writing-mode: vertical-rl;
   text-orientation: mixed;
   font-size: 11px;
   font-weight: 600;
-  letter-spacing: 0.03em;
-  opacity: 0.9;
+  letter-spacing: 0.02em;
   user-select: none;
 }
 
-.device-panel-restore-tab-count {
+.device-panel-collapsed-tab-count {
   display: inline-flex;
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  font-size: 10px;
-  line-height: 1;
   gap: 2px;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1;
   color: rgba(89, 94, 102, 0.95);
   user-select: none;
 }
 
-[data-mantine-color-scheme="dark"] .device-panel-restore-tab-count {
+[data-mantine-color-scheme="dark"] .device-panel-collapsed-tab-count {
   color: rgba(208, 214, 225, 0.9);
 }
 
@@ -488,6 +507,15 @@ body::before {
   flex-wrap: wrap;
 }
 
+.pinned-command-more {
+  flex: 0 0 auto;
+  padding: 2px 4px;
+  border-right: 1px solid var(--card-border);
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+
 .pinned-command-send {
   flex: 0 0 auto;
   padding: 2px 6px;
@@ -496,6 +524,45 @@ body::before {
 
 [data-mantine-color-scheme="dark"] .pinned-command-chip {
   background: rgba(45, 185, 177, 0.12);
+}
+
+.command-deck-chip {
+  transition:
+    box-shadow 120ms ease,
+    opacity 120ms ease,
+    transform 120ms ease;
+}
+
+.command-deck-chip-dragging {
+  opacity: 0.58;
+}
+
+.command-deck-chip-drop-before {
+  box-shadow: inset 0 2px 0 #0e9f9a;
+}
+
+.command-deck-chip-drop-after {
+  box-shadow: inset 0 -2px 0 #0e9f9a;
+}
+
+.command-deck-chip-drop-swap {
+  box-shadow: 0 0 0 2px rgba(14, 159, 154, 0.35);
+}
+
+.command-deck-drag-handle {
+  cursor: grab;
+}
+
+.command-deck-drag-handle:active {
+  cursor: grabbing;
+}
+
+.command-deck-options-card {
+  background: rgba(148, 163, 184, 0.04);
+}
+
+[data-mantine-color-scheme="dark"] .command-deck-options-card {
+  background: rgba(148, 163, 184, 0.08);
 }
 
 .sequencer-var-chip {

@@ -60,7 +60,7 @@ export function SettingsModal({
             </Text>
             <Text size="xs" c="dimmed">
               UI profile export/import includes layout, plot panels, DAG
-              workspaces, and pinned commands.
+              workspaces, pinned commands, and command deck entries.
             </Text>
           </Stack>
           <Group gap="xs">

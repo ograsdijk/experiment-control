@@ -53,6 +53,7 @@ import {
   buildWsUrl,
   cleanupInstanceOrphans,
   fetchLogTail,
+  fetchCapabilities,
   fetchDevices,
   fetchGatewaySettings,
   fetchInstanceRuntimeStatus,
@@ -74,9 +75,11 @@ import {
   type InstanceRuntimeStatus,
 } from "./api";
 import { AppModalsLayer } from "./components/AppModalsLayer";
+import { CommandDeckPanel } from "./components/CommandDeckPanel";
 import { DashboardHeaderBar } from "./components/DashboardHeaderBar";
 import { DeviceCard } from "./components/DeviceCard";
 import { DeviceNameInline } from "./components/DeviceNameInline";
+import { coerceParamValue } from "./components/ParamInput";
 import { PlotPanel, computeTelemetryAutoYRange } from "./components/PlotPanel";
 import { PlotModalsLayer } from "./components/PlotModalsLayer";
 import { StreamParamsPanel } from "./components/StreamParamsPanel";
@@ -131,6 +134,7 @@ import type {
 } from "./features/profile/types";
 import {
   clampNavWidth,
+  normalizeCommandDeck,
   normalizePinnedCommands,
   normalizeUiProfile,
 } from "./features/profile/utils";
@@ -141,7 +145,11 @@ import { useDeviceCapabilitiesController } from "./features/devices/useDeviceCap
 import { useDeviceGridController } from "./features/devices/useDeviceGridController";
 import { useDeviceLifecycleController } from "./features/devices/useDeviceLifecycleController";
 import { useDeviceCommandController } from "./features/devices/useDeviceCommandController";
-import { buildParamDefaults } from "./features/devices/command_schema";
+import {
+  buildParamDefaults,
+  effectiveDeviceMemberParams,
+  mapDeviceActionForMember,
+} from "./features/devices/command_schema";
 import { useProcessCommandController } from "./features/processes/useProcessCommandController";
 import { useProcessLifecycleController } from "./features/processes/useProcessLifecycleController";
 import { useProcessesController } from "./features/processes/useProcessesController";
@@ -283,6 +291,7 @@ import { useSequencerController } from "./features/sequencer/useSequencerControl
 import { RingBuffer } from "./utils/ringBuffer";
 import { colorWithAlpha, traceColorAt } from "./utils/traceColors";
 import {
+  CommandDeckEntry,
   CapabilityMember,
   DeviceStatus,
   LogEntry,
@@ -349,6 +358,11 @@ function isErrorSeverity(severity: unknown): boolean {
   );
 }
 
+function normalizeDeckGroup(raw: string | null | undefined): string | null {
+  const text = String(raw ?? "").trim();
+  return text.length > 0 ? text : null;
+}
+
 export function App() {
   const [navWidth, setNavWidth] = useState(() => {
     try {
@@ -373,6 +387,15 @@ export function App() {
       // ignore storage errors
     }
     return false;
+  });
+  const [devicePanelTab, setDevicePanelTab] = useState<"devices" | "deck">(() => {
+    try {
+      const raw = String(localStorage.getItem("ecui.devicePanelTab") ?? "").trim();
+      return raw === "deck" ? "deck" : "devices";
+    } catch {
+      // ignore storage errors
+    }
+    return "devices";
   });
   const resizeRef = useRef<{ startX: number; startWidth: number } | null>(null);
   const [isResizing, setIsResizing] = useState(false);
@@ -564,6 +587,21 @@ export function App() {
       return {};
     }
   });
+  const [commandDeck, setCommandDeck] = useState<CommandDeckEntry[]>(() => {
+    try {
+      const raw = localStorage.getItem("ecui.commandDeck");
+      if (!raw) {
+        return [];
+      }
+      return normalizeCommandDeck(JSON.parse(raw));
+    } catch {
+      return [];
+    }
+  });
+  const [commandDeckBusyById, setCommandDeckBusyById] = useState<
+    Record<string, boolean>
+  >({});
+  const commandDeckIdRef = useRef(1);
   const buffersRef = useMemo(
     () => new Map<string, Map<string, RingBuffer>>(),
     []
@@ -1274,6 +1312,7 @@ export function App() {
         layout: {
           nav_width: navWidth,
           device_panel_collapsed: isDevicePanelCollapsed,
+          device_panel_tab: devicePanelTab,
           device_order: [...deviceOrder],
           telemetry_collapsed_by_device: { ...telemetryCollapsedByDevice },
         },
@@ -1282,6 +1321,7 @@ export function App() {
         },
         commands: {
           pinned_commands: { ...pinnedCommands },
+          command_deck: [...commandDeck],
         },
         analysis: {
           stream_workspaces: { ...streamWorkspaces },
@@ -1343,11 +1383,13 @@ export function App() {
       panelIdRef.current = profile.plotState.nextPanelId;
       setNavWidth(profile.navWidth);
       setDevicePanelCollapsed(profile.devicePanelCollapsed);
+      setDevicePanelTab(profile.devicePanelTab);
       setPanels(profile.plotState.panels);
       setActivePanelId(profile.plotState.activePanelId);
       setDeviceOrder(profile.deviceOrder);
       setTelemetryCollapsedByDevice(profile.telemetryCollapsedByDevice);
       setPinnedCommands(profile.pinnedCommands);
+      setCommandDeck(profile.commandDeck);
       {
         const migratedFromPanels: Record<string, StreamAnalysisWorkspaceConfig> = {};
         for (const panel of profile.plotState.panels) {
@@ -1531,6 +1573,14 @@ export function App() {
 
   useEffect(() => {
     try {
+      localStorage.setItem("ecui.commandDeck", JSON.stringify(commandDeck));
+    } catch {
+      // ignore storage errors
+    }
+  }, [commandDeck]);
+
+  useEffect(() => {
+    try {
       localStorage.setItem("ecui.deviceOrder", JSON.stringify(deviceOrder));
     } catch {
       // ignore storage errors
@@ -1621,6 +1671,25 @@ export function App() {
   }, [pinnedCommands, capabilitiesByDevice]);
 
   useEffect(() => {
+    commandDeckIdRef.current = Math.max(
+      commandDeckIdRef.current,
+      commandDeck.length + 1
+    );
+    setCommandDeckBusyById((prev) => {
+      const valid = new Set(commandDeck.map((entry) => entry.id));
+      let changed = false;
+      const next = { ...prev };
+      for (const key of Object.keys(next)) {
+        if (!valid.has(key)) {
+          delete next[key];
+          changed = true;
+        }
+      }
+      return changed ? next : prev;
+    });
+  }, [commandDeck]);
+
+  useEffect(() => {
     try {
       localStorage.setItem("ecui.navWidth", String(navWidth));
     } catch {
@@ -1638,6 +1707,14 @@ export function App() {
       // ignore storage errors
     }
   }, [isDevicePanelCollapsed]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem("ecui.devicePanelTab", devicePanelTab);
+    } catch {
+      // ignore storage errors
+    }
+  }, [devicePanelTab]);
 
   useEffect(() => {
     try {
@@ -2941,6 +3018,291 @@ export function App() {
     setPinnedBusyByKey,
     sendDeviceCommand,
   });
+
+  const createCommandDeckEntry = (
+    partial?: Partial<
+      Pick<
+        CommandDeckEntry,
+        "targetKind" | "targetId" | "action" | "label" | "group" | "paramsDraft"
+      >
+    >
+  ): CommandDeckEntry => {
+    const id = `deck-${Date.now()}-${commandDeckIdRef.current++}`;
+    const firstDeviceId = orderedDevices[0]?.device_id ?? "";
+    return {
+      id,
+      targetKind: partial?.targetKind ?? "device",
+      targetId: String(partial?.targetId ?? firstDeviceId).trim(),
+      action: String(partial?.action ?? "").trim(),
+      label:
+        typeof partial?.label === "string" && partial.label.trim().length > 0
+          ? partial.label.trim()
+          : undefined,
+      group: normalizeDeckGroup(partial?.group),
+      paramsDraft: { ...(partial?.paramsDraft ?? {}) },
+      createdAt: Date.now(),
+    };
+  };
+
+  const addCommandDeckEntry = (
+    partial?: Partial<
+      Pick<
+        CommandDeckEntry,
+        "targetKind" | "targetId" | "action" | "label" | "group" | "paramsDraft"
+      >
+    >
+  ) => {
+    const next = createCommandDeckEntry(partial);
+    setCommandDeck((prev) => [...prev, next]);
+    setDevicePanelTab("deck");
+    return next;
+  };
+
+  const addToDeckFromCommandModal = () => {
+    if (!commandDevice || !commandAction) {
+      notifications.show({
+        color: "red",
+        title: "Cannot add to deck",
+        message: "Select device and action first.",
+      });
+      return;
+    }
+    addCommandDeckEntry({
+      targetKind: "device",
+      targetId: commandDevice,
+      action: commandAction,
+      label: commandLabel,
+      paramsDraft: { ...commandParamValues },
+    });
+    notifications.show({
+      color: "teal",
+      title: "Added to command deck",
+      message: `${commandDevice}.${commandAction}`,
+    });
+  };
+
+  const updateCommandDeckEntry = (
+    entryId: string,
+    patch: Partial<
+      Pick<
+        CommandDeckEntry,
+        "targetId" | "action" | "label" | "group" | "paramsDraft"
+      >
+    >
+  ) => {
+    setCommandDeck((prev) =>
+      prev.map((entry) => {
+        if (entry.id !== entryId) {
+          return entry;
+        }
+        const nextTargetId =
+          patch.targetId !== undefined ? String(patch.targetId).trim() : entry.targetId;
+        const nextAction =
+          patch.action !== undefined ? String(patch.action).trim() : entry.action;
+        const nextLabel =
+          patch.label !== undefined
+            ? (() => {
+                const raw = String(patch.label);
+                return raw.trim().length > 0 ? raw : undefined;
+              })()
+            : entry.label ?? undefined;
+        const nextGroup =
+          patch.group !== undefined
+            ? normalizeDeckGroup(String(patch.group))
+            : normalizeDeckGroup(entry.group);
+        const nextParamsDraft =
+          patch.paramsDraft !== undefined
+            ? { ...patch.paramsDraft }
+            : { ...(entry.paramsDraft ?? {}) };
+        return {
+          ...entry,
+          targetId: nextTargetId,
+          action: nextAction,
+          label: nextLabel,
+          group: nextGroup,
+          paramsDraft: nextParamsDraft,
+        };
+      })
+    );
+  };
+
+  const removeCommandDeckEntry = (entryId: string) => {
+    setCommandDeck((prev) => prev.filter((entry) => entry.id !== entryId));
+  };
+
+  const moveCommandDeckEntryWithinGroup = (entryId: string, direction: -1 | 1) => {
+    setCommandDeck((prev) => {
+      const index = prev.findIndex((entry) => entry.id === entryId);
+      if (index < 0) {
+        return prev;
+      }
+      const currentGroup = normalizeDeckGroup(prev[index].group) ?? "Ungrouped";
+      const step = direction > 0 ? 1 : -1;
+      let targetIndex = -1;
+      for (let idx = index + step; idx >= 0 && idx < prev.length; idx += step) {
+        const group = normalizeDeckGroup(prev[idx].group) ?? "Ungrouped";
+        if (group === currentGroup) {
+          targetIndex = idx;
+          break;
+        }
+      }
+      if (targetIndex < 0) {
+        return prev;
+      }
+      const next = [...prev];
+      const current = next[index];
+      next[index] = next[targetIndex];
+      next[targetIndex] = current;
+      return next;
+    });
+  };
+
+  const reorderCommandDeckEntryWithinGroup = (
+    entryId: string,
+    targetEntryId: string,
+    mode: "before" | "after" | "swap"
+  ) => {
+    if (!entryId || !targetEntryId || entryId === targetEntryId) {
+      return;
+    }
+    setCommandDeck((prev) => {
+      const sourceIndex = prev.findIndex((entry) => entry.id === entryId);
+      const targetIndex = prev.findIndex((entry) => entry.id === targetEntryId);
+      if (sourceIndex < 0 || targetIndex < 0) {
+        return prev;
+      }
+      const sourceGroup = normalizeDeckGroup(prev[sourceIndex].group) ?? "Ungrouped";
+      const targetGroup = normalizeDeckGroup(prev[targetIndex].group) ?? "Ungrouped";
+      if (sourceGroup !== targetGroup) {
+        return prev;
+      }
+      const next = [...prev];
+      if (mode === "swap") {
+        const current = next[sourceIndex];
+        next[sourceIndex] = next[targetIndex];
+        next[targetIndex] = current;
+        return next;
+      }
+      const [sourceEntry] = next.splice(sourceIndex, 1);
+      const nextTargetIndex = next.findIndex((entry) => entry.id === targetEntryId);
+      if (nextTargetIndex < 0) {
+        return prev;
+      }
+      const insertIndex =
+        mode === "before" ? nextTargetIndex : nextTargetIndex + 1;
+      next.splice(insertIndex, 0, sourceEntry);
+      return next;
+    });
+  };
+
+  const setCommandDeckEntryGroup = (entryId: string, nextGroupRaw: string) => {
+    const nextGroup = normalizeDeckGroup(nextGroupRaw);
+    setCommandDeck((prev) => {
+      const index = prev.findIndex((entry) => entry.id === entryId);
+      if (index < 0) {
+        return prev;
+      }
+      const current = prev[index];
+      const currentGroup = normalizeDeckGroup(current.group);
+      if (currentGroup === nextGroup) {
+        return prev;
+      }
+      const remaining = [...prev.slice(0, index), ...prev.slice(index + 1)];
+      const updated: CommandDeckEntry = { ...current, group: nextGroup };
+      const normalizedTarget = nextGroup ?? "Ungrouped";
+      let insertAt = remaining.length;
+      for (let idx = remaining.length - 1; idx >= 0; idx -= 1) {
+        const group = normalizeDeckGroup(remaining[idx].group) ?? "Ungrouped";
+        if (group === normalizedTarget) {
+          insertAt = idx + 1;
+          break;
+        }
+      }
+      const next = [...remaining];
+      next.splice(insertAt, 0, updated);
+      return next;
+    });
+  };
+
+  const runCommandDeckEntry = async (entryId: string) => {
+    const entry = commandDeck.find((candidate) => candidate.id === entryId);
+    if (!entry) {
+      return;
+    }
+    if (entry.targetKind !== "device") {
+      notifications.show({
+        color: "red",
+        title: "Unsupported deck target",
+        message: `Unsupported target kind ${entry.targetKind}`,
+      });
+      return;
+    }
+    const deviceId = entry.targetId.trim();
+    const action = entry.action.trim();
+    if (!deviceId || !action) {
+      notifications.show({
+        color: "red",
+        title: "Invalid deck command",
+        message: "Device and action are required.",
+      });
+      return;
+    }
+    if (commandDeckBusyById[entryId]) {
+      return;
+    }
+    setCommandDeckBusyById((prev) => ({ ...prev, [entryId]: true }));
+    try {
+      let capabilities = capabilitiesByDevice[deviceId] ?? [];
+      if (capabilities.length === 0) {
+        const fetched = await fetchCapabilities(deviceId);
+        if (fetched.length > 0) {
+          setCapabilitiesByDevice((prev) => ({ ...prev, [deviceId]: fetched }));
+          capabilities = fetched;
+        }
+      }
+      const member = capabilities.find((candidate) => candidate.name === action);
+      const paramsMeta = effectiveDeviceMemberParams(member);
+      const draft = entry.paramsDraft ?? {};
+      const params: Record<string, unknown> = {};
+      for (const param of paramsMeta) {
+        const raw = (draft[param.name] ?? "").trim();
+        if (!raw) {
+          if (param.required) {
+            notifications.show({
+              color: "red",
+              title: "Missing parameter",
+              message: `${deviceId}.${action} requires ${param.name}`,
+            });
+            return;
+          }
+          continue;
+        }
+        params[param.name] = coerceParamValue(raw, param);
+      }
+      const mapped = mapDeviceActionForMember(member, action, params);
+      const resp = await sendDeviceCommand(
+        deviceId,
+        mapped.action,
+        mapped.params,
+        "command-deck"
+      );
+      if (!resp.ok) {
+        notifications.show({
+          color: "red",
+          title: "Command failed",
+          message: `${deviceId}.${mapped.action}`,
+        });
+        return;
+      }
+      notifications.show({
+        color: "teal",
+        title: "Command sent",
+        message: `${deviceId}.${mapped.action}`,
+      });
+    } finally {
+      setCommandDeckBusyById((prev) => ({ ...prev, [entryId]: false }));
+    }
+  };
 
   const copyJsonToClipboard = async (label: string, payload: unknown) => {
     if (typeof navigator === "undefined" || !navigator.clipboard?.writeText) {
@@ -6185,20 +6547,48 @@ export function App() {
           }`}
         >
           {isDevicePanelCollapsed ? (
-            <button
-              type="button"
-              className="device-panel-restore-tab"
-              onClick={expandDevicePanel}
-              aria-label={`Show device panel (${connectedDeviceCount} connected)`}
-              title={`Show devices (${connectedDeviceCount} connected / ${devices.length} total)`}
-            >
-              <span className="device-panel-restore-tab-count" aria-hidden="true">
-                <IconPlug size={12} />
-                <span>{connectedDeviceCount}</span>
-              </span>
-              <IconChevronRight size={14} />
-              <span className="device-panel-restore-tab-label">Devices</span>
-            </button>
+            <div className="device-panel-collapsed-card">
+              <button
+                type="button"
+                className={`device-panel-collapsed-tab${
+                  devicePanelTab === "devices"
+                    ? " device-panel-collapsed-tab-active"
+                    : ""
+                }`}
+                onClick={() => {
+                  setDevicePanelTab("devices");
+                  expandDevicePanel();
+                }}
+                aria-label={`Open devices panel (${connectedDeviceCount} connected)`}
+                title={`Devices (${connectedDeviceCount} connected / ${devices.length} total)`}
+              >
+                <span className="device-panel-collapsed-tab-count">
+                  <IconPlug size={12} />
+                  {connectedDeviceCount}
+                </span>
+                <span className="device-panel-collapsed-tab-label">Devices</span>
+              </button>
+              <button
+                type="button"
+                className={`device-panel-collapsed-tab${
+                  devicePanelTab === "deck"
+                    ? " device-panel-collapsed-tab-active"
+                    : ""
+                }`}
+                onClick={() => {
+                  setDevicePanelTab("deck");
+                  expandDevicePanel();
+                }}
+                aria-label={`Open command deck (${commandDeck.length} entries)`}
+                title={`Command deck (${commandDeck.length} entries)`}
+              >
+                <span className="device-panel-collapsed-tab-count">
+                  <IconTerminal2 size={12} />
+                  {commandDeck.length}
+                </span>
+                <span className="device-panel-collapsed-tab-label">Deck</span>
+              </button>
+            </div>
           ) : null}
           <section
             className={`device-panel${
@@ -6206,37 +6596,55 @@ export function App() {
             }`}
             style={{ width: isDevicePanelCollapsed ? 0 : navWidth }}
           >
-            <Group mb="sm" justify="space-between">
-              <Group gap={8}>
-                <Text fw={600}>Devices</Text>
-                <Button
-                  size="compact-xs"
-                  variant="light"
-                  color="indigo"
-                  loading={deviceStartAllBusy}
-                  disabled={disableStartAllButton}
-                  onClick={async () => {
-                    await handleStartAllDevices();
-                  }}
-                >
-                  Start all
-                </Button>
-                <Button
-                  size="compact-xs"
-                  variant="light"
-                  color="teal"
-                  loading={deviceConnectAllBusy}
-                  disabled={disableConnectAllButton}
-                  onClick={async () => {
-                    await handleConnectAllDevices();
-                  }}
-                >
-                  Connect all
-                </Button>
+            <Group mb="sm" justify="space-between" align="center">
+              <Group gap={8} align="center">
+                <SegmentedControl
+                  size="xs"
+                  value={devicePanelTab}
+                  onChange={(value) =>
+                    setDevicePanelTab(value === "deck" ? "deck" : "devices")
+                  }
+                  data={[
+                    { value: "devices", label: "Devices" },
+                    { value: "deck", label: "Command Deck" },
+                  ]}
+                />
+                {devicePanelTab === "devices" ? (
+                  <>
+                    <Button
+                      size="compact-xs"
+                      variant="light"
+                      color="indigo"
+                      loading={deviceStartAllBusy}
+                      disabled={disableStartAllButton}
+                      onClick={async () => {
+                        await handleStartAllDevices();
+                      }}
+                    >
+                      Start all
+                    </Button>
+                    <Button
+                      size="compact-xs"
+                      variant="light"
+                      color="teal"
+                      loading={deviceConnectAllBusy}
+                      disabled={disableConnectAllButton}
+                      onClick={async () => {
+                        await handleConnectAllDevices();
+                      }}
+                    >
+                      Connect all
+                    </Button>
+                  </>
+                ) : null}
               </Group>
               <Group
                 gap={6}
-                title={`${connectedDeviceCount} connected / ${devices.length} total`}
+                title={
+                  devicePanelTab === "devices"
+                    ? `${connectedDeviceCount} connected / ${devices.length} total`
+                    : `${commandDeck.length} command deck entries`
+                }
               >
                 <ActionIcon
                   size="sm"
@@ -6248,110 +6656,223 @@ export function App() {
                 >
                   <IconChevronLeft size={16} />
                 </ActionIcon>
-                <IconPlug size={16} />
+                {devicePanelTab === "devices" ? (
+                  <IconPlug size={16} />
+                ) : (
+                  <IconTerminal2 size={16} />
+                )}
                 <Text size="xs" c="dimmed">
-                  {connectedDeviceCount}
+                  {devicePanelTab === "devices"
+                    ? connectedDeviceCount
+                    : commandDeck.length}
                 </Text>
               </Group>
             </Group>
             <ScrollArea h="calc(100vh - 180px)" type="never">
-              <div
-                className="device-grid"
-                onDragOver={handleDeviceGridDragOver}
-                onDrop={handleDeviceGridDrop}
-                onDragLeave={handleDeviceGridDragLeave}
-              >
-                {orderedDevices.map((device, idx) => (
-                  <DeviceCard
-                    key={device.device_id}
-                    device={device}
-                    signals={latestByDevice[device.device_id]}
-                    busy={Boolean(deviceBusyById[device.device_id])}
-                    onConnect={() => handleDeviceConnect(device.device_id)}
-                    onDisconnect={() => handleDeviceDisconnect(device.device_id)}
-                    onRestart={() => handleDeviceRestart(device.device_id)}
-                    onPlot={(signal) => onPlotSignal(device.device_id, signal)}
-                    onCommand={() => openCommand(device.device_id)}
-                    onDragSignal={(signal, event) =>
-                      handleSignalDragStart(device.device_id, signal, event)
-                    }
-                    onDeviceDragStart={(event) =>
-                      handleDeviceDragStart(device.device_id, event)
-                    }
-                    onDeviceDragEnd={handleDeviceDragEnd}
-                    onDeviceDragOver={(event) =>
-                      handleDeviceDragOver(device.device_id, event)
-                    }
-                    onDeviceDragLeave={() => handleDeviceDragLeave(device.device_id)}
-                    onDeviceDrop={(event) => handleDeviceDrop(device.device_id, event)}
-                    telemetryCollapsed={Boolean(
-                      telemetryCollapsedByDevice[device.device_id]
-                    )}
-                    onTelemetryToggle={() =>
-                      handleDeviceTelemetryToggle(device.device_id)
-                    }
-                    dragMode={(() => {
-                      if (dragOverDeviceTarget?.deviceId === device.device_id) {
-                        return dragOverDeviceTarget.mode;
+              {devicePanelTab === "devices" ? (
+                <div
+                  className="device-grid"
+                  onDragOver={handleDeviceGridDragOver}
+                  onDrop={handleDeviceGridDrop}
+                  onDragLeave={handleDeviceGridDragLeave}
+                >
+                  {orderedDevices.map((device, idx) => (
+                    <DeviceCard
+                      key={device.device_id}
+                      device={device}
+                      signals={latestByDevice[device.device_id]}
+                      busy={Boolean(deviceBusyById[device.device_id])}
+                      onConnect={() => handleDeviceConnect(device.device_id)}
+                      onDisconnect={() => handleDeviceDisconnect(device.device_id)}
+                      onRestart={() => handleDeviceRestart(device.device_id)}
+                      onPlot={(signal) => onPlotSignal(device.device_id, signal)}
+                      onCommand={() => openCommand(device.device_id)}
+                      onDragSignal={(signal, event) =>
+                        handleSignalDragStart(device.device_id, signal, event)
                       }
-                      if (!dragDeviceId || deviceInsertIndex == null) {
+                      onDeviceDragStart={(event) =>
+                        handleDeviceDragStart(device.device_id, event)
+                      }
+                      onDeviceDragEnd={handleDeviceDragEnd}
+                      onDeviceDragOver={(event) =>
+                        handleDeviceDragOver(device.device_id, event)
+                      }
+                      onDeviceDragLeave={() => handleDeviceDragLeave(device.device_id)}
+                      onDeviceDrop={(event) => handleDeviceDrop(device.device_id, event)}
+                      telemetryCollapsed={Boolean(
+                        telemetryCollapsedByDevice[device.device_id]
+                      )}
+                      onTelemetryToggle={() =>
+                        handleDeviceTelemetryToggle(device.device_id)
+                      }
+                      dragMode={(() => {
+                        if (dragOverDeviceTarget?.deviceId === device.device_id) {
+                          return dragOverDeviceTarget.mode;
+                        }
+                        if (!dragDeviceId || deviceInsertIndex == null) {
+                          return null;
+                        }
+                        const withoutDragged = orderedDevices
+                          .map((entry) => entry.device_id)
+                          .filter((entryId) => entryId !== dragDeviceId);
+                        const idxWithoutDragged = withoutDragged.indexOf(device.device_id);
+                        if (idxWithoutDragged < 0) {
+                          return null;
+                        }
+                        if (deviceInsertIndex === idxWithoutDragged) {
+                          return "before";
+                        }
+                        if (
+                          deviceInsertIndex === withoutDragged.length &&
+                          idxWithoutDragged === withoutDragged.length - 1
+                        ) {
+                          return "after";
+                        }
                         return null;
-                      }
-                      const withoutDragged = orderedDevices
-                        .map((entry) => entry.device_id)
-                        .filter((entryId) => entryId !== dragDeviceId);
-                      const idxWithoutDragged = withoutDragged.indexOf(device.device_id);
-                      if (idxWithoutDragged < 0) {
-                        return null;
-                      }
-                      if (deviceInsertIndex === idxWithoutDragged) {
-                        return "before";
-                      }
-                      if (
-                        deviceInsertIndex === withoutDragged.length &&
-                        idxWithoutDragged === withoutDragged.length - 1
-                      ) {
-                        return "after";
-                      }
-                      return null;
-                    })()}
-                    isDragging={dragDeviceId === device.device_id}
-                    pinnedCommands={pinnedCommands[device.device_id] ?? []}
-                    onPinnedCommand={(action) => openCommand(device.device_id, action)}
-                    capabilities={capabilitiesByDevice[device.device_id] ?? []}
-                    pinnedParamValuesByAction={Object.fromEntries(
-                      (pinnedCommands[device.device_id] ?? []).map((entry) => [
-                        entry.action,
-                        pinnedParamDrafts[
-                          pinnedCommandKey(device.device_id, entry.action)
-                        ] ?? {},
-                      ])
-                    )}
-                    pinnedBusyByAction={Object.fromEntries(
-                      (pinnedCommands[device.device_id] ?? []).map((entry) => [
-                        entry.action,
-                        Boolean(
-                          pinnedBusyByKey[
+                      })()}
+                      isDragging={dragDeviceId === device.device_id}
+                      pinnedCommands={pinnedCommands[device.device_id] ?? []}
+                      onPinnedCommand={(action) => openCommand(device.device_id, action)}
+                      onAddPinnedToDeck={(action) => {
+                        const draftKey = pinnedCommandKey(device.device_id, action);
+                        const label =
+                          (pinnedCommands[device.device_id] ?? []).find(
+                            (entry) => entry.action === action
+                          )?.label ?? undefined;
+                        addCommandDeckEntry({
+                          targetKind: "device",
+                          targetId: device.device_id,
+                          action,
+                          label,
+                          paramsDraft: { ...(pinnedParamDrafts[draftKey] ?? {}) },
+                        });
+                        notifications.show({
+                          color: "teal",
+                          title: "Added to command deck",
+                          message: `${device.device_id}.${action}`,
+                        });
+                      }}
+                      onAddAllPinnedToDeck={() => {
+                        const entries = pinnedCommands[device.device_id] ?? [];
+                        if (entries.length === 0) {
+                          notifications.show({
+                            color: "yellow",
+                            title: "No pinned commands",
+                            message: `${device.device_id} has no pinned commands.`,
+                          });
+                          return;
+                        }
+                        for (const entry of entries) {
+                          const action = entry.action;
+                          const draftKey = pinnedCommandKey(device.device_id, action);
+                          addCommandDeckEntry({
+                            targetKind: "device",
+                            targetId: device.device_id,
+                            action,
+                            label: entry.label ?? undefined,
+                            paramsDraft: { ...(pinnedParamDrafts[draftKey] ?? {}) },
+                          });
+                        }
+                        notifications.show({
+                          color: "teal",
+                          title: "Added pinned commands to deck",
+                          message: `${device.device_id}: ${entries.length} command${
+                            entries.length === 1 ? "" : "s"
+                          }`,
+                        });
+                      }}
+                      capabilities={capabilitiesByDevice[device.device_id] ?? []}
+                      pinnedParamValuesByAction={Object.fromEntries(
+                        (pinnedCommands[device.device_id] ?? []).map((entry) => [
+                          entry.action,
+                          pinnedParamDrafts[
                             pinnedCommandKey(device.device_id, entry.action)
-                          ]
-                        ),
-                      ])
-                    )}
-                    onPinnedParamChange={(action, paramName, value) =>
-                      handlePinnedParamChange(
-                        device.device_id,
-                        action,
-                        paramName,
-                        value
-                      )
+                          ] ?? {},
+                        ])
+                      )}
+                      pinnedBusyByAction={Object.fromEntries(
+                        (pinnedCommands[device.device_id] ?? []).map((entry) => [
+                          entry.action,
+                          Boolean(
+                            pinnedBusyByKey[
+                              pinnedCommandKey(device.device_id, entry.action)
+                            ]
+                          ),
+                        ])
+                      )}
+                      onPinnedParamChange={(action, paramName, value) =>
+                        handlePinnedParamChange(
+                          device.device_id,
+                          action,
+                          paramName,
+                          value
+                        )
+                      }
+                      onPinnedSend={(action) =>
+                        handlePinnedCommandSend(device.device_id, action)
+                      }
+                      index={idx}
+                    />
+                  ))}
+                </div>
+              ) : (
+                <CommandDeckPanel
+                  entries={commandDeck}
+                  devices={orderedDevices}
+                  capabilitiesByDevice={capabilitiesByDevice}
+                  busyById={commandDeckBusyById}
+                  onAddEntry={() => {
+                    const created = addCommandDeckEntry();
+                    if (!created.targetId && orderedDevices[0]?.device_id) {
+                      updateCommandDeckEntry(created.id, {
+                        targetId: orderedDevices[0].device_id,
+                      });
                     }
-                    onPinnedSend={(action) =>
-                      handlePinnedCommandSend(device.device_id, action)
+                  }}
+                  onRunEntry={(entryId) => {
+                    void runCommandDeckEntry(entryId);
+                  }}
+                  onRemoveEntry={removeCommandDeckEntry}
+                  onMoveEntryUp={(entryId) =>
+                    moveCommandDeckEntryWithinGroup(entryId, -1)
+                  }
+                  onMoveEntryDown={(entryId) =>
+                    moveCommandDeckEntryWithinGroup(entryId, 1)
+                  }
+                  onReorderEntry={(entryId, targetEntryId, mode) =>
+                    reorderCommandDeckEntryWithinGroup(
+                      entryId,
+                      targetEntryId,
+                      mode
+                    )
+                  }
+                  onUpdateEntryTarget={(entryId, targetId) =>
+                    updateCommandDeckEntry(entryId, { targetId })
+                  }
+                  onUpdateEntryAction={(entryId, action) =>
+                    updateCommandDeckEntry(entryId, { action })
+                  }
+                  onUpdateEntryLabel={(entryId, label) =>
+                    updateCommandDeckEntry(entryId, { label })
+                  }
+                  onUpdateEntryGroup={(entryId, group) =>
+                    setCommandDeckEntryGroup(entryId, group)
+                  }
+                  onUpdateEntryParam={(entryId, paramName, value) => {
+                    const entry =
+                      commandDeck.find((candidate) => candidate.id === entryId) ?? null;
+                    if (!entry) {
+                      return;
                     }
-                    index={idx}
-                  />
-                ))}
-              </div>
+                    updateCommandDeckEntry(entryId, {
+                      paramsDraft: {
+                        ...(entry.paramsDraft ?? {}),
+                        [paramName]: value,
+                      },
+                    });
+                  }}
+                />
+              )}
             </ScrollArea>
           </section>
           {isDevicePanelCollapsed ? null : (
@@ -7626,6 +8147,8 @@ export function App() {
           isPinned,
           pinDisabled: !commandAction || !commandDevice,
           onTogglePin: handlePinClick,
+          deckDisabled: !commandAction || !commandDevice,
+          onAddToDeck: addToDeckFromCommandModal,
           onExecute: executeCommand,
         }}
       />

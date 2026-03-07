@@ -1,10 +1,6 @@
-﻿import type { PinnedCommand } from "../../types";
+import type { CommandDeckEntry, PinnedCommand } from "../../types";
 import { normalizeBooleanMap, normalizeStringList } from "../common/normalize";
-import type {
-  PinnedCommandMap,
-  PlotState,
-  UiProfileState,
-} from "./types";
+import type { PinnedCommandMap, PlotState, UiProfileState } from "./types";
 
 export function clampNavWidth(
   value: number,
@@ -56,6 +52,85 @@ export function normalizePinnedCommands(raw: unknown): PinnedCommandMap {
   return result;
 }
 
+export function normalizeCommandDeck(raw: unknown): CommandDeckEntry[] {
+  if (!Array.isArray(raw)) {
+    return [];
+  }
+  const out: CommandDeckEntry[] = [];
+  const seenIds = new Set<string>();
+  for (let index = 0; index < raw.length; index += 1) {
+    const item = raw[index];
+    if (!item || typeof item !== "object") {
+      continue;
+    }
+    const obj = item as Record<string, unknown>;
+    const targetKindRaw = String(
+      obj.targetKind ?? obj.target_kind ?? "device"
+    ).trim();
+    const targetKind = targetKindRaw === "device" ? "device" : null;
+    if (!targetKind) {
+      continue;
+    }
+    const targetId = String(obj.targetId ?? obj.target_id ?? "").trim();
+    const action = String(obj.action ?? "").trim();
+    if (!targetId || !action) {
+      continue;
+    }
+    let id = String(obj.id ?? "").trim();
+    if (!id) {
+      id = `deck-${index}-${targetId}-${action}`;
+    }
+    if (seenIds.has(id)) {
+      continue;
+    }
+    seenIds.add(id);
+    const labelRaw = obj.label;
+    const label =
+      typeof labelRaw === "string" && labelRaw.trim().length > 0
+        ? labelRaw.trim()
+        : undefined;
+    const groupRaw = obj.group;
+    const group =
+      typeof groupRaw === "string" && groupRaw.trim().length > 0
+        ? groupRaw.trim()
+        : undefined;
+    const createdAtRaw = obj.createdAt ?? obj.created_at;
+    const createdAt =
+      typeof createdAtRaw === "number" && Number.isFinite(createdAtRaw)
+        ? createdAtRaw
+        : undefined;
+    const paramsDraftRaw = obj.paramsDraft ?? obj.params_draft;
+    const paramsDraft: Record<string, string> = {};
+    if (paramsDraftRaw && typeof paramsDraftRaw === "object") {
+      for (const [key, value] of Object.entries(
+        paramsDraftRaw as Record<string, unknown>
+      )) {
+        if (typeof key !== "string" || !key.trim()) {
+          continue;
+        }
+        if (typeof value === "string") {
+          paramsDraft[key] = value;
+        } else if (value != null) {
+          paramsDraft[key] = String(value);
+        } else {
+          paramsDraft[key] = "";
+        }
+      }
+    }
+    out.push({
+      id,
+      targetKind,
+      targetId,
+      action,
+      label,
+      group,
+      paramsDraft,
+      createdAt,
+    });
+  }
+  return out;
+}
+
 export function normalizeUiProfile(
   raw: unknown,
   opts: {
@@ -92,6 +167,8 @@ export function normalizeUiProfile(
   const navWidthRaw = layout.nav_width ?? layout.navWidth ?? obj.navWidth;
   const deviceOrderRaw =
     layout.device_order ?? layout.deviceOrder ?? obj.deviceOrder;
+  const devicePanelTabRaw =
+    layout.device_panel_tab ?? layout.devicePanelTab ?? obj.devicePanelTab;
   const devicePanelCollapsedRaw =
     layout.device_panel_collapsed ??
     layout.devicePanelCollapsed ??
@@ -102,6 +179,8 @@ export function normalizeUiProfile(
     obj.telemetryCollapsedByDevice;
   const pinnedCommandsRaw =
     commands.pinned_commands ?? commands.pinnedCommands ?? obj.pinnedCommands;
+  const commandDeckRaw =
+    commands.command_deck ?? commands.commandDeck ?? obj.commandDeck;
   const streamWorkspacesRaw =
     analysis.stream_workspaces ??
     analysis.streamWorkspaces ??
@@ -121,9 +200,11 @@ export function normalizeUiProfile(
   const hasKnownData =
     navWidthRaw !== undefined ||
     devicePanelCollapsedRaw !== undefined ||
+    devicePanelTabRaw !== undefined ||
     deviceOrderRaw !== undefined ||
     collapsedRaw !== undefined ||
     pinnedCommandsRaw !== undefined ||
+    commandDeckRaw !== undefined ||
     streamWorkspacesRaw !== undefined ||
     (plotStateRaw &&
       typeof plotStateRaw === "object" &&
@@ -141,10 +222,12 @@ export function normalizeUiProfile(
   return {
     navWidth,
     devicePanelCollapsed: Boolean(devicePanelCollapsedRaw),
+    devicePanelTab: devicePanelTabRaw === "deck" ? "deck" : "devices",
     plotState: opts.normalizePlotState(plotStateRaw),
     deviceOrder: normalizeStringList(deviceOrderRaw),
     telemetryCollapsedByDevice: normalizeBooleanMap(collapsedRaw),
     pinnedCommands: normalizePinnedCommands(pinnedCommandsRaw),
+    commandDeck: normalizeCommandDeck(commandDeckRaw),
     streamWorkspaces: opts.normalizeStreamWorkspaceRecord(streamWorkspacesRaw),
   };
 }
