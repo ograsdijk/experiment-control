@@ -17,6 +17,9 @@ init_kwargs:
   trace_offset_counts: 1200
   amplitude_peak_counts: 2600.0
   trace_noise_sigma_counts: 30.0
+device_metadata:
+  device_type: dummy_resonance_trace
+  location: bench_a
 telemetry_calls:
   - method: read_frequency_setpoint_hz
     outputs:

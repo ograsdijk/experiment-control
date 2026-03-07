@@ -551,6 +551,13 @@ Runtime metadata hooks (HDF writer behavior at measurement/file start):
   - stream attrs: `stream_calls[].outputs[].attrs` then YAML `stream_metadata`
     then runtime `stream_metadata` hook result
 
+Influx writer (wide mode) also consumes `manager.device_config`:
+- Uses `device_metadata[device_type_key]` (default key: `device_type`) to resolve
+  measurement names by device type.
+- Uses selected device metadata keys (for example `location`) as tags.
+- Skips federated mirrors (`source_kind=federated` / `is_remote=true`) so only
+  owning instances write their own telemetry.
+
 ### `manager.run_metadata`
 - Producer: manager
 - Consumers: HDF writer

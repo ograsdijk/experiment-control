@@ -73,6 +73,10 @@ trace_spec = DeviceSpec(
     {"port": 23456},
     telemetry_calls=[],
     stream_calls=stream_calls,
+    device_metadata={
+        "device_type": "dummy_trace",
+        "location": "bench_a",
+    },
     stream_metadata={
         "trace": {
             "channel_descriptions": ["PMT", "PD", "E", "B", "spare"],

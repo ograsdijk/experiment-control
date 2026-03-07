@@ -5,6 +5,9 @@ driver:
   class_name: DummyTraceDriver
 init_kwargs:
   port: 23456
+device_metadata:
+  device_type: dummy_trace
+  location: bench_a
 telemetry_calls: []
 stream_calls:
   - method: acquire_trace

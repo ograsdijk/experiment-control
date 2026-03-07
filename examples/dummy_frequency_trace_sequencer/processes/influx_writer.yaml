@@ -12,10 +12,18 @@ init_kwargs:
       token: "${INFLUX_TOKEN}"
       org: "centrex"
       bucket: "telemetry"
-      measurement: "telemetry_v1"
+      measurement: "unknown_device"
       precision: "ns"
       request_timeout_s: 5.0
   default_destination: "default"
+  # Optional per-device overrides:
+  # routes:
+  #   trace1:
+  #     destination: "default"
+  #     measurement: "dummy_resonance_trace"
+  #     device_type: "dummy_resonance_trace"
+  #     tags:
+  #       location: "bench_a"
   routes: {}
   disabled_devices: []
   enabled: true
@@ -24,15 +32,10 @@ init_kwargs:
   max_queue_points: 100000
   overflow_policy: "drop_oldest"
   include_device_type_tag: true
-  quantity_from_units:
-    Hz: frequency
-    GHz: frequency
-    THz: frequency
-    dBm: power
-    mW: power
-    C: temperature
-    mmHg: pressure
-  quantity_overrides: {}
+  include_quality_fields: true
+  include_unit_fields: false
+  device_type_key: "device_type"
+  device_tag_keys: ["location"]
 
 heartbeat_period_s: 1.0
 heartbeat_timeout_s: 3.0

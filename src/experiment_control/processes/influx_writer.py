@@ -48,8 +48,9 @@ class InfluxDestination:
 @dataclass(frozen=True)
 class DeviceRoute:
     destination: str
-    quantity_overrides: dict[str, str]
+    measurement: str | None
     device_type: str | None
+    tags: dict[str, str]
 
 
 @dataclass(frozen=True)
@@ -73,15 +74,9 @@ def _expand_env_vars(text: str) -> str:
     return os.path.expandvars(text)
 
 
-def _normalize_unit_key(unit: str) -> str:
-    return str(unit).strip().lower()
-
-
-def _normalize_quantity(value: Any) -> str | None:
-    if value is None:
-        return None
-    text = str(value).strip().lower().replace(" ", "_")
-    return text or None
+def _normalize_meta_tag_key(raw: Any) -> str | None:
+    text = str(raw).strip()
+    return text if text else None
 
 
 def _escape_measurement(value: str) -> str:
@@ -185,10 +180,31 @@ def _timestamp_ns_from_payload(
     return int(time.time() * 1_000_000_000)
 
 
-def _extract_device_type_from_config(payload: Json) -> str | None:
+def _timestamp_ns_from_bundle(payload: Json) -> int:
+    ts_obj = payload.get("ts")
+    if isinstance(ts_obj, dict):
+        t_wall = ts_obj.get("t_wall")
+        try:
+            return int(float(t_wall) * 1_000_000_000)
+        except Exception:
+            pass
+    signals = payload.get("signals")
+    if isinstance(signals, dict):
+        for signal_payload in signals.values():
+            if not isinstance(signal_payload, dict):
+                continue
+            ts_ns = _timestamp_ns_from_payload(signal_payload, payload)
+            if ts_ns > 0:
+                return ts_ns
+    return int(time.time() * 1_000_000_000)
+
+
+def _extract_device_type_from_config(
+    payload: Json, *, metadata_key: str = "device_type"
+) -> str | None:
     device_metadata = payload.get("device_metadata")
     if isinstance(device_metadata, dict):
-        from_meta = device_metadata.get("device_type")
+        from_meta = device_metadata.get(metadata_key)
         if isinstance(from_meta, str) and from_meta.strip():
             return from_meta.strip()
 
@@ -211,45 +227,6 @@ def _extract_device_type_from_config(payload: Json) -> str | None:
     return text or None
 
 
-def _parse_quantity_overrides(raw: Any) -> dict[str, dict[str, str]]:
-    out: dict[str, dict[str, str]] = {"*": {}}
-    if raw is None:
-        return out
-    if not isinstance(raw, dict):
-        return out
-
-    for key, value in raw.items():
-        if isinstance(value, dict):
-            dev_id = str(key).strip()
-            if not dev_id:
-                continue
-            dev_map = out.setdefault(dev_id, {})
-            for sig, quantity_raw in value.items():
-                sig_name = str(sig).strip()
-                quantity = _normalize_quantity(quantity_raw)
-                if not sig_name or quantity is None:
-                    continue
-                dev_map[sig_name] = quantity
-            continue
-
-        quantity = _normalize_quantity(value)
-        if quantity is None:
-            continue
-        text_key = str(key).strip()
-        if not text_key:
-            continue
-        if "." in text_key:
-            dev_id, sig_name = text_key.split(".", 1)
-            dev_id = dev_id.strip()
-            sig_name = sig_name.strip()
-            if not dev_id or not sig_name:
-                continue
-            out.setdefault(dev_id, {})[sig_name] = quantity
-            continue
-        out["*"][text_key] = quantity
-    return out
-
-
 class InfluxWriterProcess(ManagedProcessBase):
     def __init__(
         self,
@@ -270,9 +247,11 @@ class InfluxWriterProcess(ManagedProcessBase):
         write_flush_interval_ms: int = 1000,
         max_queue_points: int = 100_000,
         overflow_policy: str = "drop_oldest",
-        quantity_from_units: dict[str, Any] | None = None,
-        quantity_overrides: dict[str, Any] | None = None,
         include_device_type_tag: bool = True,
+        include_quality_fields: bool = True,
+        include_unit_fields: bool = False,
+        device_type_key: str = "device_type",
+        device_tag_keys: list[str] | None = None,
     ) -> None:
         super().__init__(
             process_id=process_id,
@@ -303,6 +282,13 @@ class InfluxWriterProcess(ManagedProcessBase):
         self._overflow_policy = overflow
         self._enabled = bool(enabled)
         self._include_device_type_tag = bool(include_device_type_tag)
+        self._include_quality_fields = bool(include_quality_fields)
+        self._include_unit_fields = bool(include_unit_fields)
+        type_key = str(device_type_key).strip()
+        self._device_type_key = type_key if type_key else "device_type"
+        self._device_tag_keys = self._parse_device_tag_keys(
+            device_tag_keys if device_tag_keys is not None else ["location"]
+        )
         self._disabled_devices: set[str] = {
             str(device_id).strip()
             for device_id in (disabled_devices or [])
@@ -314,19 +300,18 @@ class InfluxWriterProcess(ManagedProcessBase):
             default_destination=default_destination
         )
         self._routes = self._parse_routes(routes or {})
-        self._quantity_from_units = self._parse_quantity_from_units(
-            quantity_from_units or {}
-        )
-        self._quantity_overrides = _parse_quantity_overrides(quantity_overrides or {})
 
         # Runtime metadata from manager.device_config
         self._device_type_by_id: dict[str, str] = {}
+        self._device_tags_by_id: dict[str, dict[str, str]] = {}
+        self._remote_device_ids: set[str] = set()
 
         self._queue: deque[QueuedPoint] = deque()
         self._points_received = 0
         self._points_queued = 0
         self._points_written = 0
         self._points_skipped_invalid = 0
+        self._points_skipped_remote = 0
         self._points_dropped_overflow = 0
         self._write_errors = 0
         self._batches_written = 0
@@ -369,9 +354,9 @@ class InfluxWriterProcess(ManagedProcessBase):
             token = _expand_env_vars(str(item.get("token", "")).strip())
             if not url or not org or not bucket:
                 continue
-            measurement = str(item.get("measurement", "telemetry_v1")).strip()
+            measurement = str(item.get("measurement", "unknown_device")).strip()
             if not measurement:
-                measurement = "telemetry_v1"
+                measurement = "unknown_device"
             precision = str(item.get("precision", "ns")).strip().lower() or "ns"
             if precision not in {"ns", "us", "ms", "s"}:
                 precision = "ns"
@@ -421,36 +406,48 @@ class InfluxWriterProcess(ManagedProcessBase):
             destination = str(item.get("destination", self._default_destination)).strip()
             if destination not in self._destinations:
                 continue
-            quantity_overrides = {}
-            raw_q = item.get("quantity_overrides")
-            if isinstance(raw_q, dict):
-                for sig, quantity_raw in raw_q.items():
-                    sig_name = str(sig).strip()
-                    quantity = _normalize_quantity(quantity_raw)
-                    if sig_name and quantity is not None:
-                        quantity_overrides[sig_name] = quantity
             device_type_raw = item.get("device_type")
             device_type = (
                 str(device_type_raw).strip()
                 if isinstance(device_type_raw, str) and str(device_type_raw).strip()
                 else None
             )
+            measurement_raw = item.get("measurement")
+            measurement = (
+                str(measurement_raw).strip()
+                if isinstance(measurement_raw, str) and str(measurement_raw).strip()
+                else None
+            )
+            tags: dict[str, str] = {}
+            tags_raw = item.get("tags")
+            if isinstance(tags_raw, dict):
+                for key_raw, value_raw in tags_raw.items():
+                    key = str(key_raw).strip()
+                    value = str(value_raw).strip()
+                    if key and value:
+                        tags[key] = value
             out[device_id] = DeviceRoute(
                 destination=destination,
-                quantity_overrides=quantity_overrides,
+                measurement=measurement,
                 device_type=device_type,
+                tags=tags,
             )
         return out
 
     @staticmethod
-    def _parse_quantity_from_units(raw: dict[str, Any]) -> dict[str, str]:
-        out: dict[str, str] = {}
-        for unit_raw, quantity_raw in raw.items():
-            unit_key = _normalize_unit_key(unit_raw)
-            quantity = _normalize_quantity(quantity_raw)
-            if not unit_key or quantity is None:
+    def _parse_device_tag_keys(raw: list[str] | tuple[str, ...] | Any) -> list[str]:
+        out: list[str] = []
+        seen: set[str] = set()
+        if isinstance(raw, (list, tuple)):
+            items = list(raw)
+        else:
+            items = [raw]
+        for item in items:
+            key = _normalize_meta_tag_key(item)
+            if key is None or key in seen:
                 continue
-            out[unit_key] = quantity
+            seen.add(key)
+            out.append(key)
         return out
 
     def _refresh_device_catalog(self) -> None:
@@ -470,11 +467,32 @@ class InfluxWriterProcess(ManagedProcessBase):
         device_id = str(payload.get("device_id", "")).strip()
         if not device_id:
             return
+        source_kind = str(payload.get("source_kind", "")).strip().lower()
+        is_remote = bool(payload.get("is_remote")) or source_kind == "federated"
+        if is_remote:
+            self._remote_device_ids.add(device_id)
+        else:
+            self._remote_device_ids.discard(device_id)
+
+        tags: dict[str, str] = {}
+        device_metadata = payload.get("device_metadata")
+        if isinstance(device_metadata, dict):
+            for key in self._device_tag_keys:
+                value = device_metadata.get(key)
+                if value is None:
+                    continue
+                value_text = str(value).strip()
+                if value_text:
+                    tags[key] = value_text
+        self._device_tags_by_id[device_id] = tags
+
         route = self._routes.get(device_id)
         if route is not None and route.device_type:
             self._device_type_by_id[device_id] = route.device_type
             return
-        device_type = _extract_device_type_from_config(payload)
+        device_type = _extract_device_type_from_config(
+            payload, metadata_key=self._device_type_key
+        )
         if device_type:
             self._device_type_by_id[device_id] = device_type
 
@@ -484,60 +502,16 @@ class InfluxWriterProcess(ManagedProcessBase):
             return route.destination
         return self._default_destination
 
-    def _resolve_device_type(self, device_id: str) -> str | None:
+    def _resolve_measurement(self, *, device_id: str, destination: InfluxDestination) -> str:
         route = self._routes.get(device_id)
+        if route is not None and route.measurement:
+            return route.measurement
         if route is not None and route.device_type:
             return route.device_type
-        return self._device_type_by_id.get(device_id)
-
-    def _resolve_quantity(
-        self,
-        *,
-        device_id: str,
-        signal: str,
-        unit: str,
-        value: Any,
-    ) -> str | None:
-        route = self._routes.get(device_id)
-        if route is not None:
-            q = route.quantity_overrides.get(signal)
-            if q is not None:
-                return q
-
-        device_map = self._quantity_overrides.get(device_id, {})
-        if signal in device_map:
-            return device_map[signal]
-
-        wildcard_map = self._quantity_overrides.get("*", {})
-        if signal in wildcard_map:
-            return wildcard_map[signal]
-
-        if unit:
-            q = self._quantity_from_units.get(_normalize_unit_key(unit))
-            if q is not None:
-                return q
-
-        # Unitless fallback heuristics (keep deterministic and conservative).
-        sig = signal.strip().lower().replace(" ", "_")
-        if isinstance(value, bool):
-            return "state"
-        if any(k in sig for k in ("enable", "state", "lock", "interlock", "settled")):
-            return "state"
-        if any(k in sig for k in ("count", "index", "port", "channel")):
-            return "index"
-        if any(k in sig for k in ("code", "status", "mode")):
-            return "code"
-        if sig.endswith("_s") or "age_s" in sig:
-            return "time"
-        if "temperature" in sig or sig.startswith("temp_") or sig.endswith("_temp"):
-            return "temperature"
-        if "pressure" in sig:
-            return "pressure"
-        if "power" in sig:
-            return "power"
-        if "frequency" in sig or sig.startswith("freq"):
-            return "frequency"
-        return None
+        device_type = self._device_type_by_id.get(device_id)
+        if device_type:
+            return device_type
+        return destination.measurement
 
     def _enqueue_point(self, point: QueuedPoint) -> None:
         if len(self._queue) >= self._max_queue_points:
@@ -574,6 +548,9 @@ class InfluxWriterProcess(ManagedProcessBase):
         device_id = str(payload.get("device_id", "")).strip()
         if not device_id or device_id in self._disabled_devices:
             return
+        if device_id in self._remote_device_ids:
+            self._points_skipped_remote += 1
+            return
         signals = payload.get("signals")
         if not isinstance(signals, dict):
             return
@@ -587,71 +564,68 @@ class InfluxWriterProcess(ManagedProcessBase):
             )
             return
 
-        device_type = self._resolve_device_type(device_id)
+        fields: dict[str, Any] = {}
         for signal_name_raw, signal_payload_raw in signals.items():
             signal_name = str(signal_name_raw).strip()
             if not signal_name or not isinstance(signal_payload_raw, dict):
                 continue
-
-            self._points_received += 1
-
             value = signal_payload_raw.get("value")
             quality = str(signal_payload_raw.get("quality", "UNKNOWN")).strip().upper()
             unit_raw = signal_payload_raw.get("units")
             unit = str(unit_raw).strip() if isinstance(unit_raw, str) else ""
-            ts_ns = _timestamp_ns_from_payload(signal_payload_raw, payload)
-
-            fields: dict[str, Any] = {"quality": quality}
-            if unit:
-                fields["unit"] = unit
 
             if isinstance(value, bool):
-                fields["value_bool"] = bool(value)
+                fields[signal_name] = bool(value)
             elif isinstance(value, int):
                 as_i64 = int(value)
                 if as_i64 < -(2**63) or as_i64 > 2**63 - 1:
-                    self._points_skipped_invalid += 1
                     continue
-                fields["value_i64"] = as_i64
+                fields[signal_name] = as_i64
             elif isinstance(value, float):
                 if not math.isfinite(value):
-                    self._points_skipped_invalid += 1
                     continue
-                fields["value_f64"] = float(value)
+                fields[signal_name] = float(value)
             elif isinstance(value, str):
-                fields["value_str"] = value
+                fields[signal_name] = value
             else:
-                self._points_skipped_invalid += 1
                 continue
 
-            tags: dict[str, str] = {
-                "instance_id": self._instance_id,
-                "device_id": device_id,
-                "signal": signal_name,
-            }
-            tags.update(destination.static_tags)
-            if self._include_device_type_tag and device_type:
-                tags["device_type"] = device_type
-            quantity = self._resolve_quantity(
-                device_id=device_id,
-                signal=signal_name,
-                unit=unit,
-                value=value,
+            if self._include_quality_fields:
+                fields[f"{signal_name}__quality"] = quality
+            if self._include_unit_fields and unit:
+                fields[f"{signal_name}__unit"] = unit
+
+        if not fields:
+            self._points_skipped_invalid += 1
+            return
+
+        self._points_received += 1
+        ts_ns = _timestamp_ns_from_bundle(payload)
+        measurement = self._resolve_measurement(device_id=device_id, destination=destination)
+        tags: dict[str, str] = {
+            "instance_id": self._instance_id,
+            "device_id": device_id,
+        }
+        tags.update(destination.static_tags)
+        route = self._routes.get(device_id)
+        tags.update(self._device_tags_by_id.get(device_id, {}))
+        if route is not None and route.tags:
+            tags.update(route.tags)
+        device_type = self._device_type_by_id.get(device_id)
+        if self._include_device_type_tag and device_type:
+            tags["device_type"] = device_type
+
+        try:
+            line = _build_line_protocol(
+                measurement=measurement,
+                tags=tags,
+                fields=fields,
+                ts_ns=ts_ns,
             )
-            if quantity:
-                tags["quantity"] = quantity
-
-            try:
-                line = _build_line_protocol(
-                    measurement=destination.measurement,
-                    tags=tags,
-                    fields=fields,
-                    ts_ns=ts_ns,
-                )
-            except Exception:
-                self._points_skipped_invalid += 1
-                continue
-            self._enqueue_point(QueuedPoint(destination=destination_name, line=line))
+        except Exception:
+            self._points_skipped_invalid += 1
+            return
+        self._enqueue_point(QueuedPoint(destination=destination_name, line=line))
 
     @staticmethod
     def _destination_write_url(destination: InfluxDestination) -> str:
@@ -790,11 +764,15 @@ class InfluxWriterProcess(ManagedProcessBase):
             "overflow_policy": self._overflow_policy,
             "batch_max_points": self._batch_max_points,
             "flush_interval_s": self._flush_interval_s,
+            "include_quality_fields": self._include_quality_fields,
+            "include_unit_fields": self._include_unit_fields,
+            "device_tag_keys": list(self._device_tag_keys),
             "counters": {
                 "points_received": self._points_received,
                 "points_queued": self._points_queued,
                 "points_written": self._points_written,
                 "points_skipped_invalid": self._points_skipped_invalid,
+                "points_skipped_remote": self._points_skipped_remote,
                 "points_dropped_overflow": self._points_dropped_overflow,
                 "write_errors": self._write_errors,
                 "batches_written": self._batches_written,
@@ -805,6 +783,7 @@ class InfluxWriterProcess(ManagedProcessBase):
                 "t_mono": self._last_flush_mono_s,
             },
             "device_type_known_count": len(self._device_type_by_id),
+            "remote_device_known_count": len(self._remote_device_ids),
         }
 
     def _handle_rpc(self, req: Json) -> Json:
@@ -985,15 +964,17 @@ def main(argv: list[str] | None = None) -> None:
         ),
         max_queue_points=coerce_int(init_kwargs.get("max_queue_points"), default=100_000),
         overflow_policy=str(init_kwargs.get("overflow_policy", "drop_oldest")),
-        quantity_from_units=optional_dict(
-            init_kwargs.get("quantity_from_units"), path=["quantity_from_units"]
-        ),
-        quantity_overrides=optional_dict(
-            init_kwargs.get("quantity_overrides"), path=["quantity_overrides"]
-        ),
         include_device_type_tag=coerce_bool(
             init_kwargs.get("include_device_type_tag"), default=True
         ),
+        include_quality_fields=coerce_bool(
+            init_kwargs.get("include_quality_fields"), default=True
+        ),
+        include_unit_fields=coerce_bool(
+            init_kwargs.get("include_unit_fields"), default=False
+        ),
+        device_type_key=str(init_kwargs.get("device_type_key", "device_type")),
+        device_tag_keys=init_kwargs.get("device_tag_keys", ["location"]),
     )
     proc.run()
 

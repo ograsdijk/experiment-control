@@ -259,6 +259,48 @@ Notes:
 - Sequencer lifecycle and loaded YAML snapshots are written under `/sequencer`.
 - For custom workflow-style managed processes, see `docs/state_machines.md`.
 
+## Influx writer (wide mode)
+
+`influx_writer` writes one Influx row per telemetry update (wide schema), not one row per signal.
+
+Example `init_kwargs`:
+
+```yaml
+init_kwargs:
+  instance_id: "lab_a"
+  destinations:
+    default:
+      url: "http://127.0.0.1:8086"
+      token: "${INFLUX_TOKEN}"
+      org: "centrex"
+      bucket: "telemetry"
+      measurement: "unknown_device"   # fallback if type is unknown
+  default_destination: "default"
+  routes: {}
+  include_device_type_tag: true
+  include_quality_fields: true
+  include_unit_fields: false
+  device_type_key: "device_type"
+  device_tag_keys: ["location"]
+```
+
+Behavior:
+- Measurement name resolution:
+  1. `routes.<device_id>.measurement`
+  2. `routes.<device_id>.device_type`
+  3. `device_metadata[device_type_key]` from `manager.device_config`
+  4. destination fallback `measurement`
+- Base tags: `instance_id`, `device_id`
+- Optional tags:
+  - `device_type` (when `include_device_type_tag=true`)
+  - selected keys from `device_metadata` via `device_tag_keys` (for example `location`)
+  - static destination tags and route tag overrides
+- Fields:
+  - one field per telemetry signal (`signal_name -> value`)
+  - optional `signal_name__quality` string fields
+  - optional `signal_name__unit` string fields
+- Federated/remote devices are skipped (`source_kind=federated` / `is_remote=true`).
+
 ## Instance lifecycle recovery (lock + orphan cleanup)
 
 `run_stack` now performs a startup preflight:
