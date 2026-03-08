@@ -44,6 +44,27 @@ def _build_manager() -> Manager:
 
 
 class ManagerRuntimeMetadataTests(unittest.TestCase):
+    def test_connect_device_does_not_publish_run_metadata(self) -> None:
+        mgr = _build_manager()
+
+        class _RunningProcess:
+            @staticmethod
+            def poll() -> None:
+                return None
+
+        mgr._devices["trace1"].process = _RunningProcess()  # type: ignore[attr-defined]
+        mgr._call_device_rpc = mock.Mock(return_value={"ok": True})  # type: ignore[attr-defined]
+        mgr._publish_manager_event = mock.Mock()  # type: ignore[attr-defined]
+
+        resp = Manager.connect_device(mgr, "trace1")
+        self.assertEqual(resp.get("ok"), True)
+        mgr._call_device_rpc.assert_called_once_with(  # type: ignore[attr-defined]
+            device_id="trace1",
+            action="connect_device",
+            params={},
+        )
+        mgr._publish_manager_event.assert_not_called()  # type: ignore[attr-defined]
+
     def test_metadata_get_returns_base_and_effective(self) -> None:
         mgr = _build_manager()
         resp = Manager._route_internal_request(  # type: ignore[arg-type]

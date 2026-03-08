@@ -63,6 +63,22 @@ def _make_proc() -> InfluxWriterProcess:
 
 
 class InfluxWriterWideModeTests(unittest.TestCase):
+    def test_handle_device_config_does_not_use_yaml_fallback_for_device_type(self) -> None:
+        proc = _make_proc()
+        proc._handle_device_config(  # noqa: SLF001
+            {
+                "device_id": "trace1",
+                "source_kind": "local",
+                "is_remote": False,
+                "yaml_text": (
+                    "driver:\n"
+                    "  module: experiment_control.drivers.dummy_trace_driver\n"
+                    "  class_name: DummyTraceDriver\n"
+                ),
+            }
+        )
+        self.assertNotIn("trace1", proc._device_type_by_id)  # noqa: SLF001
+
     def test_handle_device_config_tracks_type_tags_and_remote_flag(self) -> None:
         proc = _make_proc()
         proc._handle_device_config(  # noqa: SLF001

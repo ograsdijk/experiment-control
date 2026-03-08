@@ -162,6 +162,41 @@ class ManagerCommandSourceTests(unittest.TestCase):
         self.assertEqual(len(journal.rows), 1)
         self.assertEqual(journal.rows[0].get("action"), "set_frequency_hz")
 
+    def test_append_command_journal_entry_skips_status_action(self) -> None:
+        mgr = _build_manager()
+        journal = _JournalStub()
+        mgr._command_journal = journal  # type: ignore[attr-defined]
+
+        Manager._append_command_journal_entry(  # type: ignore[arg-type]
+            mgr,
+            {
+                "device_id": "process:sequencer",
+                "action": "sequencer.status",
+                "params_json": "{}",
+                "ok": True,
+            },
+        )
+        self.assertEqual(journal.rows, [])
+
+    def test_append_command_journal_entry_skips_capabilities_action(self) -> None:
+        mgr = _build_manager()
+        journal = _JournalStub()
+        mgr._command_journal = journal  # type: ignore[attr-defined]
+
+        for action in ("capabilities", "process.capabilities", "device.capabilities"):
+            with self.subTest(action=action):
+                Manager._append_command_journal_entry(  # type: ignore[arg-type]
+                    mgr,
+                    {
+                        "device_id": "trace1",
+                        "action": action,
+                        "params_json": "{}",
+                        "ok": True,
+                    },
+                )
+
+        self.assertEqual(journal.rows, [])
+
     def test_process_rpc_publishes_manager_command_event(self) -> None:
         mgr = _build_manager()
         mgr._processes = {  # type: ignore[attr-defined]

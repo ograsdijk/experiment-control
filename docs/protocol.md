@@ -3,6 +3,11 @@
 ## Overview
 Topics are published over PUB/SUB. Payloads are JSON and include `version` where noted.
 
+For Python automation against this protocol (without FastAPI), use:
+
+- `docs/python_client_sdk.md`
+- `experiment_control.client.StackClient`
+
 ## Driver RPC actions (REQ/REP)
 
 ### `capabilities`
@@ -625,18 +630,21 @@ Response:
   - `units`: str | null
   - `description`: str | null
   - `ring_slots`: int
-  - `attrs`: dict | null (free-form metadata, e.g. channel names). These are
-    applied to the HDF stream dataset attributes (unless overridden by
-    `stream_metadata` for the same stream).
+  - `attrs`: dict | null (free-form stream-local metadata)
 
-Runtime metadata hooks (HDF writer behavior at measurement/file start):
-- For local devices, HDF writer may call driver commands `device_metadata` and
-  `stream_metadata` and merge the returned dicts into config metadata.
-- These are optional driver methods; missing methods are ignored.
-- Merge precedence:
-  - `device_metadata`: YAML payload then runtime hook result
-  - stream attrs: `stream_calls[].outputs[].attrs` then YAML `stream_metadata`
-    then runtime `stream_metadata` hook result
+Metadata behavior:
+- `device_metadata` and `stream_metadata` come from the manager device config
+  payload (YAML base + optional runtime override RPCs).
+- HDF writer does not call device runtime metadata hooks for these fields.
+- Stream dataset attr merge precedence:
+  - `stream_calls[].outputs[].attrs` + output `units`/`description`
+  - then `stream_metadata[stream]` (overrides)
+  - then runtime `device.metadata.set` stream overrides (via manager payload)
+- HDF writer stores effective config metadata under `/config/<device_id>`:
+  - `yaml` (scalar text dataset)
+  - `device_metadata_json` (scalar JSON dataset)
+  - `stream_metadata_json` (scalar JSON dataset)
+  - `run_meta_calls_json` (scalar JSON dataset)
 
 Influx writer (wide mode) also consumes `manager.device_config`:
 - Uses `device_metadata[device_type_key]` (default key: `device_type`) to resolve
@@ -646,12 +654,18 @@ Influx writer (wide mode) also consumes `manager.device_config`:
   owning instances write their own telemetry.
 
 ### `manager.run_metadata`
-- Producer: manager
+- Producer: optional (no default manager publisher in current stack)
 - Consumers: HDF writer
 - Payload (version 1):
   - `version`: int
   - `device_id`: str
   - `run_metadata`: dict
+
+HDF storage:
+- `/run_metadata/<device_id>/json` (scalar JSON dataset)
+- Captured at HDF measurement/file start (`hdf.rotate`) for local devices via
+  direct `collect_run_metadata` RPC calls from HDF writer.
+- If any process publishes `manager.run_metadata`, HDF writer also ingests it.
 
 ### `manager.telemetry_stale`
 - Producer: manager

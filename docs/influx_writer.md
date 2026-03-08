@@ -48,6 +48,7 @@ Measurement is resolved per device in this order:
 4. destination fallback `measurement`
 
 Recommended: provide `device_metadata.device_type` in device YAML and keep destination fallback as `unknown_device`.
+`influx_writer` does not use `yaml_text` fallback for device type resolution.
 
 ## Config schema (`init_kwargs`)
 
@@ -130,4 +131,3 @@ Example wide row:
 ```text
 hipace700,instance_id=lab_a,device_id=pump1,location=rack_a rot_speed_hz=233.5,rot_speed_hz__quality="OK",is_running=true,is_running__quality="OK" 1731112345000000000
 ```
-

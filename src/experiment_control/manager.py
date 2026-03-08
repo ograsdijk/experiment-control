@@ -1775,26 +1775,9 @@ class Manager:
 
     def connect_device(self, device_id: str) -> Json:
         self._require_running_driver(device_id)
-        resp = self._call_device_rpc(
+        return self._call_device_rpc(
             device_id=device_id, action="connect_device", params={}
         )
-        if resp.get("ok"):
-            try:
-                meta_resp = self._call_device_rpc(
-                    device_id=device_id, action="collect_run_metadata", params={}
-                )
-                if meta_resp.get("ok"):
-                    self._publish_manager_event(
-                        "manager.run_metadata",
-                        {
-                            "version": 1,
-                            "device_id": device_id,
-                            "run_metadata": meta_resp.get("result", {}),
-                        },
-                    )
-            except Exception:
-                pass
-        return resp
 
     def disconnect_device(self, device_id: str) -> Json:
         self._require_running_driver(device_id)
@@ -4418,7 +4401,13 @@ class Manager:
             return False
         if text.startswith("telemetry__"):
             return False
-        if text == "process.capabilities":
+        if text == "capabilities" or text.endswith(".capabilities"):
+            return False
+        if text.endswith(".status"):
+            return False
+        if text.endswith(".list_status"):
+            return False
+        if text in {"device.get_status", "device.list_status", "process.list_status"}:
             return False
         return True
 

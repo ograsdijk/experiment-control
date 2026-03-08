@@ -62,3 +62,7 @@ stream_calls:
         attrs:
           units: V
           channel_names: ["error", "monitor", "control"]
+
+stream_metadata:
+  trace:
+    axis_names: ["channel", "sample"]

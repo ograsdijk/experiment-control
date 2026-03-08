@@ -159,6 +159,23 @@ experiment-control-stack examples/linien_cli/stack.yaml
 
 See `docs/manager_start.md` for full stack schema and config details.
 
+## Python Script Control (direct ZMQ)
+
+For automation scripts, you can control the stack directly without FastAPI:
+
+```python
+from experiment_control.client import StackClient
+
+with StackClient.from_stack_yaml("examples/dummy_frequency_trace_sequencer/stack.yaml") as ec:
+    ec.processes.start("sequencer")
+    ec.wait.process_rpc_ready("sequencer", probe_action="sequencer.status", timeout_s=10.0)
+    ec.sequencer.load(path="examples/dummy_frequency_trace_sequencer/sequence_frequency_sweep.yaml")
+    ec.sequencer.start()
+```
+
+See `docs/python_client_sdk.md` for full API details (device commands, HDF rotate,
+sequencer helpers, and PUB/SUB subscriptions).
+
 ## Ports and Networking
 
 In `stack.yaml`, manager networking is configured under `manager`:
@@ -191,6 +208,7 @@ The helper script (`run_linien_fastapi.py`) sets these automatically from stack 
 
 - `docs/manager_start.md` - stack runner and YAML schema
 - `docs/protocol.md` - RPC and PUB/SUB protocol
+- `docs/python_client_sdk.md` - Python SDK for direct stack control
 - `docs/sequencer_config.md` - sequencer configuration
 - `docs/state_machines.md` - state machine process base/template
 

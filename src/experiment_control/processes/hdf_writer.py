@@ -620,20 +620,6 @@ class HdfWriter(ManagedProcessBase):
             out[stream] = cls._normalize_metadata_dict(attrs_raw)
         return out
 
-    @staticmethod
-    def _merge_stream_metadata(
-        base: dict[str, dict[str, Any]],
-        overlay: dict[str, dict[str, Any]],
-    ) -> dict[str, dict[str, Any]]:
-        merged: dict[str, dict[str, Any]] = {}
-        for stream, attrs in base.items():
-            merged[stream] = dict(attrs)
-        for stream, attrs in overlay.items():
-            current = dict(merged.get(stream, {}))
-            current.update(attrs)
-            merged[stream] = current
-        return merged
-
     def _call_optional_device_action(
         self,
         *,
@@ -662,38 +648,39 @@ class HdfWriter(ManagedProcessBase):
             return None
         return resp.get("result")
 
-    def _merge_driver_metadata_into_config(self, config: Json) -> Json:
-        merged = copy.deepcopy(config)
-        device_id = self._normalize_device_id(merged.get("device_id"))
-        if device_id is None:
-            return merged
-        source_kind = str(merged.get("source_kind", "")).strip().lower()
-        if bool(merged.get("is_remote")) or source_kind == "federated":
-            return merged
+    @staticmethod
+    def _is_remote_config(config: Json) -> bool:
+        source_kind = str(config.get("source_kind", "")).strip().lower()
+        return bool(config.get("is_remote")) or source_kind == "federated"
 
-        base_device = self._normalize_metadata_dict(merged.get("device_metadata"))
-        base_stream = self._normalize_stream_metadata_dict(merged.get("stream_metadata"))
-
-        device_from_driver = self._normalize_metadata_dict(
-            self._call_optional_device_action(
+    def _capture_run_metadata_for_configs(self, configs: list[Json]) -> None:
+        seen: set[str] = set()
+        timeout_ms = min(max(200, int(self._rpc_timeout_ms)), 1500)
+        for config in configs:
+            device_id = self._normalize_device_id(config.get("device_id"))
+            if device_id is None or device_id in seen:
+                continue
+            seen.add(device_id)
+            if not self._is_device_enabled(device_id):
+                continue
+            if self._is_remote_config(config):
+                continue
+            run_metadata = self._call_optional_device_action(
                 device_id=device_id,
-                action="device_metadata",
+                action="collect_run_metadata",
+                timeout_ms=timeout_ms,
             )
-        )
-        stream_from_driver = self._normalize_stream_metadata_dict(
-            self._call_optional_device_action(
-                device_id=device_id,
-                action="stream_metadata",
+            if run_metadata is None:
+                continue
+            if not isinstance(run_metadata, dict):
+                self._bump_error("run_metadata.invalid")
+                continue
+            self._handle_run_metadata(
+                {
+                    "device_id": device_id,
+                    "run_metadata": run_metadata,
+                }
             )
-        )
-        if device_from_driver:
-            base_device.update(device_from_driver)
-        if stream_from_driver:
-            base_stream = self._merge_stream_metadata(base_stream, stream_from_driver)
-
-        merged["device_metadata"] = base_device
-        merged["stream_metadata"] = base_stream
-        return merged
 
     def _build_measurement_metadata(
         self,
@@ -1093,8 +1080,8 @@ class HdfWriter(ManagedProcessBase):
                 device_id = self._normalize_device_id(config.get("device_id"))
                 if device_id is not None:
                     self._latest_device_config[device_id] = copy.deepcopy(config)
-                effective = self._merge_driver_metadata_into_config(config)
-                self._handle_device_config(effective, cache=False)
+                self._handle_device_config(config, cache=False)
+            self._capture_run_metadata_for_configs(configs)
 
         self._pending = 0
         now = time.monotonic()
@@ -2673,8 +2660,9 @@ class HdfWriter(ManagedProcessBase):
             return
 
         yaml_text = msg.get("yaml_text")
-        stream_metadata = msg.get("stream_metadata", {})
+        stream_metadata = self._normalize_stream_metadata_dict(msg.get("stream_metadata"))
         stream_calls = msg.get("stream_calls", [])
+        run_meta_calls = msg.get("run_meta_calls", [])
 
         if can_write_device and self._config_group is not None:
             device_group = self._config_group.require_group(device_id)
@@ -2685,6 +2673,26 @@ class HdfWriter(ManagedProcessBase):
                     dtype=h5py.string_dtype("utf-8"),
                 )
                 ds[()] = str(yaml_text)
+            device_metadata = self._normalize_metadata_dict(msg.get("device_metadata"))
+            device_meta_ds = device_group.require_dataset(
+                "device_metadata_json",
+                shape=(),
+                dtype=h5py.string_dtype("utf-8"),
+            )
+            device_meta_ds[()] = json.dumps(device_metadata)
+            stream_meta_ds = device_group.require_dataset(
+                "stream_metadata_json",
+                shape=(),
+                dtype=h5py.string_dtype("utf-8"),
+            )
+            stream_meta_ds[()] = json.dumps(stream_metadata)
+            run_meta_schema: list[Any] = run_meta_calls if isinstance(run_meta_calls, list) else []
+            run_meta_calls_ds = device_group.require_dataset(
+                "run_meta_calls_json",
+                shape=(),
+                dtype=h5py.string_dtype("utf-8"),
+            )
+            run_meta_calls_ds[()] = json.dumps(run_meta_schema)
 
         stream_call_attrs: dict[str, dict[str, Any]] = {}
         if isinstance(stream_calls, list):
@@ -2705,26 +2713,25 @@ class HdfWriter(ManagedProcessBase):
                         self._stream_expected_nbytes[key] = expected
                     except Exception:
                         self._stream_expected_nbytes.pop(key, None)
+                    merged = stream_call_attrs.setdefault(stream, {})
+                    units = out.get("units")
+                    if units is not None:
+                        merged["units"] = units
+                    description = out.get("description")
+                    if description is not None:
+                        merged["description"] = description
                     attrs = out.get("attrs")
                     if isinstance(attrs, dict):
-                        merged = stream_call_attrs.setdefault(stream, {})
                         merged.update(attrs)
 
         combined_stream: dict[str, dict[str, Any]] = {}
-        if isinstance(stream_metadata, dict):
-            for stream, attrs in stream_metadata.items():
-                stream_name = str(stream)
-                if not isinstance(attrs, dict):
-                    continue
-                combined_stream[stream_name] = dict(attrs)
-
         for stream_name, attrs in stream_call_attrs.items():
-            if stream_name in combined_stream:
-                merged = dict(attrs)
-                merged.update(combined_stream[stream_name])
-                combined_stream[stream_name] = merged
-            else:
-                combined_stream[stream_name] = dict(attrs)
+            combined_stream[stream_name] = dict(attrs)
+
+        for stream_name, attrs in stream_metadata.items():
+            current = dict(combined_stream.get(stream_name, {}))
+            current.update(attrs)
+            combined_stream[stream_name] = current
 
         for stream_name, attrs in combined_stream.items():
             base_key = (device_id, stream_name)

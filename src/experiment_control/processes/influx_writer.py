@@ -11,8 +11,6 @@ from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
-
-import yaml
 import zmq
 
 from ..capabilities import capabilities_payload, method, param
@@ -207,24 +205,7 @@ def _extract_device_type_from_config(
         from_meta = device_metadata.get(metadata_key)
         if isinstance(from_meta, str) and from_meta.strip():
             return from_meta.strip()
-
-    yaml_text = payload.get("yaml_text")
-    if not isinstance(yaml_text, str) or not yaml_text.strip():
-        return None
-    try:
-        raw = yaml.safe_load(yaml_text)
-    except Exception:
-        return None
-    if not isinstance(raw, dict):
-        return None
-    driver = raw.get("driver")
-    if not isinstance(driver, dict):
-        return None
-    class_name = driver.get("class_name")
-    if not isinstance(class_name, str):
-        return None
-    text = class_name.strip()
-    return text or None
+    return None
 
 
 class InfluxWriterProcess(ManagedProcessBase):

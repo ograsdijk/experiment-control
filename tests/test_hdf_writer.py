@@ -2,6 +2,7 @@ import shutil
 import sys
 import tempfile
 import uuid
+import json
 from contextlib import contextmanager
 from pathlib import Path
 import unittest
@@ -619,7 +620,7 @@ class HdfWriterCompressionTests(unittest.TestCase):
                 self.assertEqual(datasets["data"].compression, "lzf")
 
 
-class HdfWriterRuntimeMetadataHookTests(unittest.TestCase):
+class HdfWriterMetadataConsolidationTests(unittest.TestCase):
     def _make_writer(self, out_dir: str) -> HdfWriter:
         return HdfWriter(
             out_dir=out_dir,
@@ -637,110 +638,15 @@ class HdfWriterRuntimeMetadataHookTests(unittest.TestCase):
             event_log_mode="all",
         )
 
-    def test_merge_driver_metadata_overlays_config_metadata(self) -> None:
-        writer = self._make_writer("data")
-        called: list[str] = []
-
-        def _fake_call(
-            *, device_id: str, action: str, timeout_ms: int = 1200
-        ) -> object | None:
-            _ = device_id, timeout_ms
-            called.append(action)
-            if action == "device_metadata":
-                return {"location": "runtime_bench", "serial": "SN-123"}
-            if action == "stream_metadata":
-                return {"trace": {"gain": 2.5, "runtime_only": True}}
-            return None
-
-        writer._call_optional_device_action = _fake_call  # type: ignore[method-assign]  # noqa: SLF001
-
-        config = {
-            "device_id": "trace1",
-            "device_metadata": {
-                "device_type": "dummy_trace",
-                "location": "rack_a",
-            },
-            "stream_metadata": {
-                "trace": {"gain": 1.0, "axis": "sample"},
-                "aux": {"scale": 10},
-            },
-        }
-        merged = writer._merge_driver_metadata_into_config(config)  # noqa: SLF001
-
-        self.assertEqual(config["device_metadata"]["location"], "rack_a")
-        self.assertEqual(config["stream_metadata"]["trace"]["gain"], 1.0)
-
-        device_meta = merged.get("device_metadata")
-        self.assertIsInstance(device_meta, dict)
-        assert isinstance(device_meta, dict)
-        self.assertEqual(device_meta.get("device_type"), "dummy_trace")
-        self.assertEqual(device_meta.get("location"), "runtime_bench")
-        self.assertEqual(device_meta.get("serial"), "SN-123")
-
-        stream_meta = merged.get("stream_metadata")
-        self.assertIsInstance(stream_meta, dict)
-        assert isinstance(stream_meta, dict)
-        trace_meta = stream_meta.get("trace")
-        self.assertIsInstance(trace_meta, dict)
-        assert isinstance(trace_meta, dict)
-        self.assertEqual(trace_meta.get("gain"), 2.5)
-        self.assertEqual(trace_meta.get("axis"), "sample")
-        self.assertEqual(trace_meta.get("runtime_only"), True)
-        aux_meta = stream_meta.get("aux")
-        self.assertIsInstance(aux_meta, dict)
-        assert isinstance(aux_meta, dict)
-        self.assertEqual(aux_meta.get("scale"), 10)
-        self.assertEqual(called, ["device_metadata", "stream_metadata"])
-
-    def test_merge_driver_metadata_skips_remote_or_federated_devices(self) -> None:
-        writer = self._make_writer("data")
-        called: list[str] = []
-
-        def _fake_call(
-            *, device_id: str, action: str, timeout_ms: int = 1200
-        ) -> object | None:
-            _ = device_id, timeout_ms
-            called.append(action)
-            return {"unexpected": True}
-
-        writer._call_optional_device_action = _fake_call  # type: ignore[method-assign]  # noqa: SLF001
-
-        remote_cfg = {
-            "device_id": "remote_trace",
-            "is_remote": True,
-            "device_metadata": {"device_type": "dummy_trace"},
-            "stream_metadata": {"trace": {"gain": 1.0}},
-        }
-        federated_cfg = {
-            "device_id": "fed_trace",
-            "source_kind": "federated",
-            "device_metadata": {"device_type": "dummy_trace"},
-            "stream_metadata": {"trace": {"gain": 1.0}},
-        }
-        remote_merged = writer._merge_driver_metadata_into_config(remote_cfg)  # noqa: SLF001
-        federated_merged = writer._merge_driver_metadata_into_config(federated_cfg)  # noqa: SLF001
-
-        self.assertEqual(remote_merged.get("device_metadata"), remote_cfg["device_metadata"])
-        self.assertEqual(
-            remote_merged.get("stream_metadata"), remote_cfg["stream_metadata"]
-        )
-        self.assertEqual(
-            federated_merged.get("device_metadata"),
-            federated_cfg["device_metadata"],
-        )
-        self.assertEqual(
-            federated_merged.get("stream_metadata"),
-            federated_cfg["stream_metadata"],
-        )
-        self.assertEqual(called, [])
-
-    def test_configure_active_file_merges_runtime_stream_metadata(self) -> None:
+    def test_configure_active_file_merges_stream_output_attrs_with_stream_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             writer = self._make_writer(str(root))
 
             config_payload = {
                 "device_id": "trace1",
+                "source_kind": "local",
+                "is_remote": False,
                 "yaml_text": None,
                 "device_metadata": {"device_type": "dummy_trace"},
                 "stream_metadata": {"trace": {"from_config": "cfg", "shared": "config"}},
@@ -752,6 +658,8 @@ class HdfWriterRuntimeMetadataHookTests(unittest.TestCase):
                                 "stream": "trace",
                                 "dtype": "float64",
                                 "shape": [8],
+                                "units": "V",
+                                "description": "trace samples",
                                 "attrs": {"from_call": "call", "shared": "call"},
                             }
                         ],
@@ -766,12 +674,13 @@ class HdfWriterRuntimeMetadataHookTests(unittest.TestCase):
                 lambda timeout_s=5.0: [config_payload]
             )
 
+            calls: list[tuple[str, str]] = []
+
             def _fake_call(
                 *, device_id: str, action: str, timeout_ms: int = 1200
             ) -> object | None:
-                _ = device_id, timeout_ms
-                if action == "stream_metadata":
-                    return {"trace": {"from_driver": "drv", "shared": "driver"}}
+                _ = timeout_ms
+                calls.append((device_id, action))
                 return None
 
             writer._call_optional_device_action = _fake_call  # type: ignore[method-assign]  # noqa: SLF001
@@ -792,10 +701,296 @@ class HdfWriterRuntimeMetadataHookTests(unittest.TestCase):
                 pending = writer._pending_stream_metadata.get(("trace1", "trace"))  # noqa: SLF001
                 self.assertIsInstance(pending, dict)
                 assert isinstance(pending, dict)
-                self.assertEqual(pending.get("from_call"), "call")
                 self.assertEqual(pending.get("from_config"), "cfg")
-                self.assertEqual(pending.get("from_driver"), "drv")
-                self.assertEqual(pending.get("shared"), "driver")
+                self.assertEqual(pending.get("from_call"), "call")
+                self.assertEqual(pending.get("units"), "V")
+                self.assertEqual(pending.get("description"), "trace samples")
+                self.assertEqual(pending.get("shared"), "config")
+                self.assertNotIn("from_driver", pending)
+
+            self.assertIn(("trace1", "collect_run_metadata"), calls)
+            self.assertNotIn(("trace1", "device_metadata"), calls)
+            self.assertNotIn(("trace1", "stream_metadata"), calls)
+
+    def test_configure_active_file_collects_run_metadata_for_local_devices(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            writer = self._make_writer(str(root))
+
+            local_cfg = {
+                "device_id": "trace1",
+                "source_kind": "local",
+                "is_remote": False,
+                "yaml_text": None,
+                "device_metadata": {"device_type": "dummy_trace"},
+                "stream_metadata": {},
+                "stream_calls": [],
+            }
+            remote_cfg = {
+                "device_id": "remote_trace",
+                "source_kind": "federated",
+                "is_remote": True,
+                "yaml_text": None,
+                "device_metadata": {"device_type": "dummy_trace"},
+                "stream_metadata": {},
+                "stream_calls": [],
+            }
+
+            writer._fetch_schema_with_backoff = (  # type: ignore[method-assign]  # noqa: SLF001
+                lambda timeout_s=5.0: {"devices": []}
+            )
+            writer._fetch_config_with_backoff = (  # type: ignore[method-assign]  # noqa: SLF001
+                lambda timeout_s=5.0: [local_cfg, remote_cfg]
+            )
+
+            calls: list[tuple[str, str]] = []
+
+            def _fake_call(
+                *, device_id: str, action: str, timeout_ms: int = 1200
+            ) -> object | None:
+                _ = timeout_ms
+                calls.append((device_id, action))
+                if action == "collect_run_metadata" and device_id == "trace1":
+                    return {"frequency_hz": 12_345.0, "mode": "lock"}
+                return None
+
+            writer._call_optional_device_action = _fake_call  # type: ignore[method-assign]  # noqa: SLF001
+
+            h5_path = root / "run_meta_on_configure.h5"
+            with h5py.File(h5_path, "w") as h5:
+                writer._configure_active_file(  # noqa: SLF001
+                    h5,
+                    write_every_s=1.0,
+                    load_manager_state=True,
+                    measurement_meta=writer._build_measurement_metadata(  # noqa: SLF001
+                        profile_id=None,
+                        values=None,
+                        require_profile=False,
+                    ),
+                )
+
+                run_meta_group = h5.get("run_metadata")
+                self.assertIsNotNone(run_meta_group)
+                assert run_meta_group is not None
+                ds = run_meta_group["trace1"]["json"]
+                payload = json.loads(_as_text(ds[()]))
+                self.assertEqual(payload.get("frequency_hz"), 12_345.0)
+                self.assertEqual(payload.get("mode"), "lock")
+                self.assertNotIn("remote_trace", run_meta_group)
+
+            self.assertIn(("trace1", "collect_run_metadata"), calls)
+            self.assertNotIn(("remote_trace", "collect_run_metadata"), calls)
+
+
+class HdfWriterDeviceMetadataStorageTests(unittest.TestCase):
+    def _make_writer(self, out_dir: str) -> HdfWriter:
+        return HdfWriter(
+            out_dir=out_dir,
+            filename=None,
+            manager_rpc="tcp://127.0.0.1:65531",
+            manager_pub="tcp://127.0.0.1:65532",
+            rpc_timeout_ms=2000,
+            timezone="America/Chicago",
+            rcvhwm=1000,
+            write_every_s=1.0,
+            buffer_max_messages=1000,
+            flush_every_n=10,
+            flush_every_s=1.0,
+            disabled_devices=[],
+            event_log_mode="all",
+        )
+
+    def test_handle_device_config_writes_metadata_json_snapshots(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            writer = self._make_writer(str(root))
+            h5_path = root / "device_metadata_write.h5"
+
+            with h5py.File(h5_path, "w") as h5:
+                writer._configure_active_file(  # noqa: SLF001
+                    h5,
+                    write_every_s=1.0,
+                    load_manager_state=False,
+                    measurement_meta=writer._build_measurement_metadata(  # noqa: SLF001
+                        profile_id=None,
+                        values=None,
+                        require_profile=False,
+                    ),
+                )
+                writer._handle_device_config(  # noqa: SLF001
+                    {
+                        "device_id": "trace1",
+                        "yaml_text": "version: 1\n",
+                        "device_metadata": {
+                            "device_type": "dummy_trace",
+                            "location": "rack_a",
+                        },
+                        "stream_metadata": {
+                            "trace": {"scale": 2.0, "units": "V"},
+                        },
+                        "stream_calls": [
+                            {
+                                "method": "acquire_trace",
+                                "outputs": [
+                                    {
+                                        "stream": "trace",
+                                        "dtype": "float64",
+                                        "shape": [8],
+                                    }
+                                ],
+                            }
+                        ],
+                        "run_meta_calls": [
+                            {
+                                "method": "read_gain",
+                                "kwargs": {},
+                                "outputs": [
+                                    {
+                                        "key": "adc_gain",
+                                        "kind": "scalar",
+                                        "dtype": "float64",
+                                        "units": "V/V",
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                )
+                device_ds = h5["config"]["trace1"]["device_metadata_json"]
+                stream_ds = h5["config"]["trace1"]["stream_metadata_json"]
+                run_meta_ds = h5["config"]["trace1"]["run_meta_calls_json"]
+                device_payload = json.loads(_as_text(device_ds[()]))
+                stream_payload = json.loads(_as_text(stream_ds[()]))
+                run_meta_payload = json.loads(_as_text(run_meta_ds[()]))
+                self.assertEqual(device_payload.get("device_type"), "dummy_trace")
+                self.assertEqual(device_payload.get("location"), "rack_a")
+                self.assertEqual(stream_payload.get("trace", {}).get("scale"), 2.0)
+                self.assertEqual(stream_payload.get("trace", {}).get("units"), "V")
+                self.assertEqual(len(run_meta_payload), 1)
+                self.assertEqual(run_meta_payload[0].get("method"), "read_gain")
+
+    def test_device_metadata_json_updates_on_subsequent_config(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            writer = self._make_writer(str(root))
+            h5_path = root / "device_metadata_update.h5"
+
+            with h5py.File(h5_path, "w") as h5:
+                writer._configure_active_file(  # noqa: SLF001
+                    h5,
+                    write_every_s=1.0,
+                    load_manager_state=False,
+                    measurement_meta=writer._build_measurement_metadata(  # noqa: SLF001
+                        profile_id=None,
+                        values=None,
+                        require_profile=False,
+                    ),
+                )
+                writer._handle_device_config(  # noqa: SLF001
+                    {
+                        "device_id": "trace1",
+                        "yaml_text": "version: 1\n",
+                        "device_metadata": {"location": "rack_a"},
+                        "stream_metadata": {},
+                        "stream_calls": [],
+                    }
+                )
+                writer._handle_device_config(  # noqa: SLF001
+                    {
+                        "device_id": "trace1",
+                        "yaml_text": "version: 1\n",
+                        "device_metadata": {"location": "rack_b", "serial": "SN-42"},
+                        "stream_metadata": {},
+                        "stream_calls": [],
+                    }
+                )
+                ds = h5["config"]["trace1"]["device_metadata_json"]
+                payload = json.loads(_as_text(ds[()]))
+                self.assertEqual(payload.get("location"), "rack_b")
+                self.assertEqual(payload.get("serial"), "SN-42")
+
+    def test_stream_metadata_json_updates_on_subsequent_config(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            writer = self._make_writer(str(root))
+            h5_path = root / "stream_metadata_update.h5"
+
+            with h5py.File(h5_path, "w") as h5:
+                writer._configure_active_file(  # noqa: SLF001
+                    h5,
+                    write_every_s=1.0,
+                    load_manager_state=False,
+                    measurement_meta=writer._build_measurement_metadata(  # noqa: SLF001
+                        profile_id=None,
+                        values=None,
+                        require_profile=False,
+                    ),
+                )
+                writer._handle_device_config(  # noqa: SLF001
+                    {
+                        "device_id": "trace1",
+                        "yaml_text": "version: 1\n",
+                        "device_metadata": {"location": "rack_a"},
+                        "stream_metadata": {"trace": {"scale": 1.0, "units": "V"}},
+                        "stream_calls": [],
+                        "run_meta_calls": [{"method": "read_gain"}],
+                    }
+                )
+                writer._handle_device_config(  # noqa: SLF001
+                    {
+                        "device_id": "trace1",
+                        "yaml_text": "version: 1\n",
+                        "device_metadata": {"location": "rack_a"},
+                        "stream_metadata": {"trace": {"scale": 2.0, "units": "counts"}},
+                        "stream_calls": [],
+                        "run_meta_calls": [{"method": "read_offset"}],
+                    }
+                )
+                stream_ds = h5["config"]["trace1"]["stream_metadata_json"]
+                run_meta_ds = h5["config"]["trace1"]["run_meta_calls_json"]
+                stream_payload = json.loads(_as_text(stream_ds[()]))
+                run_meta_payload = json.loads(_as_text(run_meta_ds[()]))
+                self.assertEqual(stream_payload.get("trace", {}).get("scale"), 2.0)
+                self.assertEqual(stream_payload.get("trace", {}).get("units"), "counts")
+                self.assertEqual(len(run_meta_payload), 1)
+                self.assertEqual(run_meta_payload[0].get("method"), "read_offset")
+
+    def test_metadata_json_snapshots_default_to_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            writer = self._make_writer(str(root))
+            h5_path = root / "device_metadata_default.h5"
+
+            with h5py.File(h5_path, "w") as h5:
+                writer._configure_active_file(  # noqa: SLF001
+                    h5,
+                    write_every_s=1.0,
+                    load_manager_state=False,
+                    measurement_meta=writer._build_measurement_metadata(  # noqa: SLF001
+                        profile_id=None,
+                        values=None,
+                        require_profile=False,
+                    ),
+                )
+                writer._handle_device_config(  # noqa: SLF001
+                    {
+                        "device_id": "trace1",
+                        "yaml_text": "version: 1\n",
+                        "device_metadata": "not-a-dict",
+                        "stream_metadata": "not-a-dict",
+                        "stream_calls": [],
+                        "run_meta_calls": "not-a-list",
+                    }
+                )
+                device_ds = h5["config"]["trace1"]["device_metadata_json"]
+                stream_ds = h5["config"]["trace1"]["stream_metadata_json"]
+                run_meta_ds = h5["config"]["trace1"]["run_meta_calls_json"]
+                device_payload = json.loads(_as_text(device_ds[()]))
+                stream_payload = json.loads(_as_text(stream_ds[()]))
+                run_meta_payload = json.loads(_as_text(run_meta_ds[()]))
+                self.assertEqual(device_payload, {})
+                self.assertEqual(stream_payload, {})
+                self.assertEqual(run_meta_payload, [])
 
 
 if __name__ == "__main__":

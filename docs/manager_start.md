@@ -65,6 +65,12 @@ For wide-mode Influx writer behavior and configuration, see:
 
 - `docs/influx_writer.md`
 
+## Python SDK (direct ZMQ)
+
+For scripting against a running stack without FastAPI, see:
+
+- `docs/python_client_sdk.md`
+
 ## Stack YAML schema (version 1)
 
 ```yaml
@@ -214,35 +220,20 @@ stream_calls:
 
 Notes:
 - `shape` is required and describes a single shot.
-- `attrs` is free-form metadata (useful for channel/axis labels) and is applied
-  to the HDF stream dataset attributes. If `stream_metadata` also defines the
-  same stream, its keys override `attrs`.
+- `outputs[].attrs` is stream-local metadata colocated with the stream call.
+  `outputs[].units` and `outputs[].description` are also mirrored as stream attrs.
 - `device_metadata` is device-level metadata (for example device type, location,
   and tags for sink processes such as Influx).
-- `stream_metadata` is stream-level metadata (for example calibration factors).
-- Optional driver runtime hooks (called when a new HDF measurement/file starts):
-  - `device_metadata()` -> `dict[str, object]`
-  - `stream_metadata()` -> `dict[str, dict[str, object]]`
-  - these are invoked by HDF writer on local devices only (not federated mirrors)
-  - merge precedence:
-    - `device_metadata`: YAML `device_metadata` then runtime `device_metadata()`
-    - stream attrs: `stream_calls.outputs[].attrs` then YAML `stream_metadata`
-      then runtime `stream_metadata()`
-
-Example driver hooks:
-
-```python
-def device_metadata(self) -> dict[str, object]:
-    return {"device_type": "hipace700", "location": "rack_a"}
-
-def stream_metadata(self) -> dict[str, dict[str, object]]:
-    return {
-        "trace": {
-            "adc_gain_db": 20.0,
-            "counts_to_volt": 3.05e-4,
-        }
-    }
-```
+- `stream_metadata` is stream-level metadata (for example calibration factors,
+  channel labels, and axis labels). These keys are written to HDF stream dataset
+  attributes and override conflicting keys from `outputs[].attrs`.
+- `run_meta_calls` is a per-measurement snapshot schema:
+  - list of driver method calls + extractors used to build `run_metadata` dicts
+  - snapshots are written by HDF writer under `/run_metadata/<device_id>/json`
+  - snapshots are captured at HDF measurement/file start (`hdf.rotate`) for
+    local devices via direct `collect_run_metadata` RPC calls from HDF writer.
+  - optional `manager.run_metadata` topic events are also ingested by HDF writer
+    if another process publishes them.
 
 Runtime override RPCs (manager-side, no YAML edit/restart):
 - `device.metadata.get`
@@ -304,6 +295,12 @@ Notes:
       optional `ended_wall_ns`, optional `schema_source`
     - dataset `/measurement/header_json` (scalar UTF-8 string)
     - dataset `/measurement/notes` (append-only structured rows)
+  - Device config/metadata snapshots are written under `/config/<device_id>`:
+    - dataset `yaml` (raw device YAML text)
+    - dataset `device_metadata_json` (effective device metadata JSON)
+    - dataset `stream_metadata_json` (effective stream metadata JSON)
+    - dataset `run_meta_calls_json` (configured run metadata schema JSON)
+  - Per-measurement run snapshots are written under `/run_metadata/<device_id>/json`.
   - Recommended startup policy: do not auto-start `hdf_writer`; start it when you
     are ready to open a new file via `hdf.rotate` with measurement parameters.
 - Sequencer lifecycle and loaded YAML snapshots are written under `/sequencer`.
