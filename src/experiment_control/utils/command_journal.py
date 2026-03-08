@@ -58,6 +58,7 @@ class CommandJournal:
         self._dropped = 0
         self._write_errors = 0
         self._pruned_rows = 0
+        self._close_incomplete_count = 0
         self._last_error: str | None = None
 
     @property
@@ -82,8 +83,25 @@ class CommandJournal:
             return
         self._stop_evt.set()
         thread = self._thread
+        timed_out = False
         if thread is not None:
-            thread.join(timeout=max(0.1, float(timeout_s)))
+            deadline = time.monotonic() + max(0.1, float(timeout_s))
+            while thread.is_alive():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    timed_out = True
+                    break
+                thread.join(timeout=min(0.1, remaining))
+        if timed_out:
+            queue_depth = int(self._queue.qsize())
+            with self._lock:
+                self._close_incomplete_count += 1
+                self._last_error = (
+                    "command journal close timed out "
+                    f"(queue_depth={queue_depth}, timeout_s={float(timeout_s):.2f})"
+                )
+        elif thread is not None and not thread.is_alive():
+            self._thread = None
         self._started = False
 
     def append(self, item: Json) -> None:
@@ -101,6 +119,7 @@ class CommandJournal:
             dropped = int(self._dropped)
             write_errors = int(self._write_errors)
             pruned_rows = int(self._pruned_rows)
+            close_incomplete_count = int(self._close_incomplete_count)
             last_error = self._last_error
         thread = self._thread
         return {
@@ -118,6 +137,7 @@ class CommandJournal:
             "dropped": dropped,
             "write_errors": write_errors,
             "pruned_rows": pruned_rows,
+            "close_incomplete_count": close_incomplete_count,
             "last_error": last_error,
             "thread_alive": bool(thread is not None and thread.is_alive()),
         }
@@ -294,7 +314,8 @@ class CommandJournal:
             flush_timeout_s = max(0.01, float(self._settings.flush_interval_ms) / 1000.0)
             next_prune = time.monotonic() + max(0.5, float(self._settings.prune_interval_s))
             while not self._stop_evt.is_set() or not self._queue.empty():
-                batch = self._dequeue_batch(timeout_s=flush_timeout_s)
+                timeout_s = 0.01 if self._stop_evt.is_set() else flush_timeout_s
+                batch = self._dequeue_batch(timeout_s=timeout_s)
                 if batch:
                     self._write_batch(conn, batch)
 

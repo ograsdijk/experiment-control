@@ -405,14 +405,25 @@ def configure_child_parent_guard(*, parent_pid: int | None) -> None:
 @dataclass
 class ProcessGuardian:
     _job: "_WindowsJobObject | None" = None
+    _init_error: str | None = None
 
     def __init__(self) -> None:
         self._job = None
+        self._init_error = None
         if sys.platform == "win32":
             try:
                 self._job = _WindowsJobObject()
-            except Exception:
+            except Exception as exc:
                 self._job = None
+                self._init_error = str(exc)
+
+    @property
+    def available(self) -> bool:
+        return self._job is not None
+
+    @property
+    def init_error(self) -> str | None:
+        return self._init_error
 
     def adopt_popen(self, popen: subprocess.Popen[str] | None) -> None:
         if self._job is None or popen is None:

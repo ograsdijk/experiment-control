@@ -15,6 +15,7 @@ from .manager_client_helper import ManagerClientHelper
 from .process_base import ManagedProcessBase
 from ..capabilities import capabilities_payload, method
 from ..manager_client import ManagerClient
+from ..utils.command_interceptors import apply_command_interceptor_chain
 from ..utils.zmq_helpers import json_dumps, poll_and_drain, safe_json_loads
 
 Json = dict[str, Any]
@@ -412,34 +413,6 @@ class _DeviceWorker(_BaseWorker):
             include_ts=True,
         )
 
-    @staticmethod
-    def _interceptor_error(
-        *,
-        code: str,
-        message: str,
-        process_id: str,
-        device_id: str,
-        action: str,
-        interceptor_id: str | None = None,
-        rule: str | None = None,
-        details: Json | None = None,
-    ) -> Json:
-        err: Json = {
-            "kind": "command_interceptor",
-            "code": code,
-            "message": message,
-            "process_id": process_id,
-            "device_id": device_id,
-            "action": action,
-        }
-        if interceptor_id is not None:
-            err["interceptor_id"] = interceptor_id
-        if rule is not None:
-            err["rule"] = rule
-        if details is not None:
-            err["details"] = details
-        return err
-
     def _call_interceptor(
         self, *, process_id: str, endpoint: str, request: Json
     ) -> Json | None:
@@ -457,190 +430,40 @@ class _DeviceWorker(_BaseWorker):
     def _apply_command_interceptors(
         self, task: _DeviceTask
     ) -> tuple[bool, Json | None, Json | None]:
-        if not task.chain:
-            return (
-                True,
-                {
-                    "device_id": task.device_id,
-                    "action": task.action,
-                    "params": task.params,
-                },
-                None,
-            )
-        cur_cmd: Json = {
-            "device_id": task.device_id,
-            "action": task.action,
-            "params": task.params,
-        }
-        for route in task.chain:
-            process_id = route.process_id
+        def _is_route_available(process_id: str) -> bool:
             endpoint = task.interceptor_endpoints.get(process_id)
             state = task.interceptor_states.get(process_id)
-            if not endpoint or (state and state not in _ALLOWED_PROCESS_STATES):
-                err = self._interceptor_error(
-                    code="INTERCEPTOR_UNAVAILABLE",
-                    message=(
-                        f"Interceptor {process_id!r} unavailable for "
-                        f"{task.device_id}.{task.action}"
-                    ),
-                    process_id=process_id,
-                    device_id=task.device_id,
-                    action=task.action,
-                )
-                self._publish_event(
-                    "manager.command_interceptor.error",
-                    {"error": err, "command": cur_cmd},
-                )
-                return False, None, err
+            if not endpoint:
+                return False
+            return not state or state in _ALLOWED_PROCESS_STATES
 
-            meta: Json = {"request_id": task.request_id, "t_mono": time.monotonic()}
-            if task.caller_process_id:
-                meta["caller_process_id"] = task.caller_process_id
-            req = {"type": "command_interceptor.check", "command": cur_cmd, "meta": meta}
+        def _call(process_id: str, request: Json) -> tuple[str, Json | None, str | None]:
+            endpoint = task.interceptor_endpoints.get(process_id)
+            if not endpoint:
+                return "unavailable", None, None
             resp = self._call_interceptor(
-                process_id=process_id, endpoint=endpoint, request=req
+                process_id=process_id,
+                endpoint=endpoint,
+                request=request,
             )
             if resp is None:
-                err = self._interceptor_error(
-                    code="INTERCEPTOR_TIMEOUT",
-                    message=(
-                        f"Interceptor {process_id!r} timed out for "
-                        f"{task.device_id}.{task.action}"
-                    ),
-                    process_id=process_id,
-                    device_id=task.device_id,
-                    action=task.action,
-                )
-                self._publish_event(
-                    "manager.command_interceptor.error",
-                    {"error": err, "command": cur_cmd},
-                )
-                return False, None, err
+                return "timeout", None, None
+            return "ok", resp, None
 
-            if not isinstance(resp, dict) or resp.get("ok") is False:
-                err = self._interceptor_error(
-                    code="INTERCEPTOR_BAD_RESPONSE",
-                    message=f"Interceptor {process_id!r} returned invalid response",
-                    process_id=process_id,
-                    device_id=task.device_id,
-                    action=task.action,
-                    details={"response": resp},
-                )
-                self._publish_event(
-                    "manager.command_interceptor.error",
-                    {"error": err, "command": cur_cmd},
-                )
-                return False, None, err
-
-            allow = resp.get("allow")
-            if allow is True:
-                if "command" in resp:
-                    new_cmd_raw = resp.get("command")
-                    if not isinstance(new_cmd_raw, dict):
-                        err = self._interceptor_error(
-                            code="INTERCEPTOR_BAD_RESPONSE",
-                            message=f"Interceptor {process_id!r} returned invalid command",
-                            process_id=process_id,
-                            device_id=task.device_id,
-                            action=task.action,
-                        )
-                        self._publish_event(
-                            "manager.command_interceptor.error",
-                            {"error": err, "command": cur_cmd},
-                        )
-                        return False, None, err
-                    new_device = str(new_cmd_raw.get("device_id", task.device_id))
-                    new_action = str(new_cmd_raw.get("action", task.action))
-                    if new_device != task.device_id or new_action != task.action:
-                        err = self._interceptor_error(
-                            code="INTERCEPTOR_BAD_RESPONSE",
-                            message=(
-                                f"Interceptor {process_id!r} attempted to change route"
-                            ),
-                            process_id=process_id,
-                            device_id=task.device_id,
-                            action=task.action,
-                        )
-                        self._publish_event(
-                            "manager.command_interceptor.error",
-                            {"error": err, "command": cur_cmd},
-                        )
-                        return False, None, err
-                    if "params" in new_cmd_raw:
-                        new_params = new_cmd_raw.get("params")
-                    else:
-                        new_params = cur_cmd.get("params")
-                    if not isinstance(new_params, dict):
-                        err = self._interceptor_error(
-                            code="INTERCEPTOR_BAD_RESPONSE",
-                            message=f"Interceptor {process_id!r} returned invalid params",
-                            process_id=process_id,
-                            device_id=task.device_id,
-                            action=task.action,
-                        )
-                        self._publish_event(
-                            "manager.command_interceptor.error",
-                            {"error": err, "command": cur_cmd},
-                        )
-                        return False, None, err
-                    new_cmd = {
-                        "device_id": task.device_id,
-                        "action": task.action,
-                        "params": new_params,
-                    }
-                    if new_cmd != cur_cmd:
-                        self._publish_event(
-                            "manager.command_interceptor.modified",
-                            {
-                                "process_id": process_id,
-                                "interceptor_id": resp.get("interceptor_id"),
-                                "rule": resp.get("rule"),
-                                "note": resp.get("note"),
-                                "before": cur_cmd,
-                                "after": new_cmd,
-                            },
-                        )
-                        cur_cmd = new_cmd
-                continue
-
-            if allow is False:
-                inner = resp.get("error") or {}
-                inner_code = str(inner.get("code", "CONDITION_FAILED"))
-                inner_msg = str(inner.get("message", "Command rejected by interceptor"))
-                err = self._interceptor_error(
-                    code="INTERCEPTOR_REJECTED",
-                    message=inner_msg,
-                    process_id=process_id,
-                    device_id=task.device_id,
-                    action=task.action,
-                    interceptor_id=resp.get("interceptor_id"),
-                    rule=resp.get("rule"),
-                    details={
-                        "code": inner_code,
-                        "message": inner_msg,
-                        "details": inner.get("details", {}),
-                    },
-                )
-                self._publish_event(
-                    "manager.command_interceptor.error",
-                    {"error": err, "command": cur_cmd},
-                )
-                return False, None, err
-
-            err = self._interceptor_error(
-                code="INTERCEPTOR_BAD_RESPONSE",
-                message=f"Interceptor {process_id!r} returned invalid response",
-                process_id=process_id,
-                device_id=task.device_id,
-                action=task.action,
-                details={"response": resp},
-            )
-            self._publish_event(
-                "manager.command_interceptor.error", {"error": err, "command": cur_cmd}
-            )
-            return False, None, err
-
-        return True, cur_cmd, None
+        return apply_command_interceptor_chain(
+            initial_command={
+                "device_id": task.device_id,
+                "action": task.action,
+                "params": task.params,
+            },
+            chain=task.chain,
+            request_id=task.request_id,
+            caller_process_id=task.caller_process_id,
+            is_route_available=_is_route_available,
+            call_interceptor=_call,
+            publish_event=self._publish_event,
+            distinct_ok_false_message=False,
+        )
 
     def _call_device(self, endpoint: str, action: str, params: Json) -> Json:
         sock = self._get_device_sock(endpoint)

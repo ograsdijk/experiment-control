@@ -15,6 +15,16 @@ if str(SRC) not in sys.path:
 from experiment_control.utils.command_journal import CommandJournal, CommandJournalSettings
 
 
+class _SlowWriteCommandJournal(CommandJournal):
+    def __init__(self, *, settings: CommandJournalSettings, instance_id: str, delay_s: float):
+        super().__init__(settings=settings, instance_id=instance_id)
+        self._delay_s = float(delay_s)
+
+    def _write_batch(self, conn, batch):  # type: ignore[override]
+        time.sleep(self._delay_s)
+        super()._write_batch(conn, batch)
+
+
 class CommandJournalTests(unittest.TestCase):
     def _make_tempfile_path(self) -> Path:
         root = ROOT / ".tmp_tests"
@@ -128,6 +138,47 @@ class CommandJournalTests(unittest.TestCase):
             self.assertLessEqual(int(result.get("count", 0)), 3)
         finally:
             journal.close()
+
+    def test_command_journal_close_reports_incomplete_flush(self) -> None:
+        path = self._make_tempfile_path()
+        settings = CommandJournalSettings(
+            path=path,
+            queue_max=20,
+            batch_size=1,
+            flush_interval_ms=10,
+            retention_max_rows=None,
+            retention_max_age_days=None,
+            prune_interval_s=60.0,
+        )
+        journal = _SlowWriteCommandJournal(
+            settings=settings, instance_id="inst-slow", delay_s=0.25
+        )
+        journal.start()
+        for idx in range(4):
+            journal.append(
+                {
+                    "t_wall": time.time(),
+                    "t_mono": time.monotonic(),
+                    "instance_id": "inst-slow",
+                    "device_id": "trace1",
+                    "action": f"slow_{idx}",
+                    "params_json": "{}",
+                    "ok": True,
+                    "status": "OK",
+                    "error_json": "",
+                    "result_json": "null",
+                    "is_remote_target": False,
+                }
+            )
+
+        # Intentionally too short: this should surface an incomplete close.
+        journal.close(timeout_s=0.05)
+        status = journal.status()
+        self.assertGreaterEqual(int(status.get("close_incomplete_count", 0)), 1)
+        self.assertIn("close timed out", str(status.get("last_error", "")))
+        self.assertTrue(
+            self._wait_until(lambda: not bool(journal.status().get("thread_alive")), timeout_s=3.0)
+        )
 
 
 if __name__ == "__main__":

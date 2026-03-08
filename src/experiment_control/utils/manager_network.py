@@ -1,11 +1,13 @@
 from __future__ import annotations
 
-import ipaddress
-import socket
 from dataclasses import dataclass
 from typing import Any
 
 from .config_parsing import ConfigError, optional_dict
+from .network_hosts import (
+    first_non_loopback_ipv4 as shared_first_non_loopback_ipv4,
+    is_loopback_host as shared_is_loopback_host,
+)
 
 Json = dict[str, Any]
 
@@ -51,13 +53,7 @@ def _is_wildcard_host(host: str) -> bool:
 
 
 def _is_loopback_host(host: str) -> bool:
-    text = str(host or "").strip().lower().strip("[]")
-    if text in {"localhost", "127.0.0.1", "::1"}:
-        return True
-    try:
-        return bool(ipaddress.ip_address(text).is_loopback)
-    except Exception:
-        return False
+    return bool(shared_is_loopback_host(host))
 
 
 def _format_host(host: str) -> str:
@@ -155,38 +151,7 @@ def derive_local_connect_endpoint(bind_endpoint: str, default_port: int) -> str:
 
 
 def _first_non_loopback_ip() -> str | None:
-    candidates: set[str] = set()
-    try:
-        _host, _aliases, ips = socket.gethostbyname_ex(socket.gethostname())
-        for ip in ips:
-            try:
-                parsed = ipaddress.ip_address(ip)
-            except Exception:
-                continue
-            if parsed.version == 4 and not parsed.is_loopback:
-                candidates.add(str(parsed))
-    except Exception:
-        pass
-    try:
-        infos = socket.getaddrinfo(
-            socket.gethostname(),
-            None,
-            family=socket.AF_INET,
-            type=socket.SOCK_STREAM,
-        )
-        for info in infos:
-            ip = info[4][0]
-            try:
-                parsed = ipaddress.ip_address(ip)
-            except Exception:
-                continue
-            if parsed.version == 4 and not parsed.is_loopback:
-                candidates.add(str(parsed))
-    except Exception:
-        pass
-    if not candidates:
-        return None
-    return sorted(candidates)[0]
+    return shared_first_non_loopback_ipv4()
 
 
 def _resolve_public_host(*, bind_host: str, advertise_host: str | None) -> str:

@@ -37,6 +37,9 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--telemetry-period-s", type=float, default=1.0)
     p.add_argument("--heartbeat-period-s", type=float, default=1.0)
     p.add_argument("--command-poll-period-s", type=float, default=0.01)
+    p.add_argument("--register-timeout-ms", type=int, default=2000)
+    p.add_argument("--register-retries", type=int, default=3)
+    p.add_argument("--register-retry-delay-s", type=float, default=0.2)
     p.add_argument("--instance-id", default=None)
     p.add_argument("--parent-pid", type=int, default=None)
 
@@ -140,6 +143,9 @@ def main(argv: list[str] | None = None) -> None:
             telemetry_period_s=ns.telemetry_period_s,
             heartbeat_period_s=ns.heartbeat_period_s,
             command_poll_period_s=ns.command_poll_period_s,
+            register_timeout_ms=ns.register_timeout_ms,
+            register_retries=ns.register_retries,
+            register_retry_delay_s=ns.register_retry_delay_s,
         )
         driver.run()
     except Exception as e:

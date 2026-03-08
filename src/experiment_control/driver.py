@@ -582,6 +582,9 @@ class DeviceRunner:
         telemetry_period_s: float = 1.0,
         heartbeat_period_s: float = 1.0,
         command_poll_period_s: float = 0.01,
+        register_timeout_ms: int = 2000,
+        register_retries: int = 3,
+        register_retry_delay_s: float = 0.2,
     ) -> None:
         if telemetry_period_s <= 0:
             raise ValueError("telemetry_period_s must be > 0")
@@ -589,6 +592,12 @@ class DeviceRunner:
             raise ValueError("heartbeat_period_s must be > 0")
         if command_poll_period_s <= 0:
             raise ValueError("command_poll_period_s must be > 0")
+        if register_timeout_ms <= 0:
+            raise ValueError("register_timeout_ms must be > 0")
+        if register_retries <= 0:
+            raise ValueError("register_retries must be > 0")
+        if register_retry_delay_s < 0:
+            raise ValueError("register_retry_delay_s must be >= 0")
 
         self.device_id = device_id
         self._device = import_class(device_class_path, device_class_name)(
@@ -603,6 +612,9 @@ class DeviceRunner:
         self.telemetry_period_s = telemetry_period_s
         self.heartbeat_period_s = heartbeat_period_s
         self.command_poll_period_s = command_poll_period_s
+        self._register_timeout_ms = int(register_timeout_ms)
+        self._register_retries = int(register_retries)
+        self._register_retry_delay_s = float(register_retry_delay_s)
 
         self._telemetry_plan: list[_TelemetryCallPlan] = []
         self._init_telemetry_plan()
@@ -763,9 +775,6 @@ class DeviceRunner:
             pass
 
     def register_with_manager(self) -> None:
-        reg = self.ctx.socket(zmq.REQ)
-        reg.connect(self.registry_endpoint)
-
         msg = {
             "type": "register",
             "device_id": self.device_id,
@@ -773,10 +782,29 @@ class DeviceRunner:
             "pub_endpoint": self.pub_endpoint,
             "capabilities": self.capabilities(),
         }
-
-        reg.send_json(msg)
-        reg.recv_json()  # simple ACK
-        reg.close()
+        last_exc: Exception | None = None
+        for attempt in range(1, self._register_retries + 1):
+            reg = self.ctx.socket(zmq.REQ)
+            reg.setsockopt(zmq.LINGER, 0)
+            reg.setsockopt(zmq.SNDTIMEO, self._register_timeout_ms)
+            reg.setsockopt(zmq.RCVTIMEO, self._register_timeout_ms)
+            reg.connect(self.registry_endpoint)
+            try:
+                reg.send_json(msg)
+                _ack = reg.recv_json()  # simple ACK
+                return
+            except Exception as exc:
+                last_exc = exc
+            finally:
+                try:
+                    reg.close(0)
+                except Exception:
+                    pass
+            if attempt < self._register_retries and self._register_retry_delay_s > 0:
+                time.sleep(self._register_retry_delay_s)
+        raise RuntimeError(
+            f"Manager registration failed after {self._register_retries} attempts"
+        ) from last_exc
 
     def connect_device(self) -> None:
         assert self._device is not None, "Device not set"

@@ -2,10 +2,8 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
-import ipaddress
 import math
 import os
-import socket
 import sys
 import time
 import uuid
@@ -25,6 +23,10 @@ from ..utils.instance_lock import (
     derive_lock_effective_status,
     lock_effective_status_help,
     read_instance_lock_status,
+)
+from ..utils.network_hosts import (
+    is_loopback_host as shared_is_loopback_host,
+    server_ipv4_candidates as shared_server_ipv4_candidates,
 )
 
 
@@ -101,6 +103,9 @@ def _load_settings() -> GatewaySettings:
         router_rpc_public_hint=router_rpc_public_hint or None,
         manager_pub_public_hint=manager_pub_public_hint or None,
         rpc_timeout_ms=int(os.environ.get("EXPERIMENT_CONTROL_RPC_TIMEOUT_MS", "2000")),
+        rpc_queue_max=max(
+            1, int(os.environ.get("EXPERIMENT_CONTROL_RPC_QUEUE_MAX", "1024"))
+        ),
     )
 
 
@@ -335,15 +340,7 @@ async def _stream_analysis_rpc(
 
 
 def _is_loopback_host(raw_host: str | None) -> bool:
-    if not raw_host:
-        return False
-    host = str(raw_host).strip().lower().strip("[]")
-    if host in {"localhost", "127.0.0.1", "::1"}:
-        return True
-    try:
-        return bool(ipaddress.ip_address(host).is_loopback)
-    except Exception:
-        return False
+    return bool(shared_is_loopback_host(raw_host))
 
 
 def _extract_host(endpoint: str) -> str | None:
@@ -386,36 +383,7 @@ def _replace_endpoint_host(endpoint: str, new_host: str) -> str:
 
 
 def _server_ip_candidates() -> list[str]:
-    candidates: set[str] = set()
-    try:
-        _host, _aliases, ips = socket.gethostbyname_ex(socket.gethostname())
-        for ip in ips:
-            try:
-                parsed = ipaddress.ip_address(ip)
-            except Exception:
-                continue
-            if parsed.version == 4 and not parsed.is_loopback:
-                candidates.add(str(parsed))
-    except Exception:
-        pass
-    try:
-        infos = socket.getaddrinfo(
-            socket.gethostname(),
-            None,
-            family=socket.AF_INET,
-            type=socket.SOCK_STREAM,
-        )
-        for info in infos:
-            addr = info[4][0]
-            try:
-                parsed = ipaddress.ip_address(addr)
-            except Exception:
-                continue
-            if parsed.version == 4 and not parsed.is_loopback:
-                candidates.add(str(parsed))
-    except Exception:
-        pass
-    return sorted(candidates)
+    return shared_server_ipv4_candidates()
 
 
 def _request_origin_and_host(request: Request) -> tuple[str, str | None]:
@@ -741,7 +709,11 @@ _UI_DIST_PATH: Path | None = _resolve_ui_dist_path()
 @app.on_event("startup")
 async def _startup() -> None:
     settings = _load_settings()
-    router = RouterRpcClient(settings.router_rpc, timeout_ms=settings.rpc_timeout_ms)
+    router = RouterRpcClient(
+        settings.router_rpc,
+        timeout_ms=settings.rpc_timeout_ms,
+        queue_max=settings.rpc_queue_max,
+    )
     router.start()
     manager_identity = await _fetch_manager_identity(router)
     telemetry_hub = TelemetryHub(settings.manager_pub, topics=settings.telemetry_topics)
@@ -824,6 +796,10 @@ async def settings_view(request: Request) -> dict[str, Any]:
             router_rpc_hint = _replace_endpoint_host(settings.router_rpc, preferred_host)
         if settings.manager_pub_public_hint is None and _is_loopback_host(manager_host):
             manager_pub_hint = _replace_endpoint_host(settings.manager_pub, preferred_host)
+    router: RouterRpcClient | None = getattr(app.state, "router", None)
+    rpc_queue: dict[str, Any] | None = None
+    if router is not None:
+        rpc_queue = router.stats()
 
     return {
         "ok": True,
@@ -834,6 +810,8 @@ async def settings_view(request: Request) -> dict[str, Any]:
             "router_rpc_hint": router_rpc_hint,
             "manager_pub_hint": manager_pub_hint,
             "rpc_timeout_ms": settings.rpc_timeout_ms,
+            "rpc_queue_max": settings.rpc_queue_max,
+            "rpc_queue": rpc_queue,
             "telemetry_topics": list(settings.telemetry_topics),
             "log_topics": list(settings.log_topics),
             "stream_topics": list(settings.stream_topics),

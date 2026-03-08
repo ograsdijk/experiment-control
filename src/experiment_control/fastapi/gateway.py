@@ -24,6 +24,7 @@ class GatewaySettings:
     router_rpc_public_hint: str | None = None
     manager_pub_public_hint: str | None = None
     rpc_timeout_ms: int = 2000
+    rpc_queue_max: int = 1024
     telemetry_topics: tuple[str, ...] = ("manager.telemetry_update",)
     log_topics: tuple[str, ...] = ("manager.log",)
     stream_topics: tuple[str, ...] = ("manager.chunk_ready",)
@@ -36,45 +37,95 @@ class GatewaySettings:
 
 
 class RouterRpcClient:
-    def __init__(self, endpoint: str, *, timeout_ms: int = 2000) -> None:
+    def __init__(
+        self, endpoint: str, *, timeout_ms: int = 2000, queue_max: int = 1024
+    ) -> None:
         self._endpoint = endpoint
         self._timeout_ms = int(timeout_ms)
         self._ctx = zmq.Context.instance()
+        self._queue_max = max(1, int(queue_max))
         self._queue: queue.Queue[
             tuple[dict[str, Any], int | None, concurrent.futures.Future]
-        ] = queue.Queue()
+        ] = queue.Queue(maxsize=self._queue_max)
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._lock = threading.Lock()
+        self._queue_rejected = 0
+        self._closed_pending = 0
+
+    @staticmethod
+    def _error(code: str, message: str, *, details: dict[str, Any] | None = None) -> dict:
+        err: dict[str, Any] = {"code": code, "message": message}
+        if details:
+            err["details"] = details
+        return {"ok": False, "error": err}
 
     def start(self) -> None:
-        if self._thread is not None:
+        if self._thread is not None and self._thread.is_alive():
             return
+        self._stop.clear()
         self._thread = threading.Thread(target=self._run, name="router-rpc", daemon=True)
         self._thread.start()
 
     def close(self) -> None:
         self._stop.set()
-        self._queue.put_nowait(({"type": "noop"}, 0, concurrent.futures.Future()))
-        if self._thread is not None:
-            self._thread.join(timeout=2.0)
-        self._thread = None
+        drained = 0
+        while True:
+            try:
+                _payload, _timeout_ms, fut = self._queue.get_nowait()
+            except queue.Empty:
+                break
+            drained += 1
+            if not fut.done():
+                fut.set_result(
+                    self._error(
+                        "gateway_closed",
+                        "router rpc client closed before request was processed",
+                    )
+                )
+        if drained:
+            with self._lock:
+                self._closed_pending += drained
+        thread = self._thread
+        if thread is not None:
+            thread.join(timeout=2.0)
+            if not thread.is_alive():
+                self._thread = None
+
+    def stats(self) -> dict[str, Any]:
+        with self._lock:
+            queue_rejected = int(self._queue_rejected)
+            closed_pending = int(self._closed_pending)
+        return {
+            "queue_depth": int(self._queue.qsize()),
+            "queue_max": int(self._queue_max),
+            "queue_rejected": queue_rejected,
+            "closed_pending": closed_pending,
+            "thread_alive": bool(self._thread is not None and self._thread.is_alive()),
+        }
 
     def request(self, payload: dict[str, Any], timeout_ms: int | None = None) -> dict:
-        if self._thread is None:
+        if self._thread is None or not self._thread.is_alive():
             raise RuntimeError("RouterRpcClient not started")
         fut: concurrent.futures.Future = concurrent.futures.Future()
-        self._queue.put((payload, timeout_ms, fut))
+        try:
+            self._queue.put_nowait((payload, timeout_ms, fut))
+        except queue.Full:
+            with self._lock:
+                self._queue_rejected += 1
+            return self._error(
+                "gateway_busy",
+                "router rpc queue is full",
+                details={
+                    "queue_depth": int(self._queue.qsize()),
+                    "queue_max": int(self._queue_max),
+                },
+            )
         timeout_s = (timeout_ms or self._timeout_ms) / 1000.0 + 0.5
         try:
             return fut.result(timeout=timeout_s)  # type: ignore[return-value]
         except concurrent.futures.TimeoutError:
-            return {
-                "ok": False,
-                "error": {
-                    "code": "gateway_timeout",
-                    "message": "router rpc timed out",
-                },
-            }
+            return self._error("gateway_timeout", "router rpc timed out")
 
     def _run(self) -> None:
         sock = self._ctx.socket(zmq.DEALER)
@@ -160,8 +211,9 @@ class TelemetryHub:
         self._lock = threading.Lock()
 
     def start(self, loop: asyncio.AbstractEventLoop) -> None:
-        if self._thread is not None:
+        if self._thread is not None and self._thread.is_alive():
             return
+        self._stop.clear()
         self._loop = loop
         self._thread = threading.Thread(
             target=self._run, name="telemetry-hub", daemon=True
@@ -172,7 +224,9 @@ class TelemetryHub:
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=2.0)
-        self._thread = None
+            if not self._thread.is_alive():
+                self._thread = None
+        self._loop = None
 
     def subscribe(self, *, maxsize: int = 100) -> asyncio.Queue:
         q: asyncio.Queue = asyncio.Queue(maxsize=maxsize)
@@ -255,8 +309,9 @@ class StreamFrameHub:
         self._latest_frame: dict[tuple[str, str], dict[str, Any]] = {}
 
     def start(self, loop: asyncio.AbstractEventLoop) -> None:
-        if self._thread is not None:
+        if self._thread is not None and self._thread.is_alive():
             return
+        self._stop.clear()
         self._loop = loop
         self._thread = threading.Thread(
             target=self._run, name="stream-frame-hub", daemon=True
@@ -267,7 +322,9 @@ class StreamFrameHub:
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=2.0)
-        self._thread = None
+            if not self._thread.is_alive():
+                self._thread = None
+        self._loop = None
         for reader in list(self._readers.values()):
             try:
                 reader.close()

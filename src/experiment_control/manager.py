@@ -32,6 +32,7 @@ from .utils.config_parsing import (
 )
 from .utils.manager_network import derive_local_connect_endpoint
 from .utils.command_journal import CommandJournal, CommandJournalSettings
+from .utils.command_interceptors import apply_command_interceptor_chain
 from .types import (
     DeviceState,
     DriverState,
@@ -776,6 +777,18 @@ class Manager:
         self._stop = False
         self._shutdown_requested = False
         self._process_guard = ProcessGuardian()
+        self._process_guard_attach_failures = 0
+        self._process_guard_last_error: str | None = None
+        self._process_guard_init_error = self._process_guard.init_error
+        if self._process_guard_init_error:
+            self._emit_log(
+                severity="warning",
+                topic="manager.process_guard.init_failed",
+                message=self._process_guard_init_error,
+                source_kind="manager",
+                source_id="manager",
+                stream="event",
+            )
 
         self._poller = zmq.Poller()
         self._poller.register(self._registry_rep, zmq.POLLIN)
@@ -851,10 +864,9 @@ class Manager:
                 payload={"device_id": device_id, "cmd": cmd},
             )
             raise
-        try:
-            self._process_guard.adopt_popen(handle.process)
-        except Exception:
-            pass
+        self._adopt_with_process_guard(
+            handle.process, target_kind="driver", target_id=device_id
+        )
         handle.driver_pid = handle.process.pid
         handle.driver_process_state = ManagedProcessState.STARTING
         handle.driver_last_exit_code = None
@@ -1296,6 +1308,39 @@ class Manager:
             str(os.getpid()),
         ]
 
+    def _adopt_with_process_guard(
+        self,
+        popen: subprocess.Popen[str] | None,
+        *,
+        target_kind: str,
+        target_id: str,
+    ) -> None:
+        if popen is None:
+            return
+        if not hasattr(self, "_process_guard_attach_failures"):
+            self._process_guard_attach_failures = 0
+        if not hasattr(self, "_process_guard_last_error"):
+            self._process_guard_last_error = None
+        try:
+            self._process_guard.adopt_popen(popen)
+        except Exception as exc:
+            self._process_guard_attach_failures += 1
+            self._process_guard_last_error = str(exc)
+            self._emit_log(
+                severity="warning",
+                topic="manager.process_guard.adopt_failed",
+                message=str(exc),
+                source_kind="manager",
+                source_id="manager",
+                stream="event",
+                payload={
+                    "target_kind": str(target_kind or "unknown"),
+                    "target_id": str(target_id or ""),
+                    "pid": int(getattr(popen, "pid", -1) or -1),
+                    "attach_failures": int(self._process_guard_attach_failures),
+                },
+            )
+
     def _require_process(self, process_id: str) -> ProcessHandle:
         handle = self._processes.get(process_id)
         if handle is None:
@@ -1424,10 +1469,9 @@ class Manager:
                 payload={"process_id": handle.spec.process_id, "argv": argv},
             )
             raise
-        try:
-            self._process_guard.adopt_popen(handle.popen)
-        except Exception:
-            pass
+        self._adopt_with_process_guard(
+            handle.popen, target_kind="process", target_id=handle.spec.process_id
+        )
         handle.pid = handle.popen.pid
         handle.state = ManagedProcessState.STARTING
         handle.rpc_endpoint = None
@@ -2964,245 +3008,52 @@ class Manager:
         self._command_interceptor_cache[key] = list(ordered)
         return ordered
 
-    def _command_interceptor_error(
-        self,
-        *,
-        code: str,
-        message: str,
-        process_id: str,
-        device_id: str,
-        action: str,
-        interceptor_id: str | None = None,
-        rule: str | None = None,
-        details: Json | None = None,
-    ) -> Json:
-        err: Json = {
-            "kind": "command_interceptor",
-            "code": code,
-            "message": message,
-            "process_id": process_id,
-            "device_id": device_id,
-            "action": action,
-        }
-        if interceptor_id is not None:
-            err["interceptor_id"] = interceptor_id
-        if rule is not None:
-            err["rule"] = rule
-        if details is not None:
-            err["details"] = details
-        return err
-
     def _apply_command_interceptors(
         self, cmd: Json, *, request_id: str | None, caller_process_id: str | None
     ) -> tuple[bool, Json | None, Json | None]:
         device_id = str(cmd.get("device_id", ""))
         action = str(cmd.get("action", ""))
         chain = self._command_interceptor_chain(device_id, action)
-        if not chain:
-            return True, cmd, None
 
-        cur_cmd: Json = {
-            "device_id": device_id,
-            "action": action,
-            "params": cmd.get("params", {}),
-        }
-        for route in chain:
-            process_id = route.process_id
+        def _is_route_available(process_id: str) -> bool:
             handle = self._processes.get(process_id)
-            if (
-                handle is None
-                or handle.state
-                not in {
-                    ManagedProcessState.STARTING,
-                    ManagedProcessState.RUNNING,
-                    ManagedProcessState.STOPPING,
-                }
-                or handle.rpc_endpoint is None
-            ):
-                err = self._command_interceptor_error(
-                    code="INTERCEPTOR_UNAVAILABLE",
-                    message=f"Interceptor {process_id!r} unavailable for {device_id}.{action}",
-                    process_id=process_id,
-                    device_id=device_id,
-                    action=action,
-                )
-                self._publish_manager_event(
-                    "manager.command_interceptor.error", {"error": err, "command": cur_cmd}
-                )
-                return False, None, err
+            if handle is None:
+                return False
+            if handle.state not in {
+                ManagedProcessState.STARTING,
+                ManagedProcessState.RUNNING,
+                ManagedProcessState.STOPPING,
+            }:
+                return False
+            return handle.rpc_endpoint is not None
 
-            meta: Json = {"request_id": request_id, "t_mono": time.monotonic()}
-            if caller_process_id:
-                meta["caller_process_id"] = caller_process_id
-            req = {"type": "command_interceptor.check", "command": cur_cmd, "meta": meta}
-
+        def _call(process_id: str, request: Json) -> tuple[str, Json | None, str | None]:
             try:
                 resp = self._call_process_rpc(
                     process_id=process_id,
-                    request=req,
+                    request=request,
                     timeout_ms=self._interceptor_rpc_timeout_ms,
                 )
+                return "ok", resp, None
             except zmq.Again:
-                err = self._command_interceptor_error(
-                    code="INTERCEPTOR_TIMEOUT",
-                    message=f"Interceptor {process_id!r} timed out for {device_id}.{action}",
-                    process_id=process_id,
-                    device_id=device_id,
-                    action=action,
-                )
-                self._publish_manager_event(
-                    "manager.command_interceptor.error", {"error": err, "command": cur_cmd}
-                )
-                return False, None, err
-            except Exception as e:
-                err = self._command_interceptor_error(
-                    code="INTERCEPTOR_UNAVAILABLE",
-                    message=f"Interceptor {process_id!r} failed for {device_id}.{action}: {e}",
-                    process_id=process_id,
-                    device_id=device_id,
-                    action=action,
-                )
-                self._publish_manager_event(
-                    "manager.command_interceptor.error", {"error": err, "command": cur_cmd}
-                )
-                return False, None, err
+                return "timeout", None, None
+            except Exception as exc:
+                return "unavailable", None, str(exc)
 
-            if not isinstance(resp, dict):
-                err = self._command_interceptor_error(
-                    code="INTERCEPTOR_BAD_RESPONSE",
-                    message=f"Interceptor {process_id!r} returned invalid response",
-                    process_id=process_id,
-                    device_id=device_id,
-                    action=action,
-                    details={"response": resp},
-                )
-                self._publish_manager_event(
-                    "manager.command_interceptor.error", {"error": err, "command": cur_cmd}
-                )
-                return False, None, err
-
-            if resp.get("ok") is False:
-                err = self._command_interceptor_error(
-                    code="INTERCEPTOR_BAD_RESPONSE",
-                    message=f"Interceptor {process_id!r} returned error response",
-                    process_id=process_id,
-                    device_id=device_id,
-                    action=action,
-                    details={"response": resp},
-                )
-                self._publish_manager_event(
-                    "manager.command_interceptor.error", {"error": err, "command": cur_cmd}
-                )
-                return False, None, err
-
-            allow = resp.get("allow")
-            if allow is True:
-                if "command" in resp:
-                    new_cmd_raw = resp.get("command")
-                    if not isinstance(new_cmd_raw, dict):
-                        err = self._command_interceptor_error(
-                            code="INTERCEPTOR_BAD_RESPONSE",
-                            message=f"Interceptor {process_id!r} returned invalid command",
-                            process_id=process_id,
-                            device_id=device_id,
-                            action=action,
-                        )
-                        self._publish_manager_event(
-                            "manager.command_interceptor.error",
-                            {"error": err, "command": cur_cmd},
-                        )
-                        return False, None, err
-                    new_device = str(new_cmd_raw.get("device_id", device_id))
-                    new_action = str(new_cmd_raw.get("action", action))
-                    if new_device != device_id or new_action != action:
-                        err = self._command_interceptor_error(
-                            code="INTERCEPTOR_BAD_RESPONSE",
-                            message=(
-                                f"Interceptor {process_id!r} attempted to change route"
-                            ),
-                            process_id=process_id,
-                            device_id=device_id,
-                            action=action,
-                        )
-                        self._publish_manager_event(
-                            "manager.command_interceptor.error",
-                            {"error": err, "command": cur_cmd},
-                        )
-                        return False, None, err
-                    if "params" in new_cmd_raw:
-                        new_params = new_cmd_raw.get("params")
-                    else:
-                        new_params = cur_cmd.get("params")
-                    if not isinstance(new_params, dict):
-                        err = self._command_interceptor_error(
-                            code="INTERCEPTOR_BAD_RESPONSE",
-                            message=f"Interceptor {process_id!r} returned invalid params",
-                            process_id=process_id,
-                            device_id=device_id,
-                            action=action,
-                        )
-                        self._publish_manager_event(
-                            "manager.command_interceptor.error",
-                            {"error": err, "command": cur_cmd},
-                        )
-                        return False, None, err
-                    new_cmd = {
-                        "device_id": device_id,
-                        "action": action,
-                        "params": new_params,
-                    }
-                    if new_cmd != cur_cmd:
-                        self._publish_manager_event(
-                            "manager.command_interceptor.modified",
-                            {
-                                "process_id": process_id,
-                                "interceptor_id": resp.get("interceptor_id"),
-                                "rule": resp.get("rule"),
-                                "note": resp.get("note"),
-                                "before": cur_cmd,
-                                "after": new_cmd,
-                            },
-                        )
-                        cur_cmd = new_cmd
-                continue
-
-            if allow is False:
-                inner = resp.get("error") or {}
-                inner_code = str(inner.get("code", "CONDITION_FAILED"))
-                inner_msg = str(inner.get("message", "Command rejected by interceptor"))
-                err = self._command_interceptor_error(
-                    code="INTERCEPTOR_REJECTED",
-                    message=inner_msg,
-                    process_id=process_id,
-                    device_id=device_id,
-                    action=action,
-                    interceptor_id=resp.get("interceptor_id"),
-                    rule=resp.get("rule"),
-                    details={
-                        "code": inner_code,
-                        "message": inner_msg,
-                        "details": inner.get("details", {}),
-                    },
-                )
-                self._publish_manager_event(
-                    "manager.command_interceptor.error", {"error": err, "command": cur_cmd}
-                )
-                return False, None, err
-
-            err = self._command_interceptor_error(
-                code="INTERCEPTOR_BAD_RESPONSE",
-                message=f"Interceptor {process_id!r} returned invalid response",
-                process_id=process_id,
-                device_id=device_id,
-                action=action,
-                details={"response": resp},
-            )
-            self._publish_manager_event(
-                "manager.command_interceptor.error", {"error": err, "command": cur_cmd}
-            )
-            return False, None, err
-
-        return True, cur_cmd, None
+        return apply_command_interceptor_chain(
+            initial_command={
+                "device_id": device_id,
+                "action": action,
+                "params": cmd.get("params", {}),
+            },
+            chain=chain,
+            request_id=request_id,
+            caller_process_id=caller_process_id,
+            is_route_available=_is_route_available,
+            call_interceptor=_call,
+            publish_event=self._publish_manager_event,
+            distinct_ok_false_message=True,
+        )
 
     def _handle_internal_rpc(self) -> None:
         """
@@ -3892,6 +3743,17 @@ class Manager:
                 manager_reachable=True,
                 reported_effective_status=None,
             )
+            process_guard = getattr(self, "_process_guard", None)
+            process_guard_enabled = bool(
+                getattr(process_guard, "available", False) if process_guard is not None else False
+            )
+            process_guard_init_error = getattr(self, "_process_guard_init_error", None)
+            if process_guard_init_error is None and process_guard is not None:
+                process_guard_init_error = getattr(process_guard, "init_error", None)
+            process_guard_attach_failures = int(
+                getattr(self, "_process_guard_attach_failures", 0) or 0
+            )
+            process_guard_last_error = getattr(self, "_process_guard_last_error", None)
             return {
                 "ok": True,
                 "result": {
@@ -3908,6 +3770,12 @@ class Manager:
                         lock_effective_status
                     ),
                     "last_orphan_cleanup": self._last_orphan_cleanup,
+                    "process_guard": {
+                        "enabled": process_guard_enabled,
+                        "init_error": process_guard_init_error,
+                        "attach_failures": process_guard_attach_failures,
+                        "last_attach_error": process_guard_last_error,
+                    },
                 },
             }
         if rtype == "manager.cleanup_orphans":
