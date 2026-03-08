@@ -15,6 +15,8 @@ import type {
 import type { PlotState } from "./types";
 import {
   DEFAULT_STREAM_OVERLAY_COUNT,
+  DEFAULT_TELEMETRY_SMOOTHING_MODE,
+  DEFAULT_TELEMETRY_SMOOTHING_WINDOW_S,
   DEFAULT_TRACE_AVERAGE_MODE,
   DEFAULT_TRACE_DECIMATOR,
   DEFAULT_TRACE_MAX_FPS,
@@ -22,6 +24,8 @@ import {
   DEFAULT_TRACE_ROLLING_WINDOW,
   DEFAULT_UNCERTAINTY_SCALE,
   normalizeShape,
+  normalizeTelemetrySmoothingMode,
+  normalizeTelemetrySmoothingWindow,
   normalizeTraceAverageMode,
   normalizeTraceDecimator,
   normalizeTraceMaxFps,
@@ -48,6 +52,8 @@ export function normalizePlotState(
     yDisplayMode: "absolute",
     yOffsetMode: "auto",
     yOffsetValue: null,
+    smoothingMode: DEFAULT_TELEMETRY_SMOOTHING_MODE,
+    smoothingWindowS: DEFAULT_TELEMETRY_SMOOTHING_WINDOW_S,
   };
   const fallback: PlotState = {
     panels: [fallbackPanel],
@@ -97,6 +103,8 @@ export function normalizePlotState(
       yDisplayMode?: unknown;
       yOffsetMode?: unknown;
       yOffsetValue?: unknown;
+      smoothingMode?: unknown;
+      smoothingWindowS?: unknown;
     };
     const id = typeof panel.id === "string" ? panel.id : "";
     if (!id) {
@@ -124,6 +132,12 @@ export function normalizePlotState(
     const yDisplayMode = panel.yDisplayMode === "delta" ? "delta" : "absolute";
     const yOffsetMode = panel.yOffsetMode === "freeze" ? "freeze" : "auto";
     const yOffsetValue = normalizeYBound(panel.yOffsetValue);
+    const smoothingMode = normalizeTelemetrySmoothingMode(
+      panel.smoothingMode ?? DEFAULT_TELEMETRY_SMOOTHING_MODE
+    );
+    const smoothingWindowS = normalizeTelemetrySmoothingWindow(
+      panel.smoothingWindowS ?? DEFAULT_TELEMETRY_SMOOTHING_WINDOW_S
+    );
     if (kind === "stream_raw" || kind === "stream_waterfall") {
       const streamRaw =
         panel.stream && typeof panel.stream === "object"
@@ -449,6 +463,8 @@ export function normalizePlotState(
       yDisplayMode,
       yOffsetMode,
       yOffsetValue,
+      smoothingMode,
+      smoothingWindowS,
     });
   }
   if (panels.length === 0) {

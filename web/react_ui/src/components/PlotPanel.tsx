@@ -1,7 +1,9 @@
 ﻿import { useEffect, useMemo, useRef } from "react";
 import uPlot from "uplot";
+import type { TelemetrySmoothingMode } from "../features/stream/types";
+import { buildTelemetrySmoothingOverlays } from "../features/stream/telemetry_smoothing";
 import { RingBuffer } from "../utils/ringBuffer";
-import { traceColorAt } from "../utils/traceColors";
+import { colorWithAlpha, traceColorAt } from "../utils/traceColors";
 import { TraceKey } from "../types";
 
 type PlotPanelProps = {
@@ -16,6 +18,15 @@ type PlotPanelProps = {
   yMax?: number | null;
   yDisplayMode?: "absolute" | "delta";
   yOffset?: number | null;
+  smoothingMode?: TelemetrySmoothingMode;
+  smoothingWindowS?: number;
+};
+
+type PanelSeriesEntry = {
+  trace: TraceKey;
+  traceIndex: number;
+  isOverlay: boolean;
+  label: string;
 };
 
 function traceKeyToId(trace: TraceKey) {
@@ -100,7 +111,7 @@ export function computeTelemetryAutoYRange(
 
 function applyTelemetryDisplayTransform(
   data: number[][],
-  traces: TraceKey[],
+  seriesEntries: readonly PanelSeriesEntry[],
   yDisplayMode: "absolute" | "delta",
   yOffset: number | null
 ): number[][] {
@@ -114,9 +125,9 @@ function applyTelemetryDisplayTransform(
   }
   const out: number[][] = [data[0]];
   for (let si = 1; si < data.length; si += 1) {
-    const trace = traces[si - 1];
+    const entry = seriesEntries[si - 1];
     const series = data[si] ?? [];
-    if (trace?.valueKind === "boolean") {
+    if (entry?.trace.valueKind === "boolean") {
       out.push(series);
       continue;
     }
@@ -199,6 +210,8 @@ export function PlotPanel({
   yMax = null,
   yDisplayMode = "absolute",
   yOffset = null,
+  smoothingMode = "none",
+  smoothingWindowS = 5,
 }: PlotPanelProps) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const plotRef = useRef<uPlot | null>(null);
@@ -238,7 +251,95 @@ export function PlotPanel({
     };
   }, []);
 
+  const smoothingModeNormalized: TelemetrySmoothingMode =
+    smoothingMode === "sma" || smoothingMode === "ema" ? smoothingMode : "none";
+  const smoothingWindowNormalized = Number.isFinite(smoothingWindowS)
+    ? Math.max(1, Math.min(300, smoothingWindowS))
+    : 5;
+  const smoothingLabel = useMemo(() => {
+    if (smoothingModeNormalized === "none") {
+      return null;
+    }
+    const prettyWindow =
+      Math.abs(smoothingWindowNormalized - Math.round(smoothingWindowNormalized)) < 1e-6
+        ? String(Math.round(smoothingWindowNormalized))
+        : smoothingWindowNormalized.toFixed(1).replace(/\.?0+$/, "");
+    return `${smoothingModeNormalized.toUpperCase()} ${prettyWindow}s`;
+  }, [smoothingModeNormalized, smoothingWindowNormalized]);
+
+  const seriesEntries = useMemo<PanelSeriesEntry[]>(() => {
+    const out: PanelSeriesEntry[] = traces.map((trace, idx) => ({
+      trace,
+      traceIndex: idx,
+      isOverlay: false,
+      label: `${trace.deviceId}.${trace.signal}`,
+    }));
+    if (smoothingModeNormalized !== "none" && smoothingLabel) {
+      for (let idx = 0; idx < traces.length; idx += 1) {
+        const trace = traces[idx];
+        if (trace.valueKind === "boolean") {
+          continue;
+        }
+        out.push({
+          trace,
+          traceIndex: idx,
+          isOverlay: true,
+          label: `${trace.deviceId}.${trace.signal} (${smoothingLabel})`,
+        });
+      }
+    }
+    return out;
+  }, [traces, smoothingModeNormalized, smoothingLabel]);
+
+  const buildPanelData = useMemo(
+    () => (): number[][] => {
+      const rawData = buildTelemetryData(traces, buffers);
+      const time = rawData[0] ?? [];
+      const rawSeries = rawData.slice(1);
+      const combined: number[][] = [time, ...rawSeries];
+      if (smoothingModeNormalized !== "none" && time.length > 0 && traces.length > 0) {
+        const overlays = buildTelemetrySmoothingOverlays(
+          time,
+          traces,
+          rawSeries,
+          smoothingModeNormalized,
+          smoothingWindowNormalized
+        );
+        const overlaysByTrace = new Map<number, number[]>(
+          overlays.map((entry) => [entry.traceIndex, entry.values])
+        );
+        for (const entry of seriesEntries) {
+          if (!entry.isOverlay) {
+            continue;
+          }
+          const overlay = overlaysByTrace.get(entry.traceIndex);
+          if (overlay && overlay.length === time.length) {
+            combined.push(overlay);
+          } else {
+            combined.push(new Array(time.length).fill(Number.NaN));
+          }
+        }
+      }
+      return applyTelemetryDisplayTransform(
+        combined,
+        seriesEntries,
+        yDisplayMode,
+        yOffset
+      );
+    },
+    [
+      traces,
+      buffers,
+      seriesEntries,
+      smoothingModeNormalized,
+      smoothingWindowNormalized,
+      yDisplayMode,
+      yOffset,
+    ]
+  );
+
   const series = useMemo(() => {
+    const smoothingActive = smoothingModeNormalized !== "none";
     return [
       {
         label: "time",
@@ -255,10 +356,22 @@ export function PlotPanel({
           return timeFormatter(numeric);
         },
       },
-      ...traces.map((trace, idx) => ({
-        label: `${trace.deviceId}.${trace.signal}`,
-        stroke: traceColorAt(idx),
-        width: 2,
+      ...seriesEntries.map((entry) => ({
+        label: entry.label,
+        stroke: entry.isOverlay
+          ? traceColorAt(entry.traceIndex)
+          : smoothingActive && entry.trace.valueKind !== "boolean"
+          ? colorWithAlpha(traceColorAt(entry.traceIndex), isDark ? 0.52 : 0.6)
+          : traceColorAt(entry.traceIndex),
+        width: entry.isOverlay
+          ? 2.4
+          : smoothingActive && entry.trace.valueKind !== "boolean"
+          ? 1.2
+          : 2,
+        dash:
+          !entry.isOverlay && smoothingActive && entry.trace.valueKind !== "boolean"
+            ? [6, 4]
+            : undefined,
         value: (
           u: uPlot,
           v: number | Date | null,
@@ -269,14 +382,14 @@ export function PlotPanel({
           if (numeric === null) {
             return "";
           }
-          if (trace.valueKind === "boolean") {
+          if (entry.trace.valueKind === "boolean") {
             return numeric >= 0.5 ? "true" : "false";
           }
           return formatNumber(numeric);
         },
       })),
     ];
-  }, [traces, timeFormatter, formatNumber]);
+  }, [seriesEntries, timeFormatter, formatNumber, isDark, smoothingModeNormalized]);
 
   const booleanOnly = useMemo(() => {
     if (traces.length === 0) {
@@ -382,13 +495,7 @@ export function PlotPanel({
         },
       ],
     };
-    const rawData = buildTelemetryData(traces, buffers);
-    const data = applyTelemetryDisplayTransform(
-      rawData,
-      traces,
-      yDisplayMode,
-      yOffset
-    );
+    const data = buildPanelData();
     plotRef.current = new uPlot(opts, data, hostRef.current);
     applyTimeWindow(plotRef.current, data, timeWindowS);
 
@@ -409,36 +516,27 @@ export function PlotPanel({
     };
   }, [
     series,
-    traces,
-    buffers,
     timeWindowS,
     yAxisLabel,
     booleanOnly,
     timeFormatter,
-      formatNumber,
-      isDark,
-      plotHeight,
-      hasManualY,
+    formatNumber,
+    isDark,
+    plotHeight,
+    hasManualY,
     yMin,
     yMax,
-    yDisplayMode,
-    yOffset,
+    buildPanelData,
   ]);
 
   useEffect(() => {
     if (!plotRef.current) {
       return;
     }
-    const rawData = buildTelemetryData(traces, buffers);
-    const data = applyTelemetryDisplayTransform(
-      rawData,
-      traces,
-      yDisplayMode,
-      yOffset
-    );
+    const data = buildPanelData();
     plotRef.current.setData(data);
     applyTimeWindow(plotRef.current, data, timeWindowS);
-  }, [tick, traces, buffers, timeWindowS, yDisplayMode, yOffset]);
+  }, [tick, timeWindowS, buildPanelData]);
 
   return <div className="plot-panel" ref={hostRef} />;
 }

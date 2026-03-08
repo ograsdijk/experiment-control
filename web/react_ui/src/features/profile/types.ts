@@ -2,6 +2,7 @@ import type { CommandDeckEntry, PinnedCommand } from "../../types";
 import type { PlotPanelState, StreamAnalysisWorkspaceConfig } from "../stream/types";
 
 export type PinnedCommandMap = Record<string, PinnedCommand[]>;
+export type PlotWorkspaceColumnsSetting = "auto" | "1" | "2" | "3" | "4";
 
 export type PlotState = {
   panels: PlotPanelState[];
@@ -13,6 +14,7 @@ export type UiProfileState = {
   navWidth: number;
   devicePanelCollapsed: boolean;
   devicePanelTab: "devices" | "deck";
+  plotWorkspaceColumns: PlotWorkspaceColumnsSetting;
   plotState: PlotState;
   deviceOrder: string[];
   telemetryCollapsedByDevice: Record<string, boolean>;
@@ -29,6 +31,7 @@ export type UiProfileFile = {
     nav_width: number;
     device_panel_collapsed?: boolean;
     device_panel_tab?: "devices" | "deck";
+    plot_workspace_columns?: PlotWorkspaceColumnsSetting;
     device_order: string[];
     telemetry_collapsed_by_device: Record<string, boolean>;
   };

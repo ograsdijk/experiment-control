@@ -1,6 +1,7 @@
 ﻿import type { Bin2dReducer } from "../../components/StreamBin2dPanel";
 import type { TraceKey } from "../../types";
 import type {
+  TelemetrySmoothingMode,
   StreamTraceAverageMode,
   StreamTraceDecimator,
   YScaleMode,
@@ -19,6 +20,8 @@ export const DEFAULT_TRACE_MAX_POINTS = 1200;
 export const DEFAULT_TRACE_MAX_FPS = 10;
 export const DEFAULT_TRACE_ROLLING_WINDOW = 1;
 export const DEFAULT_TRACE_AVERAGE_MODE: StreamTraceAverageMode = "block";
+export const DEFAULT_TELEMETRY_SMOOTHING_MODE: TelemetrySmoothingMode = "none";
+export const DEFAULT_TELEMETRY_SMOOTHING_WINDOW_S = 5;
 export const DEFAULT_WATERFALL_ROWS = 120;
 export const DEFAULT_STREAM_OVERLAY_COUNT = 1;
 export const DEFAULT_BIN2D_REDUCER: Bin2dReducer = "mean";
@@ -119,6 +122,24 @@ export function normalizeTraceAverageMode(
     return "rolling";
   }
   return "block";
+}
+
+export function normalizeTelemetrySmoothingMode(
+  value: unknown
+): TelemetrySmoothingMode {
+  const raw = String(value ?? "").trim().toLowerCase();
+  if (raw === "sma" || raw === "ema") {
+    return raw;
+  }
+  return "none";
+}
+
+export function normalizeTelemetrySmoothingWindow(value: unknown): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) {
+    return DEFAULT_TELEMETRY_SMOOTHING_WINDOW_S;
+  }
+  return Math.max(1, Math.min(300, parsed));
 }
 
 export function dagOutputKindColor(kind: string | null | undefined): string {

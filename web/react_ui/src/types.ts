@@ -149,9 +149,11 @@ export type PinnedCommand = {
 };
 
 export type CommandDeckTargetKind = "device" | "process";
+export type CommandDeckEntryKind = "command" | "telemetry";
 
-export type CommandDeckEntry = {
+export type CommandDeckCommandEntry = {
   id: string;
+  kind?: "command";
   targetKind: CommandDeckTargetKind;
   targetId: string;
   action: string;
@@ -160,6 +162,20 @@ export type CommandDeckEntry = {
   paramsDraft?: Record<string, string>;
   createdAt?: number | null;
 };
+
+export type CommandDeckTelemetryEntry = {
+  id: string;
+  kind: "telemetry";
+  deviceId: string;
+  signal: string;
+  format?: "auto" | "fixed" | "scientific";
+  decimals?: number | null;
+  label?: string | null;
+  group?: string | null;
+  createdAt?: number | null;
+};
+
+export type CommandDeckEntry = CommandDeckCommandEntry | CommandDeckTelemetryEntry;
 
 export type RouteMatch = {
   device_id: string;

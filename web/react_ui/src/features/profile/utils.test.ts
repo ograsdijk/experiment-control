@@ -83,6 +83,26 @@ describe("profile normalizeUiProfile", () => {
     expect(profile?.devicePanelTab).toBe("devices");
   });
 
+  it("reads layout.plot_workspace_columns", () => {
+    const profile = normalizeUiProfile(
+      {
+        layout: {
+          nav_width: 380,
+          plot_workspace_columns: "3",
+        },
+      },
+      {
+        defaultNavWidth: 360,
+        navMin: 260,
+        navMax: 900,
+        normalizePlotState,
+        normalizeStreamWorkspaceRecord: () => ({}),
+      }
+    );
+    expect(profile).not.toBeNull();
+    expect(profile?.plotWorkspaceColumns).toBe("3");
+  });
+
   it("reads command deck entries from commands.command_deck", () => {
     const profile = normalizeUiProfile(
       {
@@ -143,5 +163,44 @@ describe("profile normalizeUiProfile", () => {
     expect(profile?.commandDeck[0].targetKind).toBe("process");
     expect(profile?.commandDeck[0].targetId).toBe("bias_sequence");
     expect(profile?.commandDeck[0].action).toBe("turn_on");
+  });
+
+  it("accepts telemetry deck entries", () => {
+    const profile = normalizeUiProfile(
+      {
+        layout: { nav_width: 380 },
+        commands: {
+          command_deck: [
+            {
+              id: "deck-telem-1",
+              kind: "telemetry",
+              device_id: "laser",
+              signal: "frequency_hz",
+              format: "scientific",
+              decimals: 4,
+              label: "Readback",
+              group: "Scan",
+            },
+          ],
+        },
+      },
+      {
+        defaultNavWidth: 360,
+        navMin: 260,
+        navMax: 900,
+        normalizePlotState,
+        normalizeStreamWorkspaceRecord: () => ({}),
+      }
+    );
+    expect(profile).not.toBeNull();
+    expect(profile?.commandDeck).toHaveLength(1);
+    const entry = profile?.commandDeck[0];
+    expect(entry?.kind).toBe("telemetry");
+    if (entry && entry.kind === "telemetry") {
+      expect(entry.deviceId).toBe("laser");
+      expect(entry.signal).toBe("frequency_hz");
+      expect(entry.format).toBe("scientific");
+      expect(entry.decimals).toBe(4);
+    }
   });
 });

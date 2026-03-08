@@ -4,23 +4,12 @@ import { StreamBin2dOptionsModal } from "./StreamBin2dOptionsModal";
 import { StreamBinStatsOptionsModal } from "./StreamBinStatsOptionsModal";
 import { StreamParamsOptionsModal } from "./StreamParamsOptionsModal";
 import { StreamTraceOptionsModal } from "./StreamTraceOptionsModal";
-import { YAxisModal } from "./YAxisModal";
 
 type Props = {
   expandedPlotOpened: boolean;
   onCloseExpandedPlot: () => void;
   expandedPlotTitle: string;
   expandedPlotContent: ReactNode;
-  yAxisOpened: boolean;
-  onCloseYAxis: () => void;
-  yAxisTitle: string;
-  yAxisAutoRange: boolean;
-  yAxisDraftMin: string;
-  onYAxisDraftMinChange: (value: string) => void;
-  yAxisDraftMax: string;
-  onYAxisDraftMaxChange: (value: string) => void;
-  yAxisDraftInvalid: boolean;
-  onApplyYAxis: () => void;
   streamTraceOpened: boolean;
   onCloseStreamTrace: () => void;
   streamTracePanel: ComponentProps<typeof StreamTraceOptionsModal>["panel"];
@@ -130,16 +119,6 @@ export function PlotModalsLayer({
   onCloseExpandedPlot,
   expandedPlotTitle,
   expandedPlotContent,
-  yAxisOpened,
-  onCloseYAxis,
-  yAxisTitle,
-  yAxisAutoRange,
-  yAxisDraftMin,
-  onYAxisDraftMinChange,
-  yAxisDraftMax,
-  onYAxisDraftMaxChange,
-  yAxisDraftInvalid,
-  onApplyYAxis,
   streamTraceOpened,
   onCloseStreamTrace,
   streamTracePanel,
@@ -196,19 +175,6 @@ export function PlotModalsLayer({
       >
         {expandedPlotContent}
       </Modal>
-
-      <YAxisModal
-        opened={yAxisOpened}
-        onClose={onCloseYAxis}
-        title={yAxisTitle}
-        autoRange={yAxisAutoRange}
-        draftMin={yAxisDraftMin}
-        onDraftMinChange={onYAxisDraftMinChange}
-        draftMax={yAxisDraftMax}
-        onDraftMaxChange={onYAxisDraftMaxChange}
-        draftInvalid={yAxisDraftInvalid}
-        onApply={onApplyYAxis}
-      />
 
       <StreamTraceOptionsModal
         opened={streamTraceOpened}

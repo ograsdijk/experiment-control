@@ -96,6 +96,7 @@ export type StreamTraceAverageMode = "block" | "rolling";
 export type YScaleMode = "auto" | "manual";
 export type YDisplayMode = "absolute" | "delta";
 export type YOffsetMode = "auto" | "freeze";
+export type TelemetrySmoothingMode = "none" | "sma" | "ema";
 
 export type StreamTarget = {
   deviceId: string;
@@ -160,6 +161,8 @@ export type PlotTelemetryPanelState = {
   yDisplayMode: YDisplayMode;
   yOffsetMode: YOffsetMode;
   yOffsetValue: number | null;
+  smoothingMode: TelemetrySmoothingMode;
+  smoothingWindowS: number;
 };
 
 export type PlotStreamPanelState = {
