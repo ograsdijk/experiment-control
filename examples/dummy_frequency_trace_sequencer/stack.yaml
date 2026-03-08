@@ -14,9 +14,10 @@ devices:
   glob: "*.yaml"
 
 processes:
-  dirs:
-    - processes
-  glob: "*.yaml"
+  files:
+    - processes/sequencer.yaml
+    - processes/stream_analysis.yaml
+    - processes/hdf_writer.yaml
 
 tui:
   enabled: true
@@ -26,7 +27,7 @@ tui:
 
 startup:
   start_devices: true
-  start_processes: false
+  start_processes: true
   process_order: [sequencer, stream_analysis, hdf_writer]
   wait_for_registered: true
   wait_for_online: true
