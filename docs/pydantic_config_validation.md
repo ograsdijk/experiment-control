@@ -62,6 +62,11 @@ class DeviceDriverCfg(BaseModel):
     file: str
     class_name: str
 
+class DeviceConnectCheckCfg(BaseModel):
+    enabled: bool = False
+    identity: dict[str, Any] = Field(default_factory=dict)
+    on_fail: str = "disconnect"  # disconnect | keep_connected
+
 class DeviceYaml(BaseModel):
     device_id: str
     driver: DeviceDriverCfg
@@ -71,6 +76,7 @@ class DeviceYaml(BaseModel):
     run_meta_calls: Any = None
     device_metadata: dict[str, Any] = Field(default_factory=dict)
     stream_metadata: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    connect_check: DeviceConnectCheckCfg = Field(default_factory=DeviceConnectCheckCfg)
 
     @field_validator("device_id")
     def device_id_nonempty(cls, v: str) -> str:

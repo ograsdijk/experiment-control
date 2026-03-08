@@ -49,6 +49,14 @@ Request:
 Response:
 - `{"id": 12, "status": "OK", "result": {"version": 1, "members": [...]}}`
 
+### `identity`
+Request:
+- `{"id": 13, "action": "identity", "params": {}}`
+
+Response:
+- `{"id": 13, "status": "OK", "result": {"model": "...", "serial_number": "...", "...": "..."}}`
+- `{"id": 13, "status": "ERROR", "error_code": "identity_not_supported", "error": "identity not supported"}`
+
 ## DeviceRouter external RPC (ROUTER)
 
 ### `command`
@@ -155,6 +163,21 @@ Request:
 
 Response:
 - `{"ok": true, "result": {"version": 1, "instance_id": "laser-lock-1", "started_ts": {"t_wall": 1700000000.0, "t_mono": 12345.6}}}`
+
+### `device.connect`
+Request:
+- `{"type": "device.connect", "device_id": "dummy1"}`
+
+Response:
+- `{"ok": true, "result": {"status": "connected"}}`
+- `{"ok": false, "error": {"code": "connect_check_failed", "message": "...", "details": {"expected": {...}, "actual": {...}, "mismatch": {...}}}}`
+
+Notes:
+- If device config has `connect_check.enabled: true`, manager runs a post-connect
+  driver `identity` RPC and compares configured identity fields.
+- Default failure policy is disconnect (`connect_check.on_fail: disconnect`).
+- `connect_check.on_fail: keep_connected` keeps the link up but `device.connect`
+  still reports `ok=false` with `code=connect_check_failed`.
 
 ### `device.metadata.get`
 Request:
@@ -616,6 +639,7 @@ Response:
   - `metadata_revision`: int
   - `device_metadata`: dict
   - `stream_metadata`: dict
+  - `connect_check`: dict (`enabled`, `identity`, `on_fail`)
   - `telemetry_calls`: list
   - `stream_calls`: list
   - `run_meta_calls`: list

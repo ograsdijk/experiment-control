@@ -3,6 +3,13 @@
 ## Process lifecycle / Windows TUI
 - Verify TUI responsiveness (mouse + keyboard) remains stable under long-running sessions.
 
+## Device connect checks
+- Identity-based connect check is implemented (`connect_check.identity` + default `on_fail: disconnect`).
+- Follow-ups:
+  - Add expected-value sources (`env`, startup input map) so serial/model expectations don't have to be hardcoded.
+  - Add custom callable/action-based connect checks (beyond fixed `identity`).
+  - Add richer comparators (regex/set/range) for identity fields.
+
 ## GUI (React Web UI) design + implementation
 - Sequencer workflow snippets/presets:
   - Add an "Insert snippet" library in the Sequencer YAML editor (not generic stack config).

@@ -13,7 +13,7 @@ import sys
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Callable, TextIO
@@ -169,6 +169,58 @@ def _coerce_stream_metadata(raw: object) -> dict[str, dict[str, Any]]:
     return out
 
 
+@dataclass(frozen=True)
+class ConnectCheckSpec:
+    enabled: bool = False
+    identity: dict[str, Any] = field(default_factory=dict)
+    on_fail: str = "disconnect"
+
+
+def _coerce_connect_check(raw: object) -> ConnectCheckSpec:
+    if raw is None:
+        return ConnectCheckSpec()
+
+    obj = require_dict(raw, path=["connect_check"])
+    enabled_raw = obj.get("enabled", True)
+    if not isinstance(enabled_raw, bool):
+        raise ConfigError("connect_check.enabled", "must be a bool")
+    enabled = bool(enabled_raw)
+
+    identity_raw = obj.get("identity", {})
+    if identity_raw is None:
+        identity_raw = {}
+    identity_obj = require_dict(identity_raw, path=["connect_check", "identity"])
+    identity: dict[str, Any] = {}
+    for key, value in identity_obj.items():
+        field_name = str(key).strip()
+        if not field_name:
+            raise ConfigError(
+                "connect_check.identity", "identity keys must be non-empty strings"
+            )
+        identity[field_name] = copy.deepcopy(value)
+
+    on_fail_raw = str(obj.get("on_fail", "disconnect")).strip().lower()
+    if not on_fail_raw:
+        on_fail_raw = "disconnect"
+    if on_fail_raw not in {"disconnect", "keep_connected"}:
+        raise ConfigError(
+            "connect_check.on_fail",
+            "must be 'disconnect' or 'keep_connected'",
+        )
+
+    if enabled and not identity:
+        raise ConfigError(
+            "connect_check.identity",
+            "must be non-empty when connect_check.enabled is true",
+        )
+
+    return ConnectCheckSpec(
+        enabled=enabled,
+        identity=identity,
+        on_fail=on_fail_raw,
+    )
+
+
 def _load_driver_defaults(
     *,
     module_name: str | None,
@@ -242,6 +294,7 @@ class DeviceSpec:
     run_meta_calls: list[RunMetaCall] | None = None
     device_metadata: dict[str, Any] | None = None
     stream_metadata: dict[str, dict[str, Any]] | None = None
+    connect_check: ConnectCheckSpec = field(default_factory=ConnectCheckSpec)
     config_yaml_text: str | None = None
     telemetry_period_s: float = 1.0
     heartbeat_period_s: float = 1.0
@@ -288,6 +341,7 @@ class DeviceHandle:
     driver_last_error: str | None = None
     driver_stop_requested_t_mono: float | None = None
     driver_next_restart_t_mono: float | None = None
+    connect_check_last: dict[str, Any] | None = None
     config_published: bool = False
 
 
@@ -390,6 +444,7 @@ def device_spec_from_yaml(path: str | Path) -> DeviceSpec:
         run_meta_calls = run_meta_calls_from_json(raw_obj.get("run_meta_calls"))
         device_metadata = _coerce_device_metadata(raw_obj.get("device_metadata"))
         stream_metadata = _coerce_stream_metadata(raw_obj.get("stream_metadata"))
+        connect_check = _coerce_connect_check(raw_obj.get("connect_check"))
         telemetry_period_s = float(raw_obj.get("telemetry_period_s", 1.0))
         heartbeat_period_s = float(raw_obj.get("heartbeat_period_s", 1.0))
         command_poll_period_s = float(raw_obj.get("command_poll_period_s", 0.01))
@@ -406,6 +461,7 @@ def device_spec_from_yaml(path: str | Path) -> DeviceSpec:
         run_meta_calls=run_meta_calls,
         device_metadata=device_metadata,
         stream_metadata=stream_metadata,
+        connect_check=connect_check,
         config_yaml_text=yaml_text,
         telemetry_period_s=telemetry_period_s,
         heartbeat_period_s=heartbeat_period_s,
@@ -1774,16 +1830,184 @@ class Manager:
         self._prune_supervisor_log_threads()
 
     def connect_device(self, device_id: str) -> Json:
-        self._require_running_driver(device_id)
-        return self._call_device_rpc(
+        handle = self._require_running_driver(device_id)
+        connect_resp = self._call_device_rpc(
             device_id=device_id, action="connect_device", params={}
         )
+        if not self._device_rpc_status_ok(connect_resp):
+            handle.connect_check_last = {
+                "ok": False,
+                "checked_at": {"t_wall": time.time(), "t_mono": time.monotonic()},
+                "message": f"connect RPC failed: {self._device_rpc_error_text(connect_resp)}",
+            }
+            return connect_resp
+
+        check = handle.spec.connect_check
+        if not check.enabled:
+            handle.connect_check_last = None
+            return connect_resp
+
+        identity_resp = self._call_device_rpc(
+            device_id=device_id,
+            action="identity",
+            params={},
+        )
+        if not self._device_rpc_status_ok(identity_resp):
+            message = (
+                "connect_check failed: identity RPC failed: "
+                f"{self._device_rpc_error_text(identity_resp)}"
+            )
+            details = {
+                "device_id": device_id,
+                "identity_error": identity_resp.get("error"),
+            }
+            return self._connect_check_failed_response(
+                handle=handle,
+                message=message,
+                details=details,
+            )
+
+        identity_result = identity_resp.get("result")
+        if not isinstance(identity_result, dict):
+            message = (
+                "connect_check failed: identity RPC must return an object/dict"
+            )
+            details = {
+                "device_id": device_id,
+                "actual_type": type(identity_result).__name__,
+            }
+            return self._connect_check_failed_response(
+                handle=handle,
+                message=message,
+                details=details,
+            )
+
+        mismatches: list[dict[str, Any]] = []
+        for field_name, expected in check.identity.items():
+            actual = identity_result.get(field_name)
+            if actual != expected:
+                mismatches.append(
+                    {
+                        "field": field_name,
+                        "expected": expected,
+                        "actual": actual,
+                    }
+                )
+
+        if mismatches:
+            mismatch = mismatches[0]
+            message = (
+                f"connect_check failed for {device_id}: identity.{mismatch['field']} "
+                f"expected {mismatch['expected']!r}, got {mismatch['actual']!r}"
+            )
+            details = {
+                "device_id": device_id,
+                "checks": mismatches,
+                "identity": identity_result,
+            }
+            return self._connect_check_failed_response(
+                handle=handle,
+                message=message,
+                details=details,
+            )
+
+        handle.connect_check_last = {
+            "ok": True,
+            "checked_at": {"t_wall": time.time(), "t_mono": time.monotonic()},
+            "message": "identity check passed",
+            "details": {
+                "expected": copy.deepcopy(check.identity),
+                "identity": copy.deepcopy(identity_result),
+            },
+        }
+        self._publish_manager_event(
+            "manager.connect_check.passed",
+            {
+                "device_id": device_id,
+                "expected": copy.deepcopy(check.identity),
+                "identity": copy.deepcopy(identity_result),
+                "ts": {"t_wall": time.time(), "t_mono": time.monotonic()},
+            },
+        )
+        return connect_resp
 
     def disconnect_device(self, device_id: str) -> Json:
         self._require_running_driver(device_id)
         return self._call_device_rpc(
             device_id=device_id, action="disconnect_device", params={}
         )
+
+    @staticmethod
+    def _device_rpc_status_ok(resp: Any) -> bool:
+        if not isinstance(resp, dict):
+            return False
+        status = resp.get("status")
+        if isinstance(status, str):
+            status_norm = status.strip().upper()
+            if status_norm == "OK":
+                return True
+            if status_norm == "ERROR":
+                return False
+        ok_value = resp.get("ok")
+        if isinstance(ok_value, bool):
+            return ok_value
+        return False
+
+    @staticmethod
+    def _device_rpc_error_text(resp: Any) -> str:
+        if not isinstance(resp, dict):
+            return str(resp)
+        err = resp.get("error")
+        if isinstance(err, str) and err.strip():
+            return err.strip()
+        if isinstance(err, dict):
+            message = err.get("message")
+            if isinstance(message, str) and message.strip():
+                return message.strip()
+            code = err.get("code")
+            if isinstance(code, str) and code.strip():
+                return code.strip()
+        return "device rpc error"
+
+    def _connect_check_failed_response(
+        self,
+        *,
+        handle: DeviceHandle,
+        message: str,
+        details: dict[str, Any],
+    ) -> Json:
+        device_id = handle.spec.device_id
+        now = {"t_wall": time.time(), "t_mono": time.monotonic()}
+        self._publish_manager_event(
+            "manager.connect_check.failed",
+            {
+                "device_id": device_id,
+                "message": message,
+                "details": details,
+                "ts": now,
+            },
+        )
+        handle.connect_check_last = {
+            "ok": False,
+            "checked_at": now,
+            "message": message,
+            "details": details,
+        }
+        if handle.spec.connect_check.on_fail != "keep_connected":
+            try:
+                self._call_device_rpc(
+                    device_id=device_id,
+                    action="disconnect_device",
+                    params={},
+                )
+            except Exception:
+                pass
+        return {
+            "status": "ERROR",
+            "error": message,
+            "error_code": "connect_check_failed",
+            "error_details": details,
+        }
 
     def _require_running_driver(self, device_id: str) -> DeviceHandle:
         handle = self._devices.get(device_id)
@@ -2099,10 +2323,20 @@ class Manager:
         if self._auto_connect_on_register:
             try:
                 resp = self.connect_device(reg.device_id)
-                self._publish_manager_event(
-                    "manager.connect_device_sent",
-                    {"device_id": reg.device_id, "response": resp},
-                )
+                if self._device_rpc_status_ok(resp):
+                    self._publish_manager_event(
+                        "manager.connect_device_sent",
+                        {"device_id": reg.device_id, "response": resp},
+                    )
+                else:
+                    self._publish_manager_event(
+                        "manager.connect_device_failed",
+                        {
+                            "device_id": reg.device_id,
+                            "error": self._device_rpc_error_text(resp),
+                            "response": resp,
+                        },
+                    )
             except Exception as e:
                 self._publish_manager_event(
                     "manager.connect_device_failed",
@@ -3143,7 +3377,16 @@ class Manager:
                     "ts": {"t_wall": time.time(), "t_mono": time.monotonic()},
                 },
             )
-            return {"ok": True, "result": resp}
+            if self._device_rpc_status_ok(resp):
+                return {"ok": True, "result": resp}
+            error: Json = {
+                "code": str(resp.get("error_code") or "device_error"),
+                "message": self._device_rpc_error_text(resp),
+            }
+            details = resp.get("error_details")
+            if isinstance(details, dict):
+                error["details"] = details
+            return {"ok": False, "error": error, "result": resp}
         if rtype == "device.disconnect":
             device_id = str(req["device_id"])
             fed_resp = self._federation_hub.forward_device_request(req)
@@ -4316,6 +4559,7 @@ class Manager:
                 "last_exit_code": handle.driver_last_exit_code,
                 "last_error": handle.driver_last_error,
             },
+            "connect_check": copy.deepcopy(handle.connect_check_last),
             "source_kind": "local",
             "is_remote": False,
             "owner_peer_id": None,
@@ -5178,6 +5422,11 @@ class Manager:
             "yaml_text": yaml_text,
             "device_metadata": device_metadata,
             "stream_metadata": stream_metadata,
+            "connect_check": {
+                "enabled": bool(handle.spec.connect_check.enabled),
+                "identity": copy.deepcopy(handle.spec.connect_check.identity),
+                "on_fail": str(handle.spec.connect_check.on_fail),
+            },
             "telemetry_calls": telemetry_calls_to_json(handle.spec.telemetry_calls),
             "stream_calls": stream_calls_to_json(list(handle.spec.stream_calls or [])),
             "run_meta_calls": run_meta_calls_to_json(
@@ -5205,6 +5454,11 @@ class Manager:
             "run_meta_calls": run_meta_calls_to_json(list(spec.run_meta_calls or [])),
             "device_metadata": spec.device_metadata or {},
             "stream_metadata": spec.stream_metadata or {},
+            "connect_check": {
+                "enabled": bool(spec.connect_check.enabled),
+                "identity": copy.deepcopy(spec.connect_check.identity),
+                "on_fail": str(spec.connect_check.on_fail),
+            },
         }
         try:
             import yaml  # type: ignore[import-not-found]

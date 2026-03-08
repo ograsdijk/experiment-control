@@ -23,9 +23,7 @@ from .types import (
     MemberParamSpec,
     MemberSpec,
     RunMetaCall,
-    RunMetaOut,
     StreamCall,
-    StreamMeta,
     StreamOut,
     TelemetryCall,
     TelemetryOut,
@@ -1139,6 +1137,22 @@ class DeviceRunner:
                     }
                 result = self.collect_run_metadata()
                 return {"id": req_id, "status": "OK", "result": result}
+
+            if action == "identity":
+                func = getattr(self._device, "identity", None)
+                if func is None or not callable(func):
+                    return {
+                        "id": req_id,
+                        "status": "ERROR",
+                        "error": "identity not supported",
+                        "error_code": "identity_not_supported",
+                    }
+                result = func()
+                return {
+                    "id": req_id,
+                    "status": "OK",
+                    "result": _jsonable_value(result),
+                }
 
             if action == "connect_device":
                 if self._device_state != DeviceState.DISCONNECTED:

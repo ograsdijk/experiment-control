@@ -1,5 +1,6 @@
+# ruff: noqa: E402
+
 import sys
-import tempfile
 from pathlib import Path
 import unittest
 
@@ -10,6 +11,7 @@ if str(SRC) not in sys.path:
 
 from experiment_control.driver import DeviceRunner
 from experiment_control.types import TelemetryCall, TelemetryOut, TelemetryQuality
+from tests._temp_utils import repo_temp_dir
 
 _DRIVER_CODE = """
 class TelemetryPropertyDevice:
@@ -35,6 +37,9 @@ class TelemetryPropertyDevice:
     def scaled_value(self, scale: float = 1.0) -> float:
         return 3.0 * float(scale)
 
+    def identity(self) -> dict[str, object]:
+        return {"serial": "SIM-001", "model": "TelemetryPropertyDevice"}
+
     def __getattr__(self, name: str):
         if name == "dynamic_value":
             return 11.0
@@ -46,9 +51,10 @@ class TelemetryPropertyDevice:
 
 class DeviceRunnerTelemetryPropertyTests(unittest.TestCase):
     def _build_runner(self, telemetry_calls: list[TelemetryCall]) -> DeviceRunner:
-        tmpdir = tempfile.TemporaryDirectory()
-        self.addCleanup(tmpdir.cleanup)
-        driver_path = Path(tmpdir.name) / "device.py"
+        ctx = repo_temp_dir("driver-telemetry-props")
+        base = ctx.__enter__()
+        self.addCleanup(ctx.__exit__, None, None, None)
+        driver_path = Path(base) / "device.py"
         driver_path.write_text(_DRIVER_CODE, encoding="utf-8")
         runner = DeviceRunner(
             device_id="dev",
@@ -141,6 +147,15 @@ class DeviceRunnerTelemetryPropertyTests(unittest.TestCase):
         self.assertAlmostEqual(got["dynamic_value"]["value"], 11.0)
         self.assertEqual(got["dynamic_callable"]["quality"], TelemetryQuality.OK)
         self.assertAlmostEqual(got["dynamic_callable"]["value"], 8.0)
+
+    def test_identity_rpc_action(self) -> None:
+        runner = self._build_runner([])
+        resp = runner._handle_rpc_request(
+            {"id": "req-1", "action": "identity", "params": {}}
+        )
+        self.assertEqual(resp.get("status"), "OK")
+        result = resp.get("result", {})
+        self.assertEqual(result.get("serial"), "SIM-001")
 
 
 if __name__ == "__main__":

@@ -196,6 +196,13 @@ stream_metadata:
     counts_to_volt: 3.05e-4
     adc_gain_db: 20.0
 
+connect_check:
+  enabled: true
+  identity:
+    model: "DummyFrequencyTrace"
+    serial_number: "DUMMY-001"
+  on_fail: disconnect   # disconnect | keep_connected
+
 telemetry_calls: []     # empty list disables defaults
 stream_calls: []        # empty list disables defaults
 
@@ -220,6 +227,18 @@ stream_calls:
 
 Notes:
 - `shape` is required and describes a single shot.
+- `connect_check` is optional and defaults to:
+  - `enabled: false`
+  - `identity: {}`
+  - `on_fail: disconnect`
+- When enabled, the manager runs a post-connect driver RPC `identity` check and compares
+  configured `identity` fields using exact equality.
+- `connect_check.identity` must be non-empty when `connect_check.enabled: true`.
+- If the identity check fails:
+  - manager reports `error_code: connect_check_failed`
+  - default behavior is to disconnect immediately (`on_fail: disconnect`)
+  - optional `on_fail: keep_connected` keeps the device connected but still reports failure
+- Last connect-check result is exposed in `device.list_status` under `connect_check`.
 - `outputs[].attrs` is stream-local metadata colocated with the stream call.
   `outputs[].units` and `outputs[].description` are also mirrored as stream attrs.
 - `device_metadata` is device-level metadata (for example device type, location,
