@@ -67,7 +67,10 @@ export function normalizeCommandDeck(raw: unknown): CommandDeckEntry[] {
     const targetKindRaw = String(
       obj.targetKind ?? obj.target_kind ?? "device"
     ).trim();
-    const targetKind = targetKindRaw === "device" ? "device" : null;
+    const targetKind =
+      targetKindRaw === "device" || targetKindRaw === "process"
+        ? targetKindRaw
+        : null;
     if (!targetKind) {
       continue;
     }

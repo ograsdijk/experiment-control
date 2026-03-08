@@ -292,6 +292,7 @@ import { RingBuffer } from "./utils/ringBuffer";
 import { colorWithAlpha, traceColorAt } from "./utils/traceColors";
 import {
   CommandDeckEntry,
+  CommandDeckTargetKind,
   CapabilityMember,
   DeviceStatus,
   LogEntry,
@@ -1690,6 +1691,34 @@ export function App() {
   }, [commandDeck]);
 
   useEffect(() => {
+    const processById = new Map(
+      processes.map((process) => [process.process_id, process])
+    );
+    const processIds = [
+      ...new Set(
+        commandDeck
+          .filter((entry) => entry.targetKind === "process")
+          .map((entry) => String(entry.targetId ?? "").trim())
+          .filter((processId) => processId.length > 0)
+      ),
+    ];
+    for (const processId of processIds) {
+      if ((capabilitiesByProcess[processId] ?? []).length > 0) {
+        continue;
+      }
+      const process = processById.get(processId);
+      if (!process) {
+        continue;
+      }
+      const state = String(process.state ?? "").toUpperCase();
+      if (!["RUNNING", "STARTING", "STOPPING"].includes(state)) {
+        continue;
+      }
+      void ensureProcessCapabilitiesLoaded(processId);
+    }
+  }, [commandDeck, capabilitiesByProcess, ensureProcessCapabilitiesLoaded, processes]);
+
+  useEffect(() => {
     try {
       localStorage.setItem("ecui.navWidth", String(navWidth));
     } catch {
@@ -2848,6 +2877,7 @@ export function App() {
   const {
     processCommandOpen,
     setProcessCommandOpen,
+    processCommandProcessId,
     processCommandAction,
     setProcessCommandParams,
     processCommandParams,
@@ -3028,11 +3058,21 @@ export function App() {
     >
   ): CommandDeckEntry => {
     const id = `deck-${Date.now()}-${commandDeckIdRef.current++}`;
-    const firstDeviceId = orderedDevices[0]?.device_id ?? "";
+    const defaultTargetKind: CommandDeckTargetKind =
+      partial?.targetKind ??
+      (orderedDevices[0]?.device_id
+        ? "device"
+        : processes[0]?.process_id
+        ? "process"
+        : "device");
+    const fallbackTargetId =
+      defaultTargetKind === "process"
+        ? (processes[0]?.process_id ?? "")
+        : (orderedDevices[0]?.device_id ?? "");
     return {
       id,
-      targetKind: partial?.targetKind ?? "device",
-      targetId: String(partial?.targetId ?? firstDeviceId).trim(),
+      targetKind: defaultTargetKind,
+      targetId: String(partial?.targetId ?? fallbackTargetId).trim(),
       action: String(partial?.action ?? "").trim(),
       label:
         typeof partial?.label === "string" && partial.label.trim().length > 0
@@ -3081,12 +3121,34 @@ export function App() {
     });
   };
 
+  const addToDeckFromProcessCommandModal = () => {
+    if (!processCommandProcessId || !processCommandAction) {
+      notifications.show({
+        color: "red",
+        title: "Cannot add to deck",
+        message: "Select process and action first.",
+      });
+      return;
+    }
+    addCommandDeckEntry({
+      targetKind: "process",
+      targetId: processCommandProcessId,
+      action: processCommandAction,
+      paramsDraft: { ...processCommandParamValues },
+    });
+    notifications.show({
+      color: "teal",
+      title: "Added to command deck",
+      message: `${processCommandProcessId}.${processCommandAction}`,
+    });
+  };
+
   const updateCommandDeckEntry = (
     entryId: string,
     patch: Partial<
       Pick<
         CommandDeckEntry,
-        "targetId" | "action" | "label" | "group" | "paramsDraft"
+        "targetKind" | "targetId" | "action" | "label" | "group" | "paramsDraft"
       >
     >
   ) => {
@@ -3095,6 +3157,10 @@ export function App() {
         if (entry.id !== entryId) {
           return entry;
         }
+        const nextTargetKind: CommandDeckTargetKind =
+          patch.targetKind !== undefined
+            ? patch.targetKind
+            : entry.targetKind;
         const nextTargetId =
           patch.targetId !== undefined ? String(patch.targetId).trim() : entry.targetId;
         const nextAction =
@@ -3116,6 +3182,7 @@ export function App() {
             : { ...(entry.paramsDraft ?? {}) };
         return {
           ...entry,
+          targetKind: nextTargetKind,
           targetId: nextTargetId,
           action: nextAction,
           label: nextLabel,
@@ -3124,6 +3191,25 @@ export function App() {
         };
       })
     );
+  };
+
+  const setCommandDeckEntryTargetKind = (
+    entryId: string,
+    targetKind: CommandDeckTargetKind
+  ) => {
+    const fallbackTargetId =
+      targetKind === "process"
+        ? (processes[0]?.process_id ?? "")
+        : (orderedDevices[0]?.device_id ?? "");
+    updateCommandDeckEntry(entryId, {
+      targetKind,
+      targetId: fallbackTargetId,
+      action: "",
+      paramsDraft: {},
+    });
+    if (targetKind === "process" && fallbackTargetId) {
+      void ensureProcessCapabilitiesLoaded(fallbackTargetId);
+    }
   };
 
   const removeCommandDeckEntry = (entryId: string) => {
@@ -3229,21 +3315,13 @@ export function App() {
     if (!entry) {
       return;
     }
-    if (entry.targetKind !== "device") {
-      notifications.show({
-        color: "red",
-        title: "Unsupported deck target",
-        message: `Unsupported target kind ${entry.targetKind}`,
-      });
-      return;
-    }
-    const deviceId = entry.targetId.trim();
+    const targetId = entry.targetId.trim();
     const action = entry.action.trim();
-    if (!deviceId || !action) {
+    if (!targetId || !action) {
       notifications.show({
         color: "red",
         title: "Invalid deck command",
-        message: "Device and action are required.",
+        message: "Target and action are required.",
       });
       return;
     }
@@ -3252,53 +3330,108 @@ export function App() {
     }
     setCommandDeckBusyById((prev) => ({ ...prev, [entryId]: true }));
     try {
-      let capabilities = capabilitiesByDevice[deviceId] ?? [];
-      if (capabilities.length === 0) {
-        const fetched = await fetchCapabilities(deviceId);
-        if (fetched.length > 0) {
-          setCapabilitiesByDevice((prev) => ({ ...prev, [deviceId]: fetched }));
-          capabilities = fetched;
+      if (entry.targetKind === "process") {
+        let capabilities = capabilitiesByProcess[targetId] ?? [];
+        if (capabilities.length === 0) {
+          capabilities = await ensureProcessCapabilitiesLoaded(targetId);
         }
-      }
-      const member = capabilities.find((candidate) => candidate.name === action);
-      const paramsMeta = effectiveDeviceMemberParams(member);
-      const draft = entry.paramsDraft ?? {};
-      const params: Record<string, unknown> = {};
-      for (const param of paramsMeta) {
-        const raw = (draft[param.name] ?? "").trim();
-        if (!raw) {
-          if (param.required) {
-            notifications.show({
-              color: "red",
-              title: "Missing parameter",
-              message: `${deviceId}.${action} requires ${param.name}`,
-            });
-            return;
+        const member = capabilities.find((candidate) => candidate.name === action);
+        const paramsMeta = member?.params ?? [];
+        const draft = entry.paramsDraft ?? {};
+        const params: Record<string, unknown> = {};
+        for (const param of paramsMeta) {
+          const raw = (draft[param.name] ?? "").trim();
+          if (!raw) {
+            if (param.required) {
+              notifications.show({
+                color: "red",
+                title: "Missing parameter",
+                message: `${targetId}.${action} requires ${param.name}`,
+              });
+              return;
+            }
+            continue;
           }
-          continue;
+          params[param.name] = coerceParamValue(raw, param);
         }
-        params[param.name] = coerceParamValue(raw, param);
-      }
-      const mapped = mapDeviceActionForMember(member, action, params);
-      const resp = await sendDeviceCommand(
-        deviceId,
-        mapped.action,
-        mapped.params,
-        "command-deck"
-      );
-      if (!resp.ok) {
+        const resp = await sendProcessCommand(
+          targetId,
+          action,
+          params,
+          "command-deck"
+        );
+        if (!resp.ok) {
+          notifications.show({
+            color: "red",
+            title: "Command failed",
+            message: `${targetId}.${action}`,
+          });
+          return;
+        }
+        notifications.show({
+          color: "teal",
+          title: "Command sent",
+          message: `${targetId}.${action}`,
+        });
+        await refreshProcesses();
+        if (action.startsWith("hdf.") || hdfWriterProcessId === targetId) {
+          await refreshHdfWriterStatus(targetId);
+        }
+      } else if (entry.targetKind === "device") {
+        let capabilities = capabilitiesByDevice[targetId] ?? [];
+        if (capabilities.length === 0) {
+          const fetched = await fetchCapabilities(targetId);
+          if (fetched.length > 0) {
+            setCapabilitiesByDevice((prev) => ({ ...prev, [targetId]: fetched }));
+            capabilities = fetched;
+          }
+        }
+        const member = capabilities.find((candidate) => candidate.name === action);
+        const paramsMeta = effectiveDeviceMemberParams(member);
+        const draft = entry.paramsDraft ?? {};
+        const params: Record<string, unknown> = {};
+        for (const param of paramsMeta) {
+          const raw = (draft[param.name] ?? "").trim();
+          if (!raw) {
+            if (param.required) {
+              notifications.show({
+                color: "red",
+                title: "Missing parameter",
+                message: `${targetId}.${action} requires ${param.name}`,
+              });
+              return;
+            }
+            continue;
+          }
+          params[param.name] = coerceParamValue(raw, param);
+        }
+        const mapped = mapDeviceActionForMember(member, action, params);
+        const resp = await sendDeviceCommand(
+          targetId,
+          mapped.action,
+          mapped.params,
+          "command-deck"
+        );
+        if (!resp.ok) {
+          notifications.show({
+            color: "red",
+            title: "Command failed",
+            message: `${targetId}.${mapped.action}`,
+          });
+          return;
+        }
+        notifications.show({
+          color: "teal",
+          title: "Command sent",
+          message: `${targetId}.${mapped.action}`,
+        });
+      } else {
         notifications.show({
           color: "red",
-          title: "Command failed",
-          message: `${deviceId}.${mapped.action}`,
+          title: "Unsupported deck target",
+          message: `Unsupported target kind ${entry.targetKind}`,
         });
-        return;
       }
-      notifications.show({
-        color: "teal",
-        title: "Command sent",
-        message: `${deviceId}.${mapped.action}`,
-      });
     } finally {
       setCommandDeckBusyById((prev) => ({ ...prev, [entryId]: false }));
     }
@@ -6819,14 +6952,22 @@ export function App() {
                 <CommandDeckPanel
                   entries={commandDeck}
                   devices={orderedDevices}
+                  processes={processes}
                   capabilitiesByDevice={capabilitiesByDevice}
+                  capabilitiesByProcess={capabilitiesByProcess}
                   busyById={commandDeckBusyById}
                   onAddEntry={() => {
-                    const created = addCommandDeckEntry();
-                    if (!created.targetId && orderedDevices[0]?.device_id) {
-                      updateCommandDeckEntry(created.id, {
-                        targetId: orderedDevices[0].device_id,
-                      });
+                    const defaultDeviceId = orderedDevices[0]?.device_id ?? "";
+                    const defaultProcessId = processes[0]?.process_id ?? "";
+                    const created = addCommandDeckEntry(
+                      defaultDeviceId
+                        ? { targetKind: "device", targetId: defaultDeviceId }
+                        : defaultProcessId
+                        ? { targetKind: "process", targetId: defaultProcessId }
+                        : undefined
+                    );
+                    if (created.targetKind === "process" && created.targetId) {
+                      void ensureProcessCapabilitiesLoaded(created.targetId);
                     }
                   }}
                   onRunEntry={(entryId) => {
@@ -6846,9 +6987,24 @@ export function App() {
                       mode
                     )
                   }
-                  onUpdateEntryTarget={(entryId, targetId) =>
-                    updateCommandDeckEntry(entryId, { targetId })
+                  onUpdateEntryTargetKind={(entryId, targetKind) =>
+                    setCommandDeckEntryTargetKind(entryId, targetKind)
                   }
+                  onUpdateEntryTarget={(entryId, targetId) => {
+                    const entry =
+                      commandDeck.find((candidate) => candidate.id === entryId) ?? null;
+                    const nextTargetId = targetId.trim();
+                    updateCommandDeckEntry(entryId, { targetId });
+                    if (
+                      nextTargetId &&
+                      (entry?.targetKind === "process" ||
+                        processes.some(
+                          (process) => process.process_id === nextTargetId
+                        ))
+                    ) {
+                      void ensureProcessCapabilitiesLoaded(nextTargetId);
+                    }
+                  }}
                   onUpdateEntryAction={(entryId, action) =>
                     updateCommandDeckEntry(entryId, { action })
                   }
@@ -8158,6 +8314,8 @@ export function App() {
         renderMeasurementFieldInput={renderMeasurementFieldInput}
         processesController={processesController}
         processCommandController={processCommandController}
+        processCommandDeckDisabled={!processCommandAction || !processCommandProcessId}
+        onAddProcessCommandToDeck={addToDeckFromProcessCommandModal}
         onProcessAction={handleProcessAction}
         settingsOpen={settingsOpen}
         setSettingsOpen={setSettingsOpen}

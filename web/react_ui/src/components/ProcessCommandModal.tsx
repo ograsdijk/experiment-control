@@ -1,4 +1,4 @@
-﻿import {
+import {
   Button,
   Group,
   Modal,
@@ -8,6 +8,7 @@
   Text,
   Textarea,
 } from "@mantine/core";
+import { IconPlaylistAdd } from "@tabler/icons-react";
 import { ParamInput } from "./ParamInput";
 import type { CapabilityMember } from "../types";
 
@@ -27,6 +28,8 @@ type Props = {
   onParamValueChange: (name: string, value: string) => void;
   commandParams: string;
   onCommandParamsChange: (value: string) => void;
+  deckDisabled?: boolean;
+  onAddToDeck?: () => void;
   onExecute: () => void;
 };
 
@@ -44,10 +47,19 @@ export function ProcessCommandModal({
   onParamValueChange,
   commandParams,
   onCommandParamsChange,
+  deckDisabled,
+  onAddToDeck,
   onExecute,
 }: Props) {
   return (
-    <Modal opened={opened} onClose={onClose} title={title} size="clamp(42rem, 82vw, 64rem)" centered zIndex={450}>
+    <Modal
+      opened={opened}
+      onClose={onClose}
+      title={title}
+      size="clamp(42rem, 82vw, 64rem)"
+      centered
+      zIndex={450}
+    >
       <Stack gap="md">
         <Group align="flex-end" justify="space-between">
           <Select
@@ -94,6 +106,14 @@ export function ProcessCommandModal({
           label="Advanced JSON params"
         />
         <Group justify="flex-end">
+          <Button
+            variant="light"
+            leftSection={<IconPlaylistAdd size={14} />}
+            onClick={onAddToDeck}
+            disabled={deckDisabled || !onAddToDeck}
+          >
+            Add to Deck
+          </Button>
           <Button variant="light" onClick={onClose}>
             Cancel
           </Button>
@@ -103,3 +123,4 @@ export function ProcessCommandModal({
     </Modal>
   );
 }
+

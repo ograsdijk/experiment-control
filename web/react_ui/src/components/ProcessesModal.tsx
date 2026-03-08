@@ -1,13 +1,15 @@
-﻿import {
+import {
   Badge,
   Button,
   Card,
   Group,
   Modal,
+  Select,
   Stack,
   Text,
 } from "@mantine/core";
 import { IconRefresh } from "@tabler/icons-react";
+import { useEffect, useState } from "react";
 import { processStateColor } from "../features/runtime/helpers";
 import type { CapabilityMember, ProcessStatus } from "../types";
 
@@ -37,6 +39,40 @@ export function ProcessesModal({
   onProcessAction,
   onOpenCommand,
 }: Props) {
+  const [selectedActionByProcess, setSelectedActionByProcess] = useState<
+    Record<string, string>
+  >({});
+
+  useEffect(() => {
+    setSelectedActionByProcess((prev) => {
+      let changed = false;
+      const next: Record<string, string> = {};
+      for (const process of processes) {
+        const processId = process.process_id;
+        const commands = (capabilitiesByProcess[processId] ?? [])
+          .map((capability) => capability.name)
+          .sort((a, b) => a.localeCompare(b));
+        if (commands.length === 0) {
+          if (Object.prototype.hasOwnProperty.call(prev, processId)) {
+            changed = true;
+          }
+          continue;
+        }
+        const previous = prev[processId];
+        const chosen =
+          previous && commands.includes(previous) ? previous : commands[0];
+        next[processId] = chosen;
+        if (previous !== chosen) {
+          changed = true;
+        }
+      }
+      if (!changed && Object.keys(prev).length !== Object.keys(next).length) {
+        changed = true;
+      }
+      return changed ? next : prev;
+    });
+  }, [processes, capabilitiesByProcess]);
+
   return (
     <Modal
       opened={opened}
@@ -72,6 +108,8 @@ export function ProcessesModal({
           const commands = (capabilitiesByProcess[processId] ?? [])
             .map((capability) => capability.name)
             .sort((a, b) => a.localeCompare(b));
+          const selectedAction =
+            selectedActionByProcess[processId] ?? commands[0] ?? "";
           const busy = Boolean(busyByProcess[processId]);
           const error = errorByProcess[processId];
           return (
@@ -127,20 +165,33 @@ export function ProcessesModal({
                     </Button>
                   </Group>
                 </Group>
-                <Group gap="xs" wrap="wrap">
-                  {commands.map((name) => (
+                {commands.length > 0 ? (
+                  <Group align="flex-end" wrap="nowrap">
+                    <Select
+                      size="xs"
+                      label="Action"
+                      value={selectedAction || null}
+                      data={commands.map((name) => ({ value: name, label: name }))}
+                      searchable
+                      allowDeselect={false}
+                      flex={1}
+                      onChange={(value) =>
+                        setSelectedActionByProcess((prev) => ({
+                          ...prev,
+                          [processId]: value ?? "",
+                        }))
+                      }
+                    />
                     <Button
-                      key={`${processId}:${name}`}
                       size="xs"
                       variant="light"
-                      onClick={() => onOpenCommand(processId, name)}
-                      disabled={busy}
+                      onClick={() => onOpenCommand(processId, selectedAction)}
+                      disabled={busy || !selectedAction}
                     >
-                      {name}
+                      Command
                     </Button>
-                  ))}
-                </Group>
-                {commands.length === 0 && (
+                  </Group>
+                ) : (
                   <Text size="xs" c="dimmed">
                     {error ?? "No process commands available yet."}
                   </Text>

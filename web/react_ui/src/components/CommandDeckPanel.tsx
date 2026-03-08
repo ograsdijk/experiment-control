@@ -25,7 +25,13 @@ import {
 import { useEffect, useMemo, useState, type DragEvent } from "react";
 import { effectiveDeviceMemberParams } from "../features/devices/command_schema";
 import { computeVerticalReorderMode } from "../features/layout/reorder";
-import type { CapabilityMember, CommandDeckEntry, DeviceStatus } from "../types";
+import type {
+  CapabilityMember,
+  CommandDeckEntry,
+  CommandDeckTargetKind,
+  DeviceStatus,
+  ProcessStatus,
+} from "../types";
 import { DeviceNameInline } from "./DeviceNameInline";
 
 function normalizeGroupName(raw: string | null | undefined): string {
@@ -36,7 +42,9 @@ function normalizeGroupName(raw: string | null | undefined): string {
 type Props = {
   entries: CommandDeckEntry[];
   devices: DeviceStatus[];
+  processes: ProcessStatus[];
   capabilitiesByDevice: Record<string, CapabilityMember[]>;
+  capabilitiesByProcess: Record<string, CapabilityMember[]>;
   busyById: Record<string, boolean>;
   onAddEntry: () => void;
   onRunEntry: (entryId: string) => void;
@@ -48,6 +56,7 @@ type Props = {
     targetEntryId: string,
     mode: "before" | "after" | "swap"
   ) => void;
+  onUpdateEntryTargetKind: (entryId: string, targetKind: CommandDeckTargetKind) => void;
   onUpdateEntryTarget: (entryId: string, targetId: string) => void;
   onUpdateEntryAction: (entryId: string, action: string) => void;
   onUpdateEntryLabel: (entryId: string, label: string) => void;
@@ -58,7 +67,9 @@ type Props = {
 export function CommandDeckPanel({
   entries,
   devices,
+  processes,
   capabilitiesByDevice,
+  capabilitiesByProcess,
   busyById,
   onAddEntry,
   onRunEntry,
@@ -66,6 +77,7 @@ export function CommandDeckPanel({
   onMoveEntryUp,
   onMoveEntryDown,
   onReorderEntry,
+  onUpdateEntryTargetKind,
   onUpdateEntryTarget,
   onUpdateEntryAction,
   onUpdateEntryLabel,
@@ -87,6 +99,10 @@ export function CommandDeckPanel({
     () => new Map(devices.map((device) => [device.device_id, device])),
     [devices]
   );
+  const processById = useMemo(
+    () => new Map(processes.map((process) => [process.process_id, process])),
+    [processes]
+  );
   const deviceOptions = useMemo(() => {
     const items = devices.map((device) => {
       const suffix = device.is_remote ? " (remote)" : "";
@@ -98,6 +114,14 @@ export function CommandDeckPanel({
     items.sort((a, b) => a.label.localeCompare(b.label));
     return items;
   }, [devices]);
+  const processOptions = useMemo(() => {
+    const items = processes.map((process) => ({
+      value: process.process_id,
+      label: process.process_id,
+    }));
+    items.sort((a, b) => a.label.localeCompare(b.label));
+    return items;
+  }, [processes]);
   const knownGroupNames = useMemo(() => {
     const values = new Set<string>();
     for (const entry of entries) {
@@ -287,7 +311,12 @@ export function CommandDeckPanel({
                   {!collapsed && (
                     <Stack gap="xs">
                       {groupEntries.map((entry) => {
-                        const capabilities = capabilitiesByDevice[entry.targetId] ?? [];
+                        const targetKind: CommandDeckTargetKind =
+                          entry.targetKind === "process" ? "process" : "device";
+                        const capabilities =
+                          targetKind === "process"
+                            ? capabilitiesByProcess[entry.targetId] ?? []
+                            : capabilitiesByDevice[entry.targetId] ?? [];
                         const optionsOpen = expandedByEntryId[entry.id] === true;
                         const actionOptions = capabilities
                           .map((candidate) => ({
@@ -304,14 +333,17 @@ export function CommandDeckPanel({
                             label: `${entry.action} (current)`,
                           });
                         }
-                        const entryDeviceOptions = [...deviceOptions];
+                        const entryTargetOptions =
+                          targetKind === "process"
+                            ? [...processOptions]
+                            : [...deviceOptions];
                         if (
                           entry.targetId &&
-                          !entryDeviceOptions.some(
+                          !entryTargetOptions.some(
                             (option) => option.value === entry.targetId
                           )
                         ) {
-                          entryDeviceOptions.unshift({
+                          entryTargetOptions.unshift({
                             value: entry.targetId,
                             label: `${entry.targetId} (current)`,
                           });
@@ -342,7 +374,10 @@ export function CommandDeckPanel({
                         const member = capabilities.find(
                           (candidate) => candidate.name === entry.action
                         );
-                        const params = effectiveDeviceMemberParams(member);
+                        const params =
+                          targetKind === "process"
+                            ? (member?.params ?? [])
+                            : effectiveDeviceMemberParams(member);
                         const draft = entry.paramsDraft ?? {};
                         const buttonText = String(entry.label ?? "").trim() || entry.action;
                         const buttonTooltip =
@@ -511,21 +546,57 @@ export function CommandDeckPanel({
                               >
                                 <Stack gap={6}>
                                   <Text size="xs" c="dimmed">
-                                    <DeviceNameInline
-                                      deviceId={entry.targetId}
-                                      device={deviceById.get(entry.targetId) ?? null}
-                                    />{" "}
-                                    .{entry.action || "(select action)"}
+                                    {targetKind === "process" ? (
+                                      <>
+                                        process:
+                                        {processById.get(entry.targetId)?.process_id ??
+                                          entry.targetId}{" "}
+                                        .{entry.action || "(select action)"}
+                                      </>
+                                    ) : (
+                                      <>
+                                        <DeviceNameInline
+                                          deviceId={entry.targetId}
+                                          device={deviceById.get(entry.targetId) ?? null}
+                                        />{" "}
+                                        .{entry.action || "(select action)"}
+                                      </>
+                                    )}
                                   </Text>
                                   <Group grow>
                                     <Select
                                       size="xs"
-                                      label="Device"
-                                      data={entryDeviceOptions}
+                                      label="Target kind"
+                                      data={[
+                                        { value: "device", label: "Device" },
+                                        { value: "process", label: "Process" },
+                                      ]}
+                                      value={targetKind}
+                                      allowDeselect={false}
+                                      onChange={(value) => {
+                                        if (value === "device" || value === "process") {
+                                          onUpdateEntryTargetKind(entry.id, value);
+                                        }
+                                      }}
+                                    />
+                                  </Group>
+                                  <Group grow>
+                                    <Select
+                                      size="xs"
+                                      label={targetKind === "process" ? "Process" : "Device"}
+                                      data={entryTargetOptions}
                                       value={entry.targetId || null}
                                       searchable
-                                      nothingFoundMessage="No devices"
-                                      placeholder="Select device"
+                                      nothingFoundMessage={
+                                        targetKind === "process"
+                                          ? "No processes"
+                                          : "No devices"
+                                      }
+                                      placeholder={
+                                        targetKind === "process"
+                                          ? "Select process"
+                                          : "Select device"
+                                      }
                                       onChange={(value) => {
                                         if (typeof value === "string") {
                                           onUpdateEntryTarget(entry.id, value);
@@ -542,11 +613,15 @@ export function CommandDeckPanel({
                                       nothingFoundMessage={
                                         entry.targetId
                                           ? "No command capabilities"
+                                          : targetKind === "process"
+                                          ? "Select a process first"
                                           : "Select a device first"
                                       }
                                       placeholder={
                                         entry.targetId
                                           ? "Select command"
+                                          : targetKind === "process"
+                                          ? "Select a process first"
                                           : "Select a device first"
                                       }
                                       onChange={(value) => {

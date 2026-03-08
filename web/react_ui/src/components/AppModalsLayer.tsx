@@ -45,6 +45,8 @@ type Props = {
   >["renderMeasurementFieldInput"];
   processesController: ProcessesControllerState;
   processCommandController: ProcessCommandControllerState;
+  processCommandDeckDisabled: boolean;
+  onAddProcessCommandToDeck: () => void;
   onProcessAction: ComponentProps<typeof ProcessesModal>["onProcessAction"];
   settingsOpen: boolean;
   setSettingsOpen: Dispatch<SetStateAction<boolean>>;
@@ -103,6 +105,8 @@ export function AppModalsLayer({
   renderMeasurementFieldInput,
   processesController,
   processCommandController,
+  processCommandDeckDisabled,
+  onAddProcessCommandToDeck,
   onProcessAction,
   settingsOpen,
   setSettingsOpen,
@@ -183,6 +187,8 @@ export function AppModalsLayer({
         }
         commandParams={processCommandController.processCommandParams}
         onCommandParamsChange={processCommandController.setProcessCommandParams}
+        deckDisabled={processCommandDeckDisabled}
+        onAddToDeck={onAddProcessCommandToDeck}
         onExecute={processCommandController.executeProcessCommand}
       />
 

@@ -113,4 +113,35 @@ describe("profile normalizeUiProfile", () => {
     expect(profile?.commandDeck[0].targetId).toBe("laser");
     expect(profile?.commandDeck[0].action).toBe("set_frequency_hz");
   });
+
+  it("accepts process command deck entries", () => {
+    const profile = normalizeUiProfile(
+      {
+        layout: { nav_width: 380 },
+        commands: {
+          command_deck: [
+            {
+              id: "deck-proc-1",
+              target_kind: "process",
+              target_id: "bias_sequence",
+              action: "turn_on",
+              label: "Bias ON",
+            },
+          ],
+        },
+      },
+      {
+        defaultNavWidth: 360,
+        navMin: 260,
+        navMax: 900,
+        normalizePlotState,
+        normalizeStreamWorkspaceRecord: () => ({}),
+      }
+    );
+    expect(profile).not.toBeNull();
+    expect(profile?.commandDeck).toHaveLength(1);
+    expect(profile?.commandDeck[0].targetKind).toBe("process");
+    expect(profile?.commandDeck[0].targetId).toBe("bias_sequence");
+    expect(profile?.commandDeck[0].action).toBe("turn_on");
+  });
 });

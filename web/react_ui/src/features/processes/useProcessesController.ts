@@ -1,4 +1,4 @@
-﻿import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { fetchProcesses, type ApiResponse } from "../../api";
 import type { CapabilityMember, ProcessStatus } from "../../types";
 
@@ -9,6 +9,38 @@ type UseProcessesControllerArgs = {
     params: Record<string, unknown>
   ) => Promise<ApiResponse<unknown>>;
 };
+
+function extractCapabilityMembers(
+  value: unknown
+): CapabilityMember[] {
+  if (!value || typeof value !== "object") {
+    return [];
+  }
+  const direct = value as { members?: unknown };
+  if (Array.isArray(direct.members)) {
+    return direct.members as CapabilityMember[];
+  }
+  const nested = value as { result?: unknown };
+  if (nested.result && typeof nested.result === "object") {
+    const inner = nested.result as { members?: unknown };
+    if (Array.isArray(inner.members)) {
+      return inner.members as CapabilityMember[];
+    }
+  }
+  return [];
+}
+
+function isProcessRpcReady(process: ProcessStatus | undefined): boolean {
+  if (!process) {
+    return false;
+  }
+  if (typeof process.registered === "boolean") {
+    return process.registered;
+  }
+  const endpoint =
+    typeof process.rpc_endpoint === "string" ? process.rpc_endpoint.trim() : "";
+  return endpoint.length > 0;
+}
 
 export function useProcessesController({ callProcessFn }: UseProcessesControllerArgs) {
   const [processes, setProcesses] = useState<ProcessStatus[]>([]);
@@ -39,7 +71,7 @@ export function useProcessesController({ callProcessFn }: UseProcessesController
         return existing;
       }
       const process = processes.find((item) => item.process_id === processId);
-      if (process && process.registered !== true) {
+      if (process && !isProcessRpcReady(process)) {
         setProcessCapabilitiesErrorById((prev) => ({
           ...prev,
           [processId]: "Process RPC endpoint is not ready.",
@@ -47,11 +79,7 @@ export function useProcessesController({ callProcessFn }: UseProcessesController
         return [];
       }
       const resp = await callProcessFn(processId, "process.capabilities", {});
-      const result =
-        resp.result && typeof resp.result === "object"
-          ? (resp.result as { members?: CapabilityMember[] })
-          : undefined;
-      const members = Array.isArray(result?.members) ? result.members : [];
+      const members = extractCapabilityMembers(resp.result);
       if (resp.ok && members.length > 0) {
         setCapabilitiesByProcess((prev) => ({ ...prev, [processId]: members }));
         setProcessCapabilitiesErrorById((prev) => {
@@ -130,7 +158,7 @@ export function useProcessesController({ callProcessFn }: UseProcessesController
           errors[processId] = "Process RPC is unavailable while process is stopped.";
           continue;
         }
-        if (process.registered !== true) {
+        if (!isProcessRpcReady(process)) {
           errors[processId] = "Process RPC endpoint is not ready.";
           continue;
         }
@@ -138,11 +166,7 @@ export function useProcessesController({ callProcessFn }: UseProcessesController
         if (cancelled) {
           return;
         }
-        const result =
-          resp.result && typeof resp.result === "object"
-            ? (resp.result as { members?: CapabilityMember[] })
-            : undefined;
-        const members = Array.isArray(result?.members) ? result.members : [];
+        const members = extractCapabilityMembers(resp.result);
         if (resp.ok && members.length > 0) {
           nextCaps[processId] = members;
           continue;

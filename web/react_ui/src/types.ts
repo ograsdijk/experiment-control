@@ -149,7 +149,7 @@ export type PinnedCommand = {
   label?: string | null;
 };
 
-export type CommandDeckTargetKind = "device";
+export type CommandDeckTargetKind = "device" | "process";
 
 export type CommandDeckEntry = {
   id: string;
