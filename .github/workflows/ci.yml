@@ -42,6 +42,9 @@ jobs:
       - name: Lint Python
         run: uv run ruff check src tests examples
 
+      - name: Complexity guard (incremental)
+        run: uv run ruff check src/experiment_control/utils/command_interceptors.py src/experiment_control/utils/network_hosts.py --select C901
+
       - name: Run Python tests
         run: uv run python -m unittest discover -s tests -p "test_*.py" -q
 
