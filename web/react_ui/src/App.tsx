@@ -14,6 +14,7 @@
   Menu,
   Select,
   NumberInput,
+  Popover,
   Switch,
   SegmentedControl,
   useComputedColorScheme,
@@ -45,6 +46,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type CSSProperties,
   type ChangeEvent,
   type DragEvent,
 } from "react";
@@ -129,6 +131,7 @@ import type {
   PinnedCommandMap,
   PinnedParamDrafts,
   PlotState,
+  PlotWorkspaceColumnsSetting,
   UiProfileFile,
   UiProfileState,
 } from "./features/profile/types";
@@ -136,6 +139,7 @@ import {
   clampNavWidth,
   normalizeCommandDeck,
   normalizePinnedCommands,
+  normalizePlotWorkspaceColumnsSetting,
   normalizeUiProfile,
 } from "./features/profile/utils";
 import { normalizePlotState, serializePlotState } from "./features/profile/plot_state";
@@ -185,6 +189,7 @@ import type {
   StreamParamsOutputValue,
   StreamWorkspaceStoreStatus,
   StreamWorkspaceSummary,
+  TelemetrySmoothingMode,
   TraceDragPayload,
   YDisplayMode,
   YOffsetMode,
@@ -235,6 +240,8 @@ import {
   DEFAULT_BIN_OUTPUT_ID,
   DEFAULT_BIN_X_MAX,
   DEFAULT_BIN_X_MIN,
+  DEFAULT_TELEMETRY_SMOOTHING_MODE,
+  DEFAULT_TELEMETRY_SMOOTHING_WINDOW_S,
   DEFAULT_INTEGRAL_OUTPUT_ID,
   DEFAULT_STREAM_CONTEXT_FIELD,
   DEFAULT_STREAM_OVERLAY_COUNT,
@@ -247,6 +254,8 @@ import {
   DEFAULT_WATERFALL_ROWS,
   inferChannelCountFromShape,
   normalizeShape,
+  normalizeTelemetrySmoothingMode,
+  normalizeTelemetrySmoothingWindow,
   normalizeTraceAverageMode,
   normalizeTraceDecimator,
   normalizeTraceMaxFps,
@@ -291,7 +300,9 @@ import { useSequencerController } from "./features/sequencer/useSequencerControl
 import { RingBuffer } from "./utils/ringBuffer";
 import { colorWithAlpha, traceColorAt } from "./utils/traceColors";
 import {
+  CommandDeckCommandEntry,
   CommandDeckEntry,
+  CommandDeckTelemetryEntry,
   CommandDeckTargetKind,
   CapabilityMember,
   DeviceStatus,
@@ -312,6 +323,7 @@ const DEFAULT_BUFFER_POINTS = 500;
 const DEFAULT_NAV_WIDTH = 360;
 const NAV_MIN_WIDTH = 260;
 const NAV_MAX_WIDTH = 900;
+const PLOT_GRID_MOBILE_BREAKPOINT = 900;
 const MAX_LOG_ROWS = 2000;
 const MAX_STREAM_FRAME_BUFFER = 240;
 const STREAM_ANALYSIS_PROCESS_ID = "stream_analysis";
@@ -364,6 +376,18 @@ function normalizeDeckGroup(raw: string | null | undefined): string | null {
   return text.length > 0 ? text : null;
 }
 
+function isCommandDeckCommandEntry(
+  entry: CommandDeckEntry
+): entry is CommandDeckCommandEntry {
+  return entry.kind !== "telemetry";
+}
+
+function isCommandDeckTelemetryEntry(
+  entry: CommandDeckEntry
+): entry is CommandDeckTelemetryEntry {
+  return entry.kind === "telemetry";
+}
+
 export function App() {
   const [navWidth, setNavWidth] = useState(() => {
     try {
@@ -398,8 +422,27 @@ export function App() {
     }
     return "devices";
   });
+  const [plotWorkspaceColumns, setPlotWorkspaceColumns] =
+    useState<PlotWorkspaceColumnsSetting>(() => {
+      try {
+        return normalizePlotWorkspaceColumnsSetting(
+          localStorage.getItem("ecui.plotWorkspaceColumns")
+        );
+      } catch {
+        return "auto";
+      }
+    });
+  const [plotWorkspaceOptionsOpen, setPlotWorkspaceOptionsOpen] = useState(false);
+  const [viewportWidth, setViewportWidth] = useState(() => {
+    if (typeof window === "undefined") {
+      return 1200;
+    }
+    return window.innerWidth;
+  });
   const resizeRef = useRef<{ startX: number; startWidth: number } | null>(null);
   const [isResizing, setIsResizing] = useState(false);
+  const resizePendingWidthRef = useRef<number | null>(null);
+  const resizeRafRef = useRef<number | null>(null);
   const initialPlotState = useMemo(() => {
     try {
       const raw = localStorage.getItem("ecui.plotState");
@@ -466,7 +509,7 @@ export function App() {
   const [daqResetNodeBusyId, setDaqResetNodeBusyId] = useState<string | null>(null);
   const [daqFocusedNodeId, setDaqFocusedNodeId] = useState<string | null>(null);
   const [plotTick, setPlotTick] = useState(0);
-  const [yAxisModalPanelId, setYAxisModalPanelId] = useState<string | null>(null);
+  const [plotOptionsPanelId, setPlotOptionsPanelId] = useState<string | null>(null);
   const [expandedPlotPanelId, setExpandedPlotPanelId] = useState<string | null>(null);
   const [streamTraceOptionsPanelId, setStreamTraceOptionsPanelId] = useState<
     string | null
@@ -647,6 +690,18 @@ export function App() {
   const telemetrySnapshotHydratedRef = useRef(false);
   const rawSnapshotHydratedRef = useRef<Set<string>>(new Set());
   const workspaceSnapshotHydratedRef = useRef<Set<string>>(new Set());
+  const isNarrowPlotViewport = viewportWidth <= PLOT_GRID_MOBILE_BREAKPOINT;
+  const plotGridStyle = useMemo<CSSProperties | undefined>(() => {
+    if (isNarrowPlotViewport) {
+      return { gridTemplateColumns: "1fr" };
+    }
+    if (plotWorkspaceColumns === "auto") {
+      return undefined;
+    }
+    return {
+      gridTemplateColumns: `repeat(${plotWorkspaceColumns}, minmax(0, 1fr))`,
+    };
+  }, [isNarrowPlotViewport, plotWorkspaceColumns]);
 
   useEffect(() => {
     return () => {
@@ -654,6 +709,17 @@ export function App() {
         window.clearTimeout(daqNodeFocusTimeoutRef.current);
         daqNodeFocusTimeoutRef.current = null;
       }
+    };
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    const onResize = () => setViewportWidth(window.innerWidth);
+    window.addEventListener("resize", onResize);
+    return () => {
+      window.removeEventListener("resize", onResize);
     };
   }, []);
 
@@ -803,10 +869,6 @@ export function App() {
           .map((n) => n.id)
       ),
     [daqDraftNodes]
-  );
-  const yAxisModalPanel = useMemo(
-    () => panels.find((panel) => panel.id === yAxisModalPanelId) ?? null,
-    [panels, yAxisModalPanelId]
   );
   const expandedPlotPanel = useMemo(
     () => panels.find((panel) => panel.id === expandedPlotPanelId) ?? null,
@@ -1318,6 +1380,7 @@ export function App() {
           nav_width: navWidth,
           device_panel_collapsed: isDevicePanelCollapsed,
           device_panel_tab: devicePanelTab,
+          plot_workspace_columns: plotWorkspaceColumns,
           device_order: [...deviceOrder],
           telemetry_collapsed_by_device: { ...telemetryCollapsedByDevice },
         },
@@ -1389,6 +1452,7 @@ export function App() {
       setNavWidth(profile.navWidth);
       setDevicePanelCollapsed(profile.devicePanelCollapsed);
       setDevicePanelTab(profile.devicePanelTab);
+      setPlotWorkspaceColumns(profile.plotWorkspaceColumns);
       setPanels(profile.plotState.panels);
       setActivePanelId(profile.plotState.activePanelId);
       setDeviceOrder(profile.deviceOrder);
@@ -1701,7 +1765,10 @@ export function App() {
     const processIds = [
       ...new Set(
         commandDeck
-          .filter((entry) => entry.targetKind === "process")
+          .filter(
+            (entry) =>
+              isCommandDeckCommandEntry(entry) && entry.targetKind === "process"
+          )
           .map((entry) => String(entry.targetId ?? "").trim())
           .filter((processId) => processId.length > 0)
       ),
@@ -1748,6 +1815,14 @@ export function App() {
       // ignore storage errors
     }
   }, [devicePanelTab]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem("ecui.plotWorkspaceColumns", plotWorkspaceColumns);
+    } catch {
+      // ignore storage errors
+    }
+  }, [plotWorkspaceColumns]);
 
   useEffect(() => {
     try {
@@ -1954,9 +2029,29 @@ export function App() {
       const max = Math.min(NAV_MAX_WIDTH, window.innerWidth - 320);
       const safeMax = Math.max(NAV_MIN_WIDTH, max);
       const nextWidth = Math.max(NAV_MIN_WIDTH, Math.min(safeMax, proposed));
-      setNavWidth(nextWidth);
+      resizePendingWidthRef.current = nextWidth;
+      if (resizeRafRef.current !== null) {
+        return;
+      }
+      resizeRafRef.current = window.requestAnimationFrame(() => {
+        resizeRafRef.current = null;
+        const pending = resizePendingWidthRef.current;
+        if (pending == null) {
+          return;
+        }
+        setNavWidth(pending);
+      });
     };
     const handleUp = () => {
+      if (resizeRafRef.current !== null) {
+        window.cancelAnimationFrame(resizeRafRef.current);
+        resizeRafRef.current = null;
+      }
+      const pending = resizePendingWidthRef.current;
+      resizePendingWidthRef.current = null;
+      if (pending != null) {
+        setNavWidth(pending);
+      }
       resizeRef.current = null;
       setIsResizing(false);
     };
@@ -1967,6 +2062,11 @@ export function App() {
     return () => {
       window.removeEventListener("pointermove", handleMove);
       window.removeEventListener("pointerup", handleUp);
+      if (resizeRafRef.current !== null) {
+        window.cancelAnimationFrame(resizeRafRef.current);
+        resizeRafRef.current = null;
+      }
+      resizePendingWidthRef.current = null;
       document.body.style.cursor = "";
       document.body.style.userSelect = "";
     };
@@ -3091,15 +3191,18 @@ export function App() {
     sendDeviceCommand,
   });
 
-  const createCommandDeckEntry = (
+  const createCommandDeckCommandEntry = (
     partial?: Partial<
       Pick<
-        CommandDeckEntry,
-        "targetKind" | "targetId" | "action" | "label" | "group" | "paramsDraft"
+        CommandDeckCommandEntry,
+        "id" | "targetKind" | "targetId" | "action" | "label" | "group" | "paramsDraft"
       >
     >
-  ): CommandDeckEntry => {
-    const id = `deck-${Date.now()}-${commandDeckIdRef.current++}`;
+  ): CommandDeckCommandEntry => {
+    const id =
+      typeof partial?.id === "string" && partial.id.trim().length > 0
+        ? partial.id.trim()
+        : `deck-${Date.now()}-${commandDeckIdRef.current++}`;
     const defaultTargetKind: CommandDeckTargetKind =
       partial?.targetKind ??
       (orderedDevices[0]?.device_id
@@ -3113,6 +3216,7 @@ export function App() {
         : (orderedDevices[0]?.device_id ?? "");
     return {
       id,
+      kind: "command",
       targetKind: defaultTargetKind,
       targetId: String(partial?.targetId ?? fallbackTargetId).trim(),
       action: String(partial?.action ?? "").trim(),
@@ -3126,15 +3230,71 @@ export function App() {
     };
   };
 
-  const addCommandDeckEntry = (
+  const createCommandDeckTelemetryEntry = (
     partial?: Partial<
       Pick<
-        CommandDeckEntry,
-        "targetKind" | "targetId" | "action" | "label" | "group" | "paramsDraft"
+        CommandDeckTelemetryEntry,
+        "id" | "deviceId" | "signal" | "format" | "decimals" | "label" | "group"
+      >
+    >
+  ): CommandDeckTelemetryEntry => {
+    const id =
+      typeof partial?.id === "string" && partial.id.trim().length > 0
+        ? partial.id.trim()
+        : `deck-${Date.now()}-${commandDeckIdRef.current++}`;
+    const fallbackDeviceId = orderedDevices[0]?.device_id ?? "";
+    const deviceId = String(partial?.deviceId ?? fallbackDeviceId).trim();
+    const signalOptions = [
+      ...Object.keys(latestByDevice[deviceId] ?? {}),
+    ].sort((a, b) => a.localeCompare(b));
+    const fallbackSignal = signalOptions[0] ?? "";
+    const formatRaw = String(partial?.format ?? "auto").trim().toLowerCase();
+    const format =
+      formatRaw === "fixed" || formatRaw === "scientific" ? formatRaw : "auto";
+    const decimalsRaw = partial?.decimals;
+    const decimals =
+      typeof decimalsRaw === "number" && Number.isFinite(decimalsRaw)
+        ? Math.max(0, Math.min(12, Math.trunc(decimalsRaw)))
+        : 3;
+    return {
+      id,
+      kind: "telemetry",
+      deviceId,
+      signal: String(partial?.signal ?? fallbackSignal).trim(),
+      format,
+      decimals,
+      label:
+        typeof partial?.label === "string" && partial.label.trim().length > 0
+          ? partial.label.trim()
+          : undefined,
+      group: normalizeDeckGroup(partial?.group),
+      createdAt: Date.now(),
+    };
+  };
+
+  const addCommandDeckCommandEntry = (
+    partial?: Partial<
+      Pick<
+        CommandDeckCommandEntry,
+        "id" | "targetKind" | "targetId" | "action" | "label" | "group" | "paramsDraft"
       >
     >
   ) => {
-    const next = createCommandDeckEntry(partial);
+    const next = createCommandDeckCommandEntry(partial);
+    setCommandDeck((prev) => [...prev, next]);
+    setDevicePanelTab("deck");
+    return next;
+  };
+
+  const addCommandDeckTelemetryEntry = (
+    partial?: Partial<
+      Pick<
+        CommandDeckTelemetryEntry,
+        "id" | "deviceId" | "signal" | "format" | "decimals" | "label" | "group"
+      >
+    >
+  ) => {
+    const next = createCommandDeckTelemetryEntry(partial);
     setCommandDeck((prev) => [...prev, next]);
     setDevicePanelTab("deck");
     return next;
@@ -3149,7 +3309,7 @@ export function App() {
       });
       return;
     }
-    addCommandDeckEntry({
+    addCommandDeckCommandEntry({
       targetKind: "device",
       targetId: commandDevice,
       action: commandAction,
@@ -3172,7 +3332,7 @@ export function App() {
       });
       return;
     }
-    addCommandDeckEntry({
+    addCommandDeckCommandEntry({
       targetKind: "process",
       targetId: processCommandProcessId,
       action: processCommandAction,
@@ -3185,18 +3345,18 @@ export function App() {
     });
   };
 
-  const updateCommandDeckEntry = (
+  const updateCommandDeckCommandEntry = (
     entryId: string,
     patch: Partial<
       Pick<
-        CommandDeckEntry,
+        CommandDeckCommandEntry,
         "targetKind" | "targetId" | "action" | "label" | "group" | "paramsDraft"
       >
     >
   ) => {
     setCommandDeck((prev) =>
       prev.map((entry) => {
-        if (entry.id !== entryId) {
+        if (entry.id !== entryId || !isCommandDeckCommandEntry(entry)) {
           return entry;
         }
         const nextTargetKind: CommandDeckTargetKind =
@@ -3235,6 +3395,58 @@ export function App() {
     );
   };
 
+  const updateCommandDeckTelemetryEntry = (
+    entryId: string,
+    patch: Partial<
+      Pick<
+        CommandDeckTelemetryEntry,
+        "deviceId" | "signal" | "format" | "decimals" | "label" | "group"
+      >
+    >
+  ) => {
+    setCommandDeck((prev) =>
+      prev.map((entry) => {
+        if (entry.id !== entryId || !isCommandDeckTelemetryEntry(entry)) {
+          return entry;
+        }
+        const nextDeviceId =
+          patch.deviceId !== undefined ? String(patch.deviceId).trim() : entry.deviceId;
+        const nextSignal =
+          patch.signal !== undefined ? String(patch.signal).trim() : entry.signal;
+        const formatRaw =
+          patch.format !== undefined ? String(patch.format).trim().toLowerCase() : entry.format;
+        const nextFormat =
+          formatRaw === "fixed" || formatRaw === "scientific" ? formatRaw : "auto";
+        const decimalsCandidate =
+          patch.decimals !== undefined ? patch.decimals : entry.decimals;
+        const nextDecimals =
+          typeof decimalsCandidate === "number" && Number.isFinite(decimalsCandidate)
+            ? Math.max(0, Math.min(12, Math.trunc(decimalsCandidate)))
+            : null;
+        const nextLabel =
+          patch.label !== undefined
+            ? (() => {
+                const raw = String(patch.label);
+                return raw.trim().length > 0 ? raw : undefined;
+              })()
+            : entry.label ?? undefined;
+        const nextGroup =
+          patch.group !== undefined
+            ? normalizeDeckGroup(String(patch.group))
+            : normalizeDeckGroup(entry.group);
+        return {
+          ...entry,
+          deviceId: nextDeviceId,
+          signal: nextSignal,
+          format: nextFormat,
+          decimals: nextDecimals,
+          label: nextLabel,
+          group: nextGroup,
+        };
+      })
+    );
+  };
+
   const setCommandDeckEntryTargetKind = (
     entryId: string,
     targetKind: CommandDeckTargetKind
@@ -3243,7 +3455,7 @@ export function App() {
       targetKind === "process"
         ? (processes[0]?.process_id ?? "")
         : (orderedDevices[0]?.device_id ?? "");
-    updateCommandDeckEntry(entryId, {
+    updateCommandDeckCommandEntry(entryId, {
       targetKind,
       targetId: fallbackTargetId,
       action: "",
@@ -3352,9 +3564,30 @@ export function App() {
     });
   };
 
+  const setCommandDeckGroupEntries = (fromGroup: string, toGroupRaw: string) => {
+    const sourceGroup = String(fromGroup ?? "").trim() || "Ungrouped";
+    const nextGroup = normalizeDeckGroup(toGroupRaw);
+    const targetGroup = nextGroup ?? "Ungrouped";
+    if (sourceGroup === targetGroup) {
+      return;
+    }
+    setCommandDeck((prev) => {
+      let changed = false;
+      const next = prev.map((entry) => {
+        const entryGroup = normalizeDeckGroup(entry.group) ?? "Ungrouped";
+        if (entryGroup !== sourceGroup) {
+          return entry;
+        }
+        changed = true;
+        return { ...entry, group: nextGroup };
+      });
+      return changed ? next : prev;
+    });
+  };
+
   const runCommandDeckEntry = async (entryId: string) => {
     const entry = commandDeck.find((candidate) => candidate.id === entryId);
-    if (!entry) {
+    if (!entry || !isCommandDeckCommandEntry(entry)) {
       return;
     }
     const targetId = entry.targetId.trim();
@@ -3466,12 +3699,6 @@ export function App() {
           color: "teal",
           title: "Command sent",
           message: `${targetId}.${mapped.action}`,
-        });
-      } else {
-        notifications.show({
-          color: "red",
-          title: "Unsupported deck target",
-          message: `Unsupported target kind ${entry.targetKind}`,
         });
       }
     } finally {
@@ -4320,6 +4547,8 @@ export function App() {
         yDisplayMode: "absolute",
         yOffsetMode: "auto",
         yOffsetValue: null,
+        smoothingMode: DEFAULT_TELEMETRY_SMOOTHING_MODE,
+        smoothingWindowS: DEFAULT_TELEMETRY_SMOOTHING_WINDOW_S,
       };
       buffersRef.set(id, new Map());
     }
@@ -4355,6 +4584,9 @@ export function App() {
     }
     if (streamParamsOptionsPanelId === panelId) {
       setStreamParamsOptionsPanelId(null);
+    }
+    if (plotOptionsPanelId === panelId) {
+      closePlotOptions();
     }
     if (expandedPlotPanelId === panelId) {
       setExpandedPlotPanelId(null);
@@ -4695,6 +4927,39 @@ export function App() {
     );
   };
 
+  const setTelemetrySmoothingMode = (
+    panelId: string,
+    mode: TelemetrySmoothingMode
+  ) => {
+    const nextMode = normalizeTelemetrySmoothingMode(mode);
+    setPanels((prev) =>
+      prev.map((panel) => {
+        if (panel.id !== panelId || !isTelemetryPanel(panel)) {
+          return panel;
+        }
+        return {
+          ...panel,
+          smoothingMode: nextMode,
+          smoothingWindowS: normalizeTelemetrySmoothingWindow(panel.smoothingWindowS),
+        };
+      })
+    );
+  };
+
+  const setTelemetrySmoothingWindow = (panelId: string, value: number) => {
+    setPanels((prev) =>
+      prev.map((panel) => {
+        if (panel.id !== panelId || !isTelemetryPanel(panel)) {
+          return panel;
+        }
+        return {
+          ...panel,
+          smoothingWindowS: normalizeTelemetrySmoothingWindow(value),
+        };
+      })
+    );
+  };
+
   const resolvePanelAutoYRange = (
     panel: PlotPanelState | null
   ): { min: number; max: number } | null => {
@@ -4833,27 +5098,14 @@ export function App() {
     setExpandedPlotPanelId(null);
   };
 
-  const openYAxisModal = (
-    panelId: string,
-    options?: { prefillFromAuto?: boolean }
-  ) => {
+  const openPlotOptions = (panelId: string) => {
     const panel = panels.find((entry) => entry.id === panelId) ?? null;
     if (!panel) {
       return;
     }
     const autoRange = resolvePanelAutoYRange(panel);
-    setYAxisModalPanelId(panelId);
+    setPlotOptionsPanelId(panelId);
     setYAxisAutoRange(autoRange);
-    if (options?.prefillFromAuto) {
-      if (autoRange) {
-        setYAxisDraftMin(autoRange.min);
-        setYAxisDraftMax(autoRange.max);
-      } else {
-        setYAxisDraftMin(0);
-        setYAxisDraftMax(1);
-      }
-      return;
-    }
     if (
       panel.yScaleMode === "manual" &&
       typeof panel.yMin === "number" &&
@@ -4870,18 +5122,14 @@ export function App() {
     setYAxisDraftMax(autoRange ? autoRange.max : "");
   };
 
-  const closeYAxisModal = () => {
-    setYAxisModalPanelId(null);
+  const closePlotOptions = () => {
+    setPlotOptionsPanelId(null);
     setYAxisDraftMin("");
     setYAxisDraftMax("");
     setYAxisAutoRange(null);
   };
 
-  const applyYAxisModal = () => {
-    const panelId = yAxisModalPanelId;
-    if (!panelId) {
-      return;
-    }
+  const applyPlotOptionsAxis = (panelId: string) => {
     const min = parseNumberInput(yAxisDraftMin);
     const max = parseNumberInput(yAxisDraftMax);
     if (min === null || max === null) {
@@ -4901,7 +5149,32 @@ export function App() {
       return;
     }
     setPanelManualYRange(panelId, min, max);
-    closeYAxisModal();
+  };
+
+  const setPlotOptionsAxisMode = (panel: PlotPanelState, mode: YScaleMode) => {
+    if (mode === "auto") {
+      setPanelYScaleMode(panel.id, "auto");
+      return;
+    }
+    const autoRange = resolvePanelAutoYRange(panel);
+    setYAxisAutoRange(autoRange);
+    if (
+      panel.yScaleMode !== "manual" ||
+      typeof panel.yMin !== "number" ||
+      typeof panel.yMax !== "number" ||
+      !Number.isFinite(panel.yMin) ||
+      !Number.isFinite(panel.yMax) ||
+      panel.yMin >= panel.yMax
+    ) {
+      if (autoRange) {
+        setYAxisDraftMin(autoRange.min);
+        setYAxisDraftMax(autoRange.max);
+      } else {
+        setYAxisDraftMin(0);
+        setYAxisDraftMax(1);
+      }
+    }
+    setPanelYScaleMode(panel.id, "manual");
   };
 
   const setStreamPanelTarget = (
@@ -5011,6 +5284,8 @@ export function App() {
           yMax={panel.yMax}
           yDisplayMode={panel.yDisplayMode}
           yOffset={resolveTelemetryPanelOffset(panel)}
+          smoothingMode={panel.smoothingMode}
+          smoothingWindowS={panel.smoothingWindowS}
         />
       );
     }
@@ -6486,6 +6761,11 @@ export function App() {
   };
 
   const setDevicePanelCollapsed = (collapsed: boolean) => {
+    if (resizeRafRef.current !== null) {
+      window.cancelAnimationFrame(resizeRafRef.current);
+      resizeRafRef.current = null;
+    }
+    resizePendingWidthRef.current = null;
     resizeRef.current = null;
     setIsResizing(false);
     setIsDevicePanelCollapsed(collapsed);
@@ -6768,7 +7048,7 @@ export function App() {
           <section
             className={`device-panel${
               isDevicePanelCollapsed ? " device-panel-collapsed" : ""
-            }`}
+            }${isResizing ? " device-panel-resizing" : ""}`}
             style={{ width: isDevicePanelCollapsed ? 0 : navWidth }}
           >
             <Group mb="sm" justify="space-between" align="center">
@@ -6914,7 +7194,7 @@ export function App() {
                           (pinnedCommands[device.device_id] ?? []).find(
                             (entry) => entry.action === action
                           )?.label ?? undefined;
-                        addCommandDeckEntry({
+                        addCommandDeckCommandEntry({
                           targetKind: "device",
                           targetId: device.device_id,
                           action,
@@ -6940,7 +7220,7 @@ export function App() {
                         for (const entry of entries) {
                           const action = entry.action;
                           const draftKey = pinnedCommandKey(device.device_id, action);
-                          addCommandDeckEntry({
+                          addCommandDeckCommandEntry({
                             targetKind: "device",
                             targetId: device.device_id,
                             action,
@@ -6995,22 +7275,33 @@ export function App() {
                   entries={commandDeck}
                   devices={orderedDevices}
                   processes={processes}
+                  latestSignalsByDevice={latestByDevice}
                   capabilitiesByDevice={capabilitiesByDevice}
                   capabilitiesByProcess={capabilitiesByProcess}
                   busyById={commandDeckBusyById}
-                  onAddEntry={() => {
+                  onAddCommandEntry={() => {
                     const defaultDeviceId = orderedDevices[0]?.device_id ?? "";
                     const defaultProcessId = processes[0]?.process_id ?? "";
-                    const created = addCommandDeckEntry(
+                    const created = addCommandDeckCommandEntry(
                       defaultDeviceId
                         ? { targetKind: "device", targetId: defaultDeviceId }
                         : defaultProcessId
                         ? { targetKind: "process", targetId: defaultProcessId }
                         : undefined
                     );
-                    if (created.targetKind === "process" && created.targetId) {
+                    if (
+                      isCommandDeckCommandEntry(created) &&
+                      created.targetKind === "process" &&
+                      created.targetId
+                    ) {
                       void ensureProcessCapabilitiesLoaded(created.targetId);
                     }
+                    return created;
+                  }}
+                  onAddTelemetryEntry={() => {
+                    return addCommandDeckTelemetryEntry({
+                      deviceId: orderedDevices[0]?.device_id ?? "",
+                    });
                   }}
                   onRunEntry={(entryId) => {
                     void runCommandDeckEntry(entryId);
@@ -7029,15 +7320,17 @@ export function App() {
                       mode
                     )
                   }
-                  onUpdateEntryTargetKind={(entryId, targetKind) =>
+                  onUpdateCommandEntryTargetKind={(entryId, targetKind) =>
                     setCommandDeckEntryTargetKind(entryId, targetKind)
                   }
-                  onUpdateEntryTarget={(entryId, targetId) => {
+                  onUpdateCommandEntryTarget={(entryId, targetId) => {
                     const entry =
                       commandDeck.find((candidate) => candidate.id === entryId) ?? null;
                     const nextTargetId = targetId.trim();
-                    updateCommandDeckEntry(entryId, { targetId });
+                    updateCommandDeckCommandEntry(entryId, { targetId });
                     if (
+                      entry &&
+                      isCommandDeckCommandEntry(entry) &&
                       nextTargetId &&
                       (entry?.targetKind === "process" ||
                         processes.some(
@@ -7047,28 +7340,60 @@ export function App() {
                       void ensureProcessCapabilitiesLoaded(nextTargetId);
                     }
                   }}
-                  onUpdateEntryAction={(entryId, action) =>
-                    updateCommandDeckEntry(entryId, { action })
+                  onUpdateCommandEntryAction={(entryId, action) =>
+                    updateCommandDeckCommandEntry(entryId, { action })
                   }
                   onUpdateEntryLabel={(entryId, label) =>
-                    updateCommandDeckEntry(entryId, { label })
+                    commandDeck.find((candidate) => candidate.id === entryId)?.kind ===
+                    "telemetry"
+                      ? updateCommandDeckTelemetryEntry(entryId, { label })
+                      : updateCommandDeckCommandEntry(entryId, { label })
                   }
                   onUpdateEntryGroup={(entryId, group) =>
                     setCommandDeckEntryGroup(entryId, group)
                   }
-                  onUpdateEntryParam={(entryId, paramName, value) => {
+                  onUpdateGroupEntries={(fromGroup, toGroupRaw) =>
+                    setCommandDeckGroupEntries(fromGroup, toGroupRaw)
+                  }
+                  onUpdateCommandEntryParam={(entryId, paramName, value) => {
                     const entry =
                       commandDeck.find((candidate) => candidate.id === entryId) ?? null;
-                    if (!entry) {
+                    if (!entry || !isCommandDeckCommandEntry(entry)) {
                       return;
                     }
-                    updateCommandDeckEntry(entryId, {
+                    updateCommandDeckCommandEntry(entryId, {
                       paramsDraft: {
                         ...(entry.paramsDraft ?? {}),
                         [paramName]: value,
                       },
                     });
                   }}
+                  onUpdateTelemetryEntryDevice={(entryId, deviceId) => {
+                    const signals = Object.keys(latestByDevice[deviceId] ?? {}).sort(
+                      (a, b) => a.localeCompare(b)
+                    );
+                    const current =
+                      commandDeck.find((candidate) => candidate.id === entryId) ?? null;
+                    const nextSignal =
+                      current && isCommandDeckTelemetryEntry(current)
+                        ? current.signal && signals.includes(current.signal)
+                          ? current.signal
+                          : signals[0] ?? ""
+                        : signals[0] ?? "";
+                    updateCommandDeckTelemetryEntry(entryId, {
+                      deviceId,
+                      signal: nextSignal,
+                    });
+                  }}
+                  onUpdateTelemetryEntrySignal={(entryId, signal) =>
+                    updateCommandDeckTelemetryEntry(entryId, { signal })
+                  }
+                  onUpdateTelemetryEntryFormat={(entryId, format) =>
+                    updateCommandDeckTelemetryEntry(entryId, { format })
+                  }
+                  onUpdateTelemetryEntryDecimals={(entryId, decimals) =>
+                    updateCommandDeckTelemetryEntry(entryId, { decimals })
+                  }
                 />
               )}
             </ScrollArea>
@@ -7088,7 +7413,64 @@ export function App() {
           >
             <Stack gap="lg">
               <Group justify="space-between">
-                <Text fw={600}>Plot workspace</Text>
+                <Group gap={6} align="center">
+                  <Text fw={600}>Plot workspace</Text>
+                  <Popover
+                    opened={plotWorkspaceOptionsOpen}
+                    onChange={setPlotWorkspaceOptionsOpen}
+                    position="bottom-start"
+                    withArrow
+                    shadow="md"
+                    withinPortal
+                    zIndex={700}
+                    width={260}
+                  >
+                    <Popover.Target>
+                      <ActionIcon
+                        size="sm"
+                        variant="light"
+                        color="gray"
+                        onClick={() =>
+                          setPlotWorkspaceOptionsOpen((current) => !current)
+                        }
+                        aria-label="Plot workspace options"
+                        title="Plot workspace options"
+                      >
+                        <IconSettings size={14} />
+                      </ActionIcon>
+                    </Popover.Target>
+                    <Popover.Dropdown>
+                      <Stack gap="xs">
+                        <Group justify="space-between" align="center">
+                          <Text size="xs" c="dimmed">
+                            Columns
+                          </Text>
+                          <SegmentedControl
+                            size="xs"
+                            value={plotWorkspaceColumns}
+                            onChange={(value) =>
+                              setPlotWorkspaceColumns(
+                                normalizePlotWorkspaceColumnsSetting(value)
+                              )
+                            }
+                            data={[
+                              { value: "auto", label: "Auto" },
+                              { value: "1", label: "1" },
+                              { value: "2", label: "2" },
+                              { value: "3", label: "3" },
+                              { value: "4", label: "4" },
+                            ]}
+                          />
+                        </Group>
+                        {isNarrowPlotViewport && plotWorkspaceColumns !== "auto" ? (
+                          <Text size="xs" c="dimmed">
+                            Narrow viewport: forcing 1 column.
+                          </Text>
+                        ) : null}
+                      </Stack>
+                    </Popover.Dropdown>
+                  </Popover>
+                </Group>
                 <Menu
                   shadow="md"
                   width={220}
@@ -7133,6 +7515,7 @@ export function App() {
               </Group>
               <div
                 className="plot-grid"
+                style={plotGridStyle}
                 onDragOver={handlePanelGridDragOver}
                 onDrop={handlePanelGridDrop}
                 onDragLeave={handlePanelGridDragLeave}
@@ -7441,227 +7824,302 @@ export function App() {
                               ? "Stream 2D bins"
                               : "Stream scalar"}
                           </Badge>
-                          {!isStreamParamsPanel(panel) ? (
-                            <Group gap={6} align="center">
-                              <Text size="xs" c="dimmed">
-                                {isStreamWaterfallPanel(panel) || isStreamBin2dPanel(panel)
-                                  ? "Z"
-                                  : "Y"}
-                              </Text>
-                              <SegmentedControl
-                                size="xs"
-                                value={panel.yScaleMode}
-                                onChange={(value) => {
-                                  const nextMode = value as YScaleMode;
-                                  if (nextMode === "auto") {
-                                    setPanelYScaleMode(panel.id, "auto");
-                                    return;
-                                  }
-                                  openYAxisModal(panel.id, { prefillFromAuto: true });
-                                }}
-                                data={[
-                                  { value: "auto", label: "Auto" },
-                                  {
-                                    value: "manual",
-                                    label: (
-                                      <span
-                                        onMouseDown={() => {
-                                          if (panel.yScaleMode === "manual") {
-                                            openYAxisModal(panel.id);
-                                          }
-                                        }}
-                                      >
-                                        Manual
-                                      </span>
-                                    ),
-                                  },
-                                ]}
-                              />
-                            </Group>
-                          ) : null}
-                          {isTelemetryPanel(panel) ? (
-                            <Group gap={6} align="center" wrap="wrap">
-                              <Text size="xs" c="dimmed">
-                                Window (s)
-                              </Text>
-                              <NumberInput
-                                size="xs"
-                                w={110}
-                                min={5}
-                                max={600}
-                                value={panel.timeWindowS}
-                                onChange={(value) =>
-                                  setPanelTimeWindow(panel.id, Number(value))
-                                }
-                              />
-                              <Text size="xs" c="dimmed">
-                                Display
-                              </Text>
-                              <SegmentedControl
-                                size="xs"
-                                value={panel.yDisplayMode}
-                                data={[
-                                  { value: "absolute", label: "Abs" },
-                                  { value: "delta", label: "Delta" },
-                                ]}
-                                onChange={(value) => {
-                                  const nextMode = value as YDisplayMode;
-                                  if (
-                                    nextMode === "delta" &&
-                                    telemetryNumericTraceCount === 0
-                                  ) {
-                                    notifications.show({
-                                      color: "yellow",
-                                      title: "No numeric traces",
-                                      message:
-                                        "Delta display requires at least one numeric telemetry trace.",
-                                    });
-                                    return;
-                                  }
-                                  setTelemetryYDisplayMode(panel.id, nextMode);
-                                }}
-                              />
-                              {panel.yDisplayMode === "delta" && (
-                                <>
-                                  <Text size="xs" c="dimmed">
-                                    Offset
-                                  </Text>
-                                  <SegmentedControl
-                                    size="xs"
-                                    value={panel.yOffsetMode}
-                                    data={[
-                                      { value: "auto", label: "Auto" },
-                                      { value: "freeze", label: "Freeze" },
-                                    ]}
-                                    onChange={(value) => {
-                                      const nextMode = value as YOffsetMode;
-                                      if (nextMode === "auto") {
-                                        setTelemetryYOffsetMode(panel.id, "auto");
-                                        return;
-                                      }
-                                      if (
-                                        typeof telemetryOffset !== "number" ||
-                                        !Number.isFinite(telemetryOffset)
-                                      ) {
-                                        notifications.show({
-                                          color: "yellow",
-                                          title: "Offset unavailable",
-                                          message:
-                                            "No numeric telemetry samples available to freeze offset yet.",
-                                        });
-                                        return;
-                                      }
-                                      setTelemetryYOffsetMode(
-                                        panel.id,
-                                        "freeze",
-                                        telemetryOffset
-                                      );
-                                    }}
-                                  />
-                                  <Badge
-                                    variant="light"
-                                    color={
-                                      panel.yOffsetMode === "freeze"
-                                        ? "blue"
-                                        : "gray"
-                                    }
-                                  >
-                                    offset: {telemetryOffsetLabel}
-                                  </Badge>
-                                </>
-                              )}
-                            </Group>
-                          ) : isStreamTracePanel(panel) ? (
-                            <Group gap={6} align="center" wrap="wrap">
-                              <Badge
-                                variant="light"
-                                color={panel.sourceMode === "raw" ? "orange" : "teal"}
-                              >
-                                {panel.sourceMode === "raw" ? "Raw source" : "DAG source"}
-                              </Badge>
+                          <Popover
+                            opened={plotOptionsPanelId === panel.id}
+                            onChange={(opened) => {
+                              if (!opened && plotOptionsPanelId === panel.id) {
+                                closePlotOptions();
+                              }
+                            }}
+                            position="bottom-start"
+                            withArrow
+                            shadow="md"
+                            withinPortal
+                            zIndex={700}
+                            width={420}
+                          >
+                            <Popover.Target>
                               <Button
                                 size="xs"
                                 variant="light"
                                 leftSection={<IconSettings size={14} />}
-                                onClick={() => openStreamTraceOptionsModal(panel.id)}
-                              >
-                                Plot options
-                              </Button>
-                            </Group>
-                          ) : isStreamScalarPanel(panel) ? (
-                            <Group gap={6} align="center" wrap="wrap">
-                              <Select
-                                size="xs"
-                                w={260}
-                                searchable
-                                placeholder="Select workspace"
-                                comboboxProps={{ zIndex: 500 }}
-                                data={streamWorkspaceOptions}
-                                value={panel.workspaceId}
-                                onChange={(value) =>
-                                  setStreamAnalysisPanelWorkspace(panel.id, value)
-                                }
-                              />
-                              <Select
-                                size="xs"
-                                w={320}
-                                searchable
-                                clearable
-                                placeholder="Select scalar output"
-                                comboboxProps={{ zIndex: 500 }}
-                                data={integralOutputOptions}
-                                value={panel.outputId}
-                                onChange={(value) =>
-                                  setStreamAnalysisPanelOutput(panel.id, value)
-                                }
-                              />
-                              <Group gap={6} align="center">
-                                <Text size="xs" c="dimmed">
-                                  Window (s)
-                                </Text>
-                                <NumberInput
-                                  size="xs"
-                                  w={110}
-                                  min={5}
-                                  max={600}
-                                  value={panel.timeWindowS}
-                                  onChange={(value) =>
-                                    setPanelTimeWindow(panel.id, Number(value))
-                                  }
-                                />
-                              </Group>
-                            </Group>
-                          ) : isStreamParamsPanel(panel) ? (
-                            <Group gap={6} align="center" wrap="wrap">
-                              <Button
-                                size="xs"
-                                variant="light"
-                                leftSection={<IconSettings size={14} />}
-                                onClick={() => openStreamParamsOptionsModal(panel.id)}
-                              >
-                                Plot options
-                              </Button>
-                            </Group>
-                          ) : (
-                            <Group gap={6} align="center" wrap="wrap">
-                              <Button
-                                size="xs"
-                                variant="light"
-                                leftSection={<IconSettings size={14} />}
+                                style={{ marginLeft: "auto" }}
                                 onClick={() => {
-                                  if (isStreamBin2dPanel(panel)) {
-                                    openStreamBin2dOptionsModal(panel.id);
+                                  if (plotOptionsPanelId === panel.id) {
+                                    closePlotOptions();
                                     return;
                                   }
-                                  openStreamBinStatsOptionsModal(panel.id);
+                                  openPlotOptions(panel.id);
                                 }}
                               >
                                 Plot options
                               </Button>
-                            </Group>
-                          )}
-                        </Group>
-                        <Group gap="xs">
+                            </Popover.Target>
+                            <Popover.Dropdown>
+                              <Stack gap="sm">
+                                {!isStreamParamsPanel(panel) ? (
+                                  <Stack gap={6}>
+                                    <Group justify="space-between" align="center">
+                                      <Text size="xs" c="dimmed">
+                                        {(isStreamWaterfallPanel(panel) ||
+                                          isStreamBin2dPanel(panel)
+                                          ? "Z"
+                                          : "Y") + " axis"}
+                                      </Text>
+                                      <SegmentedControl
+                                        size="xs"
+                                        value={panel.yScaleMode}
+                                        onChange={(value) =>
+                                          setPlotOptionsAxisMode(panel, value as YScaleMode)
+                                        }
+                                        data={[
+                                          { value: "auto", label: "Auto" },
+                                          { value: "manual", label: "Manual" },
+                                        ]}
+                                      />
+                                    </Group>
+                                    {panel.yScaleMode === "manual" ? (
+                                      <>
+                                        <Group grow>
+                                          <NumberInput
+                                            size="xs"
+                                            label="Min"
+                                            value={yAxisDraftMin}
+                                            onChange={setYAxisDraftMin}
+                                          />
+                                          <NumberInput
+                                            size="xs"
+                                            label="Max"
+                                            value={yAxisDraftMax}
+                                            onChange={setYAxisDraftMax}
+                                          />
+                                        </Group>
+                                        <Group justify="space-between" align="center">
+                                          <Text size="xs" c="dimmed">
+                                            {yAxisAutoRange
+                                              ? `auto: ${yAxisAutoRange.min.toFixed(
+                                                  4
+                                                )} .. ${yAxisAutoRange.max.toFixed(4)}`
+                                              : "auto range unavailable"}
+                                          </Text>
+                                          <Button
+                                            size="xs"
+                                            variant="light"
+                                            onClick={() => applyPlotOptionsAxis(panel.id)}
+                                            disabled={yAxisDraftInvalid}
+                                          >
+                                            Apply axis
+                                          </Button>
+                                        </Group>
+                                      </>
+                                    ) : (
+                                      <Text size="xs" c="dimmed">
+                                        {yAxisAutoRange
+                                          ? `auto: ${yAxisAutoRange.min.toFixed(
+                                              4
+                                            )} .. ${yAxisAutoRange.max.toFixed(4)}`
+                                          : "auto range unavailable"}
+                                      </Text>
+                                    )}
+                                  </Stack>
+                                ) : null}
+                                {isTelemetryPanel(panel) ? (
+                                  <Stack gap={6}>
+                                    <Group grow>
+                                      <NumberInput
+                                        size="xs"
+                                        label="Window (s)"
+                                        min={5}
+                                        max={600}
+                                        value={panel.timeWindowS}
+                                        onChange={(value) =>
+                                          setPanelTimeWindow(panel.id, Number(value))
+                                        }
+                                      />
+                                    </Group>
+                                    <Group justify="space-between" align="center">
+                                      <Text size="xs" c="dimmed">
+                                        Display
+                                      </Text>
+                                      <SegmentedControl
+                                        size="xs"
+                                        value={panel.yDisplayMode}
+                                        data={[
+                                          { value: "absolute", label: "Abs" },
+                                          { value: "delta", label: "Delta" },
+                                        ]}
+                                        onChange={(value) => {
+                                          const nextMode = value as YDisplayMode;
+                                          if (
+                                            nextMode === "delta" &&
+                                            telemetryNumericTraceCount === 0
+                                          ) {
+                                            notifications.show({
+                                              color: "yellow",
+                                              title: "No numeric traces",
+                                              message:
+                                                "Delta display requires at least one numeric telemetry trace.",
+                                            });
+                                            return;
+                                          }
+                                          setTelemetryYDisplayMode(panel.id, nextMode);
+                                        }}
+                                      />
+                                    </Group>
+                                    {panel.yDisplayMode === "delta" ? (
+                                      <>
+                                        <Group justify="space-between" align="center">
+                                          <Text size="xs" c="dimmed">
+                                            Offset
+                                          </Text>
+                                          <SegmentedControl
+                                            size="xs"
+                                            value={panel.yOffsetMode}
+                                            data={[
+                                              { value: "auto", label: "Auto" },
+                                              { value: "freeze", label: "Freeze" },
+                                            ]}
+                                            onChange={(value) => {
+                                              const nextMode = value as YOffsetMode;
+                                              if (nextMode === "auto") {
+                                                setTelemetryYOffsetMode(panel.id, "auto");
+                                                return;
+                                              }
+                                              if (
+                                                typeof telemetryOffset !== "number" ||
+                                                !Number.isFinite(telemetryOffset)
+                                              ) {
+                                                notifications.show({
+                                                  color: "yellow",
+                                                  title: "Offset unavailable",
+                                                  message:
+                                                    "No numeric telemetry samples available to freeze offset yet.",
+                                                });
+                                                return;
+                                              }
+                                              setTelemetryYOffsetMode(
+                                                panel.id,
+                                                "freeze",
+                                                telemetryOffset
+                                              );
+                                            }}
+                                          />
+                                        </Group>
+                                        <Text size="xs" c="dimmed">
+                                          offset: {telemetryOffsetLabel}
+                                          {telemetryOffsetFullLabel &&
+                                          telemetryOffsetFullLabel !== telemetryOffsetLabel
+                                            ? ` (${telemetryOffsetFullLabel})`
+                                            : ""}
+                                        </Text>
+                                      </>
+                                    ) : null}
+                                    <Group justify="space-between" align="center">
+                                      <Text size="xs" c="dimmed">
+                                        Smoothing
+                                      </Text>
+                                      <SegmentedControl
+                                        size="xs"
+                                        value={panel.smoothingMode}
+                                        data={[
+                                          { value: "none", label: "Off" },
+                                          { value: "sma", label: "SMA" },
+                                          { value: "ema", label: "EMA" },
+                                        ]}
+                                        onChange={(value) =>
+                                          setTelemetrySmoothingMode(
+                                            panel.id,
+                                            value as TelemetrySmoothingMode
+                                          )
+                                        }
+                                      />
+                                    </Group>
+                                    {panel.smoothingMode !== "none" ? (
+                                      <NumberInput
+                                        size="xs"
+                                        label="Smoothing window (s)"
+                                        min={1}
+                                        max={300}
+                                        value={panel.smoothingWindowS}
+                                        onChange={(value) =>
+                                          setTelemetrySmoothingWindow(
+                                            panel.id,
+                                            Number(value)
+                                          )
+                                        }
+                                      />
+                                    ) : null}
+                                  </Stack>
+                                ) : null}
+                                {isStreamScalarPanel(panel) ? (
+                                  <Stack gap={6}>
+                                    <Select
+                                      size="xs"
+                                      searchable
+                                      label="Workspace"
+                                      placeholder="Select workspace"
+                                      comboboxProps={{ zIndex: 800 }}
+                                      data={streamWorkspaceOptions}
+                                      value={panel.workspaceId}
+                                      onChange={(value) =>
+                                        setStreamAnalysisPanelWorkspace(panel.id, value)
+                                      }
+                                    />
+                                    <Select
+                                      size="xs"
+                                      searchable
+                                      clearable
+                                      label="Scalar output"
+                                      placeholder="Select scalar output"
+                                      comboboxProps={{ zIndex: 800 }}
+                                      data={integralOutputOptions}
+                                      value={panel.outputId}
+                                      onChange={(value) =>
+                                        setStreamAnalysisPanelOutput(panel.id, value)
+                                      }
+                                    />
+                                    <NumberInput
+                                      size="xs"
+                                      label="Window (s)"
+                                      min={5}
+                                      max={600}
+                                      value={panel.timeWindowS}
+                                      onChange={(value) =>
+                                        setPanelTimeWindow(panel.id, Number(value))
+                                      }
+                                    />
+                                  </Stack>
+                                ) : null}
+                                {(isStreamTracePanel(panel) ||
+                                  isStreamParamsPanel(panel) ||
+                                  isStreamBinStatsPanel(panel) ||
+                                  isStreamBin2dPanel(panel)) && (
+                                  <Button
+                                    size="xs"
+                                    variant="light"
+                                    onClick={() => {
+                                      closePlotOptions();
+                                      if (isStreamTracePanel(panel)) {
+                                        openStreamTraceOptionsModal(panel.id);
+                                        return;
+                                      }
+                                      if (isStreamParamsPanel(panel)) {
+                                        openStreamParamsOptionsModal(panel.id);
+                                        return;
+                                      }
+                                      if (isStreamBin2dPanel(panel)) {
+                                        openStreamBin2dOptionsModal(panel.id);
+                                        return;
+                                      }
+                                      openStreamBinStatsOptionsModal(panel.id);
+                                    }}
+                                  >
+                                    Open advanced options
+                                  </Button>
+                                )}
+                              </Stack>
+                            </Popover.Dropdown>
+                          </Popover>
                           <Button
                             size="xs"
                             variant="light"
@@ -7685,11 +8143,13 @@ export function App() {
                               }
                               clearStreamPanelFrames(panel.id);
                             }}
-                            >
-                              {isStreamBinStatsPanel(panel) || isStreamBin2dPanel(panel)
-                                ? "Clear binned data"
-                                : "Clear"}
-                            </Button>
+                          >
+                            {isStreamBinStatsPanel(panel) || isStreamBin2dPanel(panel)
+                              ? "Clear binned data"
+                              : "Clear"}
+                          </Button>
+                        </Group>
+                        <Group gap="xs">
                             {isExpandablePlotPanel(panel) ? (
                               <ActionIcon
                                 variant="light"
@@ -7723,6 +8183,8 @@ export function App() {
                             yMax={panel.yMax}
                             yDisplayMode={panel.yDisplayMode}
                             yOffset={telemetryOffset}
+                            smoothingMode={panel.smoothingMode}
+                            smoothingWindowS={panel.smoothingWindowS}
                           />
                           <Group gap="sm" wrap="wrap" mt="sm">
                             {panel.traces.map((trace, traceIndex) => {
@@ -8212,16 +8674,6 @@ export function App() {
         expandedPlotContent={
           expandedPlotPanel ? renderExpandedPlot(expandedPlotPanel) : null
         }
-        yAxisOpened={yAxisModalPanelId !== null}
-        onCloseYAxis={closeYAxisModal}
-        yAxisTitle={`Y axis ${yAxisModalPanel?.title ?? ""}`}
-        yAxisAutoRange={yAxisAutoRange}
-        yAxisDraftMin={yAxisDraftMin}
-        onYAxisDraftMinChange={setYAxisDraftMin}
-        yAxisDraftMax={yAxisDraftMax}
-        onYAxisDraftMaxChange={setYAxisDraftMax}
-        yAxisDraftInvalid={yAxisDraftInvalid}
-        onApplyYAxis={applyYAxisModal}
         streamTraceOpened={streamTraceOptionsPanel !== null}
         onCloseStreamTrace={closeStreamTraceOptionsModal}
         streamTracePanel={streamTraceOptionsPanel}

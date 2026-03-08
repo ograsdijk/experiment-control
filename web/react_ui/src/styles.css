@@ -8,6 +8,7 @@
   --accent-2: #d8634f;
   --card: #fbf9f4;
   --card-border: #e7dfd1;
+  --pinned-command-chip-bg: #e8f2ed;
   --shadow: 0 18px 40px rgba(28, 26, 22, 0.12);
   --font-body: "IBM Plex Sans", "Segoe UI", sans-serif;
   --font-display: "Space Grotesk", "Trebuchet MS", sans-serif;
@@ -23,6 +24,7 @@
   --accent-2: #e07a63;
   --card: #171d25;
   --card-border: #2a3441;
+  --pinned-command-chip-bg: #1a3036;
   --shadow: 0 18px 40px rgba(5, 6, 8, 0.5);
 }
 
@@ -146,6 +148,10 @@ body::before {
     padding 140ms ease,
     border-color 140ms ease,
     box-shadow 140ms ease;
+}
+
+.device-panel-resizing {
+  transition: none;
 }
 
 [data-mantine-color-scheme="dark"] .device-panel {
@@ -428,7 +434,7 @@ body::before {
   width: 100%;
   border: 1px solid var(--card-border);
   border-radius: 999px;
-  background: rgba(14, 159, 154, 0.08);
+  background: var(--pinned-command-chip-bg);
   display: flex;
   align-items: center;
   gap: 0;
@@ -522,8 +528,8 @@ body::before {
   border-left: 1px solid var(--card-border);
 }
 
-[data-mantine-color-scheme="dark"] .pinned-command-chip {
-  background: rgba(45, 185, 177, 0.12);
+.pinned-command-chip.command-deck-chip {
+  background: var(--pinned-command-chip-bg);
 }
 
 .command-deck-chip {
@@ -531,6 +537,44 @@ body::before {
     box-shadow 120ms ease,
     opacity 120ms ease,
     transform 120ms ease;
+}
+
+.command-deck-telemetry-row {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 34px;
+  padding: 2px 0;
+}
+
+.command-deck-telemetry-left {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.command-deck-telemetry-value {
+  flex: 0 1 auto;
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  white-space: nowrap;
+}
+
+.command-deck-telemetry-actions {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.command-deck-telemetry-actions .command-deck-drag-handle {
+  margin-left: 2px;
 }
 
 .command-deck-chip-dragging {
