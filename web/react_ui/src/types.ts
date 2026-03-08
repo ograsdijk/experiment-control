@@ -23,7 +23,6 @@ export type StreamCatalogEntry = {
   shape?: number[];
   units?: string | null;
   description?: string | null;
-  attrs?: Record<string, unknown> | null;
 };
 
 export type StreamFramePayload = {

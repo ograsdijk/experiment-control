@@ -31,13 +31,6 @@ type InterlocksControllerState = ReturnType<typeof useInterlocksController>;
 type SequencerControllerState = ReturnType<typeof useSequencerController>;
 type CommandHistoryControllerState = ReturnType<typeof useCommandHistoryController>;
 
-const MIN_COMMAND_HISTORY_LIMIT = 20;
-const MAX_COMMAND_HISTORY_LIMIT = 2000;
-const COMMAND_HISTORY_LIMIT_BOUNDS = {
-  min: MIN_COMMAND_HISTORY_LIMIT,
-  max: MAX_COMMAND_HISTORY_LIMIT,
-} as const;
-
 type Props = {
   hdf: HdfControllerState;
   renderMeasurementFieldInput: ComponentProps<
@@ -321,26 +314,8 @@ export function AppModalsLayer({
       <CommandHistoryModalContainer
         opened={commandHistoryController.commandHistoryOpen}
         onClose={() => commandHistoryController.setCommandHistoryOpen(false)}
-        filteredRows={commandHistoryController.filteredCommandHistoryRows}
+        controller={commandHistoryController}
         devices={devices}
-        totalRows={commandHistoryController.commandHistoryRows.length}
-        persistLimit={commandHistoryController.commandHistoryLimit}
-        persistLimitMin={MIN_COMMAND_HISTORY_LIMIT}
-        persistLimitMax={MAX_COMMAND_HISTORY_LIMIT}
-        persistLimitBounds={COMMAND_HISTORY_LIMIT_BOUNDS}
-        onPersistLimitChange={commandHistoryController.setCommandHistoryLimit}
-        autoScroll={commandHistoryController.commandHistoryAutoScroll}
-        onAutoScrollChange={commandHistoryController.setCommandHistoryAutoScroll}
-        onClear={() => commandHistoryController.setCommandHistoryRows([])}
-        targetFilter={commandHistoryController.commandHistoryTargetFilter}
-        onTargetFilterChange={commandHistoryController.setCommandHistoryTargetFilter}
-        statusFilter={commandHistoryController.commandHistoryStatusFilter}
-        onStatusFilterChange={commandHistoryController.setCommandHistoryStatusFilter}
-        sourceFilter={commandHistoryController.commandHistorySourceFilter}
-        onSourceFilterChange={commandHistoryController.setCommandHistorySourceFilter}
-        sourceOptions={commandHistoryController.commandHistorySourceOptions}
-        textFilter={commandHistoryController.commandHistoryTextFilter}
-        onTextFilterChange={commandHistoryController.setCommandHistoryTextFilter}
         viewportRef={commandHistoryScrollRef}
         onCopyJson={(label, payload) => {
           void copyJsonToClipboard(label, payload);

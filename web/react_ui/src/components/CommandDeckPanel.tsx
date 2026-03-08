@@ -511,6 +511,16 @@ export function CommandDeckPanel({
                                           event.currentTarget.value
                                         )
                                       }
+                                      onKeyDown={(event) => {
+                                        if (event.key !== "Enter" || event.shiftKey) {
+                                          return;
+                                        }
+                                        event.preventDefault();
+                                        if (busyById[entry.id]) {
+                                          return;
+                                        }
+                                        void onRunEntry(entry.id);
+                                      }}
                                       placeholder={
                                         param.required
                                           ? `${param.name} *`

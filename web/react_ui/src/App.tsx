@@ -571,6 +571,7 @@ export function App() {
   const logSeenRef = useRef<Set<string>>(new Set());
   const logScrollRef = useRef<HTMLDivElement | null>(null);
   const commandHistoryScrollRef = useRef<HTMLDivElement | null>(null);
+  const commandHistoryNearBottomRef = useRef(true);
   const commandHistoryBaselineReadyRef = useRef(false);
   const commandHistoryLastIdRef = useRef<string | null>(null);
   const logRowsBaselineReadyRef = useRef(false);
@@ -681,7 +682,9 @@ export function App() {
   const {
     commandHistoryOpen,
     setCommandHistoryOpen,
+    commandHistoryMode,
     commandHistoryRows,
+    commandJournalRows,
     setCommandHistoryRows,
     commandHistoryLimit,
     setCommandHistoryLimit,
@@ -697,6 +700,7 @@ export function App() {
     setCommandHistoryTextFilter,
     commandHistorySourceOptions,
     filteredCommandHistoryRows,
+    filteredCommandJournalRows,
     sendDeviceCommand,
     sendProcessCommand,
   } = commandHistoryController;
@@ -2769,15 +2773,53 @@ export function App() {
   }, [filteredLogRows, logsOpen, logAutoScroll]);
 
   useEffect(() => {
-    if (!commandHistoryOpen || !commandHistoryAutoScroll) {
+    if (!commandHistoryOpen) {
+      commandHistoryNearBottomRef.current = true;
       return;
     }
     const host = commandHistoryScrollRef.current;
     if (!host) {
       return;
     }
+    const thresholdPx = 24;
+    const updateNearBottom = () => {
+      const offset = host.scrollHeight - (host.scrollTop + host.clientHeight);
+      commandHistoryNearBottomRef.current = offset <= thresholdPx;
+    };
+    updateNearBottom();
+    host.addEventListener("scroll", updateNearBottom, { passive: true });
+    return () => {
+      host.removeEventListener("scroll", updateNearBottom);
+    };
+  }, [
+    commandHistoryOpen,
+    commandHistoryMode,
+    filteredCommandHistoryRows,
+    filteredCommandJournalRows,
+  ]);
+
+  useEffect(() => {
+    if (!commandHistoryOpen || !commandHistoryAutoScroll) {
+      return;
+    }
+    if (commandHistoryMode === "restore") {
+      return;
+    }
+    const host = commandHistoryScrollRef.current;
+    if (!host) {
+      return;
+    }
+    if (!commandHistoryNearBottomRef.current) {
+      return;
+    }
     host.scrollTop = host.scrollHeight;
-  }, [filteredCommandHistoryRows, commandHistoryOpen, commandHistoryAutoScroll]);
+  }, [
+    filteredCommandHistoryRows,
+    filteredCommandJournalRows,
+    commandHistoryOpen,
+    commandHistoryAutoScroll,
+    commandHistoryMode,
+  ]);
 
   const panelCapacity = (timeWindow: number) =>
     Math.max(DEFAULT_BUFFER_POINTS, Math.floor(timeWindow * 10));
@@ -6639,7 +6681,7 @@ export function App() {
           setCommandUnreadError(false);
           setCommandHistoryOpen(true);
         }}
-        commandHistoryCount={commandHistoryRows.length}
+        commandHistoryCount={Math.max(commandHistoryRows.length, commandJournalRows.length)}
         logsUnreadError={logsUnreadError}
         onOpenLogs={() => {
           setLogsUnreadError(false);

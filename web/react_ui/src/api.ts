@@ -65,6 +65,34 @@ export type InstanceRuntimeStatus = {
   last_orphan_cleanup?: Record<string, unknown> | null;
 };
 
+export type CommandJournalStatusResult = {
+  enabled: boolean;
+  path?: string | null;
+  start_error?: string | null;
+  queue_depth?: number;
+  queue_max?: number;
+  batch_size?: number;
+  flush_interval_ms?: number;
+  retention?: {
+    max_rows?: number | null;
+    max_age_days?: number | null;
+  } | null;
+  written?: number;
+  dropped?: number;
+  write_errors?: number;
+  pruned_rows?: number;
+  last_error?: string | null;
+  thread_alive?: boolean;
+};
+
+export type CommandJournalTailResult = {
+  entries?: unknown[];
+  count?: number;
+  total_matched?: number;
+  limit?: number;
+  latest_id?: number | null;
+};
+
 function isCapabilitiesPayload(value: unknown): boolean {
   if (!value || typeof value !== "object") {
     return false;
@@ -368,12 +396,23 @@ export async function fetchCapabilities(deviceId: string): Promise<CapabilityMem
 export async function callDevice(
   deviceId: string,
   action: string,
-  params: Record<string, unknown>
+  params: Record<string, unknown>,
+  opts?: {
+    requestId?: string;
+    sourceKind?: string;
+    sourceId?: string;
+  }
 ) {
   return apiFetch(`/api/devices/${deviceId}/call`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ action, params }),
+    body: JSON.stringify({
+      action,
+      params,
+      request_id: opts?.requestId,
+      source_kind: opts?.sourceKind,
+      source_id: opts?.sourceId,
+    }),
   });
 }
 
@@ -432,12 +471,23 @@ export async function fetchProcessCapabilities(
 export async function callProcess(
   processId: string,
   action: string,
-  params: Record<string, unknown>
+  params: Record<string, unknown>,
+  opts?: {
+    requestId?: string;
+    sourceKind?: string;
+    sourceId?: string;
+  }
 ) {
   return apiFetch(`/api/processes/${processId}/call`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ action, params }),
+    body: JSON.stringify({
+      action,
+      params,
+      request_id: opts?.requestId,
+      source_kind: opts?.sourceKind,
+      source_id: opts?.sourceId,
+    }),
   });
 }
 
@@ -723,6 +773,18 @@ export async function cleanupInstanceOrphans(params?: {
       stale_only: params?.stale_only ?? true,
       timeout_s: params?.timeout_s ?? 2.0,
     }),
+  });
+}
+
+export async function fetchCommandJournalStatus() {
+  return apiFetch<CommandJournalStatusResult>("/api/commands/journal/status");
+}
+
+export async function fetchCommandJournalTail(params: Record<string, unknown>) {
+  return apiFetch<CommandJournalTailResult>("/api/commands/journal/tail", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ params }),
   });
 }
 

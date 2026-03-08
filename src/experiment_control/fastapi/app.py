@@ -58,6 +58,10 @@ class LogTailRequest(BaseModel):
     params: dict[str, Any] = Field(default_factory=dict)
 
 
+class CommandJournalTailRequest(BaseModel):
+    params: dict[str, Any] = Field(default_factory=dict)
+
+
 class StreamWorkspaceRequest(BaseModel):
     workspace: dict[str, Any]
     expected_revision: int | None = None
@@ -938,9 +942,6 @@ async def list_streams() -> dict[str, Any]:
                         "shape": shape,
                         "units": output.get("units"),
                         "description": output.get("description"),
-                        "attrs": output.get("attrs")
-                        if isinstance(output.get("attrs"), dict)
-                        else {},
                     }
                 )
 
@@ -1314,6 +1315,25 @@ async def stream_workspace_store_reload(
 async def logs_tail(req: LogTailRequest | None = None) -> dict[str, Any]:
     payload = {
         "type": "manager.log.tail",
+        "params": req.params if req is not None else {},
+    }
+    resp = await asyncio.to_thread(app.state.router.request, payload)
+    return _ensure_error_shape(resp)
+
+
+@app.get("/api/commands/journal/status")
+async def command_journal_status() -> dict[str, Any]:
+    payload = {"type": "manager.command_journal.status"}
+    resp = await asyncio.to_thread(app.state.router.request, payload)
+    return _ensure_error_shape(resp)
+
+
+@app.post("/api/commands/journal/tail")
+async def command_journal_tail(
+    req: CommandJournalTailRequest | None = None,
+) -> dict[str, Any]:
+    payload = {
+        "type": "manager.command_journal.tail",
         "params": req.params if req is not None else {},
     }
     resp = await asyncio.to_thread(app.state.router.request, payload)
