@@ -1,0 +1,431 @@
+from __future__ import annotations
+
+import json
+import time
+from typing import Any
+
+from .utils.zmq_helpers import safe_json_loads
+
+Json = dict[str, Any]
+
+
+def _decode_driver_pub_payload(manager: Any, topic: str, payload_b: bytes) -> Json | None:
+    msg_any: Any
+    try:
+        msg_any = safe_json_loads(payload_b)
+    except Exception:
+        msg_any = None
+    if isinstance(msg_any, dict):
+        return msg_any
+    try:
+        msg_any = json.loads(payload_b.decode("utf-8"))
+    except Exception as e:
+        manager._publish_manager_event(
+            "manager.unknown_driver_pub",
+            {"topic": topic, "error": f"decode failed: {e}"},
+        )
+        return None
+    if not isinstance(msg_any, dict):
+        manager._publish_manager_event(
+            "manager.unknown_driver_pub",
+            {"topic": topic, "error": "payload not a dict"},
+        )
+        return None
+    return msg_any
+
+
+def _handle_telemetry_topic(manager: Any, msg: Json) -> None:
+    try:
+        manager._ingest_telemetry(msg)
+    except Exception as e:
+        manager._publish_manager_event(
+            "manager.telemetry_error",
+            {"error": f"telemetry ingest failed: {e}", "raw": msg},
+        )
+
+
+def _translate_heartbeat_pid(msg: Json) -> bool:
+    if "pid" not in msg and "driver_pid" in msg:
+        msg["pid"] = msg["driver_pid"]
+    return "pid" in msg
+
+
+def _handle_heartbeat_topic(manager: Any, *, topic: str, msg: Json) -> None:
+    if not _translate_heartbeat_pid(msg):
+        manager._publish_manager_event(
+            "manager.unknown_driver_pub",
+            {"topic": topic, "error": "heartbeat missing pid", "raw": msg},
+        )
+        return
+    try:
+        manager._ingest_heartbeat(msg)
+    except Exception as e:
+        manager._publish_manager_event(
+            "manager.heartbeat_error",
+            {"error": f"heartbeat ingest failed: {e}", "raw": msg},
+        )
+
+
+def _handle_chunk_ready_topic(manager: Any, msg: Json) -> None:
+    try:
+        manager._ingest_chunk_ready(msg)
+    except Exception as e:
+        manager._publish_manager_event(
+            "manager.chunk_error",
+            {"error": f"chunk ingest failed: {e}", "raw": msg},
+        )
+
+
+def handle_driver_pub(manager: Any) -> None:
+    topic_b, payload_b = manager._sub.recv_multipart()
+    topic = manager._normalize_topic(topic_b.decode("utf-8", errors="replace"))
+    msg = _decode_driver_pub_payload(manager, topic, payload_b)
+    if msg is None:
+        return
+    if topic.endswith("/telemetry"):
+        _handle_telemetry_topic(manager, msg)
+        return
+    if topic.endswith("/heartbeat"):
+        _handle_heartbeat_topic(manager, topic=topic, msg=msg)
+        return
+    if topic.endswith("/chunk_ready"):
+        _handle_chunk_ready_topic(manager, msg)
+        return
+    manager._publish_manager_event("manager.unknown_driver_pub", {"topic": topic, "raw": msg})
+
+
+def _emit_ingest_error(manager: Any, topic: str, payload: Json) -> None:
+    manager._publish_manager_event(topic, payload)
+
+
+def _parse_bundle_timestamp(
+    manager: Any,
+    *,
+    msg: Json,
+    device_id: str,
+    error_topic: str,
+    error_prefix: str,
+    timestamp_cls: Any,
+) -> Any:
+    ts_raw = msg.get("ts")
+    try:
+        return manager._parse_timestamp(ts_raw)
+    except Exception as e:
+        ts = timestamp_cls(t_wall=time.time(), t_mono=time.monotonic())
+        _emit_ingest_error(
+            manager,
+            error_topic,
+            {"device_id": device_id, "error": f"{error_prefix}: {e}", "raw": msg},
+        )
+        return ts
+
+
+def _require_device_id(manager: Any, *, msg: Json, error_topic: str, noun: str) -> str | None:
+    device_id_raw = msg.get("device_id")
+    if device_id_raw is None:
+        _emit_ingest_error(
+            manager,
+            error_topic,
+            {"error": f"{noun} missing device_id", "raw": msg},
+        )
+        return None
+    return str(device_id_raw)
+
+
+def _coerce_signal_quality(
+    manager: Any,
+    *,
+    raw_signal: Json,
+    telemetry_quality_enum: Any,
+) -> tuple[Any, Any]:
+    quality_raw = raw_signal.get("quality", telemetry_quality_enum.BAD)
+    quality = manager._coerce_enum(
+        telemetry_quality_enum, quality_raw, telemetry_quality_enum.BAD
+    )
+    return quality, quality_raw
+
+
+def _is_bad_quality_value(quality: Any, quality_raw: Any, telemetry_quality_enum: Any) -> bool:
+    return quality is telemetry_quality_enum.BAD and quality_raw not in {
+        telemetry_quality_enum.BAD,
+        "BAD",
+    }
+
+
+def ingest_telemetry(
+    manager: Any,
+    msg: Json,
+    *,
+    telemetry_signal_cls: Any,
+    timestamp_cls: Any,
+    telemetry_quality_enum: Any,
+) -> None:
+    device_id = _require_device_id(
+        manager,
+        msg=msg,
+        error_topic="manager.telemetry_error",
+        noun="telemetry",
+    )
+    if device_id is None:
+        return
+    ts = _parse_bundle_timestamp(
+        manager,
+        msg=msg,
+        device_id=device_id,
+        error_topic="manager.telemetry_error",
+        error_prefix="telemetry bad ts",
+        timestamp_cls=timestamp_cls,
+    )
+    raw_signals = msg.get("signals")
+    if not isinstance(raw_signals, dict):
+        _emit_ingest_error(
+            manager,
+            "manager.telemetry_error",
+            {
+                "device_id": device_id,
+                "error": "telemetry signals must be a dict",
+                "raw": msg,
+            },
+        )
+        return
+    device_cache = manager._telemetry_latest.setdefault(device_id, {})
+    bad_signals: list[str] = []
+    for name, raw_signal in raw_signals.items():
+        if not isinstance(name, str) or not isinstance(raw_signal, dict):
+            continue
+        quality, quality_raw = _coerce_signal_quality(
+            manager,
+            raw_signal=raw_signal,
+            telemetry_quality_enum=telemetry_quality_enum,
+        )
+        if "quality" in raw_signal and _is_bad_quality_value(
+            quality, quality_raw, telemetry_quality_enum
+        ):
+            bad_signals.append(name)
+        sig_ts = None
+        if raw_signal.get("ts") is not None:
+            try:
+                sig_ts = manager._parse_timestamp(raw_signal["ts"])
+            except Exception:
+                bad_signals.append(name)
+                sig_ts = None
+        sig = telemetry_signal_cls(
+            value=raw_signal.get("value"),
+            units=raw_signal.get("units"),
+            quality=quality,
+            ts=sig_ts,
+            quality_source="device",
+        )
+        device_cache[name] = (ts, sig)
+    manager._telemetry_last_bundle_ts[device_id] = ts
+    if bad_signals:
+        _emit_ingest_error(
+            manager,
+            "manager.telemetry_error",
+            {
+                "device_id": device_id,
+                "signals": sorted(set(bad_signals)),
+                "error": "telemetry had invalid quality or ts",
+            },
+        )
+    seq = int(msg.get("seq", -1))
+    manager._publish_manager_event(
+        "manager.telemetry_update",
+        {
+            "version": 1,
+            "device_id": device_id,
+            "seq": seq,
+            "ts": {"t_wall": ts.t_wall, "t_mono": ts.t_mono},
+            "signals": raw_signals,
+        },
+    )
+
+
+def _parse_heartbeat_pid(manager: Any, *, msg: Json, device_id: str) -> int | None:
+    pid_raw = msg.get("pid")
+    try:
+        return int(pid_raw)
+    except Exception:
+        _emit_ingest_error(
+            manager,
+            "manager.heartbeat_error",
+            {"device_id": device_id, "error": "heartbeat bad pid", "raw": msg},
+        )
+        return None
+
+
+def _parse_heartbeat_seq(msg: Json) -> int:
+    seq_raw = msg.get("seq", -1)
+    try:
+        return int(seq_raw)
+    except Exception:
+        return -1
+
+
+def _heartbeat_state_invalid(state_raw: Any, *, state_enum: Any, field_present: bool) -> bool:
+    state_values = {s.value for s in state_enum}
+    if isinstance(state_raw, str):
+        return state_raw not in state_values
+    return field_present and not isinstance(state_raw, state_enum)
+
+
+def _coerce_heartbeat_states(
+    manager: Any,
+    *,
+    msg: Json,
+    device_id: str,
+    driver_state_enum: Any,
+    device_state_enum: Any,
+) -> tuple[Any, Any]:
+    driver_state_raw = msg.get("driver_state", driver_state_enum.INIT)
+    driver_state = manager._coerce_enum(
+        driver_state_enum, driver_state_raw, driver_state_enum.INIT
+    )
+    device_state_raw = msg.get("device_state", device_state_enum.UNKNOWN)
+    device_state = manager._coerce_enum(
+        device_state_enum, device_state_raw, device_state_enum.UNKNOWN
+    )
+    bad_state = _heartbeat_state_invalid(
+        driver_state_raw,
+        state_enum=driver_state_enum,
+        field_present="driver_state" in msg,
+    ) or _heartbeat_state_invalid(
+        device_state_raw,
+        state_enum=device_state_enum,
+        field_present="device_state" in msg,
+    )
+    if bad_state:
+        _emit_ingest_error(
+            manager,
+            "manager.heartbeat_error",
+            {
+                "device_id": device_id,
+                "error": "heartbeat had invalid state values",
+                "raw": msg,
+            },
+        )
+    return driver_state, device_state
+
+
+def _store_heartbeat_on_handle(manager: Any, *, device_id: str, hb: Any) -> None:
+    handle = manager._devices.get(device_id)
+    if handle is None:
+        return
+    handle.last_hb = hb
+    handle.last_hb_recv_mono = time.monotonic()
+    if handle.driver_pid != hb.pid:
+        handle.driver_pid = hb.pid
+
+
+def ingest_heartbeat(
+    manager: Any,
+    msg: Json,
+    *,
+    heartbeat_cls: Any,
+    timestamp_cls: Any,
+    driver_state_enum: Any,
+    device_state_enum: Any,
+) -> None:
+    device_id = _require_device_id(
+        manager,
+        msg=msg,
+        error_topic="manager.heartbeat_error",
+        noun="heartbeat",
+    )
+    if device_id is None:
+        return
+    pid = _parse_heartbeat_pid(manager, msg=msg, device_id=device_id)
+    if pid is None:
+        return
+    seq = _parse_heartbeat_seq(msg)
+    ts = _parse_bundle_timestamp(
+        manager,
+        msg=msg,
+        device_id=device_id,
+        error_topic="manager.heartbeat_error",
+        error_prefix="heartbeat bad ts",
+        timestamp_cls=timestamp_cls,
+    )
+    driver_state, device_state = _coerce_heartbeat_states(
+        manager,
+        msg=msg,
+        device_id=device_id,
+        driver_state_enum=driver_state_enum,
+        device_state_enum=device_state_enum,
+    )
+    hb = heartbeat_cls(
+        pid=pid,
+        seq=seq,
+        driver_state=driver_state,
+        device_reachable=bool(msg.get("device_reachable", False)),
+        device_state=device_state,
+        device_health=msg.get("device_health"),
+        last_error=msg.get("last_error"),
+        last_ok_wall=msg.get("last_ok_wall"),
+        last_ok_mono=msg.get("last_ok_mono"),
+        loop_lag_s=msg.get("loop_lag_s"),
+        ts=ts,
+    )
+    _store_heartbeat_on_handle(manager, device_id=device_id, hb=hb)
+    manager._publish_manager_event(
+        "manager.heartbeat",
+        {
+            "version": 1,
+            "device_id": device_id,
+            "pid": hb.pid,
+            "seq": hb.seq,
+            "driver_state": hb.driver_state,
+            "device_state": hb.device_state,
+            "device_reachable": hb.device_reachable,
+            "device_health": hb.device_health,
+            "last_error": hb.last_error,
+            "last_ok_wall": hb.last_ok_wall,
+            "last_ok_mono": hb.last_ok_mono,
+            "loop_lag_s": hb.loop_lag_s,
+            "ts": {"t_wall": hb.ts.t_wall, "t_mono": hb.ts.t_mono},
+        },
+    )
+
+
+def _coerce_int_field(desc: Json, key: str) -> None:
+    if key in desc and desc[key] is not None:
+        try:
+            desc[key] = int(desc[key])
+        except Exception:
+            pass
+
+
+def _normalized_chunk_descriptor(msg: Json) -> Json | None:
+    desc_raw = msg.get("descriptor") if isinstance(msg.get("descriptor"), dict) else msg
+    if not isinstance(desc_raw, dict):
+        return None
+    desc = dict(desc_raw)
+    device_id = str(desc.get("device_id") or msg.get("device_id") or "")
+    stream = str(desc.get("stream") or msg.get("stream") or "")
+    if not device_id or not stream:
+        return None
+    shm_name = desc.get("shm_name")
+    if not shm_name:
+        return None
+    desc["version"] = int(desc.get("version", 1))
+    desc["device_id"] = device_id
+    desc["stream"] = stream
+    desc["shm_name"] = shm_name
+    try:
+        desc["layout_version"] = int(desc.get("layout_version", 1))
+    except Exception:
+        desc["layout_version"] = 1
+    _coerce_int_field(desc, "seq")
+    _coerce_int_field(desc, "t0_mono_ns")
+    _coerce_int_field(desc, "t0_wall_ns")
+    return desc
+
+
+def ingest_chunk_ready(manager: Any, msg: Json) -> None:
+    desc = _normalized_chunk_descriptor(msg)
+    if desc is None:
+        return
+    device_id = str(desc["device_id"])
+    stream = str(desc["stream"])
+    manager._latest_chunk_desc.setdefault(device_id, {})[stream] = desc
+    manager._publish_manager_event("manager.chunk_ready", desc)

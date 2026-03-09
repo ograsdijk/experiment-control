@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import copy
-import datetime
 import importlib
 import importlib.util
 import json
@@ -24,15 +23,27 @@ from .federation import FederationConfig
 from .federation.hub import FederationHub
 from .utils.config_parsing import (
     ConfigError,
-    normalize_list,
     optional_dict,
-    optional_str,
     require_dict,
     require_str,
 )
 from .utils.manager_network import derive_local_connect_endpoint
 from .utils.command_journal import CommandJournal, CommandJournalSettings
 from .utils.command_interceptors import apply_command_interceptor_chain
+from .manager_device_routing import route_device_request
+from .manager_driver_pub import handle_driver_pub as shared_handle_driver_pub
+from .manager_driver_pub import ingest_chunk_ready as shared_ingest_chunk_ready
+from .manager_driver_pub import ingest_heartbeat as shared_ingest_heartbeat
+from .manager_driver_pub import ingest_telemetry as shared_ingest_telemetry
+from .manager_lifecycle import shutdown_cleanup as shared_shutdown_cleanup
+from .manager_lifecycle import startup_sequence as shared_startup_sequence
+from .manager_log_events import maybe_emit_manager_log_sink as shared_maybe_emit_manager_log_sink
+from .manager_log_events import (
+    maybe_publish_log_event as shared_maybe_publish_log_event,
+)
+from .manager_process_spec import process_spec_kwargs_from_yaml
+from .manager_rpc_calls import call_device_rpc as shared_call_device_rpc
+from .manager_rpc_calls import call_process_rpc as shared_call_process_rpc
 from .types import (
     DeviceState,
     DriverState,
@@ -476,109 +487,13 @@ def process_spec_from_yaml(
     manager_rpc: str,
     manager_pub: str,
 ) -> ProcessSpec:
-    raw, yaml_text = load_yaml_file(path, return_text=True)
-    try:
-        raw_obj = require_dict(raw, path=[])
-        process_id = require_str(raw_obj.get("process_id"), path=["process_id"])
-        process_raw = raw_obj.get("process")
-        argv_raw = raw_obj.get("argv")
-        if process_raw is None and argv_raw is None:
-            raise ConfigError("<root>", "process or argv must be provided")
-        if process_raw is not None and argv_raw is not None:
-            raise ConfigError("<root>", "process and argv are mutually exclusive")
-
-        heartbeat_period_s_raw = raw_obj.get("heartbeat_period_s")
-        heartbeat_period_s = (
-            float(heartbeat_period_s_raw)
-            if heartbeat_period_s_raw is not None
-            else None
-        )
-        init_kwargs = optional_dict(raw_obj.get("init_kwargs"), path=["init_kwargs"])
-        forbidden = {
-            "process_id",
-            "manager_rpc",
-            "manager_pub",
-            "heartbeat_endpoint",
-            "process_data_endpoint",
-        }
-        bad_keys = sorted(set(init_kwargs) & forbidden)
-        if bad_keys:
-            raise ConfigError(
-                "init_kwargs",
-                f"contains reserved keys: {', '.join(bad_keys)}",
-            )
-
-        argv: list[str]
-        if process_raw is not None:
-            process_obj = require_dict(process_raw, path=["process"])
-            process_file = process_obj.get("file")
-            process_module = process_obj.get("module")
-            if process_file and process_module:
-                raise ConfigError("process", "file and module are mutually exclusive")
-            if not process_file and not process_module:
-                raise ConfigError("process", "file or module must be provided")
-            if process_module:
-                module_name = require_str(process_module, path=["process", "module"])
-                spec = importlib.util.find_spec(module_name)
-                if spec is None or spec.origin is None:
-                    raise ConfigError(
-                        "process.module", f"module not found: {module_name!r}"
-                    )
-                process_file = spec.origin
-            process_file = require_str(process_file, path=["process", "file"])
-            class_name = require_str(
-                process_obj.get("class_name"), path=["process", "class_name"]
-            )
-            argv = [
-                sys.executable,
-                "-m",
-                "experiment_control.cli.start_process",
-                "--process-class-path",
-                process_file,
-                "--process-class-name",
-                class_name,
-                "--process-init-json",
-                json.dumps(init_kwargs),
-                "--manager-rpc",
-                manager_rpc,
-                "--manager-pub",
-                manager_pub,
-            ]
-            if heartbeat_period_s is not None:
-                argv += ["--heartbeat-period-s", str(heartbeat_period_s)]
-        else:
-            argv = normalize_list(argv_raw, path=["argv"])
-            if not all(isinstance(a, str) for a in argv):
-                raise ConfigError("argv", "must be a list[str]")
-
-        restart_policy = raw_obj.get("restart_policy", RestartPolicy.NEVER)
-        if isinstance(restart_policy, str):
-            restart_policy = RestartPolicy(restart_policy)
-        if not isinstance(restart_policy, RestartPolicy):
-            raise ConfigError("restart_policy", "must be a RestartPolicy or string")
-        cwd = optional_str(raw_obj.get("cwd"), path=["cwd"])
-        env = optional_dict(raw_obj.get("env"), path=["env"])
-        env_val = env or None
-    except ConfigError as e:
-        raise TypeError(str(e)) from None
-
     return ProcessSpec(
-        process_id=process_id,
-        argv=argv,
-        cwd=cwd,
-        env=env_val,
-        heartbeat_period_s=(
-            float(raw_obj.get("heartbeat_period_s", 1.0))
-            if heartbeat_period_s is None
-            else heartbeat_period_s
-        ),
-        heartbeat_timeout_s=float(raw_obj.get("heartbeat_timeout_s", 3.0)),
-        shutdown_timeout_s=float(raw_obj.get("shutdown_timeout_s", 3.0)),
-        restart_policy=restart_policy,
-        restart_backoff_s=float(raw_obj.get("restart_backoff_s", 0.5)),
-        max_restarts=raw_obj.get("max_restarts"),
-        heartbeat_endpoint=raw_obj.get("heartbeat_endpoint"),
-        process_data_endpoint=raw_obj.get("process_data_endpoint"),
+        **process_spec_kwargs_from_yaml(
+            path,
+            manager_rpc=manager_rpc,
+            manager_pub=manager_pub,
+            restart_policy_enum=RestartPolicy,
+        )
     )
 
 
@@ -2081,136 +1996,19 @@ class Manager:
         timeout_s: float = 10.0,
         poll_ms: int = 50,
     ) -> None:
-        """
-        Start a configured manager session in a predictable way.
-
-        Steps:
-        1) optionally start managed processes
-        2) optionally wait for managed processes RUNNING (or timeout)
-        3) optionally start all driver processes
-        4) pump the event loop until all drivers register (or timeout)
-        5) optionally connect all devices (if connect=True; if connect is None, obey policy)
-        6) optionally pump until devices are ONLINE (or timeout)
-
-        Notes:
-        - If wait_processes_running is None, it defaults to start_processes.
-        This avoids waiting for processes that were not started by this call.
-
-        Raises:
-        TimeoutError if registration/online wait exceeds timeout_s.
-        """
-        self._ensure_router_running(timeout_s=timeout_s, poll_ms=poll_ms)
-        self._federation_hub.activate()
-        if wait_processes_running is None:
-            wait_processes_running = start_processes
-
-        if start_processes:
-            self.start_all_processes()
-
-        deadline = time.monotonic() + timeout_s
-
-        if wait_processes_running:
-            while True:
-                if time.monotonic() > deadline:
-                    not_running = [
-                        pid
-                        for pid, h in self._processes.items()
-                        if h.state != ManagedProcessState.RUNNING
-                    ]
-                    self._emit_log(
-                        severity="error",
-                        topic="manager.startup.process_timeout",
-                        message="Timed out waiting for processes RUNNING",
-                        source_kind="manager",
-                        source_id="manager",
-                        stream="event",
-                        payload={"not_running": not_running},
-                    )
-                    raise TimeoutError(
-                        f"Timed out waiting for processes RUNNING: {not_running}"
-                    )
-
-                self._pump_once(poll_ms=poll_ms)
-
-                all_running = all(
-                    h.state == ManagedProcessState.RUNNING
-                    for h in self._processes.values()
-                )
-                if all_running:
-                    break
-
-        if start_drivers:
-            self.start_all_drivers()
-
-        def all_registered() -> bool:
-            return all(h.rpc_endpoint is not None for h in self._devices.values())
-
-        if wait_for_registered:
-            while not all_registered():
-                if time.monotonic() > deadline:
-                    missing = [
-                        k for k, h in self._devices.items() if h.rpc_endpoint is None
-                    ]
-                    self._emit_log(
-                        severity="error",
-                        topic="manager.startup.registration_timeout",
-                        message="Timed out waiting for registration",
-                        source_kind="manager",
-                        source_id="manager",
-                        stream="event",
-                        payload={"missing": missing},
-                    )
-                    raise TimeoutError(f"Timed out waiting for registration: {missing}")
-                self._pump_once(poll_ms=poll_ms)
-
-        # Decide whether to connect:
-        # - explicit connect=True/False wins.
-        # - when connect is None, rely on registration-time auto-connect policy only.
-        do_connect = bool(connect) if connect is not None else False
-        if do_connect:
-            self.connect_all_devices()
-
-        if wait_for_online:
-            while True:
-                if time.monotonic() > deadline:
-                    not_online: list[str] = []
-                    for device_id, h in self._devices.items():
-                        if h.last_hb is None:
-                            not_online.append(device_id)
-                            continue
-                        if (not h.last_hb.device_reachable) or (
-                            h.last_hb.driver_state != DriverState.OK
-                        ):
-                            not_online.append(device_id)
-                    self._emit_log(
-                        severity="error",
-                        topic="manager.startup.online_timeout",
-                        message="Timed out waiting for devices ONLINE",
-                        source_kind="manager",
-                        source_id="manager",
-                        stream="event",
-                        payload={"not_online": not_online},
-                    )
-
-                    raise TimeoutError(
-                        f"Timed out waiting for ONLINE devices: {not_online}"
-                    )
-
-                self._pump_once(poll_ms=poll_ms)
-
-                all_online = True
-                for h in self._devices.values():
-                    if h.last_hb is None:
-                        all_online = False
-                        break
-                    if (not h.last_hb.device_reachable) or (
-                        h.last_hb.driver_state != DriverState.OK
-                    ):
-                        all_online = False
-                        break
-
-                if all_online:
-                    break
+        return shared_startup_sequence(
+            self,
+            start_drivers=start_drivers,
+            start_processes=start_processes,
+            wait_processes_running=wait_processes_running,
+            connect=connect,
+            wait_for_registered=wait_for_registered,
+            wait_for_online=wait_for_online,
+            timeout_s=timeout_s,
+            poll_ms=poll_ms,
+            managed_process_running=ManagedProcessState.RUNNING,
+            driver_state_ok=DriverState.OK,
+        )
 
     def _pump_once(self, poll_ms: int = 50) -> None:
         """Run one iteration of the manager poll loop."""
@@ -2257,58 +2055,7 @@ class Manager:
         self._shutdown_requested = True
 
     def _shutdown_cleanup(self) -> None:
-        self._federation_hub.close()
-        for handle in self._devices.values():
-            try:
-                self.stop_driver(handle.spec.device_id)
-            except Exception:
-                pass
-        for handle in self._processes.values():
-            try:
-                self._stop_process_handle(handle)
-            except Exception:
-                pass
-        self._drain_supervisor_logs(max_items=5000)
-        self._flush_stale_supervisor_blocks(force=True)
-        journal = self._command_journal
-        if journal is not None:
-            try:
-                journal.close(timeout_s=2.0)
-            except Exception:
-                pass
-        self._close_manager_log_sink_file()
-        try:
-            self._registry_rep.close(0)
-        except Exception:
-            pass
-        try:
-            self._sub.close(0)
-        except Exception:
-            pass
-        try:
-            self._process_hb_sub.close(0)
-        except Exception:
-            pass
-        try:
-            self._process_data_sub.close(0)
-        except Exception:
-            pass
-        try:
-            self._internal_rpc.close(0)
-        except Exception:
-            pass
-        try:
-            self._external_pub.close(0)
-        except Exception:
-            pass
-        try:
-            self._ctx.term()
-        except Exception:
-            pass
-        try:
-            self._process_guard.close()
-        except Exception:
-            pass
+        shared_shutdown_cleanup(self)
 
     def add_event_hook(self, hook: Callable[[str, Json], None]) -> None:
         self._event_hooks.append(hook)
@@ -2438,80 +2185,7 @@ class Manager:
     # -----------------------------
 
     def _handle_driver_pub(self) -> None:
-        topic_b, payload_b = self._sub.recv_multipart()
-        topic = self._normalize_topic(topic_b.decode("utf-8", errors="replace"))
-
-        msg_any: Any
-        try:
-                msg_any = safe_json_loads(payload_b)
-        except Exception:
-            msg_any = None
-
-        msg: Json | None
-        if not isinstance(msg_any, dict):
-            try:
-                msg_any = json.loads(payload_b.decode("utf-8"))
-            except Exception as e:
-                self._publish_manager_event(
-                    "manager.unknown_driver_pub",
-                    {"topic": topic, "error": f"decode failed: {e}"},
-                )
-                return
-            if not isinstance(msg_any, dict):
-                self._publish_manager_event(
-                    "manager.unknown_driver_pub",
-                    {"topic": topic, "error": "payload not a dict"},
-                )
-                return
-
-        msg = msg_any
-
-        # Route by topic suffix; BaseDriver publishes:
-        #   f"{device_id}/telemetry"
-        #   f"{device_id}/heartbeat"
-        if topic.endswith("/telemetry"):
-            try:
-                self._ingest_telemetry(msg)
-            except Exception as e:
-                self._publish_manager_event(
-                    "manager.telemetry_error",
-                    {"error": f"telemetry ingest failed: {e}", "raw": msg},
-                )
-            return
-
-        if topic.endswith("/heartbeat"):
-            # BaseDriver uses "driver_pid"; manager currently expects "pid".
-            # Translate here to avoid touching _ingest_heartbeat.
-            if "pid" not in msg and "driver_pid" in msg:
-                msg["pid"] = msg["driver_pid"]
-            if "pid" not in msg:
-                self._publish_manager_event(
-                    "manager.unknown_driver_pub",
-                    {"topic": topic, "error": "heartbeat missing pid", "raw": msg},
-                )
-                return
-            try:
-                self._ingest_heartbeat(msg)
-            except Exception as e:
-                self._publish_manager_event(
-                    "manager.heartbeat_error",
-                    {"error": f"heartbeat ingest failed: {e}", "raw": msg},
-                )
-            return
-
-        if topic.endswith("/chunk_ready"):
-            try:
-                self._ingest_chunk_ready(msg)
-            except Exception as e:
-                self._publish_manager_event(
-                    "manager.chunk_error",
-                    {"error": f"chunk ingest failed: {e}", "raw": msg},
-                )
-            return
-
-        self._publish_manager_event(
-            "manager.unknown_driver_pub", {"topic": topic, "raw": msg}
-        )
+        shared_handle_driver_pub(self)
 
     def _handle_process_pub(self) -> None:
         topic_b, payload_b = self._process_hb_sub.recv_multipart()
@@ -2566,266 +2240,26 @@ class Manager:
             )
 
     def _ingest_telemetry(self, msg: Json) -> None:
-        """
-        Telemetry payload shape + semantics follow the newer telemetry spec:
-        - one dict per update, merged signals
-        - per-signal failure/quality
-        - bundle ts present; per-signal ts is None unless device provides real timestamps
-        """
-        device_id_raw = msg.get("device_id")
-        if device_id_raw is None:
-            self._publish_manager_event(
-                "manager.telemetry_error",
-                {"error": "telemetry missing device_id", "raw": msg},
-            )
-            return
-        device_id = str(device_id_raw)
-
-        ts_raw = msg.get("ts")
-        try:
-            ts = self._parse_timestamp(ts_raw)
-        except Exception as e:
-            ts = Timestamp(t_wall=time.time(), t_mono=time.monotonic())
-            self._publish_manager_event(
-                "manager.telemetry_error",
-                {
-                    "device_id": device_id,
-                    "error": f"telemetry bad ts: {e}",
-                    "raw": msg,
-                },
-            )
-
-        raw_signals = msg.get("signals")
-        if not isinstance(raw_signals, dict):
-            self._publish_manager_event(
-                "manager.telemetry_error",
-                {
-                    "device_id": device_id,
-                    "error": "telemetry signals must be a dict",
-                    "raw": msg,
-                },
-            )
-            return
-
-        device_cache = self._telemetry_latest.setdefault(device_id, {})
-        bad_signals: list[str] = []
-        for name, s in raw_signals.items():
-            if not isinstance(name, str) or not isinstance(s, dict):
-                continue
-            quality_raw = s.get("quality", TelemetryQuality.BAD)
-            quality = self._coerce_enum(
-                TelemetryQuality, quality_raw, TelemetryQuality.BAD
-            )
-            if "quality" in s:
-                if quality is TelemetryQuality.BAD and quality_raw not in {
-                    TelemetryQuality.BAD,
-                    "BAD",
-                }:
-                    bad_signals.append(name)
-
-            sig_ts = None
-            if s.get("ts") is not None:
-                try:
-                    sig_ts = self._parse_timestamp(s["ts"])
-                except Exception:
-                    bad_signals.append(name)
-                    sig_ts = None
-
-            sig = TelemetrySignal(
-                value=s.get("value"),
-                units=s.get("units"),
-                quality=quality,
-                ts=sig_ts,
-                quality_source="device",
-            )
-            device_cache[name] = (ts, sig)
-        self._telemetry_last_bundle_ts[device_id] = ts
-
-        if bad_signals:
-            self._publish_manager_event(
-                "manager.telemetry_error",
-                {
-                    "device_id": device_id,
-                    "signals": sorted(set(bad_signals)),
-                    "error": "telemetry had invalid quality or ts",
-                },
-            )
-
-        # Publish a compact update for GUIs etc (do not spam large blobs unless needed)
-        seq = int(msg.get("seq", -1))
-        self._publish_manager_event(
-            "manager.telemetry_update",
-            {
-                "version": 1,
-                "device_id": device_id,
-                "seq": seq,
-                "ts": {"t_wall": ts.t_wall, "t_mono": ts.t_mono},
-                "signals": raw_signals,
-            },
+        shared_ingest_telemetry(
+            self,
+            msg,
+            telemetry_signal_cls=TelemetrySignal,
+            timestamp_cls=Timestamp,
+            telemetry_quality_enum=TelemetryQuality,
         )
 
     def _ingest_heartbeat(self, msg: Json) -> None:
-        device_id_raw = msg.get("device_id")
-        if device_id_raw is None:
-            self._publish_manager_event(
-                "manager.heartbeat_error",
-                {"error": "heartbeat missing device_id", "raw": msg},
-            )
-            return
-        device_id = str(device_id_raw)
-
-        pid_raw = msg.get("pid")
-        try:
-            pid = int(pid_raw)
-        except Exception:
-            self._publish_manager_event(
-                "manager.heartbeat_error",
-                {"device_id": device_id, "error": "heartbeat bad pid", "raw": msg},
-            )
-            return
-
-        seq_raw = msg.get("seq", -1)
-        try:
-            seq = int(seq_raw)
-        except Exception:
-            seq = -1
-
-        ts_raw = msg.get("ts")
-        try:
-            ts = self._parse_timestamp(ts_raw)
-        except Exception as e:
-            ts = Timestamp(t_wall=time.time(), t_mono=time.monotonic())
-            self._publish_manager_event(
-                "manager.heartbeat_error",
-                {
-                    "device_id": device_id,
-                    "error": f"heartbeat bad ts: {e}",
-                    "raw": msg,
-                },
-            )
-
-        driver_state_raw = msg.get("driver_state", DriverState.INIT)
-        driver_state = self._coerce_enum(
-            DriverState, driver_state_raw, DriverState.INIT
-        )
-        device_state_raw = msg.get("device_state", DeviceState.UNKNOWN)
-        device_state = self._coerce_enum(
-            DeviceState, device_state_raw, DeviceState.UNKNOWN
-        )
-
-        bad_state = False
-        driver_state_values = {s.value for s in DriverState}
-        device_state_values = {s.value for s in DeviceState}
-        if isinstance(driver_state_raw, str):
-            if driver_state_raw not in driver_state_values:
-                bad_state = True
-        elif "driver_state" in msg and not isinstance(driver_state_raw, DriverState):
-            bad_state = True
-        if isinstance(device_state_raw, str):
-            if device_state_raw not in device_state_values:
-                bad_state = True
-        elif "device_state" in msg and not isinstance(device_state_raw, DeviceState):
-            bad_state = True
-        if bad_state:
-            self._publish_manager_event(
-                "manager.heartbeat_error",
-                {
-                    "device_id": device_id,
-                    "error": "heartbeat had invalid state values",
-                    "raw": msg,
-                },
-            )
-
-        hb = Heartbeat(
-            pid=pid,
-            seq=seq,
-            driver_state=driver_state,
-            device_reachable=bool(msg.get("device_reachable", False)),
-            device_state=device_state,
-            device_health=msg.get("device_health"),
-            last_error=msg.get("last_error"),
-            last_ok_wall=msg.get("last_ok_wall"),
-            last_ok_mono=msg.get("last_ok_mono"),
-            loop_lag_s=msg.get("loop_lag_s"),
-            ts=ts,
-        )
-        handle = self._devices.get(device_id)
-        if handle is not None:
-            handle.last_hb = hb
-            handle.last_hb_recv_mono = time.monotonic()
-            if handle.driver_pid != hb.pid:
-                handle.driver_pid = hb.pid
-
-        self._publish_manager_event(
-            "manager.heartbeat",
-            {
-                "version": 1,
-                "device_id": device_id,
-                "pid": hb.pid,
-                "seq": hb.seq,
-                "driver_state": hb.driver_state,
-                "device_state": hb.device_state,
-                "device_reachable": hb.device_reachable,
-                "device_health": hb.device_health,
-                "last_error": hb.last_error,
-                "last_ok_wall": hb.last_ok_wall,
-                "last_ok_mono": hb.last_ok_mono,
-                "loop_lag_s": hb.loop_lag_s,
-                "ts": {"t_wall": hb.ts.t_wall, "t_mono": hb.ts.t_mono},
-            },
+        shared_ingest_heartbeat(
+            self,
+            msg,
+            heartbeat_cls=Heartbeat,
+            timestamp_cls=Timestamp,
+            driver_state_enum=DriverState,
+            device_state_enum=DeviceState,
         )
 
     def _ingest_chunk_ready(self, msg: Json) -> None:
-        """
-        Fast data philosophy: never send raw arrays over IPC; publish a descriptor
-        and keep payload out-of-band (shared memory or file).
-        """
-        desc_raw = (
-            msg.get("descriptor") if isinstance(msg.get("descriptor"), dict) else msg
-        )
-        if not isinstance(desc_raw, dict):
-            return
-
-        desc = dict(desc_raw)
-        device_id = str(desc.get("device_id") or msg.get("device_id") or "")
-        stream = str(desc.get("stream") or msg.get("stream") or "")
-        if not device_id or not stream:
-            return
-        shm_name = desc.get("shm_name")
-        if not shm_name:
-            return
-
-        desc["version"] = int(desc.get("version", 1))
-        desc["device_id"] = device_id
-        desc["stream"] = stream
-        desc["shm_name"] = shm_name
-
-        if "layout_version" in desc:
-            try:
-                desc["layout_version"] = int(desc["layout_version"])
-            except Exception:
-                desc["layout_version"] = 1
-        else:
-            desc["layout_version"] = 1
-
-        if "seq" in desc and desc["seq"] is not None:
-            try:
-                desc["seq"] = int(desc["seq"])
-            except Exception:
-                pass
-        if "t0_mono_ns" in desc and desc["t0_mono_ns"] is not None:
-            try:
-                desc["t0_mono_ns"] = int(desc["t0_mono_ns"])
-            except Exception:
-                pass
-        if "t0_wall_ns" in desc and desc["t0_wall_ns"] is not None:
-            try:
-                desc["t0_wall_ns"] = int(desc["t0_wall_ns"])
-            except Exception:
-                pass
-
-        self._latest_chunk_desc.setdefault(device_id, {})[stream] = desc
-        self._publish_manager_event("manager.chunk_ready", desc)
+        shared_ingest_chunk_ready(self, msg)
 
     def _ingest_process_heartbeat(self, topic: str, msg: Json) -> None:
         process_id = str(msg["process_id"])
@@ -3087,619 +2521,186 @@ class Manager:
                 "ok": True,
                 "telemetry": self._get_device_telemetry_snapshot(device_id),
             }
-        if rtype == "command":
-            device_id = str(req["device_id"])
-            action = str(req["action"])
-            params = req.get("params", {})
-            request_id = req.get("request_id")
-            caller_process_id = req.get("caller_process_id")
-            source_kind, source_id = self._normalize_command_source(
-                source_kind=req.get("source_kind"),
-                source_id=req.get("source_id"),
-                caller_process_id=caller_process_id,
-            )
-            if not isinstance(params, dict):
-                raise TypeError("params must be a dict")
-            handle = self._devices.get(device_id)
-            if handle is None:
-                fed_resp = self._federation_hub.forward_device_request(req)
-                if fed_resp is not None:
-                    return fed_resp
-                return {"ok": False, "error": f"Unknown device_id {device_id!r}"}
-            if self._driver_is_stopped(handle) or handle.rpc_endpoint is None:
-                return {"ok": False, "error": "driver not running"}
-            cmd = {"device_id": device_id, "action": action, "params": params}
-            ok, new_cmd, err = self._apply_command_interceptors(
-                cmd,
-                request_id=request_id,
-                caller_process_id=caller_process_id,
-            )
-            if not ok:
-                return {"ok": False, "error": err}
-            if new_cmd is None:
-                return {"ok": False, "error": "command blocked"}
-            return self._call_device_rpc(
-                device_id=str(new_cmd.get("device_id", device_id)),
-                action=str(new_cmd.get("action", action)),
-                params=new_cmd.get("params", params),
-                request_id=request_id,
-                caller_process_id=caller_process_id,
-                source_kind=source_kind,
-                source_id=source_id,
-                is_remote_target=False,
-            )
+        device_resp = self._route_device_request(rtype, req)
+        if device_resp is not None:
+            return device_resp
 
-        if rtype == "federation.capabilities.update":
-            device_id = str(req.get("device_id", ""))
-            capabilities = req.get("capabilities")
-            if not device_id:
-                return {
-                    "ok": False,
-                    "error": {
-                        "code": "invalid_federation_update",
-                        "message": "missing device_id",
-                    },
-                }
-            if not isinstance(capabilities, dict):
-                return {
-                    "ok": False,
-                    "error": {
-                        "code": "invalid_federation_update",
-                        "message": "capabilities must be a dict",
-                    },
-                }
-            try:
-                self._federation_hub.update_capabilities(device_id, capabilities)
-            except KeyError:
-                return {
-                    "ok": False,
-                    "error": {
-                        "code": "unknown_device",
-                        "message": f"Unknown mirrored device_id {device_id!r}",
-                    },
-                }
-            return {"ok": True, "result": {"device_id": device_id}}
+        process_resp = self._route_process_request(rtype, req)
+        if process_resp is not None:
+            return process_resp
 
-        if rtype == "device.get_status":
-            device_id = str(req["device_id"])
-            if self._federation_hub.is_mirrored_device(device_id):
-                return {
-                    "ok": True,
-                    "result": self._federation_hub.device_status_snapshot(device_id),
-                }
-            return {"ok": True, "result": self._device_status_snapshot(device_id)}
-        if rtype == "device.list_status":
-            return {"ok": True, "result": self._list_devices_status_snapshot()}
+        manager_resp = self._route_manager_request(rtype, req)
+        if manager_resp is not None:
+            return manager_resp
 
-        if rtype == "device.driver.start":
-            device_id = str(req["device_id"])
-            fed_resp = self._federation_hub.forward_device_request(req)
-            if fed_resp is not None:
-                return fed_resp
-            handle = self._devices.get(device_id)
-            if handle is None:
-                return {"ok": False, "error": f"Unknown device_id {device_id!r}"}
-            if self._driver_is_started(handle):
-                return {"ok": False, "error": "driver already started"}
-            self.start_driver(device_id)
-            return {"ok": True, "result": {"device_id": device_id}}
-        if rtype == "device.driver.stop":
-            device_id = str(req["device_id"])
-            force = bool(req.get("force", False))
-            fed_resp = self._federation_hub.forward_device_request(req)
-            if fed_resp is not None:
-                return fed_resp
-            handle = self._devices.get(device_id)
-            if handle is None:
-                return {"ok": False, "error": f"Unknown device_id {device_id!r}"}
-            if self._driver_is_stopped(handle):
-                return {"ok": False, "error": "driver already stopped"}
-            self.stop_driver(device_id, force=force)
-            return {"ok": True, "result": {"device_id": device_id}}
-        if rtype == "device.driver.restart":
-            device_id = str(req["device_id"])
-            force = bool(req.get("force", False))
-            fed_resp = self._federation_hub.forward_device_request(req)
-            if fed_resp is not None:
-                return fed_resp
-            self.restart_driver(device_id, force=force)
-            return {"ok": True, "result": {"device_id": device_id}}
-        if rtype == "device.recover":
-            device_id = str(req["device_id"])
-            reconnect = bool(req.get("reconnect", True))
-            force = bool(req.get("force", False))
-            fed_resp = self._federation_hub.forward_device_request(req)
-            if fed_resp is not None:
-                return fed_resp
-            self.recover_device(device_id, reconnect=reconnect, force=force)
-            return {"ok": True, "result": {"device_id": device_id}}
+        raise ValueError(f"Unknown external request type {rtype!r}")
 
-        if rtype == "device.connect":
-            device_id = str(req["device_id"])
-            fed_resp = self._federation_hub.forward_device_request(req)
-            if fed_resp is not None:
-                return fed_resp
-            resp = self.connect_device(device_id)
-            self._publish_manager_event(
-                "manager.device.connect_sent",
-                {
-                    "device_id": device_id,
-                    "response": resp,
-                    "ts": {"t_wall": time.time(), "t_mono": time.monotonic()},
-                },
-            )
-            if self._device_rpc_status_ok(resp):
-                return {"ok": True, "result": resp}
-            error: Json = {
-                "code": str(resp.get("error_code") or "device_error"),
-                "message": self._device_rpc_error_text(resp),
+    def _route_device_request(self, rtype: Any, req: Json) -> Json | None:
+        return route_device_request(self, rtype, req)
+
+    def _publish_process_command_response(
+        self,
+        *,
+        process_id: str,
+        action: str,
+        params: Json,
+        response: Json,
+        request_id: Any,
+        caller_process_id: Any,
+        source_kind: str,
+        source_id: str,
+    ) -> Json:
+        self._publish_process_command_event(
+            process_id=process_id,
+            action=action,
+            params=params,
+            response=response,
+            request_id=request_id,
+            caller_process_id=caller_process_id,
+            source_kind=source_kind,
+            source_id=source_id,
+        )
+        return response
+
+    def _route_process_request(self, rtype: Any, req: Json) -> Json | None:
+        handlers: dict[str, Callable[[Json], Json]] = {
+            "process.list_status": self._route_process_list_status,
+            "process.get": self._route_process_get,
+            "process.start": self._route_process_start,
+            "process.stop": self._route_process_stop,
+            "process.restart": self._route_process_restart,
+            "process.add": self._route_process_add,
+            "process.remove": self._route_process_remove,
+            "process.rpc.advertise": self._route_process_rpc_advertise,
+            "process.rpc": self._route_process_rpc,
+            "command_interceptor.register": self._route_command_interceptor_register,
+            "command_interceptor.list": self._route_command_interceptor_list,
+        }
+        handler = handlers.get(str(rtype))
+        if handler is None:
+            return None
+        return handler(req)
+
+    def _route_process_list_status(self, req: Json) -> Json:
+        del req
+        return {"ok": True, "result": self.list_processes()}
+
+    def _route_process_get(self, req: Json) -> Json:
+        process_id = str(req["process_id"])
+        return {"ok": True, "result": self.get_process(process_id)}
+
+    def _route_process_control(
+        self,
+        req: Json,
+        *,
+        action: str,
+        runner: Callable[[str], None],
+    ) -> Json:
+        process_id = str(req["process_id"])
+        request_id = req.get("request_id")
+        caller_process_id = req.get("caller_process_id")
+        source_kind, source_id = self._normalize_command_source(
+            source_kind=req.get("source_kind"),
+            source_id=req.get("source_id"),
+            caller_process_id=caller_process_id,
+        )
+        runner(process_id)
+        resp = {"ok": True, "result": {"process_id": process_id}}
+        return self._publish_process_command_response(
+            process_id=process_id,
+            action=action,
+            params={"process_id": process_id},
+            response=resp,
+            request_id=request_id,
+            caller_process_id=caller_process_id,
+            source_kind=source_kind,
+            source_id=source_id,
+        )
+
+    def _route_process_start(self, req: Json) -> Json:
+        return self._route_process_control(req, action="process.start", runner=self.start_process)
+
+    def _route_process_stop(self, req: Json) -> Json:
+        return self._route_process_control(req, action="process.stop", runner=self.stop_process)
+
+    def _route_process_restart(self, req: Json) -> Json:
+        return self._route_process_control(
+            req, action="process.restart", runner=self.restart_process
+        )
+
+    def _route_process_add(self, req: Json) -> Json:
+        spec_raw = req.get("spec")
+        if not isinstance(spec_raw, dict):
+            raise TypeError("spec must be a dict")
+        spec = self._parse_process_spec(spec_raw)
+        self.add_process(spec)
+        return {"ok": True, "result": {"process_id": spec.process_id}}
+
+    def _route_process_remove(self, req: Json) -> Json:
+        process_id = str(req["process_id"])
+        self.remove_process(process_id)
+        return {"ok": True, "result": {"process_id": process_id}}
+
+    def _route_process_rpc_advertise(self, req: Json) -> Json:
+        process_id = str(req.get("process_id", ""))
+        rpc_endpoint = str(req.get("rpc_endpoint", ""))
+        if not process_id or not rpc_endpoint:
+            return {
+                "ok": False,
+                "error": {"code": "invalid_advertise", "message": "missing fields"},
             }
-            details = resp.get("error_details")
-            if isinstance(details, dict):
-                error["details"] = details
-            return {"ok": False, "error": error, "result": resp}
-        if rtype == "device.disconnect":
-            device_id = str(req["device_id"])
-            fed_resp = self._federation_hub.forward_device_request(req)
-            if fed_resp is not None:
-                return fed_resp
-            resp = self.disconnect_device(device_id)
-            self._publish_manager_event(
-                "manager.device.disconnect_sent",
-                {
-                    "device_id": device_id,
-                    "response": resp,
-                    "ts": {"t_wall": time.time(), "t_mono": time.monotonic()},
-                },
-            )
-            return {"ok": True, "result": resp}
+        handle = self._processes.get(process_id)
+        if handle is None:
+            return {"ok": False, "error": {"code": "unknown_process"}}
+        if handle.rpc_endpoint != rpc_endpoint:
+            self._close_process_rpc(handle)
+        handle.rpc_endpoint = rpc_endpoint
+        self._publish_manager_event(
+            "manager.process.rpc_update",
+            {
+                "process_id": process_id,
+                "rpc_endpoint": rpc_endpoint,
+                "ts": {"t_wall": time.time(), "t_mono": time.monotonic()},
+            },
+        )
+        return {"ok": True, "result": {"process_id": process_id}}
 
-        if rtype == "device.config.get":
-            device_id = str(req["device_id"])
-            fed_cfg = self._federation_hub.device_config_get(device_id)
-            if fed_cfg is not None:
-                return {"ok": True, "result": fed_cfg}
-            handle = self._devices.get(device_id)
-            if handle is None:
-                return {"ok": False, "error": f"Unknown device_id {device_id!r}"}
-            return {"ok": True, "result": self._device_config_payload(handle)}
-        if rtype == "device.config.list":
-            configs = [
-                self._device_config_payload(handle)
-                for handle in self._devices.values()
-            ]
-            configs.extend(self._federation_hub.device_config_list())
-            configs.sort(key=lambda item: str(item.get("device_id", "")))
-            return {"ok": True, "result": configs}
-        if rtype == "device.metadata.get":
-            device_id = str(req.get("device_id", "")).strip()
-            if not device_id:
-                return {
-                    "ok": False,
-                    "error": {
-                        "code": "invalid_device_id",
-                        "message": "device_id is required",
-                    },
-                }
-            if self._federation_hub.is_mirrored_device(device_id):
-                return {
-                    "ok": False,
-                    "error": {
-                        "code": "remote_device_unsupported",
-                        "message": "runtime metadata overrides only apply to local devices",
-                    },
-                }
-            handle = self._devices.get(device_id)
-            if handle is None:
-                return {"ok": False, "error": {"code": "unknown_device"}}
-            return {"ok": True, "result": self._runtime_metadata_state(device_id, handle)}
-        if rtype == "device.metadata.set":
-            device_id = str(req.get("device_id", "")).strip()
-            if not device_id:
-                return {
-                    "ok": False,
-                    "error": {
-                        "code": "invalid_device_id",
-                        "message": "device_id is required",
-                    },
-                }
-            if self._federation_hub.is_mirrored_device(device_id):
-                return {
-                    "ok": False,
-                    "error": {
-                        "code": "remote_device_unsupported",
-                        "message": "runtime metadata overrides only apply to local devices",
-                    },
-                }
-            handle = self._devices.get(device_id)
-            if handle is None:
-                return {"ok": False, "error": {"code": "unknown_device"}}
-            params = req.get("params", {})
-            if params is None:
-                params = {}
-            if not isinstance(params, dict):
-                return {
-                    "ok": False,
-                    "error": {"code": "invalid_params", "message": "params must be a dict"},
-                }
-            mode = str(params.get("mode", "merge")).strip().lower()
-            if mode not in {"merge", "replace"}:
-                return {
-                    "ok": False,
-                    "error": {
-                        "code": "invalid_params",
-                        "message": "mode must be 'merge' or 'replace'",
-                    },
-                }
-            has_device = "device_metadata" in params
-            has_stream = "stream_metadata" in params
-            if not has_device and not has_stream:
-                return {
-                    "ok": False,
-                    "error": {
-                        "code": "invalid_params",
-                        "message": "device_metadata and/or stream_metadata required",
-                    },
-                }
-            try:
-                parsed_device: dict[str, Any] | None = None
-                parsed_stream: dict[str, dict[str, Any]] | None = None
-                clear_device = False
-                clear_stream = False
-                if has_device:
-                    raw_device = params.get("device_metadata")
-                    if raw_device is None:
-                        clear_device = True
-                    else:
-                        parsed_device = self._normalize_runtime_metadata_dict(
-                            raw_device, label="device_metadata"
-                        )
-                if has_stream:
-                    raw_stream = params.get("stream_metadata")
-                    if raw_stream is None:
-                        clear_stream = True
-                    else:
-                        parsed_stream = self._normalize_runtime_stream_metadata_dict(
-                            raw_stream, label="stream_metadata"
-                        )
-            except Exception as e:
-                return {
-                    "ok": False,
-                    "error": {"code": "invalid_params", "message": str(e)},
-                }
-
-            changed = False
-            cur_device = copy.deepcopy(
-                self._runtime_device_metadata_overrides.get(device_id, {})
-            )
-            cur_stream = copy.deepcopy(
-                self._runtime_stream_metadata_overrides.get(device_id, {})
-            )
-            next_device = copy.deepcopy(cur_device)
-            next_stream = copy.deepcopy(cur_stream)
-
-            if has_device:
-                if clear_device:
-                    next_device = {}
-                elif parsed_device is not None:
-                    if mode == "replace":
-                        next_device = dict(parsed_device)
-                    else:
-                        next_device.update(parsed_device)
-
-            if has_stream:
-                if clear_stream:
-                    next_stream = {}
-                elif parsed_stream is not None:
-                    if mode == "replace":
-                        next_stream = dict(parsed_stream)
-                    else:
-                        next_stream = self._merge_stream_metadata_dicts(
-                            next_stream, parsed_stream
-                        )
-
-            if next_device != cur_device:
-                changed = True
-                if next_device:
-                    self._runtime_device_metadata_overrides[device_id] = next_device
-                else:
-                    self._runtime_device_metadata_overrides.pop(device_id, None)
-
-            if next_stream != cur_stream:
-                changed = True
-                if next_stream:
-                    self._runtime_stream_metadata_overrides[device_id] = next_stream
-                else:
-                    self._runtime_stream_metadata_overrides.pop(device_id, None)
-
-            if changed:
-                self._touch_runtime_metadata_revision(device_id)
-                self._publish_device_config(handle)
-
-            result = self._runtime_metadata_state(device_id, handle)
-            result["changed"] = changed
-            result["mode"] = mode
-            return {"ok": True, "result": result}
-        if rtype == "device.metadata.clear":
-            device_id = str(req.get("device_id", "")).strip()
-            if not device_id:
-                return {
-                    "ok": False,
-                    "error": {
-                        "code": "invalid_device_id",
-                        "message": "device_id is required",
-                    },
-                }
-            if self._federation_hub.is_mirrored_device(device_id):
-                return {
-                    "ok": False,
-                    "error": {
-                        "code": "remote_device_unsupported",
-                        "message": "runtime metadata overrides only apply to local devices",
-                    },
-                }
-            handle = self._devices.get(device_id)
-            if handle is None:
-                return {"ok": False, "error": {"code": "unknown_device"}}
-            params = req.get("params", {})
-            if params is None:
-                params = {}
-            if not isinstance(params, dict):
-                return {
-                    "ok": False,
-                    "error": {"code": "invalid_params", "message": "params must be a dict"},
-                }
-            scope = str(params.get("scope", "all")).strip().lower()
-            if scope not in {"all", "device", "stream"}:
-                return {
-                    "ok": False,
-                    "error": {
-                        "code": "invalid_params",
-                        "message": "scope must be 'all', 'device', or 'stream'",
-                    },
-                }
-
-            changed = False
-            if scope in {"all", "device"} and device_id in self._runtime_device_metadata_overrides:
-                self._runtime_device_metadata_overrides.pop(device_id, None)
-                changed = True
-            if scope in {"all", "stream"} and device_id in self._runtime_stream_metadata_overrides:
-                self._runtime_stream_metadata_overrides.pop(device_id, None)
-                changed = True
-            if changed:
-                self._touch_runtime_metadata_revision(device_id)
-                self._publish_device_config(handle)
-
-            result = self._runtime_metadata_state(device_id, handle)
-            result["changed"] = changed
-            result["scope"] = scope
-            return {"ok": True, "result": result}
-
-        if rtype == "process.list_status":
-            return {"ok": True, "result": self.list_processes()}
-        if rtype == "process.get":
-            process_id = str(req["process_id"])
-            return {"ok": True, "result": self.get_process(process_id)}
-        if rtype == "process.start":
-            process_id = str(req["process_id"])
-            request_id = req.get("request_id")
-            caller_process_id = req.get("caller_process_id")
-            source_kind, source_id = self._normalize_command_source(
-                source_kind=req.get("source_kind"),
-                source_id=req.get("source_id"),
-                caller_process_id=caller_process_id,
-            )
-            self.start_process(process_id)
-            resp = {"ok": True, "result": {"process_id": process_id}}
-            self._publish_process_command_event(
-                process_id=process_id,
-                action="process.start",
-                params={"process_id": process_id},
+    def _route_process_rpc(self, req: Json) -> Json:
+        process_id = str(req.get("process_id", ""))
+        request = req.get("request")
+        request_id = req.get("request_id")
+        caller_process_id = req.get("caller_process_id")
+        source_kind, source_id = self._normalize_command_source(
+            source_kind=req.get("source_kind"),
+            source_id=req.get("source_id"),
+            caller_process_id=caller_process_id,
+        )
+        process_action = "process.rpc"
+        process_params: Json = {}
+        if isinstance(request, dict):
+            process_action = str(request.get("type", "process.rpc") or "process.rpc")
+            raw_params = request.get("params", {})
+            if isinstance(raw_params, dict):
+                process_params = raw_params
+        if not process_id or not isinstance(request, dict):
+            resp = {
+                "ok": False,
+                "error": {"code": "invalid_process_rpc", "message": "bad request"},
+            }
+            return self._publish_process_command_response(
+                process_id=process_id or "unknown",
+                action=process_action,
+                params=process_params,
                 response=resp,
                 request_id=request_id,
                 caller_process_id=caller_process_id,
                 source_kind=source_kind,
                 source_id=source_id,
             )
-            return resp
-        if rtype == "process.stop":
-            process_id = str(req["process_id"])
-            request_id = req.get("request_id")
-            caller_process_id = req.get("caller_process_id")
-            source_kind, source_id = self._normalize_command_source(
-                source_kind=req.get("source_kind"),
-                source_id=req.get("source_id"),
-                caller_process_id=caller_process_id,
-            )
-            self.stop_process(process_id)
-            resp = {"ok": True, "result": {"process_id": process_id}}
-            self._publish_process_command_event(
-                process_id=process_id,
-                action="process.stop",
-                params={"process_id": process_id},
-                response=resp,
-                request_id=request_id,
-                caller_process_id=caller_process_id,
-                source_kind=source_kind,
-                source_id=source_id,
-            )
-            return resp
-        if rtype == "process.restart":
-            process_id = str(req["process_id"])
-            request_id = req.get("request_id")
-            caller_process_id = req.get("caller_process_id")
-            source_kind, source_id = self._normalize_command_source(
-                source_kind=req.get("source_kind"),
-                source_id=req.get("source_id"),
-                caller_process_id=caller_process_id,
-            )
-            self.restart_process(process_id)
-            resp = {"ok": True, "result": {"process_id": process_id}}
-            self._publish_process_command_event(
-                process_id=process_id,
-                action="process.restart",
-                params={"process_id": process_id},
-                response=resp,
-                request_id=request_id,
-                caller_process_id=caller_process_id,
-                source_kind=source_kind,
-                source_id=source_id,
-            )
-            return resp
-        if rtype == "process.add":
-            spec_raw = req.get("spec")
-            if not isinstance(spec_raw, dict):
-                raise TypeError("spec must be a dict")
-            spec = self._parse_process_spec(spec_raw)
-            self.add_process(spec)
-            return {"ok": True, "result": {"process_id": spec.process_id}}
-        if rtype == "process.remove":
-            process_id = str(req["process_id"])
-            self.remove_process(process_id)
-            return {"ok": True, "result": {"process_id": process_id}}
-
-        if rtype == "process.rpc.advertise":
-            process_id = str(req.get("process_id", ""))
-            rpc_endpoint = str(req.get("rpc_endpoint", ""))
-            if not process_id or not rpc_endpoint:
-                return {
-                    "ok": False,
-                    "error": {"code": "invalid_advertise", "message": "missing fields"},
-                }
-            handle = self._processes.get(process_id)
-            if handle is None:
-                return {"ok": False, "error": {"code": "unknown_process"}}
-            if handle.rpc_endpoint != rpc_endpoint:
-                self._close_process_rpc(handle)
-            handle.rpc_endpoint = rpc_endpoint
-            self._publish_manager_event(
-                "manager.process.rpc_update",
-                {
-                    "process_id": process_id,
-                    "rpc_endpoint": rpc_endpoint,
-                    "ts": {"t_wall": time.time(), "t_mono": time.monotonic()},
-                },
-            )
-            return {"ok": True, "result": {"process_id": process_id}}
-
-        if rtype == "process.rpc":
-            process_id = str(req.get("process_id", ""))
-            request = req.get("request")
-            request_id = req.get("request_id")
-            caller_process_id = req.get("caller_process_id")
-            source_kind, source_id = self._normalize_command_source(
-                source_kind=req.get("source_kind"),
-                source_id=req.get("source_id"),
-                caller_process_id=caller_process_id,
-            )
-            process_action = "process.rpc"
-            process_params: Json = {}
-            if isinstance(request, dict):
-                process_action = str(request.get("type", "process.rpc") or "process.rpc")
-                raw_params = request.get("params", {})
-                if isinstance(raw_params, dict):
-                    process_params = raw_params
-            if not process_id or not isinstance(request, dict):
-                resp = {
-                    "ok": False,
-                    "error": {"code": "invalid_process_rpc", "message": "bad request"},
-                }
-                self._publish_process_command_event(
-                    process_id=process_id or "unknown",
-                    action=process_action,
-                    params=process_params,
-                    response=resp,
-                    request_id=request_id,
-                    caller_process_id=caller_process_id,
-                    source_kind=source_kind,
-                    source_id=source_id,
-                )
-                return resp
-            handle = self._processes.get(process_id)
-            if handle is None:
-                resp = {"ok": False, "error": {"code": "unknown_process"}}
-                self._publish_process_command_event(
-                    process_id=process_id,
-                    action=process_action,
-                    params=process_params,
-                    response=resp,
-                    request_id=request_id,
-                    caller_process_id=caller_process_id,
-                    source_kind=source_kind,
-                    source_id=source_id,
-                )
-                return resp
-            if handle.state not in {
-                ManagedProcessState.STARTING,
-                ManagedProcessState.RUNNING,
-                ManagedProcessState.STOPPING,
-            }:
-                resp = {
-                    "ok": False,
-                    "error": {"code": "process_not_running"},
-                }
-                self._publish_process_command_event(
-                    process_id=process_id,
-                    action=process_action,
-                    params=process_params,
-                    response=resp,
-                    request_id=request_id,
-                    caller_process_id=caller_process_id,
-                    source_kind=source_kind,
-                    source_id=source_id,
-                )
-                return resp
-            if handle.rpc_endpoint is None:
-                if (
-                    process_action == "process.capabilities"
-                    and handle.state == ManagedProcessState.STARTING
-                ):
-                    resp = {
-                        "ok": False,
-                        "error": {
-                            "code": "process_starting",
-                            "message": "process is starting; RPC endpoint not advertised yet",
-                            "retry_after_ms": 500,
-                        },
-                    }
-                else:
-                    resp = {
-                        "ok": False,
-                        "error": {"code": "process_rpc_not_ready"},
-                    }
-                self._publish_process_command_event(
-                    process_id=process_id,
-                    action=process_action,
-                    params=process_params,
-                    response=resp,
-                    request_id=request_id,
-                    caller_process_id=caller_process_id,
-                    source_kind=source_kind,
-                    source_id=source_id,
-                )
-                return resp
-            try:
-                resp = self._call_process_rpc(
-                    process_id=process_id,
-                    request=request,
-                )
-            except Exception as e:
-                resp = {
-                    "ok": False,
-                    "error": {"code": "process_rpc_failed", "message": str(e)},
-                }
-                self._publish_process_command_event(
-                    process_id=process_id,
-                    action=process_action,
-                    params=process_params,
-                    response=resp,
-                    request_id=request_id,
-                    caller_process_id=caller_process_id,
-                    source_kind=source_kind,
-                    source_id=source_id,
-                )
-                return resp
-            self._publish_process_command_event(
+        handle = self._processes.get(process_id)
+        if handle is None:
+            resp = {"ok": False, "error": {"code": "unknown_process"}}
+            return self._publish_process_command_response(
                 process_id=process_id,
                 action=process_action,
                 params=process_params,
@@ -3709,183 +2710,271 @@ class Manager:
                 source_kind=source_kind,
                 source_id=source_id,
             )
-            return resp
-
-        if rtype == "command_interceptor.register":
-            process_id = str(req.get("process_id", ""))
-            routes_raw = req.get("routes", [])
-            replace = bool(req.get("replace", False))
-            if not process_id:
-                return {
+        if handle.state not in {
+            ManagedProcessState.STARTING,
+            ManagedProcessState.RUNNING,
+            ManagedProcessState.STOPPING,
+        }:
+            resp = {"ok": False, "error": {"code": "process_not_running"}}
+            return self._publish_process_command_response(
+                process_id=process_id,
+                action=process_action,
+                params=process_params,
+                response=resp,
+                request_id=request_id,
+                caller_process_id=caller_process_id,
+                source_kind=source_kind,
+                source_id=source_id,
+            )
+        if handle.rpc_endpoint is None:
+            if (
+                process_action == "process.capabilities"
+                and handle.state == ManagedProcessState.STARTING
+            ):
+                resp = {
                     "ok": False,
-                    "error": {"code": "invalid_register", "message": "missing process_id"},
+                    "error": {
+                        "code": "process_starting",
+                        "message": "process is starting; RPC endpoint not advertised yet",
+                        "retry_after_ms": 500,
+                    },
                 }
-            try:
-                routes = self._register_command_interceptor_routes(
-                    process_id, routes_raw, replace=replace
-                )
-            except Exception as e:
-                return {"ok": False, "error": {"code": "register_failed", "message": str(e)}}
-            return {"ok": True, "result": {"routes": routes}}
+            else:
+                resp = {"ok": False, "error": {"code": "process_rpc_not_ready"}}
+            return self._publish_process_command_response(
+                process_id=process_id,
+                action=process_action,
+                params=process_params,
+                response=resp,
+                request_id=request_id,
+                caller_process_id=caller_process_id,
+                source_kind=source_kind,
+                source_id=source_id,
+            )
+        try:
+            resp = self._call_process_rpc(
+                process_id=process_id,
+                request=request,
+            )
+        except Exception as e:
+            resp = {
+                "ok": False,
+                "error": {"code": "process_rpc_failed", "message": str(e)},
+            }
+            return self._publish_process_command_response(
+                process_id=process_id,
+                action=process_action,
+                params=process_params,
+                response=resp,
+                request_id=request_id,
+                caller_process_id=caller_process_id,
+                source_kind=source_kind,
+                source_id=source_id,
+            )
+        return self._publish_process_command_response(
+            process_id=process_id,
+            action=process_action,
+            params=process_params,
+            response=resp,
+            request_id=request_id,
+            caller_process_id=caller_process_id,
+            source_kind=source_kind,
+            source_id=source_id,
+        )
 
-        if rtype == "command_interceptor.list":
-            return {"ok": True, "result": {"routes": self._command_interceptor_routes_snapshot()}}
-
-        if rtype == "manager.shutdown":
-            self.shutdown()
-            return {"ok": True, "result": {"status": "shutting_down"}}
-        if rtype == "manager.identity":
-            manager_pid = int(os.getpid())
-            lock_status = read_instance_lock_status(self._instance_id)
-            lock_effective_status = derive_lock_effective_status(
-                lock_status=lock_status,
-                manager_pid=manager_pid,
-                manager_reachable=True,
-                reported_effective_status=None,
-            )
-            process_guard = getattr(self, "_process_guard", None)
-            process_guard_enabled = bool(
-                getattr(process_guard, "available", False) if process_guard is not None else False
-            )
-            process_guard_init_error = getattr(self, "_process_guard_init_error", None)
-            if process_guard_init_error is None and process_guard is not None:
-                process_guard_init_error = getattr(process_guard, "init_error", None)
-            process_guard_attach_failures = int(
-                getattr(self, "_process_guard_attach_failures", 0) or 0
-            )
-            process_guard_last_error = getattr(self, "_process_guard_last_error", None)
+    def _route_command_interceptor_register(self, req: Json) -> Json:
+        process_id = str(req.get("process_id", ""))
+        routes_raw = req.get("routes", [])
+        replace = bool(req.get("replace", False))
+        if not process_id:
             return {
-                "ok": True,
-                "result": {
-                    "version": 1,
-                    "instance_id": self._instance_id,
-                    "manager_pid": manager_pid,
-                    "started_ts": {
-                        "t_wall": float(self._started_t_wall),
-                        "t_mono": float(self._started_t_mono),
-                    },
-                    "lock_status": lock_status,
-                    "lock_effective_status": lock_effective_status,
-                    "lock_effective_help": lock_effective_status_help(
-                        lock_effective_status
-                    ),
-                    "last_orphan_cleanup": self._last_orphan_cleanup,
-                    "process_guard": {
-                        "enabled": process_guard_enabled,
-                        "init_error": process_guard_init_error,
-                        "attach_failures": process_guard_attach_failures,
-                        "last_attach_error": process_guard_last_error,
-                    },
+                "ok": False,
+                "error": {"code": "invalid_register", "message": "missing process_id"},
+            }
+        try:
+            routes = self._register_command_interceptor_routes(
+                process_id, routes_raw, replace=replace
+            )
+        except Exception as e:
+            return {"ok": False, "error": {"code": "register_failed", "message": str(e)}}
+        return {"ok": True, "result": {"routes": routes}}
+
+    def _route_command_interceptor_list(self, req: Json) -> Json:
+        del req
+        return {"ok": True, "result": {"routes": self._command_interceptor_routes_snapshot()}}
+
+    def _route_manager_request(self, rtype: Any, req: Json) -> Json | None:
+        handlers: dict[str, Callable[[Json], Json]] = {
+            "manager.shutdown": self._route_manager_shutdown,
+            "manager.identity": self._route_manager_identity,
+            "manager.cleanup_orphans": self._route_manager_cleanup_orphans,
+            "manager.log.publish": self._route_manager_log_publish,
+            "manager.log.tail": self._route_manager_log_tail,
+            "manager.command_journal.status": self._route_manager_command_journal_status,
+            "manager.command_journal.tail": self._route_manager_command_journal_tail,
+            "manager.event.publish": self._route_manager_event_publish,
+        }
+        handler = handlers.get(str(rtype))
+        if handler is None:
+            return None
+        return handler(req)
+
+    def _route_manager_shutdown(self, req: Json) -> Json:
+        del req
+        self.shutdown()
+        return {"ok": True, "result": {"status": "shutting_down"}}
+
+    def _route_manager_identity(self, req: Json) -> Json:
+        del req
+        manager_pid = int(os.getpid())
+        lock_status = read_instance_lock_status(self._instance_id)
+        lock_effective_status = derive_lock_effective_status(
+            lock_status=lock_status,
+            manager_pid=manager_pid,
+            manager_reachable=True,
+            reported_effective_status=None,
+        )
+        process_guard = getattr(self, "_process_guard", None)
+        process_guard_enabled = bool(
+            getattr(process_guard, "available", False) if process_guard is not None else False
+        )
+        process_guard_init_error = getattr(self, "_process_guard_init_error", None)
+        if process_guard_init_error is None and process_guard is not None:
+            process_guard_init_error = getattr(process_guard, "init_error", None)
+        process_guard_attach_failures = int(
+            getattr(self, "_process_guard_attach_failures", 0) or 0
+        )
+        process_guard_last_error = getattr(self, "_process_guard_last_error", None)
+        return {
+            "ok": True,
+            "result": {
+                "version": 1,
+                "instance_id": self._instance_id,
+                "manager_pid": manager_pid,
+                "started_ts": {
+                    "t_wall": float(self._started_t_wall),
+                    "t_mono": float(self._started_t_mono),
+                },
+                "lock_status": lock_status,
+                "lock_effective_status": lock_effective_status,
+                "lock_effective_help": lock_effective_status_help(lock_effective_status),
+                "last_orphan_cleanup": self._last_orphan_cleanup,
+                "process_guard": {
+                    "enabled": process_guard_enabled,
+                    "init_error": process_guard_init_error,
+                    "attach_failures": process_guard_attach_failures,
+                    "last_attach_error": process_guard_last_error,
+                },
+            },
+        }
+
+    def _route_manager_cleanup_orphans(self, req: Json) -> Json:
+        params = req.get("params", {})
+        if params is None:
+            params = {}
+        if not isinstance(params, dict):
+            return {
+                "ok": False,
+                "error": {"code": "invalid_params", "message": "params must be a dict"},
+            }
+        try:
+            dry_run = bool(params.get("dry_run", False))
+            stale_only = bool(params.get("stale_only", True))
+            timeout_s = float(params.get("timeout_s", 2.0))
+            if timeout_s <= 0:
+                raise ValueError("timeout_s must be > 0")
+        except Exception as e:
+            return {
+                "ok": False,
+                "error": {"code": "invalid_params", "message": str(e)},
+            }
+        result = self._cleanup_orphans_summary(
+            dry_run=dry_run,
+            stale_only=stale_only,
+            timeout_s=timeout_s,
+        )
+        self._record_orphan_cleanup(source="rpc", summary=result)
+        self._publish_manager_event(
+            "manager.orphan_cleanup",
+            {
+                "result": result,
+                "ts": {"t_wall": time.time(), "t_mono": time.monotonic()},
+            },
+        )
+        return {"ok": True, "result": result}
+
+    def _route_manager_log_publish(self, req: Json) -> Json:
+        payload = req.get("payload")
+        if not isinstance(payload, dict):
+            return {"ok": False, "error": {"code": "invalid_payload"}}
+        entry = self._emit_log_from_payload(payload, default_topic="manager.log.publish")
+        return {"ok": True, "result": {"status": "published", "entry": entry}}
+
+    def _route_manager_log_tail(self, req: Json) -> Json:
+        params = req.get("params", {})
+        if params is None:
+            params = {}
+        if not isinstance(params, dict):
+            return {
+                "ok": False,
+                "error": {
+                    "code": "invalid_params",
+                    "message": "params must be a dict",
                 },
             }
-        if rtype == "manager.cleanup_orphans":
-            params = req.get("params", {})
-            if params is None:
-                params = {}
-            if not isinstance(params, dict):
-                return {
-                    "ok": False,
-                    "error": {"code": "invalid_params", "message": "params must be a dict"},
-                }
-            try:
-                dry_run = bool(params.get("dry_run", False))
-                stale_only = bool(params.get("stale_only", True))
-                timeout_s = float(params.get("timeout_s", 2.0))
-                if timeout_s <= 0:
-                    raise ValueError("timeout_s must be > 0")
-            except Exception as e:
-                return {
-                    "ok": False,
-                    "error": {"code": "invalid_params", "message": str(e)},
-                }
-            result = self._cleanup_orphans_summary(
-                dry_run=dry_run,
-                stale_only=stale_only,
-                timeout_s=timeout_s,
-            )
-            self._record_orphan_cleanup(source="rpc", summary=result)
-            self._publish_manager_event(
-                "manager.orphan_cleanup",
-                {
-                    "result": result,
-                    "ts": {"t_wall": time.time(), "t_mono": time.monotonic()},
+        try:
+            result = self._log_tail(params)
+        except Exception as e:
+            return {
+                "ok": False,
+                "error": {"code": "invalid_params", "message": str(e)},
+            }
+        return {"ok": True, "result": result}
+
+    def _route_manager_command_journal_status(self, req: Json) -> Json:
+        del req
+        return {"ok": True, "result": self._command_journal_status_payload()}
+
+    def _route_manager_command_journal_tail(self, req: Json) -> Json:
+        params = req.get("params", {})
+        if params is None:
+            params = {}
+        if not isinstance(params, dict):
+            return {
+                "ok": False,
+                "error": {"code": "invalid_params", "message": "params must be a dict"},
+            }
+        journal = self._command_journal
+        if journal is None:
+            return {
+                "ok": False,
+                "error": {
+                    "code": "journal_disabled",
+                    "message": "command journal is disabled",
                 },
-            )
-            return {"ok": True, "result": result}
+            }
+        try:
+            result = journal.tail(params)
+        except Exception as e:
+            return {
+                "ok": False,
+                "error": {"code": "invalid_params", "message": str(e)},
+            }
+        return {"ok": True, "result": result}
 
-        if rtype == "manager.log.publish":
-            payload = req.get("payload")
-            if not isinstance(payload, dict):
-                return {"ok": False, "error": {"code": "invalid_payload"}}
-            entry = self._emit_log_from_payload(payload, default_topic="manager.log.publish")
-            return {"ok": True, "result": {"status": "published", "entry": entry}}
-
-        if rtype == "manager.log.tail":
-            params = req.get("params", {})
-            if params is None:
-                params = {}
-            if not isinstance(params, dict):
-                return {
-                    "ok": False,
-                    "error": {
-                        "code": "invalid_params",
-                        "message": "params must be a dict",
-                    },
-                }
-            try:
-                result = self._log_tail(params)
-            except Exception as e:
-                return {
-                    "ok": False,
-                    "error": {"code": "invalid_params", "message": str(e)},
-                }
-            return {"ok": True, "result": result}
-
-        if rtype == "manager.command_journal.status":
-            return {"ok": True, "result": self._command_journal_status_payload()}
-
-        if rtype == "manager.command_journal.tail":
-            params = req.get("params", {})
-            if params is None:
-                params = {}
-            if not isinstance(params, dict):
-                return {
-                    "ok": False,
-                    "error": {"code": "invalid_params", "message": "params must be a dict"},
-                }
-            journal = self._command_journal
-            if journal is None:
-                return {
-                    "ok": False,
-                    "error": {
-                        "code": "journal_disabled",
-                        "message": "command journal is disabled",
-                    },
-                }
-            try:
-                result = journal.tail(params)
-            except Exception as e:
-                return {
-                    "ok": False,
-                    "error": {"code": "invalid_params", "message": str(e)},
-                }
-            return {"ok": True, "result": result}
-
-        if rtype == "manager.event.publish":
-            topic = req.get("topic")
-            payload = req.get("payload")
-            if not isinstance(topic, str) or not topic.strip():
-                return {"ok": False, "error": {"code": "invalid_topic"}}
-            if not isinstance(payload, dict):
-                return {"ok": False, "error": {"code": "invalid_payload"}}
-            normalized_topic = self._normalize_topic(topic)
-            if normalized_topic == "manager.log":
-                self._emit_log_from_payload(payload, default_topic=normalized_topic)
-            else:
-                self._publish_manager_event(normalized_topic, payload)
-            return {"ok": True, "result": {"status": "published"}}
-
-        raise ValueError(f"Unknown external request type {rtype!r}")
+    def _route_manager_event_publish(self, req: Json) -> Json:
+        topic = req.get("topic")
+        payload = req.get("payload")
+        if not isinstance(topic, str) or not topic.strip():
+            return {"ok": False, "error": {"code": "invalid_topic"}}
+        if not isinstance(payload, dict):
+            return {"ok": False, "error": {"code": "invalid_payload"}}
+        normalized_topic = self._normalize_topic(topic)
+        if normalized_topic == "manager.log":
+            self._emit_log_from_payload(payload, default_topic=normalized_topic)
+        else:
+            self._publish_manager_event(normalized_topic, payload)
+        return {"ok": True, "result": {"status": "published"}}
 
     def _call_device_rpc(
         self,
@@ -3900,113 +2989,18 @@ class Manager:
         source_id: Any = None,
         is_remote_target: bool = False,
     ) -> Json:
-        """
-        RPC semantics: strictly serial per device; blocking is allowed driver-side.
-        """
-        handle = self._devices.get(device_id)
-        if handle is None or handle.rpc_endpoint is None:
-            raise RuntimeError(f"Device {device_id!r} is not registered")
-
-        sock = handle.rpc_sock
-        if sock is None:
-            sock = self._ctx.socket(zmq.REQ)
-            sock.setsockopt(zmq.LINGER, 0)
-            sock.setsockopt(zmq.REQ_RELAXED, 1)
-            sock.setsockopt(zmq.REQ_CORRELATE, 1)
-            sock.connect(handle.rpc_endpoint)
-            handle.rpc_sock = sock
-
-        effective_timeout = (
-            self._device_rpc_timeout_ms if timeout_ms is None else timeout_ms
-        )
-        caller_process_id_text = self._normalize_id(caller_process_id)
-        source_kind_text, source_id_text = self._normalize_command_source(
+        return shared_call_device_rpc(
+            self,
+            device_id=device_id,
+            action=action,
+            params=params,
+            timeout_ms=timeout_ms,
+            request_id=request_id,
+            caller_process_id=caller_process_id,
             source_kind=source_kind,
             source_id=source_id,
-            caller_process_id=caller_process_id_text,
+            is_remote_target=is_remote_target,
         )
-        is_remote_target_flag = bool(is_remote_target)
-        sock.setsockopt(zmq.RCVTIMEO, int(effective_timeout))
-        sock.setsockopt(zmq.SNDTIMEO, int(effective_timeout))
-        try:
-            self._rpc_seq += 1
-            envelope = {
-                "id": self._rpc_seq,
-                "action": action,
-                "params": params,
-            }
-            self._send_json(sock, envelope)
-            deadline = time.monotonic() + (effective_timeout / 1000.0)
-            resp = None
-            while True:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise zmq.Again()
-                step_ms = int(min(50.0, remaining * 1000.0))
-                if sock.poll(step_ms, zmq.POLLIN):
-                    resp = self._recv_json(sock)
-                    break
-                while self._sub.poll(0, zmq.POLLIN):
-                    self._handle_driver_pub()
-                while self._process_hb_sub.poll(0, zmq.POLLIN):
-                    self._handle_process_pub()
-                while self._process_data_sub.poll(0, zmq.POLLIN):
-                    self._handle_process_data_pub()
-            if resp is None:
-                raise zmq.Again()
-            handle.rpc_fail_count = 0
-            handle.rpc_last_fail_t_mono = None
-            status = resp.get("status")
-            ok = None
-            if status in {"OK", "ERROR"}:
-                ok = status == "OK"
-            elif "ok" in resp:
-                ok = bool(resp.get("ok"))
-            cmd_payload: Json = {
-                "version": 1,
-                "device_id": device_id,
-                "action": action,
-                "params_json": self._safe_json(params),
-                "ok": ok,
-                "status": status,
-                "error": resp.get("error"),
-                "result_json": self._safe_json(resp.get("result")),
-                "source_kind": source_kind_text,
-                "source_id": source_id_text,
-                "is_remote_target": is_remote_target_flag,
-                "ts": {"t_wall": time.time(), "t_mono": time.monotonic()},
-            }
-            if request_id is not None:
-                cmd_payload["request_id"] = request_id
-            if caller_process_id_text is not None:
-                cmd_payload["caller_process_id"] = caller_process_id_text
-            self._publish_manager_event("manager.command", cmd_payload)
-            return resp
-        except Exception as e:
-            handle.rpc_fail_count += 1
-            handle.rpc_last_fail_t_mono = time.monotonic()
-            if handle.rpc_fail_count >= 2:
-                self._close_device_rpc(handle)
-            cmd_payload = {
-                "version": 1,
-                "device_id": device_id,
-                "action": action,
-                "params_json": self._safe_json(params),
-                "ok": False,
-                "status": None,
-                "error": str(e),
-                "result_json": "",
-                "source_kind": source_kind_text,
-                "source_id": source_id_text,
-                "is_remote_target": is_remote_target_flag,
-                "ts": {"t_wall": time.time(), "t_mono": time.monotonic()},
-            }
-            if request_id is not None:
-                cmd_payload["request_id"] = request_id
-            if caller_process_id_text is not None:
-                cmd_payload["caller_process_id"] = caller_process_id_text
-            self._publish_manager_event("manager.command", cmd_payload)
-            raise
 
     def _call_process_rpc(
         self,
@@ -4015,69 +3009,12 @@ class Manager:
         request: Json,
         timeout_ms: int | None = None,
     ) -> Json:
-        handle = self._processes.get(process_id)
-        if handle is None:
-            raise RuntimeError(f"Process {process_id!r} is not configured")
-        if handle.rpc_endpoint is None:
-            raise RuntimeError("process rpc endpoint not ready")
-
-        sock = handle.rpc_sock
-        if sock is None:
-            sock = self._ctx.socket(zmq.DEALER)
-            sock.setsockopt(zmq.LINGER, 0)
-            sock.connect(handle.rpc_endpoint)
-            handle.rpc_sock = sock
-
-        effective_timeout = (
-            self._device_rpc_timeout_ms if timeout_ms is None else timeout_ms
+        return shared_call_process_rpc(
+            self,
+            process_id=process_id,
+            request=request,
+            timeout_ms=timeout_ms,
         )
-        sock.setsockopt(zmq.RCVTIMEO, int(effective_timeout))
-        sock.setsockopt(zmq.SNDTIMEO, int(effective_timeout))
-        expected_request_id = request.get("request_id")
-        try:
-            # Drop late replies from previous timed-out requests on this socket.
-            while True:
-                try:
-                    if not sock.poll(0, zmq.POLLIN):
-                        break
-                    _ = sock.recv(zmq.NOBLOCK)
-                except zmq.Again:
-                    break
-                except Exception:
-                    break
-            sock.send(json_dumps(request))
-            deadline = time.monotonic() + (int(effective_timeout) / 1000.0)
-            while True:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise zmq.Again()
-                step_ms = int(min(50.0, max(1.0, remaining * 1000.0)))
-                if not sock.poll(step_ms, zmq.POLLIN):
-                    while self._sub.poll(0, zmq.POLLIN):
-                        self._handle_driver_pub()
-                    while self._process_hb_sub.poll(0, zmq.POLLIN):
-                        self._handle_process_pub()
-                    while self._process_data_sub.poll(0, zmq.POLLIN):
-                        self._handle_process_data_pub()
-                    continue
-                resp = self._recv_json(sock)
-                if not isinstance(resp, dict):
-                    continue
-                if (
-                    expected_request_id is not None
-                    and resp.get("request_id") != expected_request_id
-                ):
-                    # Late/stale reply from an older request; keep waiting.
-                    continue
-                break
-            handle.rpc_fail_count = 0
-            handle.rpc_last_fail_t_mono = None
-            return resp
-        except Exception:
-            handle.rpc_fail_count += 1
-            handle.rpc_last_fail_t_mono = time.monotonic()
-            self._close_process_rpc(handle)
-            raise
 
     def _close_device_rpc(self, handle: DeviceHandle) -> None:
         sock = handle.rpc_sock
@@ -4107,10 +3044,7 @@ class Manager:
     # Timeouts + derived states
     # -----------------------------
 
-    def _check_timeouts(self) -> None:
-        now_mono = time.monotonic()
-
-        # Heartbeat-based liveness :contentReference[oaicite:16]{index=16}
+    def _update_device_liveness(self, now_mono: float) -> None:
         for dev_id, handle in self._devices.items():
             if handle.last_hb_recv_mono is None:
                 continue
@@ -4130,8 +3064,8 @@ class Manager:
                     "manager.liveness",
                     {"device_id": dev_id, "liveness": liveness, "age_s": age},
                 )
-        self._federation_hub.check_timeouts(now_mono)
 
+    def _mark_stale_telemetry(self, now_mono: float) -> None:
         # Telemetry staleness: driver emits OK/BAD/MISSING; manager derives STALE.
         # Mark staleness per-signal so partial updates do not mask old values.
         for dev_id, signals in self._telemetry_latest.items():
@@ -4170,160 +3104,175 @@ class Manager:
                     },
                 )
 
-        # Driver process supervision (per device)
+    def _update_device_driver_exit_state(self, handle: DeviceHandle, rc: int) -> None:
+        handle.driver_last_exit_code = int(rc)
+        handle.process = None
+        handle.driver_pid = None
+        if (
+            handle.driver_process_state == ManagedProcessState.STOPPING
+            and handle.driver_stop_requested_t_mono is not None
+        ):
+            handle.driver_process_state = ManagedProcessState.STOPPED
+            self._publish_driver_event("manager.driver.stopped", handle)
+            return
+        if rc == 0:
+            handle.driver_process_state = ManagedProcessState.STOPPED
+            self._publish_driver_event("manager.driver.exited", handle)
+            return
+        handle.driver_process_state = ManagedProcessState.FAILED
+        handle.driver_last_error = handle.driver_last_error or "driver exited"
+        self._publish_driver_event("manager.driver.failed", handle)
+
+    def _enforce_device_driver_stop_timeout(
+        self, handle: DeviceHandle, now_mono: float
+    ) -> None:
+        if handle.driver_process_state != ManagedProcessState.STOPPING:
+            return
+        if (
+            handle.driver_stop_requested_t_mono is None
+            or handle.process is None
+            or handle.process.poll() is not None
+        ):
+            return
+        if now_mono - handle.driver_stop_requested_t_mono > handle.spec.driver_stop_timeout_s:
+            try:
+                handle.process.kill()
+                self._publish_driver_event("manager.driver.killing", handle)
+            except Exception as e:
+                handle.driver_last_error = str(e)
+        if (
+            now_mono - handle.driver_stop_requested_t_mono
+            > handle.spec.driver_stop_timeout_s + handle.spec.driver_kill_timeout_s
+            and handle.process is not None
+            and handle.process.poll() is None
+        ):
+            handle.driver_process_state = ManagedProcessState.FAILED
+            handle.driver_last_error = "kill timeout"
+            self._publish_driver_event("manager.driver.kill_timeout", handle)
+
+    def _maybe_restart_device_driver(
+        self, device_id: str, handle: DeviceHandle, now_mono: float
+    ) -> None:
+        if (
+            handle.driver_next_restart_t_mono is None
+            or now_mono < handle.driver_next_restart_t_mono
+        ):
+            return
+        if (
+            handle.spec.driver_max_restarts is not None
+            and handle.driver_restart_count >= handle.spec.driver_max_restarts
+        ):
+            handle.driver_process_state = ManagedProcessState.CRASHLOOP
+            handle.driver_next_restart_t_mono = None
+            self._publish_driver_event("manager.driver.crashloop", handle)
+            return
+        handle.driver_restart_count += 1
+        handle.driver_last_restart_t_mono = now_mono
+        handle.driver_next_restart_t_mono = None
+        self._publish_driver_event("manager.driver.restarting", handle)
+        self.start_driver(device_id)
+
+    def _supervise_device_drivers(self, now_mono: float) -> None:
         for device_id, handle in self._devices.items():
             proc = handle.process
             if proc is not None:
                 rc = proc.poll()
                 if rc is not None:
-                    handle.driver_last_exit_code = int(rc)
-                    handle.process = None
-                    handle.driver_pid = None
+                    self._update_device_driver_exit_state(handle, int(rc))
+            self._enforce_device_driver_stop_timeout(handle, now_mono)
+            self._maybe_restart_device_driver(device_id, handle, now_mono)
 
-                    if (
-                        handle.driver_process_state == ManagedProcessState.STOPPING
-                        and handle.driver_stop_requested_t_mono is not None
-                    ):
-                        handle.driver_process_state = ManagedProcessState.STOPPED
-                        self._publish_driver_event("manager.driver.stopped", handle)
-                    else:
-                        if rc == 0:
-                            handle.driver_process_state = ManagedProcessState.STOPPED
-                            self._publish_driver_event("manager.driver.exited", handle)
-                        else:
-                            handle.driver_process_state = ManagedProcessState.FAILED
-                            handle.driver_last_error = (
-                                handle.driver_last_error or "driver exited"
-                            )
-                            self._publish_driver_event("manager.driver.failed", handle)
+    def _update_managed_process_exit_state(self, handle: ProcessHandle, rc: int) -> bool:
+        handle.last_exit_code = int(rc)
+        handle.popen = None
+        handle.pid = None
+        handle.rpc_endpoint = None
+        self._close_process_rpc(handle)
+        if handle.state == ManagedProcessState.STOPPING:
+            handle.state = ManagedProcessState.EXITED
+            self._publish_process_event("manager.process.exited", handle)
+            return False
+        if rc == 0:
+            handle.state = ManagedProcessState.STOPPED
+            self._publish_process_event("manager.process.exited", handle)
+            return False
+        if self._maybe_recover_process_start_collision(handle):
+            return True
+        handle.state = ManagedProcessState.FAILED
+        handle.last_error = handle.last_error or "process exited"
+        self._publish_process_event("manager.process.failed", handle)
+        return False
 
-            if handle.driver_process_state == ManagedProcessState.STOPPING:
-                if (
-                    handle.driver_stop_requested_t_mono is not None
-                    and handle.process is not None
-                    and handle.process.poll() is None
-                ):
-                    if (
-                        now_mono - handle.driver_stop_requested_t_mono
-                        > handle.spec.driver_stop_timeout_s
-                    ):
-                        try:
-                            handle.process.kill()
-                            self._publish_driver_event("manager.driver.killing", handle)
-                        except Exception as e:
-                            handle.driver_last_error = str(e)
+    def _enforce_managed_process_heartbeat_timeout(
+        self, handle: ProcessHandle, now_mono: float
+    ) -> None:
+        if handle.state not in {
+            ManagedProcessState.STARTING,
+            ManagedProcessState.RUNNING,
+        }:
+            return
+        hb_age: float | None = None
+        if handle.last_hb_t_mono is not None:
+            hb_age = now_mono - handle.last_hb_t_mono
+        elif handle.last_start_t_mono is not None:
+            hb_age = now_mono - handle.last_start_t_mono
+        if hb_age is None or hb_age <= handle.spec.heartbeat_timeout_s:
+            return
+        handle.state = ManagedProcessState.FAILED
+        handle.last_error = "heartbeat stale"
+        if handle.popen is not None and handle.popen.poll() is None:
+            try:
+                handle.popen.terminate()
+                handle.stop_requested_t_mono = now_mono
+            except Exception as e:
+                handle.last_error = f"heartbeat stale; terminate failed: {e}"
+        self._publish_process_event("manager.process.failed", handle)
 
-                    if (
-                        now_mono - handle.driver_stop_requested_t_mono
-                        > handle.spec.driver_stop_timeout_s
-                        + handle.spec.driver_kill_timeout_s
-                        and handle.process is not None
-                        and handle.process.poll() is None
-                    ):
-                        handle.driver_process_state = ManagedProcessState.FAILED
-                        handle.driver_last_error = "kill timeout"
-                        self._publish_driver_event(
-                            "manager.driver.kill_timeout", handle
-                        )
+    def _enforce_managed_process_stop_timeout(
+        self, handle: ProcessHandle, now_mono: float
+    ) -> None:
+        if (
+            handle.state != ManagedProcessState.STOPPING
+            or handle.stop_requested_t_mono is None
+            or handle.popen is None
+            or handle.popen.poll() is not None
+        ):
+            return
+        if now_mono - handle.stop_requested_t_mono <= handle.spec.shutdown_timeout_s:
+            return
+        try:
+            handle.popen.kill()
+        except Exception as e:
+            handle.last_error = str(e)
 
-            if (
-                handle.driver_next_restart_t_mono is not None
-                and now_mono >= handle.driver_next_restart_t_mono
-            ):
-                if (
-                    handle.spec.driver_max_restarts is not None
-                    and handle.driver_restart_count >= handle.spec.driver_max_restarts
-                ):
-                    handle.driver_process_state = ManagedProcessState.CRASHLOOP
-                    handle.driver_next_restart_t_mono = None
-                    self._publish_driver_event("manager.driver.crashloop", handle)
-                else:
-                    handle.driver_restart_count += 1
-                    handle.driver_last_restart_t_mono = now_mono
-                    handle.driver_next_restart_t_mono = None
-                    self._publish_driver_event("manager.driver.restarting", handle)
-                    self.start_driver(device_id)
+    def _maybe_restart_managed_process(self, handle: ProcessHandle, now_mono: float) -> None:
+        if handle.state in {ManagedProcessState.FAILED, ManagedProcessState.EXITED}:
+            if handle.stop_requested_t_mono is None:
+                self._maybe_schedule_restart(handle, now_mono)
+        if (
+            handle.next_restart_t_mono is not None
+            and now_mono >= handle.next_restart_t_mono
+        ):
+            self._try_restart_process(handle)
 
-        # Managed process supervision
-        for process_id, handle in self._processes.items():
+    def _supervise_managed_processes(self, now_mono: float) -> None:
+        for _process_id, handle in self._processes.items():
             popen = handle.popen
             if popen is not None:
                 rc = popen.poll()
-                if rc is not None:
-                    handle.last_exit_code = int(rc)
-                    handle.popen = None
-                    handle.pid = None
-                    handle.rpc_endpoint = None
-                    self._close_process_rpc(handle)
-                    if handle.state == ManagedProcessState.STOPPING:
-                        handle.state = ManagedProcessState.EXITED
-                        self._publish_process_event("manager.process.exited", handle)
-                    else:
-                        if rc == 0:
-                            handle.state = ManagedProcessState.STOPPED
-                            self._publish_process_event(
-                                "manager.process.exited", handle
-                            )
-                        else:
-                            if self._maybe_recover_process_start_collision(handle):
-                                continue
-                            handle.state = ManagedProcessState.FAILED
-                            handle.last_error = handle.last_error or "process exited"
-                            self._publish_process_event(
-                                "manager.process.failed", handle
-                            )
+                if rc is not None and self._update_managed_process_exit_state(handle, int(rc)):
+                    continue
+            self._enforce_managed_process_heartbeat_timeout(handle, now_mono)
+            self._enforce_managed_process_stop_timeout(handle, now_mono)
+            self._maybe_restart_managed_process(handle, now_mono)
 
-            # Heartbeat stale detection
-            if handle.state in {
-                ManagedProcessState.STARTING,
-                ManagedProcessState.RUNNING,
-            }:
-                hb_age: float | None = None
-                if handle.last_hb_t_mono is not None:
-                    hb_age = now_mono - handle.last_hb_t_mono
-                elif handle.last_start_t_mono is not None:
-                    hb_age = now_mono - handle.last_start_t_mono
-
-                if hb_age is not None and hb_age > handle.spec.heartbeat_timeout_s:
-                    handle.state = ManagedProcessState.FAILED
-                    handle.last_error = "heartbeat stale"
-                    if handle.popen is not None and handle.popen.poll() is None:
-                        try:
-                            handle.popen.terminate()
-                            handle.stop_requested_t_mono = now_mono
-                        except Exception as e:
-                            handle.last_error = (
-                                f"heartbeat stale; terminate failed: {e}"
-                            )
-                    self._publish_process_event("manager.process.failed", handle)
-
-            # Stop timeout -> kill
-            if handle.state == ManagedProcessState.STOPPING:
-                if (
-                    handle.stop_requested_t_mono is not None
-                    and handle.popen is not None
-                    and handle.popen.poll() is None
-                ):
-                    if (
-                        now_mono - handle.stop_requested_t_mono
-                        > handle.spec.shutdown_timeout_s
-                    ):
-                        try:
-                            handle.popen.kill()
-                        except Exception as e:
-                            handle.last_error = str(e)
-
-            # Restart scheduling
-            if handle.state in {ManagedProcessState.FAILED, ManagedProcessState.EXITED}:
-                if handle.stop_requested_t_mono is None:
-                    self._maybe_schedule_restart(handle, now_mono)
-
-            # Execute scheduled restart
-            if (
-                handle.next_restart_t_mono is not None
-                and now_mono >= handle.next_restart_t_mono
-            ):
-                self._try_restart_process(handle)
+    def _check_timeouts(self) -> None:
+        now_mono = time.monotonic()
+        self._update_device_liveness(now_mono)
+        self._federation_hub.check_timeouts(now_mono)
+        self._mark_stale_telemetry(now_mono)
+        self._supervise_device_drivers(now_mono)
+        self._supervise_managed_processes(now_mono)
 
     # -----------------------------
     # Snapshots for external consumers
@@ -4805,46 +3754,7 @@ class Manager:
         return False
 
     def _maybe_emit_manager_log_sink(self, topic: str, payload: Json) -> None:
-        try:
-            severity, line_topic, source_kind, source_id, message = self._manager_log_sink_event(
-                topic, payload
-            )
-        except Exception:
-            return
-        min_rank = int(
-            getattr(self, "_manager_log_min_level_rank", self._severity_rank("error"))
-        )
-        if self._severity_rank(severity) < min_rank:
-            return
-        fingerprint = f"{severity}|{line_topic}|{source_kind}|{source_id}|{message}"
-        if self._manager_log_sink_is_duplicate(fingerprint):
-            return
-        ts = payload.get("ts")
-        t_wall = time.time()
-        if isinstance(ts, dict):
-            try:
-                t_wall = float(ts.get("t_wall", t_wall))
-            except Exception:
-                pass
-        try:
-            dt = datetime.datetime.fromtimestamp(t_wall, tz=datetime.timezone.utc)
-            ts_text = dt.isoformat(timespec="milliseconds")
-        except Exception:
-            ts_text = str(t_wall)
-        source_text = f"{source_kind}:{source_id}" if source_id else source_kind
-        line = f"{ts_text} [{severity.upper()}] {line_topic} {source_text} {message}"
-        if bool(getattr(self, "_manager_log_stderr_enabled", False)):
-            try:
-                sys.stderr.write(line + "\n")
-                sys.stderr.flush()
-            except Exception:
-                pass
-        log_file = getattr(self, "_manager_log_file", None)
-        if log_file is not None:
-            try:
-                log_file.write(line + "\n")
-            except Exception:
-                self._close_manager_log_sink_file()
+        shared_maybe_emit_manager_log_sink(self, topic, payload)
 
     @staticmethod
     def _normalize_id(raw: Any) -> str | None:
@@ -4977,22 +3887,24 @@ class Manager:
             return out if out else None
         raise TypeError(f"{field} must be a string or list[str]")
 
-    def _log_tail(self, params: Json) -> Json:
-        limit_raw = params.get("limit", 200)
+    @staticmethod
+    def _parse_log_tail_limit(raw: Any) -> int:
         try:
-            limit = int(limit_raw)
+            limit = int(raw)
         except Exception as e:
             raise TypeError(f"limit must be int: {e}") from e
-        limit = max(1, min(limit, 5000))
+        return max(1, min(limit, 5000))
 
-        since_t_mono_raw = params.get("since_t_mono")
-        since_t_mono: float | None = None
-        if since_t_mono_raw is not None:
-            try:
-                since_t_mono = float(since_t_mono_raw)
-            except Exception as e:
-                raise TypeError(f"since_t_mono must be float: {e}") from e
+    @staticmethod
+    def _parse_log_tail_since_t_mono(raw: Any) -> float | None:
+        if raw is None:
+            return None
+        try:
+            return float(raw)
+        except Exception as e:
+            raise TypeError(f"since_t_mono must be float: {e}") from e
 
+    def _log_tail_filters(self, params: Json) -> dict[str, Any]:
         severity_min_raw = params.get("severity_min")
         severity_min_rank: int | None = None
         if severity_min_raw is not None:
@@ -5008,57 +3920,119 @@ class Manager:
         if source_kind_set is not None:
             source_kind_set = {item.lower() for item in source_kind_set}
 
-        device_set = self._normalize_filter_set(params.get("device_ids"), field="device_ids")
-        process_set = self._normalize_filter_set(params.get("process_ids"), field="process_ids")
-        source_id_set = self._normalize_filter_set(params.get("source_ids"), field="source_ids")
+        return {
+            "since_t_mono": self._parse_log_tail_since_t_mono(params.get("since_t_mono")),
+            "severity_min_rank": severity_min_rank,
+            "severity_set": severity_set,
+            "source_kind_set": source_kind_set,
+            "device_set": self._normalize_filter_set(
+                params.get("device_ids"), field="device_ids"
+            ),
+            "process_set": self._normalize_filter_set(
+                params.get("process_ids"), field="process_ids"
+            ),
+            "source_id_set": self._normalize_filter_set(
+                params.get("source_ids"), field="source_ids"
+            ),
+            "topic_contains": str(params.get("topic_contains", "") or "").strip().lower(),
+            "text_contains": str(params.get("text_contains", "") or "").strip().lower(),
+        }
 
-        topic_contains = str(params.get("topic_contains", "") or "").strip().lower()
-        text_contains = str(params.get("text_contains", "") or "").strip().lower()
+    @staticmethod
+    def _log_tail_entry_t_mono(entry: Json) -> float | None:
+        ts = entry.get("ts")
+        if not isinstance(ts, dict):
+            return None
+        try:
+            return float(ts.get("t_mono"))
+        except Exception:
+            return None
 
-        entries = list(self._log_history)
-        filtered: list[Json] = []
-        for entry in entries:
-            if since_t_mono is not None:
-                ts = entry.get("ts")
-                if not isinstance(ts, dict):
-                    continue
-                try:
-                    if float(ts.get("t_mono", -1.0)) < since_t_mono:
-                        continue
-                except Exception:
-                    continue
+    def _log_tail_matches_time(self, entry: Json, *, filters: dict[str, Any]) -> bool:
+        since_t_mono = filters.get("since_t_mono")
+        if since_t_mono is not None:
+            t_mono = self._log_tail_entry_t_mono(entry)
+            if t_mono is None or t_mono < float(since_t_mono):
+                return False
+        return True
 
-            severity = self._normalize_log_severity(entry.get("severity"))
-            if severity_min_rank is not None and self._severity_rank(severity) < severity_min_rank:
-                continue
-            if severity_set is not None and severity not in severity_set:
-                continue
+    def _log_tail_matches_severity(self, entry: Json, *, filters: dict[str, Any]) -> bool:
+        severity = self._normalize_log_severity(entry.get("severity"))
+        severity_min_rank = filters.get("severity_min_rank")
+        if severity_min_rank is not None and self._severity_rank(severity) < int(
+            severity_min_rank
+        ):
+            return False
+        severity_set = filters.get("severity_set")
+        if isinstance(severity_set, set) and severity not in severity_set:
+            return False
+        return True
 
-            source_kind = str(entry.get("source_kind", "") or "").lower()
-            if source_kind_set is not None and source_kind not in source_kind_set:
-                continue
+    @staticmethod
+    def _log_tail_matches_source_kind(entry: Json, *, filters: dict[str, Any]) -> bool:
+        source_kind = str(entry.get("source_kind", "") or "").lower()
+        source_kind_set = filters.get("source_kind_set")
+        if isinstance(source_kind_set, set) and source_kind not in source_kind_set:
+            return False
+        return True
 
-            device_id = self._normalize_id(entry.get("device_id"))
-            if device_set is not None and (device_id is None or device_id not in device_set):
-                continue
-            process_id = self._normalize_id(entry.get("process_id"))
-            if process_set is not None and (process_id is None or process_id not in process_set):
-                continue
-            source_id = self._normalize_id(entry.get("source_id"))
-            if source_id_set is not None and (source_id is None or source_id not in source_id_set):
-                continue
+    def _log_tail_matches_ids(self, entry: Json, *, filters: dict[str, Any]) -> bool:
+        device_set = filters.get("device_set")
+        device_id = self._normalize_id(entry.get("device_id"))
+        if isinstance(device_set, set) and (device_id is None or device_id not in device_set):
+            return False
 
+        process_set = filters.get("process_set")
+        process_id = self._normalize_id(entry.get("process_id"))
+        if isinstance(process_set, set) and (
+            process_id is None or process_id not in process_set
+        ):
+            return False
+
+        source_id_set = filters.get("source_id_set")
+        source_id = self._normalize_id(entry.get("source_id"))
+        if isinstance(source_id_set, set) and (
+            source_id is None or source_id not in source_id_set
+        ):
+            return False
+        return True
+
+    @staticmethod
+    def _log_tail_matches_contains(entry: Json, *, filters: dict[str, Any]) -> bool:
+        topic_contains = str(filters.get("topic_contains", "") or "")
+        if topic_contains:
             topic = str(entry.get("topic", "") or "").lower()
-            if topic_contains and topic_contains not in topic:
-                continue
+            if topic_contains not in topic:
+                return False
 
-            if text_contains:
-                message = str(entry.get("message", "") or "").lower()
-                payload_json = str(entry.get("payload_json", "") or "").lower()
-                if text_contains not in message and text_contains not in payload_json:
-                    continue
+        text_contains = str(filters.get("text_contains", "") or "")
+        if text_contains:
+            message = str(entry.get("message", "") or "").lower()
+            payload_json = str(entry.get("payload_json", "") or "").lower()
+            if text_contains not in message and text_contains not in payload_json:
+                return False
 
-            filtered.append(entry)
+        return True
+
+    def _log_tail_entry_matches(self, entry: Json, *, filters: dict[str, Any]) -> bool:
+        if not self._log_tail_matches_time(entry, filters=filters):
+            return False
+        if not self._log_tail_matches_severity(entry, filters=filters):
+            return False
+        if not self._log_tail_matches_source_kind(entry, filters=filters):
+            return False
+        if not self._log_tail_matches_ids(entry, filters=filters):
+            return False
+        return self._log_tail_matches_contains(entry, filters=filters)
+
+    def _log_tail(self, params: Json) -> Json:
+        limit = self._parse_log_tail_limit(params.get("limit", 200))
+        filters = self._log_tail_filters(params)
+
+        filtered: list[Json] = []
+        for entry in list(self._log_history):
+            if self._log_tail_entry_matches(entry, filters=filters):
+                filtered.append(entry)
 
         total = len(filtered)
         if total > limit:
@@ -5066,12 +4040,7 @@ class Manager:
 
         latest_t_mono: float | None = None
         if filtered:
-            ts = filtered[-1].get("ts")
-            if isinstance(ts, dict):
-                try:
-                    latest_t_mono = float(ts.get("t_mono"))
-                except Exception:
-                    latest_t_mono = None
+            latest_t_mono = self._log_tail_entry_t_mono(filtered[-1])
 
         return {
             "entries": filtered,
@@ -5082,67 +4051,7 @@ class Manager:
         }
 
     def _maybe_publish_log_event(self, topic: str, payload: Json) -> None:
-        severity = None
-        if topic == "manager.command":
-            ok = payload.get("ok")
-            status = str(payload.get("status", "") or "").upper()
-            if ok is False or status == "ERROR":
-                severity = "error"
-            else:
-                return
-        elif topic.endswith("telemetry_stale"):
-            severity = "warning"
-        elif (
-            "error" in topic
-            or topic.endswith("failed")
-            or topic.endswith("crashloop")
-            or "kill_timeout" in topic
-        ):
-            severity = "error"
-        if severity is None:
-            return
-
-        process_id = payload.get("process_id")
-        device_id = payload.get("device_id")
-        source_kind = "manager"
-        source_id = "manager"
-        if process_id is not None:
-            source_kind = "process"
-            source_id = str(process_id)
-        elif device_id is not None:
-            source_kind = "driver"
-            source_id = str(device_id)
-        message = payload.get("error") or payload.get("message") or ""
-        if topic == "manager.command":
-            action = str(payload.get("action", "") or "")
-            err_raw = payload.get("error")
-            if isinstance(err_raw, dict):
-                err_message = err_raw.get("message") or err_raw.get("code") or ""
-                if err_message is None:
-                    err_message = ""
-            else:
-                err_message = str(err_raw or "")
-            target = (
-                f"{device_id}.{action}"
-                if device_id is not None and action
-                else str(device_id or action or "unknown command")
-            )
-            message = (
-                f"Command failed: {target} ({err_message})"
-                if err_message
-                else f"Command failed: {target}"
-            )
-        self._emit_log(
-            severity=severity,
-            topic=topic,
-            message=str(message) if message is not None else "",
-            source_kind=source_kind,
-            source_id=source_id,
-            device_id=device_id,
-            process_id=process_id,
-            stream="event",
-            payload=payload,
-        )
+        shared_maybe_publish_log_event(self, topic, payload)
 
     def _publish_process_event(self, topic: str, handle: ProcessHandle) -> None:
         payload = {
