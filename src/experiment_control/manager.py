@@ -933,6 +933,12 @@ class Manager:
         router_path = (
             Path(__file__).resolve().parent / "processes" / "device_router.py"
         )
+        # Router startup does a manager RPC advertisement before heartbeats begin.
+        # Keep startup supervision timeout comfortably above that RPC timeout.
+        router_heartbeat_timeout_s = max(
+            3.0,
+            (float(self._device_rpc_timeout_ms) / 1000.0) + 2.0,
+        )
         init_kwargs = {
             "external_rpc_bind": self._external_rpc_bind,
             "device_rpc_timeout_ms": self._device_rpc_timeout_ms,
@@ -959,7 +965,7 @@ class Manager:
             process_id=self._router_process_id,
             argv=argv,
             heartbeat_period_s=1.0,
-            heartbeat_timeout_s=3.0,
+            heartbeat_timeout_s=router_heartbeat_timeout_s,
             shutdown_timeout_s=3.0,
             restart_policy=RestartPolicy.ALWAYS,
             restart_backoff_s=0.5,
@@ -979,12 +985,18 @@ class Manager:
         self._start_process_handle(handle)
         deadline = time.monotonic() + timeout_s
         while handle.state != ManagedProcessState.RUNNING:
-            if handle.popen is not None and handle.popen.poll() is not None:
+            if time.monotonic() > deadline:
                 # Flush pending stdout/stderr so startup failures include the real cause.
                 self._drain_supervisor_logs(max_items=5000)
                 self._flush_stale_supervisor_blocks(force=True)
-                raise RuntimeError(self._format_router_startup_failure(handle))
-            if time.monotonic() > deadline:
+                if handle.state in {
+                    ManagedProcessState.FAILED,
+                    ManagedProcessState.EXITED,
+                    ManagedProcessState.CRASHLOOP,
+                }:
+                    raise RuntimeError(self._format_router_startup_failure(handle))
+                if handle.popen is not None and handle.popen.poll() is not None:
+                    raise RuntimeError(self._format_router_startup_failure(handle))
                 raise TimeoutError("Timed out waiting for device_router RUNNING")
             self._pump_once(poll_ms=poll_ms)
 

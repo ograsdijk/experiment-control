@@ -455,7 +455,7 @@ class _WindowsJobObject:
         self._handle = self._kernel32.CreateJobObjectW(None, None)
         if not self._handle:
             self._raise_last_error("CreateJobObjectW failed")
-        info = self._extended_info_type()
+        info = self._extended_info_type()()
         info.BasicLimitInformation.LimitFlags = self._JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
         ok = self._kernel32.SetInformationJobObject(
             self._handle,
