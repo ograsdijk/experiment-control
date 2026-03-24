@@ -295,7 +295,7 @@ class StreamFrameHub:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
-        self._queues: set[asyncio.Queue] = set()
+        self._queues: dict[asyncio.Queue, tuple[str, str] | None] = {}
         self._lock = threading.Lock()
         self._readers: dict[tuple[str, str], ShmRingReader] = {}
         self._last_seq: dict[tuple[str, str], int] = {}
@@ -325,6 +325,8 @@ class StreamFrameHub:
             if not self._thread.is_alive():
                 self._thread = None
         self._loop = None
+        with self._lock:
+            self._queues.clear()
         for reader in list(self._readers.values()):
             try:
                 reader.close()
@@ -336,15 +338,26 @@ class StreamFrameHub:
         self._context_by_seq.clear()
         self._latest_frame.clear()
 
-    def subscribe(self, *, maxsize: int = 100) -> asyncio.Queue:
+    def subscribe(
+        self,
+        *,
+        maxsize: int = 100,
+        device_id: str | None = None,
+        stream: str | None = None,
+    ) -> asyncio.Queue:
         q: asyncio.Queue = asyncio.Queue(maxsize=maxsize)
+        filter_key: tuple[str, str] | None = None
+        device_text = str(device_id or "").strip()
+        stream_text = str(stream or "").strip()
+        if device_text and stream_text:
+            filter_key = (device_text, stream_text)
         with self._lock:
-            self._queues.add(q)
+            self._queues[q] = filter_key
         return q
 
     def unsubscribe(self, q: asyncio.Queue) -> None:
         with self._lock:
-            self._queues.discard(q)
+            self._queues.pop(q, None)
 
     def get_latest_frame(self, *, device_id: str, stream: str) -> dict[str, Any] | None:
         key = (str(device_id).strip(), str(stream).strip())
@@ -357,9 +370,18 @@ class StreamFrameHub:
             return _sanitize_json(dict(latest))
 
     def _fanout(self, msg: dict[str, Any]) -> None:
+        payload = msg.get("payload")
+        message_key: tuple[str, str] | None = None
+        if isinstance(payload, dict):
+            msg_device_id = str(payload.get("device_id") or "").strip()
+            msg_stream = str(payload.get("stream") or "").strip()
+            if msg_device_id and msg_stream:
+                message_key = (msg_device_id, msg_stream)
         with self._lock:
-            queues = list(self._queues)
-        for q in queues:
+            queue_items = list(self._queues.items())
+        for q, filter_key in queue_items:
+            if filter_key is not None and filter_key != message_key:
+                continue
             if q.full():
                 try:
                     q.get_nowait()

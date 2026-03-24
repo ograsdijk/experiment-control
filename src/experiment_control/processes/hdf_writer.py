@@ -526,6 +526,42 @@ class HdfWriter(ManagedProcessBase):
         did = self._normalize_device_id(device_id)
         return bool(did) and did not in self._disabled_devices
 
+    def _stream_buffer_snapshot(self) -> tuple[list[Json], int, int]:
+        items: list[Json] = []
+        total_samples = 0
+        total_data_bytes = 0
+        for key in sorted(self._stream_buffers.keys()):
+            device_id, stream = key
+            buf = self._stream_buffers.get(key, {})
+            data_raw = buf.get("data") if isinstance(buf, dict) else []
+            data_list = data_raw if isinstance(data_raw, list) else []
+            sample_count = len(data_list)
+            data_bytes = 0
+            for payload in data_list:
+                if isinstance(payload, (bytes, bytearray, memoryview)):
+                    data_bytes += len(payload)
+            total_samples += sample_count
+            total_data_bytes += data_bytes
+            if sample_count <= 0 and data_bytes <= 0:
+                continue
+            item: Json = {
+                "device_id": device_id,
+                "stream": stream,
+                "buffered_samples": int(sample_count),
+                "buffered_data_bytes": int(data_bytes),
+            }
+            last_seq = self._stream_last_seq.get(key)
+            if last_seq is not None:
+                item["last_seq"] = int(last_seq)
+            dropped_total = self._stream_dropped_total.get(key)
+            if dropped_total is not None:
+                item["dropped_total"] = int(dropped_total)
+            session = self._stream_active_session.get(key)
+            if session is not None:
+                item["session"] = int(session)
+            items.append(item)
+        return items, total_samples, total_data_bytes
+
     def _bump_error(self, key: str) -> None:
         self._error_counts[key] = self._error_counts.get(key, 0) + 1
 
@@ -1767,13 +1803,39 @@ class HdfWriter(ManagedProcessBase):
 
         if rtype == "hdf.status":
             schema_configured, schema_available, schema_error = self._measurement_schema_state()
+            stream_buffered, stream_buffered_samples, stream_buffered_data_bytes = (
+                self._stream_buffer_snapshot()
+            )
+            telemetry_buffer_depth = len(self._buf) if self._buf is not None else 0
+            telemetry_buffer_capacity = (
+                int(self._buf.maxlen)
+                if self._buf is not None and self._buf.maxlen is not None
+                else None
+            )
+            event_buffer_depth = len(self._event_buf) if self._event_buf is not None else 0
+            event_buffer_capacity = (
+                int(self._event_buf.maxlen)
+                if self._event_buf is not None and self._event_buf.maxlen is not None
+                else None
+            )
             result = {
                 "file": str(self._h5.filename) if self._h5 is not None else None,
                 "writing_active": self._h5 is not None,
                 "autostart_writing": bool(self._autostart_writing),
                 "pending": int(self._pending),
                 "dropped": int(self._dropped_local),
+                "dropped_by_topic": dict(self._dropped_local_by_topic),
                 "dropped_events": int(self._dropped_events),
+                "telemetry_buffer_depth": int(telemetry_buffer_depth),
+                "telemetry_buffer_capacity": telemetry_buffer_capacity,
+                "event_buffer_depth": int(event_buffer_depth),
+                "event_buffer_capacity": event_buffer_capacity,
+                "stream_buffered_streams": int(len(stream_buffered)),
+                "stream_buffered_samples": int(stream_buffered_samples),
+                "stream_buffered_data_bytes": int(stream_buffered_data_bytes),
+                "stream_buffered": stream_buffered,
+                "stream_context_entries": int(len(self._stream_context_id)),
+                "seen_context_ids_count": int(len(self._seen_context_ids)),
                 "event_log_mode": str(self._event_log_mode),
                 "measurement_id": self._measurement_id,
                 "measurement_type": self._measurement_type,

@@ -1117,7 +1117,7 @@ async def ws_logs(ws: WebSocket) -> None:
 @app.websocket("/ws/streams")
 async def ws_streams(ws: WebSocket) -> None:
     await ws.accept()
-    q = app.state.stream_hub.subscribe(maxsize=80)
+    q = app.state.stream_hub.subscribe(maxsize=20)
     try:
         while True:
             msg = await q.get()
@@ -1190,7 +1190,12 @@ async def ws_raw_stream(ws: WebSocket) -> None:
         pending_msg = msg
 
     await ws.accept()
-    q = app.state.stream_hub.subscribe(maxsize=120)
+    # Keep this queue small: each entry can contain large trace payloads.
+    q = app.state.stream_hub.subscribe(
+        maxsize=8,
+        device_id=device_id,
+        stream=stream,
+    )
     try:
         while True:
             timeout_s = 0.05 if pending_msg is not None and trace_interval_s > 0 else None

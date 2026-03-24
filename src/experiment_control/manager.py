@@ -679,6 +679,7 @@ class Manager:
         self._latest_chunk_desc: dict[str, dict[str, Json]] = {}
         self._command_interceptor_routes: list[CommandInterceptorRoute] = []
         self._command_interceptor_order = 0
+        self._command_interceptor_cache_max = 2048
         self._command_interceptor_cache: dict[tuple[str, str], list[CommandInterceptorRoute]] = {}
         self._runtime_device_metadata_overrides: dict[str, dict[str, Any]] = {}
         self._runtime_stream_metadata_overrides: dict[
@@ -2437,6 +2438,9 @@ class Manager:
         key = (device_id, action)
         cached = self._command_interceptor_cache.get(key)
         if cached is not None:
+            # Touch entry so eviction behaves as LRU.
+            self._command_interceptor_cache.pop(key, None)
+            self._command_interceptor_cache[key] = cached
             return list(cached)
         matches = [
             r
@@ -2452,6 +2456,10 @@ class Manager:
             seen.add(r.process_id)
             ordered.append(r)
         self._command_interceptor_cache[key] = list(ordered)
+        max_items = max(32, int(getattr(self, "_command_interceptor_cache_max", 2048)))
+        while len(self._command_interceptor_cache) > max_items:
+            oldest = next(iter(self._command_interceptor_cache))
+            self._command_interceptor_cache.pop(oldest, None)
         return ordered
 
     def _apply_command_interceptors(

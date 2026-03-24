@@ -127,6 +127,12 @@ class _BaseWorker(threading.Thread):
     def submit(self, task: object) -> None:
         self._queue.put(task)
 
+    def queue_depth(self) -> int | None:
+        try:
+            return int(self._queue.qsize())
+        except Exception:
+            return None
+
 
 class _ProcessWorker(_BaseWorker):
     def __init__(
@@ -721,6 +727,7 @@ class DeviceRouter(ManagedProcessBase):
 
         self._route_lock = threading.Lock()
         self._routes: list[CommandInterceptorRoute] = []
+        self._route_cache_max = 2048
         self._route_cache: dict[tuple[str, str], list[CommandInterceptorRoute]] = {}
         self._route_order = 0
 
@@ -879,6 +886,88 @@ class DeviceRouter(ManagedProcessBase):
             include_ts=True,
         )
 
+    @staticmethod
+    def _safe_queue_depth(q: queue.Queue | None) -> int | None:
+        if q is None:
+            return None
+        try:
+            return int(q.qsize())
+        except Exception:
+            return None
+
+    def _worker_queue_depth_snapshot(self) -> Json:
+        device_workers: list[Json] = []
+        process_workers: list[Json] = []
+        mirrored_workers: list[Json] = []
+
+        total_device_queue_depth = 0
+        total_process_queue_depth = 0
+        total_mirrored_queue_depth = 0
+
+        for device_id in sorted(self._device_workers):
+            worker = self._device_workers[device_id]
+            depth = worker.queue_depth()
+            if depth is not None:
+                total_device_queue_depth += depth
+            device_workers.append(
+                {
+                    "device_id": device_id,
+                    "queue_depth": depth,
+                    "alive": bool(worker.is_alive()),
+                }
+            )
+
+        for process_id in sorted(self._process_workers):
+            worker = self._process_workers[process_id]
+            depth = worker.queue_depth()
+            if depth is not None:
+                total_process_queue_depth += depth
+            process_workers.append(
+                {
+                    "process_id": process_id,
+                    "queue_depth": depth,
+                    "alive": bool(worker.is_alive()),
+                }
+            )
+
+        for local_id in sorted(self._mirrored_workers):
+            worker = self._mirrored_workers[local_id]
+            depth = worker.queue_depth()
+            if depth is not None:
+                total_mirrored_queue_depth += depth
+            mirrored_workers.append(
+                {
+                    "device_id": local_id,
+                    "queue_depth": depth,
+                    "alive": bool(worker.is_alive()),
+                }
+            )
+
+        manager_worker_depth: int | None = None
+        manager_worker_alive = False
+        if self._manager_worker is not None:
+            manager_worker_depth = self._manager_worker.queue_depth()
+            manager_worker_alive = bool(self._manager_worker.is_alive())
+
+        return {
+            "reply_queue_depth": self._safe_queue_depth(self._reply_queue),
+            "manager_worker": {
+                "queue_depth": manager_worker_depth,
+                "alive": manager_worker_alive,
+            },
+            "device_workers": device_workers,
+            "process_workers": process_workers,
+            "mirrored_workers": mirrored_workers,
+            "totals": {
+                "device_worker_count": int(len(device_workers)),
+                "process_worker_count": int(len(process_workers)),
+                "mirrored_worker_count": int(len(mirrored_workers)),
+                "device_worker_queue_depth": int(total_device_queue_depth),
+                "process_worker_queue_depth": int(total_process_queue_depth),
+                "mirrored_worker_queue_depth": int(total_mirrored_queue_depth),
+            },
+        }
+
     def _invalidate_route_cache(self) -> None:
         self._route_cache.clear()
 
@@ -943,6 +1032,9 @@ class DeviceRouter(ManagedProcessBase):
         key = (device_id, action)
         cached = self._route_cache.get(key)
         if cached is not None:
+            # Touch entry so eviction behaves as LRU.
+            self._route_cache.pop(key, None)
+            self._route_cache[key] = cached
             return list(cached)
         matches = [r for r in self._routes if self._match_route(r, device_id, action)]
         matches.sort(key=lambda r: r.order)
@@ -954,6 +1046,10 @@ class DeviceRouter(ManagedProcessBase):
             seen.add(r.process_id)
             ordered.append(r)
         self._route_cache[key] = list(ordered)
+        max_items = max(32, int(getattr(self, "_route_cache_max", 2048)))
+        while len(self._route_cache) > max_items:
+            oldest = next(iter(self._route_cache))
+            self._route_cache.pop(oldest, None)
         return ordered
 
     def _handle_command_interceptor(self, req: Json) -> Json:
@@ -1260,6 +1356,7 @@ class DeviceRouter(ManagedProcessBase):
                     "mirrored_devices": len(self._mirrored_routes),
                     "processes": len(self._process_endpoints),
                     "routes": len(self._routes),
+                    "queue_depths": self._worker_queue_depth_snapshot(),
                 },
             }
         return {"request_id": req.get("request_id"), "ok": False, "error": {"code": "unknown_request"}}
