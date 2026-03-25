@@ -30,11 +30,11 @@ Given a static config mapping:
 - The hub manager subscribes to the owning peer's `manager_pub`.
 - Relayed remote events are rewritten to the mirrored local `device_id`.
 - The hub manager merges mirrored devices into:
-  - `list_devices`
+  - `manager.devices.list`
   - `device.list_status`
   - `device.config.get`
   - `device.config.list`
-  - `telemetry.schema.list`
+  - `manager.telemetry.schema.list` (action-routed)
 
 Mirrored devices are tagged with:
 - `source_kind: "federated"`
@@ -123,7 +123,7 @@ Mirrored device capabilities are cached on the hub manager.
 
 Current behavior:
 - If a mirrored `capabilities` command succeeds, the local router notifies the local manager to cache the returned payload.
-- `list_devices` then includes the cached `capabilities` for that mirrored device.
+- `manager.devices.list` then includes the cached `capabilities` for that mirrored device.
 - There is no TTL yet. The cache stays until overwritten by a later successful `capabilities` call or until restart.
 
 Optional startup warm-up:
@@ -239,7 +239,7 @@ This prevents mirrored-device-to-mirrored-device forwarding chains.
 - No separate leaf-side inbound federation ACL.
   - The leaf accepts forwarded requests the same way it accepts normal router requests.
   - Normal local driver checks and local command interceptors still apply.
-- No cross-host forwarding for `process.*` or `manager.*` admin RPC.
+- No cross-host forwarding for `manager.processes.*` or manager-control/admin RPC.
 - Reconnect backoff settings are not yet used by the runtime.
 
 ---
@@ -249,5 +249,5 @@ This prevents mirrored-device-to-mirrored-device forwarding chains.
 - FastAPI is not part of the host-to-host transport path.
   - FastAPI can be a client of the local hub.
   - Federation itself runs underneath that, via ZMQ router/manager sockets.
-- Existing UI/processes that consume `device.list_status`, `device.config.list`, and `telemetry.schema.list` can see mirrored devices through the hub.
+- Existing UI/processes that consume `device.list_status`, `device.config.list`, and `manager.telemetry.schema.list` can see mirrored devices through the hub.
 - HDF/other process behavior for mirrored telemetry now depends on the same manager-side inventory/config/schema surfaces as local devices.

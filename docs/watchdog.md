@@ -118,9 +118,9 @@ Retries:
 - `retries: 0` = one attempt
 - `retries: 1` = two attempts
 
-## Watchdog RPC (via `process.rpc`)
+## Watchdog RPC (via `manager.processes.rpc`)
 
-Use the manager `process.rpc` API to call watchdog RPCs.
+Use the manager `manager.processes.rpc` API to call watchdog RPCs.
 
 ### `watchdog.status`
 Returns loaded rules and state (latched + last_trigger).

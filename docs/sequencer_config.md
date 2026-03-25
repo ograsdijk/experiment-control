@@ -303,6 +303,12 @@ Behavior:
 - `context_id` resets when the sequencer process restarts.
 - `context_fields` must be JSON-serializable scalars (float, int, bool, str).
 - Drivers attach `context_id` + `context_fields` to `chunk_ready`.
+- Sequencer applies bounded retry for transient `stream.context.set` failures
+  (for example device restart windows), then fails the step if retries are exhausted
+  or if the error is non-transient.
+- HDF writer resolves context by `seq` (not sticky per-stream carry-forward). If a
+  matching context descriptor never arrives within the configured TTL, samples are
+  written as `context_id = -1`.
 
 ## Range generators (`gen`)
 ```yaml

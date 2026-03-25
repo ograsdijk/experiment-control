@@ -27,6 +27,10 @@ FastAPI reads manager endpoints from environment variables:
 - `EXPERIMENT_CONTROL_ROUTER_RPC_HINT` (optional remote/public hint endpoint)
 - `EXPERIMENT_CONTROL_MANAGER_PUB_HINT` (optional remote/public hint endpoint)
 - `EXPERIMENT_CONTROL_RPC_TIMEOUT_MS` (defaults to `2000`)
+- `EXPERIMENT_CONTROL_RPC_QUEUE_MAX` (defaults to `1024`)
+- `EXPERIMENT_CONTROL_STREAM_MAX_PAYLOAD_POINTS` (defaults to `200000`)
+- `EXPERIMENT_CONTROL_STREAM_MAX_KEYS` (defaults to `1024`)
+- `EXPERIMENT_CONTROL_STREAM_KEY_TTL_S` (defaults to `600`)
 
 To serve the React UI from FastAPI:
 
@@ -87,10 +91,21 @@ manager:
     registry: 5555
     rpc: 6002                         # manager internal RPC
     heartbeat_base: 6100              # managed-process heartbeat port base
+    event_base: 6200                  # managed-process event/data port base
   heartbeat_timeout_s: 3.0
   telemetry_stale_s: 10.0
   device_rpc_timeout_ms: 1500
   interceptor_rpc_timeout_ms: 500
+  router_manager_worker_queue_max: 8192
+  router_process_worker_queue_max: 8192
+  router_device_worker_queue_max: 16384
+  router_mirrored_worker_queue_max: 8192
+  router_reply_queue_max: 32768
+  router_inflight_max: 32768
+  telemetry_cache_max_devices: 4096
+  telemetry_cache_max_signals_per_device: 4096
+  chunk_cache_max_devices: 4096
+  chunk_cache_max_streams_per_device: 2048
   auto_connect_on_register: true
   command_journal:
     enabled: false
@@ -140,11 +155,15 @@ Notes:
 - `files` can list explicit YAML paths in addition to `dirs`.
 - `process_order` is optional. If omitted, `hdf_writer` is started first if present.
 - If `tui.enabled: true`, the stack runner starts a manager subprocess and runs the TUI in the same terminal.
-- When the TUI exits, the runner sends `manager.shutdown` and then terminates the manager subprocess.
+- When the TUI exits, the runner sends `manager.control.shutdown` and then terminates the manager subprocess.
 - Startup timeouts (registration / process running / online) are logged as warnings; the stack continues.
 - The `device_router` process is started automatically by the manager and is not listed under `processes:`.
 - `external.rpc_port` is the **device_router** front door; `external.pub_port` is manager PUB.
 - The manager binds its **internal** RPC on `internal_ports.rpc` and the router forwards to it.
+- Router queue knobs (`router_*_queue_max`, `router_inflight_max`) control
+  device-router overload behavior and memory ceilings under sustained load.
+- Telemetry/chunk cache knobs (`telemetry_cache_*`, `chunk_cache_*`) bound
+  manager-side key growth for high-cardinality device/signal/stream workloads.
 - `bind_host` controls external bind/listen host and can be wildcard (`0.0.0.0`, `*`, `[::]`).
 - Local clients launched by `run_stack` (TUI + managed processes) always use loopback connect
   addresses (`tcp://127.0.0.1:<port>`) derived from the external ports.
@@ -162,15 +181,16 @@ Notes:
 - Rapid duplicate sink lines are de-duplicated in a short window to reduce log spam.
 - Journal scope includes:
   - device commands (`type=command`)
-  - process control commands (`process.start`, `process.stop`, `process.restart`)
-  - process RPC commands (`process.rpc`, e.g. `sequencer.start`, `hdf.rotate`)
+  - process control commands (`manager.processes.start`, `manager.processes.stop`, `manager.processes.restart`)
+  - process RPC envelope (`manager.processes.rpc`, for example `sequencer.start`, `hdf.rotate`)
 - Command-journal action filter: `stream__*` and `telemetry__*` actions are skipped to
   avoid high-volume acquisition noise.
 - Remote/public endpoint hints use `advertise_host` if set, otherwise:
   non-wildcard `bind_host`, otherwise first non-loopback host IP.
 - Legacy keys are still accepted:
   `external_rpc_bind`, `external_pub_bind`, `registry_bind`, `internal_rpc_bind`,
-  `process_hb_bind_base`, `external_rpc_connect_local`, `external_pub_connect_local`.
+  `process_hb_bind_base`, `process_data_bind_base`,
+  `external_rpc_connect_local`, `external_pub_connect_local`.
 
 ## Device config (example)
 
@@ -283,6 +303,9 @@ init_kwargs:
   buffer_max_messages: 200000
   flush_every_n: 200
   flush_every_s: 2.0
+  context_resolve_ttl_s: 5.0          # max wait for matching context_id by seq
+  context_pending_max_per_stream: 10000
+  context_map_max_per_stream: 20000
   disabled_devices: []   # optional: device_ids to skip writing (default write-all)
   event_log_mode: all    # all | failures_only | none
   measurement_schema_path: examples/dummy_frequency_trace_sequencer/measurement.yaml  # optional
@@ -305,6 +328,12 @@ Notes:
 - `event_log_mode` controls writes to `/events/data`:
   `all` writes all manager command/log rows, `failures_only` keeps failed commands
   plus warning/error/critical logs, and `none` disables event row writes.
+- Stream context matching in HDF is seq-indexed and bounded:
+  - `context_resolve_ttl_s`: unresolved samples are written with `context_id=-1`
+    after this TTL.
+  - `context_pending_max_per_stream`: cap for unresolved sample backlog per stream.
+  - `context_map_max_per_stream`: cap for context descriptor map per stream.
+  - This avoids stale context carry-forward and keeps memory bounded during long runs.
 - `measurement_schema_path` enables schema-driven measurement metadata and notes:
   - `hdf.rotate` can take `measurement_profile` + `measurement_values`.
   - `hdf.measurement.schema.get` exposes schema to clients.

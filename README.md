@@ -9,6 +9,39 @@ Experiment control framework with:
 
 This README focuses on the current recommended workflow used in `examples/linien_cli`.
 
+## Current Code Structure
+
+Recent refactors split the large manager/router/process paths into focused modules.
+
+- Manager orchestration remains in `src/experiment_control/manager.py`.
+- Manager routing and handlers are split across:
+  - `manager_request_routing.py`
+  - `manager_internal_rpc.py`
+  - `manager_route_handlers.py`
+  - `manager_device_routing.py`
+- Process supervision/recovery/logging are split across:
+  - `manager_process_supervision.py`
+  - `manager_process_recovery.py`
+  - `manager_process_logs.py`
+- Command interceptor route state is isolated in:
+  - `manager_interceptor_routes.py`
+- Driver PUB ingest/caches are isolated in:
+  - `manager_driver_pub.py`
+- Router worker/backpressure logic is in:
+  - `processes/device_router.py`
+
+## Runtime Safety Bounds
+
+The stack now has explicit memory/backpressure bounds in hot paths:
+
+- `device_router` uses bounded worker queues, bounded reply queue, and inflight caps with
+  fail-fast `router_busy` responses on saturation.
+- Manager telemetry/chunk descriptor caches are bounded by configurable device/signal/stream limits.
+- FastAPI stream hub bounds retained stream keys by count and TTL, and exposes stream-hub stats.
+
+See `docs/manager_start.md` for all manager/stack knobs and `docs/protocol.md` for runtime
+stats endpoints (`manager.info.identity`, `router.stats`, `/api/settings`).
+
 ## Requirements
 
 - Python `>=3.13`
@@ -183,7 +216,7 @@ In `stack.yaml`, manager networking is configured under `manager`:
 - `bind_host` (external listener host, for example `127.0.0.1`, `0.0.0.0`, or LAN IP)
 - `advertise_host` (optional host for remote/public endpoint hints)
 - `external.rpc_port` and `external.pub_port`
-- `internal_ports.registry`, `internal_ports.rpc`, `internal_ports.heartbeat_base`
+- `internal_ports.registry`, `internal_ports.rpc`, `internal_ports.heartbeat_base`, `internal_ports.event_base`
 
 Common pattern:
 
@@ -201,16 +234,24 @@ For FastAPI, the manager endpoints are taken from env:
 - `EXPERIMENT_CONTROL_MANAGER_PUB`
 - `EXPERIMENT_CONTROL_ROUTER_RPC_HINT` (optional remote/public hint)
 - `EXPERIMENT_CONTROL_MANAGER_PUB_HINT` (optional remote/public hint)
+- `EXPERIMENT_CONTROL_RPC_TIMEOUT_MS` (router RPC timeout)
+- `EXPERIMENT_CONTROL_RPC_QUEUE_MAX` (gateway request queue bound)
+- `EXPERIMENT_CONTROL_STREAM_MAX_PAYLOAD_POINTS` (per-frame truncation cap)
+- `EXPERIMENT_CONTROL_STREAM_MAX_KEYS` (stream key retention cap)
+- `EXPERIMENT_CONTROL_STREAM_KEY_TTL_S` (stream key idle eviction TTL)
 
 The helper script (`run_linien_fastapi.py`) sets these automatically from stack config.
 
 ## Useful Docs
 
 - `docs/manager_start.md` - stack runner and YAML schema
-- `docs/protocol.md` - RPC and PUB/SUB protocol
+- `docs/protocol.md` - canonical RPC/PUB-SUB protocol (`manager.*` / `manager.processes.*` namespaces)
 - `docs/python_client_sdk.md` - Python SDK for direct stack control
 - `docs/sequencer_config.md` - sequencer configuration
 - `docs/state_machines.md` - state machine process base/template
+
+Internal planning/ops/backlog notes live under `notes/` and are intentionally kept
+separate from user-facing docs.
 
 ## Troubleshooting
 

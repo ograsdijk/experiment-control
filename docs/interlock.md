@@ -95,9 +95,10 @@ Expressions inside `${...}` are evaluated in a restricted environment. Available
 - Telemetry bindings (see above)
 - `device_id` and `action`
 
-## Interlock RPC (via `process.rpc`)
+## Interlock RPC (via `manager.processes.rpc`)
 
-These requests are sent to the interlock process through the manager `process.rpc` API.
+These requests are sent to the interlock process through the manager
+`manager.processes.rpc` API.
 
 ### `interlock.list`
 Returns the currently loaded interceptors and their enabled state.
@@ -209,4 +210,5 @@ The manager blocks commands when:
 
 - The interlock never performs synchronous reads from the manager during checks.
 - It relies only on the telemetry cache populated from `manager.telemetry_update`.
-- Interlock startup registers routes via `command_interceptor.register` with `replace: true`.
+- Interlock startup registers routes via `manager.interceptors.register` with
+  `replace: true`.

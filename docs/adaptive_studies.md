@@ -441,38 +441,3 @@ Current limits:
 6. `resume` and `warm_start` currently use the same replay-based behavior
 7. no controller serialization; studies are rebuilt from saved trial history
 8. `analysis_output` only works inside the sequencer process runtime, because it waits on `manager.stream_analysis.output`
-
-## TODO
-
-High-value next steps:
-
-1. add more controllers:
-   - `adaptive.random`
-   - `adaptive.coordinate_search`
-2. add real 2D adaptive controllers
-3. implement real `warm_start` semantics distinct from `resume`
-4. surface richer controller diagnostics in the UI
-5. use `min_step` as a proper refinement floor where it makes sense
-6. add motion-aware next-point scheduling for slow actuators
-
-### Motion-aware scheduling
-
-This is the next important control-layer improvement for hardware that cannot jump quickly.
-
-The current controller only picks informative points. It does not account for move cost.
-
-The recommended next design is:
-
-1. let the controller produce several promising candidate points
-2. add a scheduler layer that chooses the next actual point using:
-   - information value
-   - estimated move time from the current position
-   - optional settle penalty
-   - optional max jump
-
-That keeps:
-
-1. the learner focused on information / refinement
-2. the scheduler focused on hardware cost
-
-This should be implemented as a scheduling layer on top of the current adaptive controller, not by trying to bake move-time cost directly into the external learner first.

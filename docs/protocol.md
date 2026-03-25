@@ -59,6 +59,11 @@ Response:
 
 ## DeviceRouter external RPC (ROUTER)
 
+Canonical manager/process request namespaces:
+- `manager.processes.*` for process control + process RPC forwarding
+- `manager.info.*`, `manager.control.*`, `manager.logs.*`, `manager.commands.*`
+- `manager.interceptors.*` for interceptor route registration/listing
+
 ### `command`
 Request:
 - `{"type": "command", "device_id": "hv", "action": "enable_output", "params": {"enabled": true}, "request_id": "optional", "caller_process_id": "optional", "source_kind": "optional", "source_id": "optional"}`
@@ -76,44 +81,112 @@ Response (pass-through from driver):
 Response (interceptor blocked):
 - `{"ok": false, "error": {"kind": "command_interceptor", "code": "INTERCEPTOR_REJECTED", ...}}`
 
-### `process.rpc.advertise`
+### `manager.devices.list`
 Request:
-- `{"type": "process.rpc.advertise", "process_id": "sequencer", "rpc_endpoint": "tcp://127.0.0.1:7001"}`
+- `{"type": "manager.devices.list"}`
+
+Response:
+- `{"ok": true, "devices": [{"device_id": "hv", "registered": true, "...": "..."}]}`
+
+### `device.list_status`
+Request:
+- `{"type": "device.list_status"}`
+
+Response:
+- `{"ok": true, "result": [{"device_id": "hv", "liveness": "ONLINE", "...": "..."}]}`
+
+### `manager.telemetry.snapshot`
+Request:
+- `{"type": "manager.telemetry.snapshot"}`
+
+Response:
+- `{"ok": true, "result": {"generated_ts": {...}, "devices": {"hv": {"voltage": {...}}}}}`
+
+### `manager.telemetry.get`
+Request:
+- `{"type": "manager.telemetry.get", "device_id": "hv"}`
+
+Response:
+- `{"ok": true, "telemetry": {"voltage": {...}}}`
+
+### `manager.telemetry.schema.list` (action-routed)
+Request:
+- `{"action": "manager.telemetry.schema.list"}`
+
+Response:
+- `{"ok": true, "result": {"schema_version": 1, "devices": [{"device_id": "hv", "signals": [...]}]}}`
+
+### `manager.processes.rpc.advertise`
+Request:
+- `{"type": "manager.processes.rpc.advertise", "process_id": "sequencer", "rpc_endpoint": "tcp://127.0.0.1:7001"}`
 
 Response:
 - `{"ok": true, "result": {"process_id": "sequencer"}}`
 
-### `process.rpc`
+### `manager.processes.rpc`
 Request:
-- `{"type": "process.rpc", "process_id": "sequencer", "request": {...}}`
+- `{"type": "manager.processes.rpc", "process_id": "sequencer", "request": {...}}`
 
 Response:
 - `{"ok": true, "result": ...}` or `{"ok": false, "error": {...}}`
 
-### `process.capabilities` (process.rpc payload)
+### `manager.processes.list`
+Request:
+- `{"type": "manager.processes.list"}`
+
+Response:
+- `{"ok": true, "result": [{"process_id": "sequencer", "state": "RUNNING", "...": "..."}]}`
+
+### `manager.processes.get`
+Request:
+- `{"type": "manager.processes.get", "process_id": "sequencer"}`
+
+Response:
+- `{"ok": true, "result": {"process_id": "sequencer", "state": "RUNNING", "...": "..."}}`
+
+### `manager.processes.start` / `manager.processes.stop` / `manager.processes.restart`
+Request:
+- `{"type": "manager.processes.start", "process_id": "sequencer"}`
+- `{"type": "manager.processes.stop", "process_id": "sequencer"}`
+- `{"type": "manager.processes.restart", "process_id": "sequencer"}`
+
+Response:
+- `{"ok": true, "result": {"process_id": "sequencer"}}`
+
+### `process.capabilities` (`manager.processes.rpc.request` payload)
 Request:
 - `{"type": "process.capabilities"}`
 
 Response:
 - `{"ok": true, "result": {"version": 1, "members": [...]}}`
 
-### `manager.event.publish`
+### `router.stats` (`manager.processes.rpc.request` payload to `device_router`)
+Request envelope:
+- `{"type": "manager.processes.rpc", "process_id": "device_router", "request": {"type": "router.stats"}}`
+
+Response highlights:
+- queue depths/maxes for manager/process/device/mirrored workers
+- bounded reply queue stats
+- inflight counters (`inflight`, `inflight_max`, `inflight_rejected`)
+- overload reject counters per bucket
+
+### `manager.events.publish`
 Request:
-- `{"type": "manager.event.publish", "topic": "manager.watchdog.triggered", "payload": {...}}`
+- `{"type": "manager.events.publish", "topic": "manager.watchdog.triggered", "payload": {...}}`
 
 Response:
 - `{"ok": true, "result": {"status": "published"}}`
 
-### `manager.log.publish`
+### `manager.logs.publish`
 Request:
-- `{"type": "manager.log.publish", "payload": {"severity": "error", "topic": "sequencer", "message": "..."}}`
+- `{"type": "manager.logs.publish", "payload": {"severity": "error", "topic": "sequencer", "message": "..."}}`
 
 Response:
 - `{"ok": true, "result": {"status": "published", "entry": {...}}}`
 
-### `manager.log.tail`
+### `manager.logs.tail`
 Request:
-- `{"type": "manager.log.tail", "params": {"limit": 200}}`
+- `{"type": "manager.logs.tail", "params": {"limit": 200}}`
 - Optional filters in `params`:
   - `since_t_mono`: float
   - `severity_min`: str (`debug|info|warning|error|critical`)
@@ -128,9 +201,9 @@ Request:
 Response:
 - `{"ok": true, "result": {"entries": [...], "count": 200, "total_matched": 740, "limit": 200, "latest_t_mono": 123456.7}}`
 
-### `manager.command_journal.status`
+### `manager.commands.journal.status`
 Request:
-- `{"type": "manager.command_journal.status"}`
+- `{"type": "manager.commands.journal.status"}`
 
 Response:
 - `{"ok": true, "result": {"enabled": false, "path": ".state/instance/command_journal.sqlite3", "start_error": null}}`
@@ -142,9 +215,9 @@ Notes:
 - Journaled command events also skip `process.capabilities`.
 - Process commands are journaled with `device_id="process:<process_id>"`.
 
-### `manager.command_journal.tail`
+### `manager.commands.journal.tail`
 Request:
-- `{"type": "manager.command_journal.tail", "params": {"limit": 200}}`
+- `{"type": "manager.commands.journal.tail", "params": {"limit": 200}}`
 - Optional filters in `params`:
   - `since_t_wall`: float
   - `ok`: bool
@@ -157,12 +230,12 @@ Response:
 - `{"ok": true, "result": {"entries": [...], "count": 200, "total_matched": 740, "limit": 200, "latest_id": 1234}}`
 - `{"ok": false, "error": {"code": "journal_disabled"}}`
 
-### `manager.identity`
+### `manager.info.identity`
 Request:
-- `{"type": "manager.identity"}`
+- `{"type": "manager.info.identity"}`
 
 Response:
-- `{"ok": true, "result": {"version": 1, "instance_id": "laser-lock-1", "started_ts": {"t_wall": 1700000000.0, "t_mono": 12345.6}}}`
+- `{"ok": true, "result": {"version": 1, "instance_id": "laser-lock-1", "started_ts": {"t_wall": 1700000000.0, "t_mono": 12345.6}, "lock_status": {...}, "lock_effective_status": "active", "process_guard": {...}, "cache_bounds": {"telemetry_max_devices": 4096, "telemetry_max_signals_per_device": 4096, "chunk_max_devices": 4096, "chunk_max_streams_per_device": 2048}, "cache_stats": {"telemetry_devices": 12, "chunk_devices": 3, "telemetry_evicted_devices": 0, "telemetry_evicted_signals": 0, "chunk_evicted_devices": 0, "chunk_evicted_streams": 0}}}`
 
 ### `device.connect`
 Request:
@@ -210,29 +283,29 @@ Notes:
 Response:
 - `{"ok": true, "result": {"changed": true, "scope": "stream", "revision": 4, "...": "same shape as device.metadata.get"}}`
 
-### `manager.cleanup_orphans`
+### `manager.control.cleanup_orphans`
 Request:
-- `{"type": "manager.cleanup_orphans"}`
-- `{"type": "manager.cleanup_orphans", "params": {"dry_run": true, "stale_only": true, "timeout_s": 2.0}}`
+- `{"type": "manager.control.cleanup_orphans"}`
+- `{"type": "manager.control.cleanup_orphans", "params": {"dry_run": true, "stale_only": true, "timeout_s": 2.0}}`
 
 Response:
 - `{"ok": true, "result": {"instance_id": "laser-lock-1", "dry_run": true, "stale_only": true, "matched": 2, "terminated": [], "failed": [], "skipped_live_parent": [1234], "candidates": [4567]}}`
 
-### `command_interceptor.register`
+### `manager.interceptors.register`
 Request:
-- `{"type": "command_interceptor.register", "process_id": "interlock", "routes": [{"device_id": "hv", "action": "enable_output"}], "replace": true}`
+- `{"type": "manager.interceptors.register", "process_id": "interlock", "routes": [{"device_id": "hv", "action": "enable_output"}], "replace": true}`
 
 Response:
 - `{"ok": true, "result": {"routes": [...]}}`
 
-### `command_interceptor.list`
+### `manager.interceptors.list`
 Request:
-- `{"type": "command_interceptor.list"}`
+- `{"type": "manager.interceptors.list"}`
 
 Response:
 - `{"ok": true, "result": {"routes": [...]}}`
 
-## Router → interceptor RPC (process.rpc payload)
+## Router → interceptor RPC (`manager.processes.rpc.request` payload)
 
 ### `command_interceptor.check`
 Request:
@@ -247,7 +320,7 @@ Response (allow + transform):
 Response (reject):
 - `{"ok": true, "allow": false, "interceptor_id": "hv_safety", "rule": "block_hv_enable_pressure", "error": {"code": "CONDITION_FAILED", "message": "...", "details": {...}}}`
 
-## Interlock process RPC (process.rpc payload)
+## Interlock process RPC (`manager.processes.rpc.request` payload)
 
 ### `interlock.list`
 Request:
@@ -297,7 +370,7 @@ Request:
 Response:
 - `{"ok": true, "result": {"enabled": true, "count": 2}}`
 
-## Frequency-power follower process RPC (process.rpc payload)
+## Frequency-power follower process RPC (`manager.processes.rpc.request` payload)
 
 ### `follower.rules`
 Request:
@@ -314,7 +387,7 @@ Request:
 Response:
 - `{"ok": true, "result": {"rule_id": "r0", "enabled": true}}`
 
-## Watchdog process RPC (process.rpc payload)
+## Watchdog process RPC (`manager.processes.rpc.request` payload)
 
 ### `watchdog.status`
 Request:
@@ -347,7 +420,7 @@ Request:
 Response:
 - `{"ok": true, "result": {"enabled": true, "count": 2}}`
 
-## Influx writer process RPC (process.rpc payload)
+## Influx writer process RPC (`manager.processes.rpc.request` payload)
 
 For writer data model/config details, see `docs/influx_writer.md`.
 
@@ -388,7 +461,7 @@ Request:
 Response:
 - `{"ok": true, "result": {"disabled_devices": []}}`
 
-## Sequencer process RPC (process.rpc payload)
+## Sequencer process RPC (`manager.processes.rpc.request` payload)
 
 ### `sequencer.validate`
 Request (from path):
@@ -476,7 +549,7 @@ Request:
 Response:
 - `{"ok": true, "result": {"loaded": true, "source": "sequences/main.yaml", "source_kind": "library", "active_sequence_id": "main", "text": "...yaml..."}}`
 
-## HDF writer process RPC (process.rpc payload)
+## HDF writer process RPC (`manager.processes.rpc.request` payload)
 
 ### `hdf.status`
 Request:
@@ -484,6 +557,16 @@ Request:
 
 Response:
 - `{"ok": true, "result": {"file": "path/to/file.h5" | null, "pending": 0, "dropped": 0, "dropped_events": 0, "event_log_mode": "all" | "failures_only" | "none", "disabled_devices": [...], "known_devices": [...], "enabled_known_devices": [...], "measurement_id": "uuid" | null, "measurement_type": "frequency_scan" | null, "measurement_schema_version": 1 | null, "measurement_started_wall_ns": 1730000000000000000 | null, "measurement_ended_wall_ns": 1730000010000000000 | null, "measurement_notes_rows": 0, "measurement_schema_configured": true | false, "measurement_schema_available": true | false, "measurement_schema_path": "path/to/measurement.yaml" | null, "measurement_schema_error": "..." | null, "sequencer_event_rows": 0, "sequencer_yaml_snapshots": 0}}`
+- Additional stream-context diagnostics may be present:
+  - `stream_pending_context_samples`
+  - `stream_context_map_entries` (and compatibility mirror `stream_context_entries`)
+  - `context_resolved_exact`
+  - `context_late_resolved`
+  - `context_written_minus1_missing`
+  - `context_evicted_pending_overflow`
+  - `context_evicted_map_overflow`
+  - `stream_buffered[*].pending_context_samples`
+  - `stream_buffered[*].context_map_entries`
 
 ### `hdf.devices.get`
 Request:
@@ -533,9 +616,12 @@ Response:
 - `{"ok": true, "result": {"index": 0, "t_wall": 1730000000.0, "t_mono": 112233.44, "author": "alice", "kind": "note"}}`
 - Note payload is written to `/measurement/notes` with `author`, `kind`, `message`, and extra fields in `payload_json`.
 
-### `process.stop` (common process RPC)
+### `process.stop` (common process-internal RPC)
 Request:
 - `{"type": "process.stop"}`
+
+Notes:
+- Send this as the `request` payload inside `manager.processes.rpc`.
 
 Response:
 - `{"ok": true, "result": {"status": "stopping"}}`
@@ -628,6 +714,8 @@ Response:
   - `seq`: int
   - `t0_mono_ns`: int
   - `t0_wall_ns`: int
+  - `context_id`: int (optional)
+  - `context_fields`: dict (optional)
 
 ### `manager.device_config`
 - Producer: manager
