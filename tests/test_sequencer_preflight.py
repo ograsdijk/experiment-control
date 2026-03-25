@@ -31,12 +31,12 @@ class _FakeManager:
     def call(self, payload, *, timeout_ms=None):  # noqa: ANN001, ARG002
         if not isinstance(payload, dict):
             return {"ok": False, "error": "bad_payload"}
-        if payload.get("type") == "list_devices":
+        if payload.get("type") == "manager.devices.list":
             return {
                 "ok": True,
                 "devices": [{"device_id": device_id} for device_id in sorted(self._devices)],
             }
-        if payload.get("action") == "telemetry.schema.list":
+        if payload.get("action") == "manager.telemetry.schema.list":
             devices = []
             for device_id in sorted(self._devices):
                 devices.append(

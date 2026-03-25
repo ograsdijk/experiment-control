@@ -24,6 +24,12 @@ class ManagerRouterStartupTests(unittest.TestCase):
         mgr._federation_hub = SimpleNamespace(  # type: ignore[attr-defined]
             mirror_route_entries=lambda: []
         )
+        mgr._router_manager_worker_queue_max = 8192  # type: ignore[attr-defined]
+        mgr._router_process_worker_queue_max = 8192  # type: ignore[attr-defined]
+        mgr._router_device_worker_queue_max = 16384  # type: ignore[attr-defined]
+        mgr._router_mirrored_worker_queue_max = 8192  # type: ignore[attr-defined]
+        mgr._router_reply_queue_max = 32768  # type: ignore[attr-defined]
+        mgr._router_inflight_max = 32768  # type: ignore[attr-defined]
         mgr._instance_id = "test-instance"  # type: ignore[attr-defined]
         mgr._internal_rpc_endpoint = "tcp://127.0.0.1:6200"  # type: ignore[attr-defined]
         mgr._external_pub_connect_local = "tcp://127.0.0.1:6201"  # type: ignore[attr-defined]

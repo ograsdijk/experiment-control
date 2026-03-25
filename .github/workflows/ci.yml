@@ -43,7 +43,7 @@ jobs:
         run: uv run ruff check src tests examples
 
       - name: Complexity guard (incremental)
-        run: uv run ruff check src/experiment_control/utils/command_interceptors.py src/experiment_control/utils/network_hosts.py --select C901
+        run: uv run ruff check src/experiment_control/utils/command_interceptors.py src/experiment_control/utils/network_hosts.py src/experiment_control/processes/stream_analysis.py src/experiment_control/processes/influx_writer.py src/experiment_control/sequencer/sequencer.py src/experiment_control/processes/interlock.py src/experiment_control/processes/watchdog.py --select C901
 
       - name: Run Python tests
         run: uv run python -m unittest discover -s tests -p "test_*.py" -q

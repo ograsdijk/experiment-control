@@ -17,6 +17,8 @@ from experiment_control.processes.device_router import (
     MirroredRoute,
     _MirroredDeviceWorker,
     _MirroredTask,
+    _ReplyItem,
+    _device_rpc_exception_error,
 )
 
 
@@ -24,8 +26,9 @@ class _CaptureWorker:
     def __init__(self) -> None:
         self.tasks = []
 
-    def submit(self, task: object) -> None:
+    def submit(self, task: object) -> bool:
         self.tasks.append(task)
+        return True
 
 
 class _CaptureManager:
@@ -93,6 +96,7 @@ class DeviceRouterFederationTests(unittest.TestCase):
                 lambda identity, resp: responses.append((identity, resp))
             )
             router._device_endpoints["dummy"] = "tcp://127.0.0.1:7001"
+            router._device_states["dummy"] = "STOPPING"
 
             router._dispatch_device_command(
                 b"client-1",
@@ -113,8 +117,23 @@ class DeviceRouterFederationTests(unittest.TestCase):
             self.assertEqual(task.request_id, "req-123")
             self.assertEqual(task.source_kind, "webui")
             self.assertEqual(task.source_id, "fastapi")
+            self.assertEqual(task.device_state, "STOPPING")
         finally:
             router.close()
+
+    def test_device_rpc_exception_timeout_maps_to_structured_error(self) -> None:
+        err = _device_rpc_exception_error(
+            zmq.Again(),
+            timeout_ms=1500,
+            device_id="trace1",
+            action="capabilities",
+        )
+        self.assertEqual(err.get("code"), "device_rpc_timeout")
+        self.assertEqual(err.get("device_id"), "trace1")
+        self.assertEqual(err.get("action"), "capabilities")
+        self.assertEqual(err.get("timeout_ms"), 1500)
+        self.assertTrue(bool(err.get("transient")))
+        self.assertTrue(bool(err.get("retryable")))
 
     def test_process_rpc_task_carries_action_and_source_fields(self) -> None:
         router = DeviceRouter(
@@ -133,7 +152,7 @@ class DeviceRouterFederationTests(unittest.TestCase):
             router._dispatch_process_rpc(
                 b"client-1",
                 {
-                    "type": "process.rpc",
+                    "type": "manager.processes.rpc",
                     "process_id": "sequencer",
                     "request_id": "req-outer",
                     "source_kind": "webui",
@@ -219,6 +238,7 @@ class DeviceRouterFederationTests(unittest.TestCase):
             manager_rpc="tcp://127.0.0.1:6002",
             manager_pub="tcp://127.0.0.1:6001",
             manager_timeout_ms=250,
+            queue_max=8,
         )
         task = _MirroredTask(
             identity=b"client-1",
@@ -245,6 +265,85 @@ class DeviceRouterFederationTests(unittest.TestCase):
         self.assertEqual(payload["capabilities"]["version"], 1)
         self.assertEqual(timeout_ms, 250)
 
+    def test_queue_full_returns_router_busy_for_device_command(self) -> None:
+        router = DeviceRouter(
+            external_rpc_bind="tcp://127.0.0.1:*",
+            process_id="device_router",
+            inflight_max=32,
+        )
+        try:
+            class _RejectWorker:
+                @staticmethod
+                def submit(task: object) -> bool:
+                    del task
+                    return False
+
+                @staticmethod
+                def queue_depth() -> int:
+                    return 32
+
+                @staticmethod
+                def queue_max() -> int:
+                    return 32
+
+                @staticmethod
+                def is_alive() -> bool:
+                    return True
+
+            responses = []
+            router._ensure_device_worker = lambda _device_id: _RejectWorker()  # type: ignore[method-assign]
+            router._send_external_response = (  # type: ignore[method-assign]
+                lambda identity, resp: responses.append((identity, resp))
+            )
+            router._device_endpoints["dummy"] = "tcp://127.0.0.1:7001"
+
+            router._dispatch_device_command(
+                b"client-1",
+                {
+                    "type": "command",
+                    "device_id": "dummy",
+                    "action": "get",
+                    "params": {},
+                },
+            )
+
+            self.assertEqual(len(responses), 1)
+            resp = responses[0][1]
+            self.assertFalse(bool(resp.get("ok")))
+            self.assertEqual(resp.get("error", {}).get("code"), "router_busy")
+            self.assertEqual(router._inflight_count, 0)  # noqa: SLF001
+        finally:
+            router.close()
+
+    def test_drain_replies_releases_inflight(self) -> None:
+        router = DeviceRouter(
+            external_rpc_bind="tcp://127.0.0.1:*",
+            process_id="device_router",
+        )
+        try:
+            sent = []
+
+            class _SocketStub:
+                @staticmethod
+                def send_multipart(parts):
+                    sent.append(parts)
+
+            router._external_rpc = _SocketStub()  # type: ignore[attr-defined]
+            router._inflight_count = 1  # noqa: SLF001
+            router._reply_queue.put_nowait(  # noqa: SLF001
+                _ReplyItem(
+                    identity=b"client-1",
+                    response={"ok": True},
+                    inflight_reserved=True,
+                )
+            )
+            router._drain_replies()  # noqa: SLF001
+            self.assertEqual(len(sent), 1)
+            self.assertEqual(router._inflight_count, 0)  # noqa: SLF001
+        finally:
+            router.close()
+
 
 if __name__ == "__main__":
     unittest.main()
+

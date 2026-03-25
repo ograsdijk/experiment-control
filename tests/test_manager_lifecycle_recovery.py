@@ -89,7 +89,7 @@ class ManagerLifecycleRecoveryTests(unittest.TestCase):
         ):
             identity_stale = Manager._route_internal_request(
                 mgr,  # type: ignore[arg-type]
-                {"type": "manager.identity"},
+                {"type": "manager.info.identity"},
             )
         self.assertTrue(identity_stale.get("ok"))
         stale_result = identity_stale.get("result", {})
@@ -112,7 +112,7 @@ class ManagerLifecycleRecoveryTests(unittest.TestCase):
         ):
             identity_active = Manager._route_internal_request(
                 mgr,  # type: ignore[arg-type]
-                {"type": "manager.identity"},
+                {"type": "manager.info.identity"},
             )
         self.assertTrue(identity_active.get("ok"))
         active_result = identity_active.get("result", {})
@@ -121,7 +121,7 @@ class ManagerLifecycleRecoveryTests(unittest.TestCase):
         cleanup_resp = Manager._route_internal_request(
             mgr,  # type: ignore[arg-type]
             {
-                "type": "manager.cleanup_orphans",
+                "type": "manager.control.cleanup_orphans",
                 "params": {"dry_run": True, "stale_only": True, "timeout_s": 2.0},
             },
         )
@@ -171,12 +171,12 @@ class ManagerLifecycleRecoveryTests(unittest.TestCase):
         mgr._publish_manager_event = mock.Mock()  # type: ignore[attr-defined]
         cleanup_resp = Manager._route_internal_request(
             mgr,  # type: ignore[arg-type]
-            {"type": "manager.cleanup_orphans", "params": {}},
+            {"type": "manager.control.cleanup_orphans", "params": {}},
         )
         self.assertTrue(cleanup_resp.get("ok"))
         identity_resp = Manager._route_internal_request(
             mgr,  # type: ignore[arg-type]
-            {"type": "manager.identity"},
+            {"type": "manager.info.identity"},
         )
         self.assertTrue(identity_resp.get("ok"))
         identity = identity_resp.get("result", {})
@@ -218,7 +218,7 @@ class ManagerLifecycleRecoveryTests(unittest.TestCase):
         resp = Manager._route_internal_request(
             mgr,  # type: ignore[arg-type]
             {
-                "type": "manager.cleanup_orphans",
+                "type": "manager.control.cleanup_orphans",
                 "params": {"dry_run": True, "stale_only": False, "timeout_s": 1.5},
             },
         )
@@ -235,7 +235,7 @@ class ManagerLifecycleRecoveryTests(unittest.TestCase):
         mgr._publish_manager_event = mock.Mock()  # type: ignore[attr-defined]
         resp = Manager._route_internal_request(
             mgr,  # type: ignore[arg-type]
-            {"type": "manager.cleanup_orphans", "params": "invalid"},
+            {"type": "manager.control.cleanup_orphans", "params": "invalid"},
         )
         self.assertFalse(resp.get("ok"))
         self.assertEqual(resp.get("error", {}).get("code"), "invalid_params")
@@ -294,3 +294,4 @@ class ManagerLifecycleRecoveryTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

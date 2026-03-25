@@ -63,7 +63,7 @@ class ManagerProcessGuardTests(unittest.TestCase):
         ):
             resp = Manager._route_internal_request(  # type: ignore[arg-type]
                 mgr,
-                {"type": "manager.identity"},
+                {"type": "manager.info.identity"},
             )
         self.assertTrue(resp.get("ok"))
         result = resp.get("result", {})
@@ -77,3 +77,4 @@ class ManagerProcessGuardTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

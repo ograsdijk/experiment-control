@@ -84,7 +84,7 @@ class PythonClientSdkTests(unittest.TestCase):
         client.transport.request = fake_request  # type: ignore[method-assign]
         result = client.process("sequencer").call("sequencer.start", {})
         self.assertEqual(result, {"state": "RUNNING"})
-        self.assertEqual(captured.get("type"), "process.rpc")
+        self.assertEqual(captured.get("type"), "manager.processes.rpc")
         self.assertEqual(captured.get("process_id"), "sequencer")
         request = captured.get("request")
         self.assertIsInstance(request, dict)

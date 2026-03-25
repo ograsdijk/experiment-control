@@ -64,7 +64,7 @@ def _wait_for_manager_identity(endpoint: str, *, timeout_s: float) -> dict[str, 
         request_id = uuid.uuid4().hex
         resp = _rpc_request(
             endpoint,
-            {"type": "manager.identity", "request_id": request_id},
+            {"type": "manager.info.identity", "request_id": request_id},
             timeout_ms=500,
         )
         if isinstance(resp, dict) and resp.get("ok"):
@@ -138,7 +138,7 @@ class WindowsLifecycleSmokeTests(unittest.TestCase):
         # Best-effort cleanup from prior interrupted test runs.
         _rpc_request(
             manager_rpc,
-            {"type": "manager.shutdown"},
+            {"type": "manager.control.shutdown"},
             timeout_ms=300,
         )
         time.sleep(0.3)
@@ -210,7 +210,7 @@ class WindowsLifecycleSmokeTests(unittest.TestCase):
                 _terminate_process(fastapi_proc)
             _rpc_request(
                 manager_rpc,
-                {"type": "manager.shutdown"},
+                {"type": "manager.control.shutdown"},
                 timeout_ms=700,
             )
             _terminate_process(manager_proc)
@@ -218,3 +218,4 @@ class WindowsLifecycleSmokeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

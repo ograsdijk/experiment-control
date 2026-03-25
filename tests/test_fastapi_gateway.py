@@ -33,6 +33,14 @@ class _StoppedThreadStub:
         return False
 
 
+class _ReaderStub:
+    def __init__(self) -> None:
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+
 class GatewayLifecycleTests(unittest.TestCase):
     @staticmethod
     def _wait_until(predicate, *, timeout_s: float = 2.0, sleep_s: float = 0.02) -> bool:
@@ -119,6 +127,61 @@ class GatewayLifecycleTests(unittest.TestCase):
         finally:
             hub.close()
             loop.close()
+
+    def test_stream_frame_hub_prunes_keys_by_capacity(self) -> None:
+        hub = StreamFrameHub(
+            "tcp://127.0.0.1:1",
+            topics=("manager.chunk_ready",),
+            max_stream_keys=2,
+            stream_key_ttl_s=600.0,
+        )
+        keys = [("dev-1", "a"), ("dev-2", "b"), ("dev-3", "c")]
+        readers = [_ReaderStub(), _ReaderStub(), _ReaderStub()]
+        now = time.monotonic()
+        for idx, key in enumerate(keys):
+            hub._readers[key] = readers[idx]  # noqa: SLF001
+            hub._last_seq[key] = idx  # noqa: SLF001
+            hub._stream_context[key] = (None, None)  # noqa: SLF001
+            hub._context_by_seq[key] = {}  # noqa: SLF001
+            with hub._lock:  # noqa: SLF001
+                hub._latest_frame[key] = {  # noqa: SLF001
+                    "topic": "manager.stream_frame",
+                    "payload": {"device_id": key[0], "stream": key[1]},
+                }
+            hub._touch_stream_key(key, now_mono=now + idx)  # noqa: SLF001
+        hub._prune_stream_keys(now_mono=now + 10.0)  # noqa: SLF001
+
+        self.assertEqual(len(hub._stream_key_order), 2)  # noqa: SLF001
+        self.assertNotIn(("dev-1", "a"), hub._readers)  # noqa: SLF001
+        self.assertTrue(readers[0].closed)
+        self.assertEqual(int(hub.stats().get("dropped_stream_keys_capacity", 0)), 1)
+
+    def test_stream_frame_hub_prunes_keys_by_ttl(self) -> None:
+        hub = StreamFrameHub(
+            "tcp://127.0.0.1:1",
+            topics=("manager.chunk_ready",),
+            max_stream_keys=10,
+            stream_key_ttl_s=1.0,
+        )
+        key = ("dev-1", "a")
+        reader = _ReaderStub()
+        hub._readers[key] = reader  # noqa: SLF001
+        hub._last_seq[key] = 1  # noqa: SLF001
+        hub._stream_context[key] = (None, None)  # noqa: SLF001
+        hub._context_by_seq[key] = {}  # noqa: SLF001
+        with hub._lock:  # noqa: SLF001
+            hub._latest_frame[key] = {  # noqa: SLF001
+                "topic": "manager.stream_frame",
+                "payload": {"device_id": key[0], "stream": key[1]},
+            }
+        now = time.monotonic()
+        hub._stream_key_last_seen[key] = now - 5.0  # noqa: SLF001
+        hub._stream_key_order[key] = None  # noqa: SLF001
+
+        hub._prune_stream_keys(now_mono=now)  # noqa: SLF001
+        self.assertNotIn(key, hub._readers)  # noqa: SLF001
+        self.assertTrue(reader.closed)
+        self.assertEqual(int(hub.stats().get("dropped_stream_keys_ttl", 0)), 1)
 
 
 if __name__ == "__main__":

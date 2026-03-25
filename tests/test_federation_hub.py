@@ -99,7 +99,7 @@ class FederationHubCapabilityTests(unittest.TestCase):
                         }
                     ],
                 }
-            if payload.get("action") == "telemetry.schema.list":
+            if payload.get("action") == "manager.telemetry.schema.list":
                 return {
                     "ok": True,
                     "result": {"devices": [{"device_id": "psu", "signals": [], "dtypes": [], "units": []}]},

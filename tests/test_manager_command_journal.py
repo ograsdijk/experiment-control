@@ -106,13 +106,13 @@ class ManagerCommandSourceTests(unittest.TestCase):
     def test_command_journal_status_and_tail_when_disabled(self) -> None:
         mgr = _build_manager()
         status_resp = Manager._route_internal_request(  # type: ignore[arg-type]
-            mgr, {"type": "manager.command_journal.status"}
+            mgr, {"type": "manager.commands.journal.status"}
         )
         self.assertTrue(status_resp.get("ok"))
         self.assertFalse(status_resp.get("result", {}).get("enabled"))
 
         tail_resp = Manager._route_internal_request(  # type: ignore[arg-type]
-            mgr, {"type": "manager.command_journal.tail", "params": {"limit": 5}}
+            mgr, {"type": "manager.commands.journal.tail", "params": {"limit": 5}}
         )
         self.assertFalse(tail_resp.get("ok"))
         self.assertEqual(tail_resp.get("error", {}).get("code"), "journal_disabled")
@@ -214,7 +214,7 @@ class ManagerCommandSourceTests(unittest.TestCase):
         resp = Manager._route_internal_request(  # type: ignore[arg-type]
             mgr,
             {
-                "type": "process.rpc",
+                "type": "manager.processes.rpc",
                 "request_id": "req-1",
                 "process_id": "sequencer",
                 "request": {
@@ -257,7 +257,7 @@ class ManagerCommandSourceTests(unittest.TestCase):
         resp = Manager._route_internal_request(  # type: ignore[arg-type]
             mgr,
             {
-                "type": "process.rpc",
+                "type": "manager.processes.rpc",
                 "process_id": "sequencer",
                 "request": {
                     "type": "sequencer.start",
@@ -281,7 +281,7 @@ class ManagerCommandSourceTests(unittest.TestCase):
         resp = Manager._route_internal_request(  # type: ignore[arg-type]
             mgr,
             {
-                "type": "process.start",
+                "type": "manager.processes.start",
                 "request_id": "req-start",
                 "process_id": "sequencer",
                 "source_kind": "webui",
@@ -294,7 +294,7 @@ class ManagerCommandSourceTests(unittest.TestCase):
         topic = publish_mock.call_args.args[0]
         payload = publish_mock.call_args.args[1]
         self.assertEqual(topic, "manager.command")
-        self.assertEqual(payload.get("action"), "process.start")
+        self.assertEqual(payload.get("action"), "manager.processes.start")
         self.assertEqual(payload.get("device_id"), "process:sequencer")
 
     def test_startup_sequence_does_not_double_connect_when_auto_connect_enabled(self) -> None:
@@ -378,3 +378,4 @@ class ManagerCommandSourceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

@@ -79,7 +79,7 @@ class ManagerTuiRpcTests(unittest.TestCase):
             fake = _StaleThenReplySocket()
             app._rpc = fake
 
-            resp = app._rpc_call({"type": "manager.identity"})
+            resp = app._rpc_call({"type": "manager.info.identity"})
 
             self.assertIsInstance(resp, dict)
             assert resp is not None
@@ -105,7 +105,7 @@ class ManagerTuiRpcTests(unittest.TestCase):
             app._rpc = timeout_sock
             app._new_rpc_socket = lambda: replacement  # type: ignore[method-assign]
 
-            resp = app._rpc_call({"type": "manager.identity"})
+            resp = app._rpc_call({"type": "manager.info.identity"})
 
             self.assertIsNone(resp)
             self.assertTrue(timeout_sock.closed)
@@ -156,7 +156,7 @@ class ManagerTuiRpcTests(unittest.TestCase):
                 calls,
                 [
                     "Reconnecting backend...",
-                    "manager.identity",
+                    "manager.info.identity",
                     "log_tail",
                     "refresh",
                     "Backend reconnected",
@@ -218,3 +218,4 @@ class ManagerTuiRpcTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

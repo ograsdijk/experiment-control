@@ -118,6 +118,56 @@ class HdfWriterEventModeTests(unittest.TestCase):
             )
         )
 
+    def test_measurement_schema_capabilities_hidden_when_not_configured(self) -> None:
+        writer = self._make_writer(event_log_mode="all")
+        member_names = set()
+        for member in writer._hdf_capability_members():  # noqa: SLF001
+            name = getattr(member, "name", None)
+            if isinstance(name, str):
+                member_names.add(name)
+                continue
+            if isinstance(member, dict):
+                raw = member.get("name")
+                if isinstance(raw, str):
+                    member_names.add(raw)
+        self.assertNotIn("hdf.measurement.schema.get", member_names)
+        self.assertNotIn("hdf.measurement.note", member_names)
+        self.assertIn("hdf.writing.start", member_names)
+        self.assertIn("hdf.writing.stop", member_names)
+
+    def test_measurement_schema_capabilities_present_when_configured(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            schema_path = Path(td) / "measurement.yaml"
+            schema_path.write_text(
+                yaml.safe_dump(
+                    {
+                        "version": 1,
+                        "profiles": [],
+                        "notes": {"fields": []},
+                    },
+                    sort_keys=False,
+                ),
+                encoding="utf-8",
+            )
+            writer = self._make_writer(
+                event_log_mode="all",
+                measurement_schema_path=str(schema_path),
+            )
+            member_names = set()
+            for member in writer._hdf_capability_members():  # noqa: SLF001
+                name = getattr(member, "name", None)
+                if isinstance(name, str):
+                    member_names.add(name)
+                    continue
+                if isinstance(member, dict):
+                    raw = member.get("name")
+                    if isinstance(raw, str):
+                        member_names.add(raw)
+            self.assertIn("hdf.measurement.schema.get", member_names)
+            self.assertIn("hdf.measurement.note", member_names)
+            self.assertIn("hdf.writing.start", member_names)
+            self.assertIn("hdf.writing.stop", member_names)
+
 
 class HdfWriterSequencerTests(unittest.TestCase):
     def test_lifecycle_start_appends_row_with_snapshot_id(self) -> None:
@@ -382,6 +432,104 @@ class HdfWriterStorageSafetyTests(unittest.TestCase):
                 )
 
 
+class HdfWriterWritingControlTests(unittest.TestCase):
+    def _make_writer(self, out_dir: str) -> HdfWriter:
+        return HdfWriter(
+            out_dir=out_dir,
+            filename=None,
+            manager_rpc="tcp://127.0.0.1:65531",
+            manager_pub="tcp://127.0.0.1:65532",
+            rpc_timeout_ms=2000,
+            timezone="America/Chicago",
+            rcvhwm=1000,
+            write_every_s=1.0,
+            buffer_max_messages=1000,
+            flush_every_n=10,
+            flush_every_s=1.0,
+            disabled_devices=[],
+            event_log_mode="all",
+        )
+
+    def test_writing_stop_then_start_roundtrip(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            writer = self._make_writer(str(root))
+            current_path = root / "current.h5"
+            h5 = h5py.File(current_path, "w")
+            try:
+                meta = writer._build_measurement_metadata(  # noqa: SLF001
+                    profile_id=None, values=None, require_profile=False
+                )
+                writer._configure_active_file(  # noqa: SLF001
+                    h5,
+                    write_every_s=1.0,
+                    load_manager_state=False,
+                    measurement_meta=meta,
+                )
+                stop_resp = writer._handle_rpc(  # noqa: SLF001
+                    {"request_id": "w1", "type": "hdf.writing.stop", "params": {}}
+                )
+                self.assertTrue(bool(stop_resp.get("ok")))
+                self.assertIsNone(writer._h5)  # noqa: SLF001
+                stop_result = stop_resp.get("result")
+                assert isinstance(stop_result, dict)
+                self.assertFalse(bool(stop_result.get("already_stopped")))
+
+                start_resp = writer._handle_rpc(  # noqa: SLF001
+                    {
+                        "request_id": "w2",
+                        "type": "hdf.writing.start",
+                        "params": {"filename": "resumed.h5"},
+                    }
+                )
+                self.assertTrue(bool(start_resp.get("ok")))
+                self.assertIsNotNone(writer._h5)  # noqa: SLF001
+                assert writer._h5 is not None  # noqa: SLF001
+                self.assertEqual(Path(writer._h5.filename).name, "resumed.h5")  # noqa: SLF001
+            finally:
+                writer.close()
+
+    def test_writing_stop_is_idempotent_when_inactive(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            writer = self._make_writer(str(Path(td)))
+            resp = writer._handle_rpc(  # noqa: SLF001
+                {"request_id": "w3", "type": "hdf.writing.stop", "params": {}}
+            )
+            self.assertTrue(bool(resp.get("ok")))
+            result = resp.get("result")
+            assert isinstance(result, dict)
+            self.assertTrue(bool(result.get("already_stopped")))
+
+    def test_writing_start_rejects_when_already_active(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            writer = self._make_writer(str(root))
+            h5 = h5py.File(root / "active.h5", "w")
+            try:
+                meta = writer._build_measurement_metadata(  # noqa: SLF001
+                    profile_id=None, values=None, require_profile=False
+                )
+                writer._configure_active_file(  # noqa: SLF001
+                    h5,
+                    write_every_s=1.0,
+                    load_manager_state=False,
+                    measurement_meta=meta,
+                )
+                resp = writer._handle_rpc(  # noqa: SLF001
+                    {
+                        "request_id": "w4",
+                        "type": "hdf.writing.start",
+                        "params": {"filename": "ignored.h5"},
+                    }
+                )
+                self.assertFalse(bool(resp.get("ok")))
+                error_obj = resp.get("error")
+                assert isinstance(error_obj, dict)
+                self.assertEqual(error_obj.get("code"), "already_writing")
+            finally:
+                writer.close()
+
+
 class HdfWriterStreamBufferTests(unittest.TestCase):
     def _make_writer(self, out_dir: str) -> HdfWriter:
         return HdfWriter(
@@ -492,6 +640,281 @@ class HdfWriterStreamBufferTests(unittest.TestCase):
                 self.assertEqual(list(datasets["context_id"][...]), [-1, -1])
 
 
+class HdfWriterContextResolutionTests(unittest.TestCase):
+    @staticmethod
+    def _make_writer(out_dir: str) -> HdfWriter:
+        return HdfWriter(
+            out_dir=out_dir,
+            filename=None,
+            manager_rpc="tcp://127.0.0.1:65531",
+            manager_pub="tcp://127.0.0.1:65532",
+            rpc_timeout_ms=2000,
+            timezone="America/Chicago",
+            rcvhwm=1000,
+            write_every_s=1.0,
+            buffer_max_messages=1000,
+            flush_every_n=10,
+            flush_every_s=1.0,
+            disabled_devices=[],
+            event_log_mode="all",
+        )
+
+    @staticmethod
+    def _u16_payload(value: int) -> bytes:
+        return np.asarray([value], dtype=np.uint16).tobytes()
+
+    @staticmethod
+    def _fake_reader() -> object:
+        class _Layout:
+            dtype = np.dtype("uint16")
+            shape = (1,)
+
+        class _Reader:
+            layout = _Layout()
+
+        return _Reader()
+
+    def test_exact_seq_context_resolution(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            writer = self._make_writer(str(root))
+            h5_path = root / "context_exact.h5"
+            with h5py.File(h5_path, "w") as h5:
+                meta = writer._build_measurement_metadata(  # noqa: SLF001
+                    profile_id=None,
+                    values=None,
+                    require_profile=False,
+                )
+                writer._configure_active_file(  # noqa: SLF001
+                    h5,
+                    write_every_s=1.0,
+                    load_manager_state=False,
+                    measurement_meta=meta,
+                )
+                key = ("trace1", "trace")
+                writer._store_context_for_seq(  # noqa: SLF001
+                    key=key,
+                    seq=5,
+                    context_id=42,
+                    now_mono=10.0,
+                )
+                writer._append_chunk_ready_events(  # noqa: SLF001
+                    key=key,
+                    reader=self._fake_reader(),
+                    events=[
+                        {
+                            "seq": 5,
+                            "payload": self._u16_payload(7),
+                            "t0_mono_ns": 11,
+                            "t0_wall_ns": 12,
+                        }
+                    ],
+                    initial_last_seq=4,
+                    now_mono=10.0,
+                )
+                self.assertEqual(writer._context_resolved_exact, 1)  # noqa: SLF001
+                writer._write_stream_buffers()  # noqa: SLF001
+                ds = writer._stream_datasets[("trace1", "trace", 1)]["context_id"]  # noqa: SLF001
+                self.assertEqual(list(ds[...]), [42])
+
+    def test_late_context_resolution(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            writer = self._make_writer(str(root))
+            h5_path = root / "context_late.h5"
+            with h5py.File(h5_path, "w") as h5:
+                meta = writer._build_measurement_metadata(  # noqa: SLF001
+                    profile_id=None,
+                    values=None,
+                    require_profile=False,
+                )
+                writer._configure_active_file(  # noqa: SLF001
+                    h5,
+                    write_every_s=1.0,
+                    load_manager_state=False,
+                    measurement_meta=meta,
+                )
+                key = ("trace1", "trace")
+                writer._append_chunk_ready_events(  # noqa: SLF001
+                    key=key,
+                    reader=self._fake_reader(),
+                    events=[
+                        {
+                            "seq": 1,
+                            "payload": self._u16_payload(1),
+                            "t0_mono_ns": 101,
+                            "t0_wall_ns": 102,
+                        }
+                    ],
+                    initial_last_seq=0,
+                    now_mono=1.0,
+                )
+                self.assertEqual(len(writer._stream_pending_by_seq[key]), 1)  # noqa: SLF001
+                writer._store_context_for_seq(  # noqa: SLF001
+                    key=key,
+                    seq=1,
+                    context_id=9,
+                    now_mono=1.2,
+                )
+                writer._resolve_pending_stream_event(  # noqa: SLF001
+                    key=key,
+                    seq=1,
+                    context_id=9,
+                )
+                self.assertEqual(writer._context_late_resolved, 1)  # noqa: SLF001
+                writer._write_stream_buffers()  # noqa: SLF001
+                ds = writer._stream_datasets[("trace1", "trace", 1)]["context_id"]  # noqa: SLF001
+                self.assertEqual(list(ds[...]), [9])
+
+    def test_pending_context_ttl_expires_to_minus_one(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            writer = self._make_writer(str(root))
+            writer._context_resolve_ttl_s = 0.01  # noqa: SLF001
+            h5_path = root / "context_ttl.h5"
+            with h5py.File(h5_path, "w") as h5:
+                meta = writer._build_measurement_metadata(  # noqa: SLF001
+                    profile_id=None,
+                    values=None,
+                    require_profile=False,
+                )
+                writer._configure_active_file(  # noqa: SLF001
+                    h5,
+                    write_every_s=1.0,
+                    load_manager_state=False,
+                    measurement_meta=meta,
+                )
+                key = ("trace1", "trace")
+                writer._append_chunk_ready_events(  # noqa: SLF001
+                    key=key,
+                    reader=self._fake_reader(),
+                    events=[
+                        {
+                            "seq": 1,
+                            "payload": self._u16_payload(1),
+                            "t0_mono_ns": 101,
+                            "t0_wall_ns": 102,
+                        }
+                    ],
+                    initial_last_seq=0,
+                    now_mono=1.0,
+                )
+                writer._expire_pending_context(key=key, now_mono=1.02)  # noqa: SLF001
+                self.assertEqual(writer._context_written_minus1_missing, 1)  # noqa: SLF001
+                writer._write_stream_buffers()  # noqa: SLF001
+                ds = writer._stream_datasets[("trace1", "trace", 1)]["context_id"]  # noqa: SLF001
+                self.assertEqual(list(ds[...]), [-1])
+
+    def test_pending_context_overflow_evicts_oldest(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            writer = self._make_writer(str(root))
+            writer._context_pending_max_per_stream = 2  # noqa: SLF001
+            h5_path = root / "context_overflow.h5"
+            with h5py.File(h5_path, "w") as h5:
+                meta = writer._build_measurement_metadata(  # noqa: SLF001
+                    profile_id=None,
+                    values=None,
+                    require_profile=False,
+                )
+                writer._configure_active_file(  # noqa: SLF001
+                    h5,
+                    write_every_s=1.0,
+                    load_manager_state=False,
+                    measurement_meta=meta,
+                )
+                key = ("trace1", "trace")
+                writer._append_chunk_ready_events(  # noqa: SLF001
+                    key=key,
+                    reader=self._fake_reader(),
+                    events=[
+                        {
+                            "seq": 1,
+                            "payload": self._u16_payload(1),
+                            "t0_mono_ns": 101,
+                            "t0_wall_ns": 102,
+                        },
+                        {
+                            "seq": 2,
+                            "payload": self._u16_payload(2),
+                            "t0_mono_ns": 111,
+                            "t0_wall_ns": 112,
+                        },
+                        {
+                            "seq": 3,
+                            "payload": self._u16_payload(3),
+                            "t0_mono_ns": 121,
+                            "t0_wall_ns": 122,
+                        },
+                    ],
+                    initial_last_seq=0,
+                    now_mono=1.0,
+                )
+                pending = writer._stream_pending_by_seq[key]  # noqa: SLF001
+                self.assertEqual(sorted(pending.keys()), [2, 3])
+                self.assertEqual(writer._context_evicted_pending_overflow, 1)  # noqa: SLF001
+                self.assertEqual(writer._context_written_minus1_missing, 1)  # noqa: SLF001
+
+    def test_missing_context_does_not_reuse_previous_context(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            writer = self._make_writer(str(root))
+            writer._context_resolve_ttl_s = 0.01  # noqa: SLF001
+            h5_path = root / "context_no_sticky.h5"
+            with h5py.File(h5_path, "w") as h5:
+                meta = writer._build_measurement_metadata(  # noqa: SLF001
+                    profile_id=None,
+                    values=None,
+                    require_profile=False,
+                )
+                writer._configure_active_file(  # noqa: SLF001
+                    h5,
+                    write_every_s=1.0,
+                    load_manager_state=False,
+                    measurement_meta=meta,
+                )
+                key = ("trace1", "trace")
+                writer._store_context_for_seq(  # noqa: SLF001
+                    key=key,
+                    seq=10,
+                    context_id=77,
+                    now_mono=1.0,
+                )
+                writer._append_chunk_ready_events(  # noqa: SLF001
+                    key=key,
+                    reader=self._fake_reader(),
+                    events=[
+                        {
+                            "seq": 10,
+                            "payload": self._u16_payload(10),
+                            "t0_mono_ns": 201,
+                            "t0_wall_ns": 202,
+                        }
+                    ],
+                    initial_last_seq=9,
+                    now_mono=1.0,
+                )
+                writer._write_stream_buffers()  # noqa: SLF001
+                writer._append_chunk_ready_events(  # noqa: SLF001
+                    key=key,
+                    reader=self._fake_reader(),
+                    events=[
+                        {
+                            "seq": 11,
+                            "payload": self._u16_payload(11),
+                            "t0_mono_ns": 211,
+                            "t0_wall_ns": 212,
+                        }
+                    ],
+                    initial_last_seq=10,
+                    now_mono=1.01,
+                )
+                writer._expire_pending_context(key=key, now_mono=1.03)  # noqa: SLF001
+                writer._write_stream_buffers()  # noqa: SLF001
+                ds = writer._stream_datasets[("trace1", "trace", 1)]["context_id"]  # noqa: SLF001
+                self.assertEqual(list(ds[...]), [77, -1])
+
+
 class HdfWriterContextColumnTests(unittest.TestCase):
     def _make_writer(self, out_dir: str) -> HdfWriter:
         return HdfWriter(
@@ -594,6 +1017,7 @@ class HdfWriterCompressionTests(unittest.TestCase):
                     [""],
                 )
                 self.assertEqual(ds.compression, "lzf")
+                self.assertEqual(ds.chunks, (64,))
 
     def test_stream_data_dataset_uses_lzf(self) -> None:
         with tempfile.TemporaryDirectory() as td:
