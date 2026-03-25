@@ -14,7 +14,7 @@ class ProcessAPI(ClientFacadeBase):
         retries: int | None = None,
     ) -> Any:
         return self._request_result(
-            {"type": "process.list_status"},
+            {"type": "manager.processes.list"},
             timeout_ms=timeout_ms,
             retries=retries,
         )
@@ -27,7 +27,7 @@ class ProcessAPI(ClientFacadeBase):
         retries: int | None = None,
     ) -> Any:
         return self._request_result(
-            {"type": "process.get", "process_id": str(process_id)},
+            {"type": "manager.processes.get", "process_id": str(process_id)},
             timeout_ms=timeout_ms,
             retries=retries,
         )
@@ -40,7 +40,7 @@ class ProcessAPI(ClientFacadeBase):
         retries: int | None = None,
     ) -> Any:
         return self._request_result(
-            {"type": "process.start", "process_id": str(process_id)},
+            {"type": "manager.processes.start", "process_id": str(process_id)},
             timeout_ms=timeout_ms,
             retries=retries,
         )
@@ -53,7 +53,7 @@ class ProcessAPI(ClientFacadeBase):
         retries: int | None = None,
     ) -> Any:
         return self._request_result(
-            {"type": "process.stop", "process_id": str(process_id)},
+            {"type": "manager.processes.stop", "process_id": str(process_id)},
             timeout_ms=timeout_ms,
             retries=retries,
         )
@@ -66,7 +66,7 @@ class ProcessAPI(ClientFacadeBase):
         retries: int | None = None,
     ) -> Any:
         return self._request_result(
-            {"type": "process.restart", "process_id": str(process_id)},
+            {"type": "manager.processes.restart", "process_id": str(process_id)},
             timeout_ms=timeout_ms,
             retries=retries,
         )
@@ -81,7 +81,7 @@ class ProcessAPI(ClientFacadeBase):
         retries: int | None = None,
     ) -> Json:
         payload: Json = {
-            "type": "process.rpc",
+            "type": "manager.processes.rpc",
             "process_id": str(process_id),
             "request": {"type": str(action), "params": dict(params or {})},
         }
@@ -97,7 +97,7 @@ class ProcessAPI(ClientFacadeBase):
         retries: int | None = None,
     ) -> Any:
         payload: Json = {
-            "type": "process.rpc",
+            "type": "manager.processes.rpc",
             "process_id": str(process_id),
             "request": {"type": str(action), "params": dict(params or {})},
         }
@@ -175,4 +175,5 @@ class ProcessHandle:
             timeout_ms=timeout_ms,
             retries=retries,
         )
+
 

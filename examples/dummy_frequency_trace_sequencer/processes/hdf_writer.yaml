@@ -15,7 +15,7 @@ init_kwargs:
   flush_every_s: 2.0
   disabled_devices: []
   event_log_mode: failures_only
-  measurement_schema_path: examples/dummy_frequency_trace_sequencer/measurement.yaml
+  # measurement_schema_path: examples/dummy_frequency_trace_sequencer/measurement.yaml
 restart_policy: NEVER
 heartbeat_timeout_s: 3.0
 shutdown_timeout_s: 3.0

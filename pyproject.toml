@@ -33,7 +33,7 @@ experiment-control-stack = "experiment_control.cli.run_stack:main"
 experiment-control-instance-lock-status = "experiment_control.cli.instance_lock_status:main"
 
 [build-system]
-requires = ["uv_build>=0.9.26,<0.10.0"]
+requires = ["uv_build>=0.9.26,<0.11.0"]
 build-backend = "uv_build"
 
 [dependency-groups]

@@ -106,7 +106,7 @@ class LinienDriver:
     ) -> None:
         if self._remote_params is None:
             raise RuntimeError("Not connected")
-        self._maybe_refresh(max_age_s)
+        self._maybe_refresh()
         if p is not None:
             self._remote_params.p.value = int(p)
         if i is not None:

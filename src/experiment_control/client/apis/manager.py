@@ -14,7 +14,7 @@ class ManagerAPI(ClientFacadeBase):
         retries: int | None = None,
     ) -> Any:
         return self._request_result(
-            {"type": "manager.identity"},
+            {"type": "manager.info.identity"},
             timeout_ms=timeout_ms,
             retries=retries,
         )
@@ -26,7 +26,7 @@ class ManagerAPI(ClientFacadeBase):
         retries: int | None = None,
     ) -> Any:
         return self._request_result(
-            {"type": "manager.shutdown"},
+            {"type": "manager.control.shutdown"},
             timeout_ms=timeout_ms,
             retries=retries,
         )
@@ -42,7 +42,7 @@ class ManagerAPI(ClientFacadeBase):
     ) -> Any:
         return self._request_result(
             {
-                "type": "manager.cleanup_orphans",
+                "type": "manager.control.cleanup_orphans",
                 "params": {
                     "dry_run": bool(dry_run),
                     "stale_only": bool(stale_only),
@@ -60,7 +60,7 @@ class ManagerAPI(ClientFacadeBase):
         retries: int | None = None,
     ) -> Any:
         return self._request_result(
-            {"type": "manager.command_journal.status"},
+            {"type": "manager.commands.journal.status"},
             timeout_ms=timeout_ms,
             retries=retries,
         )
@@ -73,7 +73,7 @@ class ManagerAPI(ClientFacadeBase):
         retries: int | None = None,
     ) -> Any:
         return self._request_result(
-            {"type": "manager.command_journal.tail", "params": dict(params or {})},
+            {"type": "manager.commands.journal.tail", "params": dict(params or {})},
             timeout_ms=timeout_ms,
             retries=retries,
         )
@@ -86,7 +86,7 @@ class ManagerAPI(ClientFacadeBase):
         retries: int | None = None,
     ) -> Any:
         return self._request_result(
-            {"type": "manager.log.tail", "params": dict(params or {})},
+            {"type": "manager.logs.tail", "params": dict(params or {})},
             timeout_ms=timeout_ms,
             retries=retries,
         )
@@ -98,8 +98,9 @@ class ManagerAPI(ClientFacadeBase):
         retries: int | None = None,
     ) -> Any:
         return self._request_result(
-            {"type": "telemetry.snapshot"},
+            {"type": "manager.telemetry.snapshot"},
             timeout_ms=timeout_ms,
             retries=retries,
         )
+
 

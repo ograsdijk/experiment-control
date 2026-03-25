@@ -169,7 +169,7 @@ def _parse_command_journal(
         value = raw.get(name, default)
         try:
             parsed = int(value)
-        except Exception as e:
+        except (TypeError, ValueError, OverflowError) as e:
             raise ConfigError(
                 f"manager.command_journal.{name}",
                 f"must be an int: {e}",
@@ -198,7 +198,7 @@ def _parse_command_journal(
     else:
         try:
             retention_max_rows = int(retention_max_rows_raw)
-        except Exception as e:
+        except (TypeError, ValueError, OverflowError) as e:
             raise ConfigError(
                 "manager.command_journal.retention.max_rows",
                 f"must be an int or null: {e}",
@@ -216,7 +216,7 @@ def _parse_command_journal(
     else:
         try:
             retention_max_age_days = float(retention_max_age_days_raw)
-        except Exception as e:
+        except (TypeError, ValueError, OverflowError) as e:
             raise ConfigError(
                 "manager.command_journal.retention.max_age_days",
                 f"must be a float or null: {e}",
@@ -314,10 +314,10 @@ def _shutdown_manager(manager_rpc: str) -> None:
     sock.setsockopt(zmq.RCVTIMEO, 300)
     sock.connect(manager_rpc)
     try:
-        sock.send(json_dumps({"type": "manager.shutdown"}))
+        sock.send(json_dumps({"type": "manager.control.shutdown"}))
         if sock.poll(300, zmq.POLLIN):
             sock.recv()
-    except BaseException:
+    except (zmq.ZMQError, TypeError, ValueError):
         pass
     sock.close(0)
 
@@ -328,15 +328,15 @@ def _wait_for_exit(proc: subprocess.Popen[str], timeout_s: float) -> None:
     try:
         proc.wait(timeout=timeout_s)
         return
-    except Exception:
+    except subprocess.TimeoutExpired:
         pass
     try:
         proc.terminate()
-    except Exception:
+    except OSError:
         pass
     try:
         proc.wait(timeout=3.0)
-    except Exception:
+    except subprocess.TimeoutExpired:
         pass
 
 
@@ -368,7 +368,7 @@ def _probe_manager_ready(
     sock.connect(manager_rpc)
     request_id = f"startup-{time.monotonic_ns()}"
     try:
-        sock.send(json_dumps({"type": "manager.identity", "request_id": request_id}))
+        sock.send(json_dumps({"type": "manager.info.identity", "request_id": request_id}))
         if not sock.poll(int(timeout_ms), zmq.POLLIN):
             return False
         raw = sock.recv()
@@ -388,7 +388,7 @@ def _probe_manager_ready(
         if not isinstance(result, dict):
             return False
         return str(result.get("instance_id", "")) == expected_instance_id
-    except Exception:
+    except (zmq.ZMQError, TypeError, ValueError):
         return False
     finally:
         sock.close(0)
@@ -657,6 +657,24 @@ def main(argv: list[str] | None = None) -> None:
                 telemetry_stale_s=float(manager_raw.get("telemetry_stale_s", 10.0)),
                 device_rpc_timeout_ms=int(manager_raw.get("device_rpc_timeout_ms", 1500)),
                 interceptor_rpc_timeout_ms=int(manager_raw.get("interceptor_rpc_timeout_ms", 500)),
+                router_manager_worker_queue_max=int(
+                    manager_raw.get("router_manager_worker_queue_max", 8192)
+                ),
+                router_process_worker_queue_max=int(
+                    manager_raw.get("router_process_worker_queue_max", 8192)
+                ),
+                router_device_worker_queue_max=int(
+                    manager_raw.get("router_device_worker_queue_max", 16384)
+                ),
+                router_mirrored_worker_queue_max=int(
+                    manager_raw.get("router_mirrored_worker_queue_max", 8192)
+                ),
+                router_reply_queue_max=int(
+                    manager_raw.get("router_reply_queue_max", 32768)
+                ),
+                router_inflight_max=int(
+                    manager_raw.get("router_inflight_max", 32768)
+                ),
                 auto_connect_on_register=bool(
                     manager_raw.get("auto_connect_on_register", True)
                 ),
@@ -671,6 +689,18 @@ def main(argv: list[str] | None = None) -> None:
                 command_journal_retention_max_age_days=command_journal[
                     "retention_max_age_days"
                 ],
+                telemetry_cache_max_devices=int(
+                    manager_raw.get("telemetry_cache_max_devices", 4096)
+                ),
+                telemetry_cache_max_signals_per_device=int(
+                    manager_raw.get("telemetry_cache_max_signals_per_device", 4096)
+                ),
+                chunk_cache_max_devices=int(
+                    manager_raw.get("chunk_cache_max_devices", 4096)
+                ),
+                chunk_cache_max_streams_per_device=int(
+                    manager_raw.get("chunk_cache_max_streams_per_device", 2048)
+                ),
                 manager_log_stderr=manager_logging["stderr"],
                 manager_log_file=manager_logging["file"],
                 manager_log_min_level=manager_logging["min_level"],
@@ -751,3 +781,4 @@ def main(argv: list[str] | None = None) -> None:
 
 if __name__ == "__main__":
     main()
+

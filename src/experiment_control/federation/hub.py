@@ -335,7 +335,7 @@ class FederationHub:
 
     def _refresh_peer_metadata(self, peer_rt: PeerRuntime) -> None:
         config_resp = self._rpc_call(peer_rt, {"type": "device.config.list"})
-        schema_resp = self._rpc_call(peer_rt, {"action": "telemetry.schema.list"})
+        schema_resp = self._rpc_call(peer_rt, {"action": "manager.telemetry.schema.list"})
 
         config_items: list[Json] = []
         if (
@@ -583,3 +583,4 @@ class FederationHub:
             "origin_instance_id": self._instance_id,
             "hop_count": hop_count + 1,
         }
+

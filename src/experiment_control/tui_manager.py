@@ -815,7 +815,7 @@ class ManagerTUI(App):
     def _load_manager_log_tail_bootstrap(self) -> None:
         resp = self._rpc_call(
             {
-                "type": "manager.log.tail",
+                "type": "manager.logs.tail",
                 "params": {"limit": self._log_tail_bootstrap_limit},
             }
         )
@@ -965,7 +965,7 @@ class ManagerTUI(App):
     def _process_rpc(self, process_id: str, request: Json) -> Json | None:
         resp = self._rpc_call(
             {
-                "type": "process.rpc",
+                "type": "manager.processes.rpc",
                 "process_id": process_id,
                 "request": request,
                 "source_kind": "tui",
@@ -1147,7 +1147,7 @@ class ManagerTUI(App):
                 self._device_status = next_status
                 snapshot_changed = True
 
-        proc_resp = self._rpc_call({"type": "process.list_status"})
+        proc_resp = self._rpc_call({"type": "manager.processes.list"})
         if proc_resp and proc_resp.get("ok"):
             raw = proc_resp.get("result", [])
             if isinstance(raw, list):
@@ -2007,7 +2007,7 @@ class ManagerTUI(App):
         self._log_action_result("Reconnecting backend...")
         self._reset_rpc_socket()
         self._request_sub_reconnect()
-        ready = bool(self._rpc_call({"type": "manager.identity"}))
+        ready = bool(self._rpc_call({"type": "manager.info.identity"}))
         if not ready:
             self._set_backend_status("Backend: unavailable")
             self._log_action_result("Backend reconnect failed")
@@ -2171,7 +2171,7 @@ class ManagerTUI(App):
 
     def action_quit(self) -> None:
         try:
-            self._rpc_call({"type": "manager.shutdown"})
+            self._rpc_call({"type": "manager.control.shutdown"})
         except Exception:
             pass
         self.exit()
@@ -2474,7 +2474,7 @@ class ManagerTUI(App):
             if self._status_process_started(proc):
                 self.notify(f"Process already started: {process_id}")
                 return
-            resp = self._rpc_call({"type": "process.start", "process_id": process_id})
+            resp = self._rpc_call({"type": "manager.processes.start", "process_id": process_id})
             self._notify_rpc_result("Process start", process_id, resp)
             return
 
@@ -2495,7 +2495,7 @@ class ManagerTUI(App):
                 if not process_id:
                     continue
                 resp = self._rpc_call(
-                    {"type": "process.start", "process_id": process_id}
+                    {"type": "manager.processes.start", "process_id": process_id}
                 )
                 self._notify_rpc_result("Process start", process_id, resp)
             return
@@ -2520,7 +2520,7 @@ class ManagerTUI(App):
                 if not confirmed:
                     return
                 resp = self._rpc_call(
-                    {"type": "process.stop", "process_id": process_id}
+                    {"type": "manager.processes.stop", "process_id": process_id}
                 )
                 self._notify_rpc_result("Process stop", process_id, resp)
 
@@ -2557,7 +2557,7 @@ class ManagerTUI(App):
                 if not confirmed:
                     return
                 resp = self._rpc_call(
-                    {"type": "process.restart", "process_id": process_id}
+                    {"type": "manager.processes.restart", "process_id": process_id}
                 )
                 self._notify_rpc_result("Process restart", process_id, resp)
 
@@ -2623,7 +2623,7 @@ class ManagerTUI(App):
                     if not process_id:
                         continue
                     resp = self._rpc_call(
-                        {"type": "process.stop", "process_id": process_id}
+                        {"type": "manager.processes.stop", "process_id": process_id}
                     )
                     if resp and resp.get("ok"):
                         ok_count += 1
@@ -2671,3 +2671,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

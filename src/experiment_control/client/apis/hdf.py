@@ -46,6 +46,37 @@ class HdfAPI(ClientFacadeBase):
     def status(self, *, timeout_ms: int | None = None, retries: int | None = None) -> Any:
         return self.call("hdf.status", {}, timeout_ms=timeout_ms, retries=retries)
 
+    def writing_start(
+        self,
+        *,
+        filename: str | None = None,
+        disabled_devices: list[str] | None = None,
+        measurement_profile: str | None = None,
+        measurement_values: Json | None = None,
+        timeout_ms: int | None = None,
+        retries: int | None = None,
+    ) -> Any:
+        params: Json = {}
+        if filename is not None:
+            params["filename"] = str(filename)
+        if disabled_devices is not None:
+            params["disabled_devices"] = [str(item) for item in disabled_devices]
+        if measurement_profile is not None:
+            params["measurement_profile"] = str(measurement_profile)
+        if measurement_values is not None:
+            params["measurement_values"] = dict(measurement_values)
+        return self.call(
+            "hdf.writing.start", params, timeout_ms=timeout_ms, retries=retries
+        )
+
+    def writing_stop(
+        self,
+        *,
+        timeout_ms: int | None = None,
+        retries: int | None = None,
+    ) -> Any:
+        return self.call("hdf.writing.stop", {}, timeout_ms=timeout_ms, retries=retries)
+
     def rotate(
         self,
         *,
@@ -102,4 +133,3 @@ class HdfAPI(ClientFacadeBase):
             timeout_ms=timeout_ms,
             retries=retries,
         )
-

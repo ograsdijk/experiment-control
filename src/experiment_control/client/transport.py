@@ -113,10 +113,10 @@ class RpcTransport:
         req_type = str(outbound.get("type", "")).strip()
         if req_type in {
             "command",
-            "process.rpc",
-            "process.start",
-            "process.stop",
-            "process.restart",
+            "manager.processes.rpc",
+            "manager.processes.start",
+            "manager.processes.stop",
+            "manager.processes.restart",
             "device.connect",
             "device.disconnect",
             "device.driver.start",
@@ -127,7 +127,7 @@ class RpcTransport:
             if outbound.get("source_id") is None:
                 outbound["source_id"] = self._settings.source_id
 
-        if req_type == "process.rpc":
+        if req_type == "manager.processes.rpc":
             request_raw = outbound.get("request")
             if isinstance(request_raw, dict):
                 request = dict(request_raw)

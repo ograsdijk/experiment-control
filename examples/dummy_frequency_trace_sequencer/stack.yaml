@@ -18,6 +18,7 @@ processes:
     - processes/sequencer.yaml
     - processes/stream_analysis.yaml
     - processes/hdf_writer.yaml
+    - processes/influx_writer.yaml
 
 tui:
   enabled: true
