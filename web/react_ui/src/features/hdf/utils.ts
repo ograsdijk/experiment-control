@@ -168,6 +168,8 @@ export function sameHdfWriterStatus(
     return false;
   }
   return (
+    current.writingActive === nextStatus.writingActive &&
+    current.autostartWriting === nextStatus.autostartWriting &&
     current.filePath === nextStatus.filePath &&
     current.fileName === nextStatus.fileName &&
     current.pending === nextStatus.pending &&

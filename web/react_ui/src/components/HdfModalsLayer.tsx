@@ -62,8 +62,12 @@ export function HdfModalsLayer({ hdf, renderMeasurementFieldInput }: Props) {
         hdfStatusBusy={hdf.hdfStatusBusy}
         hdfCommandsBlocked={hdf.hdfCommandsBlocked}
         hdfSupportsStatus={hdf.hdfSupportsStatus}
+        hdfSupportsWritingStart={hdf.hdfSupportsWritingStart}
+        hdfSupportsWritingStop={hdf.hdfSupportsWritingStop}
         hdfAnyCommandBusy={hdf.hdfAnyCommandBusy}
         onRefreshStatus={hdf.executeHdfStatus}
+        onExecuteWritingStart={hdf.executeHdfWritingStart}
+        onExecuteWritingStop={hdf.executeHdfWritingStop}
         hdfProcessCapabilitiesError={hdf.hdfProcessCapabilitiesError ?? null}
         hdfMeasurementSchemaConfigured={hdf.hdfMeasurementSchemaConfigured}
         hdfMeasurementSchemaAvailable={hdf.hdfMeasurementSchemaAvailable}
@@ -94,6 +98,8 @@ export function HdfModalsLayer({ hdf, renderMeasurementFieldInput }: Props) {
         onSetRotateFieldValue={hdf.setHdfRotateFieldValue}
         onSetRotateFieldUseCustom={hdf.setHdfRotateFieldUseCustom}
         hdfRotateBusy={hdf.hdfRotateBusy}
+        hdfWritingStartBusy={hdf.hdfWritingStartBusy}
+        hdfWritingStopBusy={hdf.hdfWritingStopBusy}
         hdfSupportsRotate={hdf.hdfSupportsRotate}
         onExecuteRotate={hdf.executeHdfRotate}
         hdfSupportsMeasurementNote={hdf.hdfSupportsMeasurementNote}

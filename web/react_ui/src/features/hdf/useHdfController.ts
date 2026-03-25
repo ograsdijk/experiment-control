@@ -132,6 +132,14 @@ export function useHdfController({
     "hdf.devices.disable"
   );
   const hdfSupportsRotate = supportsProcessCapability(hdfCapabilities, "hdf.rotate");
+  const hdfSupportsWritingStart = supportsProcessCapability(
+    hdfCapabilities,
+    "hdf.writing.start"
+  );
+  const hdfSupportsWritingStop = supportsProcessCapability(
+    hdfCapabilities,
+    "hdf.writing.stop"
+  );
   const hdfSupportsMeasurementSchemaGet = supportsProcessCapability(
     hdfCapabilities,
     "hdf.measurement.schema.get"
@@ -145,6 +153,8 @@ export function useHdfController({
   const hdfDevicesEnableBusy = Boolean(hdfCommandBusyByAction["hdf.devices.enable"]);
   const hdfDevicesDisableBusy = Boolean(hdfCommandBusyByAction["hdf.devices.disable"]);
   const hdfRotateBusy = Boolean(hdfCommandBusyByAction["hdf.rotate"]);
+  const hdfWritingStartBusy = Boolean(hdfCommandBusyByAction["hdf.writing.start"]);
+  const hdfWritingStopBusy = Boolean(hdfCommandBusyByAction["hdf.writing.stop"]);
   const hdfMeasurementNoteBusy = Boolean(hdfCommandBusyByAction["hdf.measurement.note"]);
   const hdfAnyCommandBusy = Object.values(hdfCommandBusyByAction).some(Boolean);
   const hdfCommandsBlocked = !hdfWriterProcessId || !hdfRpcAvailable;
@@ -224,6 +234,8 @@ export function useHdfController({
           setHdfStatusByProcessId((prev) => {
             const current = prev[processId];
             const nextStatus: HdfWriterStatus = {
+              writingActive: current?.writingActive ?? false,
+              autostartWriting: current?.autostartWriting ?? false,
               filePath: current?.filePath ?? null,
               fileName: current?.fileName ?? null,
               pending: current?.pending ?? null,
@@ -252,6 +264,8 @@ export function useHdfController({
           return;
         }
         const result = resp.result as {
+          writing_active?: unknown;
+          autostart_writing?: unknown;
           file?: unknown;
           pending?: unknown;
           dropped?: unknown;
@@ -270,6 +284,8 @@ export function useHdfController({
           measurement_schema_path?: unknown;
           measurement_schema_error?: unknown;
         };
+        const writingActive = result.writing_active === true;
+        const autostartWriting = result.autostart_writing === true;
         const filePath = typeof result.file === "string" ? result.file : null;
         const pending =
           typeof result.pending === "number" && Number.isFinite(result.pending)
@@ -332,6 +348,8 @@ export function useHdfController({
         setHdfStatusByProcessId((prev) => {
           const current = prev[processId];
           const nextStatus: HdfWriterStatus = {
+            writingActive,
+            autostartWriting,
             filePath,
             fileName: fileNameFromPath(filePath),
             pending,
@@ -362,6 +380,8 @@ export function useHdfController({
         setHdfStatusByProcessId((prev) => {
           const current = prev[processId];
           const nextStatus: HdfWriterStatus = {
+            writingActive: current?.writingActive ?? false,
+            autostartWriting: current?.autostartWriting ?? false,
             filePath: current?.filePath ?? null,
             fileName: current?.fileName ?? null,
             pending: current?.pending ?? null,
@@ -745,7 +765,7 @@ export function useHdfController({
     ]
   );
 
-  const executeHdfRotate = useCallback(async () => {
+  const buildHdfWriteParams = useCallback((): Record<string, unknown> | null => {
     const params: Record<string, unknown> = {};
     const filename = hdfRotateFilenameDraft.trim();
     if (filename) {
@@ -768,9 +788,9 @@ export function useHdfController({
         notifications.show({
           color: "red",
           title: "Missing measurement profile",
-          message: "Select a measurement profile before rotating the file.",
+          message: "Select a measurement profile before starting or rotating the file.",
         });
-        return;
+        return null;
       }
       params.measurement_profile = selectedProfile.id;
       const measurementValues: Record<string, unknown> = {};
@@ -785,7 +805,7 @@ export function useHdfController({
                 title: "Missing parameter",
                 message: `${field.label} is required.`,
               });
-              return;
+              return null;
             }
             continue;
           }
@@ -796,18 +816,12 @@ export function useHdfController({
             title: "Invalid measurement value",
             message: error instanceof Error ? error.message : String(error),
           });
-          return;
+          return null;
         }
       }
       params.measurement_values = measurementValues;
     }
-    const ok = await runHdfCommand("hdf.rotate", params, "HDF file rotated");
-    if (ok) {
-      setHdfRotateFilenameDraft("");
-      if (schema && schema.notes.fields.length > 0) {
-        applyMeasurementNoteDraft(schema, { preserveValues: false });
-      }
-    }
+    return params;
   }, [
     hdfRotateFilenameDraft,
     hdfRotateDisabledDevicesDraft,
@@ -815,9 +829,52 @@ export function useHdfController({
     hdfMeasurementSchemaByProcessId,
     hdfRotateMeasurementProfileDraft,
     hdfRotateMeasurementValuesDraft,
+  ]);
+
+  const executeHdfRotate = useCallback(async () => {
+    const params = buildHdfWriteParams();
+    if (!params) {
+      return;
+    }
+    const ok = await runHdfCommand("hdf.rotate", params, "HDF file rotated");
+    if (ok) {
+      const processId = hdfWriterProcess?.process_id;
+      if (processId) {
+        await refreshDevices();
+      }
+      setHdfRotateFilenameDraft("");
+      const schema = processId ? hdfMeasurementSchemaByProcessId[processId]?.schema ?? null : null;
+      if (schema && schema.notes.fields.length > 0) {
+        applyMeasurementNoteDraft(schema, { preserveValues: false });
+      }
+    }
+  }, [
+    buildHdfWriteParams,
+    hdfWriterProcess,
+    hdfMeasurementSchemaByProcessId,
     runHdfCommand,
     applyMeasurementNoteDraft,
+    refreshDevices,
   ]);
+
+  const executeHdfWritingStart = useCallback(async () => {
+    const params = buildHdfWriteParams();
+    if (!params) {
+      return;
+    }
+    const ok = await runHdfCommand("hdf.writing.start", params, "HDF writing started");
+    if (ok) {
+      await refreshDevices();
+      setHdfRotateFilenameDraft("");
+    }
+  }, [buildHdfWriteParams, runHdfCommand, refreshDevices]);
+
+  const executeHdfWritingStop = useCallback(async () => {
+    const ok = await runHdfCommand("hdf.writing.stop", {}, "HDF writing stopped");
+    if (ok) {
+      await refreshDevices();
+    }
+  }, [runHdfCommand, refreshDevices]);
 
   const executeHdfMeasurementNote = useCallback(async () => {
     if (!hdfWriterProcess) {
@@ -1109,6 +1166,8 @@ export function useHdfController({
     hdfSupportsDevicesEnable,
     hdfSupportsDevicesDisable,
     hdfSupportsRotate,
+    hdfSupportsWritingStart,
+    hdfSupportsWritingStop,
     hdfSupportsMeasurementSchemaGet,
     hdfSupportsMeasurementNote,
     hdfStatusBusy,
@@ -1116,6 +1175,8 @@ export function useHdfController({
     hdfDevicesEnableBusy,
     hdfDevicesDisableBusy,
     hdfRotateBusy,
+    hdfWritingStartBusy,
+    hdfWritingStopBusy,
     hdfMeasurementNoteBusy,
     hdfAnyCommandBusy,
     hdfCommandsBlocked,
@@ -1145,6 +1206,8 @@ export function useHdfController({
     setHdfNoteFieldUseCustom,
     executeHdfStatus,
     executeHdfRotate,
+    executeHdfWritingStart,
+    executeHdfWritingStop,
     executeHdfMeasurementNote,
     executeHdfDevicesGet,
     executeHdfDevicesEnable,

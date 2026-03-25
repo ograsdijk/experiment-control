@@ -33,8 +33,12 @@ type Props = {
   hdfStatusBusy: boolean;
   hdfCommandsBlocked: boolean;
   hdfSupportsStatus: boolean;
+  hdfSupportsWritingStart: boolean;
+  hdfSupportsWritingStop: boolean;
   hdfAnyCommandBusy: boolean;
   onRefreshStatus: () => Promise<unknown> | void;
+  onExecuteWritingStart: () => Promise<unknown> | void;
+  onExecuteWritingStop: () => Promise<unknown> | void;
   hdfProcessCapabilitiesError: string | null;
   hdfMeasurementSchemaConfigured: boolean;
   hdfMeasurementSchemaAvailable: boolean;
@@ -66,6 +70,8 @@ type Props = {
   onSetRotateFieldValue: (fieldKey: string, value: string) => void;
   onSetRotateFieldUseCustom: (fieldKey: string, useCustom: boolean) => void;
   hdfRotateBusy: boolean;
+  hdfWritingStartBusy: boolean;
+  hdfWritingStopBusy: boolean;
   hdfSupportsRotate: boolean;
   onExecuteRotate: () => Promise<unknown> | void;
   hdfSupportsMeasurementNote: boolean;
@@ -102,8 +108,12 @@ export function HdfWriterModal({
   hdfStatusBusy,
   hdfCommandsBlocked,
   hdfSupportsStatus,
+  hdfSupportsWritingStart,
+  hdfSupportsWritingStop,
   hdfAnyCommandBusy,
   onRefreshStatus,
+  onExecuteWritingStart,
+  onExecuteWritingStop,
   hdfProcessCapabilitiesError,
   hdfMeasurementSchemaConfigured,
   hdfMeasurementSchemaAvailable,
@@ -129,6 +139,8 @@ export function HdfWriterModal({
   onSetRotateFieldValue,
   onSetRotateFieldUseCustom,
   hdfRotateBusy,
+  hdfWritingStartBusy,
+  hdfWritingStopBusy,
   hdfSupportsRotate,
   onExecuteRotate,
   hdfSupportsMeasurementNote,
@@ -205,6 +217,12 @@ export function HdfWriterModal({
               <Badge variant="light" color="gray">
                 pending {hdfWriterStatus?.pending ?? "n/a"}
               </Badge>
+              <Badge
+                variant="light"
+                color={hdfWriterStatus?.writingActive ? "teal" : "orange"}
+              >
+                writing {hdfWriterStatus?.writingActive ? "active" : "stopped"}
+              </Badge>
               <Badge variant="light" color="gray">
                 dropped {hdfWriterStatus?.dropped ?? "n/a"}
               </Badge>
@@ -275,6 +293,42 @@ export function HdfWriterModal({
                 measurement schema error: {hdfMeasurementSchemaDisplayError}
               </Text>
             )}
+            <Group justify="flex-end">
+              <Button
+                size="xs"
+                variant="light"
+                color="teal"
+                loading={hdfWritingStartBusy}
+                disabled={
+                  hdfCommandsBlocked ||
+                  !hdfSupportsWritingStart ||
+                  hdfAnyCommandBusy ||
+                  hdfWriterStatus?.writingActive === true
+                }
+                onClick={() => {
+                  void onExecuteWritingStart();
+                }}
+              >
+                Start writing
+              </Button>
+              <Button
+                size="xs"
+                variant="light"
+                color="orange"
+                loading={hdfWritingStopBusy}
+                disabled={
+                  hdfCommandsBlocked ||
+                  !hdfSupportsWritingStop ||
+                  hdfAnyCommandBusy ||
+                  hdfWriterStatus?.writingActive !== true
+                }
+                onClick={() => {
+                  void onExecuteWritingStop();
+                }}
+              >
+                Stop writing
+              </Button>
+            </Group>
           </Stack>
         </Card>
 

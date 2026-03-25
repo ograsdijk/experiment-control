@@ -121,7 +121,11 @@ function summarizeApiError(error: unknown): string {
 
 function isProcessControlAction(action: string): boolean {
   const text = String(action ?? "").trim().toLowerCase();
-  return text === "process.start" || text === "process.stop" || text === "process.restart";
+  return (
+    text === "manager.processes.start" ||
+    text === "manager.processes.stop" ||
+    text === "manager.processes.restart"
+  );
 }
 
 function buildSourceOptionsFromLive(rows: CommandHistoryEntry[]): string[] {

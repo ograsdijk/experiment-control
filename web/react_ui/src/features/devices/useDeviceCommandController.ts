@@ -35,7 +35,7 @@ type UseDeviceCommandControllerArgs = {
 export function useDeviceCommandController({
   capabilitiesByDevice,
   setCapabilitiesByDevice,
-  invalidateDeviceCapabilities,
+  invalidateDeviceCapabilities: _invalidateDeviceCapabilities,
   pinnedCommands,
   setPinnedCommands,
   pinnedParamDrafts,
@@ -138,8 +138,6 @@ export function useDeviceCommandController({
       caps = fetched;
       if (fetched.length > 0) {
         setCapabilitiesByDevice((prev) => ({ ...prev, [deviceId]: fetched }));
-      } else {
-        invalidateDeviceCapabilities(deviceId);
       }
     }
     if (action) {

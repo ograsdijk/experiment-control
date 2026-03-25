@@ -1,4 +1,6 @@
-﻿export type HdfWriterStatus = {
+export type HdfWriterStatus = {
+  writingActive: boolean;
+  autostartWriting: boolean;
   filePath: string | null;
   fileName: string | null;
   pending: number | null;

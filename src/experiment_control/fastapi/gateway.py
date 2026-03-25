@@ -25,6 +25,9 @@ class GatewaySettings:
     manager_pub_public_hint: str | None = None
     rpc_timeout_ms: int = 2000
     rpc_queue_max: int = 1024
+    stream_max_payload_points: int = 200_000
+    stream_max_keys: int = 1024
+    stream_key_ttl_s: float = 600.0
     telemetry_topics: tuple[str, ...] = ("manager.telemetry_update",)
     log_topics: tuple[str, ...] = ("manager.log",)
     stream_topics: tuple[str, ...] = ("manager.chunk_ready",)
@@ -287,10 +290,14 @@ class StreamFrameHub:
         *,
         topics: tuple[str, ...] = ("manager.chunk_ready",),
         max_payload_points: int = 200_000,
+        max_stream_keys: int = 1024,
+        stream_key_ttl_s: float = 600.0,
     ) -> None:
         self._endpoint = endpoint
         self._topics = topics
         self._max_payload_points = max(1, int(max_payload_points))
+        self._max_stream_keys = max(1, int(max_stream_keys))
+        self._stream_key_ttl_s = max(0.0, float(stream_key_ttl_s))
         self._ctx = zmq.Context.instance()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -307,6 +314,10 @@ class StreamFrameHub:
         ] = {}
         self._context_cache_limit = 8192
         self._latest_frame: dict[tuple[str, str], dict[str, Any]] = {}
+        self._stream_key_order: dict[tuple[str, str], None] = {}
+        self._stream_key_last_seen: dict[tuple[str, str], float] = {}
+        self._stream_key_dropped_capacity = 0
+        self._stream_key_dropped_ttl = 0
 
     def start(self, loop: asyncio.AbstractEventLoop) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -337,6 +348,48 @@ class StreamFrameHub:
         self._stream_context.clear()
         self._context_by_seq.clear()
         self._latest_frame.clear()
+        self._stream_key_order.clear()
+        self._stream_key_last_seen.clear()
+
+    def _drop_stream_key(self, key: tuple[str, str], *, reason: str) -> None:
+        reader = self._readers.pop(key, None)
+        if reader is not None:
+            try:
+                reader.close()
+            except Exception:
+                pass
+        self._last_seq.pop(key, None)
+        self._stream_context.pop(key, None)
+        self._context_by_seq.pop(key, None)
+        with self._lock:
+            self._latest_frame.pop(key, None)
+        self._stream_key_order.pop(key, None)
+        self._stream_key_last_seen.pop(key, None)
+        if reason == "capacity":
+            self._stream_key_dropped_capacity += 1
+        elif reason == "ttl":
+            self._stream_key_dropped_ttl += 1
+
+    def _touch_stream_key(self, key: tuple[str, str], *, now_mono: float) -> None:
+        self._stream_key_last_seen[key] = now_mono
+        if key in self._stream_key_order:
+            self._stream_key_order.pop(key, None)
+        self._stream_key_order[key] = None
+
+    def _prune_stream_keys(self, *, now_mono: float) -> None:
+        if self._stream_key_ttl_s > 0.0:
+            stale = [
+                key
+                for key, seen in self._stream_key_last_seen.items()
+                if (now_mono - float(seen)) > self._stream_key_ttl_s
+            ]
+            for key in stale:
+                self._drop_stream_key(key, reason="ttl")
+        while len(self._stream_key_order) > self._max_stream_keys:
+            oldest = next(iter(self._stream_key_order), None)
+            if oldest is None:
+                break
+            self._drop_stream_key(oldest, reason="capacity")
 
     def subscribe(
         self,
@@ -358,6 +411,21 @@ class StreamFrameHub:
     def unsubscribe(self, q: asyncio.Queue) -> None:
         with self._lock:
             self._queues.pop(q, None)
+
+    def stats(self) -> dict[str, Any]:
+        with self._lock:
+            latest_frame_count = int(len(self._latest_frame))
+            subscriber_count = int(len(self._queues))
+        return {
+            "max_payload_points": int(self._max_payload_points),
+            "max_stream_keys": int(self._max_stream_keys),
+            "stream_key_ttl_s": float(self._stream_key_ttl_s),
+            "latest_frame_count": latest_frame_count,
+            "subscriber_count": subscriber_count,
+            "reader_count": int(len(self._readers)),
+            "dropped_stream_keys_capacity": int(self._stream_key_dropped_capacity),
+            "dropped_stream_keys_ttl": int(self._stream_key_dropped_ttl),
+        }
 
     def get_latest_frame(self, *, device_id: str, stream: str) -> dict[str, Any] | None:
         key = (str(device_id).strip(), str(stream).strip())
@@ -471,6 +539,7 @@ class StreamFrameHub:
         poller.register(sub, zmq.POLLIN)
 
         while not self._stop.is_set():
+            self._prune_stream_keys(now_mono=time.monotonic())
             events = dict(poller.poll(100))
             if sub not in events:
                 continue
@@ -485,6 +554,9 @@ class StreamFrameHub:
                 continue
             device_id, stream, shm_name = normalized
             key = (device_id, stream)
+            now_mono = time.monotonic()
+            self._touch_stream_key(key, now_mono=now_mono)
+            self._prune_stream_keys(now_mono=now_mono)
 
             context_id: int | None = None
             context_fields: dict[str, Any] | None = None
@@ -518,10 +590,7 @@ class StreamFrameHub:
                 try:
                     reader = ShmRingReader.attach(shm_name)
                 except Exception:
-                    self._readers.pop(key, None)
-                    self._last_seq.pop(key, None)
-                    self._stream_context.pop(key, None)
-                    self._context_by_seq.pop(key, None)
+                    self._drop_stream_key(key, reason="error")
                     continue
                 self._readers[key] = reader
                 self._last_seq[key] = 0
@@ -532,14 +601,7 @@ class StreamFrameHub:
             try:
                 stream_events_all = reader.read_events(last_seq)
             except Exception:
-                try:
-                    reader.close()
-                except Exception:
-                    pass
-                self._readers.pop(key, None)
-                self._last_seq.pop(key, None)
-                self._stream_context.pop(key, None)
-                self._context_by_seq.pop(key, None)
+                self._drop_stream_key(key, reason="error")
                 continue
             if msg_seq is None:
                 stream_events = stream_events_all

@@ -63,6 +63,15 @@ class ProcessCommandRequest(BaseModel):
     source_id: str | None = None
 
 
+class HdfWritingStartRequest(BaseModel):
+    filename: str | None = None
+    disabled_devices: list[str] | None = None
+    measurement_profile: str | None = None
+    measurement_values: dict[str, Any] | None = None
+    source_kind: str | None = None
+    source_id: str | None = None
+
+
 class InstanceCleanupRequest(BaseModel):
     dry_run: bool = True
     stale_only: bool = True
@@ -119,6 +128,21 @@ def _load_settings() -> GatewaySettings:
         rpc_queue_max=max(
             1, int(os.environ.get("EXPERIMENT_CONTROL_RPC_QUEUE_MAX", "1024"))
         ),
+        stream_max_payload_points=max(
+            1,
+            int(
+                os.environ.get(
+                    "EXPERIMENT_CONTROL_STREAM_MAX_PAYLOAD_POINTS", "200000"
+                )
+            ),
+        ),
+        stream_max_keys=max(
+            1, int(os.environ.get("EXPERIMENT_CONTROL_STREAM_MAX_KEYS", "1024"))
+        ),
+        stream_key_ttl_s=max(
+            0.0,
+            float(os.environ.get("EXPERIMENT_CONTROL_STREAM_KEY_TTL_S", "600")),
+        ),
     )
 
 
@@ -173,6 +197,78 @@ def _normalize_command_response(resp: Any) -> dict[str, Any]:
     return out
 
 
+_TRANSIENT_CAPABILITIES_ERROR_CODES = {
+    "device_rpc_timeout",
+    "device_starting",
+    "device_stopping",
+    "device_rpc_not_ready",
+    "driver_not_running",
+    "gateway_busy",
+    "gateway_timeout",
+}
+
+
+def _command_error_code(resp: dict[str, Any]) -> str:
+    err = resp.get("error")
+    if isinstance(err, dict):
+        return str(err.get("code", "") or "").strip().lower()
+    return ""
+
+
+def _command_error_message(resp: dict[str, Any]) -> str:
+    err = resp.get("error")
+    if isinstance(err, dict):
+        return str(err.get("message", "") or "").strip().lower()
+    if isinstance(err, str):
+        return err.strip().lower()
+    return ""
+
+
+def _is_transient_capabilities_failure(resp: dict[str, Any]) -> bool:
+    if not isinstance(resp, dict) or resp.get("ok") is not False:
+        return False
+    code = _command_error_code(resp)
+    if code in _TRANSIENT_CAPABILITIES_ERROR_CODES:
+        return True
+    err = resp.get("error")
+    if isinstance(err, dict):
+        if bool(err.get("transient")):
+            return True
+        details = err.get("details")
+        if isinstance(details, dict):
+            nested_msg = str(details.get("message", "") or "").strip().lower()
+            if "resource temporarily unavailable" in nested_msg:
+                return True
+    msg = _command_error_message(resp)
+    if "resource temporarily unavailable" in msg:
+        return True
+    if code in {"gateway_error", "device_error", "error"} and "timed out" in msg:
+        return True
+    return False
+
+
+async def _request_device_capabilities_with_retry(
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    first = await asyncio.to_thread(app.state.router.request, payload)
+    first_shaped = _normalize_command_response(first)
+    if not _is_transient_capabilities_failure(first_shaped):
+        return first_shaped
+
+    await asyncio.sleep(0.2)
+    retry_payload = dict(payload)
+    retry_payload["request_id"] = uuid.uuid4().hex
+    second = await asyncio.to_thread(app.state.router.request, retry_payload)
+    second_shaped = _normalize_command_response(second)
+    if _is_transient_capabilities_failure(second_shaped):
+        err = second_shaped.get("error")
+        if isinstance(err, dict):
+            err.setdefault("transient", True)
+            err.setdefault("retryable", True)
+            err.setdefault("retry_attempted", True)
+    return second_shaped
+
+
 def _normalize_command_interceptor_routes(raw: Any) -> list[dict[str, Any]]:
     if not isinstance(raw, list):
         return []
@@ -203,7 +299,7 @@ def _normalize_command_interceptor_routes(raw: Any) -> list[dict[str, Any]]:
 
 async def _fetch_manager_identity(router: RouterRpcClient) -> dict[str, Any] | None:
     request_id = uuid.uuid4().hex
-    payload = {"type": "manager.identity", "request_id": request_id}
+    payload = {"type": "manager.info.identity", "request_id": request_id}
     try:
         resp = await asyncio.to_thread(router.request, payload)
     except Exception:
@@ -218,7 +314,7 @@ async def _fetch_manager_identity(router: RouterRpcClient) -> dict[str, Any] | N
 
 
 async def _lookup_process_status(process_id: str) -> dict[str, Any] | None:
-    payload = {"type": "process.list_status"}
+    payload = {"type": "manager.processes.list"}
     try:
         resp = await asyncio.to_thread(app.state.router.request, payload)
     except Exception:
@@ -322,7 +418,7 @@ async def _process_rpc(
 ) -> dict[str, Any]:
     request_id = uuid.uuid4().hex
     payload = {
-        "type": "process.rpc",
+        "type": "manager.processes.rpc",
         "request_id": request_id,
         "process_id": process_id,
         "request": {
@@ -340,7 +436,10 @@ async def _process_rpc(
                 "ok": False,
                 "error": {
                     "code": "rpc_request_id_mismatch",
-                    "message": f"process.rpc request_id mismatch: expected {request_id}, got {got}",
+                    "message": (
+                        f"manager.processes.rpc request_id mismatch: expected "
+                        f"{request_id}, got {got}"
+                    ),
                 },
             }
     return shaped
@@ -488,7 +587,13 @@ async def _startup() -> None:
     telemetry_hub.start(asyncio.get_running_loop())
     logs_hub = TelemetryHub(settings.manager_pub, topics=settings.log_topics)
     logs_hub.start(asyncio.get_running_loop())
-    stream_hub = StreamFrameHub(settings.manager_pub, topics=settings.stream_topics)
+    stream_hub = StreamFrameHub(
+        settings.manager_pub,
+        topics=settings.stream_topics,
+        max_payload_points=settings.stream_max_payload_points,
+        max_stream_keys=settings.stream_max_keys,
+        stream_key_ttl_s=settings.stream_key_ttl_s,
+    )
     stream_hub.start(asyncio.get_running_loop())
     stream_analysis_hub = TelemetryHub(
         settings.manager_pub, topics=settings.stream_analysis_topics
@@ -568,6 +673,10 @@ async def settings_view(request: Request) -> dict[str, Any]:
     rpc_queue: dict[str, Any] | None = None
     if router is not None:
         rpc_queue = router.stats()
+    stream_hub: StreamFrameHub | None = getattr(app.state, "stream_hub", None)
+    stream_state: dict[str, Any] | None = None
+    if stream_hub is not None:
+        stream_state = stream_hub.stats()
 
     return {
         "ok": True,
@@ -580,6 +689,10 @@ async def settings_view(request: Request) -> dict[str, Any]:
             "rpc_timeout_ms": settings.rpc_timeout_ms,
             "rpc_queue_max": settings.rpc_queue_max,
             "rpc_queue": rpc_queue,
+            "stream_max_payload_points": settings.stream_max_payload_points,
+            "stream_max_keys": settings.stream_max_keys,
+            "stream_key_ttl_s": settings.stream_key_ttl_s,
+            "stream_state": stream_state,
             "telemetry_topics": list(settings.telemetry_topics),
             "log_topics": list(settings.log_topics),
             "stream_topics": list(settings.stream_topics),
@@ -617,7 +730,7 @@ async def instance_cleanup_orphans(
         "stale_only": bool(req.stale_only) if req is not None else True,
         "timeout_s": float(req.timeout_s) if req is not None else 2.0,
     }
-    payload = {"type": "manager.cleanup_orphans", "params": params}
+    payload = {"type": "manager.control.cleanup_orphans", "params": params}
     resp = await asyncio.to_thread(app.state.router.request, payload)
     return _ensure_error_shape(resp)
 
@@ -631,7 +744,7 @@ async def list_devices() -> dict[str, Any]:
 
 @app.get("/api/snapshots/telemetry")
 async def telemetry_snapshot() -> dict[str, Any]:
-    payload = {"type": "telemetry.snapshot"}
+    payload = {"type": "manager.telemetry.snapshot"}
     resp = await asyncio.to_thread(app.state.router.request, payload)
     return _ensure_error_shape(resp)
 
@@ -705,8 +818,7 @@ async def device_capabilities(device_id: str, request: Request) -> dict[str, Any
         "request_id": uuid.uuid4().hex,
         **_command_source_fields(request),
     }
-    resp = await asyncio.to_thread(app.state.router.request, payload)
-    return _normalize_command_response(resp)
+    return await _request_device_capabilities_with_retry(payload)
 
 
 @app.post("/api/devices/{device_id}/call")
@@ -765,7 +877,7 @@ async def device_restart(
 
 @app.get("/api/processes")
 async def list_processes() -> dict[str, Any]:
-    payload = {"type": "process.list_status"}
+    payload = {"type": "manager.processes.list"}
     resp = await asyncio.to_thread(app.state.router.request, payload)
     return _ensure_error_shape(resp)
 
@@ -773,7 +885,7 @@ async def list_processes() -> dict[str, Any]:
 @app.post("/api/processes/{process_id}/start")
 async def process_start(process_id: str, request: Request) -> dict[str, Any]:
     payload = {
-        "type": "process.start",
+        "type": "manager.processes.start",
         "process_id": process_id,
         **_command_source_fields(request),
     }
@@ -784,7 +896,7 @@ async def process_start(process_id: str, request: Request) -> dict[str, Any]:
 @app.post("/api/processes/{process_id}/stop")
 async def process_stop(process_id: str, request: Request) -> dict[str, Any]:
     payload = {
-        "type": "process.stop",
+        "type": "manager.processes.stop",
         "process_id": process_id,
         **_command_source_fields(request),
     }
@@ -795,9 +907,62 @@ async def process_stop(process_id: str, request: Request) -> dict[str, Any]:
 @app.post("/api/processes/{process_id}/restart")
 async def process_restart(process_id: str, request: Request) -> dict[str, Any]:
     payload = {
-        "type": "process.restart",
+        "type": "manager.processes.restart",
         "process_id": process_id,
         **_command_source_fields(request),
+    }
+    resp = await asyncio.to_thread(app.state.router.request, payload)
+    return _ensure_error_shape(resp)
+
+
+@app.post("/api/processes/hdf_writer/writing/stop")
+async def hdf_writer_writing_stop(request: Request) -> dict[str, Any]:
+    request_id = uuid.uuid4().hex
+    payload = {
+        "type": "manager.processes.rpc",
+        "request_id": request_id,
+        "process_id": "hdf_writer",
+        "request": {
+            "type": "hdf.writing.stop",
+            "params": {},
+            "request_id": request_id,
+        },
+        **_command_source_fields(request),
+    }
+    resp = await asyncio.to_thread(app.state.router.request, payload)
+    return _ensure_error_shape(resp)
+
+
+@app.post("/api/processes/hdf_writer/writing/start")
+async def hdf_writer_writing_start(
+    request: Request,
+    req: HdfWritingStartRequest | None = None,
+) -> dict[str, Any]:
+    params: dict[str, Any] = {}
+    if req is not None:
+        if req.filename is not None:
+            params["filename"] = req.filename
+        if req.disabled_devices is not None:
+            params["disabled_devices"] = list(req.disabled_devices)
+        if req.measurement_profile is not None:
+            params["measurement_profile"] = req.measurement_profile
+        if req.measurement_values is not None:
+            params["measurement_values"] = dict(req.measurement_values)
+    request_id = uuid.uuid4().hex
+    payload = {
+        "type": "manager.processes.rpc",
+        "request_id": request_id,
+        "process_id": "hdf_writer",
+        "request": {
+            "type": "hdf.writing.start",
+            "params": params,
+            "request_id": request_id,
+        },
+        **_command_source_fields(
+            request,
+            source_kind=req.source_kind if req is not None else None,
+            source_id=req.source_id if req is not None else None,
+        ),
     }
     resp = await asyncio.to_thread(app.state.router.request, payload)
     return _ensure_error_shape(resp)
@@ -809,7 +974,7 @@ async def process_capabilities(process_id: str) -> dict[str, Any]:
     if isinstance(status, dict) and not _process_rpc_registered(status):
         return {"ok": False, "error": {"code": "process_rpc_not_ready"}}
     payload = {
-        "type": "process.rpc",
+        "type": "manager.processes.rpc",
         "process_id": process_id,
         "request": {
             "type": "process.capabilities",
@@ -835,7 +1000,7 @@ async def process_call(
         source_id=req.source_id,
     )
     payload = {
-        "type": "process.rpc",
+        "type": "manager.processes.rpc",
         "process_id": process_id,
         "request": {
             "type": req.action,
@@ -850,7 +1015,7 @@ async def process_call(
 
 @app.get("/api/interlocks/interceptor_routes")
 async def list_interceptor_routes() -> dict[str, Any]:
-    payload = {"type": "command_interceptor.list"}
+    payload = {"type": "manager.interceptors.list"}
     resp = await asyncio.to_thread(app.state.router.request, payload)
     shaped = _ensure_error_shape(resp)
     if not shaped.get("ok"):
@@ -1060,7 +1225,7 @@ async def stream_workspace_store_reload(
 @app.post("/api/logs/tail")
 async def logs_tail(req: LogTailRequest | None = None) -> dict[str, Any]:
     payload = {
-        "type": "manager.log.tail",
+        "type": "manager.logs.tail",
         "params": req.params if req is not None else {},
     }
     resp = await asyncio.to_thread(app.state.router.request, payload)
@@ -1069,7 +1234,7 @@ async def logs_tail(req: LogTailRequest | None = None) -> dict[str, Any]:
 
 @app.get("/api/commands/journal/status")
 async def command_journal_status() -> dict[str, Any]:
-    payload = {"type": "manager.command_journal.status"}
+    payload = {"type": "manager.commands.journal.status"}
     resp = await asyncio.to_thread(app.state.router.request, payload)
     return _ensure_error_shape(resp)
 
@@ -1079,7 +1244,7 @@ async def command_journal_tail(
     req: CommandJournalTailRequest | None = None,
 ) -> dict[str, Any]:
     payload = {
-        "type": "manager.command_journal.tail",
+        "type": "manager.commands.journal.tail",
         "params": req.params if req is not None else {},
     }
     resp = await asyncio.to_thread(app.state.router.request, payload)
@@ -1314,266 +1479,387 @@ async def raw_stream_snapshot(request: Request) -> dict[str, Any]:
     }
 
 
+_WORKSPACE_STREAM_ALLOWED_KINDS = {
+    "scalar",
+    "hist_agg",
+    "hist2d",
+    "trace",
+    "params_map",
+    "fit_1d",
+}
+_WORKSPACE_STREAM_ALLOWED_TOPICS = {
+    "manager.stream_analysis.output",
+    "manager.stream_analysis.trace_ready",
+    "manager.stream_analysis.workspace_status",
+    "manager.stream_analysis.error",
+}
+
+
+class _WorkspaceTraceWsState:
+    def __init__(
+        self,
+        *,
+        trace_decimator: str,
+        trace_max_points: int | None,
+        trace_interval_s: float,
+        rolling_window: int,
+        trace_average_mode: str,
+    ) -> None:
+        self.trace_decimator = trace_decimator
+        self.trace_max_points = trace_max_points
+        self.trace_interval_s = trace_interval_s
+        self.rolling_window = rolling_window
+        self.trace_average_mode = trace_average_mode
+        self.next_trace_send_at: dict[str, float] = {}
+        self.pending_trace_msgs: dict[str, dict[str, Any]] = {}
+        self.trace_readers: dict[tuple[str, str], ShmRingReader] = {}
+        self.rolling_buffers: dict[str, deque[np.ndarray]] = {}
+        self.rolling_sums: dict[str, np.ndarray] = {}
+        self.block_sums: dict[str, np.ndarray] = {}
+        self.block_counts: dict[str, int] = {}
+
+
+def _parse_workspace_allowed_output_kinds(raw: Any) -> set[str] | None:
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    parsed = {
+        part.strip()
+        for part in text.split(",")
+        if part.strip() in _WORKSPACE_STREAM_ALLOWED_KINDS
+    }
+    return parsed or None
+
+
+def _workspace_trace_key(workspace_id: str, output_id: str) -> str:
+    return f"{workspace_id}:{output_id}"
+
+
+def _workspace_close_trace_reader(
+    state: _WorkspaceTraceWsState,
+    key: tuple[str, str],
+) -> None:
+    reader = state.trace_readers.pop(key, None)
+    if reader is None:
+        return
+    try:
+        reader.close()
+    except Exception:
+        pass
+
+
+def _workspace_apply_trace_average(
+    state: _WorkspaceTraceWsState,
+    *,
+    output_key: str,
+    trace: np.ndarray,
+) -> np.ndarray | None:
+    if state.rolling_window <= 1:
+        return trace
+    if trace.size <= 0:
+        return trace
+    if state.trace_average_mode == "rolling":
+        buf = state.rolling_buffers.get(output_key)
+        sum_trace = state.rolling_sums.get(output_key)
+        if buf is None or sum_trace is None or int(sum_trace.size) != int(trace.size):
+            buf = deque()
+            sum_trace = np.zeros(int(trace.size), dtype=np.float64)
+            state.rolling_buffers[output_key] = buf
+            state.rolling_sums[output_key] = sum_trace
+        incoming = trace.astype(np.float64, copy=True)
+        if len(buf) >= int(state.rolling_window):
+            oldest = buf.popleft()
+            sum_trace -= oldest
+        buf.append(incoming)
+        sum_trace += incoming
+        return sum_trace / float(max(1, len(buf)))
+    sum_trace = state.block_sums.get(output_key)
+    count = int(state.block_counts.get(output_key, 0))
+    if sum_trace is None or int(sum_trace.size) != int(trace.size):
+        sum_trace = np.zeros(int(trace.size), dtype=np.float64)
+        count = 0
+        state.block_sums[output_key] = sum_trace
+    sum_trace += trace.astype(np.float64, copy=False)
+    count += 1
+    state.block_counts[output_key] = count
+    if count < int(state.rolling_window):
+        return None
+    out = sum_trace / float(count)
+    sum_trace.fill(0.0)
+    state.block_counts[output_key] = 0
+    return out
+
+
+async def _workspace_send_trace_message(
+    *,
+    ws: WebSocket,
+    state: _WorkspaceTraceWsState,
+    msg_workspace: str,
+    trace_payload: dict[str, Any],
+    trace_msg: dict[str, Any],
+) -> None:
+    if state.trace_interval_s > 0:
+        output_id = str(trace_payload.get("output_id") or "").strip()
+        trace_key = _workspace_trace_key(msg_workspace, output_id)
+        now = time.monotonic()
+        next_at = state.next_trace_send_at.get(trace_key, 0.0)
+        if now >= next_at:
+            await ws.send_json(trace_msg)
+            state.next_trace_send_at[trace_key] = now + state.trace_interval_s
+        else:
+            state.pending_trace_msgs[trace_key] = trace_msg
+            if trace_key not in state.next_trace_send_at:
+                state.next_trace_send_at[trace_key] = next_at
+        return
+    await ws.send_json(trace_msg)
+
+
+async def _workspace_flush_pending_trace_messages(
+    *,
+    ws: WebSocket,
+    state: _WorkspaceTraceWsState,
+) -> None:
+    if not state.pending_trace_msgs:
+        return
+    now = time.monotonic()
+    due = [key for key, at in state.next_trace_send_at.items() if now >= at]
+    for key in due:
+        pending = state.pending_trace_msgs.pop(key, None)
+        if pending is None:
+            continue
+        await ws.send_json(pending)
+        if state.trace_interval_s > 0:
+            state.next_trace_send_at[key] = now + state.trace_interval_s
+        else:
+            state.next_trace_send_at.pop(key, None)
+
+
+def _workspace_filter_stream_message(
+    *,
+    msg: Any,
+    workspace: str,
+    allowed_output_kinds: set[str] | None,
+) -> tuple[str, dict[str, Any], str] | None:
+    if not isinstance(msg, dict):
+        return None
+    topic = str(msg.get("topic") or "").strip()
+    payload = msg.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    msg_workspace = str(payload.get("workspace_id") or "").strip()
+    if msg_workspace != workspace:
+        return None
+    if topic not in _WORKSPACE_STREAM_ALLOWED_TOPICS:
+        return None
+    if topic in {"manager.stream_analysis.output", "manager.stream_analysis.trace_ready"}:
+        if allowed_output_kinds is not None:
+            kind = str(payload.get("kind") or "").strip()
+            if kind not in allowed_output_kinds:
+                return None
+    return topic, payload, msg_workspace
+
+
+async def _workspace_handle_trace_ready_message(
+    *,
+    ws: WebSocket,
+    state: _WorkspaceTraceWsState,
+    payload: dict[str, Any],
+    msg_workspace: str,
+) -> bool:
+    output_id = str(payload.get("output_id") or "").strip()
+    node_id = str(payload.get("node_id") or "").strip()
+    shm_name = str(payload.get("shm_name") or "").strip()
+    seq_raw = payload.get("seq")
+    if not output_id or not node_id or not shm_name:
+        return False
+    try:
+        trace_seq = int(seq_raw)
+    except Exception:
+        return False
+    reader_key = (msg_workspace, output_id)
+    reader = state.trace_readers.get(reader_key)
+    if reader is None or reader.name != shm_name:
+        _workspace_close_trace_reader(state, reader_key)
+        try:
+            reader = ShmRingReader.attach(shm_name)
+        except Exception:
+            return False
+        state.trace_readers[reader_key] = reader
+    event = reader.read_event(trace_seq)
+    if not isinstance(event, dict):
+        return False
+    payload_bytes = event.get("payload")
+    if not isinstance(payload_bytes, (bytes, bytearray, memoryview)):
+        return False
+    try:
+        trace_arr = np.frombuffer(payload_bytes, dtype=reader.layout.dtype).reshape(
+            tuple(int(v) for v in reader.layout.shape)
+        )
+    except Exception:
+        return False
+    trace_key = _workspace_trace_key(msg_workspace, output_id)
+    trace_flat = _workspace_apply_trace_average(
+        state,
+        output_key=trace_key,
+        trace=trace_arr.reshape(-1),
+    )
+    if trace_flat is None:
+        return True
+    if state.trace_max_points is not None:
+        trace_values = _decimate_trace_values(
+            trace_flat,
+            mode=state.trace_decimator,
+            max_points=state.trace_max_points,
+        )
+    else:
+        trace_values = trace_flat.tolist()
+    trace_payload: dict[str, Any] = {
+        "version": 1,
+        "workspace_id": msg_workspace,
+        "output_id": output_id,
+        "node_id": node_id,
+        "kind": "trace",
+        "device_id": payload.get("device_id"),
+        "stream": payload.get("stream"),
+        "seq": int(event.get("seq") or trace_seq),
+        "t0_mono_ns": event.get("t0_mono_ns"),
+        "t0_wall_ns": event.get("t0_wall_ns"),
+        "channel_index": payload.get("channel_index"),
+        "channel_count": payload.get("channel_count"),
+        "value": trace_values,
+        "point_count": len(trace_values) if isinstance(trace_values, list) else 0,
+    }
+    if bool(payload.get("truncated")):
+        trace_payload["truncated"] = True
+    if payload.get("context_id") is not None:
+        trace_payload["context_id"] = payload.get("context_id")
+    if isinstance(payload.get("context_fields"), dict):
+        trace_payload["context_fields"] = payload.get("context_fields")
+    await _workspace_send_trace_message(
+        ws=ws,
+        state=state,
+        msg_workspace=msg_workspace,
+        trace_payload=trace_payload,
+        trace_msg={"topic": "manager.stream_analysis.output", "payload": trace_payload},
+    )
+    return True
+
+
+async def _workspace_handle_trace_output_message(
+    *,
+    ws: WebSocket,
+    state: _WorkspaceTraceWsState,
+    msg: dict[str, Any],
+    payload: dict[str, Any],
+    msg_workspace: str,
+) -> bool:
+    if str(payload.get("kind") or "").strip() != "trace":
+        return False
+    trace_payload = payload
+    points = _coerce_trace_array(payload.get("value"))
+    output_id = str(payload.get("output_id") or "").strip()
+    if points is not None and output_id:
+        trace_key = _workspace_trace_key(msg_workspace, output_id)
+        rolled = _workspace_apply_trace_average(state, output_key=trace_key, trace=points)
+        if rolled is None:
+            return True
+        decimated = (
+            _decimate_trace_values(
+                rolled,
+                mode=state.trace_decimator,
+                max_points=state.trace_max_points,
+            )
+            if state.trace_max_points is not None
+            else rolled.tolist()
+        )
+        trace_payload = dict(payload)
+        trace_payload["value"] = decimated
+        trace_payload["point_count"] = len(decimated) if isinstance(decimated, list) else 0
+        if state.trace_max_points is not None and len(decimated) < int(points.size):
+            trace_payload["decimated"] = True
+    trace_msg = msg if trace_payload is payload else {**msg, "payload": trace_payload}
+    await _workspace_send_trace_message(
+        ws=ws,
+        state=state,
+        msg_workspace=msg_workspace,
+        trace_payload=trace_payload,
+        trace_msg=trace_msg,
+    )
+    return True
+
+
 @app.websocket("/ws/stream/{workspace_id}")
 async def ws_stream_workspace(ws: WebSocket, workspace_id: str) -> None:
     workspace = str(workspace_id).strip()
     if not workspace:
         await ws.close(code=1008)
         return
-    kinds_raw = str(ws.query_params.get("kinds") or "").strip()
-    allowed_output_kinds: set[str] | None = None
-    if kinds_raw:
-        parsed = {
-            part.strip()
-            for part in kinds_raw.split(",")
-            if part.strip()
-            in {"scalar", "hist_agg", "hist2d", "trace", "params_map", "fit_1d"}
-        }
-        if parsed:
-            allowed_output_kinds = parsed
+    allowed_output_kinds = _parse_workspace_allowed_output_kinds(
+        ws.query_params.get("kinds")
+    )
     trace_decimator = _parse_trace_decimator(ws.query_params.get("trace_decimator"))
     trace_max_points = _parse_trace_max_points(ws.query_params.get("trace_max_points"))
     trace_max_fps = _parse_trace_max_fps(ws.query_params.get("trace_max_fps"))
     rolling_window = _parse_trace_rolling_window(ws.query_params.get("rolling_window"))
     trace_average_mode = _parse_trace_average_mode(ws.query_params.get("trace_average_mode"))
     trace_interval_s = (1.0 / trace_max_fps) if trace_max_fps else 0.0
-    next_trace_send_at: dict[str, float] = {}
-    pending_trace_msgs: dict[str, dict[str, Any]] = {}
-    trace_readers: dict[tuple[str, str], ShmRingReader] = {}
-    rolling_buffers: dict[str, deque[np.ndarray]] = {}
-    rolling_sums: dict[str, np.ndarray] = {}
-    block_sums: dict[str, np.ndarray] = {}
-    block_counts: dict[str, int] = {}
-
-    def _close_trace_reader(key: tuple[str, str]) -> None:
-        reader = trace_readers.pop(key, None)
-        if reader is None:
-            return
-        try:
-            reader.close()
-        except Exception:
-            pass
-
-    async def _send_trace_message(
-        *,
-        msg_workspace: str,
-        trace_payload: dict[str, Any],
-        trace_msg: dict[str, Any],
-    ) -> None:
-        if trace_interval_s > 0:
-            output_id = str(trace_payload.get("output_id") or "").strip()
-            trace_key = f"{msg_workspace}:{output_id}"
-            now = time.monotonic()
-            next_at = next_trace_send_at.get(trace_key, 0.0)
-            if now >= next_at:
-                await ws.send_json(trace_msg)
-                next_trace_send_at[trace_key] = now + trace_interval_s
-            else:
-                pending_trace_msgs[trace_key] = trace_msg
-                if trace_key not in next_trace_send_at:
-                    next_trace_send_at[trace_key] = next_at
-            return
-        await ws.send_json(trace_msg)
-
-    def _apply_trace_average(output_key: str, trace: np.ndarray) -> np.ndarray | None:
-        if rolling_window <= 1:
-            return trace
-        if trace.size <= 0:
-            return trace
-        if trace_average_mode == "rolling":
-            buf = rolling_buffers.get(output_key)
-            sum_trace = rolling_sums.get(output_key)
-            if buf is None or sum_trace is None or int(sum_trace.size) != int(trace.size):
-                buf = deque()
-                sum_trace = np.zeros(int(trace.size), dtype=np.float64)
-                rolling_buffers[output_key] = buf
-                rolling_sums[output_key] = sum_trace
-            incoming = trace.astype(np.float64, copy=True)
-            if len(buf) >= int(rolling_window):
-                oldest = buf.popleft()
-                sum_trace -= oldest
-            buf.append(incoming)
-            sum_trace += incoming
-            return sum_trace / float(max(1, len(buf)))
-        sum_trace = block_sums.get(output_key)
-        count = int(block_counts.get(output_key, 0))
-        if sum_trace is None or int(sum_trace.size) != int(trace.size):
-            sum_trace = np.zeros(int(trace.size), dtype=np.float64)
-            count = 0
-            block_sums[output_key] = sum_trace
-        sum_trace += trace.astype(np.float64, copy=False)
-        count += 1
-        block_counts[output_key] = count
-        if count < int(rolling_window):
-            return None
-        out = sum_trace / float(count)
-        sum_trace.fill(0.0)
-        block_counts[output_key] = 0
-        return out
+    state = _WorkspaceTraceWsState(
+        trace_decimator=trace_decimator,
+        trace_max_points=trace_max_points,
+        trace_interval_s=trace_interval_s,
+        rolling_window=rolling_window,
+        trace_average_mode=trace_average_mode,
+    )
 
     await ws.accept()
     q = app.state.stream_analysis_hub.subscribe(maxsize=150)
     try:
         while True:
-            timeout_s = 0.05 if pending_trace_msgs else None
+            timeout_s = 0.05 if state.pending_trace_msgs else None
             try:
                 if timeout_s is None:
                     msg = await q.get()
                 else:
                     msg = await asyncio.wait_for(q.get(), timeout=timeout_s)
             except asyncio.TimeoutError:
-                if not pending_trace_msgs:
-                    continue
-                now = time.monotonic()
-                due = [k for k, at in next_trace_send_at.items() if now >= at]
-                for key in due:
-                    pending = pending_trace_msgs.pop(key, None)
-                    if pending is None:
-                        continue
-                    await ws.send_json(pending)
-                    if trace_interval_s > 0:
-                        next_trace_send_at[key] = now + trace_interval_s
-                    else:
-                        next_trace_send_at.pop(key, None)
+                await _workspace_flush_pending_trace_messages(ws=ws, state=state)
                 continue
-            if not isinstance(msg, dict):
+            filtered = _workspace_filter_stream_message(
+                msg=msg,
+                workspace=workspace,
+                allowed_output_kinds=allowed_output_kinds,
+            )
+            if filtered is None:
                 continue
-            topic = str(msg.get("topic") or "").strip()
-            payload = msg.get("payload")
-            if not isinstance(payload, dict):
-                continue
-            msg_workspace = str(payload.get("workspace_id") or "").strip()
-            if msg_workspace != workspace:
-                continue
-            if topic not in {
-                "manager.stream_analysis.output",
-                "manager.stream_analysis.trace_ready",
-                "manager.stream_analysis.workspace_status",
-                "manager.stream_analysis.error",
-            }:
-                continue
-            if (
-                topic in {"manager.stream_analysis.output", "manager.stream_analysis.trace_ready"}
-                and allowed_output_kinds is not None
-            ):
-                kind = str(payload.get("kind") or "").strip()
-                if kind not in allowed_output_kinds:
-                    continue
+            topic, payload, msg_workspace = filtered
 
             if topic == "manager.stream_analysis.trace_ready":
-                output_id = str(payload.get("output_id") or "").strip()
-                node_id = str(payload.get("node_id") or "").strip()
-                shm_name = str(payload.get("shm_name") or "").strip()
-                seq_raw = payload.get("seq")
-                if not output_id or not node_id or not shm_name:
-                    continue
-                try:
-                    trace_seq = int(seq_raw)
-                except Exception:
-                    continue
-                reader_key = (msg_workspace, output_id)
-                reader = trace_readers.get(reader_key)
-                if reader is None or reader.name != shm_name:
-                    _close_trace_reader(reader_key)
-                    try:
-                        reader = ShmRingReader.attach(shm_name)
-                    except Exception:
-                        continue
-                    trace_readers[reader_key] = reader
-                event = reader.read_event(trace_seq)
-                if not isinstance(event, dict):
-                    continue
-                payload_bytes = event.get("payload")
-                if not isinstance(payload_bytes, (bytes, bytearray, memoryview)):
-                    continue
-                try:
-                    trace_arr = np.frombuffer(payload_bytes, dtype=reader.layout.dtype).reshape(
-                        tuple(int(v) for v in reader.layout.shape)
-                    )
-                except Exception:
-                    continue
-                trace_key = f"{msg_workspace}:{output_id}"
-                trace_flat = _apply_trace_average(trace_key, trace_arr.reshape(-1))
-                if trace_flat is None:
-                    continue
-                if trace_max_points is not None:
-                    trace_values = _decimate_trace_values(
-                        trace_flat,
-                        mode=trace_decimator,
-                        max_points=trace_max_points,
-                    )
-                else:
-                    trace_values = trace_flat.tolist()
-                trace_payload: dict[str, Any] = {
-                    "version": 1,
-                    "workspace_id": msg_workspace,
-                    "output_id": output_id,
-                    "node_id": node_id,
-                    "kind": "trace",
-                    "device_id": payload.get("device_id"),
-                    "stream": payload.get("stream"),
-                    "seq": int(event.get("seq") or trace_seq),
-                    "t0_mono_ns": event.get("t0_mono_ns"),
-                    "t0_wall_ns": event.get("t0_wall_ns"),
-                    "channel_index": payload.get("channel_index"),
-                    "channel_count": payload.get("channel_count"),
-                    "value": trace_values,
-                    "point_count": len(trace_values) if isinstance(trace_values, list) else 0,
-                }
-                if bool(payload.get("truncated")):
-                    trace_payload["truncated"] = True
-                if payload.get("context_id") is not None:
-                    trace_payload["context_id"] = payload.get("context_id")
-                if isinstance(payload.get("context_fields"), dict):
-                    trace_payload["context_fields"] = payload.get("context_fields")
-                await _send_trace_message(
+                handled = await _workspace_handle_trace_ready_message(
+                    ws=ws,
+                    state=state,
+                    payload=payload,
                     msg_workspace=msg_workspace,
-                    trace_payload=trace_payload,
-                    trace_msg={"topic": "manager.stream_analysis.output", "payload": trace_payload},
                 )
-                continue
+                if handled:
+                    continue
 
-            if (
-                topic == "manager.stream_analysis.output"
-                and str(payload.get("kind") or "").strip() == "trace"
-            ):
-                trace_payload = payload
-                points = _coerce_trace_array(payload.get("value"))
-                output_id = str(payload.get("output_id") or "").strip()
-                if points is not None and output_id:
-                    trace_key = f"{msg_workspace}:{output_id}"
-                    rolled = _apply_trace_average(trace_key, points)
-                    if rolled is None:
-                        continue
-                    decimated = (
-                        _decimate_trace_values(
-                            rolled,
-                            mode=trace_decimator,
-                            max_points=trace_max_points,
-                        )
-                        if trace_max_points is not None
-                        else rolled.tolist()
-                    )
-                    trace_payload = dict(payload)
-                    trace_payload["value"] = decimated
-                    trace_payload["point_count"] = (
-                        len(decimated) if isinstance(decimated, list) else 0
-                    )
-                    if trace_max_points is not None and len(decimated) < int(points.size):
-                        trace_payload["decimated"] = True
-                trace_msg = msg if trace_payload is payload else {**msg, "payload": trace_payload}
-                await _send_trace_message(
+            if topic == "manager.stream_analysis.output":
+                handled = await _workspace_handle_trace_output_message(
+                    ws=ws,
+                    state=state,
+                    msg=msg,
+                    payload=payload,
                     msg_workspace=msg_workspace,
-                    trace_payload=trace_payload,
-                    trace_msg=trace_msg,
                 )
-                continue
+                if handled:
+                    continue
+
             await ws.send_json(msg)
     except WebSocketDisconnect:
         pass
     finally:
-        for key in list(trace_readers.keys()):
-            _close_trace_reader(key)
+        for key in list(state.trace_readers.keys()):
+            _workspace_close_trace_reader(state, key)
         app.state.stream_analysis_hub.unsubscribe(q)
 
 
@@ -1599,3 +1885,4 @@ if _UI_DIST_PATH is not None:
         if candidate.is_file():
             return FileResponse(candidate)
         return FileResponse(_UI_DIST_PATH / "index.html")
+

@@ -338,7 +338,7 @@ export function InterlocksModal({
                 )}
               </Group>
               <Text size="xs" c="dimmed">
-                Registered order from <code>command_interceptor.list</code>.
+                Registered order from <code>manager.interceptors.list</code>.
               </Text>
               {commandInterceptorRoutesError && (
                 <Text size="xs" c="red">

@@ -16,6 +16,7 @@ import {
 } from "@mantine/core";
 import { useState, type MutableRefObject } from "react";
 import type { useCommandHistoryController } from "../features/commands/useCommandHistoryController";
+import type { CommandHistoryEntry } from "../features/commands/types";
 import { formatWallTimeSeconds } from "../features/logs/utils";
 import type { DeviceStatus } from "../types";
 import { DeviceNameInline } from "./DeviceNameInline";
@@ -82,6 +83,26 @@ function formatParamsDetailText(
   return raw || "{}";
 }
 
+function formatJsonDetailText(value: unknown): string {
+  try {
+    return JSON.stringify(value ?? {}, null, 2);
+  } catch {
+    return String(value ?? "{}");
+  }
+}
+
+function buildLiveRequestCopyPayload(row: CommandHistoryEntry): Record<string, unknown> {
+  return {
+    id: row.id,
+    ts_wall_s: row.ts_wall_s,
+    target_kind: row.target_kind,
+    target_id: row.target_id,
+    action: row.action,
+    params: row.params,
+    source: row.source,
+  };
+}
+
 export function CommandHistoryModal({
   opened,
   onClose,
@@ -95,6 +116,9 @@ export function CommandHistoryModal({
   >({});
   const [expandedRestoreParamsById, setExpandedRestoreParamsById] = useState<
     Record<number, boolean>
+  >({});
+  const [expandedLiveDetailsById, setExpandedLiveDetailsById] = useState<
+    Record<string, boolean>
   >({});
   const deviceById = new Map(devices.map((device) => [device.device_id, device]));
   const mode = controller.commandHistoryMode;
@@ -293,6 +317,8 @@ export function CommandHistoryModal({
                   const ok = row.response.ok === true;
                   const errorMessage =
                     row.response.error?.message ?? row.response.error?.code;
+                  const expanded = expandedLiveDetailsById[row.id] === true;
+                  const requestPayload = buildLiveRequestCopyPayload(row);
                   return (
                     <Card
                       key={row.id}
@@ -345,7 +371,22 @@ export function CommandHistoryModal({
                               size="compact-xs"
                               variant="subtle"
                               color="gray"
-                              onClick={() => onCopyJson("Request JSON", row)}
+                              onClick={() =>
+                                setExpandedLiveDetailsById((prev) => ({
+                                  ...prev,
+                                  [row.id]: !expanded,
+                                }))
+                              }
+                            >
+                              {expanded ? "Hide details" : "Show details"}
+                            </Button>
+                            <Button
+                              size="compact-xs"
+                              variant="subtle"
+                              color="gray"
+                              onClick={() =>
+                                onCopyJson("Request JSON", requestPayload)
+                              }
                             >
                               Copy request
                             </Button>
@@ -359,6 +400,36 @@ export function CommandHistoryModal({
                             </Button>
                           </Group>
                         </Group>
+                        {expanded && (
+                          <Stack gap={4}>
+                            <Text size="xs" c="dimmed">
+                              Request
+                            </Text>
+                            <Text
+                              size="xs"
+                              style={{
+                                whiteSpace: "pre-wrap",
+                                fontFamily: "monospace",
+                                wordBreak: "break-word",
+                              }}
+                            >
+                              {formatJsonDetailText(requestPayload)}
+                            </Text>
+                            <Text size="xs" c="dimmed">
+                              Reply
+                            </Text>
+                            <Text
+                              size="xs"
+                              style={{
+                                whiteSpace: "pre-wrap",
+                                fontFamily: "monospace",
+                                wordBreak: "break-word",
+                              }}
+                            >
+                              {formatJsonDetailText(row.response)}
+                            </Text>
+                          </Stack>
+                        )}
                       </Stack>
                     </Card>
                   );
