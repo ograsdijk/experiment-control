@@ -14,6 +14,7 @@ import numpy as np
 import zmq
 
 from ..capabilities import capabilities_payload, method, param
+from ..contracts.messages import ChunkReadyMessage, RpcActionRequest
 from ..schemas.measurement import (
     MeasurementSchema,
     measurement_schema_from_json,
@@ -30,8 +31,11 @@ from ..utils.cli_args import (
 )
 from ..utils.value_coercion import coerce_scalar
 from ..utils.logging_levels import normalize_log_severity
+from ..utils.rpc_dispatch import RpcDispatchRegistry
 from ..utils.yaml_helpers import load_yaml_file
 from ..utils.zmq_helpers import json_dumps, json_loads, safe_json_loads
+from .hdf_writer_context import coerce_context_value
+from .hdf_writer_topics import build_hdf_topic_handlers
 from .process_base import ManagedProcessBase
 
 Json = dict[str, Any]
@@ -50,6 +54,7 @@ DTYPE_MAP: dict[str, np.dtype[Any]] = {
 }
 DEFAULT_NUMERIC_COMPRESSION = "lzf"
 DEFAULT_NUMERIC_SHUFFLE = True
+DEFAULT_TELEMETRY_CHUNK_ROWS = 64
 
 
 def _default_filename() -> str:
@@ -148,6 +153,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--buffer-max-messages", type=int, default=200_000)
     p.add_argument("--flush-every-n", type=int, default=200)
     p.add_argument("--flush-every-s", type=float, default=2.0)
+    p.add_argument("--context-resolve-ttl-s", type=float, default=5.0)
+    p.add_argument("--context-pending-max-per-stream", type=int, default=10_000)
+    p.add_argument("--context-map-max-per-stream", type=int, default=20_000)
     p.add_argument("--disabled-devices", nargs="*", default=None)
     p.add_argument("--measurement-schema-path", default=None)
     p.add_argument("--autostart-writing", default=None)
@@ -165,7 +173,7 @@ def _schema_rpc(ctx: zmq.Context, endpoint: str, timeout_ms: int = 2000) -> Json
     sock.setsockopt(zmq.RCVTIMEO, timeout_ms)
     sock.setsockopt(zmq.LINGER, 0)
     try:
-        msg = {"action": "telemetry.schema.list"}
+        msg = {"action": "manager.telemetry.schema.list"}
         sock.send(json_dumps(msg))
         raw = sock.recv()
         resp = json_loads(raw)
@@ -240,7 +248,7 @@ def _create_device_dataset(
     dtypes: list[str],
     units: list[str],
     *,
-    chunk_size: int = 1024,
+    chunk_size: int = DEFAULT_TELEMETRY_CHUNK_ROWS,
 ) -> h5py.Dataset:
     device_group = telemetry_group.require_group(device_id)
 
@@ -273,7 +281,7 @@ def _ingest_schema(
     datasets: dict[str, h5py.Dataset],
     *,
     write_enabled: Callable[[str], bool] | None = None,
-    chunk_size: int = 1024,
+    chunk_size: int = DEFAULT_TELEMETRY_CHUNK_ROWS,
 ) -> dict[str, Json]:
     devices_raw = schema.get("devices", [])
     if not isinstance(devices_raw, list):
@@ -323,6 +331,9 @@ class HdfWriter(ManagedProcessBase):
         buffer_max_messages: int,
         flush_every_n: int,
         flush_every_s: float,
+        context_resolve_ttl_s: float = 5.0,
+        context_pending_max_per_stream: int = 10_000,
+        context_map_max_per_stream: int = 20_000,
         disabled_devices: list[str] | None = None,
         measurement_schema_path: str | None = None,
         autostart_writing: bool | str | None = None,
@@ -344,6 +355,16 @@ class HdfWriter(ManagedProcessBase):
         self._buffer_max_messages = int(buffer_max_messages)
         self._flush_every_n = int(flush_every_n)
         self._flush_every_s = float(flush_every_s)
+        batch_rows = max(64, min(max(1, self._flush_every_n), 2048))
+        self._telemetry_batch_rows = int(batch_rows)
+        self._event_batch_rows = int(batch_rows)
+        self._context_resolve_ttl_s = max(0.1, float(context_resolve_ttl_s))
+        self._context_pending_max_per_stream = max(
+            1, int(context_pending_max_per_stream)
+        )
+        self._context_map_max_per_stream = max(1, int(context_map_max_per_stream))
+        self._context_map_ttl_s = 60.0
+        self._context_map_written_margin = 512
         self._disabled_devices = self._normalize_device_ids(disabled_devices or [])
         self._measurement_schema_path = self._normalize_schema_path(measurement_schema_path)
         self._autostart_writing = self._normalize_autostart_writing(
@@ -389,13 +410,14 @@ class HdfWriter(ManagedProcessBase):
         self._context_columns_fetch_attempted = False
         self._sequencer_process_id = "sequencer"
         self._seen_context_ids: set[int] = set()
-        self._stream_context_id: dict[tuple[str, str], int] = {}
         self._datasets: dict[str, h5py.Dataset] = {}
         self._device_map: dict[str, Json] = {}
         self._sub: zmq.Socket | None = None
         self._poller: zmq.Poller | None = None
         self._buf: deque[Json] | None = None
         self._event_buf: deque[tuple[str, Json]] | None = None
+        self._telemetry_batch_buffers: dict[str, np.ndarray[Any, Any]] = {}
+        self._event_batch_buffer: np.ndarray[Any, Any] | None = None
         self._rpc_router: zmq.Socket | None = None
         self._rpc_endpoint: str | None = None
         self._dropped_local = 0
@@ -419,6 +441,14 @@ class HdfWriter(ManagedProcessBase):
         self._pending_stream_metadata: dict[tuple[str, str], dict[str, Any]] = {}
         self._stream_sessions: dict[tuple[str, str], int] = {}
         self._stream_active_session: dict[tuple[str, str], int] = {}
+        self._stream_context_by_seq: dict[tuple[str, str], dict[int, tuple[int, float]]] = {}
+        self._stream_pending_by_seq: dict[tuple[str, str], dict[int, Json]] = {}
+        self._stream_last_written_seq: dict[tuple[str, str], int] = {}
+        self._context_resolved_exact = 0
+        self._context_late_resolved = 0
+        self._context_written_minus1_missing = 0
+        self._context_evicted_pending_overflow = 0
+        self._context_evicted_map_overflow = 0
 
         self._process_id: str | None = None
         self._heartbeat_endpoint: str | None = None
@@ -429,6 +459,8 @@ class HdfWriter(ManagedProcessBase):
         self._next_write = 0.0
 
         self._error_counts: dict[str, int] = {}
+        self._rpc_registry = self._build_rpc_registry()
+        self._topic_handlers = self._build_topic_handlers()
 
     @staticmethod
     def _normalize_device_id(raw: Any) -> str | None:
@@ -530,7 +562,10 @@ class HdfWriter(ManagedProcessBase):
         items: list[Json] = []
         total_samples = 0
         total_data_bytes = 0
-        for key in sorted(self._stream_buffers.keys()):
+        keys = set(self._stream_buffers.keys())
+        keys.update(self._stream_pending_by_seq.keys())
+        keys.update(self._stream_context_by_seq.keys())
+        for key in sorted(keys):
             device_id, stream = key
             buf = self._stream_buffers.get(key, {})
             data_raw = buf.get("data") if isinstance(buf, dict) else []
@@ -542,7 +577,16 @@ class HdfWriter(ManagedProcessBase):
                     data_bytes += len(payload)
             total_samples += sample_count
             total_data_bytes += data_bytes
-            if sample_count <= 0 and data_bytes <= 0:
+            pending = self._stream_pending_by_seq.get(key, {})
+            pending_count = len(pending)
+            context_map = self._stream_context_by_seq.get(key, {})
+            context_count = len(context_map)
+            if (
+                sample_count <= 0
+                and data_bytes <= 0
+                and pending_count <= 0
+                and context_count <= 0
+            ):
                 continue
             item: Json = {
                 "device_id": device_id,
@@ -550,6 +594,10 @@ class HdfWriter(ManagedProcessBase):
                 "buffered_samples": int(sample_count),
                 "buffered_data_bytes": int(data_bytes),
             }
+            if pending_count:
+                item["pending_context_samples"] = int(pending_count)
+            if context_count:
+                item["context_map_entries"] = int(context_count)
             last_seq = self._stream_last_seq.get(key)
             if last_seq is not None:
                 item["last_seq"] = int(last_seq)
@@ -561,6 +609,12 @@ class HdfWriter(ManagedProcessBase):
                 item["session"] = int(session)
             items.append(item)
         return items, total_samples, total_data_bytes
+
+    def _stream_pending_context_count(self) -> int:
+        return sum(len(items) for items in self._stream_pending_by_seq.values())
+
+    def _stream_context_map_count(self) -> int:
+        return sum(len(items) for items in self._stream_context_by_seq.values())
 
     def _bump_error(self, key: str) -> None:
         self._error_counts[key] = self._error_counts.get(key, 0) + 1
@@ -901,6 +955,15 @@ class HdfWriter(ManagedProcessBase):
         for key in list(self._stream_buffers.keys()):
             if key[0] in disabled:
                 self._stream_buffers.pop(key, None)
+        for key in list(self._stream_pending_by_seq.keys()):
+            if key[0] in disabled:
+                self._stream_pending_by_seq.pop(key, None)
+        for key in list(self._stream_context_by_seq.keys()):
+            if key[0] in disabled:
+                self._stream_context_by_seq.pop(key, None)
+        for device_id in list(self._telemetry_batch_buffers.keys()):
+            if device_id in disabled:
+                self._telemetry_batch_buffers.pop(device_id, None)
 
     def _snapshot_file_state(self) -> dict[str, Any]:
         return {
@@ -933,7 +996,6 @@ class HdfWriter(ManagedProcessBase):
             "context_columns_ready": self._context_columns_ready,
             "context_columns_fetch_attempted": self._context_columns_fetch_attempted,
             "seen_context_ids": self._seen_context_ids,
-            "stream_context_id": self._stream_context_id,
             "datasets": self._datasets,
             "device_map": self._device_map,
             "stream_datasets": self._stream_datasets,
@@ -943,6 +1005,14 @@ class HdfWriter(ManagedProcessBase):
             "pending_stream_metadata": self._pending_stream_metadata,
             "stream_sessions": self._stream_sessions,
             "stream_active_session": self._stream_active_session,
+            "stream_context_by_seq": self._stream_context_by_seq,
+            "stream_pending_by_seq": self._stream_pending_by_seq,
+            "stream_last_written_seq": self._stream_last_written_seq,
+            "context_resolved_exact": self._context_resolved_exact,
+            "context_late_resolved": self._context_late_resolved,
+            "context_written_minus1_missing": self._context_written_minus1_missing,
+            "context_evicted_pending_overflow": self._context_evicted_pending_overflow,
+            "context_evicted_map_overflow": self._context_evicted_map_overflow,
             "pending": self._pending,
             "last_flush": self._last_flush,
             "next_write": self._next_write,
@@ -978,7 +1048,6 @@ class HdfWriter(ManagedProcessBase):
         self._context_columns_ready = state["context_columns_ready"]
         self._context_columns_fetch_attempted = state["context_columns_fetch_attempted"]
         self._seen_context_ids = state["seen_context_ids"]
-        self._stream_context_id = state["stream_context_id"]
         self._datasets = state["datasets"]
         self._device_map = state["device_map"]
         self._stream_datasets = state["stream_datasets"]
@@ -988,6 +1057,20 @@ class HdfWriter(ManagedProcessBase):
         self._pending_stream_metadata = state["pending_stream_metadata"]
         self._stream_sessions = state["stream_sessions"]
         self._stream_active_session = state["stream_active_session"]
+        self._stream_context_by_seq = state["stream_context_by_seq"]
+        self._stream_pending_by_seq = state["stream_pending_by_seq"]
+        self._stream_last_written_seq = state["stream_last_written_seq"]
+        self._context_resolved_exact = int(state["context_resolved_exact"])
+        self._context_late_resolved = int(state["context_late_resolved"])
+        self._context_written_minus1_missing = int(
+            state["context_written_minus1_missing"]
+        )
+        self._context_evicted_pending_overflow = int(
+            state["context_evicted_pending_overflow"]
+        )
+        self._context_evicted_map_overflow = int(
+            state["context_evicted_map_overflow"]
+        )
         self._pending = int(state["pending"])
         self._last_flush = float(state["last_flush"])
         self._next_write = float(state["next_write"])
@@ -1021,7 +1104,6 @@ class HdfWriter(ManagedProcessBase):
         self._context_columns_ready = False
         self._context_columns_fetch_attempted = False
         self._seen_context_ids = set()
-        self._stream_context_id = {}
         self._datasets = {}
         self._device_map = {}
         self._stream_datasets = {}
@@ -1031,6 +1113,16 @@ class HdfWriter(ManagedProcessBase):
         self._pending_stream_metadata = {}
         self._stream_sessions = {}
         self._stream_active_session = {}
+        self._stream_context_by_seq = {}
+        self._stream_pending_by_seq = {}
+        self._stream_last_written_seq = {}
+        self._context_resolved_exact = 0
+        self._context_late_resolved = 0
+        self._context_written_minus1_missing = 0
+        self._context_evicted_pending_overflow = 0
+        self._context_evicted_map_overflow = 0
+        self._telemetry_batch_buffers = {}
+        self._event_batch_buffer = None
 
     def _configure_active_file(
         self,
@@ -1053,6 +1145,11 @@ class HdfWriter(ManagedProcessBase):
         h5.attrs["write_every_s"] = float(write_every_s)
         h5.attrs["drop_policy"] = str(self._drop_policy)
         h5.attrs["event_log_mode"] = str(self._event_log_mode)
+        h5.attrs["context_resolve_ttl_s"] = float(self._context_resolve_ttl_s)
+        h5.attrs["context_pending_max_per_stream"] = int(
+            self._context_pending_max_per_stream
+        )
+        h5.attrs["context_map_max_per_stream"] = int(self._context_map_max_per_stream)
         h5.attrs["dropped_local_messages_total"] = 0
         h5.attrs["dropped_event_messages_total"] = 0
         h5.attrs["disabled_devices_json"] = json.dumps(sorted(self._disabled_devices))
@@ -1247,6 +1344,42 @@ class HdfWriter(ManagedProcessBase):
 
         return str(h5.filename)
 
+    def _stop_writing_file(self) -> str | None:
+        h5 = self._h5
+        if h5 is None:
+            return None
+        file_path = str(h5.filename)
+        errors: list[str] = []
+        try:
+            self._drain_pending_to_file()
+        except Exception as e:
+            self._bump_error("stop_writing.drain")
+            errors.append(f"drain_pending failed: {e}")
+        try:
+            self._mark_active_measurement_ended()
+        except Exception as e:
+            self._bump_error("stop_writing.measurement_end")
+            errors.append(f"mark_measurement_ended failed: {e}")
+        try:
+            h5.flush()
+        except Exception as e:
+            self._bump_error("stop_writing.flush")
+            errors.append(f"flush failed: {e}")
+        try:
+            h5.close()
+        except Exception as e:
+            self._bump_error("stop_writing.close")
+            errors.append(f"close failed: {e}")
+        self._h5 = None
+        self._reset_per_file_state()
+        self._pending = 0
+        now = time.monotonic()
+        self._last_flush = now
+        self._next_write = now + max(0.1, float(self._write_every_s))
+        if errors:
+            raise RuntimeError("; ".join(errors))
+        return file_path
+
     def close(self) -> None:
         self._stop_evt.set()
 
@@ -1355,7 +1488,7 @@ class HdfWriter(ManagedProcessBase):
                             self._ctx,
                             self._manager_rpc,
                             {
-                                "type": "process.rpc.advertise",
+                                "type": "manager.processes.rpc.advertise",
                                 "process_id": self._process_id,
                                 "rpc_endpoint": self._rpc_endpoint,
                             },
@@ -1498,7 +1631,7 @@ class HdfWriter(ManagedProcessBase):
                 self._ctx,
                 self._manager_rpc,
                 {
-                    "type": "process.rpc",
+                    "type": "manager.processes.rpc",
                     "process_id": self._sequencer_process_id,
                     "request": {
                         "type": "sequencer.loaded_yaml",
@@ -1581,6 +1714,7 @@ class HdfWriter(ManagedProcessBase):
     def _drain_socket(self) -> None:
         if self._sub is None or self._buf is None:
             return
+        handlers = self._ensure_topic_handlers()
         while True:
             try:
                 topic_b, payload_b = self._sub.recv_multipart(flags=zmq.NOBLOCK)
@@ -1591,42 +1725,10 @@ class HdfWriter(ManagedProcessBase):
             msg = safe_json_loads(payload_b)
             if not isinstance(msg, dict):
                 continue
-
-            if topic == "manager.telemetry_update":
-                device_id = self._normalize_device_id(msg.get("device_id"))
-                if device_id is None or not self._is_device_enabled(device_id):
-                    continue
-                self._buffer_append(topic=topic, msg=msg)
+            handler = handlers.get(topic)
+            if handler is None:
                 continue
-
-            if topic == "manager.chunk_ready":
-                self._handle_chunk_ready(msg)
-                continue
-
-            if topic == "manager.device_config":
-                self._handle_device_config(msg)
-                continue
-
-            if topic == "manager.run_metadata":
-                device_id = self._normalize_device_id(msg.get("device_id"))
-                if device_id is None or not self._is_device_enabled(device_id):
-                    continue
-                self._handle_run_metadata(msg)
-                continue
-
-            if topic in {"manager.command", "manager.log"}:
-                if topic == "manager.command":
-                    device_id = self._normalize_device_id(msg.get("device_id"))
-                    if device_id is None or not self._is_device_enabled(device_id):
-                        continue
-                if not self._should_keep_event(topic=topic, msg=msg):
-                    continue
-                self._buffer_event(topic=topic, msg=msg)
-                continue
-
-            if topic == "sequencer.lifecycle":
-                self._handle_sequencer_lifecycle(msg)
-                continue
+            handler(msg)
 
     def _ensure_device(self, device_id: str) -> bool:
         if not self._is_device_enabled(device_id):
@@ -1648,6 +1750,65 @@ class HdfWriter(ManagedProcessBase):
             return False
         return device_id in self._datasets
 
+    def _append_dataset_rows(
+        self,
+        *,
+        ds: h5py.Dataset,
+        batch: np.ndarray[Any, Any],
+        count: int,
+    ) -> None:
+        n = int(count)
+        if n <= 0:
+            return
+        old = int(ds.shape[0])
+        ds.resize((old + n,))
+        ds[old : old + n] = batch[:n]
+        self._pending += n
+
+    def _ensure_telemetry_batch_buffer(
+        self,
+        *,
+        device_id: str,
+        dtype: np.dtype[Any],
+    ) -> np.ndarray[Any, Any]:
+        batch = self._telemetry_batch_buffers.get(device_id)
+        if (
+            batch is None
+            or batch.shape[0] != self._telemetry_batch_rows
+            or batch.dtype != dtype
+        ):
+            batch = np.zeros(self._telemetry_batch_rows, dtype=dtype)
+            self._telemetry_batch_buffers[device_id] = batch
+        return batch
+
+    def _flush_telemetry_batch(
+        self,
+        *,
+        device_id: str,
+        ds: h5py.Dataset,
+        used: int,
+    ) -> None:
+        batch = self._telemetry_batch_buffers.get(device_id)
+        if batch is None:
+            return
+        self._append_dataset_rows(ds=ds, batch=batch, count=used)
+
+    def _prune_telemetry_batch_buffers(self) -> None:
+        for device_id in list(self._telemetry_batch_buffers.keys()):
+            if device_id not in self._datasets:
+                self._telemetry_batch_buffers.pop(device_id, None)
+
+    def _ensure_event_batch_buffer(self, *, dtype: np.dtype[Any]) -> np.ndarray[Any, Any]:
+        batch = self._event_batch_buffer
+        if (
+            batch is None
+            or batch.shape[0] != self._event_batch_rows
+            or batch.dtype != dtype
+        ):
+            batch = np.zeros(self._event_batch_rows, dtype=dtype)
+            self._event_batch_buffer = batch
+        return batch
+
     def _write_event_rows(self) -> None:
         if self._event_buf is None:
             return
@@ -1655,7 +1816,16 @@ class HdfWriter(ManagedProcessBase):
             self._event_buf.clear()
             return
 
-        rows: list[np.void] = []
+        batch = self._ensure_event_batch_buffer(dtype=self._events_ds.dtype)
+        used = 0
+
+        def _flush() -> None:
+            nonlocal used
+            if used <= 0:
+                return
+            self._append_dataset_rows(ds=self._events_ds, batch=batch, count=used)
+            used = 0
+
         while self._event_buf:
             topic, msg = self._event_buf.popleft()
             ts = msg.get("ts", {})
@@ -1666,491 +1836,645 @@ class HdfWriter(ManagedProcessBase):
                 device_id = self._normalize_device_id(msg.get("device_id"))
                 if device_id is None or not self._is_device_enabled(device_id):
                     continue
-                row = np.zeros(1, dtype=self._events_ds.dtype)
-                row[0]["t_wall"] = t_wall
-                row[0]["t_mono"] = t_mono
-                row[0]["kind"] = "command"
-                row[0]["severity"] = "info"
-                row[0]["device_id"] = device_id
-                row[0]["action"] = str(msg.get("action", ""))
-                row[0]["params_json"] = str(msg.get("params_json", ""))
-                row[0]["ok"] = bool(msg.get("ok", False))
-                row[0]["error"] = str(msg.get("error", "") or "")
-                row[0]["result_json"] = str(msg.get("result_json", ""))
-                row[0]["topic"] = topic
-                row[0]["message"] = ""
-                row[0]["payload_json"] = ""
-                rows.append(row[0])
+                if used >= batch.shape[0]:
+                    _flush()
+                row = batch[used]
+                row["t_wall"] = t_wall
+                row["t_mono"] = t_mono
+                row["kind"] = "command"
+                row["severity"] = "info"
+                row["device_id"] = device_id
+                row["action"] = str(msg.get("action", ""))
+                row["params_json"] = str(msg.get("params_json", ""))
+                row["ok"] = bool(msg.get("ok", False))
+                row["error"] = str(msg.get("error", "") or "")
+                row["result_json"] = str(msg.get("result_json", ""))
+                row["topic"] = topic
+                row["message"] = ""
+                row["payload_json"] = ""
+                used += 1
             elif topic == "manager.log":
-                row = np.zeros(1, dtype=self._events_ds.dtype)
-                row[0]["t_wall"] = t_wall
-                row[0]["t_mono"] = t_mono
-                row[0]["kind"] = "event"
-                row[0]["severity"] = str(msg.get("severity", ""))
-                row[0]["device_id"] = str(msg.get("device_id", "") or "")
-                row[0]["action"] = ""
-                row[0]["params_json"] = ""
-                row[0]["ok"] = False
-                row[0]["error"] = str(msg.get("error", "") or "")
-                row[0]["result_json"] = ""
-                row[0]["topic"] = str(msg.get("topic", "") or "")
-                row[0]["message"] = str(msg.get("message", "") or "")
-                row[0]["payload_json"] = str(msg.get("payload_json", "") or "")
-                rows.append(row[0])
+                if used >= batch.shape[0]:
+                    _flush()
+                row = batch[used]
+                row["t_wall"] = t_wall
+                row["t_mono"] = t_mono
+                row["kind"] = "event"
+                row["severity"] = str(msg.get("severity", ""))
+                row["device_id"] = str(msg.get("device_id", "") or "")
+                row["action"] = ""
+                row["params_json"] = ""
+                row["ok"] = False
+                row["error"] = str(msg.get("error", "") or "")
+                row["result_json"] = ""
+                row["topic"] = str(msg.get("topic", "") or "")
+                row["message"] = str(msg.get("message", "") or "")
+                row["payload_json"] = str(msg.get("payload_json", "") or "")
+                used += 1
+        _flush()
 
-        if not rows:
-            return
-        n = len(rows)
-        old = self._events_ds.shape[0]
-        self._events_ds.resize((old + n,))
-        self._events_ds[old : old + n] = np.array(rows, dtype=self._events_ds.dtype)
-        self._pending += n
+    def _build_rpc_registry(self) -> RpcDispatchRegistry:
+        return RpcDispatchRegistry(
+            handlers={
+                "hdf.status": self._rpc_hdf_status,
+                "hdf.writing.start": self._rpc_hdf_writing_start,
+                "hdf.writing.stop": self._rpc_hdf_writing_stop,
+                "hdf.measurement.schema.get": self._rpc_hdf_measurement_schema_get,
+                "hdf.measurement.note": self._rpc_hdf_measurement_note,
+                "hdf.devices.get": self._rpc_hdf_devices_get,
+                "hdf.devices.disable": self._rpc_hdf_devices_disable,
+                "hdf.devices.enable": self._rpc_hdf_devices_enable,
+                "hdf.rotate": self._rpc_hdf_rotate,
+            },
+            aliases={
+                "hdf.get_status": "hdf.status",
+                "hdf.get_measurement_schema": "hdf.measurement.schema.get",
+                "hdf.add_measurement_note": "hdf.measurement.note",
+                "hdf.get_devices": "hdf.devices.get",
+                "hdf.disable_devices": "hdf.devices.disable",
+                "hdf.enable_devices": "hdf.devices.enable",
+                "hdf.rotate_file": "hdf.rotate",
+            },
+        )
+
+    @staticmethod
+    def _rpc_request_id(req: Json) -> Any:
+        return req.get("request_id")
+
+    def _build_topic_handlers(self) -> dict[str, Callable[[Json], None]]:
+        return build_hdf_topic_handlers(self)
+
+    def _ensure_topic_handlers(self) -> dict[str, Callable[[Json], None]]:
+        handlers = getattr(self, "_topic_handlers", None)
+        if isinstance(handlers, dict):
+            return handlers
+        handlers = self._build_topic_handlers()
+        self._topic_handlers = handlers
+        return handlers
+
+    def _rpc_ok(self, req: Json, *, result: Any) -> Json:
+        return {
+            "request_id": self._rpc_request_id(req),
+            "ok": True,
+            "result": result,
+        }
+
+    def _rpc_error(self, req: Json, *, code: str, message: str | None = None) -> Json:
+        err: Json = {"code": str(code)}
+        if message is not None:
+            err["message"] = str(message)
+        return {
+            "request_id": self._rpc_request_id(req),
+            "ok": False,
+            "error": err,
+        }
+
+    def _hdf_capability_members(self) -> list[Json]:
+        members = [
+            method("hdf.status", params=None, doc="Get writer status."),
+            method(
+                "hdf.writing.start",
+                params=[
+                    param(
+                        "filename",
+                        required=False,
+                        default=None,
+                        annotation="str",
+                    ),
+                    param(
+                        "disabled_devices",
+                        required=False,
+                        default=None,
+                        annotation="list[str]",
+                    ),
+                    param(
+                        "measurement_profile",
+                        required=False,
+                        default=None,
+                        annotation="str",
+                    ),
+                    param(
+                        "measurement_values",
+                        required=False,
+                        default=None,
+                        annotation="dict",
+                    ),
+                ],
+                doc="Start writing to a new file when currently inactive.",
+            ),
+            method(
+                "hdf.writing.stop",
+                params=None,
+                doc="Stop writing and close the active file while keeping process alive.",
+            ),
+            method("hdf.devices.get", params=None, doc="Get HDF device write filter."),
+            method(
+                "hdf.devices.disable",
+                params=[
+                    param(
+                        "device_ids",
+                        required=True,
+                        default=None,
+                        annotation="list[str]",
+                    ),
+                ],
+                doc="Disable writing for device_ids.",
+            ),
+            method(
+                "hdf.devices.enable",
+                params=[
+                    param(
+                        "device_ids",
+                        required=True,
+                        default=None,
+                        annotation="list[str]",
+                    ),
+                ],
+                doc="Enable writing for device_ids.",
+            ),
+            method(
+                "hdf.rotate",
+                params=[
+                    param(
+                        "filename",
+                        required=False,
+                        default=None,
+                        annotation="str",
+                    ),
+                    param(
+                        "disabled_devices",
+                        required=False,
+                        default=None,
+                        annotation="list[str]",
+                    ),
+                    param(
+                        "measurement_profile",
+                        required=False,
+                        default=None,
+                        annotation="str",
+                    ),
+                    param(
+                        "measurement_values",
+                        required=False,
+                        default=None,
+                        annotation="dict",
+                    ),
+                ],
+                doc="Rotate writer output to a new file.",
+            ),
+        ]
+        if self._measurement_schema_path is not None:
+            members.extend(
+                [
+                    method(
+                        "hdf.measurement.schema.get",
+                        params=None,
+                        doc="Get configured measurement schema (profiles + note fields).",
+                    ),
+                    method(
+                        "hdf.measurement.note",
+                        params=[
+                            param("author", required=True, default=None, annotation="str"),
+                            param("kind", required=False, default="note", annotation="str"),
+                            param("message", required=True, default=None, annotation="str"),
+                            param("payload", required=False, default=None, annotation="dict"),
+                        ],
+                        doc="Append a measurement note row to /measurement/notes.",
+                    ),
+                ]
+            )
+        return self._with_common_capabilities(members)
+
+    def _hdf_device_filter_state(self) -> Json:
+        known = self._known_devices()
+        disabled = sorted(self._disabled_devices)
+        disabled_set = set(disabled)
+        enabled_known = [did for did in known if did not in disabled_set]
+        return {
+            "disabled_devices": disabled,
+            "known_devices": known,
+            "enabled_known_devices": enabled_known,
+        }
+
+    def _rpc_hdf_status(self, req: Json) -> Json:
+        schema_configured, schema_available, schema_error = self._measurement_schema_state()
+        stream_buffered, stream_buffered_samples, stream_buffered_data_bytes = (
+            self._stream_buffer_snapshot()
+        )
+        telemetry_buffer_depth = len(self._buf) if self._buf is not None else 0
+        telemetry_buffer_capacity = (
+            int(self._buf.maxlen)
+            if self._buf is not None and self._buf.maxlen is not None
+            else None
+        )
+        event_buffer_depth = len(self._event_buf) if self._event_buf is not None else 0
+        event_buffer_capacity = (
+            int(self._event_buf.maxlen)
+            if self._event_buf is not None and self._event_buf.maxlen is not None
+            else None
+        )
+        result = {
+            "file": str(self._h5.filename) if self._h5 is not None else None,
+            "writing_active": self._h5 is not None,
+            "autostart_writing": bool(self._autostart_writing),
+            "pending": int(self._pending),
+            "dropped": int(self._dropped_local),
+            "dropped_by_topic": dict(self._dropped_local_by_topic),
+            "dropped_events": int(self._dropped_events),
+            "telemetry_buffer_depth": int(telemetry_buffer_depth),
+            "telemetry_buffer_capacity": telemetry_buffer_capacity,
+            "event_buffer_depth": int(event_buffer_depth),
+            "event_buffer_capacity": event_buffer_capacity,
+            "stream_buffered_streams": int(len(stream_buffered)),
+            "stream_buffered_samples": int(stream_buffered_samples),
+            "stream_buffered_data_bytes": int(stream_buffered_data_bytes),
+            "stream_buffered": stream_buffered,
+            "stream_pending_context_samples": int(self._stream_pending_context_count()),
+            "stream_context_map_entries": int(self._stream_context_map_count()),
+            "stream_context_entries": int(self._stream_context_map_count()),
+            "context_resolved_exact": int(self._context_resolved_exact),
+            "context_late_resolved": int(self._context_late_resolved),
+            "context_written_minus1_missing": int(self._context_written_minus1_missing),
+            "context_evicted_pending_overflow": int(
+                self._context_evicted_pending_overflow
+            ),
+            "context_evicted_map_overflow": int(self._context_evicted_map_overflow),
+            "seen_context_ids_count": int(len(self._seen_context_ids)),
+            "event_log_mode": str(self._event_log_mode),
+            "measurement_id": self._measurement_id,
+            "measurement_type": self._measurement_type,
+            "measurement_schema_version": self._measurement_schema_version,
+            "measurement_started_wall_ns": self._measurement_started_wall_ns,
+            "measurement_ended_wall_ns": self._measurement_ended_wall_ns,
+            "measurement_notes_rows": int(self._measurement_notes_ds.shape[0])
+            if self._measurement_notes_ds is not None
+            else 0,
+            "measurement_schema_configured": bool(schema_configured),
+            "measurement_schema_available": bool(schema_available),
+            "measurement_schema_path": self._measurement_schema_source
+            or self._measurement_schema_path,
+            "measurement_schema_error": schema_error,
+            "sequencer_event_rows": int(self._sequencer_events_ds.shape[0])
+            if self._sequencer_events_ds is not None
+            else 0,
+            "sequencer_yaml_snapshots": int(self._sequencer_yaml_ds.shape[0])
+            if self._sequencer_yaml_ds is not None
+            else 0,
+        }
+        result.update(self._hdf_device_filter_state())
+        return self._rpc_ok(req, result=result)
+
+    def _rpc_hdf_measurement_schema_get(self, req: Json) -> Json:
+        configured, available, error = self._measurement_schema_state()
+        if not configured:
+            return self._rpc_error(
+                req,
+                code="measurement_schema_not_configured",
+                message="measurement schema path is not configured",
+            )
+        if not available or self._measurement_schema is None:
+            return self._rpc_error(
+                req,
+                code="measurement_schema_unavailable",
+                message=error or "measurement schema unavailable",
+            )
+        return self._rpc_ok(
+            req,
+            result={
+                "schema": measurement_schema_to_json(self._measurement_schema),
+                "path": self._measurement_schema_source or self._measurement_schema_path,
+            },
+        )
+
+    def _rpc_hdf_measurement_note(self, req: Json) -> Json:
+        params = req.get("params", {})
+        if params is None:
+            params = {}
+        if not isinstance(params, dict):
+            return self._rpc_error(
+                req, code="invalid_params", message="params must be a dict"
+            )
+        configured, available, error = self._measurement_schema_state()
+        if not configured:
+            return self._rpc_error(
+                req,
+                code="measurement_schema_not_configured",
+                message="measurement schema path is not configured",
+            )
+        if not available or self._measurement_schema is None:
+            return self._rpc_error(
+                req,
+                code="measurement_schema_unavailable",
+                message=error or "measurement schema unavailable",
+            )
+        try:
+            core, payload = normalize_measurement_note_values(
+                self._measurement_schema,
+                values=params,
+            )
+        except Exception as e:
+            return self._rpc_error(req, code="invalid_params", message=str(e))
+        try:
+            payload_json = json.dumps(payload)
+        except Exception as e:
+            return self._rpc_error(req, code="invalid_params", message=str(e))
+        try:
+            index, t_wall, t_mono = self._append_measurement_note_row(
+                author=str(core.get("author", "")),
+                kind=str(core.get("kind", "note")),
+                message=str(core.get("message", "")),
+                payload_json=payload_json,
+            )
+        except Exception as e:
+            return self._rpc_error(req, code="note_write_failed", message=str(e))
+        return self._rpc_ok(
+            req,
+            result={
+                "index": int(index),
+                "t_wall": float(t_wall),
+                "t_mono": float(t_mono),
+                "author": str(core.get("author", "")),
+                "kind": str(core.get("kind", "note")),
+            },
+        )
+
+    def _rpc_hdf_devices_get(self, req: Json) -> Json:
+        return self._rpc_ok(req, result=self._hdf_device_filter_state())
+
+    def _rpc_hdf_devices_disable(self, req: Json) -> Json:
+        return self._rpc_hdf_devices_toggle(req, disable=True)
+
+    def _rpc_hdf_devices_enable(self, req: Json) -> Json:
+        return self._rpc_hdf_devices_toggle(req, disable=False)
+
+    def _rpc_hdf_devices_toggle(self, req: Json, *, disable: bool) -> Json:
+        params = req.get("params", {})
+        if not isinstance(params, dict):
+            return self._rpc_error(req, code="invalid_params", message="params must be a dict")
+        try:
+            ids = self._normalize_device_id_list(params.get("device_ids"))
+        except Exception as e:
+            return self._rpc_error(req, code="invalid_params", message=str(e))
+        if not ids:
+            return self._rpc_error(
+                req,
+                code="invalid_params",
+                message="device_ids must contain at least one id",
+            )
+
+        known = set(self._known_devices())
+        unknown = sorted([did for did in ids if did not in known])
+        changed: list[str] = []
+        if disable:
+            for did in ids:
+                if did not in self._disabled_devices:
+                    self._disabled_devices.add(did)
+                    changed.append(did)
+            if changed:
+                self._clear_buffered_for_disabled(set(changed))
+        else:
+            for did in ids:
+                if did in self._disabled_devices:
+                    self._disabled_devices.remove(did)
+                    changed.append(did)
+            if changed and self._telemetry_group is not None:
+                try:
+                    schema = _schema_rpc(self._ctx, self._manager_rpc)
+                    self._device_map = _ingest_schema(
+                        schema,
+                        self._telemetry_group,
+                        self._datasets,
+                        write_enabled=self._is_device_enabled,
+                    )
+                except Exception:
+                    self._bump_error("schema.rpc")
+
+        if self._h5 is not None:
+            try:
+                self._h5.attrs["disabled_devices_json"] = json.dumps(
+                    sorted(self._disabled_devices)
+                )
+            except Exception:
+                self._bump_error("h5.attrs.disabled_devices")
+
+        return self._rpc_ok(
+            req,
+            result={
+                "changed": changed,
+                "unknown": unknown,
+                **self._hdf_device_filter_state(),
+            },
+        )
+
+    def _rpc_hdf_rotate(self, req: Json) -> Json:
+        params = req.get("params", {})
+        if params is None:
+            params = {}
+        if not isinstance(params, dict):
+            return self._rpc_error(req, code="invalid_params", message="params must be a dict")
+
+        filename_raw = params.get("filename")
+        filename: str | None = None
+        if filename_raw is not None:
+            filename = str(filename_raw).strip()
+            if not filename:
+                return self._rpc_error(
+                    req,
+                    code="invalid_params",
+                    message="filename must be a non-empty string",
+                )
+
+        disabled_override: set[str] | None = None
+        unknown: list[str] = []
+        if "disabled_devices" in params:
+            try:
+                disabled_override = self._normalize_device_ids(
+                    params.get("disabled_devices")
+                )
+            except Exception as e:
+                return self._rpc_error(req, code="invalid_params", message=str(e))
+            known = set(self._known_devices())
+            unknown = sorted([did for did in disabled_override if did not in known])
+
+        measurement_profile: str | None = None
+        if "measurement_profile" in params:
+            raw_profile = params.get("measurement_profile")
+            if raw_profile is not None:
+                profile_text = str(raw_profile).strip()
+                if not profile_text:
+                    return self._rpc_error(
+                        req,
+                        code="invalid_params",
+                        message="measurement_profile must be a non-empty string",
+                    )
+                measurement_profile = profile_text
+
+        measurement_values: object = params.get("measurement_values", {})
+        if measurement_values is None:
+            measurement_values = {}
+        if not isinstance(measurement_values, dict):
+            return self._rpc_error(
+                req,
+                code="invalid_params",
+                message="measurement_values must be a dict",
+            )
+
+        try:
+            old_file, new_file = self._rotate_file(
+                filename=filename,
+                disabled_devices=disabled_override,
+                measurement_profile=measurement_profile,
+                measurement_values=measurement_values,
+            )
+        except FileExistsError as e:
+            return self._rpc_error(req, code="file_exists", message=str(e))
+        except Exception as e:
+            return self._rpc_error(req, code="rotate_failed", message=str(e))
+
+        return self._rpc_ok(
+            req,
+            result={
+                "old_file": old_file,
+                "new_file": new_file,
+                "measurement_id": self._measurement_id,
+                "measurement_type": self._measurement_type,
+                "unknown": unknown,
+                **self._hdf_device_filter_state(),
+            },
+        )
+
+    def _rpc_hdf_writing_stop(self, req: Json) -> Json:
+        params = req.get("params", {})
+        if params is None:
+            params = {}
+        if not isinstance(params, dict):
+            return self._rpc_error(req, code="invalid_params", message="params must be a dict")
+        if self._h5 is None:
+            return self._rpc_ok(
+                req,
+                result={
+                    "already_stopped": True,
+                    "old_file": None,
+                    **self._hdf_device_filter_state(),
+                },
+            )
+        try:
+            old_file = self._stop_writing_file()
+        except Exception as e:
+            return self._rpc_error(req, code="stop_failed", message=str(e))
+        return self._rpc_ok(
+            req,
+            result={
+                "already_stopped": False,
+                "old_file": old_file,
+                **self._hdf_device_filter_state(),
+            },
+        )
+
+    def _rpc_hdf_writing_start(self, req: Json) -> Json:
+        params = req.get("params", {})
+        if params is None:
+            params = {}
+        if not isinstance(params, dict):
+            return self._rpc_error(req, code="invalid_params", message="params must be a dict")
+        if self._h5 is not None:
+            return self._rpc_error(
+                req, code="already_writing", message="HDF writer is already writing"
+            )
+
+        filename_raw = params.get("filename")
+        filename: str | None = None
+        if filename_raw is not None:
+            filename = str(filename_raw).strip()
+            if not filename:
+                return self._rpc_error(
+                    req,
+                    code="invalid_params",
+                    message="filename must be a non-empty string",
+                )
+
+        disabled_override: set[str] | None = None
+        unknown: list[str] = []
+        if "disabled_devices" in params:
+            try:
+                disabled_override = self._normalize_device_ids(
+                    params.get("disabled_devices")
+                )
+            except Exception as e:
+                return self._rpc_error(req, code="invalid_params", message=str(e))
+            known = set(self._known_devices())
+            unknown = sorted([did for did in disabled_override if did not in known])
+
+        measurement_profile: str | None = None
+        if "measurement_profile" in params:
+            raw_profile = params.get("measurement_profile")
+            if raw_profile is not None:
+                profile_text = str(raw_profile).strip()
+                if not profile_text:
+                    return self._rpc_error(
+                        req,
+                        code="invalid_params",
+                        message="measurement_profile must be a non-empty string",
+                    )
+                measurement_profile = profile_text
+
+        measurement_values: object = params.get("measurement_values", {})
+        if measurement_values is None:
+            measurement_values = {}
+        if not isinstance(measurement_values, dict):
+            return self._rpc_error(
+                req,
+                code="invalid_params",
+                message="measurement_values must be a dict",
+            )
+
+        try:
+            new_file = self._start_writing_file(
+                filename=filename,
+                disabled_devices=disabled_override,
+                measurement_profile=measurement_profile,
+                measurement_values=measurement_values,
+            )
+        except FileExistsError as e:
+            return self._rpc_error(req, code="file_exists", message=str(e))
+        except Exception as e:
+            return self._rpc_error(req, code="start_failed", message=str(e))
+
+        return self._rpc_ok(
+            req,
+            result={
+                "new_file": new_file,
+                "measurement_id": self._measurement_id,
+                "measurement_type": self._measurement_type,
+                "unknown": unknown,
+                **self._hdf_device_filter_state(),
+            },
+        )
 
     def _handle_rpc(self, req: Json) -> Json:
-        request_id = req.get("request_id")
-        rtype = req.get("type", "")
         common = self._handle_common_rpc(req)
         if common is not None:
             return common
 
-        if rtype == "process.capabilities":
-            members = [
-                method("hdf.status", params=None, doc="Get writer status."),
-                method("hdf.devices.get", params=None, doc="Get HDF device write filter."),
-                method(
-                    "hdf.devices.disable",
-                    params=[
-                        param(
-                            "device_ids",
-                            required=True,
-                            default=None,
-                            annotation="list[str]",
-                        ),
-                    ],
-                    doc="Disable writing for device_ids.",
-                ),
-                method(
-                    "hdf.devices.enable",
-                    params=[
-                        param(
-                            "device_ids",
-                            required=True,
-                            default=None,
-                            annotation="list[str]",
-                        ),
-                    ],
-                    doc="Enable writing for device_ids.",
-                ),
-                method(
-                    "hdf.rotate",
-                    params=[
-                        param(
-                            "filename",
-                            required=False,
-                            default=None,
-                            annotation="str",
-                        ),
-                        param(
-                            "disabled_devices",
-                            required=False,
-                            default=None,
-                            annotation="list[str]",
-                        ),
-                        param(
-                            "measurement_profile",
-                            required=False,
-                            default=None,
-                            annotation="str",
-                        ),
-                        param(
-                            "measurement_values",
-                            required=False,
-                            default=None,
-                            annotation="dict",
-                        ),
-                    ],
-                    doc="Rotate writer output to a new file.",
-                ),
-                method(
-                    "hdf.measurement.schema.get",
-                    params=None,
-                    doc="Get configured measurement schema (profiles + note fields).",
-                ),
-                method(
-                    "hdf.measurement.note",
-                    params=[
-                        param("author", required=True, default=None, annotation="str"),
-                        param("kind", required=False, default="note", annotation="str"),
-                        param("message", required=True, default=None, annotation="str"),
-                        param("payload", required=False, default=None, annotation="dict"),
-                    ],
-                    doc="Append a measurement note row to /measurement/notes.",
-                ),
-            ]
-            members = self._with_common_capabilities(members)
-            return {"request_id": request_id, "ok": True, "result": capabilities_payload(members)}
-
-        def _filter_state() -> Json:
-            known = self._known_devices()
-            disabled = sorted(self._disabled_devices)
-            disabled_set = set(disabled)
-            enabled_known = [did for did in known if did not in disabled_set]
-            return {
-                "disabled_devices": disabled,
-                "known_devices": known,
-                "enabled_known_devices": enabled_known,
-            }
-
-        if rtype == "hdf.status":
-            schema_configured, schema_available, schema_error = self._measurement_schema_state()
-            stream_buffered, stream_buffered_samples, stream_buffered_data_bytes = (
-                self._stream_buffer_snapshot()
+        rpc = RpcActionRequest.parse(
+            req,
+            action_field="type",
+            request_id_field="request_id",
+        )
+        if rpc is None:
+            return self._rpc_error(req, code="invalid_request", message="Malformed request")
+        dispatch_req = rpc.as_dispatch_payload(request_id_field="request_id")
+        if rpc.action == "process.capabilities":
+            return self._rpc_ok(
+                dispatch_req,
+                result=capabilities_payload(self._hdf_capability_members()),
             )
-            telemetry_buffer_depth = len(self._buf) if self._buf is not None else 0
-            telemetry_buffer_capacity = (
-                int(self._buf.maxlen)
-                if self._buf is not None and self._buf.maxlen is not None
-                else None
-            )
-            event_buffer_depth = len(self._event_buf) if self._event_buf is not None else 0
-            event_buffer_capacity = (
-                int(self._event_buf.maxlen)
-                if self._event_buf is not None and self._event_buf.maxlen is not None
-                else None
-            )
-            result = {
-                "file": str(self._h5.filename) if self._h5 is not None else None,
-                "writing_active": self._h5 is not None,
-                "autostart_writing": bool(self._autostart_writing),
-                "pending": int(self._pending),
-                "dropped": int(self._dropped_local),
-                "dropped_by_topic": dict(self._dropped_local_by_topic),
-                "dropped_events": int(self._dropped_events),
-                "telemetry_buffer_depth": int(telemetry_buffer_depth),
-                "telemetry_buffer_capacity": telemetry_buffer_capacity,
-                "event_buffer_depth": int(event_buffer_depth),
-                "event_buffer_capacity": event_buffer_capacity,
-                "stream_buffered_streams": int(len(stream_buffered)),
-                "stream_buffered_samples": int(stream_buffered_samples),
-                "stream_buffered_data_bytes": int(stream_buffered_data_bytes),
-                "stream_buffered": stream_buffered,
-                "stream_context_entries": int(len(self._stream_context_id)),
-                "seen_context_ids_count": int(len(self._seen_context_ids)),
-                "event_log_mode": str(self._event_log_mode),
-                "measurement_id": self._measurement_id,
-                "measurement_type": self._measurement_type,
-                "measurement_schema_version": self._measurement_schema_version,
-                "measurement_started_wall_ns": self._measurement_started_wall_ns,
-                "measurement_ended_wall_ns": self._measurement_ended_wall_ns,
-                "measurement_notes_rows": int(self._measurement_notes_ds.shape[0])
-                if self._measurement_notes_ds is not None
-                else 0,
-                "measurement_schema_configured": bool(schema_configured),
-                "measurement_schema_available": bool(schema_available),
-                "measurement_schema_path": self._measurement_schema_source
-                or self._measurement_schema_path,
-                "measurement_schema_error": schema_error,
-                "sequencer_event_rows": int(self._sequencer_events_ds.shape[0])
-                if self._sequencer_events_ds is not None
-                else 0,
-                "sequencer_yaml_snapshots": int(self._sequencer_yaml_ds.shape[0])
-                if self._sequencer_yaml_ds is not None
-                else 0,
-            }
-            result.update(_filter_state())
-            return {"request_id": request_id, "ok": True, "result": result}
 
-        if rtype == "hdf.measurement.schema.get":
-            configured, available, error = self._measurement_schema_state()
-            if not configured:
-                return {
-                    "request_id": request_id,
-                    "ok": False,
-                    "error": {
-                        "code": "measurement_schema_not_configured",
-                        "message": "measurement schema path is not configured",
-                    },
-                }
-            if not available or self._measurement_schema is None:
-                return {
-                    "request_id": request_id,
-                    "ok": False,
-                    "error": {
-                        "code": "measurement_schema_unavailable",
-                        "message": error or "measurement schema unavailable",
-                    },
-                }
-            return {
-                "request_id": request_id,
-                "ok": True,
-                "result": {
-                    "schema": measurement_schema_to_json(self._measurement_schema),
-                    "path": self._measurement_schema_source or self._measurement_schema_path,
-                },
-            }
+        dispatched = self._rpc_registry.dispatch(dispatch_req)
+        if dispatched is not None:
+            return dispatched
 
-        if rtype == "hdf.measurement.note":
-            params = req.get("params", {})
-            if params is None:
-                params = {}
-            if not isinstance(params, dict):
-                return {
-                    "request_id": request_id,
-                    "ok": False,
-                    "error": {"code": "invalid_params", "message": "params must be a dict"},
-                }
-            configured, available, error = self._measurement_schema_state()
-            if not configured:
-                return {
-                    "request_id": request_id,
-                    "ok": False,
-                    "error": {
-                        "code": "measurement_schema_not_configured",
-                        "message": "measurement schema path is not configured",
-                    },
-                }
-            if not available or self._measurement_schema is None:
-                return {
-                    "request_id": request_id,
-                    "ok": False,
-                    "error": {
-                        "code": "measurement_schema_unavailable",
-                        "message": error or "measurement schema unavailable",
-                    },
-                }
-            try:
-                core, payload = normalize_measurement_note_values(
-                    self._measurement_schema,
-                    values=params,
-                )
-            except Exception as e:
-                return {
-                    "request_id": request_id,
-                    "ok": False,
-                    "error": {"code": "invalid_params", "message": str(e)},
-                }
-            try:
-                payload_json = json.dumps(payload)
-            except Exception as e:
-                return {
-                    "request_id": request_id,
-                    "ok": False,
-                    "error": {"code": "invalid_params", "message": str(e)},
-                }
-            try:
-                index, t_wall, t_mono = self._append_measurement_note_row(
-                    author=str(core.get("author", "")),
-                    kind=str(core.get("kind", "note")),
-                    message=str(core.get("message", "")),
-                    payload_json=payload_json,
-                )
-            except Exception as e:
-                return {
-                    "request_id": request_id,
-                    "ok": False,
-                    "error": {"code": "note_write_failed", "message": str(e)},
-                }
-            return {
-                "request_id": request_id,
-                "ok": True,
-                "result": {
-                    "index": int(index),
-                    "t_wall": float(t_wall),
-                    "t_mono": float(t_mono),
-                    "author": str(core.get("author", "")),
-                    "kind": str(core.get("kind", "note")),
-                },
-            }
-
-        if rtype == "hdf.devices.get":
-            return {"request_id": request_id, "ok": True, "result": _filter_state()}
-
-        if rtype in {"hdf.devices.disable", "hdf.devices.enable"}:
-            params = req.get("params", {})
-            if not isinstance(params, dict):
-                return {
-                    "request_id": request_id,
-                    "ok": False,
-                    "error": {"code": "invalid_params", "message": "params must be a dict"},
-                }
-            try:
-                ids = self._normalize_device_id_list(params.get("device_ids"))
-            except Exception as e:
-                return {
-                    "request_id": request_id,
-                    "ok": False,
-                    "error": {"code": "invalid_params", "message": str(e)},
-                }
-            if not ids:
-                return {
-                    "request_id": request_id,
-                    "ok": False,
-                    "error": {
-                        "code": "invalid_params",
-                        "message": "device_ids must contain at least one id",
-                    },
-                }
-
-            known = set(self._known_devices())
-            unknown = sorted([did for did in ids if did not in known])
-            changed: list[str] = []
-            if rtype == "hdf.devices.disable":
-                for did in ids:
-                    if did not in self._disabled_devices:
-                        self._disabled_devices.add(did)
-                        changed.append(did)
-                if changed:
-                    self._clear_buffered_for_disabled(set(changed))
-            else:
-                for did in ids:
-                    if did in self._disabled_devices:
-                        self._disabled_devices.remove(did)
-                        changed.append(did)
-                if changed and self._telemetry_group is not None:
-                    try:
-                        schema = _schema_rpc(self._ctx, self._manager_rpc)
-                        self._device_map = _ingest_schema(
-                            schema,
-                            self._telemetry_group,
-                            self._datasets,
-                            write_enabled=self._is_device_enabled,
-                        )
-                    except Exception:
-                        self._bump_error("schema.rpc")
-
-            if self._h5 is not None:
-                try:
-                    self._h5.attrs["disabled_devices_json"] = json.dumps(
-                        sorted(self._disabled_devices)
-                    )
-                except Exception:
-                    self._bump_error("h5.attrs.disabled_devices")
-
-            return {
-                "request_id": request_id,
-                "ok": True,
-                "result": {
-                    "changed": changed,
-                    "unknown": unknown,
-                    **_filter_state(),
-                },
-            }
-
-        if rtype == "hdf.rotate":
-            params = req.get("params", {})
-            if params is None:
-                params = {}
-            if not isinstance(params, dict):
-                return {
-                    "request_id": request_id,
-                    "ok": False,
-                    "error": {"code": "invalid_params", "message": "params must be a dict"},
-                }
-            filename_raw = params.get("filename")
-            filename: str | None = None
-            if filename_raw is not None:
-                filename = str(filename_raw).strip()
-                if not filename:
-                    return {
-                        "request_id": request_id,
-                        "ok": False,
-                        "error": {
-                            "code": "invalid_params",
-                            "message": "filename must be a non-empty string",
-                        },
-                    }
-
-            disabled_override: set[str] | None = None
-            unknown: list[str] = []
-            if "disabled_devices" in params:
-                try:
-                    disabled_override = self._normalize_device_ids(
-                        params.get("disabled_devices")
-                    )
-                except Exception as e:
-                    return {
-                        "request_id": request_id,
-                        "ok": False,
-                        "error": {"code": "invalid_params", "message": str(e)},
-                    }
-                known = set(self._known_devices())
-                unknown = sorted(
-                    [did for did in disabled_override if did not in known]
-                )
-
-            measurement_profile: str | None = None
-            if "measurement_profile" in params:
-                raw_profile = params.get("measurement_profile")
-                if raw_profile is not None:
-                    profile_text = str(raw_profile).strip()
-                    if not profile_text:
-                        return {
-                            "request_id": request_id,
-                            "ok": False,
-                            "error": {
-                                "code": "invalid_params",
-                                "message": "measurement_profile must be a non-empty string",
-                            },
-                        }
-                    measurement_profile = profile_text
-
-            measurement_values: object = params.get("measurement_values", {})
-            if measurement_values is None:
-                measurement_values = {}
-            if not isinstance(measurement_values, dict):
-                return {
-                    "request_id": request_id,
-                    "ok": False,
-                    "error": {
-                        "code": "invalid_params",
-                        "message": "measurement_values must be a dict",
-                    },
-                }
-
-            try:
-                old_file, new_file = self._rotate_file(
-                    filename=filename,
-                    disabled_devices=disabled_override,
-                    measurement_profile=measurement_profile,
-                    measurement_values=measurement_values,
-                )
-            except FileExistsError as e:
-                return {
-                    "request_id": request_id,
-                    "ok": False,
-                    "error": {
-                        "code": "file_exists",
-                        "message": str(e),
-                    },
-                }
-            except Exception as e:
-                return {
-                    "request_id": request_id,
-                    "ok": False,
-                    "error": {
-                        "code": "rotate_failed",
-                        "message": str(e),
-                    },
-                }
-
-            return {
-                "request_id": request_id,
-                "ok": True,
-                "result": {
-                    "old_file": old_file,
-                    "new_file": new_file,
-                    "measurement_id": self._measurement_id,
-                    "measurement_type": self._measurement_type,
-                    "unknown": unknown,
-                    **_filter_state(),
-                },
-            }
-
-        return {
-            "request_id": request_id,
-            "ok": False,
-            "error": {"code": "unknown_request"},
-        }
+        return self._rpc_error(dispatch_req, code="unknown_request")
 
     def _write_buffered_rows(self) -> None:
         if self._buf is None:
@@ -2158,7 +2482,7 @@ class HdfWriter(ManagedProcessBase):
         if self._h5 is None or self._telemetry_group is None:
             self._buf.clear()
             return
-        rows_by_device: dict[str, list[np.void]] = {}
+        used_by_device: dict[str, int] = {}
 
         while self._buf:
             msg = self._buf.popleft()
@@ -2181,105 +2505,230 @@ class HdfWriter(ManagedProcessBase):
             if not isinstance(sigs, dict):
                 sigs = {}
 
-            row = np.zeros(1, dtype=ds.dtype)
-            row[0]["t_wall"] = t_wall
-            row[0]["t_mono"] = t_mono
-            row[0]["seq"] = seq
+            batch = self._ensure_telemetry_batch_buffer(device_id=device_id, dtype=ds.dtype)
+            used = int(used_by_device.get(device_id, 0))
+            if used >= batch.shape[0]:
+                self._flush_telemetry_batch(
+                    device_id=device_id,
+                    ds=ds,
+                    used=used,
+                )
+                used = 0
+            row = batch[used]
+            row["t_wall"] = t_wall
+            row["t_mono"] = t_mono
+            row["seq"] = seq
 
             for name, dtype_str in zip(signals, dtypes, strict=True):
                 raw = sigs.get(name, {})
                 value = raw.get("value") if isinstance(raw, dict) else None
-                row[0][name] = _convert_value(value, dtype_str)
+                row[name] = _convert_value(value, dtype_str)
+            used += 1
+            if used >= batch.shape[0]:
+                self._flush_telemetry_batch(
+                    device_id=device_id,
+                    ds=ds,
+                    used=used,
+                )
+                used = 0
+            used_by_device[device_id] = used
 
-            rows_by_device.setdefault(device_id, []).append(row[0])
-
-        for device_id, rows in rows_by_device.items():
-            ds = self._datasets[device_id]
-            n = len(rows)
-            if n == 0:
+        for device_id, used in used_by_device.items():
+            if used <= 0:
                 continue
-            old = ds.shape[0]
-            ds.resize((old + n,))
-            ds[old : old + n] = np.array(rows, dtype=ds.dtype)
-            self._pending += n
+            ds = self._datasets.get(device_id)
+            if ds is None:
+                continue
+            self._flush_telemetry_batch(
+                device_id=device_id,
+                ds=ds,
+                used=used,
+            )
+        self._prune_telemetry_batch_buffers()
 
-    def _handle_chunk_ready(self, msg: Json) -> None:
-        device_id = self._normalize_device_id(msg.get("device_id"))
-        stream = self._normalize_device_id(msg.get("stream"))
-        shm_name = msg.get("shm_name")
-        if not device_id or not stream or not shm_name:
+    def _handle_chunk_ready(
+        self,
+        msg: Json,
+        *,
+        parsed: ChunkReadyMessage | None = None,
+    ) -> None:
+        chunk = parsed if parsed is not None else ChunkReadyMessage.parse(msg)
+        if chunk is None:
             return
-
+        device_id = chunk.device_id
+        stream = chunk.stream
         key = (device_id, stream)
+        now_mono = time.monotonic()
         if not self._is_device_enabled(device_id):
-            seq_raw = msg.get("seq")
-            try:
-                seq = int(seq_raw)
-            except Exception:
-                seq = None
-            if seq is not None:
-                prev = int(self._stream_last_seq.get(key, 0))
-                if seq > prev:
-                    self._stream_last_seq[key] = seq
-            self._stream_buffers.pop(key, None)
+            self._handle_chunk_ready_disabled_device(key=key, seq=chunk.seq)
             return
 
-        ctx_id: int | None = None
-        context_id = msg.get("context_id")
-        if context_id is not None:
-            try:
-                ctx_id = int(context_id)
-                fields = msg.get("context_fields")
-                if isinstance(fields, dict):
-                    self._record_context(ctx_id, fields)
-            except Exception:
-                ctx_id = None
+        ctx_id = chunk.context_id
+        if ctx_id is not None and chunk.context_fields is not None:
+            self._record_context(ctx_id, chunk.context_fields)
+        if ctx_id is not None and chunk.seq is not None:
+            seq = int(chunk.seq)
+            self._store_context_for_seq(
+                key=key,
+                seq=seq,
+                context_id=int(ctx_id),
+                now_mono=now_mono,
+            )
+            self._resolve_pending_stream_event(
+                key=key,
+                seq=seq,
+                context_id=int(ctx_id),
+            )
+        elif ctx_id is not None:
+            self._bump_error("stream.context_seq_missing")
 
+        reader = self._ensure_chunk_ready_reader(
+            key=key,
+            device_id=device_id,
+            stream=stream,
+            shm_name=chunk.shm_name,
+        )
+        if reader is None:
+            return
+
+        last_seq = int(self._stream_last_seq.get(key, 0))
+        events = self._read_chunk_ready_events(key=key, reader=reader, last_seq=last_seq)
+        if not events:
+            self._expire_pending_context(key=key, now_mono=now_mono)
+            self._trim_context_map(key=key, now_mono=now_mono)
+            return
+        self._append_chunk_ready_events(
+            key=key,
+            reader=reader,
+            events=events,
+            initial_last_seq=last_seq,
+            now_mono=now_mono,
+        )
+
+    def _handle_chunk_ready_disabled_device(
+        self,
+        *,
+        key: tuple[str, str],
+        seq: int | None,
+    ) -> None:
+        if seq is not None:
+            prev = int(self._stream_last_seq.get(key, 0))
+            if seq > prev:
+                self._stream_last_seq[key] = seq
+        self._stream_buffers.pop(key, None)
+        self._stream_pending_by_seq.pop(key, None)
+        self._stream_context_by_seq.pop(key, None)
+
+    def _reset_stream_runtime_state(self, key: tuple[str, str]) -> None:
+        self._stream_readers.pop(key, None)
+        self._stream_last_seq.pop(key, None)
+        self._stream_buffers.pop(key, None)
+        self._stream_schema.pop(key, None)
+        self._stream_expected_nbytes.pop(key, None)
+        self._stream_pending_by_seq.pop(key, None)
+        self._stream_context_by_seq.pop(key, None)
+        self._stream_last_written_seq.pop(key, None)
+
+    def _ensure_chunk_ready_reader(
+        self,
+        *,
+        key: tuple[str, str],
+        device_id: str,
+        stream: str,
+        shm_name: str,
+    ) -> ShmRingReader | None:
         reader = self._stream_readers.get(key)
-        if reader is None or reader.name != shm_name:
-            if reader is not None:
-                try:
-                    reader.close()
-                except Exception:
-                    self._bump_error("stream.reader_close")
+        if reader is not None and reader.name == shm_name:
+            return reader
+        if reader is not None:
             try:
-                reader = ShmRingReader.attach(str(shm_name))
+                reader.close()
             except Exception:
-                self._bump_error("stream.attach")
-                return
-            self._stream_readers[key] = reader
-            session = self._next_stream_session(device_id, stream)
-            self._stream_sessions[key] = session
-            self._stream_active_session[key] = session
-            self._stream_last_seq[key] = 0
-            self._stream_dropped_total[key] = 0
-            self._stream_buffers.pop(key, None)
-            self._stream_schema.pop(key, None)
-            self._stream_expected_nbytes.pop(key, None)
-            self._stream_context_id.pop(key, None)
-
-        if ctx_id is not None:
-            self._stream_context_id[key] = ctx_id
-
-        last_seq = self._stream_last_seq.get(key, 0)
+                self._bump_error("stream.reader_close")
         try:
-            events = reader.read_events(last_seq)
+            reader = ShmRingReader.attach(str(shm_name))
+        except Exception:
+            self._bump_error("stream.attach")
+            return None
+        self._stream_readers[key] = reader
+        session = self._next_stream_session(device_id, stream)
+        self._stream_sessions[key] = session
+        self._stream_active_session[key] = session
+        self._stream_last_seq[key] = 0
+        self._stream_dropped_total[key] = 0
+        self._stream_buffers.pop(key, None)
+        self._stream_schema.pop(key, None)
+        self._stream_expected_nbytes.pop(key, None)
+        self._stream_pending_by_seq.pop(key, None)
+        self._stream_context_by_seq.pop(key, None)
+        self._stream_last_written_seq[key] = 0
+        return reader
+
+    def _read_chunk_ready_events(
+        self,
+        *,
+        key: tuple[str, str],
+        reader: ShmRingReader,
+        last_seq: int,
+    ) -> list[Json] | None:
+        try:
+            return reader.read_events(last_seq)
         except Exception:
             try:
                 reader.close()
             except Exception:
                 self._bump_error("stream.reader_close")
             self._bump_error("stream.drain")
-            self._stream_readers.pop(key, None)
-            self._stream_last_seq.pop(key, None)
-            self._stream_buffers.pop(key, None)
-            self._stream_schema.pop(key, None)
-            self._stream_context_id.pop(key, None)
-            return
+            self._reset_stream_runtime_state(key)
+            return None
+
+    def _append_chunk_ready_events(
+        self,
+        *,
+        key: tuple[str, str],
+        reader: ShmRingReader,
+        events: list[Json],
+        initial_last_seq: int,
+        now_mono: float,
+    ) -> None:
         if not events:
             return
+        dropped = int(self._stream_dropped_total.get(key, 0))
+        last_seq = int(initial_last_seq)
+        for ev in events:
+            seq = int(ev["seq"])
+            if last_seq and seq > last_seq + 1:
+                dropped += seq - last_seq - 1
+            last_seq = seq
+            context_id = self._resolve_context_for_seq(key=key, seq=seq)
+            if context_id is not None:
+                event = self._pending_event_payload(ev=ev, now_mono=now_mono)
+                self._append_resolved_stream_event(
+                    key=key,
+                    event=event,
+                    context_id=context_id,
+                )
+                self._context_resolved_exact += 1
+                continue
+            self._queue_pending_stream_event(
+                key=key,
+                ev=ev,
+                now_mono=now_mono,
+            )
 
-        buf = self._stream_buffers.setdefault(
+        self._stream_last_seq[key] = last_seq
+        self._stream_dropped_total[key] = dropped
+        if key not in self._stream_schema:
+            self._stream_schema[key] = {
+                "dtype": str(reader.layout.dtype),
+                "shape": reader.layout.shape,
+            }
+        self._enforce_pending_context_cap(key=key)
+        self._expire_pending_context(key=key, now_mono=now_mono)
+        self._trim_context_map(key=key, now_mono=now_mono)
+
+    def _stream_buffer_for_key(self, key: tuple[str, str]) -> dict[str, list[Any]]:
+        return self._stream_buffers.setdefault(
             key,
             {
                 "data": [],
@@ -2290,28 +2739,190 @@ class HdfWriter(ManagedProcessBase):
             },
         )
 
-        dropped = self._stream_dropped_total.get(key, 0)
-        current_context_id = self._stream_context_id.get(key, -1)
-        for ev in events:
-            seq = int(ev["seq"])
-            if last_seq and seq > last_seq + 1:
-                dropped += seq - last_seq - 1
-            last_seq = seq
+    def _append_resolved_stream_event(
+        self,
+        *,
+        key: tuple[str, str],
+        event: Json,
+        context_id: int,
+    ) -> None:
+        buf = self._stream_buffer_for_key(key)
+        buf["data"].append(event["payload"])
+        buf["seq"].append(int(event["seq"]))
+        buf["t0_mono_ns"].append(int(event["t0_mono_ns"]))
+        buf["t0_wall_ns"].append(int(event["t0_wall_ns"]))
+        buf["context_id"].append(int(context_id))
 
-            buf["data"].append(ev["payload"])
-            buf["seq"].append(seq)
-            buf["t0_mono_ns"].append(int(ev["t0_mono_ns"]))
-            buf["t0_wall_ns"].append(int(ev["t0_wall_ns"]))
-            buf["context_id"].append(int(current_context_id))
+    def _store_context_for_seq(
+        self,
+        *,
+        key: tuple[str, str],
+        seq: int,
+        context_id: int,
+        now_mono: float,
+    ) -> None:
+        context_map = self._stream_context_by_seq.setdefault(key, {})
+        context_map[int(seq)] = (int(context_id), float(now_mono))
 
-        self._stream_last_seq[key] = last_seq
-        self._stream_dropped_total[key] = dropped
+    def _resolve_context_for_seq(
+        self, *, key: tuple[str, str], seq: int
+    ) -> int | None:
+        context_map = self._stream_context_by_seq.get(key)
+        if not context_map:
+            return None
+        hit = context_map.pop(int(seq), None)
+        if not context_map:
+            self._stream_context_by_seq.pop(key, None)
+        if hit is None:
+            return None
+        return int(hit[0])
 
-        if key not in self._stream_schema:
-            self._stream_schema[key] = {
-                "dtype": str(reader.layout.dtype),
-                "shape": reader.layout.shape,
-            }
+    @staticmethod
+    def _pending_event_payload(*, ev: Json, now_mono: float) -> Json:
+        return {
+            "seq": int(ev["seq"]),
+            "payload": ev["payload"],
+            "t0_mono_ns": int(ev["t0_mono_ns"]),
+            "t0_wall_ns": int(ev["t0_wall_ns"]),
+            "first_seen_mono": float(now_mono),
+        }
+
+    def _queue_pending_stream_event(
+        self,
+        *,
+        key: tuple[str, str],
+        ev: Json,
+        now_mono: float,
+    ) -> None:
+        seq = int(ev["seq"])
+        pending = self._stream_pending_by_seq.setdefault(key, {})
+        pending[seq] = self._pending_event_payload(ev=ev, now_mono=now_mono)
+
+    def _resolve_pending_stream_event(
+        self,
+        *,
+        key: tuple[str, str],
+        seq: int,
+        context_id: int,
+    ) -> None:
+        pending = self._stream_pending_by_seq.get(key)
+        if not pending:
+            return
+        event = pending.pop(int(seq), None)
+        if not pending:
+            self._stream_pending_by_seq.pop(key, None)
+        if event is None:
+            return
+        self._append_resolved_stream_event(
+            key=key,
+            event=event,
+            context_id=int(context_id),
+        )
+        self._context_late_resolved += 1
+        context_map = self._stream_context_by_seq.get(key)
+        if context_map is not None:
+            context_map.pop(int(seq), None)
+            if not context_map:
+                self._stream_context_by_seq.pop(key, None)
+
+    def _flush_pending_as_unknown(
+        self,
+        *,
+        key: tuple[str, str],
+        seqs: list[int],
+        count_overflow: bool,
+    ) -> None:
+        if not seqs:
+            return
+        pending = self._stream_pending_by_seq.get(key)
+        if not pending:
+            return
+        for seq in seqs:
+            event = pending.pop(int(seq), None)
+            if event is None:
+                continue
+            self._append_resolved_stream_event(key=key, event=event, context_id=-1)
+            self._context_written_minus1_missing += 1
+            if count_overflow:
+                self._context_evicted_pending_overflow += 1
+        if not pending:
+            self._stream_pending_by_seq.pop(key, None)
+
+    def _enforce_pending_context_cap(self, *, key: tuple[str, str]) -> None:
+        pending = self._stream_pending_by_seq.get(key)
+        if not pending:
+            return
+        cap = int(self._context_pending_max_per_stream)
+        if len(pending) <= cap:
+            return
+        overflow = len(pending) - cap
+        oldest = sorted(pending.keys())[:overflow]
+        self._flush_pending_as_unknown(
+            key=key,
+            seqs=oldest,
+            count_overflow=True,
+        )
+
+    def _expire_pending_context(self, *, key: tuple[str, str], now_mono: float) -> None:
+        pending = self._stream_pending_by_seq.get(key)
+        if not pending:
+            return
+        ttl_s = float(self._context_resolve_ttl_s)
+        if ttl_s <= 0.0:
+            return
+        expired = [
+            seq
+            for seq, event in pending.items()
+            if (now_mono - float(event.get("first_seen_mono", now_mono))) >= ttl_s
+        ]
+        if not expired:
+            return
+        expired.sort()
+        self._flush_pending_as_unknown(
+            key=key,
+            seqs=expired,
+            count_overflow=False,
+        )
+
+    def _trim_context_map(self, *, key: tuple[str, str], now_mono: float) -> None:
+        context_map = self._stream_context_by_seq.get(key)
+        if context_map is None:
+            return
+        if not context_map:
+            self._stream_context_by_seq.pop(key, None)
+            return
+        last_written = int(self._stream_last_written_seq.get(key, 0))
+        written_floor = max(0, last_written - int(self._context_map_written_margin))
+        if written_floor > 0:
+            stale_written = [seq for seq in context_map if seq <= written_floor]
+            for seq in stale_written:
+                context_map.pop(seq, None)
+        ttl_s = float(self._context_map_ttl_s)
+        if ttl_s > 0.0:
+            stale_ttl = [
+                seq
+                for seq, (_, seen_mono) in context_map.items()
+                if (now_mono - float(seen_mono)) >= ttl_s
+            ]
+            for seq in stale_ttl:
+                context_map.pop(seq, None)
+        cap = int(self._context_map_max_per_stream)
+        if len(context_map) > cap:
+            overflow = len(context_map) - cap
+            oldest = sorted(context_map.keys())[:overflow]
+            for seq in oldest:
+                context_map.pop(seq, None)
+                self._context_evicted_map_overflow += 1
+        if not context_map:
+            self._stream_context_by_seq.pop(key, None)
+
+    def _sweep_context_buffers(self, *, now_mono: float) -> None:
+        keys = set(self._stream_pending_by_seq.keys())
+        keys.update(self._stream_context_by_seq.keys())
+        for key in keys:
+            self._enforce_pending_context_cap(key=key)
+            self._expire_pending_context(key=key, now_mono=now_mono)
+            self._trim_context_map(key=key, now_mono=now_mono)
 
     def _next_stream_session(self, device_id: str, stream: str) -> int:
         key = (device_id, stream)
@@ -2360,7 +2971,7 @@ class HdfWriter(ManagedProcessBase):
                 self._ctx,
                 self._manager_rpc,
                 {
-                    "type": "process.rpc",
+                    "type": "manager.processes.rpc",
                     "process_id": self._sequencer_process_id,
                     "request": {
                         "type": "sequencer.status",
@@ -2462,32 +3073,12 @@ class HdfWriter(ManagedProcessBase):
             ds[index] = self._coerce_context_value(name, raw)
 
     def _coerce_context_value(self, name: str, value: Any) -> Any:
-        missing = self._context_columns_missing.get(name, np.nan)
-        dtype = self._context_columns_types.get(name, "float64")
-        if value is None:
-            return missing
-        try:
-            if dtype == "int64":
-                if isinstance(value, (bool, np.bool_)):
-                    return int(bool(value))
-                if isinstance(value, (int, np.integer)):
-                    return int(value)
-                if isinstance(value, (float, np.floating)):
-                    return int(value)
-                return missing
-            if dtype == "bool":
-                if isinstance(value, (bool, np.bool_)):
-                    return np.uint8(1 if bool(value) else 0)
-                if isinstance(value, (int, np.integer)) and int(value) in {0, 1}:
-                    return np.uint8(int(value))
-                return missing
-            if isinstance(value, (bool, np.bool_)):
-                return float(bool(value))
-            if isinstance(value, (int, float, np.integer, np.floating)):
-                return float(value)
-        except Exception:
-            return missing
-        return missing
+        return coerce_context_value(
+            name=name,
+            value=value,
+            missing_values=self._context_columns_missing,
+            dtype_map=self._context_columns_types,
+        )
 
     def _record_context(self, context_id: int, fields: dict[str, Any]) -> None:
         if self._context_table_ds is None:
@@ -2514,7 +3105,10 @@ class HdfWriter(ManagedProcessBase):
         if self._h5 is None or self._streams_group is None:
             for _key, buf in self._stream_buffers.items():
                 self._clear_stream_buffer(buf)
+            self._stream_pending_by_seq.clear()
+            self._stream_context_by_seq.clear()
             return
+        self._sweep_context_buffers(now_mono=time.monotonic())
         for key, buf in list(self._stream_buffers.items()):
             data_list = buf.get("data", [])
             if not data_list:
@@ -2550,6 +3144,13 @@ class HdfWriter(ManagedProcessBase):
             t0_mono_list = list(buf["t0_mono_ns"])
             t0_wall_list = list(buf["t0_wall_ns"])
             context_list = list(buf.get("context_id", []))
+            if n > 1 and any(seq_list[idx] > seq_list[idx + 1] for idx in range(n - 1)):
+                order = sorted(range(n), key=lambda idx: seq_list[idx])
+                data_list = [data_list[idx] for idx in order]
+                seq_list = [seq_list[idx] for idx in order]
+                t0_mono_list = [t0_mono_list[idx] for idx in order]
+                t0_wall_list = [t0_wall_list[idx] for idx in order]
+                context_list = [context_list[idx] for idx in order]
             if context_list and len(context_list) != n:
                 context_list = [-1] * n
                 self._bump_error("stream.context_alignment_repair")
@@ -2606,6 +3207,12 @@ class HdfWriter(ManagedProcessBase):
             dropped = int(self._stream_dropped_total.get(key, 0))
             data_ds.attrs["dropped_total"] = dropped
 
+            if seq_list:
+                self._stream_last_written_seq[key] = max(
+                    int(self._stream_last_written_seq.get(key, 0)),
+                    int(max(seq_list)),
+                )
+                self._trim_context_map(key=key, now_mono=time.monotonic())
             self._clear_stream_buffer(buf)
 
     def _active_stream_dataset_key(
@@ -2662,8 +3269,8 @@ class HdfWriter(ManagedProcessBase):
             maxshape=(None,),
             dtype=np.uint64,
             chunks=(chunk_n,),
-            compression="lzf",
-            shuffle=True,
+            compression=DEFAULT_NUMERIC_COMPRESSION,
+            shuffle=DEFAULT_NUMERIC_SHUFFLE,
         )
         t0_mono_ds = session_group.create_dataset(
             "t0_mono_ns",
@@ -2671,8 +3278,8 @@ class HdfWriter(ManagedProcessBase):
             maxshape=(None,),
             dtype=np.uint64,
             chunks=(chunk_n,),
-            compression="lzf",
-            shuffle=True,
+            compression=DEFAULT_NUMERIC_COMPRESSION,
+            shuffle=DEFAULT_NUMERIC_SHUFFLE,
         )
         t0_wall_ds = session_group.create_dataset(
             "t0_wall_ns",
@@ -2680,8 +3287,8 @@ class HdfWriter(ManagedProcessBase):
             maxshape=(None,),
             dtype=np.uint64,
             chunks=(chunk_n,),
-            compression="lzf",
-            shuffle=True,
+            compression=DEFAULT_NUMERIC_COMPRESSION,
+            shuffle=DEFAULT_NUMERIC_SHUFFLE,
         )
         context_ds = session_group.create_dataset(
             "context_id",
@@ -2689,8 +3296,8 @@ class HdfWriter(ManagedProcessBase):
             maxshape=(None,),
             dtype=np.int64,
             chunks=(chunk_n,),
-            compression="lzf",
-            shuffle=True,
+            compression=DEFAULT_NUMERIC_COMPRESSION,
+            shuffle=DEFAULT_NUMERIC_SHUFFLE,
         )
 
         pending = self._pending_stream_metadata.get((device_id, stream), None)
@@ -2840,6 +3447,9 @@ def main(argv: list[str] | None = None) -> None:
         buffer_max_messages=ns.buffer_max_messages,
         flush_every_n=ns.flush_every_n,
         flush_every_s=ns.flush_every_s,
+        context_resolve_ttl_s=ns.context_resolve_ttl_s,
+        context_pending_max_per_stream=ns.context_pending_max_per_stream,
+        context_map_max_per_stream=ns.context_map_max_per_stream,
         disabled_devices=ns.disabled_devices,
         measurement_schema_path=ns.measurement_schema_path,
         autostart_writing=ns.autostart_writing,
@@ -2853,3 +3463,4 @@ def main(argv: list[str] | None = None) -> None:
 
 if __name__ == "__main__":
     main()
+

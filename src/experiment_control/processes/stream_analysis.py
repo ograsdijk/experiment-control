@@ -7,6 +7,7 @@ import re
 import time
 import uuid
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from graphlib import TopologicalSorter
 from pathlib import Path
@@ -14,20 +15,21 @@ from typing import Any
 
 import numpy as np
 import zmq
+
 try:
     from scipy.optimize import curve_fit
 except Exception:  # pragma: no cover - optional dependency at runtime
     curve_fit = None  # type: ignore[assignment]
 
 from ..capabilities import capabilities_payload, method, param
-from ..shm.shm_ring import ShmRingWriter, now_mono_ns, now_wall_ns
-from ..shm.shm_ring import ShmRingReader
+from ..shm.shm_ring import ShmRingReader, ShmRingWriter, now_mono_ns, now_wall_ns
 from ..utils.cli_args import (
     add_heartbeat_args,
     add_manager_args,
     add_process_id_arg,
     add_rpc_timeout_arg,
 )
+from ..utils.rpc_dispatch import RpcDispatchRegistry
 from ..utils.yaml_helpers import load_yaml_file
 from ..utils.zmq_helpers import safe_json_loads
 from .manager_client_helper import ManagerClientHelper
@@ -233,7 +235,7 @@ class BinStatsState:
         min_x = float(np.min(xs))
         max_x = float(np.max(xs))
         grouped: dict[str, tuple[float, list[float]]] = {}
-        for x_value, y_value in zip(self.samples_x, self.samples_y):
+        for x_value, y_value in zip(self.samples_x, self.samples_y, strict=False):
             key = format(float(x_value), ".15g")
             existing = grouped.get(key)
             if existing is None:
@@ -590,7 +592,12 @@ class Bin2DStatsState:
             np.add.at(counts, (xv, yv), 1)
             np.add.at(sums, (xv, yv), zv)
             np.add.at(sums_sq, (xv, yv), zv * zv)
-            for bx, by, v in zip(xv.tolist(), yv.tolist(), zv.tolist()):
+            for bx, by, v in zip(
+                xv.tolist(),
+                yv.tolist(),
+                zv.tolist(),
+                strict=False,
+            ):
                 mins[bx, by] = min(mins[bx, by], float(v))
                 maxs[bx, by] = max(maxs[bx, by], float(v))
 
@@ -1201,64 +1208,61 @@ def execute_trace_integrate(trace_raw: Any) -> float | None:
     return float(np.sum(trace, dtype=np.float64))
 
 
-def execute_trace_decimate(trace_raw: Any, params: Json) -> np.ndarray | None:
-    trace = _coerce_trace(trace_raw)
-    if trace is None:
-        return None
-    method, target_points = _validate_trace_decimate_params(params)
-    n = int(trace.size)
-    if n <= 0 or n <= target_points:
-        return trace
-    points = trace.astype(np.float64, copy=False)
+def _decimate_trace_stride(points: np.ndarray, *, target_points: int) -> np.ndarray:
+    n = int(points.size)
+    step = max(1, int(math.ceil(float(n) / float(target_points))))
+    out = points[::step]
+    if out.size > 0 and float(out[-1]) != float(points[-1]):
+        out = np.concatenate([out, points[-1:]])
+    return out[:target_points]
 
-    if method == "stride":
-        step = max(1, int(math.ceil(float(n) / float(target_points))))
-        out = points[::step]
-        if out.size > 0 and float(out[-1]) != float(points[-1]):
-            out = np.concatenate([out, points[-1:]])
-        return out[:target_points]
 
-    if method == "mean":
-        bucket_count = max(1, min(target_points, n))
-        out = np.zeros(bucket_count, dtype=np.float64)
-        idx = 0
-        for start, stop in _bucket_ranges(n, bucket_count):
-            chunk = points[start:stop]
-            if chunk.size <= 0:
-                continue
-            out[idx] = float(np.mean(chunk, dtype=np.float64))
-            idx += 1
-        return out[:idx]
+def _decimate_trace_mean(points: np.ndarray, *, target_points: int) -> np.ndarray:
+    n = int(points.size)
+    bucket_count = max(1, min(target_points, n))
+    out = np.zeros(bucket_count, dtype=np.float64)
+    out_count = 0
+    for start, stop in _bucket_ranges(n, bucket_count):
+        chunk = points[start:stop]
+        if chunk.size <= 0:
+            continue
+        out[out_count] = float(np.mean(chunk, dtype=np.float64))
+        out_count += 1
+    return out[:out_count]
 
-    if method == "m4":
-        bucket_count = max(1, min(max(1, target_points // 4), n))
-        out = np.zeros(target_points, dtype=np.float64)
-        out_count = 0
-        for start, stop in _bucket_ranges(n, bucket_count):
-            if stop <= start:
-                continue
-            first_i = start
-            last_i = stop - 1
-            min_i = start
-            max_i = start
-            min_v = float(points[start])
-            max_v = float(points[start])
-            for idx in range(start + 1, stop):
-                value = float(points[idx])
-                if value < min_v:
-                    min_v = value
-                    min_i = idx
-                if value > max_v:
-                    max_v = value
-                    max_i = idx
-            for idx in sorted({first_i, min_i, max_i, last_i}):
-                out[out_count] = float(points[idx])
-                out_count += 1
-                if out_count >= target_points:
-                    return out[:out_count]
-        return out[:out_count]
 
-    # default: minmax
+def _decimate_trace_m4(points: np.ndarray, *, target_points: int) -> np.ndarray:
+    n = int(points.size)
+    bucket_count = max(1, min(max(1, target_points // 4), n))
+    out = np.zeros(target_points, dtype=np.float64)
+    out_count = 0
+    for start, stop in _bucket_ranges(n, bucket_count):
+        if stop <= start:
+            continue
+        first_i = start
+        last_i = stop - 1
+        min_i = start
+        max_i = start
+        min_v = float(points[start])
+        max_v = float(points[start])
+        for idx in range(start + 1, stop):
+            value = float(points[idx])
+            if value < min_v:
+                min_v = value
+                min_i = idx
+            if value > max_v:
+                max_v = value
+                max_i = idx
+        for idx in sorted({first_i, min_i, max_i, last_i}):
+            out[out_count] = float(points[idx])
+            out_count += 1
+            if out_count >= target_points:
+                return out[:out_count]
+    return out[:out_count]
+
+
+def _decimate_trace_minmax(points: np.ndarray, *, target_points: int) -> np.ndarray:
+    n = int(points.size)
     bucket_count = max(1, min(max(1, target_points // 2), n))
     out = np.zeros(target_points, dtype=np.float64)
     out_count = 0
@@ -1292,6 +1296,28 @@ def execute_trace_decimate(trace_raw: Any, params: Json) -> np.ndarray | None:
         if out_count >= target_points:
             return out[:out_count]
     return out[:out_count]
+
+
+def _decimate_trace(points: np.ndarray, *, method: str, target_points: int) -> np.ndarray:
+    if method == "stride":
+        return _decimate_trace_stride(points, target_points=target_points)
+    if method == "mean":
+        return _decimate_trace_mean(points, target_points=target_points)
+    if method == "m4":
+        return _decimate_trace_m4(points, target_points=target_points)
+    return _decimate_trace_minmax(points, target_points=target_points)
+
+
+def execute_trace_decimate(trace_raw: Any, params: Json) -> np.ndarray | None:
+    trace = _coerce_trace(trace_raw)
+    if trace is None:
+        return None
+    method, target_points = _validate_trace_decimate_params(params)
+    n = int(trace.size)
+    if n <= 0 or n <= target_points:
+        return trace
+    points = trace.astype(np.float64, copy=False)
+    return _decimate_trace(points, method=method, target_points=target_points)
 
 
 def execute_trace_divide(a_raw: Any, b_raw: Any) -> np.ndarray | None:
@@ -1502,6 +1528,98 @@ def _fit_curve_initial_guess(
     )
 
 
+def _fit_curve_prepare_xy(
+    *, x_raw: Any, y_raw: Any
+) -> tuple[np.ndarray, np.ndarray] | None:
+    x = _coerce_trace(x_raw)
+    y = _coerce_trace(y_raw)
+    if x is None or y is None:
+        return None
+    if int(x.size) != int(y.size):
+        return None
+    if int(x.size) < 4:
+        return None
+    x_arr = np.asarray(x, dtype=np.float64).reshape(-1)
+    y_arr = np.asarray(y, dtype=np.float64).reshape(-1)
+    mask = np.isfinite(x_arr) & np.isfinite(y_arr)
+    if not np.any(mask):
+        return None
+    x_arr = x_arr[mask]
+    y_arr = y_arr[mask]
+    if int(x_arr.size) < 4:
+        return None
+    return x_arr, y_arr
+
+
+def _fit_curve_dense_eval(
+    *,
+    eval_func: Callable[..., np.ndarray],
+    popt: np.ndarray,
+    x: np.ndarray,
+    dense_eval_points: int | None,
+) -> tuple[np.ndarray | None, np.ndarray | None]:
+    if dense_eval_points is None or dense_eval_points < 2:
+        return None, None
+    x_dense = np.linspace(
+        float(np.min(x)),
+        float(np.max(x)),
+        int(dense_eval_points),
+        dtype=np.float64,
+    )
+    yhat_dense = np.asarray(eval_func(x_dense, *popt), dtype=np.float64).reshape(-1)
+    return x_dense, yhat_dense
+
+
+def _fit_curve_param_stderr(
+    *, pcov: Any, param_names: list[str]
+) -> dict[str, float]:
+    stderr: dict[str, float] = {}
+    if not isinstance(pcov, np.ndarray) or pcov.ndim != 2:
+        return stderr
+    diag = np.diag(pcov)
+    for i, name in enumerate(param_names):
+        if i >= int(diag.size):
+            break
+        var = float(diag[i])
+        if math.isfinite(var) and var >= 0.0:
+            stderr[name] = float(math.sqrt(var))
+    return stderr
+
+
+def _fit_curve_reduced_chi2(
+    *,
+    y: np.ndarray,
+    yhat: np.ndarray,
+    param_count: int,
+    sigma_y: float | None,
+    sigma_trace_raw: Any,
+) -> float | None:
+    if y.size <= 0 or y.size != yhat.size:
+        return None
+    dof = int(y.size) - int(param_count)
+    if dof <= 0:
+        return None
+    resid = y - yhat
+    sigma_vec: np.ndarray | None = None
+    sigma_trace = _coerce_trace(sigma_trace_raw)
+    if sigma_trace is not None and int(sigma_trace.size) == int(y.size):
+        sigma_vec = np.asarray(sigma_trace, dtype=np.float64).reshape(-1)
+    elif sigma_y is not None and sigma_y > 0:
+        sigma_vec = np.full(int(y.size), float(sigma_y), dtype=np.float64)
+    if sigma_vec is None:
+        return None
+    valid = np.isfinite(sigma_vec) & (sigma_vec > 0)
+    if not np.any(valid):
+        return None
+    w_resid = resid[valid] / sigma_vec[valid]
+    if w_resid.size <= 0:
+        return None
+    chi2 = float(np.sum(w_resid * w_resid, dtype=np.float64))
+    if not math.isfinite(chi2):
+        return None
+    return float(chi2 / float(dof))
+
+
 def _fit_curve_run(
     *,
     x_raw: Any,
@@ -1512,23 +1630,10 @@ def _fit_curve_run(
     sigma_trace_raw: Any = None,
     dense_eval_points: int | None = None,
 ) -> dict[str, Any] | None:
-    x = _coerce_trace(x_raw)
-    y = _coerce_trace(y_raw)
-    if x is None or y is None:
+    xy = _fit_curve_prepare_xy(x_raw=x_raw, y_raw=y_raw)
+    if xy is None:
         return None
-    if int(x.size) != int(y.size):
-        return None
-    if int(x.size) < 4:
-        return None
-    x = np.asarray(x, dtype=np.float64).reshape(-1)
-    y = np.asarray(y, dtype=np.float64).reshape(-1)
-    mask = np.isfinite(x) & np.isfinite(y)
-    if not np.any(mask):
-        return None
-    x = x[mask]
-    y = y[mask]
-    if int(x.size) < 4:
-        return None
+    x, y = xy
     if curve_fit is None:
         return None
 
@@ -1547,45 +1652,27 @@ def _fit_curve_run(
     except Exception:
         return None
     yhat = np.asarray(eval_func(x, *popt), dtype=np.float64).reshape(-1)
-    x_dense: np.ndarray | None = None
-    yhat_dense: np.ndarray | None = None
-    if dense_eval_points is not None and dense_eval_points >= 2:
-        x_dense = np.linspace(
-            float(np.min(x)),
-            float(np.max(x)),
-            int(dense_eval_points),
-            dtype=np.float64,
-        )
-        yhat_dense = np.asarray(eval_func(x_dense, *popt), dtype=np.float64).reshape(-1)
-    params = {name: float(val) for name, val in zip(param_names, popt.tolist())}
-    stderr: dict[str, float] = {}
-    if isinstance(pcov, np.ndarray) and pcov.ndim == 2:
-        diag = np.diag(pcov)
-        for i, name in enumerate(param_names):
-            if i >= int(diag.size):
-                break
-            var = float(diag[i])
-            if math.isfinite(var) and var >= 0.0:
-                stderr[name] = float(math.sqrt(var))
+    x_dense, yhat_dense = _fit_curve_dense_eval(
+        eval_func=eval_func,
+        popt=popt,
+        x=x,
+        dense_eval_points=dense_eval_points,
+    )
+    params = {
+        name: float(val)
+        for name, val in zip(param_names, popt.tolist(), strict=False)
+    }
+    stderr = _fit_curve_param_stderr(pcov=pcov, param_names=param_names)
     # Reduced chi^2 is only meaningful when a noise scale is available.
-    if x.size > 0 and y.size == yhat.size:
-        resid = y - yhat
-        dof = int(y.size) - int(len(param_names))
-        if dof > 0:
-            sigma_vec: np.ndarray | None = None
-            sigma_trace = _coerce_trace(sigma_trace_raw)
-            if sigma_trace is not None and int(sigma_trace.size) == int(y.size):
-                sigma_vec = np.asarray(sigma_trace, dtype=np.float64).reshape(-1)
-            elif sigma_y is not None and sigma_y > 0:
-                sigma_vec = np.full(int(y.size), float(sigma_y), dtype=np.float64)
-            if sigma_vec is not None:
-                valid = np.isfinite(sigma_vec) & (sigma_vec > 0)
-                if np.any(valid):
-                    w_resid = resid[valid] / sigma_vec[valid]
-                    if w_resid.size > 0:
-                        chi2 = float(np.sum(w_resid * w_resid, dtype=np.float64))
-                        if math.isfinite(chi2):
-                            params["reduced_chi2"] = float(chi2 / float(dof))
+    reduced_chi2 = _fit_curve_reduced_chi2(
+        y=y,
+        yhat=yhat,
+        param_count=len(param_names),
+        sigma_y=sigma_y,
+        sigma_trace_raw=sigma_trace_raw,
+    )
+    if reduced_chi2 is not None:
+        params["reduced_chi2"] = reduced_chi2
     params["model"] = model
     params["baseline_mode"] = baseline_mode
     out: dict[str, Any] = {
@@ -1804,9 +1891,7 @@ def _hist_agg_to_xy(
     x_raw = hist_raw.get("x_bins")
     y_raw = hist_raw.get(y_source)
     c_raw = hist_raw.get("count")
-    sigma_raw = None
-    if chi2_sigma_source in {"sem", "std"}:
-        sigma_raw = hist_raw.get(chi2_sigma_source)
+    sigma_raw = _hist_agg_sigma_source(hist_raw, chi2_sigma_source=chi2_sigma_source)
     if not isinstance(x_raw, list) or not isinstance(y_raw, list) or not isinstance(c_raw, list):
         return None
     n = min(len(x_raw), len(y_raw), len(c_raw))
@@ -1814,40 +1899,103 @@ def _hist_agg_to_xy(
         return None
     x_vals: list[float] = []
     y_vals: list[float] = []
-    sigma_vals: list[float] = []
+    sigma_vals: list[float] = [] if chi2_sigma_source != "none" else []
     for i in range(n):
-        x = _normalize_float(x_raw[i])
-        y = _normalize_float(y_raw[i])
-        c = _normalize_float(c_raw[i])
-        if x is None or y is None or c is None:
+        row = _hist_agg_parse_row(
+            x_raw=x_raw,
+            y_raw=y_raw,
+            c_raw=c_raw,
+            sigma_raw=sigma_raw,
+            index=i,
+            chi2_sigma_source=chi2_sigma_source,
+            min_count=min_count,
+            x_min=x_min,
+            x_max=x_max,
+        )
+        if row is None:
             continue
-        if int(c) < int(min_count):
-            continue
-        if x_min is not None and x < x_min:
-            continue
-        if x_max is not None and x > x_max:
-            continue
-        if chi2_sigma_source != "none":
-            if not isinstance(sigma_raw, list) or i >= len(sigma_raw):
-                continue
-            sigma = _normalize_float(sigma_raw[i])
-            if sigma is None or sigma <= 0:
-                continue
-            sigma_vals.append(float(sigma))
-        x_vals.append(float(x))
-        y_vals.append(float(y))
+        x_value, y_value, sigma_value = row
+        x_vals.append(x_value)
+        y_vals.append(y_value)
+        if sigma_value is not None:
+            sigma_vals.append(sigma_value)
     if len(x_vals) < 4:
         return None
+    x_arr, y_arr, order = _hist_agg_sorted_xy(x_vals=x_vals, y_vals=y_vals)
+    sigma_arr: np.ndarray | None = None
+    if chi2_sigma_source != "none":
+        sigma_arr = np.asarray(sigma_vals, dtype=np.float64)[order]
+    return x_arr, y_arr, sigma_arr
+
+
+def _hist_agg_sigma_source(
+    hist_raw: dict[str, Any],
+    *,
+    chi2_sigma_source: str,
+) -> Any:
+    if chi2_sigma_source not in {"sem", "std"}:
+        return None
+    return hist_raw.get(chi2_sigma_source)
+
+
+def _hist_agg_parse_row(
+    *,
+    x_raw: list[Any],
+    y_raw: list[Any],
+    c_raw: list[Any],
+    sigma_raw: Any,
+    index: int,
+    chi2_sigma_source: str,
+    min_count: int,
+    x_min: float | None,
+    x_max: float | None,
+) -> tuple[float, float, float | None] | None:
+    x = _normalize_float(x_raw[index])
+    y = _normalize_float(y_raw[index])
+    c = _normalize_float(c_raw[index])
+    if x is None or y is None or c is None:
+        return None
+    if int(c) < int(min_count):
+        return None
+    if x_min is not None and x < x_min:
+        return None
+    if x_max is not None and x > x_max:
+        return None
+    sigma = _hist_agg_parse_sigma_at(
+        sigma_raw=sigma_raw,
+        index=index,
+        chi2_sigma_source=chi2_sigma_source,
+    )
+    if chi2_sigma_source != "none" and sigma is None:
+        return None
+    return float(x), float(y), sigma
+
+
+def _hist_agg_parse_sigma_at(
+    *,
+    sigma_raw: Any,
+    index: int,
+    chi2_sigma_source: str,
+) -> float | None:
+    if chi2_sigma_source == "none":
+        return None
+    if not isinstance(sigma_raw, list) or index >= len(sigma_raw):
+        return None
+    sigma = _normalize_float(sigma_raw[index])
+    if sigma is None or sigma <= 0:
+        return None
+    return float(sigma)
+
+
+def _hist_agg_sorted_xy(
+    *,
+    x_vals: list[float],
+    y_vals: list[float],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     x_arr = np.asarray(x_vals, dtype=np.float64)
     y_arr = np.asarray(y_vals, dtype=np.float64)
     order = np.argsort(x_arr)
-    x_arr = x_arr[order]
-    y_arr = y_arr[order]
-    sigma_arr: np.ndarray | None = None
-    if chi2_sigma_source != "none":
-        sigma_arr = np.asarray(sigma_vals, dtype=np.float64)
-        sigma_arr = sigma_arr[order]
-    return x_arr, y_arr, sigma_arr
+    return x_arr[order], y_arr[order], order
 
 
 def execute_fit_from_hist_agg(
@@ -1927,40 +2075,48 @@ def _normalize_node(raw: Any, *, index: int) -> NodeSpec:
     op = _normalize_id(raw.get("op"))
     if op is None:
         raise ValueError(f"graph.nodes[{index}].op is required")
-    params_raw = raw.get("params")
-    if params_raw is None:
-        params: Json = {}
-    elif isinstance(params_raw, dict):
-        params = dict(params_raw)
-    else:
-        raise ValueError(f"graph.nodes[{index}].params must be an object")
-
-    inputs_raw = raw.get("inputs")
-    if inputs_raw is None:
-        inputs: dict[str, str] = {}
-    elif isinstance(inputs_raw, dict):
-        inputs = {}
-        for key, value in inputs_raw.items():
-            port = _normalize_id(key)
-            source = _normalize_id(value)
-            if port is None or source is None:
-                raise ValueError(f"graph.nodes[{index}].inputs entries must be strings")
-            inputs[port] = source
-    else:
-        raise ValueError(f"graph.nodes[{index}].inputs must be an object")
-
-    # Legacy migration: old dedicated stream reducer ops are folded into source.stream.
-    if op == "source.stream_average":
-        op = "source.stream"
-        params.setdefault("channel_mode", "average")
-    elif op == "source.stream_sum":
-        op = "source.stream"
-        params.setdefault("channel_mode", "sum")
+    params = _normalize_node_params(raw.get("params"), index=index)
+    inputs = _normalize_node_inputs(raw.get("inputs"), index=index)
+    op = _normalize_node_legacy_op(op=op, params=params)
 
     return NodeSpec(node_id=node_id, op=op, params=params, inputs=inputs)
 
 
-def compile_workspace_graph(config: Json) -> CompiledWorkspace:
+def _normalize_node_params(params_raw: Any, *, index: int) -> Json:
+    if params_raw is None:
+        return {}
+    if isinstance(params_raw, dict):
+        return dict(params_raw)
+    raise ValueError(f"graph.nodes[{index}].params must be an object")
+
+
+def _normalize_node_inputs(inputs_raw: Any, *, index: int) -> dict[str, str]:
+    if inputs_raw is None:
+        return {}
+    if not isinstance(inputs_raw, dict):
+        raise ValueError(f"graph.nodes[{index}].inputs must be an object")
+    inputs: dict[str, str] = {}
+    for key, value in inputs_raw.items():
+        port = _normalize_id(key)
+        source = _normalize_id(value)
+        if port is None or source is None:
+            raise ValueError(f"graph.nodes[{index}].inputs entries must be strings")
+        inputs[port] = source
+    return inputs
+
+
+def _normalize_node_legacy_op(*, op: str, params: Json) -> str:
+    # Legacy migration: old dedicated stream reducer ops are folded into source.stream.
+    if op == "source.stream_average":
+        params.setdefault("channel_mode", "average")
+        return "source.stream"
+    if op == "source.stream_sum":
+        params.setdefault("channel_mode", "sum")
+        return "source.stream"
+    return op
+
+
+def _parse_workspace_root(config: Json) -> tuple[str, bool, list[NodeSpec], dict[str, NodeSpec]]:
     workspace_id = _normalize_id(config.get("workspace_id"))
     if workspace_id is None:
         raise ValueError("workspace_id is required")
@@ -1979,7 +2135,12 @@ def compile_workspace_graph(config: Json) -> CompiledWorkspace:
         if node.node_id in nodes:
             raise ValueError(f"duplicate node id {node.node_id!r}")
         nodes[node.node_id] = node
+    return workspace_id, enabled, nodes_list, nodes
 
+
+def _compile_workspace_dependencies(
+    *, nodes_list: list[NodeSpec], nodes: dict[str, NodeSpec]
+) -> dict[str, set[str]]:
     deps: dict[str, set[str]] = {}
     for node in nodes_list:
         dependencies: set[str] = set()
@@ -1991,90 +2152,296 @@ def compile_workspace_graph(config: Json) -> CompiledWorkspace:
         if missing:
             raise ValueError(f"node {node.node_id!r} references unknown inputs {missing}")
         deps[node.node_id] = dependencies
+    return deps
 
+
+def _compile_workspace_order(deps: dict[str, set[str]]) -> list[str]:
     try:
         sorter = TopologicalSorter(deps)
-        order = list(sorter.static_order())
+        return list(sorter.static_order())
     except Exception as exc:
         raise ValueError(f"graph is cyclic: {exc}") from exc
 
+
+def _validate_compiled_node(
+    *,
+    node: NodeSpec,
+    out_type: dict[str, str],
+    source_stream_nodes: list[str],
+) -> None:
+    sig = _node_signature(node.op)
+    _validate_node_input_contract(node=node, sig=sig, out_type=out_type)
+    _validate_node_op_params(node=node, source_stream_nodes=source_stream_nodes)
+    out_type[node.node_id] = sig.output_type
+
+
+def _validate_node_input_contract(
+    *,
+    node: NodeSpec,
+    sig: OpSpec,
+    out_type: dict[str, str],
+) -> None:
+    required_inputs = set(sig.input_types.keys())
+    optional_inputs = set(sig.optional_input_types.keys())
+    expected_inputs = required_inputs | optional_inputs
+    given_inputs = set(node.inputs.keys())
+    missing_inputs = sorted(required_inputs - given_inputs)
+    unknown_inputs = sorted(given_inputs - expected_inputs)
+    if missing_inputs or unknown_inputs:
+        raise ValueError(
+            f"node {node.node_id!r} inputs mismatch; "
+            f"missing required {missing_inputs}, unknown {unknown_inputs}, "
+            f"allowed {sorted(expected_inputs)}"
+        )
+    for port, source_id in node.inputs.items():
+        _validate_node_input_type(
+            node=node,
+            sig=sig,
+            out_type=out_type,
+            port=port,
+            source_id=source_id,
+        )
+
+
+def _validate_node_input_type(
+    *,
+    node: NodeSpec,
+    sig: OpSpec,
+    out_type: dict[str, str],
+    port: str,
+    source_id: str,
+) -> None:
+    if _is_special_input_source(node.op, port, source_id):
+        return
+    expected_type = sig.input_types.get(port) or sig.optional_input_types.get(port)
+    if expected_type is None:
+        raise ValueError(f"node {node.node_id!r} has unknown input port {port!r}")
+    source_type = out_type.get(source_id)
+    if source_type != expected_type:
+        raise ValueError(
+            f"node {node.node_id!r} input {port!r} expects {expected_type}, "
+            f"got {source_type} from {source_id!r}"
+        )
+
+
+def _validate_node_op_params(
+    *,
+    node: NodeSpec,
+    source_stream_nodes: list[str],
+) -> None:
+    validator = _NODE_OP_PARAM_VALIDATORS.get(node.op)
+    if validator is None:
+        return
+    validator(node=node, source_stream_nodes=source_stream_nodes)
+
+
+def _validate_source_stream_node(
+    *,
+    node: NodeSpec,
+    source_stream_nodes: list[str],
+) -> None:
+    source_stream_nodes.append(node.node_id)
+    did = _normalize_id(node.params.get("device_id"))
+    stream = _normalize_id(node.params.get("stream"))
+    if did is None or stream is None:
+        raise ValueError(f"node {node.node_id!r} {node.op} requires device_id and stream")
+    _ = _parse_stream_source_mode(node.params.get("channel_mode"))
+    _ = _parse_channel_indices(node.params.get("channel_indices"))
+
+
+def _validate_source_context_field_node(node: NodeSpec) -> None:
+    field = _normalize_id(node.params.get("field"))
+    if field is None:
+        raise ValueError(f"node {node.node_id!r} source.context_field requires field")
+
+
+def _validate_source_telemetry_nearest_node(node: NodeSpec) -> None:
+    did = _normalize_id(node.params.get("device_id"))
+    signal = _normalize_id(node.params.get("signal"))
+    if did is None or signal is None:
+        raise ValueError(
+            f"node {node.node_id!r} source.telemetry_nearest requires device_id and signal"
+        )
+    max_dt_s = _normalize_float(node.params.get("max_dt_s", 2.0))
+    if max_dt_s is None or max_dt_s <= 0:
+        raise ValueError(
+            f"node {node.node_id!r} source.telemetry_nearest requires max_dt_s > 0"
+        )
+
+
+def _validate_node_scalar_threshold(
+    node: NodeSpec,
+    source_stream_nodes: list[str],
+) -> None:
+    del source_stream_nodes
+    _ = _validate_scalar_threshold_params(node.params)
+
+
+def _validate_node_trace_rolling_mean(
+    node: NodeSpec,
+    source_stream_nodes: list[str],
+) -> None:
+    del source_stream_nodes
+    _ = TraceRollingMeanState.from_params(node.params)
+
+
+def _validate_node_trace_decimate(
+    node: NodeSpec,
+    source_stream_nodes: list[str],
+) -> None:
+    del source_stream_nodes
+    _ = _validate_trace_decimate_params(node.params)
+
+
+def _validate_node_fit_curve_1d(
+    node: NodeSpec,
+    source_stream_nodes: list[str],
+) -> None:
+    del source_stream_nodes
+    _ = _validate_fit_curve_params(node.params)
+
+
+def _validate_node_fit_from_hist(
+    node: NodeSpec,
+    source_stream_nodes: list[str],
+) -> None:
+    del source_stream_nodes
+    _ = _validate_fit_from_hist_params(node.params)
+
+
+def _validate_node_fit_param(
+    node: NodeSpec,
+    source_stream_nodes: list[str],
+) -> None:
+    del source_stream_nodes
+    _ = _normalize_fit_param_name(node.params.get("name", "center"))
+
+
+def _validate_node_aggregate_bin_stats(
+    node: NodeSpec,
+    source_stream_nodes: list[str],
+) -> None:
+    del source_stream_nodes
+    _ = BinStatsState.from_params(node.params)
+
+
+def _validate_node_aggregate_bin2d_stats(
+    node: NodeSpec,
+    source_stream_nodes: list[str],
+) -> None:
+    del source_stream_nodes
+    _ = Bin2DStatsState.from_params(node.params)
+
+
+def _validate_node_source_context_field(
+    node: NodeSpec,
+    source_stream_nodes: list[str],
+) -> None:
+    del source_stream_nodes
+    _validate_source_context_field_node(node)
+
+
+def _validate_node_source_telemetry_nearest(
+    node: NodeSpec,
+    source_stream_nodes: list[str],
+) -> None:
+    del source_stream_nodes
+    _validate_source_telemetry_nearest_node(node)
+
+
+_NODE_OP_PARAM_VALIDATORS: dict[str, Callable[[NodeSpec, list[str]], None]] = {
+    "source.stream": _validate_source_stream_node,
+    "source.context_field": _validate_node_source_context_field,
+    "source.telemetry_nearest": _validate_node_source_telemetry_nearest,
+    "scalar.threshold": _validate_node_scalar_threshold,
+    "trace.rolling_mean": _validate_node_trace_rolling_mean,
+    "trace.decimate": _validate_node_trace_decimate,
+    "fit.curve_1d": _validate_node_fit_curve_1d,
+    "fit.from_hist_agg": _validate_node_fit_from_hist,
+    "fit.param": _validate_node_fit_param,
+    "aggregate.bin_stats": _validate_node_aggregate_bin_stats,
+    "aggregate.bin2d_stats": _validate_node_aggregate_bin2d_stats,
+}
+
+
+def _compile_workspace_outputs(
+    *,
+    config: Json,
+    nodes: dict[str, NodeSpec],
+    out_type: dict[str, str],
+) -> list[PublishOutput]:
+    outputs_raw = _compile_workspace_outputs_raw(config)
+    outputs: list[PublishOutput] = []
+    output_ids: set[str] = set()
+    for idx, item in enumerate(outputs_raw):
+        output = _compile_workspace_output_item(
+            item=item,
+            idx=idx,
+            nodes=nodes,
+            out_type=out_type,
+            seen_output_ids=output_ids,
+        )
+        outputs.append(output)
+    return outputs
+
+
+def _compile_workspace_outputs_raw(config: Json) -> list[Any]:
+    publish_raw = config.get("publish")
+    publish = publish_raw if isinstance(publish_raw, dict) else {}
+    outputs_raw = publish.get("outputs")
+    if outputs_raw is None:
+        return []
+    if not isinstance(outputs_raw, list):
+        raise ValueError("publish.outputs must be a list")
+    return outputs_raw
+
+
+def _compile_workspace_output_item(
+    *,
+    item: Any,
+    idx: int,
+    nodes: dict[str, NodeSpec],
+    out_type: dict[str, str],
+    seen_output_ids: set[str],
+) -> PublishOutput:
+    if not isinstance(item, dict):
+        raise ValueError(f"publish.outputs[{idx}] must be an object")
+    output_id = _normalize_id(item.get("output_id"))
+    if output_id is None:
+        raise ValueError(f"publish.outputs[{idx}].output_id is required")
+    if output_id in seen_output_ids:
+        raise ValueError(f"duplicate publish output_id {output_id!r}")
+    node_id = _normalize_id(item.get("node_id"))
+    if node_id is None:
+        raise ValueError(f"publish.outputs[{idx}].node_id is required")
+    if node_id not in nodes:
+        raise ValueError(
+            f"publish.outputs[{idx}].node_id references unknown node {node_id!r}"
+        )
+    kind = out_type.get(node_id)
+    if kind is None:
+        raise ValueError(f"publish.outputs[{idx}].node_id has no output type {node_id!r}")
+    if kind not in {"scalar", "hist_agg", "hist2d", "trace", "params_map", "fit_1d"}:
+        raise ValueError(
+            f"publish.outputs[{idx}].node_id type {kind!r} is not publishable in v1"
+        )
+    seen_output_ids.add(output_id)
+    return PublishOutput(output_id=output_id, node_id=node_id, kind=kind)
+
+
+def compile_workspace_graph(config: Json) -> CompiledWorkspace:
+    workspace_id, enabled, nodes_list, nodes = _parse_workspace_root(config)
+    deps = _compile_workspace_dependencies(nodes_list=nodes_list, nodes=nodes)
+    order = _compile_workspace_order(deps)
     out_type: dict[str, str] = {}
     source_stream_nodes: list[str] = []
     for node_id in order:
         node = nodes[node_id]
-        sig = _node_signature(node.op)
-        required_inputs = set(sig.input_types.keys())
-        optional_inputs = set(sig.optional_input_types.keys())
-        expected_inputs = required_inputs | optional_inputs
-        given_inputs = set(node.inputs.keys())
-        missing_inputs = sorted(required_inputs - given_inputs)
-        unknown_inputs = sorted(given_inputs - expected_inputs)
-        if missing_inputs or unknown_inputs:
-            raise ValueError(
-                f"node {node.node_id!r} inputs mismatch; "
-                f"missing required {missing_inputs}, unknown {unknown_inputs}, "
-                f"allowed {sorted(expected_inputs)}"
-            )
-        for port, source_id in node.inputs.items():
-            if _is_special_input_source(node.op, port, source_id):
-                continue
-            expected_type = sig.input_types.get(port) or sig.optional_input_types.get(
-                port
-            )
-            if expected_type is None:
-                raise ValueError(
-                    f"node {node.node_id!r} has unknown input port {port!r}"
-                )
-            source_type = out_type.get(source_id)
-            if source_type != expected_type:
-                raise ValueError(
-                    f"node {node.node_id!r} input {port!r} expects {expected_type}, got {source_type} from {source_id!r}"
-                )
-        if node.op == "source.stream":
-            source_stream_nodes.append(node.node_id)
-            did = _normalize_id(node.params.get("device_id"))
-            stream = _normalize_id(node.params.get("stream"))
-            if did is None or stream is None:
-                raise ValueError(
-                    f"node {node.node_id!r} {node.op} requires device_id and stream"
-                )
-            _ = _parse_stream_source_mode(node.params.get("channel_mode"))
-            _ = _parse_channel_indices(node.params.get("channel_indices"))
-        if node.op == "source.context_field":
-            field = _normalize_id(node.params.get("field"))
-            if field is None:
-                raise ValueError(
-                    f"node {node.node_id!r} source.context_field requires field"
-                )
-        if node.op == "source.telemetry_nearest":
-            did = _normalize_id(node.params.get("device_id"))
-            signal = _normalize_id(node.params.get("signal"))
-            if did is None or signal is None:
-                raise ValueError(
-                    f"node {node.node_id!r} source.telemetry_nearest requires device_id and signal"
-                )
-            max_dt_s = _normalize_float(node.params.get("max_dt_s", 2.0))
-            if max_dt_s is None or max_dt_s <= 0:
-                raise ValueError(
-                    f"node {node.node_id!r} source.telemetry_nearest requires max_dt_s > 0"
-                )
-        if node.op == "scalar.threshold":
-            _ = _validate_scalar_threshold_params(node.params)
-        if node.op == "trace.rolling_mean":
-            _ = TraceRollingMeanState.from_params(node.params)
-        if node.op == "trace.decimate":
-            _ = _validate_trace_decimate_params(node.params)
-        if node.op == "fit.curve_1d":
-            _ = _validate_fit_curve_params(node.params)
-        if node.op == "fit.from_hist_agg":
-            _ = _validate_fit_from_hist_params(node.params)
-        if node.op == "fit.param":
-            _ = _normalize_fit_param_name(node.params.get("name", "center"))
-        if node.op == "aggregate.bin_stats":
-            _ = BinStatsState.from_params(node.params)
-        if node.op == "aggregate.bin2d_stats":
-            _ = Bin2DStatsState.from_params(node.params)
-        out_type[node.node_id] = sig.output_type
+        _validate_compiled_node(
+            node=node,
+            out_type=out_type,
+            source_stream_nodes=source_stream_nodes,
+        )
 
     if len(source_stream_nodes) != 1:
         raise ValueError("graph must contain exactly one source.stream node")
@@ -2084,49 +2451,7 @@ def compile_workspace_graph(config: Json) -> CompiledWorkspace:
         str(source_node.params["device_id"]).strip(),
         str(source_node.params["stream"]).strip(),
     )
-
-    publish_raw = config.get("publish")
-    publish = publish_raw if isinstance(publish_raw, dict) else {}
-    outputs_raw = publish.get("outputs")
-    if outputs_raw is None:
-        outputs_raw = []
-    if not isinstance(outputs_raw, list):
-        raise ValueError("publish.outputs must be a list")
-    outputs: list[PublishOutput] = []
-    output_ids: set[str] = set()
-    for idx, item in enumerate(outputs_raw):
-        if not isinstance(item, dict):
-            raise ValueError(f"publish.outputs[{idx}] must be an object")
-        output_id = _normalize_id(item.get("output_id"))
-        if output_id is None:
-            raise ValueError(f"publish.outputs[{idx}].output_id is required")
-        if output_id in output_ids:
-            raise ValueError(f"duplicate publish output_id {output_id!r}")
-        node_id = _normalize_id(item.get("node_id"))
-        if node_id is None:
-            raise ValueError(f"publish.outputs[{idx}].node_id is required")
-        if node_id not in nodes:
-            raise ValueError(
-                f"publish.outputs[{idx}].node_id references unknown node {node_id!r}"
-            )
-        kind = out_type.get(node_id)
-        if kind is None:
-            raise ValueError(
-                f"publish.outputs[{idx}].node_id has no output type {node_id!r}"
-            )
-        if kind not in {
-            "scalar",
-            "hist_agg",
-            "hist2d",
-            "trace",
-            "params_map",
-            "fit_1d",
-        }:
-            raise ValueError(
-                f"publish.outputs[{idx}].node_id type {kind!r} is not publishable in v1"
-            )
-        output_ids.add(output_id)
-        outputs.append(PublishOutput(output_id=output_id, node_id=node_id, kind=kind))
+    outputs = _compile_workspace_outputs(config=config, nodes=nodes, out_type=out_type)
 
     return CompiledWorkspace(
         workspace_id=workspace_id,
@@ -2212,10 +2537,13 @@ class StreamAnalysisProcess(ManagedProcessBase):
         self._telemetry_history: dict[tuple[str, str], list[tuple[float, float]]] = {}
         self._telemetry_history_max_points = 4096
         self._telemetry_history_max_age_s = 300.0
+        self._telemetry_history_prune_period_s = 30.0
+        self._telemetry_history_last_prune_mono = 0.0
         self._latest_output_payloads: dict[tuple[str, str], Json] = {}
 
         self._processed_updates = 0
         self._dropped_updates = 0
+        self._rpc_registry = self._build_rpc_registry()
         self._hist_last_emit_mono: dict[str, float] = {}
         self._trace_last_emit_mono: dict[str, float] = {}
         self._workspace_store_path = self._normalize_workspace_store_path(
@@ -2290,42 +2618,53 @@ class StreamAnalysisProcess(ManagedProcessBase):
     def _parse_workspace_store_payload(raw: Any) -> list[Json]:
         if raw is None:
             return []
-        entries: list[Json] = []
-        source_items: list[tuple[str | None, Any]] = []
-        if isinstance(raw, list):
-            source_items = [(None, item) for item in raw]
-        elif isinstance(raw, dict):
-            if "workspaces" in raw:
-                workspaces_raw = raw.get("workspaces")
-                if workspaces_raw is None:
-                    source_items = []
-                elif isinstance(workspaces_raw, list):
-                    source_items = [(None, item) for item in workspaces_raw]
-                elif isinstance(workspaces_raw, dict):
-                    source_items = list(workspaces_raw.items())
-                else:
-                    raise ValueError("workspace store workspaces must be list or mapping")
-            elif "workspace_id" in raw and "graph" in raw:
-                source_items = [(None, raw)]
-            elif len(raw) == 0:
-                source_items = []
-            else:
-                raise ValueError("workspace store must contain workspaces list or mapping")
-        else:
-            raise ValueError("workspace store payload must be a dict or list")
-
-        for key, item in source_items:
-            if not isinstance(item, dict):
-                raise ValueError("workspace entry must be an object")
-            cfg = dict(item)
-            if _normalize_id(cfg.get("workspace_id")) is None and key is not None:
-                cfg["workspace_id"] = str(key).strip()
-            workspace_id = _normalize_id(cfg.get("workspace_id"))
-            if workspace_id is None:
-                raise ValueError("workspace entry missing workspace_id")
-            entries.append(cfg)
+        source_items = StreamAnalysisProcess._workspace_store_source_items(raw)
+        entries = [
+            StreamAnalysisProcess._workspace_store_normalize_entry(key=key, item=item)
+            for key, item in source_items
+        ]
         entries.sort(key=lambda item: str(item.get("workspace_id", "")))
         return entries
+
+    @staticmethod
+    def _workspace_store_source_items(raw: Any) -> list[tuple[str | None, Any]]:
+        if isinstance(raw, list):
+            return [(None, item) for item in raw]
+        if not isinstance(raw, dict):
+            raise ValueError("workspace store payload must be a dict or list")
+        if "workspaces" in raw:
+            return StreamAnalysisProcess._workspace_store_items_from_workspaces(
+                raw.get("workspaces")
+            )
+        if "workspace_id" in raw and "graph" in raw:
+            return [(None, raw)]
+        if len(raw) == 0:
+            return []
+        raise ValueError("workspace store must contain workspaces list or mapping")
+
+    @staticmethod
+    def _workspace_store_items_from_workspaces(
+        workspaces_raw: Any,
+    ) -> list[tuple[str | None, Any]]:
+        if workspaces_raw is None:
+            return []
+        if isinstance(workspaces_raw, list):
+            return [(None, item) for item in workspaces_raw]
+        if isinstance(workspaces_raw, dict):
+            return list(workspaces_raw.items())
+        raise ValueError("workspace store workspaces must be list or mapping")
+
+    @staticmethod
+    def _workspace_store_normalize_entry(*, key: str | None, item: Any) -> Json:
+        if not isinstance(item, dict):
+            raise ValueError("workspace entry must be an object")
+        cfg = dict(item)
+        if _normalize_id(cfg.get("workspace_id")) is None and key is not None:
+            cfg["workspace_id"] = str(key).strip()
+        workspace_id = _normalize_id(cfg.get("workspace_id"))
+        if workspace_id is None:
+            raise ValueError("workspace entry missing workspace_id")
+        return cfg
 
     def _clear_workspaces(self, *, mark_dirty: bool, publish: bool) -> list[str]:
         removed = sorted(self._workspaces.keys())
@@ -2512,6 +2851,22 @@ class StreamAnalysisProcess(ManagedProcessBase):
                 continue
             out.setdefault(c.stream_key, set()).add(c.workspace_id)
         self._stream_to_workspaces = out
+        self._reconcile_stream_runtime_keys()
+
+    def _reconcile_stream_runtime_keys(self) -> None:
+        active = set(self._stream_to_workspaces.keys())
+        for key in list(self._readers.keys()):
+            if key in active:
+                continue
+            reader = self._readers.pop(key, None)
+            if reader is not None:
+                try:
+                    reader.close()
+                except Exception:
+                    pass
+            self._last_seq.pop(key, None)
+            self._stream_context.pop(key, None)
+            self._context_by_seq.pop(key, None)
 
     def _put_workspace_from_config(
         self,
@@ -2523,91 +2878,26 @@ class StreamAnalysisProcess(ManagedProcessBase):
     ) -> WorkspaceRuntime:
         compiled = compile_workspace_graph(config)
         existing = self._workspaces.get(compiled.workspace_id)
-        current_revision = existing.revision if existing is not None else None
-        if expected_revision is not None:
-            if existing is None:
-                if int(expected_revision) != 0:
-                    raise WorkspaceRevisionConflict(
-                        workspace_id=compiled.workspace_id,
-                        expected_revision=int(expected_revision),
-                        current_revision=None,
-                    )
-            elif int(expected_revision) != int(current_revision):
-                raise WorkspaceRevisionConflict(
-                    workspace_id=compiled.workspace_id,
-                    expected_revision=int(expected_revision),
-                    current_revision=int(current_revision),
-                )
-        node_state: dict[str, Any] = {}
-        if existing is not None:
-            graph_unchanged = (
-                set(existing.compiled.nodes.keys()) == set(compiled.nodes.keys())
-            )
-            if graph_unchanged:
-                for node_id, old_node in existing.compiled.nodes.items():
-                    new_node = compiled.nodes.get(node_id)
-                    if new_node is None:
-                        graph_unchanged = False
-                        break
-                    if (
-                        old_node.op != new_node.op
-                        or old_node.params != new_node.params
-                        or old_node.inputs != new_node.inputs
-                    ):
-                        graph_unchanged = False
-                        break
-            if not graph_unchanged:
-                existing = None
-
-        if existing is not None:
-            for node_id, state in existing.node_state.items():
-                old_node = existing.compiled.nodes.get(node_id)
-                new_node = compiled.nodes.get(node_id)
-                if old_node is None or new_node is None:
-                    continue
-                if old_node.op != new_node.op:
-                    continue
-                if old_node.params != new_node.params:
-                    continue
-                node_state[node_id] = state
-
-        runtime = WorkspaceRuntime(
-            compiled=compiled,
-            raw_config={},
-            node_state=node_state,
-            processed_samples=existing.processed_samples if existing else 0,
-            dropped_samples=existing.dropped_samples if existing else 0,
-            revision=(existing.revision + 1) if existing is not None else 1,
-            etag=self._workspace_etag(
-                compiled.workspace_id,
-                (existing.revision + 1) if existing is not None else 1,
-            ),
+        self._validate_workspace_expected_revision(
+            workspace_id=compiled.workspace_id,
+            existing=existing,
+            expected_revision=expected_revision,
         )
-        raw_cfg = _sanitize_json(dict(config))
-        raw_cfg["workspace_id"] = compiled.workspace_id
-        raw_cfg["enabled"] = bool(compiled.enabled)
-        if not isinstance(raw_cfg.get("graph"), dict):
-            raw_cfg["graph"] = {}
-        if not isinstance(raw_cfg.get("publish"), dict):
-            raw_cfg["publish"] = {}
-        runtime.raw_config = raw_cfg
-
-        for node_id in compiled.order:
-            node = compiled.nodes[node_id]
-            spec = OPS[node.op]
-            if not spec.stateful:
-                continue
-            if node_id not in runtime.node_state:
-                if node.op == "aggregate.bin_stats":
-                    runtime.node_state[node_id] = BinStatsState.from_params(node.params)
-                elif node.op == "aggregate.bin2d_stats":
-                    runtime.node_state[node_id] = Bin2DStatsState.from_params(node.params)
-                elif node.op == "trace.rolling_mean":
-                    runtime.node_state[node_id] = TraceRollingMeanState.from_params(node.params)
-                elif node.op == "fit.curve_1d":
-                    runtime.node_state[node_id] = FitCurve1DState.from_params(node.params)
-                elif node.op == "fit.from_hist_agg":
-                    runtime.node_state[node_id] = FitCurve1DState.from_params(node.params)
+        existing_for_state = self._workspace_reusable_existing(
+            existing=existing,
+            compiled=compiled,
+        )
+        node_state = self._workspace_reused_node_state(
+            existing=existing_for_state,
+            compiled=compiled,
+        )
+        runtime = self._workspace_runtime_from_compiled(
+            compiled=compiled,
+            config=config,
+            existing=existing_for_state,
+            node_state=node_state,
+        )
+        self._workspace_init_stateful_nodes(runtime)
 
         self._workspaces[compiled.workspace_id] = runtime
         self._prune_workspace_snapshot_outputs(runtime)
@@ -2622,6 +2912,146 @@ class StreamAnalysisProcess(ManagedProcessBase):
                 details={"workspace": self._workspace_summary(runtime)},
             )
         return runtime
+
+    def _validate_workspace_expected_revision(
+        self,
+        *,
+        workspace_id: str,
+        existing: WorkspaceRuntime | None,
+        expected_revision: int | None,
+    ) -> None:
+        if expected_revision is None:
+            return
+        if existing is None:
+            if int(expected_revision) != 0:
+                raise WorkspaceRevisionConflict(
+                    workspace_id=workspace_id,
+                    expected_revision=int(expected_revision),
+                    current_revision=None,
+                )
+            return
+        current_revision = int(existing.revision)
+        if int(expected_revision) != current_revision:
+            raise WorkspaceRevisionConflict(
+                workspace_id=workspace_id,
+                expected_revision=int(expected_revision),
+                current_revision=current_revision,
+            )
+
+    def _workspace_reusable_existing(
+        self,
+        *,
+        existing: WorkspaceRuntime | None,
+        compiled: CompiledWorkspace,
+    ) -> WorkspaceRuntime | None:
+        if existing is None:
+            return None
+        if not self._workspace_graph_unchanged(existing.compiled, compiled):
+            return None
+        return existing
+
+    @staticmethod
+    def _workspace_graph_unchanged(
+        old_compiled: CompiledWorkspace,
+        new_compiled: CompiledWorkspace,
+    ) -> bool:
+        if set(old_compiled.nodes.keys()) != set(new_compiled.nodes.keys()):
+            return False
+        for node_id, old_node in old_compiled.nodes.items():
+            new_node = new_compiled.nodes.get(node_id)
+            if new_node is None:
+                return False
+            if old_node.op != new_node.op:
+                return False
+            if old_node.params != new_node.params:
+                return False
+            if old_node.inputs != new_node.inputs:
+                return False
+        return True
+
+    @staticmethod
+    def _workspace_reused_node_state(
+        *,
+        existing: WorkspaceRuntime | None,
+        compiled: CompiledWorkspace,
+    ) -> dict[str, Any]:
+        if existing is None:
+            return {}
+        node_state: dict[str, Any] = {}
+        for node_id, state in existing.node_state.items():
+            old_node = existing.compiled.nodes.get(node_id)
+            new_node = compiled.nodes.get(node_id)
+            if old_node is None or new_node is None:
+                continue
+            if old_node.op != new_node.op:
+                continue
+            if old_node.params != new_node.params:
+                continue
+            node_state[node_id] = state
+        return node_state
+
+    def _workspace_runtime_from_compiled(
+        self,
+        *,
+        compiled: CompiledWorkspace,
+        config: Json,
+        existing: WorkspaceRuntime | None,
+        node_state: dict[str, Any],
+    ) -> WorkspaceRuntime:
+        revision = (existing.revision + 1) if existing is not None else 1
+        runtime = WorkspaceRuntime(
+            compiled=compiled,
+            raw_config={},
+            node_state=node_state,
+            processed_samples=existing.processed_samples if existing else 0,
+            dropped_samples=existing.dropped_samples if existing else 0,
+            revision=revision,
+            etag=self._workspace_etag(compiled.workspace_id, revision),
+        )
+        runtime.raw_config = self._workspace_normalized_raw_config(
+            config=config,
+            compiled=compiled,
+        )
+        return runtime
+
+    @staticmethod
+    def _workspace_normalized_raw_config(
+        *,
+        config: Json,
+        compiled: CompiledWorkspace,
+    ) -> Json:
+        raw_cfg = _sanitize_json(dict(config))
+        raw_cfg["workspace_id"] = compiled.workspace_id
+        raw_cfg["enabled"] = bool(compiled.enabled)
+        if not isinstance(raw_cfg.get("graph"), dict):
+            raw_cfg["graph"] = {}
+        if not isinstance(raw_cfg.get("publish"), dict):
+            raw_cfg["publish"] = {}
+        return raw_cfg
+
+    def _workspace_init_stateful_nodes(self, runtime: WorkspaceRuntime) -> None:
+        for node_id in runtime.compiled.order:
+            if node_id in runtime.node_state:
+                continue
+            node = runtime.compiled.nodes[node_id]
+            spec = OPS[node.op]
+            if not spec.stateful:
+                continue
+            state = self._workspace_new_stateful_node(node)
+            if state is not None:
+                runtime.node_state[node_id] = state
+
+    @staticmethod
+    def _workspace_new_stateful_node(node: NodeSpec) -> Any:
+        if node.op == "aggregate.bin_stats":
+            return BinStatsState.from_params(node.params)
+        if node.op == "aggregate.bin2d_stats":
+            return Bin2DStatsState.from_params(node.params)
+        if node.op == "trace.rolling_mean":
+            return TraceRollingMeanState.from_params(node.params)
+        if node.op in {"fit.curve_1d", "fit.from_hist_agg"}:
+            return FitCurve1DState.from_params(node.params)
+        return None
 
     def _delete_workspace(
         self,
@@ -3031,6 +3461,31 @@ class StreamAnalysisProcess(ManagedProcessBase):
         if max_points > 0 and len(samples) > max_points:
             del samples[: len(samples) - max_points]
 
+    def _prune_telemetry_history(self, *, now_mono: float | None = None) -> None:
+        if not self._telemetry_history:
+            return
+        now = float(now_mono) if now_mono is not None else float(time.monotonic())
+        if now < (
+            self._telemetry_history_last_prune_mono
+            + self._telemetry_history_prune_period_s
+        ):
+            return
+        self._telemetry_history_last_prune_mono = now
+        max_age_s = float(self._telemetry_history_max_age_s)
+        if not (math.isfinite(max_age_s) and max_age_s > 0):
+            return
+        cutoff = now - max_age_s
+        for key in list(self._telemetry_history.keys()):
+            samples = self._telemetry_history.get(key)
+            if not samples:
+                self._telemetry_history.pop(key, None)
+                continue
+            trim_idx = bisect.bisect_left(samples, (cutoff, -math.inf))
+            if trim_idx > 0:
+                del samples[:trim_idx]
+            if not samples:
+                self._telemetry_history.pop(key, None)
+
     def _ingest_telemetry_update(self, msg: Json) -> None:
         device_id = _normalize_id(msg.get("device_id"))
         signals = msg.get("signals")
@@ -3062,6 +3517,7 @@ class StreamAnalysisProcess(ManagedProcessBase):
             self._record_telemetry_sample(
                 device_id=device_id, signal=signal, t_mono_s=t_mono_s, value=value
             )
+        self._prune_telemetry_history(now_mono=time.monotonic())
 
     def _lookup_telemetry_nearest(
         self,
@@ -3095,6 +3551,564 @@ class StreamAnalysisProcess(ManagedProcessBase):
             return None
         return float(best_value)
 
+    def _execute_workspace_node(
+        self,
+        *,
+        workspace: WorkspaceRuntime,
+        node: NodeSpec,
+        node_id: str,
+        values: dict[str, Any],
+        array: np.ndarray,
+        context_fields: dict[str, Any] | None,
+        event_t_mono_s: float | None,
+        include_hist_outputs: bool,
+    ) -> tuple[int, int] | None:
+        handlers = (
+            self._execute_workspace_node_source_ops,
+            self._execute_workspace_node_scalar_ops,
+            self._execute_workspace_node_trace_ops,
+            self._execute_workspace_node_fit_ops,
+            self._execute_workspace_node_aggregate_ops,
+        )
+        for handler in handlers:
+            handled, source_update = handler(
+                workspace=workspace,
+                node=node,
+                node_id=node_id,
+                values=values,
+                array=array,
+                context_fields=context_fields,
+                event_t_mono_s=event_t_mono_s,
+                include_hist_outputs=include_hist_outputs,
+            )
+            if handled:
+                return source_update
+        raise RuntimeError(f"unexpected op {node.op!r}")
+
+    def _execute_workspace_node_source_ops(
+        self,
+        *,
+        workspace: WorkspaceRuntime,
+        node: NodeSpec,
+        node_id: str,
+        values: dict[str, Any],
+        array: np.ndarray,
+        context_fields: dict[str, Any] | None,
+        event_t_mono_s: float | None,
+        include_hist_outputs: bool,
+    ) -> tuple[bool, tuple[int, int] | None]:
+        del include_hist_outputs
+        op = node.op
+        if op == "source.stream":
+            source_update = self._workspace_node_source_stream(
+                workspace=workspace,
+                node=node,
+                node_id=node_id,
+                values=values,
+                array=array,
+            )
+            return True, source_update
+        if op == "source.context_field":
+            field = _normalize_id(node.params.get("field"))
+            scalar = None
+            if field is not None and isinstance(context_fields, dict):
+                scalar = _normalize_float(context_fields.get(field))
+            values[node_id] = scalar
+            return True, None
+        if op == "source.telemetry_nearest":
+            did = _normalize_id(node.params.get("device_id"))
+            signal = _normalize_id(node.params.get("signal"))
+            max_dt_s = _normalize_float(node.params.get("max_dt_s", 2.0))
+            if max_dt_s is None or max_dt_s <= 0:
+                max_dt_s = 2.0
+            scalar = None
+            if did is not None and signal is not None:
+                scalar = self._lookup_telemetry_nearest(
+                    device_id=did,
+                    signal=signal,
+                    event_t_mono_s=event_t_mono_s,
+                    max_dt_s=max_dt_s,
+                )
+            values[node_id] = scalar
+            return True, None
+        return False, None
+
+    def _workspace_node_source_stream(
+        self,
+        *,
+        workspace: WorkspaceRuntime,
+        node: NodeSpec,
+        node_id: str,
+        values: dict[str, Any],
+        array: np.ndarray,
+    ) -> tuple[int, int]:
+        mode = _parse_stream_source_mode(node.params.get("channel_mode"))
+        if mode == "single":
+            selected = _parse_channel_indices(node.params.get("channel_indices"))
+            if selected and len(selected) > 0:
+                channel_index = int(selected[0])
+            else:
+                channel_index = _normalize_int(node.params.get("channel_index"))
+                if channel_index is None:
+                    channel_index = 0
+            trace, channel_count, actual_index = _select_trace(array, channel_index)
+            source_channel_index = actual_index
+            source_channel_count = channel_count
+        else:
+            reducer = "sum" if mode == "sum" else "mean"
+            trace, channel_count, selected = _reduce_trace_channels(
+                array,
+                reducer=reducer,
+                channel_indices_raw=node.params.get("channel_indices"),
+            )
+            source_channel_count = channel_count
+            source_channel_index = int(selected[0]) if selected else 0
+        if trace.size > self._max_payload_points:
+            trace = trace[: self._max_payload_points]
+            workspace.dropped_samples += 1
+            self._dropped_updates += 1
+        values[node_id] = trace
+        return source_channel_index, source_channel_count
+
+    def _execute_workspace_node_scalar_ops(
+        self,
+        *,
+        workspace: WorkspaceRuntime,
+        node: NodeSpec,
+        node_id: str,
+        values: dict[str, Any],
+        array: np.ndarray,
+        context_fields: dict[str, Any] | None,
+        event_t_mono_s: float | None,
+        include_hist_outputs: bool,
+    ) -> tuple[bool, tuple[int, int] | None]:
+        del workspace, array, context_fields, event_t_mono_s, include_hist_outputs
+        op_name = {
+            "scalar.add": "add",
+            "scalar.subtract": "subtract",
+            "scalar.multiply": "multiply",
+            "scalar.divide": "divide",
+        }.get(node.op)
+        if op_name is not None:
+            values[node_id] = execute_scalar_binary(
+                values.get(node.inputs["a"]),
+                values.get(node.inputs["b"]),
+                op=op_name,
+            )
+            return True, None
+        if node.op == "scalar.threshold":
+            threshold, mode = _validate_scalar_threshold_params(node.params)
+            values[node_id] = execute_scalar_threshold(
+                values.get(node.inputs["x"]),
+                threshold=threshold,
+                mode=mode,
+            )
+            return True, None
+        return False, None
+
+    def _execute_workspace_node_trace_ops(
+        self,
+        *,
+        workspace: WorkspaceRuntime,
+        node: NodeSpec,
+        node_id: str,
+        values: dict[str, Any],
+        array: np.ndarray,
+        context_fields: dict[str, Any] | None,
+        event_t_mono_s: float | None,
+        include_hist_outputs: bool,
+    ) -> tuple[bool, tuple[int, int] | None]:
+        del array, context_fields, event_t_mono_s, include_hist_outputs
+        op = node.op
+        if op == "trace.divide":
+            values[node_id] = execute_trace_divide(
+                values.get(node.inputs["a"]),
+                values.get(node.inputs["b"]),
+            )
+            return True, None
+        scalar_op = {
+            "trace.add_scalar": "add",
+            "trace.subtract_scalar": "subtract",
+            "trace.multiply_scalar": "multiply",
+            "trace.divide_scalar": "divide",
+        }.get(op)
+        if scalar_op is not None:
+            values[node_id] = execute_trace_scalar_math(
+                values.get(node.inputs["trace"]),
+                values.get(node.inputs["scalar"]),
+                op=scalar_op,
+            )
+            return True, None
+        if op == "trace.rolling_mean":
+            src = values.get(node.inputs["trace"])
+            state = workspace.node_state.get(node_id)
+            if not isinstance(state, TraceRollingMeanState):
+                state = TraceRollingMeanState.from_params(node.params)
+                workspace.node_state[node_id] = state
+            values[node_id] = state.update(src)
+            return True, None
+        return self._execute_workspace_node_trace_unary_ops(
+            node=node,
+            node_id=node_id,
+            values=values,
+        )
+
+    @staticmethod
+    def _execute_workspace_node_trace_unary_ops(
+        *,
+        node: NodeSpec,
+        node_id: str,
+        values: dict[str, Any],
+    ) -> tuple[bool, tuple[int, int] | None]:
+        op = node.op
+        src = values.get(node.inputs["trace"]) if "trace" in node.inputs else None
+        if op == "trace.decimate":
+            values[node_id] = execute_trace_decimate(src, node.params)
+            return True, None
+        if op == "trace.crop":
+            values[node_id] = execute_trace_crop(src, node.params)
+            return True, None
+        if op == "trace.subtract_background":
+            values[node_id] = execute_trace_subtract_background(src, node.params)
+            return True, None
+        if op == "trace.integrate":
+            values[node_id] = execute_trace_integrate(src)
+            return True, None
+        return False, None
+
+    def _execute_workspace_node_fit_ops(
+        self,
+        *,
+        workspace: WorkspaceRuntime,
+        node: NodeSpec,
+        node_id: str,
+        values: dict[str, Any],
+        array: np.ndarray,
+        context_fields: dict[str, Any] | None,
+        event_t_mono_s: float | None,
+        include_hist_outputs: bool,
+    ) -> tuple[bool, tuple[int, int] | None]:
+        del array, context_fields, event_t_mono_s, include_hist_outputs
+        if node.op == "fit.curve_1d":
+            values[node_id] = self._execute_workspace_fit_curve_1d(
+                workspace=workspace,
+                node=node,
+                node_id=node_id,
+                values=values,
+            )
+            return True, None
+        if node.op == "fit.from_hist_agg":
+            values[node_id] = self._execute_workspace_fit_from_hist(
+                workspace=workspace,
+                node=node,
+                node_id=node_id,
+                values=values,
+            )
+            return True, None
+        if node.op == "fit.param":
+            fit_val = values.get(node.inputs["fit"])
+            values[node_id] = execute_fit_param(fit_val, node.params)
+            return True, None
+        if node.op == "fit.params":
+            fit_val = values.get(node.inputs["fit"])
+            values[node_id] = execute_fit_params(fit_val)
+            return True, None
+        return self._execute_workspace_node_fit_extract_ops(
+            node=node,
+            node_id=node_id,
+            values=values,
+        )
+
+    @staticmethod
+    def _execute_workspace_node_fit_extract_ops(
+        *,
+        node: NodeSpec,
+        node_id: str,
+        values: dict[str, Any],
+    ) -> tuple[bool, tuple[int, int] | None]:
+        fit_ops: dict[str, Callable[[Any], Any]] = {
+            "fit.yhat": execute_fit_yhat,
+            "fit.xhat": execute_fit_xhat,
+            "fit.yhat_dense": execute_fit_yhat_dense,
+            "fit.xhat_dense": execute_fit_xhat_dense,
+        }
+        func = fit_ops.get(node.op)
+        if func is None:
+            return False, None
+        fit_val = values.get(node.inputs["fit"])
+        values[node_id] = func(fit_val)
+        return True, None
+
+    def _execute_workspace_fit_curve_1d(
+        self,
+        *,
+        workspace: WorkspaceRuntime,
+        node: NodeSpec,
+        node_id: str,
+        values: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        y_raw = values.get(node.inputs["y"])
+        x_input = str(node.inputs.get("x") or "").strip()
+        if x_input == SAMPLE_INDEX_INPUT_TOKEN:
+            y_trace = _coerce_trace(y_raw)
+            x_raw = np.arange(int(y_trace.size), dtype=np.float64) if y_trace is not None else None
+        else:
+            x_raw = values.get(node.inputs["x"])
+        state = workspace.node_state.get(node_id)
+        if not isinstance(state, FitCurve1DState):
+            state = FitCurve1DState.from_params(node.params)
+            workspace.node_state[node_id] = state
+        gate_val = values.get(node.inputs["gate"]) if "gate" in node.inputs else None
+        return execute_fit_curve_1d(
+            state=state,
+            x_raw=x_raw,
+            y_raw=y_raw,
+            gate_raw=gate_val,
+        )
+
+    def _execute_workspace_fit_from_hist(
+        self,
+        *,
+        workspace: WorkspaceRuntime,
+        node: NodeSpec,
+        node_id: str,
+        values: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        hist_val = values.get(node.inputs["hist"])
+        state = workspace.node_state.get(node_id)
+        if not isinstance(state, FitCurve1DState):
+            state = FitCurve1DState.from_params(node.params)
+            workspace.node_state[node_id] = state
+        (
+            _model,
+            _baseline_mode,
+            _every_n,
+            _sigma_y,
+            _dense_eval_points,
+            y_source,
+            chi2_sigma_source,
+            min_count,
+            x_min,
+            x_max,
+        ) = _validate_fit_from_hist_params(node.params)
+        gate_val = values.get(node.inputs["gate"]) if "gate" in node.inputs else None
+        return execute_fit_from_hist_agg(
+            state=state,
+            hist_raw=hist_val,
+            gate_raw=gate_val,
+            y_source=y_source,
+            chi2_sigma_source=chi2_sigma_source,
+            min_count=min_count,
+            x_min=x_min,
+            x_max=x_max,
+        )
+
+    def _execute_workspace_node_aggregate_ops(
+        self,
+        *,
+        workspace: WorkspaceRuntime,
+        node: NodeSpec,
+        node_id: str,
+        values: dict[str, Any],
+        array: np.ndarray,
+        context_fields: dict[str, Any] | None,
+        event_t_mono_s: float | None,
+        include_hist_outputs: bool,
+    ) -> tuple[bool, tuple[int, int] | None]:
+        del array, context_fields, event_t_mono_s
+        if node.op == "aggregate.bin_stats":
+            values[node_id] = self._execute_workspace_aggregate_bin_stats(
+                workspace=workspace,
+                node=node,
+                node_id=node_id,
+                values=values,
+                include_hist_outputs=include_hist_outputs,
+            )
+            return True, None
+        if node.op == "aggregate.bin2d_stats":
+            values[node_id] = self._execute_workspace_aggregate_bin2d_stats(
+                workspace=workspace,
+                node=node,
+                node_id=node_id,
+                values=values,
+                include_hist_outputs=include_hist_outputs,
+            )
+            return True, None
+        return False, None
+
+    def _execute_workspace_aggregate_bin_stats(
+        self,
+        *,
+        workspace: WorkspaceRuntime,
+        node: NodeSpec,
+        node_id: str,
+        values: dict[str, Any],
+        include_hist_outputs: bool,
+    ) -> Json | None:
+        x_val = values.get(node.inputs["x"])
+        y_val = values.get(node.inputs["y"])
+        state = workspace.node_state.get(node_id)
+        if not isinstance(state, BinStatsState):
+            state = BinStatsState.from_params(node.params)
+            workspace.node_state[node_id] = state
+        gate_val = values.get(node.inputs["gate"]) if "gate" in node.inputs else None
+        last_sample = state.update_sample(x_val, y_val) if _gate_open(gate_val, default=True) else None
+        if not include_hist_outputs:
+            return None
+        return state.payload(last_sample=last_sample)
+
+    def _execute_workspace_aggregate_bin2d_stats(
+        self,
+        *,
+        workspace: WorkspaceRuntime,
+        node: NodeSpec,
+        node_id: str,
+        values: dict[str, Any],
+        include_hist_outputs: bool,
+    ) -> Json | None:
+        x_val = values.get(node.inputs["x"])
+        y_val = values.get(node.inputs["y"])
+        z_val = values.get(node.inputs["z"])
+        state = workspace.node_state.get(node_id)
+        if not isinstance(state, Bin2DStatsState):
+            state = Bin2DStatsState.from_params(node.params)
+            workspace.node_state[node_id] = state
+        gate_val = values.get(node.inputs["gate"]) if "gate" in node.inputs else None
+        last_sample = (
+            state.update_sample(x_val, y_val, z_val)
+            if _gate_open(gate_val, default=True)
+            else None
+        )
+        if not include_hist_outputs:
+            return None
+        return state.payload(last_sample=last_sample)
+
+    def _build_workspace_output_payloads(
+        self,
+        *,
+        workspace: WorkspaceRuntime,
+        values: dict[str, Any],
+        source_channel_index: int,
+        source_channel_count: int,
+        include_hist_outputs: bool,
+        include_trace_outputs: bool,
+    ) -> list[Json]:
+        outputs: list[Json] = []
+        for output in workspace.compiled.outputs:
+            payload = self._build_workspace_output_payload(
+                workspace=workspace,
+                output=output,
+                raw_value=values.get(output.node_id),
+                source_channel_index=source_channel_index,
+                source_channel_count=source_channel_count,
+                include_hist_outputs=include_hist_outputs,
+                include_trace_outputs=include_trace_outputs,
+            )
+            if payload is not None:
+                outputs.append(payload)
+        return outputs
+
+    def _build_workspace_output_payload(
+        self,
+        *,
+        workspace: WorkspaceRuntime,
+        output: PublishOutput,
+        raw_value: Any,
+        source_channel_index: int,
+        source_channel_count: int,
+        include_hist_outputs: bool,
+        include_trace_outputs: bool,
+    ) -> Json | None:
+        parsed = self._normalize_workspace_output_value(
+            output=output,
+            raw_value=raw_value,
+            include_hist_outputs=include_hist_outputs,
+            include_trace_outputs=include_trace_outputs,
+        )
+        if parsed is None:
+            return None
+        value, point_count, truncated = parsed
+        payload: Json = {
+            "workspace_id": workspace.compiled.workspace_id,
+            "output_id": output.output_id,
+            "node_id": output.node_id,
+            "kind": output.kind,
+            "channel_index": int(source_channel_index),
+            "channel_count": int(source_channel_count),
+            "value": value,
+        }
+        if point_count is not None:
+            payload["point_count"] = int(point_count)
+        if truncated:
+            payload["truncated"] = True
+        return payload
+
+    def _normalize_workspace_output_value(
+        self,
+        *,
+        output: PublishOutput,
+        raw_value: Any,
+        include_hist_outputs: bool,
+        include_trace_outputs: bool,
+    ) -> tuple[Any, int | None, bool] | None:
+        if output.kind == "scalar":
+            return self._normalize_workspace_scalar_output(raw_value)
+        if output.kind in {"hist_agg", "hist2d"}:
+            return self._normalize_workspace_hist_output(
+                raw_value,
+                include_hist_outputs=include_hist_outputs,
+            )
+        if output.kind in {"params_map", "fit_1d"}:
+            return self._normalize_workspace_map_output(raw_value)
+        if output.kind == "trace":
+            return self._normalize_workspace_trace_output(
+                raw_value,
+                include_trace_outputs=include_trace_outputs,
+            )
+        return None
+
+    @staticmethod
+    def _normalize_workspace_scalar_output(
+        raw_value: Any,
+    ) -> tuple[float, None, bool] | None:
+        scalar = _normalize_float(raw_value)
+        if scalar is None:
+            return None
+        return float(scalar), None, False
+
+    @staticmethod
+    def _normalize_workspace_hist_output(
+        raw_value: Any,
+        *,
+        include_hist_outputs: bool,
+    ) -> tuple[Json, None, bool] | None:
+        if not include_hist_outputs or not isinstance(raw_value, dict):
+            return None
+        return _sanitize_json(dict(raw_value)), None, False
+
+    @staticmethod
+    def _normalize_workspace_map_output(raw_value: Any) -> tuple[Json, None, bool] | None:
+        if not isinstance(raw_value, dict):
+            return None
+        return _sanitize_json(dict(raw_value)), None, False
+
+    def _normalize_workspace_trace_output(
+        self,
+        raw_value: Any,
+        *,
+        include_trace_outputs: bool,
+    ) -> tuple[np.ndarray, int, bool] | None:
+        if not include_trace_outputs:
+            return None
+        trace = _coerce_trace(raw_value)
+        if trace is None:
+            return None
+        truncated = False
+        if trace.size > self._max_payload_points:
+            trace = trace[: self._max_payload_points]
+            truncated = True
+        return trace, int(trace.size), truncated
+
     def _execute_workspace_event(
         self,
         *,
@@ -3111,363 +4125,27 @@ class StreamAnalysisProcess(ManagedProcessBase):
 
         for node_id in workspace.compiled.order:
             node = workspace.compiled.nodes[node_id]
-            op = node.op
-            if op == "source.stream":
-                mode = _parse_stream_source_mode(node.params.get("channel_mode"))
-                if mode == "single":
-                    selected = _parse_channel_indices(node.params.get("channel_indices"))
-                    if selected and len(selected) > 0:
-                        channel_index = int(selected[0])
-                    else:
-                        channel_index = _normalize_int(node.params.get("channel_index"))
-                        if channel_index is None:
-                            channel_index = 0
-                    trace, channel_count, actual_index = _select_trace(array, channel_index)
-                    source_channel_index = actual_index
-                    source_channel_count = channel_count
-                else:
-                    reducer = "sum" if mode == "sum" else "mean"
-                    trace, channel_count, selected = _reduce_trace_channels(
-                        array,
-                        reducer=reducer,
-                        channel_indices_raw=node.params.get("channel_indices"),
-                    )
-                    source_channel_count = channel_count
-                    source_channel_index = int(selected[0]) if selected else 0
-                if trace.size > self._max_payload_points:
-                    trace = trace[: self._max_payload_points]
-                    workspace.dropped_samples += 1
-                    self._dropped_updates += 1
-                values[node_id] = trace
-                continue
+            source_update = self._execute_workspace_node(
+                workspace=workspace,
+                node=node,
+                node_id=node_id,
+                values=values,
+                array=array,
+                context_fields=context_fields,
+                event_t_mono_s=event_t_mono_s,
+                include_hist_outputs=include_hist_outputs,
+            )
+            if source_update is not None:
+                source_channel_index, source_channel_count = source_update
 
-            if op == "source.context_field":
-                field = _normalize_id(node.params.get("field"))
-                scalar = None
-                if field is not None and isinstance(context_fields, dict):
-                    scalar = _normalize_float(context_fields.get(field))
-                values[node_id] = scalar
-                continue
-
-            if op == "source.telemetry_nearest":
-                did = _normalize_id(node.params.get("device_id"))
-                signal = _normalize_id(node.params.get("signal"))
-                max_dt_s = _normalize_float(node.params.get("max_dt_s", 2.0))
-                if max_dt_s is None or max_dt_s <= 0:
-                    max_dt_s = 2.0
-                scalar = None
-                if did is not None and signal is not None:
-                    scalar = self._lookup_telemetry_nearest(
-                        device_id=did,
-                        signal=signal,
-                        event_t_mono_s=event_t_mono_s,
-                        max_dt_s=max_dt_s,
-                    )
-                values[node_id] = scalar
-                continue
-
-            if op == "scalar.add":
-                values[node_id] = execute_scalar_binary(
-                    values.get(node.inputs["a"]),
-                    values.get(node.inputs["b"]),
-                    op="add",
-                )
-                continue
-
-            if op == "scalar.subtract":
-                values[node_id] = execute_scalar_binary(
-                    values.get(node.inputs["a"]),
-                    values.get(node.inputs["b"]),
-                    op="subtract",
-                )
-                continue
-
-            if op == "scalar.multiply":
-                values[node_id] = execute_scalar_binary(
-                    values.get(node.inputs["a"]),
-                    values.get(node.inputs["b"]),
-                    op="multiply",
-                )
-                continue
-
-            if op == "scalar.divide":
-                values[node_id] = execute_scalar_binary(
-                    values.get(node.inputs["a"]),
-                    values.get(node.inputs["b"]),
-                    op="divide",
-                )
-                continue
-
-            if op == "scalar.threshold":
-                threshold, mode = _validate_scalar_threshold_params(node.params)
-                values[node_id] = execute_scalar_threshold(
-                    values.get(node.inputs["x"]),
-                    threshold=threshold,
-                    mode=mode,
-                )
-                continue
-
-            if op == "trace.divide":
-                values[node_id] = execute_trace_divide(
-                    values.get(node.inputs["a"]),
-                    values.get(node.inputs["b"]),
-                )
-                continue
-
-            if op == "trace.add_scalar":
-                values[node_id] = execute_trace_scalar_math(
-                    values.get(node.inputs["trace"]),
-                    values.get(node.inputs["scalar"]),
-                    op="add",
-                )
-                continue
-
-            if op == "trace.subtract_scalar":
-                values[node_id] = execute_trace_scalar_math(
-                    values.get(node.inputs["trace"]),
-                    values.get(node.inputs["scalar"]),
-                    op="subtract",
-                )
-                continue
-
-            if op == "trace.multiply_scalar":
-                values[node_id] = execute_trace_scalar_math(
-                    values.get(node.inputs["trace"]),
-                    values.get(node.inputs["scalar"]),
-                    op="multiply",
-                )
-                continue
-
-            if op == "trace.divide_scalar":
-                values[node_id] = execute_trace_scalar_math(
-                    values.get(node.inputs["trace"]),
-                    values.get(node.inputs["scalar"]),
-                    op="divide",
-                )
-                continue
-
-            if op == "trace.rolling_mean":
-                src = values.get(node.inputs["trace"])
-                state = workspace.node_state.get(node_id)
-                if not isinstance(state, TraceRollingMeanState):
-                    state = TraceRollingMeanState.from_params(node.params)
-                    workspace.node_state[node_id] = state
-                values[node_id] = state.update(src)
-                continue
-
-            if op == "trace.decimate":
-                src = values.get(node.inputs["trace"])
-                values[node_id] = execute_trace_decimate(src, node.params)
-                continue
-
-            if op == "trace.crop":
-                src = values.get(node.inputs["trace"])
-                values[node_id] = execute_trace_crop(src, node.params)
-                continue
-
-            if op == "trace.subtract_background":
-                src = values.get(node.inputs["trace"])
-                values[node_id] = execute_trace_subtract_background(src, node.params)
-                continue
-
-            if op == "trace.integrate":
-                src = values.get(node.inputs["trace"])
-                values[node_id] = execute_trace_integrate(src)
-                continue
-
-            if op == "fit.curve_1d":
-                y_raw = values.get(node.inputs["y"])
-                x_input = str(node.inputs.get("x") or "").strip()
-                if x_input == SAMPLE_INDEX_INPUT_TOKEN:
-                    y_trace = _coerce_trace(y_raw)
-                    x_raw = (
-                        np.arange(int(y_trace.size), dtype=np.float64)
-                        if y_trace is not None
-                        else None
-                    )
-                else:
-                    x_raw = values.get(node.inputs["x"])
-                state = workspace.node_state.get(node_id)
-                if not isinstance(state, FitCurve1DState):
-                    state = FitCurve1DState.from_params(node.params)
-                    workspace.node_state[node_id] = state
-                gate_val = values.get(node.inputs["gate"]) if "gate" in node.inputs else None
-                values[node_id] = execute_fit_curve_1d(
-                    state=state,
-                    x_raw=x_raw,
-                    y_raw=y_raw,
-                    gate_raw=gate_val,
-                )
-                continue
-
-            if op == "fit.yhat":
-                fit_val = values.get(node.inputs["fit"])
-                values[node_id] = execute_fit_yhat(fit_val)
-                continue
-
-            if op == "fit.xhat":
-                fit_val = values.get(node.inputs["fit"])
-                values[node_id] = execute_fit_xhat(fit_val)
-                continue
-
-            if op == "fit.yhat_dense":
-                fit_val = values.get(node.inputs["fit"])
-                values[node_id] = execute_fit_yhat_dense(fit_val)
-                continue
-
-            if op == "fit.xhat_dense":
-                fit_val = values.get(node.inputs["fit"])
-                values[node_id] = execute_fit_xhat_dense(fit_val)
-                continue
-
-            if op == "fit.param":
-                fit_val = values.get(node.inputs["fit"])
-                values[node_id] = execute_fit_param(fit_val, node.params)
-                continue
-
-            if op == "fit.params":
-                fit_val = values.get(node.inputs["fit"])
-                values[node_id] = execute_fit_params(fit_val)
-                continue
-
-            if op == "fit.from_hist_agg":
-                hist_val = values.get(node.inputs["hist"])
-                state = workspace.node_state.get(node_id)
-                if not isinstance(state, FitCurve1DState):
-                    state = FitCurve1DState.from_params(node.params)
-                    workspace.node_state[node_id] = state
-                (
-                    _model,
-                    _baseline_mode,
-                    _every_n,
-                    _sigma_y,
-                    _dense_eval_points,
-                    y_source,
-                    chi2_sigma_source,
-                    min_count,
-                    x_min,
-                    x_max,
-                ) = (
-                    _validate_fit_from_hist_params(node.params)
-                )
-                gate_val = values.get(node.inputs["gate"]) if "gate" in node.inputs else None
-                values[node_id] = execute_fit_from_hist_agg(
-                    state=state,
-                    hist_raw=hist_val,
-                    gate_raw=gate_val,
-                    y_source=y_source,
-                    chi2_sigma_source=chi2_sigma_source,
-                    min_count=min_count,
-                    x_min=x_min,
-                    x_max=x_max,
-                )
-                continue
-
-            if op == "aggregate.bin_stats":
-                x_val = values.get(node.inputs["x"])
-                y_val = values.get(node.inputs["y"])
-                state = workspace.node_state.get(node_id)
-                if not isinstance(state, BinStatsState):
-                    state = BinStatsState.from_params(node.params)
-                    workspace.node_state[node_id] = state
-                gate_val = (
-                    values.get(node.inputs["gate"])
-                    if "gate" in node.inputs
-                    else None
-                )
-                if _gate_open(gate_val, default=True):
-                    last_sample = state.update_sample(x_val, y_val)
-                else:
-                    last_sample = None
-                values[node_id] = (
-                    state.payload(last_sample=last_sample)
-                    if include_hist_outputs
-                    else None
-                )
-                continue
-
-            if op == "aggregate.bin2d_stats":
-                x_val = values.get(node.inputs["x"])
-                y_val = values.get(node.inputs["y"])
-                z_val = values.get(node.inputs["z"])
-                state = workspace.node_state.get(node_id)
-                if not isinstance(state, Bin2DStatsState):
-                    state = Bin2DStatsState.from_params(node.params)
-                    workspace.node_state[node_id] = state
-                gate_val = (
-                    values.get(node.inputs["gate"])
-                    if "gate" in node.inputs
-                    else None
-                )
-                if _gate_open(gate_val, default=True):
-                    last_sample = state.update_sample(x_val, y_val, z_val)
-                else:
-                    last_sample = None
-                values[node_id] = (
-                    state.payload(last_sample=last_sample)
-                    if include_hist_outputs
-                    else None
-                )
-                continue
-
-            raise RuntimeError(f"unexpected op {op!r}")
-
-        outputs: list[Json] = []
-        for output in workspace.compiled.outputs:
-            raw_value = values.get(output.node_id)
-            if output.kind == "scalar":
-                scalar = _normalize_float(raw_value)
-                if scalar is None:
-                    continue
-                value: Any = float(scalar)
-            elif output.kind == "hist_agg":
-                if not include_hist_outputs:
-                    continue
-                if not isinstance(raw_value, dict):
-                    continue
-                value = _sanitize_json(dict(raw_value))
-            elif output.kind == "hist2d":
-                if not include_hist_outputs:
-                    continue
-                if not isinstance(raw_value, dict):
-                    continue
-                value = _sanitize_json(dict(raw_value))
-            elif output.kind == "params_map":
-                if not isinstance(raw_value, dict):
-                    continue
-                value = _sanitize_json(dict(raw_value))
-            elif output.kind == "fit_1d":
-                if not isinstance(raw_value, dict):
-                    continue
-                value = _sanitize_json(dict(raw_value))
-            elif output.kind == "trace":
-                if not include_trace_outputs:
-                    continue
-                trace = _coerce_trace(raw_value)
-                if trace is None:
-                    continue
-                truncated = False
-                if trace.size > self._max_payload_points:
-                    trace = trace[: self._max_payload_points]
-                    truncated = True
-                value = trace
-            else:
-                continue
-            payload: Json = {
-                "workspace_id": workspace.compiled.workspace_id,
-                "output_id": output.output_id,
-                "node_id": output.node_id,
-                "kind": output.kind,
-                "channel_index": int(source_channel_index),
-                "channel_count": int(source_channel_count),
-                "value": value,
-            }
-            if output.kind == "trace":
-                payload["point_count"] = int(trace.size)
-                if truncated:
-                    payload["truncated"] = True
-            outputs.append(payload)
-        return outputs
+        return self._build_workspace_output_payloads(
+            workspace=workspace,
+            values=values,
+            source_channel_index=source_channel_index,
+            source_channel_count=source_channel_count,
+            include_hist_outputs=include_hist_outputs,
+            include_trace_outputs=include_trace_outputs,
+        )
 
     def _publish_output_update(
         self,
@@ -3483,101 +4161,27 @@ class StreamAnalysisProcess(ManagedProcessBase):
     ) -> None:
         kind = str(output.get("kind") or "").strip()
         if kind == "trace":
-            workspace_id = _normalize_id(output.get("workspace_id"))
-            output_id = _normalize_id(output.get("output_id"))
-            node_id = _normalize_id(output.get("node_id"))
-            trace_raw = output.get("value")
-            trace = _coerce_trace(trace_raw)
-            if (
-                workspace_id is None
-                or output_id is None
-                or node_id is None
-                or trace is None
-                or trace.size <= 0
-            ):
-                return
-            writer = self._ensure_trace_writer(
-                workspace_id=workspace_id,
-                output_id=output_id,
-                point_count=int(trace.size),
-            )
-            t0_mono_out = (
-                int(t0_mono_ns) if t0_mono_ns is not None else int(now_mono_ns())
-            )
-            t0_wall_out = (
-                int(t0_wall_ns) if t0_wall_ns is not None else int(now_wall_ns())
-            )
-            try:
-                trace_seq = writer.write(
-                    np.asarray(trace, dtype=np.float64).reshape(-1),
-                    t0_mono_ns=t0_mono_out,
-                    t0_wall_ns=t0_wall_out,
-                )
-            except Exception:
-                return
-
-            descriptor: Json = {
-                "version": 1,
-                "workspace_id": workspace_id,
-                "output_id": output_id,
-                "node_id": node_id,
-                "kind": "trace",
-                "device_id": device_id,
-                "stream": stream,
-                "shm_name": writer.name,
-                "seq": int(trace_seq),
-                "t0_mono_ns": t0_mono_out,
-                "t0_wall_ns": t0_wall_out,
-                "dtype": "float64",
-                "shape": [int(trace.size)],
-                "point_count": int(trace.size),
-                "channel_index": int(output.get("channel_index", 0) or 0),
-                "channel_count": int(output.get("channel_count", 1) or 1),
-            }
-            if bool(output.get("truncated")):
-                descriptor["truncated"] = True
-            if context_id is not None:
-                descriptor["context_id"] = int(context_id)
-            if context_fields:
-                descriptor["context_fields"] = _sanitize_json(dict(context_fields))
-            snapshot_payload: Json = {
-                "version": 1,
-                "workspace_id": workspace_id,
-                "output_id": output_id,
-                "node_id": node_id,
-                "kind": "trace",
-                "device_id": device_id,
-                "stream": stream,
-                "seq": int(trace_seq),
-                "t0_mono_ns": t0_mono_out,
-                "t0_wall_ns": t0_wall_out,
-                "channel_index": int(output.get("channel_index", 0) or 0),
-                "channel_count": int(output.get("channel_count", 1) or 1),
-                "value": trace.astype(np.float64, copy=False).reshape(-1).tolist(),
-                "point_count": int(trace.size),
-            }
-            if bool(output.get("truncated")):
-                snapshot_payload["truncated"] = True
-            if context_id is not None:
-                snapshot_payload["context_id"] = int(context_id)
-            if context_fields:
-                snapshot_payload["context_fields"] = _sanitize_json(dict(context_fields))
-            self._remember_latest_output(snapshot_payload)
-            self._publish_manager_event(
-                topic="manager.stream_analysis.trace_ready",
-                payload=descriptor,
+            self._publish_trace_output_update(
+                output=output,
+                context_id=context_id,
+                context_fields=context_fields,
+                device_id=device_id,
+                stream=stream,
+                t0_mono_ns=t0_mono_ns,
+                t0_wall_ns=t0_wall_ns,
             )
             return
 
-        payload: Json = {
-            "version": 1,
-            "device_id": device_id,
-            "stream": stream,
-            "seq": seq,
-            "t0_mono_ns": t0_mono_ns,
-            "t0_wall_ns": t0_wall_ns,
-            **output,
-        }
+        payload = self._build_non_trace_output_payload(
+            output=output,
+            seq=seq,
+            t0_mono_ns=t0_mono_ns,
+            t0_wall_ns=t0_wall_ns,
+            context_id=context_id,
+            context_fields=context_fields,
+            device_id=device_id,
+            stream=stream,
+        )
         if context_id is not None:
             payload["context_id"] = int(context_id)
         if context_fields:
@@ -3589,21 +4193,472 @@ class StreamAnalysisProcess(ManagedProcessBase):
             payload=payload,
         )
 
+    def _publish_trace_output_update(
+        self,
+        *,
+        output: Json,
+        context_id: int | None,
+        context_fields: dict[str, Any] | None,
+        device_id: str,
+        stream: str,
+        t0_mono_ns: int | None,
+        t0_wall_ns: int | None,
+    ) -> None:
+        workspace_id = _normalize_id(output.get("workspace_id"))
+        output_id = _normalize_id(output.get("output_id"))
+        node_id = _normalize_id(output.get("node_id"))
+        trace_raw = output.get("value")
+        trace = _coerce_trace(trace_raw)
+        if (
+            workspace_id is None
+            or output_id is None
+            or node_id is None
+            or trace is None
+            or trace.size <= 0
+        ):
+            return
+        writer = self._ensure_trace_writer(
+            workspace_id=workspace_id,
+            output_id=output_id,
+            point_count=int(trace.size),
+        )
+        t0_mono_out = int(t0_mono_ns) if t0_mono_ns is not None else int(now_mono_ns())
+        t0_wall_out = int(t0_wall_ns) if t0_wall_ns is not None else int(now_wall_ns())
+        try:
+            trace_seq = writer.write(
+                np.asarray(trace, dtype=np.float64).reshape(-1),
+                t0_mono_ns=t0_mono_out,
+                t0_wall_ns=t0_wall_out,
+            )
+        except Exception:
+            return
+
+        descriptor = self._build_trace_descriptor_payload(
+            output=output,
+            workspace_id=workspace_id,
+            output_id=output_id,
+            node_id=node_id,
+            trace=trace,
+            trace_seq=trace_seq,
+            writer_name=writer.name,
+            context_id=context_id,
+            context_fields=context_fields,
+            device_id=device_id,
+            stream=stream,
+            t0_mono_out=t0_mono_out,
+            t0_wall_out=t0_wall_out,
+        )
+        snapshot_payload = self._build_trace_snapshot_payload(
+            output=output,
+            workspace_id=workspace_id,
+            output_id=output_id,
+            node_id=node_id,
+            trace=trace,
+            trace_seq=trace_seq,
+            context_id=context_id,
+            context_fields=context_fields,
+            device_id=device_id,
+            stream=stream,
+            t0_mono_out=t0_mono_out,
+            t0_wall_out=t0_wall_out,
+        )
+        self._remember_latest_output(snapshot_payload)
+        self._publish_manager_event(
+            topic="manager.stream_analysis.trace_ready",
+            payload=descriptor,
+        )
+
+    @staticmethod
+    def _build_trace_descriptor_payload(
+        *,
+        output: Json,
+        workspace_id: str,
+        output_id: str,
+        node_id: str,
+        trace: np.ndarray,
+        trace_seq: int,
+        writer_name: str,
+        context_id: int | None,
+        context_fields: dict[str, Any] | None,
+        device_id: str,
+        stream: str,
+        t0_mono_out: int,
+        t0_wall_out: int,
+    ) -> Json:
+        descriptor: Json = {
+            "version": 1,
+            "workspace_id": workspace_id,
+            "output_id": output_id,
+            "node_id": node_id,
+            "kind": "trace",
+            "device_id": device_id,
+            "stream": stream,
+            "shm_name": writer_name,
+            "seq": int(trace_seq),
+            "t0_mono_ns": t0_mono_out,
+            "t0_wall_ns": t0_wall_out,
+            "dtype": "float64",
+            "shape": [int(trace.size)],
+            "point_count": int(trace.size),
+            "channel_index": int(output.get("channel_index", 0) or 0),
+            "channel_count": int(output.get("channel_count", 1) or 1),
+        }
+        if bool(output.get("truncated")):
+            descriptor["truncated"] = True
+        if context_id is not None:
+            descriptor["context_id"] = int(context_id)
+        if context_fields:
+            descriptor["context_fields"] = _sanitize_json(dict(context_fields))
+        return descriptor
+
+    @staticmethod
+    def _build_trace_snapshot_payload(
+        *,
+        output: Json,
+        workspace_id: str,
+        output_id: str,
+        node_id: str,
+        trace: np.ndarray,
+        trace_seq: int,
+        context_id: int | None,
+        context_fields: dict[str, Any] | None,
+        device_id: str,
+        stream: str,
+        t0_mono_out: int,
+        t0_wall_out: int,
+    ) -> Json:
+        snapshot_payload: Json = {
+            "version": 1,
+            "workspace_id": workspace_id,
+            "output_id": output_id,
+            "node_id": node_id,
+            "kind": "trace",
+            "device_id": device_id,
+            "stream": stream,
+            "seq": int(trace_seq),
+            "t0_mono_ns": t0_mono_out,
+            "t0_wall_ns": t0_wall_out,
+            "channel_index": int(output.get("channel_index", 0) or 0),
+            "channel_count": int(output.get("channel_count", 1) or 1),
+            "value": trace.astype(np.float64, copy=False).reshape(-1).tolist(),
+            "point_count": int(trace.size),
+        }
+        if bool(output.get("truncated")):
+            snapshot_payload["truncated"] = True
+        if context_id is not None:
+            snapshot_payload["context_id"] = int(context_id)
+        if context_fields:
+            snapshot_payload["context_fields"] = _sanitize_json(dict(context_fields))
+        return snapshot_payload
+
+    @staticmethod
+    def _build_non_trace_output_payload(
+        *,
+        output: Json,
+        seq: int | None,
+        t0_mono_ns: int | None,
+        t0_wall_ns: int | None,
+        context_id: int | None,
+        context_fields: dict[str, Any] | None,
+        device_id: str,
+        stream: str,
+    ) -> Json:
+        del context_id, context_fields
+        return {
+            "version": 1,
+            "device_id": device_id,
+            "stream": stream,
+            "seq": seq,
+            "t0_mono_ns": t0_mono_ns,
+            "t0_wall_ns": t0_wall_ns,
+            **output,
+        }
+
+    @staticmethod
+    def _filter_chunk_events_for_message(
+        *, events_all: list[Json], msg_seq: int | None
+    ) -> list[Json]:
+        if msg_seq is None:
+            return events_all
+        events: list[Json] = []
+        for event in events_all:
+            seq = _normalize_int(event.get("seq"))
+            if seq is None:
+                continue
+            if seq <= msg_seq:
+                events.append(event)
+        return events
+
+    def _process_chunk_events(
+        self,
+        *,
+        key: tuple[str, str],
+        workspace_ids: set[str],
+        events: list[Json],
+        msg_seq: int | None,
+        msg_context_id: int | None,
+        msg_context_fields: dict[str, Any] | None,
+        current_context_id: int | None,
+        current_context_fields: dict[str, Any] | None,
+        device_id: str,
+        stream: str,
+        initial_latest_seq: int,
+    ) -> tuple[int, int | None, dict[str, Any] | None]:
+        latest_seq = initial_latest_seq
+        for event_index, event in enumerate(events):
+            seq = _normalize_int(event.get("seq"))
+            latest_seq = self._max_seq(latest_seq, seq)
+            (
+                event_context_id,
+                event_context_fields,
+                current_context_id,
+                current_context_fields,
+            ) = self._resolve_chunk_event_context(
+                key=key,
+                seq=seq,
+                msg_seq=msg_seq,
+                msg_context_id=msg_context_id,
+                msg_context_fields=msg_context_fields,
+                current_context_id=current_context_id,
+                current_context_fields=current_context_fields,
+            )
+            array = self._decode_array(self._readers[key], event)
+            if array is None:
+                continue
+            t0_mono_ns = _normalize_int(event.get("t0_mono_ns"))
+            t0_wall_ns = _normalize_int(event.get("t0_wall_ns"))
+            event_t_mono_s = float(t0_mono_ns) * 1e-9 if t0_mono_ns is not None else None
+            is_last_event = event_index == (len(events) - 1)
+            self._process_chunk_event_workspaces(
+                workspace_ids=workspace_ids,
+                array=array,
+                seq=seq,
+                t0_mono_ns=t0_mono_ns,
+                t0_wall_ns=t0_wall_ns,
+                context_id=event_context_id,
+                context_fields=event_context_fields,
+                event_t_mono_s=event_t_mono_s,
+                is_last_event=is_last_event,
+                device_id=device_id,
+                stream=stream,
+            )
+        return latest_seq, current_context_id, current_context_fields
+
+    @staticmethod
+    def _max_seq(current: int, seq: int | None) -> int:
+        if seq is None:
+            return current
+        return max(current, seq)
+
+    def _resolve_chunk_event_context(
+        self,
+        *,
+        key: tuple[str, str],
+        seq: int | None,
+        msg_seq: int | None,
+        msg_context_id: int | None,
+        msg_context_fields: dict[str, Any] | None,
+        current_context_id: int | None,
+        current_context_fields: dict[str, Any] | None,
+    ) -> tuple[
+        int | None,
+        dict[str, Any] | None,
+        int | None,
+        dict[str, Any] | None,
+    ]:
+        event_context_id, event_context_fields = self._pop_context_for_seq(
+            key=key,
+            seq=seq,
+        )
+        if (
+            event_context_fields is None
+            and event_context_id is None
+            and msg_seq is not None
+            and seq == msg_seq
+        ):
+            # Common case: this chunk-ready message carries the event context.
+            event_context_id = msg_context_id
+            event_context_fields = msg_context_fields
+        if event_context_fields is None and event_context_id is None:
+            event_context_id = current_context_id
+            event_context_fields = current_context_fields
+            return (
+                event_context_id,
+                event_context_fields,
+                current_context_id,
+                current_context_fields,
+            )
+        next_context_fields = (
+            dict(event_context_fields) if isinstance(event_context_fields, dict) else None
+        )
+        return (
+            event_context_id,
+            event_context_fields,
+            event_context_id,
+            next_context_fields,
+        )
+
+    def _process_chunk_event_workspaces(
+        self,
+        *,
+        workspace_ids: set[str],
+        array: np.ndarray,
+        seq: int | None,
+        t0_mono_ns: int | None,
+        t0_wall_ns: int | None,
+        context_id: int | None,
+        context_fields: dict[str, Any] | None,
+        event_t_mono_s: float | None,
+        is_last_event: bool,
+        device_id: str,
+        stream: str,
+    ) -> None:
+        now_mono = time.monotonic()
+        for workspace_id in list(workspace_ids):
+            workspace = self._workspaces.get(workspace_id)
+            if workspace is None or not workspace.compiled.enabled:
+                continue
+            include_hist_outputs = self._allow_hist_outputs_for_workspace(
+                workspace,
+                now_mono=now_mono,
+            )
+            include_trace_outputs = False
+            if is_last_event:
+                include_trace_outputs = self._allow_trace_outputs_for_workspace(
+                    workspace,
+                    now_mono=now_mono,
+                )
+            try:
+                output_payloads = self._execute_workspace_event(
+                    workspace=workspace,
+                    array=array,
+                    context_fields=context_fields,
+                    event_t_mono_s=event_t_mono_s,
+                    include_hist_outputs=include_hist_outputs,
+                    include_trace_outputs=include_trace_outputs,
+                )
+            except Exception as exc:
+                workspace.dropped_samples += 1
+                self._publish_error(
+                    workspace_id=workspace_id,
+                    code="workspace_runtime_error",
+                    message=str(exc),
+                )
+                continue
+            workspace.processed_samples += 1
+            self._processed_updates += 1
+            self._publish_workspace_outputs(
+                output_payloads=output_payloads,
+                seq=seq,
+                t0_mono_ns=t0_mono_ns,
+                t0_wall_ns=t0_wall_ns,
+                context_id=context_id,
+                context_fields=context_fields,
+                device_id=device_id,
+                stream=stream,
+            )
+
+    def _publish_workspace_outputs(
+        self,
+        *,
+        output_payloads: list[Json],
+        seq: int | None,
+        t0_mono_ns: int | None,
+        t0_wall_ns: int | None,
+        context_id: int | None,
+        context_fields: dict[str, Any] | None,
+        device_id: str,
+        stream: str,
+    ) -> None:
+        for output in output_payloads:
+            self._publish_output_update(
+                output=output,
+                seq=seq,
+                t0_mono_ns=t0_mono_ns,
+                t0_wall_ns=t0_wall_ns,
+                context_id=context_id,
+                context_fields=context_fields,
+                device_id=device_id,
+                stream=stream,
+            )
+
     def _handle_chunk_ready(self, msg: Json) -> None:
+        prepared = self._prepare_chunk_ready(msg)
+        if prepared is None:
+            return
+        device_id, stream, key, workspace_ids, reader, last_seq = prepared
+        msg_seq, context_id, context_fields = self._extract_chunk_message_context(
+            msg=msg,
+            key=key,
+        )
+        events = self._load_chunk_events(
+            key=key,
+            reader=reader,
+            last_seq=last_seq,
+            msg_seq=msg_seq,
+        )
+        if events is None:
+            return
+        if not events:
+            return
+        current_context_id, current_context_fields = self._stream_context.get(
+            key, (None, None)
+        )
+        if current_context_fields is not None:
+            current_context_fields = dict(current_context_fields)
+
+        latest_seq, current_context_id, current_context_fields = self._process_chunk_events(
+            key=key,
+            workspace_ids=workspace_ids,
+            events=events,
+            msg_seq=msg_seq,
+            msg_context_id=context_id,
+            msg_context_fields=context_fields,
+            current_context_id=current_context_id,
+            current_context_fields=current_context_fields,
+            device_id=device_id,
+            stream=stream,
+            initial_latest_seq=last_seq,
+        )
+
+        self._store_chunk_stream_context(
+            key=key,
+            latest_seq=latest_seq,
+            current_context_id=current_context_id,
+            current_context_fields=current_context_fields,
+        )
+
+    def _prepare_chunk_ready(
+        self,
+        msg: Json,
+    ) -> tuple[
+        str,
+        str,
+        tuple[str, str],
+        set[str],
+        ShmRingReader,
+        int,
+    ] | None:
         parsed = self._normalize_chunk_payload(msg)
         if parsed is None:
-            return
+            return None
         device_id, stream, shm_name = parsed
         key = (device_id, stream)
-
         workspace_ids = self._stream_to_workspaces.get(key)
         if not workspace_ids:
-            return
-
+            return None
         reader = self._ensure_reader(key, shm_name)
         if reader is None:
-            return
+            return None
+        last_seq = int(self._last_seq.get(key, 0))
+        return device_id, stream, key, workspace_ids, reader, last_seq
 
+    def _extract_chunk_message_context(
+        self,
+        *,
+        msg: Json,
+        key: tuple[str, str],
+    ) -> tuple[int | None, int | None, dict[str, Any] | None]:
         msg_seq = _normalize_int(msg.get("seq"))
         context_id = _normalize_int(msg.get("context_id"))
         context_fields_raw = msg.get("context_fields")
@@ -3616,139 +4671,64 @@ class StreamAnalysisProcess(ManagedProcessBase):
             context_id=context_id,
             context_fields=context_fields,
         )
+        return msg_seq, context_id, context_fields
 
-        last_seq = int(self._last_seq.get(key, 0))
+    def _load_chunk_events(
+        self,
+        *,
+        key: tuple[str, str],
+        reader: ShmRingReader,
+        last_seq: int,
+        msg_seq: int | None,
+    ) -> list[Json] | None:
         try:
             events_all = reader.read_events(last_seq)
         except Exception:
-            try:
-                reader.close()
-            except Exception:
-                pass
-            self._readers.pop(key, None)
-            self._last_seq.pop(key, None)
-            self._stream_context.pop(key, None)
-            self._context_by_seq.pop(key, None)
-            return
+            self._reset_chunk_reader_state(key=key, reader=reader)
+            return None
         if not events_all:
-            return
-
-        if msg_seq is None:
-            events = events_all
-        else:
-            events = []
-            for event in events_all:
-                seq = _normalize_int(event.get("seq"))
-                if seq is None:
-                    continue
-                if seq <= msg_seq:
-                    events.append(event)
+            return []
+        events = self._filter_chunk_events_for_message(
+            events_all=events_all,
+            msg_seq=msg_seq,
+        )
         if not events:
             self._prune_context_cache(key=key, last_seq=last_seq)
-            return
+            return []
+        return events
 
-        current_context_id, current_context_fields = self._stream_context.get(
-            key, (None, None)
-        )
-        if current_context_fields is not None:
-            current_context_fields = dict(current_context_fields)
+    def _reset_chunk_reader_state(
+        self,
+        *,
+        key: tuple[str, str],
+        reader: ShmRingReader,
+    ) -> None:
+        try:
+            reader.close()
+        except Exception:
+            pass
+        self._readers.pop(key, None)
+        self._last_seq.pop(key, None)
+        self._stream_context.pop(key, None)
+        self._context_by_seq.pop(key, None)
 
-        latest_seq = last_seq
-        event_count = len(events)
-        for event in events:
-            seq = _normalize_int(event.get("seq"))
-            if seq is not None:
-                latest_seq = max(latest_seq, seq)
-            event_context_id, event_context_fields = self._pop_context_for_seq(
-                key=key, seq=seq
-            )
-            if (
-                event_context_fields is None
-                and event_context_id is None
-                and msg_seq is not None
-                and seq == msg_seq
-            ):
-                # Fast-path for the common case where this chunk message carries
-                # the context for exactly this event.
-                event_context_id = context_id
-                event_context_fields = context_fields
-            if event_context_fields is None and event_context_id is None:
-                event_context_id = current_context_id
-                event_context_fields = current_context_fields
-            else:
-                current_context_id = event_context_id
-                current_context_fields = (
-                    dict(event_context_fields)
-                    if isinstance(event_context_fields, dict)
-                    else None
-                )
-            array = self._decode_array(reader, event)
-            if array is None:
-                continue
-            t0_mono_ns = _normalize_int(event.get("t0_mono_ns"))
-            t0_wall_ns = _normalize_int(event.get("t0_wall_ns"))
-            event_t_mono_s = (
-                float(t0_mono_ns) * 1e-9 if t0_mono_ns is not None else None
-            )
-            is_last_event = event is events[-1] if event_count > 0 else True
-            now_mono = time.monotonic()
-
-            for workspace_id in list(workspace_ids):
-                workspace = self._workspaces.get(workspace_id)
-                if workspace is None or not workspace.compiled.enabled:
-                    continue
-                include_hist_outputs = self._allow_hist_outputs_for_workspace(
-                    workspace, now_mono=now_mono
-                )
-                include_trace_outputs = False
-                if is_last_event:
-                    include_trace_outputs = self._allow_trace_outputs_for_workspace(
-                        workspace, now_mono=now_mono
-                    )
-                try:
-                    output_payloads = self._execute_workspace_event(
-                        workspace=workspace,
-                        array=array,
-                        context_fields=event_context_fields,
-                        event_t_mono_s=event_t_mono_s,
-                        include_hist_outputs=include_hist_outputs,
-                        include_trace_outputs=include_trace_outputs,
-                    )
-                except Exception as exc:
-                    workspace.dropped_samples += 1
-                    self._publish_error(
-                        workspace_id=workspace_id,
-                        code="workspace_runtime_error",
-                        message=str(exc),
-                    )
-                    continue
-
-                workspace.processed_samples += 1
-                self._processed_updates += 1
-
-                for output in output_payloads:
-                    self._publish_output_update(
-                        output=output,
-                        seq=seq,
-                        t0_mono_ns=t0_mono_ns,
-                        t0_wall_ns=t0_wall_ns,
-                        context_id=event_context_id,
-                        context_fields=event_context_fields,
-                        device_id=device_id,
-                        stream=stream,
-                    )
-
+    def _store_chunk_stream_context(
+        self,
+        *,
+        key: tuple[str, str],
+        latest_seq: int,
+        current_context_id: int | None,
+        current_context_fields: dict[str, Any] | None,
+    ) -> None:
         self._last_seq[key] = latest_seq
         self._prune_context_cache(key=key, last_seq=latest_seq)
         if current_context_id is None and current_context_fields is None:
             self._stream_context.pop(key, None)
-        else:
-            self._stream_context[key] = (
-                int(current_context_id) if current_context_id is not None else None,
-                dict(current_context_fields)
-                if isinstance(current_context_fields, dict)
-                else None,
-            )
+            return
+        self._stream_context[key] = (
+            int(current_context_id) if current_context_id is not None else None,
+            dict(current_context_fields) if isinstance(current_context_fields, dict) else None,
+        )
 
     def _drain_sub(self) -> int:
         processed = 0
@@ -3885,298 +4865,298 @@ class StreamAnalysisProcess(ManagedProcessBase):
             },
         }
 
-    def _handle_rpc(self, req: Json) -> Json:
-        common = self._handle_common_rpc(req)
-        if common is not None:
-            return common
+    def _stream_analysis_capability_members(self) -> list[Any]:
+        members = [
+            method("stream_analysis.status", params=None, doc="Get stream-analysis runtime status."),
+            method("stream_analysis.operators", params=None, doc="List available DAG operators."),
+            method("stream_analysis.workspace.list", params=None, doc="List workspaces."),
+            method(
+                "stream_analysis.workspace.get",
+                params=[
+                    param(
+                        "workspace_id",
+                        required=True,
+                        default=None,
+                        annotation="str",
+                    )
+                ],
+                doc="Get workspace config and summary.",
+            ),
+            method(
+                "stream_analysis.workspace.snapshot",
+                params=[
+                    param("workspace_id", required=True, default=None, annotation="str"),
+                    param("kinds", required=False, default=None, annotation="list[str]|str"),
+                    param("output_ids", required=False, default=None, annotation="list[str]|str"),
+                    param("max_trace_points", required=False, default=None, annotation="int"),
+                ],
+                doc="Get latest published outputs for a workspace (latest-state snapshot).",
+            ),
+            method(
+                "stream_analysis.workspace.put",
+                params=[
+                    param(
+                        "workspace",
+                        required=True,
+                        default=None,
+                        annotation="dict",
+                    )
+                ],
+                doc="Create/update workspace graph.",
+            ),
+            method(
+                "stream_analysis.workspace.validate",
+                params=[
+                    param(
+                        "workspace",
+                        required=True,
+                        default=None,
+                        annotation="dict",
+                    )
+                ],
+                doc="Validate workspace graph without activating it.",
+            ),
+            method(
+                "stream_analysis.workspace.delete",
+                params=[
+                    param(
+                        "workspace_id",
+                        required=True,
+                        default=None,
+                        annotation="str",
+                    )
+                ],
+                doc="Delete a workspace.",
+            ),
+            method(
+                "stream_analysis.workspace.reset",
+                params=[
+                    param("workspace_id", required=False, default=None, annotation="str"),
+                    param("node_id", required=False, default=None, annotation="str"),
+                ],
+                doc="Reset workspace state (aggregates). If workspace_id omitted, reset all workspaces; if node_id provided, reset only that node in the workspace.",
+            ),
+            method(
+                "stream_analysis.workspace.clear",
+                params=None,
+                doc="Delete all workspaces.",
+            ),
+            method(
+                "stream_analysis.workspace_store.status",
+                params=None,
+                doc="Get workspace-store persistence status.",
+            ),
+            method(
+                "stream_analysis.workspace_store.save",
+                params=[
+                    param("path", required=False, default=None, annotation="str"),
+                ],
+                doc="Save all workspaces to the configured workspace store YAML path.",
+            ),
+            method(
+                "stream_analysis.workspace_store.reload",
+                params=[
+                    param("path", required=False, default=None, annotation="str"),
+                ],
+                doc="Reload all workspaces from workspace store YAML path.",
+            ),
+        ]
+        return self._with_common_capabilities(members)
 
-        request_id = req.get("request_id")
-        rtype = str(req.get("type", ""))
-        params = req.get("params", {})
-        if params is None:
-            params = {}
+    def _rpc_stream_analysis_capabilities(self, req: Json) -> Json:
+        return self._rpc_ok(req, result=capabilities_payload(self._stream_analysis_capability_members()))
+
+    def _rpc_stream_analysis_status(self, req: Json) -> Json:
+        return self._rpc_ok(req, result=self._status_payload())
+
+    def _rpc_stream_analysis_operators(self, req: Json) -> Json:
+        return self._rpc_ok(req, result={"operators": operator_catalog_payload()})
+
+    def _rpc_stream_analysis_workspace_list(self, req: Json) -> Json:
+        return self._rpc_ok(
+            req,
+            result={
+                "workspaces": [
+                    self._workspace_summary(self._workspaces[key])
+                    for key in sorted(self._workspaces.keys())
+                ]
+            },
+        )
+
+    def _rpc_stream_analysis_workspace_store_status(self, req: Json) -> Json:
+        return self._rpc_ok(req, result=self._workspace_store_status_payload())
+
+    def _rpc_stream_analysis_workspace_get(self, req: Json) -> Json:
+        params = req.get("params", {}) or {}
         if not isinstance(params, dict):
             return self._rpc_invalid_params(req, message="params must be a dict")
+        workspace_id = _normalize_id(params.get("workspace_id"))
+        if workspace_id is None:
+            return self._rpc_invalid_params(req, message="workspace_id is required")
+        workspace = self._workspaces.get(workspace_id)
+        if workspace is None:
+            return self._rpc_err(req, code="unknown_workspace")
+        return self._rpc_ok(
+            req,
+            result={
+                "workspace": self._workspace_summary(workspace),
+                "raw": workspace.raw_config,
+            },
+        )
 
+    def _rpc_stream_analysis_workspace_snapshot(self, req: Json) -> Json:
+        params = req.get("params", {}) or {}
+        if not isinstance(params, dict):
+            return self._rpc_invalid_params(req, message="params must be a dict")
         try:
-            if rtype == "process.capabilities":
-                members = [
-                    method("stream_analysis.status", params=None, doc="Get stream-analysis runtime status."),
-                    method("stream_analysis.operators", params=None, doc="List available DAG operators."),
-                    method("stream_analysis.workspace.list", params=None, doc="List workspaces."),
-                    method(
-                        "stream_analysis.workspace.get",
-                        params=[
-                            param(
-                                "workspace_id",
-                                required=True,
-                                default=None,
-                                annotation="str",
-                            )
-                        ],
-                        doc="Get workspace config and summary.",
-                    ),
-                    method(
-                        "stream_analysis.workspace.snapshot",
-                        params=[
-                            param("workspace_id", required=True, default=None, annotation="str"),
-                            param("kinds", required=False, default=None, annotation="list[str]|str"),
-                            param("output_ids", required=False, default=None, annotation="list[str]|str"),
-                            param("max_trace_points", required=False, default=None, annotation="int"),
-                        ],
-                        doc="Get latest published outputs for a workspace (latest-state snapshot).",
-                    ),
-                    method(
-                        "stream_analysis.workspace.put",
-                        params=[
-                            param(
-                                "workspace",
-                                required=True,
-                                default=None,
-                                annotation="dict",
-                            )
-                        ],
-                        doc="Create/update workspace graph.",
-                    ),
-                    method(
-                        "stream_analysis.workspace.validate",
-                        params=[
-                            param(
-                                "workspace",
-                                required=True,
-                                default=None,
-                                annotation="dict",
-                            )
-                        ],
-                        doc="Validate workspace graph without activating it.",
-                    ),
-                    method(
-                        "stream_analysis.workspace.delete",
-                        params=[
-                            param(
-                                "workspace_id",
-                                required=True,
-                                default=None,
-                                annotation="str",
-                            )
-                        ],
-                        doc="Delete a workspace.",
-                    ),
-                    method(
-                        "stream_analysis.workspace.reset",
-                        params=[
-                            param("workspace_id", required=False, default=None, annotation="str"),
-                            param("node_id", required=False, default=None, annotation="str"),
-                        ],
-                        doc="Reset workspace state (aggregates). If workspace_id omitted, reset all workspaces; if node_id provided, reset only that node in the workspace.",
-                    ),
-                    method(
-                        "stream_analysis.workspace.clear",
-                        params=None,
-                        doc="Delete all workspaces.",
-                    ),
-                    method(
-                        "stream_analysis.workspace_store.status",
-                        params=None,
-                        doc="Get workspace-store persistence status.",
-                    ),
-                    method(
-                        "stream_analysis.workspace_store.save",
-                        params=[
-                            param("path", required=False, default=None, annotation="str"),
-                        ],
-                        doc="Save all workspaces to the configured workspace store YAML path.",
-                    ),
-                    method(
-                        "stream_analysis.workspace_store.reload",
-                        params=[
-                            param("path", required=False, default=None, annotation="str"),
-                        ],
-                        doc="Reload all workspaces from workspace store YAML path.",
-                    ),
-                ]
-                members = self._with_common_capabilities(members)
-                return self._rpc_ok(req, result=capabilities_payload(members))
+            snapshot = self._workspace_snapshot_payload(params)
+        except ValueError as exc:
+            return self._rpc_invalid_params(req, message=str(exc))
+        except KeyError:
+            return self._rpc_err(req, code="unknown_workspace")
+        return self._rpc_ok(req, result=snapshot)
 
-            if rtype == "stream_analysis.status":
-                return {"request_id": request_id, "ok": True, "result": self._status_payload()}
+    def _rpc_stream_analysis_workspace_validate(self, req: Json) -> Json:
+        params = req.get("params", {}) or {}
+        if not isinstance(params, dict):
+            return self._rpc_invalid_params(req, message="params must be a dict")
+        result = self._handle_workspace_validate(params)
+        if not result.get("ok"):
+            return self._rpc_err(
+                req,
+                code=str((result.get("error") or {}).get("code") or "validation_failed"),
+                message=(result.get("error") or {}).get("message"),
+            )
+        return self._rpc_ok(req, result=result.get("result"))
 
-            if rtype == "stream_analysis.operators":
-                return {
-                    "request_id": request_id,
-                    "ok": True,
-                    "result": {"operators": operator_catalog_payload()},
-                }
+    def _rpc_stream_analysis_workspace_put(self, req: Json) -> Json:
+        params = req.get("params", {}) or {}
+        if not isinstance(params, dict):
+            return self._rpc_invalid_params(req, message="params must be a dict")
+        result = self._handle_workspace_put(params)
+        if not result.get("ok"):
+            return self._rpc_err(
+                req,
+                code=str((result.get("error") or {}).get("code") or "put_failed"),
+                message=(result.get("error") or {}).get("message"),
+            )
+        return self._rpc_ok(req, result=result.get("result"))
 
-            if rtype == "stream_analysis.workspace.list":
-                return {
-                    "request_id": request_id,
-                    "ok": True,
-                    "result": {
-                        "workspaces": [
-                            self._workspace_summary(self._workspaces[key])
-                            for key in sorted(self._workspaces.keys())
-                        ]
-                    },
-                }
-
-            if rtype == "stream_analysis.workspace.get":
-                workspace_id = _normalize_id(params.get("workspace_id"))
-                if workspace_id is None:
-                    return self._rpc_invalid_params(req, message="workspace_id is required")
-                workspace = self._workspaces.get(workspace_id)
-                if workspace is None:
-                    return self._rpc_err(req, code="unknown_workspace")
-                return {
-                    "request_id": request_id,
-                    "ok": True,
-                    "result": {
-                        "workspace": self._workspace_summary(workspace),
-                        "raw": workspace.raw_config,
-                    },
-                }
-
-            if rtype == "stream_analysis.workspace.snapshot":
-                try:
-                    snapshot = self._workspace_snapshot_payload(params)
-                except ValueError as exc:
-                    return self._rpc_invalid_params(req, message=str(exc))
-                except KeyError:
-                    return self._rpc_err(req, code="unknown_workspace")
-                return {
-                    "request_id": request_id,
-                    "ok": True,
-                    "result": snapshot,
-                }
-
-            if rtype == "stream_analysis.workspace.validate":
-                result = self._handle_workspace_validate(params)
-                if not result.get("ok"):
-                    return {
-                        "request_id": request_id,
-                        "ok": False,
-                        "error": result.get("error") or {"code": "validation_failed"},
-                    }
-                return {"request_id": request_id, **result}
-
-            if rtype == "stream_analysis.workspace.put":
-                result = self._handle_workspace_put(params)
-                if not result.get("ok"):
-                    return {
-                        "request_id": request_id,
-                        "ok": False,
-                        "error": result.get("error") or {"code": "put_failed"},
-                    }
-                return {"request_id": request_id, **result}
-
-            if rtype == "stream_analysis.workspace.delete":
-                workspace_id = _normalize_id(params.get("workspace_id"))
-                if workspace_id is None:
-                    return self._rpc_invalid_params(req, message="workspace_id is required")
-                expected_raw = params.get("expected_revision")
-                expected_revision: int | None = None
-                if expected_raw is not None:
-                    expected_revision = _normalize_int(expected_raw)
-                    if expected_revision is None or expected_revision < 0:
-                        return self._rpc_invalid_params(
-                            req,
-                            message="expected_revision must be a non-negative integer",
-                        )
-                removed = self._delete_workspace(
-                    workspace_id,
-                    expected_revision=expected_revision,
-                    mark_dirty=True,
-                    publish=True,
+    def _rpc_stream_analysis_workspace_delete(self, req: Json) -> Json:
+        params = req.get("params", {}) or {}
+        if not isinstance(params, dict):
+            return self._rpc_invalid_params(req, message="params must be a dict")
+        workspace_id = _normalize_id(params.get("workspace_id"))
+        if workspace_id is None:
+            return self._rpc_invalid_params(req, message="workspace_id is required")
+        expected_raw = params.get("expected_revision")
+        expected_revision: int | None = None
+        if expected_raw is not None:
+            expected_revision = _normalize_int(expected_raw)
+            if expected_revision is None or expected_revision < 0:
+                return self._rpc_invalid_params(
+                    req,
+                    message="expected_revision must be a non-negative integer",
                 )
-                if not removed:
-                    return self._rpc_err(req, code="unknown_workspace")
-                return {
-                    "request_id": request_id,
-                    "ok": True,
-                    "result": {"workspace_id": workspace_id, "deleted": True},
-                }
+        removed = self._delete_workspace(
+            workspace_id,
+            expected_revision=expected_revision,
+            mark_dirty=True,
+            publish=True,
+        )
+        if not removed:
+            return self._rpc_err(req, code="unknown_workspace")
+        return self._rpc_ok(req, result={"workspace_id": workspace_id, "deleted": True})
 
-            if rtype == "stream_analysis.workspace.reset":
-                workspace_id = _normalize_id(params.get("workspace_id"))
-                node_id = _normalize_id(params.get("node_id"))
-                if workspace_id is None:
-                    if node_id is not None:
-                        return self._rpc_invalid_params(
-                            req, message="node_id requires workspace_id"
-                        )
-                    for workspace in self._workspaces.values():
-                        self._reset_workspace_states(workspace)
-                    self._latest_output_payloads.clear()
-                    return {
-                        "request_id": request_id,
-                        "ok": True,
-                        "result": {"reset": "all", "count": len(self._workspaces)},
-                    }
-                workspace = self._workspaces.get(workspace_id)
-                if workspace is None:
-                    return self._rpc_err(req, code="unknown_workspace")
-                if node_id is not None:
-                    ok = self._reset_workspace_node_state(workspace, node_id)
-                    if not ok:
-                        return self._rpc_err(req, code="unknown_or_non_stateful_node")
-                    self._clear_workspace_snapshot_outputs(
-                        workspace_id, node_id=node_id
-                    )
-                    return {
-                        "request_id": request_id,
-                        "ok": True,
-                        "result": {"reset": workspace_id, "node_id": node_id},
-                    }
+    def _rpc_stream_analysis_workspace_reset(self, req: Json) -> Json:
+        params = req.get("params", {}) or {}
+        if not isinstance(params, dict):
+            return self._rpc_invalid_params(req, message="params must be a dict")
+        workspace_id = _normalize_id(params.get("workspace_id"))
+        node_id = _normalize_id(params.get("node_id"))
+        if workspace_id is None:
+            if node_id is not None:
+                return self._rpc_invalid_params(
+                    req, message="node_id requires workspace_id"
+                )
+            for workspace in self._workspaces.values():
                 self._reset_workspace_states(workspace)
-                self._clear_workspace_snapshot_outputs(workspace_id)
-                return {
-                    "request_id": request_id,
-                    "ok": True,
-                    "result": {"reset": workspace_id},
-                }
+            self._latest_output_payloads.clear()
+            return self._rpc_ok(req, result={"reset": "all", "count": len(self._workspaces)})
+        workspace = self._workspaces.get(workspace_id)
+        if workspace is None:
+            return self._rpc_err(req, code="unknown_workspace")
+        if node_id is not None:
+            ok = self._reset_workspace_node_state(workspace, node_id)
+            if not ok:
+                return self._rpc_err(req, code="unknown_or_non_stateful_node")
+            self._clear_workspace_snapshot_outputs(workspace_id, node_id=node_id)
+            return self._rpc_ok(req, result={"reset": workspace_id, "node_id": node_id})
+        self._reset_workspace_states(workspace)
+        self._clear_workspace_snapshot_outputs(workspace_id)
+        return self._rpc_ok(req, result={"reset": workspace_id})
 
-            if rtype == "stream_analysis.workspace.clear":
-                removed = self._clear_workspaces(mark_dirty=True, publish=True)
-                return {
-                    "request_id": request_id,
-                    "ok": True,
-                    "result": {"removed": removed},
-                }
+    def _rpc_stream_analysis_workspace_clear(self, req: Json) -> Json:
+        removed = self._clear_workspaces(mark_dirty=True, publish=True)
+        return self._rpc_ok(req, result={"removed": removed})
 
-            if rtype == "stream_analysis.workspace_store.status":
-                return {
-                    "request_id": request_id,
-                    "ok": True,
-                    "result": self._workspace_store_status_payload(),
-                }
+    def _rpc_stream_analysis_workspace_store_save(self, req: Json) -> Json:
+        params = req.get("params", {}) or {}
+        if not isinstance(params, dict):
+            return self._rpc_invalid_params(req, message="params must be a dict")
+        saved = self._save_workspace_store(path_override=params.get("path"))
+        return self._rpc_ok(
+            req,
+            result={**saved, "status": self._workspace_store_status_payload()},
+        )
 
-            if rtype == "stream_analysis.workspace_store.save":
-                saved = self._save_workspace_store(path_override=params.get("path"))
-                return {
-                    "request_id": request_id,
-                    "ok": True,
-                    "result": {
-                        **saved,
-                        "status": self._workspace_store_status_payload(),
-                    },
-                }
+    def _rpc_stream_analysis_workspace_store_reload(self, req: Json) -> Json:
+        params = req.get("params", {}) or {}
+        if not isinstance(params, dict):
+            return self._rpc_invalid_params(req, message="params must be a dict")
+        override = self._normalize_workspace_store_path(params.get("path"))
+        if override is not None:
+            self._workspace_store_path = override
+        reloaded = self._reload_workspace_store(strict_missing=True)
+        return self._rpc_ok(
+            req,
+            result={**reloaded, "status": self._workspace_store_status_payload()},
+        )
 
-            if rtype == "stream_analysis.workspace_store.reload":
-                override = self._normalize_workspace_store_path(params.get("path"))
-                if override is not None:
-                    self._workspace_store_path = override
-                reloaded = self._reload_workspace_store(strict_missing=True)
-                return {
-                    "request_id": request_id,
-                    "ok": True,
-                    "result": {
-                        **reloaded,
-                        "status": self._workspace_store_status_payload(),
-                    },
-                }
+    def _build_rpc_registry(self) -> RpcDispatchRegistry:
+        handlers = {
+            "process.capabilities": self._rpc_stream_analysis_capabilities,
+            "stream_analysis.status": self._rpc_stream_analysis_status,
+            "stream_analysis.operators": self._rpc_stream_analysis_operators,
+            "stream_analysis.workspace.list": self._rpc_stream_analysis_workspace_list,
+            "stream_analysis.workspace_store.status": self._rpc_stream_analysis_workspace_store_status,
+            "stream_analysis.workspace.get": self._rpc_stream_analysis_workspace_get,
+            "stream_analysis.workspace.snapshot": self._rpc_stream_analysis_workspace_snapshot,
+            "stream_analysis.workspace.validate": self._rpc_stream_analysis_workspace_validate,
+            "stream_analysis.workspace.put": self._rpc_stream_analysis_workspace_put,
+            "stream_analysis.workspace.delete": self._rpc_stream_analysis_workspace_delete,
+            "stream_analysis.workspace.reset": self._rpc_stream_analysis_workspace_reset,
+            "stream_analysis.workspace.clear": self._rpc_stream_analysis_workspace_clear,
+            "stream_analysis.workspace_store.save": self._rpc_stream_analysis_workspace_store_save,
+            "stream_analysis.workspace_store.reload": self._rpc_stream_analysis_workspace_store_reload,
+        }
+        return RpcDispatchRegistry(
+            handlers=handlers,
+            aliases={
+                "stream_analysis.get_status": "stream_analysis.status",
+                "stream_analysis.workspace.upsert": "stream_analysis.workspace.put",
+                "stream_analysis.workspace.remove": "stream_analysis.workspace.delete",
+                "stream_analysis.workspace_store.persist": "stream_analysis.workspace_store.save",
+                "stream_analysis.workspace_store.load": "stream_analysis.workspace_store.reload",
+            },
+        )
+
+    def _dispatch_rpc_with_error_mapping(self, req: Json, params: Any) -> Json | None:
+        try:
+            return self._rpc_registry.dispatch(req)
         except WorkspaceRevisionConflict as exc:
             return {
-                "request_id": request_id,
+                "request_id": req.get("request_id"),
                 "ok": False,
                 "error": {
                     "code": "revision_conflict",
@@ -4189,9 +5169,17 @@ class StreamAnalysisProcess(ManagedProcessBase):
                 },
             }
         except Exception as exc:
-            workspace_id = _normalize_id(params.get("workspace_id"))
+            workspace_id = (
+                _normalize_id(params.get("workspace_id"))
+                if isinstance(params, dict)
+                else None
+            )
             if isinstance(exc, FileNotFoundError):
-                return self._rpc_err(req, code="workspace_store_not_found", message=str(exc))
+                return self._rpc_err(
+                    req,
+                    code="workspace_store_not_found",
+                    message=str(exc),
+                )
             if isinstance(exc, ValueError) and "workspace_store_path" in str(exc):
                 return self._rpc_err(
                     req,
@@ -4205,6 +5193,30 @@ class StreamAnalysisProcess(ManagedProcessBase):
             )
             return self._rpc_err(req, code="rpc_error", message=str(exc))
 
+    def _handle_rpc(self, req: Json) -> Json:
+        common = self._handle_common_rpc(req)
+        if common is not None:
+            return common
+
+        if not hasattr(self, "_rpc_registry"):
+            self._rpc_registry = self._build_rpc_registry()
+        canonical = self._rpc_registry.canonical_action(req.get("type"))
+        if canonical:
+            req_type = str(req.get("type", ""))
+            if canonical != req_type:
+                req = dict(req)
+                req["type"] = canonical
+
+        params = req.get("params", {})
+        if params is None:
+            params = {}
+
+        dispatched = self._dispatch_rpc_with_error_mapping(req, params)
+        if dispatched is not None:
+            return dispatched
+        return self._rpc_unknown(req)
+
+    def _handle_rpc_legacy(self, req: Json) -> Json:
         return self._rpc_unknown(req)
 
     def run(self) -> None:

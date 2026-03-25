@@ -7,7 +7,6 @@ from ..utils.config_parsing import (
     ConfigError,
     normalize_list,
     optional_dict,
-    require_dict,
     require_str,
 )
 from .rules_constants import ON_UNKNOWN_VALUES, WATCHDOG_SEVERITIES

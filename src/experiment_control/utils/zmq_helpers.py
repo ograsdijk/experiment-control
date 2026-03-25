@@ -19,7 +19,7 @@ def json_loads(data: bytes) -> Any:
 def safe_json_loads(data: bytes) -> Any | None:
     try:
         return json_loads(data)
-    except Exception:
+    except (TypeError, ValueError):
         return None
 
 
@@ -30,7 +30,7 @@ def send_json(sock: zmq.Socket, payload: Any) -> None:
 def recv_json(sock: zmq.Socket, *, flags: int = 0) -> Any | None:
     try:
         data = sock.recv(flags=flags)
-    except Exception:
+    except zmq.ZMQError:
         return None
     return safe_json_loads(data)
 
@@ -47,6 +47,6 @@ def poll_and_drain(
             if events.get(sock) == zmq.POLLIN:
                 try:
                     handler()
-                except Exception:
+                except (zmq.ZMQError, TypeError, ValueError):
                     pass
     return events

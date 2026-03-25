@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import argparse
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from ..capabilities import capabilities_payload, method, param
-from ..sequencer.eval import eval_condition, to_attrdict
 from ..rules.rules_common import (
     TelemetryBinding,
     parse_on_unknown,
@@ -15,6 +15,7 @@ from ..rules.rules_common import (
     parse_telemetry_bindings,
     parse_version,
 )
+from ..sequencer.eval import eval_condition, to_attrdict
 from ..utils.cli_args import (
     add_heartbeat_args,
     add_manager_args,
@@ -29,6 +30,7 @@ from ..utils.config_parsing import (
     require_list_of_dicts,
     require_str,
 )
+from ..utils.rpc_dispatch import RpcDispatchRegistry
 from ..utils.value_coercion import coerce_bool, coerce_float, coerce_int
 from ..utils.yaml_helpers import load_yaml_file
 from .manager_client_helper import ManagerClientHelper
@@ -90,10 +92,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
-def _parse_ruleset(raw: Any, *, source: str) -> WatchdogRuleset:
-    obj = require_dict(raw, path=[])
-    parse_version(obj, allow_type=False)
-    watchdog_id = require_str(obj.get("watchdog_id"), path=["watchdog_id"])
+def _parse_watchdog_defaults(
+    obj: dict[str, Any],
+) -> tuple[float, float, float, bool, str]:
     defaults = optional_dict(obj.get("defaults"), path=["defaults"])
     defaults_max_age = coerce_float(defaults.get("max_age_s"), default=2.0)
     defaults_stable = coerce_float(defaults.get("stable_for_s"), default=0.0)
@@ -102,118 +103,182 @@ def _parse_ruleset(raw: Any, *, source: str) -> WatchdogRuleset:
     defaults_on_unknown = parse_on_unknown(
         defaults.get("on_unknown"), path=["defaults", "on_unknown"], default="ignore"
     )
+    return (
+        defaults_max_age,
+        defaults_stable,
+        defaults_cooldown,
+        defaults_latch,
+        defaults_on_unknown,
+    )
 
-    rules_raw = require_list_of_dicts(obj.get("rules"), path=["rules"])
+
+def _parse_watchdog_actions(
+    *,
+    rule_raw: dict[str, Any],
+    rule_index: int,
+) -> list[CommandAction]:
+    actions_raw = normalize_list(rule_raw.get("actions"), path=["rules", rule_index, "actions"])
+    if not actions_raw:
+        raise ConfigError(path=f"rules[{rule_index}].actions", message="actions are required")
+    actions: list[CommandAction] = []
+    for action_index, action_raw in enumerate(actions_raw):
+        if not isinstance(action_raw, dict):
+            raise ConfigError(
+                path=f"rules[{rule_index}].actions[{action_index}]",
+                message="must be an object/dict",
+            )
+        if "command" not in action_raw:
+            raise ConfigError(
+                path=f"rules[{rule_index}].actions[{action_index}]",
+                message="only command actions are supported",
+            )
+        cmd = require_dict(
+            action_raw.get("command"),
+            path=["rules", rule_index, "actions", action_index, "command"],
+        )
+        device_id = require_str(
+            cmd.get("device_id"),
+            path=["rules", rule_index, "actions", action_index, "command", "device_id"],
+        )
+        action = require_str(
+            cmd.get("action"),
+            path=["rules", rule_index, "actions", action_index, "command", "action"],
+        )
+        params = cmd.get("params", {}) or {}
+        if not isinstance(params, dict):
+            raise ConfigError(
+                path=f"rules[{rule_index}].actions[{action_index}].command.params",
+                message="params must be a dict",
+            )
+        timeout_s = cmd.get("timeout_s")
+        timeout_s_val = None if timeout_s is None else float(timeout_s)
+        retries = coerce_int(cmd.get("retries"), default=0)
+        if retries < 0:
+            retries = 0
+        actions.append(
+            CommandAction(
+                device_id=device_id,
+                action=action,
+                params=params,
+                timeout_s=timeout_s_val,
+                retries=retries,
+            )
+        )
+    return actions
+
+
+def _parse_watchdog_rule(
+    *,
+    rule_raw: dict[str, Any],
+    rule_index: int,
+    watchdog_id: str,
+    seen_rules: set[str],
+    defaults_max_age: float,
+    defaults_stable: float,
+    defaults_cooldown: float,
+    defaults_latch: bool,
+    defaults_on_unknown: str,
+) -> WatchdogRule:
+    name = require_str(rule_raw.get("name"), path=["rules", rule_index, "name"])
+    if name in seen_rules:
+        raise ConfigError(
+            path=f"rules[{rule_index}].name",
+            message=f"duplicate rule {name!r} in watchdog {watchdog_id!r}",
+        )
+    seen_rules.add(name)
+    severity = parse_severity(rule_raw.get("severity"), path=["rules", rule_index, "severity"])
+    message = rule_raw.get("message")
+    if message is not None and not isinstance(message, str):
+        message = str(message)
+    inputs = optional_dict(rule_raw.get("inputs"), path=["rules", rule_index, "inputs"])
+    telemetry = parse_telemetry_bindings(
+        inputs,
+        path=["rules", rule_index, "inputs"],
+        default_max_age_s=defaults_max_age,
+        require_nonempty=True,
+    )
+    if "condition" not in rule_raw:
+        raise ConfigError(path=f"rules[{rule_index}].condition", message="condition is required")
+    condition = rule_raw.get("condition")
+    stable_for_s = coerce_float(rule_raw.get("stable_for_s"), default=defaults_stable)
+    cooldown_s = coerce_float(rule_raw.get("cooldown_s"), default=defaults_cooldown)
+    latch = coerce_bool(rule_raw.get("latch"), default=defaults_latch)
+    on_unknown = parse_on_unknown(
+        rule_raw.get("on_unknown"),
+        path=["rules", rule_index, "on_unknown"],
+        default=defaults_on_unknown,
+    )
+    actions = _parse_watchdog_actions(rule_raw=rule_raw, rule_index=rule_index)
+    return WatchdogRule(
+        name=name,
+        severity=severity,
+        message=message,
+        telemetry=telemetry,
+        condition=condition,
+        stable_for_s=max(0.0, float(stable_for_s)),
+        cooldown_s=max(0.0, float(cooldown_s)),
+        latch=latch,
+        on_unknown=on_unknown,
+        actions=actions,
+    )
+
+
+def _parse_watchdog_rules(
+    *,
+    rules_raw: list[dict[str, Any]],
+    watchdog_id: str,
+    defaults_max_age: float,
+    defaults_stable: float,
+    defaults_cooldown: float,
+    defaults_latch: bool,
+    defaults_on_unknown: str,
+    source: str,
+) -> list[WatchdogRule]:
     seen_rules: set[str] = set()
     rules: list[WatchdogRule] = []
     for i, rule_raw in enumerate(rules_raw):
         try:
-            name = require_str(rule_raw.get("name"), path=["rules", i, "name"])
-            if name in seen_rules:
-                raise ConfigError(
-                    path=f"rules[{i}].name",
-                    message=f"duplicate rule {name!r} in watchdog {watchdog_id!r}",
-                )
-            seen_rules.add(name)
-            severity = parse_severity(rule_raw.get("severity"), path=["rules", i, "severity"])
-            message = rule_raw.get("message")
-            if message is not None and not isinstance(message, str):
-                message = str(message)
-
-            inputs = optional_dict(rule_raw.get("inputs"), path=["rules", i, "inputs"])
-            telemetry = parse_telemetry_bindings(
-                inputs,
-                path=["rules", i, "inputs"],
-                default_max_age_s=defaults_max_age,
-                require_nonempty=True,
-            )
-
-            if "condition" not in rule_raw:
-                raise ConfigError(
-                    path=f"rules[{i}].condition", message="condition is required"
-                )
-            condition = rule_raw.get("condition")
-
-            stable_for_s = coerce_float(
-                rule_raw.get("stable_for_s"), default=defaults_stable
-            )
-            cooldown_s = coerce_float(
-                rule_raw.get("cooldown_s"), default=defaults_cooldown
-            )
-            latch = coerce_bool(rule_raw.get("latch"), default=defaults_latch)
-            on_unknown = parse_on_unknown(
-                rule_raw.get("on_unknown"),
-                path=["rules", i, "on_unknown"],
-                default=defaults_on_unknown,
-            )
-
-            actions_raw = normalize_list(rule_raw.get("actions"), path=["rules", i, "actions"])
-            if not actions_raw:
-                raise ConfigError(
-                    path=f"rules[{i}].actions", message="actions are required"
-                )
-            actions: list[CommandAction] = []
-            for j, action_raw in enumerate(actions_raw):
-                if not isinstance(action_raw, dict):
-                    raise ConfigError(
-                        path=f"rules[{i}].actions[{j}]",
-                        message="must be an object/dict",
-                    )
-                if "command" not in action_raw:
-                    raise ConfigError(
-                        path=f"rules[{i}].actions[{j}]",
-                        message="only command actions are supported",
-                    )
-                cmd = require_dict(
-                    action_raw.get("command"),
-                    path=["rules", i, "actions", j, "command"],
-                )
-                device_id = require_str(
-                    cmd.get("device_id"),
-                    path=["rules", i, "actions", j, "command", "device_id"],
-                )
-                action = require_str(
-                    cmd.get("action"),
-                    path=["rules", i, "actions", j, "command", "action"],
-                )
-                params = cmd.get("params", {}) or {}
-                if not isinstance(params, dict):
-                    raise ConfigError(
-                        path=f"rules[{i}].actions[{j}].command.params",
-                        message="params must be a dict",
-                    )
-                timeout_s = cmd.get("timeout_s")
-                timeout_s_val = None if timeout_s is None else float(timeout_s)
-                retries = coerce_int(cmd.get("retries"), default=0)
-                if retries < 0:
-                    retries = 0
-                actions.append(
-                    CommandAction(
-                        device_id=device_id,
-                        action=action,
-                        params=params,
-                        timeout_s=timeout_s_val,
-                        retries=retries,
-                    )
-                )
-
             rules.append(
-                WatchdogRule(
-                    name=name,
-                    severity=severity,
-                    message=message,
-                    telemetry=telemetry,
-                    condition=condition,
-                    stable_for_s=max(0.0, float(stable_for_s)),
-                    cooldown_s=max(0.0, float(cooldown_s)),
-                    latch=latch,
-                    on_unknown=on_unknown,
-                    actions=actions,
+                _parse_watchdog_rule(
+                    rule_raw=rule_raw,
+                    rule_index=i,
+                    watchdog_id=watchdog_id,
+                    seen_rules=seen_rules,
+                    defaults_max_age=defaults_max_age,
+                    defaults_stable=defaults_stable,
+                    defaults_cooldown=defaults_cooldown,
+                    defaults_latch=defaults_latch,
+                    defaults_on_unknown=defaults_on_unknown,
                 )
             )
         except ConfigError as e:
             raise ValueError(f"{source}: {e}") from None
+    return rules
 
+
+def _parse_ruleset(raw: Any, *, source: str) -> WatchdogRuleset:
+    obj = require_dict(raw, path=[])
+    parse_version(obj, allow_type=False)
+    watchdog_id = require_str(obj.get("watchdog_id"), path=["watchdog_id"])
+    (
+        defaults_max_age,
+        defaults_stable,
+        defaults_cooldown,
+        defaults_latch,
+        defaults_on_unknown,
+    ) = _parse_watchdog_defaults(obj)
+
+    rules_raw = require_list_of_dicts(obj.get("rules"), path=["rules"])
+    rules = _parse_watchdog_rules(
+        rules_raw=rules_raw,
+        watchdog_id=watchdog_id,
+        defaults_max_age=defaults_max_age,
+        defaults_stable=defaults_stable,
+        defaults_cooldown=defaults_cooldown,
+        defaults_latch=defaults_latch,
+        defaults_on_unknown=defaults_on_unknown,
+        source=source,
+    )
     return WatchdogRuleset(watchdog_id=watchdog_id, rules=rules)
 
 
@@ -252,47 +317,91 @@ def _resolve_watchdog_bindings(
     snapshot: Json = {}
     unknown = False
     for binding in rule.telemetry:
-        sample = telemetry_getter(binding.device_id, binding.signal)
-        entry: Json = {
-            "device": binding.device_id,
-            "signal": binding.signal,
-            "max_age_s": binding.max_age_s,
-        }
-        if sample is None:
-            entry.update(
-                {"value": None, "quality": "MISSING", "age_s": None, "ok": False}
-            )
+        entry, alias_env, is_unknown = _resolve_watchdog_binding(
+            binding=binding,
+            telemetry_getter=telemetry_getter,
+            now_mono=now_mono,
+        )
+        if alias_env is not None:
+            env[binding.alias] = alias_env
+        if is_unknown:
             unknown = True
-        else:
-            age_s = sample.get("age_s")
-            if age_s is None:
-                t_mono = sample.get("t_mono")
-                if t_mono is not None:
-                    age_s = now_mono - float(t_mono)
-            quality = sample.get("quality")
-            entry.update(
-                {
-                    "value": sample.get("value"),
-                    "quality": quality,
-                    "age_s": age_s,
-                }
-            )
-            ok = quality == "OK" and age_s is not None and age_s <= binding.max_age_s
-            entry["ok"] = ok
-            if ok:
-                env[binding.alias] = to_attrdict(
-                    {
-                        "value": sample.get("value"),
-                        "age_s": age_s,
-                        "quality": quality,
-                        "device": binding.device_id,
-                        "signal": binding.signal,
-                    }
-                )
-            else:
-                unknown = True
         snapshot[binding.alias] = entry
     return env, snapshot, unknown
+
+
+def _resolve_watchdog_binding_age_s(sample: dict[str, Any], *, now_mono: float) -> float | None:
+    age_s = sample.get("age_s")
+    if age_s is not None:
+        return float(age_s)
+    t_mono = sample.get("t_mono")
+    if t_mono is None:
+        return None
+    return now_mono - float(t_mono)
+
+
+def _resolve_watchdog_binding(
+    *,
+    binding: TelemetryBinding,
+    telemetry_getter: Callable[[str, str], dict[str, Any] | None],
+    now_mono: float,
+) -> tuple[Json, Json | None, bool]:
+    sample = telemetry_getter(binding.device_id, binding.signal)
+    entry: Json = {
+        "device": binding.device_id,
+        "signal": binding.signal,
+        "max_age_s": binding.max_age_s,
+    }
+    if sample is None:
+        entry.update({"value": None, "quality": "MISSING", "age_s": None, "ok": False})
+        return entry, None, True
+
+    age_s = _resolve_watchdog_binding_age_s(sample, now_mono=now_mono)
+    quality = sample.get("quality")
+    entry.update(
+        {
+            "value": sample.get("value"),
+            "quality": quality,
+            "age_s": age_s,
+        }
+    )
+    ok = quality == "OK" and age_s is not None and age_s <= binding.max_age_s
+    entry["ok"] = ok
+    if not ok:
+        return entry, None, True
+    alias_env: Json = to_attrdict(
+        {
+            "value": sample.get("value"),
+            "age_s": age_s,
+            "quality": quality,
+            "device": binding.device_id,
+            "signal": binding.signal,
+        }
+    )
+    return entry, alias_env, False
+
+
+def _evaluate_watchdog_alarm(*, rule: WatchdogRule, env: Json, unknown: bool) -> bool:
+    if unknown:
+        return rule.on_unknown == "trigger"
+    try:
+        return bool(eval_condition(rule.condition, env))
+    except Exception:
+        return False
+
+
+def _watchdog_stable_ready(*, rule: WatchdogRule, state: RuleState, now_mono: float) -> bool:
+    if rule.stable_for_s <= 0:
+        return True
+    if state.stable_since_mono is None:
+        state.stable_since_mono = now_mono
+    return (now_mono - state.stable_since_mono) >= rule.stable_for_s
+
+
+def _watchdog_cooldown_ready(*, rule: WatchdogRule, state: RuleState, now_mono: float) -> bool:
+    if state.last_trigger_mono is None:
+        return True
+    return (now_mono - state.last_trigger_mono) >= rule.cooldown_s
 
 
 def evaluate_watchdog_rule(
@@ -305,13 +414,7 @@ def evaluate_watchdog_rule(
     env, snapshot, unknown = _resolve_watchdog_bindings(
         rule, telemetry_getter=telemetry_getter, now_mono=now_mono
     )
-    if unknown:
-        alarm = rule.on_unknown == "trigger"
-    else:
-        try:
-            alarm = bool(eval_condition(rule.condition, env))
-        except Exception:
-            alarm = False
+    alarm = _evaluate_watchdog_alarm(rule=rule, env=env, unknown=unknown)
 
     if not alarm:
         state.stable_since_mono = None
@@ -320,19 +423,10 @@ def evaluate_watchdog_rule(
     if rule.latch and state.latched:
         return False, alarm, unknown, snapshot
 
-    if rule.stable_for_s <= 0:
-        stable_ok = True
-    else:
-        if state.stable_since_mono is None:
-            state.stable_since_mono = now_mono
-        stable_ok = (now_mono - state.stable_since_mono) >= rule.stable_for_s
-    if not stable_ok:
+    if not _watchdog_stable_ready(rule=rule, state=state, now_mono=now_mono):
         return False, alarm, unknown, snapshot
 
-    if (
-        state.last_trigger_mono is not None
-        and (now_mono - state.last_trigger_mono) < rule.cooldown_s
-    ):
+    if not _watchdog_cooldown_ready(rule=rule, state=state, now_mono=now_mono):
         return False, alarm, unknown, snapshot
 
     state.last_trigger_mono = now_mono
@@ -392,6 +486,7 @@ class WatchdogProcess(ManagedProcessBase):
         self._advertise_process_rpc()
         self._start_heartbeat_thread(state_provider=lambda: "RUNNING")
         self._publish_rules_loaded()
+        self._rpc_registry = self._build_rpc_registry()
 
     def _publish_event(self, topic: str, payload: Json) -> None:
         self._manager_helper.publish_event(self._manager, topic=topic, payload=payload)
@@ -566,12 +661,206 @@ class WatchdogProcess(ManagedProcessBase):
         self._publish_event("manager.watchdog.cleared", payload)
         return {"ok": True, "previous_latched": prev_latched}
 
-    def _handle_rpc(self, req: Json) -> Json:
+    def _watchdog_capability_members(self) -> list[Json]:
+        members = [
+            method("watchdog.status", params=None, doc="Get watchdog status."),
+            method(
+                "watchdog.clear_latch",
+                params=[
+                    param("watchdog_id", required=False, default=None, annotation="str"),
+                    param("rule", required=False, default=None, annotation="str"),
+                    param("all", required=False, default=False, annotation="bool"),
+                ],
+                doc="Clear latch for a rule or all rules.",
+            ),
+            method(
+                "watchdog.enable",
+                params=[
+                    param("watchdog_id", required=True, default=None, annotation="str"),
+                ],
+                doc="Enable a watchdog ruleset.",
+            ),
+            method(
+                "watchdog.disable",
+                params=[
+                    param("watchdog_id", required=True, default=None, annotation="str"),
+                ],
+                doc="Disable a watchdog ruleset.",
+            ),
+            method("watchdog.enable_all", params=None, doc="Enable all watchdogs."),
+            method("watchdog.disable_all", params=None, doc="Disable all watchdogs."),
+        ]
+        return self._with_common_capabilities(members)
+
+    def _rpc_watchdog_capabilities(self, req: Json) -> Json:
+        return {
+            "request_id": req.get("request_id"),
+            "ok": True,
+            "result": capabilities_payload(self._watchdog_capability_members()),
+        }
+
+    def _rpc_watchdog_status(self, req: Json) -> Json:
+        watchdogs: list[Json] = []
+        for watchdog_id in self._ruleset_order:
+            entry = self._watchdog_entries[watchdog_id]
+            ruleset = entry.ruleset
+            rules_out: list[Json] = []
+            for rule in ruleset.rules:
+                state = self._states[(watchdog_id, rule.name)]
+                rules_out.append(
+                    {
+                        "name": rule.name,
+                        "severity": rule.severity,
+                        "latched": state.latched,
+                        "stable_since_mono": state.stable_since_mono,
+                        "last_trigger_mono": state.last_trigger_mono,
+                    }
+                )
+            watchdogs.append(
+                {
+                    "watchdog_id": watchdog_id,
+                    "enabled": entry.enabled,
+                    "rules": rules_out,
+                }
+            )
+        return {
+            "request_id": req.get("request_id"),
+            "ok": True,
+            "result": {"watchdogs": watchdogs},
+        }
+
+    def _rpc_watchdog_enable_disable(self, req: Json, *, enable: bool) -> Json:
+        params = req.get("params", {}) or {}
+        if not isinstance(params, dict):
+            return {
+                "request_id": req.get("request_id"),
+                "ok": False,
+                "error": {"code": "invalid_params"},
+            }
+        watchdog_id = params.get("watchdog_id")
+        if not watchdog_id:
+            return {
+                "request_id": req.get("request_id"),
+                "ok": False,
+                "error": {"code": "missing_watchdog_id"},
+            }
+        watchdog_id_text = str(watchdog_id)
+        entry = self._watchdog_entries.get(watchdog_id_text)
+        if entry is None:
+            return {
+                "request_id": req.get("request_id"),
+                "ok": False,
+                "error": {"code": "unknown_watchdog"},
+            }
+        entry.enabled = enable
+        return {
+            "request_id": req.get("request_id"),
+            "ok": True,
+            "result": {"watchdog_id": watchdog_id_text, "enabled": entry.enabled},
+        }
+
+    def _rpc_watchdog_enable(self, req: Json) -> Json:
+        return self._rpc_watchdog_enable_disable(req, enable=True)
+
+    def _rpc_watchdog_disable(self, req: Json) -> Json:
+        return self._rpc_watchdog_enable_disable(req, enable=False)
+
+    def _rpc_watchdog_enable_all_disable_all(self, req: Json, *, enable: bool) -> Json:
+        for entry in self._watchdog_entries.values():
+            entry.enabled = enable
+        return {
+            "request_id": req.get("request_id"),
+            "ok": True,
+            "result": {"enabled": enable, "count": len(self._watchdog_entries)},
+        }
+
+    def _rpc_watchdog_enable_all(self, req: Json) -> Json:
+        return self._rpc_watchdog_enable_all_disable_all(req, enable=True)
+
+    def _rpc_watchdog_disable_all(self, req: Json) -> Json:
+        return self._rpc_watchdog_enable_all_disable_all(req, enable=False)
+
+    def _rpc_watchdog_clear_all_latches(self, req_id: Any) -> Json:
+        cleared: list[Json] = []
+        for watchdog_id in self._ruleset_order:
+            ruleset = self._watchdog_entries[watchdog_id].ruleset
+            for rule in ruleset.rules:
+                result = self._clear_rule_state(watchdog_id, rule.name)
+                if result.get("ok"):
+                    cleared.append(
+                        {
+                            "watchdog_id": watchdog_id,
+                            "rule": rule.name,
+                            "previous_latched": result.get("previous_latched"),
+                        }
+                    )
+        return {"request_id": req_id, "ok": True, "result": {"cleared": cleared}}
+
+    def _rpc_watchdog_clear_scoped(
+        self, req_id: Any, *, watchdog_id: str, rule_name: str
+    ) -> Json:
+        if watchdog_id not in self._watchdog_entries:
+            return {
+                "request_id": req_id,
+                "ok": False,
+                "error": {"code": "unknown_watchdog"},
+            }
+        result = self._clear_rule_state(watchdog_id, rule_name)
+        if not result.get("ok"):
+            return {
+                "request_id": req_id,
+                "ok": False,
+                "error": {"code": "unknown_rule"},
+            }
+        return {
+            "request_id": req_id,
+            "ok": True,
+            "result": {
+                "watchdog_id": watchdog_id,
+                "rule": rule_name,
+                "previous_latched": result.get("previous_latched"),
+            },
+        }
+
+    def _find_watchdog_rule_matches(self, *, rule_name: str) -> list[tuple[str, str]]:
+        matches: list[tuple[str, str]] = []
+        for watchdog_id in self._ruleset_order:
+            for rule in self._watchdog_entries[watchdog_id].ruleset.rules:
+                if rule.name == rule_name:
+                    matches.append((watchdog_id, rule.name))
+        return matches
+
+    def _rpc_watchdog_clear_unscoped(self, req_id: Any, *, rule_name: str) -> Json:
+        matches = self._find_watchdog_rule_matches(rule_name=rule_name)
+        if not matches:
+            return {
+                "request_id": req_id,
+                "ok": False,
+                "error": {"code": "unknown_rule"},
+            }
+        if len(matches) > 1:
+            return {
+                "request_id": req_id,
+                "ok": False,
+                "error": {
+                    "code": "ambiguous_rule",
+                    "matches": [{"watchdog_id": m[0], "rule": m[1]} for m in matches],
+                },
+            }
+        w_id, r_name = matches[0]
+        result = self._clear_rule_state(w_id, r_name)
+        return {
+            "request_id": req_id,
+            "ok": True,
+            "result": {
+                "watchdog_id": w_id,
+                "rule": r_name,
+                "previous_latched": result.get("previous_latched"),
+            },
+        }
+
+    def _rpc_watchdog_clear_latch(self, req: Json) -> Json:
         req_id = req.get("request_id")
-        rtype = str(req.get("type", ""))
-        common = self._handle_common_rpc(req)
-        if common is not None:
-            return common
         params = req.get("params", {}) or {}
         if not isinstance(params, dict):
             return {
@@ -579,187 +868,63 @@ class WatchdogProcess(ManagedProcessBase):
                 "ok": False,
                 "error": {"code": "invalid_params"},
             }
+        if params.get("all"):
+            return self._rpc_watchdog_clear_all_latches(req_id)
 
-        if rtype == "process.capabilities":
-            members = [
-                method("watchdog.status", params=None, doc="Get watchdog status."),
-                method(
-                    "watchdog.clear_latch",
-                    params=[
-                        param("watchdog_id", required=False, default=None, annotation="str"),
-                        param("rule", required=False, default=None, annotation="str"),
-                        param("all", required=False, default=False, annotation="bool"),
-                    ],
-                    doc="Clear latch for a rule or all rules.",
-                ),
-                method(
-                    "watchdog.enable",
-                    params=[
-                        param("watchdog_id", required=True, default=None, annotation="str"),
-                    ],
-                    doc="Enable a watchdog ruleset.",
-                ),
-                method(
-                    "watchdog.disable",
-                    params=[
-                        param("watchdog_id", required=True, default=None, annotation="str"),
-                    ],
-                    doc="Disable a watchdog ruleset.",
-                ),
-                method("watchdog.enable_all", params=None, doc="Enable all watchdogs."),
-                method("watchdog.disable_all", params=None, doc="Disable all watchdogs."),
-            ]
-            members = self._with_common_capabilities(members)
+        watchdog_id = params.get("watchdog_id")
+        rule_name = params.get("rule")
+        if not rule_name:
+            return {
+                "request_id": req_id,
+                "ok": False,
+                "error": {"code": "missing_rule"},
+            }
+        rule_name_text = str(rule_name)
+        if watchdog_id is not None:
+            return self._rpc_watchdog_clear_scoped(
+                req_id, watchdog_id=str(watchdog_id), rule_name=rule_name_text
+            )
+        return self._rpc_watchdog_clear_unscoped(req_id, rule_name=rule_name_text)
+
+    def _build_rpc_registry(self) -> RpcDispatchRegistry:
+        handlers = {
+            "process.capabilities": self._rpc_watchdog_capabilities,
+            "watchdog.status": self._rpc_watchdog_status,
+            "watchdog.enable": self._rpc_watchdog_enable,
+            "watchdog.disable": self._rpc_watchdog_disable,
+            "watchdog.enable_all": self._rpc_watchdog_enable_all,
+            "watchdog.disable_all": self._rpc_watchdog_disable_all,
+            "watchdog.clear_latch": self._rpc_watchdog_clear_latch,
+        }
+        return RpcDispatchRegistry(
+            handlers=handlers,
+            aliases={"watchdog.get_status": "watchdog.status"},
+        )
+
+    def _handle_rpc(self, req: Json) -> Json:
+        common = self._handle_common_rpc(req)
+        if common is not None:
+            return common
+        params = req.get("params", {}) or {}
+        if not isinstance(params, dict):
             return {
                 "request_id": req.get("request_id"),
-                "ok": True,
-                "result": capabilities_payload(members),
+                "ok": False,
+                "error": {"code": "invalid_params"},
             }
-
-        if rtype == "watchdog.status":
-            watchdogs: list[Json] = []
-            for watchdog_id in self._ruleset_order:
-                entry = self._watchdog_entries[watchdog_id]
-                ruleset = entry.ruleset
-                rules_out: list[Json] = []
-                for rule in ruleset.rules:
-                    state = self._states[(watchdog_id, rule.name)]
-                    rules_out.append(
-                        {
-                            "name": rule.name,
-                            "severity": rule.severity,
-                            "latched": state.latched,
-                            "stable_since_mono": state.stable_since_mono,
-                            "last_trigger_mono": state.last_trigger_mono,
-                        }
-                    )
-                watchdogs.append(
-                    {
-                        "watchdog_id": watchdog_id,
-                        "enabled": entry.enabled,
-                        "rules": rules_out,
-                    }
-                )
-            return {"request_id": req_id, "ok": True, "result": {"watchdogs": watchdogs}}
-
-        if rtype in {"watchdog.enable", "watchdog.disable"}:
-            watchdog_id = params.get("watchdog_id")
-            if not watchdog_id:
-                return {
-                    "request_id": req_id,
-                    "ok": False,
-                    "error": {"code": "missing_watchdog_id"},
-                }
-            watchdog_id = str(watchdog_id)
-            entry = self._watchdog_entries.get(watchdog_id)
-            if entry is None:
-                return {
-                    "request_id": req_id,
-                    "ok": False,
-                    "error": {"code": "unknown_watchdog"},
-                }
-            entry.enabled = rtype == "watchdog.enable"
-            return {
-                "request_id": req_id,
-                "ok": True,
-                "result": {"watchdog_id": watchdog_id, "enabled": entry.enabled},
-            }
-
-        if rtype in {"watchdog.enable_all", "watchdog.disable_all"}:
-            enabled = rtype == "watchdog.enable_all"
-            for entry in self._watchdog_entries.values():
-                entry.enabled = enabled
-            return {
-                "request_id": req_id,
-                "ok": True,
-                "result": {"enabled": enabled, "count": len(self._watchdog_entries)},
-            }
-
-        if rtype == "watchdog.clear_latch":
-            if params.get("all"):
-                cleared: list[Json] = []
-                for watchdog_id in self._ruleset_order:
-                    ruleset = self._watchdog_entries[watchdog_id].ruleset
-                    for rule in ruleset.rules:
-                        result = self._clear_rule_state(watchdog_id, rule.name)
-                        if result.get("ok"):
-                            cleared.append(
-                                {
-                                    "watchdog_id": watchdog_id,
-                                    "rule": rule.name,
-                                    "previous_latched": result.get("previous_latched"),
-                                }
-                            )
-                return {"request_id": req_id, "ok": True, "result": {"cleared": cleared}}
-
-            watchdog_id = params.get("watchdog_id")
-            rule_name = params.get("rule")
-            if not rule_name:
-                return {
-                    "request_id": req_id,
-                    "ok": False,
-                    "error": {"code": "missing_rule"},
-                }
-            rule_name = str(rule_name)
-            if watchdog_id is not None:
-                watchdog_id = str(watchdog_id)
-                if watchdog_id not in self._watchdog_entries:
-                    return {
-                        "request_id": req_id,
-                        "ok": False,
-                        "error": {"code": "unknown_watchdog"},
-                    }
-                result = self._clear_rule_state(watchdog_id, rule_name)
-                if not result.get("ok"):
-                    return {
-                        "request_id": req_id,
-                        "ok": False,
-                        "error": {"code": "unknown_rule"},
-                    }
-                return {
-                    "request_id": req_id,
-                    "ok": True,
-                    "result": {
-                        "watchdog_id": watchdog_id,
-                        "rule": rule_name,
-                        "previous_latched": result.get("previous_latched"),
-                    },
-                }
-
-            matches: list[tuple[str, str]] = []
-            for w_id in self._ruleset_order:
-                for rule in self._watchdog_entries[w_id].ruleset.rules:
-                    if rule.name == rule_name:
-                        matches.append((w_id, rule.name))
-            if not matches:
-                return {
-                    "request_id": req_id,
-                    "ok": False,
-                    "error": {"code": "unknown_rule"},
-                }
-            if len(matches) > 1:
-                return {
-                    "request_id": req_id,
-                    "ok": False,
-                    "error": {
-                        "code": "ambiguous_rule",
-                        "matches": [{"watchdog_id": m[0], "rule": m[1]} for m in matches],
-                    },
-                }
-            w_id, r_name = matches[0]
-            result = self._clear_rule_state(w_id, r_name)
-            return {
-                "request_id": req_id,
-                "ok": True,
-                "result": {
-                    "watchdog_id": w_id,
-                    "rule": r_name,
-                    "previous_latched": result.get("previous_latched"),
-                },
-            }
-
+        if not hasattr(self, "_rpc_registry"):
+            self._rpc_registry = self._build_rpc_registry()
+        canonical = self._rpc_registry.canonical_action(req.get("type"))
+        if canonical:
+            req_type = str(req.get("type", "")).strip()
+            if canonical != req_type:
+                req = dict(req)
+                req["type"] = canonical
+        dispatched = self._rpc_registry.dispatch(req)
+        if dispatched is not None:
+            return dispatched
         return {
-            "request_id": req_id,
+            "request_id": req.get("request_id"),
             "ok": False,
             "error": {"code": "unknown_request"},
         }

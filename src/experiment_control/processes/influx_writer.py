@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import os
+import re
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -11,6 +13,7 @@ from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
+
 import zmq
 
 from ..capabilities import capabilities_payload, method, param
@@ -21,6 +24,7 @@ from ..utils.cli_args import (
     add_rpc_timeout_arg,
 )
 from ..utils.config_parsing import optional_dict, require_dict, require_str
+from ..utils.rpc_dispatch import RpcDispatchRegistry
 from ..utils.value_coercion import coerce_bool, coerce_float, coerce_int
 from ..utils.yaml_helpers import load_yaml_file
 from ..utils.zmq_helpers import safe_json_loads
@@ -77,6 +81,80 @@ def _normalize_meta_tag_key(raw: Any) -> str | None:
     return text if text else None
 
 
+def _normalize_device_type_name(raw: Any) -> str | None:
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if not text:
+        return None
+    text = re.sub(r"(.)([A-Z][a-z]+)", r"\1_\2", text)
+    text = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", text)
+    text = text.replace("-", "_").replace(" ", "_")
+    text = re.sub(r"[^a-zA-Z0-9_]", "_", text)
+    text = re.sub(r"_+", "_", text).strip("_").lower()
+    if text.endswith("_driver"):
+        text = text[: -len("_driver")].rstrip("_")
+    elif text.endswith("driver"):
+        text = text[: -len("driver")].rstrip("_")
+    return text or None
+
+
+def _parse_driver_dict_from_yaml_text(raw: Any) -> dict[str, Any] | None:
+    if not isinstance(raw, str):
+        return None
+    text = raw.strip()
+    if not text:
+        return None
+    parsed: Any = None
+    if text.startswith("{"):
+        try:
+            parsed = json.loads(text)
+        except Exception:
+            parsed = None
+    if parsed is None:
+        try:
+            import yaml  # type: ignore[import-not-found]
+
+            parsed = yaml.safe_load(text)
+        except Exception:
+            parsed = None
+    if not isinstance(parsed, dict):
+        return None
+    driver = parsed.get("driver")
+    if not isinstance(driver, dict):
+        return None
+    return driver
+
+
+def _extract_driver_dict_from_config_payload(payload: Json) -> dict[str, Any] | None:
+    driver = payload.get("driver")
+    if isinstance(driver, dict):
+        return driver
+    return _parse_driver_dict_from_yaml_text(payload.get("yaml_text"))
+
+
+def _derive_device_type_from_driver_config(payload: Json) -> str | None:
+    driver = _extract_driver_dict_from_config_payload(payload)
+    if not isinstance(driver, dict):
+        return None
+    class_name = _normalize_device_type_name(driver.get("class_name"))
+    if class_name:
+        return class_name
+    module_raw = driver.get("module")
+    if isinstance(module_raw, str) and module_raw.strip():
+        tail = module_raw.strip().split(".")[-1]
+        module_name = _normalize_device_type_name(tail)
+        if module_name:
+            return module_name
+    file_raw = driver.get("file")
+    if isinstance(file_raw, str) and file_raw.strip():
+        stem = Path(file_raw.strip()).stem
+        file_name = _normalize_device_type_name(stem)
+        if file_name:
+            return file_name
+    return None
+
+
 def _escape_measurement(value: str) -> str:
     return (
         str(value)
@@ -110,6 +188,43 @@ def _escape_field_str(value: str) -> str:
     return str(value).replace("\\", "\\\\").replace('"', '\\"')
 
 
+def _encode_tag_parts(tags: dict[str, str]) -> list[str]:
+    out: list[str] = []
+    for key in sorted(tags.keys()):
+        value = tags.get(key)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if not text:
+            continue
+        out.append(f"{_escape_tag_component(key)}={_escape_tag_component(text)}")
+    return out
+
+
+def _encode_field_value(raw: Any) -> str | None:
+    if isinstance(raw, bool):
+        return "true" if raw else "false"
+    if isinstance(raw, int):
+        return f"{int(raw)}i"
+    if isinstance(raw, float):
+        if not math.isfinite(raw):
+            return None
+        return format(float(raw), ".17g")
+    if isinstance(raw, str):
+        return f'"{_escape_field_str(raw)}"'
+    return None
+
+
+def _encode_field_parts(fields: dict[str, Any]) -> list[str]:
+    out: list[str] = []
+    for key in sorted(fields.keys()):
+        encoded = _encode_field_value(fields[key])
+        if encoded is None:
+            continue
+        out.append(f"{_escape_field_key(key)}={encoded}")
+    return out
+
+
 def _build_line_protocol(
     *,
     measurement: str,
@@ -121,36 +236,11 @@ def _build_line_protocol(
         raise ValueError("line protocol requires at least one field")
 
     line = _escape_measurement(measurement)
-    tag_parts: list[str] = []
-    for key in sorted(tags.keys()):
-        value = tags.get(key)
-        if value is None:
-            continue
-        text = str(value).strip()
-        if not text:
-            continue
-        tag_parts.append(
-            f"{_escape_tag_component(key)}={_escape_tag_component(text)}"
-        )
+    tag_parts = _encode_tag_parts(tags)
     if tag_parts:
         line += "," + ",".join(tag_parts)
 
-    field_parts: list[str] = []
-    for key in sorted(fields.keys()):
-        raw = fields[key]
-        if isinstance(raw, bool):
-            encoded = "true" if raw else "false"
-        elif isinstance(raw, int):
-            encoded = f"{int(raw)}i"
-        elif isinstance(raw, float):
-            if not math.isfinite(raw):
-                continue
-            encoded = format(float(raw), ".17g")
-        elif isinstance(raw, str):
-            encoded = f'"{_escape_field_str(raw)}"'
-        else:
-            continue
-        field_parts.append(f"{_escape_field_key(key)}={encoded}")
+    field_parts = _encode_field_parts(fields)
     if not field_parts:
         raise ValueError("line protocol fields could not be encoded")
     line += " " + ",".join(field_parts)
@@ -202,9 +292,9 @@ def _extract_device_type_from_config(
 ) -> str | None:
     device_metadata = payload.get("device_metadata")
     if isinstance(device_metadata, dict):
-        from_meta = device_metadata.get(metadata_key)
-        if isinstance(from_meta, str) and from_meta.strip():
-            return from_meta.strip()
+        from_meta = _normalize_device_type_name(device_metadata.get(metadata_key))
+        if from_meta:
+            return from_meta
     return None
 
 
@@ -215,7 +305,7 @@ class InfluxWriterProcess(ManagedProcessBase):
         manager_rpc: str,
         manager_pub: str,
         process_id: str,
-        rpc_timeout_ms: int,
+        rpc_timeout_ms: int = 2000,
         heartbeat_endpoint: str | None,
         heartbeat_period_s: float,
         instance_id: str | None = None,
@@ -320,52 +410,71 @@ class InfluxWriterProcess(ManagedProcessBase):
         self._start_heartbeat_thread(state_provider=lambda: "RUNNING")
 
         self._refresh_device_catalog()
+        self._rpc_registry = self._build_rpc_registry()
 
     def _parse_destinations(self, raw: dict[str, Any]) -> dict[str, InfluxDestination]:
         out: dict[str, InfluxDestination] = {}
         for dest_name, item in raw.items():
-            if not isinstance(item, dict):
-                continue
-            name = str(dest_name).strip()
-            if not name:
-                continue
-            url = _expand_env_vars(str(item.get("url", "")).strip())
-            org = _expand_env_vars(str(item.get("org", "")).strip())
-            bucket = _expand_env_vars(str(item.get("bucket", "")).strip())
-            token = _expand_env_vars(str(item.get("token", "")).strip())
-            if not url or not org or not bucket:
-                continue
-            measurement = str(item.get("measurement", "unknown_device")).strip()
-            if not measurement:
-                measurement = "unknown_device"
-            precision = str(item.get("precision", "ns")).strip().lower() or "ns"
-            if precision not in {"ns", "us", "ms", "s"}:
-                precision = "ns"
-            request_timeout_s = coerce_float(
-                item.get("request_timeout_s"), default=5.0
-            )
-            static_tags: dict[str, str] = {}
-            raw_tags = item.get("static_tags")
-            if isinstance(raw_tags, dict):
-                for key, value in raw_tags.items():
-                    tag_key = str(key).strip()
-                    tag_value = str(value).strip()
-                    if tag_key and tag_value:
-                        static_tags[tag_key] = tag_value
-            out[name] = InfluxDestination(
-                name=name,
-                url=url,
-                org=org,
-                bucket=bucket,
-                token=token,
-                measurement=measurement,
-                precision=precision,
-                request_timeout_s=max(0.5, float(request_timeout_s)),
-                static_tags=static_tags,
-            )
+            destination = self._parse_destination_entry(dest_name=dest_name, item=item)
+            if destination is not None:
+                out[destination.name] = destination
         if not out:
             raise ValueError("influx_writer requires at least one destination")
         return out
+
+    @staticmethod
+    def _parse_destination_precision(raw: Any) -> str:
+        precision = str(raw or "ns").strip().lower() or "ns"
+        if precision not in {"ns", "us", "ms", "s"}:
+            return "ns"
+        return precision
+
+    @staticmethod
+    def _parse_destination_static_tags(raw: Any) -> dict[str, str]:
+        out: dict[str, str] = {}
+        if not isinstance(raw, dict):
+            return out
+        for key, value in raw.items():
+            tag_key = str(key).strip()
+            tag_value = str(value).strip()
+            if tag_key and tag_value:
+                out[tag_key] = tag_value
+        return out
+
+    def _parse_destination_entry(
+        self,
+        *,
+        dest_name: Any,
+        item: Any,
+    ) -> InfluxDestination | None:
+        if not isinstance(item, dict):
+            return None
+        name = str(dest_name).strip()
+        if not name:
+            return None
+        url = _expand_env_vars(str(item.get("url", "")).strip())
+        org = _expand_env_vars(str(item.get("org", "")).strip())
+        bucket = _expand_env_vars(str(item.get("bucket", "")).strip())
+        token = _expand_env_vars(str(item.get("token", "")).strip())
+        if not url or not org or not bucket:
+            return None
+        measurement = str(item.get("measurement", "unknown_device")).strip()
+        if not measurement:
+            measurement = "unknown_device"
+        precision = self._parse_destination_precision(item.get("precision", "ns"))
+        request_timeout_s = coerce_float(item.get("request_timeout_s"), default=5.0)
+        static_tags = self._parse_destination_static_tags(item.get("static_tags"))
+        return InfluxDestination(
+            name=name,
+            url=url,
+            org=org,
+            bucket=bucket,
+            token=token,
+            measurement=measurement,
+            precision=precision,
+            request_timeout_s=max(0.5, float(request_timeout_s)),
+            static_tags=static_tags,
+        )
 
     def _resolve_default_destination(self, *, default_destination: str | None) -> str:
         if isinstance(default_destination, str) and default_destination.strip():
@@ -469,13 +578,19 @@ class InfluxWriterProcess(ManagedProcessBase):
 
         route = self._routes.get(device_id)
         if route is not None and route.device_type:
-            self._device_type_by_id[device_id] = route.device_type
+            normalized_route = _normalize_device_type_name(route.device_type)
+            if normalized_route:
+                self._device_type_by_id[device_id] = normalized_route
             return
         device_type = _extract_device_type_from_config(
             payload, metadata_key=self._device_type_key
         )
         if device_type:
             self._device_type_by_id[device_id] = device_type
+            return
+        derived_type = _derive_device_type_from_driver_config(payload)
+        if derived_type:
+            self._device_type_by_id[device_id] = derived_type
 
     def _resolve_destination(self, device_id: str) -> str:
         route = self._routes.get(device_id)
@@ -523,79 +638,109 @@ class InfluxWriterProcess(ManagedProcessBase):
             if topic == "manager.telemetry_update":
                 self._ingest_telemetry(payload)
 
-    def _ingest_telemetry(self, payload: Json) -> None:
-        if not self._enabled:
-            return
-        device_id = str(payload.get("device_id", "")).strip()
-        if not device_id or device_id in self._disabled_devices:
-            return
-        if device_id in self._remote_device_ids:
-            self._points_skipped_remote += 1
-            return
-        signals = payload.get("signals")
-        if not isinstance(signals, dict):
-            return
-
+    def _resolve_ingest_destination(
+        self,
+        *,
+        device_id: str,
+    ) -> tuple[str, InfluxDestination] | None:
         destination_name = self._resolve_destination(device_id)
         destination = self._destinations.get(destination_name)
-        if destination is None:
-            self._write_errors += 1
-            self._last_error = (
-                f"unknown destination {destination_name!r} for device {device_id!r}"
-            )
-            return
+        if destination is not None:
+            return destination_name, destination
+        self._write_errors += 1
+        self._last_error = (
+            f"unknown destination {destination_name!r} for device {device_id!r}"
+        )
+        return None
 
+    @staticmethod
+    def _coerce_signal_field_value(value: Any) -> Any | None:
+        if isinstance(value, bool):
+            return bool(value)
+        if isinstance(value, int):
+            as_i64 = int(value)
+            if as_i64 < -(2**63) or as_i64 > 2**63 - 1:
+                return None
+            return as_i64
+        if isinstance(value, float):
+            if not math.isfinite(value):
+                return None
+            return float(value)
+        if isinstance(value, str):
+            return value
+        return None
+
+    def _build_telemetry_fields(self, signals: Any) -> dict[str, Any]:
         fields: dict[str, Any] = {}
+        if not isinstance(signals, dict):
+            return fields
         for signal_name_raw, signal_payload_raw in signals.items():
             signal_name = str(signal_name_raw).strip()
             if not signal_name or not isinstance(signal_payload_raw, dict):
                 continue
-            value = signal_payload_raw.get("value")
-            quality = str(signal_payload_raw.get("quality", "UNKNOWN")).strip().upper()
-            unit_raw = signal_payload_raw.get("units")
-            unit = str(unit_raw).strip() if isinstance(unit_raw, str) else ""
-
-            if isinstance(value, bool):
-                fields[signal_name] = bool(value)
-            elif isinstance(value, int):
-                as_i64 = int(value)
-                if as_i64 < -(2**63) or as_i64 > 2**63 - 1:
-                    continue
-                fields[signal_name] = as_i64
-            elif isinstance(value, float):
-                if not math.isfinite(value):
-                    continue
-                fields[signal_name] = float(value)
-            elif isinstance(value, str):
-                fields[signal_name] = value
-            else:
+            coerced_value = self._coerce_signal_field_value(signal_payload_raw.get("value"))
+            if coerced_value is None:
                 continue
-
+            fields[signal_name] = coerced_value
             if self._include_quality_fields:
+                quality = str(signal_payload_raw.get("quality", "UNKNOWN")).strip().upper()
                 fields[f"{signal_name}__quality"] = quality
-            if self._include_unit_fields and unit:
-                fields[f"{signal_name}__unit"] = unit
+            if self._include_unit_fields:
+                unit_raw = signal_payload_raw.get("units")
+                unit = str(unit_raw).strip() if isinstance(unit_raw, str) else ""
+                if unit:
+                    fields[f"{signal_name}__unit"] = unit
+        return fields
 
-        if not fields:
-            self._points_skipped_invalid += 1
-            return
-
-        self._points_received += 1
-        ts_ns = _timestamp_ns_from_bundle(payload)
-        measurement = self._resolve_measurement(device_id=device_id, destination=destination)
+    def _build_point_tags(
+        self,
+        *,
+        device_id: str,
+        destination: InfluxDestination,
+    ) -> dict[str, str]:
         tags: dict[str, str] = {
             "instance_id": self._instance_id,
             "device_id": device_id,
         }
         tags.update(destination.static_tags)
-        route = self._routes.get(device_id)
         tags.update(self._device_tags_by_id.get(device_id, {}))
+        route = self._routes.get(device_id)
         if route is not None and route.tags:
             tags.update(route.tags)
         device_type = self._device_type_by_id.get(device_id)
         if self._include_device_type_tag and device_type:
             tags["device_type"] = device_type
+        return tags
 
+    def _ingest_device_id(self, payload: Json) -> str | None:
+        device_id = str(payload.get("device_id", "")).strip()
+        if not device_id or device_id in self._disabled_devices:
+            return None
+        if device_id in self._remote_device_ids:
+            self._points_skipped_remote += 1
+            return None
+        return device_id
+
+    def _build_queued_point(
+        self,
+        *,
+        payload: Json,
+        device_id: str,
+        destination_name: str,
+        destination: InfluxDestination,
+    ) -> QueuedPoint | None:
+        fields = self._build_telemetry_fields(payload.get("signals"))
+        if not fields:
+            self._points_skipped_invalid += 1
+            return None
+
+        self._points_received += 1
+        ts_ns = _timestamp_ns_from_bundle(payload)
+        measurement = self._resolve_measurement(
+            device_id=device_id,
+            destination=destination,
+        )
+        tags = self._build_point_tags(device_id=device_id, destination=destination)
         try:
             line = _build_line_protocol(
                 measurement=measurement,
@@ -605,8 +750,30 @@ class InfluxWriterProcess(ManagedProcessBase):
             )
         except Exception:
             self._points_skipped_invalid += 1
+            return None
+        return QueuedPoint(destination=destination_name, line=line)
+
+    def _ingest_telemetry(self, payload: Json) -> None:
+        if not self._enabled:
             return
-        self._enqueue_point(QueuedPoint(destination=destination_name, line=line))
+        device_id = self._ingest_device_id(payload)
+        if device_id is None:
+            return
+        destination_info = self._resolve_ingest_destination(device_id=device_id)
+        if destination_info is None:
+            return
+        if not isinstance(payload.get("signals"), dict):
+            return
+        destination_name, destination = destination_info
+        point = self._build_queued_point(
+            payload=payload,
+            device_id=device_id,
+            destination_name=destination_name,
+            destination=destination,
+        )
+        if point is None:
+            return
+        self._enqueue_point(point)
 
     @staticmethod
     def _destination_write_url(destination: InfluxDestination) -> str:
@@ -664,58 +831,89 @@ class InfluxWriterProcess(ManagedProcessBase):
                 self._points_dropped_overflow += 1
             self._queue.appendleft(point)
 
-    def _flush(self) -> None:
-        if not self._queue:
-            return
+    def _drain_pending_points(self) -> list[QueuedPoint]:
         pending: list[QueuedPoint] = []
         while self._queue:
             pending.append(self._queue.popleft())
+        return pending
 
+    @staticmethod
+    def _group_points_by_destination(
+        pending: list[QueuedPoint],
+    ) -> dict[str, list[QueuedPoint]]:
         by_destination: dict[str, list[QueuedPoint]] = {}
         for point in pending:
             by_destination.setdefault(point.destination, []).append(point)
+        return by_destination
 
+    def _flush_destination_points(
+        self,
+        *,
+        destination_name: str,
+        points: list[QueuedPoint],
+    ) -> bool:
+        destination = self._destinations.get(destination_name)
+        if destination is None:
+            self._write_errors += 1
+            self._last_error = f"missing destination {destination_name!r}"
+            return False
+        lines = [point.line for point in points]
+        try:
+            self._write_batch_http(destination=destination, lines=lines)
+            self._points_written += len(points)
+            self._batches_written += 1
+            self._last_error = None
+            return True
+        except HTTPError as e:
+            body = ""
+            try:
+                body = e.read().decode("utf-8", errors="replace").strip()
+            except Exception:
+                body = ""
+            self._write_errors += 1
+            self._last_error = (
+                f"HTTPError status={e.code} destination={destination_name}: {body or str(e)}"
+            )
+            return False
+        except URLError as e:
+            self._write_errors += 1
+            self._last_error = f"URLError destination={destination_name}: {e}"
+            return False
+        except Exception as e:
+            self._write_errors += 1
+            self._last_error = f"write failed destination={destination_name}: {e}"
+            return False
+
+    def _mark_flush_timestamp(self) -> None:
+        self._last_flush_wall_s = time.time()
+        self._last_flush_mono_s = time.monotonic()
+
+    def _flush_grouped_points(
+        self,
+        *,
+        by_destination: dict[str, list[QueuedPoint]],
+    ) -> list[QueuedPoint]:
         failed: list[QueuedPoint] = []
         for destination_name, points in by_destination.items():
-            destination = self._destinations.get(destination_name)
-            if destination is None:
-                self._write_errors += 1
-                self._last_error = f"missing destination {destination_name!r}"
-                failed.extend(points)
+            if self._flush_destination_points(
+                destination_name=destination_name,
+                points=points,
+            ):
                 continue
-            lines = [point.line for point in points]
-            try:
-                self._write_batch_http(destination=destination, lines=lines)
-                self._points_written += len(points)
-                self._batches_written += 1
-                self._last_error = None
-            except HTTPError as e:
-                body = ""
-                try:
-                    body = e.read().decode("utf-8", errors="replace").strip()
-                except Exception:
-                    body = ""
-                self._write_errors += 1
-                self._last_error = (
-                    f"HTTPError status={e.code} destination={destination_name}: {body or str(e)}"
-                )
-                failed.extend(points)
-            except URLError as e:
-                self._write_errors += 1
-                self._last_error = f"URLError destination={destination_name}: {e}"
-                failed.extend(points)
-            except Exception as e:
-                self._write_errors += 1
-                self._last_error = f"write failed destination={destination_name}: {e}"
-                failed.extend(points)
+            failed.extend(points)
+        return failed
+
+    def _flush(self) -> None:
+        if not self._queue:
+            return
+        pending = self._drain_pending_points()
+        by_destination = self._group_points_by_destination(pending)
+        failed = self._flush_grouped_points(by_destination=by_destination)
 
         if failed:
             self._requeue_failed(failed)
 
-        now_wall = time.time()
-        now_mono = time.monotonic()
-        self._last_flush_wall_s = now_wall
-        self._last_flush_mono_s = now_mono
+        self._mark_flush_timestamp()
 
     @staticmethod
     def _normalize_device_list(params: Json) -> list[str]:
@@ -767,107 +965,142 @@ class InfluxWriterProcess(ManagedProcessBase):
             "remote_device_known_count": len(self._remote_device_ids),
         }
 
-    def _handle_rpc(self, req: Json) -> Json:
-        request_id = req.get("request_id")
-        rtype = str(req.get("type", "")).strip()
-        common = self._handle_common_rpc(req)
-        if common is not None:
-            return common
+    def _influx_capability_members(self) -> list[Json]:
+        members = [
+            method("influx.status", params=None, doc="Get influx writer status."),
+            method("influx.enable", params=None, doc="Enable ingest/writes."),
+            method("influx.disable", params=None, doc="Disable ingest/writes."),
+            method("influx.flush", params=None, doc="Flush queued points now."),
+            method("influx.devices.get", params=None, doc="Get device filter state."),
+            method(
+                "influx.devices.enable",
+                params=[
+                    param("device_id", required=False, default=None, annotation="str"),
+                    param("device_ids", required=False, default=None, annotation="list[str]"),
+                ],
+                doc="Enable one/many devices for writes.",
+            ),
+            method(
+                "influx.devices.disable",
+                params=[
+                    param("device_id", required=False, default=None, annotation="str"),
+                    param("device_ids", required=False, default=None, annotation="list[str]"),
+                ],
+                doc="Disable one/many devices for writes.",
+            ),
+        ]
+        return self._with_common_capabilities(members)
+
+    def _rpc_influx_capabilities(self, req: Json) -> Json:
+        return {
+            "request_id": req.get("request_id"),
+            "ok": True,
+            "result": capabilities_payload(self._influx_capability_members()),
+        }
+
+    def _rpc_influx_status(self, req: Json) -> Json:
+        return {
+            "request_id": req.get("request_id"),
+            "ok": True,
+            "result": self._status_payload(),
+        }
+
+    def _rpc_influx_enable(self, req: Json) -> Json:
+        self._enabled = True
+        return {
+            "request_id": req.get("request_id"),
+            "ok": True,
+            "result": {"enabled": True},
+        }
+
+    def _rpc_influx_disable(self, req: Json) -> Json:
+        self._enabled = False
+        return {
+            "request_id": req.get("request_id"),
+            "ok": True,
+            "result": {"enabled": False},
+        }
+
+    def _rpc_influx_flush(self, req: Json) -> Json:
+        self._flush()
+        return {
+            "request_id": req.get("request_id"),
+            "ok": True,
+            "result": {"queue_depth": len(self._queue)},
+        }
+
+    def _rpc_influx_devices_get(self, req: Json) -> Json:
+        return {
+            "request_id": req.get("request_id"),
+            "ok": True,
+            "result": {"disabled_devices": sorted(self._disabled_devices)},
+        }
+
+    def _rpc_influx_devices_toggle(self, req: Json, *, enable: bool) -> Json:
         params = req.get("params", {}) or {}
         if not isinstance(params, dict):
             return {
-                "request_id": request_id,
+                "request_id": req.get("request_id"),
                 "ok": False,
                 "error": {"code": "invalid_params"},
             }
-
-        if rtype == "process.capabilities":
-            members = [
-                method("influx.status", params=None, doc="Get influx writer status."),
-                method("influx.enable", params=None, doc="Enable ingest/writes."),
-                method("influx.disable", params=None, doc="Disable ingest/writes."),
-                method("influx.flush", params=None, doc="Flush queued points now."),
-                method("influx.devices.get", params=None, doc="Get device filter state."),
-                method(
-                    "influx.devices.enable",
-                    params=[
-                        param("device_id", required=False, default=None, annotation="str"),
-                        param("device_ids", required=False, default=None, annotation="list[str]"),
-                    ],
-                    doc="Enable one/many devices for writes.",
-                ),
-                method(
-                    "influx.devices.disable",
-                    params=[
-                        param("device_id", required=False, default=None, annotation="str"),
-                        param("device_ids", required=False, default=None, annotation="list[str]"),
-                    ],
-                    doc="Disable one/many devices for writes.",
-                ),
-            ]
-            members = self._with_common_capabilities(members)
+        device_ids = self._normalize_device_list(params)
+        if not device_ids:
             return {
-                "request_id": request_id,
-                "ok": True,
-                "result": capabilities_payload(members),
+                "request_id": req.get("request_id"),
+                "ok": False,
+                "error": {"code": "invalid_params", "message": "missing device_id(s)"},
             }
-
-        if rtype == "influx.status":
-            return {"request_id": request_id, "ok": True, "result": self._status_payload()}
-
-        if rtype == "influx.enable":
-            self._enabled = True
-            return {
-                "request_id": request_id,
-                "ok": True,
-                "result": {"enabled": True},
-            }
-
-        if rtype == "influx.disable":
-            self._enabled = False
-            return {
-                "request_id": request_id,
-                "ok": True,
-                "result": {"enabled": False},
-            }
-
-        if rtype == "influx.flush":
-            self._flush()
-            return {
-                "request_id": request_id,
-                "ok": True,
-                "result": {"queue_depth": len(self._queue)},
-            }
-
-        if rtype == "influx.devices.get":
-            return {
-                "request_id": request_id,
-                "ok": True,
-                "result": {"disabled_devices": sorted(self._disabled_devices)},
-            }
-
-        if rtype in {"influx.devices.enable", "influx.devices.disable"}:
-            device_ids = self._normalize_device_list(params)
-            if not device_ids:
-                return {
-                    "request_id": request_id,
-                    "ok": False,
-                    "error": {"code": "invalid_params", "message": "missing device_id(s)"},
-                }
-            if rtype == "influx.devices.enable":
-                for device_id in device_ids:
-                    self._disabled_devices.discard(device_id)
+        for device_id in device_ids:
+            if enable:
+                self._disabled_devices.discard(device_id)
             else:
-                for device_id in device_ids:
-                    self._disabled_devices.add(device_id)
-            return {
-                "request_id": request_id,
-                "ok": True,
-                "result": {"disabled_devices": sorted(self._disabled_devices)},
-            }
-
+                self._disabled_devices.add(device_id)
         return {
-            "request_id": request_id,
+            "request_id": req.get("request_id"),
+            "ok": True,
+            "result": {"disabled_devices": sorted(self._disabled_devices)},
+        }
+
+    def _rpc_influx_devices_enable(self, req: Json) -> Json:
+        return self._rpc_influx_devices_toggle(req, enable=True)
+
+    def _rpc_influx_devices_disable(self, req: Json) -> Json:
+        return self._rpc_influx_devices_toggle(req, enable=False)
+
+    def _build_rpc_registry(self) -> RpcDispatchRegistry:
+        handlers = {
+            "process.capabilities": self._rpc_influx_capabilities,
+            "influx.status": self._rpc_influx_status,
+            "influx.enable": self._rpc_influx_enable,
+            "influx.disable": self._rpc_influx_disable,
+            "influx.flush": self._rpc_influx_flush,
+            "influx.devices.get": self._rpc_influx_devices_get,
+            "influx.devices.enable": self._rpc_influx_devices_enable,
+            "influx.devices.disable": self._rpc_influx_devices_disable,
+        }
+        return RpcDispatchRegistry(
+            handlers=handlers,
+            aliases={"influx.get_status": "influx.status"},
+        )
+
+    def _handle_rpc(self, req: Json) -> Json:
+        common = self._handle_common_rpc(req)
+        if common is not None:
+            return common
+        if not hasattr(self, "_rpc_registry"):
+            self._rpc_registry = self._build_rpc_registry()
+        canonical = self._rpc_registry.canonical_action(req.get("type"))
+        if canonical:
+            req_type = str(req.get("type", "")).strip()
+            if canonical != req_type:
+                req = dict(req)
+                req["type"] = canonical
+        dispatched = self._rpc_registry.dispatch(req)
+        if dispatched is not None:
+            return dispatched
+        return {
+            "request_id": req.get("request_id"),
             "ok": False,
             "error": {"code": "unknown_request"},
         }

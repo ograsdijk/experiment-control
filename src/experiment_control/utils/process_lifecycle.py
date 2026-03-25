@@ -52,7 +52,7 @@ def _extract_int_flag(command: str, *, flag: str) -> int | None:
             continue
         try:
             return int(match.group(1))
-        except Exception:
+        except (TypeError, ValueError, OverflowError):
             continue
     return None
 
@@ -72,7 +72,7 @@ def _list_process_commands_posix() -> list[tuple[int, str]]:
             encoding="utf-8",
             errors="replace",
         )
-    except Exception:
+    except OSError:
         return []
     if proc.returncode != 0:
         return []
@@ -87,7 +87,7 @@ def _list_process_commands_posix() -> list[tuple[int, str]]:
         pid_text, cmd = parts
         try:
             pid = int(pid_text)
-        except Exception:
+        except (TypeError, ValueError, OverflowError):
             continue
         if pid <= 0:
             continue
@@ -111,7 +111,7 @@ def _list_process_commands_windows() -> list[tuple[int, str]]:
             encoding="utf-8",
             errors="replace",
         )
-    except Exception:
+    except OSError:
         return []
     if proc.returncode != 0:
         return []
@@ -122,7 +122,7 @@ def _list_process_commands_windows() -> list[tuple[int, str]]:
         import json
 
         decoded = json.loads(text)
-    except Exception:
+    except (TypeError, ValueError):
         return []
     if isinstance(decoded, dict):
         rows = [decoded]
@@ -138,7 +138,7 @@ def _list_process_commands_windows() -> list[tuple[int, str]]:
             continue
         try:
             pid = int(raw_pid)
-        except Exception:
+        except (TypeError, ValueError, OverflowError):
             continue
         if pid <= 0:
             continue
@@ -167,7 +167,7 @@ def _process_exists(pid: int) -> bool:
         return False
     except PermissionError:
         return True
-    except Exception:
+    except OSError:
         return False
 
 
@@ -176,7 +176,7 @@ def _process_exists_windows(pid: int) -> bool:
         return False
     try:
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    except Exception:
+    except OSError:
         return False
 
     process_query_limited_information = 0x1000
@@ -209,7 +209,7 @@ def _process_exists_windows(pid: int) -> bool:
     finally:
         try:
             kernel32.CloseHandle(handle)
-        except Exception:
+        except (OSError, ctypes.ArgumentError):
             pass
 
 
@@ -218,7 +218,7 @@ def _terminate_pid_posix(pid: int, *, timeout_s: float) -> bool:
         os.kill(pid, signal.SIGTERM)
     except ProcessLookupError:
         return True
-    except Exception:
+    except OSError:
         return False
     deadline = time.monotonic() + max(0.1, float(timeout_s))
     while time.monotonic() < deadline:
@@ -229,7 +229,7 @@ def _terminate_pid_posix(pid: int, *, timeout_s: float) -> bool:
         os.kill(pid, signal.SIGKILL)
     except ProcessLookupError:
         return True
-    except Exception:
+    except OSError:
         return False
     deadline = time.monotonic() + 0.5
     while time.monotonic() < deadline:
@@ -244,7 +244,7 @@ def _terminate_pid_windows(pid: int, *, timeout_s: float) -> bool:
         return False
     try:
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    except Exception:
+    except OSError:
         return False
 
     process_terminate = 0x0001
@@ -286,7 +286,7 @@ def _terminate_pid_windows(pid: int, *, timeout_s: float) -> bool:
     finally:
         try:
             kernel32.CloseHandle(handle)
-        except Exception:
+        except (OSError, ctypes.ArgumentError):
             pass
 
 
@@ -365,7 +365,7 @@ def _start_parent_watchdog_thread(*, expected_parent_pid: int) -> None:
 def _configure_linux_pdeathsig(*, expected_parent_pid: int) -> bool:
     try:
         libc = ctypes.CDLL("libc.so.6", use_errno=True)
-    except Exception:
+    except OSError:
         return False
     prctl = getattr(libc, "prctl", None)
     if prctl is None:
@@ -413,7 +413,7 @@ class ProcessGuardian:
         if sys.platform == "win32":
             try:
                 self._job = _WindowsJobObject()
-            except Exception as exc:
+            except (OSError, RuntimeError) as exc:
                 self._job = None
                 self._init_error = str(exc)
 
@@ -549,7 +549,7 @@ class _WindowsJobObject:
         finally:
             try:
                 self._kernel32.CloseHandle(proc_handle)
-            except Exception:
+            except (OSError, ctypes.ArgumentError):
                 pass
 
     def close(self) -> None:
@@ -558,6 +558,6 @@ class _WindowsJobObject:
             return
         try:
             self._kernel32.CloseHandle(handle)
-        except Exception:
+        except (OSError, ctypes.ArgumentError):
             pass
         self._handle = None

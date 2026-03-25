@@ -152,6 +152,8 @@ class SequencerRuntime:
         self._loops_completed = 0
         self._vars_override_active: dict[str, Any] = {}
         self._use_stack: list[str] = []
+        self._step_handlers: dict[type[Any], Callable[[Any], bool]] = {}
+        self._register_step_handlers()
 
     @property
     def state(self) -> str:
@@ -791,159 +793,200 @@ class SequencerRuntime:
 
     def _execute_step(self, step: Step) -> bool:
         self._current_step = type(step).__name__
-        if isinstance(step, ParallelStep):
-            self._last_error = "parallel not supported in v1"
-            self._state = "ERROR"
-            return True
-        if isinstance(step, PauseStep):
-            self._pause_requested = True
-            self._state = "PAUSED"
-            return True
-        if isinstance(step, SleepStep):
-            seconds = float(render_templates(step.seconds, self._env_view()))
-            self._sleep_until = time.monotonic() + seconds
-            return True
-        if isinstance(step, WaitUntilStep):
-            self._start_wait_until(step.raw)
-            return True
-        if isinstance(step, ForStep):
-            parent_index = self._env.get("__loop_index")
-            serpentine_index = int(parent_index) if parent_index is not None else None
-            records = self._resolve_iterable(
-                step.in_expr, serpentine_index=serpentine_index
-            )
-            self._stack.append(_ForFrame(dict(step.bind), records, 0, step.body))
+        handler = self._resolve_step_handler(step)
+        if handler is None:
             return False
-        if isinstance(step, RepeatStep):
-            times = int(render_templates(step.times, self._env_view()))
-            self._stack.append(_RepeatFrame(times, step.body))
-            return False
-        if isinstance(step, IfStep):
-            ok = self._eval_condition_safe(step.condition)
-            branch = step.then_steps if ok else (step.else_steps or [])
-            self._stack.append(_Frame(branch))
-            return False
-        if isinstance(step, WhileStep):
-            self._stack.append(_WhileFrame(step.condition, step.body))
-            return False
-        if isinstance(step, AtomicStep):
-            self._atomic_depth += 1
+        return handler(step)
 
-            def _exit() -> None:
-                self._atomic_depth -= 1
+    def _register_step_handlers(self) -> None:
+        self._step_handlers = {
+            ParallelStep: self._execute_parallel_step,
+            PauseStep: self._execute_pause_step,
+            SleepStep: self._execute_sleep_step,
+            WaitUntilStep: self._execute_wait_until_step,
+            ForStep: self._execute_for_step,
+            RepeatStep: self._execute_repeat_step,
+            IfStep: self._execute_if_step,
+            WhileStep: self._execute_while_step,
+            AtomicStep: self._execute_atomic_step,
+            AssignStep: self._execute_assign_step,
+            SetContextStep: self._execute_set_context_step,
+            UseStep: self._execute_use_step,
+            AdaptiveStep: self._execute_adaptive_step,
+            SetStep: self._execute_set_step,
+            CallStep: self._execute_call_step,
+        }
 
-            self._stack.append(_Frame(step.body, on_exit=_exit))
-            return False
-        if isinstance(step, AssignStep):
-            for key, value in step.values.items():
-                self._env[str(key)] = self._resolve_value(value)
-            return False
-        if isinstance(step, SetContextStep):
-            self._context_id += 1
-            ctx_id = self._context_id
-            fields = render_templates(step.fields, self._env_view())
-            for item in self._normalize_streams(step.streams):
-                device, stream = item
+    def _resolve_step_handler(self, step: Step) -> Callable[[Any], bool] | None:
+        step_type = type(step)
+        cached = self._step_handlers.get(step_type)
+        if cached is not None:
+            return cached
+        for registered_type, handler in self._step_handlers.items():
+            if isinstance(step, registered_type):
+                self._step_handlers[step_type] = handler
+                return handler
+        return None
+
+    def _fail_step(self, message: str) -> bool:
+        self._last_error = str(message)
+        self._state = "ERROR"
+        return True
+
+    def _execute_parallel_step(self, step: ParallelStep) -> bool:
+        del step
+        return self._fail_step("parallel not supported in v1")
+
+    def _execute_pause_step(self, step: PauseStep) -> bool:
+        del step
+        self._pause_requested = True
+        self._state = "PAUSED"
+        return True
+
+    def _execute_sleep_step(self, step: SleepStep) -> bool:
+        seconds = float(render_templates(step.seconds, self._env_view()))
+        self._sleep_until = time.monotonic() + seconds
+        return True
+
+    def _execute_wait_until_step(self, step: WaitUntilStep) -> bool:
+        self._start_wait_until(step.raw)
+        return True
+
+    def _execute_for_step(self, step: ForStep) -> bool:
+        parent_index = self._env.get("__loop_index")
+        serpentine_index = int(parent_index) if parent_index is not None else None
+        records = self._resolve_iterable(step.in_expr, serpentine_index=serpentine_index)
+        self._stack.append(_ForFrame(dict(step.bind), records, 0, step.body))
+        return False
+
+    def _execute_repeat_step(self, step: RepeatStep) -> bool:
+        times = int(render_templates(step.times, self._env_view()))
+        self._stack.append(_RepeatFrame(times, step.body))
+        return False
+
+    def _execute_if_step(self, step: IfStep) -> bool:
+        ok = self._eval_condition_safe(step.condition)
+        branch = step.then_steps if ok else (step.else_steps or [])
+        self._stack.append(_Frame(branch))
+        return False
+
+    def _execute_while_step(self, step: WhileStep) -> bool:
+        self._stack.append(_WhileFrame(step.condition, step.body))
+        return False
+
+    def _execute_atomic_step(self, step: AtomicStep) -> bool:
+        self._atomic_depth += 1
+
+        def _exit() -> None:
+            self._atomic_depth -= 1
+
+        self._stack.append(_Frame(step.body, on_exit=_exit))
+        return False
+
+    def _execute_assign_step(self, step: AssignStep) -> bool:
+        for key, value in step.values.items():
+            self._env[str(key)] = self._resolve_value(value)
+        return False
+
+    def _execute_set_context_step(self, step: SetContextStep) -> bool:
+        self._context_id += 1
+        ctx_id = self._context_id
+        fields = render_templates(step.fields, self._env_view())
+        try:
+            for device, stream in self._normalize_streams(step.streams):
                 self._set_stream_context(device, stream, ctx_id, fields)
-            return False
-        if isinstance(step, UseStep):
-            sequence_name = str(step.sequence_id).strip()
-            if sequence_name in self._use_stack:
-                cycle = " -> ".join([*self._use_stack, sequence_name])
-                raise RuntimeError(f"recursive use sequence detected: {cycle}")
-            spec = self._resolve_use_spec(step.sequence_id)
-            merged_vars = self._merged_use_vars(spec, step.args)
-            previous_vars = dict(self._vars)
-            self._use_stack.append(sequence_name)
+        except Exception as e:
+            return self._fail_step(f"set_context failed: {e}")
+        return False
 
-            def _restore_vars() -> None:
-                self._vars = previous_vars
-                if self._use_stack and self._use_stack[-1] == sequence_name:
-                    self._use_stack.pop()
-                elif sequence_name in self._use_stack:
-                    self._use_stack.remove(sequence_name)
+    def _execute_use_step(self, step: UseStep) -> bool:
+        sequence_name = str(step.sequence_id).strip()
+        if sequence_name in self._use_stack:
+            cycle = " -> ".join([*self._use_stack, sequence_name])
+            raise RuntimeError(f"recursive use sequence detected: {cycle}")
+        spec = self._resolve_use_spec(step.sequence_id)
+        merged_vars = self._merged_use_vars(spec, step.args)
+        previous_vars = dict(self._vars)
+        self._use_stack.append(sequence_name)
 
-            self._vars = merged_vars
-            self._stack.append(_Frame(spec.steps, on_exit=_restore_vars))
-            return False
-        if isinstance(step, AdaptiveStep):
-            if step.constraints:
-                self._last_error = "adaptive.constraints are not supported in v1"
-                self._state = "ERROR"
-                return True
-            rendered_controller = render_templates(step.controller, self._env_view())
-            if not isinstance(rendered_controller, dict):
-                self._last_error = "adaptive.controller must render to a dict"
-                self._state = "ERROR"
-                return True
-            rendered_space = render_templates(step.space, self._env_view())
-            if not isinstance(rendered_space, dict):
-                self._last_error = "adaptive.space must render to a dict"
-                self._state = "ERROR"
-                return True
-            controller = self._create_adaptive_controller(
-                step,
-                rendered_controller=rendered_controller,
-                rendered_space=rendered_space,
-            )
-            replayed_trials = self._prepare_adaptive_study(
+        def _restore_vars() -> None:
+            self._vars = previous_vars
+            if self._use_stack and self._use_stack[-1] == sequence_name:
+                self._use_stack.pop()
+            elif sequence_name in self._use_stack:
+                self._use_stack.remove(sequence_name)
+
+        self._vars = merged_vars
+        self._stack.append(_Frame(spec.steps, on_exit=_restore_vars))
+        return False
+
+    def _execute_adaptive_step(self, step: AdaptiveStep) -> bool:
+        if step.constraints:
+            return self._fail_step("adaptive.constraints are not supported in v1")
+        rendered_controller = render_templates(step.controller, self._env_view())
+        if not isinstance(rendered_controller, dict):
+            return self._fail_step("adaptive.controller must render to a dict")
+        rendered_space = render_templates(step.space, self._env_view())
+        if not isinstance(rendered_space, dict):
+            return self._fail_step("adaptive.space must render to a dict")
+        controller = self._create_adaptive_controller(
+            step,
+            rendered_controller=rendered_controller,
+            rendered_space=rendered_space,
+        )
+        replayed_trials = self._prepare_adaptive_study(
+            step=step,
+            controller=controller,
+            rendered_controller=rendered_controller,
+            rendered_space=rendered_space,
+        )
+        self._stack.append(
+            _AdaptiveFrame(
                 step=step,
+                study_id=step.id,
                 controller=controller,
                 rendered_controller=rendered_controller,
                 rendered_space=rendered_space,
+                started_t=time.monotonic(),
+                trials_completed=replayed_trials,
             )
-            self._stack.append(
-                _AdaptiveFrame(
-                    step=step,
-                    study_id=step.id,
-                    controller=controller,
-                    rendered_controller=rendered_controller,
-                    rendered_space=rendered_space,
-                    started_t=time.monotonic(),
-                    trials_completed=replayed_trials,
-                )
+        )
+        return False
+
+    def _execute_set_step(self, step: SetStep) -> bool:
+        value = render_templates(step.value, self._env_view())
+        resp = self._call_device(step.device, "set", {"name": step.name, "value": value})
+        if not resp.get("ok", False):
+            return self._fail_step(str(resp.get("error")))
+        return False
+
+    def _execute_call_step(self, step: CallStep) -> bool:
+        params = render_templates(step.params, self._env_view())
+        resp = self._call_device(step.device, step.action, params)
+        if step.save_as:
+            self._env[step.save_as] = resp
+        if step.extract and step.assign:
+            return self._fail_step("extract and assign are mutually exclusive")
+        if step.extract:
+            value = extract_value(
+                resp.get("result"),
+                kind=step.extract.get("kind", "scalar"),
+                ref=step.extract.get("ref"),
             )
-            return False
-        if isinstance(step, SetStep):
-            value = render_templates(step.value, self._env_view())
-            resp = self._call_device(step.device, "set", {"name": step.name, "value": value})
-            if not resp.get("ok", False):
-                self._last_error = str(resp.get("error"))
-                self._state = "ERROR"
-                return True
-            return False
-        if isinstance(step, CallStep):
-            params = render_templates(step.params, self._env_view())
-            resp = self._call_device(step.device, step.action, params)
-            if step.save_as:
-                self._env[step.save_as] = resp
-            if step.extract and step.assign:
-                self._last_error = "extract and assign are mutually exclusive"
-                self._state = "ERROR"
-                return True
-            if step.extract:
-                value = extract_value(
-                    resp.get("result"),
-                    kind=step.extract.get("kind", "scalar"),
-                    ref=step.extract.get("ref"),
+            target = step.save_as or "value"
+            self._env[target] = value
+        if step.assign:
+            result = resp.get("result")
+            for key, spec in step.assign.items():
+                if not isinstance(spec, dict):
+                    continue
+                self._env[key] = extract_value(
+                    result,
+                    kind=spec.get("kind", "scalar"),
+                    ref=spec.get("ref"),
                 )
-                target = step.save_as or "value"
-                self._env[target] = value
-            if step.assign:
-                result = resp.get("result")
-                for key, spec in step.assign.items():
-                    if not isinstance(spec, dict):
-                        continue
-                    self._env[key] = extract_value(
-                        result,
-                        kind=spec.get("kind", "scalar"),
-                        ref=spec.get("ref"),
-                    )
-            if not resp.get("ok", False):
-                self._last_error = str(resp.get("error"))
-                self._state = "ERROR"
-                return True
-            return False
+        if not resp.get("ok", False):
+            return self._fail_step(str(resp.get("error")))
         return False
 
     def _normalize_streams(self, streams: Any) -> list[tuple[str, str]]:

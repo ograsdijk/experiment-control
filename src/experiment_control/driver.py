@@ -8,13 +8,16 @@ import os
 import sys
 import time
 import typing
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Protocol, cast
+from typing import Any, Protocol, cast
 
 import numpy as np
 import zmq
 
+from .contracts.messages import RpcActionRequest
+from .driver_stream_wrappers import build_stream_wrapper
 from .shm.shm_ring import ShmRingWriter, now_mono_ns, now_wall_ns
 from .types import (
     DeviceState,
@@ -30,6 +33,7 @@ from .types import (
     TelemetryQuality,
     Timestamp,
 )
+from .utils.rpc_dispatch import RpcDispatchRegistry
 from .utils.value_coercion import coerce_scalar
 
 
@@ -647,6 +651,7 @@ class DeviceRunner:
         self._stream_context: dict[str, dict[str, Any]] = {}
         self._init_stream_schema()
         self._init_stream_wrappers()
+        self._rpc_registry = self._build_rpc_registry()
 
     # ----------------------------
     # Public lifecycle API
@@ -1025,6 +1030,254 @@ class DeviceRunner:
         except TypeError as e:
             raise TypeError(f"Bad parameters for command {action!r}: {e}") from e
 
+    @staticmethod
+    def _rpc_ok(req_id: Any, result: Any) -> dict[str, Any]:
+        return {"id": req_id, "status": "OK", "result": result}
+
+    @staticmethod
+    def _rpc_error(
+        req_id: Any,
+        error: str,
+        *,
+        error_code: str | None = None,
+    ) -> dict[str, Any]:
+        resp: dict[str, Any] = {"id": req_id, "status": "ERROR", "error": str(error)}
+        if error_code is not None:
+            resp["error_code"] = error_code
+        return resp
+
+    def _ensure_rpc_registry(self) -> RpcDispatchRegistry:
+        registry = getattr(self, "_rpc_registry", None)
+        if isinstance(registry, RpcDispatchRegistry):
+            return registry
+        registry = self._build_rpc_registry()
+        self._rpc_registry = registry
+        return registry
+
+    def _build_rpc_registry(self) -> RpcDispatchRegistry:
+        return RpcDispatchRegistry(
+            handlers={
+                "shutdown": self._rpc_route_shutdown,
+                "capabilities": self._rpc_route_capabilities,
+                "refresh_capabilities": self._rpc_route_refresh_capabilities,
+                "get": self._rpc_route_get,
+                "set": self._rpc_route_set,
+                "status": self._rpc_route_status,
+                "collect_run_metadata": self._rpc_route_collect_run_metadata,
+                "identity": self._rpc_route_identity,
+                "connect_device": self._rpc_route_connect_device,
+                "disconnect_device": self._rpc_route_disconnect_device,
+                "stream.context.set": self._rpc_route_stream_context_set,
+                "stream.context.clear": self._rpc_route_stream_context_clear,
+            }
+        )
+
+    def _rpc_route_shutdown(self, req: dict[str, Any]) -> dict[str, Any]:
+        req_id = req.get("id")
+        self._stop = True
+        return self._rpc_ok(req_id, None)
+
+    def _rpc_route_capabilities(self, req: dict[str, Any]) -> dict[str, Any]:
+        req_id = req.get("id")
+        return self._rpc_ok(req_id, self.capabilities())
+
+    def _rpc_route_refresh_capabilities(self, req: dict[str, Any]) -> dict[str, Any]:
+        req_id = req.get("id")
+        if self._device_state == DeviceState.DISCONNECTED:
+            return self._rpc_ok(req_id, {"version": 1, "members": []})
+        try:
+            self._refresh_capabilities_cache()
+        except Exception as e:
+            self._last_error = f"capabilities discovery failed: {e!r}"
+            return self._rpc_error(req_id, self._last_error)
+        return self._rpc_ok(req_id, self.capabilities())
+
+    def _rpc_route_get(self, req: dict[str, Any]) -> dict[str, Any]:
+        req_id = req.get("id")
+        params = req.get("params", {})
+        if self._device_state == DeviceState.DISCONNECTED:
+            return self._rpc_error(req_id, "Device is disconnected")
+        name = params.get("name")
+        if (
+            not isinstance(name, str)
+            or name.startswith("_")
+            or name in {"connect", "disconnect"}
+        ):
+            return self._rpc_error(req_id, "Invalid member name")
+        value = getattr(self._device, name)
+        return self._rpc_ok(req_id, _jsonable_value(value))
+
+    def _rpc_route_set(self, req: dict[str, Any]) -> dict[str, Any]:
+        req_id = req.get("id")
+        params = req.get("params", {})
+        if self._device_state == DeviceState.DISCONNECTED:
+            return self._rpc_error(req_id, "Device is disconnected")
+        name = params.get("name")
+        if (
+            not isinstance(name, str)
+            or name.startswith("_")
+            or name in {"connect", "disconnect"}
+        ):
+            return self._rpc_error(req_id, "Invalid member name")
+        if self._members_cache is None:
+            self._refresh_capabilities_cache()
+        spec = (self._members_cache or {}).get(name)
+        if spec is None:
+            return self._rpc_error(req_id, "Unknown member")
+        if not spec.settable:
+            return self._rpc_error(req_id, "Member is not settable")
+        value = params.get("value")
+        kind = _parse_simple_annotation(spec.value_annotation)
+        if kind is not None:
+            try:
+                value = _coerce_simple_value(value, kind)
+            except Exception:
+                return self._rpc_error(req_id, "Failed to coerce value")
+        setattr(self._device, name, value)
+        return self._rpc_ok(req_id, None)
+
+    def _rpc_route_status(self, req: dict[str, Any]) -> dict[str, Any]:
+        req_id = req.get("id")
+        return self._rpc_ok(
+            req_id,
+            {
+                "driver_state": self._driver_state().value,
+                "device_reachable": bool(self._device_reachable),
+                "device_state": self._device_state.value,
+                "last_ok_wall": self._last_ok_ts.t_wall if self._last_ok_ts else None,
+                "last_ok_mono": self._last_ok_ts.t_mono if self._last_ok_ts else None,
+                "last_error": self._last_error,
+            },
+        )
+
+    def _rpc_route_collect_run_metadata(self, req: dict[str, Any]) -> dict[str, Any]:
+        req_id = req.get("id")
+        if self._device_state == DeviceState.DISCONNECTED:
+            return self._rpc_error(req_id, "Device is disconnected")
+        return self._rpc_ok(req_id, self.collect_run_metadata())
+
+    def _rpc_route_identity(self, req: dict[str, Any]) -> dict[str, Any]:
+        req_id = req.get("id")
+        func = getattr(self._device, "identity", None)
+        if func is None or not callable(func):
+            return self._rpc_error(
+                req_id,
+                "identity not supported",
+                error_code="identity_not_supported",
+            )
+        result = func()
+        return self._rpc_ok(req_id, _jsonable_value(result))
+
+    def _rpc_route_connect_device(self, req: dict[str, Any]) -> dict[str, Any]:
+        req_id = req.get("id")
+        if self._device_state != DeviceState.DISCONNECTED:
+            return self._rpc_error(
+                req_id, f"Device is already connected ({self._device_state.value})"
+            )
+        self._connect_called = True
+        self.connect_device()
+        self._device_reachable = True
+        self._device_state = DeviceState.OK
+        self._last_ok_ts = self._now()
+        self._last_error = None
+        try:
+            self._refresh_capabilities_cache()
+        except Exception:
+            pass
+        return self._rpc_ok(req_id, None)
+
+    def _rpc_route_disconnect_device(self, req: dict[str, Any]) -> dict[str, Any]:
+        req_id = req.get("id")
+        if self._device_state == DeviceState.DISCONNECTED:
+            return self._rpc_error(req_id, "Device is already disconnected")
+        self.disconnect_device()
+        self._device_reachable = False
+        self._device_state = DeviceState.DISCONNECTED
+        self._capabilities_cache = None
+        self._members_cache = None
+        return self._rpc_ok(req_id, None)
+
+    def _rpc_route_stream_context_set(self, req: dict[str, Any]) -> dict[str, Any]:
+        req_id = req.get("id")
+        params = req.get("params", {})
+        stream = params.get("stream")
+        context_id = params.get("context_id")
+        fields = params.get("fields", {})
+        if not isinstance(stream, str) or not stream:
+            return self._rpc_error(req_id, "stream must be a non-empty string")
+        if stream not in self._stream_outputs:
+            return self._rpc_error(req_id, f"Unknown stream {stream!r}")
+        if context_id is None:
+            return self._rpc_error(req_id, "context_id required")
+        try:
+            ctx_id_int = int(context_id)
+        except Exception:
+            return self._rpc_error(req_id, "context_id must be int")
+        if fields is None:
+            fields = {}
+        if not isinstance(fields, dict):
+            return self._rpc_error(req_id, "fields must be a dict")
+        self._stream_context[stream] = {
+            "context_id": ctx_id_int,
+            "context_fields": fields,
+        }
+        return self._rpc_ok(req_id, None)
+
+    def _rpc_route_stream_context_clear(self, req: dict[str, Any]) -> dict[str, Any]:
+        req_id = req.get("id")
+        params = req.get("params", {})
+        stream = params.get("stream")
+        if stream is None:
+            self._stream_context.clear()
+            return self._rpc_ok(req_id, None)
+        if isinstance(stream, str):
+            self._stream_context.pop(stream, None)
+            return self._rpc_ok(req_id, None)
+        return self._rpc_error(req_id, "stream must be a string")
+
+    def _rpc_dispatch_device_command(self, req: dict[str, Any]) -> dict[str, Any]:
+        req_id = req.get("id")
+        action = str(req.get("action", ""))
+        params = req.get("params", {})
+
+        # Guard: if disconnected, do not forward arbitrary commands.
+        if self._device_state == DeviceState.DISCONNECTED:
+            return self._rpc_error(req_id, "Device is disconnected")
+
+        if action in self._stream_rpc:
+            result = self._stream_rpc[action](**params)
+            self._device_reachable = True
+            self._last_ok_ts = self._now()
+            self._last_error = None
+            return self._rpc_ok(req_id, result)
+
+        # Forward to subclass command handler (with optional coercion).
+        if self._members_cache is None:
+            self._refresh_capabilities_cache()
+        spec = (self._members_cache or {}).get(action)
+        if spec is not None and spec.kind == "method" and spec.params:
+            coerced = dict(params)
+            for param in spec.params:
+                if param.name in coerced:
+                    kind = _parse_simple_annotation(param.annotation)
+                    if kind is None:
+                        continue
+                    try:
+                        coerced[param.name] = _coerce_simple_value(
+                            coerced[param.name], kind
+                        )
+                    except Exception as e:
+                        raise TypeError(
+                            f"Bad parameters for command {action!r}: {param.name} ({e})"
+                        ) from e
+            params = coerced
+
+        result = self.handle_command(action, params)
+        self._device_reachable = True
+        self._last_ok_ts = self._now()
+        self._last_error = None
+        return self._rpc_ok(req_id, result)
+
     def _handle_rpc_request(self, req: dict[str, Any]) -> dict[str, Any]:
         """
         RPC request format (simple):
@@ -1033,294 +1286,24 @@ class DeviceRunner:
         Response:
         {"id": ..., "status": "OK|ERROR", "result": ..., "error": ...}
         """
-        req_id = req.get("id")
-        action = req.get("action")
-        params = req.get("params", {})
-
-        if not isinstance(action, str) or not isinstance(params, dict):
+        rpc = RpcActionRequest.parse(
+            req,
+            action_field="action",
+            request_id_field="id",
+            fallback_action_field="type",
+        )
+        if rpc is None:
+            req_id = req.get("id")
             return {"id": req_id, "status": "ERROR", "error": "Malformed request"}
-
+        rpc_req = rpc.as_dispatch_payload(request_id_field="id")
         try:
-            if action == "shutdown":
-                self._stop = True
-                return {"id": req_id, "status": "OK", "result": None}
-
-            if action == "capabilities":
-                return {"id": req_id, "status": "OK", "result": self.capabilities()}
-
-            if action == "refresh_capabilities":
-                if self._device_state == DeviceState.DISCONNECTED:
-                    return {
-                        "id": req_id,
-                        "status": "OK",
-                        "result": {"version": 1, "members": []},
-                    }
-                try:
-                    self._refresh_capabilities_cache()
-                except Exception as e:
-                    self._last_error = f"capabilities discovery failed: {e!r}"
-                    return {
-                        "id": req_id,
-                        "status": "ERROR",
-                        "error": self._last_error,
-                    }
-                return {"id": req_id, "status": "OK", "result": self.capabilities()}
-
-            if action == "get":
-                if self._device_state == DeviceState.DISCONNECTED:
-                    return {
-                        "id": req_id,
-                        "status": "ERROR",
-                        "error": "Device is disconnected",
-                    }
-                name = params.get("name")
-                if (
-                    not isinstance(name, str)
-                    or name.startswith("_")
-                    or name in {"connect", "disconnect"}
-                ):
-                    return {
-                        "id": req_id,
-                        "status": "ERROR",
-                        "error": "Invalid member name",
-                    }
-                value = getattr(self._device, name)
-                return {
-                    "id": req_id,
-                    "status": "OK",
-                    "result": _jsonable_value(value),
-                }
-
-            if action == "set":
-                if self._device_state == DeviceState.DISCONNECTED:
-                    return {
-                        "id": req_id,
-                        "status": "ERROR",
-                        "error": "Device is disconnected",
-                    }
-                name = params.get("name")
-                if (
-                    not isinstance(name, str)
-                    or name.startswith("_")
-                    or name in {"connect", "disconnect"}
-                ):
-                    return {
-                        "id": req_id,
-                        "status": "ERROR",
-                        "error": "Invalid member name",
-                    }
-                if self._members_cache is None:
-                    self._refresh_capabilities_cache()
-                spec = (self._members_cache or {}).get(name)
-                if spec is None:
-                    return {
-                        "id": req_id,
-                        "status": "ERROR",
-                        "error": "Unknown member",
-                    }
-                if not spec.settable:
-                    return {
-                        "id": req_id,
-                        "status": "ERROR",
-                        "error": "Member is not settable",
-                    }
-                value = params.get("value")
-                kind = _parse_simple_annotation(spec.value_annotation)
-                if kind is not None:
-                    try:
-                        value = _coerce_simple_value(value, kind)
-                    except Exception:
-                        return {
-                            "id": req_id,
-                            "status": "ERROR",
-                            "error": "Failed to coerce value",
-                        }
-                setattr(self._device, name, value)
-                return {"id": req_id, "status": "OK", "result": None}
-
-            if action == "status":
-                return {
-                    "id": req_id,
-                    "status": "OK",
-                    "result": {
-                        "driver_state": self._driver_state().value,
-                        "device_reachable": bool(self._device_reachable),
-                        "device_state": self._device_state.value,
-                        "last_ok_wall": self._last_ok_ts.t_wall
-                        if self._last_ok_ts
-                        else None,
-                        "last_ok_mono": self._last_ok_ts.t_mono
-                        if self._last_ok_ts
-                        else None,
-                        "last_error": self._last_error,
-                    },
-                }
-
-            if action == "collect_run_metadata":
-                if self._device_state == DeviceState.DISCONNECTED:
-                    return {
-                        "id": req_id,
-                        "status": "ERROR",
-                        "error": "Device is disconnected",
-                    }
-                result = self.collect_run_metadata()
-                return {"id": req_id, "status": "OK", "result": result}
-
-            if action == "identity":
-                func = getattr(self._device, "identity", None)
-                if func is None or not callable(func):
-                    return {
-                        "id": req_id,
-                        "status": "ERROR",
-                        "error": "identity not supported",
-                        "error_code": "identity_not_supported",
-                    }
-                result = func()
-                return {
-                    "id": req_id,
-                    "status": "OK",
-                    "result": _jsonable_value(result),
-                }
-
-            if action == "connect_device":
-                if self._device_state != DeviceState.DISCONNECTED:
-                    return {
-                        "id": req_id,
-                        "status": "ERROR",
-                        "error": f"Device is already connected ({self._device_state.value})",
-                    }
-                self._connect_called = True
-                self.connect_device()
-                self._device_reachable = True
-                self._device_state = DeviceState.OK
-                self._last_ok_ts = self._now()
-                self._last_error = None
-                try:
-                    self._refresh_capabilities_cache()
-                except Exception:
-                    pass
-                return {"id": req_id, "status": "OK", "result": None}
-
-            if action == "disconnect_device":
-                if self._device_state == DeviceState.DISCONNECTED:
-                    return {
-                        "id": req_id,
-                        "status": "ERROR",
-                        "error": "Device is already disconnected",
-                    }
-                self.disconnect_device()
-                self._device_reachable = False
-                self._device_state = DeviceState.DISCONNECTED
-                self._capabilities_cache = None
-                self._members_cache = None
-                return {"id": req_id, "status": "OK", "result": None}
-
-            if action == "stream.context.set":
-                stream = params.get("stream")
-                context_id = params.get("context_id")
-                fields = params.get("fields", {})
-                if not isinstance(stream, str) or not stream:
-                    return {
-                        "id": req_id,
-                        "status": "ERROR",
-                        "error": "stream must be a non-empty string",
-                    }
-                if stream not in self._stream_outputs:
-                    return {
-                        "id": req_id,
-                        "status": "ERROR",
-                        "error": f"Unknown stream {stream!r}",
-                    }
-                if context_id is None:
-                    return {
-                        "id": req_id,
-                        "status": "ERROR",
-                        "error": "context_id required",
-                    }
-                try:
-                    ctx_id_int = int(context_id)
-                except Exception:
-                    return {
-                        "id": req_id,
-                        "status": "ERROR",
-                        "error": "context_id must be int",
-                    }
-                if fields is None:
-                    fields = {}
-                if not isinstance(fields, dict):
-                    return {
-                        "id": req_id,
-                        "status": "ERROR",
-                        "error": "fields must be a dict",
-                    }
-                self._stream_context[stream] = {
-                    "context_id": ctx_id_int,
-                    "context_fields": fields,
-                }
-                return {"id": req_id, "status": "OK", "result": None}
-
-            if action == "stream.context.clear":
-                stream = params.get("stream")
-                if stream is None:
-                    self._stream_context.clear()
-                else:
-                    if isinstance(stream, str):
-                        self._stream_context.pop(stream, None)
-                    else:
-                        return {
-                            "id": req_id,
-                            "status": "ERROR",
-                            "error": "stream must be a string",
-                        }
-                return {"id": req_id, "status": "OK", "result": None}
-
-            # Guard: if disconnected, do not forward arbitrary commands
-            if self._device_state == DeviceState.DISCONNECTED:
-                return {
-                    "id": req_id,
-                    "status": "ERROR",
-                    "error": "Device is disconnected",
-                }
-
-            if action in self._stream_rpc:
-                result = self._stream_rpc[action](**params)
-                self._device_reachable = True
-                self._last_ok_ts = self._now()
-                self._last_error = None
-                return {"id": req_id, "status": "OK", "result": result}
-
-            # Forward to subclass command handler (with optional coercion)
-            if self._members_cache is None:
-                self._refresh_capabilities_cache()
-            spec = (self._members_cache or {}).get(action)
-            if spec is not None and spec.kind == "method" and spec.params:
-                coerced = dict(params)
-                for param in spec.params:
-                    if param.name in coerced:
-                        kind = _parse_simple_annotation(param.annotation)
-                        if kind is None:
-                            continue
-                        try:
-                            coerced[param.name] = _coerce_simple_value(
-                                coerced[param.name], kind
-                            )
-                        except Exception as e:
-                            raise TypeError(
-                                f"Bad parameters for command {action!r}: {param.name} ({e})"
-                            ) from e
-                params = coerced
-
-            result = self.handle_command(action, params)
-
-            self._device_reachable = True
-            self._last_ok_ts = self._now()
-            self._last_error = None
-
-            return {"id": req_id, "status": "OK", "result": result}
-
+            routed = self._ensure_rpc_registry().dispatch(rpc_req)
+            if routed is not None:
+                return routed
+            return self._rpc_dispatch_device_command(rpc_req)
         except Exception as e:
-            self._last_error = f"command {action} failed: {e!r}"
-            return {"id": req_id, "status": "ERROR", "error": str(e)}
+            self._last_error = f"command {rpc.action} failed: {e!r}"
+            return {"id": rpc.request_id, "status": "ERROR", "error": str(e)}
 
     # ----------------------------
     # Internal helpers
@@ -1393,143 +1376,8 @@ class DeviceRunner:
 
     def _init_stream_wrappers(self) -> None:
         for call in self._stream_calls:
-            method = call.method
-            action_name = f"stream__{method}"
-
-            def _make_wrapper(stream_call: StreamCall) -> Callable[..., Any]:
-                def _as_shot_list(
-                    value: Any,
-                    out: StreamOut,
-                    *,
-                    n_batch: int,
-                    allow_batch: bool,
-                ) -> list[np.ndarray]:
-                    if isinstance(value, np.ndarray):
-                        if tuple(value.shape) == tuple(out.shape):
-                            arr = value
-                            if not arr.flags["C_CONTIGUOUS"]:
-                                arr = np.ascontiguousarray(arr)
-                            return [arr]
-                        if allow_batch and (
-                            value.ndim >= 1
-                            and value.shape[0] == n_batch
-                            and tuple(value.shape[1:]) == tuple(out.shape)
-                        ):
-                            shots = [value[i] for i in range(n_batch)]
-                            out_list: list[np.ndarray] = []
-                            for shot in shots:
-                                arr = np.asarray(shot)
-                                if tuple(arr.shape) != tuple(out.shape):
-                                    raise ValueError(
-                                        f"Stream {out.stream!r} shot shape mismatch: got {arr.shape}, expected {out.shape}"
-                                    )
-                                if not arr.flags["C_CONTIGUOUS"]:
-                                    arr = np.ascontiguousarray(arr)
-                                out_list.append(arr)
-                            return out_list
-                        if allow_batch:
-                            raise ValueError(
-                                f"Stream {out.stream!r} batched shape mismatch: got {value.shape}, expected ({n_batch}, {out.shape})"
-                            )
-                        raise ValueError(
-                            f"Stream {out.stream!r} shot shape mismatch: got {value.shape}, expected {out.shape}"
-                        )
-                    if isinstance(value, (list, tuple)):
-                        expected_len = n_batch if allow_batch else 1
-                        if len(value) != expected_len:
-                            raise ValueError(
-                                f"Stream {out.stream!r} list length {len(value)} != {expected_len}"
-                            )
-                        out_list = []
-                        for item in value:
-                            arr = np.asarray(item)
-                            if tuple(arr.shape) != tuple(out.shape):
-                                raise ValueError(
-                                    f"Stream {out.stream!r} shot shape mismatch: got {arr.shape}, expected {out.shape}"
-                                )
-                                if not arr.flags["C_CONTIGUOUS"]:
-                                    arr = np.ascontiguousarray(arr)
-                                out_list.append(arr)
-                        return out_list
-                    if n_batch == 1:
-                        arr = np.asarray(value)
-                        if tuple(arr.shape) != tuple(out.shape):
-                            raise ValueError(
-                                f"Stream {out.stream!r} shot shape mismatch: got {arr.shape}, expected {out.shape}"
-                            )
-                        if not arr.flags["C_CONTIGUOUS"]:
-                            arr = np.ascontiguousarray(arr)
-                        return [arr]
-                    raise TypeError(
-                        f"Stream {out.stream!r} expected ndarray or list/tuple for n_batch={n_batch}"
-                    )
-
-                def _wrapper(*args: Any, **kwargs: Any) -> Any:
-                    func = getattr(self._device, stream_call.method, None)
-                    if func is None or not callable(func):
-                        raise NotImplementedError(
-                            f"Stream method {stream_call.method!r} not found"
-                        )
-
-                    call_kwargs = dict(stream_call.kwargs or {})
-                    call_kwargs.update(kwargs)
-
-                    n_batch_provided = "n_batch" in call_kwargs
-                    n_batch = int(call_kwargs.pop("n_batch", 1))
-                    if n_batch < 1:
-                        raise ValueError("n_batch must be >= 1")
-
-                    if n_batch_provided:
-                        try:
-                            ret = func(*args, n_batch=n_batch, **call_kwargs)
-                        except TypeError as e:
-                            if "n_batch" in str(e) or "unexpected keyword" in str(e):
-                                raise TypeError(
-                                    f"Stream method {stream_call.method!r} does not support n_batch"
-                                ) from e
-                            raise
-                    else:
-                        ret = func(*args, **call_kwargs)
-
-                    outputs = stream_call.outputs or []
-                    if len(outputs) == 1:
-                        out = outputs[0]
-                        shots = _as_shot_list(
-                            ret, out, n_batch=n_batch, allow_batch=n_batch_provided
-                        )
-                        return [self.publish_stream(out.stream, shot) for shot in shots]
-
-                    if not isinstance(ret, dict):
-                        raise TypeError(
-                            "Stream call with multiple outputs must return dict[str, ndarray|list]"
-                        )
-
-                    shot_lists: dict[str, list[np.ndarray]] = {}
-                    for out in outputs:
-                        if out.stream not in ret:
-                            raise KeyError(
-                                f"Missing stream output {out.stream!r} in return dict"
-                            )
-                        shot_lists[out.stream] = _as_shot_list(
-                            ret[out.stream],
-                            out,
-                            n_batch=n_batch,
-                            allow_batch=n_batch_provided,
-                        )
-
-                    results: list[dict[str, Any]] = []
-                    for i in range(n_batch):
-                        descs: dict[str, Any] = {}
-                        for out in outputs:
-                            descs[out.stream] = self.publish_stream(
-                                out.stream, shot_lists[out.stream][i]
-                            )
-                        results.append(descs)
-                    return results
-
-                return _wrapper
-
-            wrapper = _make_wrapper(call)
+            action_name = f"stream__{call.method}"
+            wrapper = build_stream_wrapper(runner=self, stream_call=call)
             self._stream_rpc[action_name] = wrapper
             setattr(self, action_name, wrapper)
 
@@ -1663,7 +1511,7 @@ class DeviceRunner:
             if isinstance(fields, dict):
                 desc["context_fields"] = fields
 
-        topic = f"{self.device_id}/chunk_ready".encode("utf-8")
+        topic = f"{self.device_id}/chunk_ready".encode()
         payload = {
             "version": 1,
             "device_id": self.device_id,
