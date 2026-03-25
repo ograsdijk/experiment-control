@@ -9,6 +9,110 @@ from .utils.zmq_helpers import safe_json_loads
 Json = dict[str, Any]
 
 
+def _positive_limit(manager: Any, attr: str, default: int) -> int:
+    raw = getattr(manager, attr, default)
+    try:
+        value = int(raw)
+    except Exception:
+        value = default
+    return max(1, value)
+
+
+def _touch_lru(order: dict[str, None], key: str) -> None:
+    if key in order:
+        order.pop(key, None)
+    order[key] = None
+
+
+def _cache_counter_inc(manager: Any, attr: str) -> None:
+    current = int(getattr(manager, attr, 0) or 0)
+    setattr(manager, attr, current + 1)
+
+
+def _ensure_telemetry_device_slot(manager: Any, device_id: str) -> dict[str, Any]:
+    latest = manager._telemetry_latest
+    last_bundle = manager._telemetry_last_bundle_ts
+    order_raw = getattr(manager, "_telemetry_device_order", None)
+    order: dict[str, None]
+    if isinstance(order_raw, dict):
+        order = order_raw
+    else:
+        order = {}
+        setattr(manager, "_telemetry_device_order", order)
+    max_devices = _positive_limit(manager, "_telemetry_cache_max_devices", 4096)
+    if device_id not in latest and len(latest) >= max_devices:
+        oldest = next(iter(order), None)
+        if oldest is None and latest:
+            oldest = next(iter(latest))
+        if oldest is not None:
+            latest.pop(oldest, None)
+            last_bundle.pop(oldest, None)
+            order.pop(oldest, None)
+            _cache_counter_inc(manager, "_telemetry_cache_evicted_devices")
+    cache = latest.setdefault(device_id, {})
+    _touch_lru(order, device_id)
+    return cache
+
+
+def _store_telemetry_signal(
+    manager: Any,
+    *,
+    device_id: str,
+    signal_name: str,
+    value: tuple[Any, Any],
+) -> None:
+    device_cache = _ensure_telemetry_device_slot(manager, device_id)
+    max_signals = _positive_limit(
+        manager, "_telemetry_cache_max_signals_per_device", 4096
+    )
+    if signal_name in device_cache:
+        device_cache.pop(signal_name, None)
+    elif len(device_cache) >= max_signals:
+        oldest_signal = next(iter(device_cache), None)
+        if oldest_signal is not None:
+            device_cache.pop(oldest_signal, None)
+            _cache_counter_inc(manager, "_telemetry_cache_evicted_signals")
+    device_cache[signal_name] = value
+
+
+def _ensure_chunk_device_slot(manager: Any, device_id: str) -> dict[str, Any]:
+    latest = manager._latest_chunk_desc
+    order_raw = getattr(manager, "_chunk_device_order", None)
+    order: dict[str, None]
+    if isinstance(order_raw, dict):
+        order = order_raw
+    else:
+        order = {}
+        setattr(manager, "_chunk_device_order", order)
+    max_devices = _positive_limit(manager, "_chunk_cache_max_devices", 4096)
+    if device_id not in latest and len(latest) >= max_devices:
+        oldest = next(iter(order), None)
+        if oldest is None and latest:
+            oldest = next(iter(latest))
+        if oldest is not None:
+            latest.pop(oldest, None)
+            order.pop(oldest, None)
+            _cache_counter_inc(manager, "_chunk_cache_evicted_devices")
+    cache = latest.setdefault(device_id, {})
+    _touch_lru(order, device_id)
+    return cache
+
+
+def _store_chunk_descriptor(manager: Any, *, device_id: str, stream: str, desc: Json) -> None:
+    device_cache = _ensure_chunk_device_slot(manager, device_id)
+    max_streams = _positive_limit(
+        manager, "_chunk_cache_max_streams_per_device", 2048
+    )
+    if stream in device_cache:
+        device_cache.pop(stream, None)
+    elif len(device_cache) >= max_streams:
+        oldest_stream = next(iter(device_cache), None)
+        if oldest_stream is not None:
+            device_cache.pop(oldest_stream, None)
+            _cache_counter_inc(manager, "_chunk_cache_evicted_streams")
+    device_cache[stream] = desc
+
+
 def _decode_driver_pub_payload(manager: Any, topic: str, payload_b: bytes) -> Json | None:
     msg_any: Any
     try:
@@ -188,7 +292,7 @@ def ingest_telemetry(
             },
         )
         return
-    device_cache = manager._telemetry_latest.setdefault(device_id, {})
+    _ = _ensure_telemetry_device_slot(manager, device_id)
     bad_signals: list[str] = []
     for name, raw_signal in raw_signals.items():
         if not isinstance(name, str) or not isinstance(raw_signal, dict):
@@ -216,8 +320,16 @@ def ingest_telemetry(
             ts=sig_ts,
             quality_source="device",
         )
-        device_cache[name] = (ts, sig)
+        _store_telemetry_signal(
+            manager,
+            device_id=device_id,
+            signal_name=name,
+            value=(ts, sig),
+        )
     manager._telemetry_last_bundle_ts[device_id] = ts
+    order_raw = getattr(manager, "_telemetry_device_order", None)
+    if isinstance(order_raw, dict):
+        _touch_lru(order_raw, device_id)
     if bad_signals:
         _emit_ingest_error(
             manager,
@@ -427,5 +539,10 @@ def ingest_chunk_ready(manager: Any, msg: Json) -> None:
         return
     device_id = str(desc["device_id"])
     stream = str(desc["stream"])
-    manager._latest_chunk_desc.setdefault(device_id, {})[stream] = desc
+    _store_chunk_descriptor(
+        manager,
+        device_id=device_id,
+        stream=stream,
+        desc=desc,
+    )
     manager._publish_manager_event("manager.chunk_ready", desc)

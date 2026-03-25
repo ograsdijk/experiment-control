@@ -8,6 +8,37 @@ from typing import Any
 Json = dict[str, Any]
 
 
+_TRANSIENT_CAPABILITIES_CODES = {
+    "device_rpc_timeout",
+    "device_starting",
+    "device_stopping",
+    "device_rpc_not_ready",
+    "driver_not_running",
+    "gateway_busy",
+    "gateway_timeout",
+}
+
+
+def _is_transient_capabilities_failure(payload: Json) -> bool:
+    action = str(payload.get("action", "") or "").strip().lower()
+    if action != "capabilities":
+        return False
+    err = payload.get("error")
+    if isinstance(err, dict):
+        code = str(err.get("code", "") or "").strip().lower()
+        if code in _TRANSIENT_CAPABILITIES_CODES:
+            return True
+        if bool(err.get("transient")):
+            return True
+        message = str(err.get("message", "") or "").strip().lower()
+        if "resource temporarily unavailable" in message:
+            return True
+    elif isinstance(err, str):
+        if "resource temporarily unavailable" in err.lower():
+            return True
+    return False
+
+
 def _sink_timestamp_text(payload: Json) -> str:
     ts = payload.get("ts")
     t_wall = time.time()
@@ -82,6 +113,8 @@ def _event_log_severity(topic: str, payload: Json) -> str | None:
     if topic == "manager.command":
         ok = payload.get("ok")
         status = str(payload.get("status", "") or "").upper()
+        if ok is False and _is_transient_capabilities_failure(payload):
+            return "warning"
         if ok is False or status == "ERROR":
             return "error"
         return None

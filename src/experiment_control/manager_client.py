@@ -61,7 +61,7 @@ class ManagerClient:
 
     def advertise_process_rpc(self, *, process_id: str, rpc_endpoint: str) -> None:
         payload = {
-            "type": "process.rpc.advertise",
+            "type": "manager.processes.rpc.advertise",
             "process_id": process_id,
             "rpc_endpoint": rpc_endpoint,
         }
@@ -110,7 +110,7 @@ class ManagerClient:
             data["severity"] = severity
         if device_id is not None and "device_id" not in data:
             data["device_id"] = device_id
-        req = {"type": "manager.event.publish", "topic": topic, "payload": data}
+        req = {"type": "manager.events.publish", "topic": topic, "payload": data}
         self.call(req)
 
     def drain_telemetry(self) -> None:
@@ -182,3 +182,4 @@ class ManagerClient:
         out = dict(sample)
         out["age_s"] = age_s
         return out
+

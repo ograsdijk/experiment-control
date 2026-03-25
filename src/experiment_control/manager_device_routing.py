@@ -8,24 +8,7 @@ Json = dict[str, Any]
 
 
 def route_device_request(manager: Any, rtype: Any, req: Json) -> Json | None:
-    handlers: dict[str, Callable[[Any, Json], Json]] = {
-        "command": _route_command,
-        "federation.capabilities.update": _route_federation_capabilities_update,
-        "device.get_status": _route_device_get_status,
-        "device.list_status": _route_device_list_status,
-        "device.driver.start": _route_device_driver_start,
-        "device.driver.stop": _route_device_driver_stop,
-        "device.driver.restart": _route_device_driver_restart,
-        "device.recover": _route_device_recover,
-        "device.connect": _route_device_connect,
-        "device.disconnect": _route_device_disconnect,
-        "device.config.get": _route_device_config_get,
-        "device.config.list": _route_device_config_list,
-        "device.metadata.get": _route_device_metadata_get,
-        "device.metadata.set": _route_device_metadata_set,
-        "device.metadata.clear": _route_device_metadata_clear,
-    }
-    handler = handlers.get(str(rtype))
+    handler = _DEVICE_ROUTE_HANDLERS.get(str(rtype))
     if handler is None:
         return None
     return handler(manager, req)
@@ -573,3 +556,22 @@ def _route_device_metadata_clear(manager: Any, req: Json) -> Json:
     result["changed"] = changed
     result["scope"] = scope
     return {"ok": True, "result": result}
+
+
+_DEVICE_ROUTE_HANDLERS: dict[str, Callable[[Any, Json], Json]] = {
+    "command": _route_command,
+    "federation.capabilities.update": _route_federation_capabilities_update,
+    "device.get_status": _route_device_get_status,
+    "device.list_status": _route_device_list_status,
+    "device.driver.start": _route_device_driver_start,
+    "device.driver.stop": _route_device_driver_stop,
+    "device.driver.restart": _route_device_driver_restart,
+    "device.recover": _route_device_recover,
+    "device.connect": _route_device_connect,
+    "device.disconnect": _route_device_disconnect,
+    "device.config.get": _route_device_config_get,
+    "device.config.list": _route_device_config_list,
+    "device.metadata.get": _route_device_metadata_get,
+    "device.metadata.set": _route_device_metadata_set,
+    "device.metadata.clear": _route_device_metadata_clear,
+}

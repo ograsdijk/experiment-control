@@ -21,29 +21,315 @@ import zmq
 
 from .federation import FederationConfig
 from .federation.hub import FederationHub
-from .utils.config_parsing import (
-    ConfigError,
-    optional_dict,
-    require_dict,
-    require_str,
+from .manager_command_journal import (
+    append_command_journal_entry as shared_append_command_journal_entry,
 )
-from .utils.manager_network import derive_local_connect_endpoint
-from .utils.command_journal import CommandJournal, CommandJournalSettings
-from .utils.command_interceptors import apply_command_interceptor_chain
+from .manager_command_journal import (
+    command_journal_status_payload as shared_command_journal_status_payload,
+)
+from .manager_command_journal import (
+    should_journal_command_action as shared_should_journal_command_action,
+)
 from .manager_device_routing import route_device_request
 from .manager_driver_pub import handle_driver_pub as shared_handle_driver_pub
 from .manager_driver_pub import ingest_chunk_ready as shared_ingest_chunk_ready
 from .manager_driver_pub import ingest_heartbeat as shared_ingest_heartbeat
 from .manager_driver_pub import ingest_telemetry as shared_ingest_telemetry
+from .manager_internal_routes_manager import (
+    route_manager_cleanup_orphans as shared_route_manager_cleanup_orphans,
+)
+from .manager_internal_routes_manager import (
+    route_manager_command_journal_status as shared_route_manager_command_journal_status,
+)
+from .manager_internal_routes_manager import (
+    route_manager_command_journal_tail as shared_route_manager_command_journal_tail,
+)
+from .manager_internal_routes_manager import (
+    route_manager_event_publish as shared_route_manager_event_publish,
+)
+from .manager_internal_routes_manager import (
+    route_manager_identity as shared_route_manager_identity,
+)
+from .manager_internal_routes_manager import (
+    route_manager_log_publish as shared_route_manager_log_publish,
+)
+from .manager_internal_routes_manager import (
+    route_manager_log_tail as shared_route_manager_log_tail,
+)
+from .manager_internal_routes_manager import (
+    route_manager_request as shared_route_manager_request,
+)
+from .manager_internal_routes_manager import (
+    route_manager_shutdown as shared_route_manager_shutdown,
+)
+from .manager_internal_routes_process import (
+    publish_process_command_response as shared_publish_process_command_response,
+)
+from .manager_internal_routes_process import (
+    route_command_interceptor_list as shared_route_command_interceptor_list,
+)
+from .manager_internal_routes_process import (
+    route_command_interceptor_register as shared_route_command_interceptor_register,
+)
+from .manager_internal_routes_process import (
+    route_process_add as shared_route_process_add,
+)
+from .manager_internal_routes_process import (
+    route_process_control as shared_route_process_control,
+)
+from .manager_internal_routes_process import (
+    route_process_get as shared_route_process_get,
+)
+from .manager_internal_routes_process import (
+    route_process_list_status as shared_route_process_list_status,
+)
+from .manager_internal_routes_process import (
+    route_process_remove as shared_route_process_remove,
+)
+from .manager_internal_routes_process import (
+    route_process_request as shared_route_process_request,
+)
+from .manager_internal_routes_process import (
+    route_process_rpc as shared_route_process_rpc,
+)
+from .manager_internal_routes_process import (
+    route_process_rpc_advertise as shared_route_process_rpc_advertise,
+)
+from .manager_internal_rpc import (
+    dispatch_registry_request as shared_dispatch_registry_request,
+)
+from .manager_internal_rpc import (
+    ensure_route_registries as shared_ensure_route_registries,
+)
+from .manager_internal_rpc import handle_internal_rpc as shared_handle_internal_rpc
+from .manager_internal_rpc import (
+    route_internal_request as shared_route_internal_request,
+)
 from .manager_lifecycle import shutdown_cleanup as shared_shutdown_cleanup
 from .manager_lifecycle import startup_sequence as shared_startup_sequence
-from .manager_log_events import maybe_emit_manager_log_sink as shared_maybe_emit_manager_log_sink
+from .manager_log_events import (
+    maybe_emit_manager_log_sink as shared_maybe_emit_manager_log_sink,
+)
 from .manager_log_events import (
     maybe_publish_log_event as shared_maybe_publish_log_event,
 )
+from .manager_logs import (
+    close_manager_log_sink_file as shared_close_manager_log_sink_file,
+)
+from .manager_logs import emit_log as shared_emit_log
+from .manager_logs import emit_log_from_payload as shared_emit_log_from_payload
+from .manager_logs import log_tail as shared_log_tail
+from .manager_logs import log_tail_entry_matches as shared_log_tail_entry_matches
+from .manager_logs import log_tail_entry_t_mono as shared_log_tail_entry_t_mono
+from .manager_logs import log_tail_filters as shared_log_tail_filters
+from .manager_logs import log_tail_matches_contains as shared_log_tail_matches_contains
+from .manager_logs import log_tail_matches_ids as shared_log_tail_matches_ids
+from .manager_logs import log_tail_matches_severity as shared_log_tail_matches_severity
+from .manager_logs import (
+    log_tail_matches_source_kind as shared_log_tail_matches_source_kind,
+)
+from .manager_logs import log_tail_matches_time as shared_log_tail_matches_time
+from .manager_logs import manager_log_sink_event as shared_manager_log_sink_event
+from .manager_logs import (
+    manager_log_sink_is_duplicate as shared_manager_log_sink_is_duplicate,
+)
+from .manager_logs import normalize_filter_set as shared_normalize_filter_set
+from .manager_logs import normalize_id as shared_normalize_id
+from .manager_logs import normalize_log_ts as shared_normalize_log_ts
+from .manager_logs import (
+    open_manager_log_sink_file as shared_open_manager_log_sink_file,
+)
+from .manager_logs import parse_boolish as shared_parse_boolish
+from .manager_logs import parse_log_tail_limit as shared_parse_log_tail_limit
+from .manager_logs import (
+    parse_log_tail_since_t_mono as shared_parse_log_tail_since_t_mono,
+)
+from .manager_logs import (
+    resolve_manager_log_file_path as shared_resolve_manager_log_file_path,
+)
+from .manager_logs import (
+    resolve_manager_log_min_level as shared_resolve_manager_log_min_level,
+)
+from .manager_logs import (
+    resolve_manager_log_stderr_enabled as shared_resolve_manager_log_stderr_enabled,
+)
+from .manager_process_logs import drain_supervisor_logs as shared_drain_supervisor_logs
+from .manager_process_logs import emit_supervisor_item as shared_emit_supervisor_item
+from .manager_process_logs import (
+    flush_stale_supervisor_blocks as shared_flush_stale_supervisor_blocks,
+)
+from .manager_process_logs import (
+    prune_supervisor_log_threads as shared_prune_supervisor_log_threads,
+)
+from .manager_process_logs import queue_supervisor_log as shared_queue_supervisor_log
+from .manager_process_logs import (
+    start_child_log_readers as shared_start_child_log_readers,
+)
+from .manager_process_logs import (
+    supervisor_block_continuation as shared_supervisor_block_continuation,
+)
+from .manager_process_logs import (
+    supervisor_block_start as shared_supervisor_block_start,
+)
+from .manager_process_logs import (
+    supervisor_infer_severity as shared_supervisor_infer_severity,
+)
+from .manager_process_logs import supervisor_key as shared_supervisor_key
+from .manager_process_recovery import (
+    cleanup_orphans_summary as shared_cleanup_orphans_summary,
+)
+from .manager_process_recovery import (
+    format_router_startup_failure as shared_format_router_startup_failure,
+)
+from .manager_process_recovery import (
+    is_endpoint_collision_process_start_failure as shared_is_endpoint_collision_process_start_failure,
+)
+from .manager_process_recovery import (
+    maybe_recover_process_start_collision as shared_maybe_recover_process_start_collision,
+)
+from .manager_process_recovery import recent_process_logs as shared_recent_process_logs
+from .manager_process_recovery import (
+    record_orphan_cleanup as shared_record_orphan_cleanup,
+)
 from .manager_process_spec import process_spec_kwargs_from_yaml
+from .manager_process_supervision import add_process as shared_add_process
+from .manager_process_supervision import (
+    adopt_with_process_guard as shared_adopt_with_process_guard,
+)
+from .manager_process_supervision import build_driver_cmd as shared_build_driver_cmd
+from .manager_process_supervision import build_router_spec as shared_build_router_spec
+from .manager_process_supervision import (
+    connect_process_data as shared_connect_process_data,
+)
+from .manager_process_supervision import (
+    connect_process_heartbeat as shared_connect_process_heartbeat,
+)
+from .manager_process_supervision import driver_is_started as shared_driver_is_started
+from .manager_process_supervision import driver_is_stopped as shared_driver_is_stopped
+from .manager_process_supervision import (
+    enforce_device_driver_stop_timeout as shared_enforce_device_driver_stop_timeout,
+)
+from .manager_process_supervision import (
+    enforce_managed_process_heartbeat_timeout as shared_enforce_managed_process_heartbeat_timeout,
+)
+from .manager_process_supervision import (
+    enforce_managed_process_stop_timeout as shared_enforce_managed_process_stop_timeout,
+)
+from .manager_process_supervision import (
+    ensure_router_handle as shared_ensure_router_handle,
+)
+from .manager_process_supervision import (
+    ensure_router_running as shared_ensure_router_running,
+)
+from .manager_process_supervision import (
+    expand_process_argv as shared_expand_process_argv,
+)
+from .manager_process_supervision import (
+    mark_device_offline as shared_mark_device_offline,
+)
+from .manager_process_supervision import (
+    maybe_restart_device_driver as shared_maybe_restart_device_driver,
+)
+from .manager_process_supervision import (
+    maybe_restart_managed_process as shared_maybe_restart_managed_process,
+)
+from .manager_process_supervision import (
+    maybe_schedule_restart as shared_maybe_schedule_restart,
+)
+from .manager_process_supervision import process_snapshot as shared_process_snapshot
+from .manager_process_supervision import recover_device as shared_recover_device
+from .manager_process_supervision import require_process as shared_require_process
+from .manager_process_supervision import (
+    resolve_process_data_endpoint as shared_resolve_process_data_endpoint,
+)
+from .manager_process_supervision import (
+    resolve_process_heartbeat_endpoint as shared_resolve_process_heartbeat_endpoint,
+)
+from .manager_process_supervision import restart_driver as shared_restart_driver
+from .manager_process_supervision import start_driver as shared_start_driver
+from .manager_process_supervision import (
+    start_process_handle as shared_start_process_handle,
+)
+from .manager_process_supervision import stop_driver as shared_stop_driver
+from .manager_process_supervision import (
+    stop_process_handle as shared_stop_process_handle,
+)
+from .manager_process_supervision import (
+    supervise_device_drivers as shared_supervise_device_drivers,
+)
+from .manager_process_supervision import (
+    supervise_managed_processes as shared_supervise_managed_processes,
+)
+from .manager_process_supervision import (
+    try_restart_process as shared_try_restart_process,
+)
+from .manager_process_supervision import (
+    update_device_driver_exit_state as shared_update_device_driver_exit_state,
+)
+from .manager_process_supervision import (
+    update_managed_process_exit_state as shared_update_managed_process_exit_state,
+)
+from .manager_pubsub import publish_manager_event as shared_publish_manager_event
+from .manager_request_routing import (
+    build_internal_action_registry,
+    build_internal_type_registry,
+    build_manager_route_registry,
+    build_process_route_registry,
+)
+from .manager_route_handlers import (
+    apply_command_interceptors as shared_apply_command_interceptors,
+)
+from .manager_route_handlers import (
+    command_interceptor_chain as shared_command_interceptor_chain,
+)
+from .manager_route_handlers import (
+    command_interceptor_routes_snapshot as shared_command_interceptor_routes_snapshot,
+)
+from .manager_route_handlers import (
+    drop_command_interceptor_routes as shared_drop_command_interceptor_routes,
+)
+from .manager_route_handlers import (
+    invalidate_command_interceptor_cache as shared_invalidate_command_interceptor_cache,
+)
+from .manager_route_handlers import (
+    match_command_interceptor_route as shared_match_command_interceptor_route,
+)
+from .manager_route_handlers import (
+    publish_interceptor_routes_update as shared_publish_interceptor_routes_update,
+)
+from .manager_route_handlers import (
+    register_command_interceptor_routes as shared_register_command_interceptor_routes,
+)
 from .manager_rpc_calls import call_device_rpc as shared_call_device_rpc
 from .manager_rpc_calls import call_process_rpc as shared_call_process_rpc
+from .manager_runtime_metadata import (
+    device_config_payload as shared_device_config_payload,
+)
+from .manager_runtime_metadata import (
+    effective_metadata_for_device as shared_effective_metadata_for_device,
+)
+from .manager_runtime_metadata import (
+    merge_stream_metadata_dicts as shared_merge_stream_metadata_dicts,
+)
+from .manager_runtime_metadata import (
+    normalize_runtime_metadata_dict as shared_normalize_runtime_metadata_dict,
+)
+from .manager_runtime_metadata import (
+    normalize_runtime_stream_metadata_dict as shared_normalize_runtime_stream_metadata_dict,
+)
+from .manager_runtime_metadata import (
+    publish_device_config as shared_publish_device_config,
+)
+from .manager_runtime_metadata import (
+    runtime_metadata_state as shared_runtime_metadata_state,
+)
+from .manager_runtime_metadata import serialize_spec_yaml as shared_serialize_spec_yaml
+from .manager_runtime_metadata import (
+    touch_runtime_metadata_revision as shared_touch_runtime_metadata_revision,
+)
+from .schemas.run_meta import run_meta_calls_from_json
+from .schemas.stream import stream_calls_from_json
+from .schemas.telemetry import telemetry_calls_from_json
 from .types import (
     DeviceState,
     DriverState,
@@ -53,25 +339,22 @@ from .types import (
     TelemetryQuality,
     Timestamp,
 )
-from .schemas.run_meta import run_meta_calls_from_json, run_meta_calls_to_json
-from .schemas.stream import stream_calls_from_json, stream_calls_to_json
-from .schemas.telemetry import telemetry_calls_from_json, telemetry_calls_to_json
+from .utils import instance_lock as _instance_lock
+from .utils.command_journal import CommandJournal, CommandJournalSettings
+from .utils.config_parsing import ConfigError, optional_dict, require_dict, require_str
+from .utils.logging_levels import normalize_log_severity, severity_rank
+from .utils.manager_network import derive_local_connect_endpoint
 from .utils.process_lifecycle import ProcessGuardian
-from .utils.process_lifecycle import cleanup_orphan_children
-from .utils.instance_lock import (
-    derive_lock_effective_status,
-    lock_effective_status_help,
-    read_instance_lock_status,
-)
-from .utils.logging_levels import (
-    is_valid_log_severity,
-    normalize_log_severity,
-    severity_rank,
-)
+from .utils.rpc_dispatch import RpcDispatchRegistry
 from .utils.yaml_helpers import load_yaml_file
 from .utils.zmq_helpers import json_dumps, safe_json_loads
 
 Json = dict[str, Any]
+
+# Re-export for test patching and manager route-handler late binding.
+read_instance_lock_status = _instance_lock.read_instance_lock_status
+derive_lock_effective_status = _instance_lock.derive_lock_effective_status
+lock_effective_status_help = _instance_lock.lock_effective_status_help
 _LOG_LEVEL_PREFIX_RE = re.compile(
     r"^\s*(DEBUG|INFO|WARNING|WARN|ERROR|CRITICAL)\b", re.IGNORECASE
 )
@@ -430,9 +713,7 @@ def device_spec_from_yaml(path: str | Path) -> DeviceSpec:
             module_name = require_str(driver_module, path=["driver", "module"])
             spec = importlib.util.find_spec(module_name)
             if spec is None or spec.origin is None:
-                raise ConfigError(
-                    "driver.module", f"module not found: {module_name!r}"
-                )
+                raise ConfigError("driver.module", f"module not found: {module_name!r}")
             device_class_path = spec.origin
         else:
             device_class_path = require_str(driver_file, path=["driver", "file"])
@@ -527,6 +808,12 @@ class Manager:
         telemetry_stale_s: float = 10.0,
         device_rpc_timeout_ms: int = 1500,
         interceptor_rpc_timeout_ms: int = 500,
+        router_manager_worker_queue_max: int = 8192,
+        router_process_worker_queue_max: int = 8192,
+        router_device_worker_queue_max: int = 16384,
+        router_mirrored_worker_queue_max: int = 8192,
+        router_reply_queue_max: int = 32768,
+        router_inflight_max: int = 32768,
         auto_connect_on_register: bool = True,
         log_history_size: int = 10000,
         command_journal_enabled: bool = False,
@@ -536,6 +823,10 @@ class Manager:
         command_journal_flush_interval_ms: int = 200,
         command_journal_retention_max_rows: int | None = 1_000_000,
         command_journal_retention_max_age_days: float | None = None,
+        telemetry_cache_max_devices: int = 4096,
+        telemetry_cache_max_signals_per_device: int = 4096,
+        chunk_cache_max_devices: int = 4096,
+        chunk_cache_max_streams_per_device: int = 2048,
         manager_log_stderr: bool | None = None,
         manager_log_file: str | Path | None = None,
         manager_log_min_level: str | None = None,
@@ -588,6 +879,23 @@ class Manager:
         self._telemetry_stale_s = telemetry_stale_s
         self._device_rpc_timeout_ms = device_rpc_timeout_ms
         self._interceptor_rpc_timeout_ms = int(interceptor_rpc_timeout_ms)
+        self._router_manager_worker_queue_max = max(
+            1, int(router_manager_worker_queue_max)
+        )
+        self._router_process_worker_queue_max = max(
+            1, int(router_process_worker_queue_max)
+        )
+        self._router_device_worker_queue_max = max(
+            1, int(router_device_worker_queue_max)
+        )
+        self._router_mirrored_worker_queue_max = max(
+            1, int(router_mirrored_worker_queue_max)
+        )
+        self._router_reply_queue_max = max(1, int(router_reply_queue_max))
+        self._router_inflight_max = max(
+            1,
+            min(int(router_inflight_max), self._router_reply_queue_max),
+        )
         self._federation_config = federation_config or FederationConfig()
 
         self._process_hb_bind_base = process_hb_bind_base
@@ -607,12 +915,21 @@ class Manager:
             str, dict[str, tuple[Timestamp, TelemetrySignal]]
         ] = {}
         self._telemetry_last_bundle_ts: dict[str, Timestamp] = {}
+        self._telemetry_device_order: dict[str, None] = {}
+        self._telemetry_cache_max_devices = max(1, int(telemetry_cache_max_devices))
+        self._telemetry_cache_max_signals_per_device = max(
+            1, int(telemetry_cache_max_signals_per_device)
+        )
+        self._telemetry_cache_evicted_devices = 0
+        self._telemetry_cache_evicted_signals = 0
         self._last_liveness: dict[str, Liveness] = {}
         self._log_history_size = max(100, int(log_history_size))
         self._log_history: deque[Json] = deque(maxlen=self._log_history_size)
         self._supervisor_log_queue: queue.Queue[Json] = queue.Queue(maxsize=5000)
         self._supervisor_log_dropped = 0
-        self._supervisor_log_threads: dict[tuple[str, str, int, str], threading.Thread] = {}
+        self._supervisor_log_threads: dict[
+            tuple[str, str, int, str], threading.Thread
+        ] = {}
         self._supervisor_pending_blocks: dict[tuple[str, str, int, str], Json] = {}
         self._last_orphan_cleanup: Json | None = None
         self._command_journal_enabled = bool(command_journal_enabled)
@@ -677,10 +994,19 @@ class Manager:
 
         # Latest fast-data descriptor cache: (device_id -> stream_name -> descriptor json)
         self._latest_chunk_desc: dict[str, dict[str, Json]] = {}
+        self._chunk_device_order: dict[str, None] = {}
+        self._chunk_cache_max_devices = max(1, int(chunk_cache_max_devices))
+        self._chunk_cache_max_streams_per_device = max(
+            1, int(chunk_cache_max_streams_per_device)
+        )
+        self._chunk_cache_evicted_devices = 0
+        self._chunk_cache_evicted_streams = 0
         self._command_interceptor_routes: list[CommandInterceptorRoute] = []
         self._command_interceptor_order = 0
         self._command_interceptor_cache_max = 2048
-        self._command_interceptor_cache: dict[tuple[str, str], list[CommandInterceptorRoute]] = {}
+        self._command_interceptor_cache: dict[
+            tuple[str, str], list[CommandInterceptorRoute]
+        ] = {}
         self._runtime_device_metadata_overrides: dict[str, dict[str, Any]] = {}
         self._runtime_stream_metadata_overrides: dict[
             str, dict[str, dict[str, Any]]
@@ -720,6 +1046,10 @@ class Manager:
             config=self._federation_config,
             instance_id=self._instance_id,
         )
+        self._internal_action_registry = self._build_internal_action_registry()
+        self._internal_type_registry = self._build_internal_type_registry()
+        self._process_route_registry = self._build_process_route_registry()
+        self._manager_route_registry = self._build_manager_route_registry()
 
         self._router_process_id = "device_router"
         self._ensure_router_handle()
@@ -734,178 +1064,41 @@ class Manager:
         self._devices[spec.device_id] = DeviceHandle(spec=spec)
 
     def start_driver(self, device_id: str) -> None:
-        handle = self._devices.get(device_id)
-        if handle is None:
-            raise KeyError(f"Unknown device_id {device_id!r}")
-        if handle.process is not None and handle.process.poll() is None:
-            return
-        if handle.driver_process_state == ManagedProcessState.CRASHLOOP:
-            return
-
-        cmd = self._build_driver_cmd(handle.spec)
-        env = os.environ.copy()
-        env.setdefault("PYTHONUNBUFFERED", "1")
-        # Always inject runtime-resolved local endpoints for driver subprocesses.
-        # Composite/virtual drivers can consume these without hardcoded ports.
-        env["EXPERIMENT_CONTROL_ROUTER_RPC"] = derive_local_connect_endpoint(
-            self._external_rpc_bind, 6000
-        )
-        env["EXPERIMENT_CONTROL_MANAGER_PUB"] = self._external_pub_connect_local
-        env["EXPERIMENT_CONTROL_INSTANCE_ID"] = self._instance_id
-        try:
-            handle.process = subprocess.Popen(
-                cmd,
-                text=True,
-                bufsize=1,
-                encoding="utf-8",
-                errors="replace",
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                env=env,
-            )
-        except Exception as e:
-            handle.process = None
-            handle.driver_pid = None
-            handle.driver_process_state = ManagedProcessState.FAILED
-            handle.driver_last_error = str(e)
-            self._publish_driver_event("manager.driver.failed", handle)
-            self._emit_log(
-                severity="error",
-                topic="manager.driver.spawn_error",
-                message=str(e),
-                source_kind="driver",
-                source_id=device_id,
-                device_id=device_id,
-                stream="event",
-                payload={"device_id": device_id, "cmd": cmd},
-            )
-            raise
-        self._adopt_with_process_guard(
-            handle.process, target_kind="driver", target_id=device_id
-        )
-        handle.driver_pid = handle.process.pid
-        handle.driver_process_state = ManagedProcessState.STARTING
-        handle.driver_last_exit_code = None
-        handle.driver_stop_requested_t_mono = None
-        handle.driver_last_error = None
-        handle.driver_next_restart_t_mono = None
-        self._start_child_log_readers(
-            popen=handle.process,
-            source_kind="driver",
-            source_id=device_id,
-            device_id=device_id,
-            process_id=None,
-        )
-
-        self._publish_driver_event("manager.driver.starting", handle)
+        shared_start_driver(self, device_id)
 
     def stop_driver(self, device_id: str, *, force: bool = False) -> None:
-        handle = self._devices.get(device_id)
-        if handle is None:
-            raise KeyError(f"Unknown device_id {device_id!r}")
-
-        self._mark_device_offline(device_id, handle)
-
-        if handle.process is None or handle.process.poll() is not None:
-            handle.process = None
-            handle.driver_pid = None
-            handle.driver_process_state = ManagedProcessState.STOPPED
-            self._close_device_rpc(handle)
-            handle.rpc_endpoint = None
-            handle.pub_endpoint = None
-            self._publish_driver_event("manager.driver.stopped", handle)
-            return
-
-        if handle.rpc_endpoint is not None:
-            try:
-                self._call_device_rpc(
-                    device_id=device_id,
-                    action="shutdown",
-                    params={},
-                    timeout_ms=1000,
-                )
-            except Exception:
-                pass
-
-        if force:
-            try:
-                handle.process.terminate()
-            except Exception as e:
-                handle.driver_last_error = str(e)
-            try:
-                handle.process.kill()
-            except Exception as e:
-                handle.driver_last_error = str(e)
-
-        handle.driver_process_state = ManagedProcessState.STOPPING
-        handle.driver_stop_requested_t_mono = time.monotonic()
-        self._close_device_rpc(handle)
-        self._publish_driver_event("manager.driver.stopping", handle)
+        shared_stop_driver(
+            self,
+            device_id,
+            force=force,
+            offline_state=Liveness.OFFLINE,
+        )
 
     def _mark_device_offline(self, device_id: str, handle: DeviceHandle) -> None:
-        age = self._heartbeat_timeout_s + 1.0
-        handle.last_hb_recv_mono = time.monotonic() - age
-        self._last_liveness[device_id] = Liveness.OFFLINE
-        self._publish_manager_event(
-            "manager.liveness",
-            {"device_id": device_id, "liveness": Liveness.OFFLINE, "age_s": age},
+        shared_mark_device_offline(
+            self,
+            device_id,
+            handle,
+            offline_state=Liveness.OFFLINE,
         )
 
     def _driver_is_started(self, handle: DeviceHandle) -> bool:
-        if handle.process is not None and handle.process.poll() is None:
-            return True
-        return handle.driver_process_state in {
-            ManagedProcessState.STARTING,
-            ManagedProcessState.RUNNING,
-            ManagedProcessState.STOPPING,
-        }
+        return shared_driver_is_started(handle)
 
     def _driver_is_stopped(self, handle: DeviceHandle) -> bool:
-        if handle.process is None or handle.process.poll() is not None:
-            return True
-        return handle.driver_process_state in {
-            ManagedProcessState.STOPPED,
-            ManagedProcessState.EXITED,
-            ManagedProcessState.FAILED,
-        }
+        return shared_driver_is_stopped(handle)
 
     def restart_driver(self, device_id: str, *, force: bool = False) -> None:
-        handle = self._devices.get(device_id)
-        if handle is None:
-            raise KeyError(f"Unknown device_id {device_id!r}")
-
-        self._publish_driver_event("manager.driver.restart_requested", handle)
-        try:
-            self.disconnect_device(device_id)
-        except Exception:
-            pass
-
-        self.stop_driver(device_id, force=force)
-        handle.driver_next_restart_t_mono = (
-            time.monotonic() + handle.spec.driver_restart_backoff_s
-        )
-        self._publish_driver_event("manager.driver.restart_scheduled", handle)
+        shared_restart_driver(self, device_id, force=force)
 
     def recover_device(
         self, device_id: str, *, reconnect: bool = True, force: bool = False
     ) -> None:
-        handle = self._devices.get(device_id)
-        if handle is None:
-            raise KeyError(f"Unknown device_id {device_id!r}")
-
-        try:
-            self.disconnect_device(device_id)
-        except Exception:
-            pass
-
-        self.restart_driver(device_id, force=force)
-        self._publish_manager_event(
-            "manager.device.recover_sent",
-            {
-                "device_id": device_id,
-                "reconnect": reconnect,
-                "ts": {"t_wall": time.time(), "t_mono": time.monotonic()},
-            },
+        shared_recover_device(
+            self,
+            device_id,
+            reconnect=reconnect,
+            force=force,
         )
 
     # -----------------------------
@@ -913,146 +1106,26 @@ class Manager:
     # -----------------------------
 
     def add_process(self, spec: ProcessSpec) -> None:
-        if spec.process_id in self._processes:
-            raise ValueError(f"Duplicate process_id {spec.process_id!r}")
-        hb_endpoint = self._resolve_process_heartbeat_endpoint(spec)
-        data_endpoint = self._resolve_process_data_endpoint(spec)
-        handle = ProcessHandle(
-            spec=spec,
-            heartbeat_endpoint=hb_endpoint,
-            process_data_endpoint=data_endpoint,
-        )
-        self._processes[spec.process_id] = handle
-        self._connect_process_heartbeat(hb_endpoint)
-        self._connect_process_data(data_endpoint)
-        self._publish_process_event(
-            "manager.process.added",
-            handle,
-        )
+        shared_add_process(self, spec, handle_cls=ProcessHandle)
 
     def _build_router_spec(self) -> ProcessSpec:
-        router_path = (
-            Path(__file__).resolve().parent / "processes" / "device_router.py"
-        )
-        # Router startup does a manager RPC advertisement before heartbeats begin.
-        # Keep startup supervision timeout comfortably above that RPC timeout.
-        router_heartbeat_timeout_s = max(
-            3.0,
-            (float(self._device_rpc_timeout_ms) / 1000.0) + 2.0,
-        )
-        init_kwargs = {
-            "external_rpc_bind": self._external_rpc_bind,
-            "device_rpc_timeout_ms": self._device_rpc_timeout_ms,
-            "interceptor_rpc_timeout_ms": self._interceptor_rpc_timeout_ms,
-            "federation_mirrors": self._federation_hub.mirror_route_entries(),
-            "origin_instance_id": self._instance_id,
-        }
-        argv = [
-            sys.executable,
-            "-m",
-            "experiment_control.cli.start_process",
-            "--process-class-path",
-            str(router_path),
-            "--process-class-name",
-            "DeviceRouter",
-            "--process-init-json",
-            json.dumps(init_kwargs),
-            "--manager-rpc",
-            self._internal_rpc_endpoint,
-            "--manager-pub",
-            self._external_pub_connect_local,
-        ]
-        return ProcessSpec(
-            process_id=self._router_process_id,
-            argv=argv,
-            heartbeat_period_s=1.0,
-            heartbeat_timeout_s=router_heartbeat_timeout_s,
-            shutdown_timeout_s=3.0,
-            restart_policy=RestartPolicy.ALWAYS,
-            restart_backoff_s=0.5,
-            max_restarts=None,
+        return shared_build_router_spec(
+            self,
+            process_spec_cls=ProcessSpec,
+            restart_policy_always=RestartPolicy.ALWAYS,
         )
 
     def _ensure_router_handle(self) -> ProcessHandle:
-        handle = self._processes.get(self._router_process_id)
-        if handle is None:
-            spec = self._build_router_spec()
-            self.add_process(spec)
-            handle = self._processes[self._router_process_id]
-        return handle
+        return shared_ensure_router_handle(self)
 
     def _ensure_router_running(self, *, timeout_s: float, poll_ms: int) -> None:
-        handle = self._ensure_router_handle()
-        self._start_process_handle(handle)
-        deadline = time.monotonic() + timeout_s
-        while handle.state != ManagedProcessState.RUNNING:
-            if time.monotonic() > deadline:
-                # Flush pending stdout/stderr so startup failures include the real cause.
-                self._drain_supervisor_logs(max_items=5000)
-                self._flush_stale_supervisor_blocks(force=True)
-                if handle.state in {
-                    ManagedProcessState.FAILED,
-                    ManagedProcessState.EXITED,
-                    ManagedProcessState.CRASHLOOP,
-                }:
-                    raise RuntimeError(self._format_router_startup_failure(handle))
-                if handle.popen is not None and handle.popen.poll() is not None:
-                    raise RuntimeError(self._format_router_startup_failure(handle))
-                raise TimeoutError("Timed out waiting for device_router RUNNING")
-            self._pump_once(poll_ms=poll_ms)
+        shared_ensure_router_running(self, timeout_s=timeout_s, poll_ms=poll_ms)
 
     def _recent_process_logs(self, *, process_id: str, limit: int = 6) -> list[str]:
-        pid = process_id.strip()
-        if not pid or limit <= 0:
-            return []
-        out: list[str] = []
-        for entry in reversed(self._log_history):
-            if not isinstance(entry, dict):
-                continue
-            source_kind = str(entry.get("source_kind", "") or "").strip().lower()
-            if source_kind != "process":
-                continue
-            source_id = self._normalize_id(entry.get("source_id"))
-            entry_process_id = self._normalize_id(entry.get("process_id"))
-            if source_id != pid and entry_process_id != pid:
-                continue
-            message = str(entry.get("message", "") or "").strip()
-            if not message:
-                continue
-            if len(message) > 220:
-                message = message[:217] + "..."
-            severity = self._normalize_log_severity(entry.get("severity"))
-            stream = str(entry.get("stream", "event") or "event").strip()
-            out.append(f"{severity}/{stream}: {message}")
-            if len(out) >= limit:
-                break
-        out.reverse()
-        return out
+        return shared_recent_process_logs(self, process_id=process_id, limit=limit)
 
     def _format_router_startup_failure(self, handle: ProcessHandle) -> str:
-        process_id = handle.spec.process_id
-        exit_code = handle.last_exit_code
-        if exit_code is None and handle.popen is not None:
-            try:
-                polled = handle.popen.poll()
-                if polled is not None:
-                    exit_code = int(polled)
-            except Exception:
-                exit_code = None
-
-        details: list[str] = []
-        if exit_code is not None:
-            details.append(f"exit_code={exit_code}")
-        if handle.last_error:
-            details.append(f"last_error={handle.last_error}")
-
-        recent_logs = self._recent_process_logs(process_id=process_id, limit=6)
-        if recent_logs:
-            details.append("recent_logs=" + " | ".join(recent_logs))
-
-        if not details:
-            return f"{process_id} exited during startup"
-        return f"{process_id} exited during startup ({'; '.join(details)})"
+        return shared_format_router_startup_failure(self, handle)
 
     def _cleanup_orphans_summary(
         self,
@@ -1061,103 +1134,51 @@ class Manager:
         stale_only: bool = True,
         timeout_s: float = 2.0,
     ) -> Json:
-        summary = cleanup_orphan_children(
-            instance_id=self._instance_id,
-            exclude_pids={os.getpid()},
-            current_parent_pid=os.getpid(),
-            timeout_s=float(timeout_s),
-            stale_only=bool(stale_only),
-            dry_run=bool(dry_run),
+        return shared_cleanup_orphans_summary(
+            self,
+            dry_run=dry_run,
+            stale_only=stale_only,
+            timeout_s=timeout_s,
         )
-        return {
-            "instance_id": self._instance_id,
-            "dry_run": bool(summary.get("dry_run", dry_run)),
-            "stale_only": bool(summary.get("stale_only", stale_only)),
-            "matched": int(summary.get("matched", 0) or 0),
-            "terminated": list(summary.get("terminated", [])),
-            "failed": list(summary.get("failed", [])),
-            "skipped_live_parent": list(summary.get("skipped_live_parent", [])),
-            "candidates": list(summary.get("candidates", [])),
-        }
 
     def _record_orphan_cleanup(self, *, source: str, summary: Json) -> None:
-        self._last_orphan_cleanup = {
-            "source": str(source),
-            "ts": {
-                "t_wall": float(time.time()),
-                "t_mono": float(time.monotonic()),
-            },
-            "result": summary,
-        }
+        shared_record_orphan_cleanup(self, source=source, summary=summary)
 
     @staticmethod
     def _is_endpoint_collision_process_start_failure(handle: ProcessHandle) -> bool:
-        err = str(handle.last_error or "").lower()
-        if "already in use" in err or "bind failed" in err:
-            return True
-        return False
+        return shared_is_endpoint_collision_process_start_failure(handle)
 
     def _maybe_recover_process_start_collision(self, handle: ProcessHandle) -> bool:
-        if handle.state != ManagedProcessState.STARTING:
-            return False
-        if handle.startup_collision_retry_done:
-            return False
-        if not self._is_endpoint_collision_process_start_failure(handle):
-            recent = " ".join(
-                self._recent_process_logs(process_id=handle.spec.process_id, limit=8)
-            ).lower()
-            markers = (
-                "already in use",
-                "bind failed",
-                "endpoint is likely already in use",
-                "address already in use",
-            )
-            if not any(marker in recent for marker in markers):
-                return False
-        handle.startup_collision_retry_done = True
-        summary = self._cleanup_orphans_summary(dry_run=False, stale_only=True)
-        self._record_orphan_cleanup(
-            source="startup_collision_recovery",
-            summary=summary,
-        )
-        self._emit_log(
-            severity="warning",
-            topic="manager.process.collision_recover",
-            message=(
-                f"startup collision cleanup for {handle.spec.process_id}: "
-                f"matched={summary.get('matched', 0)} "
-                f"terminated={len(summary.get('terminated', []))} "
-                f"failed={len(summary.get('failed', []))}"
-            ),
-            source_kind="process",
-            source_id=handle.spec.process_id,
-            process_id=handle.spec.process_id,
-            stream="event",
-            payload=summary,
-        )
-        self._publish_manager_event(
-            "manager.process.collision_recover",
-            {
-                "process_id": handle.spec.process_id,
-                "summary": summary,
-                "ts": {"t_wall": time.time(), "t_mono": time.monotonic()},
-            },
-        )
-        try:
-            self._start_process_handle(handle, reset_collision_retry=False)
-            return True
-        except Exception as e:
-            handle.state = ManagedProcessState.FAILED
-            handle.last_error = f"collision cleanup retry failed: {e}"
-            self._publish_process_event("manager.process.failed", handle)
-            return False
+        return shared_maybe_recover_process_start_collision(self, handle)
 
     def remove_process(self, process_id: str) -> None:
         handle = self._require_process(process_id)
         if handle.popen is not None and handle.popen.poll() is None:
             raise RuntimeError(f"Process {process_id!r} is still running")
+        hb_endpoint = str(handle.heartbeat_endpoint or "").strip()
+        data_endpoint = str(handle.process_data_endpoint or "").strip()
         self._drop_command_interceptor_routes(process_id)
         self._processes.pop(process_id)
+        if hb_endpoint and all(
+            str(h.heartbeat_endpoint or "").strip() != hb_endpoint
+            for h in self._processes.values()
+        ):
+            if hb_endpoint in self._process_hb_connected:
+                try:
+                    self._process_hb_sub.disconnect(hb_endpoint)
+                except Exception:
+                    pass
+                self._process_hb_connected.discard(hb_endpoint)
+        if data_endpoint and all(
+            str(h.process_data_endpoint or "").strip() != data_endpoint
+            for h in self._processes.values()
+        ):
+            if data_endpoint in self._process_data_connected:
+                try:
+                    self._process_data_sub.disconnect(data_endpoint)
+                except Exception:
+                    pass
+                self._process_data_connected.discard(data_endpoint)
         self._publish_process_event("manager.process.removed", handle)
 
     def start_process(self, process_id: str) -> None:
@@ -1198,43 +1219,7 @@ class Manager:
             self.stop_driver(device_id, force=force)
 
     def _build_driver_cmd(self, spec: DeviceSpec) -> list[str]:
-        stream_calls_json = json.dumps(
-            stream_calls_to_json(list(spec.stream_calls or []))
-        )
-        run_meta_calls_json = json.dumps(
-            run_meta_calls_to_json(list(spec.run_meta_calls or []))
-        )
-        return [
-            sys.executable,
-            "-m",
-            "experiment_control.cli.start_driver",
-            "--registry",
-            self._registry_bind,
-            "--device-id",
-            spec.device_id,
-            "--device-class-path",
-            str(spec.device_class_path),
-            "--device-class-name",
-            spec.device_class_name,
-            "--device-init-json",
-            json.dumps(spec.device_init_kwargs),
-            "--telemetry-period-s",
-            str(spec.telemetry_period_s),
-            "--heartbeat-period-s",
-            str(spec.heartbeat_period_s),
-            "--command-poll-period-s",
-            str(spec.command_poll_period_s),
-            "--telemetry-calls-json",
-            json.dumps(telemetry_calls_to_json(spec.telemetry_calls)),
-            "--stream-calls-json",
-            stream_calls_json,
-            "--run-meta-calls-json",
-            run_meta_calls_json,
-            "--instance-id",
-            self._instance_id,
-            "--parent-pid",
-            str(os.getpid()),
-        ]
+        return shared_build_driver_cmd(self, spec)
 
     def _adopt_with_process_guard(
         self,
@@ -1243,88 +1228,30 @@ class Manager:
         target_kind: str,
         target_id: str,
     ) -> None:
-        if popen is None:
-            return
-        if not hasattr(self, "_process_guard_attach_failures"):
-            self._process_guard_attach_failures = 0
-        if not hasattr(self, "_process_guard_last_error"):
-            self._process_guard_last_error = None
-        try:
-            self._process_guard.adopt_popen(popen)
-        except Exception as exc:
-            self._process_guard_attach_failures += 1
-            self._process_guard_last_error = str(exc)
-            self._emit_log(
-                severity="warning",
-                topic="manager.process_guard.adopt_failed",
-                message=str(exc),
-                source_kind="manager",
-                source_id="manager",
-                stream="event",
-                payload={
-                    "target_kind": str(target_kind or "unknown"),
-                    "target_id": str(target_id or ""),
-                    "pid": int(getattr(popen, "pid", -1) or -1),
-                    "attach_failures": int(self._process_guard_attach_failures),
-                },
-            )
+        shared_adopt_with_process_guard(
+            self,
+            popen,
+            target_kind=target_kind,
+            target_id=target_id,
+        )
 
     def _require_process(self, process_id: str) -> ProcessHandle:
-        handle = self._processes.get(process_id)
-        if handle is None:
-            raise KeyError(f"Unknown process_id {process_id!r}")
-        return handle
+        return shared_require_process(self, process_id)
 
     def _resolve_process_heartbeat_endpoint(self, spec: ProcessSpec) -> str:
-        if spec.heartbeat_endpoint is not None:
-            return spec.heartbeat_endpoint
-
-        scheme_host, _, port_str = self._process_hb_bind_base.rpartition(":")
-        if not scheme_host or not port_str.isdigit():
-            raise ValueError(
-                f"process_hb_bind_base must be tcp://host:port, got {self._process_hb_bind_base!r}"
-            )
-        base_port = int(port_str)
-        port = base_port + self._process_hb_port_offset
-        self._process_hb_port_offset += 1
-        return f"{scheme_host}:{port}"
+        return shared_resolve_process_heartbeat_endpoint(self, spec)
 
     def _resolve_process_data_endpoint(self, spec: ProcessSpec) -> str:
-        if spec.process_data_endpoint is not None:
-            return spec.process_data_endpoint
-
-        scheme_host, _, port_str = self._process_data_bind_base.rpartition(":")
-        if not scheme_host or not port_str.isdigit():
-            raise ValueError(
-                "process_data_bind_base must be tcp://host:port, "
-                f"got {self._process_data_bind_base!r}"
-            )
-        base_port = int(port_str)
-        port = base_port + self._process_data_port_offset
-        self._process_data_port_offset += 1
-        return f"{scheme_host}:{port}"
+        return shared_resolve_process_data_endpoint(self, spec)
 
     def _connect_process_heartbeat(self, endpoint: str) -> None:
-        if endpoint in self._process_hb_connected:
-            return
-        self._process_hb_sub.connect(endpoint)
-        self._process_hb_connected.add(endpoint)
+        shared_connect_process_heartbeat(self, endpoint)
 
     def _connect_process_data(self, endpoint: str) -> None:
-        if endpoint in self._process_data_connected:
-            return
-        self._process_data_sub.connect(endpoint)
-        self._process_data_connected.add(endpoint)
+        shared_connect_process_data(self, endpoint)
 
     def _expand_process_argv(self, argv: list[str], handle: ProcessHandle) -> list[str]:
-        out: list[str] = []
-        for arg in argv:
-            if isinstance(arg, str):
-                arg = arg.replace("{process_id}", handle.spec.process_id)
-                arg = arg.replace("{heartbeat_endpoint}", handle.heartbeat_endpoint)
-                arg = arg.replace("{process_data_endpoint}", handle.process_data_endpoint)
-            out.append(arg)
-        return out
+        return shared_expand_process_argv(self, argv, handle)
 
     def _start_process_handle(
         self,
@@ -1332,207 +1259,23 @@ class Manager:
         *,
         reset_collision_retry: bool = True,
     ) -> None:
-        if handle.popen is not None and handle.popen.poll() is None:
-            return
-        if handle.state == ManagedProcessState.CRASHLOOP:
-            return
-
-        if not handle.heartbeat_endpoint:
-            handle.heartbeat_endpoint = self._resolve_process_heartbeat_endpoint(
-                handle.spec
-            )
-        self._connect_process_heartbeat(handle.heartbeat_endpoint)
-        if not handle.process_data_endpoint:
-            handle.process_data_endpoint = self._resolve_process_data_endpoint(
-                handle.spec
-            )
-        self._connect_process_data(handle.process_data_endpoint)
-
-        argv = self._expand_process_argv(list(handle.spec.argv), handle)
-        argv += [
-            "--process-id",
-            handle.spec.process_id,
-            "--heartbeat-endpoint",
-            handle.heartbeat_endpoint,
-            "--process-data-endpoint",
-            handle.process_data_endpoint,
-            "--instance-id",
-            self._instance_id,
-            "--parent-pid",
-            str(os.getpid()),
-        ]
-
-        env = os.environ.copy()
-        if handle.spec.env:
-            env.update(handle.spec.env)
-        env.setdefault("PYTHONUNBUFFERED", "1")
-        env["EXPERIMENT_CONTROL_INSTANCE_ID"] = self._instance_id
-
-        try:
-            handle.popen = subprocess.Popen(
-                argv,
-                cwd=handle.spec.cwd,
-                env=env,
-                text=True,
-                bufsize=1,
-                encoding="utf-8",
-                errors="replace",
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
-        except Exception as e:
-            handle.popen = None
-            handle.pid = None
-            handle.state = ManagedProcessState.FAILED
-            handle.last_error = str(e)
-            self._publish_process_event("manager.process.failed", handle)
-            self._emit_log(
-                severity="error",
-                topic="manager.process.spawn_error",
-                message=str(e),
-                source_kind="process",
-                source_id=handle.spec.process_id,
-                process_id=handle.spec.process_id,
-                stream="event",
-                payload={"process_id": handle.spec.process_id, "argv": argv},
-            )
-            raise
-        self._adopt_with_process_guard(
-            handle.popen, target_kind="process", target_id=handle.spec.process_id
+        shared_start_process_handle(
+            self,
+            handle,
+            reset_collision_retry=reset_collision_retry,
         )
-        handle.pid = handle.popen.pid
-        handle.state = ManagedProcessState.STARTING
-        handle.rpc_endpoint = None
-        self._close_process_rpc(handle)
-        handle.last_start_t_wall = time.time()
-        handle.last_start_t_mono = time.monotonic()
-        handle.last_hb_t_wall = None
-        handle.last_hb_t_mono = None
-        handle.last_exit_code = None
-        handle.stop_requested_t_mono = None
-        handle.next_restart_t_mono = None
-        handle.last_error = None
-        if reset_collision_retry:
-            handle.startup_collision_retry_done = False
-        self._start_child_log_readers(
-            popen=handle.popen,
-            source_kind="process",
-            source_id=handle.spec.process_id,
-            device_id=None,
-            process_id=handle.spec.process_id,
-        )
-
-        self._publish_process_event("manager.process.started", handle)
 
     def _stop_process_handle(self, handle: ProcessHandle) -> None:
-        if handle.popen is None:
-            handle.state = ManagedProcessState.STOPPED
-            return
-        if handle.popen.poll() is not None:
-            handle.state = ManagedProcessState.EXITED
-            handle.last_exit_code = handle.popen.poll()
-            handle.popen = None
-            handle.rpc_endpoint = None
-            self._close_process_rpc(handle)
-            self._publish_process_event("manager.process.exited", handle)
-            return
-
-        graceful_requested = False
-        if handle.rpc_endpoint is not None:
-            req: Json = {
-                "type": "process.stop",
-                "params": {},
-                "request_id": f"mgr-stop-{int(time.time() * 1000)}",
-            }
-            timeout_ms = max(100, min(int(self._device_rpc_timeout_ms), 500))
-            try:
-                resp = self._call_process_rpc(
-                    process_id=handle.spec.process_id,
-                    request=req,
-                    timeout_ms=timeout_ms,
-                )
-                graceful_requested = bool(
-                    isinstance(resp, dict) and resp.get("ok", False)
-                )
-            except Exception:
-                graceful_requested = False
-
-        if not graceful_requested:
-            try:
-                handle.popen.terminate()
-            except Exception as e:
-                handle.last_error = str(e)
-        handle.state = ManagedProcessState.STOPPING
-        handle.stop_requested_t_mono = time.monotonic()
-        handle.rpc_endpoint = None
-        self._close_process_rpc(handle)
-        self._publish_process_event("manager.process.stopping", handle)
+        shared_stop_process_handle(self, handle)
 
     def _maybe_schedule_restart(self, handle: ProcessHandle, now_mono: float) -> None:
-        if handle.next_restart_t_mono is not None:
-            return
-
-        policy = handle.spec.restart_policy
-        if policy == RestartPolicy.NEVER:
-            return
-        if policy == RestartPolicy.ON_FAILURE:
-            if handle.last_exit_code is None:
-                return
-            if handle.last_exit_code == 0:
-                return
-
-        delay = max(handle.spec.restart_backoff_s, 0.0)
-        handle.next_restart_t_mono = now_mono + delay
-        self._publish_process_event("manager.process.restart_scheduled", handle)
+        shared_maybe_schedule_restart(self, handle, now_mono)
 
     def _try_restart_process(self, handle: ProcessHandle) -> None:
-        if (
-            handle.spec.max_restarts is not None
-            and handle.restart_count >= handle.spec.max_restarts
-        ):
-            handle.state = ManagedProcessState.CRASHLOOP
-            handle.next_restart_t_mono = None
-            self._publish_process_event("manager.process.crashloop", handle)
-            return
-
-        handle.restart_count += 1
-        handle.last_restart_t_mono = time.monotonic()
-        handle.next_restart_t_mono = None
-        handle.stop_requested_t_mono = None
-        self._start_process_handle(handle)
+        shared_try_restart_process(self, handle)
 
     def _process_snapshot(self, handle: ProcessHandle) -> Json:
-        hb_age_s: float | None = None
-        now_mono = time.monotonic()
-        if handle.last_hb_t_mono is not None:
-            hb_age_s = now_mono - handle.last_hb_t_mono
-        return {
-            "process_id": handle.spec.process_id,
-            "argv": handle.spec.argv,
-            "cwd": handle.spec.cwd,
-            "env": handle.spec.env,
-            "heartbeat_period_s": handle.spec.heartbeat_period_s,
-            "heartbeat_timeout_s": handle.spec.heartbeat_timeout_s,
-            "shutdown_timeout_s": handle.spec.shutdown_timeout_s,
-            "restart_policy": handle.spec.restart_policy,
-            "restart_backoff_s": handle.spec.restart_backoff_s,
-            "max_restarts": handle.spec.max_restarts,
-            "state": handle.state,
-            "pid": handle.pid,
-            "last_start_t_wall": handle.last_start_t_wall,
-            "last_start_t_mono": handle.last_start_t_mono,
-            "last_hb_t_wall": handle.last_hb_t_wall,
-            "last_hb_t_mono": handle.last_hb_t_mono,
-            "hb_age_s": hb_age_s,
-            "last_exit_code": handle.last_exit_code,
-            "restart_count": handle.restart_count,
-            "last_restart_t_mono": handle.last_restart_t_mono,
-            "last_error": handle.last_error,
-            "heartbeat_endpoint": handle.heartbeat_endpoint,
-            "process_data_endpoint": handle.process_data_endpoint,
-            "rpc_endpoint": handle.rpc_endpoint,
-            "registered": handle.rpc_endpoint is not None,
-        }
+        return shared_process_snapshot(self, handle)
 
     def _start_child_log_readers(
         self,
@@ -1543,263 +1286,57 @@ class Manager:
         device_id: str | None,
         process_id: str | None,
     ) -> None:
-        pid = int(popen.pid or -1)
-        if pid <= 0:
-            return
-        for stream in ("stdout", "stderr"):
-            pipe = getattr(popen, stream, None)
-            if pipe is None:
-                continue
-            key = (source_kind, source_id, pid, stream)
-            existing = self._supervisor_log_threads.get(key)
-            if existing is not None and existing.is_alive():
-                continue
-
-            def _reader(
-                *,
-                pipe_obj: Any,
-                stream_name: str,
-                source_kind_name: str,
-                source_id_name: str,
-                pid_value: int,
-                device_id_value: str | None,
-                process_id_value: str | None,
-            ) -> None:
-                try:
-                    for line in iter(pipe_obj.readline, ""):
-                        text = str(line).rstrip("\r\n")
-                        if not text:
-                            continue
-                        self._queue_supervisor_log(
-                            {
-                                "source_kind": source_kind_name,
-                                "source_id": source_id_name,
-                                "stream": stream_name,
-                                "pid": pid_value,
-                                "device_id": device_id_value,
-                                "process_id": process_id_value,
-                                "message": text,
-                            }
-                        )
-                except Exception as e:
-                    self._queue_supervisor_log(
-                        {
-                            "source_kind": source_kind_name,
-                            "source_id": source_id_name,
-                            "stream": stream_name,
-                            "pid": pid_value,
-                            "device_id": device_id_value,
-                            "process_id": process_id_value,
-                            "message": f"log stream read failed: {e}",
-                            "reader_error": True,
-                        }
-                    )
-                finally:
-                    try:
-                        pipe_obj.close()
-                    except Exception:
-                        pass
-
-            thread = threading.Thread(
-                target=_reader,
-                kwargs={
-                    "pipe_obj": pipe,
-                    "stream_name": stream,
-                    "source_kind_name": source_kind,
-                    "source_id_name": source_id,
-                    "pid_value": pid,
-                    "device_id_value": device_id,
-                    "process_id_value": process_id,
-                },
-                daemon=True,
-                name=f"ec-log-{source_kind}-{source_id}-{pid}-{stream}",
-            )
-            self._supervisor_log_threads[key] = thread
-            thread.start()
+        shared_start_child_log_readers(
+            self,
+            popen=popen,
+            source_kind=source_kind,
+            source_id=source_id,
+            device_id=device_id,
+            process_id=process_id,
+        )
 
     def _queue_supervisor_log(self, item: Json) -> None:
-        try:
-            self._supervisor_log_queue.put_nowait(item)
-        except queue.Full:
-            self._supervisor_log_dropped += 1
+        shared_queue_supervisor_log(self, item)
 
     @staticmethod
     def _supervisor_key(item: Json) -> tuple[str, str, int, str]:
-        source_kind = str(item.get("source_kind", "manager") or "manager")
-        source_id = str(item.get("source_id", "") or "")
-        stream = str(item.get("stream", "stdout") or "stdout")
-        pid = -1
-        try:
-            pid = int(item.get("pid", -1))
-        except Exception:
-            pid = -1
-        return (source_kind, source_id, pid, stream)
+        return shared_supervisor_key(item)
 
     @staticmethod
     def _supervisor_block_start(message: str) -> bool:
-        lower = message.strip().lower()
-        return (
-            lower.startswith("traceback (most recent call last):")
-            or lower.startswith("call stack:")
-            or lower.startswith("--- logging error ---")
-        )
+        return shared_supervisor_block_start(message)
 
     @staticmethod
     def _supervisor_block_continuation(message: str) -> bool:
-        if not message.strip():
-            return False
-        if message.startswith((" ", "\t")):
-            return True
-        lower = message.strip().lower()
-        if lower.startswith(("traceback (most recent call last):", "call stack:")):
-            return True
-        if lower.startswith("--- logging error ---"):
-            return True
-        if lower.startswith(("message:", "arguments:")):
-            return True
-        if lower.startswith(
-            (
-                "during handling of the above exception",
-                "the above exception was the direct cause of the following exception",
-            )
-        ):
-            return True
-        if _EXCEPTION_LINE_RE.match(message) is not None:
-            return True
-        return False
+        return shared_supervisor_block_continuation(message)
 
     def _supervisor_infer_severity(
         self, *, stream: str, message: str, reader_error: bool
     ) -> str:
-        if reader_error:
-            return "error"
-
-        match = _LOG_LEVEL_PREFIX_RE.match(message)
-        if match is None:
-            match = _LOG_LEVEL_BRACKET_PREFIX_RE.match(message)
-        if match is None:
-            match = _LOG_LEVEL_INLINE_RE.search(message)
-        if match is None:
-            match = _LOG_LEVEL_TABLE_RE.search(message)
-        if match is not None:
-            return self._normalize_log_severity(match.group(1))
-
-        lower = message.lower()
-        if "traceback (most recent call last):" in lower:
-            return "error"
-        if _EXCEPTION_LINE_RE.match(message.strip()) is not None:
-            return "error"
-        if "fatal" in lower and "error" in lower:
-            return "critical"
-        if stream == "stderr":
-            return "warning"
-        return "info"
+        return shared_supervisor_infer_severity(
+            self,
+            stream=stream,
+            message=message,
+            reader_error=reader_error,
+        )
 
     def _emit_supervisor_item(self, item: Json) -> None:
-        if not isinstance(item, dict):
-            return
-        stream = str(item.get("stream", "") or "stdout")
-        reader_error = bool(item.get("reader_error", False))
-        source_kind = str(item.get("source_kind", "manager") or "manager")
-        source_id = str(item.get("source_id", "") or "")
-        message = str(item.get("message", "") or "")
-        if not message:
-            return
-        device_id_raw = item.get("device_id")
-        process_id_raw = item.get("process_id")
-        pid_raw = item.get("pid")
-        severity = self._supervisor_infer_severity(
-            stream=stream, message=message, reader_error=reader_error
-        )
-        payload: Json = {}
-        try:
-            payload["pid"] = int(pid_raw)
-        except Exception:
-            pass
-        self._emit_log(
-            severity=severity,
-            topic=f"manager.supervisor.{source_kind}.{stream}",
-            message=message,
-            source_kind=source_kind,
-            source_id=source_id or None,
-            device_id=str(device_id_raw) if device_id_raw is not None else None,
-            process_id=str(process_id_raw) if process_id_raw is not None else None,
-            stream=stream,
-            payload=payload if payload else None,
-        )
+        shared_emit_supervisor_item(self, item)
 
     def _flush_stale_supervisor_blocks(
         self, *, max_age_s: float = 0.25, force: bool = False
     ) -> None:
-        now = time.monotonic()
-        stale_keys: list[tuple[str, str, int, str]] = []
-        for key, item in self._supervisor_pending_blocks.items():
-            last_update_raw = item.get("last_update_mono", now)
-            try:
-                last_update = float(last_update_raw)
-            except Exception:
-                last_update = now
-            if force or (now - last_update) >= max_age_s:
-                stale_keys.append(key)
-        for key in stale_keys:
-            item = self._supervisor_pending_blocks.pop(key, None)
-            if isinstance(item, dict):
-                item.pop("last_update_mono", None)
-                self._emit_supervisor_item(item)
+        shared_flush_stale_supervisor_blocks(
+            self,
+            max_age_s=max_age_s,
+            force=force,
+        )
 
     def _prune_supervisor_log_threads(self) -> None:
-        stale = [key for key, thread in self._supervisor_log_threads.items() if not thread.is_alive()]
-        for key in stale:
-            self._supervisor_log_threads.pop(key, None)
+        shared_prune_supervisor_log_threads(self)
 
     def _drain_supervisor_logs(self, *, max_items: int = 250) -> None:
-        if self._supervisor_log_dropped > 0:
-            dropped = int(self._supervisor_log_dropped)
-            self._supervisor_log_dropped = 0
-            self._emit_log(
-                severity="warning",
-                topic="manager.supervisor.drop",
-                message=f"Dropped {dropped} supervisor log lines",
-                source_kind="manager",
-                source_id="manager",
-                stream="event",
-                payload={"dropped": dropped},
-            )
-        self._flush_stale_supervisor_blocks()
-        for _ in range(max_items):
-            try:
-                item = self._supervisor_log_queue.get_nowait()
-            except queue.Empty:
-                break
-            if not isinstance(item, dict):
-                continue
-            message = str(item.get("message", "") or "")
-            if not message:
-                continue
-            key = self._supervisor_key(item)
-            pending = self._supervisor_pending_blocks.get(key)
-            if pending is not None:
-                if self._supervisor_block_continuation(message):
-                    pending_message = str(pending.get("message", "") or "")
-                    pending["message"] = (
-                        f"{pending_message}\n{message}" if pending_message else message
-                    )
-                    pending["last_update_mono"] = time.monotonic()
-                    continue
-                pending.pop("last_update_mono", None)
-                self._emit_supervisor_item(pending)
-                self._supervisor_pending_blocks.pop(key, None)
-
-            if self._supervisor_block_start(message):
-                pending_item = dict(item)
-                pending_item["message"] = message
-                pending_item["last_update_mono"] = time.monotonic()
-                self._supervisor_pending_blocks[key] = pending_item
-                continue
-
-            self._emit_supervisor_item(item)
-        self._flush_stale_supervisor_blocks()
-        self._prune_supervisor_log_threads()
+        shared_drain_supervisor_logs(self, max_items=max_items)
 
     def connect_device(self, device_id: str) -> Json:
         handle = self._require_running_driver(device_id)
@@ -1841,9 +1378,7 @@ class Manager:
 
         identity_result = identity_resp.get("result")
         if not isinstance(identity_result, dict):
-            message = (
-                "connect_check failed: identity RPC must return an object/dict"
-            )
+            message = "connect_check failed: identity RPC must return an object/dict"
             details = {
                 "device_id": device_id,
                 "actual_type": type(identity_result).__name__,
@@ -2335,225 +1870,118 @@ class Manager:
     # -----------------------------
 
     def _command_interceptor_routes_snapshot(self) -> list[Json]:
-        return [
-            {
-                "process_id": r.process_id,
-                "device_id": r.device_id,
-                "action": r.action,
-                "order": r.order,
-            }
-            for r in sorted(self._command_interceptor_routes, key=lambda r: r.order)
-        ]
+        return shared_command_interceptor_routes_snapshot(self)
 
     def _publish_interceptor_routes_update(
         self, *, process_id: str, routes: list[Json], replace: bool
     ) -> None:
-        self._publish_manager_event(
-            "manager.command_interceptor.routes_updated",
-            {
-                "process_id": process_id,
-                "routes": routes,
-                "replace": replace,
-                "ts": {"t_wall": time.time(), "t_mono": time.monotonic()},
-            },
+        shared_publish_interceptor_routes_update(
+            self,
+            process_id=process_id,
+            routes=routes,
+            replace=replace,
         )
 
     def _invalidate_command_interceptor_cache(self) -> None:
-        self._command_interceptor_cache.clear()
+        shared_invalidate_command_interceptor_cache(self)
 
     def _drop_command_interceptor_routes(self, process_id: str) -> None:
-        before = len(self._command_interceptor_routes)
-        self._command_interceptor_routes = [
-            r for r in self._command_interceptor_routes if r.process_id != process_id
-        ]
-        if len(self._command_interceptor_routes) != before:
-            self._invalidate_command_interceptor_cache()
-            self._publish_interceptor_routes_update(
-                process_id=process_id, routes=[], replace=True
-            )
+        shared_drop_command_interceptor_routes(self, process_id)
 
     def _register_command_interceptor_routes(
         self, process_id: str, routes_raw: Any, *, replace: bool
     ) -> list[Json]:
-        if process_id not in self._processes:
-            raise KeyError(f"Unknown process_id {process_id!r}")
-        if not isinstance(routes_raw, list):
-            raise TypeError("routes must be a list")
-
-        if replace:
-            self._command_interceptor_routes = [
-                r for r in self._command_interceptor_routes if r.process_id != process_id
-            ]
-            self._invalidate_command_interceptor_cache()
-
-        seen: set[tuple[str, str, str]] = set()
-        added: list[Json] = []
-        for route in routes_raw:
-            if not isinstance(route, dict):
-                raise TypeError("route must be an object")
-            device_id = str(route.get("device_id", "")).strip()
-            action = str(route.get("action", "")).strip()
-            if not device_id or not action:
-                raise ValueError("route.device_id and route.action are required")
-            key = (process_id, device_id, action)
-            if key in seen:
-                continue
-            seen.add(key)
-            self._command_interceptor_order += 1
-            entry = CommandInterceptorRoute(
-                process_id=process_id,
-                device_id=device_id,
-                action=action,
-                order=self._command_interceptor_order,
-            )
-            self._command_interceptor_routes.append(entry)
-            added.append(
-                {
-                    "process_id": process_id,
-                    "device_id": device_id,
-                    "action": action,
-                    "order": entry.order,
-                }
-            )
-
-        self._publish_interceptor_routes_update(
-            process_id=process_id, routes=added, replace=replace
+        return shared_register_command_interceptor_routes(
+            self,
+            process_id,
+            routes_raw,
+            replace=replace,
+            route_cls=CommandInterceptorRoute,
         )
-        self._invalidate_command_interceptor_cache()
-        return added
 
     @staticmethod
     def _match_command_interceptor_route(
         route: CommandInterceptorRoute, device_id: str, action: str
     ) -> bool:
-        if route.device_id != "*" and route.device_id != device_id:
-            return False
-        if route.action != "*" and route.action != action:
-            return False
-        return True
+        return shared_match_command_interceptor_route(route, device_id, action)
 
     def _command_interceptor_chain(
         self, device_id: str, action: str
     ) -> list[CommandInterceptorRoute]:
-        key = (device_id, action)
-        cached = self._command_interceptor_cache.get(key)
-        if cached is not None:
-            # Touch entry so eviction behaves as LRU.
-            self._command_interceptor_cache.pop(key, None)
-            self._command_interceptor_cache[key] = cached
-            return list(cached)
-        matches = [
-            r
-            for r in self._command_interceptor_routes
-            if self._match_command_interceptor_route(r, device_id, action)
-        ]
-        matches.sort(key=lambda r: r.order)
-        ordered: list[CommandInterceptorRoute] = []
-        seen: set[str] = set()
-        for r in matches:
-            if r.process_id in seen:
-                continue
-            seen.add(r.process_id)
-            ordered.append(r)
-        self._command_interceptor_cache[key] = list(ordered)
-        max_items = max(32, int(getattr(self, "_command_interceptor_cache_max", 2048)))
-        while len(self._command_interceptor_cache) > max_items:
-            oldest = next(iter(self._command_interceptor_cache))
-            self._command_interceptor_cache.pop(oldest, None)
-        return ordered
+        return shared_command_interceptor_chain(
+            self,
+            device_id,
+            action,
+            match_route=self._match_command_interceptor_route,
+        )
 
     def _apply_command_interceptors(
         self, cmd: Json, *, request_id: str | None, caller_process_id: str | None
     ) -> tuple[bool, Json | None, Json | None]:
-        device_id = str(cmd.get("device_id", ""))
-        action = str(cmd.get("action", ""))
-        chain = self._command_interceptor_chain(device_id, action)
-
-        def _is_route_available(process_id: str) -> bool:
-            handle = self._processes.get(process_id)
-            if handle is None:
-                return False
-            if handle.state not in {
+        return shared_apply_command_interceptors(
+            self,
+            cmd,
+            request_id=request_id,
+            caller_process_id=caller_process_id,
+            running_states={
                 ManagedProcessState.STARTING,
                 ManagedProcessState.RUNNING,
                 ManagedProcessState.STOPPING,
-            }:
-                return False
-            return handle.rpc_endpoint is not None
-
-        def _call(process_id: str, request: Json) -> tuple[str, Json | None, str | None]:
-            try:
-                resp = self._call_process_rpc(
-                    process_id=process_id,
-                    request=request,
-                    timeout_ms=self._interceptor_rpc_timeout_ms,
-                )
-                return "ok", resp, None
-            except zmq.Again:
-                return "timeout", None, None
-            except Exception as exc:
-                return "unavailable", None, str(exc)
-
-        return apply_command_interceptor_chain(
-            initial_command={
-                "device_id": device_id,
-                "action": action,
-                "params": cmd.get("params", {}),
             },
-            chain=chain,
-            request_id=request_id,
-            caller_process_id=caller_process_id,
-            is_route_available=_is_route_available,
-            call_interceptor=_call,
-            publish_event=self._publish_manager_event,
-            distinct_ok_false_message=True,
         )
 
     def _handle_internal_rpc(self) -> None:
-        """
-        Internal entities (device_router/processes) connect and send requests.
-        Manager routes to device/process RPC endpoints or handles manager actions.
-        """
-        identity, payload_bytes = self._internal_rpc.recv_multipart()
-        try:
-            req = safe_json_loads(payload_bytes)
-            if not isinstance(req, dict):
-                raise TypeError("Request must be a JSON object")
-            resp = self._route_internal_request(req)
-        except Exception as e:
-            resp = {"ok": False, "error": repr(e)}
-
-        self._internal_rpc.send_multipart([identity, json_dumps(resp)])
+        shared_handle_internal_rpc(self)
 
     def _route_internal_request(self, req: Json) -> Json:
-        action = req.get("action")
-        if action == "telemetry.schema.list":
-            return {"ok": True, "result": self._telemetry_schema_list()}
+        return shared_route_internal_request(self, req)
 
-        rtype = req.get("type")
-        if rtype == "list_devices":
-            return {"ok": True, "devices": self._list_devices_snapshot()}
-        if rtype == "telemetry.snapshot":
-            return {"ok": True, "result": self._telemetry_snapshot()}
-        if rtype == "get_telemetry":
-            device_id = str(req["device_id"])
-            return {
-                "ok": True,
-                "telemetry": self._get_device_telemetry_snapshot(device_id),
-            }
-        device_resp = self._route_device_request(rtype, req)
-        if device_resp is not None:
-            return device_resp
+    @staticmethod
+    def _dispatch_registry_request(
+        registry: RpcDispatchRegistry,
+        *,
+        route_key: Any,
+        req: Json,
+    ) -> Json | None:
+        return shared_dispatch_registry_request(
+            registry,
+            route_key=route_key,
+            req=req,
+        )
 
-        process_resp = self._route_process_request(rtype, req)
-        if process_resp is not None:
-            return process_resp
+    def _ensure_route_registries(self) -> None:
+        shared_ensure_route_registries(self)
 
-        manager_resp = self._route_manager_request(rtype, req)
-        if manager_resp is not None:
-            return manager_resp
+    def _build_internal_action_registry(self) -> RpcDispatchRegistry:
+        return build_internal_action_registry(self)
 
-        raise ValueError(f"Unknown external request type {rtype!r}")
+    def _build_internal_type_registry(self) -> RpcDispatchRegistry:
+        return build_internal_type_registry(self)
+
+    def _build_process_route_registry(self) -> RpcDispatchRegistry:
+        return build_process_route_registry(self)
+
+    def _build_manager_route_registry(self) -> RpcDispatchRegistry:
+        return build_manager_route_registry(self)
+
+    def _route_action_telemetry_schema_list(self, req: Json) -> Json:
+        del req
+        return {"ok": True, "result": self._telemetry_schema_list()}
+
+    def _route_type_list_devices(self, req: Json) -> Json:
+        del req
+        return {"ok": True, "devices": self._list_devices_snapshot()}
+
+    def _route_type_telemetry_snapshot(self, req: Json) -> Json:
+        del req
+        return {"ok": True, "result": self._telemetry_snapshot()}
+
+    def _route_type_get_telemetry(self, req: Json) -> Json:
+        device_id = str(req["device_id"])
+        return {
+            "ok": True,
+            "telemetry": self._get_device_telemetry_snapshot(device_id),
+        }
 
     def _route_device_request(self, rtype: Any, req: Json) -> Json | None:
         return route_device_request(self, rtype, req)
@@ -2570,7 +1998,8 @@ class Manager:
         source_kind: str,
         source_id: str,
     ) -> Json:
-        self._publish_process_command_event(
+        return shared_publish_process_command_response(
+            self,
             process_id=process_id,
             action=action,
             params=params,
@@ -2580,34 +2009,15 @@ class Manager:
             source_kind=source_kind,
             source_id=source_id,
         )
-        return response
 
     def _route_process_request(self, rtype: Any, req: Json) -> Json | None:
-        handlers: dict[str, Callable[[Json], Json]] = {
-            "process.list_status": self._route_process_list_status,
-            "process.get": self._route_process_get,
-            "process.start": self._route_process_start,
-            "process.stop": self._route_process_stop,
-            "process.restart": self._route_process_restart,
-            "process.add": self._route_process_add,
-            "process.remove": self._route_process_remove,
-            "process.rpc.advertise": self._route_process_rpc_advertise,
-            "process.rpc": self._route_process_rpc,
-            "command_interceptor.register": self._route_command_interceptor_register,
-            "command_interceptor.list": self._route_command_interceptor_list,
-        }
-        handler = handlers.get(str(rtype))
-        if handler is None:
-            return None
-        return handler(req)
+        return shared_route_process_request(self, rtype, req)
 
     def _route_process_list_status(self, req: Json) -> Json:
-        del req
-        return {"ok": True, "result": self.list_processes()}
+        return shared_route_process_list_status(self, req)
 
     def _route_process_get(self, req: Json) -> Json:
-        process_id = str(req["process_id"])
-        return {"ok": True, "result": self.get_process(process_id)}
+        return shared_route_process_get(self, req)
 
     def _route_process_control(
         self,
@@ -2616,385 +2026,87 @@ class Manager:
         action: str,
         runner: Callable[[str], None],
     ) -> Json:
-        process_id = str(req["process_id"])
-        request_id = req.get("request_id")
-        caller_process_id = req.get("caller_process_id")
-        source_kind, source_id = self._normalize_command_source(
-            source_kind=req.get("source_kind"),
-            source_id=req.get("source_id"),
-            caller_process_id=caller_process_id,
-        )
-        runner(process_id)
-        resp = {"ok": True, "result": {"process_id": process_id}}
-        return self._publish_process_command_response(
-            process_id=process_id,
+        return shared_route_process_control(
+            self,
+            req,
             action=action,
-            params={"process_id": process_id},
-            response=resp,
-            request_id=request_id,
-            caller_process_id=caller_process_id,
-            source_kind=source_kind,
-            source_id=source_id,
+            runner=runner,
         )
 
     def _route_process_start(self, req: Json) -> Json:
-        return self._route_process_control(req, action="process.start", runner=self.start_process)
+        return self._route_process_control(
+            req,
+            action="manager.processes.start",
+            runner=self.start_process,
+        )
 
     def _route_process_stop(self, req: Json) -> Json:
-        return self._route_process_control(req, action="process.stop", runner=self.stop_process)
+        return self._route_process_control(
+            req,
+            action="manager.processes.stop",
+            runner=self.stop_process,
+        )
 
     def _route_process_restart(self, req: Json) -> Json:
         return self._route_process_control(
-            req, action="process.restart", runner=self.restart_process
+            req,
+            action="manager.processes.restart",
+            runner=self.restart_process,
         )
 
     def _route_process_add(self, req: Json) -> Json:
-        spec_raw = req.get("spec")
-        if not isinstance(spec_raw, dict):
-            raise TypeError("spec must be a dict")
-        spec = self._parse_process_spec(spec_raw)
-        self.add_process(spec)
-        return {"ok": True, "result": {"process_id": spec.process_id}}
+        return shared_route_process_add(self, req)
 
     def _route_process_remove(self, req: Json) -> Json:
-        process_id = str(req["process_id"])
-        self.remove_process(process_id)
-        return {"ok": True, "result": {"process_id": process_id}}
+        return shared_route_process_remove(self, req)
 
     def _route_process_rpc_advertise(self, req: Json) -> Json:
-        process_id = str(req.get("process_id", ""))
-        rpc_endpoint = str(req.get("rpc_endpoint", ""))
-        if not process_id or not rpc_endpoint:
-            return {
-                "ok": False,
-                "error": {"code": "invalid_advertise", "message": "missing fields"},
-            }
-        handle = self._processes.get(process_id)
-        if handle is None:
-            return {"ok": False, "error": {"code": "unknown_process"}}
-        if handle.rpc_endpoint != rpc_endpoint:
-            self._close_process_rpc(handle)
-        handle.rpc_endpoint = rpc_endpoint
-        self._publish_manager_event(
-            "manager.process.rpc_update",
-            {
-                "process_id": process_id,
-                "rpc_endpoint": rpc_endpoint,
-                "ts": {"t_wall": time.time(), "t_mono": time.monotonic()},
-            },
-        )
-        return {"ok": True, "result": {"process_id": process_id}}
+        return shared_route_process_rpc_advertise(self, req)
 
     def _route_process_rpc(self, req: Json) -> Json:
-        process_id = str(req.get("process_id", ""))
-        request = req.get("request")
-        request_id = req.get("request_id")
-        caller_process_id = req.get("caller_process_id")
-        source_kind, source_id = self._normalize_command_source(
-            source_kind=req.get("source_kind"),
-            source_id=req.get("source_id"),
-            caller_process_id=caller_process_id,
-        )
-        process_action = "process.rpc"
-        process_params: Json = {}
-        if isinstance(request, dict):
-            process_action = str(request.get("type", "process.rpc") or "process.rpc")
-            raw_params = request.get("params", {})
-            if isinstance(raw_params, dict):
-                process_params = raw_params
-        if not process_id or not isinstance(request, dict):
-            resp = {
-                "ok": False,
-                "error": {"code": "invalid_process_rpc", "message": "bad request"},
-            }
-            return self._publish_process_command_response(
-                process_id=process_id or "unknown",
-                action=process_action,
-                params=process_params,
-                response=resp,
-                request_id=request_id,
-                caller_process_id=caller_process_id,
-                source_kind=source_kind,
-                source_id=source_id,
-            )
-        handle = self._processes.get(process_id)
-        if handle is None:
-            resp = {"ok": False, "error": {"code": "unknown_process"}}
-            return self._publish_process_command_response(
-                process_id=process_id,
-                action=process_action,
-                params=process_params,
-                response=resp,
-                request_id=request_id,
-                caller_process_id=caller_process_id,
-                source_kind=source_kind,
-                source_id=source_id,
-            )
-        if handle.state not in {
-            ManagedProcessState.STARTING,
-            ManagedProcessState.RUNNING,
-            ManagedProcessState.STOPPING,
-        }:
-            resp = {"ok": False, "error": {"code": "process_not_running"}}
-            return self._publish_process_command_response(
-                process_id=process_id,
-                action=process_action,
-                params=process_params,
-                response=resp,
-                request_id=request_id,
-                caller_process_id=caller_process_id,
-                source_kind=source_kind,
-                source_id=source_id,
-            )
-        if handle.rpc_endpoint is None:
-            if (
-                process_action == "process.capabilities"
-                and handle.state == ManagedProcessState.STARTING
-            ):
-                resp = {
-                    "ok": False,
-                    "error": {
-                        "code": "process_starting",
-                        "message": "process is starting; RPC endpoint not advertised yet",
-                        "retry_after_ms": 500,
-                    },
-                }
-            else:
-                resp = {"ok": False, "error": {"code": "process_rpc_not_ready"}}
-            return self._publish_process_command_response(
-                process_id=process_id,
-                action=process_action,
-                params=process_params,
-                response=resp,
-                request_id=request_id,
-                caller_process_id=caller_process_id,
-                source_kind=source_kind,
-                source_id=source_id,
-            )
-        try:
-            resp = self._call_process_rpc(
-                process_id=process_id,
-                request=request,
-            )
-        except Exception as e:
-            resp = {
-                "ok": False,
-                "error": {"code": "process_rpc_failed", "message": str(e)},
-            }
-            return self._publish_process_command_response(
-                process_id=process_id,
-                action=process_action,
-                params=process_params,
-                response=resp,
-                request_id=request_id,
-                caller_process_id=caller_process_id,
-                source_kind=source_kind,
-                source_id=source_id,
-            )
-        return self._publish_process_command_response(
-            process_id=process_id,
-            action=process_action,
-            params=process_params,
-            response=resp,
-            request_id=request_id,
-            caller_process_id=caller_process_id,
-            source_kind=source_kind,
-            source_id=source_id,
+        return shared_route_process_rpc(
+            self,
+            req,
+            running_states={
+                ManagedProcessState.STARTING,
+                ManagedProcessState.RUNNING,
+                ManagedProcessState.STOPPING,
+            },
+            starting_state=ManagedProcessState.STARTING,
         )
 
     def _route_command_interceptor_register(self, req: Json) -> Json:
-        process_id = str(req.get("process_id", ""))
-        routes_raw = req.get("routes", [])
-        replace = bool(req.get("replace", False))
-        if not process_id:
-            return {
-                "ok": False,
-                "error": {"code": "invalid_register", "message": "missing process_id"},
-            }
-        try:
-            routes = self._register_command_interceptor_routes(
-                process_id, routes_raw, replace=replace
-            )
-        except Exception as e:
-            return {"ok": False, "error": {"code": "register_failed", "message": str(e)}}
-        return {"ok": True, "result": {"routes": routes}}
+        return shared_route_command_interceptor_register(self, req)
 
     def _route_command_interceptor_list(self, req: Json) -> Json:
-        del req
-        return {"ok": True, "result": {"routes": self._command_interceptor_routes_snapshot()}}
+        return shared_route_command_interceptor_list(self, req)
 
     def _route_manager_request(self, rtype: Any, req: Json) -> Json | None:
-        handlers: dict[str, Callable[[Json], Json]] = {
-            "manager.shutdown": self._route_manager_shutdown,
-            "manager.identity": self._route_manager_identity,
-            "manager.cleanup_orphans": self._route_manager_cleanup_orphans,
-            "manager.log.publish": self._route_manager_log_publish,
-            "manager.log.tail": self._route_manager_log_tail,
-            "manager.command_journal.status": self._route_manager_command_journal_status,
-            "manager.command_journal.tail": self._route_manager_command_journal_tail,
-            "manager.event.publish": self._route_manager_event_publish,
-        }
-        handler = handlers.get(str(rtype))
-        if handler is None:
-            return None
-        return handler(req)
+        return shared_route_manager_request(self, rtype, req)
 
     def _route_manager_shutdown(self, req: Json) -> Json:
-        del req
-        self.shutdown()
-        return {"ok": True, "result": {"status": "shutting_down"}}
+        return shared_route_manager_shutdown(self, req)
 
     def _route_manager_identity(self, req: Json) -> Json:
-        del req
-        manager_pid = int(os.getpid())
-        lock_status = read_instance_lock_status(self._instance_id)
-        lock_effective_status = derive_lock_effective_status(
-            lock_status=lock_status,
-            manager_pid=manager_pid,
-            manager_reachable=True,
-            reported_effective_status=None,
-        )
-        process_guard = getattr(self, "_process_guard", None)
-        process_guard_enabled = bool(
-            getattr(process_guard, "available", False) if process_guard is not None else False
-        )
-        process_guard_init_error = getattr(self, "_process_guard_init_error", None)
-        if process_guard_init_error is None and process_guard is not None:
-            process_guard_init_error = getattr(process_guard, "init_error", None)
-        process_guard_attach_failures = int(
-            getattr(self, "_process_guard_attach_failures", 0) or 0
-        )
-        process_guard_last_error = getattr(self, "_process_guard_last_error", None)
-        return {
-            "ok": True,
-            "result": {
-                "version": 1,
-                "instance_id": self._instance_id,
-                "manager_pid": manager_pid,
-                "started_ts": {
-                    "t_wall": float(self._started_t_wall),
-                    "t_mono": float(self._started_t_mono),
-                },
-                "lock_status": lock_status,
-                "lock_effective_status": lock_effective_status,
-                "lock_effective_help": lock_effective_status_help(lock_effective_status),
-                "last_orphan_cleanup": self._last_orphan_cleanup,
-                "process_guard": {
-                    "enabled": process_guard_enabled,
-                    "init_error": process_guard_init_error,
-                    "attach_failures": process_guard_attach_failures,
-                    "last_attach_error": process_guard_last_error,
-                },
-            },
-        }
+        return shared_route_manager_identity(self, req)
 
     def _route_manager_cleanup_orphans(self, req: Json) -> Json:
-        params = req.get("params", {})
-        if params is None:
-            params = {}
-        if not isinstance(params, dict):
-            return {
-                "ok": False,
-                "error": {"code": "invalid_params", "message": "params must be a dict"},
-            }
-        try:
-            dry_run = bool(params.get("dry_run", False))
-            stale_only = bool(params.get("stale_only", True))
-            timeout_s = float(params.get("timeout_s", 2.0))
-            if timeout_s <= 0:
-                raise ValueError("timeout_s must be > 0")
-        except Exception as e:
-            return {
-                "ok": False,
-                "error": {"code": "invalid_params", "message": str(e)},
-            }
-        result = self._cleanup_orphans_summary(
-            dry_run=dry_run,
-            stale_only=stale_only,
-            timeout_s=timeout_s,
-        )
-        self._record_orphan_cleanup(source="rpc", summary=result)
-        self._publish_manager_event(
-            "manager.orphan_cleanup",
-            {
-                "result": result,
-                "ts": {"t_wall": time.time(), "t_mono": time.monotonic()},
-            },
-        )
-        return {"ok": True, "result": result}
+        return shared_route_manager_cleanup_orphans(self, req)
 
     def _route_manager_log_publish(self, req: Json) -> Json:
-        payload = req.get("payload")
-        if not isinstance(payload, dict):
-            return {"ok": False, "error": {"code": "invalid_payload"}}
-        entry = self._emit_log_from_payload(payload, default_topic="manager.log.publish")
-        return {"ok": True, "result": {"status": "published", "entry": entry}}
+        return shared_route_manager_log_publish(self, req)
 
     def _route_manager_log_tail(self, req: Json) -> Json:
-        params = req.get("params", {})
-        if params is None:
-            params = {}
-        if not isinstance(params, dict):
-            return {
-                "ok": False,
-                "error": {
-                    "code": "invalid_params",
-                    "message": "params must be a dict",
-                },
-            }
-        try:
-            result = self._log_tail(params)
-        except Exception as e:
-            return {
-                "ok": False,
-                "error": {"code": "invalid_params", "message": str(e)},
-            }
-        return {"ok": True, "result": result}
+        return shared_route_manager_log_tail(self, req)
 
     def _route_manager_command_journal_status(self, req: Json) -> Json:
-        del req
-        return {"ok": True, "result": self._command_journal_status_payload()}
+        return shared_route_manager_command_journal_status(self, req)
 
     def _route_manager_command_journal_tail(self, req: Json) -> Json:
-        params = req.get("params", {})
-        if params is None:
-            params = {}
-        if not isinstance(params, dict):
-            return {
-                "ok": False,
-                "error": {"code": "invalid_params", "message": "params must be a dict"},
-            }
-        journal = self._command_journal
-        if journal is None:
-            return {
-                "ok": False,
-                "error": {
-                    "code": "journal_disabled",
-                    "message": "command journal is disabled",
-                },
-            }
-        try:
-            result = journal.tail(params)
-        except Exception as e:
-            return {
-                "ok": False,
-                "error": {"code": "invalid_params", "message": str(e)},
-            }
-        return {"ok": True, "result": result}
+        return shared_route_manager_command_journal_tail(self, req)
 
     def _route_manager_event_publish(self, req: Json) -> Json:
-        topic = req.get("topic")
-        payload = req.get("payload")
-        if not isinstance(topic, str) or not topic.strip():
-            return {"ok": False, "error": {"code": "invalid_topic"}}
-        if not isinstance(payload, dict):
-            return {"ok": False, "error": {"code": "invalid_payload"}}
-        normalized_topic = self._normalize_topic(topic)
-        if normalized_topic == "manager.log":
-            self._emit_log_from_payload(payload, default_topic=normalized_topic)
-        else:
-            self._publish_manager_event(normalized_topic, payload)
-        return {"ok": True, "result": {"status": "published"}}
+        return shared_route_manager_event_publish(self, req)
 
     def _call_device_rpc(
         self,
@@ -3125,166 +2237,43 @@ class Manager:
                 )
 
     def _update_device_driver_exit_state(self, handle: DeviceHandle, rc: int) -> None:
-        handle.driver_last_exit_code = int(rc)
-        handle.process = None
-        handle.driver_pid = None
-        if (
-            handle.driver_process_state == ManagedProcessState.STOPPING
-            and handle.driver_stop_requested_t_mono is not None
-        ):
-            handle.driver_process_state = ManagedProcessState.STOPPED
-            self._publish_driver_event("manager.driver.stopped", handle)
-            return
-        if rc == 0:
-            handle.driver_process_state = ManagedProcessState.STOPPED
-            self._publish_driver_event("manager.driver.exited", handle)
-            return
-        handle.driver_process_state = ManagedProcessState.FAILED
-        handle.driver_last_error = handle.driver_last_error or "driver exited"
-        self._publish_driver_event("manager.driver.failed", handle)
+        shared_update_device_driver_exit_state(self, handle, rc)
 
     def _enforce_device_driver_stop_timeout(
         self, handle: DeviceHandle, now_mono: float
     ) -> None:
-        if handle.driver_process_state != ManagedProcessState.STOPPING:
-            return
-        if (
-            handle.driver_stop_requested_t_mono is None
-            or handle.process is None
-            or handle.process.poll() is not None
-        ):
-            return
-        if now_mono - handle.driver_stop_requested_t_mono > handle.spec.driver_stop_timeout_s:
-            try:
-                handle.process.kill()
-                self._publish_driver_event("manager.driver.killing", handle)
-            except Exception as e:
-                handle.driver_last_error = str(e)
-        if (
-            now_mono - handle.driver_stop_requested_t_mono
-            > handle.spec.driver_stop_timeout_s + handle.spec.driver_kill_timeout_s
-            and handle.process is not None
-            and handle.process.poll() is None
-        ):
-            handle.driver_process_state = ManagedProcessState.FAILED
-            handle.driver_last_error = "kill timeout"
-            self._publish_driver_event("manager.driver.kill_timeout", handle)
+        shared_enforce_device_driver_stop_timeout(self, handle, now_mono)
 
     def _maybe_restart_device_driver(
         self, device_id: str, handle: DeviceHandle, now_mono: float
     ) -> None:
-        if (
-            handle.driver_next_restart_t_mono is None
-            or now_mono < handle.driver_next_restart_t_mono
-        ):
-            return
-        if (
-            handle.spec.driver_max_restarts is not None
-            and handle.driver_restart_count >= handle.spec.driver_max_restarts
-        ):
-            handle.driver_process_state = ManagedProcessState.CRASHLOOP
-            handle.driver_next_restart_t_mono = None
-            self._publish_driver_event("manager.driver.crashloop", handle)
-            return
-        handle.driver_restart_count += 1
-        handle.driver_last_restart_t_mono = now_mono
-        handle.driver_next_restart_t_mono = None
-        self._publish_driver_event("manager.driver.restarting", handle)
-        self.start_driver(device_id)
+        shared_maybe_restart_device_driver(self, device_id, handle, now_mono)
 
     def _supervise_device_drivers(self, now_mono: float) -> None:
-        for device_id, handle in self._devices.items():
-            proc = handle.process
-            if proc is not None:
-                rc = proc.poll()
-                if rc is not None:
-                    self._update_device_driver_exit_state(handle, int(rc))
-            self._enforce_device_driver_stop_timeout(handle, now_mono)
-            self._maybe_restart_device_driver(device_id, handle, now_mono)
+        shared_supervise_device_drivers(self, now_mono)
 
-    def _update_managed_process_exit_state(self, handle: ProcessHandle, rc: int) -> bool:
-        handle.last_exit_code = int(rc)
-        handle.popen = None
-        handle.pid = None
-        handle.rpc_endpoint = None
-        self._close_process_rpc(handle)
-        if handle.state == ManagedProcessState.STOPPING:
-            handle.state = ManagedProcessState.EXITED
-            self._publish_process_event("manager.process.exited", handle)
-            return False
-        if rc == 0:
-            handle.state = ManagedProcessState.STOPPED
-            self._publish_process_event("manager.process.exited", handle)
-            return False
-        if self._maybe_recover_process_start_collision(handle):
-            return True
-        handle.state = ManagedProcessState.FAILED
-        handle.last_error = handle.last_error or "process exited"
-        self._publish_process_event("manager.process.failed", handle)
-        return False
+    def _update_managed_process_exit_state(
+        self, handle: ProcessHandle, rc: int
+    ) -> bool:
+        return shared_update_managed_process_exit_state(self, handle, rc)
 
     def _enforce_managed_process_heartbeat_timeout(
         self, handle: ProcessHandle, now_mono: float
     ) -> None:
-        if handle.state not in {
-            ManagedProcessState.STARTING,
-            ManagedProcessState.RUNNING,
-        }:
-            return
-        hb_age: float | None = None
-        if handle.last_hb_t_mono is not None:
-            hb_age = now_mono - handle.last_hb_t_mono
-        elif handle.last_start_t_mono is not None:
-            hb_age = now_mono - handle.last_start_t_mono
-        if hb_age is None or hb_age <= handle.spec.heartbeat_timeout_s:
-            return
-        handle.state = ManagedProcessState.FAILED
-        handle.last_error = "heartbeat stale"
-        if handle.popen is not None and handle.popen.poll() is None:
-            try:
-                handle.popen.terminate()
-                handle.stop_requested_t_mono = now_mono
-            except Exception as e:
-                handle.last_error = f"heartbeat stale; terminate failed: {e}"
-        self._publish_process_event("manager.process.failed", handle)
+        shared_enforce_managed_process_heartbeat_timeout(self, handle, now_mono)
 
     def _enforce_managed_process_stop_timeout(
         self, handle: ProcessHandle, now_mono: float
     ) -> None:
-        if (
-            handle.state != ManagedProcessState.STOPPING
-            or handle.stop_requested_t_mono is None
-            or handle.popen is None
-            or handle.popen.poll() is not None
-        ):
-            return
-        if now_mono - handle.stop_requested_t_mono <= handle.spec.shutdown_timeout_s:
-            return
-        try:
-            handle.popen.kill()
-        except Exception as e:
-            handle.last_error = str(e)
+        shared_enforce_managed_process_stop_timeout(self, handle, now_mono)
 
-    def _maybe_restart_managed_process(self, handle: ProcessHandle, now_mono: float) -> None:
-        if handle.state in {ManagedProcessState.FAILED, ManagedProcessState.EXITED}:
-            if handle.stop_requested_t_mono is None:
-                self._maybe_schedule_restart(handle, now_mono)
-        if (
-            handle.next_restart_t_mono is not None
-            and now_mono >= handle.next_restart_t_mono
-        ):
-            self._try_restart_process(handle)
+    def _maybe_restart_managed_process(
+        self, handle: ProcessHandle, now_mono: float
+    ) -> None:
+        shared_maybe_restart_managed_process(self, handle, now_mono)
 
     def _supervise_managed_processes(self, now_mono: float) -> None:
-        for _process_id, handle in self._processes.items():
-            popen = handle.popen
-            if popen is not None:
-                rc = popen.poll()
-                if rc is not None and self._update_managed_process_exit_state(handle, int(rc)):
-                    continue
-            self._enforce_managed_process_heartbeat_timeout(handle, now_mono)
-            self._enforce_managed_process_stop_timeout(handle, now_mono)
-            self._maybe_restart_managed_process(handle, now_mono)
+        shared_supervise_managed_processes(self, now_mono)
 
     def _check_timeouts(self) -> None:
         now_mono = time.monotonic()
@@ -3404,7 +2393,9 @@ class Manager:
         }
 
     def _list_devices_status_snapshot(self) -> list[Json]:
-        device_ids = sorted(set(self._devices) | set(self._federation_hub.mirrored_device_ids()))
+        device_ids = sorted(
+            set(self._devices) | set(self._federation_hub.mirrored_device_ids())
+        )
         return [self._device_status_snapshot(did) for did in device_ids]
 
     def _telemetry_schema_list(self) -> Json:
@@ -3451,17 +2442,7 @@ class Manager:
     # -----------------------------
 
     def _publish_manager_event(self, topic: str, payload: Json) -> None:
-        # External subscribers can filter topics at SUBSCRIBE level.
-        self._external_pub.send_multipart(
-            [topic.encode("utf-8"), json_dumps(payload)]
-        )
-        if topic == "manager.command":
-            self._append_command_journal_entry(payload)
-        for hook in self._event_hooks:
-            hook(topic, payload)
-        if topic != "manager.log":
-            self._maybe_publish_log_event(topic, payload)
-        self._maybe_emit_manager_log_sink(topic, payload)
+        shared_publish_manager_event(self, topic, payload)
 
     @staticmethod
     def _safe_json(value: Any, *, max_len: int = 4000) -> str:
@@ -3475,22 +2456,7 @@ class Manager:
 
     @staticmethod
     def _should_journal_command_action(action: Any) -> bool:
-        text = str(action or "").strip().lower()
-        if not text:
-            return True
-        if text.startswith("stream__"):
-            return False
-        if text.startswith("telemetry__"):
-            return False
-        if text == "capabilities" or text.endswith(".capabilities"):
-            return False
-        if text.endswith(".status"):
-            return False
-        if text.endswith(".list_status"):
-            return False
-        if text in {"device.get_status", "device.list_status", "process.list_status"}:
-            return False
-        return True
+        return shared_should_journal_command_action(action)
 
     @staticmethod
     def _normalize_command_source(
@@ -3521,64 +2487,10 @@ class Manager:
         return source_kind_text, source_id_text
 
     def _append_command_journal_entry(self, payload: Json) -> None:
-        journal = self._command_journal
-        if journal is None:
-            return
-        action_text = str(payload.get("action", "") or "")
-        if not self._should_journal_command_action(action_text):
-            return
-
-        ts = payload.get("ts")
-        t_wall = time.time()
-        t_mono = time.monotonic()
-        if isinstance(ts, dict):
-            try:
-                t_wall = float(ts.get("t_wall", t_wall))
-            except Exception:
-                pass
-            try:
-                t_mono = float(ts.get("t_mono", t_mono))
-            except Exception:
-                pass
-
-        error_value = payload.get("error")
-        error_json = ""
-        if error_value is not None:
-            error_json = self._safe_json(error_value)
-
-        journal.append(
-            {
-                "t_wall": t_wall,
-                "t_mono": t_mono,
-                "instance_id": self._instance_id,
-                "device_id": str(payload.get("device_id", "") or ""),
-                "action": action_text,
-                "params_json": str(payload.get("params_json", "") or ""),
-                "ok": bool(payload.get("ok")),
-                "status": payload.get("status"),
-                "error_json": error_json,
-                "result_json": str(payload.get("result_json", "") or ""),
-                "request_id": payload.get("request_id"),
-                "caller_process_id": payload.get("caller_process_id"),
-                "source_kind": payload.get("source_kind"),
-                "source_id": payload.get("source_id"),
-                "is_remote_target": bool(payload.get("is_remote_target")),
-            }
-        )
+        shared_append_command_journal_entry(self, payload)
 
     def _command_journal_status_payload(self) -> Json:
-        journal = self._command_journal
-        if journal is None:
-            return {
-                "enabled": False,
-                "path": (
-                    str(self._command_journal_path)
-                    if self._command_journal_path is not None
-                    else None
-                ),
-                "start_error": self._command_journal_start_error,
-            }
-        return journal.status()
+        return shared_command_journal_status_payload(self)
 
     def _publish_process_command_event(
         self,
@@ -3632,10 +2544,10 @@ class Manager:
             if isinstance(error_obj, dict)
             else ""
         )
-        if (
-            str(action or "").strip() == "process.capabilities"
-            and error_code in {"process_rpc_not_ready", "process_starting"}
-        ):
+        if str(action or "").strip() == "process.capabilities" and error_code in {
+            "process_rpc_not_ready",
+            "process_starting",
+        }:
             handle = self._processes.get(str(process_id))
             if handle is not None and handle.state == ManagedProcessState.STARTING:
                 return
@@ -3647,156 +2559,44 @@ class Manager:
 
     @staticmethod
     def _parse_boolish(raw: Any, *, default: bool) -> bool:
-        if raw is None:
-            return bool(default)
-        if isinstance(raw, bool):
-            return raw
-        text = str(raw).strip().lower()
-        if not text:
-            return bool(default)
-        if text in {"1", "true", "yes", "on"}:
-            return True
-        if text in {"0", "false", "no", "off"}:
-            return False
-        return bool(default)
+        return shared_parse_boolish(raw, default=default)
 
     def _resolve_manager_log_stderr_enabled(self, raw: Any) -> bool:
-        if raw is None:
-            return self._parse_boolish(
-                os.environ.get("MANAGER_LOG_STDERR"), default=True
-            )
-        return self._parse_boolish(raw, default=True)
+        return shared_resolve_manager_log_stderr_enabled(self, raw)
 
     def _resolve_manager_log_file_path(self, raw: Any) -> Path | None:
-        value = raw
-        if value is None:
-            value = os.environ.get("MANAGER_LOG_FILE")
-        if value is None:
-            return None
-        text = str(value).strip()
-        if not text:
-            return None
-        return Path(text).expanduser()
+        return shared_resolve_manager_log_file_path(raw)
 
     def _resolve_manager_log_min_level(self, raw: Any) -> str:
-        value = raw
-        if value is None:
-            value = os.environ.get("MANAGER_LOG_MIN_LEVEL")
-        text = str(value or "").strip().lower()
-        if not text:
-            return "error"
-        if not is_valid_log_severity(text):
-            return "error"
-        return normalize_log_severity(text, default="error")
+        return shared_resolve_manager_log_min_level(raw)
 
     @staticmethod
     def _severity_rank(raw: Any) -> int:
         return severity_rank(raw, default="info")
 
     def _open_manager_log_sink_file(self) -> None:
-        path = self._manager_log_file_path
-        if path is None:
-            return
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            self._manager_log_file = path.open("a", encoding="utf-8", buffering=1)
-        except Exception as e:
-            self._manager_log_file = None
-            if self._manager_log_stderr_enabled:
-                try:
-                    sys.stderr.write(
-                        f"[manager][warning] MANAGER_LOG_FILE open failed: {path} ({e})\n"
-                    )
-                    sys.stderr.flush()
-                except Exception:
-                    pass
+        shared_open_manager_log_sink_file(self)
 
     def _close_manager_log_sink_file(self) -> None:
-        handle = self._manager_log_file
-        self._manager_log_file = None
-        if handle is None:
-            return
-        try:
-            handle.close()
-        except Exception:
-            pass
+        shared_close_manager_log_sink_file(self)
 
     def _manager_log_sink_event(
         self, topic: str, payload: Json
     ) -> tuple[str, str, str, str | None, str]:
-        if topic == "manager.log":
-            severity = self._normalize_log_severity(payload.get("severity"))
-            line_topic = self._normalize_topic(str(payload.get("topic") or "manager.log"))
-        elif topic.startswith("manager.") and topic.endswith("_error"):
-            severity = "error"
-            line_topic = self._normalize_topic(topic)
-        else:
-            raise ValueError("not sink-eligible")
-
-        source_kind = self._normalize_id(payload.get("source_kind")) or "manager"
-        source_id = self._normalize_id(payload.get("source_id"))
-        message = payload.get("message")
-        if message is None:
-            message = payload.get("error")
-        text = str(message or "").strip()
-        if not text:
-            payload_json = payload.get("payload_json")
-            if isinstance(payload_json, str) and payload_json.strip():
-                text = payload_json.strip()
-            else:
-                text = self._safe_json(payload)
-        text = text.replace("\r\n", " ").replace("\n", " ").replace("\r", " ").strip()
-        if len(text) > 500:
-            text = text[:497] + "..."
-        return severity, line_topic, source_kind, source_id, text
+        return shared_manager_log_sink_event(self, topic, payload)
 
     def _manager_log_sink_is_duplicate(self, fingerprint: str) -> bool:
-        now = time.monotonic()
-        recent = getattr(self, "_manager_log_sink_recent", None)
-        if not isinstance(recent, dict):
-            recent = {}
-            self._manager_log_sink_recent = recent
-        window_s = float(getattr(self, "_manager_log_sink_recent_window_s", 0.5))
-        max_items = int(getattr(self, "_manager_log_sink_recent_max", 256))
-        prev = recent.get(fingerprint)
-        if prev is not None and (now - prev) <= window_s:
-            return True
-        recent[fingerprint] = now
-        if len(recent) > max_items:
-            cutoff = now - window_s
-            drop = [key for key, ts in recent.items() if ts < cutoff]
-            for key in drop:
-                recent.pop(key, None)
-            if len(recent) > max_items:
-                overflow = len(recent) - max_items
-                for key in list(recent.keys())[:overflow]:
-                    recent.pop(key, None)
-        return False
+        return shared_manager_log_sink_is_duplicate(self, fingerprint)
 
     def _maybe_emit_manager_log_sink(self, topic: str, payload: Json) -> None:
         shared_maybe_emit_manager_log_sink(self, topic, payload)
 
     @staticmethod
     def _normalize_id(raw: Any) -> str | None:
-        if raw is None:
-            return None
-        text = str(raw).strip()
-        return text if text else None
+        return shared_normalize_id(raw)
 
     def _normalize_log_ts(self, raw: Any) -> Json:
-        now_wall = time.time()
-        now_mono = time.monotonic()
-        if not isinstance(raw, dict):
-            return {"t_wall": now_wall, "t_mono": now_mono}
-        try:
-            t_wall = float(raw.get("t_wall", now_wall))
-        except Exception:
-            t_wall = now_wall
-        try:
-            t_mono = float(raw.get("t_mono", now_mono))
-        except Exception:
-            t_mono = now_mono
-        return {"t_wall": t_wall, "t_mono": t_mono}
+        return shared_normalize_log_ts(raw)
 
     def _emit_log(
         self,
@@ -3813,262 +2613,73 @@ class Manager:
         payload_json: Any = None,
         ts: Any = None,
     ) -> Json:
-        sev = self._normalize_log_severity(severity)
-        normalized_topic = self._normalize_topic(str(topic or "manager.log"))
-        source_kind_text = self._normalize_id(source_kind) or "manager"
-        source_id_text = self._normalize_id(source_id)
-        device_id_text = self._normalize_id(device_id)
-        process_id_text = self._normalize_id(process_id)
-        stream_text = self._normalize_id(stream) or "event"
-        msg_text = str(message or "")
-
-        if payload_json is None:
-            payload_json_text = self._safe_json(payload) if payload is not None else ""
-        else:
-            payload_json_text = str(payload_json)
-            if len(payload_json_text) > 4000:
-                payload_json_text = payload_json_text[:4000] + "...(truncated)"
-
-        entry: Json = {
-            "version": 1,
-            "severity": sev,
-            "topic": normalized_topic,
-            "source_kind": source_kind_text,
-            "source_id": source_id_text,
-            "device_id": device_id_text,
-            "process_id": process_id_text,
-            "stream": stream_text,
-            "message": msg_text,
-            "payload_json": payload_json_text,
-            "ts": self._normalize_log_ts(ts),
-        }
-        self._log_history.append(entry)
-        self._publish_manager_event("manager.log", entry)
-        return entry
-
-    def _emit_log_from_payload(
-        self, payload: Json, *, default_topic: str = "manager.log"
-    ) -> Json:
-        source_kind = payload.get("source_kind")
-        source_id = payload.get("source_id")
-        device_id = payload.get("device_id")
-        process_id = payload.get("process_id")
-
-        if source_kind is None:
-            if process_id is not None:
-                source_kind = "process"
-                if source_id is None:
-                    source_id = process_id
-            elif device_id is not None:
-                source_kind = "driver"
-                if source_id is None:
-                    source_id = device_id
-            else:
-                source_kind = "manager"
-
-        message = payload.get("message")
-        if message is None:
-            message = payload.get("error", "")
-
-        raw_payload: Json | None = None
-        payload_value = payload.get("payload")
-        if isinstance(payload_value, dict):
-            raw_payload = payload_value
-
-        return self._emit_log(
-            severity=payload.get("severity", "info"),
-            topic=payload.get("topic", default_topic),
+        return shared_emit_log(
+            self,
+            severity=severity,
+            topic=topic,
             message=message,
             source_kind=source_kind,
             source_id=source_id,
             device_id=device_id,
             process_id=process_id,
-            stream=payload.get("stream", "event"),
-            payload=raw_payload,
-            payload_json=payload.get("payload_json"),
-            ts=payload.get("ts"),
+            stream=stream,
+            payload=payload,
+            payload_json=payload_json,
+            ts=ts,
+        )
+
+    def _emit_log_from_payload(
+        self, payload: Json, *, default_topic: str = "manager.log"
+    ) -> Json:
+        return shared_emit_log_from_payload(
+            self,
+            payload,
+            default_topic=default_topic,
         )
 
     @staticmethod
     def _normalize_filter_set(raw: Any, *, field: str) -> set[str] | None:
-        if raw is None:
-            return None
-        if isinstance(raw, str):
-            text = raw.strip()
-            if not text:
-                return None
-            return {text}
-        if isinstance(raw, list):
-            out: set[str] = set()
-            for item in raw:
-                text = str(item).strip()
-                if text:
-                    out.add(text)
-            return out if out else None
-        raise TypeError(f"{field} must be a string or list[str]")
+        return shared_normalize_filter_set(raw, field=field)
 
     @staticmethod
     def _parse_log_tail_limit(raw: Any) -> int:
-        try:
-            limit = int(raw)
-        except Exception as e:
-            raise TypeError(f"limit must be int: {e}") from e
-        return max(1, min(limit, 5000))
+        return shared_parse_log_tail_limit(raw)
 
     @staticmethod
     def _parse_log_tail_since_t_mono(raw: Any) -> float | None:
-        if raw is None:
-            return None
-        try:
-            return float(raw)
-        except Exception as e:
-            raise TypeError(f"since_t_mono must be float: {e}") from e
+        return shared_parse_log_tail_since_t_mono(raw)
 
     def _log_tail_filters(self, params: Json) -> dict[str, Any]:
-        severity_min_raw = params.get("severity_min")
-        severity_min_rank: int | None = None
-        if severity_min_raw is not None:
-            severity_min_rank = self._severity_rank(severity_min_raw)
-
-        severity_set = self._normalize_filter_set(params.get("severity"), field="severity")
-        if severity_set is not None:
-            severity_set = {self._normalize_log_severity(item) for item in severity_set}
-
-        source_kind_set = self._normalize_filter_set(
-            params.get("source_kind"), field="source_kind"
-        )
-        if source_kind_set is not None:
-            source_kind_set = {item.lower() for item in source_kind_set}
-
-        return {
-            "since_t_mono": self._parse_log_tail_since_t_mono(params.get("since_t_mono")),
-            "severity_min_rank": severity_min_rank,
-            "severity_set": severity_set,
-            "source_kind_set": source_kind_set,
-            "device_set": self._normalize_filter_set(
-                params.get("device_ids"), field="device_ids"
-            ),
-            "process_set": self._normalize_filter_set(
-                params.get("process_ids"), field="process_ids"
-            ),
-            "source_id_set": self._normalize_filter_set(
-                params.get("source_ids"), field="source_ids"
-            ),
-            "topic_contains": str(params.get("topic_contains", "") or "").strip().lower(),
-            "text_contains": str(params.get("text_contains", "") or "").strip().lower(),
-        }
+        return shared_log_tail_filters(self, params)
 
     @staticmethod
     def _log_tail_entry_t_mono(entry: Json) -> float | None:
-        ts = entry.get("ts")
-        if not isinstance(ts, dict):
-            return None
-        try:
-            return float(ts.get("t_mono"))
-        except Exception:
-            return None
+        return shared_log_tail_entry_t_mono(entry)
 
     def _log_tail_matches_time(self, entry: Json, *, filters: dict[str, Any]) -> bool:
-        since_t_mono = filters.get("since_t_mono")
-        if since_t_mono is not None:
-            t_mono = self._log_tail_entry_t_mono(entry)
-            if t_mono is None or t_mono < float(since_t_mono):
-                return False
-        return True
+        return shared_log_tail_matches_time(entry, filters=filters)
 
-    def _log_tail_matches_severity(self, entry: Json, *, filters: dict[str, Any]) -> bool:
-        severity = self._normalize_log_severity(entry.get("severity"))
-        severity_min_rank = filters.get("severity_min_rank")
-        if severity_min_rank is not None and self._severity_rank(severity) < int(
-            severity_min_rank
-        ):
-            return False
-        severity_set = filters.get("severity_set")
-        if isinstance(severity_set, set) and severity not in severity_set:
-            return False
-        return True
+    def _log_tail_matches_severity(
+        self, entry: Json, *, filters: dict[str, Any]
+    ) -> bool:
+        return shared_log_tail_matches_severity(entry, filters=filters)
 
     @staticmethod
     def _log_tail_matches_source_kind(entry: Json, *, filters: dict[str, Any]) -> bool:
-        source_kind = str(entry.get("source_kind", "") or "").lower()
-        source_kind_set = filters.get("source_kind_set")
-        if isinstance(source_kind_set, set) and source_kind not in source_kind_set:
-            return False
-        return True
+        return shared_log_tail_matches_source_kind(entry, filters=filters)
 
     def _log_tail_matches_ids(self, entry: Json, *, filters: dict[str, Any]) -> bool:
-        device_set = filters.get("device_set")
-        device_id = self._normalize_id(entry.get("device_id"))
-        if isinstance(device_set, set) and (device_id is None or device_id not in device_set):
-            return False
-
-        process_set = filters.get("process_set")
-        process_id = self._normalize_id(entry.get("process_id"))
-        if isinstance(process_set, set) and (
-            process_id is None or process_id not in process_set
-        ):
-            return False
-
-        source_id_set = filters.get("source_id_set")
-        source_id = self._normalize_id(entry.get("source_id"))
-        if isinstance(source_id_set, set) and (
-            source_id is None or source_id not in source_id_set
-        ):
-            return False
-        return True
+        return shared_log_tail_matches_ids(entry, filters=filters)
 
     @staticmethod
     def _log_tail_matches_contains(entry: Json, *, filters: dict[str, Any]) -> bool:
-        topic_contains = str(filters.get("topic_contains", "") or "")
-        if topic_contains:
-            topic = str(entry.get("topic", "") or "").lower()
-            if topic_contains not in topic:
-                return False
-
-        text_contains = str(filters.get("text_contains", "") or "")
-        if text_contains:
-            message = str(entry.get("message", "") or "").lower()
-            payload_json = str(entry.get("payload_json", "") or "").lower()
-            if text_contains not in message and text_contains not in payload_json:
-                return False
-
-        return True
+        return shared_log_tail_matches_contains(entry, filters=filters)
 
     def _log_tail_entry_matches(self, entry: Json, *, filters: dict[str, Any]) -> bool:
-        if not self._log_tail_matches_time(entry, filters=filters):
-            return False
-        if not self._log_tail_matches_severity(entry, filters=filters):
-            return False
-        if not self._log_tail_matches_source_kind(entry, filters=filters):
-            return False
-        if not self._log_tail_matches_ids(entry, filters=filters):
-            return False
-        return self._log_tail_matches_contains(entry, filters=filters)
+        return shared_log_tail_entry_matches(entry, filters=filters)
 
     def _log_tail(self, params: Json) -> Json:
-        limit = self._parse_log_tail_limit(params.get("limit", 200))
-        filters = self._log_tail_filters(params)
-
-        filtered: list[Json] = []
-        for entry in list(self._log_history):
-            if self._log_tail_entry_matches(entry, filters=filters):
-                filtered.append(entry)
-
-        total = len(filtered)
-        if total > limit:
-            filtered = filtered[-limit:]
-
-        latest_t_mono: float | None = None
-        if filtered:
-            latest_t_mono = self._log_tail_entry_t_mono(filtered[-1])
-
-        return {
-            "entries": filtered,
-            "count": len(filtered),
-            "total_matched": total,
-            "limit": limit,
-            "latest_t_mono": latest_t_mono,
-        }
+        return shared_log_tail(self, params)
 
     def _maybe_publish_log_event(self, topic: str, payload: Json) -> None:
         shared_maybe_publish_log_event(self, topic, payload)
@@ -4106,15 +2717,7 @@ class Manager:
         *,
         label: str,
     ) -> dict[str, Any]:
-        if not isinstance(raw, dict):
-            raise TypeError(f"{label} must be an object/dict")
-        out: dict[str, Any] = {}
-        for key, value in raw.items():
-            name = str(key).strip()
-            if not name:
-                raise ValueError(f"{label} keys must be non-empty strings")
-            out[name] = copy.deepcopy(value)
-        return out
+        return shared_normalize_runtime_metadata_dict(raw, label=label)
 
     @classmethod
     def _normalize_runtime_stream_metadata_dict(
@@ -4123,146 +2726,95 @@ class Manager:
         *,
         label: str,
     ) -> dict[str, dict[str, Any]]:
-        if not isinstance(raw, dict):
-            raise TypeError(f"{label} must be an object/dict")
-        out: dict[str, dict[str, Any]] = {}
-        for stream_raw, attrs_raw in raw.items():
-            stream = str(stream_raw).strip()
-            if not stream:
-                raise ValueError(f"{label} stream names must be non-empty strings")
-            attrs = cls._normalize_runtime_metadata_dict(
-                attrs_raw,
-                label=f"{label}.{stream}",
-            )
-            out[stream] = attrs
-        return out
+        del cls
+        return shared_normalize_runtime_stream_metadata_dict(raw, label=label)
 
     @staticmethod
     def _merge_stream_metadata_dicts(
         base: dict[str, dict[str, Any]],
         overlay: dict[str, dict[str, Any]],
     ) -> dict[str, dict[str, Any]]:
-        merged: dict[str, dict[str, Any]] = {}
-        for stream, attrs in base.items():
-            merged[stream] = dict(attrs)
-        for stream, attrs in overlay.items():
-            cur = dict(merged.get(stream, {}))
-            cur.update(attrs)
-            merged[stream] = cur
-        return merged
+        return shared_merge_stream_metadata_dicts(base, overlay)
 
     def _effective_metadata_for_device(
         self, device_id: str, spec: DeviceSpec
     ) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
-        base_device = copy.deepcopy(spec.device_metadata or {})
-        base_stream = copy.deepcopy(spec.stream_metadata or {})
-        override_device = copy.deepcopy(
-            self._runtime_device_metadata_overrides.get(device_id, {})
-        )
-        override_stream = copy.deepcopy(
-            self._runtime_stream_metadata_overrides.get(device_id, {})
-        )
-        effective_device = dict(base_device)
-        effective_device.update(override_device)
-        effective_stream = self._merge_stream_metadata_dicts(base_stream, override_stream)
-        return effective_device, effective_stream
+        return shared_effective_metadata_for_device(self, device_id, spec)
 
     def _runtime_metadata_state(self, device_id: str, handle: DeviceHandle) -> Json:
-        base_device = copy.deepcopy(handle.spec.device_metadata or {})
-        base_stream = copy.deepcopy(handle.spec.stream_metadata or {})
-        override_device = copy.deepcopy(
-            self._runtime_device_metadata_overrides.get(device_id, {})
-        )
-        override_stream = copy.deepcopy(
-            self._runtime_stream_metadata_overrides.get(device_id, {})
-        )
-        effective_device, effective_stream = self._effective_metadata_for_device(
-            device_id, handle.spec
-        )
-        return {
-            "device_id": device_id,
-            "revision": int(self._runtime_metadata_revision.get(device_id, 0)),
-            "base": {
-                "device_metadata": base_device,
-                "stream_metadata": base_stream,
-            },
-            "overrides": {
-                "device_metadata": override_device,
-                "stream_metadata": override_stream,
-            },
-            "effective": {
-                "device_metadata": effective_device,
-                "stream_metadata": effective_stream,
-            },
-        }
+        return shared_runtime_metadata_state(self, device_id, handle)
 
     def _touch_runtime_metadata_revision(self, device_id: str) -> int:
-        current = int(self._runtime_metadata_revision.get(device_id, 0))
-        next_rev = current + 1
-        self._runtime_metadata_revision[device_id] = next_rev
-        return next_rev
+        return shared_touch_runtime_metadata_revision(self, device_id)
 
     def _publish_device_config(self, handle: DeviceHandle) -> None:
-        payload: Json = self._device_config_payload(handle)
-        self._publish_manager_event("manager.device_config", payload)
+        shared_publish_device_config(self, handle)
 
     def _device_config_payload(self, handle: DeviceHandle) -> Json:
-        yaml_text = handle.spec.config_yaml_text
-        if yaml_text is None:
-            yaml_text = self._serialize_spec_yaml(handle.spec)
-        device_metadata, stream_metadata = self._effective_metadata_for_device(
-            handle.spec.device_id, handle.spec
-        )
-        return {
-            "version": 1,
-            "device_id": handle.spec.device_id,
-            "yaml_text": yaml_text,
-            "device_metadata": device_metadata,
-            "stream_metadata": stream_metadata,
-            "connect_check": {
-                "enabled": bool(handle.spec.connect_check.enabled),
-                "identity": copy.deepcopy(handle.spec.connect_check.identity),
-                "on_fail": str(handle.spec.connect_check.on_fail),
-            },
-            "telemetry_calls": telemetry_calls_to_json(handle.spec.telemetry_calls),
-            "stream_calls": stream_calls_to_json(list(handle.spec.stream_calls or [])),
-            "run_meta_calls": run_meta_calls_to_json(
-                list(handle.spec.run_meta_calls or [])
-            ),
-            "metadata_revision": int(
-                self._runtime_metadata_revision.get(handle.spec.device_id, 0)
-            ),
-            "source_kind": "local",
-            "is_remote": False,
-            "owner_peer_id": None,
-            "remote_device_id": None,
-        }
+        return shared_device_config_payload(self, handle)
 
     def _serialize_spec_yaml(self, spec: DeviceSpec) -> str:
-        payload = {
-            "device_id": spec.device_id,
-            "driver": {
-                "file": str(spec.device_class_path),
-                "class_name": spec.device_class_name,
-            },
-            "init_kwargs": spec.device_init_kwargs,
-            "telemetry_calls": telemetry_calls_to_json(spec.telemetry_calls),
-            "stream_calls": stream_calls_to_json(list(spec.stream_calls or [])),
-            "run_meta_calls": run_meta_calls_to_json(list(spec.run_meta_calls or [])),
-            "device_metadata": spec.device_metadata or {},
-            "stream_metadata": spec.stream_metadata or {},
-            "connect_check": {
-                "enabled": bool(spec.connect_check.enabled),
-                "identity": copy.deepcopy(spec.connect_check.identity),
-                "on_fail": str(spec.connect_check.on_fail),
-            },
-        }
-        try:
-            import yaml  # type: ignore[import-not-found]
+        return shared_serialize_spec_yaml(spec)
 
-            return yaml.safe_dump(payload, sort_keys=False)
+    # -----------------------------
+    # JSON helpers
+    # -----------------------------
+
+    @staticmethod
+    def _normalize_topic(topic: str) -> str:
+        return topic.strip()
+
+    @staticmethod
+    def _parse_timestamp(raw: Json) -> Timestamp:
+        return Timestamp(t_wall=float(raw["t_wall"]), t_mono=float(raw["t_mono"]))
+
+    @staticmethod
+    def _coerce_enum(enum_cls: Any, value: Any, default: Any) -> Any:
+        if isinstance(value, enum_cls):
+            return value
+        try:
+            return enum_cls(value)
         except Exception:
-            return json.dumps(payload, indent=2, sort_keys=False)
+            return default
+
+    @staticmethod
+    def _recv_json(sock: zmq.Socket) -> Json:
+        data = sock.recv()
+        msg = safe_json_loads(data)
+        if not isinstance(msg, dict):
+            raise TypeError("JSON message must be an object")
+        return msg
+
+    @staticmethod
+    def _send_json(sock: zmq.Socket, msg: Json) -> None:
+        sock.send(json_dumps(msg))
+
+    @staticmethod
+    def _merge_stream_metadata_dicts(
+        base: dict[str, dict[str, Any]],
+        overlay: dict[str, dict[str, Any]],
+    ) -> dict[str, dict[str, Any]]:
+        return shared_merge_stream_metadata_dicts(base, overlay)
+
+    def _effective_metadata_for_device(
+        self, device_id: str, spec: DeviceSpec
+    ) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
+        return shared_effective_metadata_for_device(self, device_id, spec)
+
+    def _runtime_metadata_state(self, device_id: str, handle: DeviceHandle) -> Json:
+        return shared_runtime_metadata_state(self, device_id, handle)
+
+    def _touch_runtime_metadata_revision(self, device_id: str) -> int:
+        return shared_touch_runtime_metadata_revision(self, device_id)
+
+    def _publish_device_config(self, handle: DeviceHandle) -> None:
+        shared_publish_device_config(self, handle)
+
+    def _device_config_payload(self, handle: DeviceHandle) -> Json:
+        return shared_device_config_payload(self, handle)
+
+    def _serialize_spec_yaml(self, spec: DeviceSpec) -> str:
+        return shared_serialize_spec_yaml(spec)
 
     # -----------------------------
     # JSON helpers
