@@ -9,7 +9,10 @@ import type { GatewaySettingsInfo } from "../api";
 import type { StreamAnalysisWorkspaceConfig } from "../features/stream/types";
 import type { useCommandHistoryController } from "../features/commands/useCommandHistoryController";
 import type { useHdfController } from "../features/hdf/useHdfController";
+import type { useInfluxController } from "../features/influx/useInfluxController";
 import type { useInterlocksController } from "../features/interlocks/useInterlocksController";
+import type { useWatchdogsController } from "../features/watchdogs/useWatchdogsController";
+import type { useStateMachinesController } from "../features/state_machines/useStateMachinesController";
 import type { useProcessCommandController } from "../features/processes/useProcessCommandController";
 import type { useProcessesController } from "../features/processes/useProcessesController";
 import type { useSequencerController } from "../features/sequencer/useSequencerController";
@@ -17,22 +20,28 @@ import type { CapabilityMember, DeviceStatus, LogEntry, StreamCatalogEntry } fro
 import type { TelemetrySignal } from "../types";
 import { CommandHistoryModalContainer } from "./CommandHistoryModalContainer";
 import { HdfModalsLayer } from "./HdfModalsLayer";
-import { InterlocksModal } from "./InterlocksModal";
+import { InfluxWriterModal } from "./InfluxWriterModal";
 import { LogsModalContainer } from "./LogsModalContainer";
 import { ProcessCommandModal } from "./ProcessCommandModal";
 import { ProcessesModal } from "./ProcessesModal";
+import { SafetyModal } from "./SafetyModal";
+import { StateMachinesModal } from "./StateMachinesModal";
 import { SequencerModalContainer } from "./SequencerModalContainer";
 import { SettingsModal } from "./SettingsModal";
 
 type HdfControllerState = ReturnType<typeof useHdfController>;
+type InfluxControllerState = ReturnType<typeof useInfluxController>;
 type ProcessesControllerState = ReturnType<typeof useProcessesController>;
 type ProcessCommandControllerState = ReturnType<typeof useProcessCommandController>;
 type InterlocksControllerState = ReturnType<typeof useInterlocksController>;
+type WatchdogsControllerState = ReturnType<typeof useWatchdogsController>;
+type StateMachinesControllerState = ReturnType<typeof useStateMachinesController>;
 type SequencerControllerState = ReturnType<typeof useSequencerController>;
 type CommandHistoryControllerState = ReturnType<typeof useCommandHistoryController>;
 
 type Props = {
   hdf: HdfControllerState;
+  influx: InfluxControllerState;
   renderMeasurementFieldInput: ComponentProps<
     typeof HdfModalsLayer
   >["renderMeasurementFieldInput"];
@@ -59,6 +68,8 @@ type Props = {
   streamWorkspaces: Record<string, StreamAnalysisWorkspaceConfig>;
   latestSignalsByDevice: Record<string, Record<string, TelemetrySignal>>;
   interlocksController: InterlocksControllerState;
+  watchdogsController: WatchdogsControllerState;
+  stateMachinesController: StateMachinesControllerState;
   sequencerController: SequencerControllerState;
   sequencerPrimaryIcon: ReactNode;
   sequencerProcessId: string | null;
@@ -95,6 +106,7 @@ type Props = {
 
 export function AppModalsLayer({
   hdf,
+  influx,
   renderMeasurementFieldInput,
   processesController,
   processCommandController,
@@ -119,6 +131,8 @@ export function AppModalsLayer({
   streamWorkspaces,
   latestSignalsByDevice,
   interlocksController,
+  watchdogsController,
+  stateMachinesController,
   sequencerController,
   sequencerPrimaryIcon,
   sequencerProcessId,
@@ -157,6 +171,30 @@ export function AppModalsLayer({
       <HdfModalsLayer
         hdf={hdf}
         renderMeasurementFieldInput={renderMeasurementFieldInput}
+      />
+      <InfluxWriterModal
+        opened={influx.influxModalOpen}
+        onClose={() => influx.setInfluxModalOpen(false)}
+        title={`Influx Writer ${influx.influxWriterProcessId ?? ""}`}
+        influxWriterState={influx.influxWriterState}
+        influxWriterProcessId={influx.influxWriterProcessId}
+        influxWriterStatus={influx.influxWriterStatus}
+        influxWriterLoading={influx.influxWriterLoading}
+        influxProcessCapabilitiesError={influx.influxProcessCapabilitiesError}
+        influxCommandsBlocked={influx.influxCommandsBlocked}
+        influxAnyCommandBusy={influx.influxAnyCommandBusy}
+        influxSupportsStatus={influx.influxSupportsStatus}
+        influxSupportsEnable={influx.influxSupportsEnable}
+        influxSupportsDisable={influx.influxSupportsDisable}
+        influxSupportsFlush={influx.influxSupportsFlush}
+        influxStatusBusy={influx.influxStatusBusy}
+        influxEnableBusy={influx.influxEnableBusy}
+        influxDisableBusy={influx.influxDisableBusy}
+        influxFlushBusy={influx.influxFlushBusy}
+        onRefreshStatus={influx.executeInfluxStatus}
+        onEnable={influx.executeInfluxEnable}
+        onDisable={influx.executeInfluxDisable}
+        onFlush={influx.executeInfluxFlush}
       />
 
       <ProcessCommandModal
@@ -212,33 +250,63 @@ export function AppModalsLayer({
         telemetryStreamStatus={telemetryStreamStatus}
       />
 
-      <InterlocksModal
+      <SafetyModal
         opened={interlocksController.interlocksOpen}
         onClose={() => interlocksController.setInterlocksOpen(false)}
-        onRefresh={interlocksController.refreshInterlocksModalData}
-        devices={devices}
-        processes={interlocksController.interlocksPanelProcesses}
-        followerRulesByProcessId={interlocksController.followerRulesByProcessId}
-        interlockStatusByProcessId={interlocksController.interlockStatusByProcessId}
-        interlocksLoadingByProcessId={
-          interlocksController.interlocksLoadingByProcessId
-        }
-        interlocksErrorByProcessId={interlocksController.interlocksErrorByProcessId}
-        interlockRuleBusyByKey={interlocksController.interlockRuleBusyByKey}
-        commandInterceptorRoutes={interlocksController.commandInterceptorRoutes}
-        commandInterceptorRoutesLoading={
-          interlocksController.commandInterceptorRoutesLoading
-        }
-        commandInterceptorRoutesError={
-          interlocksController.commandInterceptorRoutesError
-        }
+        interlocks={{
+          onRefresh: interlocksController.refreshInterlocksModalData,
+          devices,
+          processes: interlocksController.interlocksPanelProcesses,
+          followerRulesByProcessId: interlocksController.followerRulesByProcessId,
+          interlockStatusByProcessId: interlocksController.interlockStatusByProcessId,
+          interlocksLoadingByProcessId: interlocksController.interlocksLoadingByProcessId,
+          interlocksErrorByProcessId: interlocksController.interlocksErrorByProcessId,
+          interlockRuleBusyByKey: interlocksController.interlockRuleBusyByKey,
+          commandInterceptorRoutes: interlocksController.commandInterceptorRoutes,
+          commandInterceptorRoutesLoading: interlocksController.commandInterceptorRoutesLoading,
+          commandInterceptorRoutesError: interlocksController.commandInterceptorRoutesError,
+          onRefreshProcess: (processId) =>
+            interlocksController.refreshInterlockProcessStatus(processId, undefined, {
+              showLoading: true,
+            }),
+          onToggleFollowerRule: interlocksController.toggleFollowerRule,
+          onToggleInterlockRule: interlocksController.toggleInterlockRule,
+        }}
+        watchdogs={{
+          processes: watchdogsController.watchdogsPanelProcesses,
+          watchdogStatusByProcessId: watchdogsController.watchdogStatusByProcessId,
+          watchdogLoadingByProcessId: watchdogsController.watchdogLoadingByProcessId,
+          watchdogErrorByProcessId: watchdogsController.watchdogErrorByProcessId,
+          watchdogBusyByKey: watchdogsController.watchdogBusyByKey,
+          onRefreshProcess: (processId) =>
+            watchdogsController.refreshWatchdogProcessStatus(processId, undefined, {
+              showLoading: true,
+            }),
+          onToggleWatchdog: watchdogsController.toggleWatchdog,
+          onClearRuleLatch: watchdogsController.clearWatchdogRuleLatch,
+        }}
+      />
+
+      <StateMachinesModal
+        opened={stateMachinesController.stateMachinesOpen}
+        onClose={() => stateMachinesController.setStateMachinesOpen(false)}
+        summary={stateMachinesController.stateMachineSummary}
+        rows={stateMachinesController.stateMachineRows}
+        selectedProcessId={stateMachinesController.selectedProcessId}
+        onSelectProcess={stateMachinesController.setSelectedProcessId}
+        onRefresh={stateMachinesController.refreshStateMachinesModalData}
         onRefreshProcess={(processId) =>
-          interlocksController.refreshInterlockProcessStatus(processId, undefined, {
+          stateMachinesController.refreshStateMachineProcess(processId, undefined, {
             showLoading: true,
           })
         }
-        onToggleFollowerRule={interlocksController.toggleFollowerRule}
-        onToggleInterlockRule={interlocksController.toggleInterlockRule}
+        onRefreshGraph={(processId) =>
+          stateMachinesController.refreshStateMachineGraph(processId, {
+            showLoading: true,
+          })
+        }
+        onExecuteAction={stateMachinesController.executeStateMachineAction}
+        colorScheme={colorScheme}
       />
 
       <SequencerModalContainer
@@ -316,6 +384,7 @@ export function AppModalsLayer({
         onClose={() => commandHistoryController.setCommandHistoryOpen(false)}
         controller={commandHistoryController}
         devices={devices}
+        colorScheme={colorScheme}
         viewportRef={commandHistoryScrollRef}
         onCopyJson={(label, payload) => {
           void copyJsonToClipboard(label, payload);
@@ -345,6 +414,7 @@ export function AppModalsLayer({
         onProcessFilterChange={setLogProcessFilter}
         textFilter={logTextFilter}
         onTextFilterChange={setLogTextFilter}
+        colorScheme={colorScheme}
         devices={devices}
         processes={processesController.processes}
         viewportRef={logScrollRef}

@@ -186,18 +186,54 @@ export function HdfWriterModal({
               {hdfWriterStatus?.filePath ?? "No active file"}
             </Text>
           </Stack>
-          <Button
-            size="xs"
-            variant="light"
-            leftSection={<IconRefresh size={14} />}
-            loading={hdfWriterLoading || hdfStatusBusy}
-            disabled={hdfCommandsBlocked || !hdfSupportsStatus || hdfAnyCommandBusy}
-            onClick={() => {
-              void onRefreshStatus();
-            }}
-          >
-            Refresh status
-          </Button>
+          <Group gap="xs">
+            <Button
+              size="xs"
+              variant="light"
+              color="teal"
+              loading={hdfWritingStartBusy}
+              disabled={
+                hdfCommandsBlocked ||
+                !hdfSupportsWritingStart ||
+                hdfAnyCommandBusy ||
+                hdfWriterStatus?.writingActive === true
+              }
+              onClick={() => {
+                void onExecuteWritingStart();
+              }}
+            >
+              Start writing
+            </Button>
+            <Button
+              size="xs"
+              variant="light"
+              color="orange"
+              loading={hdfWritingStopBusy}
+              disabled={
+                hdfCommandsBlocked ||
+                !hdfSupportsWritingStop ||
+                hdfAnyCommandBusy ||
+                hdfWriterStatus?.writingActive !== true
+              }
+              onClick={() => {
+                void onExecuteWritingStop();
+              }}
+            >
+              Stop writing
+            </Button>
+            <Button
+              size="xs"
+              variant="light"
+              leftSection={<IconRefresh size={14} />}
+              loading={hdfWriterLoading || hdfStatusBusy}
+              disabled={hdfCommandsBlocked || !hdfSupportsStatus || hdfAnyCommandBusy}
+              onClick={() => {
+                void onRefreshStatus();
+              }}
+            >
+              Refresh status
+            </Button>
+          </Group>
         </Group>
 
         {hdfProcessCapabilitiesError && (
@@ -293,42 +329,6 @@ export function HdfWriterModal({
                 measurement schema error: {hdfMeasurementSchemaDisplayError}
               </Text>
             )}
-            <Group justify="flex-end">
-              <Button
-                size="xs"
-                variant="light"
-                color="teal"
-                loading={hdfWritingStartBusy}
-                disabled={
-                  hdfCommandsBlocked ||
-                  !hdfSupportsWritingStart ||
-                  hdfAnyCommandBusy ||
-                  hdfWriterStatus?.writingActive === true
-                }
-                onClick={() => {
-                  void onExecuteWritingStart();
-                }}
-              >
-                Start writing
-              </Button>
-              <Button
-                size="xs"
-                variant="light"
-                color="orange"
-                loading={hdfWritingStopBusy}
-                disabled={
-                  hdfCommandsBlocked ||
-                  !hdfSupportsWritingStop ||
-                  hdfAnyCommandBusy ||
-                  hdfWriterStatus?.writingActive !== true
-                }
-                onClick={() => {
-                  void onExecuteWritingStop();
-                }}
-              >
-                Stop writing
-              </Button>
-            </Group>
           </Stack>
         </Card>
 

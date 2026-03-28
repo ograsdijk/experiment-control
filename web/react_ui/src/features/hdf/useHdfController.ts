@@ -7,7 +7,6 @@ import { normalizeStringList } from "../common/normalize";
 import {
   fileNameFromPath,
   isProcessRpcStateAvailable,
-  processStateColor,
   supportsProcessCapability,
 } from "../runtime/helpers";
 import type {
@@ -197,7 +196,7 @@ export function useHdfController({
     (hdfMeasurementSchema?.notes.fields.length ?? 0) > 0;
   const hdfWriterFileLabel =
     hdfWriterStatus?.fileName ?? (hdfWriterStatus?.error ? "status unavailable" : "no file");
-  const hdfWriterChipColor = processStateColor(hdfWriterState);
+  const hdfWriterChipColor = hdfWriterStatus?.writingActive === true ? "teal" : "gray";
 
   const setHdfStatusLoading = useCallback((processId: string, loading: boolean) => {
     setHdfStatusLoadingByProcessId((prev) => {

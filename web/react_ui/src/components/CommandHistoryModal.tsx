@@ -20,6 +20,7 @@ import type { CommandHistoryEntry } from "../features/commands/types";
 import { formatWallTimeSeconds } from "../features/logs/utils";
 import type { DeviceStatus } from "../types";
 import { DeviceNameInline } from "./DeviceNameInline";
+import { JsonPreview } from "./JsonPreview";
 
 type CommandHistoryControllerState = ReturnType<typeof useCommandHistoryController>;
 
@@ -28,6 +29,7 @@ type Props = {
   onClose: () => void;
   controller: CommandHistoryControllerState;
   devices: DeviceStatus[];
+  colorScheme: "light" | "dark";
   viewportRef: MutableRefObject<HTMLDivElement | null>;
   onCopyJson: (label: string, payload: unknown) => void;
 };
@@ -108,6 +110,7 @@ export function CommandHistoryModal({
   onClose,
   controller,
   devices,
+  colorScheme,
   viewportRef,
   onCopyJson,
 }: Props) {
@@ -405,29 +408,17 @@ export function CommandHistoryModal({
                             <Text size="xs" c="dimmed">
                               Request
                             </Text>
-                            <Text
-                              size="xs"
-                              style={{
-                                whiteSpace: "pre-wrap",
-                                fontFamily: "monospace",
-                                wordBreak: "break-word",
-                              }}
-                            >
-                              {formatJsonDetailText(requestPayload)}
-                            </Text>
+                            <JsonPreview
+                              text={formatJsonDetailText(requestPayload)}
+                              colorScheme={colorScheme}
+                            />
                             <Text size="xs" c="dimmed">
                               Reply
                             </Text>
-                            <Text
-                              size="xs"
-                              style={{
-                                whiteSpace: "pre-wrap",
-                                fontFamily: "monospace",
-                                wordBreak: "break-word",
-                              }}
-                            >
-                              {formatJsonDetailText(row.response)}
-                            </Text>
+                            <JsonPreview
+                              text={formatJsonDetailText(row.response)}
+                              colorScheme={colorScheme}
+                            />
                           </Stack>
                         )}
                       </Stack>
@@ -636,16 +627,10 @@ export function CommandHistoryModal({
                             )}
                           </Group>
                           {hasRawParams && expanded && (
-                            <Text
-                              size="xs"
-                              style={{
-                                whiteSpace: "pre-wrap",
-                                fontFamily: "monospace",
-                                wordBreak: "break-word",
-                              }}
-                            >
-                              {formatParamsDetailText(row.params, row.params_json)}
-                            </Text>
+                            <JsonPreview
+                              text={formatParamsDetailText(row.params, row.params_json)}
+                              colorScheme={colorScheme}
+                            />
                           )}
                           {rowErrorMessage(row.error) && (
                             <Text size="xs" c="red">
@@ -836,16 +821,10 @@ export function CommandHistoryModal({
                           )}
                         </Group>
                         {hasRawParams && expanded && (
-                          <Text
-                            size="xs"
-                            style={{
-                              whiteSpace: "pre-wrap",
-                              fontFamily: "monospace",
-                              wordBreak: "break-word",
-                            }}
-                          >
-                            {formatParamsDetailText(row.params, row.params_json)}
-                          </Text>
+                          <JsonPreview
+                            text={formatParamsDetailText(row.params, row.params_json)}
+                            colorScheme={colorScheme}
+                          />
                         )}
                         {row.skip_reason && (
                           <Text size="xs" c="yellow">

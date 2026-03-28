@@ -20,6 +20,18 @@
   useComputedColorScheme,
   useMantineColorScheme,
 } from "@mantine/core";
+import {
+  DndContext,
+  PointerSensor,
+  TouchSensor,
+  useDraggable,
+  useSensor,
+  useSensors,
+  type DragEndEvent,
+  type DragOverEvent,
+  type DragStartEvent,
+} from "@dnd-kit/core";
+import { SortableContext, rectSortingStrategy } from "@dnd-kit/sortable";
 import { notifications } from "@mantine/notifications";
 import {
   IconCheck,
@@ -42,13 +54,14 @@ import {
   IconX,
 } from "@tabler/icons-react";
 import {
+  useCallback,
   useEffect,
   useMemo,
   useRef,
   useState,
   type CSSProperties,
   type ChangeEvent,
-  type DragEvent,
+  type ReactNode,
 } from "react";
 import {
   callDevice,
@@ -114,11 +127,10 @@ import {
   normalizeStringList,
 } from "./features/common/normalize";
 import {
-  collectGridEntries,
-  computeHorizontalReorderMode,
-  computeInsertIndexFromGrid,
-  computeVerticalReorderMode,
-} from "./features/layout/reorder";
+  detectGridColumns,
+  reorderIdsSerpentine,
+} from "./features/layout/serpentine";
+import { ReorderableCardShell } from "./features/layout/ReorderableCardShell";
 import {
   logEntryKey,
   normalizeLogEntry,
@@ -144,9 +156,11 @@ import {
 } from "./features/profile/utils";
 import { normalizePlotState, serializePlotState } from "./features/profile/plot_state";
 import { useInterlocksController } from "./features/interlocks/useInterlocksController";
+import { useWatchdogsController } from "./features/watchdogs/useWatchdogsController";
+import { useStateMachinesController } from "./features/state_machines/useStateMachinesController";
 import { useHdfController } from "./features/hdf/useHdfController";
+import { useInfluxController } from "./features/influx/useInfluxController";
 import { useDeviceCapabilitiesController } from "./features/devices/useDeviceCapabilitiesController";
-import { useDeviceGridController } from "./features/devices/useDeviceGridController";
 import { useDeviceLifecycleController } from "./features/devices/useDeviceLifecycleController";
 import { useDeviceCommandController } from "./features/devices/useDeviceCommandController";
 import {
@@ -158,8 +172,6 @@ import { useProcessCommandController } from "./features/processes/useProcessComm
 import { useProcessLifecycleController } from "./features/processes/useProcessLifecycleController";
 import { useProcessesController } from "./features/processes/useProcessesController";
 import type {
-  DropPayload,
-  PanelDragPayload,
   PanelKind,
   PlotPanelState,
   PlotStreamBin2dPanelState,
@@ -170,7 +182,6 @@ import type {
   PlotStreamWaterfallPanelState,
   PlotTelemetryPanelState,
   RawStreamSubscription,
-  ReorderMode,
   StreamAnalysisSettings,
   StreamAnalysisWorkspaceConfig,
   StreamAnalysisWorkspaceSubscription,
@@ -190,7 +201,6 @@ import type {
   StreamWorkspaceStoreStatus,
   StreamWorkspaceSummary,
   TelemetrySmoothingMode,
-  TraceDragPayload,
   YDisplayMode,
   YOffsetMode,
   YScaleMode,
@@ -268,6 +278,7 @@ import {
   traceKeyId,
 } from "./features/stream/utils";
 import {
+  isInfluxWriterProcess,
   isHdfWriterProcess,
   isProcessRpcStateAvailable,
   isSequencerProcess,
@@ -386,6 +397,73 @@ function isCommandDeckTelemetryEntry(
   entry: CommandDeckEntry
 ): entry is CommandDeckTelemetryEntry {
   return entry.kind === "telemetry";
+}
+
+type UiDragData =
+  | { kind: "device"; deviceId: string }
+  | { kind: "panel"; panelId: string }
+  | { kind: "command-deck-entry"; entryId: string; groupName: string }
+  | { kind: "signal"; deviceId: string; signal: string }
+  | { kind: "trace"; deviceId: string; signal: string; originPanelId?: string };
+
+function deviceSortableId(deviceId: string): string {
+  return `device:${deviceId}`;
+}
+
+function panelSortableId(panelId: string): string {
+  return `panel:${panelId}`;
+}
+
+function parseSortablePrefixedId(raw: string | number, prefix: string): string | null {
+  if (typeof raw !== "string") {
+    return null;
+  }
+  if (!raw.startsWith(prefix)) {
+    return null;
+  }
+  const suffix = raw.slice(prefix.length);
+  return suffix.length > 0 ? suffix : null;
+}
+
+type DraggableTraceChipProps = {
+  panelId: string;
+  trace: TraceKey;
+  children: ReactNode;
+  className?: string;
+  style?: CSSProperties;
+};
+
+function DraggableTraceChip({
+  panelId,
+  trace,
+  children,
+  className,
+  style,
+}: DraggableTraceChipProps) {
+  const { attributes, listeners, setNodeRef, isDragging } = useDraggable({
+    id: `trace:${panelId}:${trace.deviceId}:${trace.signal}`,
+    data: {
+      kind: "trace",
+      deviceId: trace.deviceId,
+      signal: trace.signal,
+      originPanelId: panelId,
+    } satisfies UiDragData,
+  });
+  return (
+    <span
+      ref={setNodeRef}
+      className={className}
+      style={{
+        ...style,
+        cursor: "grab",
+        opacity: isDragging ? 0.55 : 1,
+      }}
+      {...attributes}
+      {...listeners}
+    >
+      {children}
+    </span>
+  );
 }
 
 export function App() {
@@ -557,11 +635,7 @@ export function App() {
     Record<string, boolean>
   >({});
   const [streamCatalog, setStreamCatalog] = useState<StreamCatalogEntry[]>([]);
-  const [dragOverPanelTarget, setDragOverPanelTarget] = useState<{
-    panelId: string;
-    mode: ReorderMode;
-  } | null>(null);
-  const [dragPanelId, setDragPanelId] = useState<string | null>(null);
+  const [activeUiDrag, setActiveUiDrag] = useState<UiDragData | null>(null);
   const [editingPanelId, setEditingPanelId] = useState<string | null>(null);
   const [panelTitleDraft, setPanelTitleDraft] = useState("");
   const [deviceOrder, setDeviceOrder] = useState<string[]>(() => {
@@ -604,7 +678,12 @@ export function App() {
       return {};
     }
   });
-  const [panelInsertIndex, setPanelInsertIndex] = useState<number | null>(null);
+  const deviceGridRef = useRef<HTMLDivElement | null>(null);
+  const plotGridRef = useRef<HTMLDivElement | null>(null);
+  const dragColumnsRef = useRef<{ device: number; panel: number }>({
+    device: 1,
+    panel: 1,
+  });
   const [pinnedParamDrafts, setPinnedParamDrafts] = useState<PinnedParamDrafts>(
     {}
   );
@@ -702,6 +781,14 @@ export function App() {
       gridTemplateColumns: `repeat(${plotWorkspaceColumns}, minmax(0, 1fr))`,
     };
   }, [isNarrowPlotViewport, plotWorkspaceColumns]);
+  const dndSensors = useSensors(
+    useSensor(PointerSensor, {
+      activationConstraint: { distance: 6 },
+    }),
+    useSensor(TouchSensor, {
+      activationConstraint: { delay: 140, tolerance: 8 },
+    })
+  );
 
   useEffect(() => {
     return () => {
@@ -985,6 +1072,10 @@ export function App() {
   }, [streamBin2dOptionsWorkspace, streamBin2dOptionsPanel?.outputId]);
   const hdfWriterProcess = useMemo(
     () => processes.find(isHdfWriterProcess) ?? null,
+    [processes]
+  );
+  const influxWriterProcess = useMemo(
+    () => processes.find(isInfluxWriterProcess) ?? null,
     [processes]
   );
   const sequencerProcess = useMemo(
@@ -2938,6 +3029,14 @@ export function App() {
     refreshDevices,
     ensureProcessCapabilitiesLoaded,
   });
+  const influxController = useInfluxController({
+    influxWriterProcess,
+    capabilitiesByProcess,
+    processCapabilitiesErrorById,
+    callProcessFn: callProcess,
+    sendProcessCommand,
+    ensureProcessCapabilitiesLoaded,
+  });
 
   const {
     hdfModalOpen,
@@ -3007,6 +3106,15 @@ export function App() {
     setHdfNoteFieldValue,
     setHdfNoteFieldUseCustom,
   } = hdfController;
+  const {
+    influxWriterProcessId,
+    influxWriterLoading,
+    influxWriterChipColor,
+    influxChipLabel,
+    influxWriterStatus,
+    refreshInfluxStatus,
+    openInfluxWriterCommands,
+  } = influxController;
 
   const processCommandController = useProcessCommandController({
     capabilitiesByProcess,
@@ -3060,6 +3168,66 @@ export function App() {
     toggleFollowerRule,
     toggleInterlockRule,
   } = interlocksController;
+
+  const watchdogsController = useWatchdogsController({
+    safetyOpen: interlocksOpen,
+    processes,
+    capabilitiesByProcess,
+    refreshProcesses,
+    ensureProcessCapabilitiesLoaded,
+  });
+
+  const safetyButtonSummary = useMemo(() => {
+    const interlockError = interlockButtonSummary.status === "error";
+    const watchdogError = watchdogsController.watchdogButtonSummary.status === "error";
+    const interlockActive = interlockButtonSummary.activeRuleCount > 0;
+    const watchdogActive = watchdogsController.watchdogButtonSummary.activeLatchCount > 0;
+    const totalActive =
+      interlockButtonSummary.activeRuleCount +
+      watchdogsController.watchdogButtonSummary.activeLatchCount;
+    const status = interlockError || watchdogError
+      ? "error"
+      : interlockActive || watchdogActive
+        ? "active"
+        : "idle";
+    const color = status === "error"
+      ? "red"
+      : interlockActive
+        ? "teal"
+        : watchdogActive
+          ? "orange"
+          : "gray";
+    const labelSuffix = totalActive > 0 ? ` (${totalActive})` : "";
+    const tooltip = status === "error"
+      ? interlockError
+        ? interlockButtonSummary.tooltip
+        : watchdogsController.watchdogButtonSummary.tooltip
+      : totalActive > 0
+        ? [
+            interlockActive
+              ? `${interlockButtonSummary.activeRuleCount} active interlock rule${interlockButtonSummary.activeRuleCount === 1 ? "" : "s"}`
+              : null,
+            watchdogActive
+              ? `${watchdogsController.watchdogButtonSummary.activeLatchCount} latched watchdog rule${watchdogsController.watchdogButtonSummary.activeLatchCount === 1 ? "" : "s"}`
+              : null,
+          ]
+            .filter((part): part is string => Boolean(part))
+            .join(" | ")
+        : "No active safety rules";
+    return {
+      color,
+      label: `Safety${labelSuffix}`,
+      tooltip,
+    };
+  }, [interlockButtonSummary, watchdogsController.watchdogButtonSummary]);
+
+  const stateMachinesController = useStateMachinesController({
+    processes,
+    capabilitiesByProcess,
+    refreshProcesses,
+    ensureProcessCapabilitiesLoaded,
+    callProcessFn: callProcess,
+  });
 
   const sequencerController = useSequencerController({
     sequencerProcess,
@@ -3137,24 +3305,15 @@ export function App() {
     invalidateDeviceCapabilities,
   });
 
-  const {
-    dragDeviceId,
-    dragOverDeviceTarget,
-    deviceInsertIndex,
-    handleDeviceTelemetryToggle,
-    handleDeviceDragStart,
-    handleDeviceDragEnd,
-    handleDeviceDragOver,
-    handleDeviceDragLeave,
-    handleDeviceDrop,
-    handleDeviceGridDragOver,
-    handleDeviceGridDrop,
-    handleDeviceGridDragLeave,
-  } = useDeviceGridController({
-    orderedDevices,
-    setDeviceOrder,
-    setTelemetryCollapsedByDevice,
-  });
+  const handleDeviceTelemetryToggle = useCallback(
+    (deviceId: string) => {
+      setTelemetryCollapsedByDevice((prev) => ({
+        ...prev,
+        [deviceId]: !Boolean(prev[deviceId]),
+      }));
+    },
+    []
+  );
 
   const {
     commandOpen,
@@ -3499,8 +3658,7 @@ export function App() {
 
   const reorderCommandDeckEntryWithinGroup = (
     entryId: string,
-    targetEntryId: string,
-    mode: "before" | "after" | "swap"
+    targetEntryId: string
   ) => {
     if (!entryId || !targetEntryId || entryId === targetEntryId) {
       return;
@@ -3517,19 +3675,8 @@ export function App() {
         return prev;
       }
       const next = [...prev];
-      if (mode === "swap") {
-        const current = next[sourceIndex];
-        next[sourceIndex] = next[targetIndex];
-        next[targetIndex] = current;
-        return next;
-      }
       const [sourceEntry] = next.splice(sourceIndex, 1);
-      const nextTargetIndex = next.findIndex((entry) => entry.id === targetEntryId);
-      if (nextTargetIndex < 0) {
-        return prev;
-      }
-      const insertIndex =
-        mode === "before" ? nextTargetIndex : nextTargetIndex + 1;
+      const insertIndex = Math.max(0, Math.min(next.length, targetIndex));
       next.splice(insertIndex, 0, sourceEntry);
       return next;
     });
@@ -3651,6 +3798,9 @@ export function App() {
         await refreshProcesses();
         if (action.startsWith("hdf.") || hdfWriterProcessId === targetId) {
           await refreshHdfWriterStatus(targetId);
+        }
+        if (action.startsWith("influx.") || influxWriterProcessId === targetId) {
+          await refreshInfluxStatus(targetId);
         }
       } else if (entry.targetKind === "device") {
         let capabilities = capabilitiesByDevice[targetId] ?? [];
@@ -4596,38 +4746,6 @@ export function App() {
       setActivePanelId(nextActive.id);
     }
     setPlotTick((tick) => tick + 1);
-  };
-
-  const movePanel = (
-    sourcePanelId: string,
-    targetPanelId: string,
-    mode: ReorderMode
-  ) => {
-    if (!sourcePanelId || !targetPanelId || sourcePanelId === targetPanelId) {
-      return;
-    }
-    setPanels((prev) => {
-      const sourceIndex = prev.findIndex((panel) => panel.id === sourcePanelId);
-      const targetIndex = prev.findIndex((panel) => panel.id === targetPanelId);
-      if (sourceIndex < 0 || targetIndex < 0) {
-        return prev;
-      }
-      const next = [...prev];
-      if (mode === "swap") {
-        const temp = next[sourceIndex];
-        next[sourceIndex] = next[targetIndex];
-        next[targetIndex] = temp;
-        return next;
-      }
-      const [moved] = next.splice(sourceIndex, 1);
-      const nextTargetIndex = next.findIndex((panel) => panel.id === targetPanelId);
-      if (nextTargetIndex < 0) {
-        return prev;
-      }
-      const insertIndex = mode === "before" ? nextTargetIndex : nextTargetIndex + 1;
-      next.splice(insertIndex, 0, moved);
-      return next;
-    });
   };
 
   const addTraceToPanel = (
@@ -6576,178 +6694,169 @@ export function App() {
     sequencerProcessState
   );
 
-  const handleSignalDragStart = (
-    deviceId: string,
-    signal: string,
-    event: DragEvent<HTMLDivElement>
-  ) => {
-    const payload: TraceDragPayload = { kind: "trace", deviceId, signal };
-    event.dataTransfer.setData("application/json", JSON.stringify(payload));
-    event.dataTransfer.effectAllowed = "copy";
-  };
-
-  const handleTraceDragStart = (
-    panelId: string,
-    trace: TraceKey,
-    event: DragEvent<HTMLSpanElement>
-  ) => {
-    const payload: TraceDragPayload = {
-      kind: "trace",
-      deviceId: trace.deviceId,
-      signal: trace.signal,
-      originPanelId: panelId,
-    };
-    event.dataTransfer.setData("application/json", JSON.stringify(payload));
-    event.dataTransfer.effectAllowed = "move";
-  };
-
-  const handlePanelDragStart = (
-    panelId: string,
-    event: DragEvent<HTMLElement>
-  ) => {
-    const payload: PanelDragPayload = {
-      kind: "panel",
-      panelId,
-    };
-    setDragPanelId(panelId);
-    setDragOverPanelTarget(null);
-    event.dataTransfer.setData("application/json", JSON.stringify(payload));
-    event.dataTransfer.effectAllowed = "move";
-  };
-
-  const insertPanelByIndex = (sourcePanelId: string, insertIndex: number) => {
-    if (!sourcePanelId || !Number.isFinite(insertIndex)) {
-      return;
+  const resolvePanelGridColumns = useCallback((): number => {
+    if (isNarrowPlotViewport) {
+      return 1;
     }
-    setPanels((prev) => {
-      const sourceIndex = prev.findIndex((panel) => panel.id === sourcePanelId);
-      if (sourceIndex < 0) {
-        return prev;
+    if (plotWorkspaceColumns !== "auto") {
+      const parsed = Number(plotWorkspaceColumns);
+      if (Number.isFinite(parsed) && parsed >= 1) {
+        return Math.max(1, Math.trunc(parsed));
       }
-      const next = [...prev];
-      const [moved] = next.splice(sourceIndex, 1);
-      const clamped = Math.max(0, Math.min(Math.trunc(insertIndex), next.length));
-      next.splice(clamped, 0, moved);
-      return next;
-    });
-  };
+    }
+    return detectGridColumns(plotGridRef.current, "data-panel-card-id");
+  }, [isNarrowPlotViewport, plotWorkspaceColumns]);
 
-  const handlePanelGridDragOver = (event: DragEvent<HTMLDivElement>) => {
-    if (!dragPanelId) {
-      return;
-    }
-    event.preventDefault();
-    if (
-      event.target instanceof Element &&
-      event.target.closest("[data-panel-card-id]")
-    ) {
-      return;
-    }
-    const container = event.currentTarget;
-    const entries = collectGridEntries(
-      container,
-      "data-panel-card-id",
-      dragPanelId
-    );
-    const index = computeInsertIndexFromGrid(entries, event.clientX, event.clientY);
-    setDragOverPanelTarget(null);
-    setPanelInsertIndex((prev) => (prev === index ? prev : index));
-  };
+  const resolveDeviceGridColumns = useCallback((): number => {
+    return detectGridColumns(deviceGridRef.current, "data-device-card-id");
+  }, []);
 
-  const handlePanelGridDrop = (event: DragEvent<HTMLDivElement>) => {
-    if (!dragPanelId) {
-      return;
-    }
-    event.preventDefault();
-    const raw =
-      event.dataTransfer.getData("application/json") ||
-      event.dataTransfer.getData("text/plain");
-    if (!raw) {
-      setDragPanelId(null);
-      setDragOverPanelTarget(null);
-      setPanelInsertIndex(null);
-      return;
-    }
-    try {
-      const payload = JSON.parse(raw) as DropPayload;
-      if (payload.kind !== "panel" || typeof payload.panelId !== "string") {
+  const handleUiDragStart = useCallback(
+    (event: DragStartEvent) => {
+      const payload = event.active.data.current as UiDragData | undefined;
+      if (!payload) {
+        setActiveUiDrag(null);
         return;
       }
-      const sourcePanelId = payload.panelId;
-      const container = event.currentTarget;
-      const entries = collectGridEntries(
-        container,
-        "data-panel-card-id",
-        sourcePanelId
-      );
-      const index =
-        panelInsertIndex ??
-        computeInsertIndexFromGrid(entries, event.clientX, event.clientY);
-      insertPanelByIndex(sourcePanelId, index);
-    } finally {
-      setDragPanelId(null);
-      setDragOverPanelTarget(null);
-      setPanelInsertIndex(null);
-    }
-  };
+      setActiveUiDrag(payload);
+      if (payload.kind === "device") {
+        dragColumnsRef.current.device = resolveDeviceGridColumns();
+      } else if (payload.kind === "panel") {
+        dragColumnsRef.current.panel = resolvePanelGridColumns();
+      }
+    },
+    [resolveDeviceGridColumns, resolvePanelGridColumns]
+  );
 
-  const handlePanelGridDragLeave = (event: DragEvent<HTMLDivElement>) => {
-    if (!dragPanelId) {
-      return;
-    }
-    const nextTarget = event.relatedTarget as Node | null;
-    if (nextTarget && event.currentTarget.contains(nextTarget)) {
-      return;
-    }
-    setPanelInsertIndex(null);
-    setDragOverPanelTarget(null);
-  };
+  const handleUiDragOver = useCallback(
+    (event: DragOverEvent) => {
+      const activePayload = event.active.data.current as UiDragData | undefined;
+      const overPayload = event.over?.data.current as UiDragData | undefined;
+      if (!activePayload || activePayload.kind !== "command-deck-entry") {
+        return;
+      }
+      const targetEntryId =
+        overPayload?.kind === "command-deck-entry"
+          ? overPayload.entryId
+          : parseSortablePrefixedId(event.over?.id ?? "", "deck:");
+      if (!targetEntryId || targetEntryId === activePayload.entryId) {
+        return;
+      }
+      reorderCommandDeckEntryWithinGroup(activePayload.entryId, targetEntryId);
+    },
+    [reorderCommandDeckEntryWithinGroup]
+  );
 
-  const handleDropOnPanel = (
-    panelId: string,
-    event: DragEvent<HTMLDivElement>
-  ) => {
-    const panelDropMode = computeHorizontalReorderMode(event);
-    const raw =
-      event.dataTransfer.getData("application/json") ||
-      event.dataTransfer.getData("text/plain");
-    if (!raw) {
-      return;
-    }
-    try {
-      const payload = JSON.parse(raw) as DropPayload;
-      if (payload.kind === "panel" && typeof payload.panelId === "string") {
-        if (panelDropMode !== "swap") {
+  const handleUiDragEnd = useCallback(
+    (event: DragEndEvent) => {
+      const activePayload = event.active.data.current as UiDragData | undefined;
+      const overPayload = event.over?.data.current as UiDragData | undefined;
+      if (!activePayload) {
+        setActiveUiDrag(null);
+        return;
+      }
+
+      if (activePayload.kind === "device") {
+        const targetDeviceId =
+          overPayload?.kind === "device"
+            ? overPayload.deviceId
+            : parseSortablePrefixedId(event.over?.id ?? "", "device:");
+        if (
+          targetDeviceId &&
+          targetDeviceId !== activePayload.deviceId
+        ) {
+          const columns = Math.max(1, dragColumnsRef.current.device);
+          setDeviceOrder((prev) => {
+            const base = orderedDevices.map((device) => device.device_id);
+            const next = reorderIdsSerpentine(
+              base,
+              activePayload.deviceId,
+              targetDeviceId,
+              columns
+            );
+            return sameStringArray(prev, next) ? prev : next;
+          });
+        }
+        setActiveUiDrag(null);
+        return;
+      }
+
+      if (activePayload.kind === "panel") {
+        const targetPanelId =
+          overPayload?.kind === "panel"
+            ? overPayload.panelId
+            : parseSortablePrefixedId(event.over?.id ?? "", "panel:");
+        if (
+          targetPanelId &&
+          targetPanelId !== activePayload.panelId
+        ) {
+          const columns = Math.max(1, dragColumnsRef.current.panel);
+          setPanels((prev) => {
+            const ids = prev.map((panel) => panel.id);
+            const reorderedIds = reorderIdsSerpentine(
+              ids,
+              activePayload.panelId,
+              targetPanelId,
+              columns
+            );
+            if (sameStringArray(ids, reorderedIds)) {
+              return prev;
+            }
+            const byId = new Map(prev.map((panel) => [panel.id, panel]));
+            return reorderedIds
+              .map((panelId) => byId.get(panelId))
+              .filter((panel): panel is PlotPanelState => Boolean(panel));
+          });
+        }
+        setActiveUiDrag(null);
+        return;
+      }
+
+      if (activePayload.kind === "command-deck-entry") {
+        setActiveUiDrag(null);
+        return;
+      }
+
+      if (activePayload.kind === "signal" || activePayload.kind === "trace") {
+        const targetPanelId =
+          overPayload?.kind === "panel"
+            ? overPayload.panelId
+            : parseSortablePrefixedId(event.over?.id ?? "", "panel:");
+        if (!targetPanelId) {
+          setActiveUiDrag(null);
           return;
         }
-        event.preventDefault();
-        event.stopPropagation();
-        movePanel(payload.panelId, panelId, panelDropMode);
-        setDragOverPanelTarget(null);
-        setDragPanelId(null);
-        setPanelInsertIndex(null);
-        return;
+        const targetPanel = panelsRef.current.find(
+          (panel) => panel.id === targetPanelId
+        );
+        if (!targetPanel || !isTelemetryPanel(targetPanel)) {
+          setActiveUiDrag(null);
+          return;
+        }
+        if (
+          activePayload.kind === "trace" &&
+          activePayload.originPanelId &&
+          activePayload.originPanelId !== targetPanelId
+        ) {
+          removeTraceFromPanel(activePayload.originPanelId, {
+            deviceId: activePayload.deviceId,
+            signal: activePayload.signal,
+          });
+        }
+        addTraceToPanel(
+          targetPanelId,
+          activePayload.deviceId,
+          activePayload.signal
+        );
       }
-      event.preventDefault();
-      event.stopPropagation();
-      if (!payload.deviceId || !payload.signal) {
-        return;
-      }
-      const targetPanel = panelsRef.current.find((panel) => panel.id === panelId);
-      if (!targetPanel || !isTelemetryPanel(targetPanel)) {
-        return;
-      }
-      if (payload.originPanelId && payload.originPanelId !== panelId) {
-        removeTraceFromPanel(payload.originPanelId, {
-          deviceId: payload.deviceId,
-          signal: payload.signal,
-        });
-      }
-      addTraceToPanel(panelId, payload.deviceId, payload.signal);
-    } catch {
-      return;
-    }
-  };
+      setActiveUiDrag(null);
+    },
+    [addTraceToPanel, orderedDevices, removeTraceFromPanel]
+  );
+
+  const handleUiDragCancel = useCallback(() => {
+    setActiveUiDrag(null);
+  }, []);
 
   const handleNavResizeStart = (
     event: React.PointerEvent<HTMLDivElement>
@@ -6910,12 +7019,19 @@ export function App() {
   };
 
   return (
-    <AppShell
-      className="app-shell"
-      header={{ height: 72 }}
-      padding="lg"
+    <DndContext
+      sensors={dndSensors}
+      onDragStart={handleUiDragStart}
+      onDragOver={handleUiDragOver}
+      onDragEnd={handleUiDragEnd}
+      onDragCancel={handleUiDragCancel}
     >
-      <DashboardHeaderBar
+      <AppShell
+        className="app-shell"
+        header={{ height: 72 }}
+        padding="lg"
+      >
+        <DashboardHeaderBar
         instanceLabel={instanceLabel}
         showHdfWriter={Boolean(hdfWriterProcess)}
         hdfWriterChipColor={hdfWriterChipColor}
@@ -6931,6 +7047,14 @@ export function App() {
         onOpenHdfMeasurementNote={openHdfMeasurementNoteModal}
         hdfMeasurementSchemaDisplayError={hdfMeasurementSchemaDisplayError}
         hdfMeasurementNotesRows={hdfWriterStatus?.measurementNotesRows ?? 0}
+        showInfluxWriter={Boolean(
+          influxWriterProcess && isProcessRpcStateAvailable(influxWriterProcess)
+        )}
+        influxWriterChipColor={influxWriterChipColor}
+        influxWriterLoading={influxWriterLoading}
+        onOpenInfluxWriter={openInfluxWriterCommands}
+        influxWriterTitle={influxWriterStatus?.error ?? "Open Influx writer status"}
+        influxWriterLabel={influxChipLabel}
         showSequencer={Boolean(sequencerProcess)}
         sequencerChipColor={sequencerChipColor}
         sequencerStatusLoading={sequencerStatusLoading}
@@ -6951,7 +7075,12 @@ export function App() {
           setProcessOpen(true);
           await refreshProcesses();
         }}
-        interlockButtonSummary={interlockButtonSummary}
+        stateMachineButtonSummary={stateMachinesController.stateMachineButtonSummary}
+        onOpenStateMachines={() => {
+          stateMachinesController.setStateMachinesOpen(true);
+          void stateMachinesController.refreshStateMachinesModalData();
+        }}
+        interlockButtonSummary={safetyButtonSummary}
         onOpenInterlocks={() => setInterlocksOpen(true)}
         showDaqUi={showDaqUi}
         onOpenDaq={openDaqModal}
@@ -6977,6 +7106,10 @@ export function App() {
           const hdfProcess = nextProcesses.find(isHdfWriterProcess);
           if (hdfProcess) {
             await refreshHdfWriterStatus(hdfProcess.process_id);
+          }
+          const influxProcess = nextProcesses.find(isInfluxWriterProcess);
+          if (influxProcess) {
+            await refreshInfluxStatus(influxProcess.process_id);
           }
           const seqProcess = nextProcesses.find(isSequencerProcess);
           if (seqProcess) {
@@ -7125,151 +7258,129 @@ export function App() {
             </Group>
             <ScrollArea h="calc(100vh - 180px)" type="never">
               {devicePanelTab === "devices" ? (
+                <SortableContext
+                  items={orderedDevices.map((device) =>
+                    deviceSortableId(device.device_id)
+                  )}
+                  strategy={rectSortingStrategy}
+                >
                 <div
                   className="device-grid"
-                  onDragOver={handleDeviceGridDragOver}
-                  onDrop={handleDeviceGridDrop}
-                  onDragLeave={handleDeviceGridDragLeave}
+                  ref={deviceGridRef}
                 >
                   {orderedDevices.map((device, idx) => (
-                    <DeviceCard
+                    <ReorderableCardShell
                       key={device.device_id}
-                      device={device}
-                      signals={latestByDevice[device.device_id]}
-                      busy={Boolean(deviceBusyById[device.device_id])}
-                      onConnect={() => handleDeviceConnect(device.device_id)}
-                      onDisconnect={() => handleDeviceDisconnect(device.device_id)}
-                      onRestart={() => handleDeviceRestart(device.device_id)}
-                      onPlot={(signal) => onPlotSignal(device.device_id, signal)}
-                      onCommand={() => openCommand(device.device_id)}
-                      onDragSignal={(signal, event) =>
-                        handleSignalDragStart(device.device_id, signal, event)
-                      }
-                      onDeviceDragStart={(event) =>
-                        handleDeviceDragStart(device.device_id, event)
-                      }
-                      onDeviceDragEnd={handleDeviceDragEnd}
-                      onDeviceDragOver={(event) =>
-                        handleDeviceDragOver(device.device_id, event)
-                      }
-                      onDeviceDragLeave={() => handleDeviceDragLeave(device.device_id)}
-                      onDeviceDrop={(event) => handleDeviceDrop(device.device_id, event)}
-                      telemetryCollapsed={Boolean(
-                        telemetryCollapsedByDevice[device.device_id]
-                      )}
-                      onTelemetryToggle={() =>
-                        handleDeviceTelemetryToggle(device.device_id)
-                      }
-                      dragMode={(() => {
-                        if (dragOverDeviceTarget?.deviceId === device.device_id) {
-                          return dragOverDeviceTarget.mode;
-                        }
-                        if (!dragDeviceId || deviceInsertIndex == null) {
-                          return null;
-                        }
-                        const withoutDragged = orderedDevices
-                          .map((entry) => entry.device_id)
-                          .filter((entryId) => entryId !== dragDeviceId);
-                        const idxWithoutDragged = withoutDragged.indexOf(device.device_id);
-                        if (idxWithoutDragged < 0) {
-                          return null;
-                        }
-                        if (deviceInsertIndex === idxWithoutDragged) {
-                          return "before";
-                        }
-                        if (
-                          deviceInsertIndex === withoutDragged.length &&
-                          idxWithoutDragged === withoutDragged.length - 1
-                        ) {
-                          return "after";
-                        }
-                        return null;
-                      })()}
-                      isDragging={dragDeviceId === device.device_id}
-                      pinnedCommands={pinnedCommands[device.device_id] ?? []}
-                      onPinnedCommand={(action) => openCommand(device.device_id, action)}
-                      onAddPinnedToDeck={(action) => {
-                        const draftKey = pinnedCommandKey(device.device_id, action);
-                        const label =
-                          (pinnedCommands[device.device_id] ?? []).find(
-                            (entry) => entry.action === action
-                          )?.label ?? undefined;
-                        addCommandDeckCommandEntry({
-                          targetKind: "device",
-                          targetId: device.device_id,
-                          action,
-                          label,
-                          paramsDraft: { ...(pinnedParamDrafts[draftKey] ?? {}) },
-                        });
-                        notifications.show({
-                          color: "teal",
-                          title: "Added to command deck",
-                          message: `${device.device_id}.${action}`,
-                        });
+                      id={deviceSortableId(device.device_id)}
+                      data={{ kind: "device", deviceId: device.device_id }}
+                      className="device-card"
+                      dataDeviceCardId={device.device_id}
+                      dragHandleTitle="Drag from border to reorder devices"
+                      style={{
+                        position: "relative",
+                        animationDelay: `${idx * 45}ms`,
                       }}
-                      onAddAllPinnedToDeck={() => {
-                        const entries = pinnedCommands[device.device_id] ?? [];
-                        if (entries.length === 0) {
-                          notifications.show({
-                            color: "yellow",
-                            title: "No pinned commands",
-                            message: `${device.device_id} has no pinned commands.`,
-                          });
-                          return;
+                    >
+                      <DeviceCard
+                        device={device}
+                        signals={latestByDevice[device.device_id]}
+                        busy={Boolean(deviceBusyById[device.device_id])}
+                        onConnect={() => handleDeviceConnect(device.device_id)}
+                        onDisconnect={() => handleDeviceDisconnect(device.device_id)}
+                        onRestart={() => handleDeviceRestart(device.device_id)}
+                        onPlot={(signal) => onPlotSignal(device.device_id, signal)}
+                        onCommand={() => openCommand(device.device_id)}
+                        telemetryCollapsed={Boolean(
+                          telemetryCollapsedByDevice[device.device_id]
+                        )}
+                        onTelemetryToggle={() =>
+                          handleDeviceTelemetryToggle(device.device_id)
                         }
-                        for (const entry of entries) {
-                          const action = entry.action;
+                        pinnedCommands={pinnedCommands[device.device_id] ?? []}
+                        onPinnedCommand={(action) => openCommand(device.device_id, action)}
+                        onAddPinnedToDeck={(action) => {
                           const draftKey = pinnedCommandKey(device.device_id, action);
+                          const label =
+                            (pinnedCommands[device.device_id] ?? []).find(
+                              (entry) => entry.action === action
+                            )?.label ?? undefined;
                           addCommandDeckCommandEntry({
                             targetKind: "device",
                             targetId: device.device_id,
                             action,
-                            label: entry.label ?? undefined,
+                            label,
                             paramsDraft: { ...(pinnedParamDrafts[draftKey] ?? {}) },
                           });
-                        }
-                        notifications.show({
-                          color: "teal",
-                          title: "Added pinned commands to deck",
-                          message: `${device.device_id}: ${entries.length} command${
-                            entries.length === 1 ? "" : "s"
-                          }`,
-                        });
-                      }}
-                      capabilities={capabilitiesByDevice[device.device_id] ?? []}
-                      pinnedParamValuesByAction={Object.fromEntries(
-                        (pinnedCommands[device.device_id] ?? []).map((entry) => [
-                          entry.action,
-                          pinnedParamDrafts[
-                            pinnedCommandKey(device.device_id, entry.action)
-                          ] ?? {},
-                        ])
-                      )}
-                      pinnedBusyByAction={Object.fromEntries(
-                        (pinnedCommands[device.device_id] ?? []).map((entry) => [
-                          entry.action,
-                          Boolean(
-                            pinnedBusyByKey[
+                          notifications.show({
+                            color: "teal",
+                            title: "Added to command deck",
+                            message: `${device.device_id}.${action}`,
+                          });
+                        }}
+                        onAddAllPinnedToDeck={() => {
+                          const entries = pinnedCommands[device.device_id] ?? [];
+                          if (entries.length === 0) {
+                            notifications.show({
+                              color: "yellow",
+                              title: "No pinned commands",
+                              message: `${device.device_id} has no pinned commands.`,
+                            });
+                            return;
+                          }
+                          for (const entry of entries) {
+                            const action = entry.action;
+                            const draftKey = pinnedCommandKey(device.device_id, action);
+                            addCommandDeckCommandEntry({
+                              targetKind: "device",
+                              targetId: device.device_id,
+                              action,
+                              label: entry.label ?? undefined,
+                              paramsDraft: { ...(pinnedParamDrafts[draftKey] ?? {}) },
+                            });
+                          }
+                          notifications.show({
+                            color: "teal",
+                            title: "Added pinned commands to deck",
+                            message: `${device.device_id}: ${entries.length} command${
+                              entries.length === 1 ? "" : "s"
+                            }`,
+                          });
+                        }}
+                        capabilities={capabilitiesByDevice[device.device_id] ?? []}
+                        pinnedParamValuesByAction={Object.fromEntries(
+                          (pinnedCommands[device.device_id] ?? []).map((entry) => [
+                            entry.action,
+                            pinnedParamDrafts[
                               pinnedCommandKey(device.device_id, entry.action)
-                            ]
-                          ),
-                        ])
-                      )}
-                      onPinnedParamChange={(action, paramName, value) =>
-                        handlePinnedParamChange(
-                          device.device_id,
-                          action,
-                          paramName,
-                          value
-                        )
-                      }
-                      onPinnedSend={(action) =>
-                        handlePinnedCommandSend(device.device_id, action)
-                      }
-                      index={idx}
-                    />
+                            ] ?? {},
+                          ])
+                        )}
+                        pinnedBusyByAction={Object.fromEntries(
+                          (pinnedCommands[device.device_id] ?? []).map((entry) => [
+                            entry.action,
+                            Boolean(
+                              pinnedBusyByKey[
+                                pinnedCommandKey(device.device_id, entry.action)
+                              ]
+                            ),
+                          ])
+                        )}
+                        onPinnedParamChange={(action, paramName, value) =>
+                          handlePinnedParamChange(
+                            device.device_id,
+                            action,
+                            paramName,
+                            value
+                          )
+                        }
+                        onPinnedSend={(action) =>
+                          handlePinnedCommandSend(device.device_id, action)
+                        }
+                      />
+                    </ReorderableCardShell>
                   ))}
                 </div>
+                </SortableContext>
               ) : (
                 <CommandDeckPanel
                   entries={commandDeck}
@@ -7312,13 +7423,6 @@ export function App() {
                   }
                   onMoveEntryDown={(entryId) =>
                     moveCommandDeckEntryWithinGroup(entryId, 1)
-                  }
-                  onReorderEntry={(entryId, targetEntryId, mode) =>
-                    reorderCommandDeckEntryWithinGroup(
-                      entryId,
-                      targetEntryId,
-                      mode
-                    )
                   }
                   onUpdateCommandEntryTargetKind={(entryId, targetKind) =>
                     setCommandDeckEntryTargetKind(entryId, targetKind)
@@ -7513,12 +7617,14 @@ export function App() {
                   </Menu.Dropdown>
                 </Menu>
               </Group>
+              <SortableContext
+                items={panels.map((panel) => panelSortableId(panel.id))}
+                strategy={rectSortingStrategy}
+              >
               <div
                 className="plot-grid"
                 style={plotGridStyle}
-                onDragOver={handlePanelGridDragOver}
-                onDrop={handlePanelGridDrop}
-                onDragLeave={handlePanelGridDragLeave}
+                ref={plotGridRef}
               >
                 {panels.map((panel) => {
                   const isActive = panel.id === activePanelId;
@@ -7549,37 +7655,6 @@ export function App() {
                   const bin2dYLabel = isStreamBin2dPanel(panel)
                     ? workspaceBin2dAxisLabel(streamWorkspace, panel.outputId, "y")
                     : "context_y";
-                  const panelDragMode = (() => {
-                    if (dragOverPanelTarget?.panelId === panel.id) {
-                      return dragOverPanelTarget.mode;
-                    }
-                    if (!dragPanelId || panelInsertIndex == null) {
-                      return null;
-                    }
-                    const withoutDragged = panels
-                      .map((entry) => entry.id)
-                      .filter((entryId) => entryId !== dragPanelId);
-                    const idxWithoutDragged = withoutDragged.indexOf(panel.id);
-                    if (idxWithoutDragged < 0) {
-                      return null;
-                    }
-                    if (panelInsertIndex === idxWithoutDragged) {
-                      return "before";
-                    }
-                    if (
-                      panelInsertIndex === withoutDragged.length &&
-                      idxWithoutDragged === withoutDragged.length - 1
-                    ) {
-                      return "after";
-                    }
-                    return null;
-                  })();
-                  const panelBg =
-                    panelDragMode !== null
-                      ? computedColorScheme === "dark"
-                        ? "rgba(45, 185, 177, 0.18)"
-                        : "#f2fbfa"
-                      : "var(--card)";
                   const telemetryNumericTraceCount = isTelemetryPanel(panel)
                     ? panel.traces.filter((trace) => trace.valueKind !== "boolean")
                         .length
@@ -7621,103 +7696,22 @@ export function App() {
                         : telemetryOffsetFull
                       : null;
                   return (
-                    <Card
+                    <ReorderableCardShell
                       key={panel.id}
-                      data-panel-card-id={panel.id}
+                      id={panelSortableId(panel.id)}
+                      data={{ kind: "panel", panelId: panel.id }}
                       className="plot-workspace-card"
-                      radius="lg"
-                      p="md"
+                      dataPanelCardId={panel.id}
+                      dragHandleTitle="Drag from border to reorder panels"
                       style={{
                         border:
-                          panelDragMode === "swap"
-                            ? "2px dashed #0e9f9a"
-                            : isActive
+                          isActive
                             ? "2px solid #0e9f9a"
                             : "1px solid var(--card-border)",
-                        borderLeft:
-                          panelDragMode === "before"
-                            ? "3px solid #0e9f9a"
-                            : undefined,
-                        borderRight:
-                          panelDragMode === "after"
-                            ? "3px solid #0e9f9a"
-                            : undefined,
-                        background: panelBg,
+                        background: "var(--card)",
                         position: "relative",
                       }}
-                      onDragOver={(event) => {
-                        if (!dragPanelId || dragPanelId === panel.id) {
-                          // Allow telemetry/trace drops on panel cards.
-                          event.preventDefault();
-                          return;
-                        }
-                        const mode = computeHorizontalReorderMode(event);
-                        if (mode !== "swap") {
-                          if (dragOverPanelTarget?.panelId === panel.id) {
-                            setDragOverPanelTarget(null);
-                          }
-                          return;
-                        }
-                        event.preventDefault();
-                        event.stopPropagation();
-                        setPanelInsertIndex(null);
-                        setDragOverPanelTarget((prev) =>
-                          prev && prev.panelId === panel.id && prev.mode === "swap"
-                            ? prev
-                            : { panelId: panel.id, mode: "swap" }
-                        );
-                      }}
-                      onDragLeave={() => {
-                        if (dragOverPanelTarget?.panelId === panel.id) {
-                          setDragOverPanelTarget(null);
-                        }
-                      }}
-                      onDrop={(event) => handleDropOnPanel(panel.id, event)}
                     >
-                      <div
-                        className="panel-drag-handle panel-drag-handle-top"
-                        draggable
-                        onDragStart={(event) => handlePanelDragStart(panel.id, event)}
-                        onDragEnd={() => {
-                          setDragPanelId(null);
-                          setDragOverPanelTarget(null);
-                          setPanelInsertIndex(null);
-                        }}
-                        title="Drag from border to reorder panels"
-                      />
-                      <div
-                        className="panel-drag-handle panel-drag-handle-right"
-                        draggable
-                        onDragStart={(event) => handlePanelDragStart(panel.id, event)}
-                        onDragEnd={() => {
-                          setDragPanelId(null);
-                          setDragOverPanelTarget(null);
-                          setPanelInsertIndex(null);
-                        }}
-                        title="Drag from border to reorder panels"
-                      />
-                      <div
-                        className="panel-drag-handle panel-drag-handle-bottom"
-                        draggable
-                        onDragStart={(event) => handlePanelDragStart(panel.id, event)}
-                        onDragEnd={() => {
-                          setDragPanelId(null);
-                          setDragOverPanelTarget(null);
-                          setPanelInsertIndex(null);
-                        }}
-                        title="Drag from border to reorder panels"
-                      />
-                      <div
-                        className="panel-drag-handle panel-drag-handle-left"
-                        draggable
-                        onDragStart={(event) => handlePanelDragStart(panel.id, event)}
-                        onDragEnd={() => {
-                          setDragPanelId(null);
-                          setDragOverPanelTarget(null);
-                          setPanelInsertIndex(null);
-                        }}
-                        title="Drag from border to reorder panels"
-                      />
                       <Group justify="space-between" align="center">
                         <Group gap="sm" align="center">
                           {editingPanelId === panel.id ? (
@@ -7773,7 +7767,8 @@ export function App() {
                               </ActionIcon>
                             </Group>
                           )}
-                          {dragPanelId === panel.id && (
+                          {activeUiDrag?.kind === "panel" &&
+                          activeUiDrag.panelId === panel.id && (
                             <Badge variant="light" color="blue">
                               Dragging
                             </Badge>
@@ -8190,15 +8185,12 @@ export function App() {
                             {panel.traces.map((trace, traceIndex) => {
                               const traceColor = traceColorAt(traceIndex);
                               return (
-                                <span
+                                <DraggableTraceChip
                                   key={traceKeyId(trace)}
+                                  panelId={panel.id}
+                                  trace={trace}
                                   className="trace-chip"
-                                  draggable
-                                  onDragStart={(event) =>
-                                    handleTraceDragStart(panel.id, trace, event)
-                                  }
                                   style={{
-                                    cursor: "grab",
                                     color: traceColor,
                                     background: colorWithAlpha(
                                       traceColor,
@@ -8221,7 +8213,7 @@ export function App() {
                                   >
                                     <IconX size={14} />
                                   </ActionIcon>
-                                </span>
+                                </DraggableTraceChip>
                               );
                             })}
                           </Group>
@@ -8657,11 +8649,11 @@ export function App() {
                           </Group>
                         </>
                       ) : null}
-                      
-                    </Card>
+                    </ReorderableCardShell>
                   );
                 })}
               </div>
+              </SortableContext>
             </Stack>
           </section>
         </div>
@@ -8805,6 +8797,7 @@ export function App() {
 
       <AppModalsLayer
         hdf={hdfController}
+        influx={influxController}
         renderMeasurementFieldInput={renderMeasurementFieldInput}
         processesController={processesController}
         processCommandController={processCommandController}
@@ -8829,6 +8822,8 @@ export function App() {
         streamWorkspaces={streamWorkspaces}
         latestSignalsByDevice={latestByDevice}
         interlocksController={interlocksController}
+        watchdogsController={watchdogsController}
+        stateMachinesController={stateMachinesController}
         sequencerController={sequencerController}
         sequencerPrimaryIcon={sequencerPrimaryIcon}
         sequencerProcessId={sequencerProcess?.process_id ?? null}
@@ -8861,8 +8856,9 @@ export function App() {
         logScrollRef={logScrollRef}
         expandedLogByKey={expandedLogByKey}
         copyTextToClipboard={copyTextToClipboard}
-      />
-    </AppShell>
+        />
+      </AppShell>
+    </DndContext>
   );
 }
 

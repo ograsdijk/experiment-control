@@ -28,6 +28,17 @@ type Props = {
   onOpenCommand: (processId: string, action?: string) => void;
 };
 
+function formatMemoryLabel(bytes: number | null | undefined): string {
+  if (typeof bytes !== "number" || !Number.isFinite(bytes) || bytes <= 0) {
+    return "n/a";
+  }
+  const mb = bytes / (1024 * 1024);
+  if (mb >= 1024) {
+    return `${(mb / 1024).toFixed(2)} GB`;
+  }
+  return `${mb.toFixed(1)} MB`;
+}
+
 export function ProcessesModal({
   opened,
   onClose,
@@ -129,7 +140,8 @@ export function ProcessesModal({
                       </Badge>
                     </Group>
                     <Text size="xs" c="dimmed">
-                      pid {process.pid ?? "n/a"} | hb age{" "}
+                      pid {process.pid ?? "n/a"} | mem{" "}
+                      {formatMemoryLabel(process.rss_bytes ?? null)} | hb age{" "}
                       {process.hb_age_s != null
                         ? `${process.hb_age_s.toFixed(2)} s`
                         : "n/a"}

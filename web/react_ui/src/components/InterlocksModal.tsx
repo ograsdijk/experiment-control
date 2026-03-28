@@ -11,6 +11,7 @@
 } from "@mantine/core";
 import { IconRefresh } from "@tabler/icons-react";
 import { useEffect, useMemo, useState } from "react";
+import type { ReactNode } from "react";
 import {
   formatFreqHz,
   interlockRuleKey,
@@ -29,6 +30,7 @@ import { DeviceNameInline } from "./DeviceNameInline";
 type Props = {
   opened: boolean;
   onClose: () => void;
+  panelOnly?: boolean;
   onRefresh: () => Promise<unknown> | void;
   devices: ReadonlyArray<DeviceStatus>;
   processes: ReadonlyArray<ProcessStatus>;
@@ -54,9 +56,545 @@ type Props = {
   ) => Promise<unknown> | void;
 };
 
+type ConditionNode =
+  | { kind: "always"; value: unknown }
+  | {
+      kind: "comparison";
+      op: "eq" | "ne" | "gt" | "ge" | "lt" | "le" | "abs_lt";
+      left: unknown;
+      right: unknown;
+    }
+  | { kind: "group"; op: "and" | "or"; items: ConditionNode[] }
+  | { kind: "not"; item: ConditionNode }
+  | { kind: "leaf"; value: unknown };
+
+export type ConditionTelemetryBinding = {
+  as: string;
+  device_id: string;
+  signal: string;
+  max_age_s: number;
+};
+
+const TEMPLATE_TOKEN_RE = /\$\{([^}]+)\}/g;
+const SYMBOL_TOKEN_RE = /[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*/g;
+const CONDITION_RESERVED = new Set([
+  "and",
+  "or",
+  "not",
+  "true",
+  "false",
+  "none",
+  "len",
+  "min",
+  "max",
+  "abs",
+  "round",
+  "int",
+  "float",
+  "bool",
+  "str",
+]);
+
+function formatInterlockConditionRaw(condition: unknown): string {
+  if (condition === undefined) {
+    return "n/a";
+  }
+  if (typeof condition === "string") {
+    return condition;
+  }
+  try {
+    const rendered = JSON.stringify(condition, null, 2);
+    return rendered ?? String(condition);
+  } catch {
+    return String(condition);
+  }
+}
+
+function parseConditionNode(condition: unknown): ConditionNode {
+  if (
+    condition === null ||
+    condition === undefined ||
+    typeof condition === "string" ||
+    typeof condition === "number" ||
+    typeof condition === "boolean"
+  ) {
+    return { kind: "leaf", value: condition };
+  }
+  if (Array.isArray(condition)) {
+    return { kind: "leaf", value: condition };
+  }
+  if (typeof condition !== "object") {
+    return { kind: "leaf", value: condition };
+  }
+  const obj = condition as Record<string, unknown>;
+  const keys = Object.keys(obj);
+  if (keys.length !== 1) {
+    return { kind: "leaf", value: condition };
+  }
+  if ("always" in obj) {
+    return { kind: "always", value: obj.always };
+  }
+  for (const op of ["eq", "ne", "gt", "ge", "lt", "le", "abs_lt"] as const) {
+    if (!(op in obj)) {
+      continue;
+    }
+    const pair = Array.isArray(obj[op]) ? (obj[op] as unknown[]) : [];
+    return {
+      kind: "comparison",
+      op,
+      left: pair.length > 0 ? pair[0] : undefined,
+      right: pair.length > 1 ? pair[1] : undefined,
+    };
+  }
+  if ("and" in obj) {
+    const items = Array.isArray(obj.and) ? obj.and : [];
+    return {
+      kind: "group",
+      op: "and",
+      items: items.map((item) => parseConditionNode(item)),
+    };
+  }
+  if ("or" in obj) {
+    const items = Array.isArray(obj.or) ? obj.or : [];
+    return {
+      kind: "group",
+      op: "or",
+      items: items.map((item) => parseConditionNode(item)),
+    };
+  }
+  if ("not" in obj) {
+    return { kind: "not", item: parseConditionNode(obj.not) };
+  }
+  return { kind: "leaf", value: condition };
+}
+
+function formatConditionValue(value: unknown): string {
+  if (value === undefined) {
+    return "n/a";
+  }
+  if (typeof value === "string") {
+    return value;
+  }
+  if (
+    value === null ||
+    typeof value === "number" ||
+    typeof value === "boolean"
+  ) {
+    return String(value);
+  }
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function extractSymbolsFromTemplateExpression(expr: string): string[] {
+  const symbols: string[] = [];
+  for (const match of expr.matchAll(SYMBOL_TOKEN_RE)) {
+    const token = String(match[0] ?? "").trim();
+    if (!token) {
+      continue;
+    }
+    const root = token.split(".", 1)[0]?.toLowerCase() ?? "";
+    if (CONDITION_RESERVED.has(root)) {
+      continue;
+    }
+    symbols.push(token);
+  }
+  return symbols;
+}
+
+function rewriteSymbolToken(
+  token: string,
+  telemetryByAlias: Map<string, ConditionTelemetryBinding>,
+  commandDeviceId?: string,
+  commandAction?: string
+): string {
+  const trimmed = String(token ?? "").trim();
+  const commandDevice = String(commandDeviceId ?? "").trim() || "*";
+  const action = String(commandAction ?? "").trim() || "*";
+  const commandTarget = `${commandDevice}.${action}`;
+  if (!trimmed) {
+    return trimmed;
+  }
+  if (trimmed === "params") {
+    return `${commandTarget}(params)`;
+  }
+  if (trimmed === "command.params") {
+    return `${commandTarget}(params)`;
+  }
+  if (trimmed.startsWith("params.")) {
+    const param = trimmed.slice("params.".length);
+    return `${commandTarget}(${param || "param"})`;
+  }
+  if (trimmed.startsWith("command.params.")) {
+    const param = trimmed.slice("command.params.".length);
+    return `${commandTarget}(${param || "param"})`;
+  }
+  if (trimmed === "device_id") {
+    return commandDevice;
+  }
+  if (trimmed === "command.device_id") {
+    return commandDevice;
+  }
+  if (trimmed === "action") {
+    return commandTarget;
+  }
+  if (trimmed === "command.action") {
+    return commandTarget;
+  }
+  const parts = trimmed.split(".");
+  const alias = parts[0] ?? "";
+  const binding = telemetryByAlias.get(alias);
+  if (!binding) {
+    return trimmed;
+  }
+  const tailParts = parts.slice(1);
+  const normalizedTailParts =
+    tailParts.length === 1 && tailParts[0] === "value" ? [] : tailParts;
+  const tail = normalizedTailParts.length > 0 ? `.${normalizedTailParts.join(".")}` : "";
+  return `${binding.device_id}.${binding.signal}${tail}`;
+}
+
+function rewriteExpressionText(
+  text: string,
+  telemetryByAlias: Map<string, ConditionTelemetryBinding>,
+  commandDeviceId?: string,
+  commandAction?: string
+): string {
+  return text.replace(SYMBOL_TOKEN_RE, (rawToken) => {
+    const root = String(rawToken ?? "")
+      .split(".", 1)[0]
+      ?.toLowerCase();
+    if (root && CONDITION_RESERVED.has(root)) {
+      return rawToken;
+    }
+    return rewriteSymbolToken(
+      rawToken,
+      telemetryByAlias,
+      commandDeviceId,
+      commandAction
+    );
+  });
+}
+
+function rewriteConditionString(
+  value: string,
+  telemetryByAlias: Map<string, ConditionTelemetryBinding>,
+  commandDeviceId?: string,
+  commandAction?: string
+): string {
+  const wholeTemplateMatch = value.match(/^\$\{([^}]+)\}$/);
+  if (wholeTemplateMatch) {
+    return rewriteExpressionText(
+      String(wholeTemplateMatch[1] ?? ""),
+      telemetryByAlias,
+      commandDeviceId,
+      commandAction
+    );
+  }
+  if (value.includes("${")) {
+    return value.replace(TEMPLATE_TOKEN_RE, (_full, exprRaw) => {
+      const expr = String(exprRaw ?? "");
+      return rewriteExpressionText(
+        expr,
+        telemetryByAlias,
+        commandDeviceId,
+        commandAction
+      );
+    });
+  }
+  return rewriteExpressionText(
+    value,
+    telemetryByAlias,
+    commandDeviceId,
+    commandAction
+  );
+}
+
+export function InterlockConditionView({
+  condition,
+  telemetry,
+  commandDeviceId,
+  commandAction,
+}: {
+  condition: unknown;
+  telemetry?: ReadonlyArray<ConditionTelemetryBinding>;
+  commandDeviceId?: string;
+  commandAction?: string;
+}) {
+  const [showRaw, setShowRaw] = useState(false);
+  const node = useMemo(() => parseConditionNode(condition), [condition]);
+  const raw = useMemo(
+    () => formatInterlockConditionRaw(condition),
+    [condition]
+  );
+  const telemetryByAlias = useMemo(() => {
+    const byAlias = new Map<string, ConditionTelemetryBinding>();
+    for (const binding of telemetry ?? []) {
+      const alias = String(binding.as ?? "").trim();
+      if (!alias || byAlias.has(alias)) {
+        continue;
+      }
+      byAlias.set(alias, binding);
+    }
+    return byAlias;
+  }, [telemetry]);
+
+  const resolveRenderedValue = (value: unknown): string => {
+    const rawText = formatConditionValue(value);
+    return typeof value === "string"
+      ? rewriteConditionString(
+          value,
+          telemetryByAlias,
+          commandDeviceId,
+          commandAction
+        )
+      : rawText;
+  };
+
+  const renderValue = (value: unknown) => {
+    const text = resolveRenderedValue(value);
+    const looksTemplate = typeof value === "string" && value.includes("${");
+    return (
+      <Text
+        size="xs"
+        style={{
+          fontFamily:
+            "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
+          wordBreak: "break-word",
+        }}
+        c={looksTemplate ? "teal" : undefined}
+      >
+        {text}
+      </Text>
+    );
+  };
+
+  const withCommandParamArrow = (symbolText: string, valueText: string): string => {
+    const match = symbolText.match(/^(.*)\(([^()]+)\)$/);
+    if (!match) {
+      return symbolText;
+    }
+    const prefix = String(match[1] ?? "");
+    const param = String(match[2] ?? "").trim() || "param";
+    return `${prefix}(${param} -> ${valueText})`;
+  };
+
+  const isComparableLiteral = (value: unknown): boolean =>
+    value === null ||
+    typeof value === "boolean" ||
+    typeof value === "number" ||
+    typeof value === "string";
+
+  const valueColor = (value: unknown): string | undefined => {
+    if (typeof value === "boolean") {
+      return value ? "teal" : "red";
+    }
+    if (typeof value === "string" && value.includes("${")) {
+      return "teal";
+    }
+    return undefined;
+  };
+
+  const renderNode = (current: ConditionNode): ReactNode => {
+    if (current.kind === "always") {
+      return (
+        <Group gap="xs" wrap="wrap">
+          <Badge size="xs" variant="light" color="gray">
+            Always
+          </Badge>
+          {renderValue(current.value)}
+        </Group>
+      );
+    }
+    if (current.kind === "comparison") {
+      const symbolByOp: Record<ConditionNode["op"], string> = {
+        eq: "=",
+        ne: "!=",
+        gt: ">",
+        ge: ">=",
+        lt: "<",
+        le: "<=",
+        abs_lt: "|x| <",
+      };
+      const colorByOp: Record<ConditionNode["op"], string> = {
+        eq: "blue",
+        ne: "blue",
+        gt: "violet",
+        ge: "violet",
+        lt: "violet",
+        le: "violet",
+        abs_lt: "orange",
+      };
+      const leftText = resolveRenderedValue(current.left);
+      const rightText = resolveRenderedValue(current.right);
+      const leftIsCommandParam = /\.[^.]+\([^)]+\)$/.test(leftText);
+      const rightIsCommandParam = /\.[^.]+\([^)]+\)$/.test(rightText);
+      const canArrow =
+        (current.op === "eq" || current.op === "ne") &&
+        ((leftIsCommandParam && isComparableLiteral(current.right)) ||
+          (rightIsCommandParam && isComparableLiteral(current.left)));
+      const leftDisplay = canArrow && leftIsCommandParam
+        ? withCommandParamArrow(leftText, rightText)
+        : leftText;
+      const rightDisplay = canArrow && rightIsCommandParam
+        ? withCommandParamArrow(rightText, leftText)
+        : rightText;
+      const simplifyEq = current.op === "eq" && canArrow;
+      const simplifiedText =
+        simplifyEq && leftIsCommandParam
+          ? leftDisplay
+          : simplifyEq && rightIsCommandParam
+            ? rightDisplay
+            : null;
+      const simplifiedColor =
+        simplifyEq && leftIsCommandParam
+          ? valueColor(current.right)
+          : simplifyEq && rightIsCommandParam
+            ? valueColor(current.left)
+            : undefined;
+      if (simplifiedText) {
+        return (
+          <Group gap="xs" wrap="wrap">
+            <Text
+              size="xs"
+              c={simplifiedColor}
+              style={{
+                fontFamily:
+                  "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
+                wordBreak: "break-word",
+              }}
+            >
+              {simplifiedText}
+            </Text>
+          </Group>
+        );
+      }
+      return (
+        <Group gap="xs" wrap="wrap">
+          <Text
+            size="xs"
+            c={valueColor(current.left)}
+            style={{
+              fontFamily:
+                "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
+              wordBreak: "break-word",
+            }}
+          >
+            {leftDisplay}
+          </Text>
+          <Badge size="xs" variant="outline" color={colorByOp[current.op]}>
+            {symbolByOp[current.op]}
+          </Badge>
+          <Text
+            size="xs"
+            c={valueColor(current.right)}
+            style={{
+              fontFamily:
+                "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
+              wordBreak: "break-word",
+            }}
+          >
+            {rightDisplay}
+          </Text>
+        </Group>
+      );
+    }
+    if (current.kind === "group") {
+      return (
+        <Stack
+          gap={4}
+          style={{
+            border: "1px solid var(--card-border)",
+            borderRadius: "0.375rem",
+            padding: "0.35rem 0.45rem",
+          }}
+        >
+          <Group gap="xs" wrap="wrap">
+            <Badge
+              size="xs"
+              variant="light"
+              color={current.op === "and" ? "teal" : "blue"}
+            >
+              {current.op === "and" ? "ALL" : "ANY"}
+            </Badge>
+            <Text size="xs" c="dimmed">
+              {current.op === "and"
+                ? "All conditions must pass"
+                : "Any condition can pass"}
+            </Text>
+          </Group>
+          {current.items.length > 0 ? (
+            <Stack gap={3}>
+              {current.items.map((item, idx) => (
+                <Group key={`condition-item:${idx}`} gap="xs" wrap="nowrap" align="flex-start">
+                  <Badge size="xs" variant="outline" color="gray">
+                    {idx + 1}
+                  </Badge>
+                  <Stack gap={2} style={{ flex: 1 }}>
+                    {renderNode(item)}
+                  </Stack>
+                </Group>
+              ))}
+            </Stack>
+          ) : (
+            <Text size="xs" c="dimmed">
+              (empty)
+            </Text>
+          )}
+        </Stack>
+      );
+    }
+    if (current.kind === "not") {
+      return (
+        <Stack gap={4}>
+          <Badge size="xs" variant="light" color="orange" style={{ width: "fit-content" }}>
+            NOT
+          </Badge>
+          <Stack gap={2} style={{ paddingLeft: "0.25rem" }}>
+            {renderNode(current.item)}
+          </Stack>
+        </Stack>
+      );
+    }
+    return renderValue(current.value);
+  };
+
+  return (
+    <Stack gap={4}>
+      {renderNode(node)}
+      <Button
+        size="compact-xs"
+        variant="subtle"
+        color="gray"
+        style={{ alignSelf: "flex-start" }}
+        onClick={() => setShowRaw((prev) => !prev)}
+      >
+        {showRaw ? "Hide raw" : "Show raw"}
+      </Button>
+      {showRaw && (
+        <Text
+          size="xs"
+          style={{
+            fontFamily:
+              "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
+            whiteSpace: "pre-wrap",
+            wordBreak: "break-word",
+          }}
+        >
+          {raw}
+        </Text>
+      )}
+    </Stack>
+  );
+}
+
 export function InterlocksModal({
   opened,
   onClose,
+  panelOnly = false,
   onRefresh,
   devices,
   processes,
@@ -160,6 +698,8 @@ export function InterlocksModal({
         ruleId: string;
         name: string;
         hasAllowTransform: boolean;
+        condition: unknown;
+        telemetry: ConditionTelemetryBinding[];
       }>;
       matchedFollowerRules: Array<{
         ruleId: string;
@@ -192,6 +732,8 @@ export function InterlocksModal({
         ruleId: string;
         name: string;
         hasAllowTransform: boolean;
+        condition: unknown;
+        telemetry: ConditionTelemetryBinding[];
       }> = [];
       if (processActive) {
         const interceptors = interlockStatusByProcessId[route.process_id] ?? [];
@@ -216,6 +758,10 @@ export function InterlocksModal({
               ruleId: String(rule.rule_id ?? "").trim(),
               name: String(rule.name ?? "").trim() || String(rule.rule_id ?? "rule"),
               hasAllowTransform: Boolean(rule.has_allow_transform),
+              condition: rule.condition,
+              telemetry: Array.isArray(rule.telemetry)
+                ? (rule.telemetry as ConditionTelemetryBinding[])
+                : [],
             });
           }
         }
@@ -291,15 +837,7 @@ export function InterlocksModal({
     followerRulesByProcessId,
   ]);
 
-  return (
-    <Modal
-      opened={opened}
-      onClose={onClose}
-      title="Interlocks"
-      size="clamp(56rem, 92vw, 96rem)"
-      centered
-      zIndex={420}
-    >
+  const panel = (
       <Stack gap="md">
         <Group justify="space-between">
           <Text size="sm" c="dimmed">
@@ -453,6 +991,46 @@ export function InterlocksModal({
                               )
                             </Text>
                           </Group>
+                          {entry.matchedInterlockRules.length > 0 && (
+                            <Stack gap={4}>
+                              {entry.matchedInterlockRules.map((rule, ruleIdx) => (
+                                <Card
+                                  key={`effective-interlock-rule:${entry.route.process_id}:${rule.interceptorId}:${rule.ruleId || rule.name}:${ruleIdx}`}
+                                  p={6}
+                                  radius="sm"
+                                  style={{ border: "1px solid var(--card-border)" }}
+                                >
+                                  <Stack gap={2}>
+                                    <Group gap="xs" wrap="wrap">
+                                      <Text size="xs" fw={600}>
+                                        {rule.name}
+                                      </Text>
+                                      <Badge variant="outline" color="gray">
+                                        {rule.interceptorId || "interlock"}
+                                      </Badge>
+                                      <Badge
+                                        variant="outline"
+                                        color={rule.hasAllowTransform ? "grape" : "gray"}
+                                      >
+                                        {rule.hasAllowTransform
+                                          ? "Transforms params"
+                                          : "No transform"}
+                                      </Badge>
+                                    </Group>
+                                    <Text size="xs" c="dimmed">
+                                      Condition:
+                                    </Text>
+                                    <InterlockConditionView
+                                      condition={rule.condition}
+                                      telemetry={rule.telemetry}
+                                      commandDeviceId={chainDeviceId.trim()}
+                                      commandAction={chainAction.trim()}
+                                    />
+                                  </Stack>
+                                </Card>
+                              ))}
+                            </Stack>
+                          )}
                           {entry.matchedFollowerRules.length > 0 && (
                             <Stack gap={4}>
                               {entry.matchedFollowerRules.map((rule, ruleIdx) => (
@@ -817,6 +1395,15 @@ export function InterlocksModal({
                                       <Text size="xs" c="dimmed">
                                         Telemetry bindings: {rule.telemetry.length}
                                       </Text>
+                                      <Text size="xs" c="dimmed">
+                                        Condition:
+                                      </Text>
+                                      <InterlockConditionView
+                                        condition={rule.condition}
+                                        telemetry={rule.telemetry}
+                                        commandDeviceId={rule.match.device_id}
+                                        commandAction={rule.match.action}
+                                      />
                                       {rule.on_block?.code && (
                                         <Text size="xs" c="dimmed">
                                           On block: {rule.on_block.code}
@@ -858,6 +1445,22 @@ export function InterlocksModal({
           );
         })}
       </Stack>
+  );
+
+  if (panelOnly) {
+    return panel;
+  }
+
+  return (
+    <Modal
+      opened={opened}
+      onClose={onClose}
+      title="Interlocks"
+      size="clamp(56rem, 92vw, 96rem)"
+      centered
+      zIndex={420}
+    >
+      {panel}
     </Modal>
   );
 }

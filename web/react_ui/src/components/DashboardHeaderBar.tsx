@@ -14,6 +14,7 @@ import {
 import {
   IconChevronDown,
   IconCpu,
+  IconDatabase,
   IconFileText,
   IconPencil,
   IconRefresh,
@@ -140,6 +141,12 @@ type Props = {
   onOpenHdfMeasurementNote: () => Promise<unknown> | void;
   hdfMeasurementSchemaDisplayError: string | null;
   hdfMeasurementNotesRows: number;
+  showInfluxWriter: boolean;
+  influxWriterChipColor: string;
+  influxWriterLoading: boolean;
+  onOpenInfluxWriter: () => Promise<unknown> | void;
+  influxWriterTitle: string;
+  influxWriterLabel: string;
   showSequencer: boolean;
   sequencerChipColor: string;
   sequencerStatusLoading: boolean;
@@ -157,6 +164,12 @@ type Props = {
   onRunSequencerPrimaryAction: () => Promise<unknown> | void;
   sequencerLoaded: boolean;
   onOpenProcesses: () => Promise<unknown> | void;
+  stateMachineButtonSummary: {
+    color: string;
+    tooltip: string;
+    label: string;
+  };
+  onOpenStateMachines: () => void;
   interlockButtonSummary: {
     color: string;
     tooltip: string;
@@ -202,6 +215,12 @@ export function DashboardHeaderBar({
   onOpenHdfMeasurementNote,
   hdfMeasurementSchemaDisplayError,
   hdfMeasurementNotesRows,
+  showInfluxWriter,
+  influxWriterChipColor,
+  influxWriterLoading,
+  onOpenInfluxWriter,
+  influxWriterTitle,
+  influxWriterLabel,
   showSequencer,
   sequencerChipColor,
   sequencerStatusLoading,
@@ -219,6 +238,8 @@ export function DashboardHeaderBar({
   onRunSequencerPrimaryAction,
   sequencerLoaded,
   onOpenProcesses,
+  stateMachineButtonSummary,
+  onOpenStateMachines,
   interlockButtonSummary,
   onOpenInterlocks,
   showDaqUi,
@@ -410,7 +431,6 @@ export function DashboardHeaderBar({
     <AppShell.Header className="app-header">
       <Group h="100%" px="lg" justify="space-between">
         <Group gap="sm">
-          <div className="pulse" />
           <Popover
             opened={instancePopoverOpen}
             onChange={(open) => {
@@ -584,7 +604,24 @@ export function DashboardHeaderBar({
               }}
               title={hdfWriterTitle}
             >
-              HDF {hdfWriterState} | {hdfWriterFileLabel}
+              {hdfWriterFileLabel !== "no file" && hdfWriterFileLabel !== "status unavailable"
+                ? `HDF | ${hdfWriterFileLabel}`
+                : "HDF"}
+            </Button>
+          )}
+          {showInfluxWriter && (
+            <Button
+              size="xs"
+              variant="light"
+              color={influxWriterChipColor}
+              leftSection={<IconDatabase size={14} />}
+              loading={influxWriterLoading}
+              onClick={() => {
+                void onOpenInfluxWriter();
+              }}
+              title={influxWriterTitle}
+            >
+              {influxWriterLabel}
             </Button>
           )}
           {showHdfNoteChiplet && (
@@ -654,6 +691,16 @@ export function DashboardHeaderBar({
             }}
           >
             Processes
+          </Button>
+          <Button
+            size="xs"
+            variant="light"
+            color={stateMachineButtonSummary.color}
+            leftSection={<IconCpu size={14} />}
+            onClick={onOpenStateMachines}
+            title={stateMachineButtonSummary.tooltip}
+          >
+            {stateMachineButtonSummary.label}
           </Button>
           <Button
             size="xs"

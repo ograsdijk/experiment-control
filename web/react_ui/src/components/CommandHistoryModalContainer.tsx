@@ -10,6 +10,7 @@ type Props = {
   onClose: () => void;
   controller: CommandHistoryControllerState;
   devices: DeviceStatus[];
+  colorScheme: "light" | "dark";
   viewportRef: MutableRefObject<HTMLDivElement | null>;
   onCopyJson: (label: string, payload: unknown) => void;
 };
@@ -19,6 +20,7 @@ export function CommandHistoryModalContainer({
   onClose,
   controller,
   devices,
+  colorScheme,
   viewportRef,
   onCopyJson,
 }: Props) {
@@ -28,6 +30,7 @@ export function CommandHistoryModalContainer({
       onClose={onClose}
       controller={controller}
       devices={devices}
+      colorScheme={colorScheme}
       viewportRef={viewportRef}
       onCopyJson={onCopyJson}
     />

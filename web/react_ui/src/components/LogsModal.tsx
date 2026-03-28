@@ -20,6 +20,7 @@ import {
 } from "../features/logs/utils";
 import type { DeviceStatus, LogEntry, ProcessStatus } from "../types";
 import { DeviceNameInline } from "./DeviceNameInline";
+import { JsonPreview } from "./JsonPreview";
 
 type Props = {
   opened: boolean;
@@ -42,6 +43,7 @@ type Props = {
   onProcessFilterChange: (value: string) => void;
   textFilter: string;
   onTextFilterChange: (value: string) => void;
+  colorScheme: "light" | "dark";
   devices: DeviceStatus[];
   processes: ProcessStatus[];
   viewportRef: MutableRefObject<HTMLDivElement | null>;
@@ -71,6 +73,7 @@ export function LogsModal({
   onProcessFilterChange,
   textFilter,
   onTextFilterChange,
+  colorScheme,
   devices,
   processes,
   viewportRef,
@@ -288,16 +291,9 @@ export function LogsModal({
                             Payload
                           </Text>
                         </summary>
-                        <Text
-                          size="xs"
-                          style={{
-                            whiteSpace: "pre-wrap",
-                            wordBreak: "break-word",
-                            marginTop: 4,
-                          }}
-                        >
-                          {entry.payload_json}
-                        </Text>
+                        <div style={{ marginTop: 4 }}>
+                          <JsonPreview text={entry.payload_json} colorScheme={colorScheme} />
+                        </div>
                       </details>
                     )}
                   </Stack>

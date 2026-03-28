@@ -13,6 +13,7 @@ import {
   Text,
   TextInput,
 } from "@mantine/core";
+import { SortableContext, rectSortingStrategy } from "@dnd-kit/sortable";
 import {
   IconChevronDown,
   IconChevronRight,
@@ -24,9 +25,9 @@ import {
   IconSettings,
   IconTrash,
 } from "@tabler/icons-react";
-import { useEffect, useMemo, useState, type DragEvent } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { effectiveDeviceMemberParams } from "../features/devices/command_schema";
-import { computeVerticalReorderMode } from "../features/layout/reorder";
+import { SortableItem } from "../features/layout/SortableItem";
 import type {
   CapabilityMember,
   CommandDeckCommandEntry,
@@ -41,6 +42,10 @@ import type {
 function normalizeGroupName(raw: string | null | undefined): string {
   const text = String(raw ?? "").trim();
   return text.length > 0 ? text : "Ungrouped";
+}
+
+function commandDeckSortableId(entryId: string): string {
+  return `deck:${entryId}`;
 }
 
 function isCommandEntry(entry: CommandDeckEntry): entry is CommandDeckCommandEntry {
@@ -115,11 +120,6 @@ type Props = {
   onRemoveEntry: (entryId: string) => void;
   onMoveEntryUp: (entryId: string) => void;
   onMoveEntryDown: (entryId: string) => void;
-  onReorderEntry: (
-    entryId: string,
-    targetEntryId: string,
-    mode: "before" | "after" | "swap"
-  ) => void;
   onUpdateCommandEntryTargetKind: (
     entryId: string,
     targetKind: CommandDeckTargetKind
@@ -157,7 +157,6 @@ export function CommandDeckPanel({
   onRemoveEntry,
   onMoveEntryUp,
   onMoveEntryDown,
-  onReorderEntry,
   onUpdateCommandEntryTargetKind,
   onUpdateCommandEntryTarget,
   onUpdateCommandEntryAction,
@@ -189,11 +188,6 @@ export function CommandDeckPanel({
   const [groupRenameDraftByName, setGroupRenameDraftByName] = useState<
     Record<string, string>
   >({});
-  const [dragEntryId, setDragEntryId] = useState<string | null>(null);
-  const [dragOverEntryTarget, setDragOverEntryTarget] = useState<{
-    entryId: string;
-    mode: "before" | "after" | "swap";
-  } | null>(null);
 
   const deviceOptions = useMemo(
     () =>
@@ -278,49 +272,6 @@ export function CommandDeckPanel({
       return changed ? next : prev;
     });
   }, [entries]);
-
-  const handleEntryDragStart = (
-    entryId: string,
-    event: DragEvent<HTMLElement>
-  ) => {
-    event.dataTransfer.effectAllowed = "move";
-    event.dataTransfer.setData("application/x-command-deck-entry", entryId);
-    setDragEntryId(entryId);
-    setDragOverEntryTarget(null);
-  };
-
-  const handleEntryDragOver = (
-    targetEntryId: string,
-    event: DragEvent<HTMLElement>
-  ) => {
-    if (!dragEntryId || dragEntryId === targetEntryId) {
-      if (dragOverEntryTarget?.entryId === targetEntryId) {
-        setDragOverEntryTarget(null);
-      }
-      return;
-    }
-    const mode = computeVerticalReorderMode(event) as "before" | "after" | "swap";
-    event.preventDefault();
-    setDragOverEntryTarget((prev) =>
-      prev && prev.entryId === targetEntryId && prev.mode === mode
-        ? prev
-        : { entryId: targetEntryId, mode }
-    );
-  };
-
-  const handleEntryDrop = (
-    targetEntryId: string,
-    event: DragEvent<HTMLElement>
-  ) => {
-    if (!dragEntryId || dragEntryId === targetEntryId) {
-      return;
-    }
-    const mode = computeVerticalReorderMode(event) as "before" | "after" | "swap";
-    event.preventDefault();
-    onReorderEntry(dragEntryId, targetEntryId, mode);
-    setDragEntryId(null);
-    setDragOverEntryTarget(null);
-  };
 
   const filteredEntries = useMemo(() => {
     const needle = searchText.trim().toLowerCase();
@@ -554,8 +505,12 @@ export function CommandDeckPanel({
                       </Button>
                     </Group>
                   ) : null}
-                  {!collapsed &&
-                    groupEntries.map((entry) => {
+                  {!collapsed && (
+                    <SortableContext
+                      items={groupEntries.map((entry) => commandDeckSortableId(entry.id))}
+                      strategy={rectSortingStrategy}
+                    >
+                    {groupEntries.map((entry) => {
                       const optionsOpen = expandedByEntryId[entry.id] === true;
                       const groupDraftValue = Object.prototype.hasOwnProperty.call(
                         groupDraftByEntryId,
@@ -574,31 +529,34 @@ export function CommandDeckPanel({
                           return next;
                         });
                       };
-                      const dragClass =
-                        dragEntryId === entry.id
-                          ? " command-deck-chip-dragging"
-                          : dragOverEntryTarget?.entryId === entry.id
-                          ? dragOverEntryTarget.mode === "before"
-                            ? " command-deck-chip-drop-before"
-                            : dragOverEntryTarget.mode === "after"
-                            ? " command-deck-chip-drop-after"
-                            : " command-deck-chip-drop-swap"
-                          : "";
-
                       return (
-                        <Stack
+                        <SortableItem
                           key={entry.id}
-                          gap={6}
-                          onDragOver={(event) => handleEntryDragOver(entry.id, event)}
-                          onDragLeave={() => {
-                            if (dragOverEntryTarget?.entryId === entry.id) {
-                              setDragOverEntryTarget(null);
-                            }
+                          id={commandDeckSortableId(entry.id)}
+                          data={{
+                            kind: "command-deck-entry",
+                            entryId: entry.id,
+                            groupName,
                           }}
-                          onDrop={(event) => handleEntryDrop(entry.id, event)}
                         >
+                          {({
+                            setNodeRef,
+                            attributes,
+                            listeners,
+                            style: sortableStyle,
+                            isDragging,
+                          }) => (
+                            <Stack
+                              ref={setNodeRef}
+                              gap={6}
+                              style={sortableStyle}
+                            >
                           {isCommandEntry(entry) ? (
-                            <div className={`pinned-command-chip command-deck-chip${dragClass}`}>
+                            <div
+                              className={`pinned-command-chip command-deck-chip${
+                                isDragging ? " command-deck-chip-dragging" : ""
+                              }`}
+                            >
                               <div className="pinned-command-segment pinned-command-name">
                                 <Button
                                   size="xs"
@@ -650,13 +608,9 @@ export function CommandDeckPanel({
                                   variant="subtle"
                                   color="gray"
                                   className="command-deck-drag-handle"
-                                  draggable
-                                  onDragStart={(event) => handleEntryDragStart(entry.id, event)}
-                                  onDragEnd={() => {
-                                    setDragEntryId(null);
-                                    setDragOverEntryTarget(null);
-                                  }}
                                   title="Drag to reorder in group"
+                                  {...attributes}
+                                  {...listeners}
                                 >
                                   <IconGripVertical size={14} />
                                 </ActionIcon>
@@ -699,11 +653,7 @@ export function CommandDeckPanel({
                                         placeholder={param.required ? `${param.name} *` : param.name}
                                       />
                                     ))
-                                  ) : (
-                                    <Text size="xs" c="dimmed" px={4}>
-                                      No parameters
-                                    </Text>
-                                  );
+                                  ) : null;
                                 })()}
                               </div>
                               <div className="pinned-command-segment pinned-command-send">
@@ -719,7 +669,11 @@ export function CommandDeckPanel({
                               </div>
                             </div>
                           ) : (
-                            <div className={`command-deck-telemetry-row command-deck-chip${dragClass}`}>
+                            <div
+                              className={`command-deck-telemetry-row command-deck-chip${
+                                isDragging ? " command-deck-chip-dragging" : ""
+                              }`}
+                            >
                               {(() => {
                                 const value = formatTelemetryValue(
                                   latestSignalsByDevice[entry.deviceId]?.[entry.signal],
@@ -805,13 +759,9 @@ export function CommandDeckPanel({
                                   variant="subtle"
                                   color="gray"
                                   className="command-deck-drag-handle"
-                                  draggable
-                                  onDragStart={(event) => handleEntryDragStart(entry.id, event)}
-                                  onDragEnd={() => {
-                                    setDragEntryId(null);
-                                    setDragOverEntryTarget(null);
-                                  }}
                                   title="Drag to reorder in group"
+                                  {...attributes}
+                                  {...listeners}
                                 >
                                   <IconGripVertical size={14} />
                                 </ActionIcon>
@@ -992,9 +942,13 @@ export function CommandDeckPanel({
                               </Stack>
                             </Card>
                           ) : null}
-                        </Stack>
+                            </Stack>
+                          )}
+                        </SortableItem>
                       );
                     })}
+                    </SortableContext>
+                  )}
                 </Stack>
               </Card>
             );

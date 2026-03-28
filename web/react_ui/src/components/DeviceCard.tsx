@@ -1,8 +1,7 @@
-﻿import {
+import {
   ActionIcon,
   Badge,
   Button,
-  Card,
   Group,
   Menu,
   Stack,
@@ -11,6 +10,7 @@
   Tooltip,
   useComputedColorScheme,
 } from "@mantine/core";
+import { useDraggable } from "@dnd-kit/core";
 import { notifications } from "@mantine/notifications";
 import {
   IconChartLine,
@@ -20,7 +20,7 @@ import {
   IconRefresh,
   IconTerminal2,
 } from "@tabler/icons-react";
-import type { DragEvent } from "react";
+import type { ReactNode } from "react";
 import {
   CapabilityMember,
   DeviceStatus,
@@ -40,16 +40,8 @@ type DeviceCardProps = {
   onRestart: () => void;
   onPlot: (signal: string) => void;
   onCommand: () => void;
-  onDragSignal: (signal: string, event: DragEvent<HTMLDivElement>) => void;
-  onDeviceDragStart: (event: DragEvent<HTMLElement>) => void;
-  onDeviceDragEnd: () => void;
-  onDeviceDragOver: (event: DragEvent<HTMLElement>) => void;
-  onDeviceDragLeave: () => void;
-  onDeviceDrop: (event: DragEvent<HTMLElement>) => void;
   telemetryCollapsed: boolean;
   onTelemetryToggle: () => void;
-  dragMode: "swap" | "before" | "after" | null;
-  isDragging: boolean;
   pinnedCommands: PinnedCommand[];
   onPinnedCommand: (action: string) => void;
   onAddPinnedToDeck: (action: string) => void;
@@ -63,7 +55,6 @@ type DeviceCardProps = {
     value: string
   ) => void;
   onPinnedSend: (action: string) => void;
-  index: number;
 };
 
 function livenessClass(liveness: string) {
@@ -101,6 +92,37 @@ function formatNumericFull(value: number): string {
   return trimNumericString(value.toPrecision(12));
 }
 
+type DraggableTelemetrySignalRowProps = {
+  deviceId: string;
+  signal: string;
+  children: ReactNode;
+};
+
+function DraggableTelemetrySignalRow({
+  deviceId,
+  signal,
+  children,
+}: DraggableTelemetrySignalRowProps) {
+  const { attributes, listeners, setNodeRef, isDragging } = useDraggable({
+    id: `signal:${deviceId}:${signal}`,
+    data: {
+      kind: "signal",
+      deviceId,
+      signal,
+    },
+  });
+  return (
+    <div
+      ref={setNodeRef}
+      style={{ cursor: "grab", opacity: isDragging ? 0.55 : 1 }}
+      {...attributes}
+      {...listeners}
+    >
+      {children}
+    </div>
+  );
+}
+
 export function DeviceCard({
   device,
   signals,
@@ -110,16 +132,8 @@ export function DeviceCard({
   onRestart,
   onPlot,
   onCommand,
-  onDragSignal,
-  onDeviceDragStart,
-  onDeviceDragEnd,
-  onDeviceDragOver,
-  onDeviceDragLeave,
-  onDeviceDrop,
   telemetryCollapsed,
   onTelemetryToggle,
-  dragMode,
-  isDragging,
   pinnedCommands,
   onPinnedCommand,
   onAddPinnedToDeck,
@@ -129,7 +143,6 @@ export function DeviceCard({
   pinnedBusyByAction,
   onPinnedParamChange,
   onPinnedSend,
-  index,
 }: DeviceCardProps) {
   const computedColorScheme = useComputedColorScheme("light");
   const darkTooltipStyles =
@@ -205,56 +218,8 @@ export function DeviceCard({
   const disconnected =
     String(device.device_state ?? "").toUpperCase() === "DISCONNECTED" ||
     String(device.liveness ?? "").toUpperCase() === "DISCONNECTED";
-  const dragClass =
-    dragMode === "swap"
-      ? "device-card-drag-over-swap"
-      : dragMode === "before"
-      ? "device-card-drag-over-before"
-      : dragMode === "after"
-      ? "device-card-drag-over-after"
-      : "";
   return (
-    <Card
-      data-device-card-id={device.device_id}
-      className={`device-card${dragClass ? ` ${dragClass}` : ""}${
-        isDragging ? " device-card-dragging" : ""
-      }`}
-      radius="lg"
-      p="md"
-      style={{ animationDelay: `${index * 45}ms` }}
-      onDragOver={(event) => onDeviceDragOver(event)}
-      onDragLeave={onDeviceDragLeave}
-      onDrop={(event) => onDeviceDrop(event)}
-    >
-      <div
-        className="device-drag-handle device-drag-handle-top"
-        draggable
-        onDragStart={(event) => onDeviceDragStart(event)}
-        onDragEnd={onDeviceDragEnd}
-        title="Drag from border to reorder devices"
-      />
-      <div
-        className="device-drag-handle device-drag-handle-right"
-        draggable
-        onDragStart={(event) => onDeviceDragStart(event)}
-        onDragEnd={onDeviceDragEnd}
-        title="Drag from border to reorder devices"
-      />
-      <div
-        className="device-drag-handle device-drag-handle-bottom"
-        draggable
-        onDragStart={(event) => onDeviceDragStart(event)}
-        onDragEnd={onDeviceDragEnd}
-        title="Drag from border to reorder devices"
-      />
-      <div
-        className="device-drag-handle device-drag-handle-left"
-        draggable
-        onDragStart={(event) => onDeviceDragStart(event)}
-        onDragEnd={onDeviceDragEnd}
-        title="Drag from border to reorder devices"
-      />
-      <Stack gap="xs">
+    <Stack gap="xs">
         <Group justify="space-between" align="center">
           <Stack gap={2}>
             <Text fw={600}>
@@ -318,56 +283,54 @@ export function DeviceCard({
                       ? `${rendered.full}${sig.units ? ` ${sig.units}` : ""}`
                       : null;
                   return (
-                    <Group
+                    <DraggableTelemetrySignalRow
                       key={name}
-                      justify="space-between"
-                      align="center"
-                      component="div"
-                      draggable
-                      onDragStart={(event) => onDragSignal(name, event)}
-                      style={{ cursor: "grab" }}
+                      deviceId={device.device_id}
+                      signal={name}
                     >
-                      <Text size="sm">{name}</Text>
-                      <Group gap={6}>
-                        {fullWithUnits ? (
-                          <Tooltip
-                            label={`${fullWithUnits} (click to copy)`}
-                            withArrow
-                            styles={darkTooltipStyles}
-                          >
-                            <Text
-                              size="sm"
-                              fw={500}
-                              style={{ cursor: "copy" }}
-                              onClick={() => {
-                                void copyTelemetryValue(fullWithUnits);
-                              }}
+                      <Group justify="space-between" align="center" component="div">
+                        <Text size="sm">{name}</Text>
+                        <Group gap={6}>
+                          {fullWithUnits ? (
+                            <Tooltip
+                              label={`${fullWithUnits} (click to copy)`}
+                              withArrow
+                              styles={darkTooltipStyles}
                             >
+                              <Text
+                                size="sm"
+                                fw={500}
+                                style={{ cursor: "copy" }}
+                                onClick={() => {
+                                  void copyTelemetryValue(fullWithUnits);
+                                }}
+                              >
+                                {rendered.display}
+                              </Text>
+                            </Tooltip>
+                          ) : (
+                            <Text size="sm" fw={500}>
                               {rendered.display}
                             </Text>
+                          )}
+                          {sig.units && (
+                            <Text size="xs" c="dimmed">
+                              {sig.units}
+                            </Text>
+                          )}
+                          <Tooltip label="Add to plot" withArrow>
+                            <ActionIcon
+                              variant="light"
+                              color="teal"
+                              size="sm"
+                              onClick={() => onPlot(name)}
+                            >
+                              <IconChartLine size={14} />
+                            </ActionIcon>
                           </Tooltip>
-                        ) : (
-                          <Text size="sm" fw={500}>
-                            {rendered.display}
-                          </Text>
-                        )}
-                        {sig.units && (
-                          <Text size="xs" c="dimmed">
-                            {sig.units}
-                          </Text>
-                        )}
-                        <Tooltip label="Add to plot" withArrow>
-                          <ActionIcon
-                            variant="light"
-                            color="teal"
-                            size="sm"
-                            onClick={() => onPlot(name)}
-                          >
-                            <IconChartLine size={14} />
-                          </ActionIcon>
-                        </Tooltip>
+                        </Group>
                       </Group>
-                    </Group>
+                    </DraggableTelemetrySignalRow>
                   );
                 })()
               ))}
@@ -524,7 +487,7 @@ export function DeviceCard({
             </Text>
           )}
         </Group>
-      </Stack>
-    </Card>
+    </Stack>
   );
 }
+

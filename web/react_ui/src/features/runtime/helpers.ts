@@ -118,6 +118,21 @@ export function isSequencerProcess(process: ProcessStatus): boolean {
   });
 }
 
+export function isInfluxWriterProcess(process: ProcessStatus): boolean {
+  const processId = String(process.process_id ?? "").toLowerCase();
+  if (processId === "influx_writer" || processId.includes("influx")) {
+    return true;
+  }
+  const argv = Array.isArray(process.argv) ? process.argv : [];
+  return argv.some((arg) => {
+    const normalized = String(arg).toLowerCase();
+    return (
+      normalized.includes("influx_writer.py") ||
+      normalized.includes("processes.influx_writer")
+    );
+  });
+}
+
 export function isProcessRpcStateAvailable(process: ProcessStatus): boolean {
   const state = String(process.state ?? "").toUpperCase();
   return ["RUNNING", "STARTING", "STOPPING"].includes(state);
