@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 import time
+import ctypes
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +15,130 @@ from .schemas.telemetry import telemetry_calls_to_json
 from .utils.manager_network import derive_local_connect_endpoint
 
 Json = dict[str, Any]
+
+
+def _read_process_rss_bytes_windows(pid: int) -> int | None:
+    from ctypes import wintypes
+
+    process_query_limited_information = 0x1000
+    process_query_information = 0x0400
+    process_vm_read = 0x0010
+    desired_access = process_query_limited_information | process_vm_read
+    c_size_t = ctypes.c_size_t
+
+    class _ProcessMemoryCounters(ctypes.Structure):
+        _fields_ = [
+            ("cb", wintypes.DWORD),
+            ("PageFaultCount", wintypes.DWORD),
+            ("PeakWorkingSetSize", c_size_t),
+            ("WorkingSetSize", c_size_t),
+            ("QuotaPeakPagedPoolUsage", c_size_t),
+            ("QuotaPagedPoolUsage", c_size_t),
+            ("QuotaPeakNonPagedPoolUsage", c_size_t),
+            ("QuotaNonPagedPoolUsage", c_size_t),
+            ("PagefileUsage", c_size_t),
+            ("PeakPagefileUsage", c_size_t),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    psapi = ctypes.WinDLL("psapi", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    psapi.GetProcessMemoryInfo.argtypes = [
+        wintypes.HANDLE,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+    ]
+    psapi.GetProcessMemoryInfo.restype = wintypes.BOOL
+
+    handle = kernel32.OpenProcess(desired_access, False, int(pid))
+    if not handle:
+        desired_access = process_query_information | process_vm_read
+        handle = kernel32.OpenProcess(desired_access, False, int(pid))
+    if not handle:
+        return None
+    try:
+        counters = _ProcessMemoryCounters()
+        counters.cb = ctypes.sizeof(_ProcessMemoryCounters)
+        ok = psapi.GetProcessMemoryInfo(handle, ctypes.byref(counters), counters.cb)
+        if not ok:
+            return None
+        return int(counters.WorkingSetSize)
+    except Exception:
+        return None
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _read_process_rss_bytes_procfs(pid: int) -> int | None:
+    statm = Path("/proc") / str(pid) / "statm"
+    try:
+        raw = statm.read_text(encoding="utf-8").strip()
+    except Exception:
+        return None
+    if not raw:
+        return None
+    parts = raw.split()
+    if len(parts) < 2:
+        return None
+    try:
+        resident_pages = int(parts[1])
+        page_size = int(os.sysconf("SC_PAGE_SIZE"))
+    except Exception:
+        return None
+    if resident_pages < 0 or page_size <= 0:
+        return None
+    return resident_pages * page_size
+
+
+def _read_process_rss_bytes(pid: int) -> int | None:
+    if pid <= 0:
+        return None
+    if os.name == "nt":
+        return _read_process_rss_bytes_windows(pid)
+    return _read_process_rss_bytes_procfs(pid)
+
+
+def _cached_process_rss_bytes(manager: Any, pid: int | None) -> int | None:
+    if not isinstance(pid, int) or pid <= 0:
+        return None
+    cache = getattr(manager, "_process_rss_cache", None)
+    if not isinstance(cache, dict):
+        cache = {}
+        setattr(manager, "_process_rss_cache", cache)
+    ttl_s = getattr(manager, "_process_rss_cache_ttl_s", 1.0)
+    ttl_s = float(ttl_s) if isinstance(ttl_s, (int, float)) else 1.0
+    now = time.monotonic()
+    entry = cache.get(pid)
+    if (
+        isinstance(entry, tuple)
+        and len(entry) == 2
+        and isinstance(entry[0], (int, float))
+        and now - float(entry[0]) <= ttl_s
+    ):
+        cached_value = entry[1]
+        return int(cached_value) if isinstance(cached_value, int) else None
+
+    rss_bytes = _read_process_rss_bytes(pid)
+    cache[pid] = (now, rss_bytes)
+
+    # Keep cache bounded and drop stale entries opportunistically.
+    if len(cache) > 256:
+        stale_cutoff = now - max(ttl_s * 4.0, 4.0)
+        stale_keys = [
+            key
+            for key, value in cache.items()
+            if not isinstance(value, tuple)
+            or len(value) != 2
+            or not isinstance(value[0], (int, float))
+            or float(value[0]) < stale_cutoff
+        ]
+        for key in stale_keys:
+            cache.pop(key, None)
+
+    return rss_bytes
 
 
 def _enum_member(current: Any, name: str) -> Any:
@@ -638,6 +763,7 @@ def process_snapshot(manager: Any, handle: Any) -> Json:
     now_mono = time.monotonic()
     if handle.last_hb_t_mono is not None:
         hb_age_s = now_mono - handle.last_hb_t_mono
+    rss_bytes = _cached_process_rss_bytes(manager, handle.pid)
     return {
         "process_id": handle.spec.process_id,
         "argv": handle.spec.argv,
@@ -651,6 +777,7 @@ def process_snapshot(manager: Any, handle: Any) -> Json:
         "max_restarts": handle.spec.max_restarts,
         "state": handle.state,
         "pid": handle.pid,
+        "rss_bytes": rss_bytes,
         "last_start_t_wall": handle.last_start_t_wall,
         "last_start_t_mono": handle.last_start_t_mono,
         "last_hb_t_wall": handle.last_hb_t_wall,

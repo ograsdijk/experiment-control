@@ -10,6 +10,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from experiment_control.processes.interlock import (
+    InterlockProcess,
     Rule,
     _parse_ruleset,
     evaluate_interlock_rule,
@@ -110,7 +111,30 @@ class InterlockRuleEvalTests(unittest.TestCase):
         self.assertEqual(err.get("code"), "CUSTOM_CODE")
         self.assertEqual(err.get("message"), "custom message")
 
+    def test_rule_status_payload_includes_condition(self) -> None:
+        proc = object.__new__(InterlockProcess)
+        proc._rule_enabled = {}
+        condition = {
+            "and": [
+                {"ge": ["${params.value}", 1.0]},
+                {"le": ["${params.value}", 3.0]},
+            ]
+        }
+        rule = Rule(
+            rule_id="r4",
+            name="rule-4",
+            device_id="dev1",
+            action="set",
+            telemetry=[],
+            condition=condition,
+            on_block_message=None,
+            on_block_code=None,
+            allow_transform_params=None,
+        )
+        payload = proc._rule_status_payload("i1", rule)
+        self.assertIn("condition", payload)
+        self.assertEqual(payload.get("condition"), condition)
+
 
 if __name__ == "__main__":
     unittest.main()
-

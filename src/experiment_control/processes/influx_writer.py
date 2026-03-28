@@ -930,12 +930,66 @@ class InfluxWriterProcess(ManagedProcessBase):
         text = str(device_id).strip()
         return [text] if text else []
 
+    @staticmethod
+    def _destination_status_info(destination: InfluxDestination) -> Json:
+        parsed = urlsplit(destination.url)
+        host = parsed.hostname or ""
+        port: int | None
+        try:
+            port = parsed.port
+        except ValueError:
+            port = None
+        return {
+            "name": destination.name,
+            "url": destination.url,
+            "scheme": parsed.scheme or "",
+            "host": host,
+            "port": port,
+            "org": destination.org,
+            "bucket": destination.bucket,
+            "precision": destination.precision,
+            "measurement": destination.measurement,
+            "request_timeout_s": destination.request_timeout_s,
+            "static_tags": dict(destination.static_tags),
+            "token_present": bool(destination.token),
+        }
+
+    def _measurement_resolution_status(self) -> list[Json]:
+        known_device_ids = sorted(set(self._routes.keys()) | set(self._device_type_by_id.keys()))
+        rows: list[Json] = []
+        for device_id in known_device_ids:
+            destination_name = self._resolve_destination(device_id=device_id)
+            destination = self._destinations.get(destination_name)
+            if destination is None:
+                continue
+            route = self._routes.get(device_id)
+            rows.append(
+                {
+                    "device_id": device_id,
+                    "device_type": self._device_type_by_id.get(device_id),
+                    "destination": destination_name,
+                    "measurement": self._resolve_measurement(
+                        device_id=device_id, destination=destination
+                    ),
+                    "route_measurement": route.measurement if route is not None else None,
+                    "route_device_type": route.device_type if route is not None else None,
+                }
+            )
+        return rows
+
     def _status_payload(self) -> Json:
+        destinations_sorted = sorted(self._destinations.keys())
+        destinations_info = [
+            self._destination_status_info(self._destinations[name])
+            for name in destinations_sorted
+        ]
         return {
             "enabled": self._enabled,
             "instance_id": self._instance_id,
             "default_destination": self._default_destination,
-            "destinations": sorted(self._destinations.keys()),
+            "destinations": destinations_sorted,
+            "destinations_info": destinations_info,
+            "measurement_resolution": self._measurement_resolution_status(),
             "routes_count": len(self._routes),
             "disabled_devices": sorted(self._disabled_devices),
             "queue_depth": len(self._queue),

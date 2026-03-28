@@ -48,6 +48,8 @@ def _make_proc() -> InfluxWriterProcess:
     proc._queue = deque()  # noqa: SLF001
     proc._max_queue_points = 10_000  # noqa: SLF001
     proc._overflow_policy = "drop_oldest"  # noqa: SLF001
+    proc._batch_max_points = 500  # noqa: SLF001
+    proc._flush_interval_s = 1.0  # noqa: SLF001
     proc._points_received = 0  # noqa: SLF001
     proc._points_queued = 0  # noqa: SLF001
     proc._points_written = 0  # noqa: SLF001
@@ -242,6 +244,43 @@ class InfluxWriterWideModeTests(unittest.TestCase):
         self.assertTrue(line.startswith("turbo_pump_custom,"))
         self.assertIn("station=beamline_1", line)
         self.assertIn("location=rack_b", line)
+
+    def test_status_payload_includes_destination_connection_info(self) -> None:
+        proc = _make_proc()
+        status = proc._status_payload()  # noqa: SLF001
+        info = status.get("destinations_info")
+        self.assertIsInstance(info, list)
+        self.assertEqual(len(info), 1)
+        first = info[0]
+        self.assertEqual(first.get("name"), "default")
+        self.assertEqual(first.get("host"), "127.0.0.1")
+        self.assertEqual(first.get("port"), 8086)
+        self.assertEqual(first.get("org"), "org")
+        self.assertEqual(first.get("bucket"), "bucket")
+        self.assertNotIn("token", first)
+
+    def test_status_payload_includes_measurement_resolution_rows(self) -> None:
+        proc = _make_proc()
+        proc._routes = {  # noqa: SLF001
+            "pump1": DeviceRoute(
+                destination="default",
+                measurement=None,
+                device_type=None,
+                tags={},
+            )
+        }
+        proc._device_type_by_id = {"pump1": "hipace700"}  # noqa: SLF001
+        status = proc._status_payload()  # noqa: SLF001
+        rows = status.get("measurement_resolution")
+        self.assertIsInstance(rows, list)
+        self.assertEqual(len(rows), 1)
+        first = rows[0]
+        self.assertEqual(first.get("device_id"), "pump1")
+        self.assertEqual(first.get("device_type"), "hipace700")
+        self.assertEqual(first.get("destination"), "default")
+        self.assertEqual(first.get("measurement"), "hipace700")
+        self.assertEqual(first.get("route_measurement"), None)
+        self.assertEqual(first.get("route_device_type"), None)
 
 
 if __name__ == "__main__":

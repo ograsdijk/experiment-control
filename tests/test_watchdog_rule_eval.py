@@ -12,6 +12,8 @@ if str(SRC) not in sys.path:
 from experiment_control.processes.watchdog import (
     CommandAction,
     RuleState,
+    WatchdogEntry,
+    WatchdogProcess,
     WatchdogRule,
     _parse_ruleset,
     evaluate_watchdog_rule,
@@ -143,7 +145,73 @@ class WatchdogRuleEvalTests(unittest.TestCase):
         self.assertFalse(second[0])
         self.assertTrue(state.latched)
 
+    def test_watchdog_status_includes_condition_telemetry_actions(self) -> None:
+        ruleset = _parse_ruleset(
+            {
+                "watchdog_id": "wd_status",
+                "rules": [
+                    {
+                        "name": "pressure_guard",
+                        "severity": "warn",
+                        "inputs": {
+                            "telemetry": [
+                                {
+                                    "as": "sys_p",
+                                    "device": "hornet_rc",
+                                    "signal": "system_pressure_torr",
+                                    "max_age_s": 2.0,
+                                }
+                            ]
+                        },
+                        "condition": {"gt": ["${sys_p.value}", 1e-5]},
+                        "actions": [
+                            {
+                                "command": {
+                                    "device_id": "ps_cell",
+                                    "action": "set_output_enabled",
+                                    "params": {"enabled": False},
+                                    "timeout_s": 1.5,
+                                    "retries": 2,
+                                }
+                            }
+                        ],
+                    }
+                ],
+            },
+            source="test",
+        )
+        proc = object.__new__(WatchdogProcess)
+        proc._ruleset_order = [ruleset.watchdog_id]
+        proc._watchdog_entries = {
+            ruleset.watchdog_id: WatchdogEntry(ruleset=ruleset, enabled=True)
+        }
+        proc._states = {
+            (ruleset.watchdog_id, "pressure_guard"): RuleState(
+                stable_since_mono=10.0,
+                last_trigger_mono=11.0,
+                latched=True,
+            )
+        }
+
+        resp = proc._rpc_watchdog_status({"request_id": "req-1"})
+        self.assertTrue(resp.get("ok"))
+        result = resp.get("result")
+        self.assertIsInstance(result, dict)
+        assert isinstance(result, dict)
+        watchdogs = result.get("watchdogs")
+        self.assertIsInstance(watchdogs, list)
+        assert isinstance(watchdogs, list)
+        self.assertEqual(len(watchdogs), 1)
+        rules = watchdogs[0].get("rules")
+        self.assertIsInstance(rules, list)
+        assert isinstance(rules, list)
+        self.assertEqual(len(rules), 1)
+        rule = rules[0]
+        self.assertIn("condition", rule)
+        self.assertIn("telemetry", rule)
+        self.assertIn("actions", rule)
+        self.assertEqual(rule.get("condition"), {"gt": ["${sys_p.value}", 1e-5]})
+
 
 if __name__ == "__main__":
     unittest.main()
-

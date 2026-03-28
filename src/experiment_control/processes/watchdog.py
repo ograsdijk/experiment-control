@@ -711,6 +711,31 @@ class WatchdogProcess(ManagedProcessBase):
                     {
                         "name": rule.name,
                         "severity": rule.severity,
+                        "message": rule.message,
+                        "condition": rule.condition,
+                        "telemetry": [
+                            {
+                                "as": binding.alias,
+                                "device_id": binding.device_id,
+                                "signal": binding.signal,
+                                "max_age_s": binding.max_age_s,
+                            }
+                            for binding in rule.telemetry
+                        ],
+                        "actions": [
+                            {
+                                "device_id": action.device_id,
+                                "action": action.action,
+                                "params": action.params,
+                                "timeout_s": action.timeout_s,
+                                "retries": action.retries,
+                            }
+                            for action in rule.actions
+                        ],
+                        "stable_for_s": rule.stable_for_s,
+                        "cooldown_s": rule.cooldown_s,
+                        "latch": rule.latch,
+                        "on_unknown": rule.on_unknown,
                         "latched": state.latched,
                         "stable_since_mono": state.stable_since_mono,
                         "last_trigger_mono": state.last_trigger_mono,

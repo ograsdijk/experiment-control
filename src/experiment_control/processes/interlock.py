@@ -498,6 +498,7 @@ class InterlockProcess(ManagedProcessBase):
                 }
                 for binding in rule.telemetry
             ],
+            "condition": rule.condition,
             "on_block": {
                 "code": rule.on_block_code,
                 "message": rule.on_block_message,
