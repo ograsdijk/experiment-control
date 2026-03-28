@@ -142,7 +142,7 @@ class StateMachineBaseTests(unittest.TestCase):
         finally:
             proc.close()
 
-    def test_base_rpc_transition(self) -> None:
+    def test_base_rpc_transition_endpoint_removed(self) -> None:
         proc = _DummyStateMachine()
         try:
             req = {
@@ -151,8 +151,62 @@ class StateMachineBaseTests(unittest.TestCase):
                 "params": {"target_state": "RUNNING", "reason": "rpc"},
             }
             resp = proc._handle_rpc(req)
+            self.assertFalse(resp.get("ok"))
+            self.assertEqual(resp["error"]["code"], "unknown_request")
+            self.assertEqual(proc.state, "IDLE")
+        finally:
+            proc.close()
+
+    def test_base_rpc_history_tail(self) -> None:
+        proc = _DummyStateMachine()
+        try:
+            _ = proc.transition("RUNNING", reason="rpc")
+            req = {
+                "request_id": "r2",
+                "type": "dummy.history.tail",
+                "params": {"limit": 10},
+            }
+            resp = proc._handle_rpc(req)
             self.assertTrue(resp.get("ok"))
-            self.assertEqual(resp["result"]["state"], "RUNNING")
+            result = resp.get("result")
+            self.assertIsInstance(result, dict)
+            assert isinstance(result, dict)
+            entries = result.get("entries")
+            self.assertIsInstance(entries, list)
+            assert isinstance(entries, list)
+            self.assertGreaterEqual(len(entries), 1)
+            latest = entries[-1]
+            self.assertIsInstance(latest, dict)
+            assert isinstance(latest, dict)
+            self.assertEqual(latest.get("event"), "transition")
+            self.assertEqual(latest.get("to_state"), "RUNNING")
+        finally:
+            proc.close()
+
+    def test_base_rpc_graph_payload(self) -> None:
+        proc = _DummyStateMachine()
+        try:
+            req = {
+                "request_id": "r3",
+                "type": "dummy.graph",
+            }
+            resp = proc._handle_rpc(req)
+            self.assertTrue(resp.get("ok"))
+            result = resp.get("result")
+            self.assertIsInstance(result, dict)
+            assert isinstance(result, dict)
+            self.assertEqual(result.get("namespace"), "dummy")
+            transitions = result.get("transitions")
+            self.assertIsInstance(transitions, list)
+            assert isinstance(transitions, list)
+            self.assertTrue(
+                any(
+                    isinstance(row, dict)
+                    and row.get("from_state") == "IDLE"
+                    and row.get("to_state") == "RUNNING"
+                    for row in transitions
+                )
+            )
         finally:
             proc.close()
 

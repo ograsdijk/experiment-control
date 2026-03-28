@@ -109,6 +109,7 @@ export type ProcessStatus = {
   state: string;
   argv?: string[] | null;
   pid?: number | null;
+  rss_bytes?: number | null;
   hb_age_s?: number | null;
   last_error?: string | null;
   restart_policy?: string | null;
@@ -217,6 +218,7 @@ export type InterlockRuleStatus = {
   enabled: boolean;
   match: RouteMatch;
   telemetry: InterlockTelemetryStatus[];
+  condition?: unknown;
   on_block?: { code?: string | null; message?: string | null } | null;
   has_allow_transform: boolean;
 };
@@ -231,9 +233,103 @@ export type InterlockInterceptorStatus = {
   rules: InterlockRuleStatus[];
 };
 
+export type WatchdogRuleStatus = {
+  name: string;
+  severity: string;
+  message?: string | null;
+  condition?: unknown;
+  telemetry?: InterlockTelemetryStatus[];
+  actions?: {
+    device_id: string;
+    action: string;
+    params: Record<string, unknown>;
+    timeout_s?: number | null;
+    retries?: number;
+  }[];
+  stable_for_s?: number | null;
+  cooldown_s?: number | null;
+  latch?: boolean;
+  on_unknown?: string | null;
+  latched: boolean;
+  stable_since_mono?: number | null;
+  last_trigger_mono?: number | null;
+};
+
+export type WatchdogStatus = {
+  watchdog_id: string;
+  enabled: boolean;
+  rules: WatchdogRuleStatus[];
+};
+
 export type CommandInterceptorRoute = {
   order: number;
   process_id: string;
   device_id: string;
   action: string;
+};
+
+export type StateMachineTransition = {
+  from_state?: string | null;
+  to_state?: string | null;
+  reason?: string | null;
+  ts?: { t_wall?: number; t_mono?: number } | null;
+  metadata?: Record<string, unknown> | null;
+};
+
+export type StateMachineStatus = {
+  state: string;
+  state_since?: { t_wall?: number; t_mono?: number } | null;
+  state_age_s?: number | null;
+  last_error?: string | null;
+  last_transition?: StateMachineTransition | null;
+  allowed_next_states: string[];
+  status_detail?: Record<string, unknown> | null;
+  status_age_s?: number | null;
+};
+
+export type StateMachineHistoryEntry = {
+  event?: string | null;
+  from_state?: string | null;
+  to_state?: string | null;
+  state?: string | null;
+  reason?: string | null;
+  message?: string | null;
+  ok?: boolean | null;
+  source?: string | null;
+  trigger_type?: string | null;
+  trigger_name?: string | null;
+  result?: string | null;
+  error?: string | null;
+  ts?: { t_wall?: number; t_mono?: number } | null;
+  metadata?: Record<string, unknown> | null;
+  raw?: unknown;
+};
+
+export type StateMachineGraphTransition = {
+  from_state?: string | null;
+  to_state?: string | null;
+  note?: string | null;
+};
+
+export type StateMachineGraphEffect = {
+  device_id: string;
+  device_action: string;
+  params?: Record<string, unknown> | null;
+  note?: string | null;
+};
+
+export type StateMachineGraphAction = {
+  name: string;
+  doc?: string | null;
+  params?: CapabilityParam[] | null;
+  transitions?: StateMachineGraphTransition[];
+  effects?: StateMachineGraphEffect[];
+};
+
+export type StateMachineGraph = {
+  namespace: string;
+  initial_state?: string | null;
+  states: string[];
+  transitions: StateMachineGraphTransition[];
+  actions: StateMachineGraphAction[];
 };
