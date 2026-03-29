@@ -464,7 +464,17 @@ class ManagerTUI(App):
         ("R", "capabilities_refresh", "Refresh capabilities"),
         ("f5", "reconnect_backend", "Reconnect"),
         ("p", "topics", "Topics"),
+        ("l", "clear_log", "Clear log"),
     ]
+
+    _DEFAULT_EVENT_LOG_HIDDEN_TOPICS = frozenset(
+        {
+            "manager.telemetry_update",
+            "manager.heartbeat",
+            "manager.chunk_ready",
+        }
+    )
+    _VALID_PUB_QUEUE_OVERFLOW_POLICIES = frozenset({"drop_newest", "drop_oldest"})
 
     streaming_enabled = reactive(True)
 
@@ -475,6 +485,11 @@ class ManagerTUI(App):
         manager_pub: str = "tcp://127.0.0.1:6001",
         rpc_timeout_ms: int = 1500,
         snapshot_period_s: float = 2.0,
+        event_log_max_lines: int = 10_000,
+        event_log_default_hidden_topics: list[str] | tuple[str, ...] | set[str] | None = None,
+        event_log_manager_min_severity: str = "warning",
+        pub_queue_maxsize: int = 10_000,
+        pub_queue_overflow_policy: str = "drop_newest",
         driver_class: type[Driver] | None = None,
     ) -> None:
         super().__init__(driver_class=driver_class)
@@ -482,6 +497,22 @@ class ManagerTUI(App):
         self._manager_pub = manager_pub
         self._rpc_timeout_ms = rpc_timeout_ms
         self._snapshot_period_s = snapshot_period_s
+        self._event_log_max_lines = max(100, int(event_log_max_lines))
+        self._event_log_hidden_topics = self._normalize_topic_set(
+            event_log_default_hidden_topics,
+            default=self._DEFAULT_EVENT_LOG_HIDDEN_TOPICS,
+        )
+        self._event_log_manager_min_severity = self._normalize_log_severity(
+            event_log_manager_min_severity
+        )
+        self._event_log_manager_min_rank = self._severity_rank(
+            self._event_log_manager_min_severity
+        )
+        self._pub_queue_maxsize = max(1, int(pub_queue_maxsize))
+        overflow_policy = str(pub_queue_overflow_policy or "drop_newest").strip().lower()
+        if overflow_policy not in self._VALID_PUB_QUEUE_OVERFLOW_POLICIES:
+            overflow_policy = "drop_newest"
+        self._pub_queue_overflow_policy = overflow_policy
 
         self._ctx = zmq.Context.instance()
         self._rpc = self._new_rpc_socket()
@@ -489,7 +520,9 @@ class ManagerTUI(App):
 
         self._sub: zmq.Socket | None = None
 
-        self._pub_queue: queue.Queue[tuple[str, Json]] = queue.Queue(maxsize=10_000)
+        self._pub_queue: queue.Queue[tuple[str, Json]] = queue.Queue(
+            maxsize=self._pub_queue_maxsize
+        )
         self._chunk_cache: dict[tuple[str, str], tuple[str, Json]] = {}
         self._chunk_lock = threading.Lock()
         self._stop_event = threading.Event()
@@ -591,7 +624,7 @@ class ManagerTUI(App):
             yield Static("Streaming: ON", id="streaming_status")
             yield Static("Dropped: 0", id="dropped_status")
             yield Static(self._backend_status_text, id="backend_status")
-        yield RichLog(id="event_log")
+        yield RichLog(id="event_log", max_lines=self._event_log_max_lines)
         yield Footer()
 
     def on_mount(self) -> None:
@@ -797,6 +830,34 @@ class ManagerTUI(App):
     @staticmethod
     def _severity_rank(raw: Any) -> int:
         return severity_rank(raw, default="info")
+
+    @staticmethod
+    def _normalize_topic_set(
+        raw: list[str] | tuple[str, ...] | set[str] | None,
+        *,
+        default: set[str] | frozenset[str],
+    ) -> set[str]:
+        if raw is None:
+            return set(default)
+        out: set[str] = set()
+        for item in raw:
+            topic = str(item or "").strip()
+            if topic:
+                out.add(topic)
+        return out
+
+    def _default_topic_visibility(self, topic: str) -> bool:
+        return topic not in self._event_log_hidden_topics
+
+    def _topic_enabled_for_event_log(self, topic: str, payload: Json) -> bool:
+        visible = self._topic_visible.get(topic, self._default_topic_visibility(topic))
+        if not visible:
+            return False
+        if topic == "manager.log":
+            severity = self._normalize_log_severity(payload.get("severity"))
+            if self._severity_rank(severity) < self._event_log_manager_min_rank:
+                return False
+        return True
 
     def _remember_error_fingerprint(self, fingerprint: str) -> bool:
         if fingerprint in self._seen_error_fingerprints:
@@ -1145,6 +1206,7 @@ class ManagerTUI(App):
                         self._heartbeat_cache.pop(status.device_id, None)
                         self._telemetry_cache.pop(status.device_id, None)
                 self._device_status = next_status
+                self._prune_device_caches(active_device_ids=set(next_status.keys()))
                 snapshot_changed = True
 
         proc_resp = self._rpc_call({"type": "manager.processes.list"})
@@ -1181,6 +1243,7 @@ class ManagerTUI(App):
                 )
                 for pid in stale_retry_keys:
                     self._reset_process_capabilities_retry(pid)
+                self._prune_process_caches(active_process_ids=set(next_proc_map.keys()))
                 snapshot_changed = True
 
         if snapshot_changed:
@@ -1188,6 +1251,46 @@ class ManagerTUI(App):
             self._render_processes_table()
             self._mark_inspector_dirty()
             self._render_inspector_if_needed(force=True)
+
+    def _prune_device_caches(self, *, active_device_ids: set[str]) -> None:
+        stale_telemetry = set(self._telemetry_cache) - active_device_ids
+        for device_id in stale_telemetry:
+            self._telemetry_cache.pop(device_id, None)
+
+        stale_heartbeat = set(self._heartbeat_cache) - active_device_ids
+        for device_id in stale_heartbeat:
+            self._heartbeat_cache.pop(device_id, None)
+
+        stale_caps = set(self._cap_cache) - active_device_ids
+        for device_id in stale_caps:
+            self._cap_cache.pop(device_id, None)
+            self._cap_cache_mono.pop(device_id, None)
+            self._members_last.pop(device_id, None)
+
+        stale_member_fingerprints = [
+            key
+            for key in self._members_rendered_fingerprint
+            if key.startswith("device:")
+            and key.split(":", 1)[1] not in active_device_ids
+        ]
+        for key in stale_member_fingerprints:
+            self._members_rendered_fingerprint.pop(key, None)
+
+    def _prune_process_caches(self, *, active_process_ids: set[str]) -> None:
+        stale_proc_caps = set(self._proc_cap_cache) - active_process_ids
+        for process_id in stale_proc_caps:
+            self._proc_cap_cache.pop(process_id, None)
+            self._proc_members_last.pop(process_id, None)
+            self._reset_process_capabilities_retry(process_id)
+
+        stale_member_fingerprints = [
+            key
+            for key in self._members_rendered_fingerprint
+            if key.startswith("process:")
+            and key.split(":", 1)[1] not in active_process_ids
+        ]
+        for key in stale_member_fingerprints:
+            self._members_rendered_fingerprint.pop(key, None)
 
     def _render_devices_table(self) -> None:
         devices = self.query_one("#devices_table", DataTable)
@@ -1872,10 +1975,7 @@ class ManagerTUI(App):
                             self._chunk_cache[(device_id, stream)] = (topic, payload)
                     continue
 
-                try:
-                    self._pub_queue.put_nowait((topic, payload))
-                except queue.Full:
-                    self._dropped_pub_messages += 1
+                self._enqueue_pub_message(topic, payload)
         finally:
             try:
                 if self._sub is not None:
@@ -1883,6 +1983,33 @@ class ManagerTUI(App):
             except Exception:
                 pass
             self._sub = None
+
+    def _enqueue_pub_message(self, topic: str, payload: Json) -> None:
+        try:
+            self._pub_queue.put_nowait((topic, payload))
+            return
+        except queue.Full:
+            if self._pub_queue_overflow_policy == "drop_newest":
+                self._dropped_pub_messages += 1
+                return
+
+        dropped = 0
+        if self._pub_queue_overflow_policy == "drop_oldest":
+            try:
+                self._pub_queue.get_nowait()
+                dropped += 1
+            except queue.Empty:
+                pass
+            try:
+                self._pub_queue.put_nowait((topic, payload))
+                self._dropped_pub_messages += dropped
+                return
+            except queue.Full:
+                dropped += 1
+                self._dropped_pub_messages += dropped
+                return
+
+        self._dropped_pub_messages += 1
 
     def _drain_pub_queue(self) -> None:
         if not self.streaming_enabled:
@@ -1894,10 +2021,7 @@ class ManagerTUI(App):
             cached = list(self._chunk_cache.values())
             self._chunk_cache.clear()
         for topic, payload in cached:
-            try:
-                self._pub_queue.put_nowait((topic, payload))
-            except queue.Full:
-                self._dropped_pub_messages += 1
+            self._enqueue_pub_message(topic, payload)
 
         for _ in range(self._pub_drain_max):
             try:
@@ -1946,9 +2070,9 @@ class ManagerTUI(App):
 
             self._topic_counts[topic] = self._topic_counts.get(topic, 0) + 1
             if topic not in self._topic_visible:
-                self._topic_visible[topic] = True
+                self._topic_visible[topic] = self._default_topic_visibility(topic)
 
-            if self._topic_visible.get(topic, True):
+            if self._topic_enabled_for_event_log(topic, payload):
                 try:
                     if topic == "manager.log":
                         log.write(self._format_manager_log_event_line(payload))
@@ -2428,7 +2552,7 @@ class ManagerTUI(App):
 
     def action_topics(self) -> None:
         for t in self._topic_counts.keys():
-            self._topic_visible.setdefault(t, True)
+            self._topic_visible.setdefault(t, self._default_topic_visibility(t))
 
         def _on_dismiss(result: dict[str, bool] | None) -> None:
             if not result:
@@ -2447,6 +2571,14 @@ class ManagerTUI(App):
             ),
             _on_dismiss,
         )
+
+    def action_clear_log(self) -> None:
+        log = self.query_one("#event_log", RichLog)
+        try:
+            log.clear()
+            self.notify("Event log cleared")
+        except Exception:
+            self._bump_error("log.clear")
 
     def action_device_connect(self) -> None:
         device_id = self._selected_device()
