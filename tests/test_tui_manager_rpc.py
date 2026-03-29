@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import queue
 import unittest
 
 from experiment_control.tui_manager import ManagerTUI
@@ -212,6 +213,93 @@ class ManagerTuiRpcTests(unittest.TestCase):
             try:
                 if app._sub is not None:
                     app._sub.close(0)
+            except Exception:
+                pass
+
+    def test_default_topic_visibility_hides_high_rate_topics(self) -> None:
+        app = self._build_app()
+        try:
+            self.assertFalse(app._default_topic_visibility("manager.telemetry_update"))
+            self.assertFalse(app._default_topic_visibility("manager.heartbeat"))
+            self.assertFalse(app._default_topic_visibility("manager.chunk_ready"))
+            self.assertTrue(app._default_topic_visibility("manager.log"))
+        finally:
+            try:
+                if app._sub is not None:
+                    app._sub.close(0)
+            except Exception:
+                pass
+            try:
+                app._rpc.close(0)
+            except Exception:
+                pass
+
+    def test_topic_enabled_for_event_log_applies_manager_log_min_severity(self) -> None:
+        app = self._build_app()
+        try:
+            app._topic_visible["manager.log"] = True
+            self.assertFalse(
+                app._topic_enabled_for_event_log(
+                    "manager.log", {"severity": "info", "message": "hello"}
+                )
+            )
+            self.assertTrue(
+                app._topic_enabled_for_event_log(
+                    "manager.log", {"severity": "warning", "message": "warn"}
+                )
+            )
+        finally:
+            try:
+                if app._sub is not None:
+                    app._sub.close(0)
+            except Exception:
+                pass
+            try:
+                app._rpc.close(0)
+            except Exception:
+                pass
+
+    def test_enqueue_pub_message_drop_newest_discards_incoming(self) -> None:
+        app = self._build_app()
+        try:
+            app._pub_queue = queue.Queue(maxsize=1)
+            app._pub_queue_overflow_policy = "drop_newest"
+            app._enqueue_pub_message("topic.one", {"value": 1})
+            app._enqueue_pub_message("topic.two", {"value": 2})
+
+            self.assertEqual(app._dropped_pub_messages, 1)
+            queued_topic, _queued_payload = app._pub_queue.get_nowait()
+            self.assertEqual(queued_topic, "topic.one")
+        finally:
+            try:
+                if app._sub is not None:
+                    app._sub.close(0)
+            except Exception:
+                pass
+            try:
+                app._rpc.close(0)
+            except Exception:
+                pass
+
+    def test_enqueue_pub_message_drop_oldest_replaces_oldest(self) -> None:
+        app = self._build_app()
+        try:
+            app._pub_queue = queue.Queue(maxsize=1)
+            app._pub_queue_overflow_policy = "drop_oldest"
+            app._enqueue_pub_message("topic.one", {"value": 1})
+            app._enqueue_pub_message("topic.two", {"value": 2})
+
+            self.assertEqual(app._dropped_pub_messages, 1)
+            queued_topic, _queued_payload = app._pub_queue.get_nowait()
+            self.assertEqual(queued_topic, "topic.two")
+        finally:
+            try:
+                if app._sub is not None:
+                    app._sub.close(0)
+            except Exception:
+                pass
+            try:
+                app._rpc.close(0)
             except Exception:
                 pass
 

@@ -147,6 +147,14 @@ tui:
   rpc_timeout_ms: 1500
   snapshot_period_s: 2.0
   startup_delay_s: 1.0
+  event_log_max_lines: 10000
+  event_log_default_hidden_topics:
+    - manager.telemetry_update
+    - manager.heartbeat
+    - manager.chunk_ready
+  event_log_manager_min_severity: warning
+  pub_queue_maxsize: 10000
+  pub_queue_overflow_policy: drop_newest   # drop_newest | drop_oldest
 ```
 
 Notes:
@@ -156,6 +164,22 @@ Notes:
 - `process_order` is optional. If omitted, `hdf_writer` is started first if present.
 - If `tui.enabled: true`, the stack runner starts a manager subprocess and runs the TUI in the same terminal.
 - When the TUI exits, the runner sends `manager.control.shutdown` and then terminates the manager subprocess.
+- TUI event log memory is bounded by `tui.event_log_max_lines` (oldest lines are trimmed).
+- `tui.event_log_default_hidden_topics` controls which topics start hidden from the TUI event log.
+  Hidden topics are still ingested/processed by the TUI; they are simply not appended to the
+  on-screen `RichLog` unless enabled from the Topics modal (`p`).
+- Topic toggles in the Topics modal (`p`) control **event-log writes** to `RichLog` for each topic,
+  not just post-render filtering. If a topic is off, new events for that topic are not written to
+  the `RichLog`.
+- Re-enabling a topic later resumes writing only for new incoming events (no historical backfill).
+- Set `tui.event_log_default_hidden_topics: []` to start with all topics enabled, or `null` to use
+  built-in defaults.
+- `tui.event_log_manager_min_severity` filters `manager.log` lines written to the TUI event log.
+- `tui.pub_queue_maxsize` bounds the TUI subscriber queue; when full, behavior is controlled by
+  `tui.pub_queue_overflow_policy`:
+  - `drop_newest`: reject incoming message
+  - `drop_oldest`: evict one queued message and keep incoming message
+- Press `l` in the TUI to clear the current on-screen event log buffer.
 - Startup timeouts (registration / process running / online) are logged as warnings; the stack continues.
 - The `device_router` process is started automatically by the manager and is not listed under `processes:`.
 - `external.rpc_port` is the **device_router** front door; `external.pub_port` is manager PUB.

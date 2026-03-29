@@ -350,6 +350,57 @@ class TuiStartupWaitTests(unittest.TestCase):
         self.assertEqual(env.get("MANAGER_LOG_STDERR"), "0")
         self.assertEqual(env.get("MANAGER_LOG_FILE"), "C:\\tmp\\manager.log")
 
+    def test_run_with_tui_passes_event_log_and_queue_settings(self) -> None:
+        manager_network = resolve_manager_network({})
+        captured_kwargs: dict[str, object] = {}
+
+        class _FakeApp:
+            def __init__(self, **kwargs: object) -> None:
+                captured_kwargs.update(kwargs)
+
+            def run(self) -> None:
+                captured_kwargs["run_called"] = True
+
+        fake_proc = mock.Mock()
+        with (
+            mock.patch("experiment_control.cli.run_stack.subprocess.Popen", return_value=fake_proc),
+            mock.patch(
+                "experiment_control.cli.run_stack._wait_for_manager_ready",
+                return_value=(True, None),
+            ),
+            mock.patch("experiment_control.cli.run_stack._shutdown_manager") as shutdown_mock,
+            mock.patch("experiment_control.cli.run_stack._wait_for_exit") as wait_exit_mock,
+            mock.patch("experiment_control.tui_manager.ManagerTUI", _FakeApp),
+        ):
+            _run_with_tui(
+                instance_id="vacuum",
+                stack_path=Path("dummy_stack.yaml"),
+                manager_network=manager_network,
+                tui_raw={
+                    "event_log_max_lines": 4321,
+                    "event_log_default_hidden_topics": ["manager.heartbeat"],
+                    "event_log_manager_min_severity": "error",
+                    "pub_queue_maxsize": 222,
+                    "pub_queue_overflow_policy": "drop_oldest",
+                },
+            )
+
+        self.assertTrue(bool(captured_kwargs.get("run_called")))
+        self.assertEqual(captured_kwargs.get("event_log_max_lines"), 4321)
+        self.assertEqual(
+            captured_kwargs.get("event_log_default_hidden_topics"),
+            ["manager.heartbeat"],
+        )
+        self.assertEqual(
+            captured_kwargs.get("event_log_manager_min_severity"), "error"
+        )
+        self.assertEqual(captured_kwargs.get("pub_queue_maxsize"), 222)
+        self.assertEqual(
+            captured_kwargs.get("pub_queue_overflow_policy"), "drop_oldest"
+        )
+        shutdown_mock.assert_called_once()
+        wait_exit_mock.assert_called()
+
     def test_main_with_tui_runs_cleanup_in_parent_before_spawn(self) -> None:
         manager_network = resolve_manager_network({})
         stack_raw = {
