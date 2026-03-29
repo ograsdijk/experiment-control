@@ -125,7 +125,75 @@ def _parse_tui(raw: Json) -> Json:
         return {}
     if not isinstance(tui, dict):
         raise ConfigError("tui", "must be a dict")
-    return tui
+    out = dict(tui)
+
+    def parse_int(name: str, *, default: int, min_value: int) -> int:
+        value = tui.get(name, default)
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError, OverflowError) as e:
+            raise ConfigError(f"tui.{name}", f"must be an int: {e}") from e
+        if parsed < min_value:
+            raise ConfigError(f"tui.{name}", f"must be >= {min_value}")
+        return parsed
+
+    if "event_log_max_lines" in tui:
+        out["event_log_max_lines"] = parse_int(
+            "event_log_max_lines", default=10_000, min_value=100
+        )
+    if "pub_queue_maxsize" in tui:
+        out["pub_queue_maxsize"] = parse_int(
+            "pub_queue_maxsize", default=10_000, min_value=1
+        )
+
+    if "event_log_default_hidden_topics" in tui:
+        hidden_topics_raw = tui.get("event_log_default_hidden_topics")
+        if hidden_topics_raw is None:
+            out["event_log_default_hidden_topics"] = None
+        else:
+            items = normalize_list(
+                hidden_topics_raw,
+                path=["tui", "event_log_default_hidden_topics"],
+            )
+            hidden_topics: list[str] = []
+            for idx, item in enumerate(items):
+                text = str(item or "").strip()
+                if not text:
+                    raise ConfigError(
+                        f"tui.event_log_default_hidden_topics[{idx}]",
+                        "must be a non-empty string",
+                    )
+                hidden_topics.append(text)
+            out["event_log_default_hidden_topics"] = hidden_topics
+
+    if "event_log_manager_min_severity" in tui:
+        min_severity_raw = tui.get("event_log_manager_min_severity")
+        min_severity = str(min_severity_raw or "").strip().lower()
+        if not min_severity:
+            raise ConfigError(
+                "tui.event_log_manager_min_severity", "must be a non-empty string"
+            )
+        if not is_valid_log_severity(min_severity):
+            raise ConfigError(
+                "tui.event_log_manager_min_severity",
+                f"must be one of: {', '.join(LOG_SEVERITY_NAMES)}",
+            )
+        out["event_log_manager_min_severity"] = normalize_log_severity(
+            min_severity, default="warning"
+        )
+
+    if "pub_queue_overflow_policy" in tui:
+        overflow_policy_raw = str(
+            tui.get("pub_queue_overflow_policy", "drop_newest") or ""
+        ).strip().lower()
+        if overflow_policy_raw not in {"drop_newest", "drop_oldest"}:
+            raise ConfigError(
+                "tui.pub_queue_overflow_policy",
+                "must be one of: drop_newest, drop_oldest",
+            )
+        out["pub_queue_overflow_policy"] = overflow_policy_raw
+
+    return out
 
 
 def _parse_command_journal(
@@ -504,6 +572,18 @@ def _run_with_tui(
     snapshot_period_s = float(tui_raw.get("snapshot_period_s", 2.0))
     startup_delay_s = float(tui_raw.get("startup_delay_s", 1.0))
     startup_timeout_s = float(tui_raw.get("startup_timeout_s", 15.0))
+    event_log_max_lines = int(tui_raw.get("event_log_max_lines", 10_000))
+    hidden_topics_raw = tui_raw.get("event_log_default_hidden_topics")
+    event_log_default_hidden_topics = (
+        list(hidden_topics_raw) if isinstance(hidden_topics_raw, list) else None
+    )
+    event_log_manager_min_severity = str(
+        tui_raw.get("event_log_manager_min_severity", "warning")
+    )
+    pub_queue_maxsize = int(tui_raw.get("pub_queue_maxsize", 10_000))
+    pub_queue_overflow_policy = str(
+        tui_raw.get("pub_queue_overflow_policy", "drop_newest")
+    )
     probe_timeout_ms = min(500, max(100, rpc_timeout_ms))
 
     child_cmd = [
@@ -538,6 +618,11 @@ def _run_with_tui(
             manager_pub=manager_pub,
             rpc_timeout_ms=rpc_timeout_ms,
             snapshot_period_s=snapshot_period_s,
+            event_log_max_lines=event_log_max_lines,
+            event_log_default_hidden_topics=event_log_default_hidden_topics,
+            event_log_manager_min_severity=event_log_manager_min_severity,
+            pub_queue_maxsize=pub_queue_maxsize,
+            pub_queue_overflow_policy=pub_queue_overflow_policy,
         )
         app.run()
     finally:
