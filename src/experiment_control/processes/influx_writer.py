@@ -5,6 +5,7 @@ import json
 import math
 import os
 import re
+import sys
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -96,6 +97,10 @@ def _normalize_device_type_name(raw: Any) -> str | None:
         text = text[: -len("_driver")].rstrip("_")
     elif text.endswith("driver"):
         text = text[: -len("driver")].rstrip("_")
+    if text.endswith("_device"):
+        text = text[: -len("_device")].rstrip("_")
+    elif text.endswith("device"):
+        text = text[: -len("device")].rstrip("_")
     return text or None
 
 
@@ -389,6 +394,8 @@ class InfluxWriterProcess(ManagedProcessBase):
         self._last_error: str | None = None
         self._last_flush_wall_s: float | None = None
         self._last_flush_mono_s: float | None = None
+        self._pending_log_payloads: deque[Json] = deque(maxlen=200)
+        self._last_published_error_text: str | None = None
 
         self._init_rpc_router()
         self._manager = self._manager_helper.init_client(
@@ -1159,6 +1166,65 @@ class InfluxWriterProcess(ManagedProcessBase):
             "error": {"code": "unknown_request"},
         }
 
+    def _publish_log(self, *, severity: str, message: str) -> None:
+        payload: Json = {
+            "version": 1,
+            "severity": severity,
+            "topic": "influx_writer",
+            "source_kind": "process",
+            "source_id": self._process_id,
+            "device_id": None,
+            "process_id": self._process_id,
+            "message": message,
+            "payload_json": json.dumps({"process_id": self._process_id}),
+            "ts": {"t_wall": time.time(), "t_mono": time.monotonic()},
+        }
+        if self._try_publish_log_payload(payload):
+            return
+        normalized_severity = str(severity).strip().lower()
+        if normalized_severity in {"error", "critical"}:
+            self._emit_stderr_fallback(severity=severity, message=message)
+            return
+        self._queue_log_payload(payload)
+
+    def _try_publish_log_payload(self, payload: Json, *, timeout_ms: int = 120) -> bool:
+        try:
+            resp = self._manager.call(
+                {"type": "manager.logs.publish", "payload": payload},
+                timeout_ms=timeout_ms,
+            )
+        except Exception:
+            return False
+        return isinstance(resp, dict) and resp.get("ok") is True
+
+    def _queue_log_payload(self, payload: Json) -> None:
+        self._pending_log_payloads.append(payload)
+
+    def _flush_pending_logs(self, *, max_items: int = 8) -> None:
+        for _ in range(max(0, int(max_items))):
+            if not self._pending_log_payloads:
+                return
+            payload = self._pending_log_payloads[0]
+            if not self._try_publish_log_payload(payload, timeout_ms=80):
+                return
+            self._pending_log_payloads.popleft()
+
+    @staticmethod
+    def _emit_stderr_fallback(*, severity: str, message: str) -> None:
+        try:
+            sys.stderr.write(f"[influx_writer][{severity}] {message}\n")
+            sys.stderr.flush()
+        except Exception:
+            pass
+
+    def _maybe_publish_last_error(self) -> None:
+        text = self._last_error
+        if text and text != self._last_published_error_text:
+            self._last_published_error_text = text
+            self._publish_log(severity="error", message=text)
+        elif text is None:
+            self._last_published_error_text = None
+
     def run(self) -> None:
         try:
             next_flush_mono = time.monotonic() + self._flush_interval_s
@@ -1180,6 +1246,8 @@ class InfluxWriterProcess(ManagedProcessBase):
                 ):
                     self._flush()
                     next_flush_mono = now + self._flush_interval_s
+                self._maybe_publish_last_error()
+                self._flush_pending_logs()
         finally:
             try:
                 self._flush()
