@@ -241,6 +241,32 @@ def discover_device_members(device: object) -> list[MemberSpec]:
                 if ann is None and sig is not None:
                     ann = sig.return_annotation
                 value_annotation = _type_to_str(ann)
+                # Fallback: if no static annotation is available AND the
+                # property is writable (so a future set RPC needs the type for
+                # coercion), infer the runtime type by reading the property
+                # once. This helps drivers that auto-generate properties
+                # without return annotations (e.g. pfeiffer_turbo) without
+                # incurring read I/O for purely-readable properties.
+                if (
+                    settable
+                    and (
+                        value_annotation is None
+                        or value_annotation == ""
+                        or value_annotation == "None"
+                    )
+                ):
+                    try:
+                        runtime_value = prop.fget(device)
+                    except Exception:
+                        runtime_value = None
+                    if isinstance(runtime_value, bool):
+                        value_annotation = "bool"
+                    elif isinstance(runtime_value, int):
+                        value_annotation = "int"
+                    elif isinstance(runtime_value, float):
+                        value_annotation = "float"
+                    elif isinstance(runtime_value, str):
+                        value_annotation = "str"
 
             params: list[MemberParamSpec] | None = None
             if settable and prop.fset is not None:
@@ -1127,7 +1153,11 @@ class DeviceRunner:
         if not spec.settable:
             return self._rpc_error(req_id, "Member is not settable")
         value = params.get("value")
-        kind = _parse_simple_annotation(spec.value_annotation)
+        kind: str | None = None
+        if spec.params:
+            kind = _parse_simple_annotation(spec.params[0].annotation)
+        if kind is None:
+            kind = _parse_simple_annotation(spec.value_annotation)
         if kind is not None:
             try:
                 value = _coerce_simple_value(value, kind)
