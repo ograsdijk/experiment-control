@@ -85,6 +85,80 @@ def _parse_simple_annotation(annotation: str | None) -> str | None:
     return None
 
 
+def _has_simple_annotation(annotation: str | None) -> bool:
+    return _parse_simple_annotation(annotation) is not None
+
+
+def _runtime_value_annotation(value: object) -> str | None:
+    if isinstance(value, bool):
+        return "bool"
+    if isinstance(value, int):
+        return "int"
+    if isinstance(value, float):
+        return "float"
+    if isinstance(value, str):
+        return "str"
+    return None
+
+
+def _property_getter_return_annotation(prop: property) -> str | None:
+    if prop.fget is None:
+        return None
+    try:
+        hints = typing.get_type_hints(prop.fget, include_extras=True)
+    except Exception:
+        hints = {}
+    try:
+        sig = inspect.signature(prop.fget)
+    except Exception:
+        sig = None
+    ann = hints.get("return") if isinstance(hints, dict) else None
+    if ann is None and sig is not None:
+        ann = sig.return_annotation
+    return _type_to_str(ann)
+
+
+def _property_setter_value_annotation(prop: property) -> str | None:
+    if prop.fset is None:
+        return None
+    ann = None
+    try:
+        hints = typing.get_type_hints(prop.fset, include_extras=True)
+    except Exception:
+        hints = {}
+    try:
+        sig = inspect.signature(prop.fset)
+        params_list = list(sig.parameters.values())
+        if len(params_list) >= 2:
+            param_name = params_list[1].name
+            ann = hints.get(param_name, params_list[1].annotation)
+    except Exception:
+        ann = None
+    return _type_to_str(ann)
+
+
+def _should_infer_property_runtime_annotation(
+    *,
+    settable: bool,
+    getter_annotation: str | None,
+    setter_annotation: str | None,
+) -> bool:
+    return (
+        settable
+        and not _has_simple_annotation(getter_annotation)
+        and not _has_simple_annotation(setter_annotation)
+    )
+
+
+def _infer_property_runtime_annotation(device: object, prop: property) -> str | None:
+    if prop.fget is None:
+        return None
+    try:
+        return _runtime_value_annotation(prop.fget(device))
+    except Exception:
+        return None
+
+
 def _coerce_simple_value(value: Any, kind: str) -> Any:
     if kind == "int":
         return int(cast(Any, value))
@@ -227,69 +301,32 @@ def discover_device_members(device: object) -> list[MemberSpec]:
                 doc_src = inspect.getdoc(prop)
             doc = doc_src.splitlines()[0] if doc_src else None
 
-            value_annotation = None
-            if prop.fget is not None:
-                try:
-                    hints = typing.get_type_hints(prop.fget, include_extras=True)
-                except Exception:
-                    hints = {}
-                try:
-                    sig = inspect.signature(prop.fget)
-                except Exception:
-                    sig = None
-                ann = hints.get("return") if isinstance(hints, dict) else None
-                if ann is None and sig is not None:
-                    ann = sig.return_annotation
-                value_annotation = _type_to_str(ann)
-                # Fallback: if no static annotation is available AND the
-                # property is writable (so a future set RPC needs the type for
-                # coercion), infer the runtime type by reading the property
-                # once. This helps drivers that auto-generate properties
-                # without return annotations (e.g. pfeiffer_turbo) without
-                # incurring read I/O for purely-readable properties.
-                if (
-                    settable
-                    and (
-                        value_annotation is None
-                        or value_annotation == ""
-                        or value_annotation == "None"
-                    )
-                ):
-                    try:
-                        runtime_value = prop.fget(device)
-                    except Exception:
-                        runtime_value = None
-                    if isinstance(runtime_value, bool):
-                        value_annotation = "bool"
-                    elif isinstance(runtime_value, int):
-                        value_annotation = "int"
-                    elif isinstance(runtime_value, float):
-                        value_annotation = "float"
-                    elif isinstance(runtime_value, str):
-                        value_annotation = "str"
+            value_annotation = _property_getter_return_annotation(prop)
+            setter_annotation = _property_setter_value_annotation(prop)
+            if _should_infer_property_runtime_annotation(
+                settable=settable,
+                getter_annotation=value_annotation,
+                setter_annotation=setter_annotation,
+            ):
+                # Some drivers create writable properties dynamically only after
+                # connect. For example, pfeiffer_turbo setters are broad
+                # Union[str, int, float] annotations even when the live parameter
+                # is boolean. A single bounded read gives command coercion the
+                # concrete scalar type, while still avoiding reads when static
+                # annotations are already usable.
+                runtime_annotation = _infer_property_runtime_annotation(device, prop)
+                if runtime_annotation is not None:
+                    value_annotation = runtime_annotation
 
             params: list[MemberParamSpec] | None = None
             if settable and prop.fset is not None:
-                ann = None
-                try:
-                    hints = typing.get_type_hints(prop.fset, include_extras=True)
-                except Exception:
-                    hints = {}
-                try:
-                    sig = inspect.signature(prop.fset)
-                    params_list = list(sig.parameters.values())
-                    if len(params_list) >= 2:
-                        param_name = params_list[1].name
-                        ann = hints.get(param_name, params_list[1].annotation)
-                except Exception:
-                    ann = None
                 params = [
                     MemberParamSpec(
                         name="value",
                         kind=inspect.Parameter.POSITIONAL_OR_KEYWORD.name,
                         required=True,
                         default=None,
-                        annotation=_type_to_str(ann),
+                        annotation=setter_annotation,
                     )
                 ]
 
