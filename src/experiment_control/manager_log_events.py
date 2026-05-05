@@ -5,6 +5,8 @@ import sys
 import time
 from typing import Any
 
+from .utils.logging_levels import normalize_log_severity
+
 Json = dict[str, Any]
 
 
@@ -118,6 +120,8 @@ def _event_log_severity(topic: str, payload: Json) -> str | None:
         if ok is False or status == "ERROR":
             return "error"
         return None
+    if topic == "manager.watchdog.triggered":
+        return normalize_log_severity(payload.get("severity"), default="warning")
     if topic.endswith("telemetry_stale"):
         return "warning"
     if (
