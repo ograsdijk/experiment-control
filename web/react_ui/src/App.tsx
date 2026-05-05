@@ -121,6 +121,7 @@ import {
 import { DagGraphPreview } from "./components/DagGraphPreview";
 import { WorkspaceCommandLayer } from "./components/WorkspaceCommandLayer";
 import { useCommandHistoryController } from "./features/commands/useCommandHistoryController";
+import { formatApiErrorToastMessage } from "./features/common/api_error";
 import { sameStringArray, sameStringRecord } from "./features/common/compare";
 import {
   normalizeBooleanMap,
@@ -3799,7 +3800,12 @@ export function App() {
           notifications.show({
             color: "red",
             title: "Command failed",
-            message: `${targetId}.${action}`,
+            message: formatApiErrorToastMessage(resp.error, {
+              targetKind: "process",
+              targetId,
+              action,
+            }),
+            autoClose: 15000,
           });
           return;
         }
@@ -3854,7 +3860,12 @@ export function App() {
           notifications.show({
             color: "red",
             title: "Command failed",
-            message: `${targetId}.${mapped.action}`,
+            message: formatApiErrorToastMessage(resp.error, {
+              targetKind: "device",
+              targetId,
+              action: mapped.action,
+            }),
+            autoClose: 15000,
           });
           return;
         }
