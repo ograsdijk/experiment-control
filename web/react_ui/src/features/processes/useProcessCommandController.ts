@@ -141,6 +141,7 @@ export function useProcessCommandController({
         targetId: processCommandProcessId,
         action: processCommandAction,
       }),
+      autoClose: 15000,
     });
   };
 

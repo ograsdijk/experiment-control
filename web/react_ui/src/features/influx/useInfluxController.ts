@@ -381,6 +381,7 @@ export function useInfluxController({
               targetId: influxWriterProcessId,
               action,
             }),
+            autoClose: 15000,
           });
           return false;
         }

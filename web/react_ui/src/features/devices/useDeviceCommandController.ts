@@ -248,6 +248,7 @@ export function useDeviceCommandController({
           targetId: commandDevice,
           action: mapped.action,
         }),
+        autoClose: 15000,
       });
     }
   };
@@ -330,6 +331,7 @@ export function useDeviceCommandController({
             targetId: deviceId,
             action: mapped.action,
           }),
+          autoClose: 15000,
         });
       }
     } finally {

@@ -734,6 +734,7 @@ export function useHdfController({
               targetId: processId,
               action,
             }),
+            autoClose: 15000,
           });
           return false;
         }
