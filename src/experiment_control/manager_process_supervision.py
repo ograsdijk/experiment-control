@@ -12,9 +12,27 @@ from typing import Any
 from .schemas.run_meta import run_meta_calls_to_json
 from .schemas.stream import stream_calls_to_json
 from .schemas.telemetry import telemetry_calls_to_json
+from .utils.exit_codes import derive_signal_name, describe_exit_code, exit_code_hex
 from .utils.manager_network import derive_local_connect_endpoint
 
 Json = dict[str, Any]
+
+
+# Topics emitted by `_publish_process_event` / `_publish_driver_event` that
+# should carry the full diagnostic payload (tail logs, signal name, etc.).
+FAILURE_PROCESS_TOPICS: frozenset[str] = frozenset(
+    {
+        "manager.process.failed",
+        "manager.process.crashloop",
+    }
+)
+FAILURE_DRIVER_TOPICS: frozenset[str] = frozenset(
+    {
+        "manager.driver.failed",
+        "manager.driver.crashloop",
+        "manager.driver.kill_timeout",
+    }
+)
 
 
 def _read_process_rss_bytes_windows(pid: int) -> int | None:
@@ -179,6 +197,7 @@ def start_driver(manager: Any, device_id: str) -> None:
         handle.driver_pid = None
         handle.driver_process_state = _enum_member(handle.driver_process_state, "FAILED")
         handle.driver_last_error = str(exc)
+        handle.driver_last_error_kind = "spawn_error"
         manager._publish_driver_event("manager.driver.failed", handle)
         manager._emit_log(
             severity="error",
@@ -200,7 +219,11 @@ def start_driver(manager: Any, device_id: str) -> None:
     handle.driver_process_state = _enum_member(handle.driver_process_state, "STARTING")
     handle.driver_last_exit_code = None
     handle.driver_stop_requested_t_mono = None
+    # Clear stale failure context before next attempt.
     handle.driver_last_error = None
+    handle.driver_last_error_kind = None
+    handle.driver_last_signal_name = None
+    handle.driver_last_failure_pid = None
     handle.driver_next_restart_t_mono = None
     manager._start_child_log_readers(
         popen=handle.process,
@@ -638,6 +661,7 @@ def start_process_handle(
         handle.pid = None
         handle.state = _enum_member(handle.state, "FAILED")
         handle.last_error = str(exc)
+        handle.last_error_kind = "spawn_error"
         manager._publish_process_event("manager.process.failed", handle)
         manager._emit_log(
             severity="error",
@@ -667,7 +691,14 @@ def start_process_handle(
     handle.last_exit_code = None
     handle.stop_requested_t_mono = None
     handle.next_restart_t_mono = None
+    # Clear stale failure context before next attempt.
     handle.last_error = None
+    handle.last_error_kind = None
+    handle.last_signal_name = None
+    handle.last_failure_pid = None
+    handle.last_heartbeat_age_s = None
+    handle.last_liveness_age_s = None
+    handle.last_heartbeat_received = None
     if reset_collision_retry:
         handle.startup_collision_retry_done = False
     manager._start_child_log_readers(
@@ -784,9 +815,17 @@ def process_snapshot(manager: Any, handle: Any) -> Json:
         "last_hb_t_mono": handle.last_hb_t_mono,
         "hb_age_s": hb_age_s,
         "last_exit_code": handle.last_exit_code,
+        "exit_code_hex": exit_code_hex(handle.last_exit_code),
+        "exit_code_description": describe_exit_code(handle.last_exit_code),
         "restart_count": handle.restart_count,
         "last_restart_t_mono": handle.last_restart_t_mono,
         "last_error": handle.last_error,
+        "last_error_kind": handle.last_error_kind,
+        "last_signal_name": handle.last_signal_name,
+        "last_failure_pid": handle.last_failure_pid,
+        "last_heartbeat_age_s": handle.last_heartbeat_age_s,
+        "last_liveness_age_s": handle.last_liveness_age_s,
+        "last_heartbeat_received": handle.last_heartbeat_received,
         "heartbeat_endpoint": handle.heartbeat_endpoint,
         "process_data_endpoint": handle.process_data_endpoint,
         "rpc_endpoint": handle.rpc_endpoint,
@@ -795,7 +834,9 @@ def process_snapshot(manager: Any, handle: Any) -> Json:
 
 
 def update_device_driver_exit_state(manager: Any, handle: Any, rc: int) -> None:
-    handle.driver_last_exit_code = int(rc)
+    rc_int = int(rc)
+    handle.driver_last_exit_code = rc_int
+    exiting_pid = handle.driver_pid
     handle.process = None
     handle.driver_pid = None
     if (
@@ -805,12 +846,17 @@ def update_device_driver_exit_state(manager: Any, handle: Any, rc: int) -> None:
         handle.driver_process_state = _enum_member(handle.driver_process_state, "STOPPED")
         manager._publish_driver_event("manager.driver.stopped", handle)
         return
-    if rc == 0:
+    if rc_int == 0:
         handle.driver_process_state = _enum_member(handle.driver_process_state, "STOPPED")
         manager._publish_driver_event("manager.driver.exited", handle)
         return
     handle.driver_process_state = _enum_member(handle.driver_process_state, "FAILED")
-    handle.driver_last_error = handle.driver_last_error or "driver exited"
+    handle.driver_last_failure_pid = exiting_pid
+    handle.driver_last_signal_name = derive_signal_name(rc_int)
+    handle.driver_last_error_kind = handle.driver_last_error_kind or "nonzero_exit"
+    if not handle.driver_last_error:
+        description = describe_exit_code(rc_int) or f"exit code {rc_int}"
+        handle.driver_last_error = f"driver exited: {description}"
     manager._publish_driver_event("manager.driver.failed", handle)
 
 
@@ -841,6 +887,8 @@ def enforce_device_driver_stop_timeout(
     ):
         handle.driver_process_state = _enum_member(handle.driver_process_state, "FAILED")
         handle.driver_last_error = "kill timeout"
+        handle.driver_last_error_kind = "kill_timeout"
+        handle.driver_last_failure_pid = handle.driver_pid
         manager._publish_driver_event("manager.driver.kill_timeout", handle)
 
 
@@ -882,7 +930,10 @@ def supervise_device_drivers(manager: Any, now_mono: float) -> None:
 
 
 def update_managed_process_exit_state(manager: Any, handle: Any, rc: int) -> bool:
-    handle.last_exit_code = int(rc)
+    rc_int = int(rc)
+    handle.last_exit_code = rc_int
+    # Capture the pid before we clear it; only published on the FAILED branch.
+    exiting_pid = handle.pid
     handle.popen = None
     handle.pid = None
     handle.rpc_endpoint = None
@@ -891,14 +942,20 @@ def update_managed_process_exit_state(manager: Any, handle: Any, rc: int) -> boo
         handle.state = _enum_member(handle.state, "EXITED")
         manager._publish_process_event("manager.process.exited", handle)
         return False
-    if rc == 0:
+    if rc_int == 0:
         handle.state = _enum_member(handle.state, "STOPPED")
         manager._publish_process_event("manager.process.exited", handle)
         return False
     if manager._maybe_recover_process_start_collision(handle):
         return True
     handle.state = _enum_member(handle.state, "FAILED")
-    handle.last_error = handle.last_error or "process exited"
+    handle.last_failure_pid = exiting_pid
+    handle.last_signal_name = derive_signal_name(rc_int)
+    # Recovery paths may have already set a more specific kind; don't clobber.
+    handle.last_error_kind = handle.last_error_kind or "nonzero_exit"
+    if not handle.last_error:
+        description = describe_exit_code(rc_int) or f"exit code {rc_int}"
+        handle.last_error = f"process exited: {description}"
     manager._publish_process_event("manager.process.failed", handle)
     return False
 
@@ -918,13 +975,27 @@ def enforce_managed_process_heartbeat_timeout(
     if hb_age is None or hb_age <= handle.spec.heartbeat_timeout_s:
         return
     handle.state = _enum_member(handle.state, "FAILED")
-    handle.last_error = "heartbeat stale"
+    handle.last_error_kind = "heartbeat_stale"
+    handle.last_failure_pid = handle.pid
+    heartbeat_received = handle.last_hb_t_mono is not None
+    handle.last_heartbeat_received = heartbeat_received
+    handle.last_liveness_age_s = float(hb_age)
+    handle.last_heartbeat_age_s = float(hb_age) if heartbeat_received else None
+    if heartbeat_received:
+        handle.last_error = (
+            f"heartbeat stale ({hb_age:.2f}s > {handle.spec.heartbeat_timeout_s:.2f}s)"
+        )
+    else:
+        handle.last_error = (
+            f"no heartbeat received {hb_age:.2f}s after spawn "
+            f"(timeout {handle.spec.heartbeat_timeout_s:.2f}s)"
+        )
     if handle.popen is not None and handle.popen.poll() is None:
         try:
             handle.popen.terminate()
             handle.stop_requested_t_mono = now_mono
         except Exception as exc:
-            handle.last_error = f"heartbeat stale; terminate failed: {exc}"
+            handle.last_error = f"{handle.last_error}; terminate failed: {exc}"
     manager._publish_process_event("manager.process.failed", handle)
 
 

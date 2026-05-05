@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import time
-from typing import Any
+from typing import Any, Iterator
 
 from .utils.process_lifecycle import cleanup_orphan_children
 
@@ -14,21 +14,61 @@ def _enum_member(current: Any, name: str) -> Any:
     return getattr(enum_cls, name, name)
 
 
+_HIGH_SEVERITY_LEVELS = frozenset({"error", "critical", "warning"})
+
+
+def _coerce_ts_field(ts_obj: Any, key: str) -> float | None:
+    if not isinstance(ts_obj, dict):
+        return None
+    raw = ts_obj.get(key)
+    if raw is None:
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _iter_matching_source_log_entries(
+    manager: Any, source_id: str, source_kind: str
+) -> Iterator[dict[str, Any]]:
+    """Yield raw log-history entries for `source_id` in reverse-chronological order."""
+    target_kind = source_kind.strip().lower()
+    for entry in reversed(manager._log_history):
+        if not isinstance(entry, dict):
+            continue
+        entry_kind = str(entry.get("source_kind", "") or "").strip().lower()
+        if entry_kind != target_kind:
+            continue
+        entry_source_id = manager._normalize_id(entry.get("source_id"))
+        if entry_source_id == source_id:
+            yield entry
+            continue
+        # Process logs may be tagged with a separate process_id; drivers use
+        # device_id. Honor both indirections.
+        if target_kind == "process":
+            entry_process_id = manager._normalize_id(entry.get("process_id"))
+            if entry_process_id == source_id:
+                yield entry
+        elif target_kind == "driver":
+            entry_device_id = manager._normalize_id(entry.get("device_id"))
+            if entry_device_id == source_id:
+                yield entry
+
+
+def _iter_matching_process_log_entries(
+    manager: Any, process_id: str
+) -> Iterator[dict[str, Any]]:
+    """Backwards-compatible wrapper for process-kind entries."""
+    return _iter_matching_source_log_entries(manager, process_id, "process")
+
+
 def recent_process_logs(manager: Any, *, process_id: str, limit: int = 6) -> list[str]:
     pid = process_id.strip()
     if not pid or limit <= 0:
         return []
     out: list[str] = []
-    for entry in reversed(manager._log_history):
-        if not isinstance(entry, dict):
-            continue
-        source_kind = str(entry.get("source_kind", "") or "").strip().lower()
-        if source_kind != "process":
-            continue
-        source_id = manager._normalize_id(entry.get("source_id"))
-        entry_process_id = manager._normalize_id(entry.get("process_id"))
-        if source_id != pid and entry_process_id != pid:
-            continue
+    for entry in _iter_matching_process_log_entries(manager, pid):
         message = str(entry.get("message", "") or "").strip()
         if not message:
             continue
@@ -41,6 +81,102 @@ def recent_process_logs(manager: Any, *, process_id: str, limit: int = 6) -> lis
             break
     out.reverse()
     return out
+
+
+def recent_source_logs_structured(
+    manager: Any,
+    *,
+    source_id: str,
+    source_kind: str = "process",
+    limit: int = 20,
+    max_message_len: int = 400,
+    prefer_high_severity: bool = True,
+) -> list[dict[str, Any]]:
+    """Return up to `limit` recent log entries for a process or driver source.
+
+    When `prefer_high_severity` is true the result is biased toward stderr/error
+    lines: those entries are collected first up to the limit, then chronological
+    info-level entries fill any remaining slots so plain crash output is still
+    visible. Final list is in chronological order.
+    """
+    sid = source_id.strip()
+    if not sid or limit <= 0:
+        return []
+
+    def _build_entry(entry: dict[str, Any]) -> dict[str, Any] | None:
+        message = str(entry.get("message", "") or "")
+        if not message.strip():
+            return None
+        if len(message) > max_message_len:
+            message = message[: max_message_len - 3] + "..."
+        severity = manager._normalize_log_severity(entry.get("severity"))
+        stream = str(entry.get("stream", "event") or "event").strip()
+        ts_obj = entry.get("ts")
+        return {
+            "severity": severity,
+            "stream": stream,
+            "message": message,
+            "t_wall": _coerce_ts_field(ts_obj, "t_wall"),
+            "t_mono": _coerce_ts_field(ts_obj, "t_mono"),
+        }
+
+    if not prefer_high_severity:
+        out: list[dict[str, Any]] = []
+        for entry in _iter_matching_source_log_entries(manager, sid, source_kind):
+            built = _build_entry(entry)
+            if built is None:
+                continue
+            out.append(built)
+            if len(out) >= limit:
+                break
+        out.reverse()
+        return out
+
+    raw_cap = max(limit * 4, limit + 8)
+    high: list[dict[str, Any]] = []
+    low: list[dict[str, Any]] = []
+    for entry in _iter_matching_source_log_entries(manager, sid, source_kind):
+        built = _build_entry(entry)
+        if built is None:
+            continue
+        is_high = (
+            built["severity"] in _HIGH_SEVERITY_LEVELS
+            or built["stream"] == "stderr"
+        )
+        target = high if is_high else low
+        if len(high) + len(low) >= raw_cap:
+            # Cap raw collection so we don't scan the whole deque on huge limits.
+            break
+        target.append(built)
+        if len(high) >= limit:
+            break
+
+    selected = high[:limit]
+    if len(selected) < limit:
+        remaining = limit - len(selected)
+        selected = selected + low[:remaining]
+    # Restore chronological order.
+    selected.reverse()
+    return selected
+
+
+def recent_process_logs_structured(
+    manager: Any,
+    *,
+    process_id: str,
+    limit: int = 20,
+    max_message_len: int = 400,
+    prefer_high_severity: bool = True,
+) -> list[dict[str, Any]]:
+    """Backwards-compatible wrapper for process-kind sources."""
+    return recent_source_logs_structured(
+        manager,
+        source_id=process_id,
+        source_kind="process",
+        limit=limit,
+        max_message_len=max_message_len,
+        prefer_high_severity=prefer_high_severity,
+    )
 
 
 def format_router_startup_failure(manager: Any, handle: Any) -> str:
@@ -164,5 +300,7 @@ def maybe_recover_process_start_collision(manager: Any, handle: Any) -> bool:
     except Exception as exc:
         handle.state = _enum_member(handle.state, "FAILED")
         handle.last_error = f"collision cleanup retry failed: {exc}"
-        manager._publish_process_event("manager.process.failed", handle)
+        handle.last_error_kind = "collision_recover_failed"
+        # Caller (`update_managed_process_exit_state`) is responsible for the
+        # FAILED publish so we don't emit two events back-to-back.
         return False

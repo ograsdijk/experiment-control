@@ -189,6 +189,12 @@ from .manager_process_recovery import (
 )
 from .manager_process_recovery import recent_process_logs as shared_recent_process_logs
 from .manager_process_recovery import (
+    recent_process_logs_structured as shared_recent_process_logs_structured,
+)
+from .manager_process_recovery import (
+    recent_source_logs_structured as shared_recent_source_logs_structured,
+)
+from .manager_process_recovery import (
     record_orphan_cleanup as shared_record_orphan_cleanup,
 )
 from .manager_process_spec import process_spec_kwargs_from_yaml
@@ -198,6 +204,11 @@ from .manager_process_supervision import (
 )
 from .manager_process_supervision import build_driver_cmd as shared_build_driver_cmd
 from .manager_process_supervision import build_router_spec as shared_build_router_spec
+from .manager_process_supervision import (
+    FAILURE_DRIVER_TOPICS,
+    FAILURE_PROCESS_TOPICS,
+)
+from .utils.exit_codes import describe_exit_code, exit_code_hex
 from .manager_process_supervision import (
     connect_process_data as shared_connect_process_data,
 )
@@ -634,6 +645,9 @@ class DeviceHandle:
     driver_restart_count: int = 0
     driver_last_restart_t_mono: float | None = None
     driver_last_error: str | None = None
+    driver_last_error_kind: str | None = None
+    driver_last_signal_name: str | None = None
+    driver_last_failure_pid: int | None = None
     driver_stop_requested_t_mono: float | None = None
     driver_next_restart_t_mono: float | None = None
     connect_check_last: dict[str, Any] | None = None
@@ -681,6 +695,12 @@ class ProcessHandle:
     restart_count: int = 0
     last_restart_t_mono: float | None = None
     last_error: str | None = None
+    last_error_kind: str | None = None
+    last_signal_name: str | None = None
+    last_failure_pid: int | None = None
+    last_heartbeat_age_s: float | None = None
+    last_liveness_age_s: float | None = None
+    last_heartbeat_received: bool | None = None
     heartbeat_endpoint: str = ""
     process_data_endpoint: str = ""
     stop_requested_t_mono: float | None = None
@@ -1123,6 +1143,13 @@ class Manager:
 
     def _recent_process_logs(self, *, process_id: str, limit: int = 6) -> list[str]:
         return shared_recent_process_logs(self, process_id=process_id, limit=limit)
+
+    def _recent_process_logs_structured(
+        self, *, process_id: str, limit: int = 20
+    ) -> list[dict[str, Any]]:
+        return shared_recent_process_logs_structured(
+            self, process_id=process_id, limit=limit
+        )
 
     def _format_router_startup_failure(self, handle: ProcessHandle) -> str:
         return shared_format_router_startup_failure(self, handle)
@@ -2685,7 +2712,7 @@ class Manager:
         shared_maybe_publish_log_event(self, topic, payload)
 
     def _publish_process_event(self, topic: str, handle: ProcessHandle) -> None:
-        payload = {
+        payload: dict[str, Any] = {
             "version": 1,
             "process_id": handle.spec.process_id,
             "state": handle.state,
@@ -2696,10 +2723,23 @@ class Manager:
             "error": handle.last_error,
             "ts": {"t_wall": time.time(), "t_mono": time.monotonic()},
         }
+        if topic in FAILURE_PROCESS_TOPICS:
+            payload["error_kind"] = handle.last_error_kind
+            payload["signal"] = handle.last_signal_name
+            payload["restart_count"] = handle.restart_count
+            payload["heartbeat_age_s"] = handle.last_heartbeat_age_s
+            payload["liveness_age_s"] = handle.last_liveness_age_s
+            payload["heartbeat_received"] = handle.last_heartbeat_received
+            payload["failure_pid"] = handle.last_failure_pid
+            payload["exit_code_hex"] = exit_code_hex(handle.last_exit_code)
+            payload["exit_code_description"] = describe_exit_code(handle.last_exit_code)
+            payload["tail_logs"] = self._failure_event_tail_logs(
+                process_id=handle.spec.process_id
+            )
         self._publish_manager_event(topic, payload)
 
     def _publish_driver_event(self, topic: str, handle: DeviceHandle) -> None:
-        payload = {
+        payload: dict[str, Any] = {
             "version": 1,
             "device_id": handle.spec.device_id,
             "state": handle.driver_process_state,
@@ -2709,7 +2749,47 @@ class Manager:
             "restart_count": handle.driver_restart_count,
             "ts": {"t_wall": time.time(), "t_mono": time.monotonic()},
         }
+        if topic in FAILURE_DRIVER_TOPICS:
+            payload["error_kind"] = handle.driver_last_error_kind
+            payload["signal"] = handle.driver_last_signal_name
+            payload["failure_pid"] = handle.driver_last_failure_pid
+            payload["exit_code_hex"] = exit_code_hex(handle.driver_last_exit_code)
+            payload["exit_code_description"] = describe_exit_code(
+                handle.driver_last_exit_code
+            )
+            payload["tail_logs"] = self._failure_event_tail_logs(
+                source_id=handle.spec.device_id, source_kind="driver"
+            )
         self._publish_manager_event(topic, payload)
+
+    def _failure_event_tail_logs(
+        self,
+        *,
+        process_id: str | None = None,
+        source_id: str | None = None,
+        source_kind: str = "process",
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        try:
+            return shared_recent_source_logs_structured(
+                self,
+                source_id=source_id if source_id is not None else (process_id or ""),
+                source_kind=source_kind,
+                limit=limit,
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            try:
+                self._emit_log(
+                    severity="warning",
+                    topic="manager.failure_event.tail_unavailable",
+                    message=f"failed to gather tail logs: {exc}",
+                    source_kind=source_kind,
+                    source_id=source_id or process_id or "",
+                    payload={"error": repr(exc)},
+                )
+            except Exception:
+                pass
+            return []
 
     @staticmethod
     def _normalize_runtime_metadata_dict(
