@@ -79,6 +79,10 @@ class RuleState:
     stable_since_mono: float | None = None
     last_trigger_mono: float | None = None
     latched: bool = False
+    last_evaluated_mono: float | None = None
+    alarm: bool | None = None
+    unknown: bool | None = None
+    snapshot: Json | None = None
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -415,6 +419,10 @@ def evaluate_watchdog_rule(
         rule, telemetry_getter=telemetry_getter, now_mono=now_mono
     )
     alarm = _evaluate_watchdog_alarm(rule=rule, env=env, unknown=unknown)
+    state.last_evaluated_mono = now_mono
+    state.alarm = alarm
+    state.unknown = unknown
+    state.snapshot = snapshot
 
     if not alarm:
         state.stable_since_mono = None
@@ -737,6 +745,10 @@ class WatchdogProcess(ManagedProcessBase):
                         "latch": rule.latch,
                         "on_unknown": rule.on_unknown,
                         "latched": state.latched,
+                        "alarm": state.alarm,
+                        "unknown": state.unknown,
+                        "snapshot": state.snapshot,
+                        "last_evaluated_mono": state.last_evaluated_mono,
                         "stable_since_mono": state.stable_since_mono,
                         "last_trigger_mono": state.last_trigger_mono,
                     }

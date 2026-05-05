@@ -395,6 +395,14 @@ Request:
 
 Response:
 - `{"ok": true, "result": {"watchdogs": [...]}}`
+- Each rule includes static configuration (`severity`, `condition`, `telemetry`,
+  `actions`) plus live state:
+  - `latched`: bool
+  - `alarm`: bool or null before first evaluation
+  - `unknown`: bool or null before first evaluation
+  - `snapshot`: latest telemetry snapshot dict or null before first evaluation
+  - `last_evaluated_mono`: monotonic timestamp or null before first evaluation
+  - `stable_since_mono`, `last_trigger_mono`: monotonic timestamps or null
 
 ### `watchdog.clear_latch`
 Request:

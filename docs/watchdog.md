@@ -123,7 +123,8 @@ Retries:
 Use the manager `manager.processes.rpc` API to call watchdog RPCs.
 
 ### `watchdog.status`
-Returns loaded rules and state (latched + last_trigger).
+Returns loaded rules and state, including the latest evaluated alarm state when
+the watchdog has completed at least one rule tick.
 
 ```json
 {"type": "watchdog.status"}

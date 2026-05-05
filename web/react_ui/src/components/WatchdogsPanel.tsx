@@ -30,6 +30,62 @@ function formatMonoSeconds(value: number | null | undefined): string {
   return `${value.toFixed(2)} s`;
 }
 
+function watchdogRuleState(rule: WatchdogStatus["rules"][number]): {
+  label: string;
+  color: string;
+} {
+  if (rule.latched) {
+    return { label: "Latched", color: "orange" };
+  }
+  if (rule.alarm) {
+    return { label: "Alarm", color: "red" };
+  }
+  if (rule.unknown) {
+    return { label: "Unknown", color: "yellow" };
+  }
+  if (rule.last_evaluated_mono == null) {
+    return { label: "Pending", color: "gray" };
+  }
+  return { label: "Clear", color: "teal" };
+}
+
+function summarizeWatchdogRules(watchdog: WatchdogStatus): {
+  label: string;
+  color: string;
+} {
+  if (!watchdog.enabled) {
+    return { label: "Disabled", color: "gray" };
+  }
+  let latched = 0;
+  let unknown = 0;
+  let alarm = 0;
+  let pending = 0;
+  for (const rule of watchdog.rules) {
+    if (rule.latched) {
+      latched += 1;
+    } else if (rule.alarm) {
+      alarm += 1;
+    } else if (rule.unknown) {
+      unknown += 1;
+    } else if (rule.last_evaluated_mono == null) {
+      pending += 1;
+    }
+  }
+  if (latched > 0) {
+    return { label: `${latched} latched`, color: "orange" };
+  }
+  if (alarm > 0) {
+    return { label: `${alarm} alarm`, color: "red" };
+  }
+  if (unknown > 0) {
+    return { label: `${unknown} unknown`, color: "yellow" };
+  }
+  if (pending > 0) {
+    return { label: `${pending} pending`, color: "gray" };
+  }
+  return { label: "All clear", color: "teal" };
+}
+
 export function WatchdogsPanel({
   processes,
   watchdogStatusByProcessId,
@@ -146,6 +202,7 @@ export function WatchdogsPanel({
                       String(watchdog.watchdog_id ?? "").trim() || `watchdog_${watchdogIdx}`;
                     const toggleBusyKey = `${processId}:${watchdogId}:toggle`;
                     const toggleBusy = Boolean(watchdogBusyByKey[toggleBusyKey]);
+                    const watchdogSummary = summarizeWatchdogRules(watchdog);
                     return (
                       <Card
                         key={`${processId}:${watchdogId}`}
@@ -167,6 +224,9 @@ export function WatchdogsPanel({
                               </Badge>
                               <Badge variant="outline" color="gray">
                                 {watchdog.rules.length} rules
+                              </Badge>
+                              <Badge variant="light" color={watchdogSummary.color}>
+                                {watchdogSummary.label}
                               </Badge>
                             </Group>
                             <Switch
@@ -190,6 +250,9 @@ export function WatchdogsPanel({
                                   `${processId}:${watchdogId}:${ruleName}:clear`;
                                 const clearBusy = Boolean(watchdogBusyByKey[clearBusyKey]);
                                 const latched = Boolean(rule.latched);
+                                const ruleState = watchdog.enabled
+                                  ? watchdogRuleState(rule)
+                                  : { label: "Disabled", color: "gray" };
                                 const severity = String(rule.severity ?? "info").toLowerCase();
                                 const severityColor =
                                   severity === "critical" || severity === "error"
@@ -210,16 +273,17 @@ export function WatchdogsPanel({
                                           <Text size="xs" fw={600}>
                                             {ruleName}
                                           </Text>
+                                          <Badge variant="light" color={ruleState.color}>
+                                            {ruleState.label}
+                                          </Badge>
                                           <Badge variant="light" color={severityColor}>
                                             {severity}
                                           </Badge>
-                                          <Badge
-                                            variant="outline"
-                                            color={latched ? "orange" : "gray"}
-                                          >
-                                            {latched ? "Latched" : "Clear"}
-                                          </Badge>
                                         </Group>
+                                        <Text size="xs" c="dimmed">
+                                          last evaluation:{" "}
+                                          {formatMonoSeconds(rule.last_evaluated_mono)}
+                                        </Text>
                                         <Text size="xs" c="dimmed">
                                           stable since: {formatMonoSeconds(rule.stable_since_mono)}
                                         </Text>

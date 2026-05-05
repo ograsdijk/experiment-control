@@ -76,8 +76,40 @@ class WatchdogRuleEvalTests(unittest.TestCase):
         self.assertTrue(triggered)
         self.assertTrue(alarm)
         self.assertTrue(unknown)
+        self.assertEqual(state.last_evaluated_mono, 5.0)
+        self.assertTrue(state.alarm)
+        self.assertTrue(state.unknown)
+        self.assertIsInstance(state.snapshot, dict)
         self.assertIn("t", snapshot)
         self.assertFalse(bool(snapshot["t"].get("ok")))
+
+    def test_clear_alarm_state_is_recorded_after_evaluation(self) -> None:
+        rule = WatchdogRule(
+            name="r_clear",
+            severity="warn",
+            message=None,
+            telemetry=[TelemetryBinding(alias="t", device_id="dev1", signal="temp", max_age_s=1.0)],
+            condition={"gt": ["${t.value}", 10.0]},
+            stable_for_s=0.0,
+            cooldown_s=0.0,
+            latch=False,
+            on_unknown="ignore",
+            actions=[_default_action()],
+        )
+        state = RuleState()
+        triggered, alarm, unknown, snapshot = evaluate_watchdog_rule(
+            rule=rule,
+            state=state,
+            telemetry_getter=lambda _dev, _sig: _ok_sample(1.0),
+            now_mono=6.0,
+        )
+        self.assertFalse(triggered)
+        self.assertFalse(alarm)
+        self.assertFalse(unknown)
+        self.assertEqual(state.last_evaluated_mono, 6.0)
+        self.assertFalse(state.alarm)
+        self.assertFalse(state.unknown)
+        self.assertEqual(state.snapshot, snapshot)
 
     def test_cooldown_suppresses_repeated_triggers(self) -> None:
         rule = WatchdogRule(
@@ -190,6 +222,10 @@ class WatchdogRuleEvalTests(unittest.TestCase):
                 stable_since_mono=10.0,
                 last_trigger_mono=11.0,
                 latched=True,
+                last_evaluated_mono=12.0,
+                alarm=False,
+                unknown=False,
+                snapshot={"sys_p": {"value": 1e-6, "ok": True}},
             )
         }
 
@@ -210,6 +246,14 @@ class WatchdogRuleEvalTests(unittest.TestCase):
         self.assertIn("condition", rule)
         self.assertIn("telemetry", rule)
         self.assertIn("actions", rule)
+        self.assertIn("alarm", rule)
+        self.assertIn("unknown", rule)
+        self.assertIn("snapshot", rule)
+        self.assertIn("last_evaluated_mono", rule)
+        self.assertFalse(rule.get("alarm"))
+        self.assertFalse(rule.get("unknown"))
+        self.assertEqual(rule.get("last_evaluated_mono"), 12.0)
+        self.assertEqual(rule.get("snapshot"), {"sys_p": {"value": 1e-6, "ok": True}})
         self.assertEqual(rule.get("condition"), {"gt": ["${sys_p.value}", 1e-5]})
 
 

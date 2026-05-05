@@ -31,6 +31,9 @@ type WatchdogButtonSummary = {
   status: "idle" | "active" | "error";
   color: string;
   activeLatchCount: number;
+  activeAlarmCount: number;
+  unknownRuleCount: number;
+  pendingRuleCount: number;
   label: string;
   tooltip: string;
 };
@@ -361,7 +364,11 @@ export function useWatchdogsController({
     ]);
 
     let activeLatchCount = 0;
+    let activeAlarmCount = 0;
+    let unknownRuleCount = 0;
+    let pendingRuleCount = 0;
     let hasError = false;
+    let hasTrackedWatchdogs = false;
     const errorSources: string[] = [];
 
     for (const processId of trackedProcessIds) {
@@ -380,29 +387,64 @@ export function useWatchdogsController({
       }
       const watchdogs = watchdogStatusByProcessId[processId] ?? [];
       for (const watchdog of watchdogs) {
+        hasTrackedWatchdogs = true;
         if (!processRpcActive || !watchdog.enabled) {
           continue;
         }
         for (const rule of watchdog.rules ?? []) {
           if (rule.latched) {
             activeLatchCount += 1;
+          } else if (rule.alarm) {
+            activeAlarmCount += 1;
+          } else if (rule.unknown) {
+            unknownRuleCount += 1;
+          } else if (rule.last_evaluated_mono == null) {
+            pendingRuleCount += 1;
           }
         }
       }
     }
 
-    const status = hasError ? "error" : activeLatchCount > 0 ? "active" : "idle";
-    const color = status === "error" ? "red" : status === "active" ? "orange" : "gray";
-    const labelSuffix = activeLatchCount > 0 ? ` (${activeLatchCount})` : "";
+    const activeRuleCount =
+      activeLatchCount + activeAlarmCount + unknownRuleCount + pendingRuleCount;
+    const status = hasError ? "error" : activeRuleCount > 0 ? "active" : "idle";
+    const color = status === "error"
+      ? "red"
+      : status === "active"
+        ? "orange"
+        : hasTrackedWatchdogs
+          ? "teal"
+          : "gray";
+    const labelSuffix = activeRuleCount > 0 ? ` (${activeRuleCount})` : "";
     const tooltip = hasError
       ? `Watchdog issue: ${errorSources[0] ?? "unknown"}`
-      : activeLatchCount > 0
-      ? `${activeLatchCount} latched rule${activeLatchCount === 1 ? "" : "s"}`
-      : "No latched watchdog rules";
+      : activeRuleCount > 0
+      ? [
+          activeLatchCount > 0
+            ? `${activeLatchCount} latched rule${activeLatchCount === 1 ? "" : "s"}`
+            : null,
+          activeAlarmCount > 0
+            ? `${activeAlarmCount} alarm rule${activeAlarmCount === 1 ? "" : "s"}`
+            : null,
+          unknownRuleCount > 0
+            ? `${unknownRuleCount} unknown rule${unknownRuleCount === 1 ? "" : "s"}`
+            : null,
+          pendingRuleCount > 0
+            ? `${pendingRuleCount} pending rule${pendingRuleCount === 1 ? "" : "s"}`
+            : null,
+        ]
+          .filter((part): part is string => Boolean(part))
+          .join(" | ")
+      : hasTrackedWatchdogs
+        ? "All watchdog rules clear"
+        : "No watchdog status available";
     return {
       status,
       color,
       activeLatchCount,
+      activeAlarmCount,
+      unknownRuleCount,
+      pendingRuleCount,
       label: `Watchdogs${labelSuffix}`,
       tooltip,
     };
@@ -421,4 +463,3 @@ export function useWatchdogsController({
     clearWatchdogRuleLatch,
   };
 }
-

@@ -251,6 +251,10 @@ export type WatchdogRuleStatus = {
   latch?: boolean;
   on_unknown?: string | null;
   latched: boolean;
+  alarm?: boolean | null;
+  unknown?: boolean | null;
+  snapshot?: Record<string, unknown> | null;
+  last_evaluated_mono?: number | null;
   stable_since_mono?: number | null;
   last_trigger_mono?: number | null;
 };

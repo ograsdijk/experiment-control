@@ -3181,10 +3181,20 @@ export function App() {
     const interlockError = interlockButtonSummary.status === "error";
     const watchdogError = watchdogsController.watchdogButtonSummary.status === "error";
     const interlockActive = interlockButtonSummary.activeRuleCount > 0;
-    const watchdogActive = watchdogsController.watchdogButtonSummary.activeLatchCount > 0;
+    const watchdogActive =
+      watchdogsController.watchdogButtonSummary.activeLatchCount +
+        watchdogsController.watchdogButtonSummary.activeAlarmCount +
+        watchdogsController.watchdogButtonSummary.unknownRuleCount +
+        watchdogsController.watchdogButtonSummary.pendingRuleCount >
+      0;
+    const watchdogActiveCount =
+      watchdogsController.watchdogButtonSummary.activeLatchCount +
+      watchdogsController.watchdogButtonSummary.activeAlarmCount +
+      watchdogsController.watchdogButtonSummary.unknownRuleCount +
+      watchdogsController.watchdogButtonSummary.pendingRuleCount;
     const totalActive =
       interlockButtonSummary.activeRuleCount +
-      watchdogsController.watchdogButtonSummary.activeLatchCount;
+      watchdogActiveCount;
     const status = interlockError || watchdogError
       ? "error"
       : interlockActive || watchdogActive
@@ -3194,9 +3204,12 @@ export function App() {
       ? "red"
       : interlockActive
         ? "teal"
-        : watchdogActive
-          ? "orange"
-          : "gray";
+      : watchdogActive
+          ? watchdogsController.watchdogButtonSummary.color
+          : interlockButtonSummary.activeRuleCount === 0 &&
+              watchdogsController.watchdogButtonSummary.color === "teal"
+            ? "teal"
+            : "gray";
     const labelSuffix = totalActive > 0 ? ` (${totalActive})` : "";
     const tooltip = status === "error"
       ? interlockError
@@ -3208,7 +3221,7 @@ export function App() {
               ? `${interlockButtonSummary.activeRuleCount} active interlock rule${interlockButtonSummary.activeRuleCount === 1 ? "" : "s"}`
               : null,
             watchdogActive
-              ? `${watchdogsController.watchdogButtonSummary.activeLatchCount} latched watchdog rule${watchdogsController.watchdogButtonSummary.activeLatchCount === 1 ? "" : "s"}`
+              ? watchdogsController.watchdogButtonSummary.tooltip
               : null,
           ]
             .filter((part): part is string => Boolean(part))

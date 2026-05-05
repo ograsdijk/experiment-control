@@ -358,6 +358,15 @@ function normalizeWatchdogStatus(raw: unknown): WatchdogStatus | null {
       const lastTriggerMono = Number.isFinite(lastTriggerRaw)
         ? lastTriggerRaw
         : null;
+      const lastEvaluatedRaw = asNumber(ruleObj.last_evaluated_mono, Number.NaN);
+      const lastEvaluatedMono = Number.isFinite(lastEvaluatedRaw)
+        ? lastEvaluatedRaw
+        : null;
+      const snapshotRaw = ruleObj.snapshot;
+      const snapshot =
+        snapshotRaw && typeof snapshotRaw === "object" && !Array.isArray(snapshotRaw)
+          ? (snapshotRaw as Record<string, unknown>)
+          : null;
       return {
         name: asString(ruleObj.name, ""),
         severity: asString(ruleObj.severity, "info"),
@@ -376,6 +385,14 @@ function normalizeWatchdogStatus(raw: unknown): WatchdogStatus | null {
         latch: asBoolean(ruleObj.latch, false),
         on_unknown: asString(ruleObj.on_unknown, "") || null,
         latched: asBoolean(ruleObj.latched, false),
+        alarm: Object.prototype.hasOwnProperty.call(ruleObj, "alarm")
+          ? asBoolean(ruleObj.alarm, false)
+          : null,
+        unknown: Object.prototype.hasOwnProperty.call(ruleObj, "unknown")
+          ? asBoolean(ruleObj.unknown, false)
+          : null,
+        snapshot,
+        last_evaluated_mono: lastEvaluatedMono,
         stable_since_mono: stableSinceMono,
         last_trigger_mono: lastTriggerMono,
       };
