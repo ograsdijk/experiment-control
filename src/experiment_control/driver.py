@@ -560,6 +560,7 @@ def _raise_extractor(msg: str) -> Callable[[Any], Any]:
 class _TelemetryOutPlan:
     signal: str
     units: str | None
+    dtype: str
     extractor: Callable[[Any], Any]
 
 
@@ -1029,6 +1030,8 @@ class DeviceRunner:
                 for o in plan.outputs:
                     try:
                         val = o.extractor(ret)
+                        if val is not None:
+                            val = coerce_scalar(val, o.dtype)
                         out[o.signal] = {
                             "value": val,
                             "units": o.units,
@@ -1497,6 +1500,7 @@ class DeviceRunner:
                     _TelemetryOutPlan(
                         signal=out.signal,
                         units=out.units,
+                        dtype=out.dtype,
                         extractor=extractor,
                     )
                 )
