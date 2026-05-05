@@ -25,7 +25,7 @@ import {
   IconSettings,
   IconTrash,
 } from "@tabler/icons-react";
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { effectiveDeviceMemberParams } from "../features/devices/command_schema";
 import { SortableItem } from "../features/layout/SortableItem";
 import type {
@@ -141,6 +141,12 @@ type Props = {
     format: "auto" | "fixed" | "scientific"
   ) => void;
   onUpdateTelemetryEntryDecimals: (entryId: string, decimals: number | null) => void;
+  collapsedByGroup: Record<string, boolean>;
+  setCollapsedByGroup: (
+    update:
+      | Record<string, boolean>
+      | ((prev: Record<string, boolean>) => Record<string, boolean>)
+  ) => void;
 };
 
 export function CommandDeckPanel({
@@ -168,13 +174,12 @@ export function CommandDeckPanel({
   onUpdateTelemetryEntrySignal,
   onUpdateTelemetryEntryFormat,
   onUpdateTelemetryEntryDecimals,
+  collapsedByGroup,
+  setCollapsedByGroup,
 }: Props) {
   const [searchText, setSearchText] = useState("");
   const [filterKind, setFilterKind] = useState<"all" | "command" | "telemetry">(
     "all"
-  );
-  const [collapsedByGroup, setCollapsedByGroup] = useState<Record<string, boolean>>(
-    {}
   );
   const [expandedByEntryId, setExpandedByEntryId] = useState<Record<string, boolean>>(
     {}
@@ -271,7 +276,19 @@ export function CommandDeckPanel({
       }
       return changed ? next : prev;
     });
-  }, [entries]);
+    setCollapsedByGroup((prev) => {
+      let changed = false;
+      const next: Record<string, boolean> = {};
+      for (const [groupName, collapsed] of Object.entries(prev)) {
+        if (knownGroupNames.has(groupName)) {
+          next[groupName] = collapsed;
+        } else {
+          changed = true;
+        }
+      }
+      return changed ? next : prev;
+    });
+  }, [entries, setCollapsedByGroup]);
 
   const filteredEntries = useMemo(() => {
     const needle = searchText.trim().toLowerCase();
@@ -323,21 +340,69 @@ export function CommandDeckPanel({
     });
   }, [filteredEntries]);
 
+  // Canonical set of all group names that exist in the deck, regardless of
+  // current search/filter. Used for the bulk toggle so behavior stays
+  // intuitive when a search filter is active and persistence is in play.
+  const allGroupNames = useMemo(() => {
+    const values = new Set<string>();
+    for (const entry of entries) {
+      values.add(normalizeGroupName(entry.group));
+    }
+    return [...values];
+  }, [entries]);
+
+  const anyGroupExpanded = useMemo(
+    () => allGroupNames.some((groupName) => collapsedByGroup[groupName] !== true),
+    [allGroupNames, collapsedByGroup]
+  );
+
+  // Newly-added groups appear expanded by default and are intentionally not
+  // affected by an earlier "Collapse all" click.
+  const handleToggleAllGroups = useCallback(() => {
+    setCollapsedByGroup((prev) => {
+      const collapseAll = allGroupNames.some(
+        (groupName) => prev[groupName] !== true
+      );
+      const next: Record<string, boolean> = { ...prev };
+      for (const groupName of allGroupNames) {
+        next[groupName] = collapseAll;
+      }
+      return next;
+    });
+  }, [allGroupNames, setCollapsedByGroup]);
+
   return (
     <Stack gap="xs">
       <Group justify="space-between" align="center">
         <Text fw={600}>Command Deck</Text>
-        <Menu shadow="md" width={220} position="bottom-end" withArrow withinPortal>
-          <Menu.Target>
-            <Button size="compact-xs" variant="light" leftSection={<IconPlus size={14} />}>
-              Add
+        <Group gap={6}>
+          {allGroupNames.length > 0 ? (
+            <Button
+              size="compact-xs"
+              variant="subtle"
+              color="gray"
+              onClick={handleToggleAllGroups}
+              title={
+                anyGroupExpanded
+                  ? "Collapse every group"
+                  : "Expand every group"
+              }
+            >
+              {anyGroupExpanded ? "Collapse all" : "Expand all"}
             </Button>
-          </Menu.Target>
-          <Menu.Dropdown>
-            <Menu.Item onClick={() => onAddCommandEntry()}>Add command</Menu.Item>
-            <Menu.Item onClick={() => onAddTelemetryEntry()}>Add telemetry</Menu.Item>
-          </Menu.Dropdown>
-        </Menu>
+          ) : null}
+          <Menu shadow="md" width={220} position="bottom-end" withArrow withinPortal>
+            <Menu.Target>
+              <Button size="compact-xs" variant="light" leftSection={<IconPlus size={14} />}>
+                Add
+              </Button>
+            </Menu.Target>
+            <Menu.Dropdown>
+              <Menu.Item onClick={() => onAddCommandEntry()}>Add command</Menu.Item>
+              <Menu.Item onClick={() => onAddTelemetryEntry()}>Add telemetry</Menu.Item>
+            </Menu.Dropdown>
+          </Menu>
+        </Group>
       </Group>
       <Group grow>
         <TextInput

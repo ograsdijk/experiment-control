@@ -240,6 +240,10 @@ export function normalizeUiProfile(
     commands.pinned_commands ?? commands.pinnedCommands ?? obj.pinnedCommands;
   const commandDeckRaw =
     commands.command_deck ?? commands.commandDeck ?? obj.commandDeck;
+  const commandDeckCollapsedByGroupRaw =
+    commands.command_deck_collapsed_by_group ??
+    commands.commandDeckCollapsedByGroup ??
+    obj.commandDeckCollapsedByGroup;
   const streamWorkspacesRaw =
     analysis.stream_workspaces ??
     analysis.streamWorkspaces ??
@@ -265,6 +269,7 @@ export function normalizeUiProfile(
     collapsedRaw !== undefined ||
     pinnedCommandsRaw !== undefined ||
     commandDeckRaw !== undefined ||
+    commandDeckCollapsedByGroupRaw !== undefined ||
     streamWorkspacesRaw !== undefined ||
     (plotStateRaw &&
       typeof plotStateRaw === "object" &&
@@ -291,6 +296,9 @@ export function normalizeUiProfile(
     telemetryCollapsedByDevice: normalizeBooleanMap(collapsedRaw),
     pinnedCommands: normalizePinnedCommands(pinnedCommandsRaw),
     commandDeck: normalizeCommandDeck(commandDeckRaw),
+    commandDeckCollapsedByGroup: normalizeBooleanMap(
+      commandDeckCollapsedByGroupRaw
+    ),
     streamWorkspaces: opts.normalizeStreamWorkspaceRecord(streamWorkspacesRaw),
   };
 }

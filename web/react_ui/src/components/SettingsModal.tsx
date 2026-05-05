@@ -9,9 +9,10 @@
 import {
   IconFileText,
   IconRefresh,
+  IconRestore,
   IconSquarePlus,
 } from "@tabler/icons-react";
-import type { ChangeEvent, RefObject } from "react";
+import { useState, type ChangeEvent, type RefObject } from "react";
 import type { GatewaySettingsInfo } from "../api";
 
 type Props = {
@@ -20,6 +21,9 @@ type Props = {
   settingsFileInputRef: RefObject<HTMLInputElement>;
   onImportUiProfile: (event: ChangeEvent<HTMLInputElement>) => Promise<void>;
   onExportUiProfile: () => void;
+  onLoadDefaultUiProfile: () => Promise<boolean>;
+  defaultUiProfileAvailable: boolean;
+  defaultUiProfileLoading: boolean;
   onReload: () => Promise<unknown> | void;
   loading: boolean;
   error: string | null;
@@ -29,12 +33,42 @@ type Props = {
   telemetryStreamStatus: string;
 };
 
+function hasUiCustomization(): boolean {
+  const keys = [
+    "ecui.commandDeck",
+    "ecui.commandDeck.collapsedByGroup",
+    "ecui.plotState",
+    "ecui.pinnedCommands",
+    "ecui.streamWorkspaces",
+    "ecui.deviceOrder",
+    "ecui.telemetryCollapsedByDevice",
+  ];
+  for (const key of keys) {
+    const raw = localStorage.getItem(key);
+    if (raw === null) {
+      continue;
+    }
+    const trimmed = raw.trim();
+    if (!trimmed) {
+      continue;
+    }
+    if (trimmed === "{}" || trimmed === "[]") {
+      continue;
+    }
+    return true;
+  }
+  return false;
+}
+
 export function SettingsModal({
   opened,
   onClose,
   settingsFileInputRef,
   onImportUiProfile,
   onExportUiProfile,
+  onLoadDefaultUiProfile,
+  defaultUiProfileAvailable,
+  defaultUiProfileLoading,
   onReload,
   loading,
   error,
@@ -43,6 +77,25 @@ export function SettingsModal({
   resolvedWsBase,
   telemetryStreamStatus,
 }: Props) {
+  const [confirmDefaultsOpen, setConfirmDefaultsOpen] = useState(false);
+  const [confirmCustomized, setConfirmCustomized] = useState(false);
+
+  const openLoadDefaultsConfirm = () => {
+    setConfirmCustomized(hasUiCustomization());
+    setConfirmDefaultsOpen(true);
+  };
+
+  const handleConfirmLoadDefaults = async () => {
+    setConfirmDefaultsOpen(false);
+    await onLoadDefaultUiProfile();
+  };
+
+  const handleExportThenLoadDefaults = async () => {
+    onExportUiProfile();
+    setConfirmDefaultsOpen(false);
+    await onLoadDefaultUiProfile();
+  };
+
   return (
     <Modal
       opened={opened}
@@ -89,6 +142,18 @@ export function SettingsModal({
             >
               Import UI profile
             </Button>
+            {defaultUiProfileAvailable ? (
+              <Button
+                size="xs"
+                variant="light"
+                color="blue"
+                leftSection={<IconRestore size={14} />}
+                loading={defaultUiProfileLoading}
+                onClick={openLoadDefaultsConfirm}
+              >
+                Load instance defaults
+              </Button>
+            ) : null}
             <Button
               size="xs"
               variant="light"
@@ -102,6 +167,67 @@ export function SettingsModal({
             </Button>
           </Group>
         </Group>
+
+        <Modal
+          opened={confirmDefaultsOpen}
+          onClose={() => setConfirmDefaultsOpen(false)}
+          title="Load instance default UI profile?"
+          centered
+          zIndex={500}
+          size="md"
+        >
+          <Stack gap="sm">
+            {confirmCustomized ? (
+              <>
+                <Text size="sm">
+                  This will <b>overwrite</b> your current command deck, plot
+                  workspaces, pinned commands, layout, and telemetry display
+                  state with the instance default. This cannot be undone.
+                </Text>
+                <Text size="sm" c="dimmed">
+                  You appear to have local customizations. Consider exporting
+                  your current profile first.
+                </Text>
+              </>
+            ) : (
+              <Text size="sm">
+                This will populate the command deck, plot workspaces, and
+                pinned commands with this instance's default UI profile.
+              </Text>
+            )}
+            <Group justify="flex-end" gap="xs">
+              <Button
+                size="xs"
+                variant="default"
+                onClick={() => setConfirmDefaultsOpen(false)}
+              >
+                Cancel
+              </Button>
+              {confirmCustomized ? (
+                <Button
+                  size="xs"
+                  variant="light"
+                  leftSection={<IconFileText size={14} />}
+                  onClick={() => {
+                    void handleExportThenLoadDefaults();
+                  }}
+                >
+                  Export first, then load
+                </Button>
+              ) : null}
+              <Button
+                size="xs"
+                color={confirmCustomized ? "red" : "blue"}
+                leftSection={<IconRestore size={14} />}
+                onClick={() => {
+                  void handleConfirmLoadDefaults();
+                }}
+              >
+                {confirmCustomized ? "Overwrite" : "Load defaults"}
+              </Button>
+            </Group>
+          </Stack>
+        </Modal>
 
         {error && (
           <Text size="sm" c="red">

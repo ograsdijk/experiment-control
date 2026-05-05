@@ -67,6 +67,7 @@ import {
   callDevice,
   buildWsUrl,
   cleanupInstanceOrphans,
+  fetchDefaultUiProfile,
   fetchLogTail,
   fetchCapabilities,
   fetchDevices,
@@ -671,6 +672,29 @@ export function App() {
       const next: Record<string, boolean> = {};
       for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
         if (typeof key === "string" && typeof value === "boolean") {
+          next[key] = value;
+        }
+      }
+      return next;
+    } catch {
+      return {};
+    }
+  });
+  const [commandDeckCollapsedByGroup, setCommandDeckCollapsedByGroup] = useState<
+    Record<string, boolean>
+  >(() => {
+    try {
+      const raw = localStorage.getItem("ecui.commandDeck.collapsedByGroup");
+      if (!raw) {
+        return {};
+      }
+      const parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed !== "object") {
+        return {};
+      }
+      const next: Record<string, boolean> = {};
+      for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
+        if (typeof value === "boolean") {
           next[key] = value;
         }
       }
@@ -1482,6 +1506,7 @@ export function App() {
         commands: {
           pinned_commands: { ...pinnedCommands },
           command_deck: [...commandDeck],
+          command_deck_collapsed_by_group: { ...commandDeckCollapsedByGroup },
         },
         analysis: {
           stream_workspaces: { ...streamWorkspaces },
@@ -1521,6 +1546,74 @@ export function App() {
     }
   };
 
+  const applyUiProfileRaw = async (
+    raw: unknown,
+    opts: { sourceLabel: string; syncSource: string },
+  ): Promise<void> => {
+    const { sourceLabel, syncSource } = opts;
+    const profile = normalizeUiProfile(raw, {
+      defaultNavWidth: DEFAULT_NAV_WIDTH,
+      navMin: NAV_MIN_WIDTH,
+      navMax: NAV_MAX_WIDTH,
+      normalizePlotState,
+      normalizeStreamWorkspaceRecord,
+    });
+    if (!profile) {
+      throw new Error("Invalid UI profile format.");
+    }
+    panelIdRef.current = profile.plotState.nextPanelId;
+    setNavWidth(profile.navWidth);
+    setDevicePanelCollapsed(profile.devicePanelCollapsed);
+    setDevicePanelTab(profile.devicePanelTab);
+    setPlotWorkspaceColumns(profile.plotWorkspaceColumns);
+    setPanels(profile.plotState.panels);
+    setActivePanelId(profile.plotState.activePanelId);
+    setDeviceOrder(profile.deviceOrder);
+    setTelemetryCollapsedByDevice(profile.telemetryCollapsedByDevice);
+    setPinnedCommands(profile.pinnedCommands);
+    setCommandDeck(profile.commandDeck);
+    setCommandDeckCollapsedByGroup(profile.commandDeckCollapsedByGroup);
+    {
+      const migratedFromPanels: Record<string, StreamAnalysisWorkspaceConfig> = {};
+      for (const panel of profile.plotState.panels) {
+        if (!isStreamScalarPanel(panel) && !isStreamBinStatsPanel(panel)) {
+          continue;
+        }
+        const workspaceId = String(panel.workspaceId ?? "").trim();
+        if (!workspaceId || migratedFromPanels[workspaceId]) {
+          continue;
+        }
+        migratedFromPanels[workspaceId] = workspaceFromLegacyPanel(panel);
+      }
+      const importedWorkspaces =
+        Object.keys(profile.streamWorkspaces).length > 0
+          ? profile.streamWorkspaces
+          : Object.keys(migratedFromPanels).length > 0
+          ? migratedFromPanels
+          : streamWorkspacesRef.current;
+      setStreamWorkspaces(importedWorkspaces);
+      streamWorkspacesRef.current = importedWorkspaces;
+      setStreamWorkspaceRevisions({});
+      streamWorkspaceRevisionsRef.current = {};
+      streamWorkspaceIdRef.current = nextWorkspaceCounter(importedWorkspaces);
+      const firstWorkspaceId = Object.keys(importedWorkspaces).sort()[0] ?? null;
+      setDaqWorkspaceId(firstWorkspaceId);
+      if (streamAnalysisReadyRef.current) {
+        for (const workspaceId of Object.keys(importedWorkspaces)) {
+          await syncStreamAnalysisWorkspace(workspaceId, syncSource);
+        }
+        await loadStreamAnalysisWorkspaces(syncSource, {
+          notifyOnError: false,
+        });
+      }
+    }
+    notifications.show({
+      color: "teal",
+      title: "UI profile loaded",
+      message: sourceLabel,
+    });
+  };
+
   const importUiProfile = async (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.currentTarget.files?.[0];
     event.currentTarget.value = "";
@@ -1530,65 +1623,9 @@ export function App() {
     try {
       const rawText = await file.text();
       const raw = JSON.parse(rawText);
-      const profile = normalizeUiProfile(raw, {
-        defaultNavWidth: DEFAULT_NAV_WIDTH,
-        navMin: NAV_MIN_WIDTH,
-        navMax: NAV_MAX_WIDTH,
-        normalizePlotState,
-        normalizeStreamWorkspaceRecord,
-      });
-      if (!profile) {
-        throw new Error("Invalid UI profile format.");
-      }
-      panelIdRef.current = profile.plotState.nextPanelId;
-      setNavWidth(profile.navWidth);
-      setDevicePanelCollapsed(profile.devicePanelCollapsed);
-      setDevicePanelTab(profile.devicePanelTab);
-      setPlotWorkspaceColumns(profile.plotWorkspaceColumns);
-      setPanels(profile.plotState.panels);
-      setActivePanelId(profile.plotState.activePanelId);
-      setDeviceOrder(profile.deviceOrder);
-      setTelemetryCollapsedByDevice(profile.telemetryCollapsedByDevice);
-      setPinnedCommands(profile.pinnedCommands);
-      setCommandDeck(profile.commandDeck);
-      {
-        const migratedFromPanels: Record<string, StreamAnalysisWorkspaceConfig> = {};
-        for (const panel of profile.plotState.panels) {
-          if (!isStreamScalarPanel(panel) && !isStreamBinStatsPanel(panel)) {
-            continue;
-          }
-          const workspaceId = String(panel.workspaceId ?? "").trim();
-          if (!workspaceId || migratedFromPanels[workspaceId]) {
-            continue;
-          }
-          migratedFromPanels[workspaceId] = workspaceFromLegacyPanel(panel);
-        }
-        const importedWorkspaces =
-          Object.keys(profile.streamWorkspaces).length > 0
-            ? profile.streamWorkspaces
-            : Object.keys(migratedFromPanels).length > 0
-            ? migratedFromPanels
-            : streamWorkspacesRef.current;
-        setStreamWorkspaces(importedWorkspaces);
-        streamWorkspacesRef.current = importedWorkspaces;
-        setStreamWorkspaceRevisions({});
-        streamWorkspaceRevisionsRef.current = {};
-        streamWorkspaceIdRef.current = nextWorkspaceCounter(importedWorkspaces);
-        const firstWorkspaceId = Object.keys(importedWorkspaces).sort()[0] ?? null;
-        setDaqWorkspaceId(firstWorkspaceId);
-        if (streamAnalysisReadyRef.current) {
-          for (const workspaceId of Object.keys(importedWorkspaces)) {
-            await syncStreamAnalysisWorkspace(workspaceId, "ui-profile-import");
-          }
-          await loadStreamAnalysisWorkspaces("ui-profile-import", {
-            notifyOnError: false,
-          });
-        }
-      }
-      notifications.show({
-        color: "teal",
-        title: "UI profile imported",
-        message: file.name,
+      await applyUiProfileRaw(raw, {
+        sourceLabel: file.name,
+        syncSource: "ui-profile-import",
       });
     } catch (error) {
       notifications.show({
@@ -1598,6 +1635,104 @@ export function App() {
       });
     }
   };
+
+  const [defaultProfileAvailable, setDefaultProfileAvailable] = useState(false);
+  const [defaultProfileLoading, setDefaultProfileLoading] = useState(false);
+  const defaultProfileCheckedRef = useRef(false);
+
+  const loadDefaultUiProfile = async (): Promise<boolean> => {
+    setDefaultProfileLoading(true);
+    try {
+      const result = await fetchDefaultUiProfile();
+      if (!result.ok) {
+        if (result.status === 404) {
+          setDefaultProfileAvailable(false);
+          notifications.show({
+            color: "yellow",
+            title: "No default profile",
+            message:
+              "This instance does not provide a default UI profile.",
+          });
+          return false;
+        }
+        notifications.show({
+          color: "red",
+          title: "Default profile load failed",
+          message: result.error,
+        });
+        return false;
+      }
+      await applyUiProfileRaw(result.raw, {
+        sourceLabel: "instance default",
+        syncSource: "ui-profile-default",
+      });
+      return true;
+    } catch (error) {
+      notifications.show({
+        color: "red",
+        title: "Default profile load failed",
+        message: error instanceof Error ? error.message : String(error),
+      });
+      return false;
+    } finally {
+      setDefaultProfileLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    if (defaultProfileCheckedRef.current) {
+      return;
+    }
+    defaultProfileCheckedRef.current = true;
+    let alive = true;
+    void (async () => {
+      const result = await fetchDefaultUiProfile();
+      if (!alive) {
+        return;
+      }
+      if (!result.ok) {
+        setDefaultProfileAvailable(false);
+        return;
+      }
+      setDefaultProfileAvailable(true);
+      const customizationKeys = [
+        "ecui.commandDeck",
+        "ecui.commandDeck.collapsedByGroup",
+        "ecui.plotState",
+        "ecui.pinnedCommands",
+        "ecui.streamWorkspaces",
+        "ecui.deviceOrder",
+        "ecui.telemetryCollapsedByDevice",
+      ];
+      const hasCustomization = customizationKeys.some((key) => {
+        const raw = localStorage.getItem(key);
+        if (raw === null) {
+          return false;
+        }
+        const trimmed = raw.trim();
+        if (!trimmed) {
+          return false;
+        }
+        if (trimmed === "{}" || trimmed === "[]") {
+          return false;
+        }
+        return true;
+      });
+      if (hasCustomization) {
+        return;
+      }
+      notifications.show({
+        color: "blue",
+        title: "Instance default UI profile available",
+        message:
+          "Open Settings → Load instance defaults to populate the command deck and plot workspaces.",
+        autoClose: 8000,
+      });
+    })();
+    return () => {
+      alive = false;
+    };
+  }, []);
 
   const appendLogEntries = (entries: LogEntry[]) => {
     if (entries.length === 0) {
@@ -1758,6 +1893,17 @@ export function App() {
       // ignore storage errors
     }
   }, [telemetryCollapsedByDevice]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(
+        "ecui.commandDeck.collapsedByGroup",
+        JSON.stringify(commandDeckCollapsedByGroup)
+      );
+    } catch {
+      // ignore storage errors
+    }
+  }, [commandDeckCollapsedByGroup]);
 
   useEffect(() => {
     setPinnedParamDrafts((prev) => {
@@ -3328,6 +3474,27 @@ export function App() {
     },
     []
   );
+
+  const anyDeviceTelemetryExpanded = useMemo(
+    () =>
+      orderedDevices.some(
+        (device) => !Boolean(telemetryCollapsedByDevice[device.device_id])
+      ),
+    [orderedDevices, telemetryCollapsedByDevice]
+  );
+
+  const handleToggleAllDeviceTelemetry = useCallback(() => {
+    setTelemetryCollapsedByDevice((prev) => {
+      const collapseAll = orderedDevices.some(
+        (device) => !Boolean(prev[device.device_id])
+      );
+      const next: Record<string, boolean> = { ...prev };
+      for (const device of orderedDevices) {
+        next[device.device_id] = collapseAll;
+      }
+      return next;
+    });
+  }, [orderedDevices]);
 
   const {
     commandOpen,
@@ -7247,6 +7414,21 @@ export function App() {
                     >
                       Connect all
                     </Button>
+                    {orderedDevices.length > 0 ? (
+                      <Button
+                        size="compact-xs"
+                        variant="subtle"
+                        color="gray"
+                        onClick={handleToggleAllDeviceTelemetry}
+                        title={
+                          anyDeviceTelemetryExpanded
+                            ? "Collapse telemetry on every device"
+                            : "Expand telemetry on every device"
+                        }
+                      >
+                        {anyDeviceTelemetryExpanded ? "Hide all" : "Show all"}
+                      </Button>
+                    ) : null}
                   </>
                 ) : null}
               </Group>
@@ -7522,6 +7704,8 @@ export function App() {
                   onUpdateTelemetryEntryDecimals={(entryId, decimals) =>
                     updateCommandDeckTelemetryEntry(entryId, { decimals })
                   }
+                  collapsedByGroup={commandDeckCollapsedByGroup}
+                  setCollapsedByGroup={setCommandDeckCollapsedByGroup}
                 />
               )}
             </ScrollArea>
@@ -8833,6 +9017,9 @@ export function App() {
         settingsFileInputRef={settingsFileInputRef}
         onImportUiProfile={importUiProfile}
         onExportUiProfile={exportUiProfile}
+        onLoadDefaultUiProfile={loadDefaultUiProfile}
+        defaultUiProfileAvailable={defaultProfileAvailable}
+        defaultUiProfileLoading={defaultProfileLoading}
         onReloadSettings={loadGatewayRuntimeSettings}
         settingsLoading={settingsLoading}
         settingsError={settingsError}

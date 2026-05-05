@@ -55,6 +55,9 @@ type Props = {
   settingsFileInputRef: ComponentProps<typeof SettingsModal>["settingsFileInputRef"];
   onImportUiProfile: () => Promise<unknown> | void;
   onExportUiProfile: () => Promise<unknown> | void;
+  onLoadDefaultUiProfile: () => Promise<boolean>;
+  defaultUiProfileAvailable: boolean;
+  defaultUiProfileLoading: boolean;
   onReloadSettings: () => Promise<unknown> | void;
   settingsLoading: boolean;
   settingsError: string | null;
@@ -118,6 +121,9 @@ export function AppModalsLayer({
   settingsFileInputRef,
   onImportUiProfile,
   onExportUiProfile,
+  onLoadDefaultUiProfile,
+  defaultUiProfileAvailable,
+  defaultUiProfileLoading,
   onReloadSettings,
   settingsLoading,
   settingsError,
@@ -241,6 +247,9 @@ export function AppModalsLayer({
         settingsFileInputRef={settingsFileInputRef}
         onImportUiProfile={onImportUiProfile}
         onExportUiProfile={onExportUiProfile}
+        onLoadDefaultUiProfile={onLoadDefaultUiProfile}
+        defaultUiProfileAvailable={defaultUiProfileAvailable}
+        defaultUiProfileLoading={defaultUiProfileLoading}
         onReload={onReloadSettings}
         loading={settingsLoading}
         error={settingsError}

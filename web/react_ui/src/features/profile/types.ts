@@ -20,6 +20,7 @@ export type UiProfileState = {
   telemetryCollapsedByDevice: Record<string, boolean>;
   pinnedCommands: PinnedCommandMap;
   commandDeck: CommandDeckEntry[];
+  commandDeckCollapsedByGroup: Record<string, boolean>;
   streamWorkspaces: Record<string, StreamAnalysisWorkspaceConfig>;
 };
 
@@ -44,6 +45,7 @@ export type UiProfileFile = {
   commands: {
     pinned_commands: PinnedCommandMap;
     command_deck?: CommandDeckEntry[];
+    command_deck_collapsed_by_group?: Record<string, boolean>;
   };
   analysis: {
     stream_workspaces: Record<string, StreamAnalysisWorkspaceConfig>;

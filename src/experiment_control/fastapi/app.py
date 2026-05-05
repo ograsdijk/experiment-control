@@ -562,6 +562,20 @@ def _resolve_ui_dist_path() -> Path | None:
     return path.resolve()
 
 
+def _resolve_default_profile_path() -> Path | None:
+    raw = os.environ.get("EXPERIMENT_CONTROL_DEFAULT_PROFILE", "").strip()
+    if not raw:
+        return None
+    path = Path(raw).expanduser().resolve()
+    if not path.exists() or not path.is_file():
+        sys.stderr.write(
+            f"[fastapi] default profile path does not exist: {str(path)!r}; "
+            "the /api/ui/default_profile endpoint will return 404.\n"
+        )
+        return None
+    return path
+
+
 app = FastAPI(title="Experiment Control Gateway", version="0.1")
 app.add_middleware(
     CORSMiddleware,
@@ -571,6 +585,7 @@ app.add_middleware(
 )
 
 _UI_DIST_PATH: Path | None = _resolve_ui_dist_path()
+_DEFAULT_PROFILE_PATH: Path | None = _resolve_default_profile_path()
 
 
 @app.on_event("startup")
@@ -632,6 +647,13 @@ async def _shutdown() -> None:
 @app.get("/api/health")
 async def health() -> dict[str, Any]:
     return {"ok": True}
+
+
+@app.get("/api/ui/default_profile")
+async def ui_default_profile() -> FileResponse:
+    if _DEFAULT_PROFILE_PATH is None:
+        raise HTTPException(status_code=404, detail="no default profile configured")
+    return FileResponse(_DEFAULT_PROFILE_PATH, media_type="application/json")
 
 
 @app.get("/api/settings")

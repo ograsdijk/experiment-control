@@ -1175,6 +1175,34 @@ export async function fetchLogTail(params: Record<string, unknown>) {
   });
 }
 
+export type DefaultProfileFetchResult =
+  | { ok: true; raw: unknown }
+  | { ok: false; status: number; error: string };
+
+export async function fetchDefaultUiProfile(): Promise<DefaultProfileFetchResult> {
+  try {
+    const resp = await fetch(`${API_BASE}/api/ui/default_profile`);
+    if (resp.status === 404) {
+      return { ok: false, status: 404, error: "no default profile" };
+    }
+    if (!resp.ok) {
+      return {
+        ok: false,
+        status: resp.status,
+        error: `server returned ${resp.status}`,
+      };
+    }
+    const raw = await resp.json();
+    return { ok: true, raw };
+  } catch (error) {
+    return {
+      ok: false,
+      status: 0,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
 export async function fetchGatewaySettings(): Promise<GatewaySettingsInfo | null> {
   const resp = await apiFetch<GatewaySettingsInfo>("/api/settings");
   if (!resp.ok || !resp.result) {
