@@ -1013,9 +1013,10 @@ export async function reloadStreamWorkspaceStore(path?: string | null) {
 }
 
 export async function fetchFollowerRules(
-  processId: string
+  processId: string,
+  namespace: "follower" | "step_guard" = "follower"
 ): Promise<FollowerRuleStatus[]> {
-  const resp = await callProcess(processId, "follower.rules", {});
+  const resp = await callProcess(processId, `${namespace}.rules`, {});
   if (!resp.ok || !resp.result || typeof resp.result !== "object") {
     return [];
   }
@@ -1031,11 +1032,12 @@ export async function fetchFollowerRules(
 export async function setFollowerRuleEnabled(
   processId: string,
   ruleId: string,
-  enabled: boolean
+  enabled: boolean,
+  namespace: "follower" | "step_guard" = "follower"
 ) {
   return callProcess(
     processId,
-    enabled ? "follower.enable_rule" : "follower.disable_rule",
+    enabled ? `${namespace}.enable_rule` : `${namespace}.disable_rule`,
     { rule_id: ruleId }
   );
 }

@@ -8,6 +8,7 @@ import {
   setInterlockRuleEnabled,
 } from "../../api";
 import {
+  followerRuleNamespace,
   interlockRuleKey,
   isProcessRpcStateAvailable,
   supportsProcessCapability,
@@ -150,11 +151,11 @@ export function useInterlocksController({
       }
       try {
         const caps = await ensureProcessCapabilitiesLoadedRef.current(processId);
-        const hasFollowerRules = supportsProcessCapability(caps, "follower.rules");
+        const followerNamespace = followerRuleNamespace(caps);
         const hasInterlockStatus = supportsProcessCapability(caps, "interlock.status");
 
-        if (hasFollowerRules) {
-          const rules = await fetchFollowerRules(processId);
+        if (followerNamespace !== null) {
+          const rules = await fetchFollowerRules(processId, followerNamespace);
           setFollowerRulesByProcessId((prev) => ({ ...prev, [processId]: rules }));
         } else {
           setFollowerRulesByProcessId((prev) => {
@@ -213,7 +214,7 @@ export function useInterlocksController({
       }
       const caps = await ensureProcessCapabilitiesLoadedRef.current(process.process_id);
       if (
-        supportsProcessCapability(caps, "follower.rules") ||
+        followerRuleNamespace(caps) !== null ||
         supportsProcessCapability(caps, "interlock.status")
       ) {
         discovered.push(process.process_id);
@@ -287,7 +288,16 @@ export function useInterlocksController({
       }
       setInterlockRuleBusyByKey((prev) => ({ ...prev, [key]: true }));
       try {
-        const resp = await setFollowerRuleEnabled(processId, ruleId, enabled);
+        const caps =
+          capabilitiesByProcessRef.current[processId] ??
+          (await ensureProcessCapabilitiesLoadedRef.current(processId));
+        const namespace = followerRuleNamespace(caps) ?? "follower";
+        const resp = await setFollowerRuleEnabled(
+          processId,
+          ruleId,
+          enabled,
+          namespace
+        );
         if (!resp.ok) {
           notifications.show({
             color: "red",
@@ -394,7 +404,7 @@ export function useInterlocksController({
           }
         }
         if (
-          supportsProcessCapability(effectiveCaps, "follower.rules") ||
+          followerRuleNamespace(effectiveCaps) !== null ||
           supportsProcessCapability(effectiveCaps, "interlock.status")
         ) {
           await refreshInterlockProcessStatus(processId, process);
@@ -416,7 +426,7 @@ export function useInterlocksController({
     for (const process of processes) {
       const caps = capabilitiesByProcess[process.process_id] ?? [];
       if (
-        supportsProcessCapability(caps, "follower.rules") ||
+        followerRuleNamespace(caps) !== null ||
         supportsProcessCapability(caps, "interlock.status")
       ) {
         byId.set(process.process_id, process);

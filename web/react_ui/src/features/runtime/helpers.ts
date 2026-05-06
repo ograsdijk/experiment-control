@@ -145,6 +145,18 @@ export function supportsProcessCapability(
   return capabilities.some((member) => member.name === name);
 }
 
+export function followerRuleNamespace(
+  capabilities: CapabilityMember[]
+): "step_guard" | "follower" | null {
+  if (supportsProcessCapability(capabilities, "step_guard.rules")) {
+    return "step_guard";
+  }
+  if (supportsProcessCapability(capabilities, "follower.rules")) {
+    return "follower";
+  }
+  return null;
+}
+
 export function formatFreqHz(value: number): string {
   if (!Number.isFinite(value)) {
     return "n/a";
