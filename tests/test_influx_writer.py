@@ -3,7 +3,10 @@ from __future__ import annotations
 import sys
 import unittest
 from collections import deque
+from contextlib import redirect_stderr
+from io import StringIO
 from pathlib import Path
+from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
@@ -20,6 +23,7 @@ from experiment_control.processes.influx_writer import (  # noqa: E402
 def _make_proc() -> InfluxWriterProcess:
     proc = InfluxWriterProcess.__new__(InfluxWriterProcess)
     proc._enabled = True  # noqa: SLF001
+    proc._process_id = "influx_writer"  # noqa: SLF001
     proc._disabled_devices = set()  # noqa: SLF001
     proc._remote_device_ids = set()  # noqa: SLF001
     proc._instance_id = "lab_a"  # noqa: SLF001
@@ -59,9 +63,24 @@ def _make_proc() -> InfluxWriterProcess:
     proc._write_errors = 0  # noqa: SLF001
     proc._batches_written = 0  # noqa: SLF001
     proc._last_error = None  # noqa: SLF001
+    proc._last_published_error_text = None  # noqa: SLF001
+    proc._pending_log_payloads = deque(maxlen=200)  # noqa: SLF001
     proc._last_flush_wall_s = None  # noqa: SLF001
     proc._last_flush_mono_s = None  # noqa: SLF001
     return proc
+
+
+class _FakeManager:
+    def __init__(self, responses: list[dict[str, Any] | None]) -> None:
+        self.responses = deque(responses)
+        self.calls: list[dict[str, Any]] = []
+
+    def call(self, payload: dict[str, Any], *, timeout_ms: int | None = None) -> dict[str, Any] | None:
+        _ = timeout_ms
+        self.calls.append(payload)
+        if self.responses:
+            return self.responses.popleft()
+        return {"ok": True}
 
 
 class InfluxWriterWideModeTests(unittest.TestCase):
@@ -281,6 +300,59 @@ class InfluxWriterWideModeTests(unittest.TestCase):
         self.assertEqual(first.get("measurement"), "hipace700")
         self.assertEqual(first.get("route_measurement"), None)
         self.assertEqual(first.get("route_device_type"), None)
+
+    def test_error_log_publish_failure_queues_retry_and_stderr_fallback(self) -> None:
+        proc = _make_proc()
+        proc._manager = _FakeManager([None])  # noqa: SLF001
+        proc._last_error = "write failed"  # noqa: SLF001
+
+        stderr = StringIO()
+        with redirect_stderr(stderr):
+            proc._maybe_publish_last_error()  # noqa: SLF001
+
+        self.assertIn("[influx_writer][error] write failed", stderr.getvalue())
+        self.assertEqual(proc._last_published_error_text, "write failed")  # noqa: SLF001
+        self.assertEqual(len(proc._pending_log_payloads), 1)  # noqa: SLF001
+        queued = proc._pending_log_payloads[0]  # noqa: SLF001
+        self.assertEqual(queued["severity"], "error")
+        self.assertEqual(queued["message"], "write failed")
+
+    def test_pending_error_log_is_retried_and_removed_after_success(self) -> None:
+        proc = _make_proc()
+        proc._manager = _FakeManager([None, {"ok": True}])  # noqa: SLF001
+        proc._last_error = "write failed"  # noqa: SLF001
+        with redirect_stderr(StringIO()):
+            proc._maybe_publish_last_error()  # noqa: SLF001
+
+        proc._flush_pending_logs()  # noqa: SLF001
+
+        self.assertEqual(len(proc._pending_log_payloads), 0)  # noqa: SLF001
+        self.assertEqual(len(proc._manager.calls), 2)  # noqa: SLF001
+
+    def test_same_last_error_is_not_queued_repeatedly(self) -> None:
+        proc = _make_proc()
+        proc._manager = _FakeManager([None, None])  # noqa: SLF001
+        proc._last_error = "write failed"  # noqa: SLF001
+
+        with redirect_stderr(StringIO()):
+            proc._maybe_publish_last_error()  # noqa: SLF001
+            proc._maybe_publish_last_error()  # noqa: SLF001
+
+        self.assertEqual(len(proc._pending_log_payloads), 1)  # noqa: SLF001
+        self.assertEqual(len(proc._manager.calls), 1)  # noqa: SLF001
+
+    def test_changed_last_error_queues_new_log(self) -> None:
+        proc = _make_proc()
+        proc._manager = _FakeManager([None, None])  # noqa: SLF001
+
+        with redirect_stderr(StringIO()):
+            proc._last_error = "first failure"  # noqa: SLF001
+            proc._maybe_publish_last_error()  # noqa: SLF001
+            proc._last_error = "second failure"  # noqa: SLF001
+            proc._maybe_publish_last_error()  # noqa: SLF001
+
+        messages = [item["message"] for item in proc._pending_log_payloads]  # noqa: SLF001
+        self.assertEqual(messages, ["first failure", "second failure"])
 
 
 if __name__ == "__main__":

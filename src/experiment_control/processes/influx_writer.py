@@ -1184,7 +1184,6 @@ class InfluxWriterProcess(ManagedProcessBase):
         normalized_severity = str(severity).strip().lower()
         if normalized_severity in {"error", "critical"}:
             self._emit_stderr_fallback(severity=severity, message=message)
-            return
         self._queue_log_payload(payload)
 
     def _try_publish_log_payload(self, payload: Json, *, timeout_ms: int = 120) -> bool:
@@ -1220,8 +1219,8 @@ class InfluxWriterProcess(ManagedProcessBase):
     def _maybe_publish_last_error(self) -> None:
         text = self._last_error
         if text and text != self._last_published_error_text:
-            self._last_published_error_text = text
             self._publish_log(severity="error", message=text)
+            self._last_published_error_text = text
         elif text is None:
             self._last_published_error_text = None
 

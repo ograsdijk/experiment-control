@@ -1365,6 +1365,74 @@ class Manager:
     def _drain_supervisor_logs(self, *, max_items: int = 250) -> None:
         shared_drain_supervisor_logs(self, max_items=max_items)
 
+    def _matching_supervisor_log_threads(
+        self,
+        *,
+        source_kind: str,
+        source_id: str,
+        pid: int | None,
+    ) -> list[threading.Thread]:
+        if pid is None:
+            return []
+        try:
+            pid_int = int(pid)
+        except Exception:
+            return []
+        target_kind = str(source_kind or "").strip()
+        target_id = str(source_id or "").strip()
+        out: list[threading.Thread] = []
+        for key, thread in list(self._supervisor_log_threads.items()):
+            try:
+                key_kind, key_id, key_pid, _stream = key
+            except Exception:
+                continue
+            if (
+                str(key_kind) == target_kind
+                and str(key_id) == target_id
+                and int(key_pid) == pid_int
+                and thread.is_alive()
+            ):
+                out.append(thread)
+        return out
+
+    def _drain_failure_event_supervisor_logs(
+        self,
+        *,
+        source_kind: str,
+        source_id: str,
+        pid: int | None,
+        wait_timeout_s: float = 0.05,
+    ) -> None:
+        self._drain_supervisor_logs(max_items=5000)
+        if pid is None:
+            self._flush_stale_supervisor_blocks(force=True)
+            return
+
+        deadline = time.monotonic() + max(0.0, float(wait_timeout_s))
+        while True:
+            threads = self._matching_supervisor_log_threads(
+                source_kind=source_kind,
+                source_id=source_id,
+                pid=pid,
+            )
+            if not threads:
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            join_timeout = min(0.01, remaining)
+            for thread in threads:
+                thread.join(timeout=join_timeout)
+            self._drain_supervisor_logs(max_items=5000)
+
+        self._drain_supervisor_logs(max_items=5000)
+        if not self._matching_supervisor_log_threads(
+            source_kind=source_kind,
+            source_id=source_id,
+            pid=pid,
+        ):
+            self._flush_stale_supervisor_blocks(force=True)
+
     def connect_device(self, device_id: str) -> Json:
         handle = self._require_running_driver(device_id)
         connect_resp = self._call_device_rpc(
@@ -2724,17 +2792,19 @@ class Manager:
             "ts": {"t_wall": time.time(), "t_mono": time.monotonic()},
         }
         if topic in FAILURE_PROCESS_TOPICS:
+            failure_pid = handle.last_failure_pid
             payload["error_kind"] = handle.last_error_kind
             payload["signal"] = handle.last_signal_name
             payload["restart_count"] = handle.restart_count
             payload["heartbeat_age_s"] = handle.last_heartbeat_age_s
             payload["liveness_age_s"] = handle.last_liveness_age_s
             payload["heartbeat_received"] = handle.last_heartbeat_received
-            payload["failure_pid"] = handle.last_failure_pid
+            payload["failure_pid"] = failure_pid
             payload["exit_code_hex"] = exit_code_hex(handle.last_exit_code)
             payload["exit_code_description"] = describe_exit_code(handle.last_exit_code)
             payload["tail_logs"] = self._failure_event_tail_logs(
-                process_id=handle.spec.process_id
+                process_id=handle.spec.process_id,
+                pid=failure_pid,
             )
         self._publish_manager_event(topic, payload)
 
@@ -2750,15 +2820,18 @@ class Manager:
             "ts": {"t_wall": time.time(), "t_mono": time.monotonic()},
         }
         if topic in FAILURE_DRIVER_TOPICS:
+            failure_pid = handle.driver_last_failure_pid
             payload["error_kind"] = handle.driver_last_error_kind
             payload["signal"] = handle.driver_last_signal_name
-            payload["failure_pid"] = handle.driver_last_failure_pid
+            payload["failure_pid"] = failure_pid
             payload["exit_code_hex"] = exit_code_hex(handle.driver_last_exit_code)
             payload["exit_code_description"] = describe_exit_code(
                 handle.driver_last_exit_code
             )
             payload["tail_logs"] = self._failure_event_tail_logs(
-                source_id=handle.spec.device_id, source_kind="driver"
+                source_id=handle.spec.device_id,
+                source_kind="driver",
+                pid=failure_pid,
             )
         self._publish_manager_event(topic, payload)
 
@@ -2768,12 +2841,19 @@ class Manager:
         process_id: str | None = None,
         source_id: str | None = None,
         source_kind: str = "process",
+        pid: int | None = None,
         limit: int = 20,
     ) -> list[dict[str, Any]]:
         try:
+            resolved_source_id = source_id if source_id is not None else (process_id or "")
+            self._drain_failure_event_supervisor_logs(
+                source_kind=source_kind,
+                source_id=resolved_source_id,
+                pid=pid,
+            )
             return shared_recent_source_logs_structured(
                 self,
-                source_id=source_id if source_id is not None else (process_id or ""),
+                source_id=resolved_source_id,
                 source_kind=source_kind,
                 limit=limit,
             )
