@@ -1,4 +1,5 @@
 import {
+  Box,
   Button,
   Group,
   Modal,
@@ -11,6 +12,8 @@ import {
 } from "@mantine/core";
 import { IconPlaylistAdd, IconStar, IconStarFilled } from "@tabler/icons-react";
 import type { ReactNode } from "react";
+import type { ApiResponse } from "../api";
+import { JsonPreview } from "./JsonPreview";
 import { ParamInput } from "./ParamInput";
 import type { CapabilityMember } from "../types";
 
@@ -32,6 +35,8 @@ type Props = {
   onParamValueChange: (name: string, value: string) => void;
   commandParams: string;
   onCommandParamsChange: (value: string) => void;
+  commandResponse: ApiResponse<unknown> | null;
+  colorScheme: "light" | "dark";
   isPinned: boolean;
   pinDisabled: boolean;
   onTogglePin: () => void;
@@ -56,6 +61,8 @@ export function DeviceCommandModal({
   onParamValueChange,
   commandParams,
   onCommandParamsChange,
+  commandResponse,
+  colorScheme,
   isPinned,
   pinDisabled,
   onTogglePin,
@@ -144,6 +151,24 @@ export function DeviceCommandModal({
           </Button>
           <Button onClick={onExecute}>Execute</Button>
         </Group>
+        {commandResponse !== null && (
+          <Box
+            style={{
+              border: "1px solid var(--mantine-color-default-border)",
+              borderRadius: "var(--mantine-radius-sm)",
+              padding: "0.75rem",
+              backgroundColor:
+                colorScheme === "dark"
+                  ? "var(--mantine-color-dark-7)"
+                  : "var(--mantine-color-gray-0)",
+            }}
+          >
+            <JsonPreview
+              text={JSON.stringify(commandResponse, null, 2)}
+              colorScheme={colorScheme}
+            />
+          </Box>
+        )}
       </Stack>
     </Modal>
   );

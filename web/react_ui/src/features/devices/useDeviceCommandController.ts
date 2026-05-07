@@ -53,6 +53,9 @@ export function useDeviceCommandController({
     Record<string, string>
   >({});
   const [showAdvancedParams, setShowAdvancedParams] = useState(false);
+  const [commandResponse, setCommandResponse] = useState<ApiResponse<unknown> | null>(
+    null
+  );
 
   const capabilitiesForActive = commandDevice
     ? capabilitiesByDevice[commandDevice] ?? []
@@ -123,6 +126,7 @@ export function useDeviceCommandController({
     setCommandParams("{}");
     setCommandParamValues({});
     setShowAdvancedParams(false);
+    setCommandResponse(null);
     if (action) {
       const pinned = (pinnedCommands[deviceId] ?? []).find(
         (entry) => entry.action === action
@@ -149,6 +153,7 @@ export function useDeviceCommandController({
   const handleActionChange = (value: string | null) => {
     const nextAction = value ?? "";
     setCommandAction(nextAction);
+    setCommandResponse(null);
     if (commandDevice && nextAction) {
       const nextPinned = (pinnedCommands[commandDevice] ?? []).find(
         (entry) => entry.action === nextAction
@@ -233,6 +238,7 @@ export function useDeviceCommandController({
       mapped.params,
       "device-command-modal"
     );
+    setCommandResponse(resp);
     if (resp.ok) {
       notifications.show({
         color: "teal",
@@ -351,6 +357,7 @@ export function useDeviceCommandController({
     setCommandParamValues,
     showAdvancedParams,
     setShowAdvancedParams,
+    commandResponse,
     capabilitiesForActive,
     activeMember,
     activeParams,
