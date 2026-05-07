@@ -282,6 +282,7 @@ export type StateMachineTransition = {
 
 export type StateMachineStatus = {
   state: string;
+  active_states?: string[];
   state_since?: { t_wall?: number; t_mono?: number } | null;
   state_age_s?: number | null;
   last_error?: string | null;

@@ -379,12 +379,16 @@ class StateMachineProcessBase(ManagedProcessBase):
     def _status_detail_payload(self) -> Json:
         return {}
 
+    def _active_state_ids(self) -> list[str]:
+        return [self._state] if self._state else []
+
     def _status_payload(self) -> Json:
         detail = self._status_detail_payload()
         if not isinstance(detail, dict):
             detail = {}
         return {
             "state": self._state,
+            "active_states": self._active_state_ids(),
             "state_since": {"t_wall": self._state_since_wall, "t_mono": self._state_since_mono},
             "state_age_s": max(0.0, time.monotonic() - self._state_since_mono),
             "last_error": self._last_error,

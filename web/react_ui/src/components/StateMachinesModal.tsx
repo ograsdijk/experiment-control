@@ -457,7 +457,7 @@ type GraphCanvasProps = {
     width: number;
     height: number;
   };
-  activeState: string;
+  activeStateIds: string[];
   focusCurrentState: boolean;
   highlightedAction: string | null;
   colorScheme: "light" | "dark";
@@ -468,7 +468,7 @@ type GraphCanvasProps = {
 
 function GraphCanvas({
   graph,
-  activeState,
+  activeStateIds,
   focusCurrentState,
   highlightedAction,
   colorScheme,
@@ -484,7 +484,8 @@ function GraphCanvas({
     }
     return map;
   }, [graph.nodes]);
-  const focusActive = focusCurrentState && activeState.length > 0;
+  const activeStateIdSet = useMemo(() => new Set(activeStateIds), [activeStateIds]);
+  const focusActive = focusCurrentState && activeStateIdSet.size > 0;
 
   const focusedEdgeIds = useMemo(() => {
     if (!focusActive) {
@@ -492,12 +493,12 @@ function GraphCanvas({
     }
     const ids = new Set<string>();
     for (const edge of graph.edges) {
-      if (edge.from === activeState || edge.to === activeState) {
+      if (activeStateIdSet.has(edge.from) || activeStateIdSet.has(edge.to)) {
         ids.add(edge.id);
       }
     }
     return ids;
-  }, [activeState, focusActive, graph.edges]);
+  }, [activeStateIdSet, focusActive, graph.edges]);
 
   const highlightedActionEdgeIds = useMemo(() => {
     const action = String(highlightedAction ?? "").trim();
@@ -526,8 +527,8 @@ function GraphCanvas({
 
   const emphasizedNodeIds = useMemo(() => {
     const ids = new Set<string>();
-    if (activeState) {
-      ids.add(activeState);
+    for (const state of activeStateIdSet) {
+      ids.add(state);
     }
     for (const edge of graph.edges) {
       if (emphasizedEdgeIds.has(edge.id)) {
@@ -536,7 +537,7 @@ function GraphCanvas({
       }
     }
     return ids;
-  }, [activeState, emphasizedEdgeIds, graph.edges]);
+  }, [activeStateIdSet, emphasizedEdgeIds, graph.edges]);
 
   const scaledWidth = Math.max(1, Math.round(graph.width * zoom));
   const scaledHeight = Math.max(1, Math.round(graph.height * zoom));
@@ -644,7 +645,7 @@ function GraphCanvas({
           );
         })}
         {graph.nodes.map((node) => {
-          const active = node.id === activeState;
+          const active = activeStateIdSet.has(node.id);
           const emphasized = emphasizedNodeIds.has(node.id);
           return (
             <g key={node.id} opacity={emphasized ? 1 : 0.28}>
@@ -761,6 +762,14 @@ export function StateMachinesModal({
 
   const graph = useMemo(() => (selectedRow ? buildGraphLayout(selectedRow) : null), [selectedRow]);
   const activeState = String(selectedRow?.status?.state ?? "").trim();
+  const activeStateIds = useMemo(() => {
+    const raw = selectedRow?.status?.active_states ?? [];
+    const ids = raw.map((state) => String(state ?? "").trim()).filter(Boolean);
+    if (ids.length === 0 && activeState) {
+      ids.push(activeState);
+    }
+    return [...new Set(ids)];
+  }, [activeState, selectedRow?.status?.active_states]);
   const highlightedAction = highlightSelectedActionPath
     ? String(selectedActionName ?? "").trim() || null
     : null;
@@ -906,7 +915,7 @@ export function StateMachinesModal({
                 ) : (
                   <GraphCanvas
                     graph={graph}
-                    activeState={activeState}
+                    activeStateIds={activeStateIds}
                     focusCurrentState={focusCurrentState}
                     highlightedAction={highlightedAction}
                     colorScheme={colorScheme}
@@ -992,7 +1001,7 @@ export function StateMachinesModal({
         ) : (
           <GraphCanvas
             graph={graph}
-            activeState={activeState}
+            activeStateIds={activeStateIds}
             focusCurrentState={focusCurrentState}
             highlightedAction={highlightedAction}
             colorScheme={colorScheme}

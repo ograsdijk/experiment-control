@@ -442,11 +442,18 @@ function normalizeStateMachineStatus(raw: unknown): StateMachineStatus | null {
   const allowedNextStates = allowedRaw
     .map((item) => String(item ?? "").trim())
     .filter((item) => item.length > 0);
+  const activeStatesRaw = Array.isArray(obj.active_states)
+    ? obj.active_states
+    : [];
+  const activeStates = activeStatesRaw
+    .map((item) => String(item ?? "").trim())
+    .filter((item) => item.length > 0);
   const lastTransitionObj = asOptionalRecord(obj.last_transition);
   const stateAgeRaw = Number(obj.state_age_s);
   const statusAgeRaw = Number(obj.status_age_s);
   return {
     state,
+    active_states: activeStates.length > 0 ? activeStates : [state],
     state_since: normalizeTimestamp(obj.state_since),
     state_age_s: Number.isFinite(stateAgeRaw) ? stateAgeRaw : null,
     last_error: asString(obj.last_error, "") || null,

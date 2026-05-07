@@ -183,6 +183,23 @@ class StateMachineBaseTests(unittest.TestCase):
         finally:
             proc.close()
 
+    def test_base_rpc_status_reports_active_states(self) -> None:
+        proc = _DummyStateMachine()
+        try:
+            req = {
+                "request_id": "r_status",
+                "type": "dummy.status",
+            }
+            resp = proc._handle_rpc(req)
+            self.assertTrue(resp.get("ok"))
+            result = resp.get("result")
+            self.assertIsInstance(result, dict)
+            assert isinstance(result, dict)
+            self.assertEqual(result.get("state"), "IDLE")
+            self.assertEqual(result.get("active_states"), ["IDLE"])
+        finally:
+            proc.close()
+
     def test_base_rpc_graph_payload(self) -> None:
         proc = _DummyStateMachine()
         try:
