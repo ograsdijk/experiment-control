@@ -36,6 +36,7 @@ To serve the React UI from FastAPI:
 
 - `EXPERIMENT_CONTROL_SERVE_UI=1`
 - `EXPERIMENT_CONTROL_UI_DIST=<path to web/react_ui/dist>` (optional; defaults to repo `web/react_ui/dist`)
+- `EXPERIMENT_CONTROL_EXTRA_UI_JSON=<json list>` (optional extra instance UIs served at `/instance-ui/{slug}/`)
 
 Manager error sink env knobs:
 

@@ -49,3 +49,5 @@ npm run preview
 - REST calls go to `/api/*` on the gateway.
 - Telemetry uses the WebSocket `/ws/telemetry`.
 - The UI maintains its own ring buffers; it does not persist history.
+- Extra instance UIs discovered from `/api/ui/extra` are linked from the header
+  and are served by FastAPI under `/instance-ui/{slug}/`.

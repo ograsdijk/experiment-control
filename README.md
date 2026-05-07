@@ -148,6 +148,9 @@ FastAPI serves UI only when `EXPERIMENT_CONTROL_SERVE_UI=1`.
 
 - Built-in packaged UI (default): do not set `EXPERIMENT_CONTROL_UI_DIST`.
 - Custom UI build: set `EXPERIMENT_CONTROL_UI_DIST` to your own dist folder.
+- Extra instance UIs: set `EXPERIMENT_CONTROL_EXTRA_UI_JSON` to a JSON list of
+  `{ "slug": "...", "label": "...", "dist": "..." }` entries. Each `dist`
+  must contain `index.html` and is served at `/instance-ui/{slug}/`.
 
 Examples:
 
@@ -159,7 +162,14 @@ Remove-Item Env:EXPERIMENT_CONTROL_UI_DIST -ErrorAction SilentlyContinue
 # Custom UI dist
 $env:EXPERIMENT_CONTROL_SERVE_UI = "1"
 $env:EXPERIMENT_CONTROL_UI_DIST = "C:\path\to\my-ui\dist"
+
+# Extra instance UI alongside the default UI
+$env:EXPERIMENT_CONTROL_SERVE_UI = "1"
+$env:EXPERIMENT_CONTROL_EXTRA_UI_JSON = '[{"slug":"rc-microwave-control","label":"RC Microwave Control","dist":"C:\path\to\rc-ui\dist"}]'
 ```
+
+`GET /api/ui/extra` returns the configured extra UI links. The default React UI
+shows those links in its header when any are configured.
 
 ## UI Profiles (Web UI)
 

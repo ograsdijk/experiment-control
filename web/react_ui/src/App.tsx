@@ -71,6 +71,7 @@ import {
   fetchLogTail,
   fetchCapabilities,
   fetchDevices,
+  fetchExtraUis,
   fetchGatewaySettings,
   fetchInstanceRuntimeStatus,
   fetchRawStreamSnapshot,
@@ -89,6 +90,7 @@ import {
   validateStreamWorkspace,
   type GatewaySettingsInfo,
   type InstanceRuntimeStatus,
+  type ExtraUiInfo,
 } from "./api";
 import { AppModalsLayer } from "./components/AppModalsLayer";
 import { CommandDeckPanel } from "./components/CommandDeckPanel";
@@ -620,6 +622,7 @@ export function App() {
   const [settingsError, setSettingsError] = useState<string | null>(null);
   const [gatewaySettings, setGatewaySettings] =
     useState<GatewaySettingsInfo | null>(null);
+  const [extraUis, setExtraUis] = useState<ExtraUiInfo[]>([]);
   const [instanceRuntimeStatus, setInstanceRuntimeStatus] =
     useState<InstanceRuntimeStatus | null>(null);
   const [instanceRuntimeLoading, setInstanceRuntimeLoading] = useState(false);
@@ -3055,11 +3058,15 @@ export function App() {
     let cancelled = false;
     const bootstrapSettings = async () => {
       try {
-        const next = await fetchGatewaySettings();
+        const [next, nextExtraUis] = await Promise.all([
+          fetchGatewaySettings(),
+          fetchExtraUis(),
+        ]);
         if (cancelled || next === null) {
           return;
         }
         setGatewaySettings(next);
+        setExtraUis(nextExtraUis);
       } catch {
         return;
       }
@@ -7287,6 +7294,7 @@ export function App() {
           setLogsUnreadError(false);
           setLogsOpen(true);
         }}
+        extraUis={extraUis}
         onOpenSettings={() => setSettingsOpen(true)}
         onRefreshStatus={async () => {
           const [, nextProcesses] = await Promise.all([

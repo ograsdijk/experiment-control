@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
+from dataclasses import dataclass
+import json
 import os
+import re
 import sys
 import time
 import uuid
@@ -12,7 +15,7 @@ from urllib.parse import SplitResult, urlsplit, urlunsplit
 
 import numpy as np
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -41,6 +44,20 @@ from ..utils.trace_processing import (
     parse_trace_rolling_window as _parse_trace_rolling_window,
     select_trace_from_array as _select_trace_from_array,
 )
+
+
+_EXTRA_UI_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
+
+
+@dataclass(frozen=True)
+class ExtraUiSpec:
+    slug: str
+    label: str
+    dist: Path
+
+    @property
+    def href(self) -> str:
+        return f"/instance-ui/{self.slug}/"
 
 
 class DeviceCommandRequest(BaseModel):
@@ -576,6 +593,63 @@ def _resolve_default_profile_path() -> Path | None:
     return path
 
 
+def _resolve_extra_ui_specs() -> list[ExtraUiSpec]:
+    if not _env_bool("EXPERIMENT_CONTROL_SERVE_UI", default=False):
+        return []
+    raw = os.environ.get("EXPERIMENT_CONTROL_EXTRA_UI_JSON", "").strip()
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+    except Exception as e:
+        sys.stderr.write(
+            f"[fastapi] ignoring invalid EXPERIMENT_CONTROL_EXTRA_UI_JSON: {e}\n"
+        )
+        return []
+    if not isinstance(parsed, list):
+        sys.stderr.write(
+            "[fastapi] ignoring EXPERIMENT_CONTROL_EXTRA_UI_JSON: expected a list.\n"
+        )
+        return []
+
+    specs: list[ExtraUiSpec] = []
+    seen_slugs: set[str] = set()
+    for idx, item in enumerate(parsed):
+        if not isinstance(item, dict):
+            sys.stderr.write(f"[fastapi] ignoring extra UI #{idx}: expected object.\n")
+            continue
+        slug = str(item.get("slug", "") or "").strip()
+        label = str(item.get("label", "") or "").strip()
+        dist_raw = str(item.get("dist", "") or "").strip()
+        if not slug or not _EXTRA_UI_SLUG_RE.fullmatch(slug):
+            sys.stderr.write(
+                f"[fastapi] ignoring extra UI #{idx}: invalid slug {slug!r}.\n"
+            )
+            continue
+        if slug in seen_slugs:
+            sys.stderr.write(
+                f"[fastapi] ignoring extra UI #{idx}: duplicate slug {slug!r}.\n"
+            )
+            continue
+        if not label:
+            label = slug.replace("-", " ").title()
+        if not dist_raw:
+            sys.stderr.write(
+                f"[fastapi] ignoring extra UI {slug!r}: missing dist path.\n"
+            )
+            continue
+        dist = Path(dist_raw).expanduser().resolve()
+        if not dist.exists() or not (dist / "index.html").is_file():
+            sys.stderr.write(
+                f"[fastapi] ignoring extra UI {slug!r}: build not found at "
+                f"{str(dist)!r}.\n"
+            )
+            continue
+        specs.append(ExtraUiSpec(slug=slug, label=label, dist=dist))
+        seen_slugs.add(slug)
+    return specs
+
+
 app = FastAPI(title="Experiment Control Gateway", version="0.1")
 app.add_middleware(
     CORSMiddleware,
@@ -586,6 +660,10 @@ app.add_middleware(
 
 _UI_DIST_PATH: Path | None = _resolve_ui_dist_path()
 _DEFAULT_PROFILE_PATH: Path | None = _resolve_default_profile_path()
+_EXTRA_UI_SPECS: list[ExtraUiSpec] = _resolve_extra_ui_specs()
+_EXTRA_UI_BY_SLUG: dict[str, ExtraUiSpec] = {
+    spec.slug: spec for spec in _EXTRA_UI_SPECS
+}
 
 
 @app.on_event("startup")
@@ -654,6 +732,19 @@ async def ui_default_profile() -> FileResponse:
     if _DEFAULT_PROFILE_PATH is None:
         raise HTTPException(status_code=404, detail="no default profile configured")
     return FileResponse(_DEFAULT_PROFILE_PATH, media_type="application/json")
+
+
+@app.get("/api/ui/extra")
+async def ui_extra() -> dict[str, Any]:
+    return {
+        "ok": True,
+        "result": {
+            "items": [
+                {"slug": spec.slug, "label": spec.label, "href": spec.href}
+                for spec in _EXTRA_UI_SPECS
+            ]
+        },
+    }
 
 
 @app.get("/api/settings")
@@ -1883,6 +1974,33 @@ async def ws_stream_workspace(ws: WebSocket, workspace_id: str) -> None:
         for key in list(state.trace_readers.keys()):
             _workspace_close_trace_reader(state, key)
         app.state.stream_analysis_hub.unsubscribe(q)
+
+
+if _EXTRA_UI_SPECS:
+
+    @app.get("/instance-ui/{slug}", include_in_schema=False)
+    async def extra_ui_index_redirect(slug: str) -> RedirectResponse:
+        spec = _EXTRA_UI_BY_SLUG.get(slug)
+        if spec is None:
+            raise HTTPException(status_code=404, detail="not found")
+        return RedirectResponse(url=spec.href)
+
+    @app.get("/instance-ui/{slug}/{full_path:path}", include_in_schema=False)
+    async def extra_ui_spa_fallback(slug: str, full_path: str) -> FileResponse:
+        spec = _EXTRA_UI_BY_SLUG.get(slug)
+        if spec is None:
+            raise HTTPException(status_code=404, detail="not found")
+        norm = full_path.strip("/")
+        if not norm:
+            return FileResponse(spec.dist / "index.html")
+        candidate = (spec.dist / norm).resolve()
+        try:
+            candidate.relative_to(spec.dist)
+        except Exception as e:
+            raise HTTPException(status_code=404, detail="not found") from e
+        if candidate.is_file():
+            return FileResponse(candidate)
+        return FileResponse(spec.dist / "index.html")
 
 
 if _UI_DIST_PATH is not None:

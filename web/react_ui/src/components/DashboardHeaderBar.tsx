@@ -5,6 +5,7 @@ import {
   Button,
   Divider,
   Group,
+  Menu,
   Popover,
   SegmentedControl,
   Stack,
@@ -16,12 +17,14 @@ import {
   IconCpu,
   IconDatabase,
   IconFileText,
+  IconExternalLink,
   IconPencil,
   IconRefresh,
   IconSettings,
   IconShieldCheck,
   IconTerminal2,
 } from "@tabler/icons-react";
+import type { ExtraUiInfo } from "../api";
 import { useEffect, useMemo, useState, type CSSProperties, type ReactNode } from "react";
 
 type InstanceRuntimeStatus = {
@@ -184,6 +187,7 @@ type Props = {
   commandHistoryCount: number;
   logsUnreadError: boolean;
   onOpenLogs: () => void;
+  extraUis: ExtraUiInfo[];
   onOpenSettings: () => void;
   onRefreshStatus: () => Promise<unknown> | void;
   colorScheme: "light" | "dark" | "auto";
@@ -250,6 +254,7 @@ export function DashboardHeaderBar({
   commandHistoryCount,
   logsUnreadError,
   onOpenLogs,
+  extraUis,
   onOpenSettings,
   onRefreshStatus,
   colorScheme,
@@ -745,6 +750,49 @@ export function DashboardHeaderBar({
           >
             Logs
           </Button>
+          {extraUis.length === 1 ? (
+            <Button
+              component="a"
+              href={extraUis[0].href}
+              target="_blank"
+              rel="noreferrer"
+              size="xs"
+              variant="light"
+              color="indigo"
+              leftSection={<IconExternalLink size={14} />}
+              title={`Open ${extraUis[0].label}`}
+            >
+              {extraUis[0].label}
+            </Button>
+          ) : extraUis.length > 1 ? (
+            <Menu shadow="md" width={220} position="bottom-end">
+              <Menu.Target>
+                <Button
+                  size="xs"
+                  variant="light"
+                  color="indigo"
+                  leftSection={<IconExternalLink size={14} />}
+                  rightSection={<IconChevronDown size={12} />}
+                >
+                  Instance UI
+                </Button>
+              </Menu.Target>
+              <Menu.Dropdown>
+                {extraUis.map((item) => (
+                  <Menu.Item
+                    key={item.slug}
+                    component="a"
+                    href={item.href}
+                    target="_blank"
+                    rel="noreferrer"
+                    leftSection={<IconExternalLink size={14} />}
+                  >
+                    {item.label}
+                  </Menu.Item>
+                ))}
+              </Menu.Dropdown>
+            </Menu>
+          ) : null}
           <Button
             size="xs"
             variant="light"

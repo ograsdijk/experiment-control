@@ -1188,6 +1188,12 @@ export type DefaultProfileFetchResult =
   | { ok: true; raw: unknown }
   | { ok: false; status: number; error: string };
 
+export type ExtraUiInfo = {
+  slug: string;
+  label: string;
+  href: string;
+};
+
 export async function fetchDefaultUiProfile(): Promise<DefaultProfileFetchResult> {
   try {
     const resp = await fetch(`${API_BASE}/api/ui/default_profile`);
@@ -1210,6 +1216,21 @@ export async function fetchDefaultUiProfile(): Promise<DefaultProfileFetchResult
       error: error instanceof Error ? error.message : String(error),
     };
   }
+}
+
+export async function fetchExtraUis(): Promise<ExtraUiInfo[]> {
+  const resp = await apiFetch<{ items?: ExtraUiInfo[] }>("/api/ui/extra");
+  if (!resp.ok || !resp.result || !Array.isArray(resp.result.items)) {
+    return [];
+  }
+  return resp.result.items
+    .map((item) => {
+      const slug = typeof item.slug === "string" ? item.slug.trim() : "";
+      const label = typeof item.label === "string" ? item.label.trim() : "";
+      const href = typeof item.href === "string" ? item.href.trim() : "";
+      return slug && href ? { slug, label: label || slug, href } : null;
+    })
+    .filter((item): item is ExtraUiInfo => item !== null);
 }
 
 export async function fetchGatewaySettings(): Promise<GatewaySettingsInfo | null> {
