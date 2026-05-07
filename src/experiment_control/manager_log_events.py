@@ -168,6 +168,49 @@ def _command_failure_message(payload: Json) -> str:
     return f"Command failed: {target}"
 
 
+def _last_tail_message(payload: Json, key: str) -> str:
+    tail = payload.get(key)
+    if not isinstance(tail, list) or not tail:
+        return ""
+    last = tail[-1]
+    if not isinstance(last, dict):
+        return ""
+    return str(last.get("message", "") or "").strip()
+
+
+def _heartbeat_detail(payload: Json) -> str:
+    hb = payload.get("last_heartbeat_payload")
+    if not isinstance(hb, dict):
+        return ""
+    phase = str(hb.get("phase", "") or "").strip()
+    detail = str(hb.get("detail", "") or "").strip()
+    if phase and detail:
+        return f"last heartbeat phase={phase}: {detail}"
+    if phase:
+        return f"last heartbeat phase={phase}"
+    if detail:
+        return f"last heartbeat detail={detail}"
+    return ""
+
+
+def _failure_message(topic: str, payload: Json) -> str:
+    process_id = payload.get("process_id")
+    device_id = payload.get("device_id")
+    target_kind = "Process" if process_id is not None else "Driver"
+    target_id = str(process_id if process_id is not None else device_id or "unknown")
+    error_text = str(payload.get("error") or payload.get("message") or topic)
+    parts = [f"{target_kind} {target_id} failed: {error_text}"]
+    stderr = _last_tail_message(payload, "tail_stderr")
+    if stderr:
+        parts.append(f"last stderr: {stderr}")
+    elif supervisor := _last_tail_message(payload, "tail_supervisor_logs"):
+        parts.append(f"last log: {supervisor}")
+    heartbeat = _heartbeat_detail(payload)
+    if heartbeat:
+        parts.append(heartbeat)
+    return "; ".join(parts)
+
+
 def maybe_publish_log_event(manager: Any, topic: str, payload: Json) -> None:
     severity = _event_log_severity(topic, payload)
     if severity is None:
@@ -176,6 +219,8 @@ def maybe_publish_log_event(manager: Any, topic: str, payload: Json) -> None:
     message = payload.get("error") or payload.get("message") or ""
     if topic == "manager.command":
         message = _command_failure_message(payload)
+    elif topic.endswith("failed") or topic.endswith("crashloop") or "kill_timeout" in topic:
+        message = _failure_message(topic, payload)
     manager._emit_log(
         severity=severity,
         topic=topic,

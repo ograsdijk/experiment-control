@@ -58,6 +58,27 @@ class ManagerLogEventsTests(unittest.TestCase):
         )
         self.assertEqual(severity, "warning")
 
+    def test_process_failure_log_message_includes_stderr_and_heartbeat(self) -> None:
+        manager = mock.Mock()
+        manager_log_events.maybe_publish_log_event(
+            manager,
+            "manager.process.failed",
+            {
+                "process_id": "influx_writer",
+                "error": "heartbeat stale (4.83s > 3.00s)",
+                "tail_stderr": [{"message": "Traceback: database write hung"}],
+                "last_heartbeat_payload": {"phase": "write_batch", "detail": "vacuum bucket"},
+            },
+        )
+
+        call = manager._emit_log.call_args.kwargs
+        self.assertEqual(call["severity"], "error")
+        self.assertEqual(call["source_kind"], "process")
+        self.assertEqual(call["source_id"], "influx_writer")
+        self.assertIn("heartbeat stale", call["message"])
+        self.assertIn("Traceback: database write hung", call["message"])
+        self.assertIn("write_batch", call["message"])
+
     def test_watchdog_trigger_emits_manager_log_entry(self) -> None:
         manager = mock.Mock()
         manager_log_events.maybe_publish_log_event(

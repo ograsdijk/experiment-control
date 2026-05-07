@@ -688,6 +688,7 @@ def start_process_handle(
     handle.last_start_t_mono = time.monotonic()
     handle.last_hb_t_wall = None
     handle.last_hb_t_mono = None
+    handle.last_heartbeat_payload = None
     handle.last_exit_code = None
     handle.stop_requested_t_mono = None
     handle.next_restart_t_mono = None
@@ -826,6 +827,10 @@ def process_snapshot(manager: Any, handle: Any) -> Json:
         "last_heartbeat_age_s": handle.last_heartbeat_age_s,
         "last_liveness_age_s": handle.last_liveness_age_s,
         "last_heartbeat_received": handle.last_heartbeat_received,
+        "last_heartbeat_payload": handle.last_heartbeat_payload,
+        "tail_stdout": list(handle.supervisor_stdout_tail),
+        "tail_stderr": list(handle.supervisor_stderr_tail),
+        "tail_supervisor_logs": list(handle.supervisor_log_tail),
         "heartbeat_endpoint": handle.heartbeat_endpoint,
         "process_data_endpoint": handle.process_data_endpoint,
         "rpc_endpoint": handle.rpc_endpoint,

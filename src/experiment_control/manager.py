@@ -652,6 +652,9 @@ class DeviceHandle:
     driver_next_restart_t_mono: float | None = None
     connect_check_last: dict[str, Any] | None = None
     config_published: bool = False
+    supervisor_stdout_tail: deque[Json] = field(default_factory=lambda: deque(maxlen=300))
+    supervisor_stderr_tail: deque[Json] = field(default_factory=lambda: deque(maxlen=300))
+    supervisor_log_tail: deque[Json] = field(default_factory=lambda: deque(maxlen=100))
 
 
 @dataclass
@@ -691,6 +694,7 @@ class ProcessHandle:
     last_start_t_mono: float | None = None
     last_hb_t_wall: float | None = None
     last_hb_t_mono: float | None = None
+    last_heartbeat_payload: Json | None = None
     last_exit_code: int | None = None
     restart_count: int = 0
     last_restart_t_mono: float | None = None
@@ -706,6 +710,9 @@ class ProcessHandle:
     stop_requested_t_mono: float | None = None
     next_restart_t_mono: float | None = None
     startup_collision_retry_done: bool = False
+    supervisor_stdout_tail: deque[Json] = field(default_factory=lambda: deque(maxlen=300))
+    supervisor_stderr_tail: deque[Json] = field(default_factory=lambda: deque(maxlen=300))
+    supervisor_log_tail: deque[Json] = field(default_factory=lambda: deque(maxlen=100))
 
 
 @dataclass(frozen=True)
@@ -1325,6 +1332,77 @@ class Manager:
     def _queue_supervisor_log(self, item: Json) -> None:
         shared_queue_supervisor_log(self, item)
 
+    def _supervisor_handle_for(self, *, source_kind: str, source_id: str) -> Any:
+        kind = str(source_kind or "").strip().lower()
+        sid = str(source_id or "").strip()
+        if kind == "process":
+            return self._processes.get(sid)
+        if kind == "driver":
+            return self._devices.get(sid)
+        return None
+
+    @staticmethod
+    def _supervisor_tail_entry(
+        *,
+        item: Json,
+        message: str,
+        stream: str,
+        severity: str | None = None,
+    ) -> Json:
+        now_wall = time.time()
+        now_mono = time.monotonic()
+        entry: Json = {
+            "message": message,
+            "stream": stream,
+            "pid": item.get("pid"),
+            "t_wall": now_wall,
+            "t_mono": now_mono,
+        }
+        if severity is not None:
+            entry["severity"] = severity
+        return entry
+
+    def _record_supervisor_raw_log(self, item: Json) -> None:
+        if not isinstance(item, dict):
+            return
+        source_kind = str(item.get("source_kind", "") or "")
+        source_id = str(item.get("source_id", "") or "")
+        stream = str(item.get("stream", "") or "")
+        if stream not in {"stdout", "stderr"}:
+            return
+        message = str(item.get("message", "") or "")
+        if not message:
+            return
+        handle = self._supervisor_handle_for(source_kind=source_kind, source_id=source_id)
+        if handle is None:
+            return
+        entry = self._supervisor_tail_entry(item=item, message=message, stream=stream)
+        if stream == "stdout":
+            handle.supervisor_stdout_tail.append(entry)
+        else:
+            handle.supervisor_stderr_tail.append(entry)
+
+    def _record_supervisor_emitted_log(self, item: Json, *, severity: str) -> None:
+        if not isinstance(item, dict):
+            return
+        source_kind = str(item.get("source_kind", "") or "")
+        source_id = str(item.get("source_id", "") or "")
+        stream = str(item.get("stream", "") or "")
+        message = str(item.get("message", "") or "")
+        if not message:
+            return
+        handle = self._supervisor_handle_for(source_kind=source_kind, source_id=source_id)
+        if handle is None:
+            return
+        handle.supervisor_log_tail.append(
+            self._supervisor_tail_entry(
+                item=item,
+                message=message,
+                stream=stream,
+                severity=severity,
+            )
+        )
+
     @staticmethod
     def _supervisor_key(item: Json) -> tuple[str, str, int, str]:
         return shared_supervisor_key(item)
@@ -1928,6 +2006,7 @@ class Manager:
         handle.pid = pid
         handle.last_hb_t_wall = float(ts["t_wall"])
         handle.last_hb_t_mono = float(ts["t_mono"])
+        handle.last_heartbeat_payload = copy.deepcopy(msg)
         if handle.state == ManagedProcessState.STARTING:
             handle.state = ManagedProcessState.RUNNING
             handle.startup_collision_retry_done = False
@@ -2802,9 +2881,12 @@ class Manager:
             payload["failure_pid"] = failure_pid
             payload["exit_code_hex"] = exit_code_hex(handle.last_exit_code)
             payload["exit_code_description"] = describe_exit_code(handle.last_exit_code)
-            payload["tail_logs"] = self._failure_event_tail_logs(
-                process_id=handle.spec.process_id,
-                pid=failure_pid,
+            payload["last_heartbeat_payload"] = handle.last_heartbeat_payload
+            payload.update(
+                self._failure_event_log_context(
+                    process_id=handle.spec.process_id,
+                    pid=failure_pid,
+                )
             )
         self._publish_manager_event(topic, payload)
 
@@ -2828,14 +2910,16 @@ class Manager:
             payload["exit_code_description"] = describe_exit_code(
                 handle.driver_last_exit_code
             )
-            payload["tail_logs"] = self._failure_event_tail_logs(
-                source_id=handle.spec.device_id,
-                source_kind="driver",
-                pid=failure_pid,
+            payload.update(
+                self._failure_event_log_context(
+                    source_id=handle.spec.device_id,
+                    source_kind="driver",
+                    pid=failure_pid,
+                )
             )
         self._publish_manager_event(topic, payload)
 
-    def _failure_event_tail_logs(
+    def _failure_event_log_context(
         self,
         *,
         process_id: str | None = None,
@@ -2843,20 +2927,37 @@ class Manager:
         source_kind: str = "process",
         pid: int | None = None,
         limit: int = 20,
-    ) -> list[dict[str, Any]]:
+    ) -> dict[str, Any]:
+        resolved_source_id = source_id if source_id is not None else (process_id or "")
         try:
-            resolved_source_id = source_id if source_id is not None else (process_id or "")
             self._drain_failure_event_supervisor_logs(
                 source_kind=source_kind,
                 source_id=resolved_source_id,
                 pid=pid,
             )
-            return shared_recent_source_logs_structured(
-                self,
-                source_id=resolved_source_id,
+            handle = self._supervisor_handle_for(
                 source_kind=source_kind,
-                limit=limit,
+                source_id=resolved_source_id,
             )
+            if handle is None:
+                tail_stdout: list[Json] = []
+                tail_stderr: list[Json] = []
+                tail_supervisor_logs: list[Json] = []
+            else:
+                tail_stdout = list(handle.supervisor_stdout_tail)
+                tail_stderr = list(handle.supervisor_stderr_tail)
+                tail_supervisor_logs = list(handle.supervisor_log_tail)
+            return {
+                "tail_logs": shared_recent_source_logs_structured(
+                    self,
+                    source_id=resolved_source_id,
+                    source_kind=source_kind,
+                    limit=limit,
+                ),
+                "tail_stdout": tail_stdout,
+                "tail_stderr": tail_stderr,
+                "tail_supervisor_logs": tail_supervisor_logs,
+            }
         except Exception as exc:  # pragma: no cover - defensive
             try:
                 self._emit_log(
@@ -2869,7 +2970,31 @@ class Manager:
                 )
             except Exception:
                 pass
-            return []
+            return {
+                "tail_logs": [],
+                "tail_stdout": [],
+                "tail_stderr": [],
+                "tail_supervisor_logs": [],
+            }
+
+    def _failure_event_tail_logs(
+        self,
+        *,
+        process_id: str | None = None,
+        source_id: str | None = None,
+        source_kind: str = "process",
+        pid: int | None = None,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        return list(
+            self._failure_event_log_context(
+                process_id=process_id,
+                source_id=source_id,
+                source_kind=source_kind,
+                pid=pid,
+                limit=limit,
+            ).get("tail_logs", [])
+        )
 
     @staticmethod
     def _normalize_runtime_metadata_dict(

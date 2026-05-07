@@ -117,6 +117,10 @@ def start_child_log_readers(
 
 def queue_supervisor_log(manager: Any, item: Json) -> None:
     try:
+        manager._record_supervisor_raw_log(item)
+    except Exception:
+        pass
+    try:
         manager._supervisor_log_queue.put_nowait(item)
     except queue.Full:
         manager._supervisor_log_dropped += 1
@@ -218,6 +222,10 @@ def emit_supervisor_item(manager: Any, item: Json) -> None:
         message=message,
         reader_error=reader_error,
     )
+    try:
+        manager._record_supervisor_emitted_log(item, severity=severity)
+    except Exception:
+        pass
     payload: Json = {}
     try:
         payload["pid"] = int(pid_raw)

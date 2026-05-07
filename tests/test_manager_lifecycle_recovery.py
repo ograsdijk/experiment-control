@@ -150,6 +150,23 @@ class ManagerLifecycleRecoveryTests(unittest.TestCase):
         )
         mgr._publish_manager_event.assert_called_once()
 
+    def test_process_snapshot_includes_heartbeat_and_supervisor_tails(self) -> None:
+        mgr = object.__new__(Manager)
+        handle = _build_handle("influx_writer")
+        handle.last_heartbeat_payload = {"process_id": "influx_writer", "phase": "write_batch"}
+        handle.supervisor_stdout_tail.append({"message": "started", "stream": "stdout"})
+        handle.supervisor_stderr_tail.append({"message": "write warning", "stream": "stderr"})
+        handle.supervisor_log_tail.append(
+            {"message": "write warning", "stream": "stderr", "severity": "warning"}
+        )
+
+        snapshot = Manager._process_snapshot(mgr, handle)  # type: ignore[arg-type]
+
+        self.assertEqual(snapshot["last_heartbeat_payload"]["phase"], "write_batch")
+        self.assertEqual(snapshot["tail_stdout"][-1]["message"], "started")
+        self.assertEqual(snapshot["tail_stderr"][-1]["message"], "write warning")
+        self.assertEqual(snapshot["tail_supervisor_logs"][-1]["severity"], "warning")
+
     def test_manager_identity_reports_last_orphan_cleanup(self) -> None:
         mgr = object.__new__(Manager)
         mgr._instance_id = "vacuum"  # type: ignore[attr-defined]
