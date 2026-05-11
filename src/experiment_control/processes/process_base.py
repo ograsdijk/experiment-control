@@ -3,7 +3,9 @@ from __future__ import annotations
 import os
 import threading
 import time
-from typing import Any, Callable
+import traceback
+from contextlib import contextmanager
+from typing import Any, Callable, Iterator
 
 import zmq
 
@@ -36,6 +38,13 @@ class ManagedProcessBase:
         self._rpc_endpoint: str | None = None
         self._manager: ManagerClient | None = None
         self._poller: zmq.Poller | None = None
+        self._progress_lock = threading.Lock()
+        self._phase: str | None = None
+        self._phase_detail: str | None = None
+        self._last_progress_wall: float | None = None
+        self._last_progress_mono: float | None = None
+        self._last_exception: str | None = None
+        self._last_traceback_summary: str | None = None
 
     @staticmethod
     def _rpc_request_id(req_or_id: dict[str, Any] | Any) -> Any:
@@ -114,6 +123,61 @@ class ManagedProcessBase:
                 out.append(item)
         return out
 
+    def _set_phase(self, phase: str, detail: str | None = None) -> None:
+        phase_text = str(phase or "").strip() or None
+        detail_text = str(detail).strip() if detail is not None else None
+        with self._progress_lock:
+            self._phase = phase_text
+            self._phase_detail = detail_text or None
+
+    def _mark_progress(self, detail: str | None = None) -> None:
+        now_wall = time.time()
+        now_mono = time.monotonic()
+        detail_text = str(detail).strip() if detail is not None else None
+        with self._progress_lock:
+            if detail_text:
+                self._phase_detail = detail_text
+            self._last_progress_wall = now_wall
+            self._last_progress_mono = now_mono
+
+    def _record_exception(self, exc: BaseException, phase: str | None = None) -> None:
+        if phase is not None:
+            self._set_phase(phase)
+        summary = "".join(traceback.format_exception_only(type(exc), exc)).strip()
+        tb_summary = "".join(traceback.format_exception(exc)).strip()
+        if len(tb_summary) > 2000:
+            tb_summary = tb_summary[-2000:]
+        with self._progress_lock:
+            self._last_exception = summary
+            self._last_traceback_summary = tb_summary
+
+    @contextmanager
+    def _phase_context(self, phase: str, detail: str | None = None) -> Iterator[None]:
+        self._set_phase(phase, detail)
+        try:
+            yield
+            self._mark_progress()
+        except Exception as exc:
+            self._record_exception(exc, phase=phase)
+            raise
+
+    def _heartbeat_extra_fields(self) -> dict[str, Any]:
+        with self._progress_lock:
+            out: dict[str, Any] = {}
+            if self._phase is not None:
+                out["phase"] = self._phase
+            if self._phase_detail is not None:
+                out["detail"] = self._phase_detail
+            if self._last_progress_wall is not None:
+                out["last_progress_wall"] = self._last_progress_wall
+            if self._last_progress_mono is not None:
+                out["last_progress_mono"] = self._last_progress_mono
+            if self._last_exception is not None:
+                out["last_exception"] = self._last_exception
+            if self._last_traceback_summary is not None:
+                out["last_traceback_summary"] = self._last_traceback_summary
+            return out
+
     def _start_heartbeat_thread(
         self, *, state_provider: Callable[[], str | None] | None = None
     ) -> None:
@@ -150,6 +214,7 @@ class ManagedProcessBase:
                         state = None
                     if state is not None:
                         msg["state"] = state
+                msg.update(self._heartbeat_extra_fields())
                 topic = f"process/{self._process_id}/heartbeat".encode("utf-8")
                 try:
                     pub.send_multipart([topic, json_dumps(msg)])
@@ -334,11 +399,25 @@ class ManagedProcessBase:
         if self._poller is None:
             return {}
         handlers: dict[zmq.Socket, Callable[[], None]] = {}
+        drain_result: dict[str, Any] | None = None
         if self._manager is not None and self._manager.sub_socket is not None:
-            handlers[self._manager.sub_socket] = self._manager.drain_telemetry
+
+            def _drain_manager_telemetry() -> None:
+                nonlocal drain_result
+                self._set_phase("drain_telemetry")
+                drain_result = self._manager.drain_telemetry()
+                self._mark_progress(
+                    f"drained={drain_result['count']} limited={drain_result['limited']}"
+                )
+
+            handlers[self._manager.sub_socket] = _drain_manager_telemetry
         if self._rpc_router is not None:
             handlers[self._rpc_router] = self._drain_rpc
-        return poll_and_drain(self._poller, timeout_ms, handlers=handlers)
+        self._set_phase("poll", f"timeout_ms={int(timeout_ms)}")
+        events = poll_and_drain(self._poller, timeout_ms, handlers=handlers)
+        if drain_result is None:
+            self._mark_progress()
+        return events
 
     def _handle_rpc(self, req: dict[str, Any]) -> dict[str, Any]:
         raise NotImplementedError("RPC handler not implemented")

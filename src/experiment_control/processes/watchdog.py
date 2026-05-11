@@ -973,12 +973,18 @@ class WatchdogProcess(ManagedProcessBase):
                 now = time.monotonic()
                 timeout_s = max(0.0, next_tick - now)
                 timeout_ms = int(min(timeout_s, 0.5) * 1000)
+                self._set_phase("poll", f"timeout_ms={timeout_ms}")
                 self._poll_and_drain(timeout_ms)
 
                 now = time.monotonic()
                 if now >= next_tick:
+                    self._set_phase("evaluate_rules")
                     self._evaluate_rules()
+                    self._mark_progress("rules evaluated")
                     next_tick = now + self._tick_s
+                else:
+                    self._set_phase("idle")
+                    self._mark_progress()
         finally:
             self.close()
 

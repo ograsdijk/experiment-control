@@ -482,6 +482,17 @@ class ConnectCheckSpec:
     on_fail: str = "disconnect"
 
 
+@dataclass(frozen=True)
+class AutoReconnectSpec:
+    enabled: bool = False
+    on_telemetry_stale_s: float | None = None
+    cooldown_s: float = 30.0
+    max_attempts: int | None = 3
+    reset_attempts_after_ok_s: float = 120.0
+    disconnect_timeout_ms: int = 1000
+    connect_timeout_ms: int | None = None
+
+
 def _coerce_connect_check(raw: object) -> ConnectCheckSpec:
     if raw is None:
         return ConnectCheckSpec()
@@ -524,6 +535,54 @@ def _coerce_connect_check(raw: object) -> ConnectCheckSpec:
         enabled=enabled,
         identity=identity,
         on_fail=on_fail_raw,
+    )
+
+
+def _coerce_auto_reconnect(raw: object) -> AutoReconnectSpec:
+    if raw is None:
+        return AutoReconnectSpec()
+    obj = require_dict(raw, path=["auto_reconnect"])
+    enabled_raw = obj.get("enabled", True)
+    if not isinstance(enabled_raw, bool):
+        raise ConfigError("auto_reconnect.enabled", "must be a bool")
+    enabled = bool(enabled_raw)
+
+    stale_raw = obj.get("on_telemetry_stale_s")
+    stale_s = None if stale_raw is None else float(stale_raw)
+    if enabled and (stale_s is None or stale_s <= 0):
+        raise ConfigError(
+            "auto_reconnect.on_telemetry_stale_s",
+            "must be > 0 when enabled",
+        )
+
+    cooldown_s = float(obj.get("cooldown_s", 30.0))
+    reset_s = float(obj.get("reset_attempts_after_ok_s", 120.0))
+    if cooldown_s < 0:
+        raise ConfigError("auto_reconnect.cooldown_s", "must be >= 0")
+    if reset_s < 0:
+        raise ConfigError("auto_reconnect.reset_attempts_after_ok_s", "must be >= 0")
+
+    max_raw = obj.get("max_attempts", 3)
+    max_attempts = None if max_raw is None else int(max_raw)
+    if max_attempts is not None and max_attempts < 1:
+        raise ConfigError("auto_reconnect.max_attempts", "must be >= 1 or null")
+
+    disconnect_timeout_ms = int(obj.get("disconnect_timeout_ms", 1000))
+    connect_timeout_raw = obj.get("connect_timeout_ms")
+    connect_timeout_ms = None if connect_timeout_raw is None else int(connect_timeout_raw)
+    if disconnect_timeout_ms <= 0:
+        raise ConfigError("auto_reconnect.disconnect_timeout_ms", "must be > 0")
+    if connect_timeout_ms is not None and connect_timeout_ms <= 0:
+        raise ConfigError("auto_reconnect.connect_timeout_ms", "must be > 0")
+
+    return AutoReconnectSpec(
+        enabled=enabled,
+        on_telemetry_stale_s=stale_s,
+        cooldown_s=cooldown_s,
+        max_attempts=max_attempts,
+        reset_attempts_after_ok_s=reset_s,
+        disconnect_timeout_ms=disconnect_timeout_ms,
+        connect_timeout_ms=connect_timeout_ms,
     )
 
 
@@ -601,6 +660,7 @@ class DeviceSpec:
     device_metadata: dict[str, Any] | None = None
     stream_metadata: dict[str, dict[str, Any]] | None = None
     connect_check: ConnectCheckSpec = field(default_factory=ConnectCheckSpec)
+    auto_reconnect: AutoReconnectSpec = field(default_factory=AutoReconnectSpec)
     config_yaml_text: str | None = None
     telemetry_period_s: float = 1.0
     heartbeat_period_s: float = 1.0
@@ -655,6 +715,15 @@ class DeviceHandle:
     supervisor_stdout_tail: deque[Json] = field(default_factory=lambda: deque(maxlen=300))
     supervisor_stderr_tail: deque[Json] = field(default_factory=lambda: deque(maxlen=300))
     supervisor_log_tail: deque[Json] = field(default_factory=lambda: deque(maxlen=100))
+    stdout_log_path: str | None = None
+    stderr_log_path: str | None = None
+    auto_reconnect_attempts: int = 0
+    auto_reconnect_last_attempt_mono: float | None = None
+    auto_reconnect_last_attempt_wall: float | None = None
+    auto_reconnect_healthy_since_mono: float | None = None
+    auto_reconnect_last_success_mono: float | None = None
+    auto_reconnect_last_error: str | None = None
+    auto_reconnect_suppressed: bool = False
 
 
 @dataclass
@@ -713,6 +782,8 @@ class ProcessHandle:
     supervisor_stdout_tail: deque[Json] = field(default_factory=lambda: deque(maxlen=300))
     supervisor_stderr_tail: deque[Json] = field(default_factory=lambda: deque(maxlen=300))
     supervisor_log_tail: deque[Json] = field(default_factory=lambda: deque(maxlen=100))
+    stdout_log_path: str | None = None
+    stderr_log_path: str | None = None
 
 
 @dataclass(frozen=True)
@@ -765,6 +836,7 @@ def device_spec_from_yaml(path: str | Path) -> DeviceSpec:
         device_metadata = _coerce_device_metadata(raw_obj.get("device_metadata"))
         stream_metadata = _coerce_stream_metadata(raw_obj.get("stream_metadata"))
         connect_check = _coerce_connect_check(raw_obj.get("connect_check"))
+        auto_reconnect = _coerce_auto_reconnect(raw_obj.get("auto_reconnect"))
         telemetry_period_s = float(raw_obj.get("telemetry_period_s", 1.0))
         heartbeat_period_s = float(raw_obj.get("heartbeat_period_s", 1.0))
         command_poll_period_s = float(raw_obj.get("command_poll_period_s", 0.01))
@@ -782,6 +854,7 @@ def device_spec_from_yaml(path: str | Path) -> DeviceSpec:
         device_metadata=device_metadata,
         stream_metadata=stream_metadata,
         connect_check=connect_check,
+        auto_reconnect=auto_reconnect,
         config_yaml_text=yaml_text,
         telemetry_period_s=telemetry_period_s,
         heartbeat_period_s=heartbeat_period_s,
@@ -958,6 +1031,9 @@ class Manager:
             tuple[str, str, int, str], threading.Thread
         ] = {}
         self._supervisor_pending_blocks: dict[tuple[str, str, int, str], Json] = {}
+        self._supervisor_log_dir = Path(".state") / self._instance_id / "process-logs"
+        self._supervisor_log_max_bytes = 10 * 1024 * 1024
+        self._supervisor_log_backups = 3
         self._last_orphan_cleanup: Json | None = None
         self._command_journal_enabled = bool(command_journal_enabled)
         self._command_journal: CommandJournal | None = None
@@ -2560,6 +2636,20 @@ class Manager:
                 "last_error": handle.driver_last_error,
             },
             "connect_check": copy.deepcopy(handle.connect_check_last),
+            "auto_reconnect": {
+                "enabled": bool(handle.spec.auto_reconnect.enabled),
+                "attempts": int(handle.auto_reconnect_attempts),
+                "last_attempt_mono": handle.auto_reconnect_last_attempt_mono,
+                "last_attempt_wall": handle.auto_reconnect_last_attempt_wall,
+                "last_success_mono": handle.auto_reconnect_last_success_mono,
+                "healthy_since_mono": handle.auto_reconnect_healthy_since_mono,
+                "last_error": handle.auto_reconnect_last_error,
+                "suppressed": bool(handle.auto_reconnect_suppressed),
+                "on_telemetry_stale_s": handle.spec.auto_reconnect.on_telemetry_stale_s,
+                "cooldown_s": handle.spec.auto_reconnect.cooldown_s,
+                "max_attempts": handle.spec.auto_reconnect.max_attempts,
+                "reset_attempts_after_ok_s": handle.spec.auto_reconnect.reset_attempts_after_ok_s,
+            },
             "source_kind": "local",
             "is_remote": False,
             "owner_peer_id": None,
@@ -2943,10 +3033,22 @@ class Manager:
                 tail_stdout: list[Json] = []
                 tail_stderr: list[Json] = []
                 tail_supervisor_logs: list[Json] = []
+                stdout_log_path = None
+                stderr_log_path = None
             else:
                 tail_stdout = list(handle.supervisor_stdout_tail)
                 tail_stderr = list(handle.supervisor_stderr_tail)
                 tail_supervisor_logs = list(handle.supervisor_log_tail)
+                stdout_log_path = handle.stdout_log_path
+                stderr_log_path = handle.stderr_log_path
+            recent = self._log_tail(
+                {
+                    "limit": limit,
+                    "since_t_mono": time.monotonic() - 300.0,
+                    "source_kind": source_kind,
+                    "source_ids": [resolved_source_id],
+                }
+            ).get("entries", [])
             return {
                 "tail_logs": shared_recent_source_logs_structured(
                     self,
@@ -2954,9 +3056,12 @@ class Manager:
                     source_kind=source_kind,
                     limit=limit,
                 ),
+                "tail_recent_logs": recent if isinstance(recent, list) else [],
                 "tail_stdout": tail_stdout,
                 "tail_stderr": tail_stderr,
                 "tail_supervisor_logs": tail_supervisor_logs,
+                "stdout_log_path": stdout_log_path,
+                "stderr_log_path": stderr_log_path,
             }
         except Exception as exc:  # pragma: no cover - defensive
             try:
@@ -2972,9 +3077,12 @@ class Manager:
                 pass
             return {
                 "tail_logs": [],
+                "tail_recent_logs": [],
                 "tail_stdout": [],
                 "tail_stderr": [],
                 "tail_supervisor_logs": [],
+                "stdout_log_path": None,
+                "stderr_log_path": None,
             }
 
     def _failure_event_tail_logs(

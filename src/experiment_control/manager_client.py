@@ -5,7 +5,7 @@ from typing import Any
 
 import zmq
 from .types import Timestamp
-from .utils.zmq_helpers import json_dumps, json_loads, safe_json_loads
+from .utils.zmq_helpers import drain_multipart_nonblocking, json_dumps, json_loads, safe_json_loads
 
 Json = dict[str, Any]
 
@@ -43,6 +43,11 @@ class ManagerClient:
             self._sub = sub
 
         self._telemetry_cache: dict[str, dict[str, dict[str, Any]]] = {}
+        self.telemetry_drained_total = 0
+        self.telemetry_last_drain_count = 0
+        self.telemetry_last_drain_duration_s = 0.0
+        self.telemetry_drain_limited_count = 0
+        self.telemetry_parse_errors = 0
 
     @property
     def sub_socket(self) -> zmq.Socket | None:
@@ -113,22 +118,40 @@ class ManagerClient:
         req = {"type": "manager.events.publish", "topic": topic, "payload": data}
         self.call(req)
 
-    def drain_telemetry(self) -> None:
+    def drain_telemetry(
+        self,
+        *,
+        max_messages: int | None = 1000,
+        max_duration_s: float | None = 0.1,
+    ) -> dict[str, Any]:
         if self._sub is None:
-            return
-        while True:
-            try:
-                _topic_b, payload_b = self._sub.recv_multipart(flags=zmq.NOBLOCK)
-            except zmq.Again:
-                break
-            except Exception:
-                break
-            try:
-                payload = safe_json_loads(payload_b)
-            except Exception:
-                payload = None
-            if isinstance(payload, dict):
-                self._handle_telemetry_update(payload)
+            return {"count": 0, "limited": False, "duration_s": 0.0, "parse_errors": 0}
+
+        def _handle(_topic_b: bytes, payload_b: bytes) -> bool:
+            payload = safe_json_loads(payload_b)
+            if not isinstance(payload, dict):
+                return False
+            self._handle_telemetry_update(payload)
+            return True
+
+        result = drain_multipart_nonblocking(
+            self._sub,
+            _handle,
+            max_messages=max_messages,
+            max_duration_s=max_duration_s,
+        )
+        self.telemetry_drained_total += result.count
+        self.telemetry_last_drain_count = result.count
+        self.telemetry_last_drain_duration_s = result.duration_s
+        self.telemetry_parse_errors += result.parse_errors
+        if result.limited:
+            self.telemetry_drain_limited_count += 1
+        return {
+            "count": result.count,
+            "limited": result.limited,
+            "duration_s": result.duration_s,
+            "parse_errors": result.parse_errors,
+        }
 
     def _handle_telemetry_update(self, payload: Json) -> None:
         device_id = str(payload.get("device_id", ""))

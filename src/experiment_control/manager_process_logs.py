@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 import queue
 import re
 import threading
 import time
+from pathlib import Path
 from typing import Any
 
 Json = dict[str, Any]
@@ -27,6 +29,83 @@ _LOG_LEVEL_TABLE_RE = re.compile(
 _EXCEPTION_LINE_RE = re.compile(
     r"^(?:[A-Za-z_][\w\.]*Error|Exception|Traceback)\b",
 )
+_SAFE_LOG_ID_RE = re.compile(r"[^A-Za-z0-9_.-]+")
+
+
+def _safe_log_id(raw: str) -> str:
+    text = _SAFE_LOG_ID_RE.sub("_", str(raw or "").strip()).strip("._-")
+    return text or "unknown"
+
+
+def supervisor_log_path(
+    manager: Any,
+    *,
+    source_kind: str,
+    source_id: str,
+    pid: int,
+    stream: str,
+) -> Path:
+    directory = Path(getattr(manager, "_supervisor_log_dir"))
+    filename = (
+        f"{_safe_log_id(source_kind)}-"
+        f"{_safe_log_id(source_id)}-"
+        f"{int(pid)}.{_safe_log_id(stream)}.jsonl"
+    )
+    return directory / filename
+
+
+def _rotate_log_file(path: Path, *, max_bytes: int, backups: int) -> None:
+    if max_bytes <= 0 or backups <= 0 or not path.exists():
+        return
+    try:
+        if path.stat().st_size < max_bytes:
+            return
+    except OSError:
+        return
+    for idx in range(backups - 1, 0, -1):
+        src = path.with_name(f"{path.name}.{idx}")
+        dst = path.with_name(f"{path.name}.{idx + 1}")
+        if src.exists():
+            try:
+                if dst.exists():
+                    dst.unlink()
+                src.replace(dst)
+            except OSError:
+                pass
+    first = path.with_name(f"{path.name}.1")
+    try:
+        if first.exists():
+            first.unlink()
+        path.replace(first)
+    except OSError:
+        pass
+
+
+def append_supervisor_jsonl(manager: Any, item: Json) -> None:
+    path_raw = item.get("log_path")
+    if not path_raw:
+        return
+    path = Path(str(path_raw))
+    max_bytes = int(getattr(manager, "_supervisor_log_max_bytes", 10 * 1024 * 1024))
+    backups = int(getattr(manager, "_supervisor_log_backups", 3))
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _rotate_log_file(path, max_bytes=max_bytes, backups=backups)
+        entry = {
+            "t_wall": time.time(),
+            "t_mono": time.monotonic(),
+            "source_kind": item.get("source_kind"),
+            "source_id": item.get("source_id"),
+            "device_id": item.get("device_id"),
+            "process_id": item.get("process_id"),
+            "pid": item.get("pid"),
+            "stream": item.get("stream"),
+            "message": item.get("message"),
+        }
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception:
+        return
 
 
 def start_child_log_readers(
@@ -49,6 +128,25 @@ def start_child_log_readers(
         existing = manager._supervisor_log_threads.get(key)
         if existing is not None and existing.is_alive():
             continue
+        log_path = supervisor_log_path(
+            manager,
+            source_kind=source_kind,
+            source_id=source_id,
+            pid=pid,
+            stream=stream,
+        )
+        try:
+            handle = manager._supervisor_handle_for(
+                source_kind=source_kind,
+                source_id=source_id,
+            )
+            if handle is not None:
+                if stream == "stdout":
+                    handle.stdout_log_path = str(log_path)
+                elif stream == "stderr":
+                    handle.stderr_log_path = str(log_path)
+        except Exception:
+            pass
 
         def _reader(
             *,
@@ -59,6 +157,7 @@ def start_child_log_readers(
             pid_value: int,
             device_id_value: str | None,
             process_id_value: str | None,
+            log_path_value: Path,
         ) -> None:
             try:
                 for line in iter(pipe_obj.readline, ""):
@@ -75,6 +174,7 @@ def start_child_log_readers(
                             "device_id": device_id_value,
                             "process_id": process_id_value,
                             "message": text,
+                            "log_path": str(log_path_value),
                         },
                     )
             except Exception as exc:
@@ -89,6 +189,7 @@ def start_child_log_readers(
                         "process_id": process_id_value,
                         "message": f"log stream read failed: {exc}",
                         "reader_error": True,
+                        "log_path": str(log_path_value),
                     },
                 )
             finally:
@@ -107,6 +208,7 @@ def start_child_log_readers(
                 "pid_value": pid,
                 "device_id_value": device_id,
                 "process_id_value": process_id,
+                "log_path_value": log_path,
             },
             daemon=True,
             name=f"ec-log-{source_kind}-{source_id}-{pid}-{stream}",
@@ -116,6 +218,10 @@ def start_child_log_readers(
 
 
 def queue_supervisor_log(manager: Any, item: Json) -> None:
+    try:
+        append_supervisor_jsonl(manager, item)
+    except Exception:
+        pass
     try:
         manager._record_supervisor_raw_log(item)
     except Exception:

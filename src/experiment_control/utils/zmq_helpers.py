@@ -1,11 +1,21 @@
 from __future__ import annotations
 
+import time
+from dataclasses import dataclass
 from typing import Any, Callable
 
 import zmq
 import zmq.utils.jsonapi
 
 Json = dict[str, Any]
+
+
+@dataclass(frozen=True)
+class DrainResult:
+    count: int
+    limited: bool
+    duration_s: float
+    parse_errors: int = 0
 
 
 def json_dumps(payload: Any) -> bytes:
@@ -33,6 +43,47 @@ def recv_json(sock: zmq.Socket, *, flags: int = 0) -> Any | None:
     except zmq.ZMQError:
         return None
     return safe_json_loads(data)
+
+
+def drain_multipart_nonblocking(
+    sock: zmq.Socket,
+    handler: Callable[[bytes, bytes], bool],
+    *,
+    max_messages: int | None = 1000,
+    max_duration_s: float | None = 0.1,
+) -> DrainResult:
+    start = time.monotonic()
+    count = 0
+    parse_errors = 0
+    limited = False
+    max_count = None if max_messages is None else max(1, int(max_messages))
+    max_duration = None if max_duration_s is None else max(0.0, float(max_duration_s))
+    while True:
+        if max_count is not None and count >= max_count:
+            limited = True
+            break
+        if max_duration is not None and (time.monotonic() - start) >= max_duration:
+            limited = True
+            break
+        try:
+            topic_b, payload_b = sock.recv_multipart(flags=zmq.NOBLOCK)
+        except zmq.Again:
+            break
+        except Exception:
+            break
+        count += 1
+        try:
+            ok = bool(handler(topic_b, payload_b))
+        except Exception:
+            ok = False
+        if not ok:
+            parse_errors += 1
+    return DrainResult(
+        count=count,
+        limited=limited,
+        duration_s=time.monotonic() - start,
+        parse_errors=parse_errors,
+    )
 
 
 def poll_and_drain(

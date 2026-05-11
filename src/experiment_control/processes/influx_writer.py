@@ -28,7 +28,7 @@ from ..utils.config_parsing import optional_dict, require_dict, require_str
 from ..utils.rpc_dispatch import RpcDispatchRegistry
 from ..utils.value_coercion import coerce_bool, coerce_float, coerce_int
 from ..utils.yaml_helpers import load_yaml_file
-from ..utils.zmq_helpers import safe_json_loads
+from ..utils.zmq_helpers import drain_multipart_nonblocking, safe_json_loads
 from .manager_client_helper import ManagerClientHelper
 from .process_base import ManagedProcessBase
 
@@ -394,6 +394,15 @@ class InfluxWriterProcess(ManagedProcessBase):
         self._last_error: str | None = None
         self._last_flush_wall_s: float | None = None
         self._last_flush_mono_s: float | None = None
+        self._last_flush_start_wall_s: float | None = None
+        self._last_flush_start_mono_s: float | None = None
+        self._last_flush_duration_s: float | None = None
+        self._last_flush_destination: str | None = None
+        self._last_drain_count = 0
+        self._last_drain_duration_s = 0.0
+        self._total_drained = 0
+        self._drain_limited_count = 0
+        self._drain_parse_errors = 0
         self._pending_log_payloads: deque[Json] = deque(maxlen=200)
         self._last_published_error_text: str | None = None
 
@@ -626,24 +635,43 @@ class InfluxWriterProcess(ManagedProcessBase):
         self._queue.append(point)
         self._points_queued += 1
 
-    def _drain_sub(self) -> None:
-        while True:
-            try:
-                topic_b, payload_b = self._sub.recv_multipart(flags=zmq.NOBLOCK)
-            except zmq.Again:
-                break
-            except Exception:
-                break
-
+    def _drain_sub(
+        self,
+        *,
+        max_messages: int | None = 1000,
+        max_duration_s: float | None = 0.1,
+    ) -> dict[str, Any]:
+        def _handle(topic_b: bytes, payload_b: bytes) -> bool:
             topic = topic_b.decode("utf-8", errors="replace").strip()
             payload = safe_json_loads(payload_b)
             if not isinstance(payload, dict):
-                continue
+                return False
             if topic == "manager.device_config":
                 self._handle_device_config(payload)
-                continue
+                return True
             if topic == "manager.telemetry_update":
                 self._ingest_telemetry(payload)
+                return True
+            return False
+
+        result = drain_multipart_nonblocking(
+            self._sub,
+            _handle,
+            max_messages=max_messages,
+            max_duration_s=max_duration_s,
+        )
+        self._last_drain_count = result.count
+        self._last_drain_duration_s = result.duration_s
+        self._total_drained += result.count
+        self._drain_parse_errors += result.parse_errors
+        if result.limited:
+            self._drain_limited_count += 1
+        return {
+            "count": result.count,
+            "limited": result.limited,
+            "duration_s": result.duration_s,
+            "parse_errors": result.parse_errors,
+        }
 
     def _resolve_ingest_destination(
         self,
@@ -865,6 +893,10 @@ class InfluxWriterProcess(ManagedProcessBase):
             self._last_error = f"missing destination {destination_name!r}"
             return False
         lines = [point.line for point in points]
+        self._last_flush_destination = destination_name
+        self._last_flush_start_wall_s = time.time()
+        self._last_flush_start_mono_s = time.monotonic()
+        self._set_phase("influx_write", f"destination={destination_name} points={len(points)}")
         try:
             self._write_batch_http(destination=destination, lines=lines)
             self._points_written += len(points)
@@ -890,6 +922,9 @@ class InfluxWriterProcess(ManagedProcessBase):
             self._write_errors += 1
             self._last_error = f"write failed destination={destination_name}: {e}"
             return False
+        finally:
+            if self._last_flush_start_mono_s is not None:
+                self._last_flush_duration_s = time.monotonic() - self._last_flush_start_mono_s
 
     def _mark_flush_timestamp(self) -> None:
         self._last_flush_wall_s = time.time()
@@ -1021,6 +1056,17 @@ class InfluxWriterProcess(ManagedProcessBase):
             "last_flush": {
                 "t_wall": self._last_flush_wall_s,
                 "t_mono": self._last_flush_mono_s,
+                "start_wall": self._last_flush_start_wall_s,
+                "start_mono": self._last_flush_start_mono_s,
+                "duration_s": self._last_flush_duration_s,
+                "destination": self._last_flush_destination,
+            },
+            "telemetry_drain": {
+                "last_count": self._last_drain_count,
+                "last_duration_s": self._last_drain_duration_s,
+                "total_drained": self._total_drained,
+                "limited_count": self._drain_limited_count,
+                "parse_errors": self._drain_parse_errors,
             },
             "device_type_known_count": len(self._device_type_by_id),
             "remote_device_known_count": len(self._remote_device_ids),
@@ -1231,9 +1277,14 @@ class InfluxWriterProcess(ManagedProcessBase):
                 now = time.monotonic()
                 timeout_s = max(0.0, next_flush_mono - now)
                 timeout_ms = int(max(1.0, min(500.0, timeout_s * 1000.0)))
+                self._set_phase("poll", f"timeout_ms={timeout_ms}")
                 events = self._poll_and_drain(timeout_ms)
                 if events.get(self._sub) == zmq.POLLIN:
-                    self._drain_sub()
+                    self._set_phase("drain_telemetry")
+                    drain = self._drain_sub()
+                    self._mark_progress(
+                        f"drained={drain['count']} limited={drain['limited']}"
+                    )
 
                 now = time.monotonic()
                 if (
@@ -1243,10 +1294,15 @@ class InfluxWriterProcess(ManagedProcessBase):
                         or len(self._queue) >= self._batch_max_points
                     )
                 ):
+                    self._set_phase("flush", f"queue_depth={len(self._queue)}")
                     self._flush()
                     next_flush_mono = now + self._flush_interval_s
+                self._set_phase("publish_error_log")
                 self._maybe_publish_last_error()
+                self._set_phase("flush_pending_logs")
                 self._flush_pending_logs()
+                self._set_phase("idle")
+                self._mark_progress(f"queue_depth={len(self._queue)}")
         finally:
             try:
                 self._flush()

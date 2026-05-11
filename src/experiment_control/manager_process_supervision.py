@@ -831,6 +831,8 @@ def process_snapshot(manager: Any, handle: Any) -> Json:
         "tail_stdout": list(handle.supervisor_stdout_tail),
         "tail_stderr": list(handle.supervisor_stderr_tail),
         "tail_supervisor_logs": list(handle.supervisor_log_tail),
+        "stdout_log_path": handle.stdout_log_path,
+        "stderr_log_path": handle.stderr_log_path,
         "heartbeat_endpoint": handle.heartbeat_endpoint,
         "process_data_endpoint": handle.process_data_endpoint,
         "rpc_endpoint": handle.rpc_endpoint,
@@ -923,6 +925,176 @@ def maybe_restart_device_driver(
     manager.start_driver(device_id)
 
 
+def _auto_reconnect_status(handle: Any) -> Json:
+    spec = handle.spec.auto_reconnect
+    return {
+        "enabled": bool(spec.enabled),
+        "attempts": int(handle.auto_reconnect_attempts),
+        "last_attempt_mono": handle.auto_reconnect_last_attempt_mono,
+        "last_attempt_wall": handle.auto_reconnect_last_attempt_wall,
+        "last_success_mono": handle.auto_reconnect_last_success_mono,
+        "healthy_since_mono": handle.auto_reconnect_healthy_since_mono,
+        "last_error": handle.auto_reconnect_last_error,
+        "suppressed": bool(handle.auto_reconnect_suppressed),
+        "cooldown_s": float(spec.cooldown_s),
+        "max_attempts": spec.max_attempts,
+        "on_telemetry_stale_s": spec.on_telemetry_stale_s,
+        "reset_attempts_after_ok_s": float(spec.reset_attempts_after_ok_s),
+    }
+
+
+def _auto_reconnect_publish(manager: Any, topic: str, device_id: str, payload: Json) -> None:
+    payload = dict(payload)
+    payload.setdefault("device_id", device_id)
+    payload.setdefault("ts", {"t_wall": time.time(), "t_mono": time.monotonic()})
+    manager._publish_manager_event(topic, payload)
+
+
+def _auto_reconnect_reset_if_healthy(manager: Any, device_id: str, handle: Any, now_mono: float) -> None:
+    spec = handle.spec.auto_reconnect
+    if not spec.enabled or handle.auto_reconnect_attempts <= 0:
+        return
+    latest_ts = manager._telemetry_last_bundle_ts.get(device_id)
+    if latest_ts is None:
+        handle.auto_reconnect_healthy_since_mono = None
+        return
+    age_s = now_mono - latest_ts.t_mono
+    threshold = spec.on_telemetry_stale_s
+    if threshold is None or age_s > threshold:
+        handle.auto_reconnect_healthy_since_mono = None
+        return
+    if handle.auto_reconnect_healthy_since_mono is None:
+        handle.auto_reconnect_healthy_since_mono = now_mono
+        return
+    if now_mono - handle.auto_reconnect_healthy_since_mono < spec.reset_attempts_after_ok_s:
+        return
+    handle.auto_reconnect_attempts = 0
+    handle.auto_reconnect_suppressed = False
+    handle.auto_reconnect_last_error = None
+    _auto_reconnect_publish(
+        manager,
+        "manager.device.auto_reconnect.reset",
+        device_id,
+        {"auto_reconnect": _auto_reconnect_status(handle)},
+    )
+
+
+def _auto_reconnect_should_attempt(manager: Any, device_id: str, handle: Any, now_mono: float) -> tuple[bool, float | None, str | None]:
+    spec = handle.spec.auto_reconnect
+    if not spec.enabled:
+        return False, None, None
+    if str(handle.driver_process_state) not in {"RUNNING"}:
+        return False, None, None
+    if handle.rpc_endpoint is None:
+        return False, None, None
+    latest_ts = manager._telemetry_last_bundle_ts.get(device_id)
+    if latest_ts is None:
+        return False, None, None
+    threshold = spec.on_telemetry_stale_s
+    if threshold is None:
+        return False, None, None
+    age_s = now_mono - latest_ts.t_mono
+    if age_s <= threshold:
+        return False, age_s, None
+    if (
+        handle.auto_reconnect_last_attempt_mono is not None
+        and now_mono - handle.auto_reconnect_last_attempt_mono < spec.cooldown_s
+    ):
+        return False, age_s, "cooldown"
+    if spec.max_attempts is not None and handle.auto_reconnect_attempts >= spec.max_attempts:
+        if not handle.auto_reconnect_suppressed:
+            handle.auto_reconnect_suppressed = True
+            _auto_reconnect_publish(
+                manager,
+                "manager.device.auto_reconnect.suppressed",
+                device_id,
+                {
+                    "reason": "max_attempts",
+                    "telemetry_age_s": age_s,
+                    "auto_reconnect": _auto_reconnect_status(handle),
+                },
+            )
+        return False, age_s, "max_attempts"
+    return True, age_s, None
+
+
+def _auto_reconnect_attempt(manager: Any, device_id: str, handle: Any, now_mono: float, age_s: float) -> None:
+    spec = handle.spec.auto_reconnect
+    handle.auto_reconnect_attempts += 1
+    handle.auto_reconnect_last_attempt_mono = now_mono
+    handle.auto_reconnect_last_attempt_wall = time.time()
+    handle.auto_reconnect_last_error = None
+    handle.auto_reconnect_suppressed = False
+    attempt = int(handle.auto_reconnect_attempts)
+    _auto_reconnect_publish(
+        manager,
+        "manager.device.auto_reconnect.attempt",
+        device_id,
+        {
+            "attempt": attempt,
+            "telemetry_age_s": age_s,
+            "auto_reconnect": _auto_reconnect_status(handle),
+        },
+    )
+    try:
+        try:
+            manager._call_device_rpc(
+                device_id=device_id,
+                action="disconnect_device",
+                params={},
+                timeout_ms=int(spec.disconnect_timeout_ms),
+            )
+        except Exception:
+            pass
+        connect_timeout_ms = spec.connect_timeout_ms or manager._device_rpc_timeout_ms
+        resp = manager._call_device_rpc(
+            device_id=device_id,
+            action="connect_device",
+            params={},
+            timeout_ms=int(connect_timeout_ms),
+        )
+        if not manager._device_rpc_status_ok(resp):
+            raise RuntimeError(manager._device_rpc_error_text(resp))
+        handle.auto_reconnect_last_success_mono = time.monotonic()
+        handle.auto_reconnect_last_error = None
+        _auto_reconnect_publish(
+            manager,
+            "manager.device.auto_reconnect.success",
+            device_id,
+            {
+                "attempt": attempt,
+                "telemetry_age_s": age_s,
+                "response": resp,
+                "auto_reconnect": _auto_reconnect_status(handle),
+            },
+        )
+    except Exception as exc:
+        handle.auto_reconnect_last_error = str(exc)
+        _auto_reconnect_publish(
+            manager,
+            "manager.device.auto_reconnect.failed",
+            device_id,
+            {
+                "attempt": attempt,
+                "telemetry_age_s": age_s,
+                "error": str(exc),
+                "auto_reconnect": _auto_reconnect_status(handle),
+            },
+        )
+
+
+def _maybe_auto_reconnect_device(manager: Any, device_id: str, handle: Any, now_mono: float) -> None:
+    _auto_reconnect_reset_if_healthy(manager, device_id, handle, now_mono)
+    should_attempt, age_s, _reason = _auto_reconnect_should_attempt(
+        manager,
+        device_id,
+        handle,
+        now_mono,
+    )
+    if should_attempt and age_s is not None:
+        _auto_reconnect_attempt(manager, device_id, handle, now_mono, age_s)
+
+
 def supervise_device_drivers(manager: Any, now_mono: float) -> None:
     for device_id, handle in manager._devices.items():
         proc = handle.process
@@ -932,6 +1104,7 @@ def supervise_device_drivers(manager: Any, now_mono: float) -> None:
                 manager._update_device_driver_exit_state(handle, int(rc))
         manager._enforce_device_driver_stop_timeout(handle, now_mono)
         manager._maybe_restart_device_driver(device_id, handle, now_mono)
+        _maybe_auto_reconnect_device(manager, device_id, handle, now_mono)
 
 
 def update_managed_process_exit_state(manager: Any, handle: Any, rc: int) -> bool:

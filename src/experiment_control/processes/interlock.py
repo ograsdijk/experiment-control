@@ -895,6 +895,7 @@ class InterlockProcess(ManagedProcessBase):
         device_id = str(command.get("device_id", ""))
         action = str(command.get("action", ""))
         params = command.get("params", {})
+        self._set_phase("interlock_check", f"{device_id}.{action}")
         if not device_id or not action or not isinstance(params, dict):
             return {
                 "request_id": req_id,
@@ -991,7 +992,10 @@ class InterlockProcess(ManagedProcessBase):
     def run(self) -> None:
         try:
             while True:
+                self._set_phase("poll", "timeout_ms=50")
                 self._poll_and_drain(50)
+                self._set_phase("idle")
+                self._mark_progress()
         finally:
             self.close()
 

@@ -79,6 +79,23 @@ class ManagerLogEventsTests(unittest.TestCase):
         self.assertIn("Traceback: database write hung", call["message"])
         self.assertIn("write_batch", call["message"])
 
+    def test_failure_log_prefers_recent_log_when_stderr_absent(self) -> None:
+        manager = mock.Mock()
+        manager_log_events.maybe_publish_log_event(
+            manager,
+            "manager.process.failed",
+            {
+                "process_id": "watchdog",
+                "error": "heartbeat stale",
+                "tail_recent_logs": [{"message": "phase changed to evaluate_rules"}],
+                "tail_logs": [{"message": "old unrelated error"}],
+            },
+        )
+
+        call = manager._emit_log.call_args.kwargs
+        self.assertIn("phase changed to evaluate_rules", call["message"])
+        self.assertNotIn("old unrelated error", call["message"])
+
     def test_watchdog_trigger_emits_manager_log_entry(self) -> None:
         manager = mock.Mock()
         manager_log_events.maybe_publish_log_event(

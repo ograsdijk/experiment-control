@@ -122,6 +122,12 @@ def _event_log_severity(topic: str, payload: Json) -> str | None:
         return None
     if topic == "manager.watchdog.triggered":
         return normalize_log_severity(payload.get("severity"), default="warning")
+    if topic.startswith("manager.device.auto_reconnect."):
+        if topic.endswith("success") or topic.endswith("reset"):
+            return "info"
+        if topic.endswith("attempt") or topic.endswith("suppressed"):
+            return "warning"
+        return "error"
     if topic.endswith("telemetry_stale"):
         return "warning"
     if (
@@ -193,6 +199,35 @@ def _heartbeat_detail(payload: Json) -> str:
     return ""
 
 
+def _auto_reconnect_message(topic: str, payload: Json) -> str:
+    device_id = str(payload.get("device_id") or "unknown")
+    reconnect = payload.get("auto_reconnect")
+    max_attempts = None
+    if isinstance(reconnect, dict):
+        max_attempts = reconnect.get("max_attempts")
+    attempt = payload.get("attempt")
+    age = payload.get("telemetry_age_s")
+    suffix = ""
+    if attempt is not None:
+        suffix += f" attempt {attempt}"
+        if max_attempts is not None:
+            suffix += f"/{max_attempts}"
+    if age is not None:
+        try:
+            suffix += f" telemetry_age={float(age):.2f}s"
+        except Exception:
+            pass
+    if topic.endswith("attempt"):
+        return f"Auto-reconnect {device_id}: attempting reconnect{suffix}"
+    if topic.endswith("success"):
+        return f"Auto-reconnect {device_id}: reconnect succeeded{suffix}"
+    if topic.endswith("suppressed"):
+        return f"Auto-reconnect {device_id}: suppressed ({payload.get('reason')}){suffix}"
+    if topic.endswith("reset"):
+        return f"Auto-reconnect {device_id}: attempts reset after healthy telemetry"
+    return f"Auto-reconnect {device_id}: failed ({payload.get('error')}){suffix}"
+
+
 def _failure_message(topic: str, payload: Json) -> str:
     process_id = payload.get("process_id")
     device_id = payload.get("device_id")
@@ -203,6 +238,8 @@ def _failure_message(topic: str, payload: Json) -> str:
     stderr = _last_tail_message(payload, "tail_stderr")
     if stderr:
         parts.append(f"last stderr: {stderr}")
+    elif recent := _last_tail_message(payload, "tail_recent_logs"):
+        parts.append(f"recent log: {recent}")
     elif supervisor := _last_tail_message(payload, "tail_supervisor_logs"):
         parts.append(f"last log: {supervisor}")
     heartbeat = _heartbeat_detail(payload)
@@ -219,6 +256,8 @@ def maybe_publish_log_event(manager: Any, topic: str, payload: Json) -> None:
     message = payload.get("error") or payload.get("message") or ""
     if topic == "manager.command":
         message = _command_failure_message(payload)
+    elif topic.startswith("manager.device.auto_reconnect."):
+        message = _auto_reconnect_message(topic, payload)
     elif topic.endswith("failed") or topic.endswith("crashloop") or "kill_timeout" in topic:
         message = _failure_message(topic, payload)
     manager._emit_log(
