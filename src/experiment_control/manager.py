@@ -701,6 +701,8 @@ class DeviceHandle:
     last_hb: Heartbeat | None = None
     driver_process_state: ManagedProcessState = ManagedProcessState.STOPPED
     driver_pid: int | None = None
+    driver_popen_pid: int | None = None
+    driver_heartbeat_pid: int | None = None
     driver_last_exit_code: int | None = None
     driver_restart_count: int = 0
     driver_last_restart_t_mono: float | None = None
@@ -755,6 +757,8 @@ class ProcessHandle:
     popen: subprocess.Popen[str] | None = None
     state: ManagedProcessState = ManagedProcessState.STOPPED
     pid: int | None = None
+    popen_pid: int | None = None
+    heartbeat_pid: int | None = None
     rpc_endpoint: str | None = None
     rpc_sock: zmq.Socket | None = None
     rpc_fail_count: int = 0
@@ -2079,6 +2083,7 @@ class Manager:
             )
             return
 
+        handle.heartbeat_pid = pid
         handle.pid = pid
         handle.last_hb_t_wall = float(ts["t_wall"])
         handle.last_hb_t_mono = float(ts["t_mono"])
@@ -2631,6 +2636,8 @@ class Manager:
             "driver_process": {
                 "state": handle.driver_process_state,
                 "pid": handle.driver_pid,
+                "popen_pid": handle.driver_popen_pid,
+                "heartbeat_pid": handle.driver_heartbeat_pid,
                 "restart_count": handle.driver_restart_count,
                 "last_exit_code": handle.driver_last_exit_code,
                 "last_error": handle.driver_last_error,
@@ -2954,6 +2961,8 @@ class Manager:
             "process_id": handle.spec.process_id,
             "state": handle.state,
             "pid": handle.pid,
+            "popen_pid": handle.popen_pid,
+            "heartbeat_pid": handle.heartbeat_pid,
             "exit_code": handle.last_exit_code,
             "heartbeat_endpoint": handle.heartbeat_endpoint,
             "process_data_endpoint": handle.process_data_endpoint,
@@ -2986,6 +2995,8 @@ class Manager:
             "device_id": handle.spec.device_id,
             "state": handle.driver_process_state,
             "pid": handle.driver_pid,
+            "popen_pid": handle.driver_popen_pid,
+            "heartbeat_pid": handle.driver_heartbeat_pid,
             "exit_code": handle.driver_last_exit_code,
             "error": handle.driver_last_error,
             "restart_count": handle.driver_restart_count,

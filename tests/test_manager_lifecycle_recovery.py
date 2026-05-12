@@ -14,16 +14,34 @@ if str(SRC) not in sys.path:
 
 from experiment_control.cli.run_stack import _preflight_instance_cleanup
 from experiment_control.manager import (
+    DeviceHandle,
+    DeviceSpec,
     ManagedProcessState,
     Manager,
     ProcessHandle,
     ProcessSpec,
 )
+from experiment_control.manager_driver_pub import _store_heartbeat_on_handle
+from experiment_control.types import DeviceState, DriverState, Timestamp
 
 
 def _build_handle(process_id: str = "hdf_writer") -> ProcessHandle:
     spec = ProcessSpec(process_id=process_id, argv=["python", "-m", "dummy"])
     return ProcessHandle(spec=spec, state=ManagedProcessState.STARTING)
+
+
+class _Heartbeat:
+    def __init__(self, pid: int) -> None:
+        self.pid = pid
+        self.driver_state = DriverState.OK
+        self.device_reachable = True
+        self.device_state = DeviceState.OK
+        self.device_health = None
+        self.last_error = None
+        self.last_ok_wall = None
+        self.last_ok_mono = None
+        self.loop_lag_s = None
+        self.ts = Timestamp(t_wall=1.0, t_mono=2.0)
 
 
 class ManagerLifecycleRecoveryTests(unittest.TestCase):
@@ -153,6 +171,9 @@ class ManagerLifecycleRecoveryTests(unittest.TestCase):
     def test_process_snapshot_includes_heartbeat_and_supervisor_tails(self) -> None:
         mgr = object.__new__(Manager)
         handle = _build_handle("influx_writer")
+        handle.popen_pid = 111
+        handle.heartbeat_pid = 222
+        handle.pid = 222
         handle.last_heartbeat_payload = {"process_id": "influx_writer", "phase": "write_batch"}
         handle.supervisor_stdout_tail.append({"message": "started", "stream": "stdout"})
         handle.supervisor_stderr_tail.append({"message": "write warning", "stream": "stderr"})
@@ -162,10 +183,34 @@ class ManagerLifecycleRecoveryTests(unittest.TestCase):
 
         snapshot = Manager._process_snapshot(mgr, handle)  # type: ignore[arg-type]
 
+        self.assertEqual(snapshot["pid"], 222)
+        self.assertEqual(snapshot["popen_pid"], 111)
+        self.assertEqual(snapshot["heartbeat_pid"], 222)
         self.assertEqual(snapshot["last_heartbeat_payload"]["phase"], "write_batch")
         self.assertEqual(snapshot["tail_stdout"][-1]["message"], "started")
         self.assertEqual(snapshot["tail_stderr"][-1]["message"], "write warning")
         self.assertEqual(snapshot["tail_supervisor_logs"][-1]["severity"], "warning")
+
+    def test_driver_heartbeat_preserves_popen_pid(self) -> None:
+        mgr = object.__new__(Manager)
+        handle = DeviceHandle(
+            spec=DeviceSpec(
+                device_id="ctc100",
+                device_class_path="driver.py",
+                device_class_name="Driver",
+                device_init_kwargs={},
+                telemetry_calls=[],
+            )
+        )
+        handle.driver_popen_pid = 111
+        handle.driver_pid = 111
+        mgr._devices = {"ctc100": handle}  # type: ignore[attr-defined]
+
+        _store_heartbeat_on_handle(mgr, device_id="ctc100", hb=_Heartbeat(222))
+
+        self.assertEqual(handle.driver_popen_pid, 111)
+        self.assertEqual(handle.driver_heartbeat_pid, 222)
+        self.assertEqual(handle.driver_pid, 222)
 
     def test_manager_identity_reports_last_orphan_cleanup(self) -> None:
         mgr = object.__new__(Manager)

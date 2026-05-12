@@ -425,6 +425,7 @@ def _store_heartbeat_on_handle(manager: Any, *, device_id: str, hb: Any) -> None
         return
     handle.last_hb = hb
     handle.last_hb_recv_mono = time.monotonic()
+    handle.driver_heartbeat_pid = hb.pid
     if handle.driver_pid != hb.pid:
         handle.driver_pid = hb.pid
 

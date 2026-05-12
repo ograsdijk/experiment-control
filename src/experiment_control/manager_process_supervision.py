@@ -195,6 +195,7 @@ def start_driver(manager: Any, device_id: str) -> None:
     except Exception as exc:
         handle.process = None
         handle.driver_pid = None
+        handle.driver_popen_pid = None
         handle.driver_process_state = _enum_member(handle.driver_process_state, "FAILED")
         handle.driver_last_error = str(exc)
         handle.driver_last_error_kind = "spawn_error"
@@ -215,7 +216,9 @@ def start_driver(manager: Any, device_id: str) -> None:
         target_kind="driver",
         target_id=device_id,
     )
-    handle.driver_pid = handle.process.pid
+    handle.driver_popen_pid = handle.process.pid
+    handle.driver_heartbeat_pid = None
+    handle.driver_pid = handle.driver_popen_pid
     handle.driver_process_state = _enum_member(handle.driver_process_state, "STARTING")
     handle.driver_last_exit_code = None
     handle.driver_stop_requested_t_mono = None
@@ -659,6 +662,7 @@ def start_process_handle(
     except Exception as exc:
         handle.popen = None
         handle.pid = None
+        handle.popen_pid = None
         handle.state = _enum_member(handle.state, "FAILED")
         handle.last_error = str(exc)
         handle.last_error_kind = "spawn_error"
@@ -680,7 +684,9 @@ def start_process_handle(
         target_kind="process",
         target_id=handle.spec.process_id,
     )
-    handle.pid = handle.popen.pid
+    handle.popen_pid = handle.popen.pid
+    handle.heartbeat_pid = None
+    handle.pid = handle.popen_pid
     handle.state = _enum_member(handle.state, "STARTING")
     handle.rpc_endpoint = None
     manager._close_process_rpc(handle)
@@ -809,6 +815,8 @@ def process_snapshot(manager: Any, handle: Any) -> Json:
         "max_restarts": handle.spec.max_restarts,
         "state": handle.state,
         "pid": handle.pid,
+        "popen_pid": handle.popen_pid,
+        "heartbeat_pid": handle.heartbeat_pid,
         "rss_bytes": rss_bytes,
         "last_start_t_wall": handle.last_start_t_wall,
         "last_start_t_mono": handle.last_start_t_mono,
@@ -843,7 +851,7 @@ def process_snapshot(manager: Any, handle: Any) -> Json:
 def update_device_driver_exit_state(manager: Any, handle: Any, rc: int) -> None:
     rc_int = int(rc)
     handle.driver_last_exit_code = rc_int
-    exiting_pid = handle.driver_pid
+    exiting_pid = handle.driver_popen_pid or handle.driver_pid
     handle.process = None
     handle.driver_pid = None
     if (
@@ -950,7 +958,12 @@ def _auto_reconnect_publish(manager: Any, topic: str, device_id: str, payload: J
     manager._publish_manager_event(topic, payload)
 
 
-def _auto_reconnect_reset_if_healthy(manager: Any, device_id: str, handle: Any, now_mono: float) -> None:
+def _auto_reconnect_reset_if_healthy(
+    manager: Any,
+    device_id: str,
+    handle: Any,
+    now_mono: float,
+) -> None:
     spec = handle.spec.auto_reconnect
     if not spec.enabled or handle.auto_reconnect_attempts <= 0:
         return
@@ -979,7 +992,12 @@ def _auto_reconnect_reset_if_healthy(manager: Any, device_id: str, handle: Any, 
     )
 
 
-def _auto_reconnect_should_attempt(manager: Any, device_id: str, handle: Any, now_mono: float) -> tuple[bool, float | None, str | None]:
+def _auto_reconnect_should_attempt(
+    manager: Any,
+    device_id: str,
+    handle: Any,
+    now_mono: float,
+) -> tuple[bool, float | None, str | None]:
     spec = handle.spec.auto_reconnect
     if not spec.enabled:
         return False, None, None
@@ -1018,7 +1036,13 @@ def _auto_reconnect_should_attempt(manager: Any, device_id: str, handle: Any, no
     return True, age_s, None
 
 
-def _auto_reconnect_attempt(manager: Any, device_id: str, handle: Any, now_mono: float, age_s: float) -> None:
+def _auto_reconnect_attempt(
+    manager: Any,
+    device_id: str,
+    handle: Any,
+    now_mono: float,
+    age_s: float,
+) -> None:
     spec = handle.spec.auto_reconnect
     handle.auto_reconnect_attempts += 1
     handle.auto_reconnect_last_attempt_mono = now_mono
@@ -1083,7 +1107,12 @@ def _auto_reconnect_attempt(manager: Any, device_id: str, handle: Any, now_mono:
         )
 
 
-def _maybe_auto_reconnect_device(manager: Any, device_id: str, handle: Any, now_mono: float) -> None:
+def _maybe_auto_reconnect_device(
+    manager: Any,
+    device_id: str,
+    handle: Any,
+    now_mono: float,
+) -> None:
     _auto_reconnect_reset_if_healthy(manager, device_id, handle, now_mono)
     should_attempt, age_s, _reason = _auto_reconnect_should_attempt(
         manager,
@@ -1110,8 +1139,8 @@ def supervise_device_drivers(manager: Any, now_mono: float) -> None:
 def update_managed_process_exit_state(manager: Any, handle: Any, rc: int) -> bool:
     rc_int = int(rc)
     handle.last_exit_code = rc_int
-    # Capture the pid before we clear it; only published on the FAILED branch.
-    exiting_pid = handle.pid
+    # Capture the popen pid before we clear it; only published on the FAILED branch.
+    exiting_pid = handle.popen_pid or handle.pid
     handle.popen = None
     handle.pid = None
     handle.rpc_endpoint = None

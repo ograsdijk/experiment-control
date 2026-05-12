@@ -102,10 +102,41 @@ def append_supervisor_jsonl(manager: Any, item: Json) -> None:
             "stream": item.get("stream"),
             "message": item.get("message"),
         }
+        if item.get("event") is not None:
+            entry["event"] = item.get("event")
         with path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
     except Exception:
         return
+
+
+def append_supervisor_marker(
+    manager: Any,
+    *,
+    log_path: Path,
+    source_kind: str,
+    source_id: str,
+    stream: str,
+    pid: int,
+    event: str,
+    device_id: str | None,
+    process_id: str | None,
+    message: str | None = None,
+) -> None:
+    append_supervisor_jsonl(
+        manager,
+        {
+            "source_kind": source_kind,
+            "source_id": source_id,
+            "stream": stream,
+            "pid": pid,
+            "device_id": device_id,
+            "process_id": process_id,
+            "message": message or event,
+            "event": event,
+            "log_path": str(log_path),
+        },
+    )
 
 
 def start_child_log_readers(
@@ -148,6 +179,18 @@ def start_child_log_readers(
         except Exception:
             pass
 
+        append_supervisor_marker(
+            manager,
+            log_path=log_path,
+            source_kind=source_kind,
+            source_id=source_id,
+            stream=stream,
+            pid=pid,
+            event="stream_opened",
+            device_id=device_id,
+            process_id=process_id,
+        )
+
         def _reader(
             *,
             pipe_obj: Any,
@@ -189,10 +232,22 @@ def start_child_log_readers(
                         "process_id": process_id_value,
                         "message": f"log stream read failed: {exc}",
                         "reader_error": True,
+                        "event": "stream_reader_error",
                         "log_path": str(log_path_value),
                     },
                 )
             finally:
+                append_supervisor_marker(
+                    manager,
+                    log_path=log_path_value,
+                    source_kind=source_kind_name,
+                    source_id=source_id_name,
+                    stream=stream_name,
+                    pid=pid_value,
+                    event="stream_closed",
+                    device_id=device_id_value,
+                    process_id=process_id_value,
+                )
                 try:
                     pipe_obj.close()
                 except Exception:

@@ -120,6 +120,26 @@ class ProcessDiagnosticsTests(unittest.TestCase):
             self.assertTrue(path.with_name(f"{path.name}.1").exists())
             self.assertIn("new", path.read_text(encoding="utf-8"))
 
+    def test_supervisor_jsonl_marker_records_event(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = _DummyLogManager(Path(tmp))
+            path = Path(tmp) / "process-p-1.stdout.jsonl"
+            manager_process_logs.append_supervisor_marker(
+                manager,
+                log_path=path,
+                source_kind="process",
+                source_id="p",
+                stream="stdout",
+                pid=1,
+                event="stream_opened",
+                device_id=None,
+                process_id="p",
+            )
+
+            row = json.loads(path.read_text(encoding="utf-8").splitlines()[0])
+            self.assertEqual(row["event"], "stream_opened")
+            self.assertEqual(row["message"], "stream_opened")
+
 
 if __name__ == "__main__":
     unittest.main()
