@@ -1056,6 +1056,46 @@ class DeviceRunner:
 
         return out
 
+    @staticmethod
+    def _telemetry_quality_counts(signals: dict[str, dict[str, Any]]) -> dict[str, int]:
+        counts = {"OK": 0, "BAD": 0, "MISSING": 0, "STALE": 0, "OTHER": 0}
+        for payload in signals.values():
+            if not isinstance(payload, dict):
+                counts["OTHER"] += 1
+                continue
+            quality = payload.get("quality")
+            if isinstance(quality, TelemetryQuality):
+                key = quality.value
+            else:
+                key = str(quality or "OTHER").upper()
+            if key not in counts:
+                key = "OTHER"
+            counts[key] += 1
+        return counts
+
+    def _apply_telemetry_quality_state(self, signals: dict[str, dict[str, Any]]) -> None:
+        counts = self._telemetry_quality_counts(signals)
+        total = sum(counts.values())
+        ok_count = counts.get("OK", 0)
+        bad_count = total - ok_count
+        if total == 0 or ok_count == 0:
+            self._device_reachable = False
+            if self._device_state != DeviceState.DISCONNECTED:
+                self._device_state = DeviceState.DEGRADED
+            self._last_error = f"telemetry returned no OK signals ({counts})"
+            return
+        self._device_reachable = True
+        if bad_count > 0:
+            if self._device_state != DeviceState.DISCONNECTED:
+                self._device_state = DeviceState.DEGRADED
+            self._last_error = f"telemetry partially degraded ({counts})"
+            return
+        if self._device_state == DeviceState.DISCONNECTED:
+            self._device_state = DeviceState.OK
+        elif self._device_state == DeviceState.DEGRADED:
+            self._device_state = DeviceState.OK
+        self._last_error = None
+
     def _extract_telemetry_value(self, ret: Any, o: TelemetryOut) -> Any:
         return extract_value(ret, kind=o.kind, ref=o.ref)
 
@@ -1413,11 +1453,15 @@ class DeviceRunner:
         signals: dict[str, dict[str, Any]] = {}
         try:
             signals = self.read_telemetry()
-            self._device_reachable = True
-            if self._device_state == DeviceState.DISCONNECTED:
-                self._device_state = DeviceState.OK
-            self._last_ok_ts = bundle_ts
-            self._last_error = None
+            if self.telemetry_signal_names():
+                self._apply_telemetry_quality_state(signals)
+            else:
+                self._device_reachable = True
+                if self._device_state == DeviceState.DISCONNECTED:
+                    self._device_state = DeviceState.OK
+                self._last_error = None
+            if self._device_reachable:
+                self._last_ok_ts = bundle_ts
         except Exception as e:
             self._device_reachable = False
             # Keep DISCONNECTED if it was disconnected, otherwise mark degraded
