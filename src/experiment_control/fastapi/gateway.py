@@ -26,6 +26,7 @@ class GatewaySettings:
     rpc_timeout_ms: int = 2000
     rpc_queue_max: int = 1024
     stream_max_payload_points: int = 200_000
+    stream_max_record_events: int = 512
     stream_max_keys: int = 1024
     stream_key_ttl_s: float = 600.0
     telemetry_topics: tuple[str, ...] = ("manager.telemetry_update",)
@@ -290,12 +291,14 @@ class StreamFrameHub:
         *,
         topics: tuple[str, ...] = ("manager.chunk_ready",),
         max_payload_points: int = 200_000,
+        max_record_events: int = 512,
         max_stream_keys: int = 1024,
         stream_key_ttl_s: float = 600.0,
     ) -> None:
         self._endpoint = endpoint
         self._topics = topics
         self._max_payload_points = max(1, int(max_payload_points))
+        self._max_record_events = max(1, int(max_record_events))
         self._max_stream_keys = max(1, int(max_stream_keys))
         self._stream_key_ttl_s = max(0.0, float(stream_key_ttl_s))
         self._ctx = zmq.Context.instance()
@@ -418,6 +421,7 @@ class StreamFrameHub:
             subscriber_count = int(len(self._queues))
         return {
             "max_payload_points": int(self._max_payload_points),
+            "max_record_events": int(self._max_record_events),
             "max_stream_keys": int(self._max_stream_keys),
             "stream_key_ttl_s": float(self._stream_key_ttl_s),
             "latest_frame_count": latest_frame_count,
@@ -478,6 +482,14 @@ class StreamFrameHub:
         except Exception:
             return None
 
+    def _cap_record_stream_events(
+        self, events: list[dict[str, Any]]
+    ) -> tuple[list[dict[str, Any]], int]:
+        if len(events) <= self._max_record_events:
+            return events, 0
+        dropped = len(events) - self._max_record_events
+        return events[-self._max_record_events :], dropped
+
     def _build_stream_frame(
         self,
         *,
@@ -528,6 +540,100 @@ class StreamFrameHub:
         if truncated:
             out["truncated"] = True
         return {"topic": "manager.stream_frame", "payload": out}
+
+    def _record_event_to_values(
+        self,
+        *,
+        reader: ShmRingReader,
+        event: dict[str, Any],
+    ) -> list[Any] | None:
+        payload_bytes = event.get("payload")
+        if not isinstance(payload_bytes, (bytes, bytearray, memoryview)):
+            return None
+        dtype = reader.layout.dtype
+        names = dtype.names or ()
+        try:
+            arr = np.frombuffer(payload_bytes, dtype=dtype).reshape(())
+        except Exception:
+            return None
+        values: list[Any] = []
+        for name in names:
+            try:
+                value = arr[name].item()
+            except Exception:
+                value = None
+            values.append(_sanitize_json(value))
+        return values
+
+    def _build_stream_records(
+        self,
+        *,
+        device_id: str,
+        stream: str,
+        reader: ShmRingReader,
+        events: list[tuple[dict[str, Any], int | None, dict[str, Any] | None]],
+        dropped_record_count: int = 0,
+    ) -> dict[str, Any] | None:
+        dtype = reader.layout.dtype
+        names = list(dtype.names or ())
+        if not names:
+            return None
+        records: list[list[Any]] = []
+        seqs: list[int] = []
+        t0_mono_ns: list[int | None] = []
+        t0_wall_ns: list[int | None] = []
+        context_ids: list[int | None] = []
+        context_fields_by_record: list[dict[str, Any] | None] = []
+        for event, context_id, context_fields in events:
+            seq = self._normalize_int(event.get("seq"))
+            if seq is None:
+                continue
+            values = self._record_event_to_values(reader=reader, event=event)
+            if values is None:
+                continue
+            records.append(values)
+            seqs.append(int(seq))
+            t0_mono_ns.append(self._normalize_int(event.get("t0_mono_ns")))
+            t0_wall_ns.append(self._normalize_int(event.get("t0_wall_ns")))
+            context_ids.append(int(context_id) if context_id is not None else None)
+            context_fields_by_record.append(
+                _sanitize_json(dict(context_fields))
+                if isinstance(context_fields, dict)
+                else None
+            )
+        if not records:
+            return None
+        out: dict[str, Any] = {
+            "version": 1,
+            "device_id": device_id,
+            "stream": stream,
+            "stream_kind": "records",
+            "fields": names,
+            "records": records,
+            "seqs": seqs,
+            "t0_mono_ns": t0_mono_ns,
+            "t0_wall_ns": t0_wall_ns,
+            "context_ids": context_ids,
+            "context_fields_by_record": context_fields_by_record,
+            "dtype": str(dtype),
+            "record_count": len(records),
+        }
+        if dropped_record_count > 0:
+            out["truncated"] = True
+            out["dropped_record_count"] = int(dropped_record_count)
+        if (
+            context_ids
+            and context_ids[0] is not None
+            and all(item == context_ids[0] for item in context_ids)
+        ):
+            out["context_id"] = int(context_ids[0])
+        if (
+            context_fields_by_record
+            and context_fields_by_record[0]
+            and all(item == context_fields_by_record[0] for item in context_fields_by_record)
+        ):
+            out["context_fields"] = dict(context_fields_by_record[0])
+        return {"topic": "manager.stream_records", "payload": out}
 
     def _run(self) -> None:
         sub = self._ctx.socket(zmq.SUB)
@@ -623,8 +729,15 @@ class StreamFrameHub:
                         self._context_by_seq.pop(key, None)
                 continue
 
-            # Avoid flooding websocket clients after reconnect/attach.
-            if len(stream_events) > 4:
+            is_record_stream = reader.layout.dtype.fields is not None
+
+            # Avoid flooding websocket clients after reconnect/attach for frame streams.
+            record_events_dropped = 0
+            if is_record_stream:
+                stream_events, record_events_dropped = self._cap_record_stream_events(
+                    stream_events
+                )
+            elif len(stream_events) > 4:
                 stream_events = stream_events[-4:]
 
             current_context_id, current_context_fields = self._stream_context.get(
@@ -634,6 +747,9 @@ class StreamFrameHub:
                 current_context_fields = dict(current_context_fields)
 
             latest_seq = last_seq
+            record_batch_events: list[
+                tuple[dict[str, Any], int | None, dict[str, Any] | None]
+            ] = []
             for event in stream_events:
                 seq_raw = self._normalize_int(event.get("seq"))
                 if seq_raw is None:
@@ -666,6 +782,17 @@ class StreamFrameHub:
                         if isinstance(event_context_fields, dict)
                         else None
                     )
+                if is_record_stream:
+                    record_batch_events.append(
+                        (
+                            event,
+                            event_context_id,
+                            dict(event_context_fields)
+                            if isinstance(event_context_fields, dict)
+                            else None,
+                        )
+                    )
+                    continue
                 msg = self._build_stream_frame(
                     device_id=device_id,
                     stream=stream,
@@ -680,6 +807,26 @@ class StreamFrameHub:
                         with self._lock:
                             self._latest_frame[key] = {
                                 "topic": str(msg.get("topic") or "manager.stream_frame"),
+                                "payload": _sanitize_json(dict(payload_obj)),
+                            }
+                    self._loop.call_soon_threadsafe(self._fanout, msg)
+
+            if is_record_stream and record_batch_events:
+                msg = self._build_stream_records(
+                    device_id=device_id,
+                    stream=stream,
+                    reader=reader,
+                    events=record_batch_events,
+                    dropped_record_count=record_events_dropped,
+                )
+                if msg is not None and self._loop is not None:
+                    payload_obj = msg.get("payload")
+                    if isinstance(payload_obj, dict):
+                        with self._lock:
+                            self._latest_frame[key] = {
+                                "topic": str(
+                                    msg.get("topic") or "manager.stream_records"
+                                ),
                                 "payload": _sanitize_json(dict(payload_obj)),
                             }
                     self._loop.call_soon_threadsafe(self._fanout, msg)

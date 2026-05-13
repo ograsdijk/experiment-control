@@ -745,6 +745,7 @@ class FitCurve1DState:
 
 OPS: dict[str, OpSpec] = {
     "source.stream": OpSpec(input_types={}, output_type="trace", stateful=False),
+    "source.records": OpSpec(input_types={}, output_type="record", stateful=False),
     "source.context_field": OpSpec(input_types={}, output_type="scalar", stateful=False),
     "source.telemetry_nearest": OpSpec(
         input_types={}, output_type="scalar", stateful=False
@@ -763,6 +764,12 @@ OPS: dict[str, OpSpec] = {
     ),
     "scalar.threshold": OpSpec(
         input_types={"x": "scalar"}, output_type="scalar", stateful=False
+    ),
+    "record.field": OpSpec(
+        input_types={"record": "record"}, output_type="scalar", stateful=False
+    ),
+    "record.filter_eq": OpSpec(
+        input_types={"record": "record"}, output_type="scalar", stateful=False
     ),
     "trace.divide": OpSpec(
         input_types={"a": "trace", "b": "trace"}, output_type="trace", stateful=False
@@ -870,6 +877,10 @@ OP_PARAM_SCHEMAS: dict[str, list[Json]] = {
     "source.context_field": [
         {"name": "field", "kind": "string", "required": True},
     ],
+    "source.records": [
+        {"name": "device_id", "kind": "string", "required": True},
+        {"name": "stream", "kind": "string", "required": True},
+    ],
     "source.telemetry_nearest": [
         {"name": "device_id", "kind": "string", "required": True},
         {"name": "signal", "kind": "string", "required": True},
@@ -878,6 +889,13 @@ OP_PARAM_SCHEMAS: dict[str, list[Json]] = {
     "scalar.threshold": [
         {"name": "threshold", "kind": "number", "required": True},
         {"name": "mode", "kind": "string", "required": False, "default": "gt"},
+    ],
+    "record.field": [
+        {"name": "field", "kind": "string", "required": True},
+    ],
+    "record.filter_eq": [
+        {"name": "field", "kind": "string", "required": True},
+        {"name": "value", "kind": "number", "required": True},
     ],
     "trace.rolling_mean": [
         {"name": "window_traces", "kind": "integer", "required": True, "default": 1},
@@ -1009,6 +1027,22 @@ def _normalize_float(raw: Any) -> float | None:
     if not math.isfinite(value):
         return None
     return value
+
+
+def _structured_record_to_dict(array: np.ndarray) -> dict[str, Any]:
+    dtype = array.dtype
+    names = dtype.names or ()
+    if not names:
+        return {}
+    record = np.asarray(array, dtype=dtype).reshape(())
+    out: dict[str, Any] = {}
+    for name in names:
+        try:
+            value = record[name].item()
+        except Exception:
+            value = None
+        out[str(name)] = value
+    return out
 
 
 def _normalize_bool(raw: Any, *, default: bool = False) -> bool:
@@ -2071,6 +2105,8 @@ def _normalize_node(raw: Any, *, index: int) -> NodeSpec:
         raise ValueError(f"graph.nodes[{index}] must be an object")
     node_id = _normalize_id(raw.get("id"))
     if node_id is None:
+        node_id = _normalize_id(raw.get("node_id"))
+    if node_id is None:
         raise ValueError(f"graph.nodes[{index}].id is required")
     op = _normalize_id(raw.get("op"))
     if op is None:
@@ -2249,6 +2285,18 @@ def _validate_source_stream_node(
     _ = _parse_channel_indices(node.params.get("channel_indices"))
 
 
+def _validate_source_records_node(
+    *,
+    node: NodeSpec,
+    source_stream_nodes: list[str],
+) -> None:
+    source_stream_nodes.append(node.node_id)
+    did = _normalize_id(node.params.get("device_id"))
+    stream = _normalize_id(node.params.get("stream"))
+    if did is None or stream is None:
+        raise ValueError(f"node {node.node_id!r} {node.op} requires device_id and stream")
+
+
 def _validate_source_context_field_node(node: NodeSpec) -> None:
     field = _normalize_id(node.params.get("field"))
     if field is None:
@@ -2349,11 +2397,34 @@ def _validate_node_source_telemetry_nearest(
     _validate_source_telemetry_nearest_node(node)
 
 
+def _validate_node_record_field(
+    node: NodeSpec,
+    source_stream_nodes: list[str],
+) -> None:
+    del source_stream_nodes
+    field = _normalize_id(node.params.get("field"))
+    if field is None:
+        raise ValueError(f"node {node.node_id!r} {node.op} requires field")
+
+
+def _validate_node_record_filter_eq(
+    node: NodeSpec,
+    source_stream_nodes: list[str],
+) -> None:
+    del source_stream_nodes
+    field = _normalize_id(node.params.get("field"))
+    if field is None:
+        raise ValueError(f"node {node.node_id!r} {node.op} requires field")
+
+
 _NODE_OP_PARAM_VALIDATORS: dict[str, Callable[[NodeSpec, list[str]], None]] = {
     "source.stream": _validate_source_stream_node,
+    "source.records": _validate_source_records_node,
     "source.context_field": _validate_node_source_context_field,
     "source.telemetry_nearest": _validate_node_source_telemetry_nearest,
     "scalar.threshold": _validate_node_scalar_threshold,
+    "record.field": _validate_node_record_field,
+    "record.filter_eq": _validate_node_record_filter_eq,
     "trace.rolling_mean": _validate_node_trace_rolling_mean,
     "trace.decimate": _validate_node_trace_decimate,
     "fit.curve_1d": _validate_node_fit_curve_1d,
@@ -2444,7 +2515,7 @@ def compile_workspace_graph(config: Json) -> CompiledWorkspace:
         )
 
     if len(source_stream_nodes) != 1:
-        raise ValueError("graph must contain exactly one source.stream node")
+        raise ValueError("graph must contain exactly one source stream node")
 
     source_node = nodes[source_stream_nodes[0]]
     stream_key = (
@@ -3608,6 +3679,9 @@ class StreamAnalysisProcess(ManagedProcessBase):
                 array=array,
             )
             return True, source_update
+        if op == "source.records":
+            values[node_id] = _structured_record_to_dict(array)
+            return True, (0, 1)
         if op == "source.context_field":
             field = _normalize_id(node.params.get("field"))
             scalar = None
@@ -3703,6 +3777,19 @@ class StreamAnalysisProcess(ManagedProcessBase):
                 threshold=threshold,
                 mode=mode,
             )
+            return True, None
+        if node.op == "record.field":
+            record = values.get(node.inputs["record"])
+            field = _normalize_id(node.params.get("field"))
+            value = record.get(field) if isinstance(record, dict) and field else None
+            values[node_id] = _normalize_float(value)
+            return True, None
+        if node.op == "record.filter_eq":
+            record = values.get(node.inputs["record"])
+            field = _normalize_id(node.params.get("field"))
+            expected = node.params.get("value")
+            actual = record.get(field) if isinstance(record, dict) and field else None
+            values[node_id] = 1.0 if actual == expected else 0.0
             return True, None
         return False, None
 

@@ -7,6 +7,8 @@ import time
 import unittest
 from pathlib import Path
 
+import numpy as np
+
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
 if str(SRC) not in sys.path:
@@ -39,6 +41,24 @@ class _ReaderStub:
 
     def close(self) -> None:
         self.closed = True
+
+
+class _RecordReaderStub:
+    class _Layout:
+        dtype = np.dtype([("sample_seq", "u8"), ("frequency_hz", "f8")])
+
+    layout = _Layout()
+
+
+def _record_event(seq: int, frequency_hz: float) -> dict[str, object]:
+    dtype = _RecordReaderStub.layout.dtype
+    record = np.asarray((seq, frequency_hz), dtype=dtype).reshape(())
+    return {
+        "seq": seq,
+        "t0_mono_ns": seq * 10,
+        "t0_wall_ns": seq * 100,
+        "payload": record.tobytes(),
+    }
 
 
 class GatewayLifecycleTests(unittest.TestCase):
@@ -182,6 +202,64 @@ class GatewayLifecycleTests(unittest.TestCase):
         self.assertNotIn(key, hub._readers)  # noqa: SLF001
         self.assertTrue(reader.closed)
         self.assertEqual(int(hub.stats().get("dropped_stream_keys_ttl", 0)), 1)
+
+    def test_stream_record_batches_preserve_per_record_context(self) -> None:
+        hub = StreamFrameHub("tcp://127.0.0.1:1", topics=("manager.chunk_ready",))
+        msg = hub._build_stream_records(  # noqa: SLF001
+            device_id="hf_wavemeter",
+            stream="frequency_records",
+            reader=_RecordReaderStub(),  # type: ignore[arg-type]
+            events=[
+                (_record_event(1, 101.0), 10, {"channel": 1}),
+                (_record_event(2, 202.0), 20, {"channel": 2}),
+            ],
+        )
+
+        self.assertIsNotNone(msg)
+        assert msg is not None
+        payload = msg["payload"]
+        self.assertEqual(payload["records"], [[1, 101.0], [2, 202.0]])
+        self.assertEqual(payload["seqs"], [1, 2])
+        self.assertEqual(payload["context_ids"], [10, 20])
+        self.assertEqual(
+            payload["context_fields_by_record"],
+            [{"channel": 1}, {"channel": 2}],
+        )
+        self.assertNotIn("context_id", payload)
+        self.assertNotIn("context_fields", payload)
+
+    def test_stream_record_batches_keep_uniform_top_level_context(self) -> None:
+        hub = StreamFrameHub("tcp://127.0.0.1:1", topics=("manager.chunk_ready",))
+        msg = hub._build_stream_records(  # noqa: SLF001
+            device_id="hf_wavemeter",
+            stream="frequency_records",
+            reader=_RecordReaderStub(),  # type: ignore[arg-type]
+            events=[
+                (_record_event(1, 101.0), 10, {"dwell_id": 4}),
+                (_record_event(2, 202.0), 10, {"dwell_id": 4}),
+            ],
+        )
+
+        self.assertIsNotNone(msg)
+        assert msg is not None
+        payload = msg["payload"]
+        self.assertEqual(payload["context_ids"], [10, 10])
+        self.assertEqual(payload["context_id"], 10)
+        self.assertEqual(payload["context_fields"], {"dwell_id": 4})
+
+    def test_stream_record_event_cap_keeps_newest_events(self) -> None:
+        hub = StreamFrameHub(
+            "tcp://127.0.0.1:1",
+            topics=("manager.chunk_ready",),
+            max_record_events=2,
+        )
+
+        capped, dropped = hub._cap_record_stream_events(  # noqa: SLF001
+            [{"seq": 1}, {"seq": 2}, {"seq": 3}]
+        )
+
+        self.assertEqual(dropped, 1)
+        self.assertEqual([item["seq"] for item in capped], [2, 3])
 
 
 if __name__ == "__main__":

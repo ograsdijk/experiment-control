@@ -572,6 +572,13 @@ class _TelemetryCallPlan:
     outputs: list[_TelemetryOutPlan]
 
 
+@dataclass(slots=True)
+class _ScheduledStreamCallPlan:
+    action_name: str
+    period_s: float
+    next_due_s: float
+
+
 def import_class(file_path: str | Path, class_name: str) -> type[Device]:
     """
     Import a class from a Python source file.
@@ -711,10 +718,12 @@ class DeviceRunner:
         self._stream_writers: dict[str, ShmRingWriter] = {}
         self._stream_outputs: dict[str, StreamOut] = {}
         self._stream_rpc: dict[str, Callable[..., Any]] = {}
+        self._scheduled_stream_calls: list[_ScheduledStreamCallPlan] = []
         self._stream_shm_names: dict[str, str] = {}
         self._stream_context: dict[str, dict[str, Any]] = {}
         self._init_stream_schema()
         self._init_stream_wrappers()
+        self._init_scheduled_stream_calls()
         self._rpc_registry = self._build_rpc_registry()
 
     # ----------------------------
@@ -761,6 +770,9 @@ class DeviceRunner:
 
         next_hb = time.monotonic()
         next_tel = time.monotonic()
+        stream_start = time.monotonic()
+        for plan in self._scheduled_stream_calls:
+            plan.next_due_s = stream_start + plan.period_s
         intended_tick = time.monotonic()
 
         try:
@@ -768,11 +780,13 @@ class DeviceRunner:
                 now = time.monotonic()
                 loop_lag_s = max(0.0, now - intended_tick)
                 intended_tick = now + self.command_poll_period_s
+                next_stream = self._next_scheduled_stream_due()
 
                 # Wait for an RPC request, but wake up for periodic heartbeat/telemetry.
                 timeout_s = min(
                     max(0.0, next_hb - now),
                     max(0.0, next_tel - now),
+                    max(0.0, next_stream - now),
                     self.command_poll_period_s,
                 )
                 timeout_ms = int(timeout_s * 1000)
@@ -802,6 +816,8 @@ class DeviceRunner:
                 if now >= next_tel:
                     self._publish_telemetry()
                     next_tel = now + self.telemetry_period_s
+
+                self._publish_scheduled_streams(now=time.monotonic())
 
         finally:
             # Best-effort cleanup
@@ -1495,6 +1511,49 @@ class DeviceRunner:
             self._stream_rpc[action_name] = wrapper
             setattr(self, action_name, wrapper)
 
+    def _init_scheduled_stream_calls(self) -> None:
+        self._scheduled_stream_calls.clear()
+        now = time.monotonic()
+        for call in self._stream_calls:
+            if call.period_s is None:
+                continue
+            action_name = f"stream__{call.method}"
+            if action_name not in self._stream_rpc:
+                raise ValueError(f"Scheduled stream action {action_name!r} was not registered")
+            self._scheduled_stream_calls.append(
+                _ScheduledStreamCallPlan(
+                    action_name=action_name,
+                    period_s=float(call.period_s),
+                    next_due_s=now + float(call.period_s),
+                )
+            )
+
+    def _next_scheduled_stream_due(self) -> float:
+        if not self._scheduled_stream_calls:
+            return float("inf")
+        return min(plan.next_due_s for plan in self._scheduled_stream_calls)
+
+    def _publish_scheduled_streams(self, *, now: float) -> None:
+        if self._device_state == DeviceState.DISCONNECTED:
+            return
+        for plan in self._scheduled_stream_calls:
+            if now < plan.next_due_s:
+                continue
+            missed = max(0, int((now - plan.next_due_s) // plan.period_s))
+            plan.next_due_s += (missed + 1) * plan.period_s
+            try:
+                self._stream_rpc[plan.action_name]()
+                ts = self._now()
+                self._device_reachable = True
+                if self._device_state == DeviceState.DISCONNECTED:
+                    self._device_state = DeviceState.OK
+                self._last_ok_ts = ts
+                self._last_error = None
+            except Exception as e:
+                if self._device_state != DeviceState.DISCONNECTED:
+                    self._device_state = DeviceState.DEGRADED
+                self._last_error = f"scheduled stream {plan.action_name} failed: {e!r}"
+
     def _make_telemetry_extractor(
         self, kind: ExtractorKind, ref: int | str | None
     ) -> Callable[[Any], Any]:
@@ -1566,10 +1625,10 @@ class DeviceRunner:
             shm_name = f"cntx_{self.device_id}_{stream}_{pid}"
             writer = ShmRingWriter.create(
                 shm_name,
-                dtype=out.dtype,
+                dtype=out.numpy_dtype(),
                 shape=tuple(out.shape),
                 slot_count=out.ring_slots,
-                layout_version=1,
+                layout_version=3 if out.kind == "records" else 1,
             )
             self._stream_writers[stream] = writer
             self._stream_shm_names[stream] = shm_name
@@ -1594,10 +1653,15 @@ class DeviceRunner:
         if stream not in self._stream_outputs:
             raise ValueError(f"Unknown stream {stream!r}")
         out = self._stream_outputs[stream]
-        arr = np.asarray(arr)
-        if arr.dtype != np.dtype(out.dtype):
+        expected_dtype = out.numpy_dtype()
+        arr = (
+            np.asarray(arr, dtype=expected_dtype)
+            if out.kind == "records"
+            else np.asarray(arr)
+        )
+        if arr.dtype != expected_dtype:
             raise ValueError(
-                f"Stream {stream!r} dtype mismatch: got {arr.dtype}, expected {out.dtype}"
+                f"Stream {stream!r} dtype mismatch: got {arr.dtype}, expected {expected_dtype}"
             )
         if tuple(arr.shape) != tuple(out.shape):
             raise ValueError(
@@ -1612,6 +1676,7 @@ class DeviceRunner:
         desc: dict[str, Any] = {
             "device_id": self.device_id,
             "stream": stream,
+            "stream_kind": out.kind,
             "shm_name": self._stream_shm_names[stream],
             "layout_version": writer.layout.layout_version,
             "seq": int(seq),

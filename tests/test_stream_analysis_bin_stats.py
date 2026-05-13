@@ -9,10 +9,56 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from experiment_control.processes.stream_analysis import BinStatsState
+from experiment_control.processes.stream_analysis import BinStatsState, compile_workspace_graph
 
 
 class BinStatsStateTests(unittest.TestCase):
+    def test_source_records_workspace_accepts_node_id_alias(self) -> None:
+        compiled = compile_workspace_graph(
+            {
+                "workspace_id": "wavemeter_channel_frequency",
+                "enabled": True,
+                "graph": {
+                    "nodes": [
+                        {
+                            "node_id": "records",
+                            "op": "source.records",
+                            "params": {
+                                "device_id": "hf_wavemeter",
+                                "stream": "frequency_records",
+                            },
+                        },
+                        {
+                            "node_id": "channel",
+                            "op": "record.field",
+                            "inputs": {"record": "records"},
+                            "params": {"field": "channel"},
+                        },
+                        {
+                            "node_id": "frequency",
+                            "op": "record.field",
+                            "inputs": {"record": "records"},
+                            "params": {"field": "frequency_hz"},
+                        },
+                        {
+                            "node_id": "stats",
+                            "op": "aggregate.bin_stats",
+                            "inputs": {"x": "channel", "y": "frequency"},
+                            "params": {"bin_count": 4, "x_min": 0.5, "x_max": 4.5},
+                        },
+                    ]
+                },
+                "publish": {
+                    "outputs": [
+                        {"output_id": "frequency_by_channel", "node_id": "stats"}
+                    ]
+                },
+            }
+        )
+
+        self.assertEqual(compiled.stream_key, ("hf_wavemeter", "frequency_records"))
+        self.assertEqual(compiled.order, ["records", "channel", "frequency", "stats"])
+
     def test_auto_range_keeps_distinct_x_buckets_while_sparse(self) -> None:
         state = BinStatsState.from_params({"auto_range": True, "bin_count": 4})
         for x_value, y_value in [

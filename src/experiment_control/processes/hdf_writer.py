@@ -3124,7 +3124,7 @@ class HdfWriter(ManagedProcessBase):
             dtype_raw = None if schema is None else schema.get("dtype")
             shape_raw = None if schema is None else schema.get("shape")
             if dtype_raw is None and reader is not None:
-                dtype_raw = str(reader.layout.dtype)
+                dtype_raw = reader.layout.dtype
             if shape_raw is None and reader is not None:
                 shape_raw = tuple(reader.layout.shape)
 
@@ -3132,11 +3132,11 @@ class HdfWriter(ManagedProcessBase):
                 self._clear_stream_buffer(buf)
                 continue
 
-            dtype_str = str(dtype_raw)
+            dtype_obj = np.dtype(dtype_raw)
             shape = tuple(int(x) for x in shape_raw)
             session = self._stream_active_session.get(key, 1)
             datasets = self._ensure_stream_dataset(
-                device_id, stream, dtype_str, shape, session=session
+                device_id, stream, dtype_obj, shape, session=session
             )
 
             n = len(data_list)
@@ -3165,10 +3165,10 @@ class HdfWriter(ManagedProcessBase):
             shape_obj = tuple(data_ds.shape[1:])
             expected_nbytes = self._stream_expected_nbytes.get(key)
             if expected_nbytes is None:
-                expected_nbytes = int(dtype_obj.itemsize * np.prod(shape_obj))
+                expected_nbytes = int(dtype_obj.itemsize * int(np.prod(shape_obj, dtype=np.int64)))
                 self._stream_expected_nbytes[key] = expected_nbytes
-            elif expected_nbytes != int(dtype_obj.itemsize * np.prod(shape_obj)):
-                expected_nbytes = int(dtype_obj.itemsize * np.prod(shape_obj))
+            elif expected_nbytes != int(dtype_obj.itemsize * int(np.prod(shape_obj, dtype=np.int64))):
+                expected_nbytes = int(dtype_obj.itemsize * int(np.prod(shape_obj, dtype=np.int64)))
                 self._stream_expected_nbytes[key] = expected_nbytes
             if any(len(payload) != expected_nbytes for payload in data_list):
                 self._clear_stream_buffer(buf)
@@ -3236,7 +3236,7 @@ class HdfWriter(ManagedProcessBase):
         self,
         device_id: str,
         stream: str,
-        dtype_str: str,
+        dtype: str | np.dtype[Any],
         shape: tuple[int, ...],
         *,
         session: int,
@@ -3251,7 +3251,7 @@ class HdfWriter(ManagedProcessBase):
         stream_group = device_group.require_group(stream)
         session_group = stream_group.require_group(f"session_{session:03d}")
 
-        dtype_obj = np.dtype(dtype_str)
+        dtype_obj = np.dtype(dtype)
         chunk_n = 64
         data_chunks = (chunk_n,) + tuple(shape)
         data_ds = session_group.create_dataset(
@@ -3306,6 +3306,14 @@ class HdfWriter(ManagedProcessBase):
                 data_ds.attrs[attr_key] = value
             self._pending_stream_metadata.pop((device_id, stream), None)
         data_ds.attrs["session"] = int(session)
+        data_ds.attrs["stream_kind"] = "records" if dtype_obj.fields else "frame"
+        if dtype_obj.fields:
+            data_ds.attrs["record_fields_json"] = json.dumps(
+                [
+                    {"name": name, "dtype": str(dtype_obj.fields[name][0])}
+                    for name in (dtype_obj.names or ())
+                ]
+            )
 
         datasets = {
             "data": data_ds,
@@ -3372,17 +3380,39 @@ class HdfWriter(ManagedProcessBase):
                     if not isinstance(out, dict):
                         continue
                     stream = str(out.get("stream"))
-                    dtype = str(out.get("dtype"))
-                    shape_raw = out.get("shape", []) or []
-                    shape = tuple(int(x) for x in shape_raw)
+                    kind = str(out.get("kind", "frame") or "frame")
+                    fields_raw = out.get("fields")
+                    if kind == "records" and isinstance(fields_raw, list):
+                        field_specs: list[tuple[str, str]] = []
+                        for field in fields_raw:
+                            if not isinstance(field, dict):
+                                continue
+                            name = str(field.get("name") or "").strip()
+                            dtype_text = str(field.get("dtype") or "").strip()
+                            if name and dtype_text:
+                                field_specs.append((name, dtype_text))
+                        dtype = np.dtype(field_specs)
+                        shape = ()
+                    else:
+                        dtype = np.dtype(str(out.get("dtype")))
+                        shape_raw = out.get("shape", []) or []
+                        shape = tuple(int(x) for x in shape_raw)
                     key = (device_id, stream)
                     self._stream_schema[key] = {"dtype": dtype, "shape": shape}
                     try:
-                        expected = int(np.dtype(dtype).itemsize * np.prod(shape))
+                        expected = int(dtype.itemsize * int(np.prod(shape, dtype=np.int64)))
                         self._stream_expected_nbytes[key] = expected
                     except Exception:
                         self._stream_expected_nbytes.pop(key, None)
                     merged = stream_call_attrs.setdefault(stream, {})
+                    merged["stream_kind"] = "records" if dtype.fields else "frame"
+                    if dtype.fields:
+                        merged["record_fields_json"] = json.dumps(
+                            [
+                                {"name": name, "dtype": str(dtype.fields[name][0])}
+                                for name in (dtype.names or ())
+                            ]
+                        )
                     units = out.get("units")
                     if units is not None:
                         merged["units"] = units

@@ -153,6 +153,10 @@ def _load_settings() -> GatewaySettings:
                 )
             ),
         ),
+        stream_max_record_events=max(
+            1,
+            int(os.environ.get("EXPERIMENT_CONTROL_STREAM_MAX_RECORD_EVENTS", "512")),
+        ),
         stream_max_keys=max(
             1, int(os.environ.get("EXPERIMENT_CONTROL_STREAM_MAX_KEYS", "1024"))
         ),
@@ -684,6 +688,7 @@ async def _startup() -> None:
         settings.manager_pub,
         topics=settings.stream_topics,
         max_payload_points=settings.stream_max_payload_points,
+        max_record_events=settings.stream_max_record_events,
         max_stream_keys=settings.stream_max_keys,
         stream_key_ttl_s=settings.stream_key_ttl_s,
     )
@@ -803,6 +808,7 @@ async def settings_view(request: Request) -> dict[str, Any]:
             "rpc_queue_max": settings.rpc_queue_max,
             "rpc_queue": rpc_queue,
             "stream_max_payload_points": settings.stream_max_payload_points,
+            "stream_max_record_events": settings.stream_max_record_events,
             "stream_max_keys": settings.stream_max_keys,
             "stream_key_ttl_s": settings.stream_key_ttl_s,
             "stream_state": stream_state,
@@ -906,12 +912,15 @@ async def list_streams() -> dict[str, Any]:
                     if isinstance(shape_raw, list)
                     else []
                 )
+                kind = str(output.get("kind") or "frame")
                 out.append(
                     {
                         "device_id": device_id,
                         "stream": stream,
+                        "kind": kind,
                         "dtype": str(output.get("dtype") or ""),
                         "shape": shape,
+                        "fields": output.get("fields") if kind == "records" else [],
                         "units": output.get("units"),
                         "description": output.get("description"),
                     }

@@ -15,6 +15,11 @@ class _StreamPublisher(Protocol):
 
 
 def _ensure_shot_shape(arr: np.ndarray, out: StreamOut) -> np.ndarray:
+    expected_dtype = out.numpy_dtype()
+    if arr.dtype != expected_dtype:
+        raise ValueError(
+            f"Stream {out.stream!r} dtype mismatch: got {arr.dtype}, expected {expected_dtype}"
+        )
     if tuple(arr.shape) != tuple(out.shape):
         raise ValueError(
             f"Stream {out.stream!r} shot shape mismatch: got {arr.shape}, expected {out.shape}"
@@ -27,6 +32,18 @@ def _ensure_shot_shape(arr: np.ndarray, out: StreamOut) -> np.ndarray:
 def _as_single_shot(value: Any, out: StreamOut) -> list[np.ndarray]:
     arr = np.asarray(value)
     return [_ensure_shot_shape(arr, out)]
+
+
+def _as_record_shots(value: Any, out: StreamOut) -> list[np.ndarray]:
+    dtype = out.numpy_dtype()
+    arr = np.asarray(value, dtype=dtype)
+    if arr.shape == ():
+        return [np.asarray(arr, dtype=dtype).reshape(())]
+    if arr.ndim != 1:
+        raise ValueError(
+            f"Record stream {out.stream!r} expected scalar record or 1D record batch, got {arr.shape}"
+        )
+    return [np.asarray(arr[idx], dtype=dtype).reshape(()) for idx in range(arr.shape[0])]
 
 
 def _as_batch_shots(value: np.ndarray, out: StreamOut, *, n_batch: int) -> list[np.ndarray]:
@@ -67,6 +84,8 @@ def _as_shot_list(
     n_batch: int,
     allow_batch: bool,
 ) -> list[np.ndarray]:
+    if out.kind == "records":
+        return _as_record_shots(value, out)
     if isinstance(value, np.ndarray):
         if tuple(value.shape) == tuple(out.shape):
             return [_ensure_shot_shape(value, out)]
@@ -141,6 +160,10 @@ def _collect_multi_output_shots(
     n_batch: int,
     n_batch_provided: bool,
 ) -> dict[str, list[np.ndarray]]:
+    if any(out.kind == "records" for out in outputs):
+        raise ValueError(
+            "Record streams currently require a single output per stream call"
+        )
     if not isinstance(ret, dict):
         raise TypeError(
             "Stream call with multiple outputs must return dict[str, ndarray|list]"

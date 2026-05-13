@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import struct
 import time
+import json
 from dataclasses import dataclass
 from math import prod
 from multiprocessing import shared_memory
@@ -19,6 +20,7 @@ HEADER_STRUCT_V1 = struct.Struct("<8sIIIIII")
 HEADER_STRUCT_V2 = struct.Struct("<8sIIIIIIQQQQ")
 HEADER_LAST_SEQ_OFFSET = 32
 HEADER_LAST_SLOT_OFFSET = 40
+STRUCTURED_DTYPE_PREFIX = "json:"
 
 
 def dtype_nbytes(dtype_str: str) -> int:
@@ -27,6 +29,30 @@ def dtype_nbytes(dtype_str: str) -> int:
 
 def prod_shape(shape: tuple[int, ...]) -> int:
     return int(prod(shape))
+
+
+def _dtype_to_header_text(dtype: np.dtype[Any]) -> str:
+    if dtype.fields is None:
+        return str(dtype)
+    return STRUCTURED_DTYPE_PREFIX + json.dumps(
+        {
+            "kind": "structured_dtype",
+            "descr": dtype.descr,
+        },
+        separators=(",", ":"),
+    )
+
+
+def _dtype_from_header_text(text: str) -> np.dtype[Any]:
+    if text.startswith(STRUCTURED_DTYPE_PREFIX):
+        raw = json.loads(text[len(STRUCTURED_DTYPE_PREFIX) :])
+        if not isinstance(raw, dict) or raw.get("kind") != "structured_dtype":
+            raise ValueError("Invalid structured dtype header")
+        descr = raw.get("descr")
+        if not isinstance(descr, list):
+            raise ValueError("Invalid structured dtype descriptor")
+        return np.dtype([tuple(item) for item in descr])
+    return np.dtype(text)
 
 
 def now_mono_ns() -> int:
@@ -71,14 +97,14 @@ class ShmRingWriter:
         cls,
         name: str,
         *,
-        dtype: str,
+        dtype: str | np.dtype[Any],
         shape: tuple[int, ...],
         slot_count: int,
         layout_version: int = 1,
     ) -> "ShmRingWriter":
         dtype_obj = np.dtype(dtype)
         payload_nbytes = int(dtype_obj.itemsize * prod(shape))
-        dtype_bytes = dtype.encode("utf-8")
+        dtype_bytes = _dtype_to_header_text(dtype_obj).encode("utf-8")
         shape_len = len(shape)
         dtype_str_len = len(dtype_bytes)
 
@@ -240,7 +266,7 @@ class ShmRingReader:
         payload_offset = slot_table_offset + int(slot_count) * SLOT_ENTRY_SIZE
 
         layout = ShmLayout(
-            dtype=np.dtype(dtype_str),
+            dtype=_dtype_from_header_text(dtype_str),
             shape=shape,
             slot_count=int(slot_count),
             payload_nbytes=int(payload_nbytes),
