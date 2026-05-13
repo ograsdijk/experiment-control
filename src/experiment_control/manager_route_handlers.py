@@ -499,6 +499,15 @@ def route_manager_identity(manager: Any, req: Json) -> Json:
                     getattr(manager, "_chunk_cache_max_streams_per_device", 2048)
                 ),
             },
+            "manager_loop": {
+                "last_pump_start_mono": getattr(manager, "_last_pump_start_mono", None),
+                "last_pump_end_mono": getattr(manager, "_last_pump_end_mono", None),
+                "last_pump_duration_s": getattr(manager, "_last_pump_duration_s", None),
+                "last_pump_gap_s": getattr(manager, "_last_pump_gap_s", None),
+                "last_loop_stall_mono": getattr(manager, "_last_loop_stall_mono", None),
+                "last_loop_stall_duration_s": getattr(manager, "_last_loop_stall_duration_s", None),
+                "loop_stall_count": int(getattr(manager, "_loop_stall_count", 0) or 0),
+            },
             "cache_stats": {
                 "telemetry_devices": int(
                     len(getattr(manager, "_telemetry_latest", {}) or {})

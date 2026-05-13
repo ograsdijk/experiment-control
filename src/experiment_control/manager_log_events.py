@@ -122,6 +122,10 @@ def _event_log_severity(topic: str, payload: Json) -> str | None:
         return None
     if topic == "manager.watchdog.triggered":
         return normalize_log_severity(payload.get("severity"), default="warning")
+    if topic == "manager.loop_stall":
+        return "warning"
+    if topic == "manager.process.heartbeat_stale_deferred":
+        return "warning"
     if topic.startswith("manager.device.auto_reconnect."):
         if topic.endswith("success") or topic.endswith("reset"):
             return "info"
@@ -235,6 +239,15 @@ def _failure_message(topic: str, payload: Json) -> str:
     target_id = str(process_id if process_id is not None else device_id or "unknown")
     error_text = str(payload.get("error") or payload.get("message") or topic)
     parts = [f"{target_kind} {target_id} failed: {error_text}"]
+    if payload.get("terminated_by_manager"):
+        method = str(payload.get("termination_method") or "terminate")
+        parts.append(f"manager sent {method} due to {payload.get('termination_reason')}")
+    strikes = payload.get("heartbeat_stale_strikes")
+    if strikes is not None:
+        parts.append(f"stale strikes={strikes}")
+    if payload.get("recent_manager_loop_stall"):
+        duration = payload.get("last_manager_loop_stall_duration_s")
+        parts.append(f"recent manager loop stall={duration}s")
     stderr = _last_tail_message(payload, "tail_stderr")
     if stderr:
         parts.append(f"last stderr: {stderr}")

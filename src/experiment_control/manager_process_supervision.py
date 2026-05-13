@@ -706,6 +706,14 @@ def start_process_handle(
     handle.last_heartbeat_age_s = None
     handle.last_liveness_age_s = None
     handle.last_heartbeat_received = None
+    handle.heartbeat_stale_strikes = 0
+    handle.last_stale_detected_mono = None
+    handle.terminated_by_manager = False
+    handle.termination_reason = None
+    handle.termination_method = None
+    handle.termination_error = None
+    handle.recent_manager_loop_stall = False
+    handle.last_manager_loop_stall_duration_s = None
     if reset_collision_retry:
         handle.startup_collision_retry_done = False
     manager._start_child_log_readers(
@@ -835,6 +843,14 @@ def process_snapshot(manager: Any, handle: Any) -> Json:
         "last_heartbeat_age_s": handle.last_heartbeat_age_s,
         "last_liveness_age_s": handle.last_liveness_age_s,
         "last_heartbeat_received": handle.last_heartbeat_received,
+        "heartbeat_stale_strikes": handle.heartbeat_stale_strikes,
+        "last_stale_detected_mono": handle.last_stale_detected_mono,
+        "terminated_by_manager": handle.terminated_by_manager,
+        "termination_reason": handle.termination_reason,
+        "termination_method": handle.termination_method,
+        "termination_error": handle.termination_error,
+        "recent_manager_loop_stall": handle.recent_manager_loop_stall,
+        "last_manager_loop_stall_duration_s": handle.last_manager_loop_stall_duration_s,
         "last_heartbeat_payload": handle.last_heartbeat_payload,
         "tail_stdout": list(handle.supervisor_stdout_tail),
         "tail_stderr": list(handle.supervisor_stderr_tail),
@@ -1167,6 +1183,14 @@ def update_managed_process_exit_state(manager: Any, handle: Any, rc: int) -> boo
     return False
 
 
+def _recent_manager_loop_stall(manager: Any, now_mono: float) -> bool:
+    last_stall = getattr(manager, "_last_loop_stall_mono", None)
+    if last_stall is None:
+        return False
+    recent_s = float(getattr(manager, "_manager_loop_stall_recent_s", 10.0))
+    return (now_mono - float(last_stall)) <= recent_s
+
+
 def enforce_managed_process_heartbeat_timeout(
     manager: Any,
     handle: Any,
@@ -1179,29 +1203,68 @@ def enforce_managed_process_heartbeat_timeout(
         hb_age = now_mono - handle.last_hb_t_mono
     elif handle.last_start_t_mono is not None:
         hb_age = now_mono - handle.last_start_t_mono
-    if hb_age is None or hb_age <= handle.spec.heartbeat_timeout_s:
+    if hb_age is None:
         return
-    handle.state = _enum_member(handle.state, "FAILED")
-    handle.last_error_kind = "heartbeat_stale"
-    handle.last_failure_pid = handle.pid
+    timeout_s = float(handle.spec.heartbeat_timeout_s)
+    if hb_age <= timeout_s:
+        handle.heartbeat_stale_strikes = 0
+        handle.last_stale_detected_mono = None
+        handle.recent_manager_loop_stall = False
+        return
+
     heartbeat_received = handle.last_hb_t_mono is not None
+    recent_stall = _recent_manager_loop_stall(manager, now_mono)
+    hard_multiplier = float(getattr(manager, "_heartbeat_hard_timeout_multiplier", 3.0))
+    hard_timeout_s = timeout_s * max(1.0, hard_multiplier)
+    strikes_to_fail = int(getattr(manager, "_heartbeat_stale_strikes_to_fail", 2))
+    handle.heartbeat_stale_strikes += 1
+    handle.last_stale_detected_mono = now_mono
     handle.last_heartbeat_received = heartbeat_received
     handle.last_liveness_age_s = float(hb_age)
     handle.last_heartbeat_age_s = float(hb_age) if heartbeat_received else None
-    if heartbeat_received:
-        handle.last_error = (
-            f"heartbeat stale ({hb_age:.2f}s > {handle.spec.heartbeat_timeout_s:.2f}s)"
+    handle.recent_manager_loop_stall = recent_stall
+    handle.last_manager_loop_stall_duration_s = getattr(
+        manager, "_last_loop_stall_duration_s", None
+    )
+
+    if recent_stall and handle.heartbeat_stale_strikes < strikes_to_fail and hb_age < hard_timeout_s:
+        manager._publish_manager_event(
+            "manager.process.heartbeat_stale_deferred",
+            {
+                "process_id": handle.spec.process_id,
+                "heartbeat_age_s": float(hb_age),
+                "heartbeat_timeout_s": timeout_s,
+                "strikes": int(handle.heartbeat_stale_strikes),
+                "strikes_to_fail": strikes_to_fail,
+                "recent_manager_loop_stall": True,
+                "last_manager_loop_stall_duration_s": handle.last_manager_loop_stall_duration_s,
+                "ts": {"t_wall": time.time(), "t_mono": now_mono},
+            },
         )
+        return
+
+    handle.state = _enum_member(handle.state, "FAILED")
+    handle.last_error_kind = "heartbeat_stale"
+    handle.last_failure_pid = handle.popen_pid or handle.pid
+    if heartbeat_received:
+        handle.last_error = f"heartbeat stale ({hb_age:.2f}s > {timeout_s:.2f}s)"
     else:
         handle.last_error = (
             f"no heartbeat received {hb_age:.2f}s after spawn "
-            f"(timeout {handle.spec.heartbeat_timeout_s:.2f}s)"
+            f"(timeout {timeout_s:.2f}s)"
         )
+    handle.terminated_by_manager = False
+    handle.termination_reason = "heartbeat_stale"
+    handle.termination_method = None
+    handle.termination_error = None
     if handle.popen is not None and handle.popen.poll() is None:
         try:
             handle.popen.terminate()
             handle.stop_requested_t_mono = now_mono
+            handle.terminated_by_manager = True
+            handle.termination_method = "terminate"
         except Exception as exc:
+            handle.termination_error = str(exc)
             handle.last_error = f"{handle.last_error}; terminate failed: {exc}"
     manager._publish_process_event("manager.process.failed", handle)
 

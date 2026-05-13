@@ -778,6 +778,14 @@ class ProcessHandle:
     last_heartbeat_age_s: float | None = None
     last_liveness_age_s: float | None = None
     last_heartbeat_received: bool | None = None
+    heartbeat_stale_strikes: int = 0
+    last_stale_detected_mono: float | None = None
+    terminated_by_manager: bool = False
+    termination_reason: str | None = None
+    termination_method: str | None = None
+    termination_error: str | None = None
+    recent_manager_loop_stall: bool = False
+    last_manager_loop_stall_duration_s: float | None = None
     heartbeat_endpoint: str = ""
     process_data_endpoint: str = ""
     stop_requested_t_mono: float | None = None
@@ -1038,6 +1046,17 @@ class Manager:
         self._supervisor_log_dir = Path(".state") / self._instance_id / "process-logs"
         self._supervisor_log_max_bytes = 10 * 1024 * 1024
         self._supervisor_log_backups = 3
+        self._last_pump_start_mono: float | None = None
+        self._last_pump_end_mono: float | None = None
+        self._last_pump_duration_s: float | None = None
+        self._last_pump_gap_s: float | None = None
+        self._last_loop_stall_mono: float | None = None
+        self._last_loop_stall_duration_s: float | None = None
+        self._loop_stall_count = 0
+        self._manager_loop_stall_warn_s = 1.0
+        self._manager_loop_stall_recent_s = 10.0
+        self._heartbeat_stale_strikes_to_fail = 2
+        self._heartbeat_hard_timeout_multiplier = 3.0
         self._last_orphan_cleanup: Json | None = None
         self._command_journal_enabled = bool(command_journal_enabled)
         self._command_journal: CommandJournal | None = None
@@ -1811,27 +1830,54 @@ class Manager:
             driver_state_ok=DriverState.OK,
         )
 
+    def _record_pump_timing(self, start_mono: float, end_mono: float) -> None:
+        prev_end = self._last_pump_end_mono
+        self._last_pump_start_mono = start_mono
+        self._last_pump_end_mono = end_mono
+        self._last_pump_duration_s = end_mono - start_mono
+        self._last_pump_gap_s = None if prev_end is None else start_mono - prev_end
+        stall_s = max(self._last_pump_duration_s, self._last_pump_gap_s or 0.0)
+        if stall_s <= self._manager_loop_stall_warn_s:
+            return
+        self._last_loop_stall_mono = end_mono
+        self._last_loop_stall_duration_s = stall_s
+        self._loop_stall_count += 1
+        self._publish_manager_event(
+            "manager.loop_stall",
+            {
+                "duration_s": stall_s,
+                "pump_duration_s": self._last_pump_duration_s,
+                "pump_gap_s": self._last_pump_gap_s,
+                "count": self._loop_stall_count,
+                "ts": {"t_wall": time.time(), "t_mono": end_mono},
+            },
+        )
+
     def _pump_once(self, poll_ms: int = 50) -> None:
         """Run one iteration of the manager poll loop."""
-        self._drain_supervisor_logs()
-        self._check_timeouts()
+        start_mono = time.monotonic()
+        try:
+            self._drain_supervisor_logs()
+            self._check_timeouts()
 
-        events = dict(self._poller.poll(poll_ms))
-        if events.get(self._registry_rep) == zmq.POLLIN:
-            self._handle_registry()
+            events = dict(self._poller.poll(poll_ms))
+            if events.get(self._registry_rep) == zmq.POLLIN:
+                self._handle_registry()
 
-        if events.get(self._sub) == zmq.POLLIN:
-            self._handle_driver_pub()
+            if events.get(self._sub) == zmq.POLLIN:
+                self._handle_driver_pub()
 
-        if events.get(self._process_hb_sub) == zmq.POLLIN:
-            self._handle_process_pub()
-        if events.get(self._process_data_sub) == zmq.POLLIN:
-            self._handle_process_data_pub()
-        self._federation_hub.handle_poll_events(events)
+            if events.get(self._process_hb_sub) == zmq.POLLIN:
+                self._handle_process_pub()
+            if events.get(self._process_data_sub) == zmq.POLLIN:
+                self._handle_process_data_pub()
+            self._federation_hub.handle_poll_events(events)
 
-        if events.get(self._internal_rpc) == zmq.POLLIN:
-            self._handle_internal_rpc()
-        self._drain_supervisor_logs()
+            if events.get(self._internal_rpc) == zmq.POLLIN:
+                self._handle_internal_rpc()
+            self._drain_supervisor_logs()
+        finally:
+            self._record_pump_timing(start_mono, time.monotonic())
 
     def run_forever(self, poll_ms: int = 50) -> None:
         """
@@ -2977,6 +3023,14 @@ class Manager:
             payload["heartbeat_age_s"] = handle.last_heartbeat_age_s
             payload["liveness_age_s"] = handle.last_liveness_age_s
             payload["heartbeat_received"] = handle.last_heartbeat_received
+            payload["heartbeat_stale_strikes"] = handle.heartbeat_stale_strikes
+            payload["last_stale_detected_mono"] = handle.last_stale_detected_mono
+            payload["terminated_by_manager"] = handle.terminated_by_manager
+            payload["termination_reason"] = handle.termination_reason
+            payload["termination_method"] = handle.termination_method
+            payload["termination_error"] = handle.termination_error
+            payload["recent_manager_loop_stall"] = handle.recent_manager_loop_stall
+            payload["last_manager_loop_stall_duration_s"] = handle.last_manager_loop_stall_duration_s
             payload["failure_pid"] = failure_pid
             payload["exit_code_hex"] = exit_code_hex(handle.last_exit_code)
             payload["exit_code_description"] = describe_exit_code(handle.last_exit_code)
