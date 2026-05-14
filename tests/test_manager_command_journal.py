@@ -12,6 +12,7 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
+from experiment_control.cli.run_stack import _parse_command_journal
 from experiment_control.manager import ManagedProcessState, Manager
 
 
@@ -116,6 +117,20 @@ class ManagerCommandSourceTests(unittest.TestCase):
         )
         self.assertFalse(tail_resp.get("ok"))
         self.assertEqual(tail_resp.get("error", {}).get("code"), "journal_disabled")
+
+    def test_command_journal_config_defaults_enabled(self) -> None:
+        cfg = _parse_command_journal(
+            manager_raw={}, base_dir=Path("."), instance_id="test-instance"
+        )
+        self.assertTrue(cfg["enabled"])
+
+    def test_command_journal_config_can_disable_explicitly(self) -> None:
+        cfg = _parse_command_journal(
+            manager_raw={"command_journal": {"enabled": False}},
+            base_dir=Path("."),
+            instance_id="test-instance",
+        )
+        self.assertFalse(cfg["enabled"])
 
     def test_publish_manager_command_event_appends_to_journal(self) -> None:
         mgr = object.__new__(Manager)

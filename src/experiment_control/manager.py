@@ -928,7 +928,7 @@ class Manager:
         router_inflight_max: int = 32768,
         auto_connect_on_register: bool = True,
         log_history_size: int = 10000,
-        command_journal_enabled: bool = False,
+        command_journal_enabled: bool = True,
         command_journal_path: str | Path | None = None,
         command_journal_queue_max: int = 10_000,
         command_journal_batch_size: int = 200,

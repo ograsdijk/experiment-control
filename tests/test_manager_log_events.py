@@ -96,6 +96,60 @@ class ManagerLogEventsTests(unittest.TestCase):
         self.assertIn("phase changed to evaluate_rules", call["message"])
         self.assertNotIn("old unrelated error", call["message"])
 
+    def test_command_failure_prefers_explicit_webui_source(self) -> None:
+        manager = mock.Mock()
+        payload = {
+            "device_id": "hipace_rc",
+            "action": "start",
+            "ok": False,
+            "error": {"code": "CONDITION_FAILED"},
+            "source_kind": "webui",
+            "source_id": "beamline-vacuum",
+        }
+        manager_log_events.maybe_publish_log_event(manager, "manager.command", payload)
+
+        call = manager._emit_log.call_args.kwargs
+        self.assertEqual(call["severity"], "error")
+        self.assertEqual(call["source_kind"], "webui")
+        self.assertEqual(call["source_id"], "beamline-vacuum")
+        self.assertEqual(call["device_id"], "hipace_rc")
+        self.assertIn("hipace_rc.start", call["message"])
+
+    def test_published_webui_issue_keeps_webui_source(self) -> None:
+        manager = mock.Mock()
+        payload = {
+            "severity": "error",
+            "message": "instance UI failed to load command capabilities",
+            "source_kind": "webui",
+            "source_id": "beamline-vacuum",
+        }
+        manager_log_events.maybe_publish_log_event(
+            manager, "manager.instance_ui.error", payload
+        )
+
+        call = manager._emit_log.call_args.kwargs
+        self.assertEqual(call["severity"], "error")
+        self.assertEqual(call["source_kind"], "webui")
+        self.assertEqual(call["source_id"], "beamline-vacuum")
+        self.assertEqual(call["message"], "instance UI failed to load command capabilities")
+
+    def test_process_failure_ignores_incidental_explicit_source(self) -> None:
+        manager = mock.Mock()
+        manager_log_events.maybe_publish_log_event(
+            manager,
+            "manager.process.failed",
+            {
+                "process_id": "watchdog",
+                "error": "heartbeat stale",
+                "source_kind": "webui",
+                "source_id": "beamline-vacuum",
+            },
+        )
+
+        call = manager._emit_log.call_args.kwargs
+        self.assertEqual(call["source_kind"], "process")
+        self.assertEqual(call["source_id"], "watchdog")
+
     def test_watchdog_trigger_emits_manager_log_entry(self) -> None:
         manager = mock.Mock()
         manager_log_events.maybe_publish_log_event(

@@ -144,9 +144,16 @@ def _event_log_severity(topic: str, payload: Json) -> str | None:
     return None
 
 
-def _event_log_source(payload: Json) -> tuple[str, str, Any, Any]:
+def _event_log_source(topic: str, payload: Json) -> tuple[str, str, Any, Any]:
     process_id = payload.get("process_id")
     device_id = payload.get("device_id")
+    explicit_source_kind = payload.get("source_kind")
+    explicit_source_id = payload.get("source_id")
+    if (
+        topic in {"manager.command", "manager.logs.publish"}
+        or topic.startswith("manager.instance_ui.")
+    ) and explicit_source_kind is not None and explicit_source_id is not None:
+        return str(explicit_source_kind), str(explicit_source_id), device_id, process_id
     source_kind = "manager"
     source_id = "manager"
     if process_id is not None:
@@ -265,7 +272,7 @@ def maybe_publish_log_event(manager: Any, topic: str, payload: Json) -> None:
     severity = _event_log_severity(topic, payload)
     if severity is None:
         return
-    source_kind, source_id, device_id, process_id = _event_log_source(payload)
+    source_kind, source_id, device_id, process_id = _event_log_source(topic, payload)
     message = payload.get("error") or payload.get("message") or ""
     if topic == "manager.command":
         message = _command_failure_message(payload)

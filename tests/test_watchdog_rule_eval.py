@@ -12,6 +12,7 @@ if str(SRC) not in sys.path:
 from experiment_control.processes.watchdog import (
     CommandAction,
     RuleState,
+    WatchdogArm,
     WatchdogEntry,
     WatchdogProcess,
     WatchdogRule,
@@ -177,6 +178,114 @@ class WatchdogRuleEvalTests(unittest.TestCase):
         self.assertFalse(second[0])
         self.assertTrue(state.latched)
 
+    def test_armed_rule_suppresses_startup_and_rearms_after_safe_pressure(self) -> None:
+        rule = WatchdogRule(
+            name="turbo_pressure_guard",
+            severity="critical",
+            message=None,
+            telemetry=[
+                TelemetryBinding(
+                    alias="p", device_id="hornet", signal="pressure", max_age_s=1.0
+                ),
+                TelemetryBinding(
+                    alias="pump_on", device_id="turbo", signal="pumpg_statn", max_age_s=1.0
+                ),
+            ],
+            condition={
+                "and": [{"eq": ["${pump_on.value}", True]}, {"gt": ["${p.value}", 1.0e-2]}]
+            },
+            stable_for_s=0.0,
+            cooldown_s=0.0,
+            latch=False,
+            on_unknown="ignore",
+            actions=[_default_action()],
+            arm=WatchdogArm(
+                condition={
+                    "and": [
+                        {"eq": ["${pump_on.value}", True]},
+                        {"lt": ["${p.value}", 5.0e-3]},
+                    ]
+                },
+                disarm_condition={"eq": ["${pump_on.value}", False]},
+                disarm_on_trigger=True,
+            ),
+        )
+        state = RuleState()
+        values = {
+            ("hornet", "pressure"): _ok_sample(2.0e-2),
+            ("turbo", "pumpg_statn"): _ok_sample(True),
+        }
+
+        def getter(device_id: str, signal: str) -> dict[str, object] | None:
+            return values.get((device_id, signal))
+
+        startup_high = evaluate_watchdog_rule(
+            rule=rule, state=state, telemetry_getter=getter, now_mono=1.0
+        )
+        self.assertFalse(startup_high[0])
+        self.assertFalse(state.armed)
+        self.assertTrue(startup_high[1])
+
+        values[("hornet", "pressure")] = _ok_sample(4.0e-3)
+        safe = evaluate_watchdog_rule(
+            rule=rule, state=state, telemetry_getter=getter, now_mono=2.0
+        )
+        self.assertFalse(safe[0])
+        self.assertTrue(state.armed)
+        self.assertFalse(safe[1])
+
+        values[("hornet", "pressure")] = _ok_sample(2.0e-2)
+        high_after_arm = evaluate_watchdog_rule(
+            rule=rule, state=state, telemetry_getter=getter, now_mono=3.0
+        )
+        self.assertTrue(high_after_arm[0])
+        self.assertFalse(state.armed)
+
+        high_still_unarmed = evaluate_watchdog_rule(
+            rule=rule, state=state, telemetry_getter=getter, now_mono=4.0
+        )
+        self.assertFalse(high_still_unarmed[0])
+        self.assertFalse(state.armed)
+
+        values[("hornet", "pressure")] = _ok_sample(4.0e-3)
+        rearmed = evaluate_watchdog_rule(
+            rule=rule, state=state, telemetry_getter=getter, now_mono=5.0
+        )
+        self.assertFalse(rearmed[0])
+        self.assertTrue(state.armed)
+
+    def test_parse_ruleset_includes_arm_configuration(self) -> None:
+        ruleset = _parse_ruleset(
+            {
+                "watchdog_id": "wd_arm",
+                "rules": [
+                    {
+                        "name": "armed_guard",
+                        "severity": "critical",
+                        "inputs": {
+                            "telemetry": [{"as": "p", "device": "d", "signal": "s"}]
+                        },
+                        "arm": {
+                            "condition": {"lt": ["${p.value}", 1.0]},
+                            "disarm_condition": {"gt": ["${p.value}", 2.0]},
+                            "disarm_on_trigger": True,
+                        },
+                        "condition": {"gt": ["${p.value}", 2.0]},
+                        "actions": [
+                            {"command": {"device_id": "d", "action": "stop", "params": {}}}
+                        ],
+                    }
+                ],
+            },
+            source="test",
+        )
+        arm = ruleset.rules[0].arm
+        self.assertIsNotNone(arm)
+        assert arm is not None
+        self.assertTrue(arm.disarm_on_trigger)
+        self.assertEqual(arm.condition, {"lt": ["${p.value}", 1.0]})
+        self.assertEqual(arm.disarm_condition, {"gt": ["${p.value}", 2.0]})
+
     def test_watchdog_status_includes_condition_telemetry_actions(self) -> None:
         ruleset = _parse_ruleset(
             {
@@ -222,6 +331,7 @@ class WatchdogRuleEvalTests(unittest.TestCase):
                 stable_since_mono=10.0,
                 last_trigger_mono=11.0,
                 latched=True,
+                armed=True,
                 last_evaluated_mono=12.0,
                 alarm=False,
                 unknown=False,
@@ -244,12 +354,16 @@ class WatchdogRuleEvalTests(unittest.TestCase):
         self.assertEqual(len(rules), 1)
         rule = rules[0]
         self.assertIn("condition", rule)
+        self.assertIn("arm", rule)
         self.assertIn("telemetry", rule)
         self.assertIn("actions", rule)
+        self.assertIn("armed", rule)
         self.assertIn("alarm", rule)
         self.assertIn("unknown", rule)
         self.assertIn("snapshot", rule)
         self.assertIn("last_evaluated_mono", rule)
+        self.assertIsNone(rule.get("arm"))
+        self.assertTrue(rule.get("armed"))
         self.assertFalse(rule.get("alarm"))
         self.assertFalse(rule.get("unknown"))
         self.assertEqual(rule.get("last_evaluated_mono"), 12.0)

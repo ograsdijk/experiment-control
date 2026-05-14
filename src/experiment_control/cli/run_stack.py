@@ -205,7 +205,7 @@ def _parse_command_journal(
     raw = manager_raw.get("command_journal")
     if raw is None:
         return {
-            "enabled": False,
+            "enabled": True,
             "path": None,
             "queue_max": 10_000,
             "batch_size": 200,

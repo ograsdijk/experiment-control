@@ -49,6 +49,13 @@ class CommandAction:
 
 
 @dataclass(frozen=True)
+class WatchdogArm:
+    condition: Any
+    disarm_condition: Any | None
+    disarm_on_trigger: bool
+
+
+@dataclass(frozen=True)
 class WatchdogRule:
     name: str
     severity: str
@@ -60,6 +67,7 @@ class WatchdogRule:
     latch: bool
     on_unknown: str
     actions: list[CommandAction]
+    arm: WatchdogArm | None = None
 
 
 @dataclass(frozen=True)
@@ -79,6 +87,7 @@ class RuleState:
     stable_since_mono: float | None = None
     last_trigger_mono: float | None = None
     latched: bool = False
+    armed: bool = False
     last_evaluated_mono: float | None = None
     alarm: bool | None = None
     unknown: bool | None = None
@@ -113,6 +122,26 @@ def _parse_watchdog_defaults(
         defaults_cooldown,
         defaults_latch,
         defaults_on_unknown,
+    )
+
+
+def _parse_watchdog_arm(
+    *, rule_raw: dict[str, Any], rule_index: int
+) -> WatchdogArm | None:
+    raw = rule_raw.get("arm")
+    if raw is None:
+        return None
+    arm = require_dict(raw, path=["rules", rule_index, "arm"])
+    if "condition" not in arm:
+        raise ConfigError(
+            path=f"rules[{rule_index}].arm.condition", message="condition is required"
+        )
+    disarm_condition = arm.get("disarm_condition")
+    disarm_on_trigger = coerce_bool(arm.get("disarm_on_trigger"), default=False)
+    return WatchdogArm(
+        condition=arm.get("condition"),
+        disarm_condition=disarm_condition,
+        disarm_on_trigger=disarm_on_trigger,
     )
 
 
@@ -212,6 +241,7 @@ def _parse_watchdog_rule(
         path=["rules", rule_index, "on_unknown"],
         default=defaults_on_unknown,
     )
+    arm = _parse_watchdog_arm(rule_raw=rule_raw, rule_index=rule_index)
     actions = _parse_watchdog_actions(rule_raw=rule_raw, rule_index=rule_index)
     return WatchdogRule(
         name=name,
@@ -224,6 +254,7 @@ def _parse_watchdog_rule(
         latch=latch,
         on_unknown=on_unknown,
         actions=actions,
+        arm=arm,
     )
 
 
@@ -394,6 +425,28 @@ def _evaluate_watchdog_alarm(*, rule: WatchdogRule, env: Json, unknown: bool) ->
         return False
 
 
+def _evaluate_watchdog_condition(condition: Any, env: Json, *, unknown: bool) -> bool:
+    if unknown:
+        return False
+    try:
+        return bool(eval_condition(condition, env))
+    except Exception:
+        return False
+
+
+def _update_watchdog_armed_state(
+    *, rule: WatchdogRule, state: RuleState, env: Json, unknown: bool
+) -> None:
+    if rule.arm is None:
+        return
+    if rule.arm.disarm_condition is not None and _evaluate_watchdog_condition(
+        rule.arm.disarm_condition, env, unknown=unknown
+    ):
+        state.armed = False
+    if _evaluate_watchdog_condition(rule.arm.condition, env, unknown=unknown):
+        state.armed = True
+
+
 def _watchdog_stable_ready(*, rule: WatchdogRule, state: RuleState, now_mono: float) -> bool:
     if rule.stable_for_s <= 0:
         return True
@@ -418,11 +471,16 @@ def evaluate_watchdog_rule(
     env, snapshot, unknown = _resolve_watchdog_bindings(
         rule, telemetry_getter=telemetry_getter, now_mono=now_mono
     )
+    _update_watchdog_armed_state(rule=rule, state=state, env=env, unknown=unknown)
     alarm = _evaluate_watchdog_alarm(rule=rule, env=env, unknown=unknown)
     state.last_evaluated_mono = now_mono
     state.alarm = alarm
     state.unknown = unknown
     state.snapshot = snapshot
+
+    if rule.arm is not None and not state.armed:
+        state.stable_since_mono = None
+        return False, alarm, unknown, snapshot
 
     if not alarm:
         state.stable_since_mono = None
@@ -440,6 +498,8 @@ def evaluate_watchdog_rule(
     state.last_trigger_mono = now_mono
     if rule.latch:
         state.latched = True
+    if rule.arm is not None and rule.arm.disarm_on_trigger:
+        state.armed = False
     return True, alarm, unknown, snapshot
 
 
@@ -543,6 +603,7 @@ class WatchdogProcess(ManagedProcessBase):
                 "stable_for_s": rule.stable_for_s,
                 "cooldown_s": rule.cooldown_s,
                 "latched": rule.latch,
+                "armed": state.armed,
             },
         }
         self._publish_event("manager.watchdog.triggered", payload)
@@ -658,16 +719,19 @@ class WatchdogProcess(ManagedProcessBase):
         if state is None:
             return {"ok": False, "error": "rule not found"}
         prev_latched = bool(state.latched)
+        prev_armed = bool(state.armed)
         state.latched = False
+        state.armed = False
         state.stable_since_mono = None
         payload = {
             "process_id": self._process_id,
             "watchdog_id": watchdog_id,
             "rule": rule_name,
             "previous_latched": prev_latched,
+            "previous_armed": prev_armed,
         }
         self._publish_event("manager.watchdog.cleared", payload)
-        return {"ok": True, "previous_latched": prev_latched}
+        return {"ok": True, "previous_latched": prev_latched, "previous_armed": prev_armed}
 
     def _watchdog_capability_members(self) -> list[Json]:
         members = [
@@ -721,6 +785,11 @@ class WatchdogProcess(ManagedProcessBase):
                         "severity": rule.severity,
                         "message": rule.message,
                         "condition": rule.condition,
+                        "arm": None if rule.arm is None else {
+                            "condition": rule.arm.condition,
+                            "disarm_condition": rule.arm.disarm_condition,
+                            "disarm_on_trigger": rule.arm.disarm_on_trigger,
+                        },
                         "telemetry": [
                             {
                                 "as": binding.alias,
@@ -745,6 +814,7 @@ class WatchdogProcess(ManagedProcessBase):
                         "latch": rule.latch,
                         "on_unknown": rule.on_unknown,
                         "latched": state.latched,
+                        "armed": state.armed,
                         "alarm": state.alarm,
                         "unknown": state.unknown,
                         "snapshot": state.snapshot,
@@ -829,6 +899,7 @@ class WatchdogProcess(ManagedProcessBase):
                             "watchdog_id": watchdog_id,
                             "rule": rule.name,
                             "previous_latched": result.get("previous_latched"),
+                            "previous_armed": result.get("previous_armed"),
                         }
                     )
         return {"request_id": req_id, "ok": True, "result": {"cleared": cleared}}
@@ -856,6 +927,7 @@ class WatchdogProcess(ManagedProcessBase):
                 "watchdog_id": watchdog_id,
                 "rule": rule_name,
                 "previous_latched": result.get("previous_latched"),
+                "previous_armed": result.get("previous_armed"),
             },
         }
 
@@ -893,6 +965,7 @@ class WatchdogProcess(ManagedProcessBase):
                 "watchdog_id": w_id,
                 "rule": r_name,
                 "previous_latched": result.get("previous_latched"),
+                "previous_armed": result.get("previous_armed"),
             },
         }
 
