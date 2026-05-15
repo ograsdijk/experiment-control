@@ -80,6 +80,14 @@ class ProcessCommandRequest(BaseModel):
     source_id: str | None = None
 
 
+@dataclass(frozen=True)
+class ProcessCachedCallTarget:
+    process_id: str
+    action: str
+    params: dict[str, Any]
+    period_s: float
+
+
 class HdfWritingStartRequest(BaseModel):
     filename: str | None = None
     disabled_devices: list[str] | None = None
@@ -472,6 +480,87 @@ async def _stream_analysis_rpc(
     return await _process_rpc(STREAM_ANALYSIS_PROCESS_ID, action, params)
 
 
+def _process_cached_call_key(
+    process_id: str, action: str, params: dict[str, Any] | None = None
+) -> str:
+    params_json = json.dumps(dict(params or {}), sort_keys=True, separators=(",", ":"))
+    return f"{process_id}\u241f{action}\u241f{params_json}"
+
+
+def _normalize_process_cached_call_targets(raw: Any) -> list[ProcessCachedCallTarget]:
+    if not isinstance(raw, list):
+        return []
+    out: list[ProcessCachedCallTarget] = []
+    seen: set[str] = set()
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        process_id = str(item.get("process_id", "") or "").strip()
+        action = str(item.get("action", "") or "").strip()
+        params_raw = item.get("params")
+        params = dict(params_raw) if isinstance(params_raw, dict) else {}
+        if not process_id or not action:
+            continue
+        try:
+            period_s = float(item.get("period_s", 1.0))
+        except Exception:
+            period_s = 1.0
+        key = _process_cached_call_key(process_id, action, params)
+        if key in seen:
+            continue
+        out.append(
+            ProcessCachedCallTarget(
+                process_id=process_id,
+                action=action,
+                params=params,
+                period_s=max(0.1, period_s),
+            )
+        )
+        seen.add(key)
+    return out
+
+
+def _load_process_cached_call_targets() -> list[ProcessCachedCallTarget]:
+    raw_text = os.environ.get("EXPERIMENT_CONTROL_PROCESS_CACHED_CALLS_JSON", "").strip()
+    if not raw_text:
+        return []
+    try:
+        raw = json.loads(raw_text)
+    except Exception as e:
+        sys.stderr.write(
+            f"[fastapi] ignoring invalid EXPERIMENT_CONTROL_PROCESS_CACHED_CALLS_JSON: {e}\n"
+        )
+        return []
+    targets = _normalize_process_cached_call_targets(raw)
+    if not targets:
+        sys.stderr.write(
+            "[fastapi] ignoring EXPERIMENT_CONTROL_PROCESS_CACHED_CALLS_JSON: no valid targets.\n"
+        )
+    return targets
+
+
+async def _process_cached_call_loop(target: ProcessCachedCallTarget) -> None:
+    cache: dict[str, dict[str, Any]] = app.state.process_cached_calls
+    key = _process_cached_call_key(target.process_id, target.action, target.params)
+    while True:
+        started_at = time.time()
+        try:
+            resp = await _process_rpc(target.process_id, target.action, target.params)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            resp = {
+                "ok": False,
+                "error": {"code": "gateway_error", "message": str(e)},
+            }
+        cache[key] = {
+            **_ensure_error_shape(resp),
+            "cached": True,
+            "updated_at": time.time(),
+        }
+        await asyncio.sleep(max(0.0, target.period_s - (time.time() - started_at)))
+
+
 def _is_loopback_host(raw_host: str | None) -> bool:
     return bool(shared_is_loopback_host(raw_host))
 
@@ -697,6 +786,8 @@ async def _startup() -> None:
         settings.manager_pub, topics=settings.stream_analysis_topics
     )
     stream_analysis_hub.start(asyncio.get_running_loop())
+    process_cached_call_targets = _load_process_cached_call_targets()
+    process_cached_calls: dict[str, dict[str, Any]] = {}
     app.state.settings = settings
     app.state.manager_identity = manager_identity
     app.state.router = router
@@ -704,6 +795,12 @@ async def _startup() -> None:
     app.state.logs_hub = logs_hub
     app.state.stream_hub = stream_hub
     app.state.stream_analysis_hub = stream_analysis_hub
+    app.state.process_cached_calls = process_cached_calls
+    app.state.process_cached_call_targets = process_cached_call_targets
+    app.state.process_cached_call_tasks = [
+        asyncio.create_task(_process_cached_call_loop(target))
+        for target in process_cached_call_targets
+    ]
 
 
 @app.on_event("shutdown")
@@ -715,6 +812,13 @@ async def _shutdown() -> None:
     stream_analysis_hub: TelemetryHub | None = getattr(
         app.state, "stream_analysis_hub", None
     )
+    process_cached_call_tasks: list[asyncio.Task] = getattr(
+        app.state, "process_cached_call_tasks", []
+    )
+    for task in process_cached_call_tasks:
+        task.cancel()
+    if process_cached_call_tasks:
+        await asyncio.gather(*process_cached_call_tasks, return_exceptions=True)
     if telemetry_hub is not None:
         telemetry_hub.close()
     if logs_hub is not None:
@@ -1088,6 +1192,51 @@ async def hdf_writer_writing_start(
     }
     resp = await asyncio.to_thread(app.state.router.request, payload)
     return _ensure_error_shape(resp)
+
+
+@app.get("/api/processes/{process_id}/cached-call")
+async def process_cached_call(
+    process_id: str,
+    action: str,
+    params: str = "{}",
+) -> dict[str, Any]:
+    try:
+        raw_params = json.loads(params) if str(params or "").strip() else {}
+    except Exception:
+        return {
+            "ok": False,
+            "error": {"code": "invalid_params", "message": "params must be JSON"},
+        }
+    if not isinstance(raw_params, dict):
+        return {
+            "ok": False,
+            "error": {"code": "invalid_params", "message": "params must be a JSON object"},
+        }
+    key = _process_cached_call_key(process_id, action, raw_params)
+    cache: dict[str, dict[str, Any]] = getattr(app.state, "process_cached_calls", {})
+    cached = cache.get(key)
+    if isinstance(cached, dict):
+        return dict(cached)
+    targets: list[ProcessCachedCallTarget] = getattr(
+        app.state, "process_cached_call_targets", []
+    )
+    configured = any(
+        _process_cached_call_key(target.process_id, target.action, target.params) == key
+        for target in targets
+    )
+    if configured:
+        return {
+            "ok": False,
+            "cached": True,
+            "updated_at": None,
+            "error": {"code": "cache_pending", "message": "cached call has not updated yet"},
+        }
+    return {
+        "ok": False,
+        "cached": True,
+        "updated_at": None,
+        "error": {"code": "cached_call_not_configured"},
+    }
 
 
 @app.get("/api/processes/{process_id}/capabilities")
