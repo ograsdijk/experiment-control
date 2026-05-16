@@ -77,32 +77,30 @@ DEFAULT_TELEMETRY_CHUNK_ROWS = 64
 
 
 @dataclass(frozen=True)
-class _StreamBatch:
-    """One stream's worth of pending writes, snapshotted at flush time."""
-
-    data: list[bytes]
-    seq: list[int]
-    t0_mono_ns: list[int]
-    t0_wall_ns: list[int]
-    context_ids: list[int]
-    schema: dict[str, Any]
-    session: int
-
-
-@dataclass(frozen=True)
 class _FlushBatch:
-    """Snapshot of pending main-loop state ready to be written to HDF5."""
+    """Snapshot of pending main-loop state ready to be written to HDF5.
+
+    Shape of `stream_batches` matches `self._stream_buffers` — a dict
+    keyed by `(device_id, stream)` whose values are dicts with `data`,
+    `seq`, `t0_mono_ns`, `t0_wall_ns`, `context_id` lists. This keeps
+    the existing `_write_stream_buffers_batch` signature stable.
+
+    `_dropped_local` / `_dropped_events` are cumulative counters shared
+    between threads and not snapshotted into the batch — main loop
+    increments them in `_buffer_append` / `_buffer_event`, bg thread
+    reads them in `_flush_active_file`. CPython GIL makes the int read
+    atomic; the worst case is a momentarily stale attrs value that
+    catches up on the next flush.
+    """
 
     buffered_rows: list[Json] = field(default_factory=list)
     event_rows: list[tuple[str, Json]] = field(default_factory=list)
-    stream_batches: dict[tuple[str, str], _StreamBatch] = field(
+    stream_batches: dict[tuple[str, str], dict[str, list[Any]]] = field(
         default_factory=dict
     )
     pending_stream_metadata: dict[tuple[str, str], dict[str, Any]] = field(
         default_factory=dict
     )
-    dropped_local_delta: int = 0
-    dropped_events_delta: int = 0
     force_flush: bool = False
 
 
@@ -585,6 +583,13 @@ class HdfWriter(ManagedProcessBase):
         self._bg_join_timeout_s = max(0.1, float(bg_join_timeout_s))
         self._active_h5_filename: str | None = None
         self._writing_active = False
+        # Coarse RLock serialising _h5 and stream-state access between the
+        # main loop (drain handlers, RPC handlers, file rotation) and the
+        # bg flush thread. Held briefly by the main loop on per-message
+        # processing and for the full write cycle by the bg thread.
+        # Subsequent commits will narrow the lock's scope by moving more
+        # state to bg-thread-exclusive ownership.
+        self._h5_lock = threading.RLock()
 
         self._rpc_registry = self._build_rpc_registry()
         self._topic_handlers = self._build_topic_handlers()
@@ -1102,13 +1107,37 @@ class HdfWriter(ManagedProcessBase):
     def _dispatch_bg_request(
         self, req: "_FlushBatch | _BgRequest"
     ) -> None:
-        # Commit 1 placeholder: no production code enqueues anything other
-        # than the shutdown sentinel yet. Commit 2 fills in handlers for
-        # _FlushBatch, _RotateRequest, _StartWritingRequest, _StopWritingRequest,
-        # _MeasurementNoteRequest, _DevicesToggleRequest.
+        if isinstance(req, _FlushBatch):
+            self._handle_flush_batch(req)
+            return
+        # Synchronous RPC request types are wired in a follow-up step;
+        # for now anything else surfaces as an explicit error to the
+        # caller via the response queue.
         raise NotImplementedError(
             f"bg request type not yet handled: {type(req).__name__}"
         )
+
+    def _handle_flush_batch(self, batch: "_FlushBatch") -> None:
+        # The bg thread runs this under _h5_lock — same lock that
+        # serialises h5 + stream-state access from the main-loop drain
+        # handlers, RPC handlers, and file rotation. The batch carries
+        # snapshots of the deque contents and per-stream buffers the
+        # main loop swapped out at handoff time, so the write helpers
+        # operate on private copies and don't race with concurrent
+        # main-loop appends.
+        with self._h5_lock:
+            self._write_buffered_rows_batch(batch.buffered_rows)
+            self._write_event_rows_batch(batch.event_rows)
+            if batch.stream_batches:
+                self._write_stream_buffers_batch(batch.stream_batches)
+            if batch.pending_stream_metadata:
+                # Newly observed per-stream metadata is merged into the
+                # live dict the next write cycle will read.
+                self._pending_stream_metadata.update(
+                    batch.pending_stream_metadata
+                )
+            if batch.force_flush:
+                self._flush_active_file()
 
     def _shutdown_bg_thread(self) -> None:
         thread = self._bg_thread
@@ -1134,10 +1163,88 @@ class HdfWriter(ManagedProcessBase):
         self._bg_thread = None
 
     def _drain_pending_to_file(self) -> None:
-        self._write_buffered_rows()
-        self._write_event_rows()
-        self._write_stream_buffers()
-        self._flush_active_file()
+        # Synchronous drain used by RPC paths that still execute on the
+        # main thread (file rotation, stop_writing, close). Held under
+        # _h5_lock so the bg flush thread can't be mid-write. Subsequent
+        # commits move these RPC paths through the queue too, at which
+        # point the lock can be narrowed.
+        with self._h5_lock:
+            self._write_buffered_rows()
+            self._write_event_rows()
+            self._write_stream_buffers()
+            self._flush_active_file()
+
+    def _snapshot_main_loop_buffers(
+        self,
+    ) -> tuple[
+        list[Json],
+        list[tuple[str, Json]],
+        dict[tuple[str, str], dict[str, list[Any]]],
+        dict[tuple[str, str], dict[str, Any]],
+    ]:
+        """Atomically extract main-loop drain buffers + replace with fresh.
+
+        Main loop continues to append to the fresh containers while the bg
+        thread consumes the snapshot. Caller owns the returned snapshots.
+        """
+        rows: list[Json] = []
+        if self._buf is not None:
+            while self._buf:
+                rows.append(self._buf.popleft())
+
+        event_rows: list[tuple[str, Json]] = []
+        if self._event_buf is not None:
+            while self._event_buf:
+                event_rows.append(self._event_buf.popleft())
+
+        stream_buffers = self._stream_buffers
+        self._stream_buffers = {}
+
+        pending_metadata = self._pending_stream_metadata
+        self._pending_stream_metadata = {}
+
+        return rows, event_rows, stream_buffers, pending_metadata
+
+    def _enqueue_flush_batch(self, *, force_flush: bool) -> bool:
+        """Snapshot main-loop drain state and hand it to the bg flush thread.
+
+        Returns True if the batch was queued, False if it was dropped due
+        to overflow (the data is lost — `_dropped_flush_batches` is
+        incremented so it surfaces in heartbeat/status). When the batch
+        is queued successfully, `_pending` and `_last_flush` bookkeeping
+        is updated to mirror the old synchronous-write timing.
+        """
+        rows, event_rows, stream_buffers, pending_metadata = (
+            self._snapshot_main_loop_buffers()
+        )
+        if (
+            not rows
+            and not event_rows
+            and not stream_buffers
+            and not pending_metadata
+            and not force_flush
+        ):
+            return True
+        batch = _FlushBatch(
+            buffered_rows=rows,
+            event_rows=event_rows,
+            stream_batches=stream_buffers,
+            pending_stream_metadata=pending_metadata,
+            force_flush=force_flush,
+        )
+        try:
+            self._bg_queue.put_nowait(batch)
+        except queue.Full:
+            # Bg thread is backlogged. The snapshotted data is dropped
+            # rather than blocking the main loop; counter is exposed in
+            # status so persistent overflow shows up in monitoring.
+            self._dropped_flush_batches += 1
+            self._bump_error("bg.flush_batch.dropped")
+            return False
+        if force_flush:
+            self._pending = 0
+            self._last_flush = time.monotonic()
+        return True
 
     def _clear_buffered_for_disabled(self, disabled: set[str]) -> None:
         if not disabled:
@@ -1744,6 +1851,12 @@ class HdfWriter(ManagedProcessBase):
                 )
 
                 while not self._stop_evt.is_set():
+                    # Bail out cleanly if the bg flush thread died — the
+                    # supervisor's restart policy will bring us back up.
+                    if self._bg_thread_dead:
+                        self._stop_evt.set()
+                        break
+
                     now = time.monotonic()
                     timeout_s = min(
                         self._next_write - now,
@@ -1753,20 +1866,24 @@ class HdfWriter(ManagedProcessBase):
                     events = self._poll_and_drain(timeout_ms)
 
                     if events.get(sub) == zmq.POLLIN:
-                        self._drain_socket()
+                        # Drain messages from ZMQ into our deques /
+                        # stream-state. Held under _h5_lock because the
+                        # message handlers may mutate state the bg thread
+                        # also reads. Per-message processing is fast
+                        # (microseconds); the lock is rarely contended.
+                        with self._h5_lock:
+                            self._drain_socket()
 
                     now = time.monotonic()
-                    if now >= self._next_write:
-                        self._write_buffered_rows()
-                        self._write_event_rows()
-                        self._write_stream_buffers()
-                        self._next_write = now + write_every_s
-
-                    if (
+                    should_force_flush = (
                         self._pending >= flush_every_n
                         or (now - self._last_flush) >= flush_every_s
-                    ):
-                        self._flush_active_file()
+                    )
+                    if now >= self._next_write or should_force_flush:
+                        self._enqueue_flush_batch(
+                            force_flush=should_force_flush,
+                        )
+                        self._next_write = now + write_every_s
         except KeyboardInterrupt:
             self._stop_evt.set()
         finally:
@@ -3338,14 +3455,26 @@ class HdfWriter(ManagedProcessBase):
         self._append_context_columns(old, fields)
 
     def _write_stream_buffers(self) -> None:
+        # Backward-compatible entry point. Mirrors the wrapper pattern
+        # introduced for `_write_buffered_rows` and `_write_event_rows`:
+        # callers that operate on the live `self._stream_buffers` dict go
+        # through this wrapper, while the bg-thread path (added in the next
+        # commit) will call `_write_stream_buffers_batch` directly with a
+        # snapshot dict the main loop swapped out.
+        self._write_stream_buffers_batch(self._stream_buffers)
+
+    def _write_stream_buffers_batch(
+        self,
+        stream_buffers: dict[tuple[str, str], dict[str, list[Any]]],
+    ) -> None:
         if self._h5 is None or self._streams_group is None:
-            for _key, buf in self._stream_buffers.items():
+            for _key, buf in stream_buffers.items():
                 self._clear_stream_buffer(buf)
             self._stream_pending_by_seq.clear()
             self._stream_context_by_seq.clear()
             return
         self._sweep_context_buffers(now_mono=time.monotonic())
-        for key, buf in list(self._stream_buffers.items()):
+        for key, buf in list(stream_buffers.items()):
             data_list = buf.get("data", [])
             if not data_list:
                 continue
