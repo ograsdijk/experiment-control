@@ -8,6 +8,7 @@ import { Notifications } from "@mantine/notifications";
 import React from "react";
 import ReactDOM from "react-dom/client";
 import { App } from "./App";
+import { TelemetryProvider } from "./features/telemetry/TelemetryContext";
 
 const theme = createTheme({
   fontFamily: "IBM Plex Sans, Segoe UI, sans-serif",
@@ -20,7 +21,9 @@ ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
     <MantineProvider theme={theme} defaultColorScheme="auto">
       <Notifications position="top-right" />
-      <App />
+      <TelemetryProvider>
+        <App />
+      </TelemetryProvider>
     </MantineProvider>
   </React.StrictMode>
 );
