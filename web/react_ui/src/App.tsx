@@ -177,6 +177,7 @@ import { useProcessesController } from "./features/processes/useProcessesControl
 import { useTelemetryStream } from "./features/telemetry/useTelemetryStream";
 import { useTelemetry } from "./features/telemetry/TelemetryContext";
 import { useStreamAnalysis } from "./features/stream_analysis/StreamAnalysisContext";
+import { useDevicesContext } from "./features/devices/DevicesContext";
 import { useLogsStream } from "./features/logs/useLogsStream";
 import type {
   PanelKind,
@@ -557,7 +558,21 @@ export function App() {
       };
     }
   }, []);
-  const [devices, setDevices] = useState<DeviceStatus[]>([]);
+  // Device roster + ordering + per-device UI collapse state moved to
+  // DevicesContext (features/devices/DevicesContext.tsx). The names below
+  // are kept identical so the existing call sites in App.tsx don't need
+  // touch-ups. `orderedDevices` (the sorted derivation) now lives in the
+  // Provider too — see the destructure below.
+  const {
+    devices,
+    setDevices,
+    orderedDevices,
+    deviceOrder,
+    setDeviceOrder,
+    telemetryCollapsedByDevice,
+    setTelemetryCollapsedByDevice,
+    deviceGridRef,
+  } = useDevicesContext();
   const { colorScheme, setColorScheme } = useMantineColorScheme();
   const computedColorScheme = useComputedColorScheme("light");
   const panelIdRef = useRef(initialPlotState.nextPanelId);
@@ -656,46 +671,8 @@ export function App() {
   const [activeUiDrag, setActiveUiDrag] = useState<UiDragData | null>(null);
   const [editingPanelId, setEditingPanelId] = useState<string | null>(null);
   const [panelTitleDraft, setPanelTitleDraft] = useState("");
-  const [deviceOrder, setDeviceOrder] = useState<string[]>(() => {
-    try {
-      const raw = localStorage.getItem("ecui.deviceOrder");
-      if (!raw) {
-        return [];
-      }
-      const parsed = JSON.parse(raw);
-      if (!Array.isArray(parsed)) {
-        return [];
-      }
-      return parsed
-        .map((value) => (typeof value === "string" ? value : ""))
-        .filter((value) => value.length > 0);
-    } catch {
-      return [];
-    }
-  });
-  const [telemetryCollapsedByDevice, setTelemetryCollapsedByDevice] = useState<
-    Record<string, boolean>
-  >(() => {
-    try {
-      const raw = localStorage.getItem("ecui.telemetryCollapsedByDevice");
-      if (!raw) {
-        return {};
-      }
-      const parsed = JSON.parse(raw);
-      if (!parsed || typeof parsed !== "object") {
-        return {};
-      }
-      const next: Record<string, boolean> = {};
-      for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
-        if (typeof key === "string" && typeof value === "boolean") {
-          next[key] = value;
-        }
-      }
-      return next;
-    } catch {
-      return {};
-    }
-  });
+  // deviceOrder + telemetryCollapsedByDevice now provided by
+  // DevicesContext (destructured at the top of the function).
   const [commandDeckCollapsedByGroup, setCommandDeckCollapsedByGroup] = useState<
     Record<string, boolean>
   >(() => {
@@ -719,7 +696,7 @@ export function App() {
       return {};
     }
   });
-  const deviceGridRef = useRef<HTMLDivElement | null>(null);
+  // deviceGridRef now provided by DevicesContext.
   const plotGridRef = useRef<HTMLDivElement | null>(null);
   const dragColumnsRef = useRef<{ device: number; panel: number }>({
     device: 1,
@@ -887,23 +864,7 @@ export function App() {
     invalidateDeviceCapabilities,
   } = useDeviceCapabilitiesController(devices);
 
-  const orderedDevices = useMemo(() => {
-    const rank = new Map(deviceOrder.map((deviceId, idx) => [deviceId, idx]));
-    return [...devices].sort((a, b) => {
-      const aRank = rank.get(a.device_id);
-      const bRank = rank.get(b.device_id);
-      if (aRank != null && bRank != null && aRank !== bRank) {
-        return aRank - bRank;
-      }
-      if (aRank != null) {
-        return -1;
-      }
-      if (bRank != null) {
-        return 1;
-      }
-      return a.device_id.localeCompare(b.device_id);
-    });
-  }, [devices, deviceOrder]);
+  // orderedDevices now lives in DevicesContext (destructured above).
   const streamCatalogByKey = useMemo(() => {
     const out = new Map<string, StreamCatalogEntry>();
     for (const entry of streamCatalog) {

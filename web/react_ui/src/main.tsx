@@ -8,6 +8,7 @@ import { Notifications } from "@mantine/notifications";
 import React from "react";
 import ReactDOM from "react-dom/client";
 import { App } from "./App";
+import { DevicesProvider } from "./features/devices/DevicesContext";
 import { StreamAnalysisProvider } from "./features/stream_analysis/StreamAnalysisContext";
 import { TelemetryProvider } from "./features/telemetry/TelemetryContext";
 
@@ -24,7 +25,9 @@ ReactDOM.createRoot(document.getElementById("root")!).render(
       <Notifications position="top-right" />
       <TelemetryProvider>
         <StreamAnalysisProvider>
-          <App />
+          <DevicesProvider>
+            <App />
+          </DevicesProvider>
         </StreamAnalysisProvider>
       </TelemetryProvider>
     </MantineProvider>
