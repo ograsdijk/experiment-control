@@ -175,6 +175,7 @@ import { useProcessCommandController } from "./features/processes/useProcessComm
 import { useProcessLifecycleController } from "./features/processes/useProcessLifecycleController";
 import { useProcessesController } from "./features/processes/useProcessesController";
 import { useTelemetryStream } from "./features/telemetry/useTelemetryStream";
+import { useTelemetry } from "./features/telemetry/TelemetryContext";
 import { useLogsStream } from "./features/logs/useLogsStream";
 import type {
   PanelKind,
@@ -750,38 +751,24 @@ export function App() {
     Record<string, boolean>
   >({});
   const commandDeckIdRef = useRef(1);
-  const buffersRef = useMemo(
-    () => new Map<string, Map<string, RingBuffer>>(),
-    []
-  );
-  const streamFramesRef = useMemo(
-    () => new Map<string, StreamFrameSample[]>(),
-    []
-  );
-  const streamTraceOverlayRef = useMemo(
-    () => new Map<string, Map<string, { seq: number; values: number[] }>>(),
-    []
-  );
-  const streamBinStatsOverlayRef = useMemo(
-    () => new Map<string, Map<string, { seq: number; values: number[] }>>(),
-    []
-  );
-  const streamBinStatsFitOverlayRef = useMemo(
-    () => new Map<string, Map<string, StreamFitCurveSnapshot>>(),
-    []
-  );
-  const streamParamsLatestRef = useMemo(
-    () => new Map<string, Record<string, StreamParamsOutputValue>>(),
-    []
-  );
-  const streamBinStatsRef = useMemo(
-    () => new Map<string, StreamBinStatsSnapshot>(),
-    []
-  );
-  const streamBin2dRef = useMemo(
-    () => new Map<string, StreamBin2dSnapshot>(),
-    []
-  );
+  // Plot buffers + per-stream overlay caches now live in TelemetryContext
+  // (features/telemetry/TelemetryContext.tsx) so future feature-module
+  // extractions can subscribe to them via useTelemetry() without prop-
+  // drilling refs through. The names below are kept identical so the
+  // hundreds of existing call sites in App.tsx don't need touch-ups.
+  const {
+    buffersRef,
+    streamFramesRef,
+    streamTraceOverlayRef,
+    streamBinStatsOverlayRef,
+    streamBinStatsFitOverlayRef,
+    streamParamsLatestRef,
+    streamBinStatsRef,
+    streamBin2dRef,
+    panelBuffersByTraceKey,
+    registerPanelTraces,
+    unregisterPanel: unregisterPanelTelemetry,
+  } = useTelemetry();
   const streamWorkspacesRef = useRef<Record<string, StreamAnalysisWorkspaceConfig>>(
     initialStreamWorkspaceState.workspaces
   );
@@ -2426,6 +2413,26 @@ export function App() {
         streamBin2dRef.delete(panel.id);
       }
     }
+    // P5: keep the trace-key reverse index in sync with the current panel
+    // set so the telemetry message handler can route O(1) per signal
+    // instead of walking buffersRef.values() per message. Telemetry
+    // panels register their (deviceId:signal) trace keys; other panel
+    // kinds and removed panels unregister.
+    const seenPanelIds = new Set<string>();
+    for (const panel of panels) {
+      if (isTelemetryPanel(panel)) {
+        const traceKeys = panel.traces.map(
+          (trace) => `${trace.deviceId}:${trace.signal}`
+        );
+        registerPanelTraces(panel.id, traceKeys);
+        seenPanelIds.add(panel.id);
+      }
+    }
+    for (const id of ids) {
+      if (!seenPanelIds.has(id)) {
+        unregisterPanelTelemetry(id);
+      }
+    }
   }, [
     panels,
     buffersRef,
@@ -2436,12 +2443,15 @@ export function App() {
     streamParamsLatestRef,
     streamBinStatsRef,
     streamBin2dRef,
+    registerPanelTraces,
+    unregisterPanelTelemetry,
   ]);
 
   const handleTelemetryHydrate = useCallback(
     (snapshot: LatestSignals) => {
       const booleanSignalKeys = new Set<string>();
       let pushedSamples = false;
+      const reverseIndex = panelBuffersByTraceKey.current;
       for (const [deviceId, signals] of Object.entries(snapshot)) {
         for (const [name, signal] of Object.entries(signals)) {
           const traceKey = `${deviceId}:${name}`;
@@ -2453,11 +2463,16 @@ export function App() {
             booleanSignalKeys.add(traceKey);
           }
           if (plotValue !== null) {
-            for (const panelBuffers of buffersRef.values()) {
-              const buffer = panelBuffers.get(traceKey);
-              if (buffer) {
-                buffer.push(normalizeTime(signal), plotValue);
-                pushedSamples = true;
+            // P5: O(1) lookup via reverse index instead of walking every
+            // panel's buffer map.
+            const panelIds = reverseIndex.get(traceKey);
+            if (panelIds) {
+              for (const panelId of panelIds) {
+                const buffer = buffersRef.get(panelId)?.get(traceKey);
+                if (buffer) {
+                  buffer.push(normalizeTime(signal), plotValue);
+                  pushedSamples = true;
+                }
               }
             }
           }
@@ -2489,7 +2504,7 @@ export function App() {
         setPlotTick((tick) => tick + 1);
       }
     },
-    [buffersRef]
+    [buffersRef, panelBuffersByTraceKey]
   );
 
   useEffect(() => {
@@ -2652,6 +2667,7 @@ export function App() {
       const bundleTs = msg.payload.ts?.t_wall;
       const booleanSignalKeys = new Set<string>();
       let pushedSamples = false;
+      const reverseIndex = panelBuffersByTraceKey.current;
       for (const [name, signal] of Object.entries(msg.payload.signals ?? {})) {
         const traceKey = `${deviceId}:${name}`;
         let plotValue: number | null = null;
@@ -2662,11 +2678,16 @@ export function App() {
           booleanSignalKeys.add(traceKey);
         }
         if (plotValue !== null) {
-          for (const panelBuffers of buffersRef.values()) {
-            const buffer = panelBuffers.get(traceKey);
-            if (buffer) {
-              buffer.push(normalizeTime(signal, bundleTs), plotValue);
-              pushedSamples = true;
+          // P5: O(1) lookup via reverse index instead of walking every
+          // panel's buffer map for each incoming signal.
+          const panelIds = reverseIndex.get(traceKey);
+          if (panelIds) {
+            for (const panelId of panelIds) {
+              const buffer = buffersRef.get(panelId)?.get(traceKey);
+              if (buffer) {
+                buffer.push(normalizeTime(signal, bundleTs), plotValue);
+                pushedSamples = true;
+              }
             }
           }
         }
@@ -2697,7 +2718,7 @@ export function App() {
         });
       }
     },
-    [buffersRef]
+    [buffersRef, panelBuffersByTraceKey]
   );
 
   const { latestByDevice, wsConnected, telemetryActive } = useTelemetryStream({
