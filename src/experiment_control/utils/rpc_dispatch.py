@@ -54,3 +54,25 @@ class RpcDispatchRegistry:
             return None
         return handler(req)
 
+    def canonicalize_request(self, req: Json) -> Json:
+        """Return req (or a shallow copy with req['type'] rewritten) so the
+        action is in canonical form. Used by callers that want canonicalisation
+        without the registry's built-in dispatch."""
+        canonical = self.canonical_action(req.get("type"))
+        if canonical:
+            req_type = str(req.get("type", "")).strip()
+            if canonical != req_type:
+                req = dict(req)
+                req["type"] = canonical
+        return req
+
+    def dispatch_with_canonical(self, req: Json) -> Json | None:
+        """Canonicalize req['type'] via alias map then dispatch.
+
+        If the action is aliased, the request is shallow-copied so the
+        original dict the caller passed in is not mutated. Returns None if
+        no handler matches (the caller decides what unknown_request response
+        to return).
+        """
+        return self.dispatch(self.canonicalize_request(req))
+

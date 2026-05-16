@@ -5296,12 +5296,7 @@ class StreamAnalysisProcess(ManagedProcessBase):
 
         if not hasattr(self, "_rpc_registry"):
             self._rpc_registry = self._build_rpc_registry()
-        canonical = self._rpc_registry.canonical_action(req.get("type"))
-        if canonical:
-            req_type = str(req.get("type", ""))
-            if canonical != req_type:
-                req = dict(req)
-                req["type"] = canonical
+        req = self._rpc_registry.canonicalize_request(req)
 
         params = req.get("params", {})
         if params is None:
