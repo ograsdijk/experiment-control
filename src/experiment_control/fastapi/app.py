@@ -10,6 +10,7 @@ import sys
 import time
 import uuid
 from pathlib import Path
+from collections.abc import Callable
 from typing import Any
 from urllib.parse import SplitResult, urlsplit, urlunsplit
 
@@ -193,6 +194,53 @@ async def _route_request(payload: dict[str, Any]) -> dict[str, Any]:
     return _ensure_error_shape(
         await asyncio.to_thread(app.state.router.request, payload)
     )
+
+
+def _build_trace_frame_payload(
+    payload: dict[str, Any],
+    *,
+    channel_index: int,
+    trace_decimator: str,
+    trace_max_points: int | None,
+    pre_decimate: Callable[[np.ndarray], np.ndarray | None] | None = None,
+) -> dict[str, Any] | None:
+    """Shared trace-processing chain used by /ws/raw_stream and
+    /api/streams/raw_snapshot.
+
+    Normalises shape, coerces values to an ndarray, selects the requested
+    channel, optionally runs a caller-supplied pre-decimate step (used by
+    the WS handler for rolling-average) and decimates to ``trace_max_points``.
+    Returns the rebuilt outgoing payload (with ``shape``/``values``/
+    ``channel_index``/``point_count``/optional ``decimated`` set), or ``None``
+    if the input payload was unusable.
+    """
+    shape = _normalize_shape(payload.get("shape"))
+    arr = _coerce_stream_values_array(payload.get("values"), shape)
+    if arr is None:
+        return None
+    trace = _select_trace_from_array(arr, channel_index)
+    if pre_decimate is not None:
+        trace = pre_decimate(trace)
+        if trace is None:
+            return None
+    if trace_max_points is not None:
+        trace_values = _decimate_trace_values(
+            trace,
+            mode=trace_decimator,
+            max_points=trace_max_points,
+        )
+    else:
+        trace_values = trace.tolist()
+    if not isinstance(trace_values, list):
+        return None
+    out_payload: dict[str, Any] = dict(payload)
+    out_payload["shape"] = [len(trace_values)]
+    out_payload["values"] = trace_values
+    out_payload["channel_index"] = int(channel_index)
+    out_payload["point_count"] = len(trace_values)
+    if trace_max_points is not None and len(trace_values) < int(trace.size):
+        out_payload["decimated"] = True
+    return out_payload
 
 
 def _command_source_fields(
@@ -1508,31 +1556,15 @@ async def ws_raw_stream(ws: WebSocket) -> None:
             msg_stream = str(payload.get("stream") or "").strip()
             if msg_device_id != device_id or msg_stream != stream:
                 continue
-            shape = _normalize_shape(payload.get("shape"))
-            arr = _coerce_stream_values_array(payload.get("values"), shape)
-            if arr is None:
+            out_payload = _build_trace_frame_payload(
+                payload,
+                channel_index=channel_index,
+                trace_decimator=trace_decimator,
+                trace_max_points=trace_max_points,
+                pre_decimate=_apply_trace_average,
+            )
+            if out_payload is None:
                 continue
-            trace = _select_trace_from_array(arr, channel_index)
-            trace = _apply_trace_average(trace)
-            if trace is None:
-                continue
-            if trace_max_points is not None:
-                trace_values = _decimate_trace_values(
-                    trace,
-                    mode=trace_decimator,
-                    max_points=trace_max_points,
-                )
-            else:
-                trace_values = trace.tolist()
-            if not isinstance(trace_values, list):
-                continue
-            out_payload: dict[str, Any] = dict(payload)
-            out_payload["shape"] = [len(trace_values)]
-            out_payload["values"] = trace_values
-            out_payload["channel_index"] = int(channel_index)
-            out_payload["point_count"] = len(trace_values)
-            if trace_max_points is not None and len(trace_values) < int(trace.size):
-                out_payload["decimated"] = True
             await _send_or_queue({"topic": "manager.stream_frame", "payload": out_payload})
     except WebSocketDisconnect:
         pass
@@ -1566,28 +1598,14 @@ async def raw_stream_snapshot(request: Request) -> dict[str, Any]:
     payload = frame_msg.get("payload")
     if not isinstance(payload, dict):
         return {"ok": True, "result": None}
-    shape = _normalize_shape(payload.get("shape"))
-    arr = _coerce_stream_values_array(payload.get("values"), shape)
-    if arr is None:
+    out_payload = _build_trace_frame_payload(
+        payload,
+        channel_index=channel_index,
+        trace_decimator=trace_decimator,
+        trace_max_points=trace_max_points,
+    )
+    if out_payload is None:
         return {"ok": True, "result": None}
-    trace = _select_trace_from_array(arr, channel_index)
-    if trace_max_points is not None:
-        trace_values = _decimate_trace_values(
-            trace,
-            mode=trace_decimator,
-            max_points=trace_max_points,
-        )
-    else:
-        trace_values = trace.tolist()
-    if not isinstance(trace_values, list):
-        return {"ok": True, "result": None}
-    out_payload: dict[str, Any] = dict(payload)
-    out_payload["shape"] = [len(trace_values)]
-    out_payload["values"] = trace_values
-    out_payload["channel_index"] = int(channel_index)
-    out_payload["point_count"] = len(trace_values)
-    if trace_max_points is not None and len(trace_values) < int(trace.size):
-        out_payload["decimated"] = True
     return {
         "ok": True,
         "result": {
