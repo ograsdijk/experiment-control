@@ -175,6 +175,7 @@ import { useProcessCommandController } from "./features/processes/useProcessComm
 import { useProcessLifecycleController } from "./features/processes/useProcessLifecycleController";
 import { useProcessesController } from "./features/processes/useProcessesController";
 import { useTelemetryStream } from "./features/telemetry/useTelemetryStream";
+import { useTelemetry } from "./features/telemetry/TelemetryContext";
 import { useLogsStream } from "./features/logs/useLogsStream";
 import type {
   PanelKind,
@@ -750,38 +751,24 @@ export function App() {
     Record<string, boolean>
   >({});
   const commandDeckIdRef = useRef(1);
-  const buffersRef = useMemo(
-    () => new Map<string, Map<string, RingBuffer>>(),
-    []
-  );
-  const streamFramesRef = useMemo(
-    () => new Map<string, StreamFrameSample[]>(),
-    []
-  );
-  const streamTraceOverlayRef = useMemo(
-    () => new Map<string, Map<string, { seq: number; values: number[] }>>(),
-    []
-  );
-  const streamBinStatsOverlayRef = useMemo(
-    () => new Map<string, Map<string, { seq: number; values: number[] }>>(),
-    []
-  );
-  const streamBinStatsFitOverlayRef = useMemo(
-    () => new Map<string, Map<string, StreamFitCurveSnapshot>>(),
-    []
-  );
-  const streamParamsLatestRef = useMemo(
-    () => new Map<string, Record<string, StreamParamsOutputValue>>(),
-    []
-  );
-  const streamBinStatsRef = useMemo(
-    () => new Map<string, StreamBinStatsSnapshot>(),
-    []
-  );
-  const streamBin2dRef = useMemo(
-    () => new Map<string, StreamBin2dSnapshot>(),
-    []
-  );
+  // Plot buffers + per-stream overlay caches now live in TelemetryContext
+  // (features/telemetry/TelemetryContext.tsx) so future feature-module
+  // extractions can subscribe to them via useTelemetry() without prop-
+  // drilling refs through. The names below are kept identical so the
+  // hundreds of existing call sites in App.tsx don't need touch-ups.
+  const {
+    buffersRef,
+    streamFramesRef,
+    streamTraceOverlayRef,
+    streamBinStatsOverlayRef,
+    streamBinStatsFitOverlayRef,
+    streamParamsLatestRef,
+    streamBinStatsRef,
+    streamBin2dRef,
+    panelBuffersByTraceKey,
+    registerPanelTraces,
+    unregisterPanel: unregisterPanelTelemetry,
+  } = useTelemetry();
   const streamWorkspacesRef = useRef<Record<string, StreamAnalysisWorkspaceConfig>>(
     initialStreamWorkspaceState.workspaces
   );
