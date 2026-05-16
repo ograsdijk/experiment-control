@@ -1423,8 +1423,11 @@ async def ws_telemetry(ws: WebSocket) -> None:
     q = app.state.telemetry_hub.subscribe()
     try:
         while True:
-            msg = await q.get()
-            await ws.send_json(msg)
+            # Hub queues pre-serialized JSON strings (see TelemetryHub) so
+            # all N subscribers share the same `json.dumps()` work done
+            # once in the hub's reader thread.
+            payload = await q.get()
+            await ws.send_text(payload)
     except WebSocketDisconnect:
         pass
     finally:
@@ -1437,8 +1440,8 @@ async def ws_logs(ws: WebSocket) -> None:
     q = app.state.logs_hub.subscribe(maxsize=300)
     try:
         while True:
-            msg = await q.get()
-            await ws.send_json(msg)
+            payload = await q.get()
+            await ws.send_text(payload)
     except WebSocketDisconnect:
         pass
     finally:

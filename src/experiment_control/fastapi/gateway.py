@@ -204,6 +204,19 @@ class RouterRpcClient:
 
 
 class TelemetryHub:
+    """ZMQ → WebSocket fan-out hub for simple topic broadcast streams.
+
+    Items put on subscriber queues are **pre-serialized JSON strings**, not
+    dicts. The hub serializes each incoming ZMQ payload exactly once in
+    its background thread and shares the resulting string across every
+    subscriber, so N WS clients no longer each pay `json.dumps()` on the
+    same payload. WS handlers should consume via `ws.send_text(payload)`.
+
+    `latest_message()` returns the most recently broadcast string so a
+    newly connecting client can prime its state without waiting for the
+    next ZMQ event (useful for low-rate topics like manager state).
+    """
+
     def __init__(self, endpoint: str, *, topics: tuple[str, ...]) -> None:
         self._endpoint = endpoint
         self._topics = topics
@@ -242,7 +255,7 @@ class TelemetryHub:
         with self._lock:
             self._queues.discard(q)
 
-    def _fanout(self, msg: dict[str, Any]) -> None:
+    def _fanout(self, payload: str) -> None:
         with self._lock:
             queues = list(self._queues)
         for q in queues:
@@ -252,7 +265,7 @@ class TelemetryHub:
                 except asyncio.QueueEmpty:
                     pass
             try:
-                q.put_nowait(msg)
+                q.put_nowait(payload)
             except asyncio.QueueFull:
                 pass
 
@@ -278,8 +291,16 @@ class TelemetryHub:
                 "topic": topic_b.decode("utf-8"),
                 "payload": payload,
             }
+            # Serialize once in the hub thread; the resulting str is the
+            # exact bytes every subscriber will send over its WebSocket.
+            # N subscribers no longer each pay `json.dumps(msg)` per
+            # payload.
+            try:
+                serialized = json_dumps(msg).decode("utf-8")
+            except Exception:
+                continue
             if self._loop is not None:
-                self._loop.call_soon_threadsafe(self._fanout, msg)
+                self._loop.call_soon_threadsafe(self._fanout, serialized)
         sub.setsockopt(zmq.LINGER, 0)
         sub.close(0)
 

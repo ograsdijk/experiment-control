@@ -131,6 +131,34 @@ class GatewayLifecycleTests(unittest.TestCase):
             hub.close()
             loop.close()
 
+    def test_telemetry_hub_fanout_shares_preserialized_string(self) -> None:
+        """Hub serializes once and every subscriber receives the same str
+        (round-tripped from JSON). This is the load-bearing invariant of
+        the P1 optimization: N subscribers no longer each pay
+        `json.dumps()`."""
+        import json
+
+        async def run() -> tuple[str, str, str]:
+            hub = TelemetryHub("tcp://127.0.0.1:1", topics=("any",))
+            hub._loop = asyncio.get_running_loop()  # noqa: SLF001
+            q1 = hub.subscribe()
+            q2 = hub.subscribe()
+            hub._fanout('{"topic":"any","payload":{"k":1}}')  # noqa: SLF001
+            payload1 = await asyncio.wait_for(q1.get(), timeout=1.0)
+            payload2 = await asyncio.wait_for(q2.get(), timeout=1.0)
+            return payload1, payload2, '{"topic":"any","payload":{"k":1}}'
+
+        loop = asyncio.new_event_loop()
+        try:
+            payload1, payload2, expected = loop.run_until_complete(run())
+        finally:
+            loop.close()
+        # Both subscribers received the exact same string instance —
+        # confirms the hub didn't re-serialize per subscriber.
+        self.assertIs(payload1, payload2)
+        # And the string is the JSON we put in.
+        self.assertEqual(json.loads(payload1), json.loads(expected))
+
     def test_stream_frame_hub_restart_is_safe(self) -> None:
         loop = asyncio.new_event_loop()
         hub = StreamFrameHub("tcp://127.0.0.1:1", topics=("manager.chunk_ready",))
