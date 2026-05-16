@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import queue
 import sys
+import threading
 import unittest
 from collections import deque
 from contextlib import redirect_stderr
@@ -17,6 +19,7 @@ from experiment_control.processes.influx_writer import (  # noqa: E402
     DeviceRoute,
     InfluxDestination,
     InfluxWriterProcess,
+    QueuedPoint,
 )
 
 
@@ -50,6 +53,11 @@ def _make_proc() -> InfluxWriterProcess:
     proc._device_type_by_id = {}  # noqa: SLF001
     proc._device_tags_by_id = {}  # noqa: SLF001
     proc._queue = deque()  # noqa: SLF001
+    proc._queue_lock = threading.Lock()  # noqa: SLF001
+    proc._http_queue = queue.Queue(maxsize=64)  # noqa: SLF001
+    proc._http_thread_dead = False  # noqa: SLF001
+    proc._dropped_http_batches = 0  # noqa: SLF001
+    proc._http_thread = None  # noqa: SLF001
     proc._max_queue_points = 10_000  # noqa: SLF001
     proc._overflow_policy = "drop_oldest"  # noqa: SLF001
     proc._batch_max_points = 500  # noqa: SLF001
@@ -353,6 +361,97 @@ class InfluxWriterWideModeTests(unittest.TestCase):
 
         messages = [item["message"] for item in proc._pending_log_payloads]  # noqa: SLF001
         self.assertEqual(messages, ["first failure", "second failure"])
+
+
+class _BgThreadTestMixin:
+    @staticmethod
+    def _make_bg_proc() -> InfluxWriterProcess:
+        proc = _make_proc()
+        # process_base attributes the bg thread touches via _record_exception
+        proc._phase = None  # noqa: SLF001
+        proc._phase_detail = None  # noqa: SLF001
+        proc._last_progress_wall = None  # noqa: SLF001
+        proc._last_progress_mono = None  # noqa: SLF001
+        proc._last_exception = None  # noqa: SLF001
+        proc._last_traceback_summary = None  # noqa: SLF001
+        proc._progress_lock = threading.RLock()  # noqa: SLF001
+        proc._stop_evt = threading.Event()  # noqa: SLF001
+        return proc
+
+
+class InfluxWriterBgHttpThreadTests(unittest.TestCase, _BgThreadTestMixin):
+    def test_http_error_keeps_thread_alive_and_requeues(self) -> None:
+        proc = self._make_bg_proc()
+
+        attempts: list[int] = []
+
+        def fake_flush_grouped(*, by_destination: dict[str, list[Any]]) -> list[Any]:
+            attempts.append(len(attempts))
+            if len(attempts) == 1:
+                # First batch: simulate HTTPError — _flush_destination_points
+                # would have caught it and returned False, so all points come
+                # back as failed.
+                proc._last_error = "HTTPError status=503"  # noqa: SLF001
+                return [p for points in by_destination.values() for p in points]
+            return []
+
+        proc._flush_grouped_points = fake_flush_grouped  # type: ignore[assignment]  # noqa: SLF001
+
+        thread = threading.Thread(target=proc._http_thread_run, name="test-http")  # noqa: SLF001
+        thread.start()
+        try:
+            batch1 = {"default": [QueuedPoint(destination="default", line="line1")]}
+            batch2 = {"default": [QueuedPoint(destination="default", line="line2")]}
+            proc._http_queue.put(batch1)  # noqa: SLF001
+            proc._http_queue.put(batch2)  # noqa: SLF001
+            # Wait for both to be processed
+            deadline = threading.Event()
+            for _ in range(50):
+                if len(attempts) >= 2:
+                    break
+                deadline.wait(0.05)
+            self.assertEqual(len(attempts), 2)
+            self.assertFalse(proc._http_thread_dead)  # noqa: SLF001
+            self.assertEqual(proc._last_error, "HTTPError status=503")  # noqa: SLF001
+            # First batch's point was requeued
+            with proc._queue_lock:  # noqa: SLF001
+                queued = list(proc._queue)  # noqa: SLF001
+            self.assertEqual(len(queued), 1)
+            self.assertEqual(queued[0].line, "line1")
+        finally:
+            proc._stop_evt.set()  # noqa: SLF001
+            proc._http_queue.put(None)  # noqa: SLF001
+            thread.join(timeout=2.0)
+            self.assertFalse(thread.is_alive())
+
+    def test_unexpected_exception_kills_thread_and_sets_dead_flag(self) -> None:
+        proc = self._make_bg_proc()
+
+        def boom(*, by_destination: dict[str, list[Any]]) -> list[Any]:
+            raise RuntimeError("simulated fatal")
+
+        # Force the fatal path: replace _flush_grouped_points to raise, but
+        # also block the inner try/except by re-raising from a place that the
+        # batch loop doesn't catch — easiest is to make _requeue_failed raise
+        # so the inner except re-raises out of the batch loop.
+        def detonate(_points: list[QueuedPoint]) -> None:
+            raise RuntimeError("simulated fatal")
+
+        proc._flush_grouped_points = boom  # type: ignore[assignment]  # noqa: SLF001
+        proc._requeue_failed = detonate  # type: ignore[assignment]  # noqa: SLF001
+
+        thread = threading.Thread(target=proc._http_thread_run, name="test-http")  # noqa: SLF001
+        thread.start()
+        try:
+            batch = {"default": [QueuedPoint(destination="default", line="line1")]}
+            proc._http_queue.put(batch)  # noqa: SLF001
+            thread.join(timeout=2.0)
+            self.assertFalse(thread.is_alive())
+            self.assertTrue(proc._http_thread_dead)  # noqa: SLF001
+            self.assertTrue(proc._stop_evt.is_set())  # noqa: SLF001
+            self.assertIsNotNone(proc._last_exception)  # noqa: SLF001
+        finally:
+            proc._stop_evt.set()  # noqa: SLF001
 
 
 if __name__ == "__main__":
