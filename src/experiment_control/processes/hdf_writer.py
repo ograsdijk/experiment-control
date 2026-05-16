@@ -3,9 +3,12 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import queue
+import threading
 import time
 import uuid
 from collections import deque
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Literal, cast
 
@@ -55,6 +58,102 @@ DTYPE_MAP: dict[str, np.dtype[Any]] = {
 DEFAULT_NUMERIC_COMPRESSION = "lzf"
 DEFAULT_NUMERIC_SHUFFLE = True
 DEFAULT_TELEMETRY_CHUNK_ROWS = 64
+
+
+# ---------------------------------------------------------------------------
+# Background-flush queue types.
+#
+# These are the typed payloads the main loop hands off to the bg flush
+# thread. `FlushBatch` is fire-and-forget (no response). The `_BgRequest`
+# hierarchy is for synchronous RPC handlers that need to wait on the bg
+# thread to mutate `_h5` (file rotation, start/stop writing, measurement
+# note append, device toggle). Each `_BgRequest` carries a 1-slot response
+# queue the bg thread fills with either the result or the raised exception.
+#
+# Commit 1 introduces only the type definitions and the queue plumbing —
+# main-loop handlers do not yet enqueue anything other than the shutdown
+# sentinel. Commit 2 flips all `_h5`-touching paths through the queue.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _StreamBatch:
+    """One stream's worth of pending writes, snapshotted at flush time."""
+
+    data: list[bytes]
+    seq: list[int]
+    t0_mono_ns: list[int]
+    t0_wall_ns: list[int]
+    context_ids: list[int]
+    schema: dict[str, Any]
+    session: int
+
+
+@dataclass(frozen=True)
+class _FlushBatch:
+    """Snapshot of pending main-loop state ready to be written to HDF5."""
+
+    buffered_rows: list[Json] = field(default_factory=list)
+    event_rows: list[tuple[str, Json]] = field(default_factory=list)
+    stream_batches: dict[tuple[str, str], _StreamBatch] = field(
+        default_factory=dict
+    )
+    pending_stream_metadata: dict[tuple[str, str], dict[str, Any]] = field(
+        default_factory=dict
+    )
+    dropped_local_delta: int = 0
+    dropped_events_delta: int = 0
+    force_flush: bool = False
+
+
+@dataclass
+class _BgRequest:
+    """Base for synchronous RPC requests routed through the bg thread."""
+
+    response: "queue.Queue[Any]" = field(default_factory=lambda: queue.Queue(maxsize=1))
+
+
+@dataclass
+class _RotateRequest(_BgRequest):
+    filename: str | None = None
+    disabled_devices: set[str] | None = None
+    measurement_profile: str | None = None
+    measurement_values: object = None
+
+
+@dataclass
+class _StartWritingRequest(_BgRequest):
+    filename: str | None = None
+    disabled_devices: set[str] | None = None
+    measurement_profile: str | None = None
+    measurement_values: object = None
+
+
+@dataclass
+class _StopWritingRequest(_BgRequest):
+    pass
+
+
+@dataclass
+class _MeasurementNoteRequest(_BgRequest):
+    author: str = ""
+    kind: str = ""
+    message: str = ""
+    payload_json: str = ""
+
+
+@dataclass
+class _DevicesToggleRequest(_BgRequest):
+    disabled: set[str] = field(default_factory=set)
+
+
+class _BgSentinel:
+    """Marker put on the bg queue to request a clean thread exit."""
+
+    __slots__ = ()
+
+
+_BG_SENTINEL = _BgSentinel()
 
 
 def _default_filename() -> str:
@@ -164,6 +263,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=list(EVENT_LOG_MODES),
         default="all",
     )
+    p.add_argument("--bg-join-timeout-s", type=float, default=2.0)
     return p.parse_args(argv)
 
 
@@ -338,7 +438,14 @@ class HdfWriter(ManagedProcessBase):
         measurement_schema_path: str | None = None,
         autostart_writing: bool | str | None = None,
         event_log_mode: EventLogMode = "all",
+        bg_join_timeout_s: float = 2.0,
     ) -> None:
+        # bg_join_timeout_s bounds how long close() waits for the background
+        # flush thread to drain its queue and close the HDF5 file on shutdown.
+        # Must be < the process-level shutdown_timeout_s the manager
+        # supervisor enforces, otherwise the manager will SIGKILL the worker
+        # mid-close. Default 2.0s leaves 1s headroom under the typical 3.0s
+        # supervisor budget.
         super().__init__(
             process_id=None,
             heartbeat_endpoint=None,
@@ -459,6 +566,26 @@ class HdfWriter(ManagedProcessBase):
         self._next_write = 0.0
 
         self._error_counts: dict[str, int] = {}
+
+        # Background-flush plumbing. The bg thread, once spawned in run(),
+        # consumes _FlushBatch (fire-and-forget) and _BgRequest (synchronous)
+        # items from _bg_queue. The bounded queue caps in-flight handoffs;
+        # on overflow a FlushBatch is dropped and _dropped_flush_batches is
+        # incremented. The two cached attrs (_active_h5_filename,
+        # _writing_active) are written by the bg thread on every file
+        # open/close/rotate and read by status RPC handlers without a lock
+        # (single-reference attribute reads are atomic in CPython).
+        bg_qsize = max(8, self._flush_every_n // 100)
+        self._bg_queue: "queue.Queue[_FlushBatch | _BgRequest | _BgSentinel]" = (
+            queue.Queue(maxsize=bg_qsize)
+        )
+        self._bg_thread: threading.Thread | None = None
+        self._bg_thread_dead = False
+        self._dropped_flush_batches = 0
+        self._bg_join_timeout_s = max(0.1, float(bg_join_timeout_s))
+        self._active_h5_filename: str | None = None
+        self._writing_active = False
+
         self._rpc_registry = self._build_rpc_registry()
         self._topic_handlers = self._build_topic_handlers()
 
@@ -923,6 +1050,89 @@ class HdfWriter(ManagedProcessBase):
         self._pending = 0
         self._last_flush = time.monotonic()
 
+    # ------------------------------------------------------------------
+    # Background-flush thread.
+    #
+    # Commit 1 only wires the thread up and handles the shutdown sentinel.
+    # Commit 2 will add _FlushBatch + _BgRequest dispatch; for now any
+    # other queue item raises and is logged via _record_exception.
+    # ------------------------------------------------------------------
+
+    def _start_bg_thread(self) -> None:
+        if self._bg_thread is not None:
+            return
+        self._bg_thread_dead = False
+        self._bg_thread = threading.Thread(
+            target=self._bg_thread_run,
+            name="hdf-bg-flush",
+            daemon=True,
+        )
+        self._bg_thread.start()
+
+    def _bg_thread_run(self) -> None:
+        try:
+            while not self._stop_evt.is_set():
+                try:
+                    req = self._bg_queue.get(timeout=0.5)
+                except queue.Empty:
+                    continue
+                if isinstance(req, _BgSentinel):
+                    return
+                try:
+                    self._dispatch_bg_request(req)
+                except Exception as exc:
+                    self._record_exception(
+                        exc, phase=f"bg.{type(req).__name__}"
+                    )
+                    self._bump_error(f"bg.{type(req).__name__}.failed")
+                    if isinstance(req, _BgRequest):
+                        try:
+                            req.response.put(exc, timeout=0.1)
+                        except queue.Full:
+                            pass
+        except Exception as exc:
+            # Anything that escapes the outer loop is fatal — set the
+            # watchdog flag and stop the process so the supervisor's
+            # restart policy can take over.
+            self._record_exception(exc, phase="bg_thread_fatal")
+            self._bump_error("bg_thread_fatal")
+            self._bg_thread_dead = True
+            self._stop_evt.set()
+
+    def _dispatch_bg_request(
+        self, req: "_FlushBatch | _BgRequest"
+    ) -> None:
+        # Commit 1 placeholder: no production code enqueues anything other
+        # than the shutdown sentinel yet. Commit 2 fills in handlers for
+        # _FlushBatch, _RotateRequest, _StartWritingRequest, _StopWritingRequest,
+        # _MeasurementNoteRequest, _DevicesToggleRequest.
+        raise NotImplementedError(
+            f"bg request type not yet handled: {type(req).__name__}"
+        )
+
+    def _shutdown_bg_thread(self) -> None:
+        thread = self._bg_thread
+        if thread is None:
+            return
+        try:
+            self._bg_queue.put(_BG_SENTINEL, timeout=1.0)
+        except queue.Full:
+            pass
+        if thread.is_alive():
+            thread.join(timeout=self._bg_join_timeout_s)
+            if thread.is_alive():
+                # Bg thread is stuck (likely a slow h5.close() or a wedged
+                # write). Force-close the file from the main thread so we
+                # don't leak the handle, then let close() proceed.
+                self._bump_error("close.bg_thread_hang")
+                if self._h5 is not None:
+                    try:
+                        self._h5.close()
+                    except Exception:
+                        self._bump_error("close.bg_thread_hang.h5_close")
+                    self._h5 = None
+        self._bg_thread = None
+
     def _drain_pending_to_file(self) -> None:
         self._write_buffered_rows()
         self._write_event_rows()
@@ -1383,6 +1593,12 @@ class HdfWriter(ManagedProcessBase):
     def close(self) -> None:
         self._stop_evt.set()
 
+        # Shut down the bg flush thread before tearing down sockets so a
+        # final flush attempt (if commit 2 is in place) has a chance to
+        # land. The shutdown helper is a no-op if the thread was never
+        # started.
+        self._shutdown_bg_thread()
+
         t = self._heartbeat_thread
         if t is not None and t.is_alive():
             t.join(timeout=2.0)
@@ -1480,6 +1696,7 @@ class HdfWriter(ManagedProcessBase):
                 self._last_flush = now
                 self._next_write = now + write_every_s
             self._start_heartbeat_thread()
+            self._start_bg_thread()
             if self._process_id:
                 try:
                     self._init_rpc_router()
@@ -2099,6 +2316,13 @@ class HdfWriter(ManagedProcessBase):
             ),
             "context_evicted_map_overflow": int(self._context_evicted_map_overflow),
             "seen_context_ids_count": int(len(self._seen_context_ids)),
+            "bg_thread": {
+                "alive": self._bg_thread is not None and self._bg_thread.is_alive(),
+                "dead": bool(self._bg_thread_dead),
+                "queue_depth": self._bg_queue.qsize(),
+                "queue_capacity": self._bg_queue.maxsize,
+            },
+            "dropped_flush_batches": int(self._dropped_flush_batches),
             "event_log_mode": str(self._event_log_mode),
             "measurement_id": self._measurement_id,
             "measurement_type": self._measurement_type,
@@ -3483,6 +3707,7 @@ def main(argv: list[str] | None = None) -> None:
         measurement_schema_path=ns.measurement_schema_path,
         autostart_writing=ns.autostart_writing,
         event_log_mode=ns.event_log_mode,
+        bg_join_timeout_s=ns.bg_join_timeout_s,
     )
     writer._process_id = ns.process_id
     writer._heartbeat_endpoint = ns.heartbeat_endpoint
