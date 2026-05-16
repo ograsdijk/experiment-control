@@ -75,6 +75,15 @@ def _make_proc() -> InfluxWriterProcess:
     proc._pending_log_payloads = deque(maxlen=200)  # noqa: SLF001
     proc._last_flush_wall_s = None  # noqa: SLF001
     proc._last_flush_mono_s = None  # noqa: SLF001
+    proc._last_flush_start_wall_s = None  # noqa: SLF001
+    proc._last_flush_start_mono_s = None  # noqa: SLF001
+    proc._last_flush_duration_s = None  # noqa: SLF001
+    proc._last_flush_destination = None  # noqa: SLF001
+    proc._last_drain_count = 0  # noqa: SLF001
+    proc._last_drain_duration_s = 0.0  # noqa: SLF001
+    proc._total_drained = 0  # noqa: SLF001
+    proc._drain_limited_count = 0  # noqa: SLF001
+    proc._drain_parse_errors = 0  # noqa: SLF001
     return proc
 
 
