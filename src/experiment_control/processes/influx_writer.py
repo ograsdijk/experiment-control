@@ -596,18 +596,25 @@ class InfluxWriterProcess(ManagedProcessBase):
         else:
             self._remote_device_ids.discard(device_id)
 
-        tags: dict[str, str] = {}
-        device_metadata = payload.get("device_metadata")
-        if isinstance(device_metadata, dict):
-            for key in self._device_tag_keys:
-                value = device_metadata.get(key)
-                if value is None:
-                    continue
-                value_text = str(value).strip()
-                if value_text:
-                    tags[key] = value_text
-        self._device_tags_by_id[device_id] = tags
+        self._device_tags_by_id[device_id] = self._extract_device_tags(
+            payload.get("device_metadata")
+        )
+        self._refresh_device_type(device_id=device_id, payload=payload)
 
+    def _extract_device_tags(self, device_metadata: Any) -> dict[str, str]:
+        tags: dict[str, str] = {}
+        if not isinstance(device_metadata, dict):
+            return tags
+        for key in self._device_tag_keys:
+            value = device_metadata.get(key)
+            if value is None:
+                continue
+            value_text = str(value).strip()
+            if value_text:
+                tags[key] = value_text
+        return tags
+
+    def _refresh_device_type(self, *, device_id: str, payload: Json) -> None:
         route = self._routes.get(device_id)
         if route is not None and route.device_type:
             normalized_route = _normalize_device_type_name(route.device_type)
