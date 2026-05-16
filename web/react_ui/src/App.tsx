@@ -6769,23 +6769,26 @@ export function App() {
     setPanelTitleDraft("");
   };
 
-  const onPlotSignal = (deviceId: string, signal: string) => {
-    const active = panels.find((panel) => panel.id === activePanelId);
-    const target =
-      (active && isTelemetryPanel(active) ? active : null) ??
-      panels.find((panel): panel is PlotTelemetryPanelState =>
-        isTelemetryPanel(panel)
-      );
-    if (!target) {
-      notifications.show({
-        color: "yellow",
-        title: "No telemetry panel",
-        message: "Add a telemetry panel first to plot telemetry signals.",
-      });
-      return;
-    }
-    addTraceToPanel(target.id, deviceId, signal);
-  };
+  const onPlotSignal = useCallback(
+    (deviceId: string, signal: string) => {
+      const active = panels.find((panel) => panel.id === activePanelId);
+      const target =
+        (active && isTelemetryPanel(active) ? active : null) ??
+        panels.find((panel): panel is PlotTelemetryPanelState =>
+          isTelemetryPanel(panel)
+        );
+      if (!target) {
+        notifications.show({
+          color: "yellow",
+          title: "No telemetry panel",
+          message: "Add a telemetry panel first to plot telemetry signals.",
+        });
+        return;
+      }
+      addTraceToPanel(target.id, deviceId, signal);
+    },
+    [panels, activePanelId, addTraceToPanel]
+  );
 
   const sequencerChipProgressStyle = (() => {
     const isRunning =

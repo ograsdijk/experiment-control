@@ -820,20 +820,31 @@ class DeviceRunner:
                 self._publish_scheduled_streams(now=time.monotonic())
 
         finally:
-            # Best-effort cleanup
+            # Best-effort cleanup. Log the exception to stderr before swallowing
+            # so the process supervisor (which pipes stderr to manager.log) sees
+            # cleanup failures instead of devices silently sitting in UNKNOWN.
             try:
                 if self._connect_called and self._device_state != DeviceState.DISCONNECTED:
                     self.disconnect_device()
-            except Exception:
-                pass
+            except Exception as exc:
+                sys.stderr.write(
+                    f"[driver][{self.device_id}] disconnect_device failed during cleanup: {exc!r}\n"
+                )
+                sys.stderr.flush()
             try:
                 self._cleanup_stream_publishers()
-            except Exception:
-                pass
+            except Exception as exc:
+                sys.stderr.write(
+                    f"[driver][{self.device_id}] _cleanup_stream_publishers failed: {exc!r}\n"
+                )
+                sys.stderr.flush()
             try:
                 self.disconnect_ipc()
-            except Exception:
-                pass
+            except Exception as exc:
+                sys.stderr.write(
+                    f"[driver][{self.device_id}] disconnect_ipc failed: {exc!r}\n"
+                )
+                sys.stderr.flush()
 
     # ----------------------------
     # Subclass hooks
