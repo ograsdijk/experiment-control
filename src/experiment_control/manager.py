@@ -1261,8 +1261,17 @@ class Manager:
             if hb_endpoint in self._process_hb_connected:
                 try:
                     self._process_hb_sub.disconnect(hb_endpoint)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    self._publish_manager_event(
+                        "manager.log",
+                        {
+                            "severity": "warning",
+                            "message": (
+                                f"process hb sub disconnect failed for "
+                                f"{hb_endpoint}: {exc!r}"
+                            ),
+                        },
+                    )
                 self._process_hb_connected.discard(hb_endpoint)
         if data_endpoint and all(
             str(h.process_data_endpoint or "").strip() != data_endpoint
@@ -1271,8 +1280,17 @@ class Manager:
             if data_endpoint in self._process_data_connected:
                 try:
                     self._process_data_sub.disconnect(data_endpoint)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    self._publish_manager_event(
+                        "manager.log",
+                        {
+                            "severity": "warning",
+                            "message": (
+                                f"process data sub disconnect failed for "
+                                f"{data_endpoint}: {exc!r}"
+                            ),
+                        },
+                    )
                 self._process_data_connected.discard(data_endpoint)
         self._publish_process_event("manager.process.removed", handle)
 
