@@ -49,6 +49,11 @@ class ManagerLogTailTests(unittest.TestCase):
         mgr._supervisor_pending_blocks = {}  # type: ignore[attr-defined]
         mgr._supervisor_log_threads = {}  # type: ignore[attr-defined]
         mgr._published_events = []  # type: ignore[attr-defined]
+        # `_supervisor_handle_for` reads these; tests don't need real handles
+        # but the dicts have to exist so the lookup doesn't AttributeError and
+        # silently fall through the try/except in _failure_event_log_context.
+        mgr._processes = {}  # type: ignore[attr-defined]
+        mgr._devices = {}  # type: ignore[attr-defined]
 
         def publish_manager_event(topic: str, payload: dict[str, object]) -> None:
             mgr._published_events.append((topic, payload))  # type: ignore[attr-defined]
