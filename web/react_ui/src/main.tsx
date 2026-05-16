@@ -8,6 +8,7 @@ import { Notifications } from "@mantine/notifications";
 import React from "react";
 import ReactDOM from "react-dom/client";
 import { App } from "./App";
+import { StreamAnalysisProvider } from "./features/stream_analysis/StreamAnalysisContext";
 import { TelemetryProvider } from "./features/telemetry/TelemetryContext";
 
 const theme = createTheme({
@@ -22,7 +23,9 @@ ReactDOM.createRoot(document.getElementById("root")!).render(
     <MantineProvider theme={theme} defaultColorScheme="auto">
       <Notifications position="top-right" />
       <TelemetryProvider>
-        <App />
+        <StreamAnalysisProvider>
+          <App />
+        </StreamAnalysisProvider>
       </TelemetryProvider>
     </MantineProvider>
   </React.StrictMode>
