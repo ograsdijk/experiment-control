@@ -35,64 +35,26 @@ from .manager_driver_pub import handle_driver_pub as shared_handle_driver_pub
 from .manager_driver_pub import ingest_chunk_ready as shared_ingest_chunk_ready
 from .manager_driver_pub import ingest_heartbeat as shared_ingest_heartbeat
 from .manager_driver_pub import ingest_telemetry as shared_ingest_telemetry
-from .manager_internal_routes_manager import (
-    route_manager_cleanup_orphans as shared_route_manager_cleanup_orphans,
-)
-from .manager_internal_routes_manager import (
-    route_manager_command_journal_status as shared_route_manager_command_journal_status,
-)
-from .manager_internal_routes_manager import (
-    route_manager_command_journal_tail as shared_route_manager_command_journal_tail,
-)
-from .manager_internal_routes_manager import (
-    route_manager_event_publish as shared_route_manager_event_publish,
-)
-from .manager_internal_routes_manager import (
-    route_manager_identity as shared_route_manager_identity,
-)
-from .manager_internal_routes_manager import (
-    route_manager_log_publish as shared_route_manager_log_publish,
-)
-from .manager_internal_routes_manager import (
-    route_manager_log_tail as shared_route_manager_log_tail,
-)
-from .manager_internal_routes_manager import (
-    route_manager_request as shared_route_manager_request,
-)
-from .manager_internal_routes_manager import (
-    route_manager_shutdown as shared_route_manager_shutdown,
-)
-from .manager_internal_routes_process import (
+from .manager_route_handlers import (
     publish_process_command_response as shared_publish_process_command_response,
-)
-from .manager_internal_routes_process import (
     route_command_interceptor_list as shared_route_command_interceptor_list,
-)
-from .manager_internal_routes_process import (
     route_command_interceptor_register as shared_route_command_interceptor_register,
-)
-from .manager_internal_routes_process import (
+    route_manager_cleanup_orphans as shared_route_manager_cleanup_orphans,
+    route_manager_command_journal_status as shared_route_manager_command_journal_status,
+    route_manager_command_journal_tail as shared_route_manager_command_journal_tail,
+    route_manager_event_publish as shared_route_manager_event_publish,
+    route_manager_identity as shared_route_manager_identity,
+    route_manager_log_publish as shared_route_manager_log_publish,
+    route_manager_log_tail as shared_route_manager_log_tail,
+    route_manager_request as shared_route_manager_request,
+    route_manager_shutdown as shared_route_manager_shutdown,
     route_process_add as shared_route_process_add,
-)
-from .manager_internal_routes_process import (
     route_process_control as shared_route_process_control,
-)
-from .manager_internal_routes_process import (
     route_process_get as shared_route_process_get,
-)
-from .manager_internal_routes_process import (
     route_process_list_status as shared_route_process_list_status,
-)
-from .manager_internal_routes_process import (
     route_process_remove as shared_route_process_remove,
-)
-from .manager_internal_routes_process import (
     route_process_request as shared_route_process_request,
-)
-from .manager_internal_routes_process import (
     route_process_rpc as shared_route_process_rpc,
-)
-from .manager_internal_routes_process import (
     route_process_rpc_advertise as shared_route_process_rpc_advertise,
 )
 from .manager_internal_rpc import (
