@@ -1516,11 +1516,15 @@ class HdfWriter(ManagedProcessBase):
                 self._dropped_events = 0
                 self._clear_buffered_for_disabled(self._disabled_devices)
 
-                poller = zmq.Poller()
-                self._poller = poller
-                poller.register(sub, zmq.POLLIN)
-                if self._rpc_router is not None:
-                    poller.register(self._rpc_router, zmq.POLLIN)
+                # Register the local sub socket on the shared base-class poller.
+                # `include_sub=False` because we connect our own SUB (the manager
+                # helper isn't used here); the RPC router is auto-drained by
+                # `_poll_and_drain`.
+                self._init_poller(
+                    include_sub=False,
+                    include_rpc=True,
+                    extra=[(sub, zmq.POLLIN)],
+                )
 
                 while not self._stop_evt.is_set():
                     now = time.monotonic()
@@ -1529,15 +1533,10 @@ class HdfWriter(ManagedProcessBase):
                         (self._last_flush + flush_every_s) - now,
                     )
                     timeout_ms = int(max(0.0, timeout_s) * 1000)
-                    events = dict(poller.poll(timeout_ms))
+                    events = self._poll_and_drain(timeout_ms)
 
                     if events.get(sub) == zmq.POLLIN:
                         self._drain_socket()
-                    if (
-                        self._rpc_router is not None
-                        and events.get(self._rpc_router) == zmq.POLLIN
-                    ):
-                        self._drain_rpc()
 
                     now = time.monotonic()
                     if now >= self._next_write:
