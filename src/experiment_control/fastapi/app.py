@@ -10,6 +10,7 @@ import sys
 import time
 import uuid
 from pathlib import Path
+from collections.abc import Callable
 from typing import Any
 from urllib.parse import SplitResult, urlsplit, urlunsplit
 
@@ -179,6 +180,67 @@ def _ensure_error_shape(resp: Any) -> dict[str, Any]:
     if resp.get("ok") is False and isinstance(resp.get("error"), str):
         resp["error"] = {"code": "error", "message": resp["error"]}
     return resp
+
+
+async def _route_request(payload: dict[str, Any]) -> dict[str, Any]:
+    """Dispatch ``payload`` through the router on a thread and shape the response.
+
+    Most HTTP handlers follow the pattern ``payload = {...}; resp = await
+    asyncio.to_thread(app.state.router.request, payload); return
+    _ensure_error_shape(resp)``. Use this helper for those. Handlers that
+    post-process the response (filter, reshape, fan out, etc.) should keep
+    calling the router directly.
+    """
+    return _ensure_error_shape(
+        await asyncio.to_thread(app.state.router.request, payload)
+    )
+
+
+def _build_trace_frame_payload(
+    payload: dict[str, Any],
+    *,
+    channel_index: int,
+    trace_decimator: str,
+    trace_max_points: int | None,
+    pre_decimate: Callable[[np.ndarray], np.ndarray | None] | None = None,
+) -> dict[str, Any] | None:
+    """Shared trace-processing chain used by /ws/raw_stream and
+    /api/streams/raw_snapshot.
+
+    Normalises shape, coerces values to an ndarray, selects the requested
+    channel, optionally runs a caller-supplied pre-decimate step (used by
+    the WS handler for rolling-average) and decimates to ``trace_max_points``.
+    Returns the rebuilt outgoing payload (with ``shape``/``values``/
+    ``channel_index``/``point_count``/optional ``decimated`` set), or ``None``
+    if the input payload was unusable.
+    """
+    shape = _normalize_shape(payload.get("shape"))
+    arr = _coerce_stream_values_array(payload.get("values"), shape)
+    if arr is None:
+        return None
+    trace = _select_trace_from_array(arr, channel_index)
+    if pre_decimate is not None:
+        trace = pre_decimate(trace)
+        if trace is None:
+            return None
+    if trace_max_points is not None:
+        trace_values = _decimate_trace_values(
+            trace,
+            mode=trace_decimator,
+            max_points=trace_max_points,
+        )
+    else:
+        trace_values = trace.tolist()
+    if not isinstance(trace_values, list):
+        return None
+    out_payload: dict[str, Any] = dict(payload)
+    out_payload["shape"] = [len(trace_values)]
+    out_payload["values"] = trace_values
+    out_payload["channel_index"] = int(channel_index)
+    out_payload["point_count"] = len(trace_values)
+    if trace_max_points is not None and len(trace_values) < int(trace.size):
+        out_payload["decimated"] = True
+    return out_payload
 
 
 def _command_source_fields(
@@ -850,22 +912,19 @@ async def instance_cleanup_orphans(
         "timeout_s": float(req.timeout_s) if req is not None else 2.0,
     }
     payload = {"type": "manager.control.cleanup_orphans", "params": params}
-    resp = await asyncio.to_thread(app.state.router.request, payload)
-    return _ensure_error_shape(resp)
+    return await _route_request(payload)
 
 
 @app.get("/api/devices")
 async def list_devices() -> dict[str, Any]:
     payload = {"type": "device.list_status"}
-    resp = await asyncio.to_thread(app.state.router.request, payload)
-    return _ensure_error_shape(resp)
+    return await _route_request(payload)
 
 
 @app.get("/api/snapshots/telemetry")
 async def telemetry_snapshot() -> dict[str, Any]:
     payload = {"type": "manager.telemetry.snapshot"}
-    resp = await asyncio.to_thread(app.state.router.request, payload)
-    return _ensure_error_shape(resp)
+    return await _route_request(payload)
 
 
 @app.get("/api/streams")
@@ -966,22 +1025,19 @@ async def device_call(
 @app.post("/api/devices/{device_id}/connect")
 async def device_connect(device_id: str) -> dict[str, Any]:
     payload = {"type": "device.connect", "device_id": device_id}
-    resp = await asyncio.to_thread(app.state.router.request, payload)
-    return _ensure_error_shape(resp)
+    return await _route_request(payload)
 
 
 @app.post("/api/devices/{device_id}/start")
 async def device_start(device_id: str) -> dict[str, Any]:
     payload = {"type": "device.driver.start", "device_id": device_id}
-    resp = await asyncio.to_thread(app.state.router.request, payload)
-    return _ensure_error_shape(resp)
+    return await _route_request(payload)
 
 
 @app.post("/api/devices/{device_id}/disconnect")
 async def device_disconnect(device_id: str) -> dict[str, Any]:
     payload = {"type": "device.disconnect", "device_id": device_id}
-    resp = await asyncio.to_thread(app.state.router.request, payload)
-    return _ensure_error_shape(resp)
+    return await _route_request(payload)
 
 
 @app.post("/api/devices/{device_id}/restart")
@@ -993,15 +1049,13 @@ async def device_restart(
         "device_id": device_id,
         "force": bool(req.force) if req is not None else False,
     }
-    resp = await asyncio.to_thread(app.state.router.request, payload)
-    return _ensure_error_shape(resp)
+    return await _route_request(payload)
 
 
 @app.get("/api/processes")
 async def list_processes() -> dict[str, Any]:
     payload = {"type": "manager.processes.list"}
-    resp = await asyncio.to_thread(app.state.router.request, payload)
-    return _ensure_error_shape(resp)
+    return await _route_request(payload)
 
 
 @app.post("/api/processes/{process_id}/start")
@@ -1011,8 +1065,7 @@ async def process_start(process_id: str, request: Request) -> dict[str, Any]:
         "process_id": process_id,
         **_command_source_fields(request),
     }
-    resp = await asyncio.to_thread(app.state.router.request, payload)
-    return _ensure_error_shape(resp)
+    return await _route_request(payload)
 
 
 @app.post("/api/processes/{process_id}/stop")
@@ -1022,8 +1075,7 @@ async def process_stop(process_id: str, request: Request) -> dict[str, Any]:
         "process_id": process_id,
         **_command_source_fields(request),
     }
-    resp = await asyncio.to_thread(app.state.router.request, payload)
-    return _ensure_error_shape(resp)
+    return await _route_request(payload)
 
 
 @app.post("/api/processes/{process_id}/restart")
@@ -1033,8 +1085,7 @@ async def process_restart(process_id: str, request: Request) -> dict[str, Any]:
         "process_id": process_id,
         **_command_source_fields(request),
     }
-    resp = await asyncio.to_thread(app.state.router.request, payload)
-    return _ensure_error_shape(resp)
+    return await _route_request(payload)
 
 
 @app.post("/api/processes/hdf_writer/writing/stop")
@@ -1051,8 +1102,7 @@ async def hdf_writer_writing_stop(request: Request) -> dict[str, Any]:
         },
         **_command_source_fields(request),
     }
-    resp = await asyncio.to_thread(app.state.router.request, payload)
-    return _ensure_error_shape(resp)
+    return await _route_request(payload)
 
 
 @app.post("/api/processes/hdf_writer/writing/start")
@@ -1086,8 +1136,7 @@ async def hdf_writer_writing_start(
             source_id=req.source_id if req is not None else None,
         ),
     }
-    resp = await asyncio.to_thread(app.state.router.request, payload)
-    return _ensure_error_shape(resp)
+    return await _route_request(payload)
 
 
 @app.get("/api/processes/{process_id}/capabilities")
@@ -1104,8 +1153,7 @@ async def process_capabilities(process_id: str) -> dict[str, Any]:
             "request_id": uuid.uuid4().hex,
         },
     }
-    resp = await asyncio.to_thread(app.state.router.request, payload)
-    return _ensure_error_shape(resp)
+    return await _route_request(payload)
 
 
 @app.post("/api/processes/{process_id}/call")
@@ -1131,8 +1179,7 @@ async def process_call(
         },
         **source_fields,
     }
-    resp = await asyncio.to_thread(app.state.router.request, payload)
-    return _ensure_error_shape(resp)
+    return await _route_request(payload)
 
 
 @app.get("/api/interlocks/interceptor_routes")
@@ -1350,15 +1397,13 @@ async def logs_tail(req: LogTailRequest | None = None) -> dict[str, Any]:
         "type": "manager.logs.tail",
         "params": req.params if req is not None else {},
     }
-    resp = await asyncio.to_thread(app.state.router.request, payload)
-    return _ensure_error_shape(resp)
+    return await _route_request(payload)
 
 
 @app.get("/api/commands/journal/status")
 async def command_journal_status() -> dict[str, Any]:
     payload = {"type": "manager.commands.journal.status"}
-    resp = await asyncio.to_thread(app.state.router.request, payload)
-    return _ensure_error_shape(resp)
+    return await _route_request(payload)
 
 
 @app.post("/api/commands/journal/tail")
@@ -1369,8 +1414,7 @@ async def command_journal_tail(
         "type": "manager.commands.journal.tail",
         "params": req.params if req is not None else {},
     }
-    resp = await asyncio.to_thread(app.state.router.request, payload)
-    return _ensure_error_shape(resp)
+    return await _route_request(payload)
 
 
 @app.websocket("/ws/telemetry")
@@ -1512,31 +1556,15 @@ async def ws_raw_stream(ws: WebSocket) -> None:
             msg_stream = str(payload.get("stream") or "").strip()
             if msg_device_id != device_id or msg_stream != stream:
                 continue
-            shape = _normalize_shape(payload.get("shape"))
-            arr = _coerce_stream_values_array(payload.get("values"), shape)
-            if arr is None:
+            out_payload = _build_trace_frame_payload(
+                payload,
+                channel_index=channel_index,
+                trace_decimator=trace_decimator,
+                trace_max_points=trace_max_points,
+                pre_decimate=_apply_trace_average,
+            )
+            if out_payload is None:
                 continue
-            trace = _select_trace_from_array(arr, channel_index)
-            trace = _apply_trace_average(trace)
-            if trace is None:
-                continue
-            if trace_max_points is not None:
-                trace_values = _decimate_trace_values(
-                    trace,
-                    mode=trace_decimator,
-                    max_points=trace_max_points,
-                )
-            else:
-                trace_values = trace.tolist()
-            if not isinstance(trace_values, list):
-                continue
-            out_payload: dict[str, Any] = dict(payload)
-            out_payload["shape"] = [len(trace_values)]
-            out_payload["values"] = trace_values
-            out_payload["channel_index"] = int(channel_index)
-            out_payload["point_count"] = len(trace_values)
-            if trace_max_points is not None and len(trace_values) < int(trace.size):
-                out_payload["decimated"] = True
             await _send_or_queue({"topic": "manager.stream_frame", "payload": out_payload})
     except WebSocketDisconnect:
         pass
@@ -1570,28 +1598,14 @@ async def raw_stream_snapshot(request: Request) -> dict[str, Any]:
     payload = frame_msg.get("payload")
     if not isinstance(payload, dict):
         return {"ok": True, "result": None}
-    shape = _normalize_shape(payload.get("shape"))
-    arr = _coerce_stream_values_array(payload.get("values"), shape)
-    if arr is None:
+    out_payload = _build_trace_frame_payload(
+        payload,
+        channel_index=channel_index,
+        trace_decimator=trace_decimator,
+        trace_max_points=trace_max_points,
+    )
+    if out_payload is None:
         return {"ok": True, "result": None}
-    trace = _select_trace_from_array(arr, channel_index)
-    if trace_max_points is not None:
-        trace_values = _decimate_trace_values(
-            trace,
-            mode=trace_decimator,
-            max_points=trace_max_points,
-        )
-    else:
-        trace_values = trace.tolist()
-    if not isinstance(trace_values, list):
-        return {"ok": True, "result": None}
-    out_payload: dict[str, Any] = dict(payload)
-    out_payload["shape"] = [len(trace_values)]
-    out_payload["values"] = trace_values
-    out_payload["channel_index"] = int(channel_index)
-    out_payload["point_count"] = len(trace_values)
-    if trace_max_points is not None and len(trace_values) < int(trace.size):
-        out_payload["decimated"] = True
     return {
         "ok": True,
         "result": {
