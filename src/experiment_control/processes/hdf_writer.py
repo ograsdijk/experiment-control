@@ -2028,8 +2028,13 @@ class HdfWriter(ManagedProcessBase):
     def _write_event_rows(self) -> None:
         if self._event_buf is None:
             return
+        rows: list[tuple[str, Json]] = []
+        while self._event_buf:
+            rows.append(self._event_buf.popleft())
+        self._write_event_rows_batch(rows)
+
+    def _write_event_rows_batch(self, rows: list[tuple[str, Json]]) -> None:
         if self._h5 is None or self._events_ds is None:
-            self._event_buf.clear()
             return
 
         batch = self._ensure_event_batch_buffer(dtype=self._events_ds.dtype)
@@ -2042,8 +2047,7 @@ class HdfWriter(ManagedProcessBase):
             self._append_dataset_rows(ds=self._events_ds, batch=batch, count=used)
             used = 0
 
-        while self._event_buf:
-            topic, msg = self._event_buf.popleft()
+        for topic, msg in rows:
             ts = msg.get("ts", {})
             t_wall = float(ts.get("t_wall", np.nan))
             t_mono = float(ts.get("t_mono", np.nan))
@@ -2700,15 +2704,24 @@ class HdfWriter(ManagedProcessBase):
         return self._rpc_error(dispatch_req, code="unknown_request")
 
     def _write_buffered_rows(self) -> None:
+        # Backward-compatible entry point used by the existing test suite.
+        # Drains the live deque into a list and delegates to the batch-aware
+        # variant. Once commit 2b lands and the main loop hands batches off
+        # to the bg thread, the bg thread will call `_write_buffered_rows_batch`
+        # directly with a pre-built list.
         if self._buf is None:
             return
+        rows: list[Json] = []
+        while self._buf:
+            rows.append(self._buf.popleft())
+        self._write_buffered_rows_batch(rows)
+
+    def _write_buffered_rows_batch(self, rows: list[Json]) -> None:
         if self._h5 is None or self._telemetry_group is None:
-            self._buf.clear()
             return
         used_by_device: dict[str, int] = {}
 
-        while self._buf:
-            msg = self._buf.popleft()
+        for msg in rows:
             device_id = self._normalize_device_id(msg.get("device_id"))
             if device_id is None:
                 continue
