@@ -1,6 +1,8 @@
 import shutil
 import sys
 import tempfile
+import threading
+import time
 import uuid
 import json
 from contextlib import contextmanager
@@ -16,7 +18,12 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from experiment_control.processes.hdf_writer import HdfWriter, _create_device_dataset  # noqa: E402
+from experiment_control.processes.hdf_writer import (  # noqa: E402
+    HdfWriter,
+    _BG_SENTINEL,
+    _FlushBatch,
+    _create_device_dataset,
+)
 
 
 def _as_text(value: object) -> str:
@@ -1415,6 +1422,122 @@ class HdfWriterDeviceMetadataStorageTests(unittest.TestCase):
                 self.assertEqual(device_payload, {})
                 self.assertEqual(stream_payload, {})
                 self.assertEqual(run_meta_payload, [])
+
+
+def _make_bg_test_writer() -> HdfWriter:
+    """Build a writer just complete enough to exercise the bg flush thread."""
+    return HdfWriter(
+        out_dir="data",
+        filename=None,
+        manager_rpc="tcp://127.0.0.1:65541",
+        manager_pub="tcp://127.0.0.1:65542",
+        rpc_timeout_ms=2000,
+        timezone="America/Chicago",
+        rcvhwm=1000,
+        write_every_s=1.0,
+        buffer_max_messages=1000,
+        flush_every_n=10,
+        flush_every_s=1.0,
+        disabled_devices=[],
+        bg_join_timeout_s=0.5,
+    )
+
+
+def _spawn_bg_thread(writer: HdfWriter) -> threading.Thread:
+    writer._start_bg_thread()  # noqa: SLF001
+    assert writer._bg_thread is not None  # noqa: SLF001
+    return writer._bg_thread  # noqa: SLF001
+
+
+def _wait_for(predicate, timeout_s: float = 2.0) -> bool:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return False
+
+
+class HdfWriterBgFlushThreadTests(unittest.TestCase):
+    def test_flush_batch_dispatch_failure_keeps_thread_alive(self) -> None:
+        """A failing _handle_flush_batch is logged + dropped without killing
+        the thread or setting the watchdog flag. Production policy: a
+        single batch failure is recoverable; only fatal/escaped exceptions
+        stop the process."""
+        writer = _make_bg_test_writer()
+
+        calls: list[int] = []
+
+        def boom(_batch: _FlushBatch) -> None:
+            calls.append(len(calls))
+            raise RuntimeError("simulated write failure")
+
+        writer._handle_flush_batch = boom  # type: ignore[assignment]  # noqa: SLF001
+        thread = _spawn_bg_thread(writer)
+        try:
+            writer._bg_queue.put(_FlushBatch())  # noqa: SLF001
+            writer._bg_queue.put(_FlushBatch())  # noqa: SLF001
+            self.assertTrue(_wait_for(lambda: len(calls) >= 2))
+            self.assertFalse(writer._bg_thread_dead)  # noqa: SLF001
+            self.assertFalse(writer._stop_evt.is_set())  # noqa: SLF001
+            self.assertEqual(
+                writer._error_counts.get("bg._FlushBatch.failed"),  # noqa: SLF001
+                2,
+            )
+        finally:
+            writer._stop_evt.set()  # noqa: SLF001
+            writer._bg_queue.put(_BG_SENTINEL)  # noqa: SLF001
+            thread.join(timeout=1.0)
+            self.assertFalse(thread.is_alive())
+
+    def test_fatal_bg_thread_exception_sets_watchdog_and_stops(self) -> None:
+        """A bare exception escaping the outer queue.get loop is fatal —
+        the thread sets _bg_thread_dead, _stop_evt, exits cleanly. The
+        main run loop's watchdog check in turn breaks the run loop."""
+        writer = _make_bg_test_writer()
+
+        # Replace the queue with a sentinel that raises on the first .get()
+        # call, simulating an unhandled error escaping the inner try/except.
+        class BoomQueue:
+            def get(self, *args, **kwargs):
+                raise RuntimeError("simulated queue.get failure")
+
+        writer._bg_queue = BoomQueue()  # type: ignore[assignment]  # noqa: SLF001
+        thread = _spawn_bg_thread(writer)
+        try:
+            thread.join(timeout=1.0)
+            self.assertFalse(thread.is_alive())
+            self.assertTrue(writer._bg_thread_dead)  # noqa: SLF001
+            self.assertTrue(writer._stop_evt.is_set())  # noqa: SLF001
+            self.assertEqual(
+                writer._error_counts.get("bg_thread_fatal"), 1  # noqa: SLF001
+            )
+            self.assertIsNotNone(writer._last_exception)  # noqa: SLF001
+        finally:
+            writer._stop_evt.set()  # noqa: SLF001
+
+    def test_shutdown_sentinel_drains_queue_cleanly(self) -> None:
+        """Sentinel posted to the queue makes the bg thread exit
+        immediately even if real batches remain queued behind it."""
+        writer = _make_bg_test_writer()
+
+        handled: list[_FlushBatch] = []
+
+        def record(batch: _FlushBatch) -> None:
+            handled.append(batch)
+
+        writer._handle_flush_batch = record  # type: ignore[assignment]  # noqa: SLF001
+        thread = _spawn_bg_thread(writer)
+        try:
+            first = _FlushBatch()
+            writer._bg_queue.put(first)  # noqa: SLF001
+            writer._bg_queue.put(_BG_SENTINEL)  # noqa: SLF001
+            writer._bg_queue.put(_FlushBatch())  # noqa: SLF001 — should NOT be processed
+            thread.join(timeout=1.0)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(handled, [first])
+        finally:
+            writer._stop_evt.set()  # noqa: SLF001
 
 
 if __name__ == "__main__":

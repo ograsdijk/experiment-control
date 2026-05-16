@@ -1160,6 +1160,7 @@ class HdfWriter(ManagedProcessBase):
                     except Exception:
                         self._bump_error("close.bg_thread_hang.h5_close")
                     self._h5 = None
+                    self._publish_h5_state_cache()
         self._bg_thread = None
 
     def _drain_pending_to_file(self) -> None:
@@ -1173,6 +1174,26 @@ class HdfWriter(ManagedProcessBase):
             self._write_event_rows()
             self._write_stream_buffers()
             self._flush_active_file()
+
+    def _publish_h5_state_cache(self) -> None:
+        """Refresh cached filename/writing_active from current `self._h5`.
+
+        Status RPC reads use these cached fields instead of accessing
+        `self._h5.filename` directly, so the status handler doesn't have
+        to take `_h5_lock` (read path stays free of contention with the
+        bg flush thread). CPython attribute writes/reads on a single
+        reference are atomic.
+        """
+        h5 = self._h5
+        if h5 is None:
+            self._active_h5_filename = None
+            self._writing_active = False
+        else:
+            try:
+                self._active_h5_filename = str(h5.filename)
+            except Exception:
+                self._active_h5_filename = None
+            self._writing_active = True
 
     def _snapshot_main_loop_buffers(
         self,
@@ -1337,6 +1358,7 @@ class HdfWriter(ManagedProcessBase):
 
     def _restore_file_state(self, state: dict[str, Any]) -> None:
         self._h5 = state["h5"]
+        self._publish_h5_state_cache()
         self._telemetry_group = state["telemetry_group"]
         self._streams_group = state["streams_group"]
         self._config_group = state["config_group"]
@@ -1450,6 +1472,7 @@ class HdfWriter(ManagedProcessBase):
         measurement_meta: Json,
     ) -> None:
         self._h5 = h5
+        self._publish_h5_state_cache()
         self._reset_per_file_state()
 
         h5.attrs["timezone"] = self._timezone
@@ -1688,6 +1711,7 @@ class HdfWriter(ManagedProcessBase):
             self._bump_error("stop_writing.close")
             errors.append(f"close failed: {e}")
         self._h5 = None
+        self._publish_h5_state_cache()
         self._reset_per_file_state()
         self._pending = 0
         now = time.monotonic()
@@ -1749,6 +1773,7 @@ class HdfWriter(ManagedProcessBase):
 
         h5 = self._h5
         self._h5 = None
+        self._publish_h5_state_cache()
         if h5 is not None:
             self._mark_active_measurement_ended()
             try:
@@ -1790,6 +1815,7 @@ class HdfWriter(ManagedProcessBase):
                 except FileExistsError:
                     self._bump_error("autostart.file_exists")
                     self._h5 = None
+                    self._publish_h5_state_cache()
                     self._reset_per_file_state()
                     self._pending = 0
                     now = time.monotonic()
@@ -1797,6 +1823,7 @@ class HdfWriter(ManagedProcessBase):
                     self._next_write = now + write_every_s
             else:
                 self._h5 = None
+                self._publish_h5_state_cache()
                 self._reset_per_file_state()
                 self._pending = 0
                 now = time.monotonic()
@@ -2411,8 +2438,12 @@ class HdfWriter(ManagedProcessBase):
             else None
         )
         result = {
-            "file": str(self._h5.filename) if self._h5 is not None else None,
-            "writing_active": self._h5 is not None,
+            # Read cached state (refreshed by bg thread / file rotation
+            # via _publish_h5_state_cache) instead of `self._h5.filename`
+            # so this RPC handler doesn't need to take _h5_lock while the
+            # bg thread is in the middle of a write.
+            "file": self._active_h5_filename,
+            "writing_active": bool(self._writing_active),
             "autostart_writing": bool(self._autostart_writing),
             "pending": int(self._pending),
             "dropped": int(self._dropped_local),
