@@ -176,6 +176,7 @@ import { useProcessLifecycleController } from "./features/processes/useProcessLi
 import { useProcessesController } from "./features/processes/useProcessesController";
 import { useTelemetryStream } from "./features/telemetry/useTelemetryStream";
 import { useTelemetry } from "./features/telemetry/TelemetryContext";
+import { useStreamAnalysis } from "./features/stream_analysis/StreamAnalysisContext";
 import { useLogsStream } from "./features/logs/useLogsStream";
 import type {
   PanelKind,
@@ -566,30 +567,45 @@ export function App() {
   const [activePanelId, setActivePanelId] = useState(
     initialPlotState.activePanelId
   );
-  const streamWorkspaceIdRef = useRef(initialStreamWorkspaceState.nextId);
-  const [streamWorkspaces, setStreamWorkspaces] = useState<
-    Record<string, StreamAnalysisWorkspaceConfig>
-  >(initialStreamWorkspaceState.workspaces);
-  const [streamWorkspaceRevisions, setStreamWorkspaceRevisions] = useState<
-    Record<string, number>
-  >({});
-  const [workspaceStoreStatus, setWorkspaceStoreStatus] =
-    useState<StreamWorkspaceStoreStatus>(() =>
-      normalizeWorkspaceStoreStatus(null)
-    );
-  const [workspaceStoreBusyAction, setWorkspaceStoreBusyAction] = useState<
-    "save" | "reload" | null
-  >(null);
-  const [daqOpen, setDaqOpen] = useState(false);
-  const [daqWorkspaceId, setDaqWorkspaceId] = useState<string | null>(
-    Object.keys(initialStreamWorkspaceState.workspaces)[0] ?? null
-  );
-  const [daqDraftName, setDaqDraftName] = useState("");
-  const [daqDraftNodes, setDaqDraftNodes] = useState<StreamDagNodeConfig[]>([]);
-  const [daqDraftOutputs, setDaqDraftOutputs] = useState<StreamDagOutputConfig[]>([]);
-  const [daqDraftEnabled, setDaqDraftEnabled] = useState(true);
-  const [daqResetNodeBusyId, setDaqResetNodeBusyId] = useState<string | null>(null);
-  const [daqFocusedNodeId, setDaqFocusedNodeId] = useState<string | null>(null);
+  // Stream-analysis (DAQ workspace) state moved to StreamAnalysisContext
+  // (features/stream_analysis/StreamAnalysisContext.tsx). The names below
+  // are kept identical to the inline declarations they replaced so the
+  // ~180 existing call sites in App.tsx don't need touch-ups.
+  //
+  // Network handlers (load/persist/reset) stay in App.tsx for now — they
+  // call into helpers that haven't been extracted. The Context owns the
+  // state container only, matching the round-8 TelemetryContext shape.
+  const {
+    streamWorkspaces,
+    setStreamWorkspaces,
+    streamWorkspaceRevisions,
+    setStreamWorkspaceRevisions,
+    workspaceStoreStatus,
+    setWorkspaceStoreStatus,
+    workspaceStoreBusyAction,
+    setWorkspaceStoreBusyAction,
+    daqOpen,
+    setDaqOpen,
+    daqWorkspaceId,
+    setDaqWorkspaceId,
+    daqDraftName,
+    setDaqDraftName,
+    daqDraftNodes,
+    setDaqDraftNodes,
+    daqDraftOutputs,
+    setDaqDraftOutputs,
+    daqDraftEnabled,
+    setDaqDraftEnabled,
+    daqResetNodeBusyId,
+    setDaqResetNodeBusyId,
+    daqFocusedNodeId,
+    setDaqFocusedNodeId,
+    streamWorkspaceIdRef,
+    streamWorkspacesRef,
+    streamWorkspaceRevisionsRef,
+    daqNodeCardRefs,
+    daqNodeFocusTimeoutRef,
+  } = useStreamAnalysis();
   const [plotTick, setPlotTick] = useState(0);
   const [plotOptionsPanelId, setPlotOptionsPanelId] = useState<string | null>(null);
   const [expandedPlotPanelId, setExpandedPlotPanelId] = useState<string | null>(null);
@@ -769,12 +785,9 @@ export function App() {
     registerPanelTraces,
     unregisterPanel: unregisterPanelTelemetry,
   } = useTelemetry();
-  const streamWorkspacesRef = useRef<Record<string, StreamAnalysisWorkspaceConfig>>(
-    initialStreamWorkspaceState.workspaces
-  );
-  const daqNodeCardRefs = useRef<Map<string, HTMLDivElement>>(new Map());
-  const daqNodeFocusTimeoutRef = useRef<number | null>(null);
-  const streamWorkspaceRevisionsRef = useRef<Record<string, number>>({});
+  // streamWorkspacesRef / streamWorkspaceRevisionsRef / daqNodeCardRefs /
+  // daqNodeFocusTimeoutRef now provided by StreamAnalysisContext (see
+  // destructure above).
   const panelsRef = useRef<PlotPanelState[]>(initialPlotState.panels);
   const streamAnalysisReadyRef = useRef(false);
   const rawSnapshotHydratedRef = useRef<Set<string>>(new Set());
