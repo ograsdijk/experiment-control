@@ -4,8 +4,10 @@ import argparse
 import json
 import math
 import os
+import queue
 import re
 import sys
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -406,6 +408,20 @@ class InfluxWriterProcess(ManagedProcessBase):
         self._pending_log_payloads: deque[Json] = deque(maxlen=200)
         self._last_published_error_text: str | None = None
 
+        # Background HTTP worker: hands off batched groupings so the main loop
+        # never blocks on urlopen. Queue depth 64 caps in-flight batches; on
+        # overflow we drop the batch (counted) rather than blocking the main
+        # loop. Thread-safety: bg thread only touches self._queue under
+        # _queue_lock and never calls self._manager (ZMQ REQ is not thread-safe);
+        # it surfaces errors via self._last_error which the main loop publishes.
+        self._queue_lock = threading.Lock()
+        self._http_queue: queue.Queue[dict[str, list[QueuedPoint]] | None] = (
+            queue.Queue(maxsize=64)
+        )
+        self._http_thread_dead = False
+        self._dropped_http_batches = 0
+        self._http_thread: threading.Thread | None = None
+
         self._init_rpc_router()
         self._manager = self._manager_helper.init_client(
             ctx=self._ctx,
@@ -626,14 +642,15 @@ class InfluxWriterProcess(ManagedProcessBase):
         return destination.measurement
 
     def _enqueue_point(self, point: QueuedPoint) -> None:
-        if len(self._queue) >= self._max_queue_points:
-            if self._overflow_policy == "drop_newest":
+        with self._queue_lock:
+            if len(self._queue) >= self._max_queue_points:
+                if self._overflow_policy == "drop_newest":
+                    self._points_dropped_overflow += 1
+                    return
+                self._queue.popleft()
                 self._points_dropped_overflow += 1
-                return
-            self._queue.popleft()
-            self._points_dropped_overflow += 1
-        self._queue.append(point)
-        self._points_queued += 1
+            self._queue.append(point)
+            self._points_queued += 1
 
     def _drain_sub(
         self,
@@ -857,6 +874,7 @@ class InfluxWriterProcess(ManagedProcessBase):
 
     def _requeue_failed(self, points: list[QueuedPoint]) -> None:
         # Reinsert at the front to preserve ordering semantics.
+        # Caller must hold _queue_lock.
         for point in reversed(points):
             if len(self._queue) >= self._max_queue_points:
                 if self._overflow_policy == "drop_newest":
@@ -946,16 +964,57 @@ class InfluxWriterProcess(ManagedProcessBase):
         return failed
 
     def _flush(self) -> None:
-        if not self._queue:
+        with self._queue_lock:
+            if not self._queue:
+                return
+            pending = self._drain_pending_points()
+        if not pending:
             return
-        pending = self._drain_pending_points()
         by_destination = self._group_points_by_destination(pending)
-        failed = self._flush_grouped_points(by_destination=by_destination)
+        try:
+            self._http_queue.put_nowait(by_destination)
+        except queue.Full:
+            # HTTP thread is backlogged; put the points back so we don't lose
+            # them. Counted so it shows up in status / heartbeat.
+            self._dropped_http_batches += 1
+            with self._queue_lock:
+                self._requeue_failed(pending)
 
-        if failed:
-            self._requeue_failed(failed)
-
-        self._mark_flush_timestamp()
+    def _http_thread_run(self) -> None:
+        try:
+            while not self._stop_evt.is_set():
+                try:
+                    batch = self._http_queue.get(timeout=0.5)
+                except queue.Empty:
+                    continue
+                if batch is None:
+                    # Sentinel: shutdown.
+                    return
+                try:
+                    failed = self._flush_grouped_points(by_destination=batch)
+                except Exception as exc:
+                    # _flush_grouped_points already catches HTTPError/URLError/
+                    # generic per-destination Exception. Reaching here means
+                    # an unexpected error in grouping itself; treat the whole
+                    # batch as failed and keep the thread alive.
+                    self._record_exception(exc, phase="http_thread_batch")
+                    self._write_errors += 1
+                    self._last_error = f"http thread batch error: {exc}"
+                    with self._queue_lock:
+                        for points in batch.values():
+                            self._requeue_failed(points)
+                    self._mark_flush_timestamp()
+                    continue
+                if failed:
+                    with self._queue_lock:
+                        self._requeue_failed(failed)
+                self._mark_flush_timestamp()
+        except Exception as exc:
+            self._record_exception(exc, phase="http_thread_fatal")
+            self._write_errors += 1
+            self._last_error = f"http thread died: {exc}"
+            self._http_thread_dead = True
+            self._stop_evt.set()
 
     @staticmethod
     def _normalize_device_list(params: Json) -> list[str]:
@@ -1051,6 +1110,11 @@ class InfluxWriterProcess(ManagedProcessBase):
                 "points_dropped_overflow": self._points_dropped_overflow,
                 "write_errors": self._write_errors,
                 "batches_written": self._batches_written,
+                "dropped_http_batches": self._dropped_http_batches,
+            },
+            "http_thread": {
+                "queue_depth": self._http_queue.qsize(),
+                "dead": self._http_thread_dead,
             },
             "last_error": self._last_error,
             "last_flush": {
@@ -1271,9 +1335,18 @@ class InfluxWriterProcess(ManagedProcessBase):
             self._last_published_error_text = None
 
     def run(self) -> None:
+        self._http_thread = threading.Thread(
+            target=self._http_thread_run,
+            name="influx-http",
+            daemon=True,
+        )
+        self._http_thread.start()
         try:
             next_flush_mono = time.monotonic() + self._flush_interval_s
             while not self._stop_evt.is_set():
+                if self._http_thread_dead:
+                    self._stop_evt.set()
+                    break
                 now = time.monotonic()
                 timeout_s = max(0.0, next_flush_mono - now)
                 timeout_ms = int(max(1.0, min(500.0, timeout_s * 1000.0)))
@@ -1304,10 +1377,19 @@ class InfluxWriterProcess(ManagedProcessBase):
                 self._set_phase("idle")
                 self._mark_progress(f"queue_depth={len(self._queue)}")
         finally:
+            # Drain any remaining queued points one last time, then shut the
+            # http thread down before closing sockets.
             try:
                 self._flush()
             except Exception:
                 pass
+            try:
+                self._http_queue.put(None, timeout=1.0)
+            except Exception:
+                pass
+            thread = self._http_thread
+            if thread is not None and thread.is_alive():
+                thread.join(timeout=5.0)
             try:
                 self._sub.close(0)
             except Exception:
