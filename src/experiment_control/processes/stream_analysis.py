@@ -2500,6 +2500,46 @@ def _compile_workspace_output_item(
     return PublishOutput(output_id=output_id, node_id=node_id, kind=kind)
 
 
+def _prune_unreachable_nodes(
+    *,
+    order: list[str],
+    deps: dict[str, set[str]],
+    outputs: list[PublishOutput],
+    source_stream_node_id: str,
+) -> list[str]:
+    """Return `order` filtered to nodes reachable from any published output.
+
+    Per-event execution walks every node in `order`; a node that no output
+    transitively depends on does nothing observable but still pays its
+    dispatch + handler cost on every chunk_ready. Pruning is purely a
+    compile-time optimization — runtime behaviour is unchanged for any
+    workspace whose output set genuinely depends on every node (the common
+    case for UI-built workspaces).
+
+    The source stream node is always considered reachable so the per-event
+    loop keeps a chance to advance source-channel bookkeeping even when
+    nothing downstream consumes the channel value directly.
+
+    Stateful operators (fits, aggregates) are preserved as long as they
+    sit on a path to a published output — they need to run on every event
+    to keep their internal state coherent.
+    """
+    reachable: set[str] = {source_stream_node_id}
+    queue: list[str] = [out.node_id for out in outputs] + [source_stream_node_id]
+    while queue:
+        node_id = queue.pop()
+        if node_id in reachable:
+            # Already visited; but we still want to add the seed output
+            # node_ids on first sight, so seed via the conditional below.
+            pass
+        if node_id not in reachable:
+            reachable.add(node_id)
+        for dep in deps.get(node_id, ()):  # type: ignore[arg-type]
+            if dep not in reachable:
+                queue.append(dep)
+    return [node_id for node_id in order if node_id in reachable]
+
+
 def compile_workspace_graph(config: Json) -> CompiledWorkspace:
     workspace_id, enabled, nodes_list, nodes = _parse_workspace_root(config)
     deps = _compile_workspace_dependencies(nodes_list=nodes_list, nodes=nodes)
@@ -2523,6 +2563,16 @@ def compile_workspace_graph(config: Json) -> CompiledWorkspace:
         str(source_node.params["stream"]).strip(),
     )
     outputs = _compile_workspace_outputs(config=config, nodes=nodes, out_type=out_type)
+
+    # Prune nodes that don't feed any published output. Done after
+    # outputs are compiled so we have the full set of consumer node_ids
+    # to walk backwards from.
+    order = _prune_unreachable_nodes(
+        order=order,
+        deps=deps,
+        outputs=outputs,
+        source_stream_node_id=source_stream_nodes[0],
+    )
 
     return CompiledWorkspace(
         workspace_id=workspace_id,
