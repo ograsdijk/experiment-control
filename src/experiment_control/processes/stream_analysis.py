@@ -6,7 +6,7 @@ import math
 import re
 import time
 import uuid
-from collections import deque
+from collections import OrderedDict, deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from graphlib import TopologicalSorter
@@ -2601,8 +2601,13 @@ class StreamAnalysisProcess(ManagedProcessBase):
         ] = {}
         # Per-stream context keyed by stream sequence number. This lets us
         # apply the correct context to each ring event when we process backlog.
+        # Per-stream bucket type. OrderedDict gives O(1) "drop oldest"
+        # eviction via popitem(last=False); the prior dict + sorted(keys())
+        # eviction was O(n log n) per insert past capacity, which dominated
+        # CPU on high-frequency streams once the bucket filled.
         self._context_by_seq: dict[
-            tuple[str, str], dict[int, tuple[int | None, dict[str, Any] | None]]
+            tuple[str, str],
+            "OrderedDict[int, tuple[int | None, dict[str, Any] | None]]",
         ] = {}
         self._context_cache_limit = 8192
         self._telemetry_history: dict[tuple[str, str], list[tuple[float, float]]] = {}
@@ -3461,15 +3466,19 @@ class StreamAnalysisProcess(ManagedProcessBase):
     ) -> None:
         if seq is None:
             return
-        bucket = self._context_by_seq.setdefault(key, {})
-        bucket[int(seq)] = (
+        bucket = self._context_by_seq.setdefault(key, OrderedDict())
+        seq_key = int(seq)
+        # If the seq already has an entry, remove it first so the new value
+        # lands at the end of the insertion order; otherwise OrderedDict
+        # would keep the old position and break the oldest-first invariant.
+        if seq_key in bucket:
+            del bucket[seq_key]
+        bucket[seq_key] = (
             int(context_id) if context_id is not None else None,
             dict(context_fields) if isinstance(context_fields, dict) else None,
         )
-        if len(bucket) > self._context_cache_limit:
-            trim = len(bucket) - self._context_cache_limit
-            for stale_seq in sorted(bucket.keys())[:trim]:
-                bucket.pop(stale_seq, None)
+        while len(bucket) > self._context_cache_limit:
+            bucket.popitem(last=False)
 
     def _pop_context_for_seq(
         self, *, key: tuple[str, str], seq: int | None
