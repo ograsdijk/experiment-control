@@ -77,7 +77,6 @@ import {
   fetchRawStreamSnapshot,
   fetchStreams,
   fetchStreamWorkspaceSnapshot,
-  fetchTelemetrySnapshot,
   callProcess,
   deleteStreamWorkspace,
   fetchStreamWorkspace,
@@ -175,6 +174,8 @@ import {
 import { useProcessCommandController } from "./features/processes/useProcessCommandController";
 import { useProcessLifecycleController } from "./features/processes/useProcessLifecycleController";
 import { useProcessesController } from "./features/processes/useProcessesController";
+import { useTelemetryStream } from "./features/telemetry/useTelemetryStream";
+import { useLogsStream } from "./features/logs/useLogsStream";
 import type {
   PanelKind,
   PlotPanelState,
@@ -322,7 +323,6 @@ import {
   CapabilityMember,
   DeviceStatus,
   LogEntry,
-  LogMessage,
   PinnedCommand,
   ProcessStatus,
   StreamAnalysisMessage,
@@ -556,7 +556,6 @@ export function App() {
     }
   }, []);
   const [devices, setDevices] = useState<DeviceStatus[]>([]);
-  const [latestByDevice, setLatestByDevice] = useState<LatestSignals>({});
   const { colorScheme, setColorScheme } = useMantineColorScheme();
   const computedColorScheme = useComputedColorScheme("light");
   const panelIdRef = useRef(initialPlotState.nextPanelId);
@@ -608,13 +607,10 @@ export function App() {
     min: number;
     max: number;
   } | null>(null);
-  const [wsConnected, setWsConnected] = useState(false);
-  const [telemetryActive, setTelemetryActive] = useState(false);
   const [streamWsConnected, setStreamWsConnected] = useState(false);
   const [streamAnalysisWsConnected, setStreamAnalysisWsConnected] =
     useState(false);
   const [logsOpen, setLogsOpen] = useState(false);
-  const [logsWsConnected, setLogsWsConnected] = useState(false);
   const [commandUnreadError, setCommandUnreadError] = useState(false);
   const [logsUnreadError, setLogsUnreadError] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -794,7 +790,6 @@ export function App() {
   const streamWorkspaceRevisionsRef = useRef<Record<string, number>>({});
   const panelsRef = useRef<PlotPanelState[]>(initialPlotState.panels);
   const streamAnalysisReadyRef = useRef(false);
-  const telemetrySnapshotHydratedRef = useRef(false);
   const rawSnapshotHydratedRef = useRef<Set<string>>(new Set());
   const workspaceSnapshotHydratedRef = useRef<Set<string>>(new Set());
   const isNarrowPlotViewport = viewportWidth <= PLOT_GRID_MOBILE_BREAKPOINT;
@@ -2443,86 +2438,59 @@ export function App() {
     streamBin2dRef,
   ]);
 
-  useEffect(() => {
-    if (telemetrySnapshotHydratedRef.current) {
-      return;
-    }
-    let cancelled = false;
-    const load = async () => {
-      try {
-        const snapshot = await fetchTelemetrySnapshot();
-        if (cancelled) {
-          return;
-        }
-        telemetrySnapshotHydratedRef.current = true;
-        const deviceEntries = Object.entries(snapshot);
-        if (deviceEntries.length <= 0) {
-          return;
-        }
-        const booleanSignalKeys = new Set<string>();
-        let pushedSamples = false;
-        setLatestByDevice((prev) => {
-          const next: LatestSignals = { ...prev };
-          for (const [deviceId, signals] of deviceEntries) {
-            const deviceSignals = { ...(next[deviceId] ?? {}) };
-            for (const [name, signal] of Object.entries(signals)) {
-              deviceSignals[name] = signal;
-              const traceKey = `${deviceId}:${name}`;
-              let plotValue: number | null = null;
-              if (typeof signal.value === "number" && Number.isFinite(signal.value)) {
-                plotValue = signal.value;
-              } else if (typeof signal.value === "boolean") {
-                plotValue = signal.value ? 1 : 0;
-                booleanSignalKeys.add(traceKey);
-              }
-              if (plotValue !== null) {
-                for (const panelBuffers of buffersRef.values()) {
-                  const buffer = panelBuffers.get(traceKey);
-                  if (buffer) {
-                    buffer.push(normalizeTime(signal), plotValue);
-                    pushedSamples = true;
-                  }
-                }
+  const handleTelemetryHydrate = useCallback(
+    (snapshot: LatestSignals) => {
+      const booleanSignalKeys = new Set<string>();
+      let pushedSamples = false;
+      for (const [deviceId, signals] of Object.entries(snapshot)) {
+        for (const [name, signal] of Object.entries(signals)) {
+          const traceKey = `${deviceId}:${name}`;
+          let plotValue: number | null = null;
+          if (typeof signal.value === "number" && Number.isFinite(signal.value)) {
+            plotValue = signal.value;
+          } else if (typeof signal.value === "boolean") {
+            plotValue = signal.value ? 1 : 0;
+            booleanSignalKeys.add(traceKey);
+          }
+          if (plotValue !== null) {
+            for (const panelBuffers of buffersRef.values()) {
+              const buffer = panelBuffers.get(traceKey);
+              if (buffer) {
+                buffer.push(normalizeTime(signal), plotValue);
+                pushedSamples = true;
               }
             }
-            next[deviceId] = deviceSignals;
           }
-          return next;
-        });
-        if (booleanSignalKeys.size > 0) {
-          setPanels((prev) => {
-            let changed = false;
-            const next = prev.map((panel) => {
-              if (!isTelemetryPanel(panel)) {
-                return panel;
-              }
-              let tracesChanged = false;
-              const nextTraces = panel.traces.map((trace) => {
-                const key = `${trace.deviceId}:${trace.signal}`;
-                if (!booleanSignalKeys.has(key) || trace.valueKind === "boolean") {
-                  return trace;
-                }
-                tracesChanged = true;
-                changed = true;
-                return { ...trace, valueKind: "boolean" as const };
-              });
-              return tracesChanged ? { ...panel, traces: nextTraces } : panel;
-            });
-            return changed ? next : prev;
-          });
         }
-        if (pushedSamples) {
-          setPlotTick((tick) => tick + 1);
-        }
-      } catch {
-        telemetrySnapshotHydratedRef.current = true;
       }
-    };
-    void load();
-    return () => {
-      cancelled = true;
-    };
-  }, [buffersRef]);
+      if (booleanSignalKeys.size > 0) {
+        setPanels((prev) => {
+          let changed = false;
+          const next = prev.map((panel) => {
+            if (!isTelemetryPanel(panel)) {
+              return panel;
+            }
+            let tracesChanged = false;
+            const nextTraces = panel.traces.map((trace) => {
+              const key = `${trace.deviceId}:${trace.signal}`;
+              if (!booleanSignalKeys.has(key) || trace.valueKind === "boolean") {
+                return trace;
+              }
+              tracesChanged = true;
+              changed = true;
+              return { ...trace, valueKind: "boolean" as const };
+            });
+            return tracesChanged ? { ...panel, traces: nextTraces } : panel;
+          });
+          return changed ? next : prev;
+        });
+      }
+      if (pushedSamples) {
+        setPlotTick((tick) => tick + 1);
+      }
+    },
+    [buffersRef]
+  );
 
   useEffect(() => {
     if (activeRawStreamSubscriptions.length <= 0) {
@@ -2675,92 +2643,68 @@ export function App() {
     };
   }, [streamAnalysisRpcReady, activeStreamAnalysisWorkspaceSubscriptions]);
 
-  useEffect(() => {
-    const ws = new WebSocket(buildWsUrl("/ws/telemetry"));
-    ws.onopen = () => {
-      setWsConnected(true);
-      setTelemetryActive(false);
-    };
-    ws.onclose = () => {
-      setWsConnected(false);
-      setTelemetryActive(false);
-    };
-    ws.onerror = () => {
-      // Keep the current state; close handler is the authoritative disconnect signal.
-    };
-    ws.onmessage = (event) => {
-      try {
-        setTelemetryActive(true);
-        setWsConnected(true);
-        const msg = JSON.parse(event.data) as TelemetryMessage;
-        if (!msg?.payload?.device_id) {
-          return;
-        }
-        const deviceId = msg.payload.device_id;
-        const bundleTs = msg.payload.ts?.t_wall;
-        const booleanSignalKeys = new Set<string>();
-        setLatestByDevice((prev) => {
-          const next = { ...prev };
-          const deviceSignals = { ...(next[deviceId] ?? {}) };
-          let updated = false;
-          for (const [name, signal] of Object.entries(
-            msg.payload.signals ?? {}
-          )) {
-            deviceSignals[name] = signal;
-            const traceKey = `${deviceId}:${name}`;
-            let plotValue: number | null = null;
-            if (typeof signal.value === "number" && Number.isFinite(signal.value)) {
-              plotValue = signal.value;
-            } else if (typeof signal.value === "boolean") {
-              plotValue = signal.value ? 1 : 0;
-              booleanSignalKeys.add(traceKey);
-            }
-            if (plotValue !== null) {
-              for (const panelBuffers of buffersRef.values()) {
-                const buffer = panelBuffers.get(traceKey);
-                if (buffer) {
-                  buffer.push(normalizeTime(signal, bundleTs), plotValue);
-                  updated = true;
-                }
-              }
-            }
-          }
-          next[deviceId] = deviceSignals;
-          if (updated) {
-            setPlotTick((tick) => tick + 1);
-          }
-          return next;
-        });
-        if (booleanSignalKeys.size > 0) {
-          setPanels((prev) => {
-            let changed = false;
-            const next = prev.map((panel) => {
-              if (!isTelemetryPanel(panel)) {
-                return panel;
-              }
-              let tracesChanged = false;
-              const nextTraces = panel.traces.map((trace) => {
-                const key = `${trace.deviceId}:${trace.signal}`;
-                if (!booleanSignalKeys.has(key) || trace.valueKind === "boolean") {
-                  return trace;
-                }
-                tracesChanged = true;
-                changed = true;
-                return { ...trace, valueKind: "boolean" as const };
-              });
-              return tracesChanged ? { ...panel, traces: nextTraces } : panel;
-            });
-            return changed ? next : prev;
-          });
-        }
-      } catch {
+  const handleTelemetryMessage = useCallback(
+    (msg: TelemetryMessage) => {
+      const deviceId = msg.payload?.device_id;
+      if (!deviceId) {
         return;
       }
-    };
-    return () => {
-      ws.close();
-    };
-  }, [buffersRef]);
+      const bundleTs = msg.payload.ts?.t_wall;
+      const booleanSignalKeys = new Set<string>();
+      let pushedSamples = false;
+      for (const [name, signal] of Object.entries(msg.payload.signals ?? {})) {
+        const traceKey = `${deviceId}:${name}`;
+        let plotValue: number | null = null;
+        if (typeof signal.value === "number" && Number.isFinite(signal.value)) {
+          plotValue = signal.value;
+        } else if (typeof signal.value === "boolean") {
+          plotValue = signal.value ? 1 : 0;
+          booleanSignalKeys.add(traceKey);
+        }
+        if (plotValue !== null) {
+          for (const panelBuffers of buffersRef.values()) {
+            const buffer = panelBuffers.get(traceKey);
+            if (buffer) {
+              buffer.push(normalizeTime(signal, bundleTs), plotValue);
+              pushedSamples = true;
+            }
+          }
+        }
+      }
+      if (pushedSamples) {
+        setPlotTick((tick) => tick + 1);
+      }
+      if (booleanSignalKeys.size > 0) {
+        setPanels((prev) => {
+          let changed = false;
+          const next = prev.map((panel) => {
+            if (!isTelemetryPanel(panel)) {
+              return panel;
+            }
+            let tracesChanged = false;
+            const nextTraces = panel.traces.map((trace) => {
+              const key = `${trace.deviceId}:${trace.signal}`;
+              if (!booleanSignalKeys.has(key) || trace.valueKind === "boolean") {
+                return trace;
+              }
+              tracesChanged = true;
+              changed = true;
+              return { ...trace, valueKind: "boolean" as const };
+            });
+            return tracesChanged ? { ...panel, traces: nextTraces } : panel;
+          });
+          return changed ? next : prev;
+        });
+      }
+    },
+    [buffersRef]
+  );
+
+  const { latestByDevice, wsConnected, telemetryActive } = useTelemetryStream({
+    hydrate: true,
+    onHydrate: handleTelemetryHydrate,
+    onMessage: handleTelemetryMessage,
+  });
 
   useEffect(() => {
     if (activeRawStreamSubscriptions.length <= 0) {
@@ -3081,30 +3025,9 @@ export function App() {
     document.title = `Experiment Control ${instanceLabel}`;
   }, [instanceLabel]);
 
-  useEffect(() => {
-    const ws = new WebSocket(buildWsUrl("/ws/logs"));
-    ws.onopen = () => setLogsWsConnected(true);
-    ws.onclose = () => setLogsWsConnected(false);
-    ws.onerror = () => setLogsWsConnected(false);
-    ws.onmessage = (event) => {
-      try {
-        const msg = JSON.parse(event.data) as LogMessage;
-        if (msg.topic !== "manager.log") {
-          return;
-        }
-        const entry = normalizeLogEntry(msg.payload);
-        if (entry === null) {
-          return;
-        }
-        appendLogEntries([entry]);
-      } catch {
-        return;
-      }
-    };
-    return () => {
-      ws.close();
-    };
-  }, []);
+  const { wsConnected: logsWsConnected } = useLogsStream({
+    onEntry: (entry) => appendLogEntries([entry]),
+  });
 
   useEffect(() => {
     if (!logsOpen || !logAutoScroll) {
