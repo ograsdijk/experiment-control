@@ -14,7 +14,15 @@ export function traceColorAt(index: number): string {
   return TRACE_COLORS[normalized];
 }
 
+const COLOR_WITH_ALPHA_CACHE = new Map<string, string>();
+const COLOR_WITH_ALPHA_CACHE_MAX = 256;
+
 export function colorWithAlpha(hexColor: string, alpha: number): string {
+  const cacheKey = `${hexColor}|${alpha}`;
+  const cached = COLOR_WITH_ALPHA_CACHE.get(cacheKey);
+  if (cached !== undefined) {
+    return cached;
+  }
   const hex = hexColor.trim().replace(/^#/, "");
   const expanded =
     hex.length === 3
@@ -24,11 +32,18 @@ export function colorWithAlpha(hexColor: string, alpha: number): string {
           .join("")
       : hex;
   if (!/^[0-9a-fA-F]{6}$/.test(expanded)) {
+    if (COLOR_WITH_ALPHA_CACHE.size < COLOR_WITH_ALPHA_CACHE_MAX) {
+      COLOR_WITH_ALPHA_CACHE.set(cacheKey, hexColor);
+    }
     return hexColor;
   }
   const r = Number.parseInt(expanded.slice(0, 2), 16);
   const g = Number.parseInt(expanded.slice(2, 4), 16);
   const b = Number.parseInt(expanded.slice(4, 6), 16);
   const a = Math.max(0, Math.min(1, alpha));
-  return `rgba(${r}, ${g}, ${b}, ${a})`;
+  const result = `rgba(${r}, ${g}, ${b}, ${a})`;
+  if (COLOR_WITH_ALPHA_CACHE.size < COLOR_WITH_ALPHA_CACHE_MAX) {
+    COLOR_WITH_ALPHA_CACHE.set(cacheKey, result);
+  }
+  return result;
 }
