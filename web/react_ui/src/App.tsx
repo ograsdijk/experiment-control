@@ -180,6 +180,7 @@ import { useStreamAnalysis } from "./features/stream_analysis/StreamAnalysisCont
 import { useDevicesContext } from "./features/devices/DevicesContext";
 import { useCommands } from "./features/commands/CommandsContext";
 import { useLogs } from "./features/logs/LogsContext";
+import { useSettings } from "./features/runtime/SettingsContext";
 import { useLogsStream } from "./features/logs/useLogsStream";
 import type {
   PanelKind,
@@ -647,17 +648,30 @@ export function App() {
   const [logsOpen, setLogsOpen] = useState(false);
   const [commandUnreadError, setCommandUnreadError] = useState(false);
   const [logsUnreadError, setLogsUnreadError] = useState(false);
-  const [settingsOpen, setSettingsOpen] = useState(false);
-  const [settingsLoading, setSettingsLoading] = useState(false);
-  const [settingsError, setSettingsError] = useState<string | null>(null);
-  const [gatewaySettings, setGatewaySettings] =
-    useState<GatewaySettingsInfo | null>(null);
-  const [extraUis, setExtraUis] = useState<ExtraUiInfo[]>([]);
-  const [instanceRuntimeStatus, setInstanceRuntimeStatus] =
-    useState<InstanceRuntimeStatus | null>(null);
-  const [instanceRuntimeLoading, setInstanceRuntimeLoading] = useState(false);
-  const [instanceRuntimeError, setInstanceRuntimeError] = useState<string | null>(null);
-  const [instanceCleanupBusy, setInstanceCleanupBusy] = useState(false);
+  // Settings modal + instance-runtime state moved to SettingsContext
+  // (features/runtime/SettingsContext.tsx). Network handlers stay in
+  // App.tsx — they call into other state that hasn't been extracted.
+  const {
+    settingsOpen,
+    setSettingsOpen,
+    settingsLoading,
+    setSettingsLoading,
+    settingsError,
+    setSettingsError,
+    gatewaySettings,
+    setGatewaySettings,
+    extraUis,
+    setExtraUis,
+    instanceRuntimeStatus,
+    setInstanceRuntimeStatus,
+    instanceRuntimeLoading,
+    setInstanceRuntimeLoading,
+    instanceRuntimeError,
+    setInstanceRuntimeError,
+    instanceCleanupBusy,
+    setInstanceCleanupBusy,
+    settingsFileInputRef,
+  } = useSettings();
   // Log viewer state + the filtered-rows derivation moved to LogsContext
   // (features/logs/LogsContext.tsx). WS subscription stays in App.tsx;
   // useLogsStream is unchanged for downstream compatibility.
@@ -726,7 +740,7 @@ export function App() {
   const commandHistoryNearBottomRef = useRef(true);
   const commandHistoryBaselineReadyRef = useRef(false);
   const commandHistoryLastIdRef = useRef<string | null>(null);
-  const settingsFileInputRef = useRef<HTMLInputElement | null>(null);
+  // settingsFileInputRef now provided by SettingsContext (destructured above).
   // pinnedCommands + commandDeck + commandDeckBusyById + commandDeckIdRef
   // now provided by CommandsContext (destructured above).
   // Plot buffers + per-stream overlay caches now live in TelemetryContext
