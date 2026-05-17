@@ -78,7 +78,6 @@ import {
   fetchStreams,
   fetchStreamWorkspaceSnapshot,
   callProcess,
-  validateStreamWorkspace,
   type GatewaySettingsInfo,
   type InstanceRuntimeStatus,
   type ExtraUiInfo,
@@ -173,6 +172,7 @@ import { useDaqDraftEditors } from "./features/stream_analysis/useDaqDraftEditor
 import { useDaqModalLifecycle } from "./features/stream_analysis/useDaqModalLifecycle";
 import { useWorkspaceStoreActions } from "./features/stream_analysis/useWorkspaceStoreActions";
 import { useWorkspaceListManagement } from "./features/stream_analysis/useWorkspaceListManagement";
+import { useDaqWorkspaceApply } from "./features/stream_analysis/useDaqWorkspaceApply";
 import { useDevicesContext } from "./features/devices/DevicesContext";
 import { useCommands } from "./features/commands/CommandsContext";
 import { useLayout } from "./features/layout/LayoutContext";
@@ -237,8 +237,6 @@ import {
   cloneDagOutputs,
   isPublishableNodeKind,
   nodeKindFromOp,
-  normalizeDagNode,
-  normalizeDagOutput,
   STREAM_DAG_INPUT_KINDS,
   STREAM_DAG_OP_OPTIONS,
   STREAM_DAG_OPS,
@@ -316,7 +314,6 @@ import {
   defaultStreamAnalysisSettings,
   defaultStreamAnalysisWorkspaceConfig,
   defaultStreamBinStatsSettings,
-  defaultStreamWorkspaceName,
   nextWorkspaceCounter,
   normalizeStreamAnalysisSettings,
   normalizeStreamBinStatsSettings,
@@ -327,7 +324,6 @@ import {
   workspaceBin2dAxisLabel,
   workspaceOutputKind,
   workspaceOutputOptionsByKind,
-  workspaceStreamFromGraphNodes,
   workspaceXAxisLabel,
 } from "./features/stream/workspace";
 import { useSequencerController } from "./features/sequencer/useSequencerController";
@@ -4085,212 +4081,17 @@ export function App() {
     removeDaqOutput,
   } = useDaqDraftEditors();
 
-  const applyDaqWorkspace = async () => {
-    const workspaceId = String(daqWorkspaceId ?? "").trim();
-    if (!workspaceId) {
-      return;
-    }
-    const current = streamWorkspacesRef.current[workspaceId];
-    if (!current) {
-      return;
-    }
-
-    const name = daqDraftName.trim() || defaultStreamWorkspaceName(workspaceId);
-    const cleanedNodes = daqDraftNodes
-      .map((node) => normalizeDagNode(node))
-      .filter((node): node is StreamDagNodeConfig => node !== null);
-    if (cleanedNodes.length <= 0) {
-      notifications.show({
-        color: "red",
-        title: "Invalid graph",
-        message: "At least one node is required.",
-      });
-      return;
-    }
-    const nodeIds = cleanedNodes.map((node) => node.id);
-    const uniqueNodeIds = new Set(nodeIds);
-    if (uniqueNodeIds.size !== nodeIds.length) {
-      notifications.show({
-        color: "red",
-        title: "Invalid graph",
-        message: "Node IDs must be unique and non-empty.",
-      });
-      return;
-    }
-    const sourceStreamCount = cleanedNodes.filter(
-      (node) => node.op === "source.stream"
-    ).length;
-    if (sourceStreamCount !== 1) {
-      notifications.show({
-        color: "red",
-        title: "Invalid graph",
-        message: "Graph must include exactly one source.stream node.",
-      });
-      return;
-    }
-
-    const cleanedOutputs = daqDraftOutputs
-      .map((output) => normalizeDagOutput(output))
-      .filter((output): output is StreamDagOutputConfig => output !== null)
-      .filter((output) => uniqueNodeIds.has(output.nodeId));
-    const outputIds = cleanedOutputs.map((output) => output.outputId);
-    const uniqueOutputIds = new Set(outputIds);
-    if (uniqueOutputIds.size !== outputIds.length) {
-      notifications.show({
-        color: "red",
-        title: "Invalid outputs",
-        message: "Output IDs must be unique and non-empty.",
-      });
-      return;
-    }
-
-    const derivedSource = workspaceStreamFromGraphNodes(cleanedNodes, streamCatalogByKey);
-    const updated: StreamAnalysisWorkspaceConfig = {
-      ...current,
-      workspaceId,
-      name,
-      stream: derivedSource.stream,
-      channelIndex: derivedSource.channelIndex,
-      graphNodes: cloneDagNodes(cleanedNodes),
-      publishOutputs: cloneDagOutputs(cleanedOutputs),
-      enabled: daqDraftEnabled !== false,
-    };
-    const validatePayload = buildStreamAnalysisWorkspacePayload(updated);
-    if (streamAnalysisReadyRef.current && validatePayload) {
-      const validation = await validateStreamWorkspace(workspaceId, validatePayload);
-      if (!validation.ok) {
-        notifications.show({
-          color: "red",
-          title: "Invalid DAG workspace",
-          message:
-            validation.error?.message ??
-            validation.error?.code ??
-            "workspace validation failed",
-        });
-        return;
-      }
-    }
-    setStreamWorkspaces((prev) => ({ ...prev, [workspaceId]: updated }));
-    streamWorkspacesRef.current = {
-      ...streamWorkspacesRef.current,
-      [workspaceId]: updated,
-    };
-    const scalarOutputIds = new Set(
-      workspaceOutputOptionsByKind(updated, "scalar").map((item) => item.value)
-    );
-    const paramsMapOutputIds = new Set(
-      workspaceOutputOptionsByKind(updated, "params_map").map((item) => item.value)
-    );
-    const traceOutputIds = new Set(
-      workspaceOutputOptionsByKind(updated, "trace").map((item) => item.value)
-    );
-    const histOutputIds = new Set(
-      workspaceOutputOptionsByKind(updated, "hist_agg").map((item) => item.value)
-    );
-    const fitOutputIds = new Set(
-      workspaceOutputOptionsByKind(updated, "fit_1d").map((item) => item.value)
-    );
-    const hist2dOutputIds = new Set(
-      workspaceOutputOptionsByKind(updated, "hist2d").map((item) => item.value)
-    );
-    setPanels((prev) =>
-      prev.map((panel) => {
-        if (
-          !isStreamTracePanel(panel) &&
-          !isStreamScalarPanel(panel) &&
-          !isStreamParamsPanel(panel) &&
-          !isStreamBinStatsPanel(panel) &&
-          !isStreamBin2dPanel(panel)
-        ) {
-          return panel;
-        }
-        if (panel.workspaceId !== workspaceId) {
-          return panel;
-        }
-        if (isStreamTracePanel(panel)) {
-          if (panel.sourceMode !== "dag") {
-            return panel;
-          }
-          const nextOutputId =
-            panel.outputId && traceOutputIds.has(panel.outputId)
-              ? panel.outputId
-              : defaultOutputForKind(updated, "trace");
-          streamFramesRef.set(panel.id, []);
-          streamTraceOverlayRef.set(panel.id, new Map());
-          const overlayOutputIds = (panel.overlayOutputIds ?? []).filter(
-            (id) => id !== nextOutputId && traceOutputIds.has(id)
-          );
-          return {
-            ...panel,
-            outputId: nextOutputId,
-            overlayOutputIds,
-            stream: updated.stream,
-            channelIndex: updated.channelIndex,
-          };
-        }
-        if (isStreamScalarPanel(panel)) {
-          const nextOutputId =
-            panel.outputId && scalarOutputIds.has(panel.outputId)
-              ? panel.outputId
-              : defaultOutputForKind(updated, "scalar");
-          clearPanelBuffers(panel.id);
-          return {
-            ...panel,
-            outputId: nextOutputId,
-            stream: updated.stream,
-            channelIndex: updated.channelIndex,
-            analysis: updated.analysis,
-          };
-        }
-        if (isStreamParamsPanel(panel)) {
-          const nextOutputIds = (panel.outputIds ?? []).filter((id) =>
-            scalarOutputIds.has(id) || paramsMapOutputIds.has(id)
-          );
-          streamParamsLatestRef.set(panel.id, {});
-          return {
-            ...panel,
-            outputIds: nextOutputIds,
-          };
-        }
-        if (isStreamBin2dPanel(panel)) {
-          const nextOutputId =
-            panel.outputId && hist2dOutputIds.has(panel.outputId)
-              ? panel.outputId
-              : defaultOutputForKind(updated, "hist2d");
-          streamBin2dRef.delete(panel.id);
-          return {
-            ...panel,
-            outputId: nextOutputId,
-          };
-        }
-        const nextOutputId =
-          panel.outputId && histOutputIds.has(panel.outputId)
-            ? panel.outputId
-            : defaultOutputForKind(updated, "hist_agg");
-        streamBinStatsRef.delete(panel.id);
-        streamBinStatsOverlayRef.set(panel.id, new Map());
-        streamBinStatsFitOverlayRef.set(panel.id, new Map());
-        const nextOverlayOutputIds = (panel.overlayOutputIds ?? []).filter(
-          (id) => traceOutputIds.has(id)
-        );
-        const nextFitOverlayOutputIds = (panel.fitOverlayOutputIds ?? []).filter(
-          (id) => fitOutputIds.has(id)
-        );
-        return {
-          ...panel,
-          outputId: nextOutputId,
-          overlayOutputIds: nextOverlayOutputIds,
-          fitOverlayOutputIds: nextFitOverlayOutputIds,
-          stream: updated.stream,
-          channelIndex: updated.channelIndex,
-          analysis: updated.analysis,
-          binStats: updated.binStats,
-        };
-      })
-    );
-    setPlotTick((tick) => tick + 1);
-    void syncStreamAnalysisWorkspace(workspaceId, "stream-workspace-apply");
-  };
+  // applyDaqWorkspace (round 25). See
+  // features/stream_analysis/useDaqWorkspaceApply.ts. The heaviest
+  // single DAQ handler: validates the draft, commits the workspace
+  // locally, cascades the new output set into every panel bound to
+  // this workspace, and pushes the result to the runtime.
+  const { applyDaqWorkspace } = useDaqWorkspaceApply({
+    streamCatalogByKey,
+    buildStreamAnalysisWorkspacePayload,
+    syncStreamAnalysisWorkspace,
+    clearPanelBuffers,
+  });
 
   // saveDaqWorkspaceStore + reloadDaqWorkspaceStore now provided by
   // useWorkspaceStoreActions (round 23).
