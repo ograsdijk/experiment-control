@@ -178,6 +178,7 @@ import { useTelemetryStream } from "./features/telemetry/useTelemetryStream";
 import { useTelemetry } from "./features/telemetry/TelemetryContext";
 import { useStreamAnalysis } from "./features/stream_analysis/StreamAnalysisContext";
 import { useDevicesContext } from "./features/devices/DevicesContext";
+import { useCommands } from "./features/commands/CommandsContext";
 import { useLogsStream } from "./features/logs/useLogsStream";
 import type {
   PanelKind,
@@ -673,41 +674,34 @@ export function App() {
   const [panelTitleDraft, setPanelTitleDraft] = useState("");
   // deviceOrder + telemetryCollapsedByDevice now provided by
   // DevicesContext (destructured at the top of the function).
-  const [commandDeckCollapsedByGroup, setCommandDeckCollapsedByGroup] = useState<
-    Record<string, boolean>
-  >(() => {
-    try {
-      const raw = localStorage.getItem("ecui.commandDeck.collapsedByGroup");
-      if (!raw) {
-        return {};
-      }
-      const parsed = JSON.parse(raw);
-      if (!parsed || typeof parsed !== "object") {
-        return {};
-      }
-      const next: Record<string, boolean> = {};
-      for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
-        if (typeof value === "boolean") {
-          next[key] = value;
-        }
-      }
-      return next;
-    } catch {
-      return {};
-    }
-  });
+  // Pinned commands + command deck state moved to CommandsContext
+  // (features/commands/CommandsContext.tsx). The names below are kept
+  // identical so existing call sites in App.tsx don't need touch-ups.
+  // Network/CRUD handlers stay in App.tsx for now — they call into
+  // device + process command controllers that haven't been extracted.
+  const {
+    pinnedCommands,
+    setPinnedCommands,
+    pinnedParamDrafts,
+    setPinnedParamDrafts,
+    pinnedBusyByKey,
+    setPinnedBusyByKey,
+    commandDeck,
+    setCommandDeck,
+    commandDeckCollapsedByGroup,
+    setCommandDeckCollapsedByGroup,
+    commandDeckBusyById,
+    setCommandDeckBusyById,
+    commandDeckIdRef,
+  } = useCommands();
   // deviceGridRef now provided by DevicesContext.
   const plotGridRef = useRef<HTMLDivElement | null>(null);
   const dragColumnsRef = useRef<{ device: number; panel: number }>({
     device: 1,
     panel: 1,
   });
-  const [pinnedParamDrafts, setPinnedParamDrafts] = useState<PinnedParamDrafts>(
-    {}
-  );
-  const [pinnedBusyByKey, setPinnedBusyByKey] = useState<Record<string, boolean>>(
-    {}
-  );
+  // pinnedParamDrafts + pinnedBusyByKey now provided by CommandsContext
+  // (destructured above).
   const logSeenRef = useRef<Set<string>>(new Set());
   const logScrollRef = useRef<HTMLDivElement | null>(null);
   const commandHistoryScrollRef = useRef<HTMLDivElement | null>(null);
@@ -717,33 +711,8 @@ export function App() {
   const logRowsBaselineReadyRef = useRef(false);
   const logRowsLastKeyRef = useRef<string | null>(null);
   const settingsFileInputRef = useRef<HTMLInputElement | null>(null);
-  const [pinnedCommands, setPinnedCommands] = useState<PinnedCommandMap>(() => {
-    try {
-      const raw = localStorage.getItem("ecui.pinnedCommands");
-      if (!raw) {
-        return {};
-      }
-      const parsed = JSON.parse(raw);
-      return normalizePinnedCommands(parsed);
-    } catch {
-      return {};
-    }
-  });
-  const [commandDeck, setCommandDeck] = useState<CommandDeckEntry[]>(() => {
-    try {
-      const raw = localStorage.getItem("ecui.commandDeck");
-      if (!raw) {
-        return [];
-      }
-      return normalizeCommandDeck(JSON.parse(raw));
-    } catch {
-      return [];
-    }
-  });
-  const [commandDeckBusyById, setCommandDeckBusyById] = useState<
-    Record<string, boolean>
-  >({});
-  const commandDeckIdRef = useRef(1);
+  // pinnedCommands + commandDeck + commandDeckBusyById + commandDeckIdRef
+  // now provided by CommandsContext (destructured above).
   // Plot buffers + per-stream overlay caches now live in TelemetryContext
   // (features/telemetry/TelemetryContext.tsx) so future feature-module
   // extractions can subscribe to them via useTelemetry() without prop-
