@@ -183,6 +183,7 @@ import {
 } from "./features/commands/utils";
 import { useLayout } from "./features/layout/LayoutContext";
 import { useLogs } from "./features/logs/LogsContext";
+import { ExpandedPlotBody } from "./features/panels/ExpandedPlotBody";
 import { usePanels } from "./features/panels/PanelsContext";
 import { usePanelDerivations } from "./features/panels/usePanelDerivations";
 import { usePanelUiHandlers } from "./features/panels/usePanelUiHandlers";
@@ -3616,112 +3617,9 @@ export function App() {
   // the top of this function bind the overlay refs from
   // TelemetryContext.
 
-  const renderExpandedPlot = (panel: (typeof panels)[number]) => {
-    const plotHeight = 640;
-    if (isTelemetryPanel(panel)) {
-      return (
-        <PlotPanel
-          traces={panel.traces}
-          buffers={buffersRef.get(panel.id) ?? new Map()}
-          tick={plotTick}
-          timeWindowS={panel.timeWindowS}
-          colorScheme={computedColorScheme}
-          plotHeight={plotHeight}
-          yScaleMode={panel.yScaleMode}
-          yMin={panel.yMin}
-          yMax={panel.yMax}
-          yDisplayMode={panel.yDisplayMode}
-          yOffset={resolveTelemetryPanelOffset(panel)}
-          smoothingMode={panel.smoothingMode}
-          smoothingWindowS={panel.smoothingWindowS}
-        />
-      );
-    }
-    if (isStreamTracePanel(panel)) {
-      if (isStreamRawPanel(panel)) {
-        return (
-          <StreamRawPanel
-            frames={streamFramesRef.get(panel.id) ?? []}
-            overlayCount={panel.overlayCount}
-            channelIndex={panel.sourceMode === "raw" ? panel.channelIndex : 0}
-            tick={plotTick}
-            colorScheme={computedColorScheme}
-            plotHeight={plotHeight}
-            units={panel.stream?.units ?? null}
-            extraSeries={
-              panel.sourceMode === "dag" ? streamTraceOverlaySeries(panel) : []
-            }
-            yScaleMode={panel.yScaleMode}
-            yMin={panel.yMin}
-            yMax={panel.yMax}
-          />
-        );
-      }
-      return (
-        <StreamWaterfallPanel
-          frames={streamFramesRef.get(panel.id) ?? []}
-          historyRows={panel.overlayCount}
-          channelIndex={panel.sourceMode === "raw" ? panel.channelIndex : 0}
-          tick={plotTick}
-          colorScheme={computedColorScheme}
-          plotHeight={plotHeight}
-          zScaleMode={panel.yScaleMode}
-          zMin={panel.yMin}
-          zMax={panel.yMax}
-        />
-      );
-    }
-    if (isStreamScalarPanel(panel)) {
-      return (
-        <PlotPanel
-          traces={[streamScalarTrace(panel)]}
-          buffers={buffersRef.get(panel.id) ?? new Map()}
-          tick={plotTick}
-          timeWindowS={panel.timeWindowS}
-          colorScheme={computedColorScheme}
-          plotHeight={plotHeight}
-          yScaleMode={panel.yScaleMode}
-          yMin={panel.yMin}
-          yMax={panel.yMax}
-        />
-      );
-    }
-    if (isStreamBinStatsPanel(panel)) {
-      const streamWorkspace = streamWorkspaces[panel.workspaceId] ?? null;
-      return (
-        <StreamBinStatsPanel
-          series={(streamBinStatsRef.get(panel.id) ?? null)?.series ?? null}
-          overlaySeries={streamBinStatsOverlaySeries(panel)}
-          fitOverlays={streamBinStatsFitOverlayCurves(panel)}
-          xLabel={workspaceXAxisLabel(streamWorkspace, panel.outputId)}
-          uncertaintyMode={panel.uncertaintyMode}
-          uncertaintyScale={panel.uncertaintyScale}
-          showBinMarkers={panel.showBinMarkers}
-          tick={plotTick}
-          colorScheme={computedColorScheme}
-          plotHeight={plotHeight}
-          yScaleMode={panel.yScaleMode}
-          yMin={panel.yMin}
-          yMax={panel.yMax}
-        />
-      );
-    }
-    if (isStreamBin2dPanel(panel)) {
-      return (
-        <StreamBin2dPanel
-          series={(streamBin2dRef.get(panel.id) ?? null)?.series ?? null}
-          reducer={panel.reducer}
-          tick={plotTick}
-          colorScheme={computedColorScheme}
-          plotHeight={plotHeight}
-          zScaleMode={panel.yScaleMode}
-          zMin={panel.yMin}
-          zMax={panel.yMax}
-        />
-      );
-    }
-    return null;
-  };
+  // renderExpandedPlot moved to ExpandedPlotBody (round 28).
+  // The expanded-plot modal now renders <ExpandedPlotBody panel={...} />
+  // — see App.tsx PlotModalsLayer wiring below.
   // setStreamPanelTargetFromKey now provided by useStreamPanelHandlers.
   // setStreamPanelOverlayCount now provided by useStreamPanelHandlers.
   // setStreamPanelChannelIndex now provided by useStreamPanelHandlers.
@@ -5849,7 +5747,15 @@ export function App() {
         onCloseExpandedPlot={closeExpandedPlot}
         expandedPlotTitle={expandedPlotPanel ? `Plot ${expandedPlotPanel.title}` : "Plot"}
         expandedPlotContent={
-          expandedPlotPanel ? renderExpandedPlot(expandedPlotPanel) : null
+          expandedPlotPanel ? (
+            <ExpandedPlotBody
+              panel={expandedPlotPanel}
+              resolveTelemetryPanelOffset={resolveTelemetryPanelOffset}
+              streamTraceOverlaySeries={streamTraceOverlaySeries}
+              streamBinStatsOverlaySeries={streamBinStatsOverlaySeries}
+              streamBinStatsFitOverlayCurves={streamBinStatsFitOverlayCurves}
+            />
+          ) : null
         }
         streamTraceOpened={streamTraceOptionsPanel !== null}
         onCloseStreamTrace={closeStreamTraceOptionsModal}
