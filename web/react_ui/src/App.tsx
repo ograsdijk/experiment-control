@@ -204,6 +204,7 @@ import {
   type ApplyHelpersDeps,
 } from "./features/panels/applyToPanels";
 import { useSettings } from "./features/runtime/SettingsContext";
+import { useRuntimeRefreshers } from "./features/runtime/useRuntimeRefreshers";
 import { useLogsStream } from "./features/logs/useLogsStream";
 import type {
   PanelKind,
@@ -1087,113 +1088,21 @@ export function App() {
     return value.length > 0 ? value : "unknown";
   }, [gatewaySettings]);
 
-  const refreshDevices = async () => {
-    const next = await fetchDevices();
-    setDevices(next);
-    return next;
-  };
-
-  const refreshStreams = async () => {
-    return fetchStreams();
-  };
-
-  const loadGatewayRuntimeSettings = async () => {
-    setSettingsLoading(true);
-    setSettingsError(null);
-    try {
-      const next = await fetchGatewaySettings();
-      if (next === null) {
-        setSettingsError("Could not fetch gateway settings.");
-        return null;
-      }
-      setGatewaySettings(next);
-      return next;
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      setSettingsError(message);
-      return null;
-    } finally {
-      setSettingsLoading(false);
-    }
-  };
-
-  const refreshInstanceRuntime = async () => {
-    setInstanceRuntimeLoading(true);
-    setInstanceRuntimeError(null);
-    try {
-      const next = await fetchInstanceRuntimeStatus();
-      if (next === null) {
-        setInstanceRuntimeError("Could not fetch instance runtime status.");
-        return null;
-      }
-      setInstanceRuntimeStatus(next);
-      return next;
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      setInstanceRuntimeError(message);
-      return null;
-    } finally {
-      setInstanceRuntimeLoading(false);
-    }
-  };
+  // Runtime / settings / device-list refreshers (round 27). See
+  // features/runtime/useRuntimeRefreshers.ts. Five thin async wrappers
+  // around the corresponding API endpoints, sharing the same loading
+  // / error-state surface in SettingsContext.
+  const {
+    refreshDevices,
+    refreshStreams,
+    loadGatewayRuntimeSettings,
+    refreshInstanceRuntime,
+    runInstanceCleanup,
+  } = useRuntimeRefreshers();
 
   useEffect(() => {
     void refreshInstanceRuntime();
   }, []);
-
-  const runInstanceCleanup = async (
-    dryRun: boolean
-  ): Promise<Record<string, unknown> | null> => {
-    setInstanceCleanupBusy(true);
-    try {
-      const resp = await cleanupInstanceOrphans({
-        dry_run: dryRun,
-        stale_only: true,
-        timeout_s: 2.0,
-      });
-      if (!resp.ok) {
-        const message =
-          typeof resp.error?.message === "string" && resp.error.message.trim().length > 0
-            ? resp.error.message
-            : "Cleanup request failed.";
-        notifications.show({
-          color: "red",
-          title: "Instance cleanup failed",
-          message,
-        });
-        await refreshInstanceRuntime();
-        return null;
-      }
-      const result =
-        resp.result && typeof resp.result === "object"
-          ? (resp.result as Record<string, unknown>)
-          : null;
-      const matchedRaw = result?.matched;
-      const matched =
-        typeof matchedRaw === "number" && Number.isFinite(matchedRaw)
-          ? Math.trunc(matchedRaw)
-          : 0;
-      const terminated = Array.isArray(result?.terminated) ? result.terminated.length : 0;
-      const failed = Array.isArray(result?.failed) ? result.failed.length : 0;
-      notifications.show({
-        color: dryRun ? "blue" : failed > 0 ? "yellow" : "teal",
-        title: dryRun ? "Orphan cleanup dry-run" : "Orphan cleanup executed",
-        message: `matched=${matched} terminated=${terminated} failed=${failed}`,
-      });
-      await refreshInstanceRuntime();
-      return result;
-    } catch (error) {
-      notifications.show({
-        color: "red",
-        title: "Instance cleanup failed",
-        message: error instanceof Error ? error.message : String(error),
-      });
-      await refreshInstanceRuntime();
-      return null;
-    } finally {
-      setInstanceCleanupBusy(false);
-    }
-  };
 
   const exportUiProfile = () => {
     try {
