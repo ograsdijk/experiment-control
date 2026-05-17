@@ -183,6 +183,7 @@ import { useLayout } from "./features/layout/LayoutContext";
 import { useLogs } from "./features/logs/LogsContext";
 import { usePanels } from "./features/panels/PanelsContext";
 import { usePanelDerivations } from "./features/panels/usePanelDerivations";
+import { usePanelUiHandlers } from "./features/panels/usePanelUiHandlers";
 import {
   applyRawStreamFrameToPanels as applyRawStreamFrameToPanelsImpl,
   applyStreamAnalysisOutputToPanels as applyStreamAnalysisOutputToPanelsImpl,
@@ -938,6 +939,32 @@ export function App() {
     activeRawStreamSubscriptions,
     activeStreamAnalysisWorkspaceSubscriptions,
   } = usePanelDerivations();
+
+  // Simple panel UI / Y-axis / modal-toggle handlers (round 15
+  // extraction). See features/panels/usePanelUiHandlers.ts for the
+  // hook body; names kept identical so existing call sites in App.tsx
+  // don't need touch-ups.
+  const {
+    setPanelYScaleMode,
+    setPanelManualYRange,
+    setTelemetryYDisplayMode,
+    setTelemetrySmoothingMode,
+    setTelemetrySmoothingWindow,
+    setStreamBinStatsUncertainty,
+    setStreamBinStatsShowBinMarkers,
+    setStreamBin2dReducer,
+    isExpandablePlotPanel,
+    openExpandedPlot,
+    closeExpandedPlot,
+    openStreamTraceOptionsModal,
+    closeStreamTraceOptionsModal,
+    openStreamBinStatsOptionsModal,
+    closeStreamBinStatsOptionsModal,
+    openStreamParamsOptionsModal,
+    closeStreamParamsOptionsModal,
+    openStreamBin2dOptionsModal,
+    closeStreamBin2dOptionsModal,
+  } = usePanelUiHandlers();
   const hdfWriterProcess = useMemo(
     () => processes.find(isHdfWriterProcess) ?? null,
     [processes]
@@ -4442,36 +4469,9 @@ export function App() {
     setPlotTick((tick) => tick + 1);
   };
 
-  const setPanelYScaleMode = (panelId: string, mode: YScaleMode) => {
-    setPanels((prev) =>
-      prev.map((panel) => {
-        if (panel.id !== panelId) {
-          return panel;
-        }
-        if (mode === "auto") {
-          return { ...panel, yScaleMode: "auto", yMin: null, yMax: null };
-        }
-        const nextMin = panel.yMin ?? 0;
-        const nextMax = panel.yMax ?? (nextMin + 1);
-        return {
-          ...panel,
-          yScaleMode: "manual",
-          yMin: nextMin,
-          yMax: nextMax > nextMin ? nextMax : nextMin + 1,
-        };
-      })
-    );
-  };
-
-  const setPanelManualYRange = (panelId: string, min: number, max: number) => {
-    setPanels((prev) =>
-      prev.map((panel) =>
-        panel.id === panelId
-          ? { ...panel, yScaleMode: "manual", yMin: min, yMax: max }
-          : panel
-      )
-    );
-  };
+  // setPanelYScaleMode + setPanelManualYRange now provided by
+  // usePanelUiHandlers (destructured below alongside the other simple
+  // panel-config + modal handlers).
 
   const resolveTelemetryPanelOffset = (
     panel: PlotTelemetryPanelState
@@ -4502,19 +4502,7 @@ export function App() {
     return Math.round((range.min + range.max) / 2);
   };
 
-  const setTelemetryYDisplayMode = (panelId: string, mode: YDisplayMode) => {
-    setPanels((prev) =>
-      prev.map((panel) => {
-        if (panel.id !== panelId || !isTelemetryPanel(panel)) {
-          return panel;
-        }
-        if (mode === "absolute") {
-          return { ...panel, yDisplayMode: "absolute" };
-        }
-        return { ...panel, yDisplayMode: "delta" };
-      })
-    );
-  };
+  // setTelemetryYDisplayMode now provided by usePanelUiHandlers.
 
   const setTelemetryYOffsetMode = (
     panelId: string,
@@ -4551,38 +4539,8 @@ export function App() {
     );
   };
 
-  const setTelemetrySmoothingMode = (
-    panelId: string,
-    mode: TelemetrySmoothingMode
-  ) => {
-    const nextMode = normalizeTelemetrySmoothingMode(mode);
-    setPanels((prev) =>
-      prev.map((panel) => {
-        if (panel.id !== panelId || !isTelemetryPanel(panel)) {
-          return panel;
-        }
-        return {
-          ...panel,
-          smoothingMode: nextMode,
-          smoothingWindowS: normalizeTelemetrySmoothingWindow(panel.smoothingWindowS),
-        };
-      })
-    );
-  };
-
-  const setTelemetrySmoothingWindow = (panelId: string, value: number) => {
-    setPanels((prev) =>
-      prev.map((panel) => {
-        if (panel.id !== panelId || !isTelemetryPanel(panel)) {
-          return panel;
-        }
-        return {
-          ...panel,
-          smoothingWindowS: normalizeTelemetrySmoothingWindow(value),
-        };
-      })
-    );
-  };
+  // setTelemetrySmoothingMode + setTelemetrySmoothingWindow now
+  // provided by usePanelUiHandlers.
 
   const resolvePanelAutoYRange = (
     panel: PlotPanelState | null
@@ -4658,69 +4616,8 @@ export function App() {
     );
   };
 
-  const openStreamTraceOptionsModal = (panelId: string) => {
-    const panel = panels.find((entry) => entry.id === panelId);
-    if (!panel || !isStreamTracePanel(panel)) {
-      return;
-    }
-    setStreamTraceOptionsPanelId(panelId);
-  };
-
-  const closeStreamTraceOptionsModal = () => {
-    setStreamTraceOptionsPanelId(null);
-  };
-
-  const openStreamBinStatsOptionsModal = (panelId: string) => {
-    const panel = panels.find((entry) => entry.id === panelId);
-    if (!panel || !isStreamBinStatsPanel(panel)) {
-      return;
-    }
-    setStreamBinStatsOptionsPanelId(panelId);
-  };
-
-  const closeStreamBinStatsOptionsModal = () => {
-    setStreamBinStatsOptionsPanelId(null);
-  };
-
-  const openStreamParamsOptionsModal = (panelId: string) => {
-    const panel = panels.find((entry) => entry.id === panelId);
-    if (!panel || !isStreamParamsPanel(panel)) {
-      return;
-    }
-    setStreamParamsOptionsPanelId(panelId);
-  };
-
-  const closeStreamParamsOptionsModal = () => {
-    setStreamParamsOptionsPanelId(null);
-  };
-
-  const openStreamBin2dOptionsModal = (panelId: string) => {
-    const panel = panels.find((entry) => entry.id === panelId);
-    if (!panel || !isStreamBin2dPanel(panel)) {
-      return;
-    }
-    setStreamBin2dOptionsPanelId(panelId);
-  };
-
-  const closeStreamBin2dOptionsModal = () => {
-    setStreamBin2dOptionsPanelId(null);
-  };
-
-  const isExpandablePlotPanel = (panel: (typeof panels)[number]) => {
-    return !isStreamParamsPanel(panel);
-  };
-
-  const openExpandedPlot = (panelId: string) => {
-    const panel = panels.find((entry) => entry.id === panelId);
-    if (!panel || !isExpandablePlotPanel(panel)) {
-      return;
-    }
-    setExpandedPlotPanelId(panelId);
-  };
-
-  const closeExpandedPlot = () => {
-    setExpandedPlotPanelId(null);
-  };
+  // Stream-options modal open/close handlers + expanded-plot modal +
+  // isExpandablePlotPanel now provided by usePanelUiHandlers.
 
   const openPlotOptions = (panelId: string) => {
     const panel = panels.find((entry) => entry.id === panelId) ?? null;
@@ -5399,38 +5296,8 @@ export function App() {
     }
   };
 
-  const setStreamBinStatsUncertainty = (
-    panelId: string,
-    uncertaintyMode: UncertaintyMode,
-    uncertaintyScale: number
-  ) => {
-    setPanels((prev) =>
-      prev.map((panel) =>
-        panel.id === panelId && isStreamBinStatsPanel(panel)
-          ? {
-              ...panel,
-              uncertaintyMode,
-              uncertaintyScale: Number.isFinite(uncertaintyScale)
-                ? Math.max(0, uncertaintyScale)
-                : panel.uncertaintyScale,
-            }
-          : panel
-      )
-    );
-  };
-
-  const setStreamBinStatsShowBinMarkers = (
-    panelId: string,
-    showBinMarkers: boolean
-  ) => {
-    setPanels((prev) =>
-      prev.map((panel) =>
-        panel.id === panelId && isStreamBinStatsPanel(panel)
-          ? { ...panel, showBinMarkers }
-          : panel
-      )
-    );
-  };
+  // setStreamBinStatsUncertainty + setStreamBinStatsShowBinMarkers now
+  // provided by usePanelUiHandlers.
 
   const setStreamParamsPanelOutputs = (panelId: string, outputIds: string[]) => {
     const next = outputIds
@@ -5480,16 +5347,7 @@ export function App() {
     setPlotTick((tick) => tick + 1);
   };
 
-  const setStreamBin2dReducer = (panelId: string, reducer: Bin2dReducer) => {
-    setPanels((prev) =>
-      prev.map((panel) =>
-        panel.id === panelId && isStreamBin2dPanel(panel)
-          ? { ...panel, reducer }
-          : panel
-      )
-    );
-    setPlotTick((tick) => tick + 1);
-  };
+  // setStreamBin2dReducer now provided by usePanelUiHandlers.
 
   const clearWorkspaceBinPanels = (workspaceId: string, nodeId?: string | null) => {
     const workspace = streamWorkspacesRef.current[workspaceId] ?? null;
