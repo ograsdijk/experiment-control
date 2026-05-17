@@ -184,6 +184,12 @@ import { useLogs } from "./features/logs/LogsContext";
 import { usePanels } from "./features/panels/PanelsContext";
 import { usePanelDerivations } from "./features/panels/usePanelDerivations";
 import { usePanelUiHandlers } from "./features/panels/usePanelUiHandlers";
+import { usePanelAutoRangeHandlers } from "./features/panels/usePanelAutoRangeHandlers";
+import {
+  streamBinStatsFitOverlayCurves as streamBinStatsFitOverlayCurvesImpl,
+  streamBinStatsOverlaySeries as streamBinStatsOverlaySeriesImpl,
+  streamTraceOverlaySeries as streamTraceOverlaySeriesImpl,
+} from "./features/panels/overlayHelpers";
 import {
   applyRawStreamFrameToPanels as applyRawStreamFrameToPanelsImpl,
   applyStreamAnalysisOutputToPanels as applyStreamAnalysisOutputToPanelsImpl,
@@ -965,6 +971,38 @@ export function App() {
     openStreamBin2dOptionsModal,
     closeStreamBin2dOptionsModal,
   } = usePanelUiHandlers();
+
+  // Y-axis editor + auto-range handlers (round 16 extraction). See
+  // features/panels/usePanelAutoRangeHandlers.ts. Takes the simple
+  // Y-axis setters from usePanelUiHandlers as args so the
+  // state-mutation stays in one place.
+  const {
+    resolveTelemetryPanelOffset,
+    resolvePanelAutoYRange,
+    setTelemetryYOffsetMode,
+    openPlotOptions,
+    closePlotOptions,
+    applyPlotOptionsAxis,
+    setPlotOptionsAxisMode,
+  } = usePanelAutoRangeHandlers({
+    setPanelYScaleMode,
+    setPanelManualYRange,
+  });
+
+  // Overlay-series helpers (round 16 extraction). The render loop +
+  // applyPlotOptionsAxis both use these; the pure functions live in
+  // features/panels/overlayHelpers.ts. App.tsx wraps them with the
+  // local overlay refs already destructured from TelemetryContext so
+  // call sites keep the same panel-only signature they had before.
+  const streamTraceOverlaySeries = (
+    panel: Parameters<typeof streamTraceOverlaySeriesImpl>[0]
+  ) => streamTraceOverlaySeriesImpl(panel, streamTraceOverlayRef);
+  const streamBinStatsOverlaySeries = (
+    panel: Parameters<typeof streamBinStatsOverlaySeriesImpl>[0]
+  ) => streamBinStatsOverlaySeriesImpl(panel, streamBinStatsOverlayRef);
+  const streamBinStatsFitOverlayCurves = (
+    panel: Parameters<typeof streamBinStatsFitOverlayCurvesImpl>[0]
+  ) => streamBinStatsFitOverlayCurvesImpl(panel, streamBinStatsFitOverlayRef);
   const hdfWriterProcess = useMemo(
     () => processes.find(isHdfWriterProcess) ?? null,
     [processes]
@@ -4473,321 +4511,15 @@ export function App() {
   // usePanelUiHandlers (destructured below alongside the other simple
   // panel-config + modal handlers).
 
-  const resolveTelemetryPanelOffset = (
-    panel: PlotTelemetryPanelState
-  ): number | null => {
-    if (panel.yDisplayMode !== "delta") {
-      return null;
-    }
-    if (
-      panel.yOffsetMode === "freeze" &&
-      typeof panel.yOffsetValue === "number" &&
-      Number.isFinite(panel.yOffsetValue)
-    ) {
-      return Math.round(panel.yOffsetValue);
-    }
-    const numericTraces = panel.traces.filter(
-      (trace) => trace.valueKind !== "boolean"
-    );
-    if (numericTraces.length === 0) {
-      return null;
-    }
-    const panelBuffers = buffersRef.get(panel.id) ?? new Map<string, RingBuffer>();
-    const range = normalizeAutoRange(
-      computeTelemetryAutoYRange(numericTraces, panelBuffers, panel.timeWindowS)
-    );
-    if (!range) {
-      return null;
-    }
-    return Math.round((range.min + range.max) / 2);
-  };
-
-  // setTelemetryYDisplayMode now provided by usePanelUiHandlers.
-
-  const setTelemetryYOffsetMode = (
-    panelId: string,
-    mode: YOffsetMode,
-    value: number | null = null
-  ) => {
-    const panel = panels.find((entry) => entry.id === panelId);
-    const resolvedFreezeValue =
-      mode === "freeze"
-        ? typeof value === "number" && Number.isFinite(value)
-          ? value
-          : panel && isTelemetryPanel(panel)
-          ? resolveTelemetryPanelOffset(panel)
-          : null
-        : null;
-    setPanels((prev) =>
-      prev.map((panel) => {
-        if (panel.id !== panelId || !isTelemetryPanel(panel)) {
-          return panel;
-        }
-        if (
-          mode === "freeze" &&
-          typeof resolvedFreezeValue === "number" &&
-          Number.isFinite(resolvedFreezeValue)
-        ) {
-          return {
-            ...panel,
-            yOffsetMode: "freeze",
-            yOffsetValue: Math.round(resolvedFreezeValue),
-          };
-        }
-        return { ...panel, yOffsetMode: "auto", yOffsetValue: null };
-      })
-    );
-  };
-
-  // setTelemetrySmoothingMode + setTelemetrySmoothingWindow now
-  // provided by usePanelUiHandlers.
-
-  const resolvePanelAutoYRange = (
-    panel: PlotPanelState | null
-  ): { min: number; max: number } | null => {
-    if (!panel) {
-      return null;
-    }
-    if (isTelemetryPanel(panel)) {
-      const panelBuffers = buffersRef.get(panel.id) ?? new Map<string, RingBuffer>();
-      const range = normalizeAutoRange(
-        computeTelemetryAutoYRange(panel.traces, panelBuffers, panel.timeWindowS)
-      );
-      if (!range) {
-        return null;
-      }
-      if (panel.yDisplayMode !== "delta") {
-        return range;
-      }
-      const offset = resolveTelemetryPanelOffset(panel);
-      if (offset === null) {
-        return range;
-      }
-      return {
-        min: range.min - offset,
-        max: range.max - offset,
-      };
-    }
-    if (isStreamScalarPanel(panel)) {
-      const panelBuffers = buffersRef.get(panel.id) ?? new Map<string, RingBuffer>();
-      return normalizeAutoRange(
-        computeTelemetryAutoYRange(
-          [streamScalarTrace(panel)],
-          panelBuffers,
-          panel.timeWindowS
-        )
-      );
-    }
-    if (isStreamBinStatsPanel(panel)) {
-      const snapshot = streamBinStatsRef.get(panel.id) ?? null;
-        return normalizeAutoRange(
-          computeStreamBinStatsAutoYRange(
-            snapshot?.series ?? null,
-            panel.uncertaintyMode,
-            panel.uncertaintyScale,
-            streamBinStatsOverlaySeries(panel),
-            streamBinStatsFitOverlayCurves(panel)
-          )
-        );
-    }
-    if (isStreamBin2dPanel(panel)) {
-      const snapshot = streamBin2dRef.get(panel.id) ?? null;
-      return normalizeAutoRange(
-        computeStreamBin2dAutoZRange(snapshot?.series ?? null, panel.reducer)
-      );
-    }
-    const frames = streamFramesRef.get(panel.id) ?? [];
-    if (isStreamWaterfallPanel(panel)) {
-      return normalizeAutoRange(
-        computeStreamWaterfallAutoZRange(
-          frames,
-          panel.overlayCount,
-          panel.sourceMode === "raw" ? panel.channelIndex : 0
-        )
-      );
-    }
-    return normalizeAutoRange(
-      computeStreamRawAutoYRange(
-        frames,
-        panel.overlayCount,
-        panel.sourceMode === "raw" ? panel.channelIndex : 0,
-        panel.sourceMode === "dag" ? streamTraceOverlaySeries(panel) : []
-      )
-    );
-  };
-
-  // Stream-options modal open/close handlers + expanded-plot modal +
-  // isExpandablePlotPanel now provided by usePanelUiHandlers.
-
-  const openPlotOptions = (panelId: string) => {
-    const panel = panels.find((entry) => entry.id === panelId) ?? null;
-    if (!panel) {
-      return;
-    }
-    const autoRange = resolvePanelAutoYRange(panel);
-    setPlotOptionsPanelId(panelId);
-    setYAxisAutoRange(autoRange);
-    if (
-      panel.yScaleMode === "manual" &&
-      typeof panel.yMin === "number" &&
-      typeof panel.yMax === "number" &&
-      Number.isFinite(panel.yMin) &&
-      Number.isFinite(panel.yMax) &&
-      panel.yMin < panel.yMax
-    ) {
-      setYAxisDraftMin(panel.yMin);
-      setYAxisDraftMax(panel.yMax);
-      return;
-    }
-    setYAxisDraftMin(autoRange ? autoRange.min : "");
-    setYAxisDraftMax(autoRange ? autoRange.max : "");
-  };
-
-  const closePlotOptions = () => {
-    setPlotOptionsPanelId(null);
-    setYAxisDraftMin("");
-    setYAxisDraftMax("");
-    setYAxisAutoRange(null);
-  };
-
-  const applyPlotOptionsAxis = (panelId: string) => {
-    const min = parseNumberInput(yAxisDraftMin);
-    const max = parseNumberInput(yAxisDraftMax);
-    if (min === null || max === null) {
-      notifications.show({
-        color: "red",
-        title: "Invalid y range",
-        message: "Manual y-axis limits require numeric min and max values.",
-      });
-      return;
-    }
-    if (min >= max) {
-      notifications.show({
-        color: "red",
-        title: "Invalid y range",
-        message: "Y-axis min must be less than y-axis max.",
-      });
-      return;
-    }
-    setPanelManualYRange(panelId, min, max);
-  };
-
-  const setPlotOptionsAxisMode = (panel: PlotPanelState, mode: YScaleMode) => {
-    if (mode === "auto") {
-      setPanelYScaleMode(panel.id, "auto");
-      return;
-    }
-    const autoRange = resolvePanelAutoYRange(panel);
-    setYAxisAutoRange(autoRange);
-    if (
-      panel.yScaleMode !== "manual" ||
-      typeof panel.yMin !== "number" ||
-      typeof panel.yMax !== "number" ||
-      !Number.isFinite(panel.yMin) ||
-      !Number.isFinite(panel.yMax) ||
-      panel.yMin >= panel.yMax
-    ) {
-      if (autoRange) {
-        setYAxisDraftMin(autoRange.min);
-        setYAxisDraftMax(autoRange.max);
-      } else {
-        setYAxisDraftMin(0);
-        setYAxisDraftMax(1);
-      }
-    }
-    setPanelYScaleMode(panel.id, "manual");
-  };
-
-  const setStreamPanelTarget = (
-    panelId: string,
-    target: StreamTarget | null
-  ) => {
-    const targetChannelCount = inferChannelCountFromShape(target?.shape);
-    setPanels((prev) =>
-      prev.map((panel) =>
-        panel.id === panelId &&
-        isStreamTracePanel(panel) &&
-        panel.sourceMode === "raw"
-          ? {
-              ...panel,
-              stream: target,
-              channelIndex:
-                targetChannelCount <= 1
-                  ? 0
-                  : Math.max(0, Math.min(panel.channelIndex, targetChannelCount - 1)),
-            }
-          : panel
-      )
-    );
-    streamFramesRef.set(panelId, []);
-    streamTraceOverlayRef.set(panelId, new Map());
-    setPlotTick((tick) => tick + 1);
-  };
-
-  const streamTraceOverlaySeries = (
-    panel: PlotStreamPanelState | PlotStreamWaterfallPanelState
-  ) => {
-    const overlayMap = streamTraceOverlayRef.get(panel.id);
-    if (!overlayMap || overlayMap.size <= 0) {
-      return [];
-    }
-    const selected = panel.overlayOutputIds ?? [];
-    const out: Array<{ label: string; values: number[] }> = [];
-    for (const outputId of selected) {
-      const entry = overlayMap.get(outputId);
-      if (!entry || !Array.isArray(entry.values) || entry.values.length <= 0) {
-        continue;
-      }
-      out.push({
-        label: outputId,
-        values: entry.values,
-      });
-    }
-    return out;
-  };
-
-  const streamBinStatsOverlaySeries = (
-    panel: PlotStreamBinStatsPanelState
-  ) => {
-    const overlayMap = streamBinStatsOverlayRef.get(panel.id);
-    if (!overlayMap || overlayMap.size <= 0) {
-      return [];
-    }
-    const selected = panel.overlayOutputIds ?? [];
-    const out: Array<{ label: string; values: number[] }> = [];
-    for (const outputId of selected) {
-      const entry = overlayMap.get(outputId);
-      if (!entry || !Array.isArray(entry.values) || entry.values.length <= 0) {
-        continue;
-      }
-      out.push({ label: outputId, values: entry.values });
-    }
-    return out;
-  };
-
-  const streamBinStatsFitOverlayCurves = (
-    panel: PlotStreamBinStatsPanelState
-  ) => {
-    const overlayMap = streamBinStatsFitOverlayRef.get(panel.id);
-    if (!overlayMap || overlayMap.size <= 0) {
-      return [];
-    }
-    const selected = panel.fitOverlayOutputIds ?? [];
-    const out: Array<{ label: string; x: number[]; y: number[] }> = [];
-    for (const outputId of selected) {
-      const entry = overlayMap.get(outputId);
-      if (!entry) {
-        continue;
-      }
-      const x = entry.xDense ?? entry.x;
-      const y = entry.yhatDense ?? entry.yhat;
-      if (!Array.isArray(x) || !Array.isArray(y) || x.length <= 1 || y.length <= 1) {
-        continue;
-      }
-      out.push({ label: outputId, x, y });
-    }
-    return out;
-  };
+  // resolveTelemetryPanelOffset, setTelemetryYOffsetMode,
+  // resolvePanelAutoYRange, openPlotOptions, closePlotOptions,
+  // applyPlotOptionsAxis, and setPlotOptionsAxisMode are now
+  // provided by usePanelAutoRangeHandlers (destructured above).
+  // streamTraceOverlaySeries, streamBinStatsOverlaySeries, and
+  // streamBinStatsFitOverlayCurves are pure functions in
+  // features/panels/overlayHelpers.ts; the local arrow wrappers near
+  // the top of this function bind the overlay refs from
+  // TelemetryContext.
 
   const renderExpandedPlot = (panel: (typeof panels)[number]) => {
     const plotHeight = 640;
