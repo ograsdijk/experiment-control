@@ -65,7 +65,6 @@ import {
 } from "react";
 import {
   callDevice,
-  buildWsUrl,
   cleanupInstanceOrphans,
   fetchLogTail,
   fetchCapabilities,
@@ -73,9 +72,7 @@ import {
   fetchExtraUis,
   fetchGatewaySettings,
   fetchInstanceRuntimeStatus,
-  fetchRawStreamSnapshot,
   fetchStreams,
-  fetchStreamWorkspaceSnapshot,
   callProcess,
   type GatewaySettingsInfo,
   type InstanceRuntimeStatus,
@@ -162,6 +159,8 @@ import { useProcessCommandController } from "./features/processes/useProcessComm
 import { useProcessLifecycleController } from "./features/processes/useProcessLifecycleController";
 import { useProcessesController } from "./features/processes/useProcessesController";
 import { useTelemetryStream } from "./features/telemetry/useTelemetryStream";
+import { useRawStreamSubscriptions } from "./features/telemetry/useRawStreamSubscriptions";
+import { useStreamAnalysisSubscriptions } from "./features/stream_analysis/useStreamAnalysisSubscriptions";
 import { useTelemetry } from "./features/telemetry/TelemetryContext";
 import { useStreamAnalysis } from "./features/stream_analysis/StreamAnalysisContext";
 import { useDaqDraftEditors } from "./features/stream_analysis/useDaqDraftEditors";
@@ -223,7 +222,6 @@ import type {
   RawStreamSubscription,
   StreamAnalysisSettings,
   StreamAnalysisWorkspaceConfig,
-  StreamAnalysisWorkspaceSubscription,
   StreamBin2dSnapshot,
   StreamBinStatsSettings,
   StreamBinStatsSnapshot,
@@ -258,7 +256,6 @@ import {
   normalizeHist2dValue,
   normalizeFitParamsMapValue,
   normalizeStreamAnalysisOutputMessage,
-  normalizeStreamFrameMessage,
   normalizeTime,
   normalizeTraceValues,
 } from "./features/stream/messages";
@@ -349,9 +346,7 @@ import {
   LogEntry,
   PinnedCommand,
   ProcessStatus,
-  StreamAnalysisMessage,
   StreamCatalogEntry,
-  StreamFrameMessage,
   TelemetryMessage,
   TelemetrySignal,
   TraceKey,
@@ -587,9 +582,9 @@ export function App() {
     panelTitleDraft,
     setPanelTitleDraft,
   } = usePanels();
-  const [streamWsConnected, setStreamWsConnected] = useState(false);
-  const [streamAnalysisWsConnected, setStreamAnalysisWsConnected] =
-    useState(false);
+  // streamWsConnected + streamAnalysisWsConnected moved out of useState
+  // and into useRawStreamSubscriptions / useStreamAnalysisSubscriptions
+  // hook returns (round 34). See the hook calls further down.
   const [logsOpen, setLogsOpen] = useState(false);
   const [commandUnreadError, setCommandUnreadError] = useState(false);
   const [logsUnreadError, setLogsUnreadError] = useState(false);
@@ -1847,156 +1842,7 @@ export function App() {
     [buffersRef, panelBuffersByTraceKey]
   );
 
-  useEffect(() => {
-    if (activeRawStreamSubscriptions.length <= 0) {
-      return;
-    }
-    let cancelled = false;
-    const keyFor = (subscription: RawStreamSubscription) =>
-      `${subscription.deviceId}|${subscription.stream}|${subscription.channelIndex}|${subscription.traceDecimator}|${subscription.traceMaxPoints}|${subscription.traceMaxFps.toFixed(3)}|${subscription.rollingWindow}|${subscription.averageMode}`;
-    const activeKeys = new Set(activeRawStreamSubscriptions.map((sub) => keyFor(sub)));
-    rawSnapshotHydratedRef.current = new Set(
-      [...rawSnapshotHydratedRef.current].filter((key) => activeKeys.has(key))
-    );
-    const pending = activeRawStreamSubscriptions.filter(
-      (subscription) => !rawSnapshotHydratedRef.current.has(keyFor(subscription))
-    );
-    if (pending.length <= 0) {
-      return;
-    }
-    const load = async () => {
-      let updated = false;
-      for (const subscription of pending) {
-        const key = keyFor(subscription);
-        try {
-          const msg = await fetchRawStreamSnapshot({
-            deviceId: subscription.deviceId,
-            stream: subscription.stream,
-            channelIndex: subscription.channelIndex,
-            traceDecimator: subscription.traceDecimator,
-            traceMaxPoints: subscription.traceMaxPoints,
-            traceMaxFps: subscription.traceMaxFps,
-            rollingWindow: subscription.rollingWindow,
-            averageMode: subscription.averageMode,
-          });
-          if (cancelled) {
-            return;
-          }
-          rawSnapshotHydratedRef.current.add(key);
-          const frame = msg ? normalizeStreamFrameMessage(msg) : null;
-          if (frame === null) {
-            continue;
-          }
-          if (applyRawStreamFrameToPanels(subscription, frame)) {
-            updated = true;
-          }
-        } catch {
-          rawSnapshotHydratedRef.current.add(key);
-        }
-      }
-      if (!cancelled && updated) {
-        setPlotTick((tick) => tick + 1);
-      }
-    };
-    void load();
-    return () => {
-      cancelled = true;
-    };
-  }, [activeRawStreamSubscriptions]);
 
-  useEffect(() => {
-    if (!streamAnalysisRpcReady || activeStreamAnalysisWorkspaceSubscriptions.length <= 0) {
-      return;
-    }
-    let cancelled = false;
-    const kindsByWorkspace = new Map<string, Set<string>>();
-    const traceMaxPointsByWorkspace = new Map<string, number>();
-    for (const subscription of activeStreamAnalysisWorkspaceSubscriptions) {
-      const workspaceId = String(subscription.workspaceId ?? "").trim();
-      if (!workspaceId) {
-        continue;
-      }
-      const kinds = kindsByWorkspace.get(workspaceId) ?? new Set<string>();
-      for (const kind of subscription.kinds) {
-        kinds.add(String(kind));
-      }
-      kindsByWorkspace.set(workspaceId, kinds);
-      if (
-        subscription.kinds.includes("trace") &&
-        typeof subscription.traceMaxPoints === "number" &&
-        Number.isFinite(subscription.traceMaxPoints)
-      ) {
-        const current = traceMaxPointsByWorkspace.get(workspaceId) ?? 0;
-        traceMaxPointsByWorkspace.set(
-          workspaceId,
-          Math.max(current, Math.max(32, Math.trunc(subscription.traceMaxPoints)))
-        );
-      }
-    }
-    const snapshotTargets = [...kindsByWorkspace.entries()].map(([workspaceId, kindsSet]) => {
-      const kinds = [...kindsSet].sort();
-      const maxTracePoints = traceMaxPointsByWorkspace.get(workspaceId);
-      const key = `${workspaceId}|${kinds.join(",")}|${
-        typeof maxTracePoints === "number" ? String(maxTracePoints) : ""
-      }`;
-      return { workspaceId, kinds, maxTracePoints, key };
-    });
-    const activeKeys = new Set(snapshotTargets.map((entry) => entry.key));
-    workspaceSnapshotHydratedRef.current = new Set(
-      [...workspaceSnapshotHydratedRef.current].filter((key) => activeKeys.has(key))
-    );
-    const pending = snapshotTargets.filter(
-      (entry) => !workspaceSnapshotHydratedRef.current.has(entry.key)
-    );
-    if (pending.length <= 0) {
-      return;
-    }
-    const load = async () => {
-      let updated = false;
-      for (const target of pending) {
-        try {
-          const resp = await fetchStreamWorkspaceSnapshot(target.workspaceId, {
-            kinds: target.kinds,
-            maxTracePoints: target.maxTracePoints ?? null,
-          });
-          if (cancelled) {
-            return;
-          }
-          workspaceSnapshotHydratedRef.current.add(target.key);
-          if (!resp.ok || !resp.result || typeof resp.result !== "object") {
-            continue;
-          }
-          const outputsRaw = Array.isArray(resp.result.outputs)
-            ? resp.result.outputs
-            : [];
-          for (const outputRaw of outputsRaw) {
-            if (!outputRaw || typeof outputRaw !== "object") {
-              continue;
-            }
-            const normalized = normalizeStreamAnalysisOutputMessage({
-              topic: "manager.stream_analysis.output",
-              payload: outputRaw as StreamAnalysisMessage["payload"],
-            });
-            if (normalized === null) {
-              continue;
-            }
-            if (applyStreamAnalysisOutputToPanels(normalized)) {
-              updated = true;
-            }
-          }
-        } catch {
-          workspaceSnapshotHydratedRef.current.add(target.key);
-        }
-      }
-      if (!cancelled && updated) {
-        setPlotTick((tick) => tick + 1);
-      }
-    };
-    void load();
-    return () => {
-      cancelled = true;
-    };
-  }, [streamAnalysisRpcReady, activeStreamAnalysisWorkspaceSubscriptions]);
 
   const handleTelemetryMessage = useCallback(
     (msg: TelemetryMessage) => {
@@ -2067,195 +1913,7 @@ export function App() {
     onMessage: handleTelemetryMessage,
   });
 
-  useEffect(() => {
-    if (activeRawStreamSubscriptions.length <= 0) {
-      setStreamWsConnected(true);
-      return;
-    }
-    let disposed = false;
-    const sockets = new Map<string, WebSocket>();
-    const openIds = new Set<string>();
 
-    const updateConnected = () => {
-      if (disposed) {
-        return;
-      }
-      setStreamWsConnected(openIds.size > 0);
-    };
-
-    const onMessage = (subscription: RawStreamSubscription) => (event: MessageEvent<string>) => {
-      try {
-        const msg = JSON.parse(event.data) as StreamFrameMessage;
-        const frame = normalizeStreamFrameMessage(msg);
-        if (frame === null) {
-          return;
-        }
-        if (frame.deviceId !== subscription.deviceId || frame.stream !== subscription.stream) {
-          return;
-        }
-        const updated = applyRawStreamFrameToPanels(subscription, frame);
-        if (updated) {
-          setPlotTick((tick) => tick + 1);
-        }
-      } catch {
-        return;
-      }
-    };
-
-    for (const subscription of activeRawStreamSubscriptions) {
-      const params = new URLSearchParams();
-      params.set("device_id", subscription.deviceId);
-      params.set("stream", subscription.stream);
-      params.set("channel_index", String(subscription.channelIndex));
-      params.set("trace_decimator", subscription.traceDecimator);
-      params.set("trace_max_points", String(subscription.traceMaxPoints));
-      params.set("trace_max_fps", String(subscription.traceMaxFps));
-      params.set("rolling_window", String(subscription.rollingWindow));
-      params.set("trace_average_mode", subscription.averageMode);
-      const query = params.toString();
-      const socketKey = `${subscription.deviceId}|${subscription.stream}|${subscription.channelIndex}|${subscription.traceDecimator}|${subscription.traceMaxPoints}|${subscription.traceMaxFps.toFixed(3)}|${subscription.rollingWindow}|${subscription.averageMode}`;
-      const ws = new WebSocket(buildWsUrl(`/ws/raw_stream?${query}`));
-      ws.onopen = () => {
-        openIds.add(socketKey);
-        updateConnected();
-      };
-      ws.onclose = () => {
-        openIds.delete(socketKey);
-        updateConnected();
-      };
-      ws.onerror = () => {
-        openIds.delete(socketKey);
-        updateConnected();
-      };
-      ws.onmessage = onMessage(subscription);
-      sockets.set(socketKey, ws);
-    }
-
-    updateConnected();
-    return () => {
-      disposed = true;
-      openIds.clear();
-      setStreamWsConnected(false);
-      for (const ws of sockets.values()) {
-        ws.close();
-      }
-      sockets.clear();
-    };
-  }, [activeRawStreamSubscriptions, streamFramesRef]);
-
-  useEffect(() => {
-    if (activeStreamAnalysisWorkspaceSubscriptions.length <= 0) {
-      setStreamAnalysisWsConnected(streamAnalysisRpcReady);
-      return;
-    }
-    let disposed = false;
-    const sockets = new Map<string, WebSocket>();
-    const openIds = new Set<string>();
-
-    const updateConnected = () => {
-      if (disposed) {
-        return;
-      }
-      setStreamAnalysisWsConnected(openIds.size > 0);
-    };
-
-    const onMessage = (
-      subscription: StreamAnalysisWorkspaceSubscription
-    ) => (event: MessageEvent<string>) => {
-      try {
-        const msg = JSON.parse(event.data) as StreamAnalysisMessage;
-        const output = normalizeStreamAnalysisOutputMessage(msg);
-        if (output === null) {
-          return;
-        }
-        const traceFilter =
-          subscription.kinds.includes("trace") &&
-          subscription.traceDecimator !== undefined &&
-          subscription.traceMaxPoints !== undefined &&
-          subscription.traceMaxFps !== undefined &&
-          subscription.traceRollingWindow !== undefined &&
-          subscription.traceAverageMode !== undefined
-            ? {
-                traceDecimator: subscription.traceDecimator,
-                traceMaxPoints: subscription.traceMaxPoints,
-                traceMaxFps: subscription.traceMaxFps,
-                traceRollingWindow: subscription.traceRollingWindow,
-                traceAverageMode: subscription.traceAverageMode,
-              }
-            : undefined;
-        if (applyStreamAnalysisOutputToPanels(output, traceFilter)) {
-          setPlotTick((tick) => tick + 1);
-        }
-      } catch {
-        return;
-      }
-    };
-
-    for (const subscription of activeStreamAnalysisWorkspaceSubscriptions) {
-      const workspaceId = subscription.workspaceId;
-      const params = new URLSearchParams();
-      if (subscription.kinds.length > 0) {
-        params.set("kinds", subscription.kinds.join(","));
-      }
-      if (
-        subscription.kinds.includes("trace") &&
-        subscription.traceDecimator !== undefined &&
-        subscription.traceMaxPoints !== undefined &&
-        subscription.traceMaxFps !== undefined &&
-        subscription.traceRollingWindow !== undefined &&
-        subscription.traceAverageMode !== undefined
-      ) {
-        params.set("trace_decimator", subscription.traceDecimator);
-        params.set("trace_max_points", String(subscription.traceMaxPoints));
-        params.set("trace_max_fps", String(subscription.traceMaxFps));
-        params.set("rolling_window", String(subscription.traceRollingWindow));
-        params.set("trace_average_mode", subscription.traceAverageMode);
-      }
-      const query = params.toString();
-      const socketKey = `${workspaceId}|${query}`;
-      const ws = new WebSocket(
-        buildWsUrl(
-          `/ws/stream/${encodeURIComponent(workspaceId)}${query ? `?${query}` : ""}`
-        )
-      );
-      ws.onopen = () => {
-        openIds.add(socketKey);
-        updateConnected();
-      };
-      ws.onclose = () => {
-        openIds.delete(socketKey);
-        updateConnected();
-      };
-      ws.onerror = () => {
-        openIds.delete(socketKey);
-        updateConnected();
-      };
-      ws.onmessage = onMessage(subscription);
-      sockets.set(socketKey, ws);
-    }
-
-    updateConnected();
-
-    return () => {
-      disposed = true;
-      openIds.clear();
-      setStreamAnalysisWsConnected(false);
-      for (const ws of sockets.values()) {
-        ws.close();
-      }
-      sockets.clear();
-    };
-  }, [
-    activeStreamAnalysisWorkspaceSubscriptions,
-    buffersRef,
-      streamAnalysisRpcReady,
-      streamTraceOverlayRef,
-      streamBinStatsOverlayRef,
-      streamBinStatsFitOverlayRef,
-      streamParamsLatestRef,
-      streamBinStatsRef,
-      streamBin2dRef,
-  ]);
 
   useEffect(() => {
     const currentLastId =
@@ -3234,6 +2892,27 @@ export function App() {
         }
       | undefined
   ) => applyStreamAnalysisOutputToPanelsImpl(applyDeps, output, traceFilter);
+
+  // Raw-stream WebSocket subscriptions (round 34). See
+  // features/telemetry/useRawStreamSubscriptions.ts. Owns the per-
+  // subscription snapshot hydration + live-WS plumbing that used to
+  // be two inline useEffects in App.tsx.
+  const bumpPlotTick = useCallback(
+    () => setPlotTick((tick) => tick + 1),
+    [setPlotTick]
+  );
+  const { wsConnected: streamWsConnected } = useRawStreamSubscriptions({
+    activeSubscriptions: activeRawStreamSubscriptions,
+    applyFrame: applyRawStreamFrameToPanels,
+    bumpPlotTick,
+  });
+  const { wsConnected: streamAnalysisWsConnected } =
+    useStreamAnalysisSubscriptions({
+      activeSubscriptions: activeStreamAnalysisWorkspaceSubscriptions,
+      streamAnalysisRpcReady,
+      applyOutput: applyStreamAnalysisOutputToPanels,
+      bumpPlotTick,
+    });
 
   // Workspace-list management (round 24). See
   // features/stream_analysis/useWorkspaceListManagement.ts. Four
