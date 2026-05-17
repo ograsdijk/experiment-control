@@ -179,6 +179,7 @@ import { useTelemetry } from "./features/telemetry/TelemetryContext";
 import { useStreamAnalysis } from "./features/stream_analysis/StreamAnalysisContext";
 import { useDevicesContext } from "./features/devices/DevicesContext";
 import { useCommands } from "./features/commands/CommandsContext";
+import { useLayout } from "./features/layout/LayoutContext";
 import { useLogs } from "./features/logs/LogsContext";
 import { useSettings } from "./features/runtime/SettingsContext";
 import { useLogsStream } from "./features/logs/useLogsStream";
@@ -477,60 +478,34 @@ function DraggableTraceChip({
 }
 
 export function App() {
-  const [navWidth, setNavWidth] = useState(() => {
-    try {
-      const raw = localStorage.getItem("ecui.navWidth");
-      const parsed = raw ? Number(raw) : NaN;
-      if (Number.isFinite(parsed)) {
-        return clampNavWidth(parsed, { min: NAV_MIN_WIDTH, max: NAV_MAX_WIDTH });
-      }
-    } catch {
-      // ignore storage errors
-    }
-    return clampNavWidth(DEFAULT_NAV_WIDTH, {
-      min: NAV_MIN_WIDTH,
-      max: NAV_MAX_WIDTH,
-    });
-  });
-  const [isDevicePanelCollapsed, setIsDevicePanelCollapsed] = useState(() => {
-    try {
-      const raw = localStorage.getItem("ecui.devicePanelCollapsed");
-      return raw === "1" || raw === "true";
-    } catch {
-      // ignore storage errors
-    }
-    return false;
-  });
-  const [devicePanelTab, setDevicePanelTab] = useState<"devices" | "deck">(() => {
-    try {
-      const raw = String(localStorage.getItem("ecui.devicePanelTab") ?? "").trim();
-      return raw === "deck" ? "deck" : "devices";
-    } catch {
-      // ignore storage errors
-    }
-    return "devices";
-  });
-  const [plotWorkspaceColumns, setPlotWorkspaceColumns] =
-    useState<PlotWorkspaceColumnsSetting>(() => {
-      try {
-        return normalizePlotWorkspaceColumnsSetting(
-          localStorage.getItem("ecui.plotWorkspaceColumns")
-        );
-      } catch {
-        return "auto";
-      }
-    });
-  const [plotWorkspaceOptionsOpen, setPlotWorkspaceOptionsOpen] = useState(false);
-  const [viewportWidth, setViewportWidth] = useState(() => {
-    if (typeof window === "undefined") {
-      return 1200;
-    }
-    return window.innerWidth;
-  });
-  const resizeRef = useRef<{ startX: number; startWidth: number } | null>(null);
-  const [isResizing, setIsResizing] = useState(false);
-  const resizePendingWidthRef = useRef<number | null>(null);
-  const resizeRafRef = useRef<number | null>(null);
+  // Layout / viewport / sidebar-resize state moved to LayoutContext
+  // (features/layout/LayoutContext.tsx). Resize event handlers and the
+  // window-resize listener stay in App.tsx for now — they're tied to
+  // DOM events that are easier to manage where the rest of App lives
+  // until the layout shell (header / sidebar / grids) extracts.
+  const {
+    navWidth,
+    setNavWidth,
+    isResizing,
+    setIsResizing,
+    resizeRef,
+    resizePendingWidthRef,
+    resizeRafRef,
+    isDevicePanelCollapsed,
+    setIsDevicePanelCollapsed,
+    devicePanelTab,
+    setDevicePanelTab,
+    plotWorkspaceColumns,
+    setPlotWorkspaceColumns,
+    plotWorkspaceOptionsOpen,
+    setPlotWorkspaceOptionsOpen,
+    viewportWidth,
+    setViewportWidth,
+    isNarrowPlotViewport,
+    plotGridStyle,
+    plotGridRef,
+    dragColumnsRef,
+  } = useLayout();
   const initialPlotState = useMemo(() => {
     try {
       const raw = localStorage.getItem("ecui.plotState");
@@ -727,11 +702,7 @@ export function App() {
     commandDeckIdRef,
   } = useCommands();
   // deviceGridRef now provided by DevicesContext.
-  const plotGridRef = useRef<HTMLDivElement | null>(null);
-  const dragColumnsRef = useRef<{ device: number; panel: number }>({
-    device: 1,
-    panel: 1,
-  });
+  // plotGridRef + dragColumnsRef now provided by LayoutContext.
   // pinnedParamDrafts + pinnedBusyByKey now provided by CommandsContext
   // (destructured above).
   // logSeenRef + logScrollRef + logRowsBaselineReadyRef +
@@ -768,18 +739,8 @@ export function App() {
   const streamAnalysisReadyRef = useRef(false);
   const rawSnapshotHydratedRef = useRef<Set<string>>(new Set());
   const workspaceSnapshotHydratedRef = useRef<Set<string>>(new Set());
-  const isNarrowPlotViewport = viewportWidth <= PLOT_GRID_MOBILE_BREAKPOINT;
-  const plotGridStyle = useMemo<CSSProperties | undefined>(() => {
-    if (isNarrowPlotViewport) {
-      return { gridTemplateColumns: "1fr" };
-    }
-    if (plotWorkspaceColumns === "auto") {
-      return undefined;
-    }
-    return {
-      gridTemplateColumns: `repeat(${plotWorkspaceColumns}, minmax(0, 1fr))`,
-    };
-  }, [isNarrowPlotViewport, plotWorkspaceColumns]);
+  // isNarrowPlotViewport + plotGridStyle now provided by LayoutContext
+  // (destructured at the top of App()).
   const dndSensors = useSensors(
     useSensor(PointerSensor, {
       activationConstraint: { distance: 6 },
