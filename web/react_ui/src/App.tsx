@@ -67,7 +67,6 @@ import {
   callDevice,
   buildWsUrl,
   cleanupInstanceOrphans,
-  fetchDefaultUiProfile,
   fetchLogTail,
   fetchCapabilities,
   fetchDevices,
@@ -138,7 +137,6 @@ import type {
   PinnedParamDrafts,
   PlotState,
   PlotWorkspaceColumnsSetting,
-  UiProfileFile,
   UiProfileState,
 } from "./features/profile/types";
 import {
@@ -146,9 +144,7 @@ import {
   normalizeCommandDeck,
   normalizePinnedCommands,
   normalizePlotWorkspaceColumnsSetting,
-  normalizeUiProfile,
 } from "./features/profile/utils";
-import { normalizePlotState, serializePlotState } from "./features/profile/plot_state";
 import { useInterlocksController } from "./features/interlocks/useInterlocksController";
 import { useWatchdogsController } from "./features/watchdogs/useWatchdogsController";
 import { useStateMachinesController } from "./features/state_machines/useStateMachinesController";
@@ -206,6 +202,7 @@ import {
 } from "./features/panels/applyToPanels";
 import { useSettings } from "./features/runtime/SettingsContext";
 import { useRuntimeRefreshers } from "./features/runtime/useRuntimeRefreshers";
+import { useUiProfile } from "./features/runtime/useUiProfile";
 import { useLogsStream } from "./features/logs/useLogsStream";
 import type {
   PanelKind,
@@ -270,7 +267,6 @@ import {
   isTelemetryPanel,
   normalizeAutoRange,
   streamScalarTrace,
-  workspaceFromLegacyPanel,
 } from "./features/stream/panel_helpers";
 import {
   dagOutputKindColor,
@@ -1105,254 +1101,8 @@ export function App() {
     void refreshInstanceRuntime();
   }, []);
 
-  const exportUiProfile = () => {
-    try {
-      const serializedPlotState = serializePlotState({ panels, activePanelId });
-      const profile: UiProfileFile = {
-        kind: "experiment-control-ui-profile",
-        version: 1,
-        exported_at: new Date().toISOString(),
-        layout: {
-          nav_width: navWidth,
-          device_panel_collapsed: isDevicePanelCollapsed,
-          device_panel_tab: devicePanelTab,
-          plot_workspace_columns: plotWorkspaceColumns,
-          device_order: [...deviceOrder],
-          telemetry_collapsed_by_device: { ...telemetryCollapsedByDevice },
-        },
-        plots: {
-          plot_state: serializedPlotState,
-        },
-        commands: {
-          pinned_commands: { ...pinnedCommands },
-          command_deck: [...commandDeck],
-          command_deck_collapsed_by_group: { ...commandDeckCollapsedByGroup },
-        },
-        analysis: {
-          stream_workspaces: { ...streamWorkspaces },
-        },
-      };
-      const text = JSON.stringify(profile, null, 2);
-      const now = new Date();
-      const stamp = `${now.getFullYear()}_${String(
-        now.getMonth() + 1
-      ).padStart(2, "0")}_${String(now.getDate()).padStart(2, "0")}-${String(
-        now.getHours()
-      ).padStart(2, "0")}_${String(now.getMinutes()).padStart(
-        2,
-        "0"
-      )}_${String(now.getSeconds()).padStart(2, "0")}`;
-      const filename = `ec_ui_profile_${stamp}.json`;
-      const blob = new Blob([text], { type: "application/json" });
-      const url = URL.createObjectURL(blob);
-      const link = document.createElement("a");
-      link.href = url;
-      link.download = filename;
-      document.body.appendChild(link);
-      link.click();
-      link.remove();
-      URL.revokeObjectURL(url);
-      notifications.show({
-        color: "teal",
-        title: "UI profile exported",
-        message: filename,
-      });
-    } catch (error) {
-      notifications.show({
-        color: "red",
-        title: "Export failed",
-        message: error instanceof Error ? error.message : String(error),
-      });
-    }
-  };
-
-  const applyUiProfileRaw = async (
-    raw: unknown,
-    opts: { sourceLabel: string; syncSource: string },
-  ): Promise<void> => {
-    const { sourceLabel, syncSource } = opts;
-    const profile = normalizeUiProfile(raw, {
-      defaultNavWidth: DEFAULT_NAV_WIDTH,
-      navMin: NAV_MIN_WIDTH,
-      navMax: NAV_MAX_WIDTH,
-      normalizePlotState,
-      normalizeStreamWorkspaceRecord,
-    });
-    if (!profile) {
-      throw new Error("Invalid UI profile format.");
-    }
-    panelIdRef.current = profile.plotState.nextPanelId;
-    setNavWidth(profile.navWidth);
-    setDevicePanelCollapsed(profile.devicePanelCollapsed);
-    setDevicePanelTab(profile.devicePanelTab);
-    setPlotWorkspaceColumns(profile.plotWorkspaceColumns);
-    setPanels(profile.plotState.panels);
-    setActivePanelId(profile.plotState.activePanelId);
-    setDeviceOrder(profile.deviceOrder);
-    setTelemetryCollapsedByDevice(profile.telemetryCollapsedByDevice);
-    setPinnedCommands(profile.pinnedCommands);
-    setCommandDeck(profile.commandDeck);
-    setCommandDeckCollapsedByGroup(profile.commandDeckCollapsedByGroup);
-    {
-      const migratedFromPanels: Record<string, StreamAnalysisWorkspaceConfig> = {};
-      for (const panel of profile.plotState.panels) {
-        if (!isStreamScalarPanel(panel) && !isStreamBinStatsPanel(panel)) {
-          continue;
-        }
-        const workspaceId = String(panel.workspaceId ?? "").trim();
-        if (!workspaceId || migratedFromPanels[workspaceId]) {
-          continue;
-        }
-        migratedFromPanels[workspaceId] = workspaceFromLegacyPanel(panel);
-      }
-      const importedWorkspaces =
-        Object.keys(profile.streamWorkspaces).length > 0
-          ? profile.streamWorkspaces
-          : Object.keys(migratedFromPanels).length > 0
-          ? migratedFromPanels
-          : streamWorkspacesRef.current;
-      setStreamWorkspaces(importedWorkspaces);
-      streamWorkspacesRef.current = importedWorkspaces;
-      setStreamWorkspaceRevisions({});
-      streamWorkspaceRevisionsRef.current = {};
-      streamWorkspaceIdRef.current = nextWorkspaceCounter(importedWorkspaces);
-      const firstWorkspaceId = Object.keys(importedWorkspaces).sort()[0] ?? null;
-      setDaqWorkspaceId(firstWorkspaceId);
-      if (streamAnalysisReadyRef.current) {
-        for (const workspaceId of Object.keys(importedWorkspaces)) {
-          await syncStreamAnalysisWorkspace(workspaceId, syncSource);
-        }
-        await loadStreamAnalysisWorkspaces(syncSource, {
-          notifyOnError: false,
-        });
-      }
-    }
-    notifications.show({
-      color: "teal",
-      title: "UI profile loaded",
-      message: sourceLabel,
-    });
-  };
-
-  const importUiProfile = async (event: ChangeEvent<HTMLInputElement>) => {
-    const file = event.currentTarget.files?.[0];
-    event.currentTarget.value = "";
-    if (!file) {
-      return;
-    }
-    try {
-      const rawText = await file.text();
-      const raw = JSON.parse(rawText);
-      await applyUiProfileRaw(raw, {
-        sourceLabel: file.name,
-        syncSource: "ui-profile-import",
-      });
-    } catch (error) {
-      notifications.show({
-        color: "red",
-        title: "Import failed",
-        message: error instanceof Error ? error.message : String(error),
-      });
-    }
-  };
-
-  const [defaultProfileAvailable, setDefaultProfileAvailable] = useState(false);
-  const [defaultProfileLoading, setDefaultProfileLoading] = useState(false);
-  const defaultProfileCheckedRef = useRef(false);
-
-  const loadDefaultUiProfile = async (): Promise<boolean> => {
-    setDefaultProfileLoading(true);
-    try {
-      const result = await fetchDefaultUiProfile();
-      if (!result.ok) {
-        if (result.status === 404) {
-          setDefaultProfileAvailable(false);
-          notifications.show({
-            color: "yellow",
-            title: "No default profile",
-            message:
-              "This instance does not provide a default UI profile.",
-          });
-          return false;
-        }
-        notifications.show({
-          color: "red",
-          title: "Default profile load failed",
-          message: result.error,
-        });
-        return false;
-      }
-      await applyUiProfileRaw(result.raw, {
-        sourceLabel: "instance default",
-        syncSource: "ui-profile-default",
-      });
-      return true;
-    } catch (error) {
-      notifications.show({
-        color: "red",
-        title: "Default profile load failed",
-        message: error instanceof Error ? error.message : String(error),
-      });
-      return false;
-    } finally {
-      setDefaultProfileLoading(false);
-    }
-  };
-
-  useEffect(() => {
-    if (defaultProfileCheckedRef.current) {
-      return;
-    }
-    defaultProfileCheckedRef.current = true;
-    let alive = true;
-    void (async () => {
-      const result = await fetchDefaultUiProfile();
-      if (!alive) {
-        return;
-      }
-      if (!result.ok) {
-        setDefaultProfileAvailable(false);
-        return;
-      }
-      setDefaultProfileAvailable(true);
-      const customizationKeys = [
-        "ecui.commandDeck",
-        "ecui.commandDeck.collapsedByGroup",
-        "ecui.plotState",
-        "ecui.pinnedCommands",
-        "ecui.streamWorkspaces",
-        "ecui.deviceOrder",
-        "ecui.telemetryCollapsedByDevice",
-      ];
-      const hasCustomization = customizationKeys.some((key) => {
-        const raw = localStorage.getItem(key);
-        if (raw === null) {
-          return false;
-        }
-        const trimmed = raw.trim();
-        if (!trimmed) {
-          return false;
-        }
-        if (trimmed === "{}" || trimmed === "[]") {
-          return false;
-        }
-        return true;
-      });
-      if (hasCustomization) {
-        return;
-      }
-      notifications.show({
-        color: "blue",
-        title: "Instance default UI profile available",
-        message:
-          "Open Settings → Load instance defaults to populate the command deck and plot workspaces.",
-        autoClose: 8000,
-      });
-    })();
-    return () => {
-      alive = false;
-    };
-  }, []);
+  // UI profile import/export is wired below — see the useUiProfile
+  // call after setDevicePanelCollapsed is defined (round 29).
 
   const appendLogEntries = (entries: LogEntry[]) => {
     if (entries.length === 0) {
@@ -3952,6 +3702,22 @@ export function App() {
   const expandDevicePanel = () => {
     setDevicePanelCollapsed(false);
   };
+
+  // UI profile import/export (round 29). See
+  // features/runtime/useUiProfile.ts. Wired here (rather than near the
+  // other refresh helpers) because applyUiProfileRaw needs the
+  // App-local setDevicePanelCollapsed wrapper that lives just above.
+  const {
+    exportUiProfile,
+    importUiProfile,
+    loadDefaultUiProfile,
+    defaultProfileAvailable,
+    defaultProfileLoading,
+  } = useUiProfile({
+    syncStreamAnalysisWorkspace,
+    loadStreamAnalysisWorkspaces,
+    setDevicePanelCollapsed,
+  });
 
   const yAxisDraftMinNum = parseNumberInput(yAxisDraftMin);
   const yAxisDraftMaxNum = parseNumberInput(yAxisDraftMax);
