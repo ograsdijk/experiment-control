@@ -1,5 +1,3 @@
-import type { Dispatch, SetStateAction } from "react";
-
 import type { LatestSignals } from "../telemetry/useTelemetryStream";
 import {
   isStreamScalarPanel,
@@ -72,30 +70,22 @@ const DEFAULT_WINDOW_S = 60;
  *
  * - `latestByDevice` — `useTelemetryStream` return value used by
  *   `addTraceToPanel` to seed units + valueKind on a new trace.
- * - `editingPanelId` / `setEditingPanelId` / `setPanelTitleDraft` —
- *   App's inline editor state; `removePanel` clears these if the
- *   removed panel was being edited.
  * - `closePlotOptions` — comes from `usePanelAutoRangeHandlers`;
  *   `removePanel` calls it if the plot-options modal was open on the
  *   removed panel.
+ *
+ * The panel-title editor state (`editingPanelId`, `panelTitleDraft`)
+ * is read from `PanelsContext` so `removePanel` can clear it when its
+ * target panel disappears.
  */
 
 export interface PanelLifecycleArgs {
   latestByDevice: LatestSignals;
-  editingPanelId: string | null;
-  setEditingPanelId: Dispatch<SetStateAction<string | null>>;
-  setPanelTitleDraft: Dispatch<SetStateAction<string>>;
   closePlotOptions: () => void;
 }
 
 export function usePanelLifecycle(args: PanelLifecycleArgs) {
-  const {
-    latestByDevice,
-    editingPanelId,
-    setEditingPanelId,
-    setPanelTitleDraft,
-    closePlotOptions,
-  } = args;
+  const { latestByDevice, closePlotOptions } = args;
   const {
     panels,
     setPanels,
@@ -114,6 +104,9 @@ export function usePanelLifecycle(args: PanelLifecycleArgs) {
     setStreamBin2dOptionsPanelId,
     streamParamsOptionsPanelId,
     setStreamParamsOptionsPanelId,
+    editingPanelId,
+    setEditingPanelId,
+    setPanelTitleDraft,
   } = usePanels();
   const {
     streamWorkspacesRef,

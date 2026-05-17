@@ -188,6 +188,7 @@ import { usePanelAutoRangeHandlers } from "./features/panels/usePanelAutoRangeHa
 import { useStreamPanelHandlers } from "./features/panels/useStreamPanelHandlers";
 import { useStreamWorkspaceHandlers } from "./features/panels/useStreamWorkspaceHandlers";
 import { usePanelLifecycle } from "./features/panels/usePanelLifecycle";
+import { usePanelTitleEditor } from "./features/panels/usePanelTitleEditor";
 import {
   streamBinStatsFitOverlayCurves as streamBinStatsFitOverlayCurvesImpl,
   streamBinStatsOverlaySeries as streamBinStatsOverlaySeriesImpl,
@@ -636,6 +637,9 @@ export function App() {
     setYAxisDraftMax,
     yAxisAutoRange,
     setYAxisAutoRange,
+    editingPanelId,
+    panelTitleDraft,
+    setPanelTitleDraft,
   } = usePanels();
   const [streamWsConnected, setStreamWsConnected] = useState(false);
   const [streamAnalysisWsConnected, setStreamAnalysisWsConnected] =
@@ -697,8 +701,10 @@ export function App() {
   } = useLogs();
   const [streamCatalog, setStreamCatalog] = useState<StreamCatalogEntry[]>([]);
   const [activeUiDrag, setActiveUiDrag] = useState<UiDragData | null>(null);
-  const [editingPanelId, setEditingPanelId] = useState<string | null>(null);
-  const [panelTitleDraft, setPanelTitleDraft] = useState("");
+  // editingPanelId + panelTitleDraft moved to PanelsContext (round 20).
+  // Pulled out alongside usePanelTitleEditor's 3 handlers so
+  // usePanelLifecycle's removePanel can clear the editor via context
+  // rather than taking the setters as args.
   // deviceOrder + telemetryCollapsedByDevice now provided by
   // DevicesContext (destructured at the top of the function).
   // Pinned commands + command deck state moved to CommandsContext
@@ -4193,9 +4199,6 @@ export function App() {
     setPanelTimeWindow,
   } = usePanelLifecycle({
     latestByDevice,
-    editingPanelId,
-    setEditingPanelId,
-    setPanelTitleDraft,
     closePlotOptions,
   });
 
@@ -4945,32 +4948,14 @@ export function App() {
     }
   };
 
-  const startPanelTitleEdit = (panel: PlotPanelState) => {
-    setEditingPanelId(panel.id);
-    setPanelTitleDraft(panel.title);
-  };
-
-  const cancelPanelTitleEdit = () => {
-    setEditingPanelId(null);
-    setPanelTitleDraft("");
-  };
-
-  const commitPanelTitleEdit = () => {
-    if (!editingPanelId) {
-      return;
-    }
-    const panelId = editingPanelId;
-    const trimmed = panelTitleDraft.trim();
-    setPanels((prev) =>
-      prev.map((panel) =>
-        panel.id === panelId
-          ? { ...panel, title: trimmed.length > 0 ? trimmed : panel.id }
-          : panel
-      )
-    );
-    setEditingPanelId(null);
-    setPanelTitleDraft("");
-  };
+  // Panel title editor (round 20). See features/panels/usePanelTitleEditor.ts.
+  // The editor state itself (editingPanelId, panelTitleDraft) lives in
+  // PanelsContext so usePanelLifecycle's removePanel can clear it.
+  const {
+    startPanelTitleEdit,
+    cancelPanelTitleEdit,
+    commitPanelTitleEdit,
+  } = usePanelTitleEditor();
 
   const onPlotSignal = useCallback(
     (deviceId: string, signal: string) => {
