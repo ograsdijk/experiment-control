@@ -36,6 +36,7 @@ import {
   panelCapacity as panelCapacityImpl,
 } from "./applyToPanels";
 import { usePanels } from "./PanelsContext";
+import { usePlotTick } from "./PlotTickContext";
 
 const DEFAULT_WINDOW_S = 60;
 
@@ -91,9 +92,7 @@ export function usePanelLifecycle(args: PanelLifecycleArgs) {
     setPanels,
     activePanelId,
     setActivePanelId,
-    panelIdRef,
-    setPlotTick,
-    plotOptionsPanelId,
+    panelIdRef,    plotOptionsPanelId,
     expandedPlotPanelId,
     setExpandedPlotPanelId,
     streamTraceOptionsPanelId,
@@ -108,6 +107,7 @@ export function usePanelLifecycle(args: PanelLifecycleArgs) {
     setEditingPanelId,
     setPanelTitleDraft,
   } = usePanels();
+  const { setPlotTick } = usePlotTick();
   const {
     streamWorkspacesRef,
     streamWorkspaceIdRef,

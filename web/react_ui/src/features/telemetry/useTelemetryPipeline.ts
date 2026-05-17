@@ -5,6 +5,7 @@ import { isTelemetryPanel } from "../stream/panel_helpers";
 import type { TelemetryMessage } from "../../types";
 import { usePanels } from "../panels/PanelsContext";
 import { useTelemetry } from "./TelemetryContext";
+import { usePlotTick } from "../panels/PlotTickContext";
 import {
   useTelemetryStream,
   type LatestSignals,
@@ -44,7 +45,8 @@ export function useTelemetryPipeline(): {
   telemetryActive: boolean;
 } {
   const { buffersRef, panelBuffersByTraceKey } = useTelemetry();
-  const { setPanels, setPlotTick } = usePanels();
+  const { setPanels } = usePanels();
+  const { setPlotTick } = usePlotTick();
 
   const handleTelemetryHydrate = useCallback(
     (snapshot: LatestSignals) => {

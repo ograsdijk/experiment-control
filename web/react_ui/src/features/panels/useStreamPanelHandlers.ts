@@ -28,6 +28,7 @@ import {
 import { useStreamAnalysis } from "../stream_analysis/StreamAnalysisContext";
 import { useTelemetry } from "../telemetry/TelemetryContext";
 import { usePanels } from "./PanelsContext";
+import { usePlotTick } from "./PlotTickContext";
 
 /**
  * Per-panel stream-trace config setters + the buffer-clear utilities.
@@ -70,7 +71,8 @@ export interface StreamPanelHandlersArgs {
 
 export function useStreamPanelHandlers(args: StreamPanelHandlersArgs) {
   const { streamCatalogByKey, streamAnalysisReadyRef } = args;
-  const { panels, setPanels, panelsRef, setPlotTick } = usePanels();
+  const { panels, setPanels, panelsRef } = usePanels();
+  const { setPlotTick } = usePlotTick();
   const { streamWorkspacesRef } = useStreamAnalysis();
   const {
     buffersRef,

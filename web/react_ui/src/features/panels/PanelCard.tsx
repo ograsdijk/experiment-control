@@ -64,6 +64,7 @@ import { useStreamAnalysis } from "../stream_analysis/StreamAnalysisContext";
 import { useTelemetry } from "../telemetry/TelemetryContext";
 import { colorWithAlpha, traceColorAt } from "../../utils/traceColors";
 import { usePanels } from "./PanelsContext";
+import { usePlotTick } from "./PlotTickContext";
 import type {
   PanelsGridHandlers,
   PanelsGridHelpers,
@@ -141,10 +142,8 @@ function PanelCardImpl({
     yAxisDraftMax,
     setYAxisDraftMin,
     setYAxisDraftMax,
-    yAxisAutoRange,
-    plotTick,
-    setPlotTick,
-  } = usePanels();
+    yAxisAutoRange,  } = usePanels();
+  const { plotTick, setPlotTick } = usePlotTick();
   const {
     buffersRef,
     streamFramesRef,
