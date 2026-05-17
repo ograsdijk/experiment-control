@@ -222,25 +222,30 @@ export function applyRawStreamFrameToPanels(
     if (normalizeTraceAverageMode(panel.averageMode) !== subscription.averageMode) {
       continue;
     }
-    const currentFrames = deps.streamFramesRef.get(panel.id) ?? [];
+    let currentFrames = deps.streamFramesRef.get(panel.id);
+    if (!currentFrames) {
+      currentFrames = [];
+      deps.streamFramesRef.set(panel.id, currentFrames);
+    }
     if (
       currentFrames.length > 0 &&
       currentFrames[currentFrames.length - 1].seq === frame.seq
     ) {
       continue;
     }
-    const appended = [
-      ...currentFrames,
-      {
-        seq: frame.seq,
-        shape: frame.shape,
-        values: frame.values,
-      },
-    ];
+    // PerfD: mutate the frames array in place to avoid the spread+
+    // slice double-allocation per WS message. Consumers re-render via
+    // plotTick anyway; their useMemos re-fire on tick changes, not on
+    // frames-array identity.
+    currentFrames.push({
+      seq: frame.seq,
+      shape: frame.shape,
+      values: frame.values,
+    });
     const keep = Math.max(MAX_STREAM_FRAME_BUFFER, panel.overlayCount * 4);
-    const nextFrames =
-      appended.length > keep ? appended.slice(appended.length - keep) : appended;
-    deps.streamFramesRef.set(panel.id, nextFrames);
+    if (currentFrames.length > keep) {
+      currentFrames.splice(0, currentFrames.length - keep);
+    }
     updated = true;
   }
   return updated;
@@ -418,7 +423,11 @@ export function applyStreamAnalysisOutputToPanels(
           updated = true;
           continue;
         }
-        const currentFrames = deps.streamFramesRef.get(panel.id) ?? [];
+        let currentFrames = deps.streamFramesRef.get(panel.id);
+        if (!currentFrames) {
+          currentFrames = [];
+          deps.streamFramesRef.set(panel.id, currentFrames);
+        }
         const seq =
           output.seq ??
           (currentFrames.length > 0
@@ -430,20 +439,16 @@ export function applyStreamAnalysisOutputToPanels(
         ) {
           continue;
         }
-        const appended = [
-          ...currentFrames,
-          {
-            seq,
-            shape: [values.length],
-            values,
-          },
-        ];
+        // PerfD: in-place mutation (see raw-stream apply for rationale).
+        currentFrames.push({
+          seq,
+          shape: [values.length],
+          values,
+        });
         const keep = Math.max(MAX_STREAM_FRAME_BUFFER, panel.overlayCount * 4);
-        const nextFrames =
-          appended.length > keep
-            ? appended.slice(appended.length - keep)
-            : appended;
-        deps.streamFramesRef.set(panel.id, nextFrames);
+        if (currentFrames.length > keep) {
+          currentFrames.splice(0, currentFrames.length - keep);
+        }
         updated = true;
       }
     }
