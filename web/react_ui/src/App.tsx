@@ -182,6 +182,7 @@ import { useCommands } from "./features/commands/CommandsContext";
 import { useLayout } from "./features/layout/LayoutContext";
 import { useLogs } from "./features/logs/LogsContext";
 import { usePanels } from "./features/panels/PanelsContext";
+import { usePanelDerivations } from "./features/panels/usePanelDerivations";
 import { useSettings } from "./features/runtime/SettingsContext";
 import { useLogsStream } from "./features/logs/useLogsStream";
 import type {
@@ -903,119 +904,33 @@ export function App() {
       ),
     [daqDraftNodes]
   );
-  const expandedPlotPanel = useMemo(
-    () => panels.find((panel) => panel.id === expandedPlotPanelId) ?? null,
-    [expandedPlotPanelId, panels]
-  );
-  const streamTraceOptionsPanel = useMemo(() => {
-    const panel = panels.find((entry) => entry.id === streamTraceOptionsPanelId) ?? null;
-    if (!panel || !isStreamTracePanel(panel)) {
-      return null;
-    }
-    return panel;
-  }, [panels, streamTraceOptionsPanelId]);
-  const streamTraceOptionsWorkspace = useMemo(() => {
-    if (!streamTraceOptionsPanel || streamTraceOptionsPanel.sourceMode !== "dag") {
-      return null;
-    }
-    return streamWorkspaces[streamTraceOptionsPanel.workspaceId] ?? null;
-  }, [streamTraceOptionsPanel, streamWorkspaces]);
-  const streamTraceOptionsTraceOutputOptions = useMemo(() => {
-    return workspaceOutputOptionsByKind(streamTraceOptionsWorkspace, "trace");
-  }, [streamTraceOptionsWorkspace]);
-  const streamTraceOptionsOverlayOutputOptions = useMemo(() => {
-    const selectedPrimary = String(streamTraceOptionsPanel?.outputId ?? "").trim();
-    return streamTraceOptionsTraceOutputOptions.filter(
-      (option) => option.value !== selectedPrimary
-    );
-  }, [streamTraceOptionsTraceOutputOptions, streamTraceOptionsPanel?.outputId]);
-  const streamBinStatsOptionsPanel = useMemo(() => {
-    const panel = panels.find((entry) => entry.id === streamBinStatsOptionsPanelId) ?? null;
-    if (!panel || !isStreamBinStatsPanel(panel)) {
-      return null;
-    }
-    return panel;
-  }, [panels, streamBinStatsOptionsPanelId]);
-  const streamBinStatsOptionsWorkspace = useMemo(() => {
-    if (!streamBinStatsOptionsPanel) {
-      return null;
-    }
-    return streamWorkspaces[streamBinStatsOptionsPanel.workspaceId] ?? null;
-  }, [streamBinStatsOptionsPanel, streamWorkspaces]);
-  const streamBinStatsOptionsOutputOptions = useMemo(() => {
-    return workspaceOutputOptionsByKind(streamBinStatsOptionsWorkspace, "hist_agg");
-  }, [streamBinStatsOptionsWorkspace]);
-  const streamBinStatsOptionsTraceOverlayOptions = useMemo(() => {
-    return workspaceOutputOptionsByKind(streamBinStatsOptionsWorkspace, "trace");
-  }, [streamBinStatsOptionsWorkspace]);
-  const streamBinStatsOptionsFitOverlayOptions = useMemo(() => {
-    return workspaceOutputOptionsByKind(streamBinStatsOptionsWorkspace, "fit_1d");
-  }, [streamBinStatsOptionsWorkspace]);
-  const streamBinStatsOptionsXLabel = useMemo(() => {
-    return workspaceXAxisLabel(
-      streamBinStatsOptionsWorkspace,
-      streamBinStatsOptionsPanel?.outputId ?? null
-    );
-  }, [streamBinStatsOptionsWorkspace, streamBinStatsOptionsPanel?.outputId]);
-  const streamParamsOptionsPanel = useMemo(() => {
-    const panel = panels.find((entry) => entry.id === streamParamsOptionsPanelId) ?? null;
-    if (!panel || !isStreamParamsPanel(panel)) {
-      return null;
-    }
-    return panel;
-  }, [panels, streamParamsOptionsPanelId]);
-  const streamParamsOptionsWorkspace = useMemo(() => {
-    if (!streamParamsOptionsPanel) {
-      return null;
-    }
-    return streamWorkspaces[streamParamsOptionsPanel.workspaceId] ?? null;
-  }, [streamParamsOptionsPanel, streamWorkspaces]);
-  const streamParamsOutputOptions = useMemo(() => {
-    const scalar = workspaceOutputOptionsByKind(streamParamsOptionsWorkspace, "scalar").map(
-      (item) => ({
-        value: item.value,
-        label: `[scalar] ${item.label}`,
-      })
-    );
-    const paramsMap = workspaceOutputOptionsByKind(
-      streamParamsOptionsWorkspace,
-      "params_map"
-    ).map((item) => ({
-      value: item.value,
-      label: `[fit params] ${item.label}`,
-    }));
-    return [...scalar, ...paramsMap];
-  }, [streamParamsOptionsWorkspace]);
-  const streamBin2dOptionsPanel = useMemo(() => {
-    const panel = panels.find((entry) => entry.id === streamBin2dOptionsPanelId) ?? null;
-    if (!panel || !isStreamBin2dPanel(panel)) {
-      return null;
-    }
-    return panel;
-  }, [panels, streamBin2dOptionsPanelId]);
-  const streamBin2dOptionsWorkspace = useMemo(() => {
-    if (!streamBin2dOptionsPanel) {
-      return null;
-    }
-    return streamWorkspaces[streamBin2dOptionsPanel.workspaceId] ?? null;
-  }, [streamBin2dOptionsPanel, streamWorkspaces]);
-  const streamBin2dOptionsOutputOptions = useMemo(() => {
-    return workspaceOutputOptionsByKind(streamBin2dOptionsWorkspace, "hist2d");
-  }, [streamBin2dOptionsWorkspace]);
-  const streamBin2dOptionsXLabel = useMemo(() => {
-    return workspaceBin2dAxisLabel(
-      streamBin2dOptionsWorkspace,
-      streamBin2dOptionsPanel?.outputId ?? null,
-      "x"
-    );
-  }, [streamBin2dOptionsWorkspace, streamBin2dOptionsPanel?.outputId]);
-  const streamBin2dOptionsYLabel = useMemo(() => {
-    return workspaceBin2dAxisLabel(
-      streamBin2dOptionsWorkspace,
-      streamBin2dOptionsPanel?.outputId ?? null,
-      "y"
-    );
-  }, [streamBin2dOptionsWorkspace, streamBin2dOptionsPanel?.outputId]);
+  // The 18-entry modal-resolution memo tree + the two subscription
+  // derivations all live in usePanelDerivations() (round-13 extraction
+  // — features/panels/usePanelDerivations.ts). Same names so existing
+  // call sites in App.tsx don't need touch-ups.
+  const {
+    expandedPlotPanel,
+    streamTraceOptionsPanel,
+    streamTraceOptionsWorkspace,
+    streamTraceOptionsTraceOutputOptions,
+    streamTraceOptionsOverlayOutputOptions,
+    streamBinStatsOptionsPanel,
+    streamBinStatsOptionsWorkspace,
+    streamBinStatsOptionsOutputOptions,
+    streamBinStatsOptionsTraceOverlayOptions,
+    streamBinStatsOptionsFitOverlayOptions,
+    streamBinStatsOptionsXLabel,
+    streamParamsOptionsPanel,
+    streamParamsOptionsWorkspace,
+    streamParamsOutputOptions,
+    streamBin2dOptionsPanel,
+    streamBin2dOptionsWorkspace,
+    streamBin2dOptionsOutputOptions,
+    streamBin2dOptionsXLabel,
+    streamBin2dOptionsYLabel,
+    activeRawStreamSubscriptions,
+    activeStreamAnalysisWorkspaceSubscriptions,
+  } = usePanelDerivations();
   const hdfWriterProcess = useMemo(
     () => processes.find(isHdfWriterProcess) ?? null,
     [processes]
@@ -1040,204 +955,8 @@ export function App() {
   const streamAnalysisRpcReady =
     String(streamAnalysisProcess?.state ?? "").toUpperCase() === "RUNNING";
   const showDaqUi = streamAnalysisRpcReady;
-  const activeRawStreamSubscriptions = useMemo<RawStreamSubscription[]>(() => {
-    const out = new Map<string, RawStreamSubscription>();
-    for (const panel of panels) {
-      if (!isStreamTracePanel(panel) || panel.sourceMode !== "raw" || panel.stream === null) {
-        continue;
-      }
-      const traceDecimator = normalizeTraceDecimator(panel.traceDecimator);
-      const traceMaxPoints = normalizeTraceMaxPoints(panel.traceMaxPoints);
-      const traceMaxFps = normalizeTraceMaxFps(panel.traceMaxFps);
-      const rollingWindow = normalizeTraceRollingWindow(panel.rollingWindow);
-      const averageMode = normalizeTraceAverageMode(panel.averageMode);
-      const key = [
-        panel.stream.deviceId,
-        panel.stream.stream,
-        String(panel.channelIndex),
-        traceDecimator,
-        String(traceMaxPoints),
-        traceMaxFps.toFixed(3),
-        String(rollingWindow),
-        averageMode,
-      ].join("|");
-      out.set(key, {
-        deviceId: panel.stream.deviceId,
-        stream: panel.stream.stream,
-        channelIndex: panel.channelIndex,
-        traceDecimator,
-        traceMaxPoints,
-        traceMaxFps,
-        rollingWindow,
-        averageMode,
-      });
-    }
-    return [...out.values()].sort((a, b) => {
-      if (a.deviceId !== b.deviceId) {
-        return a.deviceId.localeCompare(b.deviceId);
-      }
-      if (a.stream !== b.stream) {
-        return a.stream.localeCompare(b.stream);
-      }
-      if (a.channelIndex !== b.channelIndex) {
-        return a.channelIndex - b.channelIndex;
-      }
-      if (a.traceDecimator !== b.traceDecimator) {
-        return a.traceDecimator.localeCompare(b.traceDecimator);
-      }
-      if (a.traceMaxPoints !== b.traceMaxPoints) {
-        return a.traceMaxPoints - b.traceMaxPoints;
-      }
-      if (a.traceMaxFps !== b.traceMaxFps) {
-        return a.traceMaxFps - b.traceMaxFps;
-      }
-      if (a.rollingWindow !== b.rollingWindow) {
-        return a.rollingWindow - b.rollingWindow;
-      }
-      return a.averageMode.localeCompare(b.averageMode);
-    });
-  }, [panels]);
-  const activeStreamAnalysisWorkspaceSubscriptions = useMemo<
-    StreamAnalysisWorkspaceSubscription[]
-  >(() => {
-    const outputKindsByWorkspace = new Map<
-      string,
-      Set<"scalar" | "hist_agg" | "hist2d" | "params_map" | "fit_1d">
-    >();
-    const traceConfigsByWorkspace = new Map<
-      string,
-      Map<
-        string,
-        {
-          traceDecimator: StreamTraceDecimator;
-          traceMaxPoints: number;
-          traceMaxFps: number;
-          traceRollingWindow: number;
-          traceAverageMode: StreamTraceAverageMode;
-        }
-      >
-    >();
-    for (const panel of panels) {
-      const workspaceId = String(panel.workspaceId ?? "").trim();
-      if (!workspaceId) {
-        continue;
-      }
-      if (isStreamScalarPanel(panel)) {
-        const kinds = outputKindsByWorkspace.get(workspaceId) ?? new Set();
-        kinds.add("scalar");
-        outputKindsByWorkspace.set(workspaceId, kinds);
-        continue;
-      }
-      if (isStreamParamsPanel(panel)) {
-        const kinds = outputKindsByWorkspace.get(workspaceId) ?? new Set();
-        const workspace = streamWorkspaces[workspaceId] ?? null;
-        for (const outputId of panel.outputIds ?? []) {
-          const kind = workspaceOutputKind(workspace, outputId);
-          if (kind === "scalar" || kind === "params_map") {
-            kinds.add(kind);
-          }
-        }
-        outputKindsByWorkspace.set(workspaceId, kinds);
-        continue;
-      }
-      if (isStreamBinStatsPanel(panel)) {
-        const kinds = outputKindsByWorkspace.get(workspaceId) ?? new Set();
-        kinds.add("hist_agg");
-        if ((panel.fitOverlayOutputIds ?? []).length > 0) {
-          kinds.add("fit_1d");
-        }
-        outputKindsByWorkspace.set(workspaceId, kinds);
-        if ((panel.overlayOutputIds ?? []).length > 0) {
-          const configs = traceConfigsByWorkspace.get(workspaceId) ?? new Map();
-          const traceDecimator = DEFAULT_TRACE_DECIMATOR;
-          const traceMaxPoints = DEFAULT_TRACE_MAX_POINTS;
-          const traceMaxFps = DEFAULT_TRACE_MAX_FPS;
-          const traceRollingWindow = 1;
-          const traceAverageMode = DEFAULT_TRACE_AVERAGE_MODE;
-          const key = `${traceDecimator}|${traceMaxPoints}|${traceMaxFps.toFixed(3)}|${traceRollingWindow}|${traceAverageMode}`;
-          configs.set(key, {
-            traceDecimator,
-            traceMaxPoints,
-            traceMaxFps,
-            traceRollingWindow,
-            traceAverageMode,
-          });
-          traceConfigsByWorkspace.set(workspaceId, configs);
-        }
-        continue;
-      }
-      if (isStreamBin2dPanel(panel)) {
-        const kinds = outputKindsByWorkspace.get(workspaceId) ?? new Set();
-        kinds.add("hist2d");
-        outputKindsByWorkspace.set(workspaceId, kinds);
-        continue;
-      }
-      if (isStreamTracePanel(panel) && panel.sourceMode === "dag") {
-        const configs = traceConfigsByWorkspace.get(workspaceId) ?? new Map();
-        const traceDecimator = normalizeTraceDecimator(panel.traceDecimator);
-        const traceMaxPoints = normalizeTraceMaxPoints(panel.traceMaxPoints);
-        const traceMaxFps = normalizeTraceMaxFps(panel.traceMaxFps);
-        const traceRollingWindow = normalizeTraceRollingWindow(panel.rollingWindow);
-        const traceAverageMode = normalizeTraceAverageMode(panel.averageMode);
-        const key = `${traceDecimator}|${traceMaxPoints}|${traceMaxFps.toFixed(3)}|${traceRollingWindow}|${traceAverageMode}`;
-        configs.set(key, {
-          traceDecimator,
-          traceMaxPoints,
-          traceMaxFps,
-          traceRollingWindow,
-          traceAverageMode,
-        });
-        traceConfigsByWorkspace.set(workspaceId, configs);
-      }
-    }
-    const workspaceIds = new Set<string>([
-      ...outputKindsByWorkspace.keys(),
-      ...traceConfigsByWorkspace.keys(),
-    ]);
-    const out: StreamAnalysisWorkspaceSubscription[] = [];
-    for (const workspaceId of [...workspaceIds].sort()) {
-      const outputKinds = outputKindsByWorkspace.get(workspaceId);
-      if (outputKinds && outputKinds.size > 0) {
-        const kinds = [...outputKinds].sort() as Array<
-          "scalar" | "hist_agg" | "hist2d" | "params_map" | "fit_1d"
-        >;
-        out.push({
-          workspaceId,
-          kinds,
-        });
-      }
-      const traceConfigs = traceConfigsByWorkspace.get(workspaceId);
-      if (traceConfigs && traceConfigs.size > 0) {
-        const sortedConfigs = [...traceConfigs.values()].sort((a, b) => {
-          if (a.traceDecimator !== b.traceDecimator) {
-            return a.traceDecimator.localeCompare(b.traceDecimator);
-          }
-          if (a.traceMaxPoints !== b.traceMaxPoints) {
-            return a.traceMaxPoints - b.traceMaxPoints;
-          }
-          if (a.traceMaxFps !== b.traceMaxFps) {
-            return a.traceMaxFps - b.traceMaxFps;
-          }
-          if (a.traceRollingWindow !== b.traceRollingWindow) {
-            return a.traceRollingWindow - b.traceRollingWindow;
-          }
-          return a.traceAverageMode.localeCompare(b.traceAverageMode);
-        });
-        for (const cfg of sortedConfigs) {
-          out.push({
-            workspaceId,
-            kinds: ["trace"],
-            traceDecimator: cfg.traceDecimator,
-            traceMaxPoints: cfg.traceMaxPoints,
-            traceMaxFps: cfg.traceMaxFps,
-            traceRollingWindow: cfg.traceRollingWindow,
-            traceAverageMode: cfg.traceAverageMode,
-          });
-        }
-      }
-    }
-    return out;
-  }, [panels, streamWorkspaces]);
+  // activeRawStreamSubscriptions + activeStreamAnalysisWorkspaceSubscriptions
+  // now live in usePanelDerivations() (destructured above).
   // filteredLogRows now lives in LogsContext (destructured above).
   const resolvedApiBase = useMemo(() => {
     const configured = String(import.meta.env.VITE_API_BASE ?? "").trim();
