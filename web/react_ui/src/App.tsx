@@ -177,6 +177,10 @@ import { useProcessesController } from "./features/processes/useProcessesControl
 import { useTelemetryStream } from "./features/telemetry/useTelemetryStream";
 import { useTelemetry } from "./features/telemetry/TelemetryContext";
 import { useStreamAnalysis } from "./features/stream_analysis/StreamAnalysisContext";
+import { useDevicesContext } from "./features/devices/DevicesContext";
+import { useCommands } from "./features/commands/CommandsContext";
+import { useLogs } from "./features/logs/LogsContext";
+import { useSettings } from "./features/runtime/SettingsContext";
 import { useLogsStream } from "./features/logs/useLogsStream";
 import type {
   PanelKind,
@@ -557,7 +561,21 @@ export function App() {
       };
     }
   }, []);
-  const [devices, setDevices] = useState<DeviceStatus[]>([]);
+  // Device roster + ordering + per-device UI collapse state moved to
+  // DevicesContext (features/devices/DevicesContext.tsx). The names below
+  // are kept identical so the existing call sites in App.tsx don't need
+  // touch-ups. `orderedDevices` (the sorted derivation) now lives in the
+  // Provider too — see the destructure below.
+  const {
+    devices,
+    setDevices,
+    orderedDevices,
+    deviceOrder,
+    setDeviceOrder,
+    telemetryCollapsedByDevice,
+    setTelemetryCollapsedByDevice,
+    deviceGridRef,
+  } = useDevicesContext();
   const { colorScheme, setColorScheme } = useMantineColorScheme();
   const computedColorScheme = useComputedColorScheme("light");
   const panelIdRef = useRef(initialPlotState.nextPanelId);
@@ -630,143 +648,101 @@ export function App() {
   const [logsOpen, setLogsOpen] = useState(false);
   const [commandUnreadError, setCommandUnreadError] = useState(false);
   const [logsUnreadError, setLogsUnreadError] = useState(false);
-  const [settingsOpen, setSettingsOpen] = useState(false);
-  const [settingsLoading, setSettingsLoading] = useState(false);
-  const [settingsError, setSettingsError] = useState<string | null>(null);
-  const [gatewaySettings, setGatewaySettings] =
-    useState<GatewaySettingsInfo | null>(null);
-  const [extraUis, setExtraUis] = useState<ExtraUiInfo[]>([]);
-  const [instanceRuntimeStatus, setInstanceRuntimeStatus] =
-    useState<InstanceRuntimeStatus | null>(null);
-  const [instanceRuntimeLoading, setInstanceRuntimeLoading] = useState(false);
-  const [instanceRuntimeError, setInstanceRuntimeError] = useState<string | null>(null);
-  const [instanceCleanupBusy, setInstanceCleanupBusy] = useState(false);
-  const [logRows, setLogRows] = useState<LogEntry[]>([]);
-  const [logSeverityFilter, setLogSeverityFilter] = useState("all");
-  const [logSourceFilter, setLogSourceFilter] = useState("all");
-  const [logDeviceFilter, setLogDeviceFilter] = useState("all");
-  const [logProcessFilter, setLogProcessFilter] = useState("all");
-  const [logTextFilter, setLogTextFilter] = useState("");
-  const [logAutoScroll, setLogAutoScroll] = useState(true);
-  const [logLoading, setLogLoading] = useState(false);
-  const [expandedLogByKey, setExpandedLogByKey] = useState<
-    Record<string, boolean>
-  >({});
+  // Settings modal + instance-runtime state moved to SettingsContext
+  // (features/runtime/SettingsContext.tsx). Network handlers stay in
+  // App.tsx — they call into other state that hasn't been extracted.
+  const {
+    settingsOpen,
+    setSettingsOpen,
+    settingsLoading,
+    setSettingsLoading,
+    settingsError,
+    setSettingsError,
+    gatewaySettings,
+    setGatewaySettings,
+    extraUis,
+    setExtraUis,
+    instanceRuntimeStatus,
+    setInstanceRuntimeStatus,
+    instanceRuntimeLoading,
+    setInstanceRuntimeLoading,
+    instanceRuntimeError,
+    setInstanceRuntimeError,
+    instanceCleanupBusy,
+    setInstanceCleanupBusy,
+    settingsFileInputRef,
+  } = useSettings();
+  // Log viewer state + the filtered-rows derivation moved to LogsContext
+  // (features/logs/LogsContext.tsx). WS subscription stays in App.tsx;
+  // useLogsStream is unchanged for downstream compatibility.
+  const {
+    logRows,
+    setLogRows,
+    logSeverityFilter,
+    setLogSeverityFilter,
+    logSourceFilter,
+    setLogSourceFilter,
+    logDeviceFilter,
+    setLogDeviceFilter,
+    logProcessFilter,
+    setLogProcessFilter,
+    logTextFilter,
+    setLogTextFilter,
+    logAutoScroll,
+    setLogAutoScroll,
+    logLoading,
+    setLogLoading,
+    expandedLogByKey,
+    setExpandedLogByKey,
+    filteredLogRows,
+    logSeenRef,
+    logScrollRef,
+    logRowsBaselineReadyRef,
+    logRowsLastKeyRef,
+  } = useLogs();
   const [streamCatalog, setStreamCatalog] = useState<StreamCatalogEntry[]>([]);
   const [activeUiDrag, setActiveUiDrag] = useState<UiDragData | null>(null);
   const [editingPanelId, setEditingPanelId] = useState<string | null>(null);
   const [panelTitleDraft, setPanelTitleDraft] = useState("");
-  const [deviceOrder, setDeviceOrder] = useState<string[]>(() => {
-    try {
-      const raw = localStorage.getItem("ecui.deviceOrder");
-      if (!raw) {
-        return [];
-      }
-      const parsed = JSON.parse(raw);
-      if (!Array.isArray(parsed)) {
-        return [];
-      }
-      return parsed
-        .map((value) => (typeof value === "string" ? value : ""))
-        .filter((value) => value.length > 0);
-    } catch {
-      return [];
-    }
-  });
-  const [telemetryCollapsedByDevice, setTelemetryCollapsedByDevice] = useState<
-    Record<string, boolean>
-  >(() => {
-    try {
-      const raw = localStorage.getItem("ecui.telemetryCollapsedByDevice");
-      if (!raw) {
-        return {};
-      }
-      const parsed = JSON.parse(raw);
-      if (!parsed || typeof parsed !== "object") {
-        return {};
-      }
-      const next: Record<string, boolean> = {};
-      for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
-        if (typeof key === "string" && typeof value === "boolean") {
-          next[key] = value;
-        }
-      }
-      return next;
-    } catch {
-      return {};
-    }
-  });
-  const [commandDeckCollapsedByGroup, setCommandDeckCollapsedByGroup] = useState<
-    Record<string, boolean>
-  >(() => {
-    try {
-      const raw = localStorage.getItem("ecui.commandDeck.collapsedByGroup");
-      if (!raw) {
-        return {};
-      }
-      const parsed = JSON.parse(raw);
-      if (!parsed || typeof parsed !== "object") {
-        return {};
-      }
-      const next: Record<string, boolean> = {};
-      for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
-        if (typeof value === "boolean") {
-          next[key] = value;
-        }
-      }
-      return next;
-    } catch {
-      return {};
-    }
-  });
-  const deviceGridRef = useRef<HTMLDivElement | null>(null);
+  // deviceOrder + telemetryCollapsedByDevice now provided by
+  // DevicesContext (destructured at the top of the function).
+  // Pinned commands + command deck state moved to CommandsContext
+  // (features/commands/CommandsContext.tsx). The names below are kept
+  // identical so existing call sites in App.tsx don't need touch-ups.
+  // Network/CRUD handlers stay in App.tsx for now — they call into
+  // device + process command controllers that haven't been extracted.
+  const {
+    pinnedCommands,
+    setPinnedCommands,
+    pinnedParamDrafts,
+    setPinnedParamDrafts,
+    pinnedBusyByKey,
+    setPinnedBusyByKey,
+    commandDeck,
+    setCommandDeck,
+    commandDeckCollapsedByGroup,
+    setCommandDeckCollapsedByGroup,
+    commandDeckBusyById,
+    setCommandDeckBusyById,
+    commandDeckIdRef,
+  } = useCommands();
+  // deviceGridRef now provided by DevicesContext.
   const plotGridRef = useRef<HTMLDivElement | null>(null);
   const dragColumnsRef = useRef<{ device: number; panel: number }>({
     device: 1,
     panel: 1,
   });
-  const [pinnedParamDrafts, setPinnedParamDrafts] = useState<PinnedParamDrafts>(
-    {}
-  );
-  const [pinnedBusyByKey, setPinnedBusyByKey] = useState<Record<string, boolean>>(
-    {}
-  );
-  const logSeenRef = useRef<Set<string>>(new Set());
-  const logScrollRef = useRef<HTMLDivElement | null>(null);
+  // pinnedParamDrafts + pinnedBusyByKey now provided by CommandsContext
+  // (destructured above).
+  // logSeenRef + logScrollRef + logRowsBaselineReadyRef +
+  // logRowsLastKeyRef now provided by LogsContext (destructured above).
   const commandHistoryScrollRef = useRef<HTMLDivElement | null>(null);
   const commandHistoryNearBottomRef = useRef(true);
   const commandHistoryBaselineReadyRef = useRef(false);
   const commandHistoryLastIdRef = useRef<string | null>(null);
-  const logRowsBaselineReadyRef = useRef(false);
-  const logRowsLastKeyRef = useRef<string | null>(null);
-  const settingsFileInputRef = useRef<HTMLInputElement | null>(null);
-  const [pinnedCommands, setPinnedCommands] = useState<PinnedCommandMap>(() => {
-    try {
-      const raw = localStorage.getItem("ecui.pinnedCommands");
-      if (!raw) {
-        return {};
-      }
-      const parsed = JSON.parse(raw);
-      return normalizePinnedCommands(parsed);
-    } catch {
-      return {};
-    }
-  });
-  const [commandDeck, setCommandDeck] = useState<CommandDeckEntry[]>(() => {
-    try {
-      const raw = localStorage.getItem("ecui.commandDeck");
-      if (!raw) {
-        return [];
-      }
-      return normalizeCommandDeck(JSON.parse(raw));
-    } catch {
-      return [];
-    }
-  });
-  const [commandDeckBusyById, setCommandDeckBusyById] = useState<
-    Record<string, boolean>
-  >({});
-  const commandDeckIdRef = useRef(1);
+  // settingsFileInputRef now provided by SettingsContext (destructured above).
+  // pinnedCommands + commandDeck + commandDeckBusyById + commandDeckIdRef
+  // now provided by CommandsContext (destructured above).
   // Plot buffers + per-stream overlay caches now live in TelemetryContext
   // (features/telemetry/TelemetryContext.tsx) so future feature-module
   // extractions can subscribe to them via useTelemetry() without prop-
@@ -887,23 +863,7 @@ export function App() {
     invalidateDeviceCapabilities,
   } = useDeviceCapabilitiesController(devices);
 
-  const orderedDevices = useMemo(() => {
-    const rank = new Map(deviceOrder.map((deviceId, idx) => [deviceId, idx]));
-    return [...devices].sort((a, b) => {
-      const aRank = rank.get(a.device_id);
-      const bRank = rank.get(b.device_id);
-      if (aRank != null && bRank != null && aRank !== bRank) {
-        return aRank - bRank;
-      }
-      if (aRank != null) {
-        return -1;
-      }
-      if (bRank != null) {
-        return 1;
-      }
-      return a.device_id.localeCompare(b.device_id);
-    });
-  }, [devices, deviceOrder]);
+  // orderedDevices now lives in DevicesContext (destructured above).
   const streamCatalogByKey = useMemo(() => {
     const out = new Map<string, StreamCatalogEntry>();
     for (const entry of streamCatalog) {
@@ -1315,41 +1275,7 @@ export function App() {
     }
     return out;
   }, [panels, streamWorkspaces]);
-  const filteredLogRows = useMemo(() => {
-    const needle = logTextFilter.trim().toLowerCase();
-    return logRows.filter((entry) => {
-      const severity = String(entry.severity ?? "").toLowerCase();
-      if (logSeverityFilter !== "all" && severity !== logSeverityFilter) {
-        return false;
-      }
-      const sourceKind = String(entry.source_kind ?? "").toLowerCase();
-      if (logSourceFilter !== "all" && sourceKind !== logSourceFilter) {
-        return false;
-      }
-      const deviceId = String(entry.device_id ?? "");
-      if (logDeviceFilter !== "all" && deviceId !== logDeviceFilter) {
-        return false;
-      }
-      const processId = String(entry.process_id ?? "");
-      if (logProcessFilter !== "all" && processId !== logProcessFilter) {
-        return false;
-      }
-      if (!needle) {
-        return true;
-      }
-      const haystack = `${entry.topic ?? ""} ${entry.message ?? ""} ${
-        entry.payload_json ?? ""
-      }`.toLowerCase();
-      return haystack.includes(needle);
-    });
-  }, [
-    logRows,
-    logSeverityFilter,
-    logSourceFilter,
-    logDeviceFilter,
-    logProcessFilter,
-    logTextFilter,
-  ]);
+  // filteredLogRows now lives in LogsContext (destructured above).
   const resolvedApiBase = useMemo(() => {
     const configured = String(import.meta.env.VITE_API_BASE ?? "").trim();
     if (configured) {
