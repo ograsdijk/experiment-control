@@ -67,6 +67,23 @@ export function panelCapacity(timeWindow: number): number {
 
 export interface ApplyHelpersDeps {
   panelsRef: MutableRefObject<PlotPanelState[]>;
+  /**
+   * Reverse index for stream-analysis output dispatch.
+   *
+   * Keyed by `workspaceId → outputId → panels[]`. Each panel appears
+   * under every output it cares about: primary outputId, every
+   * overlay outputId (trace panels + bin-stats panels), every fit-
+   * overlay outputId (bin-stats panels), and every params
+   * subscription outputId.
+   *
+   * Built and updated by `useStreamOutputIndex` whenever the panels
+   * list changes. `applyStreamAnalysisOutputToPanels` reads
+   * `panelsByWorkspaceOutputRef.current.get(workspaceId)?.get(outputId)`
+   * for an O(matching) loop instead of O(all panels) per WS message.
+   */
+  panelsByWorkspaceOutputRef: MutableRefObject<
+    Map<string, Map<string, PlotPanelState[]>>
+  >;
   buffersRef: Map<string, Map<string, RingBuffer>>;
   streamFramesRef: Map<string, StreamFrameSample[]>;
   streamTraceOverlayRef: Map<
@@ -84,6 +101,71 @@ export interface ApplyHelpersDeps {
   streamParamsLatestRef: Map<string, Record<string, StreamParamsOutputValue>>;
   streamBinStatsRef: Map<string, StreamBinStatsSnapshot>;
   streamBin2dRef: Map<string, StreamBin2dSnapshot>;
+}
+
+/**
+ * Build the (workspaceId, outputId) → panels[] reverse index from
+ * the current panels list. Each panel appears under every output it
+ * references in any role (primary / overlay / fit-overlay / params
+ * subscription); the apply helpers do the role-check inline.
+ */
+export function buildPanelsByWorkspaceOutput(
+  panels: PlotPanelState[]
+): Map<string, Map<string, PlotPanelState[]>> {
+  const out = new Map<string, Map<string, PlotPanelState[]>>();
+  const add = (workspaceId: string, outputId: string, panel: PlotPanelState) => {
+    if (!workspaceId || !outputId) {
+      return;
+    }
+    let inner = out.get(workspaceId);
+    if (!inner) {
+      inner = new Map();
+      out.set(workspaceId, inner);
+    }
+    let bucket = inner.get(outputId);
+    if (!bucket) {
+      bucket = [];
+      inner.set(outputId, bucket);
+    }
+    bucket.push(panel);
+  };
+  for (const panel of panels) {
+    const workspaceId = String(panel.workspaceId ?? "").trim();
+    if (!workspaceId) {
+      continue;
+    }
+    if (isStreamScalarPanel(panel)) {
+      add(workspaceId, String(panel.outputId ?? "").trim(), panel);
+      continue;
+    }
+    if (isStreamParamsPanel(panel)) {
+      for (const id of panel.outputIds ?? []) {
+        add(workspaceId, String(id ?? "").trim(), panel);
+      }
+      continue;
+    }
+    if (isStreamBinStatsPanel(panel)) {
+      add(workspaceId, String(panel.outputId ?? "").trim(), panel);
+      for (const id of panel.overlayOutputIds ?? []) {
+        add(workspaceId, String(id ?? "").trim(), panel);
+      }
+      for (const id of panel.fitOverlayOutputIds ?? []) {
+        add(workspaceId, String(id ?? "").trim(), panel);
+      }
+      continue;
+    }
+    if (isStreamBin2dPanel(panel)) {
+      add(workspaceId, String(panel.outputId ?? "").trim(), panel);
+      continue;
+    }
+    if (isStreamTracePanel(panel) && panel.sourceMode === "dag") {
+      add(workspaceId, String(panel.outputId ?? "").trim(), panel);
+      for (const id of panel.overlayOutputIds ?? []) {
+        add(workspaceId, String(id ?? "").trim(), panel);
+      }
+    }
+  }
+  return out;
 }
 
 export function ensurePanelBuffers(
@@ -175,55 +257,50 @@ export function applyStreamAnalysisOutputToPanels(
     traceAverageMode: StreamTraceAverageMode;
   } | undefined
 ): boolean {
+  // PerfC: O(matching) loop via reverse index instead of O(N panels).
+  // `interested` lists every panel that referenced this exact
+  // (workspaceId, outputId) at the last index build (panel add/edit/
+  // remove). The per-panel role-check below stays — it determines
+  // which mutation path the output drives (scalar push, params
+  // update, hist replace, trace primary/overlay, fit overlay).
+  const interested = deps.panelsByWorkspaceOutputRef.current
+    .get(output.workspaceId)
+    ?.get(output.outputId);
+  if (!interested || interested.length === 0) {
+    return false;
+  }
   let updated = false;
   if (output.kind === "scalar") {
     const scalar = Number(output.value);
     if (Number.isFinite(scalar)) {
-      for (const panel of deps.panelsRef.current) {
-        if (!isStreamScalarPanel(panel)) {
-          if (isStreamParamsPanel(panel)) {
-            if (panel.workspaceId !== output.workspaceId) {
-              continue;
-            }
-            if (!(panel.outputIds ?? []).includes(output.outputId)) {
-              continue;
-            }
-            const latest = deps.streamParamsLatestRef.get(panel.id) ?? {};
-            latest[output.outputId] = scalar;
-            deps.streamParamsLatestRef.set(panel.id, latest);
-            updated = true;
+      for (const panel of interested) {
+        if (isStreamScalarPanel(panel)) {
+          const panelBuffers = ensurePanelBuffers(deps.buffersRef, panel.id);
+          const key = traceKeyId(streamScalarTrace(panel));
+          let buffer = panelBuffers.get(key);
+          if (!buffer) {
+            buffer = new RingBuffer(panelCapacity(panel.timeWindowS));
+            panelBuffers.set(key, buffer);
           }
+          buffer.push(output.tWallS, scalar);
+          updated = true;
           continue;
         }
-        if (panel.workspaceId !== output.workspaceId) {
-          continue;
+        if (isStreamParamsPanel(panel)) {
+          const latest = deps.streamParamsLatestRef.get(panel.id) ?? {};
+          latest[output.outputId] = scalar;
+          deps.streamParamsLatestRef.set(panel.id, latest);
+          updated = true;
         }
-        if ((panel.outputId ?? "") !== output.outputId) {
-          continue;
-        }
-        const panelBuffers = ensurePanelBuffers(deps.buffersRef, panel.id);
-        const key = traceKeyId(streamScalarTrace(panel));
-        let buffer = panelBuffers.get(key);
-        if (!buffer) {
-          buffer = new RingBuffer(panelCapacity(panel.timeWindowS));
-          panelBuffers.set(key, buffer);
-        }
-        buffer.push(output.tWallS, scalar);
-        updated = true;
       }
     }
+    return updated;
   }
   if (output.kind === "params_map") {
     const paramsMap = normalizeFitParamsMapValue(output.value);
     if (paramsMap) {
-      for (const panel of deps.panelsRef.current) {
+      for (const panel of interested) {
         if (!isStreamParamsPanel(panel)) {
-          continue;
-        }
-        if (panel.workspaceId !== output.workspaceId) {
-          continue;
-        }
-        if (!(panel.outputIds ?? []).includes(output.outputId)) {
           continue;
         }
         const latest = deps.streamParamsLatestRef.get(panel.id) ?? {};
@@ -232,57 +309,51 @@ export function applyStreamAnalysisOutputToPanels(
         updated = true;
       }
     }
+    return updated;
   }
   if (output.kind === "hist_agg") {
     const series = normalizeHistAggValue(output.value);
     if (series) {
-      for (const panel of deps.panelsRef.current) {
+      for (const panel of interested) {
         if (!isStreamBinStatsPanel(panel)) {
           continue;
         }
-        if (panel.workspaceId !== output.workspaceId) {
-          continue;
-        }
         if ((panel.outputId ?? "") !== output.outputId) {
+          // Index match was via overlay/fit-overlay; not the primary
+          // bin-stats output, so skip the snapshot replace.
           continue;
         }
         deps.streamBinStatsRef.set(panel.id, series);
         updated = true;
       }
     }
+    return updated;
   }
   if (output.kind === "hist2d") {
     const snapshot = normalizeHist2dValue(output.value);
     if (snapshot) {
-      for (const panel of deps.panelsRef.current) {
+      for (const panel of interested) {
         if (!isStreamBin2dPanel(panel)) {
-          continue;
-        }
-        if (panel.workspaceId !== output.workspaceId) {
-          continue;
-        }
-        if ((panel.outputId ?? "") !== output.outputId) {
           continue;
         }
         deps.streamBin2dRef.set(panel.id, snapshot);
         updated = true;
       }
     }
+    return updated;
   }
   if (output.kind === "fit_1d") {
     const fit = normalizeFitCurveValue(output.value);
     if (fit) {
-      for (const panel of deps.panelsRef.current) {
+      for (const panel of interested) {
         if (!isStreamBinStatsPanel(panel)) {
           continue;
         }
-        if (panel.workspaceId !== output.workspaceId) {
-          continue;
-        }
-        const overlayIds = new Set(
-          (panel.fitOverlayOutputIds ?? []).map((id) => String(id ?? "").trim())
-        );
-        if (!overlayIds.has(output.outputId)) {
+        // Must be a fit-overlay; index lookup matched, but skip if
+        // the panel only listed it as primary or trace overlay.
+        if (
+          !(panel.fitOverlayOutputIds ?? []).includes(output.outputId)
+        ) {
           continue;
         }
         const perPanel =
@@ -292,32 +363,29 @@ export function applyStreamAnalysisOutputToPanels(
         updated = true;
       }
     }
+    return updated;
   }
   if (output.kind === "trace") {
     const values = normalizeTraceValues(output.value);
     if (values !== null) {
-      for (const panel of deps.panelsRef.current) {
-        if (
-          isStreamBinStatsPanel(panel) &&
-          panel.workspaceId === output.workspaceId
-        ) {
-          const overlayIds = new Set(
-            (panel.overlayOutputIds ?? []).map((id) => String(id ?? "").trim())
-          );
-          if (overlayIds.has(output.outputId)) {
-            const perPanel =
-              deps.streamBinStatsOverlayRef.get(panel.id) ?? new Map();
-            const seq =
-              output.seq ?? (perPanel.get(output.outputId)?.seq ?? 0) + 1;
-            perPanel.set(output.outputId, { seq, values });
-            deps.streamBinStatsOverlayRef.set(panel.id, perPanel);
-            updated = true;
+      for (const panel of interested) {
+        if (isStreamBinStatsPanel(panel)) {
+          // Trace overlay on a bin-stats panel.
+          if (!(panel.overlayOutputIds ?? []).includes(output.outputId)) {
+            continue;
           }
+          const perPanel =
+            deps.streamBinStatsOverlayRef.get(panel.id) ?? new Map();
+          const seq =
+            output.seq ?? (perPanel.get(output.outputId)?.seq ?? 0) + 1;
+          perPanel.set(output.outputId, { seq, values });
+          deps.streamBinStatsOverlayRef.set(panel.id, perPanel);
+          updated = true;
+          continue;
         }
         if (
           !isStreamTracePanel(panel) ||
-          panel.sourceMode !== "dag" ||
-          panel.workspaceId !== output.workspaceId
+          panel.sourceMode !== "dag"
         ) {
           continue;
         }
@@ -334,11 +402,11 @@ export function applyStreamAnalysisOutputToPanels(
           }
         }
         const primaryOutputId = String(panel.outputId ?? "").trim();
-        const overlayOutputIds = new Set(
-          (panel.overlayOutputIds ?? []).map((id) => String(id ?? "").trim())
+        const isPrimary =
+          primaryOutputId.length > 0 && primaryOutputId === output.outputId;
+        const isOverlay = (panel.overlayOutputIds ?? []).includes(
+          output.outputId
         );
-        const isPrimary = primaryOutputId.length > 0 && primaryOutputId === output.outputId;
-        const isOverlay = overlayOutputIds.has(output.outputId);
         if (!isPrimary && !isOverlay) {
           continue;
         }
@@ -379,6 +447,7 @@ export function applyStreamAnalysisOutputToPanels(
         updated = true;
       }
     }
+    return updated;
   }
   return updated;
 }
