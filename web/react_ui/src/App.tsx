@@ -194,6 +194,7 @@ import {
 import {
   applyRawStreamFrameToPanels as applyRawStreamFrameToPanelsImpl,
   applyStreamAnalysisOutputToPanels as applyStreamAnalysisOutputToPanelsImpl,
+  buildPanelsByWorkspaceOutput,
   ensurePanelBuffers as ensurePanelBuffersImpl,
   panelCapacity as panelCapacityImpl,
   type ApplyHelpersDeps,
@@ -1713,8 +1714,20 @@ export function App() {
   // need into a `deps` object; the imported pure functions take it as
   // their first argument. Wrapping in arrow functions matches the
   // previous inline behavior (no useCallback memoization).
+  //
+  // PerfC: maintain a reverse index for stream-analysis output
+  // dispatch so applyStreamAnalysisOutputToPanels does O(matching
+  // panels) work per WS message instead of O(N panels). Rebuild on
+  // every panels change.
+  const panelsByWorkspaceOutputRef = useRef<
+    Map<string, Map<string, PlotPanelState[]>>
+  >(new Map());
+  useEffect(() => {
+    panelsByWorkspaceOutputRef.current = buildPanelsByWorkspaceOutput(panels);
+  }, [panels]);
   const applyDeps: ApplyHelpersDeps = {
     panelsRef,
+    panelsByWorkspaceOutputRef,
     buffersRef,
     streamFramesRef,
     streamTraceOverlayRef,
