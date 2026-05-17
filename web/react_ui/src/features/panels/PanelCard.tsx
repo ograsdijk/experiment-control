@@ -1,4 +1,4 @@
-import { memo, type CSSProperties } from "react";
+import { memo, useMemo, type CSSProperties } from "react";
 import {
   ActionIcon,
   Badge,
@@ -196,37 +196,81 @@ function PanelCardImpl({
   const { panels } = usePanels();
 
                   const isActive = panel.id === activePanelId;
+
+                  // PerfB: workspace-keyed derivations are memoized so they
+                  // skip recomputation on plotTick (which fires at the WS
+                  // rate). These only depend on the panel and the workspaces
+                  // map; the panel-kind branches branch the same way each
+                  // render so the cost is in the workspace lookups +
+                  // workspaceOutputOptionsByKind iteration.
+                  const workspaceDerivations = useMemo(() => {
+                    const ws =
+                      isStreamScalarPanel(panel) ||
+                      isStreamParamsPanel(panel) ||
+                      isStreamBinStatsPanel(panel) ||
+                      isStreamBin2dPanel(panel) ||
+                      (isStreamTracePanel(panel) && panel.sourceMode === "dag")
+                        ? streamWorkspaces[panel.workspaceId] ?? null
+                        : null;
+                    return {
+                      streamWorkspace: ws,
+                      integralOutputOptions: isStreamScalarPanel(panel)
+                        ? workspaceOutputOptionsByKind(ws, "scalar")
+                        : [],
+                      binStatsXLabel: isStreamBinStatsPanel(panel)
+                        ? workspaceXAxisLabel(ws, panel.outputId)
+                        : DEFAULT_STREAM_CONTEXT_FIELD,
+                      bin2dXLabel: isStreamBin2dPanel(panel)
+                        ? workspaceBin2dAxisLabel(ws, panel.outputId, "x")
+                        : DEFAULT_STREAM_CONTEXT_FIELD,
+                      bin2dYLabel: isStreamBin2dPanel(panel)
+                        ? workspaceBin2dAxisLabel(ws, panel.outputId, "y")
+                        : "context_y",
+                      telemetryNumericTraceCount: isTelemetryPanel(panel)
+                        ? panel.traces.filter(
+                            (trace) => trace.valueKind !== "boolean"
+                          ).length
+                        : 0,
+                      telemetryOffsetUnit: isTelemetryPanel(panel)
+                        ? (() => {
+                            const units = panel.traces
+                              .filter((trace) => trace.valueKind !== "boolean")
+                              .map((trace) =>
+                                typeof trace.units === "string"
+                                  ? trace.units.trim()
+                                  : ""
+                              )
+                              .filter((unit) => unit.length > 0);
+                            if (units.length === 0) {
+                              return "";
+                            }
+                            const unique = new Set(units);
+                            return unique.size === 1 ? units[0] : "";
+                          })()
+                        : "",
+                    };
+                  }, [panel, streamWorkspaces]);
+                  const {
+                    streamWorkspace,
+                    integralOutputOptions,
+                    binStatsXLabel,
+                    bin2dXLabel,
+                    bin2dYLabel,
+                    telemetryNumericTraceCount,
+                    telemetryOffsetUnit,
+                  } = workspaceDerivations;
+
+                  // Ref-reads + tick-driven derivations stay un-memoized:
+                  // they intentionally fetch fresh data on every render so
+                  // panels reflect the latest snapshot pushed by the apply
+                  // helpers.
                   const panelBuffers = buffersRef.get(panel.id) ?? new Map();
-                  const streamWorkspace =
-                    isStreamScalarPanel(panel) ||
-                    isStreamParamsPanel(panel) ||
-                    isStreamBinStatsPanel(panel) ||
-                    isStreamBin2dPanel(panel) ||
-                    (isStreamTracePanel(panel) && panel.sourceMode === "dag")
-                      ? streamWorkspaces[panel.workspaceId] ?? null
-                      : null;
-                  const integralOutputOptions = isStreamScalarPanel(panel)
-                    ? workspaceOutputOptionsByKind(streamWorkspace, "scalar")
-                    : [];
-                  const binStatsXLabel = isStreamBinStatsPanel(panel)
-                    ? workspaceXAxisLabel(streamWorkspace, panel.outputId)
-                    : DEFAULT_STREAM_CONTEXT_FIELD;
                   const binStatsSnapshot = isStreamBinStatsPanel(panel)
                     ? streamBinStatsRef.get(panel.id) ?? null
                     : null;
                   const bin2dSnapshot = isStreamBin2dPanel(panel)
                     ? streamBin2dRef.get(panel.id) ?? null
                     : null;
-                  const bin2dXLabel = isStreamBin2dPanel(panel)
-                    ? workspaceBin2dAxisLabel(streamWorkspace, panel.outputId, "x")
-                    : DEFAULT_STREAM_CONTEXT_FIELD;
-                  const bin2dYLabel = isStreamBin2dPanel(panel)
-                    ? workspaceBin2dAxisLabel(streamWorkspace, panel.outputId, "y")
-                    : "context_y";
-                  const telemetryNumericTraceCount = isTelemetryPanel(panel)
-                    ? panel.traces.filter((trace) => trace.valueKind !== "boolean")
-                        .length
-                    : 0;
                   const telemetryOffset = isTelemetryPanel(panel)
                     ? resolveTelemetryPanelOffset(panel)
                     : null;
@@ -240,20 +284,6 @@ function PanelCardImpl({
                     Number.isFinite(telemetryOffset)
                       ? formatOffsetFull(telemetryOffset)
                       : null;
-                  const telemetryOffsetUnit = (() => {
-                    if (!isTelemetryPanel(panel)) {
-                      return "";
-                    }
-                    const units = panel.traces
-                      .filter((trace) => trace.valueKind !== "boolean")
-                      .map((trace) => (typeof trace.units === "string" ? trace.units.trim() : ""))
-                      .filter((unit) => unit.length > 0);
-                    if (units.length === 0) {
-                      return "";
-                    }
-                    const unique = new Set(units);
-                    return unique.size === 1 ? units[0] : "";
-                  })();
                   const telemetryOffsetLabel = telemetryOffsetUnit
                     ? `${telemetryOffsetCompact} ${telemetryOffsetUnit}`
                     : telemetryOffsetCompact;
