@@ -83,9 +83,6 @@ import {
   fetchStreamWorkspaceList,
   fetchStreamWorkspaceStoreStatus,
   putStreamWorkspace,
-  reloadStreamWorkspaceStore,
-  resetStreamWorkspace,
-  saveStreamWorkspaceStore,
   validateStreamWorkspace,
   type GatewaySettingsInfo,
   type InstanceRuntimeStatus,
@@ -179,6 +176,7 @@ import { useTelemetry } from "./features/telemetry/TelemetryContext";
 import { useStreamAnalysis } from "./features/stream_analysis/StreamAnalysisContext";
 import { useDaqDraftEditors } from "./features/stream_analysis/useDaqDraftEditors";
 import { useDaqModalLifecycle } from "./features/stream_analysis/useDaqModalLifecycle";
+import { useWorkspaceStoreActions } from "./features/stream_analysis/useWorkspaceStoreActions";
 import { useDevicesContext } from "./features/devices/DevicesContext";
 import { useCommands } from "./features/commands/CommandsContext";
 import { useLayout } from "./features/layout/LayoutContext";
@@ -4342,41 +4340,17 @@ export function App() {
   // setStreamBinStatsFitOverlayOutputs now provided by useStreamWorkspaceHandlers.
   // setStreamBin2dReducer now provided by usePanelUiHandlers.
   // clearWorkspaceBinPanels now provided by useStreamPanelHandlers.
-  const resetDaqNodeAggregate = async (nodeId: string) => {
-    const workspaceId = String(daqWorkspaceId ?? "").trim();
-    const normalizedNodeId = String(nodeId ?? "").trim();
-    if (!workspaceId || !normalizedNodeId || daqResetNodeBusyId !== null) {
-      return;
-    }
-    if (!streamAnalysisReadyRef.current) {
-      notifications.show({
-        color: "yellow",
-        title: "Stream analysis unavailable",
-        message: "Start the stream_analysis process first.",
-      });
-      return;
-    }
-    setDaqResetNodeBusyId(normalizedNodeId);
-    try {
-      const resp = await resetStreamWorkspace(workspaceId, normalizedNodeId);
-      if (!resp.ok) {
-        notifications.show({
-          color: "red",
-          title: "Node reset failed",
-          message: resp.error?.message ?? resp.error?.code ?? "workspace.reset failed",
-        });
-        return;
-      }
-      clearWorkspaceBinPanels(workspaceId, normalizedNodeId);
-      notifications.show({
-        color: "teal",
-        title: "Node aggregate cleared",
-        message: `${workspaceId}.${normalizedNodeId}`,
-      });
-    } finally {
-      setDaqResetNodeBusyId(null);
-    }
-  };
+  // Workspace-store CRUD + node-aggregate reset (round 23). See
+  // features/stream_analysis/useWorkspaceStoreActions.ts.
+  const {
+    resetDaqNodeAggregate,
+    saveDaqWorkspaceStore,
+    reloadDaqWorkspaceStore,
+  } = useWorkspaceStoreActions({
+    clearWorkspaceBinPanels,
+    refreshWorkspaceStoreStatus,
+    loadStreamAnalysisWorkspaces,
+  });
 
   // DAQ workspace modal lifecycle (round 22). See
   // features/stream_analysis/useDaqModalLifecycle.ts. Open / close /
@@ -4617,97 +4591,8 @@ export function App() {
     void syncStreamAnalysisWorkspace(workspaceId, "stream-workspace-apply");
   };
 
-  const saveDaqWorkspaceStore = async () => {
-    if (!streamAnalysisReadyRef.current || workspaceStoreBusyAction !== null) {
-      return;
-    }
-    setWorkspaceStoreBusyAction("save");
-    try {
-      const resp = await saveStreamWorkspaceStore();
-      if (!resp.ok) {
-        notifications.show({
-          color: "red",
-          title: "Workspace save failed",
-          message:
-            resp.error?.message ?? resp.error?.code ?? "workspace_store.save failed",
-        });
-        await refreshWorkspaceStoreStatus("workspace-save", {
-          notifyOnError: false,
-        });
-        return;
-      }
-      const resultObj =
-        resp.result && typeof resp.result === "object"
-          ? (resp.result as Record<string, unknown>)
-          : {};
-      const statusRaw =
-        resultObj.status && typeof resultObj.status === "object"
-          ? resultObj.status
-          : null;
-      if (statusRaw) {
-        setWorkspaceStoreStatus(normalizeWorkspaceStoreStatus(statusRaw));
-      } else {
-        await refreshWorkspaceStoreStatus("workspace-save", {
-          notifyOnError: false,
-        });
-      }
-      notifications.show({
-        color: "teal",
-        title: "Workspace file saved",
-        message:
-          (statusRaw && typeof (statusRaw as { path?: unknown }).path === "string"
-            ? String((statusRaw as { path?: unknown }).path)
-            : workspaceStoreStatus.path) ?? "workspace store updated",
-      });
-    } finally {
-      setWorkspaceStoreBusyAction(null);
-    }
-  };
-
-  const reloadDaqWorkspaceStore = async () => {
-    if (!streamAnalysisReadyRef.current || workspaceStoreBusyAction !== null) {
-      return;
-    }
-    setWorkspaceStoreBusyAction("reload");
-    try {
-      const resp = await reloadStreamWorkspaceStore();
-      if (!resp.ok) {
-        notifications.show({
-          color: "red",
-          title: "Workspace reload failed",
-          message:
-            resp.error?.message ?? resp.error?.code ?? "workspace_store.reload failed",
-        });
-        await refreshWorkspaceStoreStatus("workspace-reload", {
-          notifyOnError: false,
-        });
-        return;
-      }
-      const resultObj =
-        resp.result && typeof resp.result === "object"
-          ? (resp.result as Record<string, unknown>)
-          : {};
-      const statusRaw =
-        resultObj.status && typeof resultObj.status === "object"
-          ? resultObj.status
-          : null;
-      if (statusRaw) {
-        setWorkspaceStoreStatus(normalizeWorkspaceStoreStatus(statusRaw));
-      } else {
-        await refreshWorkspaceStoreStatus("workspace-reload", {
-          notifyOnError: false,
-        });
-      }
-      await loadStreamAnalysisWorkspaces("workspace-reload", { notifyOnError: false });
-      notifications.show({
-        color: "teal",
-        title: "Workspace file reloaded",
-        message: "Runtime DAG workspaces refreshed from disk.",
-      });
-    } finally {
-      setWorkspaceStoreBusyAction(null);
-    }
-  };
+  // saveDaqWorkspaceStore + reloadDaqWorkspaceStore now provided by
+  // useWorkspaceStoreActions (round 23).
 
   // Panel title editor (round 20). See features/panels/usePanelTitleEditor.ts.
   // The editor state itself (editingPanelId, panelTitleDraft) lives in
