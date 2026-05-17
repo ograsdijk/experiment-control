@@ -179,6 +179,7 @@ import { useTelemetry } from "./features/telemetry/TelemetryContext";
 import { useStreamAnalysis } from "./features/stream_analysis/StreamAnalysisContext";
 import { useDevicesContext } from "./features/devices/DevicesContext";
 import { useCommands } from "./features/commands/CommandsContext";
+import { useLogs } from "./features/logs/LogsContext";
 import { useLogsStream } from "./features/logs/useLogsStream";
 import type {
   PanelKind,
@@ -657,17 +658,34 @@ export function App() {
   const [instanceRuntimeLoading, setInstanceRuntimeLoading] = useState(false);
   const [instanceRuntimeError, setInstanceRuntimeError] = useState<string | null>(null);
   const [instanceCleanupBusy, setInstanceCleanupBusy] = useState(false);
-  const [logRows, setLogRows] = useState<LogEntry[]>([]);
-  const [logSeverityFilter, setLogSeverityFilter] = useState("all");
-  const [logSourceFilter, setLogSourceFilter] = useState("all");
-  const [logDeviceFilter, setLogDeviceFilter] = useState("all");
-  const [logProcessFilter, setLogProcessFilter] = useState("all");
-  const [logTextFilter, setLogTextFilter] = useState("");
-  const [logAutoScroll, setLogAutoScroll] = useState(true);
-  const [logLoading, setLogLoading] = useState(false);
-  const [expandedLogByKey, setExpandedLogByKey] = useState<
-    Record<string, boolean>
-  >({});
+  // Log viewer state + the filtered-rows derivation moved to LogsContext
+  // (features/logs/LogsContext.tsx). WS subscription stays in App.tsx;
+  // useLogsStream is unchanged for downstream compatibility.
+  const {
+    logRows,
+    setLogRows,
+    logSeverityFilter,
+    setLogSeverityFilter,
+    logSourceFilter,
+    setLogSourceFilter,
+    logDeviceFilter,
+    setLogDeviceFilter,
+    logProcessFilter,
+    setLogProcessFilter,
+    logTextFilter,
+    setLogTextFilter,
+    logAutoScroll,
+    setLogAutoScroll,
+    logLoading,
+    setLogLoading,
+    expandedLogByKey,
+    setExpandedLogByKey,
+    filteredLogRows,
+    logSeenRef,
+    logScrollRef,
+    logRowsBaselineReadyRef,
+    logRowsLastKeyRef,
+  } = useLogs();
   const [streamCatalog, setStreamCatalog] = useState<StreamCatalogEntry[]>([]);
   const [activeUiDrag, setActiveUiDrag] = useState<UiDragData | null>(null);
   const [editingPanelId, setEditingPanelId] = useState<string | null>(null);
@@ -702,14 +720,12 @@ export function App() {
   });
   // pinnedParamDrafts + pinnedBusyByKey now provided by CommandsContext
   // (destructured above).
-  const logSeenRef = useRef<Set<string>>(new Set());
-  const logScrollRef = useRef<HTMLDivElement | null>(null);
+  // logSeenRef + logScrollRef + logRowsBaselineReadyRef +
+  // logRowsLastKeyRef now provided by LogsContext (destructured above).
   const commandHistoryScrollRef = useRef<HTMLDivElement | null>(null);
   const commandHistoryNearBottomRef = useRef(true);
   const commandHistoryBaselineReadyRef = useRef(false);
   const commandHistoryLastIdRef = useRef<string | null>(null);
-  const logRowsBaselineReadyRef = useRef(false);
-  const logRowsLastKeyRef = useRef<string | null>(null);
   const settingsFileInputRef = useRef<HTMLInputElement | null>(null);
   // pinnedCommands + commandDeck + commandDeckBusyById + commandDeckIdRef
   // now provided by CommandsContext (destructured above).
@@ -1245,41 +1261,7 @@ export function App() {
     }
     return out;
   }, [panels, streamWorkspaces]);
-  const filteredLogRows = useMemo(() => {
-    const needle = logTextFilter.trim().toLowerCase();
-    return logRows.filter((entry) => {
-      const severity = String(entry.severity ?? "").toLowerCase();
-      if (logSeverityFilter !== "all" && severity !== logSeverityFilter) {
-        return false;
-      }
-      const sourceKind = String(entry.source_kind ?? "").toLowerCase();
-      if (logSourceFilter !== "all" && sourceKind !== logSourceFilter) {
-        return false;
-      }
-      const deviceId = String(entry.device_id ?? "");
-      if (logDeviceFilter !== "all" && deviceId !== logDeviceFilter) {
-        return false;
-      }
-      const processId = String(entry.process_id ?? "");
-      if (logProcessFilter !== "all" && processId !== logProcessFilter) {
-        return false;
-      }
-      if (!needle) {
-        return true;
-      }
-      const haystack = `${entry.topic ?? ""} ${entry.message ?? ""} ${
-        entry.payload_json ?? ""
-      }`.toLowerCase();
-      return haystack.includes(needle);
-    });
-  }, [
-    logRows,
-    logSeverityFilter,
-    logSourceFilter,
-    logDeviceFilter,
-    logProcessFilter,
-    logTextFilter,
-  ]);
+  // filteredLogRows now lives in LogsContext (destructured above).
   const resolvedApiBase = useMemo(() => {
     const configured = String(import.meta.env.VITE_API_BASE ?? "").trim();
     if (configured) {
