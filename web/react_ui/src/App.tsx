@@ -20,17 +20,7 @@
   useComputedColorScheme,
   useMantineColorScheme,
 } from "@mantine/core";
-import {
-  DndContext,
-  PointerSensor,
-  TouchSensor,
-  useDraggable,
-  useSensor,
-  useSensors,
-  type DragEndEvent,
-  type DragOverEvent,
-  type DragStartEvent,
-} from "@dnd-kit/core";
+import { DndContext } from "@dnd-kit/core";
 import { SortableContext, rectSortingStrategy } from "@dnd-kit/sortable";
 import { notifications } from "@mantine/notifications";
 import {
@@ -116,10 +106,7 @@ import {
   normalizeBooleanMap,
   normalizeStringList,
 } from "./features/common/normalize";
-import {
-  detectGridColumns,
-  reorderIdsSerpentine,
-} from "./features/layout/serpentine";
+import { detectGridColumns } from "./features/layout/serpentine";
 import { ReorderableCardShell } from "./features/layout/ReorderableCardShell";
 import {
   logEntryKey,
@@ -178,6 +165,9 @@ import {
   normalizeDeckGroup,
 } from "./features/commands/utils";
 import { useLayout } from "./features/layout/LayoutContext";
+import { deviceSortableId } from "./features/layout/drag_helpers";
+import { useNavResizer } from "./features/layout/useNavResizer";
+import { useUiDragController } from "./features/layout/useUiDragController";
 import { useLogs } from "./features/logs/LogsContext";
 import { ExpandedPlotBody } from "./features/panels/ExpandedPlotBody";
 import {
@@ -410,31 +400,9 @@ function isErrorSeverity(severity: unknown): boolean {
 // isCommandDeckTelemetryEntry now live in features/commands/utils.ts
 // (round 26 — needed by useCommandDeckMutations).
 
-type UiDragData =
-  | { kind: "device"; deviceId: string }
-  | { kind: "panel"; panelId: string }
-  | { kind: "command-deck-entry"; entryId: string; groupName: string }
-  | { kind: "signal"; deviceId: string; signal: string }
-  | { kind: "trace"; deviceId: string; signal: string; originPanelId?: string };
-
-function deviceSortableId(deviceId: string): string {
-  return `device:${deviceId}`;
-}
-
-function panelSortableId(panelId: string): string {
-  return `panel:${panelId}`;
-}
-
-function parseSortablePrefixedId(raw: string | number, prefix: string): string | null {
-  if (typeof raw !== "string") {
-    return null;
-  }
-  if (!raw.startsWith(prefix)) {
-    return null;
-  }
-  const suffix = raw.slice(prefix.length);
-  return suffix.length > 0 ? suffix : null;
-}
+// UiDragData / panelSortableId / parseSortablePrefixedId moved to
+// features/layout/drag_helpers.ts (round 31). deviceSortableId is
+// imported from the same module below.
 
 // DraggableTraceChip moved to components/DraggableTraceChip.tsx
 // (round 30 — needed by PanelsGrid as well as remaining App-side uses).
@@ -642,7 +610,7 @@ export function App() {
     logRowsLastKeyRef,
   } = useLogs();
   const [streamCatalog, setStreamCatalog] = useState<StreamCatalogEntry[]>([]);
-  const [activeUiDrag, setActiveUiDrag] = useState<UiDragData | null>(null);
+  // activeUiDrag + setActiveUiDrag moved to useUiDragController (round 31).
   // editingPanelId + panelTitleDraft moved to PanelsContext (round 20).
   // Pulled out alongside usePanelTitleEditor's 3 handlers so
   // usePanelLifecycle's removePanel can clear the editor via context
@@ -709,14 +677,7 @@ export function App() {
   const workspaceSnapshotHydratedRef = useRef<Set<string>>(new Set());
   // isNarrowPlotViewport + plotGridStyle now provided by LayoutContext
   // (destructured at the top of App()).
-  const dndSensors = useSensors(
-    useSensor(PointerSensor, {
-      activationConstraint: { distance: 6 },
-    }),
-    useSensor(TouchSensor, {
-      activationConstraint: { delay: 140, tolerance: 8 },
-    })
-  );
+  // dndSensors moved to useUiDragController (round 31).
 
   useEffect(() => {
     return () => {
@@ -1575,61 +1536,7 @@ export function App() {
     });
   }, [streamAnalysisRpcReady]);
 
-  useEffect(() => {
-    if (!isResizing || isDevicePanelCollapsed) {
-      return;
-    }
-    const handleMove = (event: PointerEvent) => {
-      if (!resizeRef.current) {
-        return;
-      }
-      const delta = event.clientX - resizeRef.current.startX;
-      const proposed = resizeRef.current.startWidth + delta;
-      const max = Math.min(NAV_MAX_WIDTH, window.innerWidth - 320);
-      const safeMax = Math.max(NAV_MIN_WIDTH, max);
-      const nextWidth = Math.max(NAV_MIN_WIDTH, Math.min(safeMax, proposed));
-      resizePendingWidthRef.current = nextWidth;
-      if (resizeRafRef.current !== null) {
-        return;
-      }
-      resizeRafRef.current = window.requestAnimationFrame(() => {
-        resizeRafRef.current = null;
-        const pending = resizePendingWidthRef.current;
-        if (pending == null) {
-          return;
-        }
-        setNavWidth(pending);
-      });
-    };
-    const handleUp = () => {
-      if (resizeRafRef.current !== null) {
-        window.cancelAnimationFrame(resizeRafRef.current);
-        resizeRafRef.current = null;
-      }
-      const pending = resizePendingWidthRef.current;
-      resizePendingWidthRef.current = null;
-      if (pending != null) {
-        setNavWidth(pending);
-      }
-      resizeRef.current = null;
-      setIsResizing(false);
-    };
-    window.addEventListener("pointermove", handleMove);
-    window.addEventListener("pointerup", handleUp);
-    document.body.style.cursor = "col-resize";
-    document.body.style.userSelect = "none";
-    return () => {
-      window.removeEventListener("pointermove", handleMove);
-      window.removeEventListener("pointerup", handleUp);
-      if (resizeRafRef.current !== null) {
-        window.cancelAnimationFrame(resizeRafRef.current);
-        resizeRafRef.current = null;
-      }
-      resizePendingWidthRef.current = null;
-      document.body.style.cursor = "";
-      document.body.style.userSelect = "";
-    };
-  }, [isResizing, isDevicePanelCollapsed]);
+  // Resize-while-dragging window listeners moved to useNavResizer (round 31).
 
   useEffect(() => {
     const handleResize = () => {
@@ -2904,182 +2811,33 @@ export function App() {
     return detectGridColumns(deviceGridRef.current, "data-device-card-id");
   }, []);
 
-  const handleUiDragStart = useCallback(
-    (event: DragStartEvent) => {
-      const payload = event.active.data.current as UiDragData | undefined;
-      if (!payload) {
-        setActiveUiDrag(null);
-        return;
-      }
-      setActiveUiDrag(payload);
-      if (payload.kind === "device") {
-        dragColumnsRef.current.device = resolveDeviceGridColumns();
-      } else if (payload.kind === "panel") {
-        dragColumnsRef.current.panel = resolvePanelGridColumns();
-      }
-    },
-    [resolveDeviceGridColumns, resolvePanelGridColumns]
-  );
+  // UI drag controller (round 31). See features/layout/useUiDragController.ts.
+  // Owns the dnd-kit sensors + the four drag lifecycle handlers +
+  // transient activeUiDrag state.
+  const {
+    dndSensors,
+    activeUiDrag,
+    handleUiDragStart,
+    handleUiDragOver,
+    handleUiDragEnd,
+    handleUiDragCancel,
+  } = useUiDragController({
+    resolveDeviceGridColumns,
+    resolvePanelGridColumns,
+    addTraceToPanel,
+    removeTraceFromPanel,
+    reorderCommandDeckEntryWithinGroup,
+  });
 
-  const handleUiDragOver = useCallback(
-    (event: DragOverEvent) => {
-      const activePayload = event.active.data.current as UiDragData | undefined;
-      const overPayload = event.over?.data.current as UiDragData | undefined;
-      if (!activePayload || activePayload.kind !== "command-deck-entry") {
-        return;
-      }
-      const targetEntryId =
-        overPayload?.kind === "command-deck-entry"
-          ? overPayload.entryId
-          : parseSortablePrefixedId(event.over?.id ?? "", "deck:");
-      if (!targetEntryId || targetEntryId === activePayload.entryId) {
-        return;
-      }
-      reorderCommandDeckEntryWithinGroup(activePayload.entryId, targetEntryId);
-    },
-    [reorderCommandDeckEntryWithinGroup]
-  );
-
-  const handleUiDragEnd = useCallback(
-    (event: DragEndEvent) => {
-      const activePayload = event.active.data.current as UiDragData | undefined;
-      const overPayload = event.over?.data.current as UiDragData | undefined;
-      if (!activePayload) {
-        setActiveUiDrag(null);
-        return;
-      }
-
-      if (activePayload.kind === "device") {
-        const targetDeviceId =
-          overPayload?.kind === "device"
-            ? overPayload.deviceId
-            : parseSortablePrefixedId(event.over?.id ?? "", "device:");
-        if (
-          targetDeviceId &&
-          targetDeviceId !== activePayload.deviceId
-        ) {
-          const columns = Math.max(1, dragColumnsRef.current.device);
-          setDeviceOrder((prev) => {
-            const base = orderedDevices.map((device) => device.device_id);
-            const next = reorderIdsSerpentine(
-              base,
-              activePayload.deviceId,
-              targetDeviceId,
-              columns
-            );
-            return sameStringArray(prev, next) ? prev : next;
-          });
-        }
-        setActiveUiDrag(null);
-        return;
-      }
-
-      if (activePayload.kind === "panel") {
-        const targetPanelId =
-          overPayload?.kind === "panel"
-            ? overPayload.panelId
-            : parseSortablePrefixedId(event.over?.id ?? "", "panel:");
-        if (
-          targetPanelId &&
-          targetPanelId !== activePayload.panelId
-        ) {
-          const columns = Math.max(1, dragColumnsRef.current.panel);
-          setPanels((prev) => {
-            const ids = prev.map((panel) => panel.id);
-            const reorderedIds = reorderIdsSerpentine(
-              ids,
-              activePayload.panelId,
-              targetPanelId,
-              columns
-            );
-            if (sameStringArray(ids, reorderedIds)) {
-              return prev;
-            }
-            const byId = new Map(prev.map((panel) => [panel.id, panel]));
-            return reorderedIds
-              .map((panelId) => byId.get(panelId))
-              .filter((panel): panel is PlotPanelState => Boolean(panel));
-          });
-        }
-        setActiveUiDrag(null);
-        return;
-      }
-
-      if (activePayload.kind === "command-deck-entry") {
-        setActiveUiDrag(null);
-        return;
-      }
-
-      if (activePayload.kind === "signal" || activePayload.kind === "trace") {
-        const targetPanelId =
-          overPayload?.kind === "panel"
-            ? overPayload.panelId
-            : parseSortablePrefixedId(event.over?.id ?? "", "panel:");
-        if (!targetPanelId) {
-          setActiveUiDrag(null);
-          return;
-        }
-        const targetPanel = panelsRef.current.find(
-          (panel) => panel.id === targetPanelId
-        );
-        if (!targetPanel || !isTelemetryPanel(targetPanel)) {
-          setActiveUiDrag(null);
-          return;
-        }
-        if (
-          activePayload.kind === "trace" &&
-          activePayload.originPanelId &&
-          activePayload.originPanelId !== targetPanelId
-        ) {
-          removeTraceFromPanel(activePayload.originPanelId, {
-            deviceId: activePayload.deviceId,
-            signal: activePayload.signal,
-          });
-        }
-        addTraceToPanel(
-          targetPanelId,
-          activePayload.deviceId,
-          activePayload.signal
-        );
-      }
-      setActiveUiDrag(null);
-    },
-    [addTraceToPanel, orderedDevices, removeTraceFromPanel]
-  );
-
-  const handleUiDragCancel = useCallback(() => {
-    setActiveUiDrag(null);
-  }, []);
-
-  const handleNavResizeStart = (
-    event: React.PointerEvent<HTMLDivElement>
-  ) => {
-    if (isDevicePanelCollapsed) {
-      return;
-    }
-    event.preventDefault();
-    resizeRef.current = { startX: event.clientX, startWidth: navWidth };
-    setIsResizing(true);
-  };
-
-  const setDevicePanelCollapsed = (collapsed: boolean) => {
-    if (resizeRafRef.current !== null) {
-      window.cancelAnimationFrame(resizeRafRef.current);
-      resizeRafRef.current = null;
-    }
-    resizePendingWidthRef.current = null;
-    resizeRef.current = null;
-    setIsResizing(false);
-    setIsDevicePanelCollapsed(collapsed);
-  };
-
-  const collapseDevicePanel = () => {
-    setDevicePanelCollapsed(true);
-  };
-
-  const expandDevicePanel = () => {
-    setDevicePanelCollapsed(false);
-  };
+  // Nav-sidebar resizer (round 31). See features/layout/useNavResizer.ts.
+  // Owns pointer-drag resize + collapse/expand helpers that need to
+  // cancel any in-flight RAF first.
+  const {
+    handleNavResizeStart,
+    setDevicePanelCollapsed,
+    collapseDevicePanel,
+    expandDevicePanel,
+  } = useNavResizer();
 
   // UI profile import/export (round 29). See
   // features/runtime/useUiProfile.ts. Wired here (rather than near the
