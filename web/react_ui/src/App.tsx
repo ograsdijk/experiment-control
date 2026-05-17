@@ -177,6 +177,7 @@ import { useProcessesController } from "./features/processes/useProcessesControl
 import { useTelemetryStream } from "./features/telemetry/useTelemetryStream";
 import { useTelemetry } from "./features/telemetry/TelemetryContext";
 import { useStreamAnalysis } from "./features/stream_analysis/StreamAnalysisContext";
+import { useDaqDraftEditors } from "./features/stream_analysis/useDaqDraftEditors";
 import { useDevicesContext } from "./features/devices/DevicesContext";
 import { useCommands } from "./features/commands/CommandsContext";
 import { useLayout } from "./features/layout/LayoutContext";
@@ -222,7 +223,6 @@ import type {
   StreamBinStatsSnapshot,
   StreamFitCurveSnapshot,
   StreamDagNodeConfig,
-  StreamDagOpId,
   StreamDagOutputConfig,
   StreamFrameSample,
   StreamTarget,
@@ -241,8 +241,6 @@ import {
   cloneDagNodes,
   cloneDagOutputs,
   coerceDagParamValue,
-  defaultInputsForOp,
-  defaultParamsForOp,
   isPublishableNodeKind,
   nodeKindFromOp,
   normalizeDagNode,
@@ -4473,181 +4471,22 @@ export function App() {
     }
   };
 
-  const setDaqNodeId = (index: number, value: string) => {
-    const nextId = value.trim();
-    if (!nextId) {
-      return;
-    }
-    const current = daqDraftNodes[index];
-    if (!current) {
-      return;
-    }
-    if (current.id === nextId) {
-      return;
-    }
-    if (daqDraftNodes.some((node, idx) => idx !== index && node.id === nextId)) {
-      notifications.show({
-        color: "red",
-        title: "Duplicate node ID",
-        message: `Node id '${nextId}' is already in use.`,
-      });
-      return;
-    }
-    const oldId = current.id;
-    setDaqDraftNodes((prev) =>
-      prev.map((node, idx) => {
-        if (idx === index) {
-          return { ...node, id: nextId };
-        }
-        let changed = false;
-        const nextInputs: Record<string, string> = {};
-        for (const [port, source] of Object.entries(node.inputs ?? {})) {
-          if (source === oldId) {
-            nextInputs[port] = nextId;
-            changed = true;
-          } else {
-            nextInputs[port] = source;
-          }
-        }
-        return changed ? { ...node, inputs: nextInputs } : node;
-      })
-    );
-    setDaqDraftOutputs((prev) =>
-      prev.map((output) =>
-        output.nodeId === oldId ? { ...output, nodeId: nextId } : output
-      )
-    );
-  };
-
-  const setDaqNodeOp = (index: number, opRaw: string | null) => {
-    if (!opRaw || !Object.prototype.hasOwnProperty.call(STREAM_DAG_OPS, opRaw)) {
-      return;
-    }
-    const op = opRaw as StreamDagOpId;
-    setDaqDraftNodes((prev) =>
-      prev.map((node, idx) =>
-        idx === index
-          ? {
-              ...node,
-              op,
-              params: defaultParamsForOp(op),
-              inputs: defaultInputsForOp(op),
-            }
-          : node
-      )
-    );
-  };
-
-  const setDaqNodeInput = (index: number, port: string, sourceNodeId: string | null) => {
-    setDaqDraftNodes((prev) =>
-      prev.map((node, idx) =>
-        idx === index
-          ? {
-              ...node,
-              inputs: {
-                ...node.inputs,
-                [port]: String(sourceNodeId ?? "").trim(),
-              },
-            }
-          : node
-      )
-    );
-  };
-
-  const setDaqNodeParam = (index: number, paramName: string, value: string) => {
-    setDaqDraftNodes((prev) =>
-      prev.map((node, idx) =>
-        idx === index
-          ? {
-              ...node,
-              params: {
-                ...node.params,
-                [paramName]: value,
-              },
-            }
-          : node
-      )
-    );
-  };
-
-  const addDaqNode = () => {
-    const existingIds = new Set(daqDraftNodes.map((node) => node.id));
-    let counter = daqDraftNodes.length + 1;
-    let nodeId = `node_${counter}`;
-    while (existingIds.has(nodeId)) {
-      counter += 1;
-      nodeId = `node_${counter}`;
-    }
-    const op: StreamDagOpId = "trace.integrate";
-    setDaqDraftNodes((prev) => [
-      ...prev,
-      {
-        id: nodeId,
-        op,
-        params: defaultParamsForOp(op),
-        inputs: defaultInputsForOp(op),
-      },
-    ]);
-  };
-
-  const removeDaqNode = (index: number) => {
-    const removed = daqDraftNodes[index];
-    if (!removed) {
-      return;
-    }
-    const removedId = removed.id;
-    setDaqDraftNodes((prev) => prev.filter((_, idx) => idx !== index));
-    setDaqDraftOutputs((prev) => prev.filter((output) => output.nodeId !== removedId));
-  };
-
-  const setDaqOutputId = (index: number, outputId: string) => {
-    setDaqDraftOutputs((prev) =>
-      prev.map((output, idx) =>
-        idx === index ? { ...output, outputId: outputId.trim() } : output
-      )
-    );
-  };
-
-  const setDaqOutputNode = (index: number, nodeId: string | null) => {
-    setDaqDraftOutputs((prev) =>
-      prev.map((output, idx) =>
-        idx === index ? { ...output, nodeId: String(nodeId ?? "").trim() } : output
-      )
-    );
-  };
-
-  const addDaqOutput = () => {
-    const publishableNodeIds = daqDraftNodes
-      .filter((node) => isPublishableNodeKind(nodeKindFromOp(node.op)))
-      .map((node) => node.id);
-    if (publishableNodeIds.length <= 0) {
-        notifications.show({
-          color: "yellow",
-          title: "No publishable nodes",
-          message:
-            "Add a scalar, trace, fit_1d, hist_agg, hist2d, or params_map node first.",
-        });
-        return;
-      }
-    const usedOutputIds = new Set(daqDraftOutputs.map((output) => output.outputId));
-    let counter = daqDraftOutputs.length + 1;
-    let outputId = `out_${counter}`;
-    while (usedOutputIds.has(outputId)) {
-      counter += 1;
-      outputId = `out_${counter}`;
-    }
-    setDaqDraftOutputs((prev) => [
-      ...prev,
-      {
-        outputId,
-        nodeId: publishableNodeIds[0],
-      },
-    ]);
-  };
-
-  const removeDaqOutput = (index: number) => {
-    setDaqDraftOutputs((prev) => prev.filter((_, idx) => idx !== index));
-  };
+  // DAQ draft node/output editors (round 21). See
+  // features/stream_analysis/useDaqDraftEditors.ts. Pure draft-state
+  // mutators — every handler here only touches the draft state in
+  // StreamAnalysisContext, never the API or panel/output cascade.
+  const {
+    setDaqNodeId,
+    setDaqNodeOp,
+    setDaqNodeInput,
+    setDaqNodeParam,
+    addDaqNode,
+    removeDaqNode,
+    setDaqOutputId,
+    setDaqOutputNode,
+    addDaqOutput,
+    removeDaqOutput,
+  } = useDaqDraftEditors();
 
   const applyDaqWorkspace = async () => {
     const workspaceId = String(daqWorkspaceId ?? "").trim();
