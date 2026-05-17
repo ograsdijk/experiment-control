@@ -159,6 +159,7 @@ import { useDevicesContext } from "./features/devices/DevicesContext";
 import { useCommands } from "./features/commands/CommandsContext";
 import { useCommandDeckMutations } from "./features/commands/useCommandDeckMutations";
 import { useCommandDeckRunner } from "./features/commands/useCommandDeckRunner";
+import { usePinnedParamsReconciler } from "./features/commands/usePinnedParamsReconciler";
 import {
   isCommandDeckCommandEntry,
   isCommandDeckTelemetryEntry,
@@ -170,6 +171,7 @@ import { useNavResizer } from "./features/layout/useNavResizer";
 import { useUiDragController } from "./features/layout/useUiDragController";
 import { useLogs } from "./features/logs/LogsContext";
 import { ExpandedPlotBody } from "./features/panels/ExpandedPlotBody";
+import { useStreamWorkspacePanelReconciler } from "./features/panels/useStreamWorkspacePanelReconciler";
 import {
   PanelsGrid,
   type PanelsGridHandlers,
@@ -1200,77 +1202,14 @@ export function App() {
     }
   }, [commandDeckCollapsedByGroup]);
 
-  useEffect(() => {
-    setPinnedParamDrafts((prev) => {
-      const next: PinnedParamDrafts = { ...prev };
-      const validKeys = new Set<string>();
-      let changed = false;
-      for (const [deviceId, entries] of Object.entries(pinnedCommands)) {
-        const capabilities = capabilitiesByDevice[deviceId] ?? [];
-        for (const entry of entries) {
-          const key = pinnedCommandKey(deviceId, entry.action);
-          validKeys.add(key);
-          const member = capabilities.find(
-            (capability) => capability.name === entry.action
-          );
-          const params = member?.params ?? [];
-          if (params.length === 0) {
-            const current = next[key] ?? {};
-            if (Object.keys(current).length > 0) {
-              next[key] = {};
-              changed = true;
-            } else if (!(key in next)) {
-              next[key] = {};
-              changed = true;
-            }
-            continue;
-          }
-          const defaults = buildParamDefaults(member);
-          const current = next[key] ?? {};
-          const merged: Record<string, string> = {};
-          for (const param of params) {
-            const paramName = param.name;
-            if (typeof current[paramName] === "string") {
-              merged[paramName] = current[paramName];
-            } else {
-              merged[paramName] = defaults[paramName] ?? "";
-            }
-          }
-          if (!sameStringRecord(current, merged)) {
-            next[key] = merged;
-            changed = true;
-          } else if (!(key in next)) {
-            next[key] = merged;
-            changed = true;
-          }
-        }
-      }
-      for (const key of Object.keys(next)) {
-        if (!validKeys.has(key)) {
-          delete next[key];
-          changed = true;
-        }
-      }
-      return changed ? next : prev;
-    });
-    setPinnedBusyByKey((prev) => {
-      const next = { ...prev };
-      const valid = new Set<string>();
-      for (const [deviceId, entries] of Object.entries(pinnedCommands)) {
-        for (const entry of entries) {
-          valid.add(pinnedCommandKey(deviceId, entry.action));
-        }
-      }
-      let changed = false;
-      for (const key of Object.keys(next)) {
-        if (!valid.has(key)) {
-          delete next[key];
-          changed = true;
-        }
-      }
-      return changed ? next : prev;
-    });
-  }, [pinnedCommands, capabilitiesByDevice]);
+  // Pinned-params draft reconciliation moved to
+  // features/commands/usePinnedParamsReconciler.ts (round 32).
+  usePinnedParamsReconciler({
+    pinnedCommands,
+    capabilitiesByDevice,
+    setPinnedParamDrafts,
+    setPinnedBusyByKey,
+  });
 
   useEffect(() => {
     commandDeckIdRef.current = Math.max(
@@ -1396,129 +1335,9 @@ export function App() {
     }
   }, [streamWorkspaces, daqWorkspaceId]);
 
-  useEffect(() => {
-    setPanels((prev) => {
-      let changed = false;
-      const next = prev.map((panel) => {
-        if (isStreamTracePanel(panel) && panel.sourceMode === "dag") {
-          const workspace = streamWorkspaces[panel.workspaceId] ?? null;
-          const validTraceOutputIds = new Set(
-            workspace?.publishOutputs
-              .filter((entry) => workspaceOutputKind(workspace, entry.outputId) === "trace")
-              .map((entry) => entry.outputId) ?? []
-          );
-          const outputId =
-            panel.outputId &&
-            workspace &&
-            workspaceOutputKind(workspace, panel.outputId) === "trace"
-              ? panel.outputId
-              : defaultOutputForKind(workspace, "trace");
-          const overlayOutputIds = (panel.overlayOutputIds ?? []).filter(
-            (id) => id !== outputId && validTraceOutputIds.has(id)
-          );
-          const currentStreamKey = panel.stream
-            ? streamTargetKey(panel.stream.deviceId, panel.stream.stream)
-            : "";
-          const workspaceStreamKey = workspace?.stream
-            ? streamTargetKey(workspace.stream.deviceId, workspace.stream.stream)
-            : "";
-          const streamChanged = currentStreamKey !== workspaceStreamKey;
-          const channelChanged = panel.channelIndex !== (workspace?.channelIndex ?? panel.channelIndex);
-          const outputChanged = panel.outputId !== outputId;
-          const overlayChanged = !sameStringArray(panel.overlayOutputIds ?? [], overlayOutputIds);
-          if (!streamChanged && !channelChanged && !outputChanged && !overlayChanged) {
-            return panel;
-          }
-          changed = true;
-          return {
-            ...panel,
-            outputId,
-            overlayOutputIds,
-            stream: workspace?.stream ?? panel.stream,
-            channelIndex: workspace?.channelIndex ?? panel.channelIndex,
-          };
-        }
-        if (isStreamScalarPanel(panel)) {
-          if (panel.outputId) {
-            return panel;
-          }
-          const workspace = streamWorkspaces[panel.workspaceId] ?? null;
-          const outputId = defaultOutputForKind(workspace, "scalar");
-          if (!outputId) {
-            return panel;
-          }
-          changed = true;
-          return { ...panel, outputId };
-        }
-        if (isStreamParamsPanel(panel)) {
-          const workspace = streamWorkspaces[panel.workspaceId] ?? null;
-          if (!workspace) {
-            return panel;
-          }
-          const validOutputIds = new Set(
-            workspaceOutputOptionsByKind(workspace, "scalar").map((item) => item.value)
-          );
-          for (const item of workspaceOutputOptionsByKind(workspace, "params_map")) {
-            validOutputIds.add(item.value);
-          }
-          const outputIds = (panel.outputIds ?? []).filter((id) => validOutputIds.has(id));
-          if (sameStringArray(panel.outputIds ?? [], outputIds)) {
-            return panel;
-          }
-          changed = true;
-          return { ...panel, outputIds };
-        }
-        if (isStreamBinStatsPanel(panel)) {
-          const workspace = streamWorkspaces[panel.workspaceId] ?? null;
-          if (!workspace) {
-            return panel;
-          }
-          const outputId =
-            panel.outputId &&
-            workspaceOutputKind(workspace, panel.outputId) === "hist_agg"
-              ? panel.outputId
-              : defaultOutputForKind(workspace, "hist_agg");
-          const validTraceOutputIds = new Set(
-            workspaceOutputOptionsByKind(workspace, "trace").map((item) => item.value)
-          );
-          const validFitOutputIds = new Set(
-            workspaceOutputOptionsByKind(workspace, "fit_1d").map((item) => item.value)
-          );
-          const overlayOutputIds = (panel.overlayOutputIds ?? []).filter((id) =>
-            validTraceOutputIds.has(id)
-          );
-          const fitOverlayOutputIds = (panel.fitOverlayOutputIds ?? []).filter((id) =>
-            validFitOutputIds.has(id)
-          );
-          const outputChanged = panel.outputId !== outputId;
-          const overlayChanged = !sameStringArray(panel.overlayOutputIds ?? [], overlayOutputIds);
-          const fitOverlayChanged = !sameStringArray(
-            panel.fitOverlayOutputIds ?? [],
-            fitOverlayOutputIds
-          );
-          if (!outputChanged && !overlayChanged && !fitOverlayChanged) {
-            return panel;
-          }
-          changed = true;
-          return { ...panel, outputId, overlayOutputIds, fitOverlayOutputIds };
-        }
-        if (isStreamBin2dPanel(panel)) {
-          if (panel.outputId) {
-            return panel;
-          }
-          const workspace = streamWorkspaces[panel.workspaceId] ?? null;
-          const outputId = defaultOutputForKind(workspace, "hist2d");
-          if (!outputId) {
-            return panel;
-          }
-          changed = true;
-          return { ...panel, outputId };
-        }
-        return panel;
-      });
-      return changed ? next : prev;
-    });
-  }, [streamWorkspaces]);
+  // Stream-workspace → panel output reconciliation moved to
+  // features/panels/useStreamWorkspacePanelReconciler.ts (round 32).
+  useStreamWorkspacePanelReconciler();
 
   useEffect(() => {
     const wasReady = streamAnalysisReadyRef.current;
