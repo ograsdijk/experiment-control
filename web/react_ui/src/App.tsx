@@ -180,7 +180,11 @@ import {
 import { useLayout } from "./features/layout/LayoutContext";
 import { useLogs } from "./features/logs/LogsContext";
 import { ExpandedPlotBody } from "./features/panels/ExpandedPlotBody";
-import { PanelsGrid } from "./features/panels/PanelsGrid";
+import {
+  PanelsGrid,
+  type PanelsGridHandlers,
+  type PanelsGridHelpers,
+} from "./features/panels/PanelsGrid";
 import { DraggableTraceChip } from "./components/DraggableTraceChip";
 import { usePanels } from "./features/panels/PanelsContext";
 import { usePanelDerivations } from "./features/panels/usePanelDerivations";
@@ -3683,6 +3687,125 @@ export function App() {
     setDevicePanelCollapsed,
   });
 
+  // Stable identities for the panel helpers/handlers bags passed to
+  // <PanelsGrid>. Without this, every App.tsx render builds new
+  // function references and React.memo on <PanelCard> can never hit.
+  // Pattern: keep a mutable ref to the latest functions, then expose
+  // a single useMemo-stable bag whose methods deref the ref.
+  const panelHelpersRef = useRef<PanelsGridHelpers | null>(null);
+  panelHelpersRef.current = {
+    resolveTelemetryPanelOffset,
+    streamTraceOverlaySeries,
+    streamBinStatsOverlaySeries,
+    streamBinStatsFitOverlayCurves,
+    isExpandablePlotPanel,
+    copyTextToClipboard,
+  };
+  const panelHandlersRef = useRef<PanelsGridHandlers | null>(null);
+  panelHandlersRef.current = {
+    startPanelTitleEdit,
+    commitPanelTitleEdit,
+    cancelPanelTitleEdit,
+    removePanel,
+    removeTraceFromPanel,
+    setPanelTimeWindow,
+    openPlotOptions,
+    closePlotOptions,
+    applyPlotOptionsAxis,
+    setPlotOptionsAxisMode,
+    setTelemetryYDisplayMode,
+    setTelemetryYOffsetMode,
+    setTelemetrySmoothingMode,
+    setTelemetrySmoothingWindow,
+    clearPanelBuffers,
+    clearStreamPanelFrames,
+    clearStreamBinStatsPanel,
+    clearStreamBin2dPanel,
+    setStreamAnalysisPanelWorkspace,
+    setStreamAnalysisPanelOutput,
+    openExpandedPlot,
+    openStreamTraceOptionsModal,
+    openStreamBin2dOptionsModal,
+    openStreamParamsOptionsModal,
+    openStreamBinStatsOptionsModal,
+  };
+  const stablePanelHelpers = useMemo<PanelsGridHelpers>(
+    () => ({
+      resolveTelemetryPanelOffset: (panel) =>
+        panelHelpersRef.current!.resolveTelemetryPanelOffset(panel),
+      streamTraceOverlaySeries: (panel) =>
+        panelHelpersRef.current!.streamTraceOverlaySeries(panel),
+      streamBinStatsOverlaySeries: (panel) =>
+        panelHelpersRef.current!.streamBinStatsOverlaySeries(panel),
+      streamBinStatsFitOverlayCurves: (panel) =>
+        panelHelpersRef.current!.streamBinStatsFitOverlayCurves(panel),
+      isExpandablePlotPanel: (panel) =>
+        panelHelpersRef.current!.isExpandablePlotPanel(panel),
+      copyTextToClipboard: (label, text) =>
+        panelHelpersRef.current!.copyTextToClipboard(label, text),
+    }),
+    []
+  );
+  const stablePanelHandlers = useMemo<PanelsGridHandlers>(
+    () => ({
+      startPanelTitleEdit: (panel) =>
+        panelHandlersRef.current!.startPanelTitleEdit(panel),
+      commitPanelTitleEdit: () =>
+        panelHandlersRef.current!.commitPanelTitleEdit(),
+      cancelPanelTitleEdit: () =>
+        panelHandlersRef.current!.cancelPanelTitleEdit(),
+      removePanel: (panelId) => panelHandlersRef.current!.removePanel(panelId),
+      removeTraceFromPanel: (panelId, trace) =>
+        panelHandlersRef.current!.removeTraceFromPanel(panelId, trace),
+      setPanelTimeWindow: (panelId, value) =>
+        panelHandlersRef.current!.setPanelTimeWindow(panelId, value),
+      openPlotOptions: (panelId) =>
+        panelHandlersRef.current!.openPlotOptions(panelId),
+      closePlotOptions: () => panelHandlersRef.current!.closePlotOptions(),
+      applyPlotOptionsAxis: (panelId) =>
+        panelHandlersRef.current!.applyPlotOptionsAxis(panelId),
+      setPlotOptionsAxisMode: (panel, mode) =>
+        panelHandlersRef.current!.setPlotOptionsAxisMode(panel, mode),
+      setTelemetryYDisplayMode: (panelId, mode) =>
+        panelHandlersRef.current!.setTelemetryYDisplayMode(panelId, mode),
+      setTelemetryYOffsetMode: (panelId, mode, value) =>
+        panelHandlersRef.current!.setTelemetryYOffsetMode(panelId, mode, value),
+      setTelemetrySmoothingMode: (panelId, mode) =>
+        panelHandlersRef.current!.setTelemetrySmoothingMode(panelId, mode),
+      setTelemetrySmoothingWindow: (panelId, value) =>
+        panelHandlersRef.current!.setTelemetrySmoothingWindow(panelId, value),
+      clearPanelBuffers: (panelId) =>
+        panelHandlersRef.current!.clearPanelBuffers(panelId),
+      clearStreamPanelFrames: (panelId) =>
+        panelHandlersRef.current!.clearStreamPanelFrames(panelId),
+      clearStreamBinStatsPanel: (panelId) =>
+        panelHandlersRef.current!.clearStreamBinStatsPanel(panelId),
+      clearStreamBin2dPanel: (panelId) =>
+        panelHandlersRef.current!.clearStreamBin2dPanel(panelId),
+      setStreamAnalysisPanelWorkspace: (panelId, workspaceId) =>
+        panelHandlersRef.current!.setStreamAnalysisPanelWorkspace(
+          panelId,
+          workspaceId
+        ),
+      setStreamAnalysisPanelOutput: (panelId, outputId) =>
+        panelHandlersRef.current!.setStreamAnalysisPanelOutput(
+          panelId,
+          outputId
+        ),
+      openExpandedPlot: (panelId) =>
+        panelHandlersRef.current!.openExpandedPlot(panelId),
+      openStreamTraceOptionsModal: (panelId) =>
+        panelHandlersRef.current!.openStreamTraceOptionsModal(panelId),
+      openStreamBin2dOptionsModal: (panelId) =>
+        panelHandlersRef.current!.openStreamBin2dOptionsModal(panelId),
+      openStreamParamsOptionsModal: (panelId) =>
+        panelHandlersRef.current!.openStreamParamsOptionsModal(panelId),
+      openStreamBinStatsOptionsModal: (panelId) =>
+        panelHandlersRef.current!.openStreamBinStatsOptionsModal(panelId),
+    }),
+    []
+  );
+
   const yAxisDraftMinNum = parseNumberInput(yAxisDraftMin);
   const yAxisDraftMaxNum = parseNumberInput(yAxisDraftMax);
   const yAxisDraftInvalid =
@@ -4436,41 +4559,8 @@ export function App() {
                 streamWsConnected={streamWsConnected}
                 streamAnalysisWsConnected={streamAnalysisWsConnected}
                 activeUiDrag={activeUiDrag}
-                helpers={{
-                  resolveTelemetryPanelOffset,
-                  streamTraceOverlaySeries,
-                  streamBinStatsOverlaySeries,
-                  streamBinStatsFitOverlayCurves,
-                  isExpandablePlotPanel,
-                  copyTextToClipboard,
-                }}
-                handlers={{
-                  startPanelTitleEdit,
-                  commitPanelTitleEdit,
-                  cancelPanelTitleEdit,
-                  removePanel,
-                  removeTraceFromPanel,
-                  setPanelTimeWindow,
-                  openPlotOptions,
-                  closePlotOptions,
-                  applyPlotOptionsAxis,
-                  setPlotOptionsAxisMode,
-                  setTelemetryYDisplayMode,
-                  setTelemetryYOffsetMode,
-                  setTelemetrySmoothingMode,
-                  setTelemetrySmoothingWindow,
-                  clearPanelBuffers,
-                  clearStreamPanelFrames,
-                  clearStreamBinStatsPanel,
-                  clearStreamBin2dPanel,
-                  setStreamAnalysisPanelWorkspace,
-                  setStreamAnalysisPanelOutput,
-                  openExpandedPlot,
-                  openStreamTraceOptionsModal,
-                  openStreamBin2dOptionsModal,
-                  openStreamParamsOptionsModal,
-                  openStreamBinStatsOptionsModal,
-                }}
+                helpers={stablePanelHelpers}
+                handlers={stablePanelHandlers}
               />
             </Stack>
           </section>
