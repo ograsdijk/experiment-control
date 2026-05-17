@@ -178,6 +178,7 @@ import { useTelemetryStream } from "./features/telemetry/useTelemetryStream";
 import { useTelemetry } from "./features/telemetry/TelemetryContext";
 import { useStreamAnalysis } from "./features/stream_analysis/StreamAnalysisContext";
 import { useDaqDraftEditors } from "./features/stream_analysis/useDaqDraftEditors";
+import { useDaqModalLifecycle } from "./features/stream_analysis/useDaqModalLifecycle";
 import { useDevicesContext } from "./features/devices/DevicesContext";
 import { useCommands } from "./features/commands/CommandsContext";
 import { useLayout } from "./features/layout/LayoutContext";
@@ -4377,99 +4378,20 @@ export function App() {
     }
   };
 
-  const focusDaqNodeCard = (nodeId: string) => {
-    const normalizedNodeId = String(nodeId ?? "").trim();
-    if (!normalizedNodeId) {
-      return;
-    }
-    const card = daqNodeCardRefs.current.get(normalizedNodeId);
-    if (card) {
-      card.scrollIntoView({
-        behavior: "smooth",
-        block: "center",
-        inline: "nearest",
-      });
-    }
-    setDaqFocusedNodeId(normalizedNodeId);
-    if (daqNodeFocusTimeoutRef.current !== null) {
-      window.clearTimeout(daqNodeFocusTimeoutRef.current);
-      daqNodeFocusTimeoutRef.current = null;
-    }
-    daqNodeFocusTimeoutRef.current = window.setTimeout(() => {
-      setDaqFocusedNodeId((current) =>
-        current === normalizedNodeId ? null : current
-      );
-      daqNodeFocusTimeoutRef.current = null;
-    }, 1600);
-  };
-
-  const loadDaqWorkspaceDraft = (workspaceId: string | null) => {
-    const id = String(workspaceId ?? "").trim();
-    if (!id) {
-      return;
-    }
-    const workspace = streamWorkspacesRef.current[id];
-    if (!workspace) {
-      return;
-    }
-    setDaqWorkspaceId(id);
-    setDaqDraftName(workspace.name);
-    setDaqDraftNodes(cloneDagNodes(workspace.graphNodes));
-    setDaqDraftOutputs(cloneDagOutputs(workspace.publishOutputs));
-    setDaqDraftEnabled(workspace.enabled !== false);
-    setDaqFocusedNodeId(null);
-    daqNodeCardRefs.current.clear();
-  };
-
-  const createStreamWorkspace = () => {
-    const nextId = Math.max(1, Math.trunc(streamWorkspaceIdRef.current));
-    const workspaceId = `workspace-${nextId}`;
-    streamWorkspaceIdRef.current = nextId + 1;
-    const workspace = defaultStreamAnalysisWorkspaceConfig(workspaceId);
-    workspace.name = `Workspace ${nextId}`;
-    setStreamWorkspaces((prev) => ({ ...prev, [workspaceId]: workspace }));
-    streamWorkspacesRef.current = {
-      ...streamWorkspacesRef.current,
-      [workspaceId]: workspace,
-    };
-    loadDaqWorkspaceDraft(workspaceId);
-  };
-
-  const openDaqModal = async (workspaceId?: string | null) => {
-    if (!streamAnalysisReadyRef.current) {
-      notifications.show({
-        color: "yellow",
-        title: "stream_analysis not running",
-        message: "Start the stream_analysis process first.",
-      });
-      return;
-    }
-    if (streamAnalysisReadyRef.current) {
-      await loadStreamAnalysisWorkspaces("daq-modal-open", { notifyOnError: false });
-    }
-    const preferred = String(workspaceId ?? "").trim();
-    const knownIds = Object.keys(streamWorkspacesRef.current).sort();
-    if (knownIds.length === 0) {
-      createStreamWorkspace();
-      setDaqOpen(true);
-      return;
-    }
-    const nextId =
-      (preferred && streamWorkspacesRef.current[preferred] ? preferred : null) ??
-      daqWorkspaceId ??
-      knownIds[0];
-    loadDaqWorkspaceDraft(nextId);
-    setDaqOpen(true);
-  };
-
-  const closeDaqModal = () => {
-    setDaqOpen(false);
-    setDaqFocusedNodeId(null);
-    if (daqNodeFocusTimeoutRef.current !== null) {
-      window.clearTimeout(daqNodeFocusTimeoutRef.current);
-      daqNodeFocusTimeoutRef.current = null;
-    }
-  };
+  // DAQ workspace modal lifecycle (round 22). See
+  // features/stream_analysis/useDaqModalLifecycle.ts. Open / close /
+  // load / create + the focus-highlight helper. Takes
+  // loadStreamAnalysisWorkspaces from App as an arg because it's
+  // still defined inline above.
+  const {
+    focusDaqNodeCard,
+    loadDaqWorkspaceDraft,
+    createStreamWorkspace,
+    openDaqModal,
+    closeDaqModal,
+  } = useDaqModalLifecycle({
+    loadStreamAnalysisWorkspaces,
+  });
 
   // DAQ draft node/output editors (round 21). See
   // features/stream_analysis/useDaqDraftEditors.ts. Pure draft-state
