@@ -10,7 +10,9 @@ import ReactDOM from "react-dom/client";
 import { App } from "./App";
 import { CommandsProvider } from "./features/commands/CommandsContext";
 import { DevicesProvider } from "./features/devices/DevicesContext";
+import { LayoutProvider } from "./features/layout/LayoutContext";
 import { LogsProvider } from "./features/logs/LogsContext";
+import { PanelsProvider } from "./features/panels/PanelsContext";
 import { SettingsProvider } from "./features/runtime/SettingsContext";
 import { StreamAnalysisProvider } from "./features/stream_analysis/StreamAnalysisContext";
 import { TelemetryProvider } from "./features/telemetry/TelemetryContext";
@@ -26,19 +28,23 @@ ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
     <MantineProvider theme={theme} defaultColorScheme="auto">
       <Notifications position="top-right" />
-      <TelemetryProvider>
-        <StreamAnalysisProvider>
-          <DevicesProvider>
-            <CommandsProvider>
-              <LogsProvider>
-                <SettingsProvider>
-                  <App />
-                </SettingsProvider>
-              </LogsProvider>
-            </CommandsProvider>
-          </DevicesProvider>
-        </StreamAnalysisProvider>
-      </TelemetryProvider>
+      <LayoutProvider>
+        <TelemetryProvider>
+          <StreamAnalysisProvider>
+            <DevicesProvider>
+              <CommandsProvider>
+                <LogsProvider>
+                  <SettingsProvider>
+                    <PanelsProvider>
+                      <App />
+                    </PanelsProvider>
+                  </SettingsProvider>
+                </LogsProvider>
+              </CommandsProvider>
+            </DevicesProvider>
+          </StreamAnalysisProvider>
+        </TelemetryProvider>
+      </LayoutProvider>
     </MantineProvider>
   </React.StrictMode>
 );
