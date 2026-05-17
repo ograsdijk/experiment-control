@@ -186,6 +186,7 @@ import { usePanelDerivations } from "./features/panels/usePanelDerivations";
 import { usePanelUiHandlers } from "./features/panels/usePanelUiHandlers";
 import { usePanelAutoRangeHandlers } from "./features/panels/usePanelAutoRangeHandlers";
 import { useStreamPanelHandlers } from "./features/panels/useStreamPanelHandlers";
+import { useStreamWorkspaceHandlers } from "./features/panels/useStreamWorkspaceHandlers";
 import {
   streamBinStatsFitOverlayCurves as streamBinStatsFitOverlayCurvesImpl,
   streamBinStatsOverlaySeries as streamBinStatsOverlaySeriesImpl,
@@ -1012,6 +1013,25 @@ export function App() {
   } = useStreamPanelHandlers({
     streamCatalogByKey,
     streamAnalysisReadyRef,
+  });
+
+  // Stream-trace source/workspace/output + stream-analysis panel
+  // workspace/output switches + binstats overlay/fit-overlay setters
+  // (round 18). See features/panels/useStreamWorkspaceHandlers.ts.
+  // Takes clearPanelBuffers from useStreamPanelHandlers because the
+  // workspace switches clear accumulated buffers on scalar panels.
+  const {
+    setStreamTracePanelSourceMode,
+    setStreamTracePanelWorkspace,
+    setStreamTracePanelOutput,
+    setStreamTracePanelOverlayOutputs,
+    setStreamAnalysisPanelWorkspace,
+    setStreamAnalysisPanelOutput,
+    setStreamParamsPanelOutputs,
+    setStreamBinStatsOverlayOutputs,
+    setStreamBinStatsFitOverlayOutputs,
+  } = useStreamWorkspaceHandlers({
+    clearPanelBuffers,
   });
 
   // Overlay-series helpers (round 16 extraction). The render loop +
@@ -4576,324 +4596,17 @@ export function App() {
   // setStreamPanelTraceMaxFps now provided by useStreamPanelHandlers.
   // setStreamPanelRollingWindow now provided by useStreamPanelHandlers.
   // setStreamPanelAverageMode now provided by useStreamPanelHandlers.
-  const setStreamTracePanelSourceMode = (
-    panelId: string,
-    sourceMode: StreamTraceSourceMode
-  ) => {
-    setPanels((prev) =>
-      prev.map((panel) => {
-        if (panel.id !== panelId || !isStreamTracePanel(panel)) {
-          return panel;
-        }
-        if (panel.sourceMode === sourceMode) {
-          return panel;
-        }
-        if (sourceMode === "raw") {
-          return {
-            ...panel,
-            sourceMode: "raw",
-            overlayOutputIds: [],
-          };
-        }
-        const workspaceId =
-          panel.workspaceId && streamWorkspacesRef.current[panel.workspaceId]
-            ? panel.workspaceId
-            : Object.keys(streamWorkspacesRef.current).sort()[0] ?? panel.workspaceId;
-        const workspace = workspaceId
-          ? streamWorkspacesRef.current[workspaceId] ?? null
-          : null;
-        const outputId =
-          panel.outputId &&
-          workspace &&
-          workspaceOutputKind(workspace, panel.outputId) === "trace"
-            ? panel.outputId
-            : defaultOutputForKind(workspace, "trace");
-        return {
-          ...panel,
-          sourceMode: "dag",
-          workspaceId,
-          outputId,
-          overlayOutputIds: [],
-          stream: workspace?.stream ?? panel.stream,
-          channelIndex: workspace?.channelIndex ?? panel.channelIndex,
-        };
-      })
-    );
-    streamFramesRef.set(panelId, []);
-    streamTraceOverlayRef.set(panelId, new Map());
-    setPlotTick((tick) => tick + 1);
-  };
-
-  const setStreamTracePanelWorkspace = (
-    panelId: string,
-    workspaceId: string | null
-  ) => {
-    const nextWorkspaceId = String(workspaceId ?? "").trim();
-    const workspace = streamWorkspacesRef.current[nextWorkspaceId] ?? null;
-    if (!nextWorkspaceId || !workspace) {
-      return;
-    }
-    setPanels((prev) =>
-      prev.map((panel) => {
-        if (
-          panel.id !== panelId ||
-          !isStreamTracePanel(panel) ||
-          panel.sourceMode !== "dag"
-        ) {
-          return panel;
-        }
-        const outputId = defaultOutputForKind(workspace, "trace");
-        return {
-          ...panel,
-          workspaceId: nextWorkspaceId,
-          outputId,
-          overlayOutputIds: [],
-          stream: workspace.stream,
-          channelIndex: workspace.channelIndex,
-        };
-      })
-    );
-    streamFramesRef.set(panelId, []);
-    streamTraceOverlayRef.set(panelId, new Map());
-    setPlotTick((tick) => tick + 1);
-  };
-
-  const setStreamTracePanelOutput = (panelId: string, outputId: string | null) => {
-    const nextOutputId = String(outputId ?? "").trim() || null;
-    setPanels((prev) =>
-      prev.map((panel) => {
-        if (
-          panel.id !== panelId ||
-          !isStreamTracePanel(panel) ||
-          panel.sourceMode !== "dag"
-        ) {
-          return panel;
-        }
-        return {
-          ...panel,
-          outputId: nextOutputId,
-          overlayOutputIds: (panel.overlayOutputIds ?? []).filter(
-            (id) => id !== nextOutputId
-          ),
-        };
-      })
-    );
-    streamFramesRef.set(panelId, []);
-    streamTraceOverlayRef.set(panelId, new Map());
-    setPlotTick((tick) => tick + 1);
-  };
-
-  const setStreamTracePanelOverlayOutputs = (
-    panelId: string,
-    outputIds: string[]
-  ) => {
-    const nextSet = new Set(
-      outputIds
-        .map((value) => String(value ?? "").trim())
-        .filter((value) => value.length > 0)
-    );
-    setPanels((prev) =>
-      prev.map((panel) => {
-        if (
-          panel.id !== panelId ||
-          !isStreamTracePanel(panel) ||
-          panel.sourceMode !== "dag"
-        ) {
-          return panel;
-        }
-        const primary = String(panel.outputId ?? "").trim();
-        if (primary) {
-          nextSet.delete(primary);
-        }
-        return {
-          ...panel,
-          overlayOutputIds: [...nextSet],
-        };
-      })
-    );
-    streamTraceOverlayRef.set(panelId, new Map());
-    setPlotTick((tick) => tick + 1);
-  };
-
-  const setStreamAnalysisPanelWorkspace = (
-    panelId: string,
-    workspaceId: string | null
-  ) => {
-    const nextWorkspaceId = String(workspaceId ?? "").trim();
-    const nextWorkspace = streamWorkspacesRef.current[nextWorkspaceId];
-    if (!nextWorkspaceId || !nextWorkspace) {
-      return;
-    }
-    const panel = panels.find((entry) => entry.id === panelId);
-    if (
-      !panel ||
-      (!isStreamScalarPanel(panel) &&
-        !isStreamParamsPanel(panel) &&
-        !isStreamBinStatsPanel(panel) &&
-        !isStreamBin2dPanel(panel))
-    ) {
-      return;
-    }
-    if (panel.workspaceId === nextWorkspaceId) {
-      return;
-    }
-    const nextOutputId = isStreamScalarPanel(panel)
-      ? defaultOutputForKind(nextWorkspace, "scalar")
-      : isStreamParamsPanel(panel)
-      ? null
-      : isStreamBinStatsPanel(panel)
-      ? defaultOutputForKind(nextWorkspace, "hist_agg")
-      : defaultOutputForKind(nextWorkspace, "hist2d");
-    const updated = isStreamScalarPanel(panel)
-      ? ({
-          ...panel,
-          workspaceId: nextWorkspaceId,
-          outputId: nextOutputId,
-          stream: nextWorkspace.stream,
-          channelIndex: nextWorkspace.channelIndex,
-          analysis: nextWorkspace.analysis,
-        } as PlotStreamScalarPanelState)
-      : isStreamParamsPanel(panel)
-      ? ({
-          ...panel,
-          workspaceId: nextWorkspaceId,
-          outputIds: (() => {
-            const paramsOutputs = workspaceOutputOptionsByKind(
-              nextWorkspace,
-              "params_map"
-            ).map((item) => item.value);
-            if (paramsOutputs.length > 0) {
-              return paramsOutputs;
-            }
-            const firstScalar = defaultOutputForKind(nextWorkspace, "scalar");
-            return firstScalar ? [firstScalar] : [];
-          })(),
-        } as PlotStreamParamsPanelState)
-      : isStreamBinStatsPanel(panel)
-      ? ({
-          ...panel,
-          workspaceId: nextWorkspaceId,
-          outputId: nextOutputId,
-          overlayOutputIds: [],
-          fitOverlayOutputIds: [],
-          stream: nextWorkspace.stream,
-          channelIndex: nextWorkspace.channelIndex,
-          analysis: nextWorkspace.analysis,
-          binStats: nextWorkspace.binStats,
-        } as PlotStreamBinStatsPanelState)
-      : ({
-          ...panel,
-          workspaceId: nextWorkspaceId,
-          outputId: nextOutputId,
-        } as PlotStreamBin2dPanelState);
-    setPanels((prev) =>
-      prev.map((entry) => (entry.id === panelId ? updated : entry))
-    );
-    if (isStreamScalarPanel(panel)) {
-      clearPanelBuffers(panelId);
-    } else if (isStreamParamsPanel(panel)) {
-      streamParamsLatestRef.set(panelId, {});
-      setPlotTick((tick) => tick + 1);
-    } else if (isStreamBinStatsPanel(panel)) {
-      streamBinStatsRef.delete(panelId);
-      streamBinStatsOverlayRef.set(panelId, new Map());
-      streamBinStatsFitOverlayRef.set(panelId, new Map());
-      setPlotTick((tick) => tick + 1);
-    } else {
-      streamBin2dRef.delete(panelId);
-      setPlotTick((tick) => tick + 1);
-    }
-  };
-
-  const setStreamAnalysisPanelOutput = (panelId: string, outputId: string | null) => {
-    const nextOutputId = String(outputId ?? "").trim() || null;
-    const panel = panels.find((entry) => entry.id === panelId);
-    if (
-      !panel ||
-      (!isStreamScalarPanel(panel) &&
-        !isStreamBinStatsPanel(panel) &&
-        !isStreamBin2dPanel(panel))
-    ) {
-      return;
-    }
-    setPanels((prev) =>
-      prev.map((entry) => {
-        if (entry.id !== panelId) {
-          return entry;
-        }
-        if (isStreamScalarPanel(entry)) {
-          return { ...entry, outputId: nextOutputId };
-        }
-        if (isStreamBinStatsPanel(entry)) {
-          return { ...entry, outputId: nextOutputId };
-        }
-        return { ...entry, outputId: nextOutputId };
-      })
-    );
-    if (isStreamScalarPanel(panel)) {
-      clearPanelBuffers(panelId);
-    } else if (isStreamBinStatsPanel(panel)) {
-      streamBinStatsRef.delete(panelId);
-      streamBinStatsOverlayRef.set(panelId, new Map());
-      streamBinStatsFitOverlayRef.set(panelId, new Map());
-      setPlotTick((tick) => tick + 1);
-    } else {
-      streamBin2dRef.delete(panelId);
-      setPlotTick((tick) => tick + 1);
-    }
-  };
-
+  // setStreamTracePanelSourceMode now provided by useStreamWorkspaceHandlers.
+  // setStreamTracePanelWorkspace now provided by useStreamWorkspaceHandlers.
+  // setStreamTracePanelOutput now provided by useStreamWorkspaceHandlers.
+  // setStreamTracePanelOverlayOutputs now provided by useStreamWorkspaceHandlers.
+  // setStreamAnalysisPanelWorkspace now provided by useStreamWorkspaceHandlers.
+  // setStreamAnalysisPanelOutput now provided by useStreamWorkspaceHandlers.
   // setStreamBinStatsUncertainty + setStreamBinStatsShowBinMarkers now
   // provided by usePanelUiHandlers.
-
-  const setStreamParamsPanelOutputs = (panelId: string, outputIds: string[]) => {
-    const next = outputIds
-      .map((value) => String(value ?? "").trim())
-      .filter((value) => value.length > 0);
-    setPanels((prev) =>
-      prev.map((panel) =>
-        panel.id === panelId && isStreamParamsPanel(panel)
-          ? { ...panel, outputIds: next }
-          : panel
-      )
-    );
-    streamParamsLatestRef.set(panelId, {});
-    setPlotTick((tick) => tick + 1);
-  };
-
-  const setStreamBinStatsOverlayOutputs = (panelId: string, outputIds: string[]) => {
-    const next = outputIds
-      .map((value) => String(value ?? "").trim())
-      .filter((value) => value.length > 0);
-    setPanels((prev) =>
-      prev.map((panel) =>
-        panel.id === panelId && isStreamBinStatsPanel(panel)
-          ? { ...panel, overlayOutputIds: next }
-          : panel
-      )
-    );
-    streamBinStatsOverlayRef.set(panelId, new Map());
-    setPlotTick((tick) => tick + 1);
-  };
-
-  const setStreamBinStatsFitOverlayOutputs = (
-    panelId: string,
-    outputIds: string[]
-  ) => {
-    const next = outputIds
-      .map((value) => String(value ?? "").trim())
-      .filter((value) => value.length > 0);
-    setPanels((prev) =>
-      prev.map((panel) =>
-        panel.id === panelId && isStreamBinStatsPanel(panel)
-          ? { ...panel, fitOverlayOutputIds: next }
-          : panel
-      )
-    );
-    streamBinStatsFitOverlayRef.set(panelId, new Map());
-    setPlotTick((tick) => tick + 1);
-  };
-
+  // setStreamParamsPanelOutputs now provided by useStreamWorkspaceHandlers.
+  // setStreamBinStatsOverlayOutputs now provided by useStreamWorkspaceHandlers.
+  // setStreamBinStatsFitOverlayOutputs now provided by useStreamWorkspaceHandlers.
   // setStreamBin2dReducer now provided by usePanelUiHandlers.
   // clearWorkspaceBinPanels now provided by useStreamPanelHandlers.
   const resetDaqNodeAggregate = async (nodeId: string) => {
