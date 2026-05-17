@@ -20,6 +20,7 @@ import {
 import { useStreamAnalysis } from "../stream_analysis/StreamAnalysisContext";
 import { useTelemetry } from "../telemetry/TelemetryContext";
 import { usePanels } from "./PanelsContext";
+import { usePlotTick } from "./PlotTickContext";
 
 /**
  * Workspace / output handlers for stream panels.
@@ -54,7 +55,8 @@ export interface StreamWorkspaceHandlersArgs {
 
 export function useStreamWorkspaceHandlers(args: StreamWorkspaceHandlersArgs) {
   const { clearPanelBuffers } = args;
-  const { panels, setPanels, setPlotTick } = usePanels();
+  const { panels, setPanels } = usePanels();
+  const { setPlotTick } = usePlotTick();
   const { streamWorkspacesRef } = useStreamAnalysis();
   const {
     streamFramesRef,

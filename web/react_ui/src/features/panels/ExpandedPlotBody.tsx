@@ -25,6 +25,7 @@ import { workspaceXAxisLabel } from "../stream/workspace";
 import { useStreamAnalysis } from "../stream_analysis/StreamAnalysisContext";
 import { useTelemetry } from "../telemetry/TelemetryContext";
 import { usePanels } from "./PanelsContext";
+import { usePlotTick } from "./PlotTickContext";
 
 /**
  * Expanded-plot modal body — renders a single panel at the larger
@@ -81,7 +82,7 @@ export function ExpandedPlotBody({
   streamBinStatsOverlaySeries,
   streamBinStatsFitOverlayCurves,
 }: ExpandedPlotBodyProps) {
-  const { plotTick } = usePanels();
+  const { plotTick } = usePlotTick();
   const {
     buffersRef,
     streamFramesRef,

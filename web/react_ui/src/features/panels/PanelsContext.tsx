@@ -83,9 +83,9 @@ export interface PanelsContextValue {
   // -----------------------------------------------------------------
   // Plot re-render pulse — bumped by telemetry handlers after
   // out-of-band buffer pushes so panel components know to refresh.
+  // Moved to features/panels/PlotTickContext.tsx (round 34) so
+  // `usePanels()` consumers don't re-render at the WS-sample rate.
   // -----------------------------------------------------------------
-  plotTick: number;
-  setPlotTick: Dispatch<SetStateAction<number>>;
 
   // -----------------------------------------------------------------
   // Modal-panel-id state — which panel currently has each modal open
@@ -155,8 +155,6 @@ export function PanelsProvider({ children }: { children: ReactNode }) {
   const panelsRef = useRef<PlotPanelState[]>(initial.panels);
   const panelIdRef = useRef<number>(initial.nextPanelId);
 
-  const [plotTick, setPlotTick] = useState(0);
-
   const [plotOptionsPanelId, setPlotOptionsPanelId] = useState<string | null>(
     null
   );
@@ -212,8 +210,6 @@ export function PanelsProvider({ children }: { children: ReactNode }) {
       setActivePanelId,
       panelsRef,
       panelIdRef,
-      plotTick,
-      setPlotTick,
       plotOptionsPanelId,
       setPlotOptionsPanelId,
       expandedPlotPanelId,
@@ -240,7 +236,6 @@ export function PanelsProvider({ children }: { children: ReactNode }) {
     [
       panels,
       activePanelId,
-      plotTick,
       plotOptionsPanelId,
       expandedPlotPanelId,
       streamTraceOptionsPanelId,
