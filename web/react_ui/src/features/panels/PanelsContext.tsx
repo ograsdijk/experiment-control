@@ -115,6 +115,14 @@ export interface PanelsContextValue {
   setYAxisAutoRange: Dispatch<
     SetStateAction<{ min: number; max: number } | null>
   >;
+
+  // -----------------------------------------------------------------
+  // Panel title editor (transient draft state)
+  // -----------------------------------------------------------------
+  editingPanelId: string | null;
+  setEditingPanelId: Dispatch<SetStateAction<string | null>>;
+  panelTitleDraft: string;
+  setPanelTitleDraft: Dispatch<SetStateAction<string>>;
 }
 
 const PanelsContext = createContext<PanelsContextValue | null>(null);
@@ -174,6 +182,9 @@ export function PanelsProvider({ children }: { children: ReactNode }) {
     max: number;
   } | null>(null);
 
+  const [editingPanelId, setEditingPanelId] = useState<string | null>(null);
+  const [panelTitleDraft, setPanelTitleDraft] = useState("");
+
   // Keep panelsRef in sync so closures (telemetry message handlers,
   // animation-frame callbacks, etc.) always see the latest panels
   // array without subscribing to re-renders.
@@ -221,6 +232,10 @@ export function PanelsProvider({ children }: { children: ReactNode }) {
       setYAxisDraftMax,
       yAxisAutoRange,
       setYAxisAutoRange,
+      editingPanelId,
+      setEditingPanelId,
+      panelTitleDraft,
+      setPanelTitleDraft,
     }),
     [
       panels,
@@ -235,6 +250,8 @@ export function PanelsProvider({ children }: { children: ReactNode }) {
       yAxisDraftMin,
       yAxisDraftMax,
       yAxisAutoRange,
+      editingPanelId,
+      panelTitleDraft,
     ]
   );
 
