@@ -145,7 +145,7 @@ import {
 import { useProcessCommandController } from "./features/processes/useProcessCommandController";
 import { useProcessLifecycleController } from "./features/processes/useProcessLifecycleController";
 import { useProcessesController } from "./features/processes/useProcessesController";
-import { useTelemetryStream } from "./features/telemetry/useTelemetryStream";
+import { useTelemetryPipeline } from "./features/telemetry/useTelemetryPipeline";
 import { useRawStreamSubscriptions } from "./features/telemetry/useRawStreamSubscriptions";
 import { useStreamAnalysisSubscriptions } from "./features/stream_analysis/useStreamAnalysisSubscriptions";
 import { useTelemetry } from "./features/telemetry/TelemetryContext";
@@ -1509,136 +1509,10 @@ export function App() {
     unregisterPanelTelemetry,
   ]);
 
-  const handleTelemetryHydrate = useCallback(
-    (snapshot: LatestSignals) => {
-      const booleanSignalKeys = new Set<string>();
-      let pushedSamples = false;
-      const reverseIndex = panelBuffersByTraceKey.current;
-      for (const [deviceId, signals] of Object.entries(snapshot)) {
-        for (const [name, signal] of Object.entries(signals)) {
-          const traceKey = `${deviceId}:${name}`;
-          let plotValue: number | null = null;
-          if (typeof signal.value === "number" && Number.isFinite(signal.value)) {
-            plotValue = signal.value;
-          } else if (typeof signal.value === "boolean") {
-            plotValue = signal.value ? 1 : 0;
-            booleanSignalKeys.add(traceKey);
-          }
-          if (plotValue !== null) {
-            // P5: O(1) lookup via reverse index instead of walking every
-            // panel's buffer map.
-            const panelIds = reverseIndex.get(traceKey);
-            if (panelIds) {
-              for (const panelId of panelIds) {
-                const buffer = buffersRef.get(panelId)?.get(traceKey);
-                if (buffer) {
-                  buffer.push(normalizeTime(signal), plotValue);
-                  pushedSamples = true;
-                }
-              }
-            }
-          }
-        }
-      }
-      if (booleanSignalKeys.size > 0) {
-        setPanels((prev) => {
-          let changed = false;
-          const next = prev.map((panel) => {
-            if (!isTelemetryPanel(panel)) {
-              return panel;
-            }
-            let tracesChanged = false;
-            const nextTraces = panel.traces.map((trace) => {
-              const key = `${trace.deviceId}:${trace.signal}`;
-              if (!booleanSignalKeys.has(key) || trace.valueKind === "boolean") {
-                return trace;
-              }
-              tracesChanged = true;
-              changed = true;
-              return { ...trace, valueKind: "boolean" as const };
-            });
-            return tracesChanged ? { ...panel, traces: nextTraces } : panel;
-          });
-          return changed ? next : prev;
-        });
-      }
-      if (pushedSamples) {
-        setPlotTick((tick) => tick + 1);
-      }
-    },
-    [buffersRef, panelBuffersByTraceKey]
-  );
-
-
-
-  const handleTelemetryMessage = useCallback(
-    (msg: TelemetryMessage) => {
-      const deviceId = msg.payload?.device_id;
-      if (!deviceId) {
-        return;
-      }
-      const bundleTs = msg.payload.ts?.t_wall;
-      const booleanSignalKeys = new Set<string>();
-      let pushedSamples = false;
-      const reverseIndex = panelBuffersByTraceKey.current;
-      for (const [name, signal] of Object.entries(msg.payload.signals ?? {})) {
-        const traceKey = `${deviceId}:${name}`;
-        let plotValue: number | null = null;
-        if (typeof signal.value === "number" && Number.isFinite(signal.value)) {
-          plotValue = signal.value;
-        } else if (typeof signal.value === "boolean") {
-          plotValue = signal.value ? 1 : 0;
-          booleanSignalKeys.add(traceKey);
-        }
-        if (plotValue !== null) {
-          // P5: O(1) lookup via reverse index instead of walking every
-          // panel's buffer map for each incoming signal.
-          const panelIds = reverseIndex.get(traceKey);
-          if (panelIds) {
-            for (const panelId of panelIds) {
-              const buffer = buffersRef.get(panelId)?.get(traceKey);
-              if (buffer) {
-                buffer.push(normalizeTime(signal, bundleTs), plotValue);
-                pushedSamples = true;
-              }
-            }
-          }
-        }
-      }
-      if (pushedSamples) {
-        setPlotTick((tick) => tick + 1);
-      }
-      if (booleanSignalKeys.size > 0) {
-        setPanels((prev) => {
-          let changed = false;
-          const next = prev.map((panel) => {
-            if (!isTelemetryPanel(panel)) {
-              return panel;
-            }
-            let tracesChanged = false;
-            const nextTraces = panel.traces.map((trace) => {
-              const key = `${trace.deviceId}:${trace.signal}`;
-              if (!booleanSignalKeys.has(key) || trace.valueKind === "boolean") {
-                return trace;
-              }
-              tracesChanged = true;
-              changed = true;
-              return { ...trace, valueKind: "boolean" as const };
-            });
-            return tracesChanged ? { ...panel, traces: nextTraces } : panel;
-          });
-          return changed ? next : prev;
-        });
-      }
-    },
-    [buffersRef, panelBuffersByTraceKey]
-  );
-
-  const { latestByDevice, wsConnected, telemetryActive } = useTelemetryStream({
-    hydrate: true,
-    onHydrate: handleTelemetryHydrate,
-    onMessage: handleTelemetryMessage,
-  });
+  // Telemetry pipeline (round 33). See features/telemetry/useTelemetryPipeline.ts.
+  // Owns the /ws/telemetry connection + per-sample fan-out into panel
+  // buffers + the boolean-promotion logic on telemetry traces.
+  const { latestByDevice, wsConnected, telemetryActive } = useTelemetryPipeline();
 
 
 
