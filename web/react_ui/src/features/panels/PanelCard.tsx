@@ -1,4 +1,4 @@
-import { type CSSProperties } from "react";
+import { memo, type CSSProperties } from "react";
 import {
   ActionIcon,
   Badge,
@@ -120,7 +120,7 @@ export interface PanelCardProps {
   handlers: PanelsGridHandlers;
 }
 
-export function PanelCard({
+function PanelCardImpl({
   panel,
   streamWorkspaceOptions,
   yAxisDraftInvalid,
@@ -1221,3 +1221,22 @@ export function PanelCard({
                     </ReorderableCardShell>
                   );
 }
+
+/**
+ * Memoized export — skips re-rendering when none of the props change.
+ *
+ * Caveat: PanelCardImpl still subscribes to PanelsContext +
+ * TelemetryContext + StreamAnalysisContext directly via hooks, so any
+ * change in those contexts (notably `plotTick`, which fires on every
+ * telemetry sample) still re-renders every PanelCard. The memo wrapper
+ * only stops re-renders that come from the parent `<PanelsGrid>`
+ * re-rendering with unchanged props — which is the dominant case
+ * when App.tsx itself re-renders for unrelated reasons (e.g.
+ * sequencer ticks, command-deck updates).
+ *
+ * For a deeper win the parent must memoize the `helpers` and
+ * `handlers` bags it passes in, and the per-tick context coupling
+ * needs to be narrowed (split `plotTick` into its own context).
+ * Those are follow-ups.
+ */
+export const PanelCard = memo(PanelCardImpl);
