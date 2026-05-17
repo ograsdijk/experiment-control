@@ -18,6 +18,7 @@ import {
 } from "../stream/utils";
 import { isTelemetryPanel } from "../stream/panel_helpers";
 import { usePanels } from "./PanelsContext";
+import { usePlotTick } from "./PlotTickContext";
 
 /**
  * Panel UI / Y-axis / modal-toggle handlers.
@@ -72,10 +73,9 @@ export function usePanelUiHandlers() {
     setStreamTraceOptionsPanelId,
     setStreamBinStatsOptionsPanelId,
     setStreamParamsOptionsPanelId,
-    setStreamBin2dOptionsPanelId,
-    setPlotTick,
-    panels,
+    setStreamBin2dOptionsPanelId,    panels,
   } = usePanels();
+  const { setPlotTick } = usePlotTick();
 
   const setPanelYScaleMode = (panelId: string, mode: YScaleMode) => {
     setPanels((prev) =>

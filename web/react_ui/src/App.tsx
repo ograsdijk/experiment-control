@@ -329,6 +329,7 @@ import {
 import { useSequencerController } from "./features/sequencer/useSequencerController";
 import { RingBuffer } from "./utils/ringBuffer";
 import { colorWithAlpha, traceColorAt } from "./utils/traceColors";
+import { usePlotTick } from "./features/panels/PlotTickContext";
 import {
   CommandDeckCommandEntry,
   CommandDeckEntry,
@@ -528,10 +529,7 @@ export function App() {
     activePanelId,
     setActivePanelId,
     panelsRef,
-    panelIdRef,
-    plotTick,
-    setPlotTick,
-    plotOptionsPanelId,
+    panelIdRef,    plotOptionsPanelId,
     setPlotOptionsPanelId,
     expandedPlotPanelId,
     setExpandedPlotPanelId,
@@ -553,6 +551,7 @@ export function App() {
     panelTitleDraft,
     setPanelTitleDraft,
   } = usePanels();
+  const { plotTick, setPlotTick } = usePlotTick();
   // streamWsConnected + streamAnalysisWsConnected moved out of useState
   // and into useRawStreamSubscriptions / useStreamAnalysisSubscriptions
   // hook returns (round 34). See the hook calls further down.

@@ -29,6 +29,7 @@ import {
 } from "../stream/workspace";
 import { useTelemetry } from "../telemetry/TelemetryContext";
 import { useStreamAnalysis } from "./StreamAnalysisContext";
+import { usePlotTick } from "../panels/PlotTickContext";
 
 /**
  * `applyDaqWorkspace` — validate the DAQ workspace draft, commit it
@@ -99,7 +100,8 @@ export function useDaqWorkspaceApply(args: DaqWorkspaceApplyArgs) {
     daqDraftOutputs,
     daqDraftEnabled,
   } = useStreamAnalysis();
-  const { setPanels, setPlotTick } = usePanels();
+  const { setPanels } = usePanels();
+  const { setPlotTick } = usePlotTick();
   const {
     streamFramesRef,
     streamTraceOverlayRef,
