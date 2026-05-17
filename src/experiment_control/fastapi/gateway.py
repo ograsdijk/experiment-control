@@ -460,7 +460,10 @@ class StreamFrameHub:
             latest = self._latest_frame.get(key)
             if latest is None:
                 return None
-            return _sanitize_json(dict(latest))
+            # PerfA: latest was stored with an already-sanitised payload
+            # (see the snapshot writes in _run); a shallow copy of the
+            # wrapper dict suffices.
+            return dict(latest)
 
     def _fanout(self, msg: dict[str, Any]) -> None:
         payload = msg.get("payload")
@@ -703,9 +706,19 @@ class StreamFrameHub:
                     dict(context_fields) if context_fields is not None else None,
                 )
                 if len(bucket) > self._context_cache_limit:
+                    # PerfB: contexts are inserted in increasing-seq
+                    # order so dict insertion order == seq order; pop the
+                    # oldest N entries directly in O(trim) instead of
+                    # `sorted(bucket.keys())[:trim]` (O(N log N) on the
+                    # full bucket, runs on every frame once the cap is
+                    # hit).
                     trim = len(bucket) - self._context_cache_limit
-                    for stale_seq in sorted(bucket.keys())[:trim]:
-                        bucket.pop(stale_seq, None)
+                    for _ in range(trim):
+                        try:
+                            oldest = next(iter(bucket))
+                        except StopIteration:
+                            break
+                        bucket.pop(oldest, None)
 
             reader = self._readers.get(key)
             if reader is None or reader.name != shm_name:
@@ -825,10 +838,18 @@ class StreamFrameHub:
                 if msg is not None and self._loop is not None:
                     payload_obj = msg.get("payload")
                     if isinstance(payload_obj, dict):
+                        # PerfA: payload was already sanitised in
+                        # `_build_stream_frame` (values via line 541,
+                        # context_fields via line 560). A shallow dict()
+                        # copy detaches the snapshot reference from the
+                        # outbound msg dict; inner values/contexts are
+                        # read-only downstream so sharing the inner refs
+                        # is safe. Skips one O(payload-size) recursive
+                        # walk per frame.
                         with self._lock:
                             self._latest_frame[key] = {
                                 "topic": str(msg.get("topic") or "manager.stream_frame"),
-                                "payload": _sanitize_json(dict(payload_obj)),
+                                "payload": dict(payload_obj),
                             }
                     self._loop.call_soon_threadsafe(self._fanout, msg)
 
@@ -843,12 +864,16 @@ class StreamFrameHub:
                 if msg is not None and self._loop is not None:
                     payload_obj = msg.get("payload")
                     if isinstance(payload_obj, dict):
+                        # PerfA: see _build_stream_frame snapshot above —
+                        # record payload values were sanitised at line
+                        # 586 and context_fields at line 621; shallow
+                        # copy is enough to detach the snapshot ref.
                         with self._lock:
                             self._latest_frame[key] = {
                                 "topic": str(
                                     msg.get("topic") or "manager.stream_records"
                                 ),
-                                "payload": _sanitize_json(dict(payload_obj)),
+                                "payload": dict(payload_obj),
                             }
                     self._loop.call_soon_threadsafe(self._fanout, msg)
 
