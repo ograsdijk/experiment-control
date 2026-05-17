@@ -181,6 +181,7 @@ import { useDevicesContext } from "./features/devices/DevicesContext";
 import { useCommands } from "./features/commands/CommandsContext";
 import { useLayout } from "./features/layout/LayoutContext";
 import { useLogs } from "./features/logs/LogsContext";
+import { usePanels } from "./features/panels/PanelsContext";
 import { useSettings } from "./features/runtime/SettingsContext";
 import { useLogsStream } from "./features/logs/useLogsStream";
 import type {
@@ -506,19 +507,11 @@ export function App() {
     plotGridRef,
     dragColumnsRef,
   } = useLayout();
-  const initialPlotState = useMemo(() => {
-    try {
-      const raw = localStorage.getItem("ecui.plotState");
-      if (!raw) {
-        return normalizePlotState(null, { defaultWindowS: DEFAULT_WINDOW_S });
-      }
-      return normalizePlotState(JSON.parse(raw), {
-        defaultWindowS: DEFAULT_WINDOW_S,
-      });
-    } catch {
-      return normalizePlotState(null, { defaultWindowS: DEFAULT_WINDOW_S });
-    }
-  }, []);
+  // initialPlotState (localStorage rehydration) now lives in
+  // PanelsContext (features/panels/PanelsContext.tsx). The panel state,
+  // refs, modal-panel-id state, Y-axis editor state, plotTick, and the
+  // autosave useEffect all moved into the Provider — see the
+  // usePanels() destructure below.
   const initialStreamWorkspaceState = useMemo(() => {
     try {
       const raw = localStorage.getItem("ecui.streamWorkspaces");
@@ -553,13 +546,9 @@ export function App() {
   } = useDevicesContext();
   const { colorScheme, setColorScheme } = useMantineColorScheme();
   const computedColorScheme = useComputedColorScheme("light");
-  const panelIdRef = useRef(initialPlotState.nextPanelId);
-  const [panels, setPanels] = useState<PlotPanelState[]>(
-    initialPlotState.panels
-  );
-  const [activePanelId, setActivePanelId] = useState(
-    initialPlotState.activePanelId
-  );
+  // Panel state moved to PanelsContext — see the usePanels() destructure
+  // below for `panels`, `setPanels`, `activePanelId`, `panelIdRef`,
+  // `panelsRef`, `plotTick`, modal-panel-id state, and Y-axis editor.
   // Stream-analysis (DAQ workspace) state moved to StreamAnalysisContext
   // (features/stream_analysis/StreamAnalysisContext.tsx). The names below
   // are kept identical to the inline declarations they replaced so the
@@ -599,24 +588,37 @@ export function App() {
     daqNodeCardRefs,
     daqNodeFocusTimeoutRef,
   } = useStreamAnalysis();
-  const [plotTick, setPlotTick] = useState(0);
-  const [plotOptionsPanelId, setPlotOptionsPanelId] = useState<string | null>(null);
-  const [expandedPlotPanelId, setExpandedPlotPanelId] = useState<string | null>(null);
-  const [streamTraceOptionsPanelId, setStreamTraceOptionsPanelId] = useState<
-    string | null
-  >(null);
-  const [streamBinStatsOptionsPanelId, setStreamBinStatsOptionsPanelId] =
-    useState<string | null>(null);
-  const [streamParamsOptionsPanelId, setStreamParamsOptionsPanelId] =
-    useState<string | null>(null);
-  const [streamBin2dOptionsPanelId, setStreamBin2dOptionsPanelId] =
-    useState<string | null>(null);
-  const [yAxisDraftMin, setYAxisDraftMin] = useState<string | number>("");
-  const [yAxisDraftMax, setYAxisDraftMax] = useState<string | number>("");
-  const [yAxisAutoRange, setYAxisAutoRange] = useState<{
-    min: number;
-    max: number;
-  } | null>(null);
+  // Panel state container — see features/panels/PanelsContext.tsx.
+  // Names kept identical so the ~37 setPanels(prev => ...) sites and
+  // the modal handlers throughout this file don't need touch-ups.
+  const {
+    panels,
+    setPanels,
+    activePanelId,
+    setActivePanelId,
+    panelsRef,
+    panelIdRef,
+    plotTick,
+    setPlotTick,
+    plotOptionsPanelId,
+    setPlotOptionsPanelId,
+    expandedPlotPanelId,
+    setExpandedPlotPanelId,
+    streamTraceOptionsPanelId,
+    setStreamTraceOptionsPanelId,
+    streamBinStatsOptionsPanelId,
+    setStreamBinStatsOptionsPanelId,
+    streamParamsOptionsPanelId,
+    setStreamParamsOptionsPanelId,
+    streamBin2dOptionsPanelId,
+    setStreamBin2dOptionsPanelId,
+    yAxisDraftMin,
+    setYAxisDraftMin,
+    yAxisDraftMax,
+    setYAxisDraftMax,
+    yAxisAutoRange,
+    setYAxisAutoRange,
+  } = usePanels();
   const [streamWsConnected, setStreamWsConnected] = useState(false);
   const [streamAnalysisWsConnected, setStreamAnalysisWsConnected] =
     useState(false);
@@ -735,7 +737,7 @@ export function App() {
   // streamWorkspacesRef / streamWorkspaceRevisionsRef / daqNodeCardRefs /
   // daqNodeFocusTimeoutRef now provided by StreamAnalysisContext (see
   // destructure above).
-  const panelsRef = useRef<PlotPanelState[]>(initialPlotState.panels);
+  // panelsRef now provided by PanelsContext (destructured above).
   const streamAnalysisReadyRef = useRef(false);
   const rawSnapshotHydratedRef = useRef<Set<string>>(new Set());
   const workspaceSnapshotHydratedRef = useRef<Set<string>>(new Set());
@@ -1947,17 +1949,8 @@ export function App() {
     }
   }, [plotWorkspaceColumns]);
 
-  useEffect(() => {
-    try {
-      const serializedPlotState = serializePlotState({ panels, activePanelId });
-      localStorage.setItem(
-        "ecui.plotState",
-        JSON.stringify(serializedPlotState)
-      );
-    } catch {
-      // ignore storage errors
-    }
-  }, [panels, activePanelId]);
+  // panels/activePanelId autosave to ecui.plotState now lives in
+  // PanelsContext. panelsRef sync also moved there.
 
   useEffect(() => {
     try {
@@ -1969,10 +1962,6 @@ export function App() {
       // ignore storage errors
     }
   }, [streamWorkspaces]);
-
-  useEffect(() => {
-    panelsRef.current = panels;
-  }, [panels]);
 
   useEffect(() => {
     streamWorkspacesRef.current = streamWorkspaces;
