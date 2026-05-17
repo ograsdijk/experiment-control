@@ -10,6 +10,7 @@ import ReactDOM from "react-dom/client";
 import { App } from "./App";
 import { CommandsProvider } from "./features/commands/CommandsContext";
 import { DevicesProvider } from "./features/devices/DevicesContext";
+import { LogsProvider } from "./features/logs/LogsContext";
 import { StreamAnalysisProvider } from "./features/stream_analysis/StreamAnalysisContext";
 import { TelemetryProvider } from "./features/telemetry/TelemetryContext";
 
@@ -28,7 +29,9 @@ ReactDOM.createRoot(document.getElementById("root")!).render(
         <StreamAnalysisProvider>
           <DevicesProvider>
             <CommandsProvider>
-              <App />
+              <LogsProvider>
+                <App />
+              </LogsProvider>
             </CommandsProvider>
           </DevicesProvider>
         </StreamAnalysisProvider>
