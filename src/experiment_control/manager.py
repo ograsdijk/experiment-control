@@ -12,6 +12,7 @@ import sys
 import threading
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
@@ -1142,6 +1143,21 @@ class Manager:
         self._router_process_id = "device_router"
         self._ensure_router_handle()
 
+        # Lifecycle parallelism: device.connect / disconnect /
+        # driver.start / stop / restart / recover run on this pool
+        # instead of blocking the main loop. Per-device threading.Lock
+        # ensures same-device ops serialise; different devices run
+        # concurrently up to max_workers. Replies + events are
+        # marshalled back to the main thread via the two queues below,
+        # which the poll loop drains each tick.
+        self._main_thread_id = threading.get_ident()
+        self._lifecycle_executor = ThreadPoolExecutor(
+            max_workers=32, thread_name_prefix="mgr-lifecycle"
+        )
+        self._lifecycle_device_locks: dict[str, threading.Lock] = {}
+        self._lifecycle_reply_queue: queue.Queue[tuple[bytes, Json]] = queue.Queue()
+        self._lifecycle_event_queue: queue.Queue[tuple[str, Json]] = queue.Queue()
+
     # -----------------------------
     # Public API
     # -----------------------------
@@ -1856,6 +1872,11 @@ class Manager:
             if events.get(self._internal_rpc) == zmq.POLLIN:
                 self._handle_internal_rpc()
             self._drain_supervisor_logs()
+            # Drain replies + events produced by lifecycle worker
+            # threads since the last tick. Both perform main-thread-only
+            # ZMQ sends; the workers themselves never touch sockets.
+            self._drain_lifecycle_replies()
+            self._drain_lifecycle_events()
         finally:
             self._record_pump_timing(start_mono, time.monotonic())
 
@@ -2213,6 +2234,94 @@ class Manager:
 
     def _handle_internal_rpc(self) -> None:
         shared_handle_internal_rpc(self)
+
+    # -----------------------------
+    # Lifecycle parallelism
+    # -----------------------------
+    #
+    # Lifecycle ops (device.connect / disconnect / driver.start / stop /
+    # restart / recover) used to block the manager's main poll loop
+    # because route_device_request runs them synchronously and each does
+    # one or two blocking device RPCs. A hypothetical "connect all 20
+    # devices" UI button would take ~N × per-device latency.
+    #
+    # _dispatch_lifecycle_task hands the work off to the executor and
+    # returns immediately. The worker thread takes a per-device lock
+    # (so same-device ops serialise), runs the existing
+    # route_device_request unchanged, then enqueues the reply. The main
+    # poll loop drains the reply queue and sends each reply via
+    # `_internal_rpc.send_multipart` — keeping all ZMQ socket writes on
+    # the main thread.
+    #
+    # Events emitted from worker threads (via _publish_manager_event)
+    # are redirected to `_lifecycle_event_queue` by the off-thread
+    # check in manager_pubsub.publish_manager_event; the main loop
+    # drains and publishes them.
+
+    def _dispatch_lifecycle_task(
+        self, identity: bytes, req: Json, rtype: str, device_id: str
+    ) -> None:
+        self._lifecycle_executor.submit(
+            self._run_lifecycle, identity, req, rtype, device_id
+        )
+
+    def _run_lifecycle(
+        self, identity: bytes, req: Json, rtype: str, device_id: str
+    ) -> None:
+        lock = self._lifecycle_device_locks.setdefault(device_id, threading.Lock())
+        with lock:
+            try:
+                resp = route_device_request(self, rtype, req)
+                if resp is None:
+                    resp = {
+                        "ok": False,
+                        "error": {
+                            "code": "unknown_lifecycle_type",
+                            "message": f"no handler for {rtype!r}",
+                        },
+                    }
+            except Exception as exc:
+                resp = {
+                    "ok": False,
+                    "error": {
+                        "code": "lifecycle_error",
+                        "message": str(exc),
+                    },
+                }
+        rid = req.get("request_id")
+        if isinstance(resp, dict) and rid is not None and "request_id" not in resp:
+            # Mirror DeviceRouter's request_id echo so the pipelined
+            # RouterRpcClient can correlate the reply.
+            resp = dict(resp)
+            resp["request_id"] = rid
+        self._lifecycle_reply_queue.put((identity, resp))
+
+    def _drain_lifecycle_replies(self) -> None:
+        while True:
+            try:
+                identity, resp = self._lifecycle_reply_queue.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                self._internal_rpc.send_multipart([identity, json_dumps(resp)])
+            except Exception:
+                # Socket may be torn down mid-shutdown; drop the reply.
+                pass
+
+    def _drain_lifecycle_events(self) -> None:
+        while True:
+            try:
+                topic, payload = self._lifecycle_event_queue.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                # Calls into manager_pubsub.publish_manager_event on the
+                # main thread — the off-thread redirect check will see
+                # the main thread id and run the full sync publish path
+                # (socket send + journal + hooks + log forwarding).
+                self._publish_manager_event(topic, payload)
+            except Exception:
+                pass
 
     def _route_internal_request(self, req: Json) -> Json:
         return shared_route_internal_request(self, req)
