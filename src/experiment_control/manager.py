@@ -1173,6 +1173,12 @@ class Manager:
         self._lifecycle_reply_queue: queue.Queue[tuple[bytes, Json]] = queue.Queue()
         self._lifecycle_event_queue: queue.Queue[tuple[str, Json]] = queue.Queue()
 
+        # Per-socket monotonic timestamp of the last "drain cap hit"
+        # event we published. Used to rate-limit drain-cap-hit notifications
+        # (see _maybe_publish_drain_cap_hit) so a sustained backlog does
+        # not flood the manager event bus.
+        self._last_drain_cap_event_mono: dict[str, float] = {}
+
     # -----------------------------
     # Public API
     # -----------------------------
@@ -2087,6 +2093,10 @@ class Manager:
                     "manager.process.heartbeat_error",
                     {"topic": topic, "error": str(e)},
                 )
+        # Loop completed full MAX_DRAIN_PER_TICK iterations without zmq.Again:
+        # queue still has data. Surface this (rate-limited) so operators see
+        # the backlog instead of silent message lag.
+        self._maybe_publish_drain_cap_hit("process_hb", MAX_DRAIN_PER_TICK)
 
     def _handle_process_data_pub(self) -> None:
         # Drain all available data events per tick. Same rationale as
@@ -2121,6 +2131,10 @@ class Manager:
                     "manager.process.data_error",
                     {"topic": topic, "error": str(e)},
                 )
+        # Loop completed full MAX_DRAIN_PER_TICK iterations without zmq.Again:
+        # queue still has data. Surface this (rate-limited) so operators see
+        # the backlog instead of silent message lag.
+        self._maybe_publish_drain_cap_hit("process_data", MAX_DRAIN_PER_TICK)
 
     def _ingest_telemetry(self, msg: Json) -> None:
         shared_ingest_telemetry(
@@ -2300,9 +2314,33 @@ class Manager:
     def _dispatch_lifecycle_task(
         self, identity: bytes, req: Json, rtype: str, device_id: str
     ) -> None:
-        self._lifecycle_executor.submit(
-            self._run_lifecycle, identity, req, rtype, device_id
-        )
+        try:
+            self._lifecycle_executor.submit(
+                self._run_lifecycle, identity, req, rtype, device_id
+            )
+        except RuntimeError:
+            # Executor was shut down (e.g. _shutdown_cleanup ran between
+            # the RPC arriving and this dispatch). Send an immediate
+            # `shutting_down` error reply so the caller sees a clean
+            # failure rather than the manager loop crashing.
+            rid = req.get("request_id")
+            resp: Json = {
+                "ok": False,
+                "error": {
+                    "code": "manager_shutting_down",
+                    "message": (
+                        "Lifecycle executor is shut down; manager is "
+                        "tearing down."
+                    ),
+                },
+            }
+            if rid is not None:
+                resp["request_id"] = rid
+            try:
+                self._internal_rpc.send_multipart([identity, json_dumps(resp)])
+            except Exception:
+                # Socket itself may already be closed in shutdown; drop.
+                pass
 
     def _run_lifecycle(
         self, identity: bytes, req: Json, rtype: str, device_id: str
@@ -2888,6 +2926,26 @@ class Manager:
 
     def _publish_manager_event(self, topic: str, payload: Json) -> None:
         shared_publish_manager_event(self, topic, payload)
+
+    def _maybe_publish_drain_cap_hit(self, socket: str, cap: int) -> None:
+        """Publish a `manager.drain_cap_hit` event for `socket`, rate-limited
+        to at most once per second per socket name. Called when a SUB-drain
+        loop completes its full iteration count without seeing `zmq.Again`,
+        meaning unread messages remain queued at the end of the tick.
+        """
+        now_mono = time.monotonic()
+        last = self._last_drain_cap_event_mono.get(socket, 0.0)
+        if now_mono - last < 1.0:
+            return
+        self._last_drain_cap_event_mono[socket] = now_mono
+        self._publish_manager_event(
+            "manager.drain_cap_hit",
+            {
+                "socket": socket,
+                "cap": cap,
+                "ts": {"t_wall": time.time(), "t_mono": now_mono},
+            },
+        )
 
     @staticmethod
     def _safe_json(value: Any, *, max_len: int = 4000) -> str:

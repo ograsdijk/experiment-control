@@ -25,13 +25,19 @@ class DrainResult:
 # natively via OPT_SERIALIZE_NUMPY, so callers don't need to convert
 # numpy.int64 etc. before encoding.
 #
-# Edge case: orjson rejects NaN/Inf floats (JSON spec compliant). The
-# hot-path callers already sanitise via `_sanitize_json` before
-# encoding, so this should not trigger in practice. The fallback below
-# catches any path that slips through and re-encodes via the stdlib
-# JSON encoder used by zmq.utils.jsonapi (which produces non-spec
-# `NaN`/`Infinity` literals — same behaviour as before this change,
-# so consumers are unaffected).
+# NaN/Inf handling: orjson silently encodes NaN/Inf floats as JSON
+# `null` (it does NOT raise — verified empirically). This is a
+# wire-format change vs the previous encoder, which emitted non-spec
+# `NaN`/`Infinity` literals. The hot-path callers already sanitise
+# via `_sanitize_json` before encoding, so null-emission only affects
+# paths that bypass sanitisation — a tolerable degradation given
+# those paths are not part of the analysis stream contract.
+#
+# The fallback below is therefore NOT reached for NaN/Inf. It exists
+# for genuinely unsupported types: complex numbers, non-string dict
+# keys, custom objects without __dict__ / dataclass support, etc.
+# zmq.utils.jsonapi.dumps (stdlib json) handles a broader type set
+# at the cost of speed.
 _ORJSON_OPTIONS = orjson.OPT_SERIALIZE_NUMPY
 
 
@@ -39,9 +45,9 @@ def json_dumps(payload: Any) -> bytes:
     try:
         return orjson.dumps(payload, option=_ORJSON_OPTIONS)
     except (TypeError, ValueError):
-        # Fallback for: NaN/Inf floats, custom types orjson refuses,
-        # or sub-dicts with non-string keys. Matches the previous
-        # encoder's behaviour exactly.
+        # Fallback for types orjson refuses (complex numbers,
+        # non-string dict keys, custom objects, etc.). NaN/Inf
+        # do NOT take this path — orjson encodes them as `null`.
         return zmq.utils.jsonapi.dumps(payload)
 
 
