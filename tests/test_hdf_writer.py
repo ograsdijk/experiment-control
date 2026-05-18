@@ -1,3 +1,4 @@
+import queue
 import shutil
 import sys
 import tempfile
@@ -5,6 +6,7 @@ import threading
 import time
 import uuid
 import json
+from collections import deque
 from contextlib import contextmanager
 from pathlib import Path
 import unittest
@@ -1538,6 +1540,128 @@ class HdfWriterBgFlushThreadTests(unittest.TestCase):
             self.assertEqual(handled, [first])
         finally:
             writer._stop_evt.set()  # noqa: SLF001
+
+
+class HdfWriterFlushBatchOverflowTests(unittest.TestCase):
+    """Regression coverage for `_enqueue_flush_batch` overflow handling.
+
+    Pins down three behaviours that PR #41 introduced/relied upon:
+      * counter + error-bucket bump on the dropped batch,
+      * a `hdf.flush_batch_dropped` event published on the process data PUB,
+      * the snapshotted main-loop data is *lost* (NOT requeued) — the
+        documented trade-off for not blocking the producer.
+    Also pins the 1-second rate limit on the event publish.
+    """
+
+    def _make_writer(self) -> HdfWriter:
+        return HdfWriter(
+            out_dir="data",
+            filename=None,
+            manager_rpc="tcp://127.0.0.1:65551",
+            manager_pub="tcp://127.0.0.1:65552",
+            rpc_timeout_ms=2000,
+            timezone="America/Chicago",
+            rcvhwm=1000,
+            write_every_s=1.0,
+            buffer_max_messages=1000,
+            flush_every_n=10,
+            flush_every_s=1.0,
+            disabled_devices=[],
+            event_log_mode="all",
+        )
+
+    def _shrink_bg_queue(self, writer: HdfWriter) -> None:
+        # Replace the bounded bg queue with a tiny one so the second
+        # put_nowait raises queue.Full deterministically. Cast away the
+        # typing on the protected attribute the way the existing bg-thread
+        # tests do.
+        writer._bg_queue = queue.Queue(maxsize=1)  # type: ignore[assignment]  # noqa: SLF001
+
+    @staticmethod
+    def _seed_buf_with_row(writer: HdfWriter, row: dict) -> None:
+        # The writer's `_buf` is only allocated inside run(); for these tests
+        # we just need a non-empty drain buffer so the snapshot has data we
+        # can assert is lost on overflow.
+        writer._buf = deque([row])  # noqa: SLF001
+
+    def test_overflow_drops_batch_increments_counter_and_publishes_event(self) -> None:
+        writer = self._make_writer()
+        self._shrink_bg_queue(writer)
+        published: list[tuple[str, dict]] = []
+
+        def fake_publish(*, topic, payload, **_kw) -> bool:
+            published.append((topic, dict(payload)))
+            return True
+
+        writer._publish_process_event = fake_publish  # type: ignore[method-assign]  # noqa: SLF001
+
+        # Fill the queue with a first batch (this one fits).
+        self._seed_buf_with_row(writer, {"device_id": "dev1", "v": 1})
+        self.assertTrue(writer._enqueue_flush_batch(force_flush=True))  # noqa: SLF001
+        self.assertEqual(writer._bg_queue.qsize(), 1)  # noqa: SLF001
+
+        # Second batch: snapshot has real data, queue is full, must drop.
+        self._seed_buf_with_row(writer, {"device_id": "dev1", "v": 2})
+        self.assertFalse(writer._buf is None and len(writer._buf or []) == 0)  # noqa: SLF001
+        result = writer._enqueue_flush_batch(force_flush=True)  # noqa: SLF001
+
+        self.assertFalse(result)
+        self.assertEqual(writer._dropped_flush_batches, 1)  # noqa: SLF001
+        self.assertEqual(
+            writer._error_counts.get("bg.flush_batch.dropped"), 1  # noqa: SLF001
+        )
+
+        # The snapshotted data is LOST (not requeued). `_buf` is empty.
+        # This pins the documented behaviour: the writer chooses to drop
+        # rather than block the main loop; a future change that quietly
+        # starts re-buffering needs to update the call-site contract.
+        self.assertEqual(len(writer._buf or []), 0)  # noqa: SLF001
+
+        # Event was published with the expected payload shape.
+        self.assertEqual(len(published), 1)
+        topic, payload = published[0]
+        self.assertEqual(topic, "hdf.flush_batch_dropped")
+        self.assertEqual(payload.get("queue_max"), 1)
+        self.assertEqual(payload.get("dropped_total"), 1)
+        self.assertIn("queue_depth", payload)
+
+    def test_overflow_event_is_rate_limited_to_one_per_second(self) -> None:
+        writer = self._make_writer()
+        self._shrink_bg_queue(writer)
+        published: list[tuple[str, dict]] = []
+
+        def fake_publish(*, topic, payload, **_kw) -> bool:
+            published.append((topic, dict(payload)))
+            return True
+
+        writer._publish_process_event = fake_publish  # type: ignore[method-assign]  # noqa: SLF001
+
+        # First put fills the queue.
+        self._seed_buf_with_row(writer, {"device_id": "dev1", "v": 1})
+        self.assertTrue(writer._enqueue_flush_batch(force_flush=True))  # noqa: SLF001
+
+        # First overflow publishes an event.
+        self._seed_buf_with_row(writer, {"device_id": "dev1", "v": 2})
+        self.assertFalse(writer._enqueue_flush_batch(force_flush=True))  # noqa: SLF001
+        self.assertEqual(len(published), 1)
+
+        # Second overflow within the 1-second window: counter still bumps,
+        # but no additional event publish (rate-limited).
+        self._seed_buf_with_row(writer, {"device_id": "dev1", "v": 3})
+        self.assertFalse(writer._enqueue_flush_batch(force_flush=True))  # noqa: SLF001
+        self.assertEqual(writer._dropped_flush_batches, 2)  # noqa: SLF001
+        self.assertEqual(
+            writer._error_counts.get("bg.flush_batch.dropped"), 2  # noqa: SLF001
+        )
+        self.assertEqual(len(published), 1)
+
+        # Advance the rate-limit window — pretend the last event was published
+        # more than a second ago — and a new overflow publishes again.
+        writer._last_flush_drop_event_mono = time.monotonic() - 2.0  # noqa: SLF001
+        self._seed_buf_with_row(writer, {"device_id": "dev1", "v": 4})
+        self.assertFalse(writer._enqueue_flush_batch(force_flush=True))  # noqa: SLF001
+        self.assertEqual(len(published), 2)
+        self.assertEqual(published[-1][1].get("dropped_total"), 3)
 
 
 if __name__ == "__main__":
