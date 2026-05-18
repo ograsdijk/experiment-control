@@ -1476,9 +1476,11 @@ class DeviceRouter(ManagedProcessBase):
                     self._release_inflight()
                 continue
             try:
-                self._external_rpc.send_multipart(
-                    [identity, json_dumps(_inject_request_id(resp, request_id))]
-                )
+                outbound = _inject_request_id(resp, request_id)
+                if request_id is not None and isinstance(item, _ReplyItem):
+                    outbound = dict(outbound)
+                    outbound["request_id"] = request_id
+                self._external_rpc.send_multipart([identity, json_dumps(outbound)])
             except Exception:
                 pass
             finally:
