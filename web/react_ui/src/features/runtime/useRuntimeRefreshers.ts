@@ -1,3 +1,5 @@
+import { useCallback } from "react";
+
 import { notifications } from "@mantine/notifications";
 
 import {
@@ -48,17 +50,20 @@ export function useRuntimeRefreshers() {
     setInstanceCleanupBusy,
   } = useSettings();
 
-  const refreshDevices = async (): Promise<DeviceStatus[]> => {
+  const refreshDevices = useCallback(async (): Promise<DeviceStatus[]> => {
     const next = await fetchDevices();
     setDevices(next);
     return next;
-  };
+  }, [setDevices]);
 
-  const refreshStreams = async (): Promise<StreamCatalogEntry[]> => {
-    return fetchStreams();
-  };
+  const refreshStreams = useCallback(
+    async (): Promise<StreamCatalogEntry[]> => {
+      return fetchStreams();
+    },
+    []
+  );
 
-  const loadGatewayRuntimeSettings =
+  const loadGatewayRuntimeSettings = useCallback(
     async (): Promise<GatewaySettingsInfo | null> => {
       setSettingsLoading(true);
       setSettingsError(null);
@@ -77,9 +82,11 @@ export function useRuntimeRefreshers() {
       } finally {
         setSettingsLoading(false);
       }
-    };
+    },
+    [setSettingsLoading, setSettingsError, setGatewaySettings]
+  );
 
-  const refreshInstanceRuntime =
+  const refreshInstanceRuntime = useCallback(
     async (): Promise<InstanceRuntimeStatus | null> => {
       setInstanceRuntimeLoading(true);
       setInstanceRuntimeError(null);
@@ -98,64 +105,73 @@ export function useRuntimeRefreshers() {
       } finally {
         setInstanceRuntimeLoading(false);
       }
-    };
+    },
+    [
+      setInstanceRuntimeLoading,
+      setInstanceRuntimeError,
+      setInstanceRuntimeStatus,
+    ]
+  );
 
-  const runInstanceCleanup = async (
-    dryRun: boolean
-  ): Promise<Record<string, unknown> | null> => {
-    setInstanceCleanupBusy(true);
-    try {
-      const resp = await cleanupInstanceOrphans({
-        dry_run: dryRun,
-        stale_only: true,
-        timeout_s: 2.0,
-      });
-      if (!resp.ok) {
-        const message =
-          typeof resp.error?.message === "string" &&
-          resp.error.message.trim().length > 0
-            ? resp.error.message
-            : "Cleanup request failed.";
+  const runInstanceCleanup = useCallback(
+    async (dryRun: boolean): Promise<Record<string, unknown> | null> => {
+      setInstanceCleanupBusy(true);
+      try {
+        const resp = await cleanupInstanceOrphans({
+          dry_run: dryRun,
+          stale_only: true,
+          timeout_s: 2.0,
+        });
+        if (!resp.ok) {
+          const message =
+            typeof resp.error?.message === "string" &&
+            resp.error.message.trim().length > 0
+              ? resp.error.message
+              : "Cleanup request failed.";
+          notifications.show({
+            color: "red",
+            title: "Instance cleanup failed",
+            message,
+          });
+          await refreshInstanceRuntime();
+          return null;
+        }
+        const result =
+          resp.result && typeof resp.result === "object"
+            ? (resp.result as Record<string, unknown>)
+            : null;
+        const matchedRaw = result?.matched;
+        const matched =
+          typeof matchedRaw === "number" && Number.isFinite(matchedRaw)
+            ? Math.trunc(matchedRaw)
+            : 0;
+        const terminated = Array.isArray(result?.terminated)
+          ? result.terminated.length
+          : 0;
+        const failed = Array.isArray(result?.failed)
+          ? result.failed.length
+          : 0;
+        notifications.show({
+          color: dryRun ? "blue" : failed > 0 ? "yellow" : "teal",
+          title: dryRun ? "Orphan cleanup dry-run" : "Orphan cleanup executed",
+          message: `matched=${matched} terminated=${terminated} failed=${failed}`,
+        });
+        await refreshInstanceRuntime();
+        return result;
+      } catch (error) {
         notifications.show({
           color: "red",
           title: "Instance cleanup failed",
-          message,
+          message: error instanceof Error ? error.message : String(error),
         });
         await refreshInstanceRuntime();
         return null;
+      } finally {
+        setInstanceCleanupBusy(false);
       }
-      const result =
-        resp.result && typeof resp.result === "object"
-          ? (resp.result as Record<string, unknown>)
-          : null;
-      const matchedRaw = result?.matched;
-      const matched =
-        typeof matchedRaw === "number" && Number.isFinite(matchedRaw)
-          ? Math.trunc(matchedRaw)
-          : 0;
-      const terminated = Array.isArray(result?.terminated)
-        ? result.terminated.length
-        : 0;
-      const failed = Array.isArray(result?.failed) ? result.failed.length : 0;
-      notifications.show({
-        color: dryRun ? "blue" : failed > 0 ? "yellow" : "teal",
-        title: dryRun ? "Orphan cleanup dry-run" : "Orphan cleanup executed",
-        message: `matched=${matched} terminated=${terminated} failed=${failed}`,
-      });
-      await refreshInstanceRuntime();
-      return result;
-    } catch (error) {
-      notifications.show({
-        color: "red",
-        title: "Instance cleanup failed",
-        message: error instanceof Error ? error.message : String(error),
-      });
-      await refreshInstanceRuntime();
-      return null;
-    } finally {
-      setInstanceCleanupBusy(false);
-    }
-  };
+    },
+    [setInstanceCleanupBusy, refreshInstanceRuntime]
+  );
 
   return {
     refreshDevices,
