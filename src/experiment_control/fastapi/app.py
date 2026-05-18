@@ -621,7 +621,25 @@ async def _process_cached_call_loop(target: ProcessCachedCallTarget) -> None:
         # only for the `updated_at` field exposed to the UI.
         started_mono = time.monotonic()
         try:
-            resp = await _process_rpc(target.process_id, target.action, target.params)
+            status = await _lookup_process_status(target.process_id)
+            if not isinstance(status, dict):
+                resp = {
+                    "ok": False,
+                    "error": {
+                        "code": "process_not_running",
+                        "message": "process is not running",
+                    },
+                }
+            elif not _process_rpc_registered(status):
+                resp = {
+                    "ok": False,
+                    "error": {
+                        "code": "process_rpc_not_ready",
+                        "message": "process RPC is not ready",
+                    },
+                }
+            else:
+                resp = await _process_rpc(target.process_id, target.action, target.params)
         except asyncio.CancelledError:
             raise
         except Exception as e:
