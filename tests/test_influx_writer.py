@@ -463,5 +463,47 @@ class InfluxWriterBgHttpThreadTests(unittest.TestCase, _BgThreadTestMixin):
             proc._stop_evt.set()  # noqa: SLF001
 
 
+class InfluxWriterFlushOverflowTests(unittest.TestCase):
+    """Regression coverage for `_flush()` HTTP-queue overflow.
+
+    When the bg HTTP thread is backlogged and `put_nowait` raises
+    `queue.Full`, the writer increments `_dropped_http_batches` and
+    re-queues the drained points so they aren't lost — unlike the
+    HDF writer's analogous path, which drops the batch. This test
+    pins both behaviours so a future refactor that "harmonises" the
+    two paths can't silently start dropping influx points.
+    """
+
+    def test_flush_overflow_bumps_counter_and_requeues_points(self) -> None:
+        proc = _make_proc()
+        # Force the HTTP queue to overflow on the first put_nowait.
+        proc._http_queue = queue.Queue(maxsize=1)  # noqa: SLF001
+        proc._http_queue.put_nowait({"sentinel": []})  # noqa: SLF001 — fill it
+
+        points = [
+            QueuedPoint(destination="default", line="line1"),
+            QueuedPoint(destination="default", line="line2"),
+        ]
+        for p in points:
+            proc._queue.append(p)  # noqa: SLF001
+        proc._points_queued = len(points)  # noqa: SLF001
+
+        proc._flush()  # noqa: SLF001
+
+        # Counter bumped.
+        self.assertEqual(proc._dropped_http_batches, 1)  # noqa: SLF001
+
+        # Points are re-queued (NOT lost). This is the influx-specific
+        # contract — different from HDF's overflow path, which drops.
+        with proc._queue_lock:  # noqa: SLF001
+            requeued = list(proc._queue)  # noqa: SLF001
+        self.assertEqual(len(requeued), 2)
+        self.assertEqual({p.line for p in requeued}, {"line1", "line2"})
+
+        # The HTTP queue still holds only the sentinel batch we put in —
+        # the drained payload was rejected, not silently consumed.
+        self.assertEqual(proc._http_queue.qsize(), 1)  # noqa: SLF001
+
+
 if __name__ == "__main__":
     unittest.main()
