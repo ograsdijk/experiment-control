@@ -195,17 +195,15 @@ def _ensure_error_shape(resp: Any) -> dict[str, Any]:
 
 
 async def _route_request(payload: dict[str, Any]) -> dict[str, Any]:
-    """Dispatch ``payload`` through the router on a thread and shape the response.
+    """Dispatch ``payload`` through the router and shape the response.
 
     Most HTTP handlers follow the pattern ``payload = {...}; resp = await
-    asyncio.to_thread(app.state.router.request, payload); return
-    _ensure_error_shape(resp)``. Use this helper for those. Handlers that
-    post-process the response (filter, reshape, fan out, etc.) should keep
-    calling the router directly.
+    app.state.router.request(payload); return _ensure_error_shape(resp)``.
+    Use this helper for those. Handlers that post-process the response
+    (filter, reshape, fan out, etc.) should keep calling the router
+    directly.
     """
-    return _ensure_error_shape(
-        await asyncio.to_thread(app.state.router.request, payload)
-    )
+    return _ensure_error_shape(await app.state.router.request(payload))
 
 
 def _build_trace_frame_payload(
@@ -345,7 +343,7 @@ def _is_transient_capabilities_failure(resp: dict[str, Any]) -> bool:
 async def _request_device_capabilities_with_retry(
     payload: dict[str, Any],
 ) -> dict[str, Any]:
-    first = await asyncio.to_thread(app.state.router.request, payload)
+    first = await app.state.router.request(payload)
     first_shaped = _normalize_command_response(first)
     if not _is_transient_capabilities_failure(first_shaped):
         return first_shaped
@@ -353,7 +351,7 @@ async def _request_device_capabilities_with_retry(
     await asyncio.sleep(0.2)
     retry_payload = dict(payload)
     retry_payload["request_id"] = uuid.uuid4().hex
-    second = await asyncio.to_thread(app.state.router.request, retry_payload)
+    second = await app.state.router.request(retry_payload)
     second_shaped = _normalize_command_response(second)
     if _is_transient_capabilities_failure(second_shaped):
         err = second_shaped.get("error")
@@ -396,7 +394,7 @@ async def _fetch_manager_identity(router: RouterRpcClient) -> dict[str, Any] | N
     request_id = uuid.uuid4().hex
     payload = {"type": "manager.info.identity", "request_id": request_id}
     try:
-        resp = await asyncio.to_thread(router.request, payload)
+        resp = await router.request(payload)
     except Exception:
         return None
     shaped = _ensure_error_shape(resp)
@@ -411,7 +409,7 @@ async def _fetch_manager_identity(router: RouterRpcClient) -> dict[str, Any] | N
 async def _lookup_process_status(process_id: str) -> dict[str, Any] | None:
     payload = {"type": "manager.processes.list"}
     try:
-        resp = await asyncio.to_thread(app.state.router.request, payload)
+        resp = await app.state.router.request(payload)
     except Exception:
         return None
     shaped = _ensure_error_shape(resp)
@@ -522,7 +520,7 @@ async def _process_rpc(
             "request_id": request_id,
         },
     }
-    resp = await asyncio.to_thread(app.state.router.request, payload)
+    resp = await app.state.router.request(payload)
     shaped = _ensure_error_shape(resp)
     if shaped.get("ok") is True:
         got = shaped.get("request_id")
@@ -752,7 +750,7 @@ async def _startup() -> None:
         timeout_ms=settings.rpc_timeout_ms,
         queue_max=settings.rpc_queue_max,
     )
-    router.start()
+    router.start(asyncio.get_running_loop())
     manager_identity = await _fetch_manager_identity(router)
     telemetry_hub = TelemetryHub(settings.manager_pub, topics=settings.telemetry_topics)
     telemetry_hub.start(asyncio.get_running_loop())
@@ -942,7 +940,7 @@ async def telemetry_snapshot() -> dict[str, Any]:
 @app.get("/api/streams")
 async def list_streams() -> dict[str, Any]:
     payload = {"type": "device.config.list"}
-    resp = await asyncio.to_thread(app.state.router.request, payload)
+    resp = await app.state.router.request(payload)
     resp = _ensure_error_shape(resp)
     if not resp.get("ok"):
         return resp
@@ -1030,7 +1028,7 @@ async def device_call(
             source_id=req.source_id,
         ),
     }
-    resp = await asyncio.to_thread(app.state.router.request, payload)
+    resp = await app.state.router.request(payload)
     return _normalize_command_response(resp)
 
 
@@ -1197,7 +1195,7 @@ async def process_call(
 @app.get("/api/interlocks/interceptor_routes")
 async def list_interceptor_routes() -> dict[str, Any]:
     payload = {"type": "manager.interceptors.list"}
-    resp = await asyncio.to_thread(app.state.router.request, payload)
+    resp = await app.state.router.request(payload)
     shaped = _ensure_error_shape(resp)
     if not shaped.get("ok"):
         return shaped

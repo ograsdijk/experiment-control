@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import asyncio
-import concurrent.futures
 import time
 import math
 import queue
 import threading
+import uuid
 from dataclasses import dataclass
 from typing import Any
 
@@ -41,6 +41,21 @@ class GatewaySettings:
 
 
 class RouterRpcClient:
+    """Async-native pipelined RPC client over a single DEALER socket.
+
+    Requests are dispatched to the router (DeviceRouter's `external_rpc`
+    ROUTER bind) immediately on submission; replies are matched back to
+    callers by `request_id`. Multiple in-flight requests can be
+    outstanding concurrently — the only serialisation is at the wire
+    level (single socket), not at the request level, so N parallel
+    HTTP handlers no longer wait in line for the previous reply.
+
+    Callers use `await router.request(payload)` from asyncio code; the
+    coroutine returns when the matching reply arrives, when the
+    per-request deadline expires (`gateway_timeout`), or when the
+    client shuts down (`gateway_closed`).
+    """
+
     def __init__(
         self, endpoint: str, *, timeout_ms: int = 2000, queue_max: int = 1024
     ) -> None:
@@ -48,14 +63,18 @@ class RouterRpcClient:
         self._timeout_ms = int(timeout_ms)
         self._ctx = zmq.Context.instance()
         self._queue_max = max(1, int(queue_max))
+        # Tuple shape kept intentionally compatible with prior tests that
+        # `put_nowait` directly; only the future type changed.
         self._queue: queue.Queue[
-            tuple[dict[str, Any], int | None, concurrent.futures.Future]
+            tuple[dict[str, Any], int | None, "asyncio.Future[dict]"]
         ] = queue.Queue(maxsize=self._queue_max)
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
         self._lock = threading.Lock()
         self._queue_rejected = 0
         self._closed_pending = 0
+        self._inflight_depth = 0
 
     @staticmethod
     def _error(code: str, message: str, *, details: dict[str, Any] | None = None) -> dict:
@@ -64,9 +83,13 @@ class RouterRpcClient:
             err["details"] = details
         return {"ok": False, "error": err}
 
-    def start(self) -> None:
+    def start(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Start the dispatcher thread. `loop` is captured so the worker
+        can schedule asyncio future resolution from its thread via
+        `loop.call_soon_threadsafe` — same pattern as TelemetryHub."""
         if self._thread is not None and self._thread.is_alive():
             return
+        self._loop = loop
         self._stop.clear()
         self._thread = threading.Thread(target=self._run, name="router-rpc", daemon=True)
         self._thread.start()
@@ -80,13 +103,13 @@ class RouterRpcClient:
             except queue.Empty:
                 break
             drained += 1
-            if not fut.done():
-                fut.set_result(
-                    self._error(
-                        "gateway_closed",
-                        "router rpc client closed before request was processed",
-                    )
-                )
+            self._set_future_result(
+                fut,
+                self._error(
+                    "gateway_closed",
+                    "router rpc client closed before request was processed",
+                ),
+            )
         if drained:
             with self._lock:
                 self._closed_pending += drained
@@ -100,18 +123,28 @@ class RouterRpcClient:
         with self._lock:
             queue_rejected = int(self._queue_rejected)
             closed_pending = int(self._closed_pending)
+            inflight_depth = int(self._inflight_depth)
         return {
             "queue_depth": int(self._queue.qsize()),
             "queue_max": int(self._queue_max),
             "queue_rejected": queue_rejected,
             "closed_pending": closed_pending,
+            "inflight_depth": inflight_depth,
             "thread_alive": bool(self._thread is not None and self._thread.is_alive()),
         }
 
-    def request(self, payload: dict[str, Any], timeout_ms: int | None = None) -> dict:
-        if self._thread is None or not self._thread.is_alive():
+    async def request(
+        self, payload: dict[str, Any], timeout_ms: int | None = None
+    ) -> dict:
+        if self._thread is None or not self._thread.is_alive() or self._loop is None:
             raise RuntimeError("RouterRpcClient not started")
-        fut: concurrent.futures.Future = concurrent.futures.Future()
+        # Ensure every request carries a request_id so the worker can
+        # correlate the reply back. DeviceRouter echoes whatever id we
+        # send (see processes/device_router.py `_inject_request_id`).
+        if "request_id" not in payload:
+            payload = dict(payload)
+            payload["request_id"] = uuid.uuid4().hex
+        fut: asyncio.Future[dict] = self._loop.create_future()
         try:
             self._queue.put_nowait((payload, timeout_ms, fut))
         except queue.Full:
@@ -125,82 +158,186 @@ class RouterRpcClient:
                     "queue_max": int(self._queue_max),
                 },
             )
-        timeout_s = (timeout_ms or self._timeout_ms) / 1000.0 + 0.5
+        # Worker is the source of truth for timeouts (resolves the
+        # future with `gateway_timeout` on expiry). `asyncio.wait_for`
+        # here is a belt-and-suspenders safety net in case the worker
+        # stalls beyond the deadline.
+        safety_s = (timeout_ms or self._timeout_ms) / 1000.0 + 1.0
         try:
-            return fut.result(timeout=timeout_s)  # type: ignore[return-value]
-        except concurrent.futures.TimeoutError:
+            return await asyncio.wait_for(fut, timeout=safety_s)
+        except asyncio.TimeoutError:
             return self._error("gateway_timeout", "router rpc timed out")
+
+    def _set_future_result(self, fut: "asyncio.Future[dict]", result: dict) -> None:
+        loop = self._loop
+        if loop is None or fut.done():
+            return
+
+        def _setter() -> None:
+            if not fut.done():
+                fut.set_result(result)
+
+        try:
+            loop.call_soon_threadsafe(_setter)
+        except RuntimeError:
+            # Loop is closed; nothing we can do. The asyncio.wait_for
+            # in `request()` will surface a timeout to the caller.
+            pass
+
+    def _drain_replies(
+        self,
+        sock: zmq.Socket,
+        pending: dict[Any, tuple["asyncio.Future[dict]", float]],
+    ) -> None:
+        while True:
+            try:
+                raw = sock.recv(zmq.NOBLOCK)
+            except zmq.Again:
+                return
+            resp = safe_json_loads(raw)
+            if not isinstance(resp, dict):
+                continue
+            rid = resp.get("request_id")
+            entry = pending.pop(rid, None) if rid is not None else None
+            if entry is None:
+                # Late or unknown reply: silently drop.
+                continue
+            fut, _deadline = entry
+            self._set_future_result(fut, resp)
+
+    def _sweep_expired(
+        self, pending: dict[Any, tuple["asyncio.Future[dict]", float]]
+    ) -> None:
+        now = time.monotonic()
+        expired = [rid for rid, (_, dl) in pending.items() if now > dl]
+        for rid in expired:
+            fut, _ = pending.pop(rid)
+            self._set_future_result(
+                fut, self._error("gateway_timeout", "router rpc timed out")
+            )
+
+    def _fail_all_inflight(
+        self,
+        pending: dict[Any, tuple["asyncio.Future[dict]", float]],
+        *,
+        reason: str,
+    ) -> None:
+        for rid in list(pending.keys()):
+            fut, _ = pending.pop(rid)
+            self._set_future_result(
+                fut,
+                {
+                    "ok": False,
+                    "error": {"code": "gateway_error", "message": reason},
+                },
+            )
 
     def _run(self) -> None:
         sock = self._ctx.socket(zmq.DEALER)
         sock.setsockopt(zmq.LINGER, 0)
         sock.connect(self._endpoint)
+        poller = zmq.Poller()
+        poller.register(sock, zmq.POLLIN)
+        pending: dict[Any, tuple["asyncio.Future[dict]", float]] = {}
+
         while not self._stop.is_set():
-            try:
-                payload, timeout_ms, fut = self._queue.get(timeout=0.1)
-            except queue.Empty:
-                continue
-            if self._stop.is_set():
-                break
-            timeout_ms = int(timeout_ms or self._timeout_ms)
-            expected_request_id = payload.get("request_id")
-            try:
-                # Drop late replies from previous timed-out requests.
-                while True:
-                    try:
-                        if not sock.poll(0, zmq.POLLIN):
-                            break
-                        _ = sock.recv(zmq.NOBLOCK)
-                    except zmq.Again:
-                        break
-                sock.send(json_dumps(payload))
-                deadline = time.monotonic() + (timeout_ms / 1000.0)
-                while True:
-                    remaining_ms = int(max(1.0, (deadline - time.monotonic()) * 1000.0))
-                    if remaining_ms <= 0:
-                        raise TimeoutError(f"router rpc timed out after {timeout_ms} ms")
-                    if not sock.poll(remaining_ms):
-                        raise TimeoutError(f"router rpc timed out after {timeout_ms} ms")
-                    raw = sock.recv()
-                    resp = safe_json_loads(raw)
-                    if not isinstance(resp, dict):
-                        continue
-                    if (
-                        expected_request_id is not None
-                        and resp.get("request_id") is not None
-                        and resp.get("request_id") != expected_request_id
-                    ):
-                        # Late/stale reply from an older request; keep waiting.
-                        continue
+            # 1) Drain queue: send every pending submission immediately.
+            while True:
+                try:
+                    payload, timeout_ms, fut = self._queue.get_nowait()
+                except queue.Empty:
                     break
-                if not isinstance(resp, dict):
-                    resp = {
-                        "ok": False,
-                        "error": {
-                            "code": "invalid_response",
-                            "message": "non-dict response from router",
-                        },
-                    }
-                fut.set_result(resp)
-            except Exception as exc:
-                # Reset socket on error to avoid stale state.
-                sock.setsockopt(zmq.LINGER, 0)
-                sock.close(0)
-                sock = self._ctx.socket(zmq.DEALER)
-                sock.setsockopt(zmq.LINGER, 0)
-                sock.connect(self._endpoint)
-                if not fut.done():
-                    fut.set_result(
+                rid = payload.get("request_id")
+                eff_timeout_ms = int(timeout_ms or self._timeout_ms)
+                deadline = time.monotonic() + (eff_timeout_ms / 1000.0)
+                try:
+                    sock.send(json_dumps(payload), zmq.NOBLOCK)
+                except Exception as exc:
+                    self._set_future_result(
+                        fut,
                         {
                             "ok": False,
                             "error": {
                                 "code": "gateway_error",
                                 "message": str(exc),
                             },
-                        }
+                        },
                     )
+                    continue
+                if rid is None:
+                    # Should not happen — `request()` always assigns one
+                    # — but if it does, fail fast so we don't leak.
+                    self._set_future_result(
+                        fut,
+                        self._error(
+                            "gateway_error",
+                            "internal: request submitted without request_id",
+                        ),
+                    )
+                    continue
+                pending[rid] = (fut, deadline)
+
+            with self._lock:
+                self._inflight_depth = len(pending)
+
+            # 2) Poll for replies, bounded by the next deadline or 100 ms.
+            now = time.monotonic()
+            if pending:
+                next_dl = min(d for _, d in pending.values())
+                poll_ms = max(0, min(100, int((next_dl - now) * 1000)))
+            else:
+                poll_ms = 100
+
+            try:
+                events = dict(poller.poll(poll_ms))
+            except zmq.ZMQError as exc:
+                self._fail_all_inflight(pending, reason=str(exc))
+                # Recreate the socket to recover from terminal errors.
+                try:
+                    sock.setsockopt(zmq.LINGER, 0)
+                    sock.close(0)
+                except Exception:
+                    pass
+                sock = self._ctx.socket(zmq.DEALER)
+                sock.setsockopt(zmq.LINGER, 0)
+                sock.connect(self._endpoint)
+                poller = zmq.Poller()
+                poller.register(sock, zmq.POLLIN)
+                continue
+
+            if sock in events:
+                try:
+                    self._drain_replies(sock, pending)
+                except Exception as exc:
+                    self._fail_all_inflight(pending, reason=str(exc))
+                    try:
+                        sock.setsockopt(zmq.LINGER, 0)
+                        sock.close(0)
+                    except Exception:
+                        pass
+                    sock = self._ctx.socket(zmq.DEALER)
+                    sock.setsockopt(zmq.LINGER, 0)
+                    sock.connect(self._endpoint)
+                    poller = zmq.Poller()
+                    poller.register(sock, zmq.POLLIN)
+                    continue
+
+            # 3) Time out any expired in-flight requests.
+            self._sweep_expired(pending)
+
+        # Shutdown: fail any still-in-flight callers.
         sock.setsockopt(zmq.LINGER, 0)
         sock.close(0)
+        for fut, _ in pending.values():
+            self._set_future_result(
+                fut,
+                self._error(
+                    "gateway_closed",
+                    "router rpc client closed with in-flight request",
+                ),
+            )
+        with self._lock:
+            self._inflight_depth = 0
 
 
 class TelemetryHub:

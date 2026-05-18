@@ -32,7 +32,7 @@ class _RouterStub:
         self._responses = list(responses)
         self.calls: list[dict] = []
 
-    def request(self, payload: dict, timeout_ms: int | None = None) -> dict:
+    async def request(self, payload: dict, timeout_ms: int | None = None) -> dict:
         del timeout_ms
         self.calls.append(dict(payload))
         if self._responses:
