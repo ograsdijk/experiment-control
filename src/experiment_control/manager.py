@@ -22,15 +22,6 @@ import zmq
 
 from .federation import FederationConfig
 from .federation.hub import FederationHub
-
-# Per-socket per-tick drain cap. Each SUB handler will recv up to this
-# many messages before yielding back to the poll loop. With ~100 µs
-# per-message handling cost this bounds tick duration to ~25 ms — well
-# under the 1 s loop-stall threshold. In healthy steady-state traffic
-# (~20-30 msgs/sec total across all SUB sockets) the cap is never hit;
-# its purpose is to keep an avalanche (e.g. post-stall backlog) from
-# monopolising a single tick.
-MAX_DRAIN_PER_TICK = 256
 from .manager_command_journal import (
     append_command_journal_entry as shared_append_command_journal_entry,
 )
@@ -333,6 +324,15 @@ from .utils.yaml_helpers import load_yaml_file
 from .utils.zmq_helpers import json_dumps, safe_json_loads
 
 Json = dict[str, Any]
+
+# Per-socket per-tick drain cap. Each SUB handler will recv up to this
+# many messages before yielding back to the poll loop. With ~100 µs
+# per-message handling cost this bounds tick duration to ~25 ms — well
+# under the 1 s loop-stall threshold. In healthy steady-state traffic
+# (~20-30 msgs/sec total across all SUB sockets) the cap is never hit;
+# its purpose is to keep an avalanche (e.g. post-stall backlog) from
+# monopolising a single tick.
+MAX_DRAIN_PER_TICK = 256
 
 # Re-export for test patching and manager route-handler late binding.
 read_instance_lock_status = _instance_lock.read_instance_lock_status

@@ -8,12 +8,12 @@ import zmq
 
 from .utils.zmq_helpers import safe_json_loads
 
+Json = dict[str, Any]
+
 # Per-socket per-tick drain cap. Mirrors MAX_DRAIN_PER_TICK in
 # manager.py — keep both in sync if you change one. Bounds worst-case
 # tick duration when an avalanche arrives after a stall.
 MAX_DRAIN_PER_TICK = 256
-
-Json = dict[str, Any]
 
 
 def _positive_limit(manager: Any, attr: str, default: int) -> int:
