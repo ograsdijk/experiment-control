@@ -4,6 +4,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable
 
+import orjson
 import zmq
 import zmq.utils.jsonapi
 
@@ -18,8 +19,30 @@ class DrainResult:
     parse_errors: int = 0
 
 
+# orjson is 13-25× faster than zmq.utils.jsonapi.dumps on the payload
+# shapes the gateway and stream_analysis broadcast on every WS message
+# (per `bench/run_microbench.py`). It also serialises numpy scalars
+# natively via OPT_SERIALIZE_NUMPY, so callers don't need to convert
+# numpy.int64 etc. before encoding.
+#
+# Edge case: orjson rejects NaN/Inf floats (JSON spec compliant). The
+# hot-path callers already sanitise via `_sanitize_json` before
+# encoding, so this should not trigger in practice. The fallback below
+# catches any path that slips through and re-encodes via the stdlib
+# JSON encoder used by zmq.utils.jsonapi (which produces non-spec
+# `NaN`/`Infinity` literals — same behaviour as before this change,
+# so consumers are unaffected).
+_ORJSON_OPTIONS = orjson.OPT_SERIALIZE_NUMPY
+
+
 def json_dumps(payload: Any) -> bytes:
-    return zmq.utils.jsonapi.dumps(payload)
+    try:
+        return orjson.dumps(payload, option=_ORJSON_OPTIONS)
+    except (TypeError, ValueError):
+        # Fallback for: NaN/Inf floats, custom types orjson refuses,
+        # or sub-dicts with non-string keys. Matches the previous
+        # encoder's behaviour exactly.
+        return zmq.utils.jsonapi.dumps(payload)
 
 
 def json_loads(data: bytes) -> Any:
