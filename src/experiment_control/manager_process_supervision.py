@@ -694,6 +694,7 @@ def start_process_handle(
     handle.last_start_t_mono = time.monotonic()
     handle.last_hb_t_wall = None
     handle.last_hb_t_mono = None
+    handle.last_hb_recv_mono = None
     handle.last_heartbeat_payload = None
     handle.last_exit_code = None
     handle.stop_requested_t_mono = None
@@ -807,7 +808,13 @@ def try_restart_process(manager: Any, handle: Any) -> None:
 def process_snapshot(manager: Any, handle: Any) -> Json:
     hb_age_s: float | None = None
     now_mono = time.monotonic()
-    if handle.last_hb_t_mono is not None:
+    # Compute age from the manager-side receive time so the displayed
+    # age matches what the timeout check uses (which is what subscribers
+    # actually care about: "is the manager seeing this process alive").
+    # Fall back to sender time if recv time isn't yet populated.
+    if handle.last_hb_recv_mono is not None:
+        hb_age_s = now_mono - handle.last_hb_recv_mono
+    elif handle.last_hb_t_mono is not None:
         hb_age_s = now_mono - handle.last_hb_t_mono
     rss_bytes = _cached_process_rss_bytes(manager, handle.pid)
     return {
@@ -830,6 +837,7 @@ def process_snapshot(manager: Any, handle: Any) -> Json:
         "last_start_t_mono": handle.last_start_t_mono,
         "last_hb_t_wall": handle.last_hb_t_wall,
         "last_hb_t_mono": handle.last_hb_t_mono,
+        "last_hb_recv_mono": handle.last_hb_recv_mono,
         "hb_age_s": hb_age_s,
         "last_exit_code": handle.last_exit_code,
         "exit_code_hex": exit_code_hex(handle.last_exit_code),
@@ -1199,8 +1207,12 @@ def enforce_managed_process_heartbeat_timeout(
     if str(handle.state) not in {"STARTING", "RUNNING"}:
         return
     hb_age: float | None = None
-    if handle.last_hb_t_mono is not None:
-        hb_age = now_mono - handle.last_hb_t_mono
+    # Use manager-side receive time (not the sender's t_mono) so manager
+    # buffering / scheduling delay isn't blamed on the process. With
+    # the SUB drain-all loop in handle_process_pub, recv time follows
+    # send time within milliseconds in normal operation.
+    if handle.last_hb_recv_mono is not None:
+        hb_age = now_mono - handle.last_hb_recv_mono
     elif handle.last_start_t_mono is not None:
         hb_age = now_mono - handle.last_start_t_mono
     if hb_age is None:
@@ -1212,13 +1224,22 @@ def enforce_managed_process_heartbeat_timeout(
         handle.recent_manager_loop_stall = False
         return
 
-    heartbeat_received = handle.last_hb_t_mono is not None
+    heartbeat_received = handle.last_hb_recv_mono is not None
     recent_stall = _recent_manager_loop_stall(manager, now_mono)
     hard_multiplier = float(getattr(manager, "_heartbeat_hard_timeout_multiplier", 3.0))
     hard_timeout_s = timeout_s * max(1.0, hard_multiplier)
     strikes_to_fail = int(getattr(manager, "_heartbeat_stale_strikes_to_fail", 2))
-    handle.heartbeat_stale_strikes += 1
-    handle.last_stale_detected_mono = now_mono
+    # Rate-limit strikes to one per heartbeat_period_s. The supervision
+    # check runs every ~50 ms; without this rate limit, two consecutive
+    # checks ~100 ms apart would race past strikes_to_fail=2 even when
+    # the process is healthy (e.g. its HB is queued but not yet
+    # drained). With the rate limit, strikes accumulate at the rate
+    # the process is expected to publish HBs, giving a real margin.
+    period_s = float(handle.spec.heartbeat_period_s)
+    last_strike_mono = handle.last_stale_detected_mono
+    if last_strike_mono is None or (now_mono - float(last_strike_mono)) >= period_s:
+        handle.heartbeat_stale_strikes += 1
+        handle.last_stale_detected_mono = now_mono
     handle.last_heartbeat_received = heartbeat_received
     handle.last_liveness_age_s = float(hb_age)
     handle.last_heartbeat_age_s = float(hb_age) if heartbeat_received else None
