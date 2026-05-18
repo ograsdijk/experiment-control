@@ -3257,6 +3257,28 @@ class StreamAnalysisProcess(ManagedProcessBase):
             _sanitize_json(dict(payload))
         )
 
+    def _remember_latest_output_clean(self, payload: Json) -> None:
+        """Snapshot-store a payload whose values are already JSON-clean.
+
+        Same shape as `_remember_latest_output` but skips the recursive
+        `_sanitize_json` walk. Callers MUST guarantee that every value
+        in the payload (including nested lists/dicts) is already free
+        of NaN/Inf — typically because each upstream value-producing
+        path sanitised at build time.
+
+        Used by the trace-output snapshot path where the value list is
+        sanitised inline in `_build_trace_snapshot_payload` (200k-point
+        traces saw ~68 ms per snapshot walk in the bench; this path
+        eliminates that).
+        """
+        workspace_id = _normalize_id(payload.get("workspace_id"))
+        output_id = _normalize_id(payload.get("output_id"))
+        if workspace_id is None or output_id is None:
+            return
+        self._latest_output_payloads[self._snapshot_output_key(workspace_id, output_id)] = (
+            dict(payload)
+        )
+
     def _clear_workspace_snapshot_outputs(
         self, workspace_id: str, *, node_id: str | None = None
     ) -> None:
@@ -4408,7 +4430,11 @@ class StreamAnalysisProcess(ManagedProcessBase):
             t0_mono_out=t0_mono_out,
             t0_wall_out=t0_wall_out,
         )
-        self._remember_latest_output(snapshot_payload)
+        # PerfI: `_build_trace_snapshot_payload` sanitises the value
+        # list inline and context_fields are sanitised at line 4533;
+        # remaining header fields are ints/strs. Snapshot-store can
+        # skip the recursive walk that `_remember_latest_output` does.
+        self._remember_latest_output_clean(snapshot_payload)
         self._publish_manager_event(
             topic="manager.stream_analysis.trace_ready",
             payload=descriptor,
@@ -4473,6 +4499,24 @@ class StreamAnalysisProcess(ManagedProcessBase):
         t0_mono_out: int,
         t0_wall_out: int,
     ) -> Json:
+        # PerfI: sanitise the values list inline so the snapshot-store
+        # path below (`_remember_latest_output_clean`) can skip the
+        # recursive _sanitize_json walk over a 200k-point list per
+        # frame (~68 ms/walk in the bench).
+        #
+        # Fast path: when the trace has no non-finite values (the
+        # common case), `np.isfinite(arr).all()` is one vectorised
+        # check; the list is produced by a single `.tolist()` call
+        # as before. Slow path only triggers when there's actual
+        # NaN/Inf to scrub.
+        value_arr = trace.astype(np.float64, copy=False).reshape(-1)
+        if value_arr.size == 0 or np.isfinite(value_arr).all():
+            value_list = value_arr.tolist()
+        else:
+            value_list = value_arr.tolist()
+            for i, x in enumerate(value_list):
+                if not math.isfinite(x):
+                    value_list[i] = None
         snapshot_payload: Json = {
             "version": 1,
             "workspace_id": workspace_id,
@@ -4486,7 +4530,7 @@ class StreamAnalysisProcess(ManagedProcessBase):
             "t0_wall_ns": t0_wall_out,
             "channel_index": int(output.get("channel_index", 0) or 0),
             "channel_count": int(output.get("channel_count", 1) or 1),
-            "value": trace.astype(np.float64, copy=False).reshape(-1).tolist(),
+            "value": value_list,
             "point_count": int(trace.size),
         }
         if bool(output.get("truncated")):
