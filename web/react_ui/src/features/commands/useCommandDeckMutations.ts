@@ -146,6 +146,7 @@ export function useCommandDeckMutations() {
             : normalizeDeckGroup(entry.group);
         return {
           ...entry,
+          kind: "telemetry" as const,
           deviceId: nextDeviceId,
           signal: nextSignal,
           format: nextFormat,
