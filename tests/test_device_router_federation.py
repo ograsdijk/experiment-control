@@ -4,6 +4,7 @@ import queue
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import Mock
 
 import zmq
 
@@ -20,6 +21,7 @@ from experiment_control.processes.device_router import (
     _ReplyItem,
     _device_rpc_exception_error,
 )
+from experiment_control.utils.zmq_helpers import safe_json_loads
 
 
 class _CaptureWorker:
@@ -174,6 +176,38 @@ class DeviceRouterFederationTests(unittest.TestCase):
             self.assertEqual(task.request_id, "req-outer")
             self.assertEqual(task.source_kind, "webui")
             self.assertEqual(task.source_id, "fastapi")
+        finally:
+            router.close()
+
+    def test_process_rpc_reply_uses_outer_request_id(self) -> None:
+        router = DeviceRouter(
+            external_rpc_bind="tcp://127.0.0.1:*",
+            process_id="device_router",
+        )
+        try:
+            sent: list[list[bytes]] = []
+            router._external_rpc = Mock()
+            router._external_rpc.send_multipart.side_effect = sent.append
+            router._inflight_count = 1
+            router._reply_queue.put_nowait(
+                _ReplyItem(
+                    identity=b"client-1",
+                    response={"request_id": "req-inner", "ok": True, "result": {"done": True}},
+                    inflight_reserved=True,
+                    request_id="req-outer",
+                )
+            )
+
+            router._drain_replies()
+
+            self.assertEqual(len(sent), 1)
+            self.assertEqual(sent[0][0], b"client-1")
+            payload = safe_json_loads(sent[0][1])
+            self.assertIsInstance(payload, dict)
+            assert isinstance(payload, dict)
+            self.assertEqual(payload.get("request_id"), "req-outer")
+            self.assertEqual(payload.get("result"), {"done": True})
+            self.assertEqual(router._inflight_count, 0)
         finally:
             router.close()
 
