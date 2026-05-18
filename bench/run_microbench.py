@@ -380,11 +380,60 @@ def bench_output_index(rows: list[Row]) -> None:
 # ---------------------------------------------------------------------------
 
 
+def bench_trace_snapshot_value(rows: list[Row]) -> None:
+    """Time the trace-snapshot value materialisation path.
+
+    Compares the original `.tolist()` + recursive `_sanitize_json`
+    (what `_remember_latest_output` used to do per trace) against the
+    PerfI inline scrub (one `.tolist()` + a vectorised `np.isfinite`
+    check; fallback per-element scrub only when NaN/Inf is present).
+    """
+    print()
+    print("== trace snapshot value materialisation ==")
+    print(_HEADER)
+    rng = np.random.default_rng(42)
+
+    def baseline(arr: np.ndarray) -> Any:
+        # Same shape as the old path: tolist + sanitize the resulting list.
+        return stream_analysis_sanitize_json(arr.tolist())
+
+    def perfi_fast(arr: np.ndarray) -> Any:
+        # New path; takes the fast branch when all-finite (common case).
+        if arr.size == 0 or np.isfinite(arr).all():
+            return arr.tolist()
+        out = arr.tolist()
+        for i, x in enumerate(out):
+            if not math.isfinite(x):
+                out[i] = None
+        return out
+
+    for n in (1_000, 50_000, 200_000):
+        arr = rng.normal(size=n).astype(np.float64)
+        iters = 1000 if n < 100_000 else 200
+        r = time_call(
+            "baseline (.tolist + _sanitize_json)",
+            f"{n:,} pts",
+            lambda a=arr: baseline(a),
+            iters=iters,
+        )
+        rows.append(r)
+        print(r.fmt())
+        r = time_call(
+            "PerfI (.tolist + np.isfinite fast path)",
+            f"{n:,} pts",
+            lambda a=arr: perfi_fast(a),
+            iters=iters,
+        )
+        rows.append(r)
+        print(r.fmt())
+
+
 ALL_BENCHES = {
     "bin_stats": bench_bin_stats,
     "sanitize": bench_sanitize,
     "json_dumps": bench_json_dumps,
     "output_index": bench_output_index,
+    "trace_snapshot": bench_trace_snapshot_value,
 }
 
 
