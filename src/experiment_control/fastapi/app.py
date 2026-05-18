@@ -615,7 +615,11 @@ async def _process_cached_call_loop(target: ProcessCachedCallTarget) -> None:
     cache: dict[str, dict[str, Any]] = app.state.process_cached_calls
     key = _process_cached_call_key(target.process_id, target.action, target.params)
     while True:
-        started_at = time.time()
+        # Use monotonic for period accounting so a wall-clock jump
+        # (NTP correction, manual time change) doesn't either starve
+        # the loop or make it spin. Wall-clock `time.time()` is kept
+        # only for the `updated_at` field exposed to the UI.
+        started_mono = time.monotonic()
         try:
             resp = await _process_rpc(target.process_id, target.action, target.params)
         except asyncio.CancelledError:
@@ -630,7 +634,9 @@ async def _process_cached_call_loop(target: ProcessCachedCallTarget) -> None:
             "cached": True,
             "updated_at": time.time(),
         }
-        await asyncio.sleep(max(0.0, target.period_s - (time.time() - started_at)))
+        await asyncio.sleep(
+            max(0.0, target.period_s - (time.monotonic() - started_mono))
+        )
 
 
 def _is_loopback_host(raw_host: str | None) -> bool:
@@ -1259,6 +1265,17 @@ async def process_cached_call(
     action: str,
     params: str = "{}",
 ) -> dict[str, Any]:
+    # Cap the raw query-string length before json.loads to bound parse
+    # cost for hostile / oversized inputs. 4 KiB is well above any
+    # plausible legitimate cached-call params payload.
+    if len(params) > 4096:
+        return {
+            "ok": False,
+            "error": {
+                "code": "invalid_params",
+                "message": "params query string exceeds 4096 byte cap",
+            },
+        }
     try:
         raw_params = json.loads(params) if str(params or "").strip() else {}
     except Exception:

@@ -580,6 +580,10 @@ class HdfWriter(ManagedProcessBase):
         self._bg_thread: threading.Thread | None = None
         self._bg_thread_dead = False
         self._dropped_flush_batches = 0
+        # Monotonic timestamp of the last `hdf.flush_batch_dropped` event
+        # we published. Used to rate-limit the overflow notification so a
+        # sustained backlog doesn't flood the process data PUB bus.
+        self._last_flush_drop_event_mono: float = 0.0
         self._bg_join_timeout_s = max(0.1, float(bg_join_timeout_s))
         self._active_h5_filename: str | None = None
         self._writing_active = False
@@ -1259,8 +1263,31 @@ class HdfWriter(ManagedProcessBase):
             # Bg thread is backlogged. The snapshotted data is dropped
             # rather than blocking the main loop; counter is exposed in
             # status so persistent overflow shows up in monitoring.
+            #
+            # A dropped flush batch is a real correctness degradation for
+            # a writer whose contract is "persist data". Publish a
+            # `hdf.flush_batch_dropped` event on the process data PUB so
+            # operators see it without polling status. Rate-limited to
+            # at most once per second to avoid flooding on sustained
+            # backlog.
             self._dropped_flush_batches += 1
             self._bump_error("bg.flush_batch.dropped")
+            now_mono = time.monotonic()
+            if now_mono - self._last_flush_drop_event_mono >= 1.0:
+                self._last_flush_drop_event_mono = now_mono
+                try:
+                    self._publish_process_event(
+                        topic="hdf.flush_batch_dropped",
+                        payload={
+                            "queue_depth": self._bg_queue.qsize(),
+                            "queue_max": self._bg_queue.maxsize,
+                            "dropped_total": self._dropped_flush_batches,
+                        },
+                    )
+                except Exception:
+                    # Never let event-publish failure mask the drop or
+                    # destabilise the main loop.
+                    pass
             return False
         if force_flush:
             self._pending = 0
@@ -1471,6 +1498,13 @@ class HdfWriter(ManagedProcessBase):
         load_manager_state: bool,
         measurement_meta: Json,
     ) -> None:
+        # Thread-safety invariant: it is safe to mutate `self._h5` outside
+        # `_h5_lock` here because this RPC handler and the data-ingestion
+        # producer share the hdf_writer's main thread; while we run, no
+        # new batches enqueue for the bg flush thread. If RPC handling
+        # ever moves off the main thread, wrap this `self._h5 = ...`
+        # reassignment in `_h5_lock` to prevent a race with the bg flush
+        # thread (which takes `_h5_lock` for writes).
         self._h5 = h5
         self._publish_h5_state_cache()
         self._reset_per_file_state()
@@ -1575,6 +1609,14 @@ class HdfWriter(ManagedProcessBase):
         measurement_profile: str | None = None,
         measurement_values: object = None,
     ) -> tuple[str | None, str]:
+        # Thread-safety invariant: this RPC handler reassigns `self._h5`
+        # (via `_configure_active_file` below) without holding `_h5_lock`.
+        # That is safe today because the RPC handler and the data-ingestion
+        # producer share the hdf_writer's main thread; while we run, no
+        # new batches enqueue for the bg flush thread (which DOES take
+        # `_h5_lock` for writes). If RPC handling moves off the main thread
+        # in the future, wrap the `self._h5 = ...` reassignments in
+        # `_h5_lock` to prevent a race with the bg flush thread.
         if self._h5 is None:
             new_file = self._start_writing_file(
                 filename=filename,
@@ -1685,6 +1727,14 @@ class HdfWriter(ManagedProcessBase):
         return str(h5.filename)
 
     def _stop_writing_file(self) -> str | None:
+        # Thread-safety invariant: the `self._h5 = None` reassignment below
+        # is performed without holding `_h5_lock`. That is safe today
+        # because this RPC handler and the data-ingestion producer share
+        # the hdf_writer's main thread; while we run, no new batches
+        # enqueue for the bg flush thread (which DOES take `_h5_lock` for
+        # writes). If RPC handling moves off the main thread, wrap the
+        # `self._h5 = None` reassignment in `_h5_lock` to prevent a race
+        # with the bg flush thread.
         h5 = self._h5
         if h5 is None:
             return None
