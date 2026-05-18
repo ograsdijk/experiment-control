@@ -6,7 +6,7 @@ import math
 import re
 import time
 import uuid
-from collections import deque
+from collections import OrderedDict, deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from graphlib import TopologicalSorter
@@ -2500,6 +2500,46 @@ def _compile_workspace_output_item(
     return PublishOutput(output_id=output_id, node_id=node_id, kind=kind)
 
 
+def _prune_unreachable_nodes(
+    *,
+    order: list[str],
+    deps: dict[str, set[str]],
+    outputs: list[PublishOutput],
+    source_stream_node_id: str,
+) -> list[str]:
+    """Return `order` filtered to nodes reachable from any published output.
+
+    Per-event execution walks every node in `order`; a node that no output
+    transitively depends on does nothing observable but still pays its
+    dispatch + handler cost on every chunk_ready. Pruning is purely a
+    compile-time optimization — runtime behaviour is unchanged for any
+    workspace whose output set genuinely depends on every node (the common
+    case for UI-built workspaces).
+
+    The source stream node is always considered reachable so the per-event
+    loop keeps a chance to advance source-channel bookkeeping even when
+    nothing downstream consumes the channel value directly.
+
+    Stateful operators (fits, aggregates) are preserved as long as they
+    sit on a path to a published output — they need to run on every event
+    to keep their internal state coherent.
+    """
+    reachable: set[str] = {source_stream_node_id}
+    queue: list[str] = [out.node_id for out in outputs] + [source_stream_node_id]
+    while queue:
+        node_id = queue.pop()
+        if node_id in reachable:
+            # Already visited; but we still want to add the seed output
+            # node_ids on first sight, so seed via the conditional below.
+            pass
+        if node_id not in reachable:
+            reachable.add(node_id)
+        for dep in deps.get(node_id, ()):  # type: ignore[arg-type]
+            if dep not in reachable:
+                queue.append(dep)
+    return [node_id for node_id in order if node_id in reachable]
+
+
 def compile_workspace_graph(config: Json) -> CompiledWorkspace:
     workspace_id, enabled, nodes_list, nodes = _parse_workspace_root(config)
     deps = _compile_workspace_dependencies(nodes_list=nodes_list, nodes=nodes)
@@ -2523,6 +2563,16 @@ def compile_workspace_graph(config: Json) -> CompiledWorkspace:
         str(source_node.params["stream"]).strip(),
     )
     outputs = _compile_workspace_outputs(config=config, nodes=nodes, out_type=out_type)
+
+    # Prune nodes that don't feed any published output. Done after
+    # outputs are compiled so we have the full set of consumer node_ids
+    # to walk backwards from.
+    order = _prune_unreachable_nodes(
+        order=order,
+        deps=deps,
+        outputs=outputs,
+        source_stream_node_id=source_stream_nodes[0],
+    )
 
     return CompiledWorkspace(
         workspace_id=workspace_id,
@@ -2601,8 +2651,13 @@ class StreamAnalysisProcess(ManagedProcessBase):
         ] = {}
         # Per-stream context keyed by stream sequence number. This lets us
         # apply the correct context to each ring event when we process backlog.
+        # Per-stream bucket type. OrderedDict gives O(1) "drop oldest"
+        # eviction via popitem(last=False); the prior dict + sorted(keys())
+        # eviction was O(n log n) per insert past capacity, which dominated
+        # CPU on high-frequency streams once the bucket filled.
         self._context_by_seq: dict[
-            tuple[str, str], dict[int, tuple[int | None, dict[str, Any] | None]]
+            tuple[str, str],
+            "OrderedDict[int, tuple[int | None, dict[str, Any] | None]]",
         ] = {}
         self._context_cache_limit = 8192
         self._telemetry_history: dict[tuple[str, str], list[tuple[float, float]]] = {}
@@ -3202,6 +3257,28 @@ class StreamAnalysisProcess(ManagedProcessBase):
             _sanitize_json(dict(payload))
         )
 
+    def _remember_latest_output_clean(self, payload: Json) -> None:
+        """Snapshot-store a payload whose values are already JSON-clean.
+
+        Same shape as `_remember_latest_output` but skips the recursive
+        `_sanitize_json` walk. Callers MUST guarantee that every value
+        in the payload (including nested lists/dicts) is already free
+        of NaN/Inf — typically because each upstream value-producing
+        path sanitised at build time.
+
+        Used by the trace-output snapshot path where the value list is
+        sanitised inline in `_build_trace_snapshot_payload` (200k-point
+        traces saw ~68 ms per snapshot walk in the bench; this path
+        eliminates that).
+        """
+        workspace_id = _normalize_id(payload.get("workspace_id"))
+        output_id = _normalize_id(payload.get("output_id"))
+        if workspace_id is None or output_id is None:
+            return
+        self._latest_output_payloads[self._snapshot_output_key(workspace_id, output_id)] = (
+            dict(payload)
+        )
+
     def _clear_workspace_snapshot_outputs(
         self, workspace_id: str, *, node_id: str | None = None
     ) -> None:
@@ -3461,15 +3538,19 @@ class StreamAnalysisProcess(ManagedProcessBase):
     ) -> None:
         if seq is None:
             return
-        bucket = self._context_by_seq.setdefault(key, {})
-        bucket[int(seq)] = (
+        bucket = self._context_by_seq.setdefault(key, OrderedDict())
+        seq_key = int(seq)
+        # If the seq already has an entry, remove it first so the new value
+        # lands at the end of the insertion order; otherwise OrderedDict
+        # would keep the old position and break the oldest-first invariant.
+        if seq_key in bucket:
+            del bucket[seq_key]
+        bucket[seq_key] = (
             int(context_id) if context_id is not None else None,
             dict(context_fields) if isinstance(context_fields, dict) else None,
         )
-        if len(bucket) > self._context_cache_limit:
-            trim = len(bucket) - self._context_cache_limit
-            for stale_seq in sorted(bucket.keys())[:trim]:
-                bucket.pop(stale_seq, None)
+        while len(bucket) > self._context_cache_limit:
+            bucket.popitem(last=False)
 
     def _pop_context_for_seq(
         self, *, key: tuple[str, str], seq: int | None
@@ -4349,7 +4430,11 @@ class StreamAnalysisProcess(ManagedProcessBase):
             t0_mono_out=t0_mono_out,
             t0_wall_out=t0_wall_out,
         )
-        self._remember_latest_output(snapshot_payload)
+        # PerfI: `_build_trace_snapshot_payload` sanitises the value
+        # list inline and context_fields are sanitised at line 4533;
+        # remaining header fields are ints/strs. Snapshot-store can
+        # skip the recursive walk that `_remember_latest_output` does.
+        self._remember_latest_output_clean(snapshot_payload)
         self._publish_manager_event(
             topic="manager.stream_analysis.trace_ready",
             payload=descriptor,
@@ -4414,6 +4499,24 @@ class StreamAnalysisProcess(ManagedProcessBase):
         t0_mono_out: int,
         t0_wall_out: int,
     ) -> Json:
+        # PerfI: sanitise the values list inline so the snapshot-store
+        # path below (`_remember_latest_output_clean`) can skip the
+        # recursive _sanitize_json walk over a 200k-point list per
+        # frame (~68 ms/walk in the bench).
+        #
+        # Fast path: when the trace has no non-finite values (the
+        # common case), `np.isfinite(arr).all()` is one vectorised
+        # check; the list is produced by a single `.tolist()` call
+        # as before. Slow path only triggers when there's actual
+        # NaN/Inf to scrub.
+        value_arr = trace.astype(np.float64, copy=False).reshape(-1)
+        if value_arr.size == 0 or np.isfinite(value_arr).all():
+            value_list = value_arr.tolist()
+        else:
+            value_list = value_arr.tolist()
+            for i, x in enumerate(value_list):
+                if not math.isfinite(x):
+                    value_list[i] = None
         snapshot_payload: Json = {
             "version": 1,
             "workspace_id": workspace_id,
@@ -4427,7 +4530,7 @@ class StreamAnalysisProcess(ManagedProcessBase):
             "t0_wall_ns": t0_wall_out,
             "channel_index": int(output.get("channel_index", 0) or 0),
             "channel_count": int(output.get("channel_count", 1) or 1),
-            "value": trace.astype(np.float64, copy=False).reshape(-1).tolist(),
+            "value": value_list,
             "point_count": int(trace.size),
         }
         if bool(output.get("truncated")):
@@ -5287,12 +5390,7 @@ class StreamAnalysisProcess(ManagedProcessBase):
 
         if not hasattr(self, "_rpc_registry"):
             self._rpc_registry = self._build_rpc_registry()
-        canonical = self._rpc_registry.canonical_action(req.get("type"))
-        if canonical:
-            req_type = str(req.get("type", ""))
-            if canonical != req_type:
-                req = dict(req)
-                req["type"] = canonical
+        req = self._rpc_registry.canonicalize_request(req)
 
         params = req.get("params", {})
         if params is None:

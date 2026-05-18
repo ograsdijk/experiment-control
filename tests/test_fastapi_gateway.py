@@ -1,13 +1,14 @@
 # ruff: noqa: E402
 
 import asyncio
-import concurrent.futures
 import sys
+import threading
 import time
 import unittest
 from pathlib import Path
 
 import numpy as np
+import zmq
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
@@ -15,6 +16,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from experiment_control.fastapi.gateway import RouterRpcClient, StreamFrameHub, TelemetryHub
+from experiment_control.utils.zmq_helpers import json_dumps, safe_json_loads
 
 
 class _AliveThreadStub:
@@ -72,16 +74,17 @@ class GatewayLifecycleTests(unittest.TestCase):
         return bool(predicate())
 
     def test_router_rpc_client_restart_is_safe(self) -> None:
+        loop = asyncio.new_event_loop()
         client = RouterRpcClient("tcp://127.0.0.1:1", timeout_ms=20, queue_max=8)
         try:
-            client.start()
+            client.start(loop)
             self.assertTrue(
                 self._wait_until(
                     lambda: bool(client._thread is not None and client._thread.is_alive())
                 )
             )
             client.close()
-            client.start()
+            client.start(loop)
             self.assertTrue(
                 self._wait_until(
                     lambda: bool(client._thread is not None and client._thread.is_alive())
@@ -89,30 +92,130 @@ class GatewayLifecycleTests(unittest.TestCase):
             )
         finally:
             client.close()
+            loop.close()
 
     def test_router_rpc_client_rejects_when_queue_full(self) -> None:
-        client = RouterRpcClient("tcp://127.0.0.1:1", queue_max=1)
-        client._thread = _AliveThreadStub()  # type: ignore[assignment]
-        fut: concurrent.futures.Future = concurrent.futures.Future()
-        client._queue.put_nowait(({"type": "already-queued"}, None, fut))
-        resp = client.request({"type": "new-request"})
-        self.assertFalse(bool(resp.get("ok")))
-        err = resp.get("error", {})
-        self.assertEqual(err.get("code"), "gateway_busy")
-        self.assertEqual(int(client.stats().get("queue_rejected", 0)), 1)
+        loop = asyncio.new_event_loop()
+        try:
+            client = RouterRpcClient("tcp://127.0.0.1:1", queue_max=1)
+            client._loop = loop
+            client._thread = _AliveThreadStub()  # type: ignore[assignment]
+            fut: asyncio.Future = loop.create_future()
+            client._queue.put_nowait(({"type": "already-queued"}, None, fut))
+            resp = loop.run_until_complete(client.request({"type": "new-request"}))
+            self.assertFalse(bool(resp.get("ok")))
+            err = resp.get("error", {})
+            self.assertEqual(err.get("code"), "gateway_busy")
+            self.assertEqual(int(client.stats().get("queue_rejected", 0)), 1)
+        finally:
+            loop.close()
 
     def test_router_rpc_client_close_resolves_pending_queue(self) -> None:
-        client = RouterRpcClient("tcp://127.0.0.1:1", queue_max=4)
-        client._thread = _StoppedThreadStub()  # type: ignore[assignment]
-        fut: concurrent.futures.Future = concurrent.futures.Future()
-        client._queue.put_nowait(({"type": "queued"}, None, fut))
-        client.close()
-        self.assertTrue(fut.done())
-        result = fut.result()
-        self.assertFalse(bool(result.get("ok")))
-        err = result.get("error", {})
-        self.assertEqual(err.get("code"), "gateway_closed")
-        self.assertEqual(int(client.stats().get("closed_pending", 0)), 1)
+        loop = asyncio.new_event_loop()
+        try:
+            client = RouterRpcClient("tcp://127.0.0.1:1", queue_max=4)
+            client._loop = loop
+            client._thread = _StoppedThreadStub()  # type: ignore[assignment]
+            fut: asyncio.Future = loop.create_future()
+            client._queue.put_nowait(({"type": "queued"}, None, fut))
+            client.close()
+            # close() schedules fut.set_result via call_soon_threadsafe; run
+            # the loop once so the callback fires before we assert.
+            loop.run_until_complete(asyncio.sleep(0))
+            self.assertTrue(fut.done())
+            result = fut.result()
+            self.assertFalse(bool(result.get("ok")))
+            err = result.get("error", {})
+            self.assertEqual(err.get("code"), "gateway_closed")
+            self.assertEqual(int(client.stats().get("closed_pending", 0)), 1)
+        finally:
+            loop.close()
+
+    def test_router_rpc_client_pipelines_concurrent_requests(self) -> None:
+        """End-to-end: 10 concurrent requests against a delay-echo ROUTER
+        should complete in ~delay time, not ~10*delay (the bug we're
+        fixing). Each reply echoes back the inbound `request_id` so the
+        client can correlate replies to futures.
+        """
+        DELAY_MS = 100
+        N = 10
+
+        ctx = zmq.Context.instance()
+        router_sock = ctx.socket(zmq.ROUTER)
+        # OS-assigned port
+        port = router_sock.bind_to_random_port("tcp://127.0.0.1")
+        endpoint = f"tcp://127.0.0.1:{port}"
+        stop_evt = threading.Event()
+
+        def server() -> None:
+            poller = zmq.Poller()
+            poller.register(router_sock, zmq.POLLIN)
+            # All replies are scheduled at start_t + DELAY_MS so the run
+            # really is concurrent (not serial).
+            pending: list[tuple[float, bytes, dict]] = []
+            while not stop_evt.is_set():
+                events = dict(poller.poll(10))
+                if router_sock in events:
+                    while True:
+                        try:
+                            ident, payload = router_sock.recv_multipart(zmq.NOBLOCK)
+                        except zmq.Again:
+                            break
+                        req = safe_json_loads(payload)
+                        if isinstance(req, dict):
+                            reply = {"ok": True, "request_id": req.get("request_id")}
+                            pending.append(
+                                (time.monotonic() + DELAY_MS / 1000.0, ident, reply)
+                            )
+                now = time.monotonic()
+                still: list[tuple[float, bytes, dict]] = []
+                for due, ident, reply in pending:
+                    if now >= due:
+                        try:
+                            router_sock.send_multipart([ident, json_dumps(reply)])
+                        except Exception:
+                            pass
+                    else:
+                        still.append((due, ident, reply))
+                pending = still
+
+        srv = threading.Thread(target=server, daemon=True)
+        srv.start()
+
+        loop = asyncio.new_event_loop()
+        client = RouterRpcClient(endpoint, timeout_ms=5000, queue_max=64)
+        try:
+            client.start(loop)
+
+            async def fire_all() -> list[dict]:
+                return await asyncio.gather(
+                    *[client.request({"type": "ping", "i": i}) for i in range(N)]
+                )
+
+            t0 = time.monotonic()
+            results = loop.run_until_complete(fire_all())
+            elapsed_s = time.monotonic() - t0
+        finally:
+            client.close()
+            stop_evt.set()
+            srv.join(timeout=2.0)
+            try:
+                router_sock.close(0)
+            except Exception:
+                pass
+            loop.close()
+
+        self.assertEqual(len(results), N)
+        for r in results:
+            self.assertTrue(bool(r.get("ok")), msg=str(r))
+        # Sequential dispatch would take ~N * DELAY_MS = 1000 ms.
+        # Pipelined should finish in ~DELAY_MS + small overhead.
+        budget_s = (DELAY_MS * 3) / 1000.0
+        self.assertLess(
+            elapsed_s,
+            budget_s,
+            msg=f"pipelined N={N} took {elapsed_s:.3f}s, expected < {budget_s:.3f}s",
+        )
 
     def test_telemetry_hub_restart_is_safe(self) -> None:
         loop = asyncio.new_event_loop()
@@ -130,6 +233,34 @@ class GatewayLifecycleTests(unittest.TestCase):
         finally:
             hub.close()
             loop.close()
+
+    def test_telemetry_hub_fanout_shares_preserialized_string(self) -> None:
+        """Hub serializes once and every subscriber receives the same str
+        (round-tripped from JSON). This is the load-bearing invariant of
+        the P1 optimization: N subscribers no longer each pay
+        `json.dumps()`."""
+        import json
+
+        async def run() -> tuple[str, str, str]:
+            hub = TelemetryHub("tcp://127.0.0.1:1", topics=("any",))
+            hub._loop = asyncio.get_running_loop()  # noqa: SLF001
+            q1 = hub.subscribe()
+            q2 = hub.subscribe()
+            hub._fanout('{"topic":"any","payload":{"k":1}}')  # noqa: SLF001
+            payload1 = await asyncio.wait_for(q1.get(), timeout=1.0)
+            payload2 = await asyncio.wait_for(q2.get(), timeout=1.0)
+            return payload1, payload2, '{"topic":"any","payload":{"k":1}}'
+
+        loop = asyncio.new_event_loop()
+        try:
+            payload1, payload2, expected = loop.run_until_complete(run())
+        finally:
+            loop.close()
+        # Both subscribers received the exact same string instance —
+        # confirms the hub didn't re-serialize per subscriber.
+        self.assertIs(payload1, payload2)
+        # And the string is the JSON we put in.
+        self.assertEqual(json.loads(payload1), json.loads(expected))
 
     def test_stream_frame_hub_restart_is_safe(self) -> None:
         loop = asyncio.new_event_loop()

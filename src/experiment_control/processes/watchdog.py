@@ -1017,27 +1017,13 @@ class WatchdogProcess(ManagedProcessBase):
             return common
         params = req.get("params", {}) or {}
         if not isinstance(params, dict):
-            return {
-                "request_id": req.get("request_id"),
-                "ok": False,
-                "error": {"code": "invalid_params"},
-            }
+            return self._rpc_invalid_params(req)
         if not hasattr(self, "_rpc_registry"):
             self._rpc_registry = self._build_rpc_registry()
-        canonical = self._rpc_registry.canonical_action(req.get("type"))
-        if canonical:
-            req_type = str(req.get("type", "")).strip()
-            if canonical != req_type:
-                req = dict(req)
-                req["type"] = canonical
-        dispatched = self._rpc_registry.dispatch(req)
+        dispatched = self._rpc_registry.dispatch_with_canonical(req)
         if dispatched is not None:
             return dispatched
-        return {
-            "request_id": req.get("request_id"),
-            "ok": False,
-            "error": {"code": "unknown_request"},
-        }
+        return self._rpc_unknown(req)
 
     def run(self) -> None:
         try:

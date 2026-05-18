@@ -1,6 +1,7 @@
 # ruff: noqa: E402
 
 import asyncio
+import importlib
 import sys
 import unittest
 from pathlib import Path
@@ -13,7 +14,12 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 try:
-    from experiment_control.fastapi import app as fastapi_app_module
+    # NB: `import experiment_control.fastapi.app as ...` resolves to the FastAPI
+    # *instance* re-exported by the package __init__ (which does
+    # `from .app import app`, shadowing the submodule). Use importlib to grab
+    # the actual submodule so we can reach module-level helpers like
+    # `_is_transient_capabilities_failure` and `device_capabilities`.
+    fastapi_app_module = importlib.import_module("experiment_control.fastapi.app")
 
     _FASTAPI_IMPORT_ERROR: Exception | None = None
 except Exception as exc:  # pragma: no cover - environment specific
@@ -26,7 +32,7 @@ class _RouterStub:
         self._responses = list(responses)
         self.calls: list[dict] = []
 
-    def request(self, payload: dict, timeout_ms: int | None = None) -> dict:
+    async def request(self, payload: dict, timeout_ms: int | None = None) -> dict:
         del timeout_ms
         self.calls.append(dict(payload))
         if self._responses:

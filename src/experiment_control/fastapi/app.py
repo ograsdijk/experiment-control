@@ -10,6 +10,7 @@ import sys
 import time
 import uuid
 from pathlib import Path
+from collections.abc import Callable
 from typing import Any
 from urllib.parse import SplitResult, urlsplit, urlunsplit
 
@@ -21,6 +22,7 @@ from pydantic import BaseModel, Field
 
 from .gateway import GatewaySettings, RouterRpcClient, StreamFrameHub, TelemetryHub
 from ..shm.shm_ring import ShmRingReader
+from ..utils.zmq_helpers import json_dumps as _orjson_dumps
 from ..utils.instance_lock import (
     derive_lock_effective_status,
     lock_effective_status_help,
@@ -47,6 +49,17 @@ from ..utils.trace_processing import (
 
 
 _EXTRA_UI_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
+
+
+async def _ws_send_json(ws: WebSocket, msg: Any) -> None:
+    """Send a JSON message over WS using the project's orjson-backed
+    encoder. Equivalent to `ws.send_json(msg)` (text frame, UTF-8), but
+    avoids Starlette's stdlib `json.dumps` — orjson is ~13–22× faster on
+    the stream-frame payload shapes the gateway broadcasts. See `json_dumps`
+    in `utils/zmq_helpers.py`; falls back to pyzmq's encoder when orjson
+    rejects a payload (NaN/Inf, exotic types).
+    """
+    await ws.send_text(_orjson_dumps(msg).decode("utf-8"))
 
 
 @dataclass(frozen=True)
@@ -189,6 +202,65 @@ def _ensure_error_shape(resp: Any) -> dict[str, Any]:
     return resp
 
 
+async def _route_request(payload: dict[str, Any]) -> dict[str, Any]:
+    """Dispatch ``payload`` through the router and shape the response.
+
+    Most HTTP handlers follow the pattern ``payload = {...}; resp = await
+    app.state.router.request(payload); return _ensure_error_shape(resp)``.
+    Use this helper for those. Handlers that post-process the response
+    (filter, reshape, fan out, etc.) should keep calling the router
+    directly.
+    """
+    return _ensure_error_shape(await app.state.router.request(payload))
+
+
+def _build_trace_frame_payload(
+    payload: dict[str, Any],
+    *,
+    channel_index: int,
+    trace_decimator: str,
+    trace_max_points: int | None,
+    pre_decimate: Callable[[np.ndarray], np.ndarray | None] | None = None,
+) -> dict[str, Any] | None:
+    """Shared trace-processing chain used by /ws/raw_stream and
+    /api/streams/raw_snapshot.
+
+    Normalises shape, coerces values to an ndarray, selects the requested
+    channel, optionally runs a caller-supplied pre-decimate step (used by
+    the WS handler for rolling-average) and decimates to ``trace_max_points``.
+    Returns the rebuilt outgoing payload (with ``shape``/``values``/
+    ``channel_index``/``point_count``/optional ``decimated`` set), or ``None``
+    if the input payload was unusable.
+    """
+    shape = _normalize_shape(payload.get("shape"))
+    arr = _coerce_stream_values_array(payload.get("values"), shape)
+    if arr is None:
+        return None
+    trace = _select_trace_from_array(arr, channel_index)
+    if pre_decimate is not None:
+        trace = pre_decimate(trace)
+        if trace is None:
+            return None
+    if trace_max_points is not None:
+        trace_values = _decimate_trace_values(
+            trace,
+            mode=trace_decimator,
+            max_points=trace_max_points,
+        )
+    else:
+        trace_values = trace.tolist()
+    if not isinstance(trace_values, list):
+        return None
+    out_payload: dict[str, Any] = dict(payload)
+    out_payload["shape"] = [len(trace_values)]
+    out_payload["values"] = trace_values
+    out_payload["channel_index"] = int(channel_index)
+    out_payload["point_count"] = len(trace_values)
+    if trace_max_points is not None and len(trace_values) < int(trace.size):
+        out_payload["decimated"] = True
+    return out_payload
+
+
 def _command_source_fields(
     request: Request,
     *,
@@ -279,7 +351,7 @@ def _is_transient_capabilities_failure(resp: dict[str, Any]) -> bool:
 async def _request_device_capabilities_with_retry(
     payload: dict[str, Any],
 ) -> dict[str, Any]:
-    first = await asyncio.to_thread(app.state.router.request, payload)
+    first = await app.state.router.request(payload)
     first_shaped = _normalize_command_response(first)
     if not _is_transient_capabilities_failure(first_shaped):
         return first_shaped
@@ -287,7 +359,7 @@ async def _request_device_capabilities_with_retry(
     await asyncio.sleep(0.2)
     retry_payload = dict(payload)
     retry_payload["request_id"] = uuid.uuid4().hex
-    second = await asyncio.to_thread(app.state.router.request, retry_payload)
+    second = await app.state.router.request(retry_payload)
     second_shaped = _normalize_command_response(second)
     if _is_transient_capabilities_failure(second_shaped):
         err = second_shaped.get("error")
@@ -330,7 +402,7 @@ async def _fetch_manager_identity(router: RouterRpcClient) -> dict[str, Any] | N
     request_id = uuid.uuid4().hex
     payload = {"type": "manager.info.identity", "request_id": request_id}
     try:
-        resp = await asyncio.to_thread(router.request, payload)
+        resp = await router.request(payload)
     except Exception:
         return None
     shaped = _ensure_error_shape(resp)
@@ -345,7 +417,7 @@ async def _fetch_manager_identity(router: RouterRpcClient) -> dict[str, Any] | N
 async def _lookup_process_status(process_id: str) -> dict[str, Any] | None:
     payload = {"type": "manager.processes.list"}
     try:
-        resp = await asyncio.to_thread(app.state.router.request, payload)
+        resp = await app.state.router.request(payload)
     except Exception:
         return None
     shaped = _ensure_error_shape(resp)
@@ -456,7 +528,7 @@ async def _process_rpc(
             "request_id": request_id,
         },
     }
-    resp = await asyncio.to_thread(app.state.router.request, payload)
+    resp = await app.state.router.request(payload)
     shaped = _ensure_error_shape(resp)
     if shaped.get("ok") is True:
         got = shaped.get("request_id")
@@ -767,7 +839,7 @@ async def _startup() -> None:
         timeout_ms=settings.rpc_timeout_ms,
         queue_max=settings.rpc_queue_max,
     )
-    router.start()
+    router.start(asyncio.get_running_loop())
     manager_identity = await _fetch_manager_identity(router)
     telemetry_hub = TelemetryHub(settings.manager_pub, topics=settings.telemetry_topics)
     telemetry_hub.start(asyncio.get_running_loop())
@@ -954,28 +1026,25 @@ async def instance_cleanup_orphans(
         "timeout_s": float(req.timeout_s) if req is not None else 2.0,
     }
     payload = {"type": "manager.control.cleanup_orphans", "params": params}
-    resp = await asyncio.to_thread(app.state.router.request, payload)
-    return _ensure_error_shape(resp)
+    return await _route_request(payload)
 
 
 @app.get("/api/devices")
 async def list_devices() -> dict[str, Any]:
     payload = {"type": "device.list_status"}
-    resp = await asyncio.to_thread(app.state.router.request, payload)
-    return _ensure_error_shape(resp)
+    return await _route_request(payload)
 
 
 @app.get("/api/snapshots/telemetry")
 async def telemetry_snapshot() -> dict[str, Any]:
     payload = {"type": "manager.telemetry.snapshot"}
-    resp = await asyncio.to_thread(app.state.router.request, payload)
-    return _ensure_error_shape(resp)
+    return await _route_request(payload)
 
 
 @app.get("/api/streams")
 async def list_streams() -> dict[str, Any]:
     payload = {"type": "device.config.list"}
-    resp = await asyncio.to_thread(app.state.router.request, payload)
+    resp = await app.state.router.request(payload)
     resp = _ensure_error_shape(resp)
     if not resp.get("ok"):
         return resp
@@ -1063,29 +1132,26 @@ async def device_call(
             source_id=req.source_id,
         ),
     }
-    resp = await asyncio.to_thread(app.state.router.request, payload)
+    resp = await app.state.router.request(payload)
     return _normalize_command_response(resp)
 
 
 @app.post("/api/devices/{device_id}/connect")
 async def device_connect(device_id: str) -> dict[str, Any]:
     payload = {"type": "device.connect", "device_id": device_id}
-    resp = await asyncio.to_thread(app.state.router.request, payload)
-    return _ensure_error_shape(resp)
+    return await _route_request(payload)
 
 
 @app.post("/api/devices/{device_id}/start")
 async def device_start(device_id: str) -> dict[str, Any]:
     payload = {"type": "device.driver.start", "device_id": device_id}
-    resp = await asyncio.to_thread(app.state.router.request, payload)
-    return _ensure_error_shape(resp)
+    return await _route_request(payload)
 
 
 @app.post("/api/devices/{device_id}/disconnect")
 async def device_disconnect(device_id: str) -> dict[str, Any]:
     payload = {"type": "device.disconnect", "device_id": device_id}
-    resp = await asyncio.to_thread(app.state.router.request, payload)
-    return _ensure_error_shape(resp)
+    return await _route_request(payload)
 
 
 @app.post("/api/devices/{device_id}/restart")
@@ -1097,15 +1163,13 @@ async def device_restart(
         "device_id": device_id,
         "force": bool(req.force) if req is not None else False,
     }
-    resp = await asyncio.to_thread(app.state.router.request, payload)
-    return _ensure_error_shape(resp)
+    return await _route_request(payload)
 
 
 @app.get("/api/processes")
 async def list_processes() -> dict[str, Any]:
     payload = {"type": "manager.processes.list"}
-    resp = await asyncio.to_thread(app.state.router.request, payload)
-    return _ensure_error_shape(resp)
+    return await _route_request(payload)
 
 
 @app.post("/api/processes/{process_id}/start")
@@ -1115,8 +1179,7 @@ async def process_start(process_id: str, request: Request) -> dict[str, Any]:
         "process_id": process_id,
         **_command_source_fields(request),
     }
-    resp = await asyncio.to_thread(app.state.router.request, payload)
-    return _ensure_error_shape(resp)
+    return await _route_request(payload)
 
 
 @app.post("/api/processes/{process_id}/stop")
@@ -1126,8 +1189,7 @@ async def process_stop(process_id: str, request: Request) -> dict[str, Any]:
         "process_id": process_id,
         **_command_source_fields(request),
     }
-    resp = await asyncio.to_thread(app.state.router.request, payload)
-    return _ensure_error_shape(resp)
+    return await _route_request(payload)
 
 
 @app.post("/api/processes/{process_id}/restart")
@@ -1137,8 +1199,7 @@ async def process_restart(process_id: str, request: Request) -> dict[str, Any]:
         "process_id": process_id,
         **_command_source_fields(request),
     }
-    resp = await asyncio.to_thread(app.state.router.request, payload)
-    return _ensure_error_shape(resp)
+    return await _route_request(payload)
 
 
 @app.post("/api/processes/hdf_writer/writing/stop")
@@ -1155,8 +1216,7 @@ async def hdf_writer_writing_stop(request: Request) -> dict[str, Any]:
         },
         **_command_source_fields(request),
     }
-    resp = await asyncio.to_thread(app.state.router.request, payload)
-    return _ensure_error_shape(resp)
+    return await _route_request(payload)
 
 
 @app.post("/api/processes/hdf_writer/writing/start")
@@ -1190,8 +1250,7 @@ async def hdf_writer_writing_start(
             source_id=req.source_id if req is not None else None,
         ),
     }
-    resp = await asyncio.to_thread(app.state.router.request, payload)
-    return _ensure_error_shape(resp)
+    return await _route_request(payload)
 
 
 @app.get("/api/processes/{process_id}/cached-call")
@@ -1253,8 +1312,7 @@ async def process_capabilities(process_id: str) -> dict[str, Any]:
             "request_id": uuid.uuid4().hex,
         },
     }
-    resp = await asyncio.to_thread(app.state.router.request, payload)
-    return _ensure_error_shape(resp)
+    return await _route_request(payload)
 
 
 @app.post("/api/processes/{process_id}/call")
@@ -1280,14 +1338,13 @@ async def process_call(
         },
         **source_fields,
     }
-    resp = await asyncio.to_thread(app.state.router.request, payload)
-    return _ensure_error_shape(resp)
+    return await _route_request(payload)
 
 
 @app.get("/api/interlocks/interceptor_routes")
 async def list_interceptor_routes() -> dict[str, Any]:
     payload = {"type": "manager.interceptors.list"}
-    resp = await asyncio.to_thread(app.state.router.request, payload)
+    resp = await app.state.router.request(payload)
     shaped = _ensure_error_shape(resp)
     if not shaped.get("ok"):
         return shaped
@@ -1499,15 +1556,13 @@ async def logs_tail(req: LogTailRequest | None = None) -> dict[str, Any]:
         "type": "manager.logs.tail",
         "params": req.params if req is not None else {},
     }
-    resp = await asyncio.to_thread(app.state.router.request, payload)
-    return _ensure_error_shape(resp)
+    return await _route_request(payload)
 
 
 @app.get("/api/commands/journal/status")
 async def command_journal_status() -> dict[str, Any]:
     payload = {"type": "manager.commands.journal.status"}
-    resp = await asyncio.to_thread(app.state.router.request, payload)
-    return _ensure_error_shape(resp)
+    return await _route_request(payload)
 
 
 @app.post("/api/commands/journal/tail")
@@ -1518,8 +1573,7 @@ async def command_journal_tail(
         "type": "manager.commands.journal.tail",
         "params": req.params if req is not None else {},
     }
-    resp = await asyncio.to_thread(app.state.router.request, payload)
-    return _ensure_error_shape(resp)
+    return await _route_request(payload)
 
 
 @app.websocket("/ws/telemetry")
@@ -1528,8 +1582,11 @@ async def ws_telemetry(ws: WebSocket) -> None:
     q = app.state.telemetry_hub.subscribe()
     try:
         while True:
-            msg = await q.get()
-            await ws.send_json(msg)
+            # Hub queues pre-serialized JSON strings (see TelemetryHub) so
+            # all N subscribers share the same `json.dumps()` work done
+            # once in the hub's reader thread.
+            payload = await q.get()
+            await ws.send_text(payload)
     except WebSocketDisconnect:
         pass
     finally:
@@ -1542,8 +1599,8 @@ async def ws_logs(ws: WebSocket) -> None:
     q = app.state.logs_hub.subscribe(maxsize=300)
     try:
         while True:
-            msg = await q.get()
-            await ws.send_json(msg)
+            payload = await q.get()
+            await ws.send_text(payload)
     except WebSocketDisconnect:
         pass
     finally:
@@ -1557,7 +1614,7 @@ async def ws_streams(ws: WebSocket) -> None:
     try:
         while True:
             msg = await q.get()
-            await ws.send_json(msg)
+            await _ws_send_json(ws, msg)
     except WebSocketDisconnect:
         pass
     finally:
@@ -1615,11 +1672,11 @@ async def ws_raw_stream(ws: WebSocket) -> None:
     async def _send_or_queue(msg: dict[str, Any]) -> None:
         nonlocal next_send_at, pending_msg
         if trace_interval_s <= 0:
-            await ws.send_json(msg)
+            await _ws_send_json(ws, msg)
             return
         now = time.monotonic()
         if now >= next_send_at:
-            await ws.send_json(msg)
+            await _ws_send_json(ws, msg)
             next_send_at = now + trace_interval_s
             pending_msg = None
             return
@@ -1646,7 +1703,7 @@ async def ws_raw_stream(ws: WebSocket) -> None:
                 now = time.monotonic()
                 if now < next_send_at:
                     continue
-                await ws.send_json(pending_msg)
+                await _ws_send_json(ws, pending_msg)
                 pending_msg = None
                 next_send_at = now + trace_interval_s
                 continue
@@ -1661,31 +1718,15 @@ async def ws_raw_stream(ws: WebSocket) -> None:
             msg_stream = str(payload.get("stream") or "").strip()
             if msg_device_id != device_id or msg_stream != stream:
                 continue
-            shape = _normalize_shape(payload.get("shape"))
-            arr = _coerce_stream_values_array(payload.get("values"), shape)
-            if arr is None:
+            out_payload = _build_trace_frame_payload(
+                payload,
+                channel_index=channel_index,
+                trace_decimator=trace_decimator,
+                trace_max_points=trace_max_points,
+                pre_decimate=_apply_trace_average,
+            )
+            if out_payload is None:
                 continue
-            trace = _select_trace_from_array(arr, channel_index)
-            trace = _apply_trace_average(trace)
-            if trace is None:
-                continue
-            if trace_max_points is not None:
-                trace_values = _decimate_trace_values(
-                    trace,
-                    mode=trace_decimator,
-                    max_points=trace_max_points,
-                )
-            else:
-                trace_values = trace.tolist()
-            if not isinstance(trace_values, list):
-                continue
-            out_payload: dict[str, Any] = dict(payload)
-            out_payload["shape"] = [len(trace_values)]
-            out_payload["values"] = trace_values
-            out_payload["channel_index"] = int(channel_index)
-            out_payload["point_count"] = len(trace_values)
-            if trace_max_points is not None and len(trace_values) < int(trace.size):
-                out_payload["decimated"] = True
             await _send_or_queue({"topic": "manager.stream_frame", "payload": out_payload})
     except WebSocketDisconnect:
         pass
@@ -1719,28 +1760,14 @@ async def raw_stream_snapshot(request: Request) -> dict[str, Any]:
     payload = frame_msg.get("payload")
     if not isinstance(payload, dict):
         return {"ok": True, "result": None}
-    shape = _normalize_shape(payload.get("shape"))
-    arr = _coerce_stream_values_array(payload.get("values"), shape)
-    if arr is None:
+    out_payload = _build_trace_frame_payload(
+        payload,
+        channel_index=channel_index,
+        trace_decimator=trace_decimator,
+        trace_max_points=trace_max_points,
+    )
+    if out_payload is None:
         return {"ok": True, "result": None}
-    trace = _select_trace_from_array(arr, channel_index)
-    if trace_max_points is not None:
-        trace_values = _decimate_trace_values(
-            trace,
-            mode=trace_decimator,
-            max_points=trace_max_points,
-        )
-    else:
-        trace_values = trace.tolist()
-    if not isinstance(trace_values, list):
-        return {"ok": True, "result": None}
-    out_payload: dict[str, Any] = dict(payload)
-    out_payload["shape"] = [len(trace_values)]
-    out_payload["values"] = trace_values
-    out_payload["channel_index"] = int(channel_index)
-    out_payload["point_count"] = len(trace_values)
-    if trace_max_points is not None and len(trace_values) < int(trace.size):
-        out_payload["decimated"] = True
     return {
         "ok": True,
         "result": {
@@ -1875,14 +1902,14 @@ async def _workspace_send_trace_message(
         now = time.monotonic()
         next_at = state.next_trace_send_at.get(trace_key, 0.0)
         if now >= next_at:
-            await ws.send_json(trace_msg)
+            await _ws_send_json(ws, trace_msg)
             state.next_trace_send_at[trace_key] = now + state.trace_interval_s
         else:
             state.pending_trace_msgs[trace_key] = trace_msg
             if trace_key not in state.next_trace_send_at:
                 state.next_trace_send_at[trace_key] = next_at
         return
-    await ws.send_json(trace_msg)
+    await _ws_send_json(ws, trace_msg)
 
 
 async def _workspace_flush_pending_trace_messages(
@@ -1898,7 +1925,7 @@ async def _workspace_flush_pending_trace_messages(
         pending = state.pending_trace_msgs.pop(key, None)
         if pending is None:
             continue
-        await ws.send_json(pending)
+        await _ws_send_json(ws, pending)
         if state.trace_interval_s > 0:
             state.next_trace_send_at[key] = now + state.trace_interval_s
         else:
@@ -2125,7 +2152,7 @@ async def ws_stream_workspace(ws: WebSocket, workspace_id: str) -> None:
                 if handled:
                     continue
 
-            await ws.send_json(msg)
+            await _ws_send_json(ws, msg)
     except WebSocketDisconnect:
         pass
     finally:

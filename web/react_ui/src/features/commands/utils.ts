@@ -1,9 +1,33 @@
 import type {
+  CommandDeckCommandEntry,
+  CommandDeckEntry,
+  CommandDeckTelemetryEntry,
+} from "../../types";
+import type {
   CommandHistoryEntry,
   CommandJournalEntry,
   CommandJournalStatus,
   CommandTargetKind,
 } from "./types";
+
+export function normalizeDeckGroup(
+  raw: string | null | undefined
+): string | null {
+  const text = String(raw ?? "").trim();
+  return text.length > 0 ? text : null;
+}
+
+export function isCommandDeckCommandEntry(
+  entry: CommandDeckEntry
+): entry is CommandDeckCommandEntry {
+  return entry.kind !== "telemetry";
+}
+
+export function isCommandDeckTelemetryEntry(
+  entry: CommandDeckEntry
+): entry is CommandDeckTelemetryEntry {
+  return entry.kind === "telemetry";
+}
 
 export function clampCommandHistoryLimit(
   value: number,

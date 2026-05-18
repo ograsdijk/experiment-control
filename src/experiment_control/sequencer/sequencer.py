@@ -2658,15 +2658,9 @@ class SequencerProcess(ManagedProcessBase):
             return common
         if not hasattr(self, "_rpc_registry"):
             self._rpc_registry = self._build_rpc_registry()
-        canonical = self._rpc_registry.canonical_action(req.get("type"))
-        if canonical:
-            req_type = str(req.get("type", ""))
-            if canonical != req_type:
-                req = dict(req)
-                req["type"] = canonical
-            dispatched = self._rpc_registry.dispatch(req)
-            if dispatched is not None:
-                return dispatched
+        dispatched = self._rpc_registry.dispatch_with_canonical(req)
+        if dispatched is not None:
+            return dispatched
         return self._rpc_unknown(req)
 
     def _handle_rpc_legacy(self, req: Json) -> Json:

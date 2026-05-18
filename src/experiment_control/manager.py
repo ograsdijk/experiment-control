@@ -12,6 +12,7 @@ import sys
 import threading
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
@@ -35,64 +36,26 @@ from .manager_driver_pub import handle_driver_pub as shared_handle_driver_pub
 from .manager_driver_pub import ingest_chunk_ready as shared_ingest_chunk_ready
 from .manager_driver_pub import ingest_heartbeat as shared_ingest_heartbeat
 from .manager_driver_pub import ingest_telemetry as shared_ingest_telemetry
-from .manager_internal_routes_manager import (
-    route_manager_cleanup_orphans as shared_route_manager_cleanup_orphans,
-)
-from .manager_internal_routes_manager import (
-    route_manager_command_journal_status as shared_route_manager_command_journal_status,
-)
-from .manager_internal_routes_manager import (
-    route_manager_command_journal_tail as shared_route_manager_command_journal_tail,
-)
-from .manager_internal_routes_manager import (
-    route_manager_event_publish as shared_route_manager_event_publish,
-)
-from .manager_internal_routes_manager import (
-    route_manager_identity as shared_route_manager_identity,
-)
-from .manager_internal_routes_manager import (
-    route_manager_log_publish as shared_route_manager_log_publish,
-)
-from .manager_internal_routes_manager import (
-    route_manager_log_tail as shared_route_manager_log_tail,
-)
-from .manager_internal_routes_manager import (
-    route_manager_request as shared_route_manager_request,
-)
-from .manager_internal_routes_manager import (
-    route_manager_shutdown as shared_route_manager_shutdown,
-)
-from .manager_internal_routes_process import (
+from .manager_route_handlers import (
     publish_process_command_response as shared_publish_process_command_response,
-)
-from .manager_internal_routes_process import (
     route_command_interceptor_list as shared_route_command_interceptor_list,
-)
-from .manager_internal_routes_process import (
     route_command_interceptor_register as shared_route_command_interceptor_register,
-)
-from .manager_internal_routes_process import (
+    route_manager_cleanup_orphans as shared_route_manager_cleanup_orphans,
+    route_manager_command_journal_status as shared_route_manager_command_journal_status,
+    route_manager_command_journal_tail as shared_route_manager_command_journal_tail,
+    route_manager_event_publish as shared_route_manager_event_publish,
+    route_manager_identity as shared_route_manager_identity,
+    route_manager_log_publish as shared_route_manager_log_publish,
+    route_manager_log_tail as shared_route_manager_log_tail,
+    route_manager_request as shared_route_manager_request,
+    route_manager_shutdown as shared_route_manager_shutdown,
     route_process_add as shared_route_process_add,
-)
-from .manager_internal_routes_process import (
     route_process_control as shared_route_process_control,
-)
-from .manager_internal_routes_process import (
     route_process_get as shared_route_process_get,
-)
-from .manager_internal_routes_process import (
     route_process_list_status as shared_route_process_list_status,
-)
-from .manager_internal_routes_process import (
     route_process_remove as shared_route_process_remove,
-)
-from .manager_internal_routes_process import (
     route_process_request as shared_route_process_request,
-)
-from .manager_internal_routes_process import (
     route_process_rpc as shared_route_process_rpc,
-)
-from .manager_internal_routes_process import (
     route_process_rpc_advertise as shared_route_process_rpc_advertise,
 )
 from .manager_internal_rpc import (
@@ -361,6 +324,15 @@ from .utils.yaml_helpers import load_yaml_file
 from .utils.zmq_helpers import json_dumps, safe_json_loads
 
 Json = dict[str, Any]
+
+# Per-socket per-tick drain cap. Each SUB handler will recv up to this
+# many messages before yielding back to the poll loop. With ~100 µs
+# per-message handling cost this bounds tick duration to ~25 ms — well
+# under the 1 s loop-stall threshold. In healthy steady-state traffic
+# (~20-30 msgs/sec total across all SUB sockets) the cap is never hit;
+# its purpose is to keep an avalanche (e.g. post-stall backlog) from
+# monopolising a single tick.
+MAX_DRAIN_PER_TICK = 256
 
 # Re-export for test patching and manager route-handler late binding.
 read_instance_lock_status = _instance_lock.read_instance_lock_status
@@ -767,6 +739,12 @@ class ProcessHandle:
     last_start_t_mono: float | None = None
     last_hb_t_wall: float | None = None
     last_hb_t_mono: float | None = None
+    # Manager-side timestamp of when we DRAINED the HB from the SUB
+    # buffer, used for the timeout check. Distinct from last_hb_t_mono
+    # (the sender's clock when the HB was generated): including buffer
+    # + scheduling delay in the timeout check produces false positives
+    # when the manager is briefly slow.
+    last_hb_recv_mono: float | None = None
     last_heartbeat_payload: Json | None = None
     last_exit_code: int | None = None
     restart_count: int = 0
@@ -1180,6 +1158,21 @@ class Manager:
         self._router_process_id = "device_router"
         self._ensure_router_handle()
 
+        # Lifecycle parallelism: device.connect / disconnect /
+        # driver.start / stop / restart / recover run on this pool
+        # instead of blocking the main loop. Per-device threading.Lock
+        # ensures same-device ops serialise; different devices run
+        # concurrently up to max_workers. Replies + events are
+        # marshalled back to the main thread via the two queues below,
+        # which the poll loop drains each tick.
+        self._main_thread_id = threading.get_ident()
+        self._lifecycle_executor = ThreadPoolExecutor(
+            max_workers=32, thread_name_prefix="mgr-lifecycle"
+        )
+        self._lifecycle_device_locks: dict[str, threading.Lock] = {}
+        self._lifecycle_reply_queue: queue.Queue[tuple[bytes, Json]] = queue.Queue()
+        self._lifecycle_event_queue: queue.Queue[tuple[str, Json]] = queue.Queue()
+
     # -----------------------------
     # Public API
     # -----------------------------
@@ -1299,8 +1292,17 @@ class Manager:
             if hb_endpoint in self._process_hb_connected:
                 try:
                     self._process_hb_sub.disconnect(hb_endpoint)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    self._publish_manager_event(
+                        "manager.log",
+                        {
+                            "severity": "warning",
+                            "message": (
+                                f"process hb sub disconnect failed for "
+                                f"{hb_endpoint}: {exc!r}"
+                            ),
+                        },
+                    )
                 self._process_hb_connected.discard(hb_endpoint)
         if data_endpoint and all(
             str(h.process_data_endpoint or "").strip() != data_endpoint
@@ -1309,8 +1311,17 @@ class Manager:
             if data_endpoint in self._process_data_connected:
                 try:
                     self._process_data_sub.disconnect(data_endpoint)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    self._publish_manager_event(
+                        "manager.log",
+                        {
+                            "severity": "warning",
+                            "message": (
+                                f"process data sub disconnect failed for "
+                                f"{data_endpoint}: {exc!r}"
+                            ),
+                        },
+                    )
                 self._process_data_connected.discard(data_endpoint)
         self._publish_process_event("manager.process.removed", handle)
 
@@ -1858,7 +1869,6 @@ class Manager:
         start_mono = time.monotonic()
         try:
             self._drain_supervisor_logs()
-            self._check_timeouts()
 
             events = dict(self._poller.poll(poll_ms))
             if events.get(self._registry_rep) == zmq.POLLIN:
@@ -1876,6 +1886,17 @@ class Manager:
             if events.get(self._internal_rpc) == zmq.POLLIN:
                 self._handle_internal_rpc()
             self._drain_supervisor_logs()
+            # Drain replies + events produced by lifecycle worker
+            # threads since the last tick. Both perform main-thread-only
+            # ZMQ sends; the workers themselves never touch sockets.
+            self._drain_lifecycle_replies()
+            self._drain_lifecycle_events()
+            # Check timeouts AFTER draining all SUB sockets. Doing it
+            # at the top of the tick (the previous order) means freshly
+            # buffered HBs sitting in the SUB queue haven't been
+            # ingested yet, so the timeout check would fire against
+            # stale `last_hb_recv_mono` even when the process is fine.
+            self._check_timeouts()
         finally:
             self._record_pump_timing(start_mono, time.monotonic())
 
@@ -2035,56 +2056,71 @@ class Manager:
         shared_handle_driver_pub(self)
 
     def _handle_process_pub(self) -> None:
-        topic_b, payload_b = self._process_hb_sub.recv_multipart()
-        topic = self._normalize_topic(topic_b.decode("utf-8", errors="replace"))
-        try:
-            msg = safe_json_loads(payload_b)
-            if not isinstance(msg, dict):
-                self._publish_manager_event(
-                    "manager.process.unknown_pub", {"topic": topic}
-                )
+        # Drain all available HBs in one tick so a momentary stall
+        # doesn't leave a backlog that drips out at 1-per-tick (which
+        # in turn makes the timeout check see "stale" for processes
+        # whose HBs are still queued). Cap bounds worst-case tick
+        # duration on an avalanche.
+        for _ in range(MAX_DRAIN_PER_TICK):
+            try:
+                topic_b, payload_b = self._process_hb_sub.recv_multipart(zmq.NOBLOCK)
+            except zmq.Again:
                 return
+            topic = self._normalize_topic(topic_b.decode("utf-8", errors="replace"))
+            try:
+                msg = safe_json_loads(payload_b)
+                if not isinstance(msg, dict):
+                    self._publish_manager_event(
+                        "manager.process.unknown_pub", {"topic": topic}
+                    )
+                    continue
 
-            if not topic.startswith("process/") or not topic.endswith("/heartbeat"):
+                if not topic.startswith("process/") or not topic.endswith("/heartbeat"):
+                    self._publish_manager_event(
+                        "manager.process.unknown_pub", {"topic": topic, "raw": msg}
+                    )
+                    continue
+
+                self._ingest_process_heartbeat(topic, msg)
+            except Exception as e:
                 self._publish_manager_event(
-                    "manager.process.unknown_pub", {"topic": topic, "raw": msg}
+                    "manager.process.heartbeat_error",
+                    {"topic": topic, "error": str(e)},
                 )
-                return
-
-            self._ingest_process_heartbeat(topic, msg)
-        except Exception as e:
-            self._publish_manager_event(
-                "manager.process.heartbeat_error",
-                {"topic": topic, "error": str(e)},
-            )
 
     def _handle_process_data_pub(self) -> None:
-        topic_b, payload_b = self._process_data_sub.recv_multipart()
-        topic = self._normalize_topic(topic_b.decode("utf-8", errors="replace"))
-        try:
-            msg = safe_json_loads(payload_b)
-            if not isinstance(msg, dict):
+        # Drain all available data events per tick. Same rationale as
+        # _handle_process_pub.
+        for _ in range(MAX_DRAIN_PER_TICK):
+            try:
+                topic_b, payload_b = self._process_data_sub.recv_multipart(zmq.NOBLOCK)
+            except zmq.Again:
+                return
+            topic = self._normalize_topic(topic_b.decode("utf-8", errors="replace"))
+            try:
+                msg = safe_json_loads(payload_b)
+                if not isinstance(msg, dict):
+                    self._publish_manager_event(
+                        "manager.process.unknown_pub", {"topic": topic}
+                    )
+                    continue
+
+                if not topic.startswith("manager."):
+                    self._publish_manager_event(
+                        "manager.process.unknown_pub", {"topic": topic, "raw": msg}
+                    )
+                    continue
+
+                if topic == "manager.log":
+                    self._emit_log_from_payload(msg, default_topic=topic)
+                    continue
+
+                self._publish_manager_event(topic, msg)
+            except Exception as e:
                 self._publish_manager_event(
-                    "manager.process.unknown_pub", {"topic": topic}
+                    "manager.process.data_error",
+                    {"topic": topic, "error": str(e)},
                 )
-                return
-
-            if not topic.startswith("manager."):
-                self._publish_manager_event(
-                    "manager.process.unknown_pub", {"topic": topic, "raw": msg}
-                )
-                return
-
-            if topic == "manager.log":
-                self._emit_log_from_payload(msg, default_topic=topic)
-                return
-
-            self._publish_manager_event(topic, msg)
-        except Exception as e:
-            self._publish_manager_event(
-                "manager.process.data_error",
-                {"topic": topic, "error": str(e)},
-            )
 
     def _ingest_telemetry(self, msg: Json) -> None:
         shared_ingest_telemetry(
@@ -2133,6 +2169,10 @@ class Manager:
         handle.pid = pid
         handle.last_hb_t_wall = float(ts["t_wall"])
         handle.last_hb_t_mono = float(ts["t_mono"])
+        # Manager-side timestamp of when we processed this HB; the
+        # timeout check uses this (not the sender's t_mono) so a
+        # manager-side drain delay doesn't get blamed on the process.
+        handle.last_hb_recv_mono = time.monotonic()
         handle.last_heartbeat_payload = copy.deepcopy(msg)
         if handle.state == ManagedProcessState.STARTING:
             handle.state = ManagedProcessState.RUNNING
@@ -2233,6 +2273,94 @@ class Manager:
 
     def _handle_internal_rpc(self) -> None:
         shared_handle_internal_rpc(self)
+
+    # -----------------------------
+    # Lifecycle parallelism
+    # -----------------------------
+    #
+    # Lifecycle ops (device.connect / disconnect / driver.start / stop /
+    # restart / recover) used to block the manager's main poll loop
+    # because route_device_request runs them synchronously and each does
+    # one or two blocking device RPCs. A hypothetical "connect all 20
+    # devices" UI button would take ~N × per-device latency.
+    #
+    # _dispatch_lifecycle_task hands the work off to the executor and
+    # returns immediately. The worker thread takes a per-device lock
+    # (so same-device ops serialise), runs the existing
+    # route_device_request unchanged, then enqueues the reply. The main
+    # poll loop drains the reply queue and sends each reply via
+    # `_internal_rpc.send_multipart` — keeping all ZMQ socket writes on
+    # the main thread.
+    #
+    # Events emitted from worker threads (via _publish_manager_event)
+    # are redirected to `_lifecycle_event_queue` by the off-thread
+    # check in manager_pubsub.publish_manager_event; the main loop
+    # drains and publishes them.
+
+    def _dispatch_lifecycle_task(
+        self, identity: bytes, req: Json, rtype: str, device_id: str
+    ) -> None:
+        self._lifecycle_executor.submit(
+            self._run_lifecycle, identity, req, rtype, device_id
+        )
+
+    def _run_lifecycle(
+        self, identity: bytes, req: Json, rtype: str, device_id: str
+    ) -> None:
+        lock = self._lifecycle_device_locks.setdefault(device_id, threading.Lock())
+        with lock:
+            try:
+                resp = route_device_request(self, rtype, req)
+                if resp is None:
+                    resp = {
+                        "ok": False,
+                        "error": {
+                            "code": "unknown_lifecycle_type",
+                            "message": f"no handler for {rtype!r}",
+                        },
+                    }
+            except Exception as exc:
+                resp = {
+                    "ok": False,
+                    "error": {
+                        "code": "lifecycle_error",
+                        "message": str(exc),
+                    },
+                }
+        rid = req.get("request_id")
+        if isinstance(resp, dict) and rid is not None and "request_id" not in resp:
+            # Mirror DeviceRouter's request_id echo so the pipelined
+            # RouterRpcClient can correlate the reply.
+            resp = dict(resp)
+            resp["request_id"] = rid
+        self._lifecycle_reply_queue.put((identity, resp))
+
+    def _drain_lifecycle_replies(self) -> None:
+        while True:
+            try:
+                identity, resp = self._lifecycle_reply_queue.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                self._internal_rpc.send_multipart([identity, json_dumps(resp)])
+            except Exception:
+                # Socket may be torn down mid-shutdown; drop the reply.
+                pass
+
+    def _drain_lifecycle_events(self) -> None:
+        while True:
+            try:
+                topic, payload = self._lifecycle_event_queue.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                # Calls into manager_pubsub.publish_manager_event on the
+                # main thread — the off-thread redirect check will see
+                # the main thread id and run the full sync publish path
+                # (socket send + journal + hooks + log forwarding).
+                self._publish_manager_event(topic, payload)
+            except Exception:
+                pass
 
     def _route_internal_request(self, req: Json) -> Json:
         return shared_route_internal_request(self, req)
