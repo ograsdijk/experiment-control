@@ -8,6 +8,20 @@ from .utils.zmq_helpers import json_dumps, safe_json_loads
 
 Json = dict[str, Any]
 
+# Lifecycle types that run on the manager's lifecycle thread pool
+# (see Manager._dispatch_lifecycle_task). Anything in this set with a
+# local, non-federated device_id is handed off to a worker; the worker
+# enqueues the reply, the main loop sends it. Different devices run
+# concurrently; same-device ops serialise via per-device Lock.
+_LIFECYCLE_TYPES = frozenset({
+    "device.connect",
+    "device.disconnect",
+    "device.driver.start",
+    "device.driver.stop",
+    "device.driver.restart",
+    "device.recover",
+})
+
 
 def _parse_internal_payload(payload_bytes: bytes) -> tuple[InternalRpcEnvelope | None, Json | None]:
     try:
@@ -27,8 +41,26 @@ def handle_internal_rpc(manager: Any) -> None:
         manager._internal_rpc.send_multipart([identity, json_dumps(parse_error)])
         return
     assert envelope is not None
+    req = envelope.raw
+
+    # Lifecycle ops: hand off to the worker pool so different devices
+    # can run concurrently. Reply is sent later when the worker enqueues
+    # it on _lifecycle_reply_queue and the main loop drains. Federated
+    # devices stay on the main thread (forwarding uses sockets we
+    # haven't audited for thread safety).
+    rtype = req.get("type")
+    device_id = req.get("device_id")
+    if (
+        rtype in _LIFECYCLE_TYPES
+        and isinstance(device_id, str)
+        and device_id in manager._devices
+        and not manager._federation_hub.is_mirrored_device(device_id)
+    ):
+        manager._dispatch_lifecycle_task(identity, req, rtype, device_id)
+        return
+
     try:
-        resp = route_internal_request(manager, envelope.raw)
+        resp = route_internal_request(manager, req)
     except LookupError as exc:
         resp = rpc_error(code="unknown_request_type", message=str(exc))
     except Exception as exc:

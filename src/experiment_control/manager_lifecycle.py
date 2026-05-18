@@ -166,6 +166,17 @@ def _safe_close_socket(sock: Any) -> None:
 
 
 def shutdown_cleanup(manager: Any) -> None:
+    # Stop lifecycle workers BEFORE we tear down sockets — any in-flight
+    # worker may still call _publish_manager_event (queued) or have a
+    # pending reply to push. Drain both queues afterwards so anything
+    # produced during the cancel/wait window goes out on the still-open
+    # sockets.
+    executor = getattr(manager, "_lifecycle_executor", None)
+    if executor is not None:
+        _safe_call(lambda: executor.shutdown(wait=True, cancel_futures=True))
+    _safe_call(lambda: manager._drain_lifecycle_replies())
+    _safe_call(lambda: manager._drain_lifecycle_events())
+
     manager._federation_hub.close()
     for handle in manager._devices.values():
         _safe_call(lambda handle=handle: manager.stop_driver(handle.spec.device_id))
