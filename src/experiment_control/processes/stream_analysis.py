@@ -2528,12 +2528,10 @@ def _prune_unreachable_nodes(
     queue: list[str] = [out.node_id for out in outputs] + [source_stream_node_id]
     while queue:
         node_id = queue.pop()
-        if node_id in reachable:
-            # Already visited; but we still want to add the seed output
-            # node_ids on first sight, so seed via the conditional below.
-            pass
-        if node_id not in reachable:
-            reachable.add(node_id)
+        # `reachable` is a set so `add` is a no-op for already-visited
+        # nodes; the `dep not in reachable` guard below keeps us from
+        # re-enqueuing them, so the walk still terminates.
+        reachable.add(node_id)
         for dep in deps.get(node_id, ()):  # type: ignore[arg-type]
             if dep not in reachable:
                 queue.append(dep)

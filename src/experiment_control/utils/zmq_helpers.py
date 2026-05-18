@@ -11,6 +11,16 @@ import zmq.utils.jsonapi
 Json = dict[str, Any]
 
 
+# Per-socket per-tick drain cap. Each SUB handler will recv up to this
+# many messages before yielding back to the poll loop. With ~100 µs
+# per-message handling cost this bounds tick duration to ~25 ms — well
+# under the 1 s loop-stall threshold. In healthy steady-state traffic
+# (~20-30 msgs/sec total across all SUB sockets) the cap is never hit;
+# its purpose is to keep an avalanche (e.g. post-stall backlog) from
+# monopolising a single tick.
+MAX_DRAIN_PER_TICK = 256
+
+
 @dataclass(frozen=True)
 class DrainResult:
     count: int
