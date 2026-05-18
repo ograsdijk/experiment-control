@@ -421,6 +421,16 @@ class InfluxWriterProcess(ManagedProcessBase):
         self._http_thread_dead = False
         self._dropped_http_batches = 0
         self._http_thread: threading.Thread | None = None
+        # Both the main loop and the bg HTTP thread mutate the
+        # diagnostic counters below; on 32-bit ints `+= 1` is not
+        # atomic at GIL granularity and concurrent increments can lose
+        # updates, and a read/write race on `_last_error` can surface a
+        # stale message. Impact is diagnostic only (status / log
+        # publishing), but the fix is cheap — serialize the writer-side
+        # mutations and the read-side status snapshot through one small
+        # lock. The lock covers only field assignments / reads, never
+        # any I/O, so contention is negligible.
+        self._counters_lock = threading.Lock()
 
         self._init_rpc_router()
         self._manager = self._manager_helper.init_client(
@@ -706,10 +716,11 @@ class InfluxWriterProcess(ManagedProcessBase):
         destination = self._destinations.get(destination_name)
         if destination is not None:
             return destination_name, destination
-        self._write_errors += 1
-        self._last_error = (
-            f"unknown destination {destination_name!r} for device {device_id!r}"
-        )
+        with self._counters_lock:
+            self._write_errors += 1
+            self._last_error = (
+                f"unknown destination {destination_name!r} for device {device_id!r}"
+            )
         return None
 
     @staticmethod
@@ -914,8 +925,9 @@ class InfluxWriterProcess(ManagedProcessBase):
     ) -> bool:
         destination = self._destinations.get(destination_name)
         if destination is None:
-            self._write_errors += 1
-            self._last_error = f"missing destination {destination_name!r}"
+            with self._counters_lock:
+                self._write_errors += 1
+                self._last_error = f"missing destination {destination_name!r}"
             return False
         lines = [point.line for point in points]
         self._last_flush_destination = destination_name
@@ -926,7 +938,8 @@ class InfluxWriterProcess(ManagedProcessBase):
             self._write_batch_http(destination=destination, lines=lines)
             self._points_written += len(points)
             self._batches_written += 1
-            self._last_error = None
+            with self._counters_lock:
+                self._last_error = None
             return True
         except HTTPError as e:
             body = ""
@@ -934,18 +947,21 @@ class InfluxWriterProcess(ManagedProcessBase):
                 body = e.read().decode("utf-8", errors="replace").strip()
             except Exception:
                 body = ""
-            self._write_errors += 1
-            self._last_error = (
-                f"HTTPError status={e.code} destination={destination_name}: {body or str(e)}"
-            )
+            with self._counters_lock:
+                self._write_errors += 1
+                self._last_error = (
+                    f"HTTPError status={e.code} destination={destination_name}: {body or str(e)}"
+                )
             return False
         except URLError as e:
-            self._write_errors += 1
-            self._last_error = f"URLError destination={destination_name}: {e}"
+            with self._counters_lock:
+                self._write_errors += 1
+                self._last_error = f"URLError destination={destination_name}: {e}"
             return False
         except Exception as e:
-            self._write_errors += 1
-            self._last_error = f"write failed destination={destination_name}: {e}"
+            with self._counters_lock:
+                self._write_errors += 1
+                self._last_error = f"write failed destination={destination_name}: {e}"
             return False
         finally:
             if self._last_flush_start_mono_s is not None:
@@ -983,7 +999,8 @@ class InfluxWriterProcess(ManagedProcessBase):
         except queue.Full:
             # HTTP thread is backlogged; put the points back so we don't lose
             # them. Counted so it shows up in status / heartbeat.
-            self._dropped_http_batches += 1
+            with self._counters_lock:
+                self._dropped_http_batches += 1
             with self._queue_lock:
                 self._requeue_failed(pending)
 
@@ -1005,8 +1022,9 @@ class InfluxWriterProcess(ManagedProcessBase):
                     # an unexpected error in grouping itself; treat the whole
                     # batch as failed and keep the thread alive.
                     self._record_exception(exc, phase="http_thread_batch")
-                    self._write_errors += 1
-                    self._last_error = f"http thread batch error: {exc}"
+                    with self._counters_lock:
+                        self._write_errors += 1
+                        self._last_error = f"http thread batch error: {exc}"
                     with self._queue_lock:
                         for points in batch.values():
                             self._requeue_failed(points)
@@ -1018,8 +1036,9 @@ class InfluxWriterProcess(ManagedProcessBase):
                 self._mark_flush_timestamp()
         except Exception as exc:
             self._record_exception(exc, phase="http_thread_fatal")
-            self._write_errors += 1
-            self._last_error = f"http thread died: {exc}"
+            with self._counters_lock:
+                self._write_errors += 1
+                self._last_error = f"http thread died: {exc}"
             self._http_thread_dead = True
             self._stop_evt.set()
 
@@ -1091,6 +1110,10 @@ class InfluxWriterProcess(ManagedProcessBase):
             self._destination_status_info(self._destinations[name])
             for name in destinations_sorted
         ]
+        # Snapshot the writer-side counters + last_error under
+        # _counters_lock so concurrent bg-thread mutations can't tear
+        # the int reads or surface a partial filename/error pairing.
+        counters_snapshot, last_error_snapshot = self._counters_snapshot()
         return {
             "enabled": self._enabled,
             "instance_id": self._instance_id,
@@ -1108,22 +1131,12 @@ class InfluxWriterProcess(ManagedProcessBase):
             "include_quality_fields": self._include_quality_fields,
             "include_unit_fields": self._include_unit_fields,
             "device_tag_keys": list(self._device_tag_keys),
-            "counters": {
-                "points_received": self._points_received,
-                "points_queued": self._points_queued,
-                "points_written": self._points_written,
-                "points_skipped_invalid": self._points_skipped_invalid,
-                "points_skipped_remote": self._points_skipped_remote,
-                "points_dropped_overflow": self._points_dropped_overflow,
-                "write_errors": self._write_errors,
-                "batches_written": self._batches_written,
-                "dropped_http_batches": self._dropped_http_batches,
-            },
+            "counters": counters_snapshot,
             "http_thread": {
                 "queue_depth": self._http_queue.qsize(),
                 "dead": self._http_thread_dead,
             },
-            "last_error": self._last_error,
+            "last_error": last_error_snapshot,
             "last_flush": {
                 "t_wall": self._last_flush_wall_s,
                 "t_mono": self._last_flush_mono_s,
@@ -1323,8 +1336,34 @@ class InfluxWriterProcess(ManagedProcessBase):
         except Exception:
             pass
 
+    def _counters_snapshot(self) -> tuple[Json, str | None]:
+        """Locked snapshot of writer-side counters + last_error.
+
+        The bg HTTP thread mutates these fields concurrently with the
+        main loop; `+=` and `=` are individually atomic at GIL
+        granularity but two reads in succession can interleave and
+        report inconsistent values. Snapshotting under _counters_lock
+        gives status/log consumers a coherent view; the lock is held
+        for assignments only (no I/O), so contention is negligible.
+        """
+        with self._counters_lock:
+            counters: Json = {
+                "points_received": self._points_received,
+                "points_queued": self._points_queued,
+                "points_written": self._points_written,
+                "points_skipped_invalid": self._points_skipped_invalid,
+                "points_skipped_remote": self._points_skipped_remote,
+                "points_dropped_overflow": self._points_dropped_overflow,
+                "write_errors": self._write_errors,
+                "batches_written": self._batches_written,
+                "dropped_http_batches": self._dropped_http_batches,
+            }
+            last_error = self._last_error
+        return counters, last_error
+
     def _maybe_publish_last_error(self) -> None:
-        text = self._last_error
+        with self._counters_lock:
+            text = self._last_error
         if text and text != self._last_published_error_text:
             self._publish_log(severity="error", message=text)
             self._last_published_error_text = text

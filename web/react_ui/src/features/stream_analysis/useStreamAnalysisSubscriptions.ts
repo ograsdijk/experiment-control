@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import { buildWsUrl, fetchStreamWorkspaceSnapshot } from "../../api";
 import { normalizeStreamAnalysisOutputMessage } from "../stream/messages";
@@ -63,6 +63,26 @@ function snapshotKey(target: {
   }`;
 }
 
+function workspaceSubscriptionKey(
+  subscription: StreamAnalysisWorkspaceSubscription
+): string {
+  // Capture every field that influences either the snapshot request
+  // or the live WS query string so two subscriptions that produce the
+  // same socket / fetch collapse to the same key, and any meaningful
+  // change ticks the key.
+  const kinds = [...subscription.kinds].map(String).sort().join(",");
+  const traceParts = [
+    subscription.traceDecimator ?? "",
+    subscription.traceMaxPoints ?? "",
+    typeof subscription.traceMaxFps === "number"
+      ? subscription.traceMaxFps.toFixed(3)
+      : "",
+    subscription.traceRollingWindow ?? "",
+    subscription.traceAverageMode ?? "",
+  ].join("|");
+  return `${subscription.workspaceId}|${kinds}|${traceParts}`;
+}
+
 function buildTraceFilter(
   subscription: StreamAnalysisWorkspaceSubscription
 ): StreamAnalysisTraceFilter | undefined {
@@ -99,15 +119,37 @@ export function useStreamAnalysisSubscriptions({
   const bumpPlotTickRef = useRef(bumpPlotTick);
   bumpPlotTickRef.current = bumpPlotTick;
 
+  // Stable string key derived from the subscription set. The caller
+  // re-allocates `activeSubscriptions` on every panels-state mutation
+  // (title edits, smoothing-window changes, ...), so depending on the
+  // array reference directly would tear down and re-open every
+  // workspace WebSocket on each unrelated UI edit. The sorted-key
+  // string only changes when the actual subscription set changes,
+  // which keeps the live sockets in place across cosmetic panel edits.
+  const subscriptionsKey = useMemo(
+    () =>
+      activeSubscriptions
+        .map(workspaceSubscriptionKey)
+        .sort()
+        .join(";"),
+    [activeSubscriptions]
+  );
+  // Mirror the current subscription list into a ref so effects keyed
+  // on `subscriptionsKey` can read it without taking the array
+  // reference itself as a dep.
+  const activeSubscriptionsRef = useRef(activeSubscriptions);
+  activeSubscriptionsRef.current = activeSubscriptions;
+
   // Snapshot hydration on subscription-set / rpcReady change.
   useEffect(() => {
-    if (!streamAnalysisRpcReady || activeSubscriptions.length <= 0) {
+    const currentSubscriptions = activeSubscriptionsRef.current;
+    if (!streamAnalysisRpcReady || currentSubscriptions.length <= 0) {
       return;
     }
     let cancelled = false;
     const kindsByWorkspace = new Map<string, Set<string>>();
     const traceMaxPointsByWorkspace = new Map<string, number>();
-    for (const subscription of activeSubscriptions) {
+    for (const subscription of currentSubscriptions) {
       const workspaceId = String(subscription.workspaceId ?? "").trim();
       if (!workspaceId) {
         continue;
@@ -196,11 +238,14 @@ export function useStreamAnalysisSubscriptions({
     return () => {
       cancelled = true;
     };
-  }, [streamAnalysisRpcReady, activeSubscriptions]);
+    // subscriptionsKey only ticks on real set changes; depending on
+    // the raw array reference would re-hydrate on unrelated edits.
+  }, [streamAnalysisRpcReady, subscriptionsKey]);
 
   // Live WS for each active subscription.
   useEffect(() => {
-    if (activeSubscriptions.length <= 0) {
+    const currentSubscriptions = activeSubscriptionsRef.current;
+    if (currentSubscriptions.length <= 0) {
       setWsConnected(streamAnalysisRpcReady);
       return;
     }
@@ -233,7 +278,7 @@ export function useStreamAnalysisSubscriptions({
         }
       };
 
-    for (const subscription of activeSubscriptions) {
+    for (const subscription of currentSubscriptions) {
       const workspaceId = subscription.workspaceId;
       const params = new URLSearchParams();
       if (subscription.kinds.length > 0) {
@@ -281,7 +326,9 @@ export function useStreamAnalysisSubscriptions({
       }
       sockets.clear();
     };
-  }, [activeSubscriptions, streamAnalysisRpcReady]);
+    // subscriptionsKey only ticks on real set changes; unrelated panel
+    // edits no longer tear down and reopen every workspace socket.
+  }, [subscriptionsKey, streamAnalysisRpcReady]);
 
   return { wsConnected };
 }

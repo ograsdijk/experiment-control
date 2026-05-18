@@ -1187,17 +1187,27 @@ class HdfWriter(ManagedProcessBase):
         to take `_h5_lock` (read path stays free of contention with the
         bg flush thread). CPython attribute writes/reads on a single
         reference are atomic.
+
+        We pair the two writes under `_h5_lock` so a concurrent reader
+        never sees the inconsistent intermediate state
+        (`filename=None, writing_active=True` or vice versa) that would
+        arise if the two `=` ran across a context-switch boundary. The
+        reader path stays lock-free as documented; the lock here is
+        only for writer-side atomicity, and since `_h5_lock` is an
+        RLock most callers already hold it (this re-acquire is a
+        no-op).
         """
-        h5 = self._h5
-        if h5 is None:
-            self._active_h5_filename = None
-            self._writing_active = False
-        else:
-            try:
-                self._active_h5_filename = str(h5.filename)
-            except Exception:
+        with self._h5_lock:
+            h5 = self._h5
+            if h5 is None:
                 self._active_h5_filename = None
-            self._writing_active = True
+                self._writing_active = False
+            else:
+                try:
+                    self._active_h5_filename = str(h5.filename)
+                except Exception:
+                    self._active_h5_filename = None
+                self._writing_active = True
 
     def _snapshot_main_loop_buffers(
         self,

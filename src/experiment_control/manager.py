@@ -2397,8 +2397,24 @@ class Manager:
                 # the main thread id and run the full sync publish path
                 # (socket send + journal + hooks + log forwarding).
                 self._publish_manager_event(topic, payload)
-            except Exception:
-                pass
+            except Exception as exc:
+                # Sibling _drain_lifecycle_replies swallows shutdown
+                # races on the RPC socket; mirror that here, but log so
+                # a real publish failure (e.g. encoder bug, hook
+                # raising) isn't silently lost. The log call itself is
+                # wrapped so a logging-stack failure can't recurse
+                # through the drain loop and stall the manager.
+                try:
+                    import logging
+
+                    logging.getLogger(__name__).warning(
+                        "lifecycle event publish failed: topic=%s err=%s: %s",
+                        topic,
+                        type(exc).__name__,
+                        exc,
+                    )
+                except Exception:
+                    pass
 
     def _route_internal_request(self, req: Json) -> Json:
         return shared_route_internal_request(self, req)
