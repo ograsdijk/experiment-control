@@ -22,6 +22,7 @@ from pydantic import BaseModel, Field
 
 from .gateway import GatewaySettings, RouterRpcClient, StreamFrameHub, TelemetryHub
 from ..shm.shm_ring import ShmRingReader
+from ..utils.zmq_helpers import json_dumps as _orjson_dumps
 from ..utils.instance_lock import (
     derive_lock_effective_status,
     lock_effective_status_help,
@@ -48,6 +49,17 @@ from ..utils.trace_processing import (
 
 
 _EXTRA_UI_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
+
+
+async def _ws_send_json(ws: WebSocket, msg: Any) -> None:
+    """Send a JSON message over WS using the project's orjson-backed
+    encoder. Equivalent to `ws.send_json(msg)` (text frame, UTF-8), but
+    avoids Starlette's stdlib `json.dumps` — orjson is ~13–22× faster on
+    the stream-frame payload shapes the gateway broadcasts. See `json_dumps`
+    in `utils/zmq_helpers.py`; falls back to pyzmq's encoder when orjson
+    rejects a payload (NaN/Inf, exotic types).
+    """
+    await ws.send_text(_orjson_dumps(msg).decode("utf-8"))
 
 
 @dataclass(frozen=True)
@@ -1455,7 +1467,7 @@ async def ws_streams(ws: WebSocket) -> None:
     try:
         while True:
             msg = await q.get()
-            await ws.send_json(msg)
+            await _ws_send_json(ws, msg)
     except WebSocketDisconnect:
         pass
     finally:
@@ -1513,11 +1525,11 @@ async def ws_raw_stream(ws: WebSocket) -> None:
     async def _send_or_queue(msg: dict[str, Any]) -> None:
         nonlocal next_send_at, pending_msg
         if trace_interval_s <= 0:
-            await ws.send_json(msg)
+            await _ws_send_json(ws, msg)
             return
         now = time.monotonic()
         if now >= next_send_at:
-            await ws.send_json(msg)
+            await _ws_send_json(ws, msg)
             next_send_at = now + trace_interval_s
             pending_msg = None
             return
@@ -1544,7 +1556,7 @@ async def ws_raw_stream(ws: WebSocket) -> None:
                 now = time.monotonic()
                 if now < next_send_at:
                     continue
-                await ws.send_json(pending_msg)
+                await _ws_send_json(ws, pending_msg)
                 pending_msg = None
                 next_send_at = now + trace_interval_s
                 continue
@@ -1743,14 +1755,14 @@ async def _workspace_send_trace_message(
         now = time.monotonic()
         next_at = state.next_trace_send_at.get(trace_key, 0.0)
         if now >= next_at:
-            await ws.send_json(trace_msg)
+            await _ws_send_json(ws, trace_msg)
             state.next_trace_send_at[trace_key] = now + state.trace_interval_s
         else:
             state.pending_trace_msgs[trace_key] = trace_msg
             if trace_key not in state.next_trace_send_at:
                 state.next_trace_send_at[trace_key] = next_at
         return
-    await ws.send_json(trace_msg)
+    await _ws_send_json(ws, trace_msg)
 
 
 async def _workspace_flush_pending_trace_messages(
@@ -1766,7 +1778,7 @@ async def _workspace_flush_pending_trace_messages(
         pending = state.pending_trace_msgs.pop(key, None)
         if pending is None:
             continue
-        await ws.send_json(pending)
+        await _ws_send_json(ws, pending)
         if state.trace_interval_s > 0:
             state.next_trace_send_at[key] = now + state.trace_interval_s
         else:
@@ -1993,7 +2005,7 @@ async def ws_stream_workspace(ws: WebSocket, workspace_id: str) -> None:
                 if handled:
                     continue
 
-            await ws.send_json(msg)
+            await _ws_send_json(ws, msg)
     except WebSocketDisconnect:
         pass
     finally:
