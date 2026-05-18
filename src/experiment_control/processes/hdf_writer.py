@@ -580,10 +580,18 @@ class HdfWriter(ManagedProcessBase):
         self._bg_thread: threading.Thread | None = None
         self._bg_thread_dead = False
         self._dropped_flush_batches = 0
+        # Counter for *deferred* flush batches — non-force_flush calls that
+        # found the bg queue full and chose to leave rows/events in the
+        # in-memory deques rather than snapshot-and-drop. Exposed alongside
+        # `_dropped_flush_batches` in the status payload so operators can
+        # distinguish a backlog (deferred) from real data loss (dropped).
+        self._deferred_flush_batches = 0
         # Monotonic timestamp of the last `hdf.flush_batch_dropped` event
         # we published. Used to rate-limit the overflow notification so a
         # sustained backlog doesn't flood the process data PUB bus.
         self._last_flush_drop_event_mono: float = 0.0
+        # Same rate-limit semantics for `hdf.flush_batch_deferred`.
+        self._last_flush_defer_event_mono: float = 0.0
         self._bg_join_timeout_s = max(0.1, float(bg_join_timeout_s))
         self._active_h5_filename: str | None = None
         self._writing_active = False
@@ -1248,7 +1256,63 @@ class HdfWriter(ManagedProcessBase):
         incremented so it surfaces in heartbeat/status). When the batch
         is queued successfully, `_pending` and `_last_flush` bookkeeping
         is updated to mirror the old synchronous-write timing.
+
+        Defer-when-full: for non-force_flush calls, if the bg queue is
+        already saturated we *skip* the destructive snapshot of `_buf`
+        and `_event_buf` so the rows/events stay in the 200k-message
+        in-memory deques (where `drop_newest` already provides bounded
+        overflow handling). Stream buffers and pending stream metadata
+        are unbounded dicts though, so we snapshot-and-discard those to
+        keep memory bounded during a sustained backlog. Force-flush
+        callers retain the original "snapshot + drop on overflow"
+        contract — rotation/shutdown paths use `_drain_pending_to_file`
+        synchronously so they don't traverse this method.
         """
+        if not force_flush and self._bg_queue.full():
+            dropped_stream_rows = 0
+            try:
+                for sb in self._stream_buffers.values():
+                    if isinstance(sb, dict) and sb:
+                        # `_stream_buffers` maps stream-key ->
+                        # dict[column_name, list[value]]. Row count is
+                        # the max column length within a given stream.
+                        dropped_stream_rows += max(
+                            (len(col) for col in sb.values() if isinstance(col, list)),
+                            default=0,
+                        )
+            except Exception:
+                # Observability-only count; never let a structural
+                # surprise mask the defer or crash the main loop.
+                dropped_stream_rows = -1
+            if self._stream_buffers:
+                self._stream_buffers = {}
+            if self._pending_stream_metadata:
+                self._pending_stream_metadata = {}
+            self._deferred_flush_batches += 1
+            self._bump_error("bg.flush_batch.deferred")
+            now_mono = time.monotonic()
+            if now_mono - self._last_flush_defer_event_mono >= 1.0:
+                self._last_flush_defer_event_mono = now_mono
+                try:
+                    self._publish_process_event(
+                        topic="hdf.flush_batch_deferred",
+                        payload={
+                            "queue_depth": self._bg_queue.qsize(),
+                            "queue_max": self._bg_queue.maxsize,
+                            "deferred_total": self._deferred_flush_batches,
+                            "buffered_rows": len(self._buf) if self._buf else 0,
+                            "buffered_events": (
+                                len(self._event_buf) if self._event_buf else 0
+                            ),
+                            "dropped_stream_rows": dropped_stream_rows,
+                        },
+                    )
+                except Exception:
+                    # Never let event-publish failure mask the defer or
+                    # destabilise the main loop.
+                    pass
+            return False
+
         rows, event_rows, stream_buffers, pending_metadata = (
             self._snapshot_main_loop_buffers()
         )
@@ -2535,6 +2599,7 @@ class HdfWriter(ManagedProcessBase):
                 "queue_capacity": self._bg_queue.maxsize,
             },
             "dropped_flush_batches": int(self._dropped_flush_batches),
+            "deferred_flush_batches": int(self._deferred_flush_batches),
             "event_log_mode": str(self._event_log_mode),
             "measurement_id": self._measurement_id,
             "measurement_type": self._measurement_type,
