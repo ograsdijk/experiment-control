@@ -428,12 +428,129 @@ def bench_trace_snapshot_value(rows: list[Row]) -> None:
         print(r.fmt())
 
 
+def bench_stream_buffer_assembly(rows: list[Row]) -> None:
+    """Compare three HDF stream-buffer assembly paths.
+
+    All three produce the same (N, *shape) numpy array ready for HDF5
+    dataset assignment. They differ in WHICH thread pays the bytes→numpy
+    cost and HOW MANY copies happen end-to-end:
+
+    1. **baseline (today)** — ShmRingReader.read_events copies SHM→bytes
+       on the main thread. Main thread appends `bytes` to a Python list.
+       Bg thread flushes: `np.empty(N)` then per-event `frombuffer +
+       reshape + assign`. Two copies (SHM→bytes on main, bytes→numpy on
+       bg) plus per-batch allocation of the destination array.
+
+    2. **prealloc-from-bytes** — same SHM→bytes copy on main thread,
+       but then immediately copy bytes→pre-allocated numpy slot on
+       main thread. Bg thread just slices and writes. Still two copies,
+       but both on main thread; bg thread is fast.
+
+    3. **prealloc-from-shm** — main thread copies SHM bytes directly
+       into the pre-allocated numpy slot via `np.frombuffer(shm_view,
+       count=...).copy()` (or equivalent). Skips the intermediate
+       Python `bytes` object entirely. One copy on main thread, one
+       copy on bg thread (HDF write). The best case for high-rate
+       streams where main-thread work matters.
+
+    Cases include the upcoming detection instance's projected
+    workload: 50 Hz × 5 MHz × 20 ms × 5 ch int16 = 100 events of
+    500 K samples per 2-s batch (~100 MB/batch).
+    """
+    print()
+    print("== hdf stream-buffer assembly (3-way: today / pre-alloc / pre-alloc-from-shm) ==")
+    print(_HEADER)
+    rng = np.random.default_rng(42)
+
+    # (n_events_per_batch, sample_count, dtype, label_extra)
+    cases = [
+        (64,    256,     np.float64, ""),                 # ~130 KB
+        (256,   1024,    np.float64, ""),                 # ~2 MB
+        (1024,  4096,    np.float64, ""),                 # ~32 MB
+        (4096,  16384,   np.float64, ""),                 # ~512 MB
+        (100,   500_000, np.int16,   " [detection 50Hz]"), # ~100 MB
+    ]
+
+    for n_events, sample_count, dtype, extra in cases:
+        itemsize = np.dtype(dtype).itemsize
+        bytes_per_event = sample_count * itemsize
+        total_mb = (n_events * bytes_per_event) / (1024 * 1024)
+
+        # Simulate the SHM ring: one big bytes blob; each "event" is a
+        # contiguous slice. mirrors how ShmRingReader serves slots.
+        shm_blob = rng.integers(
+            0, 256, size=n_events * bytes_per_event, dtype=np.uint8
+        ).tobytes()
+        # Pre-build the per-event bytes objects (the baseline + prealloc-from-bytes
+        # paths receive these from read_events).
+        events_bytes: list[bytes] = [
+            shm_blob[i * bytes_per_event : (i + 1) * bytes_per_event]
+            for i in range(n_events)
+        ]
+        # And the offsets a prealloc-from-shm path would use to slice
+        # directly from the shm view.
+        shm_view = memoryview(shm_blob)
+        shape: tuple[int, ...] = (sample_count,)
+
+        # --- 1. baseline (today) ---
+        def baseline() -> np.ndarray:
+            buf_data: list[bytes] = []
+            for payload in events_bytes:
+                buf_data.append(payload)
+            arr = np.empty((n_events,) + shape, dtype=dtype)
+            for i, payload in enumerate(buf_data):
+                arr[i] = np.frombuffer(payload, dtype=dtype).reshape(shape)
+            return arr
+
+        # --- 2. prealloc-from-bytes (still receives bytes, but copies into
+        #       pre-alloc on the main thread instead of via Python list) ---
+        scratch_b = np.empty((n_events,) + shape, dtype=dtype)
+
+        def prealloc_from_bytes() -> np.ndarray:
+            n_filled = 0
+            for payload in events_bytes:
+                scratch_b[n_filled] = np.frombuffer(
+                    payload, dtype=dtype
+                ).reshape(shape)
+                n_filled += 1
+            return scratch_b[:n_filled]
+
+        # --- 3. prealloc-from-shm (skip intermediate bytes object entirely;
+        #       copy SHM → pre-alloc numpy slot directly) ---
+        scratch_s = np.empty((n_events,) + shape, dtype=dtype)
+
+        def prealloc_from_shm() -> np.ndarray:
+            n_filled = 0
+            for i in range(n_events):
+                offset = i * bytes_per_event
+                # frombuffer over a memoryview is zero-copy; .copy() into
+                # the slot is the single byte movement.
+                scratch_s[n_filled] = np.frombuffer(
+                    shm_view,
+                    dtype=dtype,
+                    count=sample_count,
+                    offset=offset,
+                ).reshape(shape)
+                n_filled += 1
+            return scratch_s[:n_filled]
+
+        iters = 1000 if n_events <= 256 else (200 if n_events <= 1024 else 50)
+        size_label = f"{n_events}×{sample_count} ({total_mb:.0f}MB){extra}"
+        r = time_call("1. baseline (list of bytes)", size_label, baseline, iters=iters)
+        rows.append(r); print(r.fmt())
+        r = time_call("2. prealloc-from-bytes",      size_label, prealloc_from_bytes, iters=iters)
+        rows.append(r); print(r.fmt())
+        r = time_call("3. prealloc-from-shm",        size_label, prealloc_from_shm, iters=iters)
+        rows.append(r); print(r.fmt())
+
+
 ALL_BENCHES = {
     "bin_stats": bench_bin_stats,
     "sanitize": bench_sanitize,
     "json_dumps": bench_json_dumps,
     "output_index": bench_output_index,
     "trace_snapshot": bench_trace_snapshot_value,
+    "stream_buffer": bench_stream_buffer_assembly,
 }
 
 
