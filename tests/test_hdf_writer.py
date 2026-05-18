@@ -1664,5 +1664,142 @@ class HdfWriterFlushBatchOverflowTests(unittest.TestCase):
         self.assertEqual(published[-1][1].get("dropped_total"), 3)
 
 
+class HdfWriterFlushBatchDeferTests(unittest.TestCase):
+    """Coverage for the defer-when-full path on `_enqueue_flush_batch`.
+
+    With `force_flush=False`, an overflowing bg queue causes the writer
+    to leave `_buf`/`_event_buf` rows in place (the 200k in-memory deque
+    already handles bounded overflow) and only snapshot-and-discard the
+    unbounded `_stream_buffers` and `_pending_stream_metadata` dicts.
+    A `hdf.flush_batch_deferred` event is published, rate-limited to
+    once per second. Force-flush callers still hit the legacy drop path.
+    """
+
+    def _make_writer(self) -> HdfWriter:
+        return HdfWriter(
+            out_dir="data",
+            filename=None,
+            manager_rpc="tcp://127.0.0.1:65553",
+            manager_pub="tcp://127.0.0.1:65554",
+            rpc_timeout_ms=2000,
+            timezone="America/Chicago",
+            rcvhwm=1000,
+            write_every_s=1.0,
+            buffer_max_messages=1000,
+            flush_every_n=10,
+            flush_every_s=1.0,
+            disabled_devices=[],
+            event_log_mode="all",
+        )
+
+    def _shrink_bg_queue(self, writer: HdfWriter) -> None:
+        writer._bg_queue = queue.Queue(maxsize=1)  # type: ignore[assignment]  # noqa: SLF001
+
+    def _fill_bg_queue(self, writer: HdfWriter) -> None:
+        writer._bg_queue.put_nowait(_FlushBatch())  # noqa: SLF001
+
+    def test_overflow_defers_when_force_flush_false(self) -> None:
+        writer = self._make_writer()
+        self._shrink_bg_queue(writer)
+        published: list[tuple[str, dict]] = []
+
+        def fake_publish(*, topic, payload, **_kw) -> bool:
+            published.append((topic, dict(payload)))
+            return True
+
+        writer._publish_process_event = fake_publish  # type: ignore[method-assign]  # noqa: SLF001
+
+        # Saturate the bg queue and populate the in-memory deque with N rows.
+        self._fill_bg_queue(writer)
+        n_rows = 5
+        seed_rows = [{"device_id": "dev1", "v": i} for i in range(n_rows)]
+        writer._buf = deque(seed_rows)  # noqa: SLF001
+
+        result = writer._enqueue_flush_batch(force_flush=False)  # noqa: SLF001
+
+        # Deferred: returns False but does NOT drop the snapshot.
+        self.assertFalse(result)
+        self.assertEqual(writer._deferred_flush_batches, 1)  # noqa: SLF001
+        self.assertEqual(writer._dropped_flush_batches, 0)  # noqa: SLF001
+        self.assertEqual(
+            writer._error_counts.get("bg.flush_batch.deferred"), 1  # noqa: SLF001
+        )
+        self.assertIsNone(  # noqa: SLF001 — `_error_counts` only carries the deferred bucket
+            writer._error_counts.get("bg.flush_batch.dropped")
+        )
+
+        # Rows are preserved in the in-memory deque.
+        self.assertEqual(len(writer._buf or []), n_rows)  # noqa: SLF001
+        self.assertEqual(list(writer._buf or []), seed_rows)  # noqa: SLF001
+
+        # Defer event published with the expected payload shape.
+        self.assertEqual(len(published), 1)
+        topic, payload = published[0]
+        self.assertEqual(topic, "hdf.flush_batch_deferred")
+        self.assertEqual(payload.get("queue_max"), 1)
+        self.assertEqual(payload.get("deferred_total"), 1)
+        self.assertEqual(payload.get("buffered_rows"), n_rows)
+        self.assertIn("buffered_events", payload)
+        self.assertIn("dropped_stream_rows", payload)
+
+    def test_defer_drops_stream_buffers_to_bound_memory(self) -> None:
+        writer = self._make_writer()
+        self._shrink_bg_queue(writer)
+        writer._publish_process_event = (  # type: ignore[method-assign]  # noqa: SLF001
+            lambda **_kw: True
+        )
+
+        self._fill_bg_queue(writer)
+        seed_rows = [{"device_id": "dev1", "v": 1}]
+        writer._buf = deque(seed_rows)  # noqa: SLF001
+        # Stream-buffer shape: {(device_id, stream): {col: list[value]}}.
+        writer._stream_buffers = {  # noqa: SLF001
+            ("dev1", "streamA"): {"t": [0.0, 0.1, 0.2], "v": [1, 2, 3]},
+            ("dev1", "streamB"): {"t": [0.0], "v": [9]},
+        }
+        writer._pending_stream_metadata = {  # noqa: SLF001
+            ("dev1", "streamA"): {"units": "V"},
+        }
+
+        result = writer._enqueue_flush_batch(force_flush=False)  # noqa: SLF001
+
+        self.assertFalse(result)
+        # Unbounded structures dropped to bound memory.
+        self.assertEqual(writer._stream_buffers, {})  # noqa: SLF001
+        self.assertEqual(writer._pending_stream_metadata, {})  # noqa: SLF001
+        # Bounded in-memory deque is untouched.
+        self.assertEqual(list(writer._buf or []), seed_rows)  # noqa: SLF001
+
+    def test_defer_event_rate_limited(self) -> None:
+        writer = self._make_writer()
+        self._shrink_bg_queue(writer)
+        published: list[tuple[str, dict]] = []
+
+        def fake_publish(*, topic, payload, **_kw) -> bool:
+            published.append((topic, dict(payload)))
+            return True
+
+        writer._publish_process_event = fake_publish  # type: ignore[method-assign]  # noqa: SLF001
+
+        self._fill_bg_queue(writer)
+        writer._buf = deque([{"device_id": "dev1", "v": 1}])  # noqa: SLF001
+
+        # First defer publishes an event.
+        self.assertFalse(writer._enqueue_flush_batch(force_flush=False))  # noqa: SLF001
+        self.assertEqual(len(published), 1)
+
+        # Second defer within the 1-second window: counter still bumps,
+        # but no additional event publish.
+        self.assertFalse(writer._enqueue_flush_batch(force_flush=False))  # noqa: SLF001
+        self.assertEqual(writer._deferred_flush_batches, 2)  # noqa: SLF001
+        self.assertEqual(len(published), 1)
+
+        # Advance the rate-limit window and a new defer publishes again.
+        writer._last_flush_defer_event_mono = time.monotonic() - 2.0  # noqa: SLF001
+        self.assertFalse(writer._enqueue_flush_batch(force_flush=False))  # noqa: SLF001
+        self.assertEqual(len(published), 2)
+        self.assertEqual(published[-1][1].get("deferred_total"), 3)
+
+
 if __name__ == "__main__":
     unittest.main()
