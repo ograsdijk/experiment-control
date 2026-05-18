@@ -58,6 +58,7 @@ def _make_proc() -> InfluxWriterProcess:
     proc._http_thread_dead = False  # noqa: SLF001
     proc._dropped_http_batches = 0  # noqa: SLF001
     proc._http_thread = None  # noqa: SLF001
+    proc._counters_lock = threading.Lock()  # noqa: SLF001
     proc._max_queue_points = 10_000  # noqa: SLF001
     proc._overflow_policy = "drop_oldest"  # noqa: SLF001
     proc._batch_max_points = 500  # noqa: SLF001

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import { buildWsUrl, fetchRawStreamSnapshot } from "../../api";
 import { normalizeStreamFrameMessage } from "../stream/messages";
@@ -65,17 +65,39 @@ export function useRawStreamSubscriptions({
   const bumpPlotTickRef = useRef(bumpPlotTick);
   bumpPlotTickRef.current = bumpPlotTick;
 
+  // Stable string key derived from the subscription set. The caller
+  // re-allocates `activeSubscriptions` on every panels-state mutation
+  // (title edits, smoothing-window changes, ...), so depending on the
+  // array reference directly would tear down and re-open every
+  // WebSocket on each unrelated UI edit. The sorted-key string only
+  // changes when the actual subscription set changes, which keeps the
+  // live sockets in place across cosmetic panel edits.
+  const subscriptionsKey = useMemo(
+    () =>
+      activeSubscriptions
+        .map(subscriptionKey)
+        .sort()
+        .join(";"),
+    [activeSubscriptions]
+  );
+  // Mirror the current subscription list into a ref so effects keyed
+  // on `subscriptionsKey` can read it without taking the array
+  // reference itself as a dep.
+  const activeSubscriptionsRef = useRef(activeSubscriptions);
+  activeSubscriptionsRef.current = activeSubscriptions;
+
   // Snapshot hydration on subscription-set change.
   useEffect(() => {
-    if (activeSubscriptions.length <= 0) {
+    const currentSubscriptions = activeSubscriptionsRef.current;
+    if (currentSubscriptions.length <= 0) {
       return;
     }
     let cancelled = false;
-    const activeKeys = new Set(activeSubscriptions.map(subscriptionKey));
+    const activeKeys = new Set(currentSubscriptions.map(subscriptionKey));
     hydratedRef.current = new Set(
       [...hydratedRef.current].filter((key) => activeKeys.has(key))
     );
-    const pending = activeSubscriptions.filter(
+    const pending = currentSubscriptions.filter(
       (subscription) => !hydratedRef.current.has(subscriptionKey(subscription))
     );
     if (pending.length <= 0) {
@@ -119,11 +141,14 @@ export function useRawStreamSubscriptions({
     return () => {
       cancelled = true;
     };
-  }, [activeSubscriptions]);
+    // subscriptionsKey changes only when the actual subscription set
+    // changes; this avoids re-hydrating on unrelated panel edits.
+  }, [subscriptionsKey]);
 
   // Live WS for each active subscription.
   useEffect(() => {
-    if (activeSubscriptions.length <= 0) {
+    const currentSubscriptions = activeSubscriptionsRef.current;
+    if (currentSubscriptions.length <= 0) {
       setWsConnected(true);
       return;
     }
@@ -161,7 +186,7 @@ export function useRawStreamSubscriptions({
         }
       };
 
-    for (const subscription of activeSubscriptions) {
+    for (const subscription of currentSubscriptions) {
       const params = new URLSearchParams();
       params.set("device_id", subscription.deviceId);
       params.set("stream", subscription.stream);
@@ -200,7 +225,9 @@ export function useRawStreamSubscriptions({
       }
       sockets.clear();
     };
-  }, [activeSubscriptions]);
+    // subscriptionsKey only ticks on real set changes; unrelated panel
+    // edits no longer tear down and reopen every socket.
+  }, [subscriptionsKey]);
 
   return { wsConnected };
 }
