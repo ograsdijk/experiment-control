@@ -62,7 +62,7 @@ class DeviceRouterFederationTests(unittest.TestCase):
             responses = []
             router._ensure_mirrored_worker = lambda device_id: worker  # type: ignore[method-assign]
             router._send_external_response = (  # type: ignore[method-assign]
-                lambda identity, resp: responses.append((identity, resp))
+                lambda identity, resp, *, request_id=None: responses.append((identity, resp))
             )
 
             router._dispatch_device_command(
@@ -93,7 +93,7 @@ class DeviceRouterFederationTests(unittest.TestCase):
             responses = []
             router._ensure_device_worker = lambda device_id: worker  # type: ignore[method-assign]
             router._send_external_response = (  # type: ignore[method-assign]
-                lambda identity, resp: responses.append((identity, resp))
+                lambda identity, resp, *, request_id=None: responses.append((identity, resp))
             )
             router._device_endpoints["dummy"] = "tcp://127.0.0.1:7001"
             router._device_states["dummy"] = "STOPPING"
@@ -145,7 +145,7 @@ class DeviceRouterFederationTests(unittest.TestCase):
             responses = []
             router._ensure_process_worker = lambda process_id: worker  # type: ignore[method-assign]
             router._send_external_response = (  # type: ignore[method-assign]
-                lambda identity, resp: responses.append((identity, resp))
+                lambda identity, resp, *, request_id=None: responses.append((identity, resp))
             )
             router._process_endpoints["sequencer"] = "tcp://127.0.0.1:9901"
 
@@ -195,7 +195,7 @@ class DeviceRouterFederationTests(unittest.TestCase):
             responses = []
             router._ensure_mirrored_worker = lambda device_id: worker  # type: ignore[method-assign]
             router._send_external_response = (  # type: ignore[method-assign]
-                lambda identity, resp: responses.append((identity, resp))
+                lambda identity, resp, *, request_id=None: responses.append((identity, resp))
             )
 
             router._dispatch_device_command(
@@ -293,7 +293,7 @@ class DeviceRouterFederationTests(unittest.TestCase):
             responses = []
             router._ensure_device_worker = lambda _device_id: _RejectWorker()  # type: ignore[method-assign]
             router._send_external_response = (  # type: ignore[method-assign]
-                lambda identity, resp: responses.append((identity, resp))
+                lambda identity, resp, *, request_id=None: responses.append((identity, resp))
             )
             router._device_endpoints["dummy"] = "tcp://127.0.0.1:7001"
 

@@ -159,6 +159,19 @@ class _ReplyItem:
     identity: bytes
     response: Json
     inflight_reserved: bool = False
+    request_id: Any = None
+
+
+def _inject_request_id(resp: Json, request_id: Any) -> Json:
+    # Echo the caller's request_id back onto the reply so a pipelined
+    # client (gateway's RouterRpcClient) can correlate response to
+    # request. Only injects when the response doesn't already carry
+    # an id, so routes that supply their own keep control.
+    if not isinstance(resp, dict) or request_id is None or "request_id" in resp:
+        return resp
+    out = dict(resp)
+    out["request_id"] = request_id
+    return out
 
 
 class _BaseWorker(threading.Thread):
@@ -209,12 +222,14 @@ class _BaseWorker(threading.Thread):
         identity: bytes,
         response: Json,
         inflight_reserved: bool,
+        request_id: Any = None,
     ) -> None:
         self._reply_queue.put(
             _ReplyItem(
                 identity=identity,
                 response=response,
                 inflight_reserved=bool(inflight_reserved),
+                request_id=request_id,
             )
         )
 
@@ -388,6 +403,7 @@ class _ProcessWorker(_BaseWorker):
                     identity=task.identity,
                     response=resp,
                     inflight_reserved=task.inflight_reserved,
+                    request_id=task.request_id,
                 )
                 continue
             resp = self._call(task.endpoint, task.request)
@@ -398,6 +414,7 @@ class _ProcessWorker(_BaseWorker):
                 identity=task.identity,
                 response=resp,
                 inflight_reserved=task.inflight_reserved,
+                request_id=task.request_id,
             )
         if self._manager is not None:
             self._manager.close()
@@ -446,6 +463,7 @@ class _ManagerWorker(_BaseWorker):
                 identity=task.identity,
                 response=resp,
                 inflight_reserved=task.inflight_reserved,
+                request_id=task.request.get("request_id") if isinstance(task.request, dict) else None,
             )
         if self._manager is not None:
             self._manager.close()
@@ -651,6 +669,7 @@ class _DeviceWorker(_BaseWorker):
                     identity=task.identity,
                     response=resp,
                     inflight_reserved=task.inflight_reserved,
+                    request_id=task.request_id,
                 )
                 continue
             ok, new_cmd, err = self._apply_command_interceptors(task)
@@ -660,6 +679,7 @@ class _DeviceWorker(_BaseWorker):
                     identity=task.identity,
                     response=resp,
                     inflight_reserved=task.inflight_reserved,
+                    request_id=task.request_id,
                 )
                 continue
             assert new_cmd is not None
@@ -713,6 +733,7 @@ class _DeviceWorker(_BaseWorker):
                 identity=task.identity,
                 response=resp,
                 inflight_reserved=task.inflight_reserved,
+                request_id=task.request_id,
             )
 
         if self._manager is not None:
@@ -848,6 +869,7 @@ class _MirroredDeviceWorker(_BaseWorker):
                 identity=task.identity,
                 response=resp,
                 inflight_reserved=task.inflight_reserved,
+                request_id=task.request.get("request_id") if isinstance(task.request, dict) else None,
             )
         if self._manager is not None:
             self._manager.close()
@@ -1157,6 +1179,7 @@ class DeviceRouter(ManagedProcessBase):
         bucket: str,
         message: str,
         worker: _BaseWorker | None = None,
+        request_id: Any = None,
     ) -> None:
         self._overload_rejected[bucket] = int(self._overload_rejected.get(bucket, 0)) + 1
         self._send_external_response(
@@ -1167,6 +1190,7 @@ class DeviceRouter(ManagedProcessBase):
                 queue_depth=self._worker_depth(worker),
                 queue_max=self._worker_max(worker),
             ),
+            request_id=request_id,
         )
 
     def _worker_queue_depth_snapshot(self) -> Json:
@@ -1422,10 +1446,12 @@ class DeviceRouter(ManagedProcessBase):
                 item = self._reply_queue.get_nowait()
             except queue.Empty:
                 break
+            request_id: Any = None
             if isinstance(item, _ReplyItem):
                 identity = item.identity
                 resp = item.response
                 inflight_reserved = bool(item.inflight_reserved)
+                request_id = item.request_id
             elif (
                 isinstance(item, tuple)
                 and len(item) == 2
@@ -1443,17 +1469,23 @@ class DeviceRouter(ManagedProcessBase):
                     self._release_inflight()
                 continue
             try:
-                self._external_rpc.send_multipart([identity, json_dumps(resp)])
+                self._external_rpc.send_multipart(
+                    [identity, json_dumps(_inject_request_id(resp, request_id))]
+                )
             except Exception:
                 pass
             finally:
                 if inflight_reserved:
                     self._release_inflight()
 
-    def _send_external_response(self, identity: bytes, resp: Json) -> None:
+    def _send_external_response(
+        self, identity: bytes, resp: Json, *, request_id: Any = None
+    ) -> None:
         if self._external_rpc is None:
             return
-        self._external_rpc.send_multipart([identity, json_dumps(resp)])
+        self._external_rpc.send_multipart(
+            [identity, json_dumps(_inject_request_id(resp, request_id))]
+        )
 
     @staticmethod
     def _federation_hop_count(raw: object) -> int:
@@ -1472,6 +1504,7 @@ class DeviceRouter(ManagedProcessBase):
         route: MirroredRoute,
         action: str,
     ) -> None:
+        req_id = req.get("request_id")
         hop_count = self._federation_hop_count(req.get("federation"))
         if hop_count > 0:
             self._send_external_response(
@@ -1485,6 +1518,7 @@ class DeviceRouter(ManagedProcessBase):
                         ),
                     },
                 },
+                request_id=req_id,
             )
             return
         if not route.allows_device_action(action):
@@ -1500,6 +1534,7 @@ class DeviceRouter(ManagedProcessBase):
                         ),
                     },
                 },
+                request_id=req_id,
             )
             return
         if not self._reserve_inflight():
@@ -1507,6 +1542,7 @@ class DeviceRouter(ManagedProcessBase):
                 identity,
                 bucket="inflight",
                 message="router inflight request limit reached",
+                request_id=req_id,
             )
             return
         task = _MirroredTask(
@@ -1523,15 +1559,17 @@ class DeviceRouter(ManagedProcessBase):
                 bucket="mirrored_worker",
                 message="mirrored worker queue is full",
                 worker=worker,
+                request_id=req_id,
             )
 
     def _dispatch_device_command(self, identity: bytes, req: Json) -> None:
         device_id = str(req.get("device_id", ""))
         action = str(req.get("action", ""))
         params = req.get("params", {})
+        req_id = req.get("request_id")
         if not device_id or not action or not isinstance(params, dict):
             resp = {"ok": False, "error": "invalid command"}
-            self._send_external_response(identity, resp)
+            self._send_external_response(identity, resp, request_id=req_id)
             return
         mirrored_route = self._mirrored_routes.get(device_id)
         if mirrored_route is not None:
@@ -1556,6 +1594,7 @@ class DeviceRouter(ManagedProcessBase):
                 identity,
                 bucket="inflight",
                 message="router inflight request limit reached",
+                request_id=req_id,
             )
             return
         task = _DeviceTask(
@@ -1593,19 +1632,20 @@ class DeviceRouter(ManagedProcessBase):
                 bucket="device_worker",
                 message="device worker queue is full",
                 worker=worker,
+                request_id=req_id,
             )
 
     def _dispatch_process_rpc(self, identity: bytes, req: Json) -> None:
         process_id = str(req.get("process_id", ""))
         request = req.get("request")
+        request_id = req.get("request_id")
         if not process_id or not isinstance(request, dict):
             resp = {"ok": False, "error": {"code": "invalid_process_rpc"}}
-            self._send_external_response(identity, resp)
+            self._send_external_response(identity, resp, request_id=request_id)
             return
         action = str(request.get("type", "process.rpc") or "process.rpc")
         params_raw = request.get("params", {})
         params = params_raw if isinstance(params_raw, dict) else {}
-        request_id = req.get("request_id")
         if request_id is None:
             request_id = request.get("request_id")
         caller_process_id = (
@@ -1633,6 +1673,7 @@ class DeviceRouter(ManagedProcessBase):
                 identity,
                 bucket="inflight",
                 message="router inflight request limit reached",
+                request_id=request_id,
             )
             return
         task = _ProcessTask(
@@ -1657,14 +1698,17 @@ class DeviceRouter(ManagedProcessBase):
                 bucket="process_worker",
                 message="process worker queue is full",
                 worker=worker,
+                request_id=request_id,
             )
 
     def _dispatch_manager_rpc(self, identity: bytes, req: Json) -> None:
+        req_id = req.get("request_id")
         if not self._reserve_inflight():
             self._reject_overload(
                 identity,
                 bucket="inflight",
                 message="router inflight request limit reached",
+                request_id=req_id,
             )
             return
         task = _ManagerTask(identity=identity, request=req, inflight_reserved=True)
@@ -1676,6 +1720,7 @@ class DeviceRouter(ManagedProcessBase):
                 bucket="manager_worker",
                 message="manager worker queue is full",
                 worker=worker,
+                request_id=req_id,
             )
 
     def _handle_external_rpc(self) -> None:
@@ -1691,6 +1736,7 @@ class DeviceRouter(ManagedProcessBase):
             self._send_external_response(identity, resp)
             return
 
+        req_id = req.get("request_id")
         rtype = req.get("type")
         if rtype == "command":
             self._dispatch_device_command(identity, req)
@@ -1700,7 +1746,7 @@ class DeviceRouter(ManagedProcessBase):
             return
         if rtype in {"manager.interceptors.register", "manager.interceptors.list"}:
             resp = self._handle_command_interceptor(req)
-            self._send_external_response(identity, resp)
+            self._send_external_response(identity, resp, request_id=req_id)
             return
         if rtype == "manager.processes.rpc.advertise":
             process_id = str(req.get("process_id", ""))
