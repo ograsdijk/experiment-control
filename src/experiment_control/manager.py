@@ -22,6 +22,15 @@ import zmq
 
 from .federation import FederationConfig
 from .federation.hub import FederationHub
+
+# Per-socket per-tick drain cap. Each SUB handler will recv up to this
+# many messages before yielding back to the poll loop. With ~100 µs
+# per-message handling cost this bounds tick duration to ~25 ms — well
+# under the 1 s loop-stall threshold. In healthy steady-state traffic
+# (~20-30 msgs/sec total across all SUB sockets) the cap is never hit;
+# its purpose is to keep an avalanche (e.g. post-stall backlog) from
+# monopolising a single tick.
+MAX_DRAIN_PER_TICK = 256
 from .manager_command_journal import (
     append_command_journal_entry as shared_append_command_journal_entry,
 )
@@ -730,6 +739,12 @@ class ProcessHandle:
     last_start_t_mono: float | None = None
     last_hb_t_wall: float | None = None
     last_hb_t_mono: float | None = None
+    # Manager-side timestamp of when we DRAINED the HB from the SUB
+    # buffer, used for the timeout check. Distinct from last_hb_t_mono
+    # (the sender's clock when the HB was generated): including buffer
+    # + scheduling delay in the timeout check produces false positives
+    # when the manager is briefly slow.
+    last_hb_recv_mono: float | None = None
     last_heartbeat_payload: Json | None = None
     last_exit_code: int | None = None
     restart_count: int = 0
@@ -1854,7 +1869,6 @@ class Manager:
         start_mono = time.monotonic()
         try:
             self._drain_supervisor_logs()
-            self._check_timeouts()
 
             events = dict(self._poller.poll(poll_ms))
             if events.get(self._registry_rep) == zmq.POLLIN:
@@ -1877,6 +1891,12 @@ class Manager:
             # ZMQ sends; the workers themselves never touch sockets.
             self._drain_lifecycle_replies()
             self._drain_lifecycle_events()
+            # Check timeouts AFTER draining all SUB sockets. Doing it
+            # at the top of the tick (the previous order) means freshly
+            # buffered HBs sitting in the SUB queue haven't been
+            # ingested yet, so the timeout check would fire against
+            # stale `last_hb_recv_mono` even when the process is fine.
+            self._check_timeouts()
         finally:
             self._record_pump_timing(start_mono, time.monotonic())
 
@@ -2036,56 +2056,71 @@ class Manager:
         shared_handle_driver_pub(self)
 
     def _handle_process_pub(self) -> None:
-        topic_b, payload_b = self._process_hb_sub.recv_multipart()
-        topic = self._normalize_topic(topic_b.decode("utf-8", errors="replace"))
-        try:
-            msg = safe_json_loads(payload_b)
-            if not isinstance(msg, dict):
-                self._publish_manager_event(
-                    "manager.process.unknown_pub", {"topic": topic}
-                )
+        # Drain all available HBs in one tick so a momentary stall
+        # doesn't leave a backlog that drips out at 1-per-tick (which
+        # in turn makes the timeout check see "stale" for processes
+        # whose HBs are still queued). Cap bounds worst-case tick
+        # duration on an avalanche.
+        for _ in range(MAX_DRAIN_PER_TICK):
+            try:
+                topic_b, payload_b = self._process_hb_sub.recv_multipart(zmq.NOBLOCK)
+            except zmq.Again:
                 return
+            topic = self._normalize_topic(topic_b.decode("utf-8", errors="replace"))
+            try:
+                msg = safe_json_loads(payload_b)
+                if not isinstance(msg, dict):
+                    self._publish_manager_event(
+                        "manager.process.unknown_pub", {"topic": topic}
+                    )
+                    continue
 
-            if not topic.startswith("process/") or not topic.endswith("/heartbeat"):
+                if not topic.startswith("process/") or not topic.endswith("/heartbeat"):
+                    self._publish_manager_event(
+                        "manager.process.unknown_pub", {"topic": topic, "raw": msg}
+                    )
+                    continue
+
+                self._ingest_process_heartbeat(topic, msg)
+            except Exception as e:
                 self._publish_manager_event(
-                    "manager.process.unknown_pub", {"topic": topic, "raw": msg}
+                    "manager.process.heartbeat_error",
+                    {"topic": topic, "error": str(e)},
                 )
-                return
-
-            self._ingest_process_heartbeat(topic, msg)
-        except Exception as e:
-            self._publish_manager_event(
-                "manager.process.heartbeat_error",
-                {"topic": topic, "error": str(e)},
-            )
 
     def _handle_process_data_pub(self) -> None:
-        topic_b, payload_b = self._process_data_sub.recv_multipart()
-        topic = self._normalize_topic(topic_b.decode("utf-8", errors="replace"))
-        try:
-            msg = safe_json_loads(payload_b)
-            if not isinstance(msg, dict):
+        # Drain all available data events per tick. Same rationale as
+        # _handle_process_pub.
+        for _ in range(MAX_DRAIN_PER_TICK):
+            try:
+                topic_b, payload_b = self._process_data_sub.recv_multipart(zmq.NOBLOCK)
+            except zmq.Again:
+                return
+            topic = self._normalize_topic(topic_b.decode("utf-8", errors="replace"))
+            try:
+                msg = safe_json_loads(payload_b)
+                if not isinstance(msg, dict):
+                    self._publish_manager_event(
+                        "manager.process.unknown_pub", {"topic": topic}
+                    )
+                    continue
+
+                if not topic.startswith("manager."):
+                    self._publish_manager_event(
+                        "manager.process.unknown_pub", {"topic": topic, "raw": msg}
+                    )
+                    continue
+
+                if topic == "manager.log":
+                    self._emit_log_from_payload(msg, default_topic=topic)
+                    continue
+
+                self._publish_manager_event(topic, msg)
+            except Exception as e:
                 self._publish_manager_event(
-                    "manager.process.unknown_pub", {"topic": topic}
+                    "manager.process.data_error",
+                    {"topic": topic, "error": str(e)},
                 )
-                return
-
-            if not topic.startswith("manager."):
-                self._publish_manager_event(
-                    "manager.process.unknown_pub", {"topic": topic, "raw": msg}
-                )
-                return
-
-            if topic == "manager.log":
-                self._emit_log_from_payload(msg, default_topic=topic)
-                return
-
-            self._publish_manager_event(topic, msg)
-        except Exception as e:
-            self._publish_manager_event(
-                "manager.process.data_error",
-                {"topic": topic, "error": str(e)},
-            )
 
     def _ingest_telemetry(self, msg: Json) -> None:
         shared_ingest_telemetry(
@@ -2134,6 +2169,10 @@ class Manager:
         handle.pid = pid
         handle.last_hb_t_wall = float(ts["t_wall"])
         handle.last_hb_t_mono = float(ts["t_mono"])
+        # Manager-side timestamp of when we processed this HB; the
+        # timeout check uses this (not the sender's t_mono) so a
+        # manager-side drain delay doesn't get blamed on the process.
+        handle.last_hb_recv_mono = time.monotonic()
         handle.last_heartbeat_payload = copy.deepcopy(msg)
         if handle.state == ManagedProcessState.STARTING:
             handle.state = ManagedProcessState.RUNNING
