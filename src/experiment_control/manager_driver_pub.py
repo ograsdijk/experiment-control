@@ -215,6 +215,10 @@ def handle_driver_pub(manager: Any) -> None:
         manager._publish_manager_event(
             "manager.unknown_driver_pub", {"topic": topic, "raw": msg}
         )
+    # Loop completed full MAX_DRAIN_PER_TICK iterations without zmq.Again:
+    # queue still has data. Surface this (rate-limited) so operators see
+    # the backlog instead of silent message lag.
+    manager._maybe_publish_drain_cap_hit("driver_pub", MAX_DRAIN_PER_TICK)
 
 
 def _emit_ingest_error(manager: Any, topic: str, payload: Json) -> None:
