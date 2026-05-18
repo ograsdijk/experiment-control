@@ -77,7 +77,9 @@ class DeviceRunnerTelemetryPropertyTests(unittest.TestCase):
                         TelemetryOut(
                             signal="system_pressure_torr", kind="key", ref="pressure_torr"
                         ),
-                        TelemetryOut(signal="mode", kind="key", ref="mode"),
+                        TelemetryOut(
+                            signal="mode", kind="key", ref="mode", dtype="str"
+                        ),
                     ],
                 )
             ]

@@ -654,7 +654,7 @@ function normalizeStateMachineHistory(raw: unknown): StateMachineHistoryEntry[] 
   return rows;
 }
 
-async function apiFetch<T>(path: string, init?: RequestInit): Promise<ApiResponse<T>> {
+export async function apiFetch<T>(path: string, init?: RequestInit): Promise<ApiResponse<T>> {
   const resp = await fetch(`${API_BASE}${path}`, init);
   return resp.json();
 }
@@ -758,7 +758,7 @@ export async function fetchCapabilities(deviceId: string): Promise<CapabilityMem
   return resp.result.members ?? [];
 }
 
-export async function callDevice(
+export async function callDevice<T = unknown>(
   deviceId: string,
   action: string,
   params: Record<string, unknown>,
@@ -767,8 +767,8 @@ export async function callDevice(
     sourceKind?: string;
     sourceId?: string;
   }
-) {
-  return apiFetch(`/api/devices/${deviceId}/call`, {
+): Promise<ApiResponse<T>> {
+  return apiFetch<T>(`/api/devices/${deviceId}/call`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -833,7 +833,7 @@ export async function fetchProcessCapabilities(
   return resp.result.members ?? [];
 }
 
-export async function callProcess(
+export async function callProcess<T = unknown>(
   processId: string,
   action: string,
   params: Record<string, unknown>,
@@ -842,8 +842,8 @@ export async function callProcess(
     sourceKind?: string;
     sourceId?: string;
   }
-) {
-  return apiFetch(`/api/processes/${processId}/call`, {
+): Promise<ApiResponse<T>> {
+  return apiFetch<T>(`/api/processes/${processId}/call`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({

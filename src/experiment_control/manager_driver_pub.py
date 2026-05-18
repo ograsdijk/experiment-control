@@ -4,9 +4,16 @@ import json
 import time
 from typing import Any
 
+import zmq
+
 from .utils.zmq_helpers import safe_json_loads
 
 Json = dict[str, Any]
+
+# Per-socket per-tick drain cap. Mirrors MAX_DRAIN_PER_TICK in
+# manager.py — keep both in sync if you change one. Bounds worst-case
+# tick duration when an avalanche arrives after a stall.
+MAX_DRAIN_PER_TICK = 256
 
 
 def _positive_limit(manager: Any, attr: str, default: int) -> int:
@@ -181,21 +188,33 @@ def _handle_chunk_ready_topic(manager: Any, msg: Json) -> None:
 
 
 def handle_driver_pub(manager: Any) -> None:
-    topic_b, payload_b = manager._sub.recv_multipart()
-    topic = manager._normalize_topic(topic_b.decode("utf-8", errors="replace"))
-    msg = _decode_driver_pub_payload(manager, topic, payload_b)
-    if msg is None:
-        return
-    if topic.endswith("/telemetry"):
-        _handle_telemetry_topic(manager, msg)
-        return
-    if topic.endswith("/heartbeat"):
-        _handle_heartbeat_topic(manager, topic=topic, msg=msg)
-        return
-    if topic.endswith("/chunk_ready"):
-        _handle_chunk_ready_topic(manager, msg)
-        return
-    manager._publish_manager_event("manager.unknown_driver_pub", {"topic": topic, "raw": msg})
+    # Drain all available driver pub messages per tick. One-per-tick
+    # was the prior behaviour and caused a backlog under load (~18
+    # devices in vacuum-cryo each pumping telemetry + heartbeats at
+    # ~1 Hz can saturate a single-message-per-tick drain at 20 Hz).
+    # Backlog → telemetry & device-heartbeat checks fire against
+    # stale state. The drain cap bounds tick duration.
+    for _ in range(MAX_DRAIN_PER_TICK):
+        try:
+            topic_b, payload_b = manager._sub.recv_multipart(zmq.NOBLOCK)
+        except zmq.Again:
+            return
+        topic = manager._normalize_topic(topic_b.decode("utf-8", errors="replace"))
+        msg = _decode_driver_pub_payload(manager, topic, payload_b)
+        if msg is None:
+            continue
+        if topic.endswith("/telemetry"):
+            _handle_telemetry_topic(manager, msg)
+            continue
+        if topic.endswith("/heartbeat"):
+            _handle_heartbeat_topic(manager, topic=topic, msg=msg)
+            continue
+        if topic.endswith("/chunk_ready"):
+            _handle_chunk_ready_topic(manager, msg)
+            continue
+        manager._publish_manager_event(
+            "manager.unknown_driver_pub", {"topic": topic, "raw": msg}
+        )
 
 
 def _emit_ingest_error(manager: Any, topic: str, payload: Json) -> None:

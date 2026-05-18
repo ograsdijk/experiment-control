@@ -20,17 +20,7 @@
   useComputedColorScheme,
   useMantineColorScheme,
 } from "@mantine/core";
-import {
-  DndContext,
-  PointerSensor,
-  TouchSensor,
-  useDraggable,
-  useSensor,
-  useSensors,
-  type DragEndEvent,
-  type DragOverEvent,
-  type DragStartEvent,
-} from "@dnd-kit/core";
+import { DndContext } from "@dnd-kit/core";
 import { SortableContext, rectSortingStrategy } from "@dnd-kit/sortable";
 import { notifications } from "@mantine/notifications";
 import {
@@ -65,29 +55,15 @@ import {
 } from "react";
 import {
   callDevice,
-  buildWsUrl,
   cleanupInstanceOrphans,
-  fetchDefaultUiProfile,
   fetchLogTail,
   fetchCapabilities,
   fetchDevices,
   fetchExtraUis,
   fetchGatewaySettings,
   fetchInstanceRuntimeStatus,
-  fetchRawStreamSnapshot,
   fetchStreams,
-  fetchStreamWorkspaceSnapshot,
-  fetchTelemetrySnapshot,
   callProcess,
-  deleteStreamWorkspace,
-  fetchStreamWorkspace,
-  fetchStreamWorkspaceList,
-  fetchStreamWorkspaceStoreStatus,
-  putStreamWorkspace,
-  reloadStreamWorkspaceStore,
-  resetStreamWorkspace,
-  saveStreamWorkspaceStore,
-  validateStreamWorkspace,
   type GatewaySettingsInfo,
   type InstanceRuntimeStatus,
   type ExtraUiInfo,
@@ -130,10 +106,7 @@ import {
   normalizeBooleanMap,
   normalizeStringList,
 } from "./features/common/normalize";
-import {
-  detectGridColumns,
-  reorderIdsSerpentine,
-} from "./features/layout/serpentine";
+import { detectGridColumns } from "./features/layout/serpentine";
 import { ReorderableCardShell } from "./features/layout/ReorderableCardShell";
 import {
   logEntryKey,
@@ -148,7 +121,6 @@ import type {
   PinnedParamDrafts,
   PlotState,
   PlotWorkspaceColumnsSetting,
-  UiProfileFile,
   UiProfileState,
 } from "./features/profile/types";
 import {
@@ -156,9 +128,7 @@ import {
   normalizeCommandDeck,
   normalizePinnedCommands,
   normalizePlotWorkspaceColumnsSetting,
-  normalizeUiProfile,
 } from "./features/profile/utils";
-import { normalizePlotState, serializePlotState } from "./features/profile/plot_state";
 import { useInterlocksController } from "./features/interlocks/useInterlocksController";
 import { useWatchdogsController } from "./features/watchdogs/useWatchdogsController";
 import { useStateMachinesController } from "./features/state_machines/useStateMachinesController";
@@ -175,6 +145,64 @@ import {
 import { useProcessCommandController } from "./features/processes/useProcessCommandController";
 import { useProcessLifecycleController } from "./features/processes/useProcessLifecycleController";
 import { useProcessesController } from "./features/processes/useProcessesController";
+import { useTelemetryPipeline } from "./features/telemetry/useTelemetryPipeline";
+import { useRawStreamSubscriptions } from "./features/telemetry/useRawStreamSubscriptions";
+import { useStreamAnalysisSubscriptions } from "./features/stream_analysis/useStreamAnalysisSubscriptions";
+import { useTelemetry } from "./features/telemetry/TelemetryContext";
+import { useStreamAnalysis } from "./features/stream_analysis/StreamAnalysisContext";
+import { useDaqDraftEditors } from "./features/stream_analysis/useDaqDraftEditors";
+import { useDaqModalLifecycle } from "./features/stream_analysis/useDaqModalLifecycle";
+import { useWorkspaceStoreActions } from "./features/stream_analysis/useWorkspaceStoreActions";
+import { useWorkspaceListManagement } from "./features/stream_analysis/useWorkspaceListManagement";
+import { useDaqWorkspaceApply } from "./features/stream_analysis/useDaqWorkspaceApply";
+import { useDevicesContext } from "./features/devices/DevicesContext";
+import { useCommands } from "./features/commands/CommandsContext";
+import { useCommandDeckMutations } from "./features/commands/useCommandDeckMutations";
+import { useCommandDeckRunner } from "./features/commands/useCommandDeckRunner";
+import { usePinnedParamsReconciler } from "./features/commands/usePinnedParamsReconciler";
+import {
+  isCommandDeckCommandEntry,
+  isCommandDeckTelemetryEntry,
+  normalizeDeckGroup,
+} from "./features/commands/utils";
+import { useLayout } from "./features/layout/LayoutContext";
+import { deviceSortableId } from "./features/layout/drag_helpers";
+import { useNavResizer } from "./features/layout/useNavResizer";
+import { useUiDragController } from "./features/layout/useUiDragController";
+import { useLogs } from "./features/logs/LogsContext";
+import { ExpandedPlotBody } from "./features/panels/ExpandedPlotBody";
+import { useStreamWorkspacePanelReconciler } from "./features/panels/useStreamWorkspacePanelReconciler";
+import {
+  PanelsGrid,
+  type PanelsGridHandlers,
+  type PanelsGridHelpers,
+} from "./features/panels/PanelsGrid";
+import { DraggableTraceChip } from "./components/DraggableTraceChip";
+import { usePanels } from "./features/panels/PanelsContext";
+import { usePanelDerivations } from "./features/panels/usePanelDerivations";
+import { usePanelUiHandlers } from "./features/panels/usePanelUiHandlers";
+import { usePanelAutoRangeHandlers } from "./features/panels/usePanelAutoRangeHandlers";
+import { useStreamPanelHandlers } from "./features/panels/useStreamPanelHandlers";
+import { useStreamWorkspaceHandlers } from "./features/panels/useStreamWorkspaceHandlers";
+import { usePanelLifecycle } from "./features/panels/usePanelLifecycle";
+import { usePanelTitleEditor } from "./features/panels/usePanelTitleEditor";
+import {
+  streamBinStatsFitOverlayCurves as streamBinStatsFitOverlayCurvesImpl,
+  streamBinStatsOverlaySeries as streamBinStatsOverlaySeriesImpl,
+  streamTraceOverlaySeries as streamTraceOverlaySeriesImpl,
+} from "./features/panels/overlayHelpers";
+import {
+  applyRawStreamFrameToPanels as applyRawStreamFrameToPanelsImpl,
+  applyStreamAnalysisOutputToPanels as applyStreamAnalysisOutputToPanelsImpl,
+  buildPanelsByWorkspaceOutput,
+  ensurePanelBuffers as ensurePanelBuffersImpl,
+  panelCapacity as panelCapacityImpl,
+  type ApplyHelpersDeps,
+} from "./features/panels/applyToPanels";
+import { useSettings } from "./features/runtime/SettingsContext";
+import { useRuntimeRefreshers } from "./features/runtime/useRuntimeRefreshers";
+import { useUiProfile } from "./features/runtime/useUiProfile";
+import { useLogsStream } from "./features/logs/useLogsStream";
 import type {
   PanelKind,
   PlotPanelState,
@@ -188,13 +216,11 @@ import type {
   RawStreamSubscription,
   StreamAnalysisSettings,
   StreamAnalysisWorkspaceConfig,
-  StreamAnalysisWorkspaceSubscription,
   StreamBin2dSnapshot,
   StreamBinStatsSettings,
   StreamBinStatsSnapshot,
   StreamFitCurveSnapshot,
   StreamDagNodeConfig,
-  StreamDagOpId,
   StreamDagOutputConfig,
   StreamFrameSample,
   StreamTarget,
@@ -212,13 +238,8 @@ import type {
 import {
   cloneDagNodes,
   cloneDagOutputs,
-  coerceDagParamValue,
-  defaultInputsForOp,
-  defaultParamsForOp,
   isPublishableNodeKind,
   nodeKindFromOp,
-  normalizeDagNode,
-  normalizeDagOutput,
   STREAM_DAG_INPUT_KINDS,
   STREAM_DAG_OP_OPTIONS,
   STREAM_DAG_OPS,
@@ -229,7 +250,6 @@ import {
   normalizeHist2dValue,
   normalizeFitParamsMapValue,
   normalizeStreamAnalysisOutputMessage,
-  normalizeStreamFrameMessage,
   normalizeTime,
   normalizeTraceValues,
 } from "./features/stream/messages";
@@ -244,7 +264,6 @@ import {
   isTelemetryPanel,
   normalizeAutoRange,
   streamScalarTrace,
-  workspaceFromLegacyPanel,
 } from "./features/stream/panel_helpers";
 import {
   dagOutputKindColor,
@@ -296,24 +315,22 @@ import {
   defaultStreamAnalysisSettings,
   defaultStreamAnalysisWorkspaceConfig,
   defaultStreamBinStatsSettings,
-  defaultStreamWorkspaceName,
   nextWorkspaceCounter,
   normalizeStreamAnalysisSettings,
   normalizeStreamBinStatsSettings,
   normalizeStreamWorkspaceRecord,
   normalizeUncertaintyMode,
   normalizeWorkspaceStoreStatus,
-  normalizeWorkspaceSummaries,
   streamWorkspaceSort,
   workspaceBin2dAxisLabel,
   workspaceOutputKind,
   workspaceOutputOptionsByKind,
-  workspaceStreamFromGraphNodes,
   workspaceXAxisLabel,
 } from "./features/stream/workspace";
 import { useSequencerController } from "./features/sequencer/useSequencerController";
 import { RingBuffer } from "./utils/ringBuffer";
 import { colorWithAlpha, traceColorAt } from "./utils/traceColors";
+import { usePlotTick } from "./features/panels/PlotTickContext";
 import {
   CommandDeckCommandEntry,
   CommandDeckEntry,
@@ -322,12 +339,9 @@ import {
   CapabilityMember,
   DeviceStatus,
   LogEntry,
-  LogMessage,
   PinnedCommand,
   ProcessStatus,
-  StreamAnalysisMessage,
   StreamCatalogEntry,
-  StreamFrameMessage,
   TelemetryMessage,
   TelemetrySignal,
   TraceKey,
@@ -386,158 +400,51 @@ function isErrorSeverity(severity: unknown): boolean {
   );
 }
 
-function normalizeDeckGroup(raw: string | null | undefined): string | null {
-  const text = String(raw ?? "").trim();
-  return text.length > 0 ? text : null;
-}
+// normalizeDeckGroup / isCommandDeckCommandEntry /
+// isCommandDeckTelemetryEntry now live in features/commands/utils.ts
+// (round 26 — needed by useCommandDeckMutations).
 
-function isCommandDeckCommandEntry(
-  entry: CommandDeckEntry
-): entry is CommandDeckCommandEntry {
-  return entry.kind !== "telemetry";
-}
+// UiDragData / panelSortableId / parseSortablePrefixedId moved to
+// features/layout/drag_helpers.ts (round 31). deviceSortableId is
+// imported from the same module below.
 
-function isCommandDeckTelemetryEntry(
-  entry: CommandDeckEntry
-): entry is CommandDeckTelemetryEntry {
-  return entry.kind === "telemetry";
-}
-
-type UiDragData =
-  | { kind: "device"; deviceId: string }
-  | { kind: "panel"; panelId: string }
-  | { kind: "command-deck-entry"; entryId: string; groupName: string }
-  | { kind: "signal"; deviceId: string; signal: string }
-  | { kind: "trace"; deviceId: string; signal: string; originPanelId?: string };
-
-function deviceSortableId(deviceId: string): string {
-  return `device:${deviceId}`;
-}
-
-function panelSortableId(panelId: string): string {
-  return `panel:${panelId}`;
-}
-
-function parseSortablePrefixedId(raw: string | number, prefix: string): string | null {
-  if (typeof raw !== "string") {
-    return null;
-  }
-  if (!raw.startsWith(prefix)) {
-    return null;
-  }
-  const suffix = raw.slice(prefix.length);
-  return suffix.length > 0 ? suffix : null;
-}
-
-type DraggableTraceChipProps = {
-  panelId: string;
-  trace: TraceKey;
-  children: ReactNode;
-  className?: string;
-  style?: CSSProperties;
-};
-
-function DraggableTraceChip({
-  panelId,
-  trace,
-  children,
-  className,
-  style,
-}: DraggableTraceChipProps) {
-  const { attributes, listeners, setNodeRef, isDragging } = useDraggable({
-    id: `trace:${panelId}:${trace.deviceId}:${trace.signal}`,
-    data: {
-      kind: "trace",
-      deviceId: trace.deviceId,
-      signal: trace.signal,
-      originPanelId: panelId,
-    } satisfies UiDragData,
-  });
-  return (
-    <span
-      ref={setNodeRef}
-      className={className}
-      style={{
-        ...style,
-        cursor: "grab",
-        opacity: isDragging ? 0.55 : 1,
-      }}
-      {...attributes}
-      {...listeners}
-    >
-      {children}
-    </span>
-  );
-}
+// DraggableTraceChip moved to components/DraggableTraceChip.tsx
+// (round 30 — needed by PanelsGrid as well as remaining App-side uses).
 
 export function App() {
-  const [navWidth, setNavWidth] = useState(() => {
-    try {
-      const raw = localStorage.getItem("ecui.navWidth");
-      const parsed = raw ? Number(raw) : NaN;
-      if (Number.isFinite(parsed)) {
-        return clampNavWidth(parsed, { min: NAV_MIN_WIDTH, max: NAV_MAX_WIDTH });
-      }
-    } catch {
-      // ignore storage errors
-    }
-    return clampNavWidth(DEFAULT_NAV_WIDTH, {
-      min: NAV_MIN_WIDTH,
-      max: NAV_MAX_WIDTH,
-    });
-  });
-  const [isDevicePanelCollapsed, setIsDevicePanelCollapsed] = useState(() => {
-    try {
-      const raw = localStorage.getItem("ecui.devicePanelCollapsed");
-      return raw === "1" || raw === "true";
-    } catch {
-      // ignore storage errors
-    }
-    return false;
-  });
-  const [devicePanelTab, setDevicePanelTab] = useState<"devices" | "deck">(() => {
-    try {
-      const raw = String(localStorage.getItem("ecui.devicePanelTab") ?? "").trim();
-      return raw === "deck" ? "deck" : "devices";
-    } catch {
-      // ignore storage errors
-    }
-    return "devices";
-  });
-  const [plotWorkspaceColumns, setPlotWorkspaceColumns] =
-    useState<PlotWorkspaceColumnsSetting>(() => {
-      try {
-        return normalizePlotWorkspaceColumnsSetting(
-          localStorage.getItem("ecui.plotWorkspaceColumns")
-        );
-      } catch {
-        return "auto";
-      }
-    });
-  const [plotWorkspaceOptionsOpen, setPlotWorkspaceOptionsOpen] = useState(false);
-  const [viewportWidth, setViewportWidth] = useState(() => {
-    if (typeof window === "undefined") {
-      return 1200;
-    }
-    return window.innerWidth;
-  });
-  const resizeRef = useRef<{ startX: number; startWidth: number } | null>(null);
-  const [isResizing, setIsResizing] = useState(false);
-  const resizePendingWidthRef = useRef<number | null>(null);
-  const resizeRafRef = useRef<number | null>(null);
-  const initialPlotState = useMemo(() => {
-    try {
-      const raw = localStorage.getItem("ecui.plotState");
-      if (!raw) {
-        return normalizePlotState(null, { defaultWindowS: DEFAULT_WINDOW_S });
-      }
-      return normalizePlotState(JSON.parse(raw), {
-        defaultWindowS: DEFAULT_WINDOW_S,
-      });
-    } catch {
-      return normalizePlotState(null, { defaultWindowS: DEFAULT_WINDOW_S });
-    }
-  }, []);
+  // Layout / viewport / sidebar-resize state moved to LayoutContext
+  // (features/layout/LayoutContext.tsx). Resize event handlers and the
+  // window-resize listener stay in App.tsx for now — they're tied to
+  // DOM events that are easier to manage where the rest of App lives
+  // until the layout shell (header / sidebar / grids) extracts.
+  const {
+    navWidth,
+    setNavWidth,
+    isResizing,
+    setIsResizing,
+    resizeRef,
+    resizePendingWidthRef,
+    resizeRafRef,
+    isDevicePanelCollapsed,
+    setIsDevicePanelCollapsed,
+    devicePanelTab,
+    setDevicePanelTab,
+    plotWorkspaceColumns,
+    setPlotWorkspaceColumns,
+    plotWorkspaceOptionsOpen,
+    setPlotWorkspaceOptionsOpen,
+    viewportWidth,
+    setViewportWidth,
+    isNarrowPlotViewport,
+    plotGridStyle,
+    plotGridRef,
+    dragColumnsRef,
+  } = useLayout();
+  // initialPlotState (localStorage rehydration) now lives in
+  // PanelsContext (features/panels/PanelsContext.tsx). The panel state,
+  // refs, modal-panel-id state, Y-axis editor state, plotTick, and the
+  // autosave useEffect all moved into the Provider — see the
+  // usePanels() destructure below.
   const initialStreamWorkspaceState = useMemo(() => {
     try {
       const raw = localStorage.getItem("ecui.streamWorkspaces");
@@ -555,268 +462,224 @@ export function App() {
       };
     }
   }, []);
-  const [devices, setDevices] = useState<DeviceStatus[]>([]);
-  const [latestByDevice, setLatestByDevice] = useState<LatestSignals>({});
+  // Device roster + ordering + per-device UI collapse state moved to
+  // DevicesContext (features/devices/DevicesContext.tsx). The names below
+  // are kept identical so the existing call sites in App.tsx don't need
+  // touch-ups. `orderedDevices` (the sorted derivation) now lives in the
+  // Provider too — see the destructure below.
+  const {
+    devices,
+    setDevices,
+    orderedDevices,
+    deviceOrder,
+    setDeviceOrder,
+    telemetryCollapsedByDevice,
+    setTelemetryCollapsedByDevice,
+    deviceGridRef,
+  } = useDevicesContext();
   const { colorScheme, setColorScheme } = useMantineColorScheme();
   const computedColorScheme = useComputedColorScheme("light");
-  const panelIdRef = useRef(initialPlotState.nextPanelId);
-  const [panels, setPanels] = useState<PlotPanelState[]>(
-    initialPlotState.panels
-  );
-  const [activePanelId, setActivePanelId] = useState(
-    initialPlotState.activePanelId
-  );
-  const streamWorkspaceIdRef = useRef(initialStreamWorkspaceState.nextId);
-  const [streamWorkspaces, setStreamWorkspaces] = useState<
-    Record<string, StreamAnalysisWorkspaceConfig>
-  >(initialStreamWorkspaceState.workspaces);
-  const [streamWorkspaceRevisions, setStreamWorkspaceRevisions] = useState<
-    Record<string, number>
-  >({});
-  const [workspaceStoreStatus, setWorkspaceStoreStatus] =
-    useState<StreamWorkspaceStoreStatus>(() =>
-      normalizeWorkspaceStoreStatus(null)
-    );
-  const [workspaceStoreBusyAction, setWorkspaceStoreBusyAction] = useState<
-    "save" | "reload" | null
-  >(null);
-  const [daqOpen, setDaqOpen] = useState(false);
-  const [daqWorkspaceId, setDaqWorkspaceId] = useState<string | null>(
-    Object.keys(initialStreamWorkspaceState.workspaces)[0] ?? null
-  );
-  const [daqDraftName, setDaqDraftName] = useState("");
-  const [daqDraftNodes, setDaqDraftNodes] = useState<StreamDagNodeConfig[]>([]);
-  const [daqDraftOutputs, setDaqDraftOutputs] = useState<StreamDagOutputConfig[]>([]);
-  const [daqDraftEnabled, setDaqDraftEnabled] = useState(true);
-  const [daqResetNodeBusyId, setDaqResetNodeBusyId] = useState<string | null>(null);
-  const [daqFocusedNodeId, setDaqFocusedNodeId] = useState<string | null>(null);
-  const [plotTick, setPlotTick] = useState(0);
-  const [plotOptionsPanelId, setPlotOptionsPanelId] = useState<string | null>(null);
-  const [expandedPlotPanelId, setExpandedPlotPanelId] = useState<string | null>(null);
-  const [streamTraceOptionsPanelId, setStreamTraceOptionsPanelId] = useState<
-    string | null
-  >(null);
-  const [streamBinStatsOptionsPanelId, setStreamBinStatsOptionsPanelId] =
-    useState<string | null>(null);
-  const [streamParamsOptionsPanelId, setStreamParamsOptionsPanelId] =
-    useState<string | null>(null);
-  const [streamBin2dOptionsPanelId, setStreamBin2dOptionsPanelId] =
-    useState<string | null>(null);
-  const [yAxisDraftMin, setYAxisDraftMin] = useState<string | number>("");
-  const [yAxisDraftMax, setYAxisDraftMax] = useState<string | number>("");
-  const [yAxisAutoRange, setYAxisAutoRange] = useState<{
-    min: number;
-    max: number;
-  } | null>(null);
-  const [wsConnected, setWsConnected] = useState(false);
-  const [telemetryActive, setTelemetryActive] = useState(false);
-  const [streamWsConnected, setStreamWsConnected] = useState(false);
-  const [streamAnalysisWsConnected, setStreamAnalysisWsConnected] =
-    useState(false);
+  // Panel state moved to PanelsContext — see the usePanels() destructure
+  // below for `panels`, `setPanels`, `activePanelId`, `panelIdRef`,
+  // `panelsRef`, `plotTick`, modal-panel-id state, and Y-axis editor.
+  // Stream-analysis (DAQ workspace) state moved to StreamAnalysisContext
+  // (features/stream_analysis/StreamAnalysisContext.tsx). The names below
+  // are kept identical to the inline declarations they replaced so the
+  // ~180 existing call sites in App.tsx don't need touch-ups.
+  //
+  // Network handlers (load/persist/reset) stay in App.tsx for now — they
+  // call into helpers that haven't been extracted. The Context owns the
+  // state container only, matching the round-8 TelemetryContext shape.
+  const {
+    streamWorkspaces,
+    setStreamWorkspaces,
+    streamWorkspaceRevisions,
+    setStreamWorkspaceRevisions,
+    workspaceStoreStatus,
+    setWorkspaceStoreStatus,
+    workspaceStoreBusyAction,
+    setWorkspaceStoreBusyAction,
+    daqOpen,
+    setDaqOpen,
+    daqWorkspaceId,
+    setDaqWorkspaceId,
+    daqDraftName,
+    setDaqDraftName,
+    daqDraftNodes,
+    setDaqDraftNodes,
+    daqDraftOutputs,
+    setDaqDraftOutputs,
+    daqDraftEnabled,
+    setDaqDraftEnabled,
+    daqResetNodeBusyId,
+    setDaqResetNodeBusyId,
+    daqFocusedNodeId,
+    setDaqFocusedNodeId,
+    streamWorkspaceIdRef,
+    streamWorkspacesRef,
+    streamWorkspaceRevisionsRef,
+    daqNodeCardRefs,
+    daqNodeFocusTimeoutRef,
+  } = useStreamAnalysis();
+  // Panel state container — see features/panels/PanelsContext.tsx.
+  // Names kept identical so the ~37 setPanels(prev => ...) sites and
+  // the modal handlers throughout this file don't need touch-ups.
+  const {
+    panels,
+    setPanels,
+    activePanelId,
+    setActivePanelId,
+    panelsRef,
+    panelIdRef,    plotOptionsPanelId,
+    setPlotOptionsPanelId,
+    expandedPlotPanelId,
+    setExpandedPlotPanelId,
+    streamTraceOptionsPanelId,
+    setStreamTraceOptionsPanelId,
+    streamBinStatsOptionsPanelId,
+    setStreamBinStatsOptionsPanelId,
+    streamParamsOptionsPanelId,
+    setStreamParamsOptionsPanelId,
+    streamBin2dOptionsPanelId,
+    setStreamBin2dOptionsPanelId,
+    yAxisDraftMin,
+    setYAxisDraftMin,
+    yAxisDraftMax,
+    setYAxisDraftMax,
+    yAxisAutoRange,
+    setYAxisAutoRange,
+    editingPanelId,
+    panelTitleDraft,
+    setPanelTitleDraft,
+  } = usePanels();
+  const { plotTick, setPlotTick } = usePlotTick();
+  // streamWsConnected + streamAnalysisWsConnected moved out of useState
+  // and into useRawStreamSubscriptions / useStreamAnalysisSubscriptions
+  // hook returns (round 34). See the hook calls further down.
   const [logsOpen, setLogsOpen] = useState(false);
-  const [logsWsConnected, setLogsWsConnected] = useState(false);
   const [commandUnreadError, setCommandUnreadError] = useState(false);
   const [logsUnreadError, setLogsUnreadError] = useState(false);
-  const [settingsOpen, setSettingsOpen] = useState(false);
-  const [settingsLoading, setSettingsLoading] = useState(false);
-  const [settingsError, setSettingsError] = useState<string | null>(null);
-  const [gatewaySettings, setGatewaySettings] =
-    useState<GatewaySettingsInfo | null>(null);
-  const [extraUis, setExtraUis] = useState<ExtraUiInfo[]>([]);
-  const [instanceRuntimeStatus, setInstanceRuntimeStatus] =
-    useState<InstanceRuntimeStatus | null>(null);
-  const [instanceRuntimeLoading, setInstanceRuntimeLoading] = useState(false);
-  const [instanceRuntimeError, setInstanceRuntimeError] = useState<string | null>(null);
-  const [instanceCleanupBusy, setInstanceCleanupBusy] = useState(false);
-  const [logRows, setLogRows] = useState<LogEntry[]>([]);
-  const [logSeverityFilter, setLogSeverityFilter] = useState("all");
-  const [logSourceFilter, setLogSourceFilter] = useState("all");
-  const [logDeviceFilter, setLogDeviceFilter] = useState("all");
-  const [logProcessFilter, setLogProcessFilter] = useState("all");
-  const [logTextFilter, setLogTextFilter] = useState("");
-  const [logAutoScroll, setLogAutoScroll] = useState(true);
-  const [logLoading, setLogLoading] = useState(false);
-  const [expandedLogByKey, setExpandedLogByKey] = useState<
-    Record<string, boolean>
-  >({});
+  // Settings modal + instance-runtime state moved to SettingsContext
+  // (features/runtime/SettingsContext.tsx). Network handlers stay in
+  // App.tsx — they call into other state that hasn't been extracted.
+  const {
+    settingsOpen,
+    setSettingsOpen,
+    settingsLoading,
+    setSettingsLoading,
+    settingsError,
+    setSettingsError,
+    gatewaySettings,
+    setGatewaySettings,
+    extraUis,
+    setExtraUis,
+    instanceRuntimeStatus,
+    setInstanceRuntimeStatus,
+    instanceRuntimeLoading,
+    setInstanceRuntimeLoading,
+    instanceRuntimeError,
+    setInstanceRuntimeError,
+    instanceCleanupBusy,
+    setInstanceCleanupBusy,
+    settingsFileInputRef,
+  } = useSettings();
+  // Log viewer state + the filtered-rows derivation moved to LogsContext
+  // (features/logs/LogsContext.tsx). WS subscription stays in App.tsx;
+  // useLogsStream is unchanged for downstream compatibility.
+  const {
+    logRows,
+    setLogRows,
+    logSeverityFilter,
+    setLogSeverityFilter,
+    logSourceFilter,
+    setLogSourceFilter,
+    logDeviceFilter,
+    setLogDeviceFilter,
+    logProcessFilter,
+    setLogProcessFilter,
+    logTextFilter,
+    setLogTextFilter,
+    logAutoScroll,
+    setLogAutoScroll,
+    logLoading,
+    setLogLoading,
+    expandedLogByKey,
+    setExpandedLogByKey,
+    filteredLogRows,
+    logSeenRef,
+    logScrollRef,
+    logRowsBaselineReadyRef,
+    logRowsLastKeyRef,
+  } = useLogs();
   const [streamCatalog, setStreamCatalog] = useState<StreamCatalogEntry[]>([]);
-  const [activeUiDrag, setActiveUiDrag] = useState<UiDragData | null>(null);
-  const [editingPanelId, setEditingPanelId] = useState<string | null>(null);
-  const [panelTitleDraft, setPanelTitleDraft] = useState("");
-  const [deviceOrder, setDeviceOrder] = useState<string[]>(() => {
-    try {
-      const raw = localStorage.getItem("ecui.deviceOrder");
-      if (!raw) {
-        return [];
-      }
-      const parsed = JSON.parse(raw);
-      if (!Array.isArray(parsed)) {
-        return [];
-      }
-      return parsed
-        .map((value) => (typeof value === "string" ? value : ""))
-        .filter((value) => value.length > 0);
-    } catch {
-      return [];
-    }
-  });
-  const [telemetryCollapsedByDevice, setTelemetryCollapsedByDevice] = useState<
-    Record<string, boolean>
-  >(() => {
-    try {
-      const raw = localStorage.getItem("ecui.telemetryCollapsedByDevice");
-      if (!raw) {
-        return {};
-      }
-      const parsed = JSON.parse(raw);
-      if (!parsed || typeof parsed !== "object") {
-        return {};
-      }
-      const next: Record<string, boolean> = {};
-      for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
-        if (typeof key === "string" && typeof value === "boolean") {
-          next[key] = value;
-        }
-      }
-      return next;
-    } catch {
-      return {};
-    }
-  });
-  const [commandDeckCollapsedByGroup, setCommandDeckCollapsedByGroup] = useState<
-    Record<string, boolean>
-  >(() => {
-    try {
-      const raw = localStorage.getItem("ecui.commandDeck.collapsedByGroup");
-      if (!raw) {
-        return {};
-      }
-      const parsed = JSON.parse(raw);
-      if (!parsed || typeof parsed !== "object") {
-        return {};
-      }
-      const next: Record<string, boolean> = {};
-      for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
-        if (typeof value === "boolean") {
-          next[key] = value;
-        }
-      }
-      return next;
-    } catch {
-      return {};
-    }
-  });
-  const deviceGridRef = useRef<HTMLDivElement | null>(null);
-  const plotGridRef = useRef<HTMLDivElement | null>(null);
-  const dragColumnsRef = useRef<{ device: number; panel: number }>({
-    device: 1,
-    panel: 1,
-  });
-  const [pinnedParamDrafts, setPinnedParamDrafts] = useState<PinnedParamDrafts>(
-    {}
-  );
-  const [pinnedBusyByKey, setPinnedBusyByKey] = useState<Record<string, boolean>>(
-    {}
-  );
-  const logSeenRef = useRef<Set<string>>(new Set());
-  const logScrollRef = useRef<HTMLDivElement | null>(null);
+  // activeUiDrag + setActiveUiDrag moved to useUiDragController (round 31).
+  // editingPanelId + panelTitleDraft moved to PanelsContext (round 20).
+  // Pulled out alongside usePanelTitleEditor's 3 handlers so
+  // usePanelLifecycle's removePanel can clear the editor via context
+  // rather than taking the setters as args.
+  // deviceOrder + telemetryCollapsedByDevice now provided by
+  // DevicesContext (destructured at the top of the function).
+  // Pinned commands + command deck state moved to CommandsContext
+  // (features/commands/CommandsContext.tsx). The names below are kept
+  // identical so existing call sites in App.tsx don't need touch-ups.
+  // Network/CRUD handlers stay in App.tsx for now — they call into
+  // device + process command controllers that haven't been extracted.
+  const {
+    pinnedCommands,
+    setPinnedCommands,
+    pinnedParamDrafts,
+    setPinnedParamDrafts,
+    pinnedBusyByKey,
+    setPinnedBusyByKey,
+    commandDeck,
+    setCommandDeck,
+    commandDeckCollapsedByGroup,
+    setCommandDeckCollapsedByGroup,
+    commandDeckBusyById,
+    setCommandDeckBusyById,
+    commandDeckIdRef,
+  } = useCommands();
+  // deviceGridRef now provided by DevicesContext.
+  // plotGridRef + dragColumnsRef now provided by LayoutContext.
+  // pinnedParamDrafts + pinnedBusyByKey now provided by CommandsContext
+  // (destructured above).
+  // logSeenRef + logScrollRef + logRowsBaselineReadyRef +
+  // logRowsLastKeyRef now provided by LogsContext (destructured above).
   const commandHistoryScrollRef = useRef<HTMLDivElement | null>(null);
   const commandHistoryNearBottomRef = useRef(true);
   const commandHistoryBaselineReadyRef = useRef(false);
   const commandHistoryLastIdRef = useRef<string | null>(null);
-  const logRowsBaselineReadyRef = useRef(false);
-  const logRowsLastKeyRef = useRef<string | null>(null);
-  const settingsFileInputRef = useRef<HTMLInputElement | null>(null);
-  const [pinnedCommands, setPinnedCommands] = useState<PinnedCommandMap>(() => {
-    try {
-      const raw = localStorage.getItem("ecui.pinnedCommands");
-      if (!raw) {
-        return {};
-      }
-      const parsed = JSON.parse(raw);
-      return normalizePinnedCommands(parsed);
-    } catch {
-      return {};
-    }
-  });
-  const [commandDeck, setCommandDeck] = useState<CommandDeckEntry[]>(() => {
-    try {
-      const raw = localStorage.getItem("ecui.commandDeck");
-      if (!raw) {
-        return [];
-      }
-      return normalizeCommandDeck(JSON.parse(raw));
-    } catch {
-      return [];
-    }
-  });
-  const [commandDeckBusyById, setCommandDeckBusyById] = useState<
-    Record<string, boolean>
-  >({});
-  const commandDeckIdRef = useRef(1);
-  const buffersRef = useMemo(
-    () => new Map<string, Map<string, RingBuffer>>(),
-    []
-  );
-  const streamFramesRef = useMemo(
-    () => new Map<string, StreamFrameSample[]>(),
-    []
-  );
-  const streamTraceOverlayRef = useMemo(
-    () => new Map<string, Map<string, { seq: number; values: number[] }>>(),
-    []
-  );
-  const streamBinStatsOverlayRef = useMemo(
-    () => new Map<string, Map<string, { seq: number; values: number[] }>>(),
-    []
-  );
-  const streamBinStatsFitOverlayRef = useMemo(
-    () => new Map<string, Map<string, StreamFitCurveSnapshot>>(),
-    []
-  );
-  const streamParamsLatestRef = useMemo(
-    () => new Map<string, Record<string, StreamParamsOutputValue>>(),
-    []
-  );
-  const streamBinStatsRef = useMemo(
-    () => new Map<string, StreamBinStatsSnapshot>(),
-    []
-  );
-  const streamBin2dRef = useMemo(
-    () => new Map<string, StreamBin2dSnapshot>(),
-    []
-  );
-  const streamWorkspacesRef = useRef<Record<string, StreamAnalysisWorkspaceConfig>>(
-    initialStreamWorkspaceState.workspaces
-  );
-  const daqNodeCardRefs = useRef<Map<string, HTMLDivElement>>(new Map());
-  const daqNodeFocusTimeoutRef = useRef<number | null>(null);
-  const streamWorkspaceRevisionsRef = useRef<Record<string, number>>({});
-  const panelsRef = useRef<PlotPanelState[]>(initialPlotState.panels);
+  // settingsFileInputRef now provided by SettingsContext (destructured above).
+  // pinnedCommands + commandDeck + commandDeckBusyById + commandDeckIdRef
+  // now provided by CommandsContext (destructured above).
+  // Plot buffers + per-stream overlay caches now live in TelemetryContext
+  // (features/telemetry/TelemetryContext.tsx) so future feature-module
+  // extractions can subscribe to them via useTelemetry() without prop-
+  // drilling refs through. The names below are kept identical so the
+  // hundreds of existing call sites in App.tsx don't need touch-ups.
+  const {
+    buffersRef,
+    streamFramesRef,
+    streamTraceOverlayRef,
+    streamBinStatsOverlayRef,
+    streamBinStatsFitOverlayRef,
+    streamParamsLatestRef,
+    streamBinStatsRef,
+    streamBin2dRef,
+    panelBuffersByTraceKey,
+    registerPanelTraces,
+    unregisterPanel: unregisterPanelTelemetry,
+  } = useTelemetry();
+  // streamWorkspacesRef / streamWorkspaceRevisionsRef / daqNodeCardRefs /
+  // daqNodeFocusTimeoutRef now provided by StreamAnalysisContext (see
+  // destructure above).
+  // panelsRef now provided by PanelsContext (destructured above).
   const streamAnalysisReadyRef = useRef(false);
-  const telemetrySnapshotHydratedRef = useRef(false);
   const rawSnapshotHydratedRef = useRef<Set<string>>(new Set());
   const workspaceSnapshotHydratedRef = useRef<Set<string>>(new Set());
-  const isNarrowPlotViewport = viewportWidth <= PLOT_GRID_MOBILE_BREAKPOINT;
-  const plotGridStyle = useMemo<CSSProperties | undefined>(() => {
-    if (isNarrowPlotViewport) {
-      return { gridTemplateColumns: "1fr" };
-    }
-    if (plotWorkspaceColumns === "auto") {
-      return undefined;
-    }
-    return {
-      gridTemplateColumns: `repeat(${plotWorkspaceColumns}, minmax(0, 1fr))`,
-    };
-  }, [isNarrowPlotViewport, plotWorkspaceColumns]);
-  const dndSensors = useSensors(
-    useSensor(PointerSensor, {
-      activationConstraint: { distance: 6 },
-    }),
-    useSensor(TouchSensor, {
-      activationConstraint: { delay: 140, tolerance: 8 },
-    })
-  );
+  // isNarrowPlotViewport + plotGridStyle now provided by LayoutContext
+  // (destructured at the top of App()).
+  // dndSensors moved to useUiDragController (round 31).
 
   useEffect(() => {
     return () => {
@@ -892,23 +755,7 @@ export function App() {
     invalidateDeviceCapabilities,
   } = useDeviceCapabilitiesController(devices);
 
-  const orderedDevices = useMemo(() => {
-    const rank = new Map(deviceOrder.map((deviceId, idx) => [deviceId, idx]));
-    return [...devices].sort((a, b) => {
-      const aRank = rank.get(a.device_id);
-      const bRank = rank.get(b.device_id);
-      if (aRank != null && bRank != null && aRank !== bRank) {
-        return aRank - bRank;
-      }
-      if (aRank != null) {
-        return -1;
-      }
-      if (bRank != null) {
-        return 1;
-      }
-      return a.device_id.localeCompare(b.device_id);
-    });
-  }, [devices, deviceOrder]);
+  // orderedDevices now lives in DevicesContext (destructured above).
   const streamCatalogByKey = useMemo(() => {
     const out = new Map<string, StreamCatalogEntry>();
     for (const entry of streamCatalog) {
@@ -985,119 +832,134 @@ export function App() {
       ),
     [daqDraftNodes]
   );
-  const expandedPlotPanel = useMemo(
-    () => panels.find((panel) => panel.id === expandedPlotPanelId) ?? null,
-    [expandedPlotPanelId, panels]
-  );
-  const streamTraceOptionsPanel = useMemo(() => {
-    const panel = panels.find((entry) => entry.id === streamTraceOptionsPanelId) ?? null;
-    if (!panel || !isStreamTracePanel(panel)) {
-      return null;
-    }
-    return panel;
-  }, [panels, streamTraceOptionsPanelId]);
-  const streamTraceOptionsWorkspace = useMemo(() => {
-    if (!streamTraceOptionsPanel || streamTraceOptionsPanel.sourceMode !== "dag") {
-      return null;
-    }
-    return streamWorkspaces[streamTraceOptionsPanel.workspaceId] ?? null;
-  }, [streamTraceOptionsPanel, streamWorkspaces]);
-  const streamTraceOptionsTraceOutputOptions = useMemo(() => {
-    return workspaceOutputOptionsByKind(streamTraceOptionsWorkspace, "trace");
-  }, [streamTraceOptionsWorkspace]);
-  const streamTraceOptionsOverlayOutputOptions = useMemo(() => {
-    const selectedPrimary = String(streamTraceOptionsPanel?.outputId ?? "").trim();
-    return streamTraceOptionsTraceOutputOptions.filter(
-      (option) => option.value !== selectedPrimary
-    );
-  }, [streamTraceOptionsTraceOutputOptions, streamTraceOptionsPanel?.outputId]);
-  const streamBinStatsOptionsPanel = useMemo(() => {
-    const panel = panels.find((entry) => entry.id === streamBinStatsOptionsPanelId) ?? null;
-    if (!panel || !isStreamBinStatsPanel(panel)) {
-      return null;
-    }
-    return panel;
-  }, [panels, streamBinStatsOptionsPanelId]);
-  const streamBinStatsOptionsWorkspace = useMemo(() => {
-    if (!streamBinStatsOptionsPanel) {
-      return null;
-    }
-    return streamWorkspaces[streamBinStatsOptionsPanel.workspaceId] ?? null;
-  }, [streamBinStatsOptionsPanel, streamWorkspaces]);
-  const streamBinStatsOptionsOutputOptions = useMemo(() => {
-    return workspaceOutputOptionsByKind(streamBinStatsOptionsWorkspace, "hist_agg");
-  }, [streamBinStatsOptionsWorkspace]);
-  const streamBinStatsOptionsTraceOverlayOptions = useMemo(() => {
-    return workspaceOutputOptionsByKind(streamBinStatsOptionsWorkspace, "trace");
-  }, [streamBinStatsOptionsWorkspace]);
-  const streamBinStatsOptionsFitOverlayOptions = useMemo(() => {
-    return workspaceOutputOptionsByKind(streamBinStatsOptionsWorkspace, "fit_1d");
-  }, [streamBinStatsOptionsWorkspace]);
-  const streamBinStatsOptionsXLabel = useMemo(() => {
-    return workspaceXAxisLabel(
-      streamBinStatsOptionsWorkspace,
-      streamBinStatsOptionsPanel?.outputId ?? null
-    );
-  }, [streamBinStatsOptionsWorkspace, streamBinStatsOptionsPanel?.outputId]);
-  const streamParamsOptionsPanel = useMemo(() => {
-    const panel = panels.find((entry) => entry.id === streamParamsOptionsPanelId) ?? null;
-    if (!panel || !isStreamParamsPanel(panel)) {
-      return null;
-    }
-    return panel;
-  }, [panels, streamParamsOptionsPanelId]);
-  const streamParamsOptionsWorkspace = useMemo(() => {
-    if (!streamParamsOptionsPanel) {
-      return null;
-    }
-    return streamWorkspaces[streamParamsOptionsPanel.workspaceId] ?? null;
-  }, [streamParamsOptionsPanel, streamWorkspaces]);
-  const streamParamsOutputOptions = useMemo(() => {
-    const scalar = workspaceOutputOptionsByKind(streamParamsOptionsWorkspace, "scalar").map(
-      (item) => ({
-        value: item.value,
-        label: `[scalar] ${item.label}`,
-      })
-    );
-    const paramsMap = workspaceOutputOptionsByKind(
-      streamParamsOptionsWorkspace,
-      "params_map"
-    ).map((item) => ({
-      value: item.value,
-      label: `[fit params] ${item.label}`,
-    }));
-    return [...scalar, ...paramsMap];
-  }, [streamParamsOptionsWorkspace]);
-  const streamBin2dOptionsPanel = useMemo(() => {
-    const panel = panels.find((entry) => entry.id === streamBin2dOptionsPanelId) ?? null;
-    if (!panel || !isStreamBin2dPanel(panel)) {
-      return null;
-    }
-    return panel;
-  }, [panels, streamBin2dOptionsPanelId]);
-  const streamBin2dOptionsWorkspace = useMemo(() => {
-    if (!streamBin2dOptionsPanel) {
-      return null;
-    }
-    return streamWorkspaces[streamBin2dOptionsPanel.workspaceId] ?? null;
-  }, [streamBin2dOptionsPanel, streamWorkspaces]);
-  const streamBin2dOptionsOutputOptions = useMemo(() => {
-    return workspaceOutputOptionsByKind(streamBin2dOptionsWorkspace, "hist2d");
-  }, [streamBin2dOptionsWorkspace]);
-  const streamBin2dOptionsXLabel = useMemo(() => {
-    return workspaceBin2dAxisLabel(
-      streamBin2dOptionsWorkspace,
-      streamBin2dOptionsPanel?.outputId ?? null,
-      "x"
-    );
-  }, [streamBin2dOptionsWorkspace, streamBin2dOptionsPanel?.outputId]);
-  const streamBin2dOptionsYLabel = useMemo(() => {
-    return workspaceBin2dAxisLabel(
-      streamBin2dOptionsWorkspace,
-      streamBin2dOptionsPanel?.outputId ?? null,
-      "y"
-    );
-  }, [streamBin2dOptionsWorkspace, streamBin2dOptionsPanel?.outputId]);
+  // The 18-entry modal-resolution memo tree + the two subscription
+  // derivations all live in usePanelDerivations() (round-13 extraction
+  // — features/panels/usePanelDerivations.ts). Same names so existing
+  // call sites in App.tsx don't need touch-ups.
+  const {
+    expandedPlotPanel,
+    streamTraceOptionsPanel,
+    streamTraceOptionsWorkspace,
+    streamTraceOptionsTraceOutputOptions,
+    streamTraceOptionsOverlayOutputOptions,
+    streamBinStatsOptionsPanel,
+    streamBinStatsOptionsWorkspace,
+    streamBinStatsOptionsOutputOptions,
+    streamBinStatsOptionsTraceOverlayOptions,
+    streamBinStatsOptionsFitOverlayOptions,
+    streamBinStatsOptionsXLabel,
+    streamParamsOptionsPanel,
+    streamParamsOptionsWorkspace,
+    streamParamsOutputOptions,
+    streamBin2dOptionsPanel,
+    streamBin2dOptionsWorkspace,
+    streamBin2dOptionsOutputOptions,
+    streamBin2dOptionsXLabel,
+    streamBin2dOptionsYLabel,
+    activeRawStreamSubscriptions,
+    activeStreamAnalysisWorkspaceSubscriptions,
+  } = usePanelDerivations();
+
+  // Simple panel UI / Y-axis / modal-toggle handlers (round 15
+  // extraction). See features/panels/usePanelUiHandlers.ts for the
+  // hook body; names kept identical so existing call sites in App.tsx
+  // don't need touch-ups.
+  const {
+    setPanelYScaleMode,
+    setPanelManualYRange,
+    setTelemetryYDisplayMode,
+    setTelemetrySmoothingMode,
+    setTelemetrySmoothingWindow,
+    setStreamBinStatsUncertainty,
+    setStreamBinStatsShowBinMarkers,
+    setStreamBin2dReducer,
+    isExpandablePlotPanel,
+    openExpandedPlot,
+    closeExpandedPlot,
+    openStreamTraceOptionsModal,
+    closeStreamTraceOptionsModal,
+    openStreamBinStatsOptionsModal,
+    closeStreamBinStatsOptionsModal,
+    openStreamParamsOptionsModal,
+    closeStreamParamsOptionsModal,
+    openStreamBin2dOptionsModal,
+    closeStreamBin2dOptionsModal,
+  } = usePanelUiHandlers();
+
+  // Y-axis editor + auto-range handlers (round 16 extraction). See
+  // features/panels/usePanelAutoRangeHandlers.ts. Takes the simple
+  // Y-axis setters from usePanelUiHandlers as args so the
+  // state-mutation stays in one place.
+  const {
+    resolveTelemetryPanelOffset,
+    resolvePanelAutoYRange,
+    setTelemetryYOffsetMode,
+    openPlotOptions,
+    closePlotOptions,
+    applyPlotOptionsAxis,
+    setPlotOptionsAxisMode,
+  } = usePanelAutoRangeHandlers({
+    setPanelYScaleMode,
+    setPanelManualYRange,
+  });
+
+  // Per-panel stream-trace config setters + buffer-clear utilities
+  // (round 17). See features/panels/useStreamPanelHandlers.ts.
+  // Also restores setStreamPanelTarget which was accidentally removed
+  // in round 16.
+  const {
+    clearPanelBuffers,
+    clearStreamPanelFrames,
+    clearStreamBinStatsPanel,
+    clearStreamBin2dPanel,
+    clearWorkspaceBinPanels,
+    setStreamPanelTarget,
+    setStreamPanelTargetFromKey,
+    setStreamPanelOverlayCount,
+    setStreamPanelChannelIndex,
+    setStreamPanelTraceDecimator,
+    setStreamPanelTraceMaxPoints,
+    setStreamPanelTraceMaxFps,
+    setStreamPanelRollingWindow,
+    setStreamPanelAverageMode,
+  } = useStreamPanelHandlers({
+    streamCatalogByKey,
+    streamAnalysisReadyRef,
+  });
+
+  // Stream-trace source/workspace/output + stream-analysis panel
+  // workspace/output switches + binstats overlay/fit-overlay setters
+  // (round 18). See features/panels/useStreamWorkspaceHandlers.ts.
+  // Takes clearPanelBuffers from useStreamPanelHandlers because the
+  // workspace switches clear accumulated buffers on scalar panels.
+  const {
+    setStreamTracePanelSourceMode,
+    setStreamTracePanelWorkspace,
+    setStreamTracePanelOutput,
+    setStreamTracePanelOverlayOutputs,
+    setStreamAnalysisPanelWorkspace,
+    setStreamAnalysisPanelOutput,
+    setStreamParamsPanelOutputs,
+    setStreamBinStatsOverlayOutputs,
+    setStreamBinStatsFitOverlayOutputs,
+  } = useStreamWorkspaceHandlers({
+    clearPanelBuffers,
+  });
+
+  // Overlay-series helpers (round 16 extraction). The render loop +
+  // applyPlotOptionsAxis both use these; the pure functions live in
+  // features/panels/overlayHelpers.ts. App.tsx wraps them with the
+  // local overlay refs already destructured from TelemetryContext so
+  // call sites keep the same panel-only signature they had before.
+  const streamTraceOverlaySeries = (
+    panel: Parameters<typeof streamTraceOverlaySeriesImpl>[0]
+  ) => streamTraceOverlaySeriesImpl(panel, streamTraceOverlayRef);
+  const streamBinStatsOverlaySeries = (
+    panel: Parameters<typeof streamBinStatsOverlaySeriesImpl>[0]
+  ) => streamBinStatsOverlaySeriesImpl(panel, streamBinStatsOverlayRef);
+  const streamBinStatsFitOverlayCurves = (
+    panel: Parameters<typeof streamBinStatsFitOverlayCurvesImpl>[0]
+  ) => streamBinStatsFitOverlayCurvesImpl(panel, streamBinStatsFitOverlayRef);
   const hdfWriterProcess = useMemo(
     () => processes.find(isHdfWriterProcess) ?? null,
     [processes]
@@ -1122,239 +984,9 @@ export function App() {
   const streamAnalysisRpcReady =
     String(streamAnalysisProcess?.state ?? "").toUpperCase() === "RUNNING";
   const showDaqUi = streamAnalysisRpcReady;
-  const activeRawStreamSubscriptions = useMemo<RawStreamSubscription[]>(() => {
-    const out = new Map<string, RawStreamSubscription>();
-    for (const panel of panels) {
-      if (!isStreamTracePanel(panel) || panel.sourceMode !== "raw" || panel.stream === null) {
-        continue;
-      }
-      const traceDecimator = normalizeTraceDecimator(panel.traceDecimator);
-      const traceMaxPoints = normalizeTraceMaxPoints(panel.traceMaxPoints);
-      const traceMaxFps = normalizeTraceMaxFps(panel.traceMaxFps);
-      const rollingWindow = normalizeTraceRollingWindow(panel.rollingWindow);
-      const averageMode = normalizeTraceAverageMode(panel.averageMode);
-      const key = [
-        panel.stream.deviceId,
-        panel.stream.stream,
-        String(panel.channelIndex),
-        traceDecimator,
-        String(traceMaxPoints),
-        traceMaxFps.toFixed(3),
-        String(rollingWindow),
-        averageMode,
-      ].join("|");
-      out.set(key, {
-        deviceId: panel.stream.deviceId,
-        stream: panel.stream.stream,
-        channelIndex: panel.channelIndex,
-        traceDecimator,
-        traceMaxPoints,
-        traceMaxFps,
-        rollingWindow,
-        averageMode,
-      });
-    }
-    return [...out.values()].sort((a, b) => {
-      if (a.deviceId !== b.deviceId) {
-        return a.deviceId.localeCompare(b.deviceId);
-      }
-      if (a.stream !== b.stream) {
-        return a.stream.localeCompare(b.stream);
-      }
-      if (a.channelIndex !== b.channelIndex) {
-        return a.channelIndex - b.channelIndex;
-      }
-      if (a.traceDecimator !== b.traceDecimator) {
-        return a.traceDecimator.localeCompare(b.traceDecimator);
-      }
-      if (a.traceMaxPoints !== b.traceMaxPoints) {
-        return a.traceMaxPoints - b.traceMaxPoints;
-      }
-      if (a.traceMaxFps !== b.traceMaxFps) {
-        return a.traceMaxFps - b.traceMaxFps;
-      }
-      if (a.rollingWindow !== b.rollingWindow) {
-        return a.rollingWindow - b.rollingWindow;
-      }
-      return a.averageMode.localeCompare(b.averageMode);
-    });
-  }, [panels]);
-  const activeStreamAnalysisWorkspaceSubscriptions = useMemo<
-    StreamAnalysisWorkspaceSubscription[]
-  >(() => {
-    const outputKindsByWorkspace = new Map<
-      string,
-      Set<"scalar" | "hist_agg" | "hist2d" | "params_map" | "fit_1d">
-    >();
-    const traceConfigsByWorkspace = new Map<
-      string,
-      Map<
-        string,
-        {
-          traceDecimator: StreamTraceDecimator;
-          traceMaxPoints: number;
-          traceMaxFps: number;
-          traceRollingWindow: number;
-          traceAverageMode: StreamTraceAverageMode;
-        }
-      >
-    >();
-    for (const panel of panels) {
-      const workspaceId = String(panel.workspaceId ?? "").trim();
-      if (!workspaceId) {
-        continue;
-      }
-      if (isStreamScalarPanel(panel)) {
-        const kinds = outputKindsByWorkspace.get(workspaceId) ?? new Set();
-        kinds.add("scalar");
-        outputKindsByWorkspace.set(workspaceId, kinds);
-        continue;
-      }
-      if (isStreamParamsPanel(panel)) {
-        const kinds = outputKindsByWorkspace.get(workspaceId) ?? new Set();
-        const workspace = streamWorkspaces[workspaceId] ?? null;
-        for (const outputId of panel.outputIds ?? []) {
-          const kind = workspaceOutputKind(workspace, outputId);
-          if (kind === "scalar" || kind === "params_map") {
-            kinds.add(kind);
-          }
-        }
-        outputKindsByWorkspace.set(workspaceId, kinds);
-        continue;
-      }
-      if (isStreamBinStatsPanel(panel)) {
-        const kinds = outputKindsByWorkspace.get(workspaceId) ?? new Set();
-        kinds.add("hist_agg");
-        if ((panel.fitOverlayOutputIds ?? []).length > 0) {
-          kinds.add("fit_1d");
-        }
-        outputKindsByWorkspace.set(workspaceId, kinds);
-        if ((panel.overlayOutputIds ?? []).length > 0) {
-          const configs = traceConfigsByWorkspace.get(workspaceId) ?? new Map();
-          const traceDecimator = DEFAULT_TRACE_DECIMATOR;
-          const traceMaxPoints = DEFAULT_TRACE_MAX_POINTS;
-          const traceMaxFps = DEFAULT_TRACE_MAX_FPS;
-          const traceRollingWindow = 1;
-          const traceAverageMode = DEFAULT_TRACE_AVERAGE_MODE;
-          const key = `${traceDecimator}|${traceMaxPoints}|${traceMaxFps.toFixed(3)}|${traceRollingWindow}|${traceAverageMode}`;
-          configs.set(key, {
-            traceDecimator,
-            traceMaxPoints,
-            traceMaxFps,
-            traceRollingWindow,
-            traceAverageMode,
-          });
-          traceConfigsByWorkspace.set(workspaceId, configs);
-        }
-        continue;
-      }
-      if (isStreamBin2dPanel(panel)) {
-        const kinds = outputKindsByWorkspace.get(workspaceId) ?? new Set();
-        kinds.add("hist2d");
-        outputKindsByWorkspace.set(workspaceId, kinds);
-        continue;
-      }
-      if (isStreamTracePanel(panel) && panel.sourceMode === "dag") {
-        const configs = traceConfigsByWorkspace.get(workspaceId) ?? new Map();
-        const traceDecimator = normalizeTraceDecimator(panel.traceDecimator);
-        const traceMaxPoints = normalizeTraceMaxPoints(panel.traceMaxPoints);
-        const traceMaxFps = normalizeTraceMaxFps(panel.traceMaxFps);
-        const traceRollingWindow = normalizeTraceRollingWindow(panel.rollingWindow);
-        const traceAverageMode = normalizeTraceAverageMode(panel.averageMode);
-        const key = `${traceDecimator}|${traceMaxPoints}|${traceMaxFps.toFixed(3)}|${traceRollingWindow}|${traceAverageMode}`;
-        configs.set(key, {
-          traceDecimator,
-          traceMaxPoints,
-          traceMaxFps,
-          traceRollingWindow,
-          traceAverageMode,
-        });
-        traceConfigsByWorkspace.set(workspaceId, configs);
-      }
-    }
-    const workspaceIds = new Set<string>([
-      ...outputKindsByWorkspace.keys(),
-      ...traceConfigsByWorkspace.keys(),
-    ]);
-    const out: StreamAnalysisWorkspaceSubscription[] = [];
-    for (const workspaceId of [...workspaceIds].sort()) {
-      const outputKinds = outputKindsByWorkspace.get(workspaceId);
-      if (outputKinds && outputKinds.size > 0) {
-        const kinds = [...outputKinds].sort() as Array<
-          "scalar" | "hist_agg" | "hist2d" | "params_map" | "fit_1d"
-        >;
-        out.push({
-          workspaceId,
-          kinds,
-        });
-      }
-      const traceConfigs = traceConfigsByWorkspace.get(workspaceId);
-      if (traceConfigs && traceConfigs.size > 0) {
-        const sortedConfigs = [...traceConfigs.values()].sort((a, b) => {
-          if (a.traceDecimator !== b.traceDecimator) {
-            return a.traceDecimator.localeCompare(b.traceDecimator);
-          }
-          if (a.traceMaxPoints !== b.traceMaxPoints) {
-            return a.traceMaxPoints - b.traceMaxPoints;
-          }
-          if (a.traceMaxFps !== b.traceMaxFps) {
-            return a.traceMaxFps - b.traceMaxFps;
-          }
-          if (a.traceRollingWindow !== b.traceRollingWindow) {
-            return a.traceRollingWindow - b.traceRollingWindow;
-          }
-          return a.traceAverageMode.localeCompare(b.traceAverageMode);
-        });
-        for (const cfg of sortedConfigs) {
-          out.push({
-            workspaceId,
-            kinds: ["trace"],
-            traceDecimator: cfg.traceDecimator,
-            traceMaxPoints: cfg.traceMaxPoints,
-            traceMaxFps: cfg.traceMaxFps,
-            traceRollingWindow: cfg.traceRollingWindow,
-            traceAverageMode: cfg.traceAverageMode,
-          });
-        }
-      }
-    }
-    return out;
-  }, [panels, streamWorkspaces]);
-  const filteredLogRows = useMemo(() => {
-    const needle = logTextFilter.trim().toLowerCase();
-    return logRows.filter((entry) => {
-      const severity = String(entry.severity ?? "").toLowerCase();
-      if (logSeverityFilter !== "all" && severity !== logSeverityFilter) {
-        return false;
-      }
-      const sourceKind = String(entry.source_kind ?? "").toLowerCase();
-      if (logSourceFilter !== "all" && sourceKind !== logSourceFilter) {
-        return false;
-      }
-      const deviceId = String(entry.device_id ?? "");
-      if (logDeviceFilter !== "all" && deviceId !== logDeviceFilter) {
-        return false;
-      }
-      const processId = String(entry.process_id ?? "");
-      if (logProcessFilter !== "all" && processId !== logProcessFilter) {
-        return false;
-      }
-      if (!needle) {
-        return true;
-      }
-      const haystack = `${entry.topic ?? ""} ${entry.message ?? ""} ${
-        entry.payload_json ?? ""
-      }`.toLowerCase();
-      return haystack.includes(needle);
-    });
-  }, [
-    logRows,
-    logSeverityFilter,
-    logSourceFilter,
-    logDeviceFilter,
-    logProcessFilter,
-    logTextFilter,
-  ]);
+  // activeRawStreamSubscriptions + activeStreamAnalysisWorkspaceSubscriptions
+  // now live in usePanelDerivations() (destructured above).
+  // filteredLogRows now lives in LogsContext (destructured above).
   const resolvedApiBase = useMemo(() => {
     const configured = String(import.meta.env.VITE_API_BASE ?? "").trim();
     if (configured) {
@@ -1380,362 +1012,24 @@ export function App() {
     return value.length > 0 ? value : "unknown";
   }, [gatewaySettings]);
 
-  const refreshDevices = async () => {
-    const next = await fetchDevices();
-    setDevices(next);
-    return next;
-  };
-
-  const refreshStreams = async () => {
-    return fetchStreams();
-  };
-
-  const loadGatewayRuntimeSettings = async () => {
-    setSettingsLoading(true);
-    setSettingsError(null);
-    try {
-      const next = await fetchGatewaySettings();
-      if (next === null) {
-        setSettingsError("Could not fetch gateway settings.");
-        return null;
-      }
-      setGatewaySettings(next);
-      return next;
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      setSettingsError(message);
-      return null;
-    } finally {
-      setSettingsLoading(false);
-    }
-  };
-
-  const refreshInstanceRuntime = async () => {
-    setInstanceRuntimeLoading(true);
-    setInstanceRuntimeError(null);
-    try {
-      const next = await fetchInstanceRuntimeStatus();
-      if (next === null) {
-        setInstanceRuntimeError("Could not fetch instance runtime status.");
-        return null;
-      }
-      setInstanceRuntimeStatus(next);
-      return next;
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      setInstanceRuntimeError(message);
-      return null;
-    } finally {
-      setInstanceRuntimeLoading(false);
-    }
-  };
+  // Runtime / settings / device-list refreshers (round 27). See
+  // features/runtime/useRuntimeRefreshers.ts. Five thin async wrappers
+  // around the corresponding API endpoints, sharing the same loading
+  // / error-state surface in SettingsContext.
+  const {
+    refreshDevices,
+    refreshStreams,
+    loadGatewayRuntimeSettings,
+    refreshInstanceRuntime,
+    runInstanceCleanup,
+  } = useRuntimeRefreshers();
 
   useEffect(() => {
     void refreshInstanceRuntime();
   }, []);
 
-  const runInstanceCleanup = async (
-    dryRun: boolean
-  ): Promise<Record<string, unknown> | null> => {
-    setInstanceCleanupBusy(true);
-    try {
-      const resp = await cleanupInstanceOrphans({
-        dry_run: dryRun,
-        stale_only: true,
-        timeout_s: 2.0,
-      });
-      if (!resp.ok) {
-        const message =
-          typeof resp.error?.message === "string" && resp.error.message.trim().length > 0
-            ? resp.error.message
-            : "Cleanup request failed.";
-        notifications.show({
-          color: "red",
-          title: "Instance cleanup failed",
-          message,
-        });
-        await refreshInstanceRuntime();
-        return null;
-      }
-      const result =
-        resp.result && typeof resp.result === "object"
-          ? (resp.result as Record<string, unknown>)
-          : null;
-      const matchedRaw = result?.matched;
-      const matched =
-        typeof matchedRaw === "number" && Number.isFinite(matchedRaw)
-          ? Math.trunc(matchedRaw)
-          : 0;
-      const terminated = Array.isArray(result?.terminated) ? result.terminated.length : 0;
-      const failed = Array.isArray(result?.failed) ? result.failed.length : 0;
-      notifications.show({
-        color: dryRun ? "blue" : failed > 0 ? "yellow" : "teal",
-        title: dryRun ? "Orphan cleanup dry-run" : "Orphan cleanup executed",
-        message: `matched=${matched} terminated=${terminated} failed=${failed}`,
-      });
-      await refreshInstanceRuntime();
-      return result;
-    } catch (error) {
-      notifications.show({
-        color: "red",
-        title: "Instance cleanup failed",
-        message: error instanceof Error ? error.message : String(error),
-      });
-      await refreshInstanceRuntime();
-      return null;
-    } finally {
-      setInstanceCleanupBusy(false);
-    }
-  };
-
-  const exportUiProfile = () => {
-    try {
-      const serializedPlotState = serializePlotState({ panels, activePanelId });
-      const profile: UiProfileFile = {
-        kind: "experiment-control-ui-profile",
-        version: 1,
-        exported_at: new Date().toISOString(),
-        layout: {
-          nav_width: navWidth,
-          device_panel_collapsed: isDevicePanelCollapsed,
-          device_panel_tab: devicePanelTab,
-          plot_workspace_columns: plotWorkspaceColumns,
-          device_order: [...deviceOrder],
-          telemetry_collapsed_by_device: { ...telemetryCollapsedByDevice },
-        },
-        plots: {
-          plot_state: serializedPlotState,
-        },
-        commands: {
-          pinned_commands: { ...pinnedCommands },
-          command_deck: [...commandDeck],
-          command_deck_collapsed_by_group: { ...commandDeckCollapsedByGroup },
-        },
-        analysis: {
-          stream_workspaces: { ...streamWorkspaces },
-        },
-      };
-      const text = JSON.stringify(profile, null, 2);
-      const now = new Date();
-      const stamp = `${now.getFullYear()}_${String(
-        now.getMonth() + 1
-      ).padStart(2, "0")}_${String(now.getDate()).padStart(2, "0")}-${String(
-        now.getHours()
-      ).padStart(2, "0")}_${String(now.getMinutes()).padStart(
-        2,
-        "0"
-      )}_${String(now.getSeconds()).padStart(2, "0")}`;
-      const filename = `ec_ui_profile_${stamp}.json`;
-      const blob = new Blob([text], { type: "application/json" });
-      const url = URL.createObjectURL(blob);
-      const link = document.createElement("a");
-      link.href = url;
-      link.download = filename;
-      document.body.appendChild(link);
-      link.click();
-      link.remove();
-      URL.revokeObjectURL(url);
-      notifications.show({
-        color: "teal",
-        title: "UI profile exported",
-        message: filename,
-      });
-    } catch (error) {
-      notifications.show({
-        color: "red",
-        title: "Export failed",
-        message: error instanceof Error ? error.message : String(error),
-      });
-    }
-  };
-
-  const applyUiProfileRaw = async (
-    raw: unknown,
-    opts: { sourceLabel: string; syncSource: string },
-  ): Promise<void> => {
-    const { sourceLabel, syncSource } = opts;
-    const profile = normalizeUiProfile(raw, {
-      defaultNavWidth: DEFAULT_NAV_WIDTH,
-      navMin: NAV_MIN_WIDTH,
-      navMax: NAV_MAX_WIDTH,
-      normalizePlotState,
-      normalizeStreamWorkspaceRecord,
-    });
-    if (!profile) {
-      throw new Error("Invalid UI profile format.");
-    }
-    panelIdRef.current = profile.plotState.nextPanelId;
-    setNavWidth(profile.navWidth);
-    setDevicePanelCollapsed(profile.devicePanelCollapsed);
-    setDevicePanelTab(profile.devicePanelTab);
-    setPlotWorkspaceColumns(profile.plotWorkspaceColumns);
-    setPanels(profile.plotState.panels);
-    setActivePanelId(profile.plotState.activePanelId);
-    setDeviceOrder(profile.deviceOrder);
-    setTelemetryCollapsedByDevice(profile.telemetryCollapsedByDevice);
-    setPinnedCommands(profile.pinnedCommands);
-    setCommandDeck(profile.commandDeck);
-    setCommandDeckCollapsedByGroup(profile.commandDeckCollapsedByGroup);
-    {
-      const migratedFromPanels: Record<string, StreamAnalysisWorkspaceConfig> = {};
-      for (const panel of profile.plotState.panels) {
-        if (!isStreamScalarPanel(panel) && !isStreamBinStatsPanel(panel)) {
-          continue;
-        }
-        const workspaceId = String(panel.workspaceId ?? "").trim();
-        if (!workspaceId || migratedFromPanels[workspaceId]) {
-          continue;
-        }
-        migratedFromPanels[workspaceId] = workspaceFromLegacyPanel(panel);
-      }
-      const importedWorkspaces =
-        Object.keys(profile.streamWorkspaces).length > 0
-          ? profile.streamWorkspaces
-          : Object.keys(migratedFromPanels).length > 0
-          ? migratedFromPanels
-          : streamWorkspacesRef.current;
-      setStreamWorkspaces(importedWorkspaces);
-      streamWorkspacesRef.current = importedWorkspaces;
-      setStreamWorkspaceRevisions({});
-      streamWorkspaceRevisionsRef.current = {};
-      streamWorkspaceIdRef.current = nextWorkspaceCounter(importedWorkspaces);
-      const firstWorkspaceId = Object.keys(importedWorkspaces).sort()[0] ?? null;
-      setDaqWorkspaceId(firstWorkspaceId);
-      if (streamAnalysisReadyRef.current) {
-        for (const workspaceId of Object.keys(importedWorkspaces)) {
-          await syncStreamAnalysisWorkspace(workspaceId, syncSource);
-        }
-        await loadStreamAnalysisWorkspaces(syncSource, {
-          notifyOnError: false,
-        });
-      }
-    }
-    notifications.show({
-      color: "teal",
-      title: "UI profile loaded",
-      message: sourceLabel,
-    });
-  };
-
-  const importUiProfile = async (event: ChangeEvent<HTMLInputElement>) => {
-    const file = event.currentTarget.files?.[0];
-    event.currentTarget.value = "";
-    if (!file) {
-      return;
-    }
-    try {
-      const rawText = await file.text();
-      const raw = JSON.parse(rawText);
-      await applyUiProfileRaw(raw, {
-        sourceLabel: file.name,
-        syncSource: "ui-profile-import",
-      });
-    } catch (error) {
-      notifications.show({
-        color: "red",
-        title: "Import failed",
-        message: error instanceof Error ? error.message : String(error),
-      });
-    }
-  };
-
-  const [defaultProfileAvailable, setDefaultProfileAvailable] = useState(false);
-  const [defaultProfileLoading, setDefaultProfileLoading] = useState(false);
-  const defaultProfileCheckedRef = useRef(false);
-
-  const loadDefaultUiProfile = async (): Promise<boolean> => {
-    setDefaultProfileLoading(true);
-    try {
-      const result = await fetchDefaultUiProfile();
-      if (!result.ok) {
-        if (result.status === 404) {
-          setDefaultProfileAvailable(false);
-          notifications.show({
-            color: "yellow",
-            title: "No default profile",
-            message:
-              "This instance does not provide a default UI profile.",
-          });
-          return false;
-        }
-        notifications.show({
-          color: "red",
-          title: "Default profile load failed",
-          message: result.error,
-        });
-        return false;
-      }
-      await applyUiProfileRaw(result.raw, {
-        sourceLabel: "instance default",
-        syncSource: "ui-profile-default",
-      });
-      return true;
-    } catch (error) {
-      notifications.show({
-        color: "red",
-        title: "Default profile load failed",
-        message: error instanceof Error ? error.message : String(error),
-      });
-      return false;
-    } finally {
-      setDefaultProfileLoading(false);
-    }
-  };
-
-  useEffect(() => {
-    if (defaultProfileCheckedRef.current) {
-      return;
-    }
-    defaultProfileCheckedRef.current = true;
-    let alive = true;
-    void (async () => {
-      const result = await fetchDefaultUiProfile();
-      if (!alive) {
-        return;
-      }
-      if (!result.ok) {
-        setDefaultProfileAvailable(false);
-        return;
-      }
-      setDefaultProfileAvailable(true);
-      const customizationKeys = [
-        "ecui.commandDeck",
-        "ecui.commandDeck.collapsedByGroup",
-        "ecui.plotState",
-        "ecui.pinnedCommands",
-        "ecui.streamWorkspaces",
-        "ecui.deviceOrder",
-        "ecui.telemetryCollapsedByDevice",
-      ];
-      const hasCustomization = customizationKeys.some((key) => {
-        const raw = localStorage.getItem(key);
-        if (raw === null) {
-          return false;
-        }
-        const trimmed = raw.trim();
-        if (!trimmed) {
-          return false;
-        }
-        if (trimmed === "{}" || trimmed === "[]") {
-          return false;
-        }
-        return true;
-      });
-      if (hasCustomization) {
-        return;
-      }
-      notifications.show({
-        color: "blue",
-        title: "Instance default UI profile available",
-        message:
-          "Open Settings → Load instance defaults to populate the command deck and plot workspaces.",
-        autoClose: 8000,
-      });
-    })();
-    return () => {
-      alive = false;
-    };
-  }, []);
+  // UI profile import/export is wired below — see the useUiProfile
+  // call after setDevicePanelCollapsed is defined (round 29).
 
   const appendLogEntries = (entries: LogEntry[]) => {
     if (entries.length === 0) {
@@ -1908,77 +1202,14 @@ export function App() {
     }
   }, [commandDeckCollapsedByGroup]);
 
-  useEffect(() => {
-    setPinnedParamDrafts((prev) => {
-      const next: PinnedParamDrafts = { ...prev };
-      const validKeys = new Set<string>();
-      let changed = false;
-      for (const [deviceId, entries] of Object.entries(pinnedCommands)) {
-        const capabilities = capabilitiesByDevice[deviceId] ?? [];
-        for (const entry of entries) {
-          const key = pinnedCommandKey(deviceId, entry.action);
-          validKeys.add(key);
-          const member = capabilities.find(
-            (capability) => capability.name === entry.action
-          );
-          const params = member?.params ?? [];
-          if (params.length === 0) {
-            const current = next[key] ?? {};
-            if (Object.keys(current).length > 0) {
-              next[key] = {};
-              changed = true;
-            } else if (!(key in next)) {
-              next[key] = {};
-              changed = true;
-            }
-            continue;
-          }
-          const defaults = buildParamDefaults(member);
-          const current = next[key] ?? {};
-          const merged: Record<string, string> = {};
-          for (const param of params) {
-            const paramName = param.name;
-            if (typeof current[paramName] === "string") {
-              merged[paramName] = current[paramName];
-            } else {
-              merged[paramName] = defaults[paramName] ?? "";
-            }
-          }
-          if (!sameStringRecord(current, merged)) {
-            next[key] = merged;
-            changed = true;
-          } else if (!(key in next)) {
-            next[key] = merged;
-            changed = true;
-          }
-        }
-      }
-      for (const key of Object.keys(next)) {
-        if (!validKeys.has(key)) {
-          delete next[key];
-          changed = true;
-        }
-      }
-      return changed ? next : prev;
-    });
-    setPinnedBusyByKey((prev) => {
-      const next = { ...prev };
-      const valid = new Set<string>();
-      for (const [deviceId, entries] of Object.entries(pinnedCommands)) {
-        for (const entry of entries) {
-          valid.add(pinnedCommandKey(deviceId, entry.action));
-        }
-      }
-      let changed = false;
-      for (const key of Object.keys(next)) {
-        if (!valid.has(key)) {
-          delete next[key];
-          changed = true;
-        }
-      }
-      return changed ? next : prev;
-    });
-  }, [pinnedCommands, capabilitiesByDevice]);
+  // Pinned-params draft reconciliation moved to
+  // features/commands/usePinnedParamsReconciler.ts (round 32).
+  usePinnedParamsReconciler({
+    pinnedCommands,
+    capabilitiesByDevice,
+    setPinnedParamDrafts,
+    setPinnedBusyByKey,
+  });
 
   useEffect(() => {
     commandDeckIdRef.current = Math.max(
@@ -2065,17 +1296,8 @@ export function App() {
     }
   }, [plotWorkspaceColumns]);
 
-  useEffect(() => {
-    try {
-      const serializedPlotState = serializePlotState({ panels, activePanelId });
-      localStorage.setItem(
-        "ecui.plotState",
-        JSON.stringify(serializedPlotState)
-      );
-    } catch {
-      // ignore storage errors
-    }
-  }, [panels, activePanelId]);
+  // panels/activePanelId autosave to ecui.plotState now lives in
+  // PanelsContext. panelsRef sync also moved there.
 
   useEffect(() => {
     try {
@@ -2087,10 +1309,6 @@ export function App() {
       // ignore storage errors
     }
   }, [streamWorkspaces]);
-
-  useEffect(() => {
-    panelsRef.current = panels;
-  }, [panels]);
 
   useEffect(() => {
     streamWorkspacesRef.current = streamWorkspaces;
@@ -2117,129 +1335,9 @@ export function App() {
     }
   }, [streamWorkspaces, daqWorkspaceId]);
 
-  useEffect(() => {
-    setPanels((prev) => {
-      let changed = false;
-      const next = prev.map((panel) => {
-        if (isStreamTracePanel(panel) && panel.sourceMode === "dag") {
-          const workspace = streamWorkspaces[panel.workspaceId] ?? null;
-          const validTraceOutputIds = new Set(
-            workspace?.publishOutputs
-              .filter((entry) => workspaceOutputKind(workspace, entry.outputId) === "trace")
-              .map((entry) => entry.outputId) ?? []
-          );
-          const outputId =
-            panel.outputId &&
-            workspace &&
-            workspaceOutputKind(workspace, panel.outputId) === "trace"
-              ? panel.outputId
-              : defaultOutputForKind(workspace, "trace");
-          const overlayOutputIds = (panel.overlayOutputIds ?? []).filter(
-            (id) => id !== outputId && validTraceOutputIds.has(id)
-          );
-          const currentStreamKey = panel.stream
-            ? streamTargetKey(panel.stream.deviceId, panel.stream.stream)
-            : "";
-          const workspaceStreamKey = workspace?.stream
-            ? streamTargetKey(workspace.stream.deviceId, workspace.stream.stream)
-            : "";
-          const streamChanged = currentStreamKey !== workspaceStreamKey;
-          const channelChanged = panel.channelIndex !== (workspace?.channelIndex ?? panel.channelIndex);
-          const outputChanged = panel.outputId !== outputId;
-          const overlayChanged = !sameStringArray(panel.overlayOutputIds ?? [], overlayOutputIds);
-          if (!streamChanged && !channelChanged && !outputChanged && !overlayChanged) {
-            return panel;
-          }
-          changed = true;
-          return {
-            ...panel,
-            outputId,
-            overlayOutputIds,
-            stream: workspace?.stream ?? panel.stream,
-            channelIndex: workspace?.channelIndex ?? panel.channelIndex,
-          };
-        }
-        if (isStreamScalarPanel(panel)) {
-          if (panel.outputId) {
-            return panel;
-          }
-          const workspace = streamWorkspaces[panel.workspaceId] ?? null;
-          const outputId = defaultOutputForKind(workspace, "scalar");
-          if (!outputId) {
-            return panel;
-          }
-          changed = true;
-          return { ...panel, outputId };
-        }
-        if (isStreamParamsPanel(panel)) {
-          const workspace = streamWorkspaces[panel.workspaceId] ?? null;
-          if (!workspace) {
-            return panel;
-          }
-          const validOutputIds = new Set(
-            workspaceOutputOptionsByKind(workspace, "scalar").map((item) => item.value)
-          );
-          for (const item of workspaceOutputOptionsByKind(workspace, "params_map")) {
-            validOutputIds.add(item.value);
-          }
-          const outputIds = (panel.outputIds ?? []).filter((id) => validOutputIds.has(id));
-          if (sameStringArray(panel.outputIds ?? [], outputIds)) {
-            return panel;
-          }
-          changed = true;
-          return { ...panel, outputIds };
-        }
-        if (isStreamBinStatsPanel(panel)) {
-          const workspace = streamWorkspaces[panel.workspaceId] ?? null;
-          if (!workspace) {
-            return panel;
-          }
-          const outputId =
-            panel.outputId &&
-            workspaceOutputKind(workspace, panel.outputId) === "hist_agg"
-              ? panel.outputId
-              : defaultOutputForKind(workspace, "hist_agg");
-          const validTraceOutputIds = new Set(
-            workspaceOutputOptionsByKind(workspace, "trace").map((item) => item.value)
-          );
-          const validFitOutputIds = new Set(
-            workspaceOutputOptionsByKind(workspace, "fit_1d").map((item) => item.value)
-          );
-          const overlayOutputIds = (panel.overlayOutputIds ?? []).filter((id) =>
-            validTraceOutputIds.has(id)
-          );
-          const fitOverlayOutputIds = (panel.fitOverlayOutputIds ?? []).filter((id) =>
-            validFitOutputIds.has(id)
-          );
-          const outputChanged = panel.outputId !== outputId;
-          const overlayChanged = !sameStringArray(panel.overlayOutputIds ?? [], overlayOutputIds);
-          const fitOverlayChanged = !sameStringArray(
-            panel.fitOverlayOutputIds ?? [],
-            fitOverlayOutputIds
-          );
-          if (!outputChanged && !overlayChanged && !fitOverlayChanged) {
-            return panel;
-          }
-          changed = true;
-          return { ...panel, outputId, overlayOutputIds, fitOverlayOutputIds };
-        }
-        if (isStreamBin2dPanel(panel)) {
-          if (panel.outputId) {
-            return panel;
-          }
-          const workspace = streamWorkspaces[panel.workspaceId] ?? null;
-          const outputId = defaultOutputForKind(workspace, "hist2d");
-          if (!outputId) {
-            return panel;
-          }
-          changed = true;
-          return { ...panel, outputId };
-        }
-        return panel;
-      });
-      return changed ? next : prev;
-    });
-  }, [streamWorkspaces]);
+  // Stream-workspace → panel output reconciliation moved to
+  // features/panels/useStreamWorkspacePanelReconciler.ts (round 32).
+  useStreamWorkspacePanelReconciler();
 
   useEffect(() => {
     const wasReady = streamAnalysisReadyRef.current;
@@ -2257,61 +1355,7 @@ export function App() {
     });
   }, [streamAnalysisRpcReady]);
 
-  useEffect(() => {
-    if (!isResizing || isDevicePanelCollapsed) {
-      return;
-    }
-    const handleMove = (event: PointerEvent) => {
-      if (!resizeRef.current) {
-        return;
-      }
-      const delta = event.clientX - resizeRef.current.startX;
-      const proposed = resizeRef.current.startWidth + delta;
-      const max = Math.min(NAV_MAX_WIDTH, window.innerWidth - 320);
-      const safeMax = Math.max(NAV_MIN_WIDTH, max);
-      const nextWidth = Math.max(NAV_MIN_WIDTH, Math.min(safeMax, proposed));
-      resizePendingWidthRef.current = nextWidth;
-      if (resizeRafRef.current !== null) {
-        return;
-      }
-      resizeRafRef.current = window.requestAnimationFrame(() => {
-        resizeRafRef.current = null;
-        const pending = resizePendingWidthRef.current;
-        if (pending == null) {
-          return;
-        }
-        setNavWidth(pending);
-      });
-    };
-    const handleUp = () => {
-      if (resizeRafRef.current !== null) {
-        window.cancelAnimationFrame(resizeRafRef.current);
-        resizeRafRef.current = null;
-      }
-      const pending = resizePendingWidthRef.current;
-      resizePendingWidthRef.current = null;
-      if (pending != null) {
-        setNavWidth(pending);
-      }
-      resizeRef.current = null;
-      setIsResizing(false);
-    };
-    window.addEventListener("pointermove", handleMove);
-    window.addEventListener("pointerup", handleUp);
-    document.body.style.cursor = "col-resize";
-    document.body.style.userSelect = "none";
-    return () => {
-      window.removeEventListener("pointermove", handleMove);
-      window.removeEventListener("pointerup", handleUp);
-      if (resizeRafRef.current !== null) {
-        window.cancelAnimationFrame(resizeRafRef.current);
-        resizeRafRef.current = null;
-      }
-      resizePendingWidthRef.current = null;
-      document.body.style.cursor = "";
-      document.body.style.userSelect = "";
-    };
-  }, [isResizing, isDevicePanelCollapsed]);
+  // Resize-while-dragging window listeners moved to useNavResizer (round 31).
 
   useEffect(() => {
     const handleResize = () => {
@@ -2431,6 +1475,26 @@ export function App() {
         streamBin2dRef.delete(panel.id);
       }
     }
+    // P5: keep the trace-key reverse index in sync with the current panel
+    // set so the telemetry message handler can route O(1) per signal
+    // instead of walking buffersRef.values() per message. Telemetry
+    // panels register their (deviceId:signal) trace keys; other panel
+    // kinds and removed panels unregister.
+    const seenPanelIds = new Set<string>();
+    for (const panel of panels) {
+      if (isTelemetryPanel(panel)) {
+        const traceKeys = panel.traces.map(
+          (trace) => `${trace.deviceId}:${trace.signal}`
+        );
+        registerPanelTraces(panel.id, traceKeys);
+        seenPanelIds.add(panel.id);
+      }
+    }
+    for (const id of ids) {
+      if (!seenPanelIds.has(id)) {
+        unregisterPanelTelemetry(id);
+      }
+    }
   }, [
     panels,
     buffersRef,
@@ -2441,516 +1505,16 @@ export function App() {
     streamParamsLatestRef,
     streamBinStatsRef,
     streamBin2dRef,
+    registerPanelTraces,
+    unregisterPanelTelemetry,
   ]);
 
-  useEffect(() => {
-    if (telemetrySnapshotHydratedRef.current) {
-      return;
-    }
-    let cancelled = false;
-    const load = async () => {
-      try {
-        const snapshot = await fetchTelemetrySnapshot();
-        if (cancelled) {
-          return;
-        }
-        telemetrySnapshotHydratedRef.current = true;
-        const deviceEntries = Object.entries(snapshot);
-        if (deviceEntries.length <= 0) {
-          return;
-        }
-        const booleanSignalKeys = new Set<string>();
-        let pushedSamples = false;
-        setLatestByDevice((prev) => {
-          const next: LatestSignals = { ...prev };
-          for (const [deviceId, signals] of deviceEntries) {
-            const deviceSignals = { ...(next[deviceId] ?? {}) };
-            for (const [name, signal] of Object.entries(signals)) {
-              deviceSignals[name] = signal;
-              const traceKey = `${deviceId}:${name}`;
-              let plotValue: number | null = null;
-              if (typeof signal.value === "number" && Number.isFinite(signal.value)) {
-                plotValue = signal.value;
-              } else if (typeof signal.value === "boolean") {
-                plotValue = signal.value ? 1 : 0;
-                booleanSignalKeys.add(traceKey);
-              }
-              if (plotValue !== null) {
-                for (const panelBuffers of buffersRef.values()) {
-                  const buffer = panelBuffers.get(traceKey);
-                  if (buffer) {
-                    buffer.push(normalizeTime(signal), plotValue);
-                    pushedSamples = true;
-                  }
-                }
-              }
-            }
-            next[deviceId] = deviceSignals;
-          }
-          return next;
-        });
-        if (booleanSignalKeys.size > 0) {
-          setPanels((prev) => {
-            let changed = false;
-            const next = prev.map((panel) => {
-              if (!isTelemetryPanel(panel)) {
-                return panel;
-              }
-              let tracesChanged = false;
-              const nextTraces = panel.traces.map((trace) => {
-                const key = `${trace.deviceId}:${trace.signal}`;
-                if (!booleanSignalKeys.has(key) || trace.valueKind === "boolean") {
-                  return trace;
-                }
-                tracesChanged = true;
-                changed = true;
-                return { ...trace, valueKind: "boolean" as const };
-              });
-              return tracesChanged ? { ...panel, traces: nextTraces } : panel;
-            });
-            return changed ? next : prev;
-          });
-        }
-        if (pushedSamples) {
-          setPlotTick((tick) => tick + 1);
-        }
-      } catch {
-        telemetrySnapshotHydratedRef.current = true;
-      }
-    };
-    void load();
-    return () => {
-      cancelled = true;
-    };
-  }, [buffersRef]);
+  // Telemetry pipeline (round 33). See features/telemetry/useTelemetryPipeline.ts.
+  // Owns the /ws/telemetry connection + per-sample fan-out into panel
+  // buffers + the boolean-promotion logic on telemetry traces.
+  const { latestByDevice, wsConnected, telemetryActive } = useTelemetryPipeline();
 
-  useEffect(() => {
-    if (activeRawStreamSubscriptions.length <= 0) {
-      return;
-    }
-    let cancelled = false;
-    const keyFor = (subscription: RawStreamSubscription) =>
-      `${subscription.deviceId}|${subscription.stream}|${subscription.channelIndex}|${subscription.traceDecimator}|${subscription.traceMaxPoints}|${subscription.traceMaxFps.toFixed(3)}|${subscription.rollingWindow}|${subscription.averageMode}`;
-    const activeKeys = new Set(activeRawStreamSubscriptions.map((sub) => keyFor(sub)));
-    rawSnapshotHydratedRef.current = new Set(
-      [...rawSnapshotHydratedRef.current].filter((key) => activeKeys.has(key))
-    );
-    const pending = activeRawStreamSubscriptions.filter(
-      (subscription) => !rawSnapshotHydratedRef.current.has(keyFor(subscription))
-    );
-    if (pending.length <= 0) {
-      return;
-    }
-    const load = async () => {
-      let updated = false;
-      for (const subscription of pending) {
-        const key = keyFor(subscription);
-        try {
-          const msg = await fetchRawStreamSnapshot({
-            deviceId: subscription.deviceId,
-            stream: subscription.stream,
-            channelIndex: subscription.channelIndex,
-            traceDecimator: subscription.traceDecimator,
-            traceMaxPoints: subscription.traceMaxPoints,
-            traceMaxFps: subscription.traceMaxFps,
-            rollingWindow: subscription.rollingWindow,
-            averageMode: subscription.averageMode,
-          });
-          if (cancelled) {
-            return;
-          }
-          rawSnapshotHydratedRef.current.add(key);
-          const frame = msg ? normalizeStreamFrameMessage(msg) : null;
-          if (frame === null) {
-            continue;
-          }
-          if (applyRawStreamFrameToPanels(subscription, frame)) {
-            updated = true;
-          }
-        } catch {
-          rawSnapshotHydratedRef.current.add(key);
-        }
-      }
-      if (!cancelled && updated) {
-        setPlotTick((tick) => tick + 1);
-      }
-    };
-    void load();
-    return () => {
-      cancelled = true;
-    };
-  }, [activeRawStreamSubscriptions]);
 
-  useEffect(() => {
-    if (!streamAnalysisRpcReady || activeStreamAnalysisWorkspaceSubscriptions.length <= 0) {
-      return;
-    }
-    let cancelled = false;
-    const kindsByWorkspace = new Map<string, Set<string>>();
-    const traceMaxPointsByWorkspace = new Map<string, number>();
-    for (const subscription of activeStreamAnalysisWorkspaceSubscriptions) {
-      const workspaceId = String(subscription.workspaceId ?? "").trim();
-      if (!workspaceId) {
-        continue;
-      }
-      const kinds = kindsByWorkspace.get(workspaceId) ?? new Set<string>();
-      for (const kind of subscription.kinds) {
-        kinds.add(String(kind));
-      }
-      kindsByWorkspace.set(workspaceId, kinds);
-      if (
-        subscription.kinds.includes("trace") &&
-        typeof subscription.traceMaxPoints === "number" &&
-        Number.isFinite(subscription.traceMaxPoints)
-      ) {
-        const current = traceMaxPointsByWorkspace.get(workspaceId) ?? 0;
-        traceMaxPointsByWorkspace.set(
-          workspaceId,
-          Math.max(current, Math.max(32, Math.trunc(subscription.traceMaxPoints)))
-        );
-      }
-    }
-    const snapshotTargets = [...kindsByWorkspace.entries()].map(([workspaceId, kindsSet]) => {
-      const kinds = [...kindsSet].sort();
-      const maxTracePoints = traceMaxPointsByWorkspace.get(workspaceId);
-      const key = `${workspaceId}|${kinds.join(",")}|${
-        typeof maxTracePoints === "number" ? String(maxTracePoints) : ""
-      }`;
-      return { workspaceId, kinds, maxTracePoints, key };
-    });
-    const activeKeys = new Set(snapshotTargets.map((entry) => entry.key));
-    workspaceSnapshotHydratedRef.current = new Set(
-      [...workspaceSnapshotHydratedRef.current].filter((key) => activeKeys.has(key))
-    );
-    const pending = snapshotTargets.filter(
-      (entry) => !workspaceSnapshotHydratedRef.current.has(entry.key)
-    );
-    if (pending.length <= 0) {
-      return;
-    }
-    const load = async () => {
-      let updated = false;
-      for (const target of pending) {
-        try {
-          const resp = await fetchStreamWorkspaceSnapshot(target.workspaceId, {
-            kinds: target.kinds,
-            maxTracePoints: target.maxTracePoints ?? null,
-          });
-          if (cancelled) {
-            return;
-          }
-          workspaceSnapshotHydratedRef.current.add(target.key);
-          if (!resp.ok || !resp.result || typeof resp.result !== "object") {
-            continue;
-          }
-          const outputsRaw = Array.isArray(resp.result.outputs)
-            ? resp.result.outputs
-            : [];
-          for (const outputRaw of outputsRaw) {
-            if (!outputRaw || typeof outputRaw !== "object") {
-              continue;
-            }
-            const normalized = normalizeStreamAnalysisOutputMessage({
-              topic: "manager.stream_analysis.output",
-              payload: outputRaw as StreamAnalysisMessage["payload"],
-            });
-            if (normalized === null) {
-              continue;
-            }
-            if (applyStreamAnalysisOutputToPanels(normalized)) {
-              updated = true;
-            }
-          }
-        } catch {
-          workspaceSnapshotHydratedRef.current.add(target.key);
-        }
-      }
-      if (!cancelled && updated) {
-        setPlotTick((tick) => tick + 1);
-      }
-    };
-    void load();
-    return () => {
-      cancelled = true;
-    };
-  }, [streamAnalysisRpcReady, activeStreamAnalysisWorkspaceSubscriptions]);
-
-  useEffect(() => {
-    const ws = new WebSocket(buildWsUrl("/ws/telemetry"));
-    ws.onopen = () => {
-      setWsConnected(true);
-      setTelemetryActive(false);
-    };
-    ws.onclose = () => {
-      setWsConnected(false);
-      setTelemetryActive(false);
-    };
-    ws.onerror = () => {
-      // Keep the current state; close handler is the authoritative disconnect signal.
-    };
-    ws.onmessage = (event) => {
-      try {
-        setTelemetryActive(true);
-        setWsConnected(true);
-        const msg = JSON.parse(event.data) as TelemetryMessage;
-        if (!msg?.payload?.device_id) {
-          return;
-        }
-        const deviceId = msg.payload.device_id;
-        const bundleTs = msg.payload.ts?.t_wall;
-        const booleanSignalKeys = new Set<string>();
-        setLatestByDevice((prev) => {
-          const next = { ...prev };
-          const deviceSignals = { ...(next[deviceId] ?? {}) };
-          let updated = false;
-          for (const [name, signal] of Object.entries(
-            msg.payload.signals ?? {}
-          )) {
-            deviceSignals[name] = signal;
-            const traceKey = `${deviceId}:${name}`;
-            let plotValue: number | null = null;
-            if (typeof signal.value === "number" && Number.isFinite(signal.value)) {
-              plotValue = signal.value;
-            } else if (typeof signal.value === "boolean") {
-              plotValue = signal.value ? 1 : 0;
-              booleanSignalKeys.add(traceKey);
-            }
-            if (plotValue !== null) {
-              for (const panelBuffers of buffersRef.values()) {
-                const buffer = panelBuffers.get(traceKey);
-                if (buffer) {
-                  buffer.push(normalizeTime(signal, bundleTs), plotValue);
-                  updated = true;
-                }
-              }
-            }
-          }
-          next[deviceId] = deviceSignals;
-          if (updated) {
-            setPlotTick((tick) => tick + 1);
-          }
-          return next;
-        });
-        if (booleanSignalKeys.size > 0) {
-          setPanels((prev) => {
-            let changed = false;
-            const next = prev.map((panel) => {
-              if (!isTelemetryPanel(panel)) {
-                return panel;
-              }
-              let tracesChanged = false;
-              const nextTraces = panel.traces.map((trace) => {
-                const key = `${trace.deviceId}:${trace.signal}`;
-                if (!booleanSignalKeys.has(key) || trace.valueKind === "boolean") {
-                  return trace;
-                }
-                tracesChanged = true;
-                changed = true;
-                return { ...trace, valueKind: "boolean" as const };
-              });
-              return tracesChanged ? { ...panel, traces: nextTraces } : panel;
-            });
-            return changed ? next : prev;
-          });
-        }
-      } catch {
-        return;
-      }
-    };
-    return () => {
-      ws.close();
-    };
-  }, [buffersRef]);
-
-  useEffect(() => {
-    if (activeRawStreamSubscriptions.length <= 0) {
-      setStreamWsConnected(true);
-      return;
-    }
-    let disposed = false;
-    const sockets = new Map<string, WebSocket>();
-    const openIds = new Set<string>();
-
-    const updateConnected = () => {
-      if (disposed) {
-        return;
-      }
-      setStreamWsConnected(openIds.size > 0);
-    };
-
-    const onMessage = (subscription: RawStreamSubscription) => (event: MessageEvent<string>) => {
-      try {
-        const msg = JSON.parse(event.data) as StreamFrameMessage;
-        const frame = normalizeStreamFrameMessage(msg);
-        if (frame === null) {
-          return;
-        }
-        if (frame.deviceId !== subscription.deviceId || frame.stream !== subscription.stream) {
-          return;
-        }
-        const updated = applyRawStreamFrameToPanels(subscription, frame);
-        if (updated) {
-          setPlotTick((tick) => tick + 1);
-        }
-      } catch {
-        return;
-      }
-    };
-
-    for (const subscription of activeRawStreamSubscriptions) {
-      const params = new URLSearchParams();
-      params.set("device_id", subscription.deviceId);
-      params.set("stream", subscription.stream);
-      params.set("channel_index", String(subscription.channelIndex));
-      params.set("trace_decimator", subscription.traceDecimator);
-      params.set("trace_max_points", String(subscription.traceMaxPoints));
-      params.set("trace_max_fps", String(subscription.traceMaxFps));
-      params.set("rolling_window", String(subscription.rollingWindow));
-      params.set("trace_average_mode", subscription.averageMode);
-      const query = params.toString();
-      const socketKey = `${subscription.deviceId}|${subscription.stream}|${subscription.channelIndex}|${subscription.traceDecimator}|${subscription.traceMaxPoints}|${subscription.traceMaxFps.toFixed(3)}|${subscription.rollingWindow}|${subscription.averageMode}`;
-      const ws = new WebSocket(buildWsUrl(`/ws/raw_stream?${query}`));
-      ws.onopen = () => {
-        openIds.add(socketKey);
-        updateConnected();
-      };
-      ws.onclose = () => {
-        openIds.delete(socketKey);
-        updateConnected();
-      };
-      ws.onerror = () => {
-        openIds.delete(socketKey);
-        updateConnected();
-      };
-      ws.onmessage = onMessage(subscription);
-      sockets.set(socketKey, ws);
-    }
-
-    updateConnected();
-    return () => {
-      disposed = true;
-      openIds.clear();
-      setStreamWsConnected(false);
-      for (const ws of sockets.values()) {
-        ws.close();
-      }
-      sockets.clear();
-    };
-  }, [activeRawStreamSubscriptions, streamFramesRef]);
-
-  useEffect(() => {
-    if (activeStreamAnalysisWorkspaceSubscriptions.length <= 0) {
-      setStreamAnalysisWsConnected(streamAnalysisRpcReady);
-      return;
-    }
-    let disposed = false;
-    const sockets = new Map<string, WebSocket>();
-    const openIds = new Set<string>();
-
-    const updateConnected = () => {
-      if (disposed) {
-        return;
-      }
-      setStreamAnalysisWsConnected(openIds.size > 0);
-    };
-
-    const onMessage = (
-      subscription: StreamAnalysisWorkspaceSubscription
-    ) => (event: MessageEvent<string>) => {
-      try {
-        const msg = JSON.parse(event.data) as StreamAnalysisMessage;
-        const output = normalizeStreamAnalysisOutputMessage(msg);
-        if (output === null) {
-          return;
-        }
-        const traceFilter =
-          subscription.kinds.includes("trace") &&
-          subscription.traceDecimator !== undefined &&
-          subscription.traceMaxPoints !== undefined &&
-          subscription.traceMaxFps !== undefined &&
-          subscription.traceRollingWindow !== undefined &&
-          subscription.traceAverageMode !== undefined
-            ? {
-                traceDecimator: subscription.traceDecimator,
-                traceMaxPoints: subscription.traceMaxPoints,
-                traceMaxFps: subscription.traceMaxFps,
-                traceRollingWindow: subscription.traceRollingWindow,
-                traceAverageMode: subscription.traceAverageMode,
-              }
-            : undefined;
-        if (applyStreamAnalysisOutputToPanels(output, traceFilter)) {
-          setPlotTick((tick) => tick + 1);
-        }
-      } catch {
-        return;
-      }
-    };
-
-    for (const subscription of activeStreamAnalysisWorkspaceSubscriptions) {
-      const workspaceId = subscription.workspaceId;
-      const params = new URLSearchParams();
-      if (subscription.kinds.length > 0) {
-        params.set("kinds", subscription.kinds.join(","));
-      }
-      if (
-        subscription.kinds.includes("trace") &&
-        subscription.traceDecimator !== undefined &&
-        subscription.traceMaxPoints !== undefined &&
-        subscription.traceMaxFps !== undefined &&
-        subscription.traceRollingWindow !== undefined &&
-        subscription.traceAverageMode !== undefined
-      ) {
-        params.set("trace_decimator", subscription.traceDecimator);
-        params.set("trace_max_points", String(subscription.traceMaxPoints));
-        params.set("trace_max_fps", String(subscription.traceMaxFps));
-        params.set("rolling_window", String(subscription.traceRollingWindow));
-        params.set("trace_average_mode", subscription.traceAverageMode);
-      }
-      const query = params.toString();
-      const socketKey = `${workspaceId}|${query}`;
-      const ws = new WebSocket(
-        buildWsUrl(
-          `/ws/stream/${encodeURIComponent(workspaceId)}${query ? `?${query}` : ""}`
-        )
-      );
-      ws.onopen = () => {
-        openIds.add(socketKey);
-        updateConnected();
-      };
-      ws.onclose = () => {
-        openIds.delete(socketKey);
-        updateConnected();
-      };
-      ws.onerror = () => {
-        openIds.delete(socketKey);
-        updateConnected();
-      };
-      ws.onmessage = onMessage(subscription);
-      sockets.set(socketKey, ws);
-    }
-
-    updateConnected();
-
-    return () => {
-      disposed = true;
-      openIds.clear();
-      setStreamAnalysisWsConnected(false);
-      for (const ws of sockets.values()) {
-        ws.close();
-      }
-      sockets.clear();
-    };
-  }, [
-    activeStreamAnalysisWorkspaceSubscriptions,
-    buffersRef,
-      streamAnalysisRpcReady,
-      streamTraceOverlayRef,
-      streamBinStatsOverlayRef,
-      streamBinStatsFitOverlayRef,
-      streamParamsLatestRef,
-      streamBinStatsRef,
-      streamBin2dRef,
-  ]);
 
   useEffect(() => {
     const currentLastId =
@@ -3081,30 +1645,9 @@ export function App() {
     document.title = `Experiment Control ${instanceLabel}`;
   }, [instanceLabel]);
 
-  useEffect(() => {
-    const ws = new WebSocket(buildWsUrl("/ws/logs"));
-    ws.onopen = () => setLogsWsConnected(true);
-    ws.onclose = () => setLogsWsConnected(false);
-    ws.onerror = () => setLogsWsConnected(false);
-    ws.onmessage = (event) => {
-      try {
-        const msg = JSON.parse(event.data) as LogMessage;
-        if (msg.topic !== "manager.log") {
-          return;
-        }
-        const entry = normalizeLogEntry(msg.payload);
-        if (entry === null) {
-          return;
-        }
-        appendLogEntries([entry]);
-      } catch {
-        return;
-      }
-    };
-    return () => {
-      ws.close();
-    };
-  }, []);
+  const { wsConnected: logsWsConnected } = useLogsStream({
+    onEntry: (entry) => appendLogEntries([entry]),
+  });
 
   useEffect(() => {
     if (!logsOpen || !logAutoScroll) {
@@ -3166,8 +1709,37 @@ export function App() {
     commandHistoryMode,
   ]);
 
-  const panelCapacity = (timeWindow: number) =>
-    Math.max(DEFAULT_BUFFER_POINTS, Math.floor(timeWindow * 10));
+  // Apply-helpers + buffer/capacity helpers moved to
+  // features/panels/applyToPanels.ts in round 14. Bind the refs they
+  // need into a `deps` object; the imported pure functions take it as
+  // their first argument. Wrapping in arrow functions matches the
+  // previous inline behavior (no useCallback memoization).
+  //
+  // PerfC: maintain a reverse index for stream-analysis output
+  // dispatch so applyStreamAnalysisOutputToPanels does O(matching
+  // panels) work per WS message instead of O(N panels). Rebuild on
+  // every panels change.
+  const panelsByWorkspaceOutputRef = useRef<
+    Map<string, Map<string, PlotPanelState[]>>
+  >(new Map());
+  useEffect(() => {
+    panelsByWorkspaceOutputRef.current = buildPanelsByWorkspaceOutput(panels);
+  }, [panels]);
+  const applyDeps: ApplyHelpersDeps = {
+    panelsRef,
+    panelsByWorkspaceOutputRef,
+    buffersRef,
+    streamFramesRef,
+    streamTraceOverlayRef,
+    streamBinStatsOverlayRef,
+    streamBinStatsFitOverlayRef,
+    streamParamsLatestRef,
+    streamBinStatsRef,
+    streamBin2dRef,
+  };
+  const panelCapacity = (timeWindow: number) => panelCapacityImpl(timeWindow);
+  const ensurePanelBuffers = (panelId: string) =>
+    ensurePanelBuffersImpl(buffersRef, panelId);
 
   const hdfController = useHdfController({
     hdfWriterProcess,
@@ -3539,521 +2111,55 @@ export function App() {
     sendDeviceCommand,
   });
 
-  const createCommandDeckCommandEntry = (
-    partial?: Partial<
-      Pick<
-        CommandDeckCommandEntry,
-        "id" | "targetKind" | "targetId" | "action" | "label" | "group" | "paramsDraft"
-      >
-    >
-  ): CommandDeckCommandEntry => {
-    const id =
-      typeof partial?.id === "string" && partial.id.trim().length > 0
-        ? partial.id.trim()
-        : `deck-${Date.now()}-${commandDeckIdRef.current++}`;
-    const defaultTargetKind: CommandDeckTargetKind =
-      partial?.targetKind ??
-      (orderedDevices[0]?.device_id
-        ? "device"
-        : processes[0]?.process_id
-        ? "process"
-        : "device");
-    const fallbackTargetId =
-      defaultTargetKind === "process"
-        ? (processes[0]?.process_id ?? "")
-        : (orderedDevices[0]?.device_id ?? "");
-    return {
-      id,
-      kind: "command",
-      targetKind: defaultTargetKind,
-      targetId: String(partial?.targetId ?? fallbackTargetId).trim(),
-      action: String(partial?.action ?? "").trim(),
-      label:
-        typeof partial?.label === "string" && partial.label.trim().length > 0
-          ? partial.label.trim()
-          : undefined,
-      group: normalizeDeckGroup(partial?.group),
-      paramsDraft: { ...(partial?.paramsDraft ?? {}) },
-      createdAt: Date.now(),
-    };
-  };
+  // Command-deck pure mutators (round 26). See
+  // features/commands/useCommandDeckMutations.ts.
+  const {
+    updateCommandDeckCommandEntry,
+    updateCommandDeckTelemetryEntry,
+    removeCommandDeckEntry,
+    moveCommandDeckEntryWithinGroup,
+    reorderCommandDeckEntryWithinGroup,
+    setCommandDeckEntryGroup,
+    setCommandDeckGroupEntries,
+  } = useCommandDeckMutations();
 
-  const createCommandDeckTelemetryEntry = (
-    partial?: Partial<
-      Pick<
-        CommandDeckTelemetryEntry,
-        "id" | "deviceId" | "signal" | "format" | "decimals" | "label" | "group"
-      >
-    >
-  ): CommandDeckTelemetryEntry => {
-    const id =
-      typeof partial?.id === "string" && partial.id.trim().length > 0
-        ? partial.id.trim()
-        : `deck-${Date.now()}-${commandDeckIdRef.current++}`;
-    const fallbackDeviceId = orderedDevices[0]?.device_id ?? "";
-    const deviceId = String(partial?.deviceId ?? fallbackDeviceId).trim();
-    const signalOptions = [
-      ...Object.keys(latestByDevice[deviceId] ?? {}),
-    ].sort((a, b) => a.localeCompare(b));
-    const fallbackSignal = signalOptions[0] ?? "";
-    const formatRaw = String(partial?.format ?? "auto").trim().toLowerCase();
-    const format =
-      formatRaw === "fixed" || formatRaw === "scientific" ? formatRaw : "auto";
-    const decimalsRaw = partial?.decimals;
-    const decimals =
-      typeof decimalsRaw === "number" && Number.isFinite(decimalsRaw)
-        ? Math.max(0, Math.min(12, Math.trunc(decimalsRaw)))
-        : 3;
-    return {
-      id,
-      kind: "telemetry",
-      deviceId,
-      signal: String(partial?.signal ?? fallbackSignal).trim(),
-      format,
-      decimals,
-      label:
-        typeof partial?.label === "string" && partial.label.trim().length > 0
-          ? partial.label.trim()
-          : undefined,
-      group: normalizeDeckGroup(partial?.group),
-      createdAt: Date.now(),
-    };
-  };
-
-  const addCommandDeckCommandEntry = (
-    partial?: Partial<
-      Pick<
-        CommandDeckCommandEntry,
-        "id" | "targetKind" | "targetId" | "action" | "label" | "group" | "paramsDraft"
-      >
-    >
-  ) => {
-    const next = createCommandDeckCommandEntry(partial);
-    setCommandDeck((prev) => [...prev, next]);
-    setDevicePanelTab("deck");
-    return next;
-  };
-
-  const addCommandDeckTelemetryEntry = (
-    partial?: Partial<
-      Pick<
-        CommandDeckTelemetryEntry,
-        "id" | "deviceId" | "signal" | "format" | "decimals" | "label" | "group"
-      >
-    >
-  ) => {
-    const next = createCommandDeckTelemetryEntry(partial);
-    setCommandDeck((prev) => [...prev, next]);
-    setDevicePanelTab("deck");
-    return next;
-  };
-
-  const addToDeckFromCommandModal = () => {
-    if (!commandDevice || !commandAction) {
-      notifications.show({
-        color: "red",
-        title: "Cannot add to deck",
-        message: "Select device and action first.",
-      });
-      return;
-    }
-    addCommandDeckCommandEntry({
-      targetKind: "device",
-      targetId: commandDevice,
-      action: commandAction,
-      label: commandLabel,
-      paramsDraft: { ...commandParamValues },
-    });
-    notifications.show({
-      color: "teal",
-      title: "Added to command deck",
-      message: `${commandDevice}.${commandAction}`,
-    });
-  };
-
-  const addToDeckFromProcessCommandModal = () => {
-    if (!processCommandProcessId || !processCommandAction) {
-      notifications.show({
-        color: "red",
-        title: "Cannot add to deck",
-        message: "Select process and action first.",
-      });
-      return;
-    }
-    addCommandDeckCommandEntry({
-      targetKind: "process",
-      targetId: processCommandProcessId,
-      action: processCommandAction,
-      paramsDraft: { ...processCommandParamValues },
-    });
-    notifications.show({
-      color: "teal",
-      title: "Added to command deck",
-      message: `${processCommandProcessId}.${processCommandAction}`,
-    });
-  };
-
-  const updateCommandDeckCommandEntry = (
-    entryId: string,
-    patch: Partial<
-      Pick<
-        CommandDeckCommandEntry,
-        "targetKind" | "targetId" | "action" | "label" | "group" | "paramsDraft"
-      >
-    >
-  ) => {
-    setCommandDeck((prev) =>
-      prev.map((entry) => {
-        if (entry.id !== entryId || !isCommandDeckCommandEntry(entry)) {
-          return entry;
-        }
-        const nextTargetKind: CommandDeckTargetKind =
-          patch.targetKind !== undefined
-            ? patch.targetKind
-            : entry.targetKind;
-        const nextTargetId =
-          patch.targetId !== undefined ? String(patch.targetId).trim() : entry.targetId;
-        const nextAction =
-          patch.action !== undefined ? String(patch.action).trim() : entry.action;
-        const nextLabel =
-          patch.label !== undefined
-            ? (() => {
-                const raw = String(patch.label);
-                return raw.trim().length > 0 ? raw : undefined;
-              })()
-            : entry.label ?? undefined;
-        const nextGroup =
-          patch.group !== undefined
-            ? normalizeDeckGroup(String(patch.group))
-            : normalizeDeckGroup(entry.group);
-        const nextParamsDraft =
-          patch.paramsDraft !== undefined
-            ? { ...patch.paramsDraft }
-            : { ...(entry.paramsDraft ?? {}) };
-        return {
-          ...entry,
-          targetKind: nextTargetKind,
-          targetId: nextTargetId,
-          action: nextAction,
-          label: nextLabel,
-          group: nextGroup,
-          paramsDraft: nextParamsDraft,
-        };
-      })
-    );
-  };
-
-  const updateCommandDeckTelemetryEntry = (
-    entryId: string,
-    patch: Partial<
-      Pick<
-        CommandDeckTelemetryEntry,
-        "deviceId" | "signal" | "format" | "decimals" | "label" | "group"
-      >
-    >
-  ) => {
-    setCommandDeck((prev) =>
-      prev.map((entry) => {
-        if (entry.id !== entryId || !isCommandDeckTelemetryEntry(entry)) {
-          return entry;
-        }
-        const nextDeviceId =
-          patch.deviceId !== undefined ? String(patch.deviceId).trim() : entry.deviceId;
-        const nextSignal =
-          patch.signal !== undefined ? String(patch.signal).trim() : entry.signal;
-        const formatRaw =
-          patch.format !== undefined ? String(patch.format).trim().toLowerCase() : entry.format;
-        const nextFormat =
-          formatRaw === "fixed" || formatRaw === "scientific" ? formatRaw : "auto";
-        const decimalsCandidate =
-          patch.decimals !== undefined ? patch.decimals : entry.decimals;
-        const nextDecimals =
-          typeof decimalsCandidate === "number" && Number.isFinite(decimalsCandidate)
-            ? Math.max(0, Math.min(12, Math.trunc(decimalsCandidate)))
-            : null;
-        const nextLabel =
-          patch.label !== undefined
-            ? (() => {
-                const raw = String(patch.label);
-                return raw.trim().length > 0 ? raw : undefined;
-              })()
-            : entry.label ?? undefined;
-        const nextGroup =
-          patch.group !== undefined
-            ? normalizeDeckGroup(String(patch.group))
-            : normalizeDeckGroup(entry.group);
-        return {
-          ...entry,
-          deviceId: nextDeviceId,
-          signal: nextSignal,
-          format: nextFormat,
-          decimals: nextDecimals,
-          label: nextLabel,
-          group: nextGroup,
-        };
-      })
-    );
-  };
-
-  const setCommandDeckEntryTargetKind = (
-    entryId: string,
-    targetKind: CommandDeckTargetKind
-  ) => {
-    const fallbackTargetId =
-      targetKind === "process"
-        ? (processes[0]?.process_id ?? "")
-        : (orderedDevices[0]?.device_id ?? "");
-    updateCommandDeckCommandEntry(entryId, {
-      targetKind,
-      targetId: fallbackTargetId,
-      action: "",
-      paramsDraft: {},
-    });
-    if (targetKind === "process" && fallbackTargetId) {
-      void ensureProcessCapabilitiesLoaded(fallbackTargetId);
-    }
-  };
-
-  const removeCommandDeckEntry = (entryId: string) => {
-    setCommandDeck((prev) => prev.filter((entry) => entry.id !== entryId));
-  };
-
-  const moveCommandDeckEntryWithinGroup = (entryId: string, direction: -1 | 1) => {
-    setCommandDeck((prev) => {
-      const index = prev.findIndex((entry) => entry.id === entryId);
-      if (index < 0) {
-        return prev;
-      }
-      const currentGroup = normalizeDeckGroup(prev[index].group) ?? "Ungrouped";
-      const step = direction > 0 ? 1 : -1;
-      let targetIndex = -1;
-      for (let idx = index + step; idx >= 0 && idx < prev.length; idx += step) {
-        const group = normalizeDeckGroup(prev[idx].group) ?? "Ungrouped";
-        if (group === currentGroup) {
-          targetIndex = idx;
-          break;
-        }
-      }
-      if (targetIndex < 0) {
-        return prev;
-      }
-      const next = [...prev];
-      const current = next[index];
-      next[index] = next[targetIndex];
-      next[targetIndex] = current;
-      return next;
-    });
-  };
-
-  const reorderCommandDeckEntryWithinGroup = (
-    entryId: string,
-    targetEntryId: string
-  ) => {
-    if (!entryId || !targetEntryId || entryId === targetEntryId) {
-      return;
-    }
-    setCommandDeck((prev) => {
-      const sourceIndex = prev.findIndex((entry) => entry.id === entryId);
-      const targetIndex = prev.findIndex((entry) => entry.id === targetEntryId);
-      if (sourceIndex < 0 || targetIndex < 0) {
-        return prev;
-      }
-      const sourceGroup = normalizeDeckGroup(prev[sourceIndex].group) ?? "Ungrouped";
-      const targetGroup = normalizeDeckGroup(prev[targetIndex].group) ?? "Ungrouped";
-      if (sourceGroup !== targetGroup) {
-        return prev;
-      }
-      const next = [...prev];
-      const [sourceEntry] = next.splice(sourceIndex, 1);
-      const insertIndex = Math.max(0, Math.min(next.length, targetIndex));
-      next.splice(insertIndex, 0, sourceEntry);
-      return next;
-    });
-  };
-
-  const setCommandDeckEntryGroup = (entryId: string, nextGroupRaw: string) => {
-    const nextGroup = normalizeDeckGroup(nextGroupRaw);
-    setCommandDeck((prev) => {
-      const index = prev.findIndex((entry) => entry.id === entryId);
-      if (index < 0) {
-        return prev;
-      }
-      const current = prev[index];
-      const currentGroup = normalizeDeckGroup(current.group);
-      if (currentGroup === nextGroup) {
-        return prev;
-      }
-      const remaining = [...prev.slice(0, index), ...prev.slice(index + 1)];
-      const updated: CommandDeckEntry = { ...current, group: nextGroup };
-      const normalizedTarget = nextGroup ?? "Ungrouped";
-      let insertAt = remaining.length;
-      for (let idx = remaining.length - 1; idx >= 0; idx -= 1) {
-        const group = normalizeDeckGroup(remaining[idx].group) ?? "Ungrouped";
-        if (group === normalizedTarget) {
-          insertAt = idx + 1;
-          break;
-        }
-      }
-      const next = [...remaining];
-      next.splice(insertAt, 0, updated);
-      return next;
-    });
-  };
-
-  const setCommandDeckGroupEntries = (fromGroup: string, toGroupRaw: string) => {
-    const sourceGroup = String(fromGroup ?? "").trim() || "Ungrouped";
-    const nextGroup = normalizeDeckGroup(toGroupRaw);
-    const targetGroup = nextGroup ?? "Ungrouped";
-    if (sourceGroup === targetGroup) {
-      return;
-    }
-    setCommandDeck((prev) => {
-      let changed = false;
-      const next = prev.map((entry) => {
-        const entryGroup = normalizeDeckGroup(entry.group) ?? "Ungrouped";
-        if (entryGroup !== sourceGroup) {
-          return entry;
-        }
-        changed = true;
-        return { ...entry, group: nextGroup };
-      });
-      return changed ? next : prev;
-    });
-  };
-
-  const runCommandDeckEntry = async (entryId: string) => {
-    const entry = commandDeck.find((candidate) => candidate.id === entryId);
-    if (!entry || !isCommandDeckCommandEntry(entry)) {
-      return;
-    }
-    const targetId = entry.targetId.trim();
-    const action = entry.action.trim();
-    if (!targetId || !action) {
-      notifications.show({
-        color: "red",
-        title: "Invalid deck command",
-        message: "Target and action are required.",
-      });
-      return;
-    }
-    if (commandDeckBusyById[entryId]) {
-      return;
-    }
-    setCommandDeckBusyById((prev) => ({ ...prev, [entryId]: true }));
-    try {
-      if (entry.targetKind === "process") {
-        let capabilities = capabilitiesByProcess[targetId] ?? [];
-        if (capabilities.length === 0) {
-          capabilities = await ensureProcessCapabilitiesLoaded(targetId);
-        }
-        const member = capabilities.find((candidate) => candidate.name === action);
-        const paramsMeta = member?.params ?? [];
-        const draft = entry.paramsDraft ?? {};
-        const params: Record<string, unknown> = {};
-        for (const param of paramsMeta) {
-          const raw = (draft[param.name] ?? "").trim();
-          if (!raw) {
-            if (param.required) {
-              notifications.show({
-                color: "red",
-                title: "Missing parameter",
-                message: `${targetId}.${action} requires ${param.name}`,
-              });
-              return;
-            }
-            continue;
-          }
-          params[param.name] = coerceParamValue(raw, param);
-        }
-        const resp = await sendProcessCommand(
-          targetId,
-          action,
-          params,
-          "command-deck"
-        );
-        if (!resp.ok) {
-          notifications.show({
-            color: "red",
-            title: "Command failed",
-            message: formatApiErrorToastMessage(resp.error, {
-              targetKind: "process",
-              targetId,
-              action,
-            }),
-            autoClose: 15000,
-          });
-          return;
-        }
-        notifications.show({
-          color: "teal",
-          title: "Command sent",
-          message: `${targetId}.${action}`,
-        });
-        await refreshProcesses();
-        if (action.startsWith("hdf.") || hdfWriterProcessId === targetId) {
-          await refreshHdfWriterStatus(targetId);
-        }
-        if (action.startsWith("influx.") || influxWriterProcessId === targetId) {
-          await refreshInfluxStatus(targetId);
-        }
-      } else if (entry.targetKind === "device") {
-        let capabilities = capabilitiesByDevice[targetId] ?? [];
-        if (capabilities.length === 0) {
-          const fetched = await fetchCapabilities(targetId);
-          if (fetched.length > 0) {
-            setCapabilitiesByDevice((prev) => ({ ...prev, [targetId]: fetched }));
-            capabilities = fetched;
-          }
-        }
-        const member = capabilities.find((candidate) => candidate.name === action);
-        const paramsMeta = effectiveDeviceMemberParams(member);
-        const draft = entry.paramsDraft ?? {};
-        const params: Record<string, unknown> = {};
-        for (const param of paramsMeta) {
-          const raw = (draft[param.name] ?? "").trim();
-          if (!raw) {
-            if (param.required) {
-              notifications.show({
-                color: "red",
-                title: "Missing parameter",
-                message: `${targetId}.${action} requires ${param.name}`,
-              });
-              return;
-            }
-            continue;
-          }
-          params[param.name] = coerceParamValue(raw, param);
-        }
-        const mapped = mapDeviceActionForMember(member, action, params);
-        const resp = await sendDeviceCommand(
-          targetId,
-          mapped.action,
-          mapped.params,
-          "command-deck"
-        );
-        if (!resp.ok) {
-          notifications.show({
-            color: "red",
-            title: "Command failed",
-            message: formatApiErrorToastMessage(resp.error, {
-              targetKind: "device",
-              targetId,
-              action: mapped.action,
-            }),
-            autoClose: 15000,
-          });
-          return;
-        }
-        notifications.show({
-          color: "teal",
-          title: "Command sent",
-          message: `${targetId}.${mapped.action}`,
-        });
-      }
-    } finally {
-      setCommandDeckBusyById((prev) => ({ ...prev, [entryId]: false }));
-    }
-  };
+  // Command-deck create / add-from-modal / run handlers (round 30). See
+  // features/commands/useCommandDeckRunner.ts. The "active" half of
+  // the deck surface that touches API + capability stores +
+  // writer-status refresh.
+  const {
+    createCommandDeckCommandEntry: _createCommandDeckCommandEntry,
+    createCommandDeckTelemetryEntry: _createCommandDeckTelemetryEntry,
+    addCommandDeckCommandEntry,
+    addCommandDeckTelemetryEntry,
+    addToDeckFromCommandModal,
+    addToDeckFromProcessCommandModal,
+    setCommandDeckEntryTargetKind,
+    runCommandDeckEntry,
+  } = useCommandDeckRunner({
+    processes,
+    capabilitiesByProcess,
+    ensureProcessCapabilitiesLoaded,
+    refreshProcesses,
+    setCapabilitiesByDevice,
+    latestByDevice,
+    sendDeviceCommand,
+    sendProcessCommand,
+    commandDevice,
+    commandAction,
+    commandLabel,
+    commandParamValues,
+    processCommandProcessId,
+    processCommandAction,
+    processCommandParamValues,
+    updateCommandDeckCommandEntry,
+    hdfWriterProcessId,
+    refreshHdfWriterStatus,
+    influxWriterProcessId,
+    refreshInfluxStatus,
+  });
+  void _createCommandDeckCommandEntry;
+  void _createCommandDeckTelemetryEntry;
 
   const copyJsonToClipboard = async (label: string, payload: unknown) => {
     if (typeof navigator === "undefined" || !navigator.clipboard?.writeText) {
@@ -4106,79 +2212,16 @@ export function App() {
     }
   };
 
-  const ensurePanelBuffers = (panelId: string) => {
-    let panelBuffers = buffersRef.get(panelId);
-    if (!panelBuffers) {
-      panelBuffers = new Map<string, RingBuffer>();
-      buffersRef.set(panelId, panelBuffers);
-    }
-    return panelBuffers;
-  };
+  // ensurePanelBuffers / applyRawStreamFrameToPanels /
+  // applyStreamAnalysisOutputToPanels were defined here before round 14.
+  // They now live in features/panels/applyToPanels.ts and are bound to
+  // the local `applyDeps` via thin wrappers earlier in this function
+  // (search for `applyDeps:`).
 
   const applyRawStreamFrameToPanels = (
     subscription: RawStreamSubscription,
-    frame: {
-      seq: number;
-      shape: number[];
-      values: unknown;
-    }
-  ) => {
-    let updated = false;
-    for (const panel of panelsRef.current) {
-      if (
-        !isStreamTracePanel(panel) ||
-        panel.sourceMode !== "raw" ||
-        panel.stream === null
-      ) {
-        continue;
-      }
-      if (
-        panel.stream.deviceId !== subscription.deviceId ||
-        panel.stream.stream !== subscription.stream
-      ) {
-        continue;
-      }
-      if (Math.max(0, Math.trunc(panel.channelIndex)) !== subscription.channelIndex) {
-        continue;
-      }
-      if (normalizeTraceDecimator(panel.traceDecimator) !== subscription.traceDecimator) {
-        continue;
-      }
-      if (normalizeTraceMaxPoints(panel.traceMaxPoints) !== subscription.traceMaxPoints) {
-        continue;
-      }
-      if (normalizeTraceMaxFps(panel.traceMaxFps) !== subscription.traceMaxFps) {
-        continue;
-      }
-      if (normalizeTraceRollingWindow(panel.rollingWindow) !== subscription.rollingWindow) {
-        continue;
-      }
-      if (normalizeTraceAverageMode(panel.averageMode) !== subscription.averageMode) {
-        continue;
-      }
-      const currentFrames = streamFramesRef.get(panel.id) ?? [];
-      if (
-        currentFrames.length > 0 &&
-        currentFrames[currentFrames.length - 1].seq === frame.seq
-      ) {
-        continue;
-      }
-      const appended = [
-        ...currentFrames,
-        {
-          seq: frame.seq,
-          shape: frame.shape,
-          values: frame.values,
-        },
-      ];
-      const keep = Math.max(MAX_STREAM_FRAME_BUFFER, panel.overlayCount * 4);
-      const nextFrames =
-        appended.length > keep ? appended.slice(appended.length - keep) : appended;
-      streamFramesRef.set(panel.id, nextFrames);
-      updated = true;
-    }
-    return updated;
-  };
+    frame: { seq: number; shape: number[]; values: unknown }
+  ) => applyRawStreamFrameToPanelsImpl(applyDeps, subscription, frame);
 
   const applyStreamAnalysisOutputToPanels = (
     output: NonNullable<ReturnType<typeof normalizeStreamAnalysisOutputMessage>>,
@@ -4191,519 +2234,41 @@ export function App() {
           traceAverageMode: StreamTraceAverageMode;
         }
       | undefined
-  ) => {
-    let updated = false;
-    if (output.kind === "scalar") {
-      const scalar = Number(output.value);
-      if (Number.isFinite(scalar)) {
-        for (const panel of panelsRef.current) {
-          if (!isStreamScalarPanel(panel)) {
-            if (isStreamParamsPanel(panel)) {
-              if (panel.workspaceId !== output.workspaceId) {
-                continue;
-              }
-              if (!(panel.outputIds ?? []).includes(output.outputId)) {
-                continue;
-              }
-              const latest = streamParamsLatestRef.get(panel.id) ?? {};
-              latest[output.outputId] = scalar;
-              streamParamsLatestRef.set(panel.id, latest);
-              updated = true;
-            }
-            continue;
-          }
-          if (panel.workspaceId !== output.workspaceId) {
-            continue;
-          }
-          if ((panel.outputId ?? "") !== output.outputId) {
-            continue;
-          }
-          const panelBuffers = ensurePanelBuffers(panel.id);
-          const key = traceKeyId(streamScalarTrace(panel));
-          let buffer = panelBuffers.get(key);
-          if (!buffer) {
-            buffer = new RingBuffer(panelCapacity(panel.timeWindowS));
-            panelBuffers.set(key, buffer);
-          }
-          buffer.push(output.tWallS, scalar);
-          updated = true;
-        }
-      }
-    }
-    if (output.kind === "params_map") {
-      const paramsMap = normalizeFitParamsMapValue(output.value);
-      if (paramsMap) {
-        for (const panel of panelsRef.current) {
-          if (!isStreamParamsPanel(panel)) {
-            continue;
-          }
-          if (panel.workspaceId !== output.workspaceId) {
-            continue;
-          }
-          if (!(panel.outputIds ?? []).includes(output.outputId)) {
-            continue;
-          }
-          const latest = streamParamsLatestRef.get(panel.id) ?? {};
-          latest[output.outputId] = paramsMap;
-          streamParamsLatestRef.set(panel.id, latest);
-          updated = true;
-        }
-      }
-    }
-    if (output.kind === "hist_agg") {
-      const series = normalizeHistAggValue(output.value);
-      if (series) {
-        for (const panel of panelsRef.current) {
-          if (!isStreamBinStatsPanel(panel)) {
-            continue;
-          }
-          if (panel.workspaceId !== output.workspaceId) {
-            continue;
-          }
-          if ((panel.outputId ?? "") !== output.outputId) {
-            continue;
-          }
-          streamBinStatsRef.set(panel.id, series);
-          updated = true;
-        }
-      }
-    }
-    if (output.kind === "hist2d") {
-      const snapshot = normalizeHist2dValue(output.value);
-      if (snapshot) {
-        for (const panel of panelsRef.current) {
-          if (!isStreamBin2dPanel(panel)) {
-            continue;
-          }
-          if (panel.workspaceId !== output.workspaceId) {
-            continue;
-          }
-          if ((panel.outputId ?? "") !== output.outputId) {
-            continue;
-          }
-          streamBin2dRef.set(panel.id, snapshot);
-          updated = true;
-        }
-      }
-    }
-    if (output.kind === "fit_1d") {
-      const fit = normalizeFitCurveValue(output.value);
-      if (fit) {
-        for (const panel of panelsRef.current) {
-          if (!isStreamBinStatsPanel(panel)) {
-            continue;
-          }
-          if (panel.workspaceId !== output.workspaceId) {
-            continue;
-          }
-          const overlayIds = new Set(
-            (panel.fitOverlayOutputIds ?? []).map((id) => String(id ?? "").trim())
-          );
-          if (!overlayIds.has(output.outputId)) {
-            continue;
-          }
-          const perPanel = streamBinStatsFitOverlayRef.get(panel.id) ?? new Map();
-          perPanel.set(output.outputId, fit);
-          streamBinStatsFitOverlayRef.set(panel.id, perPanel);
-          updated = true;
-        }
-      }
-    }
-    if (output.kind === "trace") {
-      const values = normalizeTraceValues(output.value);
-      if (values !== null) {
-        for (const panel of panelsRef.current) {
-          if (
-            isStreamBinStatsPanel(panel) &&
-            panel.workspaceId === output.workspaceId
-          ) {
-            const overlayIds = new Set(
-              (panel.overlayOutputIds ?? []).map((id) => String(id ?? "").trim())
-            );
-            if (overlayIds.has(output.outputId)) {
-              const perPanel = streamBinStatsOverlayRef.get(panel.id) ?? new Map();
-              const seq =
-                output.seq ??
-                (perPanel.get(output.outputId)?.seq ?? 0) + 1;
-              perPanel.set(output.outputId, { seq, values });
-              streamBinStatsOverlayRef.set(panel.id, perPanel);
-              updated = true;
-            }
-          }
-          if (
-            !isStreamTracePanel(panel) ||
-            panel.sourceMode !== "dag" ||
-            panel.workspaceId !== output.workspaceId
-          ) {
-            continue;
-          }
-          if (traceFilter) {
-            if (
-              normalizeTraceDecimator(panel.traceDecimator) !== traceFilter.traceDecimator ||
-              normalizeTraceMaxPoints(panel.traceMaxPoints) !== traceFilter.traceMaxPoints ||
-              normalizeTraceMaxFps(panel.traceMaxFps) !== traceFilter.traceMaxFps ||
-              normalizeTraceRollingWindow(panel.rollingWindow) !==
-                traceFilter.traceRollingWindow ||
-              normalizeTraceAverageMode(panel.averageMode) !== traceFilter.traceAverageMode
-            ) {
-              continue;
-            }
-          }
-          const primaryOutputId = String(panel.outputId ?? "").trim();
-          const overlayOutputIds = new Set(
-            (panel.overlayOutputIds ?? []).map((id) => String(id ?? "").trim())
-          );
-          const isPrimary = primaryOutputId.length > 0 && primaryOutputId === output.outputId;
-          const isOverlay = overlayOutputIds.has(output.outputId);
-          if (!isPrimary && !isOverlay) {
-            continue;
-          }
-          if (isOverlay) {
-            const perPanel = streamTraceOverlayRef.get(panel.id) ?? new Map();
-            const seq = output.seq ?? (perPanel.get(output.outputId)?.seq ?? 0) + 1;
-            perPanel.set(output.outputId, { seq, values });
-            streamTraceOverlayRef.set(panel.id, perPanel);
-            updated = true;
-            continue;
-          }
-          const currentFrames = streamFramesRef.get(panel.id) ?? [];
-          const seq =
-            output.seq ??
-            (currentFrames.length > 0
-              ? currentFrames[currentFrames.length - 1].seq + 1
-              : 0);
-          if (
-            currentFrames.length > 0 &&
-            currentFrames[currentFrames.length - 1].seq === seq
-          ) {
-            continue;
-          }
-          const appended = [
-            ...currentFrames,
-            {
-              seq,
-              shape: [values.length],
-              values,
-            },
-          ];
-          const keep = Math.max(MAX_STREAM_FRAME_BUFFER, panel.overlayCount * 4);
-          const nextFrames =
-            appended.length > keep
-              ? appended.slice(appended.length - keep)
-              : appended;
-          streamFramesRef.set(panel.id, nextFrames);
-          updated = true;
-        }
-      }
-    }
-    return updated;
-  };
+  ) => applyStreamAnalysisOutputToPanelsImpl(applyDeps, output, traceFilter);
 
-  const refreshWorkspaceStoreStatus = async (
-    source: string,
-    options?: { notifyOnError?: boolean }
-  ) => {
-    if (!streamAnalysisReadyRef.current) {
-      setWorkspaceStoreStatus(normalizeWorkspaceStoreStatus(null));
-      return;
-    }
-    const resp = await fetchStreamWorkspaceStoreStatus();
-    if (!resp.ok) {
-      if (options?.notifyOnError) {
-        notifications.show({
-          color: "red",
-          title: "Workspace store status failed",
-          message: `${source}: ${
-            resp.error?.message ?? resp.error?.code ?? "workspace_store.status failed"
-          }`,
-        });
-      }
-      return;
-    }
-    setWorkspaceStoreStatus(normalizeWorkspaceStoreStatus(resp.result));
-  };
-
-  const loadStreamAnalysisWorkspaces = async (
-    source: string,
-    options?: { notifyOnError?: boolean }
-  ) => {
-    if (!streamAnalysisReadyRef.current) {
-      return false;
-    }
-    const listResp = await fetchStreamWorkspaceList();
-    if (!listResp.ok) {
-      if (options?.notifyOnError) {
-        notifications.show({
-          color: "red",
-          title: "Workspace load failed",
-          message: `${source}: ${
-            listResp.error?.message ?? listResp.error?.code ?? "workspace.list failed"
-          }`,
-        });
-      }
-      return false;
-    }
-    const listRaw = Array.isArray(listResp.result?.workspaces)
-      ? listResp.result.workspaces
-      : [];
-    const summaries = normalizeWorkspaceSummaries(listRaw);
-    const summaryById = new Map<string, Record<string, unknown>>();
-    for (const item of listRaw) {
-      if (!item || typeof item !== "object") {
-        continue;
-      }
-      const obj = item as Record<string, unknown>;
-      const workspaceId = String(obj.workspace_id ?? "").trim();
-      if (!workspaceId) {
-        continue;
-      }
-      summaryById.set(workspaceId, obj);
-    }
-    if (
-      summaries.length === 0 &&
-      Object.keys(streamWorkspacesRef.current).length > 0
-    ) {
-      await refreshWorkspaceStoreStatus(source, { notifyOnError: false });
-      return true;
-    }
-    const rawRecord: Record<string, unknown> = {};
-    await Promise.all(
-      summaries.map(async (summary) => {
-        const getResp = await fetchStreamWorkspace(summary.workspaceId);
-        if (getResp.ok && getResp.result && typeof getResp.result === "object") {
-          const raw = (getResp.result as { raw?: unknown }).raw;
-          if (raw && typeof raw === "object") {
-            rawRecord[summary.workspaceId] = raw as Record<string, unknown>;
-            return;
-          }
-        }
-        const fallback = summaryById.get(summary.workspaceId);
-        if (!fallback) {
-          return;
-        }
-        const graph =
-          fallback.graph && typeof fallback.graph === "object"
-            ? (fallback.graph as Record<string, unknown>)
-            : {};
-        const publish =
-          fallback.publish && typeof fallback.publish === "object"
-            ? (fallback.publish as Record<string, unknown>)
-            : {};
-        rawRecord[summary.workspaceId] = {
-          workspace_id: summary.workspaceId,
-          name:
-            typeof fallback.name === "string" && fallback.name.trim().length > 0
-              ? fallback.name.trim()
-              : undefined,
-          enabled: fallback.enabled !== false,
-          graph,
-          publish,
-        };
-      })
-    );
-    const normalized = normalizeStreamWorkspaceRecord(rawRecord);
-    const revisions: Record<string, number> = {};
-    for (const summary of summaries) {
-      if (normalized[summary.workspaceId]) {
-        revisions[summary.workspaceId] = summary.revision;
-      }
-    }
-    setStreamWorkspaces(normalized);
-    streamWorkspacesRef.current = normalized;
-    setStreamWorkspaceRevisions(revisions);
-    streamWorkspaceRevisionsRef.current = revisions;
-    streamWorkspaceIdRef.current = nextWorkspaceCounter(normalized);
-    await refreshWorkspaceStoreStatus(source, { notifyOnError: false });
-    return true;
-  };
-
-  const deleteStreamAnalysisWorkspace = async (workspaceId: string, source: string) => {
-    if (!streamAnalysisReadyRef.current) {
-      return;
-    }
-    const expectedRevision =
-      streamWorkspaceRevisionsRef.current[workspaceId] ?? null;
-    const resp = await deleteStreamWorkspace(workspaceId, expectedRevision);
-    if (resp.ok) {
-      setStreamWorkspaceRevisions((prev) => {
-        if (!(workspaceId in prev)) {
-          return prev;
-        }
-        const next = { ...prev };
-        delete next[workspaceId];
-        streamWorkspaceRevisionsRef.current = next;
-        return next;
-      });
-      await refreshWorkspaceStoreStatus(source, { notifyOnError: false });
-      return;
-    }
-    if (String(resp.error?.code ?? "").toLowerCase() === "revision_conflict") {
-      notifications.show({
-        color: "yellow",
-        title: "Workspace changed elsewhere",
-        message: `${source}: Reloaded latest workspace state.`,
-      });
-      await loadStreamAnalysisWorkspaces(source, { notifyOnError: false });
-      return;
-    }
-    if (
-      String(resp.error?.code ?? "").toLowerCase() !== "unknown_workspace"
-    ) {
-      notifications.show({
-        color: "red",
-        title: "stream_analysis sync failed",
-        message: `${source}: ${resp.error?.message ?? "workspace.delete failed"}`,
-      });
-    }
-  };
-
-  const buildStreamAnalysisWorkspacePayload = (
-    workspace: StreamAnalysisWorkspaceConfig
-  ): Record<string, unknown> | null => {
-    const graphNodes = Array.isArray(workspace.graphNodes) ? workspace.graphNodes : [];
-    if (graphNodes.length <= 0) {
-      return null;
-    }
-    const nodes: Array<Record<string, unknown>> = graphNodes.map((node) => {
-      const spec = STREAM_DAG_OPS[node.op];
-      const params: Record<string, unknown> = {};
-      for (const field of spec.params) {
-        const raw = node.params[field.name];
-        const coerced = coerceDagParamValue(raw, field.kind);
-        if (
-          field.optional &&
-          (coerced === "" || coerced === null || coerced === undefined)
-        ) {
-          continue;
-        }
-        params[field.name] = coerced;
-      }
-      const inputs: Record<string, unknown> = {};
-      const allInputPorts = [...spec.inputs, ...(spec.optionalInputs ?? [])];
-      for (const port of allInputPorts) {
-        const sourceNodeId = String(node.inputs[port] ?? "").trim();
-        if (sourceNodeId) {
-          inputs[port] = sourceNodeId;
-        }
-      }
-      const out: Record<string, unknown> = {
-        id: node.id,
-        op: node.op,
-        params,
-      };
-      if (allInputPorts.length > 0) {
-        out.inputs = inputs;
-      }
-      return out;
+  // Raw-stream WebSocket subscriptions (round 34). See
+  // features/telemetry/useRawStreamSubscriptions.ts. Owns the per-
+  // subscription snapshot hydration + live-WS plumbing that used to
+  // be two inline useEffects in App.tsx.
+  const bumpPlotTick = useCallback(
+    () => setPlotTick((tick) => tick + 1),
+    [setPlotTick]
+  );
+  const { wsConnected: streamWsConnected } = useRawStreamSubscriptions({
+    activeSubscriptions: activeRawStreamSubscriptions,
+    applyFrame: applyRawStreamFrameToPanels,
+    bumpPlotTick,
+  });
+  const { wsConnected: streamAnalysisWsConnected } =
+    useStreamAnalysisSubscriptions({
+      activeSubscriptions: activeStreamAnalysisWorkspaceSubscriptions,
+      streamAnalysisRpcReady,
+      applyOutput: applyStreamAnalysisOutputToPanels,
+      bumpPlotTick,
     });
 
-    const outputs = (Array.isArray(workspace.publishOutputs) ? workspace.publishOutputs : [])
-      .map((output) => ({
-        output_id: String(output.outputId ?? "").trim(),
-        node_id: String(output.nodeId ?? "").trim(),
-      }))
-      .filter((output) => output.output_id && output.node_id);
-
-    return {
-      workspace_id: workspace.workspaceId,
-      name: workspace.name,
-      enabled: workspace.enabled !== false,
-      graph: { nodes },
-      publish: { outputs },
-    };
-  };
-
-  const syncStreamAnalysisWorkspace = async (workspaceId: string, source: string) => {
-    if (!streamAnalysisReadyRef.current) {
-      return;
-    }
-    const workspaceConfig = streamWorkspacesRef.current[workspaceId];
-    if (!workspaceConfig) {
-      await deleteStreamAnalysisWorkspace(workspaceId, source);
-      return;
-    }
-    const workspace = buildStreamAnalysisWorkspacePayload(workspaceConfig);
-    if (!workspace) {
-      await deleteStreamAnalysisWorkspace(workspaceConfig.workspaceId, source);
-      return;
-    }
-    const expectedRevision = Object.prototype.hasOwnProperty.call(
-      streamWorkspaceRevisionsRef.current,
-      workspaceConfig.workspaceId
-    )
-      ? streamWorkspaceRevisionsRef.current[workspaceConfig.workspaceId]
-      : 0;
-    const resp = await putStreamWorkspace(
-      workspaceConfig.workspaceId,
-      workspace,
-      expectedRevision
-    );
-    if (
-      !resp.ok &&
-      String(resp.error?.code ?? "").toLowerCase() === "revision_conflict"
-    ) {
-      notifications.show({
-        color: "yellow",
-        title: "Workspace changed elsewhere",
-        message: `${source}: Reloaded latest workspace state.`,
-      });
-      await loadStreamAnalysisWorkspaces(source, { notifyOnError: false });
-      return;
-    }
-    if (!resp.ok) {
-      notifications.show({
-        color: "red",
-        title: "stream_analysis sync failed",
-        message: `${source}: ${resp.error?.message ?? "workspace.put failed"}`,
-      });
-      return;
-    }
-    const resultObj =
-      resp.result && typeof resp.result === "object"
-        ? (resp.result as Record<string, unknown>)
-        : {};
-    const raw =
-      resultObj.raw && typeof resultObj.raw === "object"
-        ? ({ [workspaceConfig.workspaceId]: resultObj.raw } as Record<
-            string,
-            unknown
-          >)
-        : ({ [workspaceConfig.workspaceId]: workspace } as Record<
-            string,
-            unknown
-          >);
-    const normalized = normalizeStreamWorkspaceRecord(raw);
-    const nextWorkspace = normalized[workspaceConfig.workspaceId];
-    if (nextWorkspace) {
-      setStreamWorkspaces((prev) => ({
-        ...prev,
-        [workspaceConfig.workspaceId]: nextWorkspace,
-      }));
-      streamWorkspacesRef.current = {
-        ...streamWorkspacesRef.current,
-        [workspaceConfig.workspaceId]: nextWorkspace,
-      };
-    }
-    const summaryRaw =
-      resultObj.workspace && typeof resultObj.workspace === "object"
-        ? (resultObj.workspace as Record<string, unknown>)
-        : null;
-    if (summaryRaw) {
-      const summaries = normalizeWorkspaceSummaries([summaryRaw]);
-      const summary = summaries[0];
-      if (summary) {
-        setStreamWorkspaceRevisions((prev) => ({
-          ...prev,
-          [workspaceConfig.workspaceId]: summary.revision,
-        }));
-        streamWorkspaceRevisionsRef.current = {
-          ...streamWorkspaceRevisionsRef.current,
-          [workspaceConfig.workspaceId]: summary.revision,
-        };
-      }
-    }
-    await refreshWorkspaceStoreStatus(source, { notifyOnError: false });
-  };
+  // Workspace-list management (round 24). See
+  // features/stream_analysis/useWorkspaceListManagement.ts. Four
+  // async handlers (refresh / load / delete / sync) + the
+  // buildStreamAnalysisWorkspacePayload helper used by both sync
+  // and the still-inline applyDaqWorkspace.
+  const {
+    refreshWorkspaceStoreStatus,
+    loadStreamAnalysisWorkspaces,
+    deleteStreamAnalysisWorkspace,
+    buildStreamAnalysisWorkspacePayload,
+    syncStreamAnalysisWorkspace,
+  } = useWorkspaceListManagement();
 
   useEffect(() => {
     for (const panel of panels) {
@@ -4757,2112 +2322,153 @@ export function App() {
     }
   }, [panels, buffersRef, streamBinStatsRef, streamBin2dRef]);
 
-  const createPanel = (kind: PanelKind) => {
-    panelIdRef.current += 1;
-    const id = `panel-${panelIdRef.current}`;
-    const workspaceIds = Object.keys(streamWorkspacesRef.current).sort();
-    let defaultWorkspaceId = workspaceIds[0] ?? null;
-    if (!defaultWorkspaceId) {
-      const nextId = Math.max(1, Math.trunc(streamWorkspaceIdRef.current));
-      const workspaceId = `workspace-${nextId}`;
-      streamWorkspaceIdRef.current = nextId + 1;
-      const workspace = defaultStreamAnalysisWorkspaceConfig(workspaceId);
-      setStreamWorkspaces((prev) => ({ ...prev, [workspaceId]: workspace }));
-      streamWorkspacesRef.current = {
-        ...streamWorkspacesRef.current,
-        [workspaceId]: workspace,
-      };
-      if (!daqWorkspaceId) {
-        setDaqWorkspaceId(workspaceId);
-      }
-      defaultWorkspaceId = workspaceId;
-    }
-    const workspaceConfig =
-      (defaultWorkspaceId && streamWorkspacesRef.current[defaultWorkspaceId]) ?? null;
-    let panel: PlotPanelState;
-    if (kind === "stream_raw" || kind === "stream_waterfall") {
-      const traceOutputId = defaultOutputForKind(workspaceConfig, "trace");
-      panel = {
-        id,
-        title:
-          kind === "stream_waterfall"
-            ? `Waterfall ${panelIdRef.current}`
-            : `Trace ${panelIdRef.current}`,
-        kind,
-        sourceMode: "raw",
-        stream: null,
-        overlayCount:
-          kind === "stream_waterfall"
-            ? DEFAULT_WATERFALL_ROWS
-            : DEFAULT_STREAM_OVERLAY_COUNT,
-        channelIndex: 0,
-        workspaceId: defaultWorkspaceId ?? id,
-        outputId: traceOutputId,
-        overlayOutputIds: [],
-        traceDecimator: DEFAULT_TRACE_DECIMATOR,
-        traceMaxPoints: DEFAULT_TRACE_MAX_POINTS,
-        traceMaxFps: DEFAULT_TRACE_MAX_FPS,
-        rollingWindow: DEFAULT_TRACE_ROLLING_WINDOW,
-        averageMode: DEFAULT_TRACE_AVERAGE_MODE,
-        yScaleMode: "auto",
-        yMin: null,
-        yMax: null,
-      };
-      streamFramesRef.set(id, []);
-      streamTraceOverlayRef.set(id, new Map());
-    } else if (kind === "stream_scalar") {
-      const integralOutputId = defaultOutputForKind(workspaceConfig, "scalar");
-      panel = {
-        id,
-        title: `Scalar ${panelIdRef.current}`,
-        kind: "stream_scalar",
-        workspaceId: defaultWorkspaceId ?? id,
-        outputId: integralOutputId,
-        stream: workspaceConfig?.stream ?? null,
-        channelIndex: workspaceConfig?.channelIndex ?? 0,
-        analysis: workspaceConfig?.analysis ?? defaultStreamAnalysisSettings(),
-        timeWindowS: DEFAULT_WINDOW_S,
-        yScaleMode: "auto",
-        yMin: null,
-        yMax: null,
-      };
-      buffersRef.set(id, new Map());
-    } else if (kind === "stream_params") {
-      const paramsOutputIds = workspaceOutputOptionsByKind(
-        workspaceConfig,
-        "params_map"
-      ).map((item) => item.value);
-      const firstScalarOutputId = defaultOutputForKind(workspaceConfig, "scalar");
-      panel = {
-        id,
-        title: `Params ${panelIdRef.current}`,
-        kind: "stream_params",
-        workspaceId: defaultWorkspaceId ?? id,
-        outputIds:
-          paramsOutputIds.length > 0
-            ? paramsOutputIds
-            : firstScalarOutputId
-            ? [firstScalarOutputId]
-            : [],
-      };
-      streamParamsLatestRef.set(id, {});
-    } else if (kind === "stream_bin_stats") {
-      const binOutputId = defaultOutputForKind(workspaceConfig, "hist_agg");
-      panel = {
-        id,
-        title: `Bin stats ${panelIdRef.current}`,
-        kind: "stream_bin_stats",
-        workspaceId: defaultWorkspaceId ?? id,
-        outputId: binOutputId,
-        overlayOutputIds: [],
-        fitOverlayOutputIds: [],
-        stream: workspaceConfig?.stream ?? null,
-        channelIndex: workspaceConfig?.channelIndex ?? 0,
-        analysis: workspaceConfig?.analysis ?? defaultStreamAnalysisSettings(),
-        binStats: workspaceConfig?.binStats ?? defaultStreamBinStatsSettings(),
-        uncertaintyMode: "sem",
-        uncertaintyScale: DEFAULT_UNCERTAINTY_SCALE,
-        showBinMarkers: false,
-        yScaleMode: "auto",
-        yMin: null,
-        yMax: null,
-      };
-      streamBinStatsRef.delete(id);
-      streamBinStatsFitOverlayRef.delete(id);
-    } else if (kind === "stream_bin2d") {
-      const bin2dOutputId = defaultOutputForKind(workspaceConfig, "hist2d");
-      panel = {
-        id,
-        title: `Bin2D ${panelIdRef.current}`,
-        kind: "stream_bin2d",
-        workspaceId: defaultWorkspaceId ?? id,
-        outputId: bin2dOutputId,
-        reducer: DEFAULT_BIN2D_REDUCER,
-        yScaleMode: "auto",
-        yMin: null,
-        yMax: null,
-      };
-      streamBin2dRef.delete(id);
-    } else {
-      panel = {
-        id,
-        title: `Panel ${panelIdRef.current}`,
-        kind: "telemetry",
-        traces: [],
-        timeWindowS: DEFAULT_WINDOW_S,
-        yScaleMode: "auto",
-        yMin: null,
-        yMax: null,
-        yDisplayMode: "absolute",
-        yOffsetMode: "auto",
-        yOffsetValue: null,
-        smoothingMode: DEFAULT_TELEMETRY_SMOOTHING_MODE,
-        smoothingWindowS: DEFAULT_TELEMETRY_SMOOTHING_WINDOW_S,
-      };
-      buffersRef.set(id, new Map());
-    }
-    setPanels((prev) => [...prev, panel]);
-    setActivePanelId(id);
-  };
+  // createPanel / removePanel / addTraceToPanel / removeTraceFromPanel /
+  // setPanelTimeWindow (round 19). See features/panels/usePanelLifecycle.ts.
+  // These are the most cross-context-coupled handlers — createPanel reads
+  // PanelsContext + StreamAnalysisContext + TelemetryContext + default
+  // constants. The hook takes the App-local editor state + closePlotOptions
+  // as args because those haven't been extracted yet.
+  // clearPanelBuffers now provided by useStreamPanelHandlers.
+  // clearStreamPanelFrames now provided by useStreamPanelHandlers.
+  // clearStreamBinStatsPanel now provided by useStreamPanelHandlers.
+  // clearStreamBin2dPanel now provided by useStreamPanelHandlers.
+  const {
+    createPanel,
+    removePanel,
+    addTraceToPanel,
+    removeTraceFromPanel,
+    setPanelTimeWindow,
+  } = usePanelLifecycle({
+    latestByDevice,
+    closePlotOptions,
+  });
 
-  const removePanel = (panelId: string) => {
-    if (panels.length <= 1) {
-      return;
-    }
-    const nextActive = panels.find((panel) => panel.id !== panelId);
-    buffersRef.delete(panelId);
-    streamFramesRef.delete(panelId);
-    streamTraceOverlayRef.delete(panelId);
-    streamBinStatsOverlayRef.delete(panelId);
-    streamBinStatsFitOverlayRef.delete(panelId);
-    streamParamsLatestRef.delete(panelId);
-    streamBinStatsRef.delete(panelId);
-    streamBin2dRef.delete(panelId);
-    if (editingPanelId === panelId) {
-      setEditingPanelId(null);
-      setPanelTitleDraft("");
-    }
-    if (streamTraceOptionsPanelId === panelId) {
-      setStreamTraceOptionsPanelId(null);
-    }
-    if (streamBinStatsOptionsPanelId === panelId) {
-      setStreamBinStatsOptionsPanelId(null);
-    }
-    if (streamBin2dOptionsPanelId === panelId) {
-      setStreamBin2dOptionsPanelId(null);
-    }
-    if (streamParamsOptionsPanelId === panelId) {
-      setStreamParamsOptionsPanelId(null);
-    }
-    if (plotOptionsPanelId === panelId) {
-      closePlotOptions();
-    }
-    if (expandedPlotPanelId === panelId) {
-      setExpandedPlotPanelId(null);
-    }
-    setPanels((prev) => prev.filter((panel) => panel.id !== panelId));
-    if (activePanelId === panelId && nextActive) {
-      setActivePanelId(nextActive.id);
-    }
-    setPlotTick((tick) => tick + 1);
-  };
+  // setPanelYScaleMode + setPanelManualYRange now provided by
+  // usePanelUiHandlers (destructured below alongside the other simple
+  // panel-config + modal handlers).
 
-  const addTraceToPanel = (
-    panelId: string,
-    deviceId: string,
-    signal: string
-  ) => {
-    const panel = panels.find((p) => p.id === panelId);
-    if (!panel || !isTelemetryPanel(panel)) {
-      return;
-    }
-    if (panel.traces.some((t) => t.deviceId === deviceId && t.signal === signal)) {
-      return;
-    }
-    const units =
-      latestByDevice[deviceId]?.[signal]?.units ??
-      null;
-    const latestValue = latestByDevice[deviceId]?.[signal]?.value;
-    const valueKind =
-      typeof latestValue === "boolean"
-        ? "boolean"
-        : typeof latestValue === "number"
-        ? "number"
-        : undefined;
-    const trace = { deviceId, signal, units, valueKind };
-    setPanels((prev) =>
-      prev.map((p) =>
-        p.id === panelId ? { ...p, traces: [...p.traces, trace] } : p
-      )
-    );
-    const panelBuffers = ensurePanelBuffers(panelId);
-    const capacity = panelCapacity(panel.timeWindowS);
-    const key = traceKeyId(trace);
-    if (!panelBuffers.has(key)) {
-      panelBuffers.set(key, new RingBuffer(capacity));
-    }
-    setPlotTick((tick) => tick + 1);
-  };
+  // resolveTelemetryPanelOffset, setTelemetryYOffsetMode,
+  // resolvePanelAutoYRange, openPlotOptions, closePlotOptions,
+  // applyPlotOptionsAxis, and setPlotOptionsAxisMode are now
+  // provided by usePanelAutoRangeHandlers (destructured above).
+  // streamTraceOverlaySeries, streamBinStatsOverlaySeries, and
+  // streamBinStatsFitOverlayCurves are pure functions in
+  // features/panels/overlayHelpers.ts; the local arrow wrappers near
+  // the top of this function bind the overlay refs from
+  // TelemetryContext.
 
-  const removeTraceFromPanel = (panelId: string, trace: TraceKey) => {
-    setPanels((prev) =>
-      prev.map((panel) =>
-        panel.id === panelId && isTelemetryPanel(panel)
-          ? {
-              ...panel,
-              traces: panel.traces.filter(
-                (item) =>
-                  !(item.deviceId === trace.deviceId && item.signal === trace.signal)
-              ),
-            }
-          : panel
-      )
-    );
-    const panelBuffers = buffersRef.get(panelId);
-    panelBuffers?.delete(traceKeyId(trace));
-    setPlotTick((tick) => tick + 1);
-  };
+  // renderExpandedPlot moved to ExpandedPlotBody (round 28).
+  // The expanded-plot modal now renders <ExpandedPlotBody panel={...} />
+  // — see App.tsx PlotModalsLayer wiring below.
+  // setStreamPanelTargetFromKey now provided by useStreamPanelHandlers.
+  // setStreamPanelOverlayCount now provided by useStreamPanelHandlers.
+  // setStreamPanelChannelIndex now provided by useStreamPanelHandlers.
+  // setStreamPanelTraceDecimator now provided by useStreamPanelHandlers.
+  // setStreamPanelTraceMaxPoints now provided by useStreamPanelHandlers.
+  // setStreamPanelTraceMaxFps now provided by useStreamPanelHandlers.
+  // setStreamPanelRollingWindow now provided by useStreamPanelHandlers.
+  // setStreamPanelAverageMode now provided by useStreamPanelHandlers.
+  // setStreamTracePanelSourceMode now provided by useStreamWorkspaceHandlers.
+  // setStreamTracePanelWorkspace now provided by useStreamWorkspaceHandlers.
+  // setStreamTracePanelOutput now provided by useStreamWorkspaceHandlers.
+  // setStreamTracePanelOverlayOutputs now provided by useStreamWorkspaceHandlers.
+  // setStreamAnalysisPanelWorkspace now provided by useStreamWorkspaceHandlers.
+  // setStreamAnalysisPanelOutput now provided by useStreamWorkspaceHandlers.
+  // setStreamBinStatsUncertainty + setStreamBinStatsShowBinMarkers now
+  // provided by usePanelUiHandlers.
+  // setStreamParamsPanelOutputs now provided by useStreamWorkspaceHandlers.
+  // setStreamBinStatsOverlayOutputs now provided by useStreamWorkspaceHandlers.
+  // setStreamBinStatsFitOverlayOutputs now provided by useStreamWorkspaceHandlers.
+  // setStreamBin2dReducer now provided by usePanelUiHandlers.
+  // clearWorkspaceBinPanels now provided by useStreamPanelHandlers.
+  // Workspace-store CRUD + node-aggregate reset (round 23). See
+  // features/stream_analysis/useWorkspaceStoreActions.ts.
+  const {
+    resetDaqNodeAggregate,
+    saveDaqWorkspaceStore,
+    reloadDaqWorkspaceStore,
+  } = useWorkspaceStoreActions({
+    clearWorkspaceBinPanels,
+    refreshWorkspaceStoreStatus,
+    loadStreamAnalysisWorkspaces,
+  });
 
-  const clearPanelBuffers = (panelId: string) => {
-    const panelBuffers = buffersRef.get(panelId);
-    if (!panelBuffers) {
-      return;
-    }
-    for (const buffer of panelBuffers.values()) {
-      buffer.clear();
-    }
-    setPlotTick((tick) => tick + 1);
-  };
+  // DAQ workspace modal lifecycle (round 22). See
+  // features/stream_analysis/useDaqModalLifecycle.ts. Open / close /
+  // load / create + the focus-highlight helper. Takes
+  // loadStreamAnalysisWorkspaces from App as an arg because it's
+  // still defined inline above.
+  const {
+    focusDaqNodeCard,
+    loadDaqWorkspaceDraft,
+    createStreamWorkspace,
+    openDaqModal,
+    closeDaqModal,
+  } = useDaqModalLifecycle({
+    loadStreamAnalysisWorkspaces,
+  });
 
-  const clearStreamPanelFrames = (panelId: string) => {
-    streamFramesRef.set(panelId, []);
-    streamTraceOverlayRef.set(panelId, new Map());
-    setPlotTick((tick) => tick + 1);
-  };
+  // DAQ draft node/output editors (round 21). See
+  // features/stream_analysis/useDaqDraftEditors.ts. Pure draft-state
+  // mutators — every handler here only touches the draft state in
+  // StreamAnalysisContext, never the API or panel/output cascade.
+  const {
+    setDaqNodeId,
+    setDaqNodeOp,
+    setDaqNodeInput,
+    setDaqNodeParam,
+    addDaqNode,
+    removeDaqNode,
+    setDaqOutputId,
+    setDaqOutputNode,
+    addDaqOutput,
+    removeDaqOutput,
+  } = useDaqDraftEditors();
 
-  const clearStreamBinStatsPanel = async (panelId: string) => {
-    const panel = panels.find((entry) => entry.id === panelId);
-    if (!panel || !isStreamBinStatsPanel(panel)) {
-      return;
-    }
-    const workspace = streamWorkspacesRef.current[panel.workspaceId] ?? null;
-    const outputId = String(panel.outputId ?? "").trim();
-    const output = workspace?.publishOutputs.find((entry) => entry.outputId === outputId);
-    const nodeId = output?.nodeId ?? null;
-    const node = nodeId
-      ? workspace?.graphNodes.find((entry) => entry.id === nodeId) ?? null
-      : null;
-    if (
-      streamAnalysisReadyRef.current &&
-      workspace &&
-      node &&
-      node.op === "aggregate.bin_stats"
-    ) {
-      const resp = await resetStreamWorkspace(workspace.workspaceId, node.id);
-      if (!resp.ok) {
-        notifications.show({
-          color: "red",
-          title: "Clear binned data failed",
-          message: resp.error?.message ?? resp.error?.code ?? "workspace.reset failed",
-        });
-      } else {
-        clearWorkspaceBinPanels(workspace.workspaceId, node.id);
-        return;
-      }
-    }
-    streamBinStatsRef.delete(panelId);
-    streamBinStatsOverlayRef.set(panelId, new Map());
-    streamBinStatsFitOverlayRef.set(panelId, new Map());
-    setPlotTick((tick) => tick + 1);
-  };
+  // applyDaqWorkspace (round 25). See
+  // features/stream_analysis/useDaqWorkspaceApply.ts. The heaviest
+  // single DAQ handler: validates the draft, commits the workspace
+  // locally, cascades the new output set into every panel bound to
+  // this workspace, and pushes the result to the runtime.
+  const { applyDaqWorkspace } = useDaqWorkspaceApply({
+    streamCatalogByKey,
+    buildStreamAnalysisWorkspacePayload,
+    syncStreamAnalysisWorkspace,
+    clearPanelBuffers,
+  });
 
-  const clearStreamBin2dPanel = async (panelId: string) => {
-    const panel = panels.find((entry) => entry.id === panelId);
-    if (!panel || !isStreamBin2dPanel(panel)) {
-      return;
-    }
-    const workspace = streamWorkspacesRef.current[panel.workspaceId] ?? null;
-    const outputId = String(panel.outputId ?? "").trim();
-    const output = workspace?.publishOutputs.find((entry) => entry.outputId === outputId);
-    const nodeId = output?.nodeId ?? null;
-    const node = nodeId
-      ? workspace?.graphNodes.find((entry) => entry.id === nodeId) ?? null
-      : null;
-    if (
-      streamAnalysisReadyRef.current &&
-      workspace &&
-      node &&
-      node.op === "aggregate.bin2d_stats"
-    ) {
-      const resp = await resetStreamWorkspace(workspace.workspaceId, node.id);
-      if (!resp.ok) {
-        notifications.show({
-          color: "red",
-          title: "Clear binned data failed",
-          message: resp.error?.message ?? resp.error?.code ?? "workspace.reset failed",
-        });
-      } else {
-        clearWorkspaceBinPanels(workspace.workspaceId, node.id);
-        return;
-      }
-    }
-    streamBin2dRef.delete(panelId);
-    setPlotTick((tick) => tick + 1);
-  };
+  // saveDaqWorkspaceStore + reloadDaqWorkspaceStore now provided by
+  // useWorkspaceStoreActions (round 23).
 
-  const setPanelTimeWindow = (panelId: string, value: number) => {
-    const panel = panels.find((p) => p.id === panelId);
-    if (
-      !panel ||
-      (!isTelemetryPanel(panel) && !isStreamScalarPanel(panel))
-    ) {
-      return;
-    }
-    const nextWindow = Number.isFinite(value) ? Math.max(5, value) : panel.timeWindowS;
-    setPanels((prev) =>
-      prev.map((p) =>
-        p.id === panelId &&
-        (isTelemetryPanel(p) || isStreamScalarPanel(p))
-          ? { ...p, timeWindowS: nextWindow }
-          : p
-      )
-    );
-    const capacity = panelCapacity(nextWindow);
-    const panelBuffers = ensurePanelBuffers(panelId);
-    const traceKeys = isTelemetryPanel(panel)
-      ? new Set(panel.traces.map(traceKeyId))
-      : new Set([traceKeyId(streamScalarTrace(panel))]);
-    for (const [key, buffer] of panelBuffers.entries()) {
-      if (!traceKeys.has(key)) {
-        panelBuffers.delete(key);
-      } else {
-        buffer.resize(capacity);
-      }
-    }
-    if (isTelemetryPanel(panel)) {
-      for (const trace of panel.traces) {
-        const key = traceKeyId(trace);
-        if (!panelBuffers.has(key)) {
-          panelBuffers.set(key, new RingBuffer(capacity));
-        }
-      }
-    } else {
-      const key = traceKeyId(streamScalarTrace(panel));
-      if (!panelBuffers.has(key)) {
-        panelBuffers.set(key, new RingBuffer(capacity));
-      }
-    }
-    setPlotTick((tick) => tick + 1);
-  };
+  // Panel title editor (round 20). See features/panels/usePanelTitleEditor.ts.
+  // The editor state itself (editingPanelId, panelTitleDraft) lives in
+  // PanelsContext so usePanelLifecycle's removePanel can clear it.
+  const {
+    startPanelTitleEdit,
+    cancelPanelTitleEdit,
+    commitPanelTitleEdit,
+  } = usePanelTitleEditor();
 
-  const setPanelYScaleMode = (panelId: string, mode: YScaleMode) => {
-    setPanels((prev) =>
-      prev.map((panel) => {
-        if (panel.id !== panelId) {
-          return panel;
-        }
-        if (mode === "auto") {
-          return { ...panel, yScaleMode: "auto", yMin: null, yMax: null };
-        }
-        const nextMin = panel.yMin ?? 0;
-        const nextMax = panel.yMax ?? (nextMin + 1);
-        return {
-          ...panel,
-          yScaleMode: "manual",
-          yMin: nextMin,
-          yMax: nextMax > nextMin ? nextMax : nextMin + 1,
-        };
-      })
-    );
-  };
-
-  const setPanelManualYRange = (panelId: string, min: number, max: number) => {
-    setPanels((prev) =>
-      prev.map((panel) =>
-        panel.id === panelId
-          ? { ...panel, yScaleMode: "manual", yMin: min, yMax: max }
-          : panel
-      )
-    );
-  };
-
-  const resolveTelemetryPanelOffset = (
-    panel: PlotTelemetryPanelState
-  ): number | null => {
-    if (panel.yDisplayMode !== "delta") {
-      return null;
-    }
-    if (
-      panel.yOffsetMode === "freeze" &&
-      typeof panel.yOffsetValue === "number" &&
-      Number.isFinite(panel.yOffsetValue)
-    ) {
-      return Math.round(panel.yOffsetValue);
-    }
-    const numericTraces = panel.traces.filter(
-      (trace) => trace.valueKind !== "boolean"
-    );
-    if (numericTraces.length === 0) {
-      return null;
-    }
-    const panelBuffers = buffersRef.get(panel.id) ?? new Map<string, RingBuffer>();
-    const range = normalizeAutoRange(
-      computeTelemetryAutoYRange(numericTraces, panelBuffers, panel.timeWindowS)
-    );
-    if (!range) {
-      return null;
-    }
-    return Math.round((range.min + range.max) / 2);
-  };
-
-  const setTelemetryYDisplayMode = (panelId: string, mode: YDisplayMode) => {
-    setPanels((prev) =>
-      prev.map((panel) => {
-        if (panel.id !== panelId || !isTelemetryPanel(panel)) {
-          return panel;
-        }
-        if (mode === "absolute") {
-          return { ...panel, yDisplayMode: "absolute" };
-        }
-        return { ...panel, yDisplayMode: "delta" };
-      })
-    );
-  };
-
-  const setTelemetryYOffsetMode = (
-    panelId: string,
-    mode: YOffsetMode,
-    value: number | null = null
-  ) => {
-    const panel = panels.find((entry) => entry.id === panelId);
-    const resolvedFreezeValue =
-      mode === "freeze"
-        ? typeof value === "number" && Number.isFinite(value)
-          ? value
-          : panel && isTelemetryPanel(panel)
-          ? resolveTelemetryPanelOffset(panel)
-          : null
-        : null;
-    setPanels((prev) =>
-      prev.map((panel) => {
-        if (panel.id !== panelId || !isTelemetryPanel(panel)) {
-          return panel;
-        }
-        if (
-          mode === "freeze" &&
-          typeof resolvedFreezeValue === "number" &&
-          Number.isFinite(resolvedFreezeValue)
-        ) {
-          return {
-            ...panel,
-            yOffsetMode: "freeze",
-            yOffsetValue: Math.round(resolvedFreezeValue),
-          };
-        }
-        return { ...panel, yOffsetMode: "auto", yOffsetValue: null };
-      })
-    );
-  };
-
-  const setTelemetrySmoothingMode = (
-    panelId: string,
-    mode: TelemetrySmoothingMode
-  ) => {
-    const nextMode = normalizeTelemetrySmoothingMode(mode);
-    setPanels((prev) =>
-      prev.map((panel) => {
-        if (panel.id !== panelId || !isTelemetryPanel(panel)) {
-          return panel;
-        }
-        return {
-          ...panel,
-          smoothingMode: nextMode,
-          smoothingWindowS: normalizeTelemetrySmoothingWindow(panel.smoothingWindowS),
-        };
-      })
-    );
-  };
-
-  const setTelemetrySmoothingWindow = (panelId: string, value: number) => {
-    setPanels((prev) =>
-      prev.map((panel) => {
-        if (panel.id !== panelId || !isTelemetryPanel(panel)) {
-          return panel;
-        }
-        return {
-          ...panel,
-          smoothingWindowS: normalizeTelemetrySmoothingWindow(value),
-        };
-      })
-    );
-  };
-
-  const resolvePanelAutoYRange = (
-    panel: PlotPanelState | null
-  ): { min: number; max: number } | null => {
-    if (!panel) {
-      return null;
-    }
-    if (isTelemetryPanel(panel)) {
-      const panelBuffers = buffersRef.get(panel.id) ?? new Map<string, RingBuffer>();
-      const range = normalizeAutoRange(
-        computeTelemetryAutoYRange(panel.traces, panelBuffers, panel.timeWindowS)
-      );
-      if (!range) {
-        return null;
-      }
-      if (panel.yDisplayMode !== "delta") {
-        return range;
-      }
-      const offset = resolveTelemetryPanelOffset(panel);
-      if (offset === null) {
-        return range;
-      }
-      return {
-        min: range.min - offset,
-        max: range.max - offset,
-      };
-    }
-    if (isStreamScalarPanel(panel)) {
-      const panelBuffers = buffersRef.get(panel.id) ?? new Map<string, RingBuffer>();
-      return normalizeAutoRange(
-        computeTelemetryAutoYRange(
-          [streamScalarTrace(panel)],
-          panelBuffers,
-          panel.timeWindowS
-        )
-      );
-    }
-    if (isStreamBinStatsPanel(panel)) {
-      const snapshot = streamBinStatsRef.get(panel.id) ?? null;
-        return normalizeAutoRange(
-          computeStreamBinStatsAutoYRange(
-            snapshot?.series ?? null,
-            panel.uncertaintyMode,
-            panel.uncertaintyScale,
-            streamBinStatsOverlaySeries(panel),
-            streamBinStatsFitOverlayCurves(panel)
-          )
+  const onPlotSignal = useCallback(
+    (deviceId: string, signal: string) => {
+      const active = panels.find((panel) => panel.id === activePanelId);
+      const target =
+        (active && isTelemetryPanel(active) ? active : null) ??
+        panels.find((panel): panel is PlotTelemetryPanelState =>
+          isTelemetryPanel(panel)
         );
-    }
-    if (isStreamBin2dPanel(panel)) {
-      const snapshot = streamBin2dRef.get(panel.id) ?? null;
-      return normalizeAutoRange(
-        computeStreamBin2dAutoZRange(snapshot?.series ?? null, panel.reducer)
-      );
-    }
-    const frames = streamFramesRef.get(panel.id) ?? [];
-    if (isStreamWaterfallPanel(panel)) {
-      return normalizeAutoRange(
-        computeStreamWaterfallAutoZRange(
-          frames,
-          panel.overlayCount,
-          panel.sourceMode === "raw" ? panel.channelIndex : 0
-        )
-      );
-    }
-    return normalizeAutoRange(
-      computeStreamRawAutoYRange(
-        frames,
-        panel.overlayCount,
-        panel.sourceMode === "raw" ? panel.channelIndex : 0,
-        panel.sourceMode === "dag" ? streamTraceOverlaySeries(panel) : []
-      )
-    );
-  };
-
-  const openStreamTraceOptionsModal = (panelId: string) => {
-    const panel = panels.find((entry) => entry.id === panelId);
-    if (!panel || !isStreamTracePanel(panel)) {
-      return;
-    }
-    setStreamTraceOptionsPanelId(panelId);
-  };
-
-  const closeStreamTraceOptionsModal = () => {
-    setStreamTraceOptionsPanelId(null);
-  };
-
-  const openStreamBinStatsOptionsModal = (panelId: string) => {
-    const panel = panels.find((entry) => entry.id === panelId);
-    if (!panel || !isStreamBinStatsPanel(panel)) {
-      return;
-    }
-    setStreamBinStatsOptionsPanelId(panelId);
-  };
-
-  const closeStreamBinStatsOptionsModal = () => {
-    setStreamBinStatsOptionsPanelId(null);
-  };
-
-  const openStreamParamsOptionsModal = (panelId: string) => {
-    const panel = panels.find((entry) => entry.id === panelId);
-    if (!panel || !isStreamParamsPanel(panel)) {
-      return;
-    }
-    setStreamParamsOptionsPanelId(panelId);
-  };
-
-  const closeStreamParamsOptionsModal = () => {
-    setStreamParamsOptionsPanelId(null);
-  };
-
-  const openStreamBin2dOptionsModal = (panelId: string) => {
-    const panel = panels.find((entry) => entry.id === panelId);
-    if (!panel || !isStreamBin2dPanel(panel)) {
-      return;
-    }
-    setStreamBin2dOptionsPanelId(panelId);
-  };
-
-  const closeStreamBin2dOptionsModal = () => {
-    setStreamBin2dOptionsPanelId(null);
-  };
-
-  const isExpandablePlotPanel = (panel: (typeof panels)[number]) => {
-    return !isStreamParamsPanel(panel);
-  };
-
-  const openExpandedPlot = (panelId: string) => {
-    const panel = panels.find((entry) => entry.id === panelId);
-    if (!panel || !isExpandablePlotPanel(panel)) {
-      return;
-    }
-    setExpandedPlotPanelId(panelId);
-  };
-
-  const closeExpandedPlot = () => {
-    setExpandedPlotPanelId(null);
-  };
-
-  const openPlotOptions = (panelId: string) => {
-    const panel = panels.find((entry) => entry.id === panelId) ?? null;
-    if (!panel) {
-      return;
-    }
-    const autoRange = resolvePanelAutoYRange(panel);
-    setPlotOptionsPanelId(panelId);
-    setYAxisAutoRange(autoRange);
-    if (
-      panel.yScaleMode === "manual" &&
-      typeof panel.yMin === "number" &&
-      typeof panel.yMax === "number" &&
-      Number.isFinite(panel.yMin) &&
-      Number.isFinite(panel.yMax) &&
-      panel.yMin < panel.yMax
-    ) {
-      setYAxisDraftMin(panel.yMin);
-      setYAxisDraftMax(panel.yMax);
-      return;
-    }
-    setYAxisDraftMin(autoRange ? autoRange.min : "");
-    setYAxisDraftMax(autoRange ? autoRange.max : "");
-  };
-
-  const closePlotOptions = () => {
-    setPlotOptionsPanelId(null);
-    setYAxisDraftMin("");
-    setYAxisDraftMax("");
-    setYAxisAutoRange(null);
-  };
-
-  const applyPlotOptionsAxis = (panelId: string) => {
-    const min = parseNumberInput(yAxisDraftMin);
-    const max = parseNumberInput(yAxisDraftMax);
-    if (min === null || max === null) {
-      notifications.show({
-        color: "red",
-        title: "Invalid y range",
-        message: "Manual y-axis limits require numeric min and max values.",
-      });
-      return;
-    }
-    if (min >= max) {
-      notifications.show({
-        color: "red",
-        title: "Invalid y range",
-        message: "Y-axis min must be less than y-axis max.",
-      });
-      return;
-    }
-    setPanelManualYRange(panelId, min, max);
-  };
-
-  const setPlotOptionsAxisMode = (panel: PlotPanelState, mode: YScaleMode) => {
-    if (mode === "auto") {
-      setPanelYScaleMode(panel.id, "auto");
-      return;
-    }
-    const autoRange = resolvePanelAutoYRange(panel);
-    setYAxisAutoRange(autoRange);
-    if (
-      panel.yScaleMode !== "manual" ||
-      typeof panel.yMin !== "number" ||
-      typeof panel.yMax !== "number" ||
-      !Number.isFinite(panel.yMin) ||
-      !Number.isFinite(panel.yMax) ||
-      panel.yMin >= panel.yMax
-    ) {
-      if (autoRange) {
-        setYAxisDraftMin(autoRange.min);
-        setYAxisDraftMax(autoRange.max);
-      } else {
-        setYAxisDraftMin(0);
-        setYAxisDraftMax(1);
-      }
-    }
-    setPanelYScaleMode(panel.id, "manual");
-  };
-
-  const setStreamPanelTarget = (
-    panelId: string,
-    target: StreamTarget | null
-  ) => {
-    const targetChannelCount = inferChannelCountFromShape(target?.shape);
-    setPanels((prev) =>
-      prev.map((panel) =>
-        panel.id === panelId &&
-        isStreamTracePanel(panel) &&
-        panel.sourceMode === "raw"
-          ? {
-              ...panel,
-              stream: target,
-              channelIndex:
-                targetChannelCount <= 1
-                  ? 0
-                  : Math.max(0, Math.min(panel.channelIndex, targetChannelCount - 1)),
-            }
-          : panel
-      )
-    );
-    streamFramesRef.set(panelId, []);
-    streamTraceOverlayRef.set(panelId, new Map());
-    setPlotTick((tick) => tick + 1);
-  };
-
-  const streamTraceOverlaySeries = (
-    panel: PlotStreamPanelState | PlotStreamWaterfallPanelState
-  ) => {
-    const overlayMap = streamTraceOverlayRef.get(panel.id);
-    if (!overlayMap || overlayMap.size <= 0) {
-      return [];
-    }
-    const selected = panel.overlayOutputIds ?? [];
-    const out: Array<{ label: string; values: number[] }> = [];
-    for (const outputId of selected) {
-      const entry = overlayMap.get(outputId);
-      if (!entry || !Array.isArray(entry.values) || entry.values.length <= 0) {
-        continue;
-      }
-      out.push({
-        label: outputId,
-        values: entry.values,
-      });
-    }
-    return out;
-  };
-
-  const streamBinStatsOverlaySeries = (
-    panel: PlotStreamBinStatsPanelState
-  ) => {
-    const overlayMap = streamBinStatsOverlayRef.get(panel.id);
-    if (!overlayMap || overlayMap.size <= 0) {
-      return [];
-    }
-    const selected = panel.overlayOutputIds ?? [];
-    const out: Array<{ label: string; values: number[] }> = [];
-    for (const outputId of selected) {
-      const entry = overlayMap.get(outputId);
-      if (!entry || !Array.isArray(entry.values) || entry.values.length <= 0) {
-        continue;
-      }
-      out.push({ label: outputId, values: entry.values });
-    }
-    return out;
-  };
-
-  const streamBinStatsFitOverlayCurves = (
-    panel: PlotStreamBinStatsPanelState
-  ) => {
-    const overlayMap = streamBinStatsFitOverlayRef.get(panel.id);
-    if (!overlayMap || overlayMap.size <= 0) {
-      return [];
-    }
-    const selected = panel.fitOverlayOutputIds ?? [];
-    const out: Array<{ label: string; x: number[]; y: number[] }> = [];
-    for (const outputId of selected) {
-      const entry = overlayMap.get(outputId);
-      if (!entry) {
-        continue;
-      }
-      const x = entry.xDense ?? entry.x;
-      const y = entry.yhatDense ?? entry.yhat;
-      if (!Array.isArray(x) || !Array.isArray(y) || x.length <= 1 || y.length <= 1) {
-        continue;
-      }
-      out.push({ label: outputId, x, y });
-    }
-    return out;
-  };
-
-  const renderExpandedPlot = (panel: (typeof panels)[number]) => {
-    const plotHeight = 640;
-    if (isTelemetryPanel(panel)) {
-      return (
-        <PlotPanel
-          traces={panel.traces}
-          buffers={buffersRef.get(panel.id) ?? new Map()}
-          tick={plotTick}
-          timeWindowS={panel.timeWindowS}
-          colorScheme={computedColorScheme}
-          plotHeight={plotHeight}
-          yScaleMode={panel.yScaleMode}
-          yMin={panel.yMin}
-          yMax={panel.yMax}
-          yDisplayMode={panel.yDisplayMode}
-          yOffset={resolveTelemetryPanelOffset(panel)}
-          smoothingMode={panel.smoothingMode}
-          smoothingWindowS={panel.smoothingWindowS}
-        />
-      );
-    }
-    if (isStreamTracePanel(panel)) {
-      if (isStreamRawPanel(panel)) {
-        return (
-          <StreamRawPanel
-            frames={streamFramesRef.get(panel.id) ?? []}
-            overlayCount={panel.overlayCount}
-            channelIndex={panel.sourceMode === "raw" ? panel.channelIndex : 0}
-            tick={plotTick}
-            colorScheme={computedColorScheme}
-            plotHeight={plotHeight}
-            units={panel.stream?.units ?? null}
-            extraSeries={
-              panel.sourceMode === "dag" ? streamTraceOverlaySeries(panel) : []
-            }
-            yScaleMode={panel.yScaleMode}
-            yMin={panel.yMin}
-            yMax={panel.yMax}
-          />
-        );
-      }
-      return (
-        <StreamWaterfallPanel
-          frames={streamFramesRef.get(panel.id) ?? []}
-          historyRows={panel.overlayCount}
-          channelIndex={panel.sourceMode === "raw" ? panel.channelIndex : 0}
-          tick={plotTick}
-          colorScheme={computedColorScheme}
-          plotHeight={plotHeight}
-          zScaleMode={panel.yScaleMode}
-          zMin={panel.yMin}
-          zMax={panel.yMax}
-        />
-      );
-    }
-    if (isStreamScalarPanel(panel)) {
-      return (
-        <PlotPanel
-          traces={[streamScalarTrace(panel)]}
-          buffers={buffersRef.get(panel.id) ?? new Map()}
-          tick={plotTick}
-          timeWindowS={panel.timeWindowS}
-          colorScheme={computedColorScheme}
-          plotHeight={plotHeight}
-          yScaleMode={panel.yScaleMode}
-          yMin={panel.yMin}
-          yMax={panel.yMax}
-        />
-      );
-    }
-    if (isStreamBinStatsPanel(panel)) {
-      const streamWorkspace = streamWorkspaces[panel.workspaceId] ?? null;
-      return (
-        <StreamBinStatsPanel
-          series={(streamBinStatsRef.get(panel.id) ?? null)?.series ?? null}
-          overlaySeries={streamBinStatsOverlaySeries(panel)}
-          fitOverlays={streamBinStatsFitOverlayCurves(panel)}
-          xLabel={workspaceXAxisLabel(streamWorkspace, panel.outputId)}
-          uncertaintyMode={panel.uncertaintyMode}
-          uncertaintyScale={panel.uncertaintyScale}
-          showBinMarkers={panel.showBinMarkers}
-          tick={plotTick}
-          colorScheme={computedColorScheme}
-          plotHeight={plotHeight}
-          yScaleMode={panel.yScaleMode}
-          yMin={panel.yMin}
-          yMax={panel.yMax}
-        />
-      );
-    }
-    if (isStreamBin2dPanel(panel)) {
-      return (
-        <StreamBin2dPanel
-          series={(streamBin2dRef.get(panel.id) ?? null)?.series ?? null}
-          reducer={panel.reducer}
-          tick={plotTick}
-          colorScheme={computedColorScheme}
-          plotHeight={plotHeight}
-          zScaleMode={panel.yScaleMode}
-          zMin={panel.yMin}
-          zMax={panel.yMax}
-        />
-      );
-    }
-    return null;
-  };
-
-  const setStreamPanelTargetFromKey = (
-    panelId: string,
-    targetKey: string | null
-  ) => {
-    if (!targetKey) {
-      setStreamPanelTarget(panelId, null);
-      return;
-    }
-    const splitAt = targetKey.indexOf("|");
-    if (splitAt <= 0 || splitAt >= targetKey.length - 1) {
-      setStreamPanelTarget(panelId, null);
-      return;
-    }
-    const deviceId = targetKey.slice(0, splitAt);
-    const stream = targetKey.slice(splitAt + 1);
-    const meta = streamCatalogByKey.get(targetKey);
-    setStreamPanelTarget(panelId, {
-      deviceId,
-      stream,
-      units: typeof meta?.units === "string" ? meta.units : undefined,
-      shape: normalizeShape(meta?.shape),
-    });
-  };
-
-  const setStreamPanelOverlayCount = (panelId: string, value: number) => {
-    setPanels((prev) =>
-      prev.map((panel) =>
-        panel.id === panelId && isStreamTracePanel(panel)
-          ? {
-              ...panel,
-              overlayCount: Number.isFinite(value)
-                ? Math.max(
-                    1,
-                    Math.min(
-                      isStreamWaterfallPanel(panel) ? 600 : 80,
-                      Math.trunc(value)
-                    )
-                  )
-                : isStreamWaterfallPanel(panel)
-                ? DEFAULT_WATERFALL_ROWS
-                : DEFAULT_STREAM_OVERLAY_COUNT,
-            }
-          : panel
-      )
-    );
-  };
-
-  const setStreamPanelChannelIndex = (panelId: string, value: number) => {
-    const nextChannel = Number.isFinite(value)
-      ? Math.max(0, Math.trunc(value))
-      : 0;
-    setPanels((prev) =>
-      prev.map((panel) =>
-        panel.id === panelId &&
-        isStreamTracePanel(panel) &&
-        panel.sourceMode === "raw"
-          ? { ...panel, channelIndex: nextChannel }
-          : panel
-      )
-    );
-  };
-
-  const setStreamPanelTraceDecimator = (
-    panelId: string,
-    decimator: StreamTraceDecimator
-  ) => {
-    setPanels((prev) =>
-      prev.map((panel) =>
-        panel.id === panelId && isStreamTracePanel(panel)
-          ? { ...panel, traceDecimator: normalizeTraceDecimator(decimator) }
-          : panel
-      )
-    );
-    streamFramesRef.set(panelId, []);
-    streamTraceOverlayRef.set(panelId, new Map());
-    setPlotTick((tick) => tick + 1);
-  };
-
-  const setStreamPanelTraceMaxPoints = (panelId: string, value: number) => {
-    const nextPoints = normalizeTraceMaxPoints(value);
-    setPanels((prev) =>
-      prev.map((panel) =>
-        panel.id === panelId && isStreamTracePanel(panel)
-          ? { ...panel, traceMaxPoints: nextPoints }
-          : panel
-      )
-    );
-    streamFramesRef.set(panelId, []);
-    streamTraceOverlayRef.set(panelId, new Map());
-    setPlotTick((tick) => tick + 1);
-  };
-
-  const setStreamPanelTraceMaxFps = (panelId: string, value: number) => {
-    const nextFps = normalizeTraceMaxFps(value);
-    setPanels((prev) =>
-      prev.map((panel) =>
-        panel.id === panelId && isStreamTracePanel(panel)
-          ? { ...panel, traceMaxFps: nextFps }
-          : panel
-      )
-    );
-  };
-
-  const setStreamPanelRollingWindow = (panelId: string, value: number) => {
-    const nextWindow = normalizeTraceRollingWindow(value);
-    setPanels((prev) =>
-      prev.map((panel) =>
-        panel.id === panelId && isStreamTracePanel(panel)
-          ? { ...panel, rollingWindow: nextWindow }
-          : panel
-      )
-    );
-    streamFramesRef.set(panelId, []);
-    streamTraceOverlayRef.set(panelId, new Map());
-    setPlotTick((tick) => tick + 1);
-  };
-
-  const setStreamPanelAverageMode = (
-    panelId: string,
-    mode: StreamTraceAverageMode
-  ) => {
-    const nextMode = normalizeTraceAverageMode(mode);
-    setPanels((prev) =>
-      prev.map((panel) =>
-        panel.id === panelId && isStreamTracePanel(panel)
-          ? { ...panel, averageMode: nextMode }
-          : panel
-      )
-    );
-    streamFramesRef.set(panelId, []);
-    setPlotTick((tick) => tick + 1);
-  };
-
-  const setStreamTracePanelSourceMode = (
-    panelId: string,
-    sourceMode: StreamTraceSourceMode
-  ) => {
-    setPanels((prev) =>
-      prev.map((panel) => {
-        if (panel.id !== panelId || !isStreamTracePanel(panel)) {
-          return panel;
-        }
-        if (panel.sourceMode === sourceMode) {
-          return panel;
-        }
-        if (sourceMode === "raw") {
-          return {
-            ...panel,
-            sourceMode: "raw",
-            overlayOutputIds: [],
-          };
-        }
-        const workspaceId =
-          panel.workspaceId && streamWorkspacesRef.current[panel.workspaceId]
-            ? panel.workspaceId
-            : Object.keys(streamWorkspacesRef.current).sort()[0] ?? panel.workspaceId;
-        const workspace = workspaceId
-          ? streamWorkspacesRef.current[workspaceId] ?? null
-          : null;
-        const outputId =
-          panel.outputId &&
-          workspace &&
-          workspaceOutputKind(workspace, panel.outputId) === "trace"
-            ? panel.outputId
-            : defaultOutputForKind(workspace, "trace");
-        return {
-          ...panel,
-          sourceMode: "dag",
-          workspaceId,
-          outputId,
-          overlayOutputIds: [],
-          stream: workspace?.stream ?? panel.stream,
-          channelIndex: workspace?.channelIndex ?? panel.channelIndex,
-        };
-      })
-    );
-    streamFramesRef.set(panelId, []);
-    streamTraceOverlayRef.set(panelId, new Map());
-    setPlotTick((tick) => tick + 1);
-  };
-
-  const setStreamTracePanelWorkspace = (
-    panelId: string,
-    workspaceId: string | null
-  ) => {
-    const nextWorkspaceId = String(workspaceId ?? "").trim();
-    const workspace = streamWorkspacesRef.current[nextWorkspaceId] ?? null;
-    if (!nextWorkspaceId || !workspace) {
-      return;
-    }
-    setPanels((prev) =>
-      prev.map((panel) => {
-        if (
-          panel.id !== panelId ||
-          !isStreamTracePanel(panel) ||
-          panel.sourceMode !== "dag"
-        ) {
-          return panel;
-        }
-        const outputId = defaultOutputForKind(workspace, "trace");
-        return {
-          ...panel,
-          workspaceId: nextWorkspaceId,
-          outputId,
-          overlayOutputIds: [],
-          stream: workspace.stream,
-          channelIndex: workspace.channelIndex,
-        };
-      })
-    );
-    streamFramesRef.set(panelId, []);
-    streamTraceOverlayRef.set(panelId, new Map());
-    setPlotTick((tick) => tick + 1);
-  };
-
-  const setStreamTracePanelOutput = (panelId: string, outputId: string | null) => {
-    const nextOutputId = String(outputId ?? "").trim() || null;
-    setPanels((prev) =>
-      prev.map((panel) => {
-        if (
-          panel.id !== panelId ||
-          !isStreamTracePanel(panel) ||
-          panel.sourceMode !== "dag"
-        ) {
-          return panel;
-        }
-        return {
-          ...panel,
-          outputId: nextOutputId,
-          overlayOutputIds: (panel.overlayOutputIds ?? []).filter(
-            (id) => id !== nextOutputId
-          ),
-        };
-      })
-    );
-    streamFramesRef.set(panelId, []);
-    streamTraceOverlayRef.set(panelId, new Map());
-    setPlotTick((tick) => tick + 1);
-  };
-
-  const setStreamTracePanelOverlayOutputs = (
-    panelId: string,
-    outputIds: string[]
-  ) => {
-    const nextSet = new Set(
-      outputIds
-        .map((value) => String(value ?? "").trim())
-        .filter((value) => value.length > 0)
-    );
-    setPanels((prev) =>
-      prev.map((panel) => {
-        if (
-          panel.id !== panelId ||
-          !isStreamTracePanel(panel) ||
-          panel.sourceMode !== "dag"
-        ) {
-          return panel;
-        }
-        const primary = String(panel.outputId ?? "").trim();
-        if (primary) {
-          nextSet.delete(primary);
-        }
-        return {
-          ...panel,
-          overlayOutputIds: [...nextSet],
-        };
-      })
-    );
-    streamTraceOverlayRef.set(panelId, new Map());
-    setPlotTick((tick) => tick + 1);
-  };
-
-  const setStreamAnalysisPanelWorkspace = (
-    panelId: string,
-    workspaceId: string | null
-  ) => {
-    const nextWorkspaceId = String(workspaceId ?? "").trim();
-    const nextWorkspace = streamWorkspacesRef.current[nextWorkspaceId];
-    if (!nextWorkspaceId || !nextWorkspace) {
-      return;
-    }
-    const panel = panels.find((entry) => entry.id === panelId);
-    if (
-      !panel ||
-      (!isStreamScalarPanel(panel) &&
-        !isStreamParamsPanel(panel) &&
-        !isStreamBinStatsPanel(panel) &&
-        !isStreamBin2dPanel(panel))
-    ) {
-      return;
-    }
-    if (panel.workspaceId === nextWorkspaceId) {
-      return;
-    }
-    const nextOutputId = isStreamScalarPanel(panel)
-      ? defaultOutputForKind(nextWorkspace, "scalar")
-      : isStreamParamsPanel(panel)
-      ? null
-      : isStreamBinStatsPanel(panel)
-      ? defaultOutputForKind(nextWorkspace, "hist_agg")
-      : defaultOutputForKind(nextWorkspace, "hist2d");
-    const updated = isStreamScalarPanel(panel)
-      ? ({
-          ...panel,
-          workspaceId: nextWorkspaceId,
-          outputId: nextOutputId,
-          stream: nextWorkspace.stream,
-          channelIndex: nextWorkspace.channelIndex,
-          analysis: nextWorkspace.analysis,
-        } as PlotStreamScalarPanelState)
-      : isStreamParamsPanel(panel)
-      ? ({
-          ...panel,
-          workspaceId: nextWorkspaceId,
-          outputIds: (() => {
-            const paramsOutputs = workspaceOutputOptionsByKind(
-              nextWorkspace,
-              "params_map"
-            ).map((item) => item.value);
-            if (paramsOutputs.length > 0) {
-              return paramsOutputs;
-            }
-            const firstScalar = defaultOutputForKind(nextWorkspace, "scalar");
-            return firstScalar ? [firstScalar] : [];
-          })(),
-        } as PlotStreamParamsPanelState)
-      : isStreamBinStatsPanel(panel)
-      ? ({
-          ...panel,
-          workspaceId: nextWorkspaceId,
-          outputId: nextOutputId,
-          overlayOutputIds: [],
-          fitOverlayOutputIds: [],
-          stream: nextWorkspace.stream,
-          channelIndex: nextWorkspace.channelIndex,
-          analysis: nextWorkspace.analysis,
-          binStats: nextWorkspace.binStats,
-        } as PlotStreamBinStatsPanelState)
-      : ({
-          ...panel,
-          workspaceId: nextWorkspaceId,
-          outputId: nextOutputId,
-        } as PlotStreamBin2dPanelState);
-    setPanels((prev) =>
-      prev.map((entry) => (entry.id === panelId ? updated : entry))
-    );
-    if (isStreamScalarPanel(panel)) {
-      clearPanelBuffers(panelId);
-    } else if (isStreamParamsPanel(panel)) {
-      streamParamsLatestRef.set(panelId, {});
-      setPlotTick((tick) => tick + 1);
-    } else if (isStreamBinStatsPanel(panel)) {
-      streamBinStatsRef.delete(panelId);
-      streamBinStatsOverlayRef.set(panelId, new Map());
-      streamBinStatsFitOverlayRef.set(panelId, new Map());
-      setPlotTick((tick) => tick + 1);
-    } else {
-      streamBin2dRef.delete(panelId);
-      setPlotTick((tick) => tick + 1);
-    }
-  };
-
-  const setStreamAnalysisPanelOutput = (panelId: string, outputId: string | null) => {
-    const nextOutputId = String(outputId ?? "").trim() || null;
-    const panel = panels.find((entry) => entry.id === panelId);
-    if (
-      !panel ||
-      (!isStreamScalarPanel(panel) &&
-        !isStreamBinStatsPanel(panel) &&
-        !isStreamBin2dPanel(panel))
-    ) {
-      return;
-    }
-    setPanels((prev) =>
-      prev.map((entry) => {
-        if (entry.id !== panelId) {
-          return entry;
-        }
-        if (isStreamScalarPanel(entry)) {
-          return { ...entry, outputId: nextOutputId };
-        }
-        if (isStreamBinStatsPanel(entry)) {
-          return { ...entry, outputId: nextOutputId };
-        }
-        return { ...entry, outputId: nextOutputId };
-      })
-    );
-    if (isStreamScalarPanel(panel)) {
-      clearPanelBuffers(panelId);
-    } else if (isStreamBinStatsPanel(panel)) {
-      streamBinStatsRef.delete(panelId);
-      streamBinStatsOverlayRef.set(panelId, new Map());
-      streamBinStatsFitOverlayRef.set(panelId, new Map());
-      setPlotTick((tick) => tick + 1);
-    } else {
-      streamBin2dRef.delete(panelId);
-      setPlotTick((tick) => tick + 1);
-    }
-  };
-
-  const setStreamBinStatsUncertainty = (
-    panelId: string,
-    uncertaintyMode: UncertaintyMode,
-    uncertaintyScale: number
-  ) => {
-    setPanels((prev) =>
-      prev.map((panel) =>
-        panel.id === panelId && isStreamBinStatsPanel(panel)
-          ? {
-              ...panel,
-              uncertaintyMode,
-              uncertaintyScale: Number.isFinite(uncertaintyScale)
-                ? Math.max(0, uncertaintyScale)
-                : panel.uncertaintyScale,
-            }
-          : panel
-      )
-    );
-  };
-
-  const setStreamBinStatsShowBinMarkers = (
-    panelId: string,
-    showBinMarkers: boolean
-  ) => {
-    setPanels((prev) =>
-      prev.map((panel) =>
-        panel.id === panelId && isStreamBinStatsPanel(panel)
-          ? { ...panel, showBinMarkers }
-          : panel
-      )
-    );
-  };
-
-  const setStreamParamsPanelOutputs = (panelId: string, outputIds: string[]) => {
-    const next = outputIds
-      .map((value) => String(value ?? "").trim())
-      .filter((value) => value.length > 0);
-    setPanels((prev) =>
-      prev.map((panel) =>
-        panel.id === panelId && isStreamParamsPanel(panel)
-          ? { ...panel, outputIds: next }
-          : panel
-      )
-    );
-    streamParamsLatestRef.set(panelId, {});
-    setPlotTick((tick) => tick + 1);
-  };
-
-  const setStreamBinStatsOverlayOutputs = (panelId: string, outputIds: string[]) => {
-    const next = outputIds
-      .map((value) => String(value ?? "").trim())
-      .filter((value) => value.length > 0);
-    setPanels((prev) =>
-      prev.map((panel) =>
-        panel.id === panelId && isStreamBinStatsPanel(panel)
-          ? { ...panel, overlayOutputIds: next }
-          : panel
-      )
-    );
-    streamBinStatsOverlayRef.set(panelId, new Map());
-    setPlotTick((tick) => tick + 1);
-  };
-
-  const setStreamBinStatsFitOverlayOutputs = (
-    panelId: string,
-    outputIds: string[]
-  ) => {
-    const next = outputIds
-      .map((value) => String(value ?? "").trim())
-      .filter((value) => value.length > 0);
-    setPanels((prev) =>
-      prev.map((panel) =>
-        panel.id === panelId && isStreamBinStatsPanel(panel)
-          ? { ...panel, fitOverlayOutputIds: next }
-          : panel
-      )
-    );
-    streamBinStatsFitOverlayRef.set(panelId, new Map());
-    setPlotTick((tick) => tick + 1);
-  };
-
-  const setStreamBin2dReducer = (panelId: string, reducer: Bin2dReducer) => {
-    setPanels((prev) =>
-      prev.map((panel) =>
-        panel.id === panelId && isStreamBin2dPanel(panel)
-          ? { ...panel, reducer }
-          : panel
-      )
-    );
-    setPlotTick((tick) => tick + 1);
-  };
-
-  const clearWorkspaceBinPanels = (workspaceId: string, nodeId?: string | null) => {
-    const workspace = streamWorkspacesRef.current[workspaceId] ?? null;
-    const allowedOutputIds =
-      workspace && nodeId
-        ? new Set(
-            workspace.publishOutputs
-              .filter((output) => output.nodeId === nodeId)
-              .map((output) => output.outputId)
-          )
-        : null;
-    for (const panel of panelsRef.current) {
-      if (!isStreamBinStatsPanel(panel) && !isStreamBin2dPanel(panel)) {
-        continue;
-      }
-      if (panel.workspaceId !== workspaceId) {
-        continue;
-      }
-      if (allowedOutputIds && !allowedOutputIds.has(panel.outputId ?? "")) {
-        continue;
-      }
-      if (isStreamBinStatsPanel(panel)) {
-        streamBinStatsRef.delete(panel.id);
-        streamBinStatsFitOverlayRef.set(panel.id, new Map());
-      } else {
-        streamBin2dRef.delete(panel.id);
-      }
-    }
-    setPlotTick((tick) => tick + 1);
-  };
-
-  const resetDaqNodeAggregate = async (nodeId: string) => {
-    const workspaceId = String(daqWorkspaceId ?? "").trim();
-    const normalizedNodeId = String(nodeId ?? "").trim();
-    if (!workspaceId || !normalizedNodeId || daqResetNodeBusyId !== null) {
-      return;
-    }
-    if (!streamAnalysisReadyRef.current) {
-      notifications.show({
-        color: "yellow",
-        title: "Stream analysis unavailable",
-        message: "Start the stream_analysis process first.",
-      });
-      return;
-    }
-    setDaqResetNodeBusyId(normalizedNodeId);
-    try {
-      const resp = await resetStreamWorkspace(workspaceId, normalizedNodeId);
-      if (!resp.ok) {
-        notifications.show({
-          color: "red",
-          title: "Node reset failed",
-          message: resp.error?.message ?? resp.error?.code ?? "workspace.reset failed",
-        });
-        return;
-      }
-      clearWorkspaceBinPanels(workspaceId, normalizedNodeId);
-      notifications.show({
-        color: "teal",
-        title: "Node aggregate cleared",
-        message: `${workspaceId}.${normalizedNodeId}`,
-      });
-    } finally {
-      setDaqResetNodeBusyId(null);
-    }
-  };
-
-  const focusDaqNodeCard = (nodeId: string) => {
-    const normalizedNodeId = String(nodeId ?? "").trim();
-    if (!normalizedNodeId) {
-      return;
-    }
-    const card = daqNodeCardRefs.current.get(normalizedNodeId);
-    if (card) {
-      card.scrollIntoView({
-        behavior: "smooth",
-        block: "center",
-        inline: "nearest",
-      });
-    }
-    setDaqFocusedNodeId(normalizedNodeId);
-    if (daqNodeFocusTimeoutRef.current !== null) {
-      window.clearTimeout(daqNodeFocusTimeoutRef.current);
-      daqNodeFocusTimeoutRef.current = null;
-    }
-    daqNodeFocusTimeoutRef.current = window.setTimeout(() => {
-      setDaqFocusedNodeId((current) =>
-        current === normalizedNodeId ? null : current
-      );
-      daqNodeFocusTimeoutRef.current = null;
-    }, 1600);
-  };
-
-  const loadDaqWorkspaceDraft = (workspaceId: string | null) => {
-    const id = String(workspaceId ?? "").trim();
-    if (!id) {
-      return;
-    }
-    const workspace = streamWorkspacesRef.current[id];
-    if (!workspace) {
-      return;
-    }
-    setDaqWorkspaceId(id);
-    setDaqDraftName(workspace.name);
-    setDaqDraftNodes(cloneDagNodes(workspace.graphNodes));
-    setDaqDraftOutputs(cloneDagOutputs(workspace.publishOutputs));
-    setDaqDraftEnabled(workspace.enabled !== false);
-    setDaqFocusedNodeId(null);
-    daqNodeCardRefs.current.clear();
-  };
-
-  const createStreamWorkspace = () => {
-    const nextId = Math.max(1, Math.trunc(streamWorkspaceIdRef.current));
-    const workspaceId = `workspace-${nextId}`;
-    streamWorkspaceIdRef.current = nextId + 1;
-    const workspace = defaultStreamAnalysisWorkspaceConfig(workspaceId);
-    workspace.name = `Workspace ${nextId}`;
-    setStreamWorkspaces((prev) => ({ ...prev, [workspaceId]: workspace }));
-    streamWorkspacesRef.current = {
-      ...streamWorkspacesRef.current,
-      [workspaceId]: workspace,
-    };
-    loadDaqWorkspaceDraft(workspaceId);
-  };
-
-  const openDaqModal = async (workspaceId?: string | null) => {
-    if (!streamAnalysisReadyRef.current) {
-      notifications.show({
-        color: "yellow",
-        title: "stream_analysis not running",
-        message: "Start the stream_analysis process first.",
-      });
-      return;
-    }
-    if (streamAnalysisReadyRef.current) {
-      await loadStreamAnalysisWorkspaces("daq-modal-open", { notifyOnError: false });
-    }
-    const preferred = String(workspaceId ?? "").trim();
-    const knownIds = Object.keys(streamWorkspacesRef.current).sort();
-    if (knownIds.length === 0) {
-      createStreamWorkspace();
-      setDaqOpen(true);
-      return;
-    }
-    const nextId =
-      (preferred && streamWorkspacesRef.current[preferred] ? preferred : null) ??
-      daqWorkspaceId ??
-      knownIds[0];
-    loadDaqWorkspaceDraft(nextId);
-    setDaqOpen(true);
-  };
-
-  const closeDaqModal = () => {
-    setDaqOpen(false);
-    setDaqFocusedNodeId(null);
-    if (daqNodeFocusTimeoutRef.current !== null) {
-      window.clearTimeout(daqNodeFocusTimeoutRef.current);
-      daqNodeFocusTimeoutRef.current = null;
-    }
-  };
-
-  const setDaqNodeId = (index: number, value: string) => {
-    const nextId = value.trim();
-    if (!nextId) {
-      return;
-    }
-    const current = daqDraftNodes[index];
-    if (!current) {
-      return;
-    }
-    if (current.id === nextId) {
-      return;
-    }
-    if (daqDraftNodes.some((node, idx) => idx !== index && node.id === nextId)) {
-      notifications.show({
-        color: "red",
-        title: "Duplicate node ID",
-        message: `Node id '${nextId}' is already in use.`,
-      });
-      return;
-    }
-    const oldId = current.id;
-    setDaqDraftNodes((prev) =>
-      prev.map((node, idx) => {
-        if (idx === index) {
-          return { ...node, id: nextId };
-        }
-        let changed = false;
-        const nextInputs: Record<string, string> = {};
-        for (const [port, source] of Object.entries(node.inputs ?? {})) {
-          if (source === oldId) {
-            nextInputs[port] = nextId;
-            changed = true;
-          } else {
-            nextInputs[port] = source;
-          }
-        }
-        return changed ? { ...node, inputs: nextInputs } : node;
-      })
-    );
-    setDaqDraftOutputs((prev) =>
-      prev.map((output) =>
-        output.nodeId === oldId ? { ...output, nodeId: nextId } : output
-      )
-    );
-  };
-
-  const setDaqNodeOp = (index: number, opRaw: string | null) => {
-    if (!opRaw || !Object.prototype.hasOwnProperty.call(STREAM_DAG_OPS, opRaw)) {
-      return;
-    }
-    const op = opRaw as StreamDagOpId;
-    setDaqDraftNodes((prev) =>
-      prev.map((node, idx) =>
-        idx === index
-          ? {
-              ...node,
-              op,
-              params: defaultParamsForOp(op),
-              inputs: defaultInputsForOp(op),
-            }
-          : node
-      )
-    );
-  };
-
-  const setDaqNodeInput = (index: number, port: string, sourceNodeId: string | null) => {
-    setDaqDraftNodes((prev) =>
-      prev.map((node, idx) =>
-        idx === index
-          ? {
-              ...node,
-              inputs: {
-                ...node.inputs,
-                [port]: String(sourceNodeId ?? "").trim(),
-              },
-            }
-          : node
-      )
-    );
-  };
-
-  const setDaqNodeParam = (index: number, paramName: string, value: string) => {
-    setDaqDraftNodes((prev) =>
-      prev.map((node, idx) =>
-        idx === index
-          ? {
-              ...node,
-              params: {
-                ...node.params,
-                [paramName]: value,
-              },
-            }
-          : node
-      )
-    );
-  };
-
-  const addDaqNode = () => {
-    const existingIds = new Set(daqDraftNodes.map((node) => node.id));
-    let counter = daqDraftNodes.length + 1;
-    let nodeId = `node_${counter}`;
-    while (existingIds.has(nodeId)) {
-      counter += 1;
-      nodeId = `node_${counter}`;
-    }
-    const op: StreamDagOpId = "trace.integrate";
-    setDaqDraftNodes((prev) => [
-      ...prev,
-      {
-        id: nodeId,
-        op,
-        params: defaultParamsForOp(op),
-        inputs: defaultInputsForOp(op),
-      },
-    ]);
-  };
-
-  const removeDaqNode = (index: number) => {
-    const removed = daqDraftNodes[index];
-    if (!removed) {
-      return;
-    }
-    const removedId = removed.id;
-    setDaqDraftNodes((prev) => prev.filter((_, idx) => idx !== index));
-    setDaqDraftOutputs((prev) => prev.filter((output) => output.nodeId !== removedId));
-  };
-
-  const setDaqOutputId = (index: number, outputId: string) => {
-    setDaqDraftOutputs((prev) =>
-      prev.map((output, idx) =>
-        idx === index ? { ...output, outputId: outputId.trim() } : output
-      )
-    );
-  };
-
-  const setDaqOutputNode = (index: number, nodeId: string | null) => {
-    setDaqDraftOutputs((prev) =>
-      prev.map((output, idx) =>
-        idx === index ? { ...output, nodeId: String(nodeId ?? "").trim() } : output
-      )
-    );
-  };
-
-  const addDaqOutput = () => {
-    const publishableNodeIds = daqDraftNodes
-      .filter((node) => isPublishableNodeKind(nodeKindFromOp(node.op)))
-      .map((node) => node.id);
-    if (publishableNodeIds.length <= 0) {
+      if (!target) {
         notifications.show({
           color: "yellow",
-          title: "No publishable nodes",
-          message:
-            "Add a scalar, trace, fit_1d, hist_agg, hist2d, or params_map node first.",
+          title: "No telemetry panel",
+          message: "Add a telemetry panel first to plot telemetry signals.",
         });
         return;
       }
-    const usedOutputIds = new Set(daqDraftOutputs.map((output) => output.outputId));
-    let counter = daqDraftOutputs.length + 1;
-    let outputId = `out_${counter}`;
-    while (usedOutputIds.has(outputId)) {
-      counter += 1;
-      outputId = `out_${counter}`;
-    }
-    setDaqDraftOutputs((prev) => [
-      ...prev,
-      {
-        outputId,
-        nodeId: publishableNodeIds[0],
-      },
-    ]);
-  };
-
-  const removeDaqOutput = (index: number) => {
-    setDaqDraftOutputs((prev) => prev.filter((_, idx) => idx !== index));
-  };
-
-  const applyDaqWorkspace = async () => {
-    const workspaceId = String(daqWorkspaceId ?? "").trim();
-    if (!workspaceId) {
-      return;
-    }
-    const current = streamWorkspacesRef.current[workspaceId];
-    if (!current) {
-      return;
-    }
-
-    const name = daqDraftName.trim() || defaultStreamWorkspaceName(workspaceId);
-    const cleanedNodes = daqDraftNodes
-      .map((node) => normalizeDagNode(node))
-      .filter((node): node is StreamDagNodeConfig => node !== null);
-    if (cleanedNodes.length <= 0) {
-      notifications.show({
-        color: "red",
-        title: "Invalid graph",
-        message: "At least one node is required.",
-      });
-      return;
-    }
-    const nodeIds = cleanedNodes.map((node) => node.id);
-    const uniqueNodeIds = new Set(nodeIds);
-    if (uniqueNodeIds.size !== nodeIds.length) {
-      notifications.show({
-        color: "red",
-        title: "Invalid graph",
-        message: "Node IDs must be unique and non-empty.",
-      });
-      return;
-    }
-    const sourceStreamCount = cleanedNodes.filter(
-      (node) => node.op === "source.stream"
-    ).length;
-    if (sourceStreamCount !== 1) {
-      notifications.show({
-        color: "red",
-        title: "Invalid graph",
-        message: "Graph must include exactly one source.stream node.",
-      });
-      return;
-    }
-
-    const cleanedOutputs = daqDraftOutputs
-      .map((output) => normalizeDagOutput(output))
-      .filter((output): output is StreamDagOutputConfig => output !== null)
-      .filter((output) => uniqueNodeIds.has(output.nodeId));
-    const outputIds = cleanedOutputs.map((output) => output.outputId);
-    const uniqueOutputIds = new Set(outputIds);
-    if (uniqueOutputIds.size !== outputIds.length) {
-      notifications.show({
-        color: "red",
-        title: "Invalid outputs",
-        message: "Output IDs must be unique and non-empty.",
-      });
-      return;
-    }
-
-    const derivedSource = workspaceStreamFromGraphNodes(cleanedNodes, streamCatalogByKey);
-    const updated: StreamAnalysisWorkspaceConfig = {
-      ...current,
-      workspaceId,
-      name,
-      stream: derivedSource.stream,
-      channelIndex: derivedSource.channelIndex,
-      graphNodes: cloneDagNodes(cleanedNodes),
-      publishOutputs: cloneDagOutputs(cleanedOutputs),
-      enabled: daqDraftEnabled !== false,
-    };
-    const validatePayload = buildStreamAnalysisWorkspacePayload(updated);
-    if (streamAnalysisReadyRef.current && validatePayload) {
-      const validation = await validateStreamWorkspace(workspaceId, validatePayload);
-      if (!validation.ok) {
-        notifications.show({
-          color: "red",
-          title: "Invalid DAG workspace",
-          message:
-            validation.error?.message ??
-            validation.error?.code ??
-            "workspace validation failed",
-        });
-        return;
-      }
-    }
-    setStreamWorkspaces((prev) => ({ ...prev, [workspaceId]: updated }));
-    streamWorkspacesRef.current = {
-      ...streamWorkspacesRef.current,
-      [workspaceId]: updated,
-    };
-    const scalarOutputIds = new Set(
-      workspaceOutputOptionsByKind(updated, "scalar").map((item) => item.value)
-    );
-    const paramsMapOutputIds = new Set(
-      workspaceOutputOptionsByKind(updated, "params_map").map((item) => item.value)
-    );
-    const traceOutputIds = new Set(
-      workspaceOutputOptionsByKind(updated, "trace").map((item) => item.value)
-    );
-    const histOutputIds = new Set(
-      workspaceOutputOptionsByKind(updated, "hist_agg").map((item) => item.value)
-    );
-    const fitOutputIds = new Set(
-      workspaceOutputOptionsByKind(updated, "fit_1d").map((item) => item.value)
-    );
-    const hist2dOutputIds = new Set(
-      workspaceOutputOptionsByKind(updated, "hist2d").map((item) => item.value)
-    );
-    setPanels((prev) =>
-      prev.map((panel) => {
-        if (
-          !isStreamTracePanel(panel) &&
-          !isStreamScalarPanel(panel) &&
-          !isStreamParamsPanel(panel) &&
-          !isStreamBinStatsPanel(panel) &&
-          !isStreamBin2dPanel(panel)
-        ) {
-          return panel;
-        }
-        if (panel.workspaceId !== workspaceId) {
-          return panel;
-        }
-        if (isStreamTracePanel(panel)) {
-          if (panel.sourceMode !== "dag") {
-            return panel;
-          }
-          const nextOutputId =
-            panel.outputId && traceOutputIds.has(panel.outputId)
-              ? panel.outputId
-              : defaultOutputForKind(updated, "trace");
-          streamFramesRef.set(panel.id, []);
-          streamTraceOverlayRef.set(panel.id, new Map());
-          const overlayOutputIds = (panel.overlayOutputIds ?? []).filter(
-            (id) => id !== nextOutputId && traceOutputIds.has(id)
-          );
-          return {
-            ...panel,
-            outputId: nextOutputId,
-            overlayOutputIds,
-            stream: updated.stream,
-            channelIndex: updated.channelIndex,
-          };
-        }
-        if (isStreamScalarPanel(panel)) {
-          const nextOutputId =
-            panel.outputId && scalarOutputIds.has(panel.outputId)
-              ? panel.outputId
-              : defaultOutputForKind(updated, "scalar");
-          clearPanelBuffers(panel.id);
-          return {
-            ...panel,
-            outputId: nextOutputId,
-            stream: updated.stream,
-            channelIndex: updated.channelIndex,
-            analysis: updated.analysis,
-          };
-        }
-        if (isStreamParamsPanel(panel)) {
-          const nextOutputIds = (panel.outputIds ?? []).filter((id) =>
-            scalarOutputIds.has(id) || paramsMapOutputIds.has(id)
-          );
-          streamParamsLatestRef.set(panel.id, {});
-          return {
-            ...panel,
-            outputIds: nextOutputIds,
-          };
-        }
-        if (isStreamBin2dPanel(panel)) {
-          const nextOutputId =
-            panel.outputId && hist2dOutputIds.has(panel.outputId)
-              ? panel.outputId
-              : defaultOutputForKind(updated, "hist2d");
-          streamBin2dRef.delete(panel.id);
-          return {
-            ...panel,
-            outputId: nextOutputId,
-          };
-        }
-        const nextOutputId =
-          panel.outputId && histOutputIds.has(panel.outputId)
-            ? panel.outputId
-            : defaultOutputForKind(updated, "hist_agg");
-        streamBinStatsRef.delete(panel.id);
-        streamBinStatsOverlayRef.set(panel.id, new Map());
-        streamBinStatsFitOverlayRef.set(panel.id, new Map());
-        const nextOverlayOutputIds = (panel.overlayOutputIds ?? []).filter(
-          (id) => traceOutputIds.has(id)
-        );
-        const nextFitOverlayOutputIds = (panel.fitOverlayOutputIds ?? []).filter(
-          (id) => fitOutputIds.has(id)
-        );
-        return {
-          ...panel,
-          outputId: nextOutputId,
-          overlayOutputIds: nextOverlayOutputIds,
-          fitOverlayOutputIds: nextFitOverlayOutputIds,
-          stream: updated.stream,
-          channelIndex: updated.channelIndex,
-          analysis: updated.analysis,
-          binStats: updated.binStats,
-        };
-      })
-    );
-    setPlotTick((tick) => tick + 1);
-    void syncStreamAnalysisWorkspace(workspaceId, "stream-workspace-apply");
-  };
-
-  const saveDaqWorkspaceStore = async () => {
-    if (!streamAnalysisReadyRef.current || workspaceStoreBusyAction !== null) {
-      return;
-    }
-    setWorkspaceStoreBusyAction("save");
-    try {
-      const resp = await saveStreamWorkspaceStore();
-      if (!resp.ok) {
-        notifications.show({
-          color: "red",
-          title: "Workspace save failed",
-          message:
-            resp.error?.message ?? resp.error?.code ?? "workspace_store.save failed",
-        });
-        await refreshWorkspaceStoreStatus("workspace-save", {
-          notifyOnError: false,
-        });
-        return;
-      }
-      const resultObj =
-        resp.result && typeof resp.result === "object"
-          ? (resp.result as Record<string, unknown>)
-          : {};
-      const statusRaw =
-        resultObj.status && typeof resultObj.status === "object"
-          ? resultObj.status
-          : null;
-      if (statusRaw) {
-        setWorkspaceStoreStatus(normalizeWorkspaceStoreStatus(statusRaw));
-      } else {
-        await refreshWorkspaceStoreStatus("workspace-save", {
-          notifyOnError: false,
-        });
-      }
-      notifications.show({
-        color: "teal",
-        title: "Workspace file saved",
-        message:
-          (statusRaw && typeof (statusRaw as { path?: unknown }).path === "string"
-            ? String((statusRaw as { path?: unknown }).path)
-            : workspaceStoreStatus.path) ?? "workspace store updated",
-      });
-    } finally {
-      setWorkspaceStoreBusyAction(null);
-    }
-  };
-
-  const reloadDaqWorkspaceStore = async () => {
-    if (!streamAnalysisReadyRef.current || workspaceStoreBusyAction !== null) {
-      return;
-    }
-    setWorkspaceStoreBusyAction("reload");
-    try {
-      const resp = await reloadStreamWorkspaceStore();
-      if (!resp.ok) {
-        notifications.show({
-          color: "red",
-          title: "Workspace reload failed",
-          message:
-            resp.error?.message ?? resp.error?.code ?? "workspace_store.reload failed",
-        });
-        await refreshWorkspaceStoreStatus("workspace-reload", {
-          notifyOnError: false,
-        });
-        return;
-      }
-      const resultObj =
-        resp.result && typeof resp.result === "object"
-          ? (resp.result as Record<string, unknown>)
-          : {};
-      const statusRaw =
-        resultObj.status && typeof resultObj.status === "object"
-          ? resultObj.status
-          : null;
-      if (statusRaw) {
-        setWorkspaceStoreStatus(normalizeWorkspaceStoreStatus(statusRaw));
-      } else {
-        await refreshWorkspaceStoreStatus("workspace-reload", {
-          notifyOnError: false,
-        });
-      }
-      await loadStreamAnalysisWorkspaces("workspace-reload", { notifyOnError: false });
-      notifications.show({
-        color: "teal",
-        title: "Workspace file reloaded",
-        message: "Runtime DAG workspaces refreshed from disk.",
-      });
-    } finally {
-      setWorkspaceStoreBusyAction(null);
-    }
-  };
-
-  const startPanelTitleEdit = (panel: PlotPanelState) => {
-    setEditingPanelId(panel.id);
-    setPanelTitleDraft(panel.title);
-  };
-
-  const cancelPanelTitleEdit = () => {
-    setEditingPanelId(null);
-    setPanelTitleDraft("");
-  };
-
-  const commitPanelTitleEdit = () => {
-    if (!editingPanelId) {
-      return;
-    }
-    const panelId = editingPanelId;
-    const trimmed = panelTitleDraft.trim();
-    setPanels((prev) =>
-      prev.map((panel) =>
-        panel.id === panelId
-          ? { ...panel, title: trimmed.length > 0 ? trimmed : panel.id }
-          : panel
-      )
-    );
-    setEditingPanelId(null);
-    setPanelTitleDraft("");
-  };
-
-  const onPlotSignal = (deviceId: string, signal: string) => {
-    const active = panels.find((panel) => panel.id === activePanelId);
-    const target =
-      (active && isTelemetryPanel(active) ? active : null) ??
-      panels.find((panel): panel is PlotTelemetryPanelState =>
-        isTelemetryPanel(panel)
-      );
-    if (!target) {
-      notifications.show({
-        color: "yellow",
-        title: "No telemetry panel",
-        message: "Add a telemetry panel first to plot telemetry signals.",
-      });
-      return;
-    }
-    addTraceToPanel(target.id, deviceId, signal);
-  };
+      addTraceToPanel(target.id, deviceId, signal);
+    },
+    [panels, activePanelId, addTraceToPanel]
+  );
 
   const sequencerChipProgressStyle = (() => {
     const isRunning =
@@ -6910,182 +2516,168 @@ export function App() {
     return detectGridColumns(deviceGridRef.current, "data-device-card-id");
   }, []);
 
-  const handleUiDragStart = useCallback(
-    (event: DragStartEvent) => {
-      const payload = event.active.data.current as UiDragData | undefined;
-      if (!payload) {
-        setActiveUiDrag(null);
-        return;
-      }
-      setActiveUiDrag(payload);
-      if (payload.kind === "device") {
-        dragColumnsRef.current.device = resolveDeviceGridColumns();
-      } else if (payload.kind === "panel") {
-        dragColumnsRef.current.panel = resolvePanelGridColumns();
-      }
-    },
-    [resolveDeviceGridColumns, resolvePanelGridColumns]
+  // UI drag controller (round 31). See features/layout/useUiDragController.ts.
+  // Owns the dnd-kit sensors + the four drag lifecycle handlers +
+  // transient activeUiDrag state.
+  const {
+    dndSensors,
+    activeUiDrag,
+    handleUiDragStart,
+    handleUiDragOver,
+    handleUiDragEnd,
+    handleUiDragCancel,
+  } = useUiDragController({
+    resolveDeviceGridColumns,
+    resolvePanelGridColumns,
+    addTraceToPanel,
+    removeTraceFromPanel,
+    reorderCommandDeckEntryWithinGroup,
+  });
+
+  // Nav-sidebar resizer (round 31). See features/layout/useNavResizer.ts.
+  // Owns pointer-drag resize + collapse/expand helpers that need to
+  // cancel any in-flight RAF first.
+  const {
+    handleNavResizeStart,
+    setDevicePanelCollapsed,
+    collapseDevicePanel,
+    expandDevicePanel,
+  } = useNavResizer();
+
+  // UI profile import/export (round 29). See
+  // features/runtime/useUiProfile.ts. Wired here (rather than near the
+  // other refresh helpers) because applyUiProfileRaw needs the
+  // App-local setDevicePanelCollapsed wrapper that lives just above.
+  const {
+    exportUiProfile,
+    importUiProfile,
+    loadDefaultUiProfile,
+    defaultProfileAvailable,
+    defaultProfileLoading,
+  } = useUiProfile({
+    syncStreamAnalysisWorkspace,
+    loadStreamAnalysisWorkspaces,
+    setDevicePanelCollapsed,
+  });
+
+  // Stable identities for the panel helpers/handlers bags passed to
+  // <PanelsGrid>. Without this, every App.tsx render builds new
+  // function references and React.memo on <PanelCard> can never hit.
+  // Pattern: keep a mutable ref to the latest functions, then expose
+  // a single useMemo-stable bag whose methods deref the ref.
+  const panelHelpersRef = useRef<PanelsGridHelpers | null>(null);
+  panelHelpersRef.current = {
+    resolveTelemetryPanelOffset,
+    streamTraceOverlaySeries,
+    streamBinStatsOverlaySeries,
+    streamBinStatsFitOverlayCurves,
+    isExpandablePlotPanel,
+    copyTextToClipboard,
+  };
+  const panelHandlersRef = useRef<PanelsGridHandlers | null>(null);
+  panelHandlersRef.current = {
+    startPanelTitleEdit,
+    commitPanelTitleEdit,
+    cancelPanelTitleEdit,
+    removePanel,
+    removeTraceFromPanel,
+    setPanelTimeWindow,
+    openPlotOptions,
+    closePlotOptions,
+    applyPlotOptionsAxis,
+    setPlotOptionsAxisMode,
+    setTelemetryYDisplayMode,
+    setTelemetryYOffsetMode,
+    setTelemetrySmoothingMode,
+    setTelemetrySmoothingWindow,
+    clearPanelBuffers,
+    clearStreamPanelFrames,
+    clearStreamBinStatsPanel,
+    clearStreamBin2dPanel,
+    setStreamAnalysisPanelWorkspace,
+    setStreamAnalysisPanelOutput,
+    openExpandedPlot,
+    openStreamTraceOptionsModal,
+    openStreamBin2dOptionsModal,
+    openStreamParamsOptionsModal,
+    openStreamBinStatsOptionsModal,
+  };
+  const stablePanelHelpers = useMemo<PanelsGridHelpers>(
+    () => ({
+      resolveTelemetryPanelOffset: (panel) =>
+        panelHelpersRef.current!.resolveTelemetryPanelOffset(panel),
+      streamTraceOverlaySeries: (panel) =>
+        panelHelpersRef.current!.streamTraceOverlaySeries(panel),
+      streamBinStatsOverlaySeries: (panel) =>
+        panelHelpersRef.current!.streamBinStatsOverlaySeries(panel),
+      streamBinStatsFitOverlayCurves: (panel) =>
+        panelHelpersRef.current!.streamBinStatsFitOverlayCurves(panel),
+      isExpandablePlotPanel: (panel) =>
+        panelHelpersRef.current!.isExpandablePlotPanel(panel),
+      copyTextToClipboard: (label, text) =>
+        panelHelpersRef.current!.copyTextToClipboard(label, text),
+    }),
+    []
   );
-
-  const handleUiDragOver = useCallback(
-    (event: DragOverEvent) => {
-      const activePayload = event.active.data.current as UiDragData | undefined;
-      const overPayload = event.over?.data.current as UiDragData | undefined;
-      if (!activePayload || activePayload.kind !== "command-deck-entry") {
-        return;
-      }
-      const targetEntryId =
-        overPayload?.kind === "command-deck-entry"
-          ? overPayload.entryId
-          : parseSortablePrefixedId(event.over?.id ?? "", "deck:");
-      if (!targetEntryId || targetEntryId === activePayload.entryId) {
-        return;
-      }
-      reorderCommandDeckEntryWithinGroup(activePayload.entryId, targetEntryId);
-    },
-    [reorderCommandDeckEntryWithinGroup]
+  const stablePanelHandlers = useMemo<PanelsGridHandlers>(
+    () => ({
+      startPanelTitleEdit: (panel) =>
+        panelHandlersRef.current!.startPanelTitleEdit(panel),
+      commitPanelTitleEdit: () =>
+        panelHandlersRef.current!.commitPanelTitleEdit(),
+      cancelPanelTitleEdit: () =>
+        panelHandlersRef.current!.cancelPanelTitleEdit(),
+      removePanel: (panelId) => panelHandlersRef.current!.removePanel(panelId),
+      removeTraceFromPanel: (panelId, trace) =>
+        panelHandlersRef.current!.removeTraceFromPanel(panelId, trace),
+      setPanelTimeWindow: (panelId, value) =>
+        panelHandlersRef.current!.setPanelTimeWindow(panelId, value),
+      openPlotOptions: (panelId) =>
+        panelHandlersRef.current!.openPlotOptions(panelId),
+      closePlotOptions: () => panelHandlersRef.current!.closePlotOptions(),
+      applyPlotOptionsAxis: (panelId) =>
+        panelHandlersRef.current!.applyPlotOptionsAxis(panelId),
+      setPlotOptionsAxisMode: (panel, mode) =>
+        panelHandlersRef.current!.setPlotOptionsAxisMode(panel, mode),
+      setTelemetryYDisplayMode: (panelId, mode) =>
+        panelHandlersRef.current!.setTelemetryYDisplayMode(panelId, mode),
+      setTelemetryYOffsetMode: (panelId, mode, value) =>
+        panelHandlersRef.current!.setTelemetryYOffsetMode(panelId, mode, value),
+      setTelemetrySmoothingMode: (panelId, mode) =>
+        panelHandlersRef.current!.setTelemetrySmoothingMode(panelId, mode),
+      setTelemetrySmoothingWindow: (panelId, value) =>
+        panelHandlersRef.current!.setTelemetrySmoothingWindow(panelId, value),
+      clearPanelBuffers: (panelId) =>
+        panelHandlersRef.current!.clearPanelBuffers(panelId),
+      clearStreamPanelFrames: (panelId) =>
+        panelHandlersRef.current!.clearStreamPanelFrames(panelId),
+      clearStreamBinStatsPanel: (panelId) =>
+        panelHandlersRef.current!.clearStreamBinStatsPanel(panelId),
+      clearStreamBin2dPanel: (panelId) =>
+        panelHandlersRef.current!.clearStreamBin2dPanel(panelId),
+      setStreamAnalysisPanelWorkspace: (panelId, workspaceId) =>
+        panelHandlersRef.current!.setStreamAnalysisPanelWorkspace(
+          panelId,
+          workspaceId
+        ),
+      setStreamAnalysisPanelOutput: (panelId, outputId) =>
+        panelHandlersRef.current!.setStreamAnalysisPanelOutput(
+          panelId,
+          outputId
+        ),
+      openExpandedPlot: (panelId) =>
+        panelHandlersRef.current!.openExpandedPlot(panelId),
+      openStreamTraceOptionsModal: (panelId) =>
+        panelHandlersRef.current!.openStreamTraceOptionsModal(panelId),
+      openStreamBin2dOptionsModal: (panelId) =>
+        panelHandlersRef.current!.openStreamBin2dOptionsModal(panelId),
+      openStreamParamsOptionsModal: (panelId) =>
+        panelHandlersRef.current!.openStreamParamsOptionsModal(panelId),
+      openStreamBinStatsOptionsModal: (panelId) =>
+        panelHandlersRef.current!.openStreamBinStatsOptionsModal(panelId),
+    }),
+    []
   );
-
-  const handleUiDragEnd = useCallback(
-    (event: DragEndEvent) => {
-      const activePayload = event.active.data.current as UiDragData | undefined;
-      const overPayload = event.over?.data.current as UiDragData | undefined;
-      if (!activePayload) {
-        setActiveUiDrag(null);
-        return;
-      }
-
-      if (activePayload.kind === "device") {
-        const targetDeviceId =
-          overPayload?.kind === "device"
-            ? overPayload.deviceId
-            : parseSortablePrefixedId(event.over?.id ?? "", "device:");
-        if (
-          targetDeviceId &&
-          targetDeviceId !== activePayload.deviceId
-        ) {
-          const columns = Math.max(1, dragColumnsRef.current.device);
-          setDeviceOrder((prev) => {
-            const base = orderedDevices.map((device) => device.device_id);
-            const next = reorderIdsSerpentine(
-              base,
-              activePayload.deviceId,
-              targetDeviceId,
-              columns
-            );
-            return sameStringArray(prev, next) ? prev : next;
-          });
-        }
-        setActiveUiDrag(null);
-        return;
-      }
-
-      if (activePayload.kind === "panel") {
-        const targetPanelId =
-          overPayload?.kind === "panel"
-            ? overPayload.panelId
-            : parseSortablePrefixedId(event.over?.id ?? "", "panel:");
-        if (
-          targetPanelId &&
-          targetPanelId !== activePayload.panelId
-        ) {
-          const columns = Math.max(1, dragColumnsRef.current.panel);
-          setPanels((prev) => {
-            const ids = prev.map((panel) => panel.id);
-            const reorderedIds = reorderIdsSerpentine(
-              ids,
-              activePayload.panelId,
-              targetPanelId,
-              columns
-            );
-            if (sameStringArray(ids, reorderedIds)) {
-              return prev;
-            }
-            const byId = new Map(prev.map((panel) => [panel.id, panel]));
-            return reorderedIds
-              .map((panelId) => byId.get(panelId))
-              .filter((panel): panel is PlotPanelState => Boolean(panel));
-          });
-        }
-        setActiveUiDrag(null);
-        return;
-      }
-
-      if (activePayload.kind === "command-deck-entry") {
-        setActiveUiDrag(null);
-        return;
-      }
-
-      if (activePayload.kind === "signal" || activePayload.kind === "trace") {
-        const targetPanelId =
-          overPayload?.kind === "panel"
-            ? overPayload.panelId
-            : parseSortablePrefixedId(event.over?.id ?? "", "panel:");
-        if (!targetPanelId) {
-          setActiveUiDrag(null);
-          return;
-        }
-        const targetPanel = panelsRef.current.find(
-          (panel) => panel.id === targetPanelId
-        );
-        if (!targetPanel || !isTelemetryPanel(targetPanel)) {
-          setActiveUiDrag(null);
-          return;
-        }
-        if (
-          activePayload.kind === "trace" &&
-          activePayload.originPanelId &&
-          activePayload.originPanelId !== targetPanelId
-        ) {
-          removeTraceFromPanel(activePayload.originPanelId, {
-            deviceId: activePayload.deviceId,
-            signal: activePayload.signal,
-          });
-        }
-        addTraceToPanel(
-          targetPanelId,
-          activePayload.deviceId,
-          activePayload.signal
-        );
-      }
-      setActiveUiDrag(null);
-    },
-    [addTraceToPanel, orderedDevices, removeTraceFromPanel]
-  );
-
-  const handleUiDragCancel = useCallback(() => {
-    setActiveUiDrag(null);
-  }, []);
-
-  const handleNavResizeStart = (
-    event: React.PointerEvent<HTMLDivElement>
-  ) => {
-    if (isDevicePanelCollapsed) {
-      return;
-    }
-    event.preventDefault();
-    resizeRef.current = { startX: event.clientX, startWidth: navWidth };
-    setIsResizing(true);
-  };
-
-  const setDevicePanelCollapsed = (collapsed: boolean) => {
-    if (resizeRafRef.current !== null) {
-      window.cancelAnimationFrame(resizeRafRef.current);
-      resizeRafRef.current = null;
-    }
-    resizePendingWidthRef.current = null;
-    resizeRef.current = null;
-    setIsResizing(false);
-    setIsDevicePanelCollapsed(collapsed);
-  };
-
-  const collapseDevicePanel = () => {
-    setDevicePanelCollapsed(true);
-  };
-
-  const expandDevicePanel = () => {
-    setDevicePanelCollapsed(false);
-  };
 
   const yAxisDraftMinNum = parseNumberInput(yAxisDraftMin);
   const yAxisDraftMaxNum = parseNumberInput(yAxisDraftMax);
@@ -7834,1043 +3426,15 @@ export function App() {
                   </Menu.Dropdown>
                 </Menu>
               </Group>
-              <SortableContext
-                items={panels.map((panel) => panelSortableId(panel.id))}
-                strategy={rectSortingStrategy}
-              >
-              <div
-                className="plot-grid"
-                style={plotGridStyle}
-                ref={plotGridRef}
-              >
-                {panels.map((panel) => {
-                  const isActive = panel.id === activePanelId;
-                  const panelBuffers = buffersRef.get(panel.id) ?? new Map();
-                  const streamWorkspace =
-                    isStreamScalarPanel(panel) ||
-                    isStreamParamsPanel(panel) ||
-                    isStreamBinStatsPanel(panel) ||
-                    isStreamBin2dPanel(panel) ||
-                    (isStreamTracePanel(panel) && panel.sourceMode === "dag")
-                      ? streamWorkspaces[panel.workspaceId] ?? null
-                      : null;
-                  const integralOutputOptions = isStreamScalarPanel(panel)
-                    ? workspaceOutputOptionsByKind(streamWorkspace, "scalar")
-                    : [];
-                  const binStatsXLabel = isStreamBinStatsPanel(panel)
-                    ? workspaceXAxisLabel(streamWorkspace, panel.outputId)
-                    : DEFAULT_STREAM_CONTEXT_FIELD;
-                  const binStatsSnapshot = isStreamBinStatsPanel(panel)
-                    ? streamBinStatsRef.get(panel.id) ?? null
-                    : null;
-                  const bin2dSnapshot = isStreamBin2dPanel(panel)
-                    ? streamBin2dRef.get(panel.id) ?? null
-                    : null;
-                  const bin2dXLabel = isStreamBin2dPanel(panel)
-                    ? workspaceBin2dAxisLabel(streamWorkspace, panel.outputId, "x")
-                    : DEFAULT_STREAM_CONTEXT_FIELD;
-                  const bin2dYLabel = isStreamBin2dPanel(panel)
-                    ? workspaceBin2dAxisLabel(streamWorkspace, panel.outputId, "y")
-                    : "context_y";
-                  const telemetryNumericTraceCount = isTelemetryPanel(panel)
-                    ? panel.traces.filter((trace) => trace.valueKind !== "boolean")
-                        .length
-                    : 0;
-                  const telemetryOffset = isTelemetryPanel(panel)
-                    ? resolveTelemetryPanelOffset(panel)
-                    : null;
-                  const telemetryOffsetCompact =
-                    typeof telemetryOffset === "number" &&
-                    Number.isFinite(telemetryOffset)
-                      ? formatOffsetCompact(telemetryOffset)
-                      : "n/a";
-                  const telemetryOffsetFull =
-                    typeof telemetryOffset === "number" &&
-                    Number.isFinite(telemetryOffset)
-                      ? formatOffsetFull(telemetryOffset)
-                      : null;
-                  const telemetryOffsetUnit = (() => {
-                    if (!isTelemetryPanel(panel)) {
-                      return "";
-                    }
-                    const units = panel.traces
-                      .filter((trace) => trace.valueKind !== "boolean")
-                      .map((trace) => (typeof trace.units === "string" ? trace.units.trim() : ""))
-                      .filter((unit) => unit.length > 0);
-                    if (units.length === 0) {
-                      return "";
-                    }
-                    const unique = new Set(units);
-                    return unique.size === 1 ? units[0] : "";
-                  })();
-                  const telemetryOffsetLabel = telemetryOffsetUnit
-                    ? `${telemetryOffsetCompact} ${telemetryOffsetUnit}`
-                    : telemetryOffsetCompact;
-                  const telemetryOffsetFullLabel =
-                    telemetryOffsetFull !== null
-                      ? telemetryOffsetUnit
-                        ? `${telemetryOffsetFull} ${telemetryOffsetUnit}`
-                        : telemetryOffsetFull
-                      : null;
-                  return (
-                    <ReorderableCardShell
-                      key={panel.id}
-                      id={panelSortableId(panel.id)}
-                      data={{ kind: "panel", panelId: panel.id }}
-                      className="plot-workspace-card"
-                      dataPanelCardId={panel.id}
-                      dragHandleTitle="Drag from border to reorder panels"
-                      style={{
-                        border:
-                          isActive
-                            ? "2px solid #0e9f9a"
-                            : "1px solid var(--card-border)",
-                        background: "var(--card)",
-                        position: "relative",
-                      }}
-                    >
-                      <Group justify="space-between" align="center">
-                        <Group gap="sm" align="center">
-                          {editingPanelId === panel.id ? (
-                            <Group gap={6} align="center">
-                              <TextInput
-                                size="xs"
-                                w={180}
-                                value={panelTitleDraft}
-                                onChange={(event) =>
-                                  setPanelTitleDraft(event.currentTarget.value)
-                                }
-                                onKeyDown={(event) => {
-                                  if (event.key === "Enter") {
-                                    event.preventDefault();
-                                    commitPanelTitleEdit();
-                                    return;
-                                  }
-                                  if (event.key === "Escape") {
-                                    event.preventDefault();
-                                    cancelPanelTitleEdit();
-                                  }
-                                }}
-                                autoFocus
-                                placeholder={panel.id}
-                              />
-                              <ActionIcon
-                                size="sm"
-                                variant="light"
-                                color="teal"
-                                onClick={commitPanelTitleEdit}
-                              >
-                                <IconCheck size={14} />
-                              </ActionIcon>
-                              <ActionIcon
-                                size="sm"
-                                variant="light"
-                                color="gray"
-                                onClick={cancelPanelTitleEdit}
-                              >
-                                <IconX size={14} />
-                              </ActionIcon>
-                            </Group>
-                          ) : (
-                            <Group gap={6} align="center">
-                              <Text fw={600}>{panel.title}</Text>
-                              <ActionIcon
-                                size="sm"
-                                variant="subtle"
-                                color="gray"
-                                onClick={() => startPanelTitleEdit(panel)}
-                              >
-                                <IconPencil size={14} />
-                              </ActionIcon>
-                            </Group>
-                          )}
-                          {activeUiDrag?.kind === "panel" &&
-                          activeUiDrag.panelId === panel.id && (
-                            <Badge variant="light" color="blue">
-                              Dragging
-                            </Badge>
-                          )}
-                          {isActive ? (
-                            <Badge variant="light" color="teal">
-                              Active
-                            </Badge>
-                          ) : (
-                            <Button
-                              size="xs"
-                              variant="light"
-                              leftSection={<IconStar size={14} />}
-                              onClick={() => setActivePanelId(panel.id)}
-                            >
-                              Set active
-                            </Button>
-                          )}
-                          <Badge
-                            variant="light"
-                            color={
-                              isTelemetryPanel(panel)
-                                ? "teal"
-                                : isStreamRawPanel(panel)
-                                ? "orange"
-                                : isStreamWaterfallPanel(panel)
-                                ? "cyan"
-                                : isStreamParamsPanel(panel)
-                                ? "lime"
-                                : isStreamBinStatsPanel(panel)
-                                ? "blue"
-                                : isStreamBin2dPanel(panel)
-                                ? "violet"
-                                : "green"
-                            }
-                          >
-                            {isTelemetryPanel(panel)
-                              ? "Telemetry"
-                              : isStreamRawPanel(panel)
-                              ? "Stream trace"
-                              : isStreamWaterfallPanel(panel)
-                              ? "Stream waterfall"
-                              : isStreamParamsPanel(panel)
-                              ? "Stream params"
-                              : isStreamBinStatsPanel(panel)
-                              ? "Stream bin stats"
-                              : isStreamBin2dPanel(panel)
-                              ? "Stream 2D bins"
-                              : "Stream scalar"}
-                          </Badge>
-                          <Popover
-                            opened={plotOptionsPanelId === panel.id}
-                            onChange={(opened) => {
-                              if (!opened && plotOptionsPanelId === panel.id) {
-                                closePlotOptions();
-                              }
-                            }}
-                            position="bottom-start"
-                            withArrow
-                            shadow="md"
-                            withinPortal
-                            zIndex={700}
-                            width={420}
-                          >
-                            <Popover.Target>
-                              <Button
-                                size="xs"
-                                variant="light"
-                                leftSection={<IconSettings size={14} />}
-                                style={{ marginLeft: "auto" }}
-                                onClick={() => {
-                                  if (plotOptionsPanelId === panel.id) {
-                                    closePlotOptions();
-                                    return;
-                                  }
-                                  openPlotOptions(panel.id);
-                                }}
-                              >
-                                Plot options
-                              </Button>
-                            </Popover.Target>
-                            <Popover.Dropdown>
-                              <Stack gap="sm">
-                                {!isStreamParamsPanel(panel) ? (
-                                  <Stack gap={6}>
-                                    <Group justify="space-between" align="center">
-                                      <Text size="xs" c="dimmed">
-                                        {(isStreamWaterfallPanel(panel) ||
-                                          isStreamBin2dPanel(panel)
-                                          ? "Z"
-                                          : "Y") + " axis"}
-                                      </Text>
-                                      <SegmentedControl
-                                        size="xs"
-                                        value={panel.yScaleMode}
-                                        onChange={(value) =>
-                                          setPlotOptionsAxisMode(panel, value as YScaleMode)
-                                        }
-                                        data={[
-                                          { value: "auto", label: "Auto" },
-                                          { value: "manual", label: "Manual" },
-                                        ]}
-                                      />
-                                    </Group>
-                                    {panel.yScaleMode === "manual" ? (
-                                      <>
-                                        <Group grow>
-                                          <NumberInput
-                                            size="xs"
-                                            label="Min"
-                                            value={yAxisDraftMin}
-                                            onChange={setYAxisDraftMin}
-                                          />
-                                          <NumberInput
-                                            size="xs"
-                                            label="Max"
-                                            value={yAxisDraftMax}
-                                            onChange={setYAxisDraftMax}
-                                          />
-                                        </Group>
-                                        <Group justify="space-between" align="center">
-                                          <Text size="xs" c="dimmed">
-                                            {yAxisAutoRange
-                                              ? `auto: ${yAxisAutoRange.min.toFixed(
-                                                  4
-                                                )} .. ${yAxisAutoRange.max.toFixed(4)}`
-                                              : "auto range unavailable"}
-                                          </Text>
-                                          <Button
-                                            size="xs"
-                                            variant="light"
-                                            onClick={() => applyPlotOptionsAxis(panel.id)}
-                                            disabled={yAxisDraftInvalid}
-                                          >
-                                            Apply axis
-                                          </Button>
-                                        </Group>
-                                      </>
-                                    ) : (
-                                      <Text size="xs" c="dimmed">
-                                        {yAxisAutoRange
-                                          ? `auto: ${yAxisAutoRange.min.toFixed(
-                                              4
-                                            )} .. ${yAxisAutoRange.max.toFixed(4)}`
-                                          : "auto range unavailable"}
-                                      </Text>
-                                    )}
-                                  </Stack>
-                                ) : null}
-                                {isTelemetryPanel(panel) ? (
-                                  <Stack gap={6}>
-                                    <Group grow>
-                                      <NumberInput
-                                        size="xs"
-                                        label="Window (s)"
-                                        min={5}
-                                        max={600}
-                                        value={panel.timeWindowS}
-                                        onChange={(value) =>
-                                          setPanelTimeWindow(panel.id, Number(value))
-                                        }
-                                      />
-                                    </Group>
-                                    <Group justify="space-between" align="center">
-                                      <Text size="xs" c="dimmed">
-                                        Display
-                                      </Text>
-                                      <SegmentedControl
-                                        size="xs"
-                                        value={panel.yDisplayMode}
-                                        data={[
-                                          { value: "absolute", label: "Abs" },
-                                          { value: "delta", label: "Delta" },
-                                        ]}
-                                        onChange={(value) => {
-                                          const nextMode = value as YDisplayMode;
-                                          if (
-                                            nextMode === "delta" &&
-                                            telemetryNumericTraceCount === 0
-                                          ) {
-                                            notifications.show({
-                                              color: "yellow",
-                                              title: "No numeric traces",
-                                              message:
-                                                "Delta display requires at least one numeric telemetry trace.",
-                                            });
-                                            return;
-                                          }
-                                          setTelemetryYDisplayMode(panel.id, nextMode);
-                                        }}
-                                      />
-                                    </Group>
-                                    {panel.yDisplayMode === "delta" ? (
-                                      <>
-                                        <Group justify="space-between" align="center">
-                                          <Text size="xs" c="dimmed">
-                                            Offset
-                                          </Text>
-                                          <SegmentedControl
-                                            size="xs"
-                                            value={panel.yOffsetMode}
-                                            data={[
-                                              { value: "auto", label: "Auto" },
-                                              { value: "freeze", label: "Freeze" },
-                                            ]}
-                                            onChange={(value) => {
-                                              const nextMode = value as YOffsetMode;
-                                              if (nextMode === "auto") {
-                                                setTelemetryYOffsetMode(panel.id, "auto");
-                                                return;
-                                              }
-                                              if (
-                                                typeof telemetryOffset !== "number" ||
-                                                !Number.isFinite(telemetryOffset)
-                                              ) {
-                                                notifications.show({
-                                                  color: "yellow",
-                                                  title: "Offset unavailable",
-                                                  message:
-                                                    "No numeric telemetry samples available to freeze offset yet.",
-                                                });
-                                                return;
-                                              }
-                                              setTelemetryYOffsetMode(
-                                                panel.id,
-                                                "freeze",
-                                                telemetryOffset
-                                              );
-                                            }}
-                                          />
-                                        </Group>
-                                        <Text size="xs" c="dimmed">
-                                          offset: {telemetryOffsetLabel}
-                                          {telemetryOffsetFullLabel &&
-                                          telemetryOffsetFullLabel !== telemetryOffsetLabel
-                                            ? ` (${telemetryOffsetFullLabel})`
-                                            : ""}
-                                        </Text>
-                                      </>
-                                    ) : null}
-                                    <Group justify="space-between" align="center">
-                                      <Text size="xs" c="dimmed">
-                                        Smoothing
-                                      </Text>
-                                      <SegmentedControl
-                                        size="xs"
-                                        value={panel.smoothingMode}
-                                        data={[
-                                          { value: "none", label: "Off" },
-                                          { value: "sma", label: "SMA" },
-                                          { value: "ema", label: "EMA" },
-                                        ]}
-                                        onChange={(value) =>
-                                          setTelemetrySmoothingMode(
-                                            panel.id,
-                                            value as TelemetrySmoothingMode
-                                          )
-                                        }
-                                      />
-                                    </Group>
-                                    {panel.smoothingMode !== "none" ? (
-                                      <NumberInput
-                                        size="xs"
-                                        label="Smoothing window (s)"
-                                        min={1}
-                                        max={300}
-                                        value={panel.smoothingWindowS}
-                                        onChange={(value) =>
-                                          setTelemetrySmoothingWindow(
-                                            panel.id,
-                                            Number(value)
-                                          )
-                                        }
-                                      />
-                                    ) : null}
-                                  </Stack>
-                                ) : null}
-                                {isStreamScalarPanel(panel) ? (
-                                  <Stack gap={6}>
-                                    <Select
-                                      size="xs"
-                                      searchable
-                                      label="Workspace"
-                                      placeholder="Select workspace"
-                                      comboboxProps={{ zIndex: 800 }}
-                                      data={streamWorkspaceOptions}
-                                      value={panel.workspaceId}
-                                      onChange={(value) =>
-                                        setStreamAnalysisPanelWorkspace(panel.id, value)
-                                      }
-                                    />
-                                    <Select
-                                      size="xs"
-                                      searchable
-                                      clearable
-                                      label="Scalar output"
-                                      placeholder="Select scalar output"
-                                      comboboxProps={{ zIndex: 800 }}
-                                      data={integralOutputOptions}
-                                      value={panel.outputId}
-                                      onChange={(value) =>
-                                        setStreamAnalysisPanelOutput(panel.id, value)
-                                      }
-                                    />
-                                    <NumberInput
-                                      size="xs"
-                                      label="Window (s)"
-                                      min={5}
-                                      max={600}
-                                      value={panel.timeWindowS}
-                                      onChange={(value) =>
-                                        setPanelTimeWindow(panel.id, Number(value))
-                                      }
-                                    />
-                                  </Stack>
-                                ) : null}
-                                {(isStreamTracePanel(panel) ||
-                                  isStreamParamsPanel(panel) ||
-                                  isStreamBinStatsPanel(panel) ||
-                                  isStreamBin2dPanel(panel)) && (
-                                  <Button
-                                    size="xs"
-                                    variant="light"
-                                    onClick={() => {
-                                      closePlotOptions();
-                                      if (isStreamTracePanel(panel)) {
-                                        openStreamTraceOptionsModal(panel.id);
-                                        return;
-                                      }
-                                      if (isStreamParamsPanel(panel)) {
-                                        openStreamParamsOptionsModal(panel.id);
-                                        return;
-                                      }
-                                      if (isStreamBin2dPanel(panel)) {
-                                        openStreamBin2dOptionsModal(panel.id);
-                                        return;
-                                      }
-                                      openStreamBinStatsOptionsModal(panel.id);
-                                    }}
-                                  >
-                                    Open advanced options
-                                  </Button>
-                                )}
-                              </Stack>
-                            </Popover.Dropdown>
-                          </Popover>
-                          <Button
-                            size="xs"
-                            variant="light"
-                            onClick={() => {
-                              if (isTelemetryPanel(panel) || isStreamScalarPanel(panel)) {
-                                clearPanelBuffers(panel.id);
-                                return;
-                              }
-                              if (isStreamParamsPanel(panel)) {
-                                streamParamsLatestRef.set(panel.id, {});
-                                setPlotTick((tick) => tick + 1);
-                                return;
-                              }
-                              if (isStreamBinStatsPanel(panel)) {
-                                void clearStreamBinStatsPanel(panel.id);
-                                return;
-                              }
-                              if (isStreamBin2dPanel(panel)) {
-                                void clearStreamBin2dPanel(panel.id);
-                                return;
-                              }
-                              clearStreamPanelFrames(panel.id);
-                            }}
-                          >
-                            {isStreamBinStatsPanel(panel) || isStreamBin2dPanel(panel)
-                              ? "Clear binned data"
-                              : "Clear"}
-                          </Button>
-                        </Group>
-                        <Group gap="xs">
-                            {isExpandablePlotPanel(panel) ? (
-                              <ActionIcon
-                                variant="light"
-                                color="gray"
-                                onClick={() => openExpandedPlot(panel.id)}
-                                title="Enlarge plot"
-                              >
-                                <IconArrowsMaximize size={14} />
-                              </ActionIcon>
-                            ) : null}
-                            <ActionIcon
-                              variant="light"
-                              color="red"
-                            onClick={() => removePanel(panel.id)}
-                            disabled={panels.length <= 1}
-                          >
-                            <IconTrash size={14} />
-                          </ActionIcon>
-                        </Group>
-                      </Group>
-                      {isTelemetryPanel(panel) ? (
-                        <>
-                          <PlotPanel
-                            traces={panel.traces}
-                            buffers={panelBuffers}
-                            tick={plotTick}
-                            timeWindowS={panel.timeWindowS}
-                            colorScheme={computedColorScheme}
-                            yScaleMode={panel.yScaleMode}
-                            yMin={panel.yMin}
-                            yMax={panel.yMax}
-                            yDisplayMode={panel.yDisplayMode}
-                            yOffset={telemetryOffset}
-                            smoothingMode={panel.smoothingMode}
-                            smoothingWindowS={panel.smoothingWindowS}
-                          />
-                          <Group gap="sm" wrap="wrap" mt="sm">
-                            {panel.traces.map((trace, traceIndex) => {
-                              const traceColor = traceColorAt(traceIndex);
-                              return (
-                                <DraggableTraceChip
-                                  key={traceKeyId(trace)}
-                                  panelId={panel.id}
-                                  trace={trace}
-                                  className="trace-chip"
-                                  style={{
-                                    color: traceColor,
-                                    background: colorWithAlpha(
-                                      traceColor,
-                                      computedColorScheme === "dark" ? 0.22 : 0.14
-                                    ),
-                                    border: `1px solid ${colorWithAlpha(
-                                      traceColor,
-                                      computedColorScheme === "dark" ? 0.45 : 0.3
-                                    )}`,
-                                  }}
-                                >
-                                  {trace.deviceId}.{trace.signal}
-                                  <ActionIcon
-                                    size="sm"
-                                    variant="subtle"
-                                    color="red"
-                                    onClick={() => removeTraceFromPanel(panel.id, trace)}
-                                    aria-label={`Remove ${trace.deviceId}.${trace.signal}`}
-                                    title="Remove trace"
-                                  >
-                                    <IconX size={14} />
-                                  </ActionIcon>
-                                </DraggableTraceChip>
-                              );
-                            })}
-                          </Group>
-                        </>
-                      ) : isStreamTracePanel(panel) ? (
-                        <>
-                          {isStreamRawPanel(panel) ? (
-                            <StreamRawPanel
-                              frames={streamFramesRef.get(panel.id) ?? []}
-                              overlayCount={panel.overlayCount}
-                              channelIndex={panel.sourceMode === "raw" ? panel.channelIndex : 0}
-                              tick={plotTick}
-                              colorScheme={computedColorScheme}
-                              units={panel.stream?.units ?? null}
-                              extraSeries={
-                                panel.sourceMode === "dag"
-                                  ? streamTraceOverlaySeries(panel)
-                                  : []
-                              }
-                              yScaleMode={panel.yScaleMode}
-                              yMin={panel.yMin}
-                              yMax={panel.yMax}
-                            />
-                          ) : (
-                            <StreamWaterfallPanel
-                              frames={streamFramesRef.get(panel.id) ?? []}
-                              historyRows={panel.overlayCount}
-                              channelIndex={panel.sourceMode === "raw" ? panel.channelIndex : 0}
-                              tick={plotTick}
-                              colorScheme={computedColorScheme}
-                              zScaleMode={panel.yScaleMode}
-                              zMin={panel.yMin}
-                              zMax={panel.yMax}
-                            />
-                          )}
-                          <Group gap="sm" wrap="wrap" mt="sm">
-                            <Badge
-                              variant="light"
-                              color={panel.sourceMode === "raw" ? "orange" : "teal"}
-                              onClick={() => openStreamTraceOptionsModal(panel.id)}
-                              style={{ cursor: "pointer" }}
-                            >
-                              source: {panel.sourceMode}
-                            </Badge>
-                            {panel.sourceMode === "raw" ? (
-                              <>
-                                {panel.stream ? (
-                                  <Badge
-                                    variant="light"
-                                    color="orange"
-                                    onClick={() => openStreamTraceOptionsModal(panel.id)}
-                                    style={{ cursor: "pointer" }}
-                                  >
-                                    {panel.stream.deviceId}.{panel.stream.stream}
-                                  </Badge>
-                                ) : (
-                                  <Text size="xs" c="dimmed">
-                                    Select a stream to start plotting raw frames.
-                                  </Text>
-                                )}
-                                {panel.stream &&
-                                inferChannelCountFromShape(panel.stream.shape) > 1 ? (
-                                  <Badge
-                                    variant="light"
-                                    color="indigo"
-                                    onClick={() => openStreamTraceOptionsModal(panel.id)}
-                                    style={{ cursor: "pointer" }}
-                                  >
-                                    ch: {panel.channelIndex}
-                                  </Badge>
-                                ) : null}
-                              </>
-                            ) : (
-                              <>
-                                {streamWorkspace ? (
-                                  <Badge
-                                    variant="light"
-                                    color="teal"
-                                    onClick={() => openStreamTraceOptionsModal(panel.id)}
-                                    style={{ cursor: "pointer" }}
-                                  >
-                                    {streamWorkspace.name}
-                                  </Badge>
-                                ) : null}
-                                {streamWorkspace?.stream ? (
-                                  <Badge
-                                    variant="light"
-                                    color="orange"
-                                    onClick={() => openStreamTraceOptionsModal(panel.id)}
-                                    style={{ cursor: "pointer" }}
-                                  >
-                                    {streamWorkspace.stream.deviceId}.{streamWorkspace.stream.stream}
-                                  </Badge>
-                                ) : (
-                                  <Text size="xs" c="dimmed">
-                                    Bind this panel to a configured DAG workspace.
-                                  </Text>
-                                )}
-                                <Badge
-                                  variant="light"
-                                  color="teal"
-                                  onClick={() => openStreamTraceOptionsModal(panel.id)}
-                                  style={{ cursor: "pointer" }}
-                                >
-                                  output: {panel.outputId ?? "none"}
-                                </Badge>
-                              </>
-                            )}
-                            {panel.overlayCount > 1 ? (
-                              <Badge
-                                variant="light"
-                                color="indigo"
-                                onClick={() => openStreamTraceOptionsModal(panel.id)}
-                                style={{ cursor: "pointer" }}
-                              >
-                                {isStreamWaterfallPanel(panel) ? "rows" : "N"}:{" "}
-                                {panel.overlayCount}
-                              </Badge>
-                            ) : null}
-                            {panel.rollingWindow > 1 ? (
-                              <Badge
-                                variant="light"
-                                color="indigo"
-                                onClick={() => openStreamTraceOptionsModal(panel.id)}
-                                style={{ cursor: "pointer" }}
-                              >
-                                avg({panel.averageMode}): {panel.rollingWindow}
-                              </Badge>
-                            ) : null}
-                            <Badge
-                              variant="light"
-                              color="indigo"
-                              onClick={() => openStreamTraceOptionsModal(panel.id)}
-                              style={{ cursor: "pointer" }}
-                            >
-                              decimator:{" "}
-                              {panel.traceDecimator === "minmax"
-                                ? "min-max"
-                                : panel.traceDecimator}
-                            </Badge>
-                            <Badge
-                              variant="light"
-                              color="indigo"
-                              onClick={() => openStreamTraceOptionsModal(panel.id)}
-                              style={{ cursor: "pointer" }}
-                            >
-                              pts: {panel.traceMaxPoints}
-                            </Badge>
-                            <Badge
-                              variant="light"
-                              color="indigo"
-                              onClick={() => openStreamTraceOptionsModal(panel.id)}
-                              style={{ cursor: "pointer" }}
-                            >
-                              hz: {panel.traceMaxFps.toFixed(1)}
-                            </Badge>
-                            <Badge variant="light" color="indigo">
-                              {isStreamWaterfallPanel(panel) ? "z" : "y"}:{" "}
-                              {panel.yScaleMode === "manual" &&
-                              Number.isFinite(panel.yMin ?? NaN) &&
-                              Number.isFinite(panel.yMax ?? NaN)
-                                ? `manual (${Number(panel.yMin).toPrecision(4)}, ${Number(
-                                    panel.yMax
-                                  ).toPrecision(4)})`
-                                : "auto"}
-                            </Badge>
-                            <Badge
-                              variant="light"
-                              color={
-                                panel.sourceMode === "raw"
-                                  ? streamWsConnected
-                                    ? "teal"
-                                    : "red"
-                                  : streamAnalysisWsConnected
-                                  ? "teal"
-                                  : "red"
-                              }
-                            >
-                              {panel.sourceMode === "raw" ? "stream" : "analysis"} link:{" "}
-                              {panel.sourceMode === "raw"
-                                ? streamWsConnected
-                                  ? "connected"
-                                  : "disconnected"
-                                : streamAnalysisWsConnected
-                                ? "connected"
-                                : "disconnected"}
-                            </Badge>
-                          </Group>
-                        </>
-                      ) : isStreamScalarPanel(panel) ? (
-                        <>
-                          <PlotPanel
-                            traces={[streamScalarTrace(panel)]}
-                            buffers={panelBuffers}
-                            tick={plotTick}
-                            timeWindowS={panel.timeWindowS}
-                            colorScheme={computedColorScheme}
-                            yScaleMode={panel.yScaleMode}
-                            yMin={panel.yMin}
-                            yMax={panel.yMax}
-                          />
-                          <Group gap="sm" wrap="wrap" mt="sm">
-                            {streamWorkspace ? (
-                              <Badge variant="light" color="teal">
-                                {streamWorkspace.name}
-                              </Badge>
-                            ) : null}
-                            {streamWorkspace?.stream ? (
-                              <Badge variant="light" color="green">
-                                {streamWorkspace.stream.deviceId}.{streamWorkspace.stream.stream}
-                              </Badge>
-                            ) : (
-                              <Text size="xs" c="dimmed">
-                                Bind this panel to a configured DAG workspace.
-                              </Text>
-                            )}
-                            <Badge variant="light" color="teal">
-                              output: {panel.outputId ?? "none"}
-                            </Badge>
-                            <Text size="xs" c="dimmed">
-                              Analysis link{" "}
-                              {streamAnalysisWsConnected ? "connected" : "disconnected"}
-                            </Text>
-                          </Group>
-                        </>
-                      ) : isStreamParamsPanel(panel) ? (
-                        <>
-                          <StreamParamsPanel
-                            valuesByOutputId={streamParamsLatestRef.get(panel.id) ?? {}}
-                            selectedOutputIds={panel.outputIds}
-                            onCopyJson={(payload) => {
-                              void copyTextToClipboard("Params JSON", payload);
-                            }}
-                          />
-                          <Group gap="sm" wrap="wrap" mt="sm">
-                            {streamWorkspace ? (
-                              <Badge
-                                variant="light"
-                                color="teal"
-                                onClick={() => openStreamParamsOptionsModal(panel.id)}
-                                style={{ cursor: "pointer" }}
-                              >
-                                {streamWorkspace.name}
-                              </Badge>
-                            ) : null}
-                            <Badge
-                              variant="light"
-                              color="indigo"
-                              onClick={() => openStreamParamsOptionsModal(panel.id)}
-                              style={{ cursor: "pointer" }}
-                            >
-                              selected: {panel.outputIds.length}
-                            </Badge>
-                            <Badge
-                              variant="light"
-                              color={streamAnalysisWsConnected ? "teal" : "red"}
-                            >
-                              analysis link:{" "}
-                              {streamAnalysisWsConnected ? "connected" : "disconnected"}
-                            </Badge>
-                          </Group>
-                        </>
-                      ) : isStreamBinStatsPanel(panel) ? (
-                        <>
-                        <StreamBinStatsPanel
-                          series={binStatsSnapshot?.series ?? null}
-                          overlaySeries={streamBinStatsOverlaySeries(panel)}
-                          fitOverlays={streamBinStatsFitOverlayCurves(panel)}
-                          xLabel={binStatsXLabel}
-                          uncertaintyMode={panel.uncertaintyMode}
-                          uncertaintyScale={panel.uncertaintyScale}
-                          showBinMarkers={panel.showBinMarkers}
-                            tick={plotTick}
-                            colorScheme={computedColorScheme}
-                            yScaleMode={panel.yScaleMode}
-                            yMin={panel.yMin}
-                            yMax={panel.yMax}
-                          />
-                          <Group gap="sm" wrap="wrap" mt="sm">
-                            {streamWorkspace ? (
-                              <Badge
-                                variant="light"
-                                color="teal"
-                                onClick={() => openStreamBinStatsOptionsModal(panel.id)}
-                                style={{ cursor: "pointer" }}
-                              >
-                                {streamWorkspace.name}
-                              </Badge>
-                            ) : null}
-                            {streamWorkspace?.stream ? (
-                              <Badge
-                                variant="light"
-                                color="blue"
-                                onClick={() => openStreamBinStatsOptionsModal(panel.id)}
-                                style={{ cursor: "pointer" }}
-                              >
-                                {streamWorkspace.stream.deviceId}.{streamWorkspace.stream.stream}
-                              </Badge>
-                            ) : (
-                              <Text size="xs" c="dimmed">
-                                Bind this panel to a configured DAG workspace.
-                              </Text>
-                            )}
-                            <Badge variant="light" color="indigo">
-                              x: {binStatsXLabel}
-                            </Badge>
-                            <Badge
-                              variant="light"
-                              color="indigo"
-                              onClick={() => openStreamBinStatsOptionsModal(panel.id)}
-                              style={{ cursor: "pointer" }}
-                            >
-                              output: {panel.outputId ?? "none"}
-                            </Badge>
-                            <Badge variant="light" color="indigo">
-                              bins:{" "}
-                              {(() => {
-                                const active =
-                                  binStatsSnapshot?.populatedBinCount ??
-                                  binStatsSnapshot?.activeBinCount ??
-                                  null;
-                                const max = binStatsSnapshot?.maxBinCount ?? null;
-                                if (active === null || max === null || max <= 0) {
-                                  return "n/a";
-                                }
-                                return `${active}/${max}`;
-                              })()}
-                            </Badge>
-                            <Badge
-                              variant="light"
-                              color="indigo"
-                              onClick={() => openStreamBinStatsOptionsModal(panel.id)}
-                              style={{ cursor: "pointer" }}
-                            >
-                              mode: {panel.uncertaintyMode}
-                            </Badge>
-                            {panel.uncertaintyScale !== 1 ? (
-                              <Badge
-                                variant="light"
-                                color="indigo"
-                                onClick={() => openStreamBinStatsOptionsModal(panel.id)}
-                                style={{ cursor: "pointer" }}
-                              >
-                                k: {panel.uncertaintyScale}
-                              </Badge>
-                            ) : null}
-                            <Badge
-                              variant="light"
-                              color={streamAnalysisWsConnected ? "teal" : "red"}
-                            >
-                              analysis link:{" "}
-                              {streamAnalysisWsConnected ? "connected" : "disconnected"}
-                            </Badge>
-                          </Group>
-                        </>
-                      ) : isStreamBin2dPanel(panel) ? (
-                        <>
-                          <StreamBin2dPanel
-                            series={bin2dSnapshot?.series ?? null}
-                            reducer={panel.reducer}
-                            tick={plotTick}
-                            colorScheme={computedColorScheme}
-                            zScaleMode={panel.yScaleMode}
-                            zMin={panel.yMin}
-                            zMax={panel.yMax}
-                          />
-                          <Group gap="sm" wrap="wrap" mt="sm">
-                            {streamWorkspace ? (
-                              <Badge
-                                variant="light"
-                                color="teal"
-                                onClick={() => openStreamBin2dOptionsModal(panel.id)}
-                                style={{ cursor: "pointer" }}
-                              >
-                                {streamWorkspace.name}
-                              </Badge>
-                            ) : null}
-                            <Badge
-                              variant="light"
-                              color="indigo"
-                              onClick={() => openStreamBin2dOptionsModal(panel.id)}
-                              style={{ cursor: "pointer" }}
-                            >
-                              output: {panel.outputId ?? "none"}
-                            </Badge>
-                            <Badge variant="light" color="indigo">
-                              x: {bin2dXLabel}
-                            </Badge>
-                            <Badge variant="light" color="indigo">
-                              y: {bin2dYLabel}
-                            </Badge>
-                            <Badge
-                              variant="light"
-                              color="indigo"
-                              onClick={() => openStreamBin2dOptionsModal(panel.id)}
-                              style={{ cursor: "pointer" }}
-                            >
-                              mode: {panel.reducer}
-                            </Badge>
-                            <Badge variant="light" color="indigo">
-                              bins:{" "}
-                              {(() => {
-                                const xActive = bin2dSnapshot?.xActiveBinCount ?? null;
-                                const yActive = bin2dSnapshot?.yActiveBinCount ?? null;
-                                const xMax = bin2dSnapshot?.xMaxBinCount ?? null;
-                                const yMax = bin2dSnapshot?.yMaxBinCount ?? null;
-                                if (
-                                  xActive === null ||
-                                  yActive === null ||
-                                  xMax === null ||
-                                  yMax === null ||
-                                  xMax <= 0 ||
-                                  yMax <= 0
-                                ) {
-                                  return "n/a";
-                                }
-                                return `${xActive}x${yActive}/${xMax}x${yMax}`;
-                              })()}
-                            </Badge>
-                            <Badge variant="light" color="indigo">
-                              filled: {bin2dSnapshot?.populatedBinCount ?? "n/a"}
-                            </Badge>
-                            <Badge variant="light" color="indigo">
-                              dropped: {bin2dSnapshot?.droppedSamples ?? "n/a"}
-                            </Badge>
-                            <Badge
-                              variant="light"
-                              color={streamAnalysisWsConnected ? "teal" : "red"}
-                            >
-                              analysis link:{" "}
-                              {streamAnalysisWsConnected ? "connected" : "disconnected"}
-                            </Badge>
-                          </Group>
-                        </>
-                      ) : null}
-                    </ReorderableCardShell>
-                  );
-                })}
-              </div>
-              </SortableContext>
+              <PanelsGrid
+                streamWorkspaceOptions={streamWorkspaceOptions}
+                yAxisDraftInvalid={yAxisDraftInvalid}
+                streamWsConnected={streamWsConnected}
+                streamAnalysisWsConnected={streamAnalysisWsConnected}
+                activeUiDrag={activeUiDrag}
+                helpers={stablePanelHelpers}
+                handlers={stablePanelHandlers}
+              />
             </Stack>
           </section>
         </div>
@@ -8881,7 +3445,15 @@ export function App() {
         onCloseExpandedPlot={closeExpandedPlot}
         expandedPlotTitle={expandedPlotPanel ? `Plot ${expandedPlotPanel.title}` : "Plot"}
         expandedPlotContent={
-          expandedPlotPanel ? renderExpandedPlot(expandedPlotPanel) : null
+          expandedPlotPanel ? (
+            <ExpandedPlotBody
+              panel={expandedPlotPanel}
+              resolveTelemetryPanelOffset={resolveTelemetryPanelOffset}
+              streamTraceOverlaySeries={streamTraceOverlaySeries}
+              streamBinStatsOverlaySeries={streamBinStatsOverlaySeries}
+              streamBinStatsFitOverlayCurves={streamBinStatsFitOverlayCurves}
+            />
+          ) : null
         }
         streamTraceOpened={streamTraceOptionsPanel !== null}
         onCloseStreamTrace={closeStreamTraceOptionsModal}

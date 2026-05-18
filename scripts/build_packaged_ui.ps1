@@ -9,15 +9,18 @@ if (-not (Test-Path (Join-Path $uiRoot "package.json"))) {
   throw "build_packaged_ui: UI source not found at $uiRoot"
 }
 
-Push-Location $repoRoot
+# npm 11+ resolves package.json from the current working directory before
+# honouring --prefix, so running from the repo root fails with ENOENT even
+# though `--prefix web\react_ui` is supplied. Push into the UI source dir
+# for all npm invocations and drop the now-redundant --prefix flag.
+Push-Location $uiRoot
 try {
-  # npm ci --prefix $uiRoot
-  npm install --prefix $uiRoot --prefer-offline --no-audit
+  npm install --prefer-offline --no-audit
   if ($LASTEXITCODE -ne 0) {
-    throw "npm ci failed with exit code $LASTEXITCODE"
+    throw "npm install failed with exit code $LASTEXITCODE"
   }
 
-  npm run build --prefix $uiRoot
+  npm run build
   if ($LASTEXITCODE -ne 0) {
     throw "npm run build failed with exit code $LASTEXITCODE"
   }
