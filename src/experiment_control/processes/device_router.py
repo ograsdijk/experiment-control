@@ -165,9 +165,16 @@ class _ReplyItem:
 def _inject_request_id(resp: Json, request_id: Any) -> Json:
     # Echo the caller's request_id back onto the reply so a pipelined
     # client (gateway's RouterRpcClient) can correlate response to
-    # request. Only injects when the response doesn't already carry
-    # an id, so routes that supply their own keep control.
-    if not isinstance(resp, dict) or request_id is None or "request_id" in resp:
+    # request. Only injects when the response doesn't already carry a
+    # non-None id, so routes that supply their own keep control while
+    # an explicit ``{"request_id": None, ...}`` from a handler still
+    # gets overwritten (otherwise the gateway would silently drop the
+    # reply via `pending.pop(None, None)`).
+    if (
+        not isinstance(resp, dict)
+        or request_id is None
+        or resp.get("request_id") is not None
+    ):
         return resp
     out = dict(resp)
     out["request_id"] = request_id

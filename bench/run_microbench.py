@@ -249,7 +249,7 @@ def bench_sanitize(rows: list[Row]) -> None:
 def bench_json_dumps(rows: list[Row]) -> None:
     """Time the production `json_dumps` on representative payloads."""
     print()
-    print("== json_dumps (pyzmq jsonapi) ==")
+    print("== json_dumps (orjson with pyzmq fallback) ==")
     print(_HEADER)
     rng = np.random.default_rng(42)
 

@@ -1222,6 +1222,11 @@ def enforce_managed_process_heartbeat_timeout(
         handle.heartbeat_stale_strikes = 0
         handle.last_stale_detected_mono = None
         handle.recent_manager_loop_stall = False
+        # Keep the age field fresh during healthy operation so dashboards
+        # don't see a stale value left over from the last stale event.
+        handle.last_heartbeat_age_s = (
+            float(hb_age) if handle.last_hb_recv_mono is not None else None
+        )
         return
 
     heartbeat_received = handle.last_hb_recv_mono is not None
