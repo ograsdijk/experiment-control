@@ -541,7 +541,25 @@ class StreamFrameHub:
             values_arr = values_arr.reshape(-1)[: self._max_payload_points]
             truncated = True
 
-        values = _sanitize_json(values_arr.tolist())
+        # Mirrors stream_analysis._build_trace_snapshot_payload: avoid
+        # walking the values list through _sanitize_json on every frame.
+        # `np.isfinite(...).all()` is one vectorised pass; the slow
+        # per-element scrub only triggers when there's real NaN/Inf to
+        # replace. Integer dtypes are always finite so they take the
+        # fast path trivially.
+        values = values_arr.tolist()
+        try:
+            needs_scrub = (
+                values_arr.size > 0
+                and values_arr.dtype.kind in ("f", "c")
+                and not bool(np.isfinite(values_arr).all())
+            )
+        except (TypeError, ValueError):
+            needs_scrub = True
+        if needs_scrub:
+            for i, x in enumerate(values):
+                if isinstance(x, float) and not math.isfinite(x):
+                    values[i] = None
         out: dict[str, Any] = {
             "version": 1,
             "device_id": device_id,
