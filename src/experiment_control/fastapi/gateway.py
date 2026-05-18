@@ -216,6 +216,12 @@ class RouterRpcClient:
             self._set_future_result(
                 fut, self._error("gateway_timeout", "router rpc timed out")
             )
+        # Also drop entries whose caller has already cancelled (e.g. the
+        # outer `asyncio.wait_for` safety net fired). Without this they
+        # linger in `pending` until their own deadline elapses.
+        cancelled = [rid for rid, (fut, _) in pending.items() if fut.done()]
+        for rid in cancelled:
+            pending.pop(rid, None)
 
     def _fail_all_inflight(
         self,
@@ -278,8 +284,10 @@ class RouterRpcClient:
                     continue
                 pending[rid] = (fut, deadline)
 
-            with self._lock:
-                self._inflight_depth = len(pending)
+            # Best-effort observability: read by stats() racily and may
+            # be off-by-one under contention. Worker thread is the only
+            # writer of `pending`, so no lock needed for the write.
+            self._inflight_depth = len(pending)
 
             # 2) Poll for replies, bounded by the next deadline or 100 ms.
             now = time.monotonic()
@@ -349,10 +357,6 @@ class TelemetryHub:
     its background thread and shares the resulting string across every
     subscriber, so N WS clients no longer each pay `json.dumps()` on the
     same payload. WS handlers should consume via `ws.send_text(payload)`.
-
-    `latest_message()` returns the most recently broadcast string so a
-    newly connecting client can prime its state without waiting for the
-    next ZMQ event (useful for low-rate topics like manager state).
     """
 
     def __init__(self, endpoint: str, *, topics: tuple[str, ...]) -> None:

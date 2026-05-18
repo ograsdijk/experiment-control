@@ -6,14 +6,13 @@ from typing import Any
 
 import zmq
 
-from .utils.zmq_helpers import safe_json_loads
+from .utils.zmq_helpers import MAX_DRAIN_PER_TICK, safe_json_loads
 
 Json = dict[str, Any]
 
-# Per-socket per-tick drain cap. Mirrors MAX_DRAIN_PER_TICK in
-# manager.py — keep both in sync if you change one. Bounds worst-case
-# tick duration when an avalanche arrives after a stall.
-MAX_DRAIN_PER_TICK = 256
+# MAX_DRAIN_PER_TICK is re-exported from utils.zmq_helpers (defined
+# there alongside the sibling poll_and_drain helper).
+__all__ = ["MAX_DRAIN_PER_TICK"]
 
 
 def _positive_limit(manager: Any, attr: str, default: int) -> int:

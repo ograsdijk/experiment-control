@@ -1464,15 +1464,6 @@ export function App() {
         streamBinStatsFitOverlayRef.delete(panel.id);
         streamParamsLatestRef.delete(panel.id);
         streamBinStatsRef.delete(panel.id);
-      } else {
-        buffersRef.delete(panel.id);
-        streamFramesRef.delete(panel.id);
-        streamTraceOverlayRef.delete(panel.id);
-        streamBinStatsOverlayRef.delete(panel.id);
-        streamBinStatsFitOverlayRef.delete(panel.id);
-        streamParamsLatestRef.delete(panel.id);
-        streamBinStatsRef.delete(panel.id);
-        streamBin2dRef.delete(panel.id);
       }
     }
     // P5: keep the trace-key reverse index in sync with the current panel
@@ -2573,6 +2564,7 @@ export function App() {
   // Pattern: keep a mutable ref to the latest functions, then expose
   // a single useMemo-stable bag whose methods deref the ref.
   const panelHelpersRef = useRef<PanelsGridHelpers | null>(null);
+  // Render-body ref assign: works today; if we adopt concurrent React, switch to useLayoutEffect.
   panelHelpersRef.current = {
     resolveTelemetryPanelOffset,
     streamTraceOverlaySeries,
