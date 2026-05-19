@@ -531,6 +531,10 @@ class InterlockProcess(ManagedProcessBase):
         if not isinstance(resp, dict) or not resp.get("ok", False):
             raise RuntimeError(f"Failed to register interlock routes: {resp}")
 
+    def _graceful_stop(self) -> None:
+        self._unregister_command_interceptor_routes()
+        super()._graceful_stop()
+
     def _interlock_capability_members(self) -> list[Json]:
         members = [
             method("interlock.list", params=None, doc="List loaded interceptors."),
@@ -981,7 +985,7 @@ class InterlockProcess(ManagedProcessBase):
 
     def run(self) -> None:
         try:
-            while True:
+            while not self._stop_evt.is_set():
                 self._set_phase("poll", "timeout_ms=50")
                 self._poll_and_drain(50)
                 self._set_phase("idle")

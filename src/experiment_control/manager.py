@@ -40,6 +40,7 @@ from .manager_route_handlers import (
     publish_process_command_response as shared_publish_process_command_response,
     route_command_interceptor_list as shared_route_command_interceptor_list,
     route_command_interceptor_register as shared_route_command_interceptor_register,
+    route_command_interceptor_unregister as shared_route_command_interceptor_unregister,
     route_manager_cleanup_orphans as shared_route_manager_cleanup_orphans,
     route_manager_command_journal_status as shared_route_manager_command_journal_status,
     route_manager_command_journal_tail as shared_route_manager_command_journal_tail,
@@ -273,6 +274,9 @@ from .manager_route_handlers import (
 )
 from .manager_route_handlers import (
     register_command_interceptor_routes as shared_register_command_interceptor_routes,
+)
+from .manager_route_handlers import (
+    unregister_command_interceptor_routes as shared_unregister_command_interceptor_routes,
 )
 from .manager_rpc_calls import call_device_rpc as shared_call_device_rpc
 from .manager_rpc_calls import call_process_rpc as shared_call_process_rpc
@@ -2245,6 +2249,9 @@ class Manager:
             route_cls=CommandInterceptorRoute,
         )
 
+    def _unregister_command_interceptor_routes(self, process_id: str) -> bool:
+        return shared_unregister_command_interceptor_routes(self, process_id)
+
     @staticmethod
     def _match_command_interceptor_route(
         route: CommandInterceptorRoute, device_id: str, action: str
@@ -2551,6 +2558,9 @@ class Manager:
 
     def _route_command_interceptor_register(self, req: Json) -> Json:
         return shared_route_command_interceptor_register(self, req)
+
+    def _route_command_interceptor_unregister(self, req: Json) -> Json:
+        return shared_route_command_interceptor_unregister(self, req)
 
     def _route_command_interceptor_list(self, req: Json) -> Json:
         return shared_route_command_interceptor_list(self, req)

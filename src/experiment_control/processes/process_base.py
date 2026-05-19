@@ -97,6 +97,20 @@ class ManagedProcessBase:
         """Hook for subclasses to implement graceful stop behavior."""
         self._stop_evt.set()
 
+    def _unregister_command_interceptor_routes(self) -> None:
+        if not self._process_id:
+            raise RuntimeError("Cannot unregister command interceptor routes without process_id")
+        if self._manager is None:
+            raise RuntimeError("Cannot unregister command interceptor routes before manager init")
+        resp = self._manager.call(
+            {
+                "type": "manager.interceptors.unregister",
+                "process_id": self._process_id,
+            }
+        )
+        if not isinstance(resp, dict) or not resp.get("ok", False):
+            raise RuntimeError(f"Failed to unregister command interceptor routes: {resp}")
+
     def _handle_common_rpc(self, req: dict[str, Any]) -> dict[str, Any] | None:
         rtype = str(req.get("type", ""))
         if rtype == "process.stop":
