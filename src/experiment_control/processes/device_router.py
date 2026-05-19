@@ -1341,9 +1341,24 @@ class DeviceRouter(ManagedProcessBase):
             removed = len(self._routes) != before
             if removed:
                 self._invalidate_route_cache()
+            # Snapshot remaining routes inside the lock so the published event
+            # matches the manager-side shape (process_id, removed, routes).
+            routes_snapshot = [
+                {
+                    "process_id": r.process_id,
+                    "device_id": r.device_id,
+                    "action": r.action,
+                    "order": r.order,
+                }
+                for r in self._routes
+            ]
         self._publish_manager_event(
             "manager.command_interceptor.routes_unregistered",
-            {"process_id": process_id, "removed": removed},
+            {
+                "process_id": process_id,
+                "removed": removed,
+                "routes": routes_snapshot,
+            },
         )
         return removed
 

@@ -532,8 +532,12 @@ class InterlockProcess(ManagedProcessBase):
             raise RuntimeError(f"Failed to register interlock routes: {resp}")
 
     def _graceful_stop(self) -> None:
-        self._unregister_command_interceptor_routes()
-        super()._graceful_stop()
+        # super()._graceful_stop() sets _stop_evt and must always run so the
+        # process actually exits, even if the manager round-trip fails.
+        try:
+            self._unregister_command_interceptor_routes()
+        finally:
+            super()._graceful_stop()
 
     def _interlock_capability_members(self) -> list[Json]:
         members = [

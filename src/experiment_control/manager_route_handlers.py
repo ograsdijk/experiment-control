@@ -101,6 +101,10 @@ def register_command_interceptor_routes(
 
 
 def unregister_command_interceptor_routes(manager: Any, process_id: str) -> bool:
+    # Intentionally idempotent: unknown process_ids return removed=False
+    # rather than raising, so callers cleaning up after a process that
+    # already exited do not have to special-case the race. See
+    # tests/test_manager_interceptor_unregister.py for the contract.
     removed = interceptor_unregister(manager, process_id)
     manager._publish_manager_event(
         "manager.command_interceptor.routes_unregistered",
