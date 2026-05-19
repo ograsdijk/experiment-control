@@ -21,6 +21,9 @@ from .manager_interceptor_routes import (
 from .manager_interceptor_routes import (
     snapshot as interceptor_snapshot,
 )
+from .manager_interceptor_routes import (
+    unregister as interceptor_unregister,
+)
 from .utils.command_interceptors import apply_command_interceptor_chain
 
 Json = dict[str, Any]
@@ -95,6 +98,20 @@ def register_command_interceptor_routes(
         replace=replace,
     )
     return added
+
+
+def unregister_command_interceptor_routes(manager: Any, process_id: str) -> bool:
+    removed = interceptor_unregister(manager, process_id)
+    manager._publish_manager_event(
+        "manager.command_interceptor.routes_unregistered",
+        {
+            "process_id": process_id,
+            "removed": removed,
+            "routes": manager._command_interceptor_routes_snapshot(),
+            "ts": {"t_wall": time.time(), "t_mono": time.monotonic()},
+        },
+    )
+    return removed
 
 
 def match_command_interceptor_route(route: Any, device_id: str, action: str) -> bool:
@@ -419,6 +436,20 @@ def route_command_interceptor_register(manager: Any, req: Json) -> Json:
     except Exception as exc:
         return {"ok": False, "error": {"code": "register_failed", "message": str(exc)}}
     return {"ok": True, "result": {"routes": routes}}
+
+
+def route_command_interceptor_unregister(manager: Any, req: Json) -> Json:
+    process_id = str(req.get("process_id", "")).strip()
+    if not process_id:
+        return {
+            "ok": False,
+            "error": {"code": "invalid_unregister", "message": "missing process_id"},
+        }
+    try:
+        removed = manager._unregister_command_interceptor_routes(process_id)
+    except Exception as exc:
+        return {"ok": False, "error": {"code": "unregister_failed", "message": str(exc)}}
+    return {"ok": True, "result": {"process_id": process_id, "removed": removed}}
 
 
 def route_command_interceptor_list(manager: Any, req: Json) -> Json:

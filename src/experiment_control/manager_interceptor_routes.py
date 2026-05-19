@@ -172,6 +172,10 @@ def drop_process(manager: Any, process_id: str) -> bool:
     return changed
 
 
+def unregister(manager: Any, process_id: str) -> bool:
+    return drop_process(manager, process_id)
+
+
 def register(
     manager: Any,
     *,

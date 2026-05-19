@@ -36,6 +36,7 @@ def build_process_route_registry(manager: Any) -> RpcDispatchRegistry:
             "manager.processes.rpc.advertise": manager._route_process_rpc_advertise,
             "manager.processes.rpc": manager._route_process_rpc,
             "manager.interceptors.register": manager._route_command_interceptor_register,
+            "manager.interceptors.unregister": manager._route_command_interceptor_unregister,
             "manager.interceptors.list": manager._route_command_interceptor_list,
         },
     )

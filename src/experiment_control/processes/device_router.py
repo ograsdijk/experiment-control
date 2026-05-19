@@ -1334,6 +1334,19 @@ class DeviceRouter(ManagedProcessBase):
         )
         return added
 
+    def _unregister_command_interceptor_routes(self, process_id: str) -> bool:
+        with self._route_lock:
+            before = len(self._routes)
+            self._routes = [r for r in self._routes if r.process_id != process_id]
+            removed = len(self._routes) != before
+            if removed:
+                self._invalidate_route_cache()
+        self._publish_manager_event(
+            "manager.command_interceptor.routes_unregistered",
+            {"process_id": process_id, "removed": removed},
+        )
+        return removed
+
     @staticmethod
     def _match_route(
         route: CommandInterceptorRoute, device_id: str, action: str
@@ -1404,6 +1417,22 @@ class DeviceRouter(ManagedProcessBase):
                     "error": {"code": "register_failed", "message": str(e)},
                 }
             return {"ok": True, "result": {"routes": routes}}
+
+        if rtype == "manager.interceptors.unregister":
+            process_id = str(req.get("process_id", "")).strip()
+            if not process_id:
+                return {
+                    "ok": False,
+                    "error": {"code": "invalid_unregister", "message": "missing process_id"},
+                }
+            try:
+                removed = self._unregister_command_interceptor_routes(process_id)
+            except Exception as e:
+                return {
+                    "ok": False,
+                    "error": {"code": "unregister_failed", "message": str(e)},
+                }
+            return {"ok": True, "result": {"process_id": process_id, "removed": removed}}
 
         return {"ok": False, "error": {"code": "unknown_request"}}
 
@@ -1753,7 +1782,11 @@ class DeviceRouter(ManagedProcessBase):
         if rtype == "manager.processes.rpc":
             self._dispatch_process_rpc(identity, req)
             return
-        if rtype in {"manager.interceptors.register", "manager.interceptors.list"}:
+        if rtype in {
+            "manager.interceptors.register",
+            "manager.interceptors.unregister",
+            "manager.interceptors.list",
+        }:
             resp = self._handle_command_interceptor(req)
             self._send_external_response(identity, resp, request_id=req_id)
             return
