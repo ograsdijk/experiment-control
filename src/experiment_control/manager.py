@@ -1627,17 +1627,25 @@ class Manager:
         connect_resp = self._call_device_rpc(
             device_id=device_id, action="connect_device", params={}
         )
+        already_connected = False
         if not self._device_rpc_status_ok(connect_resp):
-            handle.connect_check_last = {
-                "ok": False,
-                "checked_at": {"t_wall": time.time(), "t_mono": time.monotonic()},
-                "message": f"connect RPC failed: {self._device_rpc_error_text(connect_resp)}",
-            }
-            return connect_resp
+            error_text = self._device_rpc_error_text(connect_resp)
+            error_code = str(connect_resp.get("error_code") or "").strip().lower()
+            if error_code == "already_connected" or "already connected" in error_text.lower():
+                already_connected = True
+            else:
+                handle.connect_check_last = {
+                    "ok": False,
+                    "checked_at": {"t_wall": time.time(), "t_mono": time.monotonic()},
+                    "message": f"connect RPC failed: {error_text}",
+                }
+                return connect_resp
 
         check = handle.spec.connect_check
         if not check.enabled:
             handle.connect_check_last = None
+            if already_connected:
+                return {"status": "OK", "result": None, "already_connected": True}
             return connect_resp
 
         identity_resp = self._call_device_rpc(
@@ -1720,6 +1728,8 @@ class Manager:
                 "ts": {"t_wall": time.time(), "t_mono": time.monotonic()},
             },
         )
+        if already_connected:
+            return {"status": "OK", "result": None, "already_connected": True}
         return connect_resp
 
     def disconnect_device(self, device_id: str) -> Json:
