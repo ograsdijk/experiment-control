@@ -1309,7 +1309,9 @@ class DeviceRunner:
         req_id = req.get("id")
         if self._device_state != DeviceState.DISCONNECTED:
             return self._rpc_error(
-                req_id, f"Device is already connected ({self._device_state.value})"
+                req_id,
+                f"Device is already connected ({self._device_state.value})",
+                error_code="already_connected",
             )
         self._connect_called = True
         self.connect_device()

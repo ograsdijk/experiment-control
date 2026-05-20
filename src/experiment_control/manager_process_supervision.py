@@ -1199,6 +1199,53 @@ def _recent_manager_loop_stall(manager: Any, now_mono: float) -> bool:
     return (now_mono - float(last_stall)) <= recent_s
 
 
+def _heartbeat_age_s(handle: Any, now_mono: float) -> float | None:
+    if handle.last_hb_recv_mono is not None:
+        return now_mono - handle.last_hb_recv_mono
+    if handle.last_start_t_mono is not None:
+        return now_mono - handle.last_start_t_mono
+    return None
+
+
+def _publish_heartbeat_refresh_error(manager: Any, exc: Exception) -> None:
+    publish = getattr(manager, "_publish_manager_event", None)
+    if not callable(publish):
+        return
+    now_mono = time.monotonic()
+    period_s = float(getattr(manager, "_process_hb_refresh_error_period_s", 10.0))
+    last_mono = getattr(manager, "_last_process_hb_refresh_error_mono", None)
+    if last_mono is not None and (now_mono - float(last_mono)) < period_s:
+        suppressed = int(getattr(manager, "_process_hb_refresh_error_suppressed", 0))
+        setattr(manager, "_process_hb_refresh_error_suppressed", suppressed + 1)
+        return
+    suppressed = int(getattr(manager, "_process_hb_refresh_error_suppressed", 0))
+    setattr(manager, "_last_process_hb_refresh_error_mono", now_mono)
+    setattr(manager, "_process_hb_refresh_error_suppressed", 0)
+    try:
+        publish(
+            "manager.process.heartbeat_refresh_failed",
+            {
+                "error": str(exc),
+                "suppressed_count": suppressed,
+                "ts": {"t_wall": time.time(), "t_mono": now_mono},
+            },
+        )
+    except Exception:
+        pass
+
+
+def _refresh_pending_process_heartbeats(manager: Any) -> None:
+    sock = getattr(manager, "_process_hb_sub", None)
+    handler = getattr(manager, "_handle_process_pub", None)
+    if sock is None or not callable(handler):
+        return
+    try:
+        if sock.poll(0):
+            handler()
+    except Exception as exc:
+        _publish_heartbeat_refresh_error(manager, exc)
+
+
 def enforce_managed_process_heartbeat_timeout(
     manager: Any,
     handle: Any,
@@ -1206,18 +1253,19 @@ def enforce_managed_process_heartbeat_timeout(
 ) -> None:
     if str(handle.state) not in {"STARTING", "RUNNING"}:
         return
-    hb_age: float | None = None
     # Use manager-side receive time (not the sender's t_mono) so manager
     # buffering / scheduling delay isn't blamed on the process. With
     # the SUB drain-all loop in handle_process_pub, recv time follows
     # send time within milliseconds in normal operation.
-    if handle.last_hb_recv_mono is not None:
-        hb_age = now_mono - handle.last_hb_recv_mono
-    elif handle.last_start_t_mono is not None:
-        hb_age = now_mono - handle.last_start_t_mono
+    hb_age = _heartbeat_age_s(handle, now_mono)
     if hb_age is None:
         return
     timeout_s = float(handle.spec.heartbeat_timeout_s)
+    if hb_age > timeout_s:
+        _refresh_pending_process_heartbeats(manager)
+        hb_age = _heartbeat_age_s(handle, now_mono)
+        if hb_age is None:
+            return
     if hb_age <= timeout_s:
         handle.heartbeat_stale_strikes = 0
         handle.last_stale_detected_mono = None

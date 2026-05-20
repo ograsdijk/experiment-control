@@ -10,6 +10,9 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
+TESTS = ROOT / "tests"
+if str(TESTS) not in sys.path:
+    sys.path.insert(0, str(TESTS))
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
@@ -20,7 +23,7 @@ from experiment_control.manager import (
     Manager,
     device_spec_from_yaml,
 )
-from tests._temp_utils import repo_temp_dir
+from _temp_utils import repo_temp_dir
 
 
 class _RunningProcess:
@@ -138,6 +141,57 @@ class ManagerConnectCheckTests(unittest.TestCase):
 
             with self.assertRaisesRegex(TypeError, "connect_check.identity"):
                 _ = device_spec_from_yaml(device_yaml)
+
+    def test_connect_device_already_connected_is_idempotent_success(self) -> None:
+        mgr, handle = _build_manager_with_device(connect_check=ConnectCheckSpec(enabled=False))
+        mgr._call_device_rpc.return_value = {  # type: ignore[attr-defined]
+            "status": "ERROR",
+            "error": "Device is already connected (OK)",
+            "error_code": "already_connected",
+        }
+
+        resp = Manager.connect_device(mgr, "laser_1")
+
+        self.assertEqual(resp.get("status"), "OK")
+        self.assertTrue(resp.get("already_connected"))
+        self.assertIsNone(handle.connect_check_last)
+
+    def test_connect_device_already_connected_runs_enabled_identity_check(self) -> None:
+        mgr, handle = _build_manager_with_device(
+            connect_check=ConnectCheckSpec(enabled=True, identity={"serial": "ABC12345"})
+        )
+        mgr._call_device_rpc.side_effect = [  # type: ignore[attr-defined]
+            {"status": "ERROR", "error": "Device is already connected (OK)"},
+            {"status": "OK", "result": {"serial": "ABC12345"}},
+        ]
+
+        resp = Manager.connect_device(mgr, "laser_1")
+
+        self.assertEqual(resp.get("status"), "OK")
+        self.assertTrue(resp.get("already_connected"))
+        calls = mgr._call_device_rpc.call_args_list  # type: ignore[attr-defined]
+        self.assertEqual([str(call.kwargs.get("action")) for call in calls], ["connect_device", "identity"])
+        self.assertIsNotNone(handle.connect_check_last)
+        self.assertEqual(handle.connect_check_last.get("ok"), True)
+
+    def test_connect_device_already_connected_identity_mismatch_fails(self) -> None:
+        mgr, handle = _build_manager_with_device(
+            connect_check=ConnectCheckSpec(enabled=True, identity={"serial": "ABC12345"})
+        )
+        mgr._call_device_rpc.side_effect = [  # type: ignore[attr-defined]
+            {"status": "ERROR", "error": "Device is already connected (OK)"},
+            {"status": "OK", "result": {"serial": "XYZ999"}},
+            {"status": "OK", "result": None},
+        ]
+
+        resp = Manager.connect_device(mgr, "laser_1")
+
+        self.assertEqual(resp.get("status"), "ERROR")
+        self.assertEqual(resp.get("error_code"), "connect_check_failed")
+        calls = mgr._call_device_rpc.call_args_list  # type: ignore[attr-defined]
+        self.assertEqual([str(call.kwargs.get("action")) for call in calls], ["connect_device", "identity", "disconnect_device"])
+        self.assertIsNotNone(handle.connect_check_last)
+        self.assertEqual(handle.connect_check_last.get("ok"), False)
 
     def test_connect_device_identity_check_passes(self) -> None:
         mgr, handle = _build_manager_with_device(
