@@ -75,8 +75,13 @@ Notes:
   - TUI device commands: `source_kind=tui`, `source_id=manager_tui`
   - Managed processes using `ManagerClient.call` for `type=command`: `source_kind=process`, `source_id=<process_id>` plus `caller_process_id=<process_id>`
 
-Response (pass-through from driver):
-- `{"ok": true, "result": ...}` or `{"ok": false, "error": ...}`
+Response (pass-through from driver — `id` is the manager's internal RPC sequence number):
+- `{"id": <int>, "status": "OK", "result": ...}`
+- `{"id": <int>, "status": "ERROR", "error": "...", "error_code": "..."}`
+
+Response (manager-level early return — device unknown or driver stopped):
+- `{"ok": false, "error": "Unknown device_id 'foo'"}`
+- `{"ok": false, "error": "driver not running"}`
 
 Response (interceptor blocked):
 - `{"ok": false, "error": {"kind": "command_interceptor", "code": "INTERCEPTOR_REJECTED", ...}}`
@@ -242,7 +247,8 @@ Request:
 - `{"type": "device.connect", "device_id": "dummy1"}`
 
 Response:
-- `{"ok": true, "result": {"status": "connected"}}`
+- `{"ok": true, "result": {"status": "OK", "result": null}}`
+- `{"ok": true, "result": {"status": "OK", "result": null, "already_connected": true}}` (driver was already connected; `connect_check.identity` if enabled has passed)
 - `{"ok": false, "error": {"code": "connect_check_failed", "message": "...", "details": {"expected": {...}, "actual": {...}, "mismatch": {...}}}}`
 
 Notes:
@@ -251,6 +257,9 @@ Notes:
 - Default failure policy is disconnect (`connect_check.on_fail: disconnect`).
 - `connect_check.on_fail: keep_connected` keeps the link up but `device.connect`
   still reports `ok=false` with `code=connect_check_failed`.
+- `device.connect` is idempotent: if the driver returns `error_code: already_connected`,
+  the manager treats it as success, still runs `connect_check.identity` when enabled,
+  and the response gains `already_connected: true`.
 
 ### `device.metadata.get`
 Request:
@@ -410,7 +419,8 @@ Request:
 - `{"type": "watchdog.clear_latch", "params": {"all": true}}`
 
 Response:
-- `{"ok": true, "result": {"cleared": [...]}}`
+- `{"ok": true, "result": {"cleared": [{"watchdog_id": "...", "rule": "...", "previous_latched": true, "previous_armed": true}, ...]}}` (when `params.all=true`)
+- `{"ok": true, "result": {"watchdog_id": "...", "rule": "...", "previous_latched": true, "previous_armed": true}}` (when scoped by `watchdog_id` or unscoped single-rule clear)
 
 ### `watchdog.enable` / `watchdog.disable`
 Request:
@@ -597,6 +607,28 @@ Request:
 
 Response:
 - `{"ok": true, "result": {"changed": [...], "unknown": [...], "disabled_devices": [...], "known_devices": [...], "enabled_known_devices": [...]}}`
+
+### `hdf.writing.start`
+Request:
+- `{"type": "hdf.writing.start", "params": {"filename": "run.h5", "disabled_devices": ["dev2"], "measurement_profile": "frequency_scan", "measurement_values": {"measurement_name": "scan-A", "seed1_power_dbm": -5.2}}}`
+- All params are optional.
+- If `measurement_schema_path` is configured and successfully loaded in the HDF writer, `measurement_profile` is required.
+
+Response:
+- `{"ok": true, "result": {"new_file": "path/to/file.h5", "measurement_id": "uuid", "measurement_type": "frequency_scan", "unknown": [...], "disabled_devices": [...], "known_devices": [...], "enabled_known_devices": [...]}}`
+- `{"ok": false, "error": {"code": "already_writing", "message": "HDF writer is already writing"}}`
+- `{"ok": false, "error": {"code": "invalid_params", "message": "..."}}` (filename empty, `measurement_values` not a dict, etc.)
+- `{"ok": false, "error": {"code": "file_exists", "message": "..."}}`
+- `{"ok": false, "error": {"code": "start_failed", "message": "..."}}`
+
+### `hdf.writing.stop`
+Request:
+- `{"type": "hdf.writing.stop"}`
+
+Response:
+- `{"ok": true, "result": {"already_stopped": false, "old_file": "path/to/file.h5", "disabled_devices": [...], "known_devices": [...], "enabled_known_devices": [...]}}`
+- `{"ok": true, "result": {"already_stopped": true, "old_file": null, "disabled_devices": [...], "known_devices": [...], "enabled_known_devices": [...]}}` (no file was open)
+- `{"ok": false, "error": {"code": "stop_failed", "message": "..."}}`
 
 ### `hdf.rotate`
 Request:
