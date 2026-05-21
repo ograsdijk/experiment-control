@@ -93,6 +93,15 @@ Request:
 Response:
 - `{"ok": true, "devices": [{"device_id": "hv", "registered": true, "...": "..."}]}`
 
+### `device.get_status`
+Request:
+- `{"type": "device.get_status", "device_id": "hv"}`
+
+Response:
+- `{"ok": true, "result": {"device_id": "hv", "liveness": "ONLINE", "...": "..."}}`
+- Result shape is a single device's status snapshot — same per-item shape as `device.list_status` below.
+- Federated (mirrored) devices return the federation hub's snapshot.
+
 ### `device.list_status`
 Request:
 - `{"type": "device.list_status"}`
@@ -381,6 +390,8 @@ Response:
 
 ## Frequency-power follower process RPC (`manager.processes.rpc.request` payload)
 
+This section documents a **process-RPC convention** that consumer processes are expected to implement when they act as frequency-power followers — experiment-control does not ship a follower process. centrex-experimental-stack provides two implementations: `LaserLockFreqNltlPowerFollower` and `frequency_step_guard.py` (the latter exposes these as compatibility aliases for `step_guard.*`).
+
 ### `follower.rules`
 Request:
 - `{"type": "follower.rules"}`
@@ -474,7 +485,10 @@ Response:
 ### `influx.devices.enable` / `influx.devices.disable`
 Request:
 - `{"type": "influx.devices.enable", "params": {"device_id": "device_a"}}`
+- `{"type": "influx.devices.enable", "params": {"device_ids": ["device_a", "device_b"]}}`
+- `{"type": "influx.devices.disable", "params": {"device_id": "device_a"}}`
 - `{"type": "influx.devices.disable", "params": {"device_ids": ["device_a", "device_b"]}}`
+- Both actions accept either `device_id` (single string) or `device_ids` (list of strings). When both are present, `device_ids` wins.
 
 Response:
 - `{"ok": true, "result": {"disabled_devices": []}}`
