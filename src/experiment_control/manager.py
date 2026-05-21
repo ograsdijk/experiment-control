@@ -1631,6 +1631,9 @@ class Manager:
         if not self._device_rpc_status_ok(connect_resp):
             error_text = self._device_rpc_error_text(connect_resp)
             error_code = str(connect_resp.get("error_code") or "").strip().lower()
+            # In-tree drivers emit error_code="already_connected" (see
+            # DeviceRunner._rpc_route_connect_device). Substring branch is a
+            # back-compat shim for out-of-tree drivers; remove on next major.
             if error_code == "already_connected" or "already connected" in error_text.lower():
                 already_connected = True
             else:

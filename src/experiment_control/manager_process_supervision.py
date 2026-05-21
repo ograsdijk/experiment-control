@@ -1208,9 +1208,6 @@ def _heartbeat_age_s(handle: Any, now_mono: float) -> float | None:
 
 
 def _publish_heartbeat_refresh_error(manager: Any, exc: Exception) -> None:
-    publish = getattr(manager, "_publish_manager_event", None)
-    if not callable(publish):
-        return
     now_mono = time.monotonic()
     period_s = float(getattr(manager, "_process_hb_refresh_error_period_s", 10.0))
     last_mono = getattr(manager, "_last_process_hb_refresh_error_mono", None)
@@ -1222,7 +1219,7 @@ def _publish_heartbeat_refresh_error(manager: Any, exc: Exception) -> None:
     setattr(manager, "_last_process_hb_refresh_error_mono", now_mono)
     setattr(manager, "_process_hb_refresh_error_suppressed", 0)
     try:
-        publish(
+        manager._publish_manager_event(
             "manager.process.heartbeat_refresh_failed",
             {
                 "error": str(exc),

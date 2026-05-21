@@ -1328,7 +1328,11 @@ class DeviceRunner:
     def _rpc_route_disconnect_device(self, req: dict[str, Any]) -> dict[str, Any]:
         req_id = req.get("id")
         if self._device_state == DeviceState.DISCONNECTED:
-            return self._rpc_error(req_id, "Device is already disconnected")
+            return self._rpc_error(
+                req_id,
+                "Device is already disconnected",
+                error_code="already_disconnected",
+            )
         self.disconnect_device()
         self._device_reachable = False
         self._device_state = DeviceState.DISCONNECTED

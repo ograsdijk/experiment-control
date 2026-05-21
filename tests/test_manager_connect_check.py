@@ -154,6 +154,7 @@ class ManagerConnectCheckTests(unittest.TestCase):
 
         self.assertEqual(resp.get("status"), "OK")
         self.assertTrue(resp.get("already_connected"))
+        self.assertIsNone(resp.get("result"))
         self.assertIsNone(handle.connect_check_last)
 
     def test_connect_device_already_connected_runs_enabled_identity_check(self) -> None:
