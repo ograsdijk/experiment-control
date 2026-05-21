@@ -32,7 +32,9 @@ Recent refactors split the large manager/router/process paths into focused modul
 
 ## Runtime Safety Bounds
 
-Process heartbeat supervision performs a queued-heartbeat refresh before marking a process stale, so transient manager-loop backlog does not get blamed on child processes. If heartbeat starvation continues under very high telemetry load, consider moving process heartbeat ingest to a dedicated lightweight receiver thread/task that only updates process heartbeat timestamps.
+Process heartbeat supervision performs a queued-heartbeat refresh before marking a process stale, so transient manager-loop backlog is not blamed on child processes.
+
+If heartbeat starvation continues under very high telemetry load, consider moving process heartbeat ingest to a dedicated lightweight receiver thread/task that only updates process heartbeat timestamps.
 
 The stack now has explicit memory/backpressure bounds in hot paths:
 

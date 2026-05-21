@@ -70,6 +70,22 @@ def _make_handle() -> SimpleNamespace:
     )
 
 
+def _make_supervision_manager(**overrides: object) -> SimpleNamespace:
+    """Default manager-like object for enforce_managed_process_heartbeat_timeout tests."""
+    defaults: dict[str, object] = {
+        "_process_hb_sub": None,
+        "_handle_process_pub": lambda: None,
+        "_last_loop_stall_mono": None,
+        "_last_loop_stall_duration_s": 0.0,
+        "_manager_loop_stall_recent_s": 10.0,
+        "_heartbeat_stale_strikes_to_fail": 2,
+        "_heartbeat_hard_timeout_multiplier": 3.0,
+        "_publish_manager_event": lambda *args, **kwargs: None,
+    }
+    defaults.update(overrides)
+    return SimpleNamespace(**defaults)
+
+
 class _FakePopen:
     def __init__(self) -> None:
         self.terminated = False
@@ -190,14 +206,9 @@ class ProcessSnapshotMemoryTests(unittest.TestCase):
         def _drain_queued_hb() -> None:
             handle.last_hb_recv_mono = 9.8
 
-        manager = SimpleNamespace(
+        manager = _make_supervision_manager(
             _process_hb_sub=_Sock(),
             _handle_process_pub=_drain_queued_hb,
-            _last_loop_stall_mono=None,
-            _manager_loop_stall_recent_s=10.0,
-            _heartbeat_stale_strikes_to_fail=2,
-            _heartbeat_hard_timeout_multiplier=3.0,
-            _publish_manager_event=lambda *args, **kwargs: None,
         )
 
         enforce_managed_process_heartbeat_timeout(manager, handle, 10.0)
@@ -221,14 +232,11 @@ class ProcessSnapshotMemoryTests(unittest.TestCase):
         def _drain_failure() -> None:
             raise RuntimeError("boom")
 
-        manager = SimpleNamespace(
+        manager = _make_supervision_manager(
             _process_hb_sub=_Sock(),
             _handle_process_pub=_drain_failure,
             _last_loop_stall_mono=9.5,
             _last_loop_stall_duration_s=4.0,
-            _manager_loop_stall_recent_s=10.0,
-            _heartbeat_stale_strikes_to_fail=2,
-            _heartbeat_hard_timeout_multiplier=3.0,
             _publish_manager_event=lambda topic, payload: events.append((topic, payload)),
         )
 
@@ -251,12 +259,11 @@ class ProcessSnapshotMemoryTests(unittest.TestCase):
         def _drain_failure() -> None:
             raise RuntimeError("boom")
 
-        manager = SimpleNamespace(
+        manager = _make_supervision_manager(
             _process_hb_sub=_Sock(),
             _handle_process_pub=_drain_failure,
             _last_loop_stall_mono=9.5,
             _last_loop_stall_duration_s=4.0,
-            _manager_loop_stall_recent_s=10.0,
             _heartbeat_stale_strikes_to_fail=99,
             _heartbeat_hard_timeout_multiplier=10.0,
             _process_hb_refresh_error_period_s=10.0,
