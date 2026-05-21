@@ -142,6 +142,7 @@ class StreamWorkspaceStoreRequest(BaseModel):
 
 
 STREAM_ANALYSIS_PROCESS_ID = "stream_analysis"
+_DEVICE_CONNECT_TIMEOUT_MS = int(os.environ.get("EXPERIMENT_CONTROL_DEVICE_CONNECT_TIMEOUT_MS", "30000"))
 
 
 def _load_settings() -> GatewaySettings:
@@ -1163,7 +1164,9 @@ async def device_call(
 @app.post("/api/devices/{device_id}/connect")
 async def device_connect(device_id: str) -> dict[str, Any]:
     payload = {"type": "device.connect", "device_id": device_id}
-    return await _route_request(payload)
+    return _ensure_error_shape(
+        await app.state.router.request(payload, timeout_ms=_DEVICE_CONNECT_TIMEOUT_MS)
+    )
 
 
 @app.post("/api/devices/{device_id}/start")
