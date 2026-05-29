@@ -262,11 +262,41 @@ def _telemetry_error(
 def _resolve_binding_age_s(sample: dict[str, Any], *, now_mono: float) -> float | None:
     age_s = sample.get("age_s")
     if age_s is not None:
-        return float(age_s)
+        try:
+            return float(age_s)
+        except Exception:
+            return None
     t_mono = sample.get("t_mono")
     if t_mono is None:
         return None
-    return now_mono - float(t_mono)
+    try:
+        return now_mono - float(t_mono)
+    except Exception:
+        return None
+
+
+def _optional_binding_env(
+    *,
+    binding: TelemetryBinding,
+    sample: dict[str, Any] | None,
+    ok: bool,
+    reason: str,
+    age_s: float | None,
+) -> Json:
+    return {
+        "available": sample is not None,
+        "ok": bool(ok),
+        "value": None if sample is None else sample.get("value"),
+        "units": None if sample is None else sample.get("units"),
+        "quality": "MISSING" if sample is None else str(sample.get("quality", "MISSING")),
+        "t_mono": None if sample is None else sample.get("t_mono"),
+        "t_wall": None if sample is None else sample.get("t_wall"),
+        "age_s": age_s,
+        "reason": reason,
+        "device": binding.device_id,
+        "signal": binding.signal,
+        "max_age_s": binding.max_age_s,
+    }
 
 
 def _resolve_interlock_telemetry_env(
@@ -279,6 +309,17 @@ def _resolve_interlock_telemetry_env(
     for binding in rule.telemetry:
         sample = telemetry_getter(binding.device_id, binding.signal)
         if sample is None:
+            if not binding.required:
+                env[binding.alias] = to_attrdict(
+                    _optional_binding_env(
+                        binding=binding,
+                        sample=None,
+                        ok=False,
+                        reason="missing",
+                        age_s=None,
+                    )
+                )
+                continue
             err = _telemetry_error(
                 code="TELEMETRY_MISSING",
                 message=f"Telemetry missing for {binding.device_id}.{binding.signal}",
@@ -288,6 +329,17 @@ def _resolve_interlock_telemetry_env(
             return env, err
         quality = str(sample.get("quality", "MISSING"))
         if quality != "OK":
+            if not binding.required:
+                env[binding.alias] = to_attrdict(
+                    _optional_binding_env(
+                        binding=binding,
+                        sample=sample,
+                        ok=False,
+                        reason=f"quality={quality}",
+                        age_s=_resolve_binding_age_s(sample, now_mono=now_mono),
+                    )
+                )
+                continue
             err = _telemetry_error(
                 code="TELEMETRY_NOT_OK",
                 message=f"Telemetry not OK for {binding.device_id}.{binding.signal}",
@@ -297,6 +349,17 @@ def _resolve_interlock_telemetry_env(
             return env, err
         age_s = _resolve_binding_age_s(sample, now_mono=now_mono)
         if age_s is None:
+            if not binding.required:
+                env[binding.alias] = to_attrdict(
+                    _optional_binding_env(
+                        binding=binding,
+                        sample=sample,
+                        ok=False,
+                        reason="missing timestamp",
+                        age_s=None,
+                    )
+                )
+                continue
             err = _telemetry_error(
                 code="TELEMETRY_MISSING",
                 message=f"Telemetry missing timestamp for {binding.device_id}.{binding.signal}",
@@ -305,6 +368,17 @@ def _resolve_interlock_telemetry_env(
             )
             return env, err
         if age_s > binding.max_age_s:
+            if not binding.required:
+                env[binding.alias] = to_attrdict(
+                    _optional_binding_env(
+                        binding=binding,
+                        sample=sample,
+                        ok=False,
+                        reason=f"stale: age={age_s:.3f}s",
+                        age_s=float(age_s),
+                    )
+                )
+                continue
             err = _telemetry_error(
                 code="TELEMETRY_STALE",
                 message=f"Telemetry stale for {binding.device_id}.{binding.signal}",
@@ -315,12 +389,18 @@ def _resolve_interlock_telemetry_env(
             return env, err
         env[binding.alias] = to_attrdict(
             {
+                "available": True,
+                "ok": True,
                 "value": sample.get("value"),
                 "units": sample.get("units"),
                 "quality": quality,
                 "t_mono": sample.get("t_mono"),
                 "t_wall": sample.get("t_wall"),
                 "age_s": float(age_s),
+                "reason": None,
+                "device": binding.device_id,
+                "signal": binding.signal,
+                "max_age_s": binding.max_age_s,
             }
         )
     return env, None
@@ -495,6 +575,7 @@ class InterlockProcess(ManagedProcessBase):
                     "device_id": binding.device_id,
                     "signal": binding.signal,
                     "max_age_s": binding.max_age_s,
+                    "required": binding.required,
                 }
                 for binding in rule.telemetry
             ],
