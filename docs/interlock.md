@@ -63,20 +63,53 @@ Notes:
 
 Each telemetry binding provides a value in the rule environment under its `as` name:
 
+- `<alias>.available`
+- `<alias>.ok`
 - `<alias>.value`
 - `<alias>.units`
 - `<alias>.quality`
 - `<alias>.t_mono`
 - `<alias>.t_wall`
 - `<alias>.age_s`
+- `<alias>.reason`
+- `<alias>.device`
+- `<alias>.signal`
+- `<alias>.max_age_s`
 
-Telemetry checks happen before evaluating `condition`:
+Each binding may also set `required: false` in YAML. The default is `true`.
+
+For required telemetry, checks happen before evaluating `condition`:
 
 - Missing sample -> `TELEMETRY_MISSING`
 - Not OK quality -> `TELEMETRY_NOT_OK`
+- Missing or invalid timestamp -> `TELEMETRY_MISSING`
 - Older than `max_age_s` -> `TELEMETRY_STALE`
 
 Quality is considered OK only when `quality == "OK"`.
+
+For optional telemetry (`required: false`), these states do not automatically reject the command. The binding is still added to the rule environment with `ok: false` and a `reason` such as `missing`, `quality=...`, `missing timestamp`, or `stale: age=...`, and the rule condition decides whether to allow or reject the command.
+
+Safe authoring pattern for optional telemetry:
+
+- Check `<alias>.ok` before trusting `<alias>.value`.
+- Treat `<alias>.value` as advisory only when `<alias>.ok` is true.
+
+Example:
+
+```yaml
+inputs:
+  telemetry:
+    - as: hornet
+      device: hornet_eql
+      signal: ig_on
+      required: false
+condition:
+  or:
+    - not: "${hornet.ok}"
+    - eq: ["${hornet.value}", false]
+```
+
+This example is fail-open for the Hornet binding: if Hornet telemetry is unavailable or not OK, the Hornet-specific check does not block the command. If Hornet telemetry is present and OK, then the condition requires `hornet.value == false`.
 
 ## Condition evaluation
 
