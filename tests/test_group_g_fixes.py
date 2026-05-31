@@ -300,19 +300,13 @@ class ShmRingFileExistsRecoveryTests(unittest.TestCase):
             seed.close()  # leave the OS segment behind so create() will
                           # hit FileExistsError below
 
-            # Patch SharedMemory so that the "stale" handle's close()
-            # raises but unlink() still runs. The retry create=True
-            # below must succeed.
+            # Patch SharedMemory.close to raise unconditionally for the
+            # duration of the recovery branch. mock.patch.object handles
+            # both the patch AND the restore on exit; no manual capture
+            # or restore is needed.
             from multiprocessing import shared_memory as sm_mod
-            original_close = sm_mod.SharedMemory.close
-            close_calls = {"n": 0}
 
             def _flaky_close(self):
-                close_calls["n"] += 1
-                # Only fail for the recovery-path close (the second
-                # close on this name), which corresponds to the stale
-                # handle. In practice close_calls["n"] >= 1 on the
-                # recovery path; raise unconditionally for the test.
                 raise OSError("simulated close failure")
 
             with mock.patch.object(sm_mod.SharedMemory, "close", _flaky_close):
@@ -325,8 +319,6 @@ class ShmRingFileExistsRecoveryTests(unittest.TestCase):
                     slot_count=2,
                     layout_version=1,
                 )
-            # Restore real close for teardown.
-            sm_mod.SharedMemory.close = original_close
             try:
                 self.assertEqual(recovered.layout.slot_count, 2)
             finally:
