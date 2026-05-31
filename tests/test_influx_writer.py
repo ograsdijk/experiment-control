@@ -69,6 +69,8 @@ def _make_proc() -> InfluxWriterProcess:
     proc._points_skipped_invalid = 0  # noqa: SLF001
     proc._points_skipped_remote = 0  # noqa: SLF001
     proc._points_dropped_overflow = 0  # noqa: SLF001
+    proc._signals_skipped_invalid = 0  # noqa: SLF001
+    proc._signals_skipped_invalid_seen = set()  # noqa: SLF001
     proc._write_errors = 0  # noqa: SLF001
     proc._batches_written = 0  # noqa: SLF001
     proc._last_error = None  # noqa: SLF001
