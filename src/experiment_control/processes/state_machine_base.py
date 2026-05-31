@@ -382,6 +382,13 @@ class StateMachineProcessBase(ManagedProcessBase):
         self._publish_transition_event(src, dst, reason=reason, metadata=meta)
         return True
 
+    # Prefix used when _publish_transition_event records a publish
+    # failure into self._last_error (set by PR #54, group F.34). A
+    # successful subsequent publish clears `_last_error` ONLY when the
+    # stored message starts with this prefix — operational errors
+    # (e.g. set elsewhere by the subclass) are preserved.
+    _TRANSITION_PUBLISH_ERROR_PREFIX = "failed to publish transition event"
+
     def _publish_transition_event(
         self,
         from_state: str,
@@ -406,16 +413,29 @@ class StateMachineProcessBase(ManagedProcessBase):
                 payload=payload,
             )
         except Exception as exc:
-            # Record the publish failure on the process's last_error
-            # so an operator inspecting `status` sees that the bus
-            # event was dropped, instead of the failure being
-            # silently swallowed by `except: pass`. Don't overwrite
-            # a more meaningful pre-existing error.
+            # Record the publish failure on the process's last_error so
+            # an operator inspecting `status` sees that the bus event
+            # was dropped, instead of the failure being silently
+            # swallowed. Don't overwrite a more meaningful pre-existing
+            # error.
             if not self._last_error:
                 self._last_error = (
-                    f"failed to publish transition event "
+                    f"{self._TRANSITION_PUBLISH_ERROR_PREFIX} "
                     f"{from_state!s} -> {to_state!s}: {exc!r}"
                 )
+            return
+        # Successful publish: clear a previously-recorded transition-
+        # publish error so a one-off failure (e.g. bus not yet wired at
+        # startup) doesn't permanently mask later operational errors.
+        # Only clears errors with the matching prefix; unrelated
+        # operational errors stored in _last_error are preserved.
+        if (
+            self._last_error
+            and self._last_error.startswith(
+                self._TRANSITION_PUBLISH_ERROR_PREFIX
+            )
+        ):
+            self._last_error = None
 
     def _on_state_exit(
         self,
