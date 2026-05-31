@@ -391,6 +391,16 @@ class InfluxWriterProcess(ManagedProcessBase):
         self._points_skipped_invalid = 0
         self._points_skipped_remote = 0
         self._points_dropped_overflow = 0
+        # Per-signal drop counter for telemetry values that
+        # _coerce_signal_field_value rejected (e.g. numpy arrays,
+        # non-finite floats, oversize ints). Previously these were
+        # silently dropped with no diagnostic; operators had no way
+        # to know which (device, signal) pair was producing
+        # unwritable values. The counter feeds the status RPC; the
+        # rate-limited log emits the first occurrence per
+        # (device, signal) so the noisy case is named once.
+        self._signals_skipped_invalid = 0
+        self._signals_skipped_invalid_seen: set[tuple[str, str]] = set()
         self._write_errors = 0
         self._batches_written = 0
         self._last_error: str | None = None
@@ -723,6 +733,46 @@ class InfluxWriterProcess(ManagedProcessBase):
             )
         return None
 
+    def _note_signal_dropped(
+        self,
+        *,
+        device_id: str,
+        signal_name: str,
+        raw_value: Any,
+    ) -> None:
+        """Record a signal whose value was rejected by
+        _coerce_signal_field_value.
+
+        Always bumps the counter so the status RPC reflects the total
+        drop rate. The FIRST occurrence per (device_id, signal_name)
+        pair additionally emits a one-line stderr entry naming the
+        signal and the rejected value's type, so operators can identify
+        which signals are persistently producing unwritable values
+        (e.g. a driver returning numpy arrays where Influx expects
+        scalars). Subsequent drops on the same pair just bump the
+        counter without re-logging.
+        """
+        with self._counters_lock:
+            self._signals_skipped_invalid += 1
+        key = (device_id, signal_name)
+        if key in self._signals_skipped_invalid_seen:
+            return
+        self._signals_skipped_invalid_seen.add(key)
+        try:
+            type_name = type(raw_value).__name__
+            sys.stderr.write(
+                f"[influx_writer] dropping signal "
+                f"{device_id!r}.{signal_name!r}: "
+                f"_coerce_signal_field_value rejected value of "
+                f"type {type_name!r} (further drops on this signal "
+                f"will accumulate into _signals_skipped_invalid "
+                f"without re-logging)\n"
+            )
+            sys.stderr.flush()
+        except Exception:
+            # Never let observability break ingest.
+            pass
+
     @staticmethod
     def _coerce_signal_field_value(value: Any) -> Any | None:
         if isinstance(value, bool):
@@ -740,7 +790,9 @@ class InfluxWriterProcess(ManagedProcessBase):
             return value
         return None
 
-    def _build_telemetry_fields(self, signals: Any) -> dict[str, Any]:
+    def _build_telemetry_fields(
+        self, signals: Any, *, device_id: str = ""
+    ) -> dict[str, Any]:
         fields: dict[str, Any] = {}
         if not isinstance(signals, dict):
             return fields
@@ -748,8 +800,18 @@ class InfluxWriterProcess(ManagedProcessBase):
             signal_name = str(signal_name_raw).strip()
             if not signal_name or not isinstance(signal_payload_raw, dict):
                 continue
-            coerced_value = self._coerce_signal_field_value(signal_payload_raw.get("value"))
+            raw_value = signal_payload_raw.get("value")
+            coerced_value = self._coerce_signal_field_value(raw_value)
             if coerced_value is None:
+                # Pre-fix: silent continue with no per-signal record.
+                # Now: count + first-time log so the noisy signal is
+                # named in the writer's logs once (subsequent drops
+                # accumulate into the counter only).
+                self._note_signal_dropped(
+                    device_id=device_id,
+                    signal_name=signal_name,
+                    raw_value=raw_value,
+                )
                 continue
             fields[signal_name] = coerced_value
             if self._include_quality_fields:
@@ -799,7 +861,9 @@ class InfluxWriterProcess(ManagedProcessBase):
         destination_name: str,
         destination: InfluxDestination,
     ) -> QueuedPoint | None:
-        fields = self._build_telemetry_fields(payload.get("signals"))
+        fields = self._build_telemetry_fields(
+            payload.get("signals"), device_id=device_id
+        )
         if not fields:
             self._points_skipped_invalid += 1
             return None
@@ -1354,6 +1418,11 @@ class InfluxWriterProcess(ManagedProcessBase):
                 "points_skipped_invalid": self._points_skipped_invalid,
                 "points_skipped_remote": self._points_skipped_remote,
                 "points_dropped_overflow": self._points_dropped_overflow,
+                # Total per-signal rejections by
+                # _coerce_signal_field_value (numpy arrays, non-finite
+                # floats, oversize ints, etc.). Distinct from
+                # points_skipped_invalid which is bundle-level.
+                "signals_skipped_invalid": self._signals_skipped_invalid,
                 "write_errors": self._write_errors,
                 "batches_written": self._batches_written,
                 "dropped_http_batches": self._dropped_http_batches,
