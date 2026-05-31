@@ -436,10 +436,21 @@ def _resolve_interlock_telemetry_env(
     return env, None
 
 
-def _evaluate_interlock_condition(rule: Rule, env: dict[str, Any]) -> bool:
+def _evaluate_interlock_condition(
+    rule: Rule,
+    env: dict[str, Any],
+    *,
+    on_condition_error: Callable[[BaseException], None] | None = None,
+) -> bool:
     try:
         return bool(eval_condition(rule.condition, env))
-    except Exception:
+    except Exception as e:
+        if on_condition_error is not None:
+            try:
+                on_condition_error(e)
+            except Exception:
+                # Diagnostic callback failure must not affect rule eval.
+                pass
         return False
 
 
@@ -492,7 +503,23 @@ def evaluate_interlock_rule(
     cmd: Json,
     telemetry_getter: Callable[[str, str], dict[str, Any] | None],
     now_mono: float,
+    on_condition_error: Callable[[BaseException], None] | None = None,
 ) -> tuple[str, Json | None, Json | None]:
+    """Evaluate one interlock rule against a candidate command.
+
+    Returns the 3-tuple `(verdict, new_cmd, error)` where verdict is
+    "allow" / "reject" / "transform". Tuple shape preserved for
+    backwards compatibility with downstream callers that destructure
+    `verdict, new_cmd, err = evaluate_interlock_rule(...)`.
+
+    `on_condition_error`, when supplied, is invoked with the exception
+    raised by `eval_condition(rule.condition, env)`. Default `None`
+    preserves the previous silent-failure-as-reject behaviour. The
+    InterlockProcess passes a rate-limited callback so a misconfigured
+    rule (typo in field name, divide-by-zero, etc.) surfaces as a
+    `manager.interlock.rule_error` event instead of appearing as a
+    permanent "CONDITION_FAILED" with no diagnostic.
+    """
     env = _build_interlock_env(cmd)
     telemetry_env, telemetry_err = _resolve_interlock_telemetry_env(
         rule=rule,
@@ -502,7 +529,9 @@ def evaluate_interlock_rule(
     if telemetry_err is not None:
         return "reject", None, telemetry_err
     env.update(telemetry_env)
-    cond_ok = _evaluate_interlock_condition(rule, env)
+    cond_ok = _evaluate_interlock_condition(
+        rule, env, on_condition_error=on_condition_error
+    )
     if not cond_ok:
         return "reject", None, _condition_failed_error(rule)
 
@@ -586,6 +615,14 @@ class InterlockProcess(ManagedProcessBase):
         )
         self._init_poller()
 
+        # Rate-limit state for rule-condition error events. A misconfigured
+        # rule (typo in field name, divide-by-zero etc.) that raises on
+        # every command would otherwise flood manager.interlock.rule_error.
+        # Cap at one event per `_rule_error_period_s` seconds per
+        # (interceptor_id, rule_name).
+        self._rule_error_last_mono: dict[tuple[str, str], float] = {}
+        self._rule_error_period_s: float = 30.0
+
         self._advertise_process_rpc()
         self._register_routes()
         self._start_heartbeat_thread(state_provider=lambda: "RUNNING")
@@ -607,6 +644,41 @@ class InterlockProcess(ManagedProcessBase):
 
     def _rule_enabled_state(self, interceptor_id: str, rule_id: str) -> bool:
         return bool(self._rule_enabled.get(self._rule_key(interceptor_id, rule_id), True))
+
+    def _make_condition_error_callback(
+        self, *, interceptor_id: str, rule_name: str
+    ) -> Callable[[BaseException], None]:
+        """Build a per-(interceptor_id, rule_name) callback that
+        publishes a rate-limited rule_error event when the rule's
+        condition expression raises. Before this fix,
+        `_evaluate_interlock_condition` swallowed all exceptions
+        silently — a misconfigured rule appeared as a permanent
+        "CONDITION_FAILED" rejection with no diagnostic, leaving
+        operators with no way to tell a bad rule from a real interlock.
+        """
+        rate_key = (interceptor_id, rule_name)
+
+        def _callback(exc: BaseException) -> None:
+            now = time.monotonic()
+            last = self._rule_error_last_mono.get(rate_key)
+            if last is not None and (now - last) < self._rule_error_period_s:
+                return
+            self._rule_error_last_mono[rate_key] = now
+            try:
+                self._manager_helper.publish_event(
+                    self._manager,
+                    topic="manager.interlock.rule_error",
+                    payload={
+                        "process_id": self._process_id,
+                        "interceptor_id": interceptor_id,
+                        "rule": rule_name,
+                        "error": repr(exc),
+                    },
+                )
+            except Exception:
+                pass
+
+        return _callback
 
     def _routes_for_enabled_rules(self) -> list[Json]:
         routes: list[Json] = []
@@ -1070,6 +1142,10 @@ class InterlockProcess(ManagedProcessBase):
                     cmd=cur_cmd,
                     telemetry_getter=self._manager.get_latest,
                     now_mono=now_mono,
+                    on_condition_error=self._make_condition_error_callback(
+                        interceptor_id=ruleset.interceptor_id,
+                        rule_name=rule.name,
+                    ),
                 )
                 if verdict == "reject":
                     return {
