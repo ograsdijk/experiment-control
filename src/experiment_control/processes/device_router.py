@@ -544,6 +544,11 @@ class _DeviceWorker(_BaseWorker):
         self._process_socks: OrderedDict[
             str, tuple[str, zmq.Socket]
         ] = OrderedDict()
+        # Per-interceptor-socket flag: set when an _call_interceptor
+        # times out so the NEXT call for that process drains stale
+        # replies pre-send. Healthy calls pay zero extra syscalls.
+        # Pruned alongside _process_socks via _evict_process_sock.
+        self._maybe_stale_interceptor_socks: dict[str, bool] = {}
         self._seq = 0
 
     def _close_device_sock(self) -> None:
@@ -578,24 +583,28 @@ class _DeviceWorker(_BaseWorker):
             return entry[1]
         # Stale entry (endpoint changed because the interceptor process
         # restarted on a new ephemeral port) — close before replacing.
+        # Replacing the socket also makes any prior "maybe stale reply"
+        # tracking moot for this process_id.
         if entry is not None:
             try:
                 entry[1].close(0)
             except Exception:
                 pass
             self._process_socks.pop(process_id, None)
+            self._maybe_stale_interceptor_socks.pop(process_id, None)
         # Cap the cache by evicting the least-recently-used entry
         # before inserting the new one. Without this, a router that
         # sees many distinct interceptor process_ids over its lifetime
         # leaks sockets indefinitely.
         while len(self._process_socks) >= _PROCESS_SOCKS_MAX:
-            _evicted_pid, (_evicted_ep, evicted_sock) = (
+            evicted_pid, (_evicted_ep, evicted_sock) = (
                 self._process_socks.popitem(last=False)
             )
             try:
                 evicted_sock.close(0)
             except Exception:
                 pass
+            self._maybe_stale_interceptor_socks.pop(evicted_pid, None)
         sock = self._ctx.socket(zmq.DEALER)
         sock.setsockopt(zmq.LINGER, 0)
         sock.connect(endpoint)
@@ -623,39 +632,54 @@ class _DeviceWorker(_BaseWorker):
         # auto-correlated; a prior call that timed out can leave its
         # reply buffered to be mis-attributed to the next call. Stamp a
         # transport-level request_id (preserving any caller-supplied
-        # one) and drain stale replies before sending. The interceptor's
-        # handler echoes request_id via process_base._drain_rpc/_rpc_ok,
-        # so the response is matchable.
+        # one) so the recv loop can drop stale frames via mismatch. The
+        # interceptor handler echoes request_id via
+        # process_base._drain_rpc / _rpc_ok / _rpc_err, so well-formed
+        # replies are matchable; the lenient match also lets through
+        # process_base's bad_request reply ({"request_id": None, ...}).
         outbound = request
         if "request_id" not in request:
             outbound = dict(request)
             outbound["request_id"] = uuid.uuid4().hex
         expected_request_id = outbound.get("request_id")
+        maybe_stale = self._maybe_stale_interceptor_socks.get(process_id, False)
         try:
-            _drain_stale_replies(sock)
+            if maybe_stale:
+                _drain_stale_replies(sock)
+                self._maybe_stale_interceptor_socks[process_id] = False
             sock.send(json_dumps(outbound))
             deadline = time.monotonic() + (
                 self._interceptor_timeout_ms / 1000.0
             )
             while True:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
+                remaining_ms = (deadline - time.monotonic()) * 1000.0
+                if remaining_ms <= 0:
+                    self._maybe_stale_interceptor_socks[process_id] = True
                     return None
-                poll_ms = int(min(50.0, max(1.0, remaining * 1000.0)))
-                if not sock.poll(poll_ms, zmq.POLLIN):
+                if not sock.poll(max(1, int(remaining_ms)), zmq.POLLIN):
                     continue
                 raw = sock.recv(zmq.NOBLOCK)
                 resp = safe_json_loads(raw)
                 if not isinstance(resp, dict):
                     continue
+                resp_rid = resp.get("request_id")
                 if (
                     expected_request_id is not None
-                    and resp.get("request_id") != expected_request_id
+                    and resp_rid is not None
+                    and resp_rid != expected_request_id
                 ):
-                    # Stale reply from a previous timed-out call; skip.
+                    # Stale reply from a previous timed-out call (its
+                    # send-time stamp doesn't match what we're waiting
+                    # for); skip. Replies that don't carry request_id
+                    # at all are passed through — process_base._drain_rpc
+                    # emits {"request_id": None, ...} for malformed
+                    # payloads and we should let those through too.
                     continue
                 return resp
         except Exception:
+            # Mark this sock as possibly carrying a stale reply so the
+            # NEXT _call_interceptor for the same process drains it.
+            self._maybe_stale_interceptor_socks[process_id] = True
             return None
 
     def _apply_command_interceptors(

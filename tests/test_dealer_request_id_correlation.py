@@ -77,10 +77,6 @@ class _FakeManagerServer:
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
-    def enqueue_drop(self) -> None:
-        """Next request is received but not responded to."""
-        self._behaviours.put(("drop", 0.0))
-
     def enqueue_reply_after(self, delay_s: float) -> None:
         """Next request gets a reply, delayed by delay_s seconds."""
         self._behaviours.put(("reply", delay_s))
@@ -104,11 +100,9 @@ class _FakeManagerServer:
             except zmq.Again:
                 continue
             try:
-                behaviour, delay = self._behaviours.get_nowait()
+                _behaviour, delay = self._behaviours.get_nowait()
             except queue.Empty:
-                behaviour, delay = "reply", 0.0
-            if behaviour == "drop":
-                continue
+                _behaviour, delay = "reply", 0.0
             payload = json_loads(payload_raw)
             request_id = (
                 payload.get("request_id") if isinstance(payload, dict) else None
@@ -420,6 +414,217 @@ class DeviceWorkerProcessSocksLruTests(unittest.TestCase):
                     except Exception:
                         pass
         finally:
+            ctx.term()
+
+
+class LenientMatchAcceptsNonEchoingRepliesTests(unittest.TestCase):
+    """Many manager handlers (manager.interceptors.*, manager.identity,
+    manager.devices.list, etc.) return {"ok": ..., "result": ...} without
+    a request_id field. The PR's earlier strict match silently dropped
+    every such reply and timed out; the lenient match (also used by
+    tui_manager.py:813 and client/transport.py:186) accepts them.
+
+    The server-side fix in manager_internal_rpc.handle_internal_rpc now
+    injects request_id into responses that don't already have one, so in
+    practice these replies WILL carry request_id. The lenient match is
+    defense-in-depth for mid-upgrade scenarios and for the
+    parse_error/invalid_request paths which reply before any request body
+    is parsed.
+    """
+
+    def test_response_without_request_id_is_returned_not_skipped(self) -> None:
+        ctx = _new_ctx()
+        server_sock, endpoint = _bind_inproc_router(ctx, "lenient")
+        try:
+            client = ManagerClient(
+                ctx=ctx,
+                manager_rpc=endpoint,
+                manager_pub="inproc://unused",
+                rpc_timeout_ms=500,
+                subscribe_telemetry=False,
+            )
+            try:
+                def _server_worker() -> None:
+                    if not server_sock.poll(1000, zmq.POLLIN):
+                        return
+                    identity, _payload_raw = server_sock.recv_multipart()
+                    # Deliberately omit request_id, mimicking a manager
+                    # handler that doesn't echo (the pre-fix behaviour
+                    # of e.g. route_command_interceptor_list).
+                    reply = {"ok": True, "result": {"items": []}}
+                    server_sock.send_multipart([identity, json_dumps(reply)])
+
+                t = threading.Thread(target=_server_worker, daemon=True)
+                t.start()
+                resp = client.call({"type": "manager.interceptors.list"})
+                t.join(timeout=2.0)
+                self.assertIsNotNone(
+                    resp,
+                    "lenient match must return responses that lack a "
+                    "request_id field instead of silently dropping them "
+                    "and timing out",
+                )
+                assert resp is not None
+                self.assertTrue(resp.get("ok"))
+                self.assertEqual(resp.get("result"), {"items": []})
+            finally:
+                client.close()
+        finally:
+            try:
+                server_sock.close(0)
+            except Exception:
+                pass
+            ctx.term()
+
+
+class ServerSideRequestIdEchoTests(unittest.TestCase):
+    """handle_internal_rpc now injects request_id into the response when
+    the handler didn't already set one. This makes correlation work
+    universally without per-handler edits."""
+
+    def test_handle_internal_rpc_injects_request_id(self) -> None:
+        from types import SimpleNamespace
+        from experiment_control.manager_internal_rpc import handle_internal_rpc
+
+        # Build a minimal manager stub: the only methods handle_internal_rpc
+        # touches are _internal_rpc.recv_multipart / send_multipart and
+        # the routing functions.
+        sent: list[tuple[bytes, bytes]] = []
+
+        class _FakeSocket:
+            def recv_multipart(self) -> tuple[bytes, bytes]:
+                return b"identity", json_dumps(
+                    {
+                        "type": "any-route",
+                        "request_id": "caller-rid-xyz",
+                    }
+                )
+
+            def send_multipart(self, parts: list[bytes]) -> None:
+                sent.append((parts[0], parts[1]))
+
+        mgr = SimpleNamespace(_internal_rpc=_FakeSocket())
+
+        # The real route_internal_request returns whatever the handler
+        # produces. We patch it (via monkey-patching the module-level
+        # import) to return a plain handler reply without request_id —
+        # the pre-fix shape that broke correlation.
+        import experiment_control.manager_internal_rpc as mod
+
+        original = mod.route_internal_request
+        try:
+            mod.route_internal_request = lambda _mgr, _req: {
+                "ok": True,
+                "result": {"items": []},
+            }
+            handle_internal_rpc(mgr)
+        finally:
+            mod.route_internal_request = original
+
+        self.assertEqual(len(sent), 1)
+        _identity, payload_raw = sent[0]
+        reply = json_loads(payload_raw)
+        self.assertEqual(
+            reply.get("request_id"),
+            "caller-rid-xyz",
+            "handle_internal_rpc must echo caller's request_id into the "
+            "response when the handler didn't set one — this is what "
+            "makes DEALER correlation work for the 70+ handlers that "
+            "return plain {'ok': ..., 'result': ...} dicts",
+        )
+        # Handler-provided fields must be preserved.
+        self.assertTrue(reply.get("ok"))
+        self.assertEqual(reply.get("result"), {"items": []})
+
+    def test_handler_supplied_request_id_is_not_overwritten(self) -> None:
+        from types import SimpleNamespace
+        from experiment_control.manager_internal_rpc import handle_internal_rpc
+
+        sent: list[tuple[bytes, bytes]] = []
+
+        class _FakeSocket:
+            def recv_multipart(self) -> tuple[bytes, bytes]:
+                return b"identity", json_dumps(
+                    {"type": "any-route", "request_id": "from-caller"}
+                )
+
+            def send_multipart(self, parts: list[bytes]) -> None:
+                sent.append((parts[0], parts[1]))
+
+        mgr = SimpleNamespace(_internal_rpc=_FakeSocket())
+
+        import experiment_control.manager_internal_rpc as mod
+
+        original = mod.route_internal_request
+        try:
+            mod.route_internal_request = lambda _mgr, _req: {
+                "ok": True,
+                "request_id": "handler-supplied",
+                "result": {},
+            }
+            handle_internal_rpc(mgr)
+        finally:
+            mod.route_internal_request = original
+
+        reply = json_loads(sent[0][1])
+        self.assertEqual(reply.get("request_id"), "handler-supplied")
+
+
+class MaybeStaleFlagIsDeferredTests(unittest.TestCase):
+    """The drain-before-send is now gated on a per-instance "maybe stale"
+    flag set in the except arm of `call()` / `_call_interceptor()`. Healthy
+    calls must pay zero extra `poll(0)` syscalls; only the call AFTER a
+    timeout drains.
+    """
+
+    def test_initial_state_is_clean(self) -> None:
+        ctx = _new_ctx()
+        try:
+            client = ManagerClient(
+                ctx=ctx,
+                manager_rpc="inproc://unused",
+                manager_pub="inproc://unused",
+                rpc_timeout_ms=100,
+                subscribe_telemetry=False,
+            )
+            try:
+                self.assertFalse(
+                    client._maybe_stale_reply,
+                    "fresh ManagerClient must not believe it has a stale "
+                    "reply pending",
+                )
+            finally:
+                client.close()
+        finally:
+            ctx.term()
+
+    def test_timeout_sets_maybe_stale_flag(self) -> None:
+        ctx = _new_ctx()
+        server_sock, endpoint = _bind_inproc_router(ctx, "stale-flag")
+        try:
+            client = ManagerClient(
+                ctx=ctx,
+                manager_rpc=endpoint,
+                manager_pub="inproc://unused",
+                rpc_timeout_ms=50,
+                subscribe_telemetry=False,
+            )
+            try:
+                # Server never responds; call must time out.
+                resp = client.call({"type": "no-reply"})
+                self.assertIsNone(resp)
+                self.assertTrue(
+                    client._maybe_stale_reply,
+                    "post-timeout, the next call must drain stale replies "
+                    "pre-send",
+                )
+            finally:
+                client.close()
+        finally:
+            try:
+                server_sock.close(0)
+            except Exception:
+                pass
             ctx.term()
 
 
