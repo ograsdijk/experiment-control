@@ -1012,6 +1012,14 @@ class Manager:
         self._log_history: deque[Json] = deque(maxlen=self._log_history_size)
         self._supervisor_log_queue: queue.Queue[Json] = queue.Queue(maxsize=5000)
         self._supervisor_log_dropped = 0
+        # _supervisor_log_dropped is incremented from per-log-stream
+        # reader threads (one per managed-process stdout/stderr) and
+        # reset from the main thread's drain_supervisor_logs. CPython's
+        # `+=` on an int attribute decomposes into get + add + set,
+        # which is not atomic across threads — concurrent bumps lose
+        # counts. Guard the increment and the snapshot-and-reset with
+        # this lock so the drop count remains accurate under load.
+        self._supervisor_log_dropped_lock = threading.Lock()
         self._supervisor_log_threads: dict[
             tuple[str, str, int, str], threading.Thread
         ] = {}
@@ -1166,7 +1174,17 @@ class Manager:
         )
         self._lifecycle_device_locks: dict[str, threading.Lock] = {}
         self._lifecycle_reply_queue: queue.Queue[tuple[bytes, Json]] = queue.Queue()
-        self._lifecycle_event_queue: queue.Queue[tuple[str, Json]] = queue.Queue()
+        # Bound the event queue so a stalled main-thread publisher (e.g.
+        # a slow event hook) can't let lifecycle workers grow it
+        # unboundedly. 10000 is well above realistic burst sizes (the
+        # main loop drains every tick at ~10-100Hz) but small enough
+        # that a true stall surfaces as drops + a counter operators can
+        # see, instead of as silent memory growth followed by OOM.
+        self._lifecycle_event_queue: queue.Queue[tuple[str, Json]] = queue.Queue(
+            maxsize=10_000
+        )
+        self._lifecycle_event_dropped = 0
+        self._lifecycle_event_dropped_lock = threading.Lock()
 
         # Per-socket monotonic timestamp of the last "drain cap hit"
         # event we published. Used to rate-limit drain-cap-hit notifications

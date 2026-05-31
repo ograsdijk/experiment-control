@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import queue
 import threading
 from typing import Any
 
@@ -18,7 +19,24 @@ def publish_manager_event(manager: Any, topic: str, payload: Json) -> None:
     if main_id is not None and threading.get_ident() != main_id:
         evt_queue = getattr(manager, "_lifecycle_event_queue", None)
         if evt_queue is not None:
-            evt_queue.put_nowait((topic, payload))
+            try:
+                evt_queue.put_nowait((topic, payload))
+            except queue.Full:
+                # Main thread isn't draining fast enough; drop the
+                # event and bump the counter so operators can see the
+                # symptom in the manager status RPC instead of seeing
+                # unbounded queue growth followed by OOM.
+                lock = getattr(
+                    manager, "_lifecycle_event_dropped_lock", None
+                )
+                if lock is not None:
+                    with lock:
+                        manager._lifecycle_event_dropped += 1
+                else:
+                    manager._lifecycle_event_dropped = (
+                        int(getattr(manager, "_lifecycle_event_dropped", 0))
+                        + 1
+                    )
             return
         # No queue available — fall through. In normal operation the
         # queue exists once Manager.__init__ has run.

@@ -597,6 +597,12 @@ class ManagerTUI(App):
         self._last_inspector_render = 0.0
         self._inspector_min_period_s = 0.2
         self._error_counts: dict[str, int] = {}
+        # _bump_error fires from the main thread today, but the SUB
+        # poll worker (_pub_thread) calls it via several code paths
+        # (pub.open / pub.reconnect / pub.recv / pub.decode). Guard the
+        # increment so the planned TUI worker conversion (Group F.19,
+        # deferred) doesn't introduce a cross-thread race.
+        self._error_counts_lock = threading.Lock()
         self._backend_status_text = "Backend: connecting"
 
     def compose(self) -> ComposeResult:
@@ -1487,7 +1493,8 @@ class ManagerTUI(App):
         self._inspector_dirty = True
 
     def _bump_error(self, key: str) -> None:
-        self._error_counts[key] = self._error_counts.get(key, 0) + 1
+        with self._error_counts_lock:
+            self._error_counts[key] = self._error_counts.get(key, 0) + 1
 
     def _render_inspector_if_needed(self, *, force: bool = False) -> None:
         now = time.monotonic()
