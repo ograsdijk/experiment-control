@@ -660,6 +660,19 @@ class DeviceHandle:
     process: subprocess.Popen[str] | None = None
     rpc_endpoint: str | None = None
     rpc_sock: zmq.Socket | None = None
+    # Serialises access to `rpc_sock` (a ZMQ REQ socket, NOT thread-safe).
+    # Lifecycle workers can dispatch concurrent device RPCs (e.g. two
+    # operators triggering commands on the same device, or the
+    # supervisor's stop-path racing a worker's command) — without this
+    # lock, two threads can interleave send/recv on the same socket and
+    # break ZMQ's REQ state machine. Cheap to take in the no-contention
+    # case; only contended when the same device sees concurrent RPCs.
+    #
+    # RLock so the call-path's `except` branch can re-enter via
+    # _close_device_rpc (same thread, lock already held) without
+    # deadlocking; external close-callers from a different thread
+    # block until the in-flight call returns.
+    rpc_lock: threading.RLock = field(default_factory=threading.RLock)
     rpc_fail_count: int = 0
     rpc_last_fail_t_mono: float | None = None
     pub_endpoint: str | None = None
@@ -728,6 +741,19 @@ class ProcessHandle:
     heartbeat_pid: int | None = None
     rpc_endpoint: str | None = None
     rpc_sock: zmq.Socket | None = None
+    # Serialises access to `rpc_sock` (a ZMQ DEALER socket, NOT
+    # thread-safe). Lifecycle workers can dispatch concurrent process
+    # RPCs (e.g. interceptor-invoke calls overlapping with process-
+    # command calls, or the supervisor's stop-path racing a worker's
+    # command). Without this lock, two threads can interleave send/recv
+    # on the same DEALER and either tangle correlation or trigger ZMQ
+    # EFSM. Cheap to take in the no-contention case.
+    #
+    # RLock so the call-path's `except` branch can re-enter via
+    # _close_process_rpc (same thread, lock already held) without
+    # deadlocking; external close-callers from a different thread
+    # block until the in-flight call returns.
+    rpc_lock: threading.RLock = field(default_factory=threading.RLock)
     rpc_fail_count: int = 0
     rpc_last_fail_t_mono: float | None = None
     last_start_t_wall: float | None = None
@@ -2692,29 +2718,61 @@ class Manager:
             timeout_ms=timeout_ms,
         )
 
+    # Bounded wait when an external close-caller contends with a
+    # worker's in-flight RPC. Picked at ~half the loop-stall warn
+    # threshold (_manager_loop_stall_warn_s = 1.0s default) and well
+    # under heartbeat_timeout_s = 3.0s so a single contended close
+    # can't false-positive a heartbeat timeout. On timeout we leave
+    # the socket reference intact — the worker's except branch is
+    # responsible for closing it via re-entrant lock acquisition once
+    # its call completes.
+    _CLOSE_RPC_LOCK_WAIT_S = 0.5
+
     def _close_device_rpc(self, handle: DeviceHandle) -> None:
-        sock = handle.rpc_sock
-        if sock is None:
+        # Take handle.rpc_lock (RLock) so a concurrent call_device_rpc
+        # on another thread can't be mid-send/recv when we close the
+        # socket out from under it. RLock allows re-entry from the
+        # call-path's except branch (same thread, lock already held).
+        #
+        # Bounded wait: if a worker is holding the lock for an
+        # in-flight call (worst case ~rpc_timeout_ms = 1.5s), block
+        # main-thread callers for at most _CLOSE_RPC_LOCK_WAIT_S
+        # before giving up. On timeout the worker's except branch
+        # will close the socket when its call returns (it already
+        # calls _close_*_rpc after rpc_fail_count >= 2).
+        if not handle.rpc_lock.acquire(timeout=self._CLOSE_RPC_LOCK_WAIT_S):
             return
         try:
-            sock.close(linger=0)
-        except Exception:
-            pass
-        handle.rpc_sock = None
-        handle.rpc_fail_count = 0
-        handle.rpc_last_fail_t_mono = None
+            sock = handle.rpc_sock
+            if sock is None:
+                return
+            try:
+                sock.close(linger=0)
+            except Exception:
+                pass
+            handle.rpc_sock = None
+            handle.rpc_fail_count = 0
+            handle.rpc_last_fail_t_mono = None
+        finally:
+            handle.rpc_lock.release()
 
     def _close_process_rpc(self, handle: ProcessHandle) -> None:
-        sock = handle.rpc_sock
-        if sock is None:
+        # See _close_device_rpc for the locking rationale.
+        if not handle.rpc_lock.acquire(timeout=self._CLOSE_RPC_LOCK_WAIT_S):
             return
         try:
-            sock.close(linger=0)
-        except Exception:
-            pass
-        handle.rpc_sock = None
-        handle.rpc_fail_count = 0
-        handle.rpc_last_fail_t_mono = None
+            sock = handle.rpc_sock
+            if sock is None:
+                return
+            try:
+                sock.close(linger=0)
+            except Exception:
+                pass
+            handle.rpc_sock = None
+            handle.rpc_fail_count = 0
+            handle.rpc_last_fail_t_mono = None
+        finally:
+            handle.rpc_lock.release()
 
     # -----------------------------
     # Timeouts + derived states
