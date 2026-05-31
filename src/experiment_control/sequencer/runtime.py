@@ -1996,6 +1996,20 @@ class SequencerRuntime:
             if not isinstance(params, dict):
                 params = {}
             resp = self._call_device(device, action, render_templates(params, env))
+            # Raise on failed device call instead of silently returning
+            # `resp.get("result")` (which on failure is typically None
+            # or a stale/partial dict). Without this check, sequencer
+            # assign / wait-until / condition values would treat a
+            # failed device call as a successful None reading,
+            # corrupting downstream state. Mirrors _sample_adaptive_call
+            # at line 1960. The outer step-execution loop catches the
+            # exception and transitions the sequencer to ERROR with
+            # _last_error set.
+            if not resp.get("ok", False):
+                raise RuntimeError(
+                    f"device call {device}.{action} failed: "
+                    f"{resp.get('error', 'unknown error')!s}"
+                )
             extract = call_spec.get("extract")
             if isinstance(extract, dict):
                 return extract_value(
