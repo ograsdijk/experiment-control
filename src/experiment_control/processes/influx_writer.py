@@ -584,7 +584,7 @@ class InfluxWriterProcess(ManagedProcessBase):
 
     def _refresh_device_catalog(self) -> None:
         req = {"type": "device.config.list"}
-        resp = self._manager.call(req, timeout_ms=2000)
+        resp = self._require_manager().call(req, timeout_ms=2000)
         if not isinstance(resp, dict) or not resp.get("ok"):
             return
         result = resp.get("result")
@@ -1308,7 +1308,7 @@ class InfluxWriterProcess(ManagedProcessBase):
 
     def _try_publish_log_payload(self, payload: Json, *, timeout_ms: int = 120) -> bool:
         try:
-            resp = self._manager.call(
+            resp = self._require_manager().call(
                 {"type": "manager.logs.publish", "payload": payload},
                 timeout_ms=timeout_ms,
             )

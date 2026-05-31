@@ -2011,7 +2011,7 @@ class SequencerProcess(ManagedProcessBase):
     def _preflight_sequence_spec(self, spec: SequenceSpec) -> list[Json]:
         diagnostics: list[Json] = []
 
-        list_devices_resp = self._manager.call({"type": "manager.devices.list"})
+        list_devices_resp = self._require_manager().call({"type": "manager.devices.list"})
         device_ids = self._preflight_load_devices(list_devices_resp)
         if not device_ids:
             diagnostics.append(
@@ -2023,7 +2023,7 @@ class SequencerProcess(ManagedProcessBase):
                 )
             )
 
-        telemetry_schema_resp = self._manager.call({"action": "manager.telemetry.schema.list"})
+        telemetry_schema_resp = self._require_manager().call({"action": "manager.telemetry.schema.list"})
         telemetry_signals_by_device = self._preflight_load_telemetry_signals(
             telemetry_schema_resp
         )
@@ -2037,7 +2037,7 @@ class SequencerProcess(ManagedProcessBase):
                 )
             )
 
-        device_config_resp = self._manager.call({"type": "device.config.list"})
+        device_config_resp = self._require_manager().call({"type": "device.config.list"})
         stream_names_by_device = self._preflight_load_stream_names(device_config_resp)
         if not stream_names_by_device:
             diagnostics.append(
@@ -2081,7 +2081,7 @@ class SequencerProcess(ManagedProcessBase):
             "action": action,
             "params": params,
         }
-        resp = self._manager.call(req)
+        resp = self._require_manager().call(req)
         if resp is None:
             return {"ok": False, "error": "timeout"}
         if not isinstance(resp, dict):
@@ -2149,7 +2149,7 @@ class SequencerProcess(ManagedProcessBase):
             backoff_s = min(backoff_s * 2.0, _STREAM_CONTEXT_SET_MAX_BACKOFF_S)
 
     def _get_telemetry(self, device_id: str, signal: str) -> dict[str, Any] | None:
-        return self._manager.get_latest(device_id, signal)
+        return self._require_manager().get_latest(device_id, signal)
 
     def _sequencer_capability_members(self) -> list[Any]:
         members = [
@@ -2812,7 +2812,7 @@ class SequencerProcess(ManagedProcessBase):
 
     def _try_publish_log_payload(self, payload: Json, *, timeout_ms: int = 120) -> bool:
         try:
-            resp = self._manager.call(
+            resp = self._require_manager().call(
                 {"type": "manager.logs.publish", "payload": payload},
                 timeout_ms=timeout_ms,
             )
