@@ -46,7 +46,9 @@ class _RecordingManager:
         self.heartbeats.append(dict(payload))
 
 
-def _hub(only_mirrored: bool) -> tuple[FederationHub, _RecordingManager]:
+def _hub(
+    only_mirrored: bool, *, include_origin_meta: bool = True
+) -> tuple[FederationHub, _RecordingManager]:
     cfg = parse_federation_config(
         {
             "peers": [
@@ -57,7 +59,10 @@ def _hub(only_mirrored: bool) -> tuple[FederationHub, _RecordingManager]:
                     "mirror_devices": [
                         {"local_id": "lab2.psu", "remote_device_id": "psu"}
                     ],
-                    "relay": {"only_mirrored_devices": only_mirrored},
+                    "relay": {
+                        "only_mirrored_devices": only_mirrored,
+                        "include_origin_meta": include_origin_meta,
+                    },
                 }
             ]
         },
@@ -137,6 +142,56 @@ class FederationRelayNonDeviceTests(unittest.TestCase):
         )
         self.assertEqual(manager.telemetry, [])
         self.assertEqual(manager.events, [])
+
+    def test_peer_cannot_spoof_origin_meta_when_include_origin_meta_true(self) -> None:
+        # Security regression: a malicious / compromised peer must not be
+        # able to preload origin-metadata keys in the payload to defeat the
+        # federation trust boundary. Downstream consumers (hdf_writer,
+        # influx_writer, TUI) trust source_kind / is_remote / owner_peer_id
+        # to decide whether data is locally-owned vs federated.
+        hub, manager = _hub(only_mirrored=False, include_origin_meta=True)
+        peer_rt = hub._peers["lab2"]
+        hub._relay_event(
+            peer_rt,
+            "manager.process.started",
+            {
+                "process_id": "sequencer",
+                # Adversarial: try to claim the event is local and from
+                # another peer.
+                "source_kind": "local",
+                "is_remote": False,
+                "owner_peer_id": "lab9",
+            },
+        )
+        self.assertEqual(len(manager.events), 1)
+        _topic, payload = manager.events[0]
+        # Hub overwrites with its own view of the immediate peer.
+        self.assertEqual(payload["source_kind"], "federated")
+        self.assertTrue(payload["is_remote"])
+        self.assertEqual(payload["owner_peer_id"], "lab2")
+
+    def test_peer_cannot_inject_origin_meta_when_include_origin_meta_false(self) -> None:
+        # Same threat model: with include_origin_meta=False the hub does NOT
+        # stamp origin metadata, but it also must strip any peer-supplied
+        # values so consumers can't be deceived.
+        hub, manager = _hub(only_mirrored=False, include_origin_meta=False)
+        peer_rt = hub._peers["lab2"]
+        hub._relay_event(
+            peer_rt,
+            "manager.process.started",
+            {
+                "process_id": "sequencer",
+                "source_kind": "local",
+                "is_remote": False,
+                "owner_peer_id": "lab9",
+            },
+        )
+        self.assertEqual(len(manager.events), 1)
+        _topic, payload = manager.events[0]
+        # Keys must be absent (not stamped, not carried over from peer).
+        self.assertNotIn("source_kind", payload)
+        self.assertNotIn("is_remote", payload)
+        self.assertNotIn("owner_peer_id", payload)
 
     def test_mirrored_device_event_still_uses_rewrite_path(self) -> None:
         # Sanity check: when a device_id maps to a mirror, both flag settings

@@ -493,18 +493,33 @@ class FederationHub:
         """Relay a peer event with no associated mirrored device.
 
         Reached only when `relay.only_mirrored_devices=False`. The payload is
-        passed through with origin metadata appended (peer id + remote_is_peer
-        marker) but no `device_id` rewriting, since there's no local mirror to
-        map to. Heartbeat/telemetry topics are dropped here because they would
+        passed through with origin metadata stamped with the immediate peer's
+        identity (no `device_id` rewriting, since there's no local mirror to
+        map to). Heartbeat/telemetry topics are dropped here because they would
         otherwise inject orphan state into the manager's caches.
+
+        Origin-metadata keys (`source_kind`, `is_remote`, `owner_peer_id`) are
+        always (re)assigned with this hub's view of the immediate peer, never
+        carried over from the peer-supplied payload. Otherwise a peer could
+        spoof `is_remote=False` / `source_kind="local"` / a different peer's
+        `owner_peer_id` to defeat the federation trust boundary used by
+        downstream consumers (e.g. hdf_writer._is_remote_config,
+        influx_writer._handle_device_config). This mirrors the unconditional
+        assignment used by every other emitter in this file (see
+        `_rewrite_payload`, the device-snapshot helpers, etc.).
         """
         if topic in {"manager.heartbeat", "manager.telemetry_update"}:
             return
         out = dict(payload)
+        # Strip any pre-existing origin-meta from the peer's payload; we
+        # rewrite below (or, with include_origin_meta=False, leave the keys
+        # absent so consumers can't be deceived).
+        for spoofable_key in ("source_kind", "is_remote", "owner_peer_id"):
+            out.pop(spoofable_key, None)
         if peer_rt.config.relay.include_origin_meta:
-            out.setdefault("source_kind", "federated")
-            out.setdefault("is_remote", True)
-            out.setdefault("owner_peer_id", peer_rt.config.peer_id)
+            out["source_kind"] = "federated"
+            out["is_remote"] = True
+            out["owner_peer_id"] = peer_rt.config.peer_id
         if topic == "manager.log":
             self._manager._emit_log_from_payload(out, default_topic=topic)
             return
