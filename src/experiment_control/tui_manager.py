@@ -2293,12 +2293,23 @@ class ManagerTUI(App):
         status = self.query_one("#streaming_status", Static)
         status.update("Streaming: ON" if self.streaming_enabled else "Streaming: OFF")
 
-    def action_quit(self) -> None:
-        try:
-            self._rpc_call({"type": "manager.control.shutdown"})
-        except Exception:
-            pass
-        self.exit()
+    async def action_quit(self) -> None:
+        # Send the shutdown RPC from a worker thread so the (blocking) ZMQ
+        # poll doesn't freeze the TUI event loop. The exit() call waits for
+        # the worker to finish via call_from_thread.
+        def _shutdown_then_exit() -> None:
+            try:
+                self._rpc_call({"type": "manager.control.shutdown"})
+            except Exception:
+                pass
+            self.call_from_thread(self.exit)
+
+        worker = threading.Thread(
+            target=_shutdown_then_exit,
+            name="tui-shutdown-rpc",
+            daemon=True,
+        )
+        worker.start()
 
     def action_reconnect_backend(self) -> None:
         try:
@@ -2732,16 +2743,17 @@ class ManagerTUI(App):
             self.action_member_primary()
             event.stop()
 
-    async def action_device_recover(self) -> None:
+    def action_device_recover(self) -> None:
         device_id = self._selected_device()
         if not device_id:
             return
-        confirmed = await self.push_screen(
-            ConfirmScreen(f"Recover device {device_id}?")
-        )
-        if not confirmed:
-            return
-        self._rpc_call({"type": "device.recover", "device_id": device_id})
+
+        def _on_dismiss(confirmed: bool | None) -> None:
+            if not confirmed:
+                return
+            self._rpc_call({"type": "device.recover", "device_id": device_id})
+
+        self.push_screen(ConfirmScreen(f"Recover device {device_id}?"), _on_dismiss)
 
     def action_drivers_stop_all(self) -> None:
         if self._action_target() == "process":
