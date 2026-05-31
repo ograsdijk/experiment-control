@@ -5,6 +5,8 @@ import json
 import queue
 import threading
 import time
+import uuid
+from collections import OrderedDict
 from dataclasses import dataclass
 from fnmatch import fnmatchcase
 from typing import Any, Callable
@@ -22,6 +24,14 @@ Json = dict[str, Any]
 
 _ALLOWED_PROCESS_STATES = {"STARTING", "RUNNING", "STOPPING"}
 
+# Soft cap on the number of cached interceptor DEALER sockets per
+# _DeviceWorker. Each entry is one open ZMQ socket; without a cap, a
+# router that sees many distinct interceptor process_ids over its
+# lifetime (e.g. restarts that change the endpoint each time) leaks
+# sockets indefinitely. 64 is well above the realistic per-router
+# interceptor count and small enough that eviction stays bounded.
+_PROCESS_SOCKS_MAX = 64
+
 
 def _safe_json(value: Any, *, max_len: int = 4000) -> str:
     try:
@@ -31,6 +41,26 @@ def _safe_json(value: Any, *, max_len: int = 4000) -> str:
     if len(text) > max_len:
         return text[:max_len] + "...(truncated)"
     return text
+
+
+def _drain_stale_replies(sock: zmq.Socket) -> None:
+    """Drop any buffered replies left behind by previous timed-out calls.
+
+    DEALER sockets don't auto-correlate. If a prior interceptor call
+    raised zmq.Again before recv but the handler's reply arrived later,
+    the reply sits in the socket's recv buffer; the next send/recv pair
+    would pick it up and mis-attribute it to the new request. Drain
+    before sending so the recv loop sees only fresh replies.
+    """
+    while True:
+        try:
+            if not sock.poll(0, zmq.POLLIN):
+                break
+            _ = sock.recv(zmq.NOBLOCK)
+        except zmq.Again:
+            break
+        except Exception:
+            break
 
 
 def _is_zmq_timeout_error(exc: BaseException) -> bool:
@@ -508,7 +538,12 @@ class _DeviceWorker(_BaseWorker):
         self._manager: ManagerClient | None = None
         self._device_sock: zmq.Socket | None = None
         self._device_endpoint: str | None = None
-        self._process_socks: dict[str, tuple[str, zmq.Socket]] = {}
+        # OrderedDict so we can LRU-evict the oldest cached socket when
+        # the table fills up (see _PROCESS_SOCKS_MAX). Each entry maps
+        # process_id -> (endpoint, DEALER socket).
+        self._process_socks: OrderedDict[
+            str, tuple[str, zmq.Socket]
+        ] = OrderedDict()
         self._seq = 0
 
     def _close_device_sock(self) -> None:
@@ -536,17 +571,36 @@ class _DeviceWorker(_BaseWorker):
 
     def _get_process_sock(self, process_id: str, endpoint: str) -> zmq.Socket:
         entry = self._process_socks.get(process_id)
-        if entry is None or entry[0] != endpoint:
-            if entry is not None:
-                try:
-                    entry[1].close(0)
-                except Exception:
-                    pass
-            sock = self._ctx.socket(zmq.DEALER)
-            sock.setsockopt(zmq.LINGER, 0)
-            sock.connect(endpoint)
-            self._process_socks[process_id] = (endpoint, sock)
-        return self._process_socks[process_id][1]
+        if entry is not None and entry[0] == endpoint:
+            # Cache hit: mark as MRU so an LRU eviction below picks the
+            # truly oldest-used entry.
+            self._process_socks.move_to_end(process_id)
+            return entry[1]
+        # Stale entry (endpoint changed because the interceptor process
+        # restarted on a new ephemeral port) — close before replacing.
+        if entry is not None:
+            try:
+                entry[1].close(0)
+            except Exception:
+                pass
+            self._process_socks.pop(process_id, None)
+        # Cap the cache by evicting the least-recently-used entry
+        # before inserting the new one. Without this, a router that
+        # sees many distinct interceptor process_ids over its lifetime
+        # leaks sockets indefinitely.
+        while len(self._process_socks) >= _PROCESS_SOCKS_MAX:
+            _evicted_pid, (_evicted_ep, evicted_sock) = (
+                self._process_socks.popitem(last=False)
+            )
+            try:
+                evicted_sock.close(0)
+            except Exception:
+                pass
+        sock = self._ctx.socket(zmq.DEALER)
+        sock.setsockopt(zmq.LINGER, 0)
+        sock.connect(endpoint)
+        self._process_socks[process_id] = (endpoint, sock)
+        return sock
 
     def _publish_event(self, topic: str, payload: Json) -> None:
         if self._manager is None:
@@ -565,13 +619,44 @@ class _DeviceWorker(_BaseWorker):
         sock = self._get_process_sock(process_id, endpoint)
         sock.setsockopt(zmq.RCVTIMEO, self._interceptor_timeout_ms)
         sock.setsockopt(zmq.SNDTIMEO, self._interceptor_timeout_ms)
+        # The interceptor socket is a DEALER, so replies aren't
+        # auto-correlated; a prior call that timed out can leave its
+        # reply buffered to be mis-attributed to the next call. Stamp a
+        # transport-level request_id (preserving any caller-supplied
+        # one) and drain stale replies before sending. The interceptor's
+        # handler echoes request_id via process_base._drain_rpc/_rpc_ok,
+        # so the response is matchable.
+        outbound = request
+        if "request_id" not in request:
+            outbound = dict(request)
+            outbound["request_id"] = uuid.uuid4().hex
+        expected_request_id = outbound.get("request_id")
         try:
-            sock.send(json_dumps(request))
-            raw = sock.recv()
+            _drain_stale_replies(sock)
+            sock.send(json_dumps(outbound))
+            deadline = time.monotonic() + (
+                self._interceptor_timeout_ms / 1000.0
+            )
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                poll_ms = int(min(50.0, max(1.0, remaining * 1000.0)))
+                if not sock.poll(poll_ms, zmq.POLLIN):
+                    continue
+                raw = sock.recv(zmq.NOBLOCK)
+                resp = safe_json_loads(raw)
+                if not isinstance(resp, dict):
+                    continue
+                if (
+                    expected_request_id is not None
+                    and resp.get("request_id") != expected_request_id
+                ):
+                    # Stale reply from a previous timed-out call; skip.
+                    continue
+                return resp
         except Exception:
             return None
-        resp = safe_json_loads(raw)
-        return resp if isinstance(resp, dict) else None
 
     def _apply_command_interceptors(
         self, task: _DeviceTask
