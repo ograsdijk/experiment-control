@@ -78,7 +78,6 @@ class DriverTelemetryQualityStateTests(unittest.TestCase):
         runner._telemetry_seq = 0
         runner._device_state = DeviceState.DEGRADED
         runner._telemetry_last_call_errors = {}
-        runner._telemetry_last_signal_errors = {}
         runner._now = lambda: Timestamp(t_wall=1.0, t_mono=2.0)  # type: ignore[method-assign]
         runner.read_telemetry = lambda: {}  # type: ignore[method-assign]
         runner.telemetry_signal_names = lambda: []  # type: ignore[method-assign]

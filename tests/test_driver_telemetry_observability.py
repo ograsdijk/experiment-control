@@ -11,8 +11,8 @@ call was failing every tick.
 
 These tests pin the new behaviour:
 * read_telemetry populates _telemetry_last_call_errors keyed by the
-  failing call's method name and _telemetry_last_signal_errors keyed by
-  the failing output's signal name.
+  failing call's method name, and exposes per-signal error text via
+  each signal's `error` field in the returned dict.
 * _publish_telemetry threads both into the published payload
   (call_errors at the bundle level, error per signal).
 * Repeated identical exceptions are logged to stderr at most once per
@@ -47,7 +47,6 @@ def _runner_with_plan(plan: list[_TelemetryCallPlan]) -> DeviceRunner:
     runner.device_id = "test_dev"
     runner._telemetry_plan = plan
     runner._telemetry_last_call_errors = {}
-    runner._telemetry_last_signal_errors = {}
     runner._telemetry_log_last_mono = {}
     runner._telemetry_log_period_s = 30.0
     runner._device_state = DeviceState.OK
@@ -119,10 +118,9 @@ class ReadTelemetryCapturesCallErrorsTests(unittest.TestCase):
         self.assertEqual(signals["temp_b"]["quality"], TelemetryQuality.BAD)
         self.assertIn("error", signals["temp_b"])
         self.assertIn("temp_b", signals["temp_b"]["error"])
-        # Bulk call succeeded, so no call-level error; only the per-signal
-        # extractor failure should be recorded.
+        # Bulk call succeeded, so no call-level error; per-signal extractor
+        # failures are exposed only via each signal's `error` field above.
         self.assertEqual(runner._telemetry_last_call_errors, {})
-        self.assertIn("temp_b", runner._telemetry_last_signal_errors)
 
     def test_each_tick_resets_error_dicts(self) -> None:
         # Tick 1: failing call -> error captured. Tick 2: succeeding call
@@ -150,12 +148,15 @@ class ReadTelemetryCapturesCallErrorsTests(unittest.TestCase):
         runner = _runner_with_plan(plan)
 
         with patch("sys.stderr", new_callable=io.StringIO):
-            runner.read_telemetry()
+            signals_first = runner.read_telemetry()
         self.assertIn("read_temperatures", runner._telemetry_last_call_errors)
+        self.assertIn("error", signals_first["temp_a"])
 
-        runner.read_telemetry()
+        signals_second = runner.read_telemetry()
         self.assertEqual(runner._telemetry_last_call_errors, {})
-        self.assertEqual(runner._telemetry_last_signal_errors, {})
+        # Successful tick produces an OK signal with no `error` field.
+        self.assertNotIn("error", signals_second["temp_a"])
+        self.assertEqual(signals_second["temp_a"]["quality"], TelemetryQuality.OK)
 
 
 class TelemetryStderrLoggingTests(unittest.TestCase):
@@ -237,7 +238,6 @@ class PublishTelemetryThreadsErrorsTests(unittest.TestCase):
         runner._last_error = None
         runner._last_ok_ts = None
         runner._telemetry_last_call_errors = {}
-        runner._telemetry_last_signal_errors = {}
         runner._telemetry_log_last_mono = {}
         runner._telemetry_log_period_s = 30.0
         runner._now = lambda: Timestamp(t_wall=1.0, t_mono=2.0)  # type: ignore[method-assign]
@@ -250,7 +250,6 @@ class PublishTelemetryThreadsErrorsTests(unittest.TestCase):
 
         def fake_read() -> dict[str, dict[str, object]]:
             runner._telemetry_last_call_errors = {"read_x": "RuntimeError('boom')"}
-            runner._telemetry_last_signal_errors = {"x": "RuntimeError('boom')"}
             return {
                 "x": {
                     "value": None,

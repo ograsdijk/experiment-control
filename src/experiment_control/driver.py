@@ -704,13 +704,13 @@ class DeviceRunner:
         self._last_ok_ts: Timestamp | None = None
         self._last_error: str | None = None
 
-        # Per-call / per-signal telemetry error captures populated by
-        # read_telemetry on every tick. Surfaced in the published telemetry
-        # bundle so the UI can show why a signal went BAD without operators
-        # having to read driver stderr. Keys for call_errors are the original
-        # call.method names; keys for signal_errors are the signal names.
+        # Per-call telemetry error capture populated by read_telemetry on every
+        # tick. Surfaced in the published telemetry bundle (bundle-level
+        # `call_errors`) so the UI can show why a signal went BAD without
+        # operators having to read driver stderr. Keys are the original
+        # call.method names. (Per-signal errors are exposed via each signal's
+        # own `error` field in the same bundle; no separate state needed.)
         self._telemetry_last_call_errors: dict[str, str] = {}
-        self._telemetry_last_signal_errors: dict[str, str] = {}
         # Rate-limit table for the stderr log of telemetry-call exceptions:
         # (call_method, exception_class_qualname) -> last_logged_monotonic.
         self._telemetry_log_last_mono: dict[tuple[str, str], float] = {}
@@ -1032,11 +1032,12 @@ class DeviceRunner:
 
     def read_telemetry(self) -> dict[str, dict[str, Any]]:
         out: dict[str, dict[str, Any]] = {}
-        # Reset per-tick error captures; populated below when calls or
-        # per-signal extractors fail. Surfaced in the published telemetry
-        # bundle by _publish_telemetry.
+        # Reset per-tick call-error capture; populated below when a telemetry
+        # call raises. Surfaced as bundle-level `call_errors` by
+        # _publish_telemetry. Per-signal extractor failures are not tracked
+        # here because they already flow out via each signal's own `error`
+        # field in `out`.
         self._telemetry_last_call_errors = {}
-        self._telemetry_last_signal_errors = {}
 
         for plan in self._telemetry_plan:
             if plan.func is None and plan.attr_name is None:
@@ -1085,7 +1086,6 @@ class DeviceRunner:
                         }
                     except Exception as e:
                         err_text = self._telemetry_format_error(e)
-                        self._telemetry_last_signal_errors[o.signal] = err_text
                         out[o.signal] = {
                             "value": None,
                             "units": o.units,
@@ -1098,7 +1098,6 @@ class DeviceRunner:
                 self._telemetry_last_call_errors[plan.method] = err_text
                 self._telemetry_log_call_exception(plan.method, e)
                 for o in plan.outputs:
-                    self._telemetry_last_signal_errors[o.signal] = err_text
                     out[o.signal] = {
                         "value": None,
                         "units": o.units,
@@ -1567,7 +1566,6 @@ class DeviceRunner:
             # the failure. Record under a synthetic key.
             err_text = self._telemetry_format_error(e)
             self._telemetry_last_call_errors = {"<read_telemetry>": err_text}
-            self._telemetry_last_signal_errors = {}
             self._telemetry_log_call_exception("<read_telemetry>", e)
 
         payload: dict[str, Any] = {
