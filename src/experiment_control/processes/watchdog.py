@@ -101,6 +101,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     add_rpc_timeout_arg(p, default_ms=2000)
     add_heartbeat_args(p, default_period_s=1.0)
     p.add_argument("--rules", action="append", default=[])
+    p.add_argument("--rules-dir", default=None)
     p.add_argument("--tick-s", type=float, default=0.5)
     return p.parse_args(argv)
 
@@ -322,11 +323,58 @@ def _load_ruleset(path: Path) -> WatchdogRuleset:
     return _parse_ruleset(raw, source=str(path))
 
 
-def _collect_rulesets(paths: list[Path]) -> list[WatchdogRuleset]:
+def collect_rulesets(paths: list[Path]) -> list[WatchdogRuleset]:
     rulesets: list[WatchdogRuleset] = []
     for path in paths:
         rulesets.append(_load_ruleset(path))
     return rulesets
+
+
+def resolve_rule_paths(
+    *,
+    rules: str | Path | list[str | Path] | None = None,
+    rules_dir: str | Path | None = None,
+) -> list[Path]:
+    """Same semantics as ``experiment_control.processes.interlock.resolve_rule_paths``.
+
+    Each `rules` entry is expanduser+resolve'd; `rules_dir` is globbed for
+    ``*.yml`` and ``*.yaml`` in sorted order. Returns an empty list if neither
+    is provided.
+    """
+    paths: list[Path] = []
+    if rules is not None:
+        items: list[str | Path]
+        if isinstance(rules, (str, Path)):
+            items = [rules]
+        else:
+            items = list(rules)
+        for raw in items:
+            paths.append(Path(str(raw)).expanduser().resolve())
+    if rules_dir is not None:
+        rules_dir_path = Path(str(rules_dir)).expanduser().resolve()
+        for path in sorted(rules_dir_path.glob("*.yml")) + sorted(rules_dir_path.glob("*.yaml")):
+            paths.append(path)
+    return paths
+
+
+def _normalize_rulesets_arg(
+    *,
+    rulesets: list[WatchdogRuleset] | None,
+    rules: str | Path | list[str | Path] | None,
+    rules_dir: str | Path | None,
+) -> list[WatchdogRuleset]:
+    if rulesets is not None:
+        if rules is not None or rules_dir is not None:
+            raise ValueError(
+                "pass either rulesets= or rules=/rules_dir=, not both"
+            )
+        return rulesets
+    paths = resolve_rule_paths(rules=rules, rules_dir=rules_dir)
+    if not paths:
+        raise ValueError(
+            "no rules provided: pass rulesets=, rules=, or rules_dir="
+        )
+    return collect_rulesets(paths)
 
 
 def _resp_ok(resp: Any) -> bool:
@@ -513,9 +561,14 @@ class WatchdogProcess(ManagedProcessBase):
         rpc_timeout_ms: int,
         heartbeat_endpoint: str | None,
         heartbeat_period_s: float,
-        rulesets: list[WatchdogRuleset],
         tick_s: float,
+        rulesets: list[WatchdogRuleset] | None = None,
+        rules: str | Path | list[str | Path] | None = None,
+        rules_dir: str | Path | None = None,
     ) -> None:
+        rulesets = _normalize_rulesets_arg(
+            rulesets=rulesets, rules=rules, rules_dir=rules_dir
+        )
         super().__init__(
             process_id=process_id,
             heartbeat_endpoint=heartbeat_endpoint,
@@ -1050,23 +1103,20 @@ class WatchdogProcess(ManagedProcessBase):
 
 def main(argv: list[str] | None = None) -> None:
     ns = _parse_args(argv)
-    rule_paths: list[Path] = []
-    for raw in ns.rules:
-        rule_paths.append(Path(str(raw)).expanduser().resolve())
-    if not rule_paths:
-        raise SystemExit("No rules provided (--rules)")
-
-    rulesets = _collect_rulesets(rule_paths)
-    proc = WatchdogProcess(
-        manager_rpc=ns.manager_rpc,
-        manager_pub=ns.manager_pub,
-        process_id=ns.process_id,
-        rpc_timeout_ms=ns.rpc_timeout_ms,
-        heartbeat_endpoint=ns.heartbeat_endpoint,
-        heartbeat_period_s=ns.heartbeat_period_s,
-        rulesets=rulesets,
-        tick_s=ns.tick_s,
-    )
+    try:
+        proc = WatchdogProcess(
+            manager_rpc=ns.manager_rpc,
+            manager_pub=ns.manager_pub,
+            process_id=ns.process_id,
+            rpc_timeout_ms=ns.rpc_timeout_ms,
+            heartbeat_endpoint=ns.heartbeat_endpoint,
+            heartbeat_period_s=ns.heartbeat_period_s,
+            tick_s=ns.tick_s,
+            rules=list(ns.rules) if ns.rules else None,
+            rules_dir=ns.rules_dir,
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from None
     proc.run()
 
 
