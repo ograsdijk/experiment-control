@@ -29,6 +29,15 @@ from .utils.command_interceptors import apply_command_interceptor_chain
 Json = dict[str, Any]
 
 
+# Cap on the user-supplied timeout_s parameter to
+# route_manager_cleanup_orphans. The handler runs synchronously inside
+# the main RPC handler, blocking the manager loop for the full
+# duration; an unbounded timeout would let a misconfigured client
+# stall the manager for minutes. 30s is well above the realistic
+# cleanup time (typically sub-second).
+_CLEANUP_ORPHANS_TIMEOUT_CAP_S = 30.0
+
+
 def _instance_lock_funcs() -> tuple[Any, Any, Any]:
     # Late import to keep test monkeypatching via experiment_control.manager.* working.
     from . import manager as manager_module
@@ -582,6 +591,14 @@ def route_manager_cleanup_orphans(manager: Any, req: Json) -> Json:
         timeout_s = float(params.get("timeout_s", 2.0))
         if timeout_s <= 0:
             raise ValueError("timeout_s must be > 0")
+        # Cap operator-supplied timeout so a misconfigured client can't
+        # block the manager loop for minutes. The cleanup-orphans path
+        # walks `psutil.process_iter` synchronously inside the main
+        # RPC handler; a 30s ceiling is well above the realistic
+        # cleanup time (typically <1s for a handful of orphan PIDs)
+        # while bounding worst-case manager unresponsiveness.
+        if timeout_s > _CLEANUP_ORPHANS_TIMEOUT_CAP_S:
+            timeout_s = _CLEANUP_ORPHANS_TIMEOUT_CAP_S
     except Exception as exc:
         return {
             "ok": False,
