@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+import uuid
 from typing import Any
 
 import zmq
@@ -8,6 +9,26 @@ from .types import Timestamp
 from .utils.zmq_helpers import drain_multipart_nonblocking, json_dumps, json_loads, safe_json_loads
 
 Json = dict[str, Any]
+
+
+def _drain_stale_replies(sock: zmq.Socket) -> None:
+    """Drop any buffered replies left behind by previous timed-out calls.
+
+    DEALER sockets don't auto-correlate. If a prior `call()` raised
+    zmq.Again before recv but the manager's reply arrived later, the
+    reply sits in the socket's recv buffer; the next send/recv pair
+    would pick it up and mis-attribute it to the new request. Drain
+    before sending so the recv loop sees only fresh replies.
+    """
+    while True:
+        try:
+            if not sock.poll(0, zmq.POLLIN):
+                break
+            _ = sock.recv(zmq.NOBLOCK)
+        except zmq.Again:
+            break
+        except Exception:
+            break
 
 
 class ManagerClient:
@@ -48,6 +69,10 @@ class ManagerClient:
         self.telemetry_last_drain_duration_s = 0.0
         self.telemetry_drain_limited_count = 0
         self.telemetry_parse_errors = 0
+        # Set to True by `call()` whenever a call times out or otherwise
+        # raises before a successful recv; the NEXT call drains stale
+        # replies pre-send. Healthy callers pay zero extra syscalls.
+        self._maybe_stale_reply = False
 
     @property
     def sub_socket(self) -> zmq.Socket | None:
@@ -78,22 +103,80 @@ class ManagerClient:
         else:
             timeout_ms = int(timeout_ms)
         outbound: Json = payload
-        if isinstance(payload, dict) and payload.get("type") == "command" and self._process_id:
-            outbound = dict(payload)
-            if outbound.get("caller_process_id") is None:
-                outbound["caller_process_id"] = self._process_id
-            if outbound.get("source_kind") is None:
-                outbound["source_kind"] = "process"
-            if outbound.get("source_id") is None:
-                outbound["source_id"] = self._process_id
+        # Build the outbound envelope. Process-side command callers get
+        # source_kind/source_id stamped here for the manager's command
+        # journal; transport-level request_id is added below for ALL
+        # callers so the recv loop can discard stale replies.
+        if isinstance(payload, dict):
+            needs_command_stamps = (
+                payload.get("type") == "command" and self._process_id
+            )
+            if needs_command_stamps or "request_id" not in payload:
+                outbound = dict(payload)
+                if needs_command_stamps:
+                    if outbound.get("caller_process_id") is None:
+                        outbound["caller_process_id"] = self._process_id
+                    if outbound.get("source_kind") is None:
+                        outbound["source_kind"] = "process"
+                    if outbound.get("source_id") is None:
+                        outbound["source_id"] = self._process_id
+        # DEALER sockets do not auto-correlate replies. A previous call
+        # that timed out (zmq.Again before recv) can leave its reply
+        # buffered; the next call's bare recv() would mis-attribute it
+        # to the new request. Stamp a transport-level request_id
+        # (preserving any caller-supplied one) so the recv loop can
+        # discard stale frames via request_id mismatch. After a known-
+        # timed-out call we additionally drain leftover frames before
+        # sending, so a mid-upgrade old manager (which may not echo
+        # request_id) can't have its stale reply mistaken for the new
+        # call's response.
+        if isinstance(outbound, dict):
+            if "request_id" not in outbound:
+                if outbound is payload:
+                    outbound = dict(payload)
+                outbound["request_id"] = uuid.uuid4().hex
+            expected_request_id = outbound.get("request_id")
+        else:
+            expected_request_id = None
+
         self._rpc.setsockopt(zmq.RCVTIMEO, timeout_ms)
         self._rpc.setsockopt(zmq.SNDTIMEO, timeout_ms)
         try:
+            if self._maybe_stale_reply:
+                _drain_stale_replies(self._rpc)
+                self._maybe_stale_reply = False
             self._rpc.send(json_dumps(outbound))
-            raw = self._rpc.recv()
-            resp = json_loads(raw)
-            return resp if isinstance(resp, dict) else None
+            deadline = time.monotonic() + (timeout_ms / 1000.0)
+            while True:
+                remaining_ms = (deadline - time.monotonic()) * 1000.0
+                if remaining_ms <= 0:
+                    self._maybe_stale_reply = True
+                    raise zmq.Again()
+                if not self._rpc.poll(max(1, int(remaining_ms)), zmq.POLLIN):
+                    continue
+                raw = self._rpc.recv(zmq.NOBLOCK)
+                resp = json_loads(raw)
+                if not isinstance(resp, dict):
+                    continue
+                resp_rid = resp.get("request_id")
+                if (
+                    expected_request_id is not None
+                    and resp_rid is not None
+                    and resp_rid != expected_request_id
+                ):
+                    # Stale reply from a previous timed-out call (its
+                    # send-time stamp doesn't match what we're waiting
+                    # for); skip. Replies that don't carry request_id
+                    # at all are passed through — some manager error
+                    # paths (parse_error, invalid_request) reply before
+                    # any request body is parsed and can't echo an id.
+                    continue
+                return resp
         except Exception:
+            # Mark the socket as possibly carrying a stale reply so the
+            # NEXT call's pre-send drain kicks in. Healthy calls pay no
+            # extra syscalls; only post-timeout calls do.
+            self._maybe_stale_reply = True
             return None
 
     def publish_event(
