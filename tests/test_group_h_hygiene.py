@@ -33,7 +33,7 @@ if str(SRC) not in sys.path:
 
 from experiment_control.processes.device_router import DeviceRouter
 from experiment_control.processes.process_base import ManagedProcessBase
-from experiment_control.utils.env import env_bool, env_float, env_int, env_str
+from experiment_control.utils.env import env_bool, env_float, env_int
 
 
 # ---------------------------------------------------------------------------
@@ -92,14 +92,21 @@ class EnvHelpersTests(unittest.TestCase):
         self.assertTrue(env_bool(self.KEY, default=True))
         self.assertFalse(env_bool(self.KEY, default=False))
 
-    def test_env_str_returns_value_unchanged(self) -> None:
-        os.environ[self.KEY] = "  preserved  "
-        # No strip — caller decides.
-        self.assertEqual(env_str(self.KEY, "fallback"), "  preserved  ")
-
-    def test_env_str_unset_returns_default(self) -> None:
-        os.environ.pop(self.KEY, None)
-        self.assertEqual(env_str(self.KEY, "fallback"), "fallback")
+    def test_env_bool_set_to_non_truthy_ignores_default(self) -> None:
+        # Regression for review finding: the docstring's claim
+        # "everything else returns default" was misleading. The actual
+        # contract (matching the pre-existing _env_bool in fastapi/app.py)
+        # is "any SET value is parsed as bool; only UNSET respects
+        # default". A typo or explicit "false" must NOT silently become
+        # True just because the caller passed default=True.
+        for value in ("0", "false", "off", "no", "banana"):
+            with self.subTest(value=value):
+                os.environ[self.KEY] = value
+                self.assertFalse(
+                    env_bool(self.KEY, default=True),
+                    f"env_bool with explicit non-truthy {value!r} must "
+                    f"return False even when default=True",
+                )
 
 
 # ---------------------------------------------------------------------------

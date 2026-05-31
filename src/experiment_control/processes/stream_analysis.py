@@ -2533,7 +2533,7 @@ def _prune_unreachable_nodes(
     Per-event execution walks every node in `order`; a node that no output
     transitively depends on does nothing observable but still pays its
     dispatch + handler cost on every chunk_ready. Pruning is purely a
-    compile-time optimization â€” runtime behaviour is unchanged for any
+    compile-time optimization — runtime behaviour is unchanged for any
     workspace whose output set genuinely depends on every node (the common
     case for UI-built workspaces).
 
@@ -2542,7 +2542,7 @@ def _prune_unreachable_nodes(
     nothing downstream consumes the channel value directly.
 
     Stateful operators (fits, aggregates) are preserved as long as they
-    sit on a path to a published output â€” they need to run on every event
+    sit on a path to a published output — they need to run on every event
     to keep their internal state coherent.
     """
     reachable: set[str] = {source_stream_node_id}
@@ -3282,7 +3282,7 @@ class StreamAnalysisProcess(ManagedProcessBase):
         Same shape as `_remember_latest_output` but skips the recursive
         `_sanitize_json` walk. Callers MUST guarantee that every value
         in the payload (including nested lists/dicts) is already free
-        of NaN/Inf â€” typically because each upstream value-producing
+        of NaN/Inf — typically because each upstream value-producing
         path sanitised at build time.
 
         Used by the trace-output snapshot path where the value list is

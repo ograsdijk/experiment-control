@@ -55,7 +55,7 @@ _EXTRA_UI_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 async def _ws_send_json(ws: WebSocket, msg: Any) -> None:
     """Send a JSON message over WS using the project's orjson-backed
     encoder. Equivalent to `ws.send_json(msg)` (text frame, UTF-8), but
-    avoids Starlette's stdlib `json.dumps` â€” orjson is ~13â€“22Ã— faster on
+    avoids Starlette's stdlib `json.dumps` — orjson is ~13–22× faster on
     the stream-frame payload shapes the gateway broadcasts. See `json_dumps`
     in `utils/zmq_helpers.py`; falls back to pyzmq's encoder when orjson
     rejects a payload (NaN/Inf, exotic types).
