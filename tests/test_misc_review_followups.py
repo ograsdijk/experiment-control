@@ -76,6 +76,7 @@ def _runner_with_broken_device() -> DeviceRunner:
     runner._device_state = DeviceState.OK
     runner._device_reachable = True
     runner._last_error = None
+    runner._action_failed_since_last_ok = False
     # _members_cache pre-populated so _rpc_route_get/set skip the
     # _refresh_capabilities_cache path (which would hit a different
     # codepath in real use).
@@ -133,6 +134,7 @@ class DeviceHealthDemotionTests(unittest.TestCase):
         runner._device_state = DeviceState.OK
         runner._device_reachable = True
         runner._last_error = None
+        runner._action_failed_since_last_ok = False
         runner._members_cache = {}
         runner._stream_rpc = {}
         runner._last_ok_ts = None
@@ -155,6 +157,101 @@ class DeviceHealthDemotionTests(unittest.TestCase):
         runner._mark_device_unreachable("x" * 500)
         self.assertLessEqual(len(runner._last_error), 200)
         self.assertTrue(runner._last_error.endswith("..."))
+
+    def test_latch_survives_next_telemetry_tick(self) -> None:
+        """Local review caught that the pre-fix _mark_device_unreachable
+        was undone by the very next telemetry tick because
+        _apply_telemetry_quality_state unconditionally promoted to OK
+        when telemetry signals were healthy. Telemetry runs on a
+        different code path from get/set/command and CAN succeed
+        while every action call fails (e.g. driver caches the last
+        telemetry values but every set_property to the hardware
+        raises). The _action_failed_since_last_ok latch prevents
+        the silent recovery.
+        """
+        runner = _runner_with_broken_device()
+        # Simulate a failed action — sets the latch + demotes.
+        runner._mark_device_unreachable("set 'amp' failed: VISA timeout")
+        self.assertFalse(runner._device_reachable)
+        self.assertEqual(runner._device_state, DeviceState.DEGRADED)
+        self.assertTrue(runner._action_failed_since_last_ok)
+        # Now simulate the next telemetry tick: telemetry signals all
+        # OK (e.g. driver reads its cached values, no hardware call).
+        ok_signals = {
+            "temp": {
+                "value": 1.0,
+                "units": "K",
+                "quality": "OK",
+                "ts": None,
+            }
+        }
+        runner._apply_telemetry_quality_state(ok_signals)
+        # CRITICAL: must NOT silently promote back to OK.
+        self.assertFalse(
+            runner._device_reachable,
+            "telemetry tick with OK signals must NOT clear the "
+            "action-failure demotion while the latch is set — that "
+            "was the bug the local review caught",
+        )
+        self.assertEqual(runner._device_state, DeviceState.DEGRADED)
+        # _last_error must still identify the failing action, not be
+        # replaced by a generic "telemetry partially degraded" message.
+        self.assertIn("set 'amp'", runner._last_error)
+        self.assertIn("VISA timeout", runner._last_error)
+
+    def test_latch_clears_after_successful_action_then_telemetry_promotes(
+        self,
+    ) -> None:
+        """Once the operator's retry succeeds, the latch clears and
+        the next telemetry tick is free to promote normally."""
+        runner = _runner_with_broken_device()
+        runner._mark_device_unreachable("set 'amp' failed: timeout")
+        self.assertTrue(runner._action_failed_since_last_ok)
+
+        # Successful set — clears the latch (via _mark_action_succeeded
+        # invoked from _rpc_route_set's success path; here we simulate
+        # the helper directly).
+        runner._mark_action_succeeded()
+        self.assertFalse(runner._action_failed_since_last_ok)
+        # _device_reachable / _device_state are NOT cleared by
+        # _mark_action_succeeded itself — they're cleared by the next
+        # telemetry promote pass.
+        self.assertFalse(runner._device_reachable)
+
+        ok_signals = {
+            "temp": {
+                "value": 1.0,
+                "units": "K",
+                "quality": "OK",
+                "ts": None,
+            }
+        }
+        runner._apply_telemetry_quality_state(ok_signals)
+        # NOW telemetry can promote back to OK because the latch is
+        # clear.
+        self.assertTrue(runner._device_reachable)
+        self.assertEqual(runner._device_state, DeviceState.OK)
+        self.assertIsNone(runner._last_error)
+
+    def test_latch_survives_no_telemetry_signals_tick(self) -> None:
+        """The no-telemetry-signals branch of _publish_telemetry has
+        its own promote-to-OK path; verify the latch gates that too.
+        """
+        runner = _runner_with_broken_device()
+        runner._telemetry_seq = 0
+        runner._now = lambda: SimpleNamespace(t_wall=1.0, t_mono=2.0)  # type: ignore[method-assign]
+        runner.read_telemetry = lambda: {}  # type: ignore[method-assign]
+        runner.telemetry_signal_names = lambda: []  # type: ignore[method-assign]
+        runner._ts_dict = lambda ts: {"t_wall": ts.t_wall, "t_mono": ts.t_mono}  # type: ignore[method-assign]
+        runner._serialize_signals = lambda signals, *, bundle_ts: signals  # type: ignore[method-assign]
+        runner.pub = SimpleNamespace(  # type: ignore[attr-defined]
+            send_multipart=lambda parts: None
+        )
+        runner._mark_device_unreachable("set 'amp' failed: timeout")
+        runner._publish_telemetry()
+        # Latch keeps the demotion in place.
+        self.assertFalse(runner._device_reachable)
+        self.assertEqual(runner._device_state, DeviceState.DEGRADED)
 
 
 # ---------------------------------------------------------------------------

@@ -714,6 +714,18 @@ class DeviceRunner:
         # Subclass-managed hardware status flags
         self._device_reachable: bool = False
         self._device_state: DeviceState = DeviceState.UNKNOWN
+        # Latch set by `_mark_device_unreachable` after a failed
+        # get/set/command, cleared by the next successful action call.
+        # Read by `_apply_telemetry_quality_state` and the no-telemetry-
+        # signals branch of `_publish_telemetry` to refuse promoting
+        # back to OK while a real device operation is still failing —
+        # without this, a single failed set_property would be silently
+        # papered over by the very next telemetry tick (telemetry uses
+        # a different code path from get/set/command and can succeed
+        # while every other op fails). Once the operator retries and
+        # the action succeeds, the flag clears and telemetry can
+        # promote normally.
+        self._action_failed_since_last_ok: bool = False
         self._connect_called: bool = False
         self._capabilities_cache: dict[str, object] | None = None
         self._members_cache: dict[str, MemberSpec] | None = None
@@ -1130,6 +1142,22 @@ class DeviceRunner:
                 self._device_state = DeviceState.DEGRADED
             self._last_error = f"telemetry returned no OK signals ({counts})"
             return
+        # Even when telemetry looks fine, refuse to promote back to OK
+        # while an action call (get/set/command) is still failing —
+        # telemetry runs on a different code path and can succeed
+        # while every set_property to the hardware raises. The latch
+        # is cleared by the action-success helpers
+        # (_mark_action_succeeded), so once the operator retries and
+        # the action succeeds, the next telemetry tick can promote
+        # normally.
+        if self._action_failed_since_last_ok:
+            self._device_reachable = False
+            if self._device_state != DeviceState.DISCONNECTED:
+                self._device_state = DeviceState.DEGRADED
+            # Keep the existing _last_error from _mark_device_unreachable
+            # in place — it identifies the failing action, which is the
+            # diagnostic operators need.
+            return
         self._device_reachable = True
         if bad_count > 0:
             if self._device_state != DeviceState.DISCONNECTED:
@@ -1265,6 +1293,10 @@ class DeviceRunner:
             # instead of continuing to report "OK" while every read fails.
             self._mark_device_unreachable(f"get {name!r} failed: {exc!r}")
             return self._rpc_error(req_id, f"get failed: {exc}")
+        # Successful device read clears the action-failure latch so the
+        # next telemetry tick is free to promote back to OK (see
+        # _mark_device_unreachable for why the latch exists).
+        self._mark_action_succeeded()
         return self._rpc_ok(req_id, _jsonable_value(value))
 
     def _rpc_route_set(self, req: dict[str, Any]) -> dict[str, Any]:
@@ -1307,24 +1339,47 @@ class DeviceRunner:
             # bundle while every subsequent get/set silently fails.
             self._mark_device_unreachable(f"set {name!r} failed: {exc!r}")
             return self._rpc_error(req_id, f"set failed: {exc}")
+        # Successful device write clears the action-failure latch.
+        self._mark_action_succeeded()
         return self._rpc_ok(req_id, None)
+
+    def _mark_action_succeeded(self) -> None:
+        """Counterpart to `_mark_device_unreachable`: a get/set/command
+        completed successfully, so the failure-latch can be cleared
+        and the next telemetry tick is free to promote the device
+        back to OK (when telemetry quality also looks good).
+
+        Callers must already have set `_last_ok_ts = self._now()`
+        themselves (this helper does not touch the timestamp, only the
+        latch — keeping the call sites' existing semantics intact).
+        """
+        self._action_failed_since_last_ok = False
 
     def _mark_device_unreachable(self, reason: str) -> None:
         """Demote device health after an unexpected device-side failure.
 
         Sets `_device_reachable = False` and transitions
-        `_device_state` to DEGRADED (unless already DISCONNECTED). The
-        next telemetry tick's `_apply_telemetry_quality_state` may
-        promote back to OK if telemetry comes through fine — this just
-        avoids the window where a single failed get/set/command leaves
-        the device looking healthy while in fact every operation is
-        failing.
+        `_device_state` to DEGRADED (unless already DISCONNECTED). Also
+        sets `_action_failed_since_last_ok = True` — a latch that
+        prevents `_apply_telemetry_quality_state` (and the no-
+        telemetry-signals branch of `_publish_telemetry`) from
+        silently promoting the device back to OK on the next
+        telemetry tick. Telemetry runs on a different code path from
+        get/set/command and can succeed even while every action call
+        fails (e.g. driver caches the last-known telemetry values
+        but every set_property to the hardware raises VISA timeout).
+
+        The latch is cleared by the action-success paths that already
+        set `_last_ok_ts` — so once an operator retries the failing
+        operation and it succeeds, telemetry can promote normally on
+        the next tick.
 
         Records `reason` into `_last_error` (capped at ~200 chars).
         """
         self._device_reachable = False
         if self._device_state != DeviceState.DISCONNECTED:
             self._device_state = DeviceState.DEGRADED
+        self._action_failed_since_last_ok = True
         if len(reason) > 200:
             reason = reason[:197] + "..."
         self._last_error = reason
@@ -1375,6 +1430,9 @@ class DeviceRunner:
         self._device_state = DeviceState.OK
         self._last_ok_ts = self._now()
         self._last_error = None
+        # Fresh successful connect clears the action-failure latch from
+        # any prior session.
+        self._mark_action_succeeded()
         try:
             self._refresh_capabilities_cache()
         except Exception:
@@ -1454,6 +1512,7 @@ class DeviceRunner:
             self._device_reachable = True
             self._last_ok_ts = self._now()
             self._last_error = None
+            self._mark_action_succeeded()
             return self._rpc_ok(req_id, result)
 
         # Forward to subclass command handler (with optional coercion).
@@ -1487,6 +1546,7 @@ class DeviceRunner:
         self._device_reachable = True
         self._last_ok_ts = self._now()
         self._last_error = None
+        self._mark_action_succeeded()
         return self._rpc_ok(req_id, result)
 
     def _handle_rpc_request(self, req: dict[str, Any]) -> dict[str, Any]:
@@ -1557,10 +1617,24 @@ class DeviceRunner:
             if self.telemetry_signal_names():
                 self._apply_telemetry_quality_state(signals)
             else:
-                self._device_reachable = True
-                if self._device_state == DeviceState.DISCONNECTED:
-                    self._device_state = DeviceState.OK
-                self._last_error = None
+                # Devices without telemetry signals had read_telemetry
+                # return cleanly (no exception). Previously this
+                # unconditionally promoted to OK every tick — silently
+                # erasing any `_mark_device_unreachable` from a failed
+                # action call. Gate the promote on the action-failure
+                # latch so the demotion survives until an action
+                # actually succeeds.
+                if not self._action_failed_since_last_ok:
+                    self._device_reachable = True
+                    if self._device_state == DeviceState.DISCONNECTED:
+                        self._device_state = DeviceState.OK
+                    self._last_error = None
+                else:
+                    self._device_reachable = False
+                    if self._device_state != DeviceState.DISCONNECTED:
+                        self._device_state = DeviceState.DEGRADED
+                    # Keep the action-failure _last_error as set by
+                    # _mark_device_unreachable.
             if self._device_reachable:
                 self._last_ok_ts = bundle_ts
         except Exception as e:
