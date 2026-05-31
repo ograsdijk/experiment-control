@@ -1448,21 +1448,6 @@ async def put_stream_workspace(
     )
 
 
-@app.patch("/api/stream/workspaces/{workspace_id}")
-async def patch_stream_workspace(
-    workspace_id: str, req: StreamWorkspaceRequest
-) -> dict[str, Any]:
-    workspace = dict(req.workspace)
-    workspace["workspace_id"] = workspace_id
-    payload: dict[str, Any] = {"workspace": workspace}
-    if req.expected_revision is not None:
-        payload["expected_revision"] = int(req.expected_revision)
-    return await _stream_analysis_rpc(
-        "stream_analysis.workspace.put",
-        payload,
-    )
-
-
 @app.post("/api/stream/workspaces/{workspace_id}/validate")
 async def validate_stream_workspace(
     workspace_id: str, req: StreamWorkspaceValidateRequest | None = None
