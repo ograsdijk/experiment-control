@@ -22,6 +22,7 @@ from ..utils.cli_args import (
     add_process_id_arg,
     add_rpc_timeout_arg,
 )
+from ..utils.responses import is_response_ok
 from ..utils.config_parsing import (
     ConfigError,
     normalize_list,
@@ -377,17 +378,9 @@ def _normalize_rulesets_arg(
     return collect_rulesets(paths)
 
 
-def _resp_ok(resp: Any) -> bool:
-    if not isinstance(resp, dict):
-        return False
-    if "ok" in resp:
-        return bool(resp.get("ok"))
-    status = resp.get("status")
-    if status == "OK":
-        return True
-    if status == "ERROR":
-        return False
-    return False
+# Backwards-compat alias for the canonical predicate. New code should import
+# is_response_ok from experiment_control.utils.responses directly.
+_resp_ok = is_response_ok
 
 
 def _resolve_watchdog_bindings(
