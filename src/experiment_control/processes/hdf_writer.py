@@ -2400,9 +2400,17 @@ class HdfWriter(ManagedProcessBase):
         self._topic_handlers = handlers
         return handlers
 
-    def _rpc_ok(self, req: Json, *, result: Any) -> Json:
+    @classmethod
+    def _rpc_ok(
+        cls, req_or_id: Json | Any, *, result: Any = None
+    ) -> Json:
+        # Matches the ManagedProcessBase signature (classmethod,
+        # req_or_id, default result=None) so mypy doesn't flag the
+        # override as LSP-incompatible. The body is identical to the
+        # base, kept here for now to preserve any subclass-tests that
+        # call HdfWriter._rpc_ok directly.
         return {
-            "request_id": self._rpc_request_id(req),
+            "request_id": cls._rpc_request_id(req_or_id),
             "ok": True,
             "result": result,
         }

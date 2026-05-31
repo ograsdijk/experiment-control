@@ -1334,7 +1334,18 @@ class DeviceRouter(ManagedProcessBase):
         )
         return added
 
-    def _unregister_command_interceptor_routes(self, process_id: str) -> bool:
+    def _drop_interceptor_routes_for_process(self, process_id: str) -> bool:
+        """Drop all cached interceptor routes whose process_id matches.
+
+        Distinct from the inherited
+        ``ManagedProcessBase._unregister_command_interceptor_routes(self)``
+        no-arg hook (called by an interceptor process to deregister
+        itself with the manager). This method is the device-router's
+        process_id-keyed bulk-removal entry point invoked when a
+        downstream interceptor process exits or sends an explicit
+        drop. Renamed in PR #55 to remove the LSP signature collision
+        that mypy flagged.
+        """
         with self._route_lock:
             before = len(self._routes)
             self._routes = [r for r in self._routes if r.process_id != process_id]
@@ -1441,7 +1452,7 @@ class DeviceRouter(ManagedProcessBase):
                     "error": {"code": "invalid_unregister", "message": "missing process_id"},
                 }
             try:
-                removed = self._unregister_command_interceptor_routes(process_id)
+                removed = self._drop_interceptor_routes_for_process(process_id)
             except Exception as e:
                 return {
                     "ok": False,

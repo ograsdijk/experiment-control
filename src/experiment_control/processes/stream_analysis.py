@@ -11,7 +11,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from graphlib import TopologicalSorter
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 import numpy as np
 import zmq
@@ -2318,6 +2318,7 @@ def _validate_source_telemetry_nearest_node(node: NodeSpec) -> None:
 
 
 def _validate_node_scalar_threshold(
+    *,
     node: NodeSpec,
     source_stream_nodes: list[str],
 ) -> None:
@@ -2326,6 +2327,7 @@ def _validate_node_scalar_threshold(
 
 
 def _validate_node_trace_rolling_mean(
+    *,
     node: NodeSpec,
     source_stream_nodes: list[str],
 ) -> None:
@@ -2334,6 +2336,7 @@ def _validate_node_trace_rolling_mean(
 
 
 def _validate_node_trace_decimate(
+    *,
     node: NodeSpec,
     source_stream_nodes: list[str],
 ) -> None:
@@ -2342,6 +2345,7 @@ def _validate_node_trace_decimate(
 
 
 def _validate_node_fit_curve_1d(
+    *,
     node: NodeSpec,
     source_stream_nodes: list[str],
 ) -> None:
@@ -2350,6 +2354,7 @@ def _validate_node_fit_curve_1d(
 
 
 def _validate_node_fit_from_hist(
+    *,
     node: NodeSpec,
     source_stream_nodes: list[str],
 ) -> None:
@@ -2358,6 +2363,7 @@ def _validate_node_fit_from_hist(
 
 
 def _validate_node_fit_param(
+    *,
     node: NodeSpec,
     source_stream_nodes: list[str],
 ) -> None:
@@ -2366,6 +2372,7 @@ def _validate_node_fit_param(
 
 
 def _validate_node_aggregate_bin_stats(
+    *,
     node: NodeSpec,
     source_stream_nodes: list[str],
 ) -> None:
@@ -2374,6 +2381,7 @@ def _validate_node_aggregate_bin_stats(
 
 
 def _validate_node_aggregate_bin2d_stats(
+    *,
     node: NodeSpec,
     source_stream_nodes: list[str],
 ) -> None:
@@ -2382,6 +2390,7 @@ def _validate_node_aggregate_bin2d_stats(
 
 
 def _validate_node_source_context_field(
+    *,
     node: NodeSpec,
     source_stream_nodes: list[str],
 ) -> None:
@@ -2390,6 +2399,7 @@ def _validate_node_source_context_field(
 
 
 def _validate_node_source_telemetry_nearest(
+    *,
     node: NodeSpec,
     source_stream_nodes: list[str],
 ) -> None:
@@ -2398,6 +2408,7 @@ def _validate_node_source_telemetry_nearest(
 
 
 def _validate_node_record_field(
+    *,
     node: NodeSpec,
     source_stream_nodes: list[str],
 ) -> None:
@@ -2408,6 +2419,7 @@ def _validate_node_record_field(
 
 
 def _validate_node_record_filter_eq(
+    *,
     node: NodeSpec,
     source_stream_nodes: list[str],
 ) -> None:
@@ -2417,7 +2429,16 @@ def _validate_node_record_filter_eq(
         raise ValueError(f"node {node.node_id!r} {node.op} requires field")
 
 
-_NODE_OP_PARAM_VALIDATORS: dict[str, Callable[[NodeSpec, list[str]], None]] = {
+# All validators take node + source_stream_nodes as keyword-only args.
+# The Protocol below documents the exact signature so the dict's value
+# type matches what's actually invoked at the call site (kwargs).
+class _NodeValidator(Protocol):
+    def __call__(
+        self, *, node: NodeSpec, source_stream_nodes: list[str]
+    ) -> None: ...
+
+
+_NODE_OP_PARAM_VALIDATORS: dict[str, _NodeValidator] = {
     "source.stream": _validate_source_stream_node,
     "source.records": _validate_source_records_node,
     "source.context_field": _validate_node_source_context_field,
@@ -2512,7 +2533,7 @@ def _prune_unreachable_nodes(
     Per-event execution walks every node in `order`; a node that no output
     transitively depends on does nothing observable but still pays its
     dispatch + handler cost on every chunk_ready. Pruning is purely a
-    compile-time optimization — runtime behaviour is unchanged for any
+    compile-time optimization â€” runtime behaviour is unchanged for any
     workspace whose output set genuinely depends on every node (the common
     case for UI-built workspaces).
 
@@ -2521,7 +2542,7 @@ def _prune_unreachable_nodes(
     nothing downstream consumes the channel value directly.
 
     Stateful operators (fits, aggregates) are preserved as long as they
-    sit on a path to a published output — they need to run on every event
+    sit on a path to a published output â€” they need to run on every event
     to keep their internal state coherent.
     """
     reachable: set[str] = {source_stream_node_id}
@@ -3261,7 +3282,7 @@ class StreamAnalysisProcess(ManagedProcessBase):
         Same shape as `_remember_latest_output` but skips the recursive
         `_sanitize_json` walk. Callers MUST guarantee that every value
         in the payload (including nested lists/dicts) is already free
-        of NaN/Inf — typically because each upstream value-producing
+        of NaN/Inf â€” typically because each upstream value-producing
         path sanitised at build time.
 
         Used by the trace-output snapshot path where the value list is
