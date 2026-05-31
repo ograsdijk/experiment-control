@@ -10,7 +10,7 @@ from typing import Any
 
 import zmq
 from rich.text import Text
-from textual import events, on
+from textual import events, on, work
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.driver import Driver
@@ -2126,6 +2126,86 @@ class ManagerTUI(App):
         except Exception:
             pass
 
+    @work(thread=True, exit_on_error=False, group="bulk-rpc")
+    def _run_bulk_rpc_worker(
+        self,
+        *,
+        items: list[tuple[str, Json]],
+        label: str,
+        summary_label: str,
+        error_log_prefix: str | None = None,
+    ) -> None:
+        """Run a sequence of blocking _rpc_calls on a worker thread.
+
+        Used by the TUI's bulk action handlers (start-all / stop-all)
+        so the UI event loop stays responsive during what was
+        previously an N * rpc_timeout_ms freeze. UI updates (notify,
+        log-write, error-record) are scheduled back to the main
+        thread via call_from_thread, which Textual's @work decorator
+        provides transparently when the called methods are themselves
+        thread-safe.
+
+        Parameters:
+            items: list of (id, payload) tuples to invoke. The id is
+                used for notifications and error records.
+            label: short verb-noun used in success notifications
+                (e.g. "Process start" -> "Process start sent: foo").
+            summary_label: text for the final aggregated notification
+                ("Start all processes: 5 ok, 0 failed").
+            error_log_prefix: when set, failures additionally write
+                a one-line entry to the event log (used by
+                action_drivers_stop_all's verbose error reporting).
+                When None, only the success/error notification fires.
+        """
+        ok_count = 0
+        fail_count = 0
+        for item_id, payload in items:
+            if not item_id:
+                continue
+            # _rpc_call is the blocking ZMQ round-trip; running it on
+            # a worker thread is the whole point of this helper.
+            resp = self._rpc_call(payload)
+            if resp is not None and resp.get("ok"):
+                ok_count += 1
+                # Per-item success notification (cheap; Notify is
+                # thread-safe in Textual >= 0.50).
+                self.call_from_thread(
+                    self.notify, f"{label} sent: {item_id}"
+                )
+            else:
+                fail_count += 1
+                if resp is None:
+                    err: Any = "timeout"
+                else:
+                    err = resp.get("error", "unknown error")
+                err_text = (
+                    json.dumps(err) if isinstance(err, dict) else str(err)
+                )
+                # Per-item error notification.
+                self.call_from_thread(
+                    self.notify,
+                    f"{label} failed: {item_id} ({err_text})",
+                    severity="error",
+                )
+                # Error record (drives the errors-table view).
+                self.call_from_thread(
+                    self._record_action_error,
+                    source="device" if label.startswith("Driver") else "process",
+                    id_=item_id,
+                    message=f"{label} failed: {item_id} ({err_text})",
+                )
+                if error_log_prefix is not None:
+                    self.call_from_thread(
+                        self._log_action_result,
+                        f"{error_log_prefix} {item_id} -> error {err_text}",
+                    )
+        # Final aggregated summary so operators see the total even if
+        # they missed the per-item toasts.
+        self.call_from_thread(
+            self.notify,
+            f"{summary_label}: {ok_count} ok, {fail_count} failed",
+        )
+
     def _reconnect_backend(self) -> bool:
         self._set_backend_status("Backend: reconnecting")
         self._log_action_result("Reconnecting backend...")
@@ -2621,22 +2701,36 @@ class ManagerTUI(App):
         self._notify_rpc_result("Driver start", device_id, resp)
 
     def action_drivers_start_all(self) -> None:
+        # Bulk start: previously this looped N blocking _rpc_calls on
+        # the UI thread, freezing the TUI for ~N * rpc_timeout_ms even
+        # in the happy case (each RPC is sync). Now the loop runs on
+        # a Textual worker thread; UI updates are marshalled back via
+        # call_from_thread (which @work + Notify do automatically).
         if self._action_target() == "process":
-            for proc in self._processes:
-                process_id = str(proc.get("process_id", ""))
-                if not process_id:
-                    continue
-                resp = self._rpc_call(
-                    {"type": "manager.processes.start", "process_id": process_id}
-                )
-                self._notify_rpc_result("Process start", process_id, resp)
+            items = [
+                (str(proc.get("process_id", "")),
+                 {"type": "manager.processes.start",
+                  "process_id": str(proc.get("process_id", ""))})
+                for proc in self._processes
+                if str(proc.get("process_id", ""))
+            ]
+            self._run_bulk_rpc_worker(
+                items=items,
+                label="Process start",
+                summary_label="Start all processes",
+            )
             return
 
-        for device_id in list(self._device_status):
-            resp = self._rpc_call(
-                {"type": "device.driver.start", "device_id": device_id}
-            )
-            self._notify_rpc_result("Driver start", device_id, resp)
+        items = [
+            (device_id,
+             {"type": "device.driver.start", "device_id": device_id})
+            for device_id in list(self._device_status)
+        ]
+        self._run_bulk_rpc_worker(
+            items=items,
+            label="Driver start",
+            summary_label="Start all drivers",
+        )
 
     def action_driver_stop(self) -> None:
         if self._action_target() == "process":
@@ -2744,30 +2838,25 @@ class ManagerTUI(App):
         self._rpc_call({"type": "device.recover", "device_id": device_id})
 
     def action_drivers_stop_all(self) -> None:
+        # Bulk stop: same pattern as action_drivers_start_all — the
+        # per-item loop runs on a worker thread so the UI stays
+        # responsive while N processes/drivers shut down sequentially.
         if self._action_target() == "process":
             def _on_dismiss(confirmed: bool | None) -> None:
                 if not confirmed:
                     return
-                ok_count = 0
-                fail_count = 0
-                for proc in self._processes:
-                    process_id = str(proc.get("process_id", ""))
-                    if not process_id:
-                        continue
-                    resp = self._rpc_call(
-                        {"type": "manager.processes.stop", "process_id": process_id}
-                    )
-                    if resp and resp.get("ok"):
-                        ok_count += 1
-                    else:
-                        fail_count += 1
-                        err = resp.get("error", "timeout") if resp else "timeout"
-                        err_text = json.dumps(err) if isinstance(err, dict) else str(err)
-                        self._log_action_result(
-                            f"PROC STOP {process_id} -> error {err_text}"
-                        )
-                self.notify(
-                    f"Stop all processes: {ok_count} ok, {fail_count} failed"
+                items = [
+                    (str(proc.get("process_id", "")),
+                     {"type": "manager.processes.stop",
+                      "process_id": str(proc.get("process_id", ""))})
+                    for proc in self._processes
+                    if str(proc.get("process_id", ""))
+                ]
+                self._run_bulk_rpc_worker(
+                    items=items,
+                    label="Process stop",
+                    summary_label="Stop all processes",
+                    error_log_prefix="PROC STOP",
                 )
 
             self.push_screen(ConfirmScreen("Stop all processes?"), _on_dismiss)
@@ -2776,22 +2865,17 @@ class ManagerTUI(App):
         def _on_dismiss(confirmed: bool | None) -> None:
             if not confirmed:
                 return
-            ok_count = 0
-            fail_count = 0
-            for device_id in list(self._device_status):
-                resp = self._rpc_call(
-                    {"type": "device.driver.stop", "device_id": device_id}
-                )
-                if resp and resp.get("ok"):
-                    ok_count += 1
-                else:
-                    fail_count += 1
-                    err = resp.get("error", "timeout") if resp else "timeout"
-                    err_text = json.dumps(err) if isinstance(err, dict) else str(err)
-                    self._log_action_result(
-                        f"DRIVER STOP {device_id} -> error {err_text}"
-                    )
-            self.notify(f"Stop all drivers: {ok_count} ok, {fail_count} failed")
+            items = [
+                (device_id,
+                 {"type": "device.driver.stop", "device_id": device_id})
+                for device_id in list(self._device_status)
+            ]
+            self._run_bulk_rpc_worker(
+                items=items,
+                label="Driver stop",
+                summary_label="Stop all drivers",
+                error_log_prefix="DRIVER STOP",
+            )
 
         self.push_screen(ConfirmScreen("Stop all drivers?"), _on_dismiss)
 
