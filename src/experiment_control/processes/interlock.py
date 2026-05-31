@@ -209,11 +209,41 @@ def _load_ruleset_text(text: str, *, source: str) -> Ruleset:
     return _parse_ruleset(raw, source=source)
 
 
-def _collect_rulesets(paths: list[Path]) -> list[RulesetEntry]:
+def collect_rulesets(paths: list[Path]) -> list[RulesetEntry]:
     rulesets: list[RulesetEntry] = []
     for path in paths:
         rulesets.append(RulesetEntry(ruleset=_load_ruleset(path), enabled=True, source=str(path)))
     return rulesets
+
+
+def resolve_rule_paths(
+    *,
+    rules: str | Path | list[str | Path] | None = None,
+    rules_dir: str | Path | None = None,
+) -> list[Path]:
+    """Resolve `rules` / `rules_dir` kwargs into a flat ordered list of Paths.
+
+    Mirrors the CLI's `--rules` / `--rules-dir` semantics: each `rules` entry
+    is expanduser+resolve'd; `rules_dir` is globbed for ``*.yml`` and ``*.yaml``
+    in sorted order. Either, both, or neither may be provided.
+
+    Returns an empty list when neither is given; callers decide whether that is
+    an error in their context.
+    """
+    paths: list[Path] = []
+    if rules is not None:
+        items: list[str | Path]
+        if isinstance(rules, (str, Path)):
+            items = [rules]
+        else:
+            items = list(rules)
+        for raw in items:
+            paths.append(Path(str(raw)).expanduser().resolve())
+    if rules_dir is not None:
+        rules_dir_path = Path(str(rules_dir)).expanduser().resolve()
+        for path in sorted(rules_dir_path.glob("*.yml")) + sorted(rules_dir_path.glob("*.yaml")):
+            paths.append(path)
+    return paths
 
 
 def _collect_routes(rulesets: list[Ruleset]) -> list[Json]:
@@ -485,6 +515,31 @@ def evaluate_interlock_rule(
     return "allow", None, None
 
 
+def _normalize_rulesets_arg(
+    *,
+    rulesets: list[RulesetEntry] | None,
+    rules: str | Path | list[str | Path] | None,
+    rules_dir: str | Path | None,
+) -> list[RulesetEntry]:
+    """Allow callers to supply `rulesets=` (pre-parsed) OR `rules=`/`rules_dir=`.
+
+    The two paths are mutually exclusive so a caller can't accidentally pass
+    both and get silent priority confusion.
+    """
+    if rulesets is not None:
+        if rules is not None or rules_dir is not None:
+            raise ValueError(
+                "pass either rulesets= or rules=/rules_dir=, not both"
+            )
+        return rulesets
+    paths = resolve_rule_paths(rules=rules, rules_dir=rules_dir)
+    if not paths:
+        raise ValueError(
+            "no rules provided: pass rulesets=, rules=, or rules_dir="
+        )
+    return collect_rulesets(paths)
+
+
 class InterlockProcess(ManagedProcessBase):
     def __init__(
         self,
@@ -495,8 +550,13 @@ class InterlockProcess(ManagedProcessBase):
         rpc_timeout_ms: int,
         heartbeat_endpoint: str | None,
         heartbeat_period_s: float,
-        rulesets: list[RulesetEntry],
+        rulesets: list[RulesetEntry] | None = None,
+        rules: str | Path | list[str | Path] | None = None,
+        rules_dir: str | Path | None = None,
     ) -> None:
+        rulesets = _normalize_rulesets_arg(
+            rulesets=rulesets, rules=rules, rules_dir=rules_dir
+        )
         super().__init__(
             process_id=process_id,
             heartbeat_endpoint=heartbeat_endpoint,
@@ -1081,26 +1141,19 @@ class InterlockProcess(ManagedProcessBase):
 
 def main(argv: list[str] | None = None) -> None:
     ns = _parse_args(argv)
-    rule_paths: list[Path] = []
-    for raw in ns.rules:
-        rule_paths.append(Path(str(raw)).expanduser().resolve())
-    if ns.rules_dir:
-        rules_dir = Path(str(ns.rules_dir)).expanduser().resolve()
-        for path in sorted(rules_dir.glob("*.yml")) + sorted(rules_dir.glob("*.yaml")):
-            rule_paths.append(path)
-    if not rule_paths:
-        raise SystemExit("No rules provided (--rules or --rules-dir)")
-
-    rulesets = _collect_rulesets(rule_paths)
-    proc = InterlockProcess(
-        manager_rpc=ns.manager_rpc,
-        manager_pub=ns.manager_pub,
-        process_id=ns.process_id,
-        rpc_timeout_ms=ns.rpc_timeout_ms,
-        heartbeat_endpoint=ns.heartbeat_endpoint,
-        heartbeat_period_s=ns.heartbeat_period_s,
-        rulesets=rulesets,
-    )
+    try:
+        proc = InterlockProcess(
+            manager_rpc=ns.manager_rpc,
+            manager_pub=ns.manager_pub,
+            process_id=ns.process_id,
+            rpc_timeout_ms=ns.rpc_timeout_ms,
+            heartbeat_endpoint=ns.heartbeat_endpoint,
+            heartbeat_period_s=ns.heartbeat_period_s,
+            rules=list(ns.rules) if ns.rules else None,
+            rules_dir=ns.rules_dir,
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from None
     proc.run()
 
 
