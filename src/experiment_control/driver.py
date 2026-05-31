@@ -37,6 +37,14 @@ from .utils.rpc_dispatch import RpcDispatchRegistry
 from .utils.value_coercion import coerce_scalar
 
 
+# Cap on inbound REP message size set on the driver's RPC socket via
+# zmq.MAXMSGSIZE in `connect_ipc`. The manager's normal RPC envelope
+# (action + params) is < 16 KiB; 1 MiB is well above any legitimate
+# request and well below what a malicious / misbehaving client could
+# use to wedge the driver loop on a giant recv allocation.
+_DRIVER_RPC_MAX_MSG_BYTES = 1 * 1024 * 1024
+
+
 class Device(Protocol):
     """
     Minimal interface expected from a device object.
@@ -570,6 +578,7 @@ class _TelemetryCallPlan:
     attr_name: str | None
     kwargs: dict[str, Any]
     outputs: list[_TelemetryOutPlan]
+    method: str  # Original call.method, used as key in telemetry call_errors.
 
 
 @dataclass(slots=True)
@@ -703,9 +712,33 @@ class DeviceRunner:
         self._last_ok_ts: Timestamp | None = None
         self._last_error: str | None = None
 
+        # Per-call telemetry error capture populated by read_telemetry on every
+        # tick. Surfaced in the published telemetry bundle (bundle-level
+        # `call_errors`) so the UI can show why a signal went BAD without
+        # operators having to read driver stderr. Keys are the original
+        # call.method names. (Per-signal errors are exposed via each signal's
+        # own `error` field in the same bundle; no separate state needed.)
+        self._telemetry_last_call_errors: dict[str, str] = {}
+        # Rate-limit table for the stderr log of telemetry-call exceptions:
+        # (call_method, exception_class_qualname) -> last_logged_monotonic.
+        self._telemetry_log_last_mono: dict[tuple[str, str], float] = {}
+        self._telemetry_log_period_s: float = 30.0
+
         # Subclass-managed hardware status flags
         self._device_reachable: bool = False
         self._device_state: DeviceState = DeviceState.UNKNOWN
+        # Latch set by `_mark_device_unreachable` after a failed
+        # get/set/command, cleared by the next successful action call.
+        # Read by `_apply_telemetry_quality_state` and the no-telemetry-
+        # signals branch of `_publish_telemetry` to refuse promoting
+        # back to OK while a real device operation is still failing —
+        # without this, a single failed set_property would be silently
+        # papered over by the very next telemetry tick (telemetry uses
+        # a different code path from get/set/command and can succeed
+        # while every other op fails). Once the operator retries and
+        # the action succeeds, the flag clears and telemetry can
+        # promote normally.
+        self._action_failed_since_last_ok: bool = False
         self._connect_called: bool = False
         self._capabilities_cache: dict[str, object] | None = None
         self._members_cache: dict[str, MemberSpec] | None = None
@@ -851,6 +884,17 @@ class DeviceRunner:
     # ----------------------------
 
     def connect_ipc(self) -> None:
+        # Cap inbound REP message size at 1 MiB. The manager's
+        # call_device_rpc envelope is normally < 16 KiB (action +
+        # params), so 1 MiB is well above any legitimate request.
+        # Without the cap, a misbehaving (or malicious) client sending
+        # an oversize JSON payload would have the recv_json call
+        # below allocate up to MAXMSGSIZE (default unlimited),
+        # potentially wedging the driver loop on a large allocation.
+        # libzmq enforces MAXMSGSIZE at the recv layer; oversize
+        # messages are dropped at the source socket and the client
+        # gets a disconnect.
+        self.rpc.setsockopt(zmq.MAXMSGSIZE, _DRIVER_RPC_MAX_MSG_BYTES)
         rpc_port = self.rpc.bind_to_random_port("tcp://127.0.0.1")
         pub_port = self.pub.bind_to_random_port("tcp://127.0.0.1")
         self.rpc_endpoint = f"tcp://127.0.0.1:{rpc_port}"
@@ -1019,6 +1063,12 @@ class DeviceRunner:
 
     def read_telemetry(self) -> dict[str, dict[str, Any]]:
         out: dict[str, dict[str, Any]] = {}
+        # Reset per-tick call-error capture; populated below when a telemetry
+        # call raises. Surfaced as bundle-level `call_errors` by
+        # _publish_telemetry. Per-signal extractor failures are not tracked
+        # here because they already flow out via each signal's own `error`
+        # field in `out`.
+        self._telemetry_last_call_errors = {}
 
         for plan in self._telemetry_plan:
             if plan.func is None and plan.attr_name is None:
@@ -1065,23 +1115,63 @@ class DeviceRunner:
                             "quality": TelemetryQuality.OK,
                             "ts": None,
                         }
-                    except Exception:
+                    except Exception as e:
+                        err_text = self._telemetry_format_error(e)
                         out[o.signal] = {
                             "value": None,
                             "units": o.units,
                             "quality": TelemetryQuality.BAD,
                             "ts": None,
+                            "error": err_text,
                         }
-            except Exception:
+            except Exception as e:
+                err_text = self._telemetry_format_error(e)
+                self._telemetry_last_call_errors[plan.method] = err_text
+                self._telemetry_log_call_exception(plan.method, e)
                 for o in plan.outputs:
                     out[o.signal] = {
                         "value": None,
                         "units": o.units,
                         "quality": TelemetryQuality.BAD,
                         "ts": None,
+                        "error": err_text,
                     }
 
         return out
+
+    @staticmethod
+    def _telemetry_format_error(exc: BaseException, *, max_len: int = 200) -> str:
+        """Render a telemetry exception as a single-line, length-bounded string."""
+        text = repr(exc)
+        if len(text) > max_len:
+            text = text[: max_len - 3] + "..."
+        return text
+
+    def _telemetry_log_call_exception(self, method: str, exc: BaseException) -> None:
+        """Write a telemetry-call exception to stderr, rate-limited per (method, exc-type).
+
+        Without this, the supervisor's per-device manager.log shows a device
+        sitting in DEGRADED with no diagnostic, because the only previous
+        record of the exception was in `_last_error` (overwritten on the next
+        tick). One emission per (method, exception class) per
+        `_telemetry_log_period_s` seconds is enough to surface the failure to
+        operators without flooding the log on every tick.
+        """
+        try:
+            key = (method, type(exc).__qualname__)
+            now = time.monotonic()
+            last = self._telemetry_log_last_mono.get(key)
+            if last is not None and (now - last) < self._telemetry_log_period_s:
+                return
+            self._telemetry_log_last_mono[key] = now
+            sys.stderr.write(
+                f"[driver][{self.device_id}] telemetry call {method!r} raised "
+                f"{type(exc).__name__}: {exc!r}\n"
+            )
+            sys.stderr.flush()
+        except Exception:
+            # Never let the log path itself break telemetry.
+            pass
 
     @staticmethod
     def _telemetry_quality_counts(signals: dict[str, dict[str, Any]]) -> dict[str, int]:
@@ -1110,6 +1200,22 @@ class DeviceRunner:
             if self._device_state != DeviceState.DISCONNECTED:
                 self._device_state = DeviceState.DEGRADED
             self._last_error = f"telemetry returned no OK signals ({counts})"
+            return
+        # Even when telemetry looks fine, refuse to promote back to OK
+        # while an action call (get/set/command) is still failing —
+        # telemetry runs on a different code path and can succeed
+        # while every set_property to the hardware raises. The latch
+        # is cleared by the action-success helpers
+        # (_mark_action_succeeded), so once the operator retries and
+        # the action succeeds, the next telemetry tick can promote
+        # normally.
+        if self._action_failed_since_last_ok:
+            self._device_reachable = False
+            if self._device_state != DeviceState.DISCONNECTED:
+                self._device_state = DeviceState.DEGRADED
+            # Keep the existing _last_error from _mark_device_unreachable
+            # in place — it identifies the failing action, which is the
+            # diagnostic operators need.
             return
         self._device_reachable = True
         if bad_count > 0:
@@ -1237,7 +1343,19 @@ class DeviceRunner:
             or name in {"connect", "disconnect"}
         ):
             return self._rpc_error(req_id, "Invalid member name")
-        value = getattr(self._device, name)
+        try:
+            value = getattr(self._device, name)
+        except Exception as exc:
+            # The device's getattr raised (e.g. VISA read error, hardware
+            # disconnect mid-call). Demote health so the manager sees the
+            # device as DEGRADED on its next heartbeat / telemetry tick
+            # instead of continuing to report "OK" while every read fails.
+            self._mark_device_unreachable(f"get {name!r} failed: {exc!r}")
+            return self._rpc_error(req_id, f"get failed: {exc}")
+        # Successful device read clears the action-failure latch so the
+        # next telemetry tick is free to promote back to OK (see
+        # _mark_device_unreachable for why the latch exists).
+        self._mark_action_succeeded()
         return self._rpc_ok(req_id, _jsonable_value(value))
 
     def _rpc_route_set(self, req: dict[str, Any]) -> dict[str, Any]:
@@ -1270,8 +1388,60 @@ class DeviceRunner:
                 value = _coerce_simple_value(value, kind)
             except Exception:
                 return self._rpc_error(req_id, "Failed to coerce value")
-        setattr(self._device, name, value)
+        try:
+            setattr(self._device, name, value)
+        except Exception as exc:
+            # See _rpc_route_get for rationale: a failed setattr on the
+            # underlying device (VISA write error, hardware disconnect,
+            # validation rejection inside a property setter, etc.) must
+            # not leave the device looking OK in the next telemetry
+            # bundle while every subsequent get/set silently fails.
+            self._mark_device_unreachable(f"set {name!r} failed: {exc!r}")
+            return self._rpc_error(req_id, f"set failed: {exc}")
+        # Successful device write clears the action-failure latch.
+        self._mark_action_succeeded()
         return self._rpc_ok(req_id, None)
+
+    def _mark_action_succeeded(self) -> None:
+        """Counterpart to `_mark_device_unreachable`: a get/set/command
+        completed successfully, so the failure-latch can be cleared
+        and the next telemetry tick is free to promote the device
+        back to OK (when telemetry quality also looks good).
+
+        Callers must already have set `_last_ok_ts = self._now()`
+        themselves (this helper does not touch the timestamp, only the
+        latch — keeping the call sites' existing semantics intact).
+        """
+        self._action_failed_since_last_ok = False
+
+    def _mark_device_unreachable(self, reason: str) -> None:
+        """Demote device health after an unexpected device-side failure.
+
+        Sets `_device_reachable = False` and transitions
+        `_device_state` to DEGRADED (unless already DISCONNECTED). Also
+        sets `_action_failed_since_last_ok = True` — a latch that
+        prevents `_apply_telemetry_quality_state` (and the no-
+        telemetry-signals branch of `_publish_telemetry`) from
+        silently promoting the device back to OK on the next
+        telemetry tick. Telemetry runs on a different code path from
+        get/set/command and can succeed even while every action call
+        fails (e.g. driver caches the last-known telemetry values
+        but every set_property to the hardware raises VISA timeout).
+
+        The latch is cleared by the action-success paths that already
+        set `_last_ok_ts` — so once an operator retries the failing
+        operation and it succeeds, telemetry can promote normally on
+        the next tick.
+
+        Records `reason` into `_last_error` (capped at ~200 chars).
+        """
+        self._device_reachable = False
+        if self._device_state != DeviceState.DISCONNECTED:
+            self._device_state = DeviceState.DEGRADED
+        self._action_failed_since_last_ok = True
+        if len(reason) > 200:
+            reason = reason[:197] + "..."
+        self._last_error = reason
 
     def _rpc_route_status(self, req: dict[str, Any]) -> dict[str, Any]:
         req_id = req.get("id")
@@ -1319,6 +1489,9 @@ class DeviceRunner:
         self._device_state = DeviceState.OK
         self._last_ok_ts = self._now()
         self._last_error = None
+        # Fresh successful connect clears the action-failure latch from
+        # any prior session.
+        self._mark_action_succeeded()
         try:
             self._refresh_capabilities_cache()
         except Exception:
@@ -1388,10 +1561,17 @@ class DeviceRunner:
             return self._rpc_error(req_id, "Device is disconnected")
 
         if action in self._stream_rpc:
-            result = self._stream_rpc[action](**params)
+            try:
+                result = self._stream_rpc[action](**params)
+            except Exception as exc:
+                self._mark_device_unreachable(
+                    f"stream rpc {action!r} failed: {exc!r}"
+                )
+                raise
             self._device_reachable = True
             self._last_ok_ts = self._now()
             self._last_error = None
+            self._mark_action_succeeded()
             return self._rpc_ok(req_id, result)
 
         # Forward to subclass command handler (with optional coercion).
@@ -1415,10 +1595,17 @@ class DeviceRunner:
                         ) from e
             params = coerced
 
-        result = self.handle_command(action, params)
+        try:
+            result = self.handle_command(action, params)
+        except Exception as exc:
+            self._mark_device_unreachable(
+                f"command {action!r} failed: {exc!r}"
+            )
+            raise
         self._device_reachable = True
         self._last_ok_ts = self._now()
         self._last_error = None
+        self._mark_action_succeeded()
         return self._rpc_ok(req_id, result)
 
     def _handle_rpc_request(self, req: dict[str, Any]) -> dict[str, Any]:
@@ -1489,10 +1676,24 @@ class DeviceRunner:
             if self.telemetry_signal_names():
                 self._apply_telemetry_quality_state(signals)
             else:
-                self._device_reachable = True
-                if self._device_state == DeviceState.DISCONNECTED:
-                    self._device_state = DeviceState.OK
-                self._last_error = None
+                # Devices without telemetry signals had read_telemetry
+                # return cleanly (no exception). Previously this
+                # unconditionally promoted to OK every tick — silently
+                # erasing any `_mark_device_unreachable` from a failed
+                # action call. Gate the promote on the action-failure
+                # latch so the demotion survives until an action
+                # actually succeeds.
+                if not self._action_failed_since_last_ok:
+                    self._device_reachable = True
+                    if self._device_state == DeviceState.DISCONNECTED:
+                        self._device_state = DeviceState.OK
+                    self._last_error = None
+                else:
+                    self._device_reachable = False
+                    if self._device_state != DeviceState.DISCONNECTED:
+                        self._device_state = DeviceState.DEGRADED
+                    # Keep the action-failure _last_error as set by
+                    # _mark_device_unreachable.
             if self._device_reachable:
                 self._last_ok_ts = bundle_ts
         except Exception as e:
@@ -1502,14 +1703,24 @@ class DeviceRunner:
                 self._device_state = DeviceState.DEGRADED
             self._last_error = f"telemetry read failed: {e!r}"
             signals = {}
+            # read_telemetry didn't get a chance to populate per-call errors
+            # for this exceptional path, but we still want operators to see
+            # the failure. Record under a synthetic key.
+            err_text = self._telemetry_format_error(e)
+            self._telemetry_last_call_errors = {"<read_telemetry>": err_text}
+            self._telemetry_log_call_exception("<read_telemetry>", e)
 
-        payload = {
+        payload: dict[str, Any] = {
             "version": 1,
             "device_id": self.device_id,
             "seq": self._telemetry_seq,
             "ts": self._ts_dict(bundle_ts),
             "signals": self._serialize_signals(signals, bundle_ts=bundle_ts),
         }
+        # Surface per-call errors at the bundle level so the UI can show why
+        # the device went DEGRADED without operators having to read stderr.
+        if self._telemetry_last_call_errors:
+            payload["call_errors"] = dict(self._telemetry_last_call_errors)
 
         topic = f"{self.device_id}/telemetry".encode()
         self.pub.send_multipart([topic, json.dumps(payload).encode()])
@@ -1630,6 +1841,7 @@ class DeviceRunner:
                     attr_name=attr_name,
                     kwargs=kwargs,
                     outputs=outs,
+                    method=call.method,
                 )
             )
         self._telemetry_plan = plan
@@ -1751,6 +1963,7 @@ class DeviceRunner:
             units = s.get("units")
             quality = s.get("quality", "OK")
             ts_obj = s.get("ts")
+            error = s.get("error")
 
             if units is not None and not isinstance(units, str):
                 units = str(units)
@@ -1776,12 +1989,20 @@ class DeviceRunner:
                 else:
                     ts_dict = None
 
-            out[name] = {
+            serialized: dict[str, Any] = {
                 "value": value,
                 "units": units,
                 "quality": quality,
                 "ts": ts_dict,  # None means use TelemetryUpdate.ts
             }
+            if error is not None:
+                # Coerce to str defensively in case a driver puts a non-str
+                # error value through; truncate to keep the payload bounded.
+                error_text = str(error)
+                if len(error_text) > 200:
+                    error_text = error_text[:197] + "..."
+                serialized["error"] = error_text
+            out[name] = serialized
 
         return out
 
