@@ -136,6 +136,110 @@ class HandleRpcLockTests(unittest.TestCase):
         _simulated_call()  # must not deadlock
 
 
+class CloseRpcBoundedWaitTests(unittest.TestCase):
+    """Regression for the deploy-safety review finding: an external
+    _close_*_rpc caller on the main thread blocks on rpc_lock when a
+    worker is mid-call. Without a bounded wait, contention can stall
+    the main loop for up to rpc_timeout_ms (~1.5s) and falsely trigger
+    a manager.loop_stall warning. The fix uses
+    `acquire(timeout=_CLOSE_RPC_LOCK_WAIT_S)` so the main thread
+    gives up after the bounded window."""
+
+    def _make_manager_stub(self) -> SimpleNamespace:
+        # Build a Manager-shaped stub just enough to invoke the close
+        # methods. We need to invoke the actual Manager methods
+        # (bound to the class), so use a real Manager instance via
+        # __new__ to bypass __init__.
+        from experiment_control.manager import Manager
+
+        mgr = object.__new__(Manager)
+        return mgr  # type: ignore[return-value]
+
+    def test_close_device_rpc_gives_up_after_bounded_wait(self) -> None:
+        from experiment_control.manager import Manager
+
+        spec = SimpleNamespace(device_id="d1")
+        h = DeviceHandle(spec=spec)  # type: ignore[arg-type]
+        # Pretend a socket exists so the close path has something to
+        # operate on; use a sentinel that records .close() calls.
+        class _SentinelSock:
+            closed = False
+
+            def close(self, **_kw) -> None:
+                _SentinelSock.closed = True
+
+        h.rpc_sock = _SentinelSock()  # type: ignore[assignment]
+
+        mgr = self._make_manager_stub()
+        # Hold the lock from another thread; main thread should give
+        # up after _CLOSE_RPC_LOCK_WAIT_S and leave the socket intact.
+        holder_acquired = threading.Event()
+        release_holder = threading.Event()
+
+        def _holder() -> None:
+            with h.rpc_lock:
+                holder_acquired.set()
+                release_holder.wait(timeout=5.0)
+
+        t = threading.Thread(target=_holder, daemon=True)
+        t.start()
+        self.assertTrue(holder_acquired.wait(timeout=2.0))
+
+        # Cap the wait to half a second for the test (matches the
+        # production constant), but use a shorter local override to
+        # keep the test fast.
+        original_wait = Manager._CLOSE_RPC_LOCK_WAIT_S
+        Manager._CLOSE_RPC_LOCK_WAIT_S = 0.05  # type: ignore[misc]
+        try:
+            t_start = threading.Event()
+            t_done = threading.Event()
+
+            def _attempt_close() -> None:
+                t_start.set()
+                Manager._close_device_rpc(mgr, h)
+                t_done.set()
+
+            attempt = threading.Thread(target=_attempt_close, daemon=True)
+            attempt.start()
+            self.assertTrue(t_start.wait(timeout=2.0))
+            # The close attempt should give up after ~50ms; allow
+            # generous slack on CI.
+            self.assertTrue(
+                t_done.wait(timeout=2.0),
+                "_close_device_rpc must give up after the bounded "
+                "wait when the lock is held; otherwise the main loop "
+                "stalls until the lock holder releases",
+            )
+            # Socket was NOT closed (worker's except branch handles it).
+            self.assertFalse(_SentinelSock.closed)
+            # rpc_sock NOT cleared (the close was bypassed).
+            self.assertIs(h.rpc_sock.__class__, _SentinelSock)
+        finally:
+            Manager._CLOSE_RPC_LOCK_WAIT_S = original_wait  # type: ignore[misc]
+            release_holder.set()
+            t.join(timeout=2.0)
+
+    def test_close_device_rpc_succeeds_when_uncontended(self) -> None:
+        from experiment_control.manager import Manager
+
+        spec = SimpleNamespace(device_id="d1")
+        h = DeviceHandle(spec=spec)  # type: ignore[arg-type]
+
+        class _SentinelSock:
+            closed = False
+
+            def close(self, **_kw) -> None:
+                _SentinelSock.closed = True
+
+        h.rpc_sock = _SentinelSock()  # type: ignore[assignment]
+        h.rpc_fail_count = 7
+        mgr = self._make_manager_stub()
+        Manager._close_device_rpc(mgr, h)
+        self.assertTrue(_SentinelSock.closed)
+        self.assertIsNone(h.rpc_sock)
+        self.assertEqual(h.rpc_fail_count, 0)
+
+
 # ---------------------------------------------------------------------------
 # F.19 — ManagerTUI bulk worker
 # ---------------------------------------------------------------------------
