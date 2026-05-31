@@ -666,7 +666,7 @@ class InterlockProcess(ManagedProcessBase):
             "routes": routes,
             "replace": True,
         }
-        resp = self._manager.call(payload)
+        resp = self._require_manager().call(payload)
         if resp is None:
             raise RuntimeError("Failed to register interlock routes: no response")
         if not isinstance(resp, dict) or not resp.get("ok", False):
@@ -1068,7 +1068,7 @@ class InterlockProcess(ManagedProcessBase):
                 verdict, new_cmd, err = evaluate_interlock_rule(
                     rule=rule,
                     cmd=cur_cmd,
-                    telemetry_getter=self._manager.get_latest,
+                    telemetry_getter=self._require_manager().get_latest,
                     now_mono=now_mono,
                 )
                 if verdict == "reject":

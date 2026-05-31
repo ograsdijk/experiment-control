@@ -722,7 +722,7 @@ class WatchdogProcess(ManagedProcessBase):
                 timeout_ms = None
                 if action.timeout_s is not None:
                     timeout_ms = max(1, int(float(action.timeout_s) * 1000))
-                resp = self._manager.call(req, timeout_ms=timeout_ms)
+                resp = self._require_manager().call(req, timeout_ms=timeout_ms)
                 if resp is not None and _resp_ok(resp):
                     break
                 error = resp if resp is not None else "timeout"
@@ -747,7 +747,7 @@ class WatchdogProcess(ManagedProcessBase):
                 triggered, _alarm, unknown, snapshot = evaluate_watchdog_rule(
                     rule=rule,
                     state=state,
-                    telemetry_getter=self._manager.get_latest,
+                    telemetry_getter=self._require_manager().get_latest,
                     now_mono=now_mono,
                 )
                 if triggered:
