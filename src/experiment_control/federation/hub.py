@@ -455,6 +455,12 @@ class FederationHub:
     def _relay_event(self, peer_rt: PeerRuntime, topic: str, payload: Json) -> None:
         local_id = self._resolve_local_id(peer_rt, topic, payload)
         if local_id is None:
+            # No matching mirrored device. If `only_mirrored_devices=True`
+            # (the default), drop. Otherwise relay the event verbatim so
+            # peer-level events (system logs etc.) reach the local bus.
+            if peer_rt.config.relay.only_mirrored_devices:
+                return
+            self._relay_event_verbatim(peer_rt, topic, payload)
             return
         mirror = self._mirrors.get(local_id)
         if mirror is None:
@@ -481,6 +487,29 @@ class FederationHub:
             return
         self._manager._publish_manager_event(topic, rewritten)
 
+    def _relay_event_verbatim(
+        self, peer_rt: PeerRuntime, topic: str, payload: Json
+    ) -> None:
+        """Relay a peer event with no associated mirrored device.
+
+        Reached only when `relay.only_mirrored_devices=False`. The payload is
+        passed through with origin metadata appended (peer id + remote_is_peer
+        marker) but no `device_id` rewriting, since there's no local mirror to
+        map to. Heartbeat/telemetry topics are dropped here because they would
+        otherwise inject orphan state into the manager's caches.
+        """
+        if topic in {"manager.heartbeat", "manager.telemetry_update"}:
+            return
+        out = dict(payload)
+        if peer_rt.config.relay.include_origin_meta:
+            out.setdefault("source_kind", "federated")
+            out.setdefault("is_remote", True)
+            out.setdefault("owner_peer_id", peer_rt.config.peer_id)
+        if topic == "manager.log":
+            self._manager._emit_log_from_payload(out, default_topic=topic)
+            return
+        self._manager._publish_manager_event(topic, out)
+
     def _resolve_local_id(
         self, peer_rt: PeerRuntime, topic: str, payload: Json
     ) -> str | None:
@@ -503,7 +532,7 @@ class FederationHub:
                 remote_id = str(after_raw.get("device_id")).strip()
 
         if not remote_id:
-            return None if peer_rt.config.relay.only_mirrored_devices else None
+            return None
 
         for mirror in self._mirrors.values():
             if (
