@@ -37,6 +37,14 @@ from .utils.rpc_dispatch import RpcDispatchRegistry
 from .utils.value_coercion import coerce_scalar
 
 
+# Cap on inbound REP message size set on the driver's RPC socket via
+# zmq.MAXMSGSIZE in `connect_ipc`. The manager's normal RPC envelope
+# (action + params) is < 16 KiB; 1 MiB is well above any legitimate
+# request and well below what a malicious / misbehaving client could
+# use to wedge the driver loop on a giant recv allocation.
+_DRIVER_RPC_MAX_MSG_BYTES = 1 * 1024 * 1024
+
+
 class Device(Protocol):
     """
     Minimal interface expected from a device object.
@@ -851,6 +859,17 @@ class DeviceRunner:
     # ----------------------------
 
     def connect_ipc(self) -> None:
+        # Cap inbound REP message size at 1 MiB. The manager's
+        # call_device_rpc envelope is normally < 16 KiB (action +
+        # params), so 1 MiB is well above any legitimate request.
+        # Without the cap, a misbehaving (or malicious) client sending
+        # an oversize JSON payload would have the recv_json call
+        # below allocate up to MAXMSGSIZE (default unlimited),
+        # potentially wedging the driver loop on a large allocation.
+        # libzmq enforces MAXMSGSIZE at the recv layer; oversize
+        # messages are dropped at the source socket and the client
+        # gets a disconnect.
+        self.rpc.setsockopt(zmq.MAXMSGSIZE, _DRIVER_RPC_MAX_MSG_BYTES)
         rpc_port = self.rpc.bind_to_random_port("tcp://127.0.0.1")
         pub_port = self.pub.bind_to_random_port("tcp://127.0.0.1")
         self.rpc_endpoint = f"tcp://127.0.0.1:{rpc_port}"
@@ -1237,7 +1256,15 @@ class DeviceRunner:
             or name in {"connect", "disconnect"}
         ):
             return self._rpc_error(req_id, "Invalid member name")
-        value = getattr(self._device, name)
+        try:
+            value = getattr(self._device, name)
+        except Exception as exc:
+            # The device's getattr raised (e.g. VISA read error, hardware
+            # disconnect mid-call). Demote health so the manager sees the
+            # device as DEGRADED on its next heartbeat / telemetry tick
+            # instead of continuing to report "OK" while every read fails.
+            self._mark_device_unreachable(f"get {name!r} failed: {exc!r}")
+            return self._rpc_error(req_id, f"get failed: {exc}")
         return self._rpc_ok(req_id, _jsonable_value(value))
 
     def _rpc_route_set(self, req: dict[str, Any]) -> dict[str, Any]:
@@ -1270,8 +1297,37 @@ class DeviceRunner:
                 value = _coerce_simple_value(value, kind)
             except Exception:
                 return self._rpc_error(req_id, "Failed to coerce value")
-        setattr(self._device, name, value)
+        try:
+            setattr(self._device, name, value)
+        except Exception as exc:
+            # See _rpc_route_get for rationale: a failed setattr on the
+            # underlying device (VISA write error, hardware disconnect,
+            # validation rejection inside a property setter, etc.) must
+            # not leave the device looking OK in the next telemetry
+            # bundle while every subsequent get/set silently fails.
+            self._mark_device_unreachable(f"set {name!r} failed: {exc!r}")
+            return self._rpc_error(req_id, f"set failed: {exc}")
         return self._rpc_ok(req_id, None)
+
+    def _mark_device_unreachable(self, reason: str) -> None:
+        """Demote device health after an unexpected device-side failure.
+
+        Sets `_device_reachable = False` and transitions
+        `_device_state` to DEGRADED (unless already DISCONNECTED). The
+        next telemetry tick's `_apply_telemetry_quality_state` may
+        promote back to OK if telemetry comes through fine — this just
+        avoids the window where a single failed get/set/command leaves
+        the device looking healthy while in fact every operation is
+        failing.
+
+        Records `reason` into `_last_error` (capped at ~200 chars).
+        """
+        self._device_reachable = False
+        if self._device_state != DeviceState.DISCONNECTED:
+            self._device_state = DeviceState.DEGRADED
+        if len(reason) > 200:
+            reason = reason[:197] + "..."
+        self._last_error = reason
 
     def _rpc_route_status(self, req: dict[str, Any]) -> dict[str, Any]:
         req_id = req.get("id")
@@ -1388,7 +1444,13 @@ class DeviceRunner:
             return self._rpc_error(req_id, "Device is disconnected")
 
         if action in self._stream_rpc:
-            result = self._stream_rpc[action](**params)
+            try:
+                result = self._stream_rpc[action](**params)
+            except Exception as exc:
+                self._mark_device_unreachable(
+                    f"stream rpc {action!r} failed: {exc!r}"
+                )
+                raise
             self._device_reachable = True
             self._last_ok_ts = self._now()
             self._last_error = None
@@ -1415,7 +1477,13 @@ class DeviceRunner:
                         ) from e
             params = coerced
 
-        result = self.handle_command(action, params)
+        try:
+            result = self.handle_command(action, params)
+        except Exception as exc:
+            self._mark_device_unreachable(
+                f"command {action!r} failed: {exc!r}"
+            )
+            raise
         self._device_reachable = True
         self._last_ok_ts = self._now()
         self._last_error = None
