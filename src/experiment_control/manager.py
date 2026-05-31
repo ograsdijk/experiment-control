@@ -1012,6 +1012,14 @@ class Manager:
         self._log_history: deque[Json] = deque(maxlen=self._log_history_size)
         self._supervisor_log_queue: queue.Queue[Json] = queue.Queue(maxsize=5000)
         self._supervisor_log_dropped = 0
+        # _supervisor_log_dropped is incremented from per-log-stream
+        # reader threads (one per managed-process stdout/stderr) and
+        # reset from the main thread's drain_supervisor_logs. CPython's
+        # `+=` on an int attribute decomposes into get + add + set,
+        # which is not atomic across threads — concurrent bumps lose
+        # counts. Guard the increment and the snapshot-and-reset with
+        # this lock so the drop count remains accurate under load.
+        self._supervisor_log_dropped_lock = threading.Lock()
         self._supervisor_log_threads: dict[
             tuple[str, str, int, str], threading.Thread
         ] = {}
@@ -1166,7 +1174,17 @@ class Manager:
         )
         self._lifecycle_device_locks: dict[str, threading.Lock] = {}
         self._lifecycle_reply_queue: queue.Queue[tuple[bytes, Json]] = queue.Queue()
-        self._lifecycle_event_queue: queue.Queue[tuple[str, Json]] = queue.Queue()
+        # Bound the event queue so a stalled main-thread publisher (e.g.
+        # a slow event hook) can't let lifecycle workers grow it
+        # unboundedly. 10000 is well above realistic burst sizes (the
+        # main loop drains every tick at ~10-100Hz) but small enough
+        # that a true stall surfaces as drops + a counter operators can
+        # see, instead of as silent memory growth followed by OOM.
+        self._lifecycle_event_queue: queue.Queue[tuple[str, Json]] = queue.Queue(
+            maxsize=10_000
+        )
+        self._lifecycle_event_dropped = 0
+        self._lifecycle_event_dropped_lock = threading.Lock()
 
         # Per-socket monotonic timestamp of the last "drain cap hit"
         # event we published. Used to rate-limit drain-cap-hit notifications
@@ -2401,7 +2419,7 @@ class Manager:
             try:
                 topic, payload = self._lifecycle_event_queue.get_nowait()
             except queue.Empty:
-                return
+                break
             try:
                 # Calls into manager_pubsub.publish_manager_event on the
                 # main thread — the off-thread redirect check will see
@@ -2426,6 +2444,35 @@ class Manager:
                     )
                 except Exception:
                     pass
+
+        # After draining what we can, surface any events that publish
+        # workers had to drop because the bounded queue was full. Snapshot
+        # + reset under the lock so concurrent worker drops aren't lost.
+        # Without this, _lifecycle_event_dropped would silently grow and
+        # operators would have no signal that lifecycle events were being
+        # lost.
+        with self._lifecycle_event_dropped_lock:
+            dropped = int(self._lifecycle_event_dropped)
+            self._lifecycle_event_dropped = 0
+        if dropped > 0:
+            try:
+                self._emit_log(
+                    severity="warning",
+                    topic="manager.lifecycle.events_dropped",
+                    message=(
+                        f"Lifecycle event queue full; dropped {dropped} events "
+                        f"(non-audit topics; audit topics block briefly before "
+                        f"falling back to the drop counter — see "
+                        f"manager_pubsub._AUDIT_TOPICS)"
+                    ),
+                    source_kind="manager",
+                    source_id="manager",
+                    stream="event",
+                    payload={"dropped": dropped},
+                )
+            except Exception:
+                # Never let observability break the main loop.
+                pass
 
     def _route_internal_request(self, req: Json) -> Json:
         return shared_route_internal_request(self, req)

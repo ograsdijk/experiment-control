@@ -564,6 +564,15 @@ class HdfWriter(ManagedProcessBase):
         self._next_write = 0.0
 
         self._error_counts: dict[str, int] = {}
+        # _bump_error fires on both the main thread (drain handlers, RPC
+        # handlers) and the bg flush thread. CPython dict mutation is
+        # NOT atomic across threads in the way `+=` on an attribute
+        # suggests — the get + assignment can interleave with another
+        # thread's bump on the same key, losing counts. Guard with a
+        # small lock; reads via the public _error_counts attribute (used
+        # by the bg-thread-failure tests) take a momentary snapshot to
+        # avoid mid-mutation reads of any single bucket.
+        self._error_counts_lock = threading.Lock()
 
         # Background-flush plumbing. The bg thread, once spawned in run(),
         # consumes _FlushBatch (fire-and-forget) and _BgRequest (synchronous)
@@ -767,7 +776,8 @@ class HdfWriter(ManagedProcessBase):
         return sum(len(items) for items in self._stream_context_by_seq.values())
 
     def _bump_error(self, key: str) -> None:
-        self._error_counts[key] = self._error_counts.get(key, 0) + 1
+        with self._error_counts_lock:
+            self._error_counts[key] = self._error_counts.get(key, 0) + 1
 
     def _resolve_output_path(
         self, filename: str | None, *, use_default_filename: bool

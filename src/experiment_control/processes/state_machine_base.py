@@ -405,8 +405,17 @@ class StateMachineProcessBase(ManagedProcessBase):
                 topic="manager.state_machine.transition",
                 payload=payload,
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            # Record the publish failure on the process's last_error
+            # so an operator inspecting `status` sees that the bus
+            # event was dropped, instead of the failure being
+            # silently swallowed by `except: pass`. Don't overwrite
+            # a more meaningful pre-existing error.
+            if not self._last_error:
+                self._last_error = (
+                    f"failed to publish transition event "
+                    f"{from_state!s} -> {to_state!s}: {exc!r}"
+                )
 
     def _on_state_exit(
         self,
