@@ -747,6 +747,14 @@ def stop_process_handle(manager: Any, handle: Any) -> None:
     if handle.popen.poll() is not None:
         rc = handle.popen.poll()
         handle.last_exit_code = rc
+        # Capture the pid BEFORE clearing popen so the FAILED branch
+        # below can populate handle.last_failure_pid. Mirrors the same
+        # capture-before-clear pattern in update_managed_process_exit_state
+        # (line 1199); without it, consumers of manager.process.failed
+        # (manager.py:3253 reads handle.last_failure_pid for the failure
+        # report) see stale-or-None pid only on this stop-detected-crash
+        # code path.
+        exiting_pid = handle.popen_pid or handle.pid
         handle.popen = None
         handle.rpc_endpoint = None
         manager._close_process_rpc(handle)
@@ -759,6 +767,7 @@ def stop_process_handle(manager: Any, handle: Any) -> None:
         # diagnostic.
         if isinstance(rc, int) and rc != 0:
             handle.state = _enum_member(handle.state, "FAILED")
+            handle.last_failure_pid = exiting_pid
             handle.last_signal_name = derive_signal_name(int(rc))
             handle.last_error_kind = (
                 handle.last_error_kind or "nonzero_exit"

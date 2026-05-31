@@ -588,8 +588,8 @@ def route_manager_cleanup_orphans(manager: Any, req: Json) -> Json:
     try:
         dry_run = bool(params.get("dry_run", False))
         stale_only = bool(params.get("stale_only", True))
-        timeout_s = float(params.get("timeout_s", 2.0))
-        if timeout_s <= 0:
+        timeout_s_requested = float(params.get("timeout_s", 2.0))
+        if timeout_s_requested <= 0:
             raise ValueError("timeout_s must be > 0")
         # Cap operator-supplied timeout so a misconfigured client can't
         # block the manager loop for minutes. The cleanup-orphans path
@@ -597,8 +597,10 @@ def route_manager_cleanup_orphans(manager: Any, req: Json) -> Json:
         # RPC handler; a 30s ceiling is well above the realistic
         # cleanup time (typically <1s for a handful of orphan PIDs)
         # while bounding worst-case manager unresponsiveness.
-        if timeout_s > _CLEANUP_ORPHANS_TIMEOUT_CAP_S:
+        if timeout_s_requested > _CLEANUP_ORPHANS_TIMEOUT_CAP_S:
             timeout_s = _CLEANUP_ORPHANS_TIMEOUT_CAP_S
+        else:
+            timeout_s = timeout_s_requested
     except Exception as exc:
         return {
             "ok": False,
@@ -609,6 +611,14 @@ def route_manager_cleanup_orphans(manager: Any, req: Json) -> Json:
         stale_only=stale_only,
         timeout_s=timeout_s,
     )
+    # Echo the effective timeout (and the requested one when clamped) so
+    # a caller asking for 60s can tell their budget was reduced. Without
+    # this, a partial-scan-due-to-clamping result is indistinguishable
+    # from a clean "no orphans found" outcome.
+    if isinstance(result, dict):
+        result.setdefault("timeout_s_effective", float(timeout_s))
+        if timeout_s_requested != timeout_s:
+            result.setdefault("timeout_s_requested", float(timeout_s_requested))
     manager._record_orphan_cleanup(source="rpc", summary=result)
     manager._publish_manager_event(
         "manager.orphan_cleanup",

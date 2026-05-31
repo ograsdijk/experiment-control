@@ -244,6 +244,58 @@ class LifecycleEventQueueOverflowTests(unittest.TestCase):
         publish_manager_event(mgr, "manager.test", {"i": 3})
         self.assertEqual(mgr._lifecycle_event_dropped, 2)
 
+    def test_audit_topic_blocks_for_drain_instead_of_dropping(self) -> None:
+        """Regression for review finding: audit-critical topics
+        (manager.command and related) must not be silently dropped on
+        queue overflow. They block briefly to give the main thread time
+        to drain; only after the audit-publish budget elapses do they
+        fall back to the drop counter.
+        """
+        import time as _time
+
+        main_id = threading.get_ident()
+        mgr = SimpleNamespace(
+            _main_thread_id=main_id + 999,  # off-main-thread
+            _lifecycle_event_queue=queue.Queue(maxsize=1),
+            _lifecycle_event_dropped=0,
+            _lifecycle_event_dropped_lock=threading.Lock(),
+        )
+        # Fill the queue with a non-audit event so the next audit put
+        # blocks.
+        publish_manager_event(mgr, "manager.test", {"i": 0})
+        self.assertEqual(mgr._lifecycle_event_queue.qsize(), 1)
+        self.assertEqual(mgr._lifecycle_event_dropped, 0)
+
+        # A separate consumer drains the queue after a brief delay,
+        # giving the blocking publish_manager_event call a chance to
+        # succeed. Without the blocking-put change, the audit event
+        # would be dropped immediately and the counter bumped.
+        def _consume_after_delay():
+            _time.sleep(0.1)
+            try:
+                mgr._lifecycle_event_queue.get_nowait()
+            except queue.Empty:
+                pass
+
+        threading.Thread(target=_consume_after_delay, daemon=True).start()
+
+        t0 = _time.monotonic()
+        publish_manager_event(mgr, "manager.command", {"cmd": "set"})
+        elapsed = _time.monotonic() - t0
+        # The audit put waited for the drain (some real time elapsed)
+        # but eventually succeeded; no drop bumped.
+        self.assertGreater(
+            elapsed,
+            0.05,
+            f"audit publish should have waited for drain, only took {elapsed:.3f}s",
+        )
+        self.assertEqual(mgr._lifecycle_event_dropped, 0)
+        self.assertEqual(mgr._lifecycle_event_queue.qsize(), 1)
+        # And the queued entry is the audit event itself.
+        topic, payload = mgr._lifecycle_event_queue.get_nowait()
+        self.assertEqual(topic, "manager.command")
+        self.assertEqual(payload, {"cmd": "set"})
+
 
 # ---------------------------------------------------------------------------
 # F.32 — stop_process_handle publishes .failed on non-zero exit
@@ -258,17 +310,20 @@ class _FakePopenExited:
         return self._rc
 
 
-def _make_stop_handle(popen) -> SimpleNamespace:
+def _make_stop_handle(popen, *, pid: int = 12345) -> SimpleNamespace:
     spec = SimpleNamespace(process_id="p1")
     return SimpleNamespace(
         spec=spec,
         state="RUNNING",
         popen=popen,
+        popen_pid=pid,
+        pid=pid,
         rpc_endpoint=None,
         last_exit_code=None,
         last_error=None,
         last_error_kind=None,
         last_signal_name=None,
+        last_failure_pid=None,
     )
 
 
@@ -285,7 +340,7 @@ class StopProcessHandleNonZeroExitTests(unittest.TestCase):
         self.assertEqual([e[0] for e in events], ["manager.process.exited"])
 
     def test_nonzero_exit_publishes_failed_with_diagnostic(self) -> None:
-        handle = _make_stop_handle(_FakePopenExited(137))  # SIGKILL
+        handle = _make_stop_handle(_FakePopenExited(137), pid=99999)  # SIGKILL
         events: list[tuple[str, object]] = []
         mgr = SimpleNamespace(
             _publish_process_event=lambda topic, h: events.append((topic, h)),
@@ -298,6 +353,11 @@ class StopProcessHandleNonZeroExitTests(unittest.TestCase):
         self.assertEqual(handle.last_error_kind, "nonzero_exit")
         self.assertIsNotNone(handle.last_error)
         self.assertIn("exited", handle.last_error)
+        # Regression for review finding: last_failure_pid must be the
+        # pid of the process that just crashed, not None. Without the
+        # capture-before-clear, consumers of manager.process.failed
+        # (manager.py:3253) see stale-or-None here.
+        self.assertEqual(handle.last_failure_pid, 99999)
 
 
 # ---------------------------------------------------------------------------
@@ -327,6 +387,16 @@ class CleanupOrphansTimeoutCapTests(unittest.TestCase):
         self.assertEqual(
             called_with["timeout_s"], _CLEANUP_ORPHANS_TIMEOUT_CAP_S
         )
+        # Regression for review finding: the response must surface the
+        # effective and requested timeouts so a caller asking for 60s
+        # can tell their budget was clamped. Without this, a partial-
+        # scan-due-to-clamping result is indistinguishable from a clean
+        # "no orphans found" outcome.
+        result = resp.get("result", {})
+        self.assertEqual(
+            result.get("timeout_s_effective"), _CLEANUP_ORPHANS_TIMEOUT_CAP_S
+        )
+        self.assertEqual(result.get("timeout_s_requested"), 999999.0)
 
     def test_reasonable_timeout_not_modified(self) -> None:
         called_with: dict[str, object] = {}
@@ -346,6 +416,12 @@ class CleanupOrphansTimeoutCapTests(unittest.TestCase):
         )
         self.assertTrue(resp.get("ok"))
         self.assertEqual(called_with["timeout_s"], 5.0)
+        # Echo confirms the effective value. timeout_s_requested is
+        # omitted when no clamping occurred (no need to clutter the
+        # happy path).
+        result = resp.get("result", {})
+        self.assertEqual(result.get("timeout_s_effective"), 5.0)
+        self.assertNotIn("timeout_s_requested", result)
 
     def test_invalid_timeout_returns_error(self) -> None:
         mgr = SimpleNamespace(

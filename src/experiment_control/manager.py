@@ -2419,7 +2419,7 @@ class Manager:
             try:
                 topic, payload = self._lifecycle_event_queue.get_nowait()
             except queue.Empty:
-                return
+                break
             try:
                 # Calls into manager_pubsub.publish_manager_event on the
                 # main thread — the off-thread redirect check will see
@@ -2444,6 +2444,35 @@ class Manager:
                     )
                 except Exception:
                     pass
+
+        # After draining what we can, surface any events that publish
+        # workers had to drop because the bounded queue was full. Snapshot
+        # + reset under the lock so concurrent worker drops aren't lost.
+        # Without this, _lifecycle_event_dropped would silently grow and
+        # operators would have no signal that lifecycle events were being
+        # lost.
+        with self._lifecycle_event_dropped_lock:
+            dropped = int(self._lifecycle_event_dropped)
+            self._lifecycle_event_dropped = 0
+        if dropped > 0:
+            try:
+                self._emit_log(
+                    severity="warning",
+                    topic="manager.lifecycle.events_dropped",
+                    message=(
+                        f"Lifecycle event queue full; dropped {dropped} events "
+                        f"(non-audit topics; audit topics block briefly before "
+                        f"falling back to the drop counter — see "
+                        f"manager_pubsub._AUDIT_TOPICS)"
+                    ),
+                    source_kind="manager",
+                    source_id="manager",
+                    stream="event",
+                    payload={"dropped": dropped},
+                )
+            except Exception:
+                # Never let observability break the main loop.
+                pass
 
     def _route_internal_request(self, req: Json) -> Json:
         return shared_route_internal_request(self, req)
