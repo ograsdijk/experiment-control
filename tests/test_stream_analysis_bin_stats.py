@@ -10,7 +10,13 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from experiment_control.processes.stream_analysis import BinStatsState, compile_workspace_graph
+from experiment_control.processes.stream_analysis import (
+    BinStatsState,
+    FitCurve1DState,
+    compile_workspace_graph,
+    execute_fit_curve_1d,
+    execute_fit_from_hist_agg,
+)
 
 
 class BinStatsStateTests(unittest.TestCase):
@@ -122,6 +128,55 @@ class BinStatsStateTests(unittest.TestCase):
         self.assertEqual(payload["active_bin_count"], 4)
         self.assertEqual(sum(payload["count"]), 5)
         self.assertNotEqual(payload["x_bins"], [0.0, 0.1, 0.2, 0.3, 1.0])
+
+
+class FitCurveStalenessTests(unittest.TestCase):
+    def test_fit_curve_preserves_last_fit_with_attempt_and_success_timestamps(self) -> None:
+        state = FitCurve1DState.from_params({"model": "gaussian"})
+        first = execute_fit_curve_1d(
+            state=state,
+            x_raw=[-2.0, -1.0, 0.0, 1.0, 2.0],
+            y_raw=[0.1, 0.5, 1.0, 0.5, 0.1],
+            gate_raw=True,
+        )
+        self.assertIsNotNone(first)
+        assert first is not None
+        success_ts = first["last_fit_success_ts_mono"]
+        attempt_ts = first["last_fit_attempt_ts_mono"]
+        self.assertIsNotNone(success_ts)
+        self.assertGreaterEqual(attempt_ts, 0.0)
+
+        second = execute_fit_curve_1d(
+            state=state,
+            x_raw=[1.0],
+            y_raw=[float("nan")],
+            gate_raw=True,
+        )
+
+        self.assertIs(second, first)
+        self.assertGreater(second["last_fit_attempt_ts_mono"], attempt_ts)
+        self.assertEqual(second["last_fit_success_ts_mono"], success_ts)
+
+    def test_fit_from_hist_marks_attempt_when_hist_unfittable(self) -> None:
+        state = FitCurve1DState.from_params({"model": "gaussian"})
+        state.last_fit = {"params": {"model": "gaussian"}}
+        state.last_fit_success_ts_mono = 1.0
+
+        out = execute_fit_from_hist_agg(
+            state=state,
+            hist_raw=None,
+            gate_raw=True,
+            y_source="mean",
+            chi2_sigma_source="sem",
+            min_count=1,
+            x_min=None,
+            x_max=None,
+        )
+
+        self.assertIs(out, state.last_fit)
+        assert out is not None
+        self.assertGreater(out["last_fit_attempt_ts_mono"], 0.0)
+        self.assertEqual(out["last_fit_success_ts_mono"], 1.0)
 
 
 if __name__ == "__main__":
