@@ -29,7 +29,6 @@ import numpy as np
 from experiment_control.utils.zmq_helpers import json_dumps  # noqa: E402
 from experiment_control.processes.stream_analysis import (  # noqa: E402
     BinStatsState,
-    Bin2DStatsState,
     _sanitize_json as stream_analysis_sanitize_json,
 )
 
@@ -155,7 +154,7 @@ def bench_bin_stats(rows: list[Row]) -> None:
             update()
 
         r = time_call(
-            f"bin_stats.update_sample",
+            "bin_stats.update_sample",
             f"{bin_count} bins",
             update,
             iters=20_000,
@@ -164,7 +163,7 @@ def bench_bin_stats(rows: list[Row]) -> None:
         print(r.fmt())
 
         r = time_call(
-            f"bin_stats.payload",
+            "bin_stats.payload",
             f"{bin_count} bins",
             payload,
             iters=5_000,
@@ -537,11 +536,14 @@ def bench_stream_buffer_assembly(rows: list[Row]) -> None:
         iters = 1000 if n_events <= 256 else (200 if n_events <= 1024 else 50)
         size_label = f"{n_events}×{sample_count} ({total_mb:.0f}MB){extra}"
         r = time_call("1. baseline (list of bytes)", size_label, baseline, iters=iters)
-        rows.append(r); print(r.fmt())
-        r = time_call("2. prealloc-from-bytes",      size_label, prealloc_from_bytes, iters=iters)
-        rows.append(r); print(r.fmt())
-        r = time_call("3. prealloc-from-shm",        size_label, prealloc_from_shm, iters=iters)
-        rows.append(r); print(r.fmt())
+        rows.append(r)
+        print(r.fmt())
+        r = time_call("2. prealloc-from-bytes", size_label, prealloc_from_bytes, iters=iters)
+        rows.append(r)
+        print(r.fmt())
+        r = time_call("3. prealloc-from-shm", size_label, prealloc_from_shm, iters=iters)
+        rows.append(r)
+        print(r.fmt())
 
 
 ALL_BENCHES = {
