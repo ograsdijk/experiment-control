@@ -8,7 +8,6 @@ import threading
 import time
 import uuid
 from collections import deque
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Literal, cast
 
@@ -37,7 +36,29 @@ from ..utils.logging_levels import normalize_log_severity
 from ..utils.rpc_dispatch import RpcDispatchRegistry
 from ..utils.yaml_helpers import load_yaml_file
 from ..utils.zmq_helpers import json_dumps, json_loads, safe_json_loads
+from .hdf_writer_bg import (
+    _BG_SENTINEL as _BG_SENTINEL,
+    _BgRequest as _BgRequest,
+    _BgSentinel as _BgSentinel,
+    _DevicesToggleRequest as _DevicesToggleRequest,
+    _FlushBatch as _FlushBatch,
+    _MeasurementNoteRequest as _MeasurementNoteRequest,
+    _RotateRequest as _RotateRequest,
+    _StartWritingRequest as _StartWritingRequest,
+    _StopWritingRequest as _StopWritingRequest,
+)
 from .hdf_writer_context import coerce_context_value
+from .hdf_writer_dtypes import (
+    DEFAULT_NUMERIC_COMPRESSION,
+    DEFAULT_NUMERIC_SHUFFLE,
+    DEFAULT_TELEMETRY_CHUNK_ROWS,
+    DTYPE_MAP,
+    _context_table_dtype,
+    _event_dtype,
+    _measurement_note_dtype,
+    _sequencer_event_dtype,
+    _sequencer_yaml_dtype,
+)
 from .hdf_writer_topics import build_hdf_topic_handlers
 from .process_base import ManagedProcessBase
 
@@ -46,194 +67,11 @@ EventLogMode = Literal["all", "failures_only", "none"]
 EVENT_LOG_MODES: tuple[EventLogMode, ...] = ("all", "failures_only", "none")
 
 
-DTYPE_MAP: dict[str, np.dtype[Any]] = {
-    "float64": np.dtype("float64"),
-    "float32": np.dtype("float32"),
-    "int64": np.dtype("int64"),
-    "int32": np.dtype("int32"),
-    "uint64": np.dtype("uint64"),
-    "uint32": np.dtype("uint32"),
-    "bool": np.dtype("bool"),
-}
-DEFAULT_NUMERIC_COMPRESSION = "lzf"
-DEFAULT_NUMERIC_SHUFFLE = True
-DEFAULT_TELEMETRY_CHUNK_ROWS = 64
-
-
-# ---------------------------------------------------------------------------
-# Background-flush queue types.
-#
-# These are the typed payloads the main loop hands off to the bg flush
-# thread. `FlushBatch` is fire-and-forget (no response). The `_BgRequest`
-# hierarchy is for synchronous RPC handlers that need to wait on the bg
-# thread to mutate `_h5` (file rotation, start/stop writing, measurement
-# note append, device toggle). Each `_BgRequest` carries a 1-slot response
-# queue the bg thread fills with either the result or the raised exception.
-#
-# Commit 1 introduces only the type definitions and the queue plumbing —
-# main-loop handlers do not yet enqueue anything other than the shutdown
-# sentinel. Commit 2 flips all `_h5`-touching paths through the queue.
-# ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class _FlushBatch:
-    """Snapshot of pending main-loop state ready to be written to HDF5.
-
-    Shape of `stream_batches` matches `self._stream_buffers` — a dict
-    keyed by `(device_id, stream)` whose values are dicts with `data`,
-    `seq`, `t0_mono_ns`, `t0_wall_ns`, `context_id` lists. This keeps
-    the existing `_write_stream_buffers_batch` signature stable.
-
-    `_dropped_local` / `_dropped_events` are cumulative counters shared
-    between threads and not snapshotted into the batch — main loop
-    increments them in `_buffer_append` / `_buffer_event`, bg thread
-    reads them in `_flush_active_file`. CPython GIL makes the int read
-    atomic; the worst case is a momentarily stale attrs value that
-    catches up on the next flush.
-    """
-
-    buffered_rows: list[Json] = field(default_factory=list)
-    event_rows: list[tuple[str, Json]] = field(default_factory=list)
-    stream_batches: dict[tuple[str, str], dict[str, list[Any]]] = field(
-        default_factory=dict
-    )
-    pending_stream_metadata: dict[tuple[str, str], dict[str, Any]] = field(
-        default_factory=dict
-    )
-    force_flush: bool = False
-
-
-@dataclass
-class _BgRequest:
-    """Base for synchronous RPC requests routed through the bg thread."""
-
-    response: "queue.Queue[Any]" = field(default_factory=lambda: queue.Queue(maxsize=1))
-
-
-@dataclass
-class _RotateRequest(_BgRequest):
-    filename: str | None = None
-    disabled_devices: set[str] | None = None
-    measurement_profile: str | None = None
-    measurement_values: object = None
-
-
-@dataclass
-class _StartWritingRequest(_BgRequest):
-    filename: str | None = None
-    disabled_devices: set[str] | None = None
-    measurement_profile: str | None = None
-    measurement_values: object = None
-
-
-@dataclass
-class _StopWritingRequest(_BgRequest):
-    pass
-
-
-@dataclass
-class _MeasurementNoteRequest(_BgRequest):
-    author: str = ""
-    kind: str = ""
-    message: str = ""
-    payload_json: str = ""
-
-
-@dataclass
-class _DevicesToggleRequest(_BgRequest):
-    disabled: set[str] = field(default_factory=set)
-
-
-class _BgSentinel:
-    """Marker put on the bg queue to request a clean thread exit."""
-
-    __slots__ = ()
-
-
-_BG_SENTINEL = _BgSentinel()
-
-
 def _default_filename() -> str:
     return time.strftime("%Y_%m_%d-%H_%M_%S.h5", time.localtime())
 
 
-def _event_dtype() -> np.dtype[Any]:
-    str_dt = h5py.string_dtype("utf-8")
-    return np.dtype(
-        [
-            ("t_wall", np.float64),
-            ("t_mono", np.float64),
-            ("kind", str_dt),
-            ("severity", str_dt),
-            ("device_id", str_dt),
-            ("action", str_dt),
-            ("params_json", str_dt),
-            ("ok", np.bool_),
-            ("error", str_dt),
-            ("result_json", str_dt),
-            ("topic", str_dt),
-            ("message", str_dt),
-            ("payload_json", str_dt),
-        ]
-    )
 
-
-def _context_table_dtype() -> np.dtype[Any]:
-    str_dt = h5py.string_dtype("utf-8")
-    return np.dtype(
-        [
-            ("context_id", np.int64),
-            ("ts_wall_ns", np.int64),
-            ("ts_mono_ns", np.int64),
-            ("fields_json", str_dt),
-        ]
-    )
-
-
-def _sequencer_event_dtype() -> np.dtype[Any]:
-    str_dt = h5py.string_dtype("utf-8")
-    return np.dtype(
-        [
-            ("t_wall", np.float64),
-            ("t_mono", np.float64),
-            ("process_id", str_dt),
-            ("event", str_dt),
-            ("source", str_dt),
-            ("ok", np.bool_),
-            ("message", str_dt),
-            ("payload_json", str_dt),
-            ("yaml_snapshot_id", np.int64),
-        ]
-    )
-
-
-def _sequencer_yaml_dtype() -> np.dtype[Any]:
-    str_dt = h5py.string_dtype("utf-8")
-    return np.dtype(
-        [
-            ("snapshot_id", np.int64),
-            ("t_wall", np.float64),
-            ("t_mono", np.float64),
-            ("process_id", str_dt),
-            ("source", str_dt),
-            ("text", str_dt),
-        ]
-    )
-
-
-def _measurement_note_dtype() -> np.dtype[Any]:
-    str_dt = h5py.string_dtype("utf-8")
-    return np.dtype(
-        [
-            ("t_wall", np.float64),
-            ("t_mono", np.float64),
-            ("author", str_dt),
-            ("kind", str_dt),
-            ("message", str_dt),
-            ("payload_json", str_dt),
-        ]
-    )
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:

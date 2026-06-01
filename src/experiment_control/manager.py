@@ -1,20 +1,15 @@
 from __future__ import annotations
 
 import copy
-import importlib
-import importlib.util
 import json
 import os
 import queue
 import re
 import subprocess
-import sys
 import threading
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
-from enum import StrEnum
 from pathlib import Path
 from typing import Any, Callable, TextIO
 
@@ -30,6 +25,10 @@ from .manager_command_journal import (
 )
 from .manager_command_journal import (
     should_journal_command_action as shared_should_journal_command_action,
+)
+from .manager_config import (
+    device_spec_from_yaml,
+    process_spec_from_yaml,
 )
 from .manager_device_routing import route_device_request
 from .manager_driver_pub import handle_driver_pub as shared_handle_driver_pub
@@ -161,7 +160,6 @@ from .manager_process_recovery import (
 from .manager_process_recovery import (
     record_orphan_cleanup as shared_record_orphan_cleanup,
 )
-from .manager_process_spec import process_spec_kwargs_from_yaml
 from .manager_process_supervision import add_process as shared_add_process
 from .manager_process_supervision import (
     adopt_with_process_guard as shared_adopt_with_process_guard,
@@ -251,6 +249,22 @@ from .manager_request_routing import (
     build_manager_route_registry,
     build_process_route_registry,
 )
+from .manager_models import (
+    AutoReconnectSpec,
+    CommandInterceptorRoute,
+    ConnectCheckSpec,
+    DeviceHandle,
+    DeviceSpec,
+    DriverRegistration,
+    Heartbeat,
+    Liveness,
+    ManagedProcessState,
+    ProcessHandle,
+    ProcessSpec,
+    RestartPolicy,
+    TelemetryBundle,
+    TelemetrySignal,
+)
 from .manager_route_handlers import (
     apply_command_interceptors as shared_apply_command_interceptors,
 )
@@ -305,29 +319,36 @@ from .manager_runtime_metadata import serialize_spec_yaml as shared_serialize_sp
 from .manager_runtime_metadata import (
     touch_runtime_metadata_revision as shared_touch_runtime_metadata_revision,
 )
-from .schemas.run_meta import run_meta_calls_from_json
-from .schemas.stream import stream_calls_from_json
-from .schemas.telemetry import telemetry_calls_from_json
-from .types import (
-    DeviceState,
-    DriverState,
-    RunMetaCall,
-    StreamCall,
-    TelemetryCall,
-    TelemetryQuality,
-    Timestamp,
-)
+from .types import DeviceState, DriverState, TelemetryQuality, Timestamp
 from .utils import instance_lock as _instance_lock
 from .utils.command_journal import CommandJournal, CommandJournalSettings
-from .utils.config_parsing import ConfigError, optional_dict, require_dict, require_str
 from .utils.logging_levels import normalize_log_severity, severity_rank
 from .utils.manager_network import derive_local_connect_endpoint
 from .utils.process_lifecycle import ProcessGuardian
 from .utils.rpc_dispatch import RpcDispatchRegistry
-from .utils.yaml_helpers import load_yaml_file
 from .utils.zmq_helpers import MAX_DRAIN_PER_TICK, json_dumps, safe_json_loads
 
 Json = dict[str, Any]
+
+__all__ = [
+    "AutoReconnectSpec",
+    "CommandInterceptorRoute",
+    "ConnectCheckSpec",
+    "DeviceHandle",
+    "DeviceSpec",
+    "DriverRegistration",
+    "Heartbeat",
+    "Liveness",
+    "ManagedProcessState",
+    "Manager",
+    "ProcessHandle",
+    "ProcessSpec",
+    "RestartPolicy",
+    "TelemetryBundle",
+    "TelemetrySignal",
+    "device_spec_from_yaml",
+    "process_spec_from_yaml",
+]
 
 # Re-export for test patching and manager route-handler late binding.
 read_instance_lock_status = _instance_lock.read_instance_lock_status
@@ -350,543 +371,6 @@ _EXCEPTION_LINE_RE = re.compile(
     r"^[A-Za-z_][\w.]*?(Error|Exception|Exit|Interrupt|Fault|Failure)\s*:\s*"
 )
 
-
-def _module_name_from_path(path: Path) -> tuple[str | None, Path | None]:
-    parts: list[str] = []
-    cur = path.parent
-    while (cur / "__init__.py").exists():
-        parts.append(cur.name)
-        cur = cur.parent
-    if not parts:
-        return None, None
-    module_name = ".".join(list(reversed(parts)) + [path.stem])
-    return module_name, cur
-
-
-def _load_module(
-    *,
-    module_name: str | None,
-    file_path: str | Path,
-) -> Any:
-    if module_name:
-        return importlib.import_module(module_name)
-    path = Path(file_path).expanduser().resolve()
-    inferred_name, root = _module_name_from_path(path)
-    if inferred_name and root is not None:
-        if str(root) not in sys.path:
-            sys.path.insert(0, str(root))
-        return importlib.import_module(inferred_name)
-    module_name = f"_ec_driver_{path.stem}_{abs(hash(str(path)))}"
-    spec = importlib.util.spec_from_file_location(module_name, str(path))
-    if spec is None or spec.loader is None:
-        raise ImportError(f"Could not create import spec for {str(path)!r}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
-    try:
-        spec.loader.exec_module(module)  # type: ignore[union-attr]
-    except Exception:
-        sys.modules.pop(module_name, None)
-        raise
-    return module
-
-
-def _coerce_telemetry_calls(raw: object) -> list[TelemetryCall]:
-    if raw is None:
-        return []
-    if isinstance(raw, list) and raw and all(isinstance(x, TelemetryCall) for x in raw):
-        return list(raw)
-    if isinstance(raw, list) and not raw:
-        return []
-    return telemetry_calls_from_json(raw)
-
-
-def _coerce_stream_calls(raw: object) -> list[StreamCall] | None:
-    if raw is None:
-        return []
-    if isinstance(raw, list) and raw and all(isinstance(x, StreamCall) for x in raw):
-        return list(raw)
-    if isinstance(raw, list) and not raw:
-        return []
-    return stream_calls_from_json(raw)
-
-
-def _coerce_device_metadata(raw: object) -> dict[str, Any]:
-    meta = optional_dict(raw, path=["device_metadata"])
-    out: dict[str, Any] = {}
-    for key, value in meta.items():
-        name = str(key).strip()
-        if not name:
-            raise ConfigError("device_metadata", "keys must be non-empty strings")
-        out[name] = value
-    return out
-
-
-def _coerce_stream_metadata(raw: object) -> dict[str, dict[str, Any]]:
-    meta = optional_dict(raw, path=["stream_metadata"])
-    out: dict[str, dict[str, Any]] = {}
-    for stream_raw, attrs_raw in meta.items():
-        stream = str(stream_raw).strip()
-        if not stream:
-            raise ConfigError("stream_metadata", "stream names must be non-empty")
-        attrs = require_dict(attrs_raw, path=["stream_metadata", stream])
-        normalized_attrs: dict[str, Any] = {}
-        for attr_key, attr_value in attrs.items():
-            name = str(attr_key).strip()
-            if not name:
-                raise ConfigError(
-                    f"stream_metadata.{stream}",
-                    "attribute keys must be non-empty strings",
-                )
-            normalized_attrs[name] = attr_value
-        out[stream] = normalized_attrs
-    return out
-
-
-@dataclass(frozen=True)
-class ConnectCheckSpec:
-    enabled: bool = False
-    identity: dict[str, Any] = field(default_factory=dict)
-    on_fail: str = "disconnect"
-
-
-@dataclass(frozen=True)
-class AutoReconnectSpec:
-    enabled: bool = False
-    on_telemetry_stale_s: float | None = None
-    cooldown_s: float = 30.0
-    max_attempts: int | None = 3
-    reset_attempts_after_ok_s: float = 120.0
-    disconnect_timeout_ms: int = 1000
-    connect_timeout_ms: int | None = None
-
-
-def _coerce_connect_check(raw: object) -> ConnectCheckSpec:
-    if raw is None:
-        return ConnectCheckSpec()
-
-    obj = require_dict(raw, path=["connect_check"])
-    enabled_raw = obj.get("enabled", True)
-    if not isinstance(enabled_raw, bool):
-        raise ConfigError("connect_check.enabled", "must be a bool")
-    enabled = bool(enabled_raw)
-
-    identity_raw = obj.get("identity", {})
-    if identity_raw is None:
-        identity_raw = {}
-    identity_obj = require_dict(identity_raw, path=["connect_check", "identity"])
-    identity: dict[str, Any] = {}
-    for key, value in identity_obj.items():
-        field_name = str(key).strip()
-        if not field_name:
-            raise ConfigError(
-                "connect_check.identity", "identity keys must be non-empty strings"
-            )
-        identity[field_name] = copy.deepcopy(value)
-
-    on_fail_raw = str(obj.get("on_fail", "disconnect")).strip().lower()
-    if not on_fail_raw:
-        on_fail_raw = "disconnect"
-    if on_fail_raw not in {"disconnect", "keep_connected"}:
-        raise ConfigError(
-            "connect_check.on_fail",
-            "must be 'disconnect' or 'keep_connected'",
-        )
-
-    if enabled and not identity:
-        raise ConfigError(
-            "connect_check.identity",
-            "must be non-empty when connect_check.enabled is true",
-        )
-
-    return ConnectCheckSpec(
-        enabled=enabled,
-        identity=identity,
-        on_fail=on_fail_raw,
-    )
-
-
-def _coerce_auto_reconnect(raw: object) -> AutoReconnectSpec:
-    if raw is None:
-        return AutoReconnectSpec()
-    obj = require_dict(raw, path=["auto_reconnect"])
-    enabled_raw = obj.get("enabled", True)
-    if not isinstance(enabled_raw, bool):
-        raise ConfigError("auto_reconnect.enabled", "must be a bool")
-    enabled = bool(enabled_raw)
-
-    stale_raw = obj.get("on_telemetry_stale_s")
-    stale_s = None if stale_raw is None else float(stale_raw)
-    if enabled and (stale_s is None or stale_s <= 0):
-        raise ConfigError(
-            "auto_reconnect.on_telemetry_stale_s",
-            "must be > 0 when enabled",
-        )
-
-    cooldown_s = float(obj.get("cooldown_s", 30.0))
-    reset_s = float(obj.get("reset_attempts_after_ok_s", 120.0))
-    if cooldown_s < 0:
-        raise ConfigError("auto_reconnect.cooldown_s", "must be >= 0")
-    if reset_s < 0:
-        raise ConfigError("auto_reconnect.reset_attempts_after_ok_s", "must be >= 0")
-
-    max_raw = obj.get("max_attempts", 3)
-    max_attempts = None if max_raw is None else int(max_raw)
-    if max_attempts is not None and max_attempts < 1:
-        raise ConfigError("auto_reconnect.max_attempts", "must be >= 1 or null")
-
-    disconnect_timeout_ms = int(obj.get("disconnect_timeout_ms", 1000))
-    connect_timeout_raw = obj.get("connect_timeout_ms")
-    connect_timeout_ms = None if connect_timeout_raw is None else int(connect_timeout_raw)
-    if disconnect_timeout_ms <= 0:
-        raise ConfigError("auto_reconnect.disconnect_timeout_ms", "must be > 0")
-    if connect_timeout_ms is not None and connect_timeout_ms <= 0:
-        raise ConfigError("auto_reconnect.connect_timeout_ms", "must be > 0")
-
-    return AutoReconnectSpec(
-        enabled=enabled,
-        on_telemetry_stale_s=stale_s,
-        cooldown_s=cooldown_s,
-        max_attempts=max_attempts,
-        reset_attempts_after_ok_s=reset_s,
-        disconnect_timeout_ms=disconnect_timeout_ms,
-        connect_timeout_ms=connect_timeout_ms,
-    )
-
-
-def _load_driver_defaults(
-    *,
-    module_name: str | None,
-    file_path: str | Path,
-    class_name: str,
-) -> dict[str, object]:
-    try:
-        module = _load_module(module_name=module_name, file_path=file_path)
-    except Exception:
-        return {}
-
-    defaults: dict[str, object] = {}
-    class_suffix = class_name.upper()
-    telemetry_name = f"DEFAULT_TELEMETRY_CALLS_{class_suffix}"
-    stream_name = f"DEFAULT_STREAM_CALLS_{class_suffix}"
-
-    if hasattr(module, telemetry_name):
-        defaults["telemetry_calls"] = getattr(module, telemetry_name)
-    if hasattr(module, stream_name):
-        defaults["stream_calls"] = getattr(module, stream_name)
-    return defaults
-
-
-class Liveness(StrEnum):
-    OFFLINE = "OFFLINE"  # heartbeat stale
-    DISCONNECTED = "DISCONNECTED"  # heartbeat fresh but device unreachable
-    ONLINE = "ONLINE"
-
-
-@dataclass
-class TelemetrySignal:
-    value: Any | None
-    units: str | None
-    quality: TelemetryQuality
-    ts: Timestamp | None  # None => use bundle timestamp (avoid false precision)
-    quality_source: str = "device"
-
-
-@dataclass
-class Heartbeat:
-    pid: int
-    seq: int
-    driver_state: DriverState
-    device_reachable: bool
-    device_state: DeviceState
-    device_health: str | None  # driver-specific (optional)
-    last_error: str | None
-    last_ok_wall: float | None
-    last_ok_mono: float | None
-    loop_lag_s: float | None
-    ts: Timestamp
-
-
-@dataclass(frozen=True)
-class DriverRegistration:
-    device_id: str
-    rpc_endpoint: str
-    pub_endpoint: str
-    capabilities: Json | None = None  # optional to send at register-time
-
-
-@dataclass
-class DeviceSpec:
-    device_id: str
-    device_class_path: str | Path
-    device_class_name: str
-    device_init_kwargs: dict[str, Any]
-
-    telemetry_calls: list[TelemetryCall]
-    stream_calls: list[StreamCall] | None = None
-    run_meta_calls: list[RunMetaCall] | None = None
-    device_metadata: dict[str, Any] | None = None
-    stream_metadata: dict[str, dict[str, Any]] | None = None
-    connect_check: ConnectCheckSpec = field(default_factory=ConnectCheckSpec)
-    auto_reconnect: AutoReconnectSpec = field(default_factory=AutoReconnectSpec)
-    config_yaml_text: str | None = None
-    telemetry_period_s: float = 1.0
-    heartbeat_period_s: float = 1.0
-    command_poll_period_s: float = 0.01
-    driver_stop_timeout_s: float = 3.0
-    driver_kill_timeout_s: float = 3.0
-    driver_restart_backoff_s: float = 0.5
-    driver_max_restarts: int | None = None
-
-
-class RestartPolicy(StrEnum):
-    NEVER = "NEVER"
-    ALWAYS = "ALWAYS"
-    ON_FAILURE = "ON_FAILURE"
-
-
-class ManagedProcessState(StrEnum):
-    STOPPED = "STOPPED"
-    STARTING = "STARTING"
-    RUNNING = "RUNNING"
-    STOPPING = "STOPPING"
-    EXITED = "EXITED"
-    FAILED = "FAILED"
-    CRASHLOOP = "CRASHLOOP"
-
-
-@dataclass
-class DeviceHandle:
-    spec: DeviceSpec
-    process: subprocess.Popen[str] | None = None
-    rpc_endpoint: str | None = None
-    rpc_sock: zmq.Socket | None = None
-    # Serialises access to `rpc_sock` (a ZMQ REQ socket, NOT thread-safe).
-    # Lifecycle workers can dispatch concurrent device RPCs (e.g. two
-    # operators triggering commands on the same device, or the
-    # supervisor's stop-path racing a worker's command) — without this
-    # lock, two threads can interleave send/recv on the same socket and
-    # break ZMQ's REQ state machine. Cheap to take in the no-contention
-    # case; only contended when the same device sees concurrent RPCs.
-    #
-    # RLock so the call-path's `except` branch can re-enter via
-    # _close_device_rpc (same thread, lock already held) without
-    # deadlocking; external close-callers from a different thread
-    # block until the in-flight call returns.
-    rpc_lock: threading.RLock = field(default_factory=threading.RLock)
-    rpc_fail_count: int = 0
-    rpc_last_fail_t_mono: float | None = None
-    pub_endpoint: str | None = None
-    capabilities: Json | None = None
-    last_hb_recv_mono: float | None = None
-    last_hb: Heartbeat | None = None
-    driver_process_state: ManagedProcessState = ManagedProcessState.STOPPED
-    driver_pid: int | None = None
-    driver_popen_pid: int | None = None
-    driver_heartbeat_pid: int | None = None
-    driver_last_exit_code: int | None = None
-    driver_restart_count: int = 0
-    driver_last_restart_t_mono: float | None = None
-    driver_last_error: str | None = None
-    driver_last_error_kind: str | None = None
-    driver_last_signal_name: str | None = None
-    driver_last_failure_pid: int | None = None
-    driver_stop_requested_t_mono: float | None = None
-    driver_next_restart_t_mono: float | None = None
-    connect_check_last: dict[str, Any] | None = None
-    config_published: bool = False
-    supervisor_stdout_tail: deque[Json] = field(default_factory=lambda: deque(maxlen=300))
-    supervisor_stderr_tail: deque[Json] = field(default_factory=lambda: deque(maxlen=300))
-    supervisor_log_tail: deque[Json] = field(default_factory=lambda: deque(maxlen=100))
-    stdout_log_path: str | None = None
-    stderr_log_path: str | None = None
-    auto_reconnect_attempts: int = 0
-    auto_reconnect_last_attempt_mono: float | None = None
-    auto_reconnect_last_attempt_wall: float | None = None
-    auto_reconnect_healthy_since_mono: float | None = None
-    auto_reconnect_last_success_mono: float | None = None
-    auto_reconnect_last_error: str | None = None
-    auto_reconnect_suppressed: bool = False
-
-
-@dataclass
-class TelemetryBundle:
-    device_id: str
-    ts: Timestamp
-    signals: dict[str, TelemetrySignal]
-
-
-@dataclass
-class ProcessSpec:
-    process_id: str
-    argv: list[str]
-    cwd: str | None = None
-    env: dict[str, str] | None = None
-    heartbeat_period_s: float = 1.0
-    heartbeat_timeout_s: float = 3.0
-    shutdown_timeout_s: float = 3.0
-    restart_policy: RestartPolicy = RestartPolicy.NEVER
-    restart_backoff_s: float = 0.5
-    max_restarts: int | None = None
-    heartbeat_endpoint: str | None = None
-    process_data_endpoint: str | None = None
-
-
-@dataclass
-class ProcessHandle:
-    spec: ProcessSpec
-    popen: subprocess.Popen[str] | None = None
-    state: ManagedProcessState = ManagedProcessState.STOPPED
-    pid: int | None = None
-    popen_pid: int | None = None
-    heartbeat_pid: int | None = None
-    rpc_endpoint: str | None = None
-    rpc_sock: zmq.Socket | None = None
-    # Serialises access to `rpc_sock` (a ZMQ DEALER socket, NOT
-    # thread-safe). Lifecycle workers can dispatch concurrent process
-    # RPCs (e.g. interceptor-invoke calls overlapping with process-
-    # command calls, or the supervisor's stop-path racing a worker's
-    # command). Without this lock, two threads can interleave send/recv
-    # on the same DEALER and either tangle correlation or trigger ZMQ
-    # EFSM. Cheap to take in the no-contention case.
-    #
-    # RLock so the call-path's `except` branch can re-enter via
-    # _close_process_rpc (same thread, lock already held) without
-    # deadlocking; external close-callers from a different thread
-    # block until the in-flight call returns.
-    rpc_lock: threading.RLock = field(default_factory=threading.RLock)
-    rpc_fail_count: int = 0
-    rpc_last_fail_t_mono: float | None = None
-    last_start_t_wall: float | None = None
-    last_start_t_mono: float | None = None
-    last_hb_t_wall: float | None = None
-    last_hb_t_mono: float | None = None
-    # Manager-side timestamp of when we DRAINED the HB from the SUB
-    # buffer, used for the timeout check. Distinct from last_hb_t_mono
-    # (the sender's clock when the HB was generated): including buffer
-    # + scheduling delay in the timeout check produces false positives
-    # when the manager is briefly slow.
-    last_hb_recv_mono: float | None = None
-    last_heartbeat_payload: Json | None = None
-    last_exit_code: int | None = None
-    restart_count: int = 0
-    last_restart_t_mono: float | None = None
-    last_error: str | None = None
-    last_error_kind: str | None = None
-    last_signal_name: str | None = None
-    last_failure_pid: int | None = None
-    last_heartbeat_age_s: float | None = None
-    last_liveness_age_s: float | None = None
-    last_heartbeat_received: bool | None = None
-    heartbeat_stale_strikes: int = 0
-    last_stale_detected_mono: float | None = None
-    terminated_by_manager: bool = False
-    termination_reason: str | None = None
-    termination_method: str | None = None
-    termination_error: str | None = None
-    recent_manager_loop_stall: bool = False
-    last_manager_loop_stall_duration_s: float | None = None
-    heartbeat_endpoint: str = ""
-    process_data_endpoint: str = ""
-    stop_requested_t_mono: float | None = None
-    next_restart_t_mono: float | None = None
-    startup_collision_retry_done: bool = False
-    supervisor_stdout_tail: deque[Json] = field(default_factory=lambda: deque(maxlen=300))
-    supervisor_stderr_tail: deque[Json] = field(default_factory=lambda: deque(maxlen=300))
-    supervisor_log_tail: deque[Json] = field(default_factory=lambda: deque(maxlen=100))
-    stdout_log_path: str | None = None
-    stderr_log_path: str | None = None
-
-
-@dataclass(frozen=True)
-class CommandInterceptorRoute:
-    process_id: str
-    device_id: str
-    action: str
-    order: int
-
-
-def device_spec_from_yaml(path: str | Path) -> DeviceSpec:
-    raw, yaml_text = load_yaml_file(path, return_text=True)
-    try:
-        raw_obj = require_dict(raw, path=[])
-        device_id = require_str(raw_obj.get("device_id"), path=["device_id"])
-        driver = require_dict(raw_obj.get("driver"), path=["driver"])
-        driver_file = driver.get("file")
-        driver_module = driver.get("module")
-        if driver_file and driver_module:
-            raise ConfigError("driver", "file and module are mutually exclusive")
-        if not driver_file and not driver_module:
-            raise ConfigError("driver", "file or module must be provided")
-        module_name = None
-        if driver_module:
-            module_name = require_str(driver_module, path=["driver", "module"])
-            spec = importlib.util.find_spec(module_name)
-            if spec is None or spec.origin is None:
-                raise ConfigError("driver.module", f"module not found: {module_name!r}")
-            device_class_path = spec.origin
-        else:
-            device_class_path = require_str(driver_file, path=["driver", "file"])
-        device_class_name = require_str(
-            driver.get("class_name"), path=["driver", "class_name"]
-        )
-        init_kwargs = optional_dict(raw_obj.get("init_kwargs"), path=["init_kwargs"])
-        defaults = _load_driver_defaults(
-            module_name=module_name,
-            file_path=device_class_path,
-            class_name=device_class_name,
-        )
-        if "telemetry_calls" in raw_obj:
-            telemetry_calls = _coerce_telemetry_calls(raw_obj.get("telemetry_calls"))
-        else:
-            telemetry_calls = _coerce_telemetry_calls(defaults.get("telemetry_calls"))
-        if "stream_calls" in raw_obj:
-            stream_calls = _coerce_stream_calls(raw_obj.get("stream_calls"))
-        else:
-            stream_calls = _coerce_stream_calls(defaults.get("stream_calls"))
-        run_meta_calls = run_meta_calls_from_json(raw_obj.get("run_meta_calls"))
-        device_metadata = _coerce_device_metadata(raw_obj.get("device_metadata"))
-        stream_metadata = _coerce_stream_metadata(raw_obj.get("stream_metadata"))
-        connect_check = _coerce_connect_check(raw_obj.get("connect_check"))
-        auto_reconnect = _coerce_auto_reconnect(raw_obj.get("auto_reconnect"))
-        telemetry_period_s = float(raw_obj.get("telemetry_period_s", 1.0))
-        heartbeat_period_s = float(raw_obj.get("heartbeat_period_s", 1.0))
-        command_poll_period_s = float(raw_obj.get("command_poll_period_s", 0.01))
-    except ConfigError as e:
-        raise TypeError(str(e)) from None
-
-    return DeviceSpec(
-        device_id=device_id,
-        device_class_path=device_class_path,
-        device_class_name=device_class_name,
-        device_init_kwargs=init_kwargs,
-        telemetry_calls=telemetry_calls,
-        stream_calls=stream_calls,
-        run_meta_calls=run_meta_calls,
-        device_metadata=device_metadata,
-        stream_metadata=stream_metadata,
-        connect_check=connect_check,
-        auto_reconnect=auto_reconnect,
-        config_yaml_text=yaml_text,
-        telemetry_period_s=telemetry_period_s,
-        heartbeat_period_s=heartbeat_period_s,
-        command_poll_period_s=command_poll_period_s,
-    )
-
-
-def process_spec_from_yaml(
-    path: str | Path,
-    *,
-    manager_rpc: str,
-    manager_pub: str,
-) -> ProcessSpec:
-    return ProcessSpec(
-        **process_spec_kwargs_from_yaml(
-            path,
-            manager_rpc=manager_rpc,
-            manager_pub=manager_pub,
-            restart_policy_enum=RestartPolicy,
-        )
-    )
 
 
 class Manager:
