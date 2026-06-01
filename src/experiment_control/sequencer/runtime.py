@@ -93,6 +93,7 @@ class _WaitState:
     sample_spec: dict[str, Any]
     reduce_spec: dict[str, Any] | None
     samples: list[tuple[float, Any]]
+    max_samples: int
     stable_since: float | None = None
 
 
@@ -2034,6 +2035,15 @@ class SequencerRuntime:
         else:
             sample_spec = {}
         reduce_spec = raw.get("reduce")
+        reduce_spec_dict = reduce_spec if isinstance(reduce_spec, dict) else None
+        max_samples_raw = (
+            reduce_spec_dict.get("max_samples") if reduce_spec_dict is not None else None
+        )
+        try:
+            max_samples = int(max_samples_raw) if max_samples_raw is not None else 10000
+        except Exception:
+            max_samples = 10000
+        max_samples = max(1, max_samples)
         condition = raw.get("condition")
         now = time.monotonic()
         self._wait_state = _WaitState(
@@ -2044,8 +2054,9 @@ class SequencerRuntime:
             stable_for_s=stable_for_s,
             condition=condition,
             sample_spec=sample_spec,
-            reduce_spec=reduce_spec if isinstance(reduce_spec, dict) else None,
+            reduce_spec=reduce_spec_dict,
             samples=[],
+            max_samples=max_samples,
         )
 
     def _step_wait_until(self, now: float) -> bool:
@@ -2084,11 +2095,14 @@ class SequencerRuntime:
                 ws.samples.append((sample_ts, sample))
 
         reduce_value = sample
+        method = str((ws.reduce_spec or {}).get("method", "mean"))
         if ws.reduce_spec:
-            method = str(ws.reduce_spec.get("method", "mean"))
             window_s = float(ws.reduce_spec.get("window_s", 0))
             if window_s:
                 ws.samples = [(t, v) for t, v in ws.samples if (now - t) <= window_s]
+        if len(ws.samples) > ws.max_samples:
+            del ws.samples[: len(ws.samples) - ws.max_samples]
+        if ws.reduce_spec:
             values = [v for _, v in ws.samples if v is not None]
             if values:
                 if method == "mean":
