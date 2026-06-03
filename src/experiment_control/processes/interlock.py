@@ -1240,7 +1240,7 @@ class InterlockProcess(ManagedProcessBase):
         dispatched = self._rpc_registry.dispatch_with_canonical(req)
         if dispatched is not None:
             return dispatched
-        return self._rpc_unknown(req)
+        return self.rpc_unknown(req)
 
     def run(self) -> None:
         try:

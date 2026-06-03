@@ -54,18 +54,18 @@ class CommandHappyPathTests(unittest.TestCase):
     def test_returns_response_dict_on_ok(self) -> None:
         mgr = FakeManager({"ok": True, "result": 42})
         proc = _bare_state_machine(mgr)
-        resp = proc._command("dev1", "set_x", {"x": 5})
+        resp = proc.command("dev1", "set_x", {"x": 5})
         self.assertEqual(resp, {"ok": True, "result": 42})
 
     def test_returns_response_dict_on_status_OK(self) -> None:
         mgr = FakeManager({"status": "OK", "value": 7})
         proc = _bare_state_machine(mgr)
-        self.assertEqual(proc._command("dev1", "get_x", {}), {"status": "OK", "value": 7})
+        self.assertEqual(proc.command("dev1", "get_x", {}), {"status": "OK", "value": 7})
 
     def test_stores_request_on_last_command(self) -> None:
         mgr = FakeManager({"ok": True})
         proc = _bare_state_machine(mgr, process_id="my-proc")
-        proc._command("dev1", "set_x", {"x": 5})
+        proc.command("dev1", "set_x", {"x": 5})
         self.assertEqual(
             proc._last_command,
             {
@@ -83,7 +83,7 @@ class CommandHappyPathTests(unittest.TestCase):
         mgr = FakeManager({"ok": True})
         proc = _bare_state_machine(mgr)
         params = {"x": 1}
-        proc._command("dev1", "set_x", params)
+        proc.command("dev1", "set_x", params)
         params["x"] = 99
         assert proc._last_command is not None
         self.assertEqual(proc._last_command["params"], {"x": 1})
@@ -93,20 +93,20 @@ class CommandTimeoutTests(unittest.TestCase):
     def test_none_timeout_passes_none(self) -> None:
         mgr = FakeManager({"ok": True})
         proc = _bare_state_machine(mgr)
-        proc._command("d", "a", {}, timeout_s=None)
+        proc.command("d", "a", {}, timeout_s=None)
         self.assertEqual(mgr.timeouts, [None])
 
     def test_finite_timeout_converts_to_ms(self) -> None:
         mgr = FakeManager({"ok": True})
         proc = _bare_state_machine(mgr)
-        proc._command("d", "a", {}, timeout_s=2.5)
+        proc.command("d", "a", {}, timeout_s=2.5)
         self.assertEqual(mgr.timeouts, [2500])
 
     def test_sub_ms_timeout_clamps_to_one(self) -> None:
         # max(1, int(...)) — 0.0001s would int-truncate to 0; clamp to 1.
         mgr = FakeManager({"ok": True})
         proc = _bare_state_machine(mgr)
-        proc._command("d", "a", {}, timeout_s=0.0001)
+        proc.command("d", "a", {}, timeout_s=0.0001)
         self.assertEqual(mgr.timeouts, [1])
 
 
@@ -114,14 +114,14 @@ class CommandFailureTests(unittest.TestCase):
     def test_manager_none_raises_sequence_error(self) -> None:
         proc = _bare_state_machine(None)
         with self.assertRaises(SequenceError) as ctx:
-            proc._command("d", "a", {})
+            proc.command("d", "a", {})
         self.assertIn("manager not initialized", str(ctx.exception))
 
     def test_failed_response_raises_sequence_error_with_payload(self) -> None:
         mgr = FakeManager({"ok": False, "error": "denied"})
         proc = _bare_state_machine(mgr)
         with self.assertRaises(SequenceError) as ctx:
-            proc._command("d", "a", {})
+            proc.command("d", "a", {})
         self.assertIn("command failed", str(ctx.exception))
         self.assertIn("'device_id': 'd'", str(ctx.exception))
 
@@ -129,13 +129,13 @@ class CommandFailureTests(unittest.TestCase):
         mgr = FakeManager({"status": "ERROR"})
         proc = _bare_state_machine(mgr)
         with self.assertRaises(SequenceError):
-            proc._command("d", "a", {})
+            proc.command("d", "a", {})
 
     def test_non_dict_response_raises(self) -> None:
         mgr = FakeManager(None)
         proc = _bare_state_machine(mgr)
         with self.assertRaises(SequenceError):
-            proc._command("d", "a", {})
+            proc.command("d", "a", {})
 
 
 class CustomSequenceErrorClassTests(unittest.TestCase):
@@ -146,7 +146,7 @@ class CustomSequenceErrorClassTests(unittest.TestCase):
         mgr = FakeManager({"ok": False})
         proc = _bare_state_machine(mgr, sequence_error_cls=MyError)
         with self.assertRaises(MyError):
-            proc._command("d", "a", {})
+            proc.command("d", "a", {})
 
     def test_custom_class_still_catchable_as_sequence_error(self) -> None:
         # Subclasses MUST inherit SequenceError so generic handlers keep working.
@@ -156,7 +156,7 @@ class CustomSequenceErrorClassTests(unittest.TestCase):
         mgr = FakeManager({"ok": False})
         proc = _bare_state_machine(mgr, sequence_error_cls=MyError)
         try:
-            proc._command("d", "a", {})
+            proc.command("d", "a", {})
         except SequenceError:
             return
         self.fail("expected SequenceError (via MyError)")

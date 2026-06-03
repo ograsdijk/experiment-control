@@ -405,7 +405,7 @@ class HdfWriter(ManagedProcessBase):
         # _bump_error fires on both the main thread (drain handlers, RPC
         # handlers) and the bg flush thread. CPython dict mutation is
         # NOT atomic across threads in the way `+=` on an attribute
-        # suggests — the get + assignment can interleave with another
+        # suggests â€” the get + assignment can interleave with another
         # thread's bump on the same key, losing counts. Guard with a
         # small lock; reads via the public _error_counts attribute (used
         # by the bg-thread-failure tests) take a momentary snapshot to
@@ -427,7 +427,7 @@ class HdfWriter(ManagedProcessBase):
         self._bg_thread: threading.Thread | None = None
         self._bg_thread_dead = False
         self._dropped_flush_batches = 0
-        # Counter for *deferred* flush batches — non-force_flush calls that
+        # Counter for *deferred* flush batches â€” non-force_flush calls that
         # found the bg queue full and chose to leave rows/events in the
         # in-memory deques rather than snapshot-and-drop. Exposed alongside
         # `_dropped_flush_batches` in the status payload so operators can
@@ -897,7 +897,7 @@ class HdfWriter(ManagedProcessBase):
     ) -> tuple[int, float, float]:
         # Invoked from the RPC handler thread (main loop _drain_rpc). Held
         # under _h5_lock so the bg flush thread can't be mid-write on the
-        # same h5py.File — h5py is not safe to share across threads even
+        # same h5py.File â€” h5py is not safe to share across threads even
         # for writes to distinct datasets.
         with self._h5_lock:
             if self._measurement_notes_ds is None:
@@ -968,7 +968,7 @@ class HdfWriter(ManagedProcessBase):
                         except queue.Full:
                             pass
         except Exception as exc:
-            # Anything that escapes the outer loop is fatal — set the
+            # Anything that escapes the outer loop is fatal â€” set the
             # watchdog flag and stop the process so the supervisor's
             # restart policy can take over.
             self._record_exception(exc, phase="bg_thread_fatal")
@@ -990,7 +990,7 @@ class HdfWriter(ManagedProcessBase):
         )
 
     def _handle_flush_batch(self, batch: "_FlushBatch") -> None:
-        # The bg thread runs this under _h5_lock — same lock that
+        # The bg thread runs this under _h5_lock â€” same lock that
         # serialises h5 + stream-state access from the main-loop drain
         # handlers, RPC handlers, and file rotation. The batch carries
         # snapshots of the deque contents and per-stream buffers the
@@ -1057,7 +1057,7 @@ class HdfWriter(ManagedProcessBase):
             raise AssertionError(
                 "hdf_writer mutation site invoked without _h5_lock while "
                 "the bg flush thread is live; this is a thread-safety "
-                "regression — see the lock comment in HdfWriter.__init__"
+                "regression â€” see the lock comment in HdfWriter.__init__"
             )
 
     def _drain_pending_to_file(self) -> None:
@@ -1137,7 +1137,7 @@ class HdfWriter(ManagedProcessBase):
         """Snapshot main-loop drain state and hand it to the bg flush thread.
 
         Returns True if the batch was queued, False if it was dropped due
-        to overflow (the data is lost — `_dropped_flush_batches` is
+        to overflow (the data is lost â€” `_dropped_flush_batches` is
         incremented so it surfaces in heartbeat/status). When the batch
         is queued successfully, `_pending` and `_last_flush` bookkeeping
         is updated to mirror the old synchronous-write timing.
@@ -1150,7 +1150,7 @@ class HdfWriter(ManagedProcessBase):
         are unbounded dicts though, so we snapshot-and-discard those to
         keep memory bounded during a sustained backlog. Force-flush
         callers retain the original "snapshot + drop on overflow"
-        contract — rotation/shutdown paths use `_drain_pending_to_file`
+        contract â€” rotation/shutdown paths use `_drain_pending_to_file`
         synchronously so they don't traverse this method.
         """
         if not force_flush and self._bg_queue.full():
@@ -1905,7 +1905,7 @@ class HdfWriter(ManagedProcessBase):
                 )
 
                 while not self._stop_evt.is_set():
-                    # Bail out cleanly if the bg flush thread died — the
+                    # Bail out cleanly if the bg flush thread died â€” the
                     # supervisor's restart policy will bring us back up.
                     if self._bg_thread_dead:
                         self._stop_evt.set()
@@ -2292,10 +2292,6 @@ class HdfWriter(ManagedProcessBase):
             },
         )
 
-    @staticmethod
-    def _rpc_request_id(req: Json) -> Any:
-        return req.get("request_id")
-
     def _build_topic_handlers(self) -> dict[str, Callable[[Json], None]]:
         return build_hdf_topic_handlers(self)
 
@@ -2307,20 +2303,13 @@ class HdfWriter(ManagedProcessBase):
         self._topic_handlers = handlers
         return handlers
 
-    @classmethod
-    def _rpc_ok(
-        cls, req_or_id: Json | Any, *, result: Any = None
-    ) -> Json:
-        # Matches the ManagedProcessBase signature (classmethod,
-        # req_or_id, default result=None) so mypy doesn't flag the
-        # override as LSP-incompatible. The body is identical to the
-        # base, kept here for now to preserve any subclass-tests that
-        # call HdfWriter._rpc_ok directly.
-        return {
-            "request_id": cls._rpc_request_id(req_or_id),
-            "ok": True,
-            "result": result,
-        }
+    # ``rpc_ok`` is inherited verbatim from ``ManagedProcessBase``;
+    # the prior explicit override duplicated the base body, narrowed
+    # ``_rpc_request_id`` to dict-only (an LSP violation against the
+    # base's polymorphic ``dict | Any`` accept), and was patched by no
+    # test. Inheriting keeps the wire envelope under a single source
+    # of truth so any future change to ``rpc_ok`` applies to
+    # HdfWriter automatically.
 
     def _rpc_error(self, req: Json, *, code: str, message: str | None = None) -> Json:
         err: Json = {"code": str(code)}
@@ -2537,7 +2526,7 @@ class HdfWriter(ManagedProcessBase):
             else 0,
         }
         result.update(self._hdf_device_filter_state())
-        return self._rpc_ok(req, result=result)
+        return self.rpc_ok(req, result=result)
 
     def _rpc_hdf_measurement_schema_get(self, req: Json) -> Json:
         configured, available, error = self._measurement_schema_state()
@@ -2553,7 +2542,7 @@ class HdfWriter(ManagedProcessBase):
                 code="measurement_schema_unavailable",
                 message=error or "measurement schema unavailable",
             )
-        return self._rpc_ok(
+        return self.rpc_ok(
             req,
             result={
                 "schema": measurement_schema_to_json(self._measurement_schema),
@@ -2602,7 +2591,7 @@ class HdfWriter(ManagedProcessBase):
             )
         except Exception as e:
             return self._rpc_error(req, code="note_write_failed", message=str(e))
-        return self._rpc_ok(
+        return self.rpc_ok(
             req,
             result={
                 "index": int(index),
@@ -2614,7 +2603,7 @@ class HdfWriter(ManagedProcessBase):
         )
 
     def _rpc_hdf_devices_get(self, req: Json) -> Json:
-        return self._rpc_ok(req, result=self._hdf_device_filter_state())
+        return self.rpc_ok(req, result=self._hdf_device_filter_state())
 
     def _rpc_hdf_devices_disable(self, req: Json) -> Json:
         return self._rpc_hdf_devices_toggle(req, disable=True)
@@ -2677,7 +2666,7 @@ class HdfWriter(ManagedProcessBase):
                     except Exception:
                         self._bump_error("h5.attrs.disabled_devices")
 
-        return self._rpc_ok(
+        return self.rpc_ok(
             req,
             result={
                 "changed": changed,
@@ -2751,7 +2740,7 @@ class HdfWriter(ManagedProcessBase):
         except Exception as e:
             return self._rpc_error(req, code="rotate_failed", message=str(e))
 
-        return self._rpc_ok(
+        return self.rpc_ok(
             req,
             result={
                 "old_file": old_file,
@@ -2770,7 +2759,7 @@ class HdfWriter(ManagedProcessBase):
         if not isinstance(params, dict):
             return self._rpc_error(req, code="invalid_params", message="params must be a dict")
         if self._h5 is None:
-            return self._rpc_ok(
+            return self.rpc_ok(
                 req,
                 result={
                     "already_stopped": True,
@@ -2782,7 +2771,7 @@ class HdfWriter(ManagedProcessBase):
             old_file = self._stop_writing_file()
         except Exception as e:
             return self._rpc_error(req, code="stop_failed", message=str(e))
-        return self._rpc_ok(
+        return self.rpc_ok(
             req,
             result={
                 "already_stopped": False,
@@ -2860,7 +2849,7 @@ class HdfWriter(ManagedProcessBase):
         except Exception as e:
             return self._rpc_error(req, code="start_failed", message=str(e))
 
-        return self._rpc_ok(
+        return self.rpc_ok(
             req,
             result={
                 "new_file": new_file,
@@ -2885,7 +2874,7 @@ class HdfWriter(ManagedProcessBase):
             return self._rpc_error(req, code="invalid_request", message="Malformed request")
         dispatch_req = rpc.as_dispatch_payload(request_id_field="request_id")
         if rpc.action == "process.capabilities":
-            return self._rpc_ok(
+            return self.rpc_ok(
                 dispatch_req,
                 result=capabilities_payload(self._hdf_capability_members()),
             )

@@ -4507,16 +4507,16 @@ class StreamAnalysisProcess(ManagedProcessBase):
         return self._with_common_capabilities(members)
 
     def _rpc_stream_analysis_capabilities(self, req: Json) -> Json:
-        return self._rpc_ok(req, result=capabilities_payload(self._stream_analysis_capability_members()))
+        return self.rpc_ok(req, result=capabilities_payload(self._stream_analysis_capability_members()))
 
     def _rpc_stream_analysis_status(self, req: Json) -> Json:
-        return self._rpc_ok(req, result=self._status_payload())
+        return self.rpc_ok(req, result=self._status_payload())
 
     def _rpc_stream_analysis_operators(self, req: Json) -> Json:
-        return self._rpc_ok(req, result={"operators": operator_catalog_payload()})
+        return self.rpc_ok(req, result={"operators": operator_catalog_payload()})
 
     def _rpc_stream_analysis_workspace_list(self, req: Json) -> Json:
-        return self._rpc_ok(
+        return self.rpc_ok(
             req,
             result={
                 "workspaces": [
@@ -4527,19 +4527,19 @@ class StreamAnalysisProcess(ManagedProcessBase):
         )
 
     def _rpc_stream_analysis_workspace_store_status(self, req: Json) -> Json:
-        return self._rpc_ok(req, result=self._workspace_store_status_payload())
+        return self.rpc_ok(req, result=self._workspace_store_status_payload())
 
     def _rpc_stream_analysis_workspace_get(self, req: Json) -> Json:
         params = req.get("params", {}) or {}
         if not isinstance(params, dict):
-            return self._rpc_invalid_params(req, message="params must be a dict")
+            return self.rpc_invalid_params(req, message="params must be a dict")
         workspace_id = _normalize_id(params.get("workspace_id"))
         if workspace_id is None:
-            return self._rpc_invalid_params(req, message="workspace_id is required")
+            return self.rpc_invalid_params(req, message="workspace_id is required")
         workspace = self._workspaces.get(workspace_id)
         if workspace is None:
-            return self._rpc_err(req, code="unknown_workspace")
-        return self._rpc_ok(
+            return self.rpc_err(req, code="unknown_workspace")
+        return self.rpc_ok(
             req,
             result={
                 "workspace": self._workspace_summary(workspace),
@@ -4550,54 +4550,54 @@ class StreamAnalysisProcess(ManagedProcessBase):
     def _rpc_stream_analysis_workspace_snapshot(self, req: Json) -> Json:
         params = req.get("params", {}) or {}
         if not isinstance(params, dict):
-            return self._rpc_invalid_params(req, message="params must be a dict")
+            return self.rpc_invalid_params(req, message="params must be a dict")
         try:
             snapshot = self._workspace_snapshot_payload(params)
         except ValueError as exc:
-            return self._rpc_invalid_params(req, message=str(exc))
+            return self.rpc_invalid_params(req, message=str(exc))
         except KeyError:
-            return self._rpc_err(req, code="unknown_workspace")
-        return self._rpc_ok(req, result=snapshot)
+            return self.rpc_err(req, code="unknown_workspace")
+        return self.rpc_ok(req, result=snapshot)
 
     def _rpc_stream_analysis_workspace_validate(self, req: Json) -> Json:
         params = req.get("params", {}) or {}
         if not isinstance(params, dict):
-            return self._rpc_invalid_params(req, message="params must be a dict")
+            return self.rpc_invalid_params(req, message="params must be a dict")
         result = self._handle_workspace_validate(params)
         if not result.get("ok"):
-            return self._rpc_err(
+            return self.rpc_err(
                 req,
                 code=str((result.get("error") or {}).get("code") or "validation_failed"),
                 message=(result.get("error") or {}).get("message"),
             )
-        return self._rpc_ok(req, result=result.get("result"))
+        return self.rpc_ok(req, result=result.get("result"))
 
     def _rpc_stream_analysis_workspace_put(self, req: Json) -> Json:
         params = req.get("params", {}) or {}
         if not isinstance(params, dict):
-            return self._rpc_invalid_params(req, message="params must be a dict")
+            return self.rpc_invalid_params(req, message="params must be a dict")
         result = self._handle_workspace_put(params)
         if not result.get("ok"):
-            return self._rpc_err(
+            return self.rpc_err(
                 req,
                 code=str((result.get("error") or {}).get("code") or "put_failed"),
                 message=(result.get("error") or {}).get("message"),
             )
-        return self._rpc_ok(req, result=result.get("result"))
+        return self.rpc_ok(req, result=result.get("result"))
 
     def _rpc_stream_analysis_workspace_delete(self, req: Json) -> Json:
         params = req.get("params", {}) or {}
         if not isinstance(params, dict):
-            return self._rpc_invalid_params(req, message="params must be a dict")
+            return self.rpc_invalid_params(req, message="params must be a dict")
         workspace_id = _normalize_id(params.get("workspace_id"))
         if workspace_id is None:
-            return self._rpc_invalid_params(req, message="workspace_id is required")
+            return self.rpc_invalid_params(req, message="workspace_id is required")
         expected_raw = params.get("expected_revision")
         expected_revision: int | None = None
         if expected_raw is not None:
             expected_revision = _normalize_int(expected_raw)
             if expected_revision is None or expected_revision < 0:
-                return self._rpc_invalid_params(
+                return self.rpc_invalid_params(
                     req,
                     message="expected_revision must be a non-negative integer",
                 )
@@ -4608,47 +4608,47 @@ class StreamAnalysisProcess(ManagedProcessBase):
             publish=True,
         )
         if not removed:
-            return self._rpc_err(req, code="unknown_workspace")
-        return self._rpc_ok(req, result={"workspace_id": workspace_id, "deleted": True})
+            return self.rpc_err(req, code="unknown_workspace")
+        return self.rpc_ok(req, result={"workspace_id": workspace_id, "deleted": True})
 
     def _rpc_stream_analysis_workspace_reset(self, req: Json) -> Json:
         params = req.get("params", {}) or {}
         if not isinstance(params, dict):
-            return self._rpc_invalid_params(req, message="params must be a dict")
+            return self.rpc_invalid_params(req, message="params must be a dict")
         workspace_id = _normalize_id(params.get("workspace_id"))
         node_id = _normalize_id(params.get("node_id"))
         if workspace_id is None:
             if node_id is not None:
-                return self._rpc_invalid_params(
+                return self.rpc_invalid_params(
                     req, message="node_id requires workspace_id"
                 )
             for workspace in self._workspaces.values():
                 self._reset_workspace_states(workspace)
             self._latest_output_payloads.clear()
-            return self._rpc_ok(req, result={"reset": "all", "count": len(self._workspaces)})
+            return self.rpc_ok(req, result={"reset": "all", "count": len(self._workspaces)})
         workspace = self._workspaces.get(workspace_id)
         if workspace is None:
-            return self._rpc_err(req, code="unknown_workspace")
+            return self.rpc_err(req, code="unknown_workspace")
         if node_id is not None:
             ok = self._reset_workspace_node_state(workspace, node_id)
             if not ok:
-                return self._rpc_err(req, code="unknown_or_non_stateful_node")
+                return self.rpc_err(req, code="unknown_or_non_stateful_node")
             self._clear_workspace_snapshot_outputs(workspace_id, node_id=node_id)
-            return self._rpc_ok(req, result={"reset": workspace_id, "node_id": node_id})
+            return self.rpc_ok(req, result={"reset": workspace_id, "node_id": node_id})
         self._reset_workspace_states(workspace)
         self._clear_workspace_snapshot_outputs(workspace_id)
-        return self._rpc_ok(req, result={"reset": workspace_id})
+        return self.rpc_ok(req, result={"reset": workspace_id})
 
     def _rpc_stream_analysis_workspace_clear(self, req: Json) -> Json:
         removed = self._clear_workspaces(mark_dirty=True, publish=True)
-        return self._rpc_ok(req, result={"removed": removed})
+        return self.rpc_ok(req, result={"removed": removed})
 
     def _rpc_stream_analysis_workspace_store_save(self, req: Json) -> Json:
         params = req.get("params", {}) or {}
         if not isinstance(params, dict):
-            return self._rpc_invalid_params(req, message="params must be a dict")
+            return self.rpc_invalid_params(req, message="params must be a dict")
         saved = self._save_workspace_store(path_override=params.get("path"))
-        return self._rpc_ok(
+        return self.rpc_ok(
             req,
             result={**saved, "status": self._workspace_store_status_payload()},
         )
@@ -4656,12 +4656,12 @@ class StreamAnalysisProcess(ManagedProcessBase):
     def _rpc_stream_analysis_workspace_store_reload(self, req: Json) -> Json:
         params = req.get("params", {}) or {}
         if not isinstance(params, dict):
-            return self._rpc_invalid_params(req, message="params must be a dict")
+            return self.rpc_invalid_params(req, message="params must be a dict")
         override = self._normalize_workspace_store_path(params.get("path"))
         if override is not None:
             self._workspace_store_path = override
         reloaded = self._reload_workspace_store(strict_missing=True)
-        return self._rpc_ok(
+        return self.rpc_ok(
             req,
             result={**reloaded, "status": self._workspace_store_status_payload()},
         )
@@ -4718,13 +4718,13 @@ class StreamAnalysisProcess(ManagedProcessBase):
                 else None
             )
             if isinstance(exc, FileNotFoundError):
-                return self._rpc_err(
+                return self.rpc_err(
                     req,
                     code="workspace_store_not_found",
                     message=str(exc),
                 )
             if isinstance(exc, ValueError) and "workspace_store_path" in str(exc):
-                return self._rpc_err(
+                return self.rpc_err(
                     req,
                     code="workspace_store_not_configured",
                     message=str(exc),
@@ -4734,7 +4734,7 @@ class StreamAnalysisProcess(ManagedProcessBase):
                 code="rpc_error",
                 message=str(exc),
             )
-            return self._rpc_err(req, code="rpc_error", message=str(exc))
+            return self.rpc_err(req, code="rpc_error", message=str(exc))
 
     def _handle_rpc(self, req: Json) -> Json:
         common = self._handle_common_rpc(req)
@@ -4752,10 +4752,10 @@ class StreamAnalysisProcess(ManagedProcessBase):
         dispatched = self._dispatch_rpc_with_error_mapping(req, params)
         if dispatched is not None:
             return dispatched
-        return self._rpc_unknown(req)
+        return self.rpc_unknown(req)
 
     def _handle_rpc_legacy(self, req: Json) -> Json:
-        return self._rpc_unknown(req)
+        return self.rpc_unknown(req)
 
     def run(self) -> None:
         self._stop_evt.clear()

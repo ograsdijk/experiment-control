@@ -1456,7 +1456,7 @@ class InfluxWriterProcess(ManagedProcessBase):
         dispatched = self._rpc_registry.dispatch_with_canonical(req)
         if dispatched is not None:
             return dispatched
-        return self._rpc_unknown(req)
+        return self.rpc_unknown(req)
 
     def _publish_log(self, *, severity: str, message: str) -> None:
         payload: Json = {

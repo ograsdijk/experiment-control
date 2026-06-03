@@ -350,7 +350,7 @@ class PublishTransitionEventLastErrorTests(unittest.TestCase):
 
     def test_publish_failure_recorded_in_last_error(self) -> None:
         proc = self._make_proc(_StubManagerRaises())
-        proc._publish_transition_event(
+        proc.publish_transition_event(
             "READY", "RUNNING", reason="user", metadata=None
         )
         self.assertIsNotNone(proc._last_error)
@@ -379,7 +379,7 @@ class PublishTransitionEventLastErrorTests(unittest.TestCase):
             f"{StateMachineProcessBase._TRANSITION_PUBLISH_ERROR_PREFIX} "
             "READY -> RUNNING: RuntimeError('boot race')"
         )
-        proc._publish_transition_event(
+        proc.publish_transition_event(
             "RUNNING", "READY", reason="ok", metadata=None
         )
         self.assertIsNone(
@@ -397,7 +397,7 @@ class PublishTransitionEventLastErrorTests(unittest.TestCase):
         manager = _StubManagerOK()
         proc = self._make_proc(manager)
         proc._last_error = "device disconnected: cannot reach instrument"
-        proc._publish_transition_event(
+        proc.publish_transition_event(
             "RUNNING", "READY", reason="ok", metadata=None
         )
         self.assertEqual(
@@ -412,7 +412,7 @@ class PublishTransitionEventLastErrorTests(unittest.TestCase):
         new transition-publish failure does NOT overwrite it."""
         proc = self._make_proc(_StubManagerRaises())
         proc._last_error = "existing operational error"
-        proc._publish_transition_event(
+        proc.publish_transition_event(
             "READY", "RUNNING", reason="user", metadata=None
         )
         self.assertEqual(proc._last_error, "existing operational error")
