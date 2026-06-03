@@ -3,22 +3,21 @@ from __future__ import annotations
 import datetime
 import sys
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any, Callable
 
+from .utils.errors import TRANSIENT_CAPABILITIES_ERROR_CODES
 from .utils.logging_levels import normalize_log_severity
 
+if TYPE_CHECKING:
+    from typing import TextIO
+
+    from .manager_protocol import ManagerProtocol
+
+    _MixinBase = ManagerProtocol
+else:
+    _MixinBase = object
+
 Json = dict[str, Any]
-
-
-_TRANSIENT_CAPABILITIES_CODES = {
-    "device_rpc_timeout",
-    "device_starting",
-    "device_stopping",
-    "device_rpc_not_ready",
-    "driver_not_running",
-    "gateway_busy",
-    "gateway_timeout",
-}
 
 
 def _is_transient_capabilities_failure(payload: Json) -> bool:
@@ -28,7 +27,7 @@ def _is_transient_capabilities_failure(payload: Json) -> bool:
     err = payload.get("error")
     if isinstance(err, dict):
         code = str(err.get("code", "") or "").strip().lower()
-        if code in _TRANSIENT_CAPABILITIES_CODES:
+        if code in TRANSIENT_CAPABILITIES_ERROR_CODES:
             return True
         if bool(err.get("transient")):
             return True
@@ -69,46 +68,30 @@ def _sink_line_text(
     return f"{ts_text} [{severity.upper()}] {line_topic} {source_text} {message}"
 
 
-def _write_sink_line(manager: Any, line: str) -> None:
-    if bool(getattr(manager, "_manager_log_stderr_enabled", False)):
+def _write_sink_line_impl(
+    *,
+    stderr_enabled: bool,
+    log_file: "TextIO | None",
+    close_log_file: Callable[[], None],
+    line: str,
+) -> None:
+    """Shared sink-line writer used by both the mixin and the legacy forwarder.
+
+    Kept as a pure function (no ``manager`` first arg) so the mixin
+    method can pass already-narrowed attributes — gives mypy enough
+    information without sprinkling ``Any``-typed access through the body.
+    """
+    if stderr_enabled:
         try:
             sys.stderr.write(line + "\n")
             sys.stderr.flush()
         except Exception:
             pass
-    log_file = getattr(manager, "_manager_log_file", None)
     if log_file is not None:
         try:
             log_file.write(line + "\n")
         except Exception:
-            manager._close_manager_log_sink_file()
-
-
-def maybe_emit_manager_log_sink(manager: Any, topic: str, payload: Json) -> None:
-    try:
-        severity, line_topic, source_kind, source_id, message = manager._manager_log_sink_event(
-            topic, payload
-        )
-    except Exception:
-        return
-    min_rank = int(
-        getattr(manager, "_manager_log_min_level_rank", manager._severity_rank("error"))
-    )
-    if manager._severity_rank(severity) < min_rank:
-        return
-    fingerprint = f"{severity}|{line_topic}|{source_kind}|{source_id}|{message}"
-    if manager._manager_log_sink_is_duplicate(fingerprint):
-        return
-    ts_text = _sink_timestamp_text(payload)
-    line = _sink_line_text(
-        severity=severity,
-        line_topic=line_topic,
-        source_kind=source_kind,
-        source_id=source_id,
-        message=message,
-        ts_text=ts_text,
-    )
-    _write_sink_line(manager, line)
+            close_log_file()
 
 
 def _event_log_severity(topic: str, payload: Json) -> str | None:
@@ -268,26 +251,96 @@ def _failure_message(topic: str, payload: Json) -> str:
     return "; ".join(parts)
 
 
+class LogEventsMixin(_MixinBase):
+    """Mixin providing manager-log event sinks.
+
+    Phase 8.2.3: migrated ``_maybe_emit_manager_log_sink``,
+    ``_maybe_publish_log_event``, and the private ``_write_sink_line``
+    helper from module-level helpers to mixin methods. A
+    ``maybe_publish_log_event`` module-level forwarder is kept below
+    for ``tests.test_manager_log_events`` (which calls it directly).
+
+    At runtime ``_MixinBase`` is ``object``; only mypy sees
+    :class:`ManagerProtocol` as the base, which supplies signatures
+    for ``_manager_log_sink_event`` / ``_severity_rank`` /
+    ``_manager_log_sink_is_duplicate`` / ``_close_manager_log_sink_file``
+    / ``_emit_log`` (all still on ``Manager`` itself, scheduled to move
+    onto ``LogsMixin`` in §8.2.4).
+    """
+
+    # Owned-state attributes (concrete types declared on Manager).
+    _manager_log_stderr_enabled: bool
+    _manager_log_file: "TextIO | None"
+    _manager_log_min_level_rank: int
+
+    def _write_sink_line(self, line: str) -> None:
+        _write_sink_line_impl(
+            stderr_enabled=self._manager_log_stderr_enabled,
+            log_file=self._manager_log_file,
+            close_log_file=self._close_manager_log_sink_file,
+            line=line,
+        )
+
+    def _maybe_emit_manager_log_sink(self, topic: str, payload: Json) -> None:
+        try:
+            severity, line_topic, source_kind, source_id, message = (
+                self._manager_log_sink_event(topic, payload)
+            )
+        except Exception:
+            return
+        min_rank = self._manager_log_min_level_rank
+        if self._severity_rank(severity) < min_rank:
+            return
+        fingerprint = f"{severity}|{line_topic}|{source_kind}|{source_id}|{message}"
+        if self._manager_log_sink_is_duplicate(fingerprint):
+            return
+        ts_text = _sink_timestamp_text(payload)
+        line = _sink_line_text(
+            severity=severity,
+            line_topic=line_topic,
+            source_kind=source_kind,
+            source_id=source_id,
+            message=message,
+            ts_text=ts_text,
+        )
+        self._write_sink_line(line)
+
+    def _maybe_publish_log_event(self, topic: str, payload: Json) -> None:
+        severity = _event_log_severity(topic, payload)
+        if severity is None:
+            return
+        source_kind, source_id, device_id, process_id = _event_log_source(topic, payload)
+        message = payload.get("error") or payload.get("message") or ""
+        if topic == "manager.command":
+            message = _command_failure_message(payload)
+        elif topic.startswith("manager.device.auto_reconnect."):
+            message = _auto_reconnect_message(topic, payload)
+        elif (
+            topic.endswith("failed")
+            or topic.endswith("crashloop")
+            or "kill_timeout" in topic
+        ):
+            message = _failure_message(topic, payload)
+        self._emit_log(
+            severity=severity,
+            topic=topic,
+            message=str(message) if message is not None else "",
+            source_kind=source_kind,
+            source_id=source_id,
+            device_id=device_id,
+            process_id=process_id,
+            stream="event",
+            payload=payload,
+        )
+
+
+# --- Backward-compat module-level forwarder --------------------------
+# ``tests/test_manager_log_events.py`` imports ``maybe_publish_log_event``
+# directly and calls it against a ``SimpleNamespace`` stub. The body
+# lives on :class:`LogEventsMixin`; this trampoline delegates. (The
+# ``maybe_emit_manager_log_sink`` trampoline was removed as dead code
+# — no external importer exists; tests call the mixin form via
+# ``Manager._maybe_emit_manager_log_sink``.)
+
 def maybe_publish_log_event(manager: Any, topic: str, payload: Json) -> None:
-    severity = _event_log_severity(topic, payload)
-    if severity is None:
-        return
-    source_kind, source_id, device_id, process_id = _event_log_source(topic, payload)
-    message = payload.get("error") or payload.get("message") or ""
-    if topic == "manager.command":
-        message = _command_failure_message(payload)
-    elif topic.startswith("manager.device.auto_reconnect."):
-        message = _auto_reconnect_message(topic, payload)
-    elif topic.endswith("failed") or topic.endswith("crashloop") or "kill_timeout" in topic:
-        message = _failure_message(topic, payload)
-    manager._emit_log(
-        severity=severity,
-        topic=topic,
-        message=str(message) if message is not None else "",
-        source_kind=source_kind,
-        source_id=source_id,
-        device_id=device_id,
-        process_id=process_id,
-        stream="event",
-        payload=payload,
-    )
+    LogEventsMixin._maybe_publish_log_event(manager, topic, payload)

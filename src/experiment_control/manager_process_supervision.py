@@ -131,12 +131,14 @@ def _read_process_rss_bytes(pid: int) -> int | None:
 def _cached_process_rss_bytes(manager: Any, pid: int | None) -> int | None:
     if not isinstance(pid, int) or pid <= 0:
         return None
-    cache = getattr(manager, "_process_rss_cache", None)
-    if not isinstance(cache, dict):
-        cache = {}
-        setattr(manager, "_process_rss_cache", cache)
-    ttl_s = getattr(manager, "_process_rss_cache_ttl_s", 1.0)
-    ttl_s = float(ttl_s) if isinstance(ttl_s, (int, float)) else 1.0
+    # Production ``Manager`` initialises these via ``ManagerCaches``;
+    # the hasattr guards are a safety net for SimpleNamespace stubs.
+    if not hasattr(manager, "_process_rss_cache"):
+        manager._process_rss_cache = {}
+    if not hasattr(manager, "_process_rss_cache_ttl_s"):
+        manager._process_rss_cache_ttl_s = 1.0
+    cache = manager._process_rss_cache
+    ttl_s = manager._process_rss_cache_ttl_s
     now = time.monotonic()
     entry = cache.get(pid)
     if (
@@ -528,6 +530,9 @@ def adopt_with_process_guard(
 ) -> None:
     if popen is None:
         return
+    # Production ``Manager`` initialises these in ``__init__``; the
+    # hasattr fallbacks are a safety net for SimpleNamespace stubs that
+    # don't seed the process-guard bookkeeping.
     if not hasattr(manager, "_process_guard_attach_failures"):
         manager._process_guard_attach_failures = 0
     if not hasattr(manager, "_process_guard_last_error"):
@@ -1233,11 +1238,10 @@ def update_managed_process_exit_state(manager: Any, handle: Any, rc: int) -> boo
 
 
 def _recent_manager_loop_stall(manager: Any, now_mono: float) -> bool:
-    last_stall = getattr(manager, "_last_loop_stall_mono", None)
+    last_stall = manager._last_loop_stall_mono
     if last_stall is None:
         return False
-    recent_s = float(getattr(manager, "_manager_loop_stall_recent_s", 10.0))
-    return (now_mono - float(last_stall)) <= recent_s
+    return (now_mono - float(last_stall)) <= manager._manager_loop_stall_recent_s
 
 
 def _heartbeat_age_s(handle: Any, now_mono: float) -> float | None:
@@ -1250,15 +1254,23 @@ def _heartbeat_age_s(handle: Any, now_mono: float) -> float | None:
 
 def _publish_heartbeat_refresh_error(manager: Any, exc: Exception) -> None:
     now_mono = time.monotonic()
-    period_s = float(getattr(manager, "_process_hb_refresh_error_period_s", 10.0))
-    last_mono = getattr(manager, "_last_process_hb_refresh_error_mono", None)
+    # Production ``Manager`` initialises these unconditionally; the
+    # hasattr fallbacks are purely safety nets for SimpleNamespace
+    # test stubs that don't pre-populate the rate-limit bookkeeping.
+    if not hasattr(manager, "_process_hb_refresh_error_period_s"):
+        manager._process_hb_refresh_error_period_s = 10.0
+    if not hasattr(manager, "_last_process_hb_refresh_error_mono"):
+        manager._last_process_hb_refresh_error_mono = None
+    if not hasattr(manager, "_process_hb_refresh_error_suppressed"):
+        manager._process_hb_refresh_error_suppressed = 0
+    period_s = manager._process_hb_refresh_error_period_s
+    last_mono = manager._last_process_hb_refresh_error_mono
     if last_mono is not None and (now_mono - float(last_mono)) < period_s:
-        suppressed = int(getattr(manager, "_process_hb_refresh_error_suppressed", 0))
-        setattr(manager, "_process_hb_refresh_error_suppressed", suppressed + 1)
+        manager._process_hb_refresh_error_suppressed += 1
         return
-    suppressed = int(getattr(manager, "_process_hb_refresh_error_suppressed", 0))
-    setattr(manager, "_last_process_hb_refresh_error_mono", now_mono)
-    setattr(manager, "_process_hb_refresh_error_suppressed", 0)
+    suppressed = manager._process_hb_refresh_error_suppressed
+    manager._last_process_hb_refresh_error_mono = now_mono
+    manager._process_hb_refresh_error_suppressed = 0
     try:
         manager._publish_manager_event(
             "manager.process.heartbeat_refresh_failed",
@@ -1273,13 +1285,15 @@ def _publish_heartbeat_refresh_error(manager: Any, exc: Exception) -> None:
 
 
 def _refresh_pending_process_heartbeats(manager: Any) -> None:
-    sock = getattr(manager, "_process_hb_sub", None)
-    handler = getattr(manager, "_handle_process_pub", None)
-    if sock is None or not callable(handler):
+    # Production ``Manager`` always provides ``_process_hb_sub`` (via
+    # ``ManagerSockets``) and ``_handle_process_pub`` (instance method).
+    # The hasattr guards remain as safety nets for SimpleNamespace test
+    # stubs that exercise sibling helpers without a real socket.
+    if not hasattr(manager, "_process_hb_sub") or not hasattr(manager, "_handle_process_pub"):
         return
     try:
-        if sock.poll(0):
-            handler()
+        if manager._process_hb_sub.poll(0):
+            manager._handle_process_pub()
     except Exception as exc:
         _publish_heartbeat_refresh_error(manager, exc)
 
@@ -1317,9 +1331,8 @@ def enforce_managed_process_heartbeat_timeout(
 
     heartbeat_received = handle.last_hb_recv_mono is not None
     recent_stall = _recent_manager_loop_stall(manager, now_mono)
-    hard_multiplier = float(getattr(manager, "_heartbeat_hard_timeout_multiplier", 3.0))
-    hard_timeout_s = timeout_s * max(1.0, hard_multiplier)
-    strikes_to_fail = int(getattr(manager, "_heartbeat_stale_strikes_to_fail", 2))
+    hard_timeout_s = timeout_s * max(1.0, manager._heartbeat_hard_timeout_multiplier)
+    strikes_to_fail = manager._heartbeat_stale_strikes_to_fail
     # Rate-limit strikes to one per heartbeat_period_s. The supervision
     # check runs every ~50 ms; without this rate limit, two consecutive
     # checks ~100 ms apart would race past strikes_to_fail=2 even when
@@ -1436,3 +1449,130 @@ def supervise_managed_processes(manager: Any, now_mono: float) -> None:
         manager._enforce_managed_process_heartbeat_timeout(handle, now_mono)
         manager._enforce_managed_process_stop_timeout(handle, now_mono)
         manager._maybe_restart_managed_process(handle, now_mono)
+
+
+class ProcessSupervisionMixin:
+    """Thin mixin exposing process-supervision entry points used by Manager.
+
+    Phase 8.2.16: ``manager_process_supervision.py`` is the largest
+    helper module (1450 LOC, 35+ ``manager``-taking functions).
+    Most are internal to the device-driver / managed-process
+    supervision state machines and are not called from Manager
+    directly. The mixin wraps only the ~24 functions Manager actually
+    forwarded — every wrapper is one line and Manager's forwarder
+    methods can be deleted, letting MRO take over.
+
+    Functions that need Manager-side state-enum classes (``Liveness``,
+    ``ProcessHandle``) stay as Manager forwarders because the mixin
+    can't import those without a circular dependency:
+    - ``stop_driver`` / ``_mark_device_offline`` pass ``Liveness.OFFLINE``
+    - ``add_process`` passes ``handle_cls=ProcessHandle``
+    """
+
+    # -- driver-side (start/restart are PUBLIC on Manager) -------------
+
+    def start_driver(self, device_id: str) -> None:
+        start_driver(self, device_id)
+
+    def restart_driver(self, device_id: str, *, force: bool = False) -> None:
+        restart_driver(self, device_id, force=force)
+
+    def _driver_is_started(self, handle: Any) -> bool:
+        return driver_is_started(handle)
+
+    def _driver_is_stopped(self, handle: Any) -> bool:
+        return driver_is_stopped(handle)
+
+    def _build_driver_cmd(self, spec: Any) -> list[str]:
+        return build_driver_cmd(self, spec)
+
+    # -- router supervision --------------------------------------------
+
+    # ``_build_router_spec`` stays a Manager-side wrapper because it
+    # passes ``process_spec_cls=ProcessSpec`` and
+    # ``restart_policy_always=RestartPolicy.ALWAYS`` (Manager-module
+    # enums the mixin can't reach without a circular import).
+
+    def _ensure_router_handle(self) -> Any:
+        return ensure_router_handle(self)
+
+    def _ensure_router_running(self, *, timeout_s: float, poll_ms: int) -> None:
+        ensure_router_running(self, timeout_s=timeout_s, poll_ms=poll_ms)
+
+    # -- process-handle lifecycle --------------------------------------
+
+    def _require_process(self, process_id: str) -> Any:
+        return require_process(self, process_id)
+
+    def _resolve_process_heartbeat_endpoint(self, spec: Any) -> str:
+        return resolve_process_heartbeat_endpoint(self, spec)
+
+    def _resolve_process_data_endpoint(self, spec: Any) -> str:
+        return resolve_process_data_endpoint(self, spec)
+
+    def _connect_process_heartbeat(self, endpoint: str) -> None:
+        connect_process_heartbeat(self, endpoint)
+
+    def _connect_process_data(self, endpoint: str) -> None:
+        connect_process_data(self, endpoint)
+
+    def _expand_process_argv(self, argv: list[str], handle: Any) -> list[str]:
+        return expand_process_argv(self, argv, handle)
+
+    def _start_process_handle(
+        self, handle: Any, *, reset_collision_retry: bool = True
+    ) -> None:
+        start_process_handle(
+            self, handle, reset_collision_retry=reset_collision_retry
+        )
+
+    def _stop_process_handle(self, handle: Any) -> None:
+        stop_process_handle(self, handle)
+
+    def _maybe_schedule_restart(self, handle: Any, now_mono: float) -> None:
+        maybe_schedule_restart(self, handle, now_mono)
+
+    def _try_restart_process(self, handle: Any) -> None:
+        try_restart_process(self, handle)
+
+    def _process_snapshot(self, handle: Any) -> Json:
+        return process_snapshot(self, handle)
+
+    # -- supervisor tick ------------------------------------------------
+
+    def _update_device_driver_exit_state(self, handle: Any, rc: int) -> None:
+        update_device_driver_exit_state(self, handle, rc)
+
+    def _enforce_device_driver_stop_timeout(
+        self, handle: Any, now_mono: float
+    ) -> None:
+        enforce_device_driver_stop_timeout(self, handle, now_mono)
+
+    def _maybe_restart_device_driver(
+        self, device_id: str, handle: Any, now_mono: float
+    ) -> None:
+        maybe_restart_device_driver(self, device_id, handle, now_mono)
+
+    def _supervise_device_drivers(self, now_mono: float) -> None:
+        supervise_device_drivers(self, now_mono)
+
+    def _update_managed_process_exit_state(self, handle: Any, rc: int) -> bool:
+        return update_managed_process_exit_state(self, handle, rc)
+
+    def _enforce_managed_process_heartbeat_timeout(
+        self, handle: Any, now_mono: float
+    ) -> None:
+        enforce_managed_process_heartbeat_timeout(self, handle, now_mono)
+
+    def _enforce_managed_process_stop_timeout(
+        self, handle: Any, now_mono: float
+    ) -> None:
+        enforce_managed_process_stop_timeout(self, handle, now_mono)
+
+    def _maybe_restart_managed_process(
+        self, handle: Any, now_mono: float
+    ) -> None:
+        maybe_restart_managed_process(self, handle, now_mono)
+
+    def _supervise_managed_processes(self, now_mono: float) -> None:
+        supervise_managed_processes(self, now_mono)

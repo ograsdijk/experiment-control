@@ -30,10 +30,24 @@ class _FakeSocket:
 
 
 class _DummyLogManager:
+    """Test stub mirroring the Manager attrs the supervisor-log helpers read.
+
+    Phase 8.2.10 moved the helpers onto :class:`ProcessLogsMixin`; the
+    module-level ``append_supervisor_marker`` trampoline calls
+    ``self._append_supervisor_jsonl`` (a mixin method) so the stub
+    now binds that method too.
+    """
+
     def __init__(self, directory: Path, *, max_bytes: int = 10_000, backups: int = 3) -> None:
         self._supervisor_log_dir = directory
         self._supervisor_log_max_bytes = max_bytes
         self._supervisor_log_backups = backups
+        # Bind the mixin methods the trampolines call back through.
+        from experiment_control.manager_process_logs import ProcessLogsMixin
+
+        self._append_supervisor_jsonl = (
+            lambda item: ProcessLogsMixin._append_supervisor_jsonl(self, item)
+        )
 
 
 class ProcessDiagnosticsTests(unittest.TestCase):

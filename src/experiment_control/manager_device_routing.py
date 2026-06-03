@@ -4,7 +4,13 @@ import copy
 import time
 from typing import Any, Callable
 
+from .utils.responses import RpcResponse
+
 Json = dict[str, Any]
+
+
+def _rpc_failure(code: str, message: str | None = None) -> Json:
+    return RpcResponse.failure(code, message=message).to_dict()
 
 
 def route_device_request(manager: Any, rtype: Any, req: Json) -> Json | None:
@@ -15,11 +21,41 @@ def route_device_request(manager: Any, rtype: Any, req: Json) -> Json | None:
 
 
 def _unknown_device_response(device_id: str) -> Json:
-    return {"ok": False, "error": f"Unknown device_id {device_id!r}"}
+    # Structured envelope (matches sibling routes that use
+    # ``_rpc_failure`` for the same condition). Client code can read
+    # ``resp["error"]["code"] == "unknown_device"`` without having to
+    # handle a string-vs-dict polymorphism for the same failure mode.
+    return _rpc_failure("unknown_device", f"Unknown device_id {device_id!r}")
 
 
 def _forward_device_request(manager: Any, req: Json) -> Json | None:
     return manager._federation_hub.forward_device_request(req)
+
+
+def _resolve_local_device(manager: Any, req: Json) -> tuple[str | None, Any, Json | None]:
+    """Resolve ``req["device_id"]`` to a local handle, or forward to federation.
+
+    Precedence matches the pre-refactor behaviour: the local ``_devices``
+    table wins. Only when the device is not registered locally do we ask
+    the federation hub to forward the request. This preserves the
+    long-standing invariant that a device_id present in the local
+    manager is *the* canonical owner; federation mirrors are only
+    consulted as a fallback. Changing this ordering would silently
+    re-route locally-owned devices through the federation path if a
+    duplicate id is ever introduced.
+
+    Returns ``(device_id, handle, None)`` on a local match, or
+    ``(None, None, response)`` when federation handled the request or
+    the device is unknown.
+    """
+    device_id = str(req["device_id"])
+    handle = manager._devices.get(device_id)
+    if handle is not None:
+        return device_id, handle, None
+    fed_resp = _forward_device_request(manager, req)
+    if fed_resp is not None:
+        return None, None, fed_resp
+    return device_id, None, _unknown_device_response(device_id)
 
 
 def _route_command(manager: Any, req: Json) -> Json:
@@ -35,14 +71,11 @@ def _route_command(manager: Any, req: Json) -> Json:
     )
     if not isinstance(params, dict):
         raise TypeError("params must be a dict")
-    handle = manager._devices.get(device_id)
-    if handle is None:
-        fed_resp = _forward_device_request(manager, req)
-        if fed_resp is not None:
-            return fed_resp
-        return _unknown_device_response(device_id)
+    _, handle, error_resp = _resolve_local_device(manager, req)
+    if error_resp is not None:
+        return error_resp
     if manager._driver_is_stopped(handle) or handle.rpc_endpoint is None:
-        return {"ok": False, "error": "driver not running"}
+        return _rpc_failure("driver_not_running", "driver not running")
     cmd = {"device_id": device_id, "action": action, "params": params}
     ok, new_cmd, err = manager._apply_command_interceptors(
         cmd,
@@ -50,9 +83,12 @@ def _route_command(manager: Any, req: Json) -> Json:
         caller_process_id=caller_process_id,
     )
     if not ok:
-        return {"ok": False, "error": err}
+        return _rpc_failure(
+            "command_interceptor_rejected",
+            None if err is None else str(err),
+        )
     if new_cmd is None:
-        return {"ok": False, "error": "command blocked"}
+        return _rpc_failure("command_blocked", "command blocked")
     return manager._call_device_rpc(
         device_id=str(new_cmd.get("device_id", device_id)),
         action=str(new_cmd.get("action", action)),
@@ -69,31 +105,17 @@ def _route_federation_capabilities_update(manager: Any, req: Json) -> Json:
     device_id = str(req.get("device_id", ""))
     capabilities = req.get("capabilities")
     if not device_id:
-        return {
-            "ok": False,
-            "error": {
-                "code": "invalid_federation_update",
-                "message": "missing device_id",
-            },
-        }
+        return _rpc_failure("invalid_federation_update", "missing device_id")
     if not isinstance(capabilities, dict):
-        return {
-            "ok": False,
-            "error": {
-                "code": "invalid_federation_update",
-                "message": "capabilities must be a dict",
-            },
-        }
+        return _rpc_failure(
+            "invalid_federation_update", "capabilities must be a dict"
+        )
     try:
         manager._federation_hub.update_capabilities(device_id, capabilities)
     except KeyError:
-        return {
-            "ok": False,
-            "error": {
-                "code": "unknown_device",
-                "message": f"Unknown mirrored device_id {device_id!r}",
-            },
-        }
+        return _rpc_failure(
+            "unknown_device", f"Unknown mirrored device_id {device_id!r}"
+        )
     return {"ok": True, "result": {"device_id": device_id}}
 
 
@@ -113,60 +135,54 @@ def _route_device_list_status(manager: Any, req: Json) -> Json:
 
 
 def _route_device_driver_start(manager: Any, req: Json) -> Json:
-    device_id = str(req["device_id"])
-    fed_resp = _forward_device_request(manager, req)
-    if fed_resp is not None:
-        return fed_resp
-    handle = manager._devices.get(device_id)
-    if handle is None:
-        return _unknown_device_response(device_id)
+    device_id, handle, error_resp = _resolve_local_device(manager, req)
+    if error_resp is not None:
+        return error_resp
+    assert device_id is not None
     if manager._driver_is_started(handle):
-        return {"ok": False, "error": "driver already started"}
+        return _rpc_failure("driver_already_started", "driver already started")
     manager.start_driver(device_id)
     return {"ok": True, "result": {"device_id": device_id}}
 
 
 def _route_device_driver_stop(manager: Any, req: Json) -> Json:
-    device_id = str(req["device_id"])
+    device_id, handle, error_resp = _resolve_local_device(manager, req)
+    if error_resp is not None:
+        return error_resp
+    assert device_id is not None
     force = bool(req.get("force", False))
-    fed_resp = _forward_device_request(manager, req)
-    if fed_resp is not None:
-        return fed_resp
-    handle = manager._devices.get(device_id)
-    if handle is None:
-        return _unknown_device_response(device_id)
     if manager._driver_is_stopped(handle):
-        return {"ok": False, "error": "driver already stopped"}
+        return _rpc_failure("driver_already_stopped", "driver already stopped")
     manager.stop_driver(device_id, force=force)
     return {"ok": True, "result": {"device_id": device_id}}
 
 
 def _route_device_driver_restart(manager: Any, req: Json) -> Json:
-    device_id = str(req["device_id"])
+    device_id, _, error_resp = _resolve_local_device(manager, req)
+    if error_resp is not None:
+        return error_resp
+    assert device_id is not None
     force = bool(req.get("force", False))
-    fed_resp = _forward_device_request(manager, req)
-    if fed_resp is not None:
-        return fed_resp
     manager.restart_driver(device_id, force=force)
     return {"ok": True, "result": {"device_id": device_id}}
 
 
 def _route_device_recover(manager: Any, req: Json) -> Json:
-    device_id = str(req["device_id"])
+    device_id, _, error_resp = _resolve_local_device(manager, req)
+    if error_resp is not None:
+        return error_resp
+    assert device_id is not None
     reconnect = bool(req.get("reconnect", True))
     force = bool(req.get("force", False))
-    fed_resp = _forward_device_request(manager, req)
-    if fed_resp is not None:
-        return fed_resp
     manager.recover_device(device_id, reconnect=reconnect, force=force)
     return {"ok": True, "result": {"device_id": device_id}}
 
 
 def _route_device_connect(manager: Any, req: Json) -> Json:
-    device_id = str(req["device_id"])
-    fed_resp = _forward_device_request(manager, req)
-    if fed_resp is not None:
-        return fed_resp
+    device_id, _, error_resp = _resolve_local_device(manager, req)
+    if error_resp is not None:
+        return error_resp
+    assert device_id is not None
     resp = manager.connect_device(device_id)
     manager._publish_manager_event(
         "manager.device.connect_sent",
@@ -178,21 +194,25 @@ def _route_device_connect(manager: Any, req: Json) -> Json:
     )
     if manager._device_rpc_status_ok(resp):
         return {"ok": True, "result": resp}
-    error: Json = {
-        "code": str(resp.get("error_code") or "device_error"),
-        "message": manager._device_rpc_error_text(resp),
-    }
-    details = resp.get("error_details")
-    if isinstance(details, dict):
-        error["details"] = details
-    return {"ok": False, "error": error, "result": resp}
+    # Route the ok-but-with-result-payload failure through RpcResponse
+    # so the wire envelope is built by the same factory as every other
+    # failure in this module. Keeps shape changes (e.g., future
+    # trace_id / request_id additions) in a single source of truth.
+    details_raw = resp.get("error_details")
+    return RpcResponse.failure(
+        str(resp.get("error_code") or "device_error"),
+        message=manager._device_rpc_error_text(resp),
+        details=details_raw if isinstance(details_raw, dict) else None,
+        result=resp,
+        include_result=True,
+    ).to_dict()
 
 
 def _route_device_disconnect(manager: Any, req: Json) -> Json:
-    device_id = str(req["device_id"])
-    fed_resp = _forward_device_request(manager, req)
-    if fed_resp is not None:
-        return fed_resp
+    device_id, _, error_resp = _resolve_local_device(manager, req)
+    if error_resp is not None:
+        return error_resp
+    assert device_id is not None
     resp = manager.disconnect_device(device_id)
     manager._publish_manager_event(
         "manager.device.disconnect_sent",
@@ -230,32 +250,19 @@ def _route_device_config_list(manager: Any, req: Json) -> Json:
 def _resolve_runtime_metadata_target(manager: Any, req: Json) -> tuple[str | None, Any, Json | None]:
     device_id = str(req.get("device_id", "")).strip()
     if not device_id:
-        return (
-            None,
-            None,
-            {
-                "ok": False,
-                "error": {
-                    "code": "invalid_device_id",
-                    "message": "device_id is required",
-                },
-            },
-        )
+        return None, None, _rpc_failure("invalid_device_id", "device_id is required")
     if manager._federation_hub.is_mirrored_device(device_id):
         return (
             None,
             None,
-            {
-                "ok": False,
-                "error": {
-                    "code": "remote_device_unsupported",
-                    "message": "runtime metadata overrides only apply to local devices",
-                },
-            },
+            _rpc_failure(
+                "remote_device_unsupported",
+                "runtime metadata overrides only apply to local devices",
+            ),
         )
     handle = manager._devices.get(device_id)
     if handle is None:
-        return None, None, {"ok": False, "error": {"code": "unknown_device"}}
+        return None, None, _rpc_failure("unknown_device")
     return device_id, handle, None
 
 
@@ -277,23 +284,14 @@ def _parse_metadata_set_config(params: Any) -> tuple[dict[str, Any] | None, str 
         return (
             None,
             None,
-            {
-                "ok": False,
-                "error": {"code": "invalid_params", "message": "params must be a dict"},
-            },
+            _rpc_failure("invalid_params", "params must be a dict"),
         )
     mode = str(normalized.get("mode", "merge")).strip().lower()
     if mode not in {"merge", "replace"}:
         return (
             None,
             None,
-            {
-                "ok": False,
-                "error": {
-                    "code": "invalid_params",
-                    "message": "mode must be 'merge' or 'replace'",
-                },
-            },
+            _rpc_failure("invalid_params", "mode must be 'merge' or 'replace'"),
         )
     has_device = "device_metadata" in normalized
     has_stream = "stream_metadata" in normalized
@@ -301,13 +299,9 @@ def _parse_metadata_set_config(params: Any) -> tuple[dict[str, Any] | None, str 
         return (
             None,
             None,
-            {
-                "ok": False,
-                "error": {
-                    "code": "invalid_params",
-                    "message": "device_metadata and/or stream_metadata required",
-                },
-            },
+            _rpc_failure(
+                "invalid_params", "device_metadata and/or stream_metadata required"
+            ),
         )
     return normalized, mode, None
 
@@ -350,7 +344,7 @@ def _parse_metadata_payloads(
             None,
             False,
             False,
-            {"ok": False, "error": {"code": "invalid_params", "message": str(e)}},
+            _rpc_failure("invalid_params", str(e)),
         )
     return parsed_device, parsed_stream, clear_device, clear_stream, None
 
@@ -527,19 +521,12 @@ def _route_device_metadata_clear(manager: Any, req: Json) -> Json:
     if params is None:
         params = {}
     if not isinstance(params, dict):
-        return {
-            "ok": False,
-            "error": {"code": "invalid_params", "message": "params must be a dict"},
-        }
+        return _rpc_failure("invalid_params", "params must be a dict")
     scope = str(params.get("scope", "all")).strip().lower()
     if scope not in {"all", "device", "stream"}:
-        return {
-            "ok": False,
-            "error": {
-                "code": "invalid_params",
-                "message": "scope must be 'all', 'device', or 'stream'",
-            },
-        }
+        return _rpc_failure(
+            "invalid_params", "scope must be 'all', 'device', or 'stream'"
+        )
 
     changed = False
     if scope in {"all", "device"} and device_id in manager._runtime_device_metadata_overrides:
@@ -575,3 +562,24 @@ _DEVICE_ROUTE_HANDLERS: dict[str, Callable[[Any, Json], Json]] = {
     "device.metadata.set": _route_device_metadata_set,
     "device.metadata.clear": _route_device_metadata_clear,
 }
+
+
+class DeviceRoutingMixin:
+    """Thin mixin exposing the single public device-routing entry point.
+
+    Phase 8.2.14: ``manager_device_routing.py`` exposes 19+ private
+    ``_route_device_*`` handlers and a top-level ``route_device_request``
+    dispatcher. ``Manager`` only ever forwarded to ``route_device_request``;
+    the per-handler functions are dispatch-internal. Wrapping
+    ``route_device_request`` on this mixin lets the Manager forwarder
+    method (``_route_device_request``) be deleted and MRO take over.
+
+    The module-level ``route_device_request`` callable is preserved
+    because ``InternalRpcMixin`` uses it via ``self._route_device_request``
+    -> MRO -> mixin method (no direct module-level call needed). Other
+    helpers in this file remain module-level — they form a tight
+    dispatch table that doesn't benefit from per-method migration.
+    """
+
+    def _route_device_request(self, rtype: Any, req: Json) -> Json | None:
+        return route_device_request(self, rtype, req)

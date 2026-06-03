@@ -4,13 +4,23 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .utils.logging_levels import (
     is_valid_log_severity,
     normalize_log_severity,
     severity_rank,
 )
+
+if TYPE_CHECKING:
+    from collections import deque
+    from typing import TextIO
+
+    from .manager_protocol import ManagerProtocol
+
+    _MixinBase = ManagerProtocol
+else:
+    _MixinBase = object
 
 Json = dict[str, Any]
 
@@ -30,7 +40,9 @@ def parse_boolish(raw: Any, *, default: bool) -> bool:
     return bool(default)
 
 
-def resolve_manager_log_stderr_enabled(manager: Any, raw: Any) -> bool:
+def resolve_manager_log_stderr_enabled(raw: Any) -> bool:
+    # ``manager`` first arg was vestigial — never read. Dropped in
+    # Phase 8.2.4 so the function reads cleanly as a pure utility.
     if raw is None:
         return parse_boolish(os.environ.get("MANAGER_LOG_STDERR"), default=True)
     return parse_boolish(raw, default=True)
@@ -60,90 +72,6 @@ def resolve_manager_log_min_level(raw: Any) -> str:
     return normalize_log_severity(text, default="error")
 
 
-def open_manager_log_sink_file(manager: Any) -> None:
-    path = manager._manager_log_file_path
-    if path is None:
-        return
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        manager._manager_log_file = path.open("a", encoding="utf-8", buffering=1)
-    except Exception as exc:
-        manager._manager_log_file = None
-        if manager._manager_log_stderr_enabled:
-            try:
-                sys.stderr.write(
-                    f"[manager][warning] MANAGER_LOG_FILE open failed: {path} ({exc})\n"
-                )
-                sys.stderr.flush()
-            except Exception:
-                pass
-
-
-def close_manager_log_sink_file(manager: Any) -> None:
-    handle = manager._manager_log_file
-    manager._manager_log_file = None
-    if handle is None:
-        return
-    try:
-        handle.close()
-    except Exception:
-        pass
-
-
-def manager_log_sink_event(
-    manager: Any, topic: str, payload: Json
-) -> tuple[str, str, str, str | None, str]:
-    if topic == "manager.log":
-        severity = normalize_log_severity(payload.get("severity"), default="info")
-        line_topic = manager._normalize_topic(str(payload.get("topic") or "manager.log"))
-    elif topic.startswith("manager.") and topic.endswith("_error"):
-        severity = "error"
-        line_topic = manager._normalize_topic(topic)
-    else:
-        raise ValueError("not sink-eligible")
-
-    source_kind = normalize_id(payload.get("source_kind")) or "manager"
-    source_id = normalize_id(payload.get("source_id"))
-    message = payload.get("message")
-    if message is None:
-        message = payload.get("error")
-    text = str(message or "").strip()
-    if not text:
-        payload_json = payload.get("payload_json")
-        if isinstance(payload_json, str) and payload_json.strip():
-            text = payload_json.strip()
-        else:
-            text = manager._safe_json(payload)
-    text = text.replace("\r\n", " ").replace("\n", " ").replace("\r", " ").strip()
-    if len(text) > 500:
-        text = text[:497] + "..."
-    return severity, line_topic, source_kind, source_id, text
-
-
-def manager_log_sink_is_duplicate(manager: Any, fingerprint: str) -> bool:
-    now = time.monotonic()
-    recent = getattr(manager, "_manager_log_sink_recent", None)
-    if not isinstance(recent, dict):
-        recent = {}
-        manager._manager_log_sink_recent = recent
-    window_s = float(getattr(manager, "_manager_log_sink_recent_window_s", 0.5))
-    max_items = int(getattr(manager, "_manager_log_sink_recent_max", 256))
-    prev = recent.get(fingerprint)
-    if prev is not None and (now - prev) <= window_s:
-        return True
-    recent[fingerprint] = now
-    if len(recent) > max_items:
-        cutoff = now - window_s
-        drop = [key for key, ts in recent.items() if ts < cutoff]
-        for key in drop:
-            recent.pop(key, None)
-        if len(recent) > max_items:
-            overflow = len(recent) - max_items
-            for key in list(recent.keys())[:overflow]:
-                recent.pop(key, None)
-    return False
-
-
 def normalize_id(raw: Any) -> str | None:
     if raw is None:
         return None
@@ -165,100 +93,6 @@ def normalize_log_ts(raw: Any) -> Json:
     except Exception:
         t_mono = now_mono
     return {"t_wall": t_wall, "t_mono": t_mono}
-
-
-def emit_log(
-    manager: Any,
-    *,
-    severity: Any,
-    topic: Any,
-    message: Any,
-    source_kind: Any = "manager",
-    source_id: Any = None,
-    device_id: Any = None,
-    process_id: Any = None,
-    stream: Any = "event",
-    payload: Json | None = None,
-    payload_json: Any = None,
-    ts: Any = None,
-) -> Json:
-    sev = normalize_log_severity(severity, default="info")
-    normalized_topic = manager._normalize_topic(str(topic or "manager.log"))
-    source_kind_text = normalize_id(source_kind) or "manager"
-    source_id_text = normalize_id(source_id)
-    device_id_text = normalize_id(device_id)
-    process_id_text = normalize_id(process_id)
-    stream_text = normalize_id(stream) or "event"
-    msg_text = str(message or "")
-
-    if payload_json is None:
-        payload_json_text = manager._safe_json(payload) if payload is not None else ""
-    else:
-        payload_json_text = str(payload_json)
-        if len(payload_json_text) > 4000:
-            payload_json_text = payload_json_text[:4000] + "...(truncated)"
-
-    entry: Json = {
-        "version": 1,
-        "severity": sev,
-        "topic": normalized_topic,
-        "source_kind": source_kind_text,
-        "source_id": source_id_text,
-        "device_id": device_id_text,
-        "process_id": process_id_text,
-        "stream": stream_text,
-        "message": msg_text,
-        "payload_json": payload_json_text,
-        "ts": normalize_log_ts(ts),
-    }
-    manager._log_history.append(entry)
-    manager._publish_manager_event("manager.log", entry)
-    return entry
-
-
-def emit_log_from_payload(
-    manager: Any, payload: Json, *, default_topic: str = "manager.log"
-) -> Json:
-    source_kind = payload.get("source_kind")
-    source_id = payload.get("source_id")
-    device_id = payload.get("device_id")
-    process_id = payload.get("process_id")
-
-    if source_kind is None:
-        if process_id is not None:
-            source_kind = "process"
-            if source_id is None:
-                source_id = process_id
-        elif device_id is not None:
-            source_kind = "driver"
-            if source_id is None:
-                source_id = device_id
-        else:
-            source_kind = "manager"
-
-    message = payload.get("message")
-    if message is None:
-        message = payload.get("error", "")
-
-    raw_payload: Json | None = None
-    payload_value = payload.get("payload")
-    if isinstance(payload_value, dict):
-        raw_payload = payload_value
-
-    return emit_log(
-        manager,
-        severity=payload.get("severity", "info"),
-        topic=payload.get("topic", default_topic),
-        message=message,
-        source_kind=source_kind,
-        source_id=source_id,
-        device_id=device_id,
-        process_id=process_id,
-        stream=payload.get("stream", "event"),
-        payload=raw_payload,
-        payload_json=payload.get("payload_json"),
-        ts=payload.get("ts"),
-    )
 
 
 def normalize_filter_set(raw: Any, *, field: str) -> set[str] | None:
@@ -296,7 +130,9 @@ def parse_log_tail_since_t_mono(raw: Any) -> float | None:
         raise TypeError(f"since_t_mono must be float: {exc}") from exc
 
 
-def log_tail_filters(manager: Any, params: Json) -> dict[str, Any]:
+def log_tail_filters(params: Json) -> dict[str, Any]:
+    # ``manager`` first arg was vestigial — never read. Dropped in
+    # Phase 8.2.4.
     severity_min_raw = params.get("severity_min")
     severity_min_rank: int | None = None
     if severity_min_raw is not None:
@@ -329,8 +165,11 @@ def log_tail_entry_t_mono(entry: Json) -> float | None:
     ts = entry.get("ts")
     if not isinstance(ts, dict):
         return None
+    raw = ts.get("t_mono")
+    if raw is None:
+        return None
     try:
-        return float(ts.get("t_mono"))
+        return float(raw)
     except Exception:
         return None
 
@@ -411,27 +250,230 @@ def log_tail_entry_matches(entry: Json, *, filters: dict[str, Any]) -> bool:
     return log_tail_matches_contains(entry, filters=filters)
 
 
-def log_tail(manager: Any, params: Json) -> Json:
-    limit = parse_log_tail_limit(params.get("limit", 200))
-    filters = log_tail_filters(manager, params)
+class LogsMixin(_MixinBase):
+    """Mixin providing manager-log emit, sink, and tail helpers.
 
-    filtered: list[Json] = []
-    for entry in list(manager._log_history):
-        if log_tail_entry_matches(entry, filters=filters):
-            filtered.append(entry)
+    Phase 8.2.4: migrated ``open_manager_log_sink_file``,
+    ``close_manager_log_sink_file``, ``manager_log_sink_event``,
+    ``manager_log_sink_is_duplicate``, ``emit_log``,
+    ``emit_log_from_payload``, and ``log_tail`` from module-level
+    helpers to mixin methods. Also dropped the unused trampoline
+    methods on ``Manager`` (``_log_tail_filters``, ``_log_tail_matches_*``,
+    ``_normalize_filter_set``, ``_parse_log_tail_*``) — none had
+    external callers; the underlying pure helpers remain at module
+    level for direct use.
 
-    total = len(filtered)
-    if total > limit:
-        filtered = filtered[-limit:]
+    At runtime ``_MixinBase`` is ``object``; only mypy sees
+    :class:`ManagerProtocol` as the base, supplying signatures for
+    ``_safe_json``, ``_normalize_topic``, and ``_publish_manager_event``
+    that this mixin invokes via ``self``.
+    """
 
-    latest_t_mono: float | None = None
-    if filtered:
-        latest_t_mono = log_tail_entry_t_mono(filtered[-1])
+    # Owned-state attributes (concrete types declared on Manager).
+    _manager_log_file_path: "Path | None"
+    _manager_log_file: "TextIO | None"
+    _manager_log_stderr_enabled: bool
+    _manager_log_sink_recent: dict[str, float]
+    _manager_log_sink_recent_window_s: float
+    _manager_log_sink_recent_max: int
+    # ``Manager.__init__`` allocates ``deque(maxlen=...)`` at line ~701
+    # — NOT a plain list. Annotating as ``deque`` keeps mypy honest if
+    # a future caller reaches for list-only ops (slicing, indexing).
+    _log_history: "deque[Json]"
 
-    return {
-        "entries": filtered,
-        "count": len(filtered),
-        "total_matched": total,
-        "limit": limit,
-        "latest_t_mono": latest_t_mono,
-    }
+    def _open_manager_log_sink_file(self) -> None:
+        path = self._manager_log_file_path
+        if path is None:
+            return
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            self._manager_log_file = path.open("a", encoding="utf-8", buffering=1)
+        except Exception as exc:
+            self._manager_log_file = None
+            if self._manager_log_stderr_enabled:
+                try:
+                    sys.stderr.write(
+                        f"[manager][warning] MANAGER_LOG_FILE open failed: {path} ({exc})\n"
+                    )
+                    sys.stderr.flush()
+                except Exception:
+                    pass
+
+    def _close_manager_log_sink_file(self) -> None:
+        handle = self._manager_log_file
+        self._manager_log_file = None
+        if handle is None:
+            return
+        try:
+            handle.close()
+        except Exception:
+            pass
+
+    def _manager_log_sink_event(
+        self, topic: str, payload: Json
+    ) -> tuple[str, str, str, str | None, str]:
+        if topic == "manager.log":
+            severity = normalize_log_severity(payload.get("severity"), default="info")
+            line_topic = self._normalize_topic(
+                str(payload.get("topic") or "manager.log")
+            )
+        elif topic.startswith("manager.") and topic.endswith("_error"):
+            severity = "error"
+            line_topic = self._normalize_topic(topic)
+        else:
+            raise ValueError("not sink-eligible")
+
+        source_kind = normalize_id(payload.get("source_kind")) or "manager"
+        source_id = normalize_id(payload.get("source_id"))
+        message = payload.get("message")
+        if message is None:
+            message = payload.get("error")
+        text = str(message or "").strip()
+        if not text:
+            payload_json = payload.get("payload_json")
+            if isinstance(payload_json, str) and payload_json.strip():
+                text = payload_json.strip()
+            else:
+                text = self._safe_json(payload)
+        text = text.replace("\r\n", " ").replace("\n", " ").replace("\r", " ").strip()
+        if len(text) > 500:
+            text = text[:497] + "..."
+        return severity, line_topic, source_kind, source_id, text
+
+    def _manager_log_sink_is_duplicate(self, fingerprint: str) -> bool:
+        now = time.monotonic()
+        recent = self._manager_log_sink_recent
+        window_s = self._manager_log_sink_recent_window_s
+        max_items = self._manager_log_sink_recent_max
+        prev = recent.get(fingerprint)
+        if prev is not None and (now - prev) <= window_s:
+            return True
+        recent[fingerprint] = now
+        if len(recent) > max_items:
+            cutoff = now - window_s
+            drop = [key for key, ts in recent.items() if ts < cutoff]
+            for key in drop:
+                recent.pop(key, None)
+            if len(recent) > max_items:
+                overflow = len(recent) - max_items
+                for key in list(recent.keys())[:overflow]:
+                    recent.pop(key, None)
+        return False
+
+    def _emit_log(
+        self,
+        *,
+        severity: Any,
+        topic: Any,
+        message: Any,
+        source_kind: Any = "manager",
+        source_id: Any = None,
+        device_id: Any = None,
+        process_id: Any = None,
+        stream: Any = "event",
+        payload: Json | None = None,
+        payload_json: Any = None,
+        ts: Any = None,
+    ) -> Json:
+        sev = normalize_log_severity(severity, default="info")
+        normalized_topic = self._normalize_topic(str(topic or "manager.log"))
+        source_kind_text = normalize_id(source_kind) or "manager"
+        source_id_text = normalize_id(source_id)
+        device_id_text = normalize_id(device_id)
+        process_id_text = normalize_id(process_id)
+        stream_text = normalize_id(stream) or "event"
+        msg_text = str(message or "")
+
+        if payload_json is None:
+            payload_json_text = (
+                self._safe_json(payload) if payload is not None else ""
+            )
+        else:
+            payload_json_text = str(payload_json)
+            if len(payload_json_text) > 4000:
+                payload_json_text = payload_json_text[:4000] + "...(truncated)"
+
+        entry: Json = {
+            "version": 1,
+            "severity": sev,
+            "topic": normalized_topic,
+            "source_kind": source_kind_text,
+            "source_id": source_id_text,
+            "device_id": device_id_text,
+            "process_id": process_id_text,
+            "stream": stream_text,
+            "message": msg_text,
+            "payload_json": payload_json_text,
+            "ts": normalize_log_ts(ts),
+        }
+        self._log_history.append(entry)
+        self._publish_manager_event("manager.log", entry)
+        return entry
+
+    def _emit_log_from_payload(
+        self, payload: Json, *, default_topic: str = "manager.log"
+    ) -> Json:
+        source_kind = payload.get("source_kind")
+        source_id = payload.get("source_id")
+        device_id = payload.get("device_id")
+        process_id = payload.get("process_id")
+
+        if source_kind is None:
+            if process_id is not None:
+                source_kind = "process"
+                if source_id is None:
+                    source_id = process_id
+            elif device_id is not None:
+                source_kind = "driver"
+                if source_id is None:
+                    source_id = device_id
+            else:
+                source_kind = "manager"
+
+        message = payload.get("message")
+        if message is None:
+            message = payload.get("error", "")
+
+        raw_payload: Json | None = None
+        payload_value = payload.get("payload")
+        if isinstance(payload_value, dict):
+            raw_payload = payload_value
+
+        return self._emit_log(
+            severity=payload.get("severity", "info"),
+            topic=payload.get("topic", default_topic),
+            message=message,
+            source_kind=source_kind,
+            source_id=source_id,
+            device_id=device_id,
+            process_id=process_id,
+            stream=payload.get("stream", "event"),
+            payload=raw_payload,
+            payload_json=payload.get("payload_json"),
+            ts=payload.get("ts"),
+        )
+
+    def _log_tail(self, params: Json) -> Json:
+        limit = parse_log_tail_limit(params.get("limit", 200))
+        filters = log_tail_filters(params)
+
+        filtered: list[Json] = []
+        for entry in list(self._log_history):
+            if log_tail_entry_matches(entry, filters=filters):
+                filtered.append(entry)
+
+        total = len(filtered)
+        if total > limit:
+            filtered = filtered[-limit:]
+
+        latest_t_mono: float | None = None
+        if filtered:
+            latest_t_mono = log_tail_entry_t_mono(filtered[-1])
+
+        return {
+            "entries": filtered,
+            "count": len(filtered),
+            "total_matched": total,
+            "limit": limit,
+            "latest_t_mono": latest_t_mono,
+        }

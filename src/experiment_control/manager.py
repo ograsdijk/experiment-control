@@ -4,12 +4,12 @@ import copy
 import json
 import os
 import queue
-import re
 import subprocess
 import threading
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, TextIO
 
@@ -17,96 +17,42 @@ import zmq
 
 from .federation import FederationConfig
 from .federation.hub import FederationHub
-from .manager_command_journal import (
-    append_command_journal_entry as shared_append_command_journal_entry,
-)
-from .manager_command_journal import (
-    command_journal_status_payload as shared_command_journal_status_payload,
-)
-from .manager_command_journal import (
-    should_journal_command_action as shared_should_journal_command_action,
-)
 from .manager_config import (
     device_spec_from_yaml,
     process_spec_from_yaml,
 )
+# Phase 8.2.14: route_device_request wrapped by DeviceRoutingMixin; the
+# remaining call site at L1906 (_dispatch_lifecycle_task) uses the
+# module-level callable directly because it runs off a background thread
+# without ``self`` in scope.
 from .manager_device_routing import route_device_request
-from .manager_driver_pub import handle_driver_pub as shared_handle_driver_pub
-from .manager_driver_pub import ingest_chunk_ready as shared_ingest_chunk_ready
+# Phase 8.2.13: ``handle_driver_pub`` and ``ingest_chunk_ready`` migrated
+# onto ``DriverPubMixin``. ``ingest_heartbeat`` / ``ingest_telemetry`` stay
+# imported because Manager's ``_ingest_heartbeat`` / ``_ingest_telemetry``
+# forwarders still pass Manager-module-level enum classes through.
 from .manager_driver_pub import ingest_heartbeat as shared_ingest_heartbeat
 from .manager_driver_pub import ingest_telemetry as shared_ingest_telemetry
-from .manager_route_handlers import (
-    publish_process_command_response as shared_publish_process_command_response,
-    route_command_interceptor_list as shared_route_command_interceptor_list,
-    route_command_interceptor_register as shared_route_command_interceptor_register,
-    route_command_interceptor_unregister as shared_route_command_interceptor_unregister,
-    route_manager_cleanup_orphans as shared_route_manager_cleanup_orphans,
-    route_manager_command_journal_status as shared_route_manager_command_journal_status,
-    route_manager_command_journal_tail as shared_route_manager_command_journal_tail,
-    route_manager_event_publish as shared_route_manager_event_publish,
-    route_manager_identity as shared_route_manager_identity,
-    route_manager_log_publish as shared_route_manager_log_publish,
-    route_manager_log_tail as shared_route_manager_log_tail,
-    route_manager_request as shared_route_manager_request,
-    route_manager_shutdown as shared_route_manager_shutdown,
-    route_process_add as shared_route_process_add,
-    route_process_control as shared_route_process_control,
-    route_process_get as shared_route_process_get,
-    route_process_list_status as shared_route_process_list_status,
-    route_process_remove as shared_route_process_remove,
-    route_process_request as shared_route_process_request,
-    route_process_rpc as shared_route_process_rpc,
-    route_process_rpc_advertise as shared_route_process_rpc_advertise,
-)
+# Phase 8.2.15: 21 route_*/publish_process_command_response forwarders
+# migrated onto ``RouteHandlersMixin``. Only ``route_process_rpc``
+# (which needs the Manager-side ``ManagedProcessState`` running-state
+# set) and ``apply_command_interceptors`` (same reason) stay imported
+# below — Manager's ``_route_process_rpc`` and
+# ``_apply_command_interceptors`` keep their thin wrappers because
+# moving the enum sets onto the mixin would force a circular import.
+from .manager_route_handlers import route_process_rpc as shared_route_process_rpc
+# Phase 8.2.6: ``handle_internal_rpc`` / ``route_internal_request`` /
+# ``ensure_route_registries`` migrated onto ``InternalRpcMixin``. Only
+# the pure ``dispatch_registry_request`` helper remains imported.
 from .manager_internal_rpc import (
     dispatch_registry_request as shared_dispatch_registry_request,
 )
-from .manager_internal_rpc import (
-    ensure_route_registries as shared_ensure_route_registries,
-)
-from .manager_internal_rpc import handle_internal_rpc as shared_handle_internal_rpc
-from .manager_internal_rpc import (
-    route_internal_request as shared_route_internal_request,
-)
-from .manager_lifecycle import shutdown_cleanup as shared_shutdown_cleanup
-from .manager_lifecycle import startup_sequence as shared_startup_sequence
-from .manager_log_events import (
-    maybe_emit_manager_log_sink as shared_maybe_emit_manager_log_sink,
-)
-from .manager_log_events import (
-    maybe_publish_log_event as shared_maybe_publish_log_event,
-)
-from .manager_logs import (
-    close_manager_log_sink_file as shared_close_manager_log_sink_file,
-)
-from .manager_logs import emit_log as shared_emit_log
-from .manager_logs import emit_log_from_payload as shared_emit_log_from_payload
-from .manager_logs import log_tail as shared_log_tail
-from .manager_logs import log_tail_entry_matches as shared_log_tail_entry_matches
-from .manager_logs import log_tail_entry_t_mono as shared_log_tail_entry_t_mono
-from .manager_logs import log_tail_filters as shared_log_tail_filters
-from .manager_logs import log_tail_matches_contains as shared_log_tail_matches_contains
-from .manager_logs import log_tail_matches_ids as shared_log_tail_matches_ids
-from .manager_logs import log_tail_matches_severity as shared_log_tail_matches_severity
-from .manager_logs import (
-    log_tail_matches_source_kind as shared_log_tail_matches_source_kind,
-)
-from .manager_logs import log_tail_matches_time as shared_log_tail_matches_time
-from .manager_logs import manager_log_sink_event as shared_manager_log_sink_event
-from .manager_logs import (
-    manager_log_sink_is_duplicate as shared_manager_log_sink_is_duplicate,
-)
-from .manager_logs import normalize_filter_set as shared_normalize_filter_set
+# Phase 8.2.11: startup_sequence / shutdown_cleanup migrated onto LifecycleMixin.
+# Phase 8.2.4: most ``manager_logs`` helpers migrated onto
+# ``LogsMixin``. Only the pure module-level utilities Manager still
+# calls directly during ``__init__`` (and the two `_normalize_*`
+# helpers exposed for cross-module use) remain imported.
 from .manager_logs import normalize_id as shared_normalize_id
-from .manager_logs import normalize_log_ts as shared_normalize_log_ts
-from .manager_logs import (
-    open_manager_log_sink_file as shared_open_manager_log_sink_file,
-)
 from .manager_logs import parse_boolish as shared_parse_boolish
-from .manager_logs import parse_log_tail_limit as shared_parse_log_tail_limit
-from .manager_logs import (
-    parse_log_tail_since_t_mono as shared_parse_log_tail_since_t_mono,
-)
 from .manager_logs import (
     resolve_manager_log_file_path as shared_resolve_manager_log_file_path,
 )
@@ -116,55 +62,27 @@ from .manager_logs import (
 from .manager_logs import (
     resolve_manager_log_stderr_enabled as shared_resolve_manager_log_stderr_enabled,
 )
-from .manager_process_logs import drain_supervisor_logs as shared_drain_supervisor_logs
-from .manager_process_logs import emit_supervisor_item as shared_emit_supervisor_item
-from .manager_process_logs import (
-    flush_stale_supervisor_blocks as shared_flush_stale_supervisor_blocks,
-)
-from .manager_process_logs import (
-    prune_supervisor_log_threads as shared_prune_supervisor_log_threads,
-)
-from .manager_process_logs import queue_supervisor_log as shared_queue_supervisor_log
-from .manager_process_logs import (
-    start_child_log_readers as shared_start_child_log_readers,
-)
+# Phase 8.2.10: supervisor-log helpers migrated onto ``ProcessLogsMixin``.
+# Only the pure parser utilities Manager still wraps as staticmethods
+# remain imported.
 from .manager_process_logs import (
     supervisor_block_continuation as shared_supervisor_block_continuation,
 )
 from .manager_process_logs import (
     supervisor_block_start as shared_supervisor_block_start,
 )
-from .manager_process_logs import (
-    supervisor_infer_severity as shared_supervisor_infer_severity,
-)
 from .manager_process_logs import supervisor_key as shared_supervisor_key
-from .manager_process_recovery import (
-    cleanup_orphans_summary as shared_cleanup_orphans_summary,
-)
-from .manager_process_recovery import (
-    format_router_startup_failure as shared_format_router_startup_failure,
-)
+# Phase 8.2.9: process-recovery helpers migrated onto
+# ``ProcessRecoveryMixin``. Only the pure
+# ``is_endpoint_collision_process_start_failure`` predicate remains
+# imported (Manager exposes it as a static staticmethod for tests).
 from .manager_process_recovery import (
     is_endpoint_collision_process_start_failure as shared_is_endpoint_collision_process_start_failure,
-)
-from .manager_process_recovery import (
-    maybe_recover_process_start_collision as shared_maybe_recover_process_start_collision,
-)
-from .manager_process_recovery import recent_process_logs as shared_recent_process_logs
-from .manager_process_recovery import (
-    recent_process_logs_structured as shared_recent_process_logs_structured,
-)
-from .manager_process_recovery import (
-    recent_source_logs_structured as shared_recent_source_logs_structured,
-)
-from .manager_process_recovery import (
-    record_orphan_cleanup as shared_record_orphan_cleanup,
 )
 from .manager_process_supervision import add_process as shared_add_process
 from .manager_process_supervision import (
     adopt_with_process_guard as shared_adopt_with_process_guard,
 )
-from .manager_process_supervision import build_driver_cmd as shared_build_driver_cmd
 from .manager_process_supervision import build_router_spec as shared_build_router_spec
 from .manager_process_supervision import (
     FAILURE_DRIVER_TOPICS,
@@ -172,83 +90,11 @@ from .manager_process_supervision import (
 )
 from .utils.exit_codes import describe_exit_code, exit_code_hex
 from .manager_process_supervision import (
-    connect_process_data as shared_connect_process_data,
-)
-from .manager_process_supervision import (
-    connect_process_heartbeat as shared_connect_process_heartbeat,
-)
-from .manager_process_supervision import driver_is_started as shared_driver_is_started
-from .manager_process_supervision import driver_is_stopped as shared_driver_is_stopped
-from .manager_process_supervision import (
-    enforce_device_driver_stop_timeout as shared_enforce_device_driver_stop_timeout,
-)
-from .manager_process_supervision import (
-    enforce_managed_process_heartbeat_timeout as shared_enforce_managed_process_heartbeat_timeout,
-)
-from .manager_process_supervision import (
-    enforce_managed_process_stop_timeout as shared_enforce_managed_process_stop_timeout,
-)
-from .manager_process_supervision import (
-    ensure_router_handle as shared_ensure_router_handle,
-)
-from .manager_process_supervision import (
-    ensure_router_running as shared_ensure_router_running,
-)
-from .manager_process_supervision import (
-    expand_process_argv as shared_expand_process_argv,
-)
-from .manager_process_supervision import (
     mark_device_offline as shared_mark_device_offline,
 )
-from .manager_process_supervision import (
-    maybe_restart_device_driver as shared_maybe_restart_device_driver,
-)
-from .manager_process_supervision import (
-    maybe_restart_managed_process as shared_maybe_restart_managed_process,
-)
-from .manager_process_supervision import (
-    maybe_schedule_restart as shared_maybe_schedule_restart,
-)
-from .manager_process_supervision import process_snapshot as shared_process_snapshot
 from .manager_process_supervision import recover_device as shared_recover_device
-from .manager_process_supervision import require_process as shared_require_process
-from .manager_process_supervision import (
-    resolve_process_data_endpoint as shared_resolve_process_data_endpoint,
-)
-from .manager_process_supervision import (
-    resolve_process_heartbeat_endpoint as shared_resolve_process_heartbeat_endpoint,
-)
-from .manager_process_supervision import restart_driver as shared_restart_driver
-from .manager_process_supervision import start_driver as shared_start_driver
-from .manager_process_supervision import (
-    start_process_handle as shared_start_process_handle,
-)
 from .manager_process_supervision import stop_driver as shared_stop_driver
-from .manager_process_supervision import (
-    stop_process_handle as shared_stop_process_handle,
-)
-from .manager_process_supervision import (
-    supervise_device_drivers as shared_supervise_device_drivers,
-)
-from .manager_process_supervision import (
-    supervise_managed_processes as shared_supervise_managed_processes,
-)
-from .manager_process_supervision import (
-    try_restart_process as shared_try_restart_process,
-)
-from .manager_process_supervision import (
-    update_device_driver_exit_state as shared_update_device_driver_exit_state,
-)
-from .manager_process_supervision import (
-    update_managed_process_exit_state as shared_update_managed_process_exit_state,
-)
-from .manager_pubsub import publish_manager_event as shared_publish_manager_event
-from .manager_request_routing import (
-    build_internal_action_registry,
-    build_internal_type_registry,
-    build_manager_route_registry,
-    build_process_route_registry,
-)
+# Phase 8.2.7: build_*_registry helpers migrated onto RequestRoutingMixin.
 from .manager_models import (
     AutoReconnectSpec,
     CommandInterceptorRoute,
@@ -265,6 +111,10 @@ from .manager_models import (
     TelemetryBundle,
     TelemetrySignal,
 )
+from .manager_interceptor_routes import InterceptorRouteState
+# Phase 8.2.15: command-interceptor helper wrappers also migrated to
+# ``RouteHandlersMixin``. The two below stay as imports because they
+# need Manager-side enum sets the mixin can't reference.
 from .manager_route_handlers import (
     apply_command_interceptors as shared_apply_command_interceptors,
 )
@@ -272,34 +122,14 @@ from .manager_route_handlers import (
     command_interceptor_chain as shared_command_interceptor_chain,
 )
 from .manager_route_handlers import (
-    command_interceptor_routes_snapshot as shared_command_interceptor_routes_snapshot,
-)
-from .manager_route_handlers import (
-    drop_command_interceptor_routes as shared_drop_command_interceptor_routes,
-)
-from .manager_route_handlers import (
-    invalidate_command_interceptor_cache as shared_invalidate_command_interceptor_cache,
-)
-from .manager_route_handlers import (
     match_command_interceptor_route as shared_match_command_interceptor_route,
-)
-from .manager_route_handlers import (
-    publish_interceptor_routes_update as shared_publish_interceptor_routes_update,
 )
 from .manager_route_handlers import (
     register_command_interceptor_routes as shared_register_command_interceptor_routes,
 )
-from .manager_route_handlers import (
-    unregister_command_interceptor_routes as shared_unregister_command_interceptor_routes,
-)
-from .manager_rpc_calls import call_device_rpc as shared_call_device_rpc
-from .manager_rpc_calls import call_process_rpc as shared_call_process_rpc
-from .manager_runtime_metadata import (
-    device_config_payload as shared_device_config_payload,
-)
-from .manager_runtime_metadata import (
-    effective_metadata_for_device as shared_effective_metadata_for_device,
-)
+# Phase 8.2.8: call_device_rpc / call_process_rpc migrated onto RpcCallsMixin.
+# Phase 8.2.5: manager-taking helpers migrated onto
+# ``RuntimeMetadataMixin``. Only pure utilities still imported here.
 from .manager_runtime_metadata import (
     merge_stream_metadata_dicts as shared_merge_stream_metadata_dicts,
 )
@@ -309,16 +139,32 @@ from .manager_runtime_metadata import (
 from .manager_runtime_metadata import (
     normalize_runtime_stream_metadata_dict as shared_normalize_runtime_stream_metadata_dict,
 )
-from .manager_runtime_metadata import (
-    publish_device_config as shared_publish_device_config,
-)
-from .manager_runtime_metadata import (
-    runtime_metadata_state as shared_runtime_metadata_state,
-)
 from .manager_runtime_metadata import serialize_spec_yaml as shared_serialize_spec_yaml
-from .manager_runtime_metadata import (
-    touch_runtime_metadata_revision as shared_touch_runtime_metadata_revision,
-)
+
+# --- Phase 8.1 mixin scaffolding -------------------------------------
+# Each ``manager_*.py`` helper module declares an empty mixin class at
+# its bottom. ``Manager`` inherits from all of them so individual
+# ``def shared_foo(manager, ...)`` helpers can migrate onto the mixin
+# one at a time (REFACTOR_PLAN §8.2) without churning ``Manager``'s
+# class header on every step. Until a method moves, the existing
+# ``shared_*`` forwarder pattern continues to work unchanged.
+from .manager_command_journal import CommandJournalMixin
+from .manager_device_routing import DeviceRoutingMixin
+from .manager_driver_pub import DriverPubMixin
+from .manager_interceptor_routes import InterceptorRoutesMixin
+from .manager_internal_rpc import InternalRpcMixin
+from .manager_lifecycle import LifecycleMixin
+from .manager_log_events import LogEventsMixin
+from .manager_logs import LogsMixin
+from .manager_process_logs import ProcessLogsMixin
+from .manager_process_recovery import ProcessRecoveryMixin
+from .manager_process_supervision import ProcessSupervisionMixin
+from .manager_pubsub import PubSubMixin
+from .manager_request_routing import RequestRoutingMixin
+from .manager_route_handlers import RouteHandlersMixin
+from .manager_rpc_calls import RpcCallsMixin
+from .manager_runtime_metadata import RuntimeMetadataMixin
+
 from .types import DeviceState, DriverState, TelemetryQuality, Timestamp
 from .utils import instance_lock as _instance_lock
 from .utils.command_journal import CommandJournal, CommandJournalSettings
@@ -354,26 +200,227 @@ __all__ = [
 read_instance_lock_status = _instance_lock.read_instance_lock_status
 derive_lock_effective_status = _instance_lock.derive_lock_effective_status
 lock_effective_status_help = _instance_lock.lock_effective_status_help
-_LOG_LEVEL_PREFIX_RE = re.compile(
-    r"^\s*(DEBUG|INFO|WARNING|WARN|ERROR|CRITICAL)\b", re.IGNORECASE
-)
-_LOG_LEVEL_BRACKET_PREFIX_RE = re.compile(
-    r"^\s*(?:\[[^\]]+\]\s*)+(?:\[\s*)?(DEBUG|INFO|WARNING|WARN|ERROR|CRITICAL)(?:\s*\])?\b",
-    re.IGNORECASE,
-)
-_LOG_LEVEL_INLINE_RE = re.compile(
-    r"\s-\s(DEBUG|INFO|WARNING|WARN|ERROR|CRITICAL)\s-\s", re.IGNORECASE
-)
-_LOG_LEVEL_TABLE_RE = re.compile(
-    r"\s{2,}(DEBUG|INFO|WARNING|WARN|ERROR|CRITICAL)\s{2,}", re.IGNORECASE
-)
-_EXCEPTION_LINE_RE = re.compile(
-    r"^[A-Za-z_][\w.]*?(Error|Exception|Exit|Interrupt|Fault|Failure)\s*:\s*"
-)
 
 
+@dataclass
+class ManagerSockets:
+    ctx: zmq.Context
+    registry_bind: str
+    internal_rpc_bind: str
+    external_rpc_bind: str
+    external_pub_bind: str
+    external_pub_connect_local: str
+    registry_rep: zmq.Socket
+    sub: zmq.Socket
+    process_hb_sub: zmq.Socket
+    process_data_sub: zmq.Socket
+    internal_rpc: zmq.Socket
+    internal_rpc_endpoint: str
+    external_pub: zmq.Socket
 
-class Manager:
+    @classmethod
+    def create(
+        cls,
+        *,
+        ctx: zmq.Context,
+        registry_bind: str,
+        internal_rpc_bind: str,
+        external_rpc_bind: str,
+        external_pub_bind: str,
+        external_pub_connect_local: str | None,
+    ) -> "ManagerSockets":
+        registry_rep = ctx.socket(zmq.REP)
+        registry_rep.bind(registry_bind)
+        sub = ctx.socket(zmq.SUB)
+        sub.setsockopt(zmq.SUBSCRIBE, b"")
+        process_hb_sub = ctx.socket(zmq.SUB)
+        process_hb_sub.setsockopt(zmq.SUBSCRIBE, b"")
+        process_data_sub = ctx.socket(zmq.SUB)
+        process_data_sub.setsockopt(zmq.SUBSCRIBE, b"")
+        internal_rpc = ctx.socket(zmq.ROUTER)
+        internal_rpc.bind(internal_rpc_bind)
+        external_pub = ctx.socket(zmq.PUB)
+        external_pub.bind(external_pub_bind)
+        external_pub_connect = (
+            str(external_pub_connect_local).strip()
+            if isinstance(external_pub_connect_local, str)
+            and str(external_pub_connect_local).strip()
+            else derive_local_connect_endpoint(external_pub_bind, 6001)
+        )
+        return cls(
+            ctx=ctx,
+            registry_bind=registry_bind,
+            internal_rpc_bind=internal_rpc_bind,
+            external_rpc_bind=external_rpc_bind,
+            external_pub_bind=external_pub_bind,
+            external_pub_connect_local=external_pub_connect,
+            registry_rep=registry_rep,
+            sub=sub,
+            process_hb_sub=process_hb_sub,
+            process_data_sub=process_data_sub,
+            internal_rpc=internal_rpc,
+            internal_rpc_endpoint=internal_rpc.getsockopt_string(zmq.LAST_ENDPOINT),
+            external_pub=external_pub,
+        )
+
+    def bind_to_manager(self, manager: Any) -> None:
+        manager._ctx = self.ctx
+        manager._registry_bind = self.registry_bind
+        manager._registry_rep = self.registry_rep
+        manager._sub = self.sub
+        manager._process_hb_sub = self.process_hb_sub
+        manager._process_data_sub = self.process_data_sub
+        manager._internal_rpc_bind = self.internal_rpc_bind
+        manager._internal_rpc = self.internal_rpc
+        manager._internal_rpc_endpoint = self.internal_rpc_endpoint
+        manager._external_rpc_bind = self.external_rpc_bind
+        manager._external_pub_bind = self.external_pub_bind
+        manager._external_pub_connect_local = self.external_pub_connect_local
+        manager._external_pub = self.external_pub
+
+
+@dataclass
+class ManagerCaches:
+    telemetry_latest: dict[str, dict[str, tuple[Timestamp, TelemetrySignal]]] = field(
+        default_factory=dict
+    )
+    telemetry_last_bundle_ts: dict[str, Timestamp] = field(default_factory=dict)
+    telemetry_device_order: dict[str, None] = field(default_factory=dict)
+    latest_chunk_desc: dict[str, dict[str, Json]] = field(default_factory=dict)
+    chunk_device_order: dict[str, None] = field(default_factory=dict)
+    last_liveness: dict[str, Liveness] = field(default_factory=dict)
+    process_rss_cache: dict[int, tuple[float, int | None]] = field(default_factory=dict)
+    runtime_device_metadata_overrides: dict[str, dict[str, Any]] = field(default_factory=dict)
+    runtime_stream_metadata_overrides: dict[str, dict[str, dict[str, Any]]] = field(
+        default_factory=dict
+    )
+    runtime_metadata_revision: dict[str, int] = field(default_factory=dict)
+
+    def bind_to_manager(self, manager: Any) -> None:
+        manager._telemetry_latest = self.telemetry_latest
+        manager._telemetry_last_bundle_ts = self.telemetry_last_bundle_ts
+        manager._telemetry_device_order = self.telemetry_device_order
+        manager._latest_chunk_desc = self.latest_chunk_desc
+        manager._chunk_device_order = self.chunk_device_order
+        manager._last_liveness = self.last_liveness
+        manager._process_rss_cache = self.process_rss_cache
+        manager._runtime_device_metadata_overrides = self.runtime_device_metadata_overrides
+        manager._runtime_stream_metadata_overrides = self.runtime_stream_metadata_overrides
+        manager._runtime_metadata_revision = self.runtime_metadata_revision
+
+
+@dataclass
+class ManagerJournal:
+    enabled: bool
+    path: Path | None
+    journal: CommandJournal | None = None
+    start_error: str | None = None
+
+    @classmethod
+    def start_or_disabled(
+        cls,
+        *,
+        enabled: bool,
+        instance_id: str,
+        path: str | Path | None,
+        queue_max: int,
+        batch_size: int,
+        flush_interval_ms: int,
+        retention_max_rows: int | None,
+        retention_max_age_days: float | None,
+    ) -> "ManagerJournal":
+        path_raw = str(path).strip() if path is not None else ""
+        journal_path = (
+            Path(path_raw).expanduser()
+            if path_raw
+            else Path(".state") / instance_id / "command_journal.sqlite3"
+        )
+        if not enabled:
+            return cls(enabled=False, path=journal_path)
+        try:
+            settings = CommandJournalSettings(
+                path=journal_path,
+                queue_max=int(queue_max),
+                batch_size=int(batch_size),
+                flush_interval_ms=int(flush_interval_ms),
+                retention_max_rows=(
+                    None if retention_max_rows is None else int(retention_max_rows)
+                ),
+                retention_max_age_days=(
+                    None if retention_max_age_days is None else float(retention_max_age_days)
+                ),
+            )
+            journal = CommandJournal(settings=settings, instance_id=instance_id)
+            journal.start()
+            return cls(enabled=True, path=journal_path, journal=journal)
+        except Exception as exc:
+            return cls(enabled=False, path=journal_path, start_error=str(exc))
+
+    def bind_to_manager(self, manager: Any) -> None:
+        manager._command_journal_enabled = self.enabled
+        manager._command_journal_path = self.path
+        manager._command_journal = self.journal
+        manager._command_journal_start_error = self.start_error
+
+
+@dataclass
+class LifecycleExecutor:
+    main_thread_id: int
+    executor: ThreadPoolExecutor
+    device_locks: dict[str, threading.Lock]
+    reply_queue: queue.Queue[tuple[bytes, Json]]
+    event_queue: queue.Queue[tuple[str, Json]]
+    event_dropped: int
+    event_dropped_lock: threading.Lock
+
+    @classmethod
+    def create(cls) -> "LifecycleExecutor":
+        return cls(
+            main_thread_id=threading.get_ident(),
+            executor=ThreadPoolExecutor(max_workers=32, thread_name_prefix="mgr-lifecycle"),
+            device_locks={},
+            reply_queue=queue.Queue(),
+            event_queue=queue.Queue(maxsize=10_000),
+            event_dropped=0,
+            event_dropped_lock=threading.Lock(),
+        )
+
+    def bind_to_manager(self, manager: Any) -> None:
+        manager._main_thread_id = self.main_thread_id
+        manager._lifecycle_executor = self.executor
+        manager._lifecycle_device_locks = self.device_locks
+        manager._lifecycle_reply_queue = self.reply_queue
+        manager._lifecycle_event_queue = self.event_queue
+        manager._lifecycle_event_dropped = self.event_dropped
+        manager._lifecycle_event_dropped_lock = self.event_dropped_lock
+
+
+class Manager(
+    # Phase 8.1: mixin MRO. Order is the same as REFACTOR_PLAN §8.2.1-19
+    # (least-coupled first → most-coupled last) so a method-resolution
+    # collision (if ever introduced) is won by the more foundational
+    # mixin. All mixins are currently empty scaffolds — they will gain
+    # methods one at a time as the migration progresses. Note: there is
+    # no ``manager_process_spec`` / ``manager_config`` / ``manager_client``
+    # mixin because those modules' helpers don't take ``manager`` as
+    # first arg (they are pure pre-construction utilities).
+    PubSubMixin,
+    CommandJournalMixin,
+    LogEventsMixin,
+    LogsMixin,
+    RuntimeMetadataMixin,
+    DriverPubMixin,
+    InternalRpcMixin,
+    RequestRoutingMixin,
+    RouteHandlersMixin,
+    DeviceRoutingMixin,
+    RpcCallsMixin,
+    InterceptorRoutesMixin,
+    ProcessRecoveryMixin,
+    ProcessLogsMixin,
+    LifecycleMixin,
+    ProcessSupervisionMixin,
+):
     """
     Manager process responsibilities (implementation-facing summary):
 
@@ -384,10 +431,49 @@ class Manager:
     - Subscribe to all driver PUB sockets on a single SUB socket and update
       caches (telemetry, heartbeat, chunk descriptors).
     - Provide internal RPC for the device_router/processes and publish state
-      snapshots/updates for external subscribers.
+    snapshots/updates for external subscribers.
     """
 
+    _ctx: zmq.Context
+    _registry_bind: str
+    _registry_rep: zmq.Socket
+    _sub: zmq.Socket
+    _process_hb_sub: zmq.Socket
+    _process_data_sub: zmq.Socket
+    _internal_rpc_bind: str
+    _internal_rpc: zmq.Socket
+    _internal_rpc_endpoint: str
+    _external_rpc_bind: str
+    _external_pub_bind: str
+    _external_pub_connect_local: str
+    _external_pub: zmq.Socket
+    _main_thread_id: int
+    _lifecycle_executor: ThreadPoolExecutor
+    _lifecycle_device_locks: dict[str, threading.Lock]
+    _lifecycle_reply_queue: queue.Queue[tuple[bytes, Json]]
+    _lifecycle_event_queue: queue.Queue[tuple[str, Json]]
+    _lifecycle_event_dropped: int
+    _lifecycle_event_dropped_lock: threading.Lock
+    _telemetry_latest: dict[str, dict[str, tuple[Timestamp, TelemetrySignal]]]
+    _telemetry_last_bundle_ts: dict[str, Timestamp]
+    _telemetry_device_order: dict[str, None]
+    _latest_chunk_desc: dict[str, dict[str, Json]]
+    _chunk_device_order: dict[str, None]
+    _last_liveness: dict[str, Liveness]
+    _process_rss_cache: dict[int, tuple[float, int | None]]
+    _runtime_device_metadata_overrides: dict[str, dict[str, Any]]
+    _runtime_stream_metadata_overrides: dict[str, dict[str, dict[str, Any]]]
+    _runtime_metadata_revision: dict[str, int]
+    _command_journal_enabled: bool
+    _command_journal_path: Path | None
+    _command_journal: CommandJournal | None
+    _command_journal_start_error: str | None
+    _read_instance_lock_status: Callable[[str], Any]
+    _derive_lock_effective_status: Callable[..., Any]
+    _lock_effective_status_help: Callable[[str], str]
+
     def __init__(
+
         self,
         *,
         instance_id: str | None = None,
@@ -430,45 +516,20 @@ class Manager:
             instance_id or os.environ.get("EXPERIMENT_CONTROL_INSTANCE_ID", "")
         ).strip()
         self._instance_id = instance_id_text or "unknown"
+        self._read_instance_lock_status = read_instance_lock_status
+        self._derive_lock_effective_status = derive_lock_effective_status
+        self._lock_effective_status_help = lock_effective_status_help
         self._started_t_wall = time.time()
         self._started_t_mono = time.monotonic()
-        self._ctx = zmq.Context.instance()
-
-        # Driver registry (REP): drivers register endpoints here
-        self._registry_bind = registry_bind
-        self._registry_rep = self._ctx.socket(zmq.REP)
-        self._registry_rep.bind(self._registry_bind)
-
-        # Telemetry subscriber (SUB): connects to all driver PUB endpoints
-        self._sub = self._ctx.socket(zmq.SUB)
-        self._sub.setsockopt(zmq.SUBSCRIBE, b"")  # subscribe all topics
-
-        # Process heartbeat subscriber (SUB): connects to managed process PUB endpoints
-        self._process_hb_sub = self._ctx.socket(zmq.SUB)
-        self._process_hb_sub.setsockopt(zmq.SUBSCRIBE, b"")
-        # Process data/event subscriber (SUB): high-rate managed-process events
-        self._process_data_sub = self._ctx.socket(zmq.SUB)
-        self._process_data_sub.setsockopt(zmq.SUBSCRIBE, b"")
-
-        # Internal RPC router (ROUTER): device_router/processes forward requests here
-        self._internal_rpc_bind = internal_rpc_bind
-        self._internal_rpc = self._ctx.socket(zmq.ROUTER)
-        self._internal_rpc.bind(self._internal_rpc_bind)
-        self._internal_rpc_endpoint = self._internal_rpc.getsockopt_string(
-            zmq.LAST_ENDPOINT
+        sockets = ManagerSockets.create(
+            ctx=zmq.Context.instance(),
+            registry_bind=registry_bind,
+            internal_rpc_bind=internal_rpc_bind,
+            external_rpc_bind=external_rpc_bind,
+            external_pub_bind=external_pub_bind,
+            external_pub_connect_local=external_pub_connect_local,
         )
-        self._external_rpc_bind = external_rpc_bind
-
-        # External publisher (PUB): manager broadcasts state snapshots/updates
-        self._external_pub_bind = external_pub_bind
-        self._external_pub_connect_local = (
-            str(external_pub_connect_local).strip()
-            if isinstance(external_pub_connect_local, str)
-            and str(external_pub_connect_local).strip()
-            else derive_local_connect_endpoint(external_pub_bind, 6001)
-        )
-        self._external_pub = self._ctx.socket(zmq.PUB)
-        self._external_pub.bind(external_pub_bind)
+        sockets.bind_to_manager(self)
 
         self._heartbeat_timeout_s = heartbeat_timeout_s
         self._telemetry_stale_s = telemetry_stale_s
@@ -499,6 +560,12 @@ class Manager:
         self._process_data_bind_base = process_data_bind_base
         self._process_data_connected: set[str] = set()
         self._process_data_port_offset = 0
+        caches = ManagerCaches()
+        caches.bind_to_manager(self)
+        self._process_rss_cache_ttl_s = 1.0
+        self._process_hb_refresh_error_period_s = 10.0
+        self._last_process_hb_refresh_error_mono: float | None = None
+        self._process_hb_refresh_error_suppressed = 0
 
         self._auto_connect_on_register = auto_connect_on_register
 
@@ -506,18 +573,12 @@ class Manager:
         self._processes: dict[str, ProcessHandle] = {}
 
         # Latest telemetry cache: (device_id -> signal_name -> TelemetrySignal + bundle ts)
-        self._telemetry_latest: dict[
-            str, dict[str, tuple[Timestamp, TelemetrySignal]]
-        ] = {}
-        self._telemetry_last_bundle_ts: dict[str, Timestamp] = {}
-        self._telemetry_device_order: dict[str, None] = {}
         self._telemetry_cache_max_devices = max(1, int(telemetry_cache_max_devices))
         self._telemetry_cache_max_signals_per_device = max(
             1, int(telemetry_cache_max_signals_per_device)
         )
         self._telemetry_cache_evicted_devices = 0
         self._telemetry_cache_evicted_signals = 0
-        self._last_liveness: dict[str, Liveness] = {}
         self._log_history_size = max(100, int(log_history_size))
         self._log_history: deque[Json] = deque(maxlen=self._log_history_size)
         self._supervisor_log_queue: queue.Queue[Json] = queue.Queue(maxsize=5000)
@@ -549,47 +610,25 @@ class Manager:
         self._heartbeat_stale_strikes_to_fail = 2
         self._heartbeat_hard_timeout_multiplier = 3.0
         self._last_orphan_cleanup: Json | None = None
-        self._command_journal_enabled = bool(command_journal_enabled)
-        self._command_journal: CommandJournal | None = None
-        path_raw = (
-            str(command_journal_path).strip()
-            if command_journal_path is not None
-            else ""
+        journal = ManagerJournal.start_or_disabled(
+            enabled=bool(command_journal_enabled),
+            instance_id=self._instance_id,
+            path=command_journal_path,
+            queue_max=command_journal_queue_max,
+            batch_size=command_journal_batch_size,
+            flush_interval_ms=command_journal_flush_interval_ms,
+            retention_max_rows=command_journal_retention_max_rows,
+            retention_max_age_days=command_journal_retention_max_age_days,
         )
-        if path_raw:
-            self._command_journal_path: Path | None = Path(path_raw).expanduser()
-        else:
-            self._command_journal_path = (
-                Path(".state") / self._instance_id / "command_journal.sqlite3"
-            )
-        self._command_journal_start_error: str | None = None
-        if self._command_journal_enabled:
-            try:
-                settings = CommandJournalSettings(
-                    path=self._command_journal_path,
-                    queue_max=int(command_journal_queue_max),
-                    batch_size=int(command_journal_batch_size),
-                    flush_interval_ms=int(command_journal_flush_interval_ms),
-                    retention_max_rows=(
-                        None
-                        if command_journal_retention_max_rows is None
-                        else int(command_journal_retention_max_rows)
-                    ),
-                    retention_max_age_days=(
-                        None
-                        if command_journal_retention_max_age_days is None
-                        else float(command_journal_retention_max_age_days)
-                    ),
-                )
-                self._command_journal = CommandJournal(
-                    settings=settings,
-                    instance_id=self._instance_id,
-                )
-                self._command_journal.start()
-            except Exception as e:
-                self._command_journal = None
-                self._command_journal_enabled = False
-                self._command_journal_start_error = str(e)
+        journal.bind_to_manager(self)
+
+        # Lifecycle executor binds ``_main_thread_id`` and the lifecycle
+        # event queue. Bound early so any ``_emit_log`` /
+        # ``_publish_manager_event`` call during the rest of __init__
+        # (notably ``process_guard.init_failed`` below) takes the
+        # main-thread fast path instead of an ``AttributeError``.
+        lifecycle = LifecycleExecutor.create()
+        lifecycle.bind_to_manager(self)
 
         self._manager_log_stderr_enabled = self._resolve_manager_log_stderr_enabled(
             manager_log_stderr
@@ -610,8 +649,6 @@ class Manager:
         self._open_manager_log_sink_file()
 
         # Latest fast-data descriptor cache: (device_id -> stream_name -> descriptor json)
-        self._latest_chunk_desc: dict[str, dict[str, Json]] = {}
-        self._chunk_device_order: dict[str, None] = {}
         self._chunk_cache_max_devices = max(1, int(chunk_cache_max_devices))
         self._chunk_cache_max_streams_per_device = max(
             1, int(chunk_cache_max_streams_per_device)
@@ -624,11 +661,11 @@ class Manager:
         self._command_interceptor_cache: dict[
             tuple[str, str], list[CommandInterceptorRoute]
         ] = {}
-        self._runtime_device_metadata_overrides: dict[str, dict[str, Any]] = {}
-        self._runtime_stream_metadata_overrides: dict[
-            str, dict[str, dict[str, Any]]
-        ] = {}
-        self._runtime_metadata_revision: dict[str, int] = {}
+        self._interceptor_route_state = InterceptorRouteState(
+            routes=self._command_interceptor_routes,
+            next_order=self._command_interceptor_order,
+            max_cache=self._command_interceptor_cache_max,
+        )
 
         # Optional hooks for in-process consumers (handy for unit tests / local GUI)
         self._event_hooks: list[Callable[[str, Json], None]] = []
@@ -671,31 +708,6 @@ class Manager:
         self._router_process_id = "device_router"
         self._ensure_router_handle()
 
-        # Lifecycle parallelism: device.connect / disconnect /
-        # driver.start / stop / restart / recover run on this pool
-        # instead of blocking the main loop. Per-device threading.Lock
-        # ensures same-device ops serialise; different devices run
-        # concurrently up to max_workers. Replies + events are
-        # marshalled back to the main thread via the two queues below,
-        # which the poll loop drains each tick.
-        self._main_thread_id = threading.get_ident()
-        self._lifecycle_executor = ThreadPoolExecutor(
-            max_workers=32, thread_name_prefix="mgr-lifecycle"
-        )
-        self._lifecycle_device_locks: dict[str, threading.Lock] = {}
-        self._lifecycle_reply_queue: queue.Queue[tuple[bytes, Json]] = queue.Queue()
-        # Bound the event queue so a stalled main-thread publisher (e.g.
-        # a slow event hook) can't let lifecycle workers grow it
-        # unboundedly. 10000 is well above realistic burst sizes (the
-        # main loop drains every tick at ~10-100Hz) but small enough
-        # that a true stall surfaces as drops + a counter operators can
-        # see, instead of as silent memory growth followed by OOM.
-        self._lifecycle_event_queue: queue.Queue[tuple[str, Json]] = queue.Queue(
-            maxsize=10_000
-        )
-        self._lifecycle_event_dropped = 0
-        self._lifecycle_event_dropped_lock = threading.Lock()
-
         # Per-socket monotonic timestamp of the last "drain cap hit"
         # event we published. Used to rate-limit drain-cap-hit notifications
         # (see _maybe_publish_drain_cap_hit) so a sustained backlog does
@@ -711,8 +723,13 @@ class Manager:
             raise ValueError(f"Duplicate device_id {spec.device_id!r}")
         self._devices[spec.device_id] = DeviceHandle(spec=spec)
 
-    def start_driver(self, device_id: str) -> None:
-        shared_start_driver(self, device_id)
+    # Phase 8.2.16: ``start_driver``, ``restart_driver``,
+    # ``_driver_is_started``, ``_driver_is_stopped`` are now provided
+    # by ``ProcessSupervisionMixin``. ``stop_driver`` and
+    # ``_mark_device_offline`` stay here because they pass
+    # ``Liveness.OFFLINE`` (Manager-module enum). Note that
+    # ``start_driver`` / ``restart_driver`` shed the wrapper because
+    # their bodies don't reference Manager-side enums.
 
     def stop_driver(self, device_id: str, *, force: bool = False) -> None:
         shared_stop_driver(
@@ -729,15 +746,6 @@ class Manager:
             handle,
             offline_state=Liveness.OFFLINE,
         )
-
-    def _driver_is_started(self, handle: DeviceHandle) -> bool:
-        return shared_driver_is_started(handle)
-
-    def _driver_is_stopped(self, handle: DeviceHandle) -> bool:
-        return shared_driver_is_stopped(handle)
-
-    def restart_driver(self, device_id: str, *, force: bool = False) -> None:
-        shared_restart_driver(self, device_id, force=force)
 
     def recover_device(
         self, device_id: str, *, reconnect: bool = True, force: bool = False
@@ -763,48 +771,19 @@ class Manager:
             restart_policy_always=RestartPolicy.ALWAYS,
         )
 
-    def _ensure_router_handle(self) -> ProcessHandle:
-        return shared_ensure_router_handle(self)
+    # Phase 8.2.16: ``_ensure_router_handle`` and
+    # ``_ensure_router_running`` are now provided by
+    # ``ProcessSupervisionMixin``. MRO resolves them.
 
-    def _ensure_router_running(self, *, timeout_s: float, poll_ms: int) -> None:
-        shared_ensure_router_running(self, timeout_s=timeout_s, poll_ms=poll_ms)
-
-    def _recent_process_logs(self, *, process_id: str, limit: int = 6) -> list[str]:
-        return shared_recent_process_logs(self, process_id=process_id, limit=limit)
-
-    def _recent_process_logs_structured(
-        self, *, process_id: str, limit: int = 20
-    ) -> list[dict[str, Any]]:
-        return shared_recent_process_logs_structured(
-            self, process_id=process_id, limit=limit
-        )
-
-    def _format_router_startup_failure(self, handle: ProcessHandle) -> str:
-        return shared_format_router_startup_failure(self, handle)
-
-    def _cleanup_orphans_summary(
-        self,
-        *,
-        dry_run: bool,
-        stale_only: bool = True,
-        timeout_s: float = 2.0,
-    ) -> Json:
-        return shared_cleanup_orphans_summary(
-            self,
-            dry_run=dry_run,
-            stale_only=stale_only,
-            timeout_s=timeout_s,
-        )
-
-    def _record_orphan_cleanup(self, *, source: str, summary: Json) -> None:
-        shared_record_orphan_cleanup(self, source=source, summary=summary)
+    # Phase 8.2.9: ``_recent_process_logs``, ``_recent_process_logs_structured``,
+    # ``_recent_source_logs_structured``, ``_format_router_startup_failure``,
+    # ``_cleanup_orphans_summary``, ``_record_orphan_cleanup``, and
+    # ``_maybe_recover_process_start_collision`` are now provided by
+    # ``ProcessRecoveryMixin``. MRO resolves them.
 
     @staticmethod
     def _is_endpoint_collision_process_start_failure(handle: ProcessHandle) -> bool:
         return shared_is_endpoint_collision_process_start_failure(handle)
-
-    def _maybe_recover_process_start_collision(self, handle: ProcessHandle) -> bool:
-        return shared_maybe_recover_process_start_collision(self, handle)
 
     def remove_process(self, process_id: str) -> None:
         handle = self._require_process(process_id)
@@ -891,8 +870,8 @@ class Manager:
         for device_id in self._devices.keys():
             self.stop_driver(device_id, force=force)
 
-    def _build_driver_cmd(self, spec: DeviceSpec) -> list[str]:
-        return shared_build_driver_cmd(self, spec)
+    # Phase 8.2.16: ``_build_driver_cmd`` is now provided by
+    # ``ProcessSupervisionMixin``. MRO resolves it.
 
     def _adopt_with_process_guard(
         self,
@@ -908,68 +887,17 @@ class Manager:
             target_id=target_id,
         )
 
-    def _require_process(self, process_id: str) -> ProcessHandle:
-        return shared_require_process(self, process_id)
+    # Phase 8.2.16: ``_require_process``, ``_resolve_process_heartbeat_endpoint``,
+    # ``_resolve_process_data_endpoint``, ``_connect_process_heartbeat``,
+    # ``_connect_process_data``, ``_expand_process_argv``,
+    # ``_start_process_handle``, ``_stop_process_handle``,
+    # ``_maybe_schedule_restart``, ``_try_restart_process``,
+    # ``_process_snapshot`` are now provided by
+    # ``ProcessSupervisionMixin``. MRO resolves them.
 
-    def _resolve_process_heartbeat_endpoint(self, spec: ProcessSpec) -> str:
-        return shared_resolve_process_heartbeat_endpoint(self, spec)
-
-    def _resolve_process_data_endpoint(self, spec: ProcessSpec) -> str:
-        return shared_resolve_process_data_endpoint(self, spec)
-
-    def _connect_process_heartbeat(self, endpoint: str) -> None:
-        shared_connect_process_heartbeat(self, endpoint)
-
-    def _connect_process_data(self, endpoint: str) -> None:
-        shared_connect_process_data(self, endpoint)
-
-    def _expand_process_argv(self, argv: list[str], handle: ProcessHandle) -> list[str]:
-        return shared_expand_process_argv(self, argv, handle)
-
-    def _start_process_handle(
-        self,
-        handle: ProcessHandle,
-        *,
-        reset_collision_retry: bool = True,
-    ) -> None:
-        shared_start_process_handle(
-            self,
-            handle,
-            reset_collision_retry=reset_collision_retry,
-        )
-
-    def _stop_process_handle(self, handle: ProcessHandle) -> None:
-        shared_stop_process_handle(self, handle)
-
-    def _maybe_schedule_restart(self, handle: ProcessHandle, now_mono: float) -> None:
-        shared_maybe_schedule_restart(self, handle, now_mono)
-
-    def _try_restart_process(self, handle: ProcessHandle) -> None:
-        shared_try_restart_process(self, handle)
-
-    def _process_snapshot(self, handle: ProcessHandle) -> Json:
-        return shared_process_snapshot(self, handle)
-
-    def _start_child_log_readers(
-        self,
-        *,
-        popen: subprocess.Popen[str],
-        source_kind: str,
-        source_id: str,
-        device_id: str | None,
-        process_id: str | None,
-    ) -> None:
-        shared_start_child_log_readers(
-            self,
-            popen=popen,
-            source_kind=source_kind,
-            source_id=source_id,
-            device_id=device_id,
-            process_id=process_id,
-        )
-
-    def _queue_supervisor_log(self, item: Json) -> None:
-        shared_queue_supervisor_log(self, item)
+    # Phase 8.2.10: ``_start_child_log_readers`` and
+    # ``_queue_supervisor_log`` are now provided by ``ProcessLogsMixin``.
+    # MRO resolves them.
 
     def _supervisor_handle_for(self, *, source_kind: str, source_id: str) -> Any:
         kind = str(source_kind or "").strip().lower()
@@ -1001,13 +929,19 @@ class Manager:
             entry["severity"] = severity
         return entry
 
-    def _record_supervisor_raw_log(self, item: Json) -> None:
+    def _record_supervisor_tail_log(
+        self,
+        item: Json,
+        *,
+        severity: str | None = None,
+        raw_stream_tail: bool = False,
+    ) -> None:
         if not isinstance(item, dict):
             return
         source_kind = str(item.get("source_kind", "") or "")
         source_id = str(item.get("source_id", "") or "")
         stream = str(item.get("stream", "") or "")
-        if stream not in {"stdout", "stderr"}:
+        if raw_stream_tail and stream not in {"stdout", "stderr"}:
             return
         message = str(item.get("message", "") or "")
         if not message:
@@ -1015,32 +949,32 @@ class Manager:
         handle = self._supervisor_handle_for(source_kind=source_kind, source_id=source_id)
         if handle is None:
             return
-        entry = self._supervisor_tail_entry(item=item, message=message, stream=stream)
-        if stream == "stdout":
+        entry = self._supervisor_tail_entry(
+            item=item,
+            message=message,
+            stream=stream,
+            severity=severity,
+        )
+        if not raw_stream_tail:
+            handle.supervisor_log_tail.append(entry)
+        elif stream == "stdout":
             handle.supervisor_stdout_tail.append(entry)
         else:
             handle.supervisor_stderr_tail.append(entry)
 
+    def _record_supervisor_raw_log(self, item: Json) -> None:
+        self._record_supervisor_tail_log(item, raw_stream_tail=True)
+
     def _record_supervisor_emitted_log(self, item: Json, *, severity: str) -> None:
-        if not isinstance(item, dict):
-            return
-        source_kind = str(item.get("source_kind", "") or "")
-        source_id = str(item.get("source_id", "") or "")
-        stream = str(item.get("stream", "") or "")
-        message = str(item.get("message", "") or "")
-        if not message:
-            return
-        handle = self._supervisor_handle_for(source_kind=source_kind, source_id=source_id)
-        if handle is None:
-            return
-        handle.supervisor_log_tail.append(
-            self._supervisor_tail_entry(
-                item=item,
-                message=message,
-                stream=stream,
-                severity=severity,
-            )
-        )
+        self._record_supervisor_tail_log(item, severity=severity)
+
+    # Phase 8.2.10: ``_supervisor_infer_severity``,
+    # ``_emit_supervisor_item``, ``_flush_stale_supervisor_blocks``,
+    # ``_prune_supervisor_log_threads``, ``_drain_supervisor_logs`` are
+    # now provided by ``ProcessLogsMixin``. The three pure parser
+    # staticmethods below remain on Manager so existing callers that
+    # use ``Manager._supervisor_*`` keep working — they wrap the
+    # module-level pure helpers that don't take ``manager``.
 
     @staticmethod
     def _supervisor_key(item: Json) -> tuple[str, str, int, str]:
@@ -1053,34 +987,6 @@ class Manager:
     @staticmethod
     def _supervisor_block_continuation(message: str) -> bool:
         return shared_supervisor_block_continuation(message)
-
-    def _supervisor_infer_severity(
-        self, *, stream: str, message: str, reader_error: bool
-    ) -> str:
-        return shared_supervisor_infer_severity(
-            self,
-            stream=stream,
-            message=message,
-            reader_error=reader_error,
-        )
-
-    def _emit_supervisor_item(self, item: Json) -> None:
-        shared_emit_supervisor_item(self, item)
-
-    def _flush_stale_supervisor_blocks(
-        self, *, max_age_s: float = 0.25, force: bool = False
-    ) -> None:
-        shared_flush_stale_supervisor_blocks(
-            self,
-            max_age_s=max_age_s,
-            force=force,
-        )
-
-    def _prune_supervisor_log_threads(self) -> None:
-        shared_prune_supervisor_log_threads(self)
-
-    def _drain_supervisor_logs(self, *, max_items: int = 250) -> None:
-        shared_drain_supervisor_logs(self, max_items=max_items)
 
     def _matching_supervisor_log_threads(
         self,
@@ -1357,31 +1263,11 @@ class Manager:
             results[device_id] = self.connect_device(device_id)
         return results
 
-    def startup_sequence(
-        self,
-        *,
-        start_drivers: bool = True,
-        start_processes: bool = True,
-        wait_processes_running: bool | None = None,
-        connect: bool | None = None,
-        wait_for_registered: bool = True,
-        wait_for_online: bool = True,
-        timeout_s: float = 10.0,
-        poll_ms: int = 50,
-    ) -> None:
-        return shared_startup_sequence(
-            self,
-            start_drivers=start_drivers,
-            start_processes=start_processes,
-            wait_processes_running=wait_processes_running,
-            connect=connect,
-            wait_for_registered=wait_for_registered,
-            wait_for_online=wait_for_online,
-            timeout_s=timeout_s,
-            poll_ms=poll_ms,
-            managed_process_running=ManagedProcessState.RUNNING,
-            driver_state_ok=DriverState.OK,
-        )
+    # Phase 8.2.11: ``startup_sequence`` is now provided by
+    # ``LifecycleMixin``. MRO resolves it. The mixin method has
+    # defaults for ``managed_process_running`` and ``driver_state_ok``
+    # that resolve to ``ManagedProcessState.RUNNING`` /
+    # ``DriverState.OK`` on first use, matching the prior wrapper.
 
     def _record_pump_timing(self, start_mono: float, end_mono: float) -> None:
         prev_end = self._last_pump_end_mono
@@ -1464,8 +1350,8 @@ class Manager:
     def shutdown(self) -> None:
         self._shutdown_requested = True
 
-    def _shutdown_cleanup(self) -> None:
-        shared_shutdown_cleanup(self)
+    # Phase 8.2.11: ``_shutdown_cleanup`` is now provided by
+    # ``LifecycleMixin``. MRO resolves it.
 
     def add_event_hook(self, hook: Callable[[str, Json], None]) -> None:
         self._event_hooks.append(hook)
@@ -1594,8 +1480,8 @@ class Manager:
     # Receiving driver PUB plane
     # -----------------------------
 
-    def _handle_driver_pub(self) -> None:
-        shared_handle_driver_pub(self)
+    # Phase 8.2.13: ``_handle_driver_pub`` is now provided by
+    # ``DriverPubMixin``. MRO resolves it.
 
     def _handle_process_pub(self) -> None:
         # Drain all available HBs in one tick so a momentary stall
@@ -1691,8 +1577,8 @@ class Manager:
             device_state_enum=DeviceState,
         )
 
-    def _ingest_chunk_ready(self, msg: Json) -> None:
-        shared_ingest_chunk_ready(self, msg)
+    # Phase 8.2.13: ``_ingest_chunk_ready`` is now provided by
+    # ``DriverPubMixin``. MRO resolves it.
 
     def _ingest_process_heartbeat(self, topic: str, msg: Json) -> None:
         process_id = str(msg["process_id"])
@@ -1760,24 +1646,14 @@ class Manager:
     # External command routing
     # -----------------------------
 
-    def _command_interceptor_routes_snapshot(self) -> list[Json]:
-        return shared_command_interceptor_routes_snapshot(self)
-
-    def _publish_interceptor_routes_update(
-        self, *, process_id: str, routes: list[Json], replace: bool
-    ) -> None:
-        shared_publish_interceptor_routes_update(
-            self,
-            process_id=process_id,
-            routes=routes,
-            replace=replace,
-        )
-
-    def _invalidate_command_interceptor_cache(self) -> None:
-        shared_invalidate_command_interceptor_cache(self)
-
-    def _drop_command_interceptor_routes(self, process_id: str) -> None:
-        shared_drop_command_interceptor_routes(self, process_id)
+    # Phase 8.2.15: ``_command_interceptor_routes_snapshot``,
+    # ``_publish_interceptor_routes_update``,
+    # ``_invalidate_command_interceptor_cache``,
+    # ``_drop_command_interceptor_routes``,
+    # ``_unregister_command_interceptor_routes`` are now provided by
+    # ``RouteHandlersMixin``. ``_match_command_interceptor_route`` and
+    # ``_register_command_interceptor_routes`` stay here because the
+    # latter binds the Manager-side ``CommandInterceptorRoute`` class.
 
     def _register_command_interceptor_routes(
         self, process_id: str, routes_raw: Any, *, replace: bool
@@ -1789,9 +1665,6 @@ class Manager:
             replace=replace,
             route_cls=CommandInterceptorRoute,
         )
-
-    def _unregister_command_interceptor_routes(self, process_id: str) -> bool:
-        return shared_unregister_command_interceptor_routes(self, process_id)
 
     @staticmethod
     def _match_command_interceptor_route(
@@ -1824,8 +1697,8 @@ class Manager:
             },
         )
 
-    def _handle_internal_rpc(self) -> None:
-        shared_handle_internal_rpc(self)
+    # Phase 8.2.6: ``_handle_internal_rpc`` is now provided by
+    # ``InternalRpcMixin`` via MRO.
 
     # -----------------------------
     # Lifecycle parallelism
@@ -1984,8 +1857,12 @@ class Manager:
                 # Never let observability break the main loop.
                 pass
 
-    def _route_internal_request(self, req: Json) -> Json:
-        return shared_route_internal_request(self, req)
+    # Phase 8.2.6: ``_route_internal_request``, ``_ensure_route_registries``
+    # are now provided by ``InternalRpcMixin`` via MRO.
+    # ``_dispatch_registry_request`` stays here as the pure-helper
+    # staticmethod wrapper because ``InternalRpcMixin`` invokes it via
+    # ``self._dispatch_registry_request``; turning it into a staticmethod
+    # forwarder on Manager keeps the wire shape simple.
 
     @staticmethod
     def _dispatch_registry_request(
@@ -2000,20 +1877,10 @@ class Manager:
             req=req,
         )
 
-    def _ensure_route_registries(self) -> None:
-        shared_ensure_route_registries(self)
-
-    def _build_internal_action_registry(self) -> RpcDispatchRegistry:
-        return build_internal_action_registry(self)
-
-    def _build_internal_type_registry(self) -> RpcDispatchRegistry:
-        return build_internal_type_registry(self)
-
-    def _build_process_route_registry(self) -> RpcDispatchRegistry:
-        return build_process_route_registry(self)
-
-    def _build_manager_route_registry(self) -> RpcDispatchRegistry:
-        return build_manager_route_registry(self)
+    # Phase 8.2.7: ``_build_internal_action_registry``,
+    # ``_build_internal_type_registry``, ``_build_process_route_registry``,
+    # ``_build_manager_route_registry`` are now provided by
+    # ``RequestRoutingMixin``. MRO resolves them.
 
     def _route_action_telemetry_schema_list(self, req: Json) -> Json:
         del req
@@ -2034,55 +1901,13 @@ class Manager:
             "telemetry": self._get_device_telemetry_snapshot(device_id),
         }
 
-    def _route_device_request(self, rtype: Any, req: Json) -> Json | None:
-        return route_device_request(self, rtype, req)
+    # Phase 8.2.14: ``_route_device_request`` is now provided by
+    # ``DeviceRoutingMixin``. MRO resolves it.
 
-    def _publish_process_command_response(
-        self,
-        *,
-        process_id: str,
-        action: str,
-        params: Json,
-        response: Json,
-        request_id: Any,
-        caller_process_id: Any,
-        source_kind: str,
-        source_id: str,
-    ) -> Json:
-        return shared_publish_process_command_response(
-            self,
-            process_id=process_id,
-            action=action,
-            params=params,
-            response=response,
-            request_id=request_id,
-            caller_process_id=caller_process_id,
-            source_kind=source_kind,
-            source_id=source_id,
-        )
-
-    def _route_process_request(self, rtype: Any, req: Json) -> Json | None:
-        return shared_route_process_request(self, rtype, req)
-
-    def _route_process_list_status(self, req: Json) -> Json:
-        return shared_route_process_list_status(self, req)
-
-    def _route_process_get(self, req: Json) -> Json:
-        return shared_route_process_get(self, req)
-
-    def _route_process_control(
-        self,
-        req: Json,
-        *,
-        action: str,
-        runner: Callable[[str], None],
-    ) -> Json:
-        return shared_route_process_control(
-            self,
-            req,
-            action=action,
-            runner=runner,
-        )
+    # Phase 8.2.15: ``_publish_process_command_response``,
+    # ``_route_process_request``, ``_route_process_list_status``,
+    # ``_route_process_get``, ``_route_process_control`` are now
+    # provided by ``RouteHandlersMixin``. MRO resolves them.
 
     def _route_process_start(self, req: Json) -> Json:
         return self._route_process_control(
@@ -2105,14 +1930,9 @@ class Manager:
             runner=self.restart_process,
         )
 
-    def _route_process_add(self, req: Json) -> Json:
-        return shared_route_process_add(self, req)
-
-    def _route_process_remove(self, req: Json) -> Json:
-        return shared_route_process_remove(self, req)
-
-    def _route_process_rpc_advertise(self, req: Json) -> Json:
-        return shared_route_process_rpc_advertise(self, req)
+    # Phase 8.2.15: ``_route_process_add``, ``_route_process_remove``,
+    # ``_route_process_rpc_advertise`` are now provided by
+    # ``RouteHandlersMixin``. MRO resolves them.
 
     def _route_process_rpc(self, req: Json) -> Json:
         return shared_route_process_rpc(
@@ -2126,81 +1946,12 @@ class Manager:
             starting_state=ManagedProcessState.STARTING,
         )
 
-    def _route_command_interceptor_register(self, req: Json) -> Json:
-        return shared_route_command_interceptor_register(self, req)
+    # Phase 8.2.15: 12 ``_route_command_interceptor_*`` +
+    # ``_route_manager_*`` forwarders are now provided by
+    # ``RouteHandlersMixin``. MRO resolves them.
 
-    def _route_command_interceptor_unregister(self, req: Json) -> Json:
-        return shared_route_command_interceptor_unregister(self, req)
-
-    def _route_command_interceptor_list(self, req: Json) -> Json:
-        return shared_route_command_interceptor_list(self, req)
-
-    def _route_manager_request(self, rtype: Any, req: Json) -> Json | None:
-        return shared_route_manager_request(self, rtype, req)
-
-    def _route_manager_shutdown(self, req: Json) -> Json:
-        return shared_route_manager_shutdown(self, req)
-
-    def _route_manager_identity(self, req: Json) -> Json:
-        return shared_route_manager_identity(self, req)
-
-    def _route_manager_cleanup_orphans(self, req: Json) -> Json:
-        return shared_route_manager_cleanup_orphans(self, req)
-
-    def _route_manager_log_publish(self, req: Json) -> Json:
-        return shared_route_manager_log_publish(self, req)
-
-    def _route_manager_log_tail(self, req: Json) -> Json:
-        return shared_route_manager_log_tail(self, req)
-
-    def _route_manager_command_journal_status(self, req: Json) -> Json:
-        return shared_route_manager_command_journal_status(self, req)
-
-    def _route_manager_command_journal_tail(self, req: Json) -> Json:
-        return shared_route_manager_command_journal_tail(self, req)
-
-    def _route_manager_event_publish(self, req: Json) -> Json:
-        return shared_route_manager_event_publish(self, req)
-
-    def _call_device_rpc(
-        self,
-        *,
-        device_id: str,
-        action: str,
-        params: Json,
-        timeout_ms: int | None = None,
-        request_id: Any = None,
-        caller_process_id: Any = None,
-        source_kind: Any = None,
-        source_id: Any = None,
-        is_remote_target: bool = False,
-    ) -> Json:
-        return shared_call_device_rpc(
-            self,
-            device_id=device_id,
-            action=action,
-            params=params,
-            timeout_ms=timeout_ms,
-            request_id=request_id,
-            caller_process_id=caller_process_id,
-            source_kind=source_kind,
-            source_id=source_id,
-            is_remote_target=is_remote_target,
-        )
-
-    def _call_process_rpc(
-        self,
-        *,
-        process_id: str,
-        request: Json,
-        timeout_ms: int | None = None,
-    ) -> Json:
-        return shared_call_process_rpc(
-            self,
-            process_id=process_id,
-            request=request,
-            timeout_ms=timeout_ms,
-        )
+    # Phase 8.2.8: ``_call_device_rpc`` and ``_call_process_rpc`` are
+    # now provided by ``RpcCallsMixin``. MRO resolves them.
 
     # Bounded wait when an external close-caller contends with a
     # worker's in-flight RPC. Picked at ~half the loop-stall warn
@@ -2322,44 +2073,9 @@ class Manager:
                     },
                 )
 
-    def _update_device_driver_exit_state(self, handle: DeviceHandle, rc: int) -> None:
-        shared_update_device_driver_exit_state(self, handle, rc)
-
-    def _enforce_device_driver_stop_timeout(
-        self, handle: DeviceHandle, now_mono: float
-    ) -> None:
-        shared_enforce_device_driver_stop_timeout(self, handle, now_mono)
-
-    def _maybe_restart_device_driver(
-        self, device_id: str, handle: DeviceHandle, now_mono: float
-    ) -> None:
-        shared_maybe_restart_device_driver(self, device_id, handle, now_mono)
-
-    def _supervise_device_drivers(self, now_mono: float) -> None:
-        shared_supervise_device_drivers(self, now_mono)
-
-    def _update_managed_process_exit_state(
-        self, handle: ProcessHandle, rc: int
-    ) -> bool:
-        return shared_update_managed_process_exit_state(self, handle, rc)
-
-    def _enforce_managed_process_heartbeat_timeout(
-        self, handle: ProcessHandle, now_mono: float
-    ) -> None:
-        shared_enforce_managed_process_heartbeat_timeout(self, handle, now_mono)
-
-    def _enforce_managed_process_stop_timeout(
-        self, handle: ProcessHandle, now_mono: float
-    ) -> None:
-        shared_enforce_managed_process_stop_timeout(self, handle, now_mono)
-
-    def _maybe_restart_managed_process(
-        self, handle: ProcessHandle, now_mono: float
-    ) -> None:
-        shared_maybe_restart_managed_process(self, handle, now_mono)
-
-    def _supervise_managed_processes(self, now_mono: float) -> None:
-        shared_supervise_managed_processes(self, now_mono)
+    # Phase 8.2.16: 9 ``_update_*`` / ``_enforce_*`` / ``_maybe_restart_*``
+    # / ``_supervise_*`` forwarders are now provided by
+    # ``ProcessSupervisionMixin``. MRO resolves them.
 
     def _check_timeouts(self) -> None:
         now_mono = time.monotonic()
@@ -2542,9 +2258,12 @@ class Manager:
     # -----------------------------
     # Manager -> external PUB
     # -----------------------------
-
-    def _publish_manager_event(self, topic: str, payload: Json) -> None:
-        shared_publish_manager_event(self, topic, payload)
+    # ``_publish_manager_event`` is now provided by ``PubSubMixin``
+    # (REFACTOR_PLAN §8.2.1). The prior one-line forwarder method has
+    # been removed; ``self._publish_manager_event(...)`` continues to
+    # work via MRO. Tests that imported the module-level
+    # ``publish_manager_event`` directly still work via the trampoline
+    # kept in ``manager_pubsub``.
 
     def _maybe_publish_drain_cap_hit(self, socket: str, cap: int) -> None:
         """Publish a `manager.drain_cap_hit` event for `socket`, rate-limited
@@ -2576,9 +2295,10 @@ class Manager:
             return text[:max_len] + "...(truncated)"
         return text
 
-    @staticmethod
-    def _should_journal_command_action(action: Any) -> bool:
-        return shared_should_journal_command_action(action)
+    # ``_should_journal_command_action`` was a one-line forwarder to
+    # ``manager_command_journal.should_journal_command_action`` with
+    # no internal callers; deleted in Phase 8.2.2. The module-level
+    # function remains the canonical place to ask the question.
 
     @staticmethod
     def _normalize_command_source(
@@ -2608,11 +2328,10 @@ class Manager:
             return source_kind_text, None
         return source_kind_text, source_id_text
 
-    def _append_command_journal_entry(self, payload: Json) -> None:
-        shared_append_command_journal_entry(self, payload)
-
-    def _command_journal_status_payload(self) -> Json:
-        return shared_command_journal_status_payload(self)
+    # ``_append_command_journal_entry`` & ``_command_journal_status_payload``
+    # are now provided by ``CommandJournalMixin`` (Phase 8.2.2). The
+    # prior forwarders have been removed; ``self.<method>(...)`` and
+    # ``Manager.<method>(mgr, ...)`` still resolve via MRO.
 
     def _publish_process_command_event(
         self,
@@ -2679,12 +2398,21 @@ class Manager:
     def _normalize_log_severity(raw: Any) -> str:
         return normalize_log_severity(raw, default="info")
 
+    # Phase 8.2.4: log emit/sink/tail methods provided by ``LogsMixin``.
+    # The trampolines below are the ones Manager still owns: small
+    # pure-helper wrappers used during ``__init__`` (severity / file /
+    # min-level / boolish env parsing) plus ``_normalize_id`` which is
+    # called from sibling mixins (manager_process_recovery,
+    # manager_rpc_calls). ``_severity_rank`` stays here because
+    # ``tui_manager`` and ``LogEventsMixin`` both reach for it via
+    # Manager.
+
     @staticmethod
     def _parse_boolish(raw: Any, *, default: bool) -> bool:
         return shared_parse_boolish(raw, default=default)
 
     def _resolve_manager_log_stderr_enabled(self, raw: Any) -> bool:
-        return shared_resolve_manager_log_stderr_enabled(self, raw)
+        return shared_resolve_manager_log_stderr_enabled(raw)
 
     def _resolve_manager_log_file_path(self, raw: Any) -> Path | None:
         return shared_resolve_manager_log_file_path(raw)
@@ -2696,115 +2424,9 @@ class Manager:
     def _severity_rank(raw: Any) -> int:
         return severity_rank(raw, default="info")
 
-    def _open_manager_log_sink_file(self) -> None:
-        shared_open_manager_log_sink_file(self)
-
-    def _close_manager_log_sink_file(self) -> None:
-        shared_close_manager_log_sink_file(self)
-
-    def _manager_log_sink_event(
-        self, topic: str, payload: Json
-    ) -> tuple[str, str, str, str | None, str]:
-        return shared_manager_log_sink_event(self, topic, payload)
-
-    def _manager_log_sink_is_duplicate(self, fingerprint: str) -> bool:
-        return shared_manager_log_sink_is_duplicate(self, fingerprint)
-
-    def _maybe_emit_manager_log_sink(self, topic: str, payload: Json) -> None:
-        shared_maybe_emit_manager_log_sink(self, topic, payload)
-
     @staticmethod
     def _normalize_id(raw: Any) -> str | None:
         return shared_normalize_id(raw)
-
-    def _normalize_log_ts(self, raw: Any) -> Json:
-        return shared_normalize_log_ts(raw)
-
-    def _emit_log(
-        self,
-        *,
-        severity: Any,
-        topic: Any,
-        message: Any,
-        source_kind: Any = "manager",
-        source_id: Any = None,
-        device_id: Any = None,
-        process_id: Any = None,
-        stream: Any = "event",
-        payload: Json | None = None,
-        payload_json: Any = None,
-        ts: Any = None,
-    ) -> Json:
-        return shared_emit_log(
-            self,
-            severity=severity,
-            topic=topic,
-            message=message,
-            source_kind=source_kind,
-            source_id=source_id,
-            device_id=device_id,
-            process_id=process_id,
-            stream=stream,
-            payload=payload,
-            payload_json=payload_json,
-            ts=ts,
-        )
-
-    def _emit_log_from_payload(
-        self, payload: Json, *, default_topic: str = "manager.log"
-    ) -> Json:
-        return shared_emit_log_from_payload(
-            self,
-            payload,
-            default_topic=default_topic,
-        )
-
-    @staticmethod
-    def _normalize_filter_set(raw: Any, *, field: str) -> set[str] | None:
-        return shared_normalize_filter_set(raw, field=field)
-
-    @staticmethod
-    def _parse_log_tail_limit(raw: Any) -> int:
-        return shared_parse_log_tail_limit(raw)
-
-    @staticmethod
-    def _parse_log_tail_since_t_mono(raw: Any) -> float | None:
-        return shared_parse_log_tail_since_t_mono(raw)
-
-    def _log_tail_filters(self, params: Json) -> dict[str, Any]:
-        return shared_log_tail_filters(self, params)
-
-    @staticmethod
-    def _log_tail_entry_t_mono(entry: Json) -> float | None:
-        return shared_log_tail_entry_t_mono(entry)
-
-    def _log_tail_matches_time(self, entry: Json, *, filters: dict[str, Any]) -> bool:
-        return shared_log_tail_matches_time(entry, filters=filters)
-
-    def _log_tail_matches_severity(
-        self, entry: Json, *, filters: dict[str, Any]
-    ) -> bool:
-        return shared_log_tail_matches_severity(entry, filters=filters)
-
-    @staticmethod
-    def _log_tail_matches_source_kind(entry: Json, *, filters: dict[str, Any]) -> bool:
-        return shared_log_tail_matches_source_kind(entry, filters=filters)
-
-    def _log_tail_matches_ids(self, entry: Json, *, filters: dict[str, Any]) -> bool:
-        return shared_log_tail_matches_ids(entry, filters=filters)
-
-    @staticmethod
-    def _log_tail_matches_contains(entry: Json, *, filters: dict[str, Any]) -> bool:
-        return shared_log_tail_matches_contains(entry, filters=filters)
-
-    def _log_tail_entry_matches(self, entry: Json, *, filters: dict[str, Any]) -> bool:
-        return shared_log_tail_entry_matches(entry, filters=filters)
-
-    def _log_tail(self, params: Json) -> Json:
-        return shared_log_tail(self, params)
-
-    def _maybe_publish_log_event(self, topic: str, payload: Json) -> None:
-        shared_maybe_publish_log_event(self, topic, payload)
 
     def _publish_process_event(self, topic: str, handle: ProcessHandle) -> None:
         payload: dict[str, Any] = {
@@ -2920,8 +2542,7 @@ class Manager:
                 }
             ).get("entries", [])
             return {
-                "tail_logs": shared_recent_source_logs_structured(
-                    self,
+                "tail_logs": self._recent_source_logs_structured(
                     source_id=resolved_source_id,
                     source_kind=source_kind,
                     limit=limit,
@@ -2999,22 +2620,10 @@ class Manager:
     ) -> dict[str, dict[str, Any]]:
         return shared_merge_stream_metadata_dicts(base, overlay)
 
-    def _effective_metadata_for_device(
-        self, device_id: str, spec: DeviceSpec
-    ) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
-        return shared_effective_metadata_for_device(self, device_id, spec)
-
-    def _runtime_metadata_state(self, device_id: str, handle: DeviceHandle) -> Json:
-        return shared_runtime_metadata_state(self, device_id, handle)
-
-    def _touch_runtime_metadata_revision(self, device_id: str) -> int:
-        return shared_touch_runtime_metadata_revision(self, device_id)
-
-    def _publish_device_config(self, handle: DeviceHandle) -> None:
-        shared_publish_device_config(self, handle)
-
-    def _device_config_payload(self, handle: DeviceHandle) -> Json:
-        return shared_device_config_payload(self, handle)
+    # Phase 8.2.5: ``_effective_metadata_for_device``,
+    # ``_runtime_metadata_state``, ``_touch_runtime_metadata_revision``,
+    # ``_publish_device_config``, ``_device_config_payload`` are now
+    # provided by ``RuntimeMetadataMixin``. MRO resolves them.
 
     def _serialize_spec_yaml(self, spec: DeviceSpec) -> str:
         return shared_serialize_spec_yaml(spec)

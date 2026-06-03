@@ -121,29 +121,15 @@ class InterceptorRouteState:
         return ordered
 
 
-def _legacy_state(manager: Any) -> InterceptorRouteState:
-    routes = list(getattr(manager, "_command_interceptor_routes", []))
-    next_order = int(getattr(manager, "_command_interceptor_order", 0))
-    max_cache = int(getattr(manager, "_command_interceptor_cache_max", 2048))
-    chain_cache = OrderedDict()
-    for key, value in dict(getattr(manager, "_command_interceptor_cache", {})).items():
-        if isinstance(key, tuple) and len(key) == 2:
-            chain_cache[(str(key[0]), str(key[1]))] = list(value)
-    return InterceptorRouteState(
-        routes=routes,
-        chain_cache=chain_cache,
-        next_order=next_order,
-        max_cache=max_cache,
-    )
-
-
 def ensure_interceptor_route_state(manager: Any) -> InterceptorRouteState:
-    state = getattr(manager, "_interceptor_route_state", None)
-    if isinstance(state, InterceptorRouteState):
-        return state
-    state = _legacy_state(manager)
-    manager._interceptor_route_state = state
-    return state
+    if not hasattr(manager, "_interceptor_route_state"):
+        manager._interceptor_route_state = InterceptorRouteState(
+            routes=list(manager._command_interceptor_routes),
+            chain_cache=OrderedDict(manager._command_interceptor_cache),
+            next_order=int(manager._command_interceptor_order),
+            max_cache=int(manager._command_interceptor_cache_max),
+        )
+    return manager._interceptor_route_state
 
 
 def sync_legacy_fields(manager: Any, state: InterceptorRouteState) -> None:
@@ -185,7 +171,7 @@ def register(
     route_cls: Any,
 ) -> list[Json]:
     state = ensure_interceptor_route_state(manager)
-    state.max_cache = int(getattr(manager, "_command_interceptor_cache_max", state.max_cache))
+    state.max_cache = int(manager._command_interceptor_cache_max)
     added = state.register(
         process_id=process_id,
         routes_raw=routes_raw,
@@ -204,7 +190,7 @@ def chain(
     match_route: Any,
 ) -> list[Any]:
     state = ensure_interceptor_route_state(manager)
-    state.max_cache = int(getattr(manager, "_command_interceptor_cache_max", state.max_cache))
+    state.max_cache = int(manager._command_interceptor_cache_max)
     ordered = state.chain(
         device_id=device_id,
         action=action,
@@ -212,3 +198,24 @@ def chain(
     )
     sync_legacy_fields(manager, state)
     return ordered
+
+
+class InterceptorRoutesMixin:
+    """Intentionally empty: this module doesn't benefit from migration.
+
+    Phase 8.2.12 decision: the 8 module-level helpers here
+    (``register``, ``unregister``, ``chain``, ``snapshot``,
+    ``invalidate``, ``drop_process``, ``ensure_interceptor_route_state``,
+    ``sync_legacy_fields``) are consumed only by
+    ``manager_route_handlers.py`` (which is its own helper module),
+    NOT by ``Manager`` directly. Converting them to mixin methods
+    would force changing every call site in ``manager_route_handlers``
+    from ``interceptor_register(manager, ...)`` to
+    ``self._interceptor_register(...)`` without removing any LOC.
+
+    When ``manager_route_handlers`` itself migrates to a mixin
+    (Phase 8.2.15), it will pick up these helpers as ``self.<method>``
+    calls if we decide it's worth it. For now ``InterceptorRoutesMixin``
+    stays empty — kept in ``Manager.__mro__`` only so the slot is
+    reserved.
+    """

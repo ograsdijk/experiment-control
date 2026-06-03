@@ -16,9 +16,11 @@ __all__ = ["MAX_DRAIN_PER_TICK"]
 
 
 def _positive_limit(manager: Any, attr: str, default: int) -> int:
-    raw = getattr(manager, attr, default)
+    # Production ``Manager`` initialises every ``_telemetry_cache_*`` /
+    # ``_chunk_cache_*`` limit unconditionally; ``default`` is a safety
+    # net for unit-test SimpleNamespace stubs that omit a limit attr.
     try:
-        value = int(raw)
+        value = int(getattr(manager, attr, default))
     except Exception:
         value = default
     return max(1, value)
@@ -31,30 +33,79 @@ def _touch_lru(order: dict[str, None], key: str) -> None:
 
 
 def _cache_counter_inc(manager: Any, attr: str) -> None:
-    current = int(getattr(manager, attr, 0) or 0)
-    setattr(manager, attr, current + 1)
+    # Counter attrs (_telemetry_cache_evicted_*, _chunk_cache_evicted_*)
+    # are all initialised to 0 in Manager.__init__. The ``or 0`` guard
+    # is purely a safety net for unit-test SimpleNamespace stubs that
+    # may not bother to pre-seed every counter.
+    setattr(manager, attr, int(getattr(manager, attr, 0) or 0) + 1)
+
+
+def _ensure_cache_state(manager: Any) -> None:
+    """Safety net for unit-test stubs that don't initialise LRU bookkeeping.
+
+    Production ``Manager`` initialises ``_telemetry_device_order`` and
+    ``_chunk_device_order`` unconditionally via ``ManagerCaches.bind_to_manager``,
+    so this helper is a no-op in real usage. It exists so tests that
+    instantiate a ``SimpleNamespace`` stub manager (e.g.
+    ``test_manager_driver_pub_bounds``) can call into ``ingest_telemetry`` /
+    ``ingest_chunk_ready`` without having to manually pre-populate every
+    LRU-bookkeeping attribute.
+    """
+    if not hasattr(manager, "_telemetry_device_order"):
+        manager._telemetry_device_order = {}
+    if not hasattr(manager, "_chunk_device_order"):
+        manager._chunk_device_order = {}
+
+
+def _evict_one_device(
+    manager: Any,
+    *,
+    device_id: str,
+    latest: dict[str, Any],
+    order: dict[str, None],
+    side_caches: tuple[dict[str, Any], ...],
+    max_devices: int,
+    counter_attr: str,
+) -> None:
+    """Evict the oldest device from ``latest`` (+ side caches) if at cap.
+
+    Shared between telemetry and chunk caches so the eviction policy
+    has a single source of truth. ``side_caches`` is a tuple of extra
+    per-device dicts that should be popped alongside ``latest`` (e.g.,
+    telemetry's ``last_bundle_ts`` map). Chunk callers pass ``()``.
+
+    Only triggers when ``device_id`` is brand-new AND ``latest`` is at
+    capacity — touching an existing device is a no-op (handled by
+    ``_touch_lru`` at the call site).
+    """
+    if device_id in latest or len(latest) < max_devices:
+        return
+    oldest = next(iter(order), None)
+    if oldest is None and latest:
+        oldest = next(iter(latest))
+    if oldest is None:
+        return
+    latest.pop(oldest, None)
+    for side in side_caches:
+        side.pop(oldest, None)
+    order.pop(oldest, None)
+    _cache_counter_inc(manager, counter_attr)
 
 
 def _ensure_telemetry_device_slot(manager: Any, device_id: str) -> dict[str, Any]:
+    _ensure_cache_state(manager)
     latest = manager._telemetry_latest
     last_bundle = manager._telemetry_last_bundle_ts
-    order_raw = getattr(manager, "_telemetry_device_order", None)
-    order: dict[str, None]
-    if isinstance(order_raw, dict):
-        order = order_raw
-    else:
-        order = {}
-        setattr(manager, "_telemetry_device_order", order)
-    max_devices = _positive_limit(manager, "_telemetry_cache_max_devices", 4096)
-    if device_id not in latest and len(latest) >= max_devices:
-        oldest = next(iter(order), None)
-        if oldest is None and latest:
-            oldest = next(iter(latest))
-        if oldest is not None:
-            latest.pop(oldest, None)
-            last_bundle.pop(oldest, None)
-            order.pop(oldest, None)
-            _cache_counter_inc(manager, "_telemetry_cache_evicted_devices")
+    order = manager._telemetry_device_order
+    _evict_one_device(
+        manager,
+        device_id=device_id,
+        latest=latest,
+        order=order,
+        side_caches=(last_bundle,),
+        max_devices=_positive_limit(manager, "_telemetry_cache_max_devices", 4096),
+        counter_attr="_telemetry_cache_evicted_devices",
+    )
     cache = latest.setdefault(device_id, {})
     _touch_lru(order, device_id)
     return cache
@@ -82,23 +133,18 @@ def _store_telemetry_signal(
 
 
 def _ensure_chunk_device_slot(manager: Any, device_id: str) -> dict[str, Any]:
+    _ensure_cache_state(manager)
     latest = manager._latest_chunk_desc
-    order_raw = getattr(manager, "_chunk_device_order", None)
-    order: dict[str, None]
-    if isinstance(order_raw, dict):
-        order = order_raw
-    else:
-        order = {}
-        setattr(manager, "_chunk_device_order", order)
-    max_devices = _positive_limit(manager, "_chunk_cache_max_devices", 4096)
-    if device_id not in latest and len(latest) >= max_devices:
-        oldest = next(iter(order), None)
-        if oldest is None and latest:
-            oldest = next(iter(latest))
-        if oldest is not None:
-            latest.pop(oldest, None)
-            order.pop(oldest, None)
-            _cache_counter_inc(manager, "_chunk_cache_evicted_devices")
+    order = manager._chunk_device_order
+    _evict_one_device(
+        manager,
+        device_id=device_id,
+        latest=latest,
+        order=order,
+        side_caches=(),
+        max_devices=_positive_limit(manager, "_chunk_cache_max_devices", 4096),
+        counter_attr="_chunk_cache_evicted_devices",
+    )
     cache = latest.setdefault(device_id, {})
     _touch_lru(order, device_id)
     return cache
@@ -349,9 +395,7 @@ def ingest_telemetry(
             value=(ts, sig),
         )
     manager._telemetry_last_bundle_ts[device_id] = ts
-    order_raw = getattr(manager, "_telemetry_device_order", None)
-    if isinstance(order_raw, dict):
-        _touch_lru(order_raw, device_id)
+    _touch_lru(manager._telemetry_device_order, device_id)
     if bad_signals:
         _emit_ingest_error(
             manager,
@@ -388,6 +432,8 @@ def ingest_telemetry(
 
 def _parse_heartbeat_pid(manager: Any, *, msg: Json, device_id: str) -> int | None:
     pid_raw = msg.get("pid")
+    if pid_raw is None:
+        return None
     try:
         return int(pid_raw)
     except Exception:
@@ -580,3 +626,36 @@ def ingest_chunk_ready(manager: Any, msg: Json) -> None:
         desc=desc,
     )
     manager._publish_manager_event("manager.chunk_ready", desc)
+
+
+class DriverPubMixin:
+    """Thin mixin exposing the 4 public driver-pub entry points.
+
+    Phase 8.2.13 decision: the 23 module-level helpers in this file
+    form a tight cluster of inter-calling functions (eviction +
+    decode + ingest paths). Converting them to mixin methods would
+    require ~600 LOC of mechanical ``manager.X`` -> ``self.X`` rewrites
+    with little benefit (the module is already cohesive and tested
+    directly via ``tests.test_manager_driver_pub_bounds``,
+    ``tests.test_manager_telemetry_call_errors_forwarding``).
+
+    Instead the mixin wraps only the 4 public entry points
+    ``Manager`` ever called as forwarders. The helpers stay as
+    module-level pure-ish functions and the tests' direct imports
+    keep working unchanged. Net effect: Manager forwarder methods go
+    away, MRO does the dispatch, no behavior change, no extra LOC.
+
+    ``_ingest_telemetry`` / ``_ingest_heartbeat`` are kept on
+    ``Manager`` itself (not on this mixin) because they need to
+    forward the ``TelemetrySignal`` / ``Heartbeat`` / ``Timestamp``
+    / ``DriverState`` / ``DeviceState`` / ``TelemetryQuality`` enum
+    classes — those are imported at the Manager-module level and
+    moving them onto this mixin would force the imports here, making
+    a circular reference. The 2-line forwarders on Manager stay.
+    """
+
+    def _handle_driver_pub(self) -> None:
+        handle_driver_pub(self)
+
+    def _ingest_chunk_ready(self, msg: Json) -> None:
+        ingest_chunk_ready(self, msg)
