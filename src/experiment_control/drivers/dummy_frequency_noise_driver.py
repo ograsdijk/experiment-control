@@ -2,31 +2,19 @@ from __future__ import annotations
 
 import numpy as np
 
-from experiment_control.types import TelemetryCall, TelemetryOut
+from experiment_control.types import TelemetryCall
+
+from ._dummy_helpers import scalar_telemetry
 
 
 DEFAULT_TELEMETRY_CALLS_DUMMYFREQUENCYNOISEDRIVER = [
     TelemetryCall(
         method="read_frequency_setpoint_hz",
-        outputs=[
-            TelemetryOut(
-                signal="frequency_setpoint_hz",
-                kind="scalar",
-                units="Hz",
-                dtype="float64",
-            )
-        ],
+        outputs=[scalar_telemetry("frequency_setpoint_hz", "Hz", dtype="float64")],
     ),
     TelemetryCall(
         method="read_frequency_hz",
-        outputs=[
-            TelemetryOut(
-                signal="frequency_hz",
-                kind="scalar",
-                units="Hz",
-                dtype="float64",
-            )
-        ],
+        outputs=[scalar_telemetry("frequency_hz", "Hz", dtype="float64")],
     ),
 ]
 
