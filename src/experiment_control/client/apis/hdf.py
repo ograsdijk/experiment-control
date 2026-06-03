@@ -19,10 +19,10 @@ class HdfAPI(ClientFacadeBase):
         timeout_ms: int | None = None,
         retries: int | None = None,
     ) -> Any:
-        return self._client.processes.call(
-            self.process_id,
-            action,
-            params,
+        return self._call_type(
+            "manager.processes.rpc",
+            process_id=self.process_id,
+            request={"type": str(action), "params": dict(params or {})},
             timeout_ms=timeout_ms,
             retries=retries,
         )
@@ -35,12 +35,13 @@ class HdfAPI(ClientFacadeBase):
         timeout_ms: int | None = None,
         retries: int | None = None,
     ) -> Json:
-        return self._client.processes.call_raw(
-            self.process_id,
-            action,
-            params,
+        return self._call_type(
+            "manager.processes.rpc",
+            process_id=self.process_id,
+            request={"type": str(action), "params": dict(params or {})},
             timeout_ms=timeout_ms,
             retries=retries,
+            expect_ok=False,
         )
 
     def status(self, *, timeout_ms: int | None = None, retries: int | None = None) -> Any:
