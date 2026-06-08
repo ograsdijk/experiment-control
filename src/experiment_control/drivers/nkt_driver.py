@@ -10,7 +10,12 @@ class NKTBasik(Basik):
         super().__init__(self.port, self.devID)
 
     def disconnect(self) -> None:
-        raise NotImplementedError("Disconnect method not implemented yet.")
+        # The nkt_basik library does not expose an explicit teardown for the
+        # Basik handle; the underlying serial port is closed when the object
+        # is garbage-collected. Returning silently here lets DeviceRunner's
+        # shutdown path complete without writing a misleading
+        # NotImplementedError to manager.log on every restart.
+        return None
 
     def read_temperature(self) -> float:
         return self.temperature

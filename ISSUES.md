@@ -1,37 +1,34 @@
 # Issues
 
-## Telemetry exceptions are swallowed and not surfaced in GUI logs
+(no open issues — see git history for resolved entries)
 
-Observed while debugging the `vacuum-cryo` CTC100 device in `centrex-experimental-stack`.
+## Resolved
 
-### What happens
+### Telemetry exceptions are swallowed and not surfaced in GUI logs
 
-In `src/experiment_control/driver.py`, `DeviceRunner.read_telemetry()` catches exceptions raised by an individual telemetry call and converts all outputs from that call to `quality = BAD` instead of surfacing the exception text to normal logs/UI telemetry consumers.
+Originally observed while debugging the `vacuum-cryo` CTC100 device in
+`centrex-experimental-stack`. Fixed by PR "feat(driver): surface per-call
+telemetry exceptions in published bundle + rate-limited stderr log".
 
-Then `_publish_telemetry()` stores the failure string only in `self._last_error`.
+`DeviceRunner.read_telemetry` now binds exceptions from individual
+telemetry calls, populates `_telemetry_last_call_errors` (keyed by the
+call's `method` name) and `_telemetry_last_signal_errors` (keyed by
+signal name), and rate-limits one stderr emission per `(method,
+exception class)` per 30 seconds.
 
-### Why this is a problem
+`DeviceRunner._publish_telemetry` threads both into the published
+bundle:
 
-A device can look partially healthy in the GUI while the real root cause is hidden:
-- scalar telemetry calls may still succeed
-- one bulk telemetry call may be failing every tick
-- the actual exception text is not visible in ordinary GUI logs/telemetry views
+- bundle level: `call_errors: dict[str, str]` (omitted when empty)
+- per signal: `error: str | None` (present on BAD signals when the
+  cause is a runtime exception, truncated to ≤200 chars)
 
-Concrete example from CTC100:
-- `read_telemetry()` raised because some `getOutput` channels legitimately returned `NaN`
-- `is_output_enabled`, `read_out1_setpoint`, and `read_out2_setpoint` still worked
-- the GUI therefore showed some correct values while the bulk temperature bundle was bad, without clearly surfacing the driver exception
+The manager (`manager_driver_pub.ingest_telemetry`) forwards
+`call_errors` verbatim into `manager.telemetry_update`, defensively
+filtering to (str, str) entries. See `docs/protocol.md` for the
+payload shape.
 
-### Relevant code paths
-
-- `src/experiment_control/driver.py`
-  - `DeviceRunner.read_telemetry()`
-  - `DeviceRunner._publish_telemetry()`
-
-### Desired follow-up
-
-Consider one or more of the following:
-- emit telemetry-call exceptions to the driver/process logs every time they occur (or with rate limiting)
-- include the per-call error text in the published telemetry payload for failed signals/calls
-- make `last_error` more visible in the GUI/device detail views
-- distinguish between expected bad signal values and actual driver/runtime exceptions more clearly
+The previously-vague `last_error` and the new structured payload now
+let the UI distinguish a "BAD signal because the value is genuinely
+out-of-range" from "BAD signal because the driver call raised". UI
+work to render the new field is tracked separately.

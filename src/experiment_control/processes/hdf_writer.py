@@ -564,6 +564,15 @@ class HdfWriter(ManagedProcessBase):
         self._next_write = 0.0
 
         self._error_counts: dict[str, int] = {}
+        # _bump_error fires on both the main thread (drain handlers, RPC
+        # handlers) and the bg flush thread. CPython dict mutation is
+        # NOT atomic across threads in the way `+=` on an attribute
+        # suggests — the get + assignment can interleave with another
+        # thread's bump on the same key, losing counts. Guard with a
+        # small lock; reads via the public _error_counts attribute (used
+        # by the bg-thread-failure tests) take a momentary snapshot to
+        # avoid mid-mutation reads of any single bucket.
+        self._error_counts_lock = threading.Lock()
 
         # Background-flush plumbing. The bg thread, once spawned in run(),
         # consumes _FlushBatch (fire-and-forget) and _BgRequest (synchronous)
@@ -767,7 +776,8 @@ class HdfWriter(ManagedProcessBase):
         return sum(len(items) for items in self._stream_context_by_seq.values())
 
     def _bump_error(self, key: str) -> None:
-        self._error_counts[key] = self._error_counts.get(key, 0) + 1
+        with self._error_counts_lock:
+            self._error_counts[key] = self._error_counts.get(key, 0) + 1
 
     def _resolve_output_path(
         self, filename: str | None, *, use_default_filename: bool
@@ -2459,9 +2469,17 @@ class HdfWriter(ManagedProcessBase):
         self._topic_handlers = handlers
         return handlers
 
-    def _rpc_ok(self, req: Json, *, result: Any) -> Json:
+    @classmethod
+    def _rpc_ok(
+        cls, req_or_id: Json | Any, *, result: Any = None
+    ) -> Json:
+        # Matches the ManagedProcessBase signature (classmethod,
+        # req_or_id, default result=None) so mypy doesn't flag the
+        # override as LSP-incompatible. The body is identical to the
+        # base, kept here for now to preserve any subclass-tests that
+        # call HdfWriter._rpc_ok directly.
         return {
-            "request_id": self._rpc_request_id(req),
+            "request_id": cls._rpc_request_id(req_or_id),
             "ok": True,
             "result": result,
         }
