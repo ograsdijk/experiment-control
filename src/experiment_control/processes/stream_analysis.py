@@ -311,7 +311,15 @@ class BinStatsState:
                 var = np.where(self.counts > 0, self.sums_sq / counts_f - mean * mean, np.nan)
                 var = np.where(var < 0, 0.0, var)
                 std = np.sqrt(var)
-                sem = np.where(self.counts > 0, std / np.sqrt(counts_f), np.nan)
+                # SEM is undefined for n<=1 (a single sample has no
+                # spread). Previously this returned 0 (std=0/sqrt(1)),
+                # which falsely communicated "perfectly known mean" to
+                # downstream consumers (UI error bars, fit weights).
+                # Return NaN so consumers can render "n/a" or skip the
+                # bin in weighted fits.
+                sem = np.where(
+                    self.counts > 1, std / np.sqrt(counts_f), np.nan
+                )
         else:
             mean = np.zeros(0, dtype=np.float64)
             std = np.zeros(0, dtype=np.float64)
@@ -637,7 +645,10 @@ class Bin2DStatsState:
             var = np.where(self.counts > 0, self.sums_sq / counts_f - mean * mean, np.nan)
             var = np.where(var < 0, 0.0, var)
             std = np.sqrt(var)
-            sem = np.where(self.counts > 0, std / np.sqrt(counts_f), np.nan)
+            # SEM is undefined for n<=1 — see the 1D BinStatsState.payload
+            # comment for rationale. Return NaN so consumers don't read
+            # a single-sample bin as a perfectly-known mean.
+            sem = np.where(self.counts > 1, std / np.sqrt(counts_f), np.nan)
             min_grid = np.where(self.counts > 0, self.mins, np.nan)
             max_grid = np.where(self.counts > 0, self.maxs, np.nan)
 
