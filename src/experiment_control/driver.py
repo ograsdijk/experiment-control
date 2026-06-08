@@ -1577,8 +1577,9 @@ class DeviceRunner:
         }
         # Surface per-call errors at the bundle level so the UI can show why
         # the device went DEGRADED without operators having to read stderr.
-        if self._telemetry_last_call_errors:
-            payload["call_errors"] = dict(self._telemetry_last_call_errors)
+        telemetry_last_call_errors = getattr(self, "_telemetry_last_call_errors", {})
+        if telemetry_last_call_errors:
+            payload["call_errors"] = dict(telemetry_last_call_errors)
 
         topic = f"{self.device_id}/telemetry".encode()
         self.pub.send_multipart([topic, json.dumps(payload).encode()])
