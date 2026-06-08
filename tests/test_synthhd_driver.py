@@ -17,6 +17,7 @@ class _Channel:
         self.power = 0.0
         self.enable = False
         self.phase = 0.0
+        self.temp_compensation_mode = "10 sec"
 
 
 class _BaseSynthHD:
@@ -58,27 +59,50 @@ class SynthHDDriverTests(unittest.TestCase):
         driver.disconnect()
         self.assertTrue(driver.closed)
 
-    def test_per_channel_aliases_removed(self) -> None:
+    def test_per_channel_frequency_methods(self) -> None:
         driver = SynthHD("COM1")
-        for name in (
-            "set_frequency_channel_0",
-            "set_frequency_channel_1",
-            "get_frequency_channel_0",
-            "get_frequency_channel_1",
-            "set_power_channel_0",
-            "set_power_channel_1",
-            "get_power_channel_0",
-            "get_power_channel_1",
-            "set_enable_channel_0",
-            "set_enable_channel_1",
-            "get_enable_channel_0",
-            "get_enable_channel_1",
-            "set_phase_channel_0",
-            "set_phase_channel_1",
-            "get_phase_channel_0",
-            "get_phase_channel_1",
-        ):
-            self.assertFalse(hasattr(driver, name), name)
+
+        driver.set_frequency_channel_0(1.0)
+        driver.set_frequency_channel_1(2.0)
+
+        self.assertEqual(driver.get_frequency_channel_0(), 1.0)
+        self.assertEqual(driver.get_frequency_channel_1(), 2.0)
+
+    def test_per_channel_power_methods(self) -> None:
+        driver = SynthHD("COM1")
+
+        driver.set_power_channel_0(-1.0)
+        driver.set_power_channel_1(-2.0)
+
+        self.assertEqual(driver.get_power_channel_0(), -1.0)
+        self.assertEqual(driver.get_power_channel_1(), -2.0)
+
+    def test_per_channel_enable_methods(self) -> None:
+        driver = SynthHD("COM1")
+
+        driver.set_enable_channel_0(True)
+        driver.set_enable_channel_1(False)
+
+        self.assertIs(driver.get_enable_channel_0(), True)
+        self.assertIs(driver.get_enable_channel_1(), False)
+
+    def test_per_channel_phase_methods(self) -> None:
+        driver = SynthHD("COM1")
+
+        driver.set_phase_channel_0(45.0)
+        driver.set_phase_channel_1(90.0)
+
+        self.assertEqual(driver.get_phase_channel_0(), 45.0)
+        self.assertEqual(driver.get_phase_channel_1(), 90.0)
+
+    def test_temp_compensation_mode_methods(self) -> None:
+        driver = SynthHD("COM1")
+
+        driver.set_temp_compensation_mode_channel_0("none")
+        driver.set_temp_compensation_mode_channel_1("on set")
+
+        self.assertEqual(driver.get_temp_compensation_mode_channel_0(), "none")
+        self.assertEqual(driver.get_temp_compensation_mode_channel_1(), "on set")
 
 
 if __name__ == "__main__":
