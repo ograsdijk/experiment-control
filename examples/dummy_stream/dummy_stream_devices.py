@@ -188,7 +188,7 @@ if __name__ == "__main__":
     )
     stream_thread.start()
 
-    from experiment_control.tui_manager import ManagerTUI
+    from experiment_control._tui.app import ManagerTUI
 
     app = ManagerTUI()
     try:

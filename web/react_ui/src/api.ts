@@ -226,6 +226,10 @@ function normalizeInterlockStatus(
             device_id: asString(telemetryObj.device_id, ""),
             signal: asString(telemetryObj.signal, ""),
             max_age_s: asNumber(telemetryObj.max_age_s, 0),
+            required:
+              typeof telemetryObj.required === "boolean"
+                ? telemetryObj.required
+                : true,
           };
         })
         .filter((item): item is NonNullable<typeof item> => item !== null);
@@ -324,6 +328,10 @@ function normalizeWatchdogStatus(raw: unknown): WatchdogStatus | null {
             device_id: asString(telemetryObj.device_id, ""),
             signal: asString(telemetryObj.signal, ""),
             max_age_s: asNumber(telemetryObj.max_age_s, 0),
+            required:
+              typeof telemetryObj.required === "boolean"
+                ? telemetryObj.required
+                : true,
           };
         })
         .filter((item): item is NonNullable<typeof item> => item !== null);

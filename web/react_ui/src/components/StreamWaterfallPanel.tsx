@@ -278,7 +278,7 @@ export function StreamWaterfallPanel({
       max: auto?.max ?? 1,
       manual: false,
     };
-  }, [zScaleMode, zMin, zMax, frames, historyRows, channelIndex]);
+  }, [zScaleMode, zMin, zMax, frames, historyRows, channelIndex, tick]);
 
   useEffect(() => {
     if (!hostRef.current || !canvasRef.current) {

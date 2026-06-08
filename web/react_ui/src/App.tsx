@@ -1238,7 +1238,7 @@ export function App() {
       ...new Set(
         commandDeck
           .filter(
-            (entry) =>
+            (entry): entry is CommandDeckCommandEntry =>
               isCommandDeckCommandEntry(entry) && entry.targetKind === "process"
           )
           .map((entry) => String(entry.targetId ?? "").trim())
@@ -1464,15 +1464,6 @@ export function App() {
         streamBinStatsFitOverlayRef.delete(panel.id);
         streamParamsLatestRef.delete(panel.id);
         streamBinStatsRef.delete(panel.id);
-      } else {
-        buffersRef.delete(panel.id);
-        streamFramesRef.delete(panel.id);
-        streamTraceOverlayRef.delete(panel.id);
-        streamBinStatsOverlayRef.delete(panel.id);
-        streamBinStatsFitOverlayRef.delete(panel.id);
-        streamParamsLatestRef.delete(panel.id);
-        streamBinStatsRef.delete(panel.id);
-        streamBin2dRef.delete(panel.id);
       }
     }
     // P5: keep the trace-key reverse index in sync with the current panel
@@ -1717,14 +1708,21 @@ export function App() {
   //
   // PerfC: maintain a reverse index for stream-analysis output
   // dispatch so applyStreamAnalysisOutputToPanels does O(matching
-  // panels) work per WS message instead of O(N panels). Rebuild on
-  // every panels change.
+  // panels) work per WS message instead of O(N panels). Rebuild
+  // synchronously in render (useMemo + ref assign) so the index is
+  // always current with the most recently committed `panels` — a
+  // useEffect-based rebuild lagged one commit behind, causing newly
+  // added outputs to miss the first 1-2 frames after panels mutated
+  // (and removed outputs to receive 1-2 extra). Matches the
+  // panelHelpersRef / panelHandlersRef pattern below.
   const panelsByWorkspaceOutputRef = useRef<
     Map<string, Map<string, PlotPanelState[]>>
   >(new Map());
-  useEffect(() => {
-    panelsByWorkspaceOutputRef.current = buildPanelsByWorkspaceOutput(panels);
-  }, [panels]);
+  const panelsByWorkspaceOutputIndex = useMemo(
+    () => buildPanelsByWorkspaceOutput(panels),
+    [panels]
+  );
+  panelsByWorkspaceOutputRef.current = panelsByWorkspaceOutputIndex;
   const applyDeps: ApplyHelpersDeps = {
     panelsRef,
     panelsByWorkspaceOutputRef,
@@ -2566,6 +2564,7 @@ export function App() {
   // Pattern: keep a mutable ref to the latest functions, then expose
   // a single useMemo-stable bag whose methods deref the ref.
   const panelHelpersRef = useRef<PanelsGridHelpers | null>(null);
+  // Render-body ref assign: works today; if we adopt concurrent React, switch to useLayoutEffect.
   panelHelpersRef.current = {
     resolveTelemetryPanelOffset,
     streamTraceOverlaySeries,

@@ -2,17 +2,66 @@ from __future__ import annotations
 
 from collections import deque
 import time
+import warnings
 from typing import Any
 
 import zmq
 
 from ..capabilities import capabilities_payload, method, param
+from ..utils.responses import is_response_ok
 from .process_base import ManagedProcessBase
 
 Json = dict[str, Any]
 
 
+class SequenceError(RuntimeError):
+    """Raised when a sequenced command against the manager fails.
+
+    ``StateMachineProcessBase.command`` raises this (or a configured
+    subclass — see ``sequence_error_cls``) when the manager is
+    uninitialised, or when the response does not satisfy
+    ``is_response_ok``. Subclasses that want a process-specific
+    exception type can either subclass this and set
+    ``sequence_error_cls = MySequenceError`` (the legacy
+    ``_sequence_error_cls`` spelling is honored for one release and
+    emits a ``DeprecationWarning`` via ``__init_subclass__``), or
+    just catch this base.
+    """
+
+
 class StateMachineProcessBase(ManagedProcessBase):
+    # Canonical class attribute (per AGENTS.md wire contract).
+    # ``_sequence_error_cls`` is the legacy spelling; it stays in sync
+    # via ``__init_subclass__`` below so a downstream subclass setting
+    # either name continues to work for one release.
+    sequence_error_cls: type[Exception] = SequenceError
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        super().__init_subclass__(**kwargs)
+        # Reconcile legacy ``_sequence_error_cls`` assignments at
+        # subclass-creation time. If a subclass set ONLY the legacy
+        # name, promote it to the public name and emit a deprecation
+        # warning. If both are set differently, the public name wins
+        # and we warn loudly so the drift is observable.
+        legacy = cls.__dict__.get("_sequence_error_cls")
+        public = cls.__dict__.get("sequence_error_cls")
+        if legacy is not None and public is None:
+            warnings.warn(
+                f"{cls.__name__} sets _sequence_error_cls; rename to "
+                "sequence_error_cls (Phase 10).",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            cls.sequence_error_cls = legacy
+        elif legacy is not None and public is not None and legacy is not public:
+            warnings.warn(
+                f"{cls.__name__} sets BOTH sequence_error_cls and "
+                "_sequence_error_cls with different values; public "
+                "sequence_error_cls wins.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+
     def __init__(
         self,
         *,
@@ -52,6 +101,10 @@ class StateMachineProcessBase(ManagedProcessBase):
         self._state_since_mono = now_mono
         self._last_error: str | None = None
         self._last_transition: Json | None = None
+        # Last manager-bound command request sent via self._command(...).
+        # Populated by subclasses or by the default _command implementation
+        # so introspection endpoints can show the most recent attempt.
+        self._last_command: Json | None = None
         self._graph_edges = self._normalize_graph_edges(graph_edges)
         if allowed_transitions is None and self._graph_edges:
             allowed_transitions = self._derive_allowed_transitions_from_graph_edges(self._graph_edges)
@@ -128,6 +181,22 @@ class StateMachineProcessBase(ManagedProcessBase):
     def last_error(self) -> str | None:
         return self._last_error
 
+    @property
+    def last_transition(self) -> Json | None:
+        return self._last_transition
+
+    @last_transition.setter
+    def last_transition(self, value: Json | None) -> None:
+        self._last_transition = value
+
+    @property
+    def allowed_transitions(self) -> dict[str, set[str]]:
+        return self._allowed_transitions
+
+    @allowed_transitions.setter
+    def allowed_transitions(self, value: dict[str, set[str]]) -> None:
+        self._allowed_transitions = value
+
     def _set_last_error(self, message: str | None) -> None:
         self._last_error = None if message is None else str(message)
         if self._last_error:
@@ -149,6 +218,69 @@ class StateMachineProcessBase(ManagedProcessBase):
             overflow = len(self._history) - self._history_max
             if overflow > 0:
                 del self._history[:overflow]
+
+    def command(
+        self,
+        device_id: str,
+        action: str,
+        params: Json,
+        *,
+        timeout_s: float | None = None,
+    ) -> Json:
+        """Send a typed ``command`` RPC to a device via the manager.
+
+        Stores the request payload on ``self._last_command`` for introspection
+        (status endpoints typically surface this). Raises
+        ``self.sequence_error_cls`` (default ``SequenceError``) when the
+        manager isn't initialised or when the response fails
+        ``is_response_ok``. ``timeout_s=None`` means "do not impose a per-call
+        deadline" — the manager's own RPC timeout still applies.
+
+        Returns the raw response dict so callers can read result fields.
+        Existing callers that ignore the return value are unaffected.
+        """
+        # Resolution order:
+        # 1) instance attr ``_sequence_error_cls`` if set (legacy
+        #    spelling; some tests stamp this directly on bare
+        #    instances). Emits no warning here because the assignment
+        #    site is what should be migrated, not the read site.
+        # 2) ``sequence_error_cls`` (canonical class attr, kept in
+        #    sync from subclass-level legacy assignments by
+        #    ``__init_subclass__``).
+        sequence_error_cls = self.__dict__.get("_sequence_error_cls")
+        if sequence_error_cls is None:
+            sequence_error_cls = self.sequence_error_cls
+        if self._manager is None:
+            raise sequence_error_cls("manager not initialized")
+        req: Json = {
+            "type": "command",
+            "device_id": str(device_id),
+            "action": str(action),
+            "params": dict(params),
+            "caller_process_id": self._process_id,
+        }
+        self._last_command = req
+        timeout_ms = None if timeout_s is None else max(1, int(float(timeout_s) * 1000))
+        resp = self._manager.call(req, timeout_ms=timeout_ms)
+        if not is_response_ok(resp):
+            raise sequence_error_cls(f"command failed: {req} -> {resp}")
+        return resp
+
+    def _command(
+        self,
+        device_id: str,
+        action: str,
+        params: Json,
+        *,
+        timeout_s: float | None = None,
+    ) -> Json:
+        """Deprecated alias for :meth:`command` (Phase 10 rename)."""
+        warnings.warn(
+            "StateMachineProcessBase._command is deprecated; use command instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.command(device_id, action, params, timeout_s=timeout_s)
 
     def allowed_next_states(self, state: str | None = None) -> list[str]:
         cur = self._state if state is None else str(state)
@@ -274,7 +406,7 @@ class StateMachineProcessBase(ManagedProcessBase):
                 "ts": {"t_wall": now_wall, "t_mono": now_mono},
             }
         )
-        self._publish_transition_event(src, dst, reason=reason, metadata=metadata)
+        self.publish_transition_event(src, dst, reason=reason, metadata=metadata)
 
         self._on_state_enter(src, dst, reason=reason, metadata=metadata)
         return True
@@ -323,10 +455,17 @@ class StateMachineProcessBase(ManagedProcessBase):
                 "ts": {"t_wall": now_wall, "t_mono": now_mono},
             }
         )
-        self._publish_transition_event(src, dst, reason=reason, metadata=meta)
+        self.publish_transition_event(src, dst, reason=reason, metadata=meta)
         return True
 
-    def _publish_transition_event(
+    # Prefix used when _publish_transition_event records a publish
+    # failure into self._last_error (set by PR #54, group F.34). A
+    # successful subsequent publish clears `_last_error` ONLY when the
+    # stored message starts with this prefix — operational errors
+    # (e.g. set elsewhere by the subclass) are preserved.
+    _TRANSITION_PUBLISH_ERROR_PREFIX = "failed to publish transition event"
+
+    def publish_transition_event(
         self,
         from_state: str,
         to_state: str,
@@ -349,8 +488,52 @@ class StateMachineProcessBase(ManagedProcessBase):
                 topic="manager.state_machine.transition",
                 payload=payload,
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            # Record the publish failure on the process's last_error so
+            # an operator inspecting `status` sees that the bus event
+            # was dropped, instead of the failure being silently
+            # swallowed. Don't overwrite a more meaningful pre-existing
+            # error.
+            if not self._last_error:
+                self._last_error = (
+                    f"{self._TRANSITION_PUBLISH_ERROR_PREFIX} "
+                    f"{from_state!s} -> {to_state!s}: {exc!r}"
+                )
+            return
+        # Successful publish: clear a previously-recorded transition-
+        # publish error so a one-off failure (e.g. bus not yet wired at
+        # startup) doesn't permanently mask later operational errors.
+        # Only clears errors with the matching prefix; unrelated
+        # operational errors stored in _last_error are preserved.
+        if (
+            self._last_error
+            and self._last_error.startswith(
+                self._TRANSITION_PUBLISH_ERROR_PREFIX
+            )
+        ):
+            self._last_error = None
+
+    def _publish_transition_event(
+        self,
+        from_state: str,
+        to_state: str,
+        *,
+        reason: str | None,
+        metadata: Json | None,
+    ) -> None:
+        """Deprecated alias for :meth:`publish_transition_event` (Phase 10 rename)."""
+        warnings.warn(
+            "StateMachineProcessBase._publish_transition_event is deprecated; "
+            "use publish_transition_event instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        self.publish_transition_event(
+            from_state,
+            to_state,
+            reason=reason,
+            metadata=metadata,
+        )
 
     def _on_state_exit(
         self,
@@ -593,7 +776,7 @@ class StateMachineProcessBase(ManagedProcessBase):
             "actions": action_items,
         }
 
-    def _handle_state_machine_rpc(self, req: Json) -> Json | None:
+    def handle_state_machine_rpc(self, req: Json) -> Json | None:
         rtype = str(req.get("type", ""))
         common = self._handle_common_rpc(req)
         if common is not None:
@@ -602,37 +785,47 @@ class StateMachineProcessBase(ManagedProcessBase):
         if rtype == "process.capabilities":
             members = self._base_capability_methods() + self._extra_capability_methods()
             members = self._with_common_capabilities(list(members))
-            return self._rpc_ok(req, result=capabilities_payload(members))
+            return self.rpc_ok(req, result=capabilities_payload(members))
 
         prefix = self._rpc_namespace
         if rtype == f"{prefix}.status":
-            return self._rpc_ok(req, result=self._status_payload())
+            return self.rpc_ok(req, result=self._status_payload())
 
         if rtype == f"{prefix}.graph":
-            return self._rpc_ok(req, result=self._state_machine_graph_payload())
+            return self.rpc_ok(req, result=self._state_machine_graph_payload())
 
         if rtype == f"{prefix}.history.tail":
             params = req.get("params", {}) or {}
             if not isinstance(params, dict):
-                return self._rpc_invalid_params(req, message="params must be a dict")
+                return self.rpc_invalid_params(req, message="params must be a dict")
             limit_raw = params.get("limit", 100)
             errors_only_raw = params.get("errors_only", False)
             try:
                 limit = int(limit_raw)
             except Exception:
-                return self._rpc_invalid_params(req, message="limit must be an int")
+                return self.rpc_invalid_params(req, message="limit must be an int")
             limit = max(1, min(limit, self._history_max))
             errors_only = bool(errors_only_raw)
-            return self._rpc_ok(
+            return self.rpc_ok(
                 req,
                 result=self._history_tail_payload(limit=limit, errors_only=errors_only),
             )
 
         if rtype == f"{prefix}.stop":
             self._stop_evt.set()
-            return self._rpc_ok(req, result={"status": "stopping"})
+            return self.rpc_ok(req, result={"status": "stopping"})
 
         return None
+
+    def _handle_state_machine_rpc(self, req: Json) -> Json | None:
+        """Deprecated alias for :meth:`handle_state_machine_rpc` (Phase 10 rename)."""
+        warnings.warn(
+            "StateMachineProcessBase._handle_state_machine_rpc is deprecated; "
+            "use handle_state_machine_rpc instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.handle_state_machine_rpc(req)
 
     def _tick_state(self, now_mono: float) -> None:
         raise NotImplementedError("_tick_state must be implemented by subclasses")

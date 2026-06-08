@@ -9,6 +9,7 @@ from contextlib import redirect_stderr
 from io import StringIO
 from pathlib import Path
 from typing import Any
+from urllib.error import HTTPError
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
@@ -58,6 +59,7 @@ def _make_proc() -> InfluxWriterProcess:
     proc._http_thread_dead = False  # noqa: SLF001
     proc._dropped_http_batches = 0  # noqa: SLF001
     proc._http_thread = None  # noqa: SLF001
+    proc._counters_lock = threading.Lock()  # noqa: SLF001
     proc._max_queue_points = 10_000  # noqa: SLF001
     proc._overflow_policy = "drop_oldest"  # noqa: SLF001
     proc._batch_max_points = 500  # noqa: SLF001
@@ -68,6 +70,8 @@ def _make_proc() -> InfluxWriterProcess:
     proc._points_skipped_invalid = 0  # noqa: SLF001
     proc._points_skipped_remote = 0  # noqa: SLF001
     proc._points_dropped_overflow = 0  # noqa: SLF001
+    proc._signals_skipped_invalid = 0  # noqa: SLF001
+    proc._signals_skipped_invalid_seen = set()  # noqa: SLF001
     proc._write_errors = 0  # noqa: SLF001
     proc._batches_written = 0  # noqa: SLF001
     proc._last_error = None  # noqa: SLF001
@@ -79,6 +83,7 @@ def _make_proc() -> InfluxWriterProcess:
     proc._last_flush_start_mono_s = None  # noqa: SLF001
     proc._last_flush_duration_s = None  # noqa: SLF001
     proc._last_flush_destination = None  # noqa: SLF001
+    proc._destination_retry = {}  # noqa: SLF001
     proc._last_drain_count = 0  # noqa: SLF001
     proc._last_drain_duration_s = 0.0  # noqa: SLF001
     proc._total_drained = 0  # noqa: SLF001
@@ -461,6 +466,93 @@ class InfluxWriterBgHttpThreadTests(unittest.TestCase, _BgThreadTestMixin):
             self.assertIsNotNone(proc._last_exception)  # noqa: SLF001
         finally:
             proc._stop_evt.set()  # noqa: SLF001
+
+
+class InfluxWriterRetryAfterTests(unittest.TestCase):
+    def test_retry_after_integer_sets_destination_backoff(self) -> None:
+        proc = _make_proc()
+        err = self._http_error(429, {"Retry-After": "3"})
+
+        proc._record_destination_http_error("default", err)  # noqa: SLF001
+
+        state = proc._destination_retry["default"]  # noqa: SLF001
+        self.assertEqual(state.last_status, 429)
+        self.assertAlmostEqual(state.last_retry_after_s or 0.0, 3.0, delta=0.25)
+        self.assertGreater(proc._destination_backoff_remaining_s("default"), 0.0)  # noqa: SLF001
+
+    def test_retry_after_http_date_is_parsed(self) -> None:
+        proc = _make_proc()
+        value = "Sun, 31 May 2026 22:42:12 GMT"
+        delay = proc._parse_retry_after(value, now_wall=1780267330.0)  # noqa: SLF001
+        self.assertAlmostEqual(delay or 0.0, 2.0, delta=0.01)
+
+    def test_missing_retry_after_uses_exponential_fallback(self) -> None:
+        proc = _make_proc()
+
+        proc._record_destination_http_error("default", self._http_error(503, {}))  # noqa: SLF001
+        proc._record_destination_http_error("default", self._http_error(503, {}))  # noqa: SLF001
+
+        state = proc._destination_retry["default"]  # noqa: SLF001
+        self.assertEqual(state.consecutive_failures, 2)
+        self.assertEqual(state.last_retry_after_s, 2.0)
+
+    def test_backoff_skips_only_affected_destination(self) -> None:
+        proc = _make_proc()
+        proc._destinations["other"] = InfluxDestination(  # noqa: SLF001
+            name="other",
+            url="http://127.0.0.1:8086",
+            org="org",
+            bucket="bucket",
+            token="",
+            measurement="m",
+            precision="ns",
+            request_timeout_s=5.0,
+            static_tags={},
+        )
+        proc._record_destination_http_error("default", self._http_error(429, {"Retry-After": "5"}))  # noqa: SLF001
+        flushed: list[str] = []
+
+        def flush_destination(*, destination_name: str, points: list[QueuedPoint]) -> bool:
+            del points
+            flushed.append(destination_name)
+            return True
+
+        proc._flush_destination_points = flush_destination  # type: ignore[method-assign]  # noqa: SLF001
+        failed = proc._flush_grouped_points(  # noqa: SLF001
+            by_destination={
+                "default": [QueuedPoint(destination="default", line="a")],
+                "other": [QueuedPoint(destination="other", line="b")],
+            }
+        )
+
+        self.assertEqual(flushed, ["other"])
+        self.assertEqual([point.line for point in failed], ["a"])
+
+    def test_flush_does_not_enqueue_backoff_only_batch(self) -> None:
+        proc = _make_proc()
+        proc._batch_max_points = 1  # noqa: SLF001
+        proc._record_destination_http_error("default", self._http_error(429, {"Retry-After": "5"}))  # noqa: SLF001
+        with proc._queue_lock:  # noqa: SLF001
+            proc._queue.append(QueuedPoint(destination="default", line="a"))  # noqa: SLF001
+            proc._queue.append(QueuedPoint(destination="default", line="b"))  # noqa: SLF001
+
+        proc._flush()  # noqa: SLF001
+
+        self.assertEqual(proc._http_queue.qsize(), 0)  # noqa: SLF001
+        with proc._queue_lock:  # noqa: SLF001
+            self.assertEqual([point.line for point in proc._queue], ["a", "b"])  # noqa: SLF001
+
+    @staticmethod
+    def _http_error(code: int, headers: dict[str, str]) -> HTTPError:
+        from io import BytesIO
+
+        return HTTPError(
+            "http://127.0.0.1/write",
+            code,
+            "error",
+            headers,
+            BytesIO(b"body"),
+        )
 
 
 class InfluxWriterFlushOverflowTests(unittest.TestCase):

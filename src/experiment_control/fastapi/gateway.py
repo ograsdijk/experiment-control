@@ -6,6 +6,7 @@ import math
 import queue
 import threading
 import uuid
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any
 
@@ -215,6 +216,12 @@ class RouterRpcClient:
             self._set_future_result(
                 fut, self._error("gateway_timeout", "router rpc timed out")
             )
+        # Also drop entries whose caller has already cancelled (e.g. the
+        # outer `asyncio.wait_for` safety net fired). Without this they
+        # linger in `pending` until their own deadline elapses.
+        cancelled = [rid for rid, (fut, _) in pending.items() if fut.done()]
+        for rid in cancelled:
+            pending.pop(rid, None)
 
     def _fail_all_inflight(
         self,
@@ -277,8 +284,10 @@ class RouterRpcClient:
                     continue
                 pending[rid] = (fut, deadline)
 
-            with self._lock:
-                self._inflight_depth = len(pending)
+            # Best-effort observability: read by stats() racily and may
+            # be off-by-one under contention. Worker thread is the only
+            # writer of `pending`, so no lock needed for the write.
+            self._inflight_depth = len(pending)
 
             # 2) Poll for replies, bounded by the next deadline or 100 ms.
             now = time.monotonic()
@@ -348,10 +357,6 @@ class TelemetryHub:
     its background thread and shares the resulting string across every
     subscriber, so N WS clients no longer each pay `json.dumps()` on the
     same payload. WS handlers should consume via `ws.send_text(payload)`.
-
-    `latest_message()` returns the most recently broadcast string so a
-    newly connecting client can prime its state without waiting for the
-    next ZMQ event (useful for low-rate topics like manager state).
     """
 
     def __init__(self, endpoint: str, *, topics: tuple[str, ...]) -> None:
@@ -470,8 +475,16 @@ class StreamFrameHub:
         self._stream_context: dict[
             tuple[str, str], tuple[int | None, dict[str, Any] | None]
         ] = {}
+        # Per-stream context keyed by stream sequence number. Uses
+        # OrderedDict so we can evict the lowest-seq entry in O(1) via
+        # popitem(last=False), mirroring the B3 pattern in
+        # `processes/stream_analysis.py`. With re-insertion-on-update
+        # (see the setdefault site below) insertion order tracks
+        # lowest-seq even when seqs arrive out-of-order from the
+        # publisher (network re-order / replay / retry).
         self._context_by_seq: dict[
-            tuple[str, str], dict[int, tuple[int | None, dict[str, Any] | None]]
+            tuple[str, str],
+            "OrderedDict[int, tuple[int | None, dict[str, Any] | None]]",
         ] = {}
         self._context_cache_limit = 8192
         self._latest_frame: dict[tuple[str, str], dict[str, Any]] = {}
@@ -855,25 +868,25 @@ class StreamFrameHub:
                 if isinstance(fields, dict):
                     context_fields = fields
             if msg_seq is not None:
-                bucket = self._context_by_seq.setdefault(key, {})
-                bucket[int(msg_seq)] = (
+                bucket = self._context_by_seq.setdefault(key, OrderedDict())
+                seq_key = int(msg_seq)
+                # If the seq already has an entry, drop it first so the
+                # refreshed value lands at the end of the insertion
+                # order. Without this, an out-of-order or replayed seq
+                # would update in place and `popitem(last=False)` would
+                # evict the wrong entry (matches the B3 sibling pattern
+                # in processes/stream_analysis.py).
+                if seq_key in bucket:
+                    del bucket[seq_key]
+                bucket[seq_key] = (
                     int(context_id) if context_id is not None else None,
                     dict(context_fields) if context_fields is not None else None,
                 )
-                if len(bucket) > self._context_cache_limit:
-                    # PerfB: contexts are inserted in increasing-seq
-                    # order so dict insertion order == seq order; pop the
-                    # oldest N entries directly in O(trim) instead of
-                    # `sorted(bucket.keys())[:trim]` (O(N log N) on the
-                    # full bucket, runs on every frame once the cap is
-                    # hit).
-                    trim = len(bucket) - self._context_cache_limit
-                    for _ in range(trim):
-                        try:
-                            oldest = next(iter(bucket))
-                        except StopIteration:
-                            break
-                        bucket.pop(oldest, None)
+                # O(1) drop-oldest via OrderedDict; insertion order now
+                # tracks lowest-seq even under out-of-order arrival, so
+                # we never accidentally evict a still-needed recent seq.
+                while len(bucket) > self._context_cache_limit:
+                    bucket.popitem(last=False)
 
             reader = self._readers.get(key)
             if reader is None or reader.name != shm_name:

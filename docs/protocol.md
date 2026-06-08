@@ -75,8 +75,13 @@ Notes:
   - TUI device commands: `source_kind=tui`, `source_id=manager_tui`
   - Managed processes using `ManagerClient.call` for `type=command`: `source_kind=process`, `source_id=<process_id>` plus `caller_process_id=<process_id>`
 
-Response (pass-through from driver):
-- `{"ok": true, "result": ...}` or `{"ok": false, "error": ...}`
+Response (pass-through from driver — `id` is the manager's internal RPC sequence number):
+- `{"id": <int>, "status": "OK", "result": ...}`
+- `{"id": <int>, "status": "ERROR", "error": "...", "error_code": "..."}`
+
+Response (manager-level early return — device unknown or driver stopped):
+- `{"ok": false, "error": "Unknown device_id 'foo'"}`
+- `{"ok": false, "error": "driver not running"}`
 
 Response (interceptor blocked):
 - `{"ok": false, "error": {"kind": "command_interceptor", "code": "INTERCEPTOR_REJECTED", ...}}`
@@ -87,6 +92,15 @@ Request:
 
 Response:
 - `{"ok": true, "devices": [{"device_id": "hv", "registered": true, "...": "..."}]}`
+
+### `device.get_status`
+Request:
+- `{"type": "device.get_status", "device_id": "hv"}`
+
+Response:
+- `{"ok": true, "result": {"device_id": "hv", "liveness": "ONLINE", "...": "..."}}`
+- Result shape is a single device's status snapshot — same per-item shape as `device.list_status` below.
+- Federated (mirrored) devices return the federation hub's snapshot.
 
 ### `device.list_status`
 Request:
@@ -242,7 +256,8 @@ Request:
 - `{"type": "device.connect", "device_id": "dummy1"}`
 
 Response:
-- `{"ok": true, "result": {"status": "connected"}}`
+- `{"ok": true, "result": {"status": "OK", "result": null}}`
+- `{"ok": true, "result": {"status": "OK", "result": null, "already_connected": true}}` (driver was already connected; `connect_check.identity` if enabled has passed)
 - `{"ok": false, "error": {"code": "connect_check_failed", "message": "...", "details": {"expected": {...}, "actual": {...}, "mismatch": {...}}}}`
 
 Notes:
@@ -251,6 +266,9 @@ Notes:
 - Default failure policy is disconnect (`connect_check.on_fail: disconnect`).
 - `connect_check.on_fail: keep_connected` keeps the link up but `device.connect`
   still reports `ok=false` with `code=connect_check_failed`.
+- `device.connect` is idempotent: if the driver returns `error_code: already_connected`,
+  the manager treats it as success, still runs `connect_check.identity` when enabled,
+  and the response gains `already_connected: true`.
 
 ### `device.metadata.get`
 Request:
@@ -372,6 +390,8 @@ Response:
 
 ## Frequency-power follower process RPC (`manager.processes.rpc.request` payload)
 
+This section documents a **process-RPC convention** that consumer processes are expected to implement when they act as frequency-power followers — experiment-control does not ship a follower process. centrex-experimental-stack provides two implementations: `LaserLockFreqNltlPowerFollower` and `frequency_step_guard.py` (the latter exposes these as compatibility aliases for `step_guard.*`).
+
 ### `follower.rules`
 Request:
 - `{"type": "follower.rules"}`
@@ -410,7 +430,8 @@ Request:
 - `{"type": "watchdog.clear_latch", "params": {"all": true}}`
 
 Response:
-- `{"ok": true, "result": {"cleared": [...]}}`
+- `{"ok": true, "result": {"cleared": [{"watchdog_id": "...", "rule": "...", "previous_latched": true, "previous_armed": true}, ...]}}` (when `params.all=true`)
+- `{"ok": true, "result": {"watchdog_id": "...", "rule": "...", "previous_latched": true, "previous_armed": true}}` (when scoped by `watchdog_id` or unscoped single-rule clear)
 
 ### `watchdog.enable` / `watchdog.disable`
 Request:
@@ -464,7 +485,10 @@ Response:
 ### `influx.devices.enable` / `influx.devices.disable`
 Request:
 - `{"type": "influx.devices.enable", "params": {"device_id": "device_a"}}`
+- `{"type": "influx.devices.enable", "params": {"device_ids": ["device_a", "device_b"]}}`
+- `{"type": "influx.devices.disable", "params": {"device_id": "device_a"}}`
 - `{"type": "influx.devices.disable", "params": {"device_ids": ["device_a", "device_b"]}}`
+- Both actions accept either `device_id` (single string) or `device_ids` (list of strings). When both are present, `device_ids` wins.
 
 Response:
 - `{"ok": true, "result": {"disabled_devices": []}}`
@@ -598,6 +622,28 @@ Request:
 Response:
 - `{"ok": true, "result": {"changed": [...], "unknown": [...], "disabled_devices": [...], "known_devices": [...], "enabled_known_devices": [...]}}`
 
+### `hdf.writing.start`
+Request:
+- `{"type": "hdf.writing.start", "params": {"filename": "run.h5", "disabled_devices": ["dev2"], "measurement_profile": "frequency_scan", "measurement_values": {"measurement_name": "scan-A", "seed1_power_dbm": -5.2}}}`
+- All params are optional.
+- If `measurement_schema_path` is configured and successfully loaded in the HDF writer, `measurement_profile` is required.
+
+Response:
+- `{"ok": true, "result": {"new_file": "path/to/file.h5", "measurement_id": "uuid", "measurement_type": "frequency_scan", "unknown": [...], "disabled_devices": [...], "known_devices": [...], "enabled_known_devices": [...]}}`
+- `{"ok": false, "error": {"code": "already_writing", "message": "HDF writer is already writing"}}`
+- `{"ok": false, "error": {"code": "invalid_params", "message": "..."}}` (filename empty, `measurement_values` not a dict, etc.)
+- `{"ok": false, "error": {"code": "file_exists", "message": "..."}}`
+- `{"ok": false, "error": {"code": "start_failed", "message": "..."}}`
+
+### `hdf.writing.stop`
+Request:
+- `{"type": "hdf.writing.stop"}`
+
+Response:
+- `{"ok": true, "result": {"already_stopped": false, "old_file": "path/to/file.h5", "disabled_devices": [...], "known_devices": [...], "enabled_known_devices": [...]}}`
+- `{"ok": true, "result": {"already_stopped": true, "old_file": null, "disabled_devices": [...], "known_devices": [...], "enabled_known_devices": [...]}}` (no file was open)
+- `{"ok": false, "error": {"code": "stop_failed", "message": "..."}}`
+
 ### `hdf.rotate`
 Request:
 - `{"type": "hdf.rotate", "params": {"filename": "next_run.h5", "disabled_devices": ["dev2"], "measurement_profile": "frequency_scan", "measurement_values": {"measurement_name": "scan-A", "seed1_power_dbm": -5.2}}}`
@@ -661,7 +707,15 @@ Response:
   - `device_id`: str
   - `seq`: int
   - `ts`: {`t_wall`: float, `t_mono`: float}
-  - `signals`: dict of signal → {`value`, `units`, `quality`, `ts`}
+  - `signals`: dict of signal → {`value`, `units`, `quality`, `ts`, `error?`}
+    - `error` (optional, str): present on BAD signals when the
+      cause is a runtime exception from the driver. Truncated to
+      ≤200 chars. Absent on OK / MISSING / STALE signals.
+  - `call_errors` (optional, dict[str, str]): per-call exception summaries
+    keyed by the telemetry call's `method` name. Present iff at least one
+    telemetry call raised this tick. Values are `repr(exception)` truncated
+    to ≤200 chars. When `read_telemetry` itself raises (rare), the key is
+    the synthetic placeholder `"<read_telemetry>"`.
 
 ### `{device_id}/chunk_ready`
 - Producer: driver
@@ -690,7 +744,10 @@ Response:
   - `device_id`: str
   - `seq`: int
   - `ts`: {`t_wall`, `t_mono`}
-  - `signals`: dict of signal → {`value`, `units`, `quality`, `ts`}
+  - `signals`: dict of signal → {`value`, `units`, `quality`, `ts`, `error?`}
+  - `call_errors` (optional, dict[str, str]): forwarded verbatim from the
+    driver's `{device_id}/telemetry` payload when present. See the driver
+    topic above for shape/contents.
 
 ### `manager.heartbeat`
 - Producer: manager
@@ -796,6 +853,50 @@ HDF storage:
   - `signals`: list[str]
   - `age_s`: float
   - `ts`: {`t_wall`, `t_mono`}
+
+### `manager.stream_analysis.output`
+- Producer: stream_analysis process
+- Consumers: TUI, web UI, optional dashboards
+- Payload (version 1):
+  - `workspace_id`: str
+  - `output_id`: str
+  - `node_id`: str
+  - `kind`: `scalar|trace|hist_agg|hist2d|params_map|fit_1d`
+  - `channel_index`: int
+  - `channel_count`: int
+  - `value`: output payload
+  - `point_count`: int (optional)
+  - `truncated`: bool (optional)
+  - Fit outputs include additive `last_fit_attempt_ts_mono` and
+    `last_fit_success_ts_mono` fields when a fit has been attempted.
+
+### `manager.process.failed`
+- Producer: manager
+- Consumers: TUI/logs
+- Payload includes `process_id`, `pid`/`last_failure_pid` where known,
+  `error` or `termination_reason`, and `ts`.
+
+### `manager.lifecycle.events_dropped`
+- Producer: manager
+- Consumers: logs/observability
+- Payload includes dropped-event counts and reason text when lifecycle/log
+  publication backpressure drops events.
+
+### `manager.watchdog.rule_error`
+- Producer: watchdog process
+- Consumers: logs/observability
+- Payload includes `process_id`, `watchdog_id`, `rule`, and `error`.
+
+### `manager.interlock.rule_error`
+- Producer: interlock process
+- Consumers: logs/observability
+- Payload includes `process_id`, `interceptor_id`, `rule`, and `error`.
+
+### `manager.watchdog.action_chain_error`
+- Producer: watchdog process
+- Consumers: logs/observability
+- Payload includes `process_id`, `watchdog_id`, `rule`, and `error` for
+  asynchronous remediation-action failures.
 
 ### `manager.command`
 - Producer: manager

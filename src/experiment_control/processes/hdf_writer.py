@@ -8,7 +8,6 @@ import threading
 import time
 import uuid
 from collections import deque
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Literal, cast
 
@@ -37,7 +36,29 @@ from ..utils.logging_levels import normalize_log_severity
 from ..utils.rpc_dispatch import RpcDispatchRegistry
 from ..utils.yaml_helpers import load_yaml_file
 from ..utils.zmq_helpers import json_dumps, json_loads, safe_json_loads
+from .hdf_writer_bg import (
+    _BG_SENTINEL as _BG_SENTINEL,
+    _BgRequest as _BgRequest,
+    _BgSentinel as _BgSentinel,
+    _DevicesToggleRequest as _DevicesToggleRequest,
+    _FlushBatch as _FlushBatch,
+    _MeasurementNoteRequest as _MeasurementNoteRequest,
+    _RotateRequest as _RotateRequest,
+    _StartWritingRequest as _StartWritingRequest,
+    _StopWritingRequest as _StopWritingRequest,
+)
 from .hdf_writer_context import coerce_context_value
+from .hdf_writer_dtypes import (
+    DEFAULT_NUMERIC_COMPRESSION,
+    DEFAULT_NUMERIC_SHUFFLE,
+    DEFAULT_TELEMETRY_CHUNK_ROWS,
+    DTYPE_MAP,
+    _context_table_dtype,
+    _event_dtype,
+    _measurement_note_dtype,
+    _sequencer_event_dtype,
+    _sequencer_yaml_dtype,
+)
 from .hdf_writer_topics import build_hdf_topic_handlers
 from .process_base import ManagedProcessBase
 
@@ -46,194 +67,11 @@ EventLogMode = Literal["all", "failures_only", "none"]
 EVENT_LOG_MODES: tuple[EventLogMode, ...] = ("all", "failures_only", "none")
 
 
-DTYPE_MAP: dict[str, np.dtype[Any]] = {
-    "float64": np.dtype("float64"),
-    "float32": np.dtype("float32"),
-    "int64": np.dtype("int64"),
-    "int32": np.dtype("int32"),
-    "uint64": np.dtype("uint64"),
-    "uint32": np.dtype("uint32"),
-    "bool": np.dtype("bool"),
-}
-DEFAULT_NUMERIC_COMPRESSION = "lzf"
-DEFAULT_NUMERIC_SHUFFLE = True
-DEFAULT_TELEMETRY_CHUNK_ROWS = 64
-
-
-# ---------------------------------------------------------------------------
-# Background-flush queue types.
-#
-# These are the typed payloads the main loop hands off to the bg flush
-# thread. `FlushBatch` is fire-and-forget (no response). The `_BgRequest`
-# hierarchy is for synchronous RPC handlers that need to wait on the bg
-# thread to mutate `_h5` (file rotation, start/stop writing, measurement
-# note append, device toggle). Each `_BgRequest` carries a 1-slot response
-# queue the bg thread fills with either the result or the raised exception.
-#
-# Commit 1 introduces only the type definitions and the queue plumbing —
-# main-loop handlers do not yet enqueue anything other than the shutdown
-# sentinel. Commit 2 flips all `_h5`-touching paths through the queue.
-# ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class _FlushBatch:
-    """Snapshot of pending main-loop state ready to be written to HDF5.
-
-    Shape of `stream_batches` matches `self._stream_buffers` — a dict
-    keyed by `(device_id, stream)` whose values are dicts with `data`,
-    `seq`, `t0_mono_ns`, `t0_wall_ns`, `context_id` lists. This keeps
-    the existing `_write_stream_buffers_batch` signature stable.
-
-    `_dropped_local` / `_dropped_events` are cumulative counters shared
-    between threads and not snapshotted into the batch — main loop
-    increments them in `_buffer_append` / `_buffer_event`, bg thread
-    reads them in `_flush_active_file`. CPython GIL makes the int read
-    atomic; the worst case is a momentarily stale attrs value that
-    catches up on the next flush.
-    """
-
-    buffered_rows: list[Json] = field(default_factory=list)
-    event_rows: list[tuple[str, Json]] = field(default_factory=list)
-    stream_batches: dict[tuple[str, str], dict[str, list[Any]]] = field(
-        default_factory=dict
-    )
-    pending_stream_metadata: dict[tuple[str, str], dict[str, Any]] = field(
-        default_factory=dict
-    )
-    force_flush: bool = False
-
-
-@dataclass
-class _BgRequest:
-    """Base for synchronous RPC requests routed through the bg thread."""
-
-    response: "queue.Queue[Any]" = field(default_factory=lambda: queue.Queue(maxsize=1))
-
-
-@dataclass
-class _RotateRequest(_BgRequest):
-    filename: str | None = None
-    disabled_devices: set[str] | None = None
-    measurement_profile: str | None = None
-    measurement_values: object = None
-
-
-@dataclass
-class _StartWritingRequest(_BgRequest):
-    filename: str | None = None
-    disabled_devices: set[str] | None = None
-    measurement_profile: str | None = None
-    measurement_values: object = None
-
-
-@dataclass
-class _StopWritingRequest(_BgRequest):
-    pass
-
-
-@dataclass
-class _MeasurementNoteRequest(_BgRequest):
-    author: str = ""
-    kind: str = ""
-    message: str = ""
-    payload_json: str = ""
-
-
-@dataclass
-class _DevicesToggleRequest(_BgRequest):
-    disabled: set[str] = field(default_factory=set)
-
-
-class _BgSentinel:
-    """Marker put on the bg queue to request a clean thread exit."""
-
-    __slots__ = ()
-
-
-_BG_SENTINEL = _BgSentinel()
-
-
 def _default_filename() -> str:
     return time.strftime("%Y_%m_%d-%H_%M_%S.h5", time.localtime())
 
 
-def _event_dtype() -> np.dtype[Any]:
-    str_dt = h5py.string_dtype("utf-8")
-    return np.dtype(
-        [
-            ("t_wall", np.float64),
-            ("t_mono", np.float64),
-            ("kind", str_dt),
-            ("severity", str_dt),
-            ("device_id", str_dt),
-            ("action", str_dt),
-            ("params_json", str_dt),
-            ("ok", np.bool_),
-            ("error", str_dt),
-            ("result_json", str_dt),
-            ("topic", str_dt),
-            ("message", str_dt),
-            ("payload_json", str_dt),
-        ]
-    )
 
-
-def _context_table_dtype() -> np.dtype[Any]:
-    str_dt = h5py.string_dtype("utf-8")
-    return np.dtype(
-        [
-            ("context_id", np.int64),
-            ("ts_wall_ns", np.int64),
-            ("ts_mono_ns", np.int64),
-            ("fields_json", str_dt),
-        ]
-    )
-
-
-def _sequencer_event_dtype() -> np.dtype[Any]:
-    str_dt = h5py.string_dtype("utf-8")
-    return np.dtype(
-        [
-            ("t_wall", np.float64),
-            ("t_mono", np.float64),
-            ("process_id", str_dt),
-            ("event", str_dt),
-            ("source", str_dt),
-            ("ok", np.bool_),
-            ("message", str_dt),
-            ("payload_json", str_dt),
-            ("yaml_snapshot_id", np.int64),
-        ]
-    )
-
-
-def _sequencer_yaml_dtype() -> np.dtype[Any]:
-    str_dt = h5py.string_dtype("utf-8")
-    return np.dtype(
-        [
-            ("snapshot_id", np.int64),
-            ("t_wall", np.float64),
-            ("t_mono", np.float64),
-            ("process_id", str_dt),
-            ("source", str_dt),
-            ("text", str_dt),
-        ]
-    )
-
-
-def _measurement_note_dtype() -> np.dtype[Any]:
-    str_dt = h5py.string_dtype("utf-8")
-    return np.dtype(
-        [
-            ("t_wall", np.float64),
-            ("t_mono", np.float64),
-            ("author", str_dt),
-            ("kind", str_dt),
-            ("message", str_dt),
-            ("payload_json", str_dt),
-        ]
-    )
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -564,6 +402,15 @@ class HdfWriter(ManagedProcessBase):
         self._next_write = 0.0
 
         self._error_counts: dict[str, int] = {}
+        # _bump_error fires on both the main thread (drain handlers, RPC
+        # handlers) and the bg flush thread. CPython dict mutation is
+        # NOT atomic across threads in the way `+=` on an attribute
+        # suggests â€” the get + assignment can interleave with another
+        # thread's bump on the same key, losing counts. Guard with a
+        # small lock; reads via the public _error_counts attribute (used
+        # by the bg-thread-failure tests) take a momentary snapshot to
+        # avoid mid-mutation reads of any single bucket.
+        self._error_counts_lock = threading.Lock()
 
         # Background-flush plumbing. The bg thread, once spawned in run(),
         # consumes _FlushBatch (fire-and-forget) and _BgRequest (synchronous)
@@ -580,10 +427,18 @@ class HdfWriter(ManagedProcessBase):
         self._bg_thread: threading.Thread | None = None
         self._bg_thread_dead = False
         self._dropped_flush_batches = 0
+        # Counter for *deferred* flush batches â€” non-force_flush calls that
+        # found the bg queue full and chose to leave rows/events in the
+        # in-memory deques rather than snapshot-and-drop. Exposed alongside
+        # `_dropped_flush_batches` in the status payload so operators can
+        # distinguish a backlog (deferred) from real data loss (dropped).
+        self._deferred_flush_batches = 0
         # Monotonic timestamp of the last `hdf.flush_batch_dropped` event
         # we published. Used to rate-limit the overflow notification so a
         # sustained backlog doesn't flood the process data PUB bus.
         self._last_flush_drop_event_mono: float = 0.0
+        # Same rate-limit semantics for `hdf.flush_batch_deferred`.
+        self._last_flush_defer_event_mono: float = 0.0
         self._bg_join_timeout_s = max(0.1, float(bg_join_timeout_s))
         self._active_h5_filename: str | None = None
         self._writing_active = False
@@ -593,6 +448,12 @@ class HdfWriter(ManagedProcessBase):
         # processing and for the full write cycle by the bg thread.
         # Subsequent commits will narrow the lock's scope by moving more
         # state to bg-thread-exclusive ownership.
+        #
+        # Invariant: every site that mutates `_h5`, any dataset/group on it,
+        # or any of the cached dataset handles MUST hold `_h5_lock`. The
+        # `_assert_h5_locked()` helper enforces this in debug mode at the
+        # top of every dataset-touching helper so future regressions surface
+        # immediately instead of producing intermittent HDF corruption.
         self._h5_lock = threading.RLock()
 
         self._rpc_registry = self._build_rpc_registry()
@@ -753,7 +614,8 @@ class HdfWriter(ManagedProcessBase):
         return sum(len(items) for items in self._stream_context_by_seq.values())
 
     def _bump_error(self, key: str) -> None:
-        self._error_counts[key] = self._error_counts.get(key, 0) + 1
+        with self._error_counts_lock:
+            self._error_counts[key] = self._error_counts.get(key, 0) + 1
 
     def _resolve_output_path(
         self, filename: str | None, *, use_default_filename: bool
@@ -1033,24 +895,30 @@ class HdfWriter(ManagedProcessBase):
         message: str,
         payload_json: str,
     ) -> tuple[int, float, float]:
-        if self._measurement_notes_ds is None:
-            raise RuntimeError("measurement notes dataset unavailable")
-        t_wall = float(time.time())
-        t_mono = float(time.monotonic())
-        row = np.zeros(1, dtype=self._measurement_notes_ds.dtype)
-        row[0]["t_wall"] = t_wall
-        row[0]["t_mono"] = t_mono
-        row[0]["author"] = str(author)
-        row[0]["kind"] = str(kind)
-        row[0]["message"] = str(message)
-        row[0]["payload_json"] = str(payload_json)
-        old = int(self._measurement_notes_ds.shape[0])
-        self._measurement_notes_ds.resize((old + 1,))
-        self._measurement_notes_ds[old] = row[0]
-        self._pending += 1
-        return old, t_wall, t_mono
+        # Invoked from the RPC handler thread (main loop _drain_rpc). Held
+        # under _h5_lock so the bg flush thread can't be mid-write on the
+        # same h5py.File â€” h5py is not safe to share across threads even
+        # for writes to distinct datasets.
+        with self._h5_lock:
+            if self._measurement_notes_ds is None:
+                raise RuntimeError("measurement notes dataset unavailable")
+            t_wall = float(time.time())
+            t_mono = float(time.monotonic())
+            row = np.zeros(1, dtype=self._measurement_notes_ds.dtype)
+            row[0]["t_wall"] = t_wall
+            row[0]["t_mono"] = t_mono
+            row[0]["author"] = str(author)
+            row[0]["kind"] = str(kind)
+            row[0]["message"] = str(message)
+            row[0]["payload_json"] = str(payload_json)
+            old = int(self._measurement_notes_ds.shape[0])
+            self._measurement_notes_ds.resize((old + 1,))
+            self._measurement_notes_ds[old] = row[0]
+            self._pending += 1
+            return old, t_wall, t_mono
 
     def _flush_active_file(self) -> None:
+        self._assert_h5_locked()
         if self._h5 is None:
             return
         self._h5.attrs["dropped_local_messages_total"] = int(self._dropped_local)
@@ -1100,7 +968,7 @@ class HdfWriter(ManagedProcessBase):
                         except queue.Full:
                             pass
         except Exception as exc:
-            # Anything that escapes the outer loop is fatal — set the
+            # Anything that escapes the outer loop is fatal â€” set the
             # watchdog flag and stop the process so the supervisor's
             # restart policy can take over.
             self._record_exception(exc, phase="bg_thread_fatal")
@@ -1122,7 +990,7 @@ class HdfWriter(ManagedProcessBase):
         )
 
     def _handle_flush_batch(self, batch: "_FlushBatch") -> None:
-        # The bg thread runs this under _h5_lock — same lock that
+        # The bg thread runs this under _h5_lock â€” same lock that
         # serialises h5 + stream-state access from the main-loop drain
         # handlers, RPC handlers, and file rotation. The batch carries
         # snapshots of the deque contents and per-stream buffers the
@@ -1167,6 +1035,31 @@ class HdfWriter(ManagedProcessBase):
                     self._publish_h5_state_cache()
         self._bg_thread = None
 
+    def _assert_h5_locked(self) -> None:
+        """Debug invariant: caller must hold `_h5_lock` when the bg thread is live.
+
+        Called from every helper that touches `_h5`, a cached dataset
+        handle, or stream-state mutated by the bg flush thread. The
+        assertion only fires when the bg flush thread is actually running
+        (production), because the lock's whole purpose is to mediate
+        main-thread vs bg-thread access. Tests that drive HdfWriter
+        directly without the bg thread are exercising single-threaded
+        code paths and don't need the lock.
+
+        Skipped in optimised (-O) runs.
+        """
+        if not __debug__:
+            return
+        bg = self._bg_thread
+        if bg is None or not bg.is_alive():
+            return
+        if not self._h5_lock._is_owned():
+            raise AssertionError(
+                "hdf_writer mutation site invoked without _h5_lock while "
+                "the bg flush thread is live; this is a thread-safety "
+                "regression â€” see the lock comment in HdfWriter.__init__"
+            )
+
     def _drain_pending_to_file(self) -> None:
         # Synchronous drain used by RPC paths that still execute on the
         # main thread (file rotation, stop_writing, close). Held under
@@ -1187,17 +1080,27 @@ class HdfWriter(ManagedProcessBase):
         to take `_h5_lock` (read path stays free of contention with the
         bg flush thread). CPython attribute writes/reads on a single
         reference are atomic.
+
+        We pair the two writes under `_h5_lock` so a concurrent reader
+        never sees the inconsistent intermediate state
+        (`filename=None, writing_active=True` or vice versa) that would
+        arise if the two `=` ran across a context-switch boundary. The
+        reader path stays lock-free as documented; the lock here is
+        only for writer-side atomicity, and since `_h5_lock` is an
+        RLock most callers already hold it (this re-acquire is a
+        no-op).
         """
-        h5 = self._h5
-        if h5 is None:
-            self._active_h5_filename = None
-            self._writing_active = False
-        else:
-            try:
-                self._active_h5_filename = str(h5.filename)
-            except Exception:
+        with self._h5_lock:
+            h5 = self._h5
+            if h5 is None:
                 self._active_h5_filename = None
-            self._writing_active = True
+                self._writing_active = False
+            else:
+                try:
+                    self._active_h5_filename = str(h5.filename)
+                except Exception:
+                    self._active_h5_filename = None
+                self._writing_active = True
 
     def _snapshot_main_loop_buffers(
         self,
@@ -1234,11 +1137,67 @@ class HdfWriter(ManagedProcessBase):
         """Snapshot main-loop drain state and hand it to the bg flush thread.
 
         Returns True if the batch was queued, False if it was dropped due
-        to overflow (the data is lost — `_dropped_flush_batches` is
+        to overflow (the data is lost â€” `_dropped_flush_batches` is
         incremented so it surfaces in heartbeat/status). When the batch
         is queued successfully, `_pending` and `_last_flush` bookkeeping
         is updated to mirror the old synchronous-write timing.
+
+        Defer-when-full: for non-force_flush calls, if the bg queue is
+        already saturated we *skip* the destructive snapshot of `_buf`
+        and `_event_buf` so the rows/events stay in the 200k-message
+        in-memory deques (where `drop_newest` already provides bounded
+        overflow handling). Stream buffers and pending stream metadata
+        are unbounded dicts though, so we snapshot-and-discard those to
+        keep memory bounded during a sustained backlog. Force-flush
+        callers retain the original "snapshot + drop on overflow"
+        contract â€” rotation/shutdown paths use `_drain_pending_to_file`
+        synchronously so they don't traverse this method.
         """
+        if not force_flush and self._bg_queue.full():
+            dropped_stream_rows = 0
+            try:
+                for sb in self._stream_buffers.values():
+                    if isinstance(sb, dict) and sb:
+                        # `_stream_buffers` maps stream-key ->
+                        # dict[column_name, list[value]]. Row count is
+                        # the max column length within a given stream.
+                        dropped_stream_rows += max(
+                            (len(col) for col in sb.values() if isinstance(col, list)),
+                            default=0,
+                        )
+            except Exception:
+                # Observability-only count; never let a structural
+                # surprise mask the defer or crash the main loop.
+                dropped_stream_rows = -1
+            if self._stream_buffers:
+                self._stream_buffers = {}
+            if self._pending_stream_metadata:
+                self._pending_stream_metadata = {}
+            self._deferred_flush_batches += 1
+            self._bump_error("bg.flush_batch.deferred")
+            now_mono = time.monotonic()
+            if now_mono - self._last_flush_defer_event_mono >= 1.0:
+                self._last_flush_defer_event_mono = now_mono
+                try:
+                    self._publish_process_event(
+                        topic="hdf.flush_batch_deferred",
+                        payload={
+                            "queue_depth": self._bg_queue.qsize(),
+                            "queue_max": self._bg_queue.maxsize,
+                            "deferred_total": self._deferred_flush_batches,
+                            "buffered_rows": len(self._buf) if self._buf else 0,
+                            "buffered_events": (
+                                len(self._event_buf) if self._event_buf else 0
+                            ),
+                            "dropped_stream_rows": dropped_stream_rows,
+                        },
+                    )
+                except Exception:
+                    # Never let event-publish failure mask the defer or
+                    # destabilise the main loop.
+                    pass
+            return False
+
         rows, event_rows, stream_buffers, pending_metadata = (
             self._snapshot_main_loop_buffers()
         )
@@ -1498,13 +1457,12 @@ class HdfWriter(ManagedProcessBase):
         load_manager_state: bool,
         measurement_meta: Json,
     ) -> None:
-        # Thread-safety invariant: it is safe to mutate `self._h5` outside
-        # `_h5_lock` here because this RPC handler and the data-ingestion
-        # producer share the hdf_writer's main thread; while we run, no
-        # new batches enqueue for the bg flush thread. If RPC handling
-        # ever moves off the main thread, wrap this `self._h5 = ...`
-        # reassignment in `_h5_lock` to prevent a race with the bg flush
-        # thread (which takes `_h5_lock` for writes).
+        # Reassigns `self._h5` and creates/loads datasets. Callers are
+        # _rotate_file, _start_writing_file, and the autostart branch of
+        # run(); all three now hold `_h5_lock` (run()'s case is harmless
+        # since the bg thread isn't running yet, but the lock keeps the
+        # contract uniform). The debug assertion catches future regressions.
+        self._assert_h5_locked()
         self._h5 = h5
         self._publish_h5_state_cache()
         self._reset_per_file_state()
@@ -1609,14 +1567,12 @@ class HdfWriter(ManagedProcessBase):
         measurement_profile: str | None = None,
         measurement_values: object = None,
     ) -> tuple[str | None, str]:
-        # Thread-safety invariant: this RPC handler reassigns `self._h5`
-        # (via `_configure_active_file` below) without holding `_h5_lock`.
-        # That is safe today because the RPC handler and the data-ingestion
-        # producer share the hdf_writer's main thread; while we run, no
-        # new batches enqueue for the bg flush thread (which DOES take
-        # `_h5_lock` for writes). If RPC handling moves off the main thread
-        # in the future, wrap the `self._h5 = ...` reassignments in
-        # `_h5_lock` to prevent a race with the bg flush thread.
+        # Reassigning `self._h5` and configuring the new file is guarded by
+        # `_h5_lock` so the bg flush thread can't observe a half-built file
+        # mid-write, and so concurrent attrs/dataset writes on the old
+        # handle can't race the close. Held across the full setup +
+        # old-handle teardown so the swap is atomic from observers'
+        # perspective.
         if self._h5 is None:
             new_file = self._start_writing_file(
                 filename=filename,
@@ -1626,59 +1582,69 @@ class HdfWriter(ManagedProcessBase):
             )
             return None, new_file
 
-        old_file = str(self._h5.filename)
-        old_disabled = set(self._disabled_devices)
+        with self._h5_lock:
+            old_file = str(self._h5.filename)
+            old_disabled = set(self._disabled_devices)
 
-        new_disabled = (
-            set(disabled_devices)
-            if disabled_devices is not None
-            else set(self._disabled_devices)
-        )
-        self._out_dir.mkdir(parents=True, exist_ok=True)
-        path = self._resolve_output_path(filename, use_default_filename=True)
-        self._ensure_output_path_unused(path)
-        measurement_meta = self._build_measurement_metadata(
-            profile_id=measurement_profile,
-            values=measurement_values,
-            require_profile=self._measurement_schema is not None,
-        )
-        self._drain_pending_to_file()
-        old_state = self._snapshot_file_state()
-        self._disabled_devices = new_disabled
-        self._clear_buffered_for_disabled(new_disabled)
-        new_h5 = h5py.File(path, "w")
-        try:
-            self._configure_active_file(
-                new_h5,
-                write_every_s=max(0.1, float(self._write_every_s)),
-                load_manager_state=bool(self._process_id),
-                measurement_meta=measurement_meta,
+            new_disabled = (
+                set(disabled_devices)
+                if disabled_devices is not None
+                else set(self._disabled_devices)
             )
-            self._clear_buffered_for_disabled(self._disabled_devices)
-        except Exception:
+            self._out_dir.mkdir(parents=True, exist_ok=True)
+            path = self._resolve_output_path(filename, use_default_filename=True)
+            self._ensure_output_path_unused(path)
+            measurement_meta = self._build_measurement_metadata(
+                profile_id=measurement_profile,
+                values=measurement_values,
+                require_profile=self._measurement_schema is not None,
+            )
+            self._drain_pending_to_file()
+            old_state = self._snapshot_file_state()
+            self._disabled_devices = new_disabled
+            self._clear_buffered_for_disabled(new_disabled)
+            new_h5 = h5py.File(path, "w")
+            new_path_str = str(new_h5.filename)
             try:
-                new_h5.close()
+                self._configure_active_file(
+                    new_h5,
+                    write_every_s=max(0.1, float(self._write_every_s)),
+                    load_manager_state=bool(self._process_id),
+                    measurement_meta=measurement_meta,
+                )
+                self._clear_buffered_for_disabled(self._disabled_devices)
             except Exception:
-                self._bump_error("rotate.close_new")
-            self._restore_file_state(old_state)
-            self._disabled_devices = old_disabled
-            raise
+                # _configure_active_file failed after we created the new
+                # h5py.File: close the handle AND delete the truncated
+                # file from disk so a same-name rotate next round isn't
+                # blocked by `_ensure_output_path_unused`.
+                try:
+                    new_h5.close()
+                except Exception:
+                    self._bump_error("rotate.close_new")
+                try:
+                    Path(new_path_str).unlink(missing_ok=True)
+                except Exception:
+                    self._bump_error("rotate.unlink_new")
+                self._restore_file_state(old_state)
+                self._disabled_devices = old_disabled
+                raise
 
-        old_h5 = old_state.get("h5")
-        if old_h5 is not None and old_h5 is not new_h5:
-            old_measurement_group = old_state.get("measurement_group")
-            if isinstance(old_measurement_group, h5py.Group):
-                _ = self._mark_measurement_group_ended(old_measurement_group)
-            try:
-                old_h5.flush()
-            except Exception:
-                self._bump_error("rotate.old_flush")
-            try:
-                old_h5.close()
-            except Exception:
-                self._bump_error("rotate.old_close")
+            old_h5 = old_state.get("h5")
+            if old_h5 is not None and old_h5 is not new_h5:
+                old_measurement_group = old_state.get("measurement_group")
+                if isinstance(old_measurement_group, h5py.Group):
+                    _ = self._mark_measurement_group_ended(old_measurement_group)
+                try:
+                    old_h5.flush()
+                except Exception:
+                    self._bump_error("rotate.old_flush")
+                try:
+                    old_h5.close()
+                except Exception:
+                    self._bump_error("rotate.old_close")
 
-        return old_file, str(new_h5.filename)
+            return old_file, new_path_str
 
     def _start_writing_file(
         self,
@@ -1688,102 +1654,109 @@ class HdfWriter(ManagedProcessBase):
         measurement_profile: str | None = None,
         measurement_values: object = None,
     ) -> str:
-        if self._h5 is not None:
-            raise RuntimeError("HDF writer is already writing")
+        # _configure_active_file assigns `self._h5` and creates datasets;
+        # held under `_h5_lock` so the bg flush thread can't observe a
+        # half-built file. The lock is held across new-file creation +
+        # configuration so the swap is atomic.
+        with self._h5_lock:
+            if self._h5 is not None:
+                raise RuntimeError("HDF writer is already writing")
 
-        self._out_dir.mkdir(parents=True, exist_ok=True)
-        path = self._resolve_output_path(filename, use_default_filename=False)
-        self._ensure_output_path_unused(path)
+            self._out_dir.mkdir(parents=True, exist_ok=True)
+            path = self._resolve_output_path(filename, use_default_filename=False)
+            self._ensure_output_path_unused(path)
 
-        new_disabled = (
-            set(disabled_devices)
-            if disabled_devices is not None
-            else set(self._disabled_devices)
-        )
-        self._disabled_devices = new_disabled
-        self._clear_buffered_for_disabled(new_disabled)
-
-        measurement_meta = self._build_measurement_metadata(
-            profile_id=measurement_profile,
-            values=measurement_values,
-            require_profile=self._measurement_schema is not None,
-        )
-        h5 = h5py.File(path, "w")
-        try:
-            self._configure_active_file(
-                h5,
-                write_every_s=max(0.1, float(self._write_every_s)),
-                load_manager_state=bool(self._process_id),
-                measurement_meta=measurement_meta,
+            new_disabled = (
+                set(disabled_devices)
+                if disabled_devices is not None
+                else set(self._disabled_devices)
             )
-            self._clear_buffered_for_disabled(self._disabled_devices)
-        except Exception:
-            try:
-                h5.close()
-            except Exception:
-                self._bump_error("start_writing.close_new")
-            raise
+            self._disabled_devices = new_disabled
+            self._clear_buffered_for_disabled(new_disabled)
 
-        return str(h5.filename)
+            measurement_meta = self._build_measurement_metadata(
+                profile_id=measurement_profile,
+                values=measurement_values,
+                require_profile=self._measurement_schema is not None,
+            )
+            h5 = h5py.File(path, "w")
+            file_path_str = str(h5.filename)
+            try:
+                self._configure_active_file(
+                    h5,
+                    write_every_s=max(0.1, float(self._write_every_s)),
+                    load_manager_state=bool(self._process_id),
+                    measurement_meta=measurement_meta,
+                )
+                self._clear_buffered_for_disabled(self._disabled_devices)
+            except Exception:
+                try:
+                    h5.close()
+                except Exception:
+                    self._bump_error("start_writing.close_new")
+                # Delete the just-created file from disk so a same-name
+                # start next round isn't blocked by ensure_output_path_unused.
+                try:
+                    Path(file_path_str).unlink(missing_ok=True)
+                except Exception:
+                    self._bump_error("start_writing.unlink_new")
+                raise
+
+            return file_path_str
 
     def _stop_writing_file(self) -> str | None:
-        # Thread-safety invariant: the `self._h5 = None` reassignment below
-        # is performed without holding `_h5_lock`. That is safe today
-        # because this RPC handler and the data-ingestion producer share
-        # the hdf_writer's main thread; while we run, no new batches
-        # enqueue for the bg flush thread (which DOES take `_h5_lock` for
-        # writes). If RPC handling moves off the main thread, wrap the
-        # `self._h5 = None` reassignment in `_h5_lock` to prevent a race
-        # with the bg flush thread.
-        h5 = self._h5
-        if h5 is None:
-            return None
-        file_path = str(h5.filename)
-        errors: list[str] = []
-        try:
-            self._drain_pending_to_file()
-        except Exception as e:
-            self._bump_error("stop_writing.drain")
-            errors.append(f"drain_pending failed: {e}")
-        try:
-            self._mark_active_measurement_ended()
-        except Exception as e:
-            self._bump_error("stop_writing.measurement_end")
-            errors.append(f"mark_measurement_ended failed: {e}")
-        try:
-            h5.flush()
-        except Exception as e:
-            self._bump_error("stop_writing.flush")
-            errors.append(f"flush failed: {e}")
-        try:
-            h5.close()
-        except Exception as e:
-            self._bump_error("stop_writing.close")
-            errors.append(f"close failed: {e}")
-        self._h5 = None
-        self._publish_h5_state_cache()
-        self._reset_per_file_state()
-        self._pending = 0
-        now = time.monotonic()
-        self._last_flush = now
-        self._next_write = now + max(0.1, float(self._write_every_s))
-        if errors:
-            raise RuntimeError("; ".join(errors))
-        return file_path
+        # The `self._h5 = None` reassignment and the surrounding flush +
+        # close are guarded by `_h5_lock` so the bg flush thread can't
+        # interleave a write between flush and close, and so observers
+        # (status RPC, etc.) see a coherent file-active state.
+        with self._h5_lock:
+            h5 = self._h5
+            if h5 is None:
+                return None
+            file_path = str(h5.filename)
+            errors: list[str] = []
+            try:
+                self._drain_pending_to_file()
+            except Exception as e:
+                self._bump_error("stop_writing.drain")
+                errors.append(f"drain_pending failed: {e}")
+            try:
+                self._mark_active_measurement_ended()
+            except Exception as e:
+                self._bump_error("stop_writing.measurement_end")
+                errors.append(f"mark_measurement_ended failed: {e}")
+            try:
+                h5.flush()
+            except Exception as e:
+                self._bump_error("stop_writing.flush")
+                errors.append(f"flush failed: {e}")
+            try:
+                h5.close()
+            except Exception as e:
+                self._bump_error("stop_writing.close")
+                errors.append(f"close failed: {e}")
+            self._h5 = None
+            self._publish_h5_state_cache()
+            self._reset_per_file_state()
+            self._pending = 0
+            now = time.monotonic()
+            self._last_flush = now
+            self._next_write = now + max(0.1, float(self._write_every_s))
+            if errors:
+                raise RuntimeError("; ".join(errors))
+            return file_path
 
     def close(self) -> None:
         self._stop_evt.set()
 
-        # Shut down the bg flush thread before tearing down sockets so a
-        # final flush attempt (if commit 2 is in place) has a chance to
-        # land. The shutdown helper is a no-op if the thread was never
-        # started.
+        # Shut down the bg flush thread BEFORE tearing down sockets or h5
+        # so a final flush attempt has a chance to land. The shutdown
+        # helper is a no-op if the thread was never started.
         self._shutdown_bg_thread()
 
-        t = self._heartbeat_thread
-        if t is not None and t.is_alive():
-            t.join(timeout=2.0)
-
+        # HdfWriter-specific resources that the base class doesn't know
+        # about. The SUB socket and any stream-data readers must be torn
+        # down before super().close() terminates the zmq context.
         for reader in list(self._stream_readers.values()):
             try:
                 reader.close()
@@ -1791,49 +1764,48 @@ class HdfWriter(ManagedProcessBase):
                 self._bump_error("close.reader")
         self._stream_readers.clear()
 
-        for sock in (self._sub, self._heartbeat_pub):
-            if sock is None:
-                continue
+        if self._sub is not None:
             try:
-                sock.setsockopt(zmq.LINGER, 0)
+                self._sub.setsockopt(zmq.LINGER, 0)
             except Exception:
                 self._bump_error("close.socket_setopt")
             try:
-                sock.close(0)
+                self._sub.close(0)
             except Exception:
                 self._bump_error("close.socket")
-        if self._rpc_router is not None:
-            try:
-                self._rpc_router.setsockopt(zmq.LINGER, 0)
-            except Exception:
-                self._bump_error("close.rpc_setopt")
-            try:
-                self._rpc_router.close(0)
-            except Exception:
-                self._bump_error("close.rpc")
+            self._sub = None
 
-        self._sub = None
-        self._heartbeat_pub = None
-        self._rpc_router = None
+        # Delegate manager client + heartbeat thread/pub + rpc router
+        # teardown to the base class. Previously this method open-coded
+        # all of that EXCEPT _manager.close(), leaking the ManagerClient's
+        # DEALER + SUB sockets on every shutdown.
+        try:
+            super().close()
+        except Exception:
+            self._bump_error("close.super")
 
         try:
             self._ctx.term()
         except Exception:
             self._bump_error("close.ctx")
 
-        h5 = self._h5
-        self._h5 = None
-        self._publish_h5_state_cache()
-        if h5 is not None:
-            self._mark_active_measurement_ended()
-            try:
-                h5.flush()
-            except Exception:
-                self._bump_error("close.h5_flush")
-            try:
-                h5.close()
-            except Exception:
-                self._bump_error("close.h5_close")
+        # File teardown happens last and under _h5_lock so a late bg
+        # thread (e.g. one that survived _shutdown_bg_thread's timeout)
+        # can't race the h5.close().
+        with self._h5_lock:
+            h5 = self._h5
+            self._h5 = None
+            self._publish_h5_state_cache()
+            if h5 is not None:
+                self._mark_active_measurement_ended()
+                try:
+                    h5.flush()
+                except Exception:
+                    self._bump_error("close.h5_flush")
+                try:
+                    h5.close()
+                except Exception:
+                    self._bump_error("close.h5_close")
 
     def run(self) -> None:
         self._out_dir.mkdir(parents=True, exist_ok=True)
@@ -1849,19 +1821,24 @@ class HdfWriter(ManagedProcessBase):
                 try:
                     path = self._resolve_output_path(None, use_default_filename=False)
                     self._ensure_output_path_unused(path)
-                    h5 = h5py.File(path, "w")
-                    measurement_meta = self._build_measurement_metadata(
-                        profile_id=None,
-                        values=None,
-                        require_profile=False,
-                    )
-                    self._configure_active_file(
-                        h5,
-                        write_every_s=write_every_s,
-                        load_manager_state=bool(self._process_id),
-                        measurement_meta=measurement_meta,
-                    )
-                    self._clear_buffered_for_disabled(self._disabled_devices)
+                    # Bg thread isn't started yet so the race isn't live,
+                    # but take the lock anyway so `_configure_active_file`'s
+                    # debug invariant is satisfied and the contract is
+                    # uniform across call sites.
+                    with self._h5_lock:
+                        h5 = h5py.File(path, "w")
+                        measurement_meta = self._build_measurement_metadata(
+                            profile_id=None,
+                            values=None,
+                            require_profile=False,
+                        )
+                        self._configure_active_file(
+                            h5,
+                            write_every_s=write_every_s,
+                            load_manager_state=bool(self._process_id),
+                            measurement_meta=measurement_meta,
+                        )
+                        self._clear_buffered_for_disabled(self._disabled_devices)
                 except FileExistsError:
                     self._bump_error("autostart.file_exists")
                     self._h5 = None
@@ -1928,7 +1905,7 @@ class HdfWriter(ManagedProcessBase):
                 )
 
                 while not self._stop_evt.is_set():
-                    # Bail out cleanly if the bg flush thread died — the
+                    # Bail out cleanly if the bg flush thread died â€” the
                     # supervisor's restart policy will bring us back up.
                     if self._bg_thread_dead:
                         self._stop_evt.set()
@@ -2016,6 +1993,7 @@ class HdfWriter(ManagedProcessBase):
         payload_json: str,
         yaml_snapshot_id: int = -1,
     ) -> None:
+        self._assert_h5_locked()
         if self._sequencer_events_ds is None:
             return
         row = np.zeros(1, dtype=self._sequencer_events_ds.dtype)
@@ -2034,6 +2012,7 @@ class HdfWriter(ManagedProcessBase):
         self._pending += 1
 
     def _capture_sequencer_yaml_snapshot(self) -> tuple[int, str | None]:
+        self._assert_h5_locked()
         if self._sequencer_yaml_ds is None:
             return -1, "sequencer yaml dataset unavailable"
         try:
@@ -2167,6 +2146,7 @@ class HdfWriter(ManagedProcessBase):
         batch: np.ndarray[Any, Any],
         count: int,
     ) -> None:
+        self._assert_h5_locked()
         n = int(count)
         if n <= 0:
             return
@@ -2228,6 +2208,7 @@ class HdfWriter(ManagedProcessBase):
         self._write_event_rows_batch(rows)
 
     def _write_event_rows_batch(self, rows: list[tuple[str, Json]]) -> None:
+        self._assert_h5_locked()
         if self._h5 is None or self._events_ds is None:
             return
 
@@ -2311,10 +2292,6 @@ class HdfWriter(ManagedProcessBase):
             },
         )
 
-    @staticmethod
-    def _rpc_request_id(req: Json) -> Any:
-        return req.get("request_id")
-
     def _build_topic_handlers(self) -> dict[str, Callable[[Json], None]]:
         return build_hdf_topic_handlers(self)
 
@@ -2326,12 +2303,13 @@ class HdfWriter(ManagedProcessBase):
         self._topic_handlers = handlers
         return handlers
 
-    def _rpc_ok(self, req: Json, *, result: Any) -> Json:
-        return {
-            "request_id": self._rpc_request_id(req),
-            "ok": True,
-            "result": result,
-        }
+    # ``rpc_ok`` is inherited verbatim from ``ManagedProcessBase``;
+    # the prior explicit override duplicated the base body, narrowed
+    # ``_rpc_request_id`` to dict-only (an LSP violation against the
+    # base's polymorphic ``dict | Any`` accept), and was patched by no
+    # test. Inheriting keeps the wire envelope under a single source
+    # of truth so any future change to ``rpc_ok`` applies to
+    # HdfWriter automatically.
 
     def _rpc_error(self, req: Json, *, code: str, message: str | None = None) -> Json:
         err: Json = {"code": str(code)}
@@ -2525,6 +2503,7 @@ class HdfWriter(ManagedProcessBase):
                 "queue_capacity": self._bg_queue.maxsize,
             },
             "dropped_flush_batches": int(self._dropped_flush_batches),
+            "deferred_flush_batches": int(self._deferred_flush_batches),
             "event_log_mode": str(self._event_log_mode),
             "measurement_id": self._measurement_id,
             "measurement_type": self._measurement_type,
@@ -2547,7 +2526,7 @@ class HdfWriter(ManagedProcessBase):
             else 0,
         }
         result.update(self._hdf_device_filter_state())
-        return self._rpc_ok(req, result=result)
+        return self.rpc_ok(req, result=result)
 
     def _rpc_hdf_measurement_schema_get(self, req: Json) -> Json:
         configured, available, error = self._measurement_schema_state()
@@ -2563,7 +2542,7 @@ class HdfWriter(ManagedProcessBase):
                 code="measurement_schema_unavailable",
                 message=error or "measurement schema unavailable",
             )
-        return self._rpc_ok(
+        return self.rpc_ok(
             req,
             result={
                 "schema": measurement_schema_to_json(self._measurement_schema),
@@ -2612,7 +2591,7 @@ class HdfWriter(ManagedProcessBase):
             )
         except Exception as e:
             return self._rpc_error(req, code="note_write_failed", message=str(e))
-        return self._rpc_ok(
+        return self.rpc_ok(
             req,
             result={
                 "index": int(index),
@@ -2624,7 +2603,7 @@ class HdfWriter(ManagedProcessBase):
         )
 
     def _rpc_hdf_devices_get(self, req: Json) -> Json:
-        return self._rpc_ok(req, result=self._hdf_device_filter_state())
+        return self.rpc_ok(req, result=self._hdf_device_filter_state())
 
     def _rpc_hdf_devices_disable(self, req: Json) -> Json:
         return self._rpc_hdf_devices_toggle(req, disable=True)
@@ -2675,14 +2654,19 @@ class HdfWriter(ManagedProcessBase):
                     self._bump_error("schema.rpc")
 
         if self._h5 is not None:
-            try:
-                self._h5.attrs["disabled_devices_json"] = json.dumps(
-                    sorted(self._disabled_devices)
-                )
-            except Exception:
-                self._bump_error("h5.attrs.disabled_devices")
+            # RPC handler runs on the main thread; the bg flush thread
+            # holds _h5_lock while writing. Take the lock so attrs[]
+            # assignment can't interleave with a concurrent flush.
+            with self._h5_lock:
+                if self._h5 is not None:
+                    try:
+                        self._h5.attrs["disabled_devices_json"] = json.dumps(
+                            sorted(self._disabled_devices)
+                        )
+                    except Exception:
+                        self._bump_error("h5.attrs.disabled_devices")
 
-        return self._rpc_ok(
+        return self.rpc_ok(
             req,
             result={
                 "changed": changed,
@@ -2756,7 +2740,7 @@ class HdfWriter(ManagedProcessBase):
         except Exception as e:
             return self._rpc_error(req, code="rotate_failed", message=str(e))
 
-        return self._rpc_ok(
+        return self.rpc_ok(
             req,
             result={
                 "old_file": old_file,
@@ -2775,7 +2759,7 @@ class HdfWriter(ManagedProcessBase):
         if not isinstance(params, dict):
             return self._rpc_error(req, code="invalid_params", message="params must be a dict")
         if self._h5 is None:
-            return self._rpc_ok(
+            return self.rpc_ok(
                 req,
                 result={
                     "already_stopped": True,
@@ -2787,7 +2771,7 @@ class HdfWriter(ManagedProcessBase):
             old_file = self._stop_writing_file()
         except Exception as e:
             return self._rpc_error(req, code="stop_failed", message=str(e))
-        return self._rpc_ok(
+        return self.rpc_ok(
             req,
             result={
                 "already_stopped": False,
@@ -2865,7 +2849,7 @@ class HdfWriter(ManagedProcessBase):
         except Exception as e:
             return self._rpc_error(req, code="start_failed", message=str(e))
 
-        return self._rpc_ok(
+        return self.rpc_ok(
             req,
             result={
                 "new_file": new_file,
@@ -2890,7 +2874,7 @@ class HdfWriter(ManagedProcessBase):
             return self._rpc_error(req, code="invalid_request", message="Malformed request")
         dispatch_req = rpc.as_dispatch_payload(request_id_field="request_id")
         if rpc.action == "process.capabilities":
-            return self._rpc_ok(
+            return self.rpc_ok(
                 dispatch_req,
                 result=capabilities_payload(self._hdf_capability_members()),
             )
@@ -2915,6 +2899,7 @@ class HdfWriter(ManagedProcessBase):
         self._write_buffered_rows_batch(rows)
 
     def _write_buffered_rows_batch(self, rows: list[Json]) -> None:
+        self._assert_h5_locked()
         if self._h5 is None or self._telemetry_group is None:
             return
         used_by_device: dict[str, int] = {}
@@ -3454,6 +3439,7 @@ class HdfWriter(ManagedProcessBase):
     def _init_context_columns_from_spec(
         self, spec: dict[str, str], *, source: str
     ) -> None:
+        self._assert_h5_locked()
         if self._context_table_group is None or self._context_table_ds is None:
             return
         if self._context_columns_ready:
@@ -3499,6 +3485,7 @@ class HdfWriter(ManagedProcessBase):
             self._context_columns_missing[name] = missing
 
     def _append_context_columns(self, index: int, fields: dict[str, Any]) -> None:
+        self._assert_h5_locked()
         if not self._context_columns_datasets:
             return
         for name, ds in self._context_columns_datasets.items():
@@ -3515,6 +3502,7 @@ class HdfWriter(ManagedProcessBase):
         )
 
     def _record_context(self, context_id: int, fields: dict[str, Any]) -> None:
+        self._assert_h5_locked()
         if self._context_table_ds is None:
             return
         if context_id in self._seen_context_ids:
@@ -3548,6 +3536,7 @@ class HdfWriter(ManagedProcessBase):
         self,
         stream_buffers: dict[tuple[str, str], dict[str, list[Any]]],
     ) -> None:
+        self._assert_h5_locked()
         if self._h5 is None or self._streams_group is None:
             for _key, buf in stream_buffers.items():
                 self._clear_stream_buffer(buf)
@@ -3772,6 +3761,7 @@ class HdfWriter(ManagedProcessBase):
         return datasets
 
     def _handle_device_config(self, msg: Json, *, cache: bool = True) -> None:
+        self._assert_h5_locked()
         device_id = self._normalize_device_id(msg.get("device_id"))
         if device_id is None:
             return
@@ -3892,6 +3882,7 @@ class HdfWriter(ManagedProcessBase):
                 self._pending_stream_metadata[base_key] = dict(attrs)
 
     def _handle_run_metadata(self, msg: Json) -> None:
+        self._assert_h5_locked()
         if self._run_meta_group is None:
             return
         device_id = self._normalize_device_id(msg.get("device_id"))

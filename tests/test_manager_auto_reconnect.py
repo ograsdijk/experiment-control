@@ -19,7 +19,7 @@ from experiment_control.manager import (
     Manager,
     device_spec_from_yaml,
 )
-from experiment_control.manager_process_supervision import _maybe_auto_reconnect_device
+from experiment_control._manager.process_supervision import _maybe_auto_reconnect_device
 from experiment_control.types import Timestamp
 
 

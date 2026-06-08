@@ -476,7 +476,7 @@ class LaserLockFreqNltlPowerFollower(ManagedProcessBase):
 
         params = req.get("params", {}) or {}
         if not isinstance(params, dict):
-            return self._rpc_invalid_params(req, message="params must be an object")
+            return self.rpc_invalid_params(req, message="params must be an object")
 
         rtype = str(req.get("type", ""))
         if rtype == "process.capabilities":
@@ -502,24 +502,24 @@ class LaserLockFreqNltlPowerFollower(ManagedProcessBase):
                 )
             ]
             members = self._with_common_capabilities(members)
-            return self._rpc_ok(req, result=capabilities_payload(members))
+            return self.rpc_ok(req, result=capabilities_payload(members))
 
         if rtype == "follower.rules":
             result = {
                 "rules": [self._rule_status_payload(rule) for rule in self._rules]
             }
-            return self._rpc_ok(req, result=result)
+            return self.rpc_ok(req, result=result)
 
         if rtype in {"follower.enable_rule", "follower.disable_rule"}:
             rule_id = str(params.get("rule_id", "")).strip()
             if not rule_id:
-                return self._rpc_invalid_params(
+                return self.rpc_invalid_params(
                     req, message="rule_id is required"
                 )
             if not any(rule.rule_id == rule_id for rule in self._rules):
-                return self._rpc_err(req, code="unknown_rule")
+                return self.rpc_err(req, code="unknown_rule")
             if self._manager is None:
-                return self._rpc_err(
+                return self.rpc_err(
                     req, code="manager_unavailable", message="Manager not initialized"
                 )
             enabled = rtype == "follower.enable_rule"
@@ -529,24 +529,24 @@ class LaserLockFreqNltlPowerFollower(ManagedProcessBase):
                 self._register_routes(self._manager)
             except Exception as e:
                 self._rule_enabled[rule_id] = prev
-                return self._rpc_err(
+                return self.rpc_err(
                     req, code="route_update_failed", message=str(e)
                 )
-            return self._rpc_ok(
+            return self.rpc_ok(
                 req, result={"rule_id": rule_id, "enabled": enabled}
             )
 
         if rtype != "command_interceptor.check":
-            return self._rpc_unknown(req)
+            return self.rpc_unknown(req)
 
         command = req.get("command")
         if not isinstance(command, dict):
-            return self._rpc_err(req, code="invalid_command")
+            return self.rpc_err(req, code="invalid_command")
         device_id = str(command.get("device_id", ""))
         action = str(command.get("action", ""))
         params = command.get("params", {})
         if not device_id or not action or not isinstance(params, dict):
-            return self._rpc_err(req, code="invalid_command")
+            return self.rpc_err(req, code="invalid_command")
 
         rules = self._find_rule(device_id, action, enabled_only=True)
         if not rules:

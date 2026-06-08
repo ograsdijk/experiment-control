@@ -139,6 +139,7 @@ Poll until condition becomes true.
     reduce:
       method: mean
       window_s: 1.0
+      max_samples: 10000
     condition:
       abs_lt: [${sample_reduced - hv_v}, 1.0]
     stable_for_s: 0.8
@@ -148,7 +149,7 @@ Fields:
 - `timeout_s`: fail after this many seconds (0 means no timeout)
 - `every_s`: polling interval
 - `sample`: telemetry or call (see below)
-- `reduce`: optional windowed reduction of samples
+- `reduce`: optional reduction of retained samples. `method` supports `mean`, `min`, `max`, or last-sample fallback; `window_s` trims by age; `max_samples` caps retained samples and defaults to `10000`.
 - `condition`: required structured condition (see below)
 - `stable_for_s`: require condition to hold for this duration
 

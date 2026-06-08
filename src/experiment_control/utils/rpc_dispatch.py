@@ -74,5 +74,12 @@ class RpcDispatchRegistry:
         no handler matches (the caller decides what unknown_request response
         to return).
         """
-        return self.dispatch(self.canonicalize_request(req))
+        canonical_req = self.canonicalize_request(req)
+        # `canonical_req["type"]` is already canonical, so look the
+        # handler up directly instead of routing back through
+        # `dispatch` → `handler_for` → `canonical_action` (no-op).
+        handler = self._handlers.get(normalize_rpc_action(canonical_req.get("type")))
+        if handler is None:
+            return None
+        return handler(canonical_req)
 

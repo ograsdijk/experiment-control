@@ -5,9 +5,11 @@ import json
 import queue
 import threading
 import time
+import uuid
+from collections import OrderedDict
 from dataclasses import dataclass
 from fnmatch import fnmatchcase
-from typing import Any, Callable
+from typing import Any, Callable, Mapping, Protocol
 
 import zmq
 
@@ -20,7 +22,26 @@ from ..utils.zmq_helpers import json_dumps, poll_and_drain, safe_json_loads
 
 Json = dict[str, Any]
 
+
+class _WorkerLike(Protocol):
+    def submit(self, task: object) -> bool: ...
+
+    def queue_depth(self) -> int | None: ...
+
+    def queue_max(self) -> int: ...
+
+    def is_alive(self) -> bool: ...
+
+
 _ALLOWED_PROCESS_STATES = {"STARTING", "RUNNING", "STOPPING"}
+
+# Soft cap on the number of cached interceptor DEALER sockets per
+# _DeviceWorker. Each entry is one open ZMQ socket; without a cap, a
+# router that sees many distinct interceptor process_ids over its
+# lifetime (e.g. restarts that change the endpoint each time) leaks
+# sockets indefinitely. 64 is well above the realistic per-router
+# interceptor count and small enough that eviction stays bounded.
+_PROCESS_SOCKS_MAX = 64
 
 
 def _safe_json(value: Any, *, max_len: int = 4000) -> str:
@@ -31,6 +52,26 @@ def _safe_json(value: Any, *, max_len: int = 4000) -> str:
     if len(text) > max_len:
         return text[:max_len] + "...(truncated)"
     return text
+
+
+def _drain_stale_replies(sock: zmq.Socket) -> None:
+    """Drop any buffered replies left behind by previous timed-out calls.
+
+    DEALER sockets don't auto-correlate. If a prior interceptor call
+    raised zmq.Again before recv but the handler's reply arrived later,
+    the reply sits in the socket's recv buffer; the next send/recv pair
+    would pick it up and mis-attribute it to the new request. Drain
+    before sending so the recv loop sees only fresh replies.
+    """
+    while True:
+        try:
+            if not sock.poll(0, zmq.POLLIN):
+                break
+            _ = sock.recv(zmq.NOBLOCK)
+        except zmq.Again:
+            break
+        except Exception:
+            break
 
 
 def _is_zmq_timeout_error(exc: BaseException) -> bool:
@@ -165,9 +206,16 @@ class _ReplyItem:
 def _inject_request_id(resp: Json, request_id: Any) -> Json:
     # Echo the caller's request_id back onto the reply so a pipelined
     # client (gateway's RouterRpcClient) can correlate response to
-    # request. Only injects when the response doesn't already carry
-    # an id, so routes that supply their own keep control.
-    if not isinstance(resp, dict) or request_id is None or "request_id" in resp:
+    # request. Only injects when the response doesn't already carry a
+    # non-None id, so routes that supply their own keep control while
+    # an explicit ``{"request_id": None, ...}`` from a handler still
+    # gets overwritten (otherwise the gateway would silently drop the
+    # reply via `pending.pop(None, None)`).
+    if (
+        not isinstance(resp, dict)
+        or request_id is None
+        or resp.get("request_id") is not None
+    ):
         return resp
     out = dict(resp)
     out["request_id"] = request_id
@@ -501,7 +549,17 @@ class _DeviceWorker(_BaseWorker):
         self._manager: ManagerClient | None = None
         self._device_sock: zmq.Socket | None = None
         self._device_endpoint: str | None = None
-        self._process_socks: dict[str, tuple[str, zmq.Socket]] = {}
+        # OrderedDict so we can LRU-evict the oldest cached socket when
+        # the table fills up (see _PROCESS_SOCKS_MAX). Each entry maps
+        # process_id -> (endpoint, DEALER socket).
+        self._process_socks: OrderedDict[
+            str, tuple[str, zmq.Socket]
+        ] = OrderedDict()
+        # Per-interceptor-socket flag: set when an _call_interceptor
+        # times out so the NEXT call for that process drains stale
+        # replies pre-send. Healthy calls pay zero extra syscalls.
+        # Pruned alongside _process_socks via _evict_process_sock.
+        self._maybe_stale_interceptor_socks: dict[str, bool] = {}
         self._seq = 0
 
     def _close_device_sock(self) -> None:
@@ -529,17 +587,40 @@ class _DeviceWorker(_BaseWorker):
 
     def _get_process_sock(self, process_id: str, endpoint: str) -> zmq.Socket:
         entry = self._process_socks.get(process_id)
-        if entry is None or entry[0] != endpoint:
-            if entry is not None:
-                try:
-                    entry[1].close(0)
-                except Exception:
-                    pass
-            sock = self._ctx.socket(zmq.DEALER)
-            sock.setsockopt(zmq.LINGER, 0)
-            sock.connect(endpoint)
-            self._process_socks[process_id] = (endpoint, sock)
-        return self._process_socks[process_id][1]
+        if entry is not None and entry[0] == endpoint:
+            # Cache hit: mark as MRU so an LRU eviction below picks the
+            # truly oldest-used entry.
+            self._process_socks.move_to_end(process_id)
+            return entry[1]
+        # Stale entry (endpoint changed because the interceptor process
+        # restarted on a new ephemeral port) — close before replacing.
+        # Replacing the socket also makes any prior "maybe stale reply"
+        # tracking moot for this process_id.
+        if entry is not None:
+            try:
+                entry[1].close(0)
+            except Exception:
+                pass
+            self._process_socks.pop(process_id, None)
+            self._maybe_stale_interceptor_socks.pop(process_id, None)
+        # Cap the cache by evicting the least-recently-used entry
+        # before inserting the new one. Without this, a router that
+        # sees many distinct interceptor process_ids over its lifetime
+        # leaks sockets indefinitely.
+        while len(self._process_socks) >= _PROCESS_SOCKS_MAX:
+            evicted_pid, (_evicted_ep, evicted_sock) = (
+                self._process_socks.popitem(last=False)
+            )
+            try:
+                evicted_sock.close(0)
+            except Exception:
+                pass
+            self._maybe_stale_interceptor_socks.pop(evicted_pid, None)
+        sock = self._ctx.socket(zmq.DEALER)
+        sock.setsockopt(zmq.LINGER, 0)
+        sock.connect(endpoint)
+        self._process_socks[process_id] = (endpoint, sock)
+        return sock
 
     def _publish_event(self, topic: str, payload: Json) -> None:
         if self._manager is None:
@@ -558,13 +639,59 @@ class _DeviceWorker(_BaseWorker):
         sock = self._get_process_sock(process_id, endpoint)
         sock.setsockopt(zmq.RCVTIMEO, self._interceptor_timeout_ms)
         sock.setsockopt(zmq.SNDTIMEO, self._interceptor_timeout_ms)
+        # The interceptor socket is a DEALER, so replies aren't
+        # auto-correlated; a prior call that timed out can leave its
+        # reply buffered to be mis-attributed to the next call. Stamp a
+        # transport-level request_id (preserving any caller-supplied
+        # one) so the recv loop can drop stale frames via mismatch. The
+        # interceptor handler echoes request_id via
+        # process_base._drain_rpc / _rpc_ok / _rpc_err, so well-formed
+        # replies are matchable; the lenient match also lets through
+        # process_base's bad_request reply ({"request_id": None, ...}).
+        outbound = request
+        if "request_id" not in request:
+            outbound = dict(request)
+            outbound["request_id"] = uuid.uuid4().hex
+        expected_request_id = outbound.get("request_id")
+        maybe_stale = self._maybe_stale_interceptor_socks.get(process_id, False)
         try:
-            sock.send(json_dumps(request))
-            raw = sock.recv()
+            if maybe_stale:
+                _drain_stale_replies(sock)
+                self._maybe_stale_interceptor_socks[process_id] = False
+            sock.send(json_dumps(outbound))
+            deadline = time.monotonic() + (
+                self._interceptor_timeout_ms / 1000.0
+            )
+            while True:
+                remaining_ms = (deadline - time.monotonic()) * 1000.0
+                if remaining_ms <= 0:
+                    self._maybe_stale_interceptor_socks[process_id] = True
+                    return None
+                if not sock.poll(max(1, int(remaining_ms)), zmq.POLLIN):
+                    continue
+                raw = sock.recv(zmq.NOBLOCK)
+                resp = safe_json_loads(raw)
+                if not isinstance(resp, dict):
+                    continue
+                resp_rid = resp.get("request_id")
+                if (
+                    expected_request_id is not None
+                    and resp_rid is not None
+                    and resp_rid != expected_request_id
+                ):
+                    # Stale reply from a previous timed-out call (its
+                    # send-time stamp doesn't match what we're waiting
+                    # for); skip. Replies that don't carry request_id
+                    # at all are passed through — process_base._drain_rpc
+                    # emits {"request_id": None, ...} for malformed
+                    # payloads and we should let those through too.
+                    continue
+                return resp
         except Exception:
+            # Mark this sock as possibly carrying a stale reply so the
+            # NEXT _call_interceptor for the same process drains it.
+            self._maybe_stale_interceptor_socks[process_id] = True
             return None
-        resp = safe_json_loads(raw)
-        return resp if isinstance(resp, dict) else None
 
     def _apply_command_interceptors(
         self, task: _DeviceTask
@@ -976,17 +1103,38 @@ class DeviceRouter(ManagedProcessBase):
         self._manager_sub = None
 
     def close(self) -> None:
-        for worker in self._device_workers.values():
-            worker.stop()
-        for worker in self._mirrored_workers.values():
-            worker.stop()
-        for worker in self._process_workers.values():
-            worker.stop()
+        for workers in (self._device_workers, self._mirrored_workers, self._process_workers):
+            for worker in workers.values():
+                worker.stop()
         if self._manager_worker is not None:
             self._manager_worker.stop()
         super().close()
         self._close_external()
         self._close_manager_sub()
+
+    @staticmethod
+    def _required_mirror_fields(item: Json) -> tuple[str, str, str, str]:
+        fields = (
+            str(item.get("local_id", "")).strip(),
+            str(item.get("peer_id", "")).strip(),
+            str(item.get("remote_device_id", "")).strip(),
+            str(item.get("peer_router_rpc", "")).strip(),
+        )
+        if not all(fields):
+            raise ValueError(
+                "federation_mirrors entries require local_id, peer_id, "
+                "remote_device_id, and peer_router_rpc"
+            )
+        return fields
+
+    @staticmethod
+    def _mirror_action_patterns(item: Json, key: str, default: list[str]) -> tuple[str, ...]:
+        raw = item.get(key, default)
+        if not isinstance(raw, list) or not all(
+            isinstance(v, str) and str(v).strip() for v in raw
+        ):
+            raise TypeError(f"{key} must be a list[str]")
+        return tuple(str(v).strip() for v in raw)
 
     def _load_federation_mirrors(self, items: list[Json] | None) -> None:
         if items is None:
@@ -996,35 +1144,17 @@ class DeviceRouter(ManagedProcessBase):
         for idx, item in enumerate(items):
             if not isinstance(item, dict):
                 raise TypeError(f"federation_mirrors[{idx}] must be an object")
-            local_id = str(item.get("local_id", "")).strip()
-            peer_id = str(item.get("peer_id", "")).strip()
-            remote_device_id = str(item.get("remote_device_id", "")).strip()
-            peer_router_rpc = str(item.get("peer_router_rpc", "")).strip()
-            if not local_id or not peer_id or not remote_device_id or not peer_router_rpc:
-                raise ValueError(
-                    "federation_mirrors entries require local_id, peer_id, "
-                    "remote_device_id, and peer_router_rpc"
-                )
+            local_id, peer_id, remote_device_id, peer_router_rpc = self._required_mirror_fields(item)
             if local_id in self._mirrored_routes:
                 raise ValueError(f"duplicate mirrored route for {local_id!r}")
-            allow_raw = item.get("allow_device_actions", ["*"])
-            deny_raw = item.get("deny_device_actions", [])
-            if not isinstance(allow_raw, list) or not all(
-                isinstance(v, str) and str(v).strip() for v in allow_raw
-            ):
-                raise TypeError("allow_device_actions must be a list[str]")
-            if not isinstance(deny_raw, list) or not all(
-                isinstance(v, str) and str(v).strip() for v in deny_raw
-            ):
-                raise TypeError("deny_device_actions must be a list[str]")
             self._mirrored_routes[local_id] = MirroredRoute(
                 local_id=local_id,
                 peer_id=peer_id,
                 remote_device_id=remote_device_id,
                 peer_router_rpc=peer_router_rpc,
                 rpc_timeout_ms=int(item.get("rpc_timeout_ms", self._device_rpc_timeout_ms)),
-                allow_device_actions=tuple(str(v).strip() for v in allow_raw),
-                deny_device_actions=tuple(str(v).strip() for v in deny_raw),
+                allow_device_actions=self._mirror_action_patterns(item, "allow_device_actions", ["*"]),
+                deny_device_actions=self._mirror_action_patterns(item, "deny_device_actions", []),
                 allow_lifecycle_ops=bool(item.get("allow_lifecycle_ops", False)),
                 allow_admin_ops=bool(item.get("allow_admin_ops", False)),
                 origin_instance_id=(
@@ -1129,7 +1259,7 @@ class DeviceRouter(ManagedProcessBase):
             self._inflight_count -= 1
 
     @staticmethod
-    def _worker_depth(worker: _BaseWorker | None) -> int | None:
+    def _worker_depth(worker: _WorkerLike | None) -> int | None:
         if worker is None:
             return None
         try:
@@ -1138,7 +1268,7 @@ class DeviceRouter(ManagedProcessBase):
             return None
 
     @staticmethod
-    def _worker_max(worker: _BaseWorker | None) -> int | None:
+    def _worker_max(worker: _WorkerLike | None) -> int | None:
         if worker is None:
             return None
         try:
@@ -1178,7 +1308,7 @@ class DeviceRouter(ManagedProcessBase):
         *,
         bucket: str,
         message: str,
-        worker: _BaseWorker | None = None,
+        worker: _WorkerLike | None = None,
         request_id: Any = None,
     ) -> None:
         self._overload_rejected[bucket] = int(self._overload_rejected.get(bucket, 0)) + 1
@@ -1193,75 +1323,84 @@ class DeviceRouter(ManagedProcessBase):
             request_id=request_id,
         )
 
+    def _submit_with_inflight(
+        self,
+        identity: bytes,
+        *,
+        task_factory: Callable[[], object],
+        worker_factory: Callable[[], _WorkerLike],
+        bucket: str,
+        queue_full_message: str,
+        request_id: Any = None,
+    ) -> None:
+        if not self._reserve_inflight():
+            self._reject_overload(
+                identity,
+                bucket="inflight",
+                message="router inflight request limit reached",
+                request_id=request_id,
+            )
+            return
+        worker = worker_factory()
+        if worker.submit(task_factory()):
+            return
+        self._release_inflight()
+        self._reject_overload(
+            identity,
+            bucket=bucket,
+            message=queue_full_message,
+            worker=worker,
+            request_id=request_id,
+        )
+
+    @staticmethod
+    def _worker_snapshot(
+        workers: Mapping[str, _WorkerLike], *, id_key: str
+    ) -> tuple[list[Json], int]:
+        rows: list[Json] = []
+        total_depth = 0
+        for item_id in sorted(workers):
+            worker = workers[item_id]
+            depth = worker.queue_depth()
+            if depth is not None:
+                total_depth += depth
+            rows.append(
+                {
+                    id_key: item_id,
+                    "queue_depth": depth,
+                    "queue_max": worker.queue_max(),
+                    "alive": bool(worker.is_alive()),
+                }
+            )
+        return rows, total_depth
+
+    def _manager_worker_snapshot(self) -> Json:
+        if self._manager_worker is None:
+            return {
+                "queue_depth": None,
+                "queue_max": int(self._manager_worker_queue_max),
+                "alive": False,
+            }
+        return {
+            "queue_depth": self._manager_worker.queue_depth(),
+            "queue_max": self._manager_worker.queue_max(),
+            "alive": bool(self._manager_worker.is_alive()),
+        }
+
     def _worker_queue_depth_snapshot(self) -> Json:
-        device_workers: list[Json] = []
-        process_workers: list[Json] = []
-        mirrored_workers: list[Json] = []
-
-        total_device_queue_depth = 0
-        total_process_queue_depth = 0
-        total_mirrored_queue_depth = 0
-
-        for device_id in sorted(self._device_workers):
-            worker = self._device_workers[device_id]
-            depth = worker.queue_depth()
-            if depth is not None:
-                total_device_queue_depth += depth
-            device_workers.append(
-                {
-                    "device_id": device_id,
-                    "queue_depth": depth,
-                    "queue_max": worker.queue_max(),
-                    "alive": bool(worker.is_alive()),
-                }
-            )
-
-        for process_id in sorted(self._process_workers):
-            worker = self._process_workers[process_id]
-            depth = worker.queue_depth()
-            if depth is not None:
-                total_process_queue_depth += depth
-            process_workers.append(
-                {
-                    "process_id": process_id,
-                    "queue_depth": depth,
-                    "queue_max": worker.queue_max(),
-                    "alive": bool(worker.is_alive()),
-                }
-            )
-
-        for local_id in sorted(self._mirrored_workers):
-            worker = self._mirrored_workers[local_id]
-            depth = worker.queue_depth()
-            if depth is not None:
-                total_mirrored_queue_depth += depth
-            mirrored_workers.append(
-                {
-                    "device_id": local_id,
-                    "queue_depth": depth,
-                    "queue_max": worker.queue_max(),
-                    "alive": bool(worker.is_alive()),
-                }
-            )
-
-        manager_worker_depth: int | None = None
-        manager_worker_alive = False
-        if self._manager_worker is not None:
-            manager_worker_depth = self._manager_worker.queue_depth()
-            manager_worker_alive = bool(self._manager_worker.is_alive())
-
+        device_workers, total_device_queue_depth = self._worker_snapshot(
+            self._device_workers, id_key="device_id"
+        )
+        process_workers, total_process_queue_depth = self._worker_snapshot(
+            self._process_workers, id_key="process_id"
+        )
+        mirrored_workers, total_mirrored_queue_depth = self._worker_snapshot(
+            self._mirrored_workers, id_key="device_id"
+        )
         return {
             "reply_queue_depth": self._safe_queue_depth(self._reply_queue),
             "reply_queue_max": int(self._reply_queue_max),
-            "manager_worker": {
-                "queue_depth": manager_worker_depth,
-                "queue_max": (
-                    self._manager_worker.queue_max()
-                    if self._manager_worker is not None
-                    else int(self._manager_worker_queue_max)
-                ),
-                "alive": manager_worker_alive,
-            },
+            "manager_worker": self._manager_worker_snapshot(),
             "device_workers": device_workers,
             "process_workers": process_workers,
             "mirrored_workers": mirrored_workers,
@@ -1281,6 +1420,19 @@ class DeviceRouter(ManagedProcessBase):
 
     def _invalidate_route_cache(self) -> None:
         self._route_cache.clear()
+
+    @staticmethod
+    def _route_payload(route: CommandInterceptorRoute) -> Json:
+        return {
+            "process_id": route.process_id,
+            "device_id": route.device_id,
+            "action": route.action,
+            "order": route.order,
+        }
+
+    @classmethod
+    def _route_payloads(cls, routes: list[CommandInterceptorRoute]) -> list[Json]:
+        return [cls._route_payload(r) for r in routes]
 
     def _register_command_interceptor_routes(
         self, process_id: str, routes_raw: Any, *, replace: bool
@@ -1312,20 +1464,44 @@ class DeviceRouter(ManagedProcessBase):
                     order=self._route_order,
                 )
                 self._routes.append(entry)
-                added.append(
-                    {
-                        "process_id": process_id,
-                        "device_id": device_id,
-                        "action": action,
-                        "order": entry.order,
-                    }
-                )
+                added.append(self._route_payload(entry))
             self._invalidate_route_cache()
         self._publish_manager_event(
             "manager.command_interceptor.routes_updated",
             {"process_id": process_id, "routes": added, "replace": replace},
         )
         return added
+
+    def _drop_interceptor_routes_for_process(self, process_id: str) -> bool:
+        """Drop all cached interceptor routes whose process_id matches.
+
+        Distinct from the inherited
+        ``ManagedProcessBase._unregister_command_interceptor_routes(self)``
+        no-arg hook (called by an interceptor process to deregister
+        itself with the manager). This method is the device-router's
+        process_id-keyed bulk-removal entry point invoked when a
+        downstream interceptor process exits or sends an explicit
+        drop. Renamed in PR #55 to remove the LSP signature collision
+        that mypy flagged.
+        """
+        with self._route_lock:
+            before = len(self._routes)
+            self._routes = [r for r in self._routes if r.process_id != process_id]
+            removed = len(self._routes) != before
+            if removed:
+                self._invalidate_route_cache()
+            # Snapshot remaining routes inside the lock so the published event
+            # matches the manager-side shape (process_id, removed, routes).
+            routes_snapshot = self._route_payloads(self._routes)
+        self._publish_manager_event(
+            "manager.command_interceptor.routes_unregistered",
+            {
+                "process_id": process_id,
+                "removed": removed,
+                "routes": routes_snapshot,
+            },
+        )
+        return removed
 
     @staticmethod
     def _match_route(
@@ -1367,15 +1543,7 @@ class DeviceRouter(ManagedProcessBase):
         rtype = str(req.get("type", ""))
         if rtype == "manager.interceptors.list":
             with self._route_lock:
-                routes = [
-                    {
-                        "process_id": r.process_id,
-                        "device_id": r.device_id,
-                        "action": r.action,
-                        "order": r.order,
-                    }
-                    for r in sorted(self._routes, key=lambda r: r.order)
-                ]
+                routes = self._route_payloads(sorted(self._routes, key=lambda r: r.order))
             return {"ok": True, "result": {"routes": routes}}
 
         if rtype == "manager.interceptors.register":
@@ -1398,7 +1566,55 @@ class DeviceRouter(ManagedProcessBase):
                 }
             return {"ok": True, "result": {"routes": routes}}
 
+        if rtype == "manager.interceptors.unregister":
+            process_id = str(req.get("process_id", "")).strip()
+            if not process_id:
+                return {
+                    "ok": False,
+                    "error": {"code": "invalid_unregister", "message": "missing process_id"},
+                }
+            try:
+                removed = self._drop_interceptor_routes_for_process(process_id)
+            except Exception as e:
+                return {
+                    "ok": False,
+                    "error": {"code": "unregister_failed", "message": str(e)},
+                }
+            return {"ok": True, "result": {"process_id": process_id, "removed": removed}}
+
         return {"ok": False, "error": {"code": "unknown_request"}}
+
+    def _handle_manager_topic(self, topic: str, payload: Json) -> None:
+        if topic == "manager.driver_registered":
+            self._update_endpoint(payload, "device_id", "rpc_endpoint", self._device_endpoints)
+            return
+        if topic == "manager.process.rpc_update":
+            self._update_endpoint(payload, "process_id", "rpc_endpoint", self._process_endpoints)
+            return
+        if topic.startswith("manager.driver."):
+            self._update_state(payload, "device_id", self._device_states)
+            if topic in {"manager.driver.stopped", "manager.driver.failed"}:
+                self._device_endpoints.pop(str(payload.get("device_id", "")), None)
+            return
+        if topic.startswith("manager.process."):
+            process_id = self._update_state(payload, "process_id", self._process_states)
+            if topic in {"manager.process.exited", "manager.process.failed", "manager.process.removed"}:
+                self._process_endpoints.pop(process_id, None)
+
+    @staticmethod
+    def _update_endpoint(payload: Json, id_key: str, endpoint_key: str, endpoints: dict[str, str]) -> None:
+        item_id = str(payload.get(id_key, ""))
+        endpoint = payload.get(endpoint_key)
+        if item_id and isinstance(endpoint, str):
+            endpoints[item_id] = endpoint
+
+    @staticmethod
+    def _update_state(payload: Json, id_key: str, states: dict[str, str]) -> str:
+        item_id = str(payload.get(id_key, ""))
+        state = payload.get("state")
+        if item_id and isinstance(state, str):
+            states[item_id] = state
+        return item_id
 
     def _handle_manager_pub(self) -> None:
         if self._manager_sub is None:
@@ -1410,35 +1626,9 @@ class DeviceRouter(ManagedProcessBase):
                 break
             except Exception:
                 break
-            topic = topic_b.decode("utf-8", errors="ignore")
             payload = safe_json_loads(payload_b)
-            if not isinstance(payload, dict):
-                continue
-            if topic == "manager.driver_registered":
-                device_id = str(payload.get("device_id", ""))
-                rpc_endpoint = payload.get("rpc_endpoint")
-                if device_id and isinstance(rpc_endpoint, str):
-                    self._device_endpoints[device_id] = rpc_endpoint
-            elif topic.startswith("manager.driver."):
-                device_id = str(payload.get("device_id", ""))
-                state = payload.get("state")
-                if device_id and isinstance(state, str):
-                    self._device_states[device_id] = state
-                if topic in {"manager.driver.stopped", "manager.driver.failed"} and device_id:
-                    self._device_endpoints.pop(device_id, None)
-            elif topic == "manager.process.rpc_update":
-                process_id = str(payload.get("process_id", ""))
-                rpc_endpoint = payload.get("rpc_endpoint")
-                if process_id and isinstance(rpc_endpoint, str):
-                    self._process_endpoints[process_id] = rpc_endpoint
-            elif topic.startswith("manager.process."):
-                process_id = str(payload.get("process_id", ""))
-                state = payload.get("state")
-                if process_id and isinstance(state, str):
-                    self._process_states[process_id] = state
-                if topic in {"manager.process.exited", "manager.process.failed", "manager.process.removed"}:
-                    if process_id:
-                        self._process_endpoints.pop(process_id, None)
+            if isinstance(payload, dict):
+                self._handle_manager_topic(topic_b.decode("utf-8", errors="ignore"), payload)
 
     def _drain_replies(self) -> None:
         while True:
@@ -1469,9 +1659,11 @@ class DeviceRouter(ManagedProcessBase):
                     self._release_inflight()
                 continue
             try:
-                self._external_rpc.send_multipart(
-                    [identity, json_dumps(_inject_request_id(resp, request_id))]
-                )
+                outbound = _inject_request_id(resp, request_id)
+                if request_id is not None and isinstance(item, _ReplyItem):
+                    outbound = dict(outbound)
+                    outbound["request_id"] = request_id
+                self._external_rpc.send_multipart([identity, json_dumps(outbound)])
             except Exception:
                 pass
             finally:
@@ -1496,6 +1688,15 @@ class DeviceRouter(ManagedProcessBase):
         except Exception:
             return 0
 
+    def _send_mirrored_error(
+        self, identity: bytes, *, code: str, message: str, request_id: Any
+    ) -> None:
+        self._send_external_response(
+            identity,
+            {"ok": False, "error": {"code": code, "message": message}},
+            request_id=request_id,
+        )
+
     def _dispatch_mirrored_command(
         self,
         identity: bytes,
@@ -1507,60 +1708,34 @@ class DeviceRouter(ManagedProcessBase):
         req_id = req.get("request_id")
         hop_count = self._federation_hop_count(req.get("federation"))
         if hop_count > 0:
-            self._send_external_response(
+            self._send_mirrored_error(
                 identity,
-                {
-                    "ok": False,
-                    "error": {
-                        "code": "federation_reexport_blocked",
-                        "message": (
-                            "mirrored devices cannot be re-exported to another peer"
-                        ),
-                    },
-                },
+                code="federation_reexport_blocked",
+                message="mirrored devices cannot be re-exported to another peer",
                 request_id=req_id,
             )
             return
         if not route.allows_device_action(action):
-            self._send_external_response(
+            self._send_mirrored_error(
                 identity,
-                {
-                    "ok": False,
-                    "error": {
-                        "code": "federation_acl_denied",
-                        "message": (
-                            f"federation policy denied mirrored command "
-                            f"{route.local_id!r}.{action}"
-                        ),
-                    },
-                },
+                code="federation_acl_denied",
+                message=f"federation policy denied mirrored command {route.local_id!r}.{action}",
                 request_id=req_id,
             )
             return
-        if not self._reserve_inflight():
-            self._reject_overload(
-                identity,
-                bucket="inflight",
-                message="router inflight request limit reached",
-                request_id=req_id,
-            )
-            return
-        task = _MirroredTask(
-            identity=identity,
-            request=req,
-            route=route,
-            inflight_reserved=True,
+        self._submit_with_inflight(
+            identity,
+            task_factory=lambda: _MirroredTask(
+                identity=identity,
+                request=req,
+                route=route,
+                inflight_reserved=True,
+            ),
+            worker_factory=lambda: self._ensure_mirrored_worker(route.local_id),
+            bucket="mirrored_worker",
+            queue_full_message="mirrored worker queue is full",
+            request_id=req_id,
         )
-        worker = self._ensure_mirrored_worker(route.local_id)
-        if not worker.submit(task):
-            self._release_inflight()
-            self._reject_overload(
-                identity,
-                bucket="mirrored_worker",
-                message="mirrored worker queue is full",
-                worker=worker,
-                request_id=req_id,
-            )
 
     def _dispatch_device_command(self, identity: bytes, req: Json) -> None:
         device_id = str(req.get("device_id", ""))
@@ -1589,51 +1764,63 @@ class DeviceRouter(ManagedProcessBase):
             interceptor_endpoints[pid] = self._process_endpoints.get(pid)
             interceptor_states[pid] = self._process_states.get(pid)
 
-        if not self._reserve_inflight():
-            self._reject_overload(
-                identity,
-                bucket="inflight",
-                message="router inflight request limit reached",
+        source_kind, source_id = self._request_source(req)
+        self._submit_with_inflight(
+            identity,
+            task_factory=lambda: _DeviceTask(
+                identity=identity,
+                request=req,
+                device_id=device_id,
+                action=action,
+                params=params,
                 request_id=req_id,
-            )
-            return
-        task = _DeviceTask(
-            identity=identity,
-            request=req,
-            device_id=device_id,
-            action=action,
-            params=params,
-            request_id=req.get("request_id"),
-            caller_process_id=req.get("caller_process_id"),
-            source_kind=(
-                str(req.get("source_kind")).strip()
-                if req.get("source_kind") is not None
-                and str(req.get("source_kind")).strip()
-                else None
+                caller_process_id=req.get("caller_process_id"),
+                source_kind=source_kind,
+                source_id=source_id,
+                device_endpoint=self._device_endpoints.get(device_id),
+                device_state=self._device_states.get(device_id),
+                chain=chain,
+                interceptor_endpoints=interceptor_endpoints,
+                interceptor_states=interceptor_states,
+                inflight_reserved=True,
             ),
-            source_id=(
-                str(req.get("source_id")).strip()
-                if req.get("source_id") is not None
-                and str(req.get("source_id")).strip()
-                else None
-            ),
-            device_endpoint=self._device_endpoints.get(device_id),
-            device_state=self._device_states.get(device_id),
-            chain=chain,
-            interceptor_endpoints=interceptor_endpoints,
-            interceptor_states=interceptor_states,
-            inflight_reserved=True,
+            worker_factory=lambda: self._ensure_device_worker(device_id),
+            bucket="device_worker",
+            queue_full_message="device worker queue is full",
+            request_id=req_id,
         )
-        worker = self._ensure_device_worker(device_id)
-        if not worker.submit(task):
-            self._release_inflight()
-            self._reject_overload(
-                identity,
-                bucket="device_worker",
-                message="device worker queue is full",
-                worker=worker,
-                request_id=req_id,
-            )
+
+    @staticmethod
+    def _nullable_stripped(value: Any) -> str | None:
+        if value is None:
+            return None
+        return str(value).strip() or None
+
+    @classmethod
+    def _request_source(cls, req: Json) -> tuple[str | None, str | None]:
+        return cls._nullable_stripped(req.get("source_kind")), cls._nullable_stripped(
+            req.get("source_id")
+        )
+
+    @classmethod
+    def _process_request_source(cls, req: Json) -> tuple[str | None, str | None, str | None]:
+        caller_process_id = cls._nullable_stripped(req.get("caller_process_id"))
+        raw_source_kind = cls._nullable_stripped(req.get("source_kind"))
+        source_kind = raw_source_kind.lower() if raw_source_kind is not None else None
+        source_id = cls._nullable_stripped(req.get("source_id"))
+        if source_kind is None:
+            source_kind = "process" if caller_process_id is not None else "manager"
+            source_id = source_id or caller_process_id or "rpc"
+        elif source_kind == "process" and source_id is None:
+            source_id = caller_process_id
+        return caller_process_id, source_kind, source_id
+
+    def _process_rpc_endpoint(self, process_id: str) -> str | None:
+        endpoint = self._process_endpoints.get(process_id)
+        if endpoint is None and process_id == self._process_id and self._rpc_endpoint:
+            endpoint = self._rpc_endpoint
+            self._process_endpoints[process_id] = endpoint
+        return endpoint
 
     def _dispatch_process_rpc(self, identity: bytes, req: Json) -> None:
         process_id = str(req.get("process_id", ""))
@@ -1643,85 +1830,41 @@ class DeviceRouter(ManagedProcessBase):
             resp = {"ok": False, "error": {"code": "invalid_process_rpc"}}
             self._send_external_response(identity, resp, request_id=request_id)
             return
-        action = str(request.get("type", "process.rpc") or "process.rpc")
+        request_id = request_id if request_id is not None else request.get("request_id")
         params_raw = request.get("params", {})
-        params = params_raw if isinstance(params_raw, dict) else {}
-        if request_id is None:
-            request_id = request.get("request_id")
-        caller_process_id = (
-            str(req.get("caller_process_id", "")).strip() or None
-        )
-        source_kind = str(req.get("source_kind", "")).strip().lower() or None
-        source_id = str(req.get("source_id", "")).strip() or None
-        if source_kind is None:
-            if caller_process_id is not None:
-                source_kind = "process"
-                if source_id is None:
-                    source_id = caller_process_id
-            else:
-                source_kind = "manager"
-                if source_id is None:
-                    source_id = "rpc"
-        elif source_kind == "process" and source_id is None and caller_process_id is not None:
-            source_id = caller_process_id
-        endpoint = self._process_endpoints.get(process_id)
-        if endpoint is None and process_id == self._process_id and self._rpc_endpoint:
-            endpoint = self._rpc_endpoint
-            self._process_endpoints[process_id] = endpoint
-        if not self._reserve_inflight():
-            self._reject_overload(
-                identity,
-                bucket="inflight",
-                message="router inflight request limit reached",
+        caller_process_id, source_kind, source_id = self._process_request_source(req)
+        self._submit_with_inflight(
+            identity,
+            task_factory=lambda: _ProcessTask(
+                identity=identity,
+                process_id=process_id,
+                request=request,
+                endpoint=self._process_rpc_endpoint(process_id),
+                action=str(request.get("type", "process.rpc") or "process.rpc"),
+                params=params_raw if isinstance(params_raw, dict) else {},
                 request_id=request_id,
-            )
-            return
-        task = _ProcessTask(
-            identity=identity,
-            process_id=process_id,
-            request=request,
-            endpoint=endpoint,
-            action=action,
-            params=params,
+                caller_process_id=caller_process_id,
+                source_kind=source_kind,
+                source_id=source_id,
+                process_state=self._process_states.get(process_id),
+                inflight_reserved=True,
+            ),
+            worker_factory=lambda: self._ensure_process_worker(process_id),
+            bucket="process_worker",
+            queue_full_message="process worker queue is full",
             request_id=request_id,
-            caller_process_id=caller_process_id,
-            source_kind=source_kind,
-            source_id=source_id,
-            process_state=self._process_states.get(process_id),
-            inflight_reserved=True,
         )
-        worker = self._ensure_process_worker(process_id)
-        if not worker.submit(task):
-            self._release_inflight()
-            self._reject_overload(
-                identity,
-                bucket="process_worker",
-                message="process worker queue is full",
-                worker=worker,
-                request_id=request_id,
-            )
 
     def _dispatch_manager_rpc(self, identity: bytes, req: Json) -> None:
         req_id = req.get("request_id")
-        if not self._reserve_inflight():
-            self._reject_overload(
-                identity,
-                bucket="inflight",
-                message="router inflight request limit reached",
-                request_id=req_id,
-            )
-            return
-        task = _ManagerTask(identity=identity, request=req, inflight_reserved=True)
-        worker = self._ensure_manager_worker()
-        if not worker.submit(task):
-            self._release_inflight()
-            self._reject_overload(
-                identity,
-                bucket="manager_worker",
-                message="manager worker queue is full",
-                worker=worker,
-                request_id=req_id,
-            )
+        self._submit_with_inflight(
+            identity,
+            task_factory=lambda: _ManagerTask(identity=identity, request=req, inflight_reserved=True),
+            worker_factory=self._ensure_manager_worker,
+            bucket="manager_worker",
+            queue_full_message="manager worker queue is full",
+            request_id=req_id,
+        )
 
     def _handle_external_rpc(self) -> None:
         if self._external_rpc is None:
@@ -1744,7 +1887,11 @@ class DeviceRouter(ManagedProcessBase):
         if rtype == "manager.processes.rpc":
             self._dispatch_process_rpc(identity, req)
             return
-        if rtype in {"manager.interceptors.register", "manager.interceptors.list"}:
+        if rtype in {
+            "manager.interceptors.register",
+            "manager.interceptors.unregister",
+            "manager.interceptors.list",
+        }:
             resp = self._handle_command_interceptor(req)
             self._send_external_response(identity, resp, request_id=req_id)
             return

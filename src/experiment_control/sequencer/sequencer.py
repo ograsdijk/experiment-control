@@ -2011,7 +2011,7 @@ class SequencerProcess(ManagedProcessBase):
     def _preflight_sequence_spec(self, spec: SequenceSpec) -> list[Json]:
         diagnostics: list[Json] = []
 
-        list_devices_resp = self._manager.call({"type": "manager.devices.list"})
+        list_devices_resp = self._require_manager().call({"type": "manager.devices.list"})
         device_ids = self._preflight_load_devices(list_devices_resp)
         if not device_ids:
             diagnostics.append(
@@ -2023,7 +2023,7 @@ class SequencerProcess(ManagedProcessBase):
                 )
             )
 
-        telemetry_schema_resp = self._manager.call({"action": "manager.telemetry.schema.list"})
+        telemetry_schema_resp = self._require_manager().call({"action": "manager.telemetry.schema.list"})
         telemetry_signals_by_device = self._preflight_load_telemetry_signals(
             telemetry_schema_resp
         )
@@ -2037,7 +2037,7 @@ class SequencerProcess(ManagedProcessBase):
                 )
             )
 
-        device_config_resp = self._manager.call({"type": "device.config.list"})
+        device_config_resp = self._require_manager().call({"type": "device.config.list"})
         stream_names_by_device = self._preflight_load_stream_names(device_config_resp)
         if not stream_names_by_device:
             diagnostics.append(
@@ -2081,7 +2081,7 @@ class SequencerProcess(ManagedProcessBase):
             "action": action,
             "params": params,
         }
-        resp = self._manager.call(req)
+        resp = self._require_manager().call(req)
         if resp is None:
             return {"ok": False, "error": "timeout"}
         if not isinstance(resp, dict):
@@ -2149,7 +2149,7 @@ class SequencerProcess(ManagedProcessBase):
             backoff_s = min(backoff_s * 2.0, _STREAM_CONTEXT_SET_MAX_BACKOFF_S)
 
     def _get_telemetry(self, device_id: str, signal: str) -> dict[str, Any] | None:
-        return self._manager.get_latest(device_id, signal)
+        return self._require_manager().get_latest(device_id, signal)
 
     def _sequencer_capability_members(self) -> list[Any]:
         members = [
@@ -2270,7 +2270,7 @@ class SequencerProcess(ManagedProcessBase):
         return self._with_common_capabilities(members)
 
     def _rpc_sequencer_capabilities(self, req: Json) -> Json:
-        return self._rpc_ok(req, result=capabilities_payload(self._sequencer_capability_members()))
+        return self.rpc_ok(req, result=capabilities_payload(self._sequencer_capability_members()))
 
     def _rpc_sequencer_status(self, req: Json) -> Json:
         result = self._runtime.status()
@@ -2286,19 +2286,19 @@ class SequencerProcess(ManagedProcessBase):
         result["autoload_error"] = self._autoload_error
         result["autoload_error_ts_wall"] = self._autoload_error_ts_wall
         result["autoload_error_source"] = self._autoload_error_source
-        return self._rpc_ok(req, result=result)
+        return self.rpc_ok(req, result=result)
 
     def _rpc_sequencer_adaptive_status(self, req: Json) -> Json:
-        return self._rpc_ok(req, result=self._runtime.adaptive_status())
+        return self.rpc_ok(req, result=self._runtime.adaptive_status())
 
     def _rpc_sequencer_adaptive_clear(self, req: Json) -> Json:
         params = req.get("params", {}) or {}
         if not isinstance(params, dict):
-            return self._rpc_invalid_params(req)
+            return self.rpc_invalid_params(req)
         study_id = str(params.get("study_id", "")).strip()
         if not study_id:
-            return self._rpc_err(req, code="missing_study_id")
-        return self._rpc_ok(
+            return self.rpc_err(req, code="missing_study_id")
+        return self.rpc_ok(
             req,
             result={
                 "cleared": int(self._runtime.clear_adaptive_studies(study_id=study_id)),
@@ -2307,12 +2307,12 @@ class SequencerProcess(ManagedProcessBase):
         )
 
     def _rpc_sequencer_adaptive_clear_all(self, req: Json) -> Json:
-        return self._rpc_ok(
+        return self.rpc_ok(
             req, result={"cleared": int(self._runtime.clear_adaptive_studies())}
         )
 
     def _rpc_sequencer_loaded_yaml(self, req: Json) -> Json:
-        return self._rpc_ok(
+        return self.rpc_ok(
             req,
             result={
                 "loaded": self._runtime.is_loaded,
@@ -2326,7 +2326,7 @@ class SequencerProcess(ManagedProcessBase):
     def _rpc_sequencer_load(self, req: Json) -> Json:
         params = req.get("params", {}) or {}
         if not isinstance(params, dict):
-            return self._rpc_invalid_params(req)
+            return self.rpc_invalid_params(req)
         path = params.get("path")
         text = params.get("text")
         source = "sequence_yaml"
@@ -2342,7 +2342,7 @@ class SequencerProcess(ManagedProcessBase):
                     message=str(e),
                     payload={"loaded_source": source},
                 )
-                return self._rpc_err(req, code="read_failed", message=str(e))
+                return self.rpc_err(req, code="read_failed", message=str(e))
         elif text:
             seq_text = str(text)
         else:
@@ -2353,7 +2353,7 @@ class SequencerProcess(ManagedProcessBase):
                 message="missing_yaml",
                 payload={"loaded_source": source},
             )
-            return self._rpc_err(req, code="missing_yaml")
+            return self.rpc_err(req, code="missing_yaml")
 
         ok, spec, diagnostics = self._load_sequence_text(text=seq_text, source=source)
         if not ok or spec is None:
@@ -2366,7 +2366,7 @@ class SequencerProcess(ManagedProcessBase):
                 message=message,
                 payload={"diagnostics": diagnostics, "loaded_source": source},
             )
-            return self._rpc_err(
+            return self.rpc_err(
                 req,
                 code="invalid_sequence",
                 message=message,
@@ -2390,12 +2390,12 @@ class SequencerProcess(ManagedProcessBase):
                 "context_columns": self._context_columns,
             },
         )
-        return self._rpc_ok(req, result={"status": "loaded"})
+        return self.rpc_ok(req, result={"status": "loaded"})
 
     def _rpc_sequencer_validate(self, req: Json) -> Json:
         params = req.get("params", {}) or {}
         if not isinstance(params, dict):
-            return self._rpc_invalid_params(req)
+            return self.rpc_invalid_params(req)
         path = params.get("path")
         text = params.get("text")
         source = "sequence_yaml"
@@ -2404,20 +2404,20 @@ class SequencerProcess(ManagedProcessBase):
             try:
                 seq_text = Path(str(path)).read_text(encoding="utf-8")
             except Exception as e:
-                return self._rpc_err(req, code="read_failed", message=str(e))
+                return self.rpc_err(req, code="read_failed", message=str(e))
         elif text:
             seq_text = str(text)
         else:
-            return self._rpc_err(req, code="missing_yaml")
+            return self.rpc_err(req, code="missing_yaml")
         ok, _spec, diagnostics = self._load_sequence_text(text=seq_text, source=source)
-        return self._rpc_ok(
+        return self.rpc_ok(
             req, result={"valid": bool(ok), "diagnostics": diagnostics}
         )
 
     def _rpc_sequencer_preflight(self, req: Json) -> Json:
         params = req.get("params", {}) or {}
         if not isinstance(params, dict):
-            return self._rpc_invalid_params(req)
+            return self.rpc_invalid_params(req)
         path = params.get("path")
         text = params.get("text")
         source = "sequence_yaml"
@@ -2426,17 +2426,17 @@ class SequencerProcess(ManagedProcessBase):
             try:
                 seq_text = Path(str(path)).read_text(encoding="utf-8")
             except Exception as e:
-                return self._rpc_err(req, code="read_failed", message=str(e))
+                return self.rpc_err(req, code="read_failed", message=str(e))
         elif text:
             seq_text = str(text)
         else:
-            return self._rpc_err(req, code="missing_yaml")
+            return self.rpc_err(req, code="missing_yaml")
         ok, spec, diagnostics = self._load_sequence_text(text=seq_text, source=source)
         all_diagnostics = list(diagnostics)
         if ok and isinstance(spec, SequenceSpec):
             all_diagnostics.extend(self._preflight_sequence_spec(spec))
         valid = bool(ok) and not self._preflight_has_errors(all_diagnostics)
-        return self._rpc_ok(
+        return self.rpc_ok(
             req,
             result={
                 "valid": valid,
@@ -2446,32 +2446,32 @@ class SequencerProcess(ManagedProcessBase):
         )
 
     def _rpc_sequencer_library_list(self, req: Json) -> Json:
-        return self._rpc_ok(req, result=self._library_list_payload())
+        return self.rpc_ok(req, result=self._library_list_payload())
 
     def _rpc_sequencer_library_reload(self, req: Json) -> Json:
         if not self._sequence_library_path:
-            return self._rpc_err(
+            return self.rpc_err(
                 req,
                 code="library_not_configured",
                 message="sequencer sequence_library_path is not configured",
             )
         if not self._load_sequence_library(initial=False):
-            return self._rpc_err(
+            return self.rpc_err(
                 req,
                 code="library_reload_failed",
                 message=self._sequence_library_error or "sequence library reload failed",
             )
-        return self._rpc_ok(req, result=self._library_list_payload())
+        return self.rpc_ok(req, result=self._library_list_payload())
 
     def _rpc_sequencer_library_load(self, req: Json) -> Json:
         params = req.get("params", {}) or {}
         if not isinstance(params, dict):
-            return self._rpc_invalid_params(req)
+            return self.rpc_invalid_params(req)
         sequence_id = str(params.get("sequence_id", "")).strip()
         if not sequence_id:
-            return self._rpc_err(req, code="missing_sequence_id")
+            return self.rpc_err(req, code="missing_sequence_id")
         if self._sequence_library is None:
-            return self._rpc_err(
+            return self.rpc_err(
                 req,
                 code="library_not_configured",
                 message="sequencer sequence library is not configured",
@@ -2480,7 +2480,7 @@ class SequencerProcess(ManagedProcessBase):
             entry = self._sequence_library.get_entry(sequence_id)
             self._set_loaded_sequence_from_library_entry(entry)
         except KeyError as e:
-            return self._rpc_err(req, code="unknown_sequence_id", message=str(e))
+            return self.rpc_err(req, code="unknown_sequence_id", message=str(e))
         except Exception as e:
             self._publish_lifecycle_event(
                 event="load_failed",
@@ -2489,7 +2489,7 @@ class SequencerProcess(ManagedProcessBase):
                 message=str(e),
                 payload={"active_sequence_id": sequence_id},
             )
-            return self._rpc_err(req, code="load_failed", message=str(e))
+            return self.rpc_err(req, code="load_failed", message=str(e))
         self._publish_lifecycle_event(
             event="load_ok",
             ok=True,
@@ -2501,14 +2501,14 @@ class SequencerProcess(ManagedProcessBase):
                 "context_columns": self._context_columns,
             },
         )
-        return self._rpc_ok(
+        return self.rpc_ok(
             req, result={"status": "loaded", "active_sequence_id": sequence_id}
         )
 
     def _rpc_sequencer_start(self, req: Json) -> Json:
         params = req.get("params", {}) or {}
         if not isinstance(params, dict):
-            return self._rpc_invalid_params(req)
+            return self.rpc_invalid_params(req)
         try:
             adaptive = params.get("adaptive")
             adaptive_overrides = adaptive if isinstance(adaptive, dict) else None
@@ -2550,7 +2550,7 @@ class SequencerProcess(ManagedProcessBase):
                 source="rpc",
                 message=str(e),
             )
-            return self._rpc_err(req, code="start_failed", message=str(e))
+            return self.rpc_err(req, code="start_failed", message=str(e))
         self._publish_lifecycle_event(
             event="start",
             ok=True,
@@ -2562,7 +2562,7 @@ class SequencerProcess(ManagedProcessBase):
                 "loaded_source": self._loaded_sequence_source,
             },
         )
-        return self._rpc_ok(req, result={"status": "running"})
+        return self.rpc_ok(req, result={"status": "running"})
 
     def _rpc_sequencer_pause(self, req: Json) -> Json:
         try:
@@ -2574,14 +2574,14 @@ class SequencerProcess(ManagedProcessBase):
                 source="rpc",
                 message=str(e),
             )
-            return self._rpc_err(req, code="pause_failed", message=str(e))
+            return self.rpc_err(req, code="pause_failed", message=str(e))
         self._publish_lifecycle_event(
             event="pause",
             ok=True,
             source="rpc",
             message="pause requested",
         )
-        return self._rpc_ok(req, result={"status": "pause_requested"})
+        return self.rpc_ok(req, result={"status": "pause_requested"})
 
     def _rpc_sequencer_resume(self, req: Json) -> Json:
         try:
@@ -2593,14 +2593,14 @@ class SequencerProcess(ManagedProcessBase):
                 source="rpc",
                 message=str(e),
             )
-            return self._rpc_err(req, code="resume_failed", message=str(e))
+            return self.rpc_err(req, code="resume_failed", message=str(e))
         self._publish_lifecycle_event(
             event="resume",
             ok=True,
             source="rpc",
             message="sequencer resumed",
         )
-        return self._rpc_ok(req, result={"status": "running"})
+        return self.rpc_ok(req, result={"status": "running"})
 
     def _rpc_sequencer_stop(self, req: Json) -> Json:
         try:
@@ -2612,14 +2612,14 @@ class SequencerProcess(ManagedProcessBase):
                 source="rpc",
                 message=str(e),
             )
-            return self._rpc_err(req, code="stop_failed", message=str(e))
+            return self.rpc_err(req, code="stop_failed", message=str(e))
         self._publish_lifecycle_event(
             event="stop",
             ok=True,
             source="rpc",
             message="stop requested",
         )
-        return self._rpc_ok(req, result={"status": "stop_requested"})
+        return self.rpc_ok(req, result={"status": "stop_requested"})
 
     def _build_rpc_registry(self) -> RpcDispatchRegistry:
         handlers = {
@@ -2661,10 +2661,10 @@ class SequencerProcess(ManagedProcessBase):
         dispatched = self._rpc_registry.dispatch_with_canonical(req)
         if dispatched is not None:
             return dispatched
-        return self._rpc_unknown(req)
+        return self.rpc_unknown(req)
 
     def _handle_rpc_legacy(self, req: Json) -> Json:
-        return self._rpc_unknown(req)
+        return self.rpc_unknown(req)
 
     def run(self) -> None:
         try:
@@ -2812,7 +2812,7 @@ class SequencerProcess(ManagedProcessBase):
 
     def _try_publish_log_payload(self, payload: Json, *, timeout_ms: int = 120) -> bool:
         try:
-            resp = self._manager.call(
+            resp = self._require_manager().call(
                 {"type": "manager.logs.publish", "payload": payload},
                 timeout_ms=timeout_ms,
             )

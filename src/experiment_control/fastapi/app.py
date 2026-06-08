@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-from collections import deque
 from dataclasses import dataclass
 import json
 import os
@@ -20,8 +19,11 @@ from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
+from ._trace_aggregator import TraceAggregator
 from .gateway import GatewaySettings, RouterRpcClient, StreamFrameHub, TelemetryHub
 from ..shm.shm_ring import ShmRingReader
+from ..utils.env import env_bool, env_float, env_int
+from ..utils.errors import TRANSIENT_CAPABILITIES_ERROR_CODES
 from ..utils.zmq_helpers import json_dumps as _orjson_dumps
 from ..utils.instance_lock import (
     derive_lock_effective_status,
@@ -31,6 +33,10 @@ from ..utils.instance_lock import (
 from ..utils.network_hosts import (
     is_loopback_host as shared_is_loopback_host,
     server_ipv4_candidates as shared_server_ipv4_candidates,
+)
+from ..utils.responses import (
+    ensure_error_shape as _ensure_error_shape,
+    normalize_command_response as _normalize_command_response,
 )
 from ..utils.trace_processing import (
     coerce_stream_values_array as _coerce_stream_values_array,
@@ -162,44 +168,21 @@ def _load_settings() -> GatewaySettings:
         instance_id=instance_id or None,
         router_rpc_public_hint=router_rpc_public_hint or None,
         manager_pub_public_hint=manager_pub_public_hint or None,
-        rpc_timeout_ms=int(os.environ.get("EXPERIMENT_CONTROL_RPC_TIMEOUT_MS", "2000")),
-        rpc_queue_max=max(
-            1, int(os.environ.get("EXPERIMENT_CONTROL_RPC_QUEUE_MAX", "1024"))
-        ),
+        rpc_timeout_ms=env_int("EXPERIMENT_CONTROL_RPC_TIMEOUT_MS", 2000),
+        rpc_queue_max=max(1, env_int("EXPERIMENT_CONTROL_RPC_QUEUE_MAX", 1024)),
         stream_max_payload_points=max(
-            1,
-            int(
-                os.environ.get(
-                    "EXPERIMENT_CONTROL_STREAM_MAX_PAYLOAD_POINTS", "200000"
-                )
-            ),
+            1, env_int("EXPERIMENT_CONTROL_STREAM_MAX_PAYLOAD_POINTS", 200000)
         ),
         stream_max_record_events=max(
-            1,
-            int(os.environ.get("EXPERIMENT_CONTROL_STREAM_MAX_RECORD_EVENTS", "512")),
+            1, env_int("EXPERIMENT_CONTROL_STREAM_MAX_RECORD_EVENTS", 512)
         ),
         stream_max_keys=max(
-            1, int(os.environ.get("EXPERIMENT_CONTROL_STREAM_MAX_KEYS", "1024"))
+            1, env_int("EXPERIMENT_CONTROL_STREAM_MAX_KEYS", 1024)
         ),
         stream_key_ttl_s=max(
-            0.0,
-            float(os.environ.get("EXPERIMENT_CONTROL_STREAM_KEY_TTL_S", "600")),
+            0.0, env_float("EXPERIMENT_CONTROL_STREAM_KEY_TTL_S", 600.0)
         ),
     )
-
-
-def _ensure_error_shape(resp: Any) -> dict[str, Any]:
-    if not isinstance(resp, dict):
-        return {
-            "ok": False,
-            "error": {
-                "code": "invalid_response",
-                "message": "router response was not a dict",
-            },
-        }
-    if resp.get("ok") is False and isinstance(resp.get("error"), str):
-        resp["error"] = {"code": "error", "message": resp["error"]}
-    return resp
 
 
 async def _route_request(payload: dict[str, Any]) -> dict[str, Any]:
@@ -282,33 +265,6 @@ def _command_source_fields(
     return {"source_kind": kind, "source_id": ident}
 
 
-def _normalize_command_response(resp: Any) -> dict[str, Any]:
-    resp = _ensure_error_shape(resp)
-    if "ok" in resp:
-        return resp
-    status = str(resp.get("status", "")).upper()
-    ok = status == "OK" or resp.get("ok") is True
-    out: dict[str, Any] = {"ok": ok, "result": resp.get("result")}
-    if not ok:
-        out["error"] = {
-            "code": "device_error",
-            "message": resp.get("error") or "device error",
-            "details": resp,
-        }
-    return out
-
-
-_TRANSIENT_CAPABILITIES_ERROR_CODES = {
-    "device_rpc_timeout",
-    "device_starting",
-    "device_stopping",
-    "device_rpc_not_ready",
-    "driver_not_running",
-    "gateway_busy",
-    "gateway_timeout",
-}
-
-
 def _command_error_code(resp: dict[str, Any]) -> str:
     err = resp.get("error")
     if isinstance(err, dict):
@@ -329,7 +285,7 @@ def _is_transient_capabilities_failure(resp: dict[str, Any]) -> bool:
     if not isinstance(resp, dict) or resp.get("ok") is not False:
         return False
     code = _command_error_code(resp)
-    if code in _TRANSIENT_CAPABILITIES_ERROR_CODES:
+    if code in TRANSIENT_CAPABILITIES_ERROR_CODES:
         return True
     err = resp.get("error")
     if isinstance(err, dict):
@@ -621,7 +577,25 @@ async def _process_cached_call_loop(target: ProcessCachedCallTarget) -> None:
         # only for the `updated_at` field exposed to the UI.
         started_mono = time.monotonic()
         try:
-            resp = await _process_rpc(target.process_id, target.action, target.params)
+            status = await _lookup_process_status(target.process_id)
+            if not isinstance(status, dict):
+                resp = {
+                    "ok": False,
+                    "error": {
+                        "code": "process_not_running",
+                        "message": "process is not running",
+                    },
+                }
+            elif not _process_rpc_registered(status):
+                resp = {
+                    "ok": False,
+                    "error": {
+                        "code": "process_rpc_not_ready",
+                        "message": "process RPC is not ready",
+                    },
+                }
+            else:
+                resp = await _process_rpc(target.process_id, target.action, target.params)
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -708,14 +682,6 @@ def _request_origin_and_host(request: Request) -> tuple[str, str | None]:
     return origin, parsed.hostname
 
 
-def _env_bool(name: str, default: bool = False) -> bool:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    text = raw.strip().lower()
-    return text in {"1", "true", "yes", "on"}
-
-
 def _default_ui_dist_path() -> Path:
     # Prefer packaged static assets so `pip install experiment-control` works
     # without requiring a local repo checkout.
@@ -736,7 +702,7 @@ def _default_ui_dist_path() -> Path:
 
 
 def _resolve_ui_dist_path() -> Path | None:
-    if not _env_bool("EXPERIMENT_CONTROL_SERVE_UI", default=False):
+    if not env_bool("EXPERIMENT_CONTROL_SERVE_UI", default=False):
         return None
     raw = os.environ.get("EXPERIMENT_CONTROL_UI_DIST", "").strip()
     path = Path(raw).expanduser().resolve() if raw else _default_ui_dist_path()
@@ -765,7 +731,7 @@ def _resolve_default_profile_path() -> Path | None:
 
 
 def _resolve_extra_ui_specs() -> list[ExtraUiSpec]:
-    if not _env_bool("EXPERIMENT_CONTROL_SERVE_UI", default=False):
+    if not env_bool("EXPERIMENT_CONTROL_SERVE_UI", default=False):
         return []
     raw = os.environ.get("EXPERIMENT_CONTROL_EXTRA_UI_JSON", "").strip()
     if not raw:
@@ -1430,21 +1396,6 @@ async def put_stream_workspace(
     )
 
 
-@app.patch("/api/stream/workspaces/{workspace_id}")
-async def patch_stream_workspace(
-    workspace_id: str, req: StreamWorkspaceRequest
-) -> dict[str, Any]:
-    workspace = dict(req.workspace)
-    workspace["workspace_id"] = workspace_id
-    payload: dict[str, Any] = {"workspace": workspace}
-    if req.expected_revision is not None:
-        payload["expected_revision"] = int(req.expected_revision)
-    return await _stream_analysis_rpc(
-        "stream_analysis.workspace.put",
-        payload,
-    )
-
-
 @app.post("/api/stream/workspaces/{workspace_id}/validate")
 async def validate_stream_workspace(
     workspace_id: str, req: StreamWorkspaceValidateRequest | None = None
@@ -1653,41 +1604,13 @@ async def ws_raw_stream(ws: WebSocket) -> None:
     trace_average_mode = _parse_trace_average_mode(ws.query_params.get("trace_average_mode"))
     trace_interval_s = (1.0 / trace_max_fps) if trace_max_fps else 0.0
     next_send_at = 0.0
-    pending_msg: dict[str, Any] | None = None
-    rolling_buf: deque[np.ndarray] = deque()
-    rolling_sum: np.ndarray | None = None
-    block_sum: np.ndarray | None = None
-    block_count = 0
-
-    def _apply_trace_average(trace: np.ndarray) -> np.ndarray | None:
-        nonlocal rolling_sum, block_sum, block_count
-        if rolling_window <= 1 or trace.size <= 0:
-            return trace
-        if trace_average_mode == "rolling":
-            if rolling_sum is None or int(rolling_sum.size) != int(trace.size):
-                rolling_buf.clear()
-                rolling_sum = np.zeros(int(trace.size), dtype=np.float64)
-            incoming = trace.astype(np.float64, copy=True)
-            if len(rolling_buf) >= int(rolling_window):
-                oldest = rolling_buf.popleft()
-                rolling_sum -= oldest
-            rolling_buf.append(incoming)
-            rolling_sum += incoming
-            return rolling_sum / float(max(1, len(rolling_buf)))
-        if block_sum is None or int(block_sum.size) != int(trace.size):
-            block_sum = np.zeros(int(trace.size), dtype=np.float64)
-            block_count = 0
-        block_sum += trace.astype(np.float64, copy=False)
-        block_count += 1
-        if block_count < int(rolling_window):
-            return None
-        out = block_sum / float(block_count)
-        block_sum.fill(0.0)
-        block_count = 0
-        return out
+    aggregator = TraceAggregator(
+        rolling_window=rolling_window,
+        trace_average_mode=trace_average_mode,
+    )
 
     async def _send_or_queue(msg: dict[str, Any]) -> None:
-        nonlocal next_send_at, pending_msg
+        nonlocal next_send_at
         if trace_interval_s <= 0:
             await _ws_send_json(ws, msg)
             return
@@ -1695,9 +1618,9 @@ async def ws_raw_stream(ws: WebSocket) -> None:
         if now >= next_send_at:
             await _ws_send_json(ws, msg)
             next_send_at = now + trace_interval_s
-            pending_msg = None
+            aggregator.pending_msg = None
             return
-        pending_msg = msg
+        aggregator.pending_msg = msg
 
     await ws.accept()
     # Keep this queue small: each entry can contain large trace payloads.
@@ -1708,22 +1631,24 @@ async def ws_raw_stream(ws: WebSocket) -> None:
     )
     try:
         while True:
-            timeout_s = 0.05 if pending_msg is not None and trace_interval_s > 0 else None
+            timeout_s = 0.05 if aggregator.pending_msg is not None and trace_interval_s > 0 else None
             try:
                 if timeout_s is None:
                     msg = await q.get()
                 else:
                     msg = await asyncio.wait_for(q.get(), timeout=timeout_s)
             except asyncio.TimeoutError:
+                pending_msg = aggregator.flush()
                 if pending_msg is None:
                     continue
                 now = time.monotonic()
                 if now < next_send_at:
+                    aggregator.pending_msg = pending_msg
                     continue
                 await _ws_send_json(ws, pending_msg)
-                pending_msg = None
                 next_send_at = now + trace_interval_s
                 continue
+
             if not isinstance(msg, dict):
                 continue
             if str(msg.get("topic") or "").strip() != "manager.stream_frame":
@@ -1740,7 +1665,7 @@ async def ws_raw_stream(ws: WebSocket) -> None:
                 channel_index=channel_index,
                 trace_decimator=trace_decimator,
                 trace_max_points=trace_max_points,
-                pre_decimate=_apply_trace_average,
+                pre_decimate=aggregator.add_frame,
             )
             if out_payload is None:
                 continue
@@ -1828,10 +1753,7 @@ class _WorkspaceTraceWsState:
         self.next_trace_send_at: dict[str, float] = {}
         self.pending_trace_msgs: dict[str, dict[str, Any]] = {}
         self.trace_readers: dict[tuple[str, str], ShmRingReader] = {}
-        self.rolling_buffers: dict[str, deque[np.ndarray]] = {}
-        self.rolling_sums: dict[str, np.ndarray] = {}
-        self.block_sums: dict[str, np.ndarray] = {}
-        self.block_counts: dict[str, int] = {}
+        self.trace_aggregators: dict[str, TraceAggregator] = {}
 
 
 def _parse_workspace_allowed_output_kinds(raw: Any) -> set[str] | None:
@@ -1863,46 +1785,18 @@ def _workspace_close_trace_reader(
         pass
 
 
-def _workspace_apply_trace_average(
+def _workspace_trace_aggregator(
     state: _WorkspaceTraceWsState,
-    *,
     output_key: str,
-    trace: np.ndarray,
-) -> np.ndarray | None:
-    if state.rolling_window <= 1:
-        return trace
-    if trace.size <= 0:
-        return trace
-    if state.trace_average_mode == "rolling":
-        buf = state.rolling_buffers.get(output_key)
-        sum_trace = state.rolling_sums.get(output_key)
-        if buf is None or sum_trace is None or int(sum_trace.size) != int(trace.size):
-            buf = deque()
-            sum_trace = np.zeros(int(trace.size), dtype=np.float64)
-            state.rolling_buffers[output_key] = buf
-            state.rolling_sums[output_key] = sum_trace
-        incoming = trace.astype(np.float64, copy=True)
-        if len(buf) >= int(state.rolling_window):
-            oldest = buf.popleft()
-            sum_trace -= oldest
-        buf.append(incoming)
-        sum_trace += incoming
-        return sum_trace / float(max(1, len(buf)))
-    sum_trace = state.block_sums.get(output_key)
-    count = int(state.block_counts.get(output_key, 0))
-    if sum_trace is None or int(sum_trace.size) != int(trace.size):
-        sum_trace = np.zeros(int(trace.size), dtype=np.float64)
-        count = 0
-        state.block_sums[output_key] = sum_trace
-    sum_trace += trace.astype(np.float64, copy=False)
-    count += 1
-    state.block_counts[output_key] = count
-    if count < int(state.rolling_window):
-        return None
-    out = sum_trace / float(count)
-    sum_trace.fill(0.0)
-    state.block_counts[output_key] = 0
-    return out
+) -> TraceAggregator:
+    aggregator = state.trace_aggregators.get(output_key)
+    if aggregator is None:
+        aggregator = TraceAggregator(
+            rolling_window=state.rolling_window,
+            trace_average_mode=state.trace_average_mode,
+        )
+        state.trace_aggregators[output_key] = aggregator
+    return aggregator
 
 
 async def _workspace_send_trace_message(
@@ -2013,10 +1907,8 @@ async def _workspace_handle_trace_ready_message(
     except Exception:
         return False
     trace_key = _workspace_trace_key(msg_workspace, output_id)
-    trace_flat = _workspace_apply_trace_average(
-        state,
-        output_key=trace_key,
-        trace=trace_arr.reshape(-1),
+    trace_flat = _workspace_trace_aggregator(state, trace_key).add_frame(
+        trace_arr.reshape(-1)
     )
     if trace_flat is None:
         return True
@@ -2075,7 +1967,7 @@ async def _workspace_handle_trace_output_message(
     output_id = str(payload.get("output_id") or "").strip()
     if points is not None and output_id:
         trace_key = _workspace_trace_key(msg_workspace, output_id)
-        rolled = _workspace_apply_trace_average(state, output_key=trace_key, trace=points)
+        rolled = _workspace_trace_aggregator(state, trace_key).add_frame(points)
         if rolled is None:
             return True
         decimated = (

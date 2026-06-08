@@ -11,15 +11,10 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from graphlib import TopologicalSorter
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 import numpy as np
 import zmq
-
-try:
-    from scipy.optimize import curve_fit
-except Exception:  # pragma: no cover - optional dependency at runtime
-    curve_fit = None  # type: ignore[assignment]
 
 from ..capabilities import capabilities_payload, method, param
 from ..shm.shm_ring import ShmRingReader, ShmRingWriter, now_mono_ns, now_wall_ns
@@ -34,6 +29,24 @@ from ..utils.yaml_helpers import load_yaml_file
 from ..utils.zmq_helpers import safe_json_loads
 from .manager_client_helper import ManagerClientHelper
 from .process_base import ManagedProcessBase
+from .stream_analysis_fit import (
+    FitCurve1DState,
+    _coerce_trace,
+    _gate_open,
+    _normalize_fit_param_name,
+    _normalize_float,
+    _normalize_int,
+    _validate_fit_curve_params,
+    _validate_fit_from_hist_params,
+    execute_fit_curve_1d,
+    execute_fit_from_hist_agg,
+    execute_fit_param,
+    execute_fit_params,
+    execute_fit_xhat,
+    execute_fit_xhat_dense,
+    execute_fit_yhat,
+    execute_fit_yhat_dense,
+)
 
 Json = dict[str, Any]
 SAMPLE_INDEX_INPUT_TOKEN = "__sample_index__"
@@ -311,7 +324,15 @@ class BinStatsState:
                 var = np.where(self.counts > 0, self.sums_sq / counts_f - mean * mean, np.nan)
                 var = np.where(var < 0, 0.0, var)
                 std = np.sqrt(var)
-                sem = np.where(self.counts > 0, std / np.sqrt(counts_f), np.nan)
+                # SEM is undefined for n<=1 (a single sample has no
+                # spread). Previously this returned 0 (std=0/sqrt(1)),
+                # which falsely communicated "perfectly known mean" to
+                # downstream consumers (UI error bars, fit weights).
+                # Return NaN so consumers can render "n/a" or skip the
+                # bin in weighted fits.
+                sem = np.where(
+                    self.counts > 1, std / np.sqrt(counts_f), np.nan
+                )
         else:
             mean = np.zeros(0, dtype=np.float64)
             std = np.zeros(0, dtype=np.float64)
@@ -637,7 +658,10 @@ class Bin2DStatsState:
             var = np.where(self.counts > 0, self.sums_sq / counts_f - mean * mean, np.nan)
             var = np.where(var < 0, 0.0, var)
             std = np.sqrt(var)
-            sem = np.where(self.counts > 0, std / np.sqrt(counts_f), np.nan)
+            # SEM is undefined for n<=1 — see the 1D BinStatsState.payload
+            # comment for rationale. Return NaN so consumers don't read
+            # a single-sample bin as a perfectly-known mean.
+            sem = np.where(self.counts > 1, std / np.sqrt(counts_f), np.nan)
             min_grid = np.where(self.counts > 0, self.mins, np.nan)
             max_grid = np.where(self.counts > 0, self.maxs, np.nan)
 
@@ -714,33 +738,6 @@ class TraceRollingMeanState:
         denom = max(1, len(self.traces))
         return self.sum_trace / float(denom)
 
-
-@dataclass
-class FitCurve1DState:
-    model: str
-    baseline_mode: str
-    every_n: int
-    sigma_y: float | None = None
-    dense_eval_points: int | None = None
-    sample_count: int = 0
-    last_fit: dict[str, Any] | None = None
-
-    @classmethod
-    def from_params(cls, params: Json) -> FitCurve1DState:
-        model, baseline_mode, every_n, sigma_y, dense_eval_points = (
-            _validate_fit_curve_params(params)
-        )
-        return cls(
-            model=model,
-            baseline_mode=baseline_mode,
-            every_n=every_n,
-            sigma_y=sigma_y,
-            dense_eval_points=dense_eval_points,
-        )
-
-    def reset(self) -> None:
-        self.sample_count = 0
-        self.last_fit = None
 
 
 OPS: dict[str, OpSpec] = {
@@ -1012,23 +1009,6 @@ def _normalize_id(raw: Any) -> str | None:
     return text or None
 
 
-def _normalize_int(raw: Any) -> int | None:
-    try:
-        return int(raw)
-    except Exception:
-        return None
-
-
-def _normalize_float(raw: Any) -> float | None:
-    try:
-        value = float(raw)
-    except Exception:
-        return None
-    if not math.isfinite(value):
-        return None
-    return value
-
-
 def _structured_record_to_dict(array: np.ndarray) -> dict[str, Any]:
     dtype = array.dtype
     names = dtype.names or ()
@@ -1069,22 +1049,6 @@ def _sanitize_json(value: Any) -> Any:
     if isinstance(value, dict):
         return {k: _sanitize_json(v) for k, v in value.items()}
     return value
-
-
-def _coerce_trace(trace_raw: Any) -> np.ndarray | None:
-    if trace_raw is None:
-        return None
-    arr = np.asarray(trace_raw)
-    if arr.ndim == 0:
-        arr = arr.reshape(1)
-    arr = arr.reshape(-1)
-    try:
-        arr = arr.astype(np.float64, copy=False)
-    except Exception:
-        return None
-    if arr.size <= 0:
-        return np.asarray([], dtype=np.float64)
-    return arr
 
 
 def _parse_trace_decimator(raw: Any) -> str:
@@ -1455,636 +1419,6 @@ def execute_scalar_threshold(
     return 1.0 if passed else 0.0
 
 
-def _parse_fit_model(raw: Any) -> str:
-    model = str(raw if raw is not None else "gaussian").strip().lower()
-    if model in {"gaussian", "lorentzian"}:
-        return model
-    raise ValueError("fit.curve_1d model must be one of gaussian, lorentzian")
-
-
-def _parse_fit_baseline_mode(raw: Any) -> str:
-    mode = str(raw if raw is not None else "none").strip().lower()
-    if mode in {"none", "constant", "linear"}:
-        return mode
-    raise ValueError("fit.curve_1d baseline_mode must be one of none, constant, linear")
-
-
-def _validate_fit_curve_params(
-    params: Json,
-) -> tuple[str, str, int, float | None, int | None]:
-    model = _parse_fit_model(params.get("model"))
-    baseline_mode = _parse_fit_baseline_mode(params.get("baseline_mode"))
-    every_n = _normalize_int(params.get("every_n"))
-    if every_n is None:
-        every_n = 1
-    if every_n <= 0:
-        raise ValueError("fit.curve_1d requires every_n >= 1")
-    sigma_y = _normalize_float(params.get("sigma_y"))
-    if sigma_y is not None and sigma_y <= 0:
-        raise ValueError("fit.curve_1d requires sigma_y > 0 when provided")
-    dense_eval_points = _normalize_int(params.get("dense_eval_points"))
-    if dense_eval_points is not None and dense_eval_points < 2:
-        raise ValueError("fit.curve_1d requires dense_eval_points >= 2 when provided")
-    return model, baseline_mode, int(every_n), sigma_y, dense_eval_points
-
-
-def _fit_curve_build_models(
-    *,
-    model: str,
-    baseline_mode: str,
-) -> tuple[Any, Any, list[str]]:
-    def _model_gaussian(x: np.ndarray, amp: float, center: float, sigma: float) -> np.ndarray:
-        sigma_eff = max(abs(float(sigma)), 1e-18)
-        z = (x - float(center)) / sigma_eff
-        return float(amp) * np.exp(-0.5 * z * z)
-
-    def _model_lorentzian(x: np.ndarray, amp: float, center: float, gamma: float) -> np.ndarray:
-        gamma_eff = max(abs(float(gamma)), 1e-18)
-        d = x - float(center)
-        return float(amp) * (gamma_eff * gamma_eff) / (d * d + gamma_eff * gamma_eff)
-
-    if model == "gaussian":
-        core = _model_gaussian
-        names = ["amplitude", "center", "sigma"]
-    else:
-        core = _model_lorentzian
-        names = ["amplitude", "center", "gamma"]
-
-    if baseline_mode == "none":
-        return core, core, names
-
-    if baseline_mode == "constant":
-        def func(x: np.ndarray, *p: float) -> np.ndarray:
-            return core(x, float(p[0]), float(p[1]), float(p[2])) + float(p[3])
-
-        return func, func, names + ["baseline_const"]
-
-    def func(x: np.ndarray, *p: float) -> np.ndarray:
-        return (
-            core(x, float(p[0]), float(p[1]), float(p[2]))
-            + float(p[3])
-            + float(p[4]) * x
-        )
-
-    return func, func, names + ["baseline_const", "baseline_slope"]
-
-
-def _fit_curve_initial_guess(
-    *,
-    x: np.ndarray,
-    y: np.ndarray,
-    model: str,
-    baseline_mode: str,
-) -> np.ndarray:
-    x_min = float(np.min(x))
-    x_max = float(np.max(x))
-    span = max(x_max - x_min, 1e-12)
-    y_med = float(np.median(y))
-    y_max = float(np.max(y))
-    y_min = float(np.min(y))
-    amp_guess = y_max - y_med
-    if abs(amp_guess) < 1e-12:
-        amp_guess = y_max - y_min
-    if abs(amp_guess) < 1e-12:
-        amp_guess = float(np.max(np.abs(y))) if y.size > 0 else 1.0
-    if abs(amp_guess) < 1e-12:
-        amp_guess = 1.0
-    center_guess = float(x[int(np.argmax(y))])
-    width_guess = span / 8.0 if model == "gaussian" else span / 10.0
-    width_guess = max(width_guess, 1e-9)
-    if baseline_mode == "none":
-        return np.asarray([amp_guess, center_guess, width_guess], dtype=np.float64)
-    if baseline_mode == "constant":
-        return np.asarray([amp_guess, center_guess, width_guess, y_med], dtype=np.float64)
-    slope_guess = (float(y[-1]) - float(y[0])) / span if y.size >= 2 else 0.0
-    return np.asarray(
-        [amp_guess, center_guess, width_guess, y_med, slope_guess], dtype=np.float64
-    )
-
-
-def _fit_curve_prepare_xy(
-    *, x_raw: Any, y_raw: Any
-) -> tuple[np.ndarray, np.ndarray] | None:
-    x = _coerce_trace(x_raw)
-    y = _coerce_trace(y_raw)
-    if x is None or y is None:
-        return None
-    if int(x.size) != int(y.size):
-        return None
-    if int(x.size) < 4:
-        return None
-    x_arr = np.asarray(x, dtype=np.float64).reshape(-1)
-    y_arr = np.asarray(y, dtype=np.float64).reshape(-1)
-    mask = np.isfinite(x_arr) & np.isfinite(y_arr)
-    if not np.any(mask):
-        return None
-    x_arr = x_arr[mask]
-    y_arr = y_arr[mask]
-    if int(x_arr.size) < 4:
-        return None
-    return x_arr, y_arr
-
-
-def _fit_curve_dense_eval(
-    *,
-    eval_func: Callable[..., np.ndarray],
-    popt: np.ndarray,
-    x: np.ndarray,
-    dense_eval_points: int | None,
-) -> tuple[np.ndarray | None, np.ndarray | None]:
-    if dense_eval_points is None or dense_eval_points < 2:
-        return None, None
-    x_dense = np.linspace(
-        float(np.min(x)),
-        float(np.max(x)),
-        int(dense_eval_points),
-        dtype=np.float64,
-    )
-    yhat_dense = np.asarray(eval_func(x_dense, *popt), dtype=np.float64).reshape(-1)
-    return x_dense, yhat_dense
-
-
-def _fit_curve_param_stderr(
-    *, pcov: Any, param_names: list[str]
-) -> dict[str, float]:
-    stderr: dict[str, float] = {}
-    if not isinstance(pcov, np.ndarray) or pcov.ndim != 2:
-        return stderr
-    diag = np.diag(pcov)
-    for i, name in enumerate(param_names):
-        if i >= int(diag.size):
-            break
-        var = float(diag[i])
-        if math.isfinite(var) and var >= 0.0:
-            stderr[name] = float(math.sqrt(var))
-    return stderr
-
-
-def _fit_curve_reduced_chi2(
-    *,
-    y: np.ndarray,
-    yhat: np.ndarray,
-    param_count: int,
-    sigma_y: float | None,
-    sigma_trace_raw: Any,
-) -> float | None:
-    if y.size <= 0 or y.size != yhat.size:
-        return None
-    dof = int(y.size) - int(param_count)
-    if dof <= 0:
-        return None
-    resid = y - yhat
-    sigma_vec: np.ndarray | None = None
-    sigma_trace = _coerce_trace(sigma_trace_raw)
-    if sigma_trace is not None and int(sigma_trace.size) == int(y.size):
-        sigma_vec = np.asarray(sigma_trace, dtype=np.float64).reshape(-1)
-    elif sigma_y is not None and sigma_y > 0:
-        sigma_vec = np.full(int(y.size), float(sigma_y), dtype=np.float64)
-    if sigma_vec is None:
-        return None
-    valid = np.isfinite(sigma_vec) & (sigma_vec > 0)
-    if not np.any(valid):
-        return None
-    w_resid = resid[valid] / sigma_vec[valid]
-    if w_resid.size <= 0:
-        return None
-    chi2 = float(np.sum(w_resid * w_resid, dtype=np.float64))
-    if not math.isfinite(chi2):
-        return None
-    return float(chi2 / float(dof))
-
-
-def _fit_curve_run(
-    *,
-    x_raw: Any,
-    y_raw: Any,
-    model: str,
-    baseline_mode: str,
-    sigma_y: float | None = None,
-    sigma_trace_raw: Any = None,
-    dense_eval_points: int | None = None,
-) -> dict[str, Any] | None:
-    xy = _fit_curve_prepare_xy(x_raw=x_raw, y_raw=y_raw)
-    if xy is None:
-        return None
-    x, y = xy
-    if curve_fit is None:
-        return None
-
-    fit_func, eval_func, param_names = _fit_curve_build_models(
-        model=model,
-        baseline_mode=baseline_mode,
-    )
-    p0 = _fit_curve_initial_guess(
-        x=x,
-        y=y,
-        model=model,
-        baseline_mode=baseline_mode,
-    )
-    try:
-        popt, pcov = curve_fit(fit_func, x, y, p0=p0, maxfev=8000)
-    except Exception:
-        return None
-    yhat = np.asarray(eval_func(x, *popt), dtype=np.float64).reshape(-1)
-    x_dense, yhat_dense = _fit_curve_dense_eval(
-        eval_func=eval_func,
-        popt=popt,
-        x=x,
-        dense_eval_points=dense_eval_points,
-    )
-    params = {
-        name: float(val)
-        for name, val in zip(param_names, popt.tolist(), strict=False)
-    }
-    stderr = _fit_curve_param_stderr(pcov=pcov, param_names=param_names)
-    # Reduced chi^2 is only meaningful when a noise scale is available.
-    reduced_chi2 = _fit_curve_reduced_chi2(
-        y=y,
-        yhat=yhat,
-        param_count=len(param_names),
-        sigma_y=sigma_y,
-        sigma_trace_raw=sigma_trace_raw,
-    )
-    if reduced_chi2 is not None:
-        params["reduced_chi2"] = reduced_chi2
-    params["model"] = model
-    params["baseline_mode"] = baseline_mode
-    out: dict[str, Any] = {
-        "x": x,
-        "yhat": yhat,
-        "params": params,
-        "stderr": stderr,
-    }
-    if x_dense is not None and yhat_dense is not None and x_dense.size == yhat_dense.size:
-        out["x_dense"] = x_dense
-        out["yhat_dense"] = yhat_dense
-    return out
-
-
-def execute_fit_curve_1d(
-    *,
-    state: FitCurve1DState,
-    x_raw: Any,
-    y_raw: Any,
-    gate_raw: Any,
-) -> dict[str, Any] | None:
-    if not _gate_open(gate_raw, default=True):
-        return state.last_fit
-    state.sample_count += 1
-    every_n = max(1, int(state.every_n))
-    should_fit = state.sample_count == 1 or (state.sample_count % every_n == 0)
-    if not should_fit:
-        return state.last_fit
-    fit_result = _fit_curve_run(
-        x_raw=x_raw,
-        y_raw=y_raw,
-        model=state.model,
-        baseline_mode=state.baseline_mode,
-        sigma_y=state.sigma_y,
-        dense_eval_points=state.dense_eval_points,
-    )
-    if fit_result is not None:
-        state.last_fit = fit_result
-    return state.last_fit
-
-
-def execute_fit_yhat(fit_raw: Any) -> np.ndarray | None:
-    if not isinstance(fit_raw, dict):
-        return None
-    return _coerce_trace(fit_raw.get("yhat"))
-
-
-def execute_fit_xhat(fit_raw: Any) -> np.ndarray | None:
-    if not isinstance(fit_raw, dict):
-        return None
-    return _coerce_trace(fit_raw.get("x"))
-
-
-def execute_fit_yhat_dense(fit_raw: Any) -> np.ndarray | None:
-    if not isinstance(fit_raw, dict):
-        return None
-    return _coerce_trace(fit_raw.get("yhat_dense"))
-
-
-def execute_fit_xhat_dense(fit_raw: Any) -> np.ndarray | None:
-    if not isinstance(fit_raw, dict):
-        return None
-    return _coerce_trace(fit_raw.get("x_dense"))
-
-
-def _normalize_fit_param_name(raw: Any) -> str:
-    text = str(raw if raw is not None else "center").strip().lower()
-    aliases = {
-        "amp": "amplitude",
-        "a": "amplitude",
-        "mu": "center",
-        "x0": "center",
-        "sigma": "sigma",
-        "gamma": "gamma",
-        "width": "width",
-        "fwhm": "fwhm",
-        "baseline": "baseline_const",
-        "offset": "baseline_const",
-        "slope": "baseline_slope",
-    }
-    return aliases.get(text, text)
-
-
-def execute_fit_param(fit_raw: Any, params: Json) -> float | None:
-    if not isinstance(fit_raw, dict):
-        return None
-    field = str(params.get("field", "value")).strip().lower()
-    if field in {"", "value"}:
-        fit_params = fit_raw.get("params")
-    elif field in {"stderr", "error", "std_err", "stddev"}:
-        fit_params = fit_raw.get("stderr")
-    else:
-        return None
-    if not isinstance(fit_params, dict):
-        return None
-    name = _normalize_fit_param_name(params.get("name", "center"))
-    return _normalize_float(fit_params.get(name))
-
-
-def execute_fit_params(fit_raw: Any) -> dict[str, dict[str, float | None]] | None:
-    if not isinstance(fit_raw, dict):
-        return None
-    params_raw = fit_raw.get("params")
-    stderr_raw = fit_raw.get("stderr")
-    params_map_raw = params_raw if isinstance(params_raw, dict) else None
-    stderr_map_raw = stderr_raw if isinstance(stderr_raw, dict) else None
-    if params_map_raw is None and stderr_map_raw is None:
-        return None
-    params_map = (
-        {str(key): value for key, value in params_map_raw.items()}
-        if params_map_raw is not None
-        else None
-    )
-    stderr_map = (
-        {str(key): value for key, value in stderr_map_raw.items()}
-        if stderr_map_raw is not None
-        else None
-    )
-    keys: set[str] = set()
-    if params_map is not None:
-        keys.update(params_map.keys())
-    if stderr_map is not None:
-        keys.update(stderr_map.keys())
-    out: dict[str, dict[str, float | None]] = {}
-    for key in sorted(keys):
-        if not key:
-            continue
-        value = (
-            _normalize_float(params_map.get(key))
-            if params_map is not None
-            else None
-        )
-        stderr = (
-            _normalize_float(stderr_map.get(key))
-            if stderr_map is not None
-            else None
-        )
-        if value is None and stderr is None:
-            continue
-        out[key] = {
-            "value": float(value) if value is not None else None,
-            "stderr": float(stderr) if stderr is not None else None,
-        }
-    return out or None
-
-
-def _parse_fit_hist_y_source(raw: Any) -> str:
-    source = str(raw if raw is not None else "mean").strip().lower()
-    if source in {"mean", "std", "sem", "count"}:
-        return source
-    raise ValueError("fit.from_hist_agg y_source must be one of mean, std, sem, count")
-
-
-def _parse_fit_hist_sigma_source(raw: Any) -> str:
-    source = str(raw if raw is not None else "sem").strip().lower()
-    if source in {"sem", "std", "none"}:
-        return source
-    raise ValueError("fit.from_hist_agg chi2_sigma_source must be one of sem, std, none")
-
-
-def _validate_fit_from_hist_params(
-    params: Json,
-) -> tuple[
-    str,
-    str,
-    int,
-    float | None,
-    int | None,
-    str,
-    str,
-    int,
-    float | None,
-    float | None,
-]:
-    model, baseline_mode, every_n, _sigma_y, dense_eval_points = (
-        _validate_fit_curve_params(params)
-    )
-    y_source = _parse_fit_hist_y_source(params.get("y_source", "mean"))
-    chi2_sigma_source = _parse_fit_hist_sigma_source(
-        params.get("chi2_sigma_source", "sem")
-    )
-    min_count = _normalize_int(params.get("min_count"))
-    if min_count is None:
-        min_count = 1
-    if min_count < 0:
-        raise ValueError("fit.from_hist_agg requires min_count >= 0")
-    x_min = _normalize_float(params.get("x_min"))
-    x_max = _normalize_float(params.get("x_max"))
-    if x_min is not None and x_max is not None and not (x_max > x_min):
-        raise ValueError("fit.from_hist_agg requires x_max > x_min when both are set")
-    return (
-        model,
-        baseline_mode,
-        every_n,
-        _sigma_y,
-        dense_eval_points,
-        y_source,
-        chi2_sigma_source,
-        int(min_count),
-        x_min,
-        x_max,
-    )
-
-
-def _hist_agg_to_xy(
-    hist_raw: Any,
-    *,
-    y_source: str,
-    chi2_sigma_source: str,
-    min_count: int,
-    x_min: float | None,
-    x_max: float | None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray | None] | None:
-    if not isinstance(hist_raw, dict):
-        return None
-    x_raw = hist_raw.get("x_bins")
-    y_raw = hist_raw.get(y_source)
-    c_raw = hist_raw.get("count")
-    sigma_raw = _hist_agg_sigma_source(hist_raw, chi2_sigma_source=chi2_sigma_source)
-    if not isinstance(x_raw, list) or not isinstance(y_raw, list) or not isinstance(c_raw, list):
-        return None
-    n = min(len(x_raw), len(y_raw), len(c_raw))
-    if n <= 0:
-        return None
-    x_vals: list[float] = []
-    y_vals: list[float] = []
-    sigma_vals: list[float] = [] if chi2_sigma_source != "none" else []
-    for i in range(n):
-        row = _hist_agg_parse_row(
-            x_raw=x_raw,
-            y_raw=y_raw,
-            c_raw=c_raw,
-            sigma_raw=sigma_raw,
-            index=i,
-            chi2_sigma_source=chi2_sigma_source,
-            min_count=min_count,
-            x_min=x_min,
-            x_max=x_max,
-        )
-        if row is None:
-            continue
-        x_value, y_value, sigma_value = row
-        x_vals.append(x_value)
-        y_vals.append(y_value)
-        if sigma_value is not None:
-            sigma_vals.append(sigma_value)
-    if len(x_vals) < 4:
-        return None
-    x_arr, y_arr, order = _hist_agg_sorted_xy(x_vals=x_vals, y_vals=y_vals)
-    sigma_arr: np.ndarray | None = None
-    if chi2_sigma_source != "none":
-        sigma_arr = np.asarray(sigma_vals, dtype=np.float64)[order]
-    return x_arr, y_arr, sigma_arr
-
-
-def _hist_agg_sigma_source(
-    hist_raw: dict[str, Any],
-    *,
-    chi2_sigma_source: str,
-) -> Any:
-    if chi2_sigma_source not in {"sem", "std"}:
-        return None
-    return hist_raw.get(chi2_sigma_source)
-
-
-def _hist_agg_parse_row(
-    *,
-    x_raw: list[Any],
-    y_raw: list[Any],
-    c_raw: list[Any],
-    sigma_raw: Any,
-    index: int,
-    chi2_sigma_source: str,
-    min_count: int,
-    x_min: float | None,
-    x_max: float | None,
-) -> tuple[float, float, float | None] | None:
-    x = _normalize_float(x_raw[index])
-    y = _normalize_float(y_raw[index])
-    c = _normalize_float(c_raw[index])
-    if x is None or y is None or c is None:
-        return None
-    if int(c) < int(min_count):
-        return None
-    if x_min is not None and x < x_min:
-        return None
-    if x_max is not None and x > x_max:
-        return None
-    sigma = _hist_agg_parse_sigma_at(
-        sigma_raw=sigma_raw,
-        index=index,
-        chi2_sigma_source=chi2_sigma_source,
-    )
-    if chi2_sigma_source != "none" and sigma is None:
-        return None
-    return float(x), float(y), sigma
-
-
-def _hist_agg_parse_sigma_at(
-    *,
-    sigma_raw: Any,
-    index: int,
-    chi2_sigma_source: str,
-) -> float | None:
-    if chi2_sigma_source == "none":
-        return None
-    if not isinstance(sigma_raw, list) or index >= len(sigma_raw):
-        return None
-    sigma = _normalize_float(sigma_raw[index])
-    if sigma is None or sigma <= 0:
-        return None
-    return float(sigma)
-
-
-def _hist_agg_sorted_xy(
-    *,
-    x_vals: list[float],
-    y_vals: list[float],
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    x_arr = np.asarray(x_vals, dtype=np.float64)
-    y_arr = np.asarray(y_vals, dtype=np.float64)
-    order = np.argsort(x_arr)
-    return x_arr[order], y_arr[order], order
-
-
-def execute_fit_from_hist_agg(
-    *,
-    state: FitCurve1DState,
-    hist_raw: Any,
-    gate_raw: Any,
-    y_source: str,
-    chi2_sigma_source: str,
-    min_count: int,
-    x_min: float | None,
-    x_max: float | None,
-) -> dict[str, Any] | None:
-    if not _gate_open(gate_raw, default=True):
-        return state.last_fit
-    state.sample_count += 1
-    every_n = max(1, int(state.every_n))
-    should_fit = state.sample_count == 1 or (state.sample_count % every_n == 0)
-    if not should_fit:
-        return state.last_fit
-    xy = _hist_agg_to_xy(
-        hist_raw,
-        y_source=y_source,
-        chi2_sigma_source=chi2_sigma_source,
-        min_count=min_count,
-        x_min=x_min,
-        x_max=x_max,
-    )
-    if xy is None:
-        return state.last_fit
-    x_arr, y_arr, sigma_arr = xy
-    fit_result = _fit_curve_run(
-        x_raw=x_arr,
-        y_raw=y_arr,
-        model=state.model,
-        baseline_mode=state.baseline_mode,
-        sigma_y=state.sigma_y,
-        sigma_trace_raw=sigma_arr,
-        dense_eval_points=state.dense_eval_points,
-    )
-    if fit_result is not None:
-        state.last_fit = fit_result
-    return state.last_fit
-
-
-def _gate_open(gate_raw: Any, *, default: bool = True) -> bool:
-    if gate_raw is None:
-        return bool(default)
-    if isinstance(gate_raw, bool):
-        return gate_raw
-    gate = _normalize_float(gate_raw)
-    if gate is None:
-        return False
-    return bool(gate != 0.0)
-
 
 def _node_signature(op: str) -> OpSpec:
     if op not in OPS:
@@ -2318,6 +1652,7 @@ def _validate_source_telemetry_nearest_node(node: NodeSpec) -> None:
 
 
 def _validate_node_scalar_threshold(
+    *,
     node: NodeSpec,
     source_stream_nodes: list[str],
 ) -> None:
@@ -2326,6 +1661,7 @@ def _validate_node_scalar_threshold(
 
 
 def _validate_node_trace_rolling_mean(
+    *,
     node: NodeSpec,
     source_stream_nodes: list[str],
 ) -> None:
@@ -2334,6 +1670,7 @@ def _validate_node_trace_rolling_mean(
 
 
 def _validate_node_trace_decimate(
+    *,
     node: NodeSpec,
     source_stream_nodes: list[str],
 ) -> None:
@@ -2342,6 +1679,7 @@ def _validate_node_trace_decimate(
 
 
 def _validate_node_fit_curve_1d(
+    *,
     node: NodeSpec,
     source_stream_nodes: list[str],
 ) -> None:
@@ -2350,6 +1688,7 @@ def _validate_node_fit_curve_1d(
 
 
 def _validate_node_fit_from_hist(
+    *,
     node: NodeSpec,
     source_stream_nodes: list[str],
 ) -> None:
@@ -2358,6 +1697,7 @@ def _validate_node_fit_from_hist(
 
 
 def _validate_node_fit_param(
+    *,
     node: NodeSpec,
     source_stream_nodes: list[str],
 ) -> None:
@@ -2366,6 +1706,7 @@ def _validate_node_fit_param(
 
 
 def _validate_node_aggregate_bin_stats(
+    *,
     node: NodeSpec,
     source_stream_nodes: list[str],
 ) -> None:
@@ -2374,6 +1715,7 @@ def _validate_node_aggregate_bin_stats(
 
 
 def _validate_node_aggregate_bin2d_stats(
+    *,
     node: NodeSpec,
     source_stream_nodes: list[str],
 ) -> None:
@@ -2382,6 +1724,7 @@ def _validate_node_aggregate_bin2d_stats(
 
 
 def _validate_node_source_context_field(
+    *,
     node: NodeSpec,
     source_stream_nodes: list[str],
 ) -> None:
@@ -2390,6 +1733,7 @@ def _validate_node_source_context_field(
 
 
 def _validate_node_source_telemetry_nearest(
+    *,
     node: NodeSpec,
     source_stream_nodes: list[str],
 ) -> None:
@@ -2398,6 +1742,7 @@ def _validate_node_source_telemetry_nearest(
 
 
 def _validate_node_record_field(
+    *,
     node: NodeSpec,
     source_stream_nodes: list[str],
 ) -> None:
@@ -2408,6 +1753,7 @@ def _validate_node_record_field(
 
 
 def _validate_node_record_filter_eq(
+    *,
     node: NodeSpec,
     source_stream_nodes: list[str],
 ) -> None:
@@ -2417,7 +1763,16 @@ def _validate_node_record_filter_eq(
         raise ValueError(f"node {node.node_id!r} {node.op} requires field")
 
 
-_NODE_OP_PARAM_VALIDATORS: dict[str, Callable[[NodeSpec, list[str]], None]] = {
+# All validators take node + source_stream_nodes as keyword-only args.
+# The Protocol below documents the exact signature so the dict's value
+# type matches what's actually invoked at the call site (kwargs).
+class _NodeValidator(Protocol):
+    def __call__(
+        self, *, node: NodeSpec, source_stream_nodes: list[str]
+    ) -> None: ...
+
+
+_NODE_OP_PARAM_VALIDATORS: dict[str, _NodeValidator] = {
     "source.stream": _validate_source_stream_node,
     "source.records": _validate_source_records_node,
     "source.context_field": _validate_node_source_context_field,
@@ -2528,12 +1883,10 @@ def _prune_unreachable_nodes(
     queue: list[str] = [out.node_id for out in outputs] + [source_stream_node_id]
     while queue:
         node_id = queue.pop()
-        if node_id in reachable:
-            # Already visited; but we still want to add the seed output
-            # node_ids on first sight, so seed via the conditional below.
-            pass
-        if node_id not in reachable:
-            reachable.add(node_id)
+        # `reachable` is a set so `add` is a no-op for already-visited
+        # nodes; the `dep not in reachable` guard below keeps us from
+        # re-enqueuing them, so the walk still terminates.
+        reachable.add(node_id)
         for dep in deps.get(node_id, ()):  # type: ignore[arg-type]
             if dep not in reachable:
                 queue.append(dep)
@@ -5154,16 +4507,16 @@ class StreamAnalysisProcess(ManagedProcessBase):
         return self._with_common_capabilities(members)
 
     def _rpc_stream_analysis_capabilities(self, req: Json) -> Json:
-        return self._rpc_ok(req, result=capabilities_payload(self._stream_analysis_capability_members()))
+        return self.rpc_ok(req, result=capabilities_payload(self._stream_analysis_capability_members()))
 
     def _rpc_stream_analysis_status(self, req: Json) -> Json:
-        return self._rpc_ok(req, result=self._status_payload())
+        return self.rpc_ok(req, result=self._status_payload())
 
     def _rpc_stream_analysis_operators(self, req: Json) -> Json:
-        return self._rpc_ok(req, result={"operators": operator_catalog_payload()})
+        return self.rpc_ok(req, result={"operators": operator_catalog_payload()})
 
     def _rpc_stream_analysis_workspace_list(self, req: Json) -> Json:
-        return self._rpc_ok(
+        return self.rpc_ok(
             req,
             result={
                 "workspaces": [
@@ -5174,19 +4527,19 @@ class StreamAnalysisProcess(ManagedProcessBase):
         )
 
     def _rpc_stream_analysis_workspace_store_status(self, req: Json) -> Json:
-        return self._rpc_ok(req, result=self._workspace_store_status_payload())
+        return self.rpc_ok(req, result=self._workspace_store_status_payload())
 
     def _rpc_stream_analysis_workspace_get(self, req: Json) -> Json:
         params = req.get("params", {}) or {}
         if not isinstance(params, dict):
-            return self._rpc_invalid_params(req, message="params must be a dict")
+            return self.rpc_invalid_params(req, message="params must be a dict")
         workspace_id = _normalize_id(params.get("workspace_id"))
         if workspace_id is None:
-            return self._rpc_invalid_params(req, message="workspace_id is required")
+            return self.rpc_invalid_params(req, message="workspace_id is required")
         workspace = self._workspaces.get(workspace_id)
         if workspace is None:
-            return self._rpc_err(req, code="unknown_workspace")
-        return self._rpc_ok(
+            return self.rpc_err(req, code="unknown_workspace")
+        return self.rpc_ok(
             req,
             result={
                 "workspace": self._workspace_summary(workspace),
@@ -5197,54 +4550,54 @@ class StreamAnalysisProcess(ManagedProcessBase):
     def _rpc_stream_analysis_workspace_snapshot(self, req: Json) -> Json:
         params = req.get("params", {}) or {}
         if not isinstance(params, dict):
-            return self._rpc_invalid_params(req, message="params must be a dict")
+            return self.rpc_invalid_params(req, message="params must be a dict")
         try:
             snapshot = self._workspace_snapshot_payload(params)
         except ValueError as exc:
-            return self._rpc_invalid_params(req, message=str(exc))
+            return self.rpc_invalid_params(req, message=str(exc))
         except KeyError:
-            return self._rpc_err(req, code="unknown_workspace")
-        return self._rpc_ok(req, result=snapshot)
+            return self.rpc_err(req, code="unknown_workspace")
+        return self.rpc_ok(req, result=snapshot)
 
     def _rpc_stream_analysis_workspace_validate(self, req: Json) -> Json:
         params = req.get("params", {}) or {}
         if not isinstance(params, dict):
-            return self._rpc_invalid_params(req, message="params must be a dict")
+            return self.rpc_invalid_params(req, message="params must be a dict")
         result = self._handle_workspace_validate(params)
         if not result.get("ok"):
-            return self._rpc_err(
+            return self.rpc_err(
                 req,
                 code=str((result.get("error") or {}).get("code") or "validation_failed"),
                 message=(result.get("error") or {}).get("message"),
             )
-        return self._rpc_ok(req, result=result.get("result"))
+        return self.rpc_ok(req, result=result.get("result"))
 
     def _rpc_stream_analysis_workspace_put(self, req: Json) -> Json:
         params = req.get("params", {}) or {}
         if not isinstance(params, dict):
-            return self._rpc_invalid_params(req, message="params must be a dict")
+            return self.rpc_invalid_params(req, message="params must be a dict")
         result = self._handle_workspace_put(params)
         if not result.get("ok"):
-            return self._rpc_err(
+            return self.rpc_err(
                 req,
                 code=str((result.get("error") or {}).get("code") or "put_failed"),
                 message=(result.get("error") or {}).get("message"),
             )
-        return self._rpc_ok(req, result=result.get("result"))
+        return self.rpc_ok(req, result=result.get("result"))
 
     def _rpc_stream_analysis_workspace_delete(self, req: Json) -> Json:
         params = req.get("params", {}) or {}
         if not isinstance(params, dict):
-            return self._rpc_invalid_params(req, message="params must be a dict")
+            return self.rpc_invalid_params(req, message="params must be a dict")
         workspace_id = _normalize_id(params.get("workspace_id"))
         if workspace_id is None:
-            return self._rpc_invalid_params(req, message="workspace_id is required")
+            return self.rpc_invalid_params(req, message="workspace_id is required")
         expected_raw = params.get("expected_revision")
         expected_revision: int | None = None
         if expected_raw is not None:
             expected_revision = _normalize_int(expected_raw)
             if expected_revision is None or expected_revision < 0:
-                return self._rpc_invalid_params(
+                return self.rpc_invalid_params(
                     req,
                     message="expected_revision must be a non-negative integer",
                 )
@@ -5255,47 +4608,47 @@ class StreamAnalysisProcess(ManagedProcessBase):
             publish=True,
         )
         if not removed:
-            return self._rpc_err(req, code="unknown_workspace")
-        return self._rpc_ok(req, result={"workspace_id": workspace_id, "deleted": True})
+            return self.rpc_err(req, code="unknown_workspace")
+        return self.rpc_ok(req, result={"workspace_id": workspace_id, "deleted": True})
 
     def _rpc_stream_analysis_workspace_reset(self, req: Json) -> Json:
         params = req.get("params", {}) or {}
         if not isinstance(params, dict):
-            return self._rpc_invalid_params(req, message="params must be a dict")
+            return self.rpc_invalid_params(req, message="params must be a dict")
         workspace_id = _normalize_id(params.get("workspace_id"))
         node_id = _normalize_id(params.get("node_id"))
         if workspace_id is None:
             if node_id is not None:
-                return self._rpc_invalid_params(
+                return self.rpc_invalid_params(
                     req, message="node_id requires workspace_id"
                 )
             for workspace in self._workspaces.values():
                 self._reset_workspace_states(workspace)
             self._latest_output_payloads.clear()
-            return self._rpc_ok(req, result={"reset": "all", "count": len(self._workspaces)})
+            return self.rpc_ok(req, result={"reset": "all", "count": len(self._workspaces)})
         workspace = self._workspaces.get(workspace_id)
         if workspace is None:
-            return self._rpc_err(req, code="unknown_workspace")
+            return self.rpc_err(req, code="unknown_workspace")
         if node_id is not None:
             ok = self._reset_workspace_node_state(workspace, node_id)
             if not ok:
-                return self._rpc_err(req, code="unknown_or_non_stateful_node")
+                return self.rpc_err(req, code="unknown_or_non_stateful_node")
             self._clear_workspace_snapshot_outputs(workspace_id, node_id=node_id)
-            return self._rpc_ok(req, result={"reset": workspace_id, "node_id": node_id})
+            return self.rpc_ok(req, result={"reset": workspace_id, "node_id": node_id})
         self._reset_workspace_states(workspace)
         self._clear_workspace_snapshot_outputs(workspace_id)
-        return self._rpc_ok(req, result={"reset": workspace_id})
+        return self.rpc_ok(req, result={"reset": workspace_id})
 
     def _rpc_stream_analysis_workspace_clear(self, req: Json) -> Json:
         removed = self._clear_workspaces(mark_dirty=True, publish=True)
-        return self._rpc_ok(req, result={"removed": removed})
+        return self.rpc_ok(req, result={"removed": removed})
 
     def _rpc_stream_analysis_workspace_store_save(self, req: Json) -> Json:
         params = req.get("params", {}) or {}
         if not isinstance(params, dict):
-            return self._rpc_invalid_params(req, message="params must be a dict")
+            return self.rpc_invalid_params(req, message="params must be a dict")
         saved = self._save_workspace_store(path_override=params.get("path"))
-        return self._rpc_ok(
+        return self.rpc_ok(
             req,
             result={**saved, "status": self._workspace_store_status_payload()},
         )
@@ -5303,12 +4656,12 @@ class StreamAnalysisProcess(ManagedProcessBase):
     def _rpc_stream_analysis_workspace_store_reload(self, req: Json) -> Json:
         params = req.get("params", {}) or {}
         if not isinstance(params, dict):
-            return self._rpc_invalid_params(req, message="params must be a dict")
+            return self.rpc_invalid_params(req, message="params must be a dict")
         override = self._normalize_workspace_store_path(params.get("path"))
         if override is not None:
             self._workspace_store_path = override
         reloaded = self._reload_workspace_store(strict_missing=True)
-        return self._rpc_ok(
+        return self.rpc_ok(
             req,
             result={**reloaded, "status": self._workspace_store_status_payload()},
         )
@@ -5365,13 +4718,13 @@ class StreamAnalysisProcess(ManagedProcessBase):
                 else None
             )
             if isinstance(exc, FileNotFoundError):
-                return self._rpc_err(
+                return self.rpc_err(
                     req,
                     code="workspace_store_not_found",
                     message=str(exc),
                 )
             if isinstance(exc, ValueError) and "workspace_store_path" in str(exc):
-                return self._rpc_err(
+                return self.rpc_err(
                     req,
                     code="workspace_store_not_configured",
                     message=str(exc),
@@ -5381,7 +4734,7 @@ class StreamAnalysisProcess(ManagedProcessBase):
                 code="rpc_error",
                 message=str(exc),
             )
-            return self._rpc_err(req, code="rpc_error", message=str(exc))
+            return self.rpc_err(req, code="rpc_error", message=str(exc))
 
     def _handle_rpc(self, req: Json) -> Json:
         common = self._handle_common_rpc(req)
@@ -5399,10 +4752,10 @@ class StreamAnalysisProcess(ManagedProcessBase):
         dispatched = self._dispatch_rpc_with_error_mapping(req, params)
         if dispatched is not None:
             return dispatched
-        return self._rpc_unknown(req)
+        return self.rpc_unknown(req)
 
     def _handle_rpc_legacy(self, req: Json) -> Json:
-        return self._rpc_unknown(req)
+        return self.rpc_unknown(req)
 
     def run(self) -> None:
         self._stop_evt.clear()
