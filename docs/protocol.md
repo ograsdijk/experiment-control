@@ -707,7 +707,15 @@ Response:
   - `device_id`: str
   - `seq`: int
   - `ts`: {`t_wall`: float, `t_mono`: float}
-  - `signals`: dict of signal → {`value`, `units`, `quality`, `ts`}
+  - `signals`: dict of signal → {`value`, `units`, `quality`, `ts`, `error?`}
+    - `error` (optional, str): present on BAD signals when the
+      cause is a runtime exception from the driver. Truncated to
+      ≤200 chars. Absent on OK / MISSING / STALE signals.
+  - `call_errors` (optional, dict[str, str]): per-call exception summaries
+    keyed by the telemetry call's `method` name. Present iff at least one
+    telemetry call raised this tick. Values are `repr(exception)` truncated
+    to ≤200 chars. When `read_telemetry` itself raises (rare), the key is
+    the synthetic placeholder `"<read_telemetry>"`.
 
 ### `{device_id}/chunk_ready`
 - Producer: driver
@@ -736,7 +744,10 @@ Response:
   - `device_id`: str
   - `seq`: int
   - `ts`: {`t_wall`, `t_mono`}
-  - `signals`: dict of signal → {`value`, `units`, `quality`, `ts`}
+  - `signals`: dict of signal → {`value`, `units`, `quality`, `ts`, `error?`}
+  - `call_errors` (optional, dict[str, str]): forwarded verbatim from the
+    driver's `{device_id}/telemetry` payload when present. See the driver
+    topic above for shape/contents.
 
 ### `manager.heartbeat`
 - Producer: manager

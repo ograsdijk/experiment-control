@@ -11,7 +11,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from graphlib import TopologicalSorter
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 import numpy as np
 import zmq
@@ -2329,6 +2329,7 @@ def _validate_source_telemetry_nearest_node(node: NodeSpec) -> None:
 
 
 def _validate_node_scalar_threshold(
+    *,
     node: NodeSpec,
     source_stream_nodes: list[str],
 ) -> None:
@@ -2337,6 +2338,7 @@ def _validate_node_scalar_threshold(
 
 
 def _validate_node_trace_rolling_mean(
+    *,
     node: NodeSpec,
     source_stream_nodes: list[str],
 ) -> None:
@@ -2345,6 +2347,7 @@ def _validate_node_trace_rolling_mean(
 
 
 def _validate_node_trace_decimate(
+    *,
     node: NodeSpec,
     source_stream_nodes: list[str],
 ) -> None:
@@ -2353,6 +2356,7 @@ def _validate_node_trace_decimate(
 
 
 def _validate_node_fit_curve_1d(
+    *,
     node: NodeSpec,
     source_stream_nodes: list[str],
 ) -> None:
@@ -2361,6 +2365,7 @@ def _validate_node_fit_curve_1d(
 
 
 def _validate_node_fit_from_hist(
+    *,
     node: NodeSpec,
     source_stream_nodes: list[str],
 ) -> None:
@@ -2369,6 +2374,7 @@ def _validate_node_fit_from_hist(
 
 
 def _validate_node_fit_param(
+    *,
     node: NodeSpec,
     source_stream_nodes: list[str],
 ) -> None:
@@ -2377,6 +2383,7 @@ def _validate_node_fit_param(
 
 
 def _validate_node_aggregate_bin_stats(
+    *,
     node: NodeSpec,
     source_stream_nodes: list[str],
 ) -> None:
@@ -2385,6 +2392,7 @@ def _validate_node_aggregate_bin_stats(
 
 
 def _validate_node_aggregate_bin2d_stats(
+    *,
     node: NodeSpec,
     source_stream_nodes: list[str],
 ) -> None:
@@ -2393,6 +2401,7 @@ def _validate_node_aggregate_bin2d_stats(
 
 
 def _validate_node_source_context_field(
+    *,
     node: NodeSpec,
     source_stream_nodes: list[str],
 ) -> None:
@@ -2401,6 +2410,7 @@ def _validate_node_source_context_field(
 
 
 def _validate_node_source_telemetry_nearest(
+    *,
     node: NodeSpec,
     source_stream_nodes: list[str],
 ) -> None:
@@ -2409,6 +2419,7 @@ def _validate_node_source_telemetry_nearest(
 
 
 def _validate_node_record_field(
+    *,
     node: NodeSpec,
     source_stream_nodes: list[str],
 ) -> None:
@@ -2419,6 +2430,7 @@ def _validate_node_record_field(
 
 
 def _validate_node_record_filter_eq(
+    *,
     node: NodeSpec,
     source_stream_nodes: list[str],
 ) -> None:
@@ -2428,7 +2440,16 @@ def _validate_node_record_filter_eq(
         raise ValueError(f"node {node.node_id!r} {node.op} requires field")
 
 
-_NODE_OP_PARAM_VALIDATORS: dict[str, Callable[[NodeSpec, list[str]], None]] = {
+# All validators take node + source_stream_nodes as keyword-only args.
+# The Protocol below documents the exact signature so the dict's value
+# type matches what's actually invoked at the call site (kwargs).
+class _NodeValidator(Protocol):
+    def __call__(
+        self, *, node: NodeSpec, source_stream_nodes: list[str]
+    ) -> None: ...
+
+
+_NODE_OP_PARAM_VALIDATORS: dict[str, _NodeValidator] = {
     "source.stream": _validate_source_stream_node,
     "source.records": _validate_source_records_node,
     "source.context_field": _validate_node_source_context_field,
