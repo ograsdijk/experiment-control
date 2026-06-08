@@ -18,6 +18,7 @@ from experiment_control.processes.watchdog import (
     WatchdogRule,
     _parse_ruleset,
     evaluate_watchdog_rule,
+    mark_watchdog_triggered,
 )
 from experiment_control.rules.rules_common import TelemetryBinding
 
@@ -132,6 +133,14 @@ class WatchdogRuleEvalTests(unittest.TestCase):
             telemetry_getter=lambda _dev, _sig: _ok_sample(),
             now_mono=10.0,
         )
+        # Caller is now responsible for marking the cooldown after it
+        # commits to the action chain — previously this was implicit
+        # inside evaluate_watchdog_rule, which incurred the cooldown
+        # even for callers that never executed the actions and for
+        # action chains that were never given a chance to run.
+        # WatchdogProcess._evaluate_rules calls mark_watchdog_triggered
+        # at action-submit time; this test mirrors that contract.
+        mark_watchdog_triggered(state, 10.0)
         second = evaluate_watchdog_rule(
             rule=rule,
             state=state,
@@ -147,6 +156,36 @@ class WatchdogRuleEvalTests(unittest.TestCase):
         self.assertTrue(first[0])
         self.assertFalse(second[0])
         self.assertTrue(third[0])
+
+    def test_evaluate_does_not_mark_cooldown_by_itself(self) -> None:
+        # Regression test for the cooldown-gating split: a caller that
+        # never invokes mark_watchdog_triggered must continue to see
+        # triggered=True every tick (instead of being silently locked
+        # out for cooldown_s as in the pre-fix behaviour).
+        rule = WatchdogRule(
+            name="r2_cd_split",
+            severity="warn",
+            message=None,
+            telemetry=[TelemetryBinding(alias="t", device_id="dev1", signal="temp", max_age_s=1.0)],
+            condition=True,
+            stable_for_s=0.0,
+            cooldown_s=2.0,
+            latch=False,
+            on_unknown="ignore",
+            actions=[_default_action()],
+        )
+        state = RuleState()
+        for now in (10.0, 11.0, 12.0):
+            triggered, *_ = evaluate_watchdog_rule(
+                rule=rule,
+                state=state,
+                telemetry_getter=lambda _dev, _sig: _ok_sample(),
+                now_mono=now,
+            )
+            self.assertTrue(triggered, f"tick {now}: expected triggered=True")
+        # The state's last_trigger_mono must remain unset — the function
+        # didn't write it, only mark_watchdog_triggered does.
+        self.assertIsNone(state.last_trigger_mono)
 
     def test_latch_prevents_retrigger_until_cleared(self) -> None:
         rule = WatchdogRule(

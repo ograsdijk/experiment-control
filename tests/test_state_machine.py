@@ -60,23 +60,23 @@ class _DummyStateMachine(StateMachineProcessBase):
         self.entered.append(f"{from_state}->RUNNING:{reason}")
 
     def _handle_rpc(self, req: dict) -> dict:
-        base = self._handle_state_machine_rpc(req)
+        base = self.handle_state_machine_rpc(req)
         if base is not None:
             return base
-        return self._rpc_unknown(req)
+        return self.rpc_unknown(req)
 
 
 class ManagedProcessBaseRpcHelperTests(unittest.TestCase):
     def test_rpc_ok_shape(self) -> None:
         req = {"request_id": "abc"}
-        out = ManagedProcessBase._rpc_ok(req, result={"k": 1})
+        out = ManagedProcessBase.rpc_ok(req, result={"k": 1})
         self.assertEqual(out["request_id"], "abc")
         self.assertTrue(out["ok"])
         self.assertEqual(out["result"], {"k": 1})
 
     def test_rpc_err_shape(self) -> None:
         req = {"request_id": 7}
-        out = ManagedProcessBase._rpc_err(
+        out = ManagedProcessBase.rpc_err(
             req,
             code="bad_thing",
             message="bad",

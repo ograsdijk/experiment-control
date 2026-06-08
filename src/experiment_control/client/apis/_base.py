@@ -30,3 +30,17 @@ class ClientFacadeBase:
     ) -> Any:
         return self._client.rpc(payload, timeout_ms=timeout_ms, retries=retries, expect_ok=True)
 
+    def _call_type(
+        self,
+        request_type: str,
+        *,
+        timeout_ms: int | None = None,
+        retries: int | None = None,
+        expect_ok: bool = True,
+        **kwargs: Any,
+    ) -> Any:
+        payload: Json = {"type": str(request_type), **kwargs}
+        if expect_ok:
+            return self._request_result(payload, timeout_ms=timeout_ms, retries=retries)
+        return self._request_raw(payload, timeout_ms=timeout_ms, retries=retries)
+

@@ -53,7 +53,7 @@ class ManagedProcessBase:
         return req_or_id
 
     @classmethod
-    def _rpc_ok(cls, req_or_id: dict[str, Any] | Any, *, result: Any = None) -> dict[str, Any]:
+    def rpc_ok(cls, req_or_id: dict[str, Any] | Any, *, result: Any = None) -> dict[str, Any]:
         return {
             "request_id": cls._rpc_request_id(req_or_id),
             "ok": True,
@@ -61,7 +61,7 @@ class ManagedProcessBase:
         }
 
     @classmethod
-    def _rpc_err(
+    def rpc_err(
         cls,
         req_or_id: dict[str, Any] | Any,
         *,
@@ -81,21 +81,44 @@ class ManagedProcessBase:
         }
 
     @classmethod
-    def _rpc_unknown(cls, req_or_id: dict[str, Any] | Any) -> dict[str, Any]:
-        return cls._rpc_err(req_or_id, code="unknown_request")
+    def rpc_unknown(cls, req_or_id: dict[str, Any] | Any) -> dict[str, Any]:
+        return cls.rpc_err(req_or_id, code="unknown_request")
 
     @classmethod
-    def _rpc_invalid_params(
+    def rpc_invalid_params(
         cls,
         req_or_id: dict[str, Any] | Any,
         *,
         message: str | None = None,
     ) -> dict[str, Any]:
-        return cls._rpc_err(req_or_id, code="invalid_params", message=message)
+        return cls.rpc_err(req_or_id, code="invalid_params", message=message)
 
     def _graceful_stop(self) -> None:
         """Hook for subclasses to implement graceful stop behavior."""
         self._stop_evt.set()
+
+    def _require_manager(self) -> ManagerClient:
+        """Return ``self._manager`` after asserting it is initialized.
+
+        ``self._manager`` is typed ``ManagerClient | None`` because it
+        is set during ``run()`` (after the parent process has wired
+        endpoints). At any code path that runs *after* init — the main
+        poll loop, RPC handlers, telemetry workers — the value is
+        non-None. Routing through this helper:
+
+        * narrows the type for mypy without scattering ``assert
+          self._manager is not None`` at every call site, AND
+        * surfaces a clear runtime error if a subclass somehow invokes
+          a manager method before ``init`` (vs. an obscure
+          AttributeError on ``None.call``).
+        """
+        manager = self._manager
+        if manager is None:
+            raise RuntimeError(
+                f"{type(self).__name__}._manager is not initialized; "
+                "call from inside run() / after init only"
+            )
+        return manager
 
     def _unregister_command_interceptor_routes(self) -> None:
         if not self._process_id:
@@ -117,8 +140,8 @@ class ManagedProcessBase:
             try:
                 self._graceful_stop()
             except Exception as e:
-                return self._rpc_err(req, code="stop_failed", message=str(e))
-            return self._rpc_ok(req, result={"status": "stopping"})
+                return self.rpc_err(req, code="stop_failed", message=str(e))
+            return self.rpc_ok(req, result={"status": "stopping"})
         return None
 
     @staticmethod
@@ -415,11 +438,14 @@ class ManagedProcessBase:
         handlers: dict[zmq.Socket, Callable[[], None]] = {}
         drain_result: dict[str, Any] | None = None
         if self._manager is not None and self._manager.sub_socket is not None:
+            # Bind the narrowed manager into the closure so mypy can see
+            # it isn't None when _drain_manager_telemetry fires.
+            mgr = self._manager
 
             def _drain_manager_telemetry() -> None:
                 nonlocal drain_result
                 self._set_phase("drain_telemetry")
-                drain_result = self._manager.drain_telemetry()
+                drain_result = mgr.drain_telemetry()
                 self._mark_progress(
                     f"drained={drain_result['count']} limited={drain_result['limited']}"
                 )

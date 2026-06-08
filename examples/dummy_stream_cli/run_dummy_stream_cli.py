@@ -6,7 +6,7 @@ from pathlib import Path
 
 import zmq
 from experiment_control.utils.zmq_helpers import json_dumps
-from experiment_control.tui_manager import ManagerTUI
+from experiment_control._tui.app import ManagerTUI
 
 
 def _stream_acquire_loop(stop_event: threading.Event, period_s: float = 1.0) -> None:

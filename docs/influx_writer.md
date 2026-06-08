@@ -124,6 +124,11 @@ Supported process RPC methods:
 - `points_skipped_remote`
 - `write_errors`
 
+Each destination entry includes `retry` state. On HTTP 429/503 (and other
+HTTP errors), the writer honours `Retry-After` as integer seconds or an
+HTTP-date; if absent it uses bounded exponential backoff. A destination in
+backoff is skipped and requeued while other destinations continue flushing.
+
 ## Example line protocol
 
 Example wide row:

@@ -611,7 +611,7 @@ def _run_with_tui(
         )
         if not manager_ready:
             raise SystemExit(f"[run_stack] startup error: {startup_error}")
-        from ..tui_manager import ManagerTUI
+        from .._tui.app import ManagerTUI
 
         app = ManagerTUI(
             manager_rpc=manager_rpc,

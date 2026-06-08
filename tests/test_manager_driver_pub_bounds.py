@@ -16,7 +16,7 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from experiment_control.manager_driver_pub import ingest_chunk_ready, ingest_telemetry
+from experiment_control._manager.driver_pub import ingest_chunk_ready, ingest_telemetry
 
 
 @dataclass(frozen=True)

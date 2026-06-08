@@ -1,11 +1,19 @@
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import numpy as np
 
 from ..scan_plan import generate_scan2d_records, validate_scan2d_order, validate_scan2d_pattern
 from .eval import render_templates
+
+
+# Tolerance for the math.ceil rounding in `range` gen's count
+# computation. Slightly larger than ULP so values like 0.3 / 0.1 ==
+# 2.9999999999999996 round down to 3 (not 4). 1e-9 is small enough to
+# never flip a legitimate boundary case.
+_RANGE_STOP_TOL = 1e-9
 
 
 def _apply_modifiers(
@@ -231,7 +239,30 @@ def generate_from_gen(
         step = float(params.get("step", 1))
         if step == 0:
             raise ValueError("range.step must be non-zero")
-        values = list(np.arange(start, stop + 0.0, step))
+        # Sign validation: pre-fix this used np.arange, which silently
+        # returns an empty array when the step sign points the wrong
+        # way (e.g. start=0, stop=5, step=-1). A typo'd sign on a
+        # downstream sequence YAML would just produce zero trials with
+        # no diagnostic. Detect explicitly and raise so the operator
+        # sees the bug.
+        if (stop - start) * step < 0:
+            raise ValueError(
+                f"range step direction is wrong: start={start} stop={stop} "
+                f"step={step} would never reach stop"
+            )
+        # Float-error mitigation: np.arange accumulates float-error
+        # because it computes each value as start + i*step in a way
+        # that can drift e.g. np.arange(0.0, 0.3, 0.1) returns
+        # [0.0, 0.1, 0.2] but np.arange(0.0, 0.30000000000000004, 0.1)
+        # returns [0.0, 0.1, 0.2, 0.3]. Compute the count ahead of
+        # time via math.ceil with a tiny tolerance, then use np.linspace
+        # over that count, which doesn't accumulate. The result is
+        # exclusive of `stop` (same as the original np.arange call).
+        span = stop - start
+        n = int(math.ceil(span / step - _RANGE_STOP_TOL))
+        if n < 0:
+            n = 0
+        values = list(start + np.arange(n) * step)
         return _wrap_scalar_records(
             _apply_modifiers(
                 values,
