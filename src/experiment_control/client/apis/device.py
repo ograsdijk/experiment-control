@@ -16,13 +16,15 @@ class DeviceAPI(ClientFacadeBase):
         timeout_ms: int | None = None,
         retries: int | None = None,
     ) -> Json:
-        payload: Json = {
-            "type": "command",
-            "device_id": str(device_id),
-            "action": str(action),
-            "params": dict(params or {}),
-        }
-        return self._request_raw(payload, timeout_ms=timeout_ms, retries=retries)
+        return self._call_type(
+            "command",
+            device_id=str(device_id),
+            action=str(action),
+            params=dict(params or {}),
+            timeout_ms=timeout_ms,
+            retries=retries,
+            expect_ok=False,
+        )
 
     def call(
         self,
@@ -33,13 +35,14 @@ class DeviceAPI(ClientFacadeBase):
         timeout_ms: int | None = None,
         retries: int | None = None,
     ) -> Any:
-        payload: Json = {
-            "type": "command",
-            "device_id": str(device_id),
-            "action": str(action),
-            "params": dict(params or {}),
-        }
-        return self._request_result(payload, timeout_ms=timeout_ms, retries=retries)
+        return self._call_type(
+            "command",
+            device_id=str(device_id),
+            action=str(action),
+            params=dict(params or {}),
+            timeout_ms=timeout_ms,
+            retries=retries,
+        )
 
     def capabilities(
         self,
@@ -91,11 +94,7 @@ class DeviceAPI(ClientFacadeBase):
         timeout_ms: int | None = None,
         retries: int | None = None,
     ) -> Any:
-        return self._request_result(
-            {"type": "device.list_status"},
-            timeout_ms=timeout_ms,
-            retries=retries,
-        )
+        return self._call_type("device.list_status", timeout_ms=timeout_ms, retries=retries)
 
     def connect(
         self,
@@ -104,8 +103,9 @@ class DeviceAPI(ClientFacadeBase):
         timeout_ms: int | None = None,
         retries: int | None = None,
     ) -> Any:
-        return self._request_result(
-            {"type": "device.connect", "device_id": str(device_id)},
+        return self._call_type(
+            "device.connect",
+            device_id=str(device_id),
             timeout_ms=timeout_ms,
             retries=retries,
         )
@@ -117,8 +117,9 @@ class DeviceAPI(ClientFacadeBase):
         timeout_ms: int | None = None,
         retries: int | None = None,
     ) -> Any:
-        return self._request_result(
-            {"type": "device.driver.start", "device_id": str(device_id)},
+        return self._call_type(
+            "device.driver.start",
+            device_id=str(device_id),
             timeout_ms=timeout_ms,
             retries=retries,
         )
@@ -130,8 +131,9 @@ class DeviceAPI(ClientFacadeBase):
         timeout_ms: int | None = None,
         retries: int | None = None,
     ) -> Any:
-        return self._request_result(
-            {"type": "device.disconnect", "device_id": str(device_id)},
+        return self._call_type(
+            "device.disconnect",
+            device_id=str(device_id),
             timeout_ms=timeout_ms,
             retries=retries,
         )
@@ -144,12 +146,10 @@ class DeviceAPI(ClientFacadeBase):
         timeout_ms: int | None = None,
         retries: int | None = None,
     ) -> Any:
-        return self._request_result(
-            {
-                "type": "device.driver.restart",
-                "device_id": str(device_id),
-                "force": bool(force),
-            },
+        return self._call_type(
+            "device.driver.restart",
+            device_id=str(device_id),
+            force=bool(force),
             timeout_ms=timeout_ms,
             retries=retries,
         )

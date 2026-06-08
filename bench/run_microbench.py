@@ -22,6 +22,8 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 import numpy as np
+import orjson
+import zmq.utils.jsonapi
 
 # Use the same JSON encoder as the production stack uses (pyzmq's
 # jsonapi.dumps), so timings reflect what the gateway actually
@@ -29,9 +31,10 @@ import numpy as np
 from experiment_control.utils.zmq_helpers import json_dumps  # noqa: E402
 from experiment_control.processes.stream_analysis import (  # noqa: E402
     BinStatsState,
-    Bin2DStatsState,
     _sanitize_json as stream_analysis_sanitize_json,
 )
+
+Json = dict[str, Any]
 
 
 # ---------------------------------------------------------------------------
@@ -155,7 +158,7 @@ def bench_bin_stats(rows: list[Row]) -> None:
             update()
 
         r = time_call(
-            f"bin_stats.update_sample",
+            "bin_stats.update_sample",
             f"{bin_count} bins",
             update,
             iters=20_000,
@@ -164,7 +167,7 @@ def bench_bin_stats(rows: list[Row]) -> None:
         print(r.fmt())
 
         r = time_call(
-            f"bin_stats.payload",
+            "bin_stats.payload",
             f"{bin_count} bins",
             payload,
             iters=5_000,
@@ -247,9 +250,9 @@ def bench_sanitize(rows: list[Row]) -> None:
 
 
 def bench_json_dumps(rows: list[Row]) -> None:
-    """Time the production `json_dumps` on representative payloads."""
+    """Compare production orjson-backed encoding against pyzmq's encoder."""
     print()
-    print("== json_dumps (orjson with pyzmq fallback) ==")
+    print("== json encoding (pyzmq baseline vs orjson vs production json_dumps) ==")
     print(_HEADER)
     rng = np.random.default_rng(42)
 
@@ -282,16 +285,22 @@ def bench_json_dumps(rows: list[Row]) -> None:
             )
         )
 
+    encoders: tuple[tuple[str, Callable[[Any], bytes]], ...] = (
+        ("pyzmq jsonapi.dumps", zmq.utils.jsonapi.dumps),
+        ("orjson.dumps", lambda p: orjson.dumps(p, option=orjson.OPT_SERIALIZE_NUMPY)),
+        ("production json_dumps", json_dumps),
+    )
     for label, payload in cases:
         iters = 100 if label.startswith("stream frame (200") else 1_000
-        r = time_call(
-            "json_dumps",
-            label,
-            lambda p=payload: json_dumps(p),
-            iters=iters,
-        )
-        rows.append(r)
-        print(r.fmt())
+        for encoder_label, encoder in encoders:
+            r = time_call(
+                encoder_label,
+                label,
+                lambda p=payload, e=encoder: e(p),
+                iters=iters,
+            )
+            rows.append(r)
+            print(r.fmt())
 
 
 # ---------------------------------------------------------------------------
@@ -428,6 +437,105 @@ def bench_trace_snapshot_value(rows: list[Row]) -> None:
         print(r.fmt())
 
 
+def bench_snapshot_readout(rows: list[Row]) -> None:
+    """Compare workspace snapshot readout strategies for cached trace payloads."""
+    print()
+    print("== snapshot readout (sanitize vs decimate-first vs clean fast path) ==")
+    print(_HEADER)
+    rng = np.random.default_rng(42)
+
+    def make_payload(n: int, *, dirty: bool) -> Json:
+        values = rng.normal(size=n).astype(np.float64).tolist()
+        if dirty and n >= 16:
+            values[n // 4] = float("nan")
+            values[n // 2] = float("inf")
+            values[(3 * n) // 4] = float("-inf")
+        return {
+            "version": 1,
+            "workspace_id": "ws-1",
+            "output_id": "trace-1",
+            "node_id": "node-1",
+            "kind": "trace",
+            "device_id": "dev1",
+            "stream": "trace",
+            "seq": 42,
+            "t0_mono_ns": 1_000_000,
+            "t0_wall_ns": 2_000_000,
+            "channel_index": 0,
+            "channel_count": 1,
+            "value": values,
+            "point_count": n,
+            "context_fields": {"shot": 123, "label": "bench"},
+        }
+
+    def decimate(values: list[float | None], max_points: int | None) -> list[float | None]:
+        if max_points is None or len(values) <= max_points:
+            return list(values)
+        step = max(1, int(math.ceil(len(values) / float(max_points))))
+        out = list(values[::step])
+        if values and out[-1] != values[-1]:
+            out.append(values[-1])
+        if len(out) > max_points:
+            out = out[:max_points]
+        return out
+
+    def scrub(values: list[float | None]) -> list[float | None]:
+        out = list(values)
+        for i, value in enumerate(out):
+            if value is not None and not math.isfinite(float(value)):
+                out[i] = None
+        return out
+
+    def current(payload: Json, max_points: int | None) -> Json:
+        item = stream_analysis_sanitize_json(dict(payload))
+        if max_points is not None:
+            item["value"] = decimate(item["value"], max_points)
+            item["point_count"] = len(item["value"])
+        return item
+
+    def decimate_first(payload: Json, max_points: int | None) -> Json:
+        item = dict(payload)
+        if max_points is not None:
+            item["value"] = decimate(item["value"], max_points)
+            item["point_count"] = len(item["value"])
+        return stream_analysis_sanitize_json(item)
+
+    def clean_fast_path(payload: Json, max_points: int | None, *, dirty: bool) -> Json:
+        item = dict(payload)
+        values = decimate(item["value"], max_points)
+        if dirty:
+            values = scrub(values)
+        item["value"] = values
+        item["point_count"] = len(values)
+        if "context_fields" in item:
+            item["context_fields"] = stream_analysis_sanitize_json(dict(item["context_fields"]))
+        return item
+
+    variants: tuple[tuple[str, Callable[[Json, int | None, bool], Json]], ...] = (
+        ("current sanitize-then-decimate", lambda p, m, _d: current(p, m)),
+        ("decimate-then-sanitize", lambda p, m, _d: decimate_first(p, m)),
+        ("known-clean fast path", lambda p, m, d: clean_fast_path(p, m, dirty=d)),
+    )
+    for n in (1_000, 50_000, 200_000):
+        for dirty in (False, True):
+            payload = make_payload(n, dirty=dirty)
+            dirty_label = "dirty" if dirty else "finite"
+            for max_points in (None, 2_000):
+                max_label = "full" if max_points is None else "max2k"
+                size_label = f"{n:,} {dirty_label} {max_label}"
+                iters = 1000 if n <= 1_000 else (200 if n <= 50_000 else 50)
+                for label, fn in variants:
+                    r = time_call(
+                        label,
+                        size_label,
+                        lambda p=payload, m=max_points, d=dirty, f=fn: f(p, m, d),
+                        iters=iters,
+                    )
+                    rows.append(r)
+                    print(r.fmt())
+
+
+
 def bench_stream_buffer_assembly(rows: list[Row]) -> None:
     """Compare three HDF stream-buffer assembly paths.
 
@@ -537,11 +645,14 @@ def bench_stream_buffer_assembly(rows: list[Row]) -> None:
         iters = 1000 if n_events <= 256 else (200 if n_events <= 1024 else 50)
         size_label = f"{n_events}×{sample_count} ({total_mb:.0f}MB){extra}"
         r = time_call("1. baseline (list of bytes)", size_label, baseline, iters=iters)
-        rows.append(r); print(r.fmt())
-        r = time_call("2. prealloc-from-bytes",      size_label, prealloc_from_bytes, iters=iters)
-        rows.append(r); print(r.fmt())
-        r = time_call("3. prealloc-from-shm",        size_label, prealloc_from_shm, iters=iters)
-        rows.append(r); print(r.fmt())
+        rows.append(r)
+        print(r.fmt())
+        r = time_call("2. prealloc-from-bytes", size_label, prealloc_from_bytes, iters=iters)
+        rows.append(r)
+        print(r.fmt())
+        r = time_call("3. prealloc-from-shm", size_label, prealloc_from_shm, iters=iters)
+        rows.append(r)
+        print(r.fmt())
 
 
 ALL_BENCHES = {
@@ -550,6 +661,7 @@ ALL_BENCHES = {
     "json_dumps": bench_json_dumps,
     "output_index": bench_output_index,
     "trace_snapshot": bench_trace_snapshot_value,
+    "snapshot_readout": bench_snapshot_readout,
     "stream_buffer": bench_stream_buffer_assembly,
 }
 

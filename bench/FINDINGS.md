@@ -1,107 +1,106 @@
-# Initial bench findings
+# Bench findings
 
-Run on python 3.13.5 / numpy 2.4.1 / Windows 11. Per-call timings
-captured with `--no-alloc` (tracemalloc adds 10–100× overhead and
-would skew comparisons).
+Initial run: Python 3.13.5 / numpy 2.4.1 / Windows 11, using `--no-alloc` for realistic latency numbers.
 
-## Headline numbers (per-call, microseconds)
+## Current status
 
-| Path                                         | per call (µs) | Notes |
-|----------------------------------------------|---------------|-------|
-| `BinStatsState.update_sample`                | ~1.8          | Per-sample; fires up to ~1 kHz. Effectively free. |
-| `BinStatsState.payload(50 bins)`             | 150           | At 20 Hz emit = 3 ms/s. Fine. |
-| `BinStatsState.payload(200 bins)`            | 472           | At 20 Hz = 9 ms/s per workspace. |
-| `BinStatsState.payload(1000 bins)`           | 2,002         | At 20 Hz = **40 ms/s** per workspace. |
-| `BinStatsState.payload(5000 bins)`           | 9,581         | At 20 Hz = **192 ms/s** per workspace (≈20% of one core). |
-| `_sanitize_json(telemetry 20 sigs)`          | 32            | Fine. |
-| `_sanitize_json(stream frame 1k pts)`        | 331           | At 50 Hz = 17 ms/s. |
-| `_sanitize_json(stream frame 50k pts)`       | 16,676        | At 10 Hz = **167 ms/s**. |
-| `_sanitize_json(stream frame 200k pts)`      | 68,506        | At 5 Hz = **343 ms/s**. |
-| `_sanitize_json(bin_stats 1000 bins)`        | 1,702         | At 20 Hz = 34 ms/s. |
-| `json_dumps(telemetry 20 sigs)`              | 32            | Fine. |
-| `json_dumps(stream frame 1k pts)`            | 636           | At 50 Hz = 32 ms/s. |
-| `json_dumps(stream frame 50k pts)`           | 34,677        | At 10 Hz = **347 ms/s**. |
-| `json_dumps(stream frame 200k pts)`          | **138,209**   | At 5 Hz = **690 ms/s** ≈ 70% of one core. |
-| `build_panels_by_workspace_output(200)`      | 127           | Cheap enough to run on every panels-list edit. |
+The original benchmark run identified two main backend costs:
 
-(Bolded rows are >5% of a core at realistic emit rates.)
+1. JSON encoding large stream frames.
+2. Recursive `_sanitize_json` walks over large trace payloads.
 
-## What the numbers say
+Both findings have already informed code changes:
 
-### The dominant backend cost is JSON-encoding large stream frames.
+- `json_dumps` now prints pyzmq/stdlib, direct orjson, and production `experiment_control.utils.zmq_helpers.json_dumps` timings side-by-side, making the current speedup directly visible.
+- `trace_snapshot` was added to validate the current trace snapshot fast path: finite numpy traces use `np.isfinite` plus one `tolist()` instead of `tolist()` plus a full recursive sanitize walk.
+- `snapshot_readout` was added to measure workspace snapshot response cost for cached trace payloads and compare sanitize/decimation ordering.
+- `stream_buffer` was added to compare HDF stream-buffer assembly strategies for large shared-memory-backed stream batches.
 
-`json_dumps` on a 200k-point trace takes **138 ms**. For comparison,
-the same payload through orjson would take ~5–15 ms (5–25×
-faster). For a 50k-point trace at 10 Hz, switching encoders saves
-~300 ms/s of CPU. This is the single largest win on the table.
+## Fresh JSON encoder comparison
 
-The current encoder is `zmq.utils.jsonapi.dumps`, which falls back
-to the stdlib `json` module — pure Python with C-accelerated
-serialization but no native numpy support.
+Run on 2026-06-08 with `uv run python -m bench.run_microbench --no-alloc --bench json_dumps`.
 
-### `_sanitize_json` is the second-largest cost on stream frames.
+| Payload | pyzmq/stdlib (µs) | orjson (µs) | production `json_dumps` (µs) | Speedup |
+|---|---:|---:|---:|---:|
+| telemetry bundle, 20 signals | 26.18 | 2.04 | 2.04 | 12.8× |
+| stream frame, 100 pts | 67.99 | 3.37 | 3.39 | 20.1× |
+| stream frame, 1,000 pts | 775.41 | 30.93 | 28.98 | 26.8× |
+| stream frame, 50,000 pts | 39,469.06 | 1,963.96 | 2,019.44 | 19.5× |
+| stream frame, 200,000 pts | 147,990.69 | 9,377.60 | 9,014.38 | 16.4× |
 
-68 ms for 200k points (recursive Python walk, dict-comprehension
-rebuild). This runs **in addition** to `json_dumps`. Audit item #1
-(from the broad backend pass) suggested avoiding redundant
-re-sanitization — that observation is more important than I
-estimated, *because the per-call cost is much higher than I
-assumed*. Skipping one redundant walk per 200k-point frame at 10 Hz
-saves ~685 ms/s of CPU.
+Production `json_dumps` tracks direct orjson performance, confirming the fallback wrapper has negligible overhead on normal stream payloads.
 
-The trace-output path in `stream_analysis.py:4334` and `4497` does
-re-sanitize the full payload via `_remember_latest_output(payload)`
-(line 3257). The values list comes from `trace.tolist()` which can
-produce `nan`/`inf` Python floats — so we can't drop sanitize
-entirely, but we can sanitize ONCE at build time and skip the
-snapshot re-sanitize (same fix as PR #31 for the gateway).
+## Fresh snapshot readout comparison
 
-### `BinStatsState.payload` is moderately expensive at high bin counts.
+Run on 2026-06-08 with `uv run python -m bench.run_microbench --no-alloc --bench snapshot_readout`.
 
-Default 100–200-bin histograms cost ~150–500 µs and emit at 20 Hz —
-fine. 1000+ bin histograms become noticeable (40+ ms/s). Caching
-the serialised payload between emits (per audit #1 from the
-stream_analysis pass) would help **only at large bin counts**, and
-real workloads with 5000-bin histograms are likely rare.
+Representative rows:
 
-### `update_sample` is genuinely free.
+| Payload | current sanitize-then-decimate | decimate-then-sanitize | known-clean fast path |
+|---|---:|---:|---:|
+| 50k finite, full | 17.04 ms | 16.12 ms | 0.25 ms |
+| 50k finite, max2k | 17.20 ms | 0.64 ms | 0.02 ms |
+| 50k dirty, max2k | 16.83 ms | 0.60 ms | 0.26 ms |
+| 200k finite, full | 69.53 ms | 70.92 ms | 1.96 ms |
+| 200k finite, max2k | 69.53 ms | 0.99 ms | 0.10 ms |
+| 200k dirty, max2k | 73.53 ms | 0.67 ms | 0.27 ms |
 
-1.8 µs per sample regardless of bin count — `np.searchsorted` +
-numpy in-place updates. No optimization needed.
+Key conclusions:
 
-### Reverse-index build is fast.
+- Current snapshot readout still pays the full recursive sanitize cost before applying `max_trace_points`.
+- Decimating before sanitizing is a 70–110× win for `max_trace_points=2000` on large traces.
+- For known-clean finite cached traces, skipping the recursive sanitize walk is another 6–10× faster than decimate-then-sanitize.
+- Full-resolution readout still benefits most from the known-clean path; decimate-first cannot help when no point limit is requested.
 
-127 µs at 200 panels — clearly safe to run on every panels-list
-change in `App.tsx` (which was the PerfC concern).
+This suggests a production follow-up in `stream_analysis.py`: for cached trace payloads, apply `max_trace_points` before `_sanitize_json`, and use a known-clean fast path for trace values created by `_build_trace_snapshot_payload`.
 
-## Recommended follow-up PRs
+## Historical headline numbers
 
-Ordered by impact / effort ratio:
+These numbers are from the first `--no-alloc` run before the trace/json improvements landed.
 
-1. **Switch the WS-broadcast path to orjson** (or msgpack) for large
-   stream frames. ~5–25× faster encoding, saves 100–600 ms/s of
-   CPU under heavy stream load. **L effort** (new dep, must
-   audit numpy-int / NaN-encoding behaviour). **High impact when
-   stream-heavy.**
+| Path | per call (µs) | Notes |
+|---|---:|---|
+| `BinStatsState.update_sample` | ~1.8 | Per-sample; effectively free. |
+| `BinStatsState.payload(50 bins)` | 150 | At 20 Hz emit = 3 ms/s. Fine. |
+| `BinStatsState.payload(200 bins)` | 472 | At 20 Hz = 9 ms/s per workspace. |
+| `BinStatsState.payload(1000 bins)` | 2,002 | At 20 Hz = 40 ms/s per workspace. |
+| `BinStatsState.payload(5000 bins)` | 9,581 | At 20 Hz = 192 ms/s per workspace. |
+| `_sanitize_json(telemetry 20 sigs)` | 32 | Fine. |
+| `_sanitize_json(stream frame 1k pts)` | 331 | At 50 Hz = 17 ms/s. |
+| `_sanitize_json(stream frame 50k pts)` | 16,676 | At 10 Hz = 167 ms/s. |
+| `_sanitize_json(stream frame 200k pts)` | 68,506 | At 5 Hz = 343 ms/s. |
+| `_sanitize_json(bin_stats 1000 bins)` | 1,702 | At 20 Hz = 34 ms/s. |
+| old `json_dumps(telemetry 20 sigs)` | 32 | Fine. |
+| old `json_dumps(stream frame 1k pts)` | 636 | At 50 Hz = 32 ms/s. |
+| old `json_dumps(stream frame 50k pts)` | 34,677 | At 10 Hz = 347 ms/s. |
+| old `json_dumps(stream frame 200k pts)` | 138,209 | At 5 Hz = 690 ms/s. |
+| `build_panels_by_workspace_output(200)` | 127 | Cheap enough to rebuild on panel-list edits. |
 
-2. **Push `_sanitize_json` upstream in stream_analysis trace
-   outputs**, then drop the redundant walk in `_remember_latest_output`.
-   Same pattern as gateway PR #31. **M effort**, audit each output
-   kind's build path. Saves ~10–60 ms/s under stream load.
+## Interpretation
 
-3. **Defer**: BinStatsState payload caching. Win is small at
-   default bin counts (≤200); only worth doing if measurement
-   shows a deployment with thousands of bins.
+### Large stream-frame serialization remains the path to watch
 
-## What the bench did NOT measure
+Large trace payloads dominate CPU when encoded at high rate. The exact numbers should now be regenerated with the current `json_dumps` implementation before making further encoder decisions.
 
-- ZMQ socket-level overhead (poll, recv, send). Pure-Python
-  encoding cost dominates, but a real-stack benchmark would surface
-  any per-frame socket cost we're missing.
-- HDF / Influx writer batching under realistic burst patterns.
-- Manager loop scheduling latency.
-- Cross-process IPC latency (driver → manager → gateway).
+### Trace snapshot sanitization has a focused benchmark
 
-These would require an end-to-end stack benchmark — a follow-up if
-the synthetic numbers above don't fully match observed production
-CPU profiles.
+`trace_snapshot` compares the old full recursive sanitize path with the current finite-array fast path. This should be rerun when changing trace output or snapshot storage code.
+
+### Histogram payload caching is still low priority
+
+`BinStatsState.update_sample()` is cheap. `BinStatsState.payload()` becomes noticeable only at high bin counts; default 100–200-bin usage is not worth caching unless production profiling shows thousands of bins at high emit rate.
+
+### Frontend reverse-index construction is cheap
+
+The output-index benchmark showed sub-millisecond rebuilds at realistic panel counts. The reverse-index design is not a backend bottleneck.
+
+## Useful next runs
+
+```powershell
+uv run python -m bench.run_microbench --no-alloc --bench json_dumps --bench trace_snapshot
+uv run python -m bench.run_microbench --no-alloc --bench snapshot_readout
+uv run python -m bench.run_microbench --no-alloc --bench stream_buffer
+uv run python -m bench.run_microbench --no-alloc
+```
+
+Update this file with fresh current-encoder numbers after the next full run on the target hardware.

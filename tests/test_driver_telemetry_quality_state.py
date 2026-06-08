@@ -27,6 +27,13 @@ class DriverTelemetryQualityStateTests(unittest.TestCase):
         runner._device_state = DeviceState.OK
         runner._device_reachable = True
         runner._last_error = None
+        # Latch added by PR misc-review-followups (#48 follow-up):
+        # _apply_telemetry_quality_state and the no-telemetry branch
+        # of _publish_telemetry now refuse to promote back to OK
+        # while this latch is True. Default False so the
+        # quality-state tests below see the pre-fix promote-to-OK
+        # behaviour.
+        runner._action_failed_since_last_ok = False
         return runner
 
     def test_all_ok_sets_ok_and_clears_error(self) -> None:
@@ -77,6 +84,7 @@ class DriverTelemetryQualityStateTests(unittest.TestCase):
         runner.device_id = "dev"
         runner._telemetry_seq = 0
         runner._device_state = DeviceState.DEGRADED
+        runner._telemetry_last_call_errors = {}
         runner._now = lambda: Timestamp(t_wall=1.0, t_mono=2.0)  # type: ignore[method-assign]
         runner.read_telemetry = lambda: {}  # type: ignore[method-assign]
         runner.telemetry_signal_names = lambda: []  # type: ignore[method-assign]

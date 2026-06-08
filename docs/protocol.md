@@ -707,7 +707,15 @@ Response:
   - `device_id`: str
   - `seq`: int
   - `ts`: {`t_wall`: float, `t_mono`: float}
-  - `signals`: dict of signal → {`value`, `units`, `quality`, `ts`}
+  - `signals`: dict of signal → {`value`, `units`, `quality`, `ts`, `error?`}
+    - `error` (optional, str): present on BAD signals when the
+      cause is a runtime exception from the driver. Truncated to
+      ≤200 chars. Absent on OK / MISSING / STALE signals.
+  - `call_errors` (optional, dict[str, str]): per-call exception summaries
+    keyed by the telemetry call's `method` name. Present iff at least one
+    telemetry call raised this tick. Values are `repr(exception)` truncated
+    to ≤200 chars. When `read_telemetry` itself raises (rare), the key is
+    the synthetic placeholder `"<read_telemetry>"`.
 
 ### `{device_id}/chunk_ready`
 - Producer: driver
@@ -736,7 +744,10 @@ Response:
   - `device_id`: str
   - `seq`: int
   - `ts`: {`t_wall`, `t_mono`}
-  - `signals`: dict of signal → {`value`, `units`, `quality`, `ts`}
+  - `signals`: dict of signal → {`value`, `units`, `quality`, `ts`, `error?`}
+  - `call_errors` (optional, dict[str, str]): forwarded verbatim from the
+    driver's `{device_id}/telemetry` payload when present. See the driver
+    topic above for shape/contents.
 
 ### `manager.heartbeat`
 - Producer: manager
@@ -842,6 +853,50 @@ HDF storage:
   - `signals`: list[str]
   - `age_s`: float
   - `ts`: {`t_wall`, `t_mono`}
+
+### `manager.stream_analysis.output`
+- Producer: stream_analysis process
+- Consumers: TUI, web UI, optional dashboards
+- Payload (version 1):
+  - `workspace_id`: str
+  - `output_id`: str
+  - `node_id`: str
+  - `kind`: `scalar|trace|hist_agg|hist2d|params_map|fit_1d`
+  - `channel_index`: int
+  - `channel_count`: int
+  - `value`: output payload
+  - `point_count`: int (optional)
+  - `truncated`: bool (optional)
+  - Fit outputs include additive `last_fit_attempt_ts_mono` and
+    `last_fit_success_ts_mono` fields when a fit has been attempted.
+
+### `manager.process.failed`
+- Producer: manager
+- Consumers: TUI/logs
+- Payload includes `process_id`, `pid`/`last_failure_pid` where known,
+  `error` or `termination_reason`, and `ts`.
+
+### `manager.lifecycle.events_dropped`
+- Producer: manager
+- Consumers: logs/observability
+- Payload includes dropped-event counts and reason text when lifecycle/log
+  publication backpressure drops events.
+
+### `manager.watchdog.rule_error`
+- Producer: watchdog process
+- Consumers: logs/observability
+- Payload includes `process_id`, `watchdog_id`, `rule`, and `error`.
+
+### `manager.interlock.rule_error`
+- Producer: interlock process
+- Consumers: logs/observability
+- Payload includes `process_id`, `interceptor_id`, `rule`, and `error`.
+
+### `manager.watchdog.action_chain_error`
+- Producer: watchdog process
+- Consumers: logs/observability
+- Payload includes `process_id`, `watchdog_id`, `rule`, and `error` for
+  asynchronous remediation-action failures.
 
 ### `manager.command`
 - Producer: manager

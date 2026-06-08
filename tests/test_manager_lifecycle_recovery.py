@@ -21,7 +21,7 @@ from experiment_control.manager import (
     ProcessHandle,
     ProcessSpec,
 )
-from experiment_control.manager_driver_pub import _store_heartbeat_on_handle
+from experiment_control._manager.driver_pub import _store_heartbeat_on_handle
 from experiment_control.types import DeviceState, DriverState, Timestamp
 
 

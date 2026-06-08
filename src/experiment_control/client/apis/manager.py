@@ -13,11 +13,7 @@ class ManagerAPI(ClientFacadeBase):
         timeout_ms: int | None = None,
         retries: int | None = None,
     ) -> Any:
-        return self._request_result(
-            {"type": "manager.info.identity"},
-            timeout_ms=timeout_ms,
-            retries=retries,
-        )
+        return self._call_type("manager.info.identity", timeout_ms=timeout_ms, retries=retries)
 
     def shutdown(
         self,
@@ -25,11 +21,7 @@ class ManagerAPI(ClientFacadeBase):
         timeout_ms: int | None = None,
         retries: int | None = None,
     ) -> Any:
-        return self._request_result(
-            {"type": "manager.control.shutdown"},
-            timeout_ms=timeout_ms,
-            retries=retries,
-        )
+        return self._call_type("manager.control.shutdown", timeout_ms=timeout_ms, retries=retries)
 
     def cleanup_orphans(
         self,
@@ -40,14 +32,12 @@ class ManagerAPI(ClientFacadeBase):
         timeout_ms: int | None = None,
         retries: int | None = None,
     ) -> Any:
-        return self._request_result(
-            {
-                "type": "manager.control.cleanup_orphans",
-                "params": {
-                    "dry_run": bool(dry_run),
-                    "stale_only": bool(stale_only),
-                    "timeout_s": float(timeout_s),
-                },
+        return self._call_type(
+            "manager.control.cleanup_orphans",
+            params={
+                "dry_run": bool(dry_run),
+                "stale_only": bool(stale_only),
+                "timeout_s": float(timeout_s),
             },
             timeout_ms=timeout_ms,
             retries=retries,
@@ -59,11 +49,7 @@ class ManagerAPI(ClientFacadeBase):
         timeout_ms: int | None = None,
         retries: int | None = None,
     ) -> Any:
-        return self._request_result(
-            {"type": "manager.commands.journal.status"},
-            timeout_ms=timeout_ms,
-            retries=retries,
-        )
+        return self._call_type("manager.commands.journal.status", timeout_ms=timeout_ms, retries=retries)
 
     def command_journal_tail(
         self,
@@ -72,8 +58,9 @@ class ManagerAPI(ClientFacadeBase):
         timeout_ms: int | None = None,
         retries: int | None = None,
     ) -> Any:
-        return self._request_result(
-            {"type": "manager.commands.journal.tail", "params": dict(params or {})},
+        return self._call_type(
+            "manager.commands.journal.tail",
+            params=dict(params or {}),
             timeout_ms=timeout_ms,
             retries=retries,
         )
@@ -85,8 +72,9 @@ class ManagerAPI(ClientFacadeBase):
         timeout_ms: int | None = None,
         retries: int | None = None,
     ) -> Any:
-        return self._request_result(
-            {"type": "manager.logs.tail", "params": dict(params or {})},
+        return self._call_type(
+            "manager.logs.tail",
+            params=dict(params or {}),
             timeout_ms=timeout_ms,
             retries=retries,
         )
@@ -97,10 +85,6 @@ class ManagerAPI(ClientFacadeBase):
         timeout_ms: int | None = None,
         retries: int | None = None,
     ) -> Any:
-        return self._request_result(
-            {"type": "manager.telemetry.snapshot"},
-            timeout_ms=timeout_ms,
-            retries=retries,
-        )
+        return self._call_type("manager.telemetry.snapshot", timeout_ms=timeout_ms, retries=retries)
 
 

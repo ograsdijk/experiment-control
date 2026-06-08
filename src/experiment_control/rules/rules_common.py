@@ -33,6 +33,7 @@ class TelemetryBinding:
     device_id: str
     signal: str
     max_age_s: float
+    required: bool = True
 
 
 def parse_version(
@@ -117,12 +118,19 @@ def parse_telemetry_bindings(
                 path=_fmt_path([*path, "telemetry", i, "max_age_s"]),
                 message="max_age_s must be a number",
             ) from None
+        required_raw = binding_raw.get("required", True)
+        if not isinstance(required_raw, bool):
+            raise ConfigError(
+                path=_fmt_path([*path, "telemetry", i, "required"]),
+                message="required must be a boolean",
+            )
         telemetry.append(
             TelemetryBinding(
                 alias=alias,
                 device_id=dev,
                 signal=signal,
                 max_age_s=max_age_val,
+                required=required_raw,
             )
         )
     return telemetry

@@ -115,11 +115,19 @@ class ShmRingWriter:
         try:
             shm = shared_memory.SharedMemory(name=name, create=True, size=total_bytes)
         except FileExistsError:
-            shm = shared_memory.SharedMemory(name=name, create=False)
+            # A previous run died without unlinking; reclaim the name.
+            # Catch (don't `finally: pass`) so a flaky `close()` doesn't
+            # block the subsequent `unlink()`, and a flaky `unlink()`
+            # doesn't block the retry. The retry below will surface a
+            # second FileExistsError if reclaim genuinely failed.
+            stale = shared_memory.SharedMemory(name=name, create=False)
             try:
-                shm.close()
-                shm.unlink()
-            finally:
+                stale.close()
+            except Exception:
+                pass
+            try:
+                stale.unlink()
+            except Exception:
                 pass
             shm = shared_memory.SharedMemory(name=name, create=True, size=total_bytes)
 
