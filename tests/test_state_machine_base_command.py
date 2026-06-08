@@ -1,10 +1,10 @@
 # ruff: noqa: E402
 
-"""Tests for StateMachineProcessBase._command and SequenceError.
+"""Tests for StateMachineProcessBase.command and SequenceError.
 
 These tests instantiate the class via ``__new__`` and set the bare minimum
-of attributes _command needs (``_manager``, ``_process_id``,
-``_sequence_error_cls``, ``_last_command``). This mirrors how downstream
+of attributes command needs (``_manager``, ``_process_id``,
+``sequence_error_cls``, ``_last_command``). This mirrors how downstream
 processes' unit tests construct bare instances and avoids spinning up the
 real manager/poller/heartbeat machinery.
 """
@@ -45,7 +45,7 @@ def _bare_state_machine(
     proc = StateMachineProcessBase.__new__(StateMachineProcessBase)
     proc._manager = manager
     proc._process_id = process_id
-    proc._sequence_error_cls = sequence_error_cls
+    proc.sequence_error_cls = sequence_error_cls
     proc._last_command = None
     return proc
 
@@ -78,7 +78,7 @@ class CommandHappyPathTests(unittest.TestCase):
         )
 
     def test_params_are_copied_not_referenced(self) -> None:
-        # If _command stored the caller's params dict by reference, later
+        # If command stored the caller's params dict by reference, later
         # mutations would show up in _last_command — defending against that.
         mgr = FakeManager({"ok": True})
         proc = _bare_state_machine(mgr)

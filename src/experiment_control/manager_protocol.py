@@ -1,6 +1,6 @@
 """Single source of truth for cross-mixin method signatures.
 
-The Phase 8 mixin migration (REFACTOR_PLAN §8) splits ``Manager`` into
+The manager mixin migration splits ``Manager`` into
 ~16 mixins, each living in its own ``manager_*.py`` file. Mixin
 methods routinely call methods provided by *sibling* mixins, but mypy
 checks each mixin module in isolation — without help, ``self._foo()``

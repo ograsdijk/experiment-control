@@ -645,7 +645,7 @@ class _DeviceWorker(_BaseWorker):
         # transport-level request_id (preserving any caller-supplied
         # one) so the recv loop can drop stale frames via mismatch. The
         # interceptor handler echoes request_id via
-        # process_base._drain_rpc / _rpc_ok / _rpc_err, so well-formed
+        # process_base._drain_rpc / rpc_ok / rpc_err, so well-formed
         # replies are matchable; the lenient match also lets through
         # process_base's bad_request reply ({"request_id": None, ...}).
         outbound = request

@@ -19,7 +19,7 @@ F.19 - ManagerTUI gains _run_bulk_rpc_worker (decorated with
        loop, freezing the TUI for ~N * rpc_timeout_ms during bulk
        start/stop on a stack with many devices/processes.
 
-PR #52 follow-up - StateMachineProcessBase._publish_transition_event
+PR #52 follow-up - StateMachineProcessBase.publish_transition_event
        now records a publish failure into self._last_error AND
        clears that recorded error on a subsequent successful publish.
        Only errors with the matching prefix are cleared so unrelated
@@ -323,7 +323,7 @@ class TUIBulkWorkerTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# PR #52 follow-up: _publish_transition_event records + clears _last_error
+# PR #52 follow-up: publish_transition_event records + clears _last_error
 # ---------------------------------------------------------------------------
 
 

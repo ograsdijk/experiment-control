@@ -12,15 +12,15 @@ uv run ruff check src/experiment_control/utils/command_interceptors.py src/exper
 # Tests (CI uses unittest discover, NOT pytest, because tests import `from tests._temp_utils import ...` and there is no tests/__init__.py)
 uv run python -m unittest discover -s tests -p "test_*.py" -q
 
-# Typecheck (114 pre-existing errors as of 2026-06-01; do not introduce new ones)
+# Typecheck (107 pre-existing errors as of 2026-06-08; do not introduce new ones)
 uv run mypy src/experiment_control
 ```
 
 ## Known pre-existing test/lint state (baseline, do not regress)
 
-- `mypy`: 114 errors in 34 files
+- `mypy`: 107 errors in 32 files
 - `pytest`: collection errors due to missing `tests/__init__.py` — use `unittest discover` instead
-- `unittest discover`: 1 failing test (`test_misc_review_followups.DeviceHealthDemotionTests.test_latch_survives_no_telemetry_signals_tick`) — pre-existing `AttributeError` in `driver.py:1722` for `_telemetry_last_call_errors`. Unrelated to refactor.
+- `unittest discover`: passes (595 tests, 1 skipped as of 2026-06-08).
 
 ## Downstream dependency
 
@@ -28,7 +28,7 @@ The package is consumed by `centrex-experimental-stack` (sibling repo at `..\cen
 
 1. **Manager-client methods**: `call(payload, *, timeout_ms)`, `get_latest(device_id, signal)`, `drain_telemetry()`, `publish_event(topic=, payload=, severity=, device_id=)`
 2. **Response envelope**: `{ok: bool, result?, error?: {code, message}, devices?, status?}`
-3. **Process base hooks** (on `StateMachineProcessBase` / `ManagedProcessBase`): `rpc_ok/rpc_err/rpc_invalid_params/rpc_unknown` plus deprecated `_rpc_ok/_err/_invalid_params/_unknown` aliases, `command` plus deprecated `_command`, `transition`, `handle_state_machine_rpc` plus deprecated `_handle_state_machine_rpc`, `publish_transition_event` plus deprecated `_publish_transition_event`, `append_run_event` if present, `allowed_transitions`, `last_transition`, `sequence_error_cls`, static `_derive_allowed_transitions_from_graph_edges`
+3. **Process base hooks** (on `StateMachineProcessBase` / `ManagedProcessBase`): `rpc_ok/rpc_err/rpc_invalid_params/rpc_unknown`, `command`, `transition`, `handle_state_machine_rpc`, `publish_transition_event`, `append_run_event` if present, `allowed_transitions`, `last_transition`, `sequence_error_cls`, static `_derive_allowed_transitions_from_graph_edges`
 4. **HTTP routes** (exact paths + envelope): `POST /api/{devices,processes}/{id}/call`, `GET /api/processes`, `GET /api/processes/{id}/capabilities`, `GET /api/processes/{id}/cached-call`, `GET /api/snapshots/telemetry`
 5. **ZMQ topics**: `manager.telemetry_update`, `manager.command`
 6. **Importable symbols** (downstream `from experiment_control.X import Y`):

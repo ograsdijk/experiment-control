@@ -17,7 +17,7 @@ This test parses ``manager.py``'s ``__init__`` body for explicit
 mixin-declared annotation agrees. Fields that ``Manager`` initialises
 without an explicit type annotation are ignored — the mixin
 annotation is the source of truth in that case. This catches the
-specific class of drift that prompted REFACTOR_PLAN's pass-5 cleanup
+specific class of drift that prompted the mixin cleanup
 (``LogsMixin._log_history`` declared ``list`` while Manager allocated
 ``deque``).
 """

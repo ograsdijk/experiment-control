@@ -39,10 +39,10 @@ It also exposes transition hooks:
 
 And helper response methods inherited from `ManagedProcessBase`:
 
-- `_rpc_ok(...)`
-- `_rpc_err(...)`
-- `_rpc_unknown(...)`
-- `_rpc_invalid_params(...)`
+- `rpc_ok(...)`
+- `rpc_err(...)`
+- `rpc_unknown(...)`
+- `rpc_invalid_params(...)`
 
 ## Minimal Subclass Pattern
 
@@ -78,10 +78,10 @@ class ExampleProcess(StateMachineProcessBase):
             pass
 
     def _handle_rpc(self, req: dict[str, object]) -> dict[str, object]:
-        base = self._handle_state_machine_rpc(req)
+        base = self.handle_state_machine_rpc(req)
         if base is not None:
             return base
-        return self._rpc_unknown(req)
+        return self.rpc_unknown(req)
 ```
 
 ## RPC Model

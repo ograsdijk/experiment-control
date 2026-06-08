@@ -18,7 +18,7 @@ F.32 - stop_process_handle publishes manager.process.failed (not .exited)
 F.33 - route_manager_cleanup_orphans caps user-supplied timeout_s at
        _CLEANUP_ORPHANS_TIMEOUT_CAP_S (was: unbounded — could stall the
        manager loop for minutes).
-F.34 - _publish_transition_event records publish failures into
+F.34 - publish_transition_event records publish failures into
        _last_error (was: bare `except: pass`).
 """
 
@@ -475,7 +475,7 @@ class CleanupOrphansTimeoutCapTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# F.34 — _publish_transition_event surfaces failure into _last_error
+# F.34 — publish_transition_event surfaces failure into _last_error
 # ---------------------------------------------------------------------------
 
 

@@ -2,7 +2,7 @@
 
 """Phase 8 cross-mixin protocol coverage.
 
-The mixin migration (REFACTOR_PLAN §8) splits ``Manager`` across many
+The mixin migration splits ``Manager`` across many
 ``manager_*.py`` modules. Each mixin method that calls a sibling
 method types ``self`` against :class:`ManagerProtocol`. This test
 guards against drift between the Protocol declarations and the actual
