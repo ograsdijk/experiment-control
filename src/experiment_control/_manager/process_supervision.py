@@ -415,7 +415,7 @@ def build_router_spec(
     process_spec_cls: Any,
     restart_policy_always: Any,
 ) -> Any:
-    router_path = Path(__file__).resolve().parent / "processes" / "device_router.py"
+    router_path = Path(__file__).resolve().parents[1] / "processes" / "device_router.py"
     router_heartbeat_timeout_s = max(
         3.0,
         (float(manager._device_rpc_timeout_ms) / 1000.0) + 2.0,
