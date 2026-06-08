@@ -18,6 +18,15 @@ from .utils.manager_network import derive_local_connect_endpoint
 Json = dict[str, Any]
 
 
+# Cap on consecutive popen.kill() retries inside
+# `enforce_managed_process_stop_timeout` before the handle is escalated
+# to FAILED. Five attempts at the supervise-tick rate (~10 Hz) means
+# the operator sees a clear failure within half a second of the OS
+# refusing to clean up the zombie process, instead of the watchdog
+# silently spamming kill() forever.
+_MAX_KILL_ATTEMPTS = 5
+
+
 # Topics emitted by `_publish_process_event` / `_publish_driver_event` that
 # should carry the full diagnostic payload (tail logs, signal name, etc.).
 FAILURE_PROCESS_TOPICS: frozenset[str] = frozenset(
@@ -659,6 +668,10 @@ def start_process_handle(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
+        # Fresh process: reset the kill-attempt counter tracked by
+        # enforce_managed_process_stop_timeout so a restarted handle
+        # gets the full _MAX_KILL_ATTEMPTS budget before re-escalating.
+        handle.kill_attempts = 0
     except Exception as exc:
         handle.popen = None
         handle.pid = None
@@ -732,12 +745,40 @@ def stop_process_handle(manager: Any, handle: Any) -> None:
         handle.state = _enum_member(handle.state, "STOPPED")
         return
     if handle.popen.poll() is not None:
-        handle.state = _enum_member(handle.state, "EXITED")
-        handle.last_exit_code = handle.popen.poll()
+        rc = handle.popen.poll()
+        handle.last_exit_code = rc
+        # Capture the pid BEFORE clearing popen so the FAILED branch
+        # below can populate handle.last_failure_pid. Mirrors the same
+        # capture-before-clear pattern in update_managed_process_exit_state
+        # (line 1199); without it, consumers of manager.process.failed
+        # (manager.py:3253 reads handle.last_failure_pid for the failure
+        # report) see stale-or-None pid only on this stop-detected-crash
+        # code path.
+        exiting_pid = handle.popen_pid or handle.pid
         handle.popen = None
         handle.rpc_endpoint = None
         manager._close_process_rpc(handle)
-        manager._publish_process_event("manager.process.exited", handle)
+        # A process we're "stopping" that has already died with a
+        # non-zero exit code is a crashed process, not a clean exit;
+        # mirror update_managed_process_exit_state's classification so
+        # the manager.process.* event accurately reflects what
+        # happened. Without this, an operator-initiated stop on an
+        # already-crashed process showed up as ".exited" with no
+        # diagnostic.
+        if isinstance(rc, int) and rc != 0:
+            handle.state = _enum_member(handle.state, "FAILED")
+            handle.last_failure_pid = exiting_pid
+            handle.last_signal_name = derive_signal_name(int(rc))
+            handle.last_error_kind = (
+                handle.last_error_kind or "nonzero_exit"
+            )
+            if not handle.last_error:
+                description = describe_exit_code(int(rc)) or f"exit code {rc}"
+                handle.last_error = f"process exited: {description}"
+            manager._publish_process_event("manager.process.failed", handle)
+        else:
+            handle.state = _enum_member(handle.state, "EXITED")
+            manager._publish_process_event("manager.process.exited", handle)
         return
 
     graceful_requested = False
@@ -1354,10 +1395,27 @@ def enforce_managed_process_stop_timeout(
         return
     if now_mono - handle.stop_requested_t_mono <= handle.spec.shutdown_timeout_s:
         return
+    # The process has ignored the graceful-stop window. Kill it. Without
+    # a cap this used to fire kill() on every supervise tick (typically
+    # tens of times per second) producing log spam, and never escalating
+    # the state out of STOPPING if the OS held the pid in zombie state.
+    # Track the kill attempts on the handle: after N tries, mark FAILED
+    # so the operator (and the manager's recovery logic at
+    # _maybe_schedule_restart) can take over instead of waiting forever.
+    handle.kill_attempts = int(getattr(handle, "kill_attempts", 0)) + 1
     try:
         handle.popen.kill()
     except Exception as exc:
         handle.last_error = str(exc)
+    if handle.kill_attempts >= _MAX_KILL_ATTEMPTS:
+        handle.state = _enum_member(handle.state, "FAILED")
+        handle.last_error_kind = handle.last_error_kind or "kill_escalated"
+        if not handle.last_error:
+            handle.last_error = (
+                f"process refused to exit after {handle.kill_attempts} "
+                f"kill() attempts (last poll() = None)"
+            )
+        manager._publish_process_event("manager.process.failed", handle)
 
 
 def maybe_restart_managed_process(manager: Any, handle: Any, now_mono: float) -> None:
