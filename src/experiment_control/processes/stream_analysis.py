@@ -11,7 +11,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from graphlib import TopologicalSorter
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 import numpy as np
 import zmq
@@ -311,7 +311,15 @@ class BinStatsState:
                 var = np.where(self.counts > 0, self.sums_sq / counts_f - mean * mean, np.nan)
                 var = np.where(var < 0, 0.0, var)
                 std = np.sqrt(var)
-                sem = np.where(self.counts > 0, std / np.sqrt(counts_f), np.nan)
+                # SEM is undefined for n<=1 (a single sample has no
+                # spread). Previously this returned 0 (std=0/sqrt(1)),
+                # which falsely communicated "perfectly known mean" to
+                # downstream consumers (UI error bars, fit weights).
+                # Return NaN so consumers can render "n/a" or skip the
+                # bin in weighted fits.
+                sem = np.where(
+                    self.counts > 1, std / np.sqrt(counts_f), np.nan
+                )
         else:
             mean = np.zeros(0, dtype=np.float64)
             std = np.zeros(0, dtype=np.float64)
@@ -637,7 +645,10 @@ class Bin2DStatsState:
             var = np.where(self.counts > 0, self.sums_sq / counts_f - mean * mean, np.nan)
             var = np.where(var < 0, 0.0, var)
             std = np.sqrt(var)
-            sem = np.where(self.counts > 0, std / np.sqrt(counts_f), np.nan)
+            # SEM is undefined for n<=1 — see the 1D BinStatsState.payload
+            # comment for rationale. Return NaN so consumers don't read
+            # a single-sample bin as a perfectly-known mean.
+            sem = np.where(self.counts > 1, std / np.sqrt(counts_f), np.nan)
             min_grid = np.where(self.counts > 0, self.mins, np.nan)
             max_grid = np.where(self.counts > 0, self.maxs, np.nan)
 
@@ -2318,6 +2329,7 @@ def _validate_source_telemetry_nearest_node(node: NodeSpec) -> None:
 
 
 def _validate_node_scalar_threshold(
+    *,
     node: NodeSpec,
     source_stream_nodes: list[str],
 ) -> None:
@@ -2326,6 +2338,7 @@ def _validate_node_scalar_threshold(
 
 
 def _validate_node_trace_rolling_mean(
+    *,
     node: NodeSpec,
     source_stream_nodes: list[str],
 ) -> None:
@@ -2334,6 +2347,7 @@ def _validate_node_trace_rolling_mean(
 
 
 def _validate_node_trace_decimate(
+    *,
     node: NodeSpec,
     source_stream_nodes: list[str],
 ) -> None:
@@ -2342,6 +2356,7 @@ def _validate_node_trace_decimate(
 
 
 def _validate_node_fit_curve_1d(
+    *,
     node: NodeSpec,
     source_stream_nodes: list[str],
 ) -> None:
@@ -2350,6 +2365,7 @@ def _validate_node_fit_curve_1d(
 
 
 def _validate_node_fit_from_hist(
+    *,
     node: NodeSpec,
     source_stream_nodes: list[str],
 ) -> None:
@@ -2358,6 +2374,7 @@ def _validate_node_fit_from_hist(
 
 
 def _validate_node_fit_param(
+    *,
     node: NodeSpec,
     source_stream_nodes: list[str],
 ) -> None:
@@ -2366,6 +2383,7 @@ def _validate_node_fit_param(
 
 
 def _validate_node_aggregate_bin_stats(
+    *,
     node: NodeSpec,
     source_stream_nodes: list[str],
 ) -> None:
@@ -2374,6 +2392,7 @@ def _validate_node_aggregate_bin_stats(
 
 
 def _validate_node_aggregate_bin2d_stats(
+    *,
     node: NodeSpec,
     source_stream_nodes: list[str],
 ) -> None:
@@ -2382,6 +2401,7 @@ def _validate_node_aggregate_bin2d_stats(
 
 
 def _validate_node_source_context_field(
+    *,
     node: NodeSpec,
     source_stream_nodes: list[str],
 ) -> None:
@@ -2390,6 +2410,7 @@ def _validate_node_source_context_field(
 
 
 def _validate_node_source_telemetry_nearest(
+    *,
     node: NodeSpec,
     source_stream_nodes: list[str],
 ) -> None:
@@ -2398,6 +2419,7 @@ def _validate_node_source_telemetry_nearest(
 
 
 def _validate_node_record_field(
+    *,
     node: NodeSpec,
     source_stream_nodes: list[str],
 ) -> None:
@@ -2408,6 +2430,7 @@ def _validate_node_record_field(
 
 
 def _validate_node_record_filter_eq(
+    *,
     node: NodeSpec,
     source_stream_nodes: list[str],
 ) -> None:
@@ -2417,7 +2440,16 @@ def _validate_node_record_filter_eq(
         raise ValueError(f"node {node.node_id!r} {node.op} requires field")
 
 
-_NODE_OP_PARAM_VALIDATORS: dict[str, Callable[[NodeSpec, list[str]], None]] = {
+# All validators take node + source_stream_nodes as keyword-only args.
+# The Protocol below documents the exact signature so the dict's value
+# type matches what's actually invoked at the call site (kwargs).
+class _NodeValidator(Protocol):
+    def __call__(
+        self, *, node: NodeSpec, source_stream_nodes: list[str]
+    ) -> None: ...
+
+
+_NODE_OP_PARAM_VALIDATORS: dict[str, _NodeValidator] = {
     "source.stream": _validate_source_stream_node,
     "source.records": _validate_source_records_node,
     "source.context_field": _validate_node_source_context_field,

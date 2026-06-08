@@ -93,78 +93,88 @@ def call_device_rpc(
     if handle is None or handle.rpc_endpoint is None:
         raise RuntimeError(f"Device {device_id!r} is not registered")
 
-    sock = _ensure_device_req_socket(manager, handle)
-    effective_timeout = manager._device_rpc_timeout_ms if timeout_ms is None else timeout_ms
-    caller_process_id_text = manager._normalize_id(caller_process_id)
-    source_kind_text, source_id_text = manager._normalize_command_source(
-        source_kind=source_kind,
-        source_id=source_id,
-        caller_process_id=caller_process_id_text,
-    )
-    sock.setsockopt(zmq.RCVTIMEO, int(effective_timeout))
-    sock.setsockopt(zmq.SNDTIMEO, int(effective_timeout))
-    try:
-        manager._rpc_seq += 1
-        envelope = {
-            "id": manager._rpc_seq,
-            "action": action,
-            "params": params,
-        }
-        manager._send_json(sock, envelope)
-        deadline = time.monotonic() + (effective_timeout / 1000.0)
-        resp: Json | None = None
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
+    # Serialise the full REQ-socket cycle (ensure-socket + setsockopt +
+    # send + recv-loop + state-bump + close-on-failure) per handle.
+    # ZMQ REQ sockets are not thread-safe; without this guard,
+    # concurrent lifecycle workers dispatching commands to the same
+    # device interleave send/recv and break the REQ state machine.
+    # Held across the whole call so the rpc_fail_count and rpc_sock
+    # mutations on the failure path stay consistent with the in-flight
+    # send. rpc_lock is an RLock so the except branch's
+    # _close_device_rpc re-entry on the same thread does not deadlock.
+    with handle.rpc_lock:
+        sock = _ensure_device_req_socket(manager, handle)
+        effective_timeout = manager._device_rpc_timeout_ms if timeout_ms is None else timeout_ms
+        caller_process_id_text = manager._normalize_id(caller_process_id)
+        source_kind_text, source_id_text = manager._normalize_command_source(
+            source_kind=source_kind,
+            source_id=source_id,
+            caller_process_id=caller_process_id_text,
+        )
+        sock.setsockopt(zmq.RCVTIMEO, int(effective_timeout))
+        sock.setsockopt(zmq.SNDTIMEO, int(effective_timeout))
+        try:
+            manager._rpc_seq += 1
+            envelope = {
+                "id": manager._rpc_seq,
+                "action": action,
+                "params": params,
+            }
+            manager._send_json(sock, envelope)
+            deadline = time.monotonic() + (effective_timeout / 1000.0)
+            resp: Json | None = None
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise zmq.Again()
+                step_ms = int(min(50.0, remaining * 1000.0))
+                if sock.poll(step_ms, zmq.POLLIN):
+                    resp = manager._recv_json(sock)
+                    break
+                _pump_manager_subscriptions(manager)
+            if resp is None:
                 raise zmq.Again()
-            step_ms = int(min(50.0, remaining * 1000.0))
-            if sock.poll(step_ms, zmq.POLLIN):
-                resp = manager._recv_json(sock)
-                break
-            _pump_manager_subscriptions(manager)
-        if resp is None:
-            raise zmq.Again()
-        handle.rpc_fail_count = 0
-        handle.rpc_last_fail_t_mono = None
-        payload = _build_manager_command_payload(
-            manager,
-            device_id=device_id,
-            action=action,
-            params=params,
-            ok=_effective_status_ok(resp),
-            status=resp.get("status"),
-            error=resp.get("error"),
-            result=resp.get("result"),
-            source_kind=source_kind_text,
-            source_id=source_id_text,
-            is_remote_target=bool(is_remote_target),
-            request_id=request_id,
-            caller_process_id=caller_process_id_text,
-        )
-        manager._publish_manager_event("manager.command", payload)
-        return resp
-    except Exception as e:
-        handle.rpc_fail_count += 1
-        handle.rpc_last_fail_t_mono = time.monotonic()
-        if handle.rpc_fail_count >= 2:
-            manager._close_device_rpc(handle)
-        payload = _build_manager_command_payload(
-            manager,
-            device_id=device_id,
-            action=action,
-            params=params,
-            ok=False,
-            status=None,
-            error=str(e),
-            result="",
-            source_kind=source_kind_text,
-            source_id=source_id_text,
-            is_remote_target=bool(is_remote_target),
-            request_id=request_id,
-            caller_process_id=caller_process_id_text,
-        )
-        manager._publish_manager_event("manager.command", payload)
-        raise
+            handle.rpc_fail_count = 0
+            handle.rpc_last_fail_t_mono = None
+            payload = _build_manager_command_payload(
+                manager,
+                device_id=device_id,
+                action=action,
+                params=params,
+                ok=_effective_status_ok(resp),
+                status=resp.get("status"),
+                error=resp.get("error"),
+                result=resp.get("result"),
+                source_kind=source_kind_text,
+                source_id=source_id_text,
+                is_remote_target=bool(is_remote_target),
+                request_id=request_id,
+                caller_process_id=caller_process_id_text,
+            )
+            manager._publish_manager_event("manager.command", payload)
+            return resp
+        except Exception as e:
+            handle.rpc_fail_count += 1
+            handle.rpc_last_fail_t_mono = time.monotonic()
+            if handle.rpc_fail_count >= 2:
+                manager._close_device_rpc(handle)
+            payload = _build_manager_command_payload(
+                manager,
+                device_id=device_id,
+                action=action,
+                params=params,
+                ok=False,
+                status=None,
+                error=str(e),
+                result="",
+                source_kind=source_kind_text,
+                source_id=source_id_text,
+                is_remote_target=bool(is_remote_target),
+                request_id=request_id,
+                caller_process_id=caller_process_id_text,
+            )
+            manager._publish_manager_event("manager.command", payload)
+            raise
 
 
 def _ensure_process_dealer_socket(manager: Any, handle: Any) -> zmq.Socket:
@@ -203,34 +213,44 @@ def call_process_rpc(
     if handle.rpc_endpoint is None:
         raise RuntimeError("process rpc endpoint not ready")
 
-    sock = _ensure_process_dealer_socket(manager, handle)
-    effective_timeout = manager._device_rpc_timeout_ms if timeout_ms is None else timeout_ms
-    sock.setsockopt(zmq.RCVTIMEO, int(effective_timeout))
-    sock.setsockopt(zmq.SNDTIMEO, int(effective_timeout))
-    expected_request_id = request.get("request_id")
-    try:
-        _drain_stale_replies(sock)
-        manager._send_json(sock, request)
-        deadline = time.monotonic() + (int(effective_timeout) / 1000.0)
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise zmq.Again()
-            step_ms = int(min(50.0, max(1.0, remaining * 1000.0)))
-            if not sock.poll(step_ms, zmq.POLLIN):
-                _pump_manager_subscriptions(manager)
-                continue
-            resp = manager._recv_json(sock)
-            if not isinstance(resp, dict):
-                continue
-            if expected_request_id is not None and resp.get("request_id") != expected_request_id:
-                continue
-            break
-        handle.rpc_fail_count = 0
-        handle.rpc_last_fail_t_mono = None
-        return resp
-    except Exception:
-        handle.rpc_fail_count += 1
-        handle.rpc_last_fail_t_mono = time.monotonic()
-        manager._close_process_rpc(handle)
-        raise
+    # Serialise the full DEALER-socket cycle per handle. ZMQ DEALER
+    # sockets are not thread-safe; without this guard, concurrent
+    # lifecycle workers (interceptor-invoke + process-command + the
+    # supervisor's stop path) interleave send/recv on the same DEALER
+    # and either tangle request_id correlation (different in-flight
+    # requests see each other's replies) or trigger ZMQ EFSM. Held
+    # across the whole call so close-on-failure stays consistent.
+    # rpc_lock is an RLock so the except branch's _close_process_rpc
+    # re-entry on the same thread does not deadlock.
+    with handle.rpc_lock:
+        sock = _ensure_process_dealer_socket(manager, handle)
+        effective_timeout = manager._device_rpc_timeout_ms if timeout_ms is None else timeout_ms
+        sock.setsockopt(zmq.RCVTIMEO, int(effective_timeout))
+        sock.setsockopt(zmq.SNDTIMEO, int(effective_timeout))
+        expected_request_id = request.get("request_id")
+        try:
+            _drain_stale_replies(sock)
+            manager._send_json(sock, request)
+            deadline = time.monotonic() + (int(effective_timeout) / 1000.0)
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise zmq.Again()
+                step_ms = int(min(50.0, max(1.0, remaining * 1000.0)))
+                if not sock.poll(step_ms, zmq.POLLIN):
+                    _pump_manager_subscriptions(manager)
+                    continue
+                resp = manager._recv_json(sock)
+                if not isinstance(resp, dict):
+                    continue
+                if expected_request_id is not None and resp.get("request_id") != expected_request_id:
+                    continue
+                break
+            handle.rpc_fail_count = 0
+            handle.rpc_last_fail_t_mono = None
+            return resp
+        except Exception:
+            handle.rpc_fail_count += 1
+            handle.rpc_last_fail_t_mono = time.monotonic()
+            manager._close_process_rpc(handle)
+            raise
