@@ -44,6 +44,20 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
+def _format_for_bind(bind: dict[str, str]) -> str:
+    """Render a ForStep.bind dict as a human-readable loop-variable list.
+
+    The single-name form (`bind = {"value": "x"}`) renders as `x`; the
+    multi-name form renders as `key=name, key=name` so the rendered text
+    distinguishes the field name from the bound alias.
+    """
+    if not bind:
+        return "?"
+    if len(bind) == 1 and "value" in bind:
+        return str(bind["value"])
+    return ", ".join(f"{key}={name}" for key, name in bind.items())
+
+
 def _render_templates_safe(value: Any, env: dict[str, Any]) -> Any:
     if isinstance(value, str):
         try:
@@ -282,7 +296,7 @@ def _text_lines_for_step(
 
     if isinstance(step, ForStep):
         expr = _format_value(step.in_expr, resolve=resolve, env=env)
-        lines.append(f"{prefix}for {step.var} in {expr}:")
+        lines.append(f"{prefix}for {_format_for_bind(step.bind)} in {expr}:")
         lines.extend(
             _text_lines_for_steps(step.body, resolve=resolve, env=env, indent=indent + 1)
         )
@@ -443,7 +457,9 @@ class _MermaidBuilder:
 
         if isinstance(step, ForStep):
             expr = _expr_to_str(step.in_expr, resolve=self._resolve, env=self._env)
-            loop = self._new_node(f"for {step.var} in {expr}", shape="circle")
+            loop = self._new_node(
+                f"for {_format_for_bind(step.bind)} in {expr}", shape="circle"
+            )
             body_entry, body_exit = self.build_steps(step.body)
             join = self._new_node("end for", shape="circle")
             self._add_edge(loop, body_entry, "iter")

@@ -46,6 +46,7 @@ class ManagerLogTailTests(unittest.TestCase):
         mgr._log_history = []  # type: ignore[attr-defined]
         mgr._supervisor_log_queue = queue.Queue()  # type: ignore[attr-defined]
         mgr._supervisor_log_dropped = 0  # type: ignore[attr-defined]
+        mgr._supervisor_log_dropped_lock = threading.Lock()  # type: ignore[attr-defined]
         mgr._supervisor_pending_blocks = {}  # type: ignore[attr-defined]
         mgr._supervisor_log_threads = {}  # type: ignore[attr-defined]
         mgr._published_events = []  # type: ignore[attr-defined]
