@@ -209,11 +209,41 @@ def _load_ruleset_text(text: str, *, source: str) -> Ruleset:
     return _parse_ruleset(raw, source=source)
 
 
-def _collect_rulesets(paths: list[Path]) -> list[RulesetEntry]:
+def collect_rulesets(paths: list[Path]) -> list[RulesetEntry]:
     rulesets: list[RulesetEntry] = []
     for path in paths:
         rulesets.append(RulesetEntry(ruleset=_load_ruleset(path), enabled=True, source=str(path)))
     return rulesets
+
+
+def resolve_rule_paths(
+    *,
+    rules: str | Path | list[str | Path] | None = None,
+    rules_dir: str | Path | None = None,
+) -> list[Path]:
+    """Resolve `rules` / `rules_dir` kwargs into a flat ordered list of Paths.
+
+    Mirrors the CLI's `--rules` / `--rules-dir` semantics: each `rules` entry
+    is expanduser+resolve'd; `rules_dir` is globbed for ``*.yml`` and ``*.yaml``
+    in sorted order. Either, both, or neither may be provided.
+
+    Returns an empty list when neither is given; callers decide whether that is
+    an error in their context.
+    """
+    paths: list[Path] = []
+    if rules is not None:
+        items: list[str | Path]
+        if isinstance(rules, (str, Path)):
+            items = [rules]
+        else:
+            items = list(rules)
+        for raw in items:
+            paths.append(Path(str(raw)).expanduser().resolve())
+    if rules_dir is not None:
+        rules_dir_path = Path(str(rules_dir)).expanduser().resolve()
+        for path in sorted(rules_dir_path.glob("*.yml")) + sorted(rules_dir_path.glob("*.yaml")):
+            paths.append(path)
+    return paths
 
 
 def _collect_routes(rulesets: list[Ruleset]) -> list[Json]:
@@ -262,11 +292,41 @@ def _telemetry_error(
 def _resolve_binding_age_s(sample: dict[str, Any], *, now_mono: float) -> float | None:
     age_s = sample.get("age_s")
     if age_s is not None:
-        return float(age_s)
+        try:
+            return float(age_s)
+        except Exception:
+            return None
     t_mono = sample.get("t_mono")
     if t_mono is None:
         return None
-    return now_mono - float(t_mono)
+    try:
+        return now_mono - float(t_mono)
+    except Exception:
+        return None
+
+
+def _optional_binding_env(
+    *,
+    binding: TelemetryBinding,
+    sample: dict[str, Any] | None,
+    ok: bool,
+    reason: str,
+    age_s: float | None,
+) -> Json:
+    return {
+        "available": sample is not None,
+        "ok": bool(ok),
+        "value": None if sample is None else sample.get("value"),
+        "units": None if sample is None else sample.get("units"),
+        "quality": "MISSING" if sample is None else str(sample.get("quality", "MISSING")),
+        "t_mono": None if sample is None else sample.get("t_mono"),
+        "t_wall": None if sample is None else sample.get("t_wall"),
+        "age_s": age_s,
+        "reason": reason,
+        "device": binding.device_id,
+        "signal": binding.signal,
+        "max_age_s": binding.max_age_s,
+    }
 
 
 def _resolve_interlock_telemetry_env(
@@ -279,6 +339,17 @@ def _resolve_interlock_telemetry_env(
     for binding in rule.telemetry:
         sample = telemetry_getter(binding.device_id, binding.signal)
         if sample is None:
+            if not binding.required:
+                env[binding.alias] = to_attrdict(
+                    _optional_binding_env(
+                        binding=binding,
+                        sample=None,
+                        ok=False,
+                        reason="missing",
+                        age_s=None,
+                    )
+                )
+                continue
             err = _telemetry_error(
                 code="TELEMETRY_MISSING",
                 message=f"Telemetry missing for {binding.device_id}.{binding.signal}",
@@ -288,6 +359,17 @@ def _resolve_interlock_telemetry_env(
             return env, err
         quality = str(sample.get("quality", "MISSING"))
         if quality != "OK":
+            if not binding.required:
+                env[binding.alias] = to_attrdict(
+                    _optional_binding_env(
+                        binding=binding,
+                        sample=sample,
+                        ok=False,
+                        reason=f"quality={quality}",
+                        age_s=_resolve_binding_age_s(sample, now_mono=now_mono),
+                    )
+                )
+                continue
             err = _telemetry_error(
                 code="TELEMETRY_NOT_OK",
                 message=f"Telemetry not OK for {binding.device_id}.{binding.signal}",
@@ -297,6 +379,17 @@ def _resolve_interlock_telemetry_env(
             return env, err
         age_s = _resolve_binding_age_s(sample, now_mono=now_mono)
         if age_s is None:
+            if not binding.required:
+                env[binding.alias] = to_attrdict(
+                    _optional_binding_env(
+                        binding=binding,
+                        sample=sample,
+                        ok=False,
+                        reason="missing timestamp",
+                        age_s=None,
+                    )
+                )
+                continue
             err = _telemetry_error(
                 code="TELEMETRY_MISSING",
                 message=f"Telemetry missing timestamp for {binding.device_id}.{binding.signal}",
@@ -305,6 +398,17 @@ def _resolve_interlock_telemetry_env(
             )
             return env, err
         if age_s > binding.max_age_s:
+            if not binding.required:
+                env[binding.alias] = to_attrdict(
+                    _optional_binding_env(
+                        binding=binding,
+                        sample=sample,
+                        ok=False,
+                        reason=f"stale: age={age_s:.3f}s",
+                        age_s=float(age_s),
+                    )
+                )
+                continue
             err = _telemetry_error(
                 code="TELEMETRY_STALE",
                 message=f"Telemetry stale for {binding.device_id}.{binding.signal}",
@@ -315,21 +419,38 @@ def _resolve_interlock_telemetry_env(
             return env, err
         env[binding.alias] = to_attrdict(
             {
+                "available": True,
+                "ok": True,
                 "value": sample.get("value"),
                 "units": sample.get("units"),
                 "quality": quality,
                 "t_mono": sample.get("t_mono"),
                 "t_wall": sample.get("t_wall"),
                 "age_s": float(age_s),
+                "reason": None,
+                "device": binding.device_id,
+                "signal": binding.signal,
+                "max_age_s": binding.max_age_s,
             }
         )
     return env, None
 
 
-def _evaluate_interlock_condition(rule: Rule, env: dict[str, Any]) -> bool:
+def _evaluate_interlock_condition(
+    rule: Rule,
+    env: dict[str, Any],
+    *,
+    on_condition_error: Callable[[BaseException], None] | None = None,
+) -> bool:
     try:
         return bool(eval_condition(rule.condition, env))
-    except Exception:
+    except Exception as e:
+        if on_condition_error is not None:
+            try:
+                on_condition_error(e)
+            except Exception:
+                # Diagnostic callback failure must not affect rule eval.
+                pass
         return False
 
 
@@ -382,7 +503,23 @@ def evaluate_interlock_rule(
     cmd: Json,
     telemetry_getter: Callable[[str, str], dict[str, Any] | None],
     now_mono: float,
+    on_condition_error: Callable[[BaseException], None] | None = None,
 ) -> tuple[str, Json | None, Json | None]:
+    """Evaluate one interlock rule against a candidate command.
+
+    Returns the 3-tuple `(verdict, new_cmd, error)` where verdict is
+    "allow" / "reject" / "transform". Tuple shape preserved for
+    backwards compatibility with downstream callers that destructure
+    `verdict, new_cmd, err = evaluate_interlock_rule(...)`.
+
+    `on_condition_error`, when supplied, is invoked with the exception
+    raised by `eval_condition(rule.condition, env)`. Default `None`
+    preserves the previous silent-failure-as-reject behaviour. The
+    InterlockProcess passes a rate-limited callback so a misconfigured
+    rule (typo in field name, divide-by-zero, etc.) surfaces as a
+    `manager.interlock.rule_error` event instead of appearing as a
+    permanent "CONDITION_FAILED" with no diagnostic.
+    """
     env = _build_interlock_env(cmd)
     telemetry_env, telemetry_err = _resolve_interlock_telemetry_env(
         rule=rule,
@@ -392,7 +529,9 @@ def evaluate_interlock_rule(
     if telemetry_err is not None:
         return "reject", None, telemetry_err
     env.update(telemetry_env)
-    cond_ok = _evaluate_interlock_condition(rule, env)
+    cond_ok = _evaluate_interlock_condition(
+        rule, env, on_condition_error=on_condition_error
+    )
     if not cond_ok:
         return "reject", None, _condition_failed_error(rule)
 
@@ -405,6 +544,31 @@ def evaluate_interlock_rule(
     return "allow", None, None
 
 
+def _normalize_rulesets_arg(
+    *,
+    rulesets: list[RulesetEntry] | None,
+    rules: str | Path | list[str | Path] | None,
+    rules_dir: str | Path | None,
+) -> list[RulesetEntry]:
+    """Allow callers to supply `rulesets=` (pre-parsed) OR `rules=`/`rules_dir=`.
+
+    The two paths are mutually exclusive so a caller can't accidentally pass
+    both and get silent priority confusion.
+    """
+    if rulesets is not None:
+        if rules is not None or rules_dir is not None:
+            raise ValueError(
+                "pass either rulesets= or rules=/rules_dir=, not both"
+            )
+        return rulesets
+    paths = resolve_rule_paths(rules=rules, rules_dir=rules_dir)
+    if not paths:
+        raise ValueError(
+            "no rules provided: pass rulesets=, rules=, or rules_dir="
+        )
+    return collect_rulesets(paths)
+
+
 class InterlockProcess(ManagedProcessBase):
     def __init__(
         self,
@@ -415,8 +579,13 @@ class InterlockProcess(ManagedProcessBase):
         rpc_timeout_ms: int,
         heartbeat_endpoint: str | None,
         heartbeat_period_s: float,
-        rulesets: list[RulesetEntry],
+        rulesets: list[RulesetEntry] | None = None,
+        rules: str | Path | list[str | Path] | None = None,
+        rules_dir: str | Path | None = None,
     ) -> None:
+        rulesets = _normalize_rulesets_arg(
+            rulesets=rulesets, rules=rules, rules_dir=rules_dir
+        )
         super().__init__(
             process_id=process_id,
             heartbeat_endpoint=heartbeat_endpoint,
@@ -446,6 +615,14 @@ class InterlockProcess(ManagedProcessBase):
         )
         self._init_poller()
 
+        # Rate-limit state for rule-condition error events. A misconfigured
+        # rule (typo in field name, divide-by-zero etc.) that raises on
+        # every command would otherwise flood manager.interlock.rule_error.
+        # Cap at one event per `_rule_error_period_s` seconds per
+        # (interceptor_id, rule_name).
+        self._rule_error_last_mono: dict[tuple[str, str], float] = {}
+        self._rule_error_period_s: float = 30.0
+
         self._advertise_process_rpc()
         self._register_routes()
         self._start_heartbeat_thread(state_provider=lambda: "RUNNING")
@@ -467,6 +644,41 @@ class InterlockProcess(ManagedProcessBase):
 
     def _rule_enabled_state(self, interceptor_id: str, rule_id: str) -> bool:
         return bool(self._rule_enabled.get(self._rule_key(interceptor_id, rule_id), True))
+
+    def _make_condition_error_callback(
+        self, *, interceptor_id: str, rule_name: str
+    ) -> Callable[[BaseException], None]:
+        """Build a per-(interceptor_id, rule_name) callback that
+        publishes a rate-limited rule_error event when the rule's
+        condition expression raises. Before this fix,
+        `_evaluate_interlock_condition` swallowed all exceptions
+        silently — a misconfigured rule appeared as a permanent
+        "CONDITION_FAILED" rejection with no diagnostic, leaving
+        operators with no way to tell a bad rule from a real interlock.
+        """
+        rate_key = (interceptor_id, rule_name)
+
+        def _callback(exc: BaseException) -> None:
+            now = time.monotonic()
+            last = self._rule_error_last_mono.get(rate_key)
+            if last is not None and (now - last) < self._rule_error_period_s:
+                return
+            self._rule_error_last_mono[rate_key] = now
+            try:
+                self._manager_helper.publish_event(
+                    self._manager,
+                    topic="manager.interlock.rule_error",
+                    payload={
+                        "process_id": self._process_id,
+                        "interceptor_id": interceptor_id,
+                        "rule": rule_name,
+                        "error": repr(exc),
+                    },
+                )
+            except Exception:
+                pass
+
+        return _callback
 
     def _routes_for_enabled_rules(self) -> list[Json]:
         routes: list[Json] = []
@@ -495,6 +707,7 @@ class InterlockProcess(ManagedProcessBase):
                     "device_id": binding.device_id,
                     "signal": binding.signal,
                     "max_age_s": binding.max_age_s,
+                    "required": binding.required,
                 }
                 for binding in rule.telemetry
             ],
@@ -525,11 +738,19 @@ class InterlockProcess(ManagedProcessBase):
             "routes": routes,
             "replace": True,
         }
-        resp = self._manager.call(payload)
+        resp = self._require_manager().call(payload)
         if resp is None:
             raise RuntimeError("Failed to register interlock routes: no response")
         if not isinstance(resp, dict) or not resp.get("ok", False):
             raise RuntimeError(f"Failed to register interlock routes: {resp}")
+
+    def _graceful_stop(self) -> None:
+        # super()._graceful_stop() sets _stop_evt and must always run so the
+        # process actually exits, even if the manager round-trip fails.
+        try:
+            self._unregister_command_interceptor_routes()
+        finally:
+            super()._graceful_stop()
 
     def _interlock_capability_members(self) -> list[Json]:
         members = [
@@ -919,8 +1140,12 @@ class InterlockProcess(ManagedProcessBase):
                 verdict, new_cmd, err = evaluate_interlock_rule(
                     rule=rule,
                     cmd=cur_cmd,
-                    telemetry_getter=self._manager.get_latest,
+                    telemetry_getter=self._require_manager().get_latest,
                     now_mono=now_mono,
+                    on_condition_error=self._make_condition_error_callback(
+                        interceptor_id=ruleset.interceptor_id,
+                        rule_name=rule.name,
+                    ),
                 )
                 if verdict == "reject":
                     return {
@@ -981,7 +1206,7 @@ class InterlockProcess(ManagedProcessBase):
 
     def run(self) -> None:
         try:
-            while True:
+            while not self._stop_evt.is_set():
                 self._set_phase("poll", "timeout_ms=50")
                 self._poll_and_drain(50)
                 self._set_phase("idle")
@@ -992,26 +1217,19 @@ class InterlockProcess(ManagedProcessBase):
 
 def main(argv: list[str] | None = None) -> None:
     ns = _parse_args(argv)
-    rule_paths: list[Path] = []
-    for raw in ns.rules:
-        rule_paths.append(Path(str(raw)).expanduser().resolve())
-    if ns.rules_dir:
-        rules_dir = Path(str(ns.rules_dir)).expanduser().resolve()
-        for path in sorted(rules_dir.glob("*.yml")) + sorted(rules_dir.glob("*.yaml")):
-            rule_paths.append(path)
-    if not rule_paths:
-        raise SystemExit("No rules provided (--rules or --rules-dir)")
-
-    rulesets = _collect_rulesets(rule_paths)
-    proc = InterlockProcess(
-        manager_rpc=ns.manager_rpc,
-        manager_pub=ns.manager_pub,
-        process_id=ns.process_id,
-        rpc_timeout_ms=ns.rpc_timeout_ms,
-        heartbeat_endpoint=ns.heartbeat_endpoint,
-        heartbeat_period_s=ns.heartbeat_period_s,
-        rulesets=rulesets,
-    )
+    try:
+        proc = InterlockProcess(
+            manager_rpc=ns.manager_rpc,
+            manager_pub=ns.manager_pub,
+            process_id=ns.process_id,
+            rpc_timeout_ms=ns.rpc_timeout_ms,
+            heartbeat_endpoint=ns.heartbeat_endpoint,
+            heartbeat_period_s=ns.heartbeat_period_s,
+            rules=list(ns.rules) if ns.rules else None,
+            rules_dir=ns.rules_dir,
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from None
     proc.run()
 
 

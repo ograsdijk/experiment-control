@@ -21,9 +21,21 @@ from .manager_interceptor_routes import (
 from .manager_interceptor_routes import (
     snapshot as interceptor_snapshot,
 )
+from .manager_interceptor_routes import (
+    unregister as interceptor_unregister,
+)
 from .utils.command_interceptors import apply_command_interceptor_chain
 
 Json = dict[str, Any]
+
+
+# Cap on the user-supplied timeout_s parameter to
+# route_manager_cleanup_orphans. The handler runs synchronously inside
+# the main RPC handler, blocking the manager loop for the full
+# duration; an unbounded timeout would let a misconfigured client
+# stall the manager for minutes. 30s is well above the realistic
+# cleanup time (typically sub-second).
+_CLEANUP_ORPHANS_TIMEOUT_CAP_S = 30.0
 
 
 def _instance_lock_funcs() -> tuple[Any, Any, Any]:
@@ -95,6 +107,24 @@ def register_command_interceptor_routes(
         replace=replace,
     )
     return added
+
+
+def unregister_command_interceptor_routes(manager: Any, process_id: str) -> bool:
+    # Intentionally idempotent: unknown process_ids return removed=False
+    # rather than raising, so callers cleaning up after a process that
+    # already exited do not have to special-case the race. See
+    # tests/test_manager_interceptor_unregister.py for the contract.
+    removed = interceptor_unregister(manager, process_id)
+    manager._publish_manager_event(
+        "manager.command_interceptor.routes_unregistered",
+        {
+            "process_id": process_id,
+            "removed": removed,
+            "routes": manager._command_interceptor_routes_snapshot(),
+            "ts": {"t_wall": time.time(), "t_mono": time.monotonic()},
+        },
+    )
+    return removed
 
 
 def match_command_interceptor_route(route: Any, device_id: str, action: str) -> bool:
@@ -421,6 +451,20 @@ def route_command_interceptor_register(manager: Any, req: Json) -> Json:
     return {"ok": True, "result": {"routes": routes}}
 
 
+def route_command_interceptor_unregister(manager: Any, req: Json) -> Json:
+    process_id = str(req.get("process_id", "")).strip()
+    if not process_id:
+        return {
+            "ok": False,
+            "error": {"code": "invalid_unregister", "message": "missing process_id"},
+        }
+    try:
+        removed = manager._unregister_command_interceptor_routes(process_id)
+    except Exception as exc:
+        return {"ok": False, "error": {"code": "unregister_failed", "message": str(exc)}}
+    return {"ok": True, "result": {"process_id": process_id, "removed": removed}}
+
+
 def route_command_interceptor_list(manager: Any, req: Json) -> Json:
     del req
     return {"ok": True, "result": {"routes": manager._command_interceptor_routes_snapshot()}}
@@ -544,9 +588,19 @@ def route_manager_cleanup_orphans(manager: Any, req: Json) -> Json:
     try:
         dry_run = bool(params.get("dry_run", False))
         stale_only = bool(params.get("stale_only", True))
-        timeout_s = float(params.get("timeout_s", 2.0))
-        if timeout_s <= 0:
+        timeout_s_requested = float(params.get("timeout_s", 2.0))
+        if timeout_s_requested <= 0:
             raise ValueError("timeout_s must be > 0")
+        # Cap operator-supplied timeout so a misconfigured client can't
+        # block the manager loop for minutes. The cleanup-orphans path
+        # walks `psutil.process_iter` synchronously inside the main
+        # RPC handler; a 30s ceiling is well above the realistic
+        # cleanup time (typically <1s for a handful of orphan PIDs)
+        # while bounding worst-case manager unresponsiveness.
+        if timeout_s_requested > _CLEANUP_ORPHANS_TIMEOUT_CAP_S:
+            timeout_s = _CLEANUP_ORPHANS_TIMEOUT_CAP_S
+        else:
+            timeout_s = timeout_s_requested
     except Exception as exc:
         return {
             "ok": False,
@@ -557,6 +611,14 @@ def route_manager_cleanup_orphans(manager: Any, req: Json) -> Json:
         stale_only=stale_only,
         timeout_s=timeout_s,
     )
+    # Echo the effective timeout (and the requested one when clamped) so
+    # a caller asking for 60s can tell their budget was reduced. Without
+    # this, a partial-scan-due-to-clamping result is indistinguishable
+    # from a clean "no orphans found" outcome.
+    if isinstance(result, dict):
+        result.setdefault("timeout_s_effective", float(timeout_s))
+        if timeout_s_requested != timeout_s:
+            result.setdefault("timeout_s_requested", float(timeout_s_requested))
     manager._record_orphan_cleanup(source="rpc", summary=result)
     manager._publish_manager_event(
         "manager.orphan_cleanup",

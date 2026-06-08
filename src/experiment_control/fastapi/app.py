@@ -22,6 +22,7 @@ from pydantic import BaseModel, Field
 
 from .gateway import GatewaySettings, RouterRpcClient, StreamFrameHub, TelemetryHub
 from ..shm.shm_ring import ShmRingReader
+from ..utils.env import env_bool, env_float, env_int
 from ..utils.zmq_helpers import json_dumps as _orjson_dumps
 from ..utils.instance_lock import (
     derive_lock_effective_status,
@@ -162,28 +163,19 @@ def _load_settings() -> GatewaySettings:
         instance_id=instance_id or None,
         router_rpc_public_hint=router_rpc_public_hint or None,
         manager_pub_public_hint=manager_pub_public_hint or None,
-        rpc_timeout_ms=int(os.environ.get("EXPERIMENT_CONTROL_RPC_TIMEOUT_MS", "2000")),
-        rpc_queue_max=max(
-            1, int(os.environ.get("EXPERIMENT_CONTROL_RPC_QUEUE_MAX", "1024"))
-        ),
+        rpc_timeout_ms=env_int("EXPERIMENT_CONTROL_RPC_TIMEOUT_MS", 2000),
+        rpc_queue_max=max(1, env_int("EXPERIMENT_CONTROL_RPC_QUEUE_MAX", 1024)),
         stream_max_payload_points=max(
-            1,
-            int(
-                os.environ.get(
-                    "EXPERIMENT_CONTROL_STREAM_MAX_PAYLOAD_POINTS", "200000"
-                )
-            ),
+            1, env_int("EXPERIMENT_CONTROL_STREAM_MAX_PAYLOAD_POINTS", 200000)
         ),
         stream_max_record_events=max(
-            1,
-            int(os.environ.get("EXPERIMENT_CONTROL_STREAM_MAX_RECORD_EVENTS", "512")),
+            1, env_int("EXPERIMENT_CONTROL_STREAM_MAX_RECORD_EVENTS", 512)
         ),
         stream_max_keys=max(
-            1, int(os.environ.get("EXPERIMENT_CONTROL_STREAM_MAX_KEYS", "1024"))
+            1, env_int("EXPERIMENT_CONTROL_STREAM_MAX_KEYS", 1024)
         ),
         stream_key_ttl_s=max(
-            0.0,
-            float(os.environ.get("EXPERIMENT_CONTROL_STREAM_KEY_TTL_S", "600")),
+            0.0, env_float("EXPERIMENT_CONTROL_STREAM_KEY_TTL_S", 600.0)
         ),
     )
 
@@ -621,7 +613,25 @@ async def _process_cached_call_loop(target: ProcessCachedCallTarget) -> None:
         # only for the `updated_at` field exposed to the UI.
         started_mono = time.monotonic()
         try:
-            resp = await _process_rpc(target.process_id, target.action, target.params)
+            status = await _lookup_process_status(target.process_id)
+            if not isinstance(status, dict):
+                resp = {
+                    "ok": False,
+                    "error": {
+                        "code": "process_not_running",
+                        "message": "process is not running",
+                    },
+                }
+            elif not _process_rpc_registered(status):
+                resp = {
+                    "ok": False,
+                    "error": {
+                        "code": "process_rpc_not_ready",
+                        "message": "process RPC is not ready",
+                    },
+                }
+            else:
+                resp = await _process_rpc(target.process_id, target.action, target.params)
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -708,14 +718,6 @@ def _request_origin_and_host(request: Request) -> tuple[str, str | None]:
     return origin, parsed.hostname
 
 
-def _env_bool(name: str, default: bool = False) -> bool:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    text = raw.strip().lower()
-    return text in {"1", "true", "yes", "on"}
-
-
 def _default_ui_dist_path() -> Path:
     # Prefer packaged static assets so `pip install experiment-control` works
     # without requiring a local repo checkout.
@@ -736,7 +738,7 @@ def _default_ui_dist_path() -> Path:
 
 
 def _resolve_ui_dist_path() -> Path | None:
-    if not _env_bool("EXPERIMENT_CONTROL_SERVE_UI", default=False):
+    if not env_bool("EXPERIMENT_CONTROL_SERVE_UI", default=False):
         return None
     raw = os.environ.get("EXPERIMENT_CONTROL_UI_DIST", "").strip()
     path = Path(raw).expanduser().resolve() if raw else _default_ui_dist_path()
@@ -765,7 +767,7 @@ def _resolve_default_profile_path() -> Path | None:
 
 
 def _resolve_extra_ui_specs() -> list[ExtraUiSpec]:
-    if not _env_bool("EXPERIMENT_CONTROL_SERVE_UI", default=False):
+    if not env_bool("EXPERIMENT_CONTROL_SERVE_UI", default=False):
         return []
     raw = os.environ.get("EXPERIMENT_CONTROL_EXTRA_UI_JSON", "").strip()
     if not raw:
@@ -1417,21 +1419,6 @@ async def get_stream_workspace_snapshot(
 
 @app.put("/api/stream/workspaces/{workspace_id}")
 async def put_stream_workspace(
-    workspace_id: str, req: StreamWorkspaceRequest
-) -> dict[str, Any]:
-    workspace = dict(req.workspace)
-    workspace["workspace_id"] = workspace_id
-    payload: dict[str, Any] = {"workspace": workspace}
-    if req.expected_revision is not None:
-        payload["expected_revision"] = int(req.expected_revision)
-    return await _stream_analysis_rpc(
-        "stream_analysis.workspace.put",
-        payload,
-    )
-
-
-@app.patch("/api/stream/workspaces/{workspace_id}")
-async def patch_stream_workspace(
     workspace_id: str, req: StreamWorkspaceRequest
 ) -> dict[str, Any]:
     workspace = dict(req.workspace)

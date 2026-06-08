@@ -210,6 +210,7 @@ export type InterlockTelemetryStatus = {
   device_id: string;
   signal: string;
   max_age_s: number;
+  required: boolean;
 };
 
 export type InterlockRuleStatus = {

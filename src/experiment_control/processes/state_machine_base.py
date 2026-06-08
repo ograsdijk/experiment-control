@@ -7,12 +7,28 @@ from typing import Any
 import zmq
 
 from ..capabilities import capabilities_payload, method, param
+from ..utils.responses import is_response_ok
 from .process_base import ManagedProcessBase
 
 Json = dict[str, Any]
 
 
+class SequenceError(RuntimeError):
+    """Raised when a sequenced command against the manager fails.
+
+    StateMachineProcessBase._command raises this (or a configured subclass —
+    see _sequence_error_cls) when the manager is uninitialised, or when the
+    response does not satisfy ``is_response_ok``. Subclasses that want a
+    process-specific exception type can either subclass this and set
+    ``_sequence_error_cls = MySequenceError``, or just catch this base.
+    """
+
+
 class StateMachineProcessBase(ManagedProcessBase):
+    # Exception type raised by self._command on failure. Subclasses may
+    # override to a more specific type; that type should subclass
+    # SequenceError so generic ``except SequenceError:`` callers still match.
+    _sequence_error_cls: type[Exception] = SequenceError
     def __init__(
         self,
         *,
@@ -52,6 +68,10 @@ class StateMachineProcessBase(ManagedProcessBase):
         self._state_since_mono = now_mono
         self._last_error: str | None = None
         self._last_transition: Json | None = None
+        # Last manager-bound command request sent via self._command(...).
+        # Populated by subclasses or by the default _command implementation
+        # so introspection endpoints can show the most recent attempt.
+        self._last_command: Json | None = None
         self._graph_edges = self._normalize_graph_edges(graph_edges)
         if allowed_transitions is None and self._graph_edges:
             allowed_transitions = self._derive_allowed_transitions_from_graph_edges(self._graph_edges)
@@ -149,6 +169,42 @@ class StateMachineProcessBase(ManagedProcessBase):
             overflow = len(self._history) - self._history_max
             if overflow > 0:
                 del self._history[:overflow]
+
+    def _command(
+        self,
+        device_id: str,
+        action: str,
+        params: Json,
+        *,
+        timeout_s: float | None = None,
+    ) -> Json:
+        """Send a typed ``command`` RPC to a device via the manager.
+
+        Stores the request payload on ``self._last_command`` for introspection
+        (status endpoints typically surface this). Raises
+        ``self._sequence_error_cls`` (default ``SequenceError``) when the
+        manager isn't initialised or when the response fails
+        ``is_response_ok``. ``timeout_s=None`` means "do not impose a per-call
+        deadline" — the manager's own RPC timeout still applies.
+
+        Returns the raw response dict so callers can read result fields.
+        Existing callers that ignore the return value are unaffected.
+        """
+        if self._manager is None:
+            raise self._sequence_error_cls("manager not initialized")
+        req: Json = {
+            "type": "command",
+            "device_id": str(device_id),
+            "action": str(action),
+            "params": dict(params),
+            "caller_process_id": self._process_id,
+        }
+        self._last_command = req
+        timeout_ms = None if timeout_s is None else max(1, int(float(timeout_s) * 1000))
+        resp = self._manager.call(req, timeout_ms=timeout_ms)
+        if not is_response_ok(resp):
+            raise self._sequence_error_cls(f"command failed: {req} -> {resp}")
+        return resp
 
     def allowed_next_states(self, state: str | None = None) -> list[str]:
         cur = self._state if state is None else str(state)
@@ -326,6 +382,13 @@ class StateMachineProcessBase(ManagedProcessBase):
         self._publish_transition_event(src, dst, reason=reason, metadata=meta)
         return True
 
+    # Prefix used when _publish_transition_event records a publish
+    # failure into self._last_error (set by PR #54, group F.34). A
+    # successful subsequent publish clears `_last_error` ONLY when the
+    # stored message starts with this prefix — operational errors
+    # (e.g. set elsewhere by the subclass) are preserved.
+    _TRANSITION_PUBLISH_ERROR_PREFIX = "failed to publish transition event"
+
     def _publish_transition_event(
         self,
         from_state: str,
@@ -349,8 +412,30 @@ class StateMachineProcessBase(ManagedProcessBase):
                 topic="manager.state_machine.transition",
                 payload=payload,
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            # Record the publish failure on the process's last_error so
+            # an operator inspecting `status` sees that the bus event
+            # was dropped, instead of the failure being silently
+            # swallowed. Don't overwrite a more meaningful pre-existing
+            # error.
+            if not self._last_error:
+                self._last_error = (
+                    f"{self._TRANSITION_PUBLISH_ERROR_PREFIX} "
+                    f"{from_state!s} -> {to_state!s}: {exc!r}"
+                )
+            return
+        # Successful publish: clear a previously-recorded transition-
+        # publish error so a one-off failure (e.g. bus not yet wired at
+        # startup) doesn't permanently mask later operational errors.
+        # Only clears errors with the matching prefix; unrelated
+        # operational errors stored in _last_error are preserved.
+        if (
+            self._last_error
+            and self._last_error.startswith(
+                self._TRANSITION_PUBLISH_ERROR_PREFIX
+            )
+        ):
+            self._last_error = None
 
     def _on_state_exit(
         self,

@@ -97,6 +97,43 @@ class ManagedProcessBase:
         """Hook for subclasses to implement graceful stop behavior."""
         self._stop_evt.set()
 
+    def _require_manager(self) -> ManagerClient:
+        """Return ``self._manager`` after asserting it is initialized.
+
+        ``self._manager`` is typed ``ManagerClient | None`` because it
+        is set during ``run()`` (after the parent process has wired
+        endpoints). At any code path that runs *after* init — the main
+        poll loop, RPC handlers, telemetry workers — the value is
+        non-None. Routing through this helper:
+
+        * narrows the type for mypy without scattering ``assert
+          self._manager is not None`` at every call site, AND
+        * surfaces a clear runtime error if a subclass somehow invokes
+          a manager method before ``init`` (vs. an obscure
+          AttributeError on ``None.call``).
+        """
+        manager = self._manager
+        if manager is None:
+            raise RuntimeError(
+                f"{type(self).__name__}._manager is not initialized; "
+                "call from inside run() / after init only"
+            )
+        return manager
+
+    def _unregister_command_interceptor_routes(self) -> None:
+        if not self._process_id:
+            raise RuntimeError("Cannot unregister command interceptor routes without process_id")
+        if self._manager is None:
+            raise RuntimeError("Cannot unregister command interceptor routes before manager init")
+        resp = self._manager.call(
+            {
+                "type": "manager.interceptors.unregister",
+                "process_id": self._process_id,
+            }
+        )
+        if not isinstance(resp, dict) or not resp.get("ok", False):
+            raise RuntimeError(f"Failed to unregister command interceptor routes: {resp}")
+
     def _handle_common_rpc(self, req: dict[str, Any]) -> dict[str, Any] | None:
         rtype = str(req.get("type", ""))
         if rtype == "process.stop":
@@ -401,11 +438,14 @@ class ManagedProcessBase:
         handlers: dict[zmq.Socket, Callable[[], None]] = {}
         drain_result: dict[str, Any] | None = None
         if self._manager is not None and self._manager.sub_socket is not None:
+            # Bind the narrowed manager into the closure so mypy can see
+            # it isn't None when _drain_manager_telemetry fires.
+            mgr = self._manager
 
             def _drain_manager_telemetry() -> None:
                 nonlocal drain_result
                 self._set_phase("drain_telemetry")
-                drain_result = self._manager.drain_telemetry()
+                drain_result = mgr.drain_telemetry()
                 self._mark_progress(
                     f"drained={drain_result['count']} limited={drain_result['limited']}"
                 )

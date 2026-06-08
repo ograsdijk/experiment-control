@@ -65,6 +65,19 @@ def handle_internal_rpc(manager: Any) -> None:
         resp = rpc_error(code="unknown_request_type", message=str(exc))
     except Exception as exc:
         resp = rpc_error(code="route_failed", message=str(exc))
+    # Echo the caller's transport-level request_id (when present and the
+    # handler didn't already set one) so DEALER clients can correlate
+    # this synchronous reply against their outbound payload. The
+    # lifecycle worker path at manager._run_lifecycle does the same
+    # injection for its asynchronous replies; this covers every other
+    # internal RPC route (action / type / process / manager registries,
+    # device-routing list/snapshot, command-interceptor register/list,
+    # manager.shutdown, manager.identity, etc. — 70+ handlers that
+    # otherwise return plain {"ok": ..., "result": ...} dicts).
+    rid = req.get("request_id")
+    if isinstance(resp, dict) and rid is not None and "request_id" not in resp:
+        resp = dict(resp)
+        resp["request_id"] = rid
     manager._internal_rpc.send_multipart([identity, json_dumps(resp)])
 
 

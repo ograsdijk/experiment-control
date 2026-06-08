@@ -62,6 +62,98 @@ class InterlockRuleEvalTests(unittest.TestCase):
         assert isinstance(err, dict)
         self.assertEqual(err.get("code"), "TELEMETRY_MISSING")
 
+    def test_optional_telemetry_allows_missing_and_sets_alias(self) -> None:
+        rule = Rule(
+            rule_id="r1b",
+            name="rule-optional",
+            device_id="dev1",
+            action="set",
+            telemetry=[
+                TelemetryBinding(
+                    alias="hornet",
+                    device_id="hornet_eql",
+                    signal="ig_on",
+                    max_age_s=1.0,
+                    required=False,
+                )
+            ],
+            condition={"or": [{"not": "${hornet.ok}"}, {"eq": ["${hornet.value}", False]}]},
+            on_block_message=None,
+            on_block_code=None,
+            allow_transform_params=None,
+        )
+        verdict, new_cmd, err = evaluate_interlock_rule(
+            rule=rule,
+            cmd={"device_id": "dev1", "action": "set", "params": {}},
+            telemetry_getter=lambda _dev, _sig: None,
+            now_mono=10.0,
+        )
+        self.assertEqual(verdict, "allow")
+        self.assertIsNone(new_cmd)
+        self.assertIsNone(err)
+
+    def test_optional_telemetry_can_still_block_when_condition_fails(self) -> None:
+        rule = Rule(
+            rule_id="r1c",
+            name="rule-optional-block",
+            device_id="dev1",
+            action="set",
+            telemetry=[
+                TelemetryBinding(
+                    alias="hornet",
+                    device_id="hornet_eql",
+                    signal="ig_on",
+                    max_age_s=1.0,
+                    required=False,
+                )
+            ],
+            condition={"or": [{"not": "${hornet.ok}"}, {"eq": ["${hornet.value}", False]}]},
+            on_block_message="ion gauge must be off",
+            on_block_code="HORNET_IG_ON",
+            allow_transform_params=None,
+        )
+        verdict, new_cmd, err = evaluate_interlock_rule(
+            rule=rule,
+            cmd={"device_id": "dev1", "action": "set", "params": {}},
+            telemetry_getter=lambda _dev, _sig: {
+                "value": True,
+                "quality": "OK",
+                "age_s": 0.0,
+            },
+            now_mono=10.0,
+        )
+        self.assertEqual(verdict, "reject")
+        self.assertIsNone(new_cmd)
+        self.assertIsInstance(err, dict)
+        assert isinstance(err, dict)
+        self.assertEqual(err.get("message"), "ion gauge must be off")
+
+    def test_parse_optional_telemetry_binding_required_false(self) -> None:
+        ruleset = _parse_ruleset(
+            {
+                "interceptor_id": "i1",
+                "rules": [
+                    {
+                        "name": "optional-hornet",
+                        "match": {"device_id": "dev1", "action": "set"},
+                        "inputs": {
+                            "telemetry": [
+                                {
+                                    "as": "hornet",
+                                    "device": "hornet_eql",
+                                    "signal": "ig_on",
+                                    "required": False,
+                                }
+                            ]
+                        },
+                        "condition": {"always": True},
+                    }
+                ],
+            },
+            source="inline-rules",
+        )
+        self.assertFalse(ruleset.rules[0].telemetry[0].required)
+
     def test_evaluate_can_transform_params(self) -> None:
         rule = Rule(
             rule_id="r2",
@@ -111,7 +203,7 @@ class InterlockRuleEvalTests(unittest.TestCase):
         self.assertEqual(err.get("code"), "CUSTOM_CODE")
         self.assertEqual(err.get("message"), "custom message")
 
-    def test_rule_status_payload_includes_condition(self) -> None:
+    def test_rule_status_payload_includes_condition_and_required_flag(self) -> None:
         proc = object.__new__(InterlockProcess)
         proc._rule_enabled = {}
         condition = {
@@ -125,7 +217,15 @@ class InterlockRuleEvalTests(unittest.TestCase):
             name="rule-4",
             device_id="dev1",
             action="set",
-            telemetry=[],
+            telemetry=[
+                TelemetryBinding(
+                    alias="hornet",
+                    device_id="hornet_eql",
+                    signal="ig_on",
+                    max_age_s=1.0,
+                    required=False,
+                )
+            ],
             condition=condition,
             on_block_message=None,
             on_block_code=None,
@@ -134,6 +234,10 @@ class InterlockRuleEvalTests(unittest.TestCase):
         payload = proc._rule_status_payload("i1", rule)
         self.assertIn("condition", payload)
         self.assertEqual(payload.get("condition"), condition)
+        telemetry = payload.get("telemetry")
+        self.assertIsInstance(telemetry, list)
+        assert isinstance(telemetry, list)
+        self.assertEqual(telemetry[0].get("required"), False)
 
 
 if __name__ == "__main__":

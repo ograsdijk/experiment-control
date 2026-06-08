@@ -363,16 +363,27 @@ def ingest_telemetry(
             },
         )
     seq = int(msg.get("seq", -1))
-    manager._publish_manager_event(
-        "manager.telemetry_update",
-        {
-            "version": 1,
-            "device_id": device_id,
-            "seq": seq,
-            "ts": {"t_wall": ts.t_wall, "t_mono": ts.t_mono},
-            "signals": raw_signals,
-        },
-    )
+    republished: Json = {
+        "version": 1,
+        "device_id": device_id,
+        "seq": seq,
+        "ts": {"t_wall": ts.t_wall, "t_mono": ts.t_mono},
+        "signals": raw_signals,
+    }
+    # Forward driver-side per-call telemetry exceptions verbatim so the UI
+    # can show why a device went DEGRADED without operators having to read
+    # driver stderr. The driver enforces a 200-char per-error truncation.
+    call_errors = msg.get("call_errors")
+    if isinstance(call_errors, dict) and call_errors:
+        # Defensively filter to (str, str) entries; never trust unbounded
+        # producer payloads on the manager side.
+        clean: dict[str, str] = {}
+        for key, value in call_errors.items():
+            if isinstance(key, str) and isinstance(value, str) and key:
+                clean[key] = value
+        if clean:
+            republished["call_errors"] = clean
+    manager._publish_manager_event("manager.telemetry_update", republished)
 
 
 def _parse_heartbeat_pid(manager: Any, *, msg: Json, device_id: str) -> int | None:

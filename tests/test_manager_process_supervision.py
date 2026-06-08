@@ -70,6 +70,22 @@ def _make_handle() -> SimpleNamespace:
     )
 
 
+def _make_supervision_manager(**overrides: object) -> SimpleNamespace:
+    """Default manager-like object for enforce_managed_process_heartbeat_timeout tests."""
+    defaults: dict[str, object] = {
+        "_process_hb_sub": None,
+        "_handle_process_pub": lambda: None,
+        "_last_loop_stall_mono": None,
+        "_last_loop_stall_duration_s": 0.0,
+        "_manager_loop_stall_recent_s": 10.0,
+        "_heartbeat_stale_strikes_to_fail": 2,
+        "_heartbeat_hard_timeout_multiplier": 3.0,
+        "_publish_manager_event": lambda *args, **kwargs: None,
+    }
+    defaults.update(overrides)
+    return SimpleNamespace(**defaults)
+
+
 class _FakePopen:
     def __init__(self) -> None:
         self.terminated = False
@@ -177,6 +193,91 @@ class ProcessSnapshotMemoryTests(unittest.TestCase):
 
         self.assertEqual(handle.heartbeat_stale_strikes, 1)
         self.assertFalse(handle.popen.terminated)
+
+    def test_stale_check_drains_queued_heartbeat_before_strike(self) -> None:
+        handle = _make_handle()
+        handle.last_hb_recv_mono = 1.0
+        handle.popen = _FakePopen()
+
+        class _Sock:
+            def poll(self, _timeout: int) -> bool:
+                return True
+
+        def _drain_queued_hb() -> None:
+            handle.last_hb_recv_mono = 9.8
+
+        manager = _make_supervision_manager(
+            _process_hb_sub=_Sock(),
+            _handle_process_pub=_drain_queued_hb,
+        )
+
+        enforce_managed_process_heartbeat_timeout(manager, handle, 10.0)
+
+        self.assertEqual(handle.state, "RUNNING")
+        self.assertEqual(handle.heartbeat_stale_strikes, 0)
+        self.assertIsNone(handle.last_stale_detected_mono)
+        self.assertFalse(handle.popen.terminated)
+        self.assertLess(float(handle.last_heartbeat_age_s), 0.5)
+
+    def test_stale_check_reports_queued_heartbeat_drain_failure(self) -> None:
+        events: list[tuple[str, object]] = []
+        handle = _make_handle()
+        handle.last_hb_recv_mono = 2.0
+        handle.popen = _FakePopen()
+
+        class _Sock:
+            def poll(self, _timeout: int) -> bool:
+                return True
+
+        def _drain_failure() -> None:
+            raise RuntimeError("boom")
+
+        manager = _make_supervision_manager(
+            _process_hb_sub=_Sock(),
+            _handle_process_pub=_drain_failure,
+            _last_loop_stall_mono=9.5,
+            _last_loop_stall_duration_s=4.0,
+            _publish_manager_event=lambda topic, payload: events.append((topic, payload)),
+        )
+
+        enforce_managed_process_heartbeat_timeout(manager, handle, 10.0)
+
+        self.assertEqual(events[0][0], "manager.process.heartbeat_refresh_failed")
+        self.assertEqual(handle.heartbeat_stale_strikes, 1)
+        self.assertEqual(handle.state, "RUNNING")
+
+    def test_heartbeat_refresh_failure_diagnostic_is_rate_limited(self) -> None:
+        events: list[tuple[str, object]] = []
+        handle = _make_handle()
+        handle.last_hb_recv_mono = 2.0
+        handle.popen = _FakePopen()
+
+        class _Sock:
+            def poll(self, _timeout: int) -> bool:
+                return True
+
+        def _drain_failure() -> None:
+            raise RuntimeError("boom")
+
+        manager = _make_supervision_manager(
+            _process_hb_sub=_Sock(),
+            _handle_process_pub=_drain_failure,
+            _last_loop_stall_mono=9.5,
+            _last_loop_stall_duration_s=4.0,
+            _heartbeat_stale_strikes_to_fail=99,
+            _heartbeat_hard_timeout_multiplier=10.0,
+            _process_hb_refresh_error_period_s=10.0,
+            _publish_manager_event=lambda topic, payload: events.append((topic, payload)),
+        )
+
+        enforce_managed_process_heartbeat_timeout(manager, handle, 10.0)
+        enforce_managed_process_heartbeat_timeout(manager, handle, 10.5)
+        setattr(manager, "_last_process_hb_refresh_error_mono", 0.0)
+        enforce_managed_process_heartbeat_timeout(manager, handle, 11.5)
+
+        refresh_events = [item for item in events if item[0] == "manager.process.heartbeat_refresh_failed"]
+        self.assertEqual(len(refresh_events), 2)
+        self.assertEqual(refresh_events[1][1]["suppressed_count"], 1)
 
     def test_heartbeat_check_uses_recv_time_not_sender_t_mono(self) -> None:
         """If `last_hb_t_mono` is old (sender's clock at HB-generation)

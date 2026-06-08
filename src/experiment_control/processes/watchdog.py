@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import threading
 import time
 from collections.abc import Callable
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -22,6 +24,7 @@ from ..utils.cli_args import (
     add_process_id_arg,
     add_rpc_timeout_arg,
 )
+from ..utils.responses import is_response_ok
 from ..utils.config_parsing import (
     ConfigError,
     normalize_list,
@@ -101,6 +104,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     add_rpc_timeout_arg(p, default_ms=2000)
     add_heartbeat_args(p, default_period_s=1.0)
     p.add_argument("--rules", action="append", default=[])
+    p.add_argument("--rules-dir", default=None)
     p.add_argument("--tick-s", type=float, default=0.5)
     return p.parse_args(argv)
 
@@ -322,24 +326,63 @@ def _load_ruleset(path: Path) -> WatchdogRuleset:
     return _parse_ruleset(raw, source=str(path))
 
 
-def _collect_rulesets(paths: list[Path]) -> list[WatchdogRuleset]:
+def collect_rulesets(paths: list[Path]) -> list[WatchdogRuleset]:
     rulesets: list[WatchdogRuleset] = []
     for path in paths:
         rulesets.append(_load_ruleset(path))
     return rulesets
 
 
-def _resp_ok(resp: Any) -> bool:
-    if not isinstance(resp, dict):
-        return False
-    if "ok" in resp:
-        return bool(resp.get("ok"))
-    status = resp.get("status")
-    if status == "OK":
-        return True
-    if status == "ERROR":
-        return False
-    return False
+def resolve_rule_paths(
+    *,
+    rules: str | Path | list[str | Path] | None = None,
+    rules_dir: str | Path | None = None,
+) -> list[Path]:
+    """Same semantics as ``experiment_control.processes.interlock.resolve_rule_paths``.
+
+    Each `rules` entry is expanduser+resolve'd; `rules_dir` is globbed for
+    ``*.yml`` and ``*.yaml`` in sorted order. Returns an empty list if neither
+    is provided.
+    """
+    paths: list[Path] = []
+    if rules is not None:
+        items: list[str | Path]
+        if isinstance(rules, (str, Path)):
+            items = [rules]
+        else:
+            items = list(rules)
+        for raw in items:
+            paths.append(Path(str(raw)).expanduser().resolve())
+    if rules_dir is not None:
+        rules_dir_path = Path(str(rules_dir)).expanduser().resolve()
+        for path in sorted(rules_dir_path.glob("*.yml")) + sorted(rules_dir_path.glob("*.yaml")):
+            paths.append(path)
+    return paths
+
+
+def _normalize_rulesets_arg(
+    *,
+    rulesets: list[WatchdogRuleset] | None,
+    rules: str | Path | list[str | Path] | None,
+    rules_dir: str | Path | None,
+) -> list[WatchdogRuleset]:
+    if rulesets is not None:
+        if rules is not None or rules_dir is not None:
+            raise ValueError(
+                "pass either rulesets= or rules=/rules_dir=, not both"
+            )
+        return rulesets
+    paths = resolve_rule_paths(rules=rules, rules_dir=rules_dir)
+    if not paths:
+        raise ValueError(
+            "no rules provided: pass rulesets=, rules=, or rules_dir="
+        )
+    return collect_rulesets(paths)
+
+
+# Backwards-compat alias for the canonical predicate. New code should import
+# is_response_ok from experiment_control.utils.responses directly.
+_resp_ok = is_response_ok
 
 
 def _resolve_watchdog_bindings(
@@ -416,34 +459,70 @@ def _resolve_watchdog_binding(
     return entry, alias_env, False
 
 
-def _evaluate_watchdog_alarm(*, rule: WatchdogRule, env: Json, unknown: bool) -> bool:
+def _evaluate_watchdog_alarm(
+    *,
+    rule: WatchdogRule,
+    env: Json,
+    unknown: bool,
+    on_condition_error: Callable[[BaseException], None] | None = None,
+) -> bool:
     if unknown:
         return rule.on_unknown == "trigger"
     try:
         return bool(eval_condition(rule.condition, env))
-    except Exception:
+    except Exception as e:
+        if on_condition_error is not None:
+            try:
+                on_condition_error(e)
+            except Exception:
+                # Diagnostic callback failure must not affect rule eval.
+                pass
         return False
 
 
-def _evaluate_watchdog_condition(condition: Any, env: Json, *, unknown: bool) -> bool:
+def _evaluate_watchdog_condition(
+    condition: Any,
+    env: Json,
+    *,
+    unknown: bool,
+    on_condition_error: Callable[[BaseException], None] | None = None,
+) -> bool:
     if unknown:
         return False
     try:
         return bool(eval_condition(condition, env))
-    except Exception:
+    except Exception as e:
+        if on_condition_error is not None:
+            try:
+                on_condition_error(e)
+            except Exception:
+                pass
         return False
 
 
 def _update_watchdog_armed_state(
-    *, rule: WatchdogRule, state: RuleState, env: Json, unknown: bool
+    *,
+    rule: WatchdogRule,
+    state: RuleState,
+    env: Json,
+    unknown: bool,
+    on_condition_error: Callable[[BaseException], None] | None = None,
 ) -> None:
     if rule.arm is None:
         return
     if rule.arm.disarm_condition is not None and _evaluate_watchdog_condition(
-        rule.arm.disarm_condition, env, unknown=unknown
+        rule.arm.disarm_condition,
+        env,
+        unknown=unknown,
+        on_condition_error=on_condition_error,
     ):
         state.armed = False
-    if _evaluate_watchdog_condition(rule.arm.condition, env, unknown=unknown):
+    if _evaluate_watchdog_condition(
+        rule.arm.condition,
+        env,
+        unknown=unknown,
+        on_condition_error=on_condition_error,
+    ):
         state.armed = True
 
 
@@ -467,12 +546,42 @@ def evaluate_watchdog_rule(
     state: RuleState,
     telemetry_getter: Callable[[str, str], dict[str, Any] | None],
     now_mono: float,
+    on_condition_error: Callable[[BaseException], None] | None = None,
 ) -> tuple[bool, bool, bool, Json]:
+    """Evaluate one watchdog rule against current telemetry.
+
+    Returns the 4-tuple `(triggered, alarm, unknown, snapshot)`. Callers
+    that see `triggered=True` are responsible for executing the rule's
+    actions AND for marking the rule's cooldown via
+    `mark_watchdog_triggered(state, now_mono)`. Pre-this-fix the
+    cooldown was marked here, before the caller had a chance to act —
+    a caller that never executed actions still incurred the cooldown,
+    and a failed action chain still locked the rule out for
+    `cooldown_s`. Splitting the assignment lets the caller decide when
+    to "commit" the cooldown (e.g. at the moment of action submission).
+
+    `on_condition_error`, when supplied, is invoked with any exception
+    raised by `eval_condition(rule.condition, env)` or by the arming /
+    disarming condition. Default `None` preserves the previous silent-
+    failure behaviour for backwards compatibility with callers that
+    destructure the 4-tuple but don't care about diagnostics.
+    """
     env, snapshot, unknown = _resolve_watchdog_bindings(
         rule, telemetry_getter=telemetry_getter, now_mono=now_mono
     )
-    _update_watchdog_armed_state(rule=rule, state=state, env=env, unknown=unknown)
-    alarm = _evaluate_watchdog_alarm(rule=rule, env=env, unknown=unknown)
+    _update_watchdog_armed_state(
+        rule=rule,
+        state=state,
+        env=env,
+        unknown=unknown,
+        on_condition_error=on_condition_error,
+    )
+    alarm = _evaluate_watchdog_alarm(
+        rule=rule,
+        env=env,
+        unknown=unknown,
+        on_condition_error=on_condition_error,
+    )
     state.last_evaluated_mono = now_mono
     state.alarm = alarm
     state.unknown = unknown
@@ -495,12 +604,28 @@ def evaluate_watchdog_rule(
     if not _watchdog_cooldown_ready(rule=rule, state=state, now_mono=now_mono):
         return False, alarm, unknown, snapshot
 
-    state.last_trigger_mono = now_mono
+    # NOTE: `state.last_trigger_mono` is intentionally NOT set here.
+    # The caller marks the cooldown via `mark_watchdog_triggered()`
+    # once it has decided to act on the triggered=True signal (and
+    # WatchdogProcess does so at the moment it submits the action
+    # chain to its worker thread). This avoids a missed cooldown when
+    # the caller never executes actions and avoids leaving a failed
+    # action chain locked out for `cooldown_s`.
     if rule.latch:
         state.latched = True
     if rule.arm is not None and rule.arm.disarm_on_trigger:
         state.armed = False
     return True, alarm, unknown, snapshot
+
+
+def mark_watchdog_triggered(state: RuleState, now_mono: float) -> None:
+    """Mark a rule as triggered at `now_mono` so the cooldown gate is
+    armed. Callers that act on `evaluate_watchdog_rule`'s `triggered=True`
+    must call this after committing to the action chain; otherwise the
+    cooldown would never engage and the rule would re-trigger every
+    tick.
+    """
+    state.last_trigger_mono = now_mono
 
 
 class WatchdogProcess(ManagedProcessBase):
@@ -513,9 +638,14 @@ class WatchdogProcess(ManagedProcessBase):
         rpc_timeout_ms: int,
         heartbeat_endpoint: str | None,
         heartbeat_period_s: float,
-        rulesets: list[WatchdogRuleset],
         tick_s: float,
+        rulesets: list[WatchdogRuleset] | None = None,
+        rules: str | Path | list[str | Path] | None = None,
+        rules_dir: str | Path | None = None,
     ) -> None:
+        rulesets = _normalize_rulesets_arg(
+            rulesets=rulesets, rules=rules, rules_dir=rules_dir
+        )
         super().__init__(
             process_id=process_id,
             heartbeat_endpoint=heartbeat_endpoint,
@@ -550,6 +680,29 @@ class WatchdogProcess(ManagedProcessBase):
             subscribe_telemetry=True,
         )
         self._init_poller()
+
+        # Actions are dispatched off the main tick onto a single worker
+        # so a slow / failed remediation can't wedge the watchdog loop
+        # (heartbeat keeps publishing RUNNING while actions hang
+        # otherwise). max_workers=1 keeps ManagerClient.call safely
+        # single-threaded (its DEALER socket isn't thread-safe).
+        self._action_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix=f"watchdog-actions-{self._process_id}"
+        )
+        # Set per rule when its action chain is submitted (worker
+        # thread) so the cooldown gate covers the in-flight attempt and
+        # any subsequent ones get a chance after the cooldown clears.
+        # Pre-fix this was set inside evaluate_watchdog_rule before the
+        # action ran, which meant a NO-OP caller (or a caller that never
+        # called _execute_actions) still incurred the cooldown.
+        self._inflight_action_keys: set[tuple[str, str]] = set()
+        self._inflight_lock = threading.Lock()
+        # Rate-limit state for rule-condition error events. A misconfigured
+        # rule that raises every tick would otherwise flood
+        # manager.watchdog.rule_error; cap at one event per
+        # `_rule_error_period_s` seconds per (watchdog_id, rule_name).
+        self._rule_error_last_mono: dict[tuple[str, str], float] = {}
+        self._rule_error_period_s: float = 30.0
 
         self._advertise_process_rpc()
         self._start_heartbeat_thread(state_provider=lambda: "RUNNING")
@@ -676,7 +829,7 @@ class WatchdogProcess(ManagedProcessBase):
                 timeout_ms = None
                 if action.timeout_s is not None:
                     timeout_ms = max(1, int(float(action.timeout_s) * 1000))
-                resp = self._manager.call(req, timeout_ms=timeout_ms)
+                resp = self._require_manager().call(req, timeout_ms=timeout_ms)
                 if resp is not None and _resp_ok(resp):
                     break
                 error = resp if resp is not None else "timeout"
@@ -698,21 +851,121 @@ class WatchdogProcess(ManagedProcessBase):
             ruleset = entry.ruleset
             for rule in ruleset.rules:
                 state = self._states[(watchdog_id, rule.name)]
+                key = (watchdog_id, rule.name)
                 triggered, _alarm, unknown, snapshot = evaluate_watchdog_rule(
                     rule=rule,
                     state=state,
-                    telemetry_getter=self._manager.get_latest,
+                    telemetry_getter=self._require_manager().get_latest,
                     now_mono=now_mono,
+                    on_condition_error=self._make_condition_error_callback(
+                        watchdog_id=watchdog_id, rule_name=rule.name
+                    ),
                 )
-                if triggered:
-                    self._publish_triggered(
-                        watchdog_id=watchdog_id,
-                        rule=rule,
-                        unknown=unknown,
-                        snapshot=snapshot,
-                        state=state,
-                    )
-                    self._execute_actions(watchdog_id=watchdog_id, rule=rule)
+                if not triggered:
+                    continue
+                # If a previous action chain for this same rule is still
+                # in flight on the worker, skip submitting another one.
+                # This shouldn't normally happen because we set the
+                # cooldown at submit time, but guards against the
+                # narrow window between submit and the cooldown actually
+                # being observed by the next tick.
+                with self._inflight_lock:
+                    if key in self._inflight_action_keys:
+                        continue
+                    self._inflight_action_keys.add(key)
+                # Mark the cooldown at SUBMIT time so the next tick
+                # doesn't re-trigger before the worker has run. This
+                # used to happen inside evaluate_watchdog_rule, which
+                # incurred the cooldown even for callers that never
+                # executed actions (and for action chains that were
+                # never given a chance to run, e.g. mid-shutdown).
+                mark_watchdog_triggered(state, now_mono)
+                self._publish_triggered(
+                    watchdog_id=watchdog_id,
+                    rule=rule,
+                    unknown=unknown,
+                    snapshot=snapshot,
+                    state=state,
+                )
+                self._submit_actions(
+                    watchdog_id=watchdog_id, rule=rule, key=key
+                )
+
+    def _submit_actions(
+        self, *, watchdog_id: str, rule: WatchdogRule, key: tuple[str, str]
+    ) -> None:
+        try:
+            future = self._action_executor.submit(
+                self._execute_actions, watchdog_id=watchdog_id, rule=rule
+            )
+        except RuntimeError:
+            # Executor was shut down (e.g. during graceful stop). Drop
+            # the in-flight marker so a future tick can re-trigger
+            # cleanly if the watchdog comes back online.
+            with self._inflight_lock:
+                self._inflight_action_keys.discard(key)
+            return
+        future.add_done_callback(
+            lambda _fut, _key=key: self._on_action_chain_done(_fut, _key)
+        )
+
+    def _on_action_chain_done(
+        self, future: Future[None], key: tuple[str, str]
+    ) -> None:
+        with self._inflight_lock:
+            self._inflight_action_keys.discard(key)
+        # Surface a worker-thread exception that escaped _execute_actions
+        # (it catches per-action failures, so this is an unexpected
+        # internal error path). Publish via the manager event bus so the
+        # supervisor's log captures it.
+        try:
+            future.result()
+        except Exception as exc:
+            try:
+                self._publish_event(
+                    "manager.watchdog.action_chain_error",
+                    {
+                        "process_id": self._process_id,
+                        "watchdog_id": key[0],
+                        "rule": key[1],
+                        "error": repr(exc),
+                    },
+                )
+            except Exception:
+                pass
+
+    def _make_condition_error_callback(
+        self, *, watchdog_id: str, rule_name: str
+    ) -> Callable[[BaseException], None]:
+        """Build a per-(watchdog_id, rule_name) callback that publishes
+        a rate-limited rule_error event when the rule's condition
+        expression raises. Before this fix, `_evaluate_watchdog_alarm`
+        and `_evaluate_watchdog_condition` swallowed all exceptions
+        silently — a misconfigured rule (typo in field name,
+        divide-by-zero, etc.) appeared as "never triggers" forever.
+        """
+        rate_key = (watchdog_id, rule_name)
+
+        def _callback(exc: BaseException) -> None:
+            now = time.monotonic()
+            last = self._rule_error_last_mono.get(rate_key)
+            if last is not None and (now - last) < self._rule_error_period_s:
+                return
+            self._rule_error_last_mono[rate_key] = now
+            try:
+                self._publish_event(
+                    "manager.watchdog.rule_error",
+                    {
+                        "process_id": self._process_id,
+                        "watchdog_id": watchdog_id,
+                        "rule": rule_name,
+                        "error": repr(exc),
+                    },
+                )
+            except Exception:
+                pass
+
+        return _callback
 
     def _clear_rule_state(self, watchdog_id: str, rule_name: str) -> Json:
         state = self._states.get((watchdog_id, rule_name))
@@ -1025,6 +1278,18 @@ class WatchdogProcess(ManagedProcessBase):
             return dispatched
         return self._rpc_unknown(req)
 
+    def close(self) -> None:
+        # Stop accepting new action chains AND wait for any in-flight
+        # chain to finish so we don't tear down the ManagerClient out
+        # from under it. The chain is bounded by per-action timeout x
+        # retries x action-count, so the wait is bounded; in practice
+        # actions are sub-second.
+        try:
+            self._action_executor.shutdown(wait=True, cancel_futures=False)
+        except Exception:
+            pass
+        super().close()
+
     def run(self) -> None:
         try:
             next_tick = time.monotonic() + self._tick_s
@@ -1050,23 +1315,20 @@ class WatchdogProcess(ManagedProcessBase):
 
 def main(argv: list[str] | None = None) -> None:
     ns = _parse_args(argv)
-    rule_paths: list[Path] = []
-    for raw in ns.rules:
-        rule_paths.append(Path(str(raw)).expanduser().resolve())
-    if not rule_paths:
-        raise SystemExit("No rules provided (--rules)")
-
-    rulesets = _collect_rulesets(rule_paths)
-    proc = WatchdogProcess(
-        manager_rpc=ns.manager_rpc,
-        manager_pub=ns.manager_pub,
-        process_id=ns.process_id,
-        rpc_timeout_ms=ns.rpc_timeout_ms,
-        heartbeat_endpoint=ns.heartbeat_endpoint,
-        heartbeat_period_s=ns.heartbeat_period_s,
-        rulesets=rulesets,
-        tick_s=ns.tick_s,
-    )
+    try:
+        proc = WatchdogProcess(
+            manager_rpc=ns.manager_rpc,
+            manager_pub=ns.manager_pub,
+            process_id=ns.process_id,
+            rpc_timeout_ms=ns.rpc_timeout_ms,
+            heartbeat_endpoint=ns.heartbeat_endpoint,
+            heartbeat_period_s=ns.heartbeat_period_s,
+            tick_s=ns.tick_s,
+            rules=list(ns.rules) if ns.rules else None,
+            rules_dir=ns.rules_dir,
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from None
     proc.run()
 
 

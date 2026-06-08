@@ -284,7 +284,11 @@ def queue_supervisor_log(manager: Any, item: Json) -> None:
     try:
         manager._supervisor_log_queue.put_nowait(item)
     except queue.Full:
-        manager._supervisor_log_dropped += 1
+        # Increment under the manager-owned lock; this method runs on
+        # per-log-stream reader threads while drain_supervisor_logs
+        # snapshot+resets on the main thread.
+        with manager._supervisor_log_dropped_lock:
+            manager._supervisor_log_dropped += 1
 
 
 def supervisor_key(item: Json) -> tuple[str, str, int, str]:
@@ -439,9 +443,12 @@ def prune_supervisor_log_threads(manager: Any) -> None:
 
 
 def drain_supervisor_logs(manager: Any, *, max_items: int = 250) -> None:
-    if manager._supervisor_log_dropped > 0:
+    # Snapshot + reset atomically so concurrent reader-thread bumps
+    # during the drain aren't lost.
+    with manager._supervisor_log_dropped_lock:
         dropped = int(manager._supervisor_log_dropped)
         manager._supervisor_log_dropped = 0
+    if dropped > 0:
         manager._emit_log(
             severity="warning",
             topic="manager.supervisor.drop",

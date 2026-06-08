@@ -46,3 +46,15 @@ class SynthHD(_SynthHD):
 
     def get_enable_channel_1(self) -> bool:
         return self[1].enable
+
+    def set_phase_channel_0(self, phase_deg: float) -> None:
+        self[0].phase = phase_deg
+
+    def set_phase_channel_1(self, phase_deg: float) -> None:
+        self[1].phase = phase_deg
+
+    def get_phase_channel_0(self) -> float:
+        return self[0].phase
+
+    def get_phase_channel_1(self) -> float:
+        return self[1].phase
