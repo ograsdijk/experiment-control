@@ -1,5 +1,6 @@
 # ruff: noqa: E402
 
+import math
 import sys
 from pathlib import Path
 import unittest
@@ -77,7 +78,17 @@ class BinStatsStateTests(unittest.TestCase):
         self.assertEqual(payload["x_bins"], [0.0, 0.1, 0.2, 1.0])
         self.assertEqual(payload["mean"], [10.0, 20.0, 30.0, 40.0])
         self.assertEqual(payload["std"], [0.0, 0.0, 0.0, 0.0])
-        self.assertEqual(payload["sem"], [0.0, 0.0, 0.0, 0.0])
+        # SEM is undefined for n=1 (single sample has no spread). The
+        # payload returns NaN (sanitized to None in the JSON wire
+        # payload via _sanitize_json) so downstream consumers (UI error
+        # bars, fit weights) can render n/a instead of a falsely-perfect 0.
+        sem = payload["sem"]
+        self.assertEqual(len(sem), 4)
+        for value in sem:
+            self.assertTrue(
+                value is None or (isinstance(value, float) and math.isnan(value)),
+                f"expected None or NaN, got {value!r}",
+            )
 
     def test_auto_range_groups_repeats_at_same_x(self) -> None:
         state = BinStatsState.from_params({"auto_range": True, "bin_count": 5})
