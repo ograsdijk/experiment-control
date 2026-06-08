@@ -3,7 +3,7 @@ from __future__ import annotations
 import queue
 import unittest
 
-from experiment_control.tui_manager import ManagerTUI
+from experiment_control._tui.app import ManagerTUI
 from experiment_control.utils.zmq_helpers import json_dumps
 
 

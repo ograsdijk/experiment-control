@@ -2,16 +2,16 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from .contracts.manager_requests import InternalRpcEnvelope, rpc_error
-from .utils.rpc_dispatch import RpcDispatchRegistry
-from .utils.zmq_helpers import json_dumps, safe_json_loads
+from ..contracts.manager_requests import InternalRpcEnvelope, rpc_error
+from ..utils.rpc_dispatch import RpcDispatchRegistry
+from ..utils.zmq_helpers import json_dumps, safe_json_loads
 
 if TYPE_CHECKING:
     import zmq
 
-    from .federation.hub import FederationHub
-    from .manager_models import DeviceHandle
-    from .manager_protocol import ManagerProtocol
+    from ..federation.hub import FederationHub
+    from .models import DeviceHandle
+    from ..manager_protocol import ManagerProtocol
 
     _MixinBase = ManagerProtocol
 else:
@@ -106,11 +106,6 @@ class InternalRpcMixin(_MixinBase):
             return
 
         try:
-            # Call through the module-level ``route_internal_request``
-            # so legacy tests that monkeypatch it (notably
-            # ``tests.test_dealer_request_id_correlation``) keep working.
-            # In production it's a one-line trampoline to
-            # ``self._route_internal_request``.
             resp = route_internal_request(self, req)
         except LookupError as exc:
             resp = rpc_error(code="unknown_request_type", message=str(exc))

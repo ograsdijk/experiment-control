@@ -7,14 +7,14 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from .manager_models import AutoReconnectSpec, ConnectCheckSpec, DeviceSpec, ProcessSpec, RestartPolicy
-from .manager_process_spec import process_spec_kwargs_from_yaml
-from .schemas.run_meta import run_meta_calls_from_json
-from .schemas.stream import stream_calls_from_json
-from .schemas.telemetry import telemetry_calls_from_json
-from .types import StreamCall, TelemetryCall
-from .utils.config_parsing import ConfigError, optional_dict, require_dict, require_str
-from .utils.yaml_helpers import load_yaml_file
+from .models import AutoReconnectSpec, ConnectCheckSpec, DeviceSpec, ProcessSpec, RestartPolicy
+from .process_spec import process_spec_kwargs_from_yaml
+from ..schemas.run_meta import run_meta_calls_from_json
+from ..schemas.stream import stream_calls_from_json
+from ..schemas.telemetry import telemetry_calls_from_json
+from ..types import StreamCall, TelemetryCall
+from ..utils.config_parsing import ConfigError, optional_dict, require_dict, require_str
+from ..utils.yaml_helpers import load_yaml_file
 
 
 def _module_name_from_path(path: Path) -> tuple[str | None, Path | None]:

@@ -7,10 +7,10 @@ from typing import TYPE_CHECKING, Any, Callable
 if TYPE_CHECKING:
     import zmq
 
-    from .federation.hub import FederationHub
-    from .manager_models import DeviceHandle, ProcessHandle
-    from .manager_protocol import ManagerProtocol
-    from .utils.command_journal import CommandJournal
+    from ..federation.hub import FederationHub
+    from .models import DeviceHandle, ProcessHandle
+    from ..manager_protocol import ManagerProtocol
+    from ..utils.command_journal import CommandJournal
 
     _MixinBase = ManagerProtocol
 else:
@@ -180,8 +180,8 @@ class LifecycleMixin(_MixinBase):
         # ``Manager`` already pulls those constants. If a caller passes
         # custom states, use them; otherwise resolve at first use.
         if managed_process_running is None or driver_state_ok is None:
-            from .manager_models import ManagedProcessState as _MPS
-            from .types import DriverState as _DS
+            from .models import ManagedProcessState as _MPS
+            from ..types import DriverState as _DS
 
             if managed_process_running is None:
                 managed_process_running = _MPS.RUNNING

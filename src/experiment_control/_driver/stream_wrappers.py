@@ -5,7 +5,7 @@ from typing import Any, Protocol
 
 import numpy as np
 
-from .types import StreamCall, StreamOut
+from ..types import StreamCall, StreamOut
 
 
 class _StreamPublisher(Protocol):

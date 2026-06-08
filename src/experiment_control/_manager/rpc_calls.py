@@ -5,11 +5,11 @@ from typing import TYPE_CHECKING, Any, Callable
 
 import zmq
 
-from .utils.zmq_helpers import json_dumps, safe_json_loads
+from ..utils.zmq_helpers import json_dumps, safe_json_loads
 
 if TYPE_CHECKING:
-    from .manager_models import DeviceHandle, ProcessHandle
-    from .manager_protocol import ManagerProtocol
+    from .models import DeviceHandle, ProcessHandle
+    from ..manager_protocol import ManagerProtocol
 
     _MixinBase = ManagerProtocol
 else:

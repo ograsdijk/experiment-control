@@ -37,17 +37,17 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from experiment_control.manager_process_logs import (
+from experiment_control._manager.process_logs import (
     drain_supervisor_logs,
     queue_supervisor_log,
 )
-from experiment_control.manager_process_supervision import (
+from experiment_control._manager.process_supervision import (
     _MAX_KILL_ATTEMPTS,
     enforce_managed_process_stop_timeout,
     stop_process_handle,
 )
-from experiment_control.manager_pubsub import publish_manager_event
-from experiment_control.manager_route_handlers import (
+from experiment_control._manager.pubsub import publish_manager_event
+from experiment_control._manager.route_handlers import (
     _CLEANUP_ORPHANS_TIMEOUT_CAP_S,
     route_manager_cleanup_orphans,
 )
@@ -73,7 +73,7 @@ def _make_log_manager() -> SimpleNamespace:
     ``supervisor_block_*``) stay at module level and are imported
     directly by the mixin.
     """
-    from experiment_control.manager_process_logs import ProcessLogsMixin
+    from experiment_control._manager.process_logs import ProcessLogsMixin
 
     emitted: list[dict[str, object]] = []
 
@@ -531,7 +531,7 @@ class ErrorCountsLockTests(unittest.TestCase):
         self.assertEqual(writer._error_counts, {"foo": 2, "bar": 1})
 
     def test_tui_manager_bump_error_takes_lock(self) -> None:
-        from experiment_control.tui_manager import ManagerTUI
+        from experiment_control._tui.app import ManagerTUI
 
         tui = object.__new__(ManagerTUI)
         tui._error_counts = {}

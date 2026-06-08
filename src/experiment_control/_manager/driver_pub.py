@@ -6,7 +6,7 @@ from typing import Any
 
 import zmq
 
-from .utils.zmq_helpers import MAX_DRAIN_PER_TICK, safe_json_loads
+from ..utils.zmq_helpers import MAX_DRAIN_PER_TICK, safe_json_loads
 
 Json = dict[str, Any]
 

@@ -247,7 +247,7 @@ class CloseRpcBoundedWaitTests(unittest.TestCase):
 
 class TUIBulkWorkerTests(unittest.TestCase):
     def test_run_bulk_rpc_worker_decorated_with_work_thread(self) -> None:
-        from experiment_control.tui_manager import ManagerTUI
+        from experiment_control._tui.app import ManagerTUI
 
         method = ManagerTUI._run_bulk_rpc_worker
         # @work(thread=True) wraps the method; the wrapper exposes the
@@ -266,7 +266,7 @@ class TUIBulkWorkerTests(unittest.TestCase):
         verify by patching call_from_thread on a stubbed TUI and
         invoking the worker body directly (bypassing the decorator).
         """
-        from experiment_control.tui_manager import ManagerTUI
+        from experiment_control._tui.app import ManagerTUI
 
         # Build a stub TUI; bypass __init__ — we only call the worker
         # body.

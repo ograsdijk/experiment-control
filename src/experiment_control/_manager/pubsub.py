@@ -4,12 +4,12 @@ import queue
 import threading
 from typing import TYPE_CHECKING, Any, Callable
 
-from .utils.zmq_helpers import json_dumps
+from ..utils.zmq_helpers import json_dumps
 
 if TYPE_CHECKING:
     import zmq
 
-    from .manager_protocol import ManagerProtocol
+    from ..manager_protocol import ManagerProtocol
 
     # When mypy type-checks ``PubSubMixin`` in isolation, this alias
     # lets us inherit the cross-mixin method signatures from
@@ -126,7 +126,7 @@ def publish_manager_event(manager: Any, topic: str, payload: Json) -> None:
     """Module-level forwarder kept for backward compatibility.
 
     Some tests import this name directly (e.g.
-    ``from experiment_control.manager_pubsub import publish_manager_event``)
+    ``from experiment_control._manager.pubsub import publish_manager_event``)
     and call it against a ``SimpleNamespace`` stub. The body lives on
     :class:`PubSubMixin`; this trampoline delegates so both call
     styles keep working. The forwarder will be deleted once the

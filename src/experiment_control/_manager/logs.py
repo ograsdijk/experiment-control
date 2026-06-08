@@ -6,7 +6,7 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from .utils.logging_levels import (
+from ..utils.logging_levels import (
     is_valid_log_severity,
     normalize_log_severity,
     severity_rank,
@@ -16,7 +16,7 @@ if TYPE_CHECKING:
     from collections import deque
     from typing import TextIO
 
-    from .manager_protocol import ManagerProtocol
+    from ..manager_protocol import ManagerProtocol
 
     _MixinBase = ManagerProtocol
 else:

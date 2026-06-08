@@ -7,26 +7,26 @@ from typing import Any, Callable
 
 import zmq
 
-from .manager_interceptor_routes import (
+from .interceptor_routes import (
     chain as interceptor_chain,
 )
-from .manager_interceptor_routes import (
+from .interceptor_routes import (
     drop_process as interceptor_drop_process,
 )
-from .manager_interceptor_routes import (
+from .interceptor_routes import (
     invalidate as interceptor_invalidate,
 )
-from .manager_interceptor_routes import (
+from .interceptor_routes import (
     register as interceptor_register,
 )
-from .manager_interceptor_routes import (
+from .interceptor_routes import (
     snapshot as interceptor_snapshot,
 )
-from .manager_interceptor_routes import (
+from .interceptor_routes import (
     unregister as interceptor_unregister,
 )
-from .utils.command_interceptors import apply_command_interceptor_chain
-from .utils.responses import RpcResponse
+from ..utils.command_interceptors import apply_command_interceptor_chain
+from ..utils.responses import RpcResponse
 
 Json = dict[str, Any]
 
@@ -483,7 +483,7 @@ def route_manager_identity(manager: Any, req: Json) -> Json:
     # ``_derive_lock_effective_status`` / ``_lock_effective_status_help``
     # fallbacks honor monkeypatches applied at the module level after
     # this module was imported. See ``_identity_default`` docstring.
-    from . import manager as manager_module
+    from experiment_control import manager as manager_module
 
     manager_pid = int(os.getpid())
     read_instance_lock_status = _identity_default(

@@ -2,10 +2,10 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from .utils.rpc_dispatch import RpcDispatchRegistry
+from ..utils.rpc_dispatch import RpcDispatchRegistry
 
 if TYPE_CHECKING:
-    from .manager_protocol import ManagerProtocol
+    from ..manager_protocol import ManagerProtocol
 
     _MixinBase = ManagerProtocol
 else:

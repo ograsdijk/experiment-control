@@ -484,7 +484,7 @@ class ServerSideRequestIdEchoTests(unittest.TestCase):
 
     def test_handle_internal_rpc_injects_request_id(self) -> None:
         from types import SimpleNamespace
-        from experiment_control.manager_internal_rpc import handle_internal_rpc
+        from experiment_control._manager.internal_rpc import handle_internal_rpc
 
         # Build a minimal manager stub: the only methods handle_internal_rpc
         # touches are _internal_rpc.recv_multipart / send_multipart and
@@ -509,7 +509,7 @@ class ServerSideRequestIdEchoTests(unittest.TestCase):
         # produces. We patch it (via monkey-patching the module-level
         # import) to return a plain handler reply without request_id —
         # the pre-fix shape that broke correlation.
-        import experiment_control.manager_internal_rpc as mod
+        import experiment_control._manager.internal_rpc as mod
 
         original = mod.route_internal_request
         try:
@@ -538,7 +538,7 @@ class ServerSideRequestIdEchoTests(unittest.TestCase):
 
     def test_handler_supplied_request_id_is_not_overwritten(self) -> None:
         from types import SimpleNamespace
-        from experiment_control.manager_internal_rpc import handle_internal_rpc
+        from experiment_control._manager.internal_rpc import handle_internal_rpc
 
         sent: list[tuple[bytes, bytes]] = []
 
@@ -553,7 +553,7 @@ class ServerSideRequestIdEchoTests(unittest.TestCase):
 
         mgr = SimpleNamespace(_internal_rpc=_FakeSocket())
 
-        import experiment_control.manager_internal_rpc as mod
+        import experiment_control._manager.internal_rpc as mod
 
         original = mod.route_internal_request
         try:

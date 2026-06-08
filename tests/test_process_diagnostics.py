@@ -13,7 +13,7 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from experiment_control import manager_process_logs
+from experiment_control._manager import process_logs as manager_process_logs
 from experiment_control.processes.process_base import ManagedProcessBase
 from experiment_control.utils.zmq_helpers import drain_multipart_nonblocking
 
@@ -43,7 +43,7 @@ class _DummyLogManager:
         self._supervisor_log_max_bytes = max_bytes
         self._supervisor_log_backups = backups
         # Bind the mixin methods the trampolines call back through.
-        from experiment_control.manager_process_logs import ProcessLogsMixin
+        from experiment_control._manager.process_logs import ProcessLogsMixin
 
         self._append_supervisor_jsonl = (
             lambda item: ProcessLogsMixin._append_supervisor_jsonl(self, item)

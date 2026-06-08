@@ -9,11 +9,11 @@ import ctypes
 from pathlib import Path
 from typing import Any
 
-from .schemas.run_meta import run_meta_calls_to_json
-from .schemas.stream import stream_calls_to_json
-from .schemas.telemetry import telemetry_calls_to_json
-from .utils.exit_codes import derive_signal_name, describe_exit_code, exit_code_hex
-from .utils.manager_network import derive_local_connect_endpoint
+from ..schemas.run_meta import run_meta_calls_to_json
+from ..schemas.stream import stream_calls_to_json
+from ..schemas.telemetry import telemetry_calls_to_json
+from ..utils.exit_codes import derive_signal_name, describe_exit_code, exit_code_hex
+from ..utils.manager_network import derive_local_connect_endpoint
 
 Json = dict[str, Any]
 

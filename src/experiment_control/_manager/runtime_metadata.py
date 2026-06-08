@@ -4,12 +4,12 @@ import copy
 import json
 from typing import TYPE_CHECKING, Any
 
-from .schemas.run_meta import run_meta_calls_to_json
-from .schemas.stream import stream_calls_to_json
-from .schemas.telemetry import telemetry_calls_to_json
+from ..schemas.run_meta import run_meta_calls_to_json
+from ..schemas.stream import stream_calls_to_json
+from ..schemas.telemetry import telemetry_calls_to_json
 
 if TYPE_CHECKING:
-    from .manager_protocol import ManagerProtocol
+    from ..manager_protocol import ManagerProtocol
 
     _MixinBase = ManagerProtocol
 else:

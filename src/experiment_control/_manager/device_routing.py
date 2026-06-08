@@ -4,7 +4,7 @@ import copy
 import time
 from typing import Any, Callable
 
-from .utils.responses import RpcResponse
+from ..utils.responses import RpcResponse
 
 Json = dict[str, Any]
 

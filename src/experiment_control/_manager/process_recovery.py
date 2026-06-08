@@ -4,12 +4,12 @@ import os
 import time
 from typing import TYPE_CHECKING, Any, Iterator
 
-from .utils.process_lifecycle import cleanup_orphan_children
+from ..utils.process_lifecycle import cleanup_orphan_children
 
 if TYPE_CHECKING:
     from collections import deque
 
-    from .manager_protocol import ManagerProtocol
+    from ..manager_protocol import ManagerProtocol
 
     _MixinBase = ManagerProtocol
 else:

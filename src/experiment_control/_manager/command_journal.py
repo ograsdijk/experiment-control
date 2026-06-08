@@ -6,8 +6,8 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from pathlib import Path
 
-    from .manager_protocol import ManagerProtocol
-    from .utils.command_journal import CommandJournal
+    from ..manager_protocol import ManagerProtocol
+    from ..utils.command_journal import CommandJournal
 
     _MixinBase = ManagerProtocol
 else:

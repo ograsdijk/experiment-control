@@ -5,13 +5,13 @@ import sys
 import time
 from typing import TYPE_CHECKING, Any, Callable
 
-from .utils.errors import TRANSIENT_CAPABILITIES_ERROR_CODES
-from .utils.logging_levels import normalize_log_severity
+from ..utils.errors import TRANSIENT_CAPABILITIES_ERROR_CODES
+from ..utils.logging_levels import normalize_log_severity
 
 if TYPE_CHECKING:
     from typing import TextIO
 
-    from .manager_protocol import ManagerProtocol
+    from ..manager_protocol import ManagerProtocol
 
     _MixinBase = ManagerProtocol
 else:

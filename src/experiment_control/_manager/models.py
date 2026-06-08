@@ -10,7 +10,7 @@ from typing import Any
 
 import zmq
 
-from .types import (
+from ..types import (
     DeviceState,
     DriverState,
     RunMetaCall,

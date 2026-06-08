@@ -14,7 +14,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from experiment_control.manager import CommandInterceptorRoute
-from experiment_control.manager_route_handlers import (
+from experiment_control._manager.route_handlers import (
     command_interceptor_routes_snapshot,
     register_command_interceptor_routes,
     route_command_interceptor_unregister,

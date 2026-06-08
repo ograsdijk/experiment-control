@@ -9,7 +9,6 @@ import threading
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, TextIO
 
@@ -17,7 +16,7 @@ import zmq
 
 from .federation import FederationConfig
 from .federation.hub import FederationHub
-from .manager_config import (
+from ._manager.config import (
     device_spec_from_yaml,
     process_spec_from_yaml,
 )
@@ -25,13 +24,13 @@ from .manager_config import (
 # remaining call site at L1906 (_dispatch_lifecycle_task) uses the
 # module-level callable directly because it runs off a background thread
 # without ``self`` in scope.
-from .manager_device_routing import route_device_request
+from ._manager.device_routing import route_device_request
 # Phase 8.2.13: ``handle_driver_pub`` and ``ingest_chunk_ready`` migrated
 # onto ``DriverPubMixin``. ``ingest_heartbeat`` / ``ingest_telemetry`` stay
 # imported because Manager's ``_ingest_heartbeat`` / ``_ingest_telemetry``
 # forwarders still pass Manager-module-level enum classes through.
-from .manager_driver_pub import ingest_heartbeat as shared_ingest_heartbeat
-from .manager_driver_pub import ingest_telemetry as shared_ingest_telemetry
+from ._manager.driver_pub import ingest_heartbeat as shared_ingest_heartbeat
+from ._manager.driver_pub import ingest_telemetry as shared_ingest_telemetry
 # Phase 8.2.15: 21 route_*/publish_process_command_response forwarders
 # migrated onto ``RouteHandlersMixin``. Only ``route_process_rpc``
 # (which needs the Manager-side ``ManagedProcessState`` running-state
@@ -39,11 +38,11 @@ from .manager_driver_pub import ingest_telemetry as shared_ingest_telemetry
 # below — Manager's ``_route_process_rpc`` and
 # ``_apply_command_interceptors`` keep their thin wrappers because
 # moving the enum sets onto the mixin would force a circular import.
-from .manager_route_handlers import route_process_rpc as shared_route_process_rpc
+from ._manager.route_handlers import route_process_rpc as shared_route_process_rpc
 # Phase 8.2.6: ``handle_internal_rpc`` / ``route_internal_request`` /
 # ``ensure_route_registries`` migrated onto ``InternalRpcMixin``. Only
 # the pure ``dispatch_registry_request`` helper remains imported.
-from .manager_internal_rpc import (
+from ._manager.internal_rpc import (
     dispatch_registry_request as shared_dispatch_registry_request,
 )
 # Phase 8.2.11: startup_sequence / shutdown_cleanup migrated onto LifecycleMixin.
@@ -51,51 +50,51 @@ from .manager_internal_rpc import (
 # ``LogsMixin``. Only the pure module-level utilities Manager still
 # calls directly during ``__init__`` (and the two `_normalize_*`
 # helpers exposed for cross-module use) remain imported.
-from .manager_logs import normalize_id as shared_normalize_id
-from .manager_logs import parse_boolish as shared_parse_boolish
-from .manager_logs import (
+from ._manager.logs import normalize_id as shared_normalize_id
+from ._manager.logs import parse_boolish as shared_parse_boolish
+from ._manager.logs import (
     resolve_manager_log_file_path as shared_resolve_manager_log_file_path,
 )
-from .manager_logs import (
+from ._manager.logs import (
     resolve_manager_log_min_level as shared_resolve_manager_log_min_level,
 )
-from .manager_logs import (
+from ._manager.logs import (
     resolve_manager_log_stderr_enabled as shared_resolve_manager_log_stderr_enabled,
 )
 # Phase 8.2.10: supervisor-log helpers migrated onto ``ProcessLogsMixin``.
 # Only the pure parser utilities Manager still wraps as staticmethods
 # remain imported.
-from .manager_process_logs import (
+from ._manager.process_logs import (
     supervisor_block_continuation as shared_supervisor_block_continuation,
 )
-from .manager_process_logs import (
+from ._manager.process_logs import (
     supervisor_block_start as shared_supervisor_block_start,
 )
-from .manager_process_logs import supervisor_key as shared_supervisor_key
+from ._manager.process_logs import supervisor_key as shared_supervisor_key
 # Phase 8.2.9: process-recovery helpers migrated onto
 # ``ProcessRecoveryMixin``. Only the pure
 # ``is_endpoint_collision_process_start_failure`` predicate remains
 # imported (Manager exposes it as a static staticmethod for tests).
-from .manager_process_recovery import (
+from ._manager.process_recovery import (
     is_endpoint_collision_process_start_failure as shared_is_endpoint_collision_process_start_failure,
 )
-from .manager_process_supervision import add_process as shared_add_process
-from .manager_process_supervision import (
+from ._manager.process_supervision import add_process as shared_add_process
+from ._manager.process_supervision import (
     adopt_with_process_guard as shared_adopt_with_process_guard,
 )
-from .manager_process_supervision import build_router_spec as shared_build_router_spec
-from .manager_process_supervision import (
+from ._manager.process_supervision import build_router_spec as shared_build_router_spec
+from ._manager.process_supervision import (
     FAILURE_DRIVER_TOPICS,
     FAILURE_PROCESS_TOPICS,
 )
 from .utils.exit_codes import describe_exit_code, exit_code_hex
-from .manager_process_supervision import (
+from ._manager.process_supervision import (
     mark_device_offline as shared_mark_device_offline,
 )
-from .manager_process_supervision import recover_device as shared_recover_device
-from .manager_process_supervision import stop_driver as shared_stop_driver
+from ._manager.process_supervision import recover_device as shared_recover_device
+from ._manager.process_supervision import stop_driver as shared_stop_driver
 # Phase 8.2.7: build_*_registry helpers migrated onto RequestRoutingMixin.
-from .manager_models import (
+from ._manager.models import (
     AutoReconnectSpec,
     CommandInterceptorRoute,
     ConnectCheckSpec,
@@ -111,35 +110,35 @@ from .manager_models import (
     TelemetryBundle,
     TelemetrySignal,
 )
-from .manager_interceptor_routes import InterceptorRouteState
+from ._manager.interceptor_routes import InterceptorRouteState
 # Phase 8.2.15: command-interceptor helper wrappers also migrated to
 # ``RouteHandlersMixin``. The two below stay as imports because they
 # need Manager-side enum sets the mixin can't reference.
-from .manager_route_handlers import (
+from ._manager.route_handlers import (
     apply_command_interceptors as shared_apply_command_interceptors,
 )
-from .manager_route_handlers import (
+from ._manager.route_handlers import (
     command_interceptor_chain as shared_command_interceptor_chain,
 )
-from .manager_route_handlers import (
+from ._manager.route_handlers import (
     match_command_interceptor_route as shared_match_command_interceptor_route,
 )
-from .manager_route_handlers import (
+from ._manager.route_handlers import (
     register_command_interceptor_routes as shared_register_command_interceptor_routes,
 )
 # Phase 8.2.8: call_device_rpc / call_process_rpc migrated onto RpcCallsMixin.
 # Phase 8.2.5: manager-taking helpers migrated onto
 # ``RuntimeMetadataMixin``. Only pure utilities still imported here.
-from .manager_runtime_metadata import (
+from ._manager.runtime_metadata import (
     merge_stream_metadata_dicts as shared_merge_stream_metadata_dicts,
 )
-from .manager_runtime_metadata import (
+from ._manager.runtime_metadata import (
     normalize_runtime_metadata_dict as shared_normalize_runtime_metadata_dict,
 )
-from .manager_runtime_metadata import (
+from ._manager.runtime_metadata import (
     normalize_runtime_stream_metadata_dict as shared_normalize_runtime_stream_metadata_dict,
 )
-from .manager_runtime_metadata import serialize_spec_yaml as shared_serialize_spec_yaml
+from ._manager.runtime_metadata import serialize_spec_yaml as shared_serialize_spec_yaml
 
 # --- Phase 8.1 mixin scaffolding -------------------------------------
 # Each ``manager_*.py`` helper module declares an empty mixin class at
@@ -148,28 +147,33 @@ from .manager_runtime_metadata import serialize_spec_yaml as shared_serialize_sp
 # one at a time (REFACTOR_PLAN §8.2) without churning ``Manager``'s
 # class header on every step. Until a method moves, the existing
 # ``shared_*`` forwarder pattern continues to work unchanged.
-from .manager_command_journal import CommandJournalMixin
-from .manager_device_routing import DeviceRoutingMixin
-from .manager_driver_pub import DriverPubMixin
-from .manager_interceptor_routes import InterceptorRoutesMixin
-from .manager_internal_rpc import InternalRpcMixin
-from .manager_lifecycle import LifecycleMixin
-from .manager_log_events import LogEventsMixin
-from .manager_logs import LogsMixin
-from .manager_process_logs import ProcessLogsMixin
-from .manager_process_recovery import ProcessRecoveryMixin
-from .manager_process_supervision import ProcessSupervisionMixin
-from .manager_pubsub import PubSubMixin
-from .manager_request_routing import RequestRoutingMixin
-from .manager_route_handlers import RouteHandlersMixin
-from .manager_rpc_calls import RpcCallsMixin
-from .manager_runtime_metadata import RuntimeMetadataMixin
+from ._manager.command_journal import CommandJournalMixin
+from ._manager.core_state import (
+    LifecycleExecutor,
+    ManagerCaches,
+    ManagerJournal,
+    ManagerSockets,
+)
+from ._manager.device_routing import DeviceRoutingMixin
+from ._manager.driver_pub import DriverPubMixin
+from ._manager.interceptor_routes import InterceptorRoutesMixin
+from ._manager.internal_rpc import InternalRpcMixin
+from ._manager.lifecycle import LifecycleMixin
+from ._manager.log_events import LogEventsMixin
+from ._manager.logs import LogsMixin
+from ._manager.process_logs import ProcessLogsMixin
+from ._manager.process_recovery import ProcessRecoveryMixin
+from ._manager.process_supervision import ProcessSupervisionMixin
+from ._manager.pubsub import PubSubMixin
+from ._manager.request_routing import RequestRoutingMixin
+from ._manager.route_handlers import RouteHandlersMixin
+from ._manager.rpc_calls import RpcCallsMixin
+from ._manager.runtime_metadata import RuntimeMetadataMixin
 
 from .types import DeviceState, DriverState, TelemetryQuality, Timestamp
 from .utils import instance_lock as _instance_lock
-from .utils.command_journal import CommandJournal, CommandJournalSettings
+from .utils.command_journal import CommandJournal
 from .utils.logging_levels import normalize_log_severity, severity_rank
-from .utils.manager_network import derive_local_connect_endpoint
 from .utils.process_lifecycle import ProcessGuardian
 from .utils.rpc_dispatch import RpcDispatchRegistry
 from .utils.zmq_helpers import MAX_DRAIN_PER_TICK, json_dumps, safe_json_loads
@@ -200,199 +204,6 @@ __all__ = [
 read_instance_lock_status = _instance_lock.read_instance_lock_status
 derive_lock_effective_status = _instance_lock.derive_lock_effective_status
 lock_effective_status_help = _instance_lock.lock_effective_status_help
-
-
-@dataclass
-class ManagerSockets:
-    ctx: zmq.Context
-    registry_bind: str
-    internal_rpc_bind: str
-    external_rpc_bind: str
-    external_pub_bind: str
-    external_pub_connect_local: str
-    registry_rep: zmq.Socket
-    sub: zmq.Socket
-    process_hb_sub: zmq.Socket
-    process_data_sub: zmq.Socket
-    internal_rpc: zmq.Socket
-    internal_rpc_endpoint: str
-    external_pub: zmq.Socket
-
-    @classmethod
-    def create(
-        cls,
-        *,
-        ctx: zmq.Context,
-        registry_bind: str,
-        internal_rpc_bind: str,
-        external_rpc_bind: str,
-        external_pub_bind: str,
-        external_pub_connect_local: str | None,
-    ) -> "ManagerSockets":
-        registry_rep = ctx.socket(zmq.REP)
-        registry_rep.bind(registry_bind)
-        sub = ctx.socket(zmq.SUB)
-        sub.setsockopt(zmq.SUBSCRIBE, b"")
-        process_hb_sub = ctx.socket(zmq.SUB)
-        process_hb_sub.setsockopt(zmq.SUBSCRIBE, b"")
-        process_data_sub = ctx.socket(zmq.SUB)
-        process_data_sub.setsockopt(zmq.SUBSCRIBE, b"")
-        internal_rpc = ctx.socket(zmq.ROUTER)
-        internal_rpc.bind(internal_rpc_bind)
-        external_pub = ctx.socket(zmq.PUB)
-        external_pub.bind(external_pub_bind)
-        external_pub_connect = (
-            str(external_pub_connect_local).strip()
-            if isinstance(external_pub_connect_local, str)
-            and str(external_pub_connect_local).strip()
-            else derive_local_connect_endpoint(external_pub_bind, 6001)
-        )
-        return cls(
-            ctx=ctx,
-            registry_bind=registry_bind,
-            internal_rpc_bind=internal_rpc_bind,
-            external_rpc_bind=external_rpc_bind,
-            external_pub_bind=external_pub_bind,
-            external_pub_connect_local=external_pub_connect,
-            registry_rep=registry_rep,
-            sub=sub,
-            process_hb_sub=process_hb_sub,
-            process_data_sub=process_data_sub,
-            internal_rpc=internal_rpc,
-            internal_rpc_endpoint=internal_rpc.getsockopt_string(zmq.LAST_ENDPOINT),
-            external_pub=external_pub,
-        )
-
-    def bind_to_manager(self, manager: Any) -> None:
-        manager._ctx = self.ctx
-        manager._registry_bind = self.registry_bind
-        manager._registry_rep = self.registry_rep
-        manager._sub = self.sub
-        manager._process_hb_sub = self.process_hb_sub
-        manager._process_data_sub = self.process_data_sub
-        manager._internal_rpc_bind = self.internal_rpc_bind
-        manager._internal_rpc = self.internal_rpc
-        manager._internal_rpc_endpoint = self.internal_rpc_endpoint
-        manager._external_rpc_bind = self.external_rpc_bind
-        manager._external_pub_bind = self.external_pub_bind
-        manager._external_pub_connect_local = self.external_pub_connect_local
-        manager._external_pub = self.external_pub
-
-
-@dataclass
-class ManagerCaches:
-    telemetry_latest: dict[str, dict[str, tuple[Timestamp, TelemetrySignal]]] = field(
-        default_factory=dict
-    )
-    telemetry_last_bundle_ts: dict[str, Timestamp] = field(default_factory=dict)
-    telemetry_device_order: dict[str, None] = field(default_factory=dict)
-    latest_chunk_desc: dict[str, dict[str, Json]] = field(default_factory=dict)
-    chunk_device_order: dict[str, None] = field(default_factory=dict)
-    last_liveness: dict[str, Liveness] = field(default_factory=dict)
-    process_rss_cache: dict[int, tuple[float, int | None]] = field(default_factory=dict)
-    runtime_device_metadata_overrides: dict[str, dict[str, Any]] = field(default_factory=dict)
-    runtime_stream_metadata_overrides: dict[str, dict[str, dict[str, Any]]] = field(
-        default_factory=dict
-    )
-    runtime_metadata_revision: dict[str, int] = field(default_factory=dict)
-
-    def bind_to_manager(self, manager: Any) -> None:
-        manager._telemetry_latest = self.telemetry_latest
-        manager._telemetry_last_bundle_ts = self.telemetry_last_bundle_ts
-        manager._telemetry_device_order = self.telemetry_device_order
-        manager._latest_chunk_desc = self.latest_chunk_desc
-        manager._chunk_device_order = self.chunk_device_order
-        manager._last_liveness = self.last_liveness
-        manager._process_rss_cache = self.process_rss_cache
-        manager._runtime_device_metadata_overrides = self.runtime_device_metadata_overrides
-        manager._runtime_stream_metadata_overrides = self.runtime_stream_metadata_overrides
-        manager._runtime_metadata_revision = self.runtime_metadata_revision
-
-
-@dataclass
-class ManagerJournal:
-    enabled: bool
-    path: Path | None
-    journal: CommandJournal | None = None
-    start_error: str | None = None
-
-    @classmethod
-    def start_or_disabled(
-        cls,
-        *,
-        enabled: bool,
-        instance_id: str,
-        path: str | Path | None,
-        queue_max: int,
-        batch_size: int,
-        flush_interval_ms: int,
-        retention_max_rows: int | None,
-        retention_max_age_days: float | None,
-    ) -> "ManagerJournal":
-        path_raw = str(path).strip() if path is not None else ""
-        journal_path = (
-            Path(path_raw).expanduser()
-            if path_raw
-            else Path(".state") / instance_id / "command_journal.sqlite3"
-        )
-        if not enabled:
-            return cls(enabled=False, path=journal_path)
-        try:
-            settings = CommandJournalSettings(
-                path=journal_path,
-                queue_max=int(queue_max),
-                batch_size=int(batch_size),
-                flush_interval_ms=int(flush_interval_ms),
-                retention_max_rows=(
-                    None if retention_max_rows is None else int(retention_max_rows)
-                ),
-                retention_max_age_days=(
-                    None if retention_max_age_days is None else float(retention_max_age_days)
-                ),
-            )
-            journal = CommandJournal(settings=settings, instance_id=instance_id)
-            journal.start()
-            return cls(enabled=True, path=journal_path, journal=journal)
-        except Exception as exc:
-            return cls(enabled=False, path=journal_path, start_error=str(exc))
-
-    def bind_to_manager(self, manager: Any) -> None:
-        manager._command_journal_enabled = self.enabled
-        manager._command_journal_path = self.path
-        manager._command_journal = self.journal
-        manager._command_journal_start_error = self.start_error
-
-
-@dataclass
-class LifecycleExecutor:
-    main_thread_id: int
-    executor: ThreadPoolExecutor
-    device_locks: dict[str, threading.Lock]
-    reply_queue: queue.Queue[tuple[bytes, Json]]
-    event_queue: queue.Queue[tuple[str, Json]]
-    event_dropped: int
-    event_dropped_lock: threading.Lock
-
-    @classmethod
-    def create(cls) -> "LifecycleExecutor":
-        return cls(
-            main_thread_id=threading.get_ident(),
-            executor=ThreadPoolExecutor(max_workers=32, thread_name_prefix="mgr-lifecycle"),
-            device_locks={},
-            reply_queue=queue.Queue(),
-            event_queue=queue.Queue(maxsize=10_000),
-            event_dropped=0,
-            event_dropped_lock=threading.Lock(),
-        )
-
-    def bind_to_manager(self, manager: Any) -> None:
-        manager._main_thread_id = self.main_thread_id
-        manager._lifecycle_executor = self.executor
-        manager._lifecycle_device_locks = self.device_locks
-        manager._lifecycle_reply_queue = self.reply_queue
-        manager._lifecycle_event_queue = self.event_queue
-        manager._lifecycle_event_dropped = self.event_dropped
-        manager._lifecycle_event_dropped_lock = self.event_dropped_lock
 
 
 class Manager(

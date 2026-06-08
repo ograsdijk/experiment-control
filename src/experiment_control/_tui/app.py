@@ -17,10 +17,14 @@ from textual.reactive import reactive
 from textual.screen import ModalScreen
 from textual.widgets import DataTable, Footer, Header, Input, Label, RichLog, Static
 
-from .tui_models import DeviceStatus
-from .tui_screens import ConfirmScreen, InvokeMemberScreen, SetMemberScreen, TopicFilterScreen
-from .utils.logging_levels import normalize_log_severity, severity_rank
-from .utils.zmq_helpers import json_dumps, safe_json_loads
+from .helpers import (
+    normalize_log_severity_for_tui,
+    normalize_topic_set,
+    severity_rank_for_tui,
+)
+from .models import DeviceStatus
+from .screens import ConfirmScreen, InvokeMemberScreen, SetMemberScreen, TopicFilterScreen
+from ..utils.zmq_helpers import json_dumps, safe_json_loads
 
 Json = dict[str, Any]
 
@@ -455,28 +459,9 @@ class ManagerTUI(App):
             self._reset_rpc_socket()
             return None
 
-    @staticmethod
-    def _normalize_log_severity(raw: Any) -> str:
-        return normalize_log_severity(raw, default="info")
-
-    @staticmethod
-    def _severity_rank(raw: Any) -> int:
-        return severity_rank(raw, default="info")
-
-    @staticmethod
-    def _normalize_topic_set(
-        raw: list[str] | tuple[str, ...] | set[str] | None,
-        *,
-        default: set[str] | frozenset[str],
-    ) -> set[str]:
-        if raw is None:
-            return set(default)
-        out: set[str] = set()
-        for item in raw:
-            topic = str(item or "").strip()
-            if topic:
-                out.add(topic)
-        return out
+    _normalize_log_severity = staticmethod(normalize_log_severity_for_tui)
+    _severity_rank = staticmethod(severity_rank_for_tui)
+    _normalize_topic_set = staticmethod(normalize_topic_set)
 
     def _default_topic_visibility(self, topic: str) -> bool:
         return topic not in self._event_log_hidden_topics

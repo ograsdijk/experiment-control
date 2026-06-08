@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from .utils.config_parsing import (
+from ..utils.config_parsing import (
     ConfigError,
     normalize_list,
     optional_dict,
@@ -14,7 +14,7 @@ from .utils.config_parsing import (
     require_dict,
     require_str,
 )
-from .utils.yaml_helpers import load_yaml_file
+from ..utils.yaml_helpers import load_yaml_file
 
 Json = dict[str, Any]
 
