@@ -4,6 +4,7 @@ import os
 import threading
 import time
 import traceback
+import warnings
 from contextlib import contextmanager
 from typing import Any, Callable, Iterator
 
@@ -53,7 +54,7 @@ class ManagedProcessBase:
         return req_or_id
 
     @classmethod
-    def _rpc_ok(cls, req_or_id: dict[str, Any] | Any, *, result: Any = None) -> dict[str, Any]:
+    def rpc_ok(cls, req_or_id: dict[str, Any] | Any, *, result: Any = None) -> dict[str, Any]:
         return {
             "request_id": cls._rpc_request_id(req_or_id),
             "ok": True,
@@ -61,7 +62,7 @@ class ManagedProcessBase:
         }
 
     @classmethod
-    def _rpc_err(
+    def rpc_err(
         cls,
         req_or_id: dict[str, Any] | Any,
         *,
@@ -81,8 +82,55 @@ class ManagedProcessBase:
         }
 
     @classmethod
+    def rpc_unknown(cls, req_or_id: dict[str, Any] | Any) -> dict[str, Any]:
+        return cls.rpc_err(req_or_id, code="unknown_request")
+
+    @classmethod
+    def rpc_invalid_params(
+        cls,
+        req_or_id: dict[str, Any] | Any,
+        *,
+        message: str | None = None,
+    ) -> dict[str, Any]:
+        return cls.rpc_err(req_or_id, code="invalid_params", message=message)
+
+    # Deprecated underscored aliases — Phase 10 rename. Kept for one
+    # release cycle so downstream subclasses can migrate to the
+    # un-prefixed public names (rpc_ok / rpc_err / rpc_unknown /
+    # rpc_invalid_params). Will be removed per REFACTOR_PLAN.md §10.12.
+    @classmethod
+    def _rpc_ok(cls, req_or_id: dict[str, Any] | Any, *, result: Any = None) -> dict[str, Any]:
+        warnings.warn(
+            "ManagedProcessBase._rpc_ok is deprecated; use rpc_ok instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return cls.rpc_ok(req_or_id, result=result)
+
+    @classmethod
+    def _rpc_err(
+        cls,
+        req_or_id: dict[str, Any] | Any,
+        *,
+        code: str,
+        message: str | None = None,
+        extra: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        warnings.warn(
+            "ManagedProcessBase._rpc_err is deprecated; use rpc_err instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return cls.rpc_err(req_or_id, code=code, message=message, extra=extra)
+
+    @classmethod
     def _rpc_unknown(cls, req_or_id: dict[str, Any] | Any) -> dict[str, Any]:
-        return cls._rpc_err(req_or_id, code="unknown_request")
+        warnings.warn(
+            "ManagedProcessBase._rpc_unknown is deprecated; use rpc_unknown instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return cls.rpc_unknown(req_or_id)
 
     @classmethod
     def _rpc_invalid_params(
@@ -91,7 +139,12 @@ class ManagedProcessBase:
         *,
         message: str | None = None,
     ) -> dict[str, Any]:
-        return cls._rpc_err(req_or_id, code="invalid_params", message=message)
+        warnings.warn(
+            "ManagedProcessBase._rpc_invalid_params is deprecated; use rpc_invalid_params instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return cls.rpc_invalid_params(req_or_id, message=message)
 
     def _graceful_stop(self) -> None:
         """Hook for subclasses to implement graceful stop behavior."""
@@ -140,8 +193,8 @@ class ManagedProcessBase:
             try:
                 self._graceful_stop()
             except Exception as e:
-                return self._rpc_err(req, code="stop_failed", message=str(e))
-            return self._rpc_ok(req, result={"status": "stopping"})
+                return self.rpc_err(req, code="stop_failed", message=str(e))
+            return self.rpc_ok(req, result={"status": "stopping"})
         return None
 
     @staticmethod

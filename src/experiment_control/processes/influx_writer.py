@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import email.utils
 import json
 import math
 import os
@@ -20,6 +21,7 @@ from urllib.request import Request, urlopen
 import zmq
 
 from ..capabilities import capabilities_payload, method, param
+from ..types import MemberSpec
 from ..utils.cli_args import (
     add_heartbeat_args,
     add_manager_args,
@@ -62,6 +64,14 @@ class DeviceRoute:
 class QueuedPoint:
     destination: str
     line: str
+
+
+@dataclass
+class DestinationRetryState:
+    next_attempt_mono: float = 0.0
+    consecutive_failures: int = 0
+    last_status: int | None = None
+    last_retry_after_s: float | None = None
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -410,6 +420,7 @@ class InfluxWriterProcess(ManagedProcessBase):
         self._last_flush_start_mono_s: float | None = None
         self._last_flush_duration_s: float | None = None
         self._last_flush_destination: str | None = None
+        self._destination_retry: dict[str, DestinationRetryState] = {}
         self._last_drain_count = 0
         self._last_drain_duration_s = 0.0
         self._total_drained = 0
@@ -933,6 +944,55 @@ class InfluxWriterProcess(ManagedProcessBase):
         )
 
     @staticmethod
+    def _parse_retry_after(value: str | None, *, now_wall: float | None = None) -> float | None:
+        if value is None:
+            return None
+        text = str(value).strip()
+        if not text:
+            return None
+        try:
+            delay = float(text)
+        except ValueError:
+            try:
+                parsed = email.utils.parsedate_to_datetime(text)
+            except Exception:
+                return None
+            if parsed is None:
+                return None
+            return max(0.0, parsed.timestamp() - (time.time() if now_wall is None else now_wall))
+        if not math.isfinite(delay):
+            return None
+        return max(0.0, delay)
+
+    @staticmethod
+    def _fallback_retry_delay(consecutive_failures: int) -> float:
+        return min(60.0, float(2 ** max(0, int(consecutive_failures) - 1)))
+
+    def _destination_retry_state(self, destination_name: str) -> DestinationRetryState:
+        return self._destination_retry.setdefault(destination_name, DestinationRetryState())
+
+    def _destination_backoff_remaining_s(self, destination_name: str) -> float:
+        state = self._destination_retry.get(destination_name)
+        if state is None:
+            return 0.0
+        return max(0.0, float(state.next_attempt_mono) - time.monotonic())
+
+    def _record_destination_success(self, destination_name: str) -> None:
+        self._destination_retry.pop(destination_name, None)
+
+    def _record_destination_http_error(self, destination_name: str, error: HTTPError) -> None:
+        state = self._destination_retry_state(destination_name)
+        state.consecutive_failures += 1
+        state.last_status = int(error.code)
+        retry_after = None
+        if error.headers is not None:
+            retry_after = self._parse_retry_after(error.headers.get("Retry-After"))
+        if retry_after is None:
+            retry_after = self._fallback_retry_delay(state.consecutive_failures)
+        state.last_retry_after_s = retry_after
+        state.next_attempt_mono = time.monotonic() + retry_after
+
+    @staticmethod
     def _write_batch_http(
         *,
         destination: InfluxDestination,
@@ -1000,21 +1060,25 @@ class InfluxWriterProcess(ManagedProcessBase):
         self._set_phase("influx_write", f"destination={destination_name} points={len(points)}")
         try:
             self._write_batch_http(destination=destination, lines=lines)
+            self._record_destination_success(destination_name)
             self._points_written += len(points)
             self._batches_written += 1
             with self._counters_lock:
                 self._last_error = None
             return True
         except HTTPError as e:
+            self._record_destination_http_error(destination_name, e)
             body = ""
             try:
                 body = e.read().decode("utf-8", errors="replace").strip()
             except Exception:
                 body = ""
+            retry_remaining = self._destination_backoff_remaining_s(destination_name)
             with self._counters_lock:
                 self._write_errors += 1
                 self._last_error = (
-                    f"HTTPError status={e.code} destination={destination_name}: {body or str(e)}"
+                    f"HTTPError status={e.code} destination={destination_name} "
+                    f"retry_after_s={retry_remaining:.3f}: {body or str(e)}"
                 )
             return False
         except URLError as e:
@@ -1042,6 +1106,9 @@ class InfluxWriterProcess(ManagedProcessBase):
     ) -> list[QueuedPoint]:
         failed: list[QueuedPoint] = []
         for destination_name, points in by_destination.items():
+            if self._destination_backoff_remaining_s(destination_name) > 0.0:
+                failed.extend(points)
+                continue
             if self._flush_destination_points(
                 destination_name=destination_name,
                 points=points,
@@ -1049,6 +1116,19 @@ class InfluxWriterProcess(ManagedProcessBase):
                 continue
             failed.extend(points)
         return failed
+
+    def _split_ready_backoff_points(
+        self,
+        by_destination: dict[str, list[QueuedPoint]],
+    ) -> tuple[dict[str, list[QueuedPoint]], list[QueuedPoint]]:
+        ready: dict[str, list[QueuedPoint]] = {}
+        backoff: list[QueuedPoint] = []
+        for destination_name, points in by_destination.items():
+            if self._destination_backoff_remaining_s(destination_name) > 0.0:
+                backoff.extend(points)
+            else:
+                ready[destination_name] = points
+        return ready, backoff
 
     def _flush(self) -> None:
         with self._queue_lock:
@@ -1058,15 +1138,22 @@ class InfluxWriterProcess(ManagedProcessBase):
         if not pending:
             return
         by_destination = self._group_points_by_destination(pending)
+        ready, backoff = self._split_ready_backoff_points(by_destination)
+        if backoff:
+            with self._queue_lock:
+                self._requeue_failed(backoff)
+        if not ready:
+            return
         try:
-            self._http_queue.put_nowait(by_destination)
+            self._http_queue.put_nowait(ready)
         except queue.Full:
             # HTTP thread is backlogged; put the points back so we don't lose
             # them. Counted so it shows up in status / heartbeat.
             with self._counters_lock:
                 self._dropped_http_batches += 1
+            failed = [point for points in ready.values() for point in points]
             with self._queue_lock:
-                self._requeue_failed(pending)
+                self._requeue_failed(failed)
 
     def _http_thread_run(self) -> None:
         try:
@@ -1121,8 +1208,7 @@ class InfluxWriterProcess(ManagedProcessBase):
         text = str(device_id).strip()
         return [text] if text else []
 
-    @staticmethod
-    def _destination_status_info(destination: InfluxDestination) -> Json:
+    def _destination_status_info(self, destination: InfluxDestination) -> Json:
         parsed = urlsplit(destination.url)
         host = parsed.hostname or ""
         port: int | None
@@ -1143,6 +1229,28 @@ class InfluxWriterProcess(ManagedProcessBase):
             "request_timeout_s": destination.request_timeout_s,
             "static_tags": dict(destination.static_tags),
             "token_present": bool(destination.token),
+            "retry": self._destination_retry_status(destination.name),
+        }
+
+    def _destination_retry_status(self, destination_name: str) -> Json:
+        state = self._destination_retry.get(destination_name)
+        if state is None:
+            return {
+                "in_backoff": False,
+                "next_attempt_mono": None,
+                "remaining_s": 0.0,
+                "consecutive_failures": 0,
+                "last_status": None,
+                "last_retry_after_s": None,
+            }
+        remaining_s = self._destination_backoff_remaining_s(destination_name)
+        return {
+            "in_backoff": remaining_s > 0.0,
+            "next_attempt_mono": state.next_attempt_mono,
+            "remaining_s": remaining_s,
+            "consecutive_failures": state.consecutive_failures,
+            "last_status": state.last_status,
+            "last_retry_after_s": state.last_retry_after_s,
         }
 
     def _measurement_resolution_status(self) -> list[Json]:
@@ -1220,7 +1328,7 @@ class InfluxWriterProcess(ManagedProcessBase):
             "remote_device_known_count": len(self._remote_device_ids),
         }
 
-    def _influx_capability_members(self) -> list[Json]:
+    def _influx_capability_members(self) -> list[MemberSpec]:
         members = [
             method("influx.status", params=None, doc="Get influx writer status."),
             method("influx.enable", params=None, doc="Enable ingest/writes."),
@@ -1348,7 +1456,7 @@ class InfluxWriterProcess(ManagedProcessBase):
         dispatched = self._rpc_registry.dispatch_with_canonical(req)
         if dispatched is not None:
             return dispatched
-        return self._rpc_unknown(req)
+        return self.rpc_unknown(req)
 
     def _publish_log(self, *, severity: str, message: str) -> None:
         payload: Json = {

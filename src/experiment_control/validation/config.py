@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from experiment_control.manager import device_spec_from_yaml, process_spec_from_yaml
-from experiment_control.manager_process_spec import _validated_init_kwargs
+from experiment_control._manager.process_spec import _validated_init_kwargs
 from experiment_control.utils.config_parsing import require_dict, require_str
 from experiment_control.utils.yaml_helpers import load_yaml_file
 

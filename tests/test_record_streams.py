@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 from experiment_control.driver import DeviceRunner
-from experiment_control.driver_stream_wrappers import build_stream_wrapper
+from experiment_control._driver.stream_wrappers import build_stream_wrapper
 from experiment_control.shm.shm_ring import ShmRingReader, ShmRingWriter
 from experiment_control.types import StreamCall, StreamField, StreamOut
 

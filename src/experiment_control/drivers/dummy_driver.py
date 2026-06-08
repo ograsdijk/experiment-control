@@ -1,16 +1,20 @@
+from __future__ import annotations
+
 import numpy as np
 
-from experiment_control.types import TelemetryCall, TelemetryOut
+from experiment_control.types import TelemetryCall
+
+from ._dummy_helpers import scalar_telemetry
 
 
 DEFAULT_TELEMETRY_CALLS_DUMMYDRIVER = [
     TelemetryCall(
         method="read_temperature",
-        outputs=[TelemetryOut(signal="temperature", kind="scalar", units="C")],
+        outputs=[scalar_telemetry("temperature", "C")],
     ),
     TelemetryCall(
         method="read_voltage",
-        outputs=[TelemetryOut(signal="voltage", kind="scalar", units="V")],
+        outputs=[scalar_telemetry("voltage", "V")],
     ),
 ]
 

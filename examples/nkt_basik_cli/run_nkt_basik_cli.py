@@ -5,7 +5,7 @@ from pathlib import Path
 
 import zmq
 from experiment_control.utils.zmq_helpers import json_dumps
-from experiment_control.tui_manager import ManagerTUI
+from experiment_control._tui.app import ManagerTUI
 
 
 def _shutdown_manager() -> None:

@@ -348,9 +348,9 @@ class LaserLockCompatible:
                 frequency_hz, field=f"{synth_id}.{signal_name}"
             ) / 1e6
         except Exception:
-            result = self._device_call(synth_id, f"get_frequency_channel_{channel}", {})
+            result = self._device_call(synth_id, "get_frequency", {"channel": channel})
             return self._to_float(
-                result, field=f"{synth_id}.get_frequency_channel_{channel}"
+                result, field=f"{synth_id}.get_frequency[{channel}]"
             ) / 1e6
 
     def move_laser_lockpoint(self, laser: int, lockpoint: float) -> None:
@@ -371,8 +371,8 @@ class LaserLockCompatible:
         target_hz = lockpoint_f * 1e6 if self.lockpoint_in_mhz else lockpoint_f
         self._device_call(
             synth_id,
-            f"set_frequency_channel_{int(channel)}",
-            {"freq_hz": target_hz},
+            "set_frequency",
+            {"channel": int(channel), "freq_hz": target_hz},
         )
 
     def move_laser0_lockpoint(self, lockpoint: float) -> None:

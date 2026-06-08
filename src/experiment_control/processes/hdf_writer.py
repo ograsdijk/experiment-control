@@ -8,7 +8,6 @@ import threading
 import time
 import uuid
 from collections import deque
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Literal, cast
 
@@ -37,7 +36,29 @@ from ..utils.logging_levels import normalize_log_severity
 from ..utils.rpc_dispatch import RpcDispatchRegistry
 from ..utils.yaml_helpers import load_yaml_file
 from ..utils.zmq_helpers import json_dumps, json_loads, safe_json_loads
+from .hdf_writer_bg import (
+    _BG_SENTINEL as _BG_SENTINEL,
+    _BgRequest as _BgRequest,
+    _BgSentinel as _BgSentinel,
+    _DevicesToggleRequest as _DevicesToggleRequest,
+    _FlushBatch as _FlushBatch,
+    _MeasurementNoteRequest as _MeasurementNoteRequest,
+    _RotateRequest as _RotateRequest,
+    _StartWritingRequest as _StartWritingRequest,
+    _StopWritingRequest as _StopWritingRequest,
+)
 from .hdf_writer_context import coerce_context_value
+from .hdf_writer_dtypes import (
+    DEFAULT_NUMERIC_COMPRESSION,
+    DEFAULT_NUMERIC_SHUFFLE,
+    DEFAULT_TELEMETRY_CHUNK_ROWS,
+    DTYPE_MAP,
+    _context_table_dtype,
+    _event_dtype,
+    _measurement_note_dtype,
+    _sequencer_event_dtype,
+    _sequencer_yaml_dtype,
+)
 from .hdf_writer_topics import build_hdf_topic_handlers
 from .process_base import ManagedProcessBase
 
@@ -46,194 +67,11 @@ EventLogMode = Literal["all", "failures_only", "none"]
 EVENT_LOG_MODES: tuple[EventLogMode, ...] = ("all", "failures_only", "none")
 
 
-DTYPE_MAP: dict[str, np.dtype[Any]] = {
-    "float64": np.dtype("float64"),
-    "float32": np.dtype("float32"),
-    "int64": np.dtype("int64"),
-    "int32": np.dtype("int32"),
-    "uint64": np.dtype("uint64"),
-    "uint32": np.dtype("uint32"),
-    "bool": np.dtype("bool"),
-}
-DEFAULT_NUMERIC_COMPRESSION = "lzf"
-DEFAULT_NUMERIC_SHUFFLE = True
-DEFAULT_TELEMETRY_CHUNK_ROWS = 64
-
-
-# ---------------------------------------------------------------------------
-# Background-flush queue types.
-#
-# These are the typed payloads the main loop hands off to the bg flush
-# thread. `FlushBatch` is fire-and-forget (no response). The `_BgRequest`
-# hierarchy is for synchronous RPC handlers that need to wait on the bg
-# thread to mutate `_h5` (file rotation, start/stop writing, measurement
-# note append, device toggle). Each `_BgRequest` carries a 1-slot response
-# queue the bg thread fills with either the result or the raised exception.
-#
-# Commit 1 introduces only the type definitions and the queue plumbing —
-# main-loop handlers do not yet enqueue anything other than the shutdown
-# sentinel. Commit 2 flips all `_h5`-touching paths through the queue.
-# ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class _FlushBatch:
-    """Snapshot of pending main-loop state ready to be written to HDF5.
-
-    Shape of `stream_batches` matches `self._stream_buffers` — a dict
-    keyed by `(device_id, stream)` whose values are dicts with `data`,
-    `seq`, `t0_mono_ns`, `t0_wall_ns`, `context_id` lists. This keeps
-    the existing `_write_stream_buffers_batch` signature stable.
-
-    `_dropped_local` / `_dropped_events` are cumulative counters shared
-    between threads and not snapshotted into the batch — main loop
-    increments them in `_buffer_append` / `_buffer_event`, bg thread
-    reads them in `_flush_active_file`. CPython GIL makes the int read
-    atomic; the worst case is a momentarily stale attrs value that
-    catches up on the next flush.
-    """
-
-    buffered_rows: list[Json] = field(default_factory=list)
-    event_rows: list[tuple[str, Json]] = field(default_factory=list)
-    stream_batches: dict[tuple[str, str], dict[str, list[Any]]] = field(
-        default_factory=dict
-    )
-    pending_stream_metadata: dict[tuple[str, str], dict[str, Any]] = field(
-        default_factory=dict
-    )
-    force_flush: bool = False
-
-
-@dataclass
-class _BgRequest:
-    """Base for synchronous RPC requests routed through the bg thread."""
-
-    response: "queue.Queue[Any]" = field(default_factory=lambda: queue.Queue(maxsize=1))
-
-
-@dataclass
-class _RotateRequest(_BgRequest):
-    filename: str | None = None
-    disabled_devices: set[str] | None = None
-    measurement_profile: str | None = None
-    measurement_values: object = None
-
-
-@dataclass
-class _StartWritingRequest(_BgRequest):
-    filename: str | None = None
-    disabled_devices: set[str] | None = None
-    measurement_profile: str | None = None
-    measurement_values: object = None
-
-
-@dataclass
-class _StopWritingRequest(_BgRequest):
-    pass
-
-
-@dataclass
-class _MeasurementNoteRequest(_BgRequest):
-    author: str = ""
-    kind: str = ""
-    message: str = ""
-    payload_json: str = ""
-
-
-@dataclass
-class _DevicesToggleRequest(_BgRequest):
-    disabled: set[str] = field(default_factory=set)
-
-
-class _BgSentinel:
-    """Marker put on the bg queue to request a clean thread exit."""
-
-    __slots__ = ()
-
-
-_BG_SENTINEL = _BgSentinel()
-
-
 def _default_filename() -> str:
     return time.strftime("%Y_%m_%d-%H_%M_%S.h5", time.localtime())
 
 
-def _event_dtype() -> np.dtype[Any]:
-    str_dt = h5py.string_dtype("utf-8")
-    return np.dtype(
-        [
-            ("t_wall", np.float64),
-            ("t_mono", np.float64),
-            ("kind", str_dt),
-            ("severity", str_dt),
-            ("device_id", str_dt),
-            ("action", str_dt),
-            ("params_json", str_dt),
-            ("ok", np.bool_),
-            ("error", str_dt),
-            ("result_json", str_dt),
-            ("topic", str_dt),
-            ("message", str_dt),
-            ("payload_json", str_dt),
-        ]
-    )
 
-
-def _context_table_dtype() -> np.dtype[Any]:
-    str_dt = h5py.string_dtype("utf-8")
-    return np.dtype(
-        [
-            ("context_id", np.int64),
-            ("ts_wall_ns", np.int64),
-            ("ts_mono_ns", np.int64),
-            ("fields_json", str_dt),
-        ]
-    )
-
-
-def _sequencer_event_dtype() -> np.dtype[Any]:
-    str_dt = h5py.string_dtype("utf-8")
-    return np.dtype(
-        [
-            ("t_wall", np.float64),
-            ("t_mono", np.float64),
-            ("process_id", str_dt),
-            ("event", str_dt),
-            ("source", str_dt),
-            ("ok", np.bool_),
-            ("message", str_dt),
-            ("payload_json", str_dt),
-            ("yaml_snapshot_id", np.int64),
-        ]
-    )
-
-
-def _sequencer_yaml_dtype() -> np.dtype[Any]:
-    str_dt = h5py.string_dtype("utf-8")
-    return np.dtype(
-        [
-            ("snapshot_id", np.int64),
-            ("t_wall", np.float64),
-            ("t_mono", np.float64),
-            ("process_id", str_dt),
-            ("source", str_dt),
-            ("text", str_dt),
-        ]
-    )
-
-
-def _measurement_note_dtype() -> np.dtype[Any]:
-    str_dt = h5py.string_dtype("utf-8")
-    return np.dtype(
-        [
-            ("t_wall", np.float64),
-            ("t_mono", np.float64),
-            ("author", str_dt),
-            ("kind", str_dt),
-            ("message", str_dt),
-            ("payload_json", str_dt),
-        ]
-    )
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -567,7 +405,7 @@ class HdfWriter(ManagedProcessBase):
         # _bump_error fires on both the main thread (drain handlers, RPC
         # handlers) and the bg flush thread. CPython dict mutation is
         # NOT atomic across threads in the way `+=` on an attribute
-        # suggests — the get + assignment can interleave with another
+        # suggests â€” the get + assignment can interleave with another
         # thread's bump on the same key, losing counts. Guard with a
         # small lock; reads via the public _error_counts attribute (used
         # by the bg-thread-failure tests) take a momentary snapshot to
@@ -589,7 +427,7 @@ class HdfWriter(ManagedProcessBase):
         self._bg_thread: threading.Thread | None = None
         self._bg_thread_dead = False
         self._dropped_flush_batches = 0
-        # Counter for *deferred* flush batches — non-force_flush calls that
+        # Counter for *deferred* flush batches â€” non-force_flush calls that
         # found the bg queue full and chose to leave rows/events in the
         # in-memory deques rather than snapshot-and-drop. Exposed alongside
         # `_dropped_flush_batches` in the status payload so operators can
@@ -1059,7 +897,7 @@ class HdfWriter(ManagedProcessBase):
     ) -> tuple[int, float, float]:
         # Invoked from the RPC handler thread (main loop _drain_rpc). Held
         # under _h5_lock so the bg flush thread can't be mid-write on the
-        # same h5py.File — h5py is not safe to share across threads even
+        # same h5py.File â€” h5py is not safe to share across threads even
         # for writes to distinct datasets.
         with self._h5_lock:
             if self._measurement_notes_ds is None:
@@ -1130,7 +968,7 @@ class HdfWriter(ManagedProcessBase):
                         except queue.Full:
                             pass
         except Exception as exc:
-            # Anything that escapes the outer loop is fatal — set the
+            # Anything that escapes the outer loop is fatal â€” set the
             # watchdog flag and stop the process so the supervisor's
             # restart policy can take over.
             self._record_exception(exc, phase="bg_thread_fatal")
@@ -1152,7 +990,7 @@ class HdfWriter(ManagedProcessBase):
         )
 
     def _handle_flush_batch(self, batch: "_FlushBatch") -> None:
-        # The bg thread runs this under _h5_lock — same lock that
+        # The bg thread runs this under _h5_lock â€” same lock that
         # serialises h5 + stream-state access from the main-loop drain
         # handlers, RPC handlers, and file rotation. The batch carries
         # snapshots of the deque contents and per-stream buffers the
@@ -1219,7 +1057,7 @@ class HdfWriter(ManagedProcessBase):
             raise AssertionError(
                 "hdf_writer mutation site invoked without _h5_lock while "
                 "the bg flush thread is live; this is a thread-safety "
-                "regression — see the lock comment in HdfWriter.__init__"
+                "regression â€” see the lock comment in HdfWriter.__init__"
             )
 
     def _drain_pending_to_file(self) -> None:
@@ -1299,7 +1137,7 @@ class HdfWriter(ManagedProcessBase):
         """Snapshot main-loop drain state and hand it to the bg flush thread.
 
         Returns True if the batch was queued, False if it was dropped due
-        to overflow (the data is lost — `_dropped_flush_batches` is
+        to overflow (the data is lost â€” `_dropped_flush_batches` is
         incremented so it surfaces in heartbeat/status). When the batch
         is queued successfully, `_pending` and `_last_flush` bookkeeping
         is updated to mirror the old synchronous-write timing.
@@ -1312,7 +1150,7 @@ class HdfWriter(ManagedProcessBase):
         are unbounded dicts though, so we snapshot-and-discard those to
         keep memory bounded during a sustained backlog. Force-flush
         callers retain the original "snapshot + drop on overflow"
-        contract — rotation/shutdown paths use `_drain_pending_to_file`
+        contract â€” rotation/shutdown paths use `_drain_pending_to_file`
         synchronously so they don't traverse this method.
         """
         if not force_flush and self._bg_queue.full():
@@ -2067,7 +1905,7 @@ class HdfWriter(ManagedProcessBase):
                 )
 
                 while not self._stop_evt.is_set():
-                    # Bail out cleanly if the bg flush thread died — the
+                    # Bail out cleanly if the bg flush thread died â€” the
                     # supervisor's restart policy will bring us back up.
                     if self._bg_thread_dead:
                         self._stop_evt.set()
@@ -2454,10 +2292,6 @@ class HdfWriter(ManagedProcessBase):
             },
         )
 
-    @staticmethod
-    def _rpc_request_id(req: Json) -> Any:
-        return req.get("request_id")
-
     def _build_topic_handlers(self) -> dict[str, Callable[[Json], None]]:
         return build_hdf_topic_handlers(self)
 
@@ -2469,20 +2303,13 @@ class HdfWriter(ManagedProcessBase):
         self._topic_handlers = handlers
         return handlers
 
-    @classmethod
-    def _rpc_ok(
-        cls, req_or_id: Json | Any, *, result: Any = None
-    ) -> Json:
-        # Matches the ManagedProcessBase signature (classmethod,
-        # req_or_id, default result=None) so mypy doesn't flag the
-        # override as LSP-incompatible. The body is identical to the
-        # base, kept here for now to preserve any subclass-tests that
-        # call HdfWriter._rpc_ok directly.
-        return {
-            "request_id": cls._rpc_request_id(req_or_id),
-            "ok": True,
-            "result": result,
-        }
+    # ``rpc_ok`` is inherited verbatim from ``ManagedProcessBase``;
+    # the prior explicit override duplicated the base body, narrowed
+    # ``_rpc_request_id`` to dict-only (an LSP violation against the
+    # base's polymorphic ``dict | Any`` accept), and was patched by no
+    # test. Inheriting keeps the wire envelope under a single source
+    # of truth so any future change to ``rpc_ok`` applies to
+    # HdfWriter automatically.
 
     def _rpc_error(self, req: Json, *, code: str, message: str | None = None) -> Json:
         err: Json = {"code": str(code)}
@@ -2699,7 +2526,7 @@ class HdfWriter(ManagedProcessBase):
             else 0,
         }
         result.update(self._hdf_device_filter_state())
-        return self._rpc_ok(req, result=result)
+        return self.rpc_ok(req, result=result)
 
     def _rpc_hdf_measurement_schema_get(self, req: Json) -> Json:
         configured, available, error = self._measurement_schema_state()
@@ -2715,7 +2542,7 @@ class HdfWriter(ManagedProcessBase):
                 code="measurement_schema_unavailable",
                 message=error or "measurement schema unavailable",
             )
-        return self._rpc_ok(
+        return self.rpc_ok(
             req,
             result={
                 "schema": measurement_schema_to_json(self._measurement_schema),
@@ -2764,7 +2591,7 @@ class HdfWriter(ManagedProcessBase):
             )
         except Exception as e:
             return self._rpc_error(req, code="note_write_failed", message=str(e))
-        return self._rpc_ok(
+        return self.rpc_ok(
             req,
             result={
                 "index": int(index),
@@ -2776,7 +2603,7 @@ class HdfWriter(ManagedProcessBase):
         )
 
     def _rpc_hdf_devices_get(self, req: Json) -> Json:
-        return self._rpc_ok(req, result=self._hdf_device_filter_state())
+        return self.rpc_ok(req, result=self._hdf_device_filter_state())
 
     def _rpc_hdf_devices_disable(self, req: Json) -> Json:
         return self._rpc_hdf_devices_toggle(req, disable=True)
@@ -2839,7 +2666,7 @@ class HdfWriter(ManagedProcessBase):
                     except Exception:
                         self._bump_error("h5.attrs.disabled_devices")
 
-        return self._rpc_ok(
+        return self.rpc_ok(
             req,
             result={
                 "changed": changed,
@@ -2913,7 +2740,7 @@ class HdfWriter(ManagedProcessBase):
         except Exception as e:
             return self._rpc_error(req, code="rotate_failed", message=str(e))
 
-        return self._rpc_ok(
+        return self.rpc_ok(
             req,
             result={
                 "old_file": old_file,
@@ -2932,7 +2759,7 @@ class HdfWriter(ManagedProcessBase):
         if not isinstance(params, dict):
             return self._rpc_error(req, code="invalid_params", message="params must be a dict")
         if self._h5 is None:
-            return self._rpc_ok(
+            return self.rpc_ok(
                 req,
                 result={
                     "already_stopped": True,
@@ -2944,7 +2771,7 @@ class HdfWriter(ManagedProcessBase):
             old_file = self._stop_writing_file()
         except Exception as e:
             return self._rpc_error(req, code="stop_failed", message=str(e))
-        return self._rpc_ok(
+        return self.rpc_ok(
             req,
             result={
                 "already_stopped": False,
@@ -3022,7 +2849,7 @@ class HdfWriter(ManagedProcessBase):
         except Exception as e:
             return self._rpc_error(req, code="start_failed", message=str(e))
 
-        return self._rpc_ok(
+        return self.rpc_ok(
             req,
             result={
                 "new_file": new_file,
@@ -3047,7 +2874,7 @@ class HdfWriter(ManagedProcessBase):
             return self._rpc_error(req, code="invalid_request", message="Malformed request")
         dispatch_req = rpc.as_dispatch_payload(request_id_field="request_id")
         if rpc.action == "process.capabilities":
-            return self._rpc_ok(
+            return self.rpc_ok(
                 dispatch_req,
                 result=capabilities_payload(self._hdf_capability_members()),
             )

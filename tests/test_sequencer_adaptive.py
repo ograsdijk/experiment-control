@@ -650,5 +650,81 @@ class SequencerAdaptiveTests(unittest.TestCase):
         )
 
 
+class SequencerWaitUntilSampleCapTests(unittest.TestCase):
+    def _runtime(self, values: list[float]) -> SequencerRuntime:
+        samples = deque(values)
+
+        def call_device(
+            device_id: str, action: str, params: dict[str, object]
+        ) -> dict[str, object]:
+            del device_id, action, params
+            return {"ok": True, "result": samples.popleft()}
+
+        def get_telemetry(device_id: str, signal: str) -> dict[str, object] | None:
+            del device_id, signal
+            return None
+
+        return SequencerRuntime(
+            call_device=call_device,
+            get_telemetry=get_telemetry,
+            set_stream_context=lambda *_args, **_kwargs: None,
+        )
+
+    def test_wait_until_reduce_max_samples_caps_retained_samples(self) -> None:
+        runtime = self._runtime([1.0, 2.0, 3.0, 4.0])
+        spec = parse_sequence(
+            {
+                "version": 1,
+                "steps": [
+                    {
+                        "wait_until": {
+                            "every_s": 0.0,
+                            "sample": {"call": {"device": "d", "action": "sample"}},
+                            "reduce": {"method": "mean", "max_samples": 2},
+                            "condition": {"gt": ["${sample}", 3.5]},
+                        }
+                    }
+                ],
+            }
+        )
+        runtime.load(spec)
+        runtime.start()
+        while runtime.state == "RUNNING":
+            runtime.tick()
+
+        self.assertEqual(runtime._env["samples"], [3.0, 4.0])  # noqa: SLF001
+        self.assertEqual(runtime.state, "STOPPED")
+
+    def test_wait_until_default_sample_cap_is_applied_without_window(self) -> None:
+        runtime = self._runtime([1.0, 2.0, 3.0])
+        runtime._start_wait_until(  # noqa: SLF001
+            {
+                "every_s": 0.0,
+                "sample": {"call": {"device": "d", "action": "sample"}},
+                "reduce": {"method": "mean", "max_samples": 2},
+                "condition": {"gt": ["${sample}", 10.0]},
+            }
+        )
+        assert runtime._wait_state is not None  # noqa: SLF001
+        runtime._wait_state.samples = [(0.0, -1.0), (0.1, 0.0)]  # noqa: SLF001
+        self.assertFalse(runtime._step_wait_until(time.monotonic()))  # noqa: SLF001
+        self.assertEqual([value for _, value in runtime._wait_state.samples], [0.0, 1.0])  # noqa: SLF001
+
+    def test_wait_until_caps_samples_without_reduce_spec(self) -> None:
+        runtime = self._runtime([1.0])
+        runtime._start_wait_until(  # noqa: SLF001
+            {
+                "every_s": 0.0,
+                "sample": {"call": {"device": "d", "action": "sample"}},
+                "condition": {"gt": ["${sample}", 10.0]},
+            }
+        )
+        assert runtime._wait_state is not None  # noqa: SLF001
+        runtime._wait_state.max_samples = 2  # noqa: SLF001
+        runtime._wait_state.samples = [(0.0, -1.0), (0.1, 0.0)]  # noqa: SLF001
+        self.assertFalse(runtime._step_wait_until(time.monotonic()))  # noqa: SLF001
+        self.assertEqual([value for _, value in runtime._wait_state.samples], [0.0, 1.0])  # noqa: SLF001
+
+
 if __name__ == "__main__":
     unittest.main()

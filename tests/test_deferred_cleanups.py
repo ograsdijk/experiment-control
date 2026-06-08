@@ -247,7 +247,7 @@ class CloseRpcBoundedWaitTests(unittest.TestCase):
 
 class TUIBulkWorkerTests(unittest.TestCase):
     def test_run_bulk_rpc_worker_decorated_with_work_thread(self) -> None:
-        from experiment_control.tui_manager import ManagerTUI
+        from experiment_control._tui.app import ManagerTUI
 
         method = ManagerTUI._run_bulk_rpc_worker
         # @work(thread=True) wraps the method; the wrapper exposes the
@@ -266,7 +266,7 @@ class TUIBulkWorkerTests(unittest.TestCase):
         verify by patching call_from_thread on a stubbed TUI and
         invoking the worker body directly (bypassing the decorator).
         """
-        from experiment_control.tui_manager import ManagerTUI
+        from experiment_control._tui.app import ManagerTUI
 
         # Build a stub TUI; bypass __init__ — we only call the worker
         # body.
@@ -350,7 +350,7 @@ class PublishTransitionEventLastErrorTests(unittest.TestCase):
 
     def test_publish_failure_recorded_in_last_error(self) -> None:
         proc = self._make_proc(_StubManagerRaises())
-        proc._publish_transition_event(
+        proc.publish_transition_event(
             "READY", "RUNNING", reason="user", metadata=None
         )
         self.assertIsNotNone(proc._last_error)
@@ -379,7 +379,7 @@ class PublishTransitionEventLastErrorTests(unittest.TestCase):
             f"{StateMachineProcessBase._TRANSITION_PUBLISH_ERROR_PREFIX} "
             "READY -> RUNNING: RuntimeError('boot race')"
         )
-        proc._publish_transition_event(
+        proc.publish_transition_event(
             "RUNNING", "READY", reason="ok", metadata=None
         )
         self.assertIsNone(
@@ -397,7 +397,7 @@ class PublishTransitionEventLastErrorTests(unittest.TestCase):
         manager = _StubManagerOK()
         proc = self._make_proc(manager)
         proc._last_error = "device disconnected: cannot reach instrument"
-        proc._publish_transition_event(
+        proc.publish_transition_event(
             "RUNNING", "READY", reason="ok", metadata=None
         )
         self.assertEqual(
@@ -412,7 +412,7 @@ class PublishTransitionEventLastErrorTests(unittest.TestCase):
         new transition-publish failure does NOT overwrite it."""
         proc = self._make_proc(_StubManagerRaises())
         proc._last_error = "existing operational error"
-        proc._publish_transition_event(
+        proc.publish_transition_event(
             "READY", "RUNNING", reason="user", metadata=None
         )
         self.assertEqual(proc._last_error, "existing operational error")
