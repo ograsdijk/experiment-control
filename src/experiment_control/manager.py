@@ -144,7 +144,7 @@ from ._manager.runtime_metadata import serialize_spec_yaml as shared_serialize_s
 # Each ``manager_*.py`` helper module declares an empty mixin class at
 # its bottom. ``Manager`` inherits from all of them so individual
 # ``def shared_foo(manager, ...)`` helpers can migrate onto the mixin
-# one at a time (REFACTOR_PLAN §8.2) without churning ``Manager``'s
+# one at a time during the mixin migration without churning ``Manager``'s
 # class header on every step. Until a method moves, the existing
 # ``shared_*`` forwarder pattern continues to work unchanged.
 from ._manager.command_journal import CommandJournalMixin
@@ -207,7 +207,7 @@ lock_effective_status_help = _instance_lock.lock_effective_status_help
 
 
 class Manager(
-    # Phase 8.1: mixin MRO. Order is the same as REFACTOR_PLAN §8.2.1-19
+    # Mixin MRO follows the historical manager helper migration order.
     # (least-coupled first → most-coupled last) so a method-resolution
     # collision (if ever introduced) is won by the more foundational
     # mixin. All mixins are currently empty scaffolds — they will gain
@@ -2076,7 +2076,7 @@ class Manager(
     # Manager -> external PUB
     # -----------------------------
     # ``_publish_manager_event`` is now provided by ``PubSubMixin``
-    # (REFACTOR_PLAN §8.2.1). The prior one-line forwarder method has
+    # The prior one-line forwarder method has
     # been removed; ``self._publish_manager_event(...)`` continues to
     # work via MRO. Tests that imported the module-level
     # ``publish_manager_event`` directly still work via the trampoline

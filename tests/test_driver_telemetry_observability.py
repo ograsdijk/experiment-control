@@ -1,7 +1,7 @@
 # ruff: noqa: E402
 """Driver telemetry observability — surfacing per-call exceptions.
 
-Regression test for the CTC100 case documented in ISSUES.md:
+Regression test for the CTC100 telemetry observability case:
 DeviceRunner.read_telemetry caught exceptions from individual telemetry
 calls and marked all of that call's outputs as quality=BAD, but the real
 exception text was only ever stored on self._last_error (overwritten on
