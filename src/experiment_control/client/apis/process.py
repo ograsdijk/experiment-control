@@ -13,11 +13,7 @@ class ProcessAPI(ClientFacadeBase):
         timeout_ms: int | None = None,
         retries: int | None = None,
     ) -> Any:
-        return self._request_result(
-            {"type": "manager.processes.list"},
-            timeout_ms=timeout_ms,
-            retries=retries,
-        )
+        return self._call_type("manager.processes.list", timeout_ms=timeout_ms, retries=retries)
 
     def get_status(
         self,
@@ -26,8 +22,9 @@ class ProcessAPI(ClientFacadeBase):
         timeout_ms: int | None = None,
         retries: int | None = None,
     ) -> Any:
-        return self._request_result(
-            {"type": "manager.processes.get", "process_id": str(process_id)},
+        return self._call_type(
+            "manager.processes.get",
+            process_id=str(process_id),
             timeout_ms=timeout_ms,
             retries=retries,
         )
@@ -39,8 +36,9 @@ class ProcessAPI(ClientFacadeBase):
         timeout_ms: int | None = None,
         retries: int | None = None,
     ) -> Any:
-        return self._request_result(
-            {"type": "manager.processes.start", "process_id": str(process_id)},
+        return self._call_type(
+            "manager.processes.start",
+            process_id=str(process_id),
             timeout_ms=timeout_ms,
             retries=retries,
         )
@@ -52,8 +50,9 @@ class ProcessAPI(ClientFacadeBase):
         timeout_ms: int | None = None,
         retries: int | None = None,
     ) -> Any:
-        return self._request_result(
-            {"type": "manager.processes.stop", "process_id": str(process_id)},
+        return self._call_type(
+            "manager.processes.stop",
+            process_id=str(process_id),
             timeout_ms=timeout_ms,
             retries=retries,
         )
@@ -65,8 +64,9 @@ class ProcessAPI(ClientFacadeBase):
         timeout_ms: int | None = None,
         retries: int | None = None,
     ) -> Any:
-        return self._request_result(
-            {"type": "manager.processes.restart", "process_id": str(process_id)},
+        return self._call_type(
+            "manager.processes.restart",
+            process_id=str(process_id),
             timeout_ms=timeout_ms,
             retries=retries,
         )
@@ -80,12 +80,14 @@ class ProcessAPI(ClientFacadeBase):
         timeout_ms: int | None = None,
         retries: int | None = None,
     ) -> Json:
-        payload: Json = {
-            "type": "manager.processes.rpc",
-            "process_id": str(process_id),
-            "request": {"type": str(action), "params": dict(params or {})},
-        }
-        return self._request_raw(payload, timeout_ms=timeout_ms, retries=retries)
+        return self._call_type(
+            "manager.processes.rpc",
+            process_id=str(process_id),
+            request={"type": str(action), "params": dict(params or {})},
+            timeout_ms=timeout_ms,
+            retries=retries,
+            expect_ok=False,
+        )
 
     def call(
         self,
@@ -96,12 +98,13 @@ class ProcessAPI(ClientFacadeBase):
         timeout_ms: int | None = None,
         retries: int | None = None,
     ) -> Any:
-        payload: Json = {
-            "type": "manager.processes.rpc",
-            "process_id": str(process_id),
-            "request": {"type": str(action), "params": dict(params or {})},
-        }
-        return self._request_result(payload, timeout_ms=timeout_ms, retries=retries)
+        return self._call_type(
+            "manager.processes.rpc",
+            process_id=str(process_id),
+            request={"type": str(action), "params": dict(params or {})},
+            timeout_ms=timeout_ms,
+            retries=retries,
+        )
 
     def capabilities(
         self,

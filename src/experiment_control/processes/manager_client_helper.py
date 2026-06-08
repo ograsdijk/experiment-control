@@ -5,6 +5,7 @@ from typing import Any, Iterable
 
 import zmq
 
+from ..client.protocol import ManagerProtocol
 from ..manager_client import ManagerClient
 
 
@@ -47,7 +48,7 @@ class ManagerClientHelper:
 
     def publish_event(
         self,
-        manager: ManagerClient,
+        manager: ManagerProtocol,
         *,
         topic: str,
         payload: dict[str, Any],

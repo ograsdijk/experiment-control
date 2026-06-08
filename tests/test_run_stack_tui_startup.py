@@ -370,7 +370,7 @@ class TuiStartupWaitTests(unittest.TestCase):
             ),
             mock.patch("experiment_control.cli.run_stack._shutdown_manager") as shutdown_mock,
             mock.patch("experiment_control.cli.run_stack._wait_for_exit") as wait_exit_mock,
-            mock.patch("experiment_control.tui_manager.ManagerTUI", _FakeApp),
+            mock.patch("experiment_control._tui.app.ManagerTUI", _FakeApp),
         ):
             _run_with_tui(
                 instance_id="vacuum",

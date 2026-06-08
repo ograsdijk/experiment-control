@@ -1270,13 +1270,13 @@ class WatchdogProcess(ManagedProcessBase):
             return common
         params = req.get("params", {}) or {}
         if not isinstance(params, dict):
-            return self._rpc_invalid_params(req)
+            return self.rpc_invalid_params(req)
         if not hasattr(self, "_rpc_registry"):
             self._rpc_registry = self._build_rpc_registry()
         dispatched = self._rpc_registry.dispatch_with_canonical(req)
         if dispatched is not None:
             return dispatched
-        return self._rpc_unknown(req)
+        return self.rpc_unknown(req)
 
     def close(self) -> None:
         # Stop accepting new action chains AND wait for any in-flight

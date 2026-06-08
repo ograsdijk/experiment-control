@@ -40,6 +40,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from experiment_control.processes.interlock import (
+    InterlockProcess,
     Rule,
     evaluate_interlock_rule,
 )
@@ -422,6 +423,104 @@ class WatchdogRuleErrorEventTests(unittest.TestCase):
             2,
             "rate-limit must be per-rule, not global",
         )
+
+
+class InterlockRuleErrorAsyncTests(unittest.TestCase):
+    def _make_proc(self) -> InterlockProcess:
+        from concurrent.futures import ThreadPoolExecutor
+
+        proc = object.__new__(InterlockProcess)
+        proc._process_id = "interlock-test"
+        proc._rule_error_last_mono = {}
+        proc._rule_error_period_s = 1000.0
+        proc._manager = object()
+        proc._rule_error_manager = None
+        proc._ctx = object()
+        proc._stop_evt = threading.Event()
+        proc._rule_error_executor = ThreadPoolExecutor(max_workers=1)
+        return proc
+
+    def test_condition_error_callback_does_not_block_on_publish(self) -> None:
+        release = threading.Event()
+        started = threading.Event()
+        proc = self._make_proc()
+
+        dedicated_manager = object()
+
+        class _Helper:
+            def init_client(self, **kwargs: Any) -> object:
+                self.init_kwargs = dict(kwargs)
+                return dedicated_manager
+
+            def publish_event(self, manager: object, **_kwargs: Any) -> None:
+                self.published_manager = manager
+                started.set()
+                release.wait(timeout=2.0)
+
+        helper = _Helper()
+        proc._manager_helper = helper
+        try:
+            cb = proc._make_condition_error_callback(
+                interceptor_id="i1", rule_name="r1"
+            )
+            t0 = time.monotonic()
+            cb(ValueError("boom"))
+            elapsed = time.monotonic() - t0
+            self.assertLess(elapsed, 0.2)
+            self.assertTrue(started.wait(timeout=1.0))
+            self.assertIs(helper.published_manager, dedicated_manager)
+            self.assertIsNot(helper.published_manager, proc._manager)
+            self.assertFalse(helper.init_kwargs["subscribe_telemetry"])
+        finally:
+            release.set()
+            proc._rule_error_executor.shutdown(wait=True, cancel_futures=True)
+
+    def test_condition_error_rate_limit_applies_before_enqueue(self) -> None:
+        calls: list[dict[str, Any]] = []
+        proc = self._make_proc()
+
+        class _Helper:
+            def init_client(self, **_kwargs: Any) -> object:
+                return object()
+
+            def publish_event(self, _manager: object, **kwargs: Any) -> None:
+                calls.append(dict(kwargs["payload"]))
+
+        proc._manager_helper = _Helper()
+        try:
+            cb = proc._make_condition_error_callback(
+                interceptor_id="i1", rule_name="r1"
+            )
+            cb(ValueError("a"))
+            cb(ValueError("b"))
+            proc._rule_error_executor.shutdown(wait=True, cancel_futures=False)
+            self.assertEqual(len(calls), 1)
+            self.assertIn("a", calls[0]["error"])
+        finally:
+            try:
+                proc._rule_error_executor.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                pass
+
+    def test_graceful_stop_closes_dedicated_rule_error_manager(self) -> None:
+        proc = self._make_proc()
+        closed = {"value": False}
+
+        class _AsyncManager:
+            def close(self) -> None:
+                closed["value"] = True
+
+        proc._rule_error_manager = _AsyncManager()
+        proc._unregister_command_interceptor_routes = lambda: None  # type: ignore[method-assign]
+        try:
+            proc._graceful_stop()  # noqa: SLF001
+            self.assertTrue(closed["value"])
+            self.assertIsNone(proc._rule_error_manager)  # noqa: SLF001
+        finally:
+            try:
+                proc._rule_error_executor.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":

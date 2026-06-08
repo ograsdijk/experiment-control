@@ -10,11 +10,10 @@ appendix at the bottom for cross-reference.
 
 ---
 
-## 1. Open code-quality items (concrete bugs)
+## 1. Resolved code-quality items (concrete bugs)
 
-These were identified in the original review but deliberately deferred
-because they each need a small design decision that doesn't fit the
-"surgical fix" pattern of the existing PRs.
+These were identified in the original review and have now been addressed
+on top of the merged May 2026 review track.
 
 ### 1.1 `stream_analysis` `last_fit` becomes stale silently
 
@@ -31,24 +30,11 @@ fit's parameters and have no way to tell "this is a fresh fit" from
 "this is the last successful fit from N minutes ago, the current data
 is unfittable".
 
-**Why not yet fixed.** Needs a "staleness" design choice:
-
-* Add a `last_fit_ts_mono` field and let the UI compute staleness
-  itself; payload schema change.
-* Add a `last_fit_stale: bool` flag set when the most recent fit
-  attempt failed; payload schema change.
-* Invalidate `last_fit` after N consecutive failures and let the
-  field go to `null`; arguably the cleanest but changes behaviour
-  for consumers that explicitly want "last known good".
-
-**Suggested approach.** Add `last_fit_attempt_ts_mono` AND
-`last_fit_success_ts_mono` to the payload; let the UI compute "fit
-is stale because attempt > success by > threshold". Backward-compatible
-(additive fields).
-
-**Effort.** Small — touches 1 fit-cache class and the workspace
-serializer. Needs a passing UI rendering update at the same time
-(otherwise operators don't see the new fields).
+**Resolution.** `FitCurve1DState` now stamps `last_fit_attempt_ts_mono`
+and `last_fit_success_ts_mono` into the retained fit payload. Failed
+attempts preserve the last known good fit while advancing the attempt
+timestamp, so consumers can detect stale fits without losing backward
+compatibility.
 
 ---
 
@@ -68,23 +54,10 @@ iteration. There's no per-destination backoff and no honouring of
 the `Retry-After` header. On a rate-limited InfluxDB instance the
 writer would hammer the endpoint at full speed.
 
-**Why not yet fixed.** Needs per-destination state:
-
-* A `dict[DestinationName, RetryState]` where `RetryState` carries
-  `next_attempt_mono` and `consecutive_429s`.
-* The bg loop has to skip a destination whose `next_attempt_mono` is
-  in the future, while still processing other destinations.
-* `Retry-After` parsing: handle both integer-seconds and HTTP-date
-  formats per RFC 9110 §10.2.3.
-
-**Suggested approach.** Add a tiny `BackoffPolicy` class with
-`next_delay(status_code, retry_after_header) -> float`. Default
-exponential backoff if `Retry-After` is missing (e.g. `min(60,
-2 ** consecutive_failures)`). Reset on first successful write.
-
-**Effort.** Medium — needs the new state container, plumbing in
-`_http_thread_run`, and tests with a mock HTTP server that returns
-429 with various `Retry-After` shapes.
+**Resolution.** The writer now tracks per-destination retry state,
+honours `Retry-After` as integer seconds or HTTP-date, falls back to
+bounded exponential backoff, skips destinations still in backoff while
+continuing to flush other destinations, and resets state on success.
 
 ---
 
@@ -103,25 +76,10 @@ condition is false. A long-running wait (waiting for cryogenic
 temperature equilibration, slow lock acquire, etc.) can accumulate
 hundreds of thousands of samples and exhaust memory.
 
-**Why not yet fixed.** Needs a default `window_s` decision:
-
-* Cap at a hard maximum (e.g. 10 000 samples) regardless of
-  configuration?
-* Apply a default `window_s` (e.g. `60.0`) when the step doesn't
-  specify one?
-* Switch to a `collections.deque(maxlen=...)` so old samples are
-  dropped silently?
-
-Each has trade-offs for sequence YAMLs that genuinely want "the
-median of every sample seen during the wait".
-
-**Suggested approach.** Default to `deque(maxlen=10000)` with a
-runtime warning when the cap is hit; let the operator opt into a
-larger cap via `reduce.max_samples`. Documented behaviour change
-in `docs/sequencer.md`.
-
-**Effort.** Small in code; medium in deciding the default + writing
-the migration note.
+**Resolution.** `wait_until.reduce.max_samples` now caps retained
+samples, defaulting to 10 000 when no explicit cap is provided. The
+cap is applied alongside any `window_s` trimming and the `samples`
+implicit variable reflects the retained tail.
 
 ---
 
@@ -146,19 +104,9 @@ limit (1/30s per (interceptor_id, rule_name)) caps the impact but
 the first occurrence per window still blocks the upstream command's
 rejection reply.
 
-**Why not yet fixed.** PR #52 isn't on master yet; the
-`_make_condition_error_callback` hook + `on_condition_error=` keyword
-don't exist on master, so there's no integration point on a
-master-based branch.
-
-**Suggested approach** (once PR #52 lands). Queue the publish onto a
-daemon thread (or onto the watchdog's existing single-worker
-`ThreadPoolExecutor` if it makes sense to share — they're in
-different processes though). Fire-and-forget; if the manager is
-unresponsive, drops are acceptable for observability events.
-
-**Effort.** Small — ~30-line addition to the InterlockProcess + a
-test that asserts the interceptor RPC doesn't block on the publish.
+**Resolution.** The callback now rate-limits synchronously, submits the
+`manager.interlock.rule_error` publish to a single-worker executor, and
+returns immediately. Shutdown cancels pending observability publishes.
 
 ---
 
@@ -180,25 +128,11 @@ runtime metadata. The recent in-tree refactor (`manager_*` siblings:
 moved most logic out, but `manager.py` is still the orchestrator
 holding sockets and most state.
 
-**Why not yet done.** Large PR with high coordination cost across the
-10 in-flight PRs. The dup-block in `manager.py:3466` (60 lines, fixed
-in PR #48 commit `690cc7f`) is what triggered the "this file is hard
-to navigate" observation in the first place — once #48 lands the
-file is smaller.
-
-**Suggested approach.**
-
-1. Create `manager/` as a package with `__init__.py` re-exporting
-   the `Manager` class.
-2. Split into ~5–8 modules: `manager/core.py` (Manager class + main
-   loop), `manager/sockets.py` (zmq context + socket lifecycle),
-   `manager/handles.py` (DeviceHandle / ProcessHandle), etc.
-3. Each split is a separate commit so reviewers can `git log -p`
-   one file at a time.
-4. No behaviour change; pure code organisation.
-
-**Effort.** Large. ~1 week of focused work + a downstream smoke run
-to verify nothing imports from a now-moved location.
+**Resolution.** Public imports remain on `experiment_control.manager`,
+while model/config concerns were split into `manager_models.py` and
+`manager_config.py`. The existing `manager_*` sibling modules continue
+to hold lifecycle, routing, pubsub, supervision, logs, and runtime
+metadata logic.
 
 ---
 
@@ -211,13 +145,10 @@ the repo (~5 500 lines). It has at least 7 distinct concerns:
 workspaces, fitting, bin stats, snapshot publishing, source nodes,
 validation, RPC dispatch. Cross-concern bugs are hard to spot.
 
-**Suggested approach.** Same shape as 2.1 — make
-`processes/stream_analysis/` a package with files per concern.
-Pin the existing `_NodeValidator` Protocol from PR #55 in the
-public surface.
-
-**Effort.** Large. Hardest of the four splits because the in-file
-imports are tangled.
+**Resolution.** Fit-related state, validation, execution, and hist-fit
+helpers were split into `processes/stream_analysis_fit.py` and
+re-exported from `processes/stream_analysis.py`, preserving the existing
+public import path while reducing the largest file's mixed concerns.
 
 ---
 
@@ -237,8 +168,10 @@ into:
 * `hdf_writer/datasets.py` — per-dataset write helpers
 * `hdf_writer/measurement.py` — measurement-note table + metadata
 
-**Effort.** Medium — file is large but the concerns are already
-relatively well-separated.
+**Resolution.** Background request/queue payload types moved to
+`processes/hdf_writer_bg.py`, and HDF dtype/dataset helper functions
+moved to `processes/hdf_writer_dtypes.py`. `processes/hdf_writer.py`
+continues to expose `HdfWriter` and orchestrate the process.
 
 ---
 
@@ -251,17 +184,10 @@ actions, RPC client, capabilities cache. The `_on_dismiss`
 duplicate-name pattern across nested closures was specifically
 called out as making the file hard to navigate.
 
-**Suggested approach.** Make `tui/` a package:
-* `tui/app.py` — `ManagerTUI`
-* `tui/screens/` — one file per modal screen (`ConfirmScreen` etc.)
-* `tui/actions.py` — `action_*` methods (can stay on ManagerTUI but
-  extracted as mixin)
-* `tui/rpc.py` — the `_rpc_call` / `_pub_thread` helpers
-* `tui/state.py` — `_device_status` / `_processes` etc. caches
-
-**Effort.** Medium. Coupled with the deferred TUI worker conversion
-(now landed in PR #56 as F.19) so the worker pattern survives the
-refactor.
+**Resolution.** `DeviceStatus` moved to `tui_models.py`, and modal
+screens moved to `tui_screens.py`. `tui_manager.py` remains the public
+entry point for `ManagerTUI` and keeps action/RPC orchestration in one
+place for compatibility.
 
 ---
 
@@ -274,78 +200,30 @@ refactor.
 were verified by static analysis (grep + AST inspection) but not by
 running the centrex test suite against each branch.
 
-**Suggested workflow** for each open PR:
+**Status.** The downstream checkout exists at
+`../centrex-experimental-stack`, but the smoke matrix could not be run
+because dependency resolution is currently unsatisfiable: `linien-client
+==2.1.0` requires `numpy<2`, while `experiment-control==0.2.0` requires
+`numpy>=2.4.1`. The attempted command was:
 
 ```bash
-# In centrex-experimental-stack worktree
-git checkout main
-git pull
-# Point centrex at the PR branch via the local clone
-uv pip install -e ../experiment-control@<branch-name>
-# Run the smoke matrix
-pytest instances/electrostatic-lens/tests
-pytest instances/state-preparation-b-detection/tests
-pytest instances/state-preparation/tests
-pytest instances/vacuum-cryo/tests
+uv pip install -e ../experiment-control
+uv run pytest instances/electrostatic-lens/tests \
+  instances/state-preparation-b-detection/tests \
+  instances/state-preparation/tests \
+  instances/vacuum-cryo/tests
 ```
 
-These four instances exercise the entire downstream public API
-surface my PRs touch (`evaluate_*_rule`, `collect_rulesets`,
-`StateMachineProcessBase`, the state-machine subclasses,
-`ManagerClient`, `process_base`).
-
-**Effort.** Small per PR (~5 min to install + run); medium total
-for all 10 PRs (~1 hour).
+Once the downstream environment pins are reconciled, this smoke matrix
+should be rerun.
 
 ---
 
 ### 3.2 PR merge ordering + conflict resolution
 
-**Origin.** All 10 PRs branch off the same `master` commit; some
-touch overlapping files.
-
-**Known overlap:**
-
-* **#54 ↔ #56** both touch `processes/state_machine_base.py`:
-  - #54's `cb4e78e` adds the F.34 record-into-`_last_error`.
-  - #56's `b14c4d1` supersedes the F.34 record AND adds the
-    matching clear-on-success path.
-  - **Resolution:** whichever lands first wins; the other PR needs
-    a one-hunk rebase to drop the duplicated record block. The clear
-    path is unique to #56 either way.
-
-* **#54 ↔ #57** both touch `processes/influx_writer.py`:
-  - #54 doesn't touch this file (re-check).
-  - #57 adds the `_signals_skipped_invalid` counter + status RPC.
-  - No overlap expected; verify on rebase.
-
-* **#48 ↔ #56** both touch `manager.py`:
-  - #48 deletes the dup-block at `manager.py:3466-3524` (60 lines).
-  - #56 adds `_CLOSE_RPC_LOCK_WAIT_S` and the bounded-acquire
-    `_close_*_rpc` methods.
-  - No real conflict (different parts of the file); a clean
-    rebase will likely succeed.
-
-**Suggested merge order** (least → most coupled):
-
-1. #48 (Group A — trivial fixes; only deletes things + small
-   surgical fixes)
-2. #50 (Group D — HDF; isolated to `hdf_writer.py`)
-3. #53 (Group G — sequencer / stream_analysis / shm; isolated)
-4. #55 (Group H — mypy hygiene; touches many files but only
-   adds helpers / standardises signatures)
-5. #49 (Group C — telemetry; additive payload)
-6. #51 (Group B — DEALER correlation)
-7. #52 (Group E — watchdog/interlock; unblocks 1.4 above)
-8. #54 (Group F — manager hardening)
-9. #56 (Deferred cleanups; rebase on #54 to drop the
-   duplicated state_machine_base hunk)
-10. #57 (Misc review followups; rebase on #54 if needed)
-
-After #52 lands, item 1.4 above becomes actionable as a new small
-PR.
-
-**Effort.** ~30 min per PR if there's a rebase needed; less if not.
+Resolved. PRs #48–#58 are merged. PR #56 needed one conflict-resolution
+merge after #54 landed; the remaining PRs were clean after GitHub
+recomputed mergeability.
 
 ---
 
@@ -408,16 +286,16 @@ review.
 
 | PR | Title (short) | Tests | Status |
 |---|---|---|---|
-| [#48](https://github.com/ograsdijk/experiment-control/pull/48) | Group A — trivial fixes + federation spoofing | +15 | Open |
-| [#49](https://github.com/ograsdijk/experiment-control/pull/49) | Group C — telemetry observability (closes ISSUES.md) | +14 | Open |
-| [#50](https://github.com/ograsdijk/experiment-control/pull/50) | Group D — HDF lock coverage | +7 | Open |
-| [#51](https://github.com/ograsdijk/experiment-control/pull/51) | Group B — DEALER correlation + server-side echo | +12 | Open |
-| [#52](https://github.com/ograsdijk/experiment-control/pull/52) | Group E — watchdog/interlock observability | +12 | Open |
-| [#53](https://github.com/ograsdijk/experiment-control/pull/53) | Group G — SEM/sequencer/shm_ring | +10 | Open |
-| [#54](https://github.com/ograsdijk/experiment-control/pull/54) | Group F — manager hardening | +17 | Open |
-| [#55](https://github.com/ograsdijk/experiment-control/pull/55) | Group H — mypy hygiene | +15 | Open |
-| [#56](https://github.com/ograsdijk/experiment-control/pull/56) | Deferred cleanups (F.25 + F.19 + sticky-error reset) | +12 | Open |
-| [#57](https://github.com/ograsdijk/experiment-control/pull/57) | Misc review followups (#48 + #24 + #20a + #47) | +19 | Open |
+| [#48](https://github.com/ograsdijk/experiment-control/pull/48) | Group A — trivial fixes + federation spoofing | +15 | Merged |
+| [#49](https://github.com/ograsdijk/experiment-control/pull/49) | Group C — telemetry observability (closes ISSUES.md) | +14 | Merged |
+| [#50](https://github.com/ograsdijk/experiment-control/pull/50) | Group D — HDF lock coverage | +7 | Merged |
+| [#51](https://github.com/ograsdijk/experiment-control/pull/51) | Group B — DEALER correlation + server-side echo | +12 | Merged |
+| [#52](https://github.com/ograsdijk/experiment-control/pull/52) | Group E — watchdog/interlock observability | +12 | Merged |
+| [#53](https://github.com/ograsdijk/experiment-control/pull/53) | Group G — SEM/sequencer/shm_ring | +10 | Merged |
+| [#54](https://github.com/ograsdijk/experiment-control/pull/54) | Group F — manager hardening | +17 | Merged |
+| [#55](https://github.com/ograsdijk/experiment-control/pull/55) | Group H — mypy hygiene | +15 | Merged |
+| [#56](https://github.com/ograsdijk/experiment-control/pull/56) | Deferred cleanups (F.25 + F.19 + sticky-error reset) | +12 | Merged |
+| [#57](https://github.com/ograsdijk/experiment-control/pull/57) | Misc review followups (#48 + #24 + #20a + #47) | +19 | Merged |
 
 Cumulative across all 10: ~133 new tests (vs 427 baseline). Zero
 regressions on any branch. Ruff + CI complexity guard + mojibake

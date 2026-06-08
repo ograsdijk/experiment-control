@@ -854,6 +854,50 @@ HDF storage:
   - `age_s`: float
   - `ts`: {`t_wall`, `t_mono`}
 
+### `manager.stream_analysis.output`
+- Producer: stream_analysis process
+- Consumers: TUI, web UI, optional dashboards
+- Payload (version 1):
+  - `workspace_id`: str
+  - `output_id`: str
+  - `node_id`: str
+  - `kind`: `scalar|trace|hist_agg|hist2d|params_map|fit_1d`
+  - `channel_index`: int
+  - `channel_count`: int
+  - `value`: output payload
+  - `point_count`: int (optional)
+  - `truncated`: bool (optional)
+  - Fit outputs include additive `last_fit_attempt_ts_mono` and
+    `last_fit_success_ts_mono` fields when a fit has been attempted.
+
+### `manager.process.failed`
+- Producer: manager
+- Consumers: TUI/logs
+- Payload includes `process_id`, `pid`/`last_failure_pid` where known,
+  `error` or `termination_reason`, and `ts`.
+
+### `manager.lifecycle.events_dropped`
+- Producer: manager
+- Consumers: logs/observability
+- Payload includes dropped-event counts and reason text when lifecycle/log
+  publication backpressure drops events.
+
+### `manager.watchdog.rule_error`
+- Producer: watchdog process
+- Consumers: logs/observability
+- Payload includes `process_id`, `watchdog_id`, `rule`, and `error`.
+
+### `manager.interlock.rule_error`
+- Producer: interlock process
+- Consumers: logs/observability
+- Payload includes `process_id`, `interceptor_id`, `rule`, and `error`.
+
+### `manager.watchdog.action_chain_error`
+- Producer: watchdog process
+- Consumers: logs/observability
+- Payload includes `process_id`, `watchdog_id`, `rule`, and `error` for
+  asynchronous remediation-action failures.
+
 ### `manager.command`
 - Producer: manager
 - Consumers: HDF writer, logs

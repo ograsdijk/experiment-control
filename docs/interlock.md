@@ -243,5 +243,6 @@ The manager blocks commands when:
 
 - The interlock never performs synchronous reads from the manager during checks.
 - It relies only on the telemetry cache populated from `manager.telemetry_update`.
+- Condition-expression exceptions publish rate-limited `manager.interlock.rule_error` events asynchronously so observability publishing does not delay the command rejection response.
 - Interlock startup registers routes via `manager.interceptors.register` with
   `replace: true`.

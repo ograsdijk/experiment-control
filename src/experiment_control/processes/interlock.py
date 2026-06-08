@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import time
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -14,6 +15,7 @@ from ..rules.rules_common import (
     parse_version,
 )
 from ..sequencer.eval import eval_condition, render_templates, to_attrdict
+from ..types import MemberSpec
 from ..utils.cli_args import (
     add_heartbeat_args,
     add_manager_args,
@@ -622,6 +624,11 @@ class InterlockProcess(ManagedProcessBase):
         # (interceptor_id, rule_name).
         self._rule_error_last_mono: dict[tuple[str, str], float] = {}
         self._rule_error_period_s: float = 30.0
+        self._rule_error_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix=f"{self._process_id}-rule-errors",
+        )
+        self._rule_error_manager = None
 
         self._advertise_process_rpc()
         self._register_routes()
@@ -664,21 +671,42 @@ class InterlockProcess(ManagedProcessBase):
             if last is not None and (now - last) < self._rule_error_period_s:
                 return
             self._rule_error_last_mono[rate_key] = now
+            payload = {
+                "process_id": self._process_id,
+                "interceptor_id": interceptor_id,
+                "rule": rule_name,
+                "error": repr(exc),
+            }
             try:
-                self._manager_helper.publish_event(
-                    self._manager,
-                    topic="manager.interlock.rule_error",
-                    payload={
-                        "process_id": self._process_id,
-                        "interceptor_id": interceptor_id,
-                        "rule": rule_name,
-                        "error": repr(exc),
-                    },
+                self._rule_error_executor.submit(
+                    self._publish_rule_error_event,
+                    payload,
                 )
             except Exception:
                 pass
 
         return _callback
+
+    def _rule_error_publish_manager(self):
+        manager = getattr(self, "_rule_error_manager", None)
+        if manager is None:
+            manager = self._manager_helper.init_client(
+                ctx=self._ctx,
+                process_id=self._process_id,
+                subscribe_telemetry=False,
+            )
+            self._rule_error_manager = manager
+        return manager
+
+    def _publish_rule_error_event(self, payload: Json) -> None:
+        try:
+            self._manager_helper.publish_event(
+                self._rule_error_publish_manager(),
+                topic="manager.interlock.rule_error",
+                payload=payload,
+            )
+        except Exception:
+            pass
 
     def _routes_for_enabled_rules(self) -> list[Json]:
         routes: list[Json] = []
@@ -750,9 +778,19 @@ class InterlockProcess(ManagedProcessBase):
         try:
             self._unregister_command_interceptor_routes()
         finally:
+            executor = getattr(self, "_rule_error_executor", None)
+            if executor is not None:
+                executor.shutdown(wait=False, cancel_futures=True)
+            manager = getattr(self, "_rule_error_manager", None)
+            if manager is not None:
+                try:
+                    manager.close()
+                except Exception:
+                    pass
+                self._rule_error_manager = None
             super()._graceful_stop()
 
-    def _interlock_capability_members(self) -> list[Json]:
+    def _interlock_capability_members(self) -> list[MemberSpec]:
         members = [
             method("interlock.list", params=None, doc="List loaded interceptors."),
             method(
@@ -1202,7 +1240,7 @@ class InterlockProcess(ManagedProcessBase):
         dispatched = self._rpc_registry.dispatch_with_canonical(req)
         if dispatched is not None:
             return dispatched
-        return self._rpc_unknown(req)
+        return self.rpc_unknown(req)
 
     def run(self) -> None:
         try:

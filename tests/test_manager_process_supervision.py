@@ -10,7 +10,7 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from experiment_control.manager_process_supervision import (  # noqa: E402
+from experiment_control._manager.process_supervision import (  # noqa: E402
     enforce_managed_process_heartbeat_timeout,
     process_snapshot,
 )

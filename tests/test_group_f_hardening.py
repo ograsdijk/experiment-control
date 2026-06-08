@@ -37,17 +37,17 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from experiment_control.manager_process_logs import (
+from experiment_control._manager.process_logs import (
     drain_supervisor_logs,
     queue_supervisor_log,
 )
-from experiment_control.manager_process_supervision import (
+from experiment_control._manager.process_supervision import (
     _MAX_KILL_ATTEMPTS,
     enforce_managed_process_stop_timeout,
     stop_process_handle,
 )
-from experiment_control.manager_pubsub import publish_manager_event
-from experiment_control.manager_route_handlers import (
+from experiment_control._manager.pubsub import publish_manager_event
+from experiment_control._manager.route_handlers import (
     _CLEANUP_ORPHANS_TIMEOUT_CAP_S,
     route_manager_cleanup_orphans,
 )
@@ -62,8 +62,19 @@ from experiment_control.processes.state_machine_base import (
 
 
 def _make_log_manager() -> SimpleNamespace:
-    """Minimal stub exposing the attributes record_supervisor_log_item +
-    drain_supervisor_logs read."""
+    """Minimal stub exposing the attributes / methods drain_supervisor_logs
+    + queue_supervisor_log read on the manager.
+
+    Phase 8.2.10 migration moved the supervisor-log helpers onto
+    ``ProcessLogsMixin``. ``drain_supervisor_logs`` (the module-level
+    trampoline used here) calls back via ``self.<method>`` for cross-
+    helper coordination, so the stub binds the small set of mixin
+    methods the test exercises. Pure helpers (``supervisor_key``,
+    ``supervisor_block_*``) stay at module level and are imported
+    directly by the mixin.
+    """
+    from experiment_control._manager.process_logs import ProcessLogsMixin
+
     emitted: list[dict[str, object]] = []
 
     def _emit(**kwargs):
@@ -75,6 +86,9 @@ def _make_log_manager() -> SimpleNamespace:
         _supervisor_log_dropped_lock=threading.Lock(),
         _supervisor_pending_blocks={},
         _supervisor_log_threads={},
+        _supervisor_log_dir="/tmp",
+        _supervisor_log_max_bytes=0,
+        _supervisor_log_backups=0,
         _emit_log=_emit,
         _emitted=emitted,
     )
@@ -82,6 +96,31 @@ def _make_log_manager() -> SimpleNamespace:
     # and a couple of other attrs guarded by try/except — leave them
     # absent so the try/except path runs.
     mgr._record_supervisor_raw_log = lambda *_a, **_k: None
+    # Bind mixin methods needed by drain_supervisor_logs /
+    # queue_supervisor_log (cross-method calls go through self.X).
+    mgr._flush_stale_supervisor_blocks = (
+        lambda *a, **kw: ProcessLogsMixin._flush_stale_supervisor_blocks(
+            mgr, *a, **kw
+        )
+    )
+    mgr._prune_supervisor_log_threads = (
+        lambda *a, **kw: ProcessLogsMixin._prune_supervisor_log_threads(
+            mgr, *a, **kw
+        )
+    )
+    mgr._emit_supervisor_item = lambda item: ProcessLogsMixin._emit_supervisor_item(
+        mgr, item
+    )
+    mgr._append_supervisor_jsonl = (
+        lambda item: ProcessLogsMixin._append_supervisor_jsonl(mgr, item)
+    )
+    mgr._supervisor_infer_severity = (
+        lambda *a, **kw: ProcessLogsMixin._supervisor_infer_severity(
+            mgr, *a, **kw
+        )
+    )
+    mgr._record_supervisor_emitted_log = lambda *a, **kw: None
+    mgr._normalize_log_severity = lambda raw: str(raw or "info").lower()
     return mgr
 
 
@@ -455,7 +494,7 @@ class PublishTransitionEventFailureTests(unittest.TestCase):
 
     def test_publish_failure_recorded_in_last_error(self) -> None:
         proc = self._make_proc()
-        proc._publish_transition_event(
+        proc.publish_transition_event(
             "READY", "RUNNING", reason="user", metadata=None
         )
         self.assertIsNotNone(proc._last_error)
@@ -466,7 +505,7 @@ class PublishTransitionEventFailureTests(unittest.TestCase):
     def test_prior_last_error_not_overwritten(self) -> None:
         proc = self._make_proc()
         proc._last_error = "existing operational error"
-        proc._publish_transition_event(
+        proc.publish_transition_event(
             "READY", "RUNNING", reason="user", metadata=None
         )
         # The pre-existing error stays — operational failures take
@@ -492,7 +531,7 @@ class ErrorCountsLockTests(unittest.TestCase):
         self.assertEqual(writer._error_counts, {"foo": 2, "bar": 1})
 
     def test_tui_manager_bump_error_takes_lock(self) -> None:
-        from experiment_control.tui_manager import ManagerTUI
+        from experiment_control._tui.app import ManagerTUI
 
         tui = object.__new__(ManagerTUI)
         tui._error_counts = {}
