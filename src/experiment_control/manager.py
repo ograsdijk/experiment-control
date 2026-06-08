@@ -525,6 +525,12 @@ class Manager(
         # not flood the manager event bus.
         self._last_drain_cap_event_mono: dict[str, float] = {}
 
+        # Per-socket monotonic timestamp of the last "drain cap hit"
+        # event we published. Used to rate-limit drain-cap-hit notifications
+        # (see _maybe_publish_drain_cap_hit) so a sustained backlog does
+        # not flood the manager event bus.
+        self._last_drain_cap_event_mono: dict[str, float] = {}
+
     # -----------------------------
     # Public API
     # -----------------------------
@@ -2075,6 +2081,26 @@ class Manager(
     # work via MRO. Tests that imported the module-level
     # ``publish_manager_event`` directly still work via the trampoline
     # kept in ``manager_pubsub``.
+
+    def _maybe_publish_drain_cap_hit(self, socket: str, cap: int) -> None:
+        """Publish a `manager.drain_cap_hit` event for `socket`, rate-limited
+        to at most once per second per socket name. Called when a SUB-drain
+        loop completes its full iteration count without seeing `zmq.Again`,
+        meaning unread messages remain queued at the end of the tick.
+        """
+        now_mono = time.monotonic()
+        last = self._last_drain_cap_event_mono.get(socket, 0.0)
+        if now_mono - last < 1.0:
+            return
+        self._last_drain_cap_event_mono[socket] = now_mono
+        self._publish_manager_event(
+            "manager.drain_cap_hit",
+            {
+                "socket": socket,
+                "cap": cap,
+                "ts": {"t_wall": time.time(), "t_mono": now_mono},
+            },
+        )
 
     def _maybe_publish_drain_cap_hit(self, socket: str, cap: int) -> None:
         """Publish a `manager.drain_cap_hit` event for `socket`, rate-limited
