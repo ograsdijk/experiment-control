@@ -1,58 +1,54 @@
 # Micro-benchmark suite
 
-Isolated timings of specific backend hot paths. Built to answer
-"is this code path actually expensive enough to optimise?"
-without having to bring up the whole stack and profile under
-production load.
+Isolated timings of backend hot paths. The suite answers "is this path expensive enough to optimize?" without bringing up the full stack.
 
-Each script self-contains: synthetic inputs, repeated calls, reports
-per-call timing + allocation pressure. No external services
-required.
+Each benchmark uses synthetic but representative inputs, repeated calls, and reports per-call latency plus optional allocation pressure. No external services are required.
 
 ## Running
 
 From the repo root:
 
-```
-.venv\Scripts\python.exe -m bench.run_microbench
+```powershell
+uv run python -m bench.run_microbench --no-alloc
 ```
 
-(or `python -m bench.run_microbench` if your venv is already
-active).
+Use `--no-alloc` for realistic timing. Omit it only when you specifically want `tracemalloc` allocation accounting; allocation tracking adds substantial overhead.
 
-Pass `--bench <name>` to run a subset (`bin_stats`, `sanitize`,
-`json_dumps`, `output_index`). Default: run all.
+Run a subset with `--bench <name>`; the flag is repeatable.
+
+Available benchmarks:
+
+- `bin_stats`
+- `sanitize`
+- `json_dumps`
+- `output_index`
+- `trace_snapshot`
+- `snapshot_readout`
+- `stream_buffer`
 
 ## What's measured
 
-- **`bin_stats`** — `BinStatsState.update_sample()` + `.payload()`
-  cost as a function of bin count. Validates whether the histogram
-  payload-build path is fast enough at the rate-limited
-  `max_hist_output_hz=20` cadence, or worth caching.
+- **`bin_stats`** — `BinStatsState.update_sample()` and `.payload()` cost as a function of bin count. Validates whether histogram payload construction is fast enough at `max_hist_output_hz=20` or worth caching.
 
-- **`sanitize`** — `_sanitize_json()` cost as a function of payload
-  shape (deep + narrow vs flat + wide). Validates whether the
-  redundant-walk patterns flagged in audits actually matter at
-  realistic payload sizes.
+- **`sanitize`** — `_sanitize_json()` cost as a function of payload shape. Validates whether recursive JSON-safe sanitization is significant for large stream outputs.
 
-- **`json_dumps`** — `zmq.utils.jsonapi.dumps` cost on representative
-  telemetry / stream-frame payload shapes. Sets a floor for what
-  the WS broadcast path can possibly achieve.
+- **`json_dumps`** — side-by-side encoding cost for pyzmq/stdlib `jsonapi.dumps`, direct `orjson.dumps`, and production `experiment_control.utils.zmq_helpers.json_dumps` on representative telemetry and stream-frame payloads.
 
-- **`output_index`** — `buildPanelsByWorkspaceOutput`-equivalent
-  index build cost as a function of panel count. Validates the
-  reverse-index design from PerfC.
+- **`output_index`** — `buildPanelsByWorkspaceOutput`-equivalent reverse-index construction cost as a function of panel count.
+
+- **`trace_snapshot`** — compares the old trace snapshot materialization path (`tolist()` plus recursive sanitize) with the current `np.isfinite` fast path used for finite traces.
+
+- **`snapshot_readout`** — compares workspace snapshot response strategies for cached trace payloads: current sanitize-then-decimate, decimate-before-sanitize, and a known-clean fast path.
+
+- **`stream_buffer`** — compares HDF stream-buffer assembly strategies: list-of-bytes baseline, preallocated copy from bytes, and preallocated copy from a shared-memory view.
 
 ## Reading the output
 
 Each section prints:
 
-```
-target              size      n_iter   total_s    per_call_us   allocs/call
-bin_stats.payload   100      10000    0.234      23.4           ~1.2 KB
-bin_stats.payload   1000     10000    1.876      187.6          ~12 KB
+```text
+target                                  size     n_iter      total   per call alloc/call
+bin_stats.payload                    100 bins      5,000     0.234s      46.80    1.20 KB
 ```
 
-`per_call_us` is the actionable number. If it's <10 μs, the path
-is cheap; if it's >100 μs, anything called at 50 Hz × N panels
-will show up in a profiler.
+`per_call_us` is the actionable number. As a rough guide: <10 µs is cheap; >100 µs can matter if called at high rate or across many panels/workspaces.
