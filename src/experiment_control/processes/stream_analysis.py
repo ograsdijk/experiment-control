@@ -2739,22 +2739,22 @@ class StreamAnalysisProcess(ManagedProcessBase):
             kind = str(cached.get("kind") or output.kind).strip()
             if kinds_filter is not None and kind not in kinds_filter:
                 continue
-            item = _sanitize_json(dict(cached))
+            item_raw = dict(cached)
             if kind == "trace" and max_trace_points is not None:
+                original_values = item_raw.get("value")
                 values = self._decimate_snapshot_trace(
-                    item.get("value"), max_points=max_trace_points
+                    original_values, max_points=max_trace_points
                 )
                 if values is None:
                     continue
-                original_values = item.get("value")
                 original_len = (
                     len(original_values) if isinstance(original_values, list) else len(values)
                 )
-                item["value"] = values
-                item["point_count"] = int(len(values))
+                item_raw["value"] = values
+                item_raw["point_count"] = int(len(values))
                 if int(original_len) > int(len(values)):
-                    item["truncated"] = True
-            outputs.append(item)
+                    item_raw["truncated"] = True
+            outputs.append(_sanitize_json(item_raw))
 
         return {
             "workspace_id": workspace_id,

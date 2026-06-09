@@ -12,7 +12,10 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from experiment_control.processes.stream_analysis import (
+    CompiledWorkspace,
+    PublishOutput,
     StreamAnalysisProcess,
+    WorkspaceRuntime,
     compile_workspace_graph,
 )
 
@@ -24,6 +27,39 @@ def _make_process_for_bounds() -> StreamAnalysisProcess:
     proc._telemetry_history = {}  # noqa: SLF001
     proc._telemetry_history_max_points = 32  # noqa: SLF001
     proc._telemetry_history_max_age_s = 10.0  # noqa: SLF001
+    return proc
+
+
+def _make_process_for_snapshot(values: list[float]) -> StreamAnalysisProcess:
+    proc = StreamAnalysisProcess.__new__(StreamAnalysisProcess)
+    proc._workspaces = {  # noqa: SLF001
+        "ws": WorkspaceRuntime(
+            compiled=CompiledWorkspace(
+                workspace_id="ws",
+                enabled=True,
+                nodes={},
+                order=[],
+                stream_source_node_id="src",
+                stream_key=("dev", "trace"),
+                node_output_types={},
+                outputs=[PublishOutput(output_id="trace", node_id="src", kind="trace")],
+            ),
+            raw_config={},
+            node_state={},
+            revision=7,
+            etag="etag-7",
+        )
+    }
+    proc._latest_output_payloads = {  # noqa: SLF001
+        ("ws", "trace"): {
+            "workspace_id": "ws",
+            "output_id": "trace",
+            "node_id": "src",
+            "kind": "trace",
+            "value": list(values),
+            "point_count": len(values),
+        }
+    }
     return proc
 
 
@@ -104,6 +140,34 @@ class StreamAnalysisMemoryBoundsTests(unittest.TestCase):
         self.assertTrue(samples)
         self.assertGreaterEqual(samples[0][0], 14.0)
         self.assertEqual(samples[-1][0], 19.0)
+
+    def test_snapshot_trace_decimates_before_sanitize(self) -> None:
+        values = [float(i) for i in range(200_000)]
+        values[50_000] = float("nan")
+        values[100_000] = float("inf")
+        values[150_000] = float("-inf")
+        proc = _make_process_for_snapshot(values)
+
+        payload = proc._workspace_snapshot_payload(  # noqa: SLF001
+            {"workspace_id": "ws", "max_trace_points": 2_000}
+        )
+
+        [item] = payload["outputs"]
+        self.assertEqual(item["kind"], "trace")
+        self.assertLessEqual(len(item["value"]), 2_000)
+        self.assertEqual(item["point_count"], len(item["value"]))
+        self.assertTrue(item["truncated"])
+        self.assertIn(None, item["value"])
+
+    def test_snapshot_trace_without_limit_still_sanitizes_full_payload(self) -> None:
+        proc = _make_process_for_snapshot([0.0, float("nan"), 2.0])
+
+        payload = proc._workspace_snapshot_payload({"workspace_id": "ws"})  # noqa: SLF001
+
+        [item] = payload["outputs"]
+        self.assertEqual(item["value"], [0.0, None, 2.0])
+        self.assertEqual(item["point_count"], 3)
+        self.assertNotIn("truncated", item)
 
 
 if __name__ == "__main__":
