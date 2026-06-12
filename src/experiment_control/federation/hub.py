@@ -226,7 +226,7 @@ class FederationHub:
             "driver_process": {
                 "state": "FEDERATED",
                 "pid": None,
-                "restart_count": None,
+                "restart_count": 0,
                 "last_exit_code": None,
                 "last_error": peer_rt.last_error,
             },

@@ -810,7 +810,7 @@ class ManagerTUI(App):
                         last_error=item.get("last_error"),
                         driver_proc_state=str(proc.get("state")) if proc.get("state") else None,
                         driver_pid=proc.get("pid"),
-                        driver_restart_count=int(proc.get("restart_count", 0)),
+                        driver_restart_count=int(proc.get("restart_count") or 0),
                         driver_last_exit_code=proc.get("last_exit_code"),
                         driver_last_error=proc.get("last_error"),
                         is_remote=bool(item.get("is_remote"))

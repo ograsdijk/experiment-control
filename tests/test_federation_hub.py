@@ -3,6 +3,7 @@
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 import zmq
 
@@ -53,6 +54,36 @@ class FederationHubCapabilityTests(unittest.TestCase):
         self.assertEqual(devices[0]["capabilities"]["version"], 1)
         members = devices[0]["capabilities"]["members"]
         self.assertEqual([m["name"] for m in members], ["get", "set_voltage"])
+
+    def test_federated_status_uses_numeric_restart_count(self) -> None:
+        cfg = parse_federation_config(
+            {
+                "peers": [
+                    {
+                        "peer_id": "lab2",
+                        "router_rpc": "tcp://10.0.0.22:6000",
+                        "manager_pub": "tcp://10.0.0.22:6001",
+                        "mirror_devices": [
+                            {"local_id": "lab2.psu", "remote_device_id": "psu"}
+                        ],
+                    }
+                ]
+            },
+            local_device_ids=set(),
+            manager_raw={},
+        )
+        hub = FederationHub(
+            ctx=zmq.Context.instance(),
+            poller=zmq.Poller(),
+            manager=SimpleNamespace(_telemetry_last_bundle_ts={}),
+            config=cfg,
+            instance_id="lab1",
+        )
+
+        status = hub.device_status_snapshot("lab2.psu")
+
+        self.assertEqual(status["driver_process"]["state"], "FEDERATED")
+        self.assertEqual(status["driver_process"]["restart_count"], 0)
 
     def test_warm_capabilities_on_startup_fetches_remote_capabilities(self) -> None:
         cfg = parse_federation_config(
