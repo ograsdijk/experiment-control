@@ -73,6 +73,54 @@ class ManagerTuiRpcTests(unittest.TestCase):
         app = ManagerTUI(rpc_timeout_ms=rpc_timeout_ms)
         return app
 
+    def test_refresh_snapshot_accepts_null_driver_restart_count(self) -> None:
+        app = object.__new__(ManagerTUI)
+        app._device_status = {}
+        app._heartbeat_cache = {}
+        app._telemetry_cache = {}
+        app._cap_cache = {}
+        app._cap_cache_mono = {}
+        app._members_last = {}
+        app._members_rendered_fingerprint = {}
+        app._process_status_map = {}
+        app._processes = []
+        app._proc_cap_cache = {}
+        app._proc_members_last = {}
+        app._proc_cap_retry_next_mono = {}
+        app._proc_cap_retry_delay_s = {}
+
+        def fake_rpc_call(req):
+            if req.get("type") == "device.list_status":
+                return {
+                    "ok": True,
+                    "result": [
+                        {
+                            "device_id": "hornet_eql",
+                            "registered": True,
+                            "driver_process": {
+                                "state": "FEDERATED",
+                                "pid": None,
+                                "restart_count": None,
+                            },
+                            "source_kind": "federated",
+                        }
+                    ],
+                }
+            if req.get("type") == "manager.processes.list":
+                return {"ok": True, "result": []}
+            return None
+
+        app._rpc_call = fake_rpc_call  # type: ignore[method-assign]
+        app._render_devices_table = lambda: None  # type: ignore[method-assign]
+        app._render_processes_table = lambda: None  # type: ignore[method-assign]
+        app._mark_inspector_dirty = lambda: None  # type: ignore[method-assign]
+        app._render_inspector_if_needed = lambda force=False: None  # type: ignore[method-assign]
+
+        app._refresh_snapshot()
+
+        self.assertEqual(app._device_status["hornet_eql"].driver_restart_count, 0)
+        self.assertTrue(app._device_status["hornet_eql"].is_remote)
+
     def test_rpc_call_drops_stale_reply_and_returns_current_response(self) -> None:
         app = self._build_app()
         try:
