@@ -130,7 +130,7 @@ export function useDeviceLifecycleController({
       }
       setDeviceBusy(deviceId, true);
       try {
-        const resp = await restartDevice(deviceId);
+        const resp = await restartDevice(deviceId, false, true);
         if (!resp.ok) {
           notifications.show({
             color: "red",

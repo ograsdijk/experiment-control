@@ -101,6 +101,7 @@ class DeviceSpec:
     driver_kill_timeout_s: float = 3.0
     driver_restart_backoff_s: float = 0.5
     driver_max_restarts: int | None = None
+    config_path: Path | None = None
 
 
 class RestartPolicy(StrEnum):

@@ -540,6 +540,28 @@ class Manager(
             raise ValueError(f"Duplicate device_id {spec.device_id!r}")
         self._devices[spec.device_id] = DeviceHandle(spec=spec)
 
+    def load_device_spec_from_disk(self, device_id: str) -> DeviceSpec:
+        handle = self._devices.get(device_id)
+        if handle is None:
+            raise KeyError(f"Unknown device_id {device_id!r}")
+        config_path = handle.spec.config_path
+        if config_path is None:
+            raise ValueError(f"Device {device_id!r} has no YAML config path")
+        new_spec = device_spec_from_yaml(config_path)
+        if new_spec.device_id != device_id:
+            raise ValueError(
+                f"Reloaded YAML device_id {new_spec.device_id!r} does not match {device_id!r}"
+            )
+        return new_spec
+
+    def reload_device_spec(self, device_id: str) -> DeviceSpec:
+        handle = self._devices.get(device_id)
+        new_spec = self.load_device_spec_from_disk(device_id)
+        assert handle is not None
+        handle.spec = new_spec
+        handle.config_published = False
+        return new_spec
+
     # Phase 8.2.16: ``start_driver``, ``restart_driver``,
     # ``_driver_is_started``, ``_driver_is_stopped`` are now provided
     # by ``ProcessSupervisionMixin``. ``stop_driver`` and

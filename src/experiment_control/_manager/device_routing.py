@@ -163,7 +163,11 @@ def _route_device_driver_restart(manager: Any, req: Json) -> Json:
         return error_resp
     assert device_id is not None
     force = bool(req.get("force", False))
-    manager.restart_driver(device_id, force=force)
+    reload_config = bool(req.get("reload_config", False))
+    try:
+        manager.restart_driver(device_id, force=force, reload_config=reload_config)
+    except Exception as exc:
+        return _rpc_failure("driver_restart_failed", str(exc))
     return {"ok": True, "result": {"device_id": device_id}}
 
 
