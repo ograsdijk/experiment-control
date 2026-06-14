@@ -61,6 +61,7 @@ class SynthHDDriverTests(unittest.TestCase):
 
     def test_per_channel_frequency_methods(self) -> None:
         driver = SynthHD("COM1")
+        driver.connect()
 
         driver.set_frequency_channel_0(1.0)
         driver.set_frequency_channel_1(2.0)
@@ -70,6 +71,7 @@ class SynthHDDriverTests(unittest.TestCase):
 
     def test_per_channel_power_methods(self) -> None:
         driver = SynthHD("COM1")
+        driver.connect()
 
         driver.set_power_channel_0(-1.0)
         driver.set_power_channel_1(-2.0)
@@ -79,6 +81,7 @@ class SynthHDDriverTests(unittest.TestCase):
 
     def test_per_channel_enable_methods(self) -> None:
         driver = SynthHD("COM1")
+        driver.connect()
 
         driver.set_enable_channel_0(True)
         driver.set_enable_channel_1(False)
@@ -88,6 +91,7 @@ class SynthHDDriverTests(unittest.TestCase):
 
     def test_per_channel_phase_methods(self) -> None:
         driver = SynthHD("COM1")
+        driver.connect()
 
         driver.set_phase_channel_0(45.0)
         driver.set_phase_channel_1(90.0)
@@ -97,6 +101,7 @@ class SynthHDDriverTests(unittest.TestCase):
 
     def test_temp_compensation_mode_methods(self) -> None:
         driver = SynthHD("COM1")
+        driver.connect()
 
         driver.set_temp_compensation_mode_channel_0("none")
         driver.set_temp_compensation_mode_channel_1("on set")
