@@ -2429,7 +2429,11 @@ class ManagerTUI(App):
             if not confirmed:
                 return
             resp = self._rpc_call(
-                {"type": "device.driver.restart", "device_id": device_id}
+                {
+                    "type": "device.driver.restart",
+                    "device_id": device_id,
+                    "reload_config": True,
+                }
             )
             self._notify_rpc_result("Driver restart", device_id, resp)
 

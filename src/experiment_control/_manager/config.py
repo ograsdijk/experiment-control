@@ -225,7 +225,8 @@ def _load_driver_defaults(
 
 
 def device_spec_from_yaml(path: str | Path) -> DeviceSpec:
-    raw, yaml_text = load_yaml_file(path, return_text=True)
+    config_path = Path(path).expanduser().resolve()
+    raw, yaml_text = load_yaml_file(config_path, return_text=True)
     try:
         raw_obj = require_dict(raw, path=[])
         device_id = require_str(raw_obj.get("device_id"), path=["device_id"])
@@ -286,6 +287,7 @@ def device_spec_from_yaml(path: str | Path) -> DeviceSpec:
         connect_check=connect_check,
         auto_reconnect=auto_reconnect,
         config_yaml_text=yaml_text,
+        config_path=config_path,
         telemetry_period_s=telemetry_period_s,
         heartbeat_period_s=heartbeat_period_s,
         command_poll_period_s=command_poll_period_s,

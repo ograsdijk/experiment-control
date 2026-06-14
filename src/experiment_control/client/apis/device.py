@@ -143,6 +143,7 @@ class DeviceAPI(ClientFacadeBase):
         device_id: str,
         *,
         force: bool = False,
+        reload_config: bool = False,
         timeout_ms: int | None = None,
         retries: int | None = None,
     ) -> Any:
@@ -150,6 +151,7 @@ class DeviceAPI(ClientFacadeBase):
             "device.driver.restart",
             device_id=str(device_id),
             force=bool(force),
+            reload_config=bool(reload_config),
             timeout_ms=timeout_ms,
             retries=retries,
         )

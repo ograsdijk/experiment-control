@@ -251,7 +251,13 @@ class ManagerProtocol(Protocol):
     # the sibling on ``stop_driver``.
     def start_driver(self, device_id: str) -> None: ...
 
-    def restart_driver(self, device_id: str, *, force: bool = False) -> None: ...
+    def restart_driver(
+        self,
+        device_id: str,
+        *,
+        force: bool = False,
+        reload_config: bool = False,
+    ) -> None: ...
 
     def stop_driver(self, device_id: str, *, force: bool = False) -> None: ...
 

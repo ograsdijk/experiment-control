@@ -89,6 +89,7 @@ class DeviceCommandRequest(BaseModel):
 
 class DeviceRestartRequest(BaseModel):
     force: bool = False
+    reload_config: bool = False
 
 
 class ProcessCommandRequest(BaseModel):
@@ -1137,6 +1138,7 @@ async def device_restart(
         "type": "device.driver.restart",
         "device_id": device_id,
         "force": bool(req.force) if req is not None else False,
+        "reload_config": bool(req.reload_config) if req is not None else False,
     }
     return await _route_request(payload)
 

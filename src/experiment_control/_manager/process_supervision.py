@@ -345,10 +345,17 @@ def driver_is_stopped(handle: Any) -> bool:
     }
 
 
-def restart_driver(manager: Any, device_id: str, *, force: bool = False) -> None:
+def restart_driver(
+    manager: Any,
+    device_id: str,
+    *,
+    force: bool = False,
+    reload_config: bool = False,
+) -> None:
     handle = manager._devices.get(device_id)
     if handle is None:
         raise KeyError(f"Unknown device_id {device_id!r}")
+    new_spec = manager.load_device_spec_from_disk(device_id) if reload_config else None
 
     manager._publish_driver_event("manager.driver.restart_requested", handle)
     try:
@@ -357,6 +364,9 @@ def restart_driver(manager: Any, device_id: str, *, force: bool = False) -> None
         pass
 
     manager.stop_driver(device_id, force=force)
+    if new_spec is not None:
+        handle.spec = new_spec
+        handle.config_published = False
     handle.driver_next_restart_t_mono = (
         time.monotonic() + handle.spec.driver_restart_backoff_s
     )
@@ -1474,8 +1484,14 @@ class ProcessSupervisionMixin:
     def start_driver(self, device_id: str) -> None:
         start_driver(self, device_id)
 
-    def restart_driver(self, device_id: str, *, force: bool = False) -> None:
-        restart_driver(self, device_id, force=force)
+    def restart_driver(
+        self,
+        device_id: str,
+        *,
+        force: bool = False,
+        reload_config: bool = False,
+    ) -> None:
+        restart_driver(self, device_id, force=force, reload_config=reload_config)
 
     def _driver_is_started(self, handle: Any) -> bool:
         return driver_is_started(handle)

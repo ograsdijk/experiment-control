@@ -801,11 +801,15 @@ export async function disconnectDevice(deviceId: string) {
   return apiFetch(`/api/devices/${deviceId}/disconnect`, { method: "POST" });
 }
 
-export async function restartDevice(deviceId: string, force = false) {
+export async function restartDevice(
+  deviceId: string,
+  force = false,
+  reloadConfig = false
+) {
   return apiFetch(`/api/devices/${deviceId}/restart`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ force }),
+    body: JSON.stringify({ force, reload_config: reloadConfig }),
   });
 }
 
