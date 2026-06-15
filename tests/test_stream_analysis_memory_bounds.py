@@ -39,7 +39,7 @@ def _make_process_for_snapshot(values: list[float]) -> StreamAnalysisProcess:
                 enabled=True,
                 nodes={},
                 order=[],
-                stream_source_node_id="src",
+                stream_source_node_ids=["src"],
                 stream_key=("dev", "trace"),
                 node_output_types={},
                 outputs=[PublishOutput(output_id="trace", node_id="src", kind="trace")],
@@ -84,7 +84,7 @@ class StreamAnalysisMemoryBoundsTests(unittest.TestCase):
                 },
             }
         )
-        self.assertEqual(compiled.stream_source_node_id, "src")
+        self.assertEqual(compiled.stream_source_node_ids, ["src"])
         self.assertEqual(compiled.stream_key, ("dev-a", "trace"))
 
     def test_context_cache_per_stream_is_bounded(self) -> None:
