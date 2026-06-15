@@ -24,6 +24,7 @@ Available benchmarks:
 - `output_index`
 - `trace_snapshot`
 - `snapshot_readout`
+- `binary_trace_transport`
 - `stream_buffer`
 
 ## What's measured
@@ -39,6 +40,8 @@ Available benchmarks:
 - **`trace_snapshot`** — compares the old trace snapshot materialization path (`tolist()` plus recursive sanitize) with the current `np.isfinite` fast path used for finite traces.
 
 - **`snapshot_readout`** — compares workspace snapshot response strategies for cached trace payloads: current sanitize-then-decimate, decimate-before-sanitize, and a known-clean fast path.
+
+- **`binary_trace_transport`** — compares JSON trace frames, the old list-backed binary path, ideal ndarray-backed bytes, and the current production binary builder.
 
 - **`stream_buffer`** — compares HDF stream-buffer assembly strategies: list-of-bytes baseline, preallocated copy from bytes, and preallocated copy from a shared-memory view.
 

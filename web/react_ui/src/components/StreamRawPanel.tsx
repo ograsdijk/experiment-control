@@ -44,11 +44,11 @@ function asNumber(value: unknown): number | null {
 }
 
 function toNumericList(raw: unknown): number[] {
-  if (!Array.isArray(raw)) {
+  if (!Array.isArray(raw) && !ArrayBuffer.isView(raw)) {
     return [];
   }
   const out: number[] = [];
-  for (const item of raw) {
+  for (const item of Array.from(raw as ArrayLike<unknown>)) {
     const value = asNumber(item);
     if (value === null) {
       return [];

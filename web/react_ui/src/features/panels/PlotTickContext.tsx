@@ -1,7 +1,10 @@
 import {
   createContext,
   useContext,
+  useCallback,
+  useEffect,
   useMemo,
+  useRef,
   useState,
   type Dispatch,
   type ReactNode,
@@ -34,15 +37,47 @@ import {
 interface PlotTickContextValue {
   plotTick: number;
   setPlotTick: Dispatch<SetStateAction<number>>;
+  requestPlotTick: () => void;
 }
 
 const PlotTickContext = createContext<PlotTickContextValue | null>(null);
 
 export function PlotTickProvider({ children }: { children: ReactNode }) {
-  const [plotTick, setPlotTick] = useState(0);
+  const [plotTick, rawSetPlotTick] = useState(0);
+  const frameRef = useRef<number | null>(null);
+  const pendingRef = useRef<SetStateAction<number> | null>(null);
+  const flushPlotTick = useCallback(() => {
+    frameRef.current = null;
+    const pending = pendingRef.current;
+    pendingRef.current = null;
+    if (pending !== null) {
+      rawSetPlotTick(pending);
+    }
+  }, []);
+  const setPlotTick = useCallback<Dispatch<SetStateAction<number>>>((action) => {
+    const pending = pendingRef.current;
+    if (typeof pending === "function" && typeof action === "function") {
+      pendingRef.current = (value: number) => action(pending(value));
+    } else {
+      pendingRef.current = action;
+    }
+    if (frameRef.current === null) {
+      frameRef.current = window.requestAnimationFrame(flushPlotTick);
+    }
+  }, [flushPlotTick]);
+  const requestPlotTick = useCallback(() => {
+    setPlotTick((tick) => tick + 1);
+  }, [setPlotTick]);
+  useEffect(() => {
+    return () => {
+      if (frameRef.current !== null) {
+        window.cancelAnimationFrame(frameRef.current);
+      }
+    };
+  }, []);
   const value = useMemo<PlotTickContextValue>(
-    () => ({ plotTick, setPlotTick }),
-    [plotTick]
+    () => ({ plotTick, setPlotTick, requestPlotTick }),
+    [plotTick, setPlotTick, requestPlotTick]
   );
   return (
     <PlotTickContext.Provider value={value}>

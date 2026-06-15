@@ -667,6 +667,70 @@ export async function apiFetch<T>(path: string, init?: RequestInit): Promise<Api
   return resp.json();
 }
 
+async function apiFetchMaybeBinary<T>(path: string): Promise<ApiResponse<T>> {
+  const resp = await fetch(`${API_BASE}${path}`);
+  const contentType = resp.headers.get("content-type") ?? "";
+  if (!contentType.includes("application/vnd.experiment-control.binary+json")) {
+    return resp.json();
+  }
+  const buffer = await resp.arrayBuffer();
+  if (buffer.byteLength < 8) {
+    return { ok: false, error: { code: "invalid_binary_response" } };
+  }
+  const view = new DataView(buffer);
+  const metaLength = Number(view.getBigUint64(0, true));
+  const metaStart = 8;
+  const metaEnd = metaStart + metaLength;
+  if (!Number.isFinite(metaLength) || metaEnd > buffer.byteLength) {
+    return { ok: false, error: { code: "invalid_binary_response" } };
+  }
+  const metaText = new TextDecoder().decode(buffer.slice(metaStart, metaEnd));
+  const envelope = JSON.parse(metaText) as ApiResponse<T>;
+  attachBinaryValues(envelope, buffer, metaEnd);
+  return envelope;
+}
+
+function attachBinaryValues(envelope: ApiResponse<unknown>, buffer: ArrayBuffer, dataStart: number) {
+  const result = envelope.result;
+  if (!result || typeof result !== "object") {
+    return;
+  }
+  const maybePayload = (result as { payload?: unknown }).payload;
+  if (maybePayload && typeof maybePayload === "object") {
+    attachBinaryValueToPayload(maybePayload as Record<string, unknown>, buffer, dataStart);
+  }
+  const outputs = (result as { outputs?: unknown }).outputs;
+  if (Array.isArray(outputs)) {
+    for (const output of outputs) {
+      if (output && typeof output === "object") {
+        attachBinaryValueToPayload(output as Record<string, unknown>, buffer, dataStart);
+      }
+    }
+  }
+}
+
+function attachBinaryValueToPayload(
+  payload: Record<string, unknown>,
+  buffer: ArrayBuffer,
+  dataStart: number
+) {
+  if (payload.encoding !== "binary-frame") {
+    return;
+  }
+  const byteLength = Number(payload.byte_length);
+  const byteOffset = Number(payload.byte_offset ?? 0);
+  if (!Number.isFinite(byteLength) || !Number.isFinite(byteOffset)) {
+    return;
+  }
+  const start = dataStart + byteOffset;
+  const end = start + byteLength;
+  if (start < dataStart || end > buffer.byteLength || byteLength % Float64Array.BYTES_PER_ELEMENT !== 0) {
+    return;
+  }
+  payload.value = new Float64Array(buffer.slice(start, end));
+  payload.values = payload.value;
+}
+
 export async function fetchDevices(): Promise<DeviceStatus[]> {
   const resp = await apiFetch<DeviceStatus[]>("/api/devices");
   if (!resp.ok || !resp.result) {
@@ -907,11 +971,12 @@ export async function fetchStreamWorkspaceSnapshot(
   ) {
     params.set("max_trace_points", String(Math.max(1, Math.trunc(opts.maxTracePoints))));
   }
+  params.set("transport", "binary");
   const query = params.toString();
   const path = `/api/stream/workspaces/${encodeURIComponent(workspaceId)}/snapshot${
     query ? `?${query}` : ""
   }`;
-  const resp = await apiFetch<Record<string, unknown>>(path);
+  const resp = await apiFetchMaybeBinary<Record<string, unknown>>(path);
   return rejectUnexpectedCapabilities(resp, `workspace.snapshot(${workspaceId})`);
 }
 
@@ -934,7 +999,8 @@ export async function fetchRawStreamSnapshot(opts: {
   params.set("trace_max_fps", String(opts.traceMaxFps));
   params.set("rolling_window", String(opts.rollingWindow));
   params.set("trace_average_mode", opts.averageMode);
-  const resp = await apiFetch<StreamFrameMessage | null>(
+  params.set("transport", "binary");
+  const resp = await apiFetchMaybeBinary<StreamFrameMessage | null>(
     `/api/streams/raw_snapshot?${params.toString()}`
   );
   if (!resp.ok || !resp.result || typeof resp.result !== "object") {

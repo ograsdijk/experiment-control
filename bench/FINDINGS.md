@@ -30,6 +30,23 @@ Run on 2026-06-08 with `uv run python -m bench.run_microbench --no-alloc --bench
 
 Production `json_dumps` tracks direct orjson performance, confirming the fallback wrapper has negligible overhead on normal stream payloads.
 
+## Fresh binary trace transport comparison
+
+Run on 2026-06-15 with `uv run python -m bench.run_microbench --no-alloc --bench binary_trace_transport` after adding ndarray-backed raw-stream binary frames.
+
+| Payload | JSON values frame | old binary from list | ideal binary from ndarray | production binary builder |
+|---|---:|---:|---:|---:|
+| 1k pts | 30.30 µs | 33.96 µs | 1.13 µs | 11.02 µs |
+| 50k pts | 1.97 ms | 1.76 ms | 0.017 ms | 0.051 ms |
+| 200k pts | 8.18 ms | 7.67 ms | 0.51 ms | 0.91 ms |
+
+Key conclusions:
+
+- The list-backed binary path did not materially improve backend CPU because it still paid list→ndarray conversion.
+- The current production binary builder now uses the private ndarray carried by `StreamFrameHub`, avoiding the `.tolist()`/JSON-values path for binary raw-stream clients.
+- At 200k points, backend framing drops from ~8.18 ms JSON to ~0.91 ms production binary, about a 9× improvement.
+- The remaining gap to the ideal ndarray path is mostly metadata/build wrapper overhead and safety checks; it is small compared with the original JSON cost.
+
 ## Fresh snapshot readout comparison
 
 Run on 2026-06-08 with `uv run python -m bench.run_microbench --no-alloc --bench snapshot_readout`.
@@ -98,6 +115,7 @@ The output-index benchmark showed sub-millisecond rebuilds at realistic panel co
 
 ```powershell
 uv run python -m bench.run_microbench --no-alloc --bench json_dumps --bench trace_snapshot
+uv run python -m bench.run_microbench --no-alloc --bench binary_trace_transport
 uv run python -m bench.run_microbench --no-alloc --bench snapshot_readout
 uv run python -m bench.run_microbench --no-alloc --bench stream_buffer
 uv run python -m bench.run_microbench --no-alloc

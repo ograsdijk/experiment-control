@@ -124,6 +124,98 @@ export function normalizeTraceAverageMode(
   return "block";
 }
 
+function bucketRanges(n: number, bucketCount: number): Array<[number, number]> {
+  const out: Array<[number, number]> = [];
+  for (let i = 0; i < bucketCount; i += 1) {
+    const start = Math.floor((i * n) / bucketCount);
+    const stop = Math.max(start + 1, Math.floor(((i + 1) * n) / bucketCount));
+    out.push([start, Math.min(n, stop)]);
+  }
+  return out;
+}
+
+export function decimateTraceValues(
+  values: unknown,
+  mode: StreamTraceDecimator,
+  maxPoints: number
+): number[] | null {
+  if (!Array.isArray(values) && !ArrayBuffer.isView(values)) {
+    return null;
+  }
+  const points = Array.from(values as ArrayLike<unknown>, (value) => Number(value));
+  if (!points.every(Number.isFinite)) {
+    return null;
+  }
+  const n = points.length;
+  if (maxPoints <= 0 || n <= maxPoints) {
+    return points;
+  }
+  if (mode === "mean") {
+    return bucketRanges(n, Math.min(maxPoints, n))
+      .map(([start, stop]) => {
+        let total = 0;
+        for (let idx = start; idx < stop; idx += 1) {
+          total += points[idx];
+        }
+        return total / Math.max(1, stop - start);
+      })
+      .slice(0, maxPoints);
+  }
+  if (mode === "m4") {
+    const out: number[] = [];
+    for (const [start, stop] of bucketRanges(n, Math.max(1, Math.min(Math.floor(maxPoints / 4), n)))) {
+      let minIdx = start;
+      let maxIdx = start;
+      for (let idx = start + 1; idx < stop; idx += 1) {
+        if (points[idx] < points[minIdx]) {
+          minIdx = idx;
+        }
+        if (points[idx] > points[maxIdx]) {
+          maxIdx = idx;
+        }
+      }
+      for (const idx of [...new Set([start, minIdx, maxIdx, stop - 1])].sort((a, b) => a - b)) {
+        out.push(points[idx]);
+        if (out.length >= maxPoints) {
+          return out.slice(0, maxPoints);
+        }
+      }
+    }
+    return out.slice(0, maxPoints);
+  }
+  if (mode === "minmax") {
+    const out: number[] = [];
+    for (const [start, stop] of bucketRanges(n, Math.max(1, Math.min(Math.floor(maxPoints / 2), n)))) {
+      let minIdx = start;
+      let maxIdx = start;
+      for (let idx = start + 1; idx < stop; idx += 1) {
+        if (points[idx] < points[minIdx]) {
+          minIdx = idx;
+        }
+        if (points[idx] > points[maxIdx]) {
+          maxIdx = idx;
+        }
+      }
+      const ordered = minIdx <= maxIdx ? [minIdx, maxIdx] : [maxIdx, minIdx];
+      for (const idx of ordered) {
+        if (out.length < maxPoints && (idx !== ordered[0] || minIdx !== maxIdx)) {
+          out.push(points[idx]);
+        }
+      }
+      if (out.length >= maxPoints) {
+        return out.slice(0, maxPoints);
+      }
+    }
+    return out.slice(0, maxPoints);
+  }
+  const step = Math.max(1, Math.ceil(n / maxPoints));
+  const out = points.filter((_, idx) => idx % step === 0);
+  if (out.length > 0 && out[out.length - 1] !== points[n - 1]) {
+    out.push(points[n - 1]);
+  }
+  return out.slice(0, maxPoints);
+}
+
 export function normalizeTelemetrySmoothingMode(
   value: unknown
 ): TelemetrySmoothingMode {

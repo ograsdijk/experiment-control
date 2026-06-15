@@ -35,6 +35,9 @@ export type StreamFramePayload = {
   dtype?: string | null;
   shape?: number[];
   values?: unknown;
+  encoding?: string | null;
+  byte_order?: string | null;
+  byte_length?: number | null;
   context_id?: number | null;
   context_fields?: Record<string, unknown> | null;
   truncated?: boolean;
@@ -59,6 +62,10 @@ export type StreamAnalysisOutputPayload = {
   channel_index?: number | null;
   channel_count?: number | null;
   value?: unknown;
+  encoding?: string | null;
+  dtype?: string | null;
+  byte_order?: string | null;
+  byte_length?: number | null;
   context_id?: number | null;
   context_fields?: Record<string, unknown> | null;
   truncated?: boolean;

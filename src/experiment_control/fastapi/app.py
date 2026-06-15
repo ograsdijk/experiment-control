@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 import json
+import mimetypes
 import os
 import re
 import sys
@@ -15,8 +16,9 @@ from urllib.parse import SplitResult, urlsplit, urlunsplit
 
 import numpy as np
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, RedirectResponse
+from fastapi.responses import FileResponse, RedirectResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel, Field
 
 from ._trace_aggregator import TraceAggregator
@@ -57,6 +59,19 @@ from ..utils.trace_processing import (
 _EXTRA_UI_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 
 
+def _strip_private_payload_fields(msg: Any) -> Any:
+    if not isinstance(msg, dict):
+        return msg
+    payload = msg.get("payload")
+    if not isinstance(payload, dict) or "_binary_values" not in payload:
+        return msg
+    public_payload = dict(payload)
+    public_payload.pop("_binary_values", None)
+    public_msg = dict(msg)
+    public_msg["payload"] = public_payload
+    return public_msg
+
+
 async def _ws_send_json(ws: WebSocket, msg: Any) -> None:
     """Send a JSON message over WS using the project's orjson-backed
     encoder. Equivalent to `ws.send_json(msg)` (text frame, UTF-8), but
@@ -65,7 +80,61 @@ async def _ws_send_json(ws: WebSocket, msg: Any) -> None:
     in `utils/zmq_helpers.py`; falls back to pyzmq's encoder when orjson
     rejects a payload (NaN/Inf, exotic types).
     """
-    await ws.send_text(_orjson_dumps(msg).decode("utf-8"))
+    await ws.send_text(_orjson_dumps(_strip_private_payload_fields(msg)).decode("utf-8"))
+
+
+def _binary_http_response(envelope: dict[str, Any], values: np.ndarray) -> Response:
+    return _binary_http_multi_response(envelope, [values])
+
+
+def _binary_http_multi_response(
+    envelope: dict[str, Any],
+    values: list[np.ndarray],
+) -> Response:
+    chunks = [np.asarray(value, dtype=np.float64).reshape(-1) for value in values]
+    meta_bytes = _orjson_dumps(envelope)
+    header = len(meta_bytes).to_bytes(8, byteorder="little", signed=False)
+    body = b"".join(chunk.astype("<f8", copy=False).tobytes() for chunk in chunks)
+    return Response(
+        content=header + meta_bytes + body,
+        media_type="application/vnd.experiment-control.binary+json",
+    )
+
+
+async def _ws_send_binary_trace_frame(
+    ws: WebSocket,
+    msg: dict[str, Any],
+    *,
+    value_field: str = "values",
+) -> None:
+    payload = msg.get("payload")
+    if not isinstance(payload, dict):
+        await _ws_send_json(ws, msg)
+        return
+    binary_values = payload.get("_binary_values")
+    values = binary_values if binary_values is not None else payload.get(value_field)
+    try:
+        arr = np.asarray(values, dtype=np.float64).reshape(-1)
+    except Exception:
+        await _ws_send_json(ws, msg)
+        return
+    if arr.size <= 0 or not np.isfinite(arr).all():
+        await _ws_send_json(ws, msg)
+        return
+    payload_meta = dict(payload)
+    payload_meta.pop(value_field, None)
+    payload_meta.pop("_binary_values", None)
+    payload_meta.update(
+        {
+            "encoding": "binary-frame",
+            "dtype": "float64",
+            "byte_order": "little",
+            "byte_length": int(arr.nbytes),
+            "shape": [int(arr.size)],
+        }
+    )
+    await _ws_send_json(ws, {"topic": msg.get("topic"), "payload": payload_meta})
+    await ws.send_bytes(arr.astype("<f8", copy=False).tobytes())
 
 
 @dataclass(frozen=True)
@@ -199,6 +268,47 @@ async def _route_request(payload: dict[str, Any]) -> dict[str, Any]:
     return _ensure_error_shape(await app.state.router.request(payload))
 
 
+def _build_trace_frame_array(
+    payload: dict[str, Any],
+    *,
+    channel_index: int,
+    trace_decimator: str,
+    trace_max_points: int | None,
+    pre_decimate: Callable[[np.ndarray], np.ndarray | None] | None = None,
+) -> tuple[dict[str, Any], np.ndarray] | None:
+    shape = _normalize_shape(payload.get("shape"))
+    source_values = payload.get("_binary_values", payload.get("values"))
+    arr = _coerce_stream_values_array(source_values, shape)
+    if arr is None:
+        return None
+    trace = _select_trace_from_array(arr, channel_index)
+    if pre_decimate is not None:
+        trace = pre_decimate(trace)
+        if trace is None:
+            return None
+    original_size = int(trace.size)
+    if trace_max_points is not None:
+        trace_values = _decimate_trace_values(
+            trace,
+            mode=trace_decimator,
+            max_points=trace_max_points,
+        )
+        trace = np.asarray(trace_values, dtype=np.float64).reshape(-1)
+    else:
+        trace = trace.astype(np.float64, copy=False).reshape(-1)
+    if trace.size <= 0 or not np.isfinite(trace).all():
+        return None
+    out_payload: dict[str, Any] = dict(payload)
+    out_payload.pop("values", None)
+    out_payload.pop("_binary_values", None)
+    out_payload["shape"] = [int(trace.size)]
+    out_payload["channel_index"] = int(channel_index)
+    out_payload["point_count"] = int(trace.size)
+    if trace_max_points is not None and int(trace.size) < original_size:
+        out_payload["decimated"] = True
+    return out_payload, trace
+
+
 def _build_trace_frame_payload(
     payload: dict[str, Any],
     *,
@@ -217,32 +327,17 @@ def _build_trace_frame_payload(
     ``channel_index``/``point_count``/optional ``decimated`` set), or ``None``
     if the input payload was unusable.
     """
-    shape = _normalize_shape(payload.get("shape"))
-    arr = _coerce_stream_values_array(payload.get("values"), shape)
-    if arr is None:
+    built = _build_trace_frame_array(
+        payload,
+        channel_index=channel_index,
+        trace_decimator=trace_decimator,
+        trace_max_points=trace_max_points,
+        pre_decimate=pre_decimate,
+    )
+    if built is None:
         return None
-    trace = _select_trace_from_array(arr, channel_index)
-    if pre_decimate is not None:
-        trace = pre_decimate(trace)
-        if trace is None:
-            return None
-    if trace_max_points is not None:
-        trace_values = _decimate_trace_values(
-            trace,
-            mode=trace_decimator,
-            max_points=trace_max_points,
-        )
-    else:
-        trace_values = trace.tolist()
-    if not isinstance(trace_values, list):
-        return None
-    out_payload: dict[str, Any] = dict(payload)
-    out_payload["shape"] = [len(trace_values)]
-    out_payload["values"] = trace_values
-    out_payload["channel_index"] = int(channel_index)
-    out_payload["point_count"] = len(trace_values)
-    if trace_max_points is not None and len(trace_values) < int(trace.size):
-        out_payload["decimated"] = True
+    out_payload, trace = built
+    out_payload["values"] = trace.tolist()
     return out_payload
 
 
@@ -796,6 +891,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 _UI_DIST_PATH: Path | None = _resolve_ui_dist_path()
 _DEFAULT_PROFILE_PATH: Path | None = _resolve_default_profile_path()
@@ -1364,10 +1460,10 @@ async def get_stream_workspace(workspace_id: str) -> dict[str, Any]:
     )
 
 
-@app.get("/api/stream/workspaces/{workspace_id}/snapshot")
+@app.get("/api/stream/workspaces/{workspace_id}/snapshot", response_model=None)
 async def get_stream_workspace_snapshot(
     workspace_id: str, request: Request
-) -> dict[str, Any]:
+) -> dict[str, Any] | Response:
     params: dict[str, Any] = {"workspace_id": workspace_id}
     kinds = _parse_csv_query_list(request.query_params.get("kinds"))
     if kinds is not None:
@@ -1380,10 +1476,55 @@ async def get_stream_workspace_snapshot(
     )
     if max_trace_points is not None:
         params["max_trace_points"] = int(max_trace_points)
-    return await _stream_analysis_rpc(
+    resp = await _stream_analysis_rpc(
         "stream_analysis.workspace.snapshot",
         params,
     )
+    transport = str(request.query_params.get("transport") or "json").strip().lower()
+    if transport != "binary" or not resp.get("ok"):
+        return resp
+    result = resp.get("result")
+    if not isinstance(result, dict):
+        return resp
+    outputs = result.get("outputs")
+    if not isinstance(outputs, list):
+        return resp
+    blobs: list[np.ndarray] = []
+    offset = 0
+    rewritten_outputs: list[Any] = []
+    changed = False
+    for output in outputs:
+        if not isinstance(output, dict) or str(output.get("kind") or "") != "trace":
+            rewritten_outputs.append(output)
+            continue
+        try:
+            arr = np.asarray(output.get("value"), dtype=np.float64).reshape(-1)
+        except Exception:
+            rewritten_outputs.append(output)
+            continue
+        if arr.size <= 0 or not np.isfinite(arr).all():
+            rewritten_outputs.append(output)
+            continue
+        item = dict(output)
+        item.pop("value", None)
+        item.update(
+            {
+                "encoding": "binary-frame",
+                "dtype": "float64",
+                "byte_order": "little",
+                "byte_length": int(arr.nbytes),
+                "byte_offset": offset,
+            }
+        )
+        offset += int(arr.nbytes)
+        blobs.append(arr)
+        rewritten_outputs.append(item)
+        changed = True
+    if not changed:
+        return resp
+    result_out = dict(result)
+    result_out["outputs"] = rewritten_outputs
+    return _binary_http_multi_response({**resp, "result": result_out}, blobs)
 
 
 @app.put("/api/stream/workspaces/{workspace_id}")
@@ -1582,12 +1723,17 @@ async def ws_logs(ws: WebSocket) -> None:
 
 @app.websocket("/ws/streams")
 async def ws_streams(ws: WebSocket) -> None:
+    transport = str(ws.query_params.get("transport") or "json").strip().lower()
+    binary_transport = transport == "binary"
     await ws.accept()
     q = app.state.stream_hub.subscribe(maxsize=20)
     try:
         while True:
             msg = await q.get()
-            await _ws_send_json(ws, msg)
+            if binary_transport and isinstance(msg, dict):
+                await _ws_send_binary_trace_frame(ws, msg)
+            else:
+                await _ws_send_json(ws, msg)
     except WebSocketDisconnect:
         pass
     finally:
@@ -1607,6 +1753,8 @@ async def ws_raw_stream(ws: WebSocket) -> None:
     trace_max_fps = _parse_trace_max_fps(ws.query_params.get("trace_max_fps"))
     rolling_window = _parse_trace_rolling_window(ws.query_params.get("rolling_window"))
     trace_average_mode = _parse_trace_average_mode(ws.query_params.get("trace_average_mode"))
+    transport = str(ws.query_params.get("transport") or "json").strip().lower()
+    binary_transport = transport == "binary"
     trace_interval_s = (1.0 / trace_max_fps) if trace_max_fps else 0.0
     next_send_at = 0.0
     aggregator = TraceAggregator(
@@ -1617,11 +1765,17 @@ async def ws_raw_stream(ws: WebSocket) -> None:
     async def _send_or_queue(msg: dict[str, Any]) -> None:
         nonlocal next_send_at
         if trace_interval_s <= 0:
-            await _ws_send_json(ws, msg)
+            if binary_transport:
+                await _ws_send_binary_trace_frame(ws, msg)
+            else:
+                await _ws_send_json(ws, msg)
             return
         now = time.monotonic()
         if now >= next_send_at:
-            await _ws_send_json(ws, msg)
+            if binary_transport:
+                await _ws_send_binary_trace_frame(ws, msg)
+            else:
+                await _ws_send_json(ws, msg)
             next_send_at = now + trace_interval_s
             aggregator.pending_msg = None
             return
@@ -1650,7 +1804,10 @@ async def ws_raw_stream(ws: WebSocket) -> None:
                 if now < next_send_at:
                     aggregator.pending_msg = pending_msg
                     continue
-                await _ws_send_json(ws, pending_msg)
+                if binary_transport:
+                    await _ws_send_binary_trace_frame(ws, pending_msg)
+                else:
+                    await _ws_send_json(ws, pending_msg)
                 next_send_at = now + trace_interval_s
                 continue
 
@@ -1665,15 +1822,29 @@ async def ws_raw_stream(ws: WebSocket) -> None:
             msg_stream = str(payload.get("stream") or "").strip()
             if msg_device_id != device_id or msg_stream != stream:
                 continue
-            out_payload = _build_trace_frame_payload(
-                payload,
-                channel_index=channel_index,
-                trace_decimator=trace_decimator,
-                trace_max_points=trace_max_points,
-                pre_decimate=aggregator.add_frame,
-            )
-            if out_payload is None:
-                continue
+            out_payload: dict[str, Any] | None
+            if binary_transport:
+                built = _build_trace_frame_array(
+                    payload,
+                    channel_index=channel_index,
+                    trace_decimator=trace_decimator,
+                    trace_max_points=trace_max_points,
+                    pre_decimate=aggregator.add_frame,
+                )
+                if built is None:
+                    continue
+                out_payload, trace = built
+                out_payload["_binary_values"] = trace
+            else:
+                out_payload = _build_trace_frame_payload(
+                    payload,
+                    channel_index=channel_index,
+                    trace_decimator=trace_decimator,
+                    trace_max_points=trace_max_points,
+                    pre_decimate=aggregator.add_frame,
+                )
+                if out_payload is None:
+                    continue
             await _send_or_queue({"topic": "manager.stream_frame", "payload": out_payload})
     except WebSocketDisconnect:
         pass
@@ -1681,8 +1852,8 @@ async def ws_raw_stream(ws: WebSocket) -> None:
         app.state.stream_hub.unsubscribe(q)
 
 
-@app.get("/api/streams/raw_snapshot")
-async def raw_stream_snapshot(request: Request) -> dict[str, Any]:
+@app.get("/api/streams/raw_snapshot", response_model=None)
+async def raw_stream_snapshot(request: Request) -> dict[str, Any] | Response:
     device_id = str(request.query_params.get("device_id") or "").strip()
     stream = str(request.query_params.get("stream") or "").strip()
     if not device_id or not stream:
@@ -1707,6 +1878,31 @@ async def raw_stream_snapshot(request: Request) -> dict[str, Any]:
     payload = frame_msg.get("payload")
     if not isinstance(payload, dict):
         return {"ok": True, "result": None}
+    transport = str(request.query_params.get("transport") or "json").strip().lower()
+    topic = str(frame_msg.get("topic") or "manager.stream_frame")
+    out_payload: dict[str, Any] | None
+    if transport == "binary":
+        built = _build_trace_frame_array(
+            payload,
+            channel_index=channel_index,
+            trace_decimator=trace_decimator,
+            trace_max_points=trace_max_points,
+        )
+        if built is None:
+            return {"ok": True, "result": None}
+        out_payload, trace = built
+        out_payload.update(
+            {
+                "encoding": "binary-frame",
+                "dtype": "float64",
+                "byte_order": "little",
+                "byte_length": int(trace.nbytes),
+            }
+        )
+        return _binary_http_response(
+            {"ok": True, "result": {"topic": topic, "payload": out_payload}},
+            trace,
+        )
     out_payload = _build_trace_frame_payload(
         payload,
         channel_index=channel_index,
@@ -1718,7 +1914,7 @@ async def raw_stream_snapshot(request: Request) -> dict[str, Any]:
     return {
         "ok": True,
         "result": {
-            "topic": str(frame_msg.get("topic") or "manager.stream_frame"),
+            "topic": topic,
             "payload": out_payload,
         },
     }
@@ -1749,12 +1945,14 @@ class _WorkspaceTraceWsState:
         trace_interval_s: float,
         rolling_window: int,
         trace_average_mode: str,
+        binary_transport: bool,
     ) -> None:
         self.trace_decimator = trace_decimator
         self.trace_max_points = trace_max_points
         self.trace_interval_s = trace_interval_s
         self.rolling_window = rolling_window
         self.trace_average_mode = trace_average_mode
+        self.binary_transport = bool(binary_transport)
         self.next_trace_send_at: dict[str, float] = {}
         self.pending_trace_msgs: dict[str, dict[str, Any]] = {}
         self.trace_readers: dict[tuple[str, str], ShmRingReader] = {}
@@ -1804,6 +2002,17 @@ def _workspace_trace_aggregator(
     return aggregator
 
 
+async def _workspace_send_trace_payload(
+    ws: WebSocket,
+    state: _WorkspaceTraceWsState,
+    trace_msg: dict[str, Any],
+) -> None:
+    if state.binary_transport:
+        await _ws_send_binary_trace_frame(ws, trace_msg, value_field="value")
+    else:
+        await _ws_send_json(ws, trace_msg)
+
+
 async def _workspace_send_trace_message(
     *,
     ws: WebSocket,
@@ -1818,14 +2027,14 @@ async def _workspace_send_trace_message(
         now = time.monotonic()
         next_at = state.next_trace_send_at.get(trace_key, 0.0)
         if now >= next_at:
-            await _ws_send_json(ws, trace_msg)
+            await _workspace_send_trace_payload(ws, state, trace_msg)
             state.next_trace_send_at[trace_key] = now + state.trace_interval_s
         else:
             state.pending_trace_msgs[trace_key] = trace_msg
             if trace_key not in state.next_trace_send_at:
                 state.next_trace_send_at[trace_key] = next_at
         return
-    await _ws_send_json(ws, trace_msg)
+    await _workspace_send_trace_payload(ws, state, trace_msg)
 
 
 async def _workspace_flush_pending_trace_messages(
@@ -1841,7 +2050,7 @@ async def _workspace_flush_pending_trace_messages(
         pending = state.pending_trace_msgs.pop(key, None)
         if pending is None:
             continue
-        await _ws_send_json(ws, pending)
+        await _workspace_send_trace_payload(ws, state, pending)
         if state.trace_interval_s > 0:
             state.next_trace_send_at[key] = now + state.trace_interval_s
         else:
@@ -1923,8 +2132,11 @@ async def _workspace_handle_trace_ready_message(
             mode=state.trace_decimator,
             max_points=state.trace_max_points,
         )
+        trace_binary = np.asarray(trace_values, dtype=np.float64).reshape(-1)
     else:
-        trace_values = trace_flat.tolist()
+        trace_binary = trace_flat.astype(np.float64, copy=False).reshape(-1)
+        trace_values = trace_binary.tolist() if not state.binary_transport else None
+    trace_point_count = int(trace_binary.size)
     trace_payload: dict[str, Any] = {
         "version": 1,
         "workspace_id": msg_workspace,
@@ -1938,9 +2150,12 @@ async def _workspace_handle_trace_ready_message(
         "t0_wall_ns": event.get("t0_wall_ns"),
         "channel_index": payload.get("channel_index"),
         "channel_count": payload.get("channel_count"),
-        "value": trace_values,
-        "point_count": len(trace_values) if isinstance(trace_values, list) else 0,
+        "point_count": trace_point_count,
     }
+    if state.binary_transport:
+        trace_payload["_binary_values"] = trace_binary
+    else:
+        trace_payload["value"] = trace_values
     if bool(payload.get("truncated")):
         trace_payload["truncated"] = True
     if payload.get("context_id") is not None:
@@ -1975,19 +2190,24 @@ async def _workspace_handle_trace_output_message(
         rolled = _workspace_trace_aggregator(state, trace_key).add_frame(points)
         if rolled is None:
             return True
-        decimated = (
-            _decimate_trace_values(
+        if state.trace_max_points is not None:
+            decimated = _decimate_trace_values(
                 rolled,
                 mode=state.trace_decimator,
                 max_points=state.trace_max_points,
             )
-            if state.trace_max_points is not None
-            else rolled.tolist()
-        )
+            trace_binary = np.asarray(decimated, dtype=np.float64).reshape(-1)
+        else:
+            trace_binary = rolled.astype(np.float64, copy=False).reshape(-1)
+            decimated = trace_binary.tolist() if not state.binary_transport else None
         trace_payload = dict(payload)
-        trace_payload["value"] = decimated
-        trace_payload["point_count"] = len(decimated) if isinstance(decimated, list) else 0
-        if state.trace_max_points is not None and len(decimated) < int(points.size):
+        trace_payload.pop("value", None)
+        trace_payload["point_count"] = int(trace_binary.size)
+        if state.binary_transport:
+            trace_payload["_binary_values"] = trace_binary
+        else:
+            trace_payload["value"] = decimated
+        if state.trace_max_points is not None and int(trace_binary.size) < int(points.size):
             trace_payload["decimated"] = True
     trace_msg = msg if trace_payload is payload else {**msg, "payload": trace_payload}
     await _workspace_send_trace_message(
@@ -2014,6 +2234,8 @@ async def ws_stream_workspace(ws: WebSocket, workspace_id: str) -> None:
     trace_max_fps = _parse_trace_max_fps(ws.query_params.get("trace_max_fps"))
     rolling_window = _parse_trace_rolling_window(ws.query_params.get("rolling_window"))
     trace_average_mode = _parse_trace_average_mode(ws.query_params.get("trace_average_mode"))
+    transport = str(ws.query_params.get("transport") or "json").strip().lower()
+    binary_transport = transport == "binary"
     trace_interval_s = (1.0 / trace_max_fps) if trace_max_fps else 0.0
     state = _WorkspaceTraceWsState(
         trace_decimator=trace_decimator,
@@ -2021,6 +2243,7 @@ async def ws_stream_workspace(ws: WebSocket, workspace_id: str) -> None:
         trace_interval_s=trace_interval_s,
         rolling_window=rolling_window,
         trace_average_mode=trace_average_mode,
+        binary_transport=binary_transport,
     )
 
     await ws.accept()
@@ -2075,6 +2298,46 @@ async def ws_stream_workspace(ws: WebSocket, workspace_id: str) -> None:
         app.state.stream_analysis_hub.unsubscribe(q)
 
 
+def _ui_file_response(
+    path: Path,
+    *,
+    immutable: bool = False,
+    request: Request | None = None,
+) -> FileResponse:
+    cache_control = (
+        "public, max-age=31536000, immutable" if immutable else "no-cache"
+    )
+    headers = {"Cache-Control": cache_control, "Vary": "Accept-Encoding"}
+    media_type = mimetypes.guess_type(path.name)[0]
+    accept_encoding = request.headers.get("accept-encoding", "") if request else ""
+    if "br" in accept_encoding:
+        compressed = path.with_name(f"{path.name}.br")
+        if compressed.is_file():
+            headers["Content-Encoding"] = "br"
+            return FileResponse(compressed, headers=headers, media_type=media_type)
+    if "gzip" in accept_encoding:
+        compressed = path.with_name(f"{path.name}.gz")
+        if compressed.is_file():
+            headers["Content-Encoding"] = "gzip"
+            return FileResponse(compressed, headers=headers, media_type=media_type)
+    return FileResponse(path, headers=headers, media_type=media_type)
+
+
+def _ui_asset_response(root: Path, norm: str, *, request: Request) -> FileResponse:
+    candidate = (root / norm).resolve()
+    try:
+        candidate.relative_to(root)
+    except Exception as e:
+        raise HTTPException(status_code=404, detail="not found") from e
+    if candidate.is_file():
+        return _ui_file_response(
+            candidate,
+            immutable=norm.startswith("assets/"),
+            request=request,
+        )
+    return _ui_file_response(root / "index.html", request=request)
+
+
 if _EXTRA_UI_SPECS:
 
     @app.get("/instance-ui/{slug}", include_in_schema=False)
@@ -2085,43 +2348,32 @@ if _EXTRA_UI_SPECS:
         return RedirectResponse(url=spec.href)
 
     @app.get("/instance-ui/{slug}/{full_path:path}", include_in_schema=False)
-    async def extra_ui_spa_fallback(slug: str, full_path: str) -> FileResponse:
+    async def extra_ui_spa_fallback(
+        slug: str, full_path: str, request: Request
+    ) -> FileResponse:
         spec = _EXTRA_UI_BY_SLUG.get(slug)
         if spec is None:
             raise HTTPException(status_code=404, detail="not found")
         norm = full_path.strip("/")
         if not norm:
-            return FileResponse(spec.dist / "index.html")
-        candidate = (spec.dist / norm).resolve()
-        try:
-            candidate.relative_to(spec.dist)
-        except Exception as e:
-            raise HTTPException(status_code=404, detail="not found") from e
-        if candidate.is_file():
-            return FileResponse(candidate)
-        return FileResponse(spec.dist / "index.html")
+            return _ui_file_response(spec.dist / "index.html", request=request)
+        return _ui_asset_response(spec.dist, norm, request=request)
 
 
 if _UI_DIST_PATH is not None:
+    _ui_dist_path = _UI_DIST_PATH
 
     @app.get("/", include_in_schema=False)
-    async def ui_index() -> FileResponse:
-        return FileResponse(_UI_DIST_PATH / "index.html")
+    async def ui_index(request: Request) -> FileResponse:
+        return _ui_file_response(_ui_dist_path / "index.html", request=request)
 
     @app.get("/{full_path:path}", include_in_schema=False)
-    async def ui_spa_fallback(full_path: str) -> FileResponse:
+    async def ui_spa_fallback(full_path: str, request: Request) -> FileResponse:
         norm = full_path.strip("/")
         if norm in {"api", "ws"} or norm.startswith("api/") or norm.startswith("ws/"):
             raise HTTPException(status_code=404, detail="not found")
         if not norm:
-            return FileResponse(_UI_DIST_PATH / "index.html")
+            return _ui_file_response(_ui_dist_path / "index.html", request=request)
 
-        candidate = (_UI_DIST_PATH / norm).resolve()
-        try:
-            candidate.relative_to(_UI_DIST_PATH)
-        except Exception as e:
-            raise HTTPException(status_code=404, detail="not found") from e
-        if candidate.is_file():
-            return FileResponse(candidate)
-        return FileResponse(_UI_DIST_PATH / "index.html")
+        return _ui_asset_response(_ui_dist_path, norm, request=request)
 

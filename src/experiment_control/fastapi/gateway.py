@@ -724,6 +724,7 @@ class StreamFrameHub:
                 else [int(x) for x in shape]
             ),
             "values": values,
+            "_binary_values": values_arr.astype(np.float64, copy=False),
         }
         if context_id is not None:
             out["context_id"] = int(context_id)

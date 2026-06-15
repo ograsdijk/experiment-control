@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 
 import { buildWsUrl, fetchRawStreamSnapshot } from "../../api";
 import { normalizeStreamFrameMessage } from "../stream/messages";
+import { decimateTraceValues } from "../stream/utils";
 import type { RawStreamSubscription, StreamFrameMessage } from "../stream/types";
 
 /**
@@ -48,6 +49,24 @@ export interface RawStreamSubscriptionsArgs {
 
 function subscriptionKey(subscription: RawStreamSubscription): string {
   return `${subscription.deviceId}|${subscription.stream}|${subscription.channelIndex}|${subscription.traceDecimator}|${subscription.traceMaxPoints}|${subscription.traceMaxFps.toFixed(3)}|${subscription.rollingWindow}|${subscription.averageMode}`;
+}
+
+function socketGroupKey(subscription: RawStreamSubscription): string {
+  return `${subscription.deviceId}|${subscription.stream}|${subscription.channelIndex}|${subscription.traceDecimator}|${subscription.traceMaxFps.toFixed(3)}|${subscription.rollingWindow}|${subscription.averageMode}`;
+}
+
+function binaryValuesFromFrame(
+  frame: NonNullable<ReturnType<typeof normalizeStreamFrameMessage>>,
+  data: ArrayBuffer
+): Float64Array | null {
+  const expectedBytes = Number((frame as { byteLength?: unknown }).byteLength);
+  if (Number.isFinite(expectedBytes) && expectedBytes > 0 && expectedBytes !== data.byteLength) {
+    return null;
+  }
+  if (data.byteLength % Float64Array.BYTES_PER_ELEMENT !== 0) {
+    return null;
+  }
+  return new Float64Array(data);
 }
 
 export function useRawStreamSubscriptions({
@@ -97,9 +116,15 @@ export function useRawStreamSubscriptions({
     hydratedRef.current = new Set(
       [...hydratedRef.current].filter((key) => activeKeys.has(key))
     );
-    const pending = currentSubscriptions.filter(
-      (subscription) => !hydratedRef.current.has(subscriptionKey(subscription))
-    );
+    const seenPending = new Set<string>();
+    const pending = currentSubscriptions.filter((subscription) => {
+      const key = subscriptionKey(subscription);
+      if (hydratedRef.current.has(key) || seenPending.has(key)) {
+        return false;
+      }
+      seenPending.add(key);
+      return true;
+    });
     if (pending.length <= 0) {
       return;
     }
@@ -163,42 +188,101 @@ export function useRawStreamSubscriptions({
       setWsConnected(openIds.size > 0);
     };
 
-    const onMessage =
-      (subscription: RawStreamSubscription) => (event: MessageEvent<string>) => {
+    const subscriptionsByKey = new Map<string, RawStreamSubscription[]>();
+    for (const subscription of currentSubscriptions) {
+      const key = socketGroupKey(subscription);
+      const peers = subscriptionsByKey.get(key);
+      if (peers) {
+        peers.push(subscription);
+      } else {
+        subscriptionsByKey.set(key, [subscription]);
+      }
+    }
+
+    const applyFrameToSubscriptions = (
+      subscriptions: RawStreamSubscription[],
+      frame: NonNullable<ReturnType<typeof normalizeStreamFrameMessage>>
+    ) => {
+      let updated = false;
+      for (const subscription of subscriptions) {
+        if (
+          frame.deviceId !== subscription.deviceId ||
+          frame.stream !== subscription.stream
+        ) {
+          continue;
+        }
+        const values = decimateTraceValues(
+          frame.values,
+          subscription.traceDecimator,
+          subscription.traceMaxPoints
+        );
+        const frameForSubscription = values
+          ? { ...frame, values, shape: [values.length] }
+          : frame;
+        if (applyFrameRef.current(subscription, frameForSubscription)) {
+          updated = true;
+        }
+      }
+      if (updated) {
+        bumpPlotTickRef.current();
+      }
+    };
+
+    const onMessage = (subscriptions: RawStreamSubscription[]) => {
+      let pendingFrame: NonNullable<ReturnType<typeof normalizeStreamFrameMessage>> | null = null;
+      return (event: MessageEvent<string | ArrayBuffer>) => {
         try {
-          const msg = JSON.parse(event.data) as StreamFrameMessage;
-          const frame = normalizeStreamFrameMessage(msg);
-          if (frame === null) {
+          if (typeof event.data === "string") {
+            const msg = JSON.parse(event.data) as StreamFrameMessage;
+            const frame = normalizeStreamFrameMessage(msg);
+            if (frame === null) {
+              pendingFrame = null;
+              return;
+            }
+            if (frame.encoding === "binary-frame") {
+              pendingFrame = frame;
+              return;
+            }
+            pendingFrame = null;
+            applyFrameToSubscriptions(subscriptions, frame);
             return;
           }
-          if (
-            frame.deviceId !== subscription.deviceId ||
-            frame.stream !== subscription.stream
-          ) {
+          if (pendingFrame === null) {
             return;
           }
-          const updated = applyFrameRef.current(subscription, frame);
-          if (updated) {
-            bumpPlotTickRef.current();
+          const values = binaryValuesFromFrame(pendingFrame, event.data);
+          if (values === null) {
+            pendingFrame = null;
+            return;
           }
+          const frame = { ...pendingFrame, values, shape: [values.length] };
+          pendingFrame = null;
+          applyFrameToSubscriptions(subscriptions, frame);
         } catch {
+          pendingFrame = null;
           return;
         }
       };
+    };
 
-    for (const subscription of currentSubscriptions) {
+    for (const [socketKey, subscriptions] of subscriptionsByKey) {
+      const subscription = subscriptions[0];
+      const traceMaxPoints = Math.max(
+        ...subscriptions.map((entry) => entry.traceMaxPoints)
+      );
       const params = new URLSearchParams();
       params.set("device_id", subscription.deviceId);
       params.set("stream", subscription.stream);
       params.set("channel_index", String(subscription.channelIndex));
       params.set("trace_decimator", subscription.traceDecimator);
-      params.set("trace_max_points", String(subscription.traceMaxPoints));
+      params.set("trace_max_points", String(traceMaxPoints));
       params.set("trace_max_fps", String(subscription.traceMaxFps));
       params.set("rolling_window", String(subscription.rollingWindow));
       params.set("trace_average_mode", subscription.averageMode);
+      params.set("transport", "binary");
       const query = params.toString();
-      const socketKey = subscriptionKey(subscription);
       const ws = new WebSocket(buildWsUrl(`/ws/raw_stream?${query}`));
+      ws.binaryType = "arraybuffer";
       ws.onopen = () => {
         openIds.add(socketKey);
         updateConnected();
@@ -211,7 +295,7 @@ export function useRawStreamSubscriptions({
         openIds.delete(socketKey);
         updateConnected();
       };
-      ws.onmessage = onMessage(subscription);
+      ws.onmessage = onMessage(subscriptions);
       sockets.set(socketKey, ws);
     }
 

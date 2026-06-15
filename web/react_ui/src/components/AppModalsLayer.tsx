@@ -1,3 +1,4 @@
+import { lazy, Suspense } from "react";
 import type {
   ComponentProps,
   Dispatch,
@@ -18,16 +19,50 @@ import type { useProcessesController } from "../features/processes/useProcessesC
 import type { useSequencerController } from "../features/sequencer/useSequencerController";
 import type { CapabilityMember, DeviceStatus, LogEntry, StreamCatalogEntry } from "../types";
 import type { TelemetrySignal } from "../types";
-import { CommandHistoryModalContainer } from "./CommandHistoryModalContainer";
-import { HdfModalsLayer } from "./HdfModalsLayer";
-import { InfluxWriterModal } from "./InfluxWriterModal";
-import { LogsModalContainer } from "./LogsModalContainer";
-import { ProcessCommandModal } from "./ProcessCommandModal";
-import { ProcessesModal } from "./ProcessesModal";
-import { SafetyModal } from "./SafetyModal";
-import { StateMachinesModal } from "./StateMachinesModal";
-import { SequencerModalContainer } from "./SequencerModalContainer";
-import { SettingsModal } from "./SettingsModal";
+import type { HdfMeasurementNoteModal } from "./HdfMeasurementNoteModal";
+
+const CommandHistoryModalContainer = lazy(() =>
+  import("./CommandHistoryModalContainer").then((module) => ({
+    default: module.CommandHistoryModalContainer,
+  }))
+);
+const HdfModalsLayer = lazy(() =>
+  import("./HdfModalsLayer").then((module) => ({ default: module.HdfModalsLayer }))
+);
+const InfluxWriterModal = lazy(() =>
+  import("./InfluxWriterModal").then((module) => ({
+    default: module.InfluxWriterModal,
+  }))
+);
+const LogsModalContainer = lazy(() =>
+  import("./LogsModalContainer").then((module) => ({
+    default: module.LogsModalContainer,
+  }))
+);
+const ProcessCommandModal = lazy(() =>
+  import("./ProcessCommandModal").then((module) => ({
+    default: module.ProcessCommandModal,
+  }))
+);
+const ProcessesModal = lazy(() =>
+  import("./ProcessesModal").then((module) => ({ default: module.ProcessesModal }))
+);
+const SafetyModal = lazy(() =>
+  import("./SafetyModal").then((module) => ({ default: module.SafetyModal }))
+);
+const StateMachinesModal = lazy(() =>
+  import("./StateMachinesModal").then((module) => ({
+    default: module.StateMachinesModal,
+  }))
+);
+const SequencerModalContainer = lazy(() =>
+  import("./SequencerModalContainer").then((module) => ({
+    default: module.SequencerModalContainer,
+  }))
+);
+const SettingsModal = lazy(() =>
+  import("./SettingsModal").then((module) => ({ default: module.SettingsModal }))
+);
 
 type HdfControllerState = ReturnType<typeof useHdfController>;
 type InfluxControllerState = ReturnType<typeof useInfluxController>;
@@ -43,7 +78,7 @@ type Props = {
   hdf: HdfControllerState;
   influx: InfluxControllerState;
   renderMeasurementFieldInput: ComponentProps<
-    typeof HdfModalsLayer
+    typeof HdfMeasurementNoteModal
   >["renderMeasurementFieldInput"];
   processesController: ProcessesControllerState;
   processCommandController: ProcessCommandControllerState;
@@ -173,13 +208,16 @@ export function AppModalsLayer({
   copyTextToClipboard,
 }: Props) {
   return (
-    <>
-      <HdfModalsLayer
-        hdf={hdf}
-        renderMeasurementFieldInput={renderMeasurementFieldInput}
-      />
-      <InfluxWriterModal
-        opened={influx.influxModalOpen}
+    <Suspense fallback={null}>
+      {hdf.hdfModalOpen || hdf.hdfNoteModalOpen ? (
+        <HdfModalsLayer
+          hdf={hdf}
+          renderMeasurementFieldInput={renderMeasurementFieldInput}
+        />
+      ) : null}
+      {influx.influxModalOpen ? (
+        <InfluxWriterModal
+          opened={influx.influxModalOpen}
         onClose={() => influx.setInfluxModalOpen(false)}
         title={`Influx Writer ${influx.influxWriterProcessId ?? ""}`}
         influxWriterState={influx.influxWriterState}
@@ -201,10 +239,12 @@ export function AppModalsLayer({
         onEnable={influx.executeInfluxEnable}
         onDisable={influx.executeInfluxDisable}
         onFlush={influx.executeInfluxFlush}
-      />
+        />
+      ) : null}
 
-      <ProcessCommandModal
-        opened={processCommandController.processCommandOpen}
+      {processCommandController.processCommandOpen ? (
+        <ProcessCommandModal
+          opened={processCommandController.processCommandOpen}
         onClose={() => processCommandController.setProcessCommandOpen(false)}
         title={processCommandController.processCommandTitle}
         capabilities={processCommandController.capabilitiesForProcessCommand}
@@ -227,40 +267,46 @@ export function AppModalsLayer({
         deckDisabled={processCommandDeckDisabled}
         onAddToDeck={onAddProcessCommandToDeck}
         onExecute={processCommandController.executeProcessCommand}
-      />
+        />
+      ) : null}
 
-      <ProcessesModal
-        opened={processesController.processOpen}
-        onClose={() => processesController.setProcessOpen(false)}
-        processes={processesController.processes}
-        capabilitiesByProcess={processesController.capabilitiesByProcess}
-        busyByProcess={processesController.processBusyById}
-        errorByProcess={processesController.processCapabilitiesErrorById}
-        onRefresh={processesController.refreshProcesses}
-        onProcessAction={onProcessAction}
-        onOpenCommand={processCommandController.openProcessCommand}
-      />
+      {processesController.processOpen ? (
+        <ProcessesModal
+          opened={processesController.processOpen}
+          onClose={() => processesController.setProcessOpen(false)}
+          processes={processesController.processes}
+          capabilitiesByProcess={processesController.capabilitiesByProcess}
+          busyByProcess={processesController.processBusyById}
+          errorByProcess={processesController.processCapabilitiesErrorById}
+          onRefresh={processesController.refreshProcesses}
+          onProcessAction={onProcessAction}
+          onOpenCommand={processCommandController.openProcessCommand}
+        />
+      ) : null}
 
-      <SettingsModal
-        opened={settingsOpen}
-        onClose={() => setSettingsOpen(false)}
-        settingsFileInputRef={settingsFileInputRef}
-        onImportUiProfile={onImportUiProfile}
-        onExportUiProfile={onExportUiProfile}
-        onLoadDefaultUiProfile={onLoadDefaultUiProfile}
-        defaultUiProfileAvailable={defaultUiProfileAvailable}
-        defaultUiProfileLoading={defaultUiProfileLoading}
-        onReload={onReloadSettings}
-        loading={settingsLoading}
-        error={settingsError}
-        gatewaySettings={gatewaySettings}
-        resolvedApiBase={resolvedApiBase}
-        resolvedWsBase={resolvedWsBase}
-        telemetryStreamStatus={telemetryStreamStatus}
-      />
+      {settingsOpen ? (
+        <SettingsModal
+          opened={settingsOpen}
+          onClose={() => setSettingsOpen(false)}
+          settingsFileInputRef={settingsFileInputRef}
+          onImportUiProfile={onImportUiProfile}
+          onExportUiProfile={onExportUiProfile}
+          onLoadDefaultUiProfile={onLoadDefaultUiProfile}
+          defaultUiProfileAvailable={defaultUiProfileAvailable}
+          defaultUiProfileLoading={defaultUiProfileLoading}
+          onReload={onReloadSettings}
+          loading={settingsLoading}
+          error={settingsError}
+          gatewaySettings={gatewaySettings}
+          resolvedApiBase={resolvedApiBase}
+          resolvedWsBase={resolvedWsBase}
+          telemetryStreamStatus={telemetryStreamStatus}
+        />
+      ) : null}
 
-      <SafetyModal
-        opened={interlocksController.interlocksOpen}
+      {interlocksController.interlocksOpen ? (
+        <SafetyModal
+          opened={interlocksController.interlocksOpen}
         onClose={() => interlocksController.setInterlocksOpen(false)}
         interlocks={{
           onRefresh: interlocksController.refreshInterlocksModalData,
@@ -294,10 +340,12 @@ export function AppModalsLayer({
           onToggleWatchdog: watchdogsController.toggleWatchdog,
           onClearRuleLatch: watchdogsController.clearWatchdogRuleLatch,
         }}
-      />
+        />
+      ) : null}
 
-      <StateMachinesModal
-        opened={stateMachinesController.stateMachinesOpen}
+      {stateMachinesController.stateMachinesOpen ? (
+        <StateMachinesModal
+          opened={stateMachinesController.stateMachinesOpen}
         onClose={() => stateMachinesController.setStateMachinesOpen(false)}
         summary={stateMachinesController.stateMachineSummary}
         rows={stateMachinesController.stateMachineRows}
@@ -316,10 +364,12 @@ export function AppModalsLayer({
         }
         onExecuteAction={stateMachinesController.executeStateMachineAction}
         colorScheme={colorScheme}
-      />
+        />
+      ) : null}
 
-      <SequencerModalContainer
-        opened={sequencerController.sequencerOpen}
+      {sequencerController.sequencerOpen ? (
+        <SequencerModalContainer
+          opened={sequencerController.sequencerOpen}
         onClose={() => sequencerController.setSequencerOpen(false)}
         processState={sequencerController.sequencerProcessState}
         runtimeState={sequencerController.sequencerRuntimeState}
@@ -386,10 +436,12 @@ export function AppModalsLayer({
         colorScheme={colorScheme}
         diagnostics={sequencerController.sequencerDiagnostics}
         onJumpToDiagnostic={sequencerController.jumpToSequencerDiagnostic}
-      />
+        />
+      ) : null}
 
-      <CommandHistoryModalContainer
-        opened={commandHistoryController.commandHistoryOpen}
+      {commandHistoryController.commandHistoryOpen ? (
+        <CommandHistoryModalContainer
+          opened={commandHistoryController.commandHistoryOpen}
         onClose={() => commandHistoryController.setCommandHistoryOpen(false)}
         controller={commandHistoryController}
         devices={devices}
@@ -398,10 +450,12 @@ export function AppModalsLayer({
         onCopyJson={(label, payload) => {
           void copyJsonToClipboard(label, payload);
         }}
-      />
+        />
+      ) : null}
 
-      <LogsModalContainer
-        opened={logsOpen}
+      {logsOpen ? (
+        <LogsModalContainer
+          opened={logsOpen}
         onClose={() => setLogsOpen(false)}
         connected={logsWsConnected}
         filteredRows={filteredLogRows}
@@ -429,7 +483,8 @@ export function AppModalsLayer({
         viewportRef={logScrollRef}
         expandedByKey={expandedLogByKey}
         copyTextToClipboard={copyTextToClipboard}
-      />
-    </>
+        />
+      ) : null}
+    </Suspense>
   );
 }
