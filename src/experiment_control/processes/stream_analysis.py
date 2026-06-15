@@ -81,7 +81,7 @@ class CompiledWorkspace:
     enabled: bool
     nodes: dict[str, NodeSpec]
     order: list[str]
-    stream_source_node_id: str
+    stream_source_node_ids: list[str]
     stream_key: tuple[str, str]
     node_output_types: dict[str, str]
     outputs: list[PublishOutput]
@@ -1880,7 +1880,7 @@ def _prune_unreachable_nodes(
     order: list[str],
     deps: dict[str, set[str]],
     outputs: list[PublishOutput],
-    source_stream_node_id: str,
+    source_stream_node_ids: list[str],
 ) -> list[str]:
     """Return `order` filtered to nodes reachable from any published output.
 
@@ -1891,16 +1891,16 @@ def _prune_unreachable_nodes(
     workspace whose output set genuinely depends on every node (the common
     case for UI-built workspaces).
 
-    The source stream node is always considered reachable so the per-event
-    loop keeps a chance to advance source-channel bookkeeping even when
-    nothing downstream consumes the channel value directly.
+    All source stream nodes are always considered reachable so the per-event
+    loop keeps reading each subscribed channel selection even when nothing
+    downstream consumes it directly.
 
     Stateful operators (fits, aggregates) are preserved as long as they
     sit on a path to a published output — they need to run on every event
     to keep their internal state coherent.
     """
-    reachable: set[str] = {source_stream_node_id}
-    queue: list[str] = [out.node_id for out in outputs] + [source_stream_node_id]
+    reachable: set[str] = set(source_stream_node_ids)
+    queue: list[str] = [out.node_id for out in outputs] + list(source_stream_node_ids)
     while queue:
         node_id = queue.pop()
         # `reachable` is a set so `add` is a no-op for already-visited
@@ -1927,14 +1927,23 @@ def compile_workspace_graph(config: Json) -> CompiledWorkspace:
             source_stream_nodes=source_stream_nodes,
         )
 
-    if len(source_stream_nodes) != 1:
-        raise ValueError("graph must contain exactly one source stream node")
-
-    source_node = nodes[source_stream_nodes[0]]
-    stream_key = (
-        str(source_node.params["device_id"]).strip(),
-        str(source_node.params["stream"]).strip(),
-    )
+    if not source_stream_nodes:
+        raise ValueError("graph must contain at least one source stream node")
+    # Multiple source.stream nodes are allowed (e.g. one channel selection for
+    # fluorescence, another for absorption), but they must all read the SAME
+    # (device_id, stream) — a workspace subscribes to exactly one stream.
+    stream_keys = {
+        (
+            str(nodes[node_id].params["device_id"]).strip(),
+            str(nodes[node_id].params["stream"]).strip(),
+        )
+        for node_id in source_stream_nodes
+    }
+    if len(stream_keys) != 1:
+        raise ValueError(
+            "all source.stream nodes must reference the same device_id/stream"
+        )
+    stream_key = next(iter(stream_keys))
     outputs = _compile_workspace_outputs(config=config, nodes=nodes, out_type=out_type)
 
     # Prune nodes that don't feed any published output. Done after
@@ -1944,7 +1953,7 @@ def compile_workspace_graph(config: Json) -> CompiledWorkspace:
         order=order,
         deps=deps,
         outputs=outputs,
-        source_stream_node_id=source_stream_nodes[0],
+        source_stream_node_ids=source_stream_nodes,
     )
 
     return CompiledWorkspace(
@@ -1952,7 +1961,7 @@ def compile_workspace_graph(config: Json) -> CompiledWorkspace:
         enabled=enabled,
         nodes=nodes,
         order=order,
-        stream_source_node_id=source_stream_nodes[0],
+        stream_source_node_ids=source_stream_nodes,
         stream_key=stream_key,
         node_output_types=dict(out_type),
         outputs=outputs,
@@ -3532,8 +3541,6 @@ class StreamAnalysisProcess(ManagedProcessBase):
         *,
         workspace: WorkspaceRuntime,
         values: dict[str, Any],
-        source_channel_index: int,
-        source_channel_count: int,
         include_hist_outputs: bool,
         include_trace_outputs: bool,
     ) -> list[Json]:
@@ -3543,8 +3550,6 @@ class StreamAnalysisProcess(ManagedProcessBase):
                 workspace=workspace,
                 output=output,
                 raw_value=values.get(output.node_id),
-                source_channel_index=source_channel_index,
-                source_channel_count=source_channel_count,
                 include_hist_outputs=include_hist_outputs,
                 include_trace_outputs=include_trace_outputs,
             )
@@ -3558,8 +3563,6 @@ class StreamAnalysisProcess(ManagedProcessBase):
         workspace: WorkspaceRuntime,
         output: PublishOutput,
         raw_value: Any,
-        source_channel_index: int,
-        source_channel_count: int,
         include_hist_outputs: bool,
         include_trace_outputs: bool,
     ) -> Json | None:
@@ -3577,8 +3580,6 @@ class StreamAnalysisProcess(ManagedProcessBase):
             "output_id": output.output_id,
             "node_id": output.node_id,
             "kind": output.kind,
-            "channel_index": int(source_channel_index),
-            "channel_count": int(source_channel_count),
             "value": value,
         }
         if point_count is not None:
@@ -3664,12 +3665,12 @@ class StreamAnalysisProcess(ManagedProcessBase):
         include_trace_outputs: bool = True,
     ) -> list[Json]:
         values: dict[str, Any] = {}
-        source_channel_count = 1
-        source_channel_index = 0
 
         for node_id in workspace.compiled.order:
             node = workspace.compiled.nodes[node_id]
-            source_update = self._execute_workspace_node(
+            # Return value (per-node "source update" channel metadata) is no
+            # longer consumed — output payloads don't carry channel_index/count.
+            self._execute_workspace_node(
                 workspace=workspace,
                 node=node,
                 node_id=node_id,
@@ -3679,14 +3680,10 @@ class StreamAnalysisProcess(ManagedProcessBase):
                 event_t_mono_s=event_t_mono_s,
                 include_hist_outputs=include_hist_outputs,
             )
-            if source_update is not None:
-                source_channel_index, source_channel_count = source_update
 
         return self._build_workspace_output_payloads(
             workspace=workspace,
             values=values,
-            source_channel_index=source_channel_index,
-            source_channel_count=source_channel_count,
             include_hist_outputs=include_hist_outputs,
             include_trace_outputs=include_trace_outputs,
         )
@@ -3848,8 +3845,6 @@ class StreamAnalysisProcess(ManagedProcessBase):
             "dtype": "float64",
             "shape": [int(trace.size)],
             "point_count": int(trace.size),
-            "channel_index": int(output.get("channel_index", 0) or 0),
-            "channel_count": int(output.get("channel_count", 1) or 1),
         }
         if bool(output.get("truncated")):
             descriptor["truncated"] = True
@@ -3904,8 +3899,6 @@ class StreamAnalysisProcess(ManagedProcessBase):
             "seq": int(trace_seq),
             "t0_mono_ns": t0_mono_out,
             "t0_wall_ns": t0_wall_out,
-            "channel_index": int(output.get("channel_index", 0) or 0),
-            "channel_count": int(output.get("channel_count", 1) or 1),
             "value": value_list,
             "point_count": int(trace.size),
         }
