@@ -802,6 +802,7 @@ OPS: dict[str, OpSpec] = {
         stateful=False,
     ),
     "trace.crop": OpSpec(input_types={"trace": "trace"}, output_type="trace", stateful=False),
+    "trace.scale": OpSpec(input_types={"trace": "trace"}, output_type="trace", stateful=False),
     "trace.subtract_background": OpSpec(
         input_types={"trace": "trace"}, output_type="trace", stateful=False
     ),
@@ -904,6 +905,9 @@ OP_PARAM_SCHEMAS: dict[str, list[Json]] = {
     "trace.crop": [
         {"name": "start_idx", "kind": "integer", "required": False, "default": 0},
         {"name": "stop_idx", "kind": "integer", "required": False},
+    ],
+    "trace.scale": [
+        {"name": "factor", "kind": "number", "required": False, "default": 1.0},
     ],
     "trace.subtract_background": [
         {"name": "bg_start_idx", "kind": "integer", "required": True},
@@ -1177,6 +1181,22 @@ def execute_trace_crop(trace_raw: Any, params: Json) -> np.ndarray | None:
     if stop <= start:
         return np.asarray([], dtype=np.float64)
     return trace[start:stop]
+
+
+def execute_trace_scale(trace_raw: Any, params: Json) -> np.ndarray | None:
+    """Multiply a trace by a literal `factor` (default 1.0).
+
+    `factor: -1.0` negates a trace — used as a per-channel polarity step so
+    negative-going detector traces can be flipped to a positive-going convention
+    (the op set has no other constant/negate primitive).
+    """
+    trace = _coerce_trace(trace_raw)
+    if trace is None:
+        return None
+    factor = _normalize_float(params.get("factor"))
+    if factor is None:
+        factor = 1.0
+    return trace * factor
 
 
 def execute_trace_subtract_background(trace_raw: Any, params: Json) -> np.ndarray | None:
@@ -3288,6 +3308,9 @@ class StreamAnalysisProcess(ManagedProcessBase):
             return True, None
         if op == "trace.crop":
             values[node_id] = execute_trace_crop(src, node.params)
+            return True, None
+        if op == "trace.scale":
+            values[node_id] = execute_trace_scale(src, node.params)
             return True, None
         if op == "trace.subtract_background":
             values[node_id] = execute_trace_subtract_background(src, node.params)
