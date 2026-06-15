@@ -46,7 +46,7 @@ export function useTelemetryPipeline(): {
 } {
   const { buffersRef, panelBuffersByTraceKey } = useTelemetry();
   const { setPanels } = usePanels();
-  const { setPlotTick } = usePlotTick();
+  const { requestPlotTick } = usePlotTick();
 
   const handleTelemetryHydrate = useCallback(
     (snapshot: LatestSignals) => {
@@ -100,10 +100,10 @@ export function useTelemetryPipeline(): {
         });
       }
       if (pushedSamples) {
-        setPlotTick((tick) => tick + 1);
+        requestPlotTick();
       }
     },
-    [buffersRef, panelBuffersByTraceKey, setPanels, setPlotTick]
+    [buffersRef, panelBuffersByTraceKey, setPanels, requestPlotTick]
   );
 
   const handleTelemetryMessage = useCallback(
@@ -139,7 +139,7 @@ export function useTelemetryPipeline(): {
         }
       }
       if (pushedSamples) {
-        setPlotTick((tick) => tick + 1);
+        requestPlotTick();
       }
       if (booleanSignalKeys.size > 0) {
         setPanels((prev) => {
@@ -164,7 +164,7 @@ export function useTelemetryPipeline(): {
         });
       }
     },
-    [buffersRef, panelBuffersByTraceKey, setPanels, setPlotTick]
+    [buffersRef, panelBuffersByTraceKey, setPanels, requestPlotTick]
   );
 
   return useTelemetryStream({

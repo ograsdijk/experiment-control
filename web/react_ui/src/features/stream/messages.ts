@@ -20,6 +20,9 @@ export function normalizeStreamFrameMessage(msg: StreamFrameMessage): {
   seq: number;
   shape: number[];
   values: unknown;
+  encoding: string;
+  dtype: string | null;
+  byteLength: number | null;
 } | null {
   if (msg.topic !== "manager.stream_frame") {
     return null;
@@ -41,12 +44,19 @@ export function normalizeStreamFrameMessage(msg: StreamFrameMessage): {
     .map((v) => Number(v))
     .filter((v) => Number.isFinite(v) && v > 0)
     .map((v) => Math.trunc(v));
+  const byteLengthRaw = payload?.byte_length;
   return {
     deviceId,
     stream,
     seq,
     shape,
     values: payload?.values,
+    encoding: String(payload?.encoding ?? "json"),
+    dtype: typeof payload?.dtype === "string" ? payload.dtype : null,
+    byteLength:
+      typeof byteLengthRaw === "number" && Number.isFinite(byteLengthRaw)
+        ? Math.trunc(byteLengthRaw)
+        : null,
   };
 }
 
@@ -58,6 +68,9 @@ export type NormalizedStreamAnalysisOutput = {
   value: unknown;
   tWallS: number;
   contextFields: Record<string, unknown> | null;
+  encoding: string;
+  dtype: string | null;
+  byteLength: number | null;
 };
 
 export function normalizeStreamAnalysisOutputMessage(
@@ -88,6 +101,7 @@ export function normalizeStreamAnalysisOutputMessage(
     typeof seqRaw === "number" && Number.isFinite(seqRaw)
       ? Math.trunc(seqRaw)
       : null;
+  const byteLengthRaw = payload?.byte_length;
   return {
     workspaceId,
     outputId,
@@ -96,15 +110,21 @@ export function normalizeStreamAnalysisOutputMessage(
     value: payload?.value,
     tWallS,
     contextFields,
+    encoding: String(payload?.encoding ?? "json"),
+    dtype: typeof payload?.dtype === "string" ? payload.dtype : null,
+    byteLength:
+      typeof byteLengthRaw === "number" && Number.isFinite(byteLengthRaw)
+        ? Math.trunc(byteLengthRaw)
+        : null,
   };
 }
 
 export function normalizeTraceValues(raw: unknown): number[] | null {
-  if (!Array.isArray(raw)) {
+  if (!Array.isArray(raw) && !ArrayBuffer.isView(raw)) {
     return null;
   }
   const out: number[] = [];
-  for (const item of raw) {
+  for (const item of Array.from(raw as ArrayLike<unknown>)) {
     const value = Number(item);
     if (!Number.isFinite(value)) {
       return null;

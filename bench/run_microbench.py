@@ -33,6 +33,7 @@ from experiment_control.processes.stream_analysis import (  # noqa: E402
     BinStatsState,
     _sanitize_json as stream_analysis_sanitize_json,
 )
+from experiment_control.fastapi.app import _build_trace_frame_array  # noqa: E402
 
 Json = dict[str, Any]
 
@@ -536,6 +537,95 @@ def bench_snapshot_readout(rows: list[Row]) -> None:
 
 
 
+def bench_binary_trace_transport(rows: list[Row]) -> None:
+    """Compare JSON trace values against binary metadata+bytes framing."""
+    print()
+    print("== raw trace transport (JSON values vs binary frame) ==")
+    print(_HEADER)
+    rng = np.random.default_rng(42)
+
+    for n in (1_000, 50_000, 200_000):
+        arr = rng.normal(size=n).astype(np.float64)
+        values = arr.tolist()
+        json_msg = {
+            "topic": "manager.stream_frame",
+            "payload": {
+                "version": 1,
+                "device_id": "dev1",
+                "stream": "trace",
+                "seq": 42,
+                "shape": [n],
+                "point_count": n,
+                "values": values,
+            },
+        }
+        binary_msg = {
+            "topic": "manager.stream_frame",
+            "payload": {
+                **json_msg["payload"],
+                "_binary_values": arr,
+            },
+        }
+        meta_msg = {
+            "topic": "manager.stream_frame",
+            "payload": {
+                "version": 1,
+                "device_id": "dev1",
+                "stream": "trace",
+                "seq": 42,
+                "shape": [n],
+                "point_count": n,
+                "encoding": "binary-frame",
+                "dtype": "float64",
+                "byte_order": "little",
+                "byte_length": int(arr.nbytes),
+            },
+        }
+
+        def json_values() -> bytes:
+            return json_dumps(json_msg)
+
+        def binary_from_list() -> tuple[bytes, bytes]:
+            payload_arr = np.asarray(values, dtype=np.float64).reshape(-1)
+            return json_dumps(meta_msg), payload_arr.astype("<f8", copy=False).tobytes()
+
+        def binary_from_ndarray() -> tuple[bytes, bytes]:
+            return json_dumps(meta_msg), arr.astype("<f8", copy=False).tobytes()
+
+        def production_binary_builder() -> tuple[bytes, bytes]:
+            built = _build_trace_frame_array(
+                binary_msg["payload"],
+                channel_index=0,
+                trace_decimator="stride",
+                trace_max_points=None,
+            )
+            if built is None:
+                raise RuntimeError("failed to build binary frame")
+            payload, trace = built
+            payload.update(
+                {
+                    "encoding": "binary-frame",
+                    "dtype": "float64",
+                    "byte_order": "little",
+                    "byte_length": int(trace.nbytes),
+                }
+            )
+            return json_dumps({"topic": json_msg["topic"], "payload": payload}), trace.astype("<f8", copy=False).tobytes()
+
+        iters = 1000 if n <= 1_000 else (200 if n <= 50_000 else 50)
+        size_label = f"{n:,} pts"
+        for label, fn in (
+            ("json values frame", json_values),
+            ("old binary frame from list", binary_from_list),
+            ("ideal binary from ndarray", binary_from_ndarray),
+            ("production binary builder", production_binary_builder),
+        ):
+            r = time_call(label, size_label, fn, iters=iters)
+            rows.append(r)
+            print(r.fmt())
+
+
+
 def bench_stream_buffer_assembly(rows: list[Row]) -> None:
     """Compare three HDF stream-buffer assembly paths.
 
@@ -662,6 +752,7 @@ ALL_BENCHES = {
     "output_index": bench_output_index,
     "trace_snapshot": bench_trace_snapshot_value,
     "snapshot_readout": bench_snapshot_readout,
+    "binary_trace_transport": bench_binary_trace_transport,
     "stream_buffer": bench_stream_buffer_assembly,
 }
 

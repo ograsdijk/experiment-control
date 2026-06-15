@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 
 import { buildWsUrl, fetchStreamWorkspaceSnapshot } from "../../api";
 import { normalizeStreamAnalysisOutputMessage } from "../stream/messages";
+import { decimateTraceValues } from "../stream/utils";
 import type {
   StreamAnalysisMessage,
   StreamAnalysisWorkspaceSubscription,
@@ -66,10 +67,6 @@ function snapshotKey(target: {
 function workspaceSubscriptionKey(
   subscription: StreamAnalysisWorkspaceSubscription
 ): string {
-  // Capture every field that influences either the snapshot request
-  // or the live WS query string so two subscriptions that produce the
-  // same socket / fetch collapse to the same key, and any meaningful
-  // change ticks the key.
   const kinds = [...subscription.kinds].map(String).sort().join(",");
   const traceParts = [
     subscription.traceDecimator ?? "",
@@ -81,6 +78,33 @@ function workspaceSubscriptionKey(
     subscription.traceAverageMode ?? "",
   ].join("|");
   return `${subscription.workspaceId}|${kinds}|${traceParts}`;
+}
+
+function workspaceSocketGroupKey(
+  subscription: StreamAnalysisWorkspaceSubscription
+): string {
+  const traceParts = [
+    subscription.traceDecimator ?? "",
+    typeof subscription.traceMaxFps === "number"
+      ? subscription.traceMaxFps.toFixed(3)
+      : "",
+    subscription.traceRollingWindow ?? "",
+    subscription.traceAverageMode ?? "",
+  ].join("|");
+  return `${subscription.workspaceId}|${traceParts}`;
+}
+
+function binaryValuesFromOutput(
+  output: NonNullable<ReturnType<typeof normalizeStreamAnalysisOutputMessage>>,
+  data: ArrayBuffer
+): Float64Array | null {
+  if (output.byteLength !== null && output.byteLength !== data.byteLength) {
+    return null;
+  }
+  if (data.byteLength % Float64Array.BYTES_PER_ELEMENT !== 0) {
+    return null;
+  }
+  return new Float64Array(data);
 }
 
 function buildTraceFilter(
@@ -260,45 +284,110 @@ export function useStreamAnalysisSubscriptions({
       setWsConnected(openIds.size > 0);
     };
 
-    const onMessage =
-      (subscription: StreamAnalysisWorkspaceSubscription) =>
-      (event: MessageEvent<string>) => {
+    const subscriptionsByKey = new Map<string, StreamAnalysisWorkspaceSubscription[]>();
+    for (const subscription of currentSubscriptions) {
+      const socketKey = workspaceSocketGroupKey(subscription);
+      const peers = subscriptionsByKey.get(socketKey);
+      if (peers) {
+        peers.push(subscription);
+      } else {
+        subscriptionsByKey.set(socketKey, [subscription]);
+      }
+    }
+
+    const applyOutputToSubscriptions = (
+      subscriptions: StreamAnalysisWorkspaceSubscription[],
+      output: NonNullable<ReturnType<typeof normalizeStreamAnalysisOutputMessage>>
+    ) => {
+      let updated = false;
+      for (const subscription of subscriptions) {
+        const traceFilter = buildTraceFilter(subscription);
+        const outputForSubscription =
+          output.kind === "trace" && traceFilter
+            ? {
+                ...output,
+                value: decimateTraceValues(
+                  output.value,
+                  traceFilter.traceDecimator,
+                  traceFilter.traceMaxPoints
+                ),
+              }
+            : output;
+        if (applyOutputRef.current(outputForSubscription, traceFilter)) {
+          updated = true;
+        }
+      }
+      if (updated) {
+        bumpPlotTickRef.current();
+      }
+    };
+
+    const onMessage = (subscriptions: StreamAnalysisWorkspaceSubscription[]) => {
+      let pendingOutput: NonNullable<ReturnType<typeof normalizeStreamAnalysisOutputMessage>> | null = null;
+      return (event: MessageEvent<string | ArrayBuffer>) => {
         try {
-          const msg = JSON.parse(event.data) as StreamAnalysisMessage;
-          const output = normalizeStreamAnalysisOutputMessage(msg);
-          if (output === null) {
+          if (typeof event.data === "string") {
+            const msg = JSON.parse(event.data) as StreamAnalysisMessage;
+            const output = normalizeStreamAnalysisOutputMessage(msg);
+            if (output === null) {
+              pendingOutput = null;
+              return;
+            }
+            if (output.encoding === "binary-frame") {
+              pendingOutput = output;
+              return;
+            }
+            pendingOutput = null;
+            applyOutputToSubscriptions(subscriptions, output);
             return;
           }
-          const traceFilter = buildTraceFilter(subscription);
-          if (applyOutputRef.current(output, traceFilter)) {
-            bumpPlotTickRef.current();
+          if (pendingOutput === null) {
+            return;
           }
+          const values = binaryValuesFromOutput(pendingOutput, event.data);
+          if (values === null) {
+            pendingOutput = null;
+            return;
+          }
+          const output = { ...pendingOutput, value: values };
+          pendingOutput = null;
+          applyOutputToSubscriptions(subscriptions, output);
         } catch {
+          pendingOutput = null;
           return;
         }
       };
+    };
 
-    for (const subscription of currentSubscriptions) {
+    for (const [socketKey, subscriptions] of subscriptionsByKey) {
+      const subscription = subscriptions[0];
       const workspaceId = subscription.workspaceId;
+      const kinds = [...new Set(subscriptions.flatMap((entry) => entry.kinds))].sort();
       const params = new URLSearchParams();
-      if (subscription.kinds.length > 0) {
-        params.set("kinds", subscription.kinds.join(","));
+      if (kinds.length > 0) {
+        params.set("kinds", kinds.join(","));
       }
       const traceFilter = buildTraceFilter(subscription);
       if (traceFilter) {
+        const traceMaxPoints = Math.max(
+          ...subscriptions
+            .map((entry) => buildTraceFilter(entry)?.traceMaxPoints)
+            .filter((value): value is number => typeof value === "number")
+        );
         params.set("trace_decimator", traceFilter.traceDecimator);
-        params.set("trace_max_points", String(traceFilter.traceMaxPoints));
+        params.set("trace_max_points", String(traceMaxPoints));
         params.set("trace_max_fps", String(traceFilter.traceMaxFps));
         params.set("rolling_window", String(traceFilter.traceRollingWindow));
         params.set("trace_average_mode", traceFilter.traceAverageMode);
+        params.set("transport", "binary");
       }
       const query = params.toString();
-      const socketKey = `${workspaceId}|${query}`;
       const ws = new WebSocket(
         buildWsUrl(
           `/ws/stream/${encodeURIComponent(workspaceId)}${query ? `?${query}` : ""}`
         )
       );
+      ws.binaryType = "arraybuffer";
       ws.onopen = () => {
         openIds.add(socketKey);
         updateConnected();
@@ -311,7 +400,7 @@ export function useStreamAnalysisSubscriptions({
         openIds.delete(socketKey);
         updateConnected();
       };
-      ws.onmessage = onMessage(subscription);
+      ws.onmessage = onMessage(subscriptions);
       sockets.set(socketKey, ws);
     }
 
