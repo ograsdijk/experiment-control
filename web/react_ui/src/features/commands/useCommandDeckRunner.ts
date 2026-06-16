@@ -3,12 +3,14 @@ import { notifications } from "@mantine/notifications";
 import { fetchCapabilities } from "../../api";
 import { coerceParamValue } from "../../components/ParamInput";
 import type {
+  CapabilityMember,
   CommandDeckCommandEntry,
   CommandDeckTargetKind,
   CommandDeckTelemetryEntry,
   DeviceStatus,
   ProcessStatus,
 } from "../../types";
+import type { ApiError } from "../../api";
 import { formatApiErrorToastMessage } from "../common/api_error";
 import {
   effectiveDeviceMemberParams,
@@ -52,7 +54,7 @@ export interface CommandDeckRunnerArgs {
 
   // Device-side capability cache (App-owned)
   setCapabilitiesByDevice: React.Dispatch<
-    React.SetStateAction<Record<string, unknown[]>>
+    React.SetStateAction<Record<string, CapabilityMember[]>>
   >;
 
   // Live telemetry signals (for telemetry-entry signal autodefault)
@@ -64,13 +66,13 @@ export interface CommandDeckRunnerArgs {
     action: string,
     params: Record<string, unknown>,
     source: string
-  ) => Promise<{ ok: boolean; error?: unknown }>;
+  ) => Promise<{ ok: boolean; error?: ApiError }>;
   sendProcessCommand: (
     targetId: string,
     action: string,
     params: Record<string, unknown>,
     source: string
-  ) => Promise<{ ok: boolean; error?: unknown }>;
+  ) => Promise<{ ok: boolean; error?: ApiError }>;
 
   // Command-modal draft state (drives addToDeckFromCommandModal)
   commandDevice: string | null;
@@ -132,9 +134,11 @@ export function useCommandDeckRunner(args: CommandDeckRunnerArgs) {
     setCommandDeckBusyById,
     commandDeckIdRef,
   } = useCommands();
-  const { orderedDevices, capabilitiesByDevice } = useDevicesContext() as {
+  // NOTE: capabilitiesByDevice is not part of DevicesContextValue; this cast
+  // preserves the pre-existing (App-owned) lookup shape. See follow-up below.
+  const { orderedDevices, capabilitiesByDevice } = useDevicesContext() as unknown as {
     orderedDevices: DeviceStatus[];
-    capabilitiesByDevice: Record<string, unknown[]>;
+    capabilitiesByDevice: Record<string, CapabilityMember[]>;
   };
   const { setDevicePanelTab } = useLayout();
 

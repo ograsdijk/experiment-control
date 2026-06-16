@@ -6,7 +6,7 @@ export type PlotWorkspaceColumnsSetting = "auto" | "1" | "2" | "3" | "4";
 
 export type PlotState = {
   panels: PlotPanelState[];
-  activePanelId: string;
+  activePanelId: string | null;
   nextPanelId: number;
 };
 
@@ -39,7 +39,7 @@ export type UiProfileFile = {
   plots: {
     plot_state: {
       panels: PlotPanelState[];
-      activePanelId: string;
+      activePanelId: string | null;
     };
   };
   commands: {

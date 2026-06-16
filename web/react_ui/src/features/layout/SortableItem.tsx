@@ -1,12 +1,12 @@
-import type { Attributes } from "@dnd-kit/core";
+import type { DraggableAttributes } from "@dnd-kit/core";
 import type { CSSProperties, ReactNode } from "react";
 import { useSortable } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 
 export type SortableItemRenderArgs = {
   setNodeRef: (node: HTMLElement | null) => void;
-  attributes: Attributes;
-  listeners: Record<string, (event: unknown) => void> | undefined;
+  attributes: DraggableAttributes;
+  listeners: ReturnType<typeof useSortable>["listeners"];
   style: CSSProperties;
   isDragging: boolean;
   isOver: boolean;

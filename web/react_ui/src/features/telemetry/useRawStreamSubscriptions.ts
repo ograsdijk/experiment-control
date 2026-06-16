@@ -3,7 +3,8 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { buildWsUrl, fetchRawStreamSnapshot } from "../../api";
 import { normalizeStreamFrameMessage } from "../stream/messages";
 import { decimateTraceValues } from "../stream/utils";
-import type { RawStreamSubscription, StreamFrameMessage } from "../stream/types";
+import type { RawStreamSubscription } from "../stream/types";
+import type { StreamFrameMessage } from "../../types";
 
 /**
  * Raw-stream WebSocket subscriptions manager.

@@ -61,12 +61,13 @@ export function WaitUntilStepEditor({
   capabilitiesByDevice,
   latestSignalsByDevice,
 }: WaitUntilProps) {
-  if (!node.waitUntilDetail) {
+  const detail = node.waitUntilDetail;
+  if (!detail) {
     return null;
   }
 
-  const sample = node.waitUntilDetail.sample;
-  const condition = node.waitUntilDetail.condition;
+  const sample = detail.sample;
+  const condition = detail.condition;
   const inferSampleKind = (entries: ReadonlyArray<SequencerOutlineMetadataEntry>): WaitUntilSampleKind => {
     const hasTelemetry = entries.some((entry) => entry.name.startsWith("telemetry."));
     const hasCall = entries.some((entry) => entry.name.startsWith("call."));
@@ -207,11 +208,11 @@ export function WaitUntilStepEditor({
         <TextInput
           size="xs"
           label="Timeout (s)"
-          value={renderValue(node.waitUntilDetail.timeoutS)}
+          value={renderValue(detail.timeoutS)}
           onChange={(event) =>
             updateWaitUntil(
               event.currentTarget.value,
-              renderValue(node.waitUntilDetail.everyS),
+              renderValue(detail.everyS),
               sample,
               condition
             )
@@ -220,10 +221,10 @@ export function WaitUntilStepEditor({
         <TextInput
           size="xs"
           label="Polling interval (s)"
-          value={renderValue(node.waitUntilDetail.everyS)}
+          value={renderValue(detail.everyS)}
           onChange={(event) =>
             updateWaitUntil(
-              renderValue(node.waitUntilDetail.timeoutS),
+              renderValue(detail.timeoutS),
               event.currentTarget.value,
               sample,
               condition
@@ -246,8 +247,8 @@ export function WaitUntilStepEditor({
               comboboxProps={{ withinPortal: false }}
               onChange={(value) =>
                 updateWaitUntil(
-                  renderValue(node.waitUntilDetail.timeoutS),
-                  renderValue(node.waitUntilDetail.everyS),
+                  renderValue(detail.timeoutS),
+                  renderValue(detail.everyS),
                   withSampleKind((value as WaitUntilSampleKind) ?? "custom", sample),
                   condition
                 )
@@ -267,8 +268,8 @@ export function WaitUntilStepEditor({
                       comboboxProps={{ withinPortal: false }}
                       onChange={(value) =>
                         updateWaitUntil(
-                          renderValue(node.waitUntilDetail.timeoutS),
-                          renderValue(node.waitUntilDetail.everyS),
+                          renderValue(detail.timeoutS),
+                          renderValue(detail.everyS),
                           sampleSet(
                             sampleSet(sample, "telemetry.signal", ""),
                             "telemetry.device",
@@ -285,8 +286,8 @@ export function WaitUntilStepEditor({
                       value={sampleGet(sample, "telemetry.device")}
                       onChange={(event) =>
                         updateWaitUntil(
-                          renderValue(node.waitUntilDetail.timeoutS),
-                          renderValue(node.waitUntilDetail.everyS),
+                          renderValue(detail.timeoutS),
+                          renderValue(detail.everyS),
                           sampleSet(sample, "telemetry.device", event.currentTarget.value),
                           condition
                         )
@@ -304,8 +305,8 @@ export function WaitUntilStepEditor({
                       comboboxProps={{ withinPortal: false }}
                       onChange={(value) =>
                         updateWaitUntil(
-                          renderValue(node.waitUntilDetail.timeoutS),
-                          renderValue(node.waitUntilDetail.everyS),
+                          renderValue(detail.timeoutS),
+                          renderValue(detail.everyS),
                           sampleSet(sample, "telemetry.signal", value ?? ""),
                           condition
                         )
@@ -318,8 +319,8 @@ export function WaitUntilStepEditor({
                       value={sampleGet(sample, "telemetry.signal")}
                       onChange={(event) =>
                         updateWaitUntil(
-                          renderValue(node.waitUntilDetail.timeoutS),
-                          renderValue(node.waitUntilDetail.everyS),
+                          renderValue(detail.timeoutS),
+                          renderValue(detail.everyS),
                           sampleSet(sample, "telemetry.signal", event.currentTarget.value),
                           condition
                         )
@@ -333,8 +334,8 @@ export function WaitUntilStepEditor({
                   value={sampleGet(sample, "telemetry.max_age_s")}
                   onChange={(event) =>
                     updateWaitUntil(
-                      renderValue(node.waitUntilDetail.timeoutS),
-                      renderValue(node.waitUntilDetail.everyS),
+                      renderValue(detail.timeoutS),
+                      renderValue(detail.everyS),
                       sampleSet(sample, "telemetry.max_age_s", event.currentTarget.value),
                       condition
                     )
@@ -344,8 +345,8 @@ export function WaitUntilStepEditor({
                   entries={telemetryExtraEntries}
                   onChange={(nextEntries) =>
                     updateWaitUntil(
-                      renderValue(node.waitUntilDetail.timeoutS),
-                      renderValue(node.waitUntilDetail.everyS),
+                      renderValue(detail.timeoutS),
+                      renderValue(detail.everyS),
                       [
                         ...sample.filter(
                           (entry) =>
@@ -388,8 +389,8 @@ export function WaitUntilStepEditor({
                       comboboxProps={{ withinPortal: false }}
                       onChange={(value) =>
                         updateWaitUntil(
-                          renderValue(node.waitUntilDetail.timeoutS),
-                          renderValue(node.waitUntilDetail.everyS),
+                          renderValue(detail.timeoutS),
+                          renderValue(detail.everyS),
                           [
                             ...sample.filter(
                               (entry) =>
@@ -410,8 +411,8 @@ export function WaitUntilStepEditor({
                       value={sampleGet(sample, "call.device")}
                       onChange={(event) =>
                         updateWaitUntil(
-                          renderValue(node.waitUntilDetail.timeoutS),
-                          renderValue(node.waitUntilDetail.everyS),
+                          renderValue(detail.timeoutS),
+                          renderValue(detail.everyS),
                           sampleSet(sample, "call.device", event.currentTarget.value),
                           condition
                         )
@@ -429,8 +430,8 @@ export function WaitUntilStepEditor({
                       comboboxProps={{ withinPortal: false }}
                       onChange={(value) =>
                         updateWaitUntil(
-                          renderValue(node.waitUntilDetail.timeoutS),
-                          renderValue(node.waitUntilDetail.everyS),
+                          renderValue(detail.timeoutS),
+                          renderValue(detail.everyS),
                           sampleSet(sample, "call.action", value ?? ""),
                           condition
                         )
@@ -443,8 +444,8 @@ export function WaitUntilStepEditor({
                       value={sampleGet(sample, "call.action")}
                       onChange={(event) =>
                         updateWaitUntil(
-                          renderValue(node.waitUntilDetail.timeoutS),
-                          renderValue(node.waitUntilDetail.everyS),
+                          renderValue(detail.timeoutS),
+                          renderValue(detail.everyS),
                           sampleSet(sample, "call.action", event.currentTarget.value),
                           condition
                         )
@@ -456,8 +457,8 @@ export function WaitUntilStepEditor({
                   entries={callExtraEntries}
                   onChange={(nextEntries) =>
                     updateWaitUntil(
-                      renderValue(node.waitUntilDetail.timeoutS),
-                      renderValue(node.waitUntilDetail.everyS),
+                      renderValue(detail.timeoutS),
+                      renderValue(detail.everyS),
                       [
                         ...sample.filter(
                           (entry) =>
@@ -490,8 +491,8 @@ export function WaitUntilStepEditor({
                 entries={sample}
                 onChange={(nextSample) =>
                   updateWaitUntil(
-                    renderValue(node.waitUntilDetail.timeoutS),
-                    renderValue(node.waitUntilDetail.everyS),
+                    renderValue(detail.timeoutS),
+                    renderValue(detail.everyS),
                     nextSample,
                     condition
                   )
@@ -511,8 +512,8 @@ export function WaitUntilStepEditor({
           entries={condition}
           onChange={(nextCondition) =>
             updateWaitUntil(
-              renderValue(node.waitUntilDetail.timeoutS),
-              renderValue(node.waitUntilDetail.everyS),
+              renderValue(detail.timeoutS),
+              renderValue(detail.everyS),
               sample,
               nextCondition
             )
@@ -535,19 +536,20 @@ export function SetStepEditor({
   yamlText,
   onYamlTextChange,
 }: CommonProps) {
-  if (!node.setDetail) {
+  const setDetail = node.setDetail;
+  if (!setDetail) {
     return null;
   }
 
-  const setNameError = renderValue(node.setDetail.name).trim().length <= 0;
-  const setValueError = renderValue(node.setDetail.value).trim().length <= 0;
+  const setNameError = renderValue(setDetail.name).trim().length <= 0;
+  const setValueError = renderValue(setDetail.value).trim().length <= 0;
 
   const updateSet = (nextName: string, nextValue: string) => {
     onYamlTextChange(
       applyEditedSetStep(
         yamlText,
         node,
-        renderValue(node.setDetail?.device),
+        renderValue(setDetail.device),
         nextName,
         nextValue
       )
@@ -560,25 +562,25 @@ export function SetStepEditor({
         <TextInput
           size="xs"
           label="Device"
-          value={renderValue(node.setDetail.device)}
+          value={renderValue(setDetail.device)}
           readOnly
         />
         <TextInput
           size="xs"
           label="Field"
-          value={renderValue(node.setDetail.name)}
+          value={renderValue(setDetail.name)}
           error={setNameError ? "Field name is required." : undefined}
           onChange={(event) =>
-            updateSet(event.currentTarget.value, renderValue(node.setDetail?.value))
+            updateSet(event.currentTarget.value, renderValue(setDetail.value))
           }
         />
         <TextInput
           size="xs"
           label="Value"
-          value={renderValue(node.setDetail.value)}
+          value={renderValue(setDetail.value)}
           error={setValueError ? "Value is required." : undefined}
           onChange={(event) =>
-            updateSet(renderValue(node.setDetail?.name), event.currentTarget.value)
+            updateSet(renderValue(setDetail.name), event.currentTarget.value)
           }
         />
       </Stack>

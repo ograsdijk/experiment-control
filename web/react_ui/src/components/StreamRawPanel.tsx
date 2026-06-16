@@ -312,7 +312,7 @@ export function StreamRawPanel({
         },
       ],
     };
-    plotRef.current = new uPlot(opts, built.data, hostRef.current);
+    plotRef.current = new uPlot(opts, built.data as uPlot.AlignedData, hostRef.current);
     const resize = new ResizeObserver(() => {
       if (!hostRef.current || !plotRef.current) {
         return;
@@ -344,7 +344,7 @@ export function StreamRawPanel({
     if (!plotRef.current) {
       return;
     }
-    plotRef.current.setData(built.data);
+    plotRef.current.setData(built.data as uPlot.AlignedData);
   }, [tick, built.data]);
 
   return <div className="plot-panel" ref={hostRef} />;

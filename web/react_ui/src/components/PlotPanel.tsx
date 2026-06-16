@@ -496,7 +496,7 @@ export function PlotPanel({
       ],
     };
     const data = buildPanelData();
-    plotRef.current = new uPlot(opts, data, hostRef.current);
+    plotRef.current = new uPlot(opts, data as uPlot.AlignedData, hostRef.current);
     applyTimeWindow(plotRef.current, data, timeWindowS);
 
     const resize = new ResizeObserver(() => {
@@ -534,7 +534,7 @@ export function PlotPanel({
       return;
     }
     const data = buildPanelData();
-    plotRef.current.setData(data);
+    plotRef.current.setData(data as uPlot.AlignedData);
     applyTimeWindow(plotRef.current, data, timeWindowS);
   }, [tick, timeWindowS, buildPanelData]);
 

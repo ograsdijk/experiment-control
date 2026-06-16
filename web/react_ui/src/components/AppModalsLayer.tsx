@@ -88,7 +88,7 @@ type Props = {
   settingsOpen: boolean;
   setSettingsOpen: Dispatch<SetStateAction<boolean>>;
   settingsFileInputRef: ComponentProps<typeof SettingsModal>["settingsFileInputRef"];
-  onImportUiProfile: () => Promise<unknown> | void;
+  onImportUiProfile: ComponentProps<typeof SettingsModal>["onImportUiProfile"];
   onExportUiProfile: () => Promise<unknown> | void;
   onLoadDefaultUiProfile: () => Promise<boolean>;
   defaultUiProfileAvailable: boolean;

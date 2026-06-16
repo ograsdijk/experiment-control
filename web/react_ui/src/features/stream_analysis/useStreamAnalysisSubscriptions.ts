@@ -4,11 +4,11 @@ import { buildWsUrl, fetchStreamWorkspaceSnapshot } from "../../api";
 import { normalizeStreamAnalysisOutputMessage } from "../stream/messages";
 import { decimateTraceValues } from "../stream/utils";
 import type {
-  StreamAnalysisMessage,
   StreamAnalysisWorkspaceSubscription,
   StreamTraceAverageMode,
   StreamTraceDecimator,
 } from "../stream/types";
+import type { StreamAnalysisMessage } from "../../types";
 
 /**
  * Stream-analysis WebSocket subscriptions manager.

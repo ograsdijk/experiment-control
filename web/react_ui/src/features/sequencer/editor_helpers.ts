@@ -656,7 +656,7 @@ function countAdaptiveIssues(node: SequencerStepOutlineNode): number {
       ? 1
       : 0) +
     (!isBlank(detail.observeRepeats) &&
-    /^-?\d+(?:\.\d+)?$/.test(detail.observeRepeats.trim()) &&
+    /^-?\d+(?:\.\d+)?$/.test((detail.observeRepeats ?? "").trim()) &&
     !isPositiveIntegerLiteral(detail.observeRepeats)
       ? 1
       : 0);

@@ -32,11 +32,11 @@ import {
 } from "../features/stream/utils";
 import type {
   StreamAnalysisWorkspaceConfig,
-  StreamCatalogEntry,
   StreamDagNodeConfig,
   StreamDagOutputConfig,
   StreamWorkspaceStoreStatus,
 } from "../features/stream/types";
+import type { StreamCatalogEntry } from "../types";
 
 type SelectOption = { value: string; label: string };
 
