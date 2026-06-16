@@ -520,6 +520,7 @@ export function App() {
     streamWorkspaceRevisionsRef,
     daqNodeCardRefs,
     daqNodeFocusTimeoutRef,
+    streamAnalysisReadyRef,
   } = useStreamAnalysis();
   // Panel state container — see features/panels/PanelsContext.tsx.
   // Names kept identical so the ~37 setPanels(prev => ...) sites and
@@ -674,7 +675,8 @@ export function App() {
   // daqNodeFocusTimeoutRef now provided by StreamAnalysisContext (see
   // destructure above).
   // panelsRef now provided by PanelsContext (destructured above).
-  const streamAnalysisReadyRef = useRef(false);
+  // streamAnalysisReadyRef now provided by StreamAnalysisContext (see
+  // destructure above) so useDaqModalLifecycle/useUiProfile can read it.
   const rawSnapshotHydratedRef = useRef<Set<string>>(new Set());
   const workspaceSnapshotHydratedRef = useRef<Set<string>>(new Set());
   // isNarrowPlotViewport + plotGridStyle now provided by LayoutContext
