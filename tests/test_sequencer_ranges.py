@@ -99,5 +99,74 @@ class SequencerRangeGeneratorTests(unittest.TestCase):
         self.assertEqual(len(records), 9)
 
 
+class SequencerSampleModifierTests(unittest.TestCase):
+    def _grid_spec(self) -> dict:
+        # 5x5 = 25-point grid.
+        return {
+            "scan2d": {
+                "center": {"x": 0.0, "y": 0.0},
+                "size": {"width": 4.0, "height": 4.0},
+                "steps": 5,
+            }
+        }
+
+    def test_sample_count_with_replacement(self) -> None:
+        spec = dict(self._grid_spec())
+        spec["sample"] = {"count": 4, "replace": True, "seed": 7}
+        records = generate_from_gen(spec, env={})
+        self.assertEqual(len(records), 4)
+        # x/y keys preserved from scan2d, index re-stamped 0..count-1.
+        self.assertEqual([r["index"] for r in records], [0, 1, 2, 3])
+        for r in records:
+            self.assertIn("x", r)
+            self.assertIn("y", r)
+            self.assertEqual(r["count"], 4)
+
+    def test_sample_with_replacement_may_exceed_population(self) -> None:
+        spec = dict(self._grid_spec())
+        spec["sample"] = {"count": 50, "replace": True, "seed": 1}
+        records = generate_from_gen(spec, env={})
+        self.assertEqual(len(records), 50)
+
+    def test_sample_without_replacement_is_distinct(self) -> None:
+        spec = dict(self._grid_spec())
+        spec["sample"] = {"count": 10, "replace": False, "seed": 3}
+        records = generate_from_gen(spec, env={})
+        coords = [(r["x"], r["y"]) for r in records]
+        self.assertEqual(len(coords), 10)
+        self.assertEqual(len(set(coords)), 10)
+
+    def test_sample_without_replacement_rejects_oversized_count(self) -> None:
+        spec = dict(self._grid_spec())
+        spec["sample"] = {"count": 100, "replace": False}
+        with self.assertRaises(ValueError):
+            generate_from_gen(spec, env={})
+
+    def test_sample_seed_is_reproducible(self) -> None:
+        spec = dict(self._grid_spec())
+        spec["sample"] = {"count": 6, "replace": True, "seed": 42}
+        a = generate_from_gen(dict(spec), env={})
+        b = generate_from_gen(dict(spec), env={})
+        self.assertEqual(
+            [(r["x"], r["y"]) for r in a],
+            [(r["x"], r["y"]) for r in b],
+        )
+
+    def test_sample_renders_templates_from_env(self) -> None:
+        spec = dict(self._grid_spec())
+        spec["sample"] = {"count": "${m}", "replace": True, "seed": "${s}"}
+        records = generate_from_gen(spec, env={"m": 3, "s": 5})
+        self.assertEqual(len(records), 3)
+
+    def test_sample_on_scalar_values_generator(self) -> None:
+        spec = {
+            "values": [10, 20, 30, 40],
+            "sample": {"count": 2, "replace": False, "seed": 0},
+        }
+        records = generate_from_gen(spec, env={})
+        self.assertEqual(len(records), 2)
+        self.assertTrue(all(r["value"] in (10, 20, 30, 40) for r in records))
+
+
 if __name__ == "__main__":
     unittest.main()

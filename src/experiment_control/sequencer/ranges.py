@@ -205,7 +205,81 @@ def _generate_scan2d_from_spec(spec: dict[str, Any]) -> list[dict[str, Any]]:
     )
 
 
+def _apply_sample(
+    records: list[dict[str, Any]],
+    sample_spec: Any,
+    env: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Draw `count` records from `records` (with/without replacement).
+
+    The `sample` modifier lets a `for` loop visit a random subset of a
+    generated set — e.g. `m` random spots from a `scan2d` grid — instead
+    of the whole set. `count` is decoupled from the population size:
+    with `replace: true` it may exceed it. Omit `seed` for a fresh draw
+    on every evaluation (the recommended mode for raster scans, since
+    the actual picks are recorded downstream and never need replaying);
+    set `seed` only when you want a deterministic, replayable pattern.
+
+    Sampled records are re-stamped with sequential `index`/`u`/`count`
+    so a bound loop index reflects the draw order (0..count-1), not the
+    original position in the population.
+    """
+    spec = render_templates(sample_spec, env)
+    if not isinstance(spec, dict):
+        raise TypeError("gen.sample must be a dict")
+    count = _coerce_int(spec.get("count"), name="sample.count", minimum=1)
+    replace = bool(spec.get("replace", False))
+    seed_raw = spec.get("seed")
+    seed = int(seed_raw) if seed_raw is not None else None
+
+    n = len(records)
+    if n == 0:
+        return []
+    rng = np.random.default_rng(seed)
+    if replace:
+        indices = rng.integers(0, n, size=count)
+    else:
+        if count > n:
+            raise ValueError(
+                f"sample.count={count} exceeds population size {n} "
+                "with replace=false"
+            )
+        indices = rng.choice(n, size=count, replace=False)
+
+    sampled = [dict(records[int(i)]) for i in indices]
+    total = len(sampled)
+    denom = max(1, total - 1)
+    for new_index, record in enumerate(sampled):
+        record["index"] = new_index
+        record["count"] = total
+        record["u"] = (new_index / denom) if total > 1 else 0.0
+    return sampled
+
+
 def generate_from_gen(
+    gen_spec: dict[str, Any],
+    *,
+    env: dict[str, Any],
+    serpentine_index: int | None = None,
+) -> list[dict[str, Any]]:
+    if not isinstance(gen_spec, dict):
+        raise TypeError("gen spec must be a dict")
+
+    # `sample` is an optional post-modifier that composes with any
+    # generator below (scan2d included). Strip it before dispatch so the
+    # single-generator checks still see exactly one generator key.
+    sample_spec = gen_spec.get("sample")
+    if sample_spec is not None:
+        core_spec = {k: v for k, v in gen_spec.items() if k != "sample"}
+    else:
+        core_spec = gen_spec
+    records = _generate_core(core_spec, env=env, serpentine_index=serpentine_index)
+    if sample_spec is not None:
+        records = _apply_sample(records, sample_spec, env)
+    return records
+
+
+def _generate_core(
     gen_spec: dict[str, Any],
     *,
     env: dict[str, Any],
