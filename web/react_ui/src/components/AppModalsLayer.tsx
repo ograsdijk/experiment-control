@@ -122,6 +122,8 @@ type Props = {
   logRows: LogEntry[];
   logAutoScroll: boolean;
   setLogAutoScroll: Dispatch<SetStateAction<boolean>>;
+  logSortNewestFirst: boolean;
+  setLogSortNewestFirst: Dispatch<SetStateAction<boolean>>;
   logLoading: boolean;
   loadLogTail: () => Promise<unknown> | void;
   logSeenRef: MutableRefObject<Set<string>>;
@@ -188,6 +190,8 @@ export function AppModalsLayer({
   logRows,
   logAutoScroll,
   setLogAutoScroll,
+  logSortNewestFirst,
+  setLogSortNewestFirst,
   logLoading,
   loadLogTail,
   logSeenRef,
@@ -462,6 +466,8 @@ export function AppModalsLayer({
         totalRows={logRows.length}
         autoScroll={logAutoScroll}
         onAutoScrollChange={setLogAutoScroll}
+        sortNewestFirst={logSortNewestFirst}
+        onSortNewestFirstChange={setLogSortNewestFirst}
         loading={logLoading}
         loadLogTail={loadLogTail}
         logSeenRef={logSeenRef}

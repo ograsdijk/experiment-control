@@ -602,6 +602,8 @@ export function App() {
     setLogTextFilter,
     logAutoScroll,
     setLogAutoScroll,
+    logSortNewestFirst,
+    setLogSortNewestFirst,
     logLoading,
     setLogLoading,
     expandedLogByKey,
@@ -736,6 +738,8 @@ export function App() {
     setCommandHistoryLimit,
     commandHistoryAutoScroll,
     setCommandHistoryAutoScroll,
+    commandHistorySortNewestFirst,
+    setCommandHistorySortNewestFirst,
     commandHistoryStatusFilter,
     setCommandHistoryStatusFilter,
     commandHistoryTargetFilter,
@@ -1650,8 +1654,9 @@ export function App() {
     if (!host) {
       return;
     }
-    host.scrollTop = host.scrollHeight;
-  }, [filteredLogRows, logsOpen, logAutoScroll]);
+    // Newest-first puts new entries at the top; follow that edge.
+    host.scrollTop = logSortNewestFirst ? 0 : host.scrollHeight;
+  }, [filteredLogRows, logsOpen, logAutoScroll, logSortNewestFirst]);
 
   useEffect(() => {
     if (!commandHistoryOpen) {
@@ -1664,7 +1669,10 @@ export function App() {
     }
     const thresholdPx = 24;
     const updateNearBottom = () => {
-      const offset = host.scrollHeight - (host.scrollTop + host.clientHeight);
+      // With newest-first the follow edge is the top; otherwise the bottom.
+      const offset = commandHistorySortNewestFirst
+        ? host.scrollTop
+        : host.scrollHeight - (host.scrollTop + host.clientHeight);
       commandHistoryNearBottomRef.current = offset <= thresholdPx;
     };
     updateNearBottom();
@@ -1675,6 +1683,7 @@ export function App() {
   }, [
     commandHistoryOpen,
     commandHistoryMode,
+    commandHistorySortNewestFirst,
     filteredCommandHistoryRows,
     filteredCommandJournalRows,
   ]);
@@ -1693,12 +1702,13 @@ export function App() {
     if (!commandHistoryNearBottomRef.current) {
       return;
     }
-    host.scrollTop = host.scrollHeight;
+    host.scrollTop = commandHistorySortNewestFirst ? 0 : host.scrollHeight;
   }, [
     filteredCommandHistoryRows,
     filteredCommandJournalRows,
     commandHistoryOpen,
     commandHistoryAutoScroll,
+    commandHistorySortNewestFirst,
     commandHistoryMode,
   ]);
 
@@ -3634,6 +3644,8 @@ export function App() {
         logRows={logRows}
         logAutoScroll={logAutoScroll}
         setLogAutoScroll={setLogAutoScroll}
+        logSortNewestFirst={logSortNewestFirst}
+        setLogSortNewestFirst={setLogSortNewestFirst}
         logLoading={logLoading}
         loadLogTail={loadLogTail}
         logSeenRef={logSeenRef}

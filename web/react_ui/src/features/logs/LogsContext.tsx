@@ -1,6 +1,7 @@
 import {
   createContext,
   useContext,
+  useEffect,
   useMemo,
   useRef,
   useState,
@@ -11,6 +12,8 @@ import {
 } from "react";
 
 import type { LogEntry } from "../../types";
+
+const LOG_SORT_NEWEST_FIRST_STORAGE_KEY = "ecui.logSortNewestFirst";
 
 /**
  * Shared state container for the log-viewer UI.
@@ -54,6 +57,9 @@ export interface LogsContextValue {
   setLogTextFilter: Dispatch<SetStateAction<string>>;
   logAutoScroll: boolean;
   setLogAutoScroll: Dispatch<SetStateAction<boolean>>;
+  /** When true, `filteredLogRows` is ordered newest-first. */
+  logSortNewestFirst: boolean;
+  setLogSortNewestFirst: Dispatch<SetStateAction<boolean>>;
   logLoading: boolean;
   setLogLoading: Dispatch<SetStateAction<boolean>>;
   expandedLogByKey: Record<string, boolean>;
@@ -87,6 +93,14 @@ export function LogsProvider({ children }: { children: ReactNode }) {
   const [logProcessFilter, setLogProcessFilter] = useState("all");
   const [logTextFilter, setLogTextFilter] = useState("");
   const [logAutoScroll, setLogAutoScroll] = useState(true);
+  const [logSortNewestFirst, setLogSortNewestFirst] = useState<boolean>(() => {
+    try {
+      const raw = localStorage.getItem(LOG_SORT_NEWEST_FIRST_STORAGE_KEY);
+      return raw === null ? true : raw === "true";
+    } catch {
+      return true;
+    }
+  });
   const [logLoading, setLogLoading] = useState(false);
   const [expandedLogByKey, setExpandedLogByKey] = useState<
     Record<string, boolean>
@@ -97,9 +111,20 @@ export function LogsProvider({ children }: { children: ReactNode }) {
   const logRowsBaselineReadyRef = useRef<boolean>(false);
   const logRowsLastKeyRef = useRef<string | null>(null);
 
+  useEffect(() => {
+    try {
+      localStorage.setItem(
+        LOG_SORT_NEWEST_FIRST_STORAGE_KEY,
+        String(logSortNewestFirst)
+      );
+    } catch {
+      // ignore storage errors
+    }
+  }, [logSortNewestFirst]);
+
   const filteredLogRows = useMemo(() => {
     const needle = logTextFilter.trim().toLowerCase();
-    return logRows.filter((entry) => {
+    const filtered = logRows.filter((entry) => {
       const severity = String(entry.severity ?? "").toLowerCase();
       if (logSeverityFilter !== "all" && severity !== logSeverityFilter) {
         return false;
@@ -124,6 +149,8 @@ export function LogsProvider({ children }: { children: ReactNode }) {
       }`.toLowerCase();
       return haystack.includes(needle);
     });
+    // logRows is stored oldest→newest; reverse for newest-first display.
+    return logSortNewestFirst ? filtered.slice().reverse() : filtered;
   }, [
     logRows,
     logSeverityFilter,
@@ -131,6 +158,7 @@ export function LogsProvider({ children }: { children: ReactNode }) {
     logDeviceFilter,
     logProcessFilter,
     logTextFilter,
+    logSortNewestFirst,
   ]);
 
   const value = useMemo<LogsContextValue>(
@@ -149,6 +177,8 @@ export function LogsProvider({ children }: { children: ReactNode }) {
       setLogTextFilter,
       logAutoScroll,
       setLogAutoScroll,
+      logSortNewestFirst,
+      setLogSortNewestFirst,
       logLoading,
       setLogLoading,
       expandedLogByKey,
@@ -167,6 +197,7 @@ export function LogsProvider({ children }: { children: ReactNode }) {
       logProcessFilter,
       logTextFilter,
       logAutoScroll,
+      logSortNewestFirst,
       logLoading,
       expandedLogByKey,
       filteredLogRows,

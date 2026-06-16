@@ -35,6 +35,8 @@ const COMMAND_HISTORY_LIMIT_BOUNDS = {
 const COMMAND_HISTORY_STORAGE_KEY = "ecui.commandHistory";
 const COMMAND_HISTORY_LIMIT_STORAGE_KEY = "ecui.commandHistoryLimit";
 const COMMAND_HISTORY_AUTOSCROLL_STORAGE_KEY = "ecui.commandHistoryAutoScroll";
+const COMMAND_HISTORY_SORT_NEWEST_FIRST_STORAGE_KEY =
+  "ecui.commandHistorySortNewestFirst";
 const COMMAND_HISTORY_MODE_STORAGE_KEY = "ecui.commandHistoryMode";
 
 const DEFAULT_COMMAND_JOURNAL_LIMIT = 500;
@@ -304,6 +306,17 @@ export function useCommandHistoryController({
       return true;
     }
   });
+  const [commandHistorySortNewestFirst, setCommandHistorySortNewestFirst] =
+    useState(() => {
+      try {
+        return asBoolStorage(
+          localStorage.getItem(COMMAND_HISTORY_SORT_NEWEST_FIRST_STORAGE_KEY),
+          true
+        );
+      } catch {
+        return true;
+      }
+    });
   const [commandHistoryStatusFilter, setCommandHistoryStatusFilter] =
     useState("all");
   const [commandHistoryTargetFilter, setCommandHistoryTargetFilter] =
@@ -400,19 +413,22 @@ export function useCommandHistoryController({
   );
 
   const filteredCommandHistoryRows = useMemo(
-    () =>
-      filterLiveRows(commandHistoryRows, {
+    () => {
+      const out = filterLiveRows(commandHistoryRows, {
         statusFilter: commandHistoryStatusFilter,
         targetFilter: commandHistoryTargetFilter,
         sourceFilter: commandHistorySourceFilter,
         textFilter: commandHistoryTextFilter,
-      }),
+      });
+      return commandHistorySortNewestFirst ? out.slice().reverse() : out;
+    },
     [
       commandHistoryRows,
       commandHistoryStatusFilter,
       commandHistoryTargetFilter,
       commandHistorySourceFilter,
       commandHistoryTextFilter,
+      commandHistorySortNewestFirst,
     ]
   );
 
@@ -434,7 +450,10 @@ export function useCommandHistoryController({
         sourceFilter: commandJournalSourceFilter,
         textFilter: commandJournalTextFilter,
       });
-      return commandJournalLastPerDeviceOnly ? latestPerTargetActionRows(base) : base;
+      const out = commandJournalLastPerDeviceOnly
+        ? latestPerTargetActionRows(base)
+        : base;
+      return commandHistorySortNewestFirst ? out.slice().reverse() : out;
     },
     [
       commandJournalRows,
@@ -443,6 +462,7 @@ export function useCommandHistoryController({
       commandJournalSourceFilter,
       commandJournalTextFilter,
       commandJournalLastPerDeviceOnly,
+      commandHistorySortNewestFirst,
     ]
   );
 
@@ -457,7 +477,7 @@ export function useCommandHistoryController({
   }, [commandJournalRows, selectedCommandJournalIds]);
 
   const commandRestorePreviewRows = useMemo<CommandRestorePreviewRow[]>(() => {
-    return [...selectedCommandJournalRows]
+    const rows = [...selectedCommandJournalRows]
       .sort((a, b) => a.id - b.id)
       .map((row) => {
         let skipReason: string | null = null;
@@ -493,11 +513,13 @@ export function useCommandHistoryController({
           params_json: row.params_json,
         };
       });
+    return commandHistorySortNewestFirst ? rows.slice().reverse() : rows;
   }, [
     selectedCommandJournalRows,
     commandRestoreIncludeFailed,
     commandRestoreIncludeRemote,
     commandRestoreIncludeProcessControl,
+    commandHistorySortNewestFirst,
   ]);
 
   useEffect(() => {
@@ -541,6 +563,17 @@ export function useCommandHistoryController({
       // ignore storage errors
     }
   }, [commandHistoryAutoScroll]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(
+        COMMAND_HISTORY_SORT_NEWEST_FIRST_STORAGE_KEY,
+        String(commandHistorySortNewestFirst)
+      );
+    } catch {
+      // ignore storage errors
+    }
+  }, [commandHistorySortNewestFirst]);
 
   useEffect(() => {
     try {
@@ -801,7 +834,9 @@ export function useCommandHistoryController({
     if (commandRestoreBusy) {
       return null;
     }
-    const preview = commandRestorePreviewRows;
+    // Replay chronologically (oldest→newest) regardless of the display sort
+    // order, so the newest value wins when commands touch the same target.
+    const preview = [...commandRestorePreviewRows].sort((a, b) => a.id - b.id);
     const report: CommandRestoreExecutionReport = {
       attempted: preview.length,
       executed: 0,
@@ -883,6 +918,8 @@ export function useCommandHistoryController({
     setCommandHistoryLimit,
     commandHistoryAutoScroll,
     setCommandHistoryAutoScroll,
+    commandHistorySortNewestFirst,
+    setCommandHistorySortNewestFirst,
     commandHistoryStatusFilter,
     setCommandHistoryStatusFilter,
     commandHistoryTargetFilter,

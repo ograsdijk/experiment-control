@@ -153,19 +153,31 @@ export function CommandHistoryModal({
               { label: "Restore", value: "restore" },
             ]}
           />
-          {(mode === "journal" || mode === "restore") && (
-            <Button
-              size="xs"
-              variant="light"
-              color="gray"
-              loading={controller.commandJournalLoading}
-              onClick={() => {
-                void controller.refreshCommandJournal();
-              }}
-            >
-              Refresh journal
-            </Button>
-          )}
+          <Group gap="xs">
+            <Switch
+              size="sm"
+              checked={controller.commandHistorySortNewestFirst}
+              onChange={(event) =>
+                controller.setCommandHistorySortNewestFirst(
+                  event.currentTarget.checked
+                )
+              }
+              label="Newest first"
+            />
+            {(mode === "journal" || mode === "restore") && (
+              <Button
+                size="xs"
+                variant="light"
+                color="gray"
+                loading={controller.commandJournalLoading}
+                onClick={() => {
+                  void controller.refreshCommandJournal();
+                }}
+              >
+                Refresh journal
+              </Button>
+            )}
+          </Group>
         </Group>
 
         {(mode === "journal" || mode === "restore") && (
