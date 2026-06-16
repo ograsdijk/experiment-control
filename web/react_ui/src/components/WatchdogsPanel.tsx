@@ -96,13 +96,9 @@ export function WatchdogsPanel({
   onToggleWatchdog,
   onClearRuleLatch,
 }: Props) {
-  const formatActionSummary = (action: {
-    device_id: string;
-    action: string;
-    params?: Record<string, unknown>;
-    timeout_s?: number | null;
-    retries?: number;
-  }): string => {
+  const formatActionSummary = (
+    action: NonNullable<WatchdogStatus["rules"][number]["actions"]>[number]
+  ): string => {
     const params = action.params ?? {};
     const entries = Object.entries(params);
     const paramLabel =
@@ -135,7 +131,13 @@ export function WatchdogsPanel({
       typeof action.retries === "number" && Number.isFinite(action.retries)
         ? ` | retries ${Math.max(0, Math.trunc(action.retries))}`
         : "";
-    return `${action.device_id}.${action.action}(${paramLabel})${timeoutLabel}${retriesLabel}`;
+    // Process actions carry process_id and a namespaced verb (e.g.
+    // "sequencer.pause"); device commands use the "<device>.<action>" form.
+    const target =
+      action.process_id != null
+        ? action.action
+        : `${action.device_id}.${action.action}`;
+    return `${target}(${paramLabel})${timeoutLabel}${retriesLabel}`;
   };
 
   return (
