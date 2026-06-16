@@ -248,7 +248,9 @@ export type WatchdogRuleStatus = {
   condition?: unknown;
   telemetry?: InterlockTelemetryStatus[];
   actions?: {
-    device_id: string;
+    // Device commands carry device_id; process actions carry process_id.
+    device_id?: string;
+    process_id?: string;
     action: string;
     params: Record<string, unknown>;
     timeout_s?: number | null;
