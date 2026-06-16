@@ -66,8 +66,10 @@ _WINDOWS_NTSTATUS_DESCRIPTIONS: dict[int, str] = {
 def _coerce_int(rc: object) -> int | None:
     if rc is None:
         return None
+    if not isinstance(rc, (str, bytes, bytearray, int)):
+        return None
     try:
-        return int(rc)  # type: ignore[arg-type]
+        return int(rc)
     except (TypeError, ValueError):
         return None
 

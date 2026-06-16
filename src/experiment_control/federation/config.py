@@ -104,6 +104,8 @@ def _int_value(
             raise ConfigError(".".join(str(p) for p in path), "is required")
         return int(default)
     try:
+        if not isinstance(raw, (str, bytes, bytearray, int)):
+            raise TypeError
         value = int(raw)
     except Exception:
         raise ConfigError(".".join(str(p) for p in path), "must be an integer") from None
@@ -126,6 +128,8 @@ def _float_value(
             raise ConfigError(".".join(str(p) for p in path), "is required")
         return float(default)
     try:
+        if not isinstance(raw, (str, bytes, bytearray, int, float)):
+            raise TypeError
         value = float(raw)
     except Exception:
         raise ConfigError(".".join(str(p) for p in path), "must be a number") from None

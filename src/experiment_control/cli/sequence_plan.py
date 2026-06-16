@@ -547,10 +547,10 @@ class _MermaidBuilder:
         lines = ["flowchart TD"]
         for node_id, (label, shape) in self._nodes.items():
             lines.append(f"  {_format_node(node_id, label, shape=shape)}")
-        for src, dst, label in self._edges:
-            if label:
+        for src, dst, edge_label in self._edges:
+            if edge_label:
                 lines.append(
-                    f'  {src} -->|{_escape_mermaid(label)}| {dst}'
+                    f'  {src} -->|{_escape_mermaid(edge_label)}| {dst}'
                 )
             else:
                 lines.append(f"  {src} --> {dst}")

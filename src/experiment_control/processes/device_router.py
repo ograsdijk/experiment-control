@@ -454,13 +454,13 @@ class _ProcessWorker(_BaseWorker):
                     request_id=task.request_id,
                 )
                 continue
-            resp = self._call(task.endpoint, task.request)
-            if resp is None:
-                resp = {"ok": False, "error": "timeout"}
-            self._publish_process_command(task, resp)
+            call_resp = self._call(task.endpoint, task.request)
+            if call_resp is None:
+                call_resp = {"ok": False, "error": "timeout"}
+            self._publish_process_command(task, call_resp)
             self._enqueue_reply(
                 identity=task.identity,
-                response=resp,
+                response=call_resp,
                 inflight_reserved=task.inflight_reserved,
                 request_id=task.request_id,
             )

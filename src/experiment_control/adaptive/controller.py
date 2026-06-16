@@ -45,8 +45,14 @@ class _AdaptiveGrid1DController:
                 "adaptive.adaptive_grid_1d requires a numeric space parameter (float or int)"
             )
         try:
-            lower = float(self._param_spec.get("min"))
-            upper = float(self._param_spec.get("max"))
+            min_raw = self._param_spec.get("min")
+            max_raw = self._param_spec.get("max")
+            if not isinstance(min_raw, (str, bytes, bytearray, int, float)):
+                raise TypeError
+            if not isinstance(max_raw, (str, bytes, bytearray, int, float)):
+                raise TypeError
+            lower = float(min_raw)
+            upper = float(max_raw)
         except Exception as exc:
             raise TypeError(
                 "adaptive.adaptive_grid_1d requires numeric min/max bounds"
@@ -89,13 +95,13 @@ class _AdaptiveGrid1DController:
                 **self._average_kwargs,
             )
 
-        def _placeholder(x: float) -> float:
+        def _scalar_placeholder(x: float) -> float:
             del x
             return 0.0
 
         return self._construct_learner(
             adaptive_mod.Learner1D,
-            _placeholder,
+            _scalar_placeholder,
             self._bounds,
             loss_per_interval=loss_per_interval,
         )
@@ -117,7 +123,7 @@ class _AdaptiveGrid1DController:
     def _parse_average_kwargs(config: dict[str, Any], repeats: int) -> dict[str, Any]:
         if repeats <= 1:
             return {}
-        params: dict[str, Any] = {
+        params: dict[str, int | float] = {
             "min_samples": repeats,
             "max_samples": repeats,
         }
@@ -139,16 +145,16 @@ class _AdaptiveGrid1DController:
             if name not in config:
                 continue
             try:
-                value = float(config[name])
+                float_value = float(config[name])
             except Exception as exc:
                 raise TypeError(
                     f"adaptive.controller.config.{name} must be finite numeric"
                 ) from exc
-            if not math.isfinite(value):
+            if not math.isfinite(float_value):
                 raise ValueError(
                     f"adaptive.controller.config.{name} must be finite numeric"
                 )
-            params[name] = value
+            params[name] = float_value
         if params["max_samples"] < params["min_samples"]:
             raise ValueError(
                 "adaptive.controller.config.max_samples must be >= min_samples"
@@ -239,6 +245,7 @@ class _AdaptiveGrid1DController:
         kwargs = dict(extra_kwargs)
         if loss_per_interval is None:
             return factory(placeholder, bounds, **kwargs)
+        params: Any
         try:
             params = inspect.signature(factory).parameters
         except Exception:

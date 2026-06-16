@@ -97,7 +97,12 @@ class _WaitState:
     stable_since: float | None = None
 
 
-_NO_STEP_READY = object()
+class _NoStepReady:
+    pass
+
+
+_NO_STEP_READY = _NoStepReady()
+StepResult = Step | _NoStepReady | None
 
 
 class SequencerRuntime:
@@ -394,7 +399,7 @@ class SequencerRuntime:
                 if self._check_stop_pause():
                     return
                 step = self._next_step()
-                if step is _NO_STEP_READY:
+                if isinstance(step, _NoStepReady):
                     return
                 if step is None:
                     if self._state == "RUNNING":
@@ -660,14 +665,11 @@ class SequencerRuntime:
                 return None
             return 1 + (times * inner)
         if isinstance(step, ForStep):
+            loop_index_raw = env.get("__loop_index")
             records = self._estimate_iterable(
                 step.in_expr,
                 env=env,
-                serpentine_index=(
-                    int(env.get("__loop_index"))
-                    if isinstance(env.get("__loop_index"), int)
-                    else None
-                ),
+                serpentine_index=loop_index_raw if isinstance(loop_index_raw, int) else None,
             )
             total = 1
             for index, record in enumerate(records):
@@ -730,7 +732,7 @@ class SequencerRuntime:
             return self._records_from_iterable(rendered)
         return self._records_from_iterable([rendered])
 
-    def _next_step(self) -> Step | None:
+    def _next_step(self) -> StepResult:
         while self._stack:
             frame = self._stack[-1]
             if isinstance(frame, _Frame):
@@ -783,10 +785,15 @@ class SequencerRuntime:
                 proposal = self._prepare_adaptive_proposal(frame)
                 frame.proposal = proposal
                 self._bind_adaptive_proposal(frame.step, proposal)
+                adaptive_frame = frame
+
+                def on_adaptive_exit() -> None:
+                    self._after_adaptive_body(adaptive_frame)
+
                 self._stack.append(
                     _Frame(
                         frame.step.body,
-                        on_exit=(lambda frame=frame: self._after_adaptive_body(frame)),
+                        on_exit=on_adaptive_exit,
                     )
                 )
                 continue
@@ -1251,9 +1258,17 @@ class SequencerRuntime:
             if param_type not in {"float", "int"}:
                 return False
             try:
+                min_raw = spec.get("min")
+                max_raw = spec.get("max")
+                if not isinstance(raw_value, (str, bytes, bytearray, int, float)):
+                    raise TypeError
+                if not isinstance(min_raw, (str, bytes, bytearray, int, float)):
+                    raise TypeError
+                if not isinstance(max_raw, (str, bytes, bytearray, int, float)):
+                    raise TypeError
                 value = float(raw_value)
-                lower = float(spec.get("min"))
-                upper = float(spec.get("max"))
+                lower = float(min_raw)
+                upper = float(max_raw)
             except Exception:
                 return False
             if value < lower or value > upper or upper <= lower:
@@ -1410,9 +1425,17 @@ class SequencerRuntime:
             )
 
         try:
+            min_raw = spec.get("min")
+            max_raw = spec.get("max")
+            if not isinstance(raw_value, (str, bytes, bytearray, int, float)):
+                raise TypeError
+            if not isinstance(min_raw, (str, bytes, bytearray, int, float)):
+                raise TypeError
+            if not isinstance(max_raw, (str, bytes, bytearray, int, float)):
+                raise TypeError
             value = float(raw_value)
-            lower = float(spec.get("min"))
-            upper = float(spec.get("max"))
+            lower = float(min_raw)
+            upper = float(max_raw)
         except Exception as exc:
             raise TypeError(
                 f"adaptive.space.{name} requires numeric min/max and numeric values"
@@ -2084,7 +2107,10 @@ class SequencerRuntime:
                     cached = self._get_telemetry(device, signal)
                     if isinstance(cached, dict):
                         try:
-                            sample_ts = float(cached.get("t_mono"))
+                            t_mono_raw = cached.get("t_mono")
+                            if not isinstance(t_mono_raw, (str, bytes, bytearray, int, float)):
+                                raise TypeError
+                            sample_ts = float(t_mono_raw)
                         except Exception:
                             sample_ts = None
         if sample_ts is None:

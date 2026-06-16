@@ -397,6 +397,20 @@ class Bin2DStatsState:
             raise ValueError("aggregate.bin2d_stats requires x_min < x_max")
         if not y_auto_range and (y_min is None or y_max is None or y_max <= y_min):
             raise ValueError("aggregate.bin2d_stats requires y_min < y_max")
+        if x_auto_range:
+            x_min_value = None
+            x_max_value = None
+        else:
+            assert x_min is not None and x_max is not None
+            x_min_value = float(x_min)
+            x_max_value = float(x_max)
+        if y_auto_range:
+            y_min_value = None
+            y_max_value = None
+        else:
+            assert y_min is not None and y_max is not None
+            y_min_value = float(y_min)
+            y_max_value = float(y_max)
 
         init_x_bins = 0 if x_auto_range or y_auto_range else int(x_bin_count)
         init_y_bins = 0 if x_auto_range or y_auto_range else int(y_bin_count)
@@ -408,10 +422,10 @@ class Bin2DStatsState:
             y_auto_range=y_auto_range,
             x_max_bin_count=int(x_bin_count),
             y_max_bin_count=int(y_bin_count),
-            x_min=None if x_auto_range else float(x_min),
-            x_max=None if x_auto_range else float(x_max),
-            y_min=None if y_auto_range else float(y_min),
-            y_max=None if y_auto_range else float(y_max),
+            x_min=x_min_value,
+            x_max=x_max_value,
+            y_min=y_min_value,
+            y_max=y_max_value,
             counts=np.zeros(shape, dtype=np.int64),
             sums=np.zeros(shape, dtype=np.float64),
             sums_sq=np.zeros(shape, dtype=np.float64),
@@ -2572,7 +2586,7 @@ class StreamAnalysisProcess(ManagedProcessBase):
         existing = self._workspaces.get(workspace_id)
         current_revision = existing.revision if existing is not None else None
         if expected_revision is not None:
-            if existing is None or int(expected_revision) != int(current_revision):
+            if current_revision is None or int(expected_revision) != int(current_revision):
                 raise WorkspaceRevisionConflict(
                     workspace_id=workspace_id,
                     expected_revision=int(expected_revision),
@@ -3185,9 +3199,8 @@ class StreamAnalysisProcess(ManagedProcessBase):
             if selected and len(selected) > 0:
                 channel_index = int(selected[0])
             else:
-                channel_index = _normalize_int(node.params.get("channel_index"))
-                if channel_index is None:
-                    channel_index = 0
+                channel_index_raw = _normalize_int(node.params.get("channel_index"))
+                channel_index = 0 if channel_index_raw is None else channel_index_raw
             trace, channel_count, actual_index = _select_trace(array, channel_index)
             source_channel_index = actual_index
             source_channel_count = channel_count
@@ -3881,12 +3894,13 @@ class StreamAnalysisProcess(ManagedProcessBase):
         # as before. Slow path only triggers when there's actual
         # NaN/Inf to scrub.
         value_arr = trace.astype(np.float64, copy=False).reshape(-1)
+        value_list: list[float | None]
         if value_arr.size == 0 or np.isfinite(value_arr).all():
-            value_list = value_arr.tolist()
+            value_list = list(value_arr.tolist())
         else:
-            value_list = value_arr.tolist()
+            value_list = list(value_arr.tolist())
             for i, x in enumerate(value_list):
-                if not math.isfinite(x):
+                if x is not None and not math.isfinite(x):
                     value_list[i] = None
         snapshot_payload: Json = {
             "version": 1,
@@ -4638,8 +4652,8 @@ class StreamAnalysisProcess(ManagedProcessBase):
                 return self.rpc_invalid_params(
                     req, message="node_id requires workspace_id"
                 )
-            for workspace in self._workspaces.values():
-                self._reset_workspace_states(workspace)
+            for workspace_runtime in self._workspaces.values():
+                self._reset_workspace_states(workspace_runtime)
             self._latest_output_payloads.clear()
             return self.rpc_ok(req, result={"reset": "all", "count": len(self._workspaces)})
         workspace = self._workspaces.get(workspace_id)

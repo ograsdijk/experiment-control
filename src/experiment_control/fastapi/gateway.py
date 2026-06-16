@@ -923,12 +923,12 @@ class StreamFrameHub:
                     if seq <= msg_seq:
                         stream_events.append(event)
             if not stream_events:
-                bucket = self._context_by_seq.get(key)
-                if bucket is not None:
-                    stale = [seq for seq in bucket.keys() if int(seq) <= int(last_seq)]
+                context_bucket = self._context_by_seq.get(key)
+                if context_bucket is not None:
+                    stale = [seq for seq in context_bucket.keys() if int(seq) <= int(last_seq)]
                     for seq in stale:
-                        bucket.pop(seq, None)
-                    if not bucket:
+                        context_bucket.pop(seq, None)
+                    if not context_bucket:
                         self._context_by_seq.pop(key, None)
                 continue
 
@@ -960,12 +960,12 @@ class StreamFrameHub:
                 latest_seq = max(latest_seq, seq_raw)
                 event_context_id: int | None = None
                 event_context_fields: dict[str, Any] | None = None
-                bucket = self._context_by_seq.get(key)
-                if bucket is not None:
-                    item = bucket.pop(int(seq_raw), None)
+                seq_context_bucket = self._context_by_seq.get(key)
+                if seq_context_bucket is not None:
+                    item = seq_context_bucket.pop(int(seq_raw), None)
                     if item is not None:
                         event_context_id, event_context_fields = item
-                    if not bucket:
+                    if not seq_context_bucket:
                         self._context_by_seq.pop(key, None)
                 if (
                     event_context_id is None
@@ -1047,12 +1047,12 @@ class StreamFrameHub:
                     self._loop.call_soon_threadsafe(self._fanout, msg)
 
             self._last_seq[key] = latest_seq
-            bucket = self._context_by_seq.get(key)
-            if bucket is not None:
-                stale = [seq for seq in bucket.keys() if int(seq) <= int(latest_seq)]
+            context_bucket = self._context_by_seq.get(key)
+            if context_bucket is not None:
+                stale = [seq for seq in context_bucket.keys() if int(seq) <= int(latest_seq)]
                 for seq in stale:
-                    bucket.pop(seq, None)
-                if not bucket:
+                    context_bucket.pop(seq, None)
+                if not context_bucket:
                     self._context_by_seq.pop(key, None)
             if current_context_id is None and current_context_fields is None:
                 self._stream_context.pop(key, None)

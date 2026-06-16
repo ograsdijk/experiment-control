@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 Json = dict[str, Any]
 RpcHandler = Callable[[Json], Json]
@@ -16,8 +16,8 @@ class RpcDispatchRegistry:
     def __init__(
         self,
         *,
-        handlers: dict[str, RpcHandler],
-        aliases: dict[str, str] | None = None,
+        handlers: Mapping[str, RpcHandler],
+        aliases: Mapping[str, str] | None = None,
     ) -> None:
         self._handlers: dict[str, RpcHandler] = {}
         for action, handler in handlers.items():

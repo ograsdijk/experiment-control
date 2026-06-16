@@ -318,13 +318,14 @@ class FederationHub:
         peer_rt.last_rpc_ok_mono = time.monotonic()
         peer_rt.last_error = None
         mirror.last_error = None
+        result = resp.get("result")
         if (
             rtype == "command"
             and str(req.get("action", "")) == "capabilities"
             and bool(resp.get("ok"))
-            and isinstance(resp.get("result"), dict)
+            and isinstance(result, dict)
         ):
-            mirror.capabilities = dict(resp.get("result"))
+            mirror.capabilities = dict(result)
         return resp
 
     def update_capabilities(self, device_id: str, capabilities: Json) -> None:
@@ -391,12 +392,10 @@ class FederationHub:
                     "params": {},
                 },
             )
-            if (
-                isinstance(resp, dict)
-                and bool(resp.get("ok"))
-                and isinstance(resp.get("result"), dict)
-            ):
-                mirror.capabilities = dict(resp.get("result"))
+            if isinstance(resp, dict) and bool(resp.get("ok")):
+                result = resp.get("result")
+                if isinstance(result, dict):
+                    mirror.capabilities = dict(result)
 
     def _rewrite_config_payload(self, mirror: MirroredDeviceRuntime, payload: Json) -> Json:
         out = dict(payload)

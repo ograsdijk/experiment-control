@@ -111,8 +111,10 @@ def _parse_port(raw: object, *, default: int, path: list[str | int]) -> int:
             if not text:
                 return int(default)
             port = int(text)
-        else:
+        elif isinstance(raw, int):
             port = int(raw)
+        else:
+            raise TypeError
     except Exception:
         raise ConfigError(".".join(str(p) for p in path), "must be an integer") from None
     if port <= 0 or port > 65535:

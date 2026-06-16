@@ -94,14 +94,14 @@ class StreamOut:
             raise ValueError("StreamOut.kind must be 'frame' or 'records'.")
         object.__setattr__(self, "kind", kind)
         if kind == "frame":
-            dtype = str(self.dtype).strip()
-            if not dtype:
+            dtype_text = str(self.dtype).strip()
+            if not dtype_text:
                 raise ValueError("Frame StreamOut.dtype must be non-empty.")
-            _ = np.dtype(dtype)
+            _ = np.dtype(dtype_text)
             shape = tuple(int(x) for x in self.shape)
             if not shape or any(x <= 0 for x in shape):
                 raise ValueError("Frame StreamOut.shape must be a non-empty positive tuple.")
-            object.__setattr__(self, "dtype", dtype)
+            object.__setattr__(self, "dtype", dtype_text)
             object.__setattr__(self, "shape", shape)
             object.__setattr__(self, "fields", ())
             return
@@ -114,8 +114,8 @@ class StreamOut:
             if field_item.name in names:
                 raise ValueError(f"Duplicate record field name {field_item.name!r}.")
             names.add(field_item.name)
-        dtype = np.dtype([(f.name, np.dtype(f.dtype)) for f in fields])
-        object.__setattr__(self, "dtype", str(dtype))
+        record_dtype = np.dtype([(f.name, np.dtype(f.dtype)) for f in fields])
+        object.__setattr__(self, "dtype", str(record_dtype))
         object.__setattr__(self, "shape", ())
         object.__setattr__(self, "fields", fields)
 

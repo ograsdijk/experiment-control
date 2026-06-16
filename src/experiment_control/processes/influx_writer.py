@@ -271,17 +271,19 @@ def _timestamp_ns_from_payload(
     ts_obj = signal_payload.get("ts")
     if isinstance(ts_obj, dict):
         t_wall = ts_obj.get("t_wall")
-        try:
-            return int(float(t_wall) * 1_000_000_000)
-        except Exception:
-            pass
+        if isinstance(t_wall, (str, bytes, bytearray, int, float)):
+            try:
+                return int(float(t_wall) * 1_000_000_000)
+            except Exception:
+                pass
     ts_obj = bundle_payload.get("ts")
     if isinstance(ts_obj, dict):
         t_wall = ts_obj.get("t_wall")
-        try:
-            return int(float(t_wall) * 1_000_000_000)
-        except Exception:
-            pass
+        if isinstance(t_wall, (str, bytes, bytearray, int, float)):
+            try:
+                return int(float(t_wall) * 1_000_000_000)
+            except Exception:
+                pass
     return int(time.time() * 1_000_000_000)
 
 
@@ -289,10 +291,11 @@ def _timestamp_ns_from_bundle(payload: Json) -> int:
     ts_obj = payload.get("ts")
     if isinstance(ts_obj, dict):
         t_wall = ts_obj.get("t_wall")
-        try:
-            return int(float(t_wall) * 1_000_000_000)
-        except Exception:
-            pass
+        if isinstance(t_wall, (str, bytes, bytearray, int, float)):
+            try:
+                return int(float(t_wall) * 1_000_000_000)
+            except Exception:
+                pass
     signals = payload.get("signals")
     if isinstance(signals, dict):
         for signal_payload in signals.values():

@@ -339,20 +339,20 @@ def _parse_profiles(raw: object) -> tuple[MeasurementProfile, ...]:
         label = optional_str(obj.get("label"), path=["profiles", i, "label"]) or profile_id
         description = optional_str(obj.get("description"), path=["profiles", i, "description"])
         fields_raw = normalize_list(obj.get("fields"), path=["profiles", i, "fields"])
-        fields: list[MeasurementField] = []
-        field_keys: set[str] = set()
+        profile_fields: list[MeasurementField] = []
+        profile_field_keys: set[str] = set()
         for j, field_raw in enumerate(fields_raw):
             field = _parse_field(field_raw, path=["profiles", i, "fields", j])
-            if field.key in field_keys:
+            if field.key in profile_field_keys:
                 raise _err(["profiles", i, "fields", j, "key"], "duplicate key")
-            field_keys.add(field.key)
-            fields.append(field)
+            profile_field_keys.add(field.key)
+            profile_fields.append(field)
         out.append(
             MeasurementProfile(
                 profile_id=profile_id,
                 label=label,
                 description=description,
-                fields=tuple(fields),
+                fields=tuple(profile_fields),
             )
         )
     return tuple(out)

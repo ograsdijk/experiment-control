@@ -153,7 +153,7 @@ class DummyResonanceTraceDriver:
                     0.0, self.trace_noise_sigma_counts, size=self.n_points
                 )
             else:
-                noise = 0.0
+                noise = np.zeros(self.n_points, dtype=np.float64)
             trace = np.asarray(signal + noise, dtype=np.float64)
             trace = np.clip(
                 np.rint(trace),

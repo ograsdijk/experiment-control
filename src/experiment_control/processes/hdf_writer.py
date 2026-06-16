@@ -25,6 +25,7 @@ from ..schemas.measurement import (
     normalize_measurement_values,
 )
 from ..shm.shm_ring import ShmRingReader
+from ..types import MemberSpec
 from ..utils.cli_args import (
     add_heartbeat_args,
     add_manager_args,
@@ -1053,7 +1054,7 @@ class HdfWriter(ManagedProcessBase):
         bg = self._bg_thread
         if bg is None or not bg.is_alive():
             return
-        if not self._h5_lock._is_owned():
+        if not bool(cast(Any, self._h5_lock)._is_owned()):
             raise AssertionError(
                 "hdf_writer mutation site invoked without _h5_lock while "
                 "the bg flush thread is live; this is a thread-safety "
@@ -2321,8 +2322,8 @@ class HdfWriter(ManagedProcessBase):
             "error": err,
         }
 
-    def _hdf_capability_members(self) -> list[Json]:
-        members = [
+    def _hdf_capability_members(self) -> list[MemberSpec]:
+        members: list[MemberSpec] = [
             method("hdf.status", params=None, doc="Get writer status."),
             method(
                 "hdf.writing.start",
@@ -3459,6 +3460,8 @@ class HdfWriter(ManagedProcessBase):
         for name, dtype in spec.items():
             if not name:
                 continue
+            ds_dtype: np.dtype[Any]
+            missing: object
             if dtype == "int64":
                 ds_dtype = np.dtype("int64")
                 missing = -1
@@ -3828,15 +3831,15 @@ class HdfWriter(ManagedProcessBase):
                             if name and dtype_text:
                                 field_specs.append((name, dtype_text))
                         dtype = np.dtype(field_specs)
-                        shape = ()
+                        stream_shape: tuple[int, ...] = ()
                     else:
                         dtype = np.dtype(str(out.get("dtype")))
                         shape_raw = out.get("shape", []) or []
-                        shape = tuple(int(x) for x in shape_raw)
+                        stream_shape = tuple(int(x) for x in shape_raw)
                     key = (device_id, stream)
-                    self._stream_schema[key] = {"dtype": dtype, "shape": shape}
+                    self._stream_schema[key] = {"dtype": dtype, "shape": stream_shape}
                     try:
-                        expected = int(dtype.itemsize * int(np.prod(shape, dtype=np.int64)))
+                        expected = int(dtype.itemsize * int(np.prod(stream_shape, dtype=np.int64)))
                         self._stream_expected_nbytes[key] = expected
                     except Exception:
                         self._stream_expected_nbytes.pop(key, None)

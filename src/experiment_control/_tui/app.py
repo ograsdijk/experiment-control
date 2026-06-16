@@ -5,7 +5,7 @@ import queue
 import threading
 import time
 from collections import deque
-from typing import Any
+from typing import Any, Literal
 
 import zmq
 from rich.text import Text
@@ -176,7 +176,7 @@ class ManagerTUI(App):
         self._topic_counts: dict[str, int] = {}
         self._topic_visible: dict[str, bool] = {}
         self._dropped_pub_messages = 0
-        self._errors = deque(maxlen=200)
+        self._errors: deque[Json] = deque(maxlen=200)
         self._seen_error_fingerprints: set[str] = set()
         self._seen_error_fingerprint_order: deque[str] = deque(maxlen=2000)
         self._last_manager_log_t_mono: float | None = None
@@ -517,9 +517,9 @@ class ManagerTUI(App):
         if self._severity_rank(severity) < self._severity_rank("warning"):
             ts = entry.get("ts")
             if isinstance(ts, dict):
-                t_mono = ts.get("t_mono")
-                if isinstance(t_mono, (int, float)):
-                    t_mono_f = float(t_mono)
+                log_t_mono = ts.get("t_mono")
+                if isinstance(log_t_mono, (int, float)):
+                    t_mono_f = float(log_t_mono)
                     if (
                         self._last_manager_log_t_mono is None
                         or t_mono_f > self._last_manager_log_t_mono
@@ -839,9 +839,9 @@ class ManagerTUI(App):
                     if not pid:
                         continue
                     next_proc_map[pid] = proc
-                    prev = old_proc_map.get(pid)
-                    if isinstance(prev, dict):
-                        prev_pid = prev.get("pid")
+                    prev_proc = old_proc_map.get(pid)
+                    if isinstance(prev_proc, dict):
+                        prev_pid = prev_proc.get("pid")
                         next_pid = proc.get("pid")
                         if prev_pid != next_pid:
                             self._proc_cap_cache.pop(pid, None)
@@ -1416,8 +1416,15 @@ class ManagerTUI(App):
                 return False
 
         self._last_toast_by_key[key] = (fingerprint, now)
+        severity_value: Literal["information", "warning", "error"]
+        if severity == "information":
+            severity_value = "information"
+        elif severity == "error":
+            severity_value = "error"
+        else:
+            severity_value = "warning"
         try:
-            self.notify(message, severity=severity)
+            self.notify(message, severity=severity_value)
         except Exception:
             self.notify(message)
         return True
@@ -2392,7 +2399,7 @@ class ManagerTUI(App):
             self.notify(f"Driver already stopped: {device_id}")
             return
 
-        def _on_dismiss(confirmed: bool | None) -> None:
+        def _on_driver_stop_dismiss(confirmed: bool | None) -> None:
             if not confirmed:
                 return
             resp = self._rpc_call(
@@ -2400,7 +2407,8 @@ class ManagerTUI(App):
             )
             self._notify_rpc_result("Driver stop", device_id, resp)
 
-        self.push_screen(ConfirmScreen(f"Stop driver for {device_id}?"), _on_dismiss)
+        self.push_screen(ConfirmScreen(f"Stop driver for {device_id}?"), _on_driver_stop_dismiss)
+
 
     def action_driver_restart(self) -> None:
         if self._action_target() == "process":
@@ -2408,7 +2416,7 @@ class ManagerTUI(App):
             if not process_id:
                 return
 
-            def _on_dismiss(confirmed: bool | None) -> None:
+            def _on_process_restart_dismiss(confirmed: bool | None) -> None:
                 if not confirmed:
                     return
                 resp = self._rpc_call(
@@ -2417,7 +2425,7 @@ class ManagerTUI(App):
                 self._notify_rpc_result("Process restart", process_id, resp)
 
             self.push_screen(
-                ConfirmScreen(f"Restart process {process_id}?"), _on_dismiss
+                ConfirmScreen(f"Restart process {process_id}?"), _on_process_restart_dismiss
             )
             return
 
@@ -2425,7 +2433,7 @@ class ManagerTUI(App):
         if not device_id:
             return
 
-        def _on_dismiss(confirmed: bool | None) -> None:
+        def _on_driver_restart_dismiss(confirmed: bool | None) -> None:
             if not confirmed:
                 return
             resp = self._rpc_call(
@@ -2437,7 +2445,7 @@ class ManagerTUI(App):
             )
             self._notify_rpc_result("Driver restart", device_id, resp)
 
-        self.push_screen(ConfirmScreen(f"Restart driver for {device_id}?"), _on_dismiss)
+        self.push_screen(ConfirmScreen(f"Restart driver for {device_id}?"), _on_driver_restart_dismiss)
 
     async def on_key(self, event: events.Key) -> None:  # type: ignore[override]
         # Work around cases where focused widgets swallow app bindings.
@@ -2476,7 +2484,7 @@ class ManagerTUI(App):
         # per-item loop runs on a worker thread so the UI stays
         # responsive while N processes/drivers shut down sequentially.
         if self._action_target() == "process":
-            def _on_dismiss(confirmed: bool | None) -> None:
+            def _on_processes_stop_all_dismiss(confirmed: bool | None) -> None:
                 if not confirmed:
                     return
                 items = [
@@ -2493,10 +2501,10 @@ class ManagerTUI(App):
                     error_log_prefix="PROC STOP",
                 )
 
-            self.push_screen(ConfirmScreen("Stop all processes?"), _on_dismiss)
+            self.push_screen(ConfirmScreen("Stop all processes?"), _on_processes_stop_all_dismiss)
             return
 
-        def _on_dismiss(confirmed: bool | None) -> None:
+        def _on_drivers_stop_all_dismiss(confirmed: bool | None) -> None:
             if not confirmed:
                 return
             items = [
@@ -2511,7 +2519,7 @@ class ManagerTUI(App):
                 error_log_prefix="DRIVER STOP",
             )
 
-        self.push_screen(ConfirmScreen("Stop all drivers?"), _on_dismiss)
+        self.push_screen(ConfirmScreen("Stop all drivers?"), _on_drivers_stop_all_dismiss)
 
 
 def main() -> None:

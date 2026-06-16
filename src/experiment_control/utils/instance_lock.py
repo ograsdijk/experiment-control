@@ -154,9 +154,12 @@ class InstanceLock:
             return None
         pid_raw = raw.get("pid")
         try:
+            if not isinstance(pid_raw, (str, bytes, bytearray, int)):
+                raise TypeError
             pid = int(pid_raw)
         except Exception:
             pid = -1
+        acquired_wall_raw = raw.get("acquired_wall_s")
         return InstanceLockInfo(
             instance_id=str(raw.get("instance_id", "") or "").strip(),
             pid=pid,
@@ -164,8 +167,8 @@ class InstanceLock:
             manager_rpc=str(raw.get("manager_rpc", "") or "").strip(),
             lock_path=str(path),
             acquired_wall_s=(
-                float(raw.get("acquired_wall_s"))
-                if isinstance(raw.get("acquired_wall_s"), (int, float))
+                float(acquired_wall_raw)
+                if isinstance(acquired_wall_raw, (int, float))
                 else None
             ),
         )
