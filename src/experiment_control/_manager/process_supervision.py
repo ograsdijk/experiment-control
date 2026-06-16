@@ -1412,12 +1412,18 @@ def enforce_managed_process_stop_timeout(
     handle: Any,
     now_mono: float,
 ) -> None:
-    if (
-        str(handle.state) != "STOPPING"
-        or handle.stop_requested_t_mono is None
-        or handle.popen is None
-        or handle.popen.poll() is not None
-    ):
+    if str(handle.state) != "STOPPING":
+        return
+    if handle.popen is None or handle.popen.poll() is not None:
+        # Process is gone or already exited; the supervise poll-block and
+        # update_managed_process_exit_state own that transition.
+        return
+    if handle.stop_requested_t_mono is None:
+        # Defensive: a STOPPING handle with a live process must always carry
+        # a stop deadline, otherwise the force-kill escalation can never fire
+        # and the handle wedges in STOPPING forever (the restart-vs-backoff
+        # race that cleared this field). Re-arm instead of returning forever.
+        handle.stop_requested_t_mono = now_mono
         return
     if now_mono - handle.stop_requested_t_mono <= handle.spec.shutdown_timeout_s:
         return
@@ -1449,6 +1455,17 @@ def maybe_restart_managed_process(manager: Any, handle: Any, now_mono: float) ->
         if handle.stop_requested_t_mono is None:
             manager._maybe_schedule_restart(handle, now_mono)
     if handle.next_restart_t_mono is not None and now_mono >= handle.next_restart_t_mono:
+        # Do NOT respawn while the previous process is still alive. Default
+        # restart_backoff_s (0.5) is shorter than shutdown_timeout_s (3.0),
+        # so a restart can come due before a slow graceful shutdown finishes.
+        # try_restart_process would clear stop_requested_t_mono and call
+        # start_process_handle, which bails (old popen still alive) — leaving
+        # the handle stuck in STOPPING with the kill-escalation disabled.
+        # Wait for the old process to exit (or be force-killed by
+        # enforce_managed_process_stop_timeout) first; the restart fires on a
+        # later tick once popen is gone.
+        if handle.popen is not None and handle.popen.poll() is None:
+            return
         manager._try_restart_process(handle)
 
 

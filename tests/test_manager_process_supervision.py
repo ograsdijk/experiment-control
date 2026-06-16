@@ -12,7 +12,14 @@ if str(SRC) not in sys.path:
 
 from experiment_control._manager.process_supervision import (  # noqa: E402
     enforce_managed_process_heartbeat_timeout,
+    enforce_managed_process_stop_timeout,
+    maybe_restart_managed_process,
+    maybe_schedule_restart,
     process_snapshot,
+    start_process_handle,
+    stop_process_handle,
+    try_restart_process,
+    update_managed_process_exit_state,
 )
 
 
@@ -320,6 +327,112 @@ class ProcessSnapshotMemoryTests(unittest.TestCase):
         snap = process_snapshot(manager, handle)
         self.assertIsNotNone(snap["hb_age_s"])
         self.assertLess(float(snap["hb_age_s"]), 0.5)
+
+
+class _AlwaysAlivePopen:
+    """A process that never exits (poll() stays None) and records kills.
+
+    Models a managed process whose graceful shutdown is slow / ignored —
+    the case that exposes the restart-vs-stop-escalation race.
+    """
+
+    def __init__(self) -> None:
+        self.terminated = False
+        self.kill_called = False
+        self.pid = 4242
+
+    def poll(self) -> None:
+        return None
+
+    def terminate(self) -> None:
+        self.terminated = True
+
+    def kill(self) -> None:
+        self.kill_called = True
+
+
+def _make_restart_handle() -> SimpleNamespace:
+    handle = _make_handle()
+    # Match the b-detection sequencer/watchdog config that wedged:
+    # restart_backoff_s (0.5) < shutdown_timeout_s (3.0).
+    handle.spec.shutdown_timeout_s = 3.0
+    handle.spec.restart_backoff_s = 0.5
+    handle.spec.restart_policy = "NEVER"
+    handle.spec.max_restarts = None
+    handle.state = "RUNNING"
+    handle.popen = _AlwaysAlivePopen()
+    handle.rpc_endpoint = "inproc://fake-proc-rpc"  # so the graceful path is taken
+    handle.next_restart_t_mono = None
+    return handle
+
+
+def _make_restart_manager(events: list) -> SimpleNamespace:
+    manager = SimpleNamespace()
+    manager._device_rpc_timeout_ms = 500
+    # Graceful process.stop is acked OK (process says "ok" then is slow to exit).
+    manager._call_process_rpc = lambda **_kw: {"ok": True}
+    manager._close_process_rpc = lambda _h: None
+    manager._publish_process_event = lambda topic, h: events.append(topic)
+    manager._maybe_recover_process_start_collision = lambda _h: False
+    # Wire the mixin-style indirections back to the real module functions
+    # so we exercise the real stop/restart/escalation logic.
+    manager._maybe_schedule_restart = lambda h, now: maybe_schedule_restart(manager, h, now)
+    manager._try_restart_process = lambda h: try_restart_process(manager, h)
+    manager._start_process_handle = lambda h: start_process_handle(manager, h)
+    manager._update_managed_process_exit_state = (
+        lambda h, rc: update_managed_process_exit_state(manager, h, rc)
+    )
+    return manager
+
+
+class RestartStopTimeoutRaceTests(unittest.TestCase):
+    """Regression: a UI restart of a process whose graceful shutdown takes
+    longer than restart_backoff_s must not wedge the handle in STOPPING.
+
+    Before the fix: restart_process schedules a respawn at +backoff (0.5s);
+    try_restart_process clears stop_requested_t_mono and calls
+    start_process_handle, which bails because the old process is still
+    alive — leaving state=STOPPING with stop_requested_t_mono=None, which
+    permanently disables the stop-timeout force-kill escalation.
+    """
+
+    def _drive_restart(self) -> tuple[SimpleNamespace, SimpleNamespace]:
+        events: list = []
+        manager = _make_restart_manager(events)
+        handle = _make_restart_handle()
+
+        # --- emulate manager.restart_process(): graceful stop + schedule ---
+        stop_process_handle(manager, handle)
+        self.assertEqual(handle.state, "STOPPING")
+        t0 = handle.stop_requested_t_mono
+        self.assertIsNotNone(t0)
+        handle.next_restart_t_mono = t0 + handle.spec.restart_backoff_s
+
+        # --- supervise ticks (minus heartbeat) while the process refuses
+        #     to exit, from before the backoff to past the shutdown window ---
+        now = t0
+        while now < t0 + 6.0:
+            now += 0.1
+            rc = handle.popen.poll()
+            if rc is not None:
+                if manager._update_managed_process_exit_state(handle, int(rc)):
+                    continue
+            else:
+                enforce_managed_process_stop_timeout(manager, handle, now)
+                maybe_restart_managed_process(manager, handle, now)
+        return manager, handle
+
+    def test_restart_with_slow_exit_does_not_wedge_in_stopping(self) -> None:
+        _manager, handle = self._drive_restart()
+        # The non-exiting old process MUST be force-killed by the
+        # stop-timeout escalation...
+        self.assertTrue(
+            handle.popen.kill_called,
+            "stop-timeout escalation never force-killed the old process — "
+            "handle is wedged in STOPPING",
+        )
+        # ...and the handle must reach a terminal state, not sit in STOPPING.
+        self.assertNotEqual(handle.state, "STOPPING")
 
 
 if __name__ == "__main__":
