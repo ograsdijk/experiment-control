@@ -23,6 +23,8 @@ type Props = {
   valueOptions?: ReadonlyArray<SelectOption>;
   issueCount?: number;
   issueText?: string | null;
+  onAdd?: () => void;
+  valuePlaceholderResolver?: (entry: SequencerOutlineMetadataEntry) => string;
 };
 
 function nextEntryName(
@@ -52,6 +54,8 @@ export function KeyValueChipList({
   valueOptions,
   issueCount = 0,
   issueText = null,
+  onAdd,
+  valuePlaceholderResolver,
 }: Props) {
   const updateEntry = (index: number, patch: Partial<SequencerOutlineMetadataEntry>) => {
     onChange(
@@ -92,7 +96,7 @@ export function KeyValueChipList({
           size="compact-xs"
           variant="light"
           leftSection={<IconPlus size={14} />}
-          onClick={addEntry}
+          onClick={onAdd ?? addEntry}
         >
           {addLabel}
         </Button>
@@ -124,7 +128,7 @@ export function KeyValueChipList({
                   <Select
                     size="xs"
                     aria-label={valueLabel}
-                    placeholder="value"
+                    placeholder={valuePlaceholderResolver ? valuePlaceholderResolver(entry) : "value"}
                     variant="unstyled"
                     data={Array.from(
                       new Map(
@@ -151,7 +155,7 @@ export function KeyValueChipList({
                   <TextInput
                     size="xs"
                     aria-label={valueLabel}
-                    placeholder="value"
+                    placeholder={valuePlaceholderResolver ? valuePlaceholderResolver(entry) : "value"}
                     variant="unstyled"
                     value={entry.value ?? ""}
                     onChange={(event) =>
