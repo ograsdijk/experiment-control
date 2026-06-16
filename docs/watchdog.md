@@ -100,9 +100,23 @@ Stable timer logic:
 
 ## Actions
 
-Currently supported action type: **command**.
+Each action is **exactly one** of two types — `command` (device RPC) or
+`process` (process RPC). Mixing both keys in one action, or neither, is a
+config error.
 
-Each action sends a command via the manager:
+```yaml
+actions:
+  - command:                 # device RPC
+      device_id: hv
+      action: enable_output
+      params: {enabled: false}
+  - process:                 # process RPC (e.g. pause the sequencer)
+      process_id: sequencer
+      action: sequencer.pause
+      params: {}
+```
+
+A `command` action sends a device command via the manager:
 
 ```json
 {
@@ -114,9 +128,35 @@ Each action sends a command via the manager:
 }
 ```
 
+A `process` action wraps the verb in the manager's process-RPC envelope:
+
+```json
+{
+  "type": "manager.processes.rpc",
+  "process_id": "sequencer",
+  "request": {"type": "sequencer.pause", "params": {}},
+  "caller_process_id": "watchdog"
+}
+```
+
+A failed action (e.g. `sequencer.pause` when the sequencer is not running →
+`process_not_running`) is published as `manager.watchdog.action_failed` and does
+**not** block the remaining actions in the rule.
+
 Retries:
 - `retries: 0` = one attempt
 - `retries: 1` = two attempts
+
+### Implementation note (cleanup debt)
+
+The `manager.processes.rpc` envelope above is hand-built in three places —
+`WatchdogProcess._execute_actions`, `client/apis/_base` (the SDK facade), and
+`fastapi/app.py` (the gateway) — and `StateMachineProcessBase.command()`
+similarly hand-builds the `command` envelope. If the envelope shape changes,
+all of these must be updated in lockstep. A shared builder (on
+`ManagedProcessBase` or a small helper) would centralize it. Deferred:
+low-risk while the shapes are stable, and the right fix spans the SDK + gateway
+beyond the watchdog.
 
 ## Watchdog RPC (via `manager.processes.rpc`)
 
