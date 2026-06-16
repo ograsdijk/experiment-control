@@ -30,6 +30,8 @@ type Props = {
   totalRows: number;
   autoScroll: boolean;
   onAutoScrollChange: (value: boolean) => void;
+  sortNewestFirst: boolean;
+  onSortNewestFirstChange: (value: boolean) => void;
   loading: boolean;
   onReload: () => void;
   onClear: () => void;
@@ -60,6 +62,8 @@ export function LogsModal({
   totalRows,
   autoScroll,
   onAutoScrollChange,
+  sortNewestFirst,
+  onSortNewestFirstChange,
   loading,
   onReload,
   onClear,
@@ -102,6 +106,14 @@ export function LogsModal({
             </Text>
           </Group>
           <Group gap="xs">
+            <Switch
+              size="sm"
+              checked={sortNewestFirst}
+              onChange={(event) =>
+                onSortNewestFirstChange(event.currentTarget.checked)
+              }
+              label="Newest first"
+            />
             <Switch
               size="sm"
               checked={autoScroll}
