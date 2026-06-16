@@ -187,32 +187,37 @@ class LifecycleMixin(_MixinBase):
                 managed_process_running = _MPS.RUNNING
             if driver_state_ok is None:
                 driver_state_ok = _DS.OK
-        self._ensure_router_running(timeout_s=timeout_s, poll_ms=poll_ms)
-        self._federation_hub.activate()
-        if wait_processes_running is None:
-            wait_processes_running = start_processes
-        if start_processes:
-            self.start_all_processes()
-        deadline = time.monotonic() + timeout_s
-        if wait_processes_running:
-            self._wait_processes_running(
-                deadline=deadline,
-                poll_ms=poll_ms,
-                managed_process_running=managed_process_running,
-            )
-        if start_drivers:
-            self.start_all_drivers()
-        if wait_for_registered:
-            self._wait_registered(deadline=deadline, poll_ms=poll_ms)
-        do_connect = bool(connect) if connect is not None else False
-        if do_connect:
-            self.connect_all_devices()
-        if wait_for_online:
-            self._wait_online(
-                deadline=deadline,
-                poll_ms=poll_ms,
-                driver_state_ok=driver_state_ok,
-            )
+        self._startup_sequence_active = True
+        try:
+            self._ensure_router_running(timeout_s=timeout_s, poll_ms=poll_ms)
+            self._federation_hub.activate()
+            if wait_processes_running is None:
+                wait_processes_running = start_processes
+            if start_processes:
+                self.start_all_processes()
+            deadline = time.monotonic() + timeout_s
+            if wait_processes_running:
+                self._wait_processes_running(
+                    deadline=deadline,
+                    poll_ms=poll_ms,
+                    managed_process_running=managed_process_running,
+                )
+            if start_drivers:
+                self.start_all_drivers()
+            if wait_for_registered:
+                self._wait_registered(deadline=deadline, poll_ms=poll_ms)
+            do_connect = bool(connect) if connect is not None else False
+            if do_connect:
+                self.connect_all_devices()
+            if wait_for_online:
+                self._wait_online(
+                    deadline=deadline,
+                    poll_ms=poll_ms,
+                    driver_state_ok=driver_state_ok,
+                )
+        finally:
+            self._startup_sequence_active = False
+            self._startup_sequence_complete_mono = time.monotonic()
 
     def _shutdown_cleanup(self) -> None:
         # Stop lifecycle workers BEFORE we tear down sockets — any

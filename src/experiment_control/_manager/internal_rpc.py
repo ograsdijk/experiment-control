@@ -92,8 +92,10 @@ class InternalRpcMixin(_MixinBase):
         # Lifecycle ops: hand off to the worker pool so different
         # devices can run concurrently. Reply is sent later when the
         # worker enqueues it on _lifecycle_reply_queue and the main
-        # loop drains. Federated devices stay on the main thread
-        # (forwarding uses sockets we haven't audited for thread safety).
+        # loop drains. Federated devices stay on the main thread, but
+        # FederationHub._rpc_call pre-resolves the peer host and pumps manager
+        # subscriptions while awaiting the reply, so an unreachable peer can't
+        # starve process heartbeats during the forward.
         rtype = req.get("type")
         device_id = req.get("device_id")
         if (

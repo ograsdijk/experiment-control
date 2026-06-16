@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import queue
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any
 
 import zmq
 
-from ..utils.zmq_helpers import json_dumps, safe_json_loads
+from ..utils.manager_network import connect_dealer, resolve_tcp_endpoint
+from ..utils.zmq_helpers import json_dumps, recv_json, safe_json_loads, send_json
 from .config import FederationConfig, FederationPeerConfig
 
 Json = dict[str, Any]
@@ -20,6 +23,15 @@ _MIRRORED_LIFECYCLE_TYPES = {
     "device.recover",
 }
 
+# How long _rpc_call (forward path, on the poll loop) reuses a peer's resolved
+# IP before re-resolving — bounds getaddrinfo to once/TTL instead of per command,
+# and picks up DNS changes on the next miss.
+_RESOLVE_CACHE_TTL_S = 60.0
+
+# How often the warmup thread re-fetches an already-warmed peer's metadata, so
+# config/schema drift after a peer restart is eventually picked up.
+_METADATA_REFRESH_S = 300.0
+
 
 @dataclass
 class PeerRuntime:
@@ -28,6 +40,15 @@ class PeerRuntime:
     last_event_recv_mono: float | None = None
     last_rpc_ok_mono: float | None = None
     last_error: str | None = None
+    # Set on the main thread once the background warmup thread has delivered
+    # this peer's metadata (config + schema). Until then mirrored devices are
+    # served from placeholder config/schema.
+    metadata_warmed: bool = False
+    # Main-thread-only cache of the resolved router_rpc endpoint for the forward
+    # path (_rpc_call), so a hostname peer isn't getaddrinfo'd on the poll loop
+    # on every command. None until first resolve; expires after _RESOLVE_CACHE_TTL_S.
+    resolved_endpoint: str | None = None
+    resolved_expiry_mono: float = 0.0
 
 
 @dataclass
@@ -53,7 +74,9 @@ class FederationHub:
         config: FederationConfig,
         instance_id: str,
     ) -> None:
-        self._ctx = ctx
+        # ``ctx`` (the manager's shared context) is intentionally NOT stored:
+        # every federation socket lives on the dedicated _fed_ctx below, so a bad
+        # peer host can never block the manager's I/O thread. See _ensure_fed_ctx.
         self._poller = poller
         self._manager = manager
         self._config = config
@@ -62,6 +85,31 @@ class FederationHub:
         self._mirrors: dict[str, MirroredDeviceRuntime] = {}
         self._socket_to_peer: dict[zmq.Socket, str] = {}
         self._last_liveness: dict[str, str] = {}
+
+        # Dedicated zmq context for ALL federation peer sockets (relay SUBs and
+        # peer RPC DEALERs). DEFENSE-IN-DEPTH: the PRIMARY guard against a bad
+        # peer host starving heartbeats is pre-resolution — every connect() is
+        # handed an IP from resolve_tcp_endpoint(), never a hostname, so libzmq's
+        # I/O thread never blocks on DNS. This separate context (separate I/O
+        # thread) is kept as a second line of defense so that even if some future
+        # path connects a hostname directly, it degrades only federation, never
+        # the local stack's heartbeat/driver sockets on the main context. The
+        # poller is shared (zmq_poll works across contexts). Created lazily on
+        # activate() so a disabled-federation manager allocates nothing.
+        self._fed_ctx: zmq.Context | None = None
+        self._fed_ctx_closed = False
+
+        # Background metadata warmup. The thread does all peer metadata RPCs so
+        # an unreachable/slow peer can never block the manager poll loop; the
+        # main thread applies results from this queue.
+        self._warmup_thread: threading.Thread | None = None
+        self._warmup_stop = threading.Event()
+        # (peer_id, config_resp, schema_resp, caps, error). error is None on
+        # success; set to a reason string on failure so the main thread can
+        # surface it via peer_rt.last_error (device_status_snapshot).
+        self._warmup_results: "queue.Queue[tuple[str, Json | None, Json | None, dict[str, Json], str | None]]" = (
+            queue.Queue()
+        )
 
         for peer in config.peers:
             self._peers[peer.peer_id] = PeerRuntime(config=peer)
@@ -82,12 +130,22 @@ class FederationHub:
     def mirrored_device_ids(self) -> tuple[str, ...]:
         return tuple(sorted(self._mirrors))
 
+    def _ensure_fed_ctx(self) -> zmq.Context:
+        if self._fed_ctx_closed:
+            # Don't resurrect a terminated context after close() (e.g. a late
+            # federated command racing shutdown) — that would leak a context.
+            raise RuntimeError("federation hub is closed")
+        if self._fed_ctx is None:
+            self._fed_ctx = zmq.Context()
+        return self._fed_ctx
+
     def activate(self) -> None:
         if not self.enabled:
             return
+        fed_ctx = self._ensure_fed_ctx()
         for peer_id, peer_rt in self._peers.items():
             if peer_rt.sub_sock is None:
-                sub = self._ctx.socket(zmq.SUB)
+                sub = fed_ctx.socket(zmq.SUB)
                 sub.setsockopt(zmq.LINGER, 0)
                 sub.setsockopt(zmq.RCVTIMEO, 0)
                 for topic in peer_rt.config.relay.topics:
@@ -96,9 +154,29 @@ class FederationHub:
                 self._poller.register(sub, zmq.POLLIN)
                 peer_rt.sub_sock = sub
                 self._socket_to_peer[sub] = peer_id
-            self._refresh_peer_metadata(peer_rt)
+            # NB: do not reset peer_rt.metadata_warmed here — activate() runs
+            # twice (startup_sequence then run_forever) and clobbering it would
+            # leave already-warmed peers stuck unwarmed (the guard below means
+            # the warmup thread won't re-run to fix it).
+        # Do NOT fetch peer metadata on this (poll-loop) thread: a blocking RPC
+        # to an unreachable peer would stall manager/TUI startup. Run the
+        # best-effort warmup on a background thread instead; results are applied
+        # by _drain_warmup_results() (called from check_timeouts()). Until a peer
+        # is warmed its mirrored devices are served from placeholder
+        # config/schema (see device_config_list / telemetry_schema_devices).
+        if self._warmup_thread is None:
+            self._warmup_stop.clear()
+            self._warmup_thread = threading.Thread(
+                target=self._warmup_loop, name="federation-warmup", daemon=True
+            )
+            self._warmup_thread.start()
 
     def close(self) -> None:
+        self._warmup_stop.set()
+        thread = self._warmup_thread
+        if thread is not None:
+            thread.join(timeout=2.0)
+            self._warmup_thread = None
         for sock, _peer_id in list(self._socket_to_peer.items()):
             try:
                 self._poller.unregister(sock)
@@ -111,6 +189,15 @@ class FederationHub:
         self._socket_to_peer.clear()
         for peer_rt in self._peers.values():
             peer_rt.sub_sock = None
+        # Tear down the federation context last, after the warmup thread is
+        # joined (its DEALERs closed) and the SUBs above are closed.
+        self._fed_ctx_closed = True
+        if self._fed_ctx is not None:
+            try:
+                self._fed_ctx.term()
+            except Exception:
+                pass
+            self._fed_ctx = None
 
     def mirror_route_entries(self) -> list[Json]:
         if not self.enabled:
@@ -148,6 +235,7 @@ class FederationHub:
     def check_timeouts(self, now_mono: float) -> None:
         if not self.enabled:
             return
+        self._drain_warmup_results()
         for local_id, mirror in self._mirrors.items():
             peer_rt = self._peers.get(mirror.peer_id)
             if peer_rt is None:
@@ -334,10 +422,39 @@ class FederationHub:
             raise KeyError(f"Unknown mirrored device_id {device_id!r}")
         mirror.capabilities = dict(capabilities)
 
-    def _refresh_peer_metadata(self, peer_rt: PeerRuntime) -> None:
-        config_resp = self._rpc_call(peer_rt, {"type": "device.config.list"})
-        schema_resp = self._rpc_call(peer_rt, {"action": "manager.telemetry.schema.list"})
+    def _drain_warmup_results(self) -> None:
+        """Apply any metadata the background warmup thread has delivered.
 
+        Runs on the manager poll-loop thread (from check_timeouts) and never
+        does I/O, so it cannot block.
+        """
+        while True:
+            try:
+                peer_id, config_resp, schema_resp, caps, error = (
+                    self._warmup_results.get_nowait()
+                )
+            except queue.Empty:
+                break
+            peer_rt = self._peers.get(peer_id)
+            if peer_rt is None:
+                continue
+            if error is not None:
+                # Surface why a mirror still shows placeholder metadata (e.g. an
+                # unresolvable/unreachable peer host) without crashing anything.
+                peer_rt.last_error = error
+                continue
+            self._apply_peer_metadata(peer_rt, config_resp, schema_resp, caps)
+            peer_rt.metadata_warmed = True
+            peer_rt.last_rpc_ok_mono = time.monotonic()
+            peer_rt.last_error = None
+
+    def _apply_peer_metadata(
+        self,
+        peer_rt: PeerRuntime,
+        config_resp: Json | None,
+        schema_resp: Json | None,
+        caps: dict[str, Json],
+    ) -> None:
         config_items: list[Json] = []
         if (
             isinstance(config_resp, dict)
@@ -374,28 +491,127 @@ class FederationHub:
             remote_schema = schema_by_remote.get(mirror.remote_device_id)
             if remote_schema is not None:
                 mirror.schema_entry = self._rewrite_schema_entry(mirror, remote_schema)
-        if peer_rt.config.warm_capabilities_on_startup:
-            self._warm_peer_capabilities(peer_rt)
-        if config_resp is None or schema_resp is None:
-            peer_rt.last_error = "metadata fetch failed"
+            cap = caps.get(mirror.remote_device_id)
+            if isinstance(cap, dict):
+                mirror.capabilities = dict(cap)
 
-    def _warm_peer_capabilities(self, peer_rt: PeerRuntime) -> None:
-        for mirror in self._mirrors.values():
-            if mirror.peer_id != peer_rt.config.peer_id:
-                continue
-            resp = self._rpc_call(
-                peer_rt,
-                {
-                    "type": "command",
-                    "device_id": mirror.remote_device_id,
-                    "action": "capabilities",
-                    "params": {},
-                },
+    # ---- background warmup thread (own zmq context; never touches manager
+    # ---- sockets or mirror/peer state) -----------------------------------
+
+    def _warmup_loop(self) -> None:
+        try:
+            ctx = self._ensure_fed_ctx()
+        except RuntimeError:
+            # Hub was closed before this thread got going — exit cleanly.
+            return
+        peer_cfgs = [peer_rt.config for peer_rt in self._peers.values()]
+        backoff = {
+            cfg.peer_id: max(float(cfg.reconnect_backoff_s), 0.001)
+            for cfg in peer_cfgs
+        }
+        next_attempt = {cfg.peer_id: 0.0 for cfg in peer_cfgs}
+        # Runs until close(); a warmed peer is re-fetched every _METADATA_REFRESH_S
+        # so config/schema drift after a peer restart is eventually picked up.
+        while not self._warmup_stop.is_set():
+            for cfg in peer_cfgs:
+                if self._warmup_stop.is_set():
+                    break
+                if time.monotonic() < next_attempt[cfg.peer_id]:
+                    continue
+                config_resp, schema_resp, caps, error = self._fetch_peer_metadata(
+                    ctx, cfg
+                )
+                if error is None:
+                    self._warmup_results.put(
+                        (cfg.peer_id, config_resp, schema_resp, caps, None)
+                    )
+                    next_attempt[cfg.peer_id] = time.monotonic() + _METADATA_REFRESH_S
+                    backoff[cfg.peer_id] = max(float(cfg.reconnect_backoff_s), 0.001)
+                else:
+                    self._warmup_results.put((cfg.peer_id, None, None, {}, error))
+                    next_attempt[cfg.peer_id] = time.monotonic() + backoff[cfg.peer_id]
+                    backoff[cfg.peer_id] = min(
+                        backoff[cfg.peer_id] * 2.0,
+                        float(cfg.reconnect_backoff_max_s),
+                    )
+            self._warmup_stop.wait(0.2)
+
+    def _fetch_peer_metadata(
+        self, ctx: zmq.Context, cfg: FederationPeerConfig
+    ) -> tuple[Json | None, Json | None, dict[str, Json], str | None]:
+        # Resolve the peer host to an IP HERE (on the warmup thread) and connect
+        # only to the IP. Handing a hostname to connect() would make libzmq do a
+        # synchronous DNS lookup on this context's I/O thread; an unresolvable
+        # host would block it and delay every other peer's warmup. Returns a
+        # 4th element: an error reason (None on success) surfaced as last_error.
+        resolved = resolve_tcp_endpoint(cfg.router_rpc)
+        if resolved is None:
+            return None, None, {}, f"unresolvable peer host {cfg.router_rpc!r}"
+        timeout_ms = int(cfg.metadata_rpc_timeout_ms)
+        sock = connect_dealer(ctx, resolved, timeout_ms=timeout_ms)
+        caps: dict[str, Json] = {}
+        try:
+            config_resp = self._dealer_rpc(
+                sock, {"type": "device.config.list"}, timeout_ms=timeout_ms
             )
-            if isinstance(resp, dict) and bool(resp.get("ok")):
-                result = resp.get("result")
-                if isinstance(result, dict):
-                    mirror.capabilities = dict(result)
+            schema_resp = self._dealer_rpc(
+                sock, {"action": "manager.telemetry.schema.list"}, timeout_ms=timeout_ms
+            )
+            if config_resp is None or schema_resp is None:
+                return config_resp, schema_resp, caps, "metadata fetch failed (peer unreachable)"
+            if cfg.warm_capabilities_on_startup:
+                for mirror in cfg.mirror_devices:
+                    if self._warmup_stop.is_set():
+                        break
+                    resp = self._dealer_rpc(
+                        sock,
+                        {
+                            "type": "command",
+                            "device_id": mirror.remote_device_id,
+                            "action": "capabilities",
+                            "params": {},
+                        },
+                        timeout_ms=timeout_ms,
+                    )
+                    if (
+                        isinstance(resp, dict)
+                        and bool(resp.get("ok"))
+                        and isinstance(resp.get("result"), dict)
+                    ):
+                        caps[mirror.remote_device_id] = dict(resp["result"])
+            return config_resp, schema_resp, caps, None
+        except Exception as exc:
+            return None, None, caps, f"metadata fetch error: {exc}"
+        finally:
+            try:
+                sock.close(0)
+            except Exception:
+                pass
+
+    def _dealer_rpc(
+        self, sock: zmq.Socket, payload: Json, *, timeout_ms: int
+    ) -> Json | None:
+        # Poll in short steps checking the stop event rather than one blocking
+        # recv(timeout_ms), so close() can interrupt the warmup thread promptly
+        # (otherwise join()+ctx.term() could hang for up to timeout_ms).
+        try:
+            send_json(sock, payload)
+        except Exception:
+            return None
+        deadline = time.monotonic() + max(0.0, timeout_ms / 1000.0)
+        while not self._warmup_stop.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            step_ms = int(min(100.0, max(1.0, remaining * 1000.0)))
+            try:
+                if not sock.poll(step_ms, zmq.POLLIN):
+                    continue
+                resp = recv_json(sock)
+            except Exception:
+                return None
+            return resp if isinstance(resp, dict) else None
+        return None
 
     def _rewrite_config_payload(self, mirror: MirroredDeviceRuntime, payload: Json) -> Json:
         out = dict(payload)
@@ -590,16 +806,51 @@ class FederationHub:
             out["remote_device_id"] = remote_device_id
         return out
 
+    def _resolve_router_cached(self, peer_rt: PeerRuntime) -> str | None:
+        # Main-thread TTL cache so a hostname peer isn't getaddrinfo'd on the
+        # poll loop on every forwarded command (IP literals are an instant
+        # passthrough either way). Re-resolves after the TTL, picking up DNS
+        # drift; a None (unresolvable) result is cached too so a bad host isn't
+        # re-probed per command.
+        now = time.monotonic()
+        if now < peer_rt.resolved_expiry_mono:
+            return peer_rt.resolved_endpoint
+        peer_rt.resolved_endpoint = resolve_tcp_endpoint(peer_rt.config.router_rpc)
+        peer_rt.resolved_expiry_mono = now + _RESOLVE_CACHE_TTL_S
+        return peer_rt.resolved_endpoint
+
     def _rpc_call(self, peer_rt: PeerRuntime, payload: Json) -> Json | None:
-        sock = self._ctx.socket(zmq.DEALER)
-        sock.setsockopt(zmq.LINGER, 0)
+        # Pre-resolve (cached) so an unresolvable peer host fails fast and never
+        # makes libzmq block the I/O thread on DNS.
+        resolved = self._resolve_router_cached(peer_rt)
+        if resolved is None:
+            peer_rt.last_error = f"unresolvable peer host {peer_rt.config.router_rpc!r}"
+            return None
         timeout_ms = int(peer_rt.config.rpc_timeout_ms)
-        sock.setsockopt(zmq.RCVTIMEO, timeout_ms)
-        sock.setsockopt(zmq.SNDTIMEO, timeout_ms)
-        sock.connect(peer_rt.config.router_rpc)
         try:
-            sock.send(json_dumps(payload))
-            raw = sock.recv()
+            sock = connect_dealer(self._ensure_fed_ctx(), resolved, timeout_ms=timeout_ms)
+        except RuntimeError as e:  # hub closed during shutdown
+            peer_rt.last_error = str(e)
+            return None
+        # forward_device_request runs on the manager poll loop. Pump manager
+        # subscriptions while waiting so an unreachable peer can't starve process
+        # heartbeats during the (up to rpc_timeout_ms) wait. Falls back to a
+        # plain recv when no pump is available (e.g. test stubs).
+        pump = getattr(self._manager, "_pump_manager_subscriptions", None)
+        try:
+            if callable(pump):
+                from .._manager.rpc_calls import _blocking_call_with_pump
+
+                resp: Json | None = _blocking_call_with_pump(
+                    sock,
+                    json_dumps(payload),
+                    timeout_ms=timeout_ms,
+                    response_filter=lambda _r: True,
+                    pump_fn=pump,
+                )
+            else:
+                send_json(sock, payload)
+                resp = recv_json(sock)
         except Exception as e:
             peer_rt.last_error = str(e)
             return None
@@ -609,7 +860,6 @@ class FederationHub:
             except Exception:
                 pass
 
-        resp = safe_json_loads(raw)
         if not isinstance(resp, dict):
             peer_rt.last_error = "invalid response"
             return None

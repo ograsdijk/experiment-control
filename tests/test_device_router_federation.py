@@ -299,6 +299,38 @@ class DeviceRouterFederationTests(unittest.TestCase):
         self.assertEqual(payload["capabilities"]["version"], 1)
         self.assertEqual(timeout_ms, 250)
 
+    def test_ensure_sock_unresolvable_host_raises_without_connecting(self) -> None:
+        # An unresolvable peer host must fail fast on this worker thread without
+        # ever handing a hostname to connect() (which would block the shared I/O
+        # thread on DNS and starve the device_router's own heartbeat).
+        route = MirroredRoute(
+            local_id="lab9.dev",
+            peer_id="lab9",
+            remote_device_id="dev",
+            peer_router_rpc="tcp://TODO_PLACEHOLDER_HOST:6412",
+            rpc_timeout_ms=1500,
+            allow_device_actions=("*",),
+            deny_device_actions=(),
+            allow_lifecycle_ops=False,
+            allow_admin_ops=False,
+            origin_instance_id="lab1",
+        )
+        worker = _MirroredDeviceWorker(
+            route=route,
+            ctx=zmq.Context.instance(),
+            reply_queue=queue.Queue(),
+            manager_rpc="tcp://127.0.0.1:6002",
+            manager_pub="tcp://127.0.0.1:6001",
+            manager_timeout_ms=250,
+            queue_max=8,
+        )
+        with self.assertRaises(RuntimeError):
+            worker._ensure_sock()
+        self.assertIsNone(worker._sock)
+        # Negative-cached: the second call also fails fast (no re-probe).
+        with self.assertRaises(RuntimeError):
+            worker._ensure_sock()
+
     def test_queue_full_returns_router_busy_for_device_command(self) -> None:
         router = DeviceRouter(
             external_rpc_bind="tcp://127.0.0.1:*",

@@ -18,6 +18,7 @@ from .process_base import ManagedProcessBase
 from ..capabilities import capabilities_payload, method
 from ..manager_client import ManagerClient
 from ..utils.command_interceptors import apply_command_interceptor_chain
+from ..utils.manager_network import resolve_tcp_endpoint
 from ..utils.zmq_helpers import json_dumps, poll_and_drain, safe_json_loads
 
 Json = dict[str, Any]
@@ -34,6 +35,12 @@ class _WorkerLike(Protocol):
 
 
 _ALLOWED_PROCESS_STATES = {"STARTING", "RUNNING", "STOPPING"}
+
+# After a mirrored peer host fails to resolve, skip re-running getaddrinfo for
+# this long so a persistently-bad host doesn't add a multi-second DNS probe to
+# every command (the lookup runs on this worker thread, never the heartbeat /
+# shared I/O thread, so it can't starve heartbeats — this only bounds latency).
+_MIRRORED_RESOLVE_BACKOFF_S = 5.0
 
 # Soft cap on the number of cached interceptor DEALER sockets per
 # _DeviceWorker. Each entry is one open ZMQ socket; without a cap, a
@@ -898,15 +905,35 @@ class _MirroredDeviceWorker(_BaseWorker):
         self._manager_timeout_ms = int(manager_timeout_ms)
         self._manager: ManagerClient | None = None
         self._sock: zmq.Socket | None = None
+        self._resolve_fail_until: float = 0.0
 
     def _ensure_sock(self) -> zmq.Socket:
-        if self._sock is None:
-            sock = self._ctx.socket(zmq.DEALER)
-            sock.setsockopt(zmq.LINGER, 0)
-            sock.setsockopt(zmq.RCVTIMEO, int(self._route.rpc_timeout_ms))
-            sock.setsockopt(zmq.SNDTIMEO, int(self._route.rpc_timeout_ms))
-            sock.connect(self._route.peer_router_rpc)
-            self._sock = sock
+        if self._sock is not None:
+            return self._sock
+        # Resolve the peer host to an IP HERE (on this worker thread) and
+        # connect only to the IP. libzmq would otherwise resolve a hostname
+        # synchronously on the shared context I/O thread that also drives this
+        # process's heartbeat PUB; an unresolvable host (e.g. a placeholder)
+        # would block that I/O thread and fail the device_router itself. A
+        # short negative cache bounds repeated getaddrinfo on a bad host.
+        now = time.monotonic()
+        if now < self._resolve_fail_until:
+            raise RuntimeError(
+                f"peer host unresolvable: {self._route.peer_router_rpc}"
+            )
+        resolved = resolve_tcp_endpoint(self._route.peer_router_rpc)
+        if resolved is None:
+            self._resolve_fail_until = now + _MIRRORED_RESOLVE_BACKOFF_S
+            raise RuntimeError(
+                f"peer host unresolvable: {self._route.peer_router_rpc}"
+            )
+        self._resolve_fail_until = 0.0
+        sock = self._ctx.socket(zmq.DEALER)
+        sock.setsockopt(zmq.LINGER, 0)
+        sock.setsockopt(zmq.RCVTIMEO, int(self._route.rpc_timeout_ms))
+        sock.setsockopt(zmq.SNDTIMEO, int(self._route.rpc_timeout_ms))
+        sock.connect(resolved)
+        self._sock = sock
         return self._sock
 
     def _close_sock(self) -> None:

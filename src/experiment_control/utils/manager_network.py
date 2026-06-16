@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import socket
 from dataclasses import dataclass
 from typing import Any
+
+import zmq
 
 from .config_parsing import ConfigError, optional_dict
 from .network_hosts import (
@@ -100,6 +103,71 @@ def _parse_tcp_host_port(endpoint: str) -> tuple[str, int] | None:
     if port <= 0 or port > 65535:
         return None
     return host, port
+
+
+def resolve_tcp_endpoint(endpoint: str) -> str | None:
+    """Resolve a ``tcp://host:port`` endpoint's hostname to an IP literal.
+
+    Returns ``tcp://<ip>:<port>`` (the endpoint unchanged if the host is already
+    an IP literal or a wildcard), or ``None`` if the host is empty or cannot be
+    resolved.
+
+    IMPORTANT: call this only from a non-heartbeat-critical thread. libzmq
+    resolves a hostname handed to ``connect()`` synchronously on the context's
+    I/O thread; an unresolvable host blocks that I/O thread (and any heartbeat
+    socket sharing it), cascading processes into ``heartbeat_stale``. Resolving
+    here, off that thread, and connecting only to the returned IP keeps DNS off
+    every zmq I/O thread, so one bad peer host can never affect the local stack
+    or other peers.
+    """
+    parsed = _parse_tcp_host_port(endpoint)
+    if parsed is None:
+        return None
+    host, port = parsed
+    text = str(host).strip().strip("[]")
+    if _is_wildcard_host(text):
+        return endpoint
+    if not text:
+        return None  # 'tcp://:port' is not a connectable endpoint
+    for family in (socket.AF_INET, socket.AF_INET6):
+        try:
+            socket.inet_pton(family, text)
+            return _build_tcp_endpoint(text, port)  # already an IP literal
+        except OSError:
+            pass
+    # Prefer IPv4: the stack binds IPv4 (0.0.0.0 / IPv4 advertise hosts), so a
+    # hostname that resolves to both must not be pinned to an IPv6 address the
+    # peer isn't listening on. Fall back to IPv6 only if there is no A record.
+    # (Single-address pin, no Happy-Eyeballs, is intentional for this IPv4 stack.)
+    # getaddrinfo raises UnicodeError (NOT an OSError) for malformed hosts
+    # (over-long labels, non-ASCII, ``a..b``); treat those as unresolvable too,
+    # never let them escape onto the warmup thread / poll loop.
+    for family in (socket.AF_INET, socket.AF_INET6):
+        try:
+            infos = socket.getaddrinfo(text, port, family=family, type=socket.SOCK_STREAM)
+        except (OSError, UnicodeError):
+            continue
+        for info in infos:
+            ip = info[4][0]
+            if ip:
+                return _build_tcp_endpoint(ip, int(port))
+    return None
+
+
+def connect_dealer(ctx: zmq.Context, resolved_endpoint: str, *, timeout_ms: int) -> zmq.Socket:
+    """Create a DEALER and connect it to an ALREADY-RESOLVED endpoint.
+
+    Centralises the peer-socket boilerplate (LINGER=0, RCV/SND timeouts, connect)
+    so the "never hand a hostname to connect()" invariant lives in one place:
+    callers must pass an IP endpoint from ``resolve_tcp_endpoint`` (handling its
+    ``None`` themselves), never a raw hostname.
+    """
+    sock = ctx.socket(zmq.DEALER)
+    sock.setsockopt(zmq.LINGER, 0)
+    sock.setsockopt(zmq.RCVTIMEO, int(timeout_ms))
+    sock.setsockopt(zmq.SNDTIMEO, int(timeout_ms))
+    sock.connect(resolved_endpoint)
+    return sock
 
 
 def _parse_port(raw: object, *, default: int, path: list[str | int]) -> int:

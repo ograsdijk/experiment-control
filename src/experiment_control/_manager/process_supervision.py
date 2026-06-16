@@ -1311,6 +1311,22 @@ def _refresh_pending_process_heartbeats(manager: Any) -> None:
         _publish_heartbeat_refresh_error(manager, exc)
 
 
+def _in_startup_grace(manager: Any, now_mono: float) -> bool:
+    """True while startup_sequence is running and for a short grace window
+    after it completes. During this window a slow first heartbeat (e.g. a
+    process still importing heavy deps like scipy) must not be counted as a
+    failure — startup is a known transient. Distinct from a manager loop
+    stall, which keeps its normal strike/hard-timeout failure semantics.
+    """
+    if bool(getattr(manager, "_startup_sequence_active", False)):
+        return True
+    startup_complete = getattr(manager, "_startup_sequence_complete_mono", None)
+    if startup_complete is not None:
+        grace_s = getattr(manager, "_startup_grace_s", 10.0)
+        return (now_mono - float(startup_complete)) <= grace_s
+    return False
+
+
 def enforce_managed_process_heartbeat_timeout(
     manager: Any,
     handle: Any,
@@ -1344,6 +1360,8 @@ def enforce_managed_process_heartbeat_timeout(
 
     heartbeat_received = handle.last_hb_recv_mono is not None
     recent_stall = _recent_manager_loop_stall(manager, now_mono)
+    in_startup_grace = _in_startup_grace(manager, now_mono)
+    startup_grace_hard_s = getattr(manager, "_startup_grace_hard_timeout_s", 30.0)
     hard_timeout_s = timeout_s * max(1.0, manager._heartbeat_hard_timeout_multiplier)
     strikes_to_fail = manager._heartbeat_stale_strikes_to_fail
     # Rate-limit strikes to one per heartbeat_period_s. The supervision
@@ -1365,7 +1383,26 @@ def enforce_managed_process_heartbeat_timeout(
         manager, "_last_loop_stall_duration_s", None
     )
 
-    if recent_stall and handle.heartbeat_stale_strikes < strikes_to_fail and hb_age < hard_timeout_s:
+    # Two reasons to defer rather than fail on a stale heartbeat:
+    #  - startup grace: a slow first heartbeat during/just after startup is
+    #    expected (heavy imports); defer and cap strikes so we never fail an
+    #    otherwise-healthy process while it is still booting — BUT bounded by
+    #    startup_grace_hard_s so a process that crashed on spawn and never
+    #    heartbeats is still failed during a long startup.
+    #  - recent manager loop stall: the manager (not the process) was briefly
+    #    delayed; defer until the strike count / hard timeout is reached. This
+    #    keeps a genuinely dead process failing even across a transient stall.
+    grace_defer = in_startup_grace and hb_age < startup_grace_hard_s
+    defer = grace_defer or (
+        recent_stall
+        and handle.heartbeat_stale_strikes < strikes_to_fail
+        and hb_age < hard_timeout_s
+    )
+    if defer:
+        if grace_defer:
+            handle.heartbeat_stale_strikes = min(
+                handle.heartbeat_stale_strikes, strikes_to_fail - 1
+            )
         manager._publish_manager_event(
             "manager.process.heartbeat_stale_deferred",
             {
@@ -1374,7 +1411,8 @@ def enforce_managed_process_heartbeat_timeout(
                 "heartbeat_timeout_s": timeout_s,
                 "strikes": int(handle.heartbeat_stale_strikes),
                 "strikes_to_fail": strikes_to_fail,
-                "recent_manager_loop_stall": True,
+                "recent_manager_loop_stall": recent_stall,
+                "in_startup_grace": in_startup_grace,
                 "last_manager_loop_stall_duration_s": handle.last_manager_loop_stall_duration_s,
                 "ts": {"t_wall": time.time(), "t_mono": now_mono},
             },
