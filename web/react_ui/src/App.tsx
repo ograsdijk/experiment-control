@@ -814,8 +814,8 @@ export function App() {
       daqDraftNodes
         .filter((node) => isPublishableNodeKind(nodeKindFromOp(node.op)))
         .map((node) => ({
-          value: node.id,
-          label: `${node.id} (${node.op})`,
+          value: node.nodeId,
+          label: `${node.nodeId} (${node.op})`,
         })),
     [daqDraftNodes]
   );
@@ -828,7 +828,7 @@ export function App() {
               node.op === "aggregate.bin_stats" ||
               node.op === "aggregate.bin2d_stats"
           )
-          .map((n) => n.id)
+          .map((n) => n.nodeId)
       ),
     [daqDraftNodes]
   );
