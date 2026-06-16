@@ -1093,7 +1093,25 @@ class Manager(
         for device_id, handle in self._devices.items():
             if handle.rpc_endpoint is None:
                 continue
-            results[device_id] = self.connect_device(device_id)
+            # A single dead/exited driver must not abort the whole bulk
+            # connect (and thus startup_sequence + the manager). The
+            # single-device RPC path tolerates connect_device raising
+            # (the command dispatcher catches it); this aggregator must
+            # too. Record a per-device error result and publish the same
+            # event the auto-connect-on-register path emits, then carry on.
+            try:
+                results[device_id] = self.connect_device(device_id)
+            except Exception as exc:
+                error_text = str(exc)
+                results[device_id] = {
+                    "status": "ERROR",
+                    "error": error_text,
+                    "error_code": "connect_failed",
+                }
+                self._publish_manager_event(
+                    "manager.connect_device_failed",
+                    {"device_id": device_id, "error": error_text},
+                )
         return results
 
     # Phase 8.2.11: ``startup_sequence`` is now provided by
