@@ -18,6 +18,7 @@ from ..rules.rules_common import (
     parse_version,
 )
 from ..sequencer.eval import eval_condition, to_attrdict
+from ..types import MemberSpec
 from ..utils.cli_args import (
     add_heartbeat_args,
     add_manager_args,
@@ -710,7 +711,7 @@ class WatchdogProcess(ManagedProcessBase):
         self._rpc_registry = self._build_rpc_registry()
 
     def _publish_event(self, topic: str, payload: Json) -> None:
-        self._manager_helper.publish_event(self._manager, topic=topic, payload=payload)
+        self._manager_helper.publish_event(self._require_manager(), topic=topic, payload=payload)
 
     def _publish_rules_loaded(self) -> None:
         rules: list[Json] = []
@@ -905,9 +906,10 @@ class WatchdogProcess(ManagedProcessBase):
             with self._inflight_lock:
                 self._inflight_action_keys.discard(key)
             return
-        future.add_done_callback(
-            lambda _fut, _key=key: self._on_action_chain_done(_fut, _key)
-        )
+        def on_done(done_future: Future[None]) -> None:
+            self._on_action_chain_done(done_future, key)
+
+        future.add_done_callback(on_done)
 
     def _on_action_chain_done(
         self, future: Future[None], key: tuple[str, str]
@@ -986,8 +988,8 @@ class WatchdogProcess(ManagedProcessBase):
         self._publish_event("manager.watchdog.cleared", payload)
         return {"ok": True, "previous_latched": prev_latched, "previous_armed": prev_armed}
 
-    def _watchdog_capability_members(self) -> list[Json]:
-        members = [
+    def _watchdog_capability_members(self) -> list[MemberSpec]:
+        members: list[MemberSpec] = [
             method("watchdog.status", params=None, doc="Get watchdog status."),
             method(
                 "watchdog.clear_latch",

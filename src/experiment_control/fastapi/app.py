@@ -283,9 +283,10 @@ def _build_trace_frame_array(
         return None
     trace = _select_trace_from_array(arr, channel_index)
     if pre_decimate is not None:
-        trace = pre_decimate(trace)
-        if trace is None:
+        decimated_trace = pre_decimate(trace)
+        if decimated_trace is None:
             return None
+        trace = decimated_trace
     original_size = int(trace.size)
     if trace_max_points is not None:
         trace_values = _decimate_trace_values(
@@ -537,6 +538,8 @@ async def _fetch_instance_runtime_status(
     if isinstance(manager_identity, dict):
         manager_pid_raw = manager_identity.get("manager_pid")
         try:
+            if not isinstance(manager_pid_raw, (str, bytes, bytearray, int)):
+                raise TypeError
             manager_pid_candidate = int(manager_pid_raw)
             if manager_pid_candidate > 0:
                 manager_pid = manager_pid_candidate
@@ -1003,9 +1006,9 @@ async def settings_view(request: Request) -> dict[str, Any]:
     settings: GatewaySettings = app.state.settings
     manager_identity = getattr(app.state, "manager_identity", None)
     if not isinstance(manager_identity, dict):
-        router: RouterRpcClient | None = getattr(app.state, "router", None)
-        if router is not None:
-            manager_identity = await _fetch_manager_identity(router)
+        identity_router: RouterRpcClient | None = getattr(app.state, "router", None)
+        if identity_router is not None:
+            manager_identity = await _fetch_manager_identity(identity_router)
             if isinstance(manager_identity, dict):
                 app.state.manager_identity = manager_identity
     instance_id = settings.instance_id
@@ -1033,10 +1036,10 @@ async def settings_view(request: Request) -> dict[str, Any]:
             router_rpc_hint = _replace_endpoint_host(settings.router_rpc, preferred_host)
         if settings.manager_pub_public_hint is None and _is_loopback_host(manager_host):
             manager_pub_hint = _replace_endpoint_host(settings.manager_pub, preferred_host)
-    router: RouterRpcClient | None = getattr(app.state, "router", None)
+    stats_router: RouterRpcClient | None = getattr(app.state, "router", None)
     rpc_queue: dict[str, Any] | None = None
-    if router is not None:
-        rpc_queue = router.stats()
+    if stats_router is not None:
+        rpc_queue = stats_router.stats()
     stream_hub: StreamFrameHub | None = getattr(app.state, "stream_hub", None)
     stream_state: dict[str, Any] | None = None
     if stream_hub is not None:
@@ -2096,6 +2099,8 @@ async def _workspace_handle_trace_ready_message(
     if not output_id or not node_id or not shm_name:
         return False
     try:
+        if not isinstance(seq_raw, (str, bytes, bytearray, int)):
+            raise TypeError
         trace_seq = int(seq_raw)
     except Exception:
         return False

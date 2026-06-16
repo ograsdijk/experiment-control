@@ -73,8 +73,11 @@ class StateMachineProcessBase(ManagedProcessBase):
         self._last_command: Json | None = None
         self._graph_edges = self._normalize_graph_edges(graph_edges)
         if allowed_transitions is None and self._graph_edges:
-            allowed_transitions = self._derive_allowed_transitions_from_graph_edges(self._graph_edges)
-        self._allowed_transitions = self._normalize_allowed_transitions(allowed_transitions)
+            self._allowed_transitions = self._derive_allowed_transitions_from_graph_edges(
+                self._graph_edges
+            )
+        else:
+            self._allowed_transitions = self._normalize_allowed_transitions(allowed_transitions)
         self._history_max = 500
         self._history: list[Json] = []
 
@@ -218,7 +221,7 @@ class StateMachineProcessBase(ManagedProcessBase):
         self._last_command = req
         timeout_ms = None if timeout_s is None else max(1, int(float(timeout_s) * 1000))
         resp = self._manager.call(req, timeout_ms=timeout_ms)
-        if not is_response_ok(resp):
+        if not isinstance(resp, dict) or not is_response_ok(resp):
             raise sequence_error_cls(f"command failed: {req} -> {resp}")
         return resp
 
@@ -617,15 +620,15 @@ class StateMachineProcessBase(ManagedProcessBase):
                             "annotation": getattr(p, "annotation", None),
                         }
                     )
-            item: Json = {
+            member_item: Json = {
                 "name": name,
                 "doc": str(getattr(member, "doc", "") or "") or None,
                 "params": params_payload,
                 "transitions": [],
                 "effects": [],
             }
-            action_items.append(item)
-            action_index[name] = item
+            action_items.append(member_item)
+            action_index[name] = member_item
 
         for raw in self._state_machine_graph_action_transitions():
             if not isinstance(raw, dict):
@@ -638,18 +641,18 @@ class StateMachineProcessBase(ManagedProcessBase):
                 "to_state": str(raw.get("to_state", "")).strip() or None,
                 "note": str(raw.get("note", "")).strip() or None,
             }
-            item = action_index.get(action)
-            if item is None:
-                item = {
+            action_item = action_index.get(action)
+            if action_item is None:
+                action_item = {
                     "name": action,
                     "doc": None,
                     "params": [],
                     "transitions": [],
                     "effects": [],
                 }
-                action_items.append(item)
-                action_index[action] = item
-            transitions_raw = item.get("transitions")
+                action_items.append(action_item)
+                action_index[action] = action_item
+            transitions_raw = action_item.get("transitions")
             if isinstance(transitions_raw, list):
                 transitions_raw.append(row)
 
@@ -669,18 +672,18 @@ class StateMachineProcessBase(ManagedProcessBase):
                 "params": params,
                 "note": str(raw.get("note", "")).strip() or None,
             }
-            item = action_index.get(action)
-            if item is None:
-                item = {
+            action_item = action_index.get(action)
+            if action_item is None:
+                action_item = {
                     "name": action,
                     "doc": None,
                     "params": [],
                     "transitions": [],
                     "effects": [],
                 }
-                action_items.append(item)
-                action_index[action] = item
-            effects_raw = item.get("effects")
+                action_items.append(action_item)
+                action_index[action] = action_item
+            effects_raw = action_item.get("effects")
             if isinstance(effects_raw, list):
                 effects_raw.append(row)
 

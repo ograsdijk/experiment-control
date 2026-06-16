@@ -243,12 +243,18 @@ class ManagerClient:
         if not device_id or not isinstance(signals, dict):
             return
 
-        try:
+        if isinstance(ts_raw, dict):
+            t_wall_raw = ts_raw.get("t_wall")
+            t_mono_raw = ts_raw.get("t_mono")
+        else:
+            t_wall_raw = None
+            t_mono_raw = None
+        if isinstance(t_wall_raw, (str, bytes, bytearray, int, float)) and isinstance(t_mono_raw, (str, bytes, bytearray, int, float)):
             bundle_ts = Timestamp(
-                t_wall=float(ts_raw.get("t_wall")),
-                t_mono=float(ts_raw.get("t_mono")),
+                t_wall=float(t_wall_raw),
+                t_mono=float(t_mono_raw),
             )
-        except Exception:
+        else:
             bundle_ts = Timestamp(t_wall=time.time(), t_mono=time.monotonic())
 
         now_mono = time.monotonic()

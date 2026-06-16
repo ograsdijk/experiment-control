@@ -6,7 +6,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, cast
 
 import zmq
 
@@ -390,7 +390,7 @@ def _shutdown_manager(manager_rpc: str) -> None:
     sock.close(0)
 
 
-def _wait_for_exit(proc: subprocess.Popen[str], timeout_s: float) -> None:
+def _wait_for_exit(proc: subprocess.Popen[Any], timeout_s: float) -> None:
     if proc.poll() is not None:
         return
     try:
@@ -502,7 +502,7 @@ def _assert_instance_not_running(*, instance_id: str, manager_rpc: str) -> None:
 def _wait_for_manager_ready(
     *,
     manager_rpc: str,
-    manager_proc: subprocess.Popen[str],
+    manager_proc: subprocess.Popen[Any],
     expected_instance_id: str | None,
     startup_delay_s: float,
     startup_timeout_s: float,
@@ -714,13 +714,13 @@ def main(argv: list[str] | None = None) -> None:
             device_specs = []
             seen_devices: set[str] = set()
             for dev_path in device_paths:
-                spec = device_spec_from_yaml(dev_path)
-                if spec.device_id in seen_devices:
+                device_spec = device_spec_from_yaml(dev_path)
+                if device_spec.device_id in seen_devices:
                     raise ConfigError(
-                        "devices", f"duplicate device_id {spec.device_id!r}"
+                        "devices", f"duplicate device_id {device_spec.device_id!r}"
                     )
-                seen_devices.add(spec.device_id)
-                device_specs.append(spec)
+                seen_devices.add(device_spec.device_id)
+                device_specs.append(device_spec)
 
             federation_config = parse_federation_config(
                 raw.get("federation"),
@@ -728,7 +728,8 @@ def main(argv: list[str] | None = None) -> None:
                 manager_raw=manager_raw,
             )
 
-            manager = Manager(
+            manager_cls = cast(type[Manager], Manager)
+            manager = manager_cls(
                 instance_id=instance_id,
                 federation_config=federation_config,
                 registry_bind=manager_network.registry_bind,
@@ -794,22 +795,22 @@ def main(argv: list[str] | None = None) -> None:
             process_manager_rpc = manager_network.local_rpc_connect
             process_manager_pub = manager_network.local_pub_connect
 
-            for spec in device_specs:
-                manager.add_device(spec)
+            for device_spec in device_specs:
+                manager.add_device(device_spec)
 
             seen_processes: set[str] = set()
             for proc_path in process_paths:
-                spec = process_spec_from_yaml(
+                process_spec = process_spec_from_yaml(
                     proc_path,
                     manager_rpc=process_manager_rpc,
                     manager_pub=process_manager_pub,
                 )
-                if spec.process_id in seen_processes:
+                if process_spec.process_id in seen_processes:
                     raise ConfigError(
-                        "processes", f"duplicate process_id {spec.process_id!r}"
+                        "processes", f"duplicate process_id {process_spec.process_id!r}"
                     )
-                seen_processes.add(spec.process_id)
-                manager.add_process(spec)
+                seen_processes.add(process_spec.process_id)
+                manager.add_process(process_spec)
 
             startup = _parse_startup(raw)
             start_devices = bool(startup.get("start_devices", True))

@@ -37,7 +37,7 @@ def server_ipv4_candidates() -> list[str]:
             type=socket.SOCK_STREAM,
         )
         for info in infos:
-            ip = info[4][0]
+            ip = str(info[4][0])
             try:
                 parsed = ipaddress.ip_address(ip)
             except Exception:

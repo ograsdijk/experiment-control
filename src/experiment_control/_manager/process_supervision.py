@@ -112,7 +112,10 @@ def _read_process_rss_bytes_procfs(pid: int) -> int | None:
         return None
     try:
         resident_pages = int(parts[1])
-        page_size = int(os.sysconf("SC_PAGE_SIZE"))
+        sysconf = getattr(os, "sysconf", None)
+        if not callable(sysconf):
+            return None
+        page_size = int(sysconf("SC_PAGE_SIZE"))
     except Exception:
         return None
     if resident_pages < 0 or page_size <= 0:

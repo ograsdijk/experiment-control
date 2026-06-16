@@ -233,9 +233,9 @@ def _parse_step(raw: Any) -> Step:
         return WhileStep(condition=condition, body=body)
     if "atomic" in obj:
         atom = _require_dict(obj["atomic"], name="atomic")
-        name = atom.get("name")
+        atomic_name = atom.get("name")
         body = _parse_steps(atom.get("do", []))
-        return AtomicStep(name=str(name) if name is not None else None, body=body)
+        return AtomicStep(name=str(atomic_name) if atomic_name is not None else None, body=body)
     if "pause" in obj:
         pause = obj["pause"]
         if isinstance(pause, dict):
@@ -285,14 +285,14 @@ def _parse_step(raw: Any) -> Step:
         controller = _require_dict(raw_step.get("controller"), name="adaptive.controller")
         space = _require_dict(raw_step.get("space"), name="adaptive.space")
         bind_raw = _require_dict(raw_step.get("bind"), name="adaptive.bind")
-        bind: dict[str, str] = {}
+        adaptive_bind: dict[str, str] = {}
         for raw_key, raw_value in bind_raw.items():
             key = str(raw_key).strip()
             value = str(raw_value).strip()
             if not key or not value:
                 raise TypeError("adaptive.bind entries must map non-empty names")
-            bind[key] = value
-        if not bind:
+            adaptive_bind[key] = value
+        if not adaptive_bind:
             raise TypeError("adaptive.bind must not be empty")
         state = raw_step.get("state")
         if state is not None and not isinstance(state, dict):
@@ -311,7 +311,7 @@ def _parse_step(raw: Any) -> Step:
             id=step_id,
             controller=controller,
             space=space,
-            bind=bind,
+            bind=adaptive_bind,
             state=dict(state) if isinstance(state, dict) else None,
             body=body,
             observe=observe,

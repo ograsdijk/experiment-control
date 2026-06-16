@@ -44,3 +44,14 @@ dev = [
     "ruff>=0.14.14",
     "types-PyYAML>=6.0",
 ]
+
+[tool.mypy]
+
+[[tool.mypy.overrides]]
+module = [
+    "experiment_control.adaptive.controller",
+    "experiment_control.drivers.linien_driver",
+    "experiment_control.drivers.synthhd_driver",
+    "experiment_control.processes.hdf_writer",
+]
+disable_error_code = ["import-untyped"]

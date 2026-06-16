@@ -137,6 +137,8 @@ def _list_process_commands_windows() -> list[tuple[int, str]]:
         if raw_cmd is None:
             continue
         try:
+            if not isinstance(raw_pid, (str, bytes, bytearray, int)):
+                raise TypeError
             pid = int(raw_pid)
         except (TypeError, ValueError, OverflowError):
             continue
@@ -226,7 +228,7 @@ def _terminate_pid_posix(pid: int, *, timeout_s: float) -> bool:
             return True
         time.sleep(0.05)
     try:
-        os.kill(pid, signal.SIGKILL)
+        os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
     except ProcessLookupError:
         return True
     except OSError:

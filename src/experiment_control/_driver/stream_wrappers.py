@@ -9,7 +9,7 @@ from ..types import StreamCall, StreamOut
 
 
 class _StreamPublisher(Protocol):
-    _device: object
+    _device: Any
 
     def publish_stream(self, stream: str, arr: np.ndarray) -> dict[str, Any]: ...
 
