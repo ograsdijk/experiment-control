@@ -246,15 +246,15 @@ export function DaqWorkspacesModal({
                 ) : (
                   daqDraftNodes.map((node, index) => {
                     const spec = STREAM_DAG_OPS[node.op];
-                    const isFocused = daqFocusedNodeId === node.id;
+                    const isFocused = daqFocusedNodeId === node.nodeId;
                     return (
                       <Card
                         key={`daq-node-${index}`}
                         ref={(element) => {
                           if (element) {
-                            daqNodeCardRefs.current.set(node.id, element);
+                            daqNodeCardRefs.current.set(node.nodeId, element);
                           } else {
-                            daqNodeCardRefs.current.delete(node.id);
+                            daqNodeCardRefs.current.delete(node.nodeId);
                           }
                         }}
                         radius="md"
@@ -292,10 +292,10 @@ export function DaqWorkspacesModal({
                                   size="compact-xs"
                                   variant="light"
                                   color="red"
-                                  loading={daqResetNodeBusyId === node.id}
+                                  loading={daqResetNodeBusyId === node.nodeId}
                                   disabled={!streamAnalysisRpcReady || !daqWorkspaceId}
                                   onClick={() => {
-                                    void onResetDaqNodeAggregate(node.id);
+                                    void onResetDaqNodeAggregate(node.nodeId);
                                   }}
                                 >
                                   Clear bins
@@ -314,7 +314,7 @@ export function DaqWorkspacesModal({
                           <Group gap="sm" align="end" wrap="wrap">
                             <TextInput
                               label="Node id"
-                              value={node.id}
+                              value={node.nodeId}
                               onChange={(event) =>
                                 onSetNodeId(index, event.currentTarget.value)
                               }
@@ -581,8 +581,8 @@ export function DaqWorkspacesModal({
                                     return nodeKindFromOp(candidate.op) === expectedKind;
                                   })
                                   .map((candidate) => ({
-                                    value: candidate.id,
-                                    label: `${candidate.id} (${candidate.op})`,
+                                    value: candidate.nodeId,
+                                    label: `${candidate.nodeId} (${candidate.op})`,
                                   }));
                                 if (
                                   node.op === "fit.curve_1d" &&
@@ -595,7 +595,7 @@ export function DaqWorkspacesModal({
                                 }
                                 return (
                                   <Select
-                                    key={`${node.id}:${port}`}
+                                    key={`${node.nodeId}:${port}`}
                                     label={`input.${port}${isOptional ? " (optional)" : ""}`}
                                     placeholder={
                                       expectedKind
@@ -663,7 +663,7 @@ export function DaqWorkspacesModal({
                                 if (field.kind === "boolean") {
                                   return (
                                     <Switch
-                                      key={`${node.id}:${field.name}`}
+                                      key={`${node.nodeId}:${field.name}`}
                                       label={field.label}
                                       checked={
                                         coerceDagParamValue(
@@ -697,7 +697,7 @@ export function DaqWorkspacesModal({
                                     : options[0]?.value ?? "";
                                   return (
                                     <Select
-                                      key={`${node.id}:${field.name}`}
+                                      key={`${node.nodeId}:${field.name}`}
                                       label={field.label}
                                       data={options}
                                       value={selectedValue || null}
@@ -715,7 +715,7 @@ export function DaqWorkspacesModal({
                                 }
                                 return (
                                   <TextInput
-                                    key={`${node.id}:${field.name}`}
+                                    key={`${node.nodeId}:${field.name}`}
                                     label={field.label}
                                     value={String(node.params[field.name] ?? "")}
                                     placeholder={field.placeholder}
@@ -760,7 +760,7 @@ export function DaqWorkspacesModal({
                   </Text>
                 ) : (
                   daqDraftOutputs.map((output, index) => {
-                    const node = daqDraftNodes.find((item) => item.id === output.nodeId);
+                    const node = daqDraftNodes.find((item) => item.nodeId === output.nodeId);
                     const kind = node ? nodeKindFromOp(node.op) : null;
                     return (
                       <Group key={`daq-output-${index}`} gap="sm" align="end" wrap="wrap">

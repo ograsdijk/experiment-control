@@ -71,7 +71,7 @@ class StreamAnalysisMemoryBoundsTests(unittest.TestCase):
                 "graph": {
                     "nodes": [
                         {
-                            "id": "src",
+                            "node_id": "src",
                             "op": "source.stream",
                             "params": {"device_id": "dev-a", "stream": "trace"},
                         }

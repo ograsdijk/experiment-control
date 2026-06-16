@@ -260,7 +260,7 @@ export function useWorkspaceListManagement() {
         }
       }
       const out: Record<string, unknown> = {
-        id: node.id,
+        node_id: node.nodeId,
         op: node.op,
         params,
       };

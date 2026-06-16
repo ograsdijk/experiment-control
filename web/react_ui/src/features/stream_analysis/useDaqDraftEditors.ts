@@ -59,10 +59,10 @@ export function useDaqDraftEditors() {
     if (!current) {
       return;
     }
-    if (current.id === nextId) {
+    if (current.nodeId === nextId) {
       return;
     }
-    if (daqDraftNodes.some((node, idx) => idx !== index && node.id === nextId)) {
+    if (daqDraftNodes.some((node, idx) => idx !== index && node.nodeId === nextId)) {
       notifications.show({
         color: "red",
         title: "Duplicate node ID",
@@ -70,11 +70,11 @@ export function useDaqDraftEditors() {
       });
       return;
     }
-    const oldId = current.id;
+    const oldId = current.nodeId;
     setDaqDraftNodes((prev) =>
       prev.map((node, idx) => {
         if (idx === index) {
-          return { ...node, id: nextId };
+          return { ...node, nodeId: nextId };
         }
         let changed = false;
         const nextInputs: Record<string, string> = {};
@@ -152,7 +152,7 @@ export function useDaqDraftEditors() {
   };
 
   const addDaqNode = () => {
-    const existingIds = new Set(daqDraftNodes.map((node) => node.id));
+    const existingIds = new Set(daqDraftNodes.map((node) => node.nodeId));
     let counter = daqDraftNodes.length + 1;
     let nodeId = `node_${counter}`;
     while (existingIds.has(nodeId)) {
@@ -163,7 +163,7 @@ export function useDaqDraftEditors() {
     setDaqDraftNodes((prev) => [
       ...prev,
       {
-        id: nodeId,
+        nodeId,
         op,
         params: defaultParamsForOp(op),
         inputs: defaultInputsForOp(op),
@@ -176,7 +176,7 @@ export function useDaqDraftEditors() {
     if (!removed) {
       return;
     }
-    const removedId = removed.id;
+    const removedId = removed.nodeId;
     setDaqDraftNodes((prev) => prev.filter((_, idx) => idx !== index));
     setDaqDraftOutputs((prev) =>
       prev.filter((output) => output.nodeId !== removedId)
@@ -204,7 +204,7 @@ export function useDaqDraftEditors() {
   const addDaqOutput = () => {
     const publishableNodeIds = daqDraftNodes
       .filter((node) => isPublishableNodeKind(nodeKindFromOp(node.op)))
-      .map((node) => node.id);
+      .map((node) => node.nodeId);
     if (publishableNodeIds.length <= 0) {
       notifications.show({
         color: "yellow",

@@ -148,7 +148,7 @@ export function useStreamPanelHandlers(args: StreamPanelHandlersArgs) {
     );
     const nodeId = output?.nodeId ?? null;
     const node = nodeId
-      ? workspace?.graphNodes.find((entry) => entry.id === nodeId) ?? null
+      ? workspace?.graphNodes.find((entry) => entry.nodeId === nodeId) ?? null
       : null;
     if (
       streamAnalysisReadyRef.current &&
@@ -156,7 +156,7 @@ export function useStreamPanelHandlers(args: StreamPanelHandlersArgs) {
       node &&
       node.op === "aggregate.bin_stats"
     ) {
-      const resp = await resetStreamWorkspace(workspace.workspaceId, node.id);
+      const resp = await resetStreamWorkspace(workspace.workspaceId, node.nodeId);
       if (!resp.ok) {
         notifications.show({
           color: "red",
@@ -165,7 +165,7 @@ export function useStreamPanelHandlers(args: StreamPanelHandlersArgs) {
             resp.error?.message ?? resp.error?.code ?? "workspace.reset failed",
         });
       } else {
-        clearWorkspaceBinPanels(workspace.workspaceId, node.id);
+        clearWorkspaceBinPanels(workspace.workspaceId, node.nodeId);
         return;
       }
     }
@@ -187,7 +187,7 @@ export function useStreamPanelHandlers(args: StreamPanelHandlersArgs) {
     );
     const nodeId = output?.nodeId ?? null;
     const node = nodeId
-      ? workspace?.graphNodes.find((entry) => entry.id === nodeId) ?? null
+      ? workspace?.graphNodes.find((entry) => entry.nodeId === nodeId) ?? null
       : null;
     if (
       streamAnalysisReadyRef.current &&
@@ -195,7 +195,7 @@ export function useStreamPanelHandlers(args: StreamPanelHandlersArgs) {
       node &&
       node.op === "aggregate.bin2d_stats"
     ) {
-      const resp = await resetStreamWorkspace(workspace.workspaceId, node.id);
+      const resp = await resetStreamWorkspace(workspace.workspaceId, node.nodeId);
       if (!resp.ok) {
         notifications.show({
           color: "red",
@@ -204,7 +204,7 @@ export function useStreamPanelHandlers(args: StreamPanelHandlersArgs) {
             resp.error?.message ?? resp.error?.code ?? "workspace.reset failed",
         });
       } else {
-        clearWorkspaceBinPanels(workspace.workspaceId, node.id);
+        clearWorkspaceBinPanels(workspace.workspaceId, node.nodeId);
         return;
       }
     }

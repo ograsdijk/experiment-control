@@ -170,6 +170,12 @@ export const STREAM_DAG_OPS: Record<StreamDagOpId, StreamDagOpDef> = {
     outputKind: "scalar",
     params: [],
   },
+  "trace.scale": {
+    label: "trace.scale",
+    inputs: ["trace"],
+    outputKind: "trace",
+    params: [{ name: "factor", label: "factor", kind: "number" }],
+  },
   "fit.curve_1d": {
     label: "fit.curve_1d",
     inputs: ["x", "y"],
@@ -370,6 +376,7 @@ export const STREAM_DAG_INPUT_KINDS: Record<
   "trace.crop": { trace: "trace" },
   "trace.subtract_background": { trace: "trace" },
   "trace.integrate": { trace: "trace" },
+  "trace.scale": { trace: "trace" },
   "fit.curve_1d": { x: "trace", y: "trace", gate: "scalar" },
   "fit.yhat": { fit: "fit_1d" },
   "fit.xhat": { fit: "fit_1d" },
@@ -413,6 +420,9 @@ export function defaultParamsForOp(op: StreamDagOpId): Record<string, unknown> {
   }
   if (op === "trace.subtract_background") {
     return { bg_start_idx: 0, bg_stop_idx: 1 };
+  }
+  if (op === "trace.scale") {
+    return { factor: 1.0 };
   }
   if (op === "trace.rolling_mean") {
     return { window_traces: 1 };
@@ -499,7 +509,7 @@ export function isPublishableNodeKind(
 
 export function cloneDagNodes(nodes: StreamDagNodeConfig[]): StreamDagNodeConfig[] {
   return nodes.map((node) => ({
-    id: node.id,
+    nodeId: node.nodeId,
     op: node.op,
     params: { ...node.params },
     inputs: { ...node.inputs },
@@ -517,8 +527,13 @@ export function normalizeDagNode(raw: unknown): StreamDagNodeConfig | null {
   if (!raw || typeof raw !== "object") {
     return null;
   }
-  const obj = raw as { id?: unknown; op?: unknown; params?: unknown; inputs?: unknown };
-  const id = String(obj.id ?? "").trim();
+  const obj = raw as {
+    node_id?: unknown;
+    op?: unknown;
+    params?: unknown;
+    inputs?: unknown;
+  };
+  const nodeId = String(obj.node_id ?? "").trim();
   const opText = String(obj.op ?? "").trim();
   const legacyMode =
     opText === "source.stream_average"
@@ -527,7 +542,7 @@ export function normalizeDagNode(raw: unknown): StreamDagNodeConfig | null {
         ? "sum"
         : null;
   const opRaw = (legacyMode ? "source.stream" : opText) as StreamDagOpId;
-  if (!id || !Object.prototype.hasOwnProperty.call(STREAM_DAG_OPS, opRaw)) {
+  if (!nodeId || !Object.prototype.hasOwnProperty.call(STREAM_DAG_OPS, opRaw)) {
     return null;
   }
   const paramsSrc =
@@ -561,7 +576,7 @@ export function normalizeDagNode(raw: unknown): StreamDagNodeConfig | null {
       inputs[port] = rawValue.trim();
     }
   }
-  return { id, op: opRaw, params, inputs };
+  return { nodeId, op: opRaw, params, inputs };
 }
 
 export function normalizeDagOutput(raw: unknown): StreamDagOutputConfig | null {

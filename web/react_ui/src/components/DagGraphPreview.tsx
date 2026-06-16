@@ -3,7 +3,7 @@ import { ActionIcon, Group, Text } from "@mantine/core";
 import { IconZoomIn, IconZoomOut, IconZoomReset } from "@tabler/icons-react";
 
 export type DagGraphNode = {
-  id: string;
+  nodeId: string;
   op: string;
   inputs: Record<string, string>;
   params?: Record<string, unknown>;
@@ -191,10 +191,10 @@ export function DagGraphPreview({
 
   const layout = useMemo(() => {
     const cleanNodes = nodes.filter(
-      (node) => String(node.id ?? "").trim().length > 0
+      (node) => String(node.nodeId ?? "").trim().length > 0
     );
-    const byId = new Map(cleanNodes.map((node) => [node.id, node]));
-    const indexById = new Map(cleanNodes.map((node, idx) => [node.id, idx]));
+    const byId = new Map(cleanNodes.map((node) => [node.nodeId, node]));
+    const indexById = new Map(cleanNodes.map((node, idx) => [node.nodeId, idx]));
     const depthCache = new Map<string, number>();
 
     const depthFor = (nodeId: string, visiting = new Set<string>()): number => {
@@ -224,13 +224,13 @@ export function DagGraphPreview({
 
     const layers = new Map<number, DagGraphNode[]>();
     for (const node of cleanNodes) {
-      const depth = depthFor(node.id);
+      const depth = depthFor(node.nodeId);
       const list = layers.get(depth) ?? [];
       list.push(node);
       layers.set(depth, list);
     }
     for (const [, list] of layers.entries()) {
-      list.sort((a, b) => (indexById.get(a.id) ?? 0) - (indexById.get(b.id) ?? 0));
+      list.sort((a, b) => (indexById.get(a.nodeId) ?? 0) - (indexById.get(b.nodeId) ?? 0));
     }
 
     const nodeW = 220;
@@ -254,7 +254,7 @@ export function DagGraphPreview({
       const yStart = (viewH - layerHeight) / 2;
       for (let i = 0; i < layerNodes.length; i += 1) {
         const node = layerNodes[i];
-        positioned.set(node.id, {
+        positioned.set(node.nodeId, {
           node,
           x: marginX + depth * (nodeW + hGap),
           y: yStart + i * (nodeH + vGap),
@@ -271,7 +271,7 @@ export function DagGraphPreview({
       label: string;
     }> = [];
     for (const target of cleanNodes) {
-      const to = positioned.get(target.id);
+      const to = positioned.get(target.nodeId);
       if (!to) {
         continue;
       }
@@ -589,18 +589,18 @@ export function DagGraphPreview({
 
         {[...layout.positioned.values()].map(({ node, x, y }) => {
           const outputLabels = outputs
-            .filter((item) => item.nodeId === node.id)
+            .filter((item) => item.nodeId === node.nodeId)
             .map((item) => item.outputId);
-          const resettable = resettableNodeIds?.has(node.id) === true;
-          const resetBusy = resetNodeBusyId === node.id;
+          const resettable = resettableNodeIds?.has(node.nodeId) === true;
+          const resetBusy = resetNodeBusyId === node.nodeId;
           const meta = nodeMeta(node);
           const outputY = meta.summary || meta.warning ? y + 66 : y + 56;
           return (
             <g
-              key={node.id}
+              key={node.nodeId}
               data-dag-clickable="true"
               style={{ cursor: onNodeClick ? "pointer" : undefined }}
-              onClick={() => onNodeClick?.(node.id)}
+              onClick={() => onNodeClick?.(node.nodeId)}
             >
             <rect
               x={x}
@@ -614,7 +614,7 @@ export function DagGraphPreview({
               strokeWidth={outputLabels.length > 0 ? 2 : 1}
             />
             <text x={x + 10} y={y + 22} fontSize={13} fill="#ffffff" fontWeight="700">
-              {node.id}
+              {node.nodeId}
             </text>
             <text x={x + 10} y={y + 40} fontSize={11} fill="rgba(255,255,255,0.95)">
               {node.op}
@@ -630,7 +630,7 @@ export function DagGraphPreview({
                 </text>
               ) : null}
               {outputLabels.map((label, idx) => (
-              <g key={`${node.id}:out:${label}:${idx}`}>
+              <g key={`${node.nodeId}:out:${label}:${idx}`}>
                 <rect
                   x={x + 10 + idx * 74}
                   y={outputY}
@@ -661,7 +661,7 @@ export function DagGraphPreview({
                     if (resetBusy) {
                       return;
                     }
-                    onResetNode?.(node.id);
+                    onResetNode?.(node.nodeId);
                   }}
                 >
                   <rect
