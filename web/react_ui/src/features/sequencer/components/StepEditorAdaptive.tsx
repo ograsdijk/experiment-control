@@ -1429,37 +1429,6 @@ export function AdaptiveStepEditor({
                             valueLabel="Param value"
                             removeLabel="Remove param"
                             nextNamePrefix="param"
-                            onAdd={
-                              paramNameOptions.length > 0
-                                ? () => {
-                                    const existingNames = new Set(
-                                      callParamEntries.map((entry) => entry.name)
-                                    );
-                                    const nextKnown = paramNameOptions.find(
-                                      (name) => !existingNames.has(name)
-                                    );
-                                    const nextName =
-                                      nextKnown ?? nextParamName(callParamEntries);
-                                    updateMetric({
-                                      ...metric,
-                                      config: withMetricCallParamEntries(metric, [
-                                        ...callParamEntries,
-                                        {
-                                          name: nextName,
-                                          value: getCapabilityParamDefaultValue(
-                                            paramSpecsByName.get(nextName)
-                                          ),
-                                        },
-                                      ]),
-                                    });
-                                  }
-                                : undefined
-                            }
-                            valuePlaceholderResolver={(entry) =>
-                              getCapabilityParamPlaceholder(
-                                paramSpecsByName.get(entry.name)
-                              )
-                            }
                           />
                         ) : null}
                         {issues.length > 0 ? (

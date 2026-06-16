@@ -606,7 +606,7 @@ export function useStateMachinesController({
     const processById = new Map(processes.map((process) => [process.process_id, process]));
     const nowWallS = Date.now() / 1000;
     return Object.entries(bindingsByProcessId)
-      .map(([processId, binding]) => {
+      .map(([processId, binding]): StateMachineProcessRow | null => {
         const process = processById.get(processId);
         if (!process) {
           return null;

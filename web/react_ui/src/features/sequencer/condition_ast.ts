@@ -300,7 +300,7 @@ function astToFlowObject(ast: ConditionAst): string | null {
 
 export function defaultConditionAst(
   op: ConditionCompareOp = "gt"
-): ConditionAst {
+): Exclude<ConditionAst, { kind: "empty" } | { kind: "raw" }> {
   if (op === "abs_lt") {
     return {
       kind: "compare",

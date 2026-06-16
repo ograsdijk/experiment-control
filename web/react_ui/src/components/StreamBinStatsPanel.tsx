@@ -452,7 +452,7 @@ export function StreamBinStatsPanel({
       data[3],
       ...overlayData.map((entry) => entry.values),
     ];
-    plotRef.current = new uPlot(opts, fullData, hostRef.current);
+    plotRef.current = new uPlot(opts, fullData as uPlot.AlignedData, hostRef.current);
     const resize = new ResizeObserver(() => {
       if (!hostRef.current || !plotRef.current) {
         return;

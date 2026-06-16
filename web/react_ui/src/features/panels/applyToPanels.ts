@@ -130,7 +130,8 @@ export function buildPanelsByWorkspaceOutput(
     bucket.push(panel);
   };
   for (const panel of panels) {
-    const workspaceId = String(panel.workspaceId ?? "").trim();
+    const workspaceId =
+      "workspaceId" in panel ? String(panel.workspaceId ?? "").trim() : "";
     if (!workspaceId) {
       continue;
     }

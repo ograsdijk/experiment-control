@@ -410,7 +410,7 @@ export function InterlockConditionView({
       );
     }
     if (current.kind === "comparison") {
-      const symbolByOp: Record<ConditionNode["op"], string> = {
+      const symbolByOp: Record<Extract<ConditionNode, { kind: "comparison" }>["op"], string> = {
         eq: "=",
         ne: "!=",
         gt: ">",
@@ -419,7 +419,7 @@ export function InterlockConditionView({
         le: "<=",
         abs_lt: "|x| <",
       };
-      const colorByOp: Record<ConditionNode["op"], string> = {
+      const colorByOp: Record<Extract<ConditionNode, { kind: "comparison" }>["op"], string> = {
         eq: "blue",
         ne: "blue",
         gt: "violet",

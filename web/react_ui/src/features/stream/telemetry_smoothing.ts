@@ -62,13 +62,13 @@ export function smoothTelemetrySeriesEma(
     if (!isFiniteNumber(ti) || !isFiniteNumber(value)) {
       continue;
     }
-    const shouldReset =
+    if (
       ema === null ||
       prevT === null ||
       !isFiniteNumber(prevT) ||
       ti < prevT ||
-      ti - prevT > maxGap;
-    if (shouldReset) {
+      ti - prevT > maxGap
+    ) {
       ema = value;
       prevT = ti;
       out[i] = ema;

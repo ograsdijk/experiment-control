@@ -17,10 +17,10 @@ import {
 } from "../stream/dag";
 import type {
   StreamAnalysisWorkspaceConfig,
-  StreamCatalogEntry,
   StreamDagNodeConfig,
   StreamDagOutputConfig,
 } from "../stream/types";
+import type { StreamCatalogEntry } from "../../types";
 import {
   defaultOutputForKind,
   defaultStreamWorkspaceName,

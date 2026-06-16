@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { normalizeUiProfile } from "./utils";
 import type { PlotState } from "./types";
+import type { CommandDeckCommandEntry } from "../../types";
 
 const normalizePlotState = (_raw: unknown): PlotState => ({
   panels: [],
@@ -130,8 +131,8 @@ describe("profile normalizeUiProfile", () => {
     );
     expect(profile).not.toBeNull();
     expect(profile?.commandDeck).toHaveLength(1);
-    expect(profile?.commandDeck[0].targetId).toBe("laser");
-    expect(profile?.commandDeck[0].action).toBe("set_frequency_hz");
+    expect((profile?.commandDeck[0] as CommandDeckCommandEntry).targetId).toBe("laser");
+    expect((profile?.commandDeck[0] as CommandDeckCommandEntry).action).toBe("set_frequency_hz");
   });
 
   it("accepts process command deck entries", () => {
@@ -160,9 +161,9 @@ describe("profile normalizeUiProfile", () => {
     );
     expect(profile).not.toBeNull();
     expect(profile?.commandDeck).toHaveLength(1);
-    expect(profile?.commandDeck[0].targetKind).toBe("process");
-    expect(profile?.commandDeck[0].targetId).toBe("bias_sequence");
-    expect(profile?.commandDeck[0].action).toBe("turn_on");
+    expect((profile?.commandDeck[0] as CommandDeckCommandEntry).targetKind).toBe("process");
+    expect((profile?.commandDeck[0] as CommandDeckCommandEntry).targetId).toBe("bias_sequence");
+    expect((profile?.commandDeck[0] as CommandDeckCommandEntry).action).toBe("turn_on");
   });
 
   it("accepts telemetry deck entries", () => {

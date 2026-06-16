@@ -338,10 +338,12 @@ export function usePanelLifecycle(args: PanelLifecycleArgs) {
         : typeof latestValue === "number"
         ? "number"
         : undefined;
-    const trace = { deviceId, signal, units, valueKind };
+    const trace: TraceKey = { deviceId, signal, units, valueKind };
     setPanels((prev) =>
       prev.map((p) =>
-        p.id === panelId ? { ...p, traces: [...p.traces, trace] } : p
+        p.id === panelId && isTelemetryPanel(p)
+          ? { ...p, traces: [...p.traces, trace] }
+          : p
       )
     );
     const panelBuffers = ensurePanelBuffersImpl(buffersRef, panelId);
