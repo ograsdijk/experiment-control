@@ -53,6 +53,30 @@ class CommandAction:
 
 
 @dataclass(frozen=True)
+class ProcessAction:
+    process_id: str
+    action: str
+    params: dict[str, Any]
+    timeout_s: float | None
+    retries: int
+
+
+def _action_status_payload(action: CommandAction | ProcessAction) -> dict[str, Any]:
+    """Serialize an action for the watchdog status RPC (device vs process)."""
+    payload: dict[str, Any] = {
+        "action": action.action,
+        "params": action.params,
+        "timeout_s": action.timeout_s,
+        "retries": action.retries,
+    }
+    if isinstance(action, ProcessAction):
+        payload["process_id"] = action.process_id
+    else:
+        payload["device_id"] = action.device_id
+    return payload
+
+
+@dataclass(frozen=True)
 class WatchdogArm:
     condition: Any
     disarm_condition: Any | None
@@ -70,7 +94,7 @@ class WatchdogRule:
     cooldown_s: float
     latch: bool
     on_unknown: str
-    actions: list[CommandAction]
+    actions: list[CommandAction | ProcessAction]
     arm: WatchdogArm | None = None
 
 
@@ -154,54 +178,74 @@ def _parse_watchdog_actions(
     *,
     rule_raw: dict[str, Any],
     rule_index: int,
-) -> list[CommandAction]:
+) -> list[CommandAction | ProcessAction]:
     actions_raw = normalize_list(rule_raw.get("actions"), path=["rules", rule_index, "actions"])
     if not actions_raw:
         raise ConfigError(path=f"rules[{rule_index}].actions", message="actions are required")
-    actions: list[CommandAction] = []
+    actions: list[CommandAction | ProcessAction] = []
     for action_index, action_raw in enumerate(actions_raw):
         if not isinstance(action_raw, dict):
             raise ConfigError(
                 path=f"rules[{rule_index}].actions[{action_index}]",
                 message="must be an object/dict",
             )
-        if "command" not in action_raw:
+        has_command = "command" in action_raw
+        has_process = "process" in action_raw
+        if has_command == has_process:
             raise ConfigError(
                 path=f"rules[{rule_index}].actions[{action_index}]",
-                message="only command actions are supported",
+                message="each action must be exactly one of 'command' or 'process'",
             )
-        cmd = require_dict(
-            action_raw.get("command"),
-            path=["rules", rule_index, "actions", action_index, "command"],
+        kind = "command" if has_command else "process"
+        spec = require_dict(
+            action_raw.get(kind),
+            path=["rules", rule_index, "actions", action_index, kind],
         )
-        device_id = require_str(
-            cmd.get("device_id"),
-            path=["rules", rule_index, "actions", action_index, "command", "device_id"],
-        )
+        # Shared fields (both command and process actions): the RPC verb,
+        # params, per-call timeout, retry count.
         action = require_str(
-            cmd.get("action"),
-            path=["rules", rule_index, "actions", action_index, "command", "action"],
+            spec.get("action"),
+            path=["rules", rule_index, "actions", action_index, kind, "action"],
         )
-        params = cmd.get("params", {}) or {}
+        params = spec.get("params", {}) or {}
         if not isinstance(params, dict):
             raise ConfigError(
-                path=f"rules[{rule_index}].actions[{action_index}].command.params",
+                path=f"rules[{rule_index}].actions[{action_index}].{kind}.params",
                 message="params must be a dict",
             )
-        timeout_s = cmd.get("timeout_s")
+        timeout_s = spec.get("timeout_s")
         timeout_s_val = None if timeout_s is None else float(timeout_s)
-        retries = coerce_int(cmd.get("retries"), default=0)
+        retries = coerce_int(spec.get("retries"), default=0)
         if retries < 0:
             retries = 0
-        actions.append(
-            CommandAction(
-                device_id=device_id,
-                action=action,
-                params=params,
-                timeout_s=timeout_s_val,
-                retries=retries,
+        if kind == "command":
+            device_id = require_str(
+                spec.get("device_id"),
+                path=["rules", rule_index, "actions", action_index, "command", "device_id"],
             )
-        )
+            actions.append(
+                CommandAction(
+                    device_id=device_id,
+                    action=action,
+                    params=params,
+                    timeout_s=timeout_s_val,
+                    retries=retries,
+                )
+            )
+        else:
+            process_id = require_str(
+                spec.get("process_id"),
+                path=["rules", rule_index, "actions", action_index, "process", "process_id"],
+            )
+            actions.append(
+                ProcessAction(
+                    process_id=process_id,
+                    action=action,
+                    params=params,
+                    timeout_s=timeout_s_val,
+                    retries=retries,
+                )
+            )
     return actions
 
 
@@ -807,11 +851,35 @@ class WatchdogProcess(ManagedProcessBase):
     ) -> None:
         for action in rule.actions:
             total_attempts = 1 + max(0, int(action.retries))
-            command_payload = {
-                "device_id": action.device_id,
-                "action": action.action,
-                "params": action.params,
-            }
+            # Build the manager request + an event descriptor per action kind.
+            # Device commands go straight to the router as a `command`; process
+            # actions are wrapped in a `manager.processes.rpc` envelope (same
+            # shape used by the client/gateway, e.g. sequencer.pause).
+            if isinstance(action, ProcessAction):
+                command_payload = {
+                    "process_id": action.process_id,
+                    "action": action.action,
+                    "params": action.params,
+                }
+                req = {
+                    "type": "manager.processes.rpc",
+                    "process_id": action.process_id,
+                    "request": {"type": action.action, "params": action.params},
+                    "caller_process_id": self._process_id,
+                }
+            else:
+                command_payload = {
+                    "device_id": action.device_id,
+                    "action": action.action,
+                    "params": action.params,
+                }
+                req = {
+                    "type": "command",
+                    "device_id": action.device_id,
+                    "action": action.action,
+                    "params": action.params,
+                    "caller_process_id": self._process_id,
+                }
             for attempt in range(1, total_attempts + 1):
                 self._publish_action_sent(
                     watchdog_id=watchdog_id,
@@ -820,13 +888,6 @@ class WatchdogProcess(ManagedProcessBase):
                     attempt=attempt,
                     retries=action.retries,
                 )
-                req = {
-                    "type": "command",
-                    "device_id": action.device_id,
-                    "action": action.action,
-                    "params": action.params,
-                    "caller_process_id": self._process_id,
-                }
                 timeout_ms = None
                 if action.timeout_s is not None:
                     timeout_ms = max(1, int(float(action.timeout_s) * 1000))
@@ -1055,13 +1116,7 @@ class WatchdogProcess(ManagedProcessBase):
                             for binding in rule.telemetry
                         ],
                         "actions": [
-                            {
-                                "device_id": action.device_id,
-                                "action": action.action,
-                                "params": action.params,
-                                "timeout_s": action.timeout_s,
-                                "retries": action.retries,
-                            }
+                            _action_status_payload(action)
                             for action in rule.actions
                         ],
                         "stable_for_s": rule.stable_for_s,
