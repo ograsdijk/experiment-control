@@ -1471,11 +1471,9 @@ def _is_special_input_source(op: str, port: str, source_id: str) -> bool:
 def _normalize_node(raw: Any, *, index: int) -> NodeSpec:
     if not isinstance(raw, dict):
         raise ValueError(f"graph.nodes[{index}] must be an object")
-    node_id = _normalize_id(raw.get("id"))
+    node_id = _normalize_id(raw.get("node_id"))
     if node_id is None:
-        node_id = _normalize_id(raw.get("node_id"))
-    if node_id is None:
-        raise ValueError(f"graph.nodes[{index}].id is required")
+        raise ValueError(f"graph.nodes[{index}].node_id is required")
     op = _normalize_id(raw.get("op"))
     if op is None:
         raise ValueError(f"graph.nodes[{index}].op is required")

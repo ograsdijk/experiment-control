@@ -134,7 +134,7 @@ export function useDaqWorkspaceApply(args: DaqWorkspaceApplyArgs) {
       });
       return;
     }
-    const nodeIds = cleanedNodes.map((node) => node.id);
+    const nodeIds = cleanedNodes.map((node) => node.nodeId);
     const uniqueNodeIds = new Set(nodeIds);
     if (uniqueNodeIds.size !== nodeIds.length) {
       notifications.show({

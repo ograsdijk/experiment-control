@@ -24,6 +24,7 @@ export type StreamDagOpId =
   | "trace.crop"
   | "trace.subtract_background"
   | "trace.integrate"
+  | "trace.scale"
   | "fit.curve_1d"
   | "fit.yhat"
   | "fit.xhat"
@@ -53,7 +54,7 @@ export type StreamFitParamsMap = Record<string, StreamFitParamSample>;
 export type StreamParamsOutputValue = number | StreamFitParamsMap;
 
 export type StreamDagNodeConfig = {
-  id: string;
+  nodeId: string;
   op: StreamDagOpId;
   params: Record<string, unknown>;
   inputs: Record<string, string>;

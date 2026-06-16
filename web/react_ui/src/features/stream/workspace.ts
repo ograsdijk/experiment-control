@@ -40,7 +40,7 @@ export function defaultGraphForLegacyWorkspace(
 ): { nodes: StreamDagNodeConfig[]; outputs: StreamDagOutputConfig[] } {
   const nodes: StreamDagNodeConfig[] = [
     {
-      id: "src",
+      nodeId: "src",
       op: "source.stream",
       params: {
         device_id: workspace.stream?.deviceId ?? "",
@@ -55,7 +55,7 @@ export function defaultGraphForLegacyWorkspace(
   let traceNodeId = "src";
   if (workspace.analysis.backgroundEnabled) {
     nodes.push({
-      id: "bg",
+      nodeId: "bg",
       op: "trace.subtract_background",
       params: {
         bg_start_idx: workspace.analysis.backgroundStartIdx,
@@ -66,7 +66,7 @@ export function defaultGraphForLegacyWorkspace(
     traceNodeId = "bg";
   }
   nodes.push({
-    id: "crop",
+    nodeId: "crop",
     op: "trace.crop",
     params: {
       start_idx: workspace.analysis.traceStartIdx,
@@ -78,19 +78,19 @@ export function defaultGraphForLegacyWorkspace(
   });
   traceNodeId = "crop";
   nodes.push({
-    id: "integral",
+    nodeId: "integral",
     op: "trace.integrate",
     params: {},
     inputs: { trace: traceNodeId },
   });
   nodes.push({
-    id: "ctx_x",
+    nodeId: "ctx_x",
     op: "source.context_field",
     params: { field: workspace.binStats.contextField },
     inputs: {},
   });
   nodes.push({
-    id: "bin",
+    nodeId: "bin",
     op: "aggregate.bin_stats",
     params: {
       auto_range: workspace.binStats.autoRange,
@@ -112,7 +112,7 @@ export function defaultGraphForLegacyWorkspace(
 export function workspaceNodeMap(
   workspace: StreamAnalysisWorkspaceConfig
 ): Map<string, StreamDagNodeConfig> {
-  return new Map(workspace.graphNodes.map((node) => [node.id, node]));
+  return new Map(workspace.graphNodes.map((node) => [node.nodeId, node]));
 }
 
 export function workspaceOutputKind(
@@ -126,7 +126,7 @@ export function workspaceOutputKind(
   if (!output) {
     return null;
   }
-  const node = workspace.graphNodes.find((item) => item.id === output.nodeId);
+  const node = workspace.graphNodes.find((item) => item.nodeId === output.nodeId);
   if (!node) {
     return null;
   }

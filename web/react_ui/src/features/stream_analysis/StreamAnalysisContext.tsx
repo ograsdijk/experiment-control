@@ -47,8 +47,8 @@ import {
  *   panel state moves.
  *
  * No downstream centrex instance UI imports any DAQ-related hook
- * (verified via grep against `instances/*/instance_ui/*/src/`), so
- * adding this context has zero downstream impact.
+ * (verified via grep against the instances' instance_ui app src dirs),
+ * so adding this context has zero downstream impact.
  */
 
 export interface StreamAnalysisContextValue {
