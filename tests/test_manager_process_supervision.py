@@ -164,6 +164,91 @@ class ProcessSnapshotMemoryTests(unittest.TestCase):
         self.assertEqual(handle.termination_method, "terminate")
         self.assertEqual(events[-1][0], "manager.process.failed")
 
+    def test_heartbeat_stale_deferred_during_startup_grace(self) -> None:
+        # No recent loop stall, but startup_sequence is active: a slow first
+        # heartbeat (heavy imports) must be deferred unconditionally, even past
+        # what would otherwise be a terminating strike count, so the process
+        # isn't killed while it is still booting.
+        manager = SimpleNamespace(
+            _last_loop_stall_mono=None,
+            _last_loop_stall_duration_s=0.0,
+            _manager_loop_stall_recent_s=10.0,
+            _heartbeat_stale_strikes_to_fail=2,
+            _heartbeat_hard_timeout_multiplier=3.0,
+            _startup_sequence_active=True,
+            _startup_sequence_complete_mono=None,
+            _publish_manager_event=lambda *args, **kwargs: None,
+            _publish_process_event=lambda *args, **kwargs: None,
+        )
+        handle = _make_handle()
+        handle.last_hb_recv_mono = 6.0  # hb_age = 4 > timeout 3 at t=10
+        handle.popen = _FakePopen()
+        handle.heartbeat_stale_strikes = 5  # already well past the fail threshold
+        handle.last_stale_detected_mono = 8.5
+
+        enforce_managed_process_heartbeat_timeout(manager, handle, 10.0)
+
+        self.assertEqual(handle.state, "RUNNING")
+        self.assertFalse(handle.popen.terminated)
+        # strikes are capped below the fail threshold while in startup grace
+        self.assertLess(handle.heartbeat_stale_strikes, 2)
+
+    def test_heartbeat_stale_fails_after_startup_grace_window(self) -> None:
+        # Startup completed long ago and there is no recent loop stall, so the
+        # grace no longer applies: a genuinely stale process must still fail.
+        events: list[tuple[str, object]] = []
+        manager = SimpleNamespace(
+            _last_loop_stall_mono=None,
+            _last_loop_stall_duration_s=0.0,
+            _manager_loop_stall_recent_s=10.0,
+            _heartbeat_stale_strikes_to_fail=2,
+            _heartbeat_hard_timeout_multiplier=3.0,
+            _startup_sequence_active=False,
+            _startup_sequence_complete_mono=0.0,  # > recent window before now=100
+            _publish_manager_event=lambda topic, payload: events.append((topic, payload)),
+            _publish_process_event=lambda topic, handle: events.append((topic, handle)),
+        )
+        handle = _make_handle()
+        handle.last_hb_recv_mono = 96.0  # hb_age = 4 > timeout 3 at t=100
+        handle.popen = _FakePopen()
+        handle.heartbeat_stale_strikes = 1
+        handle.last_stale_detected_mono = 98.0  # > one period ago -> 2nd strike
+
+        enforce_managed_process_heartbeat_timeout(manager, handle, 100.0)
+
+        self.assertEqual(handle.state, "FAILED")
+        self.assertTrue(handle.popen.terminated)
+        self.assertEqual(events[-1][0], "manager.process.failed")
+
+    def test_startup_grace_is_bounded_by_hard_timeout(self) -> None:
+        # Even DURING startup grace, a process whose heartbeat age exceeds
+        # _startup_grace_hard_timeout_s is failed — a crashed-at-boot process
+        # must not hide for the whole startup window.
+        events: list[tuple[str, object]] = []
+        manager = SimpleNamespace(
+            _last_loop_stall_mono=None,
+            _last_loop_stall_duration_s=0.0,
+            _manager_loop_stall_recent_s=10.0,
+            _heartbeat_stale_strikes_to_fail=2,
+            _heartbeat_hard_timeout_multiplier=3.0,
+            _startup_sequence_active=True,  # in startup grace
+            _startup_sequence_complete_mono=None,
+            _startup_grace_hard_timeout_s=5.0,
+            _publish_manager_event=lambda topic, payload: events.append((topic, payload)),
+            _publish_process_event=lambda topic, handle: events.append((topic, handle)),
+        )
+        handle = _make_handle()
+        handle.last_hb_recv_mono = 4.0  # hb_age = 6 at t=10, > grace hard cap 5
+        handle.popen = _FakePopen()
+        handle.heartbeat_stale_strikes = 1
+        handle.last_stale_detected_mono = 8.5
+
+        enforce_managed_process_heartbeat_timeout(manager, handle, 10.0)
+
+        self.assertEqual(handle.state, "FAILED")
+        self.assertTrue(handle.popen.terminated)
+        self.assertEqual(events[-1][0], "manager.process.failed")
+
     def test_strike_increments_rate_limited_to_one_per_period(self) -> None:
         """During a recent stall, a series of rapid stale checks within
         one heartbeat_period_s must only count as a single strike.

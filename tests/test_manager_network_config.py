@@ -4,13 +4,81 @@ import sys
 import unittest
 from pathlib import Path
 
+import zmq
+
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from experiment_control.utils.config_parsing import ConfigError
-from experiment_control.utils.manager_network import resolve_manager_network
+from experiment_control.utils.manager_network import (
+    connect_dealer,
+    resolve_manager_network,
+    resolve_tcp_endpoint,
+)
+
+
+class ResolveTcpEndpointTests(unittest.TestCase):
+    def test_ipv4_literal_passes_through(self) -> None:
+        self.assertEqual(
+            resolve_tcp_endpoint("tcp://10.10.222.12:6002"), "tcp://10.10.222.12:6002"
+        )
+
+    def test_wildcard_passes_through(self) -> None:
+        self.assertEqual(resolve_tcp_endpoint("tcp://0.0.0.0:7000"), "tcp://0.0.0.0:7000")
+
+    def test_localhost_resolves_to_ipv4_loopback(self) -> None:
+        # Must prefer IPv4 (the stack binds IPv4), not ::1.
+        self.assertEqual(resolve_tcp_endpoint("tcp://localhost:6000"), "tcp://127.0.0.1:6000")
+
+    def test_unresolvable_host_returns_none(self) -> None:
+        self.assertIsNone(resolve_tcp_endpoint("tcp://TODO_BRISTOL_WAVEMETER_HOST:6412"))
+
+    def test_malformed_host_returns_none_not_raises(self) -> None:
+        # getaddrinfo raises UnicodeError (NOT OSError) for these; resolve must
+        # normalize to None, never let it escape onto the warmup thread/poll loop.
+        self.assertIsNone(resolve_tcp_endpoint("tcp://" + "x" * 64 + ":6000"))
+        self.assertIsNone(resolve_tcp_endpoint("tcp://a..b:6000"))
+
+    def test_empty_host_returns_none(self) -> None:
+        self.assertIsNone(resolve_tcp_endpoint("tcp://:5555"))
+
+    def test_non_tcp_or_malformed_returns_none(self) -> None:
+        self.assertIsNone(resolve_tcp_endpoint("not-an-endpoint"))
+        self.assertIsNone(resolve_tcp_endpoint("tcp://hostonly"))
+
+
+class _FakeSock:
+    def __init__(self) -> None:
+        self.opts: dict[int, int] = {}
+        self.connected: str | None = None
+
+    def setsockopt(self, opt: int, val: int) -> None:
+        self.opts[opt] = val
+
+    def connect(self, endpoint: str) -> None:
+        self.connected = endpoint
+
+
+class _FakeCtx:
+    def __init__(self) -> None:
+        self.last: _FakeSock | None = None
+
+    def socket(self, _type: int) -> _FakeSock:
+        self.last = _FakeSock()
+        return self.last
+
+
+class ConnectDealerTests(unittest.TestCase):
+    def test_sets_timeouts_and_connects_to_resolved_ip(self) -> None:
+        ctx = _FakeCtx()
+        sock = connect_dealer(ctx, "tcp://10.0.0.5:6000", timeout_ms=1500)
+        self.assertIs(sock, ctx.last)
+        self.assertEqual(sock.connected, "tcp://10.0.0.5:6000")
+        self.assertEqual(sock.opts[zmq.LINGER], 0)
+        self.assertEqual(sock.opts[zmq.RCVTIMEO], 1500)
+        self.assertEqual(sock.opts[zmq.SNDTIMEO], 1500)
 
 
 class ManagerNetworkConfigTests(unittest.TestCase):

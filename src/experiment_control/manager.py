@@ -415,6 +415,19 @@ class Manager(
         self._last_pump_gap_s: float | None = None
         self._last_loop_stall_mono: float | None = None
         self._last_loop_stall_duration_s: float | None = None
+        # Set while startup_sequence runs (and for a short grace window after).
+        # Process heartbeat staleness is deferred during this window so a
+        # slow-importing process (e.g. stream_analysis pulling in scipy) isn't
+        # failed before it can emit its first heartbeat. See
+        # process_supervision._in_startup_grace.
+        self._startup_sequence_active = False
+        self._startup_sequence_complete_mono: float | None = None
+        # Grace window after startup_sequence completes (distinct from the
+        # loop-stall recency window) and an absolute ceiling on how long a
+        # never-heartbeating process may be deferred during startup before it is
+        # failed anyway (so a dead-at-boot process can't hide for a long startup).
+        self._startup_grace_s = 10.0
+        self._startup_grace_hard_timeout_s = 30.0
         self._loop_stall_count = 0
         self._manager_loop_stall_warn_s = 1.0
         self._manager_loop_stall_recent_s = 10.0

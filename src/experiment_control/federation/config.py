@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
 from fnmatch import fnmatchcase
 from typing import Any
@@ -24,6 +25,15 @@ DEFAULT_FEDERATION_RELAY_TOPICS: tuple[str, ...] = (
 )
 
 _SUPPORTED_RELAY_TOPICS = set(DEFAULT_FEDERATION_RELAY_TOPICS)
+
+# Per-attempt timeout for the best-effort peer metadata warmup
+# (config/schema/capabilities), which runs on a background thread. Kept
+# independent of and smaller than the device RPC timeout so a single warmup
+# thread isn't hogged for the full device timeout by an unreachable peer (and
+# so other, reachable peers warm promptly). Generous enough that a reachable
+# peer's cheap manager RPC always completes. Live federated *commands* still
+# use the peer's full ``rpc_timeout_ms``.
+DEFAULT_FEDERATION_METADATA_RPC_TIMEOUT_MS = 1500
 
 
 @dataclass(frozen=True)
@@ -69,6 +79,7 @@ class FederationPeerConfig:
     event_stale_s: float
     reconnect_backoff_s: float
     reconnect_backoff_max_s: float
+    metadata_rpc_timeout_ms: int = DEFAULT_FEDERATION_METADATA_RPC_TIMEOUT_MS
     warm_capabilities_on_startup: bool = False
     allow_reexport: bool = False
     policy: FederationPolicy = FederationPolicy()
@@ -154,6 +165,23 @@ def _pattern_list(raw: object, *, path: list[str | int], default: tuple[str, ...
     return tuple(out)
 
 
+_PLACEHOLDER_HOST_MARKERS = ("TODO", "CHANGEME", "CHANGE_ME", "<", "X.X.X.X", "YOUR-HOST")
+
+
+def _warn_if_placeholder_endpoint(endpoint: str, *, peer_id: str, field: str) -> None:
+    """Warn (never fail) when a peer endpoint host looks like an unfilled
+    placeholder (e.g. ``TODO_BRISTOL_WAVEMETER_HOST``). The stack still starts;
+    the peer is tolerated and skipped at runtime (its host won't resolve), but
+    the operator gets a loud, early signal instead of debugging a silent gap.
+    """
+    upper = endpoint.upper()
+    if any(marker in upper for marker in _PLACEHOLDER_HOST_MARKERS):
+        sys.stderr.write(
+            f"[federation] warning: peer {peer_id!r} {field} {endpoint!r} looks like "
+            "an unfilled placeholder; this peer will be skipped until its host is set.\n"
+        )
+
+
 def _validate_tcp_endpoint(value: str, *, path: list[str | int]) -> str:
     text = str(value or "").strip()
     if not text:
@@ -191,6 +219,11 @@ def parse_federation_config(
         default=3.0,
         minimum=0.001,
     )
+    default_metadata_rpc_timeout_ms = _int_value(
+        manager_raw.get("federation_metadata_rpc_timeout_ms"),
+        path=["manager", "federation_metadata_rpc_timeout_ms"],
+        default=DEFAULT_FEDERATION_METADATA_RPC_TIMEOUT_MS,
+    )
 
     peer_items = normalize_list(root.get("peers"), path=["federation", "peers"])
     if not peer_items:
@@ -225,6 +258,8 @@ def parse_federation_config(
             ),
             path=["federation", "peers", idx, "manager_pub"],
         )
+        _warn_if_placeholder_endpoint(router_rpc, peer_id=peer_id, field="router_rpc")
+        _warn_if_placeholder_endpoint(manager_pub, peer_id=peer_id, field="manager_pub")
 
         allow_reexport = _bool_value(
             peer_raw.get("allow_reexport"),
@@ -353,6 +388,11 @@ def parse_federation_config(
                 ),
                 reconnect_backoff_s=reconnect_backoff_s,
                 reconnect_backoff_max_s=reconnect_backoff_max_s,
+                metadata_rpc_timeout_ms=_int_value(
+                    peer_raw.get("metadata_rpc_timeout_ms"),
+                    path=["federation", "peers", idx, "metadata_rpc_timeout_ms"],
+                    default=default_metadata_rpc_timeout_ms,
+                ),
                 warm_capabilities_on_startup=_bool_value(
                     peer_raw.get("warm_capabilities_on_startup"),
                     path=[
