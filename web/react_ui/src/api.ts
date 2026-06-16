@@ -350,7 +350,18 @@ function normalizeWatchdogStatus(raw: unknown): WatchdogStatus | null {
           const timeoutRaw = asNumber(actionObj.timeout_s, Number.NaN);
           const retriesRaw = asNumber(actionObj.retries, Number.NaN);
           return {
-            device_id: asString(actionObj.device_id, ""),
+            // Device actions carry device_id; process actions carry
+            // process_id. Keep whichever is present (don't fabricate an
+            // empty device_id for process actions — that produced a
+            // bogus ".action" label in the watchdog panel).
+            device_id:
+              actionObj.device_id != null
+                ? asString(actionObj.device_id, "")
+                : undefined,
+            process_id:
+              actionObj.process_id != null
+                ? asString(actionObj.process_id, "")
+                : undefined,
             action: asString(actionObj.action, ""),
             params,
             timeout_s: Number.isFinite(timeoutRaw) ? timeoutRaw : null,
