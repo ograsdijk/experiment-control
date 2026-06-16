@@ -53,6 +53,7 @@ export interface CommandDeckRunnerArgs {
   refreshProcesses: () => Promise<ProcessStatus[]>;
 
   // Device-side capability cache (App-owned)
+  capabilitiesByDevice: Record<string, CapabilityMember[]>;
   setCapabilitiesByDevice: React.Dispatch<
     React.SetStateAction<Record<string, CapabilityMember[]>>
   >;
@@ -109,6 +110,7 @@ export function useCommandDeckRunner(args: CommandDeckRunnerArgs) {
     capabilitiesByProcess,
     ensureProcessCapabilitiesLoaded,
     refreshProcesses,
+    capabilitiesByDevice,
     setCapabilitiesByDevice,
     latestByDevice,
     sendDeviceCommand,
@@ -134,12 +136,7 @@ export function useCommandDeckRunner(args: CommandDeckRunnerArgs) {
     setCommandDeckBusyById,
     commandDeckIdRef,
   } = useCommands();
-  // NOTE: capabilitiesByDevice is not part of DevicesContextValue; this cast
-  // preserves the pre-existing (App-owned) lookup shape. See follow-up below.
-  const { orderedDevices, capabilitiesByDevice } = useDevicesContext() as unknown as {
-    orderedDevices: DeviceStatus[];
-    capabilitiesByDevice: Record<string, CapabilityMember[]>;
-  };
+  const { orderedDevices } = useDevicesContext();
   const { setDevicePanelTab } = useLayout();
 
   const createCommandDeckCommandEntry = (
