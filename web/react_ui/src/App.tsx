@@ -2141,6 +2141,7 @@ export function App() {
     capabilitiesByProcess,
     ensureProcessCapabilitiesLoaded,
     refreshProcesses,
+    capabilitiesByDevice,
     setCapabilitiesByDevice,
     latestByDevice,
     sendDeviceCommand,
