@@ -106,6 +106,8 @@ export interface StreamAnalysisContextValue {
   daqNodeCardRefs: MutableRefObject<Map<string, HTMLDivElement>>;
   /** Window timer id for the focus-into-view debounce. */
   daqNodeFocusTimeoutRef: MutableRefObject<number | null>;
+  /** Whether the stream_analysis RPC is ready (mutated by App.tsx). */
+  streamAnalysisReadyRef: MutableRefObject<boolean>;
 }
 
 const StreamAnalysisContext = createContext<StreamAnalysisContextValue | null>(
@@ -171,6 +173,7 @@ export function StreamAnalysisProvider({ children }: { children: ReactNode }) {
   const streamWorkspaceRevisionsRef = useRef<Record<string, number>>({});
   const daqNodeCardRefs = useRef<Map<string, HTMLDivElement>>(new Map());
   const daqNodeFocusTimeoutRef = useRef<number | null>(null);
+  const streamAnalysisReadyRef = useRef<boolean>(false);
 
   // Keep the two state-mirror refs in sync with their state. App.tsx used
   // to maintain these inline (see commits prior to round 9); centralising
@@ -227,6 +230,7 @@ export function StreamAnalysisProvider({ children }: { children: ReactNode }) {
       streamWorkspaceRevisionsRef,
       daqNodeCardRefs,
       daqNodeFocusTimeoutRef,
+      streamAnalysisReadyRef,
     }),
     [
       streamWorkspaces,
