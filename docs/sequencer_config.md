@@ -336,6 +336,24 @@ Modifiers:
 - `shuffle` + `seed`
 - `serpentine` (alternates direction based on parent loop index)
 
+### `sample`
+Draw a random subset from the generated set. `sample` is a sibling of the
+generator under `gen`, so it composes with any generator (e.g. visit `m` random
+spots on a `scan2d` grid instead of the whole grid).
+```yaml
+in:
+  gen:
+    scan2d:
+      center: {x: 0.0, y: 0.0}
+      size: 10
+      steps: {x: 11, y: 11}
+    sample: {count: 8, replace: true}
+```
+- `count` (required): number of records to draw.
+- `replace` (default `false`): allow repeats. `count` may exceed the population
+  size only when `replace: true`.
+- `seed` (optional): omit for a fresh (non-deterministic) draw each time.
+
 ### `scan2d`
 Generates 2D scan-point records for raster-like motion.
 

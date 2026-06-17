@@ -1,7 +1,5 @@
 import type {
   SequencerAdaptiveDetail,
-  SequencerAdaptiveFieldGroup,
-  SequencerAdaptiveMetricDetail,
   SequencerAtomicDetail,
   SequencerAssignDetail,
   SequencerCallDetail,
@@ -20,6 +18,22 @@ import type {
   SequencerWaitUntilDetail,
   SequencerWhileDetail,
 } from "./types";
+import type { Node } from "yaml";
+import {
+  childNode,
+  conditionEntries,
+  flattenEntries,
+  isMap,
+  isScalar,
+  isSeq,
+  leafText,
+  namedGroups,
+  normalizeScan2d,
+  readStep,
+  scalarField,
+  sectionEntries,
+  seqLength,
+} from "./yaml_detail";
 
 const STEP_CONTAINER_KEYS = new Set(["steps", "do", "then", "else"]);
 const STEP_ITEM_PATTERN = /^(\s*)-\s*([A-Za-z_][A-Za-z0-9_]*)\s*:(.*)$/;
@@ -85,268 +99,19 @@ function normalizeSnippet(lines: string[], indent: number): string {
     .join("\n");
 }
 
-function stripInlineComment(value: string): string {
-  return value.replace(/\s+#.*$/, "").trim();
-}
-
 function lineIndent(line: string): number {
   return line.match(/^\s*/)?.[0].length ?? 0;
 }
 
-function parseKeyValueLine(
-  line: string
-): { indent: number; key: string; value: string } | null {
-  const match = line.match(/^(\s*)([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(.*)$/);
-  if (!match) {
-    return null;
-  }
-  return {
-    indent: match[1].length,
-    key: match[2],
-    value: stripInlineComment(match[3] ?? ""),
-  };
-}
-
-function findSectionBaseIndent(lines: readonly string[]): number | null {
-  let baseIndent: number | null = null;
-  for (const line of lines) {
-    if (!line.trim() || line.trim().startsWith("#")) {
-      continue;
-    }
-    const indent = lineIndent(line);
-    if (baseIndent === null || indent < baseIndent) {
-      baseIndent = indent;
-    }
-  }
-  return baseIndent;
-}
-
-function findScalarValue(
-  lines: readonly string[],
-  key: string,
-  baseIndent: number | null
-): string | null {
-  if (baseIndent === null) {
-    return null;
-  }
-  for (const line of lines) {
-    const parsed = parseKeyValueLine(line);
-    if (!parsed || parsed.indent !== baseIndent || parsed.key !== key) {
-      continue;
-    }
-    return parsed.value || null;
-  }
-  return null;
-}
-
-function findSectionLines(
-  lines: readonly string[],
-  key: string,
-  baseIndent: number | null
-): string[] {
-  if (baseIndent === null) {
-    return [];
-  }
-  let startIndex = -1;
-  for (let index = 0; index < lines.length; index += 1) {
-    const parsed = parseKeyValueLine(lines[index]);
-    if (!parsed || parsed.indent !== baseIndent || parsed.key !== key) {
-      continue;
-    }
-    startIndex = index + 1;
-    break;
-  }
-  if (startIndex < 0) {
-    return [];
-  }
-  const sectionLines: string[] = [];
-  for (let index = startIndex; index < lines.length; index += 1) {
-    const line = lines[index];
-    if (!line.trim()) {
-      sectionLines.push(line);
-      continue;
-    }
-    const indent = lineIndent(line);
-    if (indent <= baseIndent) {
-      break;
-    }
-    sectionLines.push(line);
-  }
-  return sectionLines;
-}
-
-function flattenSectionEntries(lines: readonly string[]): SequencerOutlineMetadataEntry[] {
-  const entries: SequencerOutlineMetadataEntry[] = [];
-  const stack: Array<{ indent: number; key: string }> = [];
-
-  for (const line of lines) {
-    if (!line.trim() || line.trim().startsWith("#") || line.trim().startsWith("- ")) {
-      continue;
-    }
-    const parsed = parseKeyValueLine(line);
-    if (!parsed) {
-      continue;
-    }
-    while (stack.length > 0 && stack[stack.length - 1].indent >= parsed.indent) {
-      stack.pop();
-    }
-    if (parsed.value) {
-      const path = [...stack.map((item) => item.key), parsed.key].join(".");
-      entries.push({
-        name: path,
-        value: parsed.value,
-      });
-      continue;
-    }
-    stack.push({ indent: parsed.indent, key: parsed.key });
-  }
-
-  return entries;
-}
-
-function parseConditionSectionEntries(
-  lines: readonly string[]
-): SequencerOutlineMetadataEntry[] {
-  const flattened = flattenSectionEntries(lines);
-  if (flattened.length > 0) {
-    return flattened;
-  }
-  const baseIndent = findSectionBaseIndent(lines);
-  if (baseIndent === null) {
-    return [];
-  }
-
-  let head: { key: string; value: string } | null = null;
-  let headIndex = -1;
-  for (let index = 0; index < lines.length; index += 1) {
-    const parsed = parseKeyValueLine(lines[index]);
-    if (!parsed || parsed.indent !== baseIndent) {
-      continue;
-    }
-    head = { key: parsed.key, value: parsed.value };
-    headIndex = index;
-    break;
-  }
-  if (!head) {
-    return [];
-  }
-  if (head.value) {
-    return [{ name: head.key, value: head.value }];
-  }
-  if (head.key !== "and" && head.key !== "or" && head.key !== "not") {
-    return [];
-  }
-
-  const childLines = lines.slice(Math.max(0, headIndex + 1));
-  const items: string[] = [];
-
-  for (let index = 0; index < childLines.length; index += 1) {
-    const line = childLines[index];
-    if (!line.trim() || line.trim().startsWith("#")) {
-      continue;
-    }
-    const match = line.match(/^(\s*)-\s*(.*)$/);
-    if (!match) {
-      continue;
-    }
-    const dashIndent = match[1].length;
-    const inline = stripInlineComment(match[2] ?? "").trim();
-    if (inline) {
-      items.push(inline.startsWith("{") ? inline : `{${inline}}`);
-      continue;
-    }
-
-    let firstNested: string | null = null;
-    for (let next = index + 1; next < childLines.length; next += 1) {
-      const nextLine = childLines[next];
-      if (!nextLine.trim() || nextLine.trim().startsWith("#")) {
-        continue;
-      }
-      const nextIndent = lineIndent(nextLine);
-      if (nextIndent <= dashIndent) {
-        break;
-      }
-      firstNested = stripInlineComment(nextLine.trim());
-      break;
-    }
-    if (firstNested) {
-      items.push(firstNested.startsWith("{") ? firstNested : `{${firstNested}}`);
-    }
-  }
-
-  if (head.key === "not") {
-    if (items.length <= 0) {
-      return [];
-    }
-    return [{ name: "not", value: items[0] }];
-  }
-  return [{ name: head.key, value: `[${items.join(", ")}]` }];
-}
-
-function parseScalarListEntries(lines: readonly string[]): SequencerOutlineMetadataEntry[] {
-  const entries: SequencerOutlineMetadataEntry[] = [];
-  let index = 0;
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith("#")) {
-      continue;
-    }
-    const itemMatch = line.match(/^\s*-\s*(.*)$/);
-    if (!itemMatch) {
-      continue;
-    }
-    entries.push({
-      name: String(index),
-      value: stripInlineComment(itemMatch[1] ?? "") || null,
-    });
-    index += 1;
-  }
-  return entries;
-}
-
-function parseNamedFieldGroups(lines: readonly string[]): SequencerAdaptiveFieldGroup[] {
-  const groups: SequencerAdaptiveFieldGroup[] = [];
-  const baseIndent = findSectionBaseIndent(lines);
-  if (baseIndent === null) {
-    return groups;
-  }
-
-  for (let index = 0; index < lines.length; index += 1) {
-    const parsed = parseKeyValueLine(lines[index]);
-    if (!parsed || parsed.indent !== baseIndent) {
-      continue;
-    }
-    const childLines: string[] = [];
-    for (let childIndex = index + 1; childIndex < lines.length; childIndex += 1) {
-      const childLine = lines[childIndex];
-      if (!childLine.trim()) {
-        childLines.push(childLine);
-        continue;
-      }
-      if (lineIndent(childLine) <= baseIndent) {
-        break;
-      }
-      childLines.push(childLine);
-    }
-    const entries =
-      childLines.length > 0
-        ? flattenSectionEntries(childLines)
-        : parsed.value
-          ? [{ name: "value", value: parsed.value }]
-          : [];
-    groups.push({
-      name: parsed.key,
-      entries,
-    });
-  }
-
-  return groups;
-}
-
-function parseAdaptiveMetrics(lines: readonly string[]): SequencerAdaptiveMetricDetail[] {
-  return parseNamedFieldGroups(lines).map((group) => {
-    const sourceKindEntry = group.entries.find((entry) => entry.name === "kind");
-    const configEntries = group.entries
+function parseAdaptiveDetail(snippet: string): SequencerAdaptiveDetail {
+  const step = readStep(snippet);
+  const body = step?.body ?? null;
+  const src = step?.src ?? snippet;
+  const controller = childNode(body, "controller");
+  const observe = childNode(body, "observe");
+  const metrics = namedGroups(observe, "metrics", src).map((group) => {
+    const kindEntry = group.entries.find((entry) => entry.name === "kind");
+    const config = group.entries
       .filter((entry) => entry.name !== "kind")
       .map((entry) => ({
         name: entry.name.startsWith("config.")
@@ -354,233 +119,147 @@ function parseAdaptiveMetrics(lines: readonly string[]): SequencerAdaptiveMetric
           : entry.name,
         value: entry.value,
       }));
-    return {
-      name: group.name,
-      sourceKind: sourceKindEntry?.value ?? null,
-      config: configEntries,
-    };
+    return { name: group.name, sourceKind: kindEntry?.value ?? null, config };
   });
-}
-
-function parseAdaptiveDetail(snippet: string): SequencerAdaptiveDetail {
-  const snippetLines = snippet.split("\n");
-  const bodyLines = snippetLines.slice(1);
-  const baseIndent = findSectionBaseIndent(bodyLines);
-
-  const controllerLines = findSectionLines(bodyLines, "controller", baseIndent);
-  const controllerBase = findSectionBaseIndent(controllerLines);
-  const controllerConfigLines = findSectionLines(
-    controllerLines,
-    "config",
-    controllerBase
-  );
-
-  const observeLines = findSectionLines(bodyLines, "observe", baseIndent);
-  const observeBase = findSectionBaseIndent(observeLines);
-  const metricsLines = findSectionLines(observeLines, "metrics", observeBase);
-  const aggregateLines = findSectionLines(observeLines, "aggregate", observeBase);
-
   return {
-    id: findScalarValue(bodyLines, "id", baseIndent),
-    controllerKind: findScalarValue(controllerLines, "kind", controllerBase),
-    controllerConfig: flattenSectionEntries(controllerConfigLines),
-    space: parseNamedFieldGroups(findSectionLines(bodyLines, "space", baseIndent)),
-    bind: flattenSectionEntries(findSectionLines(bodyLines, "bind", baseIndent)),
-    observeRepeats: findScalarValue(observeLines, "repeats", observeBase),
-    metrics: parseAdaptiveMetrics(metricsLines),
-    aggregate: flattenSectionEntries(aggregateLines),
-    score: findScalarValue(observeLines, "score", observeBase),
-    stopping: flattenSectionEntries(findSectionLines(bodyLines, "stopping", baseIndent)),
+    id: scalarField(body, "id", src),
+    controllerKind: scalarField(controller, "kind", src),
+    controllerConfig: sectionEntries(controller, "config", src),
+    space: namedGroups(body, "space", src),
+    bind: sectionEntries(body, "bind", src),
+    observeRepeats: scalarField(observe, "repeats", src),
+    metrics,
+    aggregate: sectionEntries(observe, "aggregate", src),
+    score: scalarField(observe, "score", src),
+    stopping: sectionEntries(body, "stopping", src),
   };
 }
 
 function parseCallDetail(snippet: string): SequencerCallDetail {
-  const snippetLines = snippet.split("\n");
-  const bodyLines = snippetLines.slice(1);
-  const baseIndent = findSectionBaseIndent(bodyLines);
+  const step = readStep(snippet);
+  const body = step?.body ?? null;
+  const src = step?.src ?? snippet;
   return {
-    device: findScalarValue(bodyLines, "device", baseIndent),
-    action: findScalarValue(bodyLines, "action", baseIndent),
-    params: flattenSectionEntries(findSectionLines(bodyLines, "params", baseIndent)),
+    device: scalarField(body, "device", src),
+    action: scalarField(body, "action", src),
+    params: sectionEntries(body, "params", src),
   };
 }
 
 function parseSleepDetail(
-  inlineRemainder: string,
+  _inlineRemainder: string,
   snippet: string
 ): SequencerSleepDetail {
-  const inline = stripInlineComment(inlineRemainder);
-  if (inline) {
-    return { duration: inline };
+  const step = readStep(snippet);
+  const body = step?.body ?? null;
+  const src = step?.src ?? snippet;
+  if (isScalar(body)) {
+    return { duration: leafText(body, src) };
   }
-  const snippetLines = snippet.split("\n");
-  const bodyLines = snippetLines.slice(1);
-  const baseIndent = findSectionBaseIndent(bodyLines);
-  return {
-    duration: findScalarValue(bodyLines, "duration", baseIndent),
-  };
+  return { duration: scalarField(body, "duration", src) };
 }
 
 function parseSetDetail(snippet: string): SequencerSetDetail {
-  const snippetLines = snippet.split("\n");
-  const bodyLines = snippetLines.slice(1);
-  const baseIndent = findSectionBaseIndent(bodyLines);
+  const step = readStep(snippet);
+  const body = step?.body ?? null;
+  const src = step?.src ?? snippet;
   return {
-    device: findScalarValue(bodyLines, "device", baseIndent),
-    name: findScalarValue(bodyLines, "name", baseIndent),
-    value: findScalarValue(bodyLines, "value", baseIndent),
+    device: scalarField(body, "device", src),
+    name: scalarField(body, "name", src),
+    value: scalarField(body, "value", src),
   };
 }
 
 function parseAssignDetail(snippet: string): SequencerAssignDetail {
-  const snippetLines = snippet.split("\n");
-  const bodyLines = snippetLines.slice(1);
+  const step = readStep(snippet);
+  const body = step?.body ?? null;
+  const src = step?.src ?? snippet;
   return {
-    entries: flattenSectionEntries(bodyLines),
+    entries: isMap(body) ? flattenEntries(body, src) : [],
   };
 }
 
 function parseWaitUntilDetail(snippet: string): SequencerWaitUntilDetail {
-  const snippetLines = snippet.split("\n");
-  const bodyLines = snippetLines.slice(1);
-  const baseIndent = findSectionBaseIndent(bodyLines);
+  const step = readStep(snippet);
+  const body = step?.body ?? null;
+  const src = step?.src ?? snippet;
   return {
-    timeoutS: findScalarValue(bodyLines, "timeout_s", baseIndent),
-    everyS: findScalarValue(bodyLines, "every_s", baseIndent),
-    sample: flattenSectionEntries(findSectionLines(bodyLines, "sample", baseIndent)),
-    condition: parseConditionSectionEntries(
-      findSectionLines(bodyLines, "condition", baseIndent)
-    ),
+    timeoutS: scalarField(body, "timeout_s", src),
+    everyS: scalarField(body, "every_s", src),
+    sample: sectionEntries(body, "sample", src),
+    condition: conditionEntries(body, "condition", src),
   };
 }
 
-function parseStreamItems(lines: readonly string[]): SequencerSetContextStreamDetail[] {
-  const streams: SequencerSetContextStreamDetail[] = [];
-  let current: SequencerSetContextStreamDetail | null = null;
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith("#")) {
-      continue;
-    }
-    const itemMatch = line.match(/^\s*-\s*(.*)$/);
-    if (itemMatch) {
-      if (current) {
-        streams.push(current);
-      }
-      current = {
-        device: null,
-        stream: null,
+function readStreamItems(
+  seqNode: Node | null,
+  src: string
+): SequencerSetContextStreamDetail[] {
+  if (!isSeq(seqNode)) {
+    return [];
+  }
+  return seqNode.items.map((item) => {
+    if (isMap(item)) {
+      return {
+        device: scalarField(item as Node, "device", src),
+        stream: scalarField(item as Node, "stream", src),
       };
-      const inline = stripInlineComment(itemMatch[1] ?? "");
-      if (inline) {
-        const inlineField = inline.match(/^([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(.+)$/);
-        if (inlineField && current) {
-          const key = inlineField[1];
-          const value = stripInlineComment(inlineField[2]);
-          if (key === "device") {
-            current.device = value || null;
-          } else if (key === "stream") {
-            current.stream = value || null;
-          }
-        }
-      }
-      continue;
     }
-    if (!current) {
-      continue;
-    }
-    const parsed = parseKeyValueLine(line);
-    if (!parsed) {
-      continue;
-    }
-    if (parsed.key === "device") {
-      current.device = parsed.value || null;
-    } else if (parsed.key === "stream") {
-      current.stream = parsed.value || null;
-    }
-  }
-  if (current) {
-    streams.push(current);
-  }
-  return streams;
+    return { device: leafText(item, src), stream: null };
+  });
 }
 
 function parseSetContextDetail(snippet: string): SequencerSetContextDetail {
-  const snippetLines = snippet.split("\n");
-  const bodyLines = snippetLines.slice(1);
-  const baseIndent = findSectionBaseIndent(bodyLines);
+  const step = readStep(snippet);
+  const body = step?.body ?? null;
+  const src = step?.src ?? snippet;
   return {
-    streams: parseStreamItems(findSectionLines(bodyLines, "streams", baseIndent)),
-    fields: flattenSectionEntries(findSectionLines(bodyLines, "fields", baseIndent)),
+    streams: readStreamItems(childNode(body, "streams"), src),
+    fields: sectionEntries(body, "fields", src),
   };
 }
 
-function countDirectStepItems(lines: readonly string[]): number {
-  const baseIndent = findSectionBaseIndent(lines);
-  if (baseIndent === null) {
-    return 0;
-  }
-  let count = 0;
-  for (const line of lines) {
-    const match = line.match(STEP_ITEM_PATTERN);
-    if (!match) {
-      continue;
-    }
-    if (match[1].length === baseIndent) {
-      count += 1;
-    }
-  }
-  return count;
-}
-
 function parseIfDetail(snippet: string): SequencerIfDetail {
-  const snippetLines = snippet.split("\n");
-  const bodyLines = snippetLines.slice(1);
-  const baseIndent = findSectionBaseIndent(bodyLines);
-  const thenLines = findSectionLines(bodyLines, "then", baseIndent);
-  const elseLines = findSectionLines(bodyLines, "else", baseIndent);
+  const step = readStep(snippet);
+  const body = step?.body ?? null;
+  const src = step?.src ?? snippet;
   return {
-    condition: parseConditionSectionEntries(
-      findSectionLines(bodyLines, "condition", baseIndent)
-    ),
-    thenCount: countDirectStepItems(thenLines),
-    elseCount: countDirectStepItems(elseLines),
+    condition: conditionEntries(body, "condition", src),
+    thenCount: seqLength(body, "then"),
+    elseCount: seqLength(body, "else"),
   };
 }
 
 function parseWhileDetail(snippet: string): SequencerWhileDetail {
-  const snippetLines = snippet.split("\n");
-  const bodyLines = snippetLines.slice(1);
-  const baseIndent = findSectionBaseIndent(bodyLines);
+  const step = readStep(snippet);
+  const body = step?.body ?? null;
+  const src = step?.src ?? snippet;
   return {
-    condition: parseConditionSectionEntries(
-      findSectionLines(bodyLines, "condition", baseIndent)
-    ),
+    condition: conditionEntries(body, "condition", src),
   };
 }
 
 function parseAtomicDetail(snippet: string): SequencerAtomicDetail {
-  const snippetLines = snippet.split("\n");
-  const bodyLines = snippetLines.slice(1);
-  const baseIndent = findSectionBaseIndent(bodyLines);
+  const step = readStep(snippet);
+  const body = step?.body ?? null;
+  const src = step?.src ?? snippet;
   return {
-    name: findScalarValue(bodyLines, "name", baseIndent),
+    name: scalarField(body, "name", src),
   };
 }
 
 function parsePauseDetail(
-  inlineRemainder: string,
+  _inlineRemainder: string,
   snippet: string
 ): SequencerPauseDetail {
-  const inline = stripInlineComment(inlineRemainder);
-  if (inline && !inline.startsWith("{")) {
-    return { reason: inline };
+  const step = readStep(snippet);
+  const body = step?.body ?? null;
+  const src = step?.src ?? snippet;
+  if (isScalar(body)) {
+    return { reason: leafText(body, src) };
   }
-  const snippetLines = snippet.split("\n");
-  const bodyLines = snippetLines.slice(1);
-  const baseIndent = findSectionBaseIndent(bodyLines);
   return {
-    reason: findScalarValue(bodyLines, "reason", baseIndent),
+    reason: scalarField(body, "reason", src),
   };
 }
 
@@ -591,68 +270,66 @@ function parseParallelDetail(childCount: number): SequencerParallelDetail {
 }
 
 function parseForDetail(snippet: string): SequencerForDetail {
-  const snippetLines = snippet.split("\n");
-  const bodyLines = snippetLines.slice(1);
-  const baseIndent = findSectionBaseIndent(bodyLines);
-  const bindLines = findSectionLines(bodyLines, "bind", baseIndent);
-  const inLines = findSectionLines(bodyLines, "in", baseIndent);
-  const inBase = findSectionBaseIndent(inLines);
-  const genLines = findSectionLines(inLines, "gen", inBase);
-  const genBase = findSectionBaseIndent(genLines);
+  const step = readStep(snippet);
+  const body = step?.body ?? null;
+  const src = step?.src ?? snippet;
+
+  let bind: SequencerOutlineMetadataEntry[] = [];
+  const bindNode = childNode(body, "bind");
+  if (isScalar(bindNode)) {
+    // Scalar shorthand `bind: hv` binds the record field `value` to local `hv`.
+    bind = [{ name: "value", value: leafText(bindNode, src) }];
+  } else if (isMap(bindNode)) {
+    bind = flattenEntries(bindNode, src);
+  }
 
   let sourceMode: "generator" | "direct" = "direct";
   let generatorKind: string | null = null;
   let directValue: string | null = null;
-  let generatorModifiers: SequencerOutlineMetadataEntry[] = [];
+  const generatorModifiers: SequencerOutlineMetadataEntry[] = [];
   let iterableConfig: SequencerOutlineMetadataEntry[] = [];
 
-  if (genBase !== null) {
+  const inNode = childNode(body, "in");
+  const genNode = childNode(inNode, "gen");
+  if (isMap(genNode)) {
     sourceMode = "generator";
-    for (const line of genLines) {
-      const parsed = parseKeyValueLine(line);
-      if (!parsed || parsed.indent !== genBase) {
+    for (const pair of genNode.items) {
+      const key = pair.key == null ? "" : String(pair.key).trim();
+      if (!key) {
         continue;
       }
-      if (FOR_GENERATOR_MODIFIER_KEYS.has(parsed.key)) {
-        generatorModifiers.push({
-          name: parsed.key,
-          value: parsed.value || null,
-        });
-        continue;
-      }
-      if (!FOR_GENERATOR_KINDS.has(parsed.key)) {
-        continue;
-      }
-      generatorKind = parsed.key;
-      if (parsed.key === "values") {
-        if (parsed.value) {
-          iterableConfig = [{ name: "inline", value: parsed.value }];
-        } else {
-          iterableConfig = parseScalarListEntries(
-            findSectionLines(genLines, parsed.key, genBase)
-          );
+      const value = (pair.value as Node | null) ?? null;
+      if (FOR_GENERATOR_MODIFIER_KEYS.has(key)) {
+        generatorModifiers.push({ name: key, value: leafText(value, src) });
+      } else if (key === "sample") {
+        for (const entry of flattenEntries(value, src)) {
+          generatorModifiers.push({ name: `sample.${entry.name}`, value: entry.value });
         }
-      } else if (parsed.value) {
-        iterableConfig = [{ name: "value", value: parsed.value }];
-      } else {
-        iterableConfig = flattenSectionEntries(
-          findSectionLines(genLines, parsed.key, genBase)
-        );
+      } else if (FOR_GENERATOR_KINDS.has(key)) {
+        generatorKind = key;
+        if (key === "values") {
+          iterableConfig = isSeq(value)
+            ? value.items.map((item, index) => ({
+                name: String(index),
+                value: leafText(item, src),
+              }))
+            : [{ name: "inline", value: leafText(value, src) }];
+        } else if (key === "scan2d") {
+          iterableConfig = normalizeScan2d(value, src);
+        } else {
+          iterableConfig = isMap(value)
+            ? flattenEntries(value, src)
+            : [{ name: "value", value: leafText(value, src) }];
+        }
       }
-      break;
     }
-  }
-
-  if (!generatorKind) {
-    const directIterable = findScalarValue(bodyLines, "in", baseIndent);
-    if (directIterable) {
-      sourceMode = "direct";
-      directValue = directIterable;
-    }
+  } else if (inNode) {
+    sourceMode = "direct";
+    directValue = leafText(inNode, src);
   }
 
   return {
-    bind: flattenSectionEntries(bindLines),
+    bind,
     sourceMode,
     generatorKind,
     directValue,
@@ -662,290 +339,112 @@ function parseForDetail(snippet: string): SequencerForDetail {
 }
 
 function parseRepeatDetail(snippet: string): SequencerRepeatDetail {
-  const snippetLines = snippet.split("\n");
-  const bodyLines = snippetLines.slice(1);
-  const baseIndent = findSectionBaseIndent(bodyLines);
+  const step = readStep(snippet);
+  const body = step?.body ?? null;
+  const src = step?.src ?? snippet;
   return {
-    times: findScalarValue(bodyLines, "times", baseIndent),
+    times: scalarField(body, "times", src),
   };
 }
 
 function deriveSummary(
-  kind: string,
-  inlineRemainder: string,
-  snippet: string,
-  childCount: number,
-  adaptiveDetail: SequencerAdaptiveDetail | null,
-  forDetail: SequencerForDetail | null,
-  repeatDetail: SequencerRepeatDetail | null,
-  ifDetail: SequencerIfDetail | null,
-  whileDetail: SequencerWhileDetail | null,
-  atomicDetail: SequencerAtomicDetail | null,
-  pauseDetail: SequencerPauseDetail | null,
-  parallelDetail: SequencerParallelDetail | null
+  node: SequencerStepOutlineNode,
+  inlineRemainder: string
 ): string | null {
+  const kind = node.kind;
+  const childCount = node.children.length;
   const inline = compactText(inlineRemainder.replace(/^#.*$/, "").trim());
 
-  const findValue = (key: string): string | null => {
-    const pattern = new RegExp(`^\\s*${key}:\\s*(.+?)\\s*$`);
-    const lines = snippet.split("\n");
-    for (const line of lines) {
-      const match = line.match(pattern);
-      if (!match) {
-        continue;
-      }
-      const value = match[1].replace(/\s+#.*$/, "").trim();
-      if (value) {
-        return value;
-      }
-    }
-    return null;
-  };
-
-  const countListItems = (sectionKey: string): number => {
-    const lines = snippet.split("\n");
-    let sectionIndent: number | null = null;
-    let count = 0;
-    for (const line of lines) {
-      const sectionMatch = line.match(
-        new RegExp(`^(\\s*)${sectionKey}:\\s*(?:#.*)?$`)
-      );
-      if (sectionMatch) {
-        sectionIndent = sectionMatch[1].length;
-        continue;
-      }
-      if (sectionIndent === null) {
-        continue;
-      }
-      const indent = line.match(/^\s*/)?.[0].length ?? 0;
-      if (line.trim() && indent <= sectionIndent) {
-        break;
-      }
-      if (line.trim().startsWith("- ")) {
-        count += 1;
-      }
-    }
-    return count;
-  };
-
-  const collectMappedKeys = (sectionKey: string, limit = 3): string[] => {
-    const lines = snippet.split("\n");
-    let sectionIndent: number | null = null;
-    const keys: string[] = [];
-    for (const line of lines) {
-      const sectionMatch = line.match(
-        new RegExp(`^(\\s*)${sectionKey}:\\s*(?:#.*)?$`)
-      );
-      if (sectionMatch) {
-        sectionIndent = sectionMatch[1].length;
-        continue;
-      }
-      if (sectionIndent === null) {
-        continue;
-      }
-      const indent = line.match(/^\s*/)?.[0].length ?? 0;
-      if (line.trim() && indent <= sectionIndent) {
-        break;
-      }
-      const keyMatch = line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*:/);
-      if (!keyMatch) {
-        continue;
-      }
-      keys.push(keyMatch[1]);
-      if (keys.length >= limit) {
-        break;
-      }
-    }
-    return keys;
-  };
-
-  const collectBindPairs = (): string[] => {
-    const lines = snippet.split("\n");
-    let bindIndent: number | null = null;
-    const out: string[] = [];
-    for (const line of lines) {
-      const bindMatch = line.match(/^(\s*)bind:\s*(?:#.*)?$/);
-      if (bindMatch) {
-        bindIndent = bindMatch[1].length;
-        continue;
-      }
-      if (bindIndent === null) {
-        continue;
-      }
-      const indent = line.match(/^\s*/)?.[0].length ?? 0;
-      if (line.trim() && indent <= bindIndent) {
-        break;
-      }
-      const pairMatch = line.match(
-        /^\s*([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(.+?)\s*$/
-      );
-      if (!pairMatch) {
-        continue;
-      }
-      out.push(`${pairMatch[1]} -> ${pairMatch[2].replace(/\s+#.*$/, "").trim()}`);
-      if (out.length >= 3) {
-        break;
-      }
-    }
-    return out;
-  };
-
-  const findFirstGeneratorKind = (): string | null => {
-    const lines = snippet.split("\n");
-    let inIndent: number | null = null;
-    let genIndent: number | null = null;
-    for (const line of lines) {
-      if (inIndent === null) {
-        const inMatch = line.match(/^(\s*)in:\s*(?:#.*)?$/);
-        if (inMatch) {
-          inIndent = inMatch[1].length;
-        }
-        continue;
-      }
-      const indent = line.match(/^\s*/)?.[0].length ?? 0;
-      if (line.trim() && indent <= inIndent) {
-        break;
-      }
-      if (genIndent === null) {
-        const genMatch = line.match(/^(\s*)gen:\s*(?:#.*)?$/);
-        if (genMatch) {
-          genIndent = genMatch[1].length;
-        }
-        continue;
-      }
-      if (line.trim() && indent <= genIndent) {
-        break;
-      }
-      const keyMatch = line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*:/);
-      if (keyMatch) {
-        return keyMatch[1];
-      }
-    }
-    return null;
-  };
-
-  const summarizeCall = (): string | null => {
-    const device = findValue("device");
-    const action = findValue("action");
+  if (kind === "call" && node.callDetail) {
+    const { device, action } = node.callDetail;
     if (device && action) {
       return `${device}.${action}`;
     }
-    return device || action;
-  };
-
-  const summarizeSet = (): string | null => {
-    const device = findValue("device");
-    const name = findValue("name");
-    const value = findValue("value");
+    if (device || action) {
+      return device || action;
+    }
+  }
+  if (kind === "sleep") {
+    const duration = node.sleepDetail?.duration ?? (inline || null);
+    if (duration) {
+      return `sleep ${duration}`;
+    }
+  }
+  if (kind === "set" && node.setDetail) {
+    const { device, name, value } = node.setDetail;
     if (device && name && value) {
       return `${device}.${name} = ${compactText(value, 56)}`;
     }
     if (name && value) {
       return `${name} = ${compactText(value, 56)}`;
     }
-    return null;
-  };
-
-  const summarizeAssign = (): string | null => {
-    const lines = snippet.split("\n");
-    for (let i = 1; i < lines.length; i += 1) {
-      const match = lines[i].match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(.+?)\s*$/);
-      if (!match) {
-        continue;
-      }
-      return `${match[1]} = ${compactText(match[2].replace(/\s+#.*$/, "").trim(), 56)}`;
-    }
-    return null;
-  };
-
-  if (kind === "call") {
-    const summary = summarizeCall();
-    if (summary) {
-      return summary;
-    }
   }
-  if (kind === "sleep" && inline.length > 0) {
-    return `sleep ${inline}`;
-  }
-  if (kind === "set") {
-    const summary = summarizeSet();
-    if (summary) {
-      return summary;
-    }
-  }
-  if (kind === "assign") {
-    const summary = summarizeAssign();
-    if (summary) {
-      return summary;
+  if (kind === "assign" && node.assignDetail) {
+    const entry = node.assignDetail.entries[0];
+    if (entry && entry.value) {
+      return `${entry.name} = ${compactText(entry.value, 56)}`;
     }
   }
   if (kind === "repeat") {
-    const times = repeatDetail?.times ?? findValue("times");
+    const times = node.repeatDetail?.times;
     if (times) {
       return `repeat ${times}${childCount > 0 ? ` (${childCount} step${childCount === 1 ? "" : "s"})` : ""}`;
     }
   }
-  if (kind === "for") {
-    const binds =
-      forDetail?.bind.map((entry) => `${entry.name} -> ${entry.value ?? "n/a"}`) ??
-      collectBindPairs();
+  if (kind === "for" && node.forDetail) {
+    const detail = node.forDetail;
+    const binds = detail.bind.map((entry) => `${entry.name} -> ${entry.value ?? "n/a"}`);
     const bindSummary = binds.length > 0 ? binds.join(", ") : "bindings";
-    if (forDetail?.sourceMode === "direct") {
-      return `${bindSummary} over expression`;
+    if (detail.sourceMode === "direct") {
+      return `${bindSummary} over ${compactText(detail.directValue ?? "expression", 48)}`;
     }
-    const generatorKind = forDetail?.generatorKind ?? findFirstGeneratorKind();
-    if (generatorKind) {
-      return `${bindSummary} over ${generatorKind}`;
+    if (detail.generatorKind) {
+      return `${bindSummary} over ${detail.generatorKind}`;
     }
     return bindSummary;
   }
-  if (kind === "adaptive") {
-    const id = adaptiveDetail?.id;
-    const controllerKind = adaptiveDetail?.controllerKind;
-    const spaceKeys = adaptiveDetail?.space
-      .slice(0, 3)
-      .map((entry) => entry.name) ?? [];
+  if (kind === "adaptive" && node.adaptiveDetail) {
+    const detail = node.adaptiveDetail;
+    const spaceKeys = detail.space.slice(0, 3).map((entry) => entry.name);
     const parts = [
-      id ?? null,
-      controllerKind,
+      detail.id ?? null,
+      detail.controllerKind,
       spaceKeys.length > 0 ? `space: ${spaceKeys.join(", ")}` : null,
     ].filter((part): part is string => Boolean(part));
     if (parts.length > 0) {
       return parts.join(" | ");
     }
   }
-  if (kind === "wait_until") {
-    const timeout = findValue("timeout_s");
-    if (timeout) {
-      return `timeout ${timeout}s`;
-    }
+  if (kind === "wait_until" && node.waitUntilDetail?.timeoutS) {
+    return `timeout ${node.waitUntilDetail.timeoutS}s`;
   }
-  if (kind === "if" && ifDetail) {
-    const parts = [`then ${ifDetail.thenCount}`];
-    if (ifDetail.elseCount > 0) {
-      parts.push(`else ${ifDetail.elseCount}`);
+  if (kind === "if" && node.ifDetail) {
+    const parts = [`then ${node.ifDetail.thenCount}`];
+    if (node.ifDetail.elseCount > 0) {
+      parts.push(`else ${node.ifDetail.elseCount}`);
     }
     return parts.join(" | ");
   }
-  if (kind === "while") {
-    const firstCondition =
-      whileDetail?.condition[0]?.name ?? (findValue("condition") ? "condition" : null);
+  if (kind === "while" && node.whileDetail) {
+    const firstCondition = node.whileDetail.condition[0]?.name;
     if (firstCondition) {
       return `while ${firstCondition}`;
     }
   }
-  if (kind === "atomic" && atomicDetail?.name) {
-    return `name=${atomicDetail.name}`;
+  if (kind === "atomic" && node.atomicDetail?.name) {
+    return `name=${node.atomicDetail.name}`;
   }
-  if (kind === "pause" && pauseDetail?.reason) {
-    return `pause ${compactText(pauseDetail.reason, 56)}`;
+  if (kind === "pause" && node.pauseDetail?.reason) {
+    return `pause ${compactText(node.pauseDetail.reason, 56)}`;
   }
-  if (kind === "parallel" && parallelDetail) {
-    return `${parallelDetail.branchCount} branch${parallelDetail.branchCount === 1 ? "" : "es"}`;
+  if (kind === "parallel" && node.parallelDetail) {
+    const count = node.parallelDetail.branchCount;
+    return `${count} branch${count === 1 ? "" : "es"}`;
   }
-  if (kind === "set_context") {
-    const streamCount = countListItems("streams");
-    const fieldKeys = collectMappedKeys("fields", 3);
+  if (kind === "set_context" && node.setContextDetail) {
+    const detail = node.setContextDetail;
+    const streamCount = detail.streams.length;
+    const fieldKeys = detail.fields.slice(0, 3).map((entry) => entry.name);
     const parts = [
       streamCount > 0 ? `${streamCount} stream${streamCount === 1 ? "" : "s"}` : null,
       fieldKeys.length > 0 ? `fields: ${fieldKeys.join(", ")}` : null,
@@ -959,7 +458,7 @@ function deriveSummary(
     return inline;
   }
 
-  const lines = snippet.split("\n");
+  const lines = node.snippet.split("\n");
   const detailLines: string[] = [];
   for (let i = 1; i < lines.length; i += 1) {
     const trimmed = lines[i].trim();
@@ -1052,17 +551,21 @@ function buildFlatStepNodes(lines: string[]): FlatStepNode[] {
 
   for (let i = 0; i < flat.length; i += 1) {
     const current = flat[i];
-    let endIndex = lines.length - 1;
+    // The step spans up to its last line indented deeper than the step itself.
+    // Trailing blank lines and outer-scope comments (indent <= the step's) are
+    // excluded — including them would otherwise sweep sibling/outer comments
+    // into the snippet, where normalizeSnippet over-strips them into garbage.
+    let endIndex = current.startIndex;
     for (let lineIndex = current.startIndex + 1; lineIndex < lines.length; lineIndex += 1) {
       const nextLine = lines[lineIndex];
       const trimmed = nextLine.trim();
-      if (!trimmed || trimmed.startsWith("#")) {
+      if (!trimmed) {
         continue;
       }
       if (lineIndent(nextLine) <= current.indent) {
-        endIndex = lineIndex - 1;
         break;
       }
+      endIndex = lineIndex;
     }
     current.endIndex = Math.max(current.startIndex, endIndex);
   }
@@ -1122,20 +625,7 @@ function finalizeSummaries(
       node.forDetail = forDetail;
       node.repeatDetail = repeatDetail;
       node.adaptiveDetail = adaptiveDetail;
-    node.summary = deriveSummary(
-      node.kind,
-      flatNode.inlineRemainder,
-        node.snippet,
-        node.children.length,
-        adaptiveDetail,
-        forDetail,
-        repeatDetail,
-        ifDetail,
-        whileDetail,
-        atomicDetail,
-        pauseDetail,
-        parallelDetail
-      );
+    node.summary = deriveSummary(node, flatNode.inlineRemainder);
   }
 }
 

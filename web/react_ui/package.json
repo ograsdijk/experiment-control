@@ -23,7 +23,8 @@
     "@uiw/react-codemirror": "^4.23.12",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
-    "uplot": "^1.6.30"
+    "uplot": "^1.6.30",
+    "yaml": "^2.6.0"
   },
   "devDependencies": {
     "@types/react": "^18.2.67",

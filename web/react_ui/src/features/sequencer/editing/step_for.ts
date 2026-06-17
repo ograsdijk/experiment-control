@@ -1,83 +1,66 @@
+import { YAMLMap, YAMLSeq } from "yaml";
+import type { Document } from "yaml";
 import type { SequencerOutlineMetadataEntry, SequencerStepOutlineNode } from "../types";
+import { replaceStepSnippet } from "./shared";
 import {
-  buildNestedEntryLines,
-  replaceStepSnippet,
-  sanitizeYamlScalar,
-} from "./shared";
+  bodyMap,
+  cleanEntries,
+  editStep,
+  emptyMap,
+  entriesToMap,
+  textToNode,
+} from "./yaml_write";
 
-function renderForSnippet(
-  node: SequencerStepOutlineNode,
-  bind: SequencerOutlineMetadataEntry[],
-  sourceMode: "generator" | "direct",
+type Entry = SequencerOutlineMetadataEntry;
+
+function buildGenIn(
+  doc: Document,
   generatorKind: string | null,
-  directValue: string,
-  generatorModifiers: SequencerOutlineMetadataEntry[],
-  iterableConfig: SequencerOutlineMetadataEntry[]
-): string {
-  const lines = ["- for:"];
-  const cleanBind = bind
-    .map((entry) => ({
-      name: entry.name.trim(),
-      value: sanitizeYamlScalar(entry.value ?? ""),
-    }))
-    .filter((entry) => entry.name.length > 0);
-  if (cleanBind.length <= 0) {
-    lines.push("    bind: {}");
-  } else {
-    lines.push("    bind:");
-    for (const entry of cleanBind) {
-      lines.push(`      ${entry.name}: ${entry.value}`);
+  generatorModifiers: ReadonlyArray<Entry>,
+  iterableConfig: ReadonlyArray<Entry>
+): YAMLMap {
+  const gen = new YAMLMap();
+  const modifiers = cleanEntries(generatorModifiers);
+  for (const modifier of modifiers) {
+    // `sample.*` is folded back below; plain modifiers (offset/shuffle/...) pass through.
+    if (modifier.name === "sample" || modifier.name.startsWith("sample.")) {
+      continue;
     }
+    gen.set(modifier.name, textToNode(doc, modifier.value));
   }
-  const cleanIterable = iterableConfig
-    .map((entry) => ({
-      name: entry.name.trim(),
-      value: sanitizeYamlScalar(entry.value ?? ""),
-    }))
-    .filter((entry) => entry.name.length > 0);
 
-  if (sourceMode === "direct") {
-    lines.push(`    in: ${sanitizeYamlScalar(directValue)}`);
-  } else {
-    const normalizedKind = (generatorKind ?? "").trim() || "linspace";
-    const cleanModifiers = generatorModifiers
-      .map((entry) => ({
-        name: entry.name.trim(),
-        value: sanitizeYamlScalar(entry.value ?? ""),
-      }))
-      .filter((entry) => entry.name.length > 0);
-    lines.push("    in:");
-    lines.push("      gen:");
-    for (const modifier of cleanModifiers) {
-      lines.push(`        ${modifier.name}: ${modifier.value}`);
-    }
-    if (normalizedKind === "values") {
-      if (cleanIterable.length === 1 && cleanIterable[0]?.name === "inline") {
-        lines.push(`        values: ${cleanIterable[0].value}`);
-      } else if (cleanIterable.length <= 0) {
-        lines.push("        values: []");
-      } else {
-        lines.push("        values:");
-        for (const entry of cleanIterable) {
-          lines.push(`          - ${entry.value}`);
-        }
-      }
-    } else if (cleanIterable.length === 1 && cleanIterable[0]?.name === "value") {
-      lines.push(`        ${normalizedKind}: ${cleanIterable[0].value}`);
-    } else if (cleanIterable.length <= 0) {
-      lines.push(`        ${normalizedKind}: {}`);
+  const kind = (generatorKind ?? "").trim() || "linspace";
+  const config = cleanEntries(iterableConfig);
+  if (kind === "values") {
+    if (config.length === 1 && config[0].name === "inline") {
+      gen.set("values", textToNode(doc, config[0].value));
     } else {
-      lines.push(`        ${normalizedKind}:`);
-      lines.push(...buildNestedEntryLines(cleanIterable, 10));
+      const seq = new YAMLSeq();
+      seq.flow = true;
+      for (const entry of config) {
+        seq.add(textToNode(doc, entry.value));
+      }
+      gen.set("values", seq);
     }
+  } else if (kind === "scan2d") {
+    gen.set("scan2d", entriesToMap(doc, config));
+  } else {
+    gen.set(kind, entriesToMap(doc, config, true));
   }
 
-  const snippetLines = node.snippet.split("\n");
-  const doIndex = snippetLines.findIndex(
-    (line, index) => index > 0 && /^\s*do:\s*(?:#.*)?$/.test(line)
-  );
-  const bodyLines = doIndex >= 0 ? snippetLines.slice(doIndex) : ["    do:"];
-  return [...lines, ...bodyLines].join("\n");
+  const sampleEntries = modifiers
+    .filter((modifier) => modifier.name.startsWith("sample."))
+    .map((modifier) => ({
+      name: modifier.name.slice("sample.".length),
+      value: modifier.value,
+    }));
+  if (sampleEntries.length > 0) {
+    gen.set("sample", entriesToMap(doc, sampleEntries, true));
+  }
+
+  const inMap = new YAMLMap();
+  inMap.set("gen", gen);
+  return inMap;
 }
 
 export function applyEditedForStep(
@@ -90,17 +73,18 @@ export function applyEditedForStep(
   generatorModifiers: SequencerOutlineMetadataEntry[],
   iterableConfig: SequencerOutlineMetadataEntry[]
 ): string {
-  return replaceStepSnippet(
-    yamlText,
-    node,
-    renderForSnippet(
-      node,
-      bind,
-      sourceMode,
-      generatorKind,
-      directValue,
-      generatorModifiers,
-      iterableConfig
-    )
-  );
+  const out = editStep(node.snippet, (doc, item) => {
+    const body = bodyMap(item, "for");
+    body.set(
+      "bind",
+      cleanEntries(bind).length > 0 ? entriesToMap(doc, bind, true) : emptyMap()
+    );
+    if (sourceMode === "direct") {
+      const value = directValue && directValue.trim() ? directValue : '"${points}"';
+      body.set("in", textToNode(doc, value));
+    } else {
+      body.set("in", buildGenIn(doc, generatorKind, generatorModifiers, iterableConfig));
+    }
+  });
+  return replaceStepSnippet(yamlText, node, out);
 }

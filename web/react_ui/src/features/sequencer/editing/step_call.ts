@@ -1,36 +1,13 @@
 import type { SequencerOutlineMetadataEntry, SequencerStepOutlineNode } from "../types";
+import { replaceStepSnippet } from "./shared";
 import {
-  buildNestedEntryLines,
-  replaceStepSnippet,
-  sanitizeYamlScalar,
-  stepSiblingTailLines,
-} from "./shared";
-
-function renderCallSnippet(
-  node: SequencerStepOutlineNode,
-  device: string,
-  action: string,
-  params: SequencerOutlineMetadataEntry[]
-): string {
-  const lines = [
-    "- call:",
-    `    device: ${sanitizeYamlScalar(device)}`,
-    `    action: ${sanitizeYamlScalar(action)}`,
-  ];
-  const cleanParams = params
-    .map((entry) => ({
-      name: entry.name.trim(),
-      value: sanitizeYamlScalar(entry.value ?? ""),
-    }))
-    .filter((entry) => entry.name.length > 0);
-  if (cleanParams.length <= 0) {
-    lines.push("    params: {}");
-  } else {
-    lines.push("    params:");
-    lines.push(...buildNestedEntryLines(cleanParams, 6));
-  }
-  return [...lines, ...stepSiblingTailLines(node.snippet)].join("\n");
-}
+  bodyMap,
+  cleanEntries,
+  editStep,
+  emptyMap,
+  entriesToMap,
+  textToNode,
+} from "./yaml_write";
 
 export function applyEditedCallStep(
   yamlText: string,
@@ -39,5 +16,14 @@ export function applyEditedCallStep(
   action: string,
   params: SequencerOutlineMetadataEntry[]
 ): string {
-  return replaceStepSnippet(yamlText, node, renderCallSnippet(node, device, action, params));
+  const out = editStep(node.snippet, (doc, item) => {
+    const body = bodyMap(item, "call");
+    body.set("device", textToNode(doc, device));
+    body.set("action", textToNode(doc, action));
+    body.set(
+      "params",
+      cleanEntries(params).length > 0 ? entriesToMap(doc, params) : emptyMap()
+    );
+  });
+  return replaceStepSnippet(yamlText, node, out);
 }
