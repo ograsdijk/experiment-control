@@ -30,11 +30,11 @@ Relevant paths:
   - `DeviceSpec` stores YAML-derived fields and `config_yaml_text`
   - `DeviceHandle.spec` caches the parsed spec
   - `_telemetry_schema_list()` builds schema from `handle.spec.telemetry_calls`
-- `src/experiment_control/manager_process_supervision.py`
+- `src/experiment_control/_manager/process_supervision.py`
   - `restart_driver(...)` only disconnects/stops/schedules restart
   - `start_driver(...)` builds child args from `handle.spec`
   - `build_driver_cmd(...)` serializes telemetry calls from `spec.telemetry_calls`
-- `src/experiment_control/manager_runtime_metadata.py`
+- `src/experiment_control/_manager/runtime_metadata.py`
   - `device_config_payload(...)` uses `handle.spec`
   - `publish_device_config(...)` publishes `manager.device_config`
 - `src/experiment_control/processes/hdf_writer.py`

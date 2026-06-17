@@ -11,24 +11,23 @@ This README focuses on the current recommended workflow used in `examples/linien
 
 ## Current Code Structure
 
-Recent refactors split the large manager/router/process paths into focused modules.
+Recent refactors split the large manager/router/process paths into focused
+modules under private subpackages (`_manager/`, `_driver/`).
 
 - Manager orchestration remains in `src/experiment_control/manager.py`.
-- Manager routing and handlers are split across:
-  - `manager_request_routing.py`
-  - `manager_internal_rpc.py`
-  - `manager_route_handlers.py`
-  - `manager_device_routing.py`
-- Process supervision/recovery/logging are split across:
-  - `manager_process_supervision.py`
-  - `manager_process_recovery.py`
-  - `manager_process_logs.py`
-- Command interceptor route state is isolated in:
-  - `manager_interceptor_routes.py`
-- Driver PUB ingest/caches are isolated in:
-  - `manager_driver_pub.py`
-- Router worker/backpressure logic is in:
-  - `processes/device_router.py`
+- Manager routing and handlers live under `src/experiment_control/_manager/`:
+  - `request_routing.py`
+  - `internal_rpc.py`
+  - `route_handlers.py`
+  - `device_routing.py`
+- Process supervision/recovery/logging:
+  - `_manager/process_supervision.py`
+  - `_manager/process_recovery.py`
+  - `_manager/process_logs.py`
+- Command interceptor route state: `_manager/interceptor_routes.py`
+- Driver PUB ingest/caches: `_manager/driver_pub.py`
+- Driver subprocess class loading: `_driver/loading.py`
+- Router worker/backpressure logic: `processes/device_router.py`
 
 ## Runtime Safety Bounds
 
@@ -263,9 +262,6 @@ The helper script (`run_linien_fastapi.py`) sets these automatically from stack 
 - `docs/python_client_sdk.md` - Python SDK for direct stack control
 - `docs/sequencer_config.md` - sequencer configuration
 - `docs/state_machines.md` - state machine process base/template
-
-Internal planning/ops/backlog notes live under `notes/` and are intentionally kept
-separate from user-facing docs.
 
 ## Troubleshooting
 
