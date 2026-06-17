@@ -7,7 +7,8 @@ Experiment control framework with:
 - a terminal UI (TUI)
 - a FastAPI gateway and React web UI
 
-This README focuses on the current recommended workflow used in `examples/linien_cli`.
+This README focuses on the YAML-driven stack workflow, using the no-hardware
+`examples/dummy_stack` for the quick start.
 
 ## Examples
 
@@ -22,8 +23,7 @@ the same shape used by deployed instances.
   `verify_stream_chunks.py` SHM smoke test.
 - `examples/dummy_frequency_trace_sequencer` - sequencer + stream analysis +
   adaptive scans + measurement schema.
-- `examples/linien_cli` - real Linien/SynthHD devices (used in the quick start
-  below).
+- `examples/linien_cli` - real Linien/SynthHD devices (real-hardware example).
 - `examples/federation_dummy` - multi-stack federation (hub mirrors a leaf device).
 - `examples/dummy` - the same dummy setup wired up imperatively in Python
   (`DeviceSpec`/`Manager`), kept as a programmatic-API reference.
@@ -67,8 +67,10 @@ stats endpoints (`manager.info.identity`, `router.stats`, `/api/settings`).
 ## Requirements
 
 - Python `>=3.13`
-- Node.js `>=18` (for React UI development/build)
 - A virtual environment tool (`uv` recommended, `venv` + `pip` also works)
+- Node.js `>=18` - **optional**, only needed to rebuild the web UI. The built UI
+  ships in the repo (`src/experiment_control/_ui_dist`, committed), so running the
+  stack and web UI needs no Node install.
 
 ## Install
 
@@ -98,23 +100,27 @@ python -m pip install -U pip
 python -m pip install -e .
 ```
 
-Install web dependencies:
+Web dependencies are only needed if you intend to rebuild the UI (the built
+bundle is already committed). For UI development:
 
 ```powershell
 npm --prefix web/react_ui install
 ```
 
-## Quick Start (Linien Example)
+## Quick Start (Dummy Stack, no hardware)
+
+`examples/dummy_stack` runs two simulated devices, an HDF writer, and a command
+interlock - no instruments required.
 
 ### 1. Start manager + devices/processes (+ TUI)
 
 From repo root:
 
 ```powershell
-python examples/linien_cli/run_linien_cli.py
+python examples/dummy_stack/run_dummy_stack.py
 ```
 
-This uses `examples/linien_cli/stack.yaml` and starts the stack through `experiment_control.cli.run_stack`.
+This uses `examples/dummy_stack/stack.yaml` and starts the stack through `experiment_control.cli.run_stack`.
 By default in that stack file, `tui.enabled: true`, so you get the TUI in this terminal.
 
 ### 2. Start FastAPI gateway (and serve built web UI)
@@ -122,28 +128,31 @@ By default in that stack file, `tui.enabled: true`, so you get the TUI in this t
 In a second terminal:
 
 ```powershell
-python examples/linien_cli/run_linien_fastapi.py --stack examples/linien_cli/stack.yaml --host 0.0.0.0 --port 8000
+python examples/dummy_stack/run_dummy_stack_fastapi.py --host 0.0.0.0 --port 8000
 ```
 
 Then open:
 
-- `http://127.0.0.1:8000` (web UI, if built and UI serving enabled)
+- `http://127.0.0.1:8000` (web UI - served from the committed prebuilt bundle)
 - `http://127.0.0.1:8000/api/health` (health endpoint)
 
 Notes:
 
-- `run_linien_fastapi.py` reads manager endpoints from `stack.yaml`.
+- `run_dummy_stack_fastapi.py` reads manager endpoints from `stack.yaml`.
 - It always uses local loopback connects and also exports remote/public endpoint hints.
+
+For a real-hardware setup, see `examples/linien_cli` (Linien/SynthHD devices),
+which has the equivalent `run_linien_cli.py` and `run_linien_fastapi.py` runners.
 
 ## Web UI Development
 
 If you want hot-reload development instead of FastAPI-served static files:
 
-1. Start stack (`run_linien_cli.py`)
+1. Start stack (`run_dummy_stack.py`)
 2. Start FastAPI API only:
 
 ```powershell
-python examples/linien_cli/run_linien_fastapi.py --stack examples/linien_cli/stack.yaml --no-ui --host 127.0.0.1 --port 8000
+python examples/dummy_stack/run_dummy_stack_fastapi.py --no-ui --host 127.0.0.1 --port 8000
 ```
 
 3. Start Vite dev server:
@@ -157,12 +166,16 @@ Open `http://127.0.0.1:5173`.
 
 ## Build Bundled UI (for package/wheel)
 
+The built UI is already committed under `src/experiment_control/_ui_dist`, so this
+is only needed after you change the UI source (`web/react_ui/`).
+
 ```powershell
 ./scripts/build_packaged_ui.ps1
 ```
 
 This builds `web/react_ui/dist` and copies it into `src/experiment_control/_ui_dist`
-so installed packages can serve UI without a repo checkout.
+so installed packages can serve UI without a repo checkout. Commit the regenerated
+`_ui_dist` alongside the source change.
 
 ## Built-in vs Custom UI
 
@@ -213,13 +226,13 @@ Log filter settings are intentionally not included.
 You can run any stack YAML directly:
 
 ```powershell
-python -m experiment_control.cli.run_stack examples/linien_cli/stack.yaml
+python -m experiment_control.cli.run_stack examples/dummy_stack/stack.yaml
 ```
 
 or with script entrypoint:
 
 ```powershell
-experiment-control-stack examples/linien_cli/stack.yaml
+experiment-control-stack examples/dummy_stack/stack.yaml
 ```
 
 See `docs/manager_start.md` for full stack schema and config details.
@@ -272,7 +285,8 @@ For FastAPI, the manager endpoints are taken from env:
 - `EXPERIMENT_CONTROL_STREAM_MAX_KEYS` (stream key retention cap)
 - `EXPERIMENT_CONTROL_STREAM_KEY_TTL_S` (stream key idle eviction TTL)
 
-The helper script (`run_linien_fastapi.py`) sets these automatically from stack config.
+The FastAPI helper scripts (e.g. `run_dummy_stack_fastapi.py`, `run_linien_fastapi.py`)
+set these automatically from stack config.
 
 ## Useful Docs
 
