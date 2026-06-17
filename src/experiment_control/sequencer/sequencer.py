@@ -8,6 +8,7 @@ from collections import deque
 from pathlib import Path
 from typing import Any
 
+import yaml
 import zmq
 
 from ..capabilities import capabilities_payload, method, param
@@ -77,6 +78,67 @@ _DRIVER_BUILTIN_ACTIONS = {
     "stream.context.set",
     "stream.context.clear",
 }
+
+
+# Body containers per step kind, used to map a preflight diagnostic `path`
+# (e.g. `steps[0].for.do[1]`) back to a source line.
+_STEP_BODY_CONTAINERS: dict[str, tuple[str, ...]] = {
+    "for": ("do",),
+    "repeat": ("do",),
+    "while": ("do",),
+    "if": ("then", "else"),
+    "atomic": ("do",),
+    "parallel": ("do",),
+    "adaptive": ("do",),
+    "use": ("do",),
+}
+
+
+def _yaml_mapping_get(node: Any, key: str) -> Any:
+    if not isinstance(node, yaml.MappingNode):
+        return None
+    for key_node, value_node in node.value:
+        if isinstance(key_node, yaml.ScalarNode) and key_node.value == key:
+            return value_node
+    return None
+
+
+def _walk_step_lines(seq_node: Any, path: str, line_map: dict[str, int]) -> None:
+    if not isinstance(seq_node, yaml.SequenceNode):
+        return
+    for index, item in enumerate(seq_node.value):
+        step_path = f"{path}[{index}]"
+        line_map[step_path] = int(item.start_mark.line) + 1
+        if not isinstance(item, yaml.MappingNode):
+            continue
+        for key_node, value_node in item.value:
+            if not isinstance(key_node, yaml.ScalarNode):
+                continue
+            containers = _STEP_BODY_CONTAINERS.get(str(key_node.value))
+            if not containers:
+                continue
+            for container in containers:
+                child = _yaml_mapping_get(value_node, container)
+                if child is not None:
+                    _walk_step_lines(
+                        child, f"{step_path}.{key_node.value}.{container}", line_map
+                    )
+
+
+def _build_step_line_map(text: str | None) -> dict[str, int]:
+    """Map preflight step paths -> 1-based source line, from a line-tracking
+    YAML parse, so reachability diagnostics can point at the offending step."""
+    if not text:
+        return {}
+    try:
+        root = yaml.compose(text)
+    except Exception:
+        return {}
+    line_map: dict[str, int] = {}
+    steps_node = _yaml_mapping_get(root, "steps") if root is not None else None
+    if steps_node is not None:
+        _walk_step_lines(steps_node, "steps", line_map)
+    return line_map
 
 
 def _normalize_log_severity(raw: Any) -> str:
@@ -496,8 +558,27 @@ class SequencerProcess(ManagedProcessBase):
 
         return True, spec, diagnostics
 
-    @staticmethod
+    def _resolve_preflight_line(self, path: str) -> int | None:
+        """Longest-prefix match of a diagnostic path against the step line map,
+        so a diagnostic on a field (e.g. `steps[0].call.action`) resolves to its
+        enclosing step's source line."""
+        line_map = getattr(self, "_preflight_line_map", None)
+        if not line_map:
+            return None
+        best_line: int | None = None
+        best_len = -1
+        for key, line in line_map.items():
+            if (
+                path == key
+                or path.startswith(f"{key}.")
+                or path.startswith(f"{key}[")
+            ) and len(key) > best_len:
+                best_line = line
+                best_len = len(key)
+        return best_line
+
     def _preflight_diag(
+        self,
         *,
         severity: str,
         path: str,
@@ -510,7 +591,7 @@ class SequencerProcess(ManagedProcessBase):
             "path": path,
             "message": message,
             "source": "sequencer.preflight",
-            "line": None,
+            "line": self._resolve_preflight_line(path),
             "column": None,
         }
         if code:
@@ -568,8 +649,8 @@ class SequencerProcess(ManagedProcessBase):
                 members[name] = item
         return members
 
-    @staticmethod
     def _preflight_render(
+        self,
         *,
         value: Any,
         env: dict[str, Any],
@@ -580,7 +661,7 @@ class SequencerProcess(ManagedProcessBase):
             return render_templates(value, env)
         except Exception as e:
             diagnostics.append(
-                SequencerProcess._preflight_diag(
+                self._preflight_diag(
                     severity="error",
                     path=path,
                     code="template_unresolved",
@@ -682,7 +763,7 @@ class SequencerProcess(ManagedProcessBase):
         capabilities_by_device: dict[str, dict[str, Json] | None],
     ) -> None:
         members = capabilities_by_device.get(device_id)
-        if members is None:
+        if not members:
             diagnostics.append(
                 self._preflight_diag(
                     severity="warning",
@@ -738,7 +819,7 @@ class SequencerProcess(ManagedProcessBase):
         stream_names_by_device: dict[str, set[str]],
     ) -> None:
         streams = stream_names_by_device.get(device_id)
-        if streams is None:
+        if not streams:
             diagnostics.append(
                 self._preflight_diag(
                     severity="warning",
@@ -784,7 +865,7 @@ class SequencerProcess(ManagedProcessBase):
         if action in _DRIVER_BUILTIN_ACTIONS:
             return
         members = capabilities_by_device.get(device_id)
-        if members is None:
+        if not members:
             diagnostics.append(
                 self._preflight_diag(
                     severity="warning",
@@ -996,7 +1077,7 @@ class SequencerProcess(ManagedProcessBase):
                 )
             )
         known_signals = telemetry_signals_by_device.get(device_id)
-        if known_signals is None:
+        if not known_signals:
             diagnostics.append(
                 self._preflight_diag(
                     severity="warning",
@@ -2008,7 +2089,12 @@ class SequencerProcess(ManagedProcessBase):
             ):
                 continue
 
-    def _preflight_sequence_spec(self, spec: SequenceSpec) -> list[Json]:
+    def _preflight_sequence_spec(
+        self, spec: SequenceSpec, *, text: str | None = None
+    ) -> list[Json]:
+        # Source-line map for diagnostics (best-effort; empty if text is absent
+        # or unparseable, in which case diagnostics simply carry no line).
+        self._preflight_line_map = _build_step_line_map(text)
         diagnostics: list[Json] = []
 
         list_devices_resp = self._require_manager().call({"type": "manager.devices.list"})
@@ -2049,15 +2135,29 @@ class SequencerProcess(ManagedProcessBase):
                 )
             )
 
+        # Capabilities are already cached per device in the manager.devices.list
+        # snapshot (set at registration / federation sync), so read them from
+        # there instead of issuing a blocking `capabilities` RPC per device.
+        # Probing every device serially stalled preflight whenever any device
+        # (e.g. an offline federated peer) was slow/unreachable, blowing past the
+        # gateway RPC timeout even for a trivial sequence. Reading the snapshot is
+        # reachability-free; devices with no cached capabilities still surface as
+        # `capabilities_unavailable` warnings when referenced.
         capabilities_by_device: dict[str, dict[str, Json] | None] = {}
-        for device_id in sorted(device_ids):
-            cap_resp = self._call_device(device_id, "capabilities", {})
-            if not bool(cap_resp.get("ok", False)):
-                capabilities_by_device[device_id] = None
-                continue
-            capabilities_by_device[device_id] = self._preflight_parse_capabilities(
-                cap_resp.get("result")
-            )
+        snapshot_devices = (
+            list_devices_resp.get("devices")
+            if isinstance(list_devices_resp, dict)
+            else None
+        )
+        if isinstance(snapshot_devices, list):
+            for item in snapshot_devices:
+                if not isinstance(item, dict):
+                    continue
+                device_id = str(item.get("device_id", "")).strip()
+                if device_id:
+                    capabilities_by_device[device_id] = (
+                        self._preflight_parse_capabilities(item.get("capabilities"))
+                    )
 
         env = dict(spec.vars)
         env["vars"] = to_attrdict(dict(spec.vars))
@@ -2434,7 +2534,9 @@ class SequencerProcess(ManagedProcessBase):
         ok, spec, diagnostics = self._load_sequence_text(text=seq_text, source=source)
         all_diagnostics = list(diagnostics)
         if ok and isinstance(spec, SequenceSpec):
-            all_diagnostics.extend(self._preflight_sequence_spec(spec))
+            all_diagnostics.extend(
+                self._preflight_sequence_spec(spec, text=seq_text)
+            )
         valid = bool(ok) and not self._preflight_has_errors(all_diagnostics)
         return self.rpc_ok(
             req,
