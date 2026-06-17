@@ -44,3 +44,48 @@ class ClientFacadeBase:
             return self._request_result(payload, timeout_ms=timeout_ms, retries=retries)
         return self._request_raw(payload, timeout_ms=timeout_ms, retries=retries)
 
+
+class ProcessRpcFacade(ClientFacadeBase):
+    """Base for a typed facade over a single managed process's RPC surface.
+
+    Subclasses set a default ``process_id`` and add typed methods that delegate
+    to :meth:`call`, which forwards through ``manager.processes.rpc``.
+    """
+
+    def __init__(self, client: "StackClient", *, process_id: str) -> None:
+        super().__init__(client)
+        self.process_id = str(process_id)
+
+    def call(
+        self,
+        action: str,
+        params: Json | None = None,
+        *,
+        timeout_ms: int | None = None,
+        retries: int | None = None,
+    ) -> Any:
+        return self._call_type(
+            "manager.processes.rpc",
+            process_id=self.process_id,
+            request={"type": str(action), "params": dict(params or {})},
+            timeout_ms=timeout_ms,
+            retries=retries,
+        )
+
+    def call_raw(
+        self,
+        action: str,
+        params: Json | None = None,
+        *,
+        timeout_ms: int | None = None,
+        retries: int | None = None,
+    ) -> Json:
+        return self._call_type(
+            "manager.processes.rpc",
+            process_id=self.process_id,
+            request={"type": str(action), "params": dict(params or {})},
+            timeout_ms=timeout_ms,
+            retries=retries,
+            expect_ok=False,
+        )
+

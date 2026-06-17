@@ -10,11 +10,15 @@ from .apis import (
     DeviceAPI,
     DeviceHandle,
     HdfAPI,
+    InfluxAPI,
+    InterlockAPI,
     ManagerAPI,
     ProcessAPI,
     ProcessHandle,
     SequencerAPI,
+    StreamAnalysisAPI,
     WaitAPI,
+    WatchdogAPI,
 )
 from .errors import result_from_response
 from .events import EventSubscriber
@@ -50,6 +54,10 @@ class StackClient:
         self.processes = ProcessAPI(self)
         self.sequencer = SequencerAPI(self, process_id="sequencer")
         self.hdf = HdfAPI(self, process_id="hdf_writer")
+        self.stream_analysis = StreamAnalysisAPI(self, process_id="stream_analysis")
+        self.influx = InfluxAPI(self, process_id="influx_writer")
+        self.interlock = InterlockAPI(self, process_id="interlock")
+        self.watchdog = WatchdogAPI(self, process_id="watchdog")
         self.manager = ManagerAPI(self)
         self.wait = WaitAPI(self)
 
