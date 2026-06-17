@@ -10,7 +10,7 @@ init_kwargs:
   destinations:
     default:
       url: "http://127.0.0.1:8086"
-      token: "-pYke5tkKDCeEkeFnS9M7MZQQ2YBoM-j3iGvchdth4yyZMWlyPnNylGY95buQXKuBAQBTN0ySFwNopSGeQhO3Q=="
+      token: "${INFLUX_TOKEN}"
       org: "testing"
       bucket: "telemetry"
       measurement: "unknown_device"
