@@ -1,169 +1,55 @@
+import { YAMLMap } from "yaml";
+import type { Document } from "yaml";
 import type { SequencerOutlineMetadataEntry, SequencerStepOutlineNode } from "../types";
+import { replaceStepSnippet } from "./shared";
 import {
-  buildNestedEntryLines,
-  replaceStepSnippet,
-  sanitizeYamlScalar,
-} from "./shared";
+  bodyMap,
+  cleanEntries,
+  editStep,
+  entriesToMap,
+  setScalarOrDelete,
+  textToNode,
+} from "./yaml_write";
 
-function renderAdaptiveGroupLines(
-  groups: ReadonlyArray<{
-    name: string;
-    entries: ReadonlyArray<SequencerOutlineMetadataEntry>;
-  }>,
-  indent: number
-): string[] {
-  const lines: string[] = [];
+type Entry = SequencerOutlineMetadataEntry;
+type Group = { name: string; entries: ReadonlyArray<Entry> };
+type Metric = { name: string; sourceKind: string | null; config: ReadonlyArray<Entry> };
+
+function groupsToMap(doc: Document, groups: ReadonlyArray<Group>): YAMLMap {
+  const map = new YAMLMap();
   for (const group of groups) {
-    const groupName = group.name.trim();
-    if (!groupName) {
+    const name = group.name.trim();
+    if (!name) {
       continue;
     }
-    const prefix = " ".repeat(Math.max(0, indent));
-    const cleanEntries = group.entries
-      .map((entry) => ({
-        name: entry.name.trim(),
-        value: sanitizeYamlScalar(entry.value ?? ""),
-      }))
-      .filter((entry) => entry.name.length > 0);
-    if (cleanEntries.length === 1 && cleanEntries[0]?.name === "value") {
-      lines.push(`${prefix}${groupName}: ${cleanEntries[0].value}`);
-      continue;
+    const entries = cleanEntries(group.entries);
+    if (entries.length === 1 && entries[0].name === "value") {
+      map.set(name, textToNode(doc, entries[0].value));
+    } else {
+      map.set(name, entriesToMap(doc, entries));
     }
-    if (cleanEntries.length <= 0) {
-      lines.push(`${prefix}${groupName}: {}`);
-      continue;
-    }
-    lines.push(`${prefix}${groupName}:`);
-    lines.push(...buildNestedEntryLines(cleanEntries, indent + 2));
   }
-  return lines;
+  return map;
 }
 
-function renderAdaptiveMetricLines(
-  metrics: ReadonlyArray<{
-    name: string;
-    sourceKind: string | null;
-    config: ReadonlyArray<SequencerOutlineMetadataEntry>;
-  }>,
-  indent: number
-): string[] {
-  const lines: string[] = [];
+function metricsToMap(doc: Document, metrics: ReadonlyArray<Metric>): YAMLMap {
+  const map = new YAMLMap();
   for (const metric of metrics) {
-    const metricName = metric.name.trim();
-    if (!metricName) {
+    const name = metric.name.trim();
+    if (!name) {
       continue;
     }
-    const prefix = " ".repeat(Math.max(0, indent));
-    lines.push(`${prefix}${metricName}:`);
+    const entry = new YAMLMap();
     if (metric.sourceKind) {
-      lines.push(`${prefix}  kind: ${sanitizeYamlScalar(metric.sourceKind)}`);
+      entry.set("kind", textToNode(doc, metric.sourceKind));
     }
-    const cleanConfig = metric.config
-      .map((entry) => ({
-        name: entry.name.trim(),
-        value: sanitizeYamlScalar(entry.value ?? ""),
-      }))
-      .filter((entry) => entry.name.length > 0);
-    if (cleanConfig.length > 0) {
-      lines.push(`${prefix}  config:`);
-      lines.push(...buildNestedEntryLines(cleanConfig, indent + 4));
+    const config = cleanEntries(metric.config);
+    if (config.length > 0) {
+      entry.set("config", entriesToMap(doc, config));
     }
+    map.set(name, entry);
   }
-  return lines;
-}
-
-function renderAdaptiveSnippet(
-  node: SequencerStepOutlineNode,
-  adaptiveId: string,
-  controllerKind: string,
-  minLoss: string,
-  controllerConfigExtra: ReadonlyArray<SequencerOutlineMetadataEntry>,
-  space: ReadonlyArray<{
-    name: string;
-    entries: ReadonlyArray<SequencerOutlineMetadataEntry>;
-  }>,
-  bind: ReadonlyArray<SequencerOutlineMetadataEntry>,
-  metrics: ReadonlyArray<{
-    name: string;
-    sourceKind: string | null;
-    config: ReadonlyArray<SequencerOutlineMetadataEntry>;
-  }>,
-  aggregate: ReadonlyArray<SequencerOutlineMetadataEntry>,
-  observeRepeats: string,
-  score: string,
-  maxTrials: string,
-  stoppingExtra: ReadonlyArray<SequencerOutlineMetadataEntry>
-): string {
-  const detail = node.adaptiveDetail;
-  if (!detail) {
-    return node.snippet;
-  }
-
-  const lines = ["- adaptive:"];
-  if (adaptiveId.trim()) {
-    lines.push(`    id: ${sanitizeYamlScalar(adaptiveId)}`);
-  }
-
-  lines.push("    controller:");
-  lines.push(
-    `      kind: ${sanitizeYamlScalar(
-      controllerKind || detail.controllerKind || "adaptive.adaptive_grid_1d"
-    )}`
-  );
-  const controllerConfig = controllerConfigExtra
-    .filter((entry) => entry.name !== "min_loss")
-    .map((entry) => ({ ...entry }));
-  if (minLoss.trim()) {
-    controllerConfig.push({ name: "min_loss", value: minLoss });
-  }
-  if (controllerConfig.length > 0) {
-    lines.push("      config:");
-    lines.push(...buildNestedEntryLines(controllerConfig, 8));
-  }
-
-  if (space.length > 0) {
-    lines.push("    space:");
-    lines.push(...renderAdaptiveGroupLines(space, 6));
-  }
-
-  if (bind.length > 0) {
-    lines.push("    bind:");
-    lines.push(...buildNestedEntryLines(bind, 6));
-  }
-
-  lines.push("    observe:");
-  if (observeRepeats.trim()) {
-    lines.push(`      repeats: ${sanitizeYamlScalar(observeRepeats)}`);
-  }
-  if (metrics.length > 0) {
-    lines.push("      metrics:");
-    lines.push(...renderAdaptiveMetricLines(metrics, 8));
-  }
-  if (aggregate.length > 0) {
-    lines.push("      aggregate:");
-    lines.push(...buildNestedEntryLines(aggregate, 8));
-  }
-  if (score.trim()) {
-    lines.push(`      score: ${sanitizeYamlScalar(score)}`);
-  }
-
-  const stoppingEntries = stoppingExtra
-    .filter((entry) => entry.name !== "max_trials")
-    .map((entry) => ({ ...entry }));
-  if (maxTrials.trim()) {
-    stoppingEntries.push({ name: "max_trials", value: maxTrials });
-  }
-  if (stoppingEntries.length > 0) {
-    lines.push("    stopping:");
-    lines.push(...buildNestedEntryLines(stoppingEntries, 6));
-  }
-
-  const snippetLines = node.snippet.split("\n");
-  const doIndex = snippetLines.findIndex(
-    (line, index) => index > 0 && /^\s*do:\s*(?:#.*)?$/.test(line)
-  );
-  const bodyLines = doIndex >= 0 ? snippetLines.slice(doIndex) : ["    do:"];
-  return [...lines, ...bodyLines].join("\n");
+  return map;
 }
 
 export function applyEditedAdaptiveStep(
@@ -172,40 +58,77 @@ export function applyEditedAdaptiveStep(
   adaptiveId: string,
   controllerKind: string,
   minLoss: string,
-  controllerConfigExtra: ReadonlyArray<SequencerOutlineMetadataEntry>,
-  space: ReadonlyArray<{
-    name: string;
-    entries: ReadonlyArray<SequencerOutlineMetadataEntry>;
-  }>,
-  bind: ReadonlyArray<SequencerOutlineMetadataEntry>,
-  metrics: ReadonlyArray<{
-    name: string;
-    sourceKind: string | null;
-    config: ReadonlyArray<SequencerOutlineMetadataEntry>;
-  }>,
-  aggregate: ReadonlyArray<SequencerOutlineMetadataEntry>,
+  controllerConfigExtra: ReadonlyArray<Entry>,
+  space: ReadonlyArray<Group>,
+  bind: ReadonlyArray<Entry>,
+  metrics: ReadonlyArray<Metric>,
+  aggregate: ReadonlyArray<Entry>,
   observeRepeats: string,
   score: string,
   maxTrials: string,
-  stoppingExtra: ReadonlyArray<SequencerOutlineMetadataEntry>
+  stoppingExtra: ReadonlyArray<Entry>
 ): string {
-  return replaceStepSnippet(
-    yamlText,
-    node,
-    renderAdaptiveSnippet(
-      node,
-      adaptiveId,
-      controllerKind,
-      minLoss,
-      controllerConfigExtra,
-      space,
-      bind,
-      metrics,
-      aggregate,
-      observeRepeats,
-      score,
-      maxTrials,
-      stoppingExtra
-    )
-  );
+  const out = editStep(node.snippet, (doc, item) => {
+    const body = bodyMap(item, "adaptive");
+    setScalarOrDelete(doc, body, "id", adaptiveId);
+
+    const controller = new YAMLMap();
+    controller.set(
+      "kind",
+      textToNode(
+        doc,
+        controllerKind || node.adaptiveDetail?.controllerKind || "adaptive.adaptive_grid_1d"
+      )
+    );
+    const controllerConfig = controllerConfigExtra
+      .filter((entry) => entry.name !== "min_loss")
+      .map((entry) => ({ ...entry }));
+    if (minLoss.trim()) {
+      controllerConfig.push({ name: "min_loss", value: minLoss });
+    }
+    if (cleanEntries(controllerConfig).length > 0) {
+      controller.set("config", entriesToMap(doc, controllerConfig));
+    }
+    body.set("controller", controller);
+
+    if (space.length > 0) {
+      body.set("space", groupsToMap(doc, space));
+    } else {
+      body.delete("space");
+    }
+
+    if (cleanEntries(bind).length > 0) {
+      body.set("bind", entriesToMap(doc, bind));
+    } else {
+      body.delete("bind");
+    }
+
+    const observe = new YAMLMap();
+    if (observeRepeats.trim()) {
+      observe.set("repeats", textToNode(doc, observeRepeats));
+    }
+    if (metrics.length > 0) {
+      observe.set("metrics", metricsToMap(doc, metrics));
+    }
+    if (aggregate.length > 0) {
+      observe.set("aggregate", entriesToMap(doc, aggregate));
+    }
+    if (score.trim()) {
+      observe.set("score", textToNode(doc, score));
+    }
+    body.set("observe", observe);
+
+    const stopping = stoppingExtra
+      .filter((entry) => entry.name !== "max_trials")
+      .map((entry) => ({ ...entry }));
+    if (maxTrials.trim()) {
+      stopping.push({ name: "max_trials", value: maxTrials });
+    }
+    if (cleanEntries(stopping).length > 0) {
+      body.set("stopping", entriesToMap(doc, stopping));
+    } else {
+      body.delete("stopping");
+    }
+  });
+  return replaceStepSnippet(yamlText, node, out);
 }

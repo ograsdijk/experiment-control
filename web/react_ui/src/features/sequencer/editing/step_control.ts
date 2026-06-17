@@ -1,195 +1,45 @@
+import { YAMLMap, YAMLSeq } from "yaml";
+import type { Document } from "yaml";
 import type {
   SequencerOutlineMetadataEntry,
   SequencerSetContextStreamDetail,
   SequencerStepOutlineNode,
 } from "../types";
+import { replaceStepSnippet } from "./shared";
 import {
-  buildNestedEntryLines,
-  replaceStepSnippet,
-  sanitizeYamlScalar,
-  stepSiblingTailLines,
-} from "./shared";
+  bodyMap,
+  cleanEntries,
+  editStep,
+  emptyMap,
+  entriesToMap,
+  setCondition,
+  setScalarOrDelete,
+  textToNode,
+} from "./yaml_write";
 
-function renderSleepSnippet(node: SequencerStepOutlineNode, duration: string): string {
-  const lines = [`- sleep: ${sanitizeYamlScalar(duration)}`];
-  const tail = node.snippet.split("\n").slice(1);
-  return [...lines, ...tail].join("\n");
-}
-
-function renderSetSnippet(
-  node: SequencerStepOutlineNode,
-  device: string,
-  name: string,
-  value: string
-): string {
-  const lines = [
-    "- set:",
-    `    device: ${sanitizeYamlScalar(device)}`,
-    `    name: ${sanitizeYamlScalar(name)}`,
-    `    value: ${sanitizeYamlScalar(value)}`,
-  ];
-  return [...lines, ...stepSiblingTailLines(node.snippet)].join("\n");
-}
-
-function renderWaitUntilSnippet(
-  timeoutS: string,
-  everyS: string,
-  sample: SequencerOutlineMetadataEntry[],
-  condition: SequencerOutlineMetadataEntry[]
-): string {
-  const lines = ["- wait_until:"];
-  if (timeoutS.trim()) {
-    lines.push(`    timeout_s: ${sanitizeYamlScalar(timeoutS)}`);
+function buildStreams(
+  doc: Document,
+  streams: ReadonlyArray<SequencerSetContextStreamDetail>
+): YAMLSeq {
+  const seq = new YAMLSeq();
+  if (streams.length <= 0) {
+    seq.flow = true;
+    return seq;
   }
-  if (everyS.trim()) {
-    lines.push(`    every_s: ${sanitizeYamlScalar(everyS)}`);
-  }
-  const cleanSample = sample
-    .map((entry) => ({
-      name: entry.name.trim(),
-      value: sanitizeYamlScalar(entry.value ?? ""),
-    }))
-    .filter((entry) => entry.name.length > 0);
-  const cleanCondition = condition
-    .map((entry) => ({
-      name: entry.name.trim(),
-      value: sanitizeYamlScalar(entry.value ?? ""),
-    }))
-    .filter((entry) => entry.name.length > 0);
-
-  if (cleanSample.length <= 0) {
-    lines.push("    sample: {}");
-  } else {
-    lines.push("    sample:");
-    lines.push(...buildNestedEntryLines(cleanSample, 6));
-  }
-
-  if (cleanCondition.length <= 0) {
-    lines.push("    condition: {}");
-  } else {
-    lines.push("    condition:");
-    lines.push(...buildNestedEntryLines(cleanCondition, 6));
-  }
-
-  return lines.join("\n");
-}
-
-function renderRepeatSnippet(node: SequencerStepOutlineNode, times: string): string {
-  const lines = node.snippet.split("\n");
-  const doIndex = lines.findIndex(
-    (line, index) => index > 0 && /^\s*do:\s*(?:#.*)?$/.test(line)
-  );
-  const bodyLines = doIndex >= 0 ? lines.slice(doIndex) : ["    do:"];
-  return ["- repeat:", `    times: ${sanitizeYamlScalar(times)}`, ...bodyLines].join(
-    "\n"
-  );
-}
-
-function renderAssignSnippet(
-  node: SequencerStepOutlineNode,
-  entries: ReadonlyArray<SequencerOutlineMetadataEntry>
-): string {
-  const cleanEntries = entries
-    .map((entry) => ({
-      name: entry.name.trim(),
-      value: sanitizeYamlScalar(entry.value ?? ""),
-    }))
-    .filter((entry) => entry.name.length > 0);
-
-  const lines =
-    cleanEntries.length <= 0
-      ? ["- assign: {}"]
-      : ["- assign:", ...buildNestedEntryLines(cleanEntries, 4)];
-
-  return [...lines, ...stepSiblingTailLines(node.snippet)].join("\n");
-}
-
-function renderSetContextSnippet(
-  streams: ReadonlyArray<SequencerSetContextStreamDetail>,
-  fields: ReadonlyArray<SequencerOutlineMetadataEntry>
-): string {
-  const lines = ["- set_context:"];
-  const cleanStreams = streams
-    .map((entry) => ({
-      device: sanitizeYamlScalar(entry.device ?? ""),
-      stream: sanitizeYamlScalar(entry.stream ?? ""),
-    }));
-  const cleanFields = fields
-    .map((entry) => ({
-      name: entry.name.trim(),
-      value: sanitizeYamlScalar(entry.value ?? ""),
-    }))
-    .filter((entry) => entry.name.length > 0);
-
-  if (cleanStreams.length <= 0) {
-    lines.push("    streams: []");
-  } else {
-    lines.push("    streams:");
-    for (const entry of cleanStreams) {
-      lines.push("      -");
-      lines.push(`          device: ${entry.device}`);
-      lines.push(`          stream: ${entry.stream}`);
+  for (const item of streams) {
+    const device = (item.device ?? "").trim();
+    const stream = (item.stream ?? "").trim();
+    // `- "scope.trace"` string shorthand (no separate stream).
+    if (device && !stream) {
+      seq.add(textToNode(doc, item.device ?? ""));
+      continue;
     }
+    const map = new YAMLMap();
+    map.set("device", textToNode(doc, item.device ?? ""));
+    map.set("stream", textToNode(doc, item.stream ?? ""));
+    seq.add(map);
   }
-
-  if (cleanFields.length <= 0) {
-    lines.push("    fields: {}");
-  } else {
-    lines.push("    fields:");
-    lines.push(...buildNestedEntryLines(cleanFields, 6));
-  }
-
-  return lines.join("\n");
-}
-
-function renderIfSnippet(
-  node: SequencerStepOutlineNode,
-  condition: SequencerOutlineMetadataEntry[]
-): string {
-  const lines = ["- if:"];
-  const cleanCondition = condition
-    .map((entry) => ({
-      name: entry.name.trim(),
-      value: sanitizeYamlScalar(entry.value ?? ""),
-    }))
-    .filter((entry) => entry.name.length > 0);
-  if (cleanCondition.length <= 0) {
-    lines.push("    condition: {}");
-  } else {
-    lines.push("    condition:");
-    lines.push(...buildNestedEntryLines(cleanCondition, 6));
-  }
-  const snippetLines = node.snippet.split("\n");
-  const bodyIndex = snippetLines.findIndex(
-    (line, index) => index > 0 && /^\s*(then|else):\s*(?:#.*)?$/.test(line)
-  );
-  const bodyLines = bodyIndex >= 0 ? snippetLines.slice(bodyIndex) : ["    then:"];
-  return [...lines, ...bodyLines].join("\n");
-}
-
-function renderWhileSnippet(
-  node: SequencerStepOutlineNode,
-  condition: SequencerOutlineMetadataEntry[]
-): string {
-  const lines = ["- while:"];
-  const cleanCondition = condition
-    .map((entry) => ({
-      name: entry.name.trim(),
-      value: sanitizeYamlScalar(entry.value ?? ""),
-    }))
-    .filter((entry) => entry.name.length > 0);
-  if (cleanCondition.length <= 0) {
-    lines.push("    condition: {}");
-  } else {
-    lines.push("    condition:");
-    lines.push(...buildNestedEntryLines(cleanCondition, 6));
-  }
-  const snippetLines = node.snippet.split("\n");
-  const bodyIndex = snippetLines.findIndex(
-    (line, index) => index > 0 && /^\s*do:\s*(?:#.*)?$/.test(line)
-  );
-  const bodyLines = bodyIndex >= 0 ? snippetLines.slice(bodyIndex) : ["    do:"];
-  return [...lines, ...bodyLines].join("\n");
+  return seq;
 }
 
 export function applyEditedSleepStep(
@@ -197,7 +47,10 @@ export function applyEditedSleepStep(
   node: SequencerStepOutlineNode,
   duration: string
 ): string {
-  return replaceStepSnippet(yamlText, node, renderSleepSnippet(node, duration));
+  const out = editStep(node.snippet, (doc, item) => {
+    item.set("sleep", textToNode(doc, duration));
+  });
+  return replaceStepSnippet(yamlText, node, out);
 }
 
 export function applyEditedSetStep(
@@ -207,7 +60,13 @@ export function applyEditedSetStep(
   name: string,
   value: string
 ): string {
-  return replaceStepSnippet(yamlText, node, renderSetSnippet(node, device, name, value));
+  const out = editStep(node.snippet, (doc, item) => {
+    const body = bodyMap(item, "set");
+    body.set("device", textToNode(doc, device));
+    body.set("name", textToNode(doc, name));
+    body.set("value", textToNode(doc, value));
+  });
+  return replaceStepSnippet(yamlText, node, out);
 }
 
 export function applyEditedWaitUntilStep(
@@ -218,11 +77,17 @@ export function applyEditedWaitUntilStep(
   sample: SequencerOutlineMetadataEntry[],
   condition: SequencerOutlineMetadataEntry[]
 ): string {
-  return replaceStepSnippet(
-    yamlText,
-    node,
-    renderWaitUntilSnippet(timeoutS, everyS, sample, condition)
-  );
+  const out = editStep(node.snippet, (doc, item) => {
+    const body = bodyMap(item, "wait_until");
+    setScalarOrDelete(doc, body, "timeout_s", timeoutS);
+    setScalarOrDelete(doc, body, "every_s", everyS);
+    body.set(
+      "sample",
+      cleanEntries(sample).length > 0 ? entriesToMap(doc, sample) : emptyMap()
+    );
+    setCondition(doc, body, condition);
+  });
+  return replaceStepSnippet(yamlText, node, out);
 }
 
 export function applyEditedRepeatStep(
@@ -230,7 +95,11 @@ export function applyEditedRepeatStep(
   node: SequencerStepOutlineNode,
   times: string
 ): string {
-  return replaceStepSnippet(yamlText, node, renderRepeatSnippet(node, times));
+  const out = editStep(node.snippet, (doc, item) => {
+    const body = bodyMap(item, "repeat");
+    body.set("times", textToNode(doc, times));
+  });
+  return replaceStepSnippet(yamlText, node, out);
 }
 
 export function applyEditedAssignStep(
@@ -238,7 +107,13 @@ export function applyEditedAssignStep(
   node: SequencerStepOutlineNode,
   entries: ReadonlyArray<SequencerOutlineMetadataEntry>
 ): string {
-  return replaceStepSnippet(yamlText, node, renderAssignSnippet(node, entries));
+  const out = editStep(node.snippet, (doc, item) => {
+    item.set(
+      "assign",
+      cleanEntries(entries).length > 0 ? entriesToMap(doc, entries) : emptyMap()
+    );
+  });
+  return replaceStepSnippet(yamlText, node, out);
 }
 
 export function applyEditedSetContextStep(
@@ -247,11 +122,15 @@ export function applyEditedSetContextStep(
   streams: ReadonlyArray<SequencerSetContextStreamDetail>,
   fields: ReadonlyArray<SequencerOutlineMetadataEntry>
 ): string {
-  return replaceStepSnippet(
-    yamlText,
-    node,
-    renderSetContextSnippet(streams, fields)
-  );
+  const out = editStep(node.snippet, (doc, item) => {
+    const body = bodyMap(item, "set_context");
+    body.set("streams", buildStreams(doc, streams));
+    body.set(
+      "fields",
+      cleanEntries(fields).length > 0 ? entriesToMap(doc, fields) : emptyMap()
+    );
+  });
+  return replaceStepSnippet(yamlText, node, out);
 }
 
 export function applyEditedIfStep(
@@ -259,7 +138,10 @@ export function applyEditedIfStep(
   node: SequencerStepOutlineNode,
   condition: SequencerOutlineMetadataEntry[]
 ): string {
-  return replaceStepSnippet(yamlText, node, renderIfSnippet(node, condition));
+  const out = editStep(node.snippet, (doc, item) => {
+    setCondition(doc, bodyMap(item, "if"), condition);
+  });
+  return replaceStepSnippet(yamlText, node, out);
 }
 
 export function applyEditedWhileStep(
@@ -267,5 +149,8 @@ export function applyEditedWhileStep(
   node: SequencerStepOutlineNode,
   condition: SequencerOutlineMetadataEntry[]
 ): string {
-  return replaceStepSnippet(yamlText, node, renderWhileSnippet(node, condition));
+  const out = editStep(node.snippet, (doc, item) => {
+    setCondition(doc, bodyMap(item, "while"), condition);
+  });
+  return replaceStepSnippet(yamlText, node, out);
 }

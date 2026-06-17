@@ -189,7 +189,7 @@ describe("sequencer editing regressions", () => {
     );
     const reparsed = getNodeByKind(next, "set_context").setContextDetail;
 
-    expect(next).toContain("          device: trace1");
+    expect(next).toContain("        - device: trace1");
     expect(next).toContain("          stream: trace");
     expect(reparsed?.streams).toEqual([{ device: "trace1", stream: "trace" }]);
     expect(reparsed?.fields).toEqual([
@@ -241,8 +241,8 @@ describe("sequencer editing regressions", () => {
       "  - if:",
       "      condition:",
       "        and:",
-      "          - gt: [${x}, 0]",
-      "          - lt: [${x}, 10]",
+      '          - gt: ["${x}", 0]',
+      '          - lt: ["${x}", 10]',
       "      then:",
       "        - sleep: 0.1",
       "      else: []",
@@ -260,7 +260,7 @@ describe("sequencer editing regressions", () => {
       "steps:",
       "  - if:",
       "      condition:",
-      "        gt: [${x}, 0]",
+      '        gt: ["${x}", 0]',
       "      then:",
       "        - call:",
       "            device: foo",
@@ -287,7 +287,7 @@ describe("sequencer editing regressions", () => {
       "steps:",
       "  - while:",
       "      condition:",
-      "        lt: [${i}, 10]",
+      '        lt: ["${i}", 10]',
       "      do:",
       "        - assign:",
       "            i: ${i + 1}",
