@@ -22,6 +22,33 @@ uv run mypy src/experiment_control
 - `pytest`: collection errors due to missing `tests/__init__.py` — use `unittest discover` instead
 - `unittest discover`: passes (595 tests, 1 skipped as of 2026-06-08).
 
+## Frontend (React UI)
+
+The web UI lives in `web/react_ui/` (Vite + React + Mantine + TypeScript, tested with vitest). Run from `web/react_ui/`:
+
+```powershell
+npm install
+npm test            # vitest run (65 tests pass as of 2026-06-17)
+npm run typecheck   # tsc --noEmit (clean; do not introduce new errors)
+npm run build       # tsc --noEmit && vite build && compress-dist
+```
+
+### Deploy model (read before changing the UI)
+
+The FastAPI gateway serves a **packaged** copy of the built UI from `src/experiment_control/_ui_dist`, which is **committed to git** so a plain `pip install` ships the UI without a Node build. Serve precedence (`fastapi/app.py` `_default_ui_dist_path`, gated by env `EXPERIMENT_CONTROL_SERVE_UI`):
+
+1. `EXPERIMENT_CONTROL_UI_DIST` env override, if set
+2. packaged `src/experiment_control/_ui_dist`
+3. dev fallback `web/react_ui/dist` (source tree only)
+
+Consequence: **a UI source change does not ship until `_ui_dist` is rebuilt and committed.** Rebuild and stage the packaged bundle alongside the source change:
+
+```powershell
+.\scripts\build_packaged_ui.ps1   # npm install + npm run build, then dist -> _ui_dist
+```
+
+Asset filenames are content-hashed, so several `_ui_dist/**` files rename on each build — committing the whole regenerated tree is expected.
+
 ## Downstream dependency
 
 The package is consumed by `centrex-experimental-stack` (sibling repo at `..\centrex-experimental-stack`). Wire contracts that MUST be preserved:
