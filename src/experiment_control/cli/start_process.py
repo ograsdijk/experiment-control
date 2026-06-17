@@ -10,6 +10,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from ..utils.module_loading import module_name_from_path
 from ..utils.process_lifecycle import configure_child_parent_guard
 
 
@@ -38,19 +39,6 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
-def _module_name_from_path(path: Path) -> tuple[str | None, Path | None]:
-    parts: list[str] = []
-    cur = path.parent
-    while (cur / "__init__.py").exists():
-        parts.append(cur.name)
-        cur = cur.parent
-    if not parts:
-        return None, None
-    pkg = list(reversed(parts))
-    module_name = ".".join(pkg + [path.stem])
-    return module_name, cur
-
-
 def _import_class(file_path: str | Path, class_name: str) -> type[Any]:
     path = Path(file_path).expanduser().resolve()
     if not path.exists():
@@ -60,7 +48,7 @@ def _import_class(file_path: str | Path, class_name: str) -> type[Any]:
     if not class_name or not isinstance(class_name, str):
         raise ValueError("class_name must be a non-empty string")
 
-    module_name, root = _module_name_from_path(path)
+    module_name, root = module_name_from_path(path)
     if module_name and root is not None:
         if str(root) not in sys.path:
             sys.path.insert(0, str(root))

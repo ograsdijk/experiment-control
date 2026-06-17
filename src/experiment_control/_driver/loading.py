@@ -5,6 +5,8 @@ import sys
 from pathlib import Path
 from typing import Any, Protocol
 
+from ..utils.module_loading import module_name_from_path
+
 
 class Device(Protocol):
     """
@@ -16,24 +18,6 @@ class Device(Protocol):
     def connect(self, *args: Any, **kwargs: Any) -> None: ...
 
     def disconnect(self) -> None: ...
-
-
-def _module_name_from_path(path: Path) -> tuple[str | None, Path | None]:
-    """Infer a dotted module name for ``path`` by walking up ``__init__.py`` files.
-
-    Returns ``(module_name, package_root)`` where ``package_root`` is the directory
-    that must be on ``sys.path`` for ``module_name`` to import, or ``(None, None)``
-    if ``path`` is not inside an importable package.
-    """
-    parts: list[str] = []
-    cur = path.parent
-    while (cur / "__init__.py").exists():
-        parts.append(cur.name)
-        cur = cur.parent
-    if not parts:
-        return None, None
-    module_name = ".".join(list(reversed(parts)) + [path.stem])
-    return module_name, cur
 
 
 def import_class(file_path: str | Path, class_name: str) -> type[Device]:
@@ -63,7 +47,7 @@ def import_class(file_path: str | Path, class_name: str) -> type[Device]:
     if not class_name or not isinstance(class_name, str):
         raise ValueError("class_name must be a non-empty string")
 
-    inferred_name, root = _module_name_from_path(path)
+    inferred_name, root = module_name_from_path(path)
     if inferred_name and root is not None:
         # Import as a proper package module so relative imports work.
         if str(root) not in sys.path:
