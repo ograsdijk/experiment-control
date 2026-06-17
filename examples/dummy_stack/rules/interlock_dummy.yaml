@@ -1,0 +1,36 @@
+version: 1
+interceptor_id: dummy_interlocks
+defaults:
+  max_age_s: 5.0
+
+rules:
+  # 1) Params-only rule: bound the requested setpoint without consulting any
+  #    telemetry. The condition references only the command's own params.
+  - name: limit_temperature_setpoint
+    match: {device_id: "*", action: set_temperature}
+    condition:
+      and:
+        - ge: ["${params.temperature}", 10.0]
+        - le: ["${params.temperature}", 30.0]
+    on_block:
+      message: "Temperature setpoint out of range (10-30 C)."
+      code: CONDITION_FAILED
+
+  # 2) Telemetry-gated rule: block dummy2.set_temperature while dummy1 is hot.
+  #    Demonstrates pulling a live telemetry signal into the condition via
+  #    `inputs.telemetry`, with `.value` (latest reading) and `.ok` (fresh +
+  #    present) accessors. `max_age_s` from `defaults` rejects stale readings.
+  - name: block_dummy2_set_while_dummy1_hot
+    match: {device_id: dummy2, action: set_temperature}
+    inputs:
+      telemetry:
+        - as: dummy1_temp
+          device: dummy1
+          signal: temperature
+    condition:
+      and:
+        - eq: ["${dummy1_temp.ok}", true]
+        - lt: ["${dummy1_temp.value}", 25.0]
+    on_block:
+      message: "dummy2 set_temperature blocked: dummy1 temperature >= 25 C or telemetry unavailable."
+      code: CONDITION_FAILED

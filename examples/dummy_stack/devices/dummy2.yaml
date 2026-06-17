@@ -1,0 +1,20 @@
+version: 1
+device_id: dummy2
+driver:
+  module: experiment_control.drivers.dummy_driver
+  class_name: DummyDriver
+init_kwargs:
+  port: 12346
+telemetry_calls:
+  - method: read_temperature
+    outputs:
+      - signal: temperature
+        kind: scalar
+        units: C
+        dtype: float64
+  - method: read_voltage
+    outputs:
+      - signal: voltage
+        kind: scalar
+        units: V
+        dtype: float64

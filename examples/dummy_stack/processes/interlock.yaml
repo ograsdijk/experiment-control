@@ -1,0 +1,12 @@
+version: 1
+process_id: interlock
+process:
+  module: experiment_control.processes.interlock
+  class_name: InterlockProcess
+init_kwargs:
+  rpc_timeout_ms: 2000
+  heartbeat_period_s: 1.0
+  rules: examples/dummy_stack/rules/interlock_dummy.yaml
+restart_policy: NEVER
+heartbeat_timeout_s: 3.0
+shutdown_timeout_s: 3.0
