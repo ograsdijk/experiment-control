@@ -37,6 +37,9 @@ import {
   valueByKey,
   withMetricCallParamEntries,
 } from "../editor_helpers";
+import { callableActionNames, deviceNames } from "../device_field_options";
+import { useDevicesContext } from "../../devices/DevicesContext";
+import { FieldAutocomplete } from "./FieldAutocomplete";
 import type {
   SequencerAdaptiveFieldGroup,
   SequencerAdaptiveMetricDetail,
@@ -102,6 +105,7 @@ export function AdaptiveStepEditor({
   streamWorkspaces,
   latestSignalsByDevice,
 }: Props) {
+  const { devices } = useDevicesContext();
   const [adaptiveIdDraft, setAdaptiveIdDraft] = useState("");
   const [adaptiveControllerKindDraft, setAdaptiveControllerKindDraft] = useState("");
   const [adaptiveMinLossDraft, setAdaptiveMinLossDraft] = useState("");
@@ -868,19 +872,13 @@ export function AdaptiveStepEditor({
                     selectedOutputId.trim().length > 0 &&
                     knownOutputIds.size > 0 &&
                     !knownOutputIds.has(selectedOutputId);
-                  const telemetryDeviceOptions = Array.from(
-                    new Set([
-                      ...(metricDevice ? [metricDevice] : []),
-                      ...Object.keys(capabilitiesByDevice),
-                      ...Object.keys(latestSignalsByDevice),
-                    ])
-                  ).map((value) => ({ value, label: value }));
-                  const telemetrySignalOptions = Array.from(
-                    new Set([
-                      ...(selectedTelemetrySignal ? [selectedTelemetrySignal] : []),
-                      ...Object.keys(latestSignalsByDevice[metricDevice] ?? {}),
-                    ])
-                  ).map((value) => ({ value, label: value }));
+                  const deviceOptions = deviceNames(devices);
+                  const telemetrySignalNames = Object.keys(
+                    latestSignalsByDevice[metricDevice] ?? {}
+                  ).sort((a, b) => a.localeCompare(b));
+                  const callActionNames = callableActionNames(
+                    capabilitiesByDevice[metricDevice]
+                  );
                   const knownTelemetryDeviceIds = new Set([
                     ...Object.keys(capabilitiesByDevice),
                     ...Object.keys(latestSignalsByDevice),
@@ -895,12 +893,6 @@ export function AdaptiveStepEditor({
                     selectedTelemetrySignal.trim().length > 0 &&
                     knownTelemetrySignalIds.size > 0 &&
                     !knownTelemetrySignalIds.has(selectedTelemetrySignal);
-                  const callDeviceOptions = Array.from(
-                    new Set([
-                      ...(metricDevice ? [metricDevice] : []),
-                      ...Object.keys(capabilitiesByDevice),
-                    ])
-                  ).map((value) => ({ value, label: value }));
                   const knownCallDeviceIds = new Set(Object.keys(capabilitiesByDevice));
                   const selectedCallDeviceMissing =
                     metricDevice.trim().length > 0 &&
@@ -909,12 +901,6 @@ export function AdaptiveStepEditor({
                     (member) => member.name
                   );
                   const selectedAction = valueByKey(metric.config, "action");
-                  const actionSelectOptions = Array.from(
-                    new Set([
-                      ...(selectedAction ? [selectedAction] : []),
-                      ...actionOptions,
-                    ])
-                  ).map((value) => ({ value, label: value }));
                   const selectedActionMissing =
                     selectedAction.trim().length > 0 &&
                     actionOptions.length > 0 &&
@@ -1144,96 +1130,40 @@ export function AdaptiveStepEditor({
                         {isTelemetryMetric ? (
                           <>
                           <Group grow align="flex-end">
-                            {telemetryDeviceOptions.length > 0 ? (
-                              <Select
-                                size="xs"
-                                label="Device"
-                                data={telemetryDeviceOptions}
-                                value={metricDevice}
-                                error={
-                                  isBlank(metricDevice) ? "Device is required." : undefined
-                                }
-                                allowDeselect={false}
-                                searchable
-                                comboboxProps={{ withinPortal: false }}
-                                onChange={(value) =>
-                                  updateMetric({
-                                    ...metric,
-                                    config: setConfigEntry(
-                                      setConfigEntry(metric.config, "signal", ""),
-                                      "device",
-                                      value ?? ""
-                                    ),
-                                  })
-                                }
-                              />
-                            ) : (
-                              <TextInput
-                                size="xs"
-                                label="Device"
-                                value={metricDevice}
-                                error={
-                                  isBlank(metricDevice) ? "Device is required." : undefined
-                                }
-                                onChange={(event) =>
-                                  updateMetric({
-                                    ...metric,
-                                    config: setConfigEntry(
-                                      metric.config,
-                                      "device",
-                                      event.currentTarget.value
-                                    ),
-                                  })
-                                }
-                              />
-                            )}
-                            {telemetrySignalOptions.length > 0 ? (
-                              <Select
-                                size="xs"
-                                label="Signal"
-                                data={telemetrySignalOptions}
-                                value={selectedTelemetrySignal}
-                                error={
-                                  isBlank(selectedTelemetrySignal)
-                                    ? "Signal is required."
-                                    : undefined
-                                }
-                                allowDeselect={false}
-                                searchable
-                                comboboxProps={{ withinPortal: false }}
-                                onChange={(value) =>
-                                  updateMetric({
-                                    ...metric,
-                                    config: setConfigEntry(
-                                      metric.config,
-                                      "signal",
-                                      value ?? ""
-                                    ),
-                                  })
-                                }
-                              />
-                            ) : (
-                              <TextInput
-                                size="xs"
-                                label="Signal"
-                                value={selectedTelemetrySignal}
-                                error={
-                                  isBlank(selectedTelemetrySignal)
-                                    ? "Signal is required."
-                                    : undefined
-                                }
-                                onChange={(event) =>
-                                  updateMetric({
-                                    ...metric,
-                                    config: setConfigEntry(
-                                      metric.config,
-                                      "signal",
-                                      event.currentTarget.value
-                                    ),
-                                  })
-                                }
-                              />
-                            )}
+                            <FieldAutocomplete
+                              label="Device"
+                              value={metricDevice}
+                              options={deviceOptions}
+                              placeholder="device"
+                              error={isBlank(metricDevice) ? "Device is required." : undefined}
+                              onChange={(value) =>
+                                updateMetric({
+                                  ...metric,
+                                  config: setConfigEntry(
+                                    setConfigEntry(metric.config, "signal", ""),
+                                    "device",
+                                    value
+                                  ),
+                                })
+                              }
+                            />
+                            <FieldAutocomplete
+                              label="Signal"
+                              value={selectedTelemetrySignal}
+                              options={telemetrySignalNames}
+                              placeholder="signal"
+                              error={
+                                isBlank(selectedTelemetrySignal)
+                                  ? "Signal is required."
+                                  : undefined
+                              }
+                              onChange={(value) =>
+                                updateMetric({
+                                  ...metric,
+                                  config: setConfigEntry(metric.config, "signal", value),
+                                })
+                              }
+                            />
                           </Group>
                           {selectedTelemetryDeviceMissing ? (
                             <Text size="xs" c="orange">
@@ -1250,102 +1180,42 @@ export function AdaptiveStepEditor({
                         {isCallMetric ? (
                           <>
                           <Group grow align="flex-end">
-                            {callDeviceOptions.length > 0 ? (
-                              <Select
-                                size="xs"
-                                label="Device"
-                                data={callDeviceOptions}
-                                value={metricDevice}
-                                error={
-                                  isBlank(metricDevice) ? "Device is required." : undefined
-                                }
-                                allowDeselect={false}
-                                searchable
-                                comboboxProps={{ withinPortal: false }}
-                                onChange={(value) => {
-                                  const nextDevice = value ?? "";
-                                  const nextConfig = [
+                            <FieldAutocomplete
+                              label="Device"
+                              value={metricDevice}
+                              options={deviceOptions}
+                              placeholder="device"
+                              error={isBlank(metricDevice) ? "Device is required." : undefined}
+                              onChange={(value) =>
+                                updateMetric({
+                                  ...metric,
+                                  config: [
                                     ...metric.config.filter(
                                       (entry) =>
                                         entry.name !== "device" &&
                                         entry.name !== "action" &&
                                         !entry.name.startsWith("params.")
                                     ),
-                                    { name: "device", value: nextDevice },
-                                  ];
-                                  updateMetric({
-                                    ...metric,
-                                    config: nextConfig,
-                                  });
-                                }}
-                              />
-                            ) : (
-                              <TextInput
-                                size="xs"
-                                label="Device"
-                                value={metricDevice}
-                                error={
-                                  isBlank(metricDevice) ? "Device is required." : undefined
-                                }
-                                onChange={(event) =>
-                                  updateMetric({
-                                    ...metric,
-                                    config: setConfigEntry(
-                                      metric.config,
-                                      "device",
-                                      event.currentTarget.value
-                                    ),
-                                  })
-                                }
-                              />
-                            )}
-                            {actionSelectOptions.length > 0 ? (
-                              <Select
-                                size="xs"
-                                label="Action"
-                                data={actionSelectOptions}
-                                value={selectedAction}
-                                error={
-                                  isBlank(selectedAction)
-                                    ? "Action is required."
-                                    : undefined
-                                }
-                                allowDeselect={false}
-                                searchable
-                                comboboxProps={{ withinPortal: false }}
-                                onChange={(value) =>
-                                  updateMetric({
-                                    ...metric,
-                                    config: setConfigEntry(
-                                      metric.config,
-                                      "action",
-                                      value ?? ""
-                                    ),
-                                  })
-                                }
-                              />
-                            ) : (
-                              <TextInput
-                                size="xs"
-                                label="Action"
-                                value={selectedAction}
-                                error={
-                                  isBlank(selectedAction)
-                                    ? "Action is required."
-                                    : undefined
-                                }
-                                onChange={(event) =>
-                                  updateMetric({
-                                    ...metric,
-                                    config: setConfigEntry(
-                                      metric.config,
-                                      "action",
-                                      event.currentTarget.value
-                                    ),
-                                  })
-                                }
-                              />
-                            )}
+                                    { name: "device", value },
+                                  ],
+                                })
+                              }
+                            />
+                            <FieldAutocomplete
+                              label="Action"
+                              value={selectedAction}
+                              options={callActionNames}
+                              placeholder="action"
+                              error={
+                                isBlank(selectedAction) ? "Action is required." : undefined
+                              }
+                              onChange={(value) =>
+                                updateMetric({
+                                  ...metric,
+                                  config: setConfigEntry(metric.config, "action", value),
+                                })
+                              }
+                            />
                           </Group>
                           {selectedCallDeviceMissing ? (
                             <Text size="xs" c="orange">

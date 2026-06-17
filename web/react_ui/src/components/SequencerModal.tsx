@@ -242,8 +242,11 @@ export function SequencerModal({
       centered
       zIndex={440}
     >
-      <Stack gap="sm" style={{ height: "clamp(42rem, 88vh, 78rem)", minHeight: 0 }}>
-        <Group justify="space-between" align="flex-start">
+      <Stack
+        gap="sm"
+        style={{ height: "clamp(42rem, 88vh, 78rem)", minHeight: 0, overflow: "hidden" }}
+      >
+        <Group justify="space-between" align="flex-start" style={{ flexShrink: 0 }}>
           <Stack gap={4}>
             <Group gap="xs" wrap="wrap">
               <Badge variant="light" color={processStateColor(processState)}>
@@ -345,7 +348,11 @@ export function SequencerModal({
           </Group>
         </Group>
 
-        <Card radius="md" p="sm" style={{ border: "1px solid var(--card-border)" }}>
+        <Card
+          radius="md"
+          p="sm"
+          style={{ border: "1px solid var(--card-border)", flexShrink: 0 }}
+        >
           <Stack gap={8}>
             <Group justify="space-between" align="center" wrap="wrap">
               <Text size="sm" fw={600}>
@@ -693,7 +700,7 @@ export function SequencerModal({
           </Stack>
         )}
 
-        <Group justify="space-between">
+        <Group justify="space-between" style={{ flexShrink: 0 }}>
           <Group gap="xs">
             <input
               ref={fileInputRef}

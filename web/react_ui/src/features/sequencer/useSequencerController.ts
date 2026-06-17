@@ -1042,13 +1042,16 @@ export function useSequencerController({
     setSequencerLoadBusy(true);
     setSequencerModalError(null);
     try {
+      const selectedSequenceId = sequencerSelectedSequenceId?.trim();
       const resp = await sendProcessCommand(
         sequencerProcess.process_id,
-        "sequencer.load",
-        {
-          text: sequencerYamlText,
-        },
-        "sequencer-load"
+        selectedSequenceId ? "sequencer.library.load" : "sequencer.load",
+        selectedSequenceId
+          ? { sequence_id: selectedSequenceId }
+          : {
+              text: sequencerYamlText,
+            },
+        selectedSequenceId ? "sequencer-library-load" : "sequencer-load"
       );
       if (!resp.ok) {
         const message = resp.error?.message ?? resp.error?.code ?? "Unknown error";
@@ -1086,6 +1089,7 @@ export function useSequencerController({
     sendProcessCommand,
     sequencerLoadBusy,
     sequencerProcess,
+    sequencerSelectedSequenceId,
     sequencerYamlText,
   ]);
 
