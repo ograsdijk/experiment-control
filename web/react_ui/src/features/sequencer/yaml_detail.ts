@@ -10,7 +10,7 @@
 // snippet via each node's `range`), so quoting and flow spacing are preserved
 // and round-trip through the flat `{name, value}` model the form components use
 // (where nested structure is encoded as dotted names, e.g. `center.x`).
-import { isMap, isScalar, isSeq, parseDocument } from "yaml";
+import { isMap, isScalar, isSeq, parseDocument, stringify } from "yaml";
 import type { Document, Node, YAMLMap } from "yaml";
 import type { SequencerOutlineMetadataEntry } from "./types";
 import { conditionAstToEntries } from "./condition_ast";
@@ -145,10 +145,13 @@ export function childNode(base: Node | null, key: string): Node | null {
 }
 
 /**
- * Field value as source text. Scalars are returned directly; inline (single-
- * line) flow collections are preserved as text too, so e.g. `set` `value: [1, 2]`
- * round-trips instead of being dropped. Block (multi-line) collections return
- * null (those are read via {@link sectionEntries}).
+ * Field value as source text. Scalars (including block scalars) are returned as
+ * their exact source. Inline (single-line) flow collections are preserved
+ * verbatim, so e.g. `set` `value: [1, 2]` keeps the author's spacing. Block
+ * (multi-line) collections are flow-normalized to a single round-trippable line
+ * (e.g. a block list becomes `[0, 200, 400]`) so an editable field still shows
+ * the value: returning null here would blank the field and the writer would
+ * overwrite the collection with an empty scalar on save.
  */
 export function scalarField(base: Node | null, key: string, src: string): string | null {
   const child = childNode(base, key);
@@ -159,7 +162,20 @@ export function scalarField(base: Node | null, key: string, src: string): string
     return leafText(child, src);
   }
   const text = leafText(child, src);
-  return text != null && !text.includes("\n") ? text : null;
+  if (text != null && !text.includes("\n")) {
+    return text;
+  }
+  return collectionToFlowText(child);
+}
+
+/** Serialize a collection node to a single-line flow string (round-trippable). */
+function collectionToFlowText(node: Node): string | null {
+  try {
+    const text = stringify(node, { collectionStyle: "flow", lineWidth: 0 }).trim();
+    return text.length > 0 ? text : null;
+  } catch {
+    return null;
+  }
 }
 
 /** Entries flattened from a child map section (e.g. `params`, `fields`). */

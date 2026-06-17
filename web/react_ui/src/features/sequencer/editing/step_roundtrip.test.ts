@@ -252,6 +252,64 @@ describe("for-loop round-trip with inline flow maps (spb_raster_scan shapes)", (
     expect(reValue.replace(/\s+/g, "")).toBe("[0,200,400]");
   });
 
+  it("preserves a block (multi-line) list set value instead of dropping it", () => {
+    const yaml = [
+      "version: 1",
+      "steps:",
+      "  - set:",
+      "      device: psu",
+      "      name: ramp",
+      "      value:",
+      "        - 0",
+      "        - 200",
+      "        - 400",
+      "",
+    ].join("\n");
+
+    // A block collection used to read as null -> blank field -> the value was
+    // destroyed on save. It is now flow-normalized to one round-trippable line.
+    const detail = nodeByKind(yaml, "set").setDetail;
+    expect(detail?.value?.replace(/\s+/g, "")).toBe("[0,200,400]");
+
+    const next = applyEditedSetStep(
+      yaml,
+      nodeByKind(yaml, "set"),
+      "psu",
+      "ramp",
+      detail!.value ?? ""
+    );
+    const reValue = nodeByKind(next, "set").setDetail?.value ?? "";
+    expect(reValue.replace(/\s+/g, "")).toBe("[0,200,400]");
+  });
+
+  it("preserves a block (multi-line) map set value instead of dropping it", () => {
+    const yaml = [
+      "version: 1",
+      "steps:",
+      "  - set:",
+      "      device: psu",
+      "      name: cfg",
+      "      value:",
+      "        gain: 2",
+      '        offset: "${o}"',
+      "",
+    ].join("\n");
+
+    const detail = nodeByKind(yaml, "set").setDetail;
+    expect(detail?.value?.replace(/\s+/g, "")).toBe('{gain:2,offset:"${o}"}');
+
+    const next = applyEditedSetStep(
+      yaml,
+      nodeByKind(yaml, "set"),
+      "psu",
+      "cfg",
+      detail!.value ?? ""
+    );
+    const re = nodeByKind(next, "set").setDetail?.value ?? "";
+    expect(re).toContain("gain");
+    expect(re).toContain("offset");
+  });
+
   it("reads inline set_context streams and round-trips them", () => {
     const yaml = [
       "version: 1",
