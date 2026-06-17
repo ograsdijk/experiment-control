@@ -32,10 +32,29 @@ class _FakeManager:
         if not isinstance(payload, dict):
             return {"ok": False, "error": "bad_payload"}
         if payload.get("type") == "manager.devices.list":
-            return {
-                "ok": True,
-                "devices": [{"device_id": device_id} for device_id in sorted(self._devices)],
-            }
+            # The real manager includes each device's cached capabilities in the
+            # devices.list snapshot; preflight reads them from there.
+            devices = []
+            for device_id in sorted(self._devices):
+                entry: dict = {"device_id": device_id}
+                if device_id not in self._caps_fail:
+                    members = self._caps.get(device_id)
+                    if members is not None:
+                        entry["capabilities"] = {
+                            "version": 1,
+                            "members": [
+                                {
+                                    "name": name,
+                                    "kind": spec.get("kind", "method"),
+                                    "readable": bool(spec.get("readable", True)),
+                                    "settable": bool(spec.get("settable", False)),
+                                    "params": spec.get("params", []),
+                                }
+                                for name, spec in members.items()
+                            ],
+                        }
+                devices.append(entry)
+            return {"ok": True, "devices": devices}
         if payload.get("action") == "manager.telemetry.schema.list":
             devices = []
             for device_id in sorted(self._devices):
@@ -148,6 +167,44 @@ steps:
         self.assertTrue(resp.get("ok"))
         self.assertFalse(bool(resp.get("result", {}).get("valid")))
         self.assertIn("unknown_action", _codes_from(resp))
+
+    def test_preflight_warns_instead_of_erroring_when_capabilities_empty(self) -> None:
+        # A device that is registered but not connected reports zero members.
+        # Preflight must warn ("could not verify"), not hard-error the action.
+        mgr = _FakeManager(devices={"laser"}, capabilities_by_device={"laser": {}})
+        proc = _build_proc(mgr)
+        yaml_text = """
+version: 1
+steps:
+  - call:
+      device: laser
+      action: pass_qswitches
+      params: {}
+"""
+        resp = proc._handle_rpc({"type": "sequencer.preflight", "params": {"text": yaml_text}})
+        self.assertTrue(resp.get("ok"))
+        codes = _codes_from(resp)
+        self.assertIn("capabilities_unavailable", codes)
+        self.assertNotIn("unknown_action", codes)
+        self.assertTrue(bool(resp.get("result", {}).get("valid")))
+
+    def test_preflight_diagnostics_carry_source_line(self) -> None:
+        mgr = _FakeManager(
+            devices={"laser"},
+            capabilities_by_device={
+                "laser": {
+                    "status": {"kind": "method", "readable": True, "settable": False},
+                }
+            },
+        )
+        proc = _build_proc(mgr)
+        # `- call:` is on line 3 (1-based) of this text.
+        yaml_text = "version: 1\nsteps:\n  - call:\n      device: laser\n      action: bogus\n      params: {}\n"
+        resp = proc._handle_rpc({"type": "sequencer.preflight", "params": {"text": yaml_text}})
+        diagnostics = resp.get("result", {}).get("diagnostics", [])
+        unknown = [d for d in diagnostics if d.get("code") == "unknown_action"]
+        self.assertTrue(unknown)
+        self.assertEqual(unknown[0].get("line"), 3)
 
     def test_preflight_reports_missing_template_variable(self) -> None:
         mgr = _FakeManager(
