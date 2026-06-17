@@ -45,6 +45,14 @@ dev = [
     "types-PyYAML>=6.0",
 ]
 
+[tool.pytest.ini_options]
+# Put the repo root on sys.path so test modules can do
+# `from tests._temp_utils import ...` (tests/ is a namespace package, no
+# __init__.py). Without this, bare `pytest` fails collection with
+# "No module named 'tests'".
+pythonpath = ["."]
+testpaths = ["tests"]
+
 [tool.mypy]
 
 [[tool.mypy.overrides]]

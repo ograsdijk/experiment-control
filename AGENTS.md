@@ -9,8 +9,12 @@ uv run ruff check src tests examples
 # Complexity guard (incremental; runs in CI)
 uv run ruff check src/experiment_control/utils/command_interceptors.py src/experiment_control/utils/network_hosts.py src/experiment_control/processes/stream_analysis.py src/experiment_control/processes/influx_writer.py src/experiment_control/sequencer/sequencer.py src/experiment_control/processes/interlock.py src/experiment_control/processes/watchdog.py --select C901
 
-# Tests (CI uses unittest discover, NOT pytest, because tests import `from tests._temp_utils import ...` and there is no tests/__init__.py)
+# Tests (both runners work; CI uses unittest discover)
 uv run python -m unittest discover -s tests -p "test_*.py" -q
+# pytest also works now: `pythonpath = ["."]` in [tool.pytest.ini_options] puts
+# the repo root on sys.path so `from tests._temp_utils import ...` resolves
+# (tests/ is a namespace package, no __init__.py).
+uv run pytest -q
 
 # Typecheck (107 pre-existing errors as of 2026-06-08; do not introduce new ones)
 uv run mypy src/experiment_control
@@ -19,8 +23,9 @@ uv run mypy src/experiment_control
 ## Known pre-existing test/lint state (baseline, do not regress)
 
 - `mypy`: 107 errors in 32 files
-- `pytest`: collection errors due to missing `tests/__init__.py` — use `unittest discover` instead
-- `unittest discover`: passes (595 tests, 1 skipped as of 2026-06-08).
+- `pytest`: passes (collection fixed via `pythonpath = ["."]` in pyproject;
+  675 passed, 1 skipped as of 2026-06-17).
+- `unittest discover`: passes (669 tests, 1 skipped as of 2026-06-17).
 
 ## Frontend (React UI)
 
