@@ -9,6 +9,25 @@ Experiment control framework with:
 
 This README focuses on the current recommended workflow used in `examples/linien_cli`.
 
+## Examples
+
+All examples are YAML-driven stacks (`stack.yaml` + `devices/` + `processes/`),
+the same shape used by deployed instances.
+
+- `examples/dummy_stack` - minimal, no-hardware starting point: two dummy devices,
+  an HDF writer, and a command interlock. Includes a TUI launcher
+  (`run_dummy_stack.py`) and a FastAPI/web-UI gateway
+  (`run_dummy_stack_fastapi.py`). Best place to start.
+- `examples/dummy_stream_cli` - adds a stream (trace) device; includes a
+  `verify_stream_chunks.py` SHM smoke test.
+- `examples/dummy_frequency_trace_sequencer` - sequencer + stream analysis +
+  adaptive scans + measurement schema.
+- `examples/linien_cli` - real Linien/SynthHD devices (used in the quick start
+  below).
+- `examples/federation_dummy` - multi-stack federation (hub mirrors a leaf device).
+- `examples/dummy` - the same dummy setup wired up imperatively in Python
+  (`DeviceSpec`/`Manager`), kept as a programmatic-API reference.
+
 ## Current Code Structure
 
 Recent refactors split the large manager/router/process paths into focused
