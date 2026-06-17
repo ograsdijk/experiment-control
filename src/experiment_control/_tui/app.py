@@ -177,6 +177,11 @@ class ManagerTUI(App):
         self._topic_visible: dict[str, bool] = {}
         self._dropped_pub_messages = 0
         self._errors: deque[Json] = deque(maxlen=200)
+        # Bumped whenever _errors changes; _render_errors_table skips a full
+        # rebuild when the rendered revision already matches (the errors table
+        # is a pure function of _errors, mutated only via _record_error).
+        self._errors_rev = 0
+        self._errors_rendered_rev = -1
         self._seen_error_fingerprints: set[str] = set()
         self._seen_error_fingerprint_order: deque[str] = deque(maxlen=2000)
         self._last_manager_log_t_mono: float | None = None
@@ -222,7 +227,7 @@ class ManagerTUI(App):
         self._members_source: str = "device"
         self._inspector_mode: str = "device"
         self._members_context_key: str | None = None
-        self._members_rendered_fingerprint: dict[str, str] = {}
+        self._members_rendered_fingerprint: dict[str, int] = {}
         self._inspector_dirty = True
         self._last_inspector_render = 0.0
         self._inspector_min_period_s = 0.2
@@ -512,7 +517,12 @@ class ManagerTUI(App):
             self._last_manager_log_t_mono = float(latest)
         self._render_errors_table()
 
-    def _ingest_manager_log_entry(self, entry: Json, *, from_tail: bool = False) -> None:
+    def _ingest_manager_log_entry(
+        self, entry: Json, *, from_tail: bool = False
+    ) -> bool:
+        """Record a manager.log entry as an error if it clears the severity
+        threshold and is not a duplicate. Returns True iff a new error was
+        appended (so callers can avoid a redundant errors-table render)."""
         severity = self._normalize_log_severity(entry.get("severity"))
         if self._severity_rank(severity) < self._severity_rank("warning"):
             ts = entry.get("ts")
@@ -525,7 +535,7 @@ class ManagerTUI(App):
                         or t_mono_f > self._last_manager_log_t_mono
                     ):
                         self._last_manager_log_t_mono = t_mono_f
-            return
+            return False
 
         topic = str(entry.get("topic", "manager.log") or "manager.log")
         source_kind = str(entry.get("source_kind", "manager") or "manager")
@@ -571,7 +581,7 @@ class ManagerTUI(App):
             fingerprint = f"{severity}:{topic}:{source}:{id_}:{text[:256]}:{t_mono}"
 
         if not self._remember_error_fingerprint(fingerprint):
-            return
+            return False
 
         self._record_error(
             source=source,
@@ -597,6 +607,7 @@ class ManagerTUI(App):
                 message=toast_message,
                 severity="error",
             )
+        return True
 
     def _format_manager_log_event_line(self, entry: Json) -> str:
         severity = self._normalize_log_severity(entry.get("severity"))
@@ -1245,6 +1256,26 @@ class ManagerTUI(App):
                 text = text[:117] + "..."
             telemetry.add_row(key, text)
 
+    @staticmethod
+    def _members_render_fingerprint(members_render: list[dict[str, Any]]) -> int:
+        """Hash of only the fields that determine the rendered member rows
+        (name, kind, readable, settable, type annotation, source, doc)."""
+        return hash(
+            tuple(
+                (
+                    str(m.get("name", "")),
+                    str(m.get("kind", "")),
+                    bool(m.get("readable", False)),
+                    bool(m.get("settable", False)),
+                    str(m.get("return_annotation") or ""),
+                    str(m.get("value_annotation") or ""),
+                    str(m.get("source", "")),
+                    str(m.get("doc", "") or "")[:40],
+                )
+                for m in members_render
+            )
+        )
+
     def _render_members_table(self) -> None:
         table = self.query_one("#members_table", DataTable)
         if self._members_source == "process":
@@ -1285,10 +1316,10 @@ class ManagerTUI(App):
             [m for m in members if isinstance(m, dict)],
             key=lambda d: (str(d.get("kind", "")), str(d.get("name", ""))),
         )
-        try:
-            fingerprint = json.dumps(members_render, sort_keys=True, default=str)
-        except Exception:
-            fingerprint = str(members_render)
+        # Change-detection fingerprint over exactly the fields that affect the
+        # rendered rows. A tuple-hash is ~4–5× cheaper than json.dumps of the
+        # full member dicts (which this render runs on every inspector tick).
+        fingerprint = self._members_render_fingerprint(members_render)
         if preserve_scroll and fingerprint == self._members_rendered_fingerprint.get(
             context_key
         ):
@@ -1369,6 +1400,11 @@ class ManagerTUI(App):
         self._suppress_member_selection = False
 
     def _render_errors_table(self) -> None:
+        # Skip the full clear+rebuild (≈7 ms at the 200-row cap) when the error
+        # set has not changed since the last render.
+        if self._errors_rev == self._errors_rendered_rev:
+            return
+        self._errors_rendered_rev = self._errors_rev
         table = self.query_one("#errors_table", DataTable)
         table.clear()
         for entry in reversed(self._errors):
@@ -1458,6 +1494,7 @@ class ManagerTUI(App):
                 "fingerprint": fingerprint,
             }
         )
+        self._errors_rev += 1
         if render:
             self._render_errors_table()
 
@@ -1685,8 +1722,8 @@ class ManagerTUI(App):
                     self._mark_inspector_dirty()
 
             if topic == "manager.log":
-                self._ingest_manager_log_entry(payload)
-                errors_dirty = True
+                if self._ingest_manager_log_entry(payload):
+                    errors_dirty = True
             else:
                 before_count = len(self._errors)
                 self._maybe_emit_error_ui(topic, payload, prev_hb=prev_hb)
