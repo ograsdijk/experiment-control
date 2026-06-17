@@ -26,6 +26,25 @@ Available benchmarks:
 - `snapshot_readout`
 - `binary_trace_transport`
 - `stream_buffer`
+- `tui_members_fingerprint`
+- `tui_log_fingerprint`
+- `tui_drain_payload_encode`
+- `tui_errors_row_format`
+
+### TUI render benchmarks
+
+The `tui_*` benches above measure pure data-processing costs. Widget-level
+costs (real `DataTable` / `RichLog` operations) need a mounted Textual app and
+live in a separate harness that drives a headless `ManagerTUI`:
+
+```powershell
+uv run python -m bench.run_tui_render_bench --no-alloc
+```
+
+It profiles `_render_errors_table`, `_render_device_inspector`,
+`_render_members_table`, `_render_devices_table`, and a full `_drain_pub_queue`
+cycle (busy and sub-threshold-log mixes). Run a subset with `--bench <name>`
+(`errors_table`, `device_inspector`, `members_table`, `devices_table`, `drain`).
 
 ## What's measured
 
@@ -44,6 +63,14 @@ Available benchmarks:
 - **`binary_trace_transport`** — compares JSON trace frames, the old list-backed binary path, ideal ndarray-backed bytes, and the current production binary builder.
 
 - **`stream_buffer`** — compares HDF stream-buffer assembly strategies: list-of-bytes baseline, preallocated copy from bytes, and preallocated copy from a shared-memory view.
+
+- **`tui_members_fingerprint`** — capabilities-table change-detection fingerprint computed on every inspector render: full `json.dumps(sort_keys=True)` vs a tuple-hash over the rendered fields.
+
+- **`tui_log_fingerprint`** — per-log-entry dedup fingerprint in `_ingest_manager_log_entry`: `json.dumps(sort_keys=True)` vs an f-string.
+
+- **`tui_drain_payload_encode`** — per-message event-log encoding in the 5 Hz drain loop: `json.dumps(payload)[:200]` vs `str(payload)[:200]`.
+
+- **`tui_errors_row_format`** — errors-table per-row string/`Text` formatting (the part that is independent of the `DataTable` cost): current vs per-second strftime cache + prebuilt severity cells.
 
 ## Reading the output
 
