@@ -34,6 +34,31 @@ python examples/dummy_stack/run_dummy_stack.py
 `stack.yaml` sets `tui.enabled: true`, so the terminal UI starts automatically,
 and `startup.start_processes: true` starts `interlock` then `hdf_writer`.
 
+## Web UI / FastAPI gateway
+
+Start the stack first (above), then in a second terminal run the FastAPI gateway
+(it reads manager endpoints from `stack.yaml`):
+
+```bash
+python examples/dummy_stack/run_dummy_stack_fastapi.py
+```
+
+Then open:
+
+- `http://127.0.0.1:8000` — web UI (served when a built UI bundle is available)
+- `http://127.0.0.1:8000/api/health` — health endpoint
+
+Useful flags:
+
+- `--port 8000` / `--host 0.0.0.0` — uvicorn bind (defaults shown)
+- `--no-ui` — API/WebSocket only (no static UI)
+- `--ui-dist <path>` — serve a custom React `dist/` directory
+- `--reload` — uvicorn auto-reload
+
+The gateway connects to this example's manager on its configured ports
+(rpc `6100` / pub `6101`), so it works alongside other example stacks without
+port conflicts.
+
 ## Interlock rules
 
 `rules/interlock_dummy.yaml` demonstrates the two rule styles:
