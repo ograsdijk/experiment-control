@@ -2,6 +2,17 @@ version: 1
 instance_id: dummy-stack
 
 manager:
+  # Distinct ports so this example does not collide with the framework defaults
+  # (registry 5555 / rpc 6000 / pub 6001) used by other examples, nor with
+  # instances such as laser-lock-1 (registry 5555).
+  bind_host: 127.0.0.1
+  external:
+    rpc_port: 6100
+    pub_port: 6101
+  internal_ports:
+    registry: 5655
+    rpc: 6102
+    heartbeat_base: 7200
   auto_connect_on_register: true
   interceptor_rpc_timeout_ms: 500
 

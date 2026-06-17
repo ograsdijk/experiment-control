@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import zmq
@@ -41,6 +42,11 @@ if __name__ == "__main__":
     repo_root = Path(__file__).resolve().parents[2]
     stack_path = Path(__file__).resolve().parent / "stack.yaml"
     manager_rpc = _manager_rpc_from_stack(stack_path)
+
+    # Best-effort cleanup in case a previous run was interrupted and left the
+    # manager/router sockets bound.
+    _shutdown_manager(manager_rpc)
+    time.sleep(0.2)
 
     manager_proc = subprocess.Popen(
         [sys.executable, "-m", "experiment_control.cli.run_stack", str(stack_path)],
