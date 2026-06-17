@@ -14,19 +14,8 @@ from ..schemas.stream import stream_calls_from_json
 from ..schemas.telemetry import telemetry_calls_from_json
 from ..types import StreamCall, TelemetryCall
 from ..utils.config_parsing import ConfigError, optional_dict, require_dict, require_str
+from ..utils.module_loading import module_name_from_path
 from ..utils.yaml_helpers import load_yaml_file
-
-
-def _module_name_from_path(path: Path) -> tuple[str | None, Path | None]:
-    parts: list[str] = []
-    cur = path.parent
-    while (cur / "__init__.py").exists():
-        parts.append(cur.name)
-        cur = cur.parent
-    if not parts:
-        return None, None
-    module_name = ".".join(list(reversed(parts)) + [path.stem])
-    return module_name, cur
 
 
 def _load_module(
@@ -37,7 +26,7 @@ def _load_module(
     if module_name:
         return importlib.import_module(module_name)
     path = Path(file_path).expanduser().resolve()
-    inferred_name, root = _module_name_from_path(path)
+    inferred_name, root = module_name_from_path(path)
     if inferred_name and root is not None:
         if str(root) not in sys.path:
             sys.path.insert(0, str(root))
