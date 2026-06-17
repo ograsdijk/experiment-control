@@ -101,6 +101,7 @@ export function EditableStepInspector({
         node={node}
         yamlText={yamlText}
         onYamlTextChange={onYamlTextChange}
+        capabilitiesByDevice={capabilitiesByDevice}
       />
     );
   }

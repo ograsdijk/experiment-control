@@ -18,12 +18,19 @@ import {
   applyEditedWhileStep,
 } from "../editing";
 import { duplicateNameSet, renderValue, valueByKey } from "../editor_helpers";
+import {
+  callableActionNames,
+  deviceNames,
+  settableMemberNames,
+} from "../device_field_options";
+import { useDevicesContext } from "../../devices/DevicesContext";
 import type {
   SequencerOutlineMetadataEntry,
   SequencerSetContextStreamDetail,
   SequencerStepOutlineNode,
 } from "../types";
 import { ConditionBuilder } from "./ConditionBuilder";
+import { FieldAutocomplete } from "./FieldAutocomplete";
 import { KeyValueChipRow } from "./KeyValueChipRow";
 import { KeyValueChipList } from "./KeyValueChipList";
 import type {
@@ -41,6 +48,10 @@ type CommonProps = {
 type WaitUntilProps = CommonProps & {
   capabilitiesByDevice: Record<string, CapabilityMember[]>;
   latestSignalsByDevice: Record<string, Record<string, TelemetrySignal>>;
+};
+
+type SetProps = CommonProps & {
+  capabilitiesByDevice: Record<string, CapabilityMember[]>;
 };
 
 type SetContextProps = CommonProps & {
@@ -61,6 +72,7 @@ export function WaitUntilStepEditor({
   capabilitiesByDevice,
   latestSignalsByDevice,
 }: WaitUntilProps) {
+  const { devices } = useDevicesContext();
   const detail = node.waitUntilDetail;
   if (!detail) {
     return null;
@@ -132,28 +144,16 @@ export function WaitUntilStepEditor({
       ...extra,
     ];
   };
-  const metricDevice = sampleKind === "telemetry" ? sampleGet(sample, "telemetry.device") : sampleGet(sample, "call.device");
-  const telemetrySignal = sampleGet(sample, "telemetry.signal");
-  const telemetryDeviceOptions = Array.from(
-    new Set([...Object.keys(capabilitiesByDevice), ...Object.keys(latestSignalsByDevice), ...(metricDevice ? [metricDevice] : [])])
-  ).map((value) => ({ value, label: value }));
-  const telemetrySignalOptions = Array.from(
-    new Set([
-      ...Object.keys(latestSignalsByDevice[metricDevice] ?? {}),
-      ...(telemetrySignal ? [telemetrySignal] : []),
-    ])
-  ).map((value) => ({ value, label: value }));
+  const metricDevice =
+    sampleKind === "telemetry"
+      ? sampleGet(sample, "telemetry.device")
+      : sampleGet(sample, "call.device");
   const callDevice = sampleGet(sample, "call.device");
-  const callDeviceOptions = Array.from(
-    new Set([...Object.keys(capabilitiesByDevice), ...(callDevice ? [callDevice] : [])])
-  ).map((value) => ({ value, label: value }));
-  const selectedCallAction = sampleGet(sample, "call.action");
-  const callActionOptions = Array.from(
-    new Set([
-      ...(capabilitiesByDevice[callDevice] ?? []).map((member) => member.name),
-      ...(selectedCallAction ? [selectedCallAction] : []),
-    ])
-  ).map((value) => ({ value, label: value }));
+  const deviceOptions = deviceNames(devices);
+  const telemetrySignalNames = Object.keys(
+    latestSignalsByDevice[metricDevice] ?? {}
+  ).sort((a, b) => a.localeCompare(b));
+  const callActionNames = callableActionNames(capabilitiesByDevice[callDevice]);
   const telemetryExtraEntries =
     sampleKind === "telemetry"
       ? sample
@@ -257,76 +257,38 @@ export function WaitUntilStepEditor({
             {sampleKind === "telemetry" ? (
               <>
                 <Group grow align="flex-end">
-                  {telemetryDeviceOptions.length > 0 ? (
-                    <Select
-                      size="xs"
-                      label="Device"
-                      data={telemetryDeviceOptions}
-                      value={sampleGet(sample, "telemetry.device")}
-                      allowDeselect={false}
-                      searchable
-                      comboboxProps={{ withinPortal: false }}
-                      onChange={(value) =>
-                        updateWaitUntil(
-                          renderValue(detail.timeoutS),
-                          renderValue(detail.everyS),
-                          sampleSet(
-                            sampleSet(sample, "telemetry.signal", ""),
-                            "telemetry.device",
-                            value ?? ""
-                          ),
-                          condition
-                        )
-                      }
-                    />
-                  ) : (
-                    <TextInput
-                      size="xs"
-                      label="Device"
-                      value={sampleGet(sample, "telemetry.device")}
-                      onChange={(event) =>
-                        updateWaitUntil(
-                          renderValue(detail.timeoutS),
-                          renderValue(detail.everyS),
-                          sampleSet(sample, "telemetry.device", event.currentTarget.value),
-                          condition
-                        )
-                      }
-                    />
-                  )}
-                  {telemetrySignalOptions.length > 0 ? (
-                    <Select
-                      size="xs"
-                      label="Signal"
-                      data={telemetrySignalOptions}
-                      value={sampleGet(sample, "telemetry.signal")}
-                      allowDeselect={false}
-                      searchable
-                      comboboxProps={{ withinPortal: false }}
-                      onChange={(value) =>
-                        updateWaitUntil(
-                          renderValue(detail.timeoutS),
-                          renderValue(detail.everyS),
-                          sampleSet(sample, "telemetry.signal", value ?? ""),
-                          condition
-                        )
-                      }
-                    />
-                  ) : (
-                    <TextInput
-                      size="xs"
-                      label="Signal"
-                      value={sampleGet(sample, "telemetry.signal")}
-                      onChange={(event) =>
-                        updateWaitUntil(
-                          renderValue(detail.timeoutS),
-                          renderValue(detail.everyS),
-                          sampleSet(sample, "telemetry.signal", event.currentTarget.value),
-                          condition
-                        )
-                      }
-                    />
-                  )}
+                  <FieldAutocomplete
+                    label="Device"
+                    value={sampleGet(sample, "telemetry.device")}
+                    options={deviceOptions}
+                    placeholder="device"
+                    onChange={(value) =>
+                      updateWaitUntil(
+                        renderValue(detail.timeoutS),
+                        renderValue(detail.everyS),
+                        sampleSet(
+                          sampleSet(sample, "telemetry.signal", ""),
+                          "telemetry.device",
+                          value
+                        ),
+                        condition
+                      )
+                    }
+                  />
+                  <FieldAutocomplete
+                    label="Signal"
+                    value={sampleGet(sample, "telemetry.signal")}
+                    options={telemetrySignalNames}
+                    placeholder="signal"
+                    onChange={(value) =>
+                      updateWaitUntil(
+                        renderValue(detail.timeoutS),
+                        renderValue(detail.everyS),
+                        sampleSet(sample, "telemetry.signal", value),
+                        condition
+                      )
+                    }
+                  />
                 </Group>
                 <TextInput
                   size="xs"
@@ -378,80 +340,42 @@ export function WaitUntilStepEditor({
             {sampleKind === "call" ? (
               <>
                 <Group grow align="flex-end">
-                  {callDeviceOptions.length > 0 ? (
-                    <Select
-                      size="xs"
-                      label="Device"
-                      data={callDeviceOptions}
-                      value={sampleGet(sample, "call.device")}
-                      allowDeselect={false}
-                      searchable
-                      comboboxProps={{ withinPortal: false }}
-                      onChange={(value) =>
-                        updateWaitUntil(
-                          renderValue(detail.timeoutS),
-                          renderValue(detail.everyS),
-                          [
-                            ...sample.filter(
-                              (entry) =>
-                                entry.name !== "call.device" &&
-                                entry.name !== "call.action" &&
-                                !entry.name.startsWith("call.params.")
-                            ),
-                            { name: "call.device", value: value ?? "" },
-                          ],
-                          condition
-                        )
-                      }
-                    />
-                  ) : (
-                    <TextInput
-                      size="xs"
-                      label="Device"
-                      value={sampleGet(sample, "call.device")}
-                      onChange={(event) =>
-                        updateWaitUntil(
-                          renderValue(detail.timeoutS),
-                          renderValue(detail.everyS),
-                          sampleSet(sample, "call.device", event.currentTarget.value),
-                          condition
-                        )
-                      }
-                    />
-                  )}
-                  {callActionOptions.length > 0 ? (
-                    <Select
-                      size="xs"
-                      label="Action"
-                      data={callActionOptions}
-                      value={sampleGet(sample, "call.action")}
-                      allowDeselect={false}
-                      searchable
-                      comboboxProps={{ withinPortal: false }}
-                      onChange={(value) =>
-                        updateWaitUntil(
-                          renderValue(detail.timeoutS),
-                          renderValue(detail.everyS),
-                          sampleSet(sample, "call.action", value ?? ""),
-                          condition
-                        )
-                      }
-                    />
-                  ) : (
-                    <TextInput
-                      size="xs"
-                      label="Action"
-                      value={sampleGet(sample, "call.action")}
-                      onChange={(event) =>
-                        updateWaitUntil(
-                          renderValue(detail.timeoutS),
-                          renderValue(detail.everyS),
-                          sampleSet(sample, "call.action", event.currentTarget.value),
-                          condition
-                        )
-                      }
-                    />
-                  )}
+                  <FieldAutocomplete
+                    label="Device"
+                    value={sampleGet(sample, "call.device")}
+                    options={deviceOptions}
+                    placeholder="device"
+                    onChange={(value) =>
+                      updateWaitUntil(
+                        renderValue(detail.timeoutS),
+                        renderValue(detail.everyS),
+                        [
+                          ...sample.filter(
+                            (entry) =>
+                              entry.name !== "call.device" &&
+                              entry.name !== "call.action" &&
+                              !entry.name.startsWith("call.params.")
+                          ),
+                          { name: "call.device", value },
+                        ],
+                        condition
+                      )
+                    }
+                  />
+                  <FieldAutocomplete
+                    label="Action"
+                    value={sampleGet(sample, "call.action")}
+                    options={callActionNames}
+                    placeholder="action"
+                    onChange={(value) =>
+                      updateWaitUntil(
+                        renderValue(detail.timeoutS),
+                        renderValue(detail.everyS),
+                        sampleSet(sample, "call.action", value),
+                        condition
+                      )
+                    }
+                  />
                 </Group>
                 <KeyValueChipList
                   entries={callExtraEntries}
@@ -535,44 +459,50 @@ export function SetStepEditor({
   node,
   yamlText,
   onYamlTextChange,
-}: CommonProps) {
+  capabilitiesByDevice,
+}: SetProps) {
+  const { devices } = useDevicesContext();
   const setDetail = node.setDetail;
   if (!setDetail) {
     return null;
   }
 
+  const selectedDevice = renderValue(setDetail.device);
+  const deviceOptions = deviceNames(devices);
+  const nameOptions = settableMemberNames(capabilitiesByDevice[selectedDevice]);
   const setNameError = renderValue(setDetail.name).trim().length <= 0;
   const setValueError = renderValue(setDetail.value).trim().length <= 0;
 
   const updateSet = (nextName: string, nextValue: string) => {
     onYamlTextChange(
-      applyEditedSetStep(
-        yamlText,
-        node,
-        renderValue(setDetail.device),
-        nextName,
-        nextValue
-      )
+      applyEditedSetStep(yamlText, node, selectedDevice, nextName, nextValue)
+    );
+  };
+  // Changing the device clears the field name (it likely differs on the new
+  // device); the value is kept.
+  const changeDevice = (nextDevice: string) => {
+    onYamlTextChange(
+      applyEditedSetStep(yamlText, node, nextDevice, "", renderValue(setDetail.value))
     );
   };
 
   return (
     <Card radius="sm" p="xs" style={cardStyle}>
       <Stack gap={8}>
-        <TextInput
-          size="xs"
+        <FieldAutocomplete
           label="Device"
-          value={renderValue(setDetail.device)}
-          readOnly
+          value={selectedDevice}
+          options={deviceOptions}
+          onChange={changeDevice}
+          placeholder="device"
         />
-        <TextInput
-          size="xs"
+        <FieldAutocomplete
           label="Field"
           value={renderValue(setDetail.name)}
+          options={nameOptions}
+          placeholder="field"
           error={setNameError ? "Field name is required." : undefined}
-          onChange={(event) =>
-            updateSet(event.currentTarget.value, renderValue(setDetail.value))
-          }
+          onChange={(value) => updateSet(value, renderValue(setDetail.value))}
         />
         <TextInput
           size="xs"

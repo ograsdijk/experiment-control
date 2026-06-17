@@ -20,6 +20,9 @@ import {
   nextParamName,
   renderValue,
 } from "../editor_helpers";
+import { callableActionNames, deviceNames } from "../device_field_options";
+import { FieldAutocomplete } from "./FieldAutocomplete";
+import { useDevicesContext } from "../../devices/DevicesContext";
 import type {
   SequencerOutlineMetadataEntry,
   SequencerStepOutlineNode,
@@ -44,18 +47,15 @@ export function CallStepEditor({
   onYamlTextChange,
   capabilitiesByDevice,
 }: Props) {
+  const { devices } = useDevicesContext();
   if (!node.callDetail) {
     return null;
   }
 
   const params = node.callDetail.params;
   const selectedDevice = node.callDetail.device ?? "";
-  const actionOptions = (capabilitiesByDevice[selectedDevice] ?? []).map(
-    (member) => member.name
-  );
-  const actionSelectOptions = Array.from(
-    new Set([...(node.callDetail.action ? [node.callDetail.action] : []), ...actionOptions])
-  ).map((action) => ({ value: action, label: action }));
+  const deviceOptions = deviceNames(devices);
+  const actionOptions = callableActionNames(capabilitiesByDevice[selectedDevice]);
   const selectedActionMember =
     (capabilitiesByDevice[selectedDevice] ?? []).find(
       (member) => member.name === (node.callDetail?.action ?? "")
@@ -89,6 +89,12 @@ export function CallStepEditor({
     );
   };
 
+  // Changing the device clears the action (it likely doesn't exist on the new
+  // device); params are left for the user to adjust.
+  const changeDevice = (nextDevice: string) => {
+    onYamlTextChange(applyEditedCallStep(yamlText, node, nextDevice, "", params));
+  };
+
   const buildParamEntry = (name: string): SequencerOutlineMetadataEntry => ({
     name,
     value: getCapabilityParamDefaultValue(paramSpecsByName.get(name)),
@@ -97,48 +103,22 @@ export function CallStepEditor({
   return (
     <Card radius="sm" p="xs" style={cardStyle}>
       <Stack gap={8}>
-        <Stack gap={2}>
-          <Text size="xs" c="dimmed">
-            Device
-          </Text>
-          <Text
-            size="sm"
-            fw={500}
-            style={{
-              fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
-              wordBreak: "break-word",
-            }}
-          >
-            {selectedDevice || "No device"}
-          </Text>
-        </Stack>
+        <FieldAutocomplete
+          label="Device"
+          value={selectedDevice}
+          options={deviceOptions}
+          onChange={changeDevice}
+          placeholder="device"
+        />
 
-        {actionSelectOptions.length > 0 ? (
-          <Select
-            size="xs"
-            label="Action"
-            data={actionSelectOptions}
-            value={node.callDetail.action ?? ""}
-            allowDeselect={false}
-            searchable
-            comboboxProps={{ withinPortal: false }}
-            error={actionError ? "Action is required." : undefined}
-            onChange={(value) => {
-              if (value === null) {
-                return;
-              }
-              updateCall(value, params);
-            }}
-          />
-        ) : (
-          <TextInput
-            size="xs"
-            label="Action"
-            value={node.callDetail.action ?? ""}
-            error={actionError ? "Action is required." : undefined}
-            onChange={(event) => updateCall(event.currentTarget.value, params)}
-          />
-        )}
+        <FieldAutocomplete
+          label="Action"
+          value={node.callDetail.action ?? ""}
+          options={actionOptions}
+          onChange={(value) => updateCall(value, params)}
+          placeholder="action"
+          error={actionError ? "Action is required." : undefined}
+        />
         <Group justify="space-between" align="center">
           <Group gap={6} align="center">
             <Text size="xs" fw={600}>

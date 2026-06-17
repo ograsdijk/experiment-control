@@ -1,4 +1,4 @@
-import { ActionIcon, Badge, Card, Group, Stack, Text } from "@mantine/core";
+import { ActionIcon, Badge, Card, Group, ScrollArea, Stack, Text } from "@mantine/core";
 import { IconChevronDown, IconChevronRight } from "@tabler/icons-react";
 import { applyEditedContextColumns, applyEditedVars } from "../editing";
 import {
@@ -27,8 +27,31 @@ export function SequencerMetadataPanel({
   const contextIssueCount = countContextColumnIssues(metadata.contextColumns);
 
   return (
-    <Card radius="sm" p="xs" style={{ border: "1px solid var(--card-border)" }}>
-      <Stack gap={6}>
+    <Card
+      radius="sm"
+      p="xs"
+      style={{
+        border: "1px solid var(--card-border)",
+        // When expanded, become a flex region that shares the outline pane's
+        // height with the step tree (and is bounded by it), so the vars list
+        // scrolls within a real, fully-reachable area instead of overflowing
+        // and getting clipped by the modal.
+        ...(metadataCollapsed
+          ? { flexShrink: 0 }
+          : {
+              // Size to content for short lists, but cap and scroll for long
+              // ones. The inner ScrollArea (flex:1, minHeight:0) shrinks with
+              // the card when space is tight, so the list is always fully
+              // scrollable and never clipped.
+              flex: "0 1 auto",
+              minHeight: 0,
+              maxHeight: "clamp(8rem, 38vh, 30rem)",
+              display: "flex",
+              flexDirection: "column",
+            }),
+      }}
+    >
+      <Stack gap={6} style={metadataCollapsed ? undefined : { flex: 1, minHeight: 0 }}>
         <Group justify="space-between" align="center">
           <Group gap="xs" wrap="wrap" align="center">
             <Badge size="xs" variant="light" color="gray">
@@ -55,13 +78,18 @@ export function SequencerMetadataPanel({
           </ActionIcon>
         </Group>
         {!metadataCollapsed && (
-          <div
-            style={{
-              display: "grid",
-              gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))",
-              gap: 8,
-            }}
+          <ScrollArea
+            style={{ flex: 1, minHeight: 0 }}
+            type="auto"
+            offsetScrollbars
           >
+            <div
+              style={{
+                display: "grid",
+                gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))",
+                gap: 8,
+              }}
+            >
             <SequencerVarsEditor
               entries={metadata.vars}
               issueCount={varsIssueCount}
@@ -95,7 +123,8 @@ export function SequencerMetadataPanel({
                 onYamlTextChange(applyEditedContextColumns(yamlText, entries))
               }
             />
-          </div>
+            </div>
+          </ScrollArea>
         )}
       </Stack>
     </Card>
