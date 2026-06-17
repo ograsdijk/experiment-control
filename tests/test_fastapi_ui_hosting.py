@@ -99,7 +99,11 @@ class FastApiUiHostingTests(unittest.TestCase):
 
         self.assertEqual(response.headers.get("content-encoding"), "br")
         self.assertEqual(response.headers.get("vary"), "Accept-Encoding")
-        self.assertEqual(response.media_type, "text/javascript")
+        # Both spellings are valid JS MIME types; which one mimetypes returns for
+        # ".js" is environment-dependent (Python version + Windows registry).
+        self.assertIn(
+            response.media_type, ("text/javascript", "application/javascript")
+        )
 
     def test_trace_frame_array_builder_avoids_values_list(self) -> None:
         source = np.arange(10, dtype=np.float64)

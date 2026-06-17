@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import json
 import math
 import sys
 import time
@@ -24,6 +25,7 @@ from typing import Any, Callable
 import numpy as np
 import orjson
 import zmq.utils.jsonapi
+from rich.text import Text
 
 # Use the same JSON encoder as the production stack uses (pyzmq's
 # jsonapi.dumps), so timings reflect what the gateway actually
@@ -745,6 +747,315 @@ def bench_stream_buffer_assembly(rows: list[Row]) -> None:
         print(r.fmt())
 
 
+# ---------------------------------------------------------------------------
+# TUI hot-path benchmarks (pure-function; no Textual app needed)
+#
+# These isolate the data-processing costs paid inside the TUI's 5 Hz drain
+# loop and render methods (src/experiment_control/_tui/app.py). Widget-level
+# costs (DataTable.clear/add_row, RichLog.write) live in the separate
+# bench/run_tui_render_bench.py harness because they require a mounted app.
+# ---------------------------------------------------------------------------
+
+
+def _make_member(i: int) -> dict[str, Any]:
+    """A capability member dict shaped like manager capability responses."""
+    is_method = (i % 3) == 0
+    return {
+        "name": f"member_{i:03d}",
+        "kind": "method" if is_method else "attribute",
+        "readable": True,
+        "settable": not is_method,
+        "return_annotation": "float | None" if is_method else None,
+        "value_annotation": None if is_method else "float",
+        "source": "device" if (i % 2) else "driver",
+        "doc": f"Docstring for member {i}. " * 3,
+        # Non-rendered fields the current json.dumps fingerprint also covers:
+        "signature": f"(a: int, b: float = {i}.0)" if is_method else None,
+        "default": None if is_method else float(i),
+        "units": "V",
+    }
+
+
+def _members_fingerprint_current(members_render: list[dict[str, Any]]) -> str:
+    """Current fingerprint: full json.dumps over every member dict."""
+    try:
+        return json.dumps(members_render, sort_keys=True, default=str)
+    except Exception:
+        return str(members_render)
+
+
+def _members_fingerprint_tuplehash(members_render: list[dict[str, Any]]) -> int:
+    """Candidate fingerprint: hash of only the 8 rendered fields per member."""
+    return hash(
+        tuple(
+            (
+                str(m.get("name", "")),
+                str(m.get("kind", "")),
+                bool(m.get("readable", False)),
+                bool(m.get("settable", False)),
+                str(m.get("return_annotation") or ""),
+                str(m.get("value_annotation") or ""),
+                str(m.get("source", "")),
+                str(m.get("doc", "") or "")[:40],
+            )
+            for m in members_render
+        )
+    )
+
+
+def bench_tui_members_fingerprint(rows: list[Row]) -> None:
+    """Members-table change-detection fingerprint, computed every render.
+
+    _render_members_table (app.py ~1289) json.dumps the full sorted member
+    list every call to decide whether to skip the rebuild. A/B: full json
+    vs a tuple-hash over only the rendered fields.
+    """
+    print()
+    print("== tui_members_fingerprint ==")
+    print(_HEADER)
+    for k in (5, 50, 200):
+        members = [_make_member(i) for i in range(k)]
+        members_render = sorted(
+            members,
+            key=lambda d: (str(d.get("kind", "")), str(d.get("name", ""))),
+        )
+        r = time_call(
+            "members fp: json.dumps(sort_keys)",
+            f"{k} members",
+            lambda mr=members_render: _members_fingerprint_current(mr),
+            iters=20_000,
+        )
+        rows.append(r)
+        print(r.fmt())
+        r = time_call(
+            "members fp: hash(tuple) [candidate]",
+            f"{k} members",
+            lambda mr=members_render: _members_fingerprint_tuplehash(mr),
+            iters=20_000,
+        )
+        rows.append(r)
+        print(r.fmt())
+
+
+def bench_tui_log_fingerprint(rows: list[Row]) -> None:
+    """Per-log-entry dedup fingerprint paid in _ingest_manager_log_entry.
+
+    app.py ~569 json.dumps a fixed 6-key dict per surfaced manager.log entry.
+    A/B: json.dumps vs a NUL-joined f-string.
+    """
+    print()
+    print("== tui_log_fingerprint ==")
+    print(_HEADER)
+    base_fp = {
+        "sev": "error",
+        "topic": "manager.log",
+        "source": "device",
+        "id": "dev3",
+        "message": "Driver raised RuntimeError: connection refused on attempt 4",
+        "t_mono": 12345.678,
+    }
+
+    def current() -> str:
+        try:
+            return json.dumps(base_fp, sort_keys=True, default=str)[:800]
+        except Exception:
+            return ""
+
+    def candidate() -> str:
+        return (
+            f"{base_fp['sev']}\x00{base_fp['topic']}\x00{base_fp['source']}"
+            f"\x00{base_fp['id']}\x00{base_fp['message']}\x00{base_fp['t_mono']}"
+        )[:800]
+
+    r = time_call("log fp: json.dumps(sort_keys)", "6 keys", current, iters=50_000)
+    rows.append(r)
+    print(r.fmt())
+    r = time_call("log fp: f-string [candidate]", "6 keys", candidate, iters=50_000)
+    rows.append(r)
+    print(r.fmt())
+
+
+def bench_tui_drain_payload_encode(rows: list[Row]) -> None:
+    """Per-message event-log encoding in the drain loop (up to 500x/0.2s).
+
+    app.py ~1706 json.dumps the full payload then truncates to 200 chars for
+    a visible non-log topic. A/B: full json.dumps vs str(payload).
+    """
+    print()
+    print("== tui_drain_payload_encode ==")
+    print(_HEADER)
+    rng = np.random.default_rng(7)
+    cases: list[tuple[str, dict[str, Any]]] = [
+        ("small (4 keys)", {"device_id": "dev1", "action": "set", "ok": True, "seq": 7}),
+        (
+            "telemetry (20 signals)",
+            {
+                "device_id": "dev1",
+                "ts": {"t_wall": 1.0, "t_mono": 1.0},
+                "signals": {
+                    f"sig_{i}": {"value": float(rng.normal()), "units": "V"}
+                    for i in range(20)
+                },
+            },
+        ),
+        (
+            "large (200 floats)",
+            {
+                "device_id": "dev1",
+                "stream": "trace",
+                "values": rng.normal(size=200).tolist(),
+            },
+        ),
+    ]
+    for label, payload in cases:
+        r = time_call(
+            "drain encode: json.dumps[:200]",
+            label,
+            lambda p=payload: json.dumps(p)[:200],
+            iters=20_000,
+        )
+        rows.append(r)
+        print(r.fmt())
+        r = time_call(
+            "drain encode: str()[:200] [cand]",
+            label,
+            lambda p=payload: str(p)[:200],
+            iters=20_000,
+        )
+        rows.append(r)
+        print(r.fmt())
+
+
+def _make_error(i: int) -> dict[str, Any]:
+    return {
+        "t_mono": 1000.0 + i,
+        "t_wall": 1.70e9 + i,
+        "severity": ("critical", "error", "warning", "info")[i % 4],
+        "source": "device",
+        "id": f"dev{i % 10}",
+        "topic": "manager.log",
+        "message": f"Iteration {i} failed\r\nwith a second line\nand trailing detail",
+        "fingerprint": f"fp{i}",
+    }
+
+
+def _errors_rows_current(errors: list[dict[str, Any]]) -> list[tuple]:
+    """Replicates the per-row formatting in _render_errors_table (1374-1404)."""
+    out: list[tuple] = []
+    for entry in reversed(errors):
+        t_wall = entry.get("t_wall")
+        time_str = ""
+        if isinstance(t_wall, (int, float)):
+            try:
+                time_str = time.strftime(
+                    "%Y-%m-%d %H:%M:%S", time.localtime(float(t_wall))
+                )
+            except Exception:
+                time_str = ""
+        message = str(entry.get("message", ""))
+        message = (
+            message.replace("\r\n", " | ").replace("\n", " | ").replace("\r", " | ")
+        )
+        if len(message) > 220:
+            message = message[:217] + "..."
+        severity = str(entry.get("severity", ""))
+        sev_cell: Any
+        if severity == "critical":
+            sev_cell = Text(severity, style="bold red")
+        elif severity == "error":
+            sev_cell = Text(severity, style="red")
+        elif severity == "warning":
+            sev_cell = Text(severity, style="yellow")
+        else:
+            sev_cell = severity
+        out.append(
+            (
+                time_str,
+                sev_cell,
+                str(entry.get("source", "")),
+                str(entry.get("id", "")),
+                message,
+            )
+        )
+    return out
+
+
+_SEV_TEXT_CACHE = {
+    "critical": Text("critical", style="bold red"),
+    "error": Text("error", style="red"),
+    "warning": Text("warning", style="yellow"),
+}
+
+
+def _errors_rows_candidate(errors: list[dict[str, Any]]) -> list[tuple]:
+    """Candidate: per-second strftime cache + prebuilt severity Text cells."""
+    out: list[tuple] = []
+    strftime_cache: dict[int, str] = {}
+    for entry in reversed(errors):
+        t_wall = entry.get("t_wall")
+        time_str = ""
+        if isinstance(t_wall, (int, float)):
+            sec = int(t_wall)
+            time_str = strftime_cache.get(sec, "")
+            if not time_str:
+                try:
+                    time_str = time.strftime(
+                        "%Y-%m-%d %H:%M:%S", time.localtime(float(sec))
+                    )
+                    strftime_cache[sec] = time_str
+                except Exception:
+                    time_str = ""
+        message = str(entry.get("message", ""))
+        if "\r" in message or "\n" in message:
+            message = (
+                message.replace("\r\n", " | ").replace("\n", " | ").replace("\r", " | ")
+            )
+        if len(message) > 220:
+            message = message[:217] + "..."
+        severity = str(entry.get("severity", ""))
+        sev_cell: Any = _SEV_TEXT_CACHE.get(severity, severity)
+        out.append(
+            (
+                time_str,
+                sev_cell,
+                str(entry.get("source", "")),
+                str(entry.get("id", "")),
+                message,
+            )
+        )
+    return out
+
+
+def bench_tui_errors_row_format(rows: list[Row]) -> None:
+    """Errors-table per-row string/Text formatting (excludes DataTable cost).
+
+    _render_errors_table (app.py 1374-1404) formats every row on each call.
+    A/B: current (strftime+3x replace+Text per row) vs per-second strftime
+    cache + prebuilt severity Text cells.
+    """
+    print()
+    print("== tui_errors_row_format ==")
+    print(_HEADER)
+    for e in (10, 200):
+        errors = [_make_error(i) for i in range(e)]
+        r = time_call(
+            "errors fmt: current",
+            f"{e} rows",
+            lambda er=errors: _errors_rows_current(er),
+            iters=5_000,
+        )
+        rows.append(r)
+        print(r.fmt())
+        r = time_call(
+            "errors fmt: cached [candidate]",
+            f"{e} rows",
+            lambda er=errors: _errors_rows_candidate(er),
+            iters=5_000,
+        )
+        rows.append(r)
+        print(r.fmt())
+
+
 ALL_BENCHES = {
     "bin_stats": bench_bin_stats,
     "sanitize": bench_sanitize,
@@ -754,6 +1065,10 @@ ALL_BENCHES = {
     "snapshot_readout": bench_snapshot_readout,
     "binary_trace_transport": bench_binary_trace_transport,
     "stream_buffer": bench_stream_buffer_assembly,
+    "tui_members_fingerprint": bench_tui_members_fingerprint,
+    "tui_log_fingerprint": bench_tui_log_fingerprint,
+    "tui_drain_payload_encode": bench_tui_drain_payload_encode,
+    "tui_errors_row_format": bench_tui_errors_row_format,
 }
 
 
