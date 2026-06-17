@@ -1,3 +1,13 @@
+"""Programmatic-API reference: build a stack imperatively in Python.
+
+This example wires up devices and processes by constructing `DeviceSpec` /
+`ProcessSpec` / `TelemetryCall` objects and driving a `Manager` directly, rather
+than declaring them in YAML. It is kept as a reference for the imperative API.
+
+For the recommended, fully declarative equivalent (and the layout that matches a
+deployed instance), see `examples/dummy_stack/`.
+"""
+
 import copy
 import multiprocessing
 import sys
