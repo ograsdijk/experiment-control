@@ -64,6 +64,25 @@ class MirroredDeviceRuntime:
     last_error: str | None = None
 
 
+@dataclass
+class MirroredProcessRuntime:
+    """Hub-side state for a federated PROCESS (RPC forwarding + telemetry relay).
+
+    Distinct from MirroredDeviceRuntime: processes are reached via
+    ``manager.processes.rpc`` (not device commands) and publish on the
+    ``manager.process_telemetry_update`` channel, kept separate from device
+    telemetry. ``schema_entry`` is warmed from the peer's
+    ``manager.process_telemetry.schema.list`` so the local HDF writer can
+    create ``/process_telemetry/<local_id>`` datasets.
+    """
+
+    peer_id: str
+    local_id: str
+    remote_process_id: str
+    schema_entry: Json | None = None
+    last_error: str | None = None
+
+
 class FederationHub:
     def __init__(
         self,
@@ -83,6 +102,7 @@ class FederationHub:
         self._instance_id = str(instance_id or "").strip() or "unknown"
         self._peers: dict[str, PeerRuntime] = {}
         self._mirrors: dict[str, MirroredDeviceRuntime] = {}
+        self._process_mirrors: dict[str, MirroredProcessRuntime] = {}
         self._socket_to_peer: dict[zmq.Socket, str] = {}
         self._last_liveness: dict[str, str] = {}
 
@@ -104,10 +124,12 @@ class FederationHub:
         # main thread applies results from this queue.
         self._warmup_thread: threading.Thread | None = None
         self._warmup_stop = threading.Event()
-        # (peer_id, config_resp, schema_resp, caps, error). error is None on
-        # success; set to a reason string on failure so the main thread can
-        # surface it via peer_rt.last_error (device_status_snapshot).
-        self._warmup_results: "queue.Queue[tuple[str, Json | None, Json | None, dict[str, Json], str | None]]" = (
+        # (peer_id, config_resp, schema_resp, proc_schema_resp, caps, error).
+        # error is None on success; set to a reason string on failure so the
+        # main thread can surface it via peer_rt.last_error
+        # (device_status_snapshot). proc_schema_resp is the peer's
+        # manager.process_telemetry.schema.list (for mirrored processes).
+        self._warmup_results: "queue.Queue[tuple[str, Json | None, Json | None, Json | None, dict[str, Json], str | None]]" = (
             queue.Queue()
         )
 
@@ -119,6 +141,12 @@ class FederationHub:
                     local_id=mirror.local_id,
                     remote_device_id=mirror.remote_device_id,
                 )
+            for process in peer.mirror_processes:
+                self._process_mirrors[process.local_id] = MirroredProcessRuntime(
+                    peer_id=peer.peer_id,
+                    local_id=process.local_id,
+                    remote_process_id=process.remote_process_id,
+                )
 
     @property
     def enabled(self) -> bool:
@@ -129,6 +157,12 @@ class FederationHub:
 
     def mirrored_device_ids(self) -> tuple[str, ...]:
         return tuple(sorted(self._mirrors))
+
+    def is_mirrored_process(self, process_id: str) -> bool:
+        return str(process_id or "") in self._process_mirrors
+
+    def mirrored_process_ids(self) -> tuple[str, ...]:
+        return tuple(sorted(self._process_mirrors))
 
     def _ensure_fed_ctx(self) -> zmq.Context:
         if self._fed_ctx_closed:
@@ -356,6 +390,29 @@ class FederationHub:
             out.append(dict(item))
         return out
 
+    def process_telemetry_schema_processes(self) -> list[Json]:
+        """Schema entries for mirrored PROCESSES (parallel to
+        telemetry_schema_devices). Tagged ``source_kind: "process"`` and
+        ``is_remote: True`` so HDF records them and consumers keep the
+        device/process distinction. Placeholder (empty signals) until warmed."""
+        out: list[Json] = []
+        for local_id in sorted(self._process_mirrors):
+            mirror = self._process_mirrors[local_id]
+            item = mirror.schema_entry
+            if item is None:
+                item = {
+                    "process_id": mirror.local_id,
+                    "signals": [],
+                    "dtypes": [],
+                    "units": [],
+                    "source_kind": "process",
+                    "is_remote": True,
+                    "owner_peer_id": mirror.peer_id,
+                    "remote_process_id": mirror.remote_process_id,
+                }
+            out.append(dict(item))
+        return out
+
     def forward_device_request(self, req: Json) -> Json | None:
         device_id = str(req.get("device_id", ""))
         mirror = self._mirrors.get(device_id)
@@ -422,6 +479,52 @@ class FederationHub:
             raise KeyError(f"Unknown mirrored device_id {device_id!r}")
         mirror.capabilities = dict(capabilities)
 
+    def forward_process_request(self, req: Json) -> Json | None:
+        """Forward a ``manager.processes.rpc`` for a mirrored process to its
+        owning peer's router. Returns None if ``process_id`` is not a mirror
+        (caller falls through to local dispatch). The inner request action
+        (``request.type``, e.g. ``mw.retune``) is gated by the peer's
+        ``allow_process_actions`` ACL (default deny-all)."""
+        process_id = str(req.get("process_id", ""))
+        mirror = self._process_mirrors.get(process_id)
+        if mirror is None:
+            return None
+
+        request = req.get("request")
+        action = ""
+        if isinstance(request, dict):
+            action = str(request.get("type", ""))
+        peer_rt = self._peers[mirror.peer_id]
+        if not peer_rt.config.policy.allows_process_action(action):
+            err = {
+                "code": "federation_acl_denied",
+                "message": (
+                    f"federation policy denied mirrored process rpc "
+                    f"{process_id!r}.{action}"
+                ),
+            }
+            mirror.last_error = str(err.get("message"))
+            return {"ok": False, "error": err}
+
+        outbound = dict(req)
+        outbound["process_id"] = mirror.remote_process_id
+        outbound["federation"] = self._next_federation_meta(req.get("federation"))
+        resp = self._rpc_call(peer_rt, outbound)
+        if resp is None:
+            mirror.last_error = "peer unavailable"
+            peer_rt.last_error = "peer unavailable"
+            return {
+                "ok": False,
+                "error": {
+                    "code": "peer_unavailable",
+                    "message": f"peer {mirror.peer_id!r} unavailable",
+                },
+            }
+        peer_rt.last_rpc_ok_mono = time.monotonic()
+        peer_rt.last_error = None
+        mirror.last_error = None
+        return resp
+
     def _drain_warmup_results(self) -> None:
         """Apply any metadata the background warmup thread has delivered.
 
@@ -430,7 +533,7 @@ class FederationHub:
         """
         while True:
             try:
-                peer_id, config_resp, schema_resp, caps, error = (
+                peer_id, config_resp, schema_resp, proc_schema_resp, caps, error = (
                     self._warmup_results.get_nowait()
                 )
             except queue.Empty:
@@ -443,7 +546,9 @@ class FederationHub:
                 # unresolvable/unreachable peer host) without crashing anything.
                 peer_rt.last_error = error
                 continue
-            self._apply_peer_metadata(peer_rt, config_resp, schema_resp, caps)
+            self._apply_peer_metadata(
+                peer_rt, config_resp, schema_resp, proc_schema_resp, caps
+            )
             peer_rt.metadata_warmed = True
             peer_rt.last_rpc_ok_mono = time.monotonic()
             peer_rt.last_error = None
@@ -453,6 +558,7 @@ class FederationHub:
         peer_rt: PeerRuntime,
         config_resp: Json | None,
         schema_resp: Json | None,
+        proc_schema_resp: Json | None,
         caps: dict[str, Json],
     ) -> None:
         config_items: list[Json] = []
@@ -495,6 +601,40 @@ class FederationHub:
             if isinstance(cap, dict):
                 mirror.capabilities = dict(cap)
 
+        # Mirrored-process telemetry schemas (warmed from the peer's
+        # manager.process_telemetry.schema.list).
+        proc_schema_items: list[Json] = []
+        if isinstance(proc_schema_resp, dict) and bool(proc_schema_resp.get("ok")):
+            presult = proc_schema_resp.get("result")
+            if isinstance(presult, dict) and isinstance(presult.get("processes"), list):
+                proc_schema_items = [
+                    item for item in presult.get("processes", []) if isinstance(item, dict)
+                ]
+        proc_schema_by_remote = {
+            str(item.get("process_id", "")): item
+            for item in proc_schema_items
+            if str(item.get("process_id", ""))
+        }
+        for pmirror in self._process_mirrors.values():
+            if pmirror.peer_id != peer_rt.config.peer_id:
+                continue
+            remote_schema = proc_schema_by_remote.get(pmirror.remote_process_id)
+            if remote_schema is not None:
+                pmirror.schema_entry = self._rewrite_process_schema_entry(
+                    pmirror, remote_schema
+                )
+
+    def _rewrite_process_schema_entry(
+        self, mirror: MirroredProcessRuntime, payload: Json
+    ) -> Json:
+        out = dict(payload)
+        out["process_id"] = mirror.local_id
+        out["source_kind"] = "process"
+        out["is_remote"] = True
+        out["owner_peer_id"] = mirror.peer_id
+        out["remote_process_id"] = mirror.remote_process_id
+        return out
+
     # ---- background warmup thread (own zmq context; never touches manager
     # ---- sockets or mirror/peer state) -----------------------------------
 
@@ -518,17 +658,19 @@ class FederationHub:
                     break
                 if time.monotonic() < next_attempt[cfg.peer_id]:
                     continue
-                config_resp, schema_resp, caps, error = self._fetch_peer_metadata(
-                    ctx, cfg
+                config_resp, schema_resp, proc_schema_resp, caps, error = (
+                    self._fetch_peer_metadata(ctx, cfg)
                 )
                 if error is None:
                     self._warmup_results.put(
-                        (cfg.peer_id, config_resp, schema_resp, caps, None)
+                        (cfg.peer_id, config_resp, schema_resp, proc_schema_resp, caps, None)
                     )
                     next_attempt[cfg.peer_id] = time.monotonic() + _METADATA_REFRESH_S
                     backoff[cfg.peer_id] = max(float(cfg.reconnect_backoff_s), 0.001)
                 else:
-                    self._warmup_results.put((cfg.peer_id, None, None, {}, error))
+                    self._warmup_results.put(
+                        (cfg.peer_id, None, None, None, {}, error)
+                    )
                     next_attempt[cfg.peer_id] = time.monotonic() + backoff[cfg.peer_id]
                     backoff[cfg.peer_id] = min(
                         backoff[cfg.peer_id] * 2.0,
@@ -538,15 +680,15 @@ class FederationHub:
 
     def _fetch_peer_metadata(
         self, ctx: zmq.Context, cfg: FederationPeerConfig
-    ) -> tuple[Json | None, Json | None, dict[str, Json], str | None]:
+    ) -> tuple[Json | None, Json | None, Json | None, dict[str, Json], str | None]:
         # Resolve the peer host to an IP HERE (on the warmup thread) and connect
         # only to the IP. Handing a hostname to connect() would make libzmq do a
         # synchronous DNS lookup on this context's I/O thread; an unresolvable
         # host would block it and delay every other peer's warmup. Returns a
-        # 4th element: an error reason (None on success) surfaced as last_error.
+        # final element: an error reason (None on success) surfaced as last_error.
         resolved = resolve_tcp_endpoint(cfg.router_rpc)
         if resolved is None:
-            return None, None, {}, f"unresolvable peer host {cfg.router_rpc!r}"
+            return None, None, None, {}, f"unresolvable peer host {cfg.router_rpc!r}"
         timeout_ms = int(cfg.metadata_rpc_timeout_ms)
         sock = connect_dealer(ctx, resolved, timeout_ms=timeout_ms)
         caps: dict[str, Json] = {}
@@ -557,8 +699,24 @@ class FederationHub:
             schema_resp = self._dealer_rpc(
                 sock, {"action": "manager.telemetry.schema.list"}, timeout_ms=timeout_ms
             )
+            # Process telemetry schema is best-effort: only fetched/used when
+            # this peer mirrors processes. A None result leaves process mirrors
+            # on placeholder schema (no HDF datasets until warmed).
+            proc_schema_resp: Json | None = None
+            if cfg.mirror_processes:
+                proc_schema_resp = self._dealer_rpc(
+                    sock,
+                    {"action": "manager.process_telemetry.schema.list"},
+                    timeout_ms=timeout_ms,
+                )
             if config_resp is None or schema_resp is None:
-                return config_resp, schema_resp, caps, "metadata fetch failed (peer unreachable)"
+                return (
+                    config_resp,
+                    schema_resp,
+                    proc_schema_resp,
+                    caps,
+                    "metadata fetch failed (peer unreachable)",
+                )
             if cfg.warm_capabilities_on_startup:
                 for mirror in cfg.mirror_devices:
                     if self._warmup_stop.is_set():
@@ -579,9 +737,9 @@ class FederationHub:
                         and isinstance(resp.get("result"), dict)
                     ):
                         caps[mirror.remote_device_id] = dict(resp["result"])
-            return config_resp, schema_resp, caps, None
+            return config_resp, schema_resp, proc_schema_resp, caps, None
         except Exception as exc:
-            return None, None, caps, f"metadata fetch error: {exc}"
+            return None, None, None, caps, f"metadata fetch error: {exc}"
         finally:
             try:
                 sock.close(0)
@@ -668,6 +826,9 @@ class FederationHub:
             self._relay_event(peer_rt, topic, payload)
 
     def _relay_event(self, peer_rt: PeerRuntime, topic: str, payload: Json) -> None:
+        if topic == "manager.process_telemetry_update":
+            self._relay_process_telemetry(peer_rt, payload)
+            return
         local_id = self._resolve_local_id(peer_rt, topic, payload)
         if local_id is None:
             # No matching mirrored device. If `only_mirrored_devices=True`
@@ -739,6 +900,41 @@ class FederationHub:
             self._manager._emit_log_from_payload(out, default_topic=topic)
             return
         self._manager._publish_manager_event(topic, out)
+
+    def _relay_process_telemetry(self, peer_rt: PeerRuntime, payload: Json) -> None:
+        """Relay a peer's ``manager.process_telemetry_update`` for a mirrored
+        process. Maps ``process_id`` remote->local, stamps process/origin meta
+        (``is_remote: True`` so the hub's Influx writer skips it while HDF still
+        records it), and re-publishes locally so the manager rebroadcasts it to
+        the HDF writer and the sequencer's client cache."""
+        remote_id = str(payload.get("process_id", "")).strip()
+        if not remote_id:
+            return
+        local_id: str | None = None
+        for mirror in self._process_mirrors.values():
+            if (
+                mirror.peer_id == peer_rt.config.peer_id
+                and mirror.remote_process_id == remote_id
+            ):
+                local_id = mirror.local_id
+                break
+        if local_id is None:
+            return
+        out = dict(payload)
+        out["process_id"] = local_id
+        # `is_remote` is a federation trust-boundary flag: the hub's Influx
+        # writer uses it to avoid double-writing federated data the owner
+        # instance already records. Unlike devices (which carry this via a
+        # separate device_config channel), a mirrored process has no such
+        # channel, so stamp it UNCONDITIONALLY here (and overwrite any value a
+        # peer may have spoofed). `include_origin_meta` only gates the
+        # descriptive origin fields.
+        out["is_remote"] = True
+        out["source_kind"] = "process"
+        if peer_rt.config.relay.include_origin_meta:
+            out["owner_peer_id"] = peer_rt.config.peer_id
+            out["remote_process_id"] = remote_id
+        self._manager._publish_manager_event("manager.process_telemetry_update", out)
 
     def _resolve_local_id(
         self, peer_rt: PeerRuntime, topic: str, payload: Json

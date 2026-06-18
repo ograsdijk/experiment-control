@@ -464,7 +464,11 @@ class InfluxWriterProcess(ManagedProcessBase):
         )
         self._sub = self._manager_helper.open_sub(
             ctx=self._ctx,
-            topics=("manager.telemetry_update", "manager.device_config"),
+            topics=(
+                "manager.telemetry_update",
+                "manager.process_telemetry_update",
+                "manager.device_config",
+            ),
             rcvtimeo_ms=200,
         )
         self._init_poller(
@@ -710,6 +714,9 @@ class InfluxWriterProcess(ManagedProcessBase):
             if topic == "manager.telemetry_update":
                 self._ingest_telemetry(payload)
                 return True
+            if topic == "manager.process_telemetry_update":
+                self._ingest_process_telemetry(payload)
+                return True
             return False
 
         result = drain_multipart_nonblocking(
@@ -916,6 +923,38 @@ class InfluxWriterProcess(ManagedProcessBase):
         point = self._build_queued_point(
             payload=payload,
             device_id=device_id,
+            destination_name=destination_name,
+            destination=destination,
+        )
+        if point is None:
+            return
+        self._enqueue_point(point)
+
+    def _ingest_process_telemetry(self, payload: Json) -> None:
+        """Persist PROCESS telemetry (manager.process_telemetry_update).
+
+        Recorded only by the OWNER instance: the federation hub stamps
+        ``is_remote: True`` on relayed process telemetry, so the hub skips it
+        here (same rule federated devices follow). The point is keyed by
+        ``process_id`` (route/measurement lookup treats it like a device id, so
+        an explicit route can name the measurement)."""
+        if not self._enabled:
+            return
+        if payload.get("is_remote"):
+            self._points_skipped_remote += 1
+            return
+        process_id = str(payload.get("process_id", "")).strip()
+        if not process_id or process_id in self._disabled_devices:
+            return
+        if not isinstance(payload.get("signals"), dict):
+            return
+        destination_info = self._resolve_ingest_destination(device_id=process_id)
+        if destination_info is None:
+            return
+        destination_name, destination = destination_info
+        point = self._build_queued_point(
+            payload=payload,
+            device_id=process_id,
             destination_name=destination_name,
             destination=destination,
         )

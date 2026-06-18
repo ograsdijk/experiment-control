@@ -2119,6 +2119,35 @@ class Manager(
         ts = {"t_wall": time.time(), "t_mono": time.monotonic()}
         return {"schema_version": 1, "generated_ts": ts, "devices": devices}
 
+    def _process_telemetry_schema_list(self) -> Json:
+        """Process-telemetry schema list (parallel to ``_telemetry_schema_list``).
+
+        Entries are kept DISTINCT from device telemetry via
+        ``source_kind: "process"`` and a ``process_id`` key. Includes locally
+        advertised process schemas plus federation-warmed mirrored processes.
+        """
+        processes: list[Json] = []
+        for process_id in sorted(self._processes.keys()):
+            handle = self._processes[process_id]
+            schema = handle.telemetry_schema or []
+            processes.append(
+                {
+                    "process_id": process_id,
+                    "signals": [str(e.get("name", "")) for e in schema],
+                    "dtypes": [str(e.get("dtype", "f8")) for e in schema],
+                    "units": [str(e.get("units", "")) for e in schema],
+                    "source_kind": "process",
+                    "is_remote": False,
+                    "owner_peer_id": None,
+                    "remote_process_id": None,
+                }
+            )
+        processes.extend(self._federation_hub.process_telemetry_schema_processes())
+        processes.sort(key=lambda item: str(item.get("process_id", "")))
+
+        ts = {"t_wall": time.time(), "t_mono": time.monotonic()}
+        return {"schema_version": 1, "generated_ts": ts, "processes": processes}
+
     # -----------------------------
     # Manager -> external PUB
     # -----------------------------

@@ -5,6 +5,7 @@ from .config import (
     FederationPolicy,
     FederationRelayConfig,
     MirroredDeviceConfig,
+    MirroredProcessConfig,
     parse_federation_config,
 )
 
@@ -15,5 +16,6 @@ __all__ = [
     "FederationPolicy",
     "FederationRelayConfig",
     "MirroredDeviceConfig",
+    "MirroredProcessConfig",
     "parse_federation_config",
 ]

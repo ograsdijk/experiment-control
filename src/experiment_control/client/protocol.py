@@ -8,6 +8,8 @@ class ManagerProtocol(Protocol):
 
     def get_latest(self, device_id: str, signal: str) -> dict[str, Any] | None: ...
 
+    def get_latest_process(self, process_id: str, signal: str) -> dict[str, Any] | None: ...
+
     def drain_telemetry(
         self,
         *,

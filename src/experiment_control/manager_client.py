@@ -58,12 +58,17 @@ class ManagerClient:
         if subscribe_telemetry:
             sub = self._ctx.socket(zmq.SUB)
             sub.setsockopt(zmq.SUBSCRIBE, b"manager.telemetry_update")
+            sub.setsockopt(zmq.SUBSCRIBE, b"manager.process_telemetry_update")
             sub.setsockopt(zmq.RCVTIMEO, 100)
             sub.setsockopt(zmq.LINGER, 0)
             sub.connect(self._manager_pub)
             self._sub = sub
 
         self._telemetry_cache: dict[str, dict[str, dict[str, Any]]] = {}
+        # Process telemetry kept in a SEPARATE cache keyed by process_id, so a
+        # process and a device with the same id never collide and the
+        # device/process distinction is preserved. Read via get_latest_process.
+        self._process_telemetry_cache: dict[str, dict[str, dict[str, Any]]] = {}
         self.telemetry_drained_total = 0
         self.telemetry_last_drain_count = 0
         self.telemetry_last_drain_duration_s = 0.0
@@ -94,6 +99,16 @@ class ManagerClient:
             "type": "manager.processes.rpc.advertise",
             "process_id": process_id,
             "rpc_endpoint": rpc_endpoint,
+        }
+        self.call(payload)
+
+    def advertise_process_telemetry_schema(
+        self, *, process_id: str, schema: list[dict[str, Any]]
+    ) -> None:
+        payload = {
+            "type": "manager.process_telemetry.schema.advertise",
+            "process_id": process_id,
+            "schema": schema,
         }
         self.call(payload)
 
@@ -214,7 +229,10 @@ class ManagerClient:
             payload = safe_json_loads(payload_b)
             if not isinstance(payload, dict):
                 return False
-            self._handle_telemetry_update(payload)
+            if _topic_b == b"manager.process_telemetry_update":
+                self._handle_process_telemetry_update(payload)
+            else:
+                self._handle_telemetry_update(payload)
             return True
 
         result = drain_multipart_nonblocking(
@@ -236,13 +254,10 @@ class ManagerClient:
             "parse_errors": result.parse_errors,
         }
 
-    def _handle_telemetry_update(self, payload: Json) -> None:
-        device_id = str(payload.get("device_id", ""))
-        signals = payload.get("signals", {})
-        ts_raw = payload.get("ts", {}) or {}
-        if not device_id or not isinstance(signals, dict):
-            return
-
+    @staticmethod
+    def _ingest_signal_bundle(
+        cache: dict[str, dict[str, Any]], signals: Json, ts_raw: Any
+    ) -> None:
         if isinstance(ts_raw, dict):
             t_wall_raw = ts_raw.get("t_wall")
             t_mono_raw = ts_raw.get("t_mono")
@@ -258,7 +273,6 @@ class ManagerClient:
             bundle_ts = Timestamp(t_wall=time.time(), t_mono=time.monotonic())
 
         now_mono = time.monotonic()
-        device_cache = self._telemetry_cache.setdefault(device_id, {})
         for name, s in signals.items():
             if not isinstance(name, str) or not isinstance(s, dict):
                 continue
@@ -269,7 +283,7 @@ class ManagerClient:
             else:
                 t_wall = bundle_ts.t_wall
                 t_mono = bundle_ts.t_mono
-            device_cache[name] = {
+            cache[name] = {
                 "value": s.get("value"),
                 "units": s.get("units"),
                 "quality": s.get("quality"),
@@ -278,9 +292,12 @@ class ManagerClient:
                 "t_mono_recv": now_mono,
             }
 
-    def get_latest(self, device_id: str, signal: str) -> dict[str, Any] | None:
-        device_cache = self._telemetry_cache.get(device_id, {})
-        sample = device_cache.get(signal)
+    @staticmethod
+    def _latest_with_age(
+        cache: dict[str, dict[str, dict[str, Any]]], owner_id: str, signal: str
+    ) -> dict[str, Any] | None:
+        owner_cache = cache.get(owner_id, {})
+        sample = owner_cache.get(signal)
         if sample is None:
             return None
         now = time.monotonic()
@@ -294,4 +311,32 @@ class ManagerClient:
         out = dict(sample)
         out["age_s"] = age_s
         return out
+
+    def _handle_telemetry_update(self, payload: Json) -> None:
+        device_id = str(payload.get("device_id", ""))
+        signals = payload.get("signals", {})
+        if not device_id or not isinstance(signals, dict):
+            return
+        self._ingest_signal_bundle(
+            self._telemetry_cache.setdefault(device_id, {}),
+            signals,
+            payload.get("ts", {}) or {},
+        )
+
+    def _handle_process_telemetry_update(self, payload: Json) -> None:
+        process_id = str(payload.get("process_id", ""))
+        signals = payload.get("signals", {})
+        if not process_id or not isinstance(signals, dict):
+            return
+        self._ingest_signal_bundle(
+            self._process_telemetry_cache.setdefault(process_id, {}),
+            signals,
+            payload.get("ts", {}) or {},
+        )
+
+    def get_latest(self, device_id: str, signal: str) -> dict[str, Any] | None:
+        return self._latest_with_age(self._telemetry_cache, device_id, signal)
+
+    def get_latest_process(self, process_id: str, signal: str) -> dict[str, Any] | None:
+        return self._latest_with_age(self._process_telemetry_cache, process_id, signal)
 

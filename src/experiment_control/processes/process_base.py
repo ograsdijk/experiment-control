@@ -45,6 +45,9 @@ class ManagedProcessBase:
         self._last_progress_mono: float | None = None
         self._last_exception: str | None = None
         self._last_traceback_summary: str | None = None
+        # Set once the process telemetry schema has been advertised to the
+        # manager (lazily, on the first publish_telemetry call).
+        self._process_telemetry_schema_advertised = False
 
     @staticmethod
     def _rpc_request_id(req_or_id: dict[str, Any] | Any) -> Any:
@@ -413,6 +416,91 @@ class ManagedProcessBase:
                 process_id=self._process_id,
                 rpc_endpoint=self._rpc_endpoint,
             )
+
+    # ------------------------------------------------------------------
+    # Process telemetry (first-class, distinct from device telemetry)
+    # ------------------------------------------------------------------
+    def process_telemetry_schema(self) -> list[dict[str, Any]] | None:
+        """Override to declare the telemetry signals this process publishes.
+
+        Return a list of ``{"name": str, "dtype": "f8"|"i8"|"bool",
+        "units": str}`` entries, or ``None`` (default) to publish no
+        schema'd telemetry. A declared schema is advertised to the manager
+        (and federation-warmed to peers) so the HDF writer can create
+        ``/process_telemetry/<process_id>`` datasets. Keep it static — it is
+        read during the first ``publish_telemetry`` call.
+        """
+        return None
+
+    def _advertise_process_telemetry_schema(self) -> None:
+        """Advertise the declared telemetry schema to the manager (once)."""
+        if self._process_telemetry_schema_advertised:
+            return
+        if self._manager is None or not self._process_id:
+            return
+        schema = self.process_telemetry_schema()
+        if not schema:
+            # Nothing to advertise; mark done so we don't re-check every tick.
+            self._process_telemetry_schema_advertised = True
+            return
+        try:
+            self._manager.advertise_process_telemetry_schema(
+                process_id=self._process_id,
+                schema=list(schema),
+            )
+            self._process_telemetry_schema_advertised = True
+        except Exception:
+            # Best-effort: retry on the next publish if it failed.
+            pass
+
+    def publish_telemetry(
+        self,
+        signals: dict[str, Any],
+        *,
+        quality: str = "ok",
+    ) -> bool:
+        """Publish flat process telemetry on ``manager.process_telemetry_update``.
+
+        ``signals`` maps signal name -> scalar value (wrapped automatically as
+        ``{"value", "units", "quality", "ts"}``) or -> an already-shaped signal
+        dict. This is the process analogue of device telemetry; it is recorded
+        to HDF (incl. across federation) and read by the sequencer via
+        ``get_latest_process``, but kept distinct from device telemetry
+        (separate topic + ``source_kind: "process"`` schema).
+        """
+        manager = self._manager
+        if manager is None:
+            return False
+        self._advertise_process_telemetry_schema()
+        units_map: dict[str, str] = {}
+        for entry in self.process_telemetry_schema() or []:
+            name = entry.get("name")
+            if isinstance(name, str):
+                units_map[name] = str(entry.get("units", "") or "")
+        bundle_ts = {"t_wall": time.time(), "t_mono": time.monotonic()}
+        out: dict[str, Any] = {}
+        for name, val in signals.items():
+            if isinstance(val, dict) and "value" in val:
+                sig = dict(val)
+                sig.setdefault("units", units_map.get(name, ""))
+                sig.setdefault("quality", quality)
+                sig.setdefault("ts", bundle_ts)
+            else:
+                sig = {
+                    "value": val,
+                    "units": units_map.get(name, ""),
+                    "quality": quality,
+                    "ts": bundle_ts,
+                }
+            out[name] = sig
+        try:
+            manager.publish_event(
+                topic="manager.process_telemetry_update",
+                payload={"version": 1, "signals": out},
+            )
+            return True
+        except Exception:
+            return False
 
     def _init_poller(
         self,
