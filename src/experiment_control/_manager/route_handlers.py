@@ -345,6 +345,57 @@ def route_process_rpc_advertise(manager: Any, req: Json) -> Json:
     return {"ok": True, "result": {"process_id": process_id}}
 
 
+def _normalize_process_telemetry_schema(schema: Any) -> list[Json]:
+    """Coerce an advertised process telemetry schema into the canonical
+    ``[{"name", "dtype", "units"}, ...]`` form, dropping malformed entries."""
+    out: list[Json] = []
+    seen: set[str] = set()
+    if not isinstance(schema, list):
+        return out
+    for entry in schema:
+        if not isinstance(entry, dict):
+            continue
+        name = str(entry.get("name", "")).strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        dtype = str(entry.get("dtype", "f8")).strip() or "f8"
+        units = str(entry.get("units", "") or "")
+        out.append({"name": name, "dtype": dtype, "units": units})
+    return out
+
+
+def route_process_telemetry_schema_advertise(manager: Any, req: Json) -> Json:
+    process_id = str(req.get("process_id", ""))
+    schema = req.get("schema")
+    if not process_id or not isinstance(schema, list):
+        return _reply("invalid_advertise", message="missing fields")
+    handle = manager._processes.get(process_id)
+    if handle is None:
+        return _reply("unknown_process")
+    handle.telemetry_schema = _normalize_process_telemetry_schema(schema)
+    manager._publish_manager_event(
+        "manager.process.telemetry_schema_update",
+        {
+            "process_id": process_id,
+            "signals": [e["name"] for e in handle.telemetry_schema],
+            "ts": {"t_wall": time.time(), "t_mono": time.monotonic()},
+        },
+    )
+    return {
+        "ok": True,
+        "result": {
+            "process_id": process_id,
+            "signals": [e["name"] for e in handle.telemetry_schema],
+        },
+    }
+
+
+def route_process_telemetry_schema_list(manager: Any, req: Json) -> Json:
+    del req
+    return {"ok": True, "result": manager._process_telemetry_schema_list()}
+
+
 def route_process_rpc(
     manager: Any,
     req: Json,
@@ -384,7 +435,14 @@ def route_process_rpc(
         resp = _reply("invalid_process_rpc", message="bad request")
     else:
         handle = manager._processes.get(process_id)
-        if handle is None:
+        if handle is None and manager._federation_hub.is_mirrored_process(process_id):
+            # Local process wins; federation is the fallback (parity with the
+            # device path's _resolve_local_device, which is local-first). Forward
+            # to the owning peer (ACL-checked) only when there is no local
+            # process by this id.
+            fed = manager._federation_hub.forward_process_request(req)
+            resp = fed if fed is not None else _reply("unknown_process")
+        elif handle is None:
             resp = _reply("unknown_process")
         elif handle.state not in running_states:
             resp = _reply("process_not_running")
@@ -741,6 +799,12 @@ class RouteHandlersMixin:
 
     def _route_process_rpc_advertise(self, req: Json) -> Json:
         return route_process_rpc_advertise(self, req)
+
+    def _route_process_telemetry_schema_advertise(self, req: Json) -> Json:
+        return route_process_telemetry_schema_advertise(self, req)
+
+    def _route_process_telemetry_schema_list(self, req: Json) -> Json:
+        return route_process_telemetry_schema_list(self, req)
 
     # -- interceptor route handlers (request-layer wrappers) -----------
 

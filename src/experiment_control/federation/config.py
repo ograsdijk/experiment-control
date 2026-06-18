@@ -17,6 +17,7 @@ Json = dict[str, Any]
 
 DEFAULT_FEDERATION_RELAY_TOPICS: tuple[str, ...] = (
     "manager.telemetry_update",
+    "manager.process_telemetry_update",
     "manager.heartbeat",
     "manager.log",
     "manager.command",
@@ -49,15 +50,34 @@ class FederationPolicy:
     deny_device_actions: tuple[str, ...] = ()
     allow_lifecycle_ops: bool = False
     allow_admin_ops: bool = False
+    # Process-RPC ACL is a SEPARATE namespace from device actions: mirrored
+    # devices default to wide-open ("*") but mirrored processes default to
+    # deny-all (empty allowlist), so a federated process is never callable
+    # across a peer unless an action is explicitly allowed.
+    allow_process_actions: tuple[str, ...] = ()
+    deny_process_actions: tuple[str, ...] = ()
 
     def allows_device_action(self, action: str) -> bool:
+        return self._allows(
+            action, self.deny_device_actions, self.allow_device_actions
+        )
+
+    def allows_process_action(self, action: str) -> bool:
+        return self._allows(
+            action, self.deny_process_actions, self.allow_process_actions
+        )
+
+    @staticmethod
+    def _allows(
+        action: str, deny: tuple[str, ...], allow: tuple[str, ...]
+    ) -> bool:
         text = str(action or "").strip()
         if not text:
             return False
-        for pattern in self.deny_device_actions:
+        for pattern in deny:
             if fnmatchcase(text, pattern):
                 return False
-        for pattern in self.allow_device_actions:
+        for pattern in allow:
             if fnmatchcase(text, pattern):
                 return True
         return False
@@ -70,6 +90,12 @@ class MirroredDeviceConfig:
 
 
 @dataclass(frozen=True)
+class MirroredProcessConfig:
+    local_id: str
+    remote_process_id: str
+
+
+@dataclass(frozen=True)
 class FederationPeerConfig:
     peer_id: str
     router_rpc: str
@@ -79,6 +105,7 @@ class FederationPeerConfig:
     event_stale_s: float
     reconnect_backoff_s: float
     reconnect_backoff_max_s: float
+    mirror_processes: tuple[MirroredProcessConfig, ...] = ()
     metadata_rpc_timeout_ms: int = DEFAULT_FEDERATION_METADATA_RPC_TIMEOUT_MS
     warm_capabilities_on_startup: bool = False
     allow_reexport: bool = False
@@ -92,10 +119,25 @@ class FederationConfig:
     peers: tuple[FederationPeerConfig, ...] = ()
 
     def mirrored_local_ids(self) -> tuple[str, ...]:
+        """All mirrored local ids across devices AND processes.
+
+        Both share one local-id namespace (a mirror local_id must be unique
+        whether it names a federated device or a federated process), so this
+        is the authoritative set for collision checks.
+        """
         out: list[str] = []
         for peer in self.peers:
             for device in peer.mirror_devices:
                 out.append(device.local_id)
+            for process in peer.mirror_processes:
+                out.append(process.local_id)
+        return tuple(out)
+
+    def mirrored_process_local_ids(self) -> tuple[str, ...]:
+        out: list[str] = []
+        for peer in self.peers:
+            for process in peer.mirror_processes:
+                out.append(process.local_id)
         return tuple(out)
 
 
@@ -276,11 +318,6 @@ def parse_federation_config(
             peer_raw.get("mirror_devices"),
             path=["federation", "peers", idx, "mirror_devices"],
         )
-        if not mirror_items:
-            raise ConfigError(
-                f"federation.peers[{idx}].mirror_devices",
-                "must contain at least one mirrored device",
-            )
         mirrors: list[MirroredDeviceConfig] = []
         for m_idx, mirror_item in enumerate(mirror_items):
             mirror_raw = require_dict(
@@ -312,7 +349,7 @@ def parse_federation_config(
                     f"federation.peers[{idx}].mirror_devices[{m_idx}].local_id",
                     f"collides with local device_id {local_id!r}",
                 )
-            remote_key = (peer_id, remote_device_id)
+            remote_key = (peer_id, "device:" + remote_device_id)
             if remote_key in remote_ids_seen:
                 raise ConfigError(
                     (
@@ -328,6 +365,68 @@ def parse_federation_config(
             remote_ids_seen.add(remote_key)
             mirrors.append(
                 MirroredDeviceConfig(local_id=local_id, remote_device_id=remote_device_id)
+            )
+
+        process_items = normalize_list(
+            peer_raw.get("mirror_processes"),
+            path=["federation", "peers", idx, "mirror_processes"],
+        )
+        process_mirrors: list[MirroredProcessConfig] = []
+        for p_idx, process_item in enumerate(process_items):
+            process_raw = require_dict(
+                process_item,
+                path=["federation", "peers", idx, "mirror_processes", p_idx],
+            )
+            local_id = require_str(
+                process_raw.get("local_id"),
+                path=["federation", "peers", idx, "mirror_processes", p_idx, "local_id"],
+            ).strip()
+            remote_process_id = require_str(
+                process_raw.get("remote_process_id"),
+                path=[
+                    "federation",
+                    "peers",
+                    idx,
+                    "mirror_processes",
+                    p_idx,
+                    "remote_process_id",
+                ],
+            ).strip()
+            # Process and device mirrors share ONE local-id namespace.
+            if local_id in local_ids_seen:
+                raise ConfigError(
+                    f"federation.peers[{idx}].mirror_processes[{p_idx}].local_id",
+                    f"duplicate mirrored local_id {local_id!r}",
+                )
+            if local_id in local_device_ids:
+                raise ConfigError(
+                    f"federation.peers[{idx}].mirror_processes[{p_idx}].local_id",
+                    f"collides with local device_id {local_id!r}",
+                )
+            remote_key = (peer_id, "process:" + remote_process_id)
+            if remote_key in remote_ids_seen:
+                raise ConfigError(
+                    (
+                        "federation.peers"
+                        f"[{idx}].mirror_processes[{p_idx}].remote_process_id"
+                    ),
+                    (
+                        "duplicate mirrored remote process mapping for "
+                        f"{peer_id!r}:{remote_process_id!r}"
+                    ),
+                )
+            local_ids_seen.add(local_id)
+            remote_ids_seen.add(remote_key)
+            process_mirrors.append(
+                MirroredProcessConfig(
+                    local_id=local_id, remote_process_id=remote_process_id
+                )
+            )
+
+        if not mirrors and not process_mirrors:
+            raise ConfigError(
+                f"federation.peers[{idx}]",
+                "must contain at least one mirror_devices or mirror_processes entry",
             )
 
         policy_raw = optional_dict(
@@ -375,6 +474,7 @@ def parse_federation_config(
                 router_rpc=router_rpc,
                 manager_pub=manager_pub,
                 mirror_devices=tuple(mirrors),
+                mirror_processes=tuple(process_mirrors),
                 rpc_timeout_ms=_int_value(
                     peer_raw.get("rpc_timeout_ms"),
                     path=["federation", "peers", idx, "rpc_timeout_ms"],
@@ -413,6 +513,16 @@ def parse_federation_config(
                     deny_device_actions=_pattern_list(
                         policy_raw.get("deny_device_actions"),
                         path=["federation", "peers", idx, "policy", "deny_device_actions"],
+                        default=(),
+                    ),
+                    allow_process_actions=_pattern_list(
+                        policy_raw.get("allow_process_actions"),
+                        path=["federation", "peers", idx, "policy", "allow_process_actions"],
+                        default=(),
+                    ),
+                    deny_process_actions=_pattern_list(
+                        policy_raw.get("deny_process_actions"),
+                        path=["federation", "peers", idx, "policy", "deny_process_actions"],
                         default=(),
                     ),
                     allow_lifecycle_ops=_bool_value(

@@ -194,13 +194,17 @@ class FederationHubCapabilityTests(unittest.TestCase):
         # warm_capabilities_on_startup is set; results are applied on the main
         # thread by _apply_peer_metadata.
         fake_ctx = _FakeCtx(responder)
-        config_resp, schema_resp, caps, error = hub._fetch_peer_metadata(fake_ctx, peer_cfg)
+        config_resp, schema_resp, proc_schema_resp, caps, error = hub._fetch_peer_metadata(
+            fake_ctx, peer_cfg
+        )
         self.assertIsNone(error)
         actions = [p.get("action") for p in fake_ctx.sockets[0].sent]
         self.assertIn("capabilities", actions)
         self.assertEqual(caps["psu"]["version"], 1)
 
-        hub._apply_peer_metadata(hub._peers["lab2"], config_resp, schema_resp, caps)
+        hub._apply_peer_metadata(
+            hub._peers["lab2"], config_resp, schema_resp, proc_schema_resp, caps
+        )
         devices = hub.list_devices_snapshot()
         self.assertEqual(devices[0]["capabilities"]["version"], 1)
 
@@ -242,7 +246,7 @@ class FederationHubWarmupTests(unittest.TestCase):
         calls: list[tuple] = []
         hub._rpc_call = lambda *a, **k: calls.append((a, k))  # type: ignore[method-assign]
         # Keep the background thread off the network for a deterministic test.
-        hub._fetch_peer_metadata = lambda _ctx, _cfg: (None, None, {}, "stub")  # type: ignore[method-assign]
+        hub._fetch_peer_metadata = lambda _ctx, _cfg: (None, None, None, {}, "stub")  # type: ignore[method-assign]
 
         hub.activate()
         try:
@@ -278,6 +282,7 @@ class FederationHubWarmupTests(unittest.TestCase):
                     ],
                 },
                 {"ok": True, "result": {"devices": [{"device_id": "psu", "signals": [], "dtypes": [], "units": []}]}},
+                None,
                 {"psu": {"version": 2}},
                 None,
             )
@@ -306,7 +311,9 @@ class FederationHubWarmupTests(unittest.TestCase):
             return None
 
         fake_ctx = _FakeCtx(responder)
-        config_resp, schema_resp, caps, error = hub._fetch_peer_metadata(fake_ctx, peer_cfg)
+        config_resp, schema_resp, proc_schema_resp, caps, error = hub._fetch_peer_metadata(
+            fake_ctx, peer_cfg
+        )
 
         self.assertIsNone(error)
         self.assertIsNotNone(config_resp)
@@ -321,7 +328,9 @@ class FederationHubWarmupTests(unittest.TestCase):
         peer_cfg = hub._peers["lab2"].config
         fake_ctx = _FakeCtx(lambda _p: None)  # recv raises Again -> timeout
 
-        config_resp, schema_resp, caps, error = hub._fetch_peer_metadata(fake_ctx, peer_cfg)
+        config_resp, schema_resp, proc_schema_resp, caps, error = hub._fetch_peer_metadata(
+            fake_ctx, peer_cfg
+        )
 
         self.assertIsNone(config_resp)
         self.assertIsNone(schema_resp)
@@ -393,7 +402,13 @@ class FederationHubWarmupTests(unittest.TestCase):
 
         def _fake_fetch(_ctx: object, _cfg: object):
             calls["n"] += 1
-            return ({"ok": True, "result": []}, {"ok": True, "result": {"devices": []}}, {}, None)
+            return (
+                {"ok": True, "result": []},
+                {"ok": True, "result": {"devices": []}},
+                None,
+                {},
+                None,
+            )
 
         hub._fetch_peer_metadata = _fake_fetch  # type: ignore[method-assign]
         original_refresh = hub_mod._METADATA_REFRESH_S

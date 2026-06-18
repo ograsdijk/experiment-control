@@ -253,6 +253,53 @@ def _ingest_schema(
     return device_map
 
 
+def _ingest_process_schema(
+    schema: Json,
+    process_group: h5py.Group,
+    datasets: dict[str, h5py.Dataset],
+    device_map: dict[str, Json],
+    *,
+    chunk_size: int = DEFAULT_TELEMETRY_CHUNK_ROWS,
+) -> None:
+    """Create ``/process_telemetry/<process_id>`` datasets from a process
+    telemetry schema (manager.process_telemetry.schema.list).
+
+    Process telemetry reuses the device telemetry write path: entries are
+    merged into the SAME ``datasets``/``device_map`` (keyed by ``process_id``)
+    so ``_write_buffered_rows_batch`` writes them unchanged — but the datasets
+    live in a SEPARATE ``/process_telemetry`` group and carry a
+    ``source_kind="process"`` attribute, keeping the distinction in the file.
+    """
+    processes_raw = schema.get("processes", [])
+    if not isinstance(processes_raw, list):
+        return
+    for proc in processes_raw:
+        if not isinstance(proc, dict):
+            continue
+        process_id = str(proc.get("process_id", ""))
+        signals = list(proc.get("signals", []))
+        dtypes = list(proc.get("dtypes", []))
+        units = list(proc.get("units", []))
+        if not process_id or not signals:
+            continue
+        device_map[process_id] = {
+            "signals": signals,
+            "dtypes": dtypes,
+            "units": units,
+        }
+        if process_id not in datasets:
+            ds = _create_device_dataset(
+                process_group,
+                process_id,
+                signals,
+                dtypes,
+                units,
+                chunk_size=chunk_size,
+            )
+            ds.attrs["source_kind"] = "process"
+            datasets[process_id] = ds
+
+
 class HdfWriter(ManagedProcessBase):
     def __init__(
         self,
@@ -326,6 +373,7 @@ class HdfWriter(ManagedProcessBase):
 
         self._h5: h5py.File | None = None
         self._telemetry_group: h5py.Group | None = None
+        self._process_telemetry_group: h5py.Group | None = None
         self._streams_group: h5py.Group | None = None
         self._config_group: h5py.Group | None = None
         self._run_meta_group: h5py.Group | None = None
@@ -660,6 +708,26 @@ class HdfWriter(ManagedProcessBase):
                     return None
                 time.sleep(delay)
                 delay = min(delay * 2.0, max_delay)
+
+    def _fetch_process_schema_best_effort(self) -> Json | None:
+        """Best-effort fetch of manager.process_telemetry.schema.list.
+
+        Single attempt: process telemetry is optional, so a missing/empty
+        result simply means no /process_telemetry datasets this file."""
+        try:
+            resp = _manager_rpc(
+                self._ctx,
+                self._manager_rpc,
+                {"action": "manager.process_telemetry.schema.list"},
+                timeout_ms=self._rpc_timeout_ms,
+            )
+        except Exception:
+            self._bump_error("process_schema.rpc")
+            return None
+        if not isinstance(resp, dict) or not resp.get("ok"):
+            return None
+        result = resp.get("result")
+        return result if isinstance(result, dict) else None
 
     def _fetch_config_with_backoff(
         self,
@@ -1403,6 +1471,7 @@ class HdfWriter(ManagedProcessBase):
 
     def _reset_per_file_state(self) -> None:
         self._telemetry_group = None
+        self._process_telemetry_group = None
         self._streams_group = None
         self._config_group = None
         self._run_meta_group = None
@@ -1488,6 +1557,7 @@ class HdfWriter(ManagedProcessBase):
         h5.attrs["disabled_devices_json"] = json.dumps(sorted(self._disabled_devices))
 
         self._telemetry_group = h5.require_group("telemetry")
+        self._process_telemetry_group = h5.require_group("process_telemetry")
         self._streams_group = h5.require_group("streams")
         self._config_group = h5.require_group("config")
         self._run_meta_group = h5.require_group("run_metadata")
@@ -1534,6 +1604,19 @@ class HdfWriter(ManagedProcessBase):
                     self._datasets,
                     write_enabled=self._is_device_enabled,
                 )
+
+            # Process telemetry schema (manager.process_telemetry.schema.list):
+            # best-effort, merged into the same datasets/device_map keyed by
+            # process_id but written into the /process_telemetry group.
+            if self._process_telemetry_group is not None:
+                proc_schema = self._fetch_process_schema_best_effort()
+                if proc_schema is not None:
+                    _ingest_process_schema(
+                        proc_schema,
+                        self._process_telemetry_group,
+                        self._datasets,
+                        self._device_map,
+                    )
 
             configs: list[Json] = []
             if self._latest_device_config:
@@ -1880,6 +1963,7 @@ class HdfWriter(ManagedProcessBase):
                 self._sub = sub
                 sub.setsockopt(zmq.RCVHWM, int(self._rcvhwm))
                 sub.setsockopt(zmq.SUBSCRIBE, b"manager.telemetry_update")
+                sub.setsockopt(zmq.SUBSCRIBE, b"manager.process_telemetry_update")
                 sub.setsockopt(zmq.SUBSCRIBE, b"manager.chunk_ready")
                 sub.setsockopt(zmq.SUBSCRIBE, b"manager.device_config")
                 sub.setsockopt(zmq.SUBSCRIBE, b"manager.run_metadata")

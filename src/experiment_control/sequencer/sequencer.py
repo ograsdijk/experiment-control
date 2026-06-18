@@ -237,6 +237,8 @@ class SequencerProcess(ManagedProcessBase):
             get_telemetry=self._get_telemetry,
             set_stream_context=self._set_stream_context,
             resolve_use=self._resolve_use_sequence_spec,
+            call_process=self._call_process,
+            get_process_telemetry=self._get_process_telemetry,
         )
         self._context_columns: dict[str, str] | None = None
         self._loaded_sequence_source: str | None = None
@@ -2174,14 +2176,8 @@ class SequencerProcess(ManagedProcessBase):
         )
         return diagnostics
 
-    def _call_device(self, device_id: str, action: str, params: dict[str, Any]) -> Json:
-        req = {
-            "type": "command",
-            "device_id": device_id,
-            "action": action,
-            "params": params,
-        }
-        resp = self._require_manager().call(req)
+    @staticmethod
+    def _normalize_call_response(resp: Json | None) -> Json:
         if resp is None:
             return {"ok": False, "error": "timeout"}
         if not isinstance(resp, dict):
@@ -2194,6 +2190,29 @@ class SequencerProcess(ManagedProcessBase):
         if status == "ERROR":
             return {"ok": False, "error": resp.get("error", "unknown")}
         return resp
+
+    def _call_device(self, device_id: str, action: str, params: dict[str, Any]) -> Json:
+        req = {
+            "type": "command",
+            "device_id": device_id,
+            "action": action,
+            "params": params,
+        }
+        return self._normalize_call_response(self._require_manager().call(req))
+
+    def _call_process(self, process_id: str, action: str, params: dict[str, Any]) -> Json:
+        # Process RPC: the action is the inner request `type` (e.g. mw.retune),
+        # dispatched by the process's RPC namespace. Federated process ids are
+        # forwarded transparently by the manager (route_process_rpc).
+        req = {
+            "type": "manager.processes.rpc",
+            "process_id": process_id,
+            "request": {"type": action, "params": params},
+        }
+        return self._normalize_call_response(self._require_manager().call(req))
+
+    def _get_process_telemetry(self, process_id: str, signal: str) -> dict[str, Any] | None:
+        return self._require_manager().get_latest_process(process_id, signal)
 
     @staticmethod
     def _device_error_text(resp: Json) -> str:
