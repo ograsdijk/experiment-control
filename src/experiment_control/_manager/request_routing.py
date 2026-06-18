@@ -27,6 +27,7 @@ class RequestRoutingMixin(_MixinBase):
         return RpcDispatchRegistry(
             handlers={
                 "manager.telemetry.schema.list": self._route_action_telemetry_schema_list,
+                "manager.process_telemetry.schema.list": self._route_process_telemetry_schema_list,
             },
         )
 
@@ -50,6 +51,7 @@ class RequestRoutingMixin(_MixinBase):
                 "manager.processes.add": self._route_process_add,
                 "manager.processes.remove": self._route_process_remove,
                 "manager.processes.rpc.advertise": self._route_process_rpc_advertise,
+                "manager.process_telemetry.schema.advertise": self._route_process_telemetry_schema_advertise,
                 "manager.processes.rpc": self._route_process_rpc,
                 "manager.interceptors.register": self._route_command_interceptor_register,
                 "manager.interceptors.unregister": self._route_command_interceptor_unregister,

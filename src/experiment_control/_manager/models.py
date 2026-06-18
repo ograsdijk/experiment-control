@@ -206,6 +206,12 @@ class ProcessHandle:
     popen_pid: int | None = None
     heartbeat_pid: int | None = None
     rpc_endpoint: str | None = None
+    # Flat process-telemetry schema advertised by the process
+    # (manager.process_telemetry.schema.advertise): a list of
+    # {"name", "dtype", "units"} entries. Served via
+    # manager.process_telemetry.schema.list so the HDF writer can create
+    # /process_telemetry/<id> datasets and federation peers can warm it.
+    telemetry_schema: list[Json] | None = None
     rpc_sock: zmq.Socket | None = None
     # Serialises access to `rpc_sock` (a ZMQ DEALER socket, NOT
     # thread-safe). Lifecycle workers can dispatch concurrent process

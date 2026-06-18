@@ -113,11 +113,18 @@ class SequencerRuntime:
         get_telemetry: Callable[[str, str], dict[str, Any] | None],
         set_stream_context: Callable[[str, str, int, dict[str, Any]], None],
         resolve_use: Callable[[str], SequenceSpec] | None = None,
+        call_process: Callable[[str, str, dict[str, Any]], dict[str, Any]] | None = None,
+        get_process_telemetry: Callable[[str, str], dict[str, Any] | None] | None = None,
     ) -> None:
         self._call_device = call_device
         self._get_telemetry = get_telemetry
         self._set_stream_context = set_stream_context
         self._resolve_use = resolve_use
+        # Process RPC + process telemetry sampling. Optional so existing
+        # constructions (and tests) that only wire device callbacks keep working;
+        # a sequence that targets `process:` without these wired fails clearly.
+        self._call_process = call_process
+        self._get_process_telemetry = get_process_telemetry
 
         self._spec: SequenceSpec | None = None
         self._vars: dict[str, Any] = {}
@@ -968,9 +975,37 @@ class SequencerRuntime:
             return self._fail_step(str(resp.get("error")))
         return False
 
+    def _dispatch_call(
+        self, *, device: str, process: str | None, action: str, params: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Route a call to a device command or a process RPC."""
+        if process:
+            if self._call_process is None:
+                return {
+                    "ok": False,
+                    "error": "process calls not supported (call_process not wired)",
+                }
+            return self._call_process(process, action, params)
+        return self._call_device(device, action, params)
+
+    def _dispatch_get_telemetry(
+        self, *, device: str, process: str | None, signal: str
+    ) -> dict[str, Any] | None:
+        """Read the latest sample from device telemetry or process telemetry."""
+        if process:
+            if self._get_process_telemetry is None:
+                return None
+            return self._get_process_telemetry(process, signal)
+        return self._get_telemetry(device, signal)
+
     def _execute_call_step(self, step: CallStep) -> bool:
         params = render_templates(step.params, self._env_view())
-        resp = self._call_device(step.device, step.action, params)
+        resp = self._dispatch_call(
+            device=step.device,
+            process=step.process,
+            action=step.action,
+            params=params,
+        )
         if step.save_as:
             self._env[step.save_as] = resp
         if step.extract and step.assign:
@@ -1954,33 +1989,44 @@ class SequencerRuntime:
 
     def _sample_adaptive_telemetry(self, config: dict[str, Any]) -> Any:
         device = str(config.get("device", "") or "").strip()
+        process = str(config.get("process", "") or "").strip()
         signal = str(config.get("signal", "") or "").strip()
-        if not device or not signal:
-            raise ValueError("adaptive telemetry source requires device and signal")
+        if (not device and not process) or not signal:
+            raise ValueError(
+                "adaptive telemetry source requires device-or-process and signal"
+            )
+        target = process or device
         timeout_s = float(config.get("timeout_s", 0.0) or 0.0)
         max_age_s = float(config.get("max_age_s", 0.0) or 0.0)
         deadline = time.monotonic() + max(0.0, timeout_s)
         while True:
-            sample = self._get_telemetry(device, signal)
+            sample = self._dispatch_get_telemetry(
+                device=device, process=process or None, signal=signal
+            )
             if sample:
                 age = time.monotonic() - float(sample.get("t_mono", 0.0) or 0.0)
                 if (not max_age_s) or age <= max_age_s:
                     return sample.get("value")
             if timeout_s <= 0.0 or time.monotonic() >= deadline:
                 raise RuntimeError(
-                    f"adaptive telemetry source timed out for {device}.{signal}"
+                    f"adaptive telemetry source timed out for {target}.{signal}"
                 )
             time.sleep(0.01)
 
     def _sample_adaptive_call(self, config: dict[str, Any]) -> Any:
         device = str(config.get("device", "") or "").strip()
+        process = str(config.get("process", "") or "").strip()
         action = str(config.get("action", "") or "").strip()
-        if not device or not action:
-            raise ValueError("adaptive call source requires device and action")
+        if (not device and not process) or not action:
+            raise ValueError(
+                "adaptive call source requires device-or-process and action"
+            )
         params = config.get("params", {}) or {}
         if not isinstance(params, dict):
             raise TypeError("adaptive call source params must be a dict")
-        resp = self._call_device(device, action, params)
+        resp = self._dispatch_call(
+            device=device, process=process or None, action=action, params=params
+        )
         if not resp.get("ok", False):
             raise RuntimeError(str(resp.get("error", "adaptive call source failed")))
         extract = config.get("extract")
@@ -1999,11 +2045,14 @@ class SequencerRuntime:
             if not isinstance(spec, dict):
                 return None
             device = str(spec.get("device", ""))
+            process = str(spec.get("process", ""))
             signal = str(spec.get("signal", ""))
-            if not device or not signal:
+            if (not device and not process) or not signal:
                 return None
             max_age = float(spec.get("max_age_s", 0))
-            sample = self._get_telemetry(device, signal)
+            sample = self._dispatch_get_telemetry(
+                device=device, process=process or None, signal=signal
+            )
             if not sample:
                 return None
             age = time.monotonic() - float(sample.get("t_mono", 0))
@@ -2015,23 +2064,29 @@ class SequencerRuntime:
             if not isinstance(call_spec, dict):
                 return None
             device = str(call_spec.get("device", ""))
+            process = str(call_spec.get("process", ""))
             action = str(call_spec.get("action", ""))
             params = call_spec.get("params", {}) or {}
             if not isinstance(params, dict):
                 params = {}
-            resp = self._call_device(device, action, render_templates(params, env))
-            # Raise on failed device call instead of silently returning
+            resp = self._dispatch_call(
+                device=device,
+                process=process or None,
+                action=action,
+                params=render_templates(params, env),
+            )
+            # Raise on failed call instead of silently returning
             # `resp.get("result")` (which on failure is typically None
             # or a stale/partial dict). Without this check, sequencer
             # assign / wait-until / condition values would treat a
-            # failed device call as a successful None reading,
-            # corrupting downstream state. Mirrors _sample_adaptive_call
-            # at line 1960. The outer step-execution loop catches the
-            # exception and transitions the sequencer to ERROR with
-            # _last_error set.
+            # failed call as a successful None reading, corrupting
+            # downstream state. Mirrors _sample_adaptive_call. The outer
+            # step-execution loop catches the exception and transitions
+            # the sequencer to ERROR with _last_error set.
             if not resp.get("ok", False):
+                target = process or device
                 raise RuntimeError(
-                    f"device call {device}.{action} failed: "
+                    f"call {target}.{action} failed: "
                     f"{resp.get('error', 'unknown error')!s}"
                 )
             extract = call_spec.get("extract")
@@ -2102,9 +2157,12 @@ class SequencerRuntime:
             spec = ws.sample_spec.get("telemetry", {})
             if isinstance(spec, dict):
                 device = str(spec.get("device", ""))
+                process = str(spec.get("process", ""))
                 signal = str(spec.get("signal", ""))
-                if device and signal:
-                    cached = self._get_telemetry(device, signal)
+                if (device or process) and signal:
+                    cached = self._dispatch_get_telemetry(
+                        device=device, process=process or None, signal=signal
+                    )
                     if isinstance(cached, dict):
                         try:
                             t_mono_raw = cached.get("t_mono")

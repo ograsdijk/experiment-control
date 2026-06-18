@@ -14,6 +14,9 @@ def build_hdf_topic_handlers(writer: Any) -> dict[str, TopicHandler]:
         "manager.telemetry_update": lambda msg: _handle_manager_telemetry_update(
             writer, msg
         ),
+        "manager.process_telemetry_update": (
+            lambda msg: _handle_manager_process_telemetry_update(writer, msg)
+        ),
         "manager.chunk_ready": lambda msg: _handle_manager_chunk_ready(writer, msg),
         "manager.device_config": lambda msg: writer._handle_device_config(msg),  # noqa: SLF001
         "manager.run_metadata": lambda msg: _handle_manager_run_metadata(writer, msg),
@@ -36,6 +39,20 @@ def _handle_manager_telemetry_update(writer: Any, msg: Json) -> None:
     if _enabled_device_id(writer, msg) is None:
         return
     writer._buffer_append(topic="manager.telemetry_update", msg=msg)  # noqa: SLF001
+
+
+def _handle_manager_process_telemetry_update(writer: Any, msg: Json) -> None:
+    # Process telemetry rides the device telemetry write path: stamp the
+    # process_id into device_id so _write_buffered_rows_batch routes the row to
+    # the pre-created /process_telemetry/<process_id> dataset (see
+    # _ingest_process_schema). Distinct group + source_kind attr keep the
+    # device/process distinction in the file.
+    process_id = str(msg.get("process_id", "")).strip()
+    if not process_id or not writer._is_device_enabled(process_id):  # noqa: SLF001
+        return
+    row = dict(msg)
+    row["device_id"] = process_id
+    writer._buffer_append(topic="manager.telemetry_update", msg=row)  # noqa: SLF001
 
 
 def _handle_manager_chunk_ready(writer: Any, msg: Json) -> None:

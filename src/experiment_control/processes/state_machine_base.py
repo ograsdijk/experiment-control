@@ -743,6 +743,11 @@ class StateMachineProcessBase(ManagedProcessBase):
 
     def run(self) -> None:
         try:
+            # Advertise the process telemetry schema eagerly (now that the
+            # subclass is fully constructed) so the manager — and federation
+            # peers warming it — know the signal set BEFORE the first tick
+            # publishes. No-op for processes that don't declare a schema.
+            self._advertise_process_telemetry_schema()
             next_tick = time.monotonic() + self._tick_s
             while not self._stop_evt.is_set():
                 now = time.monotonic()

@@ -22,6 +22,10 @@ class CallStep:
     save_as: str | None = None
     extract: dict[str, Any] | None = None
     assign: dict[str, dict[str, Any]] | None = None
+    # Exactly one of `device` / `process` is set. `process` targets a (possibly
+    # federated) PROCESS RPC namespace (e.g. mw.retune) via manager.processes.rpc
+    # instead of a device command.
+    process: str | None = None
 
 
 @dataclass(frozen=True)
@@ -155,9 +159,14 @@ def _parse_step(raw: Any) -> Step:
     if "call" in obj:
         call = _require_dict(obj["call"], name="call")
         device = str(call.get("device", ""))
+        process = str(call.get("process", ""))
         action = str(call.get("action", ""))
-        if not device or not action:
-            raise TypeError("call.device and call.action are required")
+        if device and process:
+            raise TypeError("call may set only one of device / process")
+        if not device and not process:
+            raise TypeError("call.device or call.process is required")
+        if not action:
+            raise TypeError("call.action is required")
         params = call.get("params", {}) or {}
         if not isinstance(params, dict):
             raise TypeError("call.params must be a dict")
@@ -175,6 +184,7 @@ def _parse_step(raw: Any) -> Step:
             save_as=str(save_as) if save_as is not None else None,
             extract=extract,
             assign=assign,
+            process=process or None,
         )
     if "set" in obj:
         val = _require_dict(obj["set"], name="set")

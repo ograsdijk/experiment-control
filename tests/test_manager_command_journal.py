@@ -21,6 +21,14 @@ class _HubStub:
     def forward_device_request(_req):
         return None
 
+    @staticmethod
+    def is_mirrored_process(_process_id):
+        return False
+
+    @staticmethod
+    def forward_process_request(_req):
+        return None
+
 
 class _JournalStub:
     def __init__(self) -> None:
