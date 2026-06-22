@@ -4,6 +4,7 @@ process-telemetry relay + schema warm, manager_client process telemetry cache,
 and sequencer `process:` addressing."""
 
 import sys
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -18,6 +19,7 @@ import zmq
 from experiment_control._manager.route_handlers import route_process_rpc
 from experiment_control.federation import parse_federation_config
 from experiment_control.federation.hub import FederationHub
+from experiment_control.manager import Manager
 from experiment_control.manager_client import ManagerClient
 from experiment_control.sequencer.ast import CallStep, parse_sequence
 from experiment_control.sequencer.runtime import SequencerRuntime
@@ -525,6 +527,156 @@ class RouteProcessRpcPrecedenceTests(unittest.TestCase):
         )
         self.assertEqual(resp["result"], "FED")
         self.assertEqual(self.local_calls, [])
+
+
+# --------------------------------------------------------------------------
+# Federated-process liveness (relayed heartbeats) + list snapshot
+# --------------------------------------------------------------------------
+class ProcessFederationLivenessTests(unittest.TestCase):
+    def test_relay_process_heartbeat_populates_mirror(self) -> None:
+        hub, _ = _make_process_hub(allow=("mw.retune",))
+        peer_rt = hub._peers["lab2"]
+        hub._relay_process_heartbeat(
+            peer_rt,
+            {
+                "process_id": "spb_r",
+                "state": "RUNNING",
+                "pid": 4321,
+                "ts": {"t_mono": 1.0},
+            },
+        )
+        mirror = hub._process_mirrors["spb"]
+        self.assertIsNotNone(mirror.last_hb_recv_mono)
+        # remote->local id mapping + retained state/pid.
+        self.assertEqual(mirror.last_hb_payload["process_id"], "spb")
+        self.assertEqual(mirror.last_hb_payload["state"], "RUNNING")
+        self.assertEqual(mirror.last_hb_payload["pid"], 4321)
+
+    def test_relay_process_heartbeat_unknown_id_ignored(self) -> None:
+        hub, _ = _make_process_hub()
+        peer_rt = hub._peers["lab2"]
+        hub._relay_process_heartbeat(
+            peer_rt, {"process_id": "ghost", "state": "RUNNING"}
+        )
+        self.assertIsNone(hub._process_mirrors["spb"].last_hb_recv_mono)
+
+    def test_list_processes_snapshot_online_after_heartbeat(self) -> None:
+        hub, _ = _make_process_hub(allow=("mw.retune",))
+        peer_rt = hub._peers["lab2"]
+        hub._relay_process_heartbeat(
+            peer_rt, {"process_id": "spb_r", "state": "RUNNING", "pid": 7}
+        )
+        snap = hub.list_processes_snapshot()
+        self.assertEqual(len(snap), 1)
+        entry = snap[0]
+        self.assertEqual(entry["process_id"], "spb")
+        self.assertTrue(entry["is_remote"])
+        self.assertEqual(entry["source_kind"], "federated")
+        self.assertEqual(entry["owner_peer_id"], "lab2")
+        self.assertEqual(entry["remote_process_id"], "spb_r")
+        self.assertEqual(entry["state"], "RUNNING")
+        self.assertEqual(entry["pid"], 7)
+        self.assertEqual(entry["liveness"], "ONLINE")
+
+    def test_list_processes_snapshot_offline_when_no_or_stale_heartbeat(self) -> None:
+        hub, _ = _make_process_hub()
+        # No heartbeat yet -> OFFLINE + placeholder state.
+        snap = hub.list_processes_snapshot()
+        self.assertEqual(snap[0]["liveness"], "OFFLINE")
+        self.assertEqual(snap[0]["state"], "FEDERATED")
+        # Stale heartbeat (older than event_stale_s) -> OFFLINE.
+        mirror = hub._process_mirrors["spb"]
+        peer_rt = hub._peers["lab2"]
+        mirror.last_hb_payload = {"state": "RUNNING"}
+        mirror.last_hb_recv_mono = time.monotonic() - (
+            peer_rt.config.event_stale_s + 100.0
+        )
+        self.assertEqual(hub.list_processes_snapshot()[0]["liveness"], "OFFLINE")
+
+
+# --------------------------------------------------------------------------
+# Capability introspection always allowed + per-member ACL annotation
+# --------------------------------------------------------------------------
+class ProcessFederationCapabilityAclTests(unittest.TestCase):
+    def test_capabilities_allowed_and_members_annotated(self) -> None:
+        hub, _ = _make_process_hub(allow=("mw.retune",))
+        hub._rpc_call = lambda peer_rt, payload: {  # type: ignore[method-assign]
+            "ok": True,
+            "result": {
+                "version": 1,
+                "members": [{"name": "mw.retune"}, {"name": "mw.abort"}],
+            },
+        }
+        resp = hub.forward_process_request(
+            {
+                "type": "manager.processes.rpc",
+                "process_id": "spb",
+                "request": {"type": "process.capabilities", "params": {}},
+            }
+        )
+        self.assertTrue(resp["ok"])
+        by_name = {m["name"]: m for m in resp["result"]["members"]}
+        self.assertTrue(by_name["mw.retune"]["federation_allowed"])
+        self.assertFalse(by_name["mw.abort"]["federation_allowed"])
+
+    def test_capabilities_not_denied_even_when_not_allowlisted(self) -> None:
+        hub, _ = _make_process_hub(allow=())  # deny-all domain actions
+        called = {"n": 0}
+
+        def _rpc(peer_rt, payload):
+            called["n"] += 1
+            return {"ok": True, "result": {"members": []}}
+
+        hub._rpc_call = _rpc  # type: ignore[method-assign]
+        resp = hub.forward_process_request(
+            {"process_id": "spb", "request": {"type": "process.capabilities"}}
+        )
+        self.assertTrue(resp["ok"])
+        self.assertEqual(called["n"], 1)  # forwarded, not ACL-denied
+
+    def test_domain_action_still_denied(self) -> None:
+        hub, _ = _make_process_hub(allow=("mw.retune",))
+        called = {"n": 0}
+        hub._rpc_call = lambda *a, **k: called.__setitem__(  # type: ignore[method-assign]
+            "n", called["n"] + 1
+        )
+        resp = hub.forward_process_request(
+            {"process_id": "spb", "request": {"type": "mw.abort"}}
+        )
+        self.assertFalse(resp["ok"])
+        self.assertEqual(resp["error"]["code"], "federation_acl_denied")
+        self.assertEqual(called["n"], 0)
+
+
+# --------------------------------------------------------------------------
+# Manager merges federated processes into manager.processes.list
+# --------------------------------------------------------------------------
+class ManagerListProcessesMergeTests(unittest.TestCase):
+    def test_merges_and_tags_local_and_remote(self) -> None:
+        mgr = object.__new__(Manager)
+        mgr._processes = {"local1": object()}
+        mgr._process_snapshot = lambda h: {"process_id": "local1", "state": "RUNNING"}
+
+        class _Hub:
+            def list_processes_snapshot(self):
+                return [
+                    {
+                        "process_id": "spb",
+                        "is_remote": True,
+                        "source_kind": "federated",
+                        "owner_peer_id": "lab2",
+                    }
+                ]
+
+        mgr._federation_hub = _Hub()
+        result = Manager.list_processes(mgr)
+        self.assertEqual([r["process_id"] for r in result], ["local1", "spb"])
+        local = next(r for r in result if r["process_id"] == "local1")
+        self.assertFalse(local["is_remote"])
+        self.assertEqual(local["source_kind"], "local")
+        self.assertIsNone(local["owner_peer_id"])
+        remote = next(r for r in result if r["process_id"] == "spb")
+        self.assertTrue(remote["is_remote"])
 
 
 if __name__ == "__main__":
