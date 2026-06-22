@@ -249,6 +249,7 @@ export function ProcessesModal({
                     <Select
                       size="xs"
                       label="Action"
+                      comboboxProps={{ zIndex: 500 }}
                       value={selectedAction || null}
                       data={sortedMembers.map((m) => ({
                         value: m.name,
