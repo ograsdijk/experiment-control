@@ -51,6 +51,20 @@ export function processStateColor(state: string | null | undefined): string {
   return "blue";
 }
 
+export function livenessColor(liveness: string | null | undefined): string {
+  const normalized = String(liveness ?? "").toUpperCase();
+  if (normalized === "ONLINE") {
+    return "teal";
+  }
+  if (normalized === "OFFLINE") {
+    return "red";
+  }
+  if (normalized === "DISCONNECTED") {
+    return "yellow";
+  }
+  return "gray";
+}
+
 export function sequencerRuntimeStateColor(
   runtimeState: string | null | undefined,
   processState: string | null | undefined

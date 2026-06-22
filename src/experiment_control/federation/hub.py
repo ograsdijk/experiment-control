@@ -10,7 +10,7 @@ import zmq
 
 from ..utils.manager_network import connect_dealer, resolve_tcp_endpoint
 from ..utils.zmq_helpers import json_dumps, recv_json, safe_json_loads, send_json
-from .config import FederationConfig, FederationPeerConfig
+from .config import FederationConfig, FederationPeerConfig, FederationPolicy
 
 Json = dict[str, Any]
 
@@ -81,6 +81,11 @@ class MirroredProcessRuntime:
     remote_process_id: str
     schema_entry: Json | None = None
     last_error: str | None = None
+    # Last relayed `manager.process.heartbeat` payload + manager-side receive
+    # time, mirroring MirroredDeviceRuntime, so a mirrored process gets real
+    # heartbeat-based liveness (see list_processes_snapshot).
+    last_hb_payload: Json | None = None
+    last_hb_recv_mono: float | None = None
 
 
 class FederationHub:
@@ -311,6 +316,50 @@ class FederationHub:
             )
         return out
 
+    def list_processes_snapshot(self) -> list[Json]:
+        """Snapshot of mirrored PROCESSES for ``manager.processes.list``.
+
+        Parallels ``list_devices_snapshot`` but shaped like a process entry so the
+        UIs render it as a (federated) process row. Liveness is derived from the
+        relayed ``manager.process.heartbeat`` (``last_hb_recv_mono``) vs the peer's
+        ``event_stale_s``, mirroring device liveness. Supervised fields the local
+        manager can't know (restart count, exit code) are neutral defaults;
+        ``state``/``pid`` come from the last heartbeat when present.
+        """
+        out: list[Json] = []
+        now_mono = time.monotonic()
+        for local_id in sorted(self._process_mirrors):
+            mirror = self._process_mirrors[local_id]
+            peer_rt = self._peers[mirror.peer_id]
+            payload = mirror.last_hb_payload or {}
+            hb_age_s: float | None = None
+            liveness = "OFFLINE"
+            if mirror.last_hb_recv_mono is not None:
+                hb_age_s = now_mono - mirror.last_hb_recv_mono
+                if hb_age_s <= peer_rt.config.event_stale_s:
+                    liveness = "ONLINE"
+            out.append(
+                {
+                    "process_id": local_id,
+                    "registered": True,
+                    "rpc_endpoint": peer_rt.config.router_rpc,
+                    "state": payload.get("state")
+                    or payload.get("process_state")
+                    or "FEDERATED",
+                    "liveness": liveness,
+                    "pid": payload.get("pid"),
+                    "hb_age_s": hb_age_s,
+                    "restart_count": 0,
+                    "last_exit_code": None,
+                    "last_error": mirror.last_error or peer_rt.last_error,
+                    "source_kind": "federated",
+                    "is_remote": True,
+                    "owner_peer_id": mirror.peer_id,
+                    "remote_process_id": mirror.remote_process_id,
+                }
+            )
+        return out
+
     def device_status_snapshot(self, device_id: str) -> Json:
         mirror = self._mirrors.get(str(device_id or ""))
         if mirror is None:
@@ -498,7 +547,7 @@ class FederationHub:
         if isinstance(request, dict):
             action = str(request.get("type", ""))
         peer_rt = self._peers[mirror.peer_id]
-        if not peer_rt.config.policy.allows_process_action(action):
+        if not self._process_action_allowed(peer_rt.config.policy, action):
             err = {
                 "code": "federation_acl_denied",
                 "message": (
@@ -526,7 +575,38 @@ class FederationHub:
         peer_rt.last_rpc_ok_mono = time.monotonic()
         peer_rt.last_error = None
         mirror.last_error = None
+        if action == "process.capabilities" and bool(resp.get("ok")):
+            self._annotate_process_capabilities(peer_rt, resp.get("result"))
         return resp
+
+    @staticmethod
+    def _process_action_allowed(policy: FederationPolicy, action: str) -> bool:
+        """Whether a federated process RPC action is permitted.
+
+        ``process.capabilities`` is read-only introspection (no side effects) and
+        is required for clients to render a mirrored process's action set, so it is
+        ALWAYS allowed; every other action obeys ``allow_process_actions``.
+        """
+        if action == "process.capabilities":
+            return True
+        return policy.allows_process_action(action)
+
+    def _annotate_process_capabilities(
+        self, peer_rt: PeerRuntime, result: Any
+    ) -> None:
+        """Tag each capability member with ``federation_allowed`` per the peer ACL
+        so clients can grey out actions this federation link won't permit."""
+        if not isinstance(result, dict):
+            return
+        members = result.get("members")
+        if not isinstance(members, list):
+            return
+        policy = peer_rt.config.policy
+        for member in members:
+            if isinstance(member, dict):
+                member["federation_allowed"] = self._process_action_allowed(
+                    policy, str(member.get("name", ""))
+                )
 
     def _drain_warmup_results(self) -> None:
         """Apply any metadata the background warmup thread has delivered.
@@ -832,6 +912,9 @@ class FederationHub:
         if topic == "manager.process_telemetry_update":
             self._relay_process_telemetry(peer_rt, payload)
             return
+        if topic == "manager.process.heartbeat":
+            self._relay_process_heartbeat(peer_rt, payload)
+            return
         local_id = self._resolve_local_id(peer_rt, topic, payload)
         if local_id is None:
             # No matching mirrored device. If `only_mirrored_devices=True`
@@ -904,6 +987,18 @@ class FederationHub:
             return
         self._manager._publish_manager_event(topic, out)
 
+    def _process_mirror_for_remote(
+        self, peer_rt: PeerRuntime, remote_id: str
+    ) -> MirroredProcessRuntime | None:
+        """Find the mirrored-process runtime for a peer's remote process id."""
+        for mirror in self._process_mirrors.values():
+            if (
+                mirror.peer_id == peer_rt.config.peer_id
+                and mirror.remote_process_id == remote_id
+            ):
+                return mirror
+        return None
+
     def _relay_process_telemetry(self, peer_rt: PeerRuntime, payload: Json) -> None:
         """Relay a peer's ``manager.process_telemetry_update`` for a mirrored
         process. Maps ``process_id`` remote->local, stamps process/origin meta
@@ -913,18 +1008,11 @@ class FederationHub:
         remote_id = str(payload.get("process_id", "")).strip()
         if not remote_id:
             return
-        local_id: str | None = None
-        for mirror in self._process_mirrors.values():
-            if (
-                mirror.peer_id == peer_rt.config.peer_id
-                and mirror.remote_process_id == remote_id
-            ):
-                local_id = mirror.local_id
-                break
-        if local_id is None:
+        mirror = self._process_mirror_for_remote(peer_rt, remote_id)
+        if mirror is None:
             return
         out = dict(payload)
-        out["process_id"] = local_id
+        out["process_id"] = mirror.local_id
         # `is_remote` is a federation trust-boundary flag: the hub's Influx
         # writer uses it to avoid double-writing federated data the owner
         # instance already records. Unlike devices (which carry this via a
@@ -938,6 +1026,35 @@ class FederationHub:
             out["owner_peer_id"] = peer_rt.config.peer_id
             out["remote_process_id"] = remote_id
         self._manager._publish_manager_event("manager.process_telemetry_update", out)
+
+    def _relay_process_heartbeat(self, peer_rt: PeerRuntime, payload: Json) -> None:
+        """Relay a peer's ``manager.process.heartbeat`` for a mirrored process.
+
+        Stores the manager-side receive time + a trimmed payload on the mirror so
+        ``list_processes_snapshot`` can derive real liveness (ONLINE/OFFLINE),
+        mirroring the device-heartbeat path. Unlike a device it is NOT re-ingested
+        into the manager (there is no local process handle for a mirror), and the
+        owner's internal endpoints are dropped — only state/pid/metrics/timestamps
+        are retained."""
+        remote_id = str(payload.get("process_id", "")).strip()
+        if not remote_id:
+            return
+        mirror = self._process_mirror_for_remote(peer_rt, remote_id)
+        if mirror is None:
+            return
+        kept: Json = {
+            k: payload[k]
+            for k in ("state", "process_state", "pid", "metrics", "ts")
+            if k in payload
+        }
+        kept["process_id"] = mirror.local_id
+        kept["is_remote"] = True
+        kept["source_kind"] = "process"
+        if peer_rt.config.relay.include_origin_meta:
+            kept["owner_peer_id"] = peer_rt.config.peer_id
+            kept["remote_process_id"] = remote_id
+        mirror.last_hb_payload = kept
+        mirror.last_hb_recv_mono = time.monotonic()
 
     def _resolve_local_id(
         self, peer_rt: PeerRuntime, topic: str, payload: Json
