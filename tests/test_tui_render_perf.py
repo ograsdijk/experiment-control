@@ -255,5 +255,54 @@ class HeadlessRenderContentTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(members.row_count, 7)
 
 
+class _FakeProcTable:
+    """Minimal DataTable stand-in for _render_processes_table."""
+
+    def __init__(self) -> None:
+        self.ordered_rows: list = []
+        self.added: list[tuple[tuple, dict]] = []
+
+    def add_row(self, *args, **kwargs) -> None:
+        self.added.append((args, kwargs))
+
+    def update_cell(self, *args, **kwargs) -> None:  # pragma: no cover - unused here
+        pass
+
+    def remove_row(self, *args, **kwargs) -> None:  # pragma: no cover - unused here
+        pass
+
+    def move_cursor(self, *args, **kwargs) -> None:  # pragma: no cover - unused here
+        pass
+
+
+class ProcessesTableFederatedBadgeTests(unittest.TestCase):
+    def test_remote_row_prefixed_with_badge_key_stays_raw(self) -> None:
+        app = object.__new__(ManagerTUI)
+        app._suppress_selection_events = False
+        app._selected_process_id = None
+        app._has_user_process_selection = False
+        app._processes = [
+            {
+                "process_id": "spb",
+                "state": "RUNNING",
+                "pid": 7,
+                "hb_age_s": 0.5,
+                "is_remote": True,
+                "source_kind": "federated",
+            },
+            {"process_id": "local1", "state": "RUNNING", "pid": 8, "hb_age_s": 0.1},
+        ]
+        table = _FakeProcTable()
+        app.query_one = lambda *a, **k: table  # type: ignore[method-assign]
+        app.call_later = lambda *a, **k: None  # type: ignore[method-assign]
+
+        app._render_processes_table()
+
+        by_key = {kw["key"]: args for (args, kw) in table.added}
+        # Display gets the ⇄ badge; the row key stays the raw process_id.
+        self.assertEqual(by_key["spb"][0], "⇄ spb")
+        self.assertEqual(by_key["local1"][0], "local1")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -124,6 +124,12 @@ export type ProcessStatus = {
   last_exit_code?: number | null;
   rpc_endpoint?: string | null;
   registered?: boolean;
+  // Federation: set for mirrored (remote) processes.
+  is_remote?: boolean;
+  source_kind?: string | null;
+  owner_peer_id?: string | null;
+  remote_process_id?: string | null;
+  liveness?: "ONLINE" | "OFFLINE" | "DISCONNECTED" | string;
 };
 
 export type CapabilityParam = {
@@ -142,6 +148,9 @@ export type CapabilityMember = {
   readable?: boolean;
   settable?: boolean;
   return_annotation?: string | null;
+  // Federation: false when this action is denied across the federation link
+  // (annotated server-side for mirrored processes). Undefined for local processes.
+  federation_allowed?: boolean;
 };
 
 export type TraceKey = {

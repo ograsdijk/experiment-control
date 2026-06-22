@@ -1045,6 +1045,12 @@ class ManagerTUI(App):
             ]
             for proc in self._processes:
                 pid = str(proc.get("process_id", ""))
+                is_remote = bool(proc.get("is_remote")) or (
+                    str(proc.get("source_kind", "")).strip().lower() == "federated"
+                )
+                # Display-only ⇄ badge for federated rows; the row KEY stays the
+                # raw process_id so cell updates/removals keep working.
+                label = f"⇄ {pid}" if is_remote else pid
                 hb_age = ""
                 hb_age_val = proc.get("hb_age_s")
                 if isinstance(hb_age_val, (int, float)):
@@ -1054,7 +1060,7 @@ class ManagerTUI(App):
                     if isinstance(last_hb_t_mono, (int, float)):
                         hb_age = f"{max(0.0, time.monotonic() - float(last_hb_t_mono)):.1f}"
                 row_values = [
-                    pid,
+                    label,
                     str(proc.get("state", "")),
                     str(proc.get("pid", "") or ""),
                     hb_age,
@@ -1286,16 +1292,27 @@ class ManagerTUI(App):
                 table.clear()
                 return
             context_key = f"process:{process_id}"
+            proc = None
+            for item in self._processes:
+                if str(item.get("process_id", "")) == process_id:
+                    proc = item
+                    break
             if process_id not in self._proc_members_last:
-                proc = None
-                for item in self._processes:
-                    if str(item.get("process_id", "")) == process_id:
-                        proc = item
-                        break
                 state = str(proc.get("state", "")) if proc else ""
                 if state == "RUNNING":
                     self._get_process_capabilities(process_id)
             members = self._proc_members_last.get(process_id, [])
+            # Federated processes: hide actions the federation link denies (the
+            # hub annotates each member with federation_allowed).
+            if proc and (
+                bool(proc.get("is_remote"))
+                or str(proc.get("source_kind", "")).strip().lower() == "federated"
+            ):
+                members = [
+                    m
+                    for m in members
+                    if isinstance(m, dict) and m.get("federation_allowed") is not False
+                ]
         else:
             device_id = self._selected_device_id
             if not device_id:
