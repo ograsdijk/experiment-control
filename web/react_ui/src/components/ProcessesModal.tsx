@@ -7,11 +7,22 @@ import {
   Select,
   Stack,
   Text,
+  Tooltip,
+  useComputedColorScheme,
 } from "@mantine/core";
-import { IconRefresh } from "@tabler/icons-react";
+import { IconRefresh, IconTopologyStar3 } from "@tabler/icons-react";
 import { useEffect, useState } from "react";
-import { processStateColor } from "../features/runtime/helpers";
+import {
+  livenessColor,
+  processStateColor,
+} from "../features/runtime/helpers";
 import type { CapabilityMember, ProcessStatus } from "../types";
+
+// A mirrored (federated) process action is allowed unless the server annotated it
+// `federation_allowed === false`. Local processes leave it undefined → allowed.
+function actionAllowed(member: CapabilityMember | undefined): boolean {
+  return member?.federation_allowed !== false;
+}
 
 type Props = {
   opened: boolean;
@@ -53,6 +64,11 @@ export function ProcessesModal({
   const [selectedActionByProcess, setSelectedActionByProcess] = useState<
     Record<string, string>
   >({});
+  const computedColorScheme = useComputedColorScheme("light");
+  const remoteIconColor =
+    computedColorScheme === "dark"
+      ? "var(--mantine-color-blue-4)"
+      : "var(--mantine-color-blue-6)";
 
   useEffect(() => {
     setSelectedActionByProcess((prev) => {
@@ -60,18 +76,26 @@ export function ProcessesModal({
       const next: Record<string, string> = {};
       for (const process of processes) {
         const processId = process.process_id;
-        const commands = (capabilitiesByProcess[processId] ?? [])
-          .map((capability) => capability.name)
-          .sort((a, b) => a.localeCompare(b));
+        const sorted = [...(capabilitiesByProcess[processId] ?? [])].sort(
+          (a, b) => a.name.localeCompare(b.name)
+        );
+        const commands = sorted.map((m) => m.name);
         if (commands.length === 0) {
           if (Object.prototype.hasOwnProperty.call(prev, processId)) {
             changed = true;
           }
           continue;
         }
+        // Default to the first ALLOWED action so the Command button isn't
+        // pre-armed on a denied (greyed) one for federated processes.
+        const firstAllowed =
+          sorted.find((m) => actionAllowed(m))?.name ?? commands[0];
         const previous = prev[processId];
+        const previousMember = sorted.find((m) => m.name === previous);
         const chosen =
-          previous && commands.includes(previous) ? previous : commands[0];
+          previous && commands.includes(previous) && actionAllowed(previousMember)
+            ? previous
+            : firstAllowed;
         next[processId] = chosen;
         if (previous !== chosen) {
           changed = true;
@@ -116,13 +140,30 @@ export function ProcessesModal({
         )}
         {processes.map((process) => {
           const processId = process.process_id;
-          const commands = (capabilitiesByProcess[processId] ?? [])
-            .map((capability) => capability.name)
-            .sort((a, b) => a.localeCompare(b));
+          const sortedMembers = [...(capabilitiesByProcess[processId] ?? [])].sort(
+            (a, b) => a.name.localeCompare(b.name)
+          );
+          const commands = sortedMembers.map((m) => m.name);
+          const allowedByName: Record<string, boolean> = {};
+          for (const m of sortedMembers) {
+            allowedByName[m.name] = actionAllowed(m);
+          }
           const selectedAction =
-            selectedActionByProcess[processId] ?? commands[0] ?? "";
+            selectedActionByProcess[processId] ??
+            sortedMembers.find((m) => actionAllowed(m))?.name ??
+            commands[0] ??
+            "";
+          const selectedAllowed = selectedAction
+            ? allowedByName[selectedAction] !== false
+            : false;
           const busy = Boolean(busyByProcess[processId]);
           const error = errorByProcess[processId];
+          const isRemote =
+            Boolean(process.is_remote) || process.source_kind === "federated";
+          const remotePeerId = String(process.owner_peer_id ?? "").trim();
+          const remoteTooltip = remotePeerId
+            ? `Remote process (peer: ${remotePeerId})`
+            : "Remote process";
           return (
             <Card
               key={processId}
@@ -134,10 +175,32 @@ export function ProcessesModal({
                 <Group justify="space-between" align="flex-start">
                   <Stack gap={2}>
                     <Group gap="xs">
+                      {isRemote ? (
+                        <Tooltip label={remoteTooltip} withArrow>
+                          <span
+                            style={{
+                              display: "inline-flex",
+                              verticalAlign: "text-bottom",
+                              lineHeight: 0,
+                              color: remoteIconColor,
+                            }}
+                          >
+                            <IconTopologyStar3 size={14} stroke={1.8} />
+                          </span>
+                        </Tooltip>
+                      ) : null}
                       <Text fw={600}>{processId}</Text>
                       <Badge variant="light" color={processStateColor(process.state)}>
                         {process.state}
                       </Badge>
+                      {isRemote ? (
+                        <Badge
+                          variant="light"
+                          color={livenessColor(process.liveness)}
+                        >
+                          {process.liveness ?? "UNKNOWN"}
+                        </Badge>
+                      ) : null}
                     </Group>
                     <Text size="xs" c="dimmed">
                       pid {process.pid ?? "n/a"} | mem{" "}
@@ -147,35 +210,39 @@ export function ProcessesModal({
                         : "n/a"}
                     </Text>
                   </Stack>
-                  <Group gap="xs">
-                    <Button
-                      size="xs"
-                      variant="light"
-                      onClick={() => onProcessAction(processId, "start")}
-                      disabled={busy}
-                    >
-                      Start
-                    </Button>
-                    <Button
-                      size="xs"
-                      variant="light"
-                      color="red"
-                      onClick={() => onProcessAction(processId, "stop")}
-                      disabled={busy}
-                    >
-                      Stop
-                    </Button>
-                    <Button
-                      size="xs"
-                      variant="light"
-                      color="red"
-                      leftSection={<IconRefresh size={14} />}
-                      onClick={() => onProcessAction(processId, "restart")}
-                      disabled={busy}
-                    >
-                      Restart
-                    </Button>
-                  </Group>
+                  {/* Lifecycle is owner-only: the local manager doesn't supervise
+                      a mirrored process, so hide start/stop/restart for remotes. */}
+                  {!isRemote ? (
+                    <Group gap="xs">
+                      <Button
+                        size="xs"
+                        variant="light"
+                        onClick={() => onProcessAction(processId, "start")}
+                        disabled={busy}
+                      >
+                        Start
+                      </Button>
+                      <Button
+                        size="xs"
+                        variant="light"
+                        color="red"
+                        onClick={() => onProcessAction(processId, "stop")}
+                        disabled={busy}
+                      >
+                        Stop
+                      </Button>
+                      <Button
+                        size="xs"
+                        variant="light"
+                        color="red"
+                        leftSection={<IconRefresh size={14} />}
+                        onClick={() => onProcessAction(processId, "restart")}
+                        disabled={busy}
+                      >
+                        Restart
+                      </Button>
+                    </Group>
+                  ) : null}
                 </Group>
                 {commands.length > 0 ? (
                   <Group align="flex-end" wrap="nowrap">
@@ -183,7 +250,13 @@ export function ProcessesModal({
                       size="xs"
                       label="Action"
                       value={selectedAction || null}
-                      data={commands.map((name) => ({ value: name, label: name }))}
+                      data={sortedMembers.map((m) => ({
+                        value: m.name,
+                        label: allowedByName[m.name]
+                          ? m.name
+                          : `${m.name} (not federated-allowed)`,
+                        disabled: !allowedByName[m.name],
+                      }))}
                       searchable
                       allowDeselect={false}
                       flex={1}
@@ -198,7 +271,7 @@ export function ProcessesModal({
                       size="xs"
                       variant="light"
                       onClick={() => onOpenCommand(processId, selectedAction)}
-                      disabled={busy || !selectedAction}
+                      disabled={busy || !selectedAction || !selectedAllowed}
                     >
                       Command
                     </Button>
