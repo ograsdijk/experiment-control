@@ -100,6 +100,7 @@ class ManagerCaches:
         default_factory=dict
     )
     telemetry_last_bundle_ts: dict[str, Timestamp] = field(default_factory=dict)
+    telemetry_last_recv_mono: dict[str, float] = field(default_factory=dict)
     telemetry_device_order: dict[str, None] = field(default_factory=dict)
     latest_chunk_desc: dict[str, dict[str, Json]] = field(default_factory=dict)
     chunk_device_order: dict[str, None] = field(default_factory=dict)
@@ -114,6 +115,7 @@ class ManagerCaches:
     def bind_to_manager(self, manager: Any) -> None:
         manager._telemetry_latest = self.telemetry_latest
         manager._telemetry_last_bundle_ts = self.telemetry_last_bundle_ts
+        manager._telemetry_last_recv_mono = self.telemetry_last_recv_mono
         manager._telemetry_device_order = self.telemetry_device_order
         manager._latest_chunk_desc = self.latest_chunk_desc
         manager._chunk_device_order = self.chunk_device_order

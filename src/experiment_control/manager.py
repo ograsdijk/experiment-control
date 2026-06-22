@@ -1981,12 +1981,16 @@ class Manager(
         for name, (bundle_ts, sig) in device_cache.items():
             # Per-signal ts None => use bundle ts (newer spec)
             ts = sig.ts or bundle_ts
+            t_mono_recv = self._telemetry_last_recv_mono.get(device_id)
+            ts_payload = {"t_wall": ts.t_wall, "t_mono": ts.t_mono}
+            if t_mono_recv is not None:
+                ts_payload["t_mono_recv"] = t_mono_recv
             snap[name] = {
                 "value": sig.value,
                 "units": sig.units,
                 "quality": sig.quality,
                 "quality_source": sig.quality_source,
-                "ts": {"t_wall": ts.t_wall, "t_mono": ts.t_mono},
+                "ts": ts_payload,
             }
         return snap
 
@@ -2026,7 +2030,10 @@ class Manager(
             for bundle_ts, _sig in device_cache.values():
                 if latest_ts is None or bundle_ts.t_mono > latest_ts.t_mono:
                     latest_ts = bundle_ts
-        if latest_ts is not None:
+        latest_recv_mono = self._telemetry_last_recv_mono.get(device_id)
+        if latest_recv_mono is not None:
+            telemetry_age_s = now_mono - latest_recv_mono
+        elif latest_ts is not None:
             telemetry_age_s = now_mono - latest_ts.t_mono
 
         hb = handle.last_hb

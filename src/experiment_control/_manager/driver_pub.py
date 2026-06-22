@@ -96,13 +96,14 @@ def _ensure_telemetry_device_slot(manager: Any, device_id: str) -> dict[str, Any
     _ensure_cache_state(manager)
     latest = manager._telemetry_latest
     last_bundle = manager._telemetry_last_bundle_ts
+    last_recv = manager._telemetry_last_recv_mono
     order = manager._telemetry_device_order
     _evict_one_device(
         manager,
         device_id=device_id,
         latest=latest,
         order=order,
-        side_caches=(last_bundle,),
+        side_caches=(last_bundle, last_recv),
         max_devices=_positive_limit(manager, "_telemetry_cache_max_devices", 4096),
         counter_attr="_telemetry_cache_evicted_devices",
     )
@@ -340,6 +341,7 @@ def ingest_telemetry(
     )
     if device_id is None:
         return
+    recv_mono = time.monotonic()
     ts = _parse_bundle_timestamp(
         manager,
         msg=msg,
@@ -395,6 +397,7 @@ def ingest_telemetry(
             value=(ts, sig),
         )
     manager._telemetry_last_bundle_ts[device_id] = ts
+    manager._telemetry_last_recv_mono[device_id] = recv_mono
     _touch_lru(manager._telemetry_device_order, device_id)
     if bad_signals:
         _emit_ingest_error(
@@ -411,7 +414,7 @@ def ingest_telemetry(
         "version": 1,
         "device_id": device_id,
         "seq": seq,
-        "ts": {"t_wall": ts.t_wall, "t_mono": ts.t_mono},
+        "ts": {"t_wall": ts.t_wall, "t_mono": ts.t_mono, "t_mono_recv": recv_mono},
         "signals": raw_signals,
     }
     # Forward driver-side per-call telemetry exceptions verbatim so the UI

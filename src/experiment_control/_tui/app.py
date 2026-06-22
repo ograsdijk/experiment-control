@@ -1150,7 +1150,9 @@ class ManagerTUI(App):
                     continue
                 ts = entry.get("ts", {})
                 age = None
-                if isinstance(ts, dict) and "t_mono" in ts:
+                if isinstance(ts, dict) and "t_mono_recv" in ts:
+                    age = max(0.0, time.monotonic() - float(ts["t_mono_recv"]))
+                elif isinstance(ts, dict) and "t_mono" in ts:
                     age = max(0.0, time.monotonic() - float(ts["t_mono"]))
                 telemetry.add_row(
                     name,

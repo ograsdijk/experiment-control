@@ -329,8 +329,11 @@ class FederationHub:
                     liveness = "DISCONNECTED"
 
         telemetry_age_s: float | None = None
+        latest_recv_mono = self._manager._telemetry_last_recv_mono.get(mirror.local_id)
         latest_ts = self._manager._telemetry_last_bundle_ts.get(mirror.local_id)
-        if latest_ts is not None:
+        if latest_recv_mono is not None:
+            telemetry_age_s = now_mono - latest_recv_mono
+        elif latest_ts is not None:
             telemetry_age_s = now_mono - latest_ts.t_mono
 
         return {
