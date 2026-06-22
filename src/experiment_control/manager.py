@@ -694,7 +694,18 @@ class Manager(
         self._publish_process_event("manager.process.restart_scheduled", handle)
 
     def list_processes(self) -> list[Json]:
-        return [self._process_snapshot(h) for h in self._processes.values()]
+        out: list[Json] = []
+        for h in self._processes.values():
+            snap = self._process_snapshot(h)
+            snap["source_kind"] = "local"
+            snap["is_remote"] = False
+            snap["owner_peer_id"] = None
+            out.append(snap)
+        # Federated (mirrored) processes appear as `is_remote` rows so the UIs can
+        # show them with a badge; local-first (id collisions are config-prevented).
+        out.extend(self._federation_hub.list_processes_snapshot())
+        out.sort(key=lambda item: str(item.get("process_id", "")))
+        return out
 
     def get_process(self, process_id: str) -> Json:
         handle = self._require_process(process_id)
