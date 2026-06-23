@@ -94,3 +94,28 @@ class SynthHD(_SynthHD):
 
     def get_temp_compensation_mode_channel_1(self) -> str:
         return self[1].temp_compensation_mode
+
+    # --- PLL lock status (per channel, read-only) ---
+    def get_lock_status(self, channel: int) -> bool:
+        return self[int(channel)].lock_status
+
+    def get_lock_status_channel_0(self) -> bool:
+        return self[0].lock_status
+
+    def get_lock_status_channel_1(self) -> bool:
+        return self[1].lock_status
+
+    # --- Frequency reference (device-wide) ---
+    def get_reference_mode(self) -> str:
+        return self.reference_mode
+
+    def set_reference_mode(self, mode: str) -> None:
+        self.reference_mode = mode
+
+    def get_reference_frequency(self) -> float:
+        """Reference frequency in Hz."""
+        return self.reference_frequency
+
+    def set_reference_frequency(self, freq_hz: float) -> None:
+        """Reference frequency in Hz."""
+        self.reference_frequency = float(freq_hz)
