@@ -18,6 +18,7 @@ class _Channel:
         self.enable = False
         self.phase = 0.0
         self.temp_compensation_mode = "10 sec"
+        self.lock_status = False
 
 
 class _BaseSynthHD:
@@ -25,6 +26,8 @@ class _BaseSynthHD:
         self.connected_port = port
         self.channels = [_Channel(), _Channel()]
         self.closed = False
+        self.reference_mode = "internal 27mhz"
+        self.reference_frequency = 27.0e6
 
     def __getitem__(self, channel: int) -> _Channel:
         return self.channels[int(channel)]
@@ -108,6 +111,31 @@ class SynthHDDriverTests(unittest.TestCase):
 
         self.assertEqual(driver.get_temp_compensation_mode_channel_0(), "none")
         self.assertEqual(driver.get_temp_compensation_mode_channel_1(), "on set")
+
+    def test_lock_status_methods(self) -> None:
+        driver = SynthHD("COM1")
+        driver.connect()
+
+        driver.channels[0].lock_status = True
+        driver.channels[1].lock_status = False
+
+        self.assertIs(driver.get_lock_status(0), True)
+        self.assertIs(driver.get_lock_status(1), False)
+        self.assertIs(driver.get_lock_status_channel_0(), True)
+        self.assertIs(driver.get_lock_status_channel_1(), False)
+
+    def test_reference_methods(self) -> None:
+        driver = SynthHD("COM1")
+        driver.connect()
+
+        self.assertEqual(driver.get_reference_mode(), "internal 27mhz")
+        self.assertEqual(driver.get_reference_frequency(), 27.0e6)
+
+        driver.set_reference_mode("external")
+        driver.set_reference_frequency(10.0e6)
+
+        self.assertEqual(driver.get_reference_mode(), "external")
+        self.assertEqual(driver.get_reference_frequency(), 10.0e6)
 
 
 if __name__ == "__main__":
