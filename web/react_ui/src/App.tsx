@@ -330,6 +330,7 @@ import {
 import { useSequencerController } from "./features/sequencer/useSequencerController";
 import { RingBuffer } from "./utils/ringBuffer";
 import { colorWithAlpha, traceColorAt } from "./utils/traceColors";
+import { copyToClipboard } from "./utils/clipboard";
 import { usePlotTick } from "./features/panels/PlotTickContext";
 import {
   CommandDeckCommandEntry,
@@ -2173,52 +2174,34 @@ export function App() {
   void _createCommandDeckTelemetryEntry;
 
   const copyJsonToClipboard = async (label: string, payload: unknown) => {
-    if (typeof navigator === "undefined" || !navigator.clipboard?.writeText) {
-      notifications.show({
-        color: "red",
-        title: "Clipboard unavailable",
-        message: "Clipboard API is not available in this browser context.",
-      });
-      return;
-    }
     const text = toPrettyJson(payload);
-    try {
-      await navigator.clipboard.writeText(text);
+    if (await copyToClipboard(text)) {
       notifications.show({
         color: "teal",
         title: `${label} copied`,
         message: "Copied JSON to clipboard.",
       });
-    } catch (error) {
+    } else {
       notifications.show({
         color: "red",
         title: `Failed to copy ${label.toLowerCase()}`,
-        message: error instanceof Error ? error.message : "Clipboard write failed.",
+        message: "Clipboard write failed.",
       });
     }
   };
 
   const copyTextToClipboard = async (label: string, text: string) => {
-    if (typeof navigator === "undefined" || !navigator.clipboard?.writeText) {
-      notifications.show({
-        color: "red",
-        title: "Clipboard unavailable",
-        message: "Clipboard API is not available in this browser context.",
-      });
-      return;
-    }
-    try {
-      await navigator.clipboard.writeText(text);
+    if (await copyToClipboard(text)) {
       notifications.show({
         color: "teal",
         title: `${label} copied`,
         message: "Copied text to clipboard.",
       });
-    } catch (error) {
+    } else {
       notifications.show({
         color: "red",
         title: `Failed to copy ${label.toLowerCase()}`,
-        message: error instanceof Error ? error.message : "Clipboard write failed.",
+        message: "Clipboard write failed.",
       });
     }
   };
