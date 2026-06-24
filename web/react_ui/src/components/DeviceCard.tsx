@@ -28,6 +28,7 @@ import {
   TelemetrySignal,
 } from "../types";
 import { DeviceNameInline } from "./DeviceNameInline";
+import { copyToClipboard } from "../utils/clipboard";
 
 type CapabilityParamMeta = NonNullable<CapabilityMember["params"]>[number];
 
@@ -200,18 +201,17 @@ export function DeviceCard({
     return { display: String(value), full: null as string | null, numeric: false };
   };
   const copyTelemetryValue = async (text: string) => {
-    try {
-      await navigator.clipboard.writeText(text);
+    if (await copyToClipboard(text)) {
       notifications.show({
         color: "teal",
         title: "Telemetry value copied",
         message: text,
       });
-    } catch (error) {
+    } else {
       notifications.show({
         color: "red",
         title: "Copy failed",
-        message: error instanceof Error ? error.message : "Clipboard write failed",
+        message: "Clipboard write failed",
       });
     }
   };
