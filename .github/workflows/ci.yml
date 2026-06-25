@@ -34,7 +34,7 @@ jobs:
           cache-dependency-path: web/react_ui/package-lock.json
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@v8
+        uses: astral-sh/setup-uv@v7
 
       - name: Sync Python dependencies
         run: uv sync
@@ -98,7 +98,7 @@ jobs:
           python-version: "3.13"
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@v8
+        uses: astral-sh/setup-uv@v7
 
       - name: Sync Python dependencies
         run: uv sync
