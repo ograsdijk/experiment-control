@@ -128,7 +128,10 @@ class FederationHubCapabilityTests(unittest.TestCase):
         hub = FederationHub(
             ctx=zmq.Context.instance(),
             poller=zmq.Poller(),
-            manager=SimpleNamespace(_telemetry_last_bundle_ts={}),
+            manager=SimpleNamespace(
+                _telemetry_last_bundle_ts={},
+                _telemetry_last_recv_mono={},
+            ),
             config=cfg,
             instance_id="lab1",
         )
@@ -233,6 +236,7 @@ class FederationHubWarmupTests(unittest.TestCase):
             manager=SimpleNamespace(
                 _publish_manager_event=lambda *a, **k: None,
                 _telemetry_last_bundle_ts={},
+                _telemetry_last_recv_mono={},
             ),
             config=cfg,
             instance_id="lab1",
