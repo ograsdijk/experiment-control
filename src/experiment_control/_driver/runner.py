@@ -903,12 +903,29 @@ class DeviceRunner:
 
     def _rpc_route_connect_device(self, req: dict[str, Any]) -> dict[str, Any]:
         req_id = req.get("id")
-        if self._device_state != DeviceState.DISCONNECTED:
+        # Only a genuinely healthy device counts as "already connected". An
+        # unexpected drop leaves the device in DEGRADED/FAULT (see
+        # _mark_device_unreachable / _apply_telemetry_quality_state) — never
+        # back in DISCONNECTED — so guarding on `!= DISCONNECTED` used to make
+        # a plain Connect a misleading no-op for a device that is actually
+        # gone. Treat any non-OK (or OK-but-unreachable) state as a request to
+        # re-establish the link.
+        if self._device_state == DeviceState.OK and self._device_reachable:
             return self._rpc_error(
                 req_id,
                 f"Device is already connected ({self._device_state.value})",
                 error_code="already_connected",
             )
+        # Recovery path: DEGRADED/FAULT/UNKNOWN may still hold an open-but-stale
+        # handle. Best-effort disconnect first (mirrors recover_device and
+        # auto-reconnect) so the subsequent connect starts clean. The transport
+        # may already be gone (e.g. unplugged), so a failing disconnect must not
+        # block the reconnect.
+        if self._device_state != DeviceState.DISCONNECTED:
+            try:
+                self.disconnect_device()
+            except Exception:
+                pass
         self._connect_called = True
         self.connect_device()
         self._device_reachable = True
