@@ -270,7 +270,13 @@ class ManagerTuiRpcTests(unittest.TestCase):
             self.assertFalse(app._default_topic_visibility("manager.telemetry_update"))
             self.assertFalse(app._default_topic_visibility("manager.heartbeat"))
             self.assertFalse(app._default_topic_visibility("manager.chunk_ready"))
+            self.assertFalse(
+                app._default_topic_visibility("manager.process_telemetry_update")
+            )
+            self.assertFalse(app._default_topic_visibility("manager.process.heartbeat"))
+            # Edge-triggered / low-volume topics stay visible by default.
             self.assertTrue(app._default_topic_visibility("manager.log"))
+            self.assertTrue(app._default_topic_visibility("manager.liveness"))
         finally:
             try:
                 if app._sub is not None:

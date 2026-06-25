@@ -102,6 +102,8 @@ class ManagerTUI(App):
             "manager.telemetry_update",
             "manager.heartbeat",
             "manager.chunk_ready",
+            "manager.process_telemetry_update",
+            "manager.process.heartbeat",
         }
     )
     _VALID_PUB_QUEUE_OVERFLOW_POLICIES = frozenset({"drop_newest", "drop_oldest"})
