@@ -215,9 +215,42 @@ export function DeviceCard({
       });
     }
   };
-  const disconnected =
-    String(device.device_state ?? "").toUpperCase() === "DISCONNECTED" ||
-    String(device.liveness ?? "").toUpperCase() === "DISCONNECTED";
+  const deviceStateUpper = String(device.device_state ?? "").toUpperCase();
+  const livenessUpper = String(device.liveness ?? "").toUpperCase();
+  const driverOffline = livenessUpper === "OFFLINE";
+  const healthy = deviceStateUpper === "OK" && livenessUpper === "ONLINE";
+  // Primary connection action. The driver performs a disconnect+reconnect for
+  // any non-OK state, so "Recover" and "Connect" call the same handler; the
+  // label just reflects whether the device dropped from a live session
+  // (Recover) or is cleanly/never connected (Connect).
+  let connectAction: {
+    label: string;
+    color: string;
+    onClick: () => void;
+    disabled: boolean;
+  };
+  if (driverOffline) {
+    // Driver process not reporting — a device-level connect RPC can't reach it;
+    // steer the operator to Restart driver instead.
+    connectAction = { label: "Connect", color: "gray", onClick: onConnect, disabled: true };
+  } else if (healthy) {
+    connectAction = {
+      label: "Disconnect",
+      color: "yellow",
+      onClick: onDisconnect,
+      disabled: false,
+    };
+  } else if (
+    deviceStateUpper === "DISCONNECTED" ||
+    deviceStateUpper === "UNKNOWN" ||
+    deviceStateUpper === ""
+  ) {
+    connectAction = { label: "Connect", color: "gray", onClick: onConnect, disabled: false };
+  } else {
+    // DEGRADED / FAULT, or reachable-but-unhealthy (liveness DISCONNECTED while
+    // the driver is alive) — reconnect to clear the bad state.
+    connectAction = { label: "Recover", color: "orange", onClick: onConnect, disabled: false };
+  }
   return (
     <Stack gap="xs">
         <Group justify="space-between" align="center">
@@ -236,15 +269,18 @@ export function DeviceCard({
             <Button
               size="xs"
               variant="light"
-              color={disconnected ? "gray" : "yellow"}
-              onClick={disconnected ? onConnect : onDisconnect}
-              disabled={busy}
+              color={connectAction.color}
+              onClick={connectAction.onClick}
+              disabled={busy || connectAction.disabled}
             >
-              {disconnected ? "Connect" : "Disconnect"}
+              {connectAction.label}
             </Button>
-            <Tooltip label="Restart driver" withArrow>
+            <Tooltip
+              label={driverOffline ? "Driver offline — restart driver" : "Restart driver"}
+              withArrow
+            >
               <ActionIcon
-                variant="light"
+                variant={driverOffline ? "filled" : "light"}
                 color="red"
                 onClick={onRestart}
                 disabled={busy}
