@@ -53,6 +53,8 @@ def _ensure_cache_state(manager: Any) -> None:
     """
     if not hasattr(manager, "_telemetry_device_order"):
         manager._telemetry_device_order = {}
+    if not hasattr(manager, "_telemetry_last_recv_mono"):
+        manager._telemetry_last_recv_mono = {}
     if not hasattr(manager, "_chunk_device_order"):
         manager._chunk_device_order = {}
 
