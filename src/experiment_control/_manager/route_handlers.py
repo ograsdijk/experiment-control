@@ -659,6 +659,25 @@ def route_manager_identity(manager: Any, req: Json) -> Json:
     }
 
 
+def route_manager_ping(manager: Any, req: Json) -> Json:
+    """Return the manager's *current* wall clock for clock-skew probing.
+
+    Deliberately wall-only: a caller computes inter-host skew via a round-trip
+    (``skew = t_wall - (T1 + RTT/2)``) using its OWN monotonic clock to time the
+    round trip. The peer's monotonic clock is a different per-machine epoch and
+    is not comparable across hosts, so returning it would only invite a wrong
+    comparison. See ``cli/clock_skew_probe.py``.
+    """
+    del req
+    return {
+        "ok": True,
+        "result": {
+            "t_wall": time.time(),
+            "instance_id": manager._instance_id,
+        },
+    }
+
+
 def route_manager_cleanup_orphans(manager: Any, req: Json) -> Json:
     params = req.get("params", {})
     if params is None:
@@ -848,6 +867,9 @@ class RouteHandlersMixin:
 
     def _route_manager_identity(self, req: Json) -> Json:
         return route_manager_identity(self, req)
+
+    def _route_manager_ping(self, req: Json) -> Json:
+        return route_manager_ping(self, req)
 
     def _route_manager_cleanup_orphans(self, req: Json) -> Json:
         return route_manager_cleanup_orphans(self, req)

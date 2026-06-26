@@ -64,6 +64,7 @@ class RequestRoutingMixin(_MixinBase):
             handlers={
                 "manager.control.shutdown": self._route_manager_shutdown,
                 "manager.info.identity": self._route_manager_identity,
+                "manager.info.ping": self._route_manager_ping,
                 "manager.control.cleanup_orphans": self._route_manager_cleanup_orphans,
                 "manager.logs.publish": self._route_manager_log_publish,
                 "manager.logs.tail": self._route_manager_log_tail,

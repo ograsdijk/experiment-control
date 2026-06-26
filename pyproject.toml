@@ -32,6 +32,7 @@ override-dependencies = [
 experiment-control = "experiment_control:main"
 experiment-control-stack = "experiment_control.cli.run_stack:main"
 experiment-control-instance-lock-status = "experiment_control.cli.instance_lock_status:main"
+experiment-control-clock-skew-probe = "experiment_control.cli.clock_skew_probe:main"
 
 [build-system]
 requires = ["uv_build>=0.9.26,<0.11.0"]

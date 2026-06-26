@@ -99,6 +99,36 @@ class ManagerDriverPubBoundsTests(unittest.TestCase):
         self.assertNotIn("dev-1", mgr._telemetry_last_bundle_ts)
         self.assertEqual(int(getattr(mgr, "_telemetry_cache_evicted_devices", 0)), 1)
 
+    def test_telemetry_republish_stamps_wall_recv(self) -> None:
+        mgr = _build_manager_stub()
+        mgr._telemetry_cache_max_devices = 4
+        mgr._telemetry_cache_max_signals_per_device = 8
+
+        before = time.time()
+        ingest_telemetry(
+            mgr,
+            {
+                "device_id": "dev-1",
+                "seq": 1,
+                # Source bundle clock, distinct from this manager's "now".
+                "ts": {"t_wall": 1.0, "t_mono": 1.0},
+                "signals": {"x": {"value": 1.0, "quality": "OK"}},
+            },
+            telemetry_signal_cls=_TelemetrySignal,
+            timestamp_cls=_Timestamp,
+            telemetry_quality_enum=_TelemetryQuality,
+        )
+        after = time.time()
+
+        published = [p for (topic, p) in mgr.events if topic == "manager.telemetry_update"]
+        self.assertEqual(len(published), 1)
+        ts = published[0]["ts"]
+        # Source clock preserved verbatim...
+        self.assertEqual(ts["t_wall"], 1.0)
+        # ...while t_wall_recv is THIS manager's fresh wall clock at ingest.
+        self.assertGreaterEqual(ts["t_wall_recv"], before)
+        self.assertLessEqual(ts["t_wall_recv"], after)
+
     def test_telemetry_signal_cache_is_bounded_per_device(self) -> None:
         mgr = _build_manager_stub()
         mgr._telemetry_cache_max_devices = 4
