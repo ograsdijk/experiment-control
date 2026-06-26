@@ -29,9 +29,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import statistics
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import yaml
@@ -130,17 +132,30 @@ def _measure_peer(
     A fresh DEALER per peer (via ManagerClient) keeps reply correlation simple
     and isolates an unreachable peer from the others.
     """
-    # Imported lazily so peer discovery / --help never pays the zmq import cost
-    # path twice; ManagerClient owns its own socket lifecycle.
+    # Imported lazily (not at module top) so peer discovery and --help stay
+    # cheap and don't import manager_client's transitive deps. ManagerClient
+    # owns its own socket lifecycle.
     from ..manager_client import ManagerClient
 
-    client = ManagerClient(
-        ctx=ctx,
-        manager_rpc=router_rpc,
-        manager_pub="",
-        rpc_timeout_ms=rpc_timeout_ms,
-        subscribe_telemetry=False,
-    )
+    try:
+        client = ManagerClient(
+            ctx=ctx,
+            manager_rpc=router_rpc,
+            manager_pub="",
+            rpc_timeout_ms=rpc_timeout_ms,
+            subscribe_telemetry=False,
+        )
+    except Exception as exc:
+        # A malformed endpoint makes zmq connect() raise synchronously here.
+        # Report this peer unreachable rather than aborting the whole run.
+        return {
+            "peer_id": peer_id,
+            "router_rpc": router_rpc,
+            "samples_ok": 0,
+            "samples_failed": max(1, samples),
+            "reachable": False,
+            "error": f"connect failed: {exc}",
+        }
     pairs: list[tuple[float, float]] = []  # (rtt_s, skew_s)
     errors = 0
     try:
@@ -160,7 +175,13 @@ def _measure_peer(
                 continue
             result = resp.get("result")
             t_peer = result.get("t_wall") if isinstance(result, dict) else None
-            if not isinstance(t_peer, (int, float)):
+            # bool is an int subclass; exclude it, and reject non-finite values
+            # so a bad peer can't poison the skew or emit invalid JSON (--json).
+            if (
+                not isinstance(t_peer, (int, float))
+                or isinstance(t_peer, bool)
+                or not math.isfinite(t_peer)
+            ):
                 errors += 1
                 continue
             rtt = m2 - m1
@@ -204,7 +225,12 @@ def _measure_peer(
 def _format_peer(s: dict) -> str:
     head = f"peer={s['peer_id']!r} router_rpc={s['router_rpc']!r}"
     if not s.get("reachable"):
-        return f"{head} UNREACHABLE (ok={s['samples_ok']} failed={s['samples_failed']})"
+        err = s.get("error")
+        suffix = f" ({err})" if err else ""
+        return (
+            f"{head} UNREACHABLE "
+            f"(ok={s['samples_ok']} failed={s['samples_failed']}){suffix}"
+        )
     ms = 1000.0
     return (
         f"{head}\n"
@@ -228,6 +254,13 @@ def main(argv: list[str] | None = None) -> int:
             f"(pass --stack or --peer)\n"
         )
         return 2
+    except Exception as exc:
+        # Malformed stack.yaml (yaml error, unexpected structure, ...): fail
+        # with a clean message instead of a traceback.
+        sys.stderr.write(
+            f"clock_skew_probe: could not read peers from {ns.stack!r}: {exc}\n"
+        )
+        return 2
     if not peers:
         sys.stderr.write(
             "clock_skew_probe: no federation peers found "
@@ -237,8 +270,10 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     ctx = zmq.Context.instance()
-    results = [
-        _measure_peer(
+
+    def _probe(peer: tuple[str, str]) -> dict:
+        peer_id, router_rpc = peer
+        return _measure_peer(
             ctx,
             peer_id,
             router_rpc,
@@ -246,8 +281,11 @@ def main(argv: list[str] | None = None) -> int:
             rpc_timeout_ms=ns.rpc_timeout_ms,
             interval_s=ns.interval_s,
         )
-        for peer_id, router_rpc in peers
-    ]
+
+    # Probe peers concurrently: each gets its own DEALER socket and zmq.Context
+    # is thread-safe. .map preserves peer order in the output.
+    with ThreadPoolExecutor(max_workers=min(len(peers), 8)) as executor:
+        results = list(executor.map(_probe, peers))
 
     if ns.json:
         sys.stdout.write(json.dumps(results, sort_keys=True) + "\n")
