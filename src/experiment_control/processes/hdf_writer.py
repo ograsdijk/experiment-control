@@ -191,6 +191,12 @@ def _create_device_dataset(
     device_group = telemetry_group.require_group(device_id)
 
     fields: list[tuple[str, Any]] = [("t_wall", np.float64), ("t_mono", np.float64)]
+    # Wall clock of the manager when the bundle was ingested (NaN if absent).
+    # For a federated device this is the consuming host's clock, so
+    # `t_wall_recv - t_wall` = clock_skew + transport_latency; pair it with a
+    # round-trip skew measurement (cli/clock_skew_probe.py) to recover per-sample
+    # one-way latency offline. For a local device it is just pipeline latency.
+    fields.append(("t_wall_recv", np.float64))
     fields.append(("seq", np.int64))
     for name, dtype_str in zip(signals, dtypes, strict=True):
         fields.append((name, _dtype_for(dtype_str)))
@@ -3126,6 +3132,7 @@ class HdfWriter(ManagedProcessBase):
             ts = msg.get("ts", {})
             t_wall = float(ts.get("t_wall", np.nan))
             t_mono = float(ts.get("t_mono", np.nan))
+            t_wall_recv = float(ts.get("t_wall_recv", np.nan))
             seq = int(msg.get("seq", -1))
             sigs = msg.get("signals", {})
             if not isinstance(sigs, dict):
@@ -3143,6 +3150,7 @@ class HdfWriter(ManagedProcessBase):
             row = batch[used]
             row["t_wall"] = t_wall
             row["t_mono"] = t_mono
+            row["t_wall_recv"] = t_wall_recv
             row["seq"] = seq
 
             for name, dtype_str in zip(signals, dtypes, strict=True):

@@ -2,6 +2,7 @@
 
 import io
 import sys
+import time
 from pathlib import Path
 import unittest
 from contextlib import redirect_stderr
@@ -260,6 +261,30 @@ class ManagerLifecycleRecoveryTests(unittest.TestCase):
         self.assertIsInstance(summary, dict)
         assert isinstance(summary, dict)
         self.assertEqual(summary.get("matched"), 1)
+
+    def test_manager_ping_returns_fresh_wall_clock(self) -> None:
+        mgr = object.__new__(Manager)
+        mgr._instance_id = "vacuum"  # type: ignore[attr-defined]
+        before = time.time()
+        resp = Manager._route_internal_request(
+            mgr,  # type: ignore[arg-type]
+            {"type": "manager.info.ping"},
+        )
+        after = time.time()
+        self.assertTrue(resp.get("ok"))
+        result = resp.get("result", {})
+        self.assertIsInstance(result, dict)
+        assert isinstance(result, dict)
+        self.assertEqual(result.get("instance_id"), "vacuum")
+        t_wall = result.get("t_wall")
+        self.assertIsInstance(t_wall, float)
+        assert isinstance(t_wall, float)
+        # Fresh "now", not a cached/start time.
+        self.assertGreaterEqual(t_wall, before)
+        self.assertLessEqual(t_wall, after)
+        # Wall-only by design: a peer monotonic clock is not comparable
+        # cross-host, so it must not be advertised.
+        self.assertNotIn("t_mono", result)
 
     def test_manager_cleanup_orphans_rpc(self) -> None:
         mgr = object.__new__(Manager)

@@ -1028,6 +1028,84 @@ class HdfWriterCompressionTests(unittest.TestCase):
                 self.assertEqual(ds.compression, "lzf")
                 self.assertEqual(ds.chunks, (64,))
 
+    def test_telemetry_dataset_has_t_wall_recv_column(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            h5_path = Path(td) / "recv_column.h5"
+            with h5py.File(h5_path, "w") as h5:
+                telemetry_group = h5.require_group("telemetry")
+                ds = _create_device_dataset(
+                    telemetry_group,
+                    "dev1",
+                    ["signal_a"],
+                    ["float64"],
+                    [""],
+                )
+                names = ds.dtype.names
+                assert names is not None
+                self.assertIn("t_wall_recv", names)
+                # Grouped with the other timestamps, ahead of seq + signals.
+                self.assertEqual(
+                    names[:4], ("t_wall", "t_mono", "t_wall_recv", "seq")
+                )
+
+    def test_telemetry_t_wall_recv_written_and_nan_when_absent(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            writer = self._make_writer(str(root))
+            h5_path = root / "recv_write.h5"
+            with h5py.File(h5_path, "w") as h5:
+                meta = writer._build_measurement_metadata(  # noqa: SLF001
+                    profile_id=None, values=None, require_profile=False
+                )
+                with writer._h5_lock:  # noqa: SLF001
+                    writer._configure_active_file(  # noqa: SLF001
+                        h5,
+                        write_every_s=1.0,
+                        load_manager_state=False,
+                        measurement_meta=meta,
+                    )
+                    # Inject a device dataset + map entry so _ensure_device
+                    # short-circuits (no schema RPC needed).
+                    assert writer._telemetry_group is not None  # noqa: SLF001
+                    ds = _create_device_dataset(
+                        writer._telemetry_group,  # noqa: SLF001
+                        "dev1",
+                        ["signal_a"],
+                        ["float64"],
+                        [""],
+                    )
+                    writer._datasets["dev1"] = ds  # noqa: SLF001
+                    writer._device_map["dev1"] = {  # noqa: SLF001
+                        "signals": ["signal_a"],
+                        "dtypes": ["float64"],
+                    }
+                    writer._write_buffered_rows_batch(  # noqa: SLF001
+                        [
+                            {
+                                "device_id": "dev1",
+                                "seq": 0,
+                                "ts": {
+                                    "t_wall": 100.0,
+                                    "t_mono": 5.0,
+                                    "t_wall_recv": 100.25,
+                                },
+                                "signals": {"signal_a": {"value": 1.0}},
+                            },
+                            {
+                                "device_id": "dev1",
+                                "seq": 1,
+                                # No t_wall_recv (e.g. an older manager).
+                                "ts": {"t_wall": 101.0, "t_mono": 6.0},
+                                "signals": {"signal_a": {"value": 2.0}},
+                            },
+                        ]
+                    )
+
+                self.assertEqual(int(ds.shape[0]), 2)
+                self.assertAlmostEqual(float(ds[0]["t_wall_recv"]), 100.25)
+                self.assertAlmostEqual(float(ds[0]["t_wall"]), 100.0)
+                self.assertTrue(np.isnan(float(ds[1]["t_wall_recv"])))
+
     def test_stream_data_dataset_uses_lzf(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

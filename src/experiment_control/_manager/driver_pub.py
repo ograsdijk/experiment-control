@@ -344,6 +344,7 @@ def ingest_telemetry(
     if device_id is None:
         return
     recv_mono = time.monotonic()
+    recv_wall = time.time()
     ts = _parse_bundle_timestamp(
         manager,
         msg=msg,
@@ -416,7 +417,17 @@ def ingest_telemetry(
         "version": 1,
         "device_id": device_id,
         "seq": seq,
-        "ts": {"t_wall": ts.t_wall, "t_mono": ts.t_mono, "t_mono_recv": recv_mono},
+        "ts": {
+            "t_wall": ts.t_wall,
+            "t_mono": ts.t_mono,
+            "t_mono_recv": recv_mono,
+            # Wall clock of THIS manager when the bundle was ingested. For a
+            # federated device this is the consuming host's clock (the bundle is
+            # re-ingested here after relay), so `t_wall_recv - t_wall` =
+            # clock_skew + transport_latency; for a local device it is just the
+            # pipeline latency. Persisted per-row by the HDF writer.
+            "t_wall_recv": recv_wall,
+        },
         "signals": raw_signals,
     }
     # Forward driver-side per-call telemetry exceptions verbatim so the UI
