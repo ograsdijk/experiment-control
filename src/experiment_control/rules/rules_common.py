@@ -34,6 +34,21 @@ class TelemetryBinding:
     signal: str
     max_age_s: float
     required: bool = True
+    # When set, this binding reads PROCESS telemetry (manager
+    # process_telemetry cache) for `process_id` instead of device
+    # telemetry. Exactly one of device_id / process_id identifies the
+    # source; for a process binding `device_id` is "". Only consumers
+    # that opt in (parse_telemetry_bindings(allow_process=True)) accept
+    # process bindings.
+    process_id: str | None = None
+
+    @property
+    def source_kind(self) -> str:
+        return "process" if self.process_id is not None else "device"
+
+    @property
+    def source_id(self) -> str:
+        return self.process_id if self.process_id is not None else self.device_id
 
 
 def parse_version(
@@ -88,6 +103,7 @@ def parse_telemetry_bindings(
     path: list[str | int],
     default_max_age_s: float,
     require_nonempty: bool,
+    allow_process: bool = False,
 ) -> list[TelemetryBinding]:
     inputs_obj = optional_dict(inputs, path=path)
     telemetry_raw = normalize_list(inputs_obj.get("telemetry"), path=[*path, "telemetry"])
@@ -104,9 +120,33 @@ def parse_telemetry_bindings(
                 message="must be an object/dict",
             )
         alias = require_str(binding_raw.get("as"), path=[*path, "telemetry", i, "as"])
-        dev = require_str(
-            binding_raw.get("device"), path=[*path, "telemetry", i, "device"]
-        )
+        has_device = binding_raw.get("device") is not None
+        has_process = binding_raw.get("process") is not None
+        if has_device and has_process:
+            raise ConfigError(
+                path=_fmt_path([*path, "telemetry", i]),
+                message="binding must have exactly one of 'device' or 'process'",
+            )
+        if not has_device and not has_process:
+            raise ConfigError(
+                path=_fmt_path([*path, "telemetry", i]),
+                message="binding must have 'device' or 'process'",
+            )
+        if has_process and not allow_process:
+            raise ConfigError(
+                path=_fmt_path([*path, "telemetry", i, "process"]),
+                message="process telemetry bindings are not supported here; use 'device'",
+            )
+        if has_process:
+            process_id: str | None = require_str(
+                binding_raw.get("process"), path=[*path, "telemetry", i, "process"]
+            )
+            dev = ""
+        else:
+            process_id = None
+            dev = require_str(
+                binding_raw.get("device"), path=[*path, "telemetry", i, "device"]
+            )
         signal = require_str(
             binding_raw.get("signal"), path=[*path, "telemetry", i, "signal"]
         )
@@ -131,6 +171,7 @@ def parse_telemetry_bindings(
                 signal=signal,
                 max_age_s=max_age_val,
                 required=required_raw,
+                process_id=process_id,
             )
         )
     return telemetry

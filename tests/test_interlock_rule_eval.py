@@ -15,7 +15,11 @@ from experiment_control.processes.interlock import (
     _parse_ruleset,
     evaluate_interlock_rule,
 )
-from experiment_control.rules.rules_common import TelemetryBinding
+from experiment_control.rules.rules_common import (
+    TelemetryBinding,
+    parse_telemetry_bindings,
+)
+from experiment_control.utils.config_parsing import ConfigError
 
 
 class InterlockRuleEvalTests(unittest.TestCase):
@@ -238,6 +242,172 @@ class InterlockRuleEvalTests(unittest.TestCase):
         self.assertIsInstance(telemetry, list)
         assert isinstance(telemetry, list)
         self.assertEqual(telemetry[0].get("required"), False)
+
+
+class InterlockProcessTelemetryBindingTests(unittest.TestCase):
+    """Process-telemetry bindings (e.g. hdf_writer.writing_active) gating
+    a device reconfig RPC — the PXIe reconfig interlock pattern."""
+
+    def _writing_rule(self) -> Rule:
+        # Fail-open: allow when the writer telemetry is absent/stale (writer
+        # stopped), block only on a fresh writing_active == true.
+        return Rule(
+            rule_id="w1",
+            name="block-reconfig-while-writing",
+            device_id="pxie5171",
+            action="set_channel_range",
+            telemetry=[
+                TelemetryBinding(
+                    alias="writing",
+                    device_id="",
+                    signal="writing_active",
+                    max_age_s=5.0,
+                    required=False,
+                    process_id="hdf_writer",
+                )
+            ],
+            condition={
+                "or": [
+                    {"not": "${writing.ok}"},
+                    {"eq": ["${writing.value}", False]},
+                ]
+            },
+            on_block_message="HDF writer is recording",
+            on_block_code="HDF_WRITING_ACTIVE",
+            allow_transform_params=None,
+        )
+
+    def _eval(self, *, process_sample):
+        return evaluate_interlock_rule(
+            rule=self._writing_rule(),
+            cmd={"device_id": "pxie5171", "action": "set_channel_range", "params": {}},
+            telemetry_getter=lambda _dev, _sig: None,
+            process_telemetry_getter=lambda _proc, _sig: process_sample,
+            now_mono=10.0,
+        )
+
+    def test_blocks_when_writing_active_true(self) -> None:
+        verdict, _new_cmd, err = self._eval(
+            process_sample={"value": True, "quality": "OK", "age_s": 0.0}
+        )
+        self.assertEqual(verdict, "reject")
+        assert isinstance(err, dict)
+        self.assertEqual(err.get("code"), "HDF_WRITING_ACTIVE")
+
+    def test_allows_when_writing_active_false(self) -> None:
+        verdict, _new_cmd, err = self._eval(
+            process_sample={"value": False, "quality": "OK", "age_s": 0.0}
+        )
+        self.assertEqual(verdict, "allow")
+        self.assertIsNone(err)
+
+    def test_allows_when_process_telemetry_missing(self) -> None:
+        # Writer stopped -> no telemetry -> fail-open allow.
+        verdict, _new_cmd, err = self._eval(process_sample=None)
+        self.assertEqual(verdict, "allow")
+        self.assertIsNone(err)
+
+    def test_quality_check_is_case_insensitive(self) -> None:
+        # publish_telemetry defaults quality to lowercase "ok"; a fresh
+        # writing_active==true must still BLOCK (binding counted healthy).
+        verdict, _new_cmd, err = self._eval(
+            process_sample={"value": True, "quality": "ok", "age_s": 0.0}
+        )
+        self.assertEqual(verdict, "reject")
+        assert isinstance(err, dict)
+        self.assertEqual(err.get("code"), "HDF_WRITING_ACTIVE")
+
+    def test_no_process_getter_treats_process_binding_as_missing(self) -> None:
+        # Default (no process_telemetry_getter) -> sample None -> fail-open.
+        verdict, _new_cmd, err = evaluate_interlock_rule(
+            rule=self._writing_rule(),
+            cmd={"device_id": "pxie5171", "action": "set_channel_range", "params": {}},
+            telemetry_getter=lambda _dev, _sig: None,
+            now_mono=10.0,
+        )
+        self.assertEqual(verdict, "allow")
+        self.assertIsNone(err)
+
+    def test_interlock_parses_process_binding(self) -> None:
+        # _parse_ruleset (interlock) passes allow_process=True.
+        ruleset = _parse_ruleset(
+            {
+                "interceptor_id": "i1",
+                "rules": [
+                    {
+                        "name": "block-reconfig",
+                        "match": {"device_id": "pxie5171", "action": "set_trigger"},
+                        "inputs": {
+                            "telemetry": [
+                                {
+                                    "as": "writing",
+                                    "process": "hdf_writer",
+                                    "signal": "writing_active",
+                                    "required": False,
+                                }
+                            ]
+                        },
+                        "condition": {"not": "${writing.ok}"},
+                    }
+                ],
+            },
+            source="inline-rules",
+        )
+        binding = ruleset.rules[0].telemetry[0]
+        self.assertEqual(binding.process_id, "hdf_writer")
+        self.assertEqual(binding.device_id, "")
+        self.assertEqual(binding.source_kind, "process")
+        self.assertEqual(binding.source_id, "hdf_writer")
+
+
+class TelemetryBindingParseTests(unittest.TestCase):
+    def _parse(self, binding: dict, *, allow_process: bool):
+        return parse_telemetry_bindings(
+            {"telemetry": [binding]},
+            path=["inputs"],
+            default_max_age_s=2.0,
+            require_nonempty=True,
+            allow_process=allow_process,
+        )
+
+    def test_process_binding_rejected_without_allow(self) -> None:
+        with self.assertRaises(ConfigError):
+            self._parse(
+                {"as": "w", "process": "hdf_writer", "signal": "writing_active"},
+                allow_process=False,
+            )
+
+    def test_process_binding_parsed_with_allow(self) -> None:
+        out = self._parse(
+            {"as": "w", "process": "hdf_writer", "signal": "writing_active"},
+            allow_process=True,
+        )
+        self.assertEqual(out[0].process_id, "hdf_writer")
+        self.assertEqual(out[0].device_id, "")
+
+    def test_device_binding_still_works(self) -> None:
+        out = self._parse(
+            {"as": "t", "device": "dev1", "signal": "temp"},
+            allow_process=True,
+        )
+        self.assertIsNone(out[0].process_id)
+        self.assertEqual(out[0].device_id, "dev1")
+
+    def test_both_device_and_process_rejected(self) -> None:
+        with self.assertRaises(ConfigError):
+            self._parse(
+                {
+                    "as": "x",
+                    "device": "dev1",
+                    "process": "hdf_writer",
+                    "signal": "s",
+                },
+                allow_process=True,
+            )
+
+    def test_neither_device_nor_process_rejected(self) -> None:
+        with self.assertRaises(ConfigError):
+            self._parse({"as": "x", "signal": "s"}, allow_process=True)
 
 
 if __name__ == "__main__":
