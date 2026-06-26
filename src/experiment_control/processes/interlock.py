@@ -334,6 +334,24 @@ def _optional_binding_env(
     }
 
 
+def _sample_for_binding(
+    binding: TelemetryBinding,
+    *,
+    telemetry_getter: Callable[[str, str], dict[str, Any] | None],
+    process_telemetry_getter: Callable[[str, str], dict[str, Any] | None] | None,
+) -> dict[str, Any] | None:
+    """Fetch the latest sample for a binding from the matching source.
+
+    Process bindings read process telemetry (None if no process getter is
+    wired); device bindings read device telemetry.
+    """
+    if binding.process_id is not None:
+        if process_telemetry_getter is None:
+            return None
+        return process_telemetry_getter(binding.process_id, binding.signal)
+    return telemetry_getter(binding.device_id, binding.signal)
+
+
 def _resolve_interlock_telemetry_env(
     *,
     rule: Rule,
@@ -343,14 +361,11 @@ def _resolve_interlock_telemetry_env(
 ) -> tuple[dict[str, Any], Json | None]:
     env: dict[str, Any] = {}
     for binding in rule.telemetry:
-        if binding.process_id is not None:
-            sample = (
-                process_telemetry_getter(binding.process_id, binding.signal)
-                if process_telemetry_getter is not None
-                else None
-            )
-        else:
-            sample = telemetry_getter(binding.device_id, binding.signal)
+        sample = _sample_for_binding(
+            binding,
+            telemetry_getter=telemetry_getter,
+            process_telemetry_getter=process_telemetry_getter,
+        )
         if sample is None:
             if not binding.required:
                 env[binding.alias] = to_attrdict(
