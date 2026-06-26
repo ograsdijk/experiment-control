@@ -8,6 +8,7 @@ import threading
 import time
 import uuid
 from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable, Literal, cast
 
@@ -491,6 +492,26 @@ class HdfWriter(ManagedProcessBase):
         self._bg_join_timeout_s = max(0.1, float(bg_join_timeout_s))
         self._active_h5_filename: str | None = None
         self._writing_active = False
+        # writing_active is also published as PROCESS telemetry (signal
+        # "writing_active") so an interlock can gate device reconfig RPCs
+        # on whether a run is being recorded. hdf_writer has no persistent
+        # ManagerClient, so we publish via the same manager.events.publish
+        # path ManagerClient.publish_telemetry uses (see
+        # _publish_writing_active_telemetry). Periodic so the value stays
+        # fresh for the interlock's max_age check; schema advertised once.
+        self._next_writing_active_publish_mono: float = 0.0
+        self._writing_active_schema_advertised = False
+        self._writing_active_publish_period_s = 1.0
+        # The publish does a synchronous manager RPC; run it on a dedicated
+        # single-worker executor so a slow/wedged manager can never stall
+        # the writer's main loop (which drains sockets + enqueues flushes).
+        # skip-if-inflight prevents pile-up. Bounded RPC timeout caps how
+        # long a stuck publish (and thus shutdown) can take.
+        self._telemetry_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="hdf-telemetry"
+        )
+        self._telemetry_future: Future | None = None
+        self._writing_active_rpc_timeout_ms = min(self._rpc_timeout_ms, 1000)
         # Coarse RLock serialising _h5 and stream-state access between the
         # main loop (drain handlers, RPC handlers, file rotation) and the
         # bg flush thread. Held briefly by the main loop on per-message
@@ -1171,6 +1192,86 @@ class HdfWriter(ManagedProcessBase):
                     self._active_h5_filename = None
                 self._writing_active = True
 
+    def process_telemetry_schema(self) -> list[dict[str, Any]] | None:
+        """Process telemetry signals published by the HDF writer.
+
+        ``writing_active`` (bool) drives the PXIe reconfig interlock and is
+        also recorded under ``/process_telemetry/hdf_writer``.
+        """
+        return [{"name": "writing_active", "dtype": "bool", "units": ""}]
+
+    def _schedule_writing_active_publish(self) -> None:
+        """Submit a writing_active publish to the telemetry executor.
+
+        Fire-and-forget off the main loop. Skips if a prior publish is
+        still in flight (e.g. a slow manager) so calls never pile up.
+        """
+        if not self._process_id:
+            return
+        fut = self._telemetry_future
+        if fut is not None and not fut.done():
+            return
+        try:
+            self._telemetry_future = self._telemetry_executor.submit(
+                self._publish_writing_active_telemetry
+            )
+        except Exception:
+            # Executor shut down (teardown) or rejected — best-effort.
+            self._bump_error("telemetry.writing_active_schedule")
+
+    def _publish_writing_active_telemetry(self) -> None:
+        """Publish ``writing_active`` as process telemetry.
+
+        Lets an interlock gate device reconfig RPCs on whether a run is
+        being recorded. hdf_writer keeps no persistent ManagerClient, so
+        we go through the same ``manager.events.publish`` ->
+        ``manager.process_telemetry_update`` path that
+        ``ManagerClient.publish_telemetry`` uses, via the ephemeral
+        ``_manager_rpc`` helper. Quality is the canonical ``"OK"`` so the
+        interlock resolver's quality check passes. Best-effort: a publish
+        failure bumps an error counter but never disrupts writing.
+        """
+        if not self._process_id:
+            return
+        ts = {"t_wall": time.time(), "t_mono": time.monotonic()}
+        try:
+            if not self._writing_active_schema_advertised:
+                _manager_rpc(
+                    self._ctx,
+                    self._manager_rpc,
+                    {
+                        "type": "manager.process_telemetry.schema.advertise",
+                        "process_id": self._process_id,
+                        "schema": self.process_telemetry_schema(),
+                    },
+                    timeout_ms=self._writing_active_rpc_timeout_ms,
+                )
+                self._writing_active_schema_advertised = True
+            _manager_rpc(
+                self._ctx,
+                self._manager_rpc,
+                {
+                    "type": "manager.events.publish",
+                    "topic": "manager.process_telemetry_update",
+                    "payload": {
+                        "process_id": self._process_id,
+                        "version": 1,
+                        "signals": {
+                            "writing_active": {
+                                "value": bool(self._writing_active),
+                                "units": "",
+                                "quality": "OK",
+                                "ts": ts,
+                            }
+                        },
+                        "ts": ts,
+                    },
+                },
+                timeout_ms=self._writing_active_rpc_timeout_ms,
+            )
+        except Exception:
+            self._bump_error("telemetry.writing_active")
+
     def _snapshot_main_loop_buffers(
         self,
     ) -> tuple[
@@ -1838,6 +1939,17 @@ class HdfWriter(ManagedProcessBase):
         # helper is a no-op if the thread was never started.
         self._shutdown_bg_thread()
 
+        # Stop the telemetry executor before super().close() terminates the
+        # zmq context — an in-flight publish holds a socket on self._ctx and
+        # term() would block on it. A wedged publish is bounded by the short
+        # writing-active RPC timeout. Guarded for object.__new__ test instances.
+        executor = getattr(self, "_telemetry_executor", None)
+        if executor is not None:
+            try:
+                executor.shutdown(wait=True)
+            except Exception:
+                self._bump_error("close.telemetry_executor")
+
         # HdfWriter-specific resources that the base class doesn't know
         # about. The SUB socket and any stream-data readers must be torn
         # down before super().close() terminates the zmq context.
@@ -2023,6 +2135,16 @@ class HdfWriter(ManagedProcessBase):
                             force_flush=should_force_flush,
                         )
                         self._next_write = now + write_every_s
+
+                    # Periodically publish writing_active so the interlock's
+                    # max_age freshness check holds while idle (fresh false
+                    # -> allow reconfig) and trips quickly once recording
+                    # starts (fresh true -> block).
+                    if now >= self._next_writing_active_publish_mono:
+                        self._schedule_writing_active_publish()
+                        self._next_writing_active_publish_mono = (
+                            now + self._writing_active_publish_period_s
+                        )
         except KeyboardInterrupt:
             self._stop_evt.set()
         finally:

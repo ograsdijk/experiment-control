@@ -1801,5 +1801,99 @@ class HdfWriterFlushBatchDeferTests(unittest.TestCase):
         self.assertEqual(published[-1][1].get("deferred_total"), 3)
 
 
+class WritingActiveTelemetryTests(unittest.TestCase):
+    def test_process_telemetry_schema_declares_writing_active(self) -> None:
+        proc = object.__new__(HdfWriter)
+        schema = proc.process_telemetry_schema()
+        self.assertEqual(
+            schema, [{"name": "writing_active", "dtype": "bool", "units": ""}]
+        )
+
+    def test_publish_writing_active_sends_schema_then_signal(self) -> None:
+        import experiment_control.processes.hdf_writer as hw
+
+        calls: list[dict] = []
+
+        def _fake_rpc(_ctx, _endpoint, payload, timeout_ms=2000):
+            calls.append(payload)
+            return {"ok": True}
+
+        proc = object.__new__(HdfWriter)
+        proc._process_id = "hdf_writer"
+        proc._ctx = None
+        proc._manager_rpc = "tcp://127.0.0.1:1"
+        proc._rpc_timeout_ms = 2000
+        proc._writing_active_rpc_timeout_ms = 1000
+        proc._writing_active = True
+        proc._writing_active_schema_advertised = False
+
+        orig = hw._manager_rpc
+        hw._manager_rpc = _fake_rpc
+        try:
+            proc._publish_writing_active_telemetry()
+            # second call: schema already advertised, only the signal goes out
+            proc._publish_writing_active_telemetry()
+        finally:
+            hw._manager_rpc = orig
+
+        # First pass: schema advertise + telemetry publish; second pass: publish only.
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(
+            calls[0]["type"], "manager.process_telemetry.schema.advertise"
+        )
+        self.assertEqual(calls[1]["type"], "manager.events.publish")
+        self.assertEqual(calls[1]["topic"], "manager.process_telemetry_update")
+        sig = calls[1]["payload"]["signals"]["writing_active"]
+        self.assertEqual(sig["value"], True)
+        self.assertEqual(sig["quality"], "OK")
+        self.assertEqual(calls[2]["type"], "manager.events.publish")
+
+    def test_schedule_skips_when_previous_publish_in_flight(self) -> None:
+        submitted: list = []
+
+        class _Fut:
+            def __init__(self, done: bool) -> None:
+                self._done = done
+
+            def done(self) -> bool:
+                return self._done
+
+        class _Exec:
+            def submit(self, fn, *a, **k):
+                submitted.append(fn)
+                return _Fut(False)
+
+        proc = object.__new__(HdfWriter)
+        proc._process_id = "hdf_writer"
+        proc._telemetry_executor = _Exec()
+        proc._telemetry_future = None
+
+        # First schedule submits.
+        proc._schedule_writing_active_publish()
+        self.assertEqual(len(submitted), 1)
+        # Second schedule while the future is not done -> skip (no pile-up).
+        proc._schedule_writing_active_publish()
+        self.assertEqual(len(submitted), 1)
+        # Once the prior future is done, a new schedule submits again.
+        proc._telemetry_future = _Fut(True)
+        proc._schedule_writing_active_publish()
+        self.assertEqual(len(submitted), 2)
+
+    def test_schedule_noop_without_process_id(self) -> None:
+        submitted: list = []
+
+        class _Exec:
+            def submit(self, fn, *a, **k):
+                submitted.append(fn)
+                return None
+
+        proc = object.__new__(HdfWriter)
+        proc._process_id = ""
+        proc._telemetry_executor = _Exec()
+        proc._telemetry_future = None
+        proc._schedule_writing_active_publish()
+        self.assertEqual(submitted, [])
+
+
 if __name__ == "__main__":
     unittest.main()

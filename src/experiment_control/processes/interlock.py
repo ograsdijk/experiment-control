@@ -138,6 +138,7 @@ def _parse_interlock_rule(
         path=["rules", rule_index, "inputs"],
         default_max_age_s=default_max_age_s,
         require_nonempty=False,
+        allow_process=True,
     )
     if "condition" not in rule_raw:
         raise ConfigError(
@@ -274,7 +275,8 @@ def _telemetry_error(
 ) -> Json:
     details: Json = {
         "binding": binding.alias,
-        "device": binding.device_id,
+        "device": binding.device_id or None,
+        "process": binding.process_id,
         "signal": binding.signal,
         "max_age_s": binding.max_age_s,
     }
@@ -325,7 +327,8 @@ def _optional_binding_env(
         "t_wall": None if sample is None else sample.get("t_wall"),
         "age_s": age_s,
         "reason": reason,
-        "device": binding.device_id,
+        "device": binding.device_id or None,
+        "process": binding.process_id,
         "signal": binding.signal,
         "max_age_s": binding.max_age_s,
     }
@@ -336,10 +339,18 @@ def _resolve_interlock_telemetry_env(
     rule: Rule,
     telemetry_getter: Callable[[str, str], dict[str, Any] | None],
     now_mono: float,
+    process_telemetry_getter: Callable[[str, str], dict[str, Any] | None] | None = None,
 ) -> tuple[dict[str, Any], Json | None]:
     env: dict[str, Any] = {}
     for binding in rule.telemetry:
-        sample = telemetry_getter(binding.device_id, binding.signal)
+        if binding.process_id is not None:
+            sample = (
+                process_telemetry_getter(binding.process_id, binding.signal)
+                if process_telemetry_getter is not None
+                else None
+            )
+        else:
+            sample = telemetry_getter(binding.device_id, binding.signal)
         if sample is None:
             if not binding.required:
                 env[binding.alias] = to_attrdict(
@@ -354,13 +365,16 @@ def _resolve_interlock_telemetry_env(
                 continue
             err = _telemetry_error(
                 code="TELEMETRY_MISSING",
-                message=f"Telemetry missing for {binding.device_id}.{binding.signal}",
+                message=f"Telemetry missing for {binding.source_id}.{binding.signal}",
                 binding=binding,
                 sample=None,
             )
             return env, err
+        # Case-insensitive: device telemetry uses the canonical
+        # TelemetryQuality.OK ("OK"); process telemetry published via
+        # ProcessBase.publish_telemetry defaults to "ok". Both are healthy.
         quality = str(sample.get("quality", "MISSING"))
-        if quality != "OK":
+        if quality.upper() != "OK":
             if not binding.required:
                 env[binding.alias] = to_attrdict(
                     _optional_binding_env(
@@ -374,7 +388,7 @@ def _resolve_interlock_telemetry_env(
                 continue
             err = _telemetry_error(
                 code="TELEMETRY_NOT_OK",
-                message=f"Telemetry not OK for {binding.device_id}.{binding.signal}",
+                message=f"Telemetry not OK for {binding.source_id}.{binding.signal}",
                 binding=binding,
                 sample=sample,
             )
@@ -394,7 +408,7 @@ def _resolve_interlock_telemetry_env(
                 continue
             err = _telemetry_error(
                 code="TELEMETRY_MISSING",
-                message=f"Telemetry missing timestamp for {binding.device_id}.{binding.signal}",
+                message=f"Telemetry missing timestamp for {binding.source_id}.{binding.signal}",
                 binding=binding,
                 sample=sample,
             )
@@ -413,7 +427,7 @@ def _resolve_interlock_telemetry_env(
                 continue
             err = _telemetry_error(
                 code="TELEMETRY_STALE",
-                message=f"Telemetry stale for {binding.device_id}.{binding.signal}",
+                message=f"Telemetry stale for {binding.source_id}.{binding.signal}",
                 binding=binding,
                 sample=sample,
             )
@@ -430,7 +444,8 @@ def _resolve_interlock_telemetry_env(
                 "t_wall": sample.get("t_wall"),
                 "age_s": float(age_s),
                 "reason": None,
-                "device": binding.device_id,
+                "device": binding.device_id or None,
+                "process": binding.process_id,
                 "signal": binding.signal,
                 "max_age_s": binding.max_age_s,
             }
@@ -506,6 +521,7 @@ def evaluate_interlock_rule(
     telemetry_getter: Callable[[str, str], dict[str, Any] | None],
     now_mono: float,
     on_condition_error: Callable[[BaseException], None] | None = None,
+    process_telemetry_getter: Callable[[str, str], dict[str, Any] | None] | None = None,
 ) -> tuple[str, Json | None, Json | None]:
     """Evaluate one interlock rule against a candidate command.
 
@@ -527,6 +543,7 @@ def evaluate_interlock_rule(
         rule=rule,
         telemetry_getter=telemetry_getter,
         now_mono=now_mono,
+        process_telemetry_getter=process_telemetry_getter,
     )
     if telemetry_err is not None:
         return "reject", None, telemetry_err
@@ -732,7 +749,8 @@ class InterlockProcess(ManagedProcessBase):
             "telemetry": [
                 {
                     "as": binding.alias,
-                    "device_id": binding.device_id,
+                    "device_id": binding.device_id or None,
+                    "process_id": binding.process_id,
                     "signal": binding.signal,
                     "max_age_s": binding.max_age_s,
                     "required": binding.required,
@@ -1179,6 +1197,7 @@ class InterlockProcess(ManagedProcessBase):
                     rule=rule,
                     cmd=cur_cmd,
                     telemetry_getter=self._require_manager().get_latest,
+                    process_telemetry_getter=self._require_manager().get_latest_process,
                     now_mono=now_mono,
                     on_condition_error=self._make_condition_error_callback(
                         interceptor_id=ruleset.interceptor_id,
