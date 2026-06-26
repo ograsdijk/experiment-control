@@ -1645,7 +1645,8 @@ class HdfWriter(ManagedProcessBase):
         self._reset_per_file_state()
 
         h5.attrs["timezone"] = self._timezone
-        h5.attrs["schema_version"] = 4
+        # 5: added per-row `t_wall_recv` column to telemetry datasets.
+        h5.attrs["schema_version"] = 5
         h5.attrs["created_at_wall"] = time.time()
         h5.attrs["manager_rpc_endpoint"] = self._manager_rpc
         h5.attrs["manager_pub_endpoint"] = self._manager_pub

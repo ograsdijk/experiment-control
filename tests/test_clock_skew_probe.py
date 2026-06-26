@@ -39,9 +39,18 @@ class _FakePeerManager:
     Echoes request_id so ManagerClient correlation succeeds.
     """
 
-    def __init__(self, ctx: zmq.Context, *, offset_s: float) -> None:
+    def __init__(
+        self,
+        ctx: zmq.Context,
+        *,
+        offset_s: float = 0.0,
+        t_wall_override: object = None,
+    ) -> None:
         self._ctx = ctx
         self._offset_s = offset_s
+        # When set, reply with this exact t_wall value (e.g. a bool / non-finite)
+        # instead of a real clock, to exercise the probe's validation.
+        self._t_wall_override = t_wall_override
         self._sock = ctx.socket(zmq.ROUTER)
         self.endpoint = f"inproc://fake-peer-{uuid.uuid4().hex}"
         self._sock.bind(self.endpoint)
@@ -71,13 +80,15 @@ class _FakePeerManager:
             request_id = (
                 payload.get("request_id") if isinstance(payload, dict) else None
             )
+            t_wall = (
+                self._t_wall_override
+                if self._t_wall_override is not None
+                else time.time() + self._offset_s
+            )
             reply = {
                 "request_id": request_id,
                 "ok": True,
-                "result": {
-                    "t_wall": time.time() + self._offset_s,
-                    "instance_id": "fake-peer",
-                },
+                "result": {"t_wall": t_wall, "instance_id": "fake-peer"},
             }
             try:
                 self._sock.send_multipart([identity, json_dumps(reply)])
@@ -148,6 +159,46 @@ class ClockSkewProbeTests(unittest.TestCase):
         self.assertEqual(summary["samples_ok"], 0)
         self.assertEqual(summary["samples_failed"], 1)
         self.assertNotIn("skew_s", summary)
+
+    def test_malformed_endpoint_reported_not_raised(self) -> None:
+        # A bad endpoint makes ManagerClient's zmq connect() raise in __init__;
+        # the probe must report that peer unreachable, not abort the run.
+        ctx = zmq.Context()
+        try:
+            summary = _measure_peer(
+                ctx,
+                "bad",
+                "bogus://nope",
+                samples=2,
+                rpc_timeout_ms=200,
+                interval_s=0.0,
+            )
+        finally:
+            ctx.term()
+        self.assertFalse(summary["reachable"])
+        self.assertEqual(summary["samples_ok"], 0)
+        self.assertIn("error", summary)
+        self.assertNotIn("skew_s", summary)
+
+    def test_non_numeric_t_wall_rejected(self) -> None:
+        # bool is an int subclass; it must not be accepted as a timestamp.
+        ctx = zmq.Context()
+        server = _FakePeerManager(ctx, t_wall_override=True)
+        try:
+            summary = _measure_peer(
+                ctx,
+                "boolpeer",
+                server.endpoint,
+                samples=3,
+                rpc_timeout_ms=1000,
+                interval_s=0.0,
+            )
+        finally:
+            server.stop()
+            ctx.term()
+        self.assertFalse(summary["reachable"])
+        self.assertEqual(summary["samples_ok"], 0)
+        self.assertEqual(summary["samples_failed"], 3)
 
     def test_parse_peer_arg(self) -> None:
         self.assertEqual(
