@@ -26,7 +26,7 @@ from .gateway import GatewaySettings, RouterRpcClient, StreamFrameHub, Telemetry
 from ..shm.shm_ring import ShmRingReader
 from ..utils.env import env_bool, env_float, env_int
 from ..utils.errors import TRANSIENT_CAPABILITIES_ERROR_CODES
-from ..utils.zmq_helpers import json_dumps as _orjson_dumps
+from ..utils.zmq_helpers import json_dumps as _orjson_dumps, safe_json_loads
 from ..utils.instance_lock import (
     derive_lock_effective_status,
     lock_effective_status_help,
@@ -2066,6 +2066,11 @@ def _workspace_filter_stream_message(
     workspace: str,
     allowed_output_kinds: set[str] | None,
 ) -> tuple[str, dict[str, Any], str] | None:
+    if isinstance(msg, str):
+        loaded = safe_json_loads(msg.encode("utf-8"))
+        if not isinstance(loaded, dict):
+            return None
+        msg = loaded
     if not isinstance(msg, dict):
         return None
     topic = str(msg.get("topic") or "").strip()
@@ -2273,6 +2278,8 @@ async def ws_stream_workspace(ws: WebSocket, workspace_id: str) -> None:
                 continue
             topic, payload, msg_workspace = filtered
 
+            decoded_msg = {"topic": topic, "payload": payload}
+
             if topic == "manager.stream_analysis.trace_ready":
                 handled = await _workspace_handle_trace_ready_message(
                     ws=ws,
@@ -2287,14 +2294,14 @@ async def ws_stream_workspace(ws: WebSocket, workspace_id: str) -> None:
                 handled = await _workspace_handle_trace_output_message(
                     ws=ws,
                     state=state,
-                    msg=msg,
+                    msg=decoded_msg,
                     payload=payload,
                     msg_workspace=msg_workspace,
                 )
                 if handled:
                     continue
 
-            await _ws_send_json(ws, msg)
+            await _ws_send_json(ws, decoded_msg)
     except WebSocketDisconnect:
         pass
     finally:
