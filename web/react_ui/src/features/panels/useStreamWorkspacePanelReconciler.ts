@@ -50,18 +50,19 @@ export function useStreamWorkspacePanelReconciler() {
       const next = prev.map((panel) => {
         if (isStreamTracePanel(panel) && panel.sourceMode === "dag") {
           const workspace = streamWorkspaces[panel.workspaceId] ?? null;
+          if (!workspace) {
+            return panel;
+          }
           const validTraceOutputIds = new Set(
-            workspace?.publishOutputs
+            workspace.publishOutputs
               .filter(
                 (entry) =>
                   workspaceOutputKind(workspace, entry.outputId) === "trace"
               )
-              .map((entry) => entry.outputId) ?? []
+              .map((entry) => entry.outputId)
           );
           const outputId =
-            panel.outputId &&
-            workspace &&
-            workspaceOutputKind(workspace, panel.outputId) === "trace"
+            panel.outputId && workspaceOutputKind(workspace, panel.outputId) === "trace"
               ? panel.outputId
               : defaultOutputForKind(workspace, "trace");
           const overlayOutputIds = (panel.overlayOutputIds ?? []).filter(

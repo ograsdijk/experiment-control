@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { normalizePlotState } from "./plot_state";
+import { normalizePlotState, serializePlotState } from "./plot_state";
 
 describe("plot_state normalizePlotState telemetry smoothing", () => {
   it("applies smoothing defaults for fallback telemetry panel", () => {
@@ -36,6 +36,83 @@ describe("plot_state normalizePlotState telemetry smoothing", () => {
     if (panel.kind === "telemetry") {
       expect(panel.smoothingMode).toBe("none");
       expect(panel.smoothingWindowS).toBe(1);
+    }
+  });
+
+  it("preserves DAG trace output selections", () => {
+    const state = normalizePlotState({
+      panels: [
+        {
+          id: "panel-1",
+          title: "Trace",
+          kind: "stream_raw",
+          sourceMode: "dag",
+          workspaceId: "detection_fluorescence",
+          outputId: "fluorescence_trace",
+          overlayOutputIds: ["absorption_trace"],
+          stream: { deviceId: "pxie5171", stream: "waveforms", shape: [5, 4096] },
+          overlayCount: 4,
+          channelIndex: 1,
+          traceDecimator: "lttb",
+          traceMaxPoints: 4096,
+          traceMaxFps: 20,
+          rollingWindow: 1,
+          averageMode: "latest",
+        },
+      ],
+      activePanelId: "panel-1",
+    });
+
+    const panel = state.panels[0];
+    expect(panel.kind).toBe("stream_raw");
+    if (panel.kind === "stream_raw") {
+      expect(panel.sourceMode).toBe("dag");
+      expect(panel.workspaceId).toBe("detection_fluorescence");
+      expect(panel.outputId).toBe("fluorescence_trace");
+      expect(panel.overlayOutputIds).toEqual(["absorption_trace"]);
+    }
+
+    const serialized = serializePlotState(state);
+    const roundTrip = normalizePlotState(serialized);
+    const roundTripPanel = roundTrip.panels[0];
+    expect(roundTripPanel.kind).toBe("stream_raw");
+    if (roundTripPanel.kind === "stream_raw") {
+      expect(roundTripPanel.sourceMode).toBe("dag");
+      expect(roundTripPanel.outputId).toBe("fluorescence_trace");
+      expect(roundTripPanel.overlayOutputIds).toEqual(["absorption_trace"]);
+    }
+  });
+
+  it("preserves DAG scalar output selection", () => {
+    const state = normalizePlotState({
+      panels: [
+        {
+          id: "panel-1",
+          title: "Scalar",
+          kind: "stream_scalar",
+          workspaceId: "detection_fluorescence",
+          outputId: "absorption_signal",
+          stream: { deviceId: "pxie5171", stream: "waveforms", shape: [5, 4096] },
+          channelIndex: 3,
+          timeWindowS: 120,
+        },
+      ],
+      activePanelId: "panel-1",
+    });
+
+    const panel = state.panels[0];
+    expect(panel.kind).toBe("stream_scalar");
+    if (panel.kind === "stream_scalar") {
+      expect(panel.workspaceId).toBe("detection_fluorescence");
+      expect(panel.outputId).toBe("absorption_signal");
+    }
+
+    const serialized = serializePlotState(state);
+    const roundTrip = normalizePlotState(serialized);
+    const roundTripPanel = roundTrip.panels[0];
+    expect(roundTripPanel.kind).toBe("stream_scalar");
+    if (roundTripPanel.kind === "stream_scalar") {
+      expect(roundTripPanel.outputId).toBe("absorption_signal");
     }
   });
 });

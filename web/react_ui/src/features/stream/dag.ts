@@ -528,12 +528,13 @@ export function normalizeDagNode(raw: unknown): StreamDagNodeConfig | null {
     return null;
   }
   const obj = raw as {
+    nodeId?: unknown;
     node_id?: unknown;
     op?: unknown;
     params?: unknown;
     inputs?: unknown;
   };
-  const nodeId = String(obj.node_id ?? "").trim();
+  const nodeId = String(obj.nodeId ?? obj.node_id ?? "").trim();
   const opText = String(obj.op ?? "").trim();
   const legacyMode =
     opText === "source.stream_average"
