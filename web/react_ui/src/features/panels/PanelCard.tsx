@@ -159,6 +159,7 @@ function PanelCardImpl({
   const {
     resolveTelemetryPanelOffset,
     streamTraceOverlaySeries,
+    streamExtraChannelSeries,
     streamBinStatsOverlaySeries,
     streamBinStatsFitOverlayCurves,
     isExpandablePlotPanel,
@@ -818,7 +819,12 @@ function PanelCardImpl({
           {isStreamRawPanel(panel) ? (
             <StreamRawPanel
               frames={streamFramesRef.get(panel.id) ?? []}
-              overlayCount={panel.overlayCount}
+              overlayCount={
+                panel.sourceMode === "raw" &&
+                (panel.extraChannelIndices?.length ?? 0) > 0
+                  ? 1
+                  : panel.overlayCount
+              }
               channelIndex={panel.sourceMode === "raw" ? panel.channelIndex : 0}
               tick={plotTick}
               colorScheme={computedColorScheme}
@@ -826,6 +832,8 @@ function PanelCardImpl({
               extraSeries={
                 panel.sourceMode === "dag"
                   ? streamTraceOverlaySeries(panel)
+                  : (panel.extraChannelIndices?.length ?? 0) > 0
+                  ? streamExtraChannelSeries(panel)
                   : []
               }
               yScaleMode={panel.yScaleMode}

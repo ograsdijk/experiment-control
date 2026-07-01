@@ -40,6 +40,9 @@ export interface PanelsGridHelpers {
   streamTraceOverlaySeries: (
     panel: PlotStreamPanelState | PlotStreamWaterfallPanelState
   ) => Array<{ label: string; values: number[] }>;
+  streamExtraChannelSeries: (
+    panel: PlotStreamPanelState | PlotStreamWaterfallPanelState
+  ) => Array<{ label: string; values: number[] }>;
   streamBinStatsOverlaySeries: (
     panel: PlotStreamBinStatsPanelState
   ) => Array<{ label: string; values: number[] }>;

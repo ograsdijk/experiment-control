@@ -83,6 +83,78 @@ describe("plot_state normalizePlotState telemetry smoothing", () => {
     }
   });
 
+  it("preserves multi-channel raw stream selections", () => {
+    const state = normalizePlotState({
+      panels: [
+        {
+          id: "panel-1",
+          title: "Trace",
+          kind: "stream_raw",
+          sourceMode: "raw",
+          workspaceId: "detection_fluorescence",
+          outputId: null,
+          overlayOutputIds: [],
+          extraChannelIndices: [1, 3, "2"],
+          stream: { deviceId: "pxie5171", stream: "waveforms", shape: [5, 4096] },
+          overlayCount: 4,
+          channelIndex: 0,
+          traceDecimator: "lttb",
+          traceMaxPoints: 4096,
+          traceMaxFps: 20,
+          rollingWindow: 1,
+          averageMode: "latest",
+        },
+      ],
+      activePanelId: "panel-1",
+    });
+
+    const panel = state.panels[0];
+    expect(panel.kind).toBe("stream_raw");
+    if (panel.kind === "stream_raw") {
+      expect(panel.channelIndex).toBe(0);
+      expect(panel.extraChannelIndices).toEqual([1, 3, 2]);
+    }
+
+    const serialized = serializePlotState(state);
+    const roundTrip = normalizePlotState(serialized);
+    const roundTripPanel = roundTrip.panels[0];
+    expect(roundTripPanel.kind).toBe("stream_raw");
+    if (roundTripPanel.kind === "stream_raw") {
+      expect(roundTripPanel.extraChannelIndices).toEqual([1, 3, 2]);
+    }
+  });
+
+  it("defaults extraChannelIndices to empty for legacy raw panels", () => {
+    const state = normalizePlotState({
+      panels: [
+        {
+          id: "panel-1",
+          title: "Trace",
+          kind: "stream_raw",
+          sourceMode: "raw",
+          workspaceId: "detection_fluorescence",
+          outputId: null,
+          overlayOutputIds: [],
+          stream: { deviceId: "pxie5171", stream: "waveforms", shape: [5, 4096] },
+          overlayCount: 4,
+          channelIndex: 2,
+          traceDecimator: "lttb",
+          traceMaxPoints: 4096,
+          traceMaxFps: 20,
+          rollingWindow: 1,
+          averageMode: "latest",
+        },
+      ],
+      activePanelId: "panel-1",
+    });
+
+    const panel = state.panels[0];
+    expect(panel.kind).toBe("stream_raw");
+    if (panel.kind === "stream_raw") {
+      expect(panel.extraChannelIndices).toEqual([]);
+    }
+  });
+
   it("preserves DAG scalar output selection", () => {
     const state = normalizePlotState({
       panels: [

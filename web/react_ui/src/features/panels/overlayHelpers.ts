@@ -21,6 +21,7 @@ import type {
 
 type TracePanel = PlotStreamPanelState | PlotStreamWaterfallPanelState;
 type TraceOverlayMap = Map<string, Map<string, { seq: number; values: number[] }>>;
+type ExtraChannelMap = Map<string, Map<number, { seq: number; values: number[] }>>;
 type BinStatsOverlayMap = Map<string, Map<string, { seq: number; values: number[] }>>;
 type BinStatsFitOverlayMap = Map<string, Map<string, StreamFitCurveSnapshot>>;
 
@@ -43,6 +44,35 @@ export function streamTraceOverlaySeries(
       label: outputId,
       values: entry.values,
     });
+  }
+  return out;
+}
+
+/**
+ * Extra-channel series for a multi-channel raw stream panel: one entry
+ * per `extraChannelIndices` channel, each carrying that channel's latest
+ * frame (populated by `applyRawStreamFrameToPanels`). Empty for
+ * single-channel panels, DAG panels, and waterfalls. Rendered as
+ * additional uPlot series via `StreamRawPanel`'s `extraSeries` prop.
+ */
+export function streamExtraChannelSeries(
+  panel: TracePanel,
+  extraChannelRef: ExtraChannelMap
+): Array<{ label: string; values: number[] }> {
+  if (panel.kind !== "stream_raw" || panel.sourceMode !== "raw") {
+    return [];
+  }
+  const byChannel = extraChannelRef.get(panel.id);
+  if (!byChannel || byChannel.size <= 0) {
+    return [];
+  }
+  const out: Array<{ label: string; values: number[] }> = [];
+  for (const channel of panel.extraChannelIndices ?? []) {
+    const entry = byChannel.get(Math.max(0, Math.trunc(channel)));
+    if (!entry || !Array.isArray(entry.values) || entry.values.length <= 0) {
+      continue;
+    }
+    out.push({ label: `ch ${channel}`, values: entry.values });
   }
   return out;
 }

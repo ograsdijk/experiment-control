@@ -119,6 +119,7 @@ export function usePanelLifecycle(args: PanelLifecycleArgs) {
     buffersRef,
     streamFramesRef,
     streamTraceOverlayRef,
+    streamExtraChannelRef,
     streamBinStatsOverlayRef,
     streamBinStatsFitOverlayRef,
     streamParamsLatestRef,
@@ -153,34 +154,41 @@ export function usePanelLifecycle(args: PanelLifecycleArgs) {
     let panel: PlotPanelState;
     if (kind === "stream_raw" || kind === "stream_waterfall") {
       const traceOutputId = defaultOutputForKind(workspaceConfig, "trace");
-      panel = {
+      const commonTrace = {
         id,
-        title:
-          kind === "stream_waterfall"
-            ? `Waterfall ${panelIdRef.current}`
-            : `Trace ${panelIdRef.current}`,
-        kind,
-        sourceMode: "raw",
+        sourceMode: "raw" as const,
         stream: null,
-        overlayCount:
-          kind === "stream_waterfall"
-            ? DEFAULT_WATERFALL_ROWS
-            : DEFAULT_STREAM_OVERLAY_COUNT,
         channelIndex: 0,
         workspaceId: defaultWorkspaceId ?? id,
         outputId: traceOutputId,
-        overlayOutputIds: [],
+        overlayOutputIds: [] as string[],
         traceDecimator: DEFAULT_TRACE_DECIMATOR,
         traceMaxPoints: DEFAULT_TRACE_MAX_POINTS,
         traceMaxFps: DEFAULT_TRACE_MAX_FPS,
         rollingWindow: DEFAULT_TRACE_ROLLING_WINDOW,
         averageMode: DEFAULT_TRACE_AVERAGE_MODE,
-        yScaleMode: "auto",
+        yScaleMode: "auto" as const,
         yMin: null,
         yMax: null,
       };
+      panel =
+        kind === "stream_raw"
+          ? {
+              ...commonTrace,
+              kind,
+              title: `Trace ${panelIdRef.current}`,
+              overlayCount: DEFAULT_STREAM_OVERLAY_COUNT,
+              extraChannelIndices: [],
+            }
+          : {
+              ...commonTrace,
+              kind,
+              title: `Waterfall ${panelIdRef.current}`,
+              overlayCount: DEFAULT_WATERFALL_ROWS,
+            };
       streamFramesRef.set(id, []);
       streamTraceOverlayRef.set(id, new Map());
+      streamExtraChannelRef.set(id, new Map());
     } else if (kind === "stream_scalar") {
       const integralOutputId = defaultOutputForKind(workspaceConfig, "scalar");
       panel = {
@@ -284,6 +292,7 @@ export function usePanelLifecycle(args: PanelLifecycleArgs) {
     buffersRef.delete(panelId);
     streamFramesRef.delete(panelId);
     streamTraceOverlayRef.delete(panelId);
+    streamExtraChannelRef.delete(panelId);
     streamBinStatsOverlayRef.delete(panelId);
     streamBinStatsFitOverlayRef.delete(panelId);
     streamParamsLatestRef.delete(panelId);

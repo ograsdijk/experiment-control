@@ -43,6 +43,9 @@ type Props = {
   onSetStreamPanelChannelIndex: ComponentProps<
     typeof StreamTraceOptionsModal
   >["onSetChannelIndex"];
+  onSetStreamPanelChannels: ComponentProps<
+    typeof StreamTraceOptionsModal
+  >["onSetChannels"];
   onSetStreamTraceWorkspace: ComponentProps<
     typeof StreamTraceOptionsModal
   >["onSetWorkspace"];
@@ -132,6 +135,7 @@ export function PlotModalsLayer({
   onSetStreamPanelAverageMode,
   onSetStreamPanelTargetFromKey,
   onSetStreamPanelChannelIndex,
+  onSetStreamPanelChannels,
   onSetStreamTraceWorkspace,
   onSetStreamTraceOutput,
   onSetStreamTraceOverlayOutputs,
@@ -190,6 +194,7 @@ export function PlotModalsLayer({
         onSetAverageMode={onSetStreamPanelAverageMode}
         onRawTargetKeyChange={onSetStreamPanelTargetFromKey}
         onSetChannelIndex={onSetStreamPanelChannelIndex}
+        onSetChannels={onSetStreamPanelChannels}
         onSetWorkspace={onSetStreamTraceWorkspace}
         onSetOutput={onSetStreamTraceOutput}
         onSetOverlayOutputs={onSetStreamTraceOverlayOutputs}

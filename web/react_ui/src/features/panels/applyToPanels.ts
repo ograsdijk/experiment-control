@@ -36,6 +36,7 @@ import {
   traceKeyId,
 } from "../stream/utils";
 import { RingBuffer } from "../../utils/ringBuffer";
+import { extractTrace } from "../../components/StreamRawPanel";
 
 /**
  * Pure (controlled-mutation) helpers that route WS-arriving stream
@@ -89,6 +90,10 @@ export interface ApplyHelpersDeps {
   streamTraceOverlayRef: Map<
     string,
     Map<string, { seq: number; values: number[] }>
+  >;
+  streamExtraChannelRef: Map<
+    string,
+    Map<number, { seq: number; values: number[] }>
   >;
   streamBinStatsOverlayRef: Map<
     string,
@@ -205,7 +210,14 @@ export function applyRawStreamFrameToPanels(
     ) {
       continue;
     }
-    if (Math.max(0, Math.trunc(panel.channelIndex)) !== subscription.channelIndex) {
+    const primaryChannel = Math.max(0, Math.trunc(panel.channelIndex));
+    const extraChannels =
+      panel.kind === "stream_raw" ? panel.extraChannelIndices ?? [] : [];
+    const isPrimaryChannel = primaryChannel === subscription.channelIndex;
+    const isExtraChannel = extraChannels.some(
+      (value) => Math.max(0, Math.trunc(value)) === subscription.channelIndex
+    );
+    if (!isPrimaryChannel && !isExtraChannel) {
       continue;
     }
     if (normalizeTraceDecimator(panel.traceDecimator) !== subscription.traceDecimator) {
@@ -221,6 +233,27 @@ export function applyRawStreamFrameToPanels(
       continue;
     }
     if (normalizeTraceAverageMode(panel.averageMode) !== subscription.averageMode) {
+      continue;
+    }
+    if (!isPrimaryChannel) {
+      // Extra channel: keep only the latest frame per channel (multi-
+      // channel mode plots one line per channel, latest frame only).
+      let byChannel = deps.streamExtraChannelRef.get(panel.id);
+      if (!byChannel) {
+        byChannel = new Map();
+        deps.streamExtraChannelRef.set(panel.id, byChannel);
+      }
+      const previous = byChannel.get(subscription.channelIndex);
+      if (previous && previous.seq === frame.seq) {
+        continue;
+      }
+      byChannel.set(subscription.channelIndex, {
+        seq: frame.seq,
+        // The socket is channel-specific and live frames arrive 1-D, but
+        // snapshot frames may be 2-D — extractTrace handles both.
+        values: extractTrace(frame, subscription.channelIndex).y,
+      });
+      updated = true;
       continue;
     }
     let currentFrames = deps.streamFramesRef.get(panel.id);

@@ -174,6 +174,13 @@ export type PlotStreamPanelState = {
   stream: StreamTarget | null;
   overlayCount: number;
   channelIndex: number;
+  /**
+   * Additional channels (beyond the primary `channelIndex`) plotted on
+   * the same raw stream panel. Empty for single-channel panels. When
+   * non-empty the panel is in "multi-channel" mode: one line per
+   * channel showing the latest frame only (overlay-N is ignored).
+   */
+  extraChannelIndices: number[];
   workspaceId: string;
   outputId: string | null;
   overlayOutputIds: string[];

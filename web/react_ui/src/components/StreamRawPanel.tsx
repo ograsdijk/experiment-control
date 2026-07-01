@@ -58,7 +58,7 @@ function toNumericList(raw: unknown): number[] {
   return out;
 }
 
-function extractTrace(
+export function extractTrace(
   frame: StreamFrame,
   channelIndex: number
 ): { y: number[]; channelCount: number } {

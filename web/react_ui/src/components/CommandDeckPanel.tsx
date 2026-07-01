@@ -689,10 +689,24 @@ export function CommandDeckPanel({
                                   const member = capabilities.find(
                                     (candidate) => candidate.name === entry.action
                                   );
-                                  const params =
+                                  const schemaParams =
                                     entry.targetKind === "process"
                                       ? (member?.params ?? [])
                                       : effectiveDeviceMemberParams(member);
+                                  // The capability schema loads asynchronously (and
+                                  // is skipped for disconnected/unregistered targets),
+                                  // so on a fresh page load it may be empty. Fall back
+                                  // to the persisted draft keys so saved param inputs
+                                  // stay visible until the real schema arrives.
+                                  const params =
+                                    schemaParams.length > 0
+                                      ? schemaParams.map((param) => ({
+                                          name: param.name,
+                                          required: Boolean(param.required),
+                                        }))
+                                      : Object.keys(entry.paramsDraft ?? {}).map(
+                                          (name) => ({ name, required: false })
+                                        );
                                   return params.length > 0 ? (
                                     params.map((param) => (
                                       <TextInput
