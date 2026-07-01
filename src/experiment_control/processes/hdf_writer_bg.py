@@ -64,6 +64,20 @@ class _StopWritingRequest(_BgRequest):
 
 
 @dataclass
+class _CaptureRunMetadataRequest(_BgRequest):
+    """Fire-and-forget request to capture per-device run metadata off the
+    main drain loop. The RPCs are slow (one blocking ``collect_run_metadata``
+    per device); running them inline in ``_configure_active_file`` stalled the
+    SUB drain and silently dropped telemetry. ``measurement_id`` is a staleness
+    token: if a stop/rotate replaced the active file between enqueue and
+    execution, the capture is skipped. Nobody blocks on ``response``.
+    """
+
+    configs: list[Json] = field(default_factory=list)
+    measurement_id: str = ""
+
+
+@dataclass
 class _MeasurementNoteRequest(_BgRequest):
     author: str = ""
     kind: str = ""

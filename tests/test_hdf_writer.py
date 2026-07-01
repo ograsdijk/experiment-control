@@ -1973,5 +1973,178 @@ class WritingActiveTelemetryTests(unittest.TestCase):
         self.assertEqual(submitted, [])
 
 
+class HdfWriterRunMetadataCaptureTests(unittest.TestCase):
+    """Regression tests for the file-open stall that silently dropped all
+    telemetry (config + datasets present, 0 telemetry rows, dropped_local=0).
+    Root cause: run-metadata capture ran its slow serial per-device RPCs
+    inline in _configure_active_file, blocking the single SUB-drain loop.
+    Fix: capture runs OFF the main loop (bg thread) with the RPCs parallelized.
+    """
+
+    def _open_writer_file(self, writer: HdfWriter, h5: h5py.File) -> None:
+        meta = writer._build_measurement_metadata(  # noqa: SLF001
+            profile_id=None, values=None, require_profile=False
+        )
+        with writer._h5_lock:  # noqa: SLF001
+            writer._configure_active_file(  # noqa: SLF001
+                h5,
+                write_every_s=1.0,
+                load_manager_state=False,
+                measurement_meta=meta,
+            )
+
+    def test_capture_run_metadata_runs_rpcs_in_parallel(self) -> None:
+        writer = _make_bg_test_writer()
+        lock = threading.Lock()
+        active = [0]
+        peak = [0]
+
+        def collect(*, device_id: str, action: str, timeout_ms: int) -> dict:
+            with lock:
+                active[0] += 1
+                peak[0] = max(peak[0], active[0])
+            time.sleep(0.3)
+            with lock:
+                active[0] -= 1
+            return {"device": device_id}
+
+        writer._call_optional_device_action = collect  # type: ignore[assignment]  # noqa: SLF001
+        configs = [{"device_id": f"d{i}"} for i in range(4)]
+        with _temp_dir() as td:
+            with h5py.File(Path(td) / "parallel.h5", "w") as h5:
+                self._open_writer_file(writer, h5)
+                t0 = time.monotonic()
+                writer._capture_run_metadata_for_configs(configs)  # noqa: SLF001
+                elapsed = time.monotonic() - t0
+                self.assertGreater(peak[0], 1, "collect RPCs did not run concurrently")
+                self.assertLess(elapsed, 4 * 0.3 * 0.8, "capture ran serially")
+                self.assertEqual(len(h5["run_metadata"]), 4)
+                self.assertIn("json", h5["run_metadata"]["d0"])
+
+    def test_capture_deferred_to_bg_thread(self) -> None:
+        writer = _make_bg_test_writer()
+        seen: dict[str, str] = {}
+        done = threading.Event()
+
+        def rec(configs, *, expected_measurement_id=None) -> None:  # noqa: ANN001
+            seen["thread"] = threading.current_thread().name
+            done.set()
+
+        writer._capture_run_metadata_for_configs = rec  # type: ignore[assignment]  # noqa: SLF001
+        thread = _spawn_bg_thread(writer)
+        try:
+            writer._enqueue_run_metadata_capture([{"device_id": "d0"}])  # noqa: SLF001
+            self.assertTrue(done.wait(2.0))
+            self.assertEqual(seen["thread"], "hdf-bg-flush")
+        finally:
+            writer._stop_evt.set()  # noqa: SLF001
+            writer._bg_queue.put(_BG_SENTINEL)  # noqa: SLF001
+            thread.join(timeout=1.0)
+
+    def test_capture_inline_fallback_when_no_bg_thread(self) -> None:
+        writer = _make_bg_test_writer()
+        seen: dict[str, str] = {}
+
+        def rec(configs, *, expected_measurement_id=None) -> None:  # noqa: ANN001
+            seen["thread"] = threading.current_thread().name
+
+        writer._capture_run_metadata_for_configs = rec  # type: ignore[assignment]  # noqa: SLF001
+        # No bg thread spawned -> _bg_thread is None -> inline fallback so
+        # metadata is never silently skipped.
+        writer._enqueue_run_metadata_capture([{"device_id": "d0"}])  # noqa: SLF001
+        self.assertEqual(seen["thread"], threading.current_thread().name)
+
+    def test_optional_device_action_accepts_status_ok_envelope(self) -> None:
+        """Device commands routed via the manager return the raw driver
+        envelope {"status": "OK", "result"} on success; only manager-level
+        failures use {"ok": False}. _call_optional_device_action must accept
+        both, else every collect_run_metadata is dropped (empty /run_metadata)."""
+        import experiment_control.processes.hdf_writer as hw
+
+        writer = _make_bg_test_writer()
+        orig = hw._manager_rpc
+        try:
+            hw._manager_rpc = (  # type: ignore[assignment]
+                lambda ctx, ep, payload, timeout_ms=2000: {
+                    "id": 1,
+                    "status": "OK",
+                    "result": {"sample_rate_hz": 1.0},
+                }
+            )
+            got = writer._call_optional_device_action(  # noqa: SLF001
+                device_id="d0", action="collect_run_metadata", timeout_ms=500
+            )
+            self.assertEqual(got, {"sample_rate_hz": 1.0})
+
+            hw._manager_rpc = (  # type: ignore[assignment]
+                lambda *a, **k: {"ok": False, "error": {"code": "driver_not_running"}}
+            )
+            self.assertIsNone(
+                writer._call_optional_device_action(  # noqa: SLF001
+                    device_id="d0", action="collect_run_metadata", timeout_ms=500
+                )
+            )
+
+            hw._manager_rpc = (  # type: ignore[assignment]
+                lambda *a, **k: {"id": 1, "status": "ERROR", "error": "disconnected"}
+            )
+            self.assertIsNone(
+                writer._call_optional_device_action(  # noqa: SLF001
+                    device_id="d0", action="collect_run_metadata", timeout_ms=500
+                )
+            )
+        finally:
+            hw._manager_rpc = orig  # type: ignore[assignment]
+
+    def test_start_writing_does_not_stall_on_slow_run_metadata(self) -> None:
+        """Load-manager-state file-open must return promptly even when
+        collect_run_metadata is slow — the capture is deferred to the bg
+        thread. This is the direct regression for the telemetry-loss stall."""
+        writer = _make_bg_test_writer()
+        writer._fetch_schema_with_backoff = lambda **k: None  # type: ignore[assignment]  # noqa: SLF001
+        writer._fetch_process_schema_best_effort = lambda: None  # type: ignore[assignment]  # noqa: SLF001
+        writer._fetch_config_with_backoff = (  # type: ignore[assignment]  # noqa: SLF001
+            lambda **k: [{"device_id": "d0"}, {"device_id": "d1"}]
+        )
+
+        def slow_collect(*, device_id: str, action: str, timeout_ms: int) -> dict:
+            time.sleep(2.0)
+            return {"device": device_id, "sample_rate_hz": 1.0}
+
+        writer._call_optional_device_action = slow_collect  # type: ignore[assignment]  # noqa: SLF001
+        thread = _spawn_bg_thread(writer)
+        try:
+            with _temp_dir() as td:
+                with h5py.File(Path(td) / "stall.h5", "w") as h5:
+                    meta = writer._build_measurement_metadata(  # noqa: SLF001
+                        profile_id=None, values=None, require_profile=False
+                    )
+                    t0 = time.monotonic()
+                    with writer._h5_lock:  # noqa: SLF001
+                        writer._configure_active_file(  # noqa: SLF001
+                            h5,
+                            write_every_s=1.0,
+                            load_manager_state=True,
+                            measurement_meta=meta,
+                        )
+                    elapsed = time.monotonic() - t0
+                    # File-open did NOT wait on the 2s collect RPCs.
+                    self.assertLess(elapsed, 1.0)
+
+                    def captured() -> bool:
+                        with writer._h5_lock:  # noqa: SLF001
+                            grp = h5.get("run_metadata")
+                            return bool(
+                                grp is not None and "d0" in grp and "d1" in grp
+                            )
+
+                    # ...but the bg thread still captures it shortly after.
+                    self.assertTrue(_wait_for(captured, timeout_s=6.0))
+        finally:
+            writer._stop_evt.set()  # noqa: SLF001
+            writer._bg_queue.put(_BG_SENTINEL)  # noqa: SLF001
+            thread.join(timeout=2.0)
+
+
 if __name__ == "__main__":
     unittest.main()
