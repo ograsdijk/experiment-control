@@ -95,6 +95,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--context-pending-max-per-stream", type=int, default=10_000)
     p.add_argument("--context-map-max-per-stream", type=int, default=20_000)
     p.add_argument("--disabled-devices", nargs="*", default=None)
+    p.add_argument("--disabled-processes", nargs="*", default=None)
     p.add_argument("--measurement-schema-path", default=None)
     p.add_argument("--autostart-writing", default=None)
     p.add_argument(
@@ -267,8 +268,9 @@ def _ingest_process_schema(
     datasets: dict[str, h5py.Dataset],
     device_map: dict[str, Json],
     *,
+    write_enabled: Callable[[str], bool] | None = None,
     chunk_size: int = DEFAULT_TELEMETRY_CHUNK_ROWS,
-) -> None:
+) -> set[str]:
     """Create ``/process_telemetry/<process_id>`` datasets from a process
     telemetry schema (manager.process_telemetry.schema.list).
 
@@ -277,10 +279,16 @@ def _ingest_process_schema(
     so ``_write_buffered_rows_batch`` writes them unchanged — but the datasets
     live in a SEPARATE ``/process_telemetry`` group and carry a
     ``source_kind="process"`` attribute, keeping the distinction in the file.
+
+    ``write_enabled`` gates dataset creation (a disabled process gets no
+    dataset, mirroring ``_ingest_schema`` for devices). Returns the set of
+    process_ids present in the schema (known processes) regardless of enabled
+    state, so the caller can track them for the process write-filter.
     """
     processes_raw = schema.get("processes", [])
     if not isinstance(processes_raw, list):
-        return
+        return set()
+    seen: set[str] = set()
     for proc in processes_raw:
         if not isinstance(proc, dict):
             continue
@@ -290,12 +298,14 @@ def _ingest_process_schema(
         units = list(proc.get("units", []))
         if not process_id or not signals:
             continue
+        seen.add(process_id)
         device_map[process_id] = {
             "signals": signals,
             "dtypes": dtypes,
             "units": units,
         }
-        if process_id not in datasets:
+        can_write = True if write_enabled is None else bool(write_enabled(process_id))
+        if can_write and process_id not in datasets:
             ds = _create_device_dataset(
                 process_group,
                 process_id,
@@ -306,6 +316,7 @@ def _ingest_process_schema(
             )
             ds.attrs["source_kind"] = "process"
             datasets[process_id] = ds
+    return seen
 
 
 class HdfWriter(ManagedProcessBase):
@@ -327,6 +338,7 @@ class HdfWriter(ManagedProcessBase):
         context_pending_max_per_stream: int = 10_000,
         context_map_max_per_stream: int = 20_000,
         disabled_devices: list[str] | None = None,
+        disabled_processes: list[str] | None = None,
         measurement_schema_path: str | None = None,
         autostart_writing: bool | str | None = None,
         event_log_mode: EventLogMode = "all",
@@ -369,6 +381,13 @@ class HdfWriter(ManagedProcessBase):
         self._context_map_ttl_s = 60.0
         self._context_map_written_margin = 512
         self._disabled_devices = self._normalize_device_ids(disabled_devices or [])
+        # Process-telemetry write filter, a SEPARATE namespace from
+        # `_disabled_devices` so a device id and a process id never collide.
+        # `_known_process_ids` tracks which ids are processes (seen via the
+        # process telemetry schema or a process telemetry_update) so the filter
+        # state can present processes distinctly from devices.
+        self._disabled_processes = self._normalize_device_ids(disabled_processes or [])
+        self._known_process_ids: set[str] = set()
         self._measurement_schema_path = self._normalize_schema_path(measurement_schema_path)
         self._autostart_writing = self._normalize_autostart_writing(
             autostart_writing,
@@ -642,11 +661,27 @@ class HdfWriter(ManagedProcessBase):
         known = set(self._device_map)
         known.update(self._datasets)
         known.update(self._latest_device_config)
+        # Processes ride the device write path (device_map/datasets keyed by
+        # process_id) but are a separate filter namespace — exclude them so
+        # the device filter lists only real devices.
+        known.difference_update(self._known_process_ids)
         return sorted(known)
 
     def _is_device_enabled(self, device_id: str) -> bool:
         did = self._normalize_device_id(device_id)
         return bool(did) and did not in self._disabled_devices
+
+    def _known_processes(self) -> list[str]:
+        return sorted(self._known_process_ids)
+
+    def _is_process_enabled(self, process_id: str) -> bool:
+        pid = self._normalize_device_id(process_id)
+        return bool(pid) and pid not in self._disabled_processes
+
+    def _register_known_process(self, process_id: str) -> None:
+        pid = self._normalize_device_id(process_id)
+        if pid:
+            self._known_process_ids.add(pid)
 
     def _stream_buffer_snapshot(self) -> tuple[list[Json], int, int]:
         items: list[Json] = []
@@ -1867,6 +1902,7 @@ class HdfWriter(ManagedProcessBase):
         h5.attrs["dropped_local_messages_total"] = 0
         h5.attrs["dropped_event_messages_total"] = 0
         h5.attrs["disabled_devices_json"] = json.dumps(sorted(self._disabled_devices))
+        h5.attrs["disabled_processes_json"] = json.dumps(sorted(self._disabled_processes))
 
         self._telemetry_group = h5.require_group("telemetry")
         self._process_telemetry_group = h5.require_group("process_telemetry")
@@ -1923,12 +1959,14 @@ class HdfWriter(ManagedProcessBase):
             if self._process_telemetry_group is not None:
                 proc_schema = self._fetch_process_schema_best_effort()
                 if proc_schema is not None:
-                    _ingest_process_schema(
+                    seen_processes = _ingest_process_schema(
                         proc_schema,
                         self._process_telemetry_group,
                         self._datasets,
                         self._device_map,
+                        write_enabled=self._is_process_enabled,
                     )
+                    self._known_process_ids.update(seen_processes)
 
             configs: list[Json] = []
             if self._latest_device_config:
@@ -2753,6 +2791,9 @@ class HdfWriter(ManagedProcessBase):
                 "hdf.devices.get": self._rpc_hdf_devices_get,
                 "hdf.devices.disable": self._rpc_hdf_devices_disable,
                 "hdf.devices.enable": self._rpc_hdf_devices_enable,
+                "hdf.processes.get": self._rpc_hdf_processes_get,
+                "hdf.processes.disable": self._rpc_hdf_processes_disable,
+                "hdf.processes.enable": self._rpc_hdf_processes_enable,
                 "hdf.rotate": self._rpc_hdf_rotate,
             },
             aliases={
@@ -2762,6 +2803,9 @@ class HdfWriter(ManagedProcessBase):
                 "hdf.get_devices": "hdf.devices.get",
                 "hdf.disable_devices": "hdf.devices.disable",
                 "hdf.enable_devices": "hdf.devices.enable",
+                "hdf.get_processes": "hdf.processes.get",
+                "hdf.disable_processes": "hdf.processes.disable",
+                "hdf.enable_processes": "hdf.processes.enable",
                 "hdf.rotate_file": "hdf.rotate",
             },
         )
@@ -2859,6 +2903,33 @@ class HdfWriter(ManagedProcessBase):
                 doc="Enable writing for device_ids.",
             ),
             method(
+                "hdf.processes.get", params=None, doc="Get HDF process write filter."
+            ),
+            method(
+                "hdf.processes.disable",
+                params=[
+                    param(
+                        "process_ids",
+                        required=True,
+                        default=None,
+                        annotation="list[str]",
+                    ),
+                ],
+                doc="Disable writing for process telemetry process_ids.",
+            ),
+            method(
+                "hdf.processes.enable",
+                params=[
+                    param(
+                        "process_ids",
+                        required=True,
+                        default=None,
+                        annotation="list[str]",
+                    ),
+                ],
+                doc="Enable writing for process telemetry process_ids.",
+            ),
+            method(
                 "hdf.rotate",
                 params=[
                     param(
@@ -2920,6 +2991,17 @@ class HdfWriter(ManagedProcessBase):
             "disabled_devices": disabled,
             "known_devices": known,
             "enabled_known_devices": enabled_known,
+        }
+
+    def _hdf_process_filter_state(self) -> Json:
+        known = self._known_processes()
+        disabled = sorted(self._disabled_processes)
+        disabled_set = set(disabled)
+        enabled_known = [pid for pid in known if pid not in disabled_set]
+        return {
+            "disabled_processes": disabled,
+            "known_processes": known,
+            "enabled_known_processes": enabled_known,
         }
 
     def _rpc_hdf_status(self, req: Json) -> Json:
@@ -3000,6 +3082,7 @@ class HdfWriter(ManagedProcessBase):
             else 0,
         }
         result.update(self._hdf_device_filter_state())
+        result.update(self._hdf_process_filter_state())
         return self.rpc_ok(req, result=result)
 
     def _rpc_hdf_measurement_schema_get(self, req: Json) -> Json:
@@ -3146,6 +3229,81 @@ class HdfWriter(ManagedProcessBase):
                 "changed": changed,
                 "unknown": unknown,
                 **self._hdf_device_filter_state(),
+            },
+        )
+
+    def _rpc_hdf_processes_get(self, req: Json) -> Json:
+        return self.rpc_ok(req, result=self._hdf_process_filter_state())
+
+    def _rpc_hdf_processes_disable(self, req: Json) -> Json:
+        return self._rpc_hdf_processes_toggle(req, disable=True)
+
+    def _rpc_hdf_processes_enable(self, req: Json) -> Json:
+        return self._rpc_hdf_processes_toggle(req, disable=False)
+
+    def _rpc_hdf_processes_toggle(self, req: Json, *, disable: bool) -> Json:
+        params = req.get("params", {})
+        if not isinstance(params, dict):
+            return self._rpc_error(req, code="invalid_params", message="params must be a dict")
+        try:
+            ids = self._normalize_device_id_list(params.get("process_ids"))
+        except Exception as e:
+            return self._rpc_error(req, code="invalid_params", message=str(e))
+        if not ids:
+            return self._rpc_error(
+                req,
+                code="invalid_params",
+                message="process_ids must contain at least one id",
+            )
+
+        known = set(self._known_processes())
+        unknown = sorted([pid for pid in ids if pid not in known])
+        changed: list[str] = []
+        if disable:
+            for pid in ids:
+                if pid not in self._disabled_processes:
+                    self._disabled_processes.add(pid)
+                    changed.append(pid)
+            if changed:
+                # Buffered process telemetry rows carry device_id=process_id.
+                self._clear_buffered_for_disabled(set(changed))
+        else:
+            for pid in ids:
+                if pid in self._disabled_processes:
+                    self._disabled_processes.remove(pid)
+                    changed.append(pid)
+            # Re-ingest the process schema so re-enabled processes get their
+            # /process_telemetry datasets recreated (mirrors device enable).
+            if changed and self._process_telemetry_group is not None:
+                proc_schema = self._fetch_process_schema_best_effort()
+                if proc_schema is not None:
+                    with self._h5_lock:
+                        if self._process_telemetry_group is not None:
+                            seen = _ingest_process_schema(
+                                proc_schema,
+                                self._process_telemetry_group,
+                                self._datasets,
+                                self._device_map,
+                                write_enabled=self._is_process_enabled,
+                            )
+                            self._known_process_ids.update(seen)
+
+        if self._h5 is not None:
+            with self._h5_lock:
+                if self._h5 is not None:
+                    try:
+                        self._h5.attrs["disabled_processes_json"] = json.dumps(
+                            sorted(self._disabled_processes)
+                        )
+                    except Exception:
+                        self._bump_error("h5.attrs.disabled_processes")
+
+        return self.rpc_ok(
+            req,
+            result={
+                "changed": changed,
+                "unknown": unknown,
+                **self._hdf_process_filter_state(),
             },
         )
 
@@ -4446,6 +4604,7 @@ def main(argv: list[str] | None = None) -> None:
         context_pending_max_per_stream=ns.context_pending_max_per_stream,
         context_map_max_per_stream=ns.context_map_max_per_stream,
         disabled_devices=ns.disabled_devices,
+        disabled_processes=ns.disabled_processes,
         measurement_schema_path=ns.measurement_schema_path,
         autostart_writing=ns.autostart_writing,
         event_log_mode=ns.event_log_mode,
