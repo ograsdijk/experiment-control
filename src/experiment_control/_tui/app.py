@@ -225,13 +225,16 @@ class ManagerTUI(App):
         self._proc_cap_retry_initial_s: float = 0.5
         self._proc_cap_retry_max_s: float = 2.0
         # Throttle for the render-path capability fetch of the *selected*
-        # process. The render path uses a forced fetch (same as the manual
-        # Refresh) so federated processes auto-populate — the exponential
-        # backoff above only gates the manual/force path, not this — but we
-        # cap the attempt rate here so rapid ticks / cursor-scrolling can't
-        # hammer a peer whose capabilities aren't available yet.
+        # device/process. The render path uses a forced fetch (same as the
+        # manual Refresh) so federated targets auto-populate instead of getting
+        # stuck: for processes the non-force path is gated by the exponential
+        # backoff above; for devices the non-force render gate treats a mirror
+        # (no local driver pid) as "stopped" and skips the fetch. We cap the
+        # attempt rate here so rapid ticks / cursor-scrolling can't hammer a
+        # peer whose capabilities aren't available yet.
         self._proc_cap_render_attempt_mono: dict[str, float] = {}
-        self._proc_cap_render_retry_s: float = 1.0
+        self._dev_cap_render_attempt_mono: dict[str, float] = {}
+        self._cap_render_retry_s: float = 1.0
         self._members_last: dict[str, list[dict[str, Any]]] = {}
         self._proc_members_last: dict[str, list[dict[str, Any]]] = {}
         self._members_source: str = "device"
@@ -907,6 +910,10 @@ class ManagerTUI(App):
             self._cap_cache_mono.pop(device_id, None)
             self._members_last.pop(device_id, None)
 
+        stale_render_attempts = set(self._dev_cap_render_attempt_mono) - active_device_ids
+        for device_id in stale_render_attempts:
+            self._dev_cap_render_attempt_mono.pop(device_id, None)
+
         stale_member_fingerprints = [
             key
             for key in self._members_rendered_fingerprint
@@ -1321,7 +1328,7 @@ class ManagerTUI(App):
                 if self._process_capabilities_probe_ready(process_id):
                     now = time.monotonic()
                     last = self._proc_cap_render_attempt_mono.get(process_id, 0.0)
-                    if (now - last) >= self._proc_cap_render_retry_s:
+                    if (now - last) >= self._cap_render_retry_s:
                         self._proc_cap_render_attempt_mono[process_id] = now
                         self._get_process_capabilities(process_id, force=True)
             members = self._proc_members_last.get(process_id, [])
@@ -1345,8 +1352,24 @@ class ManagerTUI(App):
 
             if device_id not in self._members_last:
                 status = self._device_status.get(device_id)
-                if status and not self._status_driver_stopped(status):
-                    if status.device_state != "DISCONNECTED":
+                # A federated (mirrored) device has no local driver process, so
+                # _status_driver_stopped() is True (driver_pid is None) and the
+                # normal gate would skip it forever — the caps live on the peer.
+                # Treat is_remote devices as eligible and fetch (forced, like the
+                # manual Refresh) as long as they aren't DISCONNECTED. Throttled
+                # per device so an unavailable peer can't be hammered.
+                if (
+                    status
+                    and status.device_state != "DISCONNECTED"
+                    and (status.is_remote or not self._status_driver_stopped(status))
+                ):
+                    if status.is_remote:
+                        now = time.monotonic()
+                        last = self._dev_cap_render_attempt_mono.get(device_id, 0.0)
+                        if (now - last) >= self._cap_render_retry_s:
+                            self._dev_cap_render_attempt_mono[device_id] = now
+                            self._get_device_capabilities(device_id, force=True)
+                    else:
                         self._get_device_capabilities(device_id)
 
             members = self._members_last.get(device_id, [])
