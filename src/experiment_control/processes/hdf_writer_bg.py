@@ -29,9 +29,15 @@ class _FlushBatch:
     stream_batches: dict[tuple[str, str], dict[str, list[Any]]] = field(
         default_factory=dict
     )
-    pending_stream_metadata: dict[tuple[str, str], dict[str, Any]] = field(
-        default_factory=dict
-    )
+    # Per-stream write metadata captured at snapshot time so the bg write is
+    # fully self-contained: it never reads the main-owned `_stream_schema` /
+    # `_stream_active_session` maps during a (slow) write. Keyed by
+    # `(device_id, stream)` -> {"dtype": np.dtype, "shape": tuple, "session": int}.
+    stream_meta: dict[tuple[str, str], dict[str, Any]] = field(default_factory=dict)
+    # Context-table rows observed on the main drain thread and deferred to the
+    # bg thread for the actual h5py write. Each entry:
+    # {"context_id": int, "fields": dict, "ts_wall_ns": int, "ts_mono_ns": int}.
+    context_rows: list[dict[str, Any]] = field(default_factory=list)
     force_flush: bool = False
 
 
