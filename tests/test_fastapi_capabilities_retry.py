@@ -111,5 +111,72 @@ class FastApiCapabilitiesRetryTests(unittest.TestCase):
         )
 
 
+@unittest.skipIf(
+    _FASTAPI_IMPORT_ERROR is not None,
+    f"fastapi app import unavailable: {_FASTAPI_IMPORT_ERROR!r}",
+)
+class ProcessCapabilitiesNotReadyTests(unittest.TestCase):
+    def test_reply_starting_is_retryable(self) -> None:
+        reply = fastapi_app_module._process_rpc_not_ready_reply({"state": "STARTING"})
+        self.assertFalse(reply["ok"])
+        self.assertEqual(reply["error"]["code"], "process_starting")
+        self.assertEqual(reply["error"]["retry_after_ms"], 500)
+
+    def test_reply_running_is_terminal(self) -> None:
+        for status in ({"state": "RUNNING"}, {"state": "EXITED"}, {}):
+            reply = fastapi_app_module._process_rpc_not_ready_reply(status)
+            self.assertFalse(reply["ok"])
+            self.assertEqual(reply["error"]["code"], "process_rpc_not_ready")
+
+    def test_process_capabilities_starting_returns_retryable_without_rpc(self) -> None:
+        # Only the manager.processes.list lookup runs; the capabilities RPC is
+        # NOT forwarded because the endpoint is not advertised yet.
+        router = _RouterStub(
+            [
+                {
+                    "ok": True,
+                    "result": [
+                        {"process_id": "spb", "state": "STARTING", "registered": False}
+                    ],
+                }
+            ]
+        )
+        original_router = getattr(fastapi_app_module.app.state, "router", None)
+        fastapi_app_module.app.state.router = router
+        try:
+            resp = asyncio.run(fastapi_app_module.process_capabilities("spb"))
+        finally:
+            fastapi_app_module.app.state.router = original_router
+        self.assertFalse(bool(resp.get("ok")))
+        self.assertEqual(resp["error"]["code"], "process_starting")
+        self.assertEqual(len(router.calls), 1)
+
+    def test_process_capabilities_registered_forwards_rpc(self) -> None:
+        router = _RouterStub(
+            [
+                {
+                    "ok": True,
+                    "result": [
+                        {
+                            "process_id": "spb",
+                            "state": "RUNNING",
+                            "registered": True,
+                            "rpc_endpoint": "tcp://127.0.0.1:5555",
+                        }
+                    ],
+                },
+                {"ok": True, "result": {"version": 1, "members": []}},
+            ]
+        )
+        original_router = getattr(fastapi_app_module.app.state, "router", None)
+        fastapi_app_module.app.state.router = router
+        try:
+            resp = asyncio.run(fastapi_app_module.process_capabilities("spb"))
+        finally:
+            fastapi_app_module.app.state.router = original_router
+        self.assertTrue(bool(resp.get("ok")))
+        self.assertEqual(len(router.calls), 2)
+
+
 if __name__ == "__main__":
     unittest.main()

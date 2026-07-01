@@ -423,9 +423,13 @@ class ManagedProcessBase:
     def process_telemetry_schema(self) -> list[dict[str, Any]] | None:
         """Override to declare the telemetry signals this process publishes.
 
-        Return a list of ``{"name": str, "dtype": "f8"|"i8"|"bool",
+        Return a list of ``{"name": str, "dtype": "float64"|"int64"|"bool",
         "units": str}`` entries, or ``None`` (default) to publish no
-        schema'd telemetry. A declared schema is advertised to the manager
+        schema'd telemetry. ``dtype`` must be a canonical numpy name accepted
+        by the HDF writer's ``DTYPE_MAP`` (``float64``/``float32``/``int64``/
+        ``int32``/``uint64``/``uint32``/``bool``); typecodes like ``"f8"`` are
+        looked up by exact name and rejected, so the process's telemetry
+        dataset would never be created. A declared schema is advertised to the manager
         (and federation-warmed to peers) so the HDF writer can create
         ``/process_telemetry/<process_id>`` datasets. Keep it static — it is
         read during the first ``publish_telemetry`` call.

@@ -2170,7 +2170,7 @@ class Manager(
                 {
                     "process_id": process_id,
                     "signals": [str(e.get("name", "")) for e in schema],
-                    "dtypes": [str(e.get("dtype", "f8")) for e in schema],
+                    "dtypes": [str(e.get("dtype", "float64")) for e in schema],
                     "units": [str(e.get("units", "")) for e in schema],
                     "source_kind": "process",
                     "is_remote": False,
