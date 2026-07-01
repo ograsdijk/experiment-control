@@ -167,6 +167,80 @@ class FastApiUiHostingTests(unittest.TestCase):
         self.assertEqual(meta["ok"], True)
         self.assertEqual(len(data), 16)
 
+    def test_workspace_filter_decodes_serialized_scalar_output(self) -> None:
+        msg = json.dumps(
+            {
+                "topic": "manager.stream_analysis.output",
+                "payload": {
+                    "workspace_id": "ws",
+                    "output_id": "integral",
+                    "kind": "scalar",
+                    "seq": 3,
+                    "value": 12.5,
+                },
+            }
+        )
+
+        filtered = fastapi_app_module._workspace_filter_stream_message(
+            msg=msg,
+            workspace="ws",
+            allowed_output_kinds=None,
+        )
+
+        self.assertIsNotNone(filtered)
+        topic, payload, workspace = filtered
+        self.assertEqual(topic, "manager.stream_analysis.output")
+        self.assertEqual(workspace, "ws")
+        self.assertEqual(payload["output_id"], "integral")
+        self.assertEqual(payload["kind"], "scalar")
+
+    def test_workspace_filter_decodes_serialized_trace_ready(self) -> None:
+        msg = json.dumps(
+            {
+                "topic": "manager.stream_analysis.trace_ready",
+                "payload": {
+                    "workspace_id": "ws",
+                    "output_id": "trace",
+                    "kind": "trace",
+                    "seq": 4,
+                    "shm_name": "trace_shm",
+                },
+            }
+        )
+
+        filtered = fastapi_app_module._workspace_filter_stream_message(
+            msg=msg,
+            workspace="ws",
+            allowed_output_kinds={"trace"},
+        )
+
+        self.assertIsNotNone(filtered)
+        topic, payload, workspace = filtered
+        self.assertEqual(topic, "manager.stream_analysis.trace_ready")
+        self.assertEqual(workspace, "ws")
+        self.assertEqual(payload["output_id"], "trace")
+        self.assertEqual(payload["shm_name"], "trace_shm")
+
+    def test_workspace_non_trace_output_sends_decoded_json(self) -> None:
+        ws = _WsCapture()
+        msg = {
+            "topic": "manager.stream_analysis.output",
+            "payload": {
+                "workspace_id": "ws",
+                "output_id": "integral",
+                "kind": "scalar",
+                "seq": 3,
+                "value": 12.5,
+            },
+        }
+
+        asyncio.run(fastapi_app_module._ws_send_json(ws, msg))
+
+        decoded = json.loads(ws.text[0])
+        self.assertIsInstance(decoded, dict)
+        self.assertEqual(decoded["topic"], "manager.stream_analysis.output")
+        self.assertEqual(decoded["payload"]["value"], 12.5)
+
     def test_binary_trace_frame_supports_stream_analysis_value_field(self) -> None:
         ws = _WsCapture()
         msg = {
