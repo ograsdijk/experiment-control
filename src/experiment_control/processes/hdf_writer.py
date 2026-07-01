@@ -42,6 +42,7 @@ from .hdf_writer_bg import (
     _BG_SENTINEL as _BG_SENTINEL,
     _BgRequest as _BgRequest,
     _BgSentinel as _BgSentinel,
+    _CaptureRunMetadataRequest as _CaptureRunMetadataRequest,
     _DevicesToggleRequest as _DevicesToggleRequest,
     _FlushBatch as _FlushBatch,
     _MeasurementNoteRequest as _MeasurementNoteRequest,
@@ -828,7 +829,17 @@ class HdfWriter(ManagedProcessBase):
             return None
         if not isinstance(resp, dict):
             return None
-        if not bool(resp.get("ok")):
+        # Device commands are routed through the manager and return the raw
+        # driver-runner envelope on success: {"id", "status": "OK", "result"}.
+        # Only manager-level failures (unknown_device, driver_not_running, ...)
+        # use the {"ok": False, "error"} shape. Accept either success form —
+        # checking only ``ok`` silently treated every successful
+        # collect_run_metadata as a failure, so /run_metadata was never
+        # written.
+        ok = resp.get("ok")
+        if ok is None:
+            ok = str(resp.get("status", "")).upper() == "OK"
+        if not ok:
             return None
         return resp.get("result")
 
@@ -837,9 +848,36 @@ class HdfWriter(ManagedProcessBase):
         source_kind = str(config.get("source_kind", "")).strip().lower()
         return bool(config.get("is_remote")) or source_kind == "federated"
 
-    def _capture_run_metadata_for_configs(self, configs: list[Json]) -> None:
+    def _enqueue_run_metadata_capture(self, configs: list[Json]) -> None:
+        """Hand run-metadata capture to the bg thread so its slow per-device
+        RPCs don't stall the main SUB-drain loop during file-open. Falls back
+        to inline capture when the bg thread can't take it (autostart runs
+        file-open before the bg thread is spawned, or the thread has died),
+        so metadata is never silently skipped."""
+        req = _CaptureRunMetadataRequest(
+            configs=[copy.deepcopy(c) for c in configs],
+            measurement_id=self._measurement_id or "",
+        )
+        if self._bg_thread is None or self._bg_thread_dead:
+            self._capture_run_metadata_for_configs(
+                req.configs, expected_measurement_id=req.measurement_id
+            )
+            return
+        try:
+            self._bg_queue.put_nowait(req)
+        except queue.Full:
+            self._capture_run_metadata_for_configs(
+                req.configs, expected_measurement_id=req.measurement_id
+            )
+
+    def _capture_run_metadata_for_configs(
+        self,
+        configs: list[Json],
+        *,
+        expected_measurement_id: str | None = None,
+    ) -> None:
         seen: set[str] = set()
-        timeout_ms = min(max(200, int(self._rpc_timeout_ms)), 1500)
+        targets: list[str] = []
         for config in configs:
             device_id = self._normalize_device_id(config.get("device_id"))
             if device_id is None or device_id in seen:
@@ -849,22 +887,64 @@ class HdfWriter(ManagedProcessBase):
                 continue
             if self._is_remote_config(config):
                 continue
-            run_metadata = self._call_optional_device_action(
-                device_id=device_id,
-                action="collect_run_metadata",
-                timeout_ms=timeout_ms,
-            )
-            if run_metadata is None:
-                continue
-            if not isinstance(run_metadata, dict):
-                self._bump_error("run_metadata.invalid")
-                continue
-            self._handle_run_metadata(
-                {
-                    "device_id": device_id,
-                    "run_metadata": run_metadata,
-                }
-            )
+            targets.append(device_id)
+        if not targets:
+            return
+
+        timeout_ms = min(max(200, int(self._rpc_timeout_ms)), 1500)
+        # Fan the blocking collect_run_metadata RPCs out in parallel: each
+        # _manager_rpc opens its own DEALER socket on the shared thread-safe
+        # zmq.Context, so this turns N*1.5s serial into ~1.5s. NOTE: this may
+        # run on the bg thread (deferred) or inline (fallback) — the RPCs never
+        # touch h5, so no lock is needed here.
+        results: list[tuple[str, Json]] = []
+        max_workers = min(8, len(targets))
+        with ThreadPoolExecutor(
+            max_workers=max_workers, thread_name_prefix="hdf-runmeta"
+        ) as pool:
+            futures = {
+                pool.submit(
+                    self._call_optional_device_action,
+                    device_id=device_id,
+                    action="collect_run_metadata",
+                    timeout_ms=timeout_ms,
+                ): device_id
+                for device_id in targets
+            }
+            for fut, device_id in futures.items():
+                try:
+                    run_metadata = fut.result()
+                except Exception:
+                    self._bump_error("metadata.rpc.collect_run_metadata")
+                    continue
+                if run_metadata is None:
+                    continue
+                if not isinstance(run_metadata, dict):
+                    self._bump_error("run_metadata.invalid")
+                    continue
+                results.append((device_id, run_metadata))
+        if not results:
+            return
+
+        # h5py is not thread-safe: serialise the writes under _h5_lock. Re-check
+        # the active file first — a stop/rotate between enqueue and now may have
+        # closed or replaced it, in which case this capture is stale.
+        with self._h5_lock:
+            if self._h5 is None:
+                return
+            if (
+                expected_measurement_id is not None
+                and (self._measurement_id or "") != expected_measurement_id
+            ):
+                self._bump_error("run_metadata.stale_skip")
+                return
+            for device_id, run_metadata in results:
+                self._handle_run_metadata(
+                    {
+                        "device_id": device_id,
+                        "run_metadata": run_metadata,
+                    }
+                )
 
     def _build_measurement_metadata(
         self,
@@ -1077,6 +1157,13 @@ class HdfWriter(ManagedProcessBase):
     ) -> None:
         if isinstance(req, _FlushBatch):
             self._handle_flush_batch(req)
+            return
+        if isinstance(req, _CaptureRunMetadataRequest):
+            # Slow per-device collect_run_metadata RPCs, run off the main
+            # drain loop so file-open never stalls telemetry draining.
+            self._capture_run_metadata_for_configs(
+                req.configs, expected_measurement_id=req.measurement_id
+            )
             return
         # Synchronous RPC request types are wired in a follow-up step;
         # for now anything else surfaces as an explicit error to the
@@ -1738,7 +1825,7 @@ class HdfWriter(ManagedProcessBase):
                 if device_id is not None:
                     self._latest_device_config[device_id] = copy.deepcopy(config)
                 self._handle_device_config(config, cache=False)
-            self._capture_run_metadata_for_configs(configs)
+            self._enqueue_run_metadata_capture(configs)
 
         self._pending = 0
         now = time.monotonic()
