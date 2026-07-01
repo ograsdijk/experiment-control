@@ -10,14 +10,19 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
+from unittest import mock  # noqa: E402
+
+import experiment_control._manager.process_supervision as ps  # noqa: E402
 from experiment_control._manager.process_supervision import (  # noqa: E402
     enforce_managed_process_heartbeat_timeout,
     enforce_managed_process_stop_timeout,
     maybe_restart_managed_process,
     maybe_schedule_restart,
     process_snapshot,
+    reconcile_phantom_running_driver,
     start_process_handle,
     stop_process_handle,
+    supervise_device_drivers,
     try_restart_process,
     update_managed_process_exit_state,
 )
@@ -518,6 +523,75 @@ class RestartStopTimeoutRaceTests(unittest.TestCase):
         )
         # ...and the handle must reach a terminal state, not sit in STOPPING.
         self.assertNotEqual(handle.state, "STOPPING")
+
+
+class PhantomRunningDriverReconcileTests(unittest.TestCase):
+    """A driver stuck at RUNNING with no live process and no recent heartbeat
+    (e.g. a stale registration applied after the subprocess was reaped) must be
+    reconciled to FAILED so it can't report RUNNING with no pid forever."""
+
+    @staticmethod
+    def _driver_handle(**overrides: object) -> SimpleNamespace:
+        handle = SimpleNamespace(
+            process=None,
+            driver_pid=None,
+            driver_process_state="RUNNING",
+            driver_last_error=None,
+            driver_last_error_kind=None,
+            last_hb_recv_mono=None,
+        )
+        for key, value in overrides.items():
+            setattr(handle, key, value)
+        return handle
+
+    @staticmethod
+    def _supervision_manager(handle: SimpleNamespace, calls: list) -> SimpleNamespace:
+        return SimpleNamespace(
+            _devices={"dev": handle},
+            _heartbeat_timeout_s=3.0,
+            _update_device_driver_exit_state=lambda h, rc: calls.append(("exit", rc)),
+            _enforce_device_driver_stop_timeout=lambda h, n: None,
+            _maybe_restart_device_driver=lambda d, h, n: None,
+            _reconcile_phantom_running_driver=lambda h: calls.append(("reconcile", h)),
+        )
+
+    def test_reconcile_demotes_running_to_failed_and_clears_pid(self) -> None:
+        events: list[str] = []
+        manager = SimpleNamespace(
+            _publish_driver_event=lambda topic, h: events.append(topic)
+        )
+        handle = self._driver_handle(driver_pid=None)
+        reconcile_phantom_running_driver(manager, handle)
+        self.assertEqual(str(handle.driver_process_state), "FAILED")
+        self.assertIsNone(handle.driver_pid)
+        self.assertEqual(handle.driver_last_error_kind, "liveness_lost")
+        self.assertIn("manager.driver.failed", events)
+
+    def test_supervise_reconciles_when_no_process_and_stale_heartbeat(self) -> None:
+        calls: list = []
+        handle = self._driver_handle(last_hb_recv_mono=None)
+        manager = self._supervision_manager(handle, calls)
+        with mock.patch.object(ps, "_maybe_auto_reconnect_device", lambda *a, **k: None):
+            supervise_device_drivers(manager, 100.0)
+        self.assertIn(("reconcile", handle), calls)
+
+    def test_supervise_skips_reconcile_when_heartbeat_fresh(self) -> None:
+        calls: list = []
+        # hb age = 0.5s < timeout 3s -> fresh -> a legit (e.g. external) driver.
+        handle = self._driver_handle(last_hb_recv_mono=99.5)
+        manager = self._supervision_manager(handle, calls)
+        with mock.patch.object(ps, "_maybe_auto_reconnect_device", lambda *a, **k: None):
+            supervise_device_drivers(manager, 100.0)
+        self.assertNotIn(("reconcile", handle), calls)
+
+    def test_supervise_skips_reconcile_when_process_alive(self) -> None:
+        calls: list = []
+        handle = self._driver_handle(process=_FakePopen(), last_hb_recv_mono=None)
+        manager = self._supervision_manager(handle, calls)
+        with mock.patch.object(ps, "_maybe_auto_reconnect_device", lambda *a, **k: None):
+            supervise_device_drivers(manager, 100.0)
+        # Live process -> poll() path, never the phantom-RUNNING reconcile.
+        self.assertNotIn(("reconcile", handle), calls)
 
 
 if __name__ == "__main__":

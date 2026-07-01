@@ -958,6 +958,28 @@ def update_device_driver_exit_state(manager: Any, handle: Any, rc: int) -> None:
     manager._publish_driver_event("manager.driver.failed", handle)
 
 
+def reconcile_phantom_running_driver(manager: Any, handle: Any) -> None:
+    """Demote a driver stuck in RUNNING with no live process and no recent
+    heartbeat.
+
+    poll()-based exit detection only runs while ``handle.process is not None``.
+    If a registration is applied just after the supervisor reaped the driver's
+    subprocess (the process/pid were cleared, then a buffered ``register``
+    message set state back to RUNNING with ``pid=None``), the driver reports
+    RUNNING with no pid forever. Reset it to FAILED so status reflects reality;
+    restart-on-crash is not automatic, so this only corrects the state.
+    """
+    handle.process = None
+    handle.driver_pid = None
+    handle.driver_process_state = _enum_member(handle.driver_process_state, "FAILED")
+    handle.driver_last_error_kind = handle.driver_last_error_kind or "liveness_lost"
+    if not handle.driver_last_error:
+        handle.driver_last_error = (
+            "driver marked RUNNING but no live process or recent heartbeat"
+        )
+    manager._publish_driver_event("manager.driver.failed", handle)
+
+
 def enforce_device_driver_stop_timeout(
     manager: Any,
     handle: Any,
@@ -1214,6 +1236,16 @@ def supervise_device_drivers(manager: Any, now_mono: float) -> None:
             rc = proc.poll()
             if rc is not None:
                 manager._update_device_driver_exit_state(handle, int(rc))
+        elif str(handle.driver_process_state) == "RUNNING":
+            # RUNNING but no tracked subprocess: legitimate only if a fresh
+            # heartbeat proves the driver is alive (e.g. externally started).
+            # Otherwise it's a phantom RUNNING (e.g. a stale registration
+            # applied after the process was reaped) that poll()-based detection
+            # can never clear — reconcile so it can't report RUNNING with no pid.
+            hb = handle.last_hb_recv_mono
+            hb_stale = hb is None or (now_mono - hb) > manager._heartbeat_timeout_s
+            if hb_stale:
+                manager._reconcile_phantom_running_driver(handle)
         manager._enforce_device_driver_stop_timeout(handle, now_mono)
         manager._maybe_restart_device_driver(device_id, handle, now_mono)
         _maybe_auto_reconnect_device(manager, device_id, handle, now_mono)
@@ -1616,6 +1648,9 @@ class ProcessSupervisionMixin:
 
     def _update_device_driver_exit_state(self, handle: Any, rc: int) -> None:
         update_device_driver_exit_state(self, handle, rc)
+
+    def _reconcile_phantom_running_driver(self, handle: Any) -> None:
+        reconcile_phantom_running_driver(self, handle)
 
     def _enforce_device_driver_stop_timeout(
         self, handle: Any, now_mono: float
