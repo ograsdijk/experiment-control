@@ -498,6 +498,30 @@ def _process_rpc_registered(status: dict[str, Any]) -> bool:
     return isinstance(rpc_endpoint, str) and bool(rpc_endpoint.strip())
 
 
+def _process_rpc_not_ready_reply(status: dict[str, Any]) -> dict[str, Any]:
+    """Reply for a capabilities call against a process whose RPC endpoint is
+    not yet registered.
+
+    While the process is STARTING the endpoint simply has not been advertised
+    yet, so return the retryable ``process_starting`` (with ``retry_after_ms``)
+    — mirroring the manager's direct process-RPC route
+    (``_manager/route_handlers.py``). Only outside the STARTING window is this a
+    terminal ``process_rpc_not_ready``. Returning the terminal code during
+    startup made the webui give up instead of retrying through the brief
+    spawn->advertise gap.
+    """
+    if str(status.get("state", "")).strip().upper() == "STARTING":
+        return {
+            "ok": False,
+            "error": {
+                "code": "process_starting",
+                "message": "process is starting; RPC endpoint not advertised yet",
+                "retry_after_ms": 500,
+            },
+        }
+    return {"ok": False, "error": {"code": "process_rpc_not_ready"}}
+
+
 async def _fetch_instance_runtime_status(
     *,
     requested_instance_id: str | None,
@@ -1389,7 +1413,7 @@ async def process_cached_call(
 async def process_capabilities(process_id: str) -> dict[str, Any]:
     status = await _lookup_process_status(process_id)
     if isinstance(status, dict) and not _process_rpc_registered(status):
-        return {"ok": False, "error": {"code": "process_rpc_not_ready"}}
+        return _process_rpc_not_ready_reply(status)
     payload = {
         "type": "manager.processes.rpc",
         "process_id": process_id,
@@ -1409,7 +1433,7 @@ async def process_call(
     if str(req.action or "").strip() == "process.capabilities":
         status = await _lookup_process_status(process_id)
         if isinstance(status, dict) and not _process_rpc_registered(status):
-            return {"ok": False, "error": {"code": "process_rpc_not_ready"}}
+            return _process_rpc_not_ready_reply(status)
     source_fields = _command_source_fields(
         request,
         source_kind=req.source_kind,
