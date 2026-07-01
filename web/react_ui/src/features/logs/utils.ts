@@ -49,27 +49,35 @@ export function logEntryKey(entry: LogEntry): string {
   ].join("|");
 }
 
+// Local wall-clock timestamp including the date, matching the TUI's
+// "%Y-%m-%d %H:%M:%S" format. The date was previously omitted, so webui log
+// and command timestamps were ambiguous across day boundaries.
+const INVALID_WALL_TIME = "---------- --:--:--";
+
+function formatWallDateTimeSeconds(value: number): string {
+  if (!Number.isFinite(value)) {
+    return INVALID_WALL_TIME;
+  }
+  const d = new Date(value * 1000);
+  const yyyy = String(d.getFullYear()).padStart(4, "0");
+  const mo = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  const hh = String(d.getHours()).padStart(2, "0");
+  const mm = String(d.getMinutes()).padStart(2, "0");
+  const ss = String(d.getSeconds()).padStart(2, "0");
+  return `${yyyy}-${mo}-${dd} ${hh}:${mm}:${ss}`;
+}
+
 export function formatLogTime(entry: LogEntry): string {
   const tWall = entry.ts?.t_wall;
   if (typeof tWall !== "number" || !Number.isFinite(tWall)) {
-    return "--:--:--";
+    return INVALID_WALL_TIME;
   }
-  const d = new Date(tWall * 1000);
-  const hh = String(d.getHours()).padStart(2, "0");
-  const mm = String(d.getMinutes()).padStart(2, "0");
-  const ss = String(d.getSeconds()).padStart(2, "0");
-  return `${hh}:${mm}:${ss}`;
+  return formatWallDateTimeSeconds(tWall);
 }
 
 export function formatWallTimeSeconds(value: number): string {
-  if (!Number.isFinite(value)) {
-    return "--:--:--";
-  }
-  const d = new Date(value * 1000);
-  const hh = String(d.getHours()).padStart(2, "0");
-  const mm = String(d.getMinutes()).padStart(2, "0");
-  const ss = String(d.getSeconds()).padStart(2, "0");
-  return `${hh}:${mm}:${ss}`;
+  return formatWallDateTimeSeconds(value);
 }
 
 export function logSourceKindColor(sourceKind: string | null | undefined): string {
