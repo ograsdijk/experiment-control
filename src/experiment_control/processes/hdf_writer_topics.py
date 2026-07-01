@@ -48,7 +48,12 @@ def _handle_manager_process_telemetry_update(writer: Any, msg: Json) -> None:
     # _ingest_process_schema). Distinct group + source_kind attr keep the
     # device/process distinction in the file.
     process_id = str(msg.get("process_id", "")).strip()
-    if not process_id or not writer._is_device_enabled(process_id):  # noqa: SLF001
+    if not process_id:
+        return
+    # Track the process id for the write-filter, then gate on the SEPARATE
+    # process filter (not the device filter).
+    writer._register_known_process(process_id)  # noqa: SLF001
+    if not writer._is_process_enabled(process_id):  # noqa: SLF001
         return
     row = dict(msg)
     row["device_id"] = process_id

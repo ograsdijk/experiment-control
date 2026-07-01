@@ -25,6 +25,7 @@ from experiment_control.processes.hdf_writer import (  # noqa: E402
     _BG_SENTINEL,
     _FlushBatch,
     _create_device_dataset,
+    _ingest_process_schema,
 )
 
 
@@ -2343,6 +2344,115 @@ class HdfWriterRunMetadataCaptureTests(unittest.TestCase):
             writer._stop_evt.set()  # noqa: SLF001
             writer._bg_queue.put(_BG_SENTINEL)  # noqa: SLF001
             thread.join(timeout=2.0)
+
+
+class HdfWriterProcessDisableTests(unittest.TestCase):
+    """Disabling process telemetry from the HDF file, a separate namespace
+    from device disable (federated processes in particular)."""
+
+    @staticmethod
+    def _make_writer(out_dir: str) -> HdfWriter:
+        return HdfWriter(
+            out_dir=out_dir,
+            filename=None,
+            manager_rpc="tcp://127.0.0.1:65561",
+            manager_pub="tcp://127.0.0.1:65562",
+            rpc_timeout_ms=2000,
+            timezone="America/Chicago",
+            rcvhwm=1000,
+            write_every_s=1.0,
+            buffer_max_messages=1000,
+            flush_every_n=10,
+            flush_every_s=1.0,
+            disabled_devices=[],
+            event_log_mode="all",
+        )
+
+    def test_device_and_process_filters_are_separate_namespaces(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            w = self._make_writer(td)
+            w._disabled_devices = {"shared_id"}  # noqa: SLF001
+            w._disabled_processes = {"proc1"}  # noqa: SLF001
+            # Device filter ignores the process disable and vice versa.
+            self.assertFalse(w._is_device_enabled("shared_id"))  # noqa: SLF001
+            self.assertTrue(w._is_device_enabled("proc1"))  # noqa: SLF001
+            self.assertFalse(w._is_process_enabled("proc1"))  # noqa: SLF001
+            self.assertTrue(w._is_process_enabled("shared_id"))  # noqa: SLF001
+
+    def test_ingest_process_schema_skips_disabled_and_reports_seen(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            with h5py.File(Path(td) / "p.h5", "w") as h5:
+                grp = h5.require_group("process_telemetry")
+                datasets: dict = {}
+                device_map: dict = {}
+                schema = {
+                    "processes": [
+                        {"process_id": "p1", "signals": ["x"], "dtypes": ["float64"], "units": [""]},
+                        {"process_id": "p2", "signals": ["y"], "dtypes": ["float64"], "units": [""]},
+                    ]
+                }
+                seen = _ingest_process_schema(
+                    schema, grp, datasets, device_map,
+                    write_enabled=lambda pid: pid != "p2",
+                )
+                self.assertEqual(seen, {"p1", "p2"})
+                self.assertIn("p1", datasets)  # enabled -> dataset created
+                self.assertNotIn("p2", datasets)  # disabled -> no dataset
+                self.assertEqual(datasets["p1"].attrs["source_kind"], "process")
+
+    def test_process_telemetry_gated_by_process_filter(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            w = self._make_writer(td)
+            w._buf = deque(maxlen=1000)  # noqa: SLF001
+            handlers = w._build_topic_handlers()  # noqa: SLF001
+            handler = handlers["manager.process_telemetry_update"]
+            msg = {
+                "process_id": "spb_microwave",
+                "version": 1,
+                "signals": {"lock": {"value": 1.0}},
+                "ts": {"t_wall": 1.0, "t_mono": 1.0},
+            }
+            # Disabled: registered as known, but not buffered.
+            w._disabled_processes = {"spb_microwave"}  # noqa: SLF001
+            handler(msg)
+            self.assertIn("spb_microwave", w._known_process_ids)  # noqa: SLF001
+            self.assertEqual(len(w._buf), 0)  # noqa: SLF001
+            # Enabled: buffered.
+            w._disabled_processes = set()  # noqa: SLF001
+            handler(msg)
+            self.assertEqual(len(w._buf), 1)  # noqa: SLF001
+            self.assertEqual(list(w._buf)[0]["device_id"], "spb_microwave")  # noqa: SLF001
+
+    def test_processes_toggle_rpc(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            w = self._make_writer(td)
+            w._known_process_ids = {"spb_microwave"}  # noqa: SLF001
+            resp = w._rpc_hdf_processes_disable(  # noqa: SLF001
+                {"params": {"process_ids": ["spb_microwave"]}}
+            )
+            self.assertTrue(resp["ok"])
+            self.assertIn("spb_microwave", w._disabled_processes)  # noqa: SLF001
+            self.assertEqual(resp["result"]["disabled_processes"], ["spb_microwave"])
+            self.assertEqual(resp["result"]["changed"], ["spb_microwave"])
+            # Filter state also surfaces known/enabled.
+            self.assertIn("spb_microwave", resp["result"]["known_processes"])
+            self.assertNotIn("spb_microwave", resp["result"]["enabled_known_processes"])
+
+            resp2 = w._rpc_hdf_processes_enable(  # noqa: SLF001
+                {"params": {"process_ids": ["spb_microwave"]}}
+            )
+            self.assertTrue(resp2["ok"])
+            self.assertNotIn("spb_microwave", w._disabled_processes)  # noqa: SLF001
+            self.assertIn(
+                "spb_microwave", resp2["result"]["enabled_known_processes"]
+            )
+
+    def test_processes_toggle_rpc_requires_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            w = self._make_writer(td)
+            resp = w._rpc_hdf_processes_disable({"params": {"process_ids": []}})  # noqa: SLF001
+            self.assertFalse(resp["ok"])
+            self.assertEqual(resp["error"]["code"], "invalid_params")
 
 
 if __name__ == "__main__":
