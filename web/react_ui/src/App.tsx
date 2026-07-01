@@ -189,6 +189,7 @@ import { usePanelTitleEditor } from "./features/panels/usePanelTitleEditor";
 import {
   streamBinStatsFitOverlayCurves as streamBinStatsFitOverlayCurvesImpl,
   streamBinStatsOverlaySeries as streamBinStatsOverlaySeriesImpl,
+  streamExtraChannelSeries as streamExtraChannelSeriesImpl,
   streamTraceOverlaySeries as streamTraceOverlaySeriesImpl,
 } from "./features/panels/overlayHelpers";
 import {
@@ -665,6 +666,7 @@ export function App() {
     buffersRef,
     streamFramesRef,
     streamTraceOverlayRef,
+    streamExtraChannelRef,
     streamBinStatsOverlayRef,
     streamBinStatsFitOverlayRef,
     streamParamsLatestRef,
@@ -924,6 +926,7 @@ export function App() {
     setStreamPanelTargetFromKey,
     setStreamPanelOverlayCount,
     setStreamPanelChannelIndex,
+    setStreamPanelChannels,
     setStreamPanelTraceDecimator,
     setStreamPanelTraceMaxPoints,
     setStreamPanelTraceMaxFps,
@@ -961,6 +964,9 @@ export function App() {
   const streamTraceOverlaySeries = (
     panel: Parameters<typeof streamTraceOverlaySeriesImpl>[0]
   ) => streamTraceOverlaySeriesImpl(panel, streamTraceOverlayRef);
+  const streamExtraChannelSeries = (
+    panel: Parameters<typeof streamExtraChannelSeriesImpl>[0]
+  ) => streamExtraChannelSeriesImpl(panel, streamExtraChannelRef);
   const streamBinStatsOverlaySeries = (
     panel: Parameters<typeof streamBinStatsOverlaySeriesImpl>[0]
   ) => streamBinStatsOverlaySeriesImpl(panel, streamBinStatsOverlayRef);
@@ -1268,6 +1274,46 @@ export function App() {
     }
   }, [commandDeck, capabilitiesByProcess, ensureProcessCapabilitiesLoaded, processes]);
 
+  // Preload capability schemas for devices referenced by command-deck
+  // entries. The general device preloader (useDeviceCapabilitiesController)
+  // skips disconnected/unregistered devices, but the command deck may pin
+  // commands for a device that is currently offline. Without their schema
+  // the deck param inputs render blank on refresh until a command is
+  // submitted (which fetches caps on demand). Fetch here regardless of
+  // connection state so the inputs are populated up front.
+  useEffect(() => {
+    const deviceIds = [
+      ...new Set(
+        commandDeck
+          .filter(
+            (entry): entry is CommandDeckCommandEntry =>
+              isCommandDeckCommandEntry(entry) && entry.targetKind === "device"
+          )
+          .map((entry) => String(entry.targetId ?? "").trim())
+          .filter((deviceId) => deviceId.length > 0)
+      ),
+    ];
+    let cancelled = false;
+    const load = async () => {
+      for (const deviceId of deviceIds) {
+        if ((capabilitiesByDevice[deviceId] ?? []).length > 0) {
+          continue;
+        }
+        const caps = await fetchCapabilities(deviceId);
+        if (cancelled) {
+          return;
+        }
+        if (caps.length > 0) {
+          setCapabilitiesByDevice((prev) => ({ ...prev, [deviceId]: caps }));
+        }
+      }
+    };
+    void load();
+    return () => {
+      cancelled = true;
+    };
+  }, [commandDeck, capabilitiesByDevice, setCapabilitiesByDevice]);
+
   useEffect(() => {
     try {
       localStorage.setItem("ecui.navWidth", String(navWidth));
@@ -1391,6 +1437,11 @@ export function App() {
         streamTraceOverlayRef.delete(id);
       }
     }
+    for (const id of streamExtraChannelRef.keys()) {
+      if (!ids.has(id)) {
+        streamExtraChannelRef.delete(id);
+      }
+    }
     for (const id of streamBinStatsOverlayRef.keys()) {
       if (!ids.has(id)) {
         streamBinStatsOverlayRef.delete(id);
@@ -1420,6 +1471,7 @@ export function App() {
       if (isTelemetryPanel(panel) || isStreamScalarPanel(panel)) {
         streamFramesRef.delete(panel.id);
         streamTraceOverlayRef.delete(panel.id);
+        streamExtraChannelRef.delete(panel.id);
         streamBinStatsOverlayRef.delete(panel.id);
         streamBinStatsFitOverlayRef.delete(panel.id);
         streamParamsLatestRef.delete(panel.id);
@@ -1441,10 +1493,14 @@ export function App() {
         if (!streamTraceOverlayRef.has(panel.id)) {
           streamTraceOverlayRef.set(panel.id, new Map());
         }
+        if (!streamExtraChannelRef.has(panel.id)) {
+          streamExtraChannelRef.set(panel.id, new Map());
+        }
       } else if (isStreamBinStatsPanel(panel)) {
         buffersRef.delete(panel.id);
         streamFramesRef.delete(panel.id);
         streamTraceOverlayRef.delete(panel.id);
+        streamExtraChannelRef.delete(panel.id);
         if (!streamBinStatsOverlayRef.has(panel.id)) {
           streamBinStatsOverlayRef.set(panel.id, new Map());
         }
@@ -1456,6 +1512,7 @@ export function App() {
         buffersRef.delete(panel.id);
         streamFramesRef.delete(panel.id);
         streamTraceOverlayRef.delete(panel.id);
+        streamExtraChannelRef.delete(panel.id);
         streamBinStatsOverlayRef.delete(panel.id);
         streamBinStatsFitOverlayRef.delete(panel.id);
         streamBinStatsRef.delete(panel.id);
@@ -1467,6 +1524,7 @@ export function App() {
         buffersRef.delete(panel.id);
         streamFramesRef.delete(panel.id);
         streamTraceOverlayRef.delete(panel.id);
+        streamExtraChannelRef.delete(panel.id);
         streamBinStatsOverlayRef.delete(panel.id);
         streamBinStatsFitOverlayRef.delete(panel.id);
         streamParamsLatestRef.delete(panel.id);
@@ -1498,6 +1556,7 @@ export function App() {
     buffersRef,
     streamFramesRef,
     streamTraceOverlayRef,
+    streamExtraChannelRef,
     streamBinStatsOverlayRef,
     streamBinStatsFitOverlayRef,
     streamParamsLatestRef,
@@ -1742,6 +1801,7 @@ export function App() {
     buffersRef,
     streamFramesRef,
     streamTraceOverlayRef,
+    streamExtraChannelRef,
     streamBinStatsOverlayRef,
     streamBinStatsFitOverlayRef,
     streamParamsLatestRef,
@@ -2300,6 +2360,7 @@ export function App() {
         buffersRef.delete(panel.id);
         streamFramesRef.delete(panel.id);
         streamTraceOverlayRef.delete(panel.id);
+        streamExtraChannelRef.delete(panel.id);
         streamBinStatsOverlayRef.delete(panel.id);
         streamBinStatsRef.delete(panel.id);
         streamBin2dRef.delete(panel.id);
@@ -2564,6 +2625,7 @@ export function App() {
   panelHelpersRef.current = {
     resolveTelemetryPanelOffset,
     streamTraceOverlaySeries,
+    streamExtraChannelSeries,
     streamBinStatsOverlaySeries,
     streamBinStatsFitOverlayCurves,
     isExpandablePlotPanel,
@@ -2603,6 +2665,8 @@ export function App() {
         panelHelpersRef.current!.resolveTelemetryPanelOffset(panel),
       streamTraceOverlaySeries: (panel) =>
         panelHelpersRef.current!.streamTraceOverlaySeries(panel),
+      streamExtraChannelSeries: (panel) =>
+        panelHelpersRef.current!.streamExtraChannelSeries(panel),
       streamBinStatsOverlaySeries: (panel) =>
         panelHelpersRef.current!.streamBinStatsOverlaySeries(panel),
       streamBinStatsFitOverlayCurves: (panel) =>
@@ -3445,6 +3509,7 @@ export function App() {
               panel={expandedPlotPanel}
               resolveTelemetryPanelOffset={resolveTelemetryPanelOffset}
               streamTraceOverlaySeries={streamTraceOverlaySeries}
+              streamExtraChannelSeries={streamExtraChannelSeries}
               streamBinStatsOverlaySeries={streamBinStatsOverlaySeries}
               streamBinStatsFitOverlayCurves={streamBinStatsFitOverlayCurves}
             />
@@ -3463,6 +3528,7 @@ export function App() {
         onSetStreamPanelAverageMode={setStreamPanelAverageMode}
         onSetStreamPanelTargetFromKey={setStreamPanelTargetFromKey}
         onSetStreamPanelChannelIndex={setStreamPanelChannelIndex}
+        onSetStreamPanelChannels={setStreamPanelChannels}
         onSetStreamTraceWorkspace={setStreamTracePanelWorkspace}
         onSetStreamTraceOutput={setStreamTracePanelOutput}
         onSetStreamTraceOverlayOutputs={setStreamTracePanelOverlayOutputs}

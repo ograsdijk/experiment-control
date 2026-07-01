@@ -27,6 +27,7 @@ import { RingBuffer } from "../../utils/ringBuffer";
 import {
   streamBinStatsFitOverlayCurves,
   streamBinStatsOverlaySeries,
+  streamExtraChannelSeries,
   streamTraceOverlaySeries,
 } from "./overlayHelpers";
 import { usePanels } from "./PanelsContext";
@@ -85,6 +86,7 @@ export function usePanelAutoRangeHandlers(args: PanelAutoRangeHandlersArgs) {
     buffersRef,
     streamFramesRef,
     streamTraceOverlayRef,
+    streamExtraChannelRef,
     streamBinStatsOverlayRef,
     streamBinStatsFitOverlayRef,
     streamBinStatsRef,
@@ -185,13 +187,18 @@ export function usePanelAutoRangeHandlers(args: PanelAutoRangeHandlersArgs) {
       );
     }
     if (isStreamRawPanel(panel)) {
+      const rawMulti =
+        panel.sourceMode === "raw" &&
+        (panel.extraChannelIndices?.length ?? 0) > 0;
       return normalizeAutoRange(
         computeStreamRawAutoYRange(
           frames,
-          panel.overlayCount,
+          rawMulti ? 1 : panel.overlayCount,
           panel.sourceMode === "raw" ? panel.channelIndex : 0,
           panel.sourceMode === "dag"
             ? streamTraceOverlaySeries(panel, streamTraceOverlayRef)
+            : rawMulti
+            ? streamExtraChannelSeries(panel, streamExtraChannelRef)
             : []
         )
       );

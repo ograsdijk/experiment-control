@@ -39,6 +39,7 @@ type Props = {
   onSetAverageMode: (panelId: string, mode: StreamTraceAverageMode) => void;
   onRawTargetKeyChange: (panelId: string, targetKey: string | null) => void;
   onSetChannelIndex: (panelId: string, value: number) => void;
+  onSetChannels: (panelId: string, channels: number[]) => void;
   onSetWorkspace: (panelId: string, workspaceId: string | null) => void;
   onSetOutput: (panelId: string, outputId: string | null) => void;
   onSetOverlayOutputs: (panelId: string, outputIds: string[]) => void;
@@ -61,6 +62,7 @@ export function StreamTraceOptionsModal({
   onSetAverageMode,
   onRawTargetKeyChange,
   onSetChannelIndex,
+  onSetChannels,
   onSetWorkspace,
   onSetOutput,
   onSetOverlayOutputs,
@@ -151,6 +153,30 @@ export function StreamTraceOptionsModal({
                   <Text size="xs" c="dimmed">
                     Single-channel stream
                   </Text>
+                ) : panel.kind === "stream_raw" ? (
+                  <Group gap={6} align="center">
+                    <Text size="xs" c="dimmed">
+                      Channels
+                    </Text>
+                    <MultiSelect
+                      size="xs"
+                      w={240}
+                      searchable
+                      comboboxProps={{ zIndex: 500 }}
+                      placeholder="Select channels"
+                      data={Array.from({ length: channelCount }, (_v, i) => ({
+                        value: String(i),
+                        label: `ch ${i}`,
+                      }))}
+                      value={[
+                        String(panel.channelIndex),
+                        ...(panel.extraChannelIndices ?? []).map(String),
+                      ]}
+                      onChange={(values) =>
+                        onSetChannels(panel.id, values.map(Number))
+                      }
+                    />
+                  </Group>
                 ) : (
                   <Group gap={6} align="center">
                     <Text size="xs" c="dimmed">

@@ -65,6 +65,9 @@ export interface ExpandedPlotBodyProps {
   streamTraceOverlaySeries: (
     panel: PlotStreamPanelState | PlotStreamWaterfallPanelState
   ) => Array<{ label: string; values: number[] }>;
+  streamExtraChannelSeries: (
+    panel: PlotStreamPanelState | PlotStreamWaterfallPanelState
+  ) => Array<{ label: string; values: number[] }>;
   streamBinStatsOverlaySeries: (
     panel: PlotStreamBinStatsPanelState
   ) => Array<{ label: string; values: number[] }>;
@@ -79,6 +82,7 @@ export function ExpandedPlotBody({
   panel,
   resolveTelemetryPanelOffset,
   streamTraceOverlaySeries,
+  streamExtraChannelSeries,
   streamBinStatsOverlaySeries,
   streamBinStatsFitOverlayCurves,
 }: ExpandedPlotBodyProps) {
@@ -116,14 +120,23 @@ export function ExpandedPlotBody({
       return (
         <StreamRawPanel
           frames={streamFramesRef.get(panel.id) ?? []}
-          overlayCount={panel.overlayCount}
+          overlayCount={
+            panel.sourceMode === "raw" &&
+            (panel.extraChannelIndices?.length ?? 0) > 0
+              ? 1
+              : panel.overlayCount
+          }
           channelIndex={panel.sourceMode === "raw" ? panel.channelIndex : 0}
           tick={plotTick}
           colorScheme={computedColorScheme}
           plotHeight={PLOT_HEIGHT}
           units={panel.stream?.units ?? null}
           extraSeries={
-            panel.sourceMode === "dag" ? streamTraceOverlaySeries(panel) : []
+            panel.sourceMode === "dag"
+              ? streamTraceOverlaySeries(panel)
+              : (panel.extraChannelIndices?.length ?? 0) > 0
+              ? streamExtraChannelSeries(panel)
+              : []
           }
           yScaleMode={panel.yScaleMode}
           yMin={panel.yMin}

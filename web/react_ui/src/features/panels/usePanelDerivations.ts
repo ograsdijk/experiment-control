@@ -248,26 +248,42 @@ export function usePanelDerivations() {
       const traceMaxFps = normalizeTraceMaxFps(panel.traceMaxFps);
       const rollingWindow = normalizeTraceRollingWindow(panel.rollingWindow);
       const averageMode = normalizeTraceAverageMode(panel.averageMode);
-      const key = [
-        panel.stream.deviceId,
-        panel.stream.stream,
-        String(panel.channelIndex),
-        traceDecimator,
-        String(traceMaxPoints),
-        traceMaxFps.toFixed(3),
-        String(rollingWindow),
-        averageMode,
-      ].join("|");
-      out.set(key, {
-        deviceId: panel.stream.deviceId,
-        stream: panel.stream.stream,
-        channelIndex: panel.channelIndex,
-        traceDecimator,
-        traceMaxPoints,
-        traceMaxFps,
-        rollingWindow,
-        averageMode,
-      });
+      // Multi-channel raw panels subscribe to one channel each. The
+      // primary `channelIndex` plus any `extraChannelIndices` form the
+      // effective set; distinct channels → distinct subscriptions (the
+      // sub key includes the channel), which the WS manager turns into
+      // one socket per channel.
+      const extraChannels =
+        panel.kind === "stream_raw" ? panel.extraChannelIndices ?? [] : [];
+      const channels = [
+        ...new Set(
+          [panel.channelIndex, ...extraChannels].map((value) =>
+            Math.max(0, Math.trunc(value))
+          )
+        ),
+      ];
+      for (const channelIndex of channels) {
+        const key = [
+          panel.stream.deviceId,
+          panel.stream.stream,
+          String(channelIndex),
+          traceDecimator,
+          String(traceMaxPoints),
+          traceMaxFps.toFixed(3),
+          String(rollingWindow),
+          averageMode,
+        ].join("|");
+        out.set(key, {
+          deviceId: panel.stream.deviceId,
+          stream: panel.stream.stream,
+          channelIndex,
+          traceDecimator,
+          traceMaxPoints,
+          traceMaxFps,
+          rollingWindow,
+          averageMode,
+        });
+      }
     }
     return [...out.values()].sort((a, b) => {
       if (a.deviceId !== b.deviceId) {

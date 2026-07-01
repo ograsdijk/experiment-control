@@ -86,6 +86,7 @@ export function normalizePlotState(
       stream?: unknown;
       overlayCount?: unknown;
       channelIndex?: unknown;
+      extraChannelIndices?: unknown;
       traceDecimator?: unknown;
       traceMaxPoints?: unknown;
       traceMaxFps?: unknown;
@@ -205,10 +206,9 @@ export function normalizePlotState(
       const averageMode = normalizeTraceAverageMode(
         panel.averageMode ?? DEFAULT_TRACE_AVERAGE_MODE
       );
-      panels.push({
+      const baseTrace = {
         id,
         title,
-        kind,
         sourceMode,
         stream: streamTarget,
         overlayCount,
@@ -224,7 +224,19 @@ export function normalizePlotState(
         yScaleMode,
         yMin,
         yMax,
-      });
+      };
+      if (kind === "stream_raw") {
+        const extraChannelIndices = Array.isArray(panel.extraChannelIndices)
+          ? panel.extraChannelIndices
+              .map((value) => Math.trunc(Number(value)))
+              .filter(
+                (value) => Number.isFinite(value) && value >= 0 && value !== channelIndex
+              )
+          : [];
+        panels.push({ ...baseTrace, kind, extraChannelIndices });
+      } else {
+        panels.push({ ...baseTrace, kind });
+      }
       continue;
     }
 
@@ -507,6 +519,9 @@ export function serializePlotState(
             }
           : null,
         overlayOutputIds: [...panel.overlayOutputIds],
+        ...(panel.kind === "stream_raw"
+          ? { extraChannelIndices: [...panel.extraChannelIndices] }
+          : {}),
       };
     }
 

@@ -66,6 +66,14 @@ type StreamTraceOverlayMap = Map<
   string,
   Map<string, { seq: number; values: number[] }>
 >;
+// Latest frame per extra channel for multi-channel raw stream panels.
+// panelId → channelIndex → latest {seq, values}. The primary channel
+// keeps flowing through `streamFramesRef` (preserving overlay-N); extra
+// channels store only their most recent frame here.
+type StreamExtraChannelMap = Map<
+  string,
+  Map<number, { seq: number; values: number[] }>
+>;
 type StreamBinStatsOverlayMap = Map<
   string,
   Map<string, { seq: number; values: number[] }>
@@ -84,6 +92,7 @@ export interface TelemetryContextValue {
   buffersRef: PanelBuffersMap;
   streamFramesRef: StreamFramesMap;
   streamTraceOverlayRef: StreamTraceOverlayMap;
+  streamExtraChannelRef: StreamExtraChannelMap;
   streamBinStatsOverlayRef: StreamBinStatsOverlayMap;
   streamBinStatsFitOverlayRef: StreamBinStatsFitOverlayMap;
   streamParamsLatestRef: StreamParamsLatestMap;
@@ -110,6 +119,10 @@ export function TelemetryProvider({ children }: { children: ReactNode }) {
   const buffersRef = useMemo<PanelBuffersMap>(() => new Map(), []);
   const streamFramesRef = useMemo<StreamFramesMap>(() => new Map(), []);
   const streamTraceOverlayRef = useMemo<StreamTraceOverlayMap>(
+    () => new Map(),
+    []
+  );
+  const streamExtraChannelRef = useMemo<StreamExtraChannelMap>(
     () => new Map(),
     []
   );
@@ -190,6 +203,7 @@ export function TelemetryProvider({ children }: { children: ReactNode }) {
       buffersRef,
       streamFramesRef,
       streamTraceOverlayRef,
+      streamExtraChannelRef,
       streamBinStatsOverlayRef,
       streamBinStatsFitOverlayRef,
       streamParamsLatestRef,
@@ -203,6 +217,7 @@ export function TelemetryProvider({ children }: { children: ReactNode }) {
       buffersRef,
       streamFramesRef,
       streamTraceOverlayRef,
+      streamExtraChannelRef,
       streamBinStatsOverlayRef,
       streamBinStatsFitOverlayRef,
       streamParamsLatestRef,
