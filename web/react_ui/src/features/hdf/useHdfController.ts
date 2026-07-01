@@ -66,6 +66,10 @@ export function useHdfController({
     useState<string[]>([]);
   const [hdfEnableDevicesDraft, setHdfEnableDevicesDraft] = useState<string[]>([]);
   const [hdfDisableDevicesDraft, setHdfDisableDevicesDraft] = useState<string[]>([]);
+  const [hdfEnableProcessesDraft, setHdfEnableProcessesDraft] = useState<string[]>([]);
+  const [hdfDisableProcessesDraft, setHdfDisableProcessesDraft] = useState<string[]>(
+    []
+  );
   const [hdfMeasurementSchemaByProcessId, setHdfMeasurementSchemaByProcessId] =
     useState<Record<string, HdfMeasurementSchemaState>>({});
   const [
@@ -130,6 +134,18 @@ export function useHdfController({
     hdfCapabilities,
     "hdf.devices.disable"
   );
+  const hdfSupportsProcessesGet = supportsProcessCapability(
+    hdfCapabilities,
+    "hdf.processes.get"
+  );
+  const hdfSupportsProcessesEnable = supportsProcessCapability(
+    hdfCapabilities,
+    "hdf.processes.enable"
+  );
+  const hdfSupportsProcessesDisable = supportsProcessCapability(
+    hdfCapabilities,
+    "hdf.processes.disable"
+  );
   const hdfSupportsRotate = supportsProcessCapability(hdfCapabilities, "hdf.rotate");
   const hdfSupportsWritingStart = supportsProcessCapability(
     hdfCapabilities,
@@ -151,6 +167,13 @@ export function useHdfController({
   const hdfDevicesGetBusy = Boolean(hdfCommandBusyByAction["hdf.devices.get"]);
   const hdfDevicesEnableBusy = Boolean(hdfCommandBusyByAction["hdf.devices.enable"]);
   const hdfDevicesDisableBusy = Boolean(hdfCommandBusyByAction["hdf.devices.disable"]);
+  const hdfProcessesGetBusy = Boolean(hdfCommandBusyByAction["hdf.processes.get"]);
+  const hdfProcessesEnableBusy = Boolean(
+    hdfCommandBusyByAction["hdf.processes.enable"]
+  );
+  const hdfProcessesDisableBusy = Boolean(
+    hdfCommandBusyByAction["hdf.processes.disable"]
+  );
   const hdfRotateBusy = Boolean(hdfCommandBusyByAction["hdf.rotate"]);
   const hdfWritingStartBusy = Boolean(hdfCommandBusyByAction["hdf.writing.start"]);
   const hdfWritingStopBusy = Boolean(hdfCommandBusyByAction["hdf.writing.stop"]);
@@ -243,6 +266,9 @@ export function useHdfController({
               disabledDevices: current?.disabledDevices ?? [],
               knownDevices: current?.knownDevices ?? [],
               enabledKnownDevices: current?.enabledKnownDevices ?? [],
+              disabledProcesses: current?.disabledProcesses ?? [],
+              knownProcesses: current?.knownProcesses ?? [],
+              enabledKnownProcesses: current?.enabledKnownProcesses ?? [],
               measurementId: current?.measurementId ?? null,
               measurementType: current?.measurementType ?? null,
               measurementSchemaVersion: current?.measurementSchemaVersion ?? null,
@@ -272,6 +298,9 @@ export function useHdfController({
           disabled_devices?: unknown;
           known_devices?: unknown;
           enabled_known_devices?: unknown;
+          disabled_processes?: unknown;
+          known_processes?: unknown;
+          enabled_known_processes?: unknown;
           measurement_id?: unknown;
           measurement_type?: unknown;
           measurement_schema_version?: unknown;
@@ -302,6 +331,11 @@ export function useHdfController({
         const disabledDevices = normalizeStringList(result.disabled_devices);
         const knownDevices = normalizeStringList(result.known_devices);
         const enabledKnownDevices = normalizeStringList(result.enabled_known_devices);
+        const disabledProcesses = normalizeStringList(result.disabled_processes);
+        const knownProcesses = normalizeStringList(result.known_processes);
+        const enabledKnownProcesses = normalizeStringList(
+          result.enabled_known_processes
+        );
         const measurementId =
           typeof result.measurement_id === "string" &&
           result.measurement_id.trim().length > 0
@@ -357,6 +391,9 @@ export function useHdfController({
             disabledDevices,
             knownDevices,
             enabledKnownDevices,
+            disabledProcesses,
+            knownProcesses,
+            enabledKnownProcesses,
             measurementId,
             measurementType,
             measurementSchemaVersion,
@@ -389,6 +426,9 @@ export function useHdfController({
             disabledDevices: current?.disabledDevices ?? [],
             knownDevices: current?.knownDevices ?? [],
             enabledKnownDevices: current?.enabledKnownDevices ?? [],
+            disabledProcesses: current?.disabledProcesses ?? [],
+            knownProcesses: current?.knownProcesses ?? [],
+            enabledKnownProcesses: current?.enabledKnownProcesses ?? [],
             measurementId: current?.measurementId ?? null,
             measurementType: current?.measurementType ?? null,
             measurementSchemaVersion: current?.measurementSchemaVersion ?? null,
@@ -978,6 +1018,81 @@ export function useHdfController({
     }
   }, [hdfDisableDevicesDraft, runHdfCommand]);
 
+  const executeHdfProcessesGet = useCallback(async () => {
+    await runHdfCommand("hdf.processes.get", {}, "HDF process filter refreshed");
+  }, [runHdfCommand]);
+
+  const executeHdfProcessesEnable = useCallback(async () => {
+    const processIds = normalizeStringList(hdfEnableProcessesDraft);
+    if (processIds.length === 0) {
+      notifications.show({
+        color: "red",
+        title: "Missing parameter",
+        message: "Select one or more process IDs for hdf.processes.enable.",
+      });
+      return;
+    }
+    const ok = await runHdfCommand(
+      "hdf.processes.enable",
+      { process_ids: processIds },
+      "HDF processes enabled"
+    );
+    if (ok) {
+      setHdfEnableProcessesDraft([]);
+    }
+  }, [hdfEnableProcessesDraft, runHdfCommand]);
+
+  const executeHdfProcessesDisable = useCallback(async () => {
+    const processIds = normalizeStringList(hdfDisableProcessesDraft);
+    if (processIds.length === 0) {
+      notifications.show({
+        color: "red",
+        title: "Missing parameter",
+        message: "Select one or more process IDs for hdf.processes.disable.",
+      });
+      return;
+    }
+    const ok = await runHdfCommand(
+      "hdf.processes.disable",
+      { process_ids: processIds },
+      "HDF processes disabled"
+    );
+    if (ok) {
+      setHdfDisableProcessesDraft([]);
+    }
+  }, [hdfDisableProcessesDraft, runHdfCommand]);
+
+  const hdfSelectableProcessIds = useMemo(() => {
+    const out = new Set<string>();
+    for (const pid of hdfWriterStatus?.knownProcesses ?? []) {
+      if (pid) out.add(pid);
+    }
+    for (const pid of hdfWriterStatus?.enabledKnownProcesses ?? []) {
+      if (pid) out.add(pid);
+    }
+    for (const pid of hdfWriterStatus?.disabledProcesses ?? []) {
+      if (pid) out.add(pid);
+    }
+    for (const pid of hdfEnableProcessesDraft) {
+      if (pid) out.add(pid);
+    }
+    for (const pid of hdfDisableProcessesDraft) {
+      if (pid) out.add(pid);
+    }
+    return [...out].sort((a, b) => a.localeCompare(b));
+  }, [
+    hdfWriterStatus?.knownProcesses,
+    hdfWriterStatus?.enabledKnownProcesses,
+    hdfWriterStatus?.disabledProcesses,
+    hdfEnableProcessesDraft,
+    hdfDisableProcessesDraft,
+  ]);
+
+  const hdfSelectableProcessOptions = useMemo(
+    () => hdfSelectableProcessIds.map((pid) => ({ value: pid, label: pid })),
+    [hdfSelectableProcessIds]
+  );
+
   const hdfSelectableDeviceIds = useMemo(() => {
     const out = new Set<string>();
     for (const deviceId of hdfWriterStatus?.knownDevices ?? []) {
@@ -1142,6 +1257,10 @@ export function useHdfController({
     setHdfEnableDevicesDraft,
     hdfDisableDevicesDraft,
     setHdfDisableDevicesDraft,
+    hdfEnableProcessesDraft,
+    setHdfEnableProcessesDraft,
+    hdfDisableProcessesDraft,
+    setHdfDisableProcessesDraft,
     hdfMeasurementSchemaByProcessId,
     setHdfMeasurementSchemaByProcessId,
     hdfRotateMeasurementProfileDraft,
@@ -1165,6 +1284,9 @@ export function useHdfController({
     hdfSupportsDevicesGet,
     hdfSupportsDevicesEnable,
     hdfSupportsDevicesDisable,
+    hdfSupportsProcessesGet,
+    hdfSupportsProcessesEnable,
+    hdfSupportsProcessesDisable,
     hdfSupportsRotate,
     hdfSupportsWritingStart,
     hdfSupportsWritingStop,
@@ -1174,6 +1296,9 @@ export function useHdfController({
     hdfDevicesGetBusy,
     hdfDevicesEnableBusy,
     hdfDevicesDisableBusy,
+    hdfProcessesGetBusy,
+    hdfProcessesEnableBusy,
+    hdfProcessesDisableBusy,
     hdfRotateBusy,
     hdfWritingStartBusy,
     hdfWritingStopBusy,
@@ -1192,6 +1317,8 @@ export function useHdfController({
     hdfShowNoteChiplet,
     hdfSelectableDeviceIds,
     hdfSelectableDeviceOptions,
+    hdfSelectableProcessIds,
+    hdfSelectableProcessOptions,
     hdfWriterFileLabel,
     hdfWriterChipColor,
     refreshHdfWriterStatus,
@@ -1212,5 +1339,8 @@ export function useHdfController({
     executeHdfDevicesGet,
     executeHdfDevicesEnable,
     executeHdfDevicesDisable,
+    executeHdfProcessesGet,
+    executeHdfProcessesEnable,
+    executeHdfProcessesDisable,
   };
 }

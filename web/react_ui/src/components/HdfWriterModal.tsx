@@ -95,6 +95,20 @@ type Props = {
   hdfDevicesDisableBusy: boolean;
   hdfSupportsDevicesDisable: boolean;
   onExecuteDevicesDisable: () => Promise<unknown> | void;
+  hdfSelectableProcessOptions: SelectOption[];
+  hdfProcessesGetBusy: boolean;
+  hdfSupportsProcessesGet: boolean;
+  onExecuteProcessesGet: () => Promise<unknown> | void;
+  hdfEnableProcessesDraft: string[];
+  onEnableProcessesDraftChange: (value: string[]) => void;
+  hdfProcessesEnableBusy: boolean;
+  hdfSupportsProcessesEnable: boolean;
+  onExecuteProcessesEnable: () => Promise<unknown> | void;
+  hdfDisableProcessesDraft: string[];
+  onDisableProcessesDraftChange: (value: string[]) => void;
+  hdfProcessesDisableBusy: boolean;
+  hdfSupportsProcessesDisable: boolean;
+  onExecuteProcessesDisable: () => Promise<unknown> | void;
 };
 
 export function HdfWriterModal({
@@ -164,6 +178,20 @@ export function HdfWriterModal({
   hdfDevicesDisableBusy,
   hdfSupportsDevicesDisable,
   onExecuteDevicesDisable,
+  hdfSelectableProcessOptions,
+  hdfProcessesGetBusy,
+  hdfSupportsProcessesGet,
+  onExecuteProcessesGet,
+  hdfEnableProcessesDraft,
+  onEnableProcessesDraftChange,
+  hdfProcessesEnableBusy,
+  hdfSupportsProcessesEnable,
+  onExecuteProcessesEnable,
+  hdfDisableProcessesDraft,
+  onDisableProcessesDraftChange,
+  hdfProcessesDisableBusy,
+  hdfSupportsProcessesDisable,
+  onExecuteProcessesDisable,
 }: Props) {
   return (
     <Modal opened={opened} onClose={onClose} title={title} size="clamp(56rem, 92vw, 96rem)" centered zIndex={450}>
@@ -600,6 +628,105 @@ export function HdfWriterModal({
                   disabled={hdfCommandsBlocked || !hdfSupportsDevicesDisable}
                   onClick={() => {
                     void onExecuteDevicesDisable();
+                  }}
+                >
+                  Disable
+                </Button>
+              </Group>
+            </Group>
+          </Card>
+
+          <Card radius="md" p="sm" style={{ border: "1px solid var(--card-border)" }}>
+            <Group justify="space-between" align="center" wrap="wrap">
+              <Stack gap={2}>
+                <Text fw={600} size="sm">
+                  hdf.processes.get
+                </Text>
+                <Text size="xs" c="dimmed">
+                  Query known, enabled, and disabled process telemetry writers.
+                </Text>
+              </Stack>
+              <Button
+                size="xs"
+                loading={hdfProcessesGetBusy}
+                disabled={hdfCommandsBlocked || !hdfSupportsProcessesGet}
+                onClick={() => {
+                  void onExecuteProcessesGet();
+                }}
+              >
+                Run
+              </Button>
+            </Group>
+          </Card>
+
+          <Card radius="md" p="sm" style={{ border: "1px solid var(--card-border)" }}>
+            <Group justify="space-between" align="flex-end" wrap="wrap">
+              <Stack gap={2} style={{ flex: "0 0 220px" }}>
+                <Text fw={600} size="sm">
+                  hdf.processes.enable
+                </Text>
+                <Text size="xs" c="dimmed">
+                  Enable telemetry writing for selected process IDs.
+                </Text>
+              </Stack>
+              <Group gap="xs" align="flex-end" wrap="wrap" style={{ flex: 1 }}>
+                <MultiSelect
+                  size="xs"
+                  label="process_ids"
+                  placeholder="Select processes"
+                  value={hdfEnableProcessesDraft}
+                  data={hdfSelectableProcessOptions}
+                  searchable
+                  clearable
+                  comboboxProps={{ zIndex: 500 }}
+                  nothingFoundMessage="No processes discovered"
+                  onChange={onEnableProcessesDraftChange}
+                  style={{ flex: "1 1 260px" }}
+                />
+                <Button
+                  size="xs"
+                  loading={hdfProcessesEnableBusy}
+                  disabled={hdfCommandsBlocked || !hdfSupportsProcessesEnable}
+                  onClick={() => {
+                    void onExecuteProcessesEnable();
+                  }}
+                >
+                  Enable
+                </Button>
+              </Group>
+            </Group>
+          </Card>
+
+          <Card radius="md" p="sm" style={{ border: "1px solid var(--card-border)" }}>
+            <Group justify="space-between" align="flex-end" wrap="wrap">
+              <Stack gap={2} style={{ flex: "0 0 220px" }}>
+                <Text fw={600} size="sm">
+                  hdf.processes.disable
+                </Text>
+                <Text size="xs" c="dimmed">
+                  Disable telemetry writing for selected process IDs.
+                </Text>
+              </Stack>
+              <Group gap="xs" align="flex-end" wrap="wrap" style={{ flex: 1 }}>
+                <MultiSelect
+                  size="xs"
+                  label="process_ids"
+                  placeholder="Select processes"
+                  value={hdfDisableProcessesDraft}
+                  data={hdfSelectableProcessOptions}
+                  searchable
+                  clearable
+                  comboboxProps={{ zIndex: 500 }}
+                  nothingFoundMessage="No processes discovered"
+                  onChange={onDisableProcessesDraftChange}
+                  style={{ flex: "1 1 260px" }}
+                />
+                <Button
+                  size="xs"
+                  loading={hdfProcessesDisableBusy}
+                  disabled={hdfCommandsBlocked || !hdfSupportsProcessesDisable}
+                  onClick={() => {
+                    void onExecuteProcessesDisable();
                   }}
                 >
                   Disable

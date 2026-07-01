@@ -123,6 +123,20 @@ export function HdfModalsLayer({ hdf, renderMeasurementFieldInput }: Props) {
         hdfDevicesDisableBusy={hdf.hdfDevicesDisableBusy}
         hdfSupportsDevicesDisable={hdf.hdfSupportsDevicesDisable}
         onExecuteDevicesDisable={hdf.executeHdfDevicesDisable}
+        hdfSelectableProcessOptions={hdf.hdfSelectableProcessOptions}
+        hdfProcessesGetBusy={hdf.hdfProcessesGetBusy}
+        hdfSupportsProcessesGet={hdf.hdfSupportsProcessesGet}
+        onExecuteProcessesGet={hdf.executeHdfProcessesGet}
+        hdfEnableProcessesDraft={hdf.hdfEnableProcessesDraft}
+        onEnableProcessesDraftChange={hdf.setHdfEnableProcessesDraft}
+        hdfProcessesEnableBusy={hdf.hdfProcessesEnableBusy}
+        hdfSupportsProcessesEnable={hdf.hdfSupportsProcessesEnable}
+        onExecuteProcessesEnable={hdf.executeHdfProcessesEnable}
+        hdfDisableProcessesDraft={hdf.hdfDisableProcessesDraft}
+        onDisableProcessesDraftChange={hdf.setHdfDisableProcessesDraft}
+        hdfProcessesDisableBusy={hdf.hdfProcessesDisableBusy}
+        hdfSupportsProcessesDisable={hdf.hdfSupportsProcessesDisable}
+        onExecuteProcessesDisable={hdf.executeHdfProcessesDisable}
       />
     </>
   );
