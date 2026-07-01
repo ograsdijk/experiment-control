@@ -1250,8 +1250,26 @@ class Manager(
             handle.rpc_endpoint = reg.rpc_endpoint
             handle.pub_endpoint = reg.pub_endpoint
             handle.capabilities = reg.capabilities
-            handle.driver_process_state = ManagedProcessState.RUNNING
-            handle.driver_pid = handle.process.pid if handle.process else None
+            # Only promote to RUNNING when the driver is actually alive. A
+            # `register` message can be a stale buffered message from a process
+            # that already exited (and was reaped by the supervisor, clearing
+            # handle.process); promoting then would wedge the driver at RUNNING
+            # with pid=None. Trust a live tracked subprocess, or a fresh
+            # heartbeat for externally-started drivers.
+            if handle.process is not None and handle.process.poll() is None:
+                handle.driver_process_state = ManagedProcessState.RUNNING
+                handle.driver_pid = handle.process.pid
+            else:
+                hb = handle.last_hb_recv_mono
+                hb_fresh = (
+                    hb is not None
+                    and (time.monotonic() - hb) <= self._heartbeat_timeout_s
+                )
+                if hb_fresh:
+                    handle.driver_process_state = ManagedProcessState.RUNNING
+                    # pid is maintained by the heartbeat handler.
+                # else: stale registration for a dead process — leave state/pid
+                # unchanged; the supervisor reconciles a phantom RUNNING.
 
             # Connect SUB to driver PUB (one SUB can connect to many PUBs)
             self._sub.connect(reg.pub_endpoint)
