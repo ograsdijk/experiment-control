@@ -359,7 +359,9 @@ def _normalize_process_telemetry_schema(schema: Any) -> list[Json]:
         if not name or name in seen:
             continue
         seen.add(name)
-        dtype = str(entry.get("dtype", "f8")).strip() or "f8"
+        # Default to the canonical numpy name the HDF writer accepts, not the
+        # "f8" typecode (DTYPE_MAP is keyed by exact name, so "f8" is rejected).
+        dtype = str(entry.get("dtype", "float64")).strip() or "float64"
         units = str(entry.get("units", "") or "")
         out.append({"name": name, "dtype": dtype, "units": units})
     return out
