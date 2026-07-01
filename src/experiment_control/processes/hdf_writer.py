@@ -87,10 +87,10 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     add_rpc_timeout_arg(p, default_ms=2000)
     add_heartbeat_args(p, default_period_s=1.0)
     p.add_argument("--rcvhwm", type=int, default=10_000)
-    p.add_argument("--write-every-s", type=float, default=1.0)
+    p.add_argument("--write-every-s", type=float, default=5.0)
     p.add_argument("--buffer-max-messages", type=int, default=200_000)
-    p.add_argument("--flush-every-n", type=int, default=200)
-    p.add_argument("--flush-every-s", type=float, default=2.0)
+    p.add_argument("--flush-every-n", type=int, default=2000)
+    p.add_argument("--flush-every-s", type=float, default=15.0)
     p.add_argument("--context-resolve-ttl-s", type=float, default=5.0)
     p.add_argument("--context-pending-max-per-stream", type=int, default=10_000)
     p.add_argument("--context-map-max-per-stream", type=int, default=20_000)
@@ -354,7 +354,11 @@ class HdfWriter(ManagedProcessBase):
         self._buffer_max_messages = int(buffer_max_messages)
         self._flush_every_n = int(flush_every_n)
         self._flush_every_s = float(flush_every_s)
-        batch_rows = max(64, min(max(1, self._flush_every_n), 2048))
+        # Size the per-device write-staging buffer so a full write cycle is
+        # typically one contiguous h5py append. Decoupled from `flush_every_n`
+        # (which is now purely a flush-to-disk trigger) with a generous floor
+        # and ceiling so the larger 5 s write cadence still coalesces cleanly.
+        batch_rows = min(max(int(self._flush_every_n), 1024), 8192)
         self._telemetry_batch_rows = int(batch_rows)
         self._event_batch_rows = int(batch_rows)
         self._context_resolve_ttl_s = max(0.1, float(context_resolve_ttl_s))
@@ -410,6 +414,11 @@ class HdfWriter(ManagedProcessBase):
         self._context_columns_fetch_attempted = False
         self._sequencer_process_id = "sequencer"
         self._seen_context_ids: set[int] = set()
+        # Context-table rows buffered on the main drain thread (dedup'd via
+        # `_seen_context_ids`) and written to h5py by the bg thread. Keeps the
+        # one remaining h5py write off the high-frequency drain path so the SUB
+        # socket never stalls behind a slow context-table write / RPC.
+        self._pending_context_rows: list[dict[str, Any]] = []
         self._datasets: dict[str, h5py.Dataset] = {}
         self._device_map: dict[str, Json] = {}
         self._sub: zmq.Socket | None = None
@@ -477,7 +486,7 @@ class HdfWriter(ManagedProcessBase):
         # _writing_active) are written by the bg thread on every file
         # open/close/rotate and read by status RPC handlers without a lock
         # (single-reference attribute reads are atomic in CPython).
-        bg_qsize = max(8, self._flush_every_n // 100)
+        bg_qsize = max(32, self._flush_every_n // 100)
         self._bg_queue: "queue.Queue[_FlushBatch | _BgRequest | _BgSentinel]" = (
             queue.Queue(maxsize=bg_qsize)
         )
@@ -496,6 +505,13 @@ class HdfWriter(ManagedProcessBase):
         self._last_flush_drop_event_mono: float = 0.0
         # Same rate-limit semantics for `hdf.flush_batch_deferred`.
         self._last_flush_defer_event_mono: float = 0.0
+        # Rate-limit for the `hdf.backpressure` alarm (reservoir high-water).
+        self._last_backpressure_event_mono: float = 0.0
+        # Reservoir high-water marks (rows). Soft = loud alarm only; hard =
+        # last-resort drop-with-accounting so a genuine sustained overload
+        # can never grow memory without bound. Sized off the deque cap.
+        self._reservoir_soft_rows = int(self._buffer_max_messages)
+        self._reservoir_hard_rows = int(self._buffer_max_messages) * 4
         self._bg_join_timeout_s = max(0.1, float(bg_join_timeout_s))
         self._active_h5_filename: str | None = None
         self._writing_active = False
@@ -939,7 +955,7 @@ class HdfWriter(ManagedProcessBase):
                 self._bump_error("run_metadata.stale_skip")
                 return
             for device_id, run_metadata in results:
-                self._handle_run_metadata(
+                self._handle_run_metadata_locked(
                     {
                         "device_id": device_id,
                         "run_metadata": run_metadata,
@@ -1181,18 +1197,33 @@ class HdfWriter(ManagedProcessBase):
         # operate on private copies and don't race with concurrent
         # main-loop appends.
         with self._h5_lock:
+            if batch.context_rows:
+                self._write_context_rows_batch(batch.context_rows)
             self._write_buffered_rows_batch(batch.buffered_rows)
             self._write_event_rows_batch(batch.event_rows)
             if batch.stream_batches:
-                self._write_stream_buffers_batch(batch.stream_batches)
-            if batch.pending_stream_metadata:
-                # Newly observed per-stream metadata is merged into the
-                # live dict the next write cycle will read.
-                self._pending_stream_metadata.update(
-                    batch.pending_stream_metadata
+                self._write_stream_buffers_batch(
+                    batch.stream_batches, stream_meta=batch.stream_meta
                 )
             if batch.force_flush:
                 self._flush_active_file()
+
+    def _drain_bg_queue_locked(self) -> None:
+        """Write any `_FlushBatch` items still queued when the bg thread
+        exited (it stops pulling as soon as `_stop_evt` is set). Runs on the
+        main thread during close(), bg thread already joined, under _h5_lock.
+        Non-batch items (sentinels / unused request types) are discarded."""
+        self._assert_h5_locked()
+        while True:
+            try:
+                req = self._bg_queue.get_nowait()
+            except queue.Empty:
+                break
+            if isinstance(req, _FlushBatch):
+                try:
+                    self._handle_flush_batch(req)
+                except Exception:
+                    self._bump_error("close.bg_queue_batch")
 
     def _shutdown_bg_thread(self) -> None:
         thread = self._bg_thread
@@ -1244,16 +1275,50 @@ class HdfWriter(ManagedProcessBase):
             )
 
     def _drain_pending_to_file(self) -> None:
-        # Synchronous drain used by RPC paths that still execute on the
-        # main thread (file rotation, stop_writing, close). Held under
-        # _h5_lock so the bg flush thread can't be mid-write. Subsequent
-        # commits move these RPC paths through the queue too, at which
-        # point the lock can be narrowed.
+        # Synchronous drain of the LIVE reservoir, used by main-thread file
+        # ops (rotate / stop / close). Callers first `_quiesce_bg_writes()`
+        # (rotate/stop) or shut the bg thread down (close), so the bg thread
+        # is not writing concurrently. Held under _h5_lock for the h5py work.
         with self._h5_lock:
+            if self._pending_context_rows:
+                self._write_context_rows_batch(self._pending_context_rows)
+                self._pending_context_rows = []
             self._write_buffered_rows()
             self._write_event_rows()
             self._write_stream_buffers()
             self._flush_active_file()
+
+    def _quiesce_bg_writes(self, *, timeout_s: float | None = None) -> None:
+        """Flush the entire reservoir + bg queue to disk before a file op
+        closes/rotates the file, closing the in-flight-batch loss gap.
+
+        Snapshots the current reservoir into a final force-flush batch, then
+        waits (bounded) for the bg queue to fully drain. Must be called
+        WITHOUT `_h5_lock` held so the bg thread can acquire it to write.
+        No-op when the bg thread isn't running (tests / pre-start) — the
+        caller's subsequent `_drain_pending_to_file` handles those cases.
+        """
+        thread = self._bg_thread
+        if thread is None or not thread.is_alive() or self._stop_evt.is_set():
+            return
+        budget = self._bg_join_timeout_s * 10 if timeout_s is None else max(0.0, timeout_s)
+        deadline = time.monotonic() + budget
+        # Push the current reservoir; retry briefly if the queue is momentarily
+        # full (the bg thread is actively draining it).
+        while not self._enqueue_flush_batch(force_flush=True):
+            if time.monotonic() >= deadline:
+                self._bump_error("bg.quiesce_enqueue_timeout")
+                break
+            time.sleep(0.005)
+        # Wait for the bg thread to empty the queue. qsize()==0 plus the
+        # caller's subsequent `_h5_lock` acquisition guarantees the last batch
+        # has finished writing (acquiring the lock blocks until the bg thread
+        # releases it after its current write).
+        while self._bg_queue.qsize() > 0:
+            if time.monotonic() >= deadline:
+                self._bump_error("bg.quiesce_drain_timeout")
+                break
+            time.sleep(0.005)
 
     def _publish_h5_state_cache(self) -> None:
         """Refresh cached filename/writing_active from current `self._h5`.
@@ -1372,11 +1437,17 @@ class HdfWriter(ManagedProcessBase):
         list[tuple[str, Json]],
         dict[tuple[str, str], dict[str, list[Any]]],
         dict[tuple[str, str], dict[str, Any]],
+        list[dict[str, Any]],
     ]:
-        """Atomically extract main-loop drain buffers + replace with fresh.
+        """Extract main-loop drain buffers + replace with fresh containers.
 
-        Main loop continues to append to the fresh containers while the bg
-        thread consumes the snapshot. Caller owns the returned snapshots.
+        Runs on the main loop thread (the only thread that touches these
+        buffers), so the swap needs no lock. The returned snapshot is
+        transferred to the bg thread via the queue and is never mutated by
+        the main loop afterwards. It is *self-contained*: `stream_meta`
+        carries the dtype/shape/session for each buffered stream so the bg
+        write never reads the main-owned `_stream_schema` /
+        `_stream_active_session` maps.
         """
         rows: list[Json] = []
         if self._buf is not None:
@@ -1391,51 +1462,127 @@ class HdfWriter(ManagedProcessBase):
         stream_buffers = self._stream_buffers
         self._stream_buffers = {}
 
-        pending_metadata = self._pending_stream_metadata
-        self._pending_stream_metadata = {}
+        stream_meta: dict[tuple[str, str], dict[str, Any]] = {}
+        for key in stream_buffers:
+            schema = self._stream_schema.get(key)
+            if schema is None:
+                continue
+            stream_meta[key] = {
+                "dtype": schema.get("dtype"),
+                "shape": schema.get("shape"),
+                "session": int(self._stream_active_session.get(key, 1)),
+            }
 
-        return rows, event_rows, stream_buffers, pending_metadata
+        context_rows = self._pending_context_rows
+        self._pending_context_rows = []
+
+        return rows, event_rows, stream_buffers, stream_meta, context_rows
+
+    def _stream_buffered_rows(self) -> int:
+        total = 0
+        for buf in self._stream_buffers.values():
+            data = buf.get("data") if isinstance(buf, dict) else None
+            if isinstance(data, list):
+                total += len(data)
+        return total
+
+    def _reservoir_row_count(self) -> int:
+        """Total rows currently held in the in-memory reservoirs (telemetry +
+        events + stream frames + pending context rows). Drives the early-enqueue
+        trigger and the backpressure alarm. Cheap; runs on the main loop."""
+        total = 0
+        if self._buf is not None:
+            total += len(self._buf)
+        if self._event_buf is not None:
+            total += len(self._event_buf)
+        total += self._stream_buffered_rows()
+        total += len(self._pending_context_rows)
+        return total
+
+    def _check_reservoir_backpressure(self, *, now_mono: float) -> None:
+        """Alarm (and, only at the hard ceiling, drop-with-accounting) when the
+        reservoir grows unbounded because the bg thread can't keep up. For a
+        finite burst this never fires; it exists so a genuine sustained overload
+        is loud and any unavoidable loss is recorded (never silent)."""
+        total = self._reservoir_row_count()
+        if total < self._reservoir_soft_rows:
+            return
+        stream_rows = self._stream_buffered_rows()
+        if now_mono - self._last_backpressure_event_mono >= 1.0:
+            self._last_backpressure_event_mono = now_mono
+            self._bump_error("bg.reservoir_backpressure")
+            try:
+                self._publish_process_event(
+                    topic="hdf.backpressure",
+                    payload={
+                        "buffered_rows_total": int(total),
+                        "buffered_stream_rows": int(stream_rows),
+                        "soft_cap": int(self._reservoir_soft_rows),
+                        "hard_cap": int(self._reservoir_hard_rows),
+                        "queue_depth": self._bg_queue.qsize(),
+                        "queue_max": self._bg_queue.maxsize,
+                    },
+                )
+            except Exception:
+                pass
+        if stream_rows > self._reservoir_hard_rows:
+            self._drop_oldest_stream_frames(
+                target_drop=stream_rows - self._reservoir_hard_rows
+            )
+
+    def _drop_oldest_stream_frames(self, *, target_drop: int) -> None:
+        """Last-resort: drop the oldest buffered stream frames, largest buffers
+        first, and bump `_stream_dropped_total` so the drop is recorded in the
+        file's per-stream `dropped_total` attr. Only reached above the hard
+        reservoir ceiling."""
+        remaining = int(target_drop)
+        if remaining <= 0:
+            return
+        keys = sorted(
+            self._stream_buffers.keys(),
+            key=lambda k: len(self._stream_buffers[k].get("data", []) or []),
+            reverse=True,
+        )
+        for key in keys:
+            if remaining <= 0:
+                break
+            buf = self._stream_buffers.get(key)
+            if not isinstance(buf, dict):
+                continue
+            data = buf.get("data")
+            n = len(data) if isinstance(data, list) else 0
+            if n <= 0:
+                continue
+            drop = min(remaining, n)
+            for col in ("data", "seq", "t0_mono_ns", "t0_wall_ns", "context_id"):
+                values = buf.get(col)
+                if isinstance(values, list):
+                    del values[:drop]
+            self._stream_dropped_total[key] = (
+                int(self._stream_dropped_total.get(key, 0)) + drop
+            )
+            remaining -= drop
+            self._bump_error("bg.reservoir_drop")
 
     def _enqueue_flush_batch(self, *, force_flush: bool) -> bool:
         """Snapshot main-loop drain state and hand it to the bg flush thread.
 
-        Returns True if the batch was queued, False if it was dropped due
-        to overflow (the data is lost â€” `_dropped_flush_batches` is
-        incremented so it surfaces in heartbeat/status). When the batch
-        is queued successfully, `_pending` and `_last_flush` bookkeeping
-        is updated to mirror the old synchronous-write timing.
+        **Non-dropping.** If the bg queue is saturated we leave *all* data in
+        the in-memory reservoirs (the deques, the stream buffers, and the
+        pending context rows) and return False — nothing is discarded. The
+        next call ships one larger batch once the bg thread drains a slot.
+        Returns True if a batch was queued (or there was nothing to queue).
 
-        Defer-when-full: for non-force_flush calls, if the bg queue is
-        already saturated we *skip* the destructive snapshot of `_buf`
-        and `_event_buf` so the rows/events stay in the 200k-message
-        in-memory deques (where `drop_newest` already provides bounded
-        overflow handling). Stream buffers and pending stream metadata
-        are unbounded dicts though, so we snapshot-and-discard those to
-        keep memory bounded during a sustained backlog. Force-flush
-        callers retain the original "snapshot + drop on overflow"
-        contract â€” rotation/shutdown paths use `_drain_pending_to_file`
-        synchronously so they don't traverse this method.
+        `force_flush` only asks the bg thread to `h5.flush()` after writing;
+        because deferral is now lossless it never bypasses the reservoir, so
+        the old "force flush stampede drops the batch" trap is gone. The
+        flush cadence self-regulates: the bg thread resets `_last_flush` in
+        `_flush_active_file`, so `force_flush` stops being requested until the
+        next `flush_every_s` interval elapses.
         """
-        if not force_flush and self._bg_queue.full():
-            dropped_stream_rows = 0
-            try:
-                for sb in self._stream_buffers.values():
-                    if isinstance(sb, dict) and sb:
-                        # `_stream_buffers` maps stream-key ->
-                        # dict[column_name, list[value]]. Row count is
-                        # the max column length within a given stream.
-                        dropped_stream_rows += max(
-                            (len(col) for col in sb.values() if isinstance(col, list)),
-                            default=0,
-                        )
-            except Exception:
-                # Observability-only count; never let a structural
-                # surprise mask the defer or crash the main loop.
-                dropped_stream_rows = -1
-            if self._stream_buffers:
-                self._stream_buffers = {}
-            if self._pending_stream_metadata:
-                self._pending_stream_metadata = {}
+        if self._bg_queue.full():
+            # Reservoir stays intact; just record the backlog (rate-limited)
+            # so a sustained overflow is visible without polling status.
             self._deferred_flush_batches += 1
             self._bump_error("bg.flush_batch.deferred")
             now_mono = time.monotonic()
@@ -1452,7 +1599,7 @@ class HdfWriter(ManagedProcessBase):
                             "buffered_events": (
                                 len(self._event_buf) if self._event_buf else 0
                             ),
-                            "dropped_stream_rows": dropped_stream_rows,
+                            "buffered_streams": len(self._stream_buffers),
                         },
                     )
                 except Exception:
@@ -1461,14 +1608,14 @@ class HdfWriter(ManagedProcessBase):
                     pass
             return False
 
-        rows, event_rows, stream_buffers, pending_metadata = (
+        rows, event_rows, stream_buffers, stream_meta, context_rows = (
             self._snapshot_main_loop_buffers()
         )
         if (
             not rows
             and not event_rows
             and not stream_buffers
-            and not pending_metadata
+            and not context_rows
             and not force_flush
         ):
             return True
@@ -1476,44 +1623,13 @@ class HdfWriter(ManagedProcessBase):
             buffered_rows=rows,
             event_rows=event_rows,
             stream_batches=stream_buffers,
-            pending_stream_metadata=pending_metadata,
+            stream_meta=stream_meta,
+            context_rows=context_rows,
             force_flush=force_flush,
         )
-        try:
-            self._bg_queue.put_nowait(batch)
-        except queue.Full:
-            # Bg thread is backlogged. The snapshotted data is dropped
-            # rather than blocking the main loop; counter is exposed in
-            # status so persistent overflow shows up in monitoring.
-            #
-            # A dropped flush batch is a real correctness degradation for
-            # a writer whose contract is "persist data". Publish a
-            # `hdf.flush_batch_dropped` event on the process data PUB so
-            # operators see it without polling status. Rate-limited to
-            # at most once per second to avoid flooding on sustained
-            # backlog.
-            self._dropped_flush_batches += 1
-            self._bump_error("bg.flush_batch.dropped")
-            now_mono = time.monotonic()
-            if now_mono - self._last_flush_drop_event_mono >= 1.0:
-                self._last_flush_drop_event_mono = now_mono
-                try:
-                    self._publish_process_event(
-                        topic="hdf.flush_batch_dropped",
-                        payload={
-                            "queue_depth": self._bg_queue.qsize(),
-                            "queue_max": self._bg_queue.maxsize,
-                            "dropped_total": self._dropped_flush_batches,
-                        },
-                    )
-                except Exception:
-                    # Never let event-publish failure mask the drop or
-                    # destabilise the main loop.
-                    pass
-            return False
-        if force_flush:
-            self._pending = 0
-            self._last_flush = time.monotonic()
+        # Single producer (the main loop) and we checked not-full above, so
+        # put_nowait cannot raise — the bg thread's get() only frees space.
+        self._bg_queue.put_nowait(batch)
         return True
 
     def _clear_buffered_for_disabled(self, disabled: set[str]) -> None:
@@ -1693,6 +1809,7 @@ class HdfWriter(ManagedProcessBase):
         self._context_columns_ready = False
         self._context_columns_fetch_attempted = False
         self._seen_context_ids = set()
+        self._pending_context_rows = []
         self._datasets = {}
         self._device_map = {}
         self._stream_datasets = {}
@@ -1824,7 +1941,9 @@ class HdfWriter(ManagedProcessBase):
                 device_id = self._normalize_device_id(config.get("device_id"))
                 if device_id is not None:
                     self._latest_device_config[device_id] = copy.deepcopy(config)
-                self._handle_device_config(config, cache=False)
+                # Already under _h5_lock (via _configure_active_file); call the
+                # locked impl directly to avoid a redundant re-acquire.
+                self._handle_device_config_locked(config, cache=False)
             self._enqueue_run_metadata_capture(configs)
 
         self._pending = 0
@@ -1860,6 +1979,10 @@ class HdfWriter(ManagedProcessBase):
                 measurement_values=measurement_values,
             )
             return None, new_file
+
+        # Drain the reservoir + bg queue into the OLD file before rotating, so
+        # no in-flight batch is written to the new file or lost.
+        self._quiesce_bg_writes()
 
         with self._h5_lock:
             old_file = str(self._h5.filename)
@@ -1988,6 +2111,11 @@ class HdfWriter(ManagedProcessBase):
         # close are guarded by `_h5_lock` so the bg flush thread can't
         # interleave a write between flush and close, and so observers
         # (status RPC, etc.) see a coherent file-active state.
+        #
+        # Quiesce the bg thread FIRST (outside the lock) so every buffered +
+        # in-flight batch lands in this file before it closes — this is the
+        # "stop finishes writing the buffer before stopping" guarantee.
+        self._quiesce_bg_writes()
         with self._h5_lock:
             h5 = self._h5
             if h5 is None:
@@ -2026,6 +2154,15 @@ class HdfWriter(ManagedProcessBase):
             return file_path
 
     def close(self) -> None:
+        # Best-effort: while the bg thread is still running (close() called
+        # directly, not via run()'s finally), push the reservoir through and
+        # let it drain. No-op if _stop_evt is already set (run() teardown) —
+        # the post-shutdown main-thread drain below is the reliable backstop.
+        try:
+            self._quiesce_bg_writes()
+        except Exception:
+            self._bump_error("close.quiesce")
+
         self._stop_evt.set()
 
         # Shut down the bg flush thread BEFORE tearing down sockets or h5
@@ -2084,10 +2221,22 @@ class HdfWriter(ManagedProcessBase):
         # can't race the h5.close().
         with self._h5_lock:
             h5 = self._h5
+            if h5 is not None:
+                # The bg thread has stopped; write anything it left behind so
+                # shutdown is lossless: (1) batches still sitting in the bg
+                # queue when it exited, then (2) the live reservoir.
+                try:
+                    self._drain_bg_queue_locked()
+                except Exception:
+                    self._bump_error("close.bg_queue_drain")
+                try:
+                    self._drain_pending_to_file()
+                except Exception:
+                    self._bump_error("close.drain")
+                self._mark_active_measurement_ended()
             self._h5 = None
             self._publish_h5_state_cache()
             if h5 is not None:
-                self._mark_active_measurement_ended()
                 try:
                     h5.flush()
                 except Exception:
@@ -2205,30 +2354,40 @@ class HdfWriter(ManagedProcessBase):
                     now = time.monotonic()
                     timeout_s = min(
                         self._next_write - now,
-                        (self._last_flush + flush_every_s) - now,
+                        self._next_writing_active_publish_mono - now,
                     )
                     timeout_ms = int(max(0.0, timeout_s) * 1000)
                     events = self._poll_and_drain(timeout_ms)
 
                     if events.get(sub) == zmq.POLLIN:
-                        # Drain messages from ZMQ into our deques /
-                        # stream-state. Held under _h5_lock because the
-                        # message handlers may mutate state the bg thread
-                        # also reads. Per-message processing is fast
-                        # (microseconds); the lock is rarely contended.
-                        with self._h5_lock:
-                            self._drain_socket()
+                        # Drain messages from ZMQ into the in-memory reservoirs.
+                        # LOCK-FREE: the high-frequency drain path (telemetry /
+                        # events / chunk_ready) touches only main-owned Python
+                        # state and never h5py, so it can run while the bg
+                        # thread holds _h5_lock for a slow write — this is what
+                        # keeps the SUB socket drained and prevents ZMQ HWM
+                        # drops. Low-frequency handlers that DO write h5py
+                        # (device_config / run_metadata / sequencer) take
+                        # _h5_lock internally.
+                        self._drain_socket()
+
+                    # Context-buffer housekeeping (pure in-memory) moved off the
+                    # bg write onto the main thread. Runs every iteration (not
+                    # just when messages arrived) so pending-context TTL expiry
+                    # still progresses during idle gaps.
+                    self._sweep_context_buffers(now_mono=time.monotonic())
 
                     now = time.monotonic()
-                    should_force_flush = (
-                        self._pending >= flush_every_n
-                        or (now - self._last_flush) >= flush_every_s
-                    )
-                    if now >= self._next_write or should_force_flush:
-                        self._enqueue_flush_batch(
-                            force_flush=should_force_flush,
-                        )
+                    # Enqueue on the write cadence, or early if the reservoir is
+                    # filling faster than that (keeps memory bounded under load).
+                    # `force_flush` is purely the fsync-cadence flag; deferral is
+                    # lossless so it never drops (no force-flush trap).
+                    buffered = self._reservoir_row_count()
+                    want_flush = (now - self._last_flush) >= flush_every_s
+                    if now >= self._next_write or buffered >= flush_every_n:
+                        self._enqueue_flush_batch(force_flush=want_flush)
                         self._next_write = now + write_every_s
+                        self._check_reservoir_backpressure(now_mono=now)
 
                     # Periodically publish writing_active so the interlock's
                     # max_age freshness check holds while idle (fresh false
@@ -2365,6 +2524,12 @@ class HdfWriter(ManagedProcessBase):
         return snapshot_id, None
 
     def _handle_sequencer_lifecycle(self, msg: Json) -> None:
+        # Low-frequency handler from the lock-free main drain; writes h5py
+        # (sequencer events + yaml snapshot) so it takes _h5_lock.
+        with self._h5_lock:
+            self._handle_sequencer_lifecycle_locked(msg)
+
+    def _handle_sequencer_lifecycle_locked(self, msg: Json) -> None:
         ts_raw = msg.get("ts")
         ts = ts_raw if isinstance(ts_raw, dict) else {}
         t_wall = float(ts.get("t_wall", np.nan))
@@ -3807,26 +3972,49 @@ class HdfWriter(ManagedProcessBase):
         )
 
     def _record_context(self, context_id: int, fields: dict[str, Any]) -> None:
-        self._assert_h5_locked()
+        # Runs on the main drain thread (lock-free, h5py-free). Buffer the
+        # context row — deduplicated via `_seen_context_ids` — and let the bg
+        # thread perform the actual h5py write in `_write_context_rows_batch`.
+        # Deferring keeps the SUB drain from ever stalling behind a
+        # context-table write or the (blocking) columns-spec RPC.
         if self._context_table_ds is None:
             return
-        if context_id in self._seen_context_ids:
+        cid = int(context_id)
+        if cid in self._seen_context_ids:
             return
-        self._seen_context_ids.add(context_id)
-        self._ensure_context_columns(fields)
-        row = np.zeros(1, dtype=self._context_table_ds.dtype)
-        row[0]["context_id"] = int(context_id)
-        row[0]["ts_wall_ns"] = int(time.time_ns())
-        row[0]["ts_mono_ns"] = int(time.monotonic_ns())
-        try:
-            fields_json = json.dumps(fields)
-        except Exception:
-            fields_json = str(fields)
-        row[0]["fields_json"] = fields_json
-        old = self._context_table_ds.shape[0]
-        self._context_table_ds.resize((old + 1,))
-        self._context_table_ds[old] = row[0]
-        self._append_context_columns(old, fields)
+        self._seen_context_ids.add(cid)
+        self._pending_context_rows.append(
+            {
+                "context_id": cid,
+                "fields": fields,
+                "ts_wall_ns": int(time.time_ns()),
+                "ts_mono_ns": int(time.monotonic_ns()),
+            }
+        )
+
+    def _write_context_rows_batch(self, rows: list[dict[str, Any]]) -> None:
+        # Bg thread, under _h5_lock. Writes the context-table rows the main
+        # thread buffered (timestamps captured at observation time so they
+        # reflect when the context was seen, not when it was persisted).
+        self._assert_h5_locked()
+        if not rows or self._context_table_ds is None:
+            return
+        for row_info in rows:
+            fields = row_info.get("fields") or {}
+            self._ensure_context_columns(fields)
+            row = np.zeros(1, dtype=self._context_table_ds.dtype)
+            row[0]["context_id"] = int(row_info.get("context_id", -1))
+            row[0]["ts_wall_ns"] = int(row_info.get("ts_wall_ns", 0))
+            row[0]["ts_mono_ns"] = int(row_info.get("ts_mono_ns", 0))
+            try:
+                fields_json = json.dumps(fields)
+            except Exception:
+                fields_json = str(fields)
+            row[0]["fields_json"] = fields_json
+            old = self._context_table_ds.shape[0]
+            self._context_table_ds.resize((old + 1,))
+            self._context_table_ds[old] = row[0]
+            self._append_context_columns(old, fields)
 
     def _write_stream_buffers(self) -> None:
         # Backward-compatible entry point. Mirrors the wrapper pattern
@@ -3840,15 +4028,20 @@ class HdfWriter(ManagedProcessBase):
     def _write_stream_buffers_batch(
         self,
         stream_buffers: dict[tuple[str, str], dict[str, list[Any]]],
+        *,
+        stream_meta: dict[tuple[str, str], dict[str, Any]] | None = None,
     ) -> None:
+        # `stream_meta` (dtype/shape/session per key) is supplied by the bg
+        # flush path so the write is self-contained; the synchronous drain
+        # path (file rotate/stop/close, main thread with the bg quiesced)
+        # passes None and reads the live `_stream_schema`/`_stream_readers`/
+        # `_stream_active_session` maps instead. Context-buffer sweeps live on
+        # the main drain thread now, so they are NOT performed here.
         self._assert_h5_locked()
         if self._h5 is None or self._streams_group is None:
             for _key, buf in stream_buffers.items():
                 self._clear_stream_buffer(buf)
-            self._stream_pending_by_seq.clear()
-            self._stream_context_by_seq.clear()
             return
-        self._sweep_context_buffers(now_mono=time.monotonic())
         for key, buf in list(stream_buffers.items()):
             data_list = buf.get("data", [])
             if not data_list:
@@ -3858,15 +4051,20 @@ class HdfWriter(ManagedProcessBase):
             if not self._is_device_enabled(device_id):
                 self._clear_stream_buffer(buf)
                 continue
-            schema = self._stream_schema.get(key)
-            reader = self._stream_readers.get(key)
-
-            dtype_raw = None if schema is None else schema.get("dtype")
-            shape_raw = None if schema is None else schema.get("shape")
-            if dtype_raw is None and reader is not None:
-                dtype_raw = reader.layout.dtype
-            if shape_raw is None and reader is not None:
-                shape_raw = tuple(reader.layout.shape)
+            meta = stream_meta.get(key) if stream_meta else None
+            dtype_raw = meta.get("dtype") if meta else None
+            shape_raw = meta.get("shape") if meta else None
+            if dtype_raw is None or shape_raw is None:
+                schema = self._stream_schema.get(key)
+                reader = self._stream_readers.get(key)
+                if dtype_raw is None:
+                    dtype_raw = None if schema is None else schema.get("dtype")
+                if shape_raw is None:
+                    shape_raw = None if schema is None else schema.get("shape")
+                if dtype_raw is None and reader is not None:
+                    dtype_raw = reader.layout.dtype
+                if shape_raw is None and reader is not None:
+                    shape_raw = tuple(reader.layout.shape)
 
             if dtype_raw is None or shape_raw is None:
                 self._clear_stream_buffer(buf)
@@ -3874,7 +4072,10 @@ class HdfWriter(ManagedProcessBase):
 
             dtype_obj = np.dtype(dtype_raw)
             shape = tuple(int(x) for x in shape_raw)
-            session = self._stream_active_session.get(key, 1)
+            if meta and meta.get("session") is not None:
+                session = int(meta["session"])
+            else:
+                session = self._stream_active_session.get(key, 1)
             datasets = self._ensure_stream_dataset(
                 device_id, stream, dtype_obj, shape, session=session
             )
@@ -4066,6 +4267,14 @@ class HdfWriter(ManagedProcessBase):
         return datasets
 
     def _handle_device_config(self, msg: Json, *, cache: bool = True) -> None:
+        # Low-frequency handler invoked from the (lock-free) main drain: it
+        # writes h5py and mutates bg-shared stream state, so it takes _h5_lock.
+        # RLock re-entry keeps the already-locked internal caller
+        # (_configure_active_file) correct.
+        with self._h5_lock:
+            self._handle_device_config_locked(msg, cache=cache)
+
+    def _handle_device_config_locked(self, msg: Json, *, cache: bool = True) -> None:
         self._assert_h5_locked()
         device_id = self._normalize_device_id(msg.get("device_id"))
         if device_id is None:
@@ -4187,6 +4396,12 @@ class HdfWriter(ManagedProcessBase):
                 self._pending_stream_metadata[base_key] = dict(attrs)
 
     def _handle_run_metadata(self, msg: Json) -> None:
+        # Low-frequency handler from the lock-free main drain; takes _h5_lock
+        # for the h5py write (RLock re-entry keeps locked callers correct).
+        with self._h5_lock:
+            self._handle_run_metadata_locked(msg)
+
+    def _handle_run_metadata_locked(self, msg: Json) -> None:
         self._assert_h5_locked()
         if self._run_meta_group is None:
             return

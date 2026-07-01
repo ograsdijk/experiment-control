@@ -1623,12 +1623,12 @@ class HdfWriterBgFlushThreadTests(unittest.TestCase):
 class HdfWriterFlushBatchOverflowTests(unittest.TestCase):
     """Regression coverage for `_enqueue_flush_batch` overflow handling.
 
-    Pins down three behaviours that PR #41 introduced/relied upon:
-      * counter + error-bucket bump on the dropped batch,
-      * a `hdf.flush_batch_dropped` event published on the process data PUB,
-      * the snapshotted main-loop data is *lost* (NOT requeued) — the
-        documented trade-off for not blocking the producer.
-    Also pins the 1-second rate limit on the event publish.
+    The writer is now **non-dropping**: when the bg queue is full,
+    `_enqueue_flush_batch` leaves all data in the in-memory reservoirs and
+    returns False, regardless of `force_flush`. It bumps the *deferred*
+    counter (never the dropped counter) and publishes a rate-limited
+    `hdf.flush_batch_deferred` event. Nothing is discarded — the reservoir
+    is drained on the next successful enqueue.
     """
 
     def _make_writer(self) -> HdfWriter:
@@ -1662,7 +1662,7 @@ class HdfWriterFlushBatchOverflowTests(unittest.TestCase):
         # can assert is lost on overflow.
         writer._buf = deque([row])  # noqa: SLF001
 
-    def test_overflow_drops_batch_increments_counter_and_publishes_event(self) -> None:
+    def test_overflow_defers_batch_without_dropping_even_on_force_flush(self) -> None:
         writer = self._make_writer()
         self._shrink_bg_queue(writer)
         published: list[tuple[str, dict]] = []
@@ -1678,29 +1678,32 @@ class HdfWriterFlushBatchOverflowTests(unittest.TestCase):
         self.assertTrue(writer._enqueue_flush_batch(force_flush=True))  # noqa: SLF001
         self.assertEqual(writer._bg_queue.qsize(), 1)  # noqa: SLF001
 
-        # Second batch: snapshot has real data, queue is full, must drop.
+        # Second batch: snapshot has real data, queue is full. Non-dropping:
+        # even with force_flush=True the data stays in the reservoir.
         self._seed_buf_with_row(writer, {"device_id": "dev1", "v": 2})
-        self.assertFalse(writer._buf is None and len(writer._buf or []) == 0)  # noqa: SLF001
         result = writer._enqueue_flush_batch(force_flush=True)  # noqa: SLF001
 
         self.assertFalse(result)
-        self.assertEqual(writer._dropped_flush_batches, 1)  # noqa: SLF001
+        # Deferred, never dropped.
+        self.assertEqual(writer._deferred_flush_batches, 1)  # noqa: SLF001
+        self.assertEqual(writer._dropped_flush_batches, 0)  # noqa: SLF001
         self.assertEqual(
-            writer._error_counts.get("bg.flush_batch.dropped"), 1  # noqa: SLF001
+            writer._error_counts.get("bg.flush_batch.deferred"), 1  # noqa: SLF001
+        )
+        self.assertIsNone(
+            writer._error_counts.get("bg.flush_batch.dropped")  # noqa: SLF001
         )
 
-        # The snapshotted data is LOST (not requeued). `_buf` is empty.
-        # This pins the documented behaviour: the writer chooses to drop
-        # rather than block the main loop; a future change that quietly
-        # starts re-buffering needs to update the call-site contract.
-        self.assertEqual(len(writer._buf or []), 0)  # noqa: SLF001
+        # The reservoir is PRESERVED (not discarded): `_buf` still holds v=2.
+        self.assertEqual(len(writer._buf or []), 1)  # noqa: SLF001
+        self.assertEqual(list(writer._buf or [])[0].get("v"), 2)  # noqa: SLF001
 
-        # Event was published with the expected payload shape.
+        # A deferred (not dropped) event was published.
         self.assertEqual(len(published), 1)
         topic, payload = published[0]
-        self.assertEqual(topic, "hdf.flush_batch_dropped")
+        self.assertEqual(topic, "hdf.flush_batch_deferred")
         self.assertEqual(payload.get("queue_max"), 1)
-        self.assertEqual(payload.get("dropped_total"), 1)
+        self.assertEqual(payload.get("deferred_total"), 1)
         self.assertIn("queue_depth", payload)
 
     def test_overflow_event_is_rate_limited_to_one_per_second(self) -> None:
@@ -1718,28 +1721,25 @@ class HdfWriterFlushBatchOverflowTests(unittest.TestCase):
         self._seed_buf_with_row(writer, {"device_id": "dev1", "v": 1})
         self.assertTrue(writer._enqueue_flush_batch(force_flush=True))  # noqa: SLF001
 
-        # First overflow publishes an event.
+        # First overflow publishes a deferred event.
         self._seed_buf_with_row(writer, {"device_id": "dev1", "v": 2})
         self.assertFalse(writer._enqueue_flush_batch(force_flush=True))  # noqa: SLF001
         self.assertEqual(len(published), 1)
 
         # Second overflow within the 1-second window: counter still bumps,
         # but no additional event publish (rate-limited).
-        self._seed_buf_with_row(writer, {"device_id": "dev1", "v": 3})
         self.assertFalse(writer._enqueue_flush_batch(force_flush=True))  # noqa: SLF001
-        self.assertEqual(writer._dropped_flush_batches, 2)  # noqa: SLF001
+        self.assertEqual(writer._deferred_flush_batches, 2)  # noqa: SLF001
         self.assertEqual(
-            writer._error_counts.get("bg.flush_batch.dropped"), 2  # noqa: SLF001
+            writer._error_counts.get("bg.flush_batch.deferred"), 2  # noqa: SLF001
         )
         self.assertEqual(len(published), 1)
 
-        # Advance the rate-limit window — pretend the last event was published
-        # more than a second ago — and a new overflow publishes again.
-        writer._last_flush_drop_event_mono = time.monotonic() - 2.0  # noqa: SLF001
-        self._seed_buf_with_row(writer, {"device_id": "dev1", "v": 4})
+        # Advance the rate-limit window and a new overflow publishes again.
+        writer._last_flush_defer_event_mono = time.monotonic() - 2.0  # noqa: SLF001
         self.assertFalse(writer._enqueue_flush_batch(force_flush=True))  # noqa: SLF001
         self.assertEqual(len(published), 2)
-        self.assertEqual(published[-1][1].get("dropped_total"), 3)
+        self.assertEqual(published[-1][1].get("deferred_total"), 3)
 
 
 class HdfWriterFlushBatchDeferTests(unittest.TestCase):
@@ -1818,9 +1818,9 @@ class HdfWriterFlushBatchDeferTests(unittest.TestCase):
         self.assertEqual(payload.get("deferred_total"), 1)
         self.assertEqual(payload.get("buffered_rows"), n_rows)
         self.assertIn("buffered_events", payload)
-        self.assertIn("dropped_stream_rows", payload)
+        self.assertIn("buffered_streams", payload)
 
-    def test_defer_drops_stream_buffers_to_bound_memory(self) -> None:
+    def test_defer_preserves_stream_buffers(self) -> None:
         writer = self._make_writer()
         self._shrink_bg_queue(writer)
         writer._publish_process_event = (  # type: ignore[method-assign]  # noqa: SLF001
@@ -1831,9 +1831,12 @@ class HdfWriterFlushBatchDeferTests(unittest.TestCase):
         seed_rows = [{"device_id": "dev1", "v": 1}]
         writer._buf = deque(seed_rows)  # noqa: SLF001
         # Stream-buffer shape: {(device_id, stream): {col: list[value]}}.
+        stream_buffers = {
+            ("dev1", "streamA"): {"data": [b"x", b"y", b"z"]},
+            ("dev1", "streamB"): {"data": [b"w"]},
+        }
         writer._stream_buffers = {  # noqa: SLF001
-            ("dev1", "streamA"): {"t": [0.0, 0.1, 0.2], "v": [1, 2, 3]},
-            ("dev1", "streamB"): {"t": [0.0], "v": [9]},
+            k: dict(v) for k, v in stream_buffers.items()
         }
         writer._pending_stream_metadata = {  # noqa: SLF001
             ("dev1", "streamA"): {"units": "V"},
@@ -1842,10 +1845,12 @@ class HdfWriterFlushBatchDeferTests(unittest.TestCase):
         result = writer._enqueue_flush_batch(force_flush=False)  # noqa: SLF001
 
         self.assertFalse(result)
-        # Unbounded structures dropped to bound memory.
-        self.assertEqual(writer._stream_buffers, {})  # noqa: SLF001
-        self.assertEqual(writer._pending_stream_metadata, {})  # noqa: SLF001
-        # Bounded in-memory deque is untouched.
+        # Non-dropping: the reservoir is fully preserved so nothing is lost.
+        self.assertEqual(writer._stream_buffers, stream_buffers)  # noqa: SLF001
+        self.assertEqual(
+            writer._pending_stream_metadata,  # noqa: SLF001
+            {("dev1", "streamA"): {"units": "V"}},
+        )
         self.assertEqual(list(writer._buf or []), seed_rows)  # noqa: SLF001
 
     def test_defer_event_rate_limited(self) -> None:
@@ -1877,6 +1882,200 @@ class HdfWriterFlushBatchDeferTests(unittest.TestCase):
         self.assertFalse(writer._enqueue_flush_batch(force_flush=False))  # noqa: SLF001
         self.assertEqual(len(published), 2)
         self.assertEqual(published[-1][1].get("deferred_total"), 3)
+
+
+class HdfWriterLosslessHandoffTests(unittest.TestCase):
+    """Pins the non-dropping hand-off + drain guarantees introduced to stop the
+    writer losing frames/telemetry between the main loop and the bg thread."""
+
+    @staticmethod
+    def _make_writer(out_dir: str) -> HdfWriter:
+        return HdfWriter(
+            out_dir=out_dir,
+            filename=None,
+            manager_rpc="tcp://127.0.0.1:65541",
+            manager_pub="tcp://127.0.0.1:65542",
+            rpc_timeout_ms=2000,
+            timezone="America/Chicago",
+            rcvhwm=1000,
+            write_every_s=1.0,
+            buffer_max_messages=1000,
+            flush_every_n=10,
+            flush_every_s=1.0,
+            disabled_devices=[],
+            event_log_mode="all",
+        )
+
+    @staticmethod
+    def _u16_payload(value: int) -> bytes:
+        return np.asarray([value], dtype=np.uint16).tobytes()
+
+    @staticmethod
+    def _fake_reader() -> object:
+        class _Layout:
+            dtype = np.dtype("uint16")
+            shape = (1,)
+
+        class _Reader:
+            layout = _Layout()
+
+        return _Reader()
+
+    def _configure(self, writer: HdfWriter, h5: "h5py.File") -> None:
+        meta = writer._build_measurement_metadata(  # noqa: SLF001
+            profile_id=None, values=None, require_profile=False
+        )
+        writer._configure_active_file(  # noqa: SLF001
+            h5, write_every_s=1.0, load_manager_state=False, measurement_meta=meta
+        )
+
+    def _seed_stream(self, writer: HdfWriter, key, seqs) -> None:
+        for s in seqs:
+            writer._store_context_for_seq(  # noqa: SLF001
+                key=key, seq=s, context_id=100 + s, now_mono=1.0
+            )
+        writer._append_chunk_ready_events(  # noqa: SLF001
+            key=key,
+            reader=self._fake_reader(),
+            events=[
+                {
+                    "seq": s,
+                    "payload": self._u16_payload(s),
+                    "t0_mono_ns": s,
+                    "t0_wall_ns": s,
+                }
+                for s in seqs
+            ],
+            initial_last_seq=seqs[0] - 1,
+            now_mono=1.0,
+        )
+
+    def test_record_context_defers_and_bg_writes_it(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            writer = self._make_writer(str(root))
+            with h5py.File(root / "ctx.h5", "w") as h5:
+                self._configure(writer, h5)
+                # Deferred: buffered on the main thread, NOT written to h5py.
+                writer._record_context(7, {"amp": 1.0})  # noqa: SLF001
+                writer._record_context(7, {"amp": 1.0})  # dedup  # noqa: SLF001
+                self.assertEqual(len(writer._pending_context_rows), 1)  # noqa: SLF001
+                self.assertEqual(writer._context_table_ds.shape[0], 0)  # noqa: SLF001
+                # Bg write path drains + persists it.
+                _r, _e, _s, _m, context_rows = (
+                    writer._snapshot_main_loop_buffers()  # noqa: SLF001
+                )
+                self.assertEqual(len(context_rows), 1)
+                self.assertEqual(writer._pending_context_rows, [])  # noqa: SLF001
+                writer._handle_flush_batch(  # noqa: SLF001
+                    _FlushBatch(context_rows=context_rows, force_flush=True)
+                )
+                self.assertEqual(writer._context_table_ds.shape[0], 1)  # noqa: SLF001
+                self.assertEqual(
+                    int(writer._context_table_ds[0]["context_id"]), 7  # noqa: SLF001
+                )
+
+    def test_stream_handoff_via_snapshot_is_lossless(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            writer = self._make_writer(str(root))
+            with h5py.File(root / "lossless.h5", "w") as h5:
+                self._configure(writer, h5)
+                key = ("trace1", "trace")
+                seqs = list(range(1, 51))
+                self._seed_stream(writer, key, seqs)
+                # Simulate the bg hand-off: self-contained snapshot -> bg write.
+                rows, event_rows, stream_buffers, stream_meta, context_rows = (
+                    writer._snapshot_main_loop_buffers()  # noqa: SLF001
+                )
+                # stream_meta carries dtype/shape/session so the bg write needs
+                # none of the main-owned maps.
+                self.assertIn(key, stream_meta)
+                writer._handle_flush_batch(  # noqa: SLF001
+                    _FlushBatch(
+                        buffered_rows=rows,
+                        event_rows=event_rows,
+                        stream_batches=stream_buffers,
+                        stream_meta=stream_meta,
+                        context_rows=context_rows,
+                        force_flush=True,
+                    )
+                )
+                dsets = writer._stream_datasets[("trace1", "trace", 1)]  # noqa: SLF001
+                self.assertEqual(list(dsets["seq"][...]), seqs)
+                self.assertEqual(int(dsets["data"].attrs["dropped_total"]), 0)
+
+    def test_deferred_stream_batch_lands_after_queue_drains(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            writer = self._make_writer(str(root))
+            writer._bg_queue = queue.Queue(maxsize=1)  # noqa: SLF001
+            writer._publish_process_event = lambda **_k: True  # type: ignore[method-assign]  # noqa: SLF001,E731
+            with h5py.File(root / "defer.h5", "w") as h5:
+                self._configure(writer, h5)
+                key = ("trace1", "trace")
+                seqs = list(range(1, 6))
+                self._seed_stream(writer, key, seqs)
+                # Saturate the queue so the enqueue defers (non-dropping).
+                writer._bg_queue.put_nowait(_FlushBatch())  # noqa: SLF001
+                self.assertFalse(
+                    writer._enqueue_flush_batch(force_flush=True)  # noqa: SLF001
+                )
+                # Reservoir preserved — nothing dropped.
+                self.assertEqual(len(writer._stream_buffers[key]["data"]), 5)  # noqa: SLF001
+                # Drain the placeholder, enqueue again (now succeeds), process it.
+                writer._bg_queue.get_nowait()  # noqa: SLF001
+                self.assertTrue(
+                    writer._enqueue_flush_batch(force_flush=True)  # noqa: SLF001
+                )
+                writer._handle_flush_batch(writer._bg_queue.get_nowait())  # noqa: SLF001
+                dsets = writer._stream_datasets[("trace1", "trace", 1)]  # noqa: SLF001
+                self.assertEqual(list(dsets["seq"][...]), seqs)
+
+    def test_stop_writing_flushes_buffered_streams_before_close(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            writer = self._make_writer(str(root))
+            new_file = writer._start_writing_file(filename="stopflush.h5")  # noqa: SLF001
+            key = ("trace1", "trace")
+            seqs = [1, 2, 3]
+            self._seed_stream(writer, key, seqs)
+            # No bg thread running, so quiesce is a no-op and the synchronous
+            # drain writes the live reservoir before the file closes.
+            old = writer._stop_writing_file()  # noqa: SLF001
+            self.assertEqual(old, new_file)
+            with h5py.File(new_file, "r") as h5:
+                ds = h5["streams/trace1/trace/session_001/seq"]
+                self.assertEqual(list(ds[...]), seqs)
+
+    def test_close_drains_leftover_queued_batch(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            writer = self._make_writer(str(root))
+            new_file = writer._start_writing_file(filename="closeflush.h5")  # noqa: SLF001
+            key = ("trace1", "trace")
+            seqs = [1, 2, 3, 4]
+            self._seed_stream(writer, key, seqs)
+            # Snapshot into a batch and put it on the queue WITHOUT a bg thread
+            # to consume it (simulates a batch left queued when the bg thread
+            # stopped). close() must drain it before closing the file.
+            rows, event_rows, stream_buffers, stream_meta, context_rows = (
+                writer._snapshot_main_loop_buffers()  # noqa: SLF001
+            )
+            writer._bg_queue.put_nowait(  # noqa: SLF001
+                _FlushBatch(
+                    buffered_rows=rows,
+                    event_rows=event_rows,
+                    stream_batches=stream_buffers,
+                    stream_meta=stream_meta,
+                    context_rows=context_rows,
+                    force_flush=True,
+                )
+            )
+            writer.close()
+            with h5py.File(new_file, "r") as h5:
+                ds = h5["streams/trace1/trace/session_001/seq"]
+                self.assertEqual(list(ds[...]), seqs)
 
 
 class WritingActiveTelemetryTests(unittest.TestCase):
