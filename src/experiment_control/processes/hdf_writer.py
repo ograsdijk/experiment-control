@@ -2092,6 +2092,14 @@ class HdfWriter(ManagedProcessBase):
                 )
                 self._clear_buffered_for_disabled(self._disabled_devices)
             except Exception:
+                # `_configure_active_file` assigns `self._h5` before the work
+                # that can fail, so a failed start would otherwise leave the
+                # writer wedged: `self._h5` points at a (doomed) handle, so the
+                # next start is rejected with "already writing" while status
+                # reports not-writing. Reset writer state so a retry works.
+                self._h5 = None
+                self._publish_h5_state_cache()
+                self._reset_per_file_state()
                 try:
                     h5.close()
                 except Exception:

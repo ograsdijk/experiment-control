@@ -222,5 +222,46 @@ class RotateFileCleansUpOnConfigureFailureTests(unittest.TestCase):
                     pass
 
 
+class StartWritingResetsStateOnConfigureFailureTests(unittest.TestCase):
+    """A failed start_writing must not wedge the writer in a phantom 'writing'
+    state: `_configure_active_file` assigns `self._h5` before the work that can
+    fail, so on failure the writer must reset `_h5`/cache/per-file state,
+    otherwise the next start is rejected with 'already writing' while status
+    reports not-writing."""
+
+    def test_failed_start_resets_state_and_allows_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            writer = _make_minimal_writer(td)
+            real_configure = writer._configure_active_file  # noqa: SLF001
+            calls = {"n": 0}
+
+            def _flaky_configure(*args, **kwargs):
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    raise RuntimeError("simulated configure failure")
+                return real_configure(*args, **kwargs)
+
+            writer._configure_active_file = _flaky_configure  # type: ignore[method-assign]  # noqa: SLF001
+
+            # First start fails mid-configure.
+            with self.assertRaises(RuntimeError):
+                writer._start_writing_file(filename="retry.h5")  # noqa: SLF001
+
+            # State is reset — not wedged in phantom "writing".
+            self.assertIsNone(writer._h5)  # noqa: SLF001
+            self.assertFalse(writer._writing_active)  # noqa: SLF001
+
+            # Retry succeeds (before the fix this raised "already writing").
+            try:
+                path = writer._start_writing_file(filename="retry.h5")  # noqa: SLF001
+                self.assertTrue(str(path).endswith("retry.h5"))
+                self.assertIsNotNone(writer._h5)  # noqa: SLF001
+                self.assertTrue(writer._writing_active)  # noqa: SLF001
+            finally:
+                if writer._h5 is not None:  # noqa: SLF001
+                    writer._h5.close()  # noqa: SLF001
+                    writer._h5 = None  # noqa: SLF001
+
+
 if __name__ == "__main__":
     unittest.main()
