@@ -88,6 +88,7 @@ class ManagerTuiRpcTests(unittest.TestCase):
         app._proc_members_last = {}
         app._proc_cap_retry_next_mono = {}
         app._proc_cap_retry_delay_s = {}
+        app._proc_cap_render_attempt_mono = {}
 
         def fake_rpc_call(req):
             if req.get("type") == "device.list_status":

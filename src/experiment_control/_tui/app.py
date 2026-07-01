@@ -224,6 +224,14 @@ class ManagerTUI(App):
         self._proc_cap_retry_delay_s: dict[str, float] = {}
         self._proc_cap_retry_initial_s: float = 0.5
         self._proc_cap_retry_max_s: float = 2.0
+        # Throttle for the render-path capability fetch of the *selected*
+        # process. The render path uses a forced fetch (same as the manual
+        # Refresh) so federated processes auto-populate — the exponential
+        # backoff above only gates the manual/force path, not this — but we
+        # cap the attempt rate here so rapid ticks / cursor-scrolling can't
+        # hammer a peer whose capabilities aren't available yet.
+        self._proc_cap_render_attempt_mono: dict[str, float] = {}
+        self._proc_cap_render_retry_s: float = 1.0
         self._members_last: dict[str, list[dict[str, Any]]] = {}
         self._proc_members_last: dict[str, list[dict[str, Any]]] = {}
         self._members_source: str = "device"
@@ -859,10 +867,12 @@ class ManagerTUI(App):
                         if prev_pid != next_pid:
                             self._proc_cap_cache.pop(pid, None)
                             self._proc_members_last.pop(pid, None)
+                            self._proc_cap_render_attempt_mono.pop(pid, None)
                             self._reset_process_capabilities_retry(pid)
                     if not self._process_is_registered(proc):
                         self._proc_cap_cache.pop(pid, None)
                         self._proc_members_last.pop(pid, None)
+                        self._proc_cap_render_attempt_mono.pop(pid, None)
                 self._process_status_map = next_proc_map
                 self._processes = [
                     self._process_status_map[pid]
@@ -912,6 +922,10 @@ class ManagerTUI(App):
             self._proc_cap_cache.pop(process_id, None)
             self._proc_members_last.pop(process_id, None)
             self._reset_process_capabilities_retry(process_id)
+
+        stale_render_attempts = set(self._proc_cap_render_attempt_mono) - active_process_ids
+        for process_id in stale_render_attempts:
+            self._proc_cap_render_attempt_mono.pop(process_id, None)
 
         stale_member_fingerprints = [
             key
@@ -1300,9 +1314,16 @@ class ManagerTUI(App):
                     proc = item
                     break
             if process_id not in self._proc_members_last:
-                state = str(proc.get("state", "")) if proc else ""
-                if state == "RUNNING":
-                    self._get_process_capabilities(process_id)
+                # Forced fetch (like the manual Refresh), throttled per process,
+                # so federated processes auto-populate instead of getting stuck
+                # behind the non-force path's retry backoff. probe_ready gates on
+                # RUNNING + registered (same as the manual path).
+                if self._process_capabilities_probe_ready(process_id):
+                    now = time.monotonic()
+                    last = self._proc_cap_render_attempt_mono.get(process_id, 0.0)
+                    if (now - last) >= self._proc_cap_render_retry_s:
+                        self._proc_cap_render_attempt_mono[process_id] = now
+                        self._get_process_capabilities(process_id, force=True)
             members = self._proc_members_last.get(process_id, [])
             # Federated processes: hide actions the federation link denies (the
             # hub annotates each member with federation_allowed).
