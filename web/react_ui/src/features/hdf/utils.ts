@@ -188,6 +188,12 @@ export function sameHdfWriterStatus(
     current.error === nextStatus.error &&
     sameStringArray(current.disabledDevices, nextStatus.disabledDevices) &&
     sameStringArray(current.knownDevices, nextStatus.knownDevices) &&
-    sameStringArray(current.enabledKnownDevices, nextStatus.enabledKnownDevices)
+    sameStringArray(current.enabledKnownDevices, nextStatus.enabledKnownDevices) &&
+    sameStringArray(current.disabledProcesses, nextStatus.disabledProcesses) &&
+    sameStringArray(current.knownProcesses, nextStatus.knownProcesses) &&
+    sameStringArray(
+      current.enabledKnownProcesses,
+      nextStatus.enabledKnownProcesses
+    )
   );
 }

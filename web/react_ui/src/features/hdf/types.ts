@@ -9,6 +9,9 @@ export type HdfWriterStatus = {
   disabledDevices: string[];
   knownDevices: string[];
   enabledKnownDevices: string[];
+  disabledProcesses: string[];
+  knownProcesses: string[];
+  enabledKnownProcesses: string[];
   measurementId: string | null;
   measurementType: string | null;
   measurementSchemaVersion: number | null;
