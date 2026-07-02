@@ -1419,22 +1419,6 @@ export function useSequencerController({
     });
   }, [sequencerStatus?.loadedAdaptiveIds]);
 
-  useEffect(() => {
-    const activeId =
-      typeof sequencerStatus?.activeSequenceId === "string" &&
-      sequencerStatus.activeSequenceId.trim().length > 0
-        ? sequencerStatus.activeSequenceId
-        : null;
-    setSequencerSelectedSequenceId((prev) =>
-      resolveSequencerSelectedSequenceId(
-        prev,
-        activeId,
-        sequencerLibraryEntries,
-        sequencerLoadSource === "library"
-      )
-    );
-  }, [sequencerLibraryEntries, sequencerLoadSource, sequencerStatus?.activeSequenceId]);
-
   return {
     sequencerOpen,
     setSequencerOpen,
