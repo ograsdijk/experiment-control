@@ -493,7 +493,7 @@ export function useSequencerController({
           if (prev && entries.some((entry) => entry.id === prev)) {
             return prev;
           }
-          return entries[0]?.id ?? null;
+          return sequencerLoadSource === "library" ? entries[0]?.id ?? null : null;
         });
         const lastError =
           typeof result.last_error === "string" && result.last_error.trim().length > 0
@@ -514,7 +514,7 @@ export function useSequencerController({
         setSequencerLibraryLoading(false);
       }
     },
-    [callProcessFn, sequencerLibraryLoading]
+    [callProcessFn, sequencerLibraryLoading, sequencerLoadSource]
   );
 
   const fetchSequencerLoadedYaml = useCallback(
@@ -707,7 +707,7 @@ export function useSequencerController({
         if (prev && entries.some((entry) => entry.id === prev)) {
           return prev;
         }
-        return entries[0]?.id ?? null;
+        return sequencerLoadSource === "library" ? entries[0]?.id ?? null : null;
       });
       const lastError =
         typeof result.last_error === "string" && result.last_error.trim().length > 0
@@ -733,7 +733,7 @@ export function useSequencerController({
     } finally {
       setSequencerLibraryLoading(false);
     }
-  }, [callProcessFn, sequencerProcess]);
+  }, [callProcessFn, sequencerProcess, sequencerLoadSource]);
 
   const setAdaptiveMode = useCallback(
     (studyId: string, mode: AdaptiveStartMode) => {
@@ -1408,9 +1408,11 @@ export function useSequencerController({
       if (prev && sequencerLibraryEntries.some((entry) => entry.id === prev)) {
         return prev;
       }
-      return sequencerLibraryEntries[0]?.id ?? null;
+      return sequencerLoadSource === "library"
+        ? sequencerLibraryEntries[0]?.id ?? null
+        : null;
     });
-  }, [sequencerLibraryEntries, sequencerStatus?.activeSequenceId]);
+  }, [sequencerLibraryEntries, sequencerLoadSource, sequencerStatus?.activeSequenceId]);
 
   return {
     sequencerOpen,
