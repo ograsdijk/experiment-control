@@ -199,5 +199,38 @@ class ManagerLifecycleParallelTests(unittest.TestCase):
         )
 
 
+class ManagerAutoConnectOffLoopTests(unittest.TestCase):
+    """Auto-connect-on-register must run on the lifecycle executor, not block
+    the poll loop, so a slow/absent device can't stall the manager at startup."""
+
+    def test_dispatch_auto_connect_does_not_block_and_publishes(self) -> None:
+        mgr = _build_minimal_manager(["dev_a"], rpc_delay_s=0.3)
+        try:
+            t0 = time.monotonic()
+            mgr._dispatch_auto_connect("dev_a")  # type: ignore[attr-defined]
+            dispatch_elapsed = time.monotonic() - t0
+            # Returns immediately — does NOT block the caller on the 0.3s connect.
+            self.assertLess(
+                dispatch_elapsed,
+                0.1,
+                msg=f"auto-connect dispatch blocked for {dispatch_elapsed:.3f}s",
+            )
+            # The connect eventually runs on the worker and publishes an event.
+            deadline = time.monotonic() + 5.0
+            while (
+                mgr._publish_manager_event.call_count == 0  # type: ignore[attr-defined]
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.02)
+            topics = [
+                c.args[0]
+                for c in mgr._publish_manager_event.call_args_list  # type: ignore[attr-defined]
+                if c.args
+            ]
+            self.assertIn("manager.connect_device_sent", topics)
+        finally:
+            mgr._lifecycle_executor.shutdown(wait=True, cancel_futures=True)  # type: ignore[attr-defined]
+
+
 if __name__ == "__main__":
     unittest.main()

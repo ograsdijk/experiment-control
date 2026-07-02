@@ -1299,29 +1299,14 @@ class Manager(
             )
             return
 
-        # Auto-connect policy
+        # Auto-connect policy. `connect_device` does blocking device RPCs (up
+        # to device_rpc_timeout_ms each); running it inline here would stall the
+        # single poll loop per registration, queuing every other RPC (incl. the
+        # TUI's). Dispatch it to the lifecycle executor — the same off-loop path
+        # all other device lifecycle ops already use — so the loop stays
+        # responsive. Events are marshaled back via _lifecycle_event_queue.
         if self._auto_connect_on_register:
-            try:
-                resp = self.connect_device(reg.device_id)
-                if self._device_rpc_status_ok(resp):
-                    self._publish_manager_event(
-                        "manager.connect_device_sent",
-                        {"device_id": reg.device_id, "response": resp},
-                    )
-                else:
-                    self._publish_manager_event(
-                        "manager.connect_device_failed",
-                        {
-                            "device_id": reg.device_id,
-                            "error": self._device_rpc_error_text(resp),
-                            "response": resp,
-                        },
-                    )
-            except Exception as e:
-                self._publish_manager_event(
-                    "manager.connect_device_failed",
-                    {"device_id": reg.device_id, "error": str(e)},
-                )
+            self._dispatch_auto_connect(reg.device_id)
 
     @staticmethod
     def _parse_registration(msg: Json) -> DriverRegistration:
@@ -1646,6 +1631,43 @@ class Manager(
             except Exception:
                 # Socket itself may already be closed in shutdown; drop.
                 pass
+
+    def _dispatch_auto_connect(self, device_id: str) -> None:
+        """Run auto-connect-on-register off the poll loop, on the lifecycle
+        executor (per-device lock), so a slow/absent device's blocking connect
+        RPC can't stall the manager loop. Fire-and-forget: no RPC reply, just
+        the connect event marshaled back via _lifecycle_event_queue."""
+        try:
+            self._lifecycle_executor.submit(self._run_auto_connect, device_id)
+        except RuntimeError:
+            # Executor shut down during teardown — nothing to do.
+            pass
+
+    def _run_auto_connect(self, device_id: str) -> None:
+        lock = self._lifecycle_device_locks.setdefault(device_id, threading.Lock())
+        with lock:
+            try:
+                resp = self.connect_device(device_id)
+            except Exception as exc:
+                self._publish_manager_event(
+                    "manager.connect_device_failed",
+                    {"device_id": device_id, "error": str(exc)},
+                )
+                return
+        if self._device_rpc_status_ok(resp):
+            self._publish_manager_event(
+                "manager.connect_device_sent",
+                {"device_id": device_id, "response": resp},
+            )
+        else:
+            self._publish_manager_event(
+                "manager.connect_device_failed",
+                {
+                    "device_id": device_id,
+                    "error": self._device_rpc_error_text(resp),
+                    "response": resp,
+                },
+            )
 
     def _run_lifecycle(
         self, identity: bytes, req: Json, rtype: str, device_id: str
