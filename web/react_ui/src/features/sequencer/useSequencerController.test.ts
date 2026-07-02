@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   buildSequencerLoadRequest,
   buildSequencerStartParams,
+  resolveSequencerSelectedSequenceId,
 } from "./useSequencerController";
 
 describe("sequencer controller request builders", () => {
@@ -53,5 +54,38 @@ describe("sequencer controller request builders", () => {
     ).toEqual({
       sequence_id: "spb_microwave_scan",
     });
+  });
+
+  it("keeps an existing valid selection ahead of backend active ids", () => {
+    expect(
+      resolveSequencerSelectedSequenceId(
+        "spb_microwave_scan",
+        "spa_ch2",
+        [{ id: "spb_microwave_scan" }, { id: "spa_ch2" }],
+        "library"
+      )
+    ).toBe("spb_microwave_scan");
+  });
+
+  it("falls back to the backend active id when no valid selection exists", () => {
+    expect(
+      resolveSequencerSelectedSequenceId(
+        null,
+        "spa_ch2",
+        [{ id: "spb_microwave_scan" }, { id: "spa_ch2" }],
+        "library"
+      )
+    ).toBe("spa_ch2");
+  });
+
+  it("does not force an active id while in editor mode", () => {
+    expect(
+      resolveSequencerSelectedSequenceId(
+        null,
+        "spa_ch2",
+        [{ id: "spb_microwave_scan" }, { id: "spa_ch2" }],
+        "editor"
+      )
+    ).toBeNull();
   });
 });

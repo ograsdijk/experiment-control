@@ -456,12 +456,18 @@ class SequencerProcess(ManagedProcessBase):
         return {
             "configured": bool(self._sequence_library_path),
             "manifest_path": self._sequence_library_path,
+            "resolved_manifest_path": (
+                str(self._sequence_library.manifest_path)
+                if self._sequence_library is not None
+                else None
+            ),
+            "process_cwd": str(Path.cwd()),
             "description_policy": self._library_description_policy,
             "active_sequence_id": self._active_sequence_id,
             "autoload_sequence_id": self._autoload_sequence_id,
             "entry_count": len(entries),
-            "warnings": list(self._sequence_library_warnings),
-            "last_error": self._sequence_library_error,
+            "warnings": list(getattr(self, "_sequence_library_warnings", [])),
+            "last_error": getattr(self, "_sequence_library_error", None),
             "entries": entries,
         }
 
@@ -2977,4 +2983,3 @@ def main(argv: list[str] | None = None) -> None:
 
 if __name__ == "__main__":
     main()
-

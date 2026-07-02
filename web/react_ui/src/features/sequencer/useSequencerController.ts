@@ -97,6 +97,101 @@ export function buildSequencerStartParams(
   return startParams;
 }
 
+export function resolveSequencerSelectedSequenceId(
+  currentSelection: string | null,
+  activeSequenceId: string | null,
+  entries: ReadonlyArray<{ id: string }>,
+  loadSource: SequencerLoadSource
+) {
+  const current = currentSelection?.trim() ?? null;
+  if (current && entries.some((entry) => entry.id === current)) {
+    return current;
+  }
+  if (loadSource === "library") {
+    const active = activeSequenceId?.trim() ?? null;
+    if (active) {
+      return active;
+    }
+    return entries[0]?.id ?? null;
+  }
+  return null;
+}
+
+type SequencerLibraryPayload = {
+  configured: boolean;
+  entries: SequencerLibraryEntry[];
+  lastError: string | null;
+  activeSequenceId: string | null;
+};
+
+function normalizeSequencerLibraryPayload(result: unknown): SequencerLibraryPayload | null {
+  if (!result || typeof result !== "object") {
+    return null;
+  }
+  const obj = result as {
+    configured?: unknown;
+    entries?: unknown;
+    last_error?: unknown;
+    active_sequence_id?: unknown;
+  };
+  const entriesRaw = Array.isArray(obj.entries) ? obj.entries : [];
+  const entries: SequencerLibraryEntry[] = entriesRaw
+    .map((item) => {
+      if (!item || typeof item !== "object") {
+        return null;
+      }
+      const entry = item as Record<string, unknown>;
+      const id =
+        typeof entry.id === "string" && entry.id.trim().length > 0
+          ? entry.id.trim()
+          : "";
+      if (!id) {
+        return null;
+      }
+      const varsRaw = Array.isArray(entry.vars) ? entry.vars : [];
+      const vars = varsRaw
+        .filter((value): value is string => typeof value === "string")
+        .map((value) => value.trim())
+        .filter((value) => value.length > 0);
+      return {
+        id,
+        label:
+          typeof entry.label === "string" && entry.label.trim().length > 0
+            ? entry.label
+            : null,
+        description:
+          typeof entry.description === "string" && entry.description.trim().length > 0
+            ? entry.description
+            : null,
+        path:
+          typeof entry.path === "string" && entry.path.trim().length > 0
+            ? entry.path
+            : null,
+        source:
+          typeof entry.source === "string" && entry.source.trim().length > 0
+            ? entry.source
+            : null,
+        vars,
+      } satisfies SequencerLibraryEntry;
+    })
+    .filter((item): item is SequencerLibraryEntry => item !== null);
+  const lastError =
+    typeof obj.last_error === "string" && obj.last_error.trim().length > 0
+      ? obj.last_error
+      : null;
+  const activeSequenceId =
+    typeof obj.active_sequence_id === "string" &&
+    obj.active_sequence_id.trim().length > 0
+      ? obj.active_sequence_id
+      : null;
+  return {
+    configured: obj.configured === true,
+    entries,
+    lastError,
+    activeSequenceId,
+  };
+}
+
 type UseSequencerControllerArgs = {
   sequencerProcess: ProcessStatus | null;
   callProcessFn: (
@@ -432,73 +527,30 @@ export function useSequencerController({
           }
           return;
         }
-        const result = resp.result as {
-          configured?: unknown;
-          entries?: unknown;
-          last_error?: unknown;
-          active_sequence_id?: unknown;
-        };
-        const entriesRaw = Array.isArray(result.entries) ? result.entries : [];
-        const entries: SequencerLibraryEntry[] = entriesRaw
-          .map((item) => {
-            if (!item || typeof item !== "object") {
-              return null;
-            }
-            const obj = item as Record<string, unknown>;
-            const id =
-              typeof obj.id === "string" && obj.id.trim().length > 0
-                ? obj.id.trim()
-                : "";
-            if (!id) {
-              return null;
-            }
-            const varsRaw = Array.isArray(obj.vars) ? obj.vars : [];
-            const vars = varsRaw
-              .filter((value): value is string => typeof value === "string")
-              .map((value) => value.trim())
-              .filter((value) => value.length > 0);
-            return {
-              id,
-              label:
-                typeof obj.label === "string" && obj.label.trim().length > 0
-                  ? obj.label
-                  : null,
-              description:
-                typeof obj.description === "string" && obj.description.trim().length > 0
-                  ? obj.description
-                  : null,
-              path:
-                typeof obj.path === "string" && obj.path.trim().length > 0
-                  ? obj.path
-                  : null,
-              source:
-                typeof obj.source === "string" && obj.source.trim().length > 0
-                  ? obj.source
-                  : null,
-              vars,
-            } satisfies SequencerLibraryEntry;
-          })
-          .filter((item): item is SequencerLibraryEntry => item !== null);
-        setSequencerLibraryConfigured(result.configured === true);
+        const payload = normalizeSequencerLibraryPayload(resp.result);
+        if (!payload) {
+          const message = "Malformed sequence library response";
+          setSequencerLibraryError(message);
+          if (!silent) {
+            notifications.show({
+              color: "red",
+              title: "Failed to fetch sequence library",
+              message,
+            });
+          }
+          return;
+        }
+        const { configured, entries, lastError, activeSequenceId } = payload;
+        setSequencerLibraryConfigured(configured);
         setSequencerLibraryEntries(entries);
-        const activeSequenceId =
-          typeof result.active_sequence_id === "string" &&
-          result.active_sequence_id.trim().length > 0
-            ? result.active_sequence_id
-            : null;
-        setSequencerSelectedSequenceId((prev) => {
-          if (activeSequenceId) {
-            return activeSequenceId;
-          }
-          if (prev && entries.some((entry) => entry.id === prev)) {
-            return prev;
-          }
-          return sequencerLoadSource === "library" ? entries[0]?.id ?? null : null;
-        });
-        const lastError =
-          typeof result.last_error === "string" && result.last_error.trim().length > 0
-            ? result.last_error
-            : null;
+        setSequencerSelectedSequenceId((prev) =>
+          resolveSequencerSelectedSequenceId(
+            prev,
+            activeSequenceId,
+            entries,
+            sequencerLoadSource
+          )
+        );
         setSequencerLibraryError(lastError);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
@@ -646,73 +698,28 @@ export function useSequencerController({
         });
         return;
       }
-      const result = resp.result as {
-        configured?: unknown;
-        entries?: unknown;
-        last_error?: unknown;
-        active_sequence_id?: unknown;
-      };
-      const entriesRaw = Array.isArray(result.entries) ? result.entries : [];
-      const entries: SequencerLibraryEntry[] = entriesRaw
-        .map((item) => {
-          if (!item || typeof item !== "object") {
-            return null;
-          }
-          const obj = item as Record<string, unknown>;
-          const id =
-            typeof obj.id === "string" && obj.id.trim().length > 0
-              ? obj.id.trim()
-              : "";
-          if (!id) {
-            return null;
-          }
-          const varsRaw = Array.isArray(obj.vars) ? obj.vars : [];
-          const vars = varsRaw
-            .filter((value): value is string => typeof value === "string")
-            .map((value) => value.trim())
-            .filter((value) => value.length > 0);
-          return {
-            id,
-            label:
-              typeof obj.label === "string" && obj.label.trim().length > 0
-                ? obj.label
-                : null,
-            description:
-              typeof obj.description === "string" && obj.description.trim().length > 0
-                ? obj.description
-                : null,
-            path:
-              typeof obj.path === "string" && obj.path.trim().length > 0
-                ? obj.path
-                : null,
-            source:
-              typeof obj.source === "string" && obj.source.trim().length > 0
-                ? obj.source
-                : null,
-            vars,
-          } satisfies SequencerLibraryEntry;
-        })
-        .filter((item): item is SequencerLibraryEntry => item !== null);
-      setSequencerLibraryConfigured(result.configured === true);
+      const payload = normalizeSequencerLibraryPayload(resp.result);
+      if (!payload) {
+        const message = "Malformed sequence library response";
+        setSequencerLibraryError(message);
+        notifications.show({
+          color: "red",
+          title: "Failed to reload sequence library",
+          message,
+        });
+        return;
+      }
+      const { configured, entries, lastError, activeSequenceId } = payload;
+      setSequencerLibraryConfigured(configured);
       setSequencerLibraryEntries(entries);
-      const activeSequenceId =
-        typeof result.active_sequence_id === "string" &&
-        result.active_sequence_id.trim().length > 0
-          ? result.active_sequence_id
-          : null;
-      setSequencerSelectedSequenceId((prev) => {
-        if (activeSequenceId) {
-          return activeSequenceId;
-        }
-        if (prev && entries.some((entry) => entry.id === prev)) {
-          return prev;
-        }
-        return sequencerLoadSource === "library" ? entries[0]?.id ?? null : null;
-      });
-      const lastError =
-        typeof result.last_error === "string" && result.last_error.trim().length > 0
-          ? result.last_error
-          : null;
+      setSequencerSelectedSequenceId((prev) =>
+        resolveSequencerSelectedSequenceId(
+          prev,
+          activeSequenceId,
+          entries,
+          sequencerLoadSource
+        )
+      );
       setSequencerLibraryError(lastError);
       notifications.show({
         color: "teal",
@@ -1404,14 +1411,14 @@ export function useSequencerController({
       setSequencerSelectedSequenceId(activeId);
       return;
     }
-    setSequencerSelectedSequenceId((prev) => {
-      if (prev && sequencerLibraryEntries.some((entry) => entry.id === prev)) {
-        return prev;
-      }
-      return sequencerLoadSource === "library"
-        ? sequencerLibraryEntries[0]?.id ?? null
-        : null;
-    });
+    setSequencerSelectedSequenceId((prev) =>
+      resolveSequencerSelectedSequenceId(
+        prev,
+        activeId,
+        sequencerLibraryEntries,
+        sequencerLoadSource
+      )
+    );
   }, [sequencerLibraryEntries, sequencerLoadSource, sequencerStatus?.activeSequenceId]);
 
   return {
