@@ -693,10 +693,20 @@ class ManagerTUI(App):
         proc = self._process_status_map.get(process_id)
         if not isinstance(proc, dict):
             return False
-        state = str(proc.get("state", "") or "").strip().upper()
-        if state != "RUNNING":
+        if not self._process_is_registered(proc):
             return False
-        return self._process_is_registered(proc)
+        # Federated (mirrored) processes carry a synthetic state ("FEDERATED"),
+        # not the local "RUNNING", so gate them on the peer link being live
+        # rather than the local state — otherwise their capabilities are never
+        # probed and the detail panel stays empty.
+        is_remote = bool(proc.get("is_remote")) or (
+            str(proc.get("source_kind", "") or "").strip().lower() == "federated"
+        )
+        if is_remote:
+            liveness = str(proc.get("liveness", "") or "").strip().upper()
+            return liveness in ("", "ONLINE")
+        state = str(proc.get("state", "") or "").strip().upper()
+        return state == "RUNNING"
 
     def _process_capabilities_retry_allowed(self, process_id: str) -> bool:
         next_retry = self._proc_cap_retry_next_mono.get(process_id)
