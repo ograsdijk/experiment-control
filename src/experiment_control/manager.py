@@ -1259,6 +1259,9 @@ class Manager(
             if handle.process is not None and handle.process.poll() is None:
                 handle.driver_process_state = ManagedProcessState.RUNNING
                 handle.driver_pid = handle.process.pid
+                # Anchor for heartbeat-staleness aging (see
+                # enforce_device_driver_heartbeat_timeout).
+                handle.driver_running_since_mono = time.monotonic()
             else:
                 hb = handle.last_hb_recv_mono
                 hb_fresh = (
@@ -1267,9 +1270,11 @@ class Manager(
                 )
                 if hb_fresh:
                     handle.driver_process_state = ManagedProcessState.RUNNING
+                    handle.driver_running_since_mono = time.monotonic()
                     # pid is maintained by the heartbeat handler.
                 # else: stale registration for a dead process — leave state/pid
-                # unchanged; the supervisor reconciles a phantom RUNNING.
+                # unchanged; the supervisor demotes it once the heartbeat is
+                # stale beyond the grace (enforce_device_driver_heartbeat_timeout).
 
             # Connect SUB to driver PUB (one SUB can connect to many PUBs)
             self._sub.connect(reg.pub_endpoint)

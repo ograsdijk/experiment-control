@@ -18,8 +18,8 @@ from experiment_control._manager.process_supervision import (  # noqa: E402
     enforce_managed_process_stop_timeout,
     maybe_restart_managed_process,
     maybe_schedule_restart,
+    enforce_device_driver_heartbeat_timeout,
     process_snapshot,
-    reconcile_phantom_running_driver,
     start_process_handle,
     stop_process_handle,
     supervise_device_drivers,
@@ -525,73 +525,108 @@ class RestartStopTimeoutRaceTests(unittest.TestCase):
         self.assertNotEqual(handle.state, "STOPPING")
 
 
-class PhantomRunningDriverReconcileTests(unittest.TestCase):
-    """A driver stuck at RUNNING with no live process and no recent heartbeat
-    (e.g. a stale registration applied after the subprocess was reaped) must be
-    reconciled to FAILED so it can't report RUNNING with no pid forever."""
+class DeviceDriverHeartbeatDemotionTests(unittest.TestCase):
+    """Driver RUNNING state is heartbeat-authoritative: a stale heartbeat demotes
+    to FAILED even when the wrapper process is still alive (poll() can't see the
+    real driver's death), and covers the process-is-None stale-registration case
+    too. Subsumes the earlier proc.poll()-based reconcile."""
 
     @staticmethod
-    def _driver_handle(**overrides: object) -> SimpleNamespace:
+    def _handle(**overrides: object) -> SimpleNamespace:
         handle = SimpleNamespace(
             process=None,
-            driver_pid=None,
+            driver_pid=123,
             driver_process_state="RUNNING",
             driver_last_error=None,
             driver_last_error_kind=None,
             last_hb_recv_mono=None,
+            driver_running_since_mono=None,
         )
         for key, value in overrides.items():
             setattr(handle, key, value)
         return handle
 
     @staticmethod
-    def _supervision_manager(handle: SimpleNamespace, calls: list) -> SimpleNamespace:
+    def _manager() -> SimpleNamespace:
         return SimpleNamespace(
-            _devices={"dev": handle},
             _heartbeat_timeout_s=3.0,
-            _update_device_driver_exit_state=lambda h, rc: calls.append(("exit", rc)),
-            _enforce_device_driver_stop_timeout=lambda h, n: None,
-            _maybe_restart_device_driver=lambda d, h, n: None,
-            _reconcile_phantom_running_driver=lambda h: calls.append(("reconcile", h)),
+            _heartbeat_hard_timeout_multiplier=3.0,
+            _publish_driver_event=mock.Mock(),
         )
 
-    def test_reconcile_demotes_running_to_failed_and_clears_pid(self) -> None:
-        events: list[str] = []
-        manager = SimpleNamespace(
-            _publish_driver_event=lambda topic, h: events.append(topic)
+    def _no_defer(self):
+        return (
+            mock.patch.object(ps, "_in_startup_grace", lambda *a: False),
+            mock.patch.object(ps, "_recent_manager_loop_stall", lambda *a: False),
         )
-        handle = self._driver_handle(driver_pid=None)
-        reconcile_phantom_running_driver(manager, handle)
+
+    def test_demotes_when_heartbeat_stale_even_if_process_alive(self) -> None:
+        popen = _FakePopen()
+        handle = self._handle(process=popen, last_hb_recv_mono=90.0)  # age 10 > 3
+        manager = self._manager()
+        g1, g2 = self._no_defer()
+        with g1, g2:
+            enforce_device_driver_heartbeat_timeout(manager, handle, 100.0)
         self.assertEqual(str(handle.driver_process_state), "FAILED")
         self.assertIsNone(handle.driver_pid)
-        self.assertEqual(handle.driver_last_error_kind, "liveness_lost")
-        self.assertIn("manager.driver.failed", events)
+        self.assertIsNone(handle.process)  # stale wrapper cleared
+        self.assertTrue(popen.terminated)  # and terminated
+        self.assertEqual(handle.driver_last_error_kind, "heartbeat_stale")
+        manager._publish_driver_event.assert_called()
 
-    def test_supervise_reconciles_when_no_process_and_stale_heartbeat(self) -> None:
+    def test_ages_against_running_since_when_no_heartbeat(self) -> None:
+        handle = self._handle(
+            process=_FakePopen(), last_hb_recv_mono=None, driver_running_since_mono=80.0
+        )  # age 20 > 3
+        manager = self._manager()
+        g1, g2 = self._no_defer()
+        with g1, g2:
+            enforce_device_driver_heartbeat_timeout(manager, handle, 100.0)
+        self.assertEqual(str(handle.driver_process_state), "FAILED")
+
+    def test_no_demote_when_heartbeat_fresh(self) -> None:
+        handle = self._handle(process=_FakePopen(), last_hb_recv_mono=99.0)  # age 1 < 3
+        manager = self._manager()
+        enforce_device_driver_heartbeat_timeout(manager, handle, 100.0)
+        self.assertEqual(str(handle.driver_process_state), "RUNNING")
+
+    def test_no_demote_when_no_reference(self) -> None:
+        handle = self._handle(last_hb_recv_mono=None, driver_running_since_mono=None)
+        manager = self._manager()
+        enforce_device_driver_heartbeat_timeout(manager, handle, 100.0)
+        self.assertEqual(str(handle.driver_process_state), "RUNNING")
+
+    def test_only_acts_on_running_state(self) -> None:
+        handle = self._handle(
+            driver_process_state="STARTING", last_hb_recv_mono=80.0
+        )
+        manager = self._manager()
+        enforce_device_driver_heartbeat_timeout(manager, handle, 100.0)
+        self.assertEqual(str(handle.driver_process_state), "STARTING")
+
+    def test_defers_within_hard_timeout_during_startup_grace(self) -> None:
+        handle = self._handle(process=_FakePopen(), last_hb_recv_mono=96.0)  # age 4: >3, <9
+        manager = self._manager()
+        with mock.patch.object(ps, "_in_startup_grace", lambda *a: True), \
+             mock.patch.object(ps, "_recent_manager_loop_stall", lambda *a: False):
+            enforce_device_driver_heartbeat_timeout(manager, handle, 100.0)
+        self.assertEqual(str(handle.driver_process_state), "RUNNING")
+
+    def test_supervise_invokes_heartbeat_enforcement(self) -> None:
         calls: list = []
-        handle = self._driver_handle(last_hb_recv_mono=None)
-        manager = self._supervision_manager(handle, calls)
+        handle = self._handle(process=_FakePopen(), last_hb_recv_mono=90.0)
+        manager = SimpleNamespace(
+            _devices={"dev": handle},
+            _update_device_driver_exit_state=lambda h, rc: None,
+            _enforce_device_driver_heartbeat_timeout=lambda h, n: calls.append(
+                ("hb", h)
+            ),
+            _enforce_device_driver_stop_timeout=lambda h, n: None,
+            _maybe_restart_device_driver=lambda d, h, n: None,
+        )
         with mock.patch.object(ps, "_maybe_auto_reconnect_device", lambda *a, **k: None):
             supervise_device_drivers(manager, 100.0)
-        self.assertIn(("reconcile", handle), calls)
-
-    def test_supervise_skips_reconcile_when_heartbeat_fresh(self) -> None:
-        calls: list = []
-        # hb age = 0.5s < timeout 3s -> fresh -> a legit (e.g. external) driver.
-        handle = self._driver_handle(last_hb_recv_mono=99.5)
-        manager = self._supervision_manager(handle, calls)
-        with mock.patch.object(ps, "_maybe_auto_reconnect_device", lambda *a, **k: None):
-            supervise_device_drivers(manager, 100.0)
-        self.assertNotIn(("reconcile", handle), calls)
-
-    def test_supervise_skips_reconcile_when_process_alive(self) -> None:
-        calls: list = []
-        handle = self._driver_handle(process=_FakePopen(), last_hb_recv_mono=None)
-        manager = self._supervision_manager(handle, calls)
-        with mock.patch.object(ps, "_maybe_auto_reconnect_device", lambda *a, **k: None):
-            supervise_device_drivers(manager, 100.0)
-        # Live process -> poll() path, never the phantom-RUNNING reconcile.
-        self.assertNotIn(("reconcile", handle), calls)
+        self.assertIn(("hb", handle), calls)
 
 
 if __name__ == "__main__":
