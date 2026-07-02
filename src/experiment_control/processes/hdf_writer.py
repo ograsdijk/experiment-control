@@ -3706,6 +3706,16 @@ class HdfWriter(ManagedProcessBase):
             self._handle_chunk_ready_disabled_device(key=key, seq=chunk.seq)
             return
 
+        reader = self._ensure_chunk_ready_reader(
+            key=key,
+            device_id=device_id,
+            stream=stream,
+            shm_name=chunk.shm_name,
+            initial_seq=chunk.seq,
+        )
+        if reader is None:
+            return
+
         ctx_id = chunk.context_id
         if ctx_id is not None and chunk.context_fields is not None:
             self._record_context(ctx_id, chunk.context_fields)
@@ -3724,16 +3734,6 @@ class HdfWriter(ManagedProcessBase):
             )
         elif ctx_id is not None:
             self._bump_error("stream.context_seq_missing")
-
-        reader = self._ensure_chunk_ready_reader(
-            key=key,
-            device_id=device_id,
-            stream=stream,
-            shm_name=chunk.shm_name,
-            initial_seq=chunk.seq,
-        )
-        if reader is None:
-            return
 
         last_seq = int(self._stream_last_seq.get(key, 0))
         events = self._read_chunk_ready_events(key=key, reader=reader, last_seq=last_seq)
@@ -4719,4 +4719,3 @@ def main(argv: list[str] | None = None) -> None:
 
 if __name__ == "__main__":
     main()
-
