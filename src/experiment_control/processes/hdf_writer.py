@@ -242,6 +242,7 @@ def _ingest_schema(
     datasets: dict[str, h5py.Dataset],
     *,
     write_enabled: Callable[[str], bool] | None = None,
+    on_error: Callable[[str, Exception], None] | None = None,
     chunk_size: int = DEFAULT_TELEMETRY_CHUNK_ROWS,
 ) -> dict[str, Json]:
     devices_raw = schema.get("devices", [])
@@ -252,27 +253,35 @@ def _ingest_schema(
     for device in devices_raw:
         if not isinstance(device, dict):
             continue
-        device_id = str(device["device_id"])
-        signals = list(device["signals"])
-        dtypes = list(device["dtypes"])
-        units = list(device["units"])
+        # Per-device isolation: one device with a bad schema (e.g. an
+        # unsupported dtype) must not break dataset creation for the others,
+        # and the failure must name the device via on_error.
+        device_id = str(device.get("device_id", "") or "")
+        try:
+            signals = list(device["signals"])
+            dtypes = list(device["dtypes"])
+            units = list(device["units"])
 
-        device_map[device_id] = {
-            "signals": signals,
-            "dtypes": dtypes,
-            "units": units,
-        }
+            device_map[device_id] = {
+                "signals": signals,
+                "dtypes": dtypes,
+                "units": units,
+            }
 
-        can_write = True if write_enabled is None else bool(write_enabled(device_id))
-        if can_write and device_id not in datasets and signals:
-            datasets[device_id] = _create_device_dataset(
-                telemetry_group,
-                device_id,
-                signals,
-                dtypes,
-                units,
-                chunk_size=chunk_size,
-            )
+            can_write = True if write_enabled is None else bool(write_enabled(device_id))
+            if can_write and device_id not in datasets and signals:
+                datasets[device_id] = _create_device_dataset(
+                    telemetry_group,
+                    device_id,
+                    signals,
+                    dtypes,
+                    units,
+                    chunk_size=chunk_size,
+                )
+        except Exception as exc:
+            device_map.pop(device_id, None)
+            if on_error is not None:
+                on_error(device_id or "<unknown>", exc)
 
     return device_map
 
@@ -284,6 +293,7 @@ def _ingest_process_schema(
     device_map: dict[str, Json],
     *,
     write_enabled: Callable[[str], bool] | None = None,
+    on_error: Callable[[str, Exception], None] | None = None,
     chunk_size: int = DEFAULT_TELEMETRY_CHUNK_ROWS,
 ) -> set[str]:
     """Create ``/process_telemetry/<process_id>`` datasets from a process
@@ -308,29 +318,38 @@ def _ingest_process_schema(
         if not isinstance(proc, dict):
             continue
         process_id = str(proc.get("process_id", ""))
-        signals = list(proc.get("signals", []))
-        dtypes = list(proc.get("dtypes", []))
-        units = list(proc.get("units", []))
-        if not process_id or not signals:
+        if not process_id:
             continue
-        seen.add(process_id)
-        device_map[process_id] = {
-            "signals": signals,
-            "dtypes": dtypes,
-            "units": units,
-        }
-        can_write = True if write_enabled is None else bool(write_enabled(process_id))
-        if can_write and process_id not in datasets:
-            ds = _create_device_dataset(
-                process_group,
-                process_id,
-                signals,
-                dtypes,
-                units,
-                chunk_size=chunk_size,
+        try:
+            signals = list(proc.get("signals", []))
+            dtypes = list(proc.get("dtypes", []))
+            units = list(proc.get("units", []))
+            if not signals:
+                continue
+            seen.add(process_id)
+            device_map[process_id] = {
+                "signals": signals,
+                "dtypes": dtypes,
+                "units": units,
+            }
+            can_write = (
+                True if write_enabled is None else bool(write_enabled(process_id))
             )
-            ds.attrs["source_kind"] = "process"
-            datasets[process_id] = ds
+            if can_write and process_id not in datasets:
+                ds = _create_device_dataset(
+                    process_group,
+                    process_id,
+                    signals,
+                    dtypes,
+                    units,
+                    chunk_size=chunk_size,
+                )
+                ds.attrs["source_kind"] = "process"
+                datasets[process_id] = ds
+        except Exception as exc:
+            device_map.pop(process_id, None)
+            if on_error is not None:
+                on_error(process_id, exc)
     return seen
 
 
@@ -541,6 +560,9 @@ class HdfWriter(ManagedProcessBase):
         self._last_flush_defer_event_mono: float = 0.0
         # Rate-limit for the `hdf.backpressure` alarm (reservoir high-water).
         self._last_backpressure_event_mono: float = 0.0
+        # Per-device/process rate-limit for telemetry-write error events so a
+        # single persistently-bad device can't flood the process data PUB.
+        self._telemetry_error_pub_mono: dict[str, float] = {}
         # Reservoir high-water marks (rows). Soft = loud alarm only; hard =
         # last-resort drop-with-accounting so a genuine sustained overload
         # can never grow memory without bound. Sized off the deque cap.
@@ -697,6 +719,36 @@ class HdfWriter(ManagedProcessBase):
         pid = self._normalize_device_id(process_id)
         if pid:
             self._known_process_ids.add(pid)
+
+    def _report_ingest_error(self, ident: str, exc: Exception, *, kind: str) -> None:
+        """Name the offending device/process when its schema can't be ingested
+        (e.g. a bad dtype) — so a single bad entry surfaces as an actionable
+        event instead of silently breaking file init for everything."""
+        self._bump_error(f"hdf.{kind}_schema_error")
+        try:
+            self._publish_process_event(
+                topic="hdf.schema_error",
+                payload={"kind": kind, "id": str(ident), "error": str(exc)},
+            )
+        except Exception:
+            pass
+
+    def _report_telemetry_write_error(self, device_id: str, exc: Exception) -> None:
+        """Name the device/process whose telemetry row failed to write, without
+        failing the whole batch. Event is rate-limited per id (>=1s)."""
+        self._bump_error("hdf.telemetry_write_error")
+        now_mono = time.monotonic()
+        last = self._telemetry_error_pub_mono.get(device_id, 0.0)
+        if (now_mono - last) < 1.0:
+            return
+        self._telemetry_error_pub_mono[device_id] = now_mono
+        try:
+            self._publish_process_event(
+                topic="hdf.telemetry_write_error",
+                payload={"device_id": str(device_id), "error": str(exc)},
+            )
+        except Exception:
+            pass
 
     def _stream_buffer_snapshot(self) -> tuple[list[Json], int, int]:
         items: list[Json] = []
@@ -1966,6 +2018,9 @@ class HdfWriter(ManagedProcessBase):
                     self._telemetry_group,
                     self._datasets,
                     write_enabled=self._is_device_enabled,
+                    on_error=lambda did, exc: self._report_ingest_error(
+                        did, exc, kind="device"
+                    ),
                 )
 
             # Process telemetry schema (manager.process_telemetry.schema.list):
@@ -1980,6 +2035,9 @@ class HdfWriter(ManagedProcessBase):
                         self._datasets,
                         self._device_map,
                         write_enabled=self._is_process_enabled,
+                        on_error=lambda pid, exc: self._report_ingest_error(
+                            pid, exc, kind="process"
+                        ),
                     )
                     self._known_process_ids.update(seen_processes)
 
@@ -2660,6 +2718,9 @@ class HdfWriter(ManagedProcessBase):
                 self._telemetry_group,
                 self._datasets,
                 write_enabled=self._is_device_enabled,
+                on_error=lambda did, exc: self._report_ingest_error(
+                    did, exc, kind="device"
+                ),
             )
         except Exception:
             self._bump_error("schema.rpc")
@@ -3221,6 +3282,9 @@ class HdfWriter(ManagedProcessBase):
                         self._telemetry_group,
                         self._datasets,
                         write_enabled=self._is_device_enabled,
+                        on_error=lambda did, exc: self._report_ingest_error(
+                            did, exc, kind="device"
+                        ),
                     )
                 except Exception:
                     self._bump_error("schema.rpc")
@@ -3300,6 +3364,9 @@ class HdfWriter(ManagedProcessBase):
                                 self._datasets,
                                 self._device_map,
                                 write_enabled=self._is_process_enabled,
+                                on_error=lambda pid, exc: self._report_ingest_error(
+                                    pid, exc, kind="process"
+                                ),
                             )
                             self._known_process_ids.update(seen)
 
@@ -3558,48 +3625,56 @@ class HdfWriter(ManagedProcessBase):
             if not self._ensure_device(device_id):
                 continue
 
-            ds = self._datasets[device_id]
-            info = self._device_map[device_id]
-            signals = info["signals"]
-            dtypes = info["dtypes"]
+            # Per-device isolation: a bad value/dtype for one device must not
+            # fail the whole flush batch; report it (named) and skip the row.
+            try:
+                ds = self._datasets[device_id]
+                info = self._device_map[device_id]
+                signals = info["signals"]
+                dtypes = info["dtypes"]
 
-            ts = msg.get("ts", {})
-            t_wall = float(ts.get("t_wall", np.nan))
-            t_mono = float(ts.get("t_mono", np.nan))
-            t_wall_recv = float(ts.get("t_wall_recv", np.nan))
-            seq = int(msg.get("seq", -1))
-            sigs = msg.get("signals", {})
-            if not isinstance(sigs, dict):
-                sigs = {}
+                ts = msg.get("ts", {})
+                t_wall = float(ts.get("t_wall", np.nan))
+                t_mono = float(ts.get("t_mono", np.nan))
+                t_wall_recv = float(ts.get("t_wall_recv", np.nan))
+                seq = int(msg.get("seq", -1))
+                sigs = msg.get("signals", {})
+                if not isinstance(sigs, dict):
+                    sigs = {}
 
-            batch = self._ensure_telemetry_batch_buffer(device_id=device_id, dtype=ds.dtype)
-            used = int(used_by_device.get(device_id, 0))
-            if used >= batch.shape[0]:
-                self._flush_telemetry_batch(
-                    device_id=device_id,
-                    ds=ds,
-                    used=used,
+                batch = self._ensure_telemetry_batch_buffer(
+                    device_id=device_id, dtype=ds.dtype
                 )
-                used = 0
-            row = batch[used]
-            row["t_wall"] = t_wall
-            row["t_mono"] = t_mono
-            row["t_wall_recv"] = t_wall_recv
-            row["seq"] = seq
+                used = int(used_by_device.get(device_id, 0))
+                if used >= batch.shape[0]:
+                    self._flush_telemetry_batch(
+                        device_id=device_id,
+                        ds=ds,
+                        used=used,
+                    )
+                    used = 0
+                row = batch[used]
+                row["t_wall"] = t_wall
+                row["t_mono"] = t_mono
+                row["t_wall_recv"] = t_wall_recv
+                row["seq"] = seq
 
-            for name, dtype_str in zip(signals, dtypes, strict=True):
-                raw = sigs.get(name, {})
-                value = raw.get("value") if isinstance(raw, dict) else None
-                row[name] = _convert_value(value, dtype_str)
-            used += 1
-            if used >= batch.shape[0]:
-                self._flush_telemetry_batch(
-                    device_id=device_id,
-                    ds=ds,
-                    used=used,
-                )
-                used = 0
-            used_by_device[device_id] = used
+                for name, dtype_str in zip(signals, dtypes, strict=True):
+                    raw = sigs.get(name, {})
+                    value = raw.get("value") if isinstance(raw, dict) else None
+                    row[name] = _convert_value(value, dtype_str)
+                used += 1
+                if used >= batch.shape[0]:
+                    self._flush_telemetry_batch(
+                        device_id=device_id,
+                        ds=ds,
+                        used=used,
+                    )
+                    used = 0
+                used_by_device[device_id] = used
+            except Exception as exc:
+                self._report_telemetry_write_error(device_id, exc)
+                continue
 
         for device_id, used in used_by_device.items():
             if used <= 0:
