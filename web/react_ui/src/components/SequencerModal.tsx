@@ -417,6 +417,7 @@ export function SequencerModal({
                   onChange={(value) => onSelectedSequenceIdChange(value)}
                   searchable
                   clearable
+                  comboboxProps={{ zIndex: 500 }}
                   disabled={libraryLoading}
                 />
                 <Text size="xs" c="dimmed">
