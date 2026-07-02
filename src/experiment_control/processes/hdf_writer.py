@@ -61,6 +61,7 @@ from .hdf_writer_dtypes import (
     _measurement_note_dtype,
     _sequencer_event_dtype,
     _sequencer_yaml_dtype,
+    str_length_for,
 )
 from .hdf_writer_topics import build_hdf_topic_handlers
 from .process_base import ManagedProcessBase
@@ -172,12 +173,26 @@ def _config_rpc(ctx: zmq.Context, endpoint: str, timeout_ms: int = 2000) -> list
 
 
 def _dtype_for(dtype_str: str) -> np.dtype[Any]:
-    if dtype_str not in DTYPE_MAP:
-        raise ValueError(f"Unsupported dtype {dtype_str!r}")
-    return DTYPE_MAP[dtype_str]
+    if dtype_str in DTYPE_MAP:
+        return DTYPE_MAP[dtype_str]
+    length = str_length_for(dtype_str)
+    if length is not None:
+        # Fixed-length UTF-8 -> numpy S{length}; keeps the compound filterable
+        # so shuffle+compression still apply to string-bearing device datasets.
+        return np.dtype(h5py.string_dtype("utf-8", length=length))
+    raise ValueError(f"Unsupported dtype {dtype_str!r}")
 
 
 def _convert_value(value: Any, dtype_str: str) -> Any:
+    length = str_length_for(dtype_str)
+    if length is not None:
+        # Encode to UTF-8 bytes for the S{length} field (numpy would ASCII-encode
+        # a str and raise on non-ASCII). Truncate to N bytes on a char boundary
+        # so a clipped multi-byte value stays valid UTF-8.
+        raw = str(coerce_scalar(value, "str")).encode("utf-8")
+        if len(raw) > length:
+            raw = raw[:length].decode("utf-8", "ignore").encode("utf-8")
+        return raw
     return coerce_scalar(value, dtype_str)
 
 

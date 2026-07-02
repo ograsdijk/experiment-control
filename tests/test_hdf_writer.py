@@ -26,8 +26,14 @@ from experiment_control.processes.hdf_writer import (  # noqa: E402
     HdfWriter,
     _BG_SENTINEL,
     _FlushBatch,
+    _convert_value,
     _create_device_dataset,
+    _dtype_for,
     _ingest_process_schema,
+)
+from experiment_control.processes.hdf_writer_dtypes import (  # noqa: E402
+    DEFAULT_STR_LEN,
+    str_length_for,
 )
 from experiment_control.shm.shm_ring import ShmRingWriter  # noqa: E402
 
@@ -1133,6 +1139,111 @@ class HdfWriterCompressionTests(unittest.TestCase):
                     session=1,
                 )
                 self.assertEqual(datasets["data"].compression, "lzf")
+
+
+class HdfWriterFixedLengthStringTests(unittest.TestCase):
+    def _make_writer(self, out_dir: str) -> HdfWriter:
+        return HdfWriter(
+            out_dir=out_dir,
+            filename=None,
+            manager_rpc="tcp://127.0.0.1:65531",
+            manager_pub="tcp://127.0.0.1:65532",
+            rpc_timeout_ms=2000,
+            timezone="America/Chicago",
+            rcvhwm=1000,
+            write_every_s=1.0,
+            buffer_max_messages=1000,
+            flush_every_n=10,
+            flush_every_s=1.0,
+            disabled_devices=[],
+            event_log_mode="all",
+        )
+
+    def test_str_length_for(self) -> None:
+        self.assertEqual(str_length_for("str"), DEFAULT_STR_LEN)
+        self.assertEqual(str_length_for("str:16"), 16)
+        self.assertIsNone(str_length_for("float64"))
+        self.assertIsNone(str_length_for("int32"))
+        with self.assertRaises(ValueError):
+            str_length_for("str:0")
+        with self.assertRaises(ValueError):
+            str_length_for("str:abc")
+
+    def test_dtype_for_str_is_fixed_length_bytes(self) -> None:
+        dt = _dtype_for("str:16")
+        self.assertEqual(dt.kind, "S")
+        self.assertEqual(dt.itemsize, 16)
+        self.assertEqual(_dtype_for("str").itemsize, DEFAULT_STR_LEN)
+
+    def test_convert_value_encodes_and_truncates_utf8(self) -> None:
+        # ASCII within bound: exact bytes.
+        self.assertEqual(_convert_value("SETTLED", "str:16"), b"SETTLED")
+        # None -> empty.
+        self.assertEqual(_convert_value(None, "str:16"), b"")
+        # Overlong is truncated to N bytes.
+        self.assertEqual(len(_convert_value("A" * 40, "str:16")), 16)
+        # Non-ASCII does not raise and stays valid UTF-8 after truncation.
+        out = _convert_value("café-ünîcodé-tail", "str:8")
+        self.assertIsInstance(out, bytes)
+        self.assertLessEqual(len(out), 8)
+        out.decode("utf-8")  # must not raise
+
+    def test_string_signal_roundtrip_with_shuffle_and_lzf(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            writer = self._make_writer(str(root))
+            with h5py.File(root / "strsig.h5", "w") as h5:
+                meta = writer._build_measurement_metadata(  # noqa: SLF001
+                    profile_id=None, values=None, require_profile=False
+                )
+                with writer._h5_lock:  # noqa: SLF001
+                    writer._configure_active_file(  # noqa: SLF001
+                        h5,
+                        write_every_s=1.0,
+                        load_manager_state=False,
+                        measurement_meta=meta,
+                    )
+                    assert writer._telemetry_group is not None  # noqa: SLF001
+                    ds = _create_device_dataset(
+                        writer._telemetry_group,  # noqa: SLF001
+                        "wm1",
+                        ["switch_state"],
+                        ["str:16"],
+                        [""],
+                    )
+                    writer._datasets["wm1"] = ds  # noqa: SLF001
+                    writer._device_map["wm1"] = {  # noqa: SLF001
+                        "signals": ["switch_state"],
+                        "dtypes": ["str:16"],
+                    }
+                    # Fixed-length string field keeps the compound filterable.
+                    self.assertEqual(ds.compression, "lzf")
+                    self.assertTrue(ds.shuffle)
+                    self.assertEqual(ds.dtype["switch_state"].kind, "S")
+                    writer._write_buffered_rows_batch(  # noqa: SLF001
+                        [
+                            {
+                                "device_id": "wm1",
+                                "seq": 0,
+                                "ts": {"t_wall": 1.0, "t_mono": 1.0},
+                                "signals": {"switch_state": {"value": "SETTLED"}},
+                            },
+                            {
+                                "device_id": "wm1",
+                                "seq": 1,
+                                "ts": {"t_wall": 2.0, "t_mono": 2.0},
+                                "signals": {
+                                    "switch_state": {"value": "INVERSE_SAWTOOTH_TOO_LONG"}
+                                },
+                            },
+                        ]
+                    )
+                self.assertEqual(int(ds.shape[0]), 2)
+                self.assertEqual(bytes(ds[0]["switch_state"]).decode("utf-8"), "SETTLED")
+                # Overlong value truncated to 16 bytes.
+                self.assertEqual(
+                    bytes(ds[1]["switch_state"]).decode("utf-8"), "INVERSE_SAWTOOTH"
+                )
 
 
 class HdfWriterMetadataConsolidationTests(unittest.TestCase):
