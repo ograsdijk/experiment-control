@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import queue
+import threading
+import time
 import unittest
 
 from experiment_control._tui.app import ManagerTUI
@@ -68,12 +70,78 @@ class _ReplacementSocket(_BaseFakeSocket):
         self.closed = True
 
 
+class ManagerTuiRpcWorkerTests(unittest.TestCase):
+    """The single-owner RPC worker owns the socket; UI-thread code submits
+    work (fire-and-forget or blocking) and never touches the socket."""
+
+    def _make_worker_app(self) -> ManagerTUI:
+        app = object.__new__(ManagerTUI)
+        app._rpc_req_q = queue.Queue()
+        app._rpc_worker_ident = None
+        # call_from_thread runs the callback inline for the test.
+        app.call_from_thread = lambda fn, *a, **kw: fn(*a, **kw)  # type: ignore[method-assign]
+        return app
+
+    def _start_worker(self, app: ManagerTUI) -> threading.Thread:
+        t = threading.Thread(target=app._rpc_worker_loop, daemon=True)
+        t.start()
+        return t
+
+    def test_rpc_submit_delivers_result_to_callback(self) -> None:
+        app = self._make_worker_app()
+        app._do_rpc = lambda payload: {"ok": True, "echo": payload.get("type")}  # type: ignore[method-assign]
+        t = self._start_worker(app)
+        try:
+            got: list = []
+            app._rpc_submit({"type": "device.list_status"}, got.append)
+            deadline = 2.0
+            start = time.monotonic()
+            while not got and (time.monotonic() - start) < deadline:
+                time.sleep(0.01)
+            self.assertEqual(len(got), 1)
+            self.assertEqual(got[0], {"ok": True, "echo": "device.list_status"})
+        finally:
+            app._rpc_req_q.put(None)
+            t.join(timeout=1.0)
+
+    def test_rpc_call_blocks_for_result_via_worker(self) -> None:
+        app = self._make_worker_app()
+        app._do_rpc = lambda payload: {"ok": True}  # type: ignore[method-assign]
+        app._rpc_timeout_ms = 500
+        t = self._start_worker(app)
+        try:
+            resp = app._rpc_call({"type": "manager.info.identity"})
+            self.assertEqual(resp, {"ok": True})
+        finally:
+            app._rpc_req_q.put(None)
+            t.join(timeout=1.0)
+
+    def test_reset_dispatches_to_worker_when_off_thread(self) -> None:
+        app = self._make_worker_app()
+        reset_calls: list[int] = []
+        app._do_reset_rpc_socket = lambda: reset_calls.append(1)  # type: ignore[method-assign]
+        t = self._start_worker(app)
+        try:
+            app._reset_rpc_socket()
+            # Follow with a blocking call to ensure the reset job ran first.
+            app._do_rpc = lambda payload: {"ok": True}  # type: ignore[method-assign]
+            app._rpc_timeout_ms = 500
+            app._rpc_call({"type": "x"})
+            self.assertEqual(reset_calls, [1])
+        finally:
+            app._rpc_req_q.put(None)
+            t.join(timeout=1.0)
+
+
 class ManagerTuiRpcTests(unittest.TestCase):
     def _build_app(self, *, rpc_timeout_ms: int = 50) -> ManagerTUI:
         app = ManagerTUI(rpc_timeout_ms=rpc_timeout_ms)
         return app
 
-    def test_refresh_snapshot_accepts_null_driver_restart_count(self) -> None:
+    def test_apply_snapshot_accepts_null_driver_restart_count(self) -> None:
+        # _refresh_snapshot now runs the two status RPCs on the RPC worker and
+        # applies the results via _apply_snapshot on the UI thread; drive the
+        # apply step directly with the responses the worker would deliver.
         app = object.__new__(ManagerTUI)
         app._device_status = {}
         app._heartbeat_cache = {}
@@ -91,46 +159,43 @@ class ManagerTuiRpcTests(unittest.TestCase):
         app._proc_cap_render_attempt_mono = {}
         app._dev_cap_render_attempt_mono = {}
 
-        def fake_rpc_call(req):
-            if req.get("type") == "device.list_status":
-                return {
-                    "ok": True,
-                    "result": [
-                        {
-                            "device_id": "hornet_eql",
-                            "registered": True,
-                            "driver_process": {
-                                "state": "FEDERATED",
-                                "pid": None,
-                                "restart_count": None,
-                            },
-                            "source_kind": "federated",
-                        }
-                    ],
-                }
-            if req.get("type") == "manager.processes.list":
-                return {"ok": True, "result": []}
-            return None
-
-        app._rpc_call = fake_rpc_call  # type: ignore[method-assign]
         app._render_devices_table = lambda: None  # type: ignore[method-assign]
         app._render_processes_table = lambda: None  # type: ignore[method-assign]
         app._mark_inspector_dirty = lambda: None  # type: ignore[method-assign]
         app._render_inspector_if_needed = lambda force=False: None  # type: ignore[method-assign]
 
-        app._refresh_snapshot()
+        resp = {
+            "ok": True,
+            "result": [
+                {
+                    "device_id": "hornet_eql",
+                    "registered": True,
+                    "driver_process": {
+                        "state": "FEDERATED",
+                        "pid": None,
+                        "restart_count": None,
+                    },
+                    "source_kind": "federated",
+                }
+            ],
+        }
+        proc_resp = {"ok": True, "result": []}
+
+        app._apply_snapshot(resp, proc_resp)
 
         self.assertEqual(app._device_status["hornet_eql"].driver_restart_count, 0)
         self.assertTrue(app._device_status["hornet_eql"].is_remote)
 
-    def test_rpc_call_drops_stale_reply_and_returns_current_response(self) -> None:
+    def test_do_rpc_drops_stale_reply_and_returns_current_response(self) -> None:
+        # The blocking round-trip now lives in _do_rpc (run on the RPC worker);
+        # _rpc_call/_rpc_submit are thin queue wrappers around it.
         app = self._build_app()
         try:
             app._rpc.close(0)
             fake = _StaleThenReplySocket()
             app._rpc = fake
 
-            resp = app._rpc_call({"type": "manager.info.identity"})
+            resp = app._do_rpc({"type": "manager.info.identity"})
 
             self.assertIsInstance(resp, dict)
             assert resp is not None
@@ -147,7 +212,7 @@ class ManagerTuiRpcTests(unittest.TestCase):
             except Exception:
                 pass
 
-    def test_rpc_call_resets_socket_after_timeout(self) -> None:
+    def test_do_rpc_resets_socket_after_timeout(self) -> None:
         app = self._build_app(rpc_timeout_ms=1)
         try:
             app._rpc.close(0)
@@ -156,7 +221,7 @@ class ManagerTuiRpcTests(unittest.TestCase):
             app._rpc = timeout_sock
             app._new_rpc_socket = lambda: replacement  # type: ignore[method-assign]
 
-            resp = app._rpc_call({"type": "manager.info.identity"})
+            resp = app._do_rpc({"type": "manager.info.identity"})
 
             self.assertIsNone(resp)
             self.assertTrue(timeout_sock.closed)
@@ -173,6 +238,9 @@ class ManagerTuiRpcTests(unittest.TestCase):
                 pass
 
     def test_reconnect_backend_replaces_sockets_and_refreshes(self) -> None:
+        # Reconnect is now non-blocking: the socket reset is dispatched onto the
+        # RPC worker and the identity probe is submitted; the result is applied
+        # on the UI thread. Stub the reset + submit to drive the flow inline.
         app = self._build_app()
         try:
             old_rpc = _ReplacementSocket()
@@ -185,21 +253,27 @@ class ManagerTuiRpcTests(unittest.TestCase):
                 app._sub.close(0)
             app._rpc = old_rpc
             app._sub = _ReplacementSocket()
-            app._new_rpc_socket = lambda: new_rpc  # type: ignore[method-assign]
+
+            def fake_reset() -> None:
+                old_rpc.close(0)
+                app._rpc = new_rpc
+
+            app._reset_rpc_socket = fake_reset  # type: ignore[method-assign]
             app._request_sub_reconnect = lambda: sub_reconnect_requested.append(True)  # type: ignore[method-assign]
 
-            def fake_rpc_call(payload):
-                calls.append(str(payload.get("type")))
-                return {"ok": True}
+            def fake_submit(payload, on_result=None):
+                t = str(payload.get("type"))
+                calls.append(t)
+                if t == "manager.info.identity" and on_result is not None:
+                    on_result({"ok": True})
 
-            app._rpc_call = fake_rpc_call  # type: ignore[method-assign]
-            app._load_manager_log_tail_bootstrap = lambda: calls.append("log_tail")  # type: ignore[method-assign]
+            app._rpc_submit = fake_submit  # type: ignore[method-assign]
             app._refresh_snapshot = lambda: calls.append("refresh")  # type: ignore[method-assign]
             app._log_action_result = lambda message: calls.append(message)  # type: ignore[method-assign]
+            app.notify = lambda *a, **k: None  # type: ignore[method-assign]
 
-            ok = app._reconnect_backend()
+            app._reconnect_backend()
 
-            self.assertTrue(ok)
             self.assertTrue(old_rpc.closed)
             self.assertIs(app._rpc, new_rpc)
             self.assertEqual(sub_reconnect_requested, [True])
@@ -208,7 +282,7 @@ class ManagerTuiRpcTests(unittest.TestCase):
                 [
                     "Reconnecting backend...",
                     "manager.info.identity",
-                    "log_tail",
+                    "manager.logs.tail",
                     "refresh",
                     "Backend reconnected",
                 ],
@@ -233,24 +307,31 @@ class ManagerTuiRpcTests(unittest.TestCase):
                 app._sub.close(0)
             app._rpc = _ReplacementSocket()
             app._sub = _ReplacementSocket()
-            app._new_rpc_socket = lambda: _ReplacementSocket()  # type: ignore[method-assign]
             calls: list[str] = []
             sub_reconnect_requested: list[bool] = []
 
-            app._rpc_call = lambda payload: None  # type: ignore[method-assign]
+            app._reset_rpc_socket = lambda: None  # type: ignore[method-assign]
             app._request_sub_reconnect = lambda: sub_reconnect_requested.append(True)  # type: ignore[method-assign]
-            app._load_manager_log_tail_bootstrap = lambda: calls.append("log_tail")  # type: ignore[method-assign]
+
+            def fake_submit(payload, on_result=None):
+                t = str(payload.get("type"))
+                calls.append(t)
+                if t == "manager.info.identity" and on_result is not None:
+                    on_result(None)
+
+            app._rpc_submit = fake_submit  # type: ignore[method-assign]
             app._refresh_snapshot = lambda: calls.append("refresh")  # type: ignore[method-assign]
             app._log_action_result = lambda message: calls.append(message)  # type: ignore[method-assign]
+            app.notify = lambda *a, **k: None  # type: ignore[method-assign]
 
-            ok = app._reconnect_backend()
+            app._reconnect_backend()
 
-            self.assertFalse(ok)
             self.assertEqual(sub_reconnect_requested, [True])
             self.assertEqual(
                 calls,
                 [
                     "Reconnecting backend...",
+                    "manager.info.identity",
                     "Backend reconnect failed",
                 ],
             )
