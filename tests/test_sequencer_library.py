@@ -193,8 +193,8 @@ class SequenceLibraryTests(unittest.TestCase):
             entries = {item["id"]: item for item in lib.list_entries()}
             self.assertIn("a", entries)
             self.assertIn("b", entries)
-            self.assertEqual(entries["a"]["path"], "seqs/a.yaml")
-            self.assertEqual(entries["b"]["path"], "seqs/b.yaml")
+            self.assertEqual(Path(entries["a"]["path"]), Path("seqs/a.yaml"))
+            self.assertEqual(Path(entries["b"]["path"]), Path("seqs/b.yaml"))
 
 
 class SequencerLibraryPayloadTests(unittest.TestCase):
