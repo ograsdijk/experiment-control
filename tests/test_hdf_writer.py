@@ -787,6 +787,69 @@ class HdfWriterContextResolutionTests(unittest.TestCase):
                 ds = writer._stream_datasets[("trace1", "trace", 1)]["context_id"]  # noqa: SLF001
                 self.assertEqual(list(ds[...]), [9])
 
+    def test_first_chunk_context_survives_initial_reader_attach(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            writer = self._make_writer(str(root))
+            writer._context_resolve_ttl_s = 0.01  # noqa: SLF001
+            h5_path = root / "context_first_chunk.h5"
+
+            class _Reader:
+                name = "cntx_fresh"
+
+                class layout:  # noqa: N801
+                    dtype = np.dtype("uint16")
+                    shape = (1,)
+
+                def read_events(self, last_seq: int) -> list[dict[str, object]]:
+                    if int(last_seq) >= 1:
+                        return []
+                    return [
+                        {
+                            "seq": 1,
+                            "payload": HdfWriterContextResolutionTests._u16_payload(1),
+                            "t0_mono_ns": 101,
+                            "t0_wall_ns": 102,
+                        }
+                    ]
+
+                def close(self) -> None:
+                    pass
+
+            with h5py.File(h5_path, "w") as h5:
+                meta = writer._build_measurement_metadata(  # noqa: SLF001
+                    profile_id=None,
+                    values=None,
+                    require_profile=False,
+                )
+                writer._configure_active_file(  # noqa: SLF001
+                    h5,
+                    write_every_s=1.0,
+                    load_manager_state=False,
+                    measurement_meta=meta,
+                )
+                key = ("trace1", "trace")
+                with patch(
+                    "experiment_control.processes.hdf_writer.ShmRingReader.attach",
+                    return_value=_Reader(),
+                ):
+                    writer._handle_chunk_ready(  # noqa: SLF001
+                        {
+                            "device_id": "trace1",
+                            "stream": "trace",
+                            "shm_name": "cntx_fresh",
+                            "seq": 1,
+                            "context_id": 0,
+                            "context_fields": {"shot": 17, "valid": True},
+                        }
+                    )
+                writer._expire_pending_context(key=key, now_mono=2.0)  # noqa: SLF001
+                writer._write_stream_buffers()  # noqa: SLF001
+                ds = writer._stream_datasets[("trace1", "trace", 1)]["context_id"]  # noqa: SLF001
+                self.assertEqual(list(ds[...]), [0])
+                self.assertEqual(writer._context_written_minus1_missing, 0)  # noqa: SLF001
+                self.assertEqual(writer._context_resolved_exact, 1)  # noqa: SLF001
+
     def test_pending_context_ttl_expires_to_minus_one(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

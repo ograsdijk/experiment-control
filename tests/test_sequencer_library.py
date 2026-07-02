@@ -1,6 +1,7 @@
 # ruff: noqa: E402
 
 import sys
+import os
 from pathlib import Path
 import tempfile
 import textwrap
@@ -12,6 +13,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from experiment_control.sequencer.library import SequenceLibrary
+from experiment_control.sequencer.sequencer import SequencerProcess
 
 
 def _write(path: Path, text: str) -> None:
@@ -149,6 +151,86 @@ class SequenceLibraryTests(unittest.TestCase):
             with self.assertRaises(ValueError) as cm:
                 lib.reload()
             self.assertIn("use cycle detected", str(cm.exception))
+
+    def test_autoload_dirs_resolve_relative_to_manifest_path(self) -> None:
+        with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as cwd_td:
+            root = Path(td)
+            _write(
+                root / "seqs" / "a.yaml",
+                """
+                version: 1
+                steps:
+                  - assign:
+                      a_seen: true
+                """,
+            )
+            _write(
+                root / "seqs" / "b.yaml",
+                """
+                version: 1
+                steps:
+                  - assign:
+                      b_seen: true
+                """,
+            )
+            _write(
+                root / "library.yaml",
+                """
+                version: 1
+                autoload_dirs:
+                  - dir: seqs
+                    pattern: "*.yaml"
+                """,
+            )
+            old_cwd = Path.cwd()
+            os.chdir(Path(cwd_td))
+            try:
+                lib = SequenceLibrary(manifest_path=root / "library.yaml")
+                lib.reload()
+            finally:
+                os.chdir(old_cwd)
+
+            entries = {item["id"]: item for item in lib.list_entries()}
+            self.assertIn("a", entries)
+            self.assertIn("b", entries)
+            self.assertEqual(Path(entries["a"]["path"]), Path("seqs/a.yaml"))
+            self.assertEqual(Path(entries["b"]["path"]), Path("seqs/b.yaml"))
+
+
+class SequencerLibraryPayloadTests(unittest.TestCase):
+    def test_payload_includes_manifest_and_process_cwd(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            _write(
+                root / "seqs" / "a.yaml",
+                """
+                version: 1
+                steps:
+                  - assign:
+                      a_seen: true
+                """,
+            )
+            _write(
+                root / "library.yaml",
+                """
+                version: 1
+                autoload_dirs:
+                  - dir: seqs
+                    pattern: "*.yaml"
+                """,
+            )
+            lib = SequenceLibrary(manifest_path=root / "library.yaml")
+            lib.reload()
+            proc = object.__new__(SequencerProcess)
+            proc._sequence_library = lib
+            proc._sequence_library_path = str(root / "library.yaml")
+            proc._library_description_policy = "warn"
+            proc._active_sequence_id = None
+            proc._autoload_sequence_id = None
+            payload = SequencerProcess._library_list_payload(proc)
+
+        self.assertEqual(payload["resolved_manifest_path"], str((root / "library.yaml").resolve()))
+        self.assertEqual(payload["process_cwd"], str(Path.cwd()))
 
 
 if __name__ == "__main__":

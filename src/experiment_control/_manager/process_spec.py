@@ -117,6 +117,18 @@ def _coerce_restart_policy(value: Any, *, restart_policy_enum: Any) -> Any:
     return restart_policy
 
 
+def _resolve_config_relative_path(value: Any, *, config_dir: Path) -> Any:
+    if not isinstance(value, str):
+        return value
+    text = value.strip()
+    if not text:
+        return value
+    path = Path(text).expanduser()
+    if path.is_absolute():
+        return str(path.resolve())
+    return str((config_dir / path).resolve())
+
+
 def process_spec_kwargs_from_yaml(
     path: str | Path,
     *,
@@ -124,13 +136,21 @@ def process_spec_kwargs_from_yaml(
     manager_pub: str,
     restart_policy_enum: Any,
 ) -> Json:
-    raw, _ = load_yaml_file(path, return_text=True)
+    config_path = Path(path).expanduser().resolve()
+    config_dir = config_path.parent.parent if config_path.parent.name == "processes" else config_path.parent
+    raw, _ = load_yaml_file(config_path, return_text=True)
     try:
         raw_obj = require_dict(raw, path=[])
         process_id = require_str(raw_obj.get("process_id"), path=["process_id"])
         process_raw, argv_raw = _require_process_or_argv(raw_obj)
         heartbeat_period_s = _parse_heartbeat_period(raw_obj)
         init_kwargs = _validated_init_kwargs(raw_obj)
+        init_kwargs = {
+            key: _resolve_config_relative_path(value, config_dir=config_dir)
+            if key in {"sequence_library_path", "autoload_path"}
+            else value
+            for key, value in init_kwargs.items()
+        }
         if process_raw is not None:
             argv = _build_process_class_argv(
                 process_raw=process_raw,
@@ -145,7 +165,10 @@ def process_spec_kwargs_from_yaml(
             raw_obj.get("restart_policy", restart_policy_enum.NEVER),
             restart_policy_enum=restart_policy_enum,
         )
-        cwd = optional_str(raw_obj.get("cwd"), path=["cwd"])
+        cwd = _resolve_config_relative_path(
+            optional_str(raw_obj.get("cwd"), path=["cwd"]),
+            config_dir=config_dir,
+        )
         env = optional_dict(raw_obj.get("env"), path=["env"])
     except ConfigError as e:
         raise TypeError(str(e)) from None
