@@ -3640,6 +3640,7 @@ class HdfWriter(ManagedProcessBase):
             device_id=device_id,
             stream=stream,
             shm_name=chunk.shm_name,
+            initial_seq=chunk.seq,
         )
         if reader is None:
             return
@@ -3689,6 +3690,7 @@ class HdfWriter(ManagedProcessBase):
         device_id: str,
         stream: str,
         shm_name: str,
+        initial_seq: int | None = None,
     ) -> ShmRingReader | None:
         reader = self._stream_readers.get(key)
         if reader is not None and reader.name == shm_name:
@@ -3707,7 +3709,16 @@ class HdfWriter(ManagedProcessBase):
         session = self._next_stream_session(device_id, stream)
         self._stream_sessions[key] = session
         self._stream_active_session[key] = session
-        self._stream_last_seq[key] = 0
+        # Seed the starting seq to just before the chunk that triggered this
+        # attach, so frames already buffered in the (producer-owned, persistent)
+        # ring from BEFORE the writer started are skipped rather than replayed
+        # into the new file. The triggering chunk's own frame and everything
+        # after it are still written. Falls back to 0 (read whatever is present)
+        # only if the chunk carried no seq.
+        if initial_seq is not None and int(initial_seq) > 0:
+            self._stream_last_seq[key] = int(initial_seq) - 1
+        else:
+            self._stream_last_seq[key] = 0
         self._stream_dropped_total[key] = 0
         self._stream_buffers.pop(key, None)
         self._stream_schema.pop(key, None)
