@@ -176,6 +176,45 @@ class DeviceRouterFederationTests(unittest.TestCase):
             self.assertEqual(task.request_id, "req-outer")
             self.assertEqual(task.source_kind, "webui")
             self.assertEqual(task.source_id, "fastapi")
+            self.assertEqual(task.endpoint, "tcp://127.0.0.1:9901")
+        finally:
+            router.close()
+
+    def test_process_rpc_without_local_endpoint_delegates_to_manager_worker(self) -> None:
+        router = DeviceRouter(
+            external_rpc_bind="tcp://127.0.0.1:*",
+            process_id="device_router",
+        )
+        try:
+            manager_worker = _CaptureWorker()
+            process_worker = _CaptureWorker()
+            responses = []
+            router._ensure_manager_worker = lambda: manager_worker  # type: ignore[method-assign]
+            router._ensure_process_worker = lambda process_id: process_worker  # type: ignore[method-assign]
+            router._send_external_response = (  # type: ignore[method-assign]
+                lambda identity, resp, *, request_id=None: responses.append((identity, resp))
+            )
+
+            router._dispatch_process_rpc(
+                b"client-1",
+                {
+                    "type": "manager.processes.rpc",
+                    "process_id": "spb_microwave",
+                    "request_id": "req-outer",
+                    "request": {
+                        "type": "process.capabilities",
+                        "request_id": "req-inner",
+                    },
+                },
+            )
+
+            self.assertEqual(responses, [])
+            self.assertEqual(len(manager_worker.tasks), 1)
+            self.assertEqual(process_worker.tasks, [])
+            task = manager_worker.tasks[0]
+            self.assertEqual(task.request["type"], "manager.processes.rpc")
+            self.assertEqual(task.request["process_id"], "spb_microwave")
+            self.assertEqual(task.request["request_id"], "req-outer")
         finally:
             router.close()
 
@@ -412,4 +451,3 @@ class DeviceRouterFederationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

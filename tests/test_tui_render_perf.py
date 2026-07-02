@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import unittest
 from collections import deque
+from types import SimpleNamespace
 
 from experiment_control._tui.app import ManagerTUI
 
@@ -277,6 +278,11 @@ class _FakeProcTable:
         pass
 
 
+class _ProcessSelectionTable:
+    def get_row(self, *_args, **_kwargs):  # pragma: no cover - not used now
+        raise AssertionError("get_row should not be called")
+
+
 class ProcessesTableFederatedBadgeTests(unittest.TestCase):
     def test_remote_row_prefixed_with_badge_key_stays_raw(self) -> None:
         app = object.__new__(ManagerTUI)
@@ -304,6 +310,28 @@ class ProcessesTableFederatedBadgeTests(unittest.TestCase):
         # Display gets the ⇄ badge; the row key stays the raw process_id.
         self.assertEqual(by_key["spb"][0], "⇄ spb")
         self.assertEqual(by_key["local1"][0], "local1")
+
+    def test_remote_process_selection_uses_row_key_not_display_label(self) -> None:
+        app = object.__new__(ManagerTUI)
+        app._suppress_selection_events = False
+        app._selected_process_id = None
+        app._has_user_process_selection = False
+        app._set_inspector_mode = lambda mode: None  # type: ignore[method-assign]
+        app._mark_inspector_dirty = lambda: None  # type: ignore[method-assign]
+        app._render_inspector_if_needed = lambda *, force=False: None  # type: ignore[method-assign]
+        table = _ProcessSelectionTable()
+        app.query_one = lambda *a, **k: table  # type: ignore[method-assign]
+        app._is_table_focused = lambda candidate: candidate is table  # type: ignore[method-assign]
+        event = SimpleNamespace(row_key=SimpleNamespace(value="spb_microwave"))
+
+        app._on_process_selected(event)
+        self.assertEqual(app._selected_process_id, "spb_microwave")
+        self.assertTrue(app._has_user_process_selection)
+
+        app._selected_process_id = None
+        app._has_user_process_selection = False
+        app._on_process_cursor_moved(event)
+        self.assertEqual(app._selected_process_id, "spb_microwave")
 
 
 if __name__ == "__main__":
