@@ -101,20 +101,17 @@ export function resolveSequencerSelectedSequenceId(
   currentSelection: string | null,
   activeSequenceId: string | null,
   entries: ReadonlyArray<{ id: string }>,
-  loadSource: SequencerLoadSource
+  preferActive: boolean
 ) {
   const current = currentSelection?.trim() ?? null;
   if (current && entries.some((entry) => entry.id === current)) {
     return current;
   }
-  if (loadSource === "library") {
-    const active = activeSequenceId?.trim() ?? null;
-    if (active) {
-      return active;
-    }
-    return entries[0]?.id ?? null;
+  const active = activeSequenceId?.trim() ?? null;
+  if (preferActive && active && entries.some((entry) => entry.id === active)) {
+    return active;
   }
-  return null;
+  return entries[0]?.id ?? null;
 }
 
 type SequencerLibraryPayload = {
@@ -124,7 +121,28 @@ type SequencerLibraryPayload = {
   activeSequenceId: string | null;
 };
 
-function normalizeSequencerLibraryPayload(result: unknown): SequencerLibraryPayload | null {
+function unwrapSequencerLibraryPayload(result: unknown): unknown {
+  if (!result || typeof result !== "object") {
+    return result;
+  }
+  const obj = result as Record<string, unknown>;
+  if (Array.isArray(obj.entries)) {
+    return obj;
+  }
+  const nested = obj.result;
+  if (nested && typeof nested === "object") {
+    const nestedObj = nested as Record<string, unknown>;
+    if (Array.isArray(nestedObj.entries)) {
+      return nestedObj;
+    }
+  }
+  return result;
+}
+
+export function normalizeSequencerLibraryPayload(
+  result: unknown
+): SequencerLibraryPayload | null {
+  result = unwrapSequencerLibraryPayload(result);
   if (!result || typeof result !== "object") {
     return null;
   }
@@ -548,7 +566,7 @@ export function useSequencerController({
             prev,
             activeSequenceId,
             entries,
-            sequencerLoadSource
+            sequencerLoadSource === "library"
           )
         );
         setSequencerLibraryError(lastError);
@@ -717,7 +735,7 @@ export function useSequencerController({
           prev,
           activeSequenceId,
           entries,
-          sequencerLoadSource
+          sequencerLoadSource === "library"
         )
       );
       setSequencerLibraryError(lastError);
@@ -1407,16 +1425,12 @@ export function useSequencerController({
       sequencerStatus.activeSequenceId.trim().length > 0
         ? sequencerStatus.activeSequenceId
         : null;
-    if (activeId) {
-      setSequencerSelectedSequenceId(activeId);
-      return;
-    }
     setSequencerSelectedSequenceId((prev) =>
       resolveSequencerSelectedSequenceId(
         prev,
         activeId,
         sequencerLibraryEntries,
-        sequencerLoadSource
+        sequencerLoadSource === "library"
       )
     );
   }, [sequencerLibraryEntries, sequencerLoadSource, sequencerStatus?.activeSequenceId]);
@@ -1459,6 +1473,7 @@ export function useSequencerController({
     sequencerLibraryError,
     sequencerSelectedSequenceId,
     setSequencerSelectedSequenceId: setSequencerSelectedSequenceIdForUi,
+    setSequencerSelectedSequenceIdForUi,
     reloadSequencerLibrary,
     sequencerOverrideRows,
     sequencerOverrideVarOptions,
