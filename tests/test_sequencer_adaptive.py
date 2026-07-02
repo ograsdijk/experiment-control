@@ -725,6 +725,68 @@ class SequencerWaitUntilSampleCapTests(unittest.TestCase):
         self.assertFalse(runtime._step_wait_until(time.monotonic()))  # noqa: SLF001
         self.assertEqual([value for _, value in runtime._wait_state.samples], [0.0, 1.0])  # noqa: SLF001
 
+    def test_wait_until_renders_templated_numbers_before_coercion(self) -> None:
+        now = time.monotonic()
+
+        def get_process_telemetry(
+            process_id: str, signal: str
+        ) -> dict[str, object] | None:
+            self.assertEqual(process_id, "spb_microwave")
+            self.assertEqual(signal, "locked")
+            return {"value": 1.0, "t_mono": now}
+
+        runtime = SequencerRuntime(
+            call_device=lambda *_args, **_kwargs: {"ok": True, "result": None},
+            get_telemetry=lambda *_args, **_kwargs: None,
+            set_stream_context=lambda *_args, **_kwargs: None,
+            get_process_telemetry=get_process_telemetry,
+        )
+        runtime.load(
+            parse_sequence(
+                {
+                    "version": 1,
+                    "vars": {
+                        "prelock_timeout_s": 5.0,
+                        "poll_s": 0.0,
+                        "stable_s": 0.0,
+                        "max_age_s": 1.0,
+                        "reduce_window_s": 0.5,
+                        "reduce_max_samples": 3,
+                    },
+                    "steps": [
+                        {
+                            "wait_until": {
+                                "timeout_s": "${prelock_timeout_s}",
+                                "every_s": "${poll_s}",
+                                "stable_for_s": "${stable_s}",
+                                "sample": {
+                                    "telemetry": {
+                                        "process": "spb_microwave",
+                                        "signal": "locked",
+                                        "max_age_s": "${max_age_s}",
+                                    }
+                                },
+                                "reduce": {
+                                    "method": "mean",
+                                    "window_s": "${reduce_window_s}",
+                                    "max_samples": "${reduce_max_samples}",
+                                },
+                                "condition": {"ge": ["${sample_reduced}", 1.0]},
+                            }
+                        }
+                    ],
+                }
+            )
+        )
+        runtime.start()
+        while runtime.state == "RUNNING":
+            runtime.tick()
+
+        self.assertEqual(runtime.state, "STOPPED")
+        self.assertEqual(runtime._env["sample"], 1.0)  # noqa: SLF001
+        self.assertEqual(runtime._env["sample_reduced"], 1.0)  # noqa: SLF001
+        self.assertIsNone(runtime._wait_state)  # noqa: SLF001
+
 
 if __name__ == "__main__":
     unittest.main()
