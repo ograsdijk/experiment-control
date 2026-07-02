@@ -279,9 +279,6 @@ class _FakeProcTable:
 
 
 class _ProcessSelectionTable:
-    def __init__(self) -> None:
-        self.focused = True
-
     def get_row(self, *_args, **_kwargs):  # pragma: no cover - not used now
         raise AssertionError("get_row should not be called")
 
@@ -324,6 +321,7 @@ class ProcessesTableFederatedBadgeTests(unittest.TestCase):
         app._render_inspector_if_needed = lambda *, force=False: None  # type: ignore[method-assign]
         table = _ProcessSelectionTable()
         app.query_one = lambda *a, **k: table  # type: ignore[method-assign]
+        app._is_table_focused = lambda candidate: candidate is table  # type: ignore[method-assign]
         event = SimpleNamespace(row_key=SimpleNamespace(value="spb_microwave"))
 
         app._on_process_selected(event)
