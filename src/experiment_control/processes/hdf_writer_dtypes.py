@@ -24,6 +24,35 @@ DEFAULT_NUMERIC_COMPRESSION = "lzf"
 DEFAULT_NUMERIC_SHUFFLE = True
 DEFAULT_TELEMETRY_CHUNK_ROWS = 64
 
+# Fixed byte length for a bare ``str`` telemetry dtype (per-signal override via
+# ``str:N``). Fixed-length strings keep the compound dataset filterable, so the
+# numeric shuffle+compression still apply to string-bearing device compounds
+# (unlike variable-length strings, which HDF5 rejects the shuffle filter on).
+DEFAULT_STR_LEN = 32
+
+
+def str_length_for(dtype_str: str) -> int | None:
+    """Return the fixed byte length for a string telemetry dtype, else None.
+
+    Accepts ``"str"`` (-> :data:`DEFAULT_STR_LEN`) and ``"str:N"`` (-> N).
+    Returns None for any non-string dtype so callers fall through to
+    ``DTYPE_MAP``. UTF-8 values longer than N bytes are truncated at write time.
+    """
+    s = str(dtype_str).strip()
+    if s == "str":
+        return DEFAULT_STR_LEN
+    if s.startswith("str:"):
+        try:
+            n = int(s[4:])
+        except ValueError:
+            raise ValueError(
+                f"Invalid string dtype {dtype_str!r} (expected 'str' or 'str:N')"
+            ) from None
+        if n <= 0:
+            raise ValueError(f"String dtype length must be positive: {dtype_str!r}")
+        return n
+    return None
+
 
 def _event_dtype() -> np.dtype[Any]:
     str_dt = h5py.string_dtype("utf-8")

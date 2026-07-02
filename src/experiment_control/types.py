@@ -43,6 +43,13 @@ ExtractorKind = Literal["scalar", "index", "key", "attr"]
 class TelemetryOut:
     """
     Define how to extract one signal from a device method return value.
+
+    ``dtype`` is a canonical numpy name the HDF writer accepts
+    (``float64``/``float32``/``int64``/``int32``/``uint64``/``uint32``/
+    ``bool``), or a fixed-length string ``"str"`` (default width) / ``"str:N"``
+    (N bytes, UTF-8, truncated). Fixed-length strings keep the device's HDF
+    compound filterable (shuffle+compression still apply); prefer them for
+    categorical text signals.
     """
 
     signal: str

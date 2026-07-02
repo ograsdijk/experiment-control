@@ -12,7 +12,7 @@ def default_for_dtype(dtype_str: str) -> Any:
         return 0
     if dtype_str == "bool":
         return False
-    if dtype_str == "str":
+    if dtype_str == "str" or dtype_str.startswith("str:"):
         return ""
     return None
 
@@ -87,7 +87,9 @@ def coerce_scalar(value: Any, dtype_str: str) -> Any:
     if isinstance(value, np.generic):
         value = value.item()
 
-    if dtype_str == "str":
+    if dtype_str == "str" or dtype_str.startswith("str:"):
+        # Fixed-length string dtypes ("str"/"str:N") coerce to str here; the HDF
+        # writer handles UTF-8 encoding + truncation to N when it stores them.
         if value is None:
             return ""
         return str(value)
