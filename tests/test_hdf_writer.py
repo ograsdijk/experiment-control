@@ -22,6 +22,7 @@ if str(SRC) not in sys.path:
 
 from unittest.mock import patch  # noqa: E402
 
+import experiment_control.processes.hdf_writer as hdf_writer_module  # noqa: E402
 from experiment_control.processes.hdf_writer import (  # noqa: E402
     HdfWriter,
     _BG_SENTINEL,
@@ -30,6 +31,7 @@ from experiment_control.processes.hdf_writer import (  # noqa: E402
     _create_device_dataset,
     _dtype_for,
     _ingest_process_schema,
+    _ingest_schema,
 )
 from experiment_control.processes.hdf_writer_dtypes import (  # noqa: E402
     DEFAULT_STR_LEN,
@@ -2694,6 +2696,128 @@ class HdfWriterStreamStartSkipsOldRingTests(unittest.TestCase):
             finally:
                 ring.close()
                 ring.unlink()
+
+
+class HdfWriterErrorAttributionTests(unittest.TestCase):
+    """HDF errors must name the offending device/process: one bad device must
+    not break init or a flush batch for the others, and the failure surfaces."""
+
+    @staticmethod
+    def _make_writer(out_dir: str) -> HdfWriter:
+        return HdfWriter(
+            out_dir=out_dir,
+            filename=None,
+            manager_rpc="tcp://127.0.0.1:65581",
+            manager_pub="tcp://127.0.0.1:65582",
+            rpc_timeout_ms=2000,
+            timezone="America/Chicago",
+            rcvhwm=1000,
+            write_every_s=1.0,
+            buffer_max_messages=1000,
+            flush_every_n=10,
+            flush_every_s=1.0,
+            disabled_devices=[],
+            event_log_mode="all",
+        )
+
+    def test_ingest_schema_isolates_and_names_bad_device(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            with h5py.File(Path(td) / "s.h5", "w") as h5:
+                grp = h5.require_group("telemetry")
+                datasets: dict = {}
+                errors: list = []
+                schema = {
+                    "devices": [
+                        {"device_id": "good", "signals": ["v"], "dtypes": ["float64"], "units": [""]},
+                        {"device_id": "bad", "signals": ["v"], "dtypes": ["not_a_dtype"], "units": [""]},
+                    ]
+                }
+                _ingest_schema(
+                    schema, grp, datasets,
+                    on_error=lambda did, exc: errors.append((did, str(exc))),
+                )
+                self.assertIn("good", datasets)  # good device unaffected
+                self.assertNotIn("bad", datasets)  # bad device skipped
+                self.assertEqual([e[0] for e in errors], ["bad"])  # named
+
+    def test_ingest_process_schema_isolates_and_names_bad_process(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            with h5py.File(Path(td) / "p.h5", "w") as h5:
+                grp = h5.require_group("process_telemetry")
+                datasets: dict = {}
+                device_map: dict = {}
+                errors: list = []
+                schema = {
+                    "processes": [
+                        {"process_id": "pgood", "signals": ["v"], "dtypes": ["float64"], "units": [""]},
+                        {"process_id": "pbad", "signals": ["v"], "dtypes": ["nope"], "units": [""]},
+                    ]
+                }
+                seen = _ingest_process_schema(
+                    schema, grp, datasets, device_map,
+                    on_error=lambda pid, exc: errors.append((pid, str(exc))),
+                )
+                self.assertIn("pgood", datasets)
+                self.assertNotIn("pbad", datasets)
+                self.assertEqual([e[0] for e in errors], ["pbad"])
+                self.assertIn("pgood", seen)
+
+    def test_telemetry_write_error_isolated_and_named(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            w = self._make_writer(str(root))
+            published: list = []
+            w._publish_process_event = (  # type: ignore[method-assign]  # noqa: SLF001
+                lambda **kw: published.append(kw) or True
+            )
+            with h5py.File(root / "w.h5", "w") as h5:
+                meta = w._build_measurement_metadata(  # noqa: SLF001
+                    profile_id=None, values=None, require_profile=False
+                )
+                w._configure_active_file(  # noqa: SLF001
+                    h5, write_every_s=1.0, load_manager_state=False, measurement_meta=meta
+                )
+                # Two devices sharing the write path; both datasets pre-created.
+                _ingest_schema(
+                    {"devices": [
+                        {"device_id": "devok", "signals": ["v"], "dtypes": ["float64"], "units": [""]},
+                        {"device_id": "devbad", "signals": ["v"], "dtypes": ["float64"], "units": [""]},
+                    ]},
+                    w._telemetry_group,  # noqa: SLF001
+                    w._datasets,  # noqa: SLF001
+                )
+                w._device_map = {  # noqa: SLF001
+                    "devok": {"signals": ["v"], "dtypes": ["float64"], "units": [""]},
+                    "devbad": {"signals": ["v"], "dtypes": ["float64"], "units": [""]},
+                }
+
+                # Make coercion raise only for devbad's sentinel value.
+                real = hdf_writer_module._convert_value  # noqa: SLF001
+
+                def _flaky(value, dtype_str):
+                    if value == "BOOM":
+                        raise ValueError("bad value")
+                    return real(value, dtype_str)
+
+                rows = [
+                    {"device_id": "devbad", "signals": {"v": {"value": "BOOM"}}, "ts": {}},
+                    {"device_id": "devok", "signals": {"v": {"value": 1.0}}, "ts": {}},
+                ]
+                with patch.object(hdf_writer_module, "_convert_value", _flaky):
+                    w._write_buffered_rows_batch(rows)  # noqa: SLF001
+
+                # Good device written despite the bad one; bad one named.
+                self.assertEqual(int(w._datasets["devok"].shape[0]), 1)  # noqa: SLF001
+                self.assertEqual(int(w._datasets["devbad"].shape[0]), 0)  # noqa: SLF001
+                topics = [
+                    kw.get("topic") for kw in published
+                ]
+                self.assertIn("hdf.telemetry_write_error", topics)
+                evt = next(
+                    kw for kw in published
+                    if kw.get("topic") == "hdf.telemetry_write_error"
+                )
+                self.assertEqual(evt["payload"]["device_id"], "devbad")
 
 
 if __name__ == "__main__":
