@@ -5,6 +5,7 @@ import queue
 import threading
 import time
 from collections import deque
+from collections.abc import Callable
 from typing import Any, Literal
 
 import zmq
@@ -150,6 +151,29 @@ class ManagerTUI(App):
         self._rpc = self._new_rpc_socket()
         self._rpc_seq = 0
 
+        # Single-owner RPC socket: `self._rpc` (a ZMQ DEALER, NOT thread-safe)
+        # is touched by exactly ONE thread — the RPC worker started in
+        # on_mount, which drains this queue of zero-arg callables. UI-thread
+        # code and Textual @work threads never touch the socket directly;
+        # they submit work here (fire-and-forget via _rpc_submit, or blocking
+        # via _rpc_call which waits on a per-call result box). This removes the
+        # cross-thread DEALER race and keeps the UI thread off the blocking
+        # round-trip. Set to the worker's ident once it starts so re-entrant
+        # calls from the worker itself run inline instead of deadlocking.
+        self._rpc_req_q: queue.Queue[Callable[[], None] | None] = queue.Queue()
+        self._rpc_worker_ident: int | None = None
+        self._rpc_worker_handle: threading.Thread | None = None
+        # Captured in on_mount; used to marshal UI updates that originate off
+        # the UI thread (e.g. _set_backend_status from the RPC worker).
+        self._ui_thread_id: int | None = None
+        # De-dupe concurrent capability fetches per target so a busy render
+        # loop can't enqueue a burst of identical probes.
+        self._cap_fetch_inflight: set[str] = set()
+        self._proc_cap_fetch_inflight: set[str] = set()
+        # Guards against overlapping snapshot refreshes (the interval can fire
+        # again while a slow refresh RPC is still in flight on the worker).
+        self._snapshot_refresh_inflight = False
+
         self._sub: zmq.Socket | None = None
 
         self._pub_queue: queue.Queue[tuple[str, Json]] = queue.Queue(
@@ -282,8 +306,23 @@ class ManagerTUI(App):
         yield Footer()
 
     def on_mount(self) -> None:
+        self._ui_thread_id = threading.get_ident()
+        # Start the single-owner RPC worker before anything issues an RPC.
+        self._rpc_worker_handle = threading.Thread(
+            target=self._rpc_worker_loop,
+            name="tui-rpc-worker",
+            daemon=True,
+        )
+        self._rpc_worker_handle.start()
         self._setup_tables()
-        self._load_manager_log_tail_bootstrap()
+        # Bootstrap the log tail off the UI thread (blocking RPC).
+        self._rpc_submit(
+            {
+                "type": "manager.logs.tail",
+                "params": {"limit": self._log_tail_bootstrap_limit},
+            },
+            self._apply_manager_log_tail_bootstrap,
+        )
         self.set_interval(self._snapshot_period_s, self._refresh_snapshot)
         self.set_interval(0.2, self._drain_pub_queue)
         self._pub_thread_handle = threading.Thread(target=self._pub_thread, daemon=True)
@@ -292,6 +331,11 @@ class ManagerTUI(App):
     def on_unmount(self) -> None:
         self._stop_event.set()
         self._sub_reconnect_event.set()
+        # Stop the RPC worker (it owns and closes the socket).
+        self._rpc_req_q.put(None)
+        rpc_thread = self._rpc_worker_handle
+        if rpc_thread is not None:
+            rpc_thread.join(timeout=1.5)
         thread = self._pub_thread_handle
         if thread is not None:
             thread.join(timeout=1.5)
@@ -395,12 +439,28 @@ class ManagerTUI(App):
         rpc.connect(self._manager_rpc)
         return rpc
 
-    def _reset_rpc_socket(self) -> None:
+    def _on_rpc_worker(self) -> bool:
+        return (
+            self._rpc_worker_ident is not None
+            and threading.get_ident() == self._rpc_worker_ident
+        )
+
+    def _do_reset_rpc_socket(self) -> None:
+        """Close and recreate the DEALER socket. MUST run on the RPC worker."""
         try:
             self._rpc.close(0)
         except Exception:
             pass
         self._rpc = self._new_rpc_socket()
+
+    def _reset_rpc_socket(self) -> None:
+        # The socket is owned by the RPC worker; only that thread may touch it.
+        # If we're already on the worker (error path inside _do_rpc), reset
+        # inline; otherwise dispatch the reset onto the worker queue.
+        if self._on_rpc_worker():
+            self._do_reset_rpc_socket()
+        else:
+            self._rpc_req_q.put(self._do_reset_rpc_socket)
 
     def _new_sub_socket(self) -> zmq.Socket:
         sub = self._ctx.socket(zmq.SUB)
@@ -422,6 +482,14 @@ class ManagerTUI(App):
         self._sub_reconnect_event.set()
 
     def _set_backend_status(self, text: str) -> None:
+        # Updates a widget, so must run on the UI thread. The RPC worker calls
+        # this during round-trips — marshal back to the UI thread when off it.
+        if self._ui_thread_id is not None and threading.get_ident() != self._ui_thread_id:
+            try:
+                self.call_from_thread(self._set_backend_status, text)
+            except Exception:
+                pass
+            return
         self._backend_status_text = text
         try:
             self.query_one("#backend_status", Static).update(text)
@@ -432,7 +500,68 @@ class ManagerTUI(App):
         self._rpc_seq += 1
         return f"tui-{self._rpc_seq}"
 
+    def _rpc_worker_loop(self) -> None:
+        """Single owner of the DEALER socket. Runs zero-arg jobs off the queue
+        until a None sentinel is received; each job either does a round-trip
+        (delivering results via a box and/or a UI-thread callback) or resets
+        the socket. Because this is the only thread that touches `self._rpc`,
+        there is no cross-thread socket race."""
+        self._rpc_worker_ident = threading.get_ident()
+        while True:
+            job = self._rpc_req_q.get()
+            if job is None:
+                break
+            try:
+                job()
+            except Exception:
+                pass
+
+    def _worker_do_rpc(
+        self,
+        payload: Json,
+        on_result: Callable[[Json | None], None] | None,
+        box: queue.Queue[Json | None] | None,
+    ) -> None:
+        """Job body executed on the RPC worker: do the round-trip, then hand
+        the result to a blocking caller (box) and/or a UI-thread callback."""
+        resp = self._do_rpc(payload)
+        if box is not None:
+            box.put(resp)
+        if on_result is not None:
+            try:
+                self.call_from_thread(on_result, resp)
+            except Exception:
+                pass
+
+    def _rpc_submit(
+        self,
+        payload: Json,
+        on_result: Callable[[Json | None], None] | None = None,
+    ) -> None:
+        """Fire-and-forget RPC for the UI thread: enqueue the round-trip on the
+        worker and (optionally) deliver the result to `on_result`, which runs
+        on the UI thread via call_from_thread. Never blocks the caller."""
+        self._rpc_req_q.put(lambda: self._worker_do_rpc(payload, on_result, None))
+
     def _rpc_call(self, payload: Json) -> Json | None:
+        """Blocking RPC for NON-UI callers (Textual @work threads such as the
+        bulk-action worker). Routes the round-trip through the single-owner
+        worker and waits for the result, so the socket stays single-owned.
+
+        MUST NOT be called on the UI thread — it would block the event loop.
+        UI-thread code uses _rpc_submit instead. If invoked from the worker
+        itself (re-entrancy), run inline to avoid a self-deadlock."""
+        if self._on_rpc_worker():
+            return self._do_rpc(payload)
+        box: queue.Queue[Json | None] = queue.Queue(maxsize=1)
+        self._rpc_req_q.put(lambda: self._worker_do_rpc(payload, None, box))
+        timeout_s = (self._rpc_timeout_ms / 1000.0) + 5.0
+        try:
+            return box.get(timeout=timeout_s)
+        except queue.Empty:
+            return None
+
+    def _do_rpc(self, payload: Json) -> Json | None:
         try:
             request = dict(payload)
             expected_request_id = request.get("request_id")
@@ -474,7 +603,9 @@ class ManagerTUI(App):
                 return resp
         except Exception:
             self._set_backend_status("Backend: unavailable")
-            self._reset_rpc_socket()
+            # We're on the RPC worker (the only caller of _do_rpc), so reset the
+            # socket inline rather than dispatching back onto our own queue.
+            self._do_reset_rpc_socket()
             return None
 
     _normalize_log_severity = staticmethod(normalize_log_severity_for_tui)
@@ -508,13 +639,9 @@ class ManagerTUI(App):
         self._seen_error_fingerprints.add(fingerprint)
         return True
 
-    def _load_manager_log_tail_bootstrap(self) -> None:
-        resp = self._rpc_call(
-            {
-                "type": "manager.logs.tail",
-                "params": {"limit": self._log_tail_bootstrap_limit},
-            }
-        )
+    def _apply_manager_log_tail_bootstrap(self, resp: Json | None) -> None:
+        """Apply the bootstrap log-tail response (runs on the UI thread via the
+        RPC worker callback)."""
         if not resp or not resp.get("ok"):
             return
         result = resp.get("result", {})
@@ -638,21 +765,19 @@ class ManagerTUI(App):
             return f"manager.log [{severity}] {source_text} {topic} {text}"
         return f"manager.log [{severity}] {source_text} {topic}"
 
-    def _device_command(
-        self, device_id: str, action: str, params: Json | None = None
-    ) -> Json | None:
-        if params is None:
-            params = {}
-        resp = self._rpc_call(
-            {
-                "type": "command",
-                "device_id": device_id,
-                "action": action,
-                "params": params,
-                "source_kind": "tui",
-                "source_id": "manager_tui",
-            }
-        )
+    @staticmethod
+    def _command_payload(device_id: str, action: str, params: Json | None) -> Json:
+        return {
+            "type": "command",
+            "device_id": device_id,
+            "action": action,
+            "params": params or {},
+            "source_kind": "tui",
+            "source_id": "manager_tui",
+        }
+
+    @staticmethod
+    def _normalize_command_resp(resp: Json | None) -> Json | None:
         if resp is None:
             return None
         if "ok" in resp:
@@ -664,21 +789,49 @@ class ManagerTUI(App):
             return {"ok": False, "error": resp.get("error", "unknown error")}
         return resp
 
-    def _process_rpc(self, process_id: str, request: Json) -> Json | None:
-        resp = self._rpc_call(
-            {
-                "type": "manager.processes.rpc",
-                "process_id": process_id,
-                "request": request,
-                "source_kind": "tui",
-                "source_id": "manager_tui",
-            }
+    def _device_command(
+        self, device_id: str, action: str, params: Json | None = None
+    ) -> Json | None:
+        return self._normalize_command_resp(
+            self._rpc_call(self._command_payload(device_id, action, params))
         )
-        if resp is None:
-            return None
-        if "ok" in resp:
-            return resp
-        return resp
+
+    def _device_command_submit(
+        self,
+        device_id: str,
+        action: str,
+        params: Json | None,
+        on_result: Callable[[Json | None], None],
+    ) -> None:
+        """Non-blocking device command for UI-thread callers. `on_result` runs
+        on the UI thread with the normalized response."""
+        self._rpc_submit(
+            self._command_payload(device_id, action, params),
+            lambda resp: on_result(self._normalize_command_resp(resp)),
+        )
+
+    @staticmethod
+    def _process_rpc_payload(process_id: str, request: Json) -> Json:
+        return {
+            "type": "manager.processes.rpc",
+            "process_id": process_id,
+            "request": request,
+            "source_kind": "tui",
+            "source_id": "manager_tui",
+        }
+
+    def _process_rpc(self, process_id: str, request: Json) -> Json | None:
+        return self._rpc_call(self._process_rpc_payload(process_id, request))
+
+    def _process_rpc_submit(
+        self,
+        process_id: str,
+        request: Json,
+        on_result: Callable[[Json | None], None],
+    ) -> None:
+        """Non-blocking process RPC for UI-thread callers. `on_result` runs on
+        the UI thread with the raw response."""
+        self._rpc_submit(self._process_rpc_payload(process_id, request), on_result)
 
     @staticmethod
     def _process_is_registered(proc: Json | None) -> bool:
@@ -730,28 +883,55 @@ class ManagerTUI(App):
         self._proc_cap_retry_next_mono.pop(process_id, None)
         self._proc_cap_retry_delay_s.pop(process_id, None)
 
-    def _get_device_capabilities(
-        self, device_id: str, *, force: bool = False
-    ) -> dict[str, Any] | None:
-        now = time.monotonic()
-        if not force:
-            t0 = self._cap_cache_mono.get(device_id)
-            if t0 is not None and (now - t0) < self._cap_ttl_s:
-                return self._cap_cache.get(device_id)
-
-        resp = self._device_command(device_id, "capabilities", {})
+    def _apply_device_capabilities(
+        self, device_id: str, resp: Json | None
+    ) -> bool:
+        """Fold a device `capabilities` response into the caches. Runs on the
+        UI thread (from the RPC-worker callback). Returns True on success."""
         if not resp or not resp.get("ok"):
-            return None
+            return False
         result = resp.get("result")
         if not isinstance(result, dict):
-            return None
-
+            return False
         self._cap_cache[device_id] = result
-        self._cap_cache_mono[device_id] = now
+        self._cap_cache_mono[device_id] = time.monotonic()
         members = result.get("members", [])
         if isinstance(members, list):
             self._members_last[device_id] = [m for m in members if isinstance(m, dict)]
-        return result
+        return True
+
+    def _request_device_capabilities(
+        self,
+        device_id: str,
+        *,
+        force: bool = False,
+        on_done: Callable[[bool], None] | None = None,
+    ) -> None:
+        """Non-blocking device-capability fetch. The round-trip runs on the RPC
+        worker; the cache update, re-render, and `on_done(ok)` run on the UI
+        thread. De-duped per device so a busy render loop can't pile up probes."""
+        if device_id in self._cap_fetch_inflight:
+            return
+        if not force:
+            t0 = self._cap_cache_mono.get(device_id)
+            if t0 is not None and (time.monotonic() - t0) < self._cap_ttl_s:
+                if on_done is not None:
+                    on_done(True)
+                return
+
+        self._cap_fetch_inflight.add(device_id)
+
+        def _after(resp: Json | None) -> None:
+            self._cap_fetch_inflight.discard(device_id)
+            ok = self._apply_device_capabilities(
+                device_id, self._normalize_command_resp(resp)
+            )
+            if ok:
+                self._render_members_table()
+            if on_done is not None:
+                on_done(ok)
+
+        self._rpc_submit(self._command_payload(device_id, "capabilities", {}), _after)
 
     def _get_member_spec(self, device_id: str, name: str) -> dict[str, Any] | None:
         members = self._members_last.get(device_id, [])
@@ -760,28 +940,18 @@ class ManagerTUI(App):
                 return member
         return None
 
-    def _get_process_capabilities(
-        self, process_id: str, *, force: bool = False
-    ) -> dict[str, Any] | None:
-        if not self._process_capabilities_probe_ready(process_id):
-            return None
-        if not force and not self._process_capabilities_retry_allowed(process_id):
-            return None
-        if not force and process_id in self._proc_cap_cache:
-            return self._proc_cap_cache.get(process_id)
-
-        resp = self._process_rpc(
-            process_id,
-            {"type": "process.capabilities", "params": {}},
-        )
+    def _apply_process_capabilities(
+        self, process_id: str, resp: Json | None
+    ) -> bool:
+        """Fold a process `capabilities` response into the caches. Runs on the
+        UI thread (from the RPC-worker callback). Returns True on success."""
         if not resp or not resp.get("ok"):
             self._schedule_process_capabilities_retry(process_id)
-            return None
+            return False
         result = resp.get("result")
         if not isinstance(result, dict):
             self._schedule_process_capabilities_retry(process_id)
-            return None
-
+            return False
         self._proc_cap_cache[process_id] = result
         self._reset_process_capabilities_retry(process_id)
         members = result.get("members", [])
@@ -789,7 +959,44 @@ class ManagerTUI(App):
             self._proc_members_last[process_id] = [
                 m for m in members if isinstance(m, dict)
             ]
-        return result
+        return True
+
+    def _request_process_capabilities(
+        self,
+        process_id: str,
+        *,
+        force: bool = False,
+        on_done: Callable[[bool], None] | None = None,
+    ) -> None:
+        """Non-blocking process-capability fetch, mirroring
+        _request_device_capabilities. Honors the probe-ready gate and the
+        backoff/retry schedule so an unavailable peer isn't hammered."""
+        if process_id in self._proc_cap_fetch_inflight:
+            return
+        if not self._process_capabilities_probe_ready(process_id):
+            if on_done is not None:
+                on_done(False)
+            return
+        if not force and not self._process_capabilities_retry_allowed(process_id):
+            return
+        if not force and process_id in self._proc_cap_cache:
+            if on_done is not None:
+                on_done(True)
+            return
+
+        self._proc_cap_fetch_inflight.add(process_id)
+
+        def _after(resp: Json | None) -> None:
+            self._proc_cap_fetch_inflight.discard(process_id)
+            ok = self._apply_process_capabilities(process_id, resp)
+            if ok:
+                self._render_members_table()
+            if on_done is not None:
+                on_done(ok)
+
+        self._process_rpc_submit(
+            process_id, {"type": "process.capabilities", "params": {}}, _after
+        )
 
     def _get_process_member_spec(
         self, process_id: str, name: str
@@ -812,10 +1019,34 @@ class ManagerTUI(App):
         return status.device_id
 
     def _refresh_snapshot(self) -> None:
+        # Interval callback on the UI thread. The two status RPCs are blocking,
+        # so run them on the RPC worker and apply the results back on the UI
+        # thread. Skip if a prior refresh is still in flight (slow backend).
+        if self._snapshot_refresh_inflight:
+            return
+        self._snapshot_refresh_inflight = True
+        pending: dict[str, Json | None] = {}
+
+        def _after_devices(dev_resp: Json | None) -> None:
+            pending["devices"] = dev_resp
+            self._rpc_submit({"type": "manager.processes.list"}, _after_procs)
+
+        def _after_procs(proc_resp: Json | None) -> None:
+            try:
+                self._apply_snapshot(pending.get("devices"), proc_resp)
+            finally:
+                self._snapshot_refresh_inflight = False
+
+        self._rpc_submit({"type": "device.list_status"}, _after_devices)
+
+    def _apply_snapshot(
+        self, resp: Json | None, proc_resp: Json | None
+    ) -> None:
+        # Runs on the UI thread (RPC-worker callback). Mutates snapshot state
+        # and renders — all UI-thread work, serialized with render/actions.
         snapshot_changed = False
 
         old_status = self._device_status
-        resp = self._rpc_call({"type": "device.list_status"})
         if resp and resp.get("ok"):
             result = resp.get("result", [])
             if isinstance(result, list):
@@ -860,7 +1091,6 @@ class ManagerTUI(App):
                 self._prune_device_caches(active_device_ids=set(next_status.keys()))
                 snapshot_changed = True
 
-        proc_resp = self._rpc_call({"type": "manager.processes.list"})
         if proc_resp and proc_resp.get("ok"):
             raw = proc_resp.get("result", [])
             if isinstance(raw, list):
@@ -1340,7 +1570,10 @@ class ManagerTUI(App):
                     last = self._proc_cap_render_attempt_mono.get(process_id, 0.0)
                     if (now - last) >= self._cap_render_retry_s:
                         self._proc_cap_render_attempt_mono[process_id] = now
-                        self._get_process_capabilities(process_id, force=True)
+                        # Non-blocking: fetch on the RPC worker; when it lands
+                        # the callback updates the cache and re-renders. The
+                        # render itself stays I/O-free.
+                        self._request_process_capabilities(process_id, force=True)
             members = self._proc_members_last.get(process_id, [])
             # Federated processes: hide actions the federation link denies (the
             # hub annotates each member with federation_allowed).
@@ -1373,14 +1606,16 @@ class ManagerTUI(App):
                     and status.device_state != "DISCONNECTED"
                     and (status.is_remote or not self._status_driver_stopped(status))
                 ):
+                    # Non-blocking: fetch on the RPC worker; the callback
+                    # updates the cache and re-renders. Render stays I/O-free.
                     if status.is_remote:
                         now = time.monotonic()
                         last = self._dev_cap_render_attempt_mono.get(device_id, 0.0)
                         if (now - last) >= self._cap_render_retry_s:
                             self._dev_cap_render_attempt_mono[device_id] = now
-                            self._get_device_capabilities(device_id, force=True)
+                            self._request_device_capabilities(device_id, force=True)
                     else:
-                        self._get_device_capabilities(device_id)
+                        self._request_device_capabilities(device_id)
 
             members = self._members_last.get(device_id, [])
 
@@ -1943,21 +2178,34 @@ class ManagerTUI(App):
             f"{summary_label}: {ok_count} ok, {fail_count} failed",
         )
 
-    def _reconnect_backend(self) -> bool:
+    def _reconnect_backend(self) -> None:
+        # Non-blocking. The socket reset and the identity probe are enqueued on
+        # the RPC worker (FIFO: reset runs first); the result is applied on the
+        # UI thread. The UI thread never blocks on the round-trip.
         self._set_backend_status("Backend: reconnecting")
         self._log_action_result("Reconnecting backend...")
         self._reset_rpc_socket()
         self._request_sub_reconnect()
-        ready = bool(self._rpc_call({"type": "manager.info.identity"}))
-        if not ready:
-            self._set_backend_status("Backend: unavailable")
-            self._log_action_result("Backend reconnect failed")
-            return False
-        self._load_manager_log_tail_bootstrap()
-        self._refresh_snapshot()
-        self._set_backend_status("Backend: connected")
-        self._log_action_result("Backend reconnected")
-        return True
+
+        def _after(resp: Json | None) -> None:
+            if not resp:
+                self._set_backend_status("Backend: unavailable")
+                self._log_action_result("Backend reconnect failed")
+                self.notify("Backend reconnect failed", severity="warning")
+                return
+            self._rpc_submit(
+                {
+                    "type": "manager.logs.tail",
+                    "params": {"limit": self._log_tail_bootstrap_limit},
+                },
+                self._apply_manager_log_tail_bootstrap,
+            )
+            self._refresh_snapshot()
+            self._set_backend_status("Backend: connected")
+            self._log_action_result("Backend reconnected")
+            self.notify("Backend reconnected")
+
+        self._rpc_submit({"type": "manager.info.identity"}, _after)
 
     def _format_result(self, result: Any) -> str:
         if isinstance(result, dict) and "__enum__" in result and "name" in result:
@@ -2130,10 +2378,7 @@ class ManagerTUI(App):
 
     def action_reconnect_backend(self) -> None:
         try:
-            if self._reconnect_backend():
-                self.notify("Backend reconnected")
-                return
-            self.notify("Backend reconnect failed", severity="warning")
+            self._reconnect_backend()
         except Exception as exc:
             self._set_backend_status("Backend: unavailable")
             self._log_action_result(f"Backend reconnect error: {exc}")
@@ -2144,23 +2389,31 @@ class ManagerTUI(App):
             process_id = self._selected_process_id
             if not process_id:
                 return
-            resp = self._get_process_capabilities(process_id, force=True)
-            if resp is None:
-                self.notify(f"Capabilities refresh failed: {process_id}")
-                return
-            self._render_members_table()
-            self.notify(f"Capabilities refreshed: {process_id}")
+
+            def _done_proc(ok: bool) -> None:
+                self.notify(
+                    f"Capabilities refreshed: {process_id}"
+                    if ok
+                    else f"Capabilities refresh failed: {process_id}"
+                )
+
+            self._request_process_capabilities(
+                process_id, force=True, on_done=_done_proc
+            )
             return
 
         device_id = self._selected_device()
         if not device_id:
             return
-        resp = self._get_device_capabilities(device_id, force=True)
-        if resp is None:
-            self.notify(f"Capabilities refresh failed: {device_id}")
-            return
-        self._render_members_table()
-        self.notify(f"Capabilities refreshed: {device_id}")
+
+        def _done_dev(ok: bool) -> None:
+            self.notify(
+                f"Capabilities refreshed: {device_id}"
+                if ok
+                else f"Capabilities refresh failed: {device_id}"
+            )
+
+        self._request_device_capabilities(device_id, force=True, on_done=_done_dev)
 
     def action_member_primary(self) -> None:
         if isinstance(self.screen, ModalScreen):
@@ -2188,59 +2441,66 @@ class ManagerTUI(App):
                 params_spec = None
 
             if not params_spec:
-                resp = self._process_rpc(process_id, {"type": name, "params": {}})
-                if resp and resp.get("ok"):
-                    result = resp.get("result")
-                    text = self._format_result(result) if result is not None else "ok"
-                    self._log_action_result(
-                        f"PROC CALL {process_id}.{name} kwargs={{}} -> {text}"
-                    )
-                    self.notify(f"Call ok: {process_id}.{name}")
-                else:
-                    err = resp.get("error", "unknown error") if resp else "timeout"
-                    err_text = json.dumps(err) if isinstance(err, dict) else str(err)
-                    self._log_action_result(
-                        f"PROC CALL {process_id}.{name} kwargs={{}} -> error {err_text}"
-                    )
-                    self.notify(
-                        f"Call failed: {process_id}.{name} ({err_text})",
-                        severity="error",
-                    )
-                    self._record_action_error(
-                        source="process",
-                        id_=process_id,
-                        message=f"Call failed: {process_id}.{name} ({err_text})",
-                    )
+                def _after_proc_call(resp: Json | None) -> None:
+                    if resp and resp.get("ok"):
+                        result = resp.get("result")
+                        text = self._format_result(result) if result is not None else "ok"
+                        self._log_action_result(
+                            f"PROC CALL {process_id}.{name} kwargs={{}} -> {text}"
+                        )
+                        self.notify(f"Call ok: {process_id}.{name}")
+                    else:
+                        err = resp.get("error", "unknown error") if resp else "timeout"
+                        err_text = json.dumps(err) if isinstance(err, dict) else str(err)
+                        self._log_action_result(
+                            f"PROC CALL {process_id}.{name} kwargs={{}} -> error {err_text}"
+                        )
+                        self.notify(
+                            f"Call failed: {process_id}.{name} ({err_text})",
+                            severity="error",
+                        )
+                        self._record_action_error(
+                            source="process",
+                            id_=process_id,
+                            message=f"Call failed: {process_id}.{name} ({err_text})",
+                        )
+
+                self._process_rpc_submit(
+                    process_id, {"type": name, "params": {}}, _after_proc_call
+                )
                 return
 
             def _on_dismiss(params: dict[str, Any] | None) -> None:
                 if params is None:
                     return
-                resp = self._process_rpc(
-                    process_id, {"type": name, "params": params}
+
+                def _after(resp: Json | None) -> None:
+                    if resp and resp.get("ok"):
+                        result = resp.get("result")
+                        text = self._format_result(result) if result is not None else "ok"
+                        self._log_action_result(
+                            f"PROC CALL {process_id}.{name} kwargs={json.dumps(params)} -> {text}"
+                        )
+                        self.notify(f"Call ok: {process_id}.{name}")
+                    else:
+                        err = resp.get("error", "unknown error") if resp else "timeout"
+                        err_text = json.dumps(err) if isinstance(err, dict) else str(err)
+                        self._log_action_result(
+                            f"PROC CALL {process_id}.{name} kwargs={json.dumps(params)} -> error {err_text}"
+                        )
+                        self.notify(
+                            f"Call failed: {process_id}.{name} ({err_text})",
+                            severity="error",
+                        )
+                        self._record_action_error(
+                            source="process",
+                            id_=process_id,
+                            message=f"Call failed: {process_id}.{name} ({err_text})",
+                        )
+
+                self._process_rpc_submit(
+                    process_id, {"type": name, "params": params}, _after
                 )
-                if resp and resp.get("ok"):
-                    result = resp.get("result")
-                    text = self._format_result(result) if result is not None else "ok"
-                    self._log_action_result(
-                        f"PROC CALL {process_id}.{name} kwargs={json.dumps(params)} -> {text}"
-                    )
-                    self.notify(f"Call ok: {process_id}.{name}")
-                else:
-                    err = resp.get("error", "unknown error") if resp else "timeout"
-                    err_text = json.dumps(err) if isinstance(err, dict) else str(err)
-                    self._log_action_result(
-                        f"PROC CALL {process_id}.{name} kwargs={json.dumps(params)} -> error {err_text}"
-                    )
-                    self.notify(
-                        f"Call failed: {process_id}.{name} ({err_text})",
-                        severity="error",
-                    )
-                    self._record_action_error(
-                        source="process",
-                        id_=process_id,
-                        message=f"Call failed: {process_id}.{name} ({err_text})",
-                    )
 
             self.push_screen(InvokeMemberScreen(name, params_spec), _on_dismiss)
             return
@@ -2255,77 +2515,84 @@ class ManagerTUI(App):
                 params_spec = None
 
             if not params_spec:
-                resp = self._device_command(device_id, name, {})
-                if resp and resp.get("ok"):
-                    result = resp.get("result")
-                    text = self._format_result(result) if result is not None else "ok"
-                    self._log_action_result(
-                        f"CALL {device_id}.{name} kwargs={{}} -> {text}"
-                    )
-                    self.notify(f"Call ok: {device_id}.{name}")
-                else:
-                    err = resp.get("error", "unknown error") if resp else "timeout"
-                    self._log_action_result(
-                        f"CALL {device_id}.{name} kwargs={{}} -> error {err}"
-                    )
-                    self.notify(
-                        f"Call failed: {device_id}.{name} ({err})",
-                        severity="error",
-                    )
-                    self._record_action_error(
-                        source="device",
-                        id_=device_id,
-                        message=f"Call failed: {device_id}.{name} ({err})",
-                    )
+                def _after_dev_call(resp: Json | None) -> None:
+                    if resp and resp.get("ok"):
+                        result = resp.get("result")
+                        text = self._format_result(result) if result is not None else "ok"
+                        self._log_action_result(
+                            f"CALL {device_id}.{name} kwargs={{}} -> {text}"
+                        )
+                        self.notify(f"Call ok: {device_id}.{name}")
+                    else:
+                        err = resp.get("error", "unknown error") if resp else "timeout"
+                        self._log_action_result(
+                            f"CALL {device_id}.{name} kwargs={{}} -> error {err}"
+                        )
+                        self.notify(
+                            f"Call failed: {device_id}.{name} ({err})",
+                            severity="error",
+                        )
+                        self._record_action_error(
+                            source="device",
+                            id_=device_id,
+                            message=f"Call failed: {device_id}.{name} ({err})",
+                        )
+
+                self._device_command_submit(device_id, name, {}, _after_dev_call)
                 return
 
             def _on_dismiss(params: dict[str, Any] | None) -> None:
                 if params is None:
                     return
-                resp = self._device_command(device_id, name, params)
-                if resp and resp.get("ok"):
-                    result = resp.get("result")
-                    text = self._format_result(result) if result is not None else "ok"
-                    self._log_action_result(
-                        f"CALL {device_id}.{name} kwargs={json.dumps(params)} -> {text}"
-                    )
-                    self.notify(f"Call ok: {device_id}.{name}")
-                else:
-                    err = resp.get("error", "unknown error") if resp else "timeout"
-                    self._log_action_result(
-                        f"CALL {device_id}.{name} kwargs={json.dumps(params)} -> error {err}"
-                    )
-                    self.notify(
-                        f"Call failed: {device_id}.{name} ({err})",
-                        severity="error",
-                    )
-                    self._record_action_error(
-                        source="device",
-                        id_=device_id,
-                        message=f"Call failed: {device_id}.{name} ({err})",
-                    )
+
+                def _after(resp: Json | None) -> None:
+                    if resp and resp.get("ok"):
+                        result = resp.get("result")
+                        text = self._format_result(result) if result is not None else "ok"
+                        self._log_action_result(
+                            f"CALL {device_id}.{name} kwargs={json.dumps(params)} -> {text}"
+                        )
+                        self.notify(f"Call ok: {device_id}.{name}")
+                    else:
+                        err = resp.get("error", "unknown error") if resp else "timeout"
+                        self._log_action_result(
+                            f"CALL {device_id}.{name} kwargs={json.dumps(params)} -> error {err}"
+                        )
+                        self.notify(
+                            f"Call failed: {device_id}.{name} ({err})",
+                            severity="error",
+                        )
+                        self._record_action_error(
+                            source="device",
+                            id_=device_id,
+                            message=f"Call failed: {device_id}.{name} ({err})",
+                        )
+
+                self._device_command_submit(device_id, name, params, _after)
 
             self.push_screen(InvokeMemberScreen(name, params_spec), _on_dismiss)
             return
 
-        resp = self._device_command(device_id, "get", {"name": name})
-        if resp and resp.get("ok"):
-            result = resp.get("result")
-            text = self._format_result(result)
-            self._log_action_result(f"GET {device_id}.{name} -> {text}")
-            self.notify(f"Get ok: {device_id}.{name}")
-        else:
-            err = resp.get("error", "unknown error") if resp else "timeout"
-            self._log_action_result(f"GET {device_id}.{name} -> error {err}")
-            self.notify(
-                f"Get failed: {device_id}.{name} ({err})",
-                severity="error",
-            )
-            self._record_action_error(
-                source="device",
-                id_=device_id,
-                message=f"Get failed: {device_id}.{name} ({err})",
-            )
+        def _after_dev_get(resp: Json | None) -> None:
+            if resp and resp.get("ok"):
+                result = resp.get("result")
+                text = self._format_result(result)
+                self._log_action_result(f"GET {device_id}.{name} -> {text}")
+                self.notify(f"Get ok: {device_id}.{name}")
+            else:
+                err = resp.get("error", "unknown error") if resp else "timeout"
+                self._log_action_result(f"GET {device_id}.{name} -> error {err}")
+                self.notify(
+                    f"Get failed: {device_id}.{name} ({err})",
+                    severity="error",
+                )
+                self._record_action_error(
+                    source="device",
+                    id_=device_id,
+                    message=f"Get failed: {device_id}.{name} ({err})",
+                )
+
+        self._device_command_submit(device_id, "get", {"name": name}, _after_dev_get)
 
     def action_member_set(self) -> None:
         if isinstance(self.screen, ModalScreen):
@@ -2353,28 +2620,31 @@ class ManagerTUI(App):
         def _on_dismiss(value: object | None) -> None:
             if value is None:
                 return
-            resp = self._device_command(
-                device_id, "set", {"name": name, "value": value}
+
+            def _after(resp: Json | None) -> None:
+                if resp and resp.get("ok"):
+                    self._log_action_result(
+                        f"SET {device_id}.{name} = {json.dumps(value)} -> ok"
+                    )
+                    self.notify(f"Set ok: {device_id}.{name}")
+                else:
+                    err = resp.get("error", "unknown error") if resp else "timeout"
+                    self._log_action_result(
+                        f"SET {device_id}.{name} = {json.dumps(value)} -> error {err}"
+                    )
+                    self.notify(
+                        f"Set failed: {device_id}.{name} ({err})",
+                        severity="error",
+                    )
+                    self._record_action_error(
+                        source="device",
+                        id_=device_id,
+                        message=f"Set failed: {device_id}.{name} ({err})",
+                    )
+
+            self._device_command_submit(
+                device_id, "set", {"name": name, "value": value}, _after
             )
-            if resp and resp.get("ok"):
-                self._log_action_result(
-                    f"SET {device_id}.{name} = {json.dumps(value)} -> ok"
-                )
-                self.notify(f"Set ok: {device_id}.{name}")
-            else:
-                err = resp.get("error", "unknown error") if resp else "timeout"
-                self._log_action_result(
-                    f"SET {device_id}.{name} = {json.dumps(value)} -> error {err}"
-                )
-                self.notify(
-                    f"Set failed: {device_id}.{name} ({err})",
-                    severity="error",
-                )
-                self._record_action_error(
-                    source="device",
-                    id_=device_id,
-                    message=f"Set failed: {device_id}.{name} ({err})",
-                )
 
         self.push_screen(SetMemberScreen(name), _on_dismiss)
 
@@ -2412,18 +2682,21 @@ class ManagerTUI(App):
         device_id = self._selected_device()
         if not device_id:
             return
-        resp = self._rpc_call({"type": "device.connect", "device_id": device_id})
-        self._notify_rpc_result("Device connect", device_id, resp)
-        if resp and resp.get("ok"):
-            self._get_device_capabilities(device_id, force=True)
-            self._render_members_table()
+        def _after(resp: Json | None) -> None:
+            self._notify_rpc_result("Device connect", device_id, resp)
+            if resp and resp.get("ok"):
+                self._request_device_capabilities(device_id, force=True)
+
+        self._rpc_submit({"type": "device.connect", "device_id": device_id}, _after)
 
     def action_device_disconnect(self) -> None:
         device_id = self._selected_device()
         if not device_id:
             return
-        resp = self._rpc_call({"type": "device.disconnect", "device_id": device_id})
-        self._notify_rpc_result("Device disconnect", device_id, resp)
+        self._rpc_submit(
+            {"type": "device.disconnect", "device_id": device_id},
+            lambda resp: self._notify_rpc_result("Device disconnect", device_id, resp),
+        )
 
     def action_driver_start(self) -> None:
         if self._action_target() == "process":
@@ -2434,8 +2707,10 @@ class ManagerTUI(App):
             if self._status_process_started(proc):
                 self.notify(f"Process already started: {process_id}")
                 return
-            resp = self._rpc_call({"type": "manager.processes.start", "process_id": process_id})
-            self._notify_rpc_result("Process start", process_id, resp)
+            self._rpc_submit(
+                {"type": "manager.processes.start", "process_id": process_id},
+                lambda resp: self._notify_rpc_result("Process start", process_id, resp),
+            )
             return
 
         device_id = self._selected_device()
@@ -2445,8 +2720,10 @@ class ManagerTUI(App):
         if self._status_driver_started(status):
             self.notify(f"Driver already started: {device_id}")
             return
-        resp = self._rpc_call({"type": "device.driver.start", "device_id": device_id})
-        self._notify_rpc_result("Driver start", device_id, resp)
+        self._rpc_submit(
+            {"type": "device.driver.start", "device_id": device_id},
+            lambda resp: self._notify_rpc_result("Driver start", device_id, resp),
+        )
 
     def action_drivers_start_all(self) -> None:
         # Bulk start: previously this looped N blocking _rpc_calls on
@@ -2493,10 +2770,12 @@ class ManagerTUI(App):
             def _on_dismiss(confirmed: bool | None) -> None:
                 if not confirmed:
                     return
-                resp = self._rpc_call(
-                    {"type": "manager.processes.stop", "process_id": process_id}
+                self._rpc_submit(
+                    {"type": "manager.processes.stop", "process_id": process_id},
+                    lambda resp: self._notify_rpc_result(
+                        "Process stop", process_id, resp
+                    ),
                 )
-                self._notify_rpc_result("Process stop", process_id, resp)
 
             self.push_screen(
                 ConfirmScreen(f"Stop process {process_id}?"), _on_dismiss
@@ -2514,10 +2793,10 @@ class ManagerTUI(App):
         def _on_driver_stop_dismiss(confirmed: bool | None) -> None:
             if not confirmed:
                 return
-            resp = self._rpc_call(
-                {"type": "device.driver.stop", "device_id": device_id}
+            self._rpc_submit(
+                {"type": "device.driver.stop", "device_id": device_id},
+                lambda resp: self._notify_rpc_result("Driver stop", device_id, resp),
             )
-            self._notify_rpc_result("Driver stop", device_id, resp)
 
         self.push_screen(ConfirmScreen(f"Stop driver for {device_id}?"), _on_driver_stop_dismiss)
 
@@ -2531,10 +2810,12 @@ class ManagerTUI(App):
             def _on_process_restart_dismiss(confirmed: bool | None) -> None:
                 if not confirmed:
                     return
-                resp = self._rpc_call(
-                    {"type": "manager.processes.restart", "process_id": process_id}
+                self._rpc_submit(
+                    {"type": "manager.processes.restart", "process_id": process_id},
+                    lambda resp: self._notify_rpc_result(
+                        "Process restart", process_id, resp
+                    ),
                 )
-                self._notify_rpc_result("Process restart", process_id, resp)
 
             self.push_screen(
                 ConfirmScreen(f"Restart process {process_id}?"), _on_process_restart_dismiss
@@ -2548,14 +2829,14 @@ class ManagerTUI(App):
         def _on_driver_restart_dismiss(confirmed: bool | None) -> None:
             if not confirmed:
                 return
-            resp = self._rpc_call(
+            self._rpc_submit(
                 {
                     "type": "device.driver.restart",
                     "device_id": device_id,
                     "reload_config": True,
-                }
+                },
+                lambda resp: self._notify_rpc_result("Driver restart", device_id, resp),
             )
-            self._notify_rpc_result("Driver restart", device_id, resp)
 
         self.push_screen(ConfirmScreen(f"Restart driver for {device_id}?"), _on_driver_restart_dismiss)
 
@@ -2587,7 +2868,7 @@ class ManagerTUI(App):
         def _on_dismiss(confirmed: bool | None) -> None:
             if not confirmed:
                 return
-            self._rpc_call({"type": "device.recover", "device_id": device_id})
+            self._rpc_submit({"type": "device.recover", "device_id": device_id})
 
         self.push_screen(ConfirmScreen(f"Recover device {device_id}?"), _on_dismiss)
 

@@ -185,7 +185,9 @@ class HeadlessRenderContentTests(unittest.IsolatedAsyncioTestCase):
 
         app = ManagerTUI(snapshot_period_s=3600.0, rpc_timeout_ms=20)
         app._rpc_call = lambda *a, **k: None  # type: ignore[method-assign]
-        app._load_manager_log_tail_bootstrap = lambda *a, **k: None  # type: ignore[method-assign]
+        # RPC now flows through the single-owner worker; stub the submit path so
+        # the headless render test doesn't do real socket round-trips on mount.
+        app._rpc_submit = lambda *a, **k: None  # type: ignore[method-assign]
         async with app.run_test(headless=True, size=(120, 50)) as pilot:
             app._stop_event.set()
             app.streaming_enabled = False
