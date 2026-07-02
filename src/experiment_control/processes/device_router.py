@@ -1860,13 +1860,17 @@ class DeviceRouter(ManagedProcessBase):
         request_id = request_id if request_id is not None else request.get("request_id")
         params_raw = request.get("params", {})
         caller_process_id, source_kind, source_id = self._process_request_source(req)
+        endpoint = self._process_rpc_endpoint(process_id)
+        if endpoint is None:
+            self._dispatch_manager_rpc(identity, req)
+            return
         self._submit_with_inflight(
             identity,
             task_factory=lambda: _ProcessTask(
                 identity=identity,
                 process_id=process_id,
                 request=request,
-                endpoint=self._process_rpc_endpoint(process_id),
+                endpoint=endpoint,
                 action=str(request.get("type", "process.rpc") or "process.rpc"),
                 params=params_raw if isinstance(params_raw, dict) else {},
                 request_id=request_id,
@@ -1884,9 +1888,17 @@ class DeviceRouter(ManagedProcessBase):
 
     def _dispatch_manager_rpc(self, identity: bytes, req: Json) -> None:
         req_id = req.get("request_id")
+        request = req
+        inner_request_id = None
+        if isinstance(req.get("request"), dict):
+            inner_request_id = req["request"].get("request_id")
+        effective_request_id = req_id if req_id is not None else inner_request_id
+        if effective_request_id is not None and req.get("request_id") != effective_request_id:
+            request = dict(req)
+            request["request_id"] = effective_request_id
         self._submit_with_inflight(
             identity,
-            task_factory=lambda: _ManagerTask(identity=identity, request=req, inflight_reserved=True),
+            task_factory=lambda: _ManagerTask(identity=identity, request=request, inflight_reserved=True),
             worker_factory=self._ensure_manager_worker,
             bucket="manager_worker",
             queue_full_message="manager worker queue is full",
