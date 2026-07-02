@@ -20,6 +20,8 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
+from unittest.mock import patch  # noqa: E402
+
 from experiment_control.processes.hdf_writer import (  # noqa: E402
     HdfWriter,
     _BG_SENTINEL,
@@ -27,6 +29,7 @@ from experiment_control.processes.hdf_writer import (  # noqa: E402
     _create_device_dataset,
     _ingest_process_schema,
 )
+from experiment_control.shm.shm_ring import ShmRingWriter  # noqa: E402
 
 
 def _as_text(value: object) -> str:
@@ -2453,6 +2456,133 @@ class HdfWriterProcessDisableTests(unittest.TestCase):
             resp = w._rpc_hdf_processes_disable({"params": {"process_ids": []}})  # noqa: SLF001
             self.assertFalse(resp["ok"])
             self.assertEqual(resp["error"]["code"], "invalid_params")
+
+
+class HdfWriterStreamStartSkipsOldRingTests(unittest.TestCase):
+    """On a fresh reader attach the writer must skip frames already buffered in
+    the producer-owned, persistent SHM ring from before the writer (re)started,
+    instead of replaying them into the new file."""
+
+    @staticmethod
+    def _make_writer(out_dir: str) -> HdfWriter:
+        return HdfWriter(
+            out_dir=out_dir,
+            filename=None,
+            manager_rpc="tcp://127.0.0.1:65571",
+            manager_pub="tcp://127.0.0.1:65572",
+            rpc_timeout_ms=2000,
+            timezone="America/Chicago",
+            rcvhwm=1000,
+            write_every_s=1.0,
+            buffer_max_messages=1000,
+            flush_every_n=10,
+            flush_every_s=1.0,
+            disabled_devices=[],
+            event_log_mode="all",
+        )
+
+    class _FakeReader:
+        name = "cntx_fake"
+
+        class layout:  # noqa: N801
+            dtype = np.dtype("uint16")
+            shape = (1,)
+
+        def close(self) -> None:
+            pass
+
+    def test_fresh_attach_seeds_last_seq_to_initial_minus_one(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            w = self._make_writer(td)
+            key = ("dev", "trace")
+            with patch(
+                "experiment_control.processes.hdf_writer.ShmRingReader.attach",
+                return_value=self._FakeReader(),
+            ):
+                reader = w._ensure_chunk_ready_reader(  # noqa: SLF001
+                    key=key,
+                    device_id="dev",
+                    stream="trace",
+                    shm_name="cntx_fake",
+                    initial_seq=1001,
+                )
+            self.assertIsNotNone(reader)
+            # Seeded to just before the triggering chunk -> pre-existing frames
+            # (seq <= 1000) are skipped, the triggering frame (1001) is kept.
+            self.assertEqual(w._stream_last_seq[key], 1000)  # noqa: SLF001
+
+    def test_fresh_attach_without_seq_falls_back_to_zero(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            w = self._make_writer(td)
+            key = ("dev", "trace")
+            with patch(
+                "experiment_control.processes.hdf_writer.ShmRingReader.attach",
+                return_value=self._FakeReader(),
+            ):
+                w._ensure_chunk_ready_reader(  # noqa: SLF001
+                    key=key,
+                    device_id="dev",
+                    stream="trace",
+                    shm_name="cntx_fake",
+                    initial_seq=None,
+                )
+            self.assertEqual(w._stream_last_seq[key], 0)  # noqa: SLF001
+
+    def test_start_skips_frames_already_in_ring(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            name = f"ec_hdf_skip_{uuid.uuid4().hex}"
+            w = self._make_writer(str(root))
+            ring = ShmRingWriter.create(
+                name=name,
+                dtype=np.dtype("uint16"),
+                shape=(1,),
+                slot_count=16,
+                layout_version=1,  # frame stream (no header last-seq hint)
+            )
+            try:
+                # Frames buffered BEFORE the writer (re)started.
+                for i in range(1, 6):
+                    ring.write(
+                        np.asarray([i], dtype=np.uint16), t0_mono_ns=i, t0_wall_ns=i
+                    )
+                with h5py.File(root / "s.h5", "w") as h5:
+                    meta = w._build_measurement_metadata(  # noqa: SLF001
+                        profile_id=None, values=None, require_profile=False
+                    )
+                    w._configure_active_file(  # noqa: SLF001
+                        h5,
+                        write_every_s=1.0,
+                        load_manager_state=False,
+                        measurement_meta=meta,
+                    )
+                    # New acquisition: one fresh frame + its chunk_ready.
+                    new_seq = ring.write(
+                        np.asarray([6], dtype=np.uint16), t0_mono_ns=6, t0_wall_ns=6
+                    )
+                    self.assertEqual(new_seq, 6)
+                    w._handle_chunk_ready(  # noqa: SLF001
+                        {
+                            "device_id": "trace1",
+                            "stream": "trace",
+                            "shm_name": name,
+                            "seq": new_seq,
+                        }
+                    )
+                    key = ("trace1", "trace")
+                    # Only the new frame was picked up; old 1..5 were skipped.
+                    self.assertEqual(w._stream_last_seq[key], 6)  # noqa: SLF001
+                    pending = set(
+                        w._stream_pending_by_seq.get(key, {}).keys()  # noqa: SLF001
+                    )
+                    buf = w._stream_buffers.get(key, {})  # noqa: SLF001
+                    buffered = set(
+                        buf.get("seq", []) if isinstance(buf, dict) else []
+                    )
+                    self.assertEqual(pending | buffered, {6})
+            finally:
+                ring.close()
+                ring.unlink()
 
 
 if __name__ == "__main__":
