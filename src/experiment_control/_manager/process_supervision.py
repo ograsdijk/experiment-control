@@ -937,6 +937,7 @@ def update_device_driver_exit_state(manager: Any, handle: Any, rc: int) -> None:
     exiting_pid = handle.driver_popen_pid or handle.driver_pid
     handle.process = None
     handle.driver_pid = None
+    handle.driver_running_since_mono = None
     if (
         str(handle.driver_process_state) == "STOPPING"
         and handle.driver_stop_requested_t_mono is not None
@@ -958,25 +959,68 @@ def update_device_driver_exit_state(manager: Any, handle: Any, rc: int) -> None:
     manager._publish_driver_event("manager.driver.failed", handle)
 
 
-def reconcile_phantom_running_driver(manager: Any, handle: Any) -> None:
-    """Demote a driver stuck in RUNNING with no live process and no recent
-    heartbeat.
+def enforce_device_driver_heartbeat_timeout(
+    manager: Any, handle: Any, now_mono: float
+) -> None:
+    """Heartbeat-authoritative liveness for device drivers.
 
-    poll()-based exit detection only runs while ``handle.process is not None``.
-    If a registration is applied just after the supervisor reaped the driver's
-    subprocess (the process/pid were cleared, then a buffered ``register``
-    message set state back to RUNNING with ``pid=None``), the driver reports
-    RUNNING with no pid forever. Reset it to FAILED so status reflects reality;
-    restart-on-crash is not automatic, so this only corrects the state.
+    A driver's RUNNING state is only as trustworthy as the *heartbeat* — the
+    `handle.process` Popen is a wrapper (uv/python launcher) whose `poll()` can
+    stay None while the real driver died, and a stale-registration race can set
+    RUNNING with no process at all. So instead of stacking `proc.poll()`
+    special-cases, demote RUNNING → FAILED whenever the heartbeat has gone
+    stale, regardless of the wrapper. This subsumes the earlier
+    process-is-None reconcile.
+
+    Only acts on RUNNING (STARTING is left to poll() + registration). Ages
+    against the last heartbeat, or the time the driver went RUNNING if none has
+    arrived yet. Defers during startup grace / a recent manager-loop stall up to
+    a generous hard timeout, mirroring the managed-process supervisor, so a
+    briefly-slow-but-alive driver is never demoted.
     """
-    handle.process = None
-    handle.driver_pid = None
+    if str(handle.driver_process_state) != "RUNNING":
+        return
+    hb = handle.last_hb_recv_mono
+    ref = hb if hb is not None else handle.driver_running_since_mono
+    if ref is None:
+        return  # no basis to judge yet
+    age = now_mono - ref
+    timeout_s = float(manager._heartbeat_timeout_s)
+    if age <= timeout_s:
+        return
+    hard_timeout_s = timeout_s * max(
+        1.0, float(getattr(manager, "_heartbeat_hard_timeout_multiplier", 3.0))
+    )
+    if age < hard_timeout_s and (
+        _in_startup_grace(manager, now_mono)
+        or _recent_manager_loop_stall(manager, now_mono)
+    ):
+        return  # transient: manager was delayed or driver still booting
+
     handle.driver_process_state = _enum_member(handle.driver_process_state, "FAILED")
-    handle.driver_last_error_kind = handle.driver_last_error_kind or "liveness_lost"
+    handle.driver_pid = None
+    handle.driver_running_since_mono = None
+    handle.driver_last_error_kind = handle.driver_last_error_kind or "heartbeat_stale"
     if not handle.driver_last_error:
-        handle.driver_last_error = (
-            "driver marked RUNNING but no live process or recent heartbeat"
-        )
+        if hb is None:
+            handle.driver_last_error = (
+                f"driver RUNNING but no heartbeat {age:.1f}s after registering "
+                f"(timeout {timeout_s:.1f}s)"
+            )
+        else:
+            handle.driver_last_error = (
+                f"driver heartbeat stale ({age:.1f}s > {timeout_s:.1f}s)"
+            )
+    # Terminate a stale wrapper (real driver dead but launcher alive) so a
+    # subsequent restart can respawn cleanly.
+    proc = handle.process
+    if proc is not None:
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+        except Exception:
+            pass
+    handle.process = None
     manager._publish_driver_event("manager.driver.failed", handle)
 
 
@@ -1235,17 +1279,12 @@ def supervise_device_drivers(manager: Any, now_mono: float) -> None:
         if proc is not None:
             rc = proc.poll()
             if rc is not None:
+                # Fast path: the tracked (wrapper) process actually exited.
                 manager._update_device_driver_exit_state(handle, int(rc))
-        elif str(handle.driver_process_state) == "RUNNING":
-            # RUNNING but no tracked subprocess: legitimate only if a fresh
-            # heartbeat proves the driver is alive (e.g. externally started).
-            # Otherwise it's a phantom RUNNING (e.g. a stale registration
-            # applied after the process was reaped) that poll()-based detection
-            # can never clear — reconcile so it can't report RUNNING with no pid.
-            hb = handle.last_hb_recv_mono
-            hb_stale = hb is None or (now_mono - hb) > manager._heartbeat_timeout_s
-            if hb_stale:
-                manager._reconcile_phantom_running_driver(handle)
+        # Heartbeat-authoritative liveness: demote a RUNNING driver whose
+        # heartbeat has gone stale even if the wrapper's poll() still reports
+        # alive, and covers the process-is-None stale-registration case too.
+        manager._enforce_device_driver_heartbeat_timeout(handle, now_mono)
         manager._enforce_device_driver_stop_timeout(handle, now_mono)
         manager._maybe_restart_device_driver(device_id, handle, now_mono)
         _maybe_auto_reconnect_device(manager, device_id, handle, now_mono)
@@ -1649,8 +1688,10 @@ class ProcessSupervisionMixin:
     def _update_device_driver_exit_state(self, handle: Any, rc: int) -> None:
         update_device_driver_exit_state(self, handle, rc)
 
-    def _reconcile_phantom_running_driver(self, handle: Any) -> None:
-        reconcile_phantom_running_driver(self, handle)
+    def _enforce_device_driver_heartbeat_timeout(
+        self, handle: Any, now_mono: float
+    ) -> None:
+        enforce_device_driver_heartbeat_timeout(self, handle, now_mono)
 
     def _enforce_device_driver_stop_timeout(
         self, handle: Any, now_mono: float

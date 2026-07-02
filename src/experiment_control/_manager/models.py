@@ -158,6 +158,11 @@ class DeviceHandle:
     driver_last_failure_pid: int | None = None
     driver_stop_requested_t_mono: float | None = None
     driver_next_restart_t_mono: float | None = None
+    # Monotonic time the driver entered RUNNING (set on registration). Used to
+    # age a never-arrived heartbeat so a driver whose wrapper stays alive but
+    # whose real process died is demoted from RUNNING (heartbeat-authoritative
+    # liveness), not just when the wrapper's poll() reports exit.
+    driver_running_since_mono: float | None = None
     connect_check_last: dict[str, Any] | None = None
     config_published: bool = False
     supervisor_stdout_tail: deque[Json] = field(default_factory=lambda: deque(maxlen=300))
