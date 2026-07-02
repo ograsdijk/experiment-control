@@ -395,7 +395,7 @@ export function SequencerModal({
               <Stack gap={6}>
                 <Group justify="space-between" align="center">
                   <Text size="sm" fw={600}>
-                    Sequence library
+                    Sequence library ({libraryEntries.length})
                   </Text>
                   <Button
                     size="compact-xs"
@@ -417,8 +417,12 @@ export function SequencerModal({
                   onChange={(value) => onSelectedSequenceIdChange(value)}
                   searchable
                   clearable
+                  comboboxProps={{ zIndex: 500 }}
                   disabled={libraryLoading}
                 />
+                <Text size="xs" c="dimmed">
+                  Selected: {selectedSequenceId ?? "none"}
+                </Text>
                 {selectedLibraryEntry?.description && (
                   <Text size="xs" c="dimmed">
                     {selectedLibraryEntry.description}

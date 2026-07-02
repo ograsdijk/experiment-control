@@ -401,7 +401,9 @@ export function AppModalsLayer({
         libraryLoading={sequencerController.sequencerLibraryLoading}
         libraryError={sequencerController.sequencerLibraryError}
         selectedSequenceId={sequencerController.sequencerSelectedSequenceId}
-        onSelectedSequenceIdChange={sequencerController.setSequencerSelectedSequenceId}
+        onSelectedSequenceIdChange={
+          sequencerController.setSequencerSelectedSequenceIdForUi
+        }
         onReloadLibrary={sequencerController.reloadSequencerLibrary}
         overrideRows={sequencerController.sequencerOverrideRows}
         overrideVarOptions={sequencerController.sequencerOverrideVarOptions}

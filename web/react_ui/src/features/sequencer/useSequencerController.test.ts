@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   buildSequencerLoadRequest,
   buildSequencerStartParams,
+  normalizeSequencerLibraryPayload,
   resolveSequencerSelectedSequenceId,
 } from "./useSequencerController";
 
@@ -62,30 +63,80 @@ describe("sequencer controller request builders", () => {
         "spb_microwave_scan",
         "spa_ch2",
         [{ id: "spb_microwave_scan" }, { id: "spa_ch2" }],
-        "library"
+        true
       )
     ).toBe("spb_microwave_scan");
   });
 
-  it("falls back to the backend active id when no valid selection exists", () => {
+  it("falls back to the backend active id when requested", () => {
     expect(
       resolveSequencerSelectedSequenceId(
         null,
         "spa_ch2",
         [{ id: "spb_microwave_scan" }, { id: "spa_ch2" }],
-        "library"
+        true
       )
     ).toBe("spa_ch2");
   });
 
-  it("does not force an active id while in editor mode", () => {
+  it("prefers the first entry for display when not in library mode", () => {
     expect(
       resolveSequencerSelectedSequenceId(
         null,
         "spa_ch2",
         [{ id: "spb_microwave_scan" }, { id: "spa_ch2" }],
-        "editor"
+        false
       )
-    ).toBeNull();
+    ).toBe("spb_microwave_scan");
+  });
+
+  it("preserves the current selection even in editor mode", () => {
+    expect(
+      resolveSequencerSelectedSequenceId(
+        "spa_ch2",
+        "spb_microwave_scan",
+        [{ id: "spb_microwave_scan" }, { id: "spa_ch2" }],
+        false
+      )
+    ).toBe("spa_ch2");
+  });
+
+  it("returns null when there are no entries", () => {
+    expect(resolveSequencerSelectedSequenceId(null, "a", [], true)).toBeNull();
+  });
+
+  it("parses nested sequence library payloads", () => {
+    const payload = normalizeSequencerLibraryPayload({
+      result: {
+        configured: true,
+        entries: [
+          {
+            id: "spb_microwave_scan",
+            label: "SPB microwave frequency scan",
+            description: "test",
+            path: "/abs/path/spb_microwave_scan.yaml",
+            source: "autoload",
+            vars: ["freq_start_ghz"],
+          },
+        ],
+        active_sequence_id: null,
+        last_error: null,
+      },
+    });
+
+    expect(payload?.entries).toHaveLength(1);
+    expect(payload?.entries[0].id).toBe("spb_microwave_scan");
+  });
+
+  it("parses direct sequence library payloads", () => {
+    const payload = normalizeSequencerLibraryPayload({
+      configured: true,
+      entries: [{ id: "a", path: "/x/a.yaml", source: "autoload", vars: [] }],
+      active_sequence_id: null,
+      last_error: null,
+    });
+
+    expect(payload?.entries).toHaveLength(1);
+    expect(payload?.entries[0].id).toBe("a");
   });
 });
