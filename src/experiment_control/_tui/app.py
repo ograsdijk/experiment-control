@@ -2252,13 +2252,11 @@ class ManagerTUI(App):
             return
         if not self._is_table_focused(table):
             return
-        row = table.get_row(event.row_key)
-        if row:
-            self._selected_process_id = str(row[0])
-            self._has_user_process_selection = True
-            self._set_inspector_mode("process")
-            self._mark_inspector_dirty()
-            self._render_inspector_if_needed(force=True)
+        self._selected_process_id = self._row_key_str(event.row_key)
+        self._has_user_process_selection = True
+        self._set_inspector_mode("process")
+        self._mark_inspector_dirty()
+        self._render_inspector_if_needed(force=True)
 
     @on(DataTable.RowHighlighted, "#processes_table")
     def _on_process_cursor_moved(self, event: DataTable.RowHighlighted) -> None:
@@ -2267,15 +2265,10 @@ class ManagerTUI(App):
             return
         if not self._is_table_focused(table):
             return
-        try:
-            row = table.get_row(event.row_key)
-        except Exception:
-            return
-        if row:
-            self._selected_process_id = str(row[0])
-            self._set_inspector_mode("process")
-            self._mark_inspector_dirty()
-            self._render_inspector_if_needed(force=True)
+        self._selected_process_id = self._row_key_str(event.row_key)
+        self._set_inspector_mode("process")
+        self._mark_inspector_dirty()
+        self._render_inspector_if_needed(force=True)
 
     @on(DataTable.RowSelected, "#members_table")
     def _on_member_selected(self, event: DataTable.RowSelected) -> None:
@@ -2922,4 +2915,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
