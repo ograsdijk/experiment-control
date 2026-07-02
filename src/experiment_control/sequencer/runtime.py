@@ -2041,7 +2041,7 @@ class SequencerRuntime:
     def _resolve_value(self, value: Any) -> Any:
         env = self._env_view()
         if isinstance(value, dict) and "telemetry" in value:
-            spec = value["telemetry"]
+            spec = render_templates(value["telemetry"], env)
             if not isinstance(spec, dict):
                 return None
             device = str(spec.get("device", ""))
@@ -2049,7 +2049,8 @@ class SequencerRuntime:
             signal = str(spec.get("signal", ""))
             if (not device and not process) or not signal:
                 return None
-            max_age = float(spec.get("max_age_s", 0))
+            max_age_raw = spec.get("max_age_s", 0)
+            max_age = float(max_age_raw if max_age_raw is not None else 0)
             sample = self._dispatch_get_telemetry(
                 device=device, process=process or None, signal=signal
             )
@@ -2104,21 +2105,32 @@ class SequencerRuntime:
         return render_templates(value, env)
 
     def _start_wait_until(self, raw: dict[str, Any]) -> None:
-        timeout_s = float(raw.get("timeout_s", 0))
-        every_s = float(raw.get("every_s", 0.1))
-        stable_for_s = float(raw.get("stable_for_s", 0))
-        sample_spec = raw.get("sample", {})
-        if isinstance(sample_spec, dict):
-            sample_spec = sample_spec
-        else:
+        env = self._env_view()
+
+        def _render_float(value: Any, default: Any) -> float:
+            rendered = render_templates(value if value is not None else default, env)
+            return float(rendered)
+
+        timeout_s = _render_float(raw.get("timeout_s", 0), 0)
+        every_s = _render_float(raw.get("every_s", 0.1), 0.1)
+        stable_for_s = _render_float(raw.get("stable_for_s", 0), 0)
+        sample_spec_raw = raw.get("sample", {})
+        sample_spec = render_templates(sample_spec_raw, env)
+        if not isinstance(sample_spec, dict):
             sample_spec = {}
         reduce_spec = raw.get("reduce")
-        reduce_spec_dict = reduce_spec if isinstance(reduce_spec, dict) else None
+        reduce_spec_dict = render_templates(reduce_spec, env) if isinstance(reduce_spec, dict) else None
+        if not isinstance(reduce_spec_dict, dict):
+            reduce_spec_dict = None
         max_samples_raw = (
             reduce_spec_dict.get("max_samples") if reduce_spec_dict is not None else None
         )
         try:
-            max_samples = int(max_samples_raw) if max_samples_raw is not None else 10000
+            max_samples = (
+                int(render_templates(max_samples_raw, env))
+                if max_samples_raw is not None
+                else 10000
+            )
         except Exception:
             max_samples = 10000
         max_samples = max(1, max_samples)
