@@ -10,25 +10,28 @@ export type ParamInputProps = {
 export function coerceParamValue(raw: string, param: ParamInputProps["param"]) {
   const annotation = (param.annotation ?? "").toLowerCase();
   const defaultValue = param.default;
-  const isInt =
-    annotation.includes("int") ||
-    (typeof defaultValue === "number" && Number.isInteger(defaultValue));
-  const isFloat =
-    annotation.includes("float") ||
-    (typeof defaultValue === "number" && !Number.isInteger(defaultValue));
-  if (annotation.includes("bool") || typeof defaultValue === "boolean") {
+  const hasBoolAnnotation = annotation.includes("bool");
+  const hasFloatAnnotation = annotation.includes("float");
+  const hasIntAnnotation = annotation.includes("int");
+  const defaultIsNumber = typeof defaultValue === "number";
+  const defaultIsFloat = defaultIsNumber && !Number.isInteger(defaultValue);
+  const defaultIsInt = defaultIsNumber && Number.isInteger(defaultValue);
+  const isFloat = hasFloatAnnotation || defaultIsFloat;
+  const isInt = !isFloat && (hasIntAnnotation || defaultIsInt);
+
+  if (hasBoolAnnotation || typeof defaultValue === "boolean") {
     return raw === "true" || raw === "1";
+  }
+  if (isFloat || defaultIsNumber) {
+    const asNumber = Number(raw);
+    if (Number.isFinite(asNumber)) {
+      return asNumber;
+    }
   }
   if (isInt) {
     const asNumber = Number(raw);
     if (Number.isFinite(asNumber)) {
       return Math.trunc(asNumber);
-    }
-  }
-  if (isFloat || typeof defaultValue === "number") {
-    const asNumber = Number(raw);
-    if (Number.isFinite(asNumber)) {
-      return asNumber;
     }
   }
   return raw;
@@ -37,12 +40,13 @@ export function coerceParamValue(raw: string, param: ParamInputProps["param"]) {
 export function ParamInput({ param, value, onChange }: ParamInputProps) {
   const annotation = (param.annotation ?? "").toLowerCase();
   const isBool = annotation.includes("bool");
-  const isInt =
-    annotation.includes("int") ||
-    (typeof param.default === "number" && Number.isInteger(param.default));
   const isFloat =
     annotation.includes("float") ||
     (typeof param.default === "number" && !Number.isInteger(param.default));
+  const isInt =
+    !isFloat &&
+    (annotation.includes("int") ||
+      (typeof param.default === "number" && Number.isInteger(param.default)));
 
   if (isBool) {
     return (
