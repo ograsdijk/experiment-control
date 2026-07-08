@@ -16,6 +16,7 @@ import {
   moveStepDown,
   moveStepUp,
   type BasicSequencerStepTemplate,
+  type SequencerChildContainer,
 } from "../features/sequencer/editing";
 import type {
   SequencerOutlineMetadata,
@@ -202,7 +203,7 @@ export function SequencerOutlinePane({
   const handleInsertChild = (
     node: SequencerStepOutlineNode,
     kind: BasicSequencerStepTemplate,
-    containerKey: "do" | "then" | "else"
+    containerKey: SequencerChildContainer
   ) => {
     const insertionLine = getChildInsertionLine(node, containerKey);
     setPendingSelection({

@@ -9,7 +9,11 @@ import {
   IconPlus,
   IconTrash,
 } from "@tabler/icons-react";
-import { listChildInsertionTargets, type BasicSequencerStepTemplate } from "../editing";
+import {
+  listChildInsertionTargets,
+  type BasicSequencerStepTemplate,
+  type SequencerChildContainer,
+} from "../editing";
 import { countStepIssues } from "../editor_helpers";
 import type { SequencerStepOutlineNode } from "../types";
 
@@ -24,6 +28,7 @@ const STEP_TEMPLATE_OPTIONS: Array<{ kind: BasicSequencerStepTemplate; label: st
   { kind: "assign", label: "Add assign" },
   { kind: "set_context", label: "Add set_context" },
   { kind: "if", label: "Add if" },
+  { kind: "try", label: "Add try" },
   { kind: "while", label: "Add while" },
 ];
 
@@ -50,6 +55,8 @@ function insertLabel(kind: BasicSequencerStepTemplate, scope: "below" | "child")
       return `${prefix} set_context${scope === "below" ? " below" : ""}`;
     case "if":
       return `${prefix} if${scope === "below" ? " below" : ""}`;
+    case "try":
+      return `${prefix} try${scope === "below" ? " below" : ""}`;
     case "while":
       return `${prefix} while${scope === "below" ? " below" : ""}`;
     default:
@@ -98,7 +105,7 @@ type OutlineRowProps = {
   onInsertChild: (
     node: SequencerStepOutlineNode,
     kind: BasicSequencerStepTemplate,
-    containerKey: "do" | "then" | "else"
+    containerKey: SequencerChildContainer
   ) => void;
   siblingInfoById: SiblingInfoMap;
   onMoveUp: (node: SequencerStepOutlineNode) => void;
@@ -287,7 +294,7 @@ type Props = {
   onInsertChild: (
     node: SequencerStepOutlineNode,
     kind: BasicSequencerStepTemplate,
-    containerKey: "do" | "then" | "else"
+    containerKey: SequencerChildContainer
   ) => void;
   siblingInfoById: SiblingInfoMap;
   onMoveUp: (node: SequencerStepOutlineNode) => void;

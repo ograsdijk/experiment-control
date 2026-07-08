@@ -50,6 +50,61 @@ class SequencerRangeGeneratorTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             generate_from_gen({"triangle": {"start": 0, "stop": 1, "num": 1}}, env={})
 
+    def test_centered_triangle_starts_and_ends_at_center(self) -> None:
+        records = generate_from_gen(
+            {"centered_triangle": {"center": 10.0, "span": 8.0, "num": 5}},
+            env={},
+        )
+        values = [record["value"] for record in records]
+        self.assertEqual(values, [10.0, 12.0, 14.0, 14.0, 12.0, 10.0, 8.0, 6.0, 6.0, 8.0, 10.0])
+        self.assertEqual(len(records), 11)
+        self.assertEqual(records[0]["index"], 0)
+        self.assertEqual(records[-1]["index"], 10)
+        self.assertEqual(records[-1]["count"], 11)
+
+    def test_centered_triangle_renders_templates(self) -> None:
+        records = generate_from_gen(
+            {
+                "centered_triangle": {
+                    "center": "${center}",
+                    "span": "${span}",
+                    "num": "${n}",
+                    "dir": "${direction}",
+                }
+            },
+            env={"center": 100.0, "span": 4.0, "n": 3, "direction": 1},
+        )
+        self.assertEqual([record["value"] for record in records], [100.0, 102.0, 102.0, 100.0, 98.0, 98.0, 100.0])
+
+    def test_centered_triangle_dir_minus_one_starts_down(self) -> None:
+        records = generate_from_gen(
+            {"centered_triangle": {"center": 10.0, "span": 8.0, "num": 5, "dir": -1}},
+            env={},
+        )
+        values = [record["value"] for record in records]
+        self.assertEqual(values, [10.0, 8.0, 6.0, 6.0, 8.0, 10.0, 12.0, 14.0, 14.0, 12.0, 10.0])
+
+    def test_centered_triangle_num_must_be_at_least_three(self) -> None:
+        with self.assertRaises(ValueError):
+            generate_from_gen(
+                {"centered_triangle": {"center": 0, "span": 1, "num": 1}},
+                env={},
+            )
+
+    def test_centered_triangle_num_must_be_odd(self) -> None:
+        with self.assertRaises(ValueError):
+            generate_from_gen(
+                {"centered_triangle": {"center": 0, "span": 1, "num": 4}},
+                env={},
+            )
+
+    def test_centered_triangle_dir_must_be_plus_or_minus_one(self) -> None:
+        with self.assertRaises(ValueError):
+            generate_from_gen(
+                {"centered_triangle": {"center": 0, "span": 1, "num": 3, "dir": 0}},
+                env={},
+            )
+
     def test_scan2d_serpentine_shorthand(self) -> None:
         records = generate_from_gen(
             {

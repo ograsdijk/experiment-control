@@ -218,6 +218,311 @@ class SequencerLoopTests(unittest.TestCase):
         self.assertEqual(status["state"], "ERROR")
         self.assertIn("recursive use sequence detected", str(status["error"]))
 
+    def test_try_finally_runs_on_normal_completion(self) -> None:
+        calls: list[tuple[str, str]] = []
+
+        runtime = SequencerRuntime(
+            call_device=lambda d, a, p: calls.append((d, a))
+            or {"ok": True, "result": None},
+            get_telemetry=lambda d, s: None,
+            set_stream_context=lambda *a: None,
+        )
+        runtime.load(
+            parse_sequence(
+                {
+                    "version": 1,
+                    "steps": [
+                        {
+                            "try": {
+                                "do": [{"call": {"device": "dev", "action": "body"}}],
+                                "finally": [
+                                    {"call": {"device": "dev", "action": "cleanup"}}
+                                ],
+                            }
+                        }
+                    ],
+                }
+            )
+        )
+        runtime.start()
+        while runtime.state == "RUNNING":
+            runtime.tick()
+        self.assertEqual(runtime.status()["state"], "STOPPED")
+        self.assertEqual(calls, [("dev", "body"), ("dev", "cleanup")])
+
+    def test_try_finally_runs_on_call_failure(self) -> None:
+        calls: list[tuple[str, str]] = []
+
+        def call_device(device: str, action: str, params: dict[str, object]):
+            calls.append((device, action))
+            if action == "body":
+                return {"ok": False, "error": "body failed"}
+            return {"ok": True, "result": None}
+
+        runtime = SequencerRuntime(
+            call_device=call_device,
+            get_telemetry=lambda d, s: None,
+            set_stream_context=lambda *a: None,
+        )
+        runtime.load(
+            parse_sequence(
+                {
+                    "version": 1,
+                    "steps": [
+                        {
+                            "try": {
+                                "do": [{"call": {"device": "dev", "action": "body"}}],
+                                "finally": [
+                                    {"call": {"device": "dev", "action": "cleanup"}}
+                                ],
+                            }
+                        }
+                    ],
+                }
+            )
+        )
+        runtime.start()
+        while runtime.state == "RUNNING":
+            runtime.tick()
+        status = runtime.status()
+        self.assertEqual(status["state"], "ERROR")
+        self.assertEqual(status["error"], "body failed")
+        self.assertEqual(calls, [("dev", "body"), ("dev", "cleanup")])
+
+    def test_try_finally_runs_on_requested_stop(self) -> None:
+        calls: list[tuple[str, str]] = []
+        runtime = SequencerRuntime(
+            call_device=lambda d, a, p: calls.append((d, a))
+            or {"ok": True, "result": None},
+            get_telemetry=lambda d, s: None,
+            set_stream_context=lambda *a: None,
+        )
+        runtime.load(
+            parse_sequence(
+                {
+                    "version": 1,
+                    "steps": [
+                        {
+                            "try": {
+                                "do": [{"sleep": 10}],
+                                "finally": [
+                                    {"call": {"device": "dev", "action": "cleanup"}}
+                                ],
+                            }
+                        }
+                    ],
+                }
+            )
+        )
+        runtime.start()
+        runtime.tick()
+        runtime.request_stop()
+        while runtime.state == "RUNNING":
+            runtime.tick()
+        self.assertEqual(runtime.status()["state"], "STOPPED")
+        self.assertEqual(calls, [("dev", "cleanup")])
+
+    def test_try_finally_runs_on_external_fail(self) -> None:
+        calls: list[tuple[str, str]] = []
+        runtime = SequencerRuntime(
+            call_device=lambda d, a, p: calls.append((d, a))
+            or {"ok": True, "result": None},
+            get_telemetry=lambda d, s: None,
+            set_stream_context=lambda *a: None,
+        )
+        runtime.load(
+            parse_sequence(
+                {
+                    "version": 1,
+                    "steps": [
+                        {
+                            "try": {
+                                "do": [{"sleep": 10}],
+                                "finally": [
+                                    {"call": {"device": "dev", "action": "cleanup"}}
+                                ],
+                            }
+                        }
+                    ],
+                }
+            )
+        )
+        runtime.start()
+        runtime.tick()
+        runtime.fail("external fault test")
+        while runtime.state == "RUNNING":
+            runtime.tick()
+        status = runtime.status()
+        self.assertEqual(status["state"], "ERROR")
+        self.assertEqual(status["error"], "external fault test")
+        self.assertEqual(calls, [("dev", "cleanup")])
+
+    def test_try_finally_cleanup_failure_preserves_original_error(self) -> None:
+        calls: list[tuple[str, str]] = []
+
+        def call_device(device: str, action: str, params: dict[str, object]):
+            calls.append((device, action))
+            if action == "body":
+                return {"ok": False, "error": "body failed"}
+            return {"ok": False, "error": "cleanup failed too"}
+
+        runtime = SequencerRuntime(
+            call_device=call_device,
+            get_telemetry=lambda d, s: None,
+            set_stream_context=lambda *a: None,
+        )
+        runtime.load(
+            parse_sequence(
+                {
+                    "version": 1,
+                    "steps": [
+                        {
+                            "try": {
+                                "do": [{"call": {"device": "dev", "action": "body"}}],
+                                "finally": [
+                                    {"call": {"device": "dev", "action": "cleanup"}}
+                                ],
+                            }
+                        }
+                    ],
+                }
+            )
+        )
+        runtime.start()
+        while runtime.state == "RUNNING":
+            runtime.tick()
+        status = runtime.status()
+        self.assertEqual(status["state"], "ERROR")
+        self.assertIn("body failed", str(status["error"]))
+        self.assertIn("cleanup failed", str(status["error"]))
+
+    def test_nested_try_finally_continues_outer_cleanup_after_inner_cleanup_failure(
+        self,
+    ) -> None:
+        calls: list[tuple[str, str]] = []
+
+        def call_device(device: str, action: str, params: dict[str, object]):
+            calls.append((device, action))
+            if action == "body":
+                return {"ok": False, "error": "body failed"}
+            if action == "inner_cleanup":
+                return {"ok": False, "error": "inner cleanup failed"}
+            return {"ok": True, "result": None}
+
+        runtime = SequencerRuntime(
+            call_device=call_device,
+            get_telemetry=lambda d, s: None,
+            set_stream_context=lambda *a: None,
+        )
+        runtime.load(
+            parse_sequence(
+                {
+                    "version": 1,
+                    "steps": [
+                        {
+                            "try": {
+                                "do": [
+                                    {
+                                        "try": {
+                                            "do": [
+                                                {
+                                                    "call": {
+                                                        "device": "dev",
+                                                        "action": "body",
+                                                    }
+                                                }
+                                            ],
+                                            "finally": [
+                                                {
+                                                    "call": {
+                                                        "device": "dev",
+                                                        "action": "inner_cleanup",
+                                                    }
+                                                }
+                                            ],
+                                        }
+                                    }
+                                ],
+                                "finally": [
+                                    {
+                                        "call": {
+                                            "device": "dev",
+                                            "action": "outer_cleanup",
+                                        }
+                                    }
+                                ],
+                            }
+                        }
+                    ],
+                }
+            )
+        )
+        runtime.start()
+        while runtime.state == "RUNNING":
+            runtime.tick()
+        status = runtime.status()
+        self.assertEqual(status["state"], "ERROR")
+        self.assertIn("body failed", str(status["error"]))
+        self.assertIn("inner cleanup failed", str(status["error"]))
+        self.assertEqual(
+            calls,
+            [
+                ("dev", "body"),
+                ("dev", "inner_cleanup"),
+                ("dev", "outer_cleanup"),
+            ],
+        )
+
+    def test_try_finally_restores_use_vars_before_parent_cleanup(self) -> None:
+        calls: list[tuple[str, str]] = []
+
+        def call_device(device: str, action: str, params: dict[str, object]):
+            calls.append((device, action))
+            if action == "body":
+                return {"ok": False, "error": "body failed"}
+            return {"ok": True, "result": None}
+
+        helper = parse_sequence(
+            {
+                "version": 1,
+                "vars": {"cleanup_device": "child"},
+                "steps": [{"call": {"device": "dev", "action": "body"}}],
+            }
+        )
+        main = parse_sequence(
+            {
+                "version": 1,
+                "vars": {"cleanup_device": "parent"},
+                "steps": [
+                    {
+                        "try": {
+                            "do": [{"use": {"id": "helper"}}],
+                            "finally": [
+                                {
+                                    "call": {
+                                        "device": "${cleanup_device}",
+                                        "action": "cleanup",
+                                    }
+                                }
+                            ],
+                        }
+                    }
+                ],
+            }
+        )
+        runtime = SequencerRuntime(
+            call_device=call_device,
+            get_telemetry=lambda d, s: None,
+            set_stream_context=lambda *a: None,
+            resolve_use=lambda sequence_id: {"helper": helper}[sequence_id],
+        )
+        runtime.load(main)
+        runtime.start()
+        while runtime.state == "RUNNING":
+            runtime.tick()
+        self.assertEqual(runtime.status()["state"], "ERROR")
+        self.assertEqual(calls, [("dev", "body"), ("parent", "cleanup")])
+
 
 if __name__ == "__main__":
     unittest.main()

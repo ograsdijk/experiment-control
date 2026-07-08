@@ -383,6 +383,38 @@ def _generate_core(
                 serpentine_index=serpentine_index,
             )
         )
+    if "centered_triangle" in gen_spec:
+        params = render_templates(gen_spec["centered_triangle"], env)
+        center = float(params.get("center", 0))
+        span = float(params.get("span", 0))
+        num = int(params.get("num", 1))
+        direction = int(params.get("dir", 1))
+        if num < 3:
+            raise ValueError("centered_triangle.num must be >= 3")
+        if num % 2 == 0:
+            raise ValueError("centered_triangle.num must be odd so the center is included")
+        if direction not in {-1, 1}:
+            raise ValueError("centered_triangle.dir must be 1 or -1")
+        half_span = span / 2.0
+        upper = center + half_span
+        lower = center - half_span
+        first_edge = upper if direction == 1 else lower
+        second_edge = lower if direction == 1 else upper
+        edge_to_edge = list(np.linspace(first_edge, second_edge, num))
+        center_index = num // 2
+        center_to_first_edge = list(reversed(edge_to_edge[: center_index + 1]))
+        second_edge_to_center = list(reversed(edge_to_edge[center_index:]))
+        values = center_to_first_edge + edge_to_edge + second_edge_to_center
+        return _wrap_scalar_records(
+            _apply_modifiers(
+                values,
+                offset=offset_val,
+                shuffle=shuffle,
+                seed=seed,
+                serpentine=serpentine,
+                serpentine_index=serpentine_index,
+            )
+        )
     if "logspace" in gen_spec:
         params = render_templates(gen_spec["logspace"], env)
         start = float(params.get("start", 0))
@@ -434,5 +466,5 @@ def _generate_core(
 
     raise ValueError(
         "gen spec must include one of "
-        "range/linspace/triangle/logspace/geomspace/values/scan2d"
+        "range/linspace/triangle/centered_triangle/logspace/geomspace/values/scan2d"
     )

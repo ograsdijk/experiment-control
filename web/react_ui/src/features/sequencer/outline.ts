@@ -35,7 +35,7 @@ import {
   seqLength,
 } from "./yaml_detail";
 
-const STEP_CONTAINER_KEYS = new Set(["steps", "do", "then", "else"]);
+const STEP_CONTAINER_KEYS = new Set(["steps", "do", "then", "else", "finally"]);
 const STEP_ITEM_PATTERN = /^(\s*)-\s*([A-Za-z_][A-Za-z0-9_]*)\s*:(.*)$/;
 const CONTAINER_PATTERN = /^(\s*)([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(?:#.*)?$/;
 const TOP_LEVEL_KEY_PATTERN = /^([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(.*)$/;
@@ -44,6 +44,7 @@ const FOR_GENERATOR_KINDS = new Set([
   "range",
   "linspace",
   "triangle",
+  "centered_triangle",
   "logspace",
   "geomspace",
   "values",
@@ -139,8 +140,11 @@ function parseCallDetail(snippet: string): SequencerCallDetail {
   const step = readStep(snippet);
   const body = step?.body ?? null;
   const src = step?.src ?? snippet;
+  const process = scalarField(body, "process", src);
   return {
+    targetKind: process !== null ? "process" : "device",
     device: scalarField(body, "device", src),
+    process,
     action: scalarField(body, "action", src),
     params: sectionEntries(body, "params", src),
   };
@@ -356,12 +360,13 @@ function deriveSummary(
   const inline = compactText(inlineRemainder.replace(/^#.*$/, "").trim());
 
   if (kind === "call" && node.callDetail) {
-    const { device, action } = node.callDetail;
-    if (device && action) {
-      return `${device}.${action}`;
+    const { device, process, action } = node.callDetail;
+    const target = device || process;
+    if (target && action) {
+      return `${target}.${action}`;
     }
-    if (device || action) {
-      return device || action;
+    if (target || action) {
+      return target || action;
     }
   }
   if (kind === "sleep") {
@@ -671,7 +676,9 @@ export function buildSequencerStepOutline(
       endLine: flatNode.endIndex + 1,
       indent: flatNode.indent,
       branchLabel:
-        flatNode.containerKey === "then" || flatNode.containerKey === "else"
+        flatNode.containerKey === "then" ||
+        flatNode.containerKey === "else" ||
+        flatNode.containerKey === "finally"
           ? flatNode.containerKey
           : null,
       summary: null,

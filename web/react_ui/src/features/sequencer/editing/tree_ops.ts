@@ -66,6 +66,16 @@ export function listChildInsertionTargets(
     }
     return targets;
   }
+  if (node.kind === "try") {
+    const targets: ChildInsertionTarget[] = [];
+    if (findContainerInsertion(node.snippet, "do")) {
+      targets.push({ key: "do", label: "body" });
+    }
+    if (findContainerInsertion(node.snippet, "finally")) {
+      targets.push({ key: "finally", label: "finally" });
+    }
+    return targets;
+  }
   return [];
 }
 

@@ -7,7 +7,7 @@ This document explains how the sequencer YAML is parsed and executed by
 - YAML describes a sequence of steps executed sequentially.
 - Variables are defined in `vars` and are visible to templates.
 - Templates use `${...}` with a restricted expression evaluator.
-- Control flow: `for`, `repeat`, `while`, `if`, `atomic`, `pause`, `assign`, `use`.
+- Control flow: `for`, `repeat`, `while`, `if`, `try`, `atomic`, `pause`, `assign`, `use`.
 - `for` loops iterate over records and bind selected fields into local names.
 - Timing: `sleep`, `wait_until`.
 - Device I/O: `set`, `call`.
@@ -70,7 +70,7 @@ steps:
 ## Step types
 
 ### `call`
-Call a device RPC action.
+Call a device or process RPC action.
 ```yaml
 - call:
     device: yag
@@ -83,6 +83,10 @@ Call a device RPC action.
 ```
 
 Notes:
+- Use exactly one of `device` or `process`.
+- `device`, `process`, `action`, and `params` are rendered as templates at runtime,
+  so generic sequences can use targets such as `device: ${synth_device}` and
+  `action: ${set_frequency_action}`.
 - `save_as` stores the full response envelope in a variable.
 - `extract` and `assign` are mutually exclusive.
 - `extract` pulls a single value from `resp.result`.
@@ -120,6 +124,15 @@ Example using telemetry:
 ```yaml
 - assign:
     last_lock: {telemetry: {device: laser, signal: lock_error_hz}}
+```
+
+Example using a templated call source:
+```yaml
+- assign:
+    freq_center_hz:
+      call:
+        device: ${synth_device}
+        action: ${get_frequency_action}
 ```
 
 ### `sleep`
@@ -209,6 +222,24 @@ Repeat a block N times.
     do:
       - call: {device: yag, action: fire}
 ```
+
+### `try`
+Run cleanup steps even when the protected body fails, times out, is stopped, or
+is interrupted by an external sequencer fault.
+```yaml
+- try:
+    do:
+      - call: {device: bigsky_yag, action: start_qswitch}
+      - call: {device: pxie5171, action: stream__read_waveform_frame}
+    finally:
+      - call: {device: bigsky_yag, action: stop_qswitch}
+      - call: {device: bigsky_yag, action: stop_flashlamp}
+```
+
+Notes:
+- There is no `except`; the original failure still fails the run.
+- `pause` does not run `finally`; resuming continues the protected body.
+- Cleanup failures set the run to `ERROR` and preserve the original error context.
 
 ### `use`
 Run another sequence from the configured sequence library.
@@ -326,6 +357,7 @@ Supported generators (exactly one):
 - `range: {start, stop, step}`
 - `linspace: {start, stop, num}`
 - `triangle: {start, stop, num}` (forward linspace + reverse linspace; total `2*num` points)
+- `centered_triangle: {center, span, num, dir}` (`num` odd points across the full span; `dir: 1` goes `center -> high -> low -> center`, `dir: -1` goes `center -> low -> high -> center`; default `dir` is `1`; total `2*num + 1` points)
 - `logspace: {start, stop, num, base?}`
 - `geomspace: {start, stop, num}`
 - `values: [...]`

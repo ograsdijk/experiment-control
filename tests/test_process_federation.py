@@ -412,6 +412,36 @@ class SequencerProcessAddressingTests(unittest.TestCase):
         self.assertEqual(calls["device"], [("d", "act", {})])
         self.assertEqual(calls["process"], [])
 
+    def test_call_step_renders_templated_device_and_action(self) -> None:
+        rt, calls = self._runtime()
+        rt.load(
+            parse_sequence(
+                {
+                    "version": 1,
+                    "vars": {"dev": "d", "act": "templated_act"},
+                    "steps": [
+                        {
+                            "call": {
+                                "device": "${dev}",
+                                "action": "${act}",
+                                "params": {"value": "${1 + 2}"},
+                            }
+                        }
+                    ],
+                }
+            )
+        )
+        rt.start()
+        while rt.state == "RUNNING":
+            rt.tick()
+        self.assertEqual(calls["device"], [("d", "templated_act", {"value": 3})])
+
+    def test_assign_call_renders_templated_process_and_action(self) -> None:
+        rt, calls = self._runtime()
+        rt._vars = {"proc": "spb", "act": "mw.retune"}
+        rt._resolve_value({"call": {"process": "${proc}", "action": "${act}"}})
+        self.assertEqual(calls["process"], [("spb", "mw.retune", {})])
+
     def test_resolve_value_telemetry_process(self) -> None:
         rt, _ = self._runtime()
         value = rt._resolve_value(
