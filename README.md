@@ -12,7 +12,7 @@ This README focuses on the YAML-driven stack workflow, using the no-hardware
 
 ## Examples
 
-All examples are YAML-driven stacks (`stack.yaml` + `devices/` + `processes/`),
+Most examples are YAML-driven stacks (`stack.yaml` + `devices/` + `processes/`),
 the same shape used by deployed instances.
 
 - `examples/dummy_stack` - minimal, no-hardware starting point: two dummy devices,
@@ -23,7 +23,11 @@ the same shape used by deployed instances.
   `verify_stream_chunks.py` SHM smoke test.
 - `examples/dummy_frequency_trace_sequencer` - sequencer + stream analysis +
   adaptive scans + measurement schema.
+- `examples/dummy_frequency_trace_sequencer_3ch` - three-channel trace variant
+  with schema-driven measurement metadata, notes, and persisted stream-analysis
+  workspaces.
 - `examples/linien_cli` - real Linien/SynthHD devices (real-hardware example).
+- `examples/nkt_basik_cli` - real NKT BASIK laser example.
 - `examples/federation_dummy` - multi-stack federation (hub mirrors a leaf device).
 - `examples/dummy` - the same dummy setup wired up imperatively in Python
   (`DeviceSpec`/`Manager`), kept as a programmatic-API reference.
@@ -183,6 +187,8 @@ FastAPI serves UI only when `EXPERIMENT_CONTROL_SERVE_UI=1`.
 
 - Built-in packaged UI (default): do not set `EXPERIMENT_CONTROL_UI_DIST`.
 - Custom UI build: set `EXPERIMENT_CONTROL_UI_DIST` to your own dist folder.
+- Default imported UI profile: set `EXPERIMENT_CONTROL_DEFAULT_PROFILE` to a JSON
+  profile file served from `/api/ui/default_profile`.
 - Extra instance UIs: set `EXPERIMENT_CONTROL_EXTRA_UI_JSON` to a JSON list of
   `{ "slug": "...", "label": "...", "dist": "..." }` entries. Each `dist`
   must contain `index.html` and is served at `/instance-ui/{slug}/`.
@@ -279,14 +285,18 @@ For FastAPI, the manager endpoints are taken from env:
 - `EXPERIMENT_CONTROL_MANAGER_PUB`
 - `EXPERIMENT_CONTROL_ROUTER_RPC_HINT` (optional remote/public hint)
 - `EXPERIMENT_CONTROL_MANAGER_PUB_HINT` (optional remote/public hint)
+- `EXPERIMENT_CONTROL_INSTANCE_ID` (optional UI/runtime instance hint)
 - `EXPERIMENT_CONTROL_RPC_TIMEOUT_MS` (router RPC timeout)
 - `EXPERIMENT_CONTROL_RPC_QUEUE_MAX` (gateway request queue bound)
+- `EXPERIMENT_CONTROL_DEVICE_CONNECT_TIMEOUT_MS` (device connect timeout)
 - `EXPERIMENT_CONTROL_STREAM_MAX_PAYLOAD_POINTS` (per-frame truncation cap)
+- `EXPERIMENT_CONTROL_STREAM_MAX_RECORD_EVENTS` (per-frame record event cap)
 - `EXPERIMENT_CONTROL_STREAM_MAX_KEYS` (stream key retention cap)
 - `EXPERIMENT_CONTROL_STREAM_KEY_TTL_S` (stream key idle eviction TTL)
+- `EXPERIMENT_CONTROL_PROCESS_CACHED_CALLS_JSON` (optional cached process RPC targets)
 
 The FastAPI helper scripts (e.g. `run_dummy_stack_fastapi.py`, `run_linien_fastapi.py`)
-set these automatically from stack config.
+set the endpoint and instance-id vars automatically from stack config.
 
 ## Useful Docs
 
@@ -294,7 +304,15 @@ set these automatically from stack config.
 - `docs/protocol.md` - canonical RPC/PUB-SUB protocol (`manager.*` / `manager.processes.*` namespaces)
 - `docs/python_client_sdk.md` - Python SDK for direct stack control
 - `docs/sequencer_config.md` - sequencer configuration
+- `docs/sequencer_visual_editor.md` - visual sequencer editor notes
 - `docs/state_machines.md` - state machine process base/template
+- `docs/interlock.md` - command interlock rules and operation
+- `docs/watchdog.md` - watchdog rules and latching behavior
+- `docs/federation.md` - multi-instance manager federation
+- `docs/composite_devices.md` - logical devices composed from multiple physical devices
+- `docs/influx_writer.md` - telemetry export to InfluxDB
+- `docs/device_spec_reload.md` - runtime device config reload behavior
+- `docs/adaptive_studies.md` - adaptive scan/study notes
 
 ## Troubleshooting
 
