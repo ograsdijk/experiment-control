@@ -36,6 +36,7 @@ import {
   workspaceOutputOptionsByKind,
   workspaceXAxisLabel,
 } from "../stream/workspace";
+import { rawStreamSubscriptionKey } from "../telemetry/rawStreamHydration";
 import { usePanels } from "./PanelsContext";
 
 /**
@@ -263,17 +264,7 @@ export function usePanelDerivations() {
         ),
       ];
       for (const channelIndex of channels) {
-        const key = [
-          panel.stream.deviceId,
-          panel.stream.stream,
-          String(channelIndex),
-          traceDecimator,
-          String(traceMaxPoints),
-          traceMaxFps.toFixed(3),
-          String(rollingWindow),
-          averageMode,
-        ].join("|");
-        out.set(key, {
+        const subscription = {
           deviceId: panel.stream.deviceId,
           stream: panel.stream.stream,
           channelIndex,
@@ -282,7 +273,8 @@ export function usePanelDerivations() {
           traceMaxFps,
           rollingWindow,
           averageMode,
-        });
+        };
+        out.set(rawStreamSubscriptionKey(subscription), subscription);
       }
     }
     return [...out.values()].sort((a, b) => {
