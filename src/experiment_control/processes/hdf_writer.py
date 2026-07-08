@@ -473,7 +473,11 @@ class HdfWriter(ManagedProcessBase):
         self._context_columns_missing: dict[str, Any] = {}
         self._context_columns_source: str | None = None
         self._context_columns_ready = False
-        self._context_columns_fetch_attempted = False
+        self._cached_context_columns_spec: dict[str, str] | None = None
+        self._cached_context_columns_no_spec = False
+        self._context_columns_next_status_fetch_mono = 0.0
+        self._unprojected_context_fields: set[str] = set()
+        self._unprojected_context_rows_total = 0
         self._sequencer_process_id = "sequencer"
         self._seen_context_ids: set[int] = set()
         # Context-table rows buffered on the main drain thread (dedup'd via
@@ -1974,7 +1978,8 @@ class HdfWriter(ManagedProcessBase):
             "context_columns_missing": self._context_columns_missing,
             "context_columns_source": self._context_columns_source,
             "context_columns_ready": self._context_columns_ready,
-            "context_columns_fetch_attempted": self._context_columns_fetch_attempted,
+            "unprojected_context_fields": self._unprojected_context_fields,
+            "unprojected_context_rows_total": self._unprojected_context_rows_total,
             "seen_context_ids": self._seen_context_ids,
             "datasets": self._datasets,
             "device_map": self._device_map,
@@ -2027,7 +2032,10 @@ class HdfWriter(ManagedProcessBase):
         self._context_columns_missing = state["context_columns_missing"]
         self._context_columns_source = state["context_columns_source"]
         self._context_columns_ready = state["context_columns_ready"]
-        self._context_columns_fetch_attempted = state["context_columns_fetch_attempted"]
+        self._unprojected_context_fields = state["unprojected_context_fields"]
+        self._unprojected_context_rows_total = int(
+            state["unprojected_context_rows_total"]
+        )
         self._seen_context_ids = state["seen_context_ids"]
         self._datasets = state["datasets"]
         self._device_map = state["device_map"]
@@ -2084,7 +2092,8 @@ class HdfWriter(ManagedProcessBase):
         self._context_columns_missing = {}
         self._context_columns_source = None
         self._context_columns_ready = False
-        self._context_columns_fetch_attempted = False
+        self._unprojected_context_fields = set()
+        self._unprojected_context_rows_total = 0
         self._seen_context_ids = set()
         self._pending_context_rows = []
         self._datasets = {}
@@ -2184,6 +2193,7 @@ class HdfWriter(ManagedProcessBase):
             dtype=_context_table_dtype(),
             chunks=(1024,),
         )
+        self._ensure_context_columns({})
 
         if load_manager_state:
             schema = self._fetch_schema_with_backoff(timeout_s=5.0)
@@ -2847,6 +2857,9 @@ class HdfWriter(ManagedProcessBase):
                     message = f"{message}; {snapshot_error}"
                 else:
                     message = snapshot_error
+        if ok and event in {"load_ok", "start"}:
+            self._update_cached_context_columns_from_lifecycle(msg)
+            self._ensure_context_columns({})
 
         self._append_sequencer_event_row(
             t_wall=t_wall,
@@ -4282,19 +4295,39 @@ class HdfWriter(ManagedProcessBase):
         if self._context_columns_ready:
             return
 
-        spec = self._fetch_context_columns_spec()
-        if spec is not None:
-            self._init_context_columns_from_spec(spec, source="explicit")
+        if self._cached_context_columns_spec is not None:
+            self._init_context_columns_from_spec(
+                self._cached_context_columns_spec,
+                source="explicit",
+                backfill_existing=True,
+            )
             return
 
-        if fields:
+        if self._cached_context_columns_no_spec and not fields:
+            return
+
+        self._fetch_context_columns_spec()
+        if self._cached_context_columns_spec is not None:
+            self._init_context_columns_from_spec(
+                self._cached_context_columns_spec,
+                source="explicit",
+                backfill_existing=True,
+            )
+            return
+
+        if self._cached_context_columns_no_spec and fields:
             spec = self._infer_context_columns_from_fields(fields)
-            self._init_context_columns_from_spec(spec, source="auto")
+            self._init_context_columns_from_spec(
+                spec,
+                source="auto",
+                backfill_existing=True,
+            )
 
     def _fetch_context_columns_spec(self) -> dict[str, str] | None:
-        if self._context_columns_fetch_attempted:
+        now = time.monotonic()
+        if now < self._context_columns_next_status_fetch_mono:
             return None
-        self._context_columns_fetch_attempted = True
+        self._context_columns_next_status_fetch_mono = now + 1.0
         try:
             resp = _manager_rpc(
                 self._ctx,
@@ -4318,7 +4351,30 @@ class HdfWriter(ManagedProcessBase):
         result = resp.get("result")
         if not isinstance(result, dict):
             return None
-        return self._normalize_context_columns_spec(result.get("context_columns"))
+        if not result.get("loaded"):
+            return None
+        if "context_columns" not in result:
+            return None
+        spec = self._normalize_context_columns_spec(result.get("context_columns"))
+        if spec:
+            self._cached_context_columns_spec = spec
+            self._cached_context_columns_no_spec = False
+            return spec
+        self._cached_context_columns_spec = None
+        self._cached_context_columns_no_spec = True
+        return None
+
+    def _update_cached_context_columns_from_lifecycle(self, msg: Json) -> None:
+        payload = msg.get("payload")
+        if not isinstance(payload, dict) or "context_columns" not in payload:
+            return
+        spec = self._normalize_context_columns_spec(payload.get("context_columns"))
+        if spec:
+            self._cached_context_columns_spec = spec
+            self._cached_context_columns_no_spec = False
+            return
+        self._cached_context_columns_spec = None
+        self._cached_context_columns_no_spec = True
 
     def _normalize_context_columns_spec(self, raw: Any) -> dict[str, str] | None:
         if raw is None:
@@ -4347,12 +4403,18 @@ class HdfWriter(ManagedProcessBase):
         return spec
 
     def _init_context_columns_from_spec(
-        self, spec: dict[str, str], *, source: str
+        self,
+        spec: dict[str, str],
+        *,
+        source: str,
+        backfill_existing: bool = False,
     ) -> None:
         self._assert_h5_locked()
         if self._context_table_group is None or self._context_table_ds is None:
             return
         if self._context_columns_ready:
+            return
+        if not spec:
             return
 
         self._context_columns_ready = True
@@ -4360,8 +4422,12 @@ class HdfWriter(ManagedProcessBase):
         self._context_columns_types = dict(spec)
         self._context_columns_group = self._context_table_group.require_group("columns")
         self._context_columns_group.attrs["source"] = source
+        self._context_columns_group.attrs["canonical"] = False
         try:
             self._context_table_group.attrs["context_columns_json"] = json.dumps(spec)
+            self._context_table_group.attrs["canonical_context"] = (
+                "/context_table/data.fields_json"
+            )
         except Exception:
             pass
 
@@ -4395,15 +4461,55 @@ class HdfWriter(ManagedProcessBase):
                 ds.attrs["encoding"] = "0=false,1=true,255=missing"
             self._context_columns_datasets[name] = ds
             self._context_columns_missing[name] = missing
+        if backfill_existing and current_len:
+            self._backfill_context_columns(current_len)
+
+    def _backfill_context_columns(self, current_len: int) -> None:
+        if self._context_table_ds is None:
+            return
+        for index in range(current_len):
+            row = self._context_table_ds[index]
+            fields_json = row["fields_json"]
+            if isinstance(fields_json, bytes):
+                fields_json = fields_json.decode("utf-8", errors="replace")
+            try:
+                fields = json.loads(str(fields_json))
+            except Exception:
+                fields = {}
+            if isinstance(fields, dict):
+                self._record_unprojected_context_fields(fields)
+                self._write_context_columns_at(index, fields)
 
     def _append_context_columns(self, index: int, fields: dict[str, Any]) -> None:
         self._assert_h5_locked()
         if not self._context_columns_datasets:
             return
+        self._record_unprojected_context_fields(fields)
+        self._write_context_columns_at(index, fields)
+
+    def _write_context_columns_at(self, index: int, fields: dict[str, Any]) -> None:
         for name, ds in self._context_columns_datasets.items():
             ds.resize((index + 1,))
             raw = fields.get(name)
             ds[index] = self._coerce_context_value(name, raw)
+
+    def _record_unprojected_context_fields(self, fields: dict[str, Any]) -> None:
+        extra = {str(name) for name in fields if name not in self._context_columns_datasets}
+        if not extra:
+            return
+        self._unprojected_context_fields.update(extra)
+        self._unprojected_context_rows_total += 1
+        if self._context_table_group is None:
+            return
+        try:
+            self._context_table_group.attrs["unprojected_context_fields_json"] = (
+                json.dumps(sorted(self._unprojected_context_fields))
+            )
+            self._context_table_group.attrs["unprojected_context_rows_total"] = (
+                self._unprojected_context_rows_total
+            )
+        except Exception:
+            pass
 
     def _coerce_context_value(self, name: str, value: Any) -> Any:
         return coerce_context_value(

@@ -1017,21 +1017,24 @@ class HdfWriterContextColumnTests(unittest.TestCase):
             event_log_mode="all",
         )
 
+    def _configure_writer(self, writer: HdfWriter, h5: h5py.File) -> None:
+        meta = writer._build_measurement_metadata(  # noqa: SLF001
+            profile_id=None, values=None, require_profile=False
+        )
+        writer._configure_active_file(  # noqa: SLF001
+            h5,
+            write_every_s=1.0,
+            load_manager_state=False,
+            measurement_meta=meta,
+        )
+
     def test_bool_context_column_uses_uint8_encoding(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             writer = self._make_writer(str(root))
             h5_path = root / "bool_context.h5"
             with h5py.File(h5_path, "w") as h5:
-                meta = writer._build_measurement_metadata(  # noqa: SLF001
-                    profile_id=None, values=None, require_profile=False
-                )
-                writer._configure_active_file(  # noqa: SLF001
-                    h5,
-                    write_every_s=1.0,
-                    load_manager_state=False,
-                    measurement_meta=meta,
-                )
+                self._configure_writer(writer, h5)
                 writer._init_context_columns_from_spec(  # noqa: SLF001
                     {"flag": "bool"},
                     source="explicit",
@@ -1052,15 +1055,7 @@ class HdfWriterContextColumnTests(unittest.TestCase):
             writer = self._make_writer(str(root))
             h5_path = root / "bool_context_coerce.h5"
             with h5py.File(h5_path, "w") as h5:
-                meta = writer._build_measurement_metadata(  # noqa: SLF001
-                    profile_id=None, values=None, require_profile=False
-                )
-                writer._configure_active_file(  # noqa: SLF001
-                    h5,
-                    write_every_s=1.0,
-                    load_manager_state=False,
-                    measurement_meta=meta,
-                )
+                self._configure_writer(writer, h5)
                 writer._init_context_columns_from_spec(  # noqa: SLF001
                     {"flag": "bool"},
                     source="explicit",
@@ -1068,6 +1063,137 @@ class HdfWriterContextColumnTests(unittest.TestCase):
                 self.assertEqual(int(writer._coerce_context_value("flag", True)), 1)  # noqa: SLF001
                 self.assertEqual(int(writer._coerce_context_value("flag", False)), 0)  # noqa: SLF001
                 self.assertEqual(int(writer._coerce_context_value("flag", None)), 255)  # noqa: SLF001
+
+    def test_context_columns_from_lifecycle_backfill_existing_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            writer = self._make_writer(str(root))
+            h5_path = root / "context_lifecycle_backfill.h5"
+            with h5py.File(h5_path, "w") as h5:
+                self._configure_writer(writer, h5)
+                writer._write_context_rows_batch(  # noqa: SLF001
+                    [
+                        {
+                            "context_id": 1,
+                            "fields": {"freq_step_index": 3, "extra": 10},
+                            "ts_wall_ns": 11,
+                            "ts_mono_ns": 12,
+                        }
+                    ]
+                )
+                self.assertFalse(writer._context_columns_ready)  # noqa: SLF001
+
+                writer._handle_sequencer_lifecycle_locked(  # noqa: SLF001
+                    {
+                        "event": "load_ok",
+                        "ok": True,
+                        "payload": {
+                            "context_columns": {"freq_step_index": "int64"}
+                        },
+                        "ts": {"t_wall": 1.0, "t_mono": 2.0},
+                    }
+                )
+
+                ds = h5["context_table/columns/freq_step_index"]
+                self.assertEqual(ds.dtype, np.dtype("int64"))
+                self.assertEqual(list(ds[...]), [3])
+                self.assertEqual(_as_text(ds.attrs["dtype"]), "int64")
+                self.assertEqual(_as_text(h5["context_table/columns"].attrs["source"]), "explicit")
+                self.assertEqual(
+                    json.loads(
+                        _as_text(
+                            h5["context_table"].attrs[
+                                "unprojected_context_fields_json"
+                            ]
+                        )
+                    ),
+                    ["extra"],
+                )
+
+    def test_context_columns_status_fallback_uses_loaded_schema(self) -> None:
+        def fake_rpc(*args: object, **kwargs: object) -> dict[str, object]:
+            return {
+                "ok": True,
+                "result": {
+                    "loaded": True,
+                    "context_columns": {"freq_step_index": "int64"},
+                },
+            }
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            writer = self._make_writer(str(root))
+            h5_path = root / "context_status_fallback.h5"
+            with patch.object(hdf_writer_module, "_manager_rpc", fake_rpc):
+                with h5py.File(h5_path, "w") as h5:
+                    self._configure_writer(writer, h5)
+                    writer._write_context_rows_batch(  # noqa: SLF001
+                        [
+                            {
+                                "context_id": 1,
+                                "fields": {"freq_step_index": 4},
+                                "ts_wall_ns": 11,
+                                "ts_mono_ns": 12,
+                            }
+                        ]
+                    )
+
+                    ds = h5["context_table/columns/freq_step_index"]
+                    self.assertEqual(ds.dtype, np.dtype("int64"))
+                    self.assertEqual(list(ds[...]), [4])
+                    self.assertEqual(_as_text(h5["context_table/columns"].attrs["source"]), "explicit")
+
+    def test_context_columns_do_not_auto_infer_before_sequence_loaded(self) -> None:
+        def fake_rpc(*args: object, **kwargs: object) -> dict[str, object]:
+            return {"ok": True, "result": {"loaded": False}}
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            writer = self._make_writer(str(root))
+            h5_path = root / "context_no_sequence.h5"
+            with patch.object(hdf_writer_module, "_manager_rpc", fake_rpc):
+                with h5py.File(h5_path, "w") as h5:
+                    self._configure_writer(writer, h5)
+                    writer._write_context_rows_batch(  # noqa: SLF001
+                        [
+                            {
+                                "context_id": 1,
+                                "fields": {"freq_step_index": 4},
+                                "ts_wall_ns": 11,
+                                "ts_mono_ns": 12,
+                            }
+                        ]
+                    )
+
+                    self.assertIn("data", h5["context_table"])
+                    self.assertNotIn("columns", h5["context_table"])
+
+    def test_context_columns_auto_infer_when_loaded_sequence_has_no_spec(self) -> None:
+        def fake_rpc(*args: object, **kwargs: object) -> dict[str, object]:
+            return {"ok": True, "result": {"loaded": True, "context_columns": None}}
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            writer = self._make_writer(str(root))
+            h5_path = root / "context_auto_no_spec.h5"
+            with patch.object(hdf_writer_module, "_manager_rpc", fake_rpc):
+                with h5py.File(h5_path, "w") as h5:
+                    self._configure_writer(writer, h5)
+                    writer._write_context_rows_batch(  # noqa: SLF001
+                        [
+                            {
+                                "context_id": 1,
+                                "fields": {"freq_step_index": 4},
+                                "ts_wall_ns": 11,
+                                "ts_mono_ns": 12,
+                            }
+                        ]
+                    )
+
+                    ds = h5["context_table/columns/freq_step_index"]
+                    self.assertEqual(ds.dtype, np.dtype("float64"))
+                    self.assertEqual(list(ds[...]), [4.0])
+                    self.assertEqual(_as_text(h5["context_table/columns"].attrs["source"]), "auto")
 
 
 class HdfWriterCompressionTests(unittest.TestCase):
