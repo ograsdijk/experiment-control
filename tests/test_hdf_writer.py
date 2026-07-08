@@ -1365,16 +1365,18 @@ class HdfWriterMetadataConsolidationTests(unittest.TestCase):
                 lambda timeout_s=5.0: [config_payload]
             )
 
+            import experiment_control.processes.hdf_writer as hw
+
             calls: list[tuple[str, str]] = []
 
             def _fake_call(
                 *, device_id: str, action: str, timeout_ms: int = 1200
-            ) -> object | None:
+            ) -> object:
                 _ = timeout_ms
                 calls.append((device_id, action))
-                return None
+                return hw._OptionalDeviceActionResult(ok=True)  # noqa: SLF001
 
-            writer._call_optional_device_action = _fake_call  # type: ignore[method-assign]  # noqa: SLF001
+            writer._call_optional_device_action_result = _fake_call  # type: ignore[method-assign]  # noqa: SLF001
 
             h5_path = root / "runtime_meta_merge.h5"
             with h5py.File(h5_path, "w") as h5:
@@ -1434,18 +1436,23 @@ class HdfWriterMetadataConsolidationTests(unittest.TestCase):
                 lambda timeout_s=5.0: [local_cfg, remote_cfg]
             )
 
+            import experiment_control.processes.hdf_writer as hw
+
             calls: list[tuple[str, str]] = []
 
             def _fake_call(
                 *, device_id: str, action: str, timeout_ms: int = 1200
-            ) -> object | None:
+            ) -> object:
                 _ = timeout_ms
                 calls.append((device_id, action))
                 if action == "collect_run_metadata" and device_id == "trace1":
-                    return {"frequency_hz": 12_345.0, "mode": "lock"}
-                return None
+                    return hw._OptionalDeviceActionResult(  # noqa: SLF001
+                        ok=True,
+                        result={"frequency_hz": 12_345.0, "mode": "lock"},
+                    )
+                return hw._OptionalDeviceActionResult(ok=True)  # noqa: SLF001
 
-            writer._call_optional_device_action = _fake_call  # type: ignore[method-assign]  # noqa: SLF001
+            writer._call_optional_device_action_result = _fake_call  # type: ignore[method-assign]  # noqa: SLF001
 
             h5_path = root / "run_meta_on_configure.h5"
             with h5py.File(h5_path, "w") as h5:
@@ -2379,16 +2386,22 @@ class HdfWriterRunMetadataCaptureTests(unittest.TestCase):
         active = [0]
         peak = [0]
 
-        def collect(*, device_id: str, action: str, timeout_ms: int) -> dict:
+        import experiment_control.processes.hdf_writer as hw
+
+        def collect(*, device_id: str, action: str, timeout_ms: int) -> object:
+            _ = action, timeout_ms
             with lock:
                 active[0] += 1
                 peak[0] = max(peak[0], active[0])
             time.sleep(0.3)
             with lock:
                 active[0] -= 1
-            return {"device": device_id}
+            return hw._OptionalDeviceActionResult(  # noqa: SLF001
+                ok=True,
+                result={"device": device_id},
+            )
 
-        writer._call_optional_device_action = collect  # type: ignore[assignment]  # noqa: SLF001
+        writer._call_optional_device_action_result = collect  # type: ignore[assignment]  # noqa: SLF001
         configs = [{"device_id": f"d{i}"} for i in range(4)]
         with _temp_dir() as td:
             with h5py.File(Path(td) / "parallel.h5", "w") as h5:
@@ -2450,12 +2463,17 @@ class HdfWriterRunMetadataCaptureTests(unittest.TestCase):
             lambda **kw: published.append(kw) or True
         )
 
-        def collect(*, device_id: str, action: str, timeout_ms: int) -> dict:
+        import experiment_control.processes.hdf_writer as hw
+
+        def collect(*, device_id: str, action: str, timeout_ms: int) -> object:
             _ = action, timeout_ms
             calls.append(device_id)
-            return {"device": device_id}
+            return hw._OptionalDeviceActionResult(  # noqa: SLF001
+                ok=True,
+                result={"device": device_id},
+            )
 
-        writer._call_optional_device_action = collect  # type: ignore[assignment]  # noqa: SLF001
+        writer._call_optional_device_action_result = collect  # type: ignore[assignment]  # noqa: SLF001
         configs = [
             {"device_id": "online"},
             {"device_id": "unregistered"},
@@ -2507,9 +2525,14 @@ class HdfWriterRunMetadataCaptureTests(unittest.TestCase):
             },
         }
         published: list[dict] = []
-        writer._publish_process_event = (  # type: ignore[method-assign]  # noqa: SLF001
-            lambda **kw: published.append(kw) or True
-        )
+        publish_threads: list[str] = []
+
+        def publish(**kw: object) -> bool:
+            publish_threads.append(threading.current_thread().name)
+            published.append(kw)  # type: ignore[arg-type]
+            return True
+
+        writer._publish_process_event = publish  # type: ignore[method-assign]  # noqa: SLF001
         orig = hw._manager_rpc
         try:
             hw._manager_rpc = (  # type: ignore[assignment]
@@ -2543,12 +2566,20 @@ class HdfWriterRunMetadataCaptureTests(unittest.TestCase):
         self.assertEqual(len(failures), 1)
         self.assertEqual(failures[0]["device_id"], "bad")
         self.assertEqual(failures[0]["reason"], "driver_not_running")
+        self.assertFalse(
+            any(name.startswith("hdf-runmeta") for name in publish_threads)
+        )
 
     def test_capture_run_metadata_does_not_swallow_hdf_write_errors(self) -> None:
+        import experiment_control.processes.hdf_writer as hw
+
         writer = _make_bg_test_writer()
         writer._fetch_run_metadata_status_map = lambda: None  # type: ignore[assignment]  # noqa: SLF001
-        writer._call_optional_device_action = (  # type: ignore[assignment]  # noqa: SLF001
-            lambda **kw: {"device": kw["device_id"]}
+        writer._call_optional_device_action_result = (  # type: ignore[assignment]  # noqa: SLF001
+            lambda **kw: hw._OptionalDeviceActionResult(  # noqa: SLF001
+                ok=True,
+                result={"device": kw["device_id"]},
+            )
         )
 
         def fail_write(msg: dict) -> None:
@@ -2648,11 +2679,17 @@ class HdfWriterRunMetadataCaptureTests(unittest.TestCase):
             lambda **k: [{"device_id": "d0"}, {"device_id": "d1"}]
         )
 
-        def slow_collect(*, device_id: str, action: str, timeout_ms: int) -> dict:
-            time.sleep(2.0)
-            return {"device": device_id, "sample_rate_hz": 1.0}
+        import experiment_control.processes.hdf_writer as hw
 
-        writer._call_optional_device_action = slow_collect  # type: ignore[assignment]  # noqa: SLF001
+        def slow_collect(*, device_id: str, action: str, timeout_ms: int) -> object:
+            _ = action, timeout_ms
+            time.sleep(2.0)
+            return hw._OptionalDeviceActionResult(  # noqa: SLF001
+                ok=True,
+                result={"device": device_id, "sample_rate_hz": 1.0},
+            )
+
+        writer._call_optional_device_action_result = slow_collect  # type: ignore[assignment]  # noqa: SLF001
         thread = _spawn_bg_thread(writer)
         try:
             with _temp_dir() as td:

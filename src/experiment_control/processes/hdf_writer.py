@@ -9,6 +9,7 @@ import time
 import uuid
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Literal, cast
 
@@ -69,6 +70,14 @@ from .process_base import ManagedProcessBase
 Json = dict[str, Any]
 EventLogMode = Literal["all", "failures_only", "none"]
 EVENT_LOG_MODES: tuple[EventLogMode, ...] = ("all", "failures_only", "none")
+
+
+@dataclass(frozen=True)
+class _OptionalDeviceActionResult:
+    ok: bool
+    result: Any | None = None
+    reason: str | None = None
+    error: str | None = None
 
 
 def _default_filename() -> str:
@@ -930,6 +939,20 @@ class HdfWriter(ManagedProcessBase):
         action: str,
         timeout_ms: int = 1200,
     ) -> Any | None:
+        result = self._call_optional_device_action_result(
+            device_id=device_id,
+            action=action,
+            timeout_ms=timeout_ms,
+        )
+        return result.result if result.ok else None
+
+    def _call_optional_device_action_result(
+        self,
+        *,
+        device_id: str,
+        action: str,
+        timeout_ms: int = 1200,
+    ) -> _OptionalDeviceActionResult:
         try:
             resp = _manager_rpc(
                 self._ctx,
@@ -944,20 +967,16 @@ class HdfWriter(ManagedProcessBase):
             )
         except Exception as exc:
             self._bump_error(f"metadata.rpc.{action}")
-            self._report_metadata_target_unavailable(
-                device_id=device_id,
-                action=action,
+            return _OptionalDeviceActionResult(
+                ok=False,
                 reason="rpc_exception",
                 error=str(exc),
             )
-            return None
         if not isinstance(resp, dict):
-            self._report_metadata_target_unavailable(
-                device_id=device_id,
-                action=action,
+            return _OptionalDeviceActionResult(
+                ok=False,
                 reason="invalid_response",
             )
-            return None
         # Device commands are routed through the manager and return the raw
         # driver-runner envelope on success: {"id", "status": "OK", "result"}.
         # Only manager-level failures (unknown_device, driver_not_running, ...)
@@ -969,14 +988,12 @@ class HdfWriter(ManagedProcessBase):
         if ok is None:
             ok = str(resp.get("status", "")).upper() == "OK"
         if not ok:
-            self._report_metadata_target_unavailable(
-                device_id=device_id,
-                action=action,
+            return _OptionalDeviceActionResult(
+                ok=False,
                 reason=self._metadata_rpc_failure_reason(resp),
                 error=self._metadata_rpc_failure_message(resp),
             )
-            return None
-        return resp.get("result")
+        return _OptionalDeviceActionResult(ok=True, result=resp.get("result"))
 
     @staticmethod
     def _is_remote_config(config: Json) -> bool:
@@ -1165,7 +1182,7 @@ class HdfWriter(ManagedProcessBase):
         ) as pool:
             futures = {
                 pool.submit(
-                    self._call_optional_device_action,
+                    self._call_optional_device_action_result,
                     device_id=device_id,
                     action="collect_run_metadata",
                     timeout_ms=timeout_ms,
@@ -1174,10 +1191,25 @@ class HdfWriter(ManagedProcessBase):
             }
             for fut, device_id in futures.items():
                 try:
-                    run_metadata = fut.result()
-                except Exception:
+                    action_result = fut.result()
+                except Exception as exc:
                     self._bump_error("metadata.rpc.collect_run_metadata")
+                    self._report_metadata_target_unavailable(
+                        device_id=device_id,
+                        action="collect_run_metadata",
+                        reason="rpc_exception",
+                        error=str(exc),
+                    )
                     continue
+                if not action_result.ok:
+                    self._report_metadata_target_unavailable(
+                        device_id=device_id,
+                        action="collect_run_metadata",
+                        reason=action_result.reason or "rpc_failed",
+                        error=action_result.error,
+                    )
+                    continue
+                run_metadata = action_result.result
                 if run_metadata is None:
                     continue
                 if not isinstance(run_metadata, dict):
