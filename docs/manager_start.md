@@ -26,16 +26,21 @@ FastAPI reads manager endpoints from environment variables:
 - `EXPERIMENT_CONTROL_MANAGER_PUB` (defaults to `tcp://127.0.0.1:6001`)
 - `EXPERIMENT_CONTROL_ROUTER_RPC_HINT` (optional remote/public hint endpoint)
 - `EXPERIMENT_CONTROL_MANAGER_PUB_HINT` (optional remote/public hint endpoint)
+- `EXPERIMENT_CONTROL_INSTANCE_ID` (optional UI/runtime instance hint)
 - `EXPERIMENT_CONTROL_RPC_TIMEOUT_MS` (defaults to `2000`)
 - `EXPERIMENT_CONTROL_RPC_QUEUE_MAX` (defaults to `1024`)
+- `EXPERIMENT_CONTROL_DEVICE_CONNECT_TIMEOUT_MS` (defaults to `30000`)
 - `EXPERIMENT_CONTROL_STREAM_MAX_PAYLOAD_POINTS` (defaults to `200000`)
+- `EXPERIMENT_CONTROL_STREAM_MAX_RECORD_EVENTS` (defaults to `512`)
 - `EXPERIMENT_CONTROL_STREAM_MAX_KEYS` (defaults to `1024`)
 - `EXPERIMENT_CONTROL_STREAM_KEY_TTL_S` (defaults to `600`)
+- `EXPERIMENT_CONTROL_PROCESS_CACHED_CALLS_JSON` (optional JSON list of cached process RPC targets)
 
 To serve the React UI from FastAPI:
 
 - `EXPERIMENT_CONTROL_SERVE_UI=1`
-- `EXPERIMENT_CONTROL_UI_DIST=<path to web/react_ui/dist>` (optional; defaults to repo `web/react_ui/dist`)
+- `EXPERIMENT_CONTROL_UI_DIST=<path to custom dist>` (optional; defaults to packaged `src/experiment_control/_ui_dist`, then falls back to source-tree `web/react_ui/dist` for development)
+- `EXPERIMENT_CONTROL_DEFAULT_PROFILE=<path to profile JSON>` (optional profile served at `/api/ui/default_profile`)
 - `EXPERIMENT_CONTROL_EXTRA_UI_JSON=<json list>` (optional extra instance UIs served at `/instance-ui/{slug}/`)
 
 Manager error sink env knobs:

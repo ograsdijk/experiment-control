@@ -1,7 +1,7 @@
 [project]
 name = "experiment-control"
 version = "0.2.0"
-description = "Add your description here"
+description = "Experiment control framework with manager orchestration, device drivers, managed processes, TUI, and FastAPI/React UI."
 readme = "README.md"
 authors = [
     { name = "Olivier Grasdijk", email = "o.grasdijk@gmail.com" }
