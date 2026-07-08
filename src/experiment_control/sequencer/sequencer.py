@@ -49,6 +49,7 @@ from .eval import render_templates, to_attrdict
 from .library import SequenceLibrary, SequenceLibraryEntry
 from .ranges import generate_from_gen
 from .runtime import SequencerRuntime
+from .source_info import build_step_source_info
 
 Json = dict[str, Any]
 _EXTERNAL_FAULT_SEVERITIES = {"warning", "error", "critical"}
@@ -92,6 +93,7 @@ _STEP_BODY_CONTAINERS: dict[str, tuple[str, ...]] = {
     "parallel": ("do",),
     "adaptive": ("do",),
     "use": ("do",),
+    "try": ("do", "finally"),
 }
 
 
@@ -297,7 +299,12 @@ class SequencerProcess(ManagedProcessBase):
         source_kind: str,
         active_sequence_id: str | None,
     ) -> None:
-        self._runtime.load(spec)
+        step_source_info = build_step_source_info(
+            spec,
+            source=source,
+            line_map=_build_step_line_map(text),
+        )
+        self._runtime.load(spec, step_source_info=step_source_info)
         self._context_columns = spec.context_columns
         self._loaded_sequence_source = source
         self._loaded_sequence_source_kind = source_kind
@@ -481,9 +488,14 @@ class SequencerProcess(ManagedProcessBase):
             status.get("run_id"),
             status.get("state"),
             status.get("current_step"),
+            json.dumps(status.get("current_step_detail"), sort_keys=True),
+            json.dumps(status.get("error_detail"), sort_keys=True),
+            status.get("cleanup_active"),
             progress.get("completed_steps"),
             progress.get("total_steps"),
             progress.get("percent"),
+            progress.get("total_steps_known"),
+            progress.get("estimate_reason"),
             progress.get("eta_s"),
             progress.get("loop_mode"),
             progress.get("loops_completed"),
@@ -509,6 +521,9 @@ class SequencerProcess(ManagedProcessBase):
             "run_id": status.get("run_id"),
             "state": status.get("state"),
             "current_step": status.get("current_step"),
+            "current_step_detail": status.get("current_step_detail"),
+            "error_detail": status.get("error_detail"),
+            "cleanup_active": status.get("cleanup_active"),
             "loop_mode": status.get("loop_mode"),
             "loops_completed": status.get("loops_completed"),
             "loops_target": status.get("loops_target"),
@@ -2544,6 +2559,7 @@ class SequencerProcess(ManagedProcessBase):
         )
 
     def _rpc_sequencer_loaded_yaml(self, req: Json) -> Json:
+        reload_kind = self._loaded_yaml_reload_kind()
         return self.rpc_ok(
             req,
             result={
@@ -2552,8 +2568,20 @@ class SequencerProcess(ManagedProcessBase):
                 "source_kind": self._loaded_sequence_source_kind,
                 "active_sequence_id": self._active_sequence_id,
                 "text": self._loaded_sequence_text,
+                "reloadable": reload_kind is not None,
+                "reload_kind": reload_kind,
             },
         )
+
+    def _loaded_yaml_reload_kind(self) -> str | None:
+        if self._active_sequence_id:
+            return "library"
+        if self._loaded_sequence_source and self._loaded_sequence_source_kind in {
+            "autoload_path",
+            "path",
+        }:
+            return "path"
+        return None
 
     def _rpc_sequencer_load(self, req: Json) -> Json:
         params = req.get("params", {}) or {}
@@ -2605,11 +2633,12 @@ class SequencerProcess(ManagedProcessBase):
                 extra={"diagnostics": diagnostics},
             )
 
+        source_kind = "path" if path else "rpc"
         self._set_loaded_sequence(
             spec=spec,
             text=seq_text,
             source=source,
-            source_kind="rpc",
+            source_kind=source_kind,
             active_sequence_id=None,
         )
         self._publish_lifecycle_event(

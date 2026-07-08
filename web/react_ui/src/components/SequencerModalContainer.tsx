@@ -2,7 +2,9 @@ import type { ChangeEvent, ReactNode, RefObject } from "react";
 import type {
   SequencerAdaptiveStudyStatus,
   SequencerDiagnostic,
+  SequencerErrorDetail,
   SequencerProgress,
+  SequencerStepDetail,
   SequencerYamlEditorHandle,
 } from "../features/sequencer/types";
 import type { StreamAnalysisWorkspaceConfig } from "../features/stream/types";
@@ -18,6 +20,9 @@ type Props = {
   runtimeState: string;
   loaded: boolean;
   currentStep: string | null;
+  currentStepDetail: SequencerStepDetail | null;
+  errorDetail: SequencerErrorDetail | null;
+  cleanupActive: boolean | null;
   progress: SequencerProgress | null;
   progressPercent: number | null;
   totalSteps: number | null;
@@ -96,6 +101,12 @@ type Props = {
   onValidate: () => Promise<unknown> | void;
   loadBusy: boolean;
   onLoad: () => Promise<unknown> | void;
+  onLoadSelectedLibrary: () => Promise<unknown> | void;
+  yamlDirty: boolean;
+  reloadSourceBusy: boolean;
+  canReloadSource: boolean;
+  reloadSourceLabel: string;
+  onReloadLoadedSource: () => Promise<unknown> | void;
   editorRef: RefObject<SequencerYamlEditorHandle>;
   yamlText: string;
   onYamlTextChange: (value: string) => void;

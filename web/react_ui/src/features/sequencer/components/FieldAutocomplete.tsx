@@ -1,4 +1,5 @@
 import { Autocomplete } from "@mantine/core";
+import { useState } from "react";
 
 type Props = {
   /** Field label (omit for inline/unstyled usage where a label is rendered elsewhere). */
@@ -29,6 +30,7 @@ export function FieldAutocomplete({
   ariaLabel,
   disabled,
 }: Props) {
+  const [dropdownOpened, setDropdownOpened] = useState(false);
   return (
     <Autocomplete
       size="xs"
@@ -40,8 +42,12 @@ export function FieldAutocomplete({
       onChange={onChange}
       error={error}
       disabled={disabled}
+      dropdownOpened={dropdownOpened}
+      onFocus={() => setDropdownOpened(true)}
+      onClick={() => setDropdownOpened(true)}
+      onBlur={() => setDropdownOpened(false)}
       limit={50}
-      comboboxProps={{ withinPortal: false }}
+      comboboxProps={{ withinPortal: true, zIndex: 10000 }}
     />
   );
 }

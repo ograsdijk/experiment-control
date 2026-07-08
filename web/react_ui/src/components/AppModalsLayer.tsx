@@ -379,6 +379,11 @@ export function AppModalsLayer({
         runtimeState={sequencerController.sequencerRuntimeState}
         loaded={sequencerController.sequencerLoaded}
         currentStep={sequencerController.sequencerStatus?.currentStep ?? null}
+        currentStepDetail={
+          sequencerController.sequencerStatus?.currentStepDetail ?? null
+        }
+        errorDetail={sequencerController.sequencerStatus?.errorDetail ?? null}
+        cleanupActive={sequencerController.sequencerStatus?.cleanupActive ?? null}
         progress={sequencerController.sequencerProgress}
         progressPercent={sequencerController.sequencerProgressPercent}
         totalSteps={sequencerController.sequencerTotalSteps}
@@ -432,6 +437,12 @@ export function AppModalsLayer({
         onValidate={sequencerController.validateSequencerYaml}
         loadBusy={sequencerController.sequencerLoadBusy}
         onLoad={sequencerController.loadSequencerYaml}
+        onLoadSelectedLibrary={sequencerController.loadSelectedSequencerLibrary}
+        yamlDirty={sequencerController.sequencerYamlDirty}
+        reloadSourceBusy={sequencerController.sequencerReloadBusy}
+        canReloadSource={sequencerController.sequencerCanReloadSource}
+        reloadSourceLabel={sequencerController.sequencerReloadSourceLabel}
+        onReloadLoadedSource={sequencerController.reloadSequencerLoadedSource}
         editorRef={sequencerController.sequencerEditorRef}
         yamlText={sequencerController.sequencerYamlText}
         onYamlTextChange={sequencerController.onSequencerYamlTextChange}

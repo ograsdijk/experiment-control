@@ -21,8 +21,10 @@ import {
 } from "./diagnostics_jump";
 import {
   formatDurationCompact,
+  normalizeSequencerErrorDetail,
   normalizeSequencerDiagnostics,
   normalizeSequencerProgress,
+  normalizeSequencerStepDetail,
   sameSequencerStatus,
 } from "./utils";
 import {
@@ -48,6 +50,13 @@ type SequencerLibraryEntry = {
   path: string | null;
   source: string | null;
   vars: string[];
+};
+type SequencerLoadedYamlInfo = {
+  source: string | null;
+  sourceKind: string | null;
+  activeSequenceId: string | null;
+  reloadable: boolean;
+  reloadKind: "library" | "path" | null;
 };
 
 export function buildSequencerLoadRequest(
@@ -241,8 +250,18 @@ export function useSequencerController({
   const [sequencerActionBusy, setSequencerActionBusy] = useState(false);
   const [sequencerValidateBusy, setSequencerValidateBusy] = useState(false);
   const [sequencerLoadBusy, setSequencerLoadBusy] = useState(false);
+  const [sequencerReloadBusy, setSequencerReloadBusy] = useState(false);
   const [sequencerLoadedYamlBusy, setSequencerLoadedYamlBusy] = useState(false);
   const [sequencerYamlText, setSequencerYamlText] = useState("");
+  const [sequencerYamlDirty, setSequencerYamlDirty] = useState(false);
+  const [sequencerLoadedYamlInfo, setSequencerLoadedYamlInfo] =
+    useState<SequencerLoadedYamlInfo>({
+      source: null,
+      sourceKind: null,
+      activeSequenceId: null,
+      reloadable: false,
+      reloadKind: null,
+    });
   const [sequencerYamlViewMode, setSequencerYamlViewMode] = useState<
     "edit" | "preview"
   >("preview");
@@ -322,10 +341,13 @@ export function useSequencerController({
               runId: current?.runId ?? null,
               state: current?.state ?? null,
               currentStep: current?.currentStep ?? null,
+              currentStepDetail: current?.currentStepDetail ?? null,
               loopMode: current?.loopMode ?? null,
               loopsCompleted: current?.loopsCompleted ?? null,
               loopsTarget: current?.loopsTarget ?? null,
               error: message ?? code ?? "sequencer.status failed",
+              errorDetail: current?.errorDetail ?? null,
+              cleanupActive: current?.cleanupActive ?? null,
               loaded: current?.loaded ?? null,
               activeSequenceId: current?.activeSequenceId ?? null,
               contextColumns: current?.contextColumns ?? null,
@@ -346,11 +368,14 @@ export function useSequencerController({
           run_id?: unknown;
           state?: unknown;
           current_step?: unknown;
+          current_step_detail?: unknown;
           loop_mode?: unknown;
           loops_completed?: unknown;
           loops_target?: unknown;
           vars?: unknown;
           error?: unknown;
+          error_detail?: unknown;
+          cleanup_active?: unknown;
           loaded?: unknown;
           active_sequence_id?: unknown;
           context_columns?: unknown;
@@ -457,10 +482,18 @@ export function useSequencerController({
             state: typeof result.state === "string" ? result.state : null,
             currentStep:
               typeof result.current_step === "string" ? result.current_step : null,
+            currentStepDetail: normalizeSequencerStepDetail(
+              result.current_step_detail
+            ),
             loopMode,
             loopsCompleted,
             loopsTarget,
             error: typeof result.error === "string" ? result.error : null,
+            errorDetail: normalizeSequencerErrorDetail(result.error_detail),
+            cleanupActive:
+              typeof result.cleanup_active === "boolean"
+                ? result.cleanup_active
+                : null,
             loaded:
               typeof result.loaded === "boolean"
                 ? result.loaded
@@ -497,10 +530,13 @@ export function useSequencerController({
             runId: current?.runId ?? null,
             state: current?.state ?? null,
             currentStep: current?.currentStep ?? null,
+            currentStepDetail: current?.currentStepDetail ?? null,
             loopMode: current?.loopMode ?? null,
             loopsCompleted: current?.loopsCompleted ?? null,
             loopsTarget: current?.loopsTarget ?? null,
             error: message,
+            errorDetail: current?.errorDetail ?? null,
+            cleanupActive: current?.cleanupActive ?? null,
             loaded: current?.loaded ?? null,
             activeSequenceId: current?.activeSequenceId ?? null,
             contextColumns: current?.contextColumns ?? null,
@@ -615,15 +651,38 @@ export function useSequencerController({
         const result = resp.result as {
           loaded?: unknown;
           source?: unknown;
+          source_kind?: unknown;
           active_sequence_id?: unknown;
           text?: unknown;
+          reloadable?: unknown;
+          reload_kind?: unknown;
         };
         const loaded = result.loaded === true;
         const source =
           typeof result.source === "string" && result.source.trim()
             ? result.source
             : null;
+        const sourceKind =
+          typeof result.source_kind === "string" && result.source_kind.trim()
+            ? result.source_kind
+            : null;
+        const activeSequenceId =
+          typeof result.active_sequence_id === "string" &&
+          result.active_sequence_id.trim().length > 0
+            ? result.active_sequence_id
+            : null;
+        const reloadKind =
+          result.reload_kind === "library" || result.reload_kind === "path"
+            ? result.reload_kind
+            : null;
         const text = typeof result.text === "string" ? result.text : null;
+        setSequencerLoadedYamlInfo({
+          source,
+          sourceKind,
+          activeSequenceId,
+          reloadable: result.reloadable === true || reloadKind !== null,
+          reloadKind,
+        });
         setSequencerStatusByProcessId((prev) => {
           const current = prev[processId];
           if (!current) {
@@ -632,11 +691,7 @@ export function useSequencerController({
           const next: SequencerStatus = {
             ...current,
             loadedSource: source,
-            activeSequenceId:
-              typeof result.active_sequence_id === "string" &&
-              result.active_sequence_id.trim().length > 0
-                ? result.active_sequence_id
-                : null,
+            activeSequenceId,
           };
           if (sameSequencerStatus(current, next)) {
             return prev;
@@ -645,6 +700,7 @@ export function useSequencerController({
         });
         if (applyToEditor && loaded && text !== null) {
           setSequencerYamlText(text.replace(/\r\n/g, "\n"));
+          setSequencerYamlDirty(false);
         }
         if (!loaded) {
           setSequencerModalError("No sequence is currently loaded in the sequencer.");
@@ -1119,6 +1175,7 @@ export function useSequencerController({
         const text = (await file.text()).replace(/\r\n/g, "\n");
         setSequencerYamlText(text);
         setSequencerLoadSource("editor");
+        setSequencerYamlDirty(true);
         setSequencerDiagnostics([]);
         setSequencerModalError(null);
         notifications.show({
@@ -1203,7 +1260,7 @@ export function useSequencerController({
     sequencerYamlText,
   ]);
 
-  const loadSequencerYaml = useCallback(async () => {
+  const loadSequencerYamlFrom = useCallback(async (loadSource: SequencerLoadSource) => {
     if (!sequencerProcess || sequencerLoadBusy) {
       return;
     }
@@ -1211,7 +1268,7 @@ export function useSequencerController({
     setSequencerModalError(null);
     try {
       const loadRequest = buildSequencerLoadRequest(
-        sequencerLoadSource,
+        loadSource,
         sequencerSelectedSequenceId,
         sequencerYamlText
       );
@@ -1261,14 +1318,126 @@ export function useSequencerController({
     sequencerLoadBusy,
     sequencerProcess,
     sequencerSelectedSequenceId,
-    sequencerLoadSource,
     sequencerYamlText,
+  ]);
+
+  const loadSequencerYaml = useCallback(
+    async () => loadSequencerYamlFrom("editor"),
+    [loadSequencerYamlFrom]
+  );
+
+  const loadSelectedSequencerLibrary = useCallback(
+    async () => loadSequencerYamlFrom("library"),
+    [loadSequencerYamlFrom]
+  );
+
+  const reloadSequencerLoadedSource = useCallback(async () => {
+    if (!sequencerProcess || sequencerReloadBusy) {
+      return;
+    }
+    const processId = sequencerProcess.process_id;
+    setSequencerReloadBusy(true);
+    setSequencerModalError(null);
+    try {
+      const info = sequencerLoadedYamlInfo;
+      if (info.reloadKind === "library" && info.activeSequenceId) {
+        const reloadResp = await sendProcessCommand(
+          processId,
+          "sequencer.library.reload",
+          {},
+          "sequencer-library-reload"
+        );
+        if (!reloadResp.ok) {
+          const message =
+            reloadResp.error?.message ?? reloadResp.error?.code ?? "Unknown error";
+          setSequencerModalError(message);
+          notifications.show({
+            color: "red",
+            title: "Reload from library failed",
+            message,
+          });
+          return;
+        }
+        const loadResp = await sendProcessCommand(
+          processId,
+          "sequencer.library.load",
+          { sequence_id: info.activeSequenceId },
+          "sequencer-library-load"
+        );
+        if (!loadResp.ok) {
+          const message =
+            loadResp.error?.message ?? loadResp.error?.code ?? "Unknown error";
+          setSequencerModalError(message);
+          notifications.show({
+            color: "red",
+            title: "Reload from library failed",
+            message,
+          });
+          return;
+        }
+        await fetchSequencerLoadedYaml(processId, {
+          applyToEditor: true,
+          silent: true,
+        });
+        await refreshSequencerLibrary(processId, { silent: true });
+        await refreshSequencerStatus(processId);
+        notifications.show({
+          color: "teal",
+          title: "Reloaded from library",
+          message: info.activeSequenceId,
+        });
+        return;
+      }
+      if (info.reloadKind === "path" && info.source) {
+        const resp = await sendProcessCommand(
+          processId,
+          "sequencer.load",
+          { path: info.source },
+          "sequencer-load-path"
+        );
+        if (!resp.ok) {
+          const message = resp.error?.message ?? resp.error?.code ?? "Unknown error";
+          setSequencerModalError(message);
+          notifications.show({
+            color: "red",
+            title: "Reload from source failed",
+            message,
+          });
+          return;
+        }
+        await fetchSequencerLoadedYaml(processId, {
+          applyToEditor: true,
+          silent: true,
+        });
+        await refreshSequencerStatus(processId);
+        notifications.show({
+          color: "teal",
+          title: "Reloaded from source",
+          message: info.source,
+        });
+        return;
+      }
+      setSequencerModalError(
+        "Current sequence has no reloadable library or file source."
+      );
+    } finally {
+      setSequencerReloadBusy(false);
+    }
+  }, [
+    fetchSequencerLoadedYaml,
+    refreshSequencerLibrary,
+    refreshSequencerStatus,
+    sendProcessCommand,
+    sequencerLoadedYamlInfo,
+    sequencerProcess,
+    sequencerReloadBusy,
   ]);
 
   const onSequencerYamlTextChange = useCallback((value: string) => {
     setSequencerYamlText(value);
     setSequencerModalError(null);
     setSequencerLoadSource("editor");
+    setSequencerYamlDirty(true);
   }, []);
 
   const setSequencerSelectedSequenceIdForUi = useCallback(
@@ -1401,6 +1570,18 @@ export function useSequencerController({
     sequencerActionBusy ||
     (sequencerPrimaryAction === "start" &&
       (sequencerStatus?.loaded === false || !sequencerOverrideEvaluation.isValid));
+  const sequencerCanReloadSource =
+    sequencerLoadedYamlInfo.reloadable &&
+    (sequencerLoadedYamlInfo.reloadKind === "library"
+      ? Boolean(sequencerLoadedYamlInfo.activeSequenceId)
+      : sequencerLoadedYamlInfo.reloadKind === "path" &&
+        Boolean(sequencerLoadedYamlInfo.source));
+  const sequencerReloadSourceLabel =
+    sequencerLoadedYamlInfo.reloadKind === "library"
+      ? "Reload from library"
+      : sequencerLoadedYamlInfo.reloadKind === "path"
+        ? "Reload from file"
+        : "Reload from source";
 
   useEffect(() => {
     const loadedAdaptiveIds = sequencerStatus?.loadedAdaptiveIds ?? [];
@@ -1439,6 +1620,10 @@ export function useSequencerController({
     sequencerActionBusy,
     sequencerValidateBusy,
     sequencerLoadBusy,
+    sequencerReloadBusy,
+    sequencerYamlDirty,
+    sequencerCanReloadSource,
+    sequencerReloadSourceLabel,
     sequencerLoadedYamlBusy,
     sequencerYamlText,
     sequencerYamlViewMode,
@@ -1481,5 +1666,7 @@ export function useSequencerController({
     handleSequencerFileInput,
     validateSequencerYaml,
     loadSequencerYaml,
+    loadSelectedSequencerLibrary,
+    reloadSequencerLoadedSource,
   };
 }
