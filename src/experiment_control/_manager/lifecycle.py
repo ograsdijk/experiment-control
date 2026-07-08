@@ -206,9 +206,20 @@ class LifecycleMixin(_MixinBase):
                 self.start_all_drivers()
             if wait_for_registered:
                 self._wait_registered(deadline=deadline, poll_ms=poll_ms)
-            do_connect = bool(connect) if connect is not None else False
-            if do_connect:
-                self.connect_all_devices()
+            if connect is not None:
+                self._emit_log(
+                    severity="warning",
+                    topic="manager.startup.connect_deprecated",
+                    message=(
+                        "startup_sequence(connect=...) is deprecated and ignored; "
+                        "use manager.auto_connect_on_register for startup auto-connect "
+                        "or call connect_all_devices manually"
+                    ),
+                    source_kind="manager",
+                    source_id="manager",
+                    stream="event",
+                    payload={"connect_value": bool(connect)},
+                )
             if wait_for_online:
                 self._wait_online(
                     deadline=deadline,
