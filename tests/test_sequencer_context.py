@@ -134,6 +134,38 @@ class SequencerContextIdTests(unittest.TestCase):
 
 
 class SequencerSetContextRetryTests(unittest.TestCase):
+    def test_start_lifecycle_payload_includes_context_columns(self) -> None:
+        class FakeRuntime:
+            def start(self, **kwargs: object) -> None:
+                self.start_kwargs = kwargs
+
+            def status(self) -> dict[str, object]:
+                return {"run_id": "run-1"}
+
+        process = object.__new__(SequencerProcess)
+        process._runtime = FakeRuntime()
+        process._sequence_library = None
+        process._active_sequence_id = "scan"
+        process._loaded_sequence_source = "scan.yaml"
+        process._context_columns = {"freq_step_index": "int64"}
+        published: list[dict[str, object]] = []
+
+        def capture_lifecycle(**kwargs: object) -> None:
+            published.append(kwargs)
+
+        process._publish_lifecycle_event = capture_lifecycle  # type: ignore[method-assign]
+
+        response = process._rpc_sequencer_start({"params": {}})
+
+        self.assertTrue(response["ok"])
+        self.assertEqual(published[0]["event"], "start")
+        payload = published[0]["payload"]
+        self.assertIsInstance(payload, dict)
+        self.assertEqual(
+            payload.get("context_columns"),  # type: ignore[union-attr]
+            {"freq_step_index": "int64"},
+        )
+
     def test_set_stream_context_retries_transient_error(self) -> None:
         process = object.__new__(SequencerProcess)
         calls: list[tuple[str, str, dict[str, object]]] = []

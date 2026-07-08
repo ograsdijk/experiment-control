@@ -2687,6 +2687,7 @@ class SequencerProcess(ManagedProcessBase):
                 "run_id": self._runtime.status().get("run_id"),
                 "active_sequence_id": self._active_sequence_id,
                 "loaded_source": self._loaded_sequence_source,
+                "context_columns": self._context_columns,
             },
         )
         return self.rpc_ok(req, result={"status": "running"})
