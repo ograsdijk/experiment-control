@@ -13,10 +13,13 @@ export type SequencerStatus = {
   runId: number | null;
   state: string | null;
   currentStep: string | null;
+  currentStepDetail: SequencerStepDetail | null;
   loopMode: string | null;
   loopsCompleted: number | null;
   loopsTarget: number | null;
   error: string | null;
+  errorDetail: SequencerErrorDetail | null;
+  cleanupActive: boolean | null;
   loaded: boolean | null;
   activeSequenceId: string | null;
   contextColumns: Record<string, string> | null;
@@ -32,6 +35,8 @@ export type SequencerProgress = {
   elapsedS: number | null;
   completedSteps: number | null;
   totalSteps: number | null;
+  totalStepsKnown: boolean | null;
+  estimateReason: string | null;
   percent: number | null;
   etaS: number | null;
   stepEwmaS: number | null;
@@ -39,6 +44,28 @@ export type SequencerProgress = {
   loopMode: string | null;
   loopsCompleted: number | null;
   loopsTarget: number | null;
+};
+
+export type SequencerStepDetail = {
+  kind: string | null;
+  summary: string | null;
+  path: string | null;
+  line: number | null;
+  column: number | null;
+  source: string | null;
+  branch: "then" | "else" | "finally" | null;
+  targetKind?: "device" | "process" | null;
+  device?: string | null;
+  process?: string | null;
+  action?: string | null;
+  name?: string | null;
+};
+
+export type SequencerErrorDetail = {
+  message: string;
+  formatted: string;
+  step: SequencerStepDetail | null;
+  cleanupErrors: SequencerErrorDetail[];
 };
 
 export type SequencerDiagnostic = {
@@ -51,6 +78,7 @@ export type SequencerDiagnostic = {
 
 export type SequencerStepOutlineNode = {
   id: string;
+  path: string | null;
   kind: string;
   line: number;
   endLine: number;

@@ -179,7 +179,9 @@ function OutlineRow({
               </Badge>
               {node.branchLabel ? (
                 <Badge size="xs" variant="outline" color="gray">
-                  {node.branchLabel}
+                  {node.branchLabel === "finally"
+                    ? "finally cleanup"
+                    : node.branchLabel}
                 </Badge>
               ) : null}
               {issueCount > 0 ? (

@@ -12,6 +12,7 @@ if str(SRC) not in sys.path:
 
 from experiment_control.sequencer.ast import (
     AssignStep,
+    ForStep,
     RepeatStep,
     SequenceSpec,
     SleepStep,
@@ -99,6 +100,78 @@ class SequencerProgressTests(unittest.TestCase):
         progress = status.get("progress", {})
         self.assertIsNone(progress.get("total_steps"))
         self.assertIsNone(progress.get("percent"))
+        self.assertFalse(progress.get("total_steps_known"))
+        self.assertIn("while", str(progress.get("estimate_reason")))
+
+    def test_progress_unknown_total_reports_template_failure(self) -> None:
+        runtime = _build_runtime()
+        runtime.load(
+            SequenceSpec(
+                version=1,
+                meta={},
+                vars={},
+                steps=[
+                    ForStep(
+                        bind={"value": "x"},
+                        in_expr={
+                            "gen": {
+                                "triangle": {
+                                    "start": "${current_pos}",
+                                    "stop": 4.0,
+                                    "num": 3,
+                                }
+                            }
+                        },
+                        body=[AssignStep(values={"y": "${x}"})],
+                    )
+                ],
+                context_columns=None,
+            )
+        )
+        runtime.start()
+
+        progress = runtime.status().get("progress", {})
+        self.assertIsNone(progress.get("total_steps"))
+        self.assertIsNone(progress.get("percent"))
+        reason = str(progress.get("estimate_reason"))
+        self.assertIn("for generator", reason)
+        self.assertIn("current_pos", reason)
+
+    def test_progress_known_total_for_triangle_generator(self) -> None:
+        runtime = _build_runtime()
+        runtime.load(
+            SequenceSpec(
+                version=1,
+                meta={},
+                vars={},
+                steps=[
+                    ForStep(
+                        bind={"value": "x"},
+                        in_expr={
+                            "gen": {
+                                "triangle": {
+                                    "start": 0.0,
+                                    "stop": 4.0,
+                                    "num": 3,
+                                }
+                            }
+                        },
+                        body=[AssignStep(values={"y": "${x}"})],
+                    )
+                ],
+                context_columns=None,
+            )
+        )
+        runtime.start()
+        while runtime.state == "RUNNING":
+            runtime.tick()
+
+        progress = runtime.status().get("progress", {})
+        self.assertEqual(progress.get("total_steps"), 7)
+        self.assertEqual(progress.get("completed_steps"), 7)
+        self.assertEqual(progress.get("percent"), 100.0)
+        self.assertTrue(progress.get("total_steps_known"))
+        self.assertIsNone(progress.get("estimate_reason"))
 
     def test_eta_hidden_until_min_completed_steps(self) -> None:
         runtime = _build_runtime()

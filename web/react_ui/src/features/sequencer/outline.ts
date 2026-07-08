@@ -644,6 +644,50 @@ function buildStableStepId(
   return `${scope}/${containerKey}:${siblingIndex}:${kind}`;
 }
 
+function buildCanonicalStepPath(
+  parentNode: SequencerStepOutlineNode | null,
+  containerKey: string,
+  siblingIndex: number
+): string {
+  if (!parentNode || containerKey === "steps") {
+    return `steps[${siblingIndex}]`;
+  }
+  const parentPath = parentNode.path ?? parentNode.id;
+  if (containerKey === "then" || containerKey === "else") {
+    return `${parentPath}.if.${containerKey}[${siblingIndex}]`;
+  }
+  if (containerKey === "finally") {
+    return `${parentPath}.try.finally[${siblingIndex}]`;
+  }
+  return `${parentPath}.${parentNode.kind}.${containerKey}[${siblingIndex}]`;
+}
+
+function canonicalChildPrefix(
+  parentNode: SequencerStepOutlineNode,
+  containerKey: string
+): string {
+  const parentPath = parentNode.path ?? parentNode.id;
+  if (containerKey === "then" || containerKey === "else") {
+    return `${parentPath}.if.${containerKey}[`;
+  }
+  if (containerKey === "finally") {
+    return `${parentPath}.try.finally[`;
+  }
+  return `${parentPath}.${parentNode.kind}.${containerKey}[`;
+}
+
+function containerSiblingIndex(
+  parentNode: SequencerStepOutlineNode | null,
+  roots: readonly SequencerStepOutlineNode[],
+  containerKey: string
+): number {
+  if (!parentNode || containerKey === "steps") {
+    return roots.length;
+  }
+  const prefix = canonicalChildPrefix(parentNode, containerKey);
+  return parentNode.children.filter((child) => child.path?.startsWith(prefix)).length;
+}
+
 export function buildSequencerStepOutline(
   yamlText: string
 ): SequencerStepOutlineNode[] {
@@ -662,8 +706,15 @@ export function buildSequencerStepOutline(
 
   for (const flatNode of flatNodes) {
     flatMap.set(flatNode.line, flatNode);
+    while (
+      stack.length > 0 &&
+      flatNode.indent <= stack[stack.length - 1].indent
+    ) {
+      stack.pop();
+    }
+
     const parentNode = stack.length > 0 ? stack[stack.length - 1].node : null;
-    const siblingIndex = parentNode ? parentNode.children.length : roots.length;
+    const siblingIndex = containerSiblingIndex(parentNode, roots, flatNode.containerKey);
     const node: SequencerStepOutlineNode = {
       id: buildStableStepId(
         parentNode?.id ?? null,
@@ -671,6 +722,7 @@ export function buildSequencerStepOutline(
         siblingIndex,
         flatNode.kind
       ),
+      path: buildCanonicalStepPath(parentNode, flatNode.containerKey, siblingIndex),
       kind: flatNode.kind,
       line: flatNode.line,
       endLine: flatNode.endIndex + 1,
@@ -702,13 +754,6 @@ export function buildSequencerStepOutline(
       repeatDetail: null,
       adaptiveDetail: null,
     };
-
-    while (
-      stack.length > 0 &&
-      flatNode.indent <= stack[stack.length - 1].indent
-    ) {
-      stack.pop();
-    }
 
     if (stack.length > 0) {
       stack[stack.length - 1].node.children.push(node);

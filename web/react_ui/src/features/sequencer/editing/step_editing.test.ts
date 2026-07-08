@@ -125,6 +125,35 @@ describe("sequencer editing regressions", () => {
     expect(finallyChildren.map((node) => node.kind)).toEqual(["call", "sleep"]);
   });
 
+  it("computes canonical outline paths for nested branches", () => {
+    const yaml = [
+      "version: 1",
+      "steps:",
+      "  - try:",
+      "      do:",
+      "        - call: {device: fs740, action: body}",
+      "      finally:",
+      "        - call: {device: fs740, action: cleanup}",
+      "  - if:",
+      "      condition: true",
+      "      then:",
+      "        - sleep: 0.1",
+      "      else:",
+      "        - sleep: 0.2",
+      "",
+    ].join("\n");
+    const nodes = flattenSequencerStepOutline(buildSequencerStepOutline(yaml));
+
+    expect(nodes.map((node) => node.path)).toEqual([
+      "steps[0]",
+      "steps[0].try.do[0]",
+      "steps[0].try.finally[0]",
+      "steps[1]",
+      "steps[1].if.then[0]",
+      "steps[1].if.else[0]",
+    ]);
+  });
+
   it("edits set step values without dropping sibling steps", () => {
     const yaml = [
       "version: 1",

@@ -3,6 +3,7 @@
   Badge,
   Button,
   Card,
+  Collapse,
   Group,
   Modal,
   NumberInput,
@@ -34,7 +35,9 @@ import type { StreamAnalysisWorkspaceConfig } from "../features/stream/types";
 import type {
   SequencerAdaptiveStudyStatus,
   SequencerDiagnostic,
+  SequencerErrorDetail,
   SequencerProgress,
+  SequencerStepDetail,
   SequencerYamlEditorHandle,
 } from "../features/sequencer/types";
 import type { CapabilityMember } from "../types";
@@ -70,6 +73,9 @@ type Props = {
   runtimeState: string;
   loaded: boolean;
   currentStep: string | null;
+  currentStepDetail: SequencerStepDetail | null;
+  errorDetail: SequencerErrorDetail | null;
+  cleanupActive: boolean | null;
   progress: SequencerProgress | null;
   progressPercent: number | null;
   totalSteps: number | null;
@@ -131,6 +137,12 @@ type Props = {
   onValidate: () => Promise<unknown> | void;
   loadBusy: boolean;
   onLoad: () => Promise<unknown> | void;
+  onLoadSelectedLibrary: () => Promise<unknown> | void;
+  yamlDirty: boolean;
+  reloadSourceBusy: boolean;
+  canReloadSource: boolean;
+  reloadSourceLabel: string;
+  onReloadLoadedSource: () => Promise<unknown> | void;
   editorRef: RefObject<SequencerYamlEditorHandle>;
   yamlText: string;
   onYamlTextChange: (value: string) => void;
@@ -153,6 +165,9 @@ export function SequencerModal({
   runtimeState,
   loaded,
   currentStep,
+  currentStepDetail,
+  errorDetail,
+  cleanupActive,
   progress,
   progressPercent,
   totalSteps,
@@ -204,6 +219,12 @@ export function SequencerModal({
   onValidate,
   loadBusy,
   onLoad,
+  onLoadSelectedLibrary,
+  yamlDirty,
+  reloadSourceBusy,
+  canReloadSource,
+  reloadSourceLabel,
+  onReloadLoadedSource,
   editorRef,
   yamlText,
   onYamlTextChange,
@@ -217,11 +238,13 @@ export function SequencerModal({
 }: Props) {
   const [showFullYaml, setShowFullYaml] = useState(false);
   const [diagnosticsCollapsed, setDiagnosticsCollapsed] = useState(false);
+  const [controlsCollapsed, setControlsCollapsed] = useState(false);
 
   useEffect(() => {
     if (opened) {
       setShowFullYaml(false);
       setDiagnosticsCollapsed(false);
+      setControlsCollapsed(false);
     }
   }, [opened]);
 
@@ -263,9 +286,31 @@ export function SequencerModal({
               </Badge>
             </Group>
             {currentStep && (
-              <Text size="xs" c="dimmed">
-                Current step: {currentStep}
-              </Text>
+              <Stack gap={2}>
+                <Group gap="xs" wrap="wrap">
+                  <Text size="xs" c="dimmed">
+                    Current step: {currentStepDetail?.summary ?? currentStep}
+                  </Text>
+                  {cleanupActive && (
+                    <Badge size="xs" variant="light" color="yellow">
+                      cleanup/finally
+                    </Badge>
+                  )}
+                </Group>
+                {currentStepDetail && (
+                  <Text size="xs" c="dimmed">
+                    {[
+                      currentStepDetail.line !== null
+                        ? `line ${currentStepDetail.line}`
+                        : null,
+                      currentStepDetail.path,
+                      currentStepDetail.branch,
+                    ]
+                      .filter(Boolean)
+                      .join(" | ")}
+                  </Text>
+                )}
+              </Stack>
             )}
             {progress && (
               <Stack gap={4}>
@@ -275,7 +320,11 @@ export function SequencerModal({
                 <Text size="xs" c="dimmed">
                   {totalSteps !== null
                     ? `Progress: ${completedSteps ?? 0}/${totalSteps} (${(progressPercent ?? 0).toFixed(1)}%)`
-                    : `Completed steps: ${completedSteps ?? 0}`}
+                    : `Completed steps: ${completedSteps ?? 0}${
+                        progress.estimateReason
+                          ? ` | Total unknown: ${progress.estimateReason}`
+                          : ""
+                      }`}
                 </Text>
                 <Text size="xs" c="dimmed">
                   Elapsed: {formatDurationCompact(progress.elapsedS)}
@@ -309,9 +358,24 @@ export function SequencerModal({
               </Text>
             )}
             {statusError && (
-              <Text size="xs" c="red">
-                {statusError}
-              </Text>
+              <Stack gap={2}>
+                <Text size="xs" c="red">
+                  {errorDetail?.formatted ?? statusError}
+                </Text>
+                {errorDetail?.step && (
+                  <Text size="xs" c="dimmed">
+                    {[
+                      errorDetail.step.line !== null
+                        ? `line ${errorDetail.step.line}`
+                        : null,
+                      errorDetail.step.path,
+                      errorDetail.step.branch,
+                    ]
+                      .filter(Boolean)
+                      .join(" | ")}
+                  </Text>
+                )}
+              </Stack>
             )}
             {modalError && (
               <Text size="xs" c="red">
@@ -355,10 +419,58 @@ export function SequencerModal({
         >
           <Stack gap={8}>
             <Group justify="space-between" align="center" wrap="wrap">
-              <Text size="sm" fw={600}>
-                Start mode
+                <Text size="sm" fw={600}>
+                Run controls
               </Text>
-              <Group gap="xs" align="center">
+              <Group gap="xs" align="center" wrap="wrap">
+                <Badge size="xs" variant="light">
+                  {runMode}
+                </Badge>
+                {selectedSequenceId && (
+                  <Badge size="xs" variant="outline" color="gray">
+                    {selectedSequenceId}
+                  </Badge>
+                )}
+                {overrideRows.length > 0 && (
+                  <Badge size="xs" variant="light" color="blue">
+                    {overrideRows.length} override{overrideRows.length === 1 ? "" : "s"}
+                  </Badge>
+                )}
+                {yamlDirty && (
+                  <Badge size="xs" variant="light" color="yellow">
+                    Editor changes not loaded
+                  </Badge>
+                )}
+                <ActionIcon
+                  size="sm"
+                  variant="subtle"
+                  color="gray"
+                  aria-label={
+                    controlsCollapsed ? "Expand run controls" : "Collapse run controls"
+                  }
+                  onClick={() => setControlsCollapsed((prev) => !prev)}
+                >
+                  {controlsCollapsed ? (
+                    <IconChevronRight size={16} />
+                  ) : (
+                    <IconChevronDown size={16} />
+                  )}
+                </ActionIcon>
+              </Group>
+            </Group>
+            <Collapse in={!controlsCollapsed}>
+              <Stack gap={8}>
+                {yamlDirty && (
+                  <Text size="xs" c="yellow">
+                    Editor changes are not loaded into the runtime until you press
+                    Load editor YAML.
+                  </Text>
+                )}
+                <Group justify="space-between" align="center" wrap="wrap">
+                  <Text size="sm" fw={600}>
+                    Start mode
+                  </Text>
+                  <Group gap="xs" align="center">
                 <SegmentedControl
                   size="xs"
                   value={runMode}
@@ -389,7 +501,7 @@ export function SequencerModal({
                   />
                 )}
               </Group>
-            </Group>
+                </Group>
 
             {(libraryConfigured || libraryOptions.length > 0) && (
               <Stack gap={6}>
@@ -397,17 +509,31 @@ export function SequencerModal({
                   <Text size="sm" fw={600}>
                     Sequence library ({libraryEntries.length})
                   </Text>
-                  <Button
-                    size="compact-xs"
-                    variant="subtle"
-                    color="gray"
-                    loading={libraryLoading}
-                    onClick={() => {
-                      void onReloadLibrary();
-                    }}
-                  >
-                    Reload
-                  </Button>
+                  <Group gap="xs">
+                    <Button
+                      size="compact-xs"
+                      variant="subtle"
+                      color="gray"
+                      loading={loadBusy}
+                      disabled={!selectedSequenceId || libraryLoading}
+                      onClick={() => {
+                        void onLoadSelectedLibrary();
+                      }}
+                    >
+                      Load selected library
+                    </Button>
+                    <Button
+                      size="compact-xs"
+                      variant="subtle"
+                      color="gray"
+                      loading={libraryLoading}
+                      onClick={() => {
+                        void onReloadLibrary();
+                      }}
+                    >
+                      Reload
+                    </Button>
+                  </Group>
                 </Group>
                 <Select
                   size="xs"
@@ -625,6 +751,8 @@ export function SequencerModal({
                 }}
               />
             </Stack>
+              </Stack>
+            </Collapse>
           </Stack>
         </Card>
 
@@ -755,10 +883,25 @@ export function SequencerModal({
                 void onLoad();
               }}
             >
-              Load
+              Load editor YAML
+            </Button>
+            <Button
+              size="xs"
+              variant="light"
+              loading={reloadSourceBusy}
+              disabled={!canReloadSource || loadBusy || actionBusy}
+              onClick={() => {
+                void onReloadLoadedSource();
+              }}
+            >
+              {reloadSourceLabel}
             </Button>
           </Group>
         </Group>
+        <Text size="xs" c="dimmed" style={{ flexShrink: 0 }}>
+          Load editor YAML sends the current editor contents. Reload from source
+          discards editor edits and rereads the selected library/file source.
+        </Text>
 
         <SequencerOutlinePane
           yamlText={yamlText}
@@ -779,6 +922,7 @@ export function SequencerModal({
               ? "1 1 clamp(12rem, 24vh, 18rem)"
               : "0 0 auto",
             minHeight: showFullYaml ? "clamp(12rem, 24vh, 18rem)" : 0,
+            overflow: "hidden",
             display: "flex",
             flexDirection: "column",
           }}
@@ -853,11 +997,13 @@ export function SequencerModal({
                   </div>
                 </Stack>
               ) : (
-                <YamlPreview
-                  text={yamlText}
-                  colorScheme={colorScheme}
-                  height="100%"
-                />
+                <div style={{ flex: 1, minHeight: 0, overflow: "hidden" }}>
+                  <YamlPreview
+                    text={yamlText}
+                    colorScheme={colorScheme}
+                    height="100%"
+                  />
+                </div>
               ))}
           </Stack>
         </Card>

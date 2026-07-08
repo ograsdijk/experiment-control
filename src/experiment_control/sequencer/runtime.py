@@ -29,6 +29,7 @@ from .ast import (
 )
 from .eval import eval_condition, render_templates, to_attrdict
 from .ranges import generate_from_gen
+from .source_info import StepSourceInfo, step_kind, step_summary
 
 
 @dataclass
@@ -105,6 +106,12 @@ class _WaitState:
     stable_since: float | None = None
 
 
+@dataclass
+class _StepEstimate:
+    total: int | None
+    reason: str | None = None
+
+
 class _NoStepReady:
     pass
 
@@ -148,14 +155,19 @@ class SequencerRuntime:
         self._pending_terminal_state: str | None = None
         self._pending_terminal_error: str | None = None
         self._cleanup_failed = False
+        self._cleanup_errors: list[dict[str, Any]] = []
         self._sleep_until: float | None = None
         self._wait_state: _WaitState | None = None
         self._adaptive_observe_state: _AdaptiveObserveState | None = None
         self._atomic_depth = 0
         self._current_step: str | None = None
+        self._current_step_detail: dict[str, Any] | None = None
+        self._last_error_detail: dict[str, Any] | None = None
+        self._step_source_info: dict[int, StepSourceInfo] = {}
         self._context_id = -1
         self._analysis_outputs: list[dict[str, Any]] = []
         self._estimated_total_steps: int | None = None
+        self._progress_estimate_reason: str | None = None
         self._completed_steps = 0
         self._step_ewma_s: float | None = None
         self._step_ewma_alpha = 0.2
@@ -209,7 +221,12 @@ class SequencerRuntime:
                 break
         return resolved
 
-    def load(self, spec: SequenceSpec) -> None:
+    def load(
+        self,
+        spec: SequenceSpec,
+        *,
+        step_source_info: dict[int, StepSourceInfo] | None = None,
+    ) -> None:
         if self._state == "RUNNING":
             raise RuntimeError("Cannot load while running")
         self._spec = spec
@@ -220,14 +237,18 @@ class SequencerRuntime:
         self._pause_requested = False
         self._stop_requested = False
         self._last_error = None
+        self._last_error_detail = None
         self._pending_terminal_state = None
         self._pending_terminal_error = None
         self._cleanup_failed = False
+        self._cleanup_errors = []
         self._sleep_until = None
         self._wait_state = None
         self._adaptive_observe_state = None
         self._atomic_depth = 0
         self._current_step = None
+        self._current_step_detail = None
+        self._step_source_info = dict(step_source_info or {})
         self._state = "IDLE"
         self._adaptive_start_modes = {}
         self._loop_mode = "once"
@@ -300,28 +321,38 @@ class SequencerRuntime:
         self._pause_requested = False
         self._stop_requested = False
         self._last_error = None
+        self._last_error_detail = None
         self._pending_terminal_state = None
         self._pending_terminal_error = None
         self._cleanup_failed = False
+        self._cleanup_errors = []
         self._env = {}
         self._sleep_until = None
         self._wait_state = None
         self._adaptive_observe_state = None
         self._atomic_depth = 0
         self._current_step = None
+        self._current_step_detail = None
         self._reset_progress()
         now = time.monotonic()
         self._run_started_mono = now
         self._run_ended_mono = None
-        total_per_loop = self._estimate_total_steps()
+        estimate = self._estimate_total_steps()
+        total_per_loop = estimate.total
         if (
             total_per_loop is not None
             and isinstance(self._loops_target, int)
             and self._loops_target >= 0
         ):
             self._estimated_total_steps = int(total_per_loop) * int(self._loops_target)
+            self._progress_estimate_reason = None
         else:
             self._estimated_total_steps = None
+            self._progress_estimate_reason = (
+                "continuous run has no fixed loop count"
+                if total_per_loop is not None and self._loop_mode == "continuous"
+                else estimate.reason
+            )
         self._state = "RUNNING"
 
     def request_pause(self) -> None:
@@ -361,6 +392,7 @@ class SequencerRuntime:
             "run_id": int(self._run_id),
             "state": effective_state,
             "current_step": self._current_step,
+            "current_step_detail": self._current_step_detail,
             "loop_mode": self._loop_mode,
             "loops_completed": int(self._loops_completed),
             "loops_target": self._loops_target,
@@ -368,6 +400,8 @@ class SequencerRuntime:
             "vars_override": dict(self._vars_override_active),
             "env": dict(self._env),
             "error": self._last_error,
+            "error_detail": self._last_error_detail,
+            "cleanup_active": self._pending_terminal_state is not None,
             "last_context_id": int(self._context_id),
             "next_context_id": int(self._context_id + 1),
             "progress": self._progress_snapshot(time.monotonic()),
@@ -452,6 +486,8 @@ class SequencerRuntime:
                 self._finish_active_step(time.monotonic())
         except Exception as e:
             if not self._handle_runtime_exception(e):
+                if self._last_error_detail is None:
+                    self._last_error_detail = self._make_error_detail(str(e))
                 self._last_error = str(e)
                 self._state = "ERROR"
                 self._run_ended_mono = time.monotonic()
@@ -525,11 +561,17 @@ class SequencerRuntime:
         if self._pending_terminal_state is not None:
             self._note_cleanup_failure(message)
             return True
+        detail = self._make_error_detail(message)
+        self._last_error_detail = detail
         return self._begin_terminal_unwind("ERROR", message)
 
     def _note_cleanup_failure(self, message: str) -> None:
         self._cleanup_failed = True
+        detail = self._make_error_detail(str(message))
+        self._cleanup_errors.append(detail)
         cleanup_message = f"cleanup failed: {message}"
+        if self._last_error_detail is not None:
+            self._last_error_detail["cleanup_errors"] = list(self._cleanup_errors)
         if self._pending_terminal_error:
             if cleanup_message not in self._pending_terminal_error:
                 self._pending_terminal_error = (
@@ -546,10 +588,12 @@ class SequencerRuntime:
         self._pending_terminal_state = state
         self._pending_terminal_error = error
         self._cleanup_failed = False
+        self._cleanup_errors = []
         self._sleep_until = None
         self._wait_state = None
         self._adaptive_observe_state = None
         self._current_step = None
+        self._current_step_detail = None
         return True
 
     def _has_terminal_unwind_work(self) -> bool:
@@ -572,6 +616,8 @@ class SequencerRuntime:
         self._adaptive_observe_state = None
         self._state = "ERROR" if cleanup_failed else str(state or "STOPPED")
         self._last_error = error if self._state == "ERROR" else None
+        if self._state != "ERROR":
+            self._last_error_detail = None
         self._run_ended_mono = time.monotonic()
 
     def _should_continue_run_loops(self) -> bool:
@@ -596,8 +642,10 @@ class SequencerRuntime:
         self._pending_terminal_state = None
         self._pending_terminal_error = None
         self._cleanup_failed = False
+        self._cleanup_errors = []
         self._atomic_depth = 0
         self._current_step = None
+        self._current_step_detail = None
         self._use_stack = []
 
     def _reset_progress(self) -> None:
@@ -610,6 +658,7 @@ class SequencerRuntime:
         self._paused_total_s = 0.0
         self._paused_started_mono = None
         self._active_step_started_elapsed_s = None
+        self._progress_estimate_reason = None
 
     def _mark_pause_started(self, now: float) -> None:
         if self._paused_started_mono is None:
@@ -688,6 +737,8 @@ class SequencerRuntime:
             "elapsed_s": elapsed_s,
             "completed_steps": completed,
             "total_steps": total_out,
+            "total_steps_known": total_out is not None,
+            "estimate_reason": self._progress_estimate_reason,
             "percent": percent,
             "eta_s": eta_s,
             "step_ewma_s": self._step_ewma_s,
@@ -697,28 +748,30 @@ class SequencerRuntime:
             "loops_target": self._loops_target,
         }
 
-    def _estimate_total_steps(self) -> int | None:
+    def _estimate_total_steps(self) -> _StepEstimate:
         if self._spec is None:
-            return None
+            return _StepEstimate(None, "no sequence loaded")
         try:
             env = dict(self._env)
             total = self._estimate_step_list(self._spec.steps, env)
-        except Exception:
-            return None
-        if total is None:
-            return None
-        return max(0, int(total))
+        except Exception as exc:
+            return _StepEstimate(None, f"step estimate failed: {exc}")
+        if total.total is None:
+            return total
+        return _StepEstimate(max(0, int(total.total)), None)
 
-    def _estimate_step_list(self, steps: list[Step], env: dict[str, Any]) -> int | None:
+    def _estimate_step_list(
+        self, steps: list[Step], env: dict[str, Any]
+    ) -> _StepEstimate:
         total = 0
         for step in steps:
             count = self._estimate_step(step, env)
-            if count is None:
-                return None
-            total += int(count)
-        return total
+            if count.total is None:
+                return count
+            total += int(count.total)
+        return _StepEstimate(total)
 
-    def _estimate_step(self, step: Step, env: dict[str, Any]) -> int | None:
+    def _estimate_step(self, step: Step, env: dict[str, Any]) -> _StepEstimate:
         if isinstance(
             step,
             (
@@ -732,15 +785,17 @@ class SequencerRuntime:
                 SetContextStep,
             ),
         ):
-            return 1
+            return _StepEstimate(1)
         if isinstance(step, TryStep):
             body = self._estimate_step_list(step.body, env)
             cleanup = self._estimate_step_list(step.finally_steps, env)
-            if body is None or cleanup is None:
-                return None
-            return 1 + body + cleanup
+            if body.total is None:
+                return body
+            if cleanup.total is None:
+                return cleanup
+            return _StepEstimate(1 + body.total + cleanup.total)
         if isinstance(step, AdaptiveStep):
-            return None
+            return _StepEstimate(None, "adaptive step has unknown trial count")
         if isinstance(step, UseStep):
             spec = self._resolve_use_spec(step.sequence_id)
             merged = self._merged_use_vars(spec, step.args, env=env)
@@ -748,45 +803,53 @@ class SequencerRuntime:
             nested_env.update(merged)
             nested_env["vars"] = to_attrdict(merged)
             inner = self._estimate_step_list(spec.steps, nested_env)
-            if inner is None:
-                return None
-            return 1 + inner
+            if inner.total is None:
+                return inner
+            return _StepEstimate(1 + inner.total)
         if isinstance(step, AtomicStep):
             inner = self._estimate_step_list(step.body, env)
-            if inner is None:
-                return None
-            return 1 + inner
+            if inner.total is None:
+                return inner
+            return _StepEstimate(1 + inner.total)
         if isinstance(step, RepeatStep):
-            times = int(render_templates(step.times, self._estimate_env_view(env)))
+            try:
+                times = int(render_templates(step.times, self._estimate_env_view(env)))
+            except Exception as exc:
+                return _StepEstimate(None, f"repeat count could not render: {exc}")
             if times < 0:
                 times = 0
             inner = self._estimate_step_list(step.body, env)
-            if inner is None:
-                return None
-            return 1 + (times * inner)
+            if inner.total is None:
+                return inner
+            return _StepEstimate(1 + (times * inner.total))
         if isinstance(step, ForStep):
             loop_index_raw = env.get("__loop_index")
-            records = self._estimate_iterable(
-                step.in_expr,
-                env=env,
-                serpentine_index=loop_index_raw if isinstance(loop_index_raw, int) else None,
-            )
+            try:
+                records = self._estimate_iterable(
+                    step.in_expr,
+                    env=env,
+                    serpentine_index=loop_index_raw if isinstance(loop_index_raw, int) else None,
+                )
+            except Exception as exc:
+                path = self._step_source_info.get(id(step))
+                where = f" at {path.path}" if path else ""
+                return _StepEstimate(None, f"for generator{where} could not render: {exc}")
             total = 1
             for index, record in enumerate(records):
                 loop_env = dict(env)
                 if not isinstance(record, dict):
-                    return None
+                    return _StepEstimate(None, "for loop items could not be estimated")
                 loop_index = self._record_index(record, index)
                 for source, target in step.bind.items():
                     if source not in record:
-                        return None
+                        return _StepEstimate(None, "for loop binding could not be estimated")
                     loop_env[target] = record[source]
                 loop_env["__loop_index"] = loop_index
                 inner = self._estimate_step_list(step.body, loop_env)
-                if inner is None:
-                    return None
-                total += inner
-            return total
+                if inner.total is None:
+                    return inner
+                total += inner.total
+            return _StepEstimate(total)
         if isinstance(step, IfStep):
             cond_ok: bool | None = None
             try:
@@ -795,15 +858,15 @@ class SequencerRuntime:
             except Exception:
                 cond_ok = None
             if cond_ok is None:
-                return None
+                return _StepEstimate(None, "if condition could not be evaluated at start")
             branch = step.then_steps if cond_ok else (step.else_steps or [])
             inner = self._estimate_step_list(branch, env)
-            if inner is None:
-                return None
-            return 1 + inner
+            if inner.total is None:
+                return inner
+            return _StepEstimate(1 + inner.total)
         if isinstance(step, WhileStep):
-            return None
-        return None
+            return _StepEstimate(None, "while loop has unknown iteration count")
+        return _StepEstimate(None, f"{step_kind(step)} step could not be estimated")
 
     def _estimate_env_view(self, env: dict[str, Any]) -> dict[str, Any]:
         out = dict(self._vars)
@@ -946,10 +1009,81 @@ class SequencerRuntime:
 
     def _execute_step(self, step: Step) -> bool:
         self._current_step = type(step).__name__
+        self._current_step_detail = self._format_step_detail(step)
         handler = self._resolve_step_handler(step)
         if handler is None:
             return False
         return handler(step)
+
+    def _format_step_detail(self, step: Step) -> dict[str, Any]:
+        source = self._step_source_info.get(id(step))
+        return {
+            "kind": source.kind if source else step_kind(step),
+            "summary": source.summary if source else step_summary(step),
+            "path": source.path if source else None,
+            "line": source.line if source else None,
+            "column": source.column if source else None,
+            "source": source.source if source else None,
+            "branch": source.branch if source else None,
+        }
+
+    def _update_current_step_detail(self, **values: Any) -> None:
+        if self._current_step_detail is None:
+            self._current_step_detail = {}
+        self._current_step_detail.update(values)
+
+    def _make_error_detail(self, message: str) -> dict[str, Any]:
+        step = dict(self._current_step_detail) if self._current_step_detail else None
+        detail: dict[str, Any] = {
+            "message": str(message),
+            "formatted": "",
+            "step": step,
+            "cleanup_errors": [],
+        }
+        detail["formatted"] = self._format_error_text(detail)
+        return detail
+
+    def _format_error_text(self, detail: dict[str, Any]) -> str:
+        message = str(detail.get("message") or "sequencer error")
+        step = detail.get("step")
+        if not isinstance(step, dict):
+            return message
+        parts: list[str] = []
+        summary = step.get("summary")
+        if summary:
+            parts.append(str(summary))
+        source = step.get("source")
+        line = step.get("line")
+        path = step.get("path")
+        branch = step.get("branch")
+        if source or line or path:
+            location = str(source or "sequence")
+            if line is not None:
+                location += f":{line}"
+            if path:
+                location += f" ({path})"
+            parts.append(location)
+        if branch:
+            parts.append(f"branch {branch}")
+        if not parts:
+            return message
+        return f"{message} [{'; '.join(parts)}]"
+
+    @staticmethod
+    def _response_error_text(resp: dict[str, Any]) -> str:
+        error = resp.get("error")
+        if isinstance(error, dict):
+            message = error.get("message")
+            code = error.get("code")
+            if message and code:
+                return f"{message} ({code})"
+            if message:
+                return str(message)
+            if code:
+                return str(code)
+        if error:
+            return str(error)
+        return "request failed"
 
     def _register_step_handlers(self) -> None:
         self._step_handlers = {
@@ -983,9 +1117,11 @@ class SequencerRuntime:
         return None
 
     def _fail_step(self, message: str) -> bool:
+        detail = self._make_error_detail(str(message))
         if self._pending_terminal_state is not None:
             self._note_cleanup_failure(str(message))
             return True
+        self._last_error_detail = detail
         if self._begin_terminal_unwind("ERROR", str(message)):
             return True
         self._last_error = str(message)
@@ -1119,12 +1255,13 @@ class SequencerRuntime:
 
     def _execute_set_step(self, step: SetStep) -> bool:
         device = str(render_templates(step.device, self._env_view()) or "").strip()
+        self._update_current_step_detail(device=device, name=step.name)
         if not device:
             return self._fail_step("set.device rendered empty")
         value = render_templates(step.value, self._env_view())
         resp = self._call_device(device, "set", {"name": step.name, "value": value})
         if not resp.get("ok", False):
-            return self._fail_step(str(resp.get("error")))
+            return self._fail_step(self._response_error_text(resp))
         return False
 
     def _dispatch_call(
@@ -1167,6 +1304,12 @@ class SequencerRuntime:
         device, process, action = self._render_call_target(
             {"device": step.device, "process": step.process or "", "action": step.action}
         )
+        self._update_current_step_detail(
+            target_kind="process" if process else "device",
+            device=device or None,
+            process=process,
+            action=action,
+        )
         params = render_templates(step.params, self._env_view())
         resp = self._dispatch_call(
             device=device,
@@ -1197,7 +1340,7 @@ class SequencerRuntime:
                     ref=spec.get("ref"),
                 )
         if not resp.get("ok", False):
-            return self._fail_step(str(resp.get("error")))
+            return self._fail_step(self._response_error_text(resp))
         return False
 
     def _normalize_streams(self, streams: Any) -> list[tuple[str, str]]:
@@ -2239,13 +2382,13 @@ class SequencerRuntime:
             call_spec = value["call"]
             if not isinstance(call_spec, dict):
                 return None
-            device, process, action = self._render_call_target(call_spec)
+            call_device, call_process, action = self._render_call_target(call_spec)
             params = call_spec.get("params", {}) or {}
             if not isinstance(params, dict):
                 params = {}
             resp = self._dispatch_call(
-                device=device,
-                process=process,
+                device=call_device,
+                process=call_process,
                 action=action,
                 params=render_templates(params, env),
             )
@@ -2258,7 +2401,7 @@ class SequencerRuntime:
             # step-execution loop catches the exception and transitions
             # the sequencer to ERROR with _last_error set.
             if not resp.get("ok", False):
-                target = process or device
+                target = call_process or call_device
                 raise RuntimeError(
                     f"call {target}.{action} failed: "
                     f"{resp.get('error', 'unknown error')!s}"
