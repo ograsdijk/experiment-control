@@ -5,6 +5,12 @@ import { normalizeStreamFrameMessage } from "../stream/messages";
 import { decimateTraceValues } from "../stream/utils";
 import type { RawStreamSubscription } from "../stream/types";
 import type { StreamFrameMessage } from "../../types";
+import {
+  prepareRawStreamHydration,
+  RAW_STREAM_HYDRATION_INVALIDATE_EVENT,
+  rawStreamHydrationInvalidationKeys,
+  rawStreamSubscriptionKey,
+} from "./rawStreamHydration";
 
 /**
  * Raw-stream WebSocket subscriptions manager.
@@ -15,7 +21,11 @@ import type { StreamFrameMessage } from "../../types";
  *    changes, fetch a one-shot snapshot via `fetchRawStreamSnapshot`
  *    for each new subscription and feed it through `applyFrame`.
  *    Already-hydrated subscriptions are tracked in a ref so we don't
- *    re-fetch on every effect re-run.
+ *    re-fetch on every effect re-run. The cache can also be invalidated
+ *    by dispatching `experiment-control:raw-stream-hydration-invalidate`;
+ *    panel handlers do that after clearing raw-stream buffers so the
+ *    current server-side snapshot is fetched again even if the
+ *    subscription key itself did not change.
  *
  * 2. **Live WS** — for each active subscription, open a
  *    `/ws/raw_stream` WebSocket and feed each incoming frame to
@@ -48,10 +58,6 @@ export interface RawStreamSubscriptionsArgs {
   bumpPlotTick: () => void;
 }
 
-function subscriptionKey(subscription: RawStreamSubscription): string {
-  return `${subscription.deviceId}|${subscription.stream}|${subscription.channelIndex}|${subscription.traceDecimator}|${subscription.traceMaxPoints}|${subscription.traceMaxFps.toFixed(3)}|${subscription.rollingWindow}|${subscription.averageMode}`;
-}
-
 function socketGroupKey(subscription: RawStreamSubscription): string {
   return `${subscription.deviceId}|${subscription.stream}|${subscription.channelIndex}|${subscription.traceDecimator}|${subscription.traceMaxFps.toFixed(3)}|${subscription.rollingWindow}|${subscription.averageMode}`;
 }
@@ -76,7 +82,9 @@ export function useRawStreamSubscriptions({
   bumpPlotTick,
 }: RawStreamSubscriptionsArgs): { wsConnected: boolean } {
   const [wsConnected, setWsConnected] = useState(true);
+  const [hydrationGeneration, setHydrationGeneration] = useState(0);
   const hydratedRef = useRef<Set<string>>(new Set());
+  const invalidatedHydrationKeysRef = useRef<Set<string>>(new Set());
 
   // Stable refs to the callbacks so the effects below don't need
   // them in their dependency arrays.
@@ -84,6 +92,32 @@ export function useRawStreamSubscriptions({
   applyFrameRef.current = applyFrame;
   const bumpPlotTickRef = useRef(bumpPlotTick);
   bumpPlotTickRef.current = bumpPlotTick;
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    const handleInvalidate = (event: Event) => {
+      const keys = rawStreamHydrationInvalidationKeys(event);
+      if (keys.length <= 0) {
+        return;
+      }
+      for (const key of keys) {
+        invalidatedHydrationKeysRef.current.add(key);
+      }
+      setHydrationGeneration((value) => value + 1);
+    };
+    window.addEventListener(
+      RAW_STREAM_HYDRATION_INVALIDATE_EVENT,
+      handleInvalidate
+    );
+    return () => {
+      window.removeEventListener(
+        RAW_STREAM_HYDRATION_INVALIDATE_EVENT,
+        handleInvalidate
+      );
+    };
+  }, []);
 
   // Stable string key derived from the subscription set. The caller
   // re-allocates `activeSubscriptions` on every panels-state mutation
@@ -95,7 +129,7 @@ export function useRawStreamSubscriptions({
   const subscriptionsKey = useMemo(
     () =>
       activeSubscriptions
-        .map(subscriptionKey)
+        .map(rawStreamSubscriptionKey)
         .sort()
         .join(";"),
     [activeSubscriptions]
@@ -113,26 +147,20 @@ export function useRawStreamSubscriptions({
       return;
     }
     let cancelled = false;
-    const activeKeys = new Set(currentSubscriptions.map(subscriptionKey));
-    hydratedRef.current = new Set(
-      [...hydratedRef.current].filter((key) => activeKeys.has(key))
+    const { nextHydratedKeys, pending } = prepareRawStreamHydration(
+      currentSubscriptions,
+      hydratedRef.current,
+      invalidatedHydrationKeysRef.current
     );
-    const seenPending = new Set<string>();
-    const pending = currentSubscriptions.filter((subscription) => {
-      const key = subscriptionKey(subscription);
-      if (hydratedRef.current.has(key) || seenPending.has(key)) {
-        return false;
-      }
-      seenPending.add(key);
-      return true;
-    });
+    hydratedRef.current = nextHydratedKeys;
+    invalidatedHydrationKeysRef.current.clear();
     if (pending.length <= 0) {
       return;
     }
     const load = async () => {
       let updated = false;
       for (const subscription of pending) {
-        const key = subscriptionKey(subscription);
+        const key = rawStreamSubscriptionKey(subscription);
         try {
           const msg = await fetchRawStreamSnapshot({
             deviceId: subscription.deviceId,
@@ -168,8 +196,9 @@ export function useRawStreamSubscriptions({
       cancelled = true;
     };
     // subscriptionsKey changes only when the actual subscription set
-    // changes; this avoids re-hydrating on unrelated panel edits.
-  }, [subscriptionsKey]);
+    // changes; hydrationGeneration changes only when a raw panel clears
+    // its buffers and needs the current server snapshot loaded again.
+  }, [subscriptionsKey, hydrationGeneration]);
 
   // Live WS for each active subscription.
   useEffect(() => {

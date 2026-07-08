@@ -31,10 +31,9 @@ tui:
   startup_delay_s: 1.0
 
 startup:
-  connect: false
   start_devices: true
   start_processes: true
   process_order: [hdf_writer]
   wait_for_registered: true
-  wait_for_online: true
+  wait_for_online: false
   timeout_s: 30.0

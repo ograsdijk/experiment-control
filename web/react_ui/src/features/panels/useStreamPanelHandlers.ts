@@ -27,6 +27,10 @@ import {
   normalizeTraceRollingWindow,
 } from "../stream/utils";
 import { useStreamAnalysis } from "../stream_analysis/StreamAnalysisContext";
+import {
+  dispatchRawStreamHydrationInvalidation,
+  rawStreamSubscriptionKeysForPanel,
+} from "../telemetry/rawStreamHydration";
 import { useTelemetry } from "../telemetry/TelemetryContext";
 import { usePanels } from "./PanelsContext";
 import { usePlotTick } from "./PlotTickContext";
@@ -99,11 +103,23 @@ export function useStreamPanelHandlers(args: StreamPanelHandlersArgs) {
     setPlotTick((tick) => tick + 1);
   };
 
-  const clearStreamPanelFrames = (panelId: string) => {
+  const clearRawStreamPanelSnapshots = (
+    panelId: string,
+    options: { rehydrate: boolean } = { rehydrate: false }
+  ) => {
     streamFramesRef.set(panelId, []);
     streamTraceOverlayRef.set(panelId, new Map());
     streamExtraChannelRef.set(panelId, new Map());
+    if (options.rehydrate) {
+      const panel = panelsRef.current.find((entry) => entry.id === panelId);
+      const keys = panel ? rawStreamSubscriptionKeysForPanel(panel) : [];
+      dispatchRawStreamHydrationInvalidation(keys);
+    }
     setPlotTick((tick) => tick + 1);
+  };
+
+  const clearStreamPanelFrames = (panelId: string) => {
+    clearRawStreamPanelSnapshots(panelId, { rehydrate: true });
   };
 
   const clearWorkspaceBinPanels = (
@@ -255,10 +271,7 @@ export function useStreamPanelHandlers(args: StreamPanelHandlersArgs) {
           : panel
       )
     );
-    streamFramesRef.set(panelId, []);
-    streamTraceOverlayRef.set(panelId, new Map());
-    streamExtraChannelRef.set(panelId, new Map());
-    setPlotTick((tick) => tick + 1);
+    clearRawStreamPanelSnapshots(panelId);
   };
 
   const setStreamPanelTargetFromKey = (
@@ -324,10 +337,7 @@ export function useStreamPanelHandlers(args: StreamPanelHandlersArgs) {
     // The channel is part of the subscription key, so changing it swaps
     // the WS/snapshot data. Clear the stale (old-channel) buffers and
     // force an immediate redraw instead of waiting for the next frame.
-    streamFramesRef.set(panelId, []);
-    streamTraceOverlayRef.set(panelId, new Map());
-    streamExtraChannelRef.set(panelId, new Map());
-    setPlotTick((tick) => tick + 1);
+    clearRawStreamPanelSnapshots(panelId);
   };
 
   // Multi-channel selection for raw stream panels: the first selected
@@ -352,10 +362,7 @@ export function useStreamPanelHandlers(args: StreamPanelHandlersArgs) {
           : panel
       )
     );
-    streamFramesRef.set(panelId, []);
-    streamTraceOverlayRef.set(panelId, new Map());
-    streamExtraChannelRef.set(panelId, new Map());
-    setPlotTick((tick) => tick + 1);
+    clearRawStreamPanelSnapshots(panelId);
   };
 
   const setStreamPanelTraceDecimator = (
@@ -369,10 +376,7 @@ export function useStreamPanelHandlers(args: StreamPanelHandlersArgs) {
           : panel
       )
     );
-    streamFramesRef.set(panelId, []);
-    streamTraceOverlayRef.set(panelId, new Map());
-    streamExtraChannelRef.set(panelId, new Map());
-    setPlotTick((tick) => tick + 1);
+    clearRawStreamPanelSnapshots(panelId);
   };
 
   const setStreamPanelTraceMaxPoints = (panelId: string, value: number) => {
@@ -384,10 +388,7 @@ export function useStreamPanelHandlers(args: StreamPanelHandlersArgs) {
           : panel
       )
     );
-    streamFramesRef.set(panelId, []);
-    streamTraceOverlayRef.set(panelId, new Map());
-    streamExtraChannelRef.set(panelId, new Map());
-    setPlotTick((tick) => tick + 1);
+    clearRawStreamPanelSnapshots(panelId);
   };
 
   const setStreamPanelTraceMaxFps = (panelId: string, value: number) => {
@@ -410,10 +411,7 @@ export function useStreamPanelHandlers(args: StreamPanelHandlersArgs) {
           : panel
       )
     );
-    streamFramesRef.set(panelId, []);
-    streamTraceOverlayRef.set(panelId, new Map());
-    streamExtraChannelRef.set(panelId, new Map());
-    setPlotTick((tick) => tick + 1);
+    clearRawStreamPanelSnapshots(panelId);
   };
 
   const setStreamPanelAverageMode = (
@@ -428,10 +426,7 @@ export function useStreamPanelHandlers(args: StreamPanelHandlersArgs) {
           : panel
       )
     );
-    streamFramesRef.set(panelId, []);
-    streamTraceOverlayRef.set(panelId, new Map());
-    streamExtraChannelRef.set(panelId, new Map());
-    setPlotTick((tick) => tick + 1);
+    clearRawStreamPanelSnapshots(panelId);
   };
 
   return {
