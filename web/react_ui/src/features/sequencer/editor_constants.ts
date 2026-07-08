@@ -7,6 +7,7 @@ export const FOR_GENERATOR_OPTIONS = [
   { value: "range", label: "range" },
   { value: "linspace", label: "linspace" },
   { value: "triangle", label: "triangle" },
+  { value: "centered_triangle", label: "centered_triangle" },
   { value: "logspace", label: "logspace" },
   { value: "geomspace", label: "geomspace" },
   { value: "values", label: "values" },

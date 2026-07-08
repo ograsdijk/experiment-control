@@ -181,6 +181,13 @@ export function defaultForGeneratorConfig(
         { name: "stop", value: "10" },
         { name: "num", value: "11" },
       ];
+    case "centered_triangle":
+      return [
+        { name: "center", value: "0" },
+        { name: "span", value: "10" },
+        { name: "num", value: "11" },
+        { name: "dir", value: "1" },
+      ];
     case "logspace":
       return [
         { name: "start", value: "0" },
@@ -255,6 +262,8 @@ export function scalarGeneratorFieldNames(generatorKind: string): string[] | nul
     case "linspace":
     case "triangle":
       return ["start", "stop", "num"];
+    case "centered_triangle":
+      return ["center", "span", "num", "dir"];
     case "logspace":
       return ["start", "stop", "num", "base"];
     case "geomspace":
@@ -528,7 +537,12 @@ function countCallIssues(node: SequencerStepOutlineNode): number {
     return 0;
   }
   const blankParamNames = node.callDetail.params.filter((entry) => isBlank(entry.name)).length;
+  const target =
+    node.callDetail.targetKind === "process"
+      ? node.callDetail.process
+      : node.callDetail.device;
   return (
+    (isBlank(target) ? 1 : 0) +
     (isBlank(node.callDetail.action) ? 1 : 0) +
     duplicateNameSet(node.callDetail.params).size +
     blankParamNames

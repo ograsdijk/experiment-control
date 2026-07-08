@@ -54,6 +54,8 @@ export function CallStepEditor({
 
   const params = node.callDetail.params;
   const selectedDevice = node.callDetail.device ?? "";
+  const selectedProcess = node.callDetail.process ?? "";
+  const targetKind = node.callDetail.targetKind;
   const deviceOptions = deviceNames(devices);
   const actionOptions = callableActionNames(capabilitiesByDevice[selectedDevice]);
   const selectedActionMember =
@@ -85,14 +87,42 @@ export function CallStepEditor({
     nextParams: SequencerOutlineMetadataEntry[]
   ) => {
     onYamlTextChange(
-      applyEditedCallStep(yamlText, node, selectedDevice, nextAction, nextParams)
+      applyEditedCallStep(
+        yamlText,
+        node,
+        targetKind,
+        selectedDevice,
+        selectedProcess,
+        nextAction,
+        nextParams
+      )
     );
   };
 
   // Changing the device clears the action (it likely doesn't exist on the new
   // device); params are left for the user to adjust.
   const changeDevice = (nextDevice: string) => {
-    onYamlTextChange(applyEditedCallStep(yamlText, node, nextDevice, "", params));
+    onYamlTextChange(
+      applyEditedCallStep(yamlText, node, "device", nextDevice, "", "", params)
+    );
+  };
+
+  const changeProcess = (nextProcess: string) => {
+    onYamlTextChange(
+      applyEditedCallStep(yamlText, node, "process", "", nextProcess, "", params)
+    );
+  };
+
+  const changeTargetKind = (nextKind: string | null) => {
+    if (nextKind === "process") {
+      onYamlTextChange(
+        applyEditedCallStep(yamlText, node, "process", "", selectedProcess, "", params)
+      );
+    } else {
+      onYamlTextChange(
+        applyEditedCallStep(yamlText, node, "device", selectedDevice, "", "", params)
+      );
+    }
   };
 
   const buildParamEntry = (name: string): SequencerOutlineMetadataEntry => ({
@@ -103,13 +133,37 @@ export function CallStepEditor({
   return (
     <Card radius="sm" p="xs" style={cardStyle}>
       <Stack gap={8}>
-        <FieldAutocomplete
-          label="Device"
-          value={selectedDevice}
-          options={deviceOptions}
-          onChange={changeDevice}
-          placeholder="device"
-        />
+        <Group grow align="flex-end">
+          <Select
+            size="xs"
+            label="Target"
+            data={[
+              { value: "device", label: "Device" },
+              { value: "process", label: "Process" },
+            ]}
+            value={targetKind}
+            allowDeselect={false}
+            comboboxProps={{ withinPortal: false }}
+            onChange={changeTargetKind}
+          />
+          {targetKind === "process" ? (
+            <FieldAutocomplete
+              label="Process"
+              value={selectedProcess}
+              options={[]}
+              onChange={changeProcess}
+              placeholder="process"
+            />
+          ) : (
+            <FieldAutocomplete
+              label="Device"
+              value={selectedDevice}
+              options={deviceOptions}
+              onChange={changeDevice}
+              placeholder="device"
+            />
+          )}
+        </Group>
 
         <FieldAutocomplete
           label="Action"

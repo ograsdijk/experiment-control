@@ -88,6 +88,12 @@ class ParallelStep:
 
 
 @dataclass(frozen=True)
+class TryStep:
+    body: list["Step"]
+    finally_steps: list["Step"]
+
+
+@dataclass(frozen=True)
 class AssignStep:
     values: dict[str, Any]
 
@@ -130,6 +136,7 @@ Step = (
     | AtomicStep
     | PauseStep
     | ParallelStep
+    | TryStep
     | AssignStep
     | SetContextStep
     | UseStep
@@ -257,6 +264,13 @@ def _parse_step(raw: Any) -> Step:
         par = _require_dict(obj["parallel"], name="parallel")
         body = _parse_steps(par.get("do", []))
         return ParallelStep(body=body)
+    if "try" in obj:
+        tr = _require_dict(obj["try"], name="try")
+        if "do" not in tr:
+            raise TypeError("try.do is required")
+        body = _parse_steps(tr.get("do", []))
+        finally_steps = _parse_steps(tr.get("finally", []))
+        return TryStep(body=body, finally_steps=finally_steps)
     if "assign" in obj:
         values = obj.get("assign")
         if not isinstance(values, dict):
@@ -352,6 +366,9 @@ def _iter_adaptive_ids(steps: list[Step]) -> list[str]:
             ids.extend(_iter_adaptive_ids(step.body))
         elif isinstance(step, ParallelStep):
             ids.extend(_iter_adaptive_ids(step.body))
+        elif isinstance(step, TryStep):
+            ids.extend(_iter_adaptive_ids(step.body))
+            ids.extend(_iter_adaptive_ids(step.finally_steps))
     return ids
 
 
@@ -375,6 +392,9 @@ def iter_use_ids(steps: list[Step]) -> list[str]:
             out.extend(iter_use_ids(step.body))
         elif isinstance(step, ParallelStep):
             out.extend(iter_use_ids(step.body))
+        elif isinstance(step, TryStep):
+            out.extend(iter_use_ids(step.body))
+            out.extend(iter_use_ids(step.finally_steps))
     return out
 
 

@@ -20,6 +20,7 @@ export const FOR_GENERATOR_KINDS = new Set([
   "range",
   "linspace",
   "triangle",
+  "centered_triangle",
   "logspace",
   "geomspace",
   "values",

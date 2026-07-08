@@ -106,6 +106,25 @@ describe("sequencer editing regressions", () => {
     expect(nodes.map((node) => node.kind)).toEqual(["repeat", "sleep", "call"]);
   });
 
+  it("inserts child steps into try finally containers", () => {
+    const yaml = [
+      "version: 1",
+      "steps:",
+      "  - try:",
+      "      do:",
+      "        - sleep: 0.1",
+      "      finally:",
+      "        - call: {device: yag, action: stop}",
+      "",
+    ].join("\n");
+    const tryStep = getNodeByKind(yaml, "try");
+    const next = insertStepInside(yaml, tryStep, "sleep", "finally");
+    const nodes = flattenSequencerStepOutline(buildSequencerStepOutline(next));
+    const finallyChildren = nodes.filter((node) => node.branchLabel === "finally");
+
+    expect(finallyChildren.map((node) => node.kind)).toEqual(["call", "sleep"]);
+  });
+
   it("edits set step values without dropping sibling steps", () => {
     const yaml = [
       "version: 1",
@@ -135,7 +154,7 @@ describe("sequencer editing regressions", () => {
       "",
     ].join("\n");
     const callNode = getNodeByKind(yaml, "call");
-    const next = applyEditedCallStep(yaml, callNode, "laser", "configure", [
+    const next = applyEditedCallStep(yaml, callNode, "device", "laser", "", "configure", [
       { name: "mode", value: '"cw"' },
       { name: "scan.x.min", value: "0" },
       { name: "scan.x.max", value: "10" },

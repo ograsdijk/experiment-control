@@ -11,8 +11,9 @@ export type BasicSequencerStepTemplate =
   | "set_context"
   | "for"
   | "if"
+  | "try"
   | "while";
-export type SequencerChildContainer = "do" | "then" | "else";
+export type SequencerChildContainer = "do" | "then" | "else" | "finally";
 
 export function splitLines(yamlText: string): {
   lines: string[];
@@ -177,6 +178,14 @@ export function buildTemplateSnippet(kind: BasicSequencerStepTemplate): string {
         "    then:",
         "      - sleep: 0.1",
         "    else: []",
+      ].join("\n");
+    case "try":
+      return [
+        "- try:",
+        "    do:",
+        "      - sleep: 0.1",
+        "    finally:",
+        "      - sleep: 0.1",
       ].join("\n");
     case "while":
       return [

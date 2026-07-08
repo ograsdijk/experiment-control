@@ -55,7 +55,7 @@ export type SequencerStepOutlineNode = {
   line: number;
   endLine: number;
   indent: number;
-  branchLabel: "then" | "else" | null;
+  branchLabel: "then" | "else" | "finally" | null;
   summary: string | null;
   snippet: string;
   children: SequencerStepOutlineNode[];
@@ -92,7 +92,9 @@ export type SequencerAdaptiveMetricDetail = {
 };
 
 export type SequencerCallDetail = {
+  targetKind: "device" | "process";
   device: string | null;
+  process: string | null;
   action: string | null;
   params: SequencerOutlineMetadataEntry[];
 };

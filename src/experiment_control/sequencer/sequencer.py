@@ -38,6 +38,7 @@ from .ast import (
     SetStep,
     SleepStep,
     Step,
+    TryStep,
     UseStep,
     WaitUntilStep,
     WhileStep,
@@ -1049,30 +1050,46 @@ class SequencerProcess(ManagedProcessBase):
             )
             return
         device = telemetry_spec.get("device")
+        process = telemetry_spec.get("process")
         signal = telemetry_spec.get("signal")
-        if self._preflight_is_template_text(device) or self._preflight_is_template_text(
-            signal
+        if (
+            self._preflight_is_template_text(device)
+            or self._preflight_is_template_text(process)
+            or self._preflight_is_template_text(signal)
         ):
             diagnostics.append(
                 self._preflight_diag(
                     severity="warning",
                     path=f"{path}.telemetry",
                     code="dynamic_telemetry_ref_unchecked",
-                    message="telemetry device/signal is dynamic and was not checked",
+                    message="telemetry device/process/signal is dynamic and was not checked",
                 )
             )
             return
         device_id = str(device or "").strip()
+        process_id = str(process or "").strip()
         signal_name = str(signal or "").strip()
-        if not device_id or not signal_name:
+        if device_id and process_id:
             diagnostics.append(
                 self._preflight_diag(
                     severity="error",
                     path=f"{path}.telemetry",
                     code="invalid_telemetry_source",
-                    message="telemetry source requires non-empty device and signal",
+                    message="telemetry source may set only one of device or process",
                 )
             )
+            return
+        if (not device_id and not process_id) or not signal_name:
+            diagnostics.append(
+                self._preflight_diag(
+                    severity="error",
+                    path=f"{path}.telemetry",
+                    code="invalid_telemetry_source",
+                    message="telemetry source requires non-empty device/process and signal",
+                )
+            )
+            return
+        if process_id:
             return
         if device_id not in device_ids:
             diagnostics.append(
@@ -1127,32 +1144,17 @@ class SequencerProcess(ManagedProcessBase):
                 )
             )
             return
-        device = call_spec.get("device")
-        action = call_spec.get("action")
-        if self._preflight_is_template_text(device) or self._preflight_is_template_text(
-            action
-        ):
-            diagnostics.append(
-                self._preflight_diag(
-                    severity="warning",
-                    path=f"{path}.call",
-                    code="dynamic_action_unchecked",
-                    message="call device/action is dynamic and was not checked",
-                )
-            )
+        target = self._preflight_static_call_target(
+            device=call_spec.get("device"),
+            process=call_spec.get("process"),
+            action=call_spec.get("action"),
+            path=f"{path}.call",
+            source_label="call source",
+            diagnostics=diagnostics,
+        )
+        if target is None:
             return
-        device_id = str(device or "").strip()
-        action_name = str(action or "").strip()
-        if not device_id or not action_name:
-            diagnostics.append(
-                self._preflight_diag(
-                    severity="error",
-                    path=f"{path}.call",
-                    code="invalid_call_source",
-                    message="call source requires non-empty device and action",
-                )
-            )
-            return
+        device_id, action_name = target
         self._preflight_check_call_action(
             device_id=device_id,
             action=action_name,
@@ -1161,14 +1163,91 @@ class SequencerProcess(ManagedProcessBase):
             device_ids=device_ids,
             capabilities_by_device=capabilities_by_device,
         )
-        member_name = self._preflight_member_name_from_params(call_spec.get("params"))
-        if action_name in {"get", "set"}:
+        self._preflight_check_call_params(
+            device_id=device_id,
+            action=action_name,
+            params=call_spec.get("params"),
+            path=f"{path}.call",
+            diagnostics=diagnostics,
+            stream_names_by_device=stream_names_by_device,
+            capabilities_by_device=capabilities_by_device,
+        )
+
+    def _preflight_static_call_target(
+        self,
+        *,
+        device: Any,
+        process: Any,
+        action: Any,
+        path: str,
+        source_label: str,
+        diagnostics: list[Json],
+    ) -> tuple[str, str] | None:
+        if self._preflight_has_dynamic_call_target(device, process, action):
+            diagnostics.append(
+                self._preflight_diag(
+                    severity="warning",
+                    path=path,
+                    code="dynamic_call_ref_unchecked",
+                    message="call device/process/action is dynamic and was not checked",
+                )
+            )
+            return None
+        device_id = str(device or "").strip()
+        process_id = str(process or "").strip()
+        action_name = str(action or "").strip()
+        if device_id and process_id:
+            diagnostics.append(
+                self._preflight_diag(
+                    severity="error",
+                    path=path,
+                    code="invalid_call_source",
+                    message=f"{source_label} may set only one of device or process",
+                )
+            )
+            return None
+        if (not device_id and not process_id) or not action_name:
+            diagnostics.append(
+                self._preflight_diag(
+                    severity="error",
+                    path=path,
+                    code="invalid_call_source",
+                    message=f"{source_label} requires non-empty device/process and action",
+                )
+            )
+            return None
+        if process_id:
+            return None
+        return device_id, action_name
+
+    def _preflight_has_dynamic_call_target(
+        self, device: Any, process: Any, action: Any
+    ) -> bool:
+        return (
+            self._preflight_is_template_text(device)
+            or self._preflight_is_template_text(process)
+            or self._preflight_is_template_text(action)
+        )
+
+    def _preflight_check_call_params(
+        self,
+        *,
+        device_id: str,
+        action: str,
+        params: Any,
+        path: str,
+        diagnostics: list[Json],
+        stream_names_by_device: dict[str, set[str]],
+        capabilities_by_device: dict[str, dict[str, Json] | None],
+    ) -> None:
+        if action in {"get", "set"}:
+            member_name = self._preflight_member_name_from_params(params)
             if member_name:
                 self._preflight_check_member_access(
                     device_id=device_id,
                     member_name=member_name,
-                    path=f"{path}.call.params.name",
-                    mode="read" if action_name == "get" else "write",
+                    path=f"{path}.params.name",
+                    mode="read" if action == "get" else "write",
                     diagnostics=diagnostics,
                     capabilities_by_device=capabilities_by_device,
                 )
@@ -1176,7 +1255,7 @@ class SequencerProcess(ManagedProcessBase):
                 diagnostics.append(
                     self._preflight_diag(
                         severity="warning",
-                        path=f"{path}.call.params.name",
+                        path=f"{path}.params.name",
                         code="dynamic_member_name_unchecked",
                         message=(
                             "member name for get/set is dynamic or missing and "
@@ -1184,15 +1263,14 @@ class SequencerProcess(ManagedProcessBase):
                         ),
                     )
                 )
-        if action_name == "stream.context.set":
-            params = call_spec.get("params")
+        if action == "stream.context.set":
             if isinstance(params, dict):
                 stream = params.get("stream")
                 if self._preflight_is_template_text(stream):
                     diagnostics.append(
                         self._preflight_diag(
                             severity="warning",
-                            path=f"{path}.call.params.stream",
+                            path=f"{path}.params.stream",
                             code="dynamic_stream_name_unchecked",
                             message="stream name is dynamic and was not checked",
                         )
@@ -1201,7 +1279,7 @@ class SequencerProcess(ManagedProcessBase):
                     self._preflight_check_stream_name(
                         device_id=device_id,
                         stream_name=stream.strip(),
-                        path=f"{path}.call.params.stream",
+                        path=f"{path}.params.stream",
                         diagnostics=diagnostics,
                         stream_names_by_device=stream_names_by_device,
                     )
@@ -1251,6 +1329,8 @@ class SequencerProcess(ManagedProcessBase):
     ) -> None:
         device_id = str(step.device).strip()
         action = str(step.action).strip()
+        if step.process:
+            return
         self._preflight_check_call_action(
             device_id=device_id,
             action=action,
@@ -1313,15 +1393,17 @@ class SequencerProcess(ManagedProcessBase):
         stream_names_by_device: dict[str, set[str]],
         capabilities_by_device: dict[str, dict[str, Json] | None],
     ) -> None:
-        if self._preflight_is_template_text(step.device) or self._preflight_is_template_text(
-            step.action
+        if (
+            self._preflight_is_template_text(step.device)
+            or self._preflight_is_template_text(step.process)
+            or self._preflight_is_template_text(step.action)
         ):
             diagnostics.append(
                 self._preflight_diag(
                     severity="warning",
                     path=f"{step_path}.call",
-                    code="dynamic_action_unchecked",
-                    message="call device/action is dynamic and was not checked",
+                    code="dynamic_call_ref_unchecked",
+                    message="call device/process/action is dynamic and was not checked",
                 )
             )
         else:
@@ -2043,6 +2125,31 @@ class SequencerProcess(ManagedProcessBase):
             self._preflight_recurse_steps(
                 steps=step.body,
                 path=f"{step_path}.parallel.do",
+                env=env,
+                diagnostics=diagnostics,
+                device_ids=device_ids,
+                telemetry_signals_by_device=telemetry_signals_by_device,
+                stream_names_by_device=stream_names_by_device,
+                capabilities_by_device=capabilities_by_device,
+                use_stack=use_stack,
+            )
+            return True
+
+        if isinstance(step, TryStep):
+            self._preflight_recurse_steps(
+                steps=step.body,
+                path=f"{step_path}.try.do",
+                env=env,
+                diagnostics=diagnostics,
+                device_ids=device_ids,
+                telemetry_signals_by_device=telemetry_signals_by_device,
+                stream_names_by_device=stream_names_by_device,
+                capabilities_by_device=capabilities_by_device,
+                use_stack=use_stack,
+            )
+            self._preflight_recurse_steps(
+                steps=step.finally_steps,
+                path=f"{step_path}.try.finally",
                 env=env,
                 diagnostics=diagnostics,
                 device_ids=device_ids,

@@ -226,12 +226,42 @@ describe("for-loop round-trip with inline flow maps (spb_raster_scan shapes)", (
     expect(detail?.action).toBe("move_to_channel");
     expect(detail?.params).toEqual([{ name: "channel", value: '"${ch}"' }]);
 
-    const next = applyEditedCallStep(yaml, nodeByKind(yaml, "call"), "bristol_wavemeter", "move_to_channel", [
-      { name: "channel", value: '"${ch2}"' },
-    ]);
+    const next = applyEditedCallStep(
+      yaml,
+      nodeByKind(yaml, "call"),
+      "device",
+      "bristol_wavemeter",
+      "",
+      "move_to_channel",
+      [{ name: "channel", value: '"${ch2}"' }]
+    );
     expect(nodeByKind(next, "call").callDetail?.params).toEqual([
       { name: "channel", value: '"${ch2}"' },
     ]);
+  });
+
+  it("preserves process call target kind when editing params", () => {
+    const yaml = [
+      "version: 1",
+      "steps:",
+      "  - call: {process: spb_microwave, action: mw.retune, params: {mode: fast}}",
+      "",
+    ].join("\n");
+    const node = nodeByKind(yaml, "call");
+    const next = applyEditedCallStep(
+      yaml,
+      node,
+      "process",
+      "",
+      "spb_microwave",
+      "mw.retune",
+      [{ name: "mode", value: "slow" }]
+    );
+    const reparsed = nodeByKind(next, "call").callDetail;
+
+    expect(reparsed?.targetKind).toBe("process");
+    expect(reparsed?.process).toBe("spb_microwave");
+    expect(next).not.toContain("device:");
   });
 
   it("preserves a non-scalar (inline list) set value instead of dropping it", () => {

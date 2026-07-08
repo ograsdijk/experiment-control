@@ -11,6 +11,7 @@ from .ast import (
     RepeatStep,
     SequenceSpec,
     Step,
+    TryStep,
     WaitUntilStep,
     WhileStep,
 )
@@ -241,6 +242,16 @@ def _iter_step_condition_diagnostics(
             diagnostics.extend(
                 _iter_step_condition_diagnostics(
                     step.body, path=f"{step_path}.parallel.do"
+                )
+            )
+            continue
+        if isinstance(step, TryStep):
+            diagnostics.extend(
+                _iter_step_condition_diagnostics(step.body, path=f"{step_path}.try.do")
+            )
+            diagnostics.extend(
+                _iter_step_condition_diagnostics(
+                    step.finally_steps, path=f"{step_path}.try.finally"
                 )
             )
             continue

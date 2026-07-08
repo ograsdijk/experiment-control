@@ -188,6 +188,28 @@ steps:
         self.assertNotIn("unknown_action", codes)
         self.assertTrue(bool(resp.get("result", {}).get("valid")))
 
+    def test_preflight_warns_for_templated_call_target(self) -> None:
+        mgr = _FakeManager(devices={"laser"})
+        proc = _build_proc(mgr)
+        yaml_text = """
+version: 1
+vars:
+  target_device: laser
+  target_action: pass_qswitches
+steps:
+  - call:
+      device: ${target_device}
+      action: ${target_action}
+      params: {}
+"""
+        resp = proc._handle_rpc({"type": "sequencer.preflight", "params": {"text": yaml_text}})
+        self.assertTrue(resp.get("ok"))
+        codes = _codes_from(resp)
+        self.assertIn("dynamic_call_ref_unchecked", codes)
+        self.assertNotIn("unknown_device", codes)
+        self.assertNotIn("unknown_action", codes)
+        self.assertTrue(bool(resp.get("result", {}).get("valid")))
+
     def test_preflight_diagnostics_carry_source_line(self) -> None:
         mgr = _FakeManager(
             devices={"laser"},

@@ -23,6 +23,7 @@ from .ast import (
     SleepStep,
     Step,
     UseStep,
+    TryStep,
     WhileStep,
     WaitUntilStep,
 )
@@ -35,6 +36,7 @@ class _Frame:
     steps: list[Step]
     index: int = 0
     on_exit: Callable[[], None] | None = None
+    run_during_unwind: bool = False
 
 
 @dataclass
@@ -49,6 +51,12 @@ class _ForFrame:
 class _RepeatFrame:
     remaining: int
     body: list[Step]
+
+
+@dataclass
+class _TryFrame:
+    finally_steps: list[Step]
+    finalizing: bool = False
 
 
 @dataclass
@@ -131,12 +139,15 @@ class SequencerRuntime:
         self._base_vars: dict[str, Any] = {}
         self._env: dict[str, Any] = {}
         self._stack: list[
-            _Frame | _ForFrame | _RepeatFrame | _WhileFrame | _AdaptiveFrame
+            _Frame | _ForFrame | _RepeatFrame | _TryFrame | _WhileFrame | _AdaptiveFrame
         ] = []
         self._state = "IDLE"
         self._pause_requested = False
         self._stop_requested = False
         self._last_error: str | None = None
+        self._pending_terminal_state: str | None = None
+        self._pending_terminal_error: str | None = None
+        self._cleanup_failed = False
         self._sleep_until: float | None = None
         self._wait_state: _WaitState | None = None
         self._adaptive_observe_state: _AdaptiveObserveState | None = None
@@ -209,6 +220,9 @@ class SequencerRuntime:
         self._pause_requested = False
         self._stop_requested = False
         self._last_error = None
+        self._pending_terminal_state = None
+        self._pending_terminal_error = None
+        self._cleanup_failed = False
         self._sleep_until = None
         self._wait_state = None
         self._adaptive_observe_state = None
@@ -286,6 +300,9 @@ class SequencerRuntime:
         self._pause_requested = False
         self._stop_requested = False
         self._last_error = None
+        self._pending_terminal_state = None
+        self._pending_terminal_error = None
+        self._cleanup_failed = False
         self._env = {}
         self._sleep_until = None
         self._wait_state = None
@@ -324,14 +341,17 @@ class SequencerRuntime:
             return
         now = time.monotonic()
         self._mark_pause_ended(now)
-        self._last_error = str(reason or "external fault")
-        self._state = "ERROR"
-        self._run_ended_mono = now
         self._pause_requested = False
         self._stop_requested = False
         self._sleep_until = None
         self._wait_state = None
         self._adaptive_observe_state = None
+        if self._begin_terminal_unwind("ERROR", str(reason or "external fault")):
+            self._state = "RUNNING"
+            return
+        self._last_error = str(reason or "external fault")
+        self._state = "ERROR"
+        self._run_ended_mono = now
 
     def status(self) -> dict[str, Any]:
         effective_state = self._state
@@ -383,6 +403,10 @@ class SequencerRuntime:
             return
 
         try:
+            if self._pending_terminal_state is not None and not self._stack:
+                self._finish_pending_terminal()
+                return
+
             if self._check_stop_pause():
                 return
 
@@ -409,6 +433,9 @@ class SequencerRuntime:
                 if isinstance(step, _NoStepReady):
                     return
                 if step is None:
+                    if self._pending_terminal_state is not None:
+                        self._finish_pending_terminal()
+                        return
                     if self._state == "RUNNING":
                         self._loops_completed += 1
                         if self._should_continue_run_loops():
@@ -424,9 +451,10 @@ class SequencerRuntime:
                     return
                 self._finish_active_step(time.monotonic())
         except Exception as e:
-            self._last_error = str(e)
-            self._state = "ERROR"
-            self._run_ended_mono = time.monotonic()
+            if not self._handle_runtime_exception(e):
+                self._last_error = str(e)
+                self._state = "ERROR"
+                self._run_ended_mono = time.monotonic()
 
     def _env_view(self) -> dict[str, Any]:
         env = dict(self._env)
@@ -481,14 +509,70 @@ class SequencerRuntime:
         if self._stop_requested and self._atomic_depth == 0:
             now = time.monotonic()
             self._mark_pause_ended(now)
-            self._state = "STOPPED"
-            self._run_ended_mono = now
+            self._stop_requested = False
+            if not self._begin_terminal_unwind("STOPPED", None):
+                self._state = "STOPPED"
+                self._run_ended_mono = now
             return True
         if self._pause_requested and self._atomic_depth == 0:
             self._mark_pause_started(time.monotonic())
             self._state = "PAUSED"
             return True
         return False
+
+    def _handle_runtime_exception(self, exc: Exception) -> bool:
+        message = str(exc)
+        if self._pending_terminal_state is not None:
+            self._note_cleanup_failure(message)
+            return True
+        return self._begin_terminal_unwind("ERROR", message)
+
+    def _note_cleanup_failure(self, message: str) -> None:
+        self._cleanup_failed = True
+        cleanup_message = f"cleanup failed: {message}"
+        if self._pending_terminal_error:
+            if cleanup_message not in self._pending_terminal_error:
+                self._pending_terminal_error = (
+                    f"{self._pending_terminal_error}; {cleanup_message}"
+                )
+        else:
+            self._pending_terminal_error = cleanup_message
+
+    def _begin_terminal_unwind(self, state: str, error: str | None) -> bool:
+        if self._pending_terminal_state is not None:
+            return bool(self._stack)
+        if not self._has_terminal_unwind_work():
+            return False
+        self._pending_terminal_state = state
+        self._pending_terminal_error = error
+        self._cleanup_failed = False
+        self._sleep_until = None
+        self._wait_state = None
+        self._adaptive_observe_state = None
+        self._current_step = None
+        return True
+
+    def _has_terminal_unwind_work(self) -> bool:
+        for frame in reversed(self._stack):
+            if isinstance(frame, _Frame) and frame.on_exit is not None:
+                return True
+            if isinstance(frame, _TryFrame) and not frame.finalizing and frame.finally_steps:
+                return True
+        return False
+
+    def _finish_pending_terminal(self) -> None:
+        state = self._pending_terminal_state
+        error = self._pending_terminal_error
+        cleanup_failed = self._cleanup_failed
+        self._pending_terminal_state = None
+        self._pending_terminal_error = None
+        self._cleanup_failed = False
+        self._sleep_until = None
+        self._wait_state = None
+        self._adaptive_observe_state = None
+        self._state = "ERROR" if cleanup_failed else str(state or "STOPPED")
+        self._last_error = error if self._state == "ERROR" else None
+        self._run_ended_mono = time.monotonic()
 
     def _should_continue_run_loops(self) -> bool:
         if self._state != "RUNNING":
@@ -509,6 +593,9 @@ class SequencerRuntime:
         self._sleep_until = None
         self._wait_state = None
         self._adaptive_observe_state = None
+        self._pending_terminal_state = None
+        self._pending_terminal_error = None
+        self._cleanup_failed = False
         self._atomic_depth = 0
         self._current_step = None
         self._use_stack = []
@@ -646,6 +733,12 @@ class SequencerRuntime:
             ),
         ):
             return 1
+        if isinstance(step, TryStep):
+            body = self._estimate_step_list(step.body, env)
+            cleanup = self._estimate_step_list(step.finally_steps, env)
+            if body is None or cleanup is None:
+                return None
+            return 1 + body + cleanup
         if isinstance(step, AdaptiveStep):
             return None
         if isinstance(step, UseStep):
@@ -740,6 +833,9 @@ class SequencerRuntime:
         return self._records_from_iterable([rendered])
 
     def _next_step(self) -> StepResult:
+        if self._pending_terminal_state is not None:
+            return self._next_terminal_unwind_step()
+
         while self._stack:
             frame = self._stack[-1]
             if isinstance(frame, _Frame):
@@ -771,6 +867,14 @@ class SequencerRuntime:
                     continue
                 frame.remaining -= 1
                 self._stack.append(_Frame(frame.body))
+                continue
+            if isinstance(frame, _TryFrame):
+                if frame.finalizing:
+                    self._stack.pop()
+                    continue
+                frame.finalizing = True
+                if frame.finally_steps:
+                    self._stack.append(_Frame(frame.finally_steps, run_during_unwind=True))
                 continue
             if isinstance(frame, _WhileFrame):
                 ok = self._eval_condition_safe(frame.condition)
@@ -806,6 +910,40 @@ class SequencerRuntime:
                 continue
         return None
 
+    def _next_terminal_unwind_step(self) -> StepResult:
+        while self._stack:
+            frame = self._stack[-1]
+            if isinstance(frame, _Frame):
+                if frame.run_during_unwind:
+                    if frame.index >= len(frame.steps):
+                        self._stack.pop()
+                        if frame.on_exit:
+                            frame.on_exit()
+                            self._sleep_until = None
+                            self._wait_state = None
+                            self._adaptive_observe_state = None
+                        continue
+                    step = frame.steps[frame.index]
+                    frame.index += 1
+                    return step
+                self._stack.pop()
+                if frame.on_exit:
+                    frame.on_exit()
+                    self._sleep_until = None
+                    self._wait_state = None
+                    self._adaptive_observe_state = None
+                continue
+            if isinstance(frame, _TryFrame):
+                if frame.finalizing:
+                    self._stack.pop()
+                    continue
+                frame.finalizing = True
+                if frame.finally_steps:
+                    self._stack.append(_Frame(frame.finally_steps, run_during_unwind=True))
+                continue
+            self._stack.pop()
+        return None
+
     def _execute_step(self, step: Step) -> bool:
         self._current_step = type(step).__name__
         handler = self._resolve_step_handler(step)
@@ -824,6 +962,7 @@ class SequencerRuntime:
             IfStep: self._execute_if_step,
             WhileStep: self._execute_while_step,
             AtomicStep: self._execute_atomic_step,
+            TryStep: self._execute_try_step,
             AssignStep: self._execute_assign_step,
             SetContextStep: self._execute_set_context_step,
             UseStep: self._execute_use_step,
@@ -844,6 +983,11 @@ class SequencerRuntime:
         return None
 
     def _fail_step(self, message: str) -> bool:
+        if self._pending_terminal_state is not None:
+            self._note_cleanup_failure(str(message))
+            return True
+        if self._begin_terminal_unwind("ERROR", str(message)):
+            return True
         self._last_error = str(message)
         self._state = "ERROR"
         return True
@@ -896,6 +1040,11 @@ class SequencerRuntime:
             self._atomic_depth -= 1
 
         self._stack.append(_Frame(step.body, on_exit=_exit))
+        return False
+
+    def _execute_try_step(self, step: TryStep) -> bool:
+        self._stack.append(_TryFrame(step.finally_steps))
+        self._stack.append(_Frame(step.body))
         return False
 
     def _execute_assign_step(self, step: AssignStep) -> bool:
@@ -969,8 +1118,11 @@ class SequencerRuntime:
         return False
 
     def _execute_set_step(self, step: SetStep) -> bool:
+        device = str(render_templates(step.device, self._env_view()) or "").strip()
+        if not device:
+            return self._fail_step("set.device rendered empty")
         value = render_templates(step.value, self._env_view())
-        resp = self._call_device(step.device, "set", {"name": step.name, "value": value})
+        resp = self._call_device(device, "set", {"name": step.name, "value": value})
         if not resp.get("ok", False):
             return self._fail_step(str(resp.get("error")))
         return False
@@ -998,12 +1150,28 @@ class SequencerRuntime:
             return self._get_process_telemetry(process, signal)
         return self._get_telemetry(device, signal)
 
+    def _render_call_target(
+        self, call_spec: dict[str, Any]
+    ) -> tuple[str, str | None, str]:
+        env = self._env_view()
+        device = str(render_templates(call_spec.get("device", ""), env) or "").strip()
+        process = str(render_templates(call_spec.get("process", ""), env) or "").strip()
+        action = str(render_templates(call_spec.get("action", ""), env) or "").strip()
+        if device and process:
+            raise ValueError("call may set only one of device / process after rendering")
+        if (not device and not process) or not action:
+            raise ValueError("call target rendered empty device/process or action")
+        return device, process or None, action
+
     def _execute_call_step(self, step: CallStep) -> bool:
+        device, process, action = self._render_call_target(
+            {"device": step.device, "process": step.process or "", "action": step.action}
+        )
         params = render_templates(step.params, self._env_view())
         resp = self._dispatch_call(
-            device=step.device,
-            process=step.process,
-            action=step.action,
+            device=device,
+            process=process,
+            action=action,
             params=params,
         )
         if step.save_as:
@@ -1161,6 +1329,16 @@ class SequencerRuntime:
             elif isinstance(step, ParallelStep):
                 out.extend(
                     self._collect_adaptive_step_ids(step.body, seen_use_ids=seen_use_ids)
+                )
+            elif isinstance(step, TryStep):
+                out.extend(
+                    self._collect_adaptive_step_ids(step.body, seen_use_ids=seen_use_ids)
+                )
+                out.extend(
+                    self._collect_adaptive_step_ids(
+                        step.finally_steps,
+                        seen_use_ids=seen_use_ids,
+                    )
                 )
             elif isinstance(step, UseStep):
                 if step.sequence_id in seen_use_ids:
@@ -2014,18 +2192,15 @@ class SequencerRuntime:
             time.sleep(0.01)
 
     def _sample_adaptive_call(self, config: dict[str, Any]) -> Any:
-        device = str(config.get("device", "") or "").strip()
-        process = str(config.get("process", "") or "").strip()
-        action = str(config.get("action", "") or "").strip()
-        if (not device and not process) or not action:
-            raise ValueError(
-                "adaptive call source requires device-or-process and action"
-            )
+        device, process, action = self._render_call_target(config)
         params = config.get("params", {}) or {}
         if not isinstance(params, dict):
             raise TypeError("adaptive call source params must be a dict")
         resp = self._dispatch_call(
-            device=device, process=process or None, action=action, params=params
+            device=device,
+            process=process,
+            action=action,
+            params=render_templates(params, self._env_view()),
         )
         if not resp.get("ok", False):
             raise RuntimeError(str(resp.get("error", "adaptive call source failed")))
@@ -2064,15 +2239,13 @@ class SequencerRuntime:
             call_spec = value["call"]
             if not isinstance(call_spec, dict):
                 return None
-            device = str(call_spec.get("device", ""))
-            process = str(call_spec.get("process", ""))
-            action = str(call_spec.get("action", ""))
+            device, process, action = self._render_call_target(call_spec)
             params = call_spec.get("params", {}) or {}
             if not isinstance(params, dict):
                 params = {}
             resp = self._dispatch_call(
                 device=device,
-                process=process or None,
+                process=process,
                 action=action,
                 params=render_templates(params, env),
             )
@@ -2156,9 +2329,8 @@ class SequencerRuntime:
         if ws is None:
             return True
         if ws.timeout_s and (now - ws.start_t) > ws.timeout_s:
-            self._last_error = "wait_until timeout"
-            self._state = "ERROR"
             self._wait_state = None
+            self._fail_step("wait_until timeout")
             return True
         if now < ws.next_sample_t:
             return False
