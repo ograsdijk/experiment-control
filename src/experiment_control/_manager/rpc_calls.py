@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Any, Callable
 
 import zmq
 
+from .driver_pub import normalized_chunk_descriptor_or_raise
 from ..utils.zmq_helpers import json_dumps, safe_json_loads
 
 if TYPE_CHECKING:
@@ -235,22 +236,6 @@ class RpcCallsMixin(_MixinBase):
                 )
                 handle.rpc_fail_count = 0
                 handle.rpc_last_fail_t_mono = None
-                payload = self._build_manager_command_payload(
-                    device_id=device_id,
-                    action=action,
-                    params=params,
-                    ok=_effective_status_ok(resp),
-                    status=resp.get("status"),
-                    error=resp.get("error"),
-                    result=resp.get("result"),
-                    source_kind=source_kind_text,
-                    source_id=source_id_text,
-                    is_remote_target=bool(is_remote_target),
-                    request_id=request_id,
-                    caller_process_id=caller_process_id_text,
-                )
-                self._publish_manager_event("manager.command", payload)
-                return resp
             except Exception as e:
                 handle.rpc_fail_count += 1
                 handle.rpc_last_fail_t_mono = time.monotonic()
@@ -272,6 +257,43 @@ class RpcCallsMixin(_MixinBase):
                 )
                 self._publish_manager_event("manager.command", payload)
                 raise
+            payload = self._build_manager_command_payload(
+                device_id=device_id,
+                action=action,
+                params=params,
+                ok=_effective_status_ok(resp),
+                status=resp.get("status"),
+                error=resp.get("error"),
+                result=resp.get("result"),
+                source_kind=source_kind_text,
+                source_id=source_id_text,
+                is_remote_target=bool(is_remote_target),
+                request_id=request_id,
+                caller_process_id=caller_process_id_text,
+            )
+            self._publish_manager_event("manager.command", payload)
+            if _effective_status_ok(resp) is True and action.startswith("stream__"):
+                result = resp.get("result")
+                try:
+                    if not isinstance(result, dict):
+                        raise TypeError("stream RPC result must be a descriptor dict")
+                    desc = normalized_chunk_descriptor_or_raise({"descriptor": result})
+                    self._ingest_chunk_ready({"descriptor": desc})
+                except Exception as exc:
+                    self._publish_manager_event(
+                        "manager.chunk_error",
+                        {
+                            "device_id": device_id,
+                            "action": action,
+                            "error": (
+                                "stream RPC result chunk ingest failed: "
+                                f"{exc}"
+                            ),
+                            "raw": result,
+                        },
+                    )
+                    raise
+            return resp
 
     def _call_process_rpc(
         self,

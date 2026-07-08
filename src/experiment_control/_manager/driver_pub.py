@@ -629,12 +629,26 @@ def _normalized_chunk_descriptor(msg: Json) -> Json | None:
     return desc
 
 
+def normalized_chunk_descriptor_or_raise(msg: Json) -> Json:
+    desc = _normalized_chunk_descriptor(msg)
+    if desc is None:
+        raise ValueError(
+            "chunk descriptor must include device_id, stream, and shm_name"
+        )
+    return desc
+
+
 def ingest_chunk_ready(manager: Any, msg: Json) -> None:
     desc = _normalized_chunk_descriptor(msg)
     if desc is None:
         return
     device_id = str(desc["device_id"])
     stream = str(desc["stream"])
+    seq = desc.get("seq")
+    if seq is not None:
+        previous = manager._latest_chunk_desc.get(device_id, {}).get(stream)
+        if isinstance(previous, dict) and previous.get("seq") == seq:
+            return
     _store_chunk_descriptor(
         manager,
         device_id=device_id,
