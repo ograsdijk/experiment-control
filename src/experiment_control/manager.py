@@ -483,6 +483,8 @@ class Manager(
         self._manager_chunk_ready_published_total = 0
         self._manager_chunk_ready_ingest_error_total = 0
         self._manager_driver_pub_drain_cap_hit_total = 0
+        self._manager_driver_pub_priority_scan_extended_total = 0
+        self._manager_driver_pub_priority_scan_exhausted_total = 0
         self._command_interceptor_routes: list[CommandInterceptorRoute] = []
         self._command_interceptor_order = 0
         self._command_interceptor_cache_max = 2048

@@ -18,6 +18,12 @@ Json = dict[str, Any]
 # (~20-30 msgs/sec total across all SUB sockets) the cap is never hit;
 # its purpose is to keep an avalanche (e.g. post-stall backlog) from
 # monopolising a single tick.
+#
+# driver_pub is the one exception: its handler (_manager/driver_pub.py,
+# handle_driver_pub) layers a second, conditional MAX_DRAIN_PER_TICK
+# budget on top of this one to keep a chunk_ready message from starving
+# behind a telemetry/heartbeat backlog, so its worst-case per-tick read
+# count is up to 2x this constant (~50 ms), not a flat ceiling of it.
 MAX_DRAIN_PER_TICK = 256
 
 

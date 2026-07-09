@@ -263,19 +263,70 @@ def handle_driver_pub(manager: Any) -> None:
     # ~1 Hz can saturate a single-message-per-tick drain at 20 Hz).
     # Backlog → telemetry & device-heartbeat checks fire against
     # stale state. The drain cap bounds tick duration.
+    #
+    # Single SUB socket, so messages can only be read in arrival order —
+    # a chunk_ready sitting behind a full MAX_DRAIN_PER_TICK batch of
+    # telemetry/heartbeat can't be "skipped to" without first reading
+    # what's ahead of it. If the base pass hits its cap without having
+    # seen a chunk_ready yet, keep reading (bounded by a second cap) until
+    # one turns up or the socket/ceiling is exhausted, so chunk_ready is
+    # still first-class even when it's just past MAX_DRAIN_PER_TICK. A
+    # chunk_ready buried past 2*MAX_DRAIN_PER_TICK is still deferred a
+    # tick (see _manager_driver_pub_priority_scan_exhausted_total below)
+    # — closing that residual window would need chunk_ready on its own
+    # subscription/socket instead of this single shared one.
+    #
+    # This is a bespoke loop rather than utils.zmq_helpers's
+    # drain_multipart_nonblocking because that helper's handler callback
+    # has no way to signal "stop early, found what I was looking for" —
+    # its bool return only feeds a parse-error counter, never breaks the
+    # drain.
     messages: list[tuple[str, Json]] = []
     cap_hit = True
-    for _ in range(MAX_DRAIN_PER_TICK):
+    chunk_seen = False
+    base_reads = 0
+    extended_reads = 0
+    while True:
+        base_cap_reached = base_reads >= MAX_DRAIN_PER_TICK
+        if base_cap_reached:
+            extension_exhausted = extended_reads >= MAX_DRAIN_PER_TICK
+            if chunk_seen or extension_exhausted:
+                if chunk_seen and extended_reads > 0 and not extension_exhausted:
+                    # Stopped mid-extension purely because chunk_ready
+                    # turned up — we deliberately stopped reading before
+                    # exhausting the extension budget, so we have no
+                    # evidence either way about further backlog. Don't
+                    # claim a cap hit we can't back up.
+                    cap_hit = False
+                break
         try:
             topic_b, payload_b = manager._sub.recv_multipart(zmq.NOBLOCK)
         except zmq.Again:
             cap_hit = False
             break
+        if base_cap_reached:
+            extended_reads += 1
+        else:
+            base_reads += 1
         topic = manager._normalize_topic(topic_b.decode("utf-8", errors="replace"))
         msg = _decode_driver_pub_payload(manager, topic, payload_b)
         if msg is None:
             continue
         messages.append((topic, msg))
+        if topic.endswith("/chunk_ready"):
+            chunk_seen = True
+
+    if extended_reads:
+        _counter_add(
+            manager,
+            "_manager_driver_pub_priority_scan_extended_total",
+            extended_reads,
+        )
+        if extended_reads >= MAX_DRAIN_PER_TICK and not chunk_seen:
+            # Extension ran to its full budget and still never found a
+            # chunk_ready — the priority search itself gave up empty
+            # handed this tick, distinct from merely "an extension ran".
+            _counter_add(manager, "_manager_driver_pub_priority_scan_exhausted_total")
 
     chunk_messages = [
         (topic, msg) for topic, msg in messages if topic.endswith("/chunk_ready")
@@ -288,11 +339,14 @@ def handle_driver_pub(manager: Any) -> None:
 
     if not cap_hit:
         return
-    # Loop completed full MAX_DRAIN_PER_TICK iterations without zmq.Again:
-    # queue still has data. Surface this (rate-limited) so operators see
-    # the backlog instead of silent message lag.
+    # Loop completed without seeing zmq.Again: queue still has data.
+    # Surface this (rate-limited) so operators see the backlog instead
+    # of silent message lag. Report what was actually drained this tick
+    # (up to 2*MAX_DRAIN_PER_TICK once the extension pass engages), not
+    # just the base constant — the two diverge whenever the extension
+    # pass ran.
     _counter_add(manager, "_manager_driver_pub_drain_cap_hit_total")
-    manager._maybe_publish_drain_cap_hit("driver_pub", MAX_DRAIN_PER_TICK)
+    manager._maybe_publish_drain_cap_hit("driver_pub", base_reads + extended_reads)
 
 
 def _emit_ingest_error(manager: Any, topic: str, payload: Json) -> None:
