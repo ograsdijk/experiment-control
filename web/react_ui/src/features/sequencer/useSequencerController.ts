@@ -1467,19 +1467,36 @@ export function useSequencerController({
       return;
     }
     let alive = true;
+    let interval: ReturnType<typeof setInterval> | null = null;
+    // The host process can stay RUNNING even after the sequence run itself
+    // has errored out, so gate solely on process state would keep polling
+    // (and the elapsed-time display ticking) forever. Stop once the last
+    // known run state is terminal.
+    const isRunTerminal = () => {
+      const runState = String(
+        sequencerStatusByProcessIdRef.current[processId]?.state ?? ""
+      ).toUpperCase();
+      return ["ERROR", "STOPPED", "IDLE"].includes(runState);
+    };
     const load = async () => {
       if (!alive) {
         return;
       }
       await refreshSequencerStatus(processId);
+      if (alive && interval && isRunTerminal()) {
+        clearInterval(interval);
+        interval = null;
+      }
     };
     void load();
-    const interval = setInterval(() => {
+    interval = setInterval(() => {
       void load();
     }, 1500);
     return () => {
       alive = false;
-      clearInterval(interval);
+      if (interval) {
+        clearInterval(interval);
+      }
     };
   }, [refreshSequencerStatus, sequencerProcess]);
 

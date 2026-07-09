@@ -833,9 +833,15 @@ class SequencerRuntime:
                     serpentine_index=loop_index_raw if isinstance(loop_index_raw, int) else None,
                 )
             except Exception as exc:
-                path = self._step_source_info.get(id(step))
-                where = f" at {path.path}" if path else ""
-                return _StepEstimate(None, f"for generator{where} could not render: {exc}")
+                count = self._estimate_gen_count_only(step.in_expr, env)
+                if count is None:
+                    path = self._step_source_info.get(id(step))
+                    where = f" at {path.path}" if path else ""
+                    return _StepEstimate(None, f"for generator{where} could not render: {exc}")
+                records = [
+                    {"value": None, "index": index, "count": count, "u": 0.0}
+                    for index in range(count)
+                ]
             total = 1
             for index, record in enumerate(records):
                 loop_env = dict(env)
@@ -875,6 +881,50 @@ class SequencerRuntime:
         out.update(env)
         out["vars"] = to_attrdict(self._vars)
         return out
+
+    # Generator kinds whose element count is fixed by `num` alone: the
+    # sampled values (center, span, start, stop, ...) can vary without
+    # changing how many records come out. Used as a fallback when the full
+    # generator spec can't be rendered yet (e.g. `center` comes from an
+    # `assign` step that reads a live device and hasn't run at estimate
+    # time), so the progress bar isn't hidden for something count-only
+    # estimation can still answer.
+    _GEN_COUNT_ONLY_KEYS = ("linspace", "logspace", "geomspace", "triangle", "centered_triangle")
+
+    def _estimate_gen_count_only(self, value: Any, env: dict[str, Any]) -> int | None:
+        if not isinstance(value, dict):
+            return None
+        gen = value.get("gen")
+        if not isinstance(gen, dict):
+            return None
+        env_view = self._estimate_env_view(env)
+        base_count: int | None = None
+        for kind in self._GEN_COUNT_ONLY_KEYS:
+            spec = gen.get(kind)
+            if not isinstance(spec, dict) or "num" not in spec:
+                continue
+            try:
+                num = int(render_templates(spec["num"], env_view))
+            except Exception:
+                return None
+            if num < 1:
+                return None
+            if kind == "triangle":
+                base_count = 2 * num
+            elif kind == "centered_triangle":
+                base_count = 2 * num + 1
+            else:
+                base_count = num
+            break
+        if base_count is None:
+            return None
+        sample_spec = gen.get("sample")
+        if isinstance(sample_spec, dict) and "count" in sample_spec:
+            try:
+                return int(render_templates(sample_spec["count"], env_view))
+            except Exception:
+                return None
+        return base_count
 
     def _estimate_iterable(
         self,

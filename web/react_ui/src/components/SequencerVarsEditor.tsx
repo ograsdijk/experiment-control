@@ -34,7 +34,11 @@ export function SequencerVarsEditor({
   issueText = null,
 }: Props) {
   return (
-    <Card radius="sm" p="xs" style={{ border: "1px solid var(--card-border)" }}>
+    <Card
+      radius="sm"
+      p="xs"
+      style={{ border: "1px solid var(--card-border)", containerType: "inline-size" }}
+    >
       <KeyValueChipList
         entries={entries}
         onChange={onChange}
