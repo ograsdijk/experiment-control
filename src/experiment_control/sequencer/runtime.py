@@ -130,6 +130,7 @@ class SequencerRuntime:
         resolve_use: Callable[[str], SequenceSpec] | None = None,
         call_process: Callable[[str, str, dict[str, Any]], dict[str, Any]] | None = None,
         get_process_telemetry: Callable[[str, str], dict[str, Any] | None] | None = None,
+        expect_streams: Callable[[list[tuple[str, str]], int], None] | None = None,
     ) -> None:
         self._call_device = call_device
         self._get_telemetry = get_telemetry
@@ -140,6 +141,7 @@ class SequencerRuntime:
         # a sequence that targets `process:` without these wired fails clearly.
         self._call_process = call_process
         self._get_process_telemetry = get_process_telemetry
+        self._expect_streams = expect_streams
 
         self._spec: SequenceSpec | None = None
         self._vars: dict[str, Any] = {}
@@ -1193,7 +1195,10 @@ class SequencerRuntime:
         ctx_id = self._context_id
         fields = render_templates(step.fields, self._env_view())
         try:
-            for device, stream in self._normalize_streams(step.streams):
+            streams = self._normalize_streams(step.streams)
+            if streams and self._expect_streams is not None:
+                self._expect_streams(streams, ctx_id)
+            for device, stream in streams:
                 self._set_stream_context(device, stream, ctx_id, fields)
         except Exception as e:
             return self._fail_step(f"set_context failed: {e}")

@@ -81,6 +81,18 @@ class _OptionalDeviceActionResult:
     error: str | None = None
 
 
+_STREAM_COUNTER_ATTRS: tuple[str, ...] = (
+    "chunk_ready_seen_total",
+    "events_read_total",
+    "rows_written_total",
+    "seq_gap_total",
+    "startup_seq_gap",
+    "attach_failures_total",
+    "drain_failures_total",
+    "payload_size_failures_total",
+)
+
+
 def _default_filename() -> str:
     return time.strftime("%Y_%m_%d-%H_%M_%S.h5", time.localtime())
 
@@ -520,6 +532,14 @@ class HdfWriter(ManagedProcessBase):
         self._stream_context_by_seq: dict[tuple[str, str], dict[int, tuple[int, float]]] = {}
         self._stream_pending_by_seq: dict[tuple[str, str], dict[int, Json]] = {}
         self._stream_last_written_seq: dict[tuple[str, str], int] = {}
+        self._stream_expectations: dict[tuple[str, str], dict[str, Any]] = {}
+        self._stream_expectations_by_context: dict[
+            tuple[int, str, str], dict[str, Any]
+        ] = {}
+        self._stream_counters: dict[tuple[str, str], dict[str, Any]] = {}
+        self._stream_context_counters: dict[tuple[int, str, str], dict[str, Any]] = {}
+        self._strict_stream_errors: list[Json] = []
+        self._acquisition_ok = True
         self._context_resolved_exact = 0
         self._context_late_resolved = 0
         self._context_written_minus1_missing = 0
@@ -1379,6 +1399,9 @@ class HdfWriter(ManagedProcessBase):
                 self._measurement_ended_wall_ns = int(ended_raw)
             except Exception:
                 self._measurement_ended_wall_ns = None
+        self._acquisition_ok = bool(group.attrs.get("acquisition_ok", True))
+        self._strict_stream_errors = []
+        self._persist_acquisition_attrs()
 
     def _append_measurement_note_row(
         self,
@@ -2032,6 +2055,12 @@ class HdfWriter(ManagedProcessBase):
             "stream_context_by_seq": self._stream_context_by_seq,
             "stream_pending_by_seq": self._stream_pending_by_seq,
             "stream_last_written_seq": self._stream_last_written_seq,
+            "stream_expectations": self._stream_expectations,
+            "stream_expectations_by_context": self._stream_expectations_by_context,
+            "stream_counters": self._stream_counters,
+            "stream_context_counters": self._stream_context_counters,
+            "strict_stream_errors": self._strict_stream_errors,
+            "acquisition_ok": self._acquisition_ok,
             "context_resolved_exact": self._context_resolved_exact,
             "context_late_resolved": self._context_late_resolved,
             "context_written_minus1_missing": self._context_written_minus1_missing,
@@ -2088,6 +2117,14 @@ class HdfWriter(ManagedProcessBase):
         self._stream_context_by_seq = state["stream_context_by_seq"]
         self._stream_pending_by_seq = state["stream_pending_by_seq"]
         self._stream_last_written_seq = state["stream_last_written_seq"]
+        self._stream_expectations = state.get("stream_expectations", {})
+        self._stream_expectations_by_context = state.get(
+            "stream_expectations_by_context", {}
+        )
+        self._stream_counters = state.get("stream_counters", {})
+        self._stream_context_counters = state.get("stream_context_counters", {})
+        self._strict_stream_errors = state.get("strict_stream_errors", [])
+        self._acquisition_ok = bool(state.get("acquisition_ok", True))
         self._context_resolved_exact = int(state["context_resolved_exact"])
         self._context_late_resolved = int(state["context_late_resolved"])
         self._context_written_minus1_missing = int(
@@ -2147,6 +2184,12 @@ class HdfWriter(ManagedProcessBase):
         self._stream_context_by_seq = {}
         self._stream_pending_by_seq = {}
         self._stream_last_written_seq = {}
+        self._stream_expectations = {}
+        self._stream_expectations_by_context = {}
+        self._stream_counters = {}
+        self._stream_context_counters = {}
+        self._strict_stream_errors = []
+        self._acquisition_ok = True
         self._context_resolved_exact = 0
         self._context_late_resolved = 0
         self._context_written_minus1_missing = 0
@@ -2154,6 +2197,216 @@ class HdfWriter(ManagedProcessBase):
         self._context_evicted_map_overflow = 0
         self._telemetry_batch_buffers = {}
         self._event_batch_buffer = None
+
+    @staticmethod
+    def _stream_key_from_parts(device_id: Any, stream: Any) -> tuple[str, str] | None:
+        device_text = str(device_id or "").strip()
+        stream_text = str(stream or "").strip()
+        if not device_text or not stream_text:
+            return None
+        return device_text, stream_text
+
+    def _stream_counter_state(self, key: tuple[str, str]) -> dict[str, Any]:
+        counters = self._stream_counters.setdefault(
+            key,
+            {
+                "chunk_ready_seen_total": 0,
+                "events_read_total": 0,
+                "rows_written_total": 0,
+                "seq_gap_total": 0,
+                "startup_seq_gap": 0,
+                "attach_failures_total": 0,
+                "drain_failures_total": 0,
+                "payload_size_failures_total": 0,
+                "first_seq": -1,
+                "last_seq": -1,
+                "last_error": "",
+            },
+        )
+        return counters
+
+    def _stream_context_counter_state(
+        self, key: tuple[int, str, str]
+    ) -> dict[str, Any]:
+        counters = self._stream_context_counters.setdefault(
+            key,
+            {
+                "rows_written_total": 0,
+            },
+        )
+        return counters
+
+    def _stream_group_for_key(self, key: tuple[str, str]) -> h5py.Group | None:
+        if self._streams_group is None:
+            return None
+        device_id, stream = key
+        return self._streams_group.require_group(device_id).require_group(stream)
+
+    def _persist_stream_attrs(self, key: tuple[str, str]) -> None:
+        group = self._stream_group_for_key(key)
+        if group is None:
+            return
+        counters = self._stream_counter_state(key)
+        expectation = self._stream_expectations.get(key, {})
+        for attr in _STREAM_COUNTER_ATTRS:
+            group.attrs[attr] = int(counters.get(attr, 0) or 0)
+        group.attrs["first_seq"] = int(counters.get("first_seq", -1))
+        group.attrs["last_seq"] = int(counters.get("last_seq", -1))
+        group.attrs["last_error"] = str(counters.get("last_error", "") or "")
+        if expectation:
+            group.attrs["expected_count"] = int(expectation.get("expected_count", -1))
+            group.attrs["strict_required"] = bool(expectation.get("strict", False))
+            group.attrs["context_id"] = int(expectation.get("context_id", -1))
+        context_ids = sorted(
+            context_id
+            for context_id, device_id, stream in self._stream_expectations_by_context
+            if (device_id, stream) == key
+        )
+        if context_ids:
+            group.attrs["expected_context_ids_json"] = json.dumps(context_ids)
+
+    def _bump_stream_counter(
+        self,
+        key: tuple[str, str],
+        attr: str,
+        amount: int = 1,
+        *,
+        last_error: str | None = None,
+    ) -> None:
+        counters = self._stream_counter_state(key)
+        counters[attr] = int(counters.get(attr, 0) or 0) + int(amount)
+        if last_error:
+            counters["last_error"] = str(last_error)
+
+    def _bump_stream_context_counter(
+        self,
+        key: tuple[int, str, str],
+        attr: str,
+        amount: int = 1,
+    ) -> None:
+        counters = self._stream_context_counter_state(key)
+        counters[attr] = int(counters.get(attr, 0) or 0) + int(amount)
+
+    def _note_stream_seq(self, key: tuple[str, str], seq: int | None) -> None:
+        if seq is None:
+            return
+        try:
+            seq_i = int(seq)
+        except Exception:
+            return
+        counters = self._stream_counter_state(key)
+        first = int(counters.get("first_seq", -1))
+        if first < 0 or seq_i < first:
+            counters["first_seq"] = seq_i
+        last = int(counters.get("last_seq", -1))
+        if seq_i > last:
+            counters["last_seq"] = seq_i
+
+    def _persist_acquisition_attrs(self) -> None:
+        errors_json = json.dumps(self._strict_stream_errors)
+        if self._h5 is not None:
+            self._h5.attrs["acquisition_ok"] = bool(self._acquisition_ok)
+            self._h5.attrs["hdf_strict_stream_errors_json"] = errors_json
+        if self._measurement_group is not None:
+            self._measurement_group.attrs["acquisition_ok"] = bool(
+                self._acquisition_ok
+            )
+            self._measurement_group.attrs["hdf_strict_stream_errors_json"] = errors_json
+
+    def _record_strict_stream_error(
+        self,
+        key: tuple[str, str],
+        reason: str,
+        *,
+        context_id: int | None = None,
+        expected_count: int | None = None,
+        rows_written: int | None = None,
+    ) -> None:
+        device_id, stream = key
+        err: Json = {"device_id": device_id, "stream": stream, "reason": reason}
+        if context_id is not None:
+            err["context_id"] = int(context_id)
+        if expected_count is not None:
+            err["expected_count"] = int(expected_count)
+        if rows_written is not None:
+            err["rows_written"] = int(rows_written)
+        if err not in self._strict_stream_errors:
+            self._strict_stream_errors.append(err)
+        self._acquisition_ok = False
+        counters = self._stream_counter_state(key)
+        counters["last_error"] = reason
+        self._persist_stream_attrs(key)
+        self._persist_acquisition_attrs()
+        try:
+            self.publish_telemetry({"hdf_strict_stream_error": reason}, quality="bad")
+        except Exception:
+            self._bump_error("strict_streams.publish_error")
+
+    def _finalize_strict_streams_locked(self) -> None:
+        self._assert_h5_locked()
+        for context_key, expectation in list(
+            self._stream_expectations_by_context.items()
+        ):
+            if not bool(expectation.get("strict", False)):
+                continue
+            context_id, device_id, stream = context_key
+            key = (device_id, stream)
+            counters = self._stream_counter_state(key)
+            seen = int(counters.get("chunk_ready_seen_total", 0) or 0)
+            if context_id < 0:
+                rows = int(counters.get("rows_written_total", 0) or 0)
+            else:
+                context_counters = self._stream_context_counter_state(context_key)
+                rows = int(context_counters.get("rows_written_total", 0) or 0)
+            gaps = int(counters.get("seq_gap_total", 0) or 0)
+            attach_failures = int(counters.get("attach_failures_total", 0) or 0)
+            drain_failures = int(counters.get("drain_failures_total", 0) or 0)
+            payload_failures = int(
+                counters.get("payload_size_failures_total", 0) or 0
+            )
+            expected = int(expectation.get("expected_count", -1))
+            if seen <= 0:
+                self._record_strict_stream_error(
+                    key,
+                    "required stream never seen",
+                    context_id=context_id,
+                    expected_count=expected if expected >= 0 else None,
+                    rows_written=rows,
+                )
+            elif rows <= 0:
+                self._record_strict_stream_error(
+                    key,
+                    "required stream seen but no rows written",
+                    context_id=context_id,
+                    expected_count=expected if expected >= 0 else None,
+                    rows_written=rows,
+                )
+            if expected >= 0 and rows < expected:
+                self._record_strict_stream_error(
+                    key,
+                    "required stream wrote fewer rows than expected",
+                    context_id=context_id,
+                    expected_count=expected,
+                    rows_written=rows,
+                )
+            if gaps > 0:
+                self._record_strict_stream_error(
+                    key,
+                    "required stream has sequence gaps",
+                    context_id=context_id,
+                    expected_count=expected if expected >= 0 else None,
+                    rows_written=rows,
+                )
+            if attach_failures or drain_failures or payload_failures:
+                self._record_strict_stream_error(
+                    key,
+                    "required stream had attach, drain, or payload failures",
+                    context_id=context_id,
+                    expected_count=expected if expected >= 0 else None,
+                    rows_written=rows,
+                )
+            self._persist_stream_attrs(key)
+        self._persist_acquisition_attrs()
 
     def _configure_active_file(
         self,
@@ -2337,6 +2590,7 @@ class HdfWriter(ManagedProcessBase):
                 require_profile=self._measurement_schema is not None,
             )
             self._drain_pending_to_file()
+            self._finalize_strict_streams_locked()
             old_state = self._snapshot_file_state()
             self._disabled_devices = new_disabled
             self._clear_buffered_for_disabled(new_disabled)
@@ -2471,6 +2725,11 @@ class HdfWriter(ManagedProcessBase):
                 self._bump_error("stop_writing.drain")
                 errors.append(f"drain_pending failed: {e}")
             try:
+                self._finalize_strict_streams_locked()
+            except Exception as e:
+                self._bump_error("stop_writing.strict_streams")
+                errors.append(f"strict stream finalization failed: {e}")
+            try:
                 self._mark_active_measurement_ended()
             except Exception as e:
                 self._bump_error("stop_writing.measurement_end")
@@ -2576,6 +2835,10 @@ class HdfWriter(ManagedProcessBase):
                     self._drain_pending_to_file()
                 except Exception:
                     self._bump_error("close.drain")
+                try:
+                    self._finalize_strict_streams_locked()
+                except Exception:
+                    self._bump_error("close.strict_streams")
                 self._mark_active_measurement_ended()
             self._h5 = None
             self._publish_h5_state_cache()
@@ -3136,6 +3399,8 @@ class HdfWriter(ManagedProcessBase):
                 "hdf.processes.get": self._rpc_hdf_processes_get,
                 "hdf.processes.disable": self._rpc_hdf_processes_disable,
                 "hdf.processes.enable": self._rpc_hdf_processes_enable,
+                "hdf.streams.expect": self._rpc_hdf_streams_expect,
+                "hdf.ready_for_streams": self._rpc_hdf_ready_for_streams,
                 "hdf.rotate": self._rpc_hdf_rotate,
             },
             aliases={
@@ -3148,6 +3413,7 @@ class HdfWriter(ManagedProcessBase):
                 "hdf.get_processes": "hdf.processes.get",
                 "hdf.disable_processes": "hdf.processes.disable",
                 "hdf.enable_processes": "hdf.processes.enable",
+                "hdf.expect_streams": "hdf.streams.expect",
                 "hdf.rotate_file": "hdf.rotate",
             },
         )
@@ -3270,6 +3536,22 @@ class HdfWriter(ManagedProcessBase):
                     ),
                 ],
                 doc="Enable writing for process telemetry process_ids.",
+            ),
+            method(
+                "hdf.streams.expect",
+                params=[
+                    param("streams", required=True, default=None, annotation="list[dict]"),
+                    param("context_id", required=False, default=None, annotation="int"),
+                    param("strict", required=False, default=True, annotation="bool"),
+                ],
+                doc="Register required stream chunks for the active acquisition.",
+            ),
+            method(
+                "hdf.ready_for_streams",
+                params=[
+                    param("streams", required=True, default=None, annotation="list[dict]"),
+                ],
+                doc="Report whether HDF writer is ready for stream acquisition.",
             ),
             method(
                 "hdf.rotate",
@@ -3422,6 +3704,14 @@ class HdfWriter(ManagedProcessBase):
             "sequencer_yaml_snapshots": int(self._sequencer_yaml_ds.shape[0])
             if self._sequencer_yaml_ds is not None
             else 0,
+            "acquisition_ok": bool(self._acquisition_ok),
+            "strict_stream_errors": list(self._strict_stream_errors),
+            "stream_expectations": [
+                dict(value) for value in self._stream_expectations.values()
+            ],
+            "stream_expectations_by_context": [
+                dict(value) for value in self._stream_expectations_by_context.values()
+            ],
         }
         result.update(self._hdf_device_filter_state())
         result.update(self._hdf_process_filter_state())
@@ -3654,6 +3944,149 @@ class HdfWriter(ManagedProcessBase):
                 **self._hdf_process_filter_state(),
             },
         )
+
+    def _normalize_stream_expect_specs(
+        self,
+        raw_streams: Any,
+        *,
+        context_id: int | None,
+        strict: bool,
+    ) -> list[Json]:
+        if not isinstance(raw_streams, list):
+            raise TypeError("streams must be a list")
+        specs: list[Json] = []
+        for item in raw_streams:
+            expected_count = -1
+            item_context = context_id
+            if isinstance(item, str):
+                if "." in item:
+                    device_id, stream = item.split(".", 1)
+                elif "/" in item:
+                    device_id, stream = item.split("/", 1)
+                else:
+                    raise TypeError(f"stream {item!r} must be device.stream")
+            elif isinstance(item, dict):
+                device_id = item.get("device_id", item.get("device", ""))
+                stream = item.get("stream", "")
+                if item.get("expected_count") is not None:
+                    expected_count = int(item.get("expected_count"))
+                    if expected_count < 0:
+                        raise ValueError("expected_count must be >= 0")
+                if item.get("context_id") is not None:
+                    item_context = int(item.get("context_id"))
+            else:
+                raise TypeError("stream entries must be dicts or strings")
+            key = self._stream_key_from_parts(device_id, stream)
+            if key is None:
+                raise TypeError("stream entries require device_id and stream")
+            specs.append(
+                {
+                    "device_id": key[0],
+                    "stream": key[1],
+                    "expected_count": int(expected_count),
+                    "context_id": int(item_context) if item_context is not None else -1,
+                    "strict": bool(strict),
+                }
+            )
+        return specs
+
+    def _stream_ready_payload(self, specs: list[Json]) -> Json:
+        stream_items: list[Json] = []
+        for spec in specs:
+            key = (str(spec["device_id"]), str(spec["stream"]))
+            schema = self._stream_schema.get(key)
+            schema_payload = None
+            if isinstance(schema, dict):
+                schema_payload = {
+                    "dtype": str(schema.get("dtype")),
+                    "shape": list(schema.get("shape", []) or []),
+                }
+            stream_items.append(
+                {
+                    "device_id": key[0],
+                    "stream": key[1],
+                    "known_stream_schema": schema_payload,
+                    "last_chunk_seen_seq": int(
+                        self._stream_counter_state(key).get("last_seq", -1)
+                    ),
+                    "last_written_seq": int(self._stream_last_written_seq.get(key, 0)),
+                }
+            )
+        return {
+            "writing_active": bool(self._writing_active),
+            "bg_thread_alive": self._bg_thread is not None
+            and self._bg_thread.is_alive()
+            and not self._bg_thread_dead,
+            "strict_streams_enabled": True,
+            "streams": stream_items,
+            "measurement_id": self._measurement_id,
+        }
+
+    def _rpc_hdf_ready_for_streams(self, req: Json) -> Json:
+        params = req.get("params", {})
+        if params is None:
+            params = {}
+        if not isinstance(params, dict):
+            return self._rpc_error(req, code="invalid_params", message="params must be a dict")
+        try:
+            specs = self._normalize_stream_expect_specs(
+                params.get("streams", []),
+                context_id=None,
+                strict=False,
+            )
+        except Exception as e:
+            return self._rpc_error(req, code="invalid_params", message=str(e))
+        with self._h5_lock:
+            return self.rpc_ok(req, result=self._stream_ready_payload(specs))
+
+    def _rpc_hdf_streams_expect(self, req: Json) -> Json:
+        params = req.get("params", {})
+        if params is None:
+            params = {}
+        if not isinstance(params, dict):
+            return self._rpc_error(req, code="invalid_params", message="params must be a dict")
+        try:
+            context_id_raw = params.get("context_id")
+            context_id = int(context_id_raw) if context_id_raw is not None else None
+            specs = self._normalize_stream_expect_specs(
+                params.get("streams", []),
+                context_id=context_id,
+                strict=bool(params.get("strict", True)),
+            )
+        except Exception as e:
+            return self._rpc_error(req, code="invalid_params", message=str(e))
+        if not specs:
+            return self._rpc_error(
+                req, code="invalid_params", message="streams must not be empty"
+            )
+        with self._h5_lock:
+            if self._h5 is None:
+                return self._rpc_error(
+                    req,
+                    code="hdf_not_writing",
+                    message="HDF writer is not writing",
+                )
+            if (
+                self._bg_thread is None
+                or self._bg_thread_dead
+                or not self._bg_thread.is_alive()
+            ):
+                return self._rpc_error(
+                    req,
+                    code="hdf_bg_unavailable",
+                    message="HDF writer background thread is not alive",
+                )
+            for spec in specs:
+                key = (str(spec["device_id"]), str(spec["stream"]))
+                context_id = int(spec.get("context_id", -1))
+                context_key = (context_id, key[0], key[1])
+                self._stream_expectations[key] = dict(spec)
+                self._stream_expectations_by_context[context_key] = dict(spec)
+                self._stream_counter_state(key)
+                self._stream_context_counter_state(context_key)
+                self._persist_stream_attrs(key)
+            self._persist_acquisition_attrs()
+            return self.rpc_ok(req, result=self._stream_ready_payload(specs))
 
     def _rpc_hdf_rotate(self, req: Json) -> Json:
         params = req.get("params", {})
@@ -3968,6 +4401,8 @@ class HdfWriter(ManagedProcessBase):
         stream = chunk.stream
         key = (device_id, stream)
         now_mono = time.monotonic()
+        self._bump_stream_counter(key, "chunk_ready_seen_total")
+        self._note_stream_seq(key, chunk.seq)
         if not self._is_device_enabled(device_id):
             self._handle_chunk_ready_disabled_device(key=key, seq=chunk.seq)
             return
@@ -4060,6 +4495,11 @@ class HdfWriter(ManagedProcessBase):
             reader = ShmRingReader.attach(str(shm_name))
         except Exception:
             self._bump_error("stream.attach")
+            self._bump_stream_counter(
+                key,
+                "attach_failures_total",
+                last_error="stream attach failed",
+            )
             return None
         self._stream_readers[key] = reader
         session = self._next_stream_session(device_id, stream)
@@ -4073,6 +4513,10 @@ class HdfWriter(ManagedProcessBase):
         # only if the chunk carried no seq.
         if initial_seq is not None and int(initial_seq) > 0:
             self._stream_last_seq[key] = int(initial_seq) - 1
+            if int(initial_seq) > 1:
+                startup_gap = int(initial_seq) - 1
+                self._bump_stream_counter(key, "startup_seq_gap", startup_gap)
+                self._bump_stream_counter(key, "seq_gap_total", startup_gap)
         else:
             self._stream_last_seq[key] = 0
         self._stream_dropped_total[key] = 0
@@ -4099,6 +4543,11 @@ class HdfWriter(ManagedProcessBase):
             except Exception:
                 self._bump_error("stream.reader_close")
             self._bump_error("stream.drain")
+            self._bump_stream_counter(
+                key,
+                "drain_failures_total",
+                last_error="stream drain failed",
+            )
             self._reset_stream_runtime_state(key)
             return None
 
@@ -4113,13 +4562,17 @@ class HdfWriter(ManagedProcessBase):
     ) -> None:
         if not events:
             return
+        self._bump_stream_counter(key, "events_read_total", len(events))
         dropped = int(self._stream_dropped_total.get(key, 0))
         last_seq = int(initial_last_seq)
         for ev in events:
             seq = int(ev["seq"])
             if last_seq and seq > last_seq + 1:
-                dropped += seq - last_seq - 1
+                gap = seq - last_seq - 1
+                dropped += gap
+                self._bump_stream_counter(key, "seq_gap_total", gap)
             last_seq = seq
+            self._note_stream_seq(key, seq)
             context_id = self._resolve_context_for_seq(key=key, seq=seq)
             if context_id is not None:
                 event = self._pending_event_payload(ev=ev, now_mono=now_mono)
@@ -4738,6 +5191,12 @@ class HdfWriter(ManagedProcessBase):
                 expected_nbytes = int(dtype_obj.itemsize * int(np.prod(shape_obj, dtype=np.int64)))
                 self._stream_expected_nbytes[key] = expected_nbytes
             if any(len(payload) != expected_nbytes for payload in data_list):
+                self._bump_stream_counter(
+                    key,
+                    "payload_size_failures_total",
+                    last_error="stream payload size mismatch",
+                )
+                self._persist_stream_attrs(key)
                 self._clear_stream_buffer(buf)
                 continue
 
@@ -4775,10 +5234,22 @@ class HdfWriter(ManagedProcessBase):
             data_ds.attrs["dropped_total"] = dropped
 
             if seq_list:
+                self._bump_stream_counter(key, "rows_written_total", n)
+                for context_id in context_list:
+                    try:
+                        context_id_i = int(context_id)
+                    except Exception:
+                        continue
+                    if context_id_i >= 0:
+                        self._bump_stream_context_counter(
+                            (context_id_i, device_id, stream),
+                            "rows_written_total",
+                        )
                 self._stream_last_written_seq[key] = max(
                     int(self._stream_last_written_seq.get(key, 0)),
                     int(max(seq_list)),
                 )
+                self._persist_stream_attrs(key)
                 self._trim_context_map(key=key, now_mono=time.monotonic())
             self._clear_stream_buffer(buf)
 
@@ -4816,6 +5287,7 @@ class HdfWriter(ManagedProcessBase):
 
         device_group = self._streams_group.require_group(device_id)
         stream_group = device_group.require_group(stream)
+        self._persist_stream_attrs((device_id, stream))
         session_group = stream_group.require_group(f"session_{session:03d}")
 
         dtype_obj = np.dtype(dtype)

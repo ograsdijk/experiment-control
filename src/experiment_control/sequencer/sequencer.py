@@ -242,6 +242,7 @@ class SequencerProcess(ManagedProcessBase):
             resolve_use=self._resolve_use_sequence_spec,
             call_process=self._call_process,
             get_process_telemetry=self._get_process_telemetry,
+            expect_streams=self._expect_streams,
         )
         self._context_columns: dict[str, str] | None = None
         self._loaded_sequence_source: str | None = None
@@ -2394,6 +2395,21 @@ class SequencerProcess(ManagedProcessBase):
                 )
             time.sleep(backoff_s)
             backoff_s = min(backoff_s * 2.0, _STREAM_CONTEXT_SET_MAX_BACKOFF_S)
+
+    def _expect_streams(self, streams: list[tuple[str, str]], context_id: int) -> None:
+        if not streams:
+            return
+        params = {
+            "streams": [
+                {"device_id": device_id, "stream": stream}
+                for device_id, stream in streams
+            ],
+            "context_id": int(context_id),
+            "strict": True,
+        }
+        resp = self._call_process("hdf_writer", "hdf.streams.expect", params)
+        if not bool(resp.get("ok", False)):
+            raise RuntimeError(f"hdf.streams.expect failed: {self._device_error_text(resp)}")
 
     def _get_telemetry(self, device_id: str, signal: str) -> dict[str, Any] | None:
         return self._require_manager().get_latest(device_id, signal)
