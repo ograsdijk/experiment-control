@@ -90,6 +90,7 @@ _STREAM_COUNTER_ATTRS: tuple[str, ...] = (
     "attach_failures_total",
     "drain_failures_total",
     "payload_size_failures_total",
+    "write_failures_total",
 )
 
 
@@ -2218,6 +2219,7 @@ class HdfWriter(ManagedProcessBase):
                 "attach_failures_total": 0,
                 "drain_failures_total": 0,
                 "payload_size_failures_total": 0,
+                "write_failures_total": 0,
                 "first_seq": -1,
                 "last_seq": -1,
                 "last_error": "",
@@ -2364,6 +2366,7 @@ class HdfWriter(ManagedProcessBase):
             payload_failures = int(
                 counters.get("payload_size_failures_total", 0) or 0
             )
+            write_failures = int(counters.get("write_failures_total", 0) or 0)
             expected = int(expectation.get("expected_count", -1))
             if seen <= 0:
                 self._record_strict_stream_error(
@@ -2397,10 +2400,10 @@ class HdfWriter(ManagedProcessBase):
                     expected_count=expected if expected >= 0 else None,
                     rows_written=rows,
                 )
-            if attach_failures or drain_failures or payload_failures:
+            if attach_failures or drain_failures or payload_failures or write_failures:
                 self._record_strict_stream_error(
                     key,
-                    "required stream had attach, drain, or payload failures",
+                    "required stream had attach, drain, payload, or write failures",
                     context_id=context_id,
                     expected_count=expected if expected >= 0 else None,
                     rows_written=rows,
@@ -4521,7 +4524,12 @@ class HdfWriter(ManagedProcessBase):
             self._stream_last_seq[key] = 0
         self._stream_dropped_total[key] = 0
         self._stream_buffers.pop(key, None)
-        self._stream_schema.pop(key, None)
+        # Intentionally do NOT pop `_stream_schema` here. The config-driven
+        # schema (built from `stream_calls` with a real structured dtype) is
+        # authoritative and stable across sessions; dropping it forced a
+        # fallback to the reader-derived schema, which previously stored an
+        # unparseable dtype string. dtype/shape are properties of the stream,
+        # not the session, so the existing schema stays valid on re-attach.
         self._stream_expected_nbytes.pop(key, None)
         self._stream_pending_by_seq.pop(key, None)
         self._stream_context_by_seq.pop(key, None)
@@ -4592,8 +4600,14 @@ class HdfWriter(ManagedProcessBase):
         self._stream_last_seq[key] = last_seq
         self._stream_dropped_total[key] = dropped
         if key not in self._stream_schema:
+            # Store the real ``np.dtype`` object, NOT ``str(dtype)``. For a
+            # structured (records) dtype the ``str()`` form
+            # ("[('f0', '<i4'), ...]") is not round-trippable through
+            # ``np.dtype(...)`` and would raise in the bg flush path, taking
+            # the whole batch down with it. This mirrors the config-driven
+            # schema site, which also stores a live dtype object.
             self._stream_schema[key] = {
-                "dtype": str(reader.layout.dtype),
+                "dtype": reader.layout.dtype,
                 "shape": reader.layout.shape,
             }
         self._enforce_pending_context_cap(key=key)
@@ -5122,136 +5136,172 @@ class HdfWriter(ManagedProcessBase):
                 self._clear_stream_buffer(buf)
             return
         for key, buf in list(stream_buffers.items()):
-            data_list = buf.get("data", [])
-            if not data_list:
-                continue
-
-            device_id, stream = key
-            if not self._is_device_enabled(device_id):
-                self._clear_stream_buffer(buf)
-                continue
-            meta = stream_meta.get(key) if stream_meta else None
-            dtype_raw = meta.get("dtype") if meta else None
-            shape_raw = meta.get("shape") if meta else None
-            if dtype_raw is None or shape_raw is None:
-                schema = self._stream_schema.get(key)
-                reader = self._stream_readers.get(key)
-                if dtype_raw is None:
-                    dtype_raw = None if schema is None else schema.get("dtype")
-                if shape_raw is None:
-                    shape_raw = None if schema is None else schema.get("shape")
-                if dtype_raw is None and reader is not None:
-                    dtype_raw = reader.layout.dtype
-                if shape_raw is None and reader is not None:
-                    shape_raw = tuple(reader.layout.shape)
-
-            if dtype_raw is None or shape_raw is None:
-                self._clear_stream_buffer(buf)
-                continue
-
-            dtype_obj = np.dtype(dtype_raw)
-            shape = tuple(int(x) for x in shape_raw)
-            if meta and meta.get("session") is not None:
-                session = int(meta["session"])
-            else:
-                session = self._stream_active_session.get(key, 1)
-            datasets = self._ensure_stream_dataset(
-                device_id, stream, dtype_obj, shape, session=session
-            )
-
-            n = len(data_list)
-            seq_list = list(buf["seq"])
-            t0_mono_list = list(buf["t0_mono_ns"])
-            t0_wall_list = list(buf["t0_wall_ns"])
-            context_list = list(buf.get("context_id", []))
-            if n > 1 and any(seq_list[idx] > seq_list[idx + 1] for idx in range(n - 1)):
-                order = sorted(range(n), key=lambda idx: seq_list[idx])
-                data_list = [data_list[idx] for idx in order]
-                seq_list = [seq_list[idx] for idx in order]
-                t0_mono_list = [t0_mono_list[idx] for idx in order]
-                t0_wall_list = [t0_wall_list[idx] for idx in order]
-                context_list = [context_list[idx] for idx in order]
-            if context_list and len(context_list) != n:
-                context_list = [-1] * n
-                self._bump_error("stream.context_alignment_repair")
-
-            data_ds = datasets["data"]
-            seq_ds = datasets["seq"]
-            t0_mono_ds = datasets["t0_mono_ns"]
-            t0_wall_ds = datasets["t0_wall_ns"]
-            context_ds = datasets.get("context_id")
-
-            dtype_obj = data_ds.dtype
-            shape_obj = tuple(data_ds.shape[1:])
-            expected_nbytes = self._stream_expected_nbytes.get(key)
-            if expected_nbytes is None:
-                expected_nbytes = int(dtype_obj.itemsize * int(np.prod(shape_obj, dtype=np.int64)))
-                self._stream_expected_nbytes[key] = expected_nbytes
-            elif expected_nbytes != int(dtype_obj.itemsize * int(np.prod(shape_obj, dtype=np.int64))):
-                expected_nbytes = int(dtype_obj.itemsize * int(np.prod(shape_obj, dtype=np.int64)))
-                self._stream_expected_nbytes[key] = expected_nbytes
-            if any(len(payload) != expected_nbytes for payload in data_list):
+            try:
+                self._write_single_stream_buffer(key, buf, stream_meta=stream_meta)
+            except Exception as exc:
+                # A single stream's write failure (e.g. an unparseable schema)
+                # must NOT discard the rest of the batch. Sibling streams
+                # buffered in the same ~1s flush interval are independent and
+                # healthy; nuking the whole batch was what caused collateral
+                # loss of good streams. Record it, mark the stream, drop only
+                # this stream's rows, and carry on with the next key.
+                self._record_exception(exc, phase="bg._write_stream_buffer")
                 self._bump_stream_counter(
                     key,
-                    "payload_size_failures_total",
-                    last_error="stream payload size mismatch",
+                    "write_failures_total",
+                    last_error=f"stream write failed: {exc}",
                 )
-                self._persist_stream_attrs(key)
+                self._bump_error("stream.write_failed")
+                try:
+                    self._persist_stream_attrs(key)
+                except Exception:
+                    self._bump_error("stream.write_failed_persist")
                 self._clear_stream_buffer(buf)
-                continue
 
-            if n == 1:
-                data_arr = np.frombuffer(data_list[0], dtype=dtype_obj).reshape(
-                    (n,) + shape_obj
-                )
-            else:
-                data_arr = np.empty((n,) + shape_obj, dtype=dtype_obj)
-                for idx, payload in enumerate(data_list):
-                    data_arr[idx] = np.frombuffer(payload, dtype=dtype_obj).reshape(
-                        shape_obj
-                    )
+    def _write_single_stream_buffer(
+        self,
+        key: tuple[str, str],
+        buf: dict[str, list[Any]],
+        *,
+        stream_meta: dict[tuple[str, str], dict[str, Any]] | None = None,
+    ) -> None:
+        # Writes one stream's buffered frames. Raises on failure so the caller
+        # can isolate the fault to this stream (see `_write_stream_buffers_batch`).
+        # `stream_meta` (dtype/shape/session per key) is supplied by the bg
+        # flush path so the write is self-contained; the synchronous drain
+        # path (file rotate/stop/close, main thread with the bg quiesced)
+        # passes None and reads the live `_stream_schema`/`_stream_readers`/
+        # `_stream_active_session` maps instead.
+        data_list = buf.get("data", [])
+        if not data_list:
+            return
 
-            old = data_ds.shape[0]
-            data_ds.resize((old + n,) + data_ds.shape[1:])
-            seq_ds.resize((old + n,))
-            t0_mono_ds.resize((old + n,))
-            t0_wall_ds.resize((old + n,))
-            if context_ds is not None:
-                context_ds.resize((old + n,))
-
-            data_ds[old : old + n] = data_arr
-            seq_ds[old : old + n] = np.asarray(seq_list, dtype=seq_ds.dtype)
-            t0_mono_ds[old : old + n] = np.asarray(t0_mono_list, dtype=t0_mono_ds.dtype)
-            t0_wall_ds[old : old + n] = np.asarray(t0_wall_list, dtype=t0_wall_ds.dtype)
-            if context_ds is not None:
-                if len(context_list) != n:
-                    context_list = [-1] * n
-                context_ds[old : old + n] = np.asarray(
-                    context_list, dtype=context_ds.dtype
-                )
-
-            dropped = int(self._stream_dropped_total.get(key, 0))
-            data_ds.attrs["dropped_total"] = dropped
-
-            if seq_list:
-                self._bump_stream_counter(key, "rows_written_total", n)
-                for context_id in context_list:
-                    try:
-                        context_id_i = int(context_id)
-                    except Exception:
-                        continue
-                    if context_id_i >= 0:
-                        self._bump_stream_context_counter(
-                            (context_id_i, device_id, stream),
-                            "rows_written_total",
-                        )
-                self._stream_last_written_seq[key] = max(
-                    int(self._stream_last_written_seq.get(key, 0)),
-                    int(max(seq_list)),
-                )
-                self._persist_stream_attrs(key)
-                self._trim_context_map(key=key, now_mono=time.monotonic())
+        device_id, stream = key
+        if not self._is_device_enabled(device_id):
             self._clear_stream_buffer(buf)
+            return
+        meta = stream_meta.get(key) if stream_meta else None
+        dtype_raw = meta.get("dtype") if meta else None
+        shape_raw = meta.get("shape") if meta else None
+        if dtype_raw is None or shape_raw is None:
+            schema = self._stream_schema.get(key)
+            reader = self._stream_readers.get(key)
+            if dtype_raw is None:
+                dtype_raw = None if schema is None else schema.get("dtype")
+            if shape_raw is None:
+                shape_raw = None if schema is None else schema.get("shape")
+            if dtype_raw is None and reader is not None:
+                dtype_raw = reader.layout.dtype
+            if shape_raw is None and reader is not None:
+                shape_raw = tuple(reader.layout.shape)
+
+        if dtype_raw is None or shape_raw is None:
+            self._clear_stream_buffer(buf)
+            return
+
+        dtype_obj = np.dtype(dtype_raw)
+        shape = tuple(int(x) for x in shape_raw)
+        if meta and meta.get("session") is not None:
+            session = int(meta["session"])
+        else:
+            session = self._stream_active_session.get(key, 1)
+        datasets = self._ensure_stream_dataset(
+            device_id, stream, dtype_obj, shape, session=session
+        )
+
+        n = len(data_list)
+        seq_list = list(buf["seq"])
+        t0_mono_list = list(buf["t0_mono_ns"])
+        t0_wall_list = list(buf["t0_wall_ns"])
+        context_list = list(buf.get("context_id", []))
+        if n > 1 and any(seq_list[idx] > seq_list[idx + 1] for idx in range(n - 1)):
+            order = sorted(range(n), key=lambda idx: seq_list[idx])
+            data_list = [data_list[idx] for idx in order]
+            seq_list = [seq_list[idx] for idx in order]
+            t0_mono_list = [t0_mono_list[idx] for idx in order]
+            t0_wall_list = [t0_wall_list[idx] for idx in order]
+            context_list = [context_list[idx] for idx in order]
+        if context_list and len(context_list) != n:
+            context_list = [-1] * n
+            self._bump_error("stream.context_alignment_repair")
+
+        data_ds = datasets["data"]
+        seq_ds = datasets["seq"]
+        t0_mono_ds = datasets["t0_mono_ns"]
+        t0_wall_ds = datasets["t0_wall_ns"]
+        context_ds = datasets.get("context_id")
+
+        dtype_obj = data_ds.dtype
+        shape_obj = tuple(data_ds.shape[1:])
+        expected_nbytes = self._stream_expected_nbytes.get(key)
+        if expected_nbytes is None:
+            expected_nbytes = int(dtype_obj.itemsize * int(np.prod(shape_obj, dtype=np.int64)))
+            self._stream_expected_nbytes[key] = expected_nbytes
+        elif expected_nbytes != int(dtype_obj.itemsize * int(np.prod(shape_obj, dtype=np.int64))):
+            expected_nbytes = int(dtype_obj.itemsize * int(np.prod(shape_obj, dtype=np.int64)))
+            self._stream_expected_nbytes[key] = expected_nbytes
+        if any(len(payload) != expected_nbytes for payload in data_list):
+            self._bump_stream_counter(
+                key,
+                "payload_size_failures_total",
+                last_error="stream payload size mismatch",
+            )
+            self._persist_stream_attrs(key)
+            self._clear_stream_buffer(buf)
+            return
+
+        if n == 1:
+            data_arr = np.frombuffer(data_list[0], dtype=dtype_obj).reshape(
+                (n,) + shape_obj
+            )
+        else:
+            data_arr = np.empty((n,) + shape_obj, dtype=dtype_obj)
+            for idx, payload in enumerate(data_list):
+                data_arr[idx] = np.frombuffer(payload, dtype=dtype_obj).reshape(
+                    shape_obj
+                )
+
+        old = data_ds.shape[0]
+        data_ds.resize((old + n,) + data_ds.shape[1:])
+        seq_ds.resize((old + n,))
+        t0_mono_ds.resize((old + n,))
+        t0_wall_ds.resize((old + n,))
+        if context_ds is not None:
+            context_ds.resize((old + n,))
+
+        data_ds[old : old + n] = data_arr
+        seq_ds[old : old + n] = np.asarray(seq_list, dtype=seq_ds.dtype)
+        t0_mono_ds[old : old + n] = np.asarray(t0_mono_list, dtype=t0_mono_ds.dtype)
+        t0_wall_ds[old : old + n] = np.asarray(t0_wall_list, dtype=t0_wall_ds.dtype)
+        if context_ds is not None:
+            if len(context_list) != n:
+                context_list = [-1] * n
+            context_ds[old : old + n] = np.asarray(
+                context_list, dtype=context_ds.dtype
+            )
+
+        dropped = int(self._stream_dropped_total.get(key, 0))
+        data_ds.attrs["dropped_total"] = dropped
+
+        if seq_list:
+            self._bump_stream_counter(key, "rows_written_total", n)
+            for context_id in context_list:
+                try:
+                    context_id_i = int(context_id)
+                except Exception:
+                    continue
+                if context_id_i >= 0:
+                    self._bump_stream_context_counter(
+                        (context_id_i, device_id, stream),
+                        "rows_written_total",
+                    )
+            self._stream_last_written_seq[key] = max(
+                int(self._stream_last_written_seq.get(key, 0)),
+                int(max(seq_list)),
+            )
+            self._persist_stream_attrs(key)
+            self._trim_context_map(key=key, now_mono=time.monotonic())
+        self._clear_stream_buffer(buf)
 
     def _active_stream_dataset_key(
         self, device_id: str, stream: str
