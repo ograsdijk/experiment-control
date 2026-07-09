@@ -5,6 +5,7 @@ from __future__ import annotations
 import sys
 import time
 import unittest
+import json
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -16,7 +17,14 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from experiment_control._manager.driver_pub import ingest_chunk_ready, ingest_telemetry
+import zmq
+
+from experiment_control._manager import driver_pub
+from experiment_control._manager.driver_pub import (
+    handle_driver_pub,
+    ingest_chunk_ready,
+    ingest_telemetry,
+)
 
 
 @dataclass(frozen=True)
@@ -72,7 +80,25 @@ def _build_manager_stub() -> Any:
     mgr._publish_manager_event = _publish_manager_event
     mgr._parse_timestamp = _parse_timestamp
     mgr._coerce_enum = _coerce_enum
+    mgr._ingest_chunk_ready = lambda msg: ingest_chunk_ready(mgr, msg)
+    mgr._normalize_topic = lambda topic: str(topic).strip()
+    mgr._maybe_publish_drain_cap_hit = (
+        lambda socket, cap: mgr.events.append(
+            ("manager.drain_cap_hit", {"socket": socket, "cap": cap})
+        )
+    )
     return mgr
+
+
+class _FakeDriverSub:
+    def __init__(self, messages: list[tuple[str, dict[str, Any]]]) -> None:
+        self._messages = list(messages)
+
+    def recv_multipart(self, _flags: int) -> list[bytes]:
+        if not self._messages:
+            raise zmq.Again()
+        topic, payload = self._messages.pop(0)
+        return [topic.encode("utf-8"), json.dumps(payload).encode("utf-8")]
 
 
 class ManagerDriverPubBoundsTests(unittest.TestCase):
@@ -182,6 +208,266 @@ class ManagerDriverPubBoundsTests(unittest.TestCase):
         )
         self.assertEqual(set(mgr._latest_chunk_desc.keys()), {"dev-2"})
         self.assertEqual(int(getattr(mgr, "_chunk_cache_evicted_devices", 0)), 1)
+
+    def test_driver_pub_prioritizes_chunk_ready_within_drain_batch(self) -> None:
+        mgr = _build_manager_stub()
+        mgr._sub = _FakeDriverSub(
+            [
+                (
+                    "dev-1/telemetry",
+                    {
+                        "device_id": "dev-1",
+                        "seq": 1,
+                        "ts": {"t_wall": 1.0, "t_mono": 1.0},
+                        "signals": {"x": {"value": 1.0, "quality": "OK"}},
+                    },
+                ),
+                (
+                    "dev-1/heartbeat",
+                    {
+                        "device_id": "dev-1",
+                        "pid": 123,
+                        "seq": 1,
+                        "ts": {"t_wall": 1.0, "t_mono": 1.0},
+                    },
+                ),
+                (
+                    "dev-1/chunk_ready",
+                    {
+                        "device_id": "dev-1",
+                        "stream": "timestamps",
+                        "shm_name": "ec-test-shm",
+                        "seq": 5,
+                    },
+                ),
+            ]
+        )
+
+        def _ingest_telemetry(msg: dict[str, Any]) -> None:
+            mgr.events.append(("ingested.telemetry", msg))
+
+        def _ingest_heartbeat(msg: dict[str, Any]) -> None:
+            mgr.events.append(("ingested.heartbeat", msg))
+
+        mgr._ingest_telemetry = _ingest_telemetry
+        mgr._ingest_heartbeat = _ingest_heartbeat
+
+        handle_driver_pub(mgr)
+
+        topics = [topic for topic, _payload in mgr.events]
+        self.assertLess(
+            topics.index("manager.chunk_ready"),
+            topics.index("ingested.telemetry"),
+        )
+        self.assertLess(
+            topics.index("manager.chunk_ready"),
+            topics.index("ingested.heartbeat"),
+        )
+        self.assertEqual(int(getattr(mgr, "_driver_chunk_ready_seen_total", 0)), 1)
+        self.assertEqual(
+            int(getattr(mgr, "_manager_chunk_ready_published_total", 0)),
+            1,
+        )
+
+    def test_driver_pub_prioritizes_chunk_ready_past_drain_cap(self) -> None:
+        # Regression: chunk_ready queued *behind* MAX_DRAIN_PER_TICK ordinary
+        # messages must still be published in the same handle_driver_pub()
+        # call, not deferred to a later tick. Reordering within the first
+        # drained batch (test above) doesn't help when chunk_ready hasn't
+        # even been read into that batch yet.
+        mgr = _build_manager_stub()
+        cap = 4
+        telemetry_msgs = [
+            (
+                f"dev-{idx}/telemetry",
+                {
+                    "device_id": f"dev-{idx}",
+                    "seq": idx,
+                    "ts": {"t_wall": 1.0, "t_mono": 1.0},
+                    "signals": {},
+                },
+            )
+            for idx in range(cap)
+        ]
+        chunk_msg = (
+            "dev-1/chunk_ready",
+            {
+                "device_id": "dev-1",
+                "stream": "timestamps",
+                "shm_name": "ec-test-shm",
+                "seq": 5,
+            },
+        )
+        mgr._sub = _FakeDriverSub([*telemetry_msgs, chunk_msg])
+        mgr._ingest_telemetry = lambda msg: mgr.events.append(
+            ("ingested.telemetry", msg)
+        )
+
+        original_cap = driver_pub.MAX_DRAIN_PER_TICK
+        try:
+            driver_pub.MAX_DRAIN_PER_TICK = cap
+            handle_driver_pub(mgr)
+        finally:
+            driver_pub.MAX_DRAIN_PER_TICK = original_cap
+
+        topics = [topic for topic, _payload in mgr.events]
+        self.assertIn("manager.chunk_ready", topics)
+        self.assertEqual(int(getattr(mgr, "_driver_chunk_ready_seen_total", 0)), 1)
+        self.assertEqual(
+            int(getattr(mgr, "_manager_chunk_ready_published_total", 0)),
+            1,
+        )
+        # The extension pass stopped the instant chunk_ready turned up,
+        # one read short of exhausting its own budget — we deliberately
+        # didn't keep reading, so this must NOT be reported as a cap hit
+        # (regression: it used to be, even though the queue ends up
+        # fully drained here).
+        self.assertEqual(
+            int(getattr(mgr, "_manager_driver_pub_drain_cap_hit_total", 0)),
+            0,
+        )
+        self.assertNotIn(
+            "manager.drain_cap_hit",
+            [topic for topic, _payload in mgr.events],
+        )
+        self.assertEqual(
+            int(getattr(mgr, "_manager_driver_pub_priority_scan_extended_total", 0)),
+            1,
+        )
+
+    def test_driver_pub_chunk_ready_beyond_extension_budget_still_deferred(
+        self,
+    ) -> None:
+        # Known residual limit: a chunk_ready buried past 2*MAX_DRAIN_PER_TICK
+        # (base pass + the full extension budget) can't be reached this
+        # tick without an unbounded search, so it's still deferred to a
+        # later call. The priority-scan-exhausted counter is how
+        # operators see that the mitigation gave up empty-handed on a
+        # given tick, distinct from merely "an extension ran".
+        mgr = _build_manager_stub()
+        cap = 2
+        telemetry_msgs = [
+            (
+                f"dev-{idx}/telemetry",
+                {
+                    "device_id": f"dev-{idx}",
+                    "seq": idx,
+                    "ts": {"t_wall": 1.0, "t_mono": 1.0},
+                    "signals": {},
+                },
+            )
+            for idx in range(2 * cap + 1)
+        ]
+        chunk_msg = (
+            "dev-1/chunk_ready",
+            {
+                "device_id": "dev-1",
+                "stream": "timestamps",
+                "shm_name": "ec-test-shm",
+                "seq": 5,
+            },
+        )
+        mgr._sub = _FakeDriverSub([*telemetry_msgs, chunk_msg])
+        mgr._ingest_telemetry = lambda msg: mgr.events.append(
+            ("ingested.telemetry", msg)
+        )
+
+        original_cap = driver_pub.MAX_DRAIN_PER_TICK
+        try:
+            driver_pub.MAX_DRAIN_PER_TICK = cap
+            handle_driver_pub(mgr)
+        finally:
+            driver_pub.MAX_DRAIN_PER_TICK = original_cap
+
+        topics = [topic for topic, _payload in mgr.events]
+        self.assertNotIn("manager.chunk_ready", topics)
+        self.assertEqual(
+            int(getattr(mgr, "_manager_driver_pub_priority_scan_exhausted_total", 0)),
+            1,
+        )
+
+    def test_driver_pub_drain_cap_hits_are_counted(self) -> None:
+        mgr = _build_manager_stub()
+        # No chunk_ready present, so the base pass (cap=2) plus the
+        # priority-scan extension (another cap=2 worth) drain 4 messages
+        # total before giving up on this tick; 5 messages guarantees a
+        # genuine cap hit with the queue still non-empty.
+        mgr._sub = _FakeDriverSub(
+            [
+                (
+                    f"dev-{idx}/telemetry",
+                    {
+                        "device_id": f"dev-{idx}",
+                        "seq": idx,
+                        "ts": {"t_wall": 1.0, "t_mono": 1.0},
+                        "signals": {},
+                    },
+                )
+                for idx in range(5)
+            ]
+        )
+        mgr._ingest_telemetry = lambda msg: mgr.events.append(
+            ("ingested.telemetry", msg)
+        )
+
+        original_cap = driver_pub.MAX_DRAIN_PER_TICK
+        try:
+            driver_pub.MAX_DRAIN_PER_TICK = 2
+            handle_driver_pub(mgr)
+        finally:
+            driver_pub.MAX_DRAIN_PER_TICK = original_cap
+
+        self.assertEqual(
+            int(getattr(mgr, "_manager_driver_pub_drain_cap_hit_total", 0)),
+            1,
+        )
+        # cap now reflects what was actually drained this tick (base
+        # pass + the fully-exhausted extension pass = 2 + 2), not just
+        # the static MAX_DRAIN_PER_TICK constant.
+        self.assertIn(
+            ("manager.drain_cap_hit", {"socket": "driver_pub", "cap": 4}),
+            mgr.events,
+        )
+        self.assertEqual(
+            int(getattr(mgr, "_manager_driver_pub_priority_scan_extended_total", 0)),
+            2,
+        )
+        self.assertEqual(
+            int(getattr(mgr, "_manager_driver_pub_priority_scan_exhausted_total", 0)),
+            1,
+        )
+
+    def test_chunk_ready_ingest_errors_are_counted(self) -> None:
+        mgr = _build_manager_stub()
+        mgr._sub = _FakeDriverSub(
+            [
+                (
+                    "dev-1/chunk_ready",
+                    {
+                        "device_id": "dev-1",
+                        "stream": "timestamps",
+                        "shm_name": "ec-test-shm",
+                        "seq": 5,
+                    },
+                )
+            ]
+        )
+
+        def _ingest_chunk_ready(_msg: dict[str, Any]) -> None:
+            raise RuntimeError("boom")
+
+        mgr._ingest_chunk_ready = _ingest_chunk_ready
+
+        handle_driver_pub(mgr)
+
+        self.assertEqual(int(getattr(mgr, "_driver_chunk_ready_seen_total", 0)), 1)
+        self.assertEqual(
+            int(getattr(mgr, "_manager_chunk_ready_ingest_error_total", 0)),
+            1,
+        )
+        self.assertTrue(
+            [payload for topic, payload in mgr.events if topic == "manager.chunk_error"]
+        )
 
 
 if __name__ == "__main__":
