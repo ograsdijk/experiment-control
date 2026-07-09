@@ -265,6 +265,8 @@ export function StreamBinStatsPanel({
   const hostRef = useRef<HTMLDivElement | null>(null);
   const plotRef = useRef<uPlot | null>(null);
   const fitOverlayDataRef = useRef<StreamBinStatsFitOverlay[]>([]);
+  const overlayLabelsRef = useRef<string[]>([]);
+  const tooltipRef = useRef<HTMLDivElement | null>(null);
   const isDark = colorScheme === "dark";
 
   const formatNumber = useMemo(() => {
@@ -294,6 +296,7 @@ export function StreamBinStatsPanel({
     [fitOverlays, tick]
   );
   fitOverlayDataRef.current = fitOverlayData;
+  overlayLabelsRef.current = overlayData.map((entry) => entry.label);
 
   const hasManualY = useMemo(() => {
     if (yScaleMode !== "manual") {
@@ -382,9 +385,83 @@ export function StreamBinStatsPanel({
         ],
       },
     };
+    const hideTooltip = () => {
+      const el = tooltipRef.current;
+      if (el) {
+        el.style.display = "none";
+      }
+    };
+
+    const updateTooltip = (u: uPlot) => {
+      const el = tooltipRef.current;
+      if (!el) {
+        return;
+      }
+      const idx = u.cursor.idx;
+      if (idx == null || u.cursor.left == null || u.cursor.top == null) {
+        hideTooltip();
+        return;
+      }
+      const xv = u.data[0]?.[idx];
+      const lowerV = u.data[1]?.[idx];
+      const upperV = u.data[2]?.[idx];
+      const meanV = u.data[3]?.[idx];
+      if (!Number.isFinite(xv as number) || !Number.isFinite(meanV as number)) {
+        hideTooltip();
+        return;
+      }
+      const lines = [
+        `x: ${formatNumber(xv as number)}`,
+        `mean: ${formatNumber(meanV as number)}`,
+      ];
+      if (Number.isFinite(lowerV as number) && Number.isFinite(upperV as number)) {
+        lines.push(
+          `range: ${formatNumber(lowerV as number)} to ${formatNumber(upperV as number)}`
+        );
+      }
+      overlayLabelsRef.current.forEach((label, i) => {
+        const v = u.data[4 + i]?.[idx];
+        if (Number.isFinite(v as number)) {
+          lines.push(`${label}: ${formatNumber(v as number)}`);
+        }
+      });
+      el.textContent = "";
+      lines.forEach((line) => {
+        const row = document.createElement("div");
+        row.textContent = line;
+        el.appendChild(row);
+      });
+
+      const dpr = window.devicePixelRatio || 1;
+      const plotOffsetLeft = u.bbox.left / dpr;
+      const plotOffsetTop = u.bbox.top / dpr;
+      const margin = 12;
+      const cursorLeft = plotOffsetLeft + u.cursor.left;
+      const cursorTop = plotOffsetTop + u.cursor.top;
+      const elWidth = el.offsetWidth || 120;
+      const elHeight = el.offsetHeight || 60;
+      let left = cursorLeft + margin;
+      let top = cursorTop + margin;
+      if (left + elWidth > u.width) {
+        left = cursorLeft - elWidth - margin;
+      }
+      if (top + elHeight > u.height) {
+        top = cursorTop - elHeight - margin;
+      }
+      el.style.left = `${Math.max(0, left)}px`;
+      el.style.top = `${Math.max(0, top)}px`;
+      el.style.display = "block";
+    };
+
     const opts: uPlot.Options = {
       width,
       height: plotHeight,
+      cursor: {
+        points: { show: true },
+      },
+      hooks: {
+        setCursor: [updateTooltip],
+      },
       series: [
         { label: "x" },
         {
@@ -467,6 +544,7 @@ export function StreamBinStatsPanel({
       resize.disconnect();
       plotRef.current?.destroy();
       plotRef.current = null;
+      hideTooltip();
     };
   }, [
     data,
@@ -494,5 +572,26 @@ export function StreamBinStatsPanel({
     ]);
   }, [tick, data, overlayData]);
 
-  return <div className="plot-panel" ref={hostRef} />;
+  return (
+    <div style={{ position: "relative" }}>
+      <div className="plot-panel" ref={hostRef} />
+      <div
+        ref={tooltipRef}
+        style={{
+          position: "absolute",
+          display: "none",
+          pointerEvents: "none",
+          zIndex: 10,
+          padding: "6px 8px",
+          borderRadius: 6,
+          fontSize: 12,
+          lineHeight: 1.4,
+          whiteSpace: "nowrap",
+          background: isDark ? "rgba(30, 28, 24, 0.92)" : "rgba(255, 255, 255, 0.95)",
+          border: `1px solid ${isDark ? "rgba(255, 255, 255, 0.18)" : "rgba(0, 0, 0, 0.12)"}`,
+          color: isDark ? "#e8e2d7" : "#3c372f",
+        }}
+      />
+    </div>
+  );
 }
