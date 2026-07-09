@@ -19,6 +19,7 @@ def _build_runtime(
     calls: list[tuple[str, str, int, dict[str, object]]],
     *,
     set_stream_context_impl: object | None = None,
+    expect_streams_impl: object | None = None,
 ) -> SequencerRuntime:
     def call_device(device_id: str, action: str, params: dict[str, object]) -> dict[str, object]:
         return {"ok": True, "result": None}
@@ -37,10 +38,15 @@ def _build_runtime(
             return
         calls.append((device_id, stream, context_id, dict(fields)))
 
+    def expect_streams(streams: list[tuple[str, str]], context_id: int) -> None:
+        if callable(expect_streams_impl):
+            expect_streams_impl(streams, context_id)
+
     return SequencerRuntime(
         call_device=call_device,
         get_telemetry=get_telemetry,
         set_stream_context=set_stream_context,
+        expect_streams=expect_streams,
     )
 
 
@@ -132,6 +138,44 @@ class SequencerContextIdTests(unittest.TestCase):
         self.assertEqual(status.get("state"), "ERROR")
         self.assertIn("set_context failed", str(status.get("error")))
 
+    def test_set_context_registers_stream_expectations_before_device_context(self) -> None:
+        calls: list[tuple[str, str, int, dict[str, object]]] = []
+        order: list[str] = []
+
+        def expect_streams(streams: list[tuple[str, str]], context_id: int) -> None:
+            order.append(f"expect:{context_id}:{streams[0][0]}.{streams[0][1]}")
+
+        def set_stream_context(
+            device_id: str, stream: str, context_id: int, fields: dict[str, object]
+        ) -> None:
+            del fields
+            order.append(f"context:{context_id}:{device_id}.{stream}")
+            calls.append((device_id, stream, context_id, {}))
+
+        runtime = _build_runtime(
+            calls,
+            set_stream_context_impl=set_stream_context,
+            expect_streams_impl=expect_streams,
+        )
+        spec = SequenceSpec(
+            version=1,
+            meta={},
+            vars={},
+            steps=[
+                SetContextStep(
+                    streams=[{"device": "scope", "stream": "trace"}],
+                    fields={"freq_hz": 1.0},
+                )
+            ],
+            context_columns=None,
+        )
+        runtime.load(spec)
+        runtime.start()
+        while runtime.state == "RUNNING":
+            runtime.tick()
+
+        self.assertEqual(order, ["expect:0:scope.trace", "context:0:scope.trace"])
+
 
 class SequencerSetContextRetryTests(unittest.TestCase):
     def test_start_lifecycle_payload_includes_context_columns(self) -> None:
@@ -203,6 +247,27 @@ class SequencerSetContextRetryTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             process._set_stream_context("trace1", "trace", 4, {"trial": 1})  # type: ignore[misc]
         self.assertEqual(len(calls), 1)
+
+    def test_expect_streams_raises_when_hdf_rejects(self) -> None:
+        process = object.__new__(SequencerProcess)
+
+        def fake_call_process(
+            process_id: str, action: str, params: dict[str, object]
+        ) -> dict[str, object]:
+            self.assertEqual(process_id, "hdf_writer")
+            self.assertEqual(action, "hdf.streams.expect")
+            self.assertEqual(params["context_id"], 2)
+            return {
+                "ok": False,
+                "error": {
+                    "code": "hdf_not_writing",
+                    "message": "HDF writer is not writing",
+                },
+            }
+
+        process._call_process = fake_call_process  # type: ignore[attr-defined]
+        with self.assertRaisesRegex(RuntimeError, "hdf.streams.expect failed"):
+            process._expect_streams([("scope", "trace")], 2)  # type: ignore[misc]
 
 
 if __name__ == "__main__":

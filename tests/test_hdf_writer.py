@@ -402,6 +402,193 @@ class HdfWriterSequencerTests(unittest.TestCase):
                 self.assertEqual(int(writer._sequencer_events_ds.shape[0]), 0)  # noqa: SLF001
 
 
+class HdfWriterStrictStreamTests(unittest.TestCase):
+    @staticmethod
+    def _make_writer() -> HdfWriter:
+        return HdfWriter(
+            out_dir="data",
+            filename=None,
+            manager_rpc="tcp://127.0.0.1:65531",
+            manager_pub="tcp://127.0.0.1:65532",
+            rpc_timeout_ms=2000,
+            timezone="America/Chicago",
+            rcvhwm=1000,
+            write_every_s=1.0,
+            buffer_max_messages=1000,
+            flush_every_n=10,
+            flush_every_s=1.0,
+            disabled_devices=[],
+            event_log_mode="all",
+        )
+
+    @staticmethod
+    def _configure(writer: HdfWriter, h5: h5py.File) -> None:
+        writer._configure_active_file(  # noqa: SLF001
+            h5,
+            write_every_s=1.0,
+            load_manager_state=False,
+            measurement_meta=writer._build_measurement_metadata(  # noqa: SLF001
+                profile_id=None,
+                values=None,
+                require_profile=False,
+            ),
+        )
+        writer._bg_thread = threading.current_thread()  # noqa: SLF001
+
+    def test_stream_expect_creates_group_attrs_before_data(self) -> None:
+        writer = self._make_writer()
+        with tempfile.TemporaryDirectory() as td:
+            h5_path = Path(td) / "strict.h5"
+            with h5py.File(h5_path, "w") as h5:
+                self._configure(writer, h5)
+                resp = writer._rpc_hdf_streams_expect(  # noqa: SLF001
+                    {
+                        "params": {
+                            "streams": [
+                                {
+                                    "device_id": "fs740",
+                                    "stream": "timestamps",
+                                    "expected_count": 1380,
+                                }
+                            ],
+                            "context_id": 7,
+                            "strict": True,
+                        }
+                    }
+                )
+
+                self.assertTrue(resp["ok"])
+                group = h5["streams/fs740/timestamps"]
+                self.assertEqual(int(group.attrs["expected_count"]), 1380)
+                self.assertTrue(bool(group.attrs["strict_required"]))
+                self.assertEqual(int(group.attrs["context_id"]), 7)
+                self.assertEqual(int(group.attrs["rows_written_total"]), 0)
+
+    def test_required_stream_never_seen_marks_acquisition_failed(self) -> None:
+        writer = self._make_writer()
+        with tempfile.TemporaryDirectory() as td:
+            h5_path = Path(td) / "strict.h5"
+            with h5py.File(h5_path, "w") as h5:
+                self._configure(writer, h5)
+                writer._rpc_hdf_streams_expect(  # noqa: SLF001
+                    {
+                        "params": {
+                            "streams": [
+                                {"device_id": "fs740", "stream": "timestamps"}
+                            ],
+                            "context_id": 3,
+                            "strict": True,
+                        }
+                    }
+                )
+                with writer._h5_lock:  # noqa: SLF001
+                    writer._finalize_strict_streams_locked()  # noqa: SLF001
+
+                self.assertFalse(bool(h5.attrs["acquisition_ok"]))
+                errors = json.loads(_as_text(h5.attrs["hdf_strict_stream_errors_json"]))
+                self.assertEqual(errors[0]["reason"], "required stream never seen")
+                group = h5["streams/fs740/timestamps"]
+                self.assertEqual(int(group.attrs["chunk_ready_seen_total"]), 0)
+                self.assertIn("required stream never seen", _as_text(group.attrs["last_error"]))
+
+    def test_complete_required_stream_remains_acquisition_ok(self) -> None:
+        writer = self._make_writer()
+        with tempfile.TemporaryDirectory() as td:
+            h5_path = Path(td) / "strict.h5"
+            with h5py.File(h5_path, "w") as h5:
+                self._configure(writer, h5)
+                writer._rpc_hdf_streams_expect(  # noqa: SLF001
+                    {
+                        "params": {
+                            "streams": [
+                                {
+                                    "device_id": "pxie",
+                                    "stream": "waveforms",
+                                    "expected_count": 2,
+                                }
+                            ],
+                            "context_id": 9,
+                            "strict": True,
+                        }
+                    }
+                )
+                key = ("pxie", "waveforms")
+                writer._bump_stream_counter(key, "chunk_ready_seen_total")  # noqa: SLF001
+                writer._bump_stream_counter(key, "events_read_total", 2)  # noqa: SLF001
+                writer._bump_stream_counter(key, "rows_written_total", 2)  # noqa: SLF001
+                writer._bump_stream_context_counter(  # noqa: SLF001
+                    (9, "pxie", "waveforms"),
+                    "rows_written_total",
+                    2,
+                )
+                writer._note_stream_seq(key, 1)  # noqa: SLF001
+                writer._note_stream_seq(key, 2)  # noqa: SLF001
+                with writer._h5_lock:  # noqa: SLF001
+                    writer._persist_stream_attrs(key)  # noqa: SLF001
+                    writer._finalize_strict_streams_locked()  # noqa: SLF001
+
+                self.assertTrue(bool(h5.attrs["acquisition_ok"]))
+                self.assertEqual(
+                    json.loads(_as_text(h5.attrs["hdf_strict_stream_errors_json"])),
+                    [],
+                )
+                group = h5["streams/pxie/waveforms"]
+                self.assertEqual(int(group.attrs["rows_written_total"]), 2)
+
+    def test_same_stream_expectations_are_validated_per_context(self) -> None:
+        writer = self._make_writer()
+        with tempfile.TemporaryDirectory() as td:
+            h5_path = Path(td) / "strict.h5"
+            with h5py.File(h5_path, "w") as h5:
+                self._configure(writer, h5)
+                for context_id in (3, 4):
+                    writer._rpc_hdf_streams_expect(  # noqa: SLF001
+                        {
+                            "params": {
+                                "streams": [
+                                    {"device_id": "fs740", "stream": "timestamps"}
+                                ],
+                                "context_id": context_id,
+                                "strict": True,
+                            }
+                        }
+                    )
+                key = ("fs740", "timestamps")
+                writer._bump_stream_counter(key, "chunk_ready_seen_total")  # noqa: SLF001
+                writer._bump_stream_counter(key, "events_read_total")  # noqa: SLF001
+                writer._bump_stream_counter(key, "rows_written_total")  # noqa: SLF001
+                writer._bump_stream_context_counter(  # noqa: SLF001
+                    (4, "fs740", "timestamps"),
+                    "rows_written_total",
+                )
+                with writer._h5_lock:  # noqa: SLF001
+                    writer._persist_stream_attrs(key)  # noqa: SLF001
+                    writer._finalize_strict_streams_locked()  # noqa: SLF001
+
+                self.assertFalse(bool(h5.attrs["acquisition_ok"]))
+                errors = json.loads(_as_text(h5.attrs["hdf_strict_stream_errors_json"]))
+                self.assertIn(
+                    {
+                        "device_id": "fs740",
+                        "stream": "timestamps",
+                        "reason": "required stream seen but no rows written",
+                        "context_id": 3,
+                        "rows_written": 0,
+                    },
+                    errors,
+                )
+                self.assertNotIn(
+                    {
+                        "device_id": "fs740",
+                        "stream": "timestamps",
+                        "reason": "required stream seen but no rows written",
+                        "context_id": 4,
+                        "rows_written": 0,
+                    },
+                    errors,
+                )
+
+
 class HdfWriterMeasurementTests(unittest.TestCase):
     @staticmethod
     def _write_schema(path: Path) -> None:
