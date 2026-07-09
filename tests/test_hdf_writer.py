@@ -26,6 +26,7 @@ import experiment_control.processes.hdf_writer as hdf_writer_module  # noqa: E40
 from experiment_control.processes.hdf_writer import (  # noqa: E402
     HdfWriter,
     _BG_SENTINEL,
+    _CaptureSequencerYamlRequest,
     _FlushBatch,
     _convert_value,
     _create_device_dataset,
@@ -191,7 +192,7 @@ class HdfWriterEventModeTests(unittest.TestCase):
 
 
 class HdfWriterSequencerTests(unittest.TestCase):
-    def test_lifecycle_start_appends_row_with_snapshot_id(self) -> None:
+    def test_lifecycle_start_appends_row_and_queues_yaml_snapshot(self) -> None:
         writer = HdfWriter(
             out_dir="data",
             filename=None,
@@ -221,7 +222,12 @@ class HdfWriterSequencerTests(unittest.TestCase):
                         require_profile=False,
                     ),
                 )
-                writer._capture_sequencer_yaml_snapshot = lambda: (7, None)  # type: ignore[method-assign]  # noqa: E501
+                writer._bg_thread = threading.Thread()  # noqa: SLF001
+                writer._capture_sequencer_yaml_snapshot = (  # type: ignore[method-assign]
+                    lambda **_kwargs: (_ for _ in ()).throw(
+                        AssertionError("loaded_yaml RPC must not run inline")
+                    )
+                )
                 writer._handle_sequencer_lifecycle(  # noqa: SLF001
                     {
                         "version": 1,
@@ -237,10 +243,163 @@ class HdfWriterSequencerTests(unittest.TestCase):
                 assert writer._sequencer_events_ds is not None  # noqa: SLF001
                 self.assertEqual(int(writer._sequencer_events_ds.shape[0]), 1)  # noqa: SLF001
                 row = writer._sequencer_events_ds[0]  # noqa: SLF001
-                self.assertEqual(int(row["yaml_snapshot_id"]), 7)
+                self.assertEqual(int(row["yaml_snapshot_id"]), -1)
                 self.assertEqual(_as_text(row["event"]), "start")
                 self.assertEqual(_as_text(row["source"]), "rpc")
                 self.assertTrue(bool(row["ok"]))
+                req = writer._bg_queue.get_nowait()  # noqa: SLF001
+                self.assertIsInstance(req, _CaptureSequencerYamlRequest)
+                self.assertEqual(req.process_id, "sequencer")
+
+    def test_bg_sequencer_yaml_capture_writes_snapshot(self) -> None:
+        writer = HdfWriter(
+            out_dir="data",
+            filename=None,
+            manager_rpc="tcp://127.0.0.1:65531",
+            manager_pub="tcp://127.0.0.1:65532",
+            rpc_timeout_ms=2000,
+            timezone="America/Chicago",
+            rcvhwm=1000,
+            write_every_s=1.0,
+            buffer_max_messages=1000,
+            flush_every_n=10,
+            flush_every_s=1.0,
+            disabled_devices=[],
+            event_log_mode="all",
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            h5_path = Path(td) / "test.h5"
+            with h5py.File(h5_path, "w") as h5:
+                writer._configure_active_file(  # noqa: SLF001
+                    h5,
+                    write_every_s=1.0,
+                    load_manager_state=False,
+                    measurement_meta=writer._build_measurement_metadata(  # noqa: SLF001
+                        profile_id=None,
+                        values=None,
+                        require_profile=False,
+                    ),
+                )
+                req = _CaptureSequencerYamlRequest(
+                    process_id="sequencer",
+                    measurement_id=writer._measurement_id or "",  # noqa: SLF001
+                )
+                with patch.object(
+                    hdf_writer_module,
+                    "_manager_rpc",
+                    return_value={
+                        "ok": True,
+                        "result": {
+                            "loaded": True,
+                            "text": "steps: []",
+                            "source": "library://test",
+                        },
+                    },
+                ):
+                    writer._dispatch_bg_request(req)  # noqa: SLF001
+
+                assert writer._sequencer_yaml_ds is not None  # noqa: SLF001
+                self.assertEqual(int(writer._sequencer_yaml_ds.shape[0]), 1)  # noqa: SLF001
+                row = writer._sequencer_yaml_ds[0]  # noqa: SLF001
+                self.assertEqual(int(row["snapshot_id"]), 0)
+                self.assertEqual(_as_text(row["process_id"]), "sequencer")
+                self.assertEqual(_as_text(row["source"]), "library://test")
+                self.assertEqual(_as_text(row["text"]), "steps: []")
+
+    def test_bg_sequencer_yaml_capture_failure_records_event(self) -> None:
+        writer = HdfWriter(
+            out_dir="data",
+            filename=None,
+            manager_rpc="tcp://127.0.0.1:65531",
+            manager_pub="tcp://127.0.0.1:65532",
+            rpc_timeout_ms=2000,
+            timezone="America/Chicago",
+            rcvhwm=1000,
+            write_every_s=1.0,
+            buffer_max_messages=1000,
+            flush_every_n=10,
+            flush_every_s=1.0,
+            disabled_devices=[],
+            event_log_mode="all",
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            h5_path = Path(td) / "test.h5"
+            with h5py.File(h5_path, "w") as h5:
+                writer._configure_active_file(  # noqa: SLF001
+                    h5,
+                    write_every_s=1.0,
+                    load_manager_state=False,
+                    measurement_meta=writer._build_measurement_metadata(  # noqa: SLF001
+                        profile_id=None,
+                        values=None,
+                        require_profile=False,
+                    ),
+                )
+                req = _CaptureSequencerYamlRequest(
+                    process_id="sequencer",
+                    measurement_id=writer._measurement_id or "",  # noqa: SLF001
+                )
+                with patch.object(
+                    hdf_writer_module,
+                    "_manager_rpc",
+                    side_effect=RuntimeError("temporarily unavailable"),
+                ):
+                    writer._dispatch_bg_request(req)  # noqa: SLF001
+
+                assert writer._sequencer_events_ds is not None  # noqa: SLF001
+                self.assertEqual(int(writer._sequencer_events_ds.shape[0]), 1)  # noqa: SLF001
+                row = writer._sequencer_events_ds[0]  # noqa: SLF001
+                self.assertEqual(_as_text(row["event"]), "yaml_snapshot_failed")
+                self.assertFalse(bool(row["ok"]))
+                self.assertIn("loaded_yaml rpc failed", _as_text(row["message"]))
+
+    def test_bg_sequencer_yaml_capture_stale_failure_is_skipped(self) -> None:
+        writer = HdfWriter(
+            out_dir="data",
+            filename=None,
+            manager_rpc="tcp://127.0.0.1:65531",
+            manager_pub="tcp://127.0.0.1:65532",
+            rpc_timeout_ms=2000,
+            timezone="America/Chicago",
+            rcvhwm=1000,
+            write_every_s=1.0,
+            buffer_max_messages=1000,
+            flush_every_n=10,
+            flush_every_s=1.0,
+            disabled_devices=[],
+            event_log_mode="all",
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            h5_path = Path(td) / "test.h5"
+            with h5py.File(h5_path, "w") as h5:
+                writer._configure_active_file(  # noqa: SLF001
+                    h5,
+                    write_every_s=1.0,
+                    load_manager_state=False,
+                    measurement_meta=writer._build_measurement_metadata(  # noqa: SLF001
+                        profile_id=None,
+                        values=None,
+                        require_profile=False,
+                    ),
+                )
+                old_measurement_id = writer._measurement_id or ""  # noqa: SLF001
+                writer._measurement_id = "new-measurement"  # noqa: SLF001
+                req = _CaptureSequencerYamlRequest(
+                    process_id="sequencer",
+                    measurement_id=old_measurement_id,
+                )
+                with patch.object(
+                    hdf_writer_module,
+                    "_manager_rpc",
+                    side_effect=RuntimeError("temporarily unavailable"),
+                ):
+                    writer._dispatch_bg_request(req)  # noqa: SLF001
+
+                assert writer._sequencer_events_ds is not None  # noqa: SLF001
+                self.assertEqual(int(writer._sequencer_events_ds.shape[0]), 0)  # noqa: SLF001
 
 
 class HdfWriterMeasurementTests(unittest.TestCase):
