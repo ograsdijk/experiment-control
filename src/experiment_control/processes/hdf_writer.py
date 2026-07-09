@@ -44,6 +44,7 @@ from .hdf_writer_bg import (
     _BgRequest as _BgRequest,
     _BgSentinel as _BgSentinel,
     _CaptureRunMetadataRequest as _CaptureRunMetadataRequest,
+    _CaptureSequencerYamlRequest as _CaptureSequencerYamlRequest,
     _DevicesToggleRequest as _DevicesToggleRequest,
     _FlushBatch as _FlushBatch,
     _MeasurementNoteRequest as _MeasurementNoteRequest,
@@ -1123,6 +1124,25 @@ class HdfWriter(ManagedProcessBase):
                 req.configs, expected_measurement_id=req.measurement_id
             )
 
+    def _enqueue_sequencer_yaml_capture(self, *, process_id: str) -> None:
+        req = _CaptureSequencerYamlRequest(
+            process_id=str(process_id or self._sequencer_process_id),
+            measurement_id=self._measurement_id or "",
+        )
+        if self._bg_thread is None or self._bg_thread_dead:
+            self._append_sequencer_yaml_capture_failure_locked(
+                process_id=req.process_id,
+                message="loaded_yaml snapshot skipped: background thread unavailable",
+            )
+            return
+        try:
+            self._bg_queue.put_nowait(req)
+        except queue.Full:
+            self._append_sequencer_yaml_capture_failure_locked(
+                process_id=req.process_id,
+                message="loaded_yaml snapshot skipped: background queue full",
+            )
+
     def _capture_run_metadata_for_configs(
         self,
         configs: list[Json],
@@ -1461,6 +1481,25 @@ class HdfWriter(ManagedProcessBase):
             self._capture_run_metadata_for_configs(
                 req.configs, expected_measurement_id=req.measurement_id
             )
+            return
+        if isinstance(req, _CaptureSequencerYamlRequest):
+            # Slow sequencer.loaded_yaml RPC, run off the main drain loop so
+            # sequencer lifecycle handling never stalls stream chunk draining.
+            _snapshot_id, snapshot_error = self._capture_sequencer_yaml_snapshot(
+                process_id=req.process_id,
+                expected_measurement_id=req.measurement_id,
+            )
+            if snapshot_error and "stale measurement" not in snapshot_error:
+                with self._h5_lock:
+                    if (
+                        req.measurement_id
+                        and self._measurement_id != req.measurement_id
+                    ):
+                        return
+                    self._append_sequencer_yaml_capture_failure_locked(
+                        process_id=req.process_id,
+                        message=snapshot_error,
+                    )
             return
         # Synchronous RPC request types are wired in a follow-up step;
         # for now anything else surfaces as an explicit error to the
@@ -2775,17 +2814,51 @@ class HdfWriter(ManagedProcessBase):
         self._sequencer_events_ds[old] = row[0]
         self._pending += 1
 
-    def _capture_sequencer_yaml_snapshot(self) -> tuple[int, str | None]:
+    def _append_sequencer_yaml_capture_failure_locked(
+        self,
+        *,
+        process_id: str,
+        message: str,
+    ) -> None:
         self._assert_h5_locked()
-        if self._sequencer_yaml_ds is None:
-            return -1, "sequencer yaml dataset unavailable"
+        try:
+            payload_json = json.dumps(
+                {
+                    "process_id": process_id,
+                    "error": message,
+                    "source": "hdf_writer",
+                }
+            )
+        except Exception:
+            payload_json = str({"process_id": process_id, "error": message})
+        now_wall = time.time()
+        now_mono = time.monotonic()
+        self._append_sequencer_event_row(
+            t_wall=now_wall,
+            t_mono=now_mono,
+            process_id=process_id,
+            event="yaml_snapshot_failed",
+            source="hdf_writer",
+            ok=False,
+            message=message,
+            payload_json=payload_json,
+            yaml_snapshot_id=-1,
+        )
+
+    def _capture_sequencer_yaml_snapshot(
+        self,
+        *,
+        process_id: str | None = None,
+        expected_measurement_id: str | None = None,
+    ) -> tuple[int, str | None]:
+        process_id_text = str(process_id or self._sequencer_process_id)
         try:
             resp = _manager_rpc(
                 self._ctx,
                 self._manager_rpc,
                 {
                     "type": "manager.processes.rpc",
-                    "process_id": self._sequencer_process_id,
+                    "process_id": process_id_text,
                     "request": {
                         "type": "sequencer.loaded_yaml",
                         "request_id": "hdf-sequencer-loaded-yaml",
@@ -2812,24 +2885,34 @@ class HdfWriter(ManagedProcessBase):
             return -1, "loaded sequence text unavailable"
         source = str(result.get("source") or "")
         text = str(text_raw)
-        snapshot_id = int(self._sequencer_yaml_next_id)
-        row = np.zeros(1, dtype=self._sequencer_yaml_ds.dtype)
-        row[0]["snapshot_id"] = snapshot_id
-        row[0]["t_wall"] = float(time.time())
-        row[0]["t_mono"] = float(time.monotonic())
-        row[0]["process_id"] = str(self._sequencer_process_id)
-        row[0]["source"] = source
-        row[0]["text"] = text
-        old = self._sequencer_yaml_ds.shape[0]
-        self._sequencer_yaml_ds.resize((old + 1,))
-        self._sequencer_yaml_ds[old] = row[0]
-        self._sequencer_yaml_next_id = snapshot_id + 1
-        self._pending += 1
-        return snapshot_id, None
+        with self._h5_lock:
+            if (
+                expected_measurement_id is not None
+                and expected_measurement_id
+                and self._measurement_id != expected_measurement_id
+            ):
+                return -1, "loaded_yaml snapshot skipped: stale measurement"
+            if self._sequencer_yaml_ds is None:
+                return -1, "sequencer yaml dataset unavailable"
+            snapshot_id = int(self._sequencer_yaml_next_id)
+            row = np.zeros(1, dtype=self._sequencer_yaml_ds.dtype)
+            row[0]["snapshot_id"] = snapshot_id
+            row[0]["t_wall"] = float(time.time())
+            row[0]["t_mono"] = float(time.monotonic())
+            row[0]["process_id"] = process_id_text
+            row[0]["source"] = source
+            row[0]["text"] = text
+            old = self._sequencer_yaml_ds.shape[0]
+            self._sequencer_yaml_ds.resize((old + 1,))
+            self._sequencer_yaml_ds[old] = row[0]
+            self._sequencer_yaml_next_id = snapshot_id + 1
+            self._pending += 1
+            return snapshot_id, None
 
     def _handle_sequencer_lifecycle(self, msg: Json) -> None:
         # Low-frequency handler from the lock-free main drain; writes h5py
-        # (sequencer events + yaml snapshot) so it takes _h5_lock.
+        # (sequencer events + context metadata) so it takes _h5_lock. The
+        # potentially slow loaded_yaml RPC is queued to the bg thread below.
         with self._h5_lock:
             self._handle_sequencer_lifecycle_locked(msg)
 
@@ -2850,13 +2933,6 @@ class HdfWriter(ManagedProcessBase):
             payload_json = str(msg)
 
         yaml_snapshot_id = -1
-        if event == "start" and ok:
-            yaml_snapshot_id, snapshot_error = self._capture_sequencer_yaml_snapshot()
-            if snapshot_error:
-                if message:
-                    message = f"{message}; {snapshot_error}"
-                else:
-                    message = snapshot_error
         if ok and event in {"load_ok", "start"}:
             self._update_cached_context_columns_from_lifecycle(msg)
             self._ensure_context_columns({})
@@ -2872,6 +2948,8 @@ class HdfWriter(ManagedProcessBase):
             payload_json=payload_json,
             yaml_snapshot_id=yaml_snapshot_id,
         )
+        if event == "start" and ok:
+            self._enqueue_sequencer_yaml_capture(process_id=process_id)
 
     def _drain_socket(self) -> None:
         if self._sub is None or self._buf is None:
