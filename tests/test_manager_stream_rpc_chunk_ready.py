@@ -15,8 +15,12 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
+import numpy as np
+
+from experiment_control._driver.stream_wrappers import build_stream_wrapper
 from experiment_control._manager.driver_pub import ingest_chunk_ready
 from experiment_control._manager.rpc_calls import RpcCallsMixin
+from experiment_control.types import StreamCall, StreamOut
 
 
 class _FakeSocket:
@@ -43,6 +47,7 @@ class _ManagerStub(RpcCallsMixin):
         self._chunk_cache_max_streams_per_device = 16
         self.events: list[tuple[str, dict[str, Any]]] = []
         self.closed_rpc = False
+        self._manager_chunk_ready_ingest_error_total = 0
 
     def _ensure_device_req_socket(self, _handle: Any) -> _FakeSocket:
         return _FakeSocket()
@@ -82,10 +87,10 @@ class _ManagerStub(RpcCallsMixin):
         return str(value)
 
 
-def _stream_descriptor(seq: int = 1) -> dict[str, Any]:
+def _stream_descriptor(seq: int = 1, *, stream: str = "timestamps") -> dict[str, Any]:
     return {
         "device_id": "dev-1",
-        "stream": "timestamps",
+        "stream": stream,
         "shm_name": "ec-test-shm",
         "seq": seq,
         "dtype": "float64",
@@ -93,20 +98,54 @@ def _stream_descriptor(seq: int = 1) -> dict[str, Any]:
     }
 
 
-class ManagerStreamRpcChunkReadyTests(unittest.TestCase):
-    def test_stream_rpc_result_publishes_chunk_ready_without_driver_pub(self) -> None:
-        mgr = _ManagerStub()
-        resp = {"ok": True, "result": _stream_descriptor(seq=7)}
+def _stream_result(*seqs: int) -> list[dict[str, Any]]:
+    """The real device-side stream wrapper shape: a *list* of descriptors,
+    one per published shot (see ``_driver.stream_wrappers``)."""
+    return [_stream_descriptor(seq) for seq in (seqs or (1,))]
 
+
+class _StubRunner:
+    """Minimal ``_StreamPublisher`` for driving the real stream wrapper so
+    tests exercise the genuine (list) result shape rather than a fixture."""
+
+    def __init__(self) -> None:
+        self._device = SimpleNamespace(
+            read_timestamps=lambda: np.array([1.0], dtype=np.float64)
+        )
+        self.published: list[dict[str, Any]] = []
+
+    def publish_stream(self, stream: str, arr: np.ndarray) -> dict[str, Any]:
+        del arr
+        seq = len(self.published) + 1
+        desc = {
+            "device_id": "dev-1",
+            "stream": stream,
+            "stream_kind": "frame",
+            "shm_name": "ec-test-shm",
+            "layout_version": 1,
+            "seq": seq,
+            "t0_mono_ns": 0,
+            "t0_wall_ns": 0,
+        }
+        self.published.append(desc)
+        return desc
+
+
+class ManagerStreamRpcChunkReadyTests(unittest.TestCase):
+    def _call(self, mgr: _ManagerStub, resp: dict[str, Any], *, action: str):
         with patch(
             "experiment_control._manager.rpc_calls._blocking_call_with_pump",
             return_value=resp,
         ):
-            returned = mgr._call_device_rpc(
-                device_id="dev-1",
-                action="stream__timestamps",
-                params={},
-            )
+            return mgr._call_device_rpc(device_id="dev-1", action=action, params={})
+
+    def test_stream_rpc_result_list_publishes_chunk_ready(self) -> None:
+        # The device-side wrapper returns a LIST of descriptors, not a bare
+        # dict. This is the shape that failed before the fix.
+        mgr = _ManagerStub()
+        resp = {"ok": True, "result": _stream_result(7)}
+
+        returned = self._call(mgr, resp, action="stream__timestamps")
 
         self.assertIs(returned, resp)
         chunk_ready = [
@@ -121,45 +160,91 @@ class ManagerStreamRpcChunkReadyTests(unittest.TestCase):
             "ec-test-shm",
         )
 
-    def test_invalid_stream_rpc_descriptor_fails_clearly(self) -> None:
+    def test_stream_rpc_result_from_real_wrapper_shape(self) -> None:
+        # Regression guard: build the result via the ACTUAL stream wrapper
+        # so the manager-side ingest can never drift from the shape the
+        # driver really produces (a list, per shot).
+        runner = _StubRunner()
+        wrapper = build_stream_wrapper(
+            runner=runner,
+            stream_call=StreamCall(
+                method="read_timestamps",
+                outputs=[StreamOut(stream="timestamps", dtype="float64", shape=(1,))],
+            ),
+        )
+        result = wrapper()
+        self.assertIsInstance(result, list)  # documents/pins the contract
+
+        mgr = _ManagerStub()
+        resp = {"ok": True, "result": result}
+        returned = self._call(mgr, resp, action="stream__timestamps")
+
+        self.assertIs(returned, resp)
+        chunk_ready = [
+            payload for topic, payload in mgr.events if topic == "manager.chunk_ready"
+        ]
+        self.assertEqual(len(chunk_ready), 1)
+        self.assertEqual(chunk_ready[0]["stream"], "timestamps")
+
+    def test_batched_stream_result_publishes_each_shot(self) -> None:
+        mgr = _ManagerStub()
+        resp = {"ok": True, "result": _stream_result(4, 5, 6)}
+
+        self._call(mgr, resp, action="stream__timestamps")
+
+        chunk_ready = [
+            payload for topic, payload in mgr.events if topic == "manager.chunk_ready"
+        ]
+        self.assertEqual([p["seq"] for p in chunk_ready], [4, 5, 6])
+
+    def test_multi_output_result_publishes_each_stream(self) -> None:
+        # Multi-output wrapper shape: list of {stream_name: descriptor}.
         mgr = _ManagerStub()
         resp = {
             "ok": True,
-            "result": {"device_id": "dev-1", "stream": "timestamps", "seq": 1},
+            "result": [
+                {
+                    "a": _stream_descriptor(1, stream="a"),
+                    "b": _stream_descriptor(1, stream="b"),
+                }
+            ],
         }
 
-        with patch(
-            "experiment_control._manager.rpc_calls._blocking_call_with_pump",
-            return_value=resp,
-        ):
-            with self.assertRaises(ValueError):
-                mgr._call_device_rpc(
-                    device_id="dev-1",
-                    action="stream__timestamps",
-                    params={},
-                )
+        self._call(mgr, resp, action="stream__pair")
 
+        published = {
+            payload["stream"]
+            for topic, payload in mgr.events
+            if topic == "manager.chunk_ready"
+        }
+        self.assertEqual(published, {"a", "b"})
+
+    def test_malformed_stream_result_is_non_fatal(self) -> None:
+        # A descriptor missing shm_name is unusable, but the device call
+        # already succeeded and published over PUB — so we must NOT raise
+        # or fail the RPC; just record a chunk_error and return the reply.
+        mgr = _ManagerStub()
+        resp = {
+            "ok": True,
+            "result": [{"device_id": "dev-1", "stream": "timestamps", "seq": 1}],
+        }
+
+        returned = self._call(mgr, resp, action="stream__timestamps")
+
+        self.assertIs(returned, resp)
         chunk_errors = [
             payload for topic, payload in mgr.events if topic == "manager.chunk_error"
         ]
         self.assertEqual(len(chunk_errors), 1)
-        self.assertIn("stream RPC result chunk ingest failed", chunk_errors[0]["error"])
         self.assertNotIn("dev-1", mgr._latest_chunk_desc)
         self.assertFalse(mgr.closed_rpc)
+        self.assertEqual(mgr._manager_chunk_ready_ingest_error_total, 1)
 
     def test_non_stream_rpc_does_not_publish_chunk_ready(self) -> None:
         mgr = _ManagerStub()
-        resp = {"ok": True, "result": _stream_descriptor(seq=3)}
+        resp = {"ok": True, "result": _stream_result(3)}
 
-        with patch(
-            "experiment_control._manager.rpc_calls._blocking_call_with_pump",
-            return_value=resp,
-        ):
-            mgr._call_device_rpc(
-                device_id="dev-1",
-                action="read_status",
-                params={},
-            )
+        self._call(mgr, resp, action="read_status")
 
         self.assertFalse(
             [payload for topic, payload in mgr.events if topic == "manager.chunk_ready"]
@@ -167,17 +252,9 @@ class ManagerStreamRpcChunkReadyTests(unittest.TestCase):
 
     def test_duplicate_direct_and_driver_pub_chunk_ready_is_suppressed(self) -> None:
         mgr = _ManagerStub()
-        resp = {"ok": True, "result": _stream_descriptor(seq=11)}
+        resp = {"ok": True, "result": _stream_result(11)}
 
-        with patch(
-            "experiment_control._manager.rpc_calls._blocking_call_with_pump",
-            return_value=resp,
-        ):
-            mgr._call_device_rpc(
-                device_id="dev-1",
-                action="stream__timestamps",
-                params={},
-            )
+        self._call(mgr, resp, action="stream__timestamps")
         ingest_chunk_ready(mgr, {"descriptor": _stream_descriptor(seq=11)})
 
         chunk_ready = [

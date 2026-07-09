@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import time
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any, Callable, Iterator
 
 import zmq
 
-from .driver_pub import normalized_chunk_descriptor_or_raise
+from .driver_pub import _counter_add, normalized_chunk_descriptor_or_raise
 from ..utils.zmq_helpers import json_dumps, safe_json_loads
 
 if TYPE_CHECKING:
@@ -30,6 +30,37 @@ def _effective_status_ok(resp: Json) -> bool | None:
     if "ok" in resp:
         return resp.get("ok") is True
     return None
+
+
+def _iter_stream_result_descriptors(result: Any) -> "Iterator[Json]":
+    """Yield candidate chunk descriptors from a ``stream__*`` RPC result.
+
+    The device-side stream wrapper always returns a **list**, one entry
+    per published shot (``_driver.stream_wrappers._publish_single_output``
+    / ``_publish_multi_output``): a single-output stream yields a list of
+    descriptor dicts, a multi-output stream yields a list of
+    ``{stream_name: descriptor}`` maps. A bare descriptor dict is also
+    tolerated for defensiveness (hand-rolled callers and older unit
+    fixtures that predate the list contract). Anything else yields
+    nothing.
+
+    A descriptor is recognised by carrying ``shm_name``; that also lets
+    us tell a descriptor dict apart from a multi-output ``{stream:
+    descriptor}`` map (whose *values* carry ``shm_name``).
+    """
+    if isinstance(result, (list, tuple)):
+        for item in result:
+            yield from _iter_stream_result_descriptors(item)
+        return
+    if not isinstance(result, dict):
+        return
+    if result.get("shm_name"):
+        yield result
+        return
+    # Multi-output shot: {stream_name: descriptor}.
+    for value in result.values():
+        if isinstance(value, dict) and value.get("shm_name"):
+            yield value
 
 
 def _send_json(sock: zmq.Socket, msg: Json) -> None:
@@ -273,27 +304,65 @@ class RpcCallsMixin(_MixinBase):
             )
             self._publish_manager_event("manager.command", payload)
             if _effective_status_ok(resp) is True and action.startswith("stream__"):
-                result = resp.get("result")
-                try:
-                    if not isinstance(result, dict):
-                        raise TypeError("stream RPC result must be a descriptor dict")
-                    desc = normalized_chunk_descriptor_or_raise({"descriptor": result})
-                    self._ingest_chunk_ready({"descriptor": desc})
-                except Exception as exc:
-                    self._publish_manager_event(
-                        "manager.chunk_error",
-                        {
-                            "device_id": device_id,
-                            "action": action,
-                            "error": (
-                                "stream RPC result chunk ingest failed: "
-                                f"{exc}"
-                            ),
-                            "raw": result,
-                        },
-                    )
-                    raise
+                self._ingest_stream_rpc_result(
+                    device_id=device_id,
+                    action=action,
+                    result=resp.get("result"),
+                )
             return resp
+
+    def _ingest_stream_rpc_result(
+        self, *, device_id: str, action: str, result: Any
+    ) -> None:
+        """Mirror a successful ``stream__*`` RPC's descriptors into the
+        chunk_ready path as a *redundant* delivery alongside the driver PUB
+        relay (deduped by seq in ``_ingest_chunk_ready``).
+
+        Best-effort and strictly non-fatal. The device has already run the
+        stream method and published each frame over its PUB socket — the
+        primary delivery path — before this reply was sent, so a malformed
+        or unexpected result shape here must never turn a succeeded device
+        call into an RPC failure (the earlier version raised, which failed
+        every real stream call because the wrapper returns a *list* of
+        descriptors, not a bare dict). Anything we cannot ingest is counted
+        and logged, then skipped.
+        """
+        found = False
+        for raw in _iter_stream_result_descriptors(result):
+            found = True
+            try:
+                desc = normalized_chunk_descriptor_or_raise({"descriptor": raw})
+                self._ingest_chunk_ready({"descriptor": desc})
+            except Exception as exc:
+                self._note_stream_rpc_ingest_error(
+                    device_id=device_id,
+                    action=action,
+                    error=f"stream RPC result chunk ingest failed: {exc}",
+                    raw=raw,
+                )
+        # A non-empty result that carried no recognisable descriptor is a
+        # genuine shape problem worth surfacing (once), but still not fatal.
+        if not found and result not in (None, "", [], {}):
+            self._note_stream_rpc_ingest_error(
+                device_id=device_id,
+                action=action,
+                error="stream RPC result carried no chunk descriptor",
+                raw=result,
+            )
+
+    def _note_stream_rpc_ingest_error(
+        self, *, device_id: str, action: str, error: str, raw: Any
+    ) -> None:
+        _counter_add(self, "_manager_chunk_ready_ingest_error_total")
+        self._publish_manager_event(
+            "manager.chunk_error",
+            {
+                "device_id": device_id,
+                "action": action,
+                "error": error,
+                "raw": raw,
+            },
+        )
 
     def _call_process_rpc(
         self,
