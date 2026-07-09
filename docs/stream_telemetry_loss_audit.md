@@ -504,7 +504,17 @@ a failed batch is neither retried, nor restored to the reservoir, nor counted
 into any persisted attr. (Post-#115, the symptom would at least be visible as
 `events_read_total > rows_written_total`.)
 
-### FS740: zero chunk_ready messages processed by the writer (proven); loss point inside the manager relay (constrained)
+### FS740: zero chunk_ready messages processed by the writer (SUPERSEDED — see §10)
+
+> **2026-07-09 (later): this subsection's conclusion is wrong.** The
+> "no `session_*` group ⇒ zero chunk activity" inference does not hold:
+> `_write_stream_buffers_batch` raises at `np.dtype(...)` (hdf_writer.py:5152)
+> *before* `_ensure_stream_dataset` (5158) ever creates the session group, so a
+> writer that processed every chunk can still leave an empty stream group.
+> `testing_with_intentional_sequencer_failures.h5` (with #115 counters)
+> proves the relay is lossless and pins the real, deterministic root cause —
+> see §10. The worker-thread pump below remains a latent thread-safety
+> concern but is exonerated for these losses.
 
 - The empty `/streams/fs740/timestamps` group is created by stream-*metadata*
   ingestion (hdf_writer.py:2243 `require_group`), not by chunk handling —
@@ -554,14 +564,99 @@ machine:
    persist a `bg_flush_batch_failures_total` root attr, and per-key
    try/except inside `_write_stream_buffers_batch` so one stream's write
    error cannot discard sibling streams' frames.
-2. **Stop draining `manager._sub` from worker threads** (rpc_calls.py:117):
-   restrict the pump to the caller-owned REQ/reply sockets, or serialize
-   `_sub` access behind a lock/main-thread-only rule.
-3. **Fix #113 before the next lab deploy**: `_call_device_rpc`'s stream-result
-   ingest (rpc_calls.py:275-295) rejects the list that
-   `_publish_single_output` always returns; once this code reaches the lab,
-   *every* manager-mediated stream call will fail with `lifecycle_error`.
-   (#113's tests use dict fixtures and don't catch it.)
+2. ~~Stop draining `manager._sub` from worker threads~~ (rpc_calls.py:117):
+   demoted — the relay is proven lossless in §10's run. Still a genuine ZMQ
+   thread-safety violation worth fixing on hygiene grounds, but no observed
+   loss is attributed to it anymore.
+3. ~~Fix #113 before the next lab deploy~~ — **DONE**, PR #117 (`ae0eac4`,
+   merged `e49b2da`), with real-wrapper-shape regression tests.
 4. **Writer process telemetry should publish a real `seq`** (it is −1 in
    files), so writer restarts are provable from acquired files the way driver
    restarts are.
+5. **Fix the structured-dtype schema poisoning** — the actual root cause of
+   every fs740/pxie stream loss in §8–§10; see §10 for the required changes.
+
+## 10. ROOT CAUSE CONFIRMED: structured-dtype schema poisoning → bg flush batch discard (2026-07-09, from `testing_with_intentional_sequencer_failures.h5`)
+
+A fresh run on post-#117 master (file created 07-09 11:34:10, strict
+expectations active) finally carries the #115 counters, and they localize the
+loss exactly:
+
+| stream | chunk_ready_seen | events_read | rows_written | attach/drain/payload failures | seq_gap |
+|---|---|---|---|---|---|
+| fs740/timestamps | 2760 | 2760 | **0** | 0 | 0 |
+| pxie5171/waveforms | 2760 | 2760 | **1747** | 0 | 0 |
+
+The manager relay and the ring reads are **lossless** (2760/2760 both
+streams, `first_seq=1`, `last_seq=2760`, zero gaps). Everything is lost
+*after* `read_events`, in the bg flush. All 101 pxie holes span ≥ 1.009 s
+wall time — whole flush batches again. `acquisition_ok = False` with 195
+strict errors ("required stream seen but no rows written") — #115 did its
+job.
+
+### The mechanism (all code refs on master)
+
+1. At file open, config replay (`hdf_writer.py:2522-2534`) parses fs740's
+   `stream_calls` (`kind: records` + `fields`, from `devices/fs740.yaml`)
+   and stores a **real structured `np.dtype`** in `_stream_schema`
+   (hdf_writer.py:5442-5449). This is the only *good* schema source.
+2. The first fs740 `chunk_ready` of a fresh driver session attaches a new
+   ring reader — and `_ensure_chunk_ready_reader` **pops that schema entry**
+   (hdf_writer.py:4524).
+3. The events-read path then repopulates it as
+   `{"dtype": str(reader.layout.dtype), ...}` (hdf_writer.py:4594-4598).
+   For pxie's scalar `int16` the `str()` round-trips. For fs740's 11-field
+   record dtype it produces `"[('timing_metric', '<i4'), …]"` — which
+   **`np.dtype()` cannot parse back** (verified: raises `TypeError`).
+4. Every flush batch snapshots that poisoned string into `stream_meta`
+   (hdf_writer.py:1808-1817); `_write_stream_buffers_batch` calls
+   `np.dtype(dtype_raw)` (hdf_writer.py:5152) → `TypeError` → the exception
+   escapes to `_bg_thread_run` (hdf_writer.py:1475-1481) → **the entire
+   batch is silently discarded** (§9 action 1, live-only counter).
+5. Batch iteration follows `_stream_buffers` insertion order. When pxie's
+   frames entered the buffer before fs740's, pxie's rows were already
+   written when the fs740 raise hit; otherwise they died with the batch.
+   Hence fs740 = 0 rows always (it always raises at its own turn), pxie =
+   partial. The raise also precedes `_ensure_stream_dataset`
+   (hdf_writer.py:5158), so no `session_*` group is ever created for fs740 —
+   the empty-group signature §9 misread as "zero chunks processed".
+
+### Why bad-then-good on 07-08 (the state dependence, solved)
+
+Ring readers persist for the writer-process lifetime (only dropped at close,
+hdf_writer.py:2794, or on drain failure, 4551) and the ring name embeds the
+driver PID. So:
+
+- **First run after a driver (re)start** → new ring name → attach → schema
+  pop (step 2) → poisoned → fs740 0 rows, pxie collateral. Both bad files
+  are first-runs-after-restart (`records_read_total` starts at 0).
+- **Subsequent run, same driver** → `reader.name == shm_name` → attach
+  early-returns *without* popping → the config-replay schema (real dtype
+  object, refreshed at every file open) survives → **everything is written**.
+  That is exactly the good 16:46 run (4140/4140 on both streams).
+
+Quantitative cross-check: pxie survival is 886/1380 = 64.2 % (07-08 bad) vs
+1747/2760 = 63.3 % (07-09 bad) — the same deterministic insertion-order ratio
+across two runs on different code versions. The mechanism has existed since
+`8a81fa9` (05-13, structured record support); `e97e446` (07-01) routed the
+poisoned string into the bg batch path.
+
+### Fixes required
+
+1. **Round-trippable dtype in the reader-derived schema**
+   (hdf_writer.py:4594-4598): store `reader.layout.dtype` (the `np.dtype`
+   object — it only crosses a thread queue, never a process boundary), not
+   `str(...)`. This is the one-line root fix.
+2. **Don't discard the config-derived schema on attach**
+   (hdf_writer.py:4524): the config schema is authoritative; popping it in
+   favour of a reader-derived fallback is backwards. Keep it, or overwrite
+   only with equal-or-better information.
+3. **§9 action 1 unchanged and now demonstrated**: per-key try/except in
+   `_write_stream_buffers_batch` + no whole-batch discard + persisted
+   `bg_flush_batch_failures_total`. One stream's poisoned schema destroyed a
+   *healthy* sibling stream's data for two days without a single persisted
+   error.
+4. **Regression test**: a records-kind stream (structured dtype) whose
+   schema is populated via the reader-fallback path (attach → pop → read)
+   must still flush; plus a mixed batch where one stream's write raises must
+   still write the sibling stream's frames.

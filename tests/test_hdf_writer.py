@@ -1007,6 +1007,171 @@ class HdfWriterStreamBufferTests(unittest.TestCase):
                 self.assertEqual(list(datasets["context_id"][...]), [-1, -1])
 
 
+class HdfWriterStreamSchemaPoisoningTests(unittest.TestCase):
+    """Regression tests for the structured-dtype schema poisoning that caused
+    the fs740/timestamps stream to write 0 rows and take healthy sibling
+    streams (pxie5171) down with it on every flush batch."""
+
+    def _make_writer(self, out_dir: str) -> HdfWriter:
+        return HdfWriter(
+            out_dir=out_dir,
+            filename=None,
+            manager_rpc="tcp://127.0.0.1:65531",
+            manager_pub="tcp://127.0.0.1:65532",
+            rpc_timeout_ms=2000,
+            timezone="America/Chicago",
+            rcvhwm=1000,
+            write_every_s=1.0,
+            buffer_max_messages=1000,
+            flush_every_n=10,
+            flush_every_s=1.0,
+            disabled_devices=[],
+            event_log_mode="all",
+        )
+
+    def test_poisoned_stream_does_not_discard_sibling_batch(self) -> None:
+        # A structured-dtype stream whose schema is an unparseable dtype
+        # *string* (the production poison) raises inside the flush loop. It
+        # must NOT abort the batch and lose a healthy sibling stream buffered
+        # in the same flush interval. Regression for fs740 -> pxie5171
+        # collateral loss.
+        structured = np.dtype([("timing_metric", "<i4"), ("seconds", "<i4")])
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            writer = self._make_writer(str(root))
+            with h5py.File(root / "collateral.h5", "w") as h5:
+                meta = writer._build_measurement_metadata(  # noqa: SLF001
+                    profile_id=None, values=None, require_profile=False
+                )
+                writer._configure_active_file(  # noqa: SLF001
+                    h5,
+                    write_every_s=1.0,
+                    load_manager_state=False,
+                    measurement_meta=meta,
+                )
+                poison_key = ("fs740", "timestamps")
+                healthy_key = ("pxie5171", "waveforms")
+                # Poison is inserted FIRST -- the worst case that previously
+                # aborted the loop before the healthy stream was reached.
+                writer._stream_schema[poison_key] = {  # noqa: SLF001
+                    "dtype": str(structured),  # unparseable by np.dtype(...)
+                    "shape": (),
+                }
+                writer._stream_schema[healthy_key] = {  # noqa: SLF001
+                    "dtype": "int16",
+                    "shape": (2,),
+                }
+                writer._stream_buffers[poison_key] = {  # noqa: SLF001
+                    "data": [b"\x00" * structured.itemsize],
+                    "seq": [1],
+                    "t0_mono_ns": [10],
+                    "t0_wall_ns": [20],
+                    "context_id": [-1],
+                }
+                writer._stream_buffers[healthy_key] = {  # noqa: SLF001
+                    "data": [np.array([1, 2], dtype=np.int16).tobytes()],
+                    "seq": [1],
+                    "t0_mono_ns": [11],
+                    "t0_wall_ns": [21],
+                    "context_id": [-1],
+                }
+
+                writer._write_stream_buffers()  # noqa: SLF001
+
+                # Healthy sibling survived: its rows were written and buffer
+                # cleared.
+                healthy_ds = writer._stream_datasets[  # noqa: SLF001
+                    ("pxie5171", "waveforms", 1)
+                ]
+                self.assertEqual(healthy_ds["data"].shape[0], 1)
+                self.assertEqual(
+                    writer._stream_buffers[healthy_key]["data"], []  # noqa: SLF001
+                )
+                # Poison stream: no rows, failure counted, buffer dropped (not
+                # left to jam the next batch).
+                counters = writer._stream_counters[poison_key]  # noqa: SLF001
+                self.assertGreaterEqual(counters["write_failures_total"], 1)
+                self.assertEqual(counters.get("rows_written_total", 0), 0)
+                self.assertEqual(
+                    writer._stream_buffers[poison_key]["data"], []  # noqa: SLF001
+                )
+
+    def test_reader_fallback_stores_parseable_structured_dtype(self) -> None:
+        # The reader-derived schema fallback must store the real np.dtype
+        # object, not str(dtype); for a structured dtype the string form is
+        # not round-trippable through np.dtype(...) and would poison the
+        # flush path.
+        from types import SimpleNamespace
+
+        structured = np.dtype([("timing_metric", "<i4"), ("seconds", "<i4")])
+        with tempfile.TemporaryDirectory() as td:
+            writer = self._make_writer(td)
+            key = ("fs740", "timestamps")
+            reader = SimpleNamespace(
+                layout=SimpleNamespace(dtype=structured, shape=())
+            )
+            events = [
+                {
+                    "seq": 1,
+                    "payload": b"\x00" * structured.itemsize,
+                    "t0_mono_ns": 0,
+                    "t0_wall_ns": 0,
+                }
+            ]
+            writer._append_chunk_ready_events(  # noqa: SLF001
+                key=key,
+                reader=reader,
+                events=events,
+                initial_last_seq=0,
+                now_mono=0.0,
+            )
+            stored = writer._stream_schema[key]["dtype"]  # noqa: SLF001
+            self.assertIsInstance(stored, np.dtype)
+            # str(structured) would raise here; the object form round-trips.
+            self.assertEqual(np.dtype(stored), structured)
+
+    def test_config_schema_survives_ring_reattach(self) -> None:
+        # The authoritative config-driven schema (a real structured dtype)
+        # must NOT be popped when a new ring is attached; dropping it forced
+        # the poisoned reader-derived fallback.
+        from experiment_control.shm.shm_ring import ShmRingWriter
+
+        structured = np.dtype([("timing_metric", "<i4"), ("seconds", "<i4")])
+        name = f"ec_test_reattach_{uuid.uuid4().hex}"
+        ring = ShmRingWriter.create(
+            name=name,
+            dtype=structured,
+            shape=(),
+            slot_count=4,
+            layout_version=3,
+        )
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                writer = self._make_writer(td)
+                key = ("fs740", "timestamps")
+                writer._stream_schema[key] = {  # noqa: SLF001
+                    "dtype": structured,
+                    "shape": (),
+                }
+                reader = writer._ensure_chunk_ready_reader(  # noqa: SLF001
+                    key=key,
+                    device_id="fs740",
+                    stream="timestamps",
+                    shm_name=name,
+                    initial_seq=1,
+                )
+                self.assertIsNotNone(reader)
+                self.assertIn(key, writer._stream_schema)  # noqa: SLF001
+                self.assertEqual(
+                    writer._stream_schema[key]["dtype"], structured  # noqa: SLF001
+                )
+                if reader is not None:
+                    reader.close()
+        finally:
+            ring.close()
+            ring.unlink()
+
+
 class HdfWriterContextResolutionTests(unittest.TestCase):
     @staticmethod
     def _make_writer(out_dir: str) -> HdfWriter:
