@@ -15,6 +15,7 @@ import {
   insertStepInside,
   moveStepDown,
   moveStepUp,
+  toggleStepEnabled,
   type BasicSequencerStepTemplate,
   type SequencerChildContainer,
 } from "../features/sequencer/editing";
@@ -188,6 +189,15 @@ export function SequencerOutlinePane({
     onYamlTextChange(deleteStep(yamlText, node));
   };
 
+  const handleToggleEnabled = (node: SequencerStepOutlineNode) => {
+    setPendingSelection({
+      line: node.line,
+      kind: node.kind,
+      mode: "closest",
+    });
+    onYamlTextChange(toggleStepEnabled(yamlText, node));
+  };
+
   const handleInsertBelow = (
     node: SequencerStepOutlineNode,
     kind: BasicSequencerStepTemplate
@@ -352,6 +362,7 @@ export function SequencerOutlinePane({
                 }
                 onDuplicate={handleDuplicateStep}
                 onDelete={handleDeleteStep}
+                onToggleEnabled={handleToggleEnabled}
                 onInsertBelow={handleInsertBelow}
                 onInsertChild={handleInsertChild}
                 siblingInfoById={siblingInfoById}

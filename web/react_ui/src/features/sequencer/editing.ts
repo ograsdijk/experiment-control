@@ -27,4 +27,5 @@ export {
   listChildInsertionTargets,
   moveStepDown,
   moveStepUp,
+  toggleStepEnabled,
 } from "./editing/tree_ops";

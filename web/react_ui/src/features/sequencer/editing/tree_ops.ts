@@ -206,6 +206,35 @@ export function moveStepDown(
   return swapSiblingStepRanges(yamlText, node, nextSibling);
 }
 
+export function toggleStepEnabled(
+  yamlText: string,
+  node: SequencerStepOutlineNode
+): string {
+  const { lines, hasTrailingNewline } = splitLines(yamlText);
+  const startIndex = Math.max(0, node.line - 1);
+  const endIndex = Math.max(startIndex, node.endLine - 1);
+  const disabledIndent = node.indent + 2;
+  const disabledPattern = new RegExp(`^ {${disabledIndent}}disabled:\\s*true\\s*$`);
+
+  if (node.disabled) {
+    for (let index = startIndex + 1; index <= endIndex; index += 1) {
+      if (disabledPattern.test(lines[index] ?? "")) {
+        const nextLines = [...lines.slice(0, index), ...lines.slice(index + 1)];
+        return joinLines(nextLines, hasTrailingNewline);
+      }
+    }
+    return yamlText;
+  }
+
+  const insertionLine = `${" ".repeat(disabledIndent)}disabled: true`;
+  const nextLines = [
+    ...lines.slice(0, startIndex + 1),
+    insertionLine,
+    ...lines.slice(startIndex + 1),
+  ];
+  return joinLines(nextLines, hasTrailingNewline);
+}
+
 export function deleteStep(
   yamlText: string,
   node: SequencerStepOutlineNode

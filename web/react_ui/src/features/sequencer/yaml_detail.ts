@@ -77,6 +77,29 @@ export function readStep(snippet: string): ParsedStep | null {
   return { kind: kind || null, body, src: snippet };
 }
 
+/** Read the step-level `disabled:` flag (a sibling of the kind key, e.g. `- call: {...}\n  disabled: true`). */
+export function readStepDisabled(snippet: string): boolean {
+  let doc: Document;
+  try {
+    doc = parseDocument(snippet);
+  } catch {
+    return false;
+  }
+  if (doc.errors && doc.errors.length > 0) {
+    return false;
+  }
+  const root = doc.contents;
+  if (!isSeq(root) || root.items.length <= 0) {
+    return false;
+  }
+  const item = root.items[0];
+  if (!isMap(item)) {
+    return false;
+  }
+  const value = item.get("disabled", false);
+  return value === true;
+}
+
 /** Exact YAML source text of a node, sliced from the snippet (preserves quotes/flow). */
 export function leafText(node: unknown, src: string): string | null {
   if (node == null) {

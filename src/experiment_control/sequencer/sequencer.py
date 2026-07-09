@@ -2195,6 +2195,8 @@ class SequencerProcess(ManagedProcessBase):
     ) -> None:
         for index, step in enumerate(steps):
             step_path = f"{path}[{index}]"
+            if getattr(step, "disabled", False):
+                continue
             if self._preflight_dispatch_primary_step(
                 step=step,
                 step_path=step_path,
