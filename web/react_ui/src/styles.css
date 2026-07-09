@@ -550,7 +550,7 @@ body::before {
   border-radius: var(--mantine-radius-sm);
   background: rgba(148, 163, 184, 0.06);
   display: grid;
-  grid-template-columns: minmax(9rem, 0.85fr) minmax(12rem, 1.5fr) 2.5rem;
+  grid-template-columns: minmax(6rem, 0.85fr) minmax(7rem, 1.5fr) 2.5rem;
   align-items: center;
   overflow: hidden;
 }
@@ -594,7 +594,7 @@ body::before {
   background: rgba(148, 163, 184, 0.08);
 }
 
-@media (max-width: 700px) {
+@container (max-width: 26rem) {
   .sequencer-var-chip {
     grid-template-columns: minmax(0, 1fr) 2.5rem;
   }

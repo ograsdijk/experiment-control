@@ -104,6 +104,48 @@ class SequencerProgressTests(unittest.TestCase):
         self.assertIn("while", str(progress.get("estimate_reason")))
 
     def test_progress_unknown_total_reports_template_failure(self) -> None:
+        # `range`'s element count genuinely depends on rendering start/stop,
+        # so an unresolved var there can't be worked around and should still
+        # surface as an unknown total (unlike triangle/centered_triangle,
+        # see test_progress_known_total_for_triangle_with_unresolved_start).
+        runtime = _build_runtime()
+        runtime.load(
+            SequenceSpec(
+                version=1,
+                meta={},
+                vars={},
+                steps=[
+                    ForStep(
+                        bind={"value": "x"},
+                        in_expr={
+                            "gen": {
+                                "range": {
+                                    "start": 0.0,
+                                    "stop": "${current_pos}",
+                                    "step": 1.0,
+                                }
+                            }
+                        },
+                        body=[AssignStep(values={"y": "${x}"})],
+                    )
+                ],
+                context_columns=None,
+            )
+        )
+        runtime.start()
+
+        progress = runtime.status().get("progress", {})
+        self.assertIsNone(progress.get("total_steps"))
+        self.assertIsNone(progress.get("percent"))
+        reason = str(progress.get("estimate_reason"))
+        self.assertIn("for generator", reason)
+        self.assertIn("current_pos", reason)
+
+    def test_progress_known_total_for_triangle_with_unresolved_start(self) -> None:
+        # triangle's element count is 2 * num regardless of the sampled
+        # start/stop values, so the estimator should still report a known
+        # total even when `start` depends on a var that isn't set yet (e.g.
+        # assigned from a live device read earlier in the same sequence).
         runtime = _build_runtime()
         runtime.load(
             SequenceSpec(
@@ -131,11 +173,9 @@ class SequencerProgressTests(unittest.TestCase):
         runtime.start()
 
         progress = runtime.status().get("progress", {})
-        self.assertIsNone(progress.get("total_steps"))
-        self.assertIsNone(progress.get("percent"))
-        reason = str(progress.get("estimate_reason"))
-        self.assertIn("for generator", reason)
-        self.assertIn("current_pos", reason)
+        self.assertEqual(progress.get("total_steps"), 7)
+        self.assertTrue(progress.get("total_steps_known"))
+        self.assertIsNone(progress.get("estimate_reason"))
 
     def test_progress_known_total_for_triangle_generator(self) -> None:
         runtime = _build_runtime()
