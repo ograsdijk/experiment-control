@@ -61,6 +61,17 @@ jobs:
         shell: pwsh
         run: .\scripts\build_packaged_ui.ps1
 
+      - name: Verify packaged UI is up to date
+        shell: pwsh
+        run: |
+          git add -A -- src/experiment_control/_ui_dist
+          $diff = git diff --cached --stat -- src/experiment_control/_ui_dist
+          if ($diff) {
+            Write-Host $diff
+            Write-Host "::error::src/experiment_control/_ui_dist is stale — run .\scripts\build_packaged_ui.ps1 and commit the result."
+            exit 1
+          }
+
       - name: Build package artifacts
         run: uv build
 
