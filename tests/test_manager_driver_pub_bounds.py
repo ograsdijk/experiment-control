@@ -5,6 +5,7 @@ from __future__ import annotations
 import sys
 import time
 import unittest
+import json
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -16,7 +17,14 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from experiment_control._manager.driver_pub import ingest_chunk_ready, ingest_telemetry
+import zmq
+
+from experiment_control._manager import driver_pub
+from experiment_control._manager.driver_pub import (
+    handle_driver_pub,
+    ingest_chunk_ready,
+    ingest_telemetry,
+)
 
 
 @dataclass(frozen=True)
@@ -72,7 +80,25 @@ def _build_manager_stub() -> Any:
     mgr._publish_manager_event = _publish_manager_event
     mgr._parse_timestamp = _parse_timestamp
     mgr._coerce_enum = _coerce_enum
+    mgr._ingest_chunk_ready = lambda msg: ingest_chunk_ready(mgr, msg)
+    mgr._normalize_topic = lambda topic: str(topic).strip()
+    mgr._maybe_publish_drain_cap_hit = (
+        lambda socket, cap: mgr.events.append(
+            ("manager.drain_cap_hit", {"socket": socket, "cap": cap})
+        )
+    )
     return mgr
+
+
+class _FakeDriverSub:
+    def __init__(self, messages: list[tuple[str, dict[str, Any]]]) -> None:
+        self._messages = list(messages)
+
+    def recv_multipart(self, _flags: int) -> list[bytes]:
+        if not self._messages:
+            raise zmq.Again()
+        topic, payload = self._messages.pop(0)
+        return [topic.encode("utf-8"), json.dumps(payload).encode("utf-8")]
 
 
 class ManagerDriverPubBoundsTests(unittest.TestCase):
@@ -182,6 +208,134 @@ class ManagerDriverPubBoundsTests(unittest.TestCase):
         )
         self.assertEqual(set(mgr._latest_chunk_desc.keys()), {"dev-2"})
         self.assertEqual(int(getattr(mgr, "_chunk_cache_evicted_devices", 0)), 1)
+
+    def test_driver_pub_prioritizes_chunk_ready_within_drain_batch(self) -> None:
+        mgr = _build_manager_stub()
+        mgr._sub = _FakeDriverSub(
+            [
+                (
+                    "dev-1/telemetry",
+                    {
+                        "device_id": "dev-1",
+                        "seq": 1,
+                        "ts": {"t_wall": 1.0, "t_mono": 1.0},
+                        "signals": {"x": {"value": 1.0, "quality": "OK"}},
+                    },
+                ),
+                (
+                    "dev-1/heartbeat",
+                    {
+                        "device_id": "dev-1",
+                        "pid": 123,
+                        "seq": 1,
+                        "ts": {"t_wall": 1.0, "t_mono": 1.0},
+                    },
+                ),
+                (
+                    "dev-1/chunk_ready",
+                    {
+                        "device_id": "dev-1",
+                        "stream": "timestamps",
+                        "shm_name": "ec-test-shm",
+                        "seq": 5,
+                    },
+                ),
+            ]
+        )
+
+        def _ingest_telemetry(msg: dict[str, Any]) -> None:
+            mgr.events.append(("ingested.telemetry", msg))
+
+        def _ingest_heartbeat(msg: dict[str, Any]) -> None:
+            mgr.events.append(("ingested.heartbeat", msg))
+
+        mgr._ingest_telemetry = _ingest_telemetry
+        mgr._ingest_heartbeat = _ingest_heartbeat
+
+        handle_driver_pub(mgr)
+
+        topics = [topic for topic, _payload in mgr.events]
+        self.assertLess(
+            topics.index("manager.chunk_ready"),
+            topics.index("ingested.telemetry"),
+        )
+        self.assertLess(
+            topics.index("manager.chunk_ready"),
+            topics.index("ingested.heartbeat"),
+        )
+        self.assertEqual(int(getattr(mgr, "_driver_chunk_ready_seen_total", 0)), 1)
+        self.assertEqual(
+            int(getattr(mgr, "_manager_chunk_ready_published_total", 0)),
+            1,
+        )
+
+    def test_driver_pub_drain_cap_hits_are_counted(self) -> None:
+        mgr = _build_manager_stub()
+        mgr._sub = _FakeDriverSub(
+            [
+                (
+                    f"dev-{idx}/telemetry",
+                    {
+                        "device_id": f"dev-{idx}",
+                        "seq": idx,
+                        "ts": {"t_wall": 1.0, "t_mono": 1.0},
+                        "signals": {},
+                    },
+                )
+                for idx in range(3)
+            ]
+        )
+        mgr._ingest_telemetry = lambda msg: mgr.events.append(
+            ("ingested.telemetry", msg)
+        )
+
+        original_cap = driver_pub.MAX_DRAIN_PER_TICK
+        try:
+            driver_pub.MAX_DRAIN_PER_TICK = 2
+            handle_driver_pub(mgr)
+        finally:
+            driver_pub.MAX_DRAIN_PER_TICK = original_cap
+
+        self.assertEqual(
+            int(getattr(mgr, "_manager_driver_pub_drain_cap_hit_total", 0)),
+            1,
+        )
+        self.assertIn(
+            ("manager.drain_cap_hit", {"socket": "driver_pub", "cap": 2}),
+            mgr.events,
+        )
+
+    def test_chunk_ready_ingest_errors_are_counted(self) -> None:
+        mgr = _build_manager_stub()
+        mgr._sub = _FakeDriverSub(
+            [
+                (
+                    "dev-1/chunk_ready",
+                    {
+                        "device_id": "dev-1",
+                        "stream": "timestamps",
+                        "shm_name": "ec-test-shm",
+                        "seq": 5,
+                    },
+                )
+            ]
+        )
+
+        def _ingest_chunk_ready(_msg: dict[str, Any]) -> None:
+            raise RuntimeError("boom")
+
+        mgr._ingest_chunk_ready = _ingest_chunk_ready
+
+        handle_driver_pub(mgr)
+
+        self.assertEqual(int(getattr(mgr, "_driver_chunk_ready_seen_total", 0)), 1)
+        self.assertEqual(
+            int(getattr(mgr, "_manager_chunk_ready_ingest_error_total", 0)),
+            1,
+        )
+        self.assertTrue(
+            [payload for topic, payload in mgr.events if topic == "manager.chunk_error"]
+        )
 
 
 if __name__ == "__main__":

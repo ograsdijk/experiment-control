@@ -40,6 +40,10 @@ def _cache_counter_inc(manager: Any, attr: str) -> None:
     setattr(manager, attr, int(getattr(manager, attr, 0) or 0) + 1)
 
 
+def _counter_add(manager: Any, attr: str, amount: int = 1) -> None:
+    setattr(manager, attr, int(getattr(manager, attr, 0) or 0) + int(amount))
+
+
 def _ensure_cache_state(manager: Any) -> None:
     """Safety net for unit-test stubs that don't initialise LRU bookkeeping.
 
@@ -226,13 +230,30 @@ def _handle_heartbeat_topic(manager: Any, *, topic: str, msg: Json) -> None:
 
 
 def _handle_chunk_ready_topic(manager: Any, msg: Json) -> None:
+    _counter_add(manager, "_driver_chunk_ready_seen_total")
     try:
         manager._ingest_chunk_ready(msg)
     except Exception as e:
+        _counter_add(manager, "_manager_chunk_ready_ingest_error_total")
         manager._publish_manager_event(
             "manager.chunk_error",
             {"error": f"chunk ingest failed: {e}", "raw": msg},
         )
+
+
+def _handle_driver_pub_message(manager: Any, topic: str, msg: Json) -> None:
+    if topic.endswith("/telemetry"):
+        _handle_telemetry_topic(manager, msg)
+        return
+    if topic.endswith("/heartbeat"):
+        _handle_heartbeat_topic(manager, topic=topic, msg=msg)
+        return
+    if topic.endswith("/chunk_ready"):
+        _handle_chunk_ready_topic(manager, msg)
+        return
+    manager._publish_manager_event(
+        "manager.unknown_driver_pub", {"topic": topic, "raw": msg}
+    )
 
 
 def handle_driver_pub(manager: Any) -> None:
@@ -242,30 +263,35 @@ def handle_driver_pub(manager: Any) -> None:
     # ~1 Hz can saturate a single-message-per-tick drain at 20 Hz).
     # Backlog → telemetry & device-heartbeat checks fire against
     # stale state. The drain cap bounds tick duration.
+    messages: list[tuple[str, Json]] = []
+    cap_hit = True
     for _ in range(MAX_DRAIN_PER_TICK):
         try:
             topic_b, payload_b = manager._sub.recv_multipart(zmq.NOBLOCK)
         except zmq.Again:
-            return
+            cap_hit = False
+            break
         topic = manager._normalize_topic(topic_b.decode("utf-8", errors="replace"))
         msg = _decode_driver_pub_payload(manager, topic, payload_b)
         if msg is None:
             continue
-        if topic.endswith("/telemetry"):
-            _handle_telemetry_topic(manager, msg)
-            continue
-        if topic.endswith("/heartbeat"):
-            _handle_heartbeat_topic(manager, topic=topic, msg=msg)
-            continue
-        if topic.endswith("/chunk_ready"):
-            _handle_chunk_ready_topic(manager, msg)
-            continue
-        manager._publish_manager_event(
-            "manager.unknown_driver_pub", {"topic": topic, "raw": msg}
-        )
+        messages.append((topic, msg))
+
+    chunk_messages = [
+        (topic, msg) for topic, msg in messages if topic.endswith("/chunk_ready")
+    ]
+    other_messages = [
+        (topic, msg) for topic, msg in messages if not topic.endswith("/chunk_ready")
+    ]
+    for topic, msg in [*chunk_messages, *other_messages]:
+        _handle_driver_pub_message(manager, topic, msg)
+
+    if not cap_hit:
+        return
     # Loop completed full MAX_DRAIN_PER_TICK iterations without zmq.Again:
     # queue still has data. Surface this (rate-limited) so operators see
     # the backlog instead of silent message lag.
+    _counter_add(manager, "_manager_driver_pub_drain_cap_hit_total")
     manager._maybe_publish_drain_cap_hit("driver_pub", MAX_DRAIN_PER_TICK)
 
 
@@ -655,6 +681,7 @@ def ingest_chunk_ready(manager: Any, msg: Json) -> None:
         stream=stream,
         desc=desc,
     )
+    _counter_add(manager, "_manager_chunk_ready_published_total")
     manager._publish_manager_event("manager.chunk_ready", desc)
 
 
