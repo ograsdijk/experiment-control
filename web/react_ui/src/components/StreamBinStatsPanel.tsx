@@ -93,7 +93,7 @@ function normalizeXOffset(value: number): number {
   return value;
 }
 
-function buildBandData(
+export function buildBandData(
   input: StreamBinStatsSeries | null,
   mode: UncertaintyMode,
   scaleRaw: number,
@@ -178,7 +178,7 @@ function buildOverlayData(
   return out;
 }
 
-function buildFitOverlayData(
+export function buildFitOverlayData(
   overlays: StreamBinStatsFitOverlay[],
   xOffsetRaw = 0,
   xScaleRaw = 1
