@@ -184,6 +184,8 @@ export function ExpandedPlotBody({
         uncertaintyMode={panel.uncertaintyMode}
         uncertaintyScale={panel.uncertaintyScale}
         showBinMarkers={panel.showBinMarkers}
+        xOffset={panel.xOffset}
+        xScale={panel.xScale}
         tick={plotTick}
         colorScheme={computedColorScheme}
         plotHeight={PLOT_HEIGHT}

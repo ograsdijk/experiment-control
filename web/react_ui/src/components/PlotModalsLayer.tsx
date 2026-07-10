@@ -95,6 +95,9 @@ type Props = {
   onSetStreamBinStatsShowBinMarkers: ComponentProps<
     typeof StreamBinStatsOptionsModal
   >["onSetShowBinMarkers"];
+  onSetStreamBinStatsXAxisTransform: ComponentProps<
+    typeof StreamBinStatsOptionsModal
+  >["onSetXAxisTransform"];
   streamParamsOpened: boolean;
   onCloseStreamParams: () => void;
   streamParamsPanel: ComponentProps<typeof StreamParamsOptionsModal>["panel"];
@@ -155,6 +158,7 @@ export function PlotModalsLayer({
   onSetStreamBinStatsFitOverlayOutputs,
   onSetStreamBinStatsUncertainty,
   onSetStreamBinStatsShowBinMarkers,
+  onSetStreamBinStatsXAxisTransform,
   streamParamsOpened,
   onCloseStreamParams,
   streamParamsPanel,
@@ -218,6 +222,7 @@ export function PlotModalsLayer({
         onSetFitOverlayOutputs={onSetStreamBinStatsFitOverlayOutputs}
         onSetUncertainty={onSetStreamBinStatsUncertainty}
         onSetShowBinMarkers={onSetStreamBinStatsShowBinMarkers}
+        onSetXAxisTransform={onSetStreamBinStatsXAxisTransform}
       />
 
       <StreamParamsOptionsModal

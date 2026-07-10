@@ -881,6 +881,7 @@ export function App() {
     setTelemetrySmoothingWindow,
     setStreamBinStatsUncertainty,
     setStreamBinStatsShowBinMarkers,
+    setStreamBinStatsXAxisTransform,
     setStreamBin2dReducer,
     isExpandablePlotPanel,
     openExpandedPlot,
@@ -3548,6 +3549,7 @@ export function App() {
         onSetStreamBinStatsFitOverlayOutputs={setStreamBinStatsFitOverlayOutputs}
         onSetStreamBinStatsUncertainty={setStreamBinStatsUncertainty}
         onSetStreamBinStatsShowBinMarkers={setStreamBinStatsShowBinMarkers}
+        onSetStreamBinStatsXAxisTransform={setStreamBinStatsXAxisTransform}
         streamParamsOpened={streamParamsOptionsPanel !== null}
         onCloseStreamParams={closeStreamParamsOptionsModal}
         streamParamsPanel={streamParamsOptionsPanel}
