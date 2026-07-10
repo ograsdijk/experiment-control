@@ -506,6 +506,22 @@ class SequencerProcess(ManagedProcessBase):
     def _maybe_publish_progress_event(self) -> None:
         if self._manager is None:
             return
+        # Fast path: with the F5 tick budget, run() now calls this many times
+        # per sleepless scan (previously ~once per whole scan), so building
+        # the full status snapshot (progress ETA calc, dict copies of
+        # env/vars, adaptive study snapshots) on every call is wasted work
+        # whenever we already know the throttle below would discard it. A
+        # non-terminal state that's still within the rate-limit period always
+        # returns early below regardless of what the (unbuilt) signature
+        # would have been, so it's safe to skip status() entirely in that
+        # case rather than build it just to throw it away.
+        cheap_state = self._runtime.state
+        if (
+            cheap_state not in {"STOPPED", "ERROR"}
+            and (time.monotonic() - self._last_progress_event_mono)
+            < self._progress_event_period_s
+        ):
+            return
         status = self._runtime.status()
         signature = self._progress_event_signature(status)
         now = time.monotonic()
@@ -2949,13 +2965,26 @@ class SequencerProcess(ManagedProcessBase):
         return self.rpc_unknown(req)
 
     def run(self) -> None:
+        # `poll_timeout_ms` is normally the fixed 50 ms RPC/telemetry poll
+        # ceiling. `SequencerRuntime.tick()` returns True when it stopped
+        # early solely because its per-tick step/time budget (F5) was
+        # exhausted while more step work is immediately runnable (no
+        # sleep/wait/pause/stop/error is blocking progress). In that case the
+        # *next* poll must not block for the full ceiling - there may be
+        # nothing to wake it - or a sleepless scan's throughput collapses to
+        # a few percent duty cycle (poll ceiling >> per-tick compute time).
+        # Use a zero timeout (non-blocking poll) on that next iteration so
+        # tick() gets to resume immediately, while still opportunistically
+        # draining any RPC/telemetry that happens to already be queued.
+        poll_timeout_ms = 50
         try:
             while True:
-                events = self._poll_and_drain(50)
+                events = self._poll_and_drain(poll_timeout_ms)
                 self._drain_external_fault_logs(events)
                 self._drain_analysis_outputs(events)
                 self._flush_pending_logs(max_items=8)
-                self._runtime.tick()
+                more_work_pending = self._runtime.tick()
+                poll_timeout_ms = 0 if more_work_pending else 50
                 self._maybe_publish_progress_event()
                 if self._runtime.state == "ERROR" and not self._last_error_sent:
                     err_message = str(
