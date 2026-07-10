@@ -203,6 +203,29 @@ class SequencerRuntime:
         self._step_handlers: dict[type[Any], Callable[[Any], bool]] = {}
         self._register_step_handlers()
 
+    def _clear_set_context_state(self) -> None:
+        """Discard a pending/finished set_context dispatch.
+
+        Used everywhere `_set_context_state` is reset -- normal completion,
+        stop/pause, fail, terminal unwind, loop restart -- so an abandoned
+        dispatch (e.g. the operator stopped the run mid-retry) gets a
+        best-effort abort instead of silently running to completion in the
+        background (F8#3). The dispatch object is opaque to this class (it
+        may be the fallback path's `None`, or whatever `begin_set_context`
+        returned); if it exposes a no-arg `cancel()`, call it, but don't
+        assume it does.
+        """
+        state = self._set_context_state
+        self._set_context_state = None
+        if state is None:
+            return
+        cancel = getattr(state, "cancel", None)
+        if callable(cancel):
+            try:
+                cancel()
+            except Exception:
+                pass
+
     @property
     def state(self) -> str:
         return self._state
@@ -256,7 +279,7 @@ class SequencerRuntime:
         self._cleanup_errors = []
         self._sleep_until = None
         self._wait_state = None
-        self._set_context_state = None
+        self._clear_set_context_state()
         self._adaptive_observe_state = None
         self._atomic_depth = 0
         self._current_step = None
@@ -342,7 +365,7 @@ class SequencerRuntime:
         self._env = {}
         self._sleep_until = None
         self._wait_state = None
-        self._set_context_state = None
+        self._clear_set_context_state()
         self._adaptive_observe_state = None
         self._atomic_depth = 0
         self._current_step = None
@@ -390,7 +413,7 @@ class SequencerRuntime:
         self._stop_requested = False
         self._sleep_until = None
         self._wait_state = None
-        self._set_context_state = None
+        self._clear_set_context_state()
         self._adaptive_observe_state = None
         if self._begin_terminal_unwind("ERROR", str(reason or "external fault")):
             self._state = "RUNNING"
@@ -571,6 +594,14 @@ class SequencerRuntime:
             self._mark_pause_ended(now)
             self._stop_requested = False
             if not self._begin_terminal_unwind("STOPPED", None):
+                # No on_exit/finally work to unwind, so we go straight to
+                # STOPPED without routing through `_begin_terminal_unwind`'s
+                # own `_clear_set_context_state()` call. A set_context
+                # dispatch can still be pending here (e.g. `stop` requested
+                # while a stream's retry is in flight) and must still get
+                # its best-effort cancel (F8#3) instead of being silently
+                # abandoned/orphaned in `_set_context_state`.
+                self._clear_set_context_state()
                 self._state = "STOPPED"
                 self._run_ended_mono = now
             return True
@@ -615,7 +646,7 @@ class SequencerRuntime:
         self._cleanup_errors = []
         self._sleep_until = None
         self._wait_state = None
-        self._set_context_state = None
+        self._clear_set_context_state()
         self._adaptive_observe_state = None
         self._current_step = None
         self._current_step_detail = None
@@ -638,7 +669,7 @@ class SequencerRuntime:
         self._cleanup_failed = False
         self._sleep_until = None
         self._wait_state = None
-        self._set_context_state = None
+        self._clear_set_context_state()
         self._adaptive_observe_state = None
         self._state = "ERROR" if cleanup_failed else str(state or "STOPPED")
         self._last_error = error if self._state == "ERROR" else None
@@ -664,7 +695,7 @@ class SequencerRuntime:
         self._env = {}
         self._sleep_until = None
         self._wait_state = None
-        self._set_context_state = None
+        self._clear_set_context_state()
         self._adaptive_observe_state = None
         self._pending_terminal_state = None
         self._pending_terminal_error = None
@@ -1065,7 +1096,7 @@ class SequencerRuntime:
                             frame.on_exit()
                             self._sleep_until = None
                             self._wait_state = None
-                            self._set_context_state = None
+                            self._clear_set_context_state()
                             self._adaptive_observe_state = None
                         continue
                     step = frame.steps[frame.index]
@@ -1078,7 +1109,7 @@ class SequencerRuntime:
                     frame.on_exit()
                     self._sleep_until = None
                     self._wait_state = None
-                    self._set_context_state = None
+                    self._clear_set_context_state()
                     self._adaptive_observe_state = None
                 continue
             if isinstance(frame, _TryFrame):
@@ -2582,12 +2613,12 @@ class SequencerRuntime:
         if state is None:
             return True
         if self._poll_set_context is None:
-            self._set_context_state = None
+            self._clear_set_context_state()
             return True
         finished, error = self._poll_set_context(state, now)
         if not finished:
             return False
-        self._set_context_state = None
+        self._clear_set_context_state()
         if error is not None:
             self._fail_step(f"set_context failed: {error}")
         return True

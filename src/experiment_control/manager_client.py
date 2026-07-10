@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 import time
 import uuid
 from typing import Any
@@ -78,6 +79,16 @@ class ManagerClient:
         # raises before a successful recv; the NEXT call drains stale
         # replies pre-send. Healthy callers pay zero extra syscalls.
         self._maybe_stale_reply = False
+        # `call()` is the only method that sends/recvs on `self._rpc`, and it
+        # assumes strictly sequential single-threaded use: it mutates
+        # `_maybe_stale_reply`, calls setsockopt, and does a send followed by
+        # a matching recv, none of which is safe to interleave across
+        # threads. Callers that dispatch RPCs from a worker pool (e.g. the
+        # sequencer's concurrent set_context dispatch) must still be able to
+        # call `call()` from multiple threads at once without corrupting the
+        # socket or stealing another thread's reply; this lock makes `call()`
+        # itself thread-safe so no caller has to remember to guard it.
+        self._rpc_lock = threading.Lock()
 
     @property
     def sub_socket(self) -> zmq.Socket | None:
@@ -154,45 +165,50 @@ class ManagerClient:
         else:
             expected_request_id = None
 
-        self._rpc.setsockopt(zmq.RCVTIMEO, timeout_ms)
-        self._rpc.setsockopt(zmq.SNDTIMEO, timeout_ms)
-        try:
-            if self._maybe_stale_reply:
-                _drain_stale_replies(self._rpc)
-                self._maybe_stale_reply = False
-            self._rpc.send(json_dumps(outbound))
-            deadline = time.monotonic() + (timeout_ms / 1000.0)
-            while True:
-                remaining_ms = (deadline - time.monotonic()) * 1000.0
-                if remaining_ms <= 0:
-                    self._maybe_stale_reply = True
-                    raise zmq.Again()
-                if not self._rpc.poll(max(1, int(remaining_ms)), zmq.POLLIN):
-                    continue
-                raw = self._rpc.recv(zmq.NOBLOCK)
-                resp = json_loads(raw)
-                if not isinstance(resp, dict):
-                    continue
-                resp_rid = resp.get("request_id")
-                if (
-                    expected_request_id is not None
-                    and resp_rid is not None
-                    and resp_rid != expected_request_id
-                ):
-                    # Stale reply from a previous timed-out call (its
-                    # send-time stamp doesn't match what we're waiting
-                    # for); skip. Replies that don't carry request_id
-                    # at all are passed through — some manager error
-                    # paths (parse_error, invalid_request) reply before
-                    # any request body is parsed and can't echo an id.
-                    continue
-                return resp
-        except Exception:
-            # Mark the socket as possibly carrying a stale reply so the
-            # NEXT call's pre-send drain kicks in. Healthy calls pay no
-            # extra syscalls; only post-timeout calls do.
-            self._maybe_stale_reply = True
-            return None
+        # Guards the entire send/recv round trip (see the `_rpc_lock` note in
+        # __init__): without this, two threads calling `call()` at once could
+        # interleave `setsockopt`/`send`/`recv` on the shared DEALER socket
+        # and hand one thread's reply to the other.
+        with self._rpc_lock:
+            self._rpc.setsockopt(zmq.RCVTIMEO, timeout_ms)
+            self._rpc.setsockopt(zmq.SNDTIMEO, timeout_ms)
+            try:
+                if self._maybe_stale_reply:
+                    _drain_stale_replies(self._rpc)
+                    self._maybe_stale_reply = False
+                self._rpc.send(json_dumps(outbound))
+                deadline = time.monotonic() + (timeout_ms / 1000.0)
+                while True:
+                    remaining_ms = (deadline - time.monotonic()) * 1000.0
+                    if remaining_ms <= 0:
+                        self._maybe_stale_reply = True
+                        raise zmq.Again()
+                    if not self._rpc.poll(max(1, int(remaining_ms)), zmq.POLLIN):
+                        continue
+                    raw = self._rpc.recv(zmq.NOBLOCK)
+                    resp = json_loads(raw)
+                    if not isinstance(resp, dict):
+                        continue
+                    resp_rid = resp.get("request_id")
+                    if (
+                        expected_request_id is not None
+                        and resp_rid is not None
+                        and resp_rid != expected_request_id
+                    ):
+                        # Stale reply from a previous timed-out call (its
+                        # send-time stamp doesn't match what we're waiting
+                        # for); skip. Replies that don't carry request_id
+                        # at all are passed through — some manager error
+                        # paths (parse_error, invalid_request) reply before
+                        # any request body is parsed and can't echo an id.
+                        continue
+                    return resp
+            except Exception:
+                # Mark the socket as possibly carrying a stale reply so the
+                # NEXT call's pre-send drain kicks in. Healthy calls pay no
+                # extra syscalls; only post-timeout calls do.
+                self._maybe_stale_reply = True
+                return None
 
     def publish_event(
         self,

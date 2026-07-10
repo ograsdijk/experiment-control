@@ -570,6 +570,80 @@ class ServerSideRequestIdEchoTests(unittest.TestCase):
         self.assertEqual(reply.get("request_id"), "handler-supplied")
 
 
+class ManagerClientConcurrentCallThreadSafetyTests(unittest.TestCase):
+    """F8 review fix #1: the sequencer's set_context dispatch pool calls
+    `ManagerClient.call()` from multiple worker threads concurrently, and
+    concurrently with the main loop thread's own manager calls (log
+    flushing, RPC handlers, preflight). `call()` mutates shared socket
+    state (`_maybe_stale_reply`, `setsockopt`) and does a send/recv pair
+    that assumed strictly sequential single-threaded use; without an
+    internal lock, interleaved calls could corrupt the socket or hand one
+    thread's reply to another. `call()` now guards its whole round trip
+    with `self._rpc_lock`, making it safe to call from any number of
+    threads at once.
+    """
+
+    def test_concurrent_calls_from_multiple_threads_each_get_own_reply(self) -> None:
+        ctx = _new_ctx()
+        server = _FakeManagerServer(ctx)
+        try:
+            client = ManagerClient(
+                ctx=ctx,
+                manager_rpc=server.endpoint,
+                manager_pub="inproc://unused",
+                rpc_timeout_ms=2000,
+                subscribe_telemetry=False,
+            )
+            try:
+                n_threads = 12
+                # Every request gets a reply after the same short delay so
+                # replies for different threads are equally likely to land
+                # while another thread's call is still in flight.
+                for _ in range(n_threads):
+                    server.enqueue_reply_after(0.02)
+
+                results: list[tuple[int, object]] = []
+                errors: list[str] = []
+                results_lock = threading.Lock()
+
+                def _worker(tag: int) -> None:
+                    try:
+                        resp = client.call({"type": "noop", "tag": tag})
+                    except Exception as exc:  # pragma: no cover - defensive
+                        with results_lock:
+                            errors.append(f"tag {tag} raised {exc!r}")
+                        return
+                    with results_lock:
+                        results.append((tag, resp))
+
+                threads = [
+                    threading.Thread(target=_worker, args=(i,)) for i in range(n_threads)
+                ]
+                for t in threads:
+                    t.start()
+                for t in threads:
+                    t.join(timeout=5.0)
+
+                self.assertEqual(errors, [])
+                self.assertEqual(len(results), n_threads)
+                for tag, resp in results:
+                    self.assertIsNotNone(resp, f"call for tag {tag} should not have timed out")
+                    assert resp is not None
+                    echoed = resp.get("result", {}).get("echo", {})
+                    self.assertEqual(
+                        echoed.get("tag"),
+                        tag,
+                        "each thread must receive the reply to ITS OWN request, "
+                        "not another thread's -- an unlocked shared socket could "
+                        "hand out swapped replies under concurrent use",
+                    )
+            finally:
+                client.close()
+        finally:
+            server.stop()
+            ctx.term()
+
+
 class MaybeStaleFlagIsDeferredTests(unittest.TestCase):
     """The drain-before-send is now gated on a per-instance "maybe stale"
     flag set in the except arm of `call()` / `_call_interceptor()`. Healthy

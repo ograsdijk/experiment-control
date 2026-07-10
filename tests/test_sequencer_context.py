@@ -416,6 +416,46 @@ class SequencerSetContextTickBasedRetryTests(unittest.TestCase):
         self.assertIn("set_context failed", str(status.get("error")))
         self.assertIn("timeout", str(status.get("error")))
 
+    def test_stop_requested_while_pending_cancels_the_dispatch(self) -> None:
+        # F8 review fix #3: an outstanding set_context dispatch must get a
+        # best-effort cancel when the step is abandoned (operator stops the
+        # run mid-retry), not be silently orphaned in `_set_context_state`
+        # forever (which would also leak its worker threads' results).
+        cancelled: list[bool] = []
+
+        class _FakeDispatch:
+            def cancel(self) -> None:
+                cancelled.append(True)
+
+        def begin_set_context(streams, context_id, fields):
+            del streams, context_id, fields
+            return _FakeDispatch()
+
+        def poll_set_context(state, now):
+            del state, now
+            return False, None  # never resolves on its own
+
+        runtime = SequencerRuntime(
+            call_device=lambda *a, **k: {"ok": True, "result": None},
+            get_telemetry=lambda *a, **k: None,
+            set_stream_context=lambda *a, **k: None,
+            expect_streams=lambda *a, **k: None,
+            begin_set_context=begin_set_context,
+            poll_set_context=poll_set_context,
+        )
+        runtime.load(_single_set_context_spec())
+        runtime.start()
+        runtime.tick()  # begins the dispatch
+        self.assertEqual(runtime.state, "RUNNING")
+        self.assertEqual(cancelled, [])
+
+        runtime.request_stop()
+        runtime.tick()  # observes the stop request; must cancel the dispatch
+
+        self.assertEqual(cancelled, [True])
+        self.assertEqual(runtime.state, "STOPPED")
+        self.assertIsNone(runtime._set_context_state)  # noqa: SLF001
+
     def test_falls_back_to_synchronous_path_when_dispatch_not_wired(self) -> None:
         # Callers/tests that only wire `set_stream_context`/`expect_streams`
         # (no `begin_set_context`/`poll_set_context`) must keep working
@@ -451,44 +491,119 @@ class SequencerProcessSetContextDispatchTests(unittest.TestCase):
         )
         return process
 
-    def test_streams_and_expect_are_dispatched_concurrently(self) -> None:
+    def _drain(self, process: SequencerProcess, dispatch, *, deadline_s: float = 3.0):
+        finished = False
+        error: str | None = None
+        deadline = time.monotonic() + deadline_s
+        while time.monotonic() < deadline:
+            finished, error = process._poll_set_context(  # type: ignore[misc]
+                dispatch, time.monotonic()
+            )
+            if finished:
+                break
+            time.sleep(0.01)
+        return finished, error
+
+    def test_context_set_calls_dispatch_concurrently_with_each_other(self) -> None:
+        # The per-stream `stream.context.set` calls (for streams that don't
+        # depend on each other) must run concurrently rather than one at a
+        # time. `expect` is intentionally NOT part of this barrier: it must
+        # complete strictly before any context_set call starts (see the next
+        # test), so including it here would deadlock by construction.
         process = self._process_with_executor()
         streams = [("dev1", "s1"), ("dev2", "s2"), ("dev3", "s3")]
-        # One barrier party per stream plus one for the shared expect call.
-        # `barrier.wait()` only returns once ALL parties have arrived, so
-        # this only succeeds if every RPC is genuinely in flight at the same
-        # time -- a serial (one-at-a-time) dispatch would deadlock here and
-        # each call would raise BrokenBarrierError on the timeout.
-        barrier = threading.Barrier(len(streams) + 1)
+        barrier = threading.Barrier(len(streams))
 
-        def fake_expect_streams(streams_arg, context_id) -> None:
-            del streams_arg, context_id
-            barrier.wait(timeout=2.0)
+        process._expect_streams = lambda streams_arg, context_id: None  # type: ignore[attr-defined]
 
         def fake_set_stream_context(device_id, stream, context_id, fields) -> None:
             del device_id, stream, context_id, fields
+            # Only returns once all N calls are simultaneously in flight --
+            # a serial (one-at-a-time) dispatch would deadlock here and raise
+            # BrokenBarrierError on the timeout instead.
             barrier.wait(timeout=2.0)
 
-        process._expect_streams = fake_expect_streams  # type: ignore[attr-defined]
         process._set_stream_context = fake_set_stream_context  # type: ignore[attr-defined]
 
         try:
             dispatch = process._begin_set_context(streams, 0, {})  # type: ignore[misc]
-            finished = False
-            error: str | None = None
-            deadline = time.monotonic() + 3.0
-            while time.monotonic() < deadline:
-                finished, error = process._poll_set_context(  # type: ignore[misc]
-                    dispatch, time.monotonic()
-                )
-                if finished:
-                    break
-                time.sleep(0.01)
+            finished, error = self._drain(process, dispatch)
         finally:
             process._context_executor.shutdown(wait=True)  # type: ignore[attr-defined]
 
         self.assertTrue(finished)
         self.assertIsNone(error)
+
+    def test_context_set_not_dispatched_until_expect_completes(self) -> None:
+        # F8 correctness fix: hdf.streams.expect is registered strict=True,
+        # so a device must not be allowed to switch context (and start
+        # emitting samples under the new context) before the writer has
+        # processed the expect call, or those samples are silently dropped.
+        process = self._process_with_executor()
+        expect_done = threading.Event()
+        order: list[str] = []
+        lock = threading.Lock()
+
+        def fake_expect_streams(streams_arg, context_id) -> None:
+            del streams_arg, context_id
+            time.sleep(0.1)
+            with lock:
+                order.append("expect")
+            expect_done.set()
+
+        def fake_set_stream_context(device_id, stream, context_id, fields) -> None:
+            del context_id, fields
+            # If this ever runs before expect_done is set, the ordering
+            # guarantee is broken -- record it so the assertion below fails
+            # with a clear message instead of silently racing.
+            with lock:
+                order.append(f"context:{device_id}/{stream}:expect_done={expect_done.is_set()}")
+
+        process._expect_streams = fake_expect_streams  # type: ignore[attr-defined]
+        process._set_stream_context = fake_set_stream_context  # type: ignore[attr-defined]
+
+        try:
+            dispatch = process._begin_set_context(  # type: ignore[misc]
+                [("dev1", "s1"), ("dev2", "s2")], 0, {}
+            )
+            finished, error = self._drain(process, dispatch)
+        finally:
+            process._context_executor.shutdown(wait=True)  # type: ignore[attr-defined]
+
+        self.assertTrue(finished)
+        self.assertIsNone(error)
+        self.assertEqual(order[0], "expect")
+        for entry in order[1:]:
+            self.assertIn("expect_done=True", entry)
+
+    def test_expect_failure_prevents_any_context_set_dispatch(self) -> None:
+        process = self._process_with_executor()
+        context_set_calls: list[tuple[str, str]] = []
+
+        def failing_expect_streams(streams_arg, context_id) -> None:
+            del streams_arg, context_id
+            raise RuntimeError("hdf.streams.expect failed: hdf_not_writing")
+
+        def fake_set_stream_context(device_id, stream, context_id, fields) -> None:
+            del context_id, fields
+            context_set_calls.append((device_id, stream))
+
+        process._expect_streams = failing_expect_streams  # type: ignore[attr-defined]
+        process._set_stream_context = fake_set_stream_context  # type: ignore[attr-defined]
+
+        try:
+            dispatch = process._begin_set_context(  # type: ignore[misc]
+                [("dev1", "s1")], 0, {}
+            )
+            finished, error = self._drain(process, dispatch)
+        finally:
+            process._context_executor.shutdown(wait=True)  # type: ignore[attr-defined]
+
+        self.assertTrue(finished)
+        self.assertIsNotNone(error)
+        self.assertIn("hdf_not_writing", str(error))
+        # The per-stream context_set call must never have been dispatched.
+        self.assertEqual(context_set_calls, [])
 
     def test_poll_reports_pending_until_every_call_completes(self) -> None:
         process = self._process_with_executor()
@@ -555,6 +670,40 @@ class SequencerProcessSetContextDispatchTests(unittest.TestCase):
         self.assertTrue(finished)
         self.assertIsNotNone(error)
         self.assertIn("boom", str(error))
+
+    def test_dispatch_wide_deadline_fails_step_even_if_call_still_queued(self) -> None:
+        # F8 review fix #4: `_poll_set_context` must not wait purely on
+        # `future.done()` forever -- a call still queued behind a saturated
+        # pool (or a driver that never returns) needs a dispatch-wide safety
+        # net independent of any single call's own internal retry deadline.
+        process = self._process_with_executor()
+        release = threading.Event()
+
+        def blocking_set_stream_context(device_id, stream, context_id, fields) -> None:
+            del device_id, stream, context_id, fields
+            release.wait(timeout=5.0)
+
+        process._expect_streams = lambda streams, context_id: None  # type: ignore[attr-defined]
+        process._set_stream_context = blocking_set_stream_context  # type: ignore[attr-defined]
+
+        try:
+            dispatch = process._begin_set_context(  # type: ignore[misc]
+                [("dev1", "s1")], 0, {}
+            )
+            # Simulate the dispatch-wide deadline having already elapsed
+            # while the call is still running/queued, instead of waiting out
+            # the real multi-second deadline in a unit test.
+            dispatch.deadline = time.monotonic() - 0.01  # type: ignore[attr-defined]
+            finished, error = process._poll_set_context(  # type: ignore[misc]
+                dispatch, time.monotonic()
+            )
+        finally:
+            release.set()
+            process._context_executor.shutdown(wait=True)  # type: ignore[attr-defined]
+
+        self.assertTrue(finished)
+        self.assertIsNotNone(error)
+        self.assertIn("timed out", str(error))
 
 
 if __name__ == "__main__":
