@@ -273,5 +273,177 @@ class NoPendingSleepOrWaitTimingTests(unittest.TestCase):
         self.assertTrue(all(t == 50 for t in observed_timeouts))
 
 
+class WaitUntilBusySpinGuardTests(unittest.TestCase):
+    """Regression coverage for review finding #1: with the old fixed 50ms
+    poll, `wait_until(every_s: 0)` was harmless (the poll floor made it
+    irrelevant). With the dynamic poll timeout, an unclamped `every_s: 0`
+    would have `next_sample_t` stay ~= now every iteration, flooring
+    `next_poll_timeout_ms` to 1ms and spinning the outer loop at ~1000Hz for
+    the whole wait duration. `_start_wait_until` must clamp `every_s` to a
+    sane minimum so a misconfigured sequence can't peg a core."""
+
+    def test_every_s_zero_is_clamped_to_a_minimum(self) -> None:
+        from experiment_control.sequencer.runtime import _MIN_WAIT_EVERY_S
+
+        runtime = _build_runtime()
+        runtime._start_wait_until(  # noqa: SLF001
+            {
+                "every_s": 0.0,
+                "sample": {"call": {"device": "d", "action": "sample"}},
+                "condition": {"always": False},
+            }
+        )
+        assert runtime._wait_state is not None  # noqa: SLF001
+        self.assertGreaterEqual(runtime._wait_state.every_s, _MIN_WAIT_EVERY_S)  # noqa: SLF001
+
+    def test_every_s_zero_does_not_busy_spin_the_poll_loop(self) -> None:
+        runtime = _build_runtime()
+        spec = parse_sequence(
+            {
+                "version": 1,
+                "steps": [
+                    {
+                        "wait_until": {
+                            "every_s": 0.0,
+                            "sample": {"call": {"device": "d", "action": "sample"}},
+                            "condition": {"always": False},
+                            "timeout_s": 0.05,
+                        }
+                    }
+                ],
+            }
+        )
+        runtime.load(spec)
+        runtime.start()
+        runtime.tick()
+
+        poll_count = 0
+        deadline = time.monotonic() + 1.0
+        while runtime.state == "RUNNING" and time.monotonic() < deadline:
+            timeout_ms = runtime.next_poll_timeout_ms(ceiling_ms=50)
+            poll_count += 1
+            time.sleep(timeout_ms / 1000.0)
+            runtime.tick()
+
+        self.assertEqual(runtime.state, "ERROR")  # wait_until timeout
+        # A busy-spinning loop (1ms floor with every_s: 0 unclamped) would
+        # poll on the order of dozens of times over ~50ms; clamped to
+        # _MIN_WAIT_EVERY_S (5ms) it should be a handful of iterations.
+        self.assertLess(poll_count, 20)
+
+
+class WaitStateTimeoutAndStableForDeadlineTests(unittest.TestCase):
+    """Regression coverage for review finding #3: `next_poll_timeout_ms`
+    must also consider `wait_state.timeout_s` and `stable_for_s` deadlines,
+    not just the sampling cadence (`next_sample_t`) — otherwise a
+    `wait_until` with a long `every_s` but a short `timeout_s` would only
+    notice its timeout on the poll ceiling grid."""
+
+    def test_near_timeout_deadline_beats_a_distant_sample_cadence(self) -> None:
+        from experiment_control.sequencer.runtime import _WaitState
+
+        runtime = _build_runtime()
+        runtime._state = "RUNNING"  # noqa: SLF001
+        now = time.monotonic()
+        runtime._wait_state = _WaitState(  # noqa: SLF001
+            start_t=now - 0.49,
+            timeout_s=0.5,  # fires in ~10ms
+            every_s=5.0,  # next sample is far away
+            next_sample_t=now + 5.0,
+            stable_for_s=0.0,
+            condition=None,
+            sample_spec={},
+            reduce_spec=None,
+            samples=[],
+            max_samples=10000,
+        )
+        timeout_ms = runtime.next_poll_timeout_ms(ceiling_ms=50)
+        self.assertLess(timeout_ms, 30)
+
+    def test_near_stable_for_deadline_beats_a_distant_sample_cadence(self) -> None:
+        from experiment_control.sequencer.runtime import _WaitState
+
+        runtime = _build_runtime()
+        runtime._state = "RUNNING"  # noqa: SLF001
+        now = time.monotonic()
+        runtime._wait_state = _WaitState(  # noqa: SLF001
+            start_t=now,
+            timeout_s=0.0,
+            every_s=5.0,
+            next_sample_t=now + 5.0,
+            stable_for_s=0.01,
+            condition=None,
+            sample_spec={},
+            reduce_spec=None,
+            samples=[],
+            max_samples=10000,
+            stable_since=now - 0.005,  # stable_for deadline in ~5ms
+        )
+        timeout_ms = runtime.next_poll_timeout_ms(ceiling_ms=50)
+        self.assertLess(timeout_ms, 30)
+
+
+class AdaptiveObserveNextCheckDeadlineTests(unittest.TestCase):
+    """Regression coverage for review finding #2: an adaptive `observe`
+    trial pending on an `analysis_output` metric should feed its own
+    recheck cadence into `next_poll_timeout_ms`, not fall back to the full
+    poll ceiling."""
+
+    def test_pending_adaptive_observe_reports_recheck_time_not_ceiling(self) -> None:
+        from experiment_control.sequencer.runtime import _AdaptiveObserveState
+
+        runtime = _build_runtime()
+        runtime._state = "RUNNING"  # noqa: SLF001
+        runtime._adaptive_observe_state = _AdaptiveObserveState(  # noqa: SLF001
+            frame=None,  # not touched by next_poll_timeout_ms
+            proposal={},
+            trial={},
+            repeats=1,
+            metrics_spec={},
+            next_check_t=time.monotonic() + 0.01,
+        )
+        timeout_ms = runtime.next_poll_timeout_ms(ceiling_ms=50)
+        self.assertLess(timeout_ms, 30)
+
+    def test_adaptive_observe_without_pending_recheck_keeps_ceiling(self) -> None:
+        from experiment_control.sequencer.runtime import _AdaptiveObserveState
+
+        runtime = _build_runtime()
+        runtime._state = "RUNNING"  # noqa: SLF001
+        runtime._adaptive_observe_state = _AdaptiveObserveState(  # noqa: SLF001
+            frame=None,
+            proposal={},
+            trial={},
+            repeats=1,
+            metrics_spec={},
+            next_check_t=None,
+        )
+        self.assertEqual(runtime.next_poll_timeout_ms(ceiling_ms=50), 50)
+
+
+class FloorMsInvariantTests(unittest.TestCase):
+    """Regression coverage for review finding #4: `next_poll_timeout_ms`
+    must guarantee a >=1ms result itself, not merely by convention of the
+    default `floor_ms=1` — a caller passing `floor_ms=0` with an
+    already-elapsed deadline must not get a 0ms (non-blocking / busy-spin)
+    timeout back."""
+
+    def test_floor_ms_zero_with_elapsed_deadline_still_returns_at_least_one(
+        self,
+    ) -> None:
+        runtime = _build_runtime()
+        runtime._state = "RUNNING"  # noqa: SLF001
+        runtime._sleep_until = time.monotonic() - 1.0  # noqa: SLF001
+        timeout_ms = runtime.next_poll_timeout_ms(ceiling_ms=50, floor_ms=0)
+        self.assertGreaterEqual(timeout_ms, 1)
+
+    def test_negative_floor_ms_still_returns_at_least_one(self) -> None:
+        runtime = _build_runtime()
+        runtime._state = "RUNNING"  # noqa: SLF001
+        runtime._sleep_until = time.monotonic() - 1.0  # noqa: SLF001
+        timeout_ms = runtime.next_poll_timeout_ms(ceiling_ms=50, floor_ms=-5)
+        self.assertGreaterEqual(timeout_ms, 1)
+
+
 if __name__ == "__main__":
     unittest.main()

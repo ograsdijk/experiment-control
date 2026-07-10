@@ -31,6 +31,21 @@ from .eval import eval_condition, render_templates, to_attrdict
 from .ranges import generate_from_gen
 from .source_info import StepSourceInfo, step_kind, step_summary
 
+# Floor applied to `wait_until.every_s` (and the poll-timeout floor itself) so
+# a misconfigured sequence (e.g. `every_s: 0`) can't peg the process loop at
+# ~1000Hz for the duration of the wait. The old fixed 50ms poll made this
+# impossible; the dynamic poll timeout (F15) reintroduces the risk without
+# this clamp.
+_MIN_WAIT_EVERY_S = 0.005
+
+# Bound on how long the outer loop may wait between checks while an adaptive
+# `observe` trial is pending (e.g. waiting on an `analysis_output` metric).
+# Real wakeups mostly come from the analysis SUB socket firing, but this caps
+# the fallback poll so the runtime's own `timeout_s` bookkeeping for that
+# source is also checked at a reasonable cadence instead of the full 50ms
+# ceiling.
+_ADAPTIVE_OBSERVE_POLL_S = 0.02
+
 
 @dataclass
 class _Frame:
@@ -89,6 +104,10 @@ class _AdaptiveObserveState:
     metrics_spec: dict[str, Any]
     current_repeat: int = 0
     started_t: float = 0.0
+    # Next time the outer loop should re-check this trial (analysis_output
+    # polling / timeout bookkeeping); set on each pending step. `None` until
+    # the first pending tick.
+    next_check_t: float | None = None
 
 
 @dataclass
@@ -441,20 +460,36 @@ class SequencerRuntime:
         poll between ticks. If a `sleep` step or `wait_until` sample is due sooner
         than the fixed poll ceiling, using the ceiling as the poll timeout would
         quantize that deadline onto the poll cadence (F15). Report the earliest
-        of any pending `_sleep_until` deadline or `_wait_state.next_sample_t`,
-        clamped to `[floor_ms, ceiling_ms]`, so the caller can wake up exactly
-        when needed instead of waiting out the full ceiling.
+        of any pending `_sleep_until` deadline, `_wait_state` deadline (next
+        sample, `timeout_s`, or `stable_for_s`), or `_adaptive_observe_state`
+        recheck time, clamped to `[floor_ms, ceiling_ms]`, so the caller can
+        wake up exactly when needed instead of waiting out the full ceiling.
 
-        When nothing is pending (no active sleep/wait), returns `ceiling_ms`
-        unchanged so RPC responsiveness for pause/stop/status doesn't regress.
+        When nothing is pending (no active sleep/wait/adaptive-observe),
+        returns `ceiling_ms` unchanged so RPC responsiveness for
+        pause/stop/status doesn't regress.
+
+        `floor_ms` is clamped to at least 1ms here regardless of what the
+        caller passes, so an already-elapsed deadline can never produce a
+        zero/negative timeout (which would make the underlying poll
+        non-blocking and busy-spin the loop).
         """
+        floor_ms = max(1, int(floor_ms))
         if self._state != "RUNNING":
             return ceiling_ms
         deadlines = []
         if self._sleep_until is not None:
             deadlines.append(self._sleep_until)
-        if self._wait_state is not None:
-            deadlines.append(self._wait_state.next_sample_t)
+        ws = self._wait_state
+        if ws is not None:
+            deadlines.append(ws.next_sample_t)
+            if ws.timeout_s:
+                deadlines.append(ws.start_t + ws.timeout_s)
+            if ws.stable_for_s and ws.stable_since is not None:
+                deadlines.append(ws.stable_since + ws.stable_for_s)
+        aos = self._adaptive_observe_state
+        if aos is not None and aos.next_check_t is not None:
+            deadlines.append(aos.next_check_t)
         if not deadlines:
             return ceiling_ms
         remaining_s = min(deadlines) - time.monotonic()
@@ -2036,7 +2071,6 @@ class SequencerRuntime:
         return True
 
     def _collect_adaptive_repeat(self, state: _AdaptiveObserveState, now: float) -> bool:
-        del now
         repeat_values: dict[str, Any] = {}
         pending_analysis = False
         for name, source_spec in state.metrics_spec.items():
@@ -2052,7 +2086,14 @@ class SequencerRuntime:
             repeat_values[name] = value
 
         if pending_analysis:
+            # Waiting on an external analysis_output publish: real wakeups
+            # come from the analysis SUB socket, but bound the fallback poll
+            # so the trial's own timeout_s bookkeeping (checked inside
+            # _try_sample_analysis_output) is revisited at a sane cadence
+            # rather than the full poll ceiling.
+            state.next_check_t = now + _ADAPTIVE_OBSERVE_POLL_S
             return False
+        state.next_check_t = None
 
         for name, source_spec in state.metrics_spec.items():
             if name in repeat_values:
@@ -2516,7 +2557,11 @@ class SequencerRuntime:
             return float(rendered)
 
         timeout_s = _render_float(raw.get("timeout_s", 0), 0)
-        every_s = _render_float(raw.get("every_s", 0.1), 0.1)
+        # Clamp to a sane minimum: with the dynamic poll timeout (F15), an
+        # `every_s` of 0 (or sub-millisecond) would otherwise have the outer
+        # process loop busy-poll at ~1000Hz for the whole wait duration —
+        # previously impossible since the poll was always fixed at 50ms.
+        every_s = max(_render_float(raw.get("every_s", 0.1), 0.1), _MIN_WAIT_EVERY_S)
         stable_for_s = _render_float(raw.get("stable_for_s", 0), 0)
         sample_spec_raw = raw.get("sample", {})
         sample_spec = render_templates(sample_spec_raw, env)
