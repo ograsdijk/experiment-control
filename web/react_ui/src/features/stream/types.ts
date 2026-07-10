@@ -253,6 +253,8 @@ export type PlotStreamBinStatsPanelState = {
   uncertaintyMode: UncertaintyMode;
   uncertaintyScale: number;
   showBinMarkers: boolean;
+  xOffset: number;
+  xScale: number;
   yScaleMode: YScaleMode;
   yMin: number | null;
   yMax: number | null;

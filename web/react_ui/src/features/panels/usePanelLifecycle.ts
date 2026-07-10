@@ -242,6 +242,8 @@ export function usePanelLifecycle(args: PanelLifecycleArgs) {
         uncertaintyMode: "sem",
         uncertaintyScale: DEFAULT_UNCERTAINTY_SCALE,
         showBinMarkers: false,
+        xOffset: 0,
+        xScale: 1,
         yScaleMode: "auto",
         yMin: null,
         yMax: null,

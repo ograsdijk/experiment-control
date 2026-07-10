@@ -192,6 +192,27 @@ export function usePanelUiHandlers() {
     );
   };
 
+  const setStreamBinStatsXAxisTransform = (
+    panelId: string,
+    xOffset: number,
+    xScale: number
+  ) => {
+    setPanels((prev) =>
+      prev.map((panel) =>
+        panel.id === panelId && isStreamBinStatsPanel(panel)
+          ? {
+              ...panel,
+              xOffset: Number.isFinite(xOffset) ? xOffset : panel.xOffset,
+              xScale:
+                Number.isFinite(xScale) && xScale !== 0
+                  ? xScale
+                  : panel.xScale,
+            }
+          : panel
+      )
+    );
+  };
+
   const setStreamBin2dReducer = (panelId: string, reducer: Bin2dReducer) => {
     setPanels((prev) =>
       prev.map((panel) =>
@@ -274,6 +295,7 @@ export function usePanelUiHandlers() {
     setTelemetrySmoothingWindow,
     setStreamBinStatsUncertainty,
     setStreamBinStatsShowBinMarkers,
+    setStreamBinStatsXAxisTransform,
     setStreamBin2dReducer,
     isExpandablePlotPanel,
     openExpandedPlot,

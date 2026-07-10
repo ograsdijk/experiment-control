@@ -25,6 +25,8 @@ type StreamBinStatsPanelProps = {
   uncertaintyMode: UncertaintyMode;
   uncertaintyScale: number;
   showBinMarkers?: boolean;
+  xOffset?: number;
+  xScale?: number;
   tick: number;
   colorScheme: "light" | "dark";
   plotHeight?: number;
@@ -77,16 +79,34 @@ function clampScale(value: number): number {
   return Math.max(0, value);
 }
 
-function buildBandData(
+function normalizeXScale(value: number): number {
+  if (!Number.isFinite(value) || value === 0) {
+    return 1;
+  }
+  return value;
+}
+
+function normalizeXOffset(value: number): number {
+  if (!Number.isFinite(value)) {
+    return 0;
+  }
+  return value;
+}
+
+export function buildBandData(
   input: StreamBinStatsSeries | null,
   mode: UncertaintyMode,
-  scaleRaw: number
+  scaleRaw: number,
+  xOffsetRaw = 0,
+  xScaleRaw = 1
 ): number[][] {
   const series = sanitizeSeries(input);
   if (!series) {
     return [[], [], [], []];
   }
   const scale = clampScale(scaleRaw);
+  const xOffset = normalizeXOffset(xOffsetRaw);
+  const xScale = normalizeXScale(xScaleRaw);
   const spreadSource = mode === "std" ? series.std : series.sem;
   const lower: number[] = [];
   const upper: number[] = [];
@@ -105,7 +125,7 @@ function buildBandData(
       continue;
     }
     const band = spread * scale;
-    x.push(xv);
+    x.push(xv * xScale + xOffset);
     mean.push(mv);
     lower.push(mv - band);
     upper.push(mv + band);
@@ -158,12 +178,16 @@ function buildOverlayData(
   return out;
 }
 
-function buildFitOverlayData(
-  overlays: StreamBinStatsFitOverlay[]
+export function buildFitOverlayData(
+  overlays: StreamBinStatsFitOverlay[],
+  xOffsetRaw = 0,
+  xScaleRaw = 1
 ): StreamBinStatsFitOverlay[] {
   if (overlays.length <= 0) {
     return [];
   }
+  const xOffset = normalizeXOffset(xOffsetRaw);
+  const xScale = normalizeXScale(xScaleRaw);
   const out: StreamBinStatsFitOverlay[] = [];
   for (const overlay of overlays) {
     const label = String(overlay.label ?? "").trim() || "fit";
@@ -175,7 +199,7 @@ function buildFitOverlayData(
     }
     out.push({
       label,
-      x: x.slice(0, n),
+      x: x.slice(0, n).map((xv) => xv * xScale + xOffset),
       y: y.slice(0, n),
     });
   }
@@ -255,6 +279,8 @@ export function StreamBinStatsPanel({
   uncertaintyMode,
   uncertaintyScale,
   showBinMarkers = false,
+  xOffset = 0,
+  xScale = 1,
   tick,
   colorScheme,
   plotHeight = 320,
@@ -284,16 +310,16 @@ export function StreamBinStatsPanel({
   }, []);
 
   const data = useMemo(
-    () => buildBandData(series, uncertaintyMode, uncertaintyScale),
-    [series, uncertaintyMode, uncertaintyScale, tick]
+    () => buildBandData(series, uncertaintyMode, uncertaintyScale, xOffset, xScale),
+    [series, uncertaintyMode, uncertaintyScale, xOffset, xScale, tick]
   );
   const overlayData = useMemo(
     () => buildOverlayData(data[0] ?? [], overlaySeries),
     [data, overlaySeries, tick]
   );
   const fitOverlayData = useMemo(
-    () => buildFitOverlayData(fitOverlays),
-    [fitOverlays, tick]
+    () => buildFitOverlayData(fitOverlays, xOffset, xScale),
+    [fitOverlays, xOffset, xScale, tick]
   );
   fitOverlayDataRef.current = fitOverlayData;
   overlayLabelsRef.current = overlayData.map((entry) => entry.label);
