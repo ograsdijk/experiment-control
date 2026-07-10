@@ -1083,22 +1083,38 @@ def maybe_restart_device_driver(
     manager.start_driver(device_id)
 
 
+def _auto_reconnect_field_lock(handle: Any) -> threading.Lock:
+    """Return the lock guarding `handle.auto_reconnect_*` bookkeeping
+    fields (see `DeviceHandle.auto_reconnect_field_lock`). Falls back to
+    lazily attaching one for SimpleNamespace/Mock test stubs that don't
+    pre-populate it -- mirrors the hasattr-guard convention used elsewhere
+    in this module for the same reason.
+    """
+    lock = getattr(handle, "auto_reconnect_field_lock", None)
+    if lock is None:
+        lock = threading.Lock()
+        handle.auto_reconnect_field_lock = lock
+    return lock
+
+
 def _auto_reconnect_status(handle: Any) -> Json:
-    spec = handle.spec.auto_reconnect
-    return {
-        "enabled": bool(spec.enabled),
-        "attempts": int(handle.auto_reconnect_attempts),
-        "last_attempt_mono": handle.auto_reconnect_last_attempt_mono,
-        "last_attempt_wall": handle.auto_reconnect_last_attempt_wall,
-        "last_success_mono": handle.auto_reconnect_last_success_mono,
-        "healthy_since_mono": handle.auto_reconnect_healthy_since_mono,
-        "last_error": handle.auto_reconnect_last_error,
-        "suppressed": bool(handle.auto_reconnect_suppressed),
-        "cooldown_s": float(spec.cooldown_s),
-        "max_attempts": spec.max_attempts,
-        "on_telemetry_stale_s": spec.on_telemetry_stale_s,
-        "reset_attempts_after_ok_s": float(spec.reset_attempts_after_ok_s),
-    }
+    with _auto_reconnect_field_lock(handle):
+        spec = handle.spec.auto_reconnect
+        return {
+            "enabled": bool(spec.enabled),
+            "attempts": int(handle.auto_reconnect_attempts),
+            "last_attempt_mono": handle.auto_reconnect_last_attempt_mono,
+            "last_attempt_wall": handle.auto_reconnect_last_attempt_wall,
+            "last_success_mono": handle.auto_reconnect_last_success_mono,
+            "healthy_since_mono": handle.auto_reconnect_healthy_since_mono,
+            "last_error": handle.auto_reconnect_last_error,
+            "suppressed": bool(handle.auto_reconnect_suppressed),
+            "pending": bool(getattr(handle, "auto_reconnect_pending", False)),
+            "cooldown_s": float(spec.cooldown_s),
+            "max_attempts": spec.max_attempts,
+            "on_telemetry_stale_s": spec.on_telemetry_stale_s,
+            "reset_attempts_after_ok_s": float(spec.reset_attempts_after_ok_s),
+        }
 
 
 def _auto_reconnect_publish(manager: Any, topic: str, device_id: str, payload: Json) -> None:
@@ -1114,32 +1130,39 @@ def _auto_reconnect_reset_if_healthy(
     handle: Any,
     now_mono: float,
 ) -> None:
-    spec = handle.spec.auto_reconnect
-    if not spec.enabled or handle.auto_reconnect_attempts <= 0:
-        return
-    latest_ts = manager._telemetry_last_bundle_ts.get(device_id)
-    if latest_ts is None:
-        handle.auto_reconnect_healthy_since_mono = None
-        return
-    age_s = now_mono - latest_ts.t_mono
-    threshold = spec.on_telemetry_stale_s
-    if threshold is None or age_s > threshold:
-        handle.auto_reconnect_healthy_since_mono = None
-        return
-    if handle.auto_reconnect_healthy_since_mono is None:
-        handle.auto_reconnect_healthy_since_mono = now_mono
-        return
-    if now_mono - handle.auto_reconnect_healthy_since_mono < spec.reset_attempts_after_ok_s:
-        return
-    handle.auto_reconnect_attempts = 0
-    handle.auto_reconnect_suppressed = False
-    handle.auto_reconnect_last_error = None
-    _auto_reconnect_publish(
-        manager,
-        "manager.device.auto_reconnect.reset",
-        device_id,
-        {"auto_reconnect": _auto_reconnect_status(handle)},
-    )
+    did_reset = False
+    with _auto_reconnect_field_lock(handle):
+        spec = handle.spec.auto_reconnect
+        if not spec.enabled or handle.auto_reconnect_attempts <= 0:
+            return
+        latest_ts = manager._telemetry_last_bundle_ts.get(device_id)
+        if latest_ts is None:
+            handle.auto_reconnect_healthy_since_mono = None
+            return
+        age_s = now_mono - latest_ts.t_mono
+        threshold = spec.on_telemetry_stale_s
+        if threshold is None or age_s > threshold:
+            handle.auto_reconnect_healthy_since_mono = None
+            return
+        if handle.auto_reconnect_healthy_since_mono is None:
+            handle.auto_reconnect_healthy_since_mono = now_mono
+            return
+        if now_mono - handle.auto_reconnect_healthy_since_mono < spec.reset_attempts_after_ok_s:
+            return
+        handle.auto_reconnect_attempts = 0
+        handle.auto_reconnect_suppressed = False
+        handle.auto_reconnect_last_error = None
+        did_reset = True
+    if did_reset:
+        # _auto_reconnect_status() takes the same lock -- call it only
+        # after releasing the `with` block above to avoid a self-deadlock
+        # (threading.Lock is not reentrant).
+        _auto_reconnect_publish(
+            manager,
+            "manager.device.auto_reconnect.reset",
+            device_id,
+            {"auto_reconnect": _auto_reconnect_status(handle)},
+        )
 
 
 def _auto_reconnect_should_attempt(
@@ -1164,14 +1187,32 @@ def _auto_reconnect_should_attempt(
     age_s = now_mono - latest_ts.t_mono
     if age_s <= threshold:
         return False, age_s, None
-    if (
-        handle.auto_reconnect_last_attempt_mono is not None
-        and now_mono - handle.auto_reconnect_last_attempt_mono < spec.cooldown_s
-    ):
-        return False, age_s, "cooldown"
-    if spec.max_attempts is not None and handle.auto_reconnect_attempts >= spec.max_attempts:
-        if not handle.auto_reconnect_suppressed:
+
+    newly_suppressed = False
+    with _auto_reconnect_field_lock(handle):
+        if bool(getattr(handle, "auto_reconnect_pending", False)):
+            # A reconnect attempt is already in flight on the lifecycle
+            # executor for this device. Refuse to dispatch a second one
+            # regardless of cooldown_s -- cooldown_s=0 is valid config,
+            # and even a non-zero cooldown can be shorter than a slow
+            # connect_timeout_ms or a per-device lock held by a
+            # concurrent operator lifecycle op.
+            return False, age_s, "pending"
+        if (
+            handle.auto_reconnect_last_attempt_mono is not None
+            and now_mono - handle.auto_reconnect_last_attempt_mono < spec.cooldown_s
+        ):
+            return False, age_s, "cooldown"
+        over_max_attempts = (
+            spec.max_attempts is not None
+            and handle.auto_reconnect_attempts >= spec.max_attempts
+        )
+        if over_max_attempts and not handle.auto_reconnect_suppressed:
             handle.auto_reconnect_suppressed = True
+            newly_suppressed = True
+
+    if over_max_attempts:
+        if newly_suppressed:
             _auto_reconnect_publish(
                 manager,
                 "manager.device.auto_reconnect.suppressed",
@@ -1207,14 +1248,18 @@ def _auto_reconnect_attempt(
     Setting `auto_reconnect_last_attempt_mono` here (before the worker even
     starts) is what makes the cooldown check in `_auto_reconnect_should_attempt`
     correctly prevent a second dispatch for the same device while the first
-    attempt is still in flight on the executor.
+    attempt is still in flight on the executor -- and `auto_reconnect_pending`
+    (also set here) backstops that independent of the cooldown timer, since
+    cooldown_s can be 0 or shorter than how long the attempt actually takes.
     """
-    handle.auto_reconnect_attempts += 1
-    handle.auto_reconnect_last_attempt_mono = now_mono
-    handle.auto_reconnect_last_attempt_wall = time.time()
-    handle.auto_reconnect_last_error = None
-    handle.auto_reconnect_suppressed = False
-    attempt = int(handle.auto_reconnect_attempts)
+    with _auto_reconnect_field_lock(handle):
+        handle.auto_reconnect_attempts += 1
+        handle.auto_reconnect_last_attempt_mono = now_mono
+        handle.auto_reconnect_last_attempt_wall = time.time()
+        handle.auto_reconnect_last_error = None
+        handle.auto_reconnect_suppressed = False
+        handle.auto_reconnect_pending = True
+        attempt = int(handle.auto_reconnect_attempts)
     _auto_reconnect_publish(
         manager,
         "manager.device.auto_reconnect.attempt",
@@ -1231,10 +1276,13 @@ def _auto_reconnect_attempt(
         )
     except RuntimeError:
         # Executor was shut down (e.g. manager tearing down between the
-        # staleness check and this dispatch). Nothing to do — the
-        # bookkeeping above already recorded the attempt; there's no RPC
-        # reply to send back (this is fire-and-forget, like auto-connect).
-        pass
+        # staleness check and this dispatch). The worker that would have
+        # cleared `auto_reconnect_pending` will never run, so clear it
+        # here -- otherwise the device would look permanently "reconnect
+        # in progress". There's no RPC reply to send back either way
+        # (this is fire-and-forget, like auto-connect).
+        with _auto_reconnect_field_lock(handle):
+            handle.auto_reconnect_pending = False
 
 
 def _run_auto_reconnect(
@@ -1247,57 +1295,78 @@ def _run_auto_reconnect(
     """Worker-thread body: disconnect+connect the device off the manager
     poll loop, under the per-device lifecycle lock so this can't race an
     operator-initiated lifecycle op (connect/disconnect/restart/recover all
-    take the same lock via `Manager._run_lifecycle` / `_run_auto_connect`).
+    take the same lock via `Manager._run_lifecycle` / `_run_auto_connect`)
+    or the supervision tick's own driver-state mutation (`supervise_device_
+    drivers` takes the same lock, non-blocking, before touching driver
+    state for a device).
+
+    `auto_reconnect_pending` is cleared in a `finally` so it can never get
+    stuck set (executor exception, RPC exception, anything) -- that flag is
+    what lets `_auto_reconnect_should_attempt` refuse a second concurrent
+    dispatch for this device.
     """
     spec = handle.spec.auto_reconnect
     lock = manager._lifecycle_device_locks.setdefault(device_id, threading.Lock())
-    with lock:
-        try:
+    try:
+        with lock:
             try:
-                manager._call_device_rpc(
+                try:
+                    manager._call_device_rpc(
+                        device_id=device_id,
+                        action="disconnect_device",
+                        params={},
+                        timeout_ms=int(spec.disconnect_timeout_ms),
+                    )
+                except Exception:
+                    pass
+                connect_timeout_ms = spec.connect_timeout_ms or manager._device_rpc_timeout_ms
+                resp = manager._call_device_rpc(
                     device_id=device_id,
-                    action="disconnect_device",
+                    action="connect_device",
                     params={},
-                    timeout_ms=int(spec.disconnect_timeout_ms),
+                    timeout_ms=int(connect_timeout_ms),
                 )
-            except Exception:
-                pass
-            connect_timeout_ms = spec.connect_timeout_ms or manager._device_rpc_timeout_ms
-            resp = manager._call_device_rpc(
-                device_id=device_id,
-                action="connect_device",
-                params={},
-                timeout_ms=int(connect_timeout_ms),
-            )
-            if not manager._device_rpc_status_ok(resp):
-                raise RuntimeError(manager._device_rpc_error_text(resp))
-        except Exception as exc:
-            handle.auto_reconnect_last_error = str(exc)
-            _auto_reconnect_publish(
-                manager,
-                "manager.device.auto_reconnect.failed",
-                device_id,
-                {
-                    "attempt": attempt,
-                    "telemetry_age_s": age_s,
-                    "error": str(exc),
-                    "auto_reconnect": _auto_reconnect_status(handle),
-                },
-            )
-            return
-    handle.auto_reconnect_last_success_mono = time.monotonic()
-    handle.auto_reconnect_last_error = None
-    _auto_reconnect_publish(
-        manager,
-        "manager.device.auto_reconnect.success",
-        device_id,
-        {
-            "attempt": attempt,
-            "telemetry_age_s": age_s,
-            "response": resp,
-            "auto_reconnect": _auto_reconnect_status(handle),
-        },
-    )
+                if not manager._device_rpc_status_ok(resp):
+                    raise RuntimeError(manager._device_rpc_error_text(resp))
+            except Exception as exc:
+                # Stamp completion time (not just dispatch time) as the
+                # cooldown reference too, so cooldown_s measures actual
+                # elapsed-since-attempt-finished, not since it started.
+                completion_mono = time.monotonic()
+                with _auto_reconnect_field_lock(handle):
+                    handle.auto_reconnect_last_error = str(exc)
+                    handle.auto_reconnect_last_attempt_mono = completion_mono
+                _auto_reconnect_publish(
+                    manager,
+                    "manager.device.auto_reconnect.failed",
+                    device_id,
+                    {
+                        "attempt": attempt,
+                        "telemetry_age_s": age_s,
+                        "error": str(exc),
+                        "auto_reconnect": _auto_reconnect_status(handle),
+                    },
+                )
+                return
+        completion_mono = time.monotonic()
+        with _auto_reconnect_field_lock(handle):
+            handle.auto_reconnect_last_success_mono = completion_mono
+            handle.auto_reconnect_last_attempt_mono = completion_mono
+            handle.auto_reconnect_last_error = None
+        _auto_reconnect_publish(
+            manager,
+            "manager.device.auto_reconnect.success",
+            device_id,
+            {
+                "attempt": attempt,
+                "telemetry_age_s": age_s,
+                "response": resp,
+                "auto_reconnect": _auto_reconnect_status(handle),
+            },
+        )
+    finally:
+        with _auto_reconnect_field_lock(handle):
+            handle.auto_reconnect_pending = False
 
 
 def _maybe_auto_reconnect_device(
@@ -1319,18 +1388,43 @@ def _maybe_auto_reconnect_device(
 
 def supervise_device_drivers(manager: Any, now_mono: float) -> None:
     for device_id, handle in manager._devices.items():
-        proc = handle.process
-        if proc is not None:
-            rc = proc.poll()
-            if rc is not None:
-                # Fast path: the tracked (wrapper) process actually exited.
-                manager._update_device_driver_exit_state(handle, int(rc))
-        # Heartbeat-authoritative liveness: demote a RUNNING driver whose
-        # heartbeat has gone stale even if the wrapper's poll() still reports
-        # alive, and covers the process-is-None stale-registration case too.
-        manager._enforce_device_driver_heartbeat_timeout(handle, now_mono)
-        manager._enforce_device_driver_stop_timeout(handle, now_mono)
-        manager._maybe_restart_device_driver(device_id, handle, now_mono)
+        # Serialize driver-state mutation (exit-state detection,
+        # heartbeat-timeout demotion + stale-wrapper terminate, restart)
+        # against anything else doing device I/O under this device's
+        # per-device lifecycle lock: an in-flight auto-reconnect worker
+        # (`_run_auto_reconnect`) or an operator-initiated lifecycle op
+        # (`Manager._run_lifecycle` / `_run_auto_connect`). Without this,
+        # e.g. a heartbeat-timeout demotion could `proc.terminate()` the
+        # very process a reconnect worker is mid-RPC with, or a restart
+        # could spin up a brand-new driver process while that worker
+        # still believes it's talking to the old one.
+        #
+        # `acquire(blocking=False)` is essential: this runs on the main
+        # poll loop's supervision tick, which must never block on a
+        # worker-held lock (that's the F4 stall this whole fix removes).
+        # If another lifecycle op currently holds the lock, skip ALL
+        # driver-state mutation *and* a new auto-reconnect dispatch for
+        # this device this tick -- the deferred checks simply re-run next
+        # tick (~poll_ms later); other devices are unaffected.
+        lock = manager._lifecycle_device_locks.setdefault(device_id, threading.Lock())
+        if not lock.acquire(blocking=False):
+            continue
+        try:
+            proc = handle.process
+            if proc is not None:
+                rc = proc.poll()
+                if rc is not None:
+                    # Fast path: the tracked (wrapper) process actually exited.
+                    manager._update_device_driver_exit_state(handle, int(rc))
+            # Heartbeat-authoritative liveness: demote a RUNNING driver whose
+            # heartbeat has gone stale even if the wrapper's poll() still
+            # reports alive, and covers the process-is-None
+            # stale-registration case too.
+            manager._enforce_device_driver_heartbeat_timeout(handle, now_mono)
+            manager._enforce_device_driver_stop_timeout(handle, now_mono)
+            manager._maybe_restart_device_driver(device_id, handle, now_mono)
+        finally:
+            lock.release()
         _maybe_auto_reconnect_device(manager, device_id, handle, now_mono)
 
 

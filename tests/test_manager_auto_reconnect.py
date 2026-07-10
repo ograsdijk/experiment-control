@@ -25,6 +25,7 @@ from experiment_control.manager import (
     device_spec_from_yaml,
 )
 from experiment_control._manager.process_supervision import (
+    _auto_reconnect_should_attempt,
     _maybe_auto_reconnect_device,
     _run_auto_reconnect,
 )
@@ -382,6 +383,128 @@ class ManagerAutoReconnectOffLoopTests(unittest.TestCase):
             "despite sharing the per-device lifecycle lock",
         )
         self.assertEqual(handle.auto_reconnect_last_error, None)
+
+
+class ManagerAutoReconnectInFlightGuardTests(unittest.TestCase):
+    """F4 follow-up (finding #1): an in-flight reconnect worker must block a
+    second dispatch for the same device independent of the cooldown timer --
+    `cooldown_s=0` is valid config, and a slow attempt can outlast a non-zero
+    cooldown window. The `auto_reconnect_pending` flag backstops the cooldown
+    check; completion (not dispatch) is what stamps the cooldown reference."""
+
+    @staticmethod
+    def _handle(*, cooldown_s: float, max_attempts: int | None = None) -> DeviceHandle:
+        spec = DeviceSpec(
+            device_id="pt415",
+            device_class_path="driver.py",
+            device_class_name="Driver",
+            device_init_kwargs={},
+            telemetry_calls=[],
+            auto_reconnect=AutoReconnectSpec(
+                enabled=True,
+                on_telemetry_stale_s=5.0,
+                cooldown_s=cooldown_s,
+                max_attempts=max_attempts,
+                reset_attempts_after_ok_s=120.0,
+                disconnect_timeout_ms=1000,
+            ),
+        )
+        handle = DeviceHandle(spec=spec)
+        handle.driver_process_state = ManagedProcessState.RUNNING
+        handle.rpc_endpoint = "tcp://127.0.0.1:1"
+        return handle
+
+    def test_pending_blocks_second_dispatch_with_zero_cooldown(self) -> None:
+        """With cooldown_s=0 the cooldown check can never fire, so only the
+        pending flag prevents a flood: while the first worker is still
+        in-flight (pending True), a second tick must NOT dispatch again."""
+        handle = self._handle(cooldown_s=0.0)
+        manager = mock.Mock()
+        manager._devices = {"pt415": handle}
+        manager._telemetry_last_bundle_ts = {"pt415": Timestamp(t_wall=1.0, t_mono=10.0)}
+        manager._device_rpc_timeout_ms = 2000
+        manager._lifecycle_device_locks = {}
+        # Plain Mock().submit records the call but never runs the worker, so
+        # `auto_reconnect_pending` stays True (mimicking a slow in-flight op).
+
+        _maybe_auto_reconnect_device(manager, "pt415", handle, 20.0)
+        self.assertTrue(handle.auto_reconnect_pending)
+        self.assertEqual(manager._lifecycle_executor.submit.call_count, 1)
+
+        # Second tick well past the (zero) cooldown window -- must be refused
+        # solely because the first attempt is still pending.
+        should, _age, reason = _auto_reconnect_should_attempt(
+            manager, "pt415", handle, 21.0
+        )
+        self.assertFalse(should)
+        self.assertEqual(reason, "pending")
+
+        _maybe_auto_reconnect_device(manager, "pt415", handle, 21.0)
+        self.assertEqual(manager._lifecycle_executor.submit.call_count, 1)
+        self.assertEqual(handle.auto_reconnect_attempts, 1)
+
+    def test_worker_clears_pending_and_stamps_completion_time(self) -> None:
+        """On completion the worker must clear `auto_reconnect_pending` and
+        move `auto_reconnect_last_attempt_mono` to the completion instant
+        (not the dispatch instant), so cooldown measures elapsed-since-done."""
+        handle = self._handle(cooldown_s=0.0)
+        manager = mock.Mock()
+        manager._devices = {"pt415": handle}
+        manager._telemetry_last_bundle_ts = {"pt415": Timestamp(t_wall=1.0, t_mono=10.0)}
+        manager._device_rpc_timeout_ms = 2000
+        manager._call_device_rpc.return_value = {"status": "OK"}
+        manager._device_rpc_status_ok = Manager._device_rpc_status_ok
+        manager._device_rpc_error_text = Manager._device_rpc_error_text
+        manager._lifecycle_device_locks = {}
+        manager._lifecycle_executor.submit.side_effect = lambda fn, *a, **kw: fn(*a, **kw)
+
+        _maybe_auto_reconnect_device(manager, "pt415", handle, 20.0)
+
+        self.assertFalse(handle.auto_reconnect_pending)
+        self.assertIsNotNone(handle.auto_reconnect_last_success_mono)
+        # Dispatch stamped 20.0; the worker overwrote it with a real
+        # monotonic completion timestamp, so it must no longer equal 20.0.
+        self.assertNotEqual(handle.auto_reconnect_last_attempt_mono, 20.0)
+        self.assertEqual(
+            handle.auto_reconnect_last_attempt_mono,
+            handle.auto_reconnect_last_success_mono,
+        )
+
+    def test_worker_clears_pending_on_failure(self) -> None:
+        """A failing reconnect must still clear `auto_reconnect_pending`
+        (via the `finally`), otherwise the device would look permanently
+        'reconnect in progress' and never be retried."""
+        handle = self._handle(cooldown_s=0.0)
+        manager = mock.Mock()
+        manager._devices = {"pt415": handle}
+        manager._device_rpc_timeout_ms = 2000
+        manager._call_device_rpc.side_effect = RuntimeError("boom")
+        manager._device_rpc_status_ok = Manager._device_rpc_status_ok
+        manager._device_rpc_error_text = Manager._device_rpc_error_text
+        manager._lifecycle_device_locks = {}
+        manager._publish_manager_event = mock.Mock()
+
+        handle.auto_reconnect_pending = True
+        _run_auto_reconnect(manager, "pt415", handle, 1, 99.0)
+
+        self.assertFalse(handle.auto_reconnect_pending)
+        self.assertEqual(handle.auto_reconnect_last_error, "boom")
+
+    def test_dispatch_runtimeerror_clears_pending(self) -> None:
+        """If the executor is already shut down when we dispatch, the worker
+        never runs to clear the flag -- the dispatch site must clear it
+        itself so the device isn't wedged as permanently pending."""
+        handle = self._handle(cooldown_s=0.0)
+        manager = mock.Mock()
+        manager._devices = {"pt415": handle}
+        manager._telemetry_last_bundle_ts = {"pt415": Timestamp(t_wall=1.0, t_mono=10.0)}
+        manager._device_rpc_timeout_ms = 2000
+        manager._lifecycle_device_locks = {}
+        manager._lifecycle_executor.submit.side_effect = RuntimeError("shutdown")
+
+        _maybe_auto_reconnect_device(manager, "pt415", handle, 20.0)
+
+        self.assertFalse(handle.auto_reconnect_pending)
 
 
 if __name__ == "__main__":
