@@ -103,6 +103,8 @@ class ShmRingWriter:
         layout_version: int = 1,
     ) -> "ShmRingWriter":
         dtype_obj = np.dtype(dtype)
+        if dtype_obj.hasobject:
+            raise ValueError("SHM ring dtype cannot contain Python objects")
         payload_nbytes = int(dtype_obj.itemsize * prod(shape))
         dtype_bytes = _dtype_to_header_text(dtype_obj).encode("utf-8")
         shape_len = len(shape)
@@ -204,8 +206,13 @@ class ShmRingWriter:
         struct.pack_into("<Q", self._buf, slot_offset + SEQ_END_OFFSET, 0)
 
         payload_start = self._layout.payload_offset + slot * self._layout.payload_nbytes
-        payload_end = payload_start + self._layout.payload_nbytes
-        self._buf[payload_start:payload_end] = arr.tobytes(order="C")
+        payload_view = np.ndarray(
+            shape=self._layout.shape,
+            dtype=self._layout.dtype,
+            buffer=self._buf,
+            offset=payload_start,
+        )
+        np.copyto(payload_view, arr, casting="no")
 
         SLOT_STRUCT.pack_into(
             self._buf,
@@ -293,31 +300,47 @@ class ShmRingReader:
         last_slot = struct.unpack_from("<Q", self._buf, HEADER_LAST_SLOT_OFFSET)[0]
         return int(last_seq), int(last_slot)
 
+    def _read_stable_slot(
+        self,
+        slot: int,
+        *,
+        expected_seq: int,
+    ) -> dict[str, Any] | None:
+        slot_offset = self._layout.slot_table_offset + slot * SLOT_ENTRY_SIZE
+        seq_begin = struct.unpack_from("<Q", self._buf, slot_offset)[0]
+        seq_end = struct.unpack_from(
+            "<Q", self._buf, slot_offset + SEQ_END_OFFSET
+        )[0]
+        if seq_begin == 0 or seq_begin != seq_end or seq_end != expected_seq:
+            return None
+
+        t0_mono_ns, t0_wall_ns, _shot = struct.unpack_from(
+            "<QQQ", self._buf, slot_offset + 8
+        )
+        payload_start = self._layout.payload_offset + slot * self._layout.payload_nbytes
+        payload_end = payload_start + self._layout.payload_nbytes
+        payload = bytes(self._buf[payload_start:payload_end])
+
+        seq_begin_after = struct.unpack_from("<Q", self._buf, slot_offset)[0]
+        seq_end_after = struct.unpack_from(
+            "<Q", self._buf, slot_offset + SEQ_END_OFFSET
+        )[0]
+        if (
+            seq_begin_after != expected_seq
+            or seq_end_after != expected_seq
+            or seq_begin_after != seq_end_after
+        ):
+            return None
+        return {
+            "seq": int(expected_seq),
+            "t0_mono_ns": int(t0_mono_ns),
+            "t0_wall_ns": int(t0_wall_ns),
+            "payload": payload,
+        }
+
     def read_event(self, seq_target: int) -> dict[str, Any] | None:
         def try_slot(slot: int) -> dict[str, Any] | None:
-            slot_offset = self._layout.slot_table_offset + slot * SLOT_ENTRY_SIZE
-            seq_begin = struct.unpack_from("<Q", self._buf, slot_offset)[0]
-            if seq_begin == 0:
-                return None
-            seq_end = struct.unpack_from("<Q", self._buf, slot_offset + SEQ_END_OFFSET)[
-                0
-            ]
-            if seq_begin != seq_end or seq_end != seq_target:
-                return None
-            t0_mono_ns, t0_wall_ns, _shot = struct.unpack_from(
-                "<QQQ", self._buf, slot_offset + 8
-            )
-            payload_start = (
-                self._layout.payload_offset + slot * self._layout.payload_nbytes
-            )
-            payload_end = payload_start + self._layout.payload_nbytes
-            payload = bytes(self._buf[payload_start:payload_end])
-            return {
-                "seq": int(seq_end),
-                "t0_mono_ns": int(t0_mono_ns),
-                "t0_wall_ns": int(t0_wall_ns),
-                "payload": payload,
-            }
+            return self._read_stable_slot(slot, expected_seq=seq_target)
 
         last_seq_hint, last_slot_hint = self._read_last_hint()
         if last_slot_hint is not None and 0 <= last_slot_hint < self._layout.slot_count:
@@ -366,23 +389,9 @@ class ShmRingReader:
         entries.sort(key=lambda item: item[0])
         out: list[dict[str, Any]] = []
         for seq, slot in entries:
-            slot_offset = self._layout.slot_table_offset + slot * SLOT_ENTRY_SIZE
-            t0_mono_ns, t0_wall_ns, shot = struct.unpack_from(
-                "<QQQ", self._buf, slot_offset + 8
-            )
-            payload_start = (
-                self._layout.payload_offset + slot * self._layout.payload_nbytes
-            )
-            payload_end = payload_start + self._layout.payload_nbytes
-            payload = bytes(self._buf[payload_start:payload_end])
-            out.append(
-                {
-                    "seq": int(seq),
-                    "t0_mono_ns": int(t0_mono_ns),
-                    "t0_wall_ns": int(t0_wall_ns),
-                    "payload": payload,
-                }
-            )
+            event = self._read_stable_slot(slot, expected_seq=seq)
+            if event is not None:
+                out.append(event)
         return out
 
     def close(self) -> None:
