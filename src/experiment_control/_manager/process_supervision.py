@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 import ctypes
 from pathlib import Path
@@ -1192,7 +1193,22 @@ def _auto_reconnect_attempt(
     now_mono: float,
     age_s: float,
 ) -> None:
-    spec = handle.spec.auto_reconnect
+    """Record the attempt (bookkeeping only) and dispatch the blocking
+    disconnect+connect I/O to the lifecycle executor under the per-device
+    lifecycle lock (F4) — mirrors ``Manager._dispatch_auto_connect``.
+
+    Only counters / cooldown timestamp / suppressed flag / the "attempt"
+    event happen here, on the manager's main poll loop. The disconnect and
+    connect RPCs (each with their own multi-second timeout) run on a
+    worker thread so a slow/unresponsive device can't stall
+    `_pump_once` — previously this ran synchronously on the main loop and
+    could block it for up to ~2.5s per stale device per tick.
+
+    Setting `auto_reconnect_last_attempt_mono` here (before the worker even
+    starts) is what makes the cooldown check in `_auto_reconnect_should_attempt`
+    correctly prevent a second dispatch for the same device while the first
+    attempt is still in flight on the executor.
+    """
     handle.auto_reconnect_attempts += 1
     handle.auto_reconnect_last_attempt_mono = now_mono
     handle.auto_reconnect_last_attempt_wall = time.time()
@@ -1210,50 +1226,78 @@ def _auto_reconnect_attempt(
         },
     )
     try:
+        manager._lifecycle_executor.submit(
+            _run_auto_reconnect, manager, device_id, handle, attempt, age_s
+        )
+    except RuntimeError:
+        # Executor was shut down (e.g. manager tearing down between the
+        # staleness check and this dispatch). Nothing to do — the
+        # bookkeeping above already recorded the attempt; there's no RPC
+        # reply to send back (this is fire-and-forget, like auto-connect).
+        pass
+
+
+def _run_auto_reconnect(
+    manager: Any,
+    device_id: str,
+    handle: Any,
+    attempt: int,
+    age_s: float,
+) -> None:
+    """Worker-thread body: disconnect+connect the device off the manager
+    poll loop, under the per-device lifecycle lock so this can't race an
+    operator-initiated lifecycle op (connect/disconnect/restart/recover all
+    take the same lock via `Manager._run_lifecycle` / `_run_auto_connect`).
+    """
+    spec = handle.spec.auto_reconnect
+    lock = manager._lifecycle_device_locks.setdefault(device_id, threading.Lock())
+    with lock:
         try:
-            manager._call_device_rpc(
+            try:
+                manager._call_device_rpc(
+                    device_id=device_id,
+                    action="disconnect_device",
+                    params={},
+                    timeout_ms=int(spec.disconnect_timeout_ms),
+                )
+            except Exception:
+                pass
+            connect_timeout_ms = spec.connect_timeout_ms or manager._device_rpc_timeout_ms
+            resp = manager._call_device_rpc(
                 device_id=device_id,
-                action="disconnect_device",
+                action="connect_device",
                 params={},
-                timeout_ms=int(spec.disconnect_timeout_ms),
+                timeout_ms=int(connect_timeout_ms),
             )
-        except Exception:
-            pass
-        connect_timeout_ms = spec.connect_timeout_ms or manager._device_rpc_timeout_ms
-        resp = manager._call_device_rpc(
-            device_id=device_id,
-            action="connect_device",
-            params={},
-            timeout_ms=int(connect_timeout_ms),
-        )
-        if not manager._device_rpc_status_ok(resp):
-            raise RuntimeError(manager._device_rpc_error_text(resp))
-        handle.auto_reconnect_last_success_mono = time.monotonic()
-        handle.auto_reconnect_last_error = None
-        _auto_reconnect_publish(
-            manager,
-            "manager.device.auto_reconnect.success",
-            device_id,
-            {
-                "attempt": attempt,
-                "telemetry_age_s": age_s,
-                "response": resp,
-                "auto_reconnect": _auto_reconnect_status(handle),
-            },
-        )
-    except Exception as exc:
-        handle.auto_reconnect_last_error = str(exc)
-        _auto_reconnect_publish(
-            manager,
-            "manager.device.auto_reconnect.failed",
-            device_id,
-            {
-                "attempt": attempt,
-                "telemetry_age_s": age_s,
-                "error": str(exc),
-                "auto_reconnect": _auto_reconnect_status(handle),
-            },
-        )
+            if not manager._device_rpc_status_ok(resp):
+                raise RuntimeError(manager._device_rpc_error_text(resp))
+        except Exception as exc:
+            handle.auto_reconnect_last_error = str(exc)
+            _auto_reconnect_publish(
+                manager,
+                "manager.device.auto_reconnect.failed",
+                device_id,
+                {
+                    "attempt": attempt,
+                    "telemetry_age_s": age_s,
+                    "error": str(exc),
+                    "auto_reconnect": _auto_reconnect_status(handle),
+                },
+            )
+            return
+    handle.auto_reconnect_last_success_mono = time.monotonic()
+    handle.auto_reconnect_last_error = None
+    _auto_reconnect_publish(
+        manager,
+        "manager.device.auto_reconnect.success",
+        device_id,
+        {
+            "attempt": attempt,
+            "telemetry_age_s": age_s,
+            "response": resp,
+            "auto_reconnect": _auto_reconnect_status(handle),
+        },
+    )
 
 
 def _maybe_auto_reconnect_device(
