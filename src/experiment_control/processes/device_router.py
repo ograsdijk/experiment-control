@@ -33,6 +33,8 @@ class _WorkerLike(Protocol):
 
     def is_alive(self) -> bool: ...
 
+    def audit_stats(self) -> Json | None: ...
+
 
 _ALLOWED_PROCESS_STATES = {"STARTING", "RUNNING", "STOPPING"}
 
@@ -229,6 +231,147 @@ def _inject_request_id(resp: Json, request_id: Any) -> Json:
     return out
 
 
+# Bound on the number of un-published audit events buffered per worker
+# (see _AsyncEventPublisher). One event is produced per command, so this
+# is only ever reached when the Manager loop stalls long enough for
+# thousands of commands to complete against it — a pathological state in
+# which dropping best-effort observability is far preferable to applying
+# backpressure to the command path.
+_AUDIT_QUEUE_MAX = 8192
+
+# Cooldown before retrying a failed audit-client build (see
+# _AsyncEventPublisher._ensure_manager). A transient error at build time
+# must not permanently disable audit, but retrying on every event would
+# hammer a genuinely-broken endpoint.
+_AUDIT_CLIENT_RETRY_S = 5.0
+
+
+class _AsyncEventPublisher:
+    """Publishes audit/journal events on a dedicated background thread.
+
+    Previously each worker published its ``manager.command`` audit event
+    with a blocking DEALER round-trip to the Manager on the command's
+    reply path. When the Manager main loop stalled (auto-reconnect,
+    federation, startup, journal hiccups) that round-trip blocked up to
+    the RPC timeout, delaying *every* device/process command reply and the
+    worker's next dequeue — a global coupling of command latency to
+    Manager-loop health through what is only observability.
+
+    Audit delivery is moved off the critical path here: callers hand off
+    ``(topic, payload)`` via a bounded, non-blocking queue and this owned
+    thread performs the blocking publish. The wrapped ``ManagerClient`` is
+    built and used solely on this thread (ZMQ sockets are not
+    thread-safe); a build failure is retried with a cooldown rather than
+    permanently disabling audit. On sustained Manager backpressure the
+    queue saturates and the newest events are dropped; the command path
+    never blocks. Loss is observable via the ``dropped`` / ``publish_errors``
+    / ``client_error`` counters (surfaced through the worker health
+    snapshot), not silent. ``publish`` stamps a capture-time ``ts`` when the
+    caller did not, so delivery latency does not distort event times.
+    """
+
+    def __init__(
+        self,
+        *,
+        client_factory: Callable[[], ManagerClient],
+        name: str,
+        maxsize: int = _AUDIT_QUEUE_MAX,
+    ) -> None:
+        self._client_factory = client_factory
+        self._queue: queue.Queue = queue.Queue(maxsize=max(1, int(maxsize)))
+        # Observability counters (read by _BaseWorker.audit_stats). Plain
+        # int += is safe: publish() has a single producer (the worker
+        # thread) and the _run counters are touched only by the publisher
+        # thread.
+        self.dropped = 0  # events dropped: queue overflow or no client
+        self.publish_errors = 0  # publish_event raised (Manager unreachable)
+        self.client_error = False  # last audit-client build failed
+        self._thread = threading.Thread(target=self._run, name=name, daemon=True)
+        self._thread.start()
+
+    def publish(self, topic: str, payload: Json) -> None:
+        # Non-blocking, best-effort. A stalled Manager can never apply
+        # backpressure to the command path: on overflow we drop the new
+        # event and count it rather than block the caller.
+        if "ts" not in payload:
+            # Stamp capture time here so a delivery delayed by a stalled
+            # Manager does not get a delivery-time timestamp. Callers that
+            # already set ts (e.g. manager.command payloads) skip the copy.
+            payload = {
+                **payload,
+                "ts": {"t_wall": time.time(), "t_mono": time.monotonic()},
+            }
+        try:
+            self._queue.put_nowait((topic, payload))
+        except queue.Full:
+            self.dropped += 1
+
+    def _ensure_manager(
+        self, manager: ManagerClient | None, next_build_at: float
+    ) -> tuple[ManagerClient | None, float]:
+        if manager is not None:
+            return manager, next_build_at
+        now = time.monotonic()
+        if now < next_build_at:
+            return None, next_build_at
+        try:
+            built = self._client_factory()
+            self.client_error = False
+            return built, next_build_at
+        except Exception:
+            # Transient build failure (ctx/endpoint not ready). Surface it
+            # and retry after a cooldown instead of disabling audit for the
+            # worker's whole lifetime.
+            self.client_error = True
+            return None, now + _AUDIT_CLIENT_RETRY_S
+
+    def _run(self) -> None:
+        manager: ManagerClient | None = None
+        next_build_at = 0.0
+        try:
+            while True:
+                item = self._queue.get()
+                if item is None:  # shutdown sentinel
+                    break
+                manager, next_build_at = self._ensure_manager(manager, next_build_at)
+                if manager is None:
+                    # No client yet (build failed, in cooldown). Count the
+                    # discard so the gap is visible rather than silent.
+                    self.dropped += 1
+                    continue
+                topic, payload = item
+                try:
+                    manager.publish_event(
+                        topic=topic,
+                        payload=payload,
+                        include_process_id=False,
+                        include_ts=True,
+                    )
+                except Exception:
+                    self.publish_errors += 1
+        finally:
+            if manager is not None:
+                try:
+                    manager.close()
+                except Exception:
+                    pass
+
+    def close(self, *, timeout_s: float = 2.0) -> None:
+        # Enqueue the shutdown sentinel; the thread drains events already
+        # queued (best-effort) then closes the client. A blocking put with a
+        # deadline lands the sentinel without discarding a real event (the
+        # drain thread frees a slot as it consumes) yet stays bounded if the
+        # Manager is unreachable — the thread is a daemon, so any residual is
+        # abandoned at exit.
+        deadline = time.monotonic() + timeout_s
+        try:
+            self._queue.put(None, timeout=timeout_s)
+        except queue.Full:
+            pass
+        remaining = max(0.0, deadline - time.monotonic())
+        self._thread.join(timeout=remaining)
+
+
 class _BaseWorker(threading.Thread):
     def __init__(
         self,
@@ -243,6 +386,41 @@ class _BaseWorker(threading.Thread):
         self._reply_queue = reply_queue
         self._queue: queue.Queue = queue.Queue(maxsize=max(1, int(queue_max)))
         self._stop_evt = threading.Event()
+        # Set by workers that emit audit events; None for workers that
+        # don't (mirrored/manager forwarders). See _AsyncEventPublisher.
+        self._publisher: _AsyncEventPublisher | None = None
+
+    def _start_event_publisher(
+        self, client_factory: Callable[[], ManagerClient], *, name: str
+    ) -> None:
+        self._publisher = _AsyncEventPublisher(
+            client_factory=client_factory, name=name
+        )
+
+    def _publish_event(self, topic: str, payload: Json) -> None:
+        pub = self._publisher
+        if pub is None:
+            return
+        pub.publish(topic, payload)
+
+    def audit_stats(self) -> Json | None:
+        # Audit-publisher loss counters for the worker health snapshot;
+        # None for workers that don't emit audit events. See
+        # _AsyncEventPublisher.
+        pub = self._publisher
+        if pub is None:
+            return None
+        return {
+            "dropped": pub.dropped,
+            "publish_errors": pub.publish_errors,
+            "client_error": pub.client_error,
+        }
+
+    def _stop_event_publisher(self) -> None:
+        pub = self._publisher
+        if pub is not None:
+            pub.close()
+            self._publisher = None
 
     def stop(self) -> None:
         self._stop_evt.set()
@@ -316,7 +494,6 @@ class _ProcessWorker(_BaseWorker):
             manager_pub=manager_pub,
             rpc_timeout_ms=self._timeout_ms,
         )
-        self._manager: ManagerClient | None = None
         self._sock: zmq.Socket | None = None
         self._endpoint: str | None = None
 
@@ -379,15 +556,11 @@ class _ProcessWorker(_BaseWorker):
             self._close_sock()
             return None
 
-    def _publish_event(self, topic: str, payload: Json) -> None:
-        if self._manager is None:
-            return
-        self._manager_helper.publish_event(
-            self._manager,
-            topic=topic,
-            payload=payload,
-            include_process_id=False,
-            include_ts=True,
+    def _make_manager_client(self) -> ManagerClient:
+        return self._manager_helper.init_client(
+            ctx=self._ctx,
+            process_id=self._process_id,
+            subscribe_telemetry=False,
         )
 
     def _publish_process_command(self, task: _ProcessTask, response: Json) -> None:
@@ -427,53 +600,55 @@ class _ProcessWorker(_BaseWorker):
         self._publish_event("manager.command", payload)
 
     def run(self) -> None:
-        self._manager = self._manager_helper.init_client(
-            ctx=self._ctx,
-            process_id=self._process_id,
-            subscribe_telemetry=False,
+        self._start_event_publisher(
+            self._make_manager_client, name=f"audit-process-{self._process_id}"
         )
-        while not self._stop_evt.is_set():
-            task = self._queue.get()
-            if task is None:
-                break
-            if not isinstance(task, _ProcessTask):
-                continue
-            if not task.endpoint:
-                if (
-                    task.action == "process.capabilities"
-                    and str(task.process_state or "").strip().upper() == "STARTING"
-                ):
-                    resp = {
-                        "ok": False,
-                        "error": {
-                            "code": "process_starting",
-                            "message": "process is starting; RPC endpoint not advertised yet",
-                            "retry_after_ms": 500,
-                        },
-                    }
-                else:
-                    resp = {"ok": False, "error": {"code": "process_rpc_not_ready"}}
-                self._publish_process_command(task, resp)
+        # try/finally so an unexpected error in the loop still tears down the
+        # publisher thread + its ManagerClient socket; the worker is recreated
+        # on death (_ensure_process_worker), so a leak here would accumulate.
+        try:
+            while not self._stop_evt.is_set():
+                task = self._queue.get()
+                if task is None:
+                    break
+                if not isinstance(task, _ProcessTask):
+                    continue
+                if not task.endpoint:
+                    if (
+                        task.action == "process.capabilities"
+                        and str(task.process_state or "").strip().upper() == "STARTING"
+                    ):
+                        resp = {
+                            "ok": False,
+                            "error": {
+                                "code": "process_starting",
+                                "message": "process is starting; RPC endpoint not advertised yet",
+                                "retry_after_ms": 500,
+                            },
+                        }
+                    else:
+                        resp = {"ok": False, "error": {"code": "process_rpc_not_ready"}}
+                    self._publish_process_command(task, resp)
+                    self._enqueue_reply(
+                        identity=task.identity,
+                        response=resp,
+                        inflight_reserved=task.inflight_reserved,
+                        request_id=task.request_id,
+                    )
+                    continue
+                call_resp = self._call(task.endpoint, task.request)
+                if call_resp is None:
+                    call_resp = {"ok": False, "error": "timeout"}
+                self._publish_process_command(task, call_resp)
                 self._enqueue_reply(
                     identity=task.identity,
-                    response=resp,
+                    response=call_resp,
                     inflight_reserved=task.inflight_reserved,
                     request_id=task.request_id,
                 )
-                continue
-            call_resp = self._call(task.endpoint, task.request)
-            if call_resp is None:
-                call_resp = {"ok": False, "error": "timeout"}
-            self._publish_process_command(task, call_resp)
-            self._enqueue_reply(
-                identity=task.identity,
-                response=call_resp,
-                inflight_reserved=task.inflight_reserved,
-                request_id=task.request_id,
-            )
-        if self._manager is not None:
-            self._manager.close()
-        self._close_sock()
+        finally:
+            self._stop_event_publisher()
+            self._close_sock()
 
 class _ManagerWorker(_BaseWorker):
     def __init__(
@@ -548,12 +723,6 @@ class _DeviceWorker(_BaseWorker):
         self._manager_pub = manager_pub
         self._device_rpc_timeout_ms = int(device_rpc_timeout_ms)
         self._interceptor_timeout_ms = int(interceptor_timeout_ms)
-        self._manager_helper = ManagerClientHelper(
-            manager_rpc=manager_rpc,
-            manager_pub=manager_pub,
-            rpc_timeout_ms=self._device_rpc_timeout_ms,
-        )
-        self._manager: ManagerClient | None = None
         self._device_sock: zmq.Socket | None = None
         self._device_endpoint: str | None = None
         # OrderedDict so we can LRU-evict the oldest cached socket when
@@ -629,15 +798,13 @@ class _DeviceWorker(_BaseWorker):
         self._process_socks[process_id] = (endpoint, sock)
         return sock
 
-    def _publish_event(self, topic: str, payload: Json) -> None:
-        if self._manager is None:
-            return
-        self._manager_helper.publish_event(
-            self._manager,
-            topic=topic,
-            payload=payload,
-            include_process_id=False,
-            include_ts=True,
+    def _make_manager_client(self) -> ManagerClient:
+        return ManagerClient(
+            ctx=self._ctx,
+            manager_rpc=self._manager_rpc,
+            manager_pub=self._manager_pub,
+            rpc_timeout_ms=self._device_rpc_timeout_ms,
+            subscribe_telemetry=False,
         )
 
     def _call_interceptor(
@@ -781,13 +948,25 @@ class _DeviceWorker(_BaseWorker):
         return err
 
     def run(self) -> None:
-        self._manager = ManagerClient(
-            ctx=self._ctx,
-            manager_rpc=self._manager_rpc,
-            manager_pub=self._manager_pub,
-            rpc_timeout_ms=self._device_rpc_timeout_ms,
-            subscribe_telemetry=False,
+        self._start_event_publisher(
+            self._make_manager_client, name=f"audit-device-{self._device_id}"
         )
+        # try/finally so a loop exception still tears down the publisher
+        # thread + its ManagerClient socket; the worker is recreated on
+        # death (_ensure_device_worker), so a leak here would accumulate.
+        try:
+            self._run_loop()
+        finally:
+            self._stop_event_publisher()
+            self._close_device_sock()
+            for _endpoint, sock in self._process_socks.values():
+                try:
+                    sock.close(0)
+                except Exception:
+                    pass
+            self._process_socks.clear()
+
+    def _run_loop(self) -> None:
         while not self._stop_evt.is_set():
             task = self._queue.get()
             if task is None:
@@ -869,16 +1048,6 @@ class _DeviceWorker(_BaseWorker):
                 inflight_reserved=task.inflight_reserved,
                 request_id=task.request_id,
             )
-
-        if self._manager is not None:
-            self._manager.close()
-        self._close_device_sock()
-        for _endpoint, sock in self._process_socks.values():
-            try:
-                sock.close(0)
-            except Exception:
-                pass
-        self._process_socks.clear()
 
 
 class _MirroredDeviceWorker(_BaseWorker):
@@ -1007,27 +1176,37 @@ class _MirroredDeviceWorker(_BaseWorker):
             rpc_timeout_ms=self._manager_timeout_ms,
             subscribe_telemetry=False,
         )
-        while not self._stop_evt.is_set():
-            task = self._queue.get()
-            if task is None:
-                break
-            if not isinstance(task, _MirroredTask):
-                continue
-            try:
-                resp = self._forward(task)
-                self._maybe_cache_capabilities(task, resp)
-            except Exception as e:
-                self._close_sock()
-                resp = {"ok": False, "error": str(e)}
-            self._enqueue_reply(
-                identity=task.identity,
-                response=resp,
-                inflight_reserved=task.inflight_reserved,
-                request_id=task.request.get("request_id") if isinstance(task.request, dict) else None,
-            )
-        if self._manager is not None:
-            self._manager.close()
-        self._close_sock()
+        try:
+            while not self._stop_evt.is_set():
+                task = self._queue.get()
+                if task is None:
+                    break
+                if not isinstance(task, _MirroredTask):
+                    continue
+                try:
+                    resp = self._forward(task)
+                except Exception as e:
+                    self._close_sock()
+                    resp = {"ok": False, "error": str(e)}
+                # Enqueue the client reply BEFORE the capabilities cache: that
+                # cache is a blocking manager RPC (self._manager.call) and must
+                # not sit on the mirrored command's reply path (F3). It fires
+                # only for 'capabilities' responses and swallows errors, so
+                # deferring it past the reply is safe. (The worker's next
+                # dequeue can still wait on it, but only for those rare
+                # discovery responses, not per-command traffic.)
+                self._enqueue_reply(
+                    identity=task.identity,
+                    response=resp,
+                    inflight_reserved=task.inflight_reserved,
+                    request_id=task.request.get("request_id") if isinstance(task.request, dict) else None,
+                )
+                if isinstance(resp, dict):
+                    self._maybe_cache_capabilities(task, resp)
+        finally:
+            if self._manager is not None:
+                self._manager.close()
+            self._close_sock()
 
 class DeviceRouter(ManagedProcessBase):
     def __init__(
@@ -1391,14 +1570,16 @@ class DeviceRouter(ManagedProcessBase):
             depth = worker.queue_depth()
             if depth is not None:
                 total_depth += depth
-            rows.append(
-                {
-                    id_key: item_id,
-                    "queue_depth": depth,
-                    "queue_max": worker.queue_max(),
-                    "alive": bool(worker.is_alive()),
-                }
-            )
+            row: Json = {
+                id_key: item_id,
+                "queue_depth": depth,
+                "queue_max": worker.queue_max(),
+                "alive": bool(worker.is_alive()),
+            }
+            audit = worker.audit_stats()
+            if audit is not None:
+                row["audit"] = audit
+            rows.append(row)
         return rows, total_depth
 
     def _manager_worker_snapshot(self) -> Json:
