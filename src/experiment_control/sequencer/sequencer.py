@@ -3,8 +3,11 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import threading
 import time
 from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -68,6 +71,35 @@ _STREAM_CONTEXT_SET_TRANSIENT_ERRORS = (
     "not connected",
     "disconnected",
 )
+# Bounds the worker pool used to dispatch a set_context step's per-stream
+# RPCs concurrently (F8): one slot for the shared hdf.streams.expect call
+# plus one per stream, generously sized so a step rarely queues.
+_SET_CONTEXT_DISPATCH_MAX_WORKERS = 16
+
+
+@dataclass
+class _SetContextCallHandle:
+    """One in-flight (or completed) RPC dispatched for a set_context step."""
+
+    kind: str  # "expect" or "context_set"
+    device_id: str
+    stream: str
+    future: "Future[None]"
+
+
+@dataclass
+class _SetContextDispatch:
+    """Tracks the concurrent RPC fan-out for a single set_context step.
+
+    Created by `_begin_set_context` and polled tick-by-tick by
+    `_poll_set_context` (via `SequencerRuntime`) until every call has
+    acknowledged, so the step stays non-advancing until all streams are
+    done -- matching the previous blocking implementation's invariant
+    without blocking the sequencer's tick loop while a retry backoff is
+    pending on any individual stream.
+    """
+
+    calls: list[_SetContextCallHandle] = field(default_factory=list)
 _DRIVER_BUILTIN_ACTIONS = {
     "capabilities",
     "refresh_capabilities",
@@ -207,6 +239,17 @@ class SequencerProcess(ManagedProcessBase):
         self._manager_rpc = manager_rpc
         self._manager_pub = manager_pub
         self._rpc_timeout_ms = int(rpc_timeout_ms)
+        # ManagerClient's RPC socket is single-threaded by design (F8): the
+        # dispatch pool below fans out per-stream set_context RPCs onto
+        # worker threads, so their actual socket use must be serialized
+        # through this lock. Held only around the request/reply round trip,
+        # never across a retry backoff, so concurrent streams still make
+        # independent progress.
+        self._context_rpc_lock = threading.Lock()
+        self._context_executor = ThreadPoolExecutor(
+            max_workers=_SET_CONTEXT_DISPATCH_MAX_WORKERS,
+            thread_name_prefix="sequencer-set-context",
+        )
 
         # Control plane (ROUTER)
         self._init_rpc_router()
@@ -243,6 +286,8 @@ class SequencerProcess(ManagedProcessBase):
             call_process=self._call_process,
             get_process_telemetry=self._get_process_telemetry,
             expect_streams=self._expect_streams,
+            begin_set_context=self._begin_set_context,
+            poll_set_context=self._poll_set_context,
         )
         self._context_columns: dict[str, str] | None = None
         self._loaded_sequence_source: str | None = None
@@ -283,6 +328,13 @@ class SequencerProcess(ManagedProcessBase):
                 self._try_autoload_sequence_id(self._autoload_sequence_id)
         if autoload_path and self._loaded_sequence_text is None:
             self._try_autoload_path(str(autoload_path))
+
+    def close(self) -> None:
+        try:
+            self._context_executor.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
+        super().close()
 
     def _resolve_use_sequence_spec(self, sequence_id: str):
         if self._sequence_library is None:
@@ -2329,7 +2381,12 @@ class SequencerProcess(ManagedProcessBase):
             "action": action,
             "params": params,
         }
-        return self._normalize_call_response(self._require_manager().call(req))
+        # Serialized (F8): the set_context dispatch pool may call this from
+        # multiple worker threads concurrently, and ManagerClient's RPC
+        # socket is only safe for single-threaded use. The lock is held
+        # only for the request/reply round trip, not across retry backoffs.
+        with self._context_rpc_lock:
+            return self._normalize_call_response(self._require_manager().call(req))
 
     def _call_process(self, process_id: str, action: str, params: dict[str, Any]) -> Json:
         # Process RPC: the action is the inner request `type` (e.g. mw.retune),
@@ -2340,7 +2397,9 @@ class SequencerProcess(ManagedProcessBase):
             "process_id": process_id,
             "request": {"type": action, "params": params},
         }
-        return self._normalize_call_response(self._require_manager().call(req))
+        # See the lock note in `_call_device`.
+        with self._context_rpc_lock:
+            return self._normalize_call_response(self._require_manager().call(req))
 
     def _get_process_telemetry(self, process_id: str, signal: str) -> dict[str, Any] | None:
         return self._require_manager().get_latest_process(process_id, signal)
@@ -2412,6 +2471,65 @@ class SequencerProcess(ManagedProcessBase):
         resp = self._call_process("hdf_writer", "hdf.streams.expect", params)
         if not bool(resp.get("ok", False)):
             raise RuntimeError(f"hdf.streams.expect failed: {self._device_error_text(resp)}")
+
+    def _begin_set_context(
+        self, streams: list[tuple[str, str]], context_id: int, fields: dict[str, Any]
+    ) -> _SetContextDispatch:
+        """Fan out a set_context step's RPCs concurrently (F8).
+
+        Submits the shared `hdf.streams.expect` call (if any streams are
+        targeted) and each stream's `stream.context.set` call to the
+        dispatch pool at the same time, instead of the sequencer's tick
+        thread issuing them one at a time and blocking on
+        `time.sleep`-based retries in between. Each worker keeps using the
+        existing bounded-retry/backoff logic in `_set_stream_context`
+        unchanged; only where those retries and RPCs run has moved off the
+        tick thread. The returned handle is polled every tick via
+        `_poll_set_context` until every call finishes.
+        """
+        calls: list[_SetContextCallHandle] = []
+        if streams:
+            calls.append(
+                _SetContextCallHandle(
+                    kind="expect",
+                    device_id="",
+                    stream="",
+                    future=self._context_executor.submit(
+                        self._expect_streams, streams, context_id
+                    ),
+                )
+            )
+        for device_id, stream in streams:
+            calls.append(
+                _SetContextCallHandle(
+                    kind="context_set",
+                    device_id=device_id,
+                    stream=stream,
+                    future=self._context_executor.submit(
+                        self._set_stream_context, device_id, stream, context_id, fields
+                    ),
+                )
+            )
+        return _SetContextDispatch(calls=calls)
+
+    @staticmethod
+    def _poll_set_context(dispatch: _SetContextDispatch, now: float) -> tuple[bool, str | None]:
+        """Non-blocking poll of a set_context dispatch.
+
+        Returns `(finished, error)`. Not finished until every call in the
+        dispatch has completed -- preserving the "no advance until all
+        streams ack" invariant of the previous synchronous implementation,
+        just without blocking the tick thread while waiting.
+        """
+        del now  # each call bounds its own retry deadline internally
+        if any(not call.future.done() for call in dispatch.calls):
+            return False, None
+        for call in dispatch.calls:
+            try:
+                call.future.result()
+            except Exception as e:
+                return True, str(e)
+        return True, None
 
     def _get_telemetry(self, device_id: str, signal: str) -> dict[str, Any] | None:
         return self._require_manager().get_latest(device_id, signal)

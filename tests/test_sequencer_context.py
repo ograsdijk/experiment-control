@@ -1,6 +1,9 @@
 # ruff: noqa: E402
 
 import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest import mock
 import unittest
@@ -268,6 +271,290 @@ class SequencerSetContextRetryTests(unittest.TestCase):
         process._call_process = fake_call_process  # type: ignore[attr-defined]
         with self.assertRaisesRegex(RuntimeError, "hdf.streams.expect failed"):
             process._expect_streams([("scope", "trace")], 2)  # type: ignore[misc]
+
+
+def _single_set_context_spec() -> SequenceSpec:
+    return SequenceSpec(
+        version=1,
+        meta={},
+        vars={},
+        steps=[
+            SetContextStep(
+                streams=[{"device": "scope", "stream": "trace"}],
+                fields={"freq_hz": 1.0},
+            )
+        ],
+        context_columns=None,
+    )
+
+
+class SequencerSetContextTickBasedRetryTests(unittest.TestCase):
+    """F8: set_context must not block the tick loop while a retry/backoff
+    is pending, and must not advance until every stream's RPC has acked."""
+
+    def test_set_context_step_does_not_block_tick_loop_while_pending(self) -> None:
+        # Simulates a device.stream.context.set retry/backoff that would
+        # previously have been a blocking `time.sleep` on the sequencer's
+        # own thread. `poll_set_context` reports "still pending" until a
+        # deadline elapses; the fix under test is that `runtime.tick()`
+        # itself must return promptly on every call instead of blocking
+        # until that deadline -- i.e. no sleep happens inside tick().
+        ready_at: dict[str, float] = {}
+
+        def begin_set_context(streams, context_id, fields):
+            del streams, fields
+            ready_at["t"] = time.monotonic() + 0.25
+            return {"context_id": context_id}
+
+        def poll_set_context(state, now):
+            del state
+            if now < ready_at["t"]:
+                return False, None
+            return True, None
+
+        runtime = SequencerRuntime(
+            call_device=lambda *a, **k: {"ok": True, "result": None},
+            get_telemetry=lambda *a, **k: None,
+            set_stream_context=lambda *a, **k: None,
+            expect_streams=lambda *a, **k: None,
+            begin_set_context=begin_set_context,
+            poll_set_context=poll_set_context,
+        )
+        runtime.load(_single_set_context_spec())
+        runtime.start()
+
+        tick_durations: list[float] = []
+        deadline = time.monotonic() + 3.0
+        while runtime.state == "RUNNING" and time.monotonic() < deadline:
+            t0 = time.perf_counter()
+            runtime.tick()
+            tick_durations.append(time.perf_counter() - t0)
+            # Mimic the sequencer process's own tick cadence -- the point
+            # under test is that `tick()` itself never blocks, not that the
+            # calling loop is instantaneous.
+            time.sleep(0.005)
+
+        self.assertEqual(runtime.state, "STOPPED")
+        self.assertGreater(len(tick_durations), 5)
+        # The regression this guards against: a blocking `time.sleep(backoff)`
+        # inside the RPC-retry path would make some tick() call take close to
+        # the full 0.25s pending window. Every call must stay well under it.
+        self.assertLess(max(tick_durations), 0.05)
+
+    def test_set_context_step_does_not_advance_until_all_acks_received(self) -> None:
+        poll_log: list[int] = []
+
+        def begin_set_context(streams, context_id, fields):
+            del streams, context_id, fields
+            return {"n": 0}
+
+        def poll_set_context(state, now):
+            del now
+            state["n"] += 1
+            poll_log.append(state["n"])
+            if state["n"] < 3:
+                return False, None
+            return True, None
+
+        runtime = SequencerRuntime(
+            call_device=lambda *a, **k: {"ok": True, "result": None},
+            get_telemetry=lambda *a, **k: None,
+            set_stream_context=lambda *a, **k: None,
+            expect_streams=lambda *a, **k: None,
+            begin_set_context=begin_set_context,
+            poll_set_context=poll_set_context,
+        )
+        runtime.load(_single_set_context_spec())
+        runtime.start()
+
+        # First tick begins the step's dispatch (nothing to poll yet).
+        runtime.tick()
+        self.assertEqual(runtime.state, "RUNNING")
+        self.assertEqual(poll_log, [])
+
+        # Each subsequent tick polls once; the step must not advance/complete
+        # the sequence until poll_set_context reports finished.
+        runtime.tick()
+        self.assertEqual(runtime.state, "RUNNING")
+        self.assertEqual(poll_log, [1])
+
+        runtime.tick()
+        self.assertEqual(runtime.state, "RUNNING")
+        self.assertEqual(poll_log, [1, 2])
+
+        # Third poll reports all acks received -> step (and sequence) finish.
+        runtime.tick()
+        self.assertEqual(runtime.state, "STOPPED")
+        self.assertEqual(poll_log, [1, 2, 3])
+
+    def test_set_context_step_surfaces_timeout_error_non_blockingly(self) -> None:
+        def begin_set_context(streams, context_id, fields):
+            del streams, context_id, fields
+            return object()
+
+        def poll_set_context(state, now):
+            del state, now
+            return True, (
+                "stream.context.set failed for scope/trace after 4 attempts: timeout"
+            )
+
+        runtime = SequencerRuntime(
+            call_device=lambda *a, **k: {"ok": True, "result": None},
+            get_telemetry=lambda *a, **k: None,
+            set_stream_context=lambda *a, **k: None,
+            expect_streams=lambda *a, **k: None,
+            begin_set_context=begin_set_context,
+            poll_set_context=poll_set_context,
+        )
+        runtime.load(_single_set_context_spec())
+        runtime.start()
+        runtime.tick()  # begins the dispatch
+        runtime.tick()  # polls it and observes the error
+
+        status = runtime.status()
+        self.assertEqual(status.get("state"), "ERROR")
+        self.assertIn("set_context failed", str(status.get("error")))
+        self.assertIn("timeout", str(status.get("error")))
+
+    def test_falls_back_to_synchronous_path_when_dispatch_not_wired(self) -> None:
+        # Callers/tests that only wire `set_stream_context`/`expect_streams`
+        # (no `begin_set_context`/`poll_set_context`) must keep working
+        # exactly as before -- single-tick synchronous completion.
+        calls: list[tuple[str, str, int]] = []
+
+        def set_stream_context(device_id, stream, context_id, fields):
+            del fields
+            calls.append((device_id, stream, context_id))
+
+        runtime = SequencerRuntime(
+            call_device=lambda *a, **k: {"ok": True, "result": None},
+            get_telemetry=lambda *a, **k: None,
+            set_stream_context=set_stream_context,
+            expect_streams=lambda *a, **k: None,
+        )
+        runtime.load(_single_set_context_spec())
+        runtime.start()
+        runtime.tick()
+
+        self.assertEqual(runtime.state, "STOPPED")
+        self.assertEqual(calls, [("scope", "trace", 0)])
+
+
+class SequencerProcessSetContextDispatchTests(unittest.TestCase):
+    """Exercises the real `SequencerProcess._begin_set_context` /
+    `_poll_set_context` dispatch pool (F8)."""
+
+    def _process_with_executor(self) -> SequencerProcess:
+        process = object.__new__(SequencerProcess)
+        process._context_executor = ThreadPoolExecutor(  # type: ignore[attr-defined]
+            max_workers=8, thread_name_prefix="test-set-context"
+        )
+        return process
+
+    def test_streams_and_expect_are_dispatched_concurrently(self) -> None:
+        process = self._process_with_executor()
+        streams = [("dev1", "s1"), ("dev2", "s2"), ("dev3", "s3")]
+        # One barrier party per stream plus one for the shared expect call.
+        # `barrier.wait()` only returns once ALL parties have arrived, so
+        # this only succeeds if every RPC is genuinely in flight at the same
+        # time -- a serial (one-at-a-time) dispatch would deadlock here and
+        # each call would raise BrokenBarrierError on the timeout.
+        barrier = threading.Barrier(len(streams) + 1)
+
+        def fake_expect_streams(streams_arg, context_id) -> None:
+            del streams_arg, context_id
+            barrier.wait(timeout=2.0)
+
+        def fake_set_stream_context(device_id, stream, context_id, fields) -> None:
+            del device_id, stream, context_id, fields
+            barrier.wait(timeout=2.0)
+
+        process._expect_streams = fake_expect_streams  # type: ignore[attr-defined]
+        process._set_stream_context = fake_set_stream_context  # type: ignore[attr-defined]
+
+        try:
+            dispatch = process._begin_set_context(streams, 0, {})  # type: ignore[misc]
+            finished = False
+            error: str | None = None
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline:
+                finished, error = process._poll_set_context(  # type: ignore[misc]
+                    dispatch, time.monotonic()
+                )
+                if finished:
+                    break
+                time.sleep(0.01)
+        finally:
+            process._context_executor.shutdown(wait=True)  # type: ignore[attr-defined]
+
+        self.assertTrue(finished)
+        self.assertIsNone(error)
+
+    def test_poll_reports_pending_until_every_call_completes(self) -> None:
+        process = self._process_with_executor()
+        release = threading.Event()
+
+        def slow_set_stream_context(device_id, stream, context_id, fields) -> None:
+            del device_id, stream, context_id, fields
+            release.wait(timeout=2.0)
+
+        process._expect_streams = lambda streams, context_id: None  # type: ignore[attr-defined]
+        process._set_stream_context = slow_set_stream_context  # type: ignore[attr-defined]
+
+        try:
+            dispatch = process._begin_set_context(  # type: ignore[misc]
+                [("dev1", "s1")], 0, {}
+            )
+            finished, error = process._poll_set_context(  # type: ignore[misc]
+                dispatch, time.monotonic()
+            )
+            self.assertFalse(finished)
+            self.assertIsNone(error)
+
+            release.set()
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline and not finished:
+                finished, error = process._poll_set_context(  # type: ignore[misc]
+                    dispatch, time.monotonic()
+                )
+                if not finished:
+                    time.sleep(0.01)
+        finally:
+            process._context_executor.shutdown(wait=True)  # type: ignore[attr-defined]
+
+        self.assertTrue(finished)
+        self.assertIsNone(error)
+
+    def test_poll_surfaces_error_from_any_failed_stream(self) -> None:
+        process = self._process_with_executor()
+
+        def failing_set_stream_context(device_id, stream, context_id, fields) -> None:
+            del context_id, fields
+            raise RuntimeError(f"stream.context.set failed for {device_id}/{stream}: boom")
+
+        process._expect_streams = lambda streams, context_id: None  # type: ignore[attr-defined]
+        process._set_stream_context = failing_set_stream_context  # type: ignore[attr-defined]
+
+        try:
+            dispatch = process._begin_set_context(  # type: ignore[misc]
+                [("dev1", "s1")], 0, {}
+            )
+            finished = False
+            error: str | None = None
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline:
+                finished, error = process._poll_set_context(  # type: ignore[misc]
+                    dispatch, time.monotonic()
+                )
+                if finished:
+                    break
+                time.sleep(0.01)
+        finally:
+            process._context_executor.shutdown(wait=True)  # type: ignore[attr-defined]
+
+        self.assertTrue(finished)
+        self.assertIsNotNone(error)
+        self.assertIn("boom", str(error))
 
 
 if __name__ == "__main__":

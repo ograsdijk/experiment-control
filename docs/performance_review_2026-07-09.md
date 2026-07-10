@@ -35,7 +35,7 @@ Data handling (HDF writer with background flush thread, Influx with background H
 | F5 | High | `sequencer/runtime.py:465-488` | `tick()` runs until a sleep/wait step; RPC drained only between ticks | Pause/stop/status unresponsive for the duration of a sleepless scan | Bound steps per tick or drain RPC inside the loop |
 | F6 | High | `sequencer/runtime.py:1183` | `parallel` unsupported → all cross-device sets sequential | Independent devices serialized; per-point latency scales with device count | Implement bounded parallel step (needs operator sign-off) |
 | F7 | Med-High | `_driver/runner.py:237-279` | Telemetry + scheduled streams run inline with RPC in one driver thread | Commands wait behind serial telemetry sweeps / trace acquisitions | Prioritize RPC between telemetry calls or defer telemetry while RPC pending |
-| F8 | Medium | `sequencer/sequencer.py:2370-2412` | `set_stream_context` blocking retry loop (up to 6 s) + per-context `hdf.streams.expect` RPC | Inline shot-path overhead; sequencer fully blocked during retries | Make retry non-blocking (tick-based); pipeline the two RPCs |
+| F8 | Medium | ✅ **FIXED** — `sequencer/sequencer.py`, `sequencer/runtime.py` | `set_stream_context` blocking retry loop (up to 6 s) + per-context `hdf.streams.expect` RPC | Inline shot-path overhead; sequencer fully blocked during retries | Retry is now tick-driven (`_wait_state`-style non-advancing poll); per-stream RPCs dispatched concurrently on a worker pool |
 | F9 | Medium | `_manager/lifecycle.py:253-264`, `process_supervision.py:284-293` | Shutdown stops drivers sequentially, 1 s timeout each | Shutdown scales linearly with unresponsive devices | Fan out via lifecycle executor |
 | F10 | Medium | `federation/hub.py:1138-1167` | Federation forward blocks main loop up to peer timeout; new DEALER per call | Slow peer stalls Manager; per-command connect cost | Per-peer worker (like mirrored routes in the router) |
 | F11 | Medium | `processes/influx_writer.py:1038-1235` | One HTTP thread for all destinations; no keep-alive | Slow destination (5 s timeout) delays other destinations' batches | Per-destination worker; reuse connections |
@@ -196,6 +196,7 @@ Data handling (HDF writer with background flush thread, Influx with background H
 ### F8 — Sequencer `set_context` path: blocking retries + per-context RPCs
 
 - **Severity:** Medium. **Confidence:** Confirmed.
+- **Status:** ✅ **FIXED**. See *Resolution* below.
 - **File:** `src/experiment_control/sequencer/sequencer.py` — `_set_stream_context` (L2370–2397, `time.sleep(backoff)` L2396, deadline 6 s), `_expect_streams` (L2399–2412); constants L57–59.
 - **Behavior:** each `set_context` step performs one `hdf.streams.expect` process RPC plus one `stream.context.set` device RPC per stream; on transient errors the device RPC is retried in a loop with `time.sleep` (50→500 ms backoff, 6 s deadline) — **blocking the entire sequencer process** (no RPC service, no telemetry drain; heartbeat survives on its thread).
 - **Impact:** per-shot overhead of ≥2 router round-trips (each with F2's ~50 ms floor today); on a flaky driver, up to 6 s of total unresponsiveness per stream. Retry layering is bounded and sensible otherwise.
@@ -205,6 +206,12 @@ Data handling (HDF writer with background flush thread, Influx with background H
 - **Risks/assumptions:** context must be set before the triggering `call` step — keep the step non-advancing until all acks arrive.
 - **Hardware testing:** not required.
 - **Measurement:** per-`set_context` wall time in a representative shot loop.
+
+**Resolution (implemented):** `set_context` no longer blocks the sequencer's tick loop.
+
+- `sequencer/runtime.py`: added a `_set_context_state` tick-state slot alongside `_sleep_until`/`_wait_state`, checked and reset at every existing reset site (load/start/fail/terminal-unwind/loop-restart). `_execute_set_context_step` now begins a dispatch and returns "pending" (mirroring `_execute_sleep_step`/`_start_wait_until`); a new `_step_set_context` (mirroring `_step_wait_until`) polls it every tick via an injected `poll_set_context` callable until every stream's RPC has acked, errored, or the existing 6 s retry deadline is exhausted — the step stays non-advancing the whole time, exactly as before, just without a blocking `time.sleep`. The new `begin_set_context`/`poll_set_context` callables are optional constructor args; when absent (existing callers/tests that only wire `set_stream_context`/`expect_streams`), the previous synchronous single-tick behavior is preserved unchanged.
+- `sequencer/sequencer.py`: `_set_stream_context`/`_expect_streams` keep their exact bounded-retry/backoff logic (including the `time.sleep(backoff)` between attempts) unchanged — but now run on a small `ThreadPoolExecutor` (`_context_executor`) instead of the tick thread. `_begin_set_context` submits the `hdf.streams.expect` call and every stream's `stream.context.set` call to the pool *concurrently* at step start; `_poll_set_context` is a non-blocking check of `Future.done()`/`Future.result()` across all of them. Because `ManagerClient`'s RPC socket is only safe for single-threaded use, `_call_device`/`_call_process` now serialize the actual send/recv round trip behind a new `_context_rpc_lock`, held only for that round trip and never across a retry's backoff sleep — so concurrent streams still make independent progress while one is backing off. Worst-case per-step latency changes from *sum* over streams (serial, on the tick thread) to *max* over streams (parallel, off the tick thread), still bounded by the same 6 s deadline. `SequencerProcess.close()` shuts the pool down.
+- Tests: `tests/test_sequencer_context.py` adds `SequencerSetContextTickBasedRetryTests` (tick-loop non-blocking behavior via `time.perf_counter` bounds on individual `tick()` calls, non-advance-until-all-acks, timeout surfacing, and the synchronous fallback path) and `SequencerProcessSetContextDispatchTests` (concurrency proven deterministically with a `threading.Barrier` sized to all in-flight calls, pending-until-complete polling, and error propagation) — 11 new tests, all passing alongside the pre-existing `_set_stream_context`/`_expect_streams` unit tests unchanged.
 
 ### F9 — Sequential shutdown; per-device 1 s stops
 
@@ -360,7 +367,7 @@ Existing signals are good (driver `loop_lag_s`, `manager.loop_stall`, pump timin
 | 4 | F4 auto-reconnect → lifecycle executor | High when enabled | Low-medium | Yes (unplug tests) |
 | 5 | F5 tick budget / RPC drain in tick | High (operability/safety) | Low | No |
 | 6 | F15 dynamic sequencer poll timeout | Medium (shot-rate) | Low | No |
-| 7 | F8 non-blocking set_context retries | Medium | Low-medium | No |
+| 7 | F8 non-blocking set_context retries — ✅ **DONE** (`fix/f8-set-context-nonblocking`) | Medium | Low-medium | No |
 | 8 | F7 driver RPC/telemetry interleaving | Medium-high per device | Medium | **Yes, per driver** |
 | 9 | F9 parallel shutdown | Medium | Low | Once |
 | 10 | F6 `parallel` step (restricted form) | High for multi-device scans | Medium-high | **Yes + operator sign-off** |
