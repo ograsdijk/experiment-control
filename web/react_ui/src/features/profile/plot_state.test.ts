@@ -187,4 +187,49 @@ describe("plot_state normalizePlotState telemetry smoothing", () => {
       expect(roundTripPanel.outputId).toBe("absorption_signal");
     }
   });
+
+  it("normalizes and preserves stream bin stats x-axis transforms", () => {
+    const state = normalizePlotState({
+      panels: [{
+        id: "panel-1", title: "Bin stats", kind: "stream_bin_stats",
+        workspaceId: "detection_fluorescence", outputId: "bin_stats",
+        overlayOutputIds: [], fitOverlayOutputIds: [],
+        stream: { deviceId: "pxie5171", stream: "waveforms", shape: [5, 4096] },
+        binStats: {}, uncertaintyMode: "sem", uncertaintyScale: 1,
+        showBinMarkers: false, xOffset: -2.5, xScale: 1000,
+      }],
+      activePanelId: "panel-1",
+    });
+
+    const panel = state.panels[0];
+    expect(panel.kind).toBe("stream_bin_stats");
+    if (panel.kind === "stream_bin_stats") {
+      expect([panel.xOffset, panel.xScale]).toEqual([-2.5, 1000]);
+    }
+
+    const roundTripPanel = normalizePlotState(serializePlotState(state)).panels[0];
+    expect(roundTripPanel.kind).toBe("stream_bin_stats");
+    if (roundTripPanel.kind === "stream_bin_stats") {
+      expect([roundTripPanel.xOffset, roundTripPanel.xScale]).toEqual([-2.5, 1000]);
+    }
+  });
+
+  it("uses identity x-axis transforms for invalid bin stats values", () => {
+    const state = normalizePlotState({
+      panels: [{
+        id: "panel-1", title: "Bin stats", kind: "stream_bin_stats",
+        workspaceId: null, outputId: null, overlayOutputIds: [],
+        fitOverlayOutputIds: [], stream: null, binStats: {},
+        uncertaintyMode: "sem", uncertaintyScale: 1, showBinMarkers: false,
+        xOffset: "invalid", xScale: 0,
+      }],
+      activePanelId: "panel-1",
+    });
+
+    const panel = state.panels[0];
+    expect(panel.kind).toBe("stream_bin_stats");
+    if (panel.kind === "stream_bin_stats") {
+      expect([panel.xOffset, panel.xScale]).toEqual([0, 1]);
+    }
+  });
 });

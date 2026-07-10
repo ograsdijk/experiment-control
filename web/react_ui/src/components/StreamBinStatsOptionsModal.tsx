@@ -1,4 +1,5 @@
-﻿import {
+﻿import { useEffect, useState, type ChangeEvent } from "react";
+import {
   Badge,
   Button,
   Group,
@@ -10,6 +11,7 @@
   Stack,
   Switch,
   Text,
+  TextInput,
 } from "@mantine/core";
 import type { UncertaintyMode } from "./StreamBinStatsPanel";
 import type { PlotStreamBinStatsPanelState } from "../features/stream/types";
@@ -36,6 +38,11 @@ type Props = {
     scale: number
   ) => void;
   onSetShowBinMarkers: (panelId: string, show: boolean) => void;
+  onSetXAxisTransform: (
+    panelId: string,
+    xOffset: number,
+    xScale: number
+  ) => void;
 };
 
 export function StreamBinStatsOptionsModal({
@@ -53,8 +60,44 @@ export function StreamBinStatsOptionsModal({
   onSetFitOverlayOutputs,
   onSetUncertainty,
   onSetShowBinMarkers,
+  onSetXAxisTransform,
 }: Props) {
   const title = `Bin stats options ${panel?.title ?? ""}`;
+  const [xOffsetDraft, setXOffsetDraft] = useState("0");
+  const [xScaleDraft, setXScaleDraft] = useState("1");
+
+  useEffect(() => {
+    if (panel) {
+      setXOffsetDraft(String(panel.xOffset));
+      setXScaleDraft(String(panel.xScale));
+    }
+  }, [panel?.id]);
+
+  const handleXOffsetChange = (event: ChangeEvent<HTMLInputElement>) => {
+    const raw = event.currentTarget.value;
+    setXOffsetDraft(raw);
+    if (!panel) {
+      return;
+    }
+    const parsed = parseNumberInput(raw);
+    if (parsed === null) {
+      return;
+    }
+    onSetXAxisTransform(panel.id, parsed, panel.xScale);
+  };
+
+  const handleXScaleChange = (event: ChangeEvent<HTMLInputElement>) => {
+    const raw = event.currentTarget.value;
+    setXScaleDraft(raw);
+    if (!panel) {
+      return;
+    }
+    const parsed = parseNumberInput(raw);
+    if (parsed === null || parsed === 0) {
+      return;
+    }
+    onSetXAxisTransform(panel.id, panel.xOffset, parsed);
+  };
   return (
     <Modal opened={opened} onClose={onClose} title={title} size="clamp(42rem, 82vw, 64rem)" centered>
       <Stack gap="md">
@@ -143,6 +186,26 @@ export function StreamBinStatsOptionsModal({
                 onSetShowBinMarkers(panel.id, event.currentTarget.checked)
               }
             />
+            <Group gap="sm" align="flex-end" wrap="wrap">
+              <TextInput
+                size="xs"
+                w={140}
+                label="x offset"
+                type="number"
+                step="any"
+                value={xOffsetDraft}
+                onChange={handleXOffsetChange}
+              />
+              <TextInput
+                size="xs"
+                w={140}
+                label="x scale"
+                type="number"
+                step="any"
+                value={xScaleDraft}
+                onChange={handleXScaleChange}
+              />
+            </Group>
             <Badge variant="light" color="indigo">
               x-axis: {xAxisLabel}
             </Badge>
