@@ -16,7 +16,7 @@ The main problems are **latency quantization and hidden coupling on the command 
 1. **~30–50 ms added to every device command** because the DeviceRouter only sends worker replies after its 50 ms poll expires (replies land in a plain `queue.Queue` that cannot wake the poller). For a sequential sequencer this is the dominant per-step cost — a 1 000-step scan pays +30–50 s.
 2. **Every device command's reply is gated on a blocking RPC to the Manager** (the `manager.command` audit event is published via a full request/reply round-trip *before* the reply is enqueued). Any Manager main-loop stall therefore delays commands to **all** devices.
 3. **The Manager main loop can stall for seconds**: auto-reconnect performs blocking disconnect+connect device RPCs inline in the supervision tick (~2.5 s per attempting device), and federation forwards block up to the peer timeout.
-4. **A genuine thread-safety violation**: lifecycle worker threads drain the Manager's SUB sockets (`_pump_manager_subscriptions`) concurrently with the main poll loop. ZMQ sockets are not thread-safe; this can corrupt/crash under load.
+4. **A genuine thread-safety violation was found and fixed**: lifecycle worker threads could drain the Manager's SUB sockets (`_pump_manager_subscriptions`) concurrently with the main poll loop. The pump now returns immediately off the main thread.
 5. **Cross-device parallelism is absent at the sequencing layer**: `parallel` is explicitly unsupported, so independent devices are always set one at a time, each paying costs (1)+(2).
 6. Within one device, **telemetry/scheduled-stream reads share the single driver thread with command RPCs**, so a sequencer command can wait behind a multi-register serial telemetry sweep.
 
@@ -28,7 +28,7 @@ Data handling (HDF writer with background flush thread, Influx with background H
 
 | # | Sev | Location | Issue | Impact | Recommended action |
 |---|-----|----------|-------|--------|--------------------|
-| F1 | Critical | `_manager/rpc_calls.py:148`, `manager.py:1657` | SUB sockets drained from lifecycle worker threads concurrently with main loop | Undefined behavior in libzmq; corruption/crashes under load | Thread-guard the pump (no-op off main thread) |
+| F1 | Critical | ✅ **FIXED** — `_manager/rpc_calls.py:150` | SUB sockets drained from lifecycle worker threads concurrently with main loop | Undefined behavior in libzmq; corruption/crashes under load | Main-thread guard makes the pump a no-op on lifecycle workers |
 | F2 | High | ✅ **FIXED** — `processes/device_router.py` (run loop + `_BaseWorker`) | Command replies quantized to 50 ms router poll | +30–50 ms on *every* device command; dominates per-shot overhead | inproc PUSH→PULL doorbell wakes the poll loop the instant a reply is enqueued |
 | F3 | High | ✅ **FIXED** — `processes/device_router.py:840, 464-473` | Blocking `manager.command` publish RPC on the reply critical path | Couples all device command latency to Manager loop health | Audit publish moved to a bounded background thread (`_AsyncEventPublisher`) |
 | F4 | Critical | `_manager/process_supervision.py:1188-1290` | Auto-reconnect does blocking device RPCs on the Manager main loop | ~2.5 s loop stall per attempt; stalls all RPC, HB ingestion, and (via F3) all device commands | Dispatch to the existing lifecycle executor |
@@ -53,6 +53,7 @@ Data handling (HDF writer with background flush thread, Influx with background H
 
 ### F1 — Manager SUB sockets drained from worker threads (thread-safety violation)
 
+- **Status:** ✅ **FIXED**. See *Resolution* below.
 - **Severity:** Critical (correctness/stability, with performance symptoms). **Confidence:** Confirmed from code; runtime impact requires verification.
 - **File:** `src/experiment_control/_manager/rpc_calls.py` — `RpcCallsMixin._pump_manager_subscriptions` (L148–154), `_call_device_rpc` (L241–312, pump wired at L261–267); `src/experiment_control/manager.py` — `_run_lifecycle` (L1683–1712), `_run_auto_connect` (L1657–1681).
 - **Behavior:** `_call_device_rpc` waits for the driver's reply in `_blocking_call_with_pump`, calling `pump_fn=self._pump_manager_subscriptions` on every 50 ms poll-timeout. The pump drains `self._sub`, `self._process_hb_sub`, `self._process_data_sub`. Lifecycle operations (`device.connect/disconnect/driver.*/recover`) and auto-connect-on-register run `_call_device_rpc` **on lifecycle executor threads** while the main thread's `_pump_once` polls and recvs on the same three SUB sockets. Event *publishing* has an off-thread redirect (`pubsub.py:88–89` checks `_main_thread_id`), but the socket *drain* has no such guard. With two devices connecting concurrently, two worker threads plus the main thread can all touch one SUB socket.
@@ -64,6 +65,8 @@ Data handling (HDF writer with background flush thread, Influx with background H
 - **Risks/assumptions:** none significant; the pump-from-worker adds no value since the main loop polls concurrently.
 - **Hardware testing:** not required (reproducible with dummy drivers under concurrent connects).
 - **Measurement:** stress test with 20 dummy drivers auto-connecting in parallel while telemetry flows; watch for libzmq assertions, heartbeat gaps, and `manager.process.heartbeat_error` events before/after the guard.
+
+**Resolution (implemented):** `_pump_manager_subscriptions` now returns immediately when called outside the Manager's main thread. Lifecycle workers continue waiting for their device RPC normally while the main poll loop remains solely responsible for draining the three SUB sockets. `tests/test_manager_lifecycle_parallel.py` verifies that worker-thread calls do not poll or receive from any subscription socket and that main-thread calls still drain all three channels.
 
 ### F2 — DeviceRouter reply latency quantized to the 50 ms poll
 
@@ -86,17 +89,17 @@ Data handling (HDF writer with background flush thread, Influx with background H
 - **Worker side.** `_BaseWorker._enqueue_reply` now calls `_ring_doorbell()` right after putting the `_ReplyItem` on `_reply_queue`. `_ring_doorbell` lazily builds a `PUSH` socket **on the worker's own thread** (ZMQ sockets are not thread-safe; the socket is created, used, and closed solely there — preserving the F1 invariant) with `LINGER=0`, and sends an empty frame `NOBLOCK`. Every worker constructor (`_DeviceWorker`, `_ProcessWorker`, `_MirroredDeviceWorker`, `_ManagerWorker`) forwards the router's `doorbell_endpoint`; each closes its `PUSH` in its `run()` teardown (`_ManagerWorker.run` gained a `try/finally` to do so).
 - **Data path unchanged / no ordering risk.** The doorbell is a pure *signal* — the reply payload still travels on `_reply_queue`, and the main loop still calls `_drain_replies()` every iteration. So the empty-frame send is strictly best-effort: if the `PUSH` HWM is full or the send fails, or the doorbell endpoint is absent, the worst case is simply the old 50 ms-quantized latency for that one reply, never a lost or misordered reply. Multiple rings coalesce — one `_drain_doorbell` clears however many frames arrived, so the loop cannot busy-spin.
 - **Result:** for the sequential-sequencer (lone-client) case the ~50 ms per-command scheduling floor collapses to the wake-up latency (sub-millisecond in practice); a 1 000-step `set`/`call` scan sheds ~30–50 s of pure poll quantization.
-- **Tests:** `tests/test_device_router_reply_doorbell.py` — enqueuing a reply makes the `PULL` readable well inside the old 50 ms floor (poller wakes instead of timing out); the reply rides `_reply_queue` while the doorbell frame is empty; many rings drain fully to `Again` (no spin); with no doorbell endpoint the reply still enqueues.
+- **Tests:** `tests/test_device_router_reply_doorbell.py` covers both the doorbell primitive and the production router wiring. The unit cases verify that enqueuing a reply makes the `PULL` readable, the reply remains on `_reply_queue`, doorbell frames drain fully, and a missing endpoint degrades safely. The router-level regression runs the real `DeviceRouter` poll loop with its idle poll stretched to 500 ms, delays a real device worker reply by 20 ms, and requires the external ROUTER reply within 300 ms while confirming `_drain_doorbell` ran. This pins worker endpoint forwarding, PULL binding/registration, handler dispatch, and reply draining together. Full `unittest discover`: 880 passed, 1 skipped.
 
 **Post-fix code review (8-angle) — outcome.** Correctness, altitude, and conventions passes came back clean; the `AGENTS.md` gates were re-checked against the change:
 
-- `ruff check src tests examples` passes; the new test is `TestCase`-based and is picked up by the CI `unittest discover` runner (not just pytest).
+- `ruff check src tests examples` passes; the tests are `TestCase`-based and are picked up by the CI `unittest discover` runner (not just pytest).
 - `mypy src/experiment_control`: the changed file `device_router.py` has **zero** type errors — the annotations added by this fix introduce none.
 - Wire contracts unchanged: the doorbell is a purely internal inproc signal; the `manager.command` topic, response envelope, and all downstream-importable symbols are untouched.
 - **Applied:** removed a redundant `setsockopt(zmq.SNDTIMEO, 0)` on the doorbell `PUSH` — the send already passes `zmq.NOBLOCK`, so the timeout had no effect.
 - **Not fixed (consistent with existing house style, no action taken):** the small `_close_*` socket helpers duplicate a pattern already repeated ~6× in this file; per-subclass `_close_doorbell` teardown mirrors the existing per-subclass `_stop_event_publisher` convention.
 
-**Deferred issue surfaced during review (outside F2 scope):** `mypy` baseline has regressed. `AGENTS.md` documents 2 known errors (as of 2026-06-18), but the tree now reports **9** errors in 5 files — `_manager/request_routing.py:67` (`_route_manager_ping` attr-defined), `_manager/rpc_calls.py:335` (`_ingest_chunk_ready` attr-defined), `processes/hdf_writer.py:3972/3975/3979` (`Any | None` assignment/arg-type), `manager.py:2046/2095` (`_telemetry_last_recv_mono` attr-defined), plus the 2 documented baseline errors (`manager_network.py:153`, `manager.py:424`). None are in `device_router.py` (unrelated to F2), but the "do not regress mypy" gate is already red and should be triaged separately.
+**Deferred issue surfaced during review (outside F2 scope):** `mypy` baseline has regressed. `AGENTS.md` documents 2 known errors (as of 2026-06-18), but the tree now reports **9** errors in 5 files — `_manager/request_routing.py:67` (`_route_manager_ping` attr-defined), `_manager/rpc_calls.py:341` (`_ingest_chunk_ready` attr-defined), `processes/hdf_writer.py:3972/3975/3979` (`Any | None` assignment/arg-type), `manager.py:2046/2095` (`_telemetry_last_recv_mono` attr-defined), plus the 2 documented baseline errors (`manager_network.py:153`, `manager.py:424`). None are in `device_router.py` (unrelated to F2), but the "do not regress mypy" gate is already red and should be triaged separately.
 
 ### F3 — Blocking `manager.command` audit publish on the command reply path
 
@@ -356,7 +359,7 @@ Existing signals are good (driver `loop_lag_s`, `manager.loop_stall`, pump timin
 |---|---|---|---|---|
 | 1 | F2 router reply wake-up — ✅ **DONE** (inproc doorbell) | Very high (−30–50 ms every command) | Low (inproc doorbell) | No |
 | 2 | F3 audit publish off critical path — ✅ **DONE** (`fix/f3-async-audit-publish`) | High (decouples devices from Manager health) | Low | No |
-| 3 | F1 thread-guard the SUB pump | High (stability) | Very low | No |
+| 3 | F1 thread-guard the SUB pump — ✅ **DONE** | High (stability) | Very low | No |
 | 4 | F4 auto-reconnect → lifecycle executor | High when enabled | Low-medium | Yes (unplug tests) |
 | 5 | F5 tick budget / RPC drain in tick | High (operability/safety) | Low | No |
 | 6 | F15 dynamic sequencer poll timeout | Medium (shot-rate) | Low | No |
