@@ -32,7 +32,7 @@ Data handling (HDF writer with background flush thread, Influx with background H
 | F2 | High | ✅ **FIXED** — `processes/device_router.py` (run loop + `_BaseWorker`) | Command replies quantized to 50 ms router poll | +30–50 ms on *every* device command; dominates per-shot overhead | inproc PUSH→PULL doorbell wakes the poll loop the instant a reply is enqueued |
 | F3 | High | ✅ **FIXED** — `processes/device_router.py:840, 464-473` | Blocking `manager.command` publish RPC on the reply critical path | Couples all device command latency to Manager loop health | Audit publish moved to a bounded background thread (`_AsyncEventPublisher`) |
 | F4 | Critical | `_manager/process_supervision.py:1188-1290` | Auto-reconnect does blocking device RPCs on the Manager main loop | ~2.5 s loop stall per attempt; stalls all RPC, HB ingestion, and (via F3) all device commands | Dispatch to the existing lifecycle executor |
-| F5 | High | `sequencer/runtime.py:465-488` | `tick()` runs until a sleep/wait step; RPC drained only between ticks | Pause/stop/status unresponsive for the duration of a sleepless scan | Bound steps per tick or drain RPC inside the loop |
+| F5 | High | ✅ **FIXED** — `sequencer/runtime.py:465-488` | `tick()` runs until a sleep/wait step; RPC drained only between ticks | Pause/stop/status unresponsive for the duration of a sleepless scan | Per-tick step/time budget (10 ms / 200 steps), atomic blocks unaffected |
 | F6 | High | `sequencer/runtime.py:1183` | `parallel` unsupported → all cross-device sets sequential | Independent devices serialized; per-point latency scales with device count | Implement bounded parallel step (needs operator sign-off) |
 | F7 | Med-High | `_driver/runner.py:237-279` | Telemetry + scheduled streams run inline with RPC in one driver thread | Commands wait behind serial telemetry sweeps / trace acquisitions | Prioritize RPC between telemetry calls or defer telemetry while RPC pending |
 | F8 | Medium | `sequencer/sequencer.py:2370-2412` | `set_stream_context` blocking retry loop (up to 6 s) + per-context `hdf.streams.expect` RPC | Inline shot-path overhead; sequencer fully blocked during retries | Make retry non-blocking (tick-based); pipeline the two RPCs |
@@ -156,6 +156,7 @@ Data handling (HDF writer with background flush thread, Influx with background H
 
 ### F5 — Sequencer `tick()` is unbounded; RPC starved during sleepless scans
 
+- **Status:** ✅ **FIXED**. See *Resolution* below.
 - **Severity:** High (responsiveness/safety-adjacent). **Confidence:** Confirmed.
 - **File:** `src/experiment_control/sequencer/runtime.py` — `SequencerRuntime.tick` inner loop (L465–488); `src/experiment_control/sequencer/sequencer.py` — `run` (L2949–2956).
 - **Behavior:** `tick()` loops `while self._state == "RUNNING"`, executing steps until a handler returns True (sleep / wait_until / pause) or the sequence ends. `set`/`call`/`assign`/`for`/`repeat` handlers return False, so a scan composed purely of sets and calls executes **entirely within one `tick()`**. The process's RPC ROUTER (pause/stop/status) is drained only between ticks in `run()`. `_check_stop_pause` is checked per step, but the flags it reads can only be set by RPC handlers that cannot run.
@@ -167,6 +168,14 @@ Data handling (HDF writer with background flush thread, Influx with background H
 - **Risks/assumptions:** none for correctness; `atomic` blocks already defer stop/pause by design and would be unaffected.
 - **Hardware testing:** not required.
 - **Measurement:** issue `sequencer.stop` mid-scan (sleepless test sequence) and measure request→state-change latency.
+
+**Resolution (implemented):** `tick()`'s inner step loop now carries a per-tick budget so it returns control to `sequencer.py`'s `run()` regularly, instead of only when a step handler returns `True` or the sequence ends.
+
+- **Budget.** Two module-level constants in `runtime.py`, `_TICK_BUDGET_S = 0.010` (10 ms wall-clock, `time.monotonic()`-based, consistent with the rest of the tick/step timing in this module) and `_TICK_MAX_STEPS = 200` (a step-count cap so a burst of unusually cheap steps — e.g. all hitting exception/error short-circuits — can't spin the wall-clock check indefinitely). The inner `while self._state == "RUNNING"` loop records `tick_deadline = time.monotonic() + _TICK_BUDGET_S` and a `steps_executed` counter at loop entry, and after each step that completes normally (handler returned `False`, i.e. cheap `set`/`call`/`assign`/`for`/`repeat`-style steps), returns from `tick()` once `steps_executed >= _TICK_MAX_STEPS` or the deadline has passed — whichever comes first.
+- **Atomic blocks unaffected.** The budget check is gated on `self._atomic_depth == 0`, the exact same guard `_check_stop_pause` already uses to defer stop/pause while inside an `atomic` block. So a running `atomic` block is never split by the new budget, regardless of how many steps or how much wall-clock time it takes — it remains uninterruptible by anything other than its own completion, matching the pre-existing stop/pause semantics exactly. `_execute_atomic_step` still runs on the same per-step path (push a frame, `_atomic_depth += 1`/`-= 1` via `_Frame.on_exit`), so no atomic-specific code needed to change.
+- **Why this restores responsiveness.** `sequencer.py`'s `run()` loop is `_poll_and_drain(50)` (services the RPC ROUTER — pause/stop/status) → `_runtime.tick()`, repeated forever. Previously a sleepless scan of pure set/call steps ran to completion inside one `tick()` call, so `_poll_and_drain` never got another turn until the whole scan finished. With the budget, `tick()` now returns roughly every 10 ms (or every 200 steps, whichever is sooner) during such a scan, so `run()` drains RPC between chunks at essentially the same cadence as a scan with sleeps in it — a pending `sequencer.pause`/`sequencer.stop` now takes effect within about one budget window instead of waiting for the entire scan.
+- **No behavior change for sleep/wait/pause-bearing sequences.** Those already returned from `tick()` on their own (handler returns `True`), so the budget is inert for them; it only changes behavior for runs of consecutive cheap steps that would otherwise batch unboundedly.
+- **Tests:** `tests/test_sequencer_tick_budget.py` — a single `tick()` call over a long sleepless (set/call-only) sequence returns before the sequence completes, both by step-count (`current_step`/env progress) and wall-clock (elapsed time bounded well under running the full sequence); a `sequencer.stop`/`sequencer.pause` request issued between two `tick()` calls (simulating `run()`'s RPC-drain-then-tick interleaving) takes effect on the very next `tick()` rather than only after the whole scan; an `atomic` block — including one larger than `_TICK_MAX_STEPS` — still executes its entire body within a single `tick()` call, proving the budget does not split it; and a short ordinary sequence still completes via the existing `while state == RUNNING: tick()` pattern used throughout the pre-existing suite. The full pre-existing sequencer/runtime test suite (`test_sequencer_loops.py`, `test_sequencer_adaptive.py`, `test_sequencer_context.py`, etc.) passes unmodified.
 
 ### F6 — No parallel step: cross-device sets always sequential
 
@@ -358,7 +367,7 @@ Existing signals are good (driver `loop_lag_s`, `manager.loop_stall`, pump timin
 | 2 | F3 audit publish off critical path — ✅ **DONE** (`fix/f3-async-audit-publish`) | High (decouples devices from Manager health) | Low | No |
 | 3 | F1 thread-guard the SUB pump | High (stability) | Very low | No |
 | 4 | F4 auto-reconnect → lifecycle executor | High when enabled | Low-medium | Yes (unplug tests) |
-| 5 | F5 tick budget / RPC drain in tick | High (operability/safety) | Low | No |
+| 5 | F5 tick budget / RPC drain in tick — ✅ **DONE** (`fix/f5-sequencer-tick-budget`) | High (operability/safety) | Low | No |
 | 6 | F15 dynamic sequencer poll timeout | Medium (shot-rate) | Low | No |
 | 7 | F8 non-blocking set_context retries | Medium | Low-medium | No |
 | 8 | F7 driver RPC/telemetry interleaving | Medium-high per device | Medium | **Yes, per driver** |

@@ -119,6 +119,21 @@ class _NoStepReady:
 _NO_STEP_READY = _NoStepReady()
 StepResult = Step | _NoStepReady | None
 
+# F5 fix: tick() used to run the inner step loop to completion (until a
+# sleep/wait/pause step, or sequence end), so a scan made entirely of cheap
+# steps (set/call/assign/for/repeat all return False from _execute_step)
+# could run for the whole scan inside one tick() call. sequencer.py's run()
+# only drains the RPC ROUTER (pause/stop/status) *between* tick() calls, so
+# such a scan left the process unresponsive to control for its full
+# duration. Bound the inner loop by wall-clock time and step count so
+# run() regularly gets a chance to service RPC. Neither budget is checked
+# while inside an atomic block (`_atomic_depth > 0`): atomic blocks must
+# remain uninterruptible by anything other than their own completion,
+# exactly as they already are with respect to stop/pause in
+# `_check_stop_pause`.
+_TICK_BUDGET_S = 0.010
+_TICK_MAX_STEPS = 200
+
 
 class SequencerRuntime:
     def __init__(
@@ -462,6 +477,8 @@ class SequencerRuntime:
                 if not self._step_adaptive_observation(now):
                     return
 
+            tick_deadline = time.monotonic() + _TICK_BUDGET_S
+            steps_executed = 0
             while self._state == "RUNNING":
                 if self._check_stop_pause():
                     return
@@ -486,6 +503,12 @@ class SequencerRuntime:
                         self._finish_active_step(time.monotonic())
                     return
                 self._finish_active_step(time.monotonic())
+                steps_executed += 1
+                if self._atomic_depth == 0 and (
+                    steps_executed >= _TICK_MAX_STEPS
+                    or time.monotonic() >= tick_deadline
+                ):
+                    return
         except Exception as e:
             if not self._handle_runtime_exception(e):
                 if self._last_error_detail is None:
