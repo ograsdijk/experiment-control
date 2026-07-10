@@ -122,6 +122,8 @@ class StreamOut:
                 raise ValueError(f"Duplicate record field name {field_item.name!r}.")
             names.add(field_item.name)
         record_dtype = np.dtype([(f.name, np.dtype(f.dtype)) for f in fields])
+        if record_dtype.isalignedstruct:
+            raise ValueError("Record StreamOut dtype must be packed, not aligned.")
         object.__setattr__(self, "dtype", str(record_dtype))
         object.__setattr__(self, "shape", ())
         object.__setattr__(self, "fields", fields)
