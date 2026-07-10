@@ -124,6 +124,7 @@ class StreamSchemaTests(unittest.TestCase):
         self.assertEqual(outputs[0].kind, "records")
         self.assertEqual(outputs[0].shape, ())
         self.assertEqual(outputs[0].numpy_dtype().names, ("sample_seq", "frequency_hz"))
+        self.assertFalse(outputs[0].numpy_dtype().isalignedstruct)
 
     def test_stream_calls_to_json_writes_record_fields(self) -> None:
         calls = [
