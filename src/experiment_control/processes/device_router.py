@@ -380,6 +380,7 @@ class _BaseWorker(threading.Thread):
         ctx: zmq.Context,
         reply_queue: queue.Queue,
         queue_max: int,
+        doorbell_endpoint: str | None = None,
     ) -> None:
         super().__init__(name=name, daemon=True)
         self._ctx = ctx
@@ -389,6 +390,12 @@ class _BaseWorker(threading.Thread):
         # Set by workers that emit audit events; None for workers that
         # don't (mirrored/manager forwarders). See _AsyncEventPublisher.
         self._publisher: _AsyncEventPublisher | None = None
+        # inproc PUSH doorbell to the router poll loop (F2). Built lazily
+        # on this worker's own thread the first time we enqueue a reply,
+        # because ZMQ sockets are not thread-safe. None disables the
+        # wake-up (the router still drains replies every poll cycle).
+        self._doorbell_endpoint = doorbell_endpoint
+        self._doorbell: zmq.Socket | None = None
 
     def _start_event_publisher(
         self, client_factory: Callable[[], ManagerClient], *, name: str
@@ -421,6 +428,49 @@ class _BaseWorker(threading.Thread):
         if pub is not None:
             pub.close()
             self._publisher = None
+
+    def _ring_doorbell(self) -> None:
+        # Wake the router poll loop so a just-enqueued reply is sent now
+        # instead of at the next 50 ms poll expiry (F2). Best-effort: the
+        # reply is already on _reply_queue and the router drains that queue
+        # every loop, so a dropped/failed doorbell frame merely falls back
+        # to the old poll-quantized latency — never a lost reply.
+        endpoint = self._doorbell_endpoint
+        if endpoint is None:
+            return
+        sock = self._doorbell
+        if sock is None:
+            # Lazy build on this worker thread (sockets are not thread-safe;
+            # this one is created, used, and closed solely here).
+            try:
+                sock = self._ctx.socket(zmq.PUSH)
+                sock.setsockopt(zmq.LINGER, 0)
+                sock.connect(endpoint)
+            except Exception:
+                if sock is not None:
+                    try:
+                        sock.close(0)
+                    except Exception:
+                        pass
+                self._doorbell = None
+                return
+            self._doorbell = sock
+        try:
+            sock.send(b"", zmq.NOBLOCK)
+        except Exception:
+            # Queue full (router hasn't drained yet) or transient error;
+            # the router's per-loop drain will still pick the reply up.
+            pass
+
+    def _close_doorbell(self) -> None:
+        sock = self._doorbell
+        if sock is None:
+            return
+        try:
+            sock.close(0)
+        except Exception:
+            pass
+        self._doorbell = None
 
     def stop(self) -> None:
         self._stop_evt.set()
@@ -465,6 +515,7 @@ class _BaseWorker(threading.Thread):
                 request_id=request_id,
             )
         )
+        self._ring_doorbell()
 
 
 class _ProcessWorker(_BaseWorker):
@@ -478,12 +529,14 @@ class _ProcessWorker(_BaseWorker):
         manager_pub: str,
         timeout_ms: int,
         queue_max: int,
+        doorbell_endpoint: str | None = None,
     ) -> None:
         super().__init__(
             name=f"process-rpc-{process_id}",
             ctx=ctx,
             reply_queue=reply_queue,
             queue_max=queue_max,
+            doorbell_endpoint=doorbell_endpoint,
         )
         self._process_id = process_id
         self._manager_rpc = manager_rpc
@@ -649,6 +702,7 @@ class _ProcessWorker(_BaseWorker):
         finally:
             self._stop_event_publisher()
             self._close_sock()
+            self._close_doorbell()
 
 class _ManagerWorker(_BaseWorker):
     def __init__(
@@ -660,12 +714,14 @@ class _ManagerWorker(_BaseWorker):
         manager_pub: str,
         timeout_ms: int,
         queue_max: int,
+        doorbell_endpoint: str | None = None,
     ) -> None:
         super().__init__(
             name="manager-rpc",
             ctx=ctx,
             reply_queue=reply_queue,
             queue_max=queue_max,
+            doorbell_endpoint=doorbell_endpoint,
         )
         self._manager_rpc = manager_rpc
         self._manager_pub = manager_pub
@@ -680,23 +736,26 @@ class _ManagerWorker(_BaseWorker):
             rpc_timeout_ms=self._timeout_ms,
             subscribe_telemetry=False,
         )
-        while not self._stop_evt.is_set():
-            task = self._queue.get()
-            if task is None:
-                break
-            if not isinstance(task, _ManagerTask):
-                continue
-            resp = self._manager.call(task.request, timeout_ms=self._timeout_ms)
-            if resp is None:
-                resp = {"ok": False, "error": "timeout"}
-            self._enqueue_reply(
-                identity=task.identity,
-                response=resp,
-                inflight_reserved=task.inflight_reserved,
-                request_id=task.request.get("request_id") if isinstance(task.request, dict) else None,
-            )
-        if self._manager is not None:
-            self._manager.close()
+        try:
+            while not self._stop_evt.is_set():
+                task = self._queue.get()
+                if task is None:
+                    break
+                if not isinstance(task, _ManagerTask):
+                    continue
+                resp = self._manager.call(task.request, timeout_ms=self._timeout_ms)
+                if resp is None:
+                    resp = {"ok": False, "error": "timeout"}
+                self._enqueue_reply(
+                    identity=task.identity,
+                    response=resp,
+                    inflight_reserved=task.inflight_reserved,
+                    request_id=task.request.get("request_id") if isinstance(task.request, dict) else None,
+                )
+        finally:
+            if self._manager is not None:
+                self._manager.close()
+            self._close_doorbell()
 
 
 class _DeviceWorker(_BaseWorker):
@@ -711,12 +770,14 @@ class _DeviceWorker(_BaseWorker):
         device_rpc_timeout_ms: int,
         interceptor_timeout_ms: int,
         queue_max: int,
+        doorbell_endpoint: str | None = None,
     ) -> None:
         super().__init__(
             name=f"device-rpc-{device_id}",
             ctx=ctx,
             reply_queue=reply_queue,
             queue_max=queue_max,
+            doorbell_endpoint=doorbell_endpoint,
         )
         self._device_id = device_id
         self._manager_rpc = manager_rpc
@@ -965,6 +1026,7 @@ class _DeviceWorker(_BaseWorker):
                 except Exception:
                     pass
             self._process_socks.clear()
+            self._close_doorbell()
 
     def _run_loop(self) -> None:
         while not self._stop_evt.is_set():
@@ -1061,12 +1123,14 @@ class _MirroredDeviceWorker(_BaseWorker):
         manager_pub: str,
         manager_timeout_ms: int,
         queue_max: int,
+        doorbell_endpoint: str | None = None,
     ) -> None:
         super().__init__(
             name=f"mirrored-rpc-{route.local_id}",
             ctx=ctx,
             reply_queue=reply_queue,
             queue_max=queue_max,
+            doorbell_endpoint=doorbell_endpoint,
         )
         self._route = route
         self._manager_rpc = manager_rpc
@@ -1207,6 +1271,7 @@ class _MirroredDeviceWorker(_BaseWorker):
             if self._manager is not None:
                 self._manager.close()
             self._close_sock()
+            self._close_doorbell()
 
 class DeviceRouter(ManagedProcessBase):
     def __init__(
@@ -1269,6 +1334,16 @@ class DeviceRouter(ManagedProcessBase):
         self._manager_sub: zmq.Socket | None = None
         self._manager: ManagerClient | None = None
 
+        # inproc doorbell (F2): worker threads PUSH an empty frame here after
+        # enqueuing a reply so the main poll loop wakes immediately instead of
+        # waiting out its 50 ms timeout. Unique per instance so multiple
+        # routers in one process/context don't share an endpoint. The PULL end
+        # is bound on the main thread in run().
+        self._reply_doorbell_endpoint = (
+            f"inproc://router-reply-doorbell-{uuid.uuid4().hex}"
+        )
+        self._reply_doorbell: zmq.Socket | None = None
+
         self._device_endpoints: dict[str, str] = {}
         self._device_states: dict[str, str] = {}
         self._process_endpoints: dict[str, str] = {}
@@ -1308,6 +1383,32 @@ class DeviceRouter(ManagedProcessBase):
             pass
         self._manager_sub = None
 
+    def _close_reply_doorbell(self) -> None:
+        if self._reply_doorbell is None:
+            return
+        try:
+            self._reply_doorbell.close(0)
+        except Exception:
+            pass
+        self._reply_doorbell = None
+
+    def _drain_doorbell(self) -> None:
+        # Consume the wake-up frames so the PULL socket stops reporting
+        # POLLIN (otherwise the poll loop would spin). The frames are only
+        # a signal; the actual replies are drained from _reply_queue by
+        # _drain_replies. Doorbell frames coalesce naturally — one drain
+        # clears however many workers rang while we were busy.
+        sock = self._reply_doorbell
+        if sock is None:
+            return
+        while True:
+            try:
+                sock.recv(zmq.NOBLOCK)
+            except zmq.Again:
+                break
+            except Exception:
+                break
+
     def close(self) -> None:
         for workers in (self._device_workers, self._mirrored_workers, self._process_workers):
             for worker in workers.values():
@@ -1317,6 +1418,7 @@ class DeviceRouter(ManagedProcessBase):
         super().close()
         self._close_external()
         self._close_manager_sub()
+        self._close_reply_doorbell()
 
     @staticmethod
     def _required_mirror_fields(item: Json) -> tuple[str, str, str, str]:
@@ -1378,6 +1480,7 @@ class DeviceRouter(ManagedProcessBase):
                 manager_pub=self._manager_pub,
                 timeout_ms=self._device_rpc_timeout_ms,
                 queue_max=self._manager_worker_queue_max,
+                doorbell_endpoint=self._reply_doorbell_endpoint,
             )
             worker.start()
             self._manager_worker = worker
@@ -1395,6 +1498,7 @@ class DeviceRouter(ManagedProcessBase):
                 device_rpc_timeout_ms=self._device_rpc_timeout_ms,
                 interceptor_timeout_ms=self._interceptor_rpc_timeout_ms,
                 queue_max=self._device_worker_queue_max,
+                doorbell_endpoint=self._reply_doorbell_endpoint,
             )
             worker.start()
             self._device_workers[device_id] = worker
@@ -1412,6 +1516,7 @@ class DeviceRouter(ManagedProcessBase):
                 manager_pub=self._manager_pub,
                 manager_timeout_ms=self._device_rpc_timeout_ms,
                 queue_max=self._mirrored_worker_queue_max,
+                doorbell_endpoint=self._reply_doorbell_endpoint,
             )
             worker.start()
             self._mirrored_workers[device_id] = worker
@@ -1428,6 +1533,7 @@ class DeviceRouter(ManagedProcessBase):
                 manager_pub=self._manager_pub,
                 timeout_ms=self._device_rpc_timeout_ms,
                 queue_max=self._process_worker_queue_max,
+                doorbell_endpoint=self._reply_doorbell_endpoint,
             )
             worker.start()
             self._process_workers[process_id] = worker
@@ -2178,11 +2284,20 @@ class DeviceRouter(ManagedProcessBase):
         sub.connect(self._manager_pub)
         self._manager_sub = sub
 
+        # Doorbell PULL end (F2): bound before any worker is created (workers
+        # are spawned lazily inside the loop below), so their PUSH connects
+        # never race the bind. inproc requires bind-before-connect.
+        doorbell = self._ctx.socket(zmq.PULL)
+        doorbell.setsockopt(zmq.LINGER, 0)
+        doorbell.bind(self._reply_doorbell_endpoint)
+        self._reply_doorbell = doorbell
+
         self._start_heartbeat_thread(state_provider=lambda: "RUNNING")
 
         poller = zmq.Poller()
         poller.register(self._external_rpc, zmq.POLLIN)
         poller.register(self._manager_sub, zmq.POLLIN)
+        poller.register(self._reply_doorbell, zmq.POLLIN)
         if self._rpc_router is not None:
             poller.register(self._rpc_router, zmq.POLLIN)
 
@@ -2193,6 +2308,8 @@ class DeviceRouter(ManagedProcessBase):
                     handlers[self._external_rpc] = self._handle_external_rpc
                 if self._manager_sub is not None:
                     handlers[self._manager_sub] = self._handle_manager_pub
+                if self._reply_doorbell is not None:
+                    handlers[self._reply_doorbell] = self._drain_doorbell
                 if self._rpc_router is not None:
                     handlers[self._rpc_router] = self._drain_rpc
                 poll_and_drain(poller, 50, handlers=handlers)

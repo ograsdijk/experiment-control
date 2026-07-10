@@ -29,7 +29,7 @@ Data handling (HDF writer with background flush thread, Influx with background H
 | # | Sev | Location | Issue | Impact | Recommended action |
 |---|-----|----------|-------|--------|--------------------|
 | F1 | Critical | `_manager/rpc_calls.py:148`, `manager.py:1657` | SUB sockets drained from lifecycle worker threads concurrently with main loop | Undefined behavior in libzmq; corruption/crashes under load | Thread-guard the pump (no-op off main thread) |
-| F2 | High | `processes/device_router.py:2008-2018` | Command replies quantized to 50 ms router poll | +30–50 ms on *every* device command; dominates per-shot overhead | Wake the poller via inproc socket when replies are enqueued |
+| F2 | High | ✅ **FIXED** — `processes/device_router.py` (run loop + `_BaseWorker`) | Command replies quantized to 50 ms router poll | +30–50 ms on *every* device command; dominates per-shot overhead | inproc PUSH→PULL doorbell wakes the poll loop the instant a reply is enqueued |
 | F3 | High | ✅ **FIXED** — `processes/device_router.py:840, 464-473` | Blocking `manager.command` publish RPC on the reply critical path | Couples all device command latency to Manager loop health | Audit publish moved to a bounded background thread (`_AsyncEventPublisher`) |
 | F4 | Critical | `_manager/process_supervision.py:1188-1290` | Auto-reconnect does blocking device RPCs on the Manager main loop | ~2.5 s loop stall per attempt; stalls all RPC, HB ingestion, and (via F3) all device commands | Dispatch to the existing lifecycle executor |
 | F5 | High | `sequencer/runtime.py:465-488` | `tick()` runs until a sleep/wait step; RPC drained only between ticks | Pause/stop/status unresponsive for the duration of a sleepless scan | Bound steps per tick or drain RPC inside the loop |
@@ -67,6 +67,7 @@ Data handling (HDF writer with background flush thread, Influx with background H
 
 ### F2 — DeviceRouter reply latency quantized to the 50 ms poll
 
+- **Status:** ✅ **FIXED**. See *Resolution* below.
 - **Severity:** High. **Confidence:** Confirmed.
 - **File:** `src/experiment_control/processes/device_router.py` — `DeviceRouter.run` (L2008–2018), `_drain_replies` (L1660–1698), `_BaseWorker._enqueue_reply` (L274–289); `src/experiment_control/utils/zmq_helpers.py` — `poll_and_drain` (L134–148).
 - **Behavior:** the router main loop is `poll_and_drain(poller, 50, …)` then `_drain_replies()`. Worker threads deposit completed replies into a plain `queue.Queue`; nothing wakes the ZMQ poller when a reply arrives. Sequence for a lone client (the sequencer): request arrives → poll wakes → dispatched to the device worker → main loop re-enters `poll(50 ms)` → worker finishes the device RPC in ~1–20 ms → reply sits in the queue until the 50 ms poll expires → reply sent.
@@ -78,6 +79,24 @@ Data handling (HDF writer with background flush thread, Influx with background H
 - **Risks/assumptions:** minimal; keep the queue as the data channel and use inproc only as a doorbell to avoid message-ordering questions.
 - **Hardware testing:** not required.
 - **Measurement:** client-side round-trip time of a no-op command (`status` or `get`) through the router, idle system: expect a ~50 ms floor today, ~2–5 ms after the fix. This single number validates the biggest per-shot win.
+
+**Resolution (implemented):** The thread→loop reply handoff now has an inproc doorbell so the poller wakes as soon as a reply is ready, instead of on the next 50 ms poll expiry.
+
+- **Doorbell channel.** `DeviceRouter` owns a unique inproc endpoint (`inproc://router-reply-doorbell-<uuid>`) and binds the `PULL` end on the main thread in `run()` — before any worker is created (workers spawn lazily inside the loop), so a worker's `connect` can never race the `bind` (inproc requires bind-before-connect). The `PULL` is registered in the poller and drained by `_drain_doorbell`.
+- **Worker side.** `_BaseWorker._enqueue_reply` now calls `_ring_doorbell()` right after putting the `_ReplyItem` on `_reply_queue`. `_ring_doorbell` lazily builds a `PUSH` socket **on the worker's own thread** (ZMQ sockets are not thread-safe; the socket is created, used, and closed solely there — preserving the F1 invariant) with `LINGER=0`, and sends an empty frame `NOBLOCK`. Every worker constructor (`_DeviceWorker`, `_ProcessWorker`, `_MirroredDeviceWorker`, `_ManagerWorker`) forwards the router's `doorbell_endpoint`; each closes its `PUSH` in its `run()` teardown (`_ManagerWorker.run` gained a `try/finally` to do so).
+- **Data path unchanged / no ordering risk.** The doorbell is a pure *signal* — the reply payload still travels on `_reply_queue`, and the main loop still calls `_drain_replies()` every iteration. So the empty-frame send is strictly best-effort: if the `PUSH` HWM is full or the send fails, or the doorbell endpoint is absent, the worst case is simply the old 50 ms-quantized latency for that one reply, never a lost or misordered reply. Multiple rings coalesce — one `_drain_doorbell` clears however many frames arrived, so the loop cannot busy-spin.
+- **Result:** for the sequential-sequencer (lone-client) case the ~50 ms per-command scheduling floor collapses to the wake-up latency (sub-millisecond in practice); a 1 000-step `set`/`call` scan sheds ~30–50 s of pure poll quantization.
+- **Tests:** `tests/test_device_router_reply_doorbell.py` — enqueuing a reply makes the `PULL` readable well inside the old 50 ms floor (poller wakes instead of timing out); the reply rides `_reply_queue` while the doorbell frame is empty; many rings drain fully to `Again` (no spin); with no doorbell endpoint the reply still enqueues.
+
+**Post-fix code review (8-angle) — outcome.** Correctness, altitude, and conventions passes came back clean; the `AGENTS.md` gates were re-checked against the change:
+
+- `ruff check src tests examples` passes; the new test is `TestCase`-based and is picked up by the CI `unittest discover` runner (not just pytest).
+- `mypy src/experiment_control`: the changed file `device_router.py` has **zero** type errors — the annotations added by this fix introduce none.
+- Wire contracts unchanged: the doorbell is a purely internal inproc signal; the `manager.command` topic, response envelope, and all downstream-importable symbols are untouched.
+- **Applied:** removed a redundant `setsockopt(zmq.SNDTIMEO, 0)` on the doorbell `PUSH` — the send already passes `zmq.NOBLOCK`, so the timeout had no effect.
+- **Not fixed (consistent with existing house style, no action taken):** the small `_close_*` socket helpers duplicate a pattern already repeated ~6× in this file; per-subclass `_close_doorbell` teardown mirrors the existing per-subclass `_stop_event_publisher` convention.
+
+**Deferred issue surfaced during review (outside F2 scope):** `mypy` baseline has regressed. `AGENTS.md` documents 2 known errors (as of 2026-06-18), but the tree now reports **9** errors in 5 files — `_manager/request_routing.py:67` (`_route_manager_ping` attr-defined), `_manager/rpc_calls.py:335` (`_ingest_chunk_ready` attr-defined), `processes/hdf_writer.py:3972/3975/3979` (`Any | None` assignment/arg-type), `manager.py:2046/2095` (`_telemetry_last_recv_mono` attr-defined), plus the 2 documented baseline errors (`manager_network.py:153`, `manager.py:424`). None are in `device_router.py` (unrelated to F2), but the "do not regress mypy" gate is already red and should be triaged separately.
 
 ### F3 — Blocking `manager.command` audit publish on the command reply path
 
@@ -335,7 +354,7 @@ Existing signals are good (driver `loop_lag_s`, `manager.loop_stall`, pump timin
 
 | Rank | Fix | Benefit | Implementation risk | Hardware validation |
 |---|---|---|---|---|
-| 1 | F2 router reply wake-up | Very high (−30–50 ms every command) | Low (inproc doorbell) | No |
+| 1 | F2 router reply wake-up — ✅ **DONE** (inproc doorbell) | Very high (−30–50 ms every command) | Low (inproc doorbell) | No |
 | 2 | F3 audit publish off critical path — ✅ **DONE** (`fix/f3-async-audit-publish`) | High (decouples devices from Manager health) | Low | No |
 | 3 | F1 thread-guard the SUB pump | High (stability) | Very low | No |
 | 4 | F4 auto-reconnect → lifecycle executor | High when enabled | Low-medium | Yes (unplug tests) |
