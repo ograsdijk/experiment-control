@@ -434,6 +434,33 @@ class SequencerRuntime:
         if len(self._analysis_outputs) > 512:
             del self._analysis_outputs[0 : len(self._analysis_outputs) - 512]
 
+    def next_poll_timeout_ms(self, ceiling_ms: int = 50, floor_ms: int = 1) -> int:
+        """Time (in ms) until the next thing this runtime needs to act on.
+
+        The outer process loop (`sequencer.py: run()`) blocks on an RPC/telemetry
+        poll between ticks. If a `sleep` step or `wait_until` sample is due sooner
+        than the fixed poll ceiling, using the ceiling as the poll timeout would
+        quantize that deadline onto the poll cadence (F15). Report the earliest
+        of any pending `_sleep_until` deadline or `_wait_state.next_sample_t`,
+        clamped to `[floor_ms, ceiling_ms]`, so the caller can wake up exactly
+        when needed instead of waiting out the full ceiling.
+
+        When nothing is pending (no active sleep/wait), returns `ceiling_ms`
+        unchanged so RPC responsiveness for pause/stop/status doesn't regress.
+        """
+        if self._state != "RUNNING":
+            return ceiling_ms
+        deadlines = []
+        if self._sleep_until is not None:
+            deadlines.append(self._sleep_until)
+        if self._wait_state is not None:
+            deadlines.append(self._wait_state.next_sample_t)
+        if not deadlines:
+            return ceiling_ms
+        remaining_s = min(deadlines) - time.monotonic()
+        remaining_ms = int(math.ceil(remaining_s * 1000.0))
+        return max(floor_ms, min(ceiling_ms, remaining_ms))
+
     def tick(self) -> None:
         if self._state != "RUNNING":
             return

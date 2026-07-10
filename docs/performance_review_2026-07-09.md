@@ -42,7 +42,7 @@ Data handling (HDF writer with background flush thread, Influx with background H
 | F12 | Medium | `processes/stream_analysis.py:4788` | Fits run inline in the SUB drain loop | Slow fit → SUB backlog → dropped chunk descriptors | Offload fits to a worker; keep drain hot |
 | F13 | Medium | `shm/shm_ring.py:208, 296-342` | Extra full copy per SHM write; reader lacks post-copy seq re-check | Doubled memory bandwidth on streams; rare torn read on ring overrun | Write via numpy view; re-check `seq_end` after copy |
 | F14 | Medium | `_manager/device_routing.py:61-101` | Manager-side `type:"command"` route blocks main loop (1.5 s) | Latent: any direct internal-RPC command stalls the Manager | Route through lifecycle executor or reject with redirect |
-| F15 | Low-Med | `sequencer/sequencer.py:2952` | Fixed 50 ms poll quantizes sleeps and wait_until sampling | `sleep: 0.01` becomes ~50 ms; jitter per shot | Compute poll timeout from next deadline |
+| F15 | Low-Med | ✅ **FIXED** — `sequencer/sequencer.py:2952`, `sequencer/runtime.py` | Fixed 50 ms poll quantizes sleeps and wait_until sampling | `sleep: 0.01` becomes ~50 ms; jitter per shot | Poll timeout now computed from `SequencerRuntime.next_poll_timeout_ms()` (next sleep/wait deadline, capped at 50 ms) |
 | F16 | Low-Med | `_driver/runner.py:930`, `drivers/linien_driver.py:30` | Vendor `connect()` runs inline in REP handler with no driver-side timeout | Slow connect (SSH/rpyc) stops heartbeats → spurious demotion; RPC timeout races real success | Document/bound connect; raise per-device connect timeouts |
 | F17 | Low | `manager.py:1286` | SUB connects to dead driver PUB endpoints never disconnected | Slow accumulation of reconnecting endpoints over many restarts | Disconnect on driver exit |
 | F18 | Info | various | Positive: bounded caches, drop counters, loop-stall events, journal batching | — | Keep |
@@ -262,11 +262,19 @@ Data handling (HDF writer with background flush thread, Influx with background H
 
 ### F15 — Sequencer sleep/wait quantization (50 ms)
 
+- **Status:** ✅ **FIXED**. See *Resolution* below.
 - **Severity:** Low-Medium. **Confidence:** Confirmed.
 - **File:** `sequencer/sequencer.py` `run` L2952 (`_poll_and_drain(50)` fixed); `runtime.py` `_sleep_until`/`_wait_state` checked only per tick.
 - **Impact:** every `sleep` and every `wait_until` sample lands on a 50 ms grid: `sleep: 0.005` costs ~50 ms; `wait_until(every_s: 0.02)` samples at 50 ms. Directly inflates shot period for fast experiments; adds jitter.
 - **Recommendation:** compute the poll timeout from `min(next sleep deadline, next wait sample, 50 ms)` — the runtime already knows these.
 - **Measurement:** measured vs requested sleep durations in a test sequence.
+
+**Resolution (implemented):** the outer `run()` poll timeout is now computed from the runtime's own pending deadlines instead of a hardcoded constant.
+
+- **`SequencerRuntime.next_poll_timeout_ms(ceiling_ms=50, floor_ms=1)`** (`sequencer/runtime.py`): returns the time (ms) until the next thing the runtime needs to act on — the earliest of a pending `_sleep_until` deadline or a pending `_wait_state.next_sample_t` sample time — clamped to `[floor_ms, ceiling_ms]`. When the runtime isn't `RUNNING`, or when neither a sleep nor a wait is pending, it returns `ceiling_ms` unchanged, so RPC/control-plane responsiveness (pause/stop/status) for idle or non-sleep/wait ticks is exactly what it was before.
+- **`SequencerProcess.run()`** (`sequencer/sequencer.py:2951-2955`): each outer-loop iteration now calls `poll_timeout_ms = self._runtime.next_poll_timeout_ms(ceiling_ms=50)` and passes that to `_poll_and_drain(poll_timeout_ms)` instead of the fixed `_poll_and_drain(50)`. 50 ms remains the *ceiling* (unchanged worst case for RPC latency), not the floor.
+- **Scope.** This only changes the poll timeout used *between* ticks; `tick()` itself and its per-call step budget are untouched (that's F5's concern, landing separately).
+- **Tests:** `tests/test_sequencer_poll_timeout.py` — unit coverage of `next_poll_timeout_ms` (no-pending falls back to the ceiling; non-`RUNNING` state falls back to the ceiling even with a pending sleep; a pending sleep/wait reports the remaining time, clamped at both the floor and the ceiling; the earlier of a pending sleep vs. wait deadline wins), plus integration coverage driving `SequencerRuntime` through a harness that mimics `run()`'s poll-then-tick loop: a `sleep: 0.005` step completes in single-digit milliseconds (well under the old 50 ms floor), a `wait_until(every_s: 0.02)` step samples at roughly the requested 20 ms cadence (not 50 ms), and a sequence of plain `set`/`call` steps (no sleep/wait ever pending) observes the poll timeout staying at the unchanged 50 ms ceiling on every iteration.
 
 ### F16 — Driver `connect_device` unbounded; heartbeat outage during connect
 
