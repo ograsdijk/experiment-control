@@ -69,6 +69,19 @@ steps:
 
 ## Step types
 
+Every step kind accepts an optional `disabled: true` sibling key to skip it
+during execution, preflight validation, and progress estimation without
+deleting it:
+```yaml
+- call:
+    device: yag
+    action: fire
+    params: {}
+  disabled: true
+```
+Omitting `disabled` (or setting it to `false`) runs the step normally; this
+is the default, so existing sequence files are unaffected.
+
 ### `call`
 Call a device or process RPC action.
 ```yaml

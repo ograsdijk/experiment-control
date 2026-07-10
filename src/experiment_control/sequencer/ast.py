@@ -26,6 +26,7 @@ class CallStep:
     # federated) PROCESS RPC namespace (e.g. mw.retune) via manager.processes.rpc
     # instead of a device command.
     process: str | None = None
+    disabled: bool = False
 
 
 @dataclass(frozen=True)
@@ -33,16 +34,19 @@ class SetStep:
     device: str
     name: str
     value: Any
+    disabled: bool = False
 
 
 @dataclass(frozen=True)
 class SleepStep:
     seconds: Any
+    disabled: bool = False
 
 
 @dataclass(frozen=True)
 class WaitUntilStep:
     raw: dict[str, Any]
+    disabled: bool = False
 
 
 @dataclass(frozen=True)
@@ -50,12 +54,14 @@ class ForStep:
     bind: dict[str, str]
     in_expr: Any
     body: list["Step"]
+    disabled: bool = False
 
 
 @dataclass(frozen=True)
 class RepeatStep:
     times: Any
     body: list["Step"]
+    disabled: bool = False
 
 
 @dataclass(frozen=True)
@@ -63,51 +69,60 @@ class IfStep:
     condition: Any
     then_steps: list["Step"]
     else_steps: list["Step"] | None = None
+    disabled: bool = False
 
 
 @dataclass(frozen=True)
 class WhileStep:
     condition: Any
     body: list["Step"]
+    disabled: bool = False
 
 
 @dataclass(frozen=True)
 class AtomicStep:
     name: str | None
     body: list["Step"]
+    disabled: bool = False
 
 
 @dataclass(frozen=True)
 class PauseStep:
     reason: str | None
+    disabled: bool = False
 
 
 @dataclass(frozen=True)
 class ParallelStep:
     body: list["Step"]
+    disabled: bool = False
 
 
 @dataclass(frozen=True)
 class TryStep:
     body: list["Step"]
     finally_steps: list["Step"]
+    disabled: bool = False
 
 
 @dataclass(frozen=True)
 class AssignStep:
     values: dict[str, Any]
+    disabled: bool = False
 
 
 @dataclass(frozen=True)
 class SetContextStep:
     streams: Any
     fields: dict[str, Any]
+    disabled: bool = False
 
 
 @dataclass(frozen=True)
 class UseStep:
     sequence_id: str
     args: dict[str, Any] | None = None
+    disabled: bool = False
 
 
 @dataclass(frozen=True)
@@ -122,6 +137,7 @@ class AdaptiveStep:
     stopping: dict[str, Any] | None = None
     constraints: list[Any] | None = None
     fail_on_trial_error: bool = False
+    disabled: bool = False
 
 
 Step = (
@@ -161,8 +177,13 @@ def _parse_steps(raw: Any) -> list[Step]:
     return [_parse_step(item) for item in items]
 
 
+def _parse_disabled(obj: dict[str, Any]) -> bool:
+    return bool(obj.get("disabled", False))
+
+
 def _parse_step(raw: Any) -> Step:
     obj = _require_dict(raw, name="step")
+    disabled = _parse_disabled(obj)
     if "call" in obj:
         call = _require_dict(obj["call"], name="call")
         device = str(call.get("device", ""))
@@ -192,6 +213,7 @@ def _parse_step(raw: Any) -> Step:
             extract=extract,
             assign=assign,
             process=process or None,
+            disabled=disabled,
         )
     if "set" in obj:
         val = _require_dict(obj["set"], name="set")
@@ -199,13 +221,13 @@ def _parse_step(raw: Any) -> Step:
         name = str(val.get("name", ""))
         if not device or not name:
             raise TypeError("set.device and set.name are required")
-        return SetStep(device=device, name=name, value=val.get("value"))
+        return SetStep(device=device, name=name, value=val.get("value"), disabled=disabled)
     if "sleep" in obj:
         secs = obj["sleep"]
-        return SleepStep(seconds=secs)
+        return SleepStep(seconds=secs, disabled=disabled)
     if "wait_until" in obj:
         w = _require_dict(obj["wait_until"], name="wait_until")
-        return WaitUntilStep(raw=w)
+        return WaitUntilStep(raw=w, disabled=disabled)
     if "for" in obj:
         f = _require_dict(obj["for"], name="for")
         bind_raw = f.get("bind")
@@ -228,60 +250,60 @@ def _parse_step(raw: Any) -> Step:
             raise TypeError("for.bind must not be empty")
         in_expr = f.get("in")
         body = _parse_steps(f.get("do", []))
-        return ForStep(bind=bind, in_expr=in_expr, body=body)
+        return ForStep(bind=bind, in_expr=in_expr, body=body, disabled=disabled)
     if "repeat" in obj:
         rep = _require_dict(obj["repeat"], name="repeat")
         times = rep.get("times", 1)
         body = _parse_steps(rep.get("do", []))
-        return RepeatStep(times=times, body=body)
+        return RepeatStep(times=times, body=body, disabled=disabled)
     if "if" in obj:
         cond = _require_dict(obj["if"], name="if")
         condition = cond.get("condition")
         then_steps = _parse_steps(cond.get("then", []))
         else_steps_raw = cond.get("else")
         else_steps = _parse_steps(else_steps_raw) if else_steps_raw is not None else None
-        return IfStep(condition=condition, then_steps=then_steps, else_steps=else_steps)
+        return IfStep(condition=condition, then_steps=then_steps, else_steps=else_steps, disabled=disabled)
     if "while" in obj:
         w = _require_dict(obj["while"], name="while")
         if "condition" not in w:
             raise TypeError("while.condition is required")
         condition = w.get("condition")
         body = _parse_steps(w.get("do", []))
-        return WhileStep(condition=condition, body=body)
+        return WhileStep(condition=condition, body=body, disabled=disabled)
     if "atomic" in obj:
         atom = _require_dict(obj["atomic"], name="atomic")
         atomic_name = atom.get("name")
         body = _parse_steps(atom.get("do", []))
-        return AtomicStep(name=str(atomic_name) if atomic_name is not None else None, body=body)
+        return AtomicStep(name=str(atomic_name) if atomic_name is not None else None, body=body, disabled=disabled)
     if "pause" in obj:
         pause = obj["pause"]
         if isinstance(pause, dict):
             reason = pause.get("reason")
         else:
             reason = pause
-        return PauseStep(reason=str(reason) if reason is not None else None)
+        return PauseStep(reason=str(reason) if reason is not None else None, disabled=disabled)
     if "parallel" in obj:
         par = _require_dict(obj["parallel"], name="parallel")
         body = _parse_steps(par.get("do", []))
-        return ParallelStep(body=body)
+        return ParallelStep(body=body, disabled=disabled)
     if "try" in obj:
         tr = _require_dict(obj["try"], name="try")
         if "do" not in tr:
             raise TypeError("try.do is required")
         body = _parse_steps(tr.get("do", []))
         finally_steps = _parse_steps(tr.get("finally", []))
-        return TryStep(body=body, finally_steps=finally_steps)
+        return TryStep(body=body, finally_steps=finally_steps, disabled=disabled)
     if "assign" in obj:
         values = obj.get("assign")
         if not isinstance(values, dict):
             raise TypeError("assign must be a dict")
-        return AssignStep(values=values)
+        return AssignStep(values=values, disabled=disabled)
     if "set_context" in obj:
         sc = _require_dict(obj["set_context"], name="set_context")
         fields = sc.get("fields", {}) or {}
         if not isinstance(fields, dict):
             raise TypeError("set_context.fields must be a dict")
-        return SetContextStep(streams=sc.get("streams", []), fields=fields)
+        return SetContextStep(streams=sc.get("streams", []), fields=fields, disabled=disabled)
     if "use" in obj:
         raw_use = obj.get("use")
         if isinstance(raw_use, str):
@@ -300,7 +322,7 @@ def _parse_step(raw: Any) -> Step:
             raise TypeError("use must be a string id or a dict")
         if not sequence_id:
             raise TypeError("use.id is required")
-        return UseStep(sequence_id=sequence_id, args=args)
+        return UseStep(sequence_id=sequence_id, args=args, disabled=disabled)
     if "adaptive" in obj:
         raw_step = _require_dict(obj["adaptive"], name="adaptive")
         step_id = str(raw_step.get("id", "")).strip()
@@ -342,6 +364,7 @@ def _parse_step(raw: Any) -> Step:
             stopping=dict(stopping) if isinstance(stopping, dict) else None,
             constraints=list(constraints) if isinstance(constraints, list) else None,
             fail_on_trial_error=bool(raw_step.get("fail_on_trial_error", False)),
+            disabled=disabled,
         )
 
     raise TypeError(f"Unknown step type: {list(obj.keys())}")

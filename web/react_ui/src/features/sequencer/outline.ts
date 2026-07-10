@@ -30,6 +30,7 @@ import {
   namedGroups,
   normalizeScan2d,
   readStep,
+  readStepDisabled,
   scalarField,
   sectionEntries,
   seqLength,
@@ -630,6 +631,7 @@ function finalizeSummaries(
       node.forDetail = forDetail;
       node.repeatDetail = repeatDetail;
       node.adaptiveDetail = adaptiveDetail;
+    node.disabled = readStepDisabled(node.snippet);
     node.summary = deriveSummary(node, flatNode.inlineRemainder);
   }
 }
@@ -738,6 +740,7 @@ export function buildSequencerStepOutline(
         lines.slice(flatNode.startIndex, flatNode.endIndex + 1),
         flatNode.indent
       ),
+      disabled: false,
       children: [],
       callDetail: null,
       sleepDetail: null,

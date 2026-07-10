@@ -6,6 +6,8 @@ import {
   IconChevronDown,
   IconChevronRight,
   IconCopy,
+  IconEye,
+  IconEyeOff,
   IconPlus,
   IconTrash,
 } from "@tabler/icons-react";
@@ -101,6 +103,7 @@ type OutlineRowProps = {
   onToggleCollapse: (id: string) => void;
   onDuplicate: (node: SequencerStepOutlineNode) => void;
   onDelete: (node: SequencerStepOutlineNode) => void;
+  onToggleEnabled: (node: SequencerStepOutlineNode) => void;
   onInsertBelow: (node: SequencerStepOutlineNode, kind: BasicSequencerStepTemplate) => void;
   onInsertChild: (
     node: SequencerStepOutlineNode,
@@ -121,6 +124,7 @@ function OutlineRow({
   onToggleCollapse,
   onDuplicate,
   onDelete,
+  onToggleEnabled,
   onInsertBelow,
   onInsertChild,
   siblingInfoById,
@@ -170,6 +174,7 @@ function OutlineRow({
             background: selected ? "rgba(59, 130, 246, 0.08)" : "transparent",
             textAlign: "left",
             cursor: "pointer",
+            opacity: node.disabled ? 0.55 : 1,
           }}
         >
           <Stack gap={4}>
@@ -177,6 +182,11 @@ function OutlineRow({
               <Badge size="xs" variant="light" color={kindColor(node.kind)}>
                 {node.kind}
               </Badge>
+              {node.disabled ? (
+                <Badge size="xs" variant="outline" color="gray">
+                  disabled
+                </Badge>
+              ) : null}
               {node.branchLabel ? (
                 <Badge size="xs" variant="outline" color="gray">
                   {node.branchLabel === "finally"
@@ -253,6 +263,15 @@ function OutlineRow({
               </Menu.Dropdown>
             </Menu>
           ) : null}
+          <ActionIcon
+            size="sm"
+            variant="subtle"
+            color="gray"
+            aria-label={node.disabled ? "Enable step" : "Disable step"}
+            onClick={(event) => { event.stopPropagation(); onToggleEnabled(node); }}
+          >
+            {node.disabled ? <IconEyeOff size={14} /> : <IconEye size={14} />}
+          </ActionIcon>
           <ActionIcon size="sm" variant="subtle" color="gray" aria-label="Duplicate step" onClick={(event) => { event.stopPropagation(); onDuplicate(node); }}>
             <IconCopy size={14} />
           </ActionIcon>
@@ -273,6 +292,7 @@ function OutlineRow({
             onToggleCollapse={onToggleCollapse}
             onDuplicate={onDuplicate}
             onDelete={onDelete}
+            onToggleEnabled={onToggleEnabled}
             onInsertBelow={onInsertBelow}
             onInsertChild={onInsertChild}
             siblingInfoById={siblingInfoById}
@@ -292,6 +312,7 @@ type Props = {
   onToggleCollapse: (id: string) => void;
   onDuplicate: (node: SequencerStepOutlineNode) => void;
   onDelete: (node: SequencerStepOutlineNode) => void;
+  onToggleEnabled: (node: SequencerStepOutlineNode) => void;
   onInsertBelow: (node: SequencerStepOutlineNode, kind: BasicSequencerStepTemplate) => void;
   onInsertChild: (
     node: SequencerStepOutlineNode,
@@ -312,6 +333,7 @@ export function SequencerStepTree({
   onToggleCollapse,
   onDuplicate,
   onDelete,
+  onToggleEnabled,
   onInsertBelow,
   onInsertChild,
   siblingInfoById,
@@ -368,6 +390,7 @@ export function SequencerStepTree({
                 onToggleCollapse={onToggleCollapse}
                 onDuplicate={onDuplicate}
                 onDelete={onDelete}
+                onToggleEnabled={onToggleEnabled}
                 onInsertBelow={onInsertBelow}
                 onInsertChild={onInsertChild}
                 siblingInfoById={siblingInfoById}

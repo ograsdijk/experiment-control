@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { applyEditedForStep } from "./step_for";
 import { applyEditedCallStep } from "./step_call";
 import { applyEditedSetContextStep, applyEditedSetStep } from "./step_control";
+import { toggleStepEnabled } from "./tree_ops";
 import {
   buildSequencerStepOutline,
   flattenSequencerStepOutline,
@@ -365,5 +366,69 @@ describe("for-loop round-trip with inline flow maps (spb_raster_scan shapes)", (
     const reparsed = nodeByKind(next, "set_context").setContextDetail;
     expect(reparsed?.streams).toEqual([{ device: "pxie5171", stream: "waveforms" }]);
     expect(reparsed?.fields).toEqual([{ name: "freq_hz", value: '"${f}"' }]);
+  });
+});
+
+describe("toggleStepEnabled", () => {
+  it("adds a disabled: true sibling to an enabled step and marks the outline node disabled", () => {
+    const yaml = [
+      "version: 1",
+      "steps:",
+      "  - call: {device: dev, action: do_thing, params: {}}",
+      "  - sleep: 0.1",
+      "",
+    ].join("\n");
+
+    const node = nodeByKind(yaml, "call");
+    expect(node.disabled).toBe(false);
+
+    const next = toggleStepEnabled(yaml, node);
+    expect(next).toContain("disabled: true");
+
+    const reparsed = nodeByKind(next, "call");
+    expect(reparsed.disabled).toBe(true);
+    // Sibling step is untouched.
+    expect(nodeByKind(next, "sleep").disabled).toBe(false);
+  });
+
+  it("removes the disabled: true sibling when toggling a disabled step back on", () => {
+    const yaml = [
+      "version: 1",
+      "steps:",
+      "  - call: {device: dev, action: do_thing, params: {}}",
+      "    disabled: true",
+      "",
+    ].join("\n");
+
+    const node = nodeByKind(yaml, "call");
+    expect(node.disabled).toBe(true);
+
+    const next = toggleStepEnabled(yaml, node);
+    expect(next).not.toContain("disabled: true");
+
+    const reparsed = nodeByKind(next, "call");
+    expect(reparsed.disabled).toBe(false);
+  });
+
+  it("toggles a nested step without disturbing its parent or siblings", () => {
+    const yaml = [
+      "version: 1",
+      "steps:",
+      "  - for:",
+      "      bind: value",
+      "      in: { gen: { values: [1, 2] } }",
+      "      do:",
+      "        - sleep: 0.1",
+      "        - assign: {x: 1}",
+      "",
+    ].join("\n");
+
+    const node = nodeByKind(yaml, "sleep");
+    const next = toggleStepEnabled(yaml, node);
+    const reparsed = nodeByKind(next, "sleep");
+    expect(reparsed.disabled).toBe(true);
+    expect(nodeByKind(next, "assign").disabled).toBe(false);
+    expect(nodeByKind(next, "for").disabled).toBe(false);
+    expect(next).toContain("- assign: {x: 1}");
   });
 });

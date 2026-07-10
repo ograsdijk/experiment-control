@@ -774,6 +774,8 @@ class SequencerRuntime:
         return _StepEstimate(total)
 
     def _estimate_step(self, step: Step, env: dict[str, Any]) -> _StepEstimate:
+        if getattr(step, "disabled", False):
+            return _StepEstimate(0)
         if isinstance(
             step,
             (
@@ -965,6 +967,8 @@ class SequencerRuntime:
                     continue
                 step = frame.steps[frame.index]
                 frame.index += 1
+                if getattr(step, "disabled", False):
+                    continue
                 return step
             if isinstance(frame, _ForFrame):
                 if frame.index >= len(frame.records):
@@ -1040,6 +1044,8 @@ class SequencerRuntime:
                         continue
                     step = frame.steps[frame.index]
                     frame.index += 1
+                    if getattr(step, "disabled", False):
+                        continue
                     return step
                 self._stack.pop()
                 if frame.on_exit:

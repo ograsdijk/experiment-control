@@ -86,6 +86,7 @@ export type SequencerStepOutlineNode = {
   branchLabel: "then" | "else" | "finally" | null;
   summary: string | null;
   snippet: string;
+  disabled: boolean;
   children: SequencerStepOutlineNode[];
   callDetail: SequencerCallDetail | null;
   sleepDetail: SequencerSleepDetail | null;
