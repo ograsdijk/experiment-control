@@ -40,7 +40,7 @@ Data handling (HDF writer with background flush thread, Influx with background H
 | F10 | Medium | `federation/hub.py:1138-1167` | Federation forward blocks main loop up to peer timeout; new DEALER per call | Slow peer stalls Manager; per-command connect cost | Per-peer worker (like mirrored routes in the router) |
 | F11 | Medium | `processes/influx_writer.py:1038-1235` | One HTTP thread for all destinations; no keep-alive | Slow destination (5 s timeout) delays other destinations' batches | Per-destination worker; reuse connections |
 | F12 | Medium | `processes/stream_analysis.py:4788` | Fits run inline in the SUB drain loop | Slow fit → SUB backlog → dropped chunk descriptors | Offload fits to a worker; keep drain hot |
-| F13 | Medium | `shm/shm_ring.py:208, 296-342` | Extra full copy per SHM write; reader lacks post-copy seq re-check | Doubled memory bandwidth on streams; rare torn read on ring overrun | Write via numpy view; re-check `seq_end` after copy |
+| F13 | Medium | ✅ **FIXED** — `shm/shm_ring.py` | Extra full copy per SHM write; reader lacked post-copy seq re-check | Doubled memory bandwidth on streams; rare torn read on ring overrun | Direct NumPy destination view plus pre/post sequence validation |
 | F14 | Medium | `_manager/device_routing.py:61-101` | Manager-side `type:"command"` route blocks main loop (1.5 s) | Latent: any direct internal-RPC command stalls the Manager | Route through lifecycle executor or reject with redirect |
 | F15 | Low-Med | `sequencer/sequencer.py:2952` | Fixed 50 ms poll quantizes sleeps and wait_until sampling | `sleep: 0.01` becomes ~50 ms; jitter per shot | Compute poll timeout from next deadline |
 | F16 | Low-Med | `_driver/runner.py:930`, `drivers/linien_driver.py:30` | Vendor `connect()` runs inline in REP handler with no driver-side timeout | Slow connect (SSH/rpyc) stops heartbeats → spurious demotion; RPC timeout races real success | Document/bound connect; raise per-device connect timeouts |
@@ -249,12 +249,26 @@ Data handling (HDF writer with background flush thread, Influx with background H
 
 ### F13 — SHM ring: extra copy per write; seqlock gap on read
 
+- **Status:** ✅ **FIXED**. See *Resolution* below.
 - **Severity:** Medium (perf) / Low (correctness, rare). **Confidence:** Confirmed.
 - **File:** `src/experiment_control/shm/shm_ring.py` — `ShmRingWriter.write` L208 (`arr.tobytes(order="C")` allocates + copies before the memoryview copy); `ShmRingReader.read_event`/`read_events` (L296–342, L356–377) read `seq_begin`/`seq_end` **before** copying the payload and never re-validate after.
 - **Impact:** (a) every published frame pays a duplicate full-buffer copy — for large traces this doubles memory bandwidth in the driver's timing-sensitive loop; (b) if the writer laps the ring mid-copy (reader slower than producer for a full ring cycle), the reader returns a torn payload silently attributed to the old seq. Low probability with adequate `ring_slots`, but silent.
 - **Recommendation:** write via `np.frombuffer(self._buf, dtype, offset=payload_start, count=…)[…] = arr` (no intermediate bytes); in readers, re-read `seq_begin`/`seq_end` after copying and discard on mismatch.
 - **Hardware testing:** no.
 - **Measurement:** driver publish-latency per frame (t before/after `publish_stream`) for a large dummy trace stream.
+
+**Resolution (implemented):** SHM writes now copy directly from the source array into a correctly shaped NumPy view over the destination slot, avoiding the intermediate `arr.tobytes()` allocation and copy while preserving multidimensional, scalar-record, and non-contiguous inputs. Object-containing dtypes are rejected because raw cross-process SHM cannot safely carry Python object pointers. Stream configuration also validates that generated record dtypes remain packed rather than aligned; downstream consumers operate on named fields and do not depend on padding bytes. Readers now validate the slot sequence before snapshotting its metadata and payload and re-read both sequence markers afterward; an overwritten slot is discarded instead of returning a torn frame under the old sequence. The public descriptor and payload contracts are unchanged, so HDF recording, live plotting, and stream analysis continue to consume owned `bytes` snapshots and treat an overrun as a dropped sequence rather than corrupted data. `tests/test_shm_ring_consistency.py` covers multidimensional and structured-record round trips plus deterministic overwrite-during-copy races for both `read_event()` and `read_events()`. The focused HDF/plotting/analysis pipeline group passes (125 tests), and full `unittest discover` passes (886 tests, 1 skipped).
+
+**Architecture limitation:** the sequence fields use ordinary Python memory operations and therefore rely on the strong memory ordering of the project's current x86-64 deployments. Formal ARM support would require aligned cross-process acquire/release atomics and a new layout version; the deferred design and rollout constraints are recorded in [`shm_ring_arm_memory_ordering.md`](shm_ring_arm_memory_ordering.md).
+
+End-to-end writer benchmarks used the real SHM layout and complete slot bookkeeping, alternating the old and new implementations across timing rounds. Results are environment-dependent; they show that the setup cost can outweigh the copy saving for tiny payloads, while avoiding the staging allocation becomes material for larger frames:
+
+| Dtype | Shape | Payload | Old staging copy | Direct view | Reduction |
+|---|---:|---:|---:|---:|---:|
+| `float64` | `(5, 10_000)` | 400 KB | 13.51 µs | 12.94 µs | 4.2% |
+| `int16` | `(5, 40_000)` | 400 KB | 9.91 µs | 6.93 µs | 30.0% |
+| `int16` | `(5, 80_000)` | 800 KB | 46.73 µs | 14.86 µs | 68.2% |
+| `float64` | `(5, 40_000)` | 1.6 MB | 252.36 µs | 59.84 µs | 76.3% |
 
 ### F14 — Manager inline `type:"command"` route (latent)
 
