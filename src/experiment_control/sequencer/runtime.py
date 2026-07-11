@@ -139,6 +139,7 @@ class ParallelBranchPlan:
     env: dict[str, Any]
     path: str
     atomic: bool = False
+    repeat_count: int | None = None
 
 
 @dataclass(frozen=True)
@@ -150,25 +151,44 @@ class ParallelBranchResult:
     path: str | None = None
 
 
-def parallel_branch_operations(step: Step) -> tuple[ParallelBranchOperation, ...]:
-    """Return the operations for one supported parallel branch."""
+def parallel_repeat_count(step: RepeatStep, env: dict[str, Any]) -> int:
+    """Render and validate one restricted parallel repeat count."""
+    try:
+        times = int(render_templates(step.times, env))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("parallel repeat.times must render to an integer") from exc
+    if times <= 0:
+        raise ValueError("parallel repeat.times must be greater than zero")
+    return times
+
+
+def parallel_branch_operations(
+    step: Step, env: dict[str, Any] | None = None
+) -> tuple[ParallelBranchOperation, ...]:
+    """Return the body operations for one supported parallel branch."""
     if isinstance(step, (CallStep, SetStep)):
         return (ParallelBranchOperation(source_index=None, step=step),)
-    if isinstance(step, AtomicStep):
+    if isinstance(step, (AtomicStep, RepeatStep)):
+        if isinstance(step, RepeatStep):
+            if env is None:
+                raise ValueError("parallel repeat branches require a render environment")
+            parallel_repeat_count(step, env)
+        branch_kind = "repeat" if isinstance(step, RepeatStep) else "atomic"
         operations: list[ParallelBranchOperation] = []
         for source_index, child in enumerate(step.body):
             if getattr(child, "disabled", False):
                 continue
             if not isinstance(child, (CallStep, SetStep)):
                 raise ValueError(
-                    "parallel atomic branches currently support only call and set steps"
+                    f"parallel {branch_kind} branches currently support only "
+                    "call and set steps"
                 )
             operations.append(
                 ParallelBranchOperation(source_index=source_index, step=child)
             )
         return tuple(operations)
     raise ValueError(
-        "parallel branches currently support only call, set, and atomic steps"
+        "parallel branches currently support only call, set, atomic, and repeat steps"
     )
 
 
@@ -194,81 +214,87 @@ def run_parallel_branch(
     """Execute one branch sequentially against a branch-local environment."""
     env = dict(plan.env)
     outputs: dict[str, Any] = {}
-    for operation in plan.operations:
-        step = operation.step
-        operation_path = (
-            f"{plan.path}.atomic.do[{operation.source_index}]"
-            if plan.atomic
-            else plan.path
-        )
-        try:
-            if isinstance(step, SetStep):
-                device = str(render_templates(step.device, env) or "").strip()
-                if not device:
-                    raise ValueError("set.device rendered empty")
-                value = render_templates(step.value, env)
-                response = call_device(
-                    device,
-                    "set",
-                    {"name": step.name, "value": value},
+    repeat_count = plan.repeat_count or 1
+    for repeat_index in range(repeat_count):
+        for operation in plan.operations:
+            step = operation.step
+            if plan.repeat_count is not None:
+                operation_path = (
+                    f"{plan.path}.repeat.do[{operation.source_index}] "
+                    f"(iteration {repeat_index + 1}/{plan.repeat_count})"
                 )
+            elif plan.atomic:
+                operation_path = f"{plan.path}.atomic.do[{operation.source_index}]"
             else:
-                device = str(render_templates(step.device, env) or "").strip()
-                process = str(
-                    render_templates(step.process or "", env) or ""
-                ).strip()
-                action = str(render_templates(step.action, env) or "").strip()
-                if device and process:
-                    raise ValueError("call may set only one of device / process")
-                if (not device and not process) or not action:
-                    raise ValueError("call target rendered empty device/process or action")
-                params = render_templates(step.params, env)
-                if process:
-                    if call_process is None:
-                        raise RuntimeError("process calls not supported")
-                    response = call_process(process, action, params)
-                else:
-                    response = call_device(device, action, params)
-
-                if step.extract and step.assign:
-                    raise ValueError("extract and assign are mutually exclusive")
-                if step.save_as:
-                    env[step.save_as] = response
-                    outputs[step.save_as] = response
-                if step.extract:
-                    value = extract_value(
-                        response.get("result"),
-                        kind=step.extract.get("kind", "scalar"),
-                        ref=step.extract.get("ref"),
+                operation_path = plan.path
+            try:
+                if isinstance(step, SetStep):
+                    device = str(render_templates(step.device, env) or "").strip()
+                    if not device:
+                        raise ValueError("set.device rendered empty")
+                    value = render_templates(step.value, env)
+                    response = call_device(
+                        device,
+                        "set",
+                        {"name": step.name, "value": value},
                     )
-                    target = step.save_as or "value"
-                    env[target] = value
-                    outputs[target] = value
-                if step.assign:
-                    result = response.get("result")
-                    for key, spec in step.assign.items():
-                        if not isinstance(spec, dict):
-                            continue
+                else:
+                    device = str(render_templates(step.device, env) or "").strip()
+                    process = str(
+                        render_templates(step.process or "", env) or ""
+                    ).strip()
+                    action = str(render_templates(step.action, env) or "").strip()
+                    if device and process:
+                        raise ValueError("call may set only one of device / process")
+                    if (not device and not process) or not action:
+                        raise ValueError("call target rendered empty device/process or action")
+                    params = render_templates(step.params, env)
+                    if process:
+                        if call_process is None:
+                            raise RuntimeError("process calls not supported")
+                        response = call_process(process, action, params)
+                    else:
+                        response = call_device(device, action, params)
+
+                    if step.extract and step.assign:
+                        raise ValueError("extract and assign are mutually exclusive")
+                    if step.save_as:
+                        env[step.save_as] = response
+                        outputs[step.save_as] = response
+                    if step.extract:
                         value = extract_value(
-                            result,
-                            kind=spec.get("kind", "scalar"),
-                            ref=spec.get("ref"),
+                            response.get("result"),
+                            kind=step.extract.get("kind", "scalar"),
+                            ref=step.extract.get("ref"),
                         )
-                        env[key] = value
-                        outputs[key] = value
-            if not response.get("ok", False):
-                error = response.get("error")
-                if isinstance(error, dict):
-                    error = error.get("message") or error.get("code") or error
-                raise RuntimeError(str(error or "request failed"))
-        except Exception as exc:
-            return ParallelBranchResult(
-                index=plan.index,
-                ok=False,
-                outputs={},
-                error=str(exc),
-                path=operation_path,
-            )
+                        target = step.save_as or "value"
+                        env[target] = value
+                        outputs[target] = value
+                    if step.assign:
+                        result = response.get("result")
+                        for key, spec in step.assign.items():
+                            if not isinstance(spec, dict):
+                                continue
+                            value = extract_value(
+                                result,
+                                kind=spec.get("kind", "scalar"),
+                                ref=spec.get("ref"),
+                            )
+                            env[key] = value
+                            outputs[key] = value
+                if not response.get("ok", False):
+                    error = response.get("error")
+                    if isinstance(error, dict):
+                        error = error.get("message") or error.get("code") or error
+                    raise RuntimeError(str(error or "request failed"))
+            except Exception as exc:
+                return ParallelBranchResult(
+                    index=plan.index,
+                    ok=False,
+                    outputs={},
+                    error=str(exc),
+                    path=operation_path,
+                )
     return ParallelBranchResult(index=plan.index, ok=True, outputs=outputs)
 
 
@@ -1555,7 +1581,7 @@ class SequencerRuntime:
             for branch_index, branch in enumerate(step.body):
                 if getattr(branch, "disabled", False):
                     continue
-                operations = parallel_branch_operations(branch)
+                operations = parallel_branch_operations(branch, env)
                 branch_path = f"{parent_path}.parallel.do[{branch_index}]"
                 branch_outputs: set[str] = set()
                 branch_targets: set[tuple[str, str]] = set()
@@ -1614,6 +1640,11 @@ class SequencerRuntime:
                         env=dict(env),
                         path=branch_path,
                         atomic=isinstance(branch, AtomicStep),
+                        repeat_count=(
+                            parallel_repeat_count(branch, env)
+                            if isinstance(branch, RepeatStep)
+                            else None
+                        ),
                     )
                 )
         except Exception as exc:

@@ -14,6 +14,7 @@ from experiment_control.sequencer.runtime import (
     ParallelBranchPlan,
     ParallelBranchResult,
     SequencerRuntime,
+    parallel_branch_operations,
     run_parallel_branch,
 )
 from experiment_control.sequencer.sequencer import _ParallelWorkerPool
@@ -170,6 +171,140 @@ steps:
             self.assertGreaterEqual(harness.max_active, 2)
         finally:
             harness.close()
+
+    def test_repeat_branches_overlap_and_each_branch_stays_ordered(self) -> None:
+        harness = _ParallelHarness(delay_s=0.02)
+        try:
+            runtime = _runtime(
+                harness,
+                """
+version: 1
+vars: {n: 3}
+steps:
+  - parallel:
+      do:
+        - repeat:
+            times: "${n}"
+            do:
+              - call: {device: pxie, action: read_frame}
+        - repeat:
+            times: "${n}"
+            do:
+              - call: {device: fs740, action: read_timestamp}
+""",
+            )
+            _run_to_terminal(runtime)
+            self.assertEqual(runtime.state, "STOPPED")
+            self.assertGreaterEqual(harness.max_active, 2)
+            self.assertEqual(
+                [call[1] for call in harness.calls if call[0] == "pxie"],
+                ["read_frame"] * 3,
+            )
+            self.assertEqual(
+                [call[1] for call in harness.calls if call[0] == "fs740"],
+                ["read_timestamp"] * 3,
+            )
+        finally:
+            harness.close()
+
+    def test_repeat_branch_plan_size_is_independent_of_repeat_count(self) -> None:
+        spec = parse_sequence(
+            yaml.safe_load(
+                """
+version: 1
+steps:
+  - parallel:
+      do:
+        - repeat:
+            times: "${n}"
+            do:
+              - call: {device: a, action: read}
+"""
+            )
+        )
+        parallel = spec.steps[0]
+        branch = parallel.body[0]  # type: ignore[union-attr]
+        operations = parallel_branch_operations(branch, {"n": 1_000_000})
+        self.assertEqual(len(operations), 1)
+
+    def test_repeat_branch_failure_reports_iteration(self) -> None:
+        spec = parse_sequence(
+            yaml.safe_load(
+                """
+version: 1
+steps:
+  - parallel:
+      do:
+        - repeat:
+            times: 3
+            do:
+              - call: {device: a, action: read}
+"""
+            )
+        )
+        parallel = spec.steps[0]
+        branch = parallel.body[0]  # type: ignore[union-attr]
+        operations = parallel_branch_operations(branch, {})
+        calls = 0
+
+        def call_device(
+            _device: str, _action: str, _params: dict[str, Any]
+        ) -> dict[str, Any]:
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                return {"ok": False, "error": {"message": "boom"}}
+            return {"ok": True}
+
+        result = run_parallel_branch(
+            ParallelBranchPlan(
+                index=0,
+                operations=operations,
+                env={},
+                path="steps[0].parallel.do[0]",
+                repeat_count=3,
+            ),
+            call_device=call_device,
+            call_process=None,
+        )
+        self.assertFalse(result.ok)
+        self.assertIn("iteration 2/3", str(result.path))
+
+    def test_repeat_branch_rejects_unsupported_body_and_invalid_count(self) -> None:
+        cases = (
+            """
+version: 1
+steps:
+  - parallel:
+      do:
+        - repeat:
+            times: 2
+            do:
+              - sleep: 0.1
+        - call: {device: b, action: go}
+""",
+            """
+version: 1
+steps:
+  - parallel:
+      do:
+        - repeat:
+            times: 0
+            do:
+              - call: {device: a, action: go}
+        - call: {device: b, action: go}
+""",
+        )
+        for yaml_text in cases:
+            with self.subTest(yaml=yaml_text):
+                harness = _ParallelHarness(delay_s=0.001)
+                try:
+                    runtime = _runtime(harness, yaml_text)
+                    _run_to_terminal(runtime)
+                    self.assertEqual(runtime.state, "ERROR")
+                    self.assertEqual(harness.calls, [])
+                finally:
+                    harness.close()
 
     def test_branch_local_output_can_feed_later_atomic_operation(self) -> None:
         harness = _ParallelHarness(delay_s=0.005)

@@ -2277,7 +2277,7 @@ class SequencerProcess(ManagedProcessBase):
     ) -> tuple[set[str], set[tuple[str, str]]]:
         outputs: set[str] = set()
         targets: set[tuple[str, str]] = set()
-        for operation in parallel_branch_operations(branch):
+        for operation in parallel_branch_operations(branch, env):
             outputs.update(parallel_step_output_names(operation.step))
             target = self._preflight_parallel_operation_target(operation.step, env)
             if target is not None:

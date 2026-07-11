@@ -323,8 +323,8 @@ Request pause and stop the sequence at a safe point.
 
 ### `parallel`
 Run independent branches concurrently. Each direct child of `do` is one
-branch. The initial implementation supports direct `call`/`set` branches and
-`atomic` branches whose bodies contain only `call`/`set` steps.
+branch. Supported branches are direct `call`/`set` steps, `atomic` branches,
+and `repeat` branches. Atomic and repeat bodies may contain only `call`/`set`.
 ```yaml
 - parallel:
     do:
@@ -338,16 +338,22 @@ branch. The initial implementation supports direct `call`/`set` branches and
           do:
             - set: {device: b, name: mode, value: ready}
             - call: {device: b, action: arm}
+      - repeat:
+          times: "${n_traces}"
+          do:
+            - call: {device: trace_reader, action: read}
 ```
 
 Behavior:
 - Up to eight branches execute concurrently; additional branches queue.
 - Operations inside one atomic branch remain sequential. Sibling atomic
   branches may overlap.
+- Operations and iterations inside one repeat branch remain sequential. The
+  complete repeat runs in one worker and may overlap sibling branches.
 - A `parallel` step cannot appear inside an ordinary `atomic` block; place the
   atomic blocks directly under `parallel.do` when they should overlap.
 - Different branches must target disjoint devices/processes. Repeated calls to
-  one target are allowed within the same atomic branch.
+  one target are allowed within the same atomic or repeat branch.
 - Branch targets must render from the parent environment at dispatch time;
   outputs created inside a branch cannot be used to choose a later target.
 - Every branch starts from the same environment snapshot. Outputs produced
@@ -358,9 +364,10 @@ Behavior:
   already-dispatched branches, aggregates failures, and does not merge outputs.
 - Pause/stop is deferred until the parallel group joins. Parallel execution is
   always opt-in; ordinary neighboring steps remain sequential.
-- Loops, waits, sleeps, nested parallel/atomic blocks, context operations,
-  adaptive steps, `try`, `use`, and standalone `assign` are not yet supported
-  inside parallel branches.
+- Repeat is the only loop supported as a direct parallel branch. Its count must
+  render to a positive integer and its body may contain only `call`/`set`.
+  Other loops, waits, sleeps, nested parallel/atomic blocks, context operations,
+  adaptive steps, `try`, `use`, and standalone `assign` are not supported.
 
 ### `set_context`
 Set stream context for subsequent stream chunks.
