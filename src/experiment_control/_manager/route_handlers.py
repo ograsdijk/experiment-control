@@ -438,12 +438,21 @@ def route_process_rpc(
     else:
         handle = manager._processes.get(process_id)
         if handle is None and manager._federation_hub.is_mirrored_process(process_id):
-            # Local process wins; federation is the fallback (parity with the
-            # device path's _resolve_local_device, which is local-first). Forward
-            # to the owning peer (ACL-checked) only when there is no local
-            # process by this id.
-            fed = manager._federation_hub.forward_process_request(req)
-            resp = fed if fed is not None else _reply("unknown_process")
+            # F10: a mirrored process's manager.processes.rpc is intercepted
+            # and queued onto its dedicated forward worker in
+            # _handle_internal_rpc (via
+            # FederationHub.try_dispatch_process_forward) before
+            # route_process_rpc is ever called. Reaching here means a caller
+            # bypassed that interception -- should be unreachable in
+            # production.
+            resp = _reply(
+                "federation_forward_not_dispatched",
+                message=(
+                    f"mirrored process {process_id!r} request reached "
+                    "route_process_rpc without going through the federation "
+                    "forward dispatch -- this is an internal routing bug"
+                ),
+            )
         elif handle is None:
             resp = _reply("unknown_process")
         elif handle.state not in running_states:

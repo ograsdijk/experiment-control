@@ -243,25 +243,54 @@ class FederationHubWarmupTests(unittest.TestCase):
         )
 
     def test_activate_does_no_rpc_on_caller_thread_and_starts_warmup_thread(self) -> None:
-        # The whole point of the fix: activate() sets up SUB sockets and starts
-        # the background warmup thread, but never issues a (blocking) peer RPC
-        # on the caller's (poll-loop) thread.
+        # The whole point of the fix: activate() sets up SUB sockets, starts a
+        # dedicated worker thread per mirror, and starts the background
+        # warmup thread -- but never issues a blocking peer RPC on the
+        # caller's (poll-loop) thread.
         hub = self._make_hub()
-        calls: list[tuple] = []
-        hub._rpc_call = lambda *a, **k: calls.append((a, k))  # type: ignore[method-assign]
         # Keep the background thread off the network for a deterministic test.
         hub._fetch_peer_metadata = lambda _ctx, _cfg: (None, None, None, {}, "stub")  # type: ignore[method-assign]
 
         hub.activate()
         try:
-            self.assertEqual(calls, [])
             self.assertIsNotNone(hub._peers["lab2"].sub_sock)
             self.assertIsNotNone(hub._warmup_thread)
             assert hub._warmup_thread is not None
             self.assertTrue(hub._warmup_thread.is_alive())
+            worker = hub._device_forward_workers["lab2.psu"]
+            self.assertTrue(worker.is_alive())
         finally:
             hub.close()
         self.assertIsNone(hub._warmup_thread)
+        self.assertEqual(hub._device_forward_workers, {})
+        self.assertFalse(worker.is_alive())
+
+    def test_close_stops_and_joins_forward_workers(self) -> None:
+        hub = self._make_hub()
+        hub._fetch_peer_metadata = lambda _ctx, _cfg: (None, None, None, {}, "stub")  # type: ignore[method-assign]
+        hub.activate()
+        worker = hub._device_forward_workers["lab2.psu"]
+        self.assertTrue(worker.is_alive())
+
+        hub.close()
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(hub._device_forward_workers, {})
+        self.assertEqual(hub._process_forward_workers, {})
+
+    def test_reactivate_does_not_duplicate_forward_workers(self) -> None:
+        # activate() runs twice in production (startup_sequence then
+        # run_forever); the second call must not spin up a second worker for
+        # an already-running mirror.
+        hub = self._make_hub()
+        hub._fetch_peer_metadata = lambda _ctx, _cfg: (None, None, None, {}, "stub")  # type: ignore[method-assign]
+        hub.activate()
+        first_worker = hub._device_forward_workers["lab2.psu"]
+        hub.activate()
+        try:
+            self.assertIs(hub._device_forward_workers["lab2.psu"], first_worker)
+        finally:
+            hub.close()
 
     def test_drain_warmup_results_applies_metadata_and_marks_warmed(self) -> None:
         hub = self._make_hub()
@@ -342,55 +371,53 @@ class FederationHubWarmupTests(unittest.TestCase):
         self.assertIsNotNone(error)
 
 
-    def test_rpc_call_unresolvable_peer_fails_fast(self) -> None:
-        cfg = parse_federation_config(
-            {
-                "peers": [
-                    {
-                        "peer_id": "lab9",
-                        "router_rpc": "tcp://TODO_PLACEHOLDER_HOST:6000",
-                        "manager_pub": "tcp://10.0.0.9:6001",
-                        "mirror_devices": [
-                            {"local_id": "lab9.psu", "remote_device_id": "psu"}
-                        ],
-                    }
-                ]
-            },
-            local_device_ids=set(),
-            manager_raw={},
-        )
-        hub = FederationHub(
-            ctx=zmq.Context.instance(),
-            poller=zmq.Poller(),
-            manager=object(),
-            config=cfg,
-            instance_id="lab1",
-        )
-        peer_rt = hub._peers["lab9"]
-        # Unresolvable host: returns None and sets last_error without ever
-        # creating a context or socket (so nothing blocks on DNS).
-        self.assertIsNone(hub._rpc_call(peer_rt, {"type": "x"}))
-        self.assertIsNotNone(peer_rt.last_error)
-        self.assertIsNone(hub._fed_ctx)
+    def test_forward_worker_unresolvable_host_fails_fast_without_socket(self) -> None:
+        # Unresolvable host: _forward returns None without ever creating a
+        # socket (so nothing blocks on DNS on whatever thread calls it).
+        class _NoSocketCtx:
+            def socket(self, _type: int) -> None:
+                raise AssertionError(
+                    "must not create a socket for an unresolvable host"
+                )
 
-    def test_rpc_call_caches_resolution_within_ttl(self) -> None:
-        hub = self._make_hub()
-        peer_rt = hub._peers["lab2"]
+        worker = hub_mod._FederationForwardWorker(
+            name="w",
+            ctx=_NoSocketCtx(),
+            router_rpc="tcp://TODO_PLACEHOLDER_HOST:6000",
+            rpc_timeout_ms=50,
+        )
+        self.assertIsNone(worker._forward({"type": "x"}))
+
+    def test_forward_worker_resolve_failure_backoff_bounds_repeated_getaddrinfo(
+        self,
+    ) -> None:
         calls = {"n": 0}
 
         def _counting_resolve(_endpoint: str) -> None:
             calls["n"] += 1
-            return None  # unresolvable -> _rpc_call returns early, no socket
+            return None  # unresolvable every time
+
+        class _NoSocketCtx:
+            def socket(self, _type: int) -> None:
+                raise AssertionError("must not create a socket while unresolvable")
 
         original = hub_mod.resolve_tcp_endpoint
         hub_mod.resolve_tcp_endpoint = _counting_resolve  # type: ignore[assignment]
         try:
-            self.assertIsNone(hub._rpc_call(peer_rt, {"type": "x"}))
-            self.assertIsNone(hub._rpc_call(peer_rt, {"type": "x"}))
-            self.assertIsNone(hub._rpc_call(peer_rt, {"type": "x"}))
+            worker = hub_mod._FederationForwardWorker(
+                name="w",
+                ctx=_NoSocketCtx(),
+                router_rpc="tcp://lab2:6000",
+                rpc_timeout_ms=50,
+            )
+            self.assertIsNone(worker._forward({"type": "x"}))
+            self.assertIsNone(worker._forward({"type": "x"}))
+            self.assertIsNone(worker._forward({"type": "x"}))
         finally:
             hub_mod.resolve_tcp_endpoint = original  # type: ignore[assignment]
-        # Resolved once and reused from the per-peer TTL cache, not per command.
+        # First failure starts a negative-cache backoff window; the next two
+        # calls (issued immediately, well within that window) don't re-probe
+        # DNS for a host that's still known-bad.
         self.assertEqual(calls["n"], 1)
 
     def test_warmup_loop_exits_cleanly_when_hub_closed(self) -> None:

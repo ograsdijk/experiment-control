@@ -3,8 +3,8 @@ from __future__ import annotations
 import queue
 import threading
 import time
-from dataclasses import dataclass, field
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Callable
 
 import zmq
 
@@ -23,14 +23,19 @@ _MIRRORED_LIFECYCLE_TYPES = {
     "device.recover",
 }
 
-# How long _rpc_call (forward path, on the poll loop) reuses a peer's resolved
-# IP before re-resolving — bounds getaddrinfo to once/TTL instead of per command,
-# and picks up DNS changes on the next miss.
-_RESOLVE_CACHE_TTL_S = 60.0
-
 # How often the warmup thread re-fetches an already-warmed peer's metadata, so
 # config/schema drift after a peer restart is eventually picked up.
 _METADATA_REFRESH_S = 300.0
+
+# Negative-cache backoff for a per-mirror forward worker's own DNS resolution
+# (mirrors device_router.py's _MIRRORED_RESOLVE_BACKOFF_S) -- bounds repeated
+# getaddrinfo on a bad/placeholder host without retrying it every task.
+_FORWARD_RESOLVE_BACKOFF_S = 5.0
+
+# Bounded per-mirror forward queue depth. A burst beyond this is rejected
+# immediately with a busy error instead of queuing unboundedly or blocking the
+# caller (mirrors the router's per-route queue_max backpressure).
+_FORWARD_QUEUE_MAX = 256
 
 
 @dataclass
@@ -38,26 +43,16 @@ class PeerRuntime:
     config: FederationPeerConfig
     sub_sock: zmq.Socket | None = None
     last_event_recv_mono: float | None = None
+    # Written by whichever per-mirror forward worker (see
+    # _FederationForwardWorker) last called this peer, read from the main
+    # thread by the status-snapshot methods below -- same benign cross-thread
+    # read/write already accepted for the warmup thread's fields.
     last_rpc_ok_mono: float | None = None
     last_error: str | None = None
     # Set on the main thread once the background warmup thread has delivered
     # this peer's metadata (config + schema). Until then mirrored devices are
     # served from placeholder config/schema.
     metadata_warmed: bool = False
-    # Cache of the resolved router_rpc endpoint for the forward path
-    # (_rpc_call), so a hostname peer isn't getaddrinfo'd on every command.
-    # None until first resolve; expires after _RESOLVE_CACHE_TTL_S. Owned by
-    # whichever thread runs _rpc_call for this peer (main thread for process
-    # forwards, the lifecycle executor for device forwards, serialised by
-    # rpc_lock below) -- never read/written concurrently.
-    resolved_endpoint: str | None = None
-    resolved_expiry_mono: float = 0.0
-    # Persistent DEALER used by _rpc_call (F10: was reconnected per call).
-    # Guarded by rpc_lock so device forwards (lifecycle executor threads) and
-    # process forwards (main thread) can't interleave send/recv on it.
-    rpc_sock: zmq.Socket | None = None
-    rpc_sock_endpoint: str | None = None
-    rpc_lock: threading.Lock = field(default_factory=threading.Lock)
 
 
 @dataclass
@@ -97,6 +92,121 @@ class MirroredProcessRuntime:
     last_hb_recv_mono: float | None = None
 
 
+@dataclass
+class _ForwardTask:
+    outbound: Json
+    on_result: Callable[[Json | None], None]
+
+
+class _FederationForwardWorker(threading.Thread):
+    """One dedicated worker per mirrored device/process (F10 fix).
+
+    Mirrors ``processes/device_router.py``'s ``_MirroredDeviceWorker``: a
+    single-threaded, single-socket, single-queue worker per mirrored object,
+    so forwards to one mirror never contend with (a) the Manager's shared
+    local-device lifecycle thread pool, or (b) forwards to a *different*
+    mirrored object on the same peer. Runs off the Manager's poll loop
+    entirely, so a stuck peer only ever blocks its own mirror's queue.
+    """
+
+    def __init__(
+        self,
+        *,
+        name: str,
+        ctx: zmq.Context,
+        router_rpc: str,
+        rpc_timeout_ms: int,
+        queue_max: int = _FORWARD_QUEUE_MAX,
+    ) -> None:
+        super().__init__(name=name, daemon=True)
+        self._ctx = ctx
+        self._router_rpc = router_rpc
+        self._rpc_timeout_ms = int(rpc_timeout_ms)
+        self._queue: "queue.Queue[_ForwardTask | None]" = queue.Queue(
+            maxsize=max(1, int(queue_max))
+        )
+        self._stop_evt = threading.Event()
+        self._sock: zmq.Socket | None = None
+        # Own, unshared resolve state (mirrors _MirroredDeviceWorker's
+        # _resolve_fail_until) -- no PeerRuntime field is read/written here,
+        # so no cross-thread lock is needed even when several mirrors share a
+        # peer and their workers resolve/reconnect independently.
+        self._resolve_fail_until: float = 0.0
+
+    def submit(self, task: _ForwardTask) -> bool:
+        try:
+            self._queue.put_nowait(task)
+        except queue.Full:
+            return False
+        return True
+
+    def stop(self) -> None:
+        self._stop_evt.set()
+        try:
+            self._queue.put_nowait(None)
+        except queue.Full:
+            # Queue is saturated but the stop flag is set; the worker exits
+            # after draining its current backlog down to the sentinel, or on
+            # the next get() once space frees up.
+            pass
+
+    def _ensure_sock(self) -> zmq.Socket:
+        if self._sock is not None:
+            return self._sock
+        now = time.monotonic()
+        if now < self._resolve_fail_until:
+            raise RuntimeError(f"peer host unresolvable: {self._router_rpc!r}")
+        resolved = resolve_tcp_endpoint(self._router_rpc)
+        if resolved is None:
+            self._resolve_fail_until = now + _FORWARD_RESOLVE_BACKOFF_S
+            raise RuntimeError(f"peer host unresolvable: {self._router_rpc!r}")
+        self._resolve_fail_until = 0.0
+        sock = connect_dealer(self._ctx, resolved, timeout_ms=self._rpc_timeout_ms)
+        self._sock = sock
+        return sock
+
+    def _close_sock(self) -> None:
+        sock = self._sock
+        if sock is None:
+            return
+        try:
+            sock.close(0)
+        except Exception:
+            pass
+        self._sock = None
+
+    def _forward(self, outbound: Json) -> Json | None:
+        try:
+            sock = self._ensure_sock()
+            sock.send(json_dumps(outbound))
+            raw = sock.recv()
+            resp = safe_json_loads(raw)
+            if not isinstance(resp, dict):
+                raise RuntimeError("invalid mirrored forward response")
+        except Exception:
+            # Don't reuse a socket that just failed/timed out -- a DEALER has
+            # no request/reply correlation here, so a late reply for this
+            # call could otherwise be misdelivered as the response to a
+            # later, unrelated task.
+            self._close_sock()
+            return None
+        return resp
+
+    def run(self) -> None:
+        try:
+            while not self._stop_evt.is_set():
+                task = self._queue.get()
+                if task is None:
+                    break
+                resp = self._forward(task.outbound)
+                try:
+                    task.on_result(resp)
+                except Exception:
+                    pass
+        finally:
+            self._close_sock()
+
+
 class FederationHub:
     def __init__(
         self,
@@ -106,6 +216,7 @@ class FederationHub:
         manager: Any,
         config: FederationConfig,
         instance_id: str,
+        reply_queue: "queue.Queue[tuple[bytes, Json]] | None" = None,
     ) -> None:
         # ``ctx`` (the manager's shared context) is intentionally NOT stored:
         # every federation socket lives on the dedicated _fed_ctx below, so a bad
@@ -114,11 +225,22 @@ class FederationHub:
         self._manager = manager
         self._config = config
         self._instance_id = str(instance_id or "").strip() or "unknown"
+        # Replies from per-mirror forward workers land here; the Manager's
+        # main loop drains this via _drain_lifecycle_replies alongside local
+        # lifecycle-op replies (production wiring passes
+        # Manager._lifecycle_reply_queue so both share one drain path). Falls
+        # back to a private queue so callers that don't forward (most tests)
+        # don't need to plumb one through.
+        self._reply_queue: "queue.Queue[tuple[bytes, Json]]" = (
+            reply_queue if reply_queue is not None else queue.Queue()
+        )
         self._peers: dict[str, PeerRuntime] = {}
         self._mirrors: dict[str, MirroredDeviceRuntime] = {}
         self._process_mirrors: dict[str, MirroredProcessRuntime] = {}
         self._socket_to_peer: dict[zmq.Socket, str] = {}
         self._last_liveness: dict[str, str] = {}
+        self._device_forward_workers: dict[str, _FederationForwardWorker] = {}
+        self._process_forward_workers: dict[str, _FederationForwardWorker] = {}
 
         # Dedicated zmq context for ALL federation peer sockets (relay SUBs and
         # peer RPC DEALERs). DEFENSE-IN-DEPTH: the PRIMARY guard against a bad
@@ -206,6 +328,34 @@ class FederationHub:
             # twice (startup_sequence then run_forever) and clobbering it would
             # leave already-warmed peers stuck unwarmed (the guard below means
             # the warmup thread won't re-run to fix it).
+        # One dedicated forward worker per mirrored device/process (F10),
+        # started once (activate() runs twice: startup_sequence then
+        # run_forever). Mirrors are static for the process lifetime, so eager
+        # creation up front is simpler than lazy-on-first-forward.
+        for local_id, mirror in self._mirrors.items():
+            if local_id in self._device_forward_workers:
+                continue
+            peer_cfg = self._peers[mirror.peer_id].config
+            worker = _FederationForwardWorker(
+                name=f"federation-device-forward-{local_id}",
+                ctx=fed_ctx,
+                router_rpc=peer_cfg.router_rpc,
+                rpc_timeout_ms=peer_cfg.rpc_timeout_ms,
+            )
+            worker.start()
+            self._device_forward_workers[local_id] = worker
+        for local_id, pmirror in self._process_mirrors.items():
+            if local_id in self._process_forward_workers:
+                continue
+            peer_cfg = self._peers[pmirror.peer_id].config
+            worker = _FederationForwardWorker(
+                name=f"federation-process-forward-{local_id}",
+                ctx=fed_ctx,
+                router_rpc=peer_cfg.router_rpc,
+                rpc_timeout_ms=peer_cfg.rpc_timeout_ms,
+            )
+            worker.start()
+            self._process_forward_workers[local_id] = worker
         # Do NOT fetch peer metadata on this (poll-loop) thread: a blocking RPC
         # to an unreachable peer would stall manager/TUI startup. Run the
         # best-effort warmup on a background thread instead; results are applied
@@ -225,6 +375,19 @@ class FederationHub:
         if thread is not None:
             thread.join(timeout=2.0)
             self._warmup_thread = None
+        # Signal every forward worker before joining any of them, so a slow
+        # peer's worker doesn't serialize behind another's join timeout (F9-
+        # style fan-out): stop() just sets an event + pushes a sentinel, it
+        # doesn't wait for the in-flight task to finish.
+        all_workers = list(self._device_forward_workers.values()) + list(
+            self._process_forward_workers.values()
+        )
+        for worker in all_workers:
+            worker.stop()
+        for worker in all_workers:
+            worker.join(timeout=2.0)
+        self._device_forward_workers.clear()
+        self._process_forward_workers.clear()
         for sock, _peer_id in list(self._socket_to_peer.items()):
             try:
                 self._poller.unregister(sock)
@@ -237,10 +400,6 @@ class FederationHub:
         self._socket_to_peer.clear()
         for peer_rt in self._peers.values():
             peer_rt.sub_sock = None
-            # Safe without rpc_lock: the manager's lifecycle executor (the
-            # only other thread that can touch rpc_sock) is fully drained
-            # before close() is called (see Manager._shutdown_cleanup).
-            self._close_rpc_socket(peer_rt)
         # Tear down the federation context last, after the warmup thread is
         # joined (its DEALERs closed) and the SUBs above are closed.
         self._fed_ctx_closed = True
@@ -478,65 +637,105 @@ class FederationHub:
             out.append(dict(item))
         return out
 
-    def forward_device_request(self, req: Json) -> Json | None:
-        device_id = str(req.get("device_id", ""))
+    def _send_reply(self, *, identity: bytes, request_id: Any, resp: Json) -> None:
+        if request_id is not None and "request_id" not in resp:
+            resp = dict(resp)
+            resp["request_id"] = request_id
+        self._reply_queue.put((identity, resp))
+
+    def try_dispatch_device_forward(
+        self, *, identity: bytes, req: Json, rtype: str, device_id: str
+    ) -> bool:
+        """Queue a mirrored-device ``"command"``/lifecycle-type request on
+        that device's dedicated forward worker (F10). Returns ``True`` if
+        this was a forwardable request for a mirrored device -- the reply
+        (ACL denial, success, or peer-unavailable) is/will be delivered via
+        the reply queue passed to ``__init__``, never returned synchronously.
+        Returns ``False`` for anything this hub doesn't forward (unmirrored
+        device_id, or a request type ``forward_device_request`` never
+        forwarded either) -- the caller should handle it through its normal
+        (inline) path.
+        """
         mirror = self._mirrors.get(device_id)
         if mirror is None:
-            return None
+            return False
+        if rtype != "command" and rtype not in _MIRRORED_LIFECYCLE_TYPES:
+            return False
 
-        rtype = str(req.get("type", ""))
+        request_id = req.get("request_id")
         peer_rt = self._peers[mirror.peer_id]
         policy = peer_rt.config.policy
         if rtype == "command":
             action = str(req.get("action", ""))
-            if not policy.allows_device_action(action):
-                err = {
-                    "code": "federation_acl_denied",
-                    "message": (
-                        f"federation policy denied mirrored command {device_id!r}.{action}"
-                    ),
-                }
-                mirror.last_error = str(err.get("message"))
-                return {"ok": False, "error": err}
-        elif rtype in _MIRRORED_LIFECYCLE_TYPES:
-            if not policy.allow_lifecycle_ops:
-                err = {
-                    "code": "federation_acl_denied",
-                    "message": (
-                        f"federation policy denied mirrored lifecycle request {rtype!r}"
-                    ),
-                }
-                mirror.last_error = str(err.get("message"))
-                return {"ok": False, "error": err}
+            allowed = policy.allows_device_action(action)
+            denial_message = (
+                f"federation policy denied mirrored command {device_id!r}.{action}"
+            )
         else:
-            return None
+            action = ""
+            allowed = policy.allow_lifecycle_ops
+            denial_message = (
+                f"federation policy denied mirrored lifecycle request {rtype!r}"
+            )
+        if not allowed:
+            mirror.last_error = denial_message
+            self._send_reply(
+                identity=identity,
+                request_id=request_id,
+                resp={
+                    "ok": False,
+                    "error": {"code": "federation_acl_denied", "message": denial_message},
+                },
+            )
+            return True
 
         outbound = dict(req)
         outbound["device_id"] = mirror.remote_device_id
         outbound["federation"] = self._next_federation_meta(req.get("federation"))
-        resp = self._rpc_call(peer_rt, outbound)
-        if resp is None:
-            mirror.last_error = "peer unavailable"
-            peer_rt.last_error = "peer unavailable"
-            return {
-                "ok": False,
-                "error": {
-                    "code": "peer_unavailable",
-                    "message": f"peer {mirror.peer_id!r} unavailable",
+
+        def _on_result(resp: Json | None) -> None:
+            if resp is None:
+                mirror.last_error = "peer unavailable"
+                peer_rt.last_error = "peer unavailable"
+                self._send_reply(
+                    identity=identity,
+                    request_id=request_id,
+                    resp={
+                        "ok": False,
+                        "error": {
+                            "code": "peer_unavailable",
+                            "message": f"peer {mirror.peer_id!r} unavailable",
+                        },
+                    },
+                )
+                return
+            peer_rt.last_rpc_ok_mono = time.monotonic()
+            peer_rt.last_error = None
+            mirror.last_error = None
+            result = resp.get("result")
+            if (
+                rtype == "command"
+                and action == "capabilities"
+                and bool(resp.get("ok"))
+                and isinstance(result, dict)
+            ):
+                mirror.capabilities = dict(result)
+            self._send_reply(identity=identity, request_id=request_id, resp=resp)
+
+        worker = self._device_forward_workers.get(device_id)
+        if worker is None or not worker.submit(_ForwardTask(outbound=outbound, on_result=_on_result)):
+            self._send_reply(
+                identity=identity,
+                request_id=request_id,
+                resp={
+                    "ok": False,
+                    "error": {
+                        "code": "federation_forward_busy",
+                        "message": f"forward queue full for {device_id!r}",
+                    },
                 },
-            }
-        peer_rt.last_rpc_ok_mono = time.monotonic()
-        peer_rt.last_error = None
-        mirror.last_error = None
-        result = resp.get("result")
-        if (
-            rtype == "command"
-            and str(req.get("action", "")) == "capabilities"
-            and bool(resp.get("ok"))
-            and isinstance(result, dict)
-        ):
-            mirror.capabilities = dict(result)
-        return resp
+            )
+        return True
 
     def update_capabilities(self, device_id: str, capabilities: Json) -> None:
         mirror = self._mirrors.get(str(device_id or ""))
@@ -544,53 +743,79 @@ class FederationHub:
             raise KeyError(f"Unknown mirrored device_id {device_id!r}")
         mirror.capabilities = dict(capabilities)
 
-    def forward_process_request(self, req: Json) -> Json | None:
-        """Forward a ``manager.processes.rpc`` for a mirrored process to its
-        owning peer's router. Returns None if ``process_id`` is not a mirror
-        (caller falls through to local dispatch). The inner request action
-        (``request.type``, e.g. ``mw.retune``) is gated by the peer's
+    def try_dispatch_process_forward(
+        self, *, identity: bytes, req: Json, process_id: str
+    ) -> bool:
+        """Queue a ``manager.processes.rpc`` for a mirrored process on that
+        process's dedicated forward worker (F10). Same reply/return-value
+        contract as ``try_dispatch_device_forward``. The inner request
+        action (``request.type``, e.g. ``mw.retune``) is gated by the peer's
         ``allow_process_actions`` ACL (default deny-all)."""
-        process_id = str(req.get("process_id", ""))
         mirror = self._process_mirrors.get(process_id)
         if mirror is None:
-            return None
+            return False
 
+        request_id = req.get("request_id")
         request = req.get("request")
-        action = ""
-        if isinstance(request, dict):
-            action = str(request.get("type", ""))
+        action = str(request.get("type", "")) if isinstance(request, dict) else ""
         peer_rt = self._peers[mirror.peer_id]
         if not self._process_action_allowed(peer_rt.config.policy, action):
-            err = {
-                "code": "federation_acl_denied",
-                "message": (
-                    f"federation policy denied mirrored process rpc "
-                    f"{process_id!r}.{action}"
-                ),
-            }
-            mirror.last_error = str(err.get("message"))
-            return {"ok": False, "error": err}
+            message = (
+                f"federation policy denied mirrored process rpc "
+                f"{process_id!r}.{action}"
+            )
+            mirror.last_error = message
+            self._send_reply(
+                identity=identity,
+                request_id=request_id,
+                resp={
+                    "ok": False,
+                    "error": {"code": "federation_acl_denied", "message": message},
+                },
+            )
+            return True
 
         outbound = dict(req)
         outbound["process_id"] = mirror.remote_process_id
         outbound["federation"] = self._next_federation_meta(req.get("federation"))
-        resp = self._rpc_call(peer_rt, outbound)
-        if resp is None:
-            mirror.last_error = "peer unavailable"
-            peer_rt.last_error = "peer unavailable"
-            return {
-                "ok": False,
-                "error": {
-                    "code": "peer_unavailable",
-                    "message": f"peer {mirror.peer_id!r} unavailable",
+
+        def _on_result(resp: Json | None) -> None:
+            if resp is None:
+                mirror.last_error = "peer unavailable"
+                peer_rt.last_error = "peer unavailable"
+                self._send_reply(
+                    identity=identity,
+                    request_id=request_id,
+                    resp={
+                        "ok": False,
+                        "error": {
+                            "code": "peer_unavailable",
+                            "message": f"peer {mirror.peer_id!r} unavailable",
+                        },
+                    },
+                )
+                return
+            peer_rt.last_rpc_ok_mono = time.monotonic()
+            peer_rt.last_error = None
+            mirror.last_error = None
+            if action == "process.capabilities" and bool(resp.get("ok")):
+                self._annotate_process_capabilities(peer_rt, resp.get("result"))
+            self._send_reply(identity=identity, request_id=request_id, resp=resp)
+
+        worker = self._process_forward_workers.get(process_id)
+        if worker is None or not worker.submit(_ForwardTask(outbound=outbound, on_result=_on_result)):
+            self._send_reply(
+                identity=identity,
+                request_id=request_id,
+                resp={
+                    "ok": False,
+                    "error": {
+                        "code": "federation_forward_busy",
+                        "message": f"forward queue full for {process_id!r}",
+                    },
                 },
-            }
-        peer_rt.last_rpc_ok_mono = time.monotonic()
-        peer_rt.last_error = None
-        mirror.last_error = None
-        if action == "process.capabilities" and bool(resp.get("ok")):
-            self._annotate_process_capabilities(peer_rt, resp.get("result"))
-        return resp
+            )
+        return True
 
     @staticmethod
     def _process_action_allowed(policy: FederationPolicy, action: str) -> bool:
@@ -1134,106 +1359,6 @@ class FederationHub:
             out["owner_peer_id"] = peer_id
             out["remote_device_id"] = remote_device_id
         return out
-
-    def _resolve_router_cached(self, peer_rt: PeerRuntime) -> str | None:
-        # TTL cache (see PeerRuntime.resolved_endpoint) so a hostname peer
-        # isn't getaddrinfo'd on every forwarded command (IP literals are an
-        # instant passthrough either way). Re-resolves after the TTL, picking
-        # up DNS drift; a None (unresolvable) result is cached too so a bad
-        # host isn't re-probed per command. Only called while holding
-        # peer_rt.rpc_lock.
-        now = time.monotonic()
-        if now < peer_rt.resolved_expiry_mono:
-            return peer_rt.resolved_endpoint
-        peer_rt.resolved_endpoint = resolve_tcp_endpoint(peer_rt.config.router_rpc)
-        peer_rt.resolved_expiry_mono = now + _RESOLVE_CACHE_TTL_S
-        return peer_rt.resolved_endpoint
-
-    def _close_rpc_socket(self, peer_rt: PeerRuntime) -> None:
-        sock = peer_rt.rpc_sock
-        if sock is None:
-            return
-        try:
-            sock.close(0)
-        except Exception:
-            pass
-        peer_rt.rpc_sock = None
-        peer_rt.rpc_sock_endpoint = None
-
-    def _ensure_rpc_socket(self, peer_rt: PeerRuntime, resolved: str) -> zmq.Socket:
-        # Persistent per-peer DEALER (F10: used to be opened/closed per call,
-        # adding a TCP connect to every mirrored command). Reused across calls;
-        # torn down and reconnected if the resolved endpoint changes or a call
-        # fails/times out (see _rpc_call) -- a DEALER has no request/reply
-        # correlation here, so a socket that may still have a late reply
-        # in flight for a timed-out call must never be reused for the next one.
-        if peer_rt.rpc_sock is not None and peer_rt.rpc_sock_endpoint == resolved:
-            return peer_rt.rpc_sock
-        self._close_rpc_socket(peer_rt)
-        sock = connect_dealer(
-            self._ensure_fed_ctx(), resolved, timeout_ms=int(peer_rt.config.rpc_timeout_ms)
-        )
-        peer_rt.rpc_sock = sock
-        peer_rt.rpc_sock_endpoint = resolved
-        return sock
-
-    def _rpc_call(self, peer_rt: PeerRuntime, payload: Json) -> Json | None:
-        # Callers: forward_device_request (F10: now runs on the manager's
-        # lifecycle executor, not the poll loop -- see internal_rpc.py's
-        # federation-forward dispatch) and forward_process_request (still on
-        # the poll loop). rpc_lock serialises both against this peer's shared
-        # persistent socket so they can never interleave send/recv on it.
-        with peer_rt.rpc_lock:
-            # Pre-resolve (cached) so an unresolvable peer host fails fast and
-            # never makes libzmq block the I/O thread on DNS.
-            resolved = self._resolve_router_cached(peer_rt)
-            if resolved is None:
-                peer_rt.last_error = f"unresolvable peer host {peer_rt.config.router_rpc!r}"
-                return None
-            timeout_ms = int(peer_rt.config.rpc_timeout_ms)
-            try:
-                sock = self._ensure_rpc_socket(peer_rt, resolved)
-            except RuntimeError as e:  # hub closed during shutdown
-                peer_rt.last_error = str(e)
-                return None
-            # Pump manager subscriptions while waiting so an unreachable peer
-            # can't starve process heartbeats during the (up to rpc_timeout_ms)
-            # wait -- a no-op off the main thread (_pump_manager_subscriptions
-            # checks thread identity), which is the common case now that device
-            # forwards run on the lifecycle executor; the poll loop keeps
-            # pumping on its own in parallel. Falls back to a plain recv when
-            # no pump is available (e.g. test stubs).
-            pump = getattr(self._manager, "_pump_manager_subscriptions", None)
-            try:
-                if callable(pump):
-                    from .._manager.rpc_calls import _blocking_call_with_pump
-
-                    resp: Json | None = _blocking_call_with_pump(
-                        sock,
-                        json_dumps(payload),
-                        timeout_ms=timeout_ms,
-                        response_filter=lambda _r: True,
-                        pump_fn=pump,
-                    )
-                else:
-                    send_json(sock, payload)
-                    resp = recv_json(sock)
-            except Exception as e:
-                peer_rt.last_error = str(e)
-                # Don't reuse a socket that just failed/timed out -- a late
-                # reply for this call could otherwise be misdelivered as the
-                # response to a later, unrelated call on the same DEALER.
-                self._close_rpc_socket(peer_rt)
-                return None
-
-            if not isinstance(resp, dict):
-                # recv_json() (the no-pump fallback) swallows a timeout/ZMQError
-                # into None instead of raising -- same "don't reuse" reasoning
-                # as the exception branch above applies here too.
-                peer_rt.last_error = "invalid response"
-                self._close_rpc_socket(peer_rt)
-                return None
-        return resp
 
     def _next_federation_meta(self, raw: object) -> Json:
         hop_count = 0

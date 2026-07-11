@@ -161,6 +161,37 @@ class ProcessFederationConfigTests(unittest.TestCase):
 # --------------------------------------------------------------------------
 # Hub: RPC forwarding + telemetry relay + schema
 # --------------------------------------------------------------------------
+class _FakeForwardWorker:
+    """Stand-in for _FederationForwardWorker: submit() runs synchronously on
+    the calling thread instead of a real worker thread, so tests can control
+    the simulated peer response without spinning up sockets."""
+
+    def __init__(self, respond):
+        self.respond = respond  # Callable[[Json], Json | None]
+        self.outbound_calls: list = []
+
+    def submit(self, task) -> bool:
+        self.outbound_calls.append(task.outbound)
+        task.on_result(self.respond(task.outbound))
+        return True
+
+
+def _dispatch_process_forward(hub, req, *, respond=None):
+    """Drive FederationHub.try_dispatch_process_forward the way
+    _handle_internal_rpc does, using a fake worker in place of a real
+    background thread, and return (dispatched, reply_resp_or_None)."""
+    process_id = req.get("process_id")
+    if respond is not None:
+        hub._process_forward_workers[process_id] = _FakeForwardWorker(respond)
+    dispatched = hub.try_dispatch_process_forward(
+        identity=b"test-identity", req=req, process_id=process_id
+    )
+    resp = None
+    if dispatched:
+        _identity, resp = hub._reply_queue.get_nowait()
+    return dispatched, resp
+
+
 def _make_process_hub(allow=("mw.retune",)):
     cfg = parse_federation_config(
         _peer(
@@ -193,26 +224,27 @@ class ProcessFederationHubTests(unittest.TestCase):
 
     def test_forward_unmirrored_returns_none(self) -> None:
         hub, _ = _make_process_hub()
-        self.assertIsNone(
-            hub.forward_process_request({"process_id": "other", "request": {"type": "x"}})
+        dispatched, _resp = _dispatch_process_forward(
+            hub, {"process_id": "other", "request": {"type": "x"}}
         )
+        self.assertFalse(dispatched)
 
     def test_forward_rewrites_process_id_and_keeps_type(self) -> None:
         hub, _ = _make_process_hub()
-        captured: list = []
-        hub._rpc_call = lambda peer_rt, payload: (  # type: ignore[method-assign]
-            captured.append(payload) or {"ok": True, "result": {"state": "RF_ON"}}
-        )
-        resp = hub.forward_process_request(
+        dispatched, resp = _dispatch_process_forward(
+            hub,
             {
                 "type": "manager.processes.rpc",
                 "process_id": "spb",
                 "request": {"type": "mw.retune", "params": {"frequency_ghz": 13.3}},
-            }
+            },
+            respond=lambda _outbound: {"ok": True, "result": {"state": "RF_ON"}},
         )
+        self.assertTrue(dispatched)
         self.assertTrue(resp["ok"])
-        self.assertEqual(len(captured), 1)
-        out = captured[0]
+        worker = hub._process_forward_workers["spb"]
+        self.assertEqual(len(worker.outbound_calls), 1)
+        out = worker.outbound_calls[0]
         self.assertEqual(out["process_id"], "spb_r")  # local -> remote
         self.assertEqual(out["type"], "manager.processes.rpc")
         self.assertIn("federation", out)
@@ -220,20 +252,24 @@ class ProcessFederationHubTests(unittest.TestCase):
     def test_forward_denied_action_never_reaches_peer(self) -> None:
         hub, _ = _make_process_hub(allow=("mw.retune",))
         called = {"n": 0}
-        hub._rpc_call = lambda *a, **k: called.__setitem__("n", called["n"] + 1)  # type: ignore[method-assign]
-        resp = hub.forward_process_request(
-            {"process_id": "spb", "request": {"type": "mw.disable_rf"}}
+        dispatched, resp = _dispatch_process_forward(
+            hub,
+            {"process_id": "spb", "request": {"type": "mw.disable_rf"}},
+            respond=lambda _outbound: called.__setitem__("n", called["n"] + 1),
         )
+        self.assertTrue(dispatched)
         self.assertFalse(resp["ok"])
         self.assertEqual(resp["error"]["code"], "federation_acl_denied")
         self.assertEqual(called["n"], 0)
 
     def test_forward_peer_unavailable(self) -> None:
         hub, _ = _make_process_hub()
-        hub._rpc_call = lambda *a, **k: None  # type: ignore[method-assign]
-        resp = hub.forward_process_request(
-            {"process_id": "spb", "request": {"type": "mw.retune"}}
+        dispatched, resp = _dispatch_process_forward(
+            hub,
+            {"process_id": "spb", "request": {"type": "mw.retune"}},
+            respond=lambda _outbound: None,
         )
+        self.assertTrue(dispatched)
         self.assertFalse(resp["ok"])
         self.assertEqual(resp["error"]["code"], "peer_unavailable")
 
@@ -515,7 +551,6 @@ class ProcessTelemetryAdvertiseTests(unittest.TestCase):
 # --------------------------------------------------------------------------
 class RouteProcessRpcPrecedenceTests(unittest.TestCase):
     def _manager(self, *, has_local: bool):
-        self.fed_calls: list = []
         self.local_calls: list = []
         processes = {}
         if has_local:
@@ -524,12 +559,7 @@ class RouteProcessRpcPrecedenceTests(unittest.TestCase):
             _normalize_command_source=lambda **k: ("sequencer", None),
             _publish_process_command_response=lambda **k: k["response"],
             _processes=processes,
-            _federation_hub=SimpleNamespace(
-                is_mirrored_process=lambda pid: pid == "spb",
-                forward_process_request=lambda req: (
-                    self.fed_calls.append(req) or {"ok": True, "result": "FED"}
-                ),
-            ),
+            _federation_hub=SimpleNamespace(is_mirrored_process=lambda pid: pid == "spb"),
             _call_process_rpc=lambda process_id, request: (
                 self.local_calls.append(process_id) or {"ok": True, "result": "LOCAL"}
             ),
@@ -548,14 +578,21 @@ class RouteProcessRpcPrecedenceTests(unittest.TestCase):
             mgr, self._req(), running_states={"RUNNING"}, starting_state="STARTING"
         )
         self.assertEqual(resp["result"], "LOCAL")
-        self.assertEqual(self.fed_calls, [])  # federation NOT consulted
 
-    def test_forwards_when_no_local_process(self) -> None:
+    def test_unreachable_when_no_local_process(self) -> None:
+        # F10: forwarding a mirrored process with no local handle now happens
+        # earlier, in _handle_internal_rpc (via
+        # FederationHub.try_dispatch_process_forward) -- see
+        # test_federation_forward_offload.py's precedence tests for that
+        # behavior. route_process_rpc itself should never be reached for
+        # this case in production; confirm it reports that explicitly
+        # instead of silently doing something wrong.
         mgr = self._manager(has_local=False)
         resp = route_process_rpc(
             mgr, self._req(), running_states={"RUNNING"}, starting_state="STARTING"
         )
-        self.assertEqual(resp["result"], "FED")
+        self.assertFalse(resp["ok"])
+        self.assertEqual(resp["error"]["code"], "federation_forward_not_dispatched")
         self.assertEqual(self.local_calls, [])
 
 
@@ -630,20 +667,22 @@ class ProcessFederationLivenessTests(unittest.TestCase):
 class ProcessFederationCapabilityAclTests(unittest.TestCase):
     def test_capabilities_allowed_and_members_annotated(self) -> None:
         hub, _ = _make_process_hub(allow=("mw.retune",))
-        hub._rpc_call = lambda peer_rt, payload: {  # type: ignore[method-assign]
-            "ok": True,
-            "result": {
-                "version": 1,
-                "members": [{"name": "mw.retune"}, {"name": "mw.abort"}],
-            },
-        }
-        resp = hub.forward_process_request(
+        dispatched, resp = _dispatch_process_forward(
+            hub,
             {
                 "type": "manager.processes.rpc",
                 "process_id": "spb",
                 "request": {"type": "process.capabilities", "params": {}},
-            }
+            },
+            respond=lambda _outbound: {
+                "ok": True,
+                "result": {
+                    "version": 1,
+                    "members": [{"name": "mw.retune"}, {"name": "mw.abort"}],
+                },
+            },
         )
+        self.assertTrue(dispatched)
         self.assertTrue(resp["ok"])
         by_name = {m["name"]: m for m in resp["result"]["members"]}
         self.assertTrue(by_name["mw.retune"]["federation_allowed"])
@@ -653,26 +692,28 @@ class ProcessFederationCapabilityAclTests(unittest.TestCase):
         hub, _ = _make_process_hub(allow=())  # deny-all domain actions
         called = {"n": 0}
 
-        def _rpc(peer_rt, payload):
+        def _respond(_outbound):
             called["n"] += 1
             return {"ok": True, "result": {"members": []}}
 
-        hub._rpc_call = _rpc  # type: ignore[method-assign]
-        resp = hub.forward_process_request(
-            {"process_id": "spb", "request": {"type": "process.capabilities"}}
+        dispatched, resp = _dispatch_process_forward(
+            hub,
+            {"process_id": "spb", "request": {"type": "process.capabilities"}},
+            respond=_respond,
         )
+        self.assertTrue(dispatched)
         self.assertTrue(resp["ok"])
         self.assertEqual(called["n"], 1)  # forwarded, not ACL-denied
 
     def test_domain_action_still_denied(self) -> None:
         hub, _ = _make_process_hub(allow=("mw.retune",))
         called = {"n": 0}
-        hub._rpc_call = lambda *a, **k: called.__setitem__(  # type: ignore[method-assign]
-            "n", called["n"] + 1
+        dispatched, resp = _dispatch_process_forward(
+            hub,
+            {"process_id": "spb", "request": {"type": "mw.abort"}},
+            respond=lambda _outbound: called.__setitem__("n", called["n"] + 1),
         )
-        resp = hub.forward_process_request(
-            {"process_id": "spb", "request": {"type": "mw.abort"}}
-        )
+        self.assertTrue(dispatched)
         self.assertFalse(resp["ok"])
         self.assertEqual(resp["error"]["code"], "federation_acl_denied")
         self.assertEqual(called["n"], 0)

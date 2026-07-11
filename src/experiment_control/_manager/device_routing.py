@@ -29,7 +29,28 @@ def _unknown_device_response(device_id: str) -> Json:
 
 
 def _forward_device_request(manager: Any, req: Json) -> Json | None:
-    return manager._federation_hub.forward_device_request(req)
+    # F10: mirrored-device "command"/lifecycle-type requests are now
+    # intercepted and queued onto a dedicated per-device forward worker in
+    # _handle_internal_rpc (via FederationHub.try_dispatch_device_forward),
+    # before route_device_request is ever called -- this fallback only fires
+    # for a device_id that's genuinely unmirrored (in which case
+    # is_mirrored_device is False and this whole branch is skipped, see
+    # below) or for a caller that reached route_device_request directly,
+    # bypassing that interception. It should be unreachable in production.
+    device_id = str(req.get("device_id", ""))
+    if not manager._federation_hub.is_mirrored_device(device_id):
+        return None
+    return {
+        "ok": False,
+        "error": {
+            "code": "federation_forward_not_dispatched",
+            "message": (
+                f"mirrored device {device_id!r} request reached "
+                "route_device_request without going through the federation "
+                "forward dispatch -- this is an internal routing bug"
+            ),
+        },
+    }
 
 
 def _resolve_local_device(manager: Any, req: Json) -> tuple[str | None, Any, Json | None]:
