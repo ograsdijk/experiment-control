@@ -268,7 +268,8 @@ export function CommonStepInspector(props: Props) {
           color={color}
         />
         <Text size="xs" c="dimmed">
-          Accepted by the YAML parser but not supported at runtime in v1.
+          Runs distinct call/set branches concurrently; atomic branches remain
+          sequential internally.
         </Text>
       </SectionCard>
     );

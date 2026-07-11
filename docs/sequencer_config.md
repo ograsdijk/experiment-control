@@ -322,13 +322,45 @@ Request pause and stop the sequence at a safe point.
 ```
 
 ### `parallel`
-Syntax is accepted but **not supported** at runtime (v1).
+Run independent branches concurrently. Each direct child of `do` is one
+branch. The initial implementation supports direct `call`/`set` branches and
+`atomic` branches whose bodies contain only `call`/`set` steps.
 ```yaml
 - parallel:
     do:
-      - call: {device: a, action: foo}
-      - call: {device: b, action: bar}
+      - atomic:
+          name: prepare_a
+          do:
+            - set: {device: a, name: mode, value: ready}
+            - call: {device: a, action: arm}
+      - atomic:
+          name: prepare_b
+          do:
+            - set: {device: b, name: mode, value: ready}
+            - call: {device: b, action: arm}
 ```
+
+Behavior:
+- Up to eight branches execute concurrently; additional branches queue.
+- Operations inside one atomic branch remain sequential. Sibling atomic
+  branches may overlap.
+- A `parallel` step cannot appear inside an ordinary `atomic` block; place the
+  atomic blocks directly under `parallel.do` when they should overlap.
+- Different branches must target disjoint devices/processes. Repeated calls to
+  one target are allowed within the same atomic branch.
+- Branch targets must render from the parent environment at dispatch time;
+  outputs created inside a branch cannot be used to choose a later target.
+- Every branch starts from the same environment snapshot. Outputs produced
+  within an atomic branch are visible to later operations in that branch.
+- `save_as`, `extract`, and `assign` output names must be unique across
+  branches. Outputs merge only after every branch succeeds.
+- A branch stops at its first failed operation. The sequencer waits for all
+  already-dispatched branches, aggregates failures, and does not merge outputs.
+- Pause/stop is deferred until the parallel group joins. Parallel execution is
+  always opt-in; ordinary neighboring steps remain sequential.
+- Loops, waits, sleeps, nested parallel/atomic blocks, context operations,
+  adaptive steps, `try`, `use`, and standalone `assign` are not yet supported
+  inside parallel branches.
 
 ### `set_context`
 Set stream context for subsequent stream chunks.
