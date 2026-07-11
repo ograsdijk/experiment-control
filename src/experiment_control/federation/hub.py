@@ -3,7 +3,7 @@ from __future__ import annotations
 import queue
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import zmq
@@ -44,11 +44,20 @@ class PeerRuntime:
     # this peer's metadata (config + schema). Until then mirrored devices are
     # served from placeholder config/schema.
     metadata_warmed: bool = False
-    # Main-thread-only cache of the resolved router_rpc endpoint for the forward
-    # path (_rpc_call), so a hostname peer isn't getaddrinfo'd on the poll loop
-    # on every command. None until first resolve; expires after _RESOLVE_CACHE_TTL_S.
+    # Cache of the resolved router_rpc endpoint for the forward path
+    # (_rpc_call), so a hostname peer isn't getaddrinfo'd on every command.
+    # None until first resolve; expires after _RESOLVE_CACHE_TTL_S. Owned by
+    # whichever thread runs _rpc_call for this peer (main thread for process
+    # forwards, the lifecycle executor for device forwards, serialised by
+    # rpc_lock below) -- never read/written concurrently.
     resolved_endpoint: str | None = None
     resolved_expiry_mono: float = 0.0
+    # Persistent DEALER used by _rpc_call (F10: was reconnected per call).
+    # Guarded by rpc_lock so device forwards (lifecycle executor threads) and
+    # process forwards (main thread) can't interleave send/recv on it.
+    rpc_sock: zmq.Socket | None = None
+    rpc_sock_endpoint: str | None = None
+    rpc_lock: threading.Lock = field(default_factory=threading.Lock)
 
 
 @dataclass
@@ -228,6 +237,10 @@ class FederationHub:
         self._socket_to_peer.clear()
         for peer_rt in self._peers.values():
             peer_rt.sub_sock = None
+            # Safe without rpc_lock: the manager's lifecycle executor (the
+            # only other thread that can touch rpc_sock) is fully drained
+            # before close() is called (see Manager._shutdown_cleanup).
+            self._close_rpc_socket(peer_rt)
         # Tear down the federation context last, after the warmup thread is
         # joined (its DEALERs closed) and the SUBs above are closed.
         self._fed_ctx_closed = True
@@ -1123,11 +1136,12 @@ class FederationHub:
         return out
 
     def _resolve_router_cached(self, peer_rt: PeerRuntime) -> str | None:
-        # Main-thread TTL cache so a hostname peer isn't getaddrinfo'd on the
-        # poll loop on every forwarded command (IP literals are an instant
-        # passthrough either way). Re-resolves after the TTL, picking up DNS
-        # drift; a None (unresolvable) result is cached too so a bad host isn't
-        # re-probed per command.
+        # TTL cache (see PeerRuntime.resolved_endpoint) so a hostname peer
+        # isn't getaddrinfo'd on every forwarded command (IP literals are an
+        # instant passthrough either way). Re-resolves after the TTL, picking
+        # up DNS drift; a None (unresolvable) result is cached too so a bad
+        # host isn't re-probed per command. Only called while holding
+        # peer_rt.rpc_lock.
         now = time.monotonic()
         if now < peer_rt.resolved_expiry_mono:
             return peer_rt.resolved_endpoint
@@ -1135,50 +1149,90 @@ class FederationHub:
         peer_rt.resolved_expiry_mono = now + _RESOLVE_CACHE_TTL_S
         return peer_rt.resolved_endpoint
 
+    def _close_rpc_socket(self, peer_rt: PeerRuntime) -> None:
+        sock = peer_rt.rpc_sock
+        if sock is None:
+            return
+        try:
+            sock.close(0)
+        except Exception:
+            pass
+        peer_rt.rpc_sock = None
+        peer_rt.rpc_sock_endpoint = None
+
+    def _ensure_rpc_socket(self, peer_rt: PeerRuntime, resolved: str) -> zmq.Socket:
+        # Persistent per-peer DEALER (F10: used to be opened/closed per call,
+        # adding a TCP connect to every mirrored command). Reused across calls;
+        # torn down and reconnected if the resolved endpoint changes or a call
+        # fails/times out (see _rpc_call) -- a DEALER has no request/reply
+        # correlation here, so a socket that may still have a late reply
+        # in flight for a timed-out call must never be reused for the next one.
+        if peer_rt.rpc_sock is not None and peer_rt.rpc_sock_endpoint == resolved:
+            return peer_rt.rpc_sock
+        self._close_rpc_socket(peer_rt)
+        sock = connect_dealer(
+            self._ensure_fed_ctx(), resolved, timeout_ms=int(peer_rt.config.rpc_timeout_ms)
+        )
+        peer_rt.rpc_sock = sock
+        peer_rt.rpc_sock_endpoint = resolved
+        return sock
+
     def _rpc_call(self, peer_rt: PeerRuntime, payload: Json) -> Json | None:
-        # Pre-resolve (cached) so an unresolvable peer host fails fast and never
-        # makes libzmq block the I/O thread on DNS.
-        resolved = self._resolve_router_cached(peer_rt)
-        if resolved is None:
-            peer_rt.last_error = f"unresolvable peer host {peer_rt.config.router_rpc!r}"
-            return None
-        timeout_ms = int(peer_rt.config.rpc_timeout_ms)
-        try:
-            sock = connect_dealer(self._ensure_fed_ctx(), resolved, timeout_ms=timeout_ms)
-        except RuntimeError as e:  # hub closed during shutdown
-            peer_rt.last_error = str(e)
-            return None
-        # forward_device_request runs on the manager poll loop. Pump manager
-        # subscriptions while waiting so an unreachable peer can't starve process
-        # heartbeats during the (up to rpc_timeout_ms) wait. Falls back to a
-        # plain recv when no pump is available (e.g. test stubs).
-        pump = getattr(self._manager, "_pump_manager_subscriptions", None)
-        try:
-            if callable(pump):
-                from .._manager.rpc_calls import _blocking_call_with_pump
-
-                resp: Json | None = _blocking_call_with_pump(
-                    sock,
-                    json_dumps(payload),
-                    timeout_ms=timeout_ms,
-                    response_filter=lambda _r: True,
-                    pump_fn=pump,
-                )
-            else:
-                send_json(sock, payload)
-                resp = recv_json(sock)
-        except Exception as e:
-            peer_rt.last_error = str(e)
-            return None
-        finally:
+        # Callers: forward_device_request (F10: now runs on the manager's
+        # lifecycle executor, not the poll loop -- see internal_rpc.py's
+        # federation-forward dispatch) and forward_process_request (still on
+        # the poll loop). rpc_lock serialises both against this peer's shared
+        # persistent socket so they can never interleave send/recv on it.
+        with peer_rt.rpc_lock:
+            # Pre-resolve (cached) so an unresolvable peer host fails fast and
+            # never makes libzmq block the I/O thread on DNS.
+            resolved = self._resolve_router_cached(peer_rt)
+            if resolved is None:
+                peer_rt.last_error = f"unresolvable peer host {peer_rt.config.router_rpc!r}"
+                return None
+            timeout_ms = int(peer_rt.config.rpc_timeout_ms)
             try:
-                sock.close(0)
-            except Exception:
-                pass
+                sock = self._ensure_rpc_socket(peer_rt, resolved)
+            except RuntimeError as e:  # hub closed during shutdown
+                peer_rt.last_error = str(e)
+                return None
+            # Pump manager subscriptions while waiting so an unreachable peer
+            # can't starve process heartbeats during the (up to rpc_timeout_ms)
+            # wait -- a no-op off the main thread (_pump_manager_subscriptions
+            # checks thread identity), which is the common case now that device
+            # forwards run on the lifecycle executor; the poll loop keeps
+            # pumping on its own in parallel. Falls back to a plain recv when
+            # no pump is available (e.g. test stubs).
+            pump = getattr(self._manager, "_pump_manager_subscriptions", None)
+            try:
+                if callable(pump):
+                    from .._manager.rpc_calls import _blocking_call_with_pump
 
-        if not isinstance(resp, dict):
-            peer_rt.last_error = "invalid response"
-            return None
+                    resp: Json | None = _blocking_call_with_pump(
+                        sock,
+                        json_dumps(payload),
+                        timeout_ms=timeout_ms,
+                        response_filter=lambda _r: True,
+                        pump_fn=pump,
+                    )
+                else:
+                    send_json(sock, payload)
+                    resp = recv_json(sock)
+            except Exception as e:
+                peer_rt.last_error = str(e)
+                # Don't reuse a socket that just failed/timed out -- a late
+                # reply for this call could otherwise be misdelivered as the
+                # response to a later, unrelated call on the same DEALER.
+                self._close_rpc_socket(peer_rt)
+                return None
+
+            if not isinstance(resp, dict):
+                # recv_json() (the no-pump fallback) swallows a timeout/ZMQError
+                # into None instead of raising -- same "don't reuse" reasoning
+                # as the exception branch above applies here too.
+                peer_rt.last_error = "invalid response"
+                self._close_rpc_socket(peer_rt)
+                return None
         return resp
 
     def _next_federation_meta(self, raw: object) -> Json:

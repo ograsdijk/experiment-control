@@ -33,6 +33,14 @@ _LIFECYCLE_TYPES = frozenset({
     "device.recover",
 })
 
+# Request types FederationHub.forward_device_request actually forwards to a
+# peer (mirrors hub.py's "command" + _MIRRORED_LIFECYCLE_TYPES check). A
+# mirrored-device request of one of these types is handed to the lifecycle
+# thread pool exactly like _LIFECYCLE_TYPES above (F10): forwarding used to
+# run inline on the manager poll loop, blocking it for up to the peer's
+# rpc_timeout_ms per request, per unreachable/slow peer.
+_FEDERATION_FORWARD_TYPES = _LIFECYCLE_TYPES | {"command"}
+
 
 def _parse_internal_payload(payload_bytes: bytes) -> tuple[InternalRpcEnvelope | None, Json | None]:
     try:
@@ -92,17 +100,29 @@ class InternalRpcMixin(_MixinBase):
         # Lifecycle ops: hand off to the worker pool so different
         # devices can run concurrently. Reply is sent later when the
         # worker enqueues it on _lifecycle_reply_queue and the main
-        # loop drains. Federated devices stay on the main thread, but
-        # FederationHub._rpc_call pre-resolves the peer host and pumps manager
-        # subscriptions while awaiting the reply, so an unreachable peer can't
-        # starve process heartbeats during the forward.
+        # loop drains.
         rtype = req.get("type")
         device_id = req.get("device_id")
+        is_mirrored = isinstance(device_id, str) and self._federation_hub.is_mirrored_device(
+            device_id
+        )
+        # F10: federation forwards used to run inline here on the poll loop
+        # (FederationHub._rpc_call pre-resolves the peer host and pumps manager
+        # subscriptions while waiting, but that only protects heartbeats -- the
+        # loop still couldn't process any other RPC until the peer replied or
+        # timed out). Route them through the same worker pool as local
+        # lifecycle ops instead; route_device_request (called from
+        # _run_lifecycle) reaches FederationHub.forward_device_request
+        # unchanged, now off the main thread.
+        if rtype in _FEDERATION_FORWARD_TYPES and is_mirrored:
+            assert isinstance(device_id, str)
+            self._dispatch_lifecycle_task(identity, req, rtype, device_id)
+            return
         if (
             rtype in _LIFECYCLE_TYPES
             and isinstance(device_id, str)
             and device_id in self._devices
-            and not self._federation_hub.is_mirrored_device(device_id)
+            and not is_mirrored
         ):
             self._dispatch_lifecycle_task(identity, req, rtype, device_id)
             return

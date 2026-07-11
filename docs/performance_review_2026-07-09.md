@@ -283,6 +283,7 @@ Because of (1) and (2), **option (b) is the recommended default** — deferring 
 
 ### F10 — Federation forward blocks the Manager loop; socket per call
 
+- **Status:** ✅ **FIXED**. See *Resolution* below.
 - **Severity:** Medium (only when federation configured). **Confidence:** Confirmed.
 - **File:** `src/experiment_control/federation/hub.py` — `_rpc_call` (L1138–1167: `connect_dealer` per call, `_blocking_call_with_pump` on the poll loop), `forward_device_request` (L468).
 - **Behavior:** requests for mirrored devices arriving at the Manager are forwarded synchronously on the main loop, waiting up to the peer's `rpc_timeout_ms` (pumping subscriptions meanwhile — safe here, main thread). A fresh DEALER socket is created per call. DNS is properly cached/off-loop (good), and the *router's* mirrored path has per-route worker threads (good) — this Manager-side path is the weaker twin.
@@ -290,6 +291,8 @@ Because of (1) and (2), **option (b) is the recommended default** — deferring 
 - **Recommendation:** move Manager-side federation forwards onto per-peer worker threads with persistent sockets (mirror the router's `_MirroredDeviceWorker` design), replying via the lifecycle reply queue.
 - **Hardware testing:** no (network testbed suffices).
 - **Measurement:** Manager pump-gap while hammering a mirrored device with the peer blackholed.
+
+**Resolution (implemented):** `internal_rpc.py`'s `_handle_internal_rpc` now hands mirrored-device `"command"` and lifecycle-type requests to the same lifecycle thread pool already used for local device.connect/disconnect/driver.start/stop/restart/recover (`_dispatch_lifecycle_task` / `_run_lifecycle` / `_lifecycle_reply_queue`), instead of excluding mirrored devices and running `route_device_request` inline. `route_device_request` → `forward_device_request` → `_rpc_call` now executes on a lifecycle-executor worker thread, so a peer stall no longer blocks the Manager poll loop; the main loop only drains the reply queue and writes to `_internal_rpc`. `FederationHub._rpc_call` also now keeps one persistent per-peer DEALER (`PeerRuntime.rpc_sock`, guarded by a per-peer `rpc_lock` so device forwards on the executor and process forwards still on the poll loop can't interleave send/recv on it) instead of connecting fresh each call; a failed or timed-out call closes and discards that socket so a subsequent call can't misattribute a late reply (DEALER here has no per-call request/reply correlation). `forward_process_request` is unchanged (still runs on the poll loop) but now benefits from the same persistent socket. Tests: `tests/test_federation_forward_offload.py` (mirrored command/lifecycle requests dispatched to the lifecycle executor and not run inline; non-forwarding mirrored request types still run inline; persistent-socket reuse across successful calls; socket closed and reconnected after a failure) plus the existing `tests/test_federation_hub.py` suite. Full `unittest discover` passes (946 tests, 1 skipped).
 
 ### F11 — Influx writer: shared HTTP worker, no connection reuse
 
