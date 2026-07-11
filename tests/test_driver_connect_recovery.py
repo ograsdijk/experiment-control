@@ -25,6 +25,8 @@ class DriverConnectRecoveryTests(unittest.TestCase):
         runner._device_reachable = True
         runner._last_error = None
         runner._last_ok_ts = None
+        runner._capabilities_cache = {"cached": True}
+        runner._members_cache = {"cached": True}
         runner._connect_called = False
         runner._action_failed_since_last_ok = False
         runner._now = lambda: Timestamp(t_wall=1.0, t_mono=2.0)  # type: ignore[method-assign]
@@ -115,6 +117,27 @@ class DriverConnectRecoveryTests(unittest.TestCase):
         self.assertEqual(resp["status"], "OK")
         self.assertEqual(runner._calls, ["disconnect-raised", "connect"])
         self.assertEqual(runner._device_state, DeviceState.OK)
+
+    def test_failed_connect_cleans_up_and_resets_connection_state(self) -> None:
+        runner = self._runner()
+        runner._device_state = DeviceState.DISCONNECTED
+        runner._device_reachable = False
+
+        def _boom() -> None:
+            runner._calls.append("connect-raised")
+            raise RuntimeError("device unavailable")
+
+        runner.connect_device = _boom  # type: ignore[method-assign]
+
+        with self.assertRaisesRegex(RuntimeError, "device unavailable"):
+            runner._rpc_route_connect_device({"id": 7})
+
+        self.assertEqual(runner._calls, ["connect-raised", "disconnect"])
+        self.assertEqual(runner._device_state, DeviceState.DISCONNECTED)
+        self.assertFalse(runner._device_reachable)
+        self.assertIsNone(runner._capabilities_cache)
+        self.assertIsNone(runner._members_cache)
+        self.assertTrue(runner._connect_called)
 
 
 if __name__ == "__main__":

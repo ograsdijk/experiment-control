@@ -20,12 +20,15 @@ from experiment_control._manager.process_supervision import (  # noqa: E402
     maybe_restart_managed_process,
     maybe_schedule_restart,
     enforce_device_driver_heartbeat_timeout,
+    enforce_device_driver_stop_timeout,
+    driver_is_stopped,
     process_snapshot,
     start_process_handle,
     stop_process_handle,
     supervise_device_drivers,
     try_restart_process,
     update_managed_process_exit_state,
+    update_device_driver_exit_state,
 )
 
 
@@ -102,12 +105,17 @@ def _make_supervision_manager(**overrides: object) -> SimpleNamespace:
 class _FakePopen:
     def __init__(self) -> None:
         self.terminated = False
+        self.killed = False
+        self.returncode: int | None = None
 
-    def poll(self) -> None:
-        return None
+    def poll(self) -> int | None:
+        return self.returncode
 
     def terminate(self) -> None:
         self.terminated = True
+
+    def kill(self) -> None:
+        self.killed = True
 
 
 class ProcessSnapshotMemoryTests(unittest.TestCase):
@@ -540,8 +548,17 @@ class DeviceDriverHeartbeatDemotionTests(unittest.TestCase):
             driver_process_state="RUNNING",
             driver_last_error=None,
             driver_last_error_kind=None,
+            driver_last_failure_pid=None,
+            driver_last_signal_name=None,
+            driver_last_exit_code=None,
+            driver_popen_pid=123,
+            driver_stop_requested_t_mono=None,
             last_hb_recv_mono=None,
             driver_running_since_mono=None,
+            spec=SimpleNamespace(
+                driver_stop_timeout_s=3.0,
+                driver_kill_timeout_s=3.0,
+            ),
         )
         for key, value in overrides.items():
             setattr(handle, key, value)
@@ -569,11 +586,39 @@ class DeviceDriverHeartbeatDemotionTests(unittest.TestCase):
         with g1, g2:
             enforce_device_driver_heartbeat_timeout(manager, handle, 100.0)
         self.assertEqual(str(handle.driver_process_state), "FAILED")
-        self.assertIsNone(handle.driver_pid)
-        self.assertIsNone(handle.process)  # stale wrapper cleared
-        self.assertTrue(popen.terminated)  # and terminated
+        self.assertEqual(handle.driver_pid, 123)
+        self.assertIs(handle.process, popen)
+        self.assertTrue(popen.terminated)
         self.assertEqual(handle.driver_last_error_kind, "heartbeat_stale")
+        self.assertFalse(driver_is_stopped(handle))
         manager._publish_driver_event.assert_called()
+
+    def test_stale_driver_that_ignores_terminate_is_killed(self) -> None:
+        popen = _FakePopen()
+        handle = self._handle(process=popen, last_hb_recv_mono=90.0)
+        manager = self._manager()
+        g1, g2 = self._no_defer()
+        with g1, g2:
+            enforce_device_driver_heartbeat_timeout(manager, handle, 100.0)
+
+        enforce_device_driver_stop_timeout(manager, handle, 103.1)
+
+        self.assertTrue(popen.killed)
+        self.assertIs(handle.process, popen)
+
+    def test_automatic_heartbeat_failure_remains_failed_after_clean_exit(self) -> None:
+        popen = _FakePopen()
+        handle = self._handle(process=popen, last_hb_recv_mono=90.0)
+        manager = self._manager()
+        g1, g2 = self._no_defer()
+        with g1, g2:
+            enforce_device_driver_heartbeat_timeout(manager, handle, 100.0)
+
+        update_device_driver_exit_state(manager, handle, 0)
+
+        self.assertEqual(str(handle.driver_process_state), "FAILED")
+        self.assertIsNone(handle.process)
+        self.assertIsNone(handle.driver_pid)
 
     def test_ages_against_running_since_when_no_heartbeat(self) -> None:
         handle = self._handle(
