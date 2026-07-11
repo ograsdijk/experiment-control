@@ -583,7 +583,7 @@ class SequencerRuntime:
 
             if self._set_context_state is not None:
                 if not self._step_set_context(now):
-                    return
+                    return False
                 self._finish_active_step(time.monotonic())
 
             if self._adaptive_observe_state is not None:

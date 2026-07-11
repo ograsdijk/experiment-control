@@ -3969,14 +3969,16 @@ class HdfWriter(ManagedProcessBase):
                 else:
                     raise TypeError(f"stream {item!r} must be device.stream")
             elif isinstance(item, dict):
-                device_id = item.get("device_id", item.get("device", ""))
-                stream = item.get("stream", "")
-                if item.get("expected_count") is not None:
-                    expected_count = int(item.get("expected_count"))
+                device_id = str(item.get("device_id", item.get("device", "")))
+                stream = str(item.get("stream", ""))
+                expected_count_raw = item.get("expected_count")
+                if expected_count_raw is not None:
+                    expected_count = int(expected_count_raw)
                     if expected_count < 0:
                         raise ValueError("expected_count must be >= 0")
-                if item.get("context_id") is not None:
-                    item_context = int(item.get("context_id"))
+                context_id_raw = item.get("context_id")
+                if context_id_raw is not None:
+                    item_context = int(context_id_raw)
             else:
                 raise TypeError("stream entries must be dicts or strings")
             key = self._stream_key_from_parts(device_id, stream)

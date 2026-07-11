@@ -148,7 +148,7 @@ def resolve_tcp_endpoint(endpoint: str) -> str | None:
         except (OSError, UnicodeError):
             continue
         for info in infos:
-            ip = info[4][0]
+            ip = str(info[4][0])
             if ip:
                 return _build_tcp_endpoint(ip, int(port))
     return None
