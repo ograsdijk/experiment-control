@@ -223,6 +223,14 @@ Data handling (HDF writer with background flush thread, Influx with background H
 - **Hardware testing:** required (per driver; vendor libraries differ in transaction cost and reentrancy).
 - **Measurement:** add per-call durations in `read_telemetry` (see §9) and driver-side RPC service latency (poll-in → reply-sent).
 
+**Implementation note — interleaving hazards in option (a).** Option (a) ("poll RPC between telemetry calls") is safe *on the wire* by construction: the loop is single-threaded and the RPC socket is `zmq.REP` (`runner.py:174`), each telemetry call is one complete write-query-read transaction, so polling only at the boundary *between* calls (never mid-transaction) leaves the device link quiescent and the wire strictly serialized. But a naive implementation introduces three hazards that must be guarded:
+
+1. **REP recv/send alternation.** The main loop services RPC as a strict `recv_json()`→`send_json()` pair (`runner.py:256-266`); REP forbids two recvs without an intervening send. A mid-sweep "service pending RPC" helper must complete its send before resuming the sweep *and* be exception-safe — a serviced command that raises and unwinds without sending leaves the socket in the wrong state, and the next loop recv throws `Operation cannot be accomplished in current state`.
+2. **Reentrancy into telemetry state.** `read_telemetry` resets `self._telemetry_last_call_errors` at entry (`runner.py:497`) and accumulates into it during the sweep (`:555`); `_publish_telemetry` bumps `self._telemetry_seq` (`:1124`). If the serviced RPC itself triggers a telemetry read (an on-demand telemetry action, or a device command that reads the same registers), the nested call clobbers the outer sweep's error map and sequence number. Today this is structurally impossible (telemetry runs only from the one loop site); option (a) makes it reachable, so it needs a re-entry guard (e.g. an `_in_telemetry` flag that suppresses telemetry-triggering RPC while a sweep is active).
+3. **Intra-bundle snapshot coherence (minor).** A command serviced mid-sweep can change device state that a later call in the same sweep reads back, so the published bundle is no longer a single-instant snapshot. Usually benign for telemetry.
+
+Because of (1) and (2), **option (b) is the recommended default** — deferring the whole telemetry tick when an RPC arrived within the last X ms never re-enters telemetry mid-sweep and never touches the REP state machine mid-flight, at the cost of a bounded telemetry gap (which must stay under the interlock/watchdog `max_age`; operator question 5). Prefer option (a) only when the no-gap property is required, and only with all three guards above.
+
 ### F8 — Sequencer `set_context` path: blocking retries + per-context RPCs
 
 - **Severity:** Medium. **Confidence:** Confirmed.
@@ -433,7 +441,7 @@ Existing signals are good (driver `loop_lag_s`, `manager.loop_stall`, pump timin
 | 6 | F15 dynamic sequencer poll timeout — ✅ **DONE** (`fix/f15-sequencer-dynamic-poll-timeout`) | Medium (shot-rate) | Low | No |
 | 7 | F8 non-blocking set_context retries — ✅ **DONE** (`fix/f8-set-context-nonblocking`) | Medium | Low-medium | No |
 | 8 | F7 driver RPC/telemetry interleaving | Medium-high per device | Medium | **Yes, per driver** |
-| 9 | F9 parallel shutdown | Medium | Low | Once |
+| 9 | F9 parallel shutdown — ✅ **DONE** | Medium | Low | Once |
 | 10 | F6 `parallel` step (restricted form) | High for multi-device scans | Medium-high | **Yes + operator sign-off** |
 | 11 | F13 SHM copy + seqlock re-check — ✅ **DONE** (`eb54477`) | Medium (large streams) | Low | No |
 | 12 | F11 Influx per-destination workers/keep-alive | Medium (monitoring) | Low | No |
