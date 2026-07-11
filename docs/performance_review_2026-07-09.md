@@ -408,7 +408,7 @@ Network devices (Linien/rpyc) get the same per-process isolation. ZMQ transports
 
 ## 8. Data handling, logging, and HDF5 assessment
 
-The HDF writer is the strongest component reviewed: SUB drain never touches h5py on the hot path; writes are batched to a background thread through a bounded queue with lossless deferral; fsync cadence is decoupled from batching; strict-stream accounting and drop counters are written into the file. Logging in timing-sensitive loops is rate-limited (driver telemetry exceptions, drain-cap events, reconnect events). Metadata (`.attrs`) writes happen at file/measurement boundaries, not per shot. Remaining items: SHM double-copy and seqlock gap (F13); the sequencer/event datasets grow by 1-row resizes (fine at their rates); the `manager.command` event volume itself — every device command produces a manager event + journal row + HDF event-buffer entry — is worth watching at high shot rates (`event_log_mode` already lets operators reduce it).
+The HDF writer is the strongest component reviewed: SUB drain never touches h5py on the hot path; writes are batched to a background thread through a bounded queue with lossless deferral; fsync cadence is decoupled from batching; strict-stream accounting and drop counters are written into the file. Logging in timing-sensitive loops is rate-limited (driver telemetry exceptions, drain-cap events, reconnect events). Metadata (`.attrs`) writes happen at file/measurement boundaries, not per shot. The SHM double-copy and seqlock gap (F13) are fixed; the sequencer/event datasets grow by 1-row resizes (fine at their rates); the `manager.command` event volume itself — every device command produces a manager event + journal row + HDF event-buffer entry — is worth watching at high shot rates (`event_log_mode` already lets operators reduce it).
 
 ## 9. Profiling and measurement recommendations (where instrumentation belongs)
 
@@ -435,7 +435,7 @@ Existing signals are good (driver `loop_lag_s`, `manager.loop_stall`, pump timin
 | 8 | F7 driver RPC/telemetry interleaving | Medium-high per device | Medium | **Yes, per driver** |
 | 9 | F9 parallel shutdown | Medium | Low | Once |
 | 10 | F6 `parallel` step (restricted form) | High for multi-device scans | Medium-high | **Yes + operator sign-off** |
-| 11 | F13 SHM copy + seqlock re-check | Medium (large streams) | Low | No |
+| 11 | F13 SHM copy + seqlock re-check — ✅ **DONE** (`eb54477`) | Medium (large streams) | Low | No |
 | 12 | F11 Influx per-destination workers/keep-alive | Medium (monitoring) | Low | No |
 | 13 | F10/F14 federation & manager inline command hardening | Medium (deployment-dependent) | Medium | No |
 | 14 | F12 analysis fit offload | Medium | Medium | No |
