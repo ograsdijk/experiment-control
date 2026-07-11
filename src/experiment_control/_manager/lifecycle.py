@@ -54,6 +54,7 @@ class LifecycleMixin(_MixinBase):
     _external_pub: "zmq.Socket"
     _ctx: "zmq.Context"
     _process_guard: Any  # ProcessGuardian — opaque to mypy
+    _startup_sequence_complete_mono: float | None
 
     def _not_running_process_ids(self, running_state: Any) -> list[str]:
         return [

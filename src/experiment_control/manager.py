@@ -267,6 +267,7 @@ class Manager(
     _lifecycle_event_dropped_lock: threading.Lock
     _telemetry_latest: dict[str, dict[str, tuple[Timestamp, TelemetrySignal]]]
     _telemetry_last_bundle_ts: dict[str, Timestamp]
+    _telemetry_last_recv_mono: dict[str, float]
     _telemetry_device_order: dict[str, None]
     _latest_chunk_desc: dict[str, dict[str, Json]]
     _chunk_device_order: dict[str, None]
