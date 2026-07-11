@@ -435,6 +435,51 @@ steps:
         self.assertFalse(bool(resp.get("result", {}).get("valid")))
         self.assertIn("parallel_unsupported_branch", _codes_from(resp))
 
+    def test_preflight_accepts_distinct_parallel_repeat_branches(self) -> None:
+        mgr = _FakeManager(
+            devices={"a", "b"}, capabilities_by_device={"a": {}, "b": {}}
+        )
+        proc = _build_proc(mgr)
+        yaml_text = """
+version: 1
+vars: {n: 3}
+steps:
+  - parallel:
+      do:
+        - repeat:
+            times: "${n}"
+            do:
+              - call: {device: a, action: read}
+        - repeat:
+            times: "${n}"
+            do:
+              - call: {device: b, action: read}
+"""
+        response = proc._handle_rpc(
+            {"type": "sequencer.preflight", "params": {"text": yaml_text}}
+        )
+        self.assertTrue(bool(response.get("result", {}).get("valid")))
+
+    def test_preflight_rejects_repeat_target_conflict(self) -> None:
+        mgr = _FakeManager(devices={"same"}, capabilities_by_device={"same": {}})
+        proc = _build_proc(mgr)
+        yaml_text = """
+version: 1
+steps:
+  - parallel:
+      do:
+        - repeat:
+            times: 2
+            do:
+              - call: {device: same, action: read}
+        - call: {device: same, action: other}
+"""
+        response = proc._handle_rpc(
+            {"type": "sequencer.preflight", "params": {"text": yaml_text}}
+        )
+        self.assertFalse(bool(response.get("result", {}).get("valid")))
+        self.assertIn("parallel_target_conflict", _codes_from(response))
+
     def test_preflight_rejects_parallel_nested_inside_atomic(self) -> None:
         mgr = _FakeManager(
             devices={"a", "b"},
