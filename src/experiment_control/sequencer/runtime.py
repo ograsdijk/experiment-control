@@ -138,6 +138,21 @@ class _NoStepReady:
 _NO_STEP_READY = _NoStepReady()
 StepResult = Step | _NoStepReady | None
 
+# F5 fix: tick() used to run the inner step loop to completion (until a
+# sleep/wait/pause step, or sequence end), so a scan made entirely of cheap
+# steps (set/call/assign/for/repeat all return False from _execute_step)
+# could run for the whole scan inside one tick() call. sequencer.py's run()
+# only drains the RPC ROUTER (pause/stop/status) *between* tick() calls, so
+# such a scan left the process unresponsive to control for its full
+# duration. Bound the inner loop by wall-clock time and step count so
+# run() regularly gets a chance to service RPC. Neither budget is checked
+# while inside an atomic block (`_atomic_depth > 0`): atomic blocks must
+# remain uninterruptible by anything other than their own completion,
+# exactly as they already are with respect to stop/pause in
+# `_check_stop_pause`.
+_TICK_BUDGET_S = 0.010
+_TICK_MAX_STEPS = 200
+
 
 class SequencerRuntime:
     def __init__(
@@ -496,44 +511,56 @@ class SequencerRuntime:
         remaining_ms = int(math.ceil(remaining_s * 1000.0))
         return max(floor_ms, min(ceiling_ms, remaining_ms))
 
-    def tick(self) -> None:
+    def tick(self) -> bool:
+        """Advance the sequence by one tick, bounded by the per-tick budget.
+
+        Returns True only when the tick returned *solely* because the step/time
+        budget was exhausted while more step work is immediately runnable (no
+        sleep/wait/pause/stop/error is blocking progress). This lets the caller
+        (`sequencer.py`'s `run()`) distinguish "budget exhausted, resume ASAP"
+        from "genuinely idle" (sleeping, waiting, paused, stopped, errored, or
+        the sequence finished) and shorten its next RPC poll timeout accordingly
+        instead of always waiting out the full poll ceiling — see F5/F15.
+        """
         if self._state != "RUNNING":
-            return
+            return False
 
         try:
             if self._pending_terminal_state is not None and not self._stack:
                 self._finish_pending_terminal()
-                return
+                return False
 
             if self._check_stop_pause():
-                return
+                return False
 
             now = time.monotonic()
             if self._sleep_until is not None:
                 if now < self._sleep_until:
-                    return
+                    return False
                 self._sleep_until = None
                 self._finish_active_step(now)
 
             if self._wait_state is not None:
                 if not self._step_wait_until(now):
-                    return
+                    return False
                 self._finish_active_step(time.monotonic())
 
             if self._adaptive_observe_state is not None:
                 if not self._step_adaptive_observation(now):
-                    return
+                    return False
 
+            tick_deadline = time.monotonic() + _TICK_BUDGET_S
+            steps_executed = 0
             while self._state == "RUNNING":
                 if self._check_stop_pause():
-                    return
+                    return False
                 step = self._next_step()
                 if isinstance(step, _NoStepReady):
-                    return
+                    return False
                 if step is None:
                     if self._pending_terminal_state is not None:
                         self._finish_pending_terminal()
-                        return
+                        return False
                     if self._state == "RUNNING":
                         self._loops_completed += 1
                         if self._should_continue_run_loops():
@@ -541,13 +568,23 @@ class SequencerRuntime:
                             continue
                         self._state = "STOPPED"
                         self._run_ended_mono = time.monotonic()
-                    return
+                    return False
                 self._begin_active_step(time.monotonic())
                 if self._execute_step(step):
                     if self._sleep_until is None and self._wait_state is None:
                         self._finish_active_step(time.monotonic())
-                    return
+                    return False
                 self._finish_active_step(time.monotonic())
+                steps_executed += 1
+                if self._interruptible() and (
+                    steps_executed >= _TICK_MAX_STEPS
+                    or time.monotonic() >= tick_deadline
+                ):
+                    # Budget exhausted, but the loop condition
+                    # (`self._state == "RUNNING"`) still held and nothing
+                    # blocking (sleep/wait/pause/stop) intervened: there is
+                    # more step work ready right now.
+                    return True
         except Exception as e:
             if not self._handle_runtime_exception(e):
                 if self._last_error_detail is None:
@@ -555,6 +592,7 @@ class SequencerRuntime:
                 self._last_error = str(e)
                 self._state = "ERROR"
                 self._run_ended_mono = time.monotonic()
+        return False
 
     def _env_view(self) -> dict[str, Any]:
         env = dict(self._env)
@@ -605,8 +643,18 @@ class SequencerRuntime:
         except Exception:
             return False
 
+    def _interruptible(self) -> bool:
+        """Whether the run loop may act on stop/pause/tick-budget right now.
+
+        `False` while inside an `atomic` block (`_atomic_depth > 0`): atomic
+        blocks must remain uninterruptible by anything other than their own
+        completion. Single source of truth for the guard shared by
+        `_check_stop_pause` and the per-tick step/time budget in `tick()`.
+        """
+        return self._atomic_depth == 0
+
     def _check_stop_pause(self) -> bool:
-        if self._stop_requested and self._atomic_depth == 0:
+        if self._stop_requested and self._interruptible():
             now = time.monotonic()
             self._mark_pause_ended(now)
             self._stop_requested = False
@@ -614,7 +662,7 @@ class SequencerRuntime:
                 self._state = "STOPPED"
                 self._run_ended_mono = now
             return True
-        if self._pause_requested and self._atomic_depth == 0:
+        if self._pause_requested and self._interruptible():
             self._mark_pause_started(time.monotonic())
             self._state = "PAUSED"
             return True
