@@ -2,18 +2,21 @@ from __future__ import annotations
 
 import argparse
 import json
+import queue
 import sys
+import threading
 import time
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import yaml
 import zmq
 
 from ..capabilities import capabilities_payload, method, param
+from ..manager_client import ManagerClient
 from ..processes.process_base import ManagedProcessBase
 from ..utils.cli_args import (
     add_heartbeat_args,
@@ -50,7 +53,14 @@ from .condition_validation import has_error_diagnostics, validate_sequence_condi
 from .eval import render_templates, to_attrdict
 from .library import SequenceLibrary, SequenceLibraryEntry
 from .ranges import generate_from_gen
-from .runtime import SequencerRuntime
+from .runtime import (
+    ParallelBranchPlan,
+    ParallelBranchResult,
+    SequencerRuntime,
+    parallel_branch_operations,
+    parallel_step_output_names,
+    run_parallel_branch,
+)
 from .source_info import build_step_source_info
 
 Json = dict[str, Any]
@@ -83,6 +93,26 @@ _SET_CONTEXT_DISPATCH_MAX_WORKERS = 16
 # as a whole -- queued-but-not-yet-started calls included -- with a small
 # buffer over the per-call deadline for expect + queueing overhead.
 _SET_CONTEXT_DISPATCH_DEADLINE_S = _STREAM_CONTEXT_SET_RETRY_DEADLINE_S + 2.0
+_PARALLEL_MAX_WORKERS = 8
+
+
+def _nested_step_lists(step: Step) -> tuple[list[Step], ...]:
+    if isinstance(step, (ForStep, RepeatStep, WhileStep, AtomicStep, AdaptiveStep)):
+        return (step.body,)
+    if isinstance(step, IfStep):
+        return (step.then_steps, step.else_steps or [])
+    if isinstance(step, TryStep):
+        return (step.body, step.finally_steps)
+    return ()
+
+
+def _steps_contain_parallel(steps: list[Step]) -> bool:
+    return any(
+        isinstance(step, ParallelStep)
+        or any(_steps_contain_parallel(children) for children in _nested_step_lists(step))
+        for step in steps
+        if not getattr(step, "disabled", False)
+    )
 
 
 @dataclass
@@ -133,6 +163,75 @@ class _SetContextDispatch:
         for call in self.calls:
             if call.future is not None:
                 call.future.cancel()
+
+
+@dataclass
+class _ParallelDispatch:
+    futures: list[tuple[ParallelBranchPlan, Future[ParallelBranchResult]]]
+
+    def cancel(self) -> None:
+        for _plan, future in self.futures:
+            future.cancel()
+
+
+class _ParallelWorkerPool:
+    """Fixed workers with one persistent, thread-affine client each."""
+
+    def __init__(
+        self,
+        *,
+        worker_count: int,
+        client_factory: Callable[[], ManagerClient],
+        execute: Callable[
+            [ParallelBranchPlan, ManagerClient], ParallelBranchResult
+        ],
+    ) -> None:
+        self._client_factory = client_factory
+        self._execute = execute
+        self._queue: queue.Queue[
+            tuple[ParallelBranchPlan, Future[ParallelBranchResult]] | None
+        ] = queue.Queue()
+        self._threads = [
+            threading.Thread(
+                target=self._worker,
+                name=f"sequencer-parallel-{index}",
+                daemon=True,
+            )
+            for index in range(worker_count)
+        ]
+        for thread in self._threads:
+            thread.start()
+
+    def submit(self, plan: ParallelBranchPlan) -> Future[ParallelBranchResult]:
+        future: Future[ParallelBranchResult] = Future()
+        self._queue.put((plan, future))
+        return future
+
+    def close(self) -> None:
+        for _thread in self._threads:
+            self._queue.put(None)
+        for thread in self._threads:
+            thread.join()
+
+    def _worker(self) -> None:
+        client: ManagerClient | None = None
+        try:
+            while True:
+                item = self._queue.get()
+                if item is None:
+                    return
+                plan, future = item
+                if not future.set_running_or_notify_cancel():
+                    continue
+                try:
+                    if client is None:
+                        client = self._client_factory()
+                    future.set_result(self._execute(plan, client))
+                except BaseException as exc:
+                    future.set_exception(exc)
+        finally:
+            if client is not None:
+                client.close()
 
 
 _DRIVER_BUILTIN_ACTIONS = {
@@ -285,6 +384,11 @@ class SequencerProcess(ManagedProcessBase):
             max_workers=_SET_CONTEXT_DISPATCH_MAX_WORKERS,
             thread_name_prefix="sequencer-set-context",
         )
+        self._parallel_workers = _ParallelWorkerPool(
+            worker_count=_PARALLEL_MAX_WORKERS,
+            client_factory=self._new_parallel_client,
+            execute=self._run_parallel_branch,
+        )
 
         # Control plane (ROUTER)
         self._init_rpc_router()
@@ -323,6 +427,8 @@ class SequencerProcess(ManagedProcessBase):
             expect_streams=self._expect_streams,
             begin_set_context=self._begin_set_context,
             poll_set_context=self._poll_set_context,
+            begin_parallel=self._begin_parallel,
+            poll_parallel=self._poll_parallel,
         )
         self._context_columns: dict[str, str] | None = None
         self._loaded_sequence_source: str | None = None
@@ -365,6 +471,10 @@ class SequencerProcess(ManagedProcessBase):
             self._try_autoload_path(str(autoload_path))
 
     def close(self) -> None:
+        try:
+            self._parallel_workers.close()
+        except Exception:
+            pass
         try:
             self._context_executor.shutdown(wait=False, cancel_futures=True)
         except Exception:
@@ -2140,6 +2250,117 @@ class SequencerProcess(ManagedProcessBase):
             use_stack=use_stack,
         )
 
+    @staticmethod
+    def _preflight_parallel_operation_target(
+        operation: CallStep | SetStep, env: dict[str, Any]
+    ) -> tuple[str, str] | None:
+        try:
+            if isinstance(operation, SetStep):
+                device = str(render_templates(operation.device, env) or "").strip()
+                return ("device", device) if device else None
+            device = str(render_templates(operation.device, env) or "").strip()
+            process = str(
+                render_templates(operation.process or "", env) or ""
+            ).strip()
+            if device and not process:
+                return ("device", device)
+            if process and not device:
+                return ("process", process)
+        except Exception:
+            # Existing call/set preflight reports unresolved templates. Runtime
+            # repeats conflict validation after rendering the actual loop env.
+            pass
+        return None
+
+    def _preflight_parallel_branch_refs(
+        self, branch: Step, env: dict[str, Any]
+    ) -> tuple[set[str], set[tuple[str, str]]]:
+        outputs: set[str] = set()
+        targets: set[tuple[str, str]] = set()
+        for operation in parallel_branch_operations(branch):
+            outputs.update(parallel_step_output_names(operation.step))
+            target = self._preflight_parallel_operation_target(operation.step, env)
+            if target is not None:
+                targets.add(target)
+        return outputs, targets
+
+    def _preflight_parallel_conflicts(
+        self,
+        *,
+        branch_index: int,
+        branch_path: str,
+        outputs: set[str],
+        targets: set[tuple[str, str]],
+        output_owners: dict[str, int],
+        target_owners: dict[tuple[str, str], int],
+        diagnostics: list[Json],
+    ) -> None:
+        for output_name in outputs:
+            owner = output_owners.setdefault(output_name, branch_index)
+            if owner != branch_index:
+                diagnostics.append(
+                    self._preflight_diag(
+                        severity="error",
+                        path=branch_path,
+                        code="parallel_output_conflict",
+                        message=(
+                            f"parallel branches {owner} and {branch_index} both "
+                            f"write output {output_name!r}"
+                        ),
+                    )
+                )
+        for target in targets:
+            owner = target_owners.setdefault(target, branch_index)
+            if owner != branch_index:
+                kind, target_id = target
+                diagnostics.append(
+                    self._preflight_diag(
+                        severity="error",
+                        path=branch_path,
+                        code="parallel_target_conflict",
+                        message=(
+                            f"parallel branches {owner} and {branch_index} both "
+                            f"target {kind} {target_id!r}"
+                        ),
+                    )
+                )
+
+    def _preflight_handle_parallel_step(
+        self,
+        *,
+        step: ParallelStep,
+        step_path: str,
+        env: dict[str, Any],
+        diagnostics: list[Json],
+    ) -> None:
+        target_owners: dict[tuple[str, str], int] = {}
+        output_owners: dict[str, int] = {}
+        for branch_index, branch in enumerate(step.body):
+            if getattr(branch, "disabled", False):
+                continue
+            branch_path = f"{step_path}.parallel.do[{branch_index}]"
+            try:
+                outputs, targets = self._preflight_parallel_branch_refs(branch, env)
+            except ValueError as exc:
+                diagnostics.append(
+                    self._preflight_diag(
+                        severity="error",
+                        path=branch_path,
+                        code="parallel_unsupported_branch",
+                        message=str(exc),
+                    )
+                )
+                continue
+            self._preflight_parallel_conflicts(
+                branch_index=branch_index,
+                branch_path=branch_path,
+                outputs=outputs,
+                targets=targets,
+                output_owners=output_owners,
+                target_owners=target_owners,
+                diagnostics=diagnostics,
+            )
+
     def _preflight_dispatch_structural_step(
         self,
         *,
@@ -2227,6 +2448,15 @@ class SequencerProcess(ManagedProcessBase):
             return True
 
         if isinstance(step, AtomicStep):
+            if _steps_contain_parallel(step.body):
+                diagnostics.append(
+                    self._preflight_diag(
+                        severity="error",
+                        path=f"{step_path}.atomic.do",
+                        code="atomic_parallel_unsupported",
+                        message="parallel is not allowed inside an atomic block",
+                    )
+                )
             self._preflight_recurse_steps(
                 steps=step.body,
                 path=f"{step_path}.atomic.do",
@@ -2241,6 +2471,12 @@ class SequencerProcess(ManagedProcessBase):
             return True
 
         if isinstance(step, ParallelStep):
+            self._preflight_handle_parallel_step(
+                step=step,
+                step_path=step_path,
+                env=env,
+                diagnostics=diagnostics,
+            )
             self._preflight_recurse_steps(
                 steps=step.body,
                 path=f"{step_path}.parallel.do",
@@ -2424,6 +2660,76 @@ class SequencerProcess(ManagedProcessBase):
         if status == "ERROR":
             return {"ok": False, "error": resp.get("error", "unknown")}
         return resp
+
+    def _new_parallel_client(self) -> ManagerClient:
+        return ManagerClient(
+            ctx=self._ctx,
+            manager_rpc=self._manager_rpc,
+            manager_pub=self._manager_pub,
+            rpc_timeout_ms=self._rpc_timeout_ms,
+            process_id=self._process_id,
+            subscribe_telemetry=False,
+        )
+
+    def _run_parallel_branch(
+        self, plan: ParallelBranchPlan, client: ManagerClient
+    ) -> ParallelBranchResult:
+        def call_device(
+            device_id: str, action: str, params: dict[str, Any]
+        ) -> Json:
+            req = {
+                "type": "command",
+                "device_id": device_id,
+                "action": action,
+                "params": params,
+            }
+            return self._normalize_call_response(client.call(req))
+
+        def call_process(
+            process_id: str, action: str, params: dict[str, Any]
+        ) -> Json:
+            req = {
+                "type": "manager.processes.rpc",
+                "process_id": process_id,
+                "request": {"type": action, "params": params},
+            }
+            return self._normalize_call_response(client.call(req))
+
+        return run_parallel_branch(
+            plan,
+            call_device=call_device,
+            call_process=call_process,
+        )
+
+    def _begin_parallel(self, plans: list[ParallelBranchPlan]) -> _ParallelDispatch:
+        return _ParallelDispatch(
+            futures=[
+                (plan, self._parallel_workers.submit(plan))
+                for plan in plans
+            ]
+        )
+
+    @staticmethod
+    def _poll_parallel(
+        state: _ParallelDispatch,
+    ) -> tuple[bool, list[ParallelBranchResult] | None]:
+        if any(not future.done() for _plan, future in state.futures):
+            return False, None
+        results: list[ParallelBranchResult] = []
+        for plan, future in state.futures:
+            try:
+                results.append(future.result())
+            except Exception as exc:
+                results.append(
+                    ParallelBranchResult(
+                        index=plan.index,
+                        ok=False,
+                        outputs={},
+                        error=str(exc),
+                        path=plan.path,
+                    )
+                )
+        return True, results
 
     def _call_device(self, device_id: str, action: str, params: dict[str, Any]) -> Json:
         req = {

@@ -45,6 +45,7 @@ _MIN_WAIT_EVERY_S = 0.005
 # source is also checked at a reasonable cadence instead of the full 50ms
 # ceiling.
 _ADAPTIVE_OBSERVE_POLL_S = 0.02
+_PARALLEL_POLL_S = 0.005
 
 
 @dataclass
@@ -125,6 +126,152 @@ class _WaitState:
     stable_since: float | None = None
 
 
+@dataclass(frozen=True)
+class ParallelBranchOperation:
+    source_index: int | None
+    step: CallStep | SetStep
+
+
+@dataclass(frozen=True)
+class ParallelBranchPlan:
+    index: int
+    operations: tuple[ParallelBranchOperation, ...]
+    env: dict[str, Any]
+    path: str
+    atomic: bool = False
+
+
+@dataclass(frozen=True)
+class ParallelBranchResult:
+    index: int
+    ok: bool
+    outputs: dict[str, Any]
+    error: str | None = None
+    path: str | None = None
+
+
+def parallel_branch_operations(step: Step) -> tuple[ParallelBranchOperation, ...]:
+    """Return the operations for one supported parallel branch."""
+    if isinstance(step, (CallStep, SetStep)):
+        return (ParallelBranchOperation(source_index=None, step=step),)
+    if isinstance(step, AtomicStep):
+        operations: list[ParallelBranchOperation] = []
+        for source_index, child in enumerate(step.body):
+            if getattr(child, "disabled", False):
+                continue
+            if not isinstance(child, (CallStep, SetStep)):
+                raise ValueError(
+                    "parallel atomic branches currently support only call and set steps"
+                )
+            operations.append(
+                ParallelBranchOperation(source_index=source_index, step=child)
+            )
+        return tuple(operations)
+    raise ValueError(
+        "parallel branches currently support only call, set, and atomic steps"
+    )
+
+
+def parallel_step_output_names(step: CallStep | SetStep) -> set[str]:
+    if not isinstance(step, CallStep):
+        return set()
+    names: set[str] = set()
+    if step.save_as:
+        names.add(str(step.save_as))
+    if step.extract:
+        names.add(str(step.save_as or "value"))
+    if step.assign:
+        names.update(str(name) for name in step.assign)
+    return names
+
+
+def run_parallel_branch(
+    plan: ParallelBranchPlan,
+    *,
+    call_device: Callable[[str, str, dict[str, Any]], dict[str, Any]],
+    call_process: Callable[[str, str, dict[str, Any]], dict[str, Any]] | None,
+) -> ParallelBranchResult:
+    """Execute one branch sequentially against a branch-local environment."""
+    env = dict(plan.env)
+    outputs: dict[str, Any] = {}
+    for operation in plan.operations:
+        step = operation.step
+        operation_path = (
+            f"{plan.path}.atomic.do[{operation.source_index}]"
+            if plan.atomic
+            else plan.path
+        )
+        try:
+            if isinstance(step, SetStep):
+                device = str(render_templates(step.device, env) or "").strip()
+                if not device:
+                    raise ValueError("set.device rendered empty")
+                value = render_templates(step.value, env)
+                response = call_device(
+                    device,
+                    "set",
+                    {"name": step.name, "value": value},
+                )
+            else:
+                device = str(render_templates(step.device, env) or "").strip()
+                process = str(
+                    render_templates(step.process or "", env) or ""
+                ).strip()
+                action = str(render_templates(step.action, env) or "").strip()
+                if device and process:
+                    raise ValueError("call may set only one of device / process")
+                if (not device and not process) or not action:
+                    raise ValueError("call target rendered empty device/process or action")
+                params = render_templates(step.params, env)
+                if process:
+                    if call_process is None:
+                        raise RuntimeError("process calls not supported")
+                    response = call_process(process, action, params)
+                else:
+                    response = call_device(device, action, params)
+
+                if step.extract and step.assign:
+                    raise ValueError("extract and assign are mutually exclusive")
+                if step.save_as:
+                    env[step.save_as] = response
+                    outputs[step.save_as] = response
+                if step.extract:
+                    value = extract_value(
+                        response.get("result"),
+                        kind=step.extract.get("kind", "scalar"),
+                        ref=step.extract.get("ref"),
+                    )
+                    target = step.save_as or "value"
+                    env[target] = value
+                    outputs[target] = value
+                if step.assign:
+                    result = response.get("result")
+                    for key, spec in step.assign.items():
+                        if not isinstance(spec, dict):
+                            continue
+                        value = extract_value(
+                            result,
+                            kind=spec.get("kind", "scalar"),
+                            ref=spec.get("ref"),
+                        )
+                        env[key] = value
+                        outputs[key] = value
+            if not response.get("ok", False):
+                error = response.get("error")
+                if isinstance(error, dict):
+                    error = error.get("message") or error.get("code") or error
+                raise RuntimeError(str(error or "request failed"))
+        except Exception as exc:
+            return ParallelBranchResult(
+                index=plan.index,
+                ok=False,
+                outputs={},
+                error=str(exc),
+                path=operation_path,
+            )
+    return ParallelBranchResult(index=plan.index, ok=True, outputs=outputs)
+
+
 @dataclass
 class _StepEstimate:
     total: int | None
@@ -168,6 +315,11 @@ class SequencerRuntime:
         begin_set_context: Callable[[list[tuple[str, str]], int, dict[str, Any]], Any]
         | None = None,
         poll_set_context: Callable[[Any, float], tuple[bool, str | None]] | None = None,
+        begin_parallel: Callable[[list[ParallelBranchPlan]], Any] | None = None,
+        poll_parallel: Callable[
+            [Any], tuple[bool, list[ParallelBranchResult] | None]
+        ]
+        | None = None,
     ) -> None:
         self._call_device = call_device
         self._get_telemetry = get_telemetry
@@ -185,6 +337,8 @@ class SequencerRuntime:
         # existing callers/tests that only wire those keep working unchanged.
         self._begin_set_context = begin_set_context
         self._poll_set_context = poll_set_context
+        self._begin_parallel = begin_parallel
+        self._poll_parallel = poll_parallel
 
         self._spec: SequenceSpec | None = None
         self._vars: dict[str, Any] = {}
@@ -205,6 +359,8 @@ class SequencerRuntime:
         self._wait_state: _WaitState | None = None
         self._set_context_state: Any = None
         self._adaptive_observe_state: _AdaptiveObserveState | None = None
+        self._parallel_state: Any = None
+        self._parallel_pending_failure: str | None = None
         self._atomic_depth = 0
         self._current_step: str | None = None
         self._current_step_detail: dict[str, Any] | None = None
@@ -251,6 +407,19 @@ class SequencerRuntime:
         """
         state = self._set_context_state
         self._set_context_state = None
+        if state is None:
+            return
+        cancel = getattr(state, "cancel", None)
+        if callable(cancel):
+            try:
+                cancel()
+            except Exception:
+                pass
+
+    def _clear_parallel_state(self) -> None:
+        state = self._parallel_state
+        self._parallel_state = None
+        self._parallel_pending_failure = None
         if state is None:
             return
         cancel = getattr(state, "cancel", None)
@@ -315,6 +484,7 @@ class SequencerRuntime:
         self._wait_state = None
         self._clear_set_context_state()
         self._adaptive_observe_state = None
+        self._clear_parallel_state()
         self._atomic_depth = 0
         self._current_step = None
         self._current_step_detail = None
@@ -401,6 +571,7 @@ class SequencerRuntime:
         self._wait_state = None
         self._clear_set_context_state()
         self._adaptive_observe_state = None
+        self._clear_parallel_state()
         self._atomic_depth = 0
         self._current_step = None
         self._current_step_detail = None
@@ -445,10 +616,14 @@ class SequencerRuntime:
         self._mark_pause_ended(now)
         self._pause_requested = False
         self._stop_requested = False
+        if self._parallel_state is not None:
+            self._parallel_pending_failure = str(reason or "external fault")
+            return
         self._sleep_until = None
         self._wait_state = None
         self._clear_set_context_state()
         self._adaptive_observe_state = None
+        self._clear_parallel_state()
         if self._begin_terminal_unwind("ERROR", str(reason or "external fault")):
             self._state = "RUNNING"
             return
@@ -541,6 +716,8 @@ class SequencerRuntime:
         aos = self._adaptive_observe_state
         if aos is not None and aos.next_check_t is not None:
             deadlines.append(aos.next_check_t)
+        if self._parallel_state is not None:
+            deadlines.append(time.monotonic() + _PARALLEL_POLL_S)
         if not deadlines:
             return ceiling_ms
         remaining_s = min(deadlines) - time.monotonic()
@@ -586,6 +763,11 @@ class SequencerRuntime:
                     return False
                 self._finish_active_step(time.monotonic())
 
+            if self._parallel_state is not None:
+                if not self._step_parallel():
+                    return False
+                self._finish_active_step(time.monotonic())
+
             if self._adaptive_observe_state is not None:
                 if not self._step_adaptive_observation(now):
                     return False
@@ -616,6 +798,7 @@ class SequencerRuntime:
                         self._sleep_until is None
                         and self._wait_state is None
                         and self._set_context_state is None
+                        and self._parallel_state is None
                     ):
                         self._finish_active_step(time.monotonic())
                     return False
@@ -696,7 +879,7 @@ class SequencerRuntime:
         completion. Single source of truth for the guard shared by
         `_check_stop_pause` and the per-tick step/time budget in `tick()`.
         """
-        return self._atomic_depth == 0
+        return self._atomic_depth == 0 and self._parallel_state is None
 
     def _check_stop_pause(self) -> bool:
         if self._stop_requested and self._interruptible():
@@ -758,6 +941,7 @@ class SequencerRuntime:
         self._wait_state = None
         self._clear_set_context_state()
         self._adaptive_observe_state = None
+        self._clear_parallel_state()
         self._current_step = None
         self._current_step_detail = None
         return True
@@ -781,6 +965,7 @@ class SequencerRuntime:
         self._wait_state = None
         self._clear_set_context_state()
         self._adaptive_observe_state = None
+        self._clear_parallel_state()
         self._state = "ERROR" if cleanup_failed else str(state or "STOPPED")
         self._last_error = error if self._state == "ERROR" else None
         if self._state != "ERROR":
@@ -807,6 +992,7 @@ class SequencerRuntime:
         self._wait_state = None
         self._clear_set_context_state()
         self._adaptive_observe_state = None
+        self._clear_parallel_state()
         self._pending_terminal_state = None
         self._pending_terminal_error = None
         self._cleanup_failed = False
@@ -1355,8 +1541,118 @@ class SequencerRuntime:
         return True
 
     def _execute_parallel_step(self, step: ParallelStep) -> bool:
-        del step
-        return self._fail_step("parallel not supported in v1")
+        if self._atomic_depth > 0:
+            return self._fail_step("parallel is not allowed inside an atomic block")
+        if self._begin_parallel is None or self._poll_parallel is None:
+            return self._fail_step("parallel dispatcher is not configured")
+        env = self._env_view()
+        parent_path = str((self._current_step_detail or {}).get("path") or "parallel")
+        plans: list[ParallelBranchPlan] = []
+        target_owners: dict[tuple[str, str], int] = {}
+        output_owners: dict[str, int] = {}
+
+        try:
+            for branch_index, branch in enumerate(step.body):
+                if getattr(branch, "disabled", False):
+                    continue
+                operations = parallel_branch_operations(branch)
+                branch_path = f"{parent_path}.parallel.do[{branch_index}]"
+                branch_outputs: set[str] = set()
+                branch_targets: set[tuple[str, str]] = set()
+                for operation in operations:
+                    operation_step = operation.step
+                    branch_outputs.update(parallel_step_output_names(operation_step))
+                    if isinstance(operation_step, SetStep):
+                        rendered_target = str(
+                            render_templates(operation_step.device, env) or ""
+                        ).strip()
+                        if not rendered_target:
+                            raise ValueError(
+                                f"{branch_path}: set.device rendered empty"
+                            )
+                        branch_targets.add(("device", rendered_target))
+                    else:
+                        device = str(
+                            render_templates(operation_step.device, env) or ""
+                        ).strip()
+                        process = str(
+                            render_templates(operation_step.process or "", env) or ""
+                        ).strip()
+                        if device and process:
+                            raise ValueError(
+                                f"{branch_path}: call may set only one of device / process"
+                            )
+                        if not device and not process:
+                            raise ValueError(
+                                f"{branch_path}: call target rendered empty"
+                            )
+                        branch_targets.add(
+                            ("process", process) if process else ("device", device)
+                        )
+
+                for target_key in branch_targets:
+                    owner = target_owners.get(target_key)
+                    if owner is not None:
+                        kind, target_id = target_key
+                        raise ValueError(
+                            f"parallel branches {owner} and {branch_index} both target "
+                            f"{kind} {target_id!r}"
+                        )
+                    target_owners[target_key] = branch_index
+                for output_name in branch_outputs:
+                    owner = output_owners.get(output_name)
+                    if owner is not None:
+                        raise ValueError(
+                            f"parallel branches {owner} and {branch_index} both write "
+                            f"output {output_name!r}"
+                        )
+                    output_owners[output_name] = branch_index
+                plans.append(
+                    ParallelBranchPlan(
+                        index=branch_index,
+                        operations=operations,
+                        env=dict(env),
+                        path=branch_path,
+                        atomic=isinstance(branch, AtomicStep),
+                    )
+                )
+        except Exception as exc:
+            return self._fail_step(str(exc))
+
+        if not plans:
+            return False
+        self._parallel_state = self._begin_parallel(plans)
+        return True
+
+    def _step_parallel(self) -> bool:
+        state = self._parallel_state
+        if state is None:
+            return True
+        assert self._poll_parallel is not None
+        done, results = self._poll_parallel(state)
+        if not done:
+            return False
+        self._parallel_state = None
+        pending_failure = self._parallel_pending_failure
+        self._parallel_pending_failure = None
+        ordered = sorted(results or [], key=lambda item: item.index)
+        if pending_failure is not None:
+            self._pause_requested = False
+            self._stop_requested = False
+            self._fail_step(pending_failure)
+            return True
+        failures = [result for result in ordered if not result.ok]
+        if failures:
+            details = "; ".join(
+                f"branch {result.index} ({result.path or 'parallel'}): "
+                f"{result.error or 'request failed'}"
+                for result in failures
+            )
+            self._fail_step(f"parallel failed: {details}")
+            return True
+        for result in ordered:
+            self._env.update(result.outputs)
+        return True
 
     def _execute_pause_step(self, step: PauseStep) -> bool:
         del step
