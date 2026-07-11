@@ -36,7 +36,7 @@ Data handling (HDF writer with background flush thread, Influx with background H
 | F6 | High | `sequencer/runtime.py:1183` | `parallel` unsupported → all cross-device sets sequential | Independent devices serialized; per-point latency scales with device count | Implement bounded parallel step (needs operator sign-off) |
 | F7 | Med-High | `_driver/runner.py:237-279` | Telemetry + scheduled streams run inline with RPC in one driver thread | Commands wait behind serial telemetry sweeps / trace acquisitions | Prioritize RPC between telemetry calls or defer telemetry while RPC pending |
 | F8 | Medium | ✅ **FIXED** — `sequencer/sequencer.py`, `sequencer/runtime.py` | `set_stream_context` blocking retry loop (up to 6 s) + per-context `hdf.streams.expect` RPC | Inline shot-path overhead; sequencer fully blocked during retries | Retry is now tick-driven (`_wait_state`-style non-advancing poll); per-stream RPCs dispatched concurrently on a worker pool |
-| F9 | Medium | `_manager/lifecycle.py:253-264`, `process_supervision.py:284-293` | Shutdown stops drivers sequentially, 1 s timeout each | Shutdown scales linearly with unresponsive devices | Fan out via lifecycle executor |
+| F9 | Medium | ✅ **FIXED** — `_manager/lifecycle.py:253-264`, `process_supervision.py:284-293` | Shutdown stops drivers sequentially, 1 s timeout each | Shutdown scales linearly with unresponsive devices | Fan out via lifecycle executor |
 | F10 | Medium | `federation/hub.py:1138-1167` | Federation forward blocks main loop up to peer timeout; new DEALER per call | Slow peer stalls Manager; per-command connect cost | Per-peer worker (like mirrored routes in the router) |
 | F11 | Medium | `processes/influx_writer.py:1038-1235` | One HTTP thread for all destinations; no keep-alive | Slow destination (5 s timeout) delays other destinations' batches | Per-destination worker; reuse connections |
 | F12 | Medium | `processes/stream_analysis.py:4788` | Fits run inline in the SUB drain loop | Slow fit → SUB backlog → dropped chunk descriptors | Offload fits to a worker; keep drain hot |
@@ -262,6 +262,7 @@ Because of (1) and (2), **option (b) is the recommended default** — deferring 
 
 ### F9 — Sequential shutdown; per-device 1 s stops
 
+- **Status:** ✅ **FIXED** (`fix/f9-parallel-shutdown`, `852b985`, PR #134). See *Resolution* below.
 - **Severity:** Medium. **Confidence:** Confirmed.
 - **File:** `src/experiment_control/_manager/lifecycle.py` — `_shutdown_cleanup` (L253–264); `_manager/process_supervision.py` — `stop_driver` shutdown RPC `timeout_ms=1000` (L284–293).
 - **Behavior:** shutdown stops each driver in turn; a wedged driver costs the full 1 s RPC timeout before the next is attempted; then each managed process is stopped in turn (each stop can include a ≤500 ms process RPC). The lifecycle executor is already shut down at this point, so no parallelism.
@@ -270,6 +271,15 @@ Because of (1) and (2), **option (b) is the recommended default** — deferring 
 - **Risks/assumptions:** none for independent devices; if any hardware requires ordered power-down (operator question 2), keep an explicit ordered list.
 - **Hardware testing:** recommended once (confirm drivers tolerate concurrent shutdown broadcast).
 - **Measurement:** wall time of `_shutdown_cleanup` with k simulated-dead drivers.
+
+**Resolution (implemented):** the graceful-stop RPC broadcast in `_shutdown_cleanup` is now fanned out concurrently instead of walked sequentially.
+
+- **Two phases, each fanned out, joined in order.** Drivers are stopped first, over a short-lived `ThreadPoolExecutor` (`max_workers=min(32, n_dev)`, one task per device handle) whose futures are fully `wait()`-ed before the process phase starts the same way for managed processes. The driver phase is not allowed to interleave with the process phase because a driver's own graceful shutdown may depend on a managed process still being reachable.
+- **Why concurrent fan-out is safe:** each device/process owns its own REQ/DEALER socket, and `_call_device_rpc`/`_call_process_rpc` hold `handle.rpc_lock` across the whole request/reply cycle, so concurrent stops of *different* handles never share a socket. `_pump_manager_subscriptions` already early-returns off the main thread (the F1 guard), so worker tasks never touch the manager SUB sockets. Off-thread `_publish_driver_event`/`_publish_manager_event` calls land in the lifecycle reply/event queues rather than publishing inline; a second `_drain_lifecycle_replies`/`_drain_lifecycle_events` pass runs on the main thread after the fan-out (before socket teardown) so those queued stop events still go out.
+- **Pool choice:** a dedicated short-lived pool is used rather than `_lifecycle_executor`, which is intentionally already shut down earlier in `_shutdown_cleanup` and must stay quiesced.
+- **Unchanged semantics:** `stop_driver` is still called without force, and `_process_guard.close()` remains the final guaranteed reaper — the graceful-then-guard shutdown contract is unchanged, only the graceful phase's wall-clock cost.
+- **Result:** total shutdown wait is now bounded to roughly one RPC timeout regardless of how many devices are wedged, instead of `N_unresponsive × timeout`.
+- **Tests:** `ParallelShutdownCleanupTests` (`tests/test_manager_process_supervision.py`) cover the parallelism itself (wedged drivers no longer serialize), the off-thread event-drain path, and the empty-manager fast path.
 
 ### F10 — Federation forward blocks the Manager loop; socket per call
 
@@ -390,7 +400,7 @@ End-to-end writer benchmarks used the real SHM layout and complete slot bookkeep
 - The sequencer's step-at-a-time execution across independent devices (F6).
 - The `manager.command` audit RPC coupling all devices to the Manager loop (F3).
 - Auto-reconnect and federation forwards on the Manager main loop coupling all control traffic to one sick device/peer (F4, F10).
-- Sequential shutdown (F9) and `connect_all_devices` (minor; startup normally uses parallel auto-connect-on-register).
+- `connect_all_devices` (minor; startup normally uses parallel auto-connect-on-register). Sequential shutdown (F9) is fixed.
 
 **Where parallelization would be unsafe without operator confirmation:** any `parallel` sequencing across devices that share physical infrastructure (same USB hub/serial mux, RF chains with enable ordering, interlock preconditions). See §11.
 
