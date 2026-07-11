@@ -26,13 +26,6 @@ jobs:
         with:
           python-version: "3.13"
 
-      - name: Set up Node.js
-        uses: actions/setup-node@v6
-        with:
-          node-version: "20"
-          cache: npm
-          cache-dependency-path: web/react_ui/package-lock.json
-
       - name: Set up uv
         uses: astral-sh/setup-uv@v7
 
@@ -47,24 +40,6 @@ jobs:
 
       - name: Run Python tests
         run: uv run python -m unittest discover -s tests -p "test_*.py" -q
-
-      - name: Build bundled UI assets
-        shell: pwsh
-        run: .\scripts\build_packaged_ui.ps1
-
-      - name: Run UI tests
-        run: npm test --prefix web/react_ui
-
-      - name: Verify packaged UI is up to date
-        shell: pwsh
-        run: |
-          git add -A -- src/experiment_control/_ui_dist
-          $diff = git diff --cached --stat -- src/experiment_control/_ui_dist
-          if ($diff) {
-            Write-Host $diff
-            Write-Host "::error::src/experiment_control/_ui_dist is stale — run .\scripts\build_packaged_ui.ps1 and commit the result."
-            exit 1
-          }
 
       - name: Build package artifacts
         run: uv build
@@ -88,8 +63,39 @@ jobs:
           print(f"Verified bundled UI in {wheel.name}")
           '@ | python -
 
+  ui_validate:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: web/react_ui/package-lock.json
+
+      - name: Build bundled UI assets
+        shell: pwsh
+        run: .\scripts\build_packaged_ui.ps1
+
+      - name: Run UI tests
+        run: npm test --prefix web/react_ui
+
+      - name: Verify packaged UI is up to date
+        shell: pwsh
+        run: |
+          git add -A -- src/experiment_control/_ui_dist
+          $diff = git diff --cached --stat -- src/experiment_control/_ui_dist
+          if ($diff) {
+            Write-Host $diff
+            Write-Host "::error::src/experiment_control/_ui_dist is stale — run .\scripts\build_packaged_ui.ps1 and commit the result."
+            exit 1
+          }
+
   windows_lifecycle_smoke:
-    needs: validate
     runs-on: windows-latest
     timeout-minutes: 20
 
