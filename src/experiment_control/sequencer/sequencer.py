@@ -2951,7 +2951,8 @@ class SequencerProcess(ManagedProcessBase):
     def run(self) -> None:
         try:
             while True:
-                events = self._poll_and_drain(50)
+                poll_timeout_ms = self._runtime.next_poll_timeout_ms(ceiling_ms=50)
+                events = self._poll_and_drain(poll_timeout_ms)
                 self._drain_external_fault_logs(events)
                 self._drain_analysis_outputs(events)
                 self._flush_pending_logs(max_items=8)
