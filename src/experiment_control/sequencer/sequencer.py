@@ -2976,6 +2976,14 @@ class SequencerProcess(ManagedProcessBase):
         # Use a zero timeout (non-blocking poll) on that next iteration so
         # tick() gets to resume immediately, while still opportunistically
         # draining any RPC/telemetry that happens to already be queued.
+        #
+        # When tick() reports no pending step work, fall back to F15's
+        # deadline-aware `next_poll_timeout_ms()` instead of the flat 50 ms
+        # ceiling: it shortens the poll when a `sleep`/`wait_until`/adaptive-
+        # observe deadline is due sooner, and returns the ceiling when the
+        # runtime is genuinely idle. F5's non-blocking signal takes priority
+        # over F15's timeout - a pending-work tick must never be quantized onto
+        # a (possibly long) idle deadline.
         poll_timeout_ms = 50
         try:
             while True:
@@ -2984,7 +2992,11 @@ class SequencerProcess(ManagedProcessBase):
                 self._drain_analysis_outputs(events)
                 self._flush_pending_logs(max_items=8)
                 more_work_pending = self._runtime.tick()
-                poll_timeout_ms = 0 if more_work_pending else 50
+                poll_timeout_ms = (
+                    0
+                    if more_work_pending
+                    else self._runtime.next_poll_timeout_ms(ceiling_ms=50)
+                )
                 self._maybe_publish_progress_event()
                 if self._runtime.state == "ERROR" and not self._last_error_sent:
                     err_message = str(
