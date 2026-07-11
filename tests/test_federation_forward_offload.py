@@ -400,7 +400,7 @@ class DeviceForwardDispatchTests(unittest.TestCase):
         )
         self.assertTrue(dispatched)
         self.assertFalse(resp["ok"])
-        self.assertEqual(resp["error"]["code"], "federation_forward_busy")
+        self.assertEqual(resp["error"]["code"], "federation_forward_no_worker")
 
 
 class _FakeForwardHub:

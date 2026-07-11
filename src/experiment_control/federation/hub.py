@@ -723,7 +723,19 @@ class FederationHub:
             self._send_reply(identity=identity, request_id=request_id, resp=resp)
 
         worker = self._device_forward_workers.get(device_id)
-        if worker is None or not worker.submit(_ForwardTask(outbound=outbound, on_result=_on_result)):
+        if worker is None:
+            self._send_reply(
+                identity=identity,
+                request_id=request_id,
+                resp={
+                    "ok": False,
+                    "error": {
+                        "code": "federation_forward_no_worker",
+                        "message": f"no forward worker for mirrored device {device_id!r}",
+                    },
+                },
+            )
+        elif not worker.submit(_ForwardTask(outbound=outbound, on_result=_on_result)):
             self._send_reply(
                 identity=identity,
                 request_id=request_id,
@@ -803,7 +815,19 @@ class FederationHub:
             self._send_reply(identity=identity, request_id=request_id, resp=resp)
 
         worker = self._process_forward_workers.get(process_id)
-        if worker is None or not worker.submit(_ForwardTask(outbound=outbound, on_result=_on_result)):
+        if worker is None:
+            self._send_reply(
+                identity=identity,
+                request_id=request_id,
+                resp={
+                    "ok": False,
+                    "error": {
+                        "code": "federation_forward_no_worker",
+                        "message": f"no forward worker for mirrored process {process_id!r}",
+                    },
+                },
+            )
+        elif not worker.submit(_ForwardTask(outbound=outbound, on_result=_on_result)):
             self._send_reply(
                 identity=identity,
                 request_id=request_id,
