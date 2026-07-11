@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from typing import TYPE_CHECKING, Any, Callable
 
 if TYPE_CHECKING:
@@ -245,23 +245,75 @@ class LifecycleMixin(_MixinBase):
         _safe_call(self._drain_lifecycle_events)
 
         self._federation_hub.close()
+        # Graceful-stop RPC broadcast, fanned out concurrently. Each
+        # stop sends a blocking RPC (``shutdown`` at 1 s for drivers,
+        # ``process.stop`` at ≤500 ms for processes); done sequentially a
+        # wedged device costs its full timeout before the next is even
+        # attempted, so shutdown scaled linearly with the number of dead
+        # devices. Fanning out bounds total wait to ≈ one timeout.
+        #
+        # Why concurrent fan-out is safe here:
+        #   * Per-handle socket serialization — ``_call_device_rpc`` /
+        #     ``_call_process_rpc`` hold ``handle.rpc_lock`` across the
+        #     whole REQ/DEALER cycle (rpc_calls.py:247 / :396), and each
+        #     device/process owns its own socket, so concurrent stops of
+        #     *different* handles never share a socket.
+        #   * Pump is main-thread-only — ``_pump_manager_subscriptions``
+        #     early-returns off the main thread (rpc_calls.py:153), so
+        #     worker tasks never touch the manager SUB sockets.
+        #   * Event publishing is queued off-thread — ``_publish_*`` from
+        #     a worker lands in ``_lifecycle_event_queue`` /
+        #     ``_lifecycle_reply_queue``; we drain both on the main thread
+        #     after the fan-out (see below) so those events still go out.
+        #
+        # A dedicated short-lived pool is used rather than
+        # ``_lifecycle_executor`` — that one is intentionally already
+        # shut down above and must stay quiesced.
+        #
         # Per-iteration default-arg captures (``dh=dev_handle``) bind
         # each lambda to its own handle — without this every lambda
-        # would see the loop's final value when ``_safe_call`` invokes
-        # it. Explicit per-loop names disambiguate the device-handle
-        # and process-handle types for mypy.
-        for dev_handle in self._devices.values():
+        # would see the loop's final value when it runs. Explicit
+        # per-loop names disambiguate the device-handle and
+        # process-handle types for mypy.
+        #
+        # Drivers are fully joined FIRST, then processes: a driver may
+        # depend on a managed process staying up during its own graceful
+        # shutdown, so the two phases must NOT interleave.
+        n_dev = len(self._devices)
+        if n_dev:
+            with ThreadPoolExecutor(
+                max_workers=min(32, n_dev),
+                thread_name_prefix="mgr-shutdown",
+            ) as drv_pool:
+                drv_futures = []
+                for dev_handle in self._devices.values():
 
-            def _stop_drv(dh: "DeviceHandle" = dev_handle) -> None:
-                self.stop_driver(dh.spec.device_id)
+                    def _stop_drv(dh: "DeviceHandle" = dev_handle) -> None:
+                        _safe_call(lambda: self.stop_driver(dh.spec.device_id))
 
-            _safe_call(_stop_drv)
-        for proc_handle in self._processes.values():
+                    drv_futures.append(drv_pool.submit(_stop_drv))
+                wait(drv_futures)
+        n_proc = len(self._processes)
+        if n_proc:
+            with ThreadPoolExecutor(
+                max_workers=min(32, n_proc),
+                thread_name_prefix="mgr-shutdown",
+            ) as proc_pool:
+                proc_futures = []
+                for proc_handle in self._processes.values():
 
-            def _stop_proc(ph: "ProcessHandle" = proc_handle) -> None:
-                self._stop_process_handle(ph)
+                    def _stop_proc(ph: "ProcessHandle" = proc_handle) -> None:
+                        _safe_call(lambda: self._stop_process_handle(ph))
 
-            _safe_call(_stop_proc)
+                    proc_futures.append(proc_pool.submit(_stop_proc))
+                wait(proc_futures)
+        # The stop tasks ran off the main thread, so their
+        # ``_publish_driver_event`` / ``_publish_manager_event`` calls
+        # were queued rather than published inline. Drain both queues now,
+        # before the socket teardown below, so the off-thread stop events
+        # actually go out on the still-open sockets.
+        _safe_call(self._drain_lifecycle_replies)
+        _safe_call(self._drain_lifecycle_events)
         self._drain_supervisor_logs(max_items=5000)
         self._flush_stale_supervisor_blocks(force=True)
         journal = self._command_journal

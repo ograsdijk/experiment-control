@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import queue
 import sys
 import threading
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,6 +16,7 @@ if str(SRC) not in sys.path:
 from unittest import mock  # noqa: E402
 
 import experiment_control._manager.process_supervision as ps  # noqa: E402
+from experiment_control._manager.lifecycle import LifecycleMixin  # noqa: E402
 from experiment_control._manager.process_supervision import (  # noqa: E402
     enforce_managed_process_heartbeat_timeout,
     enforce_managed_process_stop_timeout,
@@ -698,6 +701,167 @@ class DeviceDriverHeartbeatDemotionTests(unittest.TestCase):
         ):
             supervise_device_drivers(manager, 100.0)
         self.assertEqual(calls, [])
+
+
+class _ShutdownFakeSocket:
+    def __init__(self) -> None:
+        self.closed = False
+
+    def close(self, _linger: int = 0) -> None:
+        self.closed = True
+
+
+class _ShutdownFakeExecutor:
+    def __init__(self) -> None:
+        self.shutdown_kwargs: dict[str, object] | None = None
+
+    def shutdown(self, **kwargs: object) -> None:
+        self.shutdown_kwargs = kwargs
+
+
+class _ShutdownFakeManager:
+    """Minimal object exposing exactly what LifecycleMixin._shutdown_cleanup
+    touches, with faithful off-thread event queuing.
+
+    The stop_driver fan-out runs on worker threads, so any driver event a
+    task publishes is redirected to ``_lifecycle_event_queue`` (mirroring
+    the real ``_publish_manager_event`` main-thread check). Only the drain
+    that ``_shutdown_cleanup`` performs after the fan-out — on the main
+    thread — moves those events into ``published``. If that second drain
+    were missing, ``published`` would stay empty: the regression guard.
+    """
+
+    def __init__(self, devices: dict, wedged_ids: set[str], wedge_s: float):
+        self._devices = devices
+        self._processes: dict[str, object] = {}
+        self._wedged_ids = wedged_ids
+        self._wedge_s = wedge_s
+        self._main_thread_id = threading.get_ident()
+        self._lifecycle_event_queue: "queue.Queue[tuple[str, object]]" = queue.Queue()
+        self.published: list[tuple[str, object]] = []
+        self._lifecycle_executor = _ShutdownFakeExecutor()
+        self._command_journal = None
+        self._federation_hub = SimpleNamespace(close=lambda: None)
+        self._process_guard = SimpleNamespace(closed=False)
+        self._process_guard.close = lambda: setattr(  # type: ignore[attr-defined]
+            self._process_guard, "closed", True
+        )
+        self._registry_rep = _ShutdownFakeSocket()
+        self._sub = _ShutdownFakeSocket()
+        self._process_hb_sub = _ShutdownFakeSocket()
+        self._process_data_sub = _ShutdownFakeSocket()
+        self._internal_rpc = _ShutdownFakeSocket()
+        self._external_pub = _ShutdownFakeSocket()
+        self._ctx = SimpleNamespace(term=lambda: None)
+
+    # --- event plumbing mirroring production ---
+    def _publish_manager_event(self, topic: str, payload: object) -> None:
+        if threading.get_ident() != self._main_thread_id:
+            self._lifecycle_event_queue.put_nowait((topic, payload))
+            return
+        self.published.append((topic, payload))
+
+    def _publish_driver_event(self, topic: str, handle: object) -> None:
+        self._publish_manager_event(
+            topic, {"device_id": handle.spec.device_id, "state": handle.driver_process_state}
+        )
+
+    def _drain_lifecycle_replies(self) -> None:
+        pass
+
+    def _drain_lifecycle_events(self) -> None:
+        while True:
+            try:
+                topic, payload = self._lifecycle_event_queue.get_nowait()
+            except queue.Empty:
+                return
+            self.published.append((topic, payload))
+
+    # --- the operation under test drives these ---
+    def stop_driver(self, device_id: str, *, force: bool = False) -> None:
+        handle = self._devices[device_id]
+        if device_id in self._wedged_ids:
+            # Simulate a wedged driver: the graceful shutdown RPC blocks to
+            # its full timeout before returning.
+            time.sleep(self._wedge_s)
+        handle.driver_process_state = "STOPPING"
+        self._publish_driver_event("manager.driver.stopping", handle)
+
+    def _stop_process_handle(self, handle: object) -> None:
+        pass
+
+    def _drain_supervisor_logs(self, max_items: int = 5000) -> None:
+        pass
+
+    def _flush_stale_supervisor_blocks(self, force: bool = False) -> None:
+        pass
+
+    def _close_manager_log_sink_file(self) -> None:
+        pass
+
+
+class ParallelShutdownCleanupTests(unittest.TestCase):
+    """F9: _shutdown_cleanup fans the graceful-stop RPC broadcast out
+    concurrently, so wedged drivers no longer serialize shutdown."""
+
+    def _make_devices(self, k: int, wedged: int) -> tuple[dict, set[str]]:
+        devices: dict[str, SimpleNamespace] = {}
+        wedged_ids: set[str] = set()
+        for i in range(k):
+            device_id = f"dev{i}"
+            devices[device_id] = SimpleNamespace(
+                spec=SimpleNamespace(device_id=device_id),
+                driver_process_state="RUNNING",
+            )
+            if i < wedged:
+                wedged_ids.add(device_id)
+        return devices, wedged_ids
+
+    def test_wedged_drivers_do_not_serialize_shutdown(self) -> None:
+        # 8 devices, 6 of them wedged for a full 1 s RPC timeout each.
+        # Sequential shutdown would cost ~6 s; concurrent fan-out ~1 s.
+        wedge_s = 1.0
+        devices, wedged_ids = self._make_devices(k=8, wedged=6)
+        manager = _ShutdownFakeManager(devices, wedged_ids, wedge_s)
+
+        start = time.monotonic()
+        LifecycleMixin._shutdown_cleanup(manager)  # type: ignore[arg-type]
+        elapsed = time.monotonic() - start
+
+        # ~one timeout, not J * timeout.
+        self.assertLess(
+            elapsed,
+            2.0,
+            f"shutdown took {elapsed:.2f}s — fan-out is not parallel",
+        )
+
+        # Every device reached STOPPING (graceful stop was attempted).
+        for handle in devices.values():
+            self.assertEqual(handle.driver_process_state, "STOPPING")
+
+        # Every stopping event published (proves the post-fan-out drain
+        # flushed the off-thread queue — the step-3 regression guard).
+        stopping = {
+            payload["device_id"]
+            for topic, payload in manager.published
+            if topic == "manager.driver.stopping"
+        }
+        self.assertEqual(stopping, set(devices.keys()))
+
+        # Guard still runs last, sockets torn down, executor quiesced first.
+        self.assertTrue(manager._process_guard.closed)
+        self.assertTrue(manager._external_pub.closed)
+        self.assertEqual(
+            manager._lifecycle_executor.shutdown_kwargs,
+            {"wait": True, "cancel_futures": True},
+        )
+
+    def test_empty_manager_shuts_down_cleanly(self) -> None:
+        # N == 0 for both devices and processes: the pools are skipped.
+        manager = _ShutdownFakeManager({}, set(), 0.0)
+        LifecycleMixin._shutdown_cleanup(manager)  # type: ignore[arg-type]
+        self.assertTrue(manager._process_guard.closed)
+        self.assertEqual(manager.published, [])
 
 
 if __name__ == "__main__":
