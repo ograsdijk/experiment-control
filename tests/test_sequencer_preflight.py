@@ -377,6 +377,89 @@ steps:
         summary = result.get("summary", {})
         self.assertEqual(int(summary.get("errors", -1)), 0)
 
+    def test_preflight_rejects_parallel_target_conflict(self) -> None:
+        mgr = _FakeManager(devices={"shared"}, capabilities_by_device={"shared": {}})
+        proc = _build_proc(mgr)
+        yaml_text = """
+version: 1
+steps:
+  - parallel:
+      do:
+        - call: {device: shared, action: one}
+        - set: {device: shared, name: value, value: 1}
+"""
+        resp = proc._handle_rpc(
+            {"type": "sequencer.preflight", "params": {"text": yaml_text}}
+        )
+        self.assertFalse(bool(resp.get("result", {}).get("valid")))
+        self.assertIn("parallel_target_conflict", _codes_from(resp))
+
+    def test_preflight_rejects_parallel_output_conflict(self) -> None:
+        mgr = _FakeManager(
+            devices={"a", "b"},
+            capabilities_by_device={"a": {}, "b": {}},
+        )
+        proc = _build_proc(mgr)
+        yaml_text = """
+version: 1
+steps:
+  - parallel:
+      do:
+        - call: {device: a, action: one}
+          save_as: result
+        - call: {device: b, action: two}
+          save_as: result
+"""
+        resp = proc._handle_rpc(
+            {"type": "sequencer.preflight", "params": {"text": yaml_text}}
+        )
+        self.assertFalse(bool(resp.get("result", {}).get("valid")))
+        self.assertIn("parallel_output_conflict", _codes_from(resp))
+
+    def test_preflight_rejects_unsupported_parallel_branch(self) -> None:
+        mgr = _FakeManager(devices={"a"}, capabilities_by_device={"a": {}})
+        proc = _build_proc(mgr)
+        yaml_text = """
+version: 1
+steps:
+  - parallel:
+      do:
+        - atomic:
+            do:
+              - call: {device: a, action: one}
+              - sleep: 0.1
+"""
+        resp = proc._handle_rpc(
+            {"type": "sequencer.preflight", "params": {"text": yaml_text}}
+        )
+        self.assertFalse(bool(resp.get("result", {}).get("valid")))
+        self.assertIn("parallel_unsupported_branch", _codes_from(resp))
+
+    def test_preflight_rejects_parallel_nested_inside_atomic(self) -> None:
+        mgr = _FakeManager(
+            devices={"a", "b"},
+            capabilities_by_device={"a": {}, "b": {}},
+        )
+        proc = _build_proc(mgr)
+        yaml_text = """
+version: 1
+steps:
+  - atomic:
+      do:
+        - repeat:
+            times: 1
+            do:
+              - parallel:
+                  do:
+                    - call: {device: a, action: one}
+                    - call: {device: b, action: one}
+"""
+        resp = proc._handle_rpc(
+            {"type": "sequencer.preflight", "params": {"text": yaml_text}}
+        )
+        self.assertFalse(bool(resp.get("result", {}).get("valid")))
+        self.assertIn("atomic_parallel_unsupported", _codes_from(resp))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -17,7 +17,7 @@ The main problems are **latency quantization and hidden coupling on the command 
 2. **Every device command's reply is gated on a blocking RPC to the Manager** (the `manager.command` audit event is published via a full request/reply round-trip *before* the reply is enqueued). Any Manager main-loop stall therefore delays commands to **all** devices.
 3. **The Manager main loop can stall for seconds**: auto-reconnect performs blocking disconnect+connect device RPCs inline in the supervision tick (~2.5 s per attempting device), and federation forwards block up to the peer timeout.
 4. **A genuine thread-safety violation was found and fixed**: lifecycle worker threads could drain the Manager's SUB sockets (`_pump_manager_subscriptions`) concurrently with the main poll loop. The pump now returns immediately off the main thread.
-5. **Cross-device parallelism is absent at the sequencing layer**: `parallel` is explicitly unsupported, so independent devices are always set one at a time, each paying costs (1)+(2).
+5. **Cross-device parallelism is now opt-in at the sequencing layer**: bounded `parallel` branches can overlap distinct device/process calls while each atomic branch remains internally sequential.
 6. Within one device, **telemetry/scheduled-stream reads share the single driver thread with command RPCs**, so a sequencer command can wait behind a multi-register serial telemetry sweep.
 
 Data handling (HDF writer with background flush thread, Influx with background HTTP thread, SHM rings) is in good shape; findings there are second-order (an extra copy per SHM write, a seqlock gap, HTTP connection reuse).
@@ -33,7 +33,7 @@ Data handling (HDF writer with background flush thread, Influx with background H
 | F3 | High | ✅ **FIXED** — `processes/device_router.py:840, 464-473` | Blocking `manager.command` publish RPC on the reply critical path | Couples all device command latency to Manager loop health | Audit publish moved to a bounded background thread (`_AsyncEventPublisher`) |
 | F4 | Critical | ✅ **FIXED** — `_manager/process_supervision.py:1188-1290` | Auto-reconnect does blocking device RPCs on the Manager main loop | ~2.5 s loop stall per attempt; stalls all RPC, HB ingestion, and (via F3) all device commands | Reconnect I/O dispatched to the existing lifecycle executor under the per-device lock |
 | F5 | High | ✅ **FIXED** — `sequencer/runtime.py:465-488` | `tick()` runs until a sleep/wait step; RPC drained only between ticks | Pause/stop/status unresponsive for the duration of a sleepless scan | Per-tick step/time budget (10 ms / 200 steps), atomic blocks unaffected |
-| F6 | High | `sequencer/runtime.py:1183` | `parallel` unsupported → all cross-device sets sequential | Independent devices serialized; per-point latency scales with device count | Implement bounded parallel step (needs operator sign-off) |
+| F6 | High | ✅ **FIXED** — `sequencer/runtime.py`, `sequencer/sequencer.py` | `parallel` unsupported → all cross-device sets sequential | Independent devices serialized; per-point latency scales with device count | Bounded eight-worker parallel dispatch with disjoint-target validation and sequential atomic branches |
 | F7 | Med-High | `_driver/runner.py:237-279` | Telemetry + scheduled streams run inline with RPC in one driver thread | Commands wait behind serial telemetry sweeps / trace acquisitions | Prioritize RPC between telemetry calls or defer telemetry while RPC pending |
 | F8 | Medium | ✅ **FIXED** — `sequencer/sequencer.py`, `sequencer/runtime.py` | `set_stream_context` blocking retry loop (up to 6 s) + per-context `hdf.streams.expect` RPC | Inline shot-path overhead; sequencer fully blocked during retries | Retry is now tick-driven (`_wait_state`-style non-advancing poll); per-stream RPCs dispatched concurrently on a worker pool |
 | F9 | Medium | ✅ **FIXED** — `_manager/lifecycle.py:253-264`, `process_supervision.py:284-293` | Shutdown stops drivers sequentially, 1 s timeout each | Shutdown scales linearly with unresponsive devices | Fan out via lifecycle executor |
@@ -200,7 +200,8 @@ Data handling (HDF writer with background flush thread, Influx with background H
 
 ### F6 — No parallel step: cross-device sets always sequential
 
-- **Severity:** High (by construction). **Confidence:** Confirmed — and explicitly intentional in v1 (`_execute_parallel_step`: "parallel not supported in v1", `runtime.py:1183–1185`).
+- **Status:** ✅ **FIXED**. See *Resolution* below.
+- **Severity:** High (by construction). **Confidence:** Confirmed at review time; the original v1 runtime explicitly rejected `parallel`.
 - **Behavior/impact:** a scan point that must set, say, a SynthHD frequency, an NKT setpoint, and a Linien parameter performs three sequential blocking round-trips, each paying F2 (+~50 ms) and F3. Per-point overhead scales linearly with device count even though the devices are fully independent (separate processes, separate serial ports/hosts, separate router workers). The infrastructure below the sequencer *already supports* concurrent per-device commands.
 - **Unrelated devices forced to wait:** Yes — by sequencing design.
 - **Root cause:** v1 scope decision.
@@ -208,6 +209,8 @@ Data handling (HDF writer with background flush thread, Influx with background H
 - **Risks/assumptions:** **operator confirmation required** — some sequences may rely on side-effect ordering across devices (e.g., enable RF only after another device is set). Parallel must remain opt-in per step, never inferred.
 - **Hardware testing:** required for representative sequences.
 - **Measurement:** per-scan-point duration for an N-device set block, sequential vs parallel.
+
+**Resolution (implemented):** `parallel.do` now treats each direct child as an independent branch. Direct `call`/`set` branches and `atomic` branches containing only `call`/`set` operations are supported. Up to eight branches run concurrently through persistent worker-owned DEALER clients, avoiding both the shared `ManagerClient.call()` lock and per-branch connection churn; excess branches queue. Operations inside an atomic branch execute strictly in YAML order, while sibling atomic branches may overlap; nesting `parallel` inside an ordinary atomic block is rejected. Preflight and runtime validation reject sibling branches that resolve to the same device/process or write the same output name. Each branch uses an isolated environment snapshot, branch-local outputs can feed later operations in that atomic branch, and outputs merge only after every branch succeeds. Failures, including external faults, are applied only after all dispatched work joins so cleanup cannot race active branches. Full control-flow branches remain explicitly deferred.
 
 ### F7 — Driver: telemetry & scheduled streams block command RPCs (per device)
 
@@ -404,7 +407,7 @@ End-to-end writer benchmarks used the real SHM layout and complete slot bookkeep
 - Connect-check (identity verification) between connect and use.
 
 **Serialization that is broader than necessary:**
-- The sequencer's step-at-a-time execution across independent devices (F6).
+- Cross-device sequencing remains serial by default; F6's bounded `parallel` step provides explicit overlap for independent targets.
 - The `manager.command` audit RPC coupling all devices to the Manager loop (F3).
 - Auto-reconnect and federation forwards on the Manager main loop coupling all control traffic to one sick device/peer (F4, F10).
 - `connect_all_devices` (minor; startup normally uses parallel auto-connect-on-register). Sequential shutdown (F9) is fixed.
@@ -459,7 +462,7 @@ Existing signals are good (driver `loop_lag_s`, `manager.loop_stall`, pump timin
 | 7 | F8 non-blocking set_context retries — ✅ **DONE** (`fix/f8-set-context-nonblocking`) | Medium | Low-medium | No |
 | 8 | F7 driver RPC/telemetry interleaving | Medium-high per device | Medium | **Yes, per driver** |
 | 9 | F9 parallel shutdown — ✅ **DONE** | Medium | Low | Once |
-| 10 | F6 `parallel` step (restricted form) | High for multi-device scans | Medium-high | **Yes + operator sign-off** |
+| 10 | F6 `parallel` step (restricted form) — ✅ **DONE** | High for multi-device scans | Medium-high | **Yes, representative sequences** |
 | 11 | F13 SHM copy + seqlock re-check — ✅ **DONE** (`eb54477`) | Medium (large streams) | Low | No |
 | 12 | F11 Influx per-destination workers/keep-alive | Medium (monitoring) | Low | No |
 | 13 | F10 federation forwards → per-mirror workers — ✅ **DONE** (`fix/f10-federation-forward-worker`); F14 manager inline command hardening still open | Medium (deployment-dependent) | Medium | No |
@@ -468,7 +471,7 @@ Existing signals are good (driver `loop_lag_s`, `manager.loop_stall`, pump timin
 
 ## 11. Open questions for the experiment operator
 
-1. **Cross-device ordering:** are there sequences that depend on side-effect order between devices (RF enable after frequency set on *another* device, laser/AOM ordering, interlock preconditions)? Required before implementing `parallel` (F6) or parallel shutdown (F9).
+1. **Cross-device ordering:** which sequences depend on side-effect order between devices (RF enable after frequency set on *another* device, laser/AOM ordering, interlock preconditions)? Those steps must remain sequential; `parallel` is opt-in only.
 2. **Shared physical buses:** do any "independent" devices share a USB hub, serial multiplexer, or power sequencing that would make concurrent I/O unsafe even across processes?
 3. **Audit guarantees:** must the `manager.command` journal entry be durable/ordered *before* the client sees the reply (F3), or is best-effort async acceptable?
 4. **Auto-reconnect in production:** is `auto_reconnect.enabled` used in real configs (F4 severity depends on this), and what are acceptable reconnect timings?
