@@ -165,6 +165,9 @@ class SequencerRuntime:
         call_process: Callable[[str, str, dict[str, Any]], dict[str, Any]] | None = None,
         get_process_telemetry: Callable[[str, str], dict[str, Any] | None] | None = None,
         expect_streams: Callable[[list[tuple[str, str]], int], None] | None = None,
+        begin_set_context: Callable[[list[tuple[str, str]], int, dict[str, Any]], Any]
+        | None = None,
+        poll_set_context: Callable[[Any, float], tuple[bool, str | None]] | None = None,
     ) -> None:
         self._call_device = call_device
         self._get_telemetry = get_telemetry
@@ -176,6 +179,12 @@ class SequencerRuntime:
         self._call_process = call_process
         self._get_process_telemetry = get_process_telemetry
         self._expect_streams = expect_streams
+        # Non-blocking set_context dispatch (F8). Optional: when not wired,
+        # `_execute_set_context_step` falls back to the previous synchronous
+        # (blocking) path via `set_stream_context`/`expect_streams` above, so
+        # existing callers/tests that only wire those keep working unchanged.
+        self._begin_set_context = begin_set_context
+        self._poll_set_context = poll_set_context
 
         self._spec: SequenceSpec | None = None
         self._vars: dict[str, Any] = {}
@@ -194,6 +203,7 @@ class SequencerRuntime:
         self._cleanup_errors: list[dict[str, Any]] = []
         self._sleep_until: float | None = None
         self._wait_state: _WaitState | None = None
+        self._set_context_state: Any = None
         self._adaptive_observe_state: _AdaptiveObserveState | None = None
         self._atomic_depth = 0
         self._current_step: str | None = None
@@ -226,6 +236,29 @@ class SequencerRuntime:
         self._use_stack: list[str] = []
         self._step_handlers: dict[type[Any], Callable[[Any], bool]] = {}
         self._register_step_handlers()
+
+    def _clear_set_context_state(self) -> None:
+        """Discard a pending/finished set_context dispatch.
+
+        Used everywhere `_set_context_state` is reset -- normal completion,
+        stop/pause, fail, terminal unwind, loop restart -- so an abandoned
+        dispatch (e.g. the operator stopped the run mid-retry) gets a
+        best-effort abort instead of silently running to completion in the
+        background (F8#3). The dispatch object is opaque to this class (it
+        may be the fallback path's `None`, or whatever `begin_set_context`
+        returned); if it exposes a no-arg `cancel()`, call it, but don't
+        assume it does.
+        """
+        state = self._set_context_state
+        self._set_context_state = None
+        if state is None:
+            return
+        cancel = getattr(state, "cancel", None)
+        if callable(cancel):
+            try:
+                cancel()
+            except Exception:
+                pass
 
     @property
     def state(self) -> str:
@@ -280,6 +313,7 @@ class SequencerRuntime:
         self._cleanup_errors = []
         self._sleep_until = None
         self._wait_state = None
+        self._clear_set_context_state()
         self._adaptive_observe_state = None
         self._atomic_depth = 0
         self._current_step = None
@@ -365,6 +399,7 @@ class SequencerRuntime:
         self._env = {}
         self._sleep_until = None
         self._wait_state = None
+        self._clear_set_context_state()
         self._adaptive_observe_state = None
         self._atomic_depth = 0
         self._current_step = None
@@ -412,6 +447,7 @@ class SequencerRuntime:
         self._stop_requested = False
         self._sleep_until = None
         self._wait_state = None
+        self._clear_set_context_state()
         self._adaptive_observe_state = None
         if self._begin_terminal_unwind("ERROR", str(reason or "external fault")):
             self._state = "RUNNING"
@@ -545,6 +581,11 @@ class SequencerRuntime:
                     return False
                 self._finish_active_step(time.monotonic())
 
+            if self._set_context_state is not None:
+                if not self._step_set_context(now):
+                    return
+                self._finish_active_step(time.monotonic())
+
             if self._adaptive_observe_state is not None:
                 if not self._step_adaptive_observation(now):
                     return False
@@ -571,7 +612,11 @@ class SequencerRuntime:
                     return False
                 self._begin_active_step(time.monotonic())
                 if self._execute_step(step):
-                    if self._sleep_until is None and self._wait_state is None:
+                    if (
+                        self._sleep_until is None
+                        and self._wait_state is None
+                        and self._set_context_state is None
+                    ):
                         self._finish_active_step(time.monotonic())
                     return False
                 self._finish_active_step(time.monotonic())
@@ -659,6 +704,14 @@ class SequencerRuntime:
             self._mark_pause_ended(now)
             self._stop_requested = False
             if not self._begin_terminal_unwind("STOPPED", None):
+                # No on_exit/finally work to unwind, so we go straight to
+                # STOPPED without routing through `_begin_terminal_unwind`'s
+                # own `_clear_set_context_state()` call. A set_context
+                # dispatch can still be pending here (e.g. `stop` requested
+                # while a stream's retry is in flight) and must still get
+                # its best-effort cancel (F8#3) instead of being silently
+                # abandoned/orphaned in `_set_context_state`.
+                self._clear_set_context_state()
                 self._state = "STOPPED"
                 self._run_ended_mono = now
             return True
@@ -703,6 +756,7 @@ class SequencerRuntime:
         self._cleanup_errors = []
         self._sleep_until = None
         self._wait_state = None
+        self._clear_set_context_state()
         self._adaptive_observe_state = None
         self._current_step = None
         self._current_step_detail = None
@@ -725,6 +779,7 @@ class SequencerRuntime:
         self._cleanup_failed = False
         self._sleep_until = None
         self._wait_state = None
+        self._clear_set_context_state()
         self._adaptive_observe_state = None
         self._state = "ERROR" if cleanup_failed else str(state or "STOPPED")
         self._last_error = error if self._state == "ERROR" else None
@@ -750,6 +805,7 @@ class SequencerRuntime:
         self._env = {}
         self._sleep_until = None
         self._wait_state = None
+        self._clear_set_context_state()
         self._adaptive_observe_state = None
         self._pending_terminal_state = None
         self._pending_terminal_error = None
@@ -1150,6 +1206,7 @@ class SequencerRuntime:
                             frame.on_exit()
                             self._sleep_until = None
                             self._wait_state = None
+                            self._clear_set_context_state()
                             self._adaptive_observe_state = None
                         continue
                     step = frame.steps[frame.index]
@@ -1162,6 +1219,7 @@ class SequencerRuntime:
                     frame.on_exit()
                     self._sleep_until = None
                     self._wait_state = None
+                    self._clear_set_context_state()
                     self._adaptive_observe_state = None
                 continue
             if isinstance(frame, _TryFrame):
@@ -1362,6 +1420,19 @@ class SequencerRuntime:
         fields = render_templates(step.fields, self._env_view())
         try:
             streams = self._normalize_streams(step.streams)
+        except Exception as e:
+            return self._fail_step(f"set_context failed: {e}")
+
+        if self._begin_set_context is not None and self._poll_set_context is not None:
+            # Non-blocking path (F8): dispatch the hdf.streams.expect + all
+            # per-stream stream.context.set RPCs concurrently and let the
+            # tick loop poll for completion, instead of blocking here.
+            self._set_context_state = self._begin_set_context(streams, ctx_id, fields)
+            return True
+
+        # Fallback: previous synchronous behavior, kept for callers/tests
+        # that only wire `set_stream_context`/`expect_streams` directly.
+        try:
             if streams and self._expect_streams is not None:
                 self._expect_streams(streams, ctx_id)
             for device, stream in streams:
@@ -2645,6 +2716,32 @@ class SequencerRuntime:
             samples=[],
             max_samples=max_samples,
         )
+
+    def _step_set_context(self, now: float) -> bool:
+        """Tick-driven poll of a pending set_context dispatch (F8).
+
+        Mirrors `_step_wait_until`'s shape: returns False while the step
+        stays pending (re-checked on later ticks), True once it is
+        resolved (all per-stream RPCs acked, or a failure/timeout is
+        surfaced via `_fail_step`). The step never advances until every
+        stream's ack has arrived, matching the previous blocking
+        implementation's invariant.
+        """
+        if self._check_stop_pause():
+            return False
+        state = self._set_context_state
+        if state is None:
+            return True
+        if self._poll_set_context is None:
+            self._clear_set_context_state()
+            return True
+        finished, error = self._poll_set_context(state, now)
+        if not finished:
+            return False
+        self._clear_set_context_state()
+        if error is not None:
+            self._fail_step(f"set_context failed: {error}")
+        return True
 
     def _step_wait_until(self, now: float) -> bool:
         if self._check_stop_pause():
