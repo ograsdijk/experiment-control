@@ -37,7 +37,7 @@ Data handling (HDF writer with background flush thread, Influx with background H
 | F7 | Med-High | `_driver/runner.py:237-279` | Telemetry + scheduled streams run inline with RPC in one driver thread | Commands wait behind serial telemetry sweeps / trace acquisitions | Prioritize RPC between telemetry calls or defer telemetry while RPC pending |
 | F8 | Medium | ✅ **FIXED** — `sequencer/sequencer.py`, `sequencer/runtime.py` | `set_stream_context` blocking retry loop (up to 6 s) + per-context `hdf.streams.expect` RPC | Inline shot-path overhead; sequencer fully blocked during retries | Retry is now tick-driven (`_wait_state`-style non-advancing poll); per-stream RPCs dispatched concurrently on a worker pool |
 | F9 | Medium | ✅ **FIXED** — `_manager/lifecycle.py:253-264`, `process_supervision.py:284-293` | Shutdown stops drivers sequentially, 1 s timeout each | Shutdown scales linearly with unresponsive devices | Fan out via lifecycle executor |
-| F10 | Medium | `federation/hub.py:1138-1167` | Federation forward blocks main loop up to peer timeout; new DEALER per call | Slow peer stalls Manager; per-command connect cost | Per-peer worker (like mirrored routes in the router) |
+| F10 | Medium | ✅ **FIXED** — `federation/hub.py` (`_FederationForwardWorker`, `try_dispatch_device_forward`/`try_dispatch_process_forward`) | Federation forward blocks main loop up to peer timeout; new DEALER per call | Slow peer stalls Manager; per-command connect cost | Per-mirror worker: one dedicated thread + persistent socket + bounded queue per mirrored device/process, off the poll loop |
 | F11 | Medium | `processes/influx_writer.py:1038-1235` | One HTTP thread for all destinations; no keep-alive | Slow destination (5 s timeout) delays other destinations' batches | Per-destination worker; reuse connections |
 | F12 | Medium | `processes/stream_analysis.py:4788` | Fits run inline in the SUB drain loop | Slow fit → SUB backlog → dropped chunk descriptors | Offload fits to a worker; keep drain hot |
 | F13 | Medium | ✅ **FIXED** — `shm/shm_ring.py` | Extra full copy per SHM write; reader lacked post-copy seq re-check | Doubled memory bandwidth on streams; rare torn read on ring overrun | Direct NumPy destination view plus pre/post sequence validation |
@@ -462,7 +462,7 @@ Existing signals are good (driver `loop_lag_s`, `manager.loop_stall`, pump timin
 | 10 | F6 `parallel` step (restricted form) | High for multi-device scans | Medium-high | **Yes + operator sign-off** |
 | 11 | F13 SHM copy + seqlock re-check — ✅ **DONE** (`eb54477`) | Medium (large streams) | Low | No |
 | 12 | F11 Influx per-destination workers/keep-alive | Medium (monitoring) | Low | No |
-| 13 | F10/F14 federation & manager inline command hardening | Medium (deployment-dependent) | Medium | No |
+| 13 | F10 federation forwards → per-mirror workers — ✅ **DONE** (`fix/f10-federation-forward-worker`); F14 manager inline command hardening still open | Medium (deployment-dependent) | Medium | No |
 | 14 | F12 analysis fit offload | Medium | Medium | No |
 | 15 | F16/F17 connect bounding, SUB disconnects | Low | Low | F16 yes |
 
