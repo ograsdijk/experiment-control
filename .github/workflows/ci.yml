@@ -48,18 +48,12 @@ jobs:
       - name: Run Python tests
         run: uv run python -m unittest discover -s tests -p "test_*.py" -q
 
-      - name: Install UI dependencies
-        run: npm ci --prefix web/react_ui
-
-      - name: Type-check UI
-        run: npm run typecheck --prefix web/react_ui
-
-      - name: Build React UI
-        run: npm run build --prefix web/react_ui
-
       - name: Build bundled UI assets
         shell: pwsh
         run: .\scripts\build_packaged_ui.ps1
+
+      - name: Run UI tests
+        run: npm test --prefix web/react_ui
 
       - name: Verify packaged UI is up to date
         shell: pwsh

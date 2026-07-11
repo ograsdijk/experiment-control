@@ -5,6 +5,8 @@ import json
 import sys
 import time
 from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -68,6 +70,71 @@ _STREAM_CONTEXT_SET_TRANSIENT_ERRORS = (
     "not connected",
     "disconnected",
 )
+# Bounds the worker pool used to dispatch a set_context step's per-stream
+# RPCs concurrently (F8): one slot for the shared hdf.streams.expect call
+# plus one per stream, generously sized so a step rarely queues.
+_SET_CONTEXT_DISPATCH_MAX_WORKERS = 16
+# Safety-net wall-clock bound for an entire set_context dispatch (F8). Each
+# individual `_set_stream_context` call already bounds itself with
+# `_STREAM_CONTEXT_SET_RETRY_DEADLINE_S`, but that only starts counting once
+# a call actually begins running; a call still queued behind a saturated
+# pool (e.g. a step targeting more streams than there are worker slots)
+# accrues wait time nothing else bounds. This deadline covers the dispatch
+# as a whole -- queued-but-not-yet-started calls included -- with a small
+# buffer over the per-call deadline for expect + queueing overhead.
+_SET_CONTEXT_DISPATCH_DEADLINE_S = _STREAM_CONTEXT_SET_RETRY_DEADLINE_S + 2.0
+
+
+@dataclass
+class _SetContextCallHandle:
+    """One in-flight (or completed) RPC dispatched for a set_context step.
+
+    `future` is `None` until the call has actually been submitted to the
+    executor. `context_set` calls are only submitted once the shared
+    `expect` call (if any) has completed successfully -- see the ordering
+    note on `_begin_set_context` -- so a `context_set` handle can sit with
+    `future is None` for a while after the dispatch begins.
+    """
+
+    kind: str  # "expect" or "context_set"
+    device_id: str
+    stream: str
+    future: "Future[None] | None" = None
+
+
+@dataclass
+class _SetContextDispatch:
+    """Tracks the concurrent RPC fan-out for a single set_context step.
+
+    Created by `_begin_set_context` and polled tick-by-tick by
+    `_poll_set_context` (via `SequencerRuntime`) until every call has
+    acknowledged, so the step stays non-advancing until all streams are
+    done -- matching the previous blocking implementation's invariant
+    without blocking the sequencer's tick loop while a retry backoff is
+    pending on any individual stream.
+
+    `deadline` is a wall-clock (`time.monotonic()`) safety net covering the
+    dispatch as a whole, including calls still queued behind a saturated
+    pool; see `_SET_CONTEXT_DISPATCH_DEADLINE_S`.
+    """
+
+    calls: list[_SetContextCallHandle] = field(default_factory=list)
+    deadline: float = 0.0
+
+    def cancel(self) -> None:
+        """Best-effort abort (F8): called when the owning step is abandoned
+        (stop/pause/fail/timeout) before the dispatch finished. Cancels any
+        call that hasn't started running yet. Futures already executing
+        `_set_stream_context`'s retry loop can't be forcibly interrupted --
+        `concurrent.futures` has no thread-kill primitive -- so those keep
+        running in the background to their own completion/deadline; this at
+        least stops *queued* work from starting after the step is gone.
+        """
+        for call in self.calls:
+            if call.future is not None:
+                call.future.cancel()
+
+
 _DRIVER_BUILTIN_ACTIONS = {
     "capabilities",
     "refresh_capabilities",
@@ -207,6 +274,17 @@ class SequencerProcess(ManagedProcessBase):
         self._manager_rpc = manager_rpc
         self._manager_pub = manager_pub
         self._rpc_timeout_ms = int(rpc_timeout_ms)
+        # The dispatch pool below (F8) fans out per-stream set_context RPCs
+        # onto worker threads that call `_call_device`/`_call_process`
+        # concurrently with each other AND with the main loop thread (which
+        # itself calls into the manager RPC socket via log flushing, RPC
+        # handlers, and preflight). `ManagerClient.call()` is internally
+        # thread-safe (guards its own socket round trip), so no additional
+        # locking is needed here.
+        self._context_executor = ThreadPoolExecutor(
+            max_workers=_SET_CONTEXT_DISPATCH_MAX_WORKERS,
+            thread_name_prefix="sequencer-set-context",
+        )
 
         # Control plane (ROUTER)
         self._init_rpc_router()
@@ -243,6 +321,8 @@ class SequencerProcess(ManagedProcessBase):
             call_process=self._call_process,
             get_process_telemetry=self._get_process_telemetry,
             expect_streams=self._expect_streams,
+            begin_set_context=self._begin_set_context,
+            poll_set_context=self._poll_set_context,
         )
         self._context_columns: dict[str, str] | None = None
         self._loaded_sequence_source: str | None = None
@@ -283,6 +363,13 @@ class SequencerProcess(ManagedProcessBase):
                 self._try_autoload_sequence_id(self._autoload_sequence_id)
         if autoload_path and self._loaded_sequence_text is None:
             self._try_autoload_path(str(autoload_path))
+
+    def close(self) -> None:
+        try:
+            self._context_executor.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
+        super().close()
 
     def _resolve_use_sequence_spec(self, sequence_id: str):
         if self._sequence_library is None:
@@ -505,6 +592,22 @@ class SequencerProcess(ManagedProcessBase):
 
     def _maybe_publish_progress_event(self) -> None:
         if self._manager is None:
+            return
+        # Fast path: with the F5 tick budget, run() now calls this many times
+        # per sleepless scan (previously ~once per whole scan), so building
+        # the full status snapshot (progress ETA calc, dict copies of
+        # env/vars, adaptive study snapshots) on every call is wasted work
+        # whenever we already know the throttle below would discard it. A
+        # non-terminal state that's still within the rate-limit period always
+        # returns early below regardless of what the (unbuilt) signature
+        # would have been, so it's safe to skip status() entirely in that
+        # case rather than build it just to throw it away.
+        cheap_state = self._runtime.state
+        if (
+            cheap_state not in {"STOPPED", "ERROR"}
+            and (time.monotonic() - self._last_progress_event_mono)
+            < self._progress_event_period_s
+        ):
             return
         status = self._runtime.status()
         signature = self._progress_event_signature(status)
@@ -2329,6 +2432,10 @@ class SequencerProcess(ManagedProcessBase):
             "action": action,
             "params": params,
         }
+        # F8: the set_context dispatch pool may call this from multiple
+        # worker threads concurrently (and concurrently with the main loop
+        # thread's own manager RPC calls). `ManagerClient.call()` is
+        # internally thread-safe, so no locking is needed here.
         return self._normalize_call_response(self._require_manager().call(req))
 
     def _call_process(self, process_id: str, action: str, params: dict[str, Any]) -> Json:
@@ -2340,6 +2447,7 @@ class SequencerProcess(ManagedProcessBase):
             "process_id": process_id,
             "request": {"type": action, "params": params},
         }
+        # See the thread-safety note in `_call_device`.
         return self._normalize_call_response(self._require_manager().call(req))
 
     def _get_process_telemetry(self, process_id: str, signal: str) -> dict[str, Any] | None:
@@ -2412,6 +2520,104 @@ class SequencerProcess(ManagedProcessBase):
         resp = self._call_process("hdf_writer", "hdf.streams.expect", params)
         if not bool(resp.get("ok", False)):
             raise RuntimeError(f"hdf.streams.expect failed: {self._device_error_text(resp)}")
+
+    def _begin_set_context(
+        self, streams: list[tuple[str, str]], context_id: int, fields: dict[str, Any]
+    ) -> _SetContextDispatch:
+        """Fan out a set_context step's RPCs concurrently (F8), off the tick
+        thread, while preserving the expect-before-context-set ordering the
+        HDF writer relies on.
+
+        `hdf.streams.expect` is registered `strict=True`: if a device's
+        `stream.context.set` acks and the device starts emitting samples
+        under the new context before the writer has processed the expect
+        call, the writer silently rejects those samples. The previous
+        synchronous implementation got this ordering for free by running
+        `_expect_streams` to completion before issuing any per-stream
+        `stream.context.set` calls; that invariant has to be preserved here
+        even though everything now runs off the tick thread.
+
+        So per-stream `context_set` calls are NOT submitted up front.
+        Instead, a single pool job runs `_expect_streams` to completion and
+        only then submits the `context_set` calls (from that same worker
+        thread, still off the tick thread) -- so no device can switch
+        context before the writer expects it, and the sequencer's own
+        thread never blocks either way. Each worker keeps using the
+        existing bounded-retry/backoff logic in `_set_stream_context`
+        unchanged. The returned handle is polled every tick via
+        `_poll_set_context` until every call finishes.
+        """
+        if not streams:
+            return _SetContextDispatch(calls=[])
+
+        deadline = time.monotonic() + _SET_CONTEXT_DISPATCH_DEADLINE_S
+        expect_handle = _SetContextCallHandle(kind="expect", device_id="", stream="")
+        context_handles = [
+            _SetContextCallHandle(kind="context_set", device_id=device_id, stream=stream)
+            for device_id, stream in streams
+        ]
+
+        def _expect_then_dispatch_context_sets() -> None:
+            self._expect_streams(streams, context_id)
+            # Only reached if `_expect_streams` succeeded. Submitting here
+            # (still inside the pool worker, not the tick thread) is what
+            # keeps this non-blocking for the sequencer while still
+            # guaranteeing every context_set is submitted strictly after
+            # expect has completed.
+            for handle, (device_id, stream) in zip(context_handles, streams, strict=True):
+                handle.future = self._context_executor.submit(
+                    self._set_stream_context, device_id, stream, context_id, fields
+                )
+
+        expect_handle.future = self._context_executor.submit(_expect_then_dispatch_context_sets)
+        return _SetContextDispatch(calls=[expect_handle, *context_handles], deadline=deadline)
+
+    @staticmethod
+    def _poll_set_context(dispatch: _SetContextDispatch, now: float) -> tuple[bool, str | None]:
+        """Non-blocking poll of a set_context dispatch.
+
+        Returns `(finished, error)`. Not finished until every call in the
+        dispatch has completed -- preserving the "no advance until all
+        streams ack" invariant of the previous synchronous implementation,
+        just without blocking the tick thread while waiting. The `expect`
+        call is checked first and in isolation: while it is still pending,
+        the `context_set` handles legitimately have `future is None` (not
+        yet submitted -- see `_begin_set_context`), so they must not be
+        mistaken for a hung call.
+
+        `dispatch.deadline` is a dispatch-wide safety net (F8#4): each call
+        bounds its own retry loop internally, but a call still queued behind
+        a saturated pool accrues wait time nothing else bounds, so this also
+        fails the step once the overall deadline passes regardless of which
+        calls are merely queued vs. actually stuck.
+        """
+        expect_call = next((call for call in dispatch.calls if call.kind == "expect"), None)
+        if expect_call is not None:
+            if expect_call.future is None or not expect_call.future.done():
+                if now >= dispatch.deadline:
+                    dispatch.cancel()
+                    return True, "set_context dispatch timed out waiting for hdf.streams.expect"
+                return False, None
+            try:
+                expect_call.future.result()
+            except Exception as e:
+                return True, str(e)
+
+        context_calls = [call for call in dispatch.calls if call.kind != "expect"]
+        pending = [call for call in context_calls if call.future is None or not call.future.done()]
+        if pending:
+            if now >= dispatch.deadline:
+                dispatch.cancel()
+                names = ", ".join(f"{call.device_id}/{call.stream}" for call in pending)
+                return True, f"set_context dispatch timed out waiting for: {names}"
+            return False, None
+        for call in context_calls:
+            assert call.future is not None
+            try:
+                call.future.result()
+            except Exception as e:
+                return True, str(e)
+        return True, None
 
     def _get_telemetry(self, device_id: str, signal: str) -> dict[str, Any] | None:
         return self._require_manager().get_latest(device_id, signal)
@@ -2949,13 +3155,38 @@ class SequencerProcess(ManagedProcessBase):
         return self.rpc_unknown(req)
 
     def run(self) -> None:
+        # `poll_timeout_ms` is normally the fixed 50 ms RPC/telemetry poll
+        # ceiling. `SequencerRuntime.tick()` returns True when it stopped
+        # early solely because its per-tick step/time budget (F5) was
+        # exhausted while more step work is immediately runnable (no
+        # sleep/wait/pause/stop/error is blocking progress). In that case the
+        # *next* poll must not block for the full ceiling - there may be
+        # nothing to wake it - or a sleepless scan's throughput collapses to
+        # a few percent duty cycle (poll ceiling >> per-tick compute time).
+        # Use a zero timeout (non-blocking poll) on that next iteration so
+        # tick() gets to resume immediately, while still opportunistically
+        # draining any RPC/telemetry that happens to already be queued.
+        #
+        # When tick() reports no pending step work, fall back to F15's
+        # deadline-aware `next_poll_timeout_ms()` instead of the flat 50 ms
+        # ceiling: it shortens the poll when a `sleep`/`wait_until`/adaptive-
+        # observe deadline is due sooner, and returns the ceiling when the
+        # runtime is genuinely idle. F5's non-blocking signal takes priority
+        # over F15's timeout - a pending-work tick must never be quantized onto
+        # a (possibly long) idle deadline.
+        poll_timeout_ms = 50
         try:
             while True:
-                events = self._poll_and_drain(50)
+                events = self._poll_and_drain(poll_timeout_ms)
                 self._drain_external_fault_logs(events)
                 self._drain_analysis_outputs(events)
                 self._flush_pending_logs(max_items=8)
-                self._runtime.tick()
+                more_work_pending = self._runtime.tick()
+                poll_timeout_ms = (
+                    0
+                    if more_work_pending
+                    else self._runtime.next_poll_timeout_ms(ceiling_ms=50)
+                )
                 self._maybe_publish_progress_event()
                 if self._runtime.state == "ERROR" and not self._last_error_sent:
                     err_message = str(

@@ -98,6 +98,8 @@ export function normalizePlotState(
       uncertaintyMode?: unknown;
       uncertaintyScale?: unknown;
       showBinMarkers?: unknown;
+      xOffset?: unknown;
+      xScale?: unknown;
       yScaleMode?: unknown;
       yMin?: unknown;
       yMax?: unknown;
@@ -394,6 +396,14 @@ export function normalizePlotState(
           return raw;
         })(),
         showBinMarkers: panel.showBinMarkers === true,
+        xOffset: (() => {
+          const raw = Number(panel.xOffset);
+          return Number.isFinite(raw) ? raw : 0;
+        })(),
+        xScale: (() => {
+          const raw = Number(panel.xScale);
+          return Number.isFinite(raw) && raw !== 0 ? raw : 1;
+        })(),
         yScaleMode,
         yMin,
         yMax,

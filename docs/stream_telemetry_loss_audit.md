@@ -660,3 +660,63 @@ poisoned string into the bg batch path.
    schema is populated via the reader-fallback path (attach → pop → read)
    must still flush; plus a mixed batch where one stream's write raises must
    still write the sibling stream's frames.
+
+---
+
+## 11. Where the new diagnostics are written (2026-07-10)
+
+The current code writes the new stream diagnostics as HDF attrs on the stream
+group, not on the `session_001/data` dataset:
+
+- `/streams/fs740/timestamps.attrs`
+- `/streams/pxie5171/waveforms.attrs`
+
+`HdfWriter._persist_stream_attrs()` in `processes/hdf_writer.py` writes the
+per-stream attrs. The key attrs are:
+
+- `chunk_ready_seen_total`
+- `events_read_total`
+- `rows_written_total`
+- `seq_gap_total`
+- `startup_seq_gap`
+- `attach_failures_total`
+- `drain_failures_total`
+- `payload_size_failures_total`
+- `first_seq`
+- `last_seq`
+- `last_error`
+- `expected_count`
+- `strict_required`
+- `context_id`
+- `context_ids_json`
+
+The counters are bumped at these boundaries:
+
+- `chunk_ready_seen_total`: when the HDF writer receives a `manager.chunk_ready`
+  descriptor.
+- `attach_failures_total`: when attaching to the stream SHM ring fails.
+- `drain_failures_total`: when reading events from the SHM ring fails.
+- `events_read_total`: after SHM events are successfully read.
+- `startup_seq_gap` and `seq_gap_total`: when first attach starts after sequence
+  1, or later sequence gaps are detected.
+- `payload_size_failures_total`: when buffered payload bytes do not match the
+  expected dataset shape/dtype.
+- `rows_written_total`: after rows are successfully written to the stream
+  datasets.
+
+The file/root-level strict-acquisition diagnostics are written as attrs on `/`
+and mirrored on `/measurement`:
+
+- `acquisition_ok`
+- `hdf_strict_stream_errors_json`
+
+The existing root drop counters remain:
+
+- `dropped_local_messages_total`
+- `dropped_event_messages_total`
+
+For a rerun with current code, the first inspection target should therefore be
+the attrs on `/streams/fs740/timestamps` and `/streams/pxie5171/waveforms`,
+then the root attrs above. The old lab files do not have these attrs, so they
+cannot identify whether their loss happened before descriptor delivery, during
+SHM drain, or during final dataset write without inference.

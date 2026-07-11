@@ -232,5 +232,54 @@ class ManagerAutoConnectOffLoopTests(unittest.TestCase):
             mgr._lifecycle_executor.shutdown(wait=True, cancel_futures=True)  # type: ignore[attr-defined]
 
 
+class ManagerSubscriptionPumpThreadSafetyTests(unittest.TestCase):
+    @staticmethod
+    def _build_manager() -> Manager:
+        mgr = object.__new__(Manager)
+        mgr._main_thread_id = threading.get_ident()  # type: ignore[attr-defined]
+        mgr._sub = mock.Mock()  # type: ignore[attr-defined]
+        mgr._process_hb_sub = mock.Mock()  # type: ignore[attr-defined]
+        mgr._process_data_sub = mock.Mock()  # type: ignore[attr-defined]
+        mgr._handle_driver_pub = mock.Mock()  # type: ignore[attr-defined]
+        mgr._handle_process_pub = mock.Mock()  # type: ignore[attr-defined]
+        mgr._handle_process_data_pub = mock.Mock()  # type: ignore[attr-defined]
+        return mgr
+
+    def test_main_thread_drains_all_subscription_sockets(self) -> None:
+        mgr = self._build_manager()
+        mgr._sub.poll.side_effect = [True, False]  # type: ignore[attr-defined]
+        mgr._process_hb_sub.poll.side_effect = [True, False]  # type: ignore[attr-defined]
+        mgr._process_data_sub.poll.side_effect = [True, False]  # type: ignore[attr-defined]
+
+        mgr._pump_manager_subscriptions()  # type: ignore[attr-defined]
+
+        mgr._handle_driver_pub.assert_called_once_with()  # type: ignore[attr-defined]
+        mgr._handle_process_pub.assert_called_once_with()  # type: ignore[attr-defined]
+        mgr._handle_process_data_pub.assert_called_once_with()  # type: ignore[attr-defined]
+
+    def test_worker_thread_does_not_touch_subscription_sockets(self) -> None:
+        mgr = self._build_manager()
+        errors: list[BaseException] = []
+
+        def pump_from_worker() -> None:
+            try:
+                mgr._pump_manager_subscriptions()  # type: ignore[attr-defined]
+            except BaseException as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+
+        worker = threading.Thread(target=pump_from_worker)
+        worker.start()
+        worker.join(timeout=1.0)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+        mgr._sub.poll.assert_not_called()  # type: ignore[attr-defined]
+        mgr._process_hb_sub.poll.assert_not_called()  # type: ignore[attr-defined]
+        mgr._process_data_sub.poll.assert_not_called()  # type: ignore[attr-defined]
+        mgr._handle_driver_pub.assert_not_called()  # type: ignore[attr-defined]
+        mgr._handle_process_pub.assert_not_called()  # type: ignore[attr-defined]
+        mgr._handle_process_data_pub.assert_not_called()  # type: ignore[attr-defined]
+
+
 if __name__ == "__main__":
     unittest.main()

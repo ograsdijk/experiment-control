@@ -15,9 +15,9 @@ if (-not (Test-Path (Join-Path $uiRoot "package.json"))) {
 # for all npm invocations and drop the now-redundant --prefix flag.
 Push-Location $uiRoot
 try {
-  npm install --prefer-offline --no-audit
+  npm ci --prefer-offline --no-audit
   if ($LASTEXITCODE -ne 0) {
-    throw "npm install failed with exit code $LASTEXITCODE"
+    throw "npm ci failed with exit code $LASTEXITCODE"
   }
 
   npm run build

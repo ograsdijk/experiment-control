@@ -31,6 +31,21 @@ from .eval import eval_condition, render_templates, to_attrdict
 from .ranges import generate_from_gen
 from .source_info import StepSourceInfo, step_kind, step_summary
 
+# Floor applied to `wait_until.every_s` (and the poll-timeout floor itself) so
+# a misconfigured sequence (e.g. `every_s: 0`) can't peg the process loop at
+# ~1000Hz for the duration of the wait. The old fixed 50ms poll made this
+# impossible; the dynamic poll timeout (F15) reintroduces the risk without
+# this clamp.
+_MIN_WAIT_EVERY_S = 0.005
+
+# Bound on how long the outer loop may wait between checks while an adaptive
+# `observe` trial is pending (e.g. waiting on an `analysis_output` metric).
+# Real wakeups mostly come from the analysis SUB socket firing, but this caps
+# the fallback poll so the runtime's own `timeout_s` bookkeeping for that
+# source is also checked at a reasonable cadence instead of the full 50ms
+# ceiling.
+_ADAPTIVE_OBSERVE_POLL_S = 0.02
+
 
 @dataclass
 class _Frame:
@@ -89,6 +104,10 @@ class _AdaptiveObserveState:
     metrics_spec: dict[str, Any]
     current_repeat: int = 0
     started_t: float = 0.0
+    # Next time the outer loop should re-check this trial (analysis_output
+    # polling / timeout bookkeeping); set on each pending step. `None` until
+    # the first pending tick.
+    next_check_t: float | None = None
 
 
 @dataclass
@@ -119,6 +138,21 @@ class _NoStepReady:
 _NO_STEP_READY = _NoStepReady()
 StepResult = Step | _NoStepReady | None
 
+# F5 fix: tick() used to run the inner step loop to completion (until a
+# sleep/wait/pause step, or sequence end), so a scan made entirely of cheap
+# steps (set/call/assign/for/repeat all return False from _execute_step)
+# could run for the whole scan inside one tick() call. sequencer.py's run()
+# only drains the RPC ROUTER (pause/stop/status) *between* tick() calls, so
+# such a scan left the process unresponsive to control for its full
+# duration. Bound the inner loop by wall-clock time and step count so
+# run() regularly gets a chance to service RPC. Neither budget is checked
+# while inside an atomic block (`_atomic_depth > 0`): atomic blocks must
+# remain uninterruptible by anything other than their own completion,
+# exactly as they already are with respect to stop/pause in
+# `_check_stop_pause`.
+_TICK_BUDGET_S = 0.010
+_TICK_MAX_STEPS = 200
+
 
 class SequencerRuntime:
     def __init__(
@@ -131,6 +165,9 @@ class SequencerRuntime:
         call_process: Callable[[str, str, dict[str, Any]], dict[str, Any]] | None = None,
         get_process_telemetry: Callable[[str, str], dict[str, Any] | None] | None = None,
         expect_streams: Callable[[list[tuple[str, str]], int], None] | None = None,
+        begin_set_context: Callable[[list[tuple[str, str]], int, dict[str, Any]], Any]
+        | None = None,
+        poll_set_context: Callable[[Any, float], tuple[bool, str | None]] | None = None,
     ) -> None:
         self._call_device = call_device
         self._get_telemetry = get_telemetry
@@ -142,6 +179,12 @@ class SequencerRuntime:
         self._call_process = call_process
         self._get_process_telemetry = get_process_telemetry
         self._expect_streams = expect_streams
+        # Non-blocking set_context dispatch (F8). Optional: when not wired,
+        # `_execute_set_context_step` falls back to the previous synchronous
+        # (blocking) path via `set_stream_context`/`expect_streams` above, so
+        # existing callers/tests that only wire those keep working unchanged.
+        self._begin_set_context = begin_set_context
+        self._poll_set_context = poll_set_context
 
         self._spec: SequenceSpec | None = None
         self._vars: dict[str, Any] = {}
@@ -160,6 +203,7 @@ class SequencerRuntime:
         self._cleanup_errors: list[dict[str, Any]] = []
         self._sleep_until: float | None = None
         self._wait_state: _WaitState | None = None
+        self._set_context_state: Any = None
         self._adaptive_observe_state: _AdaptiveObserveState | None = None
         self._atomic_depth = 0
         self._current_step: str | None = None
@@ -192,6 +236,29 @@ class SequencerRuntime:
         self._use_stack: list[str] = []
         self._step_handlers: dict[type[Any], Callable[[Any], bool]] = {}
         self._register_step_handlers()
+
+    def _clear_set_context_state(self) -> None:
+        """Discard a pending/finished set_context dispatch.
+
+        Used everywhere `_set_context_state` is reset -- normal completion,
+        stop/pause, fail, terminal unwind, loop restart -- so an abandoned
+        dispatch (e.g. the operator stopped the run mid-retry) gets a
+        best-effort abort instead of silently running to completion in the
+        background (F8#3). The dispatch object is opaque to this class (it
+        may be the fallback path's `None`, or whatever `begin_set_context`
+        returned); if it exposes a no-arg `cancel()`, call it, but don't
+        assume it does.
+        """
+        state = self._set_context_state
+        self._set_context_state = None
+        if state is None:
+            return
+        cancel = getattr(state, "cancel", None)
+        if callable(cancel):
+            try:
+                cancel()
+            except Exception:
+                pass
 
     @property
     def state(self) -> str:
@@ -246,6 +313,7 @@ class SequencerRuntime:
         self._cleanup_errors = []
         self._sleep_until = None
         self._wait_state = None
+        self._clear_set_context_state()
         self._adaptive_observe_state = None
         self._atomic_depth = 0
         self._current_step = None
@@ -331,6 +399,7 @@ class SequencerRuntime:
         self._env = {}
         self._sleep_until = None
         self._wait_state = None
+        self._clear_set_context_state()
         self._adaptive_observe_state = None
         self._atomic_depth = 0
         self._current_step = None
@@ -378,6 +447,7 @@ class SequencerRuntime:
         self._stop_requested = False
         self._sleep_until = None
         self._wait_state = None
+        self._clear_set_context_state()
         self._adaptive_observe_state = None
         if self._begin_terminal_unwind("ERROR", str(reason or "external fault")):
             self._state = "RUNNING"
@@ -434,44 +504,104 @@ class SequencerRuntime:
         if len(self._analysis_outputs) > 512:
             del self._analysis_outputs[0 : len(self._analysis_outputs) - 512]
 
-    def tick(self) -> None:
+    def next_poll_timeout_ms(self, ceiling_ms: int = 50, floor_ms: int = 1) -> int:
+        """Time (in ms) until the next thing this runtime needs to act on.
+
+        The outer process loop (`sequencer.py: run()`) blocks on an RPC/telemetry
+        poll between ticks. If a `sleep` step or `wait_until` sample is due sooner
+        than the fixed poll ceiling, using the ceiling as the poll timeout would
+        quantize that deadline onto the poll cadence (F15). Report the earliest
+        of any pending `_sleep_until` deadline, `_wait_state` deadline (next
+        sample, `timeout_s`, or `stable_for_s`), or `_adaptive_observe_state`
+        recheck time, clamped to `[floor_ms, ceiling_ms]`, so the caller can
+        wake up exactly when needed instead of waiting out the full ceiling.
+
+        When nothing is pending (no active sleep/wait/adaptive-observe),
+        returns `ceiling_ms` unchanged so RPC responsiveness for
+        pause/stop/status doesn't regress.
+
+        `floor_ms` is clamped to at least 1ms here regardless of what the
+        caller passes, so an already-elapsed deadline can never produce a
+        zero/negative timeout (which would make the underlying poll
+        non-blocking and busy-spin the loop).
+        """
+        floor_ms = max(1, int(floor_ms))
         if self._state != "RUNNING":
-            return
+            return ceiling_ms
+        deadlines = []
+        if self._sleep_until is not None:
+            deadlines.append(self._sleep_until)
+        ws = self._wait_state
+        if ws is not None:
+            deadlines.append(ws.next_sample_t)
+            if ws.timeout_s:
+                deadlines.append(ws.start_t + ws.timeout_s)
+            if ws.stable_for_s and ws.stable_since is not None:
+                deadlines.append(ws.stable_since + ws.stable_for_s)
+        aos = self._adaptive_observe_state
+        if aos is not None and aos.next_check_t is not None:
+            deadlines.append(aos.next_check_t)
+        if not deadlines:
+            return ceiling_ms
+        remaining_s = min(deadlines) - time.monotonic()
+        remaining_ms = int(math.ceil(remaining_s * 1000.0))
+        return max(floor_ms, min(ceiling_ms, remaining_ms))
+
+    def tick(self) -> bool:
+        """Advance the sequence by one tick, bounded by the per-tick budget.
+
+        Returns True only when the tick returned *solely* because the step/time
+        budget was exhausted while more step work is immediately runnable (no
+        sleep/wait/pause/stop/error is blocking progress). This lets the caller
+        (`sequencer.py`'s `run()`) distinguish "budget exhausted, resume ASAP"
+        from "genuinely idle" (sleeping, waiting, paused, stopped, errored, or
+        the sequence finished) and shorten its next RPC poll timeout accordingly
+        instead of always waiting out the full poll ceiling — see F5/F15.
+        """
+        if self._state != "RUNNING":
+            return False
 
         try:
             if self._pending_terminal_state is not None and not self._stack:
                 self._finish_pending_terminal()
-                return
+                return False
 
             if self._check_stop_pause():
-                return
+                return False
 
             now = time.monotonic()
             if self._sleep_until is not None:
                 if now < self._sleep_until:
-                    return
+                    return False
                 self._sleep_until = None
                 self._finish_active_step(now)
 
             if self._wait_state is not None:
                 if not self._step_wait_until(now):
+                    return False
+                self._finish_active_step(time.monotonic())
+
+            if self._set_context_state is not None:
+                if not self._step_set_context(now):
                     return
                 self._finish_active_step(time.monotonic())
 
             if self._adaptive_observe_state is not None:
                 if not self._step_adaptive_observation(now):
-                    return
+                    return False
 
+            tick_deadline = time.monotonic() + _TICK_BUDGET_S
+            steps_executed = 0
             while self._state == "RUNNING":
                 if self._check_stop_pause():
-                    return
+                    return False
                 step = self._next_step()
                 if isinstance(step, _NoStepReady):
-                    return
+                    return False
                 if step is None:
                     if self._pending_terminal_state is not None:
                         self._finish_pending_terminal()
-                        return
+                        return False
                     if self._state == "RUNNING":
                         self._loops_completed += 1
                         if self._should_continue_run_loops():
@@ -479,13 +609,27 @@ class SequencerRuntime:
                             continue
                         self._state = "STOPPED"
                         self._run_ended_mono = time.monotonic()
-                    return
+                    return False
                 self._begin_active_step(time.monotonic())
                 if self._execute_step(step):
-                    if self._sleep_until is None and self._wait_state is None:
+                    if (
+                        self._sleep_until is None
+                        and self._wait_state is None
+                        and self._set_context_state is None
+                    ):
                         self._finish_active_step(time.monotonic())
-                    return
+                    return False
                 self._finish_active_step(time.monotonic())
+                steps_executed += 1
+                if self._interruptible() and (
+                    steps_executed >= _TICK_MAX_STEPS
+                    or time.monotonic() >= tick_deadline
+                ):
+                    # Budget exhausted, but the loop condition
+                    # (`self._state == "RUNNING"`) still held and nothing
+                    # blocking (sleep/wait/pause/stop) intervened: there is
+                    # more step work ready right now.
+                    return True
         except Exception as e:
             if not self._handle_runtime_exception(e):
                 if self._last_error_detail is None:
@@ -493,6 +637,7 @@ class SequencerRuntime:
                 self._last_error = str(e)
                 self._state = "ERROR"
                 self._run_ended_mono = time.monotonic()
+        return False
 
     def _env_view(self) -> dict[str, Any]:
         env = dict(self._env)
@@ -543,16 +688,34 @@ class SequencerRuntime:
         except Exception:
             return False
 
+    def _interruptible(self) -> bool:
+        """Whether the run loop may act on stop/pause/tick-budget right now.
+
+        `False` while inside an `atomic` block (`_atomic_depth > 0`): atomic
+        blocks must remain uninterruptible by anything other than their own
+        completion. Single source of truth for the guard shared by
+        `_check_stop_pause` and the per-tick step/time budget in `tick()`.
+        """
+        return self._atomic_depth == 0
+
     def _check_stop_pause(self) -> bool:
-        if self._stop_requested and self._atomic_depth == 0:
+        if self._stop_requested and self._interruptible():
             now = time.monotonic()
             self._mark_pause_ended(now)
             self._stop_requested = False
             if not self._begin_terminal_unwind("STOPPED", None):
+                # No on_exit/finally work to unwind, so we go straight to
+                # STOPPED without routing through `_begin_terminal_unwind`'s
+                # own `_clear_set_context_state()` call. A set_context
+                # dispatch can still be pending here (e.g. `stop` requested
+                # while a stream's retry is in flight) and must still get
+                # its best-effort cancel (F8#3) instead of being silently
+                # abandoned/orphaned in `_set_context_state`.
+                self._clear_set_context_state()
                 self._state = "STOPPED"
                 self._run_ended_mono = now
             return True
-        if self._pause_requested and self._atomic_depth == 0:
+        if self._pause_requested and self._interruptible():
             self._mark_pause_started(time.monotonic())
             self._state = "PAUSED"
             return True
@@ -593,6 +756,7 @@ class SequencerRuntime:
         self._cleanup_errors = []
         self._sleep_until = None
         self._wait_state = None
+        self._clear_set_context_state()
         self._adaptive_observe_state = None
         self._current_step = None
         self._current_step_detail = None
@@ -615,6 +779,7 @@ class SequencerRuntime:
         self._cleanup_failed = False
         self._sleep_until = None
         self._wait_state = None
+        self._clear_set_context_state()
         self._adaptive_observe_state = None
         self._state = "ERROR" if cleanup_failed else str(state or "STOPPED")
         self._last_error = error if self._state == "ERROR" else None
@@ -640,6 +805,7 @@ class SequencerRuntime:
         self._env = {}
         self._sleep_until = None
         self._wait_state = None
+        self._clear_set_context_state()
         self._adaptive_observe_state = None
         self._pending_terminal_state = None
         self._pending_terminal_error = None
@@ -1040,6 +1206,7 @@ class SequencerRuntime:
                             frame.on_exit()
                             self._sleep_until = None
                             self._wait_state = None
+                            self._clear_set_context_state()
                             self._adaptive_observe_state = None
                         continue
                     step = frame.steps[frame.index]
@@ -1052,6 +1219,7 @@ class SequencerRuntime:
                     frame.on_exit()
                     self._sleep_until = None
                     self._wait_state = None
+                    self._clear_set_context_state()
                     self._adaptive_observe_state = None
                 continue
             if isinstance(frame, _TryFrame):
@@ -1252,6 +1420,19 @@ class SequencerRuntime:
         fields = render_templates(step.fields, self._env_view())
         try:
             streams = self._normalize_streams(step.streams)
+        except Exception as e:
+            return self._fail_step(f"set_context failed: {e}")
+
+        if self._begin_set_context is not None and self._poll_set_context is not None:
+            # Non-blocking path (F8): dispatch the hdf.streams.expect + all
+            # per-stream stream.context.set RPCs concurrently and let the
+            # tick loop poll for completion, instead of blocking here.
+            self._set_context_state = self._begin_set_context(streams, ctx_id, fields)
+            return True
+
+        # Fallback: previous synchronous behavior, kept for callers/tests
+        # that only wire `set_stream_context`/`expect_streams` directly.
+        try:
             if streams and self._expect_streams is not None:
                 self._expect_streams(streams, ctx_id)
             for device, stream in streams:
@@ -2009,7 +2190,6 @@ class SequencerRuntime:
         return True
 
     def _collect_adaptive_repeat(self, state: _AdaptiveObserveState, now: float) -> bool:
-        del now
         repeat_values: dict[str, Any] = {}
         pending_analysis = False
         for name, source_spec in state.metrics_spec.items():
@@ -2025,7 +2205,14 @@ class SequencerRuntime:
             repeat_values[name] = value
 
         if pending_analysis:
+            # Waiting on an external analysis_output publish: real wakeups
+            # come from the analysis SUB socket, but bound the fallback poll
+            # so the trial's own timeout_s bookkeeping (checked inside
+            # _try_sample_analysis_output) is revisited at a sane cadence
+            # rather than the full poll ceiling.
+            state.next_check_t = now + _ADAPTIVE_OBSERVE_POLL_S
             return False
+        state.next_check_t = None
 
         for name, source_spec in state.metrics_spec.items():
             if name in repeat_values:
@@ -2489,7 +2676,11 @@ class SequencerRuntime:
             return float(rendered)
 
         timeout_s = _render_float(raw.get("timeout_s", 0), 0)
-        every_s = _render_float(raw.get("every_s", 0.1), 0.1)
+        # Clamp to a sane minimum: with the dynamic poll timeout (F15), an
+        # `every_s` of 0 (or sub-millisecond) would otherwise have the outer
+        # process loop busy-poll at ~1000Hz for the whole wait duration —
+        # previously impossible since the poll was always fixed at 50ms.
+        every_s = max(_render_float(raw.get("every_s", 0.1), 0.1), _MIN_WAIT_EVERY_S)
         stable_for_s = _render_float(raw.get("stable_for_s", 0), 0)
         sample_spec_raw = raw.get("sample", {})
         sample_spec = render_templates(sample_spec_raw, env)
@@ -2525,6 +2716,32 @@ class SequencerRuntime:
             samples=[],
             max_samples=max_samples,
         )
+
+    def _step_set_context(self, now: float) -> bool:
+        """Tick-driven poll of a pending set_context dispatch (F8).
+
+        Mirrors `_step_wait_until`'s shape: returns False while the step
+        stays pending (re-checked on later ticks), True once it is
+        resolved (all per-stream RPCs acked, or a failure/timeout is
+        surfaced via `_fail_step`). The step never advances until every
+        stream's ack has arrived, matching the previous blocking
+        implementation's invariant.
+        """
+        if self._check_stop_pause():
+            return False
+        state = self._set_context_state
+        if state is None:
+            return True
+        if self._poll_set_context is None:
+            self._clear_set_context_state()
+            return True
+        finished, error = self._poll_set_context(state, now)
+        if not finished:
+            return False
+        self._clear_set_context_state()
+        if error is not None:
+            self._fail_step(f"set_context failed: {error}")
+        return True
 
     def _step_wait_until(self, now: float) -> bool:
         if self._check_stop_pause():

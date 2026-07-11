@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 import time
 from typing import TYPE_CHECKING, Any, Callable, Iterator
 
@@ -140,12 +141,17 @@ class RpcCallsMixin(_MixinBase):
     _sub: zmq.Socket
     _process_hb_sub: zmq.Socket
     _process_data_sub: zmq.Socket
+    _main_thread_id: int
     _device_rpc_timeout_ms: int
     _rpc_seq: int
     _devices: dict[str, "DeviceHandle"]
     _processes: dict[str, "ProcessHandle"]
 
     def _pump_manager_subscriptions(self) -> None:
+        # Lifecycle workers also use _blocking_call_with_pump, but these SUB
+        # sockets belong exclusively to the manager's main poll thread.
+        if threading.get_ident() != self._main_thread_id:
+            return
         while self._sub.poll(0, zmq.POLLIN):
             self._handle_driver_pub()
         while self._process_hb_sub.poll(0, zmq.POLLIN):
