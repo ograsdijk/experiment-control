@@ -10,7 +10,7 @@ if TYPE_CHECKING:
     import zmq
 
     from ..federation.hub import FederationHub
-    from .models import DeviceHandle
+    from .models import DeviceHandle, ProcessHandle
     from ..manager_protocol import ManagerProtocol
 
     _MixinBase = ManagerProtocol
@@ -74,6 +74,7 @@ class InternalRpcMixin(_MixinBase):
     # Owned-state attributes (concrete types declared on Manager).
     _internal_rpc: "zmq.Socket"
     _devices: dict[str, "DeviceHandle"]
+    _processes: dict[str, "ProcessHandle"]
     _federation_hub: "FederationHub"
     _internal_action_registry: RpcDispatchRegistry
     _internal_type_registry: RpcDispatchRegistry
@@ -89,20 +90,56 @@ class InternalRpcMixin(_MixinBase):
         assert envelope is not None
         req = envelope.raw
 
-        # Lifecycle ops: hand off to the worker pool so different
-        # devices can run concurrently. Reply is sent later when the
-        # worker enqueues it on _lifecycle_reply_queue and the main
-        # loop drains. Federated devices stay on the main thread, but
-        # FederationHub._rpc_call pre-resolves the peer host and pumps manager
-        # subscriptions while awaiting the reply, so an unreachable peer can't
-        # starve process heartbeats during the forward.
+        # Federation forwards (F10): a mirrored device's "command"/lifecycle-
+        # type request, or a mirrored process's manager.processes.rpc, is
+        # queued directly onto that mirror's own dedicated forward worker
+        # (FederationHub._device_forward_workers / _process_forward_workers)
+        # -- never onto the shared local-device lifecycle pool below, and
+        # never inline on this poll loop. The hub delivers the reply later via
+        # the same _lifecycle_reply_queue the local lifecycle path uses. See
+        # FederationHub.try_dispatch_device_forward/try_dispatch_process_forward.
+        #
+        # Local-first precedence: device_id collisions between a local device
+        # and a mirror are rejected at federation-config-parse time (devices
+        # are static, from YAML), so `device_id in self._devices` alone would
+        # already exclude every mirrored id -- the explicit check here just
+        # documents that. Process ids are NOT config-time-checked against
+        # federation mirrors (processes can be added/removed at runtime via
+        # manager.processes.add/remove), so a local process CAN legitimately
+        # share an id with a mirror; `process_id not in self._processes` is
+        # load-bearing here, mirroring route_process_rpc's existing
+        # local-wins-over-mirror precedence.
         rtype = req.get("type")
         device_id = req.get("device_id")
+        if (
+            isinstance(device_id, str)
+            and device_id not in self._devices
+            and self._federation_hub.try_dispatch_device_forward(
+                identity=identity, req=req, rtype=str(rtype), device_id=device_id
+            )
+        ):
+            return
+        process_id = req.get("process_id")
+        if (
+            rtype == "manager.processes.rpc"
+            and isinstance(process_id, str)
+            and process_id not in self._processes
+            and self._federation_hub.try_dispatch_process_forward(
+                identity=identity, req=req, process_id=process_id
+            )
+        ):
+            return
+
+        # Local lifecycle ops: hand off to the worker pool so different
+        # devices can run concurrently. Reply is sent later when the worker
+        # enqueues it on _lifecycle_reply_queue and the main loop drains. A
+        # mirrored device_id is never a key in self._devices (mirrors and
+        # local devices can't collide, see device_routing.py), so this can't
+        # double-dispatch a request already handled above.
         if (
             rtype in _LIFECYCLE_TYPES
             and isinstance(device_id, str)
             and device_id in self._devices
-            and not self._federation_hub.is_mirrored_device(device_id)
         ):
             self._dispatch_lifecycle_task(identity, req, rtype, device_id)
             return

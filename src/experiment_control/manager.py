@@ -529,6 +529,10 @@ class Manager(
             manager=self,
             config=self._federation_config,
             instance_id=self._instance_id,
+            # F10: per-mirror forward workers deliver replies here, drained
+            # by _drain_lifecycle_replies alongside local lifecycle-op
+            # replies (LifecycleExecutor.create() bound this above).
+            reply_queue=self._lifecycle_reply_queue,
         )
         self._internal_action_registry = self._build_internal_action_registry()
         self._internal_type_registry = self._build_internal_type_registry()
