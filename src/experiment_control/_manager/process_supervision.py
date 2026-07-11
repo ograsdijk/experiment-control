@@ -341,11 +341,7 @@ def driver_is_started(handle: Any) -> bool:
 def driver_is_stopped(handle: Any) -> bool:
     if handle.process is None or handle.process.poll() is not None:
         return True
-    return str(handle.driver_process_state) in {
-        "STOPPED",
-        "EXITED",
-        "FAILED",
-    }
+    return False
 
 
 def restart_driver(
@@ -945,6 +941,12 @@ def update_device_driver_exit_state(manager: Any, handle: Any, rc: int) -> None:
         handle.driver_process_state = _enum_member(handle.driver_process_state, "STOPPED")
         manager._publish_driver_event("manager.driver.stopped", handle)
         return
+    if handle.driver_last_error_kind == "heartbeat_stale":
+        handle.driver_process_state = _enum_member(handle.driver_process_state, "FAILED")
+        handle.driver_last_failure_pid = exiting_pid
+        handle.driver_last_signal_name = derive_signal_name(rc_int)
+        manager._publish_driver_event("manager.driver.failed", handle)
+        return
     if rc_int == 0:
         handle.driver_process_state = _enum_member(handle.driver_process_state, "STOPPED")
         manager._publish_driver_event("manager.driver.exited", handle)
@@ -998,9 +1000,9 @@ def enforce_device_driver_heartbeat_timeout(
         return  # transient: manager was delayed or driver still booting
 
     handle.driver_process_state = _enum_member(handle.driver_process_state, "FAILED")
-    handle.driver_pid = None
     handle.driver_running_since_mono = None
-    handle.driver_last_error_kind = handle.driver_last_error_kind or "heartbeat_stale"
+    handle.driver_stop_requested_t_mono = now_mono
+    handle.driver_last_error_kind = "heartbeat_stale"
     if not handle.driver_last_error:
         if hb is None:
             handle.driver_last_error = (
@@ -1020,7 +1022,6 @@ def enforce_device_driver_heartbeat_timeout(
                 proc.terminate()
         except Exception:
             pass
-    handle.process = None
     manager._publish_driver_event("manager.driver.failed", handle)
 
 
@@ -1029,7 +1030,10 @@ def enforce_device_driver_stop_timeout(
     handle: Any,
     now_mono: float,
 ) -> None:
-    if str(handle.driver_process_state) != "STOPPING":
+    state = str(handle.driver_process_state)
+    if state != "STOPPING" and not (
+        state == "FAILED" and handle.driver_last_error_kind == "heartbeat_stale"
+    ):
         return
     if (
         handle.driver_stop_requested_t_mono is None

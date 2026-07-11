@@ -283,7 +283,7 @@ class DeviceRunner:
             # so the process supervisor (which pipes stderr to manager.log) sees
             # cleanup failures instead of devices silently sitting in UNKNOWN.
             try:
-                if self._connect_called and self._device_state != DeviceState.DISCONNECTED:
+                if self._connect_called:
                     self.disconnect_device()
             except Exception as exc:
                 sys.stderr.write(
@@ -927,7 +927,18 @@ class DeviceRunner:
             except Exception:
                 pass
         self._connect_called = True
-        self.connect_device()
+        try:
+            self.connect_device()
+        except Exception:
+            try:
+                self.disconnect_device()
+            except Exception:
+                pass
+            self._device_reachable = False
+            self._device_state = DeviceState.DISCONNECTED
+            self._capabilities_cache = None
+            self._members_cache = None
+            raise
         self._device_reachable = True
         self._device_state = DeviceState.OK
         self._last_ok_ts = self._now()
