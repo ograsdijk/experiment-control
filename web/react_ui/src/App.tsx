@@ -2980,7 +2980,7 @@ export function App() {
         onRunInstanceCleanupDryRun={() => runInstanceCleanup(true)}
         onRunInstanceCleanupApply={() => runInstanceCleanup(false)}
       />
-      <AppShell.Main>
+      <AppShell.Main className="app-main">
         <div
           className={`app-layout${
             isDevicePanelCollapsed ? " app-layout-device-collapsed" : ""
@@ -3384,7 +3384,7 @@ export function App() {
               isDevicePanelCollapsed ? " plot-panel-area-expanded" : ""
             }`}
           >
-            <Stack gap="lg">
+            <Stack gap="lg" className="plot-workspace-content">
               <Group justify="space-between">
                 <Group gap={6} align="center">
                   <Text fw={600}>Plot workspace</Text>
@@ -3486,15 +3486,17 @@ export function App() {
                   </Menu.Dropdown>
                 </Menu>
               </Group>
-              <PanelsGrid
-                streamWorkspaceOptions={streamWorkspaceOptions}
-                yAxisDraftInvalid={yAxisDraftInvalid}
-                streamWsConnected={streamWsConnected}
-                streamAnalysisWsConnected={streamAnalysisWsConnected}
-                activeUiDrag={activeUiDrag}
-                helpers={stablePanelHelpers}
-                handlers={stablePanelHandlers}
-              />
+              <div className="plot-grid-scroll-area">
+                <PanelsGrid
+                  streamWorkspaceOptions={streamWorkspaceOptions}
+                  yAxisDraftInvalid={yAxisDraftInvalid}
+                  streamWsConnected={streamWsConnected}
+                  streamAnalysisWsConnected={streamAnalysisWsConnected}
+                  activeUiDrag={activeUiDrag}
+                  helpers={stablePanelHelpers}
+                  handlers={stablePanelHandlers}
+                />
+              </div>
             </Stack>
           </section>
         </div>
