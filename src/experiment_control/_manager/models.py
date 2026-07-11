@@ -177,6 +177,26 @@ class DeviceHandle:
     auto_reconnect_last_success_mono: float | None = None
     auto_reconnect_last_error: str | None = None
     auto_reconnect_suppressed: bool = False
+    # True from the moment a reconnect attempt is dispatched to the
+    # lifecycle executor until `_run_auto_reconnect` finishes (success or
+    # failure). Lets `_auto_reconnect_should_attempt` refuse to dispatch a
+    # second overlapping attempt for this device independent of
+    # `cooldown_s` -- important because `cooldown_s=0` is a valid config,
+    # and even a non-zero cooldown can be shorter than a slow
+    # `connect_timeout_ms` or a per-device lock held by a concurrent
+    # operator lifecycle op.
+    auto_reconnect_pending: bool = False
+    # Guards reads/writes of the auto_reconnect_* fields above across the
+    # main poll loop (bookkeeping in `_auto_reconnect_attempt` /
+    # `_auto_reconnect_reset_if_healthy` / `_auto_reconnect_should_attempt`)
+    # and the lifecycle-executor worker thread (`_run_auto_reconnect`).
+    # Deliberately a SEPARATE lock from the per-device entry in
+    # `Manager._lifecycle_device_locks`: that lock is held by the worker
+    # for the entire disconnect+connect RPC duration (up to ~2.5s), so
+    # reusing it here would make the main thread's cheap field
+    # reads/writes block for that long too -- reintroducing the main-loop
+    # stall this auto-reconnect fix was meant to remove.
+    auto_reconnect_field_lock: threading.Lock = field(default_factory=threading.Lock)
 
 
 @dataclass

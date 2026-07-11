@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -617,6 +618,7 @@ class DeviceDriverHeartbeatDemotionTests(unittest.TestCase):
         handle = self._handle(process=_FakePopen(), last_hb_recv_mono=90.0)
         manager = SimpleNamespace(
             _devices={"dev": handle},
+            _lifecycle_device_locks={},
             _update_device_driver_exit_state=lambda h, rc: None,
             _enforce_device_driver_heartbeat_timeout=lambda h, n: calls.append(
                 ("hb", h)
@@ -627,6 +629,30 @@ class DeviceDriverHeartbeatDemotionTests(unittest.TestCase):
         with mock.patch.object(ps, "_maybe_auto_reconnect_device", lambda *a, **k: None):
             supervise_device_drivers(manager, 100.0)
         self.assertIn(("hb", handle), calls)
+
+    def test_supervise_skips_device_whose_lifecycle_lock_is_held(self) -> None:
+        """F4 follow-up: if another lifecycle op (an in-flight auto-reconnect
+        worker or an operator connect/disconnect/restart/recover) already
+        holds a device's per-device lock, the supervision tick must not
+        race it by mutating driver state -- it should skip that device
+        entirely for this tick (non-blocking; never stalls the main loop)."""
+        calls: list = []
+        handle = self._handle(process=_FakePopen(), last_hb_recv_mono=90.0)
+        held_lock = threading.Lock()
+        held_lock.acquire()
+        manager = SimpleNamespace(
+            _devices={"dev": handle},
+            _lifecycle_device_locks={"dev": held_lock},
+            _update_device_driver_exit_state=lambda h, rc: calls.append("exit"),
+            _enforce_device_driver_heartbeat_timeout=lambda h, n: calls.append("hb"),
+            _enforce_device_driver_stop_timeout=lambda h, n: calls.append("stop"),
+            _maybe_restart_device_driver=lambda d, h, n: calls.append("restart"),
+        )
+        with mock.patch.object(
+            ps, "_maybe_auto_reconnect_device", lambda *a, **k: calls.append("reconnect")
+        ):
+            supervise_device_drivers(manager, 100.0)
+        self.assertEqual(calls, [])
 
 
 if __name__ == "__main__":
