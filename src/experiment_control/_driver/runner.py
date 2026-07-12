@@ -133,6 +133,21 @@ class DeviceRunner:
 
         self._telemetry_seq = 0
         self._heartbeat_seq = 0
+        # Accumulated count of missed scheduled-stream periods (loop fell
+        # behind a plan's next_due_s), published in the heartbeat so a
+        # blocked loop that skips samples leaves a trace -- previously this
+        # was the only loss point with zero accounting anywhere.
+        self._scheduled_stream_missed_total = 0
+        # Set while DISCONNECTED so the next reconnected tick resyncs
+        # next_due_s instead of computing "missed" from a next_due_s that's
+        # been frozen for the whole outage -- otherwise every reconnect
+        # dumps the entire outage duration into scheduled_stream_missed_total
+        # as if it were loop-lag, drowning out the genuine signal.
+        self._scheduled_streams_need_resync = False
+        # Last seq this driver actually wrote to each stream's SHM ring,
+        # published in the heartbeat so a consumer can diff produced-vs-
+        # written frames as a checkable invariant.
+        self._stream_last_published_seq: dict[str, int] = {}
 
         # Last known good hardware transaction time, set by subclasses when appropriate
         self._last_ok_ts: Timestamp | None = None
@@ -1113,6 +1128,8 @@ class DeviceRunner:
             "last_ok_mono": self._last_ok_ts.t_mono if self._last_ok_ts else None,
             "last_error": self._last_error,
             "loop_lag_s": loop_lag_s,
+            "scheduled_stream_missed_total": self._scheduled_stream_missed_total,
+            "stream_last_published_seq": dict(self._stream_last_published_seq),
         }
 
         topic = f"{self.device_id}/heartbeat".encode()
@@ -1218,12 +1235,24 @@ class DeviceRunner:
 
     def _publish_scheduled_streams(self, *, now: float) -> None:
         if self._device_state == DeviceState.DISCONNECTED:
+            self._scheduled_streams_need_resync = True
+            return
+        if self._scheduled_streams_need_resync:
+            # Just reconnected after an outage of unknown length. Resync
+            # every plan's next_due_s to the current time instead of falling
+            # through to the missed-tick math below, which would otherwise
+            # read the entire outage as "missed" scheduled samples.
+            self._scheduled_streams_need_resync = False
+            for plan in self._scheduled_stream_calls:
+                plan.next_due_s = now + plan.period_s
             return
         for plan in self._scheduled_stream_calls:
             if now < plan.next_due_s:
                 continue
             missed = max(0, int((now - plan.next_due_s) // plan.period_s))
             plan.next_due_s += (missed + 1) * plan.period_s
+            if missed:
+                self._scheduled_stream_missed_total += missed
             try:
                 self._stream_rpc[plan.action_name]()
                 ts = self._now()
@@ -1357,6 +1386,7 @@ class DeviceRunner:
         t0_mono = int(t0_mono_ns or now_mono_ns())
         t0_wall = int(t0_wall_ns or now_wall_ns())
         seq = writer.write(arr, t0_mono_ns=t0_mono, t0_wall_ns=t0_wall)
+        self._stream_last_published_seq[stream] = int(seq)
         desc: dict[str, Any] = {
             "device_id": self.device_id,
             "stream": stream,

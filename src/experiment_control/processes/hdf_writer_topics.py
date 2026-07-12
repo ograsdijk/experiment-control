@@ -63,6 +63,7 @@ def _handle_manager_process_telemetry_update(writer: Any, msg: Json) -> None:
 def _handle_manager_chunk_ready(writer: Any, msg: Json) -> None:
     parsed = ChunkReadyMessage.parse(msg)
     if parsed is None:
+        writer._bump_error("stream.chunk_parse_failed")  # noqa: SLF001
         return
     writer._handle_chunk_ready(msg, parsed=parsed)  # noqa: SLF001
 

@@ -91,6 +91,8 @@ _STREAM_COUNTER_ATTRS: tuple[str, ...] = (
     "drain_failures_total",
     "payload_size_failures_total",
     "write_failures_total",
+    "buffer_discarded_total",
+    "meta_missing_dropped_total",
 )
 
 
@@ -515,7 +517,10 @@ class HdfWriter(ManagedProcessBase):
         self._drop_policy: Literal["drop_newest", "drop_oldest"] = "drop_newest"
 
         self._stream_readers: dict[tuple[str, str], ShmRingReader] = {}
-        self._stream_last_seq: dict[tuple[str, str], int] = {}
+        # None means "no baseline established yet" (e.g. right after a
+        # no-seq ring attach) -- distinct from a real seq-0 baseline, which
+        # is why this is int | None rather than using a sentinel int value.
+        self._stream_last_seq: dict[tuple[str, str], int | None] = {}
         self._stream_buffers: dict[
             tuple[str, str],
             dict[str, list[Any]],
@@ -598,6 +603,25 @@ class HdfWriter(ManagedProcessBase):
         # Per-device/process rate-limit for telemetry-write error events so a
         # single persistently-bad device can't flood the process data PUB.
         self._telemetry_error_pub_mono: dict[str, float] = {}
+        # Negative-result cache for `_ensure_device`: a device that is
+        # enabled but confirmed absent from the manager's telemetry schema
+        # (the RPC succeeded, the device just wasn't in the returned
+        # schema) would otherwise trigger a fresh `_schema_rpc` on every
+        # flush batch while its rows are silently skipped. Cache the miss
+        # briefly so repeated batches don't hammer the manager; cleared as
+        # soon as the device shows up in the schema.
+        self._telemetry_schema_absent: dict[str, float] = {}
+        self._telemetry_schema_absent_ttl_s = 3.0
+        # Separate, much shorter backoff for when the RPC itself raised
+        # (manager unreachable/timed out/etc). Deliberately NOT the same
+        # cache/TTL as `_telemetry_schema_absent` above: that cache means
+        # "confirmed absent from a successful schema," and reusing its 3s
+        # TTL here would throttle a single transient blip for 3s even
+        # though the device may already be resolvable on the very next
+        # attempt. This backoff only exists to stop a persistently-failing
+        # RPC from being retried on every flush batch.
+        self._telemetry_schema_rpc_error: dict[str, float] = {}
+        self._telemetry_schema_rpc_error_backoff_s = 0.5
         # Reservoir high-water marks (rows). Soft = loud alarm only; hard =
         # last-resort drop-with-accounting so a genuine sustained overload
         # can never grow memory without bound. Sized off the deque cap.
@@ -616,6 +640,10 @@ class HdfWriter(ManagedProcessBase):
         self._next_writing_active_publish_mono: float = 0.0
         self._writing_active_schema_advertised = False
         self._writing_active_publish_period_s = 1.0
+        # Monotone seq stamped on each writing_active publish so a writer
+        # restart mid-run is provable from the file (device telemetry always
+        # has a real seq; process telemetry previously always read as -1).
+        self._process_telemetry_seq = 0
         # The publish does a synchronous manager RPC; run it on a dedicated
         # single-worker executor so a slow/wedged manager can never stall
         # the writer's main loop (which drains sockets + enqueues flushes).
@@ -768,15 +796,23 @@ class HdfWriter(ManagedProcessBase):
         except Exception:
             pass
 
+    @staticmethod
+    def _mono_cache_active(cache: dict[str, float], key: str, period_s: float) -> bool:
+        """True if `key` was touched in `cache` within the last `period_s`."""
+        last = cache.get(key)
+        return last is not None and (time.monotonic() - last) < period_s
+
+    @staticmethod
+    def _mono_cache_touch(cache: dict[str, float], key: str) -> None:
+        cache[key] = time.monotonic()
+
     def _report_telemetry_write_error(self, device_id: str, exc: Exception) -> None:
         """Name the device/process whose telemetry row failed to write, without
         failing the whole batch. Event is rate-limited per id (>=1s)."""
         self._bump_error("hdf.telemetry_write_error")
-        now_mono = time.monotonic()
-        last = self._telemetry_error_pub_mono.get(device_id, 0.0)
-        if (now_mono - last) < 1.0:
+        if self._mono_cache_active(self._telemetry_error_pub_mono, device_id, 1.0):
             return
-        self._telemetry_error_pub_mono[device_id] = now_mono
+        self._mono_cache_touch(self._telemetry_error_pub_mono, device_id)
         try:
             self._publish_process_event(
                 topic="hdf.telemetry_write_error",
@@ -1749,6 +1785,7 @@ class HdfWriter(ManagedProcessBase):
                     timeout_ms=self._writing_active_rpc_timeout_ms,
                 )
                 self._writing_active_schema_advertised = True
+            self._process_telemetry_seq += 1
             _manager_rpc(
                 self._ctx,
                 self._manager_rpc,
@@ -1758,6 +1795,7 @@ class HdfWriter(ManagedProcessBase):
                     "payload": {
                         "process_id": self._process_id,
                         "version": 1,
+                        "seq": self._process_telemetry_seq,
                         "signals": {
                             "writing_active": {
                                 "value": bool(self._writing_active),
@@ -2220,6 +2258,8 @@ class HdfWriter(ManagedProcessBase):
                 "drain_failures_total": 0,
                 "payload_size_failures_total": 0,
                 "write_failures_total": 0,
+                "buffer_discarded_total": 0,
+                "meta_missing_dropped_total": 0,
                 "first_seq": -1,
                 "last_seq": -1,
                 "last_error": "",
@@ -3243,6 +3283,16 @@ class HdfWriter(ManagedProcessBase):
             return True
         if self._telemetry_group is None:
             return False
+        if self._mono_cache_active(
+            self._telemetry_schema_absent, device_id, self._telemetry_schema_absent_ttl_s
+        ):
+            return False
+        if self._mono_cache_active(
+            self._telemetry_schema_rpc_error,
+            device_id,
+            self._telemetry_schema_rpc_error_backoff_s,
+        ):
+            return False
         try:
             schema = _schema_rpc(self._ctx, self._manager_rpc)
             self._device_map = _ingest_schema(
@@ -3256,8 +3306,19 @@ class HdfWriter(ManagedProcessBase):
             )
         except Exception:
             self._bump_error("schema.rpc")
+            # Short backoff only -- this is a transient RPC failure, not a
+            # confirmed "device absent from schema" result, so it must not
+            # be throttled for the full schema-absent TTL. A persistently
+            # failing/timing-out RPC (e.g. a struggling manager) still can't
+            # be re-attempted on every flush batch, so back off briefly and
+            # retry on the next one.
+            self._mono_cache_touch(self._telemetry_schema_rpc_error, device_id)
             return False
-        return device_id in self._datasets
+        if device_id in self._datasets:
+            self._telemetry_schema_absent.pop(device_id, None)
+            return True
+        self._mono_cache_touch(self._telemetry_schema_absent, device_id)
+        return False
 
     def _append_dataset_rows(
         self,
@@ -4321,12 +4382,23 @@ class HdfWriter(ManagedProcessBase):
         if self._h5 is None or self._telemetry_group is None:
             return
         used_by_device: dict[str, int] = {}
+        # Bump at most once per device per batch, not once per row -- the
+        # verdict (enabled-but-absent-from-schema) is identical for every
+        # row of the same device in the same batch, so re-deriving it and
+        # re-acquiring the error-counter lock per row is pure waste for a
+        # device stuck in this state across a high-rate telemetry stream.
+        schema_absent_bumped: set[str] = set()
 
         for msg in rows:
             device_id = self._normalize_device_id(msg.get("device_id"))
             if device_id is None:
                 continue
             if not self._ensure_device(device_id):
+                if device_id not in schema_absent_bumped and self._is_device_enabled(
+                    device_id
+                ):
+                    self._bump_error(f"telemetry.skipped_no_schema.{device_id}")
+                    schema_absent_bumped.add(device_id)
                 continue
 
             # Per-device isolation: a bad value/dtype for one device must not
@@ -4441,7 +4513,12 @@ class HdfWriter(ManagedProcessBase):
         elif ctx_id is not None:
             self._bump_error("stream.context_seq_missing")
 
-        last_seq = int(self._stream_last_seq.get(key, 0))
+        last_seq_state = self._stream_last_seq.get(key)
+        # ShmRingReader.read_events needs a real int; -1 ("nothing seen
+        # yet") is the correct coercion at this boundary only -- the
+        # persisted state and the gap-detection baseline passed below stay
+        # `None` so "unset" can never be mistaken for a real seq-0 baseline.
+        last_seq = -1 if last_seq_state is None else int(last_seq_state)
         events = self._read_chunk_ready_events(key=key, reader=reader, last_seq=last_seq)
         if not events:
             self._expire_pending_context(key=key, now_mono=now_mono)
@@ -4451,7 +4528,7 @@ class HdfWriter(ManagedProcessBase):
             key=key,
             reader=reader,
             events=events,
-            initial_last_seq=last_seq,
+            initial_last_seq=last_seq_state,
             now_mono=now_mono,
         )
 
@@ -4462,16 +4539,31 @@ class HdfWriter(ManagedProcessBase):
         seq: int | None,
     ) -> None:
         if seq is not None:
-            prev = int(self._stream_last_seq.get(key, 0))
+            prev_state = self._stream_last_seq.get(key)
+            prev = -1 if prev_state is None else int(prev_state)
             if seq > prev:
                 self._stream_last_seq[key] = seq
         self._stream_buffers.pop(key, None)
         self._stream_pending_by_seq.pop(key, None)
         self._stream_context_by_seq.pop(key, None)
 
+    def _discard_buffered_stream_frames(self, key: tuple[str, str], *, reason: str) -> None:
+        """Count and bump `buffer_discarded_total` for any frames buffered
+        for `key` right before the caller pops them. Shared by the two
+        sites that discard unflushed stream frames outright (ring
+        re-attach and drain-failure reset)."""
+        discarded = len((self._stream_buffers.get(key) or {}).get("data", []))
+        if discarded:
+            self._bump_stream_counter(
+                key, "buffer_discarded_total", discarded, last_error=reason
+            )
+
     def _reset_stream_runtime_state(self, key: tuple[str, str]) -> None:
         self._stream_readers.pop(key, None)
         self._stream_last_seq.pop(key, None)
+        self._discard_buffered_stream_frames(
+            key, reason="buffer discarded on stream drain reset"
+        )
         self._stream_buffers.pop(key, None)
         self._stream_schema.pop(key, None)
         self._stream_expected_nbytes.pop(key, None)
@@ -4514,8 +4606,10 @@ class HdfWriter(ManagedProcessBase):
         # attach, so frames already buffered in the (producer-owned, persistent)
         # ring from BEFORE the writer started are skipped rather than replayed
         # into the new file. The triggering chunk's own frame and everything
-        # after it are still written. Falls back to 0 (read whatever is present)
-        # only if the chunk carried no seq.
+        # after it are still written. Falls back to `None` -- "no baseline
+        # established yet" -- only if the chunk carried no seq; the first
+        # real seq that arrives becomes the baseline (see the
+        # `last_seq is not None` guard in `_append_chunk_ready_events`).
         if initial_seq is not None and int(initial_seq) > 0:
             self._stream_last_seq[key] = int(initial_seq) - 1
             if int(initial_seq) > 1:
@@ -4523,8 +4617,9 @@ class HdfWriter(ManagedProcessBase):
                 self._bump_stream_counter(key, "startup_seq_gap", startup_gap)
                 self._bump_stream_counter(key, "seq_gap_total", startup_gap)
         else:
-            self._stream_last_seq[key] = 0
+            self._stream_last_seq[key] = None
         self._stream_dropped_total[key] = 0
+        self._discard_buffered_stream_frames(key, reason="buffer discarded on ring re-attach")
         self._stream_buffers.pop(key, None)
         # Intentionally do NOT pop `_stream_schema` here. The config-driven
         # schema (built from `stream_calls` with a real structured dtype) is
@@ -4567,17 +4662,17 @@ class HdfWriter(ManagedProcessBase):
         key: tuple[str, str],
         reader: ShmRingReader,
         events: list[Json],
-        initial_last_seq: int,
+        initial_last_seq: int | None,
         now_mono: float,
     ) -> None:
         if not events:
             return
         self._bump_stream_counter(key, "events_read_total", len(events))
         dropped = int(self._stream_dropped_total.get(key, 0))
-        last_seq = int(initial_last_seq)
+        last_seq: int | None = initial_last_seq
         for ev in events:
             seq = int(ev["seq"])
-            if last_seq and seq > last_seq + 1:
+            if last_seq is not None and seq > last_seq + 1:
                 gap = seq - last_seq - 1
                 dropped += gap
                 self._bump_stream_counter(key, "seq_gap_total", gap)
@@ -5160,6 +5255,28 @@ class HdfWriter(ManagedProcessBase):
                     self._bump_error("stream.write_failed_persist")
                 self._clear_stream_buffer(buf)
 
+    @staticmethod
+    def _reindex_stream_frame_lists(
+        idx_list: list[int],
+        data_list: list[Any],
+        seq_list: list[int],
+        t0_mono_list: list[int],
+        t0_wall_list: list[int],
+        context_list: list[int],
+    ) -> tuple[list[Any], list[int], list[int], list[int], list[int]]:
+        """Reindex the five parallel per-frame buffer lists by `idx_list` in
+        one place, so out-of-order sorting and bad-frame filtering can't
+        drift out of sync with each other (or forget a list) as fields are
+        added in the future. `context_list` is optional -- kept empty if it
+        started empty."""
+        data_list = [data_list[idx] for idx in idx_list]
+        seq_list = [seq_list[idx] for idx in idx_list]
+        t0_mono_list = [t0_mono_list[idx] for idx in idx_list]
+        t0_wall_list = [t0_wall_list[idx] for idx in idx_list]
+        if context_list:
+            context_list = [context_list[idx] for idx in idx_list]
+        return data_list, seq_list, t0_mono_list, t0_wall_list, context_list
+
     def _write_single_stream_buffer(
         self,
         key: tuple[str, str],
@@ -5198,6 +5315,12 @@ class HdfWriter(ManagedProcessBase):
                 shape_raw = tuple(reader.layout.shape)
 
         if dtype_raw is None or shape_raw is None:
+            self._bump_stream_counter(
+                key,
+                "meta_missing_dropped_total",
+                len(data_list),
+                last_error="dtype/shape unresolved",
+            )
             self._clear_stream_buffer(buf)
             return
 
@@ -5218,11 +5341,11 @@ class HdfWriter(ManagedProcessBase):
         context_list = list(buf.get("context_id", []))
         if n > 1 and any(seq_list[idx] > seq_list[idx + 1] for idx in range(n - 1)):
             order = sorted(range(n), key=lambda idx: seq_list[idx])
-            data_list = [data_list[idx] for idx in order]
-            seq_list = [seq_list[idx] for idx in order]
-            t0_mono_list = [t0_mono_list[idx] for idx in order]
-            t0_wall_list = [t0_wall_list[idx] for idx in order]
-            context_list = [context_list[idx] for idx in order]
+            data_list, seq_list, t0_mono_list, t0_wall_list, context_list = (
+                self._reindex_stream_frame_lists(
+                    order, data_list, seq_list, t0_mono_list, t0_wall_list, context_list
+                )
+            )
         if context_list and len(context_list) != n:
             context_list = [-1] * n
             self._bump_error("stream.context_alignment_repair")
@@ -5242,15 +5365,33 @@ class HdfWriter(ManagedProcessBase):
         elif expected_nbytes != int(dtype_obj.itemsize * int(np.prod(shape_obj, dtype=np.int64))):
             expected_nbytes = int(dtype_obj.itemsize * int(np.prod(shape_obj, dtype=np.int64)))
             self._stream_expected_nbytes[key] = expected_nbytes
-        if any(len(payload) != expected_nbytes for payload in data_list):
+        bad_idx = [
+            idx for idx, payload in enumerate(data_list) if len(payload) != expected_nbytes
+        ]
+        if bad_idx:
             self._bump_stream_counter(
                 key,
                 "payload_size_failures_total",
+                len(bad_idx),
                 last_error="stream payload size mismatch",
             )
             self._persist_stream_attrs(key)
-            self._clear_stream_buffer(buf)
-            return
+            if len(bad_idx) == len(data_list):
+                # Every frame in this batch is bad -- nothing to write.
+                self._clear_stream_buffer(buf)
+                return
+            # Filter out only the bad frames so good frames in the same
+            # batch (this stream's own, or -- since the caller isolates
+            # each stream -- untouched sibling streams) are not discarded
+            # alongside them.
+            bad_set = set(bad_idx)
+            keep_idx = [idx for idx in range(len(data_list)) if idx not in bad_set]
+            data_list, seq_list, t0_mono_list, t0_wall_list, context_list = (
+                self._reindex_stream_frame_lists(
+                    keep_idx, data_list, seq_list, t0_mono_list, t0_wall_list, context_list
+                )
+            )
+            n = len(data_list)
 
         if n == 1:
             data_arr = np.frombuffer(data_list[0], dtype=dtype_obj).reshape(

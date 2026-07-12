@@ -1172,6 +1172,419 @@ class HdfWriterStreamSchemaPoisoningTests(unittest.TestCase):
             ring.unlink()
 
 
+class HdfWriterLossAccountingTests(unittest.TestCase):
+    """Regression tests for the minimal-diagnostics batch: counters that
+    turn previously-silent, zero-trace drops into accounted-for events."""
+
+    def _make_writer(self, out_dir: str) -> HdfWriter:
+        return HdfWriter(
+            out_dir=out_dir,
+            filename=None,
+            manager_rpc="tcp://127.0.0.1:65531",
+            manager_pub="tcp://127.0.0.1:65532",
+            rpc_timeout_ms=2000,
+            timezone="America/Chicago",
+            rcvhwm=1000,
+            write_every_s=1.0,
+            buffer_max_messages=1000,
+            flush_every_n=10,
+            flush_every_s=1.0,
+            disabled_devices=[],
+            event_log_mode="all",
+        )
+
+    def test_buffer_discard_on_reattach_is_counted(self) -> None:
+        # Unflushed frames discarded when a new ring is attached (driver
+        # restart) must be counted, not silently dropped.
+        class _StubReader:
+            def __init__(self, name: str) -> None:
+                self.name = name
+
+            def close(self) -> None:
+                pass
+
+        structured = np.dtype([("timing_metric", "<i4")])
+        new_name = f"ec_test_reattach_discard_{uuid.uuid4().hex}"
+        ring = ShmRingWriter.create(
+            name=new_name,
+            dtype=structured,
+            shape=(),
+            slot_count=4,
+            layout_version=3,
+        )
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                writer = self._make_writer(td)
+                key = ("fs740", "timestamps")
+                writer._stream_readers[key] = _StubReader("old_ring_name")  # noqa: SLF001
+                writer._stream_buffers[key] = {  # noqa: SLF001
+                    "data": [b"a", b"b"],
+                    "seq": [1, 2],
+                    "t0_mono_ns": [0, 0],
+                    "t0_wall_ns": [0, 0],
+                    "context_id": [-1, -1],
+                }
+
+                reader = writer._ensure_chunk_ready_reader(  # noqa: SLF001
+                    key=key,
+                    device_id="fs740",
+                    stream="timestamps",
+                    shm_name=new_name,
+                    initial_seq=None,
+                )
+                self.assertIsNotNone(reader)
+                counters = writer._stream_counters[key]  # noqa: SLF001
+                self.assertEqual(counters["buffer_discarded_total"], 2)
+                if reader is not None:
+                    reader.close()
+        finally:
+            ring.close()
+            ring.unlink()
+
+    def test_buffer_discard_on_drain_reset_is_counted(self) -> None:
+        # Unflushed frames discarded on a drain-failure reset must also be
+        # counted.
+        with tempfile.TemporaryDirectory() as td:
+            writer = self._make_writer(td)
+            key = ("fs740", "timestamps")
+            writer._stream_buffers[key] = {  # noqa: SLF001
+                "data": [b"a", b"b", b"c"],
+                "seq": [1, 2, 3],
+                "t0_mono_ns": [0, 0, 0],
+                "t0_wall_ns": [0, 0, 0],
+                "context_id": [-1, -1, -1],
+            }
+
+            writer._reset_stream_runtime_state(key)  # noqa: SLF001
+
+            counters = writer._stream_counters[key]  # noqa: SLF001
+            self.assertEqual(counters["buffer_discarded_total"], 3)
+
+    def test_meta_missing_drop_is_counted(self) -> None:
+        # A stream buffer with no resolvable dtype/shape (no schema, no
+        # reader) is cleared today; the drop must be counted.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            writer = self._make_writer(str(root))
+            h5_path = root / "meta_missing.h5"
+            with h5py.File(h5_path, "w") as h5:
+                meta = writer._build_measurement_metadata(  # noqa: SLF001
+                    profile_id=None, values=None, require_profile=False
+                )
+                writer._configure_active_file(  # noqa: SLF001
+                    h5,
+                    write_every_s=1.0,
+                    load_manager_state=False,
+                    measurement_meta=meta,
+                )
+                key = ("cam1", "frames")
+                buf = {
+                    "data": [b"\x01\x00", b"\x02\x00"],
+                    "seq": [1, 2],
+                    "t0_mono_ns": [0, 0],
+                    "t0_wall_ns": [0, 0],
+                    "context_id": [-1, -1],
+                }
+
+                writer._write_single_stream_buffer(key, buf)  # noqa: SLF001
+
+                counters = writer._stream_counters[key]  # noqa: SLF001
+                self.assertEqual(counters["meta_missing_dropped_total"], 2)
+                self.assertEqual(buf["data"], [])
+
+    def test_chunk_parse_failure_is_counted(self) -> None:
+        # A malformed chunk_ready descriptor (missing shm_name) must fail
+        # to parse loudly, not silently.
+        from experiment_control.processes.hdf_writer_topics import (
+            _handle_manager_chunk_ready,
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            writer = self._make_writer(td)
+            malformed = {"device_id": "fs740", "stream": "timestamps"}
+
+            _handle_manager_chunk_ready(writer, malformed)
+
+            self.assertGreaterEqual(
+                writer._error_counts.get("stream.chunk_parse_failed", 0), 1  # noqa: SLF001
+            )
+
+    def test_gap_after_no_seq_attach_is_counted(self) -> None:
+        # A ring attach triggered by a chunk carrying no seq seeds
+        # last_seq to the `None` "unset" sentinel. A gap in the first batch
+        # of real events after that attach must still be counted -- 0 was
+        # previously used as both "unset" and a genuine seq-0 baseline, so
+        # `if last_seq and ...` silently skipped this case.
+        from types import SimpleNamespace
+
+        with tempfile.TemporaryDirectory() as td:
+            writer = self._make_writer(td)
+            key = ("fs740", "timestamps")
+            writer._stream_last_seq[key] = None  # noqa: SLF001 (no-seq attach)
+            reader = SimpleNamespace(
+                layout=SimpleNamespace(dtype=np.dtype("int16"), shape=(1,))
+            )
+            events = [
+                {"seq": 1, "payload": b"\x00\x00", "t0_mono_ns": 0, "t0_wall_ns": 0},
+                {"seq": 3, "payload": b"\x00\x00", "t0_mono_ns": 1, "t0_wall_ns": 1},
+            ]
+
+            writer._append_chunk_ready_events(  # noqa: SLF001
+                key=key,
+                reader=reader,
+                events=events,
+                initial_last_seq=None,
+                now_mono=0.0,
+            )
+
+            counters = writer._stream_counters[key]  # noqa: SLF001
+            self.assertEqual(counters["seq_gap_total"], 1)
+
+    def test_no_seq_attach_seeds_unset_sentinel(self) -> None:
+        # _ensure_chunk_ready_reader's no-initial_seq branch must seed
+        # `None`, not 0, so the gap check above actually engages.
+        structured = np.dtype([("timing_metric", "<i4")])
+        name = f"ec_test_no_seq_attach_{uuid.uuid4().hex}"
+        ring = ShmRingWriter.create(
+            name=name,
+            dtype=structured,
+            shape=(),
+            slot_count=4,
+            layout_version=3,
+        )
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                writer = self._make_writer(td)
+                key = ("fs740", "timestamps")
+
+                reader = writer._ensure_chunk_ready_reader(  # noqa: SLF001
+                    key=key,
+                    device_id="fs740",
+                    stream="timestamps",
+                    shm_name=name,
+                    initial_seq=None,
+                )
+                self.assertIsNotNone(reader)
+                self.assertIsNone(writer._stream_last_seq[key])  # noqa: SLF001
+                if reader is not None:
+                    reader.close()
+        finally:
+            ring.close()
+            ring.unlink()
+
+    def test_writer_process_telemetry_seq_increments(self) -> None:
+        # Writer self-telemetry (writing_active) must carry a real,
+        # monotone seq so a writer restart mid-run is provable from an
+        # acquired file, matching device telemetry's real seq.
+        with tempfile.TemporaryDirectory() as td:
+            writer = self._make_writer(td)
+            writer._process_id = "hdf_writer_1"  # noqa: SLF001
+            published: list[dict] = []
+
+            def _fake_manager_rpc(_ctx, _sock, payload, timeout_ms=0):  # noqa: ARG001
+                if payload.get("type") == "manager.events.publish":
+                    published.append(payload["payload"])
+                return {"ok": True}
+
+            with patch(
+                "experiment_control.processes.hdf_writer._manager_rpc",
+                side_effect=_fake_manager_rpc,
+            ):
+                writer._publish_writing_active_telemetry()  # noqa: SLF001
+                writer._publish_writing_active_telemetry()  # noqa: SLF001
+
+            self.assertEqual([p["seq"] for p in published], [1, 2])
+
+    def test_payload_size_mismatch_filters_bad_frame_keeps_good_ones(self) -> None:
+        # A single wrong-size frame in a batch must not discard the good
+        # frames buffered alongside it -- same shape of bug as the
+        # structured-dtype schema poisoning, different trigger.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            writer = self._make_writer(str(root))
+            with h5py.File(root / "partial_payload.h5", "w") as h5:
+                meta = writer._build_measurement_metadata(  # noqa: SLF001
+                    profile_id=None, values=None, require_profile=False
+                )
+                writer._configure_active_file(  # noqa: SLF001
+                    h5,
+                    write_every_s=1.0,
+                    load_manager_state=False,
+                    measurement_meta=meta,
+                )
+                key = ("pxie5171", "waveforms")
+                writer._stream_schema[key] = {  # noqa: SLF001
+                    "dtype": "int16",
+                    "shape": (2,),
+                }
+                good = np.array([1, 2], dtype=np.int16).tobytes()
+                bad = b"\x00"  # wrong size
+                writer._stream_buffers[key] = {  # noqa: SLF001
+                    "data": [good, bad, good],
+                    "seq": [1, 2, 3],
+                    "t0_mono_ns": [10, 11, 12],
+                    "t0_wall_ns": [20, 21, 22],
+                    "context_id": [-1, -1, -1],
+                }
+
+                writer._write_stream_buffers()  # noqa: SLF001
+
+                ds = writer._stream_datasets[("pxie5171", "waveforms", 1)]  # noqa: SLF001
+                self.assertEqual(ds["data"].shape[0], 2)
+                self.assertEqual(list(ds["seq"][...]), [1, 3])
+                counters = writer._stream_counters[key]  # noqa: SLF001
+                self.assertEqual(counters["payload_size_failures_total"], 1)
+
+    def test_telemetry_schema_absent_device_is_counted_and_cached(self) -> None:
+        # A device merely absent from the manager's telemetry schema must
+        # be counted, not silently skipped forever, and must not re-fire a
+        # schema RPC on every flush batch within the negative-cache TTL.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            writer = self._make_writer(str(root))
+            with h5py.File(root / "schema_absent.h5", "w") as h5:
+                meta = writer._build_measurement_metadata(  # noqa: SLF001
+                    profile_id=None, values=None, require_profile=False
+                )
+                writer._configure_active_file(  # noqa: SLF001
+                    h5,
+                    write_every_s=1.0,
+                    load_manager_state=False,
+                    measurement_meta=meta,
+                )
+
+                call_count = {"n": 0}
+
+                def _fake_schema_rpc(_ctx, _endpoint, timeout_ms=2000):  # noqa: ARG001
+                    call_count["n"] += 1
+                    return {"devices": []}
+
+                row = {
+                    "device_id": "dev-x",
+                    "ts": {"t_wall": 0.0, "t_mono": 0.0},
+                    "seq": 1,
+                    "signals": {},
+                }
+                with patch.object(
+                    hdf_writer_module, "_schema_rpc", side_effect=_fake_schema_rpc
+                ):
+                    writer._write_buffered_rows_batch([row])  # noqa: SLF001
+                    writer._write_buffered_rows_batch([row])  # noqa: SLF001
+
+                    self.assertEqual(call_count["n"], 1)
+
+                    # Force the cache entry to look expired (rather than
+                    # sleeping for the real TTL) and confirm the RPC fires
+                    # again -- proves the cache actually bounds its
+                    # suppression window instead of caching absence forever.
+                    writer._telemetry_schema_absent["dev-x"] = (  # noqa: SLF001
+                        time.monotonic()
+                        - writer._telemetry_schema_absent_ttl_s  # noqa: SLF001
+                        - 0.1
+                    )
+                    writer._write_buffered_rows_batch([row])  # noqa: SLF001
+
+                self.assertEqual(call_count["n"], 2)
+                self.assertGreaterEqual(
+                    writer._error_counts.get(  # noqa: SLF001
+                        "telemetry.skipped_no_schema.dev-x", 0
+                    ),
+                    3,
+                )
+
+    def test_ensure_device_throttles_retries_after_schema_rpc_exception(self) -> None:
+        # A persistently failing/timing-out schema RPC (e.g. a struggling
+        # manager) must also be throttled -- not just the "RPC succeeded but
+        # device absent" path -- otherwise every flush batch keeps hammering
+        # an already-struggling manager.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            writer = self._make_writer(str(root))
+            with h5py.File(root / "schema_rpc_failing.h5", "w") as h5:
+                meta = writer._build_measurement_metadata(  # noqa: SLF001
+                    profile_id=None, values=None, require_profile=False
+                )
+                writer._configure_active_file(  # noqa: SLF001
+                    h5,
+                    write_every_s=1.0,
+                    load_manager_state=False,
+                    measurement_meta=meta,
+                )
+
+                call_count = {"n": 0}
+
+                def _raising_schema_rpc(_ctx, _endpoint, timeout_ms=2000):  # noqa: ARG001
+                    call_count["n"] += 1
+                    raise TimeoutError("manager unresponsive")
+
+                with patch.object(
+                    hdf_writer_module, "_schema_rpc", side_effect=_raising_schema_rpc
+                ):
+                    ensured_1 = writer._ensure_device("dev-y")  # noqa: SLF001
+                    ensured_2 = writer._ensure_device("dev-y")  # noqa: SLF001
+
+                self.assertFalse(ensured_1)
+                self.assertFalse(ensured_2)
+                self.assertEqual(call_count["n"], 1)
+                # An RPC exception is a transient-failure backoff, not a
+                # confirmed "device absent from schema" result -- it must
+                # land in the short-backoff cache, not the 3s absence TTL
+                # cache (conflating the two would throttle a single blip
+                # for far longer than necessary; see the dedicated test
+                # below for the actual duration difference).
+                self.assertIn("dev-y", writer._telemetry_schema_rpc_error)  # noqa: SLF001
+                self.assertNotIn("dev-y", writer._telemetry_schema_absent)  # noqa: SLF001
+
+    def test_schema_rpc_exception_backoff_is_much_shorter_than_absence_ttl(self) -> None:
+        # A single transient RPC failure must recover fast (the short
+        # backoff), not be stuck behind the full confirmed-absence TTL.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            writer = self._make_writer(str(root))
+            with h5py.File(root / "schema_rpc_backoff.h5", "w") as h5:
+                meta = writer._build_measurement_metadata(  # noqa: SLF001
+                    profile_id=None, values=None, require_profile=False
+                )
+                writer._configure_active_file(  # noqa: SLF001
+                    h5,
+                    write_every_s=1.0,
+                    load_manager_state=False,
+                    measurement_meta=meta,
+                )
+
+                self.assertLess(
+                    writer._telemetry_schema_rpc_error_backoff_s,  # noqa: SLF001
+                    writer._telemetry_schema_absent_ttl_s,  # noqa: SLF001
+                )
+
+                call_count = {"n": 0}
+
+                def _raising_schema_rpc(_ctx, _endpoint, timeout_ms=2000):  # noqa: ARG001
+                    call_count["n"] += 1
+                    raise TimeoutError("manager unresponsive")
+
+                with patch.object(
+                    hdf_writer_module, "_schema_rpc", side_effect=_raising_schema_rpc
+                ):
+                    writer._ensure_device("dev-z")  # noqa: SLF001
+                    self.assertEqual(call_count["n"], 1)
+
+                    # Still well within the short backoff -- no retry yet.
+                    writer._ensure_device("dev-z")  # noqa: SLF001
+                    self.assertEqual(call_count["n"], 1)
+
+                    # Force the short backoff to look expired (without
+                    # waiting for a real sleep) and confirm the RPC retries
+                    # promptly, unlike the 3s absence TTL.
+                    writer._telemetry_schema_rpc_error["dev-z"] = (  # noqa: SLF001
+                        time.monotonic()
+                        - writer._telemetry_schema_rpc_error_backoff_s  # noqa: SLF001
+                        - 0.01
+                    )
+                    writer._ensure_device("dev-z")  # noqa: SLF001
+                    self.assertEqual(call_count["n"], 2)
+
+
 class HdfWriterContextResolutionTests(unittest.TestCase):
     @staticmethod
     def _make_writer(out_dir: str) -> HdfWriter:
@@ -2927,6 +3340,7 @@ class WritingActiveTelemetryTests(unittest.TestCase):
         proc._writing_active_rpc_timeout_ms = 1000
         proc._writing_active = True
         proc._writing_active_schema_advertised = False
+        proc._process_telemetry_seq = 0
 
         orig = hw._manager_rpc
         hw._manager_rpc = _fake_rpc
@@ -3523,7 +3937,12 @@ class HdfWriterStreamStartSkipsOldRingTests(unittest.TestCase):
             # (seq <= 1000) are skipped, the triggering frame (1001) is kept.
             self.assertEqual(w._stream_last_seq[key], 1000)  # noqa: SLF001
 
-    def test_fresh_attach_without_seq_falls_back_to_zero(self) -> None:
+    def test_fresh_attach_without_seq_falls_back_to_unset_sentinel(self) -> None:
+        # A no-seq attach seeds `None` ("unset"), not 0 -- 0 would be
+        # indistinguishable from a genuine seq-0 baseline and silently
+        # disable gap counting for the first batch of events after this
+        # attach (see HdfWriterLossAccountingTests for the gap-counting
+        # regression this guards).
         with tempfile.TemporaryDirectory() as td:
             w = self._make_writer(td)
             key = ("dev", "trace")
@@ -3538,7 +3957,7 @@ class HdfWriterStreamStartSkipsOldRingTests(unittest.TestCase):
                     shm_name="cntx_fake",
                     initial_seq=None,
                 )
-            self.assertEqual(w._stream_last_seq[key], 0)  # noqa: SLF001
+            self.assertIsNone(w._stream_last_seq[key])  # noqa: SLF001
 
     def test_start_skips_frames_already_in_ring(self) -> None:
         with tempfile.TemporaryDirectory() as td:
