@@ -18,6 +18,7 @@ import {
   workspaceOutputOptionsByKind,
 } from "../stream/workspace";
 import { useStreamAnalysis } from "../stream_analysis/StreamAnalysisContext";
+import { dispatchStreamAnalysisHydrationInvalidation } from "../stream_analysis/streamAnalysisHydration";
 import { useTelemetry } from "../telemetry/TelemetryContext";
 import { usePanels } from "./PanelsContext";
 import { usePlotTick } from "./PlotTickContext";
@@ -68,6 +69,11 @@ export function useStreamWorkspaceHandlers(args: StreamWorkspaceHandlersArgs) {
     streamBin2dRef,
   } = useTelemetry();
 
+  const panelWorkspaceId = (panelId: string): string => {
+    const panel = panels.find((entry) => entry.id === panelId);
+    return panel && "workspaceId" in panel ? panel.workspaceId : "";
+  };
+
   const setStreamTracePanelSourceMode = (
     panelId: string,
     sourceMode: StreamTraceSourceMode
@@ -114,6 +120,32 @@ export function useStreamWorkspaceHandlers(args: StreamWorkspaceHandlersArgs) {
     streamFramesRef.set(panelId, []);
     streamTraceOverlayRef.set(panelId, new Map());
     setPlotTick((tick) => tick + 1);
+    if (sourceMode === "dag") {
+      const current = panels.find((entry) => entry.id === panelId);
+      const workspaceId =
+        current &&
+        isStreamTracePanel(current) &&
+        current.workspaceId &&
+        streamWorkspacesRef.current[current.workspaceId]
+          ? current.workspaceId
+          : Object.keys(streamWorkspacesRef.current).sort()[0] ?? "";
+      const workspace = streamWorkspacesRef.current[workspaceId] ?? null;
+      const outputId =
+        current &&
+        isStreamTracePanel(current) &&
+        current.outputId &&
+        workspaceOutputKind(workspace, current.outputId) === "trace"
+          ? current.outputId
+          : defaultOutputForKind(workspace, "trace");
+      dispatchStreamAnalysisHydrationInvalidation({
+        workspaceId,
+        outputIds: outputId ? [outputId] : [],
+        maxTracePoints:
+          current && isStreamTracePanel(current)
+            ? current.traceMaxPoints
+            : undefined,
+      });
+    }
   };
 
   const setStreamTracePanelWorkspace = (
@@ -148,6 +180,16 @@ export function useStreamWorkspaceHandlers(args: StreamWorkspaceHandlersArgs) {
     streamFramesRef.set(panelId, []);
     streamTraceOverlayRef.set(panelId, new Map());
     setPlotTick((tick) => tick + 1);
+    const outputId = defaultOutputForKind(workspace, "trace");
+    const current = panels.find((entry) => entry.id === panelId);
+    dispatchStreamAnalysisHydrationInvalidation({
+      workspaceId: nextWorkspaceId,
+      outputIds: outputId ? [outputId] : [],
+      maxTracePoints:
+        current && isStreamTracePanel(current)
+          ? current.traceMaxPoints
+          : undefined,
+    });
   };
 
   const setStreamTracePanelOutput = (
@@ -176,6 +218,20 @@ export function useStreamWorkspaceHandlers(args: StreamWorkspaceHandlersArgs) {
     streamFramesRef.set(panelId, []);
     streamTraceOverlayRef.set(panelId, new Map());
     setPlotTick((tick) => tick + 1);
+    const current = panels.find((entry) => entry.id === panelId);
+    dispatchStreamAnalysisHydrationInvalidation({
+      workspaceId: panelWorkspaceId(panelId),
+      outputIds: [
+        nextOutputId ?? "",
+        ...(current && isStreamTracePanel(current)
+          ? current.overlayOutputIds ?? []
+          : []),
+      ],
+      maxTracePoints:
+        current && isStreamTracePanel(current)
+          ? current.traceMaxPoints
+          : undefined,
+    });
   };
 
   const setStreamTracePanelOverlayOutputs = (
@@ -208,6 +264,15 @@ export function useStreamWorkspaceHandlers(args: StreamWorkspaceHandlersArgs) {
     );
     streamTraceOverlayRef.set(panelId, new Map());
     setPlotTick((tick) => tick + 1);
+    const current = panels.find((entry) => entry.id === panelId);
+    dispatchStreamAnalysisHydrationInvalidation({
+      workspaceId: panelWorkspaceId(panelId),
+      outputIds: [...nextSet],
+      maxTracePoints:
+        current && isStreamTracePanel(current)
+          ? current.traceMaxPoints
+          : undefined,
+    });
   };
 
   const setStreamAnalysisPanelWorkspace = (
@@ -298,6 +363,12 @@ export function useStreamWorkspaceHandlers(args: StreamWorkspaceHandlersArgs) {
       streamBin2dRef.delete(panelId);
       setPlotTick((tick) => tick + 1);
     }
+    dispatchStreamAnalysisHydrationInvalidation({
+      workspaceId: nextWorkspaceId,
+      outputIds: isStreamParamsPanel(updated)
+        ? updated.outputIds
+        : [updated.outputId ?? ""],
+    });
   };
 
   const setStreamAnalysisPanelOutput = (
@@ -339,6 +410,18 @@ export function useStreamWorkspaceHandlers(args: StreamWorkspaceHandlersArgs) {
       streamBin2dRef.delete(panelId);
       setPlotTick((tick) => tick + 1);
     }
+    dispatchStreamAnalysisHydrationInvalidation({
+      workspaceId: panel.workspaceId,
+      outputIds: [
+        nextOutputId ?? "",
+        ...(isStreamBinStatsPanel(panel)
+          ? [
+              ...(panel.overlayOutputIds ?? []),
+              ...(panel.fitOverlayOutputIds ?? []),
+            ]
+          : []),
+      ],
+    });
   };
 
   const setStreamParamsPanelOutputs = (
@@ -357,6 +440,10 @@ export function useStreamWorkspaceHandlers(args: StreamWorkspaceHandlersArgs) {
     );
     streamParamsLatestRef.set(panelId, {});
     setPlotTick((tick) => tick + 1);
+    dispatchStreamAnalysisHydrationInvalidation({
+      workspaceId: panelWorkspaceId(panelId),
+      outputIds: next,
+    });
   };
 
   const setStreamBinStatsOverlayOutputs = (
@@ -375,6 +462,10 @@ export function useStreamWorkspaceHandlers(args: StreamWorkspaceHandlersArgs) {
     );
     streamBinStatsOverlayRef.set(panelId, new Map());
     setPlotTick((tick) => tick + 1);
+    dispatchStreamAnalysisHydrationInvalidation({
+      workspaceId: panelWorkspaceId(panelId),
+      outputIds: next,
+    });
   };
 
   const setStreamBinStatsFitOverlayOutputs = (
@@ -393,6 +484,10 @@ export function useStreamWorkspaceHandlers(args: StreamWorkspaceHandlersArgs) {
     );
     streamBinStatsFitOverlayRef.set(panelId, new Map());
     setPlotTick((tick) => tick + 1);
+    dispatchStreamAnalysisHydrationInvalidation({
+      workspaceId: panelWorkspaceId(panelId),
+      outputIds: next,
+    });
   };
 
   return {

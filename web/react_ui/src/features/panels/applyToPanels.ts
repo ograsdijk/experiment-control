@@ -186,6 +186,18 @@ export function ensurePanelBuffers(
   return panelBuffers;
 }
 
+export function pushStreamScalarSample(
+  buffer: RingBuffer,
+  time: number,
+  value: number
+): boolean {
+  if (buffer.latest()?.time === time) {
+    return false;
+  }
+  buffer.push(time, value);
+  return true;
+}
+
 export function applyRawStreamFrameToPanels(
   deps: ApplyHelpersDeps,
   subscription: RawStreamSubscription,
@@ -321,8 +333,9 @@ export function applyStreamAnalysisOutputToPanels(
             buffer = new RingBuffer(panelCapacity(panel.timeWindowS));
             panelBuffers.set(key, buffer);
           }
-          buffer.push(output.tWallS, scalar);
-          updated = true;
+          if (pushStreamScalarSample(buffer, output.tWallS, scalar)) {
+            updated = true;
+          }
           continue;
         }
         if (isStreamParamsPanel(panel)) {

@@ -9,6 +9,13 @@ import type {
   StreamTraceDecimator,
 } from "../stream/types";
 import type { StreamAnalysisMessage } from "../../types";
+import {
+  isStreamAnalysisRefreshOutputRequested,
+  normalizeStreamAnalysisRefreshRequests,
+  STREAM_ANALYSIS_HYDRATION_INVALIDATE_EVENT,
+  streamAnalysisHydrationInvalidationRequests,
+  type StreamAnalysisRefreshRequest,
+} from "./streamAnalysisHydration";
 
 /**
  * Stream-analysis WebSocket subscriptions manager.
@@ -136,12 +143,45 @@ export function useStreamAnalysisSubscriptions({
   bumpPlotTick,
 }: StreamAnalysisSubscriptionsArgs): { wsConnected: boolean } {
   const [wsConnected, setWsConnected] = useState(false);
+  const [refreshGeneration, setRefreshGeneration] = useState(0);
   const hydratedRef = useRef<Set<string>>(new Set());
+  const pendingRefreshRequestsRef = useRef<StreamAnalysisRefreshRequest[]>([]);
+  const refreshMountedRef = useRef(true);
 
   const applyOutputRef = useRef(applyOutput);
   applyOutputRef.current = applyOutput;
   const bumpPlotTickRef = useRef(bumpPlotTick);
   bumpPlotTickRef.current = bumpPlotTick;
+
+  useEffect(() => {
+    return () => {
+      refreshMountedRef.current = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    const handleInvalidate = (event: Event) => {
+      const requests = streamAnalysisHydrationInvalidationRequests(event);
+      if (requests.length <= 0) {
+        return;
+      }
+      pendingRefreshRequestsRef.current = normalizeStreamAnalysisRefreshRequests([
+        ...pendingRefreshRequestsRef.current,
+        ...requests,
+      ]);
+      setRefreshGeneration((value) => value + 1);
+    };
+    window.addEventListener(
+      STREAM_ANALYSIS_HYDRATION_INVALIDATE_EVENT,
+      handleInvalidate
+    );
+    return () => {
+      window.removeEventListener(
+        STREAM_ANALYSIS_HYDRATION_INVALIDATE_EVENT,
+        handleInvalidate
+      );
+    };
+  }, []);
 
   // Stable string key derived from the subscription set. The caller
   // re-allocates `activeSubscriptions` on every panels-state mutation
@@ -265,6 +305,55 @@ export function useStreamAnalysisSubscriptions({
     // subscriptionsKey only ticks on real set changes; depending on
     // the raw array reference would re-hydrate on unrelated edits.
   }, [streamAnalysisRpcReady, subscriptionsKey]);
+
+  // Panel source changes refresh only the newly selected outputs. This
+  // intentionally leaves normal hydration keys and live sockets untouched.
+  useEffect(() => {
+    if (!streamAnalysisRpcReady) return;
+    const requests = pendingRefreshRequestsRef.current;
+    pendingRefreshRequestsRef.current = [];
+    if (requests.length === 0) return;
+    const load = async () => {
+      let updated = false;
+      for (const request of requests) {
+        try {
+          const resp = await fetchStreamWorkspaceSnapshot(request.workspaceId, {
+            outputIds: request.outputIds,
+            maxTracePoints: request.maxTracePoints ?? null,
+          });
+          if (!refreshMountedRef.current) return;
+          if (!resp.ok || !resp.result || typeof resp.result !== "object") {
+            continue;
+          }
+          const outputs = Array.isArray(resp.result.outputs)
+            ? resp.result.outputs
+            : [];
+          for (const outputRaw of outputs) {
+            if (!outputRaw || typeof outputRaw !== "object") continue;
+            const normalized = normalizeStreamAnalysisOutputMessage({
+              topic: "manager.stream_analysis.output",
+              payload: outputRaw as StreamAnalysisMessage["payload"],
+            });
+            if (
+              normalized &&
+              isStreamAnalysisRefreshOutputRequested(
+                request,
+                normalized.workspaceId,
+                normalized.outputId
+              ) &&
+              applyOutputRef.current(normalized)
+            ) {
+              updated = true;
+            }
+          }
+        } catch {
+          continue;
+        }
+      }
+      if (refreshMountedRef.current && updated) bumpPlotTickRef.current();
+    };
+    void load();
+  }, [streamAnalysisRpcReady, refreshGeneration]);
 
   // Live WS for each active subscription.
   useEffect(() => {
