@@ -311,7 +311,6 @@ set the endpoint and instance-id vars automatically from stack config.
 - `docs/federation.md` - multi-instance manager federation
 - `docs/composite_devices.md` - logical devices composed from multiple physical devices
 - `docs/influx_writer.md` - telemetry export to InfluxDB
-- `docs/device_spec_reload.md` - runtime device config reload behavior
 - `docs/adaptive_studies.md` - adaptive scan/study notes
 
 ## Troubleshooting
