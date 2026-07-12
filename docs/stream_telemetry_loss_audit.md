@@ -82,8 +82,8 @@ leaves evidence · 🟡 by-design skip, observable.
 | 17 | 🔴 | **Re-attach on new `shm_name`** (driver restart), hdf_writer.py:4523 | `_stream_buffers.pop(key)` discards read-but-unflushed frames (up to `write_every_s`=5 s worth) | **Yes, no counter** | none | rows just missing before session boundary | no, partial |
 | 18 | 🟠 | `read_events` drain failure → `_reset_stream_runtime_state`, hdf_writer.py:4540-4552 | reader exception; also pops unflushed buffers (same silent loss as #17) | Partially | `drain_failures_total`, `stream.drain` | group attr | repeated failures → yes |
 | 19 | 🟠 | **SHM ring wrap**: `read_events` shm_ring.py:344-386 | > `ring_slots` writes between drains → oldest overwritten | No | `seq_gap_total` + per-dataset `dropped_total` attr (hdf_writer.py:4570-4573) | seq gaps in `/seq` | no |
-| 20 | 🔴 | Torn-slot race, shm_ring.py:356-377 | payload copied without re-checking `seq_end` after copy; concurrent overwrite → corrupted frame accepted | **Yes** | none | garbage row, valid seq | no (corruption, not loss) |
-| 21 | 🔴 | Seq-gap check skips `last_seq == 0`, hdf_writer.py:4570 (`if last_seq and …`) | gap after a no-seq descriptor attach not counted | Yes | — | undercounted gaps | no |
+| 20 | ✅ | ~~Torn-slot race~~, shm_ring.py:356-377 — **FIXED** `eb54477` (2026-07-10) | payload copied without re-checking `seq_end` after copy; concurrent overwrite → corrupted frame accepted | ~~Yes~~ | `_read_stable_slot` now re-checks `seq_begin`/`seq_end` after the payload copy and discards on mismatch (used by both `read_event` and `read_events`); test: `tests/test_shm_ring_consistency.py` | garbage row, valid seq | no (corruption, not loss) |
+| 21 | ✅ | ~~Seq-gap check skips `last_seq == 0`~~, hdf_writer.py:4570 — **FIXED** 2026-07-11 | gap after a no-seq descriptor attach not counted | ~~Yes~~ | `-1` sentinel + `last_seq >= 0` guard now counts it; tests `test_gap_after_no_seq_attach_is_counted`, `test_no_seq_attach_seeds_unset_sentinel` | previously undercounted gaps | no |
 | 22 | 🟡 | Context pending TTL/overflow, hdf_writer.py:4701-4758 | unresolved context | No — **frames are still written** with `context_id=-1` | `_context_written_minus1_missing`, `_context_evicted_pending_overflow` (in `hdf.status`) | rows present, context −1 | **No** — context issues never empty a stream |
 | 23 | 🟡 | Telemetry/event deque overflow, hdf_writer.py:3012-3035 (maxlen 200 000, drop_newest) | flush stalled | No | `dropped_local_messages_total` / `dropped_event_messages_total` **file attrs** (hdf_writer.py:1440-1441) + `dropped_by_topic` in `hdf.status` | yes | no |
 | 24 | 🟡 | Reservoir hard cap: `_drop_oldest_stream_frames` hdf_writer.py:1876-1908 | stream rows > 4×200 000 | No | per-stream `dropped_total` attr, `bg.reservoir_drop`, `hdf.backpressure` event | yes | no |
@@ -189,40 +189,83 @@ with `rows_written_total==0` ⇒ writer-side (cases 4–5).
 
 ## 5. Minimal instrumentation fixes (silent → accounted)
 
-1. **Driver, missed scheduled ticks** (runner.py:1214): accumulate `missed`
-   into a `scheduled_stream_missed_total` (and a per-plan last-skip reason on
-   exception) published in the heartbeat payload. Closes the only loss point
-   with *zero* trace today (#1/#3).
-2. **Driver, produced-count in heartbeat**: include per-stream
-   `last_published_seq` (already `writer._next_seq`) in heartbeat/status.
-   Lets any consumer diff produced-vs-written; turns SHM/PUB losses into a
-   checkable invariant.
+1. ~~**Driver, missed scheduled ticks**~~ — **DONE** (2026-07-11):
+   `_publish_scheduled_streams` (runner.py) now accumulates `missed` into
+   `self._scheduled_stream_missed_total`, published in the heartbeat
+   payload. Closes the loss point with *zero* trace (#1/#3). Test:
+   `test_missed_scheduled_stream_ticks_are_counted`
+   (`tests/test_driver_stream_schedule.py`).
+2. ~~**Driver, produced-count in heartbeat**~~ — **DONE** (2026-07-11):
+   `publish_stream` (runner.py) now records
+   `self._stream_last_published_seq[stream]` on every write, published in
+   the heartbeat payload as `stream_last_published_seq`. Lets any consumer
+   diff produced-vs-written; turns SHM/PUB losses into a checkable
+   invariant. Tests: `test_publish_stream_records_last_published_seq`,
+   `test_heartbeat_includes_missed_ticks_and_published_seq`
+   (`tests/test_driver_stream_schedule.py`).
 3. **Heartbeat vs blocking device calls (the FS740 killer, #7)**: publish
    heartbeats from a small thread in `DeviceRunner` (it only touches the PUB
    socket — give the thread its own PUB or a queue), or at minimum raise
    `heartbeat_timeout_s` per-device above the max device-call timeout. Right
    now `fetch_timeout_s=10 s` is unreachable behind the manager's 3 s kill.
-4. **HDF, count buffer-discard on re-attach/reset** (hdf_writer.py:4523 and
-   `_reset_stream_runtime_state`): add `len(buf["data"])` to
-   `_stream_dropped_total[key]` before popping (#17/#18) — two lines each.
-5. **HDF, per-frame payload-size drop** (hdf_writer.py:5193): filter bad
-   frames instead of clearing the batch, bump the counter by the number
-   dropped.
-6. **HDF, count `ChunkReadyMessage.parse` failures**
-   (`stream.chunk_parse_failed`) and the dtype/shape-unknown clear at :5148
-   (`stream.meta_missing_dropped`, += n).
-7. **HDF, telemetry device-missing-from-schema** (hdf_writer.py:4324): bump
-   `telemetry.skipped_no_schema.<device>` and cache the negative result
-   briefly (also fixes the schema-RPC-per-batch cost).
+4. ~~**HDF, count buffer-discard on re-attach/reset**~~ — **DONE**
+   (2026-07-11): `_ensure_chunk_ready_reader` and
+   `_reset_stream_runtime_state` (hdf_writer.py) now bump a new per-stream
+   `buffer_discarded_total` counter (registered in
+   `_STREAM_COUNTER_ATTRS`) with the discarded frame count before popping
+   the buffer, at both sites (#17/#18). **Deviation from the original
+   proposal:** uses a dedicated `buffer_discarded_total` attr rather than
+   folding into `_stream_dropped_total`, since that map is reset to 0 on
+   every attach and already carries a different meaning (seq-gap drops) —
+   reusing it would both erase the count and conflate two loss types.
+   Tests: `test_buffer_discard_on_reattach_is_counted`,
+   `test_buffer_discard_on_drain_reset_is_counted`
+   (`tests/test_hdf_writer.py`).
+5. ~~**HDF, per-frame payload-size drop**~~ — **DONE** (2026-07-11):
+   `_write_single_stream_buffer` (hdf_writer.py) now filters out only the
+   frames whose byte length mismatches the expected size and writes the
+   rest of the batch; the counter bumps by the number of frames actually
+   dropped (only falls back to clearing the whole batch when every frame in
+   it is bad). This was an actual data-loss bug, not just missing
+   accounting — same shape as the schema-poisoning issue in §10 (one bad
+   frame taking down healthy data), different trigger. Test:
+   `test_payload_size_mismatch_filters_bad_frame_keeps_good_ones`
+   (`tests/test_hdf_writer.py`).
+6. ~~**HDF, count `ChunkReadyMessage.parse` failures and the dtype/shape-
+   unknown clear**~~ — **DONE** (2026-07-11): `_handle_manager_chunk_ready`
+   (`hdf_writer_topics.py`) bumps a global live counter
+   `stream.chunk_parse_failed` on a failed parse; `_write_single_stream_buffer`
+   (hdf_writer.py) bumps a new per-stream `meta_missing_dropped_total`
+   counter (registered in `_STREAM_COUNTER_ATTRS`) when dtype/shape can't
+   be resolved. Tests: `test_chunk_parse_failure_is_counted`,
+   `test_meta_missing_drop_is_counted` (`tests/test_hdf_writer.py`).
+7. ~~**HDF, telemetry device-missing-from-schema**~~ — **DONE**
+   (2026-07-11): `_write_buffered_rows_batch` now bumps
+   `telemetry.skipped_no_schema.<device>` when an enabled device is absent
+   from the schema; `_ensure_device` caches the negative result for 3s
+   (`_telemetry_schema_absent`), fixing the schema-RPC-per-batch cost. Real
+   data-loss bug (rows were silently gone, not just uncounted), not purely
+   a diagnostics gap. Test:
+   `test_telemetry_schema_absent_device_is_counted_and_cached`
+   (`tests/test_hdf_writer.py`).
 8. **Manager, dedup key** (driver_pub.py:729): compare `(shm_name, seq)` not
    just `seq`; optionally count dedup skips.
 9. **Manager, per-topic lifecycle drop counter** (pubsub.py:108) so a dropped
    `manager.chunk_ready` is distinguishable from log spam.
-10. **shm_ring torn-read guard** (shm_ring.py:377): re-read
-    `seq_begin/seq_end` after copying the payload; discard and count on
-    mismatch.
-11. Fix the `if last_seq and …` gap-count skip (hdf_writer.py:4570) →
-    `if last_seq >= 0 and seq > last_seq + 1` with an explicit sentinel.
+10. ~~**shm_ring torn-read guard**~~ — **DONE**, `eb54477` (2026-07-10):
+    `_read_stable_slot` re-reads `seq_begin`/`seq_end` after copying the
+    payload and discards on mismatch (see table row #20).
+11. ~~Fix the `if last_seq and …` gap-count skip~~ — **DONE** (2026-07-11):
+    a no-seq ring attach now seeds `_stream_last_seq[key] = -1` (an
+    explicit "unset" sentinel) instead of `0`, and
+    `_append_chunk_ready_events`'s guard is now
+    `if last_seq >= 0 and seq > last_seq + 1:`. All `.get(key, ...)`
+    default fallbacks for `_stream_last_seq` were updated to `-1` to match.
+    Tests: `test_gap_after_no_seq_attach_is_counted`,
+    `test_no_seq_attach_seeds_unset_sentinel`
+    (`tests/test_hdf_writer.py`); updated
+    `test_fresh_attach_without_seq_falls_back_to_unset_sentinel` (was
+    asserting the old, buggy `0` fallback).
 
 ---
 
@@ -558,23 +601,29 @@ machine:
 
 ### Immediate code actions (beyond §5)
 
-1. **Bg batch failure must not discard data** (hdf_writer.py:1475): on
-   `_FlushBatch` failure, add the batch's stream frames to per-stream
-   `dropped_total` (or better: restore them to the reservoir for retry),
-   persist a `bg_flush_batch_failures_total` root attr, and per-key
-   try/except inside `_write_stream_buffers_batch` so one stream's write
-   error cannot discard sibling streams' frames.
-2. ~~Stop draining `manager._sub` from worker threads~~ (rpc_calls.py:117):
-   demoted — the relay is proven lossless in §10's run. Still a genuine ZMQ
-   thread-safety violation worth fixing on hygiene grounds, but no observed
-   loss is attributed to it anymore.
+1. ~~**Bg batch failure must not discard data**~~ (hdf_writer.py:1475) —
+   **DONE**, `14ae1ca` (2026-07-09): per-key try/except inside
+   `_write_stream_buffers_batch` isolates each stream's write, so one
+   stream's error cannot discard sibling streams' frames; failures are
+   persisted per-stream as `write_failures_total`. See §10 "Fixes required".
+2. ~~Stop draining `manager._sub` from worker threads~~ (rpc_calls.py:117) —
+   **DONE** (verified 2026-07-11): `_pump_manager_subscriptions` now opens
+   with `if threading.get_ident() != self._main_thread_id: return`, so the
+   pump is a no-op when called from a lifecycle worker thread via
+   `_blocking_call_with_pump`. The concurrent-`recv` ZMQ thread-safety
+   hazard this item described can no longer occur.
 3. ~~Fix #113 before the next lab deploy~~ — **DONE**, PR #117 (`ae0eac4`,
    merged `e49b2da`), with real-wrapper-shape regression tests.
-4. **Writer process telemetry should publish a real `seq`** (it is −1 in
-   files), so writer restarts are provable from acquired files the way driver
-   restarts are.
-5. **Fix the structured-dtype schema poisoning** — the actual root cause of
-   every fs740/pxie stream loss in §8–§10; see §10 for the required changes.
+4. ~~**Writer process telemetry should publish a real `seq`**~~ (it was −1
+   in files) — **DONE** (2026-07-11): `_publish_writing_active_telemetry`
+   (hdf_writer.py) now increments and publishes a monotone
+   `self._process_telemetry_seq` on every `writing_active` update, so
+   writer restarts are now provable from acquired files the way driver
+   restarts already were. Test: `test_writer_process_telemetry_seq_increments`
+   (`tests/test_hdf_writer.py`).
+5. ~~**Fix the structured-dtype schema poisoning**~~ — the actual root cause
+   of every fs740/pxie stream loss in §8–§10 — **DONE**, `14ae1ca`
+   (2026-07-09); see §10 "Fixes required".
 
 ## 10. ROOT CAUSE CONFIRMED: structured-dtype schema poisoning → bg flush batch discard (2026-07-09, from `testing_with_intentional_sequencer_failures.h5`)
 
@@ -641,25 +690,33 @@ across two runs on different code versions. The mechanism has existed since
 `8a81fa9` (05-13, structured record support); `e97e446` (07-01) routed the
 poisoned string into the bg batch path.
 
-### Fixes required
+### Fixes required — ALL DONE (2026-07-09, `14ae1ca`)
 
-1. **Round-trippable dtype in the reader-derived schema**
-   (hdf_writer.py:4594-4598): store `reader.layout.dtype` (the `np.dtype`
-   object — it only crosses a thread queue, never a process boundary), not
-   `str(...)`. This is the one-line root fix.
-2. **Don't discard the config-derived schema on attach**
-   (hdf_writer.py:4524): the config schema is authoritative; popping it in
-   favour of a reader-derived fallback is backwards. Keep it, or overwrite
-   only with equal-or-better information.
-3. **§9 action 1 unchanged and now demonstrated**: per-key try/except in
-   `_write_stream_buffers_batch` + no whole-batch discard + persisted
-   `bg_flush_batch_failures_total`. One stream's poisoned schema destroyed a
-   *healthy* sibling stream's data for two days without a single persisted
-   error.
-4. **Regression test**: a records-kind stream (structured dtype) whose
-   schema is populated via the reader-fallback path (attach → pop → read)
-   must still flush; plus a mixed batch where one stream's write raises must
-   still write the sibling stream's frames.
+Fixed same-day in commit `14ae1ca` ("Fix structured-dtype schema poisoning
+that discarded stream flush batches"), with regression tests added in the
+same commit. All four items below are closed on current `master`.
+
+1. **Round-trippable dtype in the reader-derived schema** — DONE.
+   `_write_single_stream_buffer` now falls back to `reader.layout.dtype`
+   (the real `np.dtype` object, hdf_writer.py:5196), not `str(...)`.
+   Regression: `test_reader_fallback_stores_parseable_structured_dtype`
+   (tests/test_hdf_writer.py).
+2. **Don't discard the config-derived schema on attach** — DONE.
+   `_ensure_chunk_ready_reader` (hdf_writer.py:4529-4534) explicitly keeps
+   `_stream_schema` across re-attach now, with a comment recording why (dtype/
+   shape are stream properties, not session-scoped). Regression:
+   `test_config_schema_survives_ring_reattach` (tests/test_hdf_writer.py).
+3. **§9 action 1 — per-key isolation, no whole-batch discard** — DONE.
+   `_write_stream_buffers_batch` (hdf_writer.py:5140-5161) extracted the
+   per-stream write into `_write_single_stream_buffer` and wraps each key in
+   its own try/except; a poisoned stream can no longer take a healthy sibling
+   down with it. Failures are recorded per-stream as `write_failures_total`
+   (persisted via `_persist_stream_attrs`) rather than the originally proposed
+   root-level `bg_flush_batch_failures_total` — same effect, finer-grained.
+   Regression: `test_poisoned_stream_does_not_discard_sibling_batch`
+   (tests/test_hdf_writer.py).
+4. **Regression tests** — DONE. All three tests above were added in `14ae1ca`
+   and are confirmed to fail on the pre-fix source (per the commit message).
 
 ---
 
