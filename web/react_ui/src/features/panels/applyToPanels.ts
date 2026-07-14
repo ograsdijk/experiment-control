@@ -205,6 +205,10 @@ export function applyRawStreamFrameToPanels(
     seq: number;
     shape: number[];
     values: unknown;
+    truncated?: boolean;
+    originalShape?: number[];
+    originalPointCount?: number | null;
+    maxPayloadPoints?: number | null;
   }
 ): boolean {
   let updated = false;
@@ -287,6 +291,10 @@ export function applyRawStreamFrameToPanels(
       seq: frame.seq,
       shape: frame.shape,
       values: frame.values,
+      truncated: frame.truncated,
+      originalShape: frame.originalShape,
+      originalPointCount: frame.originalPointCount,
+      maxPayloadPoints: frame.maxPayloadPoints,
     });
     const keep = Math.max(MAX_STREAM_FRAME_BUFFER, panel.overlayCount * 4);
     if (currentFrames.length > keep) {
@@ -491,6 +499,10 @@ export function applyStreamAnalysisOutputToPanels(
           seq,
           shape: [values.length],
           values,
+          truncated: output.truncated,
+          originalShape: output.originalShape,
+          originalPointCount: output.originalPointCount,
+          maxPayloadPoints: output.maxPayloadPoints,
         });
         const keep = Math.max(MAX_STREAM_FRAME_BUFFER, panel.overlayCount * 4);
         if (currentFrames.length > keep) {

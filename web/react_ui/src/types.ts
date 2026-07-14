@@ -41,6 +41,9 @@ export type StreamFramePayload = {
   context_id?: number | null;
   context_fields?: Record<string, unknown> | null;
   truncated?: boolean;
+  original_shape?: number[];
+  original_point_count?: number;
+  max_payload_points?: number;
 };
 
 export type StreamFrameMessage = {
@@ -69,6 +72,9 @@ export type StreamAnalysisOutputPayload = {
   context_id?: number | null;
   context_fields?: Record<string, unknown> | null;
   truncated?: boolean;
+  original_shape?: number[];
+  original_point_count?: number;
+  max_payload_points?: number;
 };
 
 export type StreamAnalysisMessage = {

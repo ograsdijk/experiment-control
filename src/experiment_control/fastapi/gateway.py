@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 import math
 import queue
@@ -15,6 +16,9 @@ import zmq
 
 from ..shm.shm_ring import ShmRingReader
 from ..utils.zmq_helpers import json_dumps, safe_json_loads
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -492,6 +496,8 @@ class StreamFrameHub:
         self._stream_key_last_seen: dict[tuple[str, str], float] = {}
         self._stream_key_dropped_capacity = 0
         self._stream_key_dropped_ttl = 0
+        self._payload_truncation_count = 0
+        self._last_payload_truncation_warning: dict[tuple[str, str], float] = {}
 
     def start(self, loop: asyncio.AbstractEventLoop) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -524,6 +530,7 @@ class StreamFrameHub:
         self._latest_frame.clear()
         self._stream_key_order.clear()
         self._stream_key_last_seen.clear()
+        self._last_payload_truncation_warning.clear()
 
     def _drop_stream_key(self, key: tuple[str, str], *, reason: str) -> None:
         reader = self._readers.pop(key, None)
@@ -539,6 +546,7 @@ class StreamFrameHub:
             self._latest_frame.pop(key, None)
         self._stream_key_order.pop(key, None)
         self._stream_key_last_seen.pop(key, None)
+        self._last_payload_truncation_warning.pop(key, None)
         if reason == "capacity":
             self._stream_key_dropped_capacity += 1
         elif reason == "ttl":
@@ -600,7 +608,35 @@ class StreamFrameHub:
             "reader_count": int(len(self._readers)),
             "dropped_stream_keys_capacity": int(self._stream_key_dropped_capacity),
             "dropped_stream_keys_ttl": int(self._stream_key_dropped_ttl),
+            "payload_truncation_count": int(self._payload_truncation_count),
         }
+
+    def _warn_payload_truncation(
+        self,
+        *,
+        device_id: str,
+        stream: str,
+        point_count: int,
+        shape: tuple[int, ...],
+    ) -> None:
+        """Log public-payload truncation at most once per stream per minute."""
+        self._payload_truncation_count += 1
+        key = (device_id, stream)
+        now = time.monotonic()
+        last = self._last_payload_truncation_warning.get(key)
+        if last is not None and (now - last) < 60.0:
+            return
+        self._last_payload_truncation_warning[key] = now
+        logger.warning(
+            "stream frame exceeds public payload cap: device=%s stream=%s "
+            "shape=%s points=%d cap=%d; generic stream payload is truncated "
+            "but channel-selecting raw-stream endpoints retain the full frame",
+            device_id,
+            stream,
+            list(shape),
+            point_count,
+            self._max_payload_points,
+        )
 
     def get_latest_frame(self, *, device_id: str, stream: str) -> dict[str, Any] | None:
         key = (str(device_id).strip(), str(stream).strip())
@@ -685,11 +721,18 @@ class StreamFrameHub:
         except Exception:
             return None
 
-        values_arr: np.ndarray = arr
+        source_arr: np.ndarray = arr
+        values_arr: np.ndarray = source_arr
         truncated = False
         if values_arr.size > self._max_payload_points:
             values_arr = values_arr.reshape(-1)[: self._max_payload_points]
             truncated = True
+            self._warn_payload_truncation(
+                device_id=device_id,
+                stream=stream,
+                point_count=int(source_arr.size),
+                shape=shape,
+            )
 
         # Mirrors stream_analysis._build_trace_snapshot_payload: avoid
         # walking the values list through _sanitize_json on every frame.
@@ -725,6 +768,12 @@ class StreamFrameHub:
             ),
             "values": values,
             "_binary_values": values_arr.astype(np.float64, copy=False),
+            # Private, native-dtype source retained for /ws/raw_stream and
+            # /api/streams/raw_snapshot. Those endpoints select one channel
+            # before decimating, so a cap on the generic public feed must not
+            # corrupt a multidimensional frame before channel selection.
+            "_source_values": source_arr,
+            "_source_shape": [int(x) for x in shape],
         }
         if context_id is not None:
             out["context_id"] = int(context_id)
@@ -732,6 +781,9 @@ class StreamFrameHub:
             out["context_fields"] = _sanitize_json(dict(context_fields))
         if truncated:
             out["truncated"] = True
+            out["original_shape"] = [int(x) for x in shape]
+            out["original_point_count"] = int(source_arr.size)
+            out["max_payload_points"] = int(self._max_payload_points)
         return {"topic": "manager.stream_frame", "payload": out}
 
     def _record_event_to_values(

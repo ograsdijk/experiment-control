@@ -129,6 +129,37 @@ class FastApiUiHostingTests(unittest.TestCase):
         self.assertIsInstance(trace, np.ndarray)
         self.assertLessEqual(trace.size, 5)
 
+    def test_trace_builder_selects_channel_before_public_payload_cap(self) -> None:
+        source = np.arange(60, dtype=np.int16).reshape(5, 12)
+        built = fastapi_app_module._build_trace_frame_array(
+            {
+                "device_id": "digitizer",
+                "stream": "waveforms",
+                "seq": 1,
+                "shape": [20],
+                "values": source.reshape(-1)[:20].tolist(),
+                "truncated": True,
+                "original_shape": [5, 12],
+                "original_point_count": 60,
+                "max_payload_points": 20,
+                "_source_values": source,
+                "_source_shape": [5, 12],
+            },
+            channel_index=4,
+            trace_decimator="stride",
+            trace_max_points=6,
+        )
+
+        self.assertIsNotNone(built)
+        payload, trace = built
+        np.testing.assert_array_equal(trace, source[4, ::2].astype(np.float64))
+        self.assertEqual(payload["shape"], [6])
+        self.assertEqual(payload["original_point_count"], 12)
+        self.assertTrue(payload["decimated"])
+        self.assertNotIn("truncated", payload)
+        self.assertNotIn("max_payload_points", payload)
+        self.assertNotIn("_source_values", payload)
+
     def test_binary_trace_frame_sends_metadata_then_bytes(self) -> None:
         ws = _WsCapture()
         msg = {
