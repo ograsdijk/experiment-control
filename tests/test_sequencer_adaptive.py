@@ -650,6 +650,98 @@ class SequencerAdaptiveTests(unittest.TestCase):
         )
 
 
+class SequencerTelemetryReceiptAgeTests(unittest.TestCase):
+    @staticmethod
+    def _runtime(sample: dict[str, object]) -> SequencerRuntime:
+        return SequencerRuntime(
+            call_device=lambda *_args, **_kwargs: {"ok": True, "result": None},
+            get_telemetry=lambda *_args, **_kwargs: dict(sample),
+            set_stream_context=lambda *_args, **_kwargs: None,
+        )
+
+    def test_wait_until_freshness_prefers_receiver_age(self) -> None:
+        runtime = self._runtime(
+            {
+                "value": 7.0,
+                "age_s": 0.01,
+                "t_mono_recv": time.monotonic(),
+                # Simulate an unrelated peer monotonic-clock origin.
+                "t_mono": -1.0e9,
+            }
+        )
+        runtime.load(
+            parse_sequence(
+                {
+                    "version": 1,
+                    "steps": [
+                        {
+                            "wait_until": {
+                                "timeout_s": 0.1,
+                                "every_s": 0.0,
+                                "sample": {
+                                    "telemetry": {
+                                        "device": "remote_flow",
+                                        "signal": "flow_signal_sccm",
+                                        "max_age_s": 0.5,
+                                    }
+                                },
+                                "condition": {"gt": ["${sample}", 6.0]},
+                            }
+                        }
+                    ],
+                }
+            )
+        )
+        runtime.start()
+        while runtime.state == "RUNNING":
+            runtime.tick()
+
+        self.assertEqual(runtime.state, "STOPPED")
+
+    def test_stale_receiver_age_rejects_future_peer_monotonic_timestamp(self) -> None:
+        runtime = self._runtime(
+            {
+                "value": 7.0,
+                "age_s": 10.0,
+                "t_mono_recv": time.monotonic() - 10.0,
+                # A peer timestamp ahead of this host must not make it fresh.
+                "t_mono": time.monotonic() + 1.0e9,
+            }
+        )
+
+        value = runtime._resolve_value(  # noqa: SLF001
+            {
+                "telemetry": {
+                    "device": "remote_flow",
+                    "signal": "flow_signal_sccm",
+                    "max_age_s": 0.5,
+                }
+            }
+        )
+
+        self.assertIsNone(value)
+
+    def test_adaptive_telemetry_freshness_prefers_receiver_age(self) -> None:
+        runtime = self._runtime(
+            {
+                "value": 3.5,
+                "age_s": 0.01,
+                "t_mono_recv": time.monotonic(),
+                "t_mono": -1.0e9,
+            }
+        )
+
+        value = runtime._sample_adaptive_telemetry(  # noqa: SLF001
+            {
+                "device": "remote_detector",
+                "signal": "reading",
+                "max_age_s": 0.5,
+            }
+        )
+
+        self.assertEqual(value, 3.5)
+
+
 class SequencerWaitUntilSampleCapTests(unittest.TestCase):
     def _runtime(self, values: list[float]) -> SequencerRuntime:
         samples = deque(values)
