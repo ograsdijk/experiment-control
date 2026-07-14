@@ -63,10 +63,14 @@ def _strip_private_payload_fields(msg: Any) -> Any:
     if not isinstance(msg, dict):
         return msg
     payload = msg.get("payload")
-    if not isinstance(payload, dict) or "_binary_values" not in payload:
+    if not isinstance(payload, dict) or not any(
+        key in payload for key in ("_binary_values", "_source_values", "_source_shape")
+    ):
         return msg
     public_payload = dict(payload)
     public_payload.pop("_binary_values", None)
+    public_payload.pop("_source_values", None)
+    public_payload.pop("_source_shape", None)
     public_msg = dict(msg)
     public_msg["payload"] = public_payload
     return public_msg
@@ -276,8 +280,16 @@ def _build_trace_frame_array(
     trace_max_points: int | None,
     pre_decimate: Callable[[np.ndarray], np.ndarray | None] | None = None,
 ) -> tuple[dict[str, Any], np.ndarray] | None:
-    shape = _normalize_shape(payload.get("shape"))
-    source_values = payload.get("_binary_values", payload.get("values"))
+    private_source = payload.get("_source_values")
+    has_full_source = private_source is not None
+    shape = _normalize_shape(
+        payload.get("_source_shape") if has_full_source else payload.get("shape")
+    )
+    source_values = (
+        private_source
+        if has_full_source
+        else payload.get("_binary_values", payload.get("values"))
+    )
     arr = _coerce_stream_values_array(source_values, shape)
     if arr is None:
         return None
@@ -302,9 +314,17 @@ def _build_trace_frame_array(
     out_payload: dict[str, Any] = dict(payload)
     out_payload.pop("values", None)
     out_payload.pop("_binary_values", None)
+    out_payload.pop("_source_values", None)
+    out_payload.pop("_source_shape", None)
+    if has_full_source:
+        # The generic stream feed may have been capped, but this path used the
+        # complete private frame and selected a channel before decimation.
+        out_payload.pop("truncated", None)
+        out_payload.pop("max_payload_points", None)
     out_payload["shape"] = [int(trace.size)]
     out_payload["channel_index"] = int(channel_index)
     out_payload["point_count"] = int(trace.size)
+    out_payload["original_point_count"] = original_size
     if trace_max_points is not None and int(trace.size) < original_size:
         out_payload["decimated"] = True
     return out_payload, trace

@@ -23,6 +23,10 @@ export function normalizeStreamFrameMessage(msg: StreamFrameMessage): {
   encoding: string;
   dtype: string | null;
   byteLength: number | null;
+  truncated: boolean;
+  originalShape: number[];
+  originalPointCount: number | null;
+  maxPayloadPoints: number | null;
 } | null {
   if (msg.topic !== "manager.stream_frame") {
     return null;
@@ -45,6 +49,11 @@ export function normalizeStreamFrameMessage(msg: StreamFrameMessage): {
     .filter((v) => Number.isFinite(v) && v > 0)
     .map((v) => Math.trunc(v));
   const byteLengthRaw = payload?.byte_length;
+  const originalShapeRaw = Array.isArray(payload?.original_shape)
+    ? payload.original_shape
+    : [];
+  const originalPointCountRaw = Number(payload?.original_point_count);
+  const maxPayloadPointsRaw = Number(payload?.max_payload_points);
   return {
     deviceId,
     stream,
@@ -56,6 +65,19 @@ export function normalizeStreamFrameMessage(msg: StreamFrameMessage): {
     byteLength:
       typeof byteLengthRaw === "number" && Number.isFinite(byteLengthRaw)
         ? Math.trunc(byteLengthRaw)
+        : null,
+    truncated: payload?.truncated === true,
+    originalShape: originalShapeRaw
+      .map((value) => Number(value))
+      .filter((value) => Number.isFinite(value) && value > 0)
+      .map((value) => Math.trunc(value)),
+    originalPointCount:
+      Number.isFinite(originalPointCountRaw) && originalPointCountRaw > 0
+        ? Math.trunc(originalPointCountRaw)
+        : null,
+    maxPayloadPoints:
+      Number.isFinite(maxPayloadPointsRaw) && maxPayloadPointsRaw > 0
+        ? Math.trunc(maxPayloadPointsRaw)
         : null,
   };
 }
@@ -71,6 +93,10 @@ export type NormalizedStreamAnalysisOutput = {
   encoding: string;
   dtype: string | null;
   byteLength: number | null;
+  truncated: boolean;
+  originalShape: number[];
+  originalPointCount: number | null;
+  maxPayloadPoints: number | null;
 };
 
 export function normalizeStreamAnalysisOutputMessage(
@@ -102,6 +128,11 @@ export function normalizeStreamAnalysisOutputMessage(
       ? Math.trunc(seqRaw)
       : null;
   const byteLengthRaw = payload?.byte_length;
+  const originalShapeRaw = Array.isArray(payload?.original_shape)
+    ? payload.original_shape
+    : [];
+  const originalPointCountRaw = Number(payload?.original_point_count);
+  const maxPayloadPointsRaw = Number(payload?.max_payload_points);
   return {
     workspaceId,
     outputId,
@@ -115,6 +146,19 @@ export function normalizeStreamAnalysisOutputMessage(
     byteLength:
       typeof byteLengthRaw === "number" && Number.isFinite(byteLengthRaw)
         ? Math.trunc(byteLengthRaw)
+        : null,
+    truncated: payload?.truncated === true,
+    originalShape: originalShapeRaw
+      .map((value) => Number(value))
+      .filter((value) => Number.isFinite(value) && value > 0)
+      .map((value) => Math.trunc(value)),
+    originalPointCount:
+      Number.isFinite(originalPointCountRaw) && originalPointCountRaw > 0
+        ? Math.trunc(originalPointCountRaw)
+        : null,
+    maxPayloadPoints:
+      Number.isFinite(maxPayloadPointsRaw) && maxPayloadPointsRaw > 0
+        ? Math.trunc(maxPayloadPointsRaw)
         : null,
   };
 }

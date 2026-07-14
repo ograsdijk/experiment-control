@@ -1,4 +1,6 @@
 ﻿import { useEffect, useMemo, useRef } from "react";
+import { Alert } from "@mantine/core";
+import { IconAlertTriangle } from "@tabler/icons-react";
 import uPlot from "uplot";
 import { traceColorAt } from "../utils/traceColors";
 
@@ -6,6 +8,10 @@ export type StreamFrame = {
   seq: number;
   shape: number[];
   values: unknown;
+  truncated?: boolean;
+  originalShape?: number[];
+  originalPointCount?: number | null;
+  maxPayloadPoints?: number | null;
 };
 
 export type StreamExtraSeries = {
@@ -104,6 +110,11 @@ export function buildStreamRawData(
   channelIndex: number,
   extraSeries: StreamExtraSeries[] = []
 ): { data: number[][]; labels: string[] } {
+  if (frames.length > 0 && frames[frames.length - 1].truncated) {
+    // A flattened prefix of a multidimensional frame can contain complete
+    // and partial channels. Refuse to present it as a valid waveform.
+    return { data: [[], []], labels: ["sample", "trace"] };
+  }
   if (frames.length === 0) {
     if (extraSeries.length <= 0) {
       return { data: [[], []], labels: ["sample", "trace"] };
@@ -222,6 +233,10 @@ export function StreamRawPanel({
   const hostRef = useRef<HTMLDivElement | null>(null);
   const plotRef = useRef<uPlot | null>(null);
   const isDark = colorScheme === "dark";
+  const truncatedFrame =
+    frames.length > 0 && frames[frames.length - 1].truncated
+      ? frames[frames.length - 1]
+      : null;
 
   const formatNumber = useMemo(() => {
     return (value: number | Date | null | undefined) => {
@@ -347,5 +362,36 @@ export function StreamRawPanel({
     plotRef.current.setData(built.data as uPlot.AlignedData);
   }, [tick, built.data]);
 
-  return <div className="plot-panel" ref={hostRef} />;
+  const truncationDetails = truncatedFrame
+    ? [
+        truncatedFrame.originalShape?.length
+          ? `original shape ${truncatedFrame.originalShape.join(" × ")}`
+          : null,
+        typeof truncatedFrame.originalPointCount === "number"
+          ? `${truncatedFrame.originalPointCount.toLocaleString()} points`
+          : null,
+        typeof truncatedFrame.maxPayloadPoints === "number"
+          ? `gateway limit ${truncatedFrame.maxPayloadPoints.toLocaleString()}`
+          : null,
+      ]
+        .filter(Boolean)
+        .join("; ")
+    : "";
+
+  return (
+    <>
+      {truncatedFrame ? (
+        <Alert
+          color="red"
+          icon={<IconAlertTriangle size={18} />}
+          title="Stream frame truncated — plot suppressed"
+          mb="sm"
+        >
+          The frame exceeded the gateway payload limit and cannot be plotted
+          safely{truncationDetails ? ` (${truncationDetails})` : ""}.
+        </Alert>
+      ) : null}
+      <div className="plot-panel" ref={hostRef} />
+    </>
+  );
 }

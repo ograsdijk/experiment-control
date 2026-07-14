@@ -285,6 +285,10 @@ export type StreamFrameSample = {
   seq: number;
   shape: number[];
   values: unknown;
+  truncated?: boolean;
+  originalShape?: number[];
+  originalPointCount?: number | null;
+  maxPayloadPoints?: number | null;
 };
 
 export type StreamAnalysisWorkspaceSubscription = {

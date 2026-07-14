@@ -52,6 +52,14 @@ class _RecordReaderStub:
     layout = _Layout()
 
 
+class _FrameReaderStub:
+    class _Layout:
+        dtype = np.dtype("int16")
+        shape = (5, 12)
+
+    layout = _Layout()
+
+
 def _record_event(seq: int, frequency_hz: float) -> dict[str, object]:
     dtype = _RecordReaderStub.layout.dtype
     record = np.asarray((seq, frequency_hz), dtype=dtype).reshape(())
@@ -278,6 +286,35 @@ class GatewayLifecycleTests(unittest.TestCase):
         finally:
             hub.close()
             loop.close()
+
+    def test_stream_frame_cap_retains_private_shape_safe_source(self) -> None:
+        hub = StreamFrameHub(
+            "tcp://127.0.0.1:1",
+            topics=("manager.chunk_ready",),
+            max_payload_points=20,
+        )
+        source = np.arange(60, dtype=np.int16).reshape(5, 12)
+
+        msg = hub._build_stream_frame(  # noqa: SLF001
+            device_id="digitizer",
+            stream="waveforms",
+            reader=_FrameReaderStub(),  # type: ignore[arg-type]
+            event={"seq": 1, "payload": source.tobytes()},
+            context_id=None,
+            context_fields=None,
+        )
+
+        self.assertIsNotNone(msg)
+        assert msg is not None
+        payload = msg["payload"]
+        self.assertTrue(payload["truncated"])
+        self.assertEqual(payload["shape"], [20])
+        self.assertEqual(payload["original_shape"], [5, 12])
+        self.assertEqual(payload["original_point_count"], 60)
+        self.assertEqual(payload["max_payload_points"], 20)
+        np.testing.assert_array_equal(payload["_source_values"], source)
+        self.assertEqual(payload["_source_shape"], [5, 12])
+        self.assertEqual(hub.stats()["payload_truncation_count"], 1)
 
     def test_stream_frame_hub_prunes_keys_by_capacity(self) -> None:
         hub = StreamFrameHub(
