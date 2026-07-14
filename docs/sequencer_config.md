@@ -180,7 +180,9 @@ Fields:
 - `stable_for_s`: require condition to hold for this duration
 
 Sample sources:
-- Telemetry: `telemetry: {device, signal, max_age_s?}`
+- Telemetry: `telemetry: {device, signal, max_age_s?}`. Freshness uses the
+  consuming sequencer's local receipt age (`age_s` / `t_mono_recv`) when
+  available; a producer's monotonic timestamp is not comparable across hosts.
 - Call: `call: {device, action, params?, extract?}`
 
 Implicit locals during wait:

@@ -1856,6 +1856,37 @@ class SequencerRuntime:
             return self._get_process_telemetry(process, signal)
         return self._get_telemetry(device, signal)
 
+    @staticmethod
+    def _telemetry_sample_age_s(sample: dict[str, Any]) -> float | None:
+        """Return freshness age measured on the receiving host when available.
+
+        Producer ``t_mono`` values are only comparable within one host.  The
+        manager client supplies ``age_s`` from its local ``t_mono_recv``; prefer
+        that receipt-based age so federated telemetry cannot be rejected (or
+        accepted forever) because the peer hosts have different monotonic-clock
+        origins.  The producer timestamp remains a compatibility fallback for
+        older/custom telemetry providers that do not expose receipt age.
+        """
+        age_raw = sample.get("age_s")
+        if isinstance(age_raw, (str, bytes, bytearray, int, float)):
+            try:
+                return max(0.0, float(age_raw))
+            except (TypeError, ValueError):
+                pass
+        recv_raw = sample.get("t_mono_recv")
+        if isinstance(recv_raw, (str, bytes, bytearray, int, float)):
+            try:
+                return max(0.0, time.monotonic() - float(recv_raw))
+            except (TypeError, ValueError):
+                pass
+        source_raw = sample.get("t_mono")
+        if isinstance(source_raw, (str, bytes, bytearray, int, float)):
+            try:
+                return max(0.0, time.monotonic() - float(source_raw))
+            except (TypeError, ValueError):
+                pass
+        return None
+
     def _render_call_target(
         self, call_spec: dict[str, Any]
     ) -> tuple[str, str | None, str]:
@@ -2900,8 +2931,8 @@ class SequencerRuntime:
                 device=device, process=process or None, signal=signal
             )
             if sample:
-                age = time.monotonic() - float(sample.get("t_mono", 0.0) or 0.0)
-                if (not max_age_s) or age <= max_age_s:
+                age = self._telemetry_sample_age_s(sample)
+                if (not max_age_s) or (age is not None and age <= max_age_s):
                     return sample.get("value")
             if timeout_s <= 0.0 or time.monotonic() >= deadline:
                 raise RuntimeError(
@@ -2949,8 +2980,8 @@ class SequencerRuntime:
             )
             if not sample:
                 return None
-            age = time.monotonic() - float(sample.get("t_mono", 0))
-            if max_age and age > max_age:
+            age = self._telemetry_sample_age_s(sample)
+            if max_age and (age is None or age > max_age):
                 return None
             return sample.get("value")
         if isinstance(value, dict) and "call" in value:
@@ -3097,7 +3128,11 @@ class SequencerRuntime:
                     )
                     if isinstance(cached, dict):
                         try:
-                            t_mono_raw = cached.get("t_mono")
+                            t_mono_raw = cached.get("t_mono_recv")
+                            if not isinstance(
+                                t_mono_raw, (str, bytes, bytearray, int, float)
+                            ):
+                                t_mono_raw = cached.get("t_mono")
                             if not isinstance(t_mono_raw, (str, bytes, bytearray, int, float)):
                                 raise TypeError
                             sample_ts = float(t_mono_raw)
