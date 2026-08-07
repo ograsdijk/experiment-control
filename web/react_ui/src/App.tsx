@@ -109,9 +109,11 @@ import {
 import { detectGridColumns } from "./features/layout/serpentine";
 import { ReorderableCardShell } from "./features/layout/ReorderableCardShell";
 import {
+  acceptNewLogEntries,
   logEntryKey,
   normalizeLogEntry,
   toPrettyJson,
+  watchdogToastForLogEntry,
 } from "./features/logs/utils";
 import type {
   MeasurementFieldSchema,
@@ -1045,21 +1047,13 @@ export function App() {
   // UI profile import/export is wired below — see the useUiProfile
   // call after setDevicePanelCollapsed is defined (round 29).
 
-  const appendLogEntries = (entries: LogEntry[]) => {
+  const appendLogEntries = (entries: LogEntry[]): LogEntry[] => {
     if (entries.length === 0) {
-      return;
+      return [];
     }
-    const accepted: LogEntry[] = [];
-    for (const entry of entries) {
-      const key = logEntryKey(entry);
-      if (logSeenRef.current.has(key)) {
-        continue;
-      }
-      logSeenRef.current.add(key);
-      accepted.push(entry);
-    }
+    const accepted = acceptNewLogEntries(entries, logSeenRef.current);
     if (accepted.length === 0) {
-      return;
+      return [];
     }
     setLogRows((prev) => {
       const next = [...prev, ...accepted];
@@ -1071,6 +1065,7 @@ export function App() {
       logSeenRef.current = keep;
       return trimmed;
     });
+    return accepted;
   };
 
   const loadLogTail = async () => {
@@ -1704,7 +1699,16 @@ export function App() {
   }, [instanceLabel]);
 
   const { wsConnected: logsWsConnected } = useLogsStream({
-    onEntry: (entry) => appendLogEntries([entry]),
+    onEntry: (entry) => {
+      const [accepted] = appendLogEntries([entry]);
+      if (!accepted) {
+        return;
+      }
+      const toast = watchdogToastForLogEntry(accepted);
+      if (toast) {
+        notifications.show(toast);
+      }
+    },
   });
 
   useEffect(() => {
