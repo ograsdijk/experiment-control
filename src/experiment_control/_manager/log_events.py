@@ -105,6 +105,8 @@ def _event_log_severity(topic: str, payload: Json) -> str | None:
         return None
     if topic == "manager.watchdog.triggered":
         return normalize_log_severity(payload.get("severity"), default="warning")
+    if topic == "manager.watchdog.cleared":
+        return "info"
     if topic == "manager.loop_stall":
         return "warning"
     if topic == "manager.process.heartbeat_stale_deferred":
@@ -313,6 +315,10 @@ class LogEventsMixin(_MixinBase):
         message = payload.get("error") or payload.get("message") or ""
         if topic == "manager.command":
             message = _command_failure_message(payload)
+        elif topic == "manager.watchdog.cleared":
+            watchdog_id = str(payload.get("watchdog_id") or "unknown")
+            rule = str(payload.get("rule") or "unknown")
+            message = f"Watchdog {watchdog_id}:{rule} cleared"
         elif topic.startswith("manager.device.auto_reconnect."):
             message = _auto_reconnect_message(topic, payload)
         elif (

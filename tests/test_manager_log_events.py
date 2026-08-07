@@ -58,6 +58,22 @@ class ManagerLogEventsTests(unittest.TestCase):
         )
         self.assertEqual(severity, "warning")
 
+    def test_watchdog_cleared_is_info(self) -> None:
+        severity = manager_log_events._event_log_severity(
+            "manager.watchdog.cleared",
+            {"process_id": "watchdog"},
+        )
+        self.assertEqual(severity, "info")
+
+    def test_routine_watchdog_events_are_not_logged(self) -> None:
+        for topic in (
+            "manager.watchdog.rules_loaded",
+            "manager.watchdog.action_sent",
+        ):
+            with self.subTest(topic=topic):
+                severity = manager_log_events._event_log_severity(topic, {})
+                self.assertIsNone(severity)
+
     def test_process_failure_log_message_includes_stderr_and_heartbeat(self) -> None:
         manager = mock.Mock()
         manager_log_events.maybe_publish_log_event(
@@ -180,6 +196,31 @@ class ManagerLogEventsTests(unittest.TestCase):
                 "severity": "critical",
                 "message": "RC pressure > 1e-2 Torr, stopping RC turbo",
             },
+        )
+
+    def test_watchdog_cleared_emits_manager_log_entry(self) -> None:
+        manager = mock.Mock()
+        payload = {
+            "process_id": "watchdog",
+            "watchdog_id": "vacuum",
+            "rule": "pressure_high",
+            "previous_latched": True,
+            "previous_armed": True,
+        }
+        manager_log_events.maybe_publish_log_event(
+            manager, "manager.watchdog.cleared", payload
+        )
+
+        manager._emit_log.assert_called_once_with(
+            severity="info",
+            topic="manager.watchdog.cleared",
+            message="Watchdog vacuum:pressure_high cleared",
+            source_kind="process",
+            source_id="watchdog",
+            device_id=None,
+            process_id="watchdog",
+            stream="event",
+            payload=payload,
         )
 
 

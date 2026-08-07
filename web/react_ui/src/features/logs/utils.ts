@@ -1,5 +1,67 @@
 ﻿import type { LogEntry } from "../../types";
 
+export type WatchdogToast = {
+  color: string;
+  title: string;
+  message: string;
+};
+
+const WATCHDOG_TOPIC_PREFIX = "manager.watchdog.";
+const WATCHDOG_TOAST_EVENTS = new Set([
+  "triggered",
+  "cleared",
+  "rule_error",
+  "action_failed",
+  "action_chain_error",
+]);
+
+function titleCaseWords(value: string): string {
+  return value
+    .split("_")
+    .filter(Boolean)
+    .map((word) => `${word.charAt(0).toUpperCase()}${word.slice(1)}`)
+    .join(" ");
+}
+
+export function watchdogToastForLogEntry(entry: LogEntry): WatchdogToast | null {
+  const topic = entry.topic ?? "";
+  if (!topic.startsWith(WATCHDOG_TOPIC_PREFIX)) {
+    return null;
+  }
+  const eventName = topic.slice(WATCHDOG_TOPIC_PREFIX.length);
+  if (!WATCHDOG_TOAST_EVENTS.has(eventName)) {
+    return null;
+  }
+  const severity = String(entry.severity ?? "").toLowerCase();
+  const color =
+    severity === "critical" || severity === "fatal" || severity === "error"
+      ? "red"
+      : severity === "warning"
+        ? "yellow"
+        : "blue";
+  return {
+    color,
+    title: `Watchdog ${titleCaseWords(eventName) || "event"}`,
+    message: entry.message?.trim() || `${entry.process_id ?? "Watchdog"} reported ${eventName}`,
+  };
+}
+
+export function acceptNewLogEntries(
+  entries: LogEntry[],
+  seen: Set<string>
+): LogEntry[] {
+  const accepted: LogEntry[] = [];
+  for (const entry of entries) {
+    const key = logEntryKey(entry);
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    accepted.push(entry);
+  }
+  return accepted;
+}
+
 export function normalizeLogEntry(raw: unknown): LogEntry | null {
   if (!raw || typeof raw !== "object") {
     return null;

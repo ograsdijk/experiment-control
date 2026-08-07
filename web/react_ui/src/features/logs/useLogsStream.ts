@@ -25,6 +25,10 @@ export type UseLogsStreamResult = {
   wsConnected: boolean;
 };
 
+export function logsReconnectDelayMs(attempt: number): number {
+  return Math.min(1000 * 2 ** Math.max(0, attempt), 30000);
+}
+
 /**
  * Subscribe to /ws/logs and accumulate normalized entries (newest first).
  */
@@ -65,35 +69,91 @@ export function useLogsStream(options: UseLogsStreamOptions = {}): UseLogsStream
   }, [seedLimit, maxEntries]);
 
   useEffect(() => {
-    const ws = new WebSocket(buildWsUrl("/ws/logs"));
-    ws.onopen = () => setWsConnected(true);
-    ws.onclose = () => setWsConnected(false);
-    ws.onerror = () => setWsConnected(false);
-    ws.onmessage = (event) => {
+    let disposed = false;
+    let ws: WebSocket | null = null;
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    let reconnectAttempt = 0;
+    let needsCatchUp = false;
+
+    const dispatchEntry = (entry: LogEntry) => {
+      setEntries((prev) => [entry, ...prev].slice(0, maxEntries));
+      const handler = onEntryRef.current;
+      if (!handler) {
+        return;
+      }
       try {
-        const msg = JSON.parse(event.data) as LogMessage;
-        if (msg.topic !== "manager.log") {
+        handler(entry);
+      } catch {
+        return;
+      }
+    };
+
+    const catchUp = async () => {
+      try {
+        const resp = await fetchLogTail({ limit: maxEntries });
+        if (disposed || !resp.ok || !resp.result) {
           return;
         }
-        const entry = normalizeLogEntry(msg.payload);
-        if (!entry) {
-          return;
-        }
-        setEntries((prev) => [entry, ...prev].slice(0, maxEntries));
-        const handler = onEntryRef.current;
-        if (handler) {
-          try {
-            handler(entry);
-          } catch {
-            // Don't let a faulty listener tear down the socket.
+        const raw = resp.result as { entries?: unknown[]; items?: unknown[] };
+        const list = raw.entries ?? raw.items ?? [];
+        for (const item of list) {
+          const entry = normalizeLogEntry(item);
+          if (entry) {
+            dispatchEntry(entry);
           }
         }
       } catch {
-        // Ignore malformed frames.
+        return;
       }
     };
+
+    const connect = () => {
+      if (disposed) {
+        return;
+      }
+      ws = new WebSocket(buildWsUrl("/ws/logs"));
+      ws.onopen = () => {
+        reconnectAttempt = 0;
+        setWsConnected(true);
+        if (needsCatchUp) {
+          needsCatchUp = false;
+          void catchUp();
+        }
+      };
+      ws.onclose = () => {
+        setWsConnected(false);
+        if (disposed) {
+          return;
+        }
+        needsCatchUp = true;
+        const delay = logsReconnectDelayMs(reconnectAttempt);
+        reconnectAttempt += 1;
+        reconnectTimer = setTimeout(connect, delay);
+      };
+      ws.onerror = () => setWsConnected(false);
+      ws.onmessage = (event) => {
+        try {
+          const msg = JSON.parse(event.data) as LogMessage;
+          if (msg.topic !== "manager.log") {
+            return;
+          }
+          const entry = normalizeLogEntry(msg.payload);
+          if (entry) {
+            dispatchEntry(entry);
+          }
+        } catch {
+          return;
+        }
+      };
+    };
+
+    connect();
     return () => {
-      ws.close();
+      disposed = true;
+      if (reconnectTimer !== null) {
+        clearTimeout(reconnectTimer);
+      }
+      ws?.close();
     };
   }, [maxEntries]);
 
