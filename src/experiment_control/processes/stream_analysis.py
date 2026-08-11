@@ -17,6 +17,7 @@ import numpy as np
 import zmq
 
 from ..capabilities import capabilities_payload, method, param
+from ..contracts.messages import parse_chunk_sequence_range
 from ..shm.shm_ring import ShmRingReader, ShmRingWriter, now_mono_ns, now_wall_ns
 from ..utils.cli_args import (
     add_heartbeat_args,
@@ -259,9 +260,7 @@ class BinStatsState:
         if unique_count <= int(self.max_bin_count):
             sorted_items = sorted(grouped.values(), key=lambda item: item[0])
             centers = np.asarray([item[0] for item in sorted_items], dtype=np.float64)
-            counts = np.asarray(
-                [len(item[1]) for item in sorted_items], dtype=np.int64
-            )
+            counts = np.asarray([len(item[1]) for item in sorted_items], dtype=np.int64)
             sums = np.asarray(
                 [float(sum(item[1])) for item in sorted_items], dtype=np.float64
             )
@@ -287,7 +286,9 @@ class BinStatsState:
         span = max_use - min_use
         frac = np.clip((xs - min_use) / span, 0.0, 1.0)
         idx = np.minimum(np.floor(frac * active_bins).astype(np.int64), active_bins - 1)
-        self.counts = np.bincount(idx, minlength=active_bins).astype(np.int64, copy=False)
+        self.counts = np.bincount(idx, minlength=active_bins).astype(
+            np.int64, copy=False
+        )
         self.sums = np.bincount(idx, weights=ys, minlength=active_bins).astype(
             np.float64, copy=False
         )
@@ -305,7 +306,11 @@ class BinStatsState:
             self.auto_bins_dirty = False
         centers_arr = self.centers
         if centers_arr is None:
-            if self.counts.size > 0 and self.x_min is not None and self.x_max is not None:
+            if (
+                self.counts.size > 0
+                and self.x_min is not None
+                and self.x_max is not None
+            ):
                 edges = np.linspace(
                     float(self.x_min),
                     float(self.x_max),
@@ -321,7 +326,9 @@ class BinStatsState:
             counts_f = self.counts.astype(np.float64)
             with np.errstate(divide="ignore", invalid="ignore"):
                 mean = np.where(self.counts > 0, self.sums / counts_f, np.nan)
-                var = np.where(self.counts > 0, self.sums_sq / counts_f - mean * mean, np.nan)
+                var = np.where(
+                    self.counts > 0, self.sums_sq / counts_f - mean * mean, np.nan
+                )
                 var = np.where(var < 0, 0.0, var)
                 std = np.sqrt(var)
                 # SEM is undefined for n<=1 (a single sample has no
@@ -330,9 +337,7 @@ class BinStatsState:
                 # downstream consumers (UI error bars, fit weights).
                 # Return NaN so consumers can render "n/a" or skip the
                 # bin in weighted fits.
-                sem = np.where(
-                    self.counts > 1, std / np.sqrt(counts_f), np.nan
-                )
+                sem = np.where(self.counts > 1, std / np.sqrt(counts_f), np.nan)
         else:
             mean = np.zeros(0, dtype=np.float64)
             std = np.zeros(0, dtype=np.float64)
@@ -469,7 +474,9 @@ class Bin2DStatsState:
         return self.payload(last_sample=last_sample)
 
     @staticmethod
-    def _bin_index_runtime(value: float, lo: float | None, hi: float | None, bins: int) -> int | None:
+    def _bin_index_runtime(
+        value: float, lo: float | None, hi: float | None, bins: int
+    ) -> int | None:
         if not math.isfinite(value):
             return None
         if lo is None or hi is None:
@@ -503,7 +510,13 @@ class Bin2DStatsState:
             self.samples_y.append(float(y))
             self.samples_z.append(float(z))
             self.auto_bins_dirty = True
-            return {"x": float(x), "y": float(y), "z": float(z), "bin_x": None, "bin_y": None}
+            return {
+                "x": float(x),
+                "y": float(y),
+                "z": float(z),
+                "bin_x": None,
+                "bin_y": None,
+            }
 
         x_bins = int(self.counts.shape[0])
         y_bins = int(self.counts.shape[1])
@@ -517,7 +530,13 @@ class Bin2DStatsState:
         self.sums_sq[idx_x, idx_y] += float(z) * float(z)
         self.mins[idx_x, idx_y] = min(self.mins[idx_x, idx_y], float(z))
         self.maxs[idx_x, idx_y] = max(self.maxs[idx_x, idx_y], float(z))
-        return {"x": float(x), "y": float(y), "z": float(z), "bin_x": idx_x, "bin_y": idx_y}
+        return {
+            "x": float(x),
+            "y": float(y),
+            "z": float(z),
+            "bin_x": idx_x,
+            "bin_y": idx_y,
+        }
 
     def _range_from_samples(
         self,
@@ -589,7 +608,14 @@ class Bin2DStatsState:
             fixed_min=self.y_min,
             fixed_max=self.y_max,
         )
-        if x_bins <= 0 or y_bins <= 0 or x_min_use is None or x_max_use is None or y_min_use is None or y_max_use is None:
+        if (
+            x_bins <= 0
+            or y_bins <= 0
+            or x_min_use is None
+            or x_max_use is None
+            or y_min_use is None
+            or y_max_use is None
+        ):
             self.counts = np.zeros((0, 0), dtype=np.int64)
             self.sums = np.zeros((0, 0), dtype=np.float64)
             self.sums_sq = np.zeros((0, 0), dtype=np.float64)
@@ -611,8 +637,12 @@ class Bin2DStatsState:
             & (y_frac >= 0.0)
             & (y_frac <= 1.0)
         )
-        x_idx = np.minimum(np.floor(np.clip(x_frac, 0.0, 1.0) * x_bins).astype(np.int64), x_bins - 1)
-        y_idx = np.minimum(np.floor(np.clip(y_frac, 0.0, 1.0) * y_bins).astype(np.int64), y_bins - 1)
+        x_idx = np.minimum(
+            np.floor(np.clip(x_frac, 0.0, 1.0) * x_bins).astype(np.int64), x_bins - 1
+        )
+        y_idx = np.minimum(
+            np.floor(np.clip(y_frac, 0.0, 1.0) * y_bins).astype(np.int64), y_bins - 1
+        )
 
         counts = np.zeros((x_bins, y_bins), dtype=np.int64)
         sums = np.zeros((x_bins, y_bins), dtype=np.float64)
@@ -655,21 +685,41 @@ class Bin2DStatsState:
 
         x_bins = int(self.counts.shape[0])
         y_bins = int(self.counts.shape[1])
-        if x_bins > 0 and y_bins > 0 and self.x_min is not None and self.x_max is not None:
-            x_edges = np.linspace(float(self.x_min), float(self.x_max), x_bins + 1, dtype=np.float64)
+        if (
+            x_bins > 0
+            and y_bins > 0
+            and self.x_min is not None
+            and self.x_max is not None
+        ):
+            x_edges = np.linspace(
+                float(self.x_min), float(self.x_max), x_bins + 1, dtype=np.float64
+            )
             x_centers = (x_edges[:-1] + x_edges[1:]) * 0.5
         else:
             x_centers = np.zeros(0, dtype=np.float64)
-        if x_bins > 0 and y_bins > 0 and self.y_min is not None and self.y_max is not None:
-            y_edges = np.linspace(float(self.y_min), float(self.y_max), y_bins + 1, dtype=np.float64)
+        if (
+            x_bins > 0
+            and y_bins > 0
+            and self.y_min is not None
+            and self.y_max is not None
+        ):
+            y_edges = np.linspace(
+                float(self.y_min), float(self.y_max), y_bins + 1, dtype=np.float64
+            )
             y_centers = (y_edges[:-1] + y_edges[1:]) * 0.5
         else:
             y_centers = np.zeros(0, dtype=np.float64)
 
-        counts_f = self.counts.astype(np.float64, copy=False) if self.counts.size > 0 else np.zeros((0, 0), dtype=np.float64)
+        counts_f = (
+            self.counts.astype(np.float64, copy=False)
+            if self.counts.size > 0
+            else np.zeros((0, 0), dtype=np.float64)
+        )
         with np.errstate(divide="ignore", invalid="ignore"):
             mean = np.where(self.counts > 0, self.sums / counts_f, np.nan)
-            var = np.where(self.counts > 0, self.sums_sq / counts_f - mean * mean, np.nan)
+            var = np.where(
+                self.counts > 0, self.sums_sq / counts_f - mean * mean, np.nan
+            )
             var = np.where(var < 0, 0.0, var)
             std = np.sqrt(var)
             # SEM is undefined for n<=1 — see the 1D BinStatsState.payload
@@ -753,11 +803,12 @@ class TraceRollingMeanState:
         return self.sum_trace / float(denom)
 
 
-
 OPS: dict[str, OpSpec] = {
     "source.stream": OpSpec(input_types={}, output_type="trace", stateful=False),
     "source.records": OpSpec(input_types={}, output_type="record", stateful=False),
-    "source.context_field": OpSpec(input_types={}, output_type="scalar", stateful=False),
+    "source.context_field": OpSpec(
+        input_types={}, output_type="scalar", stateful=False
+    ),
     "source.telemetry_nearest": OpSpec(
         input_types={}, output_type="scalar", stateful=False
     ),
@@ -815,8 +866,12 @@ OPS: dict[str, OpSpec] = {
         output_type="trace",
         stateful=False,
     ),
-    "trace.crop": OpSpec(input_types={"trace": "trace"}, output_type="trace", stateful=False),
-    "trace.scale": OpSpec(input_types={"trace": "trace"}, output_type="trace", stateful=False),
+    "trace.crop": OpSpec(
+        input_types={"trace": "trace"}, output_type="trace", stateful=False
+    ),
+    "trace.scale": OpSpec(
+        input_types={"trace": "trace"}, output_type="trace", stateful=False
+    ),
     "trace.subtract_background": OpSpec(
         input_types={"trace": "trace"}, output_type="trace", stateful=False
     ),
@@ -977,11 +1032,21 @@ OP_PARAM_SCHEMAS: dict[str, list[Json]] = {
         {"name": "bin_count", "kind": "integer", "required": True},
     ],
     "aggregate.bin2d_stats": [
-        {"name": "x_auto_range", "kind": "boolean", "required": False, "default": False},
+        {
+            "name": "x_auto_range",
+            "kind": "boolean",
+            "required": False,
+            "default": False,
+        },
         {"name": "x_min", "kind": "number", "required": False},
         {"name": "x_max", "kind": "number", "required": False},
         {"name": "x_bin_count", "kind": "integer", "required": True},
-        {"name": "y_auto_range", "kind": "boolean", "required": False, "default": False},
+        {
+            "name": "y_auto_range",
+            "kind": "boolean",
+            "required": False,
+            "default": False,
+        },
         {"name": "y_min", "kind": "number", "required": False},
         {"name": "y_max", "kind": "number", "required": False},
         {"name": "y_bin_count", "kind": "integer", "required": True},
@@ -1213,7 +1278,9 @@ def execute_trace_scale(trace_raw: Any, params: Json) -> np.ndarray | None:
     return trace * factor
 
 
-def execute_trace_subtract_background(trace_raw: Any, params: Json) -> np.ndarray | None:
+def execute_trace_subtract_background(
+    trace_raw: Any, params: Json
+) -> np.ndarray | None:
     trace = _coerce_trace(trace_raw)
     if trace is None:
         return None
@@ -1330,7 +1397,9 @@ def _decimate_trace_minmax(points: np.ndarray, *, target_points: int) -> np.ndar
     return out[:out_count]
 
 
-def _decimate_trace(points: np.ndarray, *, method: str, target_points: int) -> np.ndarray:
+def _decimate_trace(
+    points: np.ndarray, *, method: str, target_points: int
+) -> np.ndarray:
     if method == "stride":
         return _decimate_trace_stride(points, target_points=target_points)
     if method == "mean":
@@ -1365,7 +1434,9 @@ def execute_trace_divide(a_raw: Any, b_raw: Any) -> np.ndarray | None:
     return out
 
 
-def execute_trace_scalar_math(trace_raw: Any, scalar_raw: Any, *, op: str) -> np.ndarray | None:
+def execute_trace_scalar_math(
+    trace_raw: Any, scalar_raw: Any, *, op: str
+) -> np.ndarray | None:
     trace = _coerce_trace(trace_raw)
     scalar = _normalize_float(scalar_raw)
     if trace is None or scalar is None:
@@ -1453,7 +1524,6 @@ def execute_scalar_threshold(
     return 1.0 if passed else 0.0
 
 
-
 def _node_signature(op: str) -> OpSpec:
     if op not in OPS:
         raise ValueError(f"unknown operator {op!r}")
@@ -1518,7 +1588,9 @@ def _normalize_node_legacy_op(*, op: str, params: Json) -> str:
     return op
 
 
-def _parse_workspace_root(config: Json) -> tuple[str, bool, list[NodeSpec], dict[str, NodeSpec]]:
+def _parse_workspace_root(
+    config: Json,
+) -> tuple[str, bool, list[NodeSpec], dict[str, NodeSpec]]:
     workspace_id = _normalize_id(config.get("workspace_id"))
     if workspace_id is None:
         raise ValueError("workspace_id is required")
@@ -1552,7 +1624,9 @@ def _compile_workspace_dependencies(
             dependencies.add(source_id)
         missing = [dep for dep in dependencies if dep not in nodes]
         if missing:
-            raise ValueError(f"node {node.node_id!r} references unknown inputs {missing}")
+            raise ValueError(
+                f"node {node.node_id!r} references unknown inputs {missing}"
+            )
         deps[node.node_id] = dependencies
     return deps
 
@@ -1646,7 +1720,9 @@ def _validate_source_stream_node(
     did = _normalize_id(node.params.get("device_id"))
     stream = _normalize_id(node.params.get("stream"))
     if did is None or stream is None:
-        raise ValueError(f"node {node.node_id!r} {node.op} requires device_id and stream")
+        raise ValueError(
+            f"node {node.node_id!r} {node.op} requires device_id and stream"
+        )
     _ = _parse_stream_source_mode(node.params.get("channel_mode"))
     _ = _parse_channel_indices(node.params.get("channel_indices"))
 
@@ -1660,7 +1736,9 @@ def _validate_source_records_node(
     did = _normalize_id(node.params.get("device_id"))
     stream = _normalize_id(node.params.get("stream"))
     if did is None or stream is None:
-        raise ValueError(f"node {node.node_id!r} {node.op} requires device_id and stream")
+        raise ValueError(
+            f"node {node.node_id!r} {node.op} requires device_id and stream"
+        )
 
 
 def _validate_source_context_field_node(node: NodeSpec) -> None:
@@ -1799,9 +1877,7 @@ def _validate_node_record_filter_eq(
 # The Protocol below documents the exact signature so the dict's value
 # type matches what's actually invoked at the call site (kwargs).
 class _NodeValidator(Protocol):
-    def __call__(
-        self, *, node: NodeSpec, source_stream_nodes: list[str]
-    ) -> None: ...
+    def __call__(self, *, node: NodeSpec, source_stream_nodes: list[str]) -> None: ...
 
 
 _NODE_OP_PARAM_VALIDATORS: dict[str, _NodeValidator] = {
@@ -1878,7 +1954,9 @@ def _compile_workspace_output_item(
         )
     kind = out_type.get(node_id)
     if kind is None:
-        raise ValueError(f"publish.outputs[{idx}].node_id has no output type {node_id!r}")
+        raise ValueError(
+            f"publish.outputs[{idx}].node_id has no output type {node_id!r}"
+        )
     if kind not in {"scalar", "hist_agg", "hist2d", "trace", "params_map", "fit_1d"}:
         raise ValueError(
             f"publish.outputs[{idx}].node_id type {kind!r} is not publishable in v1"
@@ -2584,7 +2662,9 @@ class StreamAnalysisProcess(ManagedProcessBase):
         existing = self._workspaces.get(workspace_id)
         current_revision = existing.revision if existing is not None else None
         if expected_revision is not None:
-            if current_revision is None or int(expected_revision) != int(current_revision):
+            if current_revision is None or int(expected_revision) != int(
+                current_revision
+            ):
                 raise WorkspaceRevisionConflict(
                     workspace_id=workspace_id,
                     expected_revision=int(expected_revision),
@@ -2623,7 +2703,9 @@ class StreamAnalysisProcess(ManagedProcessBase):
     def _allow_hist_outputs_for_workspace(
         self, workspace: WorkspaceRuntime, *, now_mono: float
     ) -> bool:
-        if not any(out.kind in {"hist_agg", "hist2d"} for out in workspace.compiled.outputs):
+        if not any(
+            out.kind in {"hist_agg", "hist2d"} for out in workspace.compiled.outputs
+        ):
             return False
         if self._hist_output_period_s <= 0:
             return True
@@ -2647,9 +2729,9 @@ class StreamAnalysisProcess(ManagedProcessBase):
         output_id = _normalize_id(payload.get("output_id"))
         if workspace_id is None or output_id is None:
             return
-        self._latest_output_payloads[self._snapshot_output_key(workspace_id, output_id)] = (
-            _sanitize_json(dict(payload))
-        )
+        self._latest_output_payloads[
+            self._snapshot_output_key(workspace_id, output_id)
+        ] = _sanitize_json(dict(payload))
 
     def _remember_latest_output_clean(self, payload: Json) -> None:
         """Snapshot-store a payload whose values are already JSON-clean.
@@ -2669,9 +2751,9 @@ class StreamAnalysisProcess(ManagedProcessBase):
         output_id = _normalize_id(payload.get("output_id"))
         if workspace_id is None or output_id is None:
             return
-        self._latest_output_payloads[self._snapshot_output_key(workspace_id, output_id)] = (
-            dict(payload)
-        )
+        self._latest_output_payloads[
+            self._snapshot_output_key(workspace_id, output_id)
+        ] = dict(payload)
 
     def _clear_workspace_snapshot_outputs(
         self, workspace_id: str, *, node_id: str | None = None
@@ -2743,7 +2825,9 @@ class StreamAnalysisProcess(ManagedProcessBase):
         return max(32, min(20000, int(parsed)))
 
     @staticmethod
-    def _decimate_snapshot_trace(values_raw: Any, *, max_points: int) -> list[float] | None:
+    def _decimate_snapshot_trace(
+        values_raw: Any, *, max_points: int
+    ) -> list[float] | None:
         trace = _coerce_trace(values_raw)
         if trace is None:
             return None
@@ -2766,12 +2850,19 @@ class StreamAnalysisProcess(ManagedProcessBase):
             raise KeyError(workspace_id)
 
         kinds_filter = self._normalize_snapshot_filter_set(params.get("kinds"))
-        output_ids_filter = self._normalize_snapshot_filter_set(params.get("output_ids"))
-        max_trace_points = self._snapshot_trace_max_points(params.get("max_trace_points"))
+        output_ids_filter = self._normalize_snapshot_filter_set(
+            params.get("output_ids")
+        )
+        max_trace_points = self._snapshot_trace_max_points(
+            params.get("max_trace_points")
+        )
 
         outputs: list[Json] = []
         for output in workspace.compiled.outputs:
-            if output_ids_filter is not None and output.output_id not in output_ids_filter:
+            if (
+                output_ids_filter is not None
+                and output.output_id not in output_ids_filter
+            ):
                 continue
             key = self._snapshot_output_key(workspace_id, output.output_id)
             cached = self._latest_output_payloads.get(key)
@@ -2789,7 +2880,9 @@ class StreamAnalysisProcess(ManagedProcessBase):
                 if values is None:
                     continue
                 original_len = (
-                    len(original_values) if isinstance(original_values, list) else len(values)
+                    len(original_values)
+                    if isinstance(original_values, list)
+                    else len(values)
                 )
                 item_raw["value"] = values
                 item_raw["point_count"] = int(len(values))
@@ -2870,10 +2963,9 @@ class StreamAnalysisProcess(ManagedProcessBase):
         expected_shape = (point_count,)
         writer = self._trace_writers.get(key)
         if writer is not None:
-            if (
-                tuple(int(x) for x in writer.layout.shape) == expected_shape
-                and writer.layout.dtype == np.dtype("float64")
-            ):
+            if tuple(
+                int(x) for x in writer.layout.shape
+            ) == expected_shape and writer.layout.dtype == np.dtype("float64"):
                 return writer
             self._drop_trace_writer(key)
 
@@ -2899,7 +2991,13 @@ class StreamAnalysisProcess(ManagedProcessBase):
             return None
         return device_id, stream, shm_name
 
-    def _ensure_reader(self, key: tuple[str, str], shm_name: str) -> ShmRingReader | None:
+    def _ensure_reader(
+        self,
+        key: tuple[str, str],
+        shm_name: str,
+        *,
+        initial_seq: int | None = None,
+    ) -> ShmRingReader | None:
         reader = self._readers.get(key)
         if reader is not None and reader.name == shm_name:
             return reader
@@ -2917,7 +3015,7 @@ class StreamAnalysisProcess(ManagedProcessBase):
             self._context_by_seq.pop(key, None)
             return None
         self._readers[key] = attached
-        self._last_seq[key] = 0
+        self._last_seq[key] = max(0, int(initial_seq or 1) - 1)
         self._stream_context.pop(key, None)
         self._context_by_seq.pop(key, None)
         return attached
@@ -3415,7 +3513,11 @@ class StreamAnalysisProcess(ManagedProcessBase):
         x_input = str(node.inputs.get("x") or "").strip()
         if x_input == SAMPLE_INDEX_INPUT_TOKEN:
             y_trace = _coerce_trace(y_raw)
-            x_raw = np.arange(int(y_trace.size), dtype=np.float64) if y_trace is not None else None
+            x_raw = (
+                np.arange(int(y_trace.size), dtype=np.float64)
+                if y_trace is not None
+                else None
+            )
         else:
             x_raw = values.get(node.inputs["x"])
         state = workspace.node_state.get(node_id)
@@ -3516,7 +3618,11 @@ class StreamAnalysisProcess(ManagedProcessBase):
             state = BinStatsState.from_params(node.params)
             workspace.node_state[node_id] = state
         gate_val = values.get(node.inputs["gate"]) if "gate" in node.inputs else None
-        last_sample = state.update_sample(x_val, y_val) if _gate_open(gate_val, default=True) else None
+        last_sample = (
+            state.update_sample(x_val, y_val)
+            if _gate_open(gate_val, default=True)
+            else None
+        )
         if not include_hist_outputs:
             return None
         return state.payload(last_sample=last_sample)
@@ -3643,7 +3749,9 @@ class StreamAnalysisProcess(ManagedProcessBase):
         return _sanitize_json(dict(raw_value)), None, False
 
     @staticmethod
-    def _normalize_workspace_map_output(raw_value: Any) -> tuple[Json, None, bool] | None:
+    def _normalize_workspace_map_output(
+        raw_value: Any,
+    ) -> tuple[Json, None, bool] | None:
         if not isinstance(raw_value, dict):
             return None
         return _sanitize_json(dict(raw_value)), None, False
@@ -3998,7 +4106,9 @@ class StreamAnalysisProcess(ManagedProcessBase):
                 continue
             t0_mono_ns = _normalize_int(event.get("t0_mono_ns"))
             t0_wall_ns = _normalize_int(event.get("t0_wall_ns"))
-            event_t_mono_s = float(t0_mono_ns) * 1e-9 if t0_mono_ns is not None else None
+            event_t_mono_s = (
+                float(t0_mono_ns) * 1e-9 if t0_mono_ns is not None else None
+            )
             is_last_event = event_index == (len(events) - 1)
             self._process_chunk_event_workspaces(
                 workspace_ids=workspace_ids,
@@ -4060,7 +4170,9 @@ class StreamAnalysisProcess(ManagedProcessBase):
                 current_context_fields,
             )
         next_context_fields = (
-            dict(event_context_fields) if isinstance(event_context_fields, dict) else None
+            dict(event_context_fields)
+            if isinstance(event_context_fields, dict)
+            else None
         )
         return (
             event_context_id,
@@ -4178,7 +4290,8 @@ class StreamAnalysisProcess(ManagedProcessBase):
         if current_context_fields is not None:
             current_context_fields = dict(current_context_fields)
 
-        latest_seq, current_context_id, current_context_fields = self._process_chunk_events(
+        latest_seq, current_context_id, current_context_fields = (
+            self._process_chunk_events(
             key=key,
             workspace_ids=workspace_ids,
             events=events,
@@ -4191,6 +4304,7 @@ class StreamAnalysisProcess(ManagedProcessBase):
             stream=stream,
             initial_latest_seq=last_seq,
         )
+        )
 
         self._store_chunk_stream_context(
             key=key,
@@ -4202,14 +4316,17 @@ class StreamAnalysisProcess(ManagedProcessBase):
     def _prepare_chunk_ready(
         self,
         msg: Json,
-    ) -> tuple[
+    ) -> (
+        tuple[
         str,
         str,
         tuple[str, str],
         set[str],
         ShmRingReader,
         int,
-    ] | None:
+        ]
+        | None
+    ):
         parsed = self._normalize_chunk_payload(msg)
         if parsed is None:
             return None
@@ -4218,8 +4335,26 @@ class StreamAnalysisProcess(ManagedProcessBase):
         workspace_ids = self._stream_to_workspaces.get(key)
         if not workspace_ids:
             return None
-        reader = self._ensure_reader(key, shm_name)
+        try:
+            seq_range = parse_chunk_sequence_range(msg)
+        except ValueError:
+            return None
+        msg_seq = None if seq_range is None else seq_range.final_seq
+        first_seq = None if seq_range is None else seq_range.first_seq
+        reader = self._ensure_reader(
+            key,
+            shm_name,
+            initial_seq=first_seq if first_seq is not None else msg_seq,
+        )
         if reader is None:
+            return None
+        try:
+            parse_chunk_sequence_range(
+                msg,
+                max_batch_count=reader.layout.slot_count,
+            )
+        except ValueError:
+            self._reset_chunk_reader_state(key=key, reader=reader)
             return None
         last_seq = int(self._last_seq.get(key, 0))
         return device_id, stream, key, workspace_ids, reader, last_seq
@@ -4230,18 +4365,21 @@ class StreamAnalysisProcess(ManagedProcessBase):
         msg: Json,
         key: tuple[str, str],
     ) -> tuple[int | None, int | None, dict[str, Any] | None]:
-        msg_seq = _normalize_int(msg.get("seq"))
+        seq_range = parse_chunk_sequence_range(msg)
+        msg_seq = None if seq_range is None else seq_range.final_seq
         context_id = _normalize_int(msg.get("context_id"))
         context_fields_raw = msg.get("context_fields")
         context_fields = (
             dict(context_fields_raw) if isinstance(context_fields_raw, dict) else None
         )
-        self._remember_context_for_seq(
-            key=key,
-            seq=msg_seq,
-            context_id=context_id,
-            context_fields=context_fields,
-        )
+        if seq_range is not None:
+            for seq in range(seq_range.first_seq, seq_range.final_seq + 1):
+                self._remember_context_for_seq(
+                    key=key,
+                    seq=seq,
+                    context_id=context_id,
+                    context_fields=context_fields,
+                )
         return msg_seq, context_id, context_fields
 
     def _load_chunk_events(
@@ -4298,7 +4436,9 @@ class StreamAnalysisProcess(ManagedProcessBase):
             return
         self._stream_context[key] = (
             int(current_context_id) if current_context_id is not None else None,
-            dict(current_context_fields) if isinstance(current_context_fields, dict) else None,
+            dict(current_context_fields)
+            if isinstance(current_context_fields, dict)
+            else None,
         )
 
     def _drain_sub(self) -> int:
@@ -4341,7 +4481,9 @@ class StreamAnalysisProcess(ManagedProcessBase):
                 continue
             workspace.node_state.pop(node_id, None)
 
-    def _reset_workspace_node_state(self, workspace: WorkspaceRuntime, node_id: str) -> bool:
+    def _reset_workspace_node_state(
+        self, workspace: WorkspaceRuntime, node_id: str
+    ) -> bool:
         state = workspace.node_state.get(node_id)
         if isinstance(state, BinStatsState):
             state.reset()
@@ -4372,12 +4514,17 @@ class StreamAnalysisProcess(ManagedProcessBase):
 
     def _handle_workspace_put(self, params: Json) -> Json:
         payload = (
-            params.get("workspace") if isinstance(params.get("workspace"), dict) else params
+            params.get("workspace")
+            if isinstance(params.get("workspace"), dict)
+            else params
         )
         if not isinstance(payload, dict):
             return {
                 "ok": False,
-                "error": {"code": "invalid_params", "message": "workspace payload must be object"},
+                "error": {
+                    "code": "invalid_params",
+                    "message": "workspace payload must be object",
+                },
             }
         expected_raw = params.get("expected_revision")
         expected_revision: int | None = None
@@ -4407,12 +4554,17 @@ class StreamAnalysisProcess(ManagedProcessBase):
 
     def _handle_workspace_validate(self, params: Json) -> Json:
         payload = (
-            params.get("workspace") if isinstance(params.get("workspace"), dict) else params
+            params.get("workspace")
+            if isinstance(params.get("workspace"), dict)
+            else params
         )
         if not isinstance(payload, dict):
             return {
                 "ok": False,
-                "error": {"code": "invalid_params", "message": "workspace payload must be object"},
+                "error": {
+                    "code": "invalid_params",
+                    "message": "workspace payload must be object",
+                },
             }
         compiled = compile_workspace_graph(dict(payload))
         return {
@@ -4438,9 +4590,19 @@ class StreamAnalysisProcess(ManagedProcessBase):
 
     def _stream_analysis_capability_members(self) -> list[Any]:
         members = [
-            method("stream_analysis.status", params=None, doc="Get stream-analysis runtime status."),
-            method("stream_analysis.operators", params=None, doc="List available DAG operators."),
-            method("stream_analysis.workspace.list", params=None, doc="List workspaces."),
+            method(
+                "stream_analysis.status",
+                params=None,
+                doc="Get stream-analysis runtime status.",
+            ),
+            method(
+                "stream_analysis.operators",
+                params=None,
+                doc="List available DAG operators.",
+            ),
+            method(
+                "stream_analysis.workspace.list", params=None, doc="List workspaces."
+            ),
             method(
                 "stream_analysis.workspace.get",
                 params=[
@@ -4456,10 +4618,27 @@ class StreamAnalysisProcess(ManagedProcessBase):
             method(
                 "stream_analysis.workspace.snapshot",
                 params=[
-                    param("workspace_id", required=True, default=None, annotation="str"),
-                    param("kinds", required=False, default=None, annotation="list[str]|str"),
-                    param("output_ids", required=False, default=None, annotation="list[str]|str"),
-                    param("max_trace_points", required=False, default=None, annotation="int"),
+                    param(
+                        "workspace_id", required=True, default=None, annotation="str"
+                    ),
+                    param(
+                        "kinds",
+                        required=False,
+                        default=None,
+                        annotation="list[str]|str",
+                    ),
+                    param(
+                        "output_ids",
+                        required=False,
+                        default=None,
+                        annotation="list[str]|str",
+                    ),
+                    param(
+                        "max_trace_points",
+                        required=False,
+                        default=None,
+                        annotation="int",
+                    ),
                 ],
                 doc="Get latest published outputs for a workspace (latest-state snapshot).",
             ),
@@ -4502,7 +4681,9 @@ class StreamAnalysisProcess(ManagedProcessBase):
             method(
                 "stream_analysis.workspace.reset",
                 params=[
-                    param("workspace_id", required=False, default=None, annotation="str"),
+                    param(
+                        "workspace_id", required=False, default=None, annotation="str"
+                    ),
                     param("node_id", required=False, default=None, annotation="str"),
                 ],
                 doc="Reset workspace state (aggregates). If workspace_id omitted, reset all workspaces; if node_id provided, reset only that node in the workspace.",
@@ -4535,7 +4716,9 @@ class StreamAnalysisProcess(ManagedProcessBase):
         return self._with_common_capabilities(members)
 
     def _rpc_stream_analysis_capabilities(self, req: Json) -> Json:
-        return self.rpc_ok(req, result=capabilities_payload(self._stream_analysis_capability_members()))
+        return self.rpc_ok(
+            req, result=capabilities_payload(self._stream_analysis_capability_members())
+        )
 
     def _rpc_stream_analysis_status(self, req: Json) -> Json:
         return self.rpc_ok(req, result=self._status_payload())
@@ -4595,7 +4778,9 @@ class StreamAnalysisProcess(ManagedProcessBase):
         if not result.get("ok"):
             return self.rpc_err(
                 req,
-                code=str((result.get("error") or {}).get("code") or "validation_failed"),
+                code=str(
+                    (result.get("error") or {}).get("code") or "validation_failed"
+                ),
                 message=(result.get("error") or {}).get("message"),
             )
         return self.rpc_ok(req, result=result.get("result"))
@@ -4653,7 +4838,9 @@ class StreamAnalysisProcess(ManagedProcessBase):
             for workspace_runtime in self._workspaces.values():
                 self._reset_workspace_states(workspace_runtime)
             self._latest_output_payloads.clear()
-            return self.rpc_ok(req, result={"reset": "all", "count": len(self._workspaces)})
+            return self.rpc_ok(
+                req, result={"reset": "all", "count": len(self._workspaces)}
+            )
         workspace = self._workspaces.get(workspace_id)
         if workspace is None:
             return self.rpc_err(req, code="unknown_workspace")

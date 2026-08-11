@@ -11,11 +11,64 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from experiment_control.schemas.stream import stream_calls_from_json, stream_calls_to_json
-from experiment_control.types import StreamCall, StreamField, StreamOut
+from experiment_control.schemas.stream import (
+    stream_calls_from_json,
+    stream_calls_to_json,
+)
+from experiment_control.types import StreamCall, StreamField, StreamMeta, StreamOut
 
 
 class StreamSchemaTests(unittest.TestCase):
+    def test_stream_meta_rejects_hdf_incompatible_names_and_dtypes(self) -> None:
+        for name in ("", "has space", "path/name", "1starts_with_digit", "naive-name"):
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                StreamMeta(name=name, dtype="float64")
+        for dtype in ("str", "U8", "datetime64[ns]", "timedelta64[ns]", "V8"):
+            with self.subTest(dtype=dtype), self.assertRaises(ValueError):
+                StreamMeta(name="valid_name", dtype=dtype)
+
+    def test_stream_meta_accepts_supported_fixed_size_scalars(self) -> None:
+        for dtype in ("bool", "uint64", "int32", "float64", "complex128", "S16"):
+            with self.subTest(dtype=dtype):
+                self.assertEqual(
+                    StreamMeta(name="valid_name", dtype=dtype).name, "valid_name"
+                )
+
+    def test_stream_metadata_round_trip(self) -> None:
+        raw = [
+            {
+                "method": "acquire",
+                "meta": [
+                    {
+                        "name": "hardware_frame_id",
+                        "dtype": "uint64",
+                        "units": None,
+                        "description": "Device frame counter",
+                    }
+                ],
+                "outputs": [{"stream": "trace", "dtype": "int16", "shape": [2]}],
+            }
+        ]
+        calls = stream_calls_from_json(raw)
+        self.assertEqual(calls[0].meta[0].name, "hardware_frame_id")
+        self.assertEqual(calls[0].meta[0].dtype, "uint64")
+        encoded = stream_calls_to_json(calls)
+        self.assertEqual(encoded[0]["meta"][0]["name"], "hardware_frame_id")
+
+    def test_stream_metadata_rejects_reserved_name(self) -> None:
+        with self.assertRaisesRegex(TypeError, "reserved"):
+            stream_calls_from_json(
+                [
+                    {
+                        "method": "acquire",
+                        "meta": [{"name": "seq", "dtype": "uint64"}],
+                        "outputs": [
+                            {"stream": "trace", "dtype": "int16", "shape": [2]}
+                        ],
+                    }
+                ]
+            )
+
     def test_stream_calls_parses_output_attrs(self) -> None:
         calls = stream_calls_from_json(
             [
@@ -113,7 +166,11 @@ class StreamSchemaTests(unittest.TestCase):
                             "ring_slots": 64,
                             "fields": [
                                 {"name": "sample_seq", "dtype": "uint64"},
-                                {"name": "frequency_hz", "dtype": "float64", "units": "Hz"},
+                                {
+                                    "name": "frequency_hz",
+                                    "dtype": "float64",
+                                    "units": "Hz",
+                                },
                             ],
                         }
                     ],
@@ -136,7 +193,9 @@ class StreamSchemaTests(unittest.TestCase):
                         kind="records",
                         fields=(
                             StreamField(name="sample_seq", dtype="uint64"),
-                            StreamField(name="frequency_hz", dtype="float64", units="Hz"),
+                            StreamField(
+                                name="frequency_hz", dtype="float64", units="Hz"
+                            ),
                         ),
                     )
                 ],
@@ -145,7 +204,10 @@ class StreamSchemaTests(unittest.TestCase):
         payload = stream_calls_to_json(calls)
         output = payload[0]["outputs"][0]
         self.assertEqual(output["kind"], "records")
-        self.assertEqual([field["name"] for field in output["fields"]], ["sample_seq", "frequency_hz"])
+        self.assertEqual(
+            [field["name"] for field in output["fields"]],
+            ["sample_seq", "frequency_hz"],
+        )
         self.assertNotIn("shape", output)
 
 

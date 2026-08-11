@@ -5,13 +5,27 @@ from typing import Any, Protocol
 
 import numpy as np
 
-from ..types import StreamCall, StreamOut
+from ..types import StreamCall, StreamMeta, StreamOut, StreamResult
 
 
 class _StreamPublisher(Protocol):
     _device: Any
 
-    def publish_stream(self, stream: str, arr: np.ndarray) -> dict[str, Any]: ...
+    def publish_stream(
+        self,
+        stream: str,
+        arr: np.ndarray,
+        *,
+        metadata: np.ndarray | np.void | None = None,
+    ) -> dict[str, Any]: ...
+
+    def publish_stream_batch(
+        self,
+        stream: str,
+        arr: np.ndarray,
+        *,
+        metadata: np.ndarray | None = None,
+    ) -> dict[str, Any]: ...
 
 
 def _ensure_shot_shape(arr: np.ndarray, out: StreamOut) -> np.ndarray:
@@ -111,6 +125,52 @@ def _resolve_stream_callable(runner: _StreamPublisher, stream_call: StreamCall) 
     return func
 
 
+def _unwrap_stream_result(ret: Any, stream_call: StreamCall) -> tuple[Any, dict[str, Any]]:
+    declared = list(stream_call.meta or [])
+    if not declared:
+        if isinstance(ret, StreamResult) and ret.meta:
+            raise ValueError("StreamResult metadata was returned but none is declared")
+        return (ret.data if isinstance(ret, StreamResult) else ret), {}
+    if not isinstance(ret, StreamResult):
+        raise TypeError("Stream call with declared metadata must return StreamResult")
+    expected = {item.name for item in declared}
+    actual = set(ret.meta)
+    if actual != expected:
+        missing = sorted(expected - actual)
+        extra = sorted(actual - expected)
+        raise ValueError(f"Stream metadata keys mismatch: missing={missing}, extra={extra}")
+    return ret.data, dict(ret.meta)
+
+
+def _metadata_array(
+    declared: list[StreamMeta],
+    values: dict[str, Any],
+    *,
+    count: int,
+) -> np.ndarray | None:
+    if not declared:
+        return None
+    dtype = np.dtype([(item.name, np.dtype(item.dtype)) for item in declared])
+    out = np.empty(count, dtype=dtype)
+    for item in declared:
+        value = np.asarray(values[item.name])
+        if value.shape == () and count == 1:
+            value = value.reshape(1)
+        if value.shape != (count,):
+            raise ValueError(
+                f"Stream metadata {item.name!r} shape mismatch: "
+                f"got {value.shape}, expected ({count},)"
+            )
+        expected_dtype = np.dtype(item.dtype)
+        if value.dtype != expected_dtype:
+            raise ValueError(
+                f"Stream metadata {item.name!r} dtype mismatch: "
+                f"got {value.dtype}, expected {expected_dtype}"
+            )
+        out[item.name] = value
+    return out
+
+
 def _invoke_stream_callable(
     *,
     func: Callable[..., Any],
@@ -143,6 +203,8 @@ def _publish_single_output(
     ret: Any,
     n_batch: int,
     n_batch_provided: bool,
+    metadata: dict[str, Any],
+    meta_schema: list[StreamMeta],
 ) -> list[dict[str, Any]]:
     shots = _as_shot_list(
         ret,
@@ -150,7 +212,16 @@ def _publish_single_output(
         n_batch=n_batch,
         allow_batch=n_batch_provided,
     )
-    return [runner.publish_stream(output.stream, shot) for shot in shots]
+    meta_arr = _metadata_array(meta_schema, metadata, count=len(shots))
+    if n_batch_provided:
+        batch = np.stack(shots, axis=0)
+        return [runner.publish_stream_batch(output.stream, batch, metadata=meta_arr)]
+    if meta_arr is None:
+        return [runner.publish_stream(output.stream, shot) for shot in shots]
+    return [
+        runner.publish_stream(output.stream, shot, metadata=meta_arr[idx])
+        for idx, shot in enumerate(shots)
+    ]
 
 
 def _collect_multi_output_shots(
@@ -187,12 +258,32 @@ def _publish_multi_output(
     outputs: list[StreamOut],
     shot_lists: dict[str, list[np.ndarray]],
     n_batch: int,
+    n_batch_provided: bool,
+    metadata: dict[str, Any],
+    meta_schema: list[StreamMeta],
 ) -> list[dict[str, Any]]:
+    meta_arr = _metadata_array(meta_schema, metadata, count=n_batch)
+    if n_batch_provided:
+        batch_descs: dict[str, Any] = {}
+        for out in outputs:
+            batch_descs[out.stream] = runner.publish_stream_batch(
+                out.stream,
+                np.stack(shot_lists[out.stream], axis=0),
+                metadata=meta_arr,
+            )
+        return [batch_descs]
     results: list[dict[str, Any]] = []
     for i in range(n_batch):
         descs: dict[str, Any] = {}
         for out in outputs:
-            descs[out.stream] = runner.publish_stream(out.stream, shot_lists[out.stream][i])
+            if meta_arr is None:
+                descs[out.stream] = runner.publish_stream(
+                    out.stream, shot_lists[out.stream][i]
+                )
+            else:
+                descs[out.stream] = runner.publish_stream(
+                    out.stream, shot_lists[out.stream][i], metadata=meta_arr[i]
+                )
         results.append(descs)
     return results
 
@@ -205,6 +296,15 @@ def build_stream_wrapper(
     outputs = list(stream_call.outputs or [])
 
     def _wrapper(*args: Any, **kwargs: Any) -> Any:
+        effective_kwargs = dict(stream_call.kwargs or {})
+        effective_kwargs.update(kwargs)
+        if "n_batch" in effective_kwargs:
+            requested_batch = int(effective_kwargs["n_batch"])
+            max_batch = min(out.ring_slots for out in outputs)
+            if requested_batch > max_batch:
+                raise ValueError(
+                    f"n_batch={requested_batch} exceeds stream ring capacity {max_batch}"
+                )
         func = _resolve_stream_callable(runner, stream_call)
         ret, n_batch, n_batch_provided = _invoke_stream_callable(
             func=func,
@@ -212,6 +312,8 @@ def build_stream_wrapper(
             args=args,
             kwargs=kwargs,
         )
+        ret, metadata = _unwrap_stream_result(ret, stream_call)
+        meta_schema = list(stream_call.meta or [])
         if len(outputs) == 1:
             return _publish_single_output(
                 runner=runner,
@@ -219,6 +321,8 @@ def build_stream_wrapper(
                 ret=ret,
                 n_batch=n_batch,
                 n_batch_provided=n_batch_provided,
+                metadata=metadata,
+                meta_schema=meta_schema,
             )
         shot_lists = _collect_multi_output_shots(
             outputs=outputs,
@@ -231,6 +335,9 @@ def build_stream_wrapper(
             outputs=outputs,
             shot_lists=shot_lists,
             n_batch=n_batch,
+            n_batch_provided=n_batch_provided,
+            metadata=metadata,
+            meta_schema=meta_schema,
         )
 
     return _wrapper

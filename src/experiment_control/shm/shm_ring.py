@@ -74,6 +74,10 @@ class ShmLayout:
     shape_len: int
     slot_table_offset: int
     payload_offset: int
+    metadata_dtype: np.dtype[Any] | None = None
+    metadata_nbytes: int = 0
+    metadata_dtype_str_len: int = 0
+    metadata_offset: int = 0
 
 
 class ShmRingWriter:
@@ -101,6 +105,7 @@ class ShmRingWriter:
         shape: tuple[int, ...],
         slot_count: int,
         layout_version: int = 1,
+        metadata_dtype: np.dtype[Any] | None = None,
     ) -> "ShmRingWriter":
         dtype_obj = np.dtype(dtype)
         if dtype_obj.hasobject:
@@ -109,10 +114,25 @@ class ShmRingWriter:
         dtype_bytes = _dtype_to_header_text(dtype_obj).encode("utf-8")
         shape_len = len(shape)
         dtype_str_len = len(dtype_bytes)
+        metadata_dtype_obj = None if metadata_dtype is None else np.dtype(metadata_dtype)
+        if metadata_dtype_obj is not None:
+            if metadata_dtype_obj.hasobject or metadata_dtype_obj.fields is None:
+                raise ValueError("SHM ring metadata dtype must be a structured fixed-size dtype")
+            if layout_version < 4:
+                raise ValueError("SHM ring metadata requires layout_version >= 4")
+            metadata_dtype_bytes = _dtype_to_header_text(metadata_dtype_obj).encode("utf-8")
+            metadata_nbytes = int(metadata_dtype_obj.itemsize)
+        else:
+            metadata_dtype_bytes = b""
+            metadata_nbytes = 0
+        metadata_dtype_str_len = len(metadata_dtype_bytes)
 
-        slot_table_offset = HEADER_SIZE + dtype_str_len + shape_len * 4
+        slot_table_offset = (
+            HEADER_SIZE + dtype_str_len + shape_len * 4 + metadata_dtype_str_len
+        )
         payload_offset = slot_table_offset + slot_count * SLOT_ENTRY_SIZE
-        total_bytes = payload_offset + slot_count * payload_nbytes
+        metadata_offset = payload_offset + slot_count * payload_nbytes
+        total_bytes = metadata_offset + slot_count * metadata_nbytes
 
         try:
             shm = shared_memory.SharedMemory(name=name, create=True, size=total_bytes)
@@ -160,13 +180,18 @@ class ShmRingWriter:
                 0,
                 0,
                 0,
-                0,
-                0,
+                int(metadata_dtype_str_len),
+                int(metadata_nbytes),
             )
         buf[HEADER_SIZE : HEADER_SIZE + dtype_str_len] = dtype_bytes
         shape_offset = HEADER_SIZE + dtype_str_len
         for i, dim in enumerate(shape):
             struct.pack_into("<i", buf, shape_offset + i * 4, int(dim))
+        metadata_dtype_offset = shape_offset + shape_len * 4
+        if metadata_dtype_bytes:
+            buf[
+                metadata_dtype_offset : metadata_dtype_offset + metadata_dtype_str_len
+            ] = metadata_dtype_bytes
 
         layout = ShmLayout(
             dtype=dtype_obj,
@@ -178,6 +203,10 @@ class ShmRingWriter:
             shape_len=int(shape_len),
             slot_table_offset=int(slot_table_offset),
             payload_offset=int(payload_offset),
+            metadata_dtype=metadata_dtype_obj,
+            metadata_nbytes=metadata_nbytes,
+            metadata_dtype_str_len=metadata_dtype_str_len,
+            metadata_offset=int(metadata_offset),
         )
         return cls(shm, layout=layout)
 
@@ -187,6 +216,7 @@ class ShmRingWriter:
         *,
         t0_mono_ns: int,
         t0_wall_ns: int,
+        metadata: np.ndarray | np.void | None = None,
     ) -> int:
         if arr.dtype != self._layout.dtype:
             raise ValueError(
@@ -196,6 +226,20 @@ class ShmRingWriter:
             raise ValueError(
                 f"shape mismatch: got {arr.shape}, expected {self._layout.shape}"
             )
+        metadata_dtype = self._layout.metadata_dtype
+        if metadata_dtype is None:
+            if metadata is not None:
+                raise ValueError("metadata provided for a ring without a metadata schema")
+        else:
+            if metadata is None:
+                raise ValueError("metadata required by the SHM ring schema")
+            metadata_arr = np.asarray(metadata)
+            if metadata_arr.dtype != metadata_dtype or metadata_arr.shape != ():
+                raise ValueError(
+                    "metadata mismatch: "
+                    f"got dtype={metadata_arr.dtype}, shape={metadata_arr.shape}; "
+                    f"expected dtype={metadata_dtype}, shape=()"
+                )
 
         slot = self._next_slot
         seq = self._next_seq + 1
@@ -213,6 +257,17 @@ class ShmRingWriter:
             offset=payload_start,
         )
         np.copyto(payload_view, arr, casting="no")
+        if metadata_dtype is not None:
+            metadata_start = (
+                self._layout.metadata_offset + slot * self._layout.metadata_nbytes
+            )
+            metadata_view = np.ndarray(
+                shape=(),
+                dtype=metadata_dtype,
+                buffer=self._buf,
+                offset=metadata_start,
+            )
+            np.copyto(metadata_view, metadata_arr, casting="no")
 
         SLOT_STRUCT.pack_into(
             self._buf,
@@ -235,6 +290,56 @@ class ShmRingWriter:
         self._next_seq = int(seq)
         self._next_slot = (slot + 1) % self._layout.slot_count
         return seq
+
+    def write_batch(
+        self,
+        arr: np.ndarray,
+        *,
+        t0_mono_ns: list[int] | np.ndarray,
+        t0_wall_ns: list[int] | np.ndarray,
+        metadata: np.ndarray | None = None,
+    ) -> tuple[int, int]:
+        """Write multiple logical frames and return their inclusive seq range."""
+        batch = np.asarray(arr)
+        if batch.ndim < 1:
+            raise ValueError("batched stream payload must have a leading batch axis")
+        expected_shape = (batch.shape[0],) + self._layout.shape
+        if tuple(batch.shape) != tuple(expected_shape):
+            raise ValueError(
+                f"batched shape mismatch: got {batch.shape}, expected (n, {self._layout.shape})"
+            )
+        if batch.dtype != self._layout.dtype:
+            raise ValueError(
+                f"dtype mismatch: got {batch.dtype}, expected {self._layout.dtype}"
+            )
+        count = int(batch.shape[0])
+        if count < 1 or count > self._layout.slot_count:
+            raise ValueError("batch size must be between 1 and the ring slot count")
+        mono = np.asarray(t0_mono_ns, dtype=np.uint64)
+        wall = np.asarray(t0_wall_ns, dtype=np.uint64)
+        if mono.shape != (count,) or wall.shape != (count,):
+            raise ValueError("batch timestamps must contain one value per frame")
+        if self._layout.metadata_dtype is None:
+            if metadata is not None:
+                raise ValueError("metadata provided for a ring without a metadata schema")
+        else:
+            if metadata is None:
+                raise ValueError("metadata required by the SHM ring schema")
+            if metadata.dtype != self._layout.metadata_dtype or metadata.shape != (count,):
+                raise ValueError("batch metadata must match the ring schema and batch size")
+
+        first_seq = 0
+        last_seq = 0
+        for idx in range(count):
+            last_seq = self.write(
+                np.asarray(batch[idx]),
+                t0_mono_ns=int(mono[idx]),
+                t0_wall_ns=int(wall[idx]),
+                metadata=None if metadata is None else metadata[idx],
+            )
+            if idx == 0:
+                first_seq = last_seq
+        return first_seq, last_seq
 
     def close(self) -> None:
         self._shm.close()
@@ -277,8 +382,30 @@ class ShmRingReader:
             for i in range(int(shape_len))
         )
 
-        slot_table_offset = HEADER_SIZE + int(dtype_len) + int(shape_len) * 4
+        metadata_dtype: np.dtype[Any] | None = None
+        metadata_dtype_len = 0
+        metadata_nbytes = 0
+        if int(layout_version) >= 4:
+            header_v2 = HEADER_STRUCT_V2.unpack_from(buf, 0)
+            metadata_dtype_len = int(header_v2[-2])
+            metadata_nbytes = int(header_v2[-1])
+            metadata_dtype_offset = shape_offset + int(shape_len) * 4
+            metadata_dtype_end = metadata_dtype_offset + metadata_dtype_len
+            metadata_dtype_text = bytes(
+                buf[metadata_dtype_offset:metadata_dtype_end]
+            ).decode("utf-8")
+            metadata_dtype = _dtype_from_header_text(metadata_dtype_text)
+            if metadata_dtype.itemsize != metadata_nbytes:
+                raise ValueError(f"Invalid SHM metadata layout for {name!r}")
+
+        slot_table_offset = (
+            HEADER_SIZE
+            + int(dtype_len)
+            + int(shape_len) * 4
+            + metadata_dtype_len
+        )
         payload_offset = slot_table_offset + int(slot_count) * SLOT_ENTRY_SIZE
+        metadata_offset = payload_offset + int(slot_count) * int(payload_nbytes)
 
         layout = ShmLayout(
             dtype=_dtype_from_header_text(dtype_str),
@@ -290,6 +417,10 @@ class ShmRingReader:
             shape_len=int(shape_len),
             slot_table_offset=int(slot_table_offset),
             payload_offset=int(payload_offset),
+            metadata_dtype=metadata_dtype,
+            metadata_nbytes=metadata_nbytes,
+            metadata_dtype_str_len=metadata_dtype_len,
+            metadata_offset=int(metadata_offset),
         )
         return cls(shm, layout=layout)
 
@@ -320,6 +451,13 @@ class ShmRingReader:
         payload_start = self._layout.payload_offset + slot * self._layout.payload_nbytes
         payload_end = payload_start + self._layout.payload_nbytes
         payload = bytes(self._buf[payload_start:payload_end])
+        metadata_payload: bytes | None = None
+        if self._layout.metadata_dtype is not None:
+            metadata_start = (
+                self._layout.metadata_offset + slot * self._layout.metadata_nbytes
+            )
+            metadata_end = metadata_start + self._layout.metadata_nbytes
+            metadata_payload = bytes(self._buf[metadata_start:metadata_end])
 
         seq_begin_after = struct.unpack_from("<Q", self._buf, slot_offset)[0]
         seq_end_after = struct.unpack_from(
@@ -331,12 +469,15 @@ class ShmRingReader:
             or seq_begin_after != seq_end_after
         ):
             return None
-        return {
+        event = {
             "seq": int(expected_seq),
             "t0_mono_ns": int(t0_mono_ns),
             "t0_wall_ns": int(t0_wall_ns),
             "payload": payload,
         }
+        if metadata_payload is not None:
+            event["metadata"] = metadata_payload
+        return event
 
     def read_event(self, seq_target: int) -> dict[str, Any] | None:
         def try_slot(slot: int) -> dict[str, Any] | None:

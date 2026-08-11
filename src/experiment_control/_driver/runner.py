@@ -191,6 +191,7 @@ class DeviceRunner:
 
         self._stream_writers: dict[str, ShmRingWriter] = {}
         self._stream_outputs: dict[str, StreamOut] = {}
+        self._stream_meta_dtypes: dict[str, np.dtype[Any]] = {}
         self._stream_rpc: dict[str, Callable[..., Any]] = {}
         self._scheduled_stream_calls: list[_ScheduledStreamCallPlan] = []
         self._stream_shm_names: dict[str, str] = {}
@@ -1199,10 +1200,17 @@ class DeviceRunner:
 
     def _init_stream_schema(self) -> None:
         for call in self._stream_calls:
+            meta_dtype = (
+                np.dtype([(item.name, np.dtype(item.dtype)) for item in call.meta or []])
+                if call.meta
+                else None
+            )
             for out in call.outputs or []:
                 if out.stream in self._stream_outputs:
                     raise ValueError(f"Duplicate stream {out.stream!r}")
                 self._stream_outputs[out.stream] = out
+                if meta_dtype is not None:
+                    self._stream_meta_dtypes[out.stream] = meta_dtype
 
     def _init_stream_wrappers(self) -> None:
         for call in self._stream_calls:
@@ -1341,7 +1349,12 @@ class DeviceRunner:
                 dtype=out.numpy_dtype(),
                 shape=tuple(out.shape),
                 slot_count=out.ring_slots,
-                layout_version=3 if out.kind == "records" else 1,
+                layout_version=(
+                    4
+                    if stream in self._stream_meta_dtypes
+                    else (3 if out.kind == "records" else 1)
+                ),
+                metadata_dtype=self._stream_meta_dtypes.get(stream),
             )
             self._stream_writers[stream] = writer
             self._stream_shm_names[stream] = shm_name
@@ -1362,6 +1375,7 @@ class DeviceRunner:
         *,
         t0_mono_ns: int | None = None,
         t0_wall_ns: int | None = None,
+        metadata: np.ndarray | np.void | None = None,
     ) -> dict[str, Any]:
         if stream not in self._stream_outputs:
             raise ValueError(f"Unknown stream {stream!r}")
@@ -1385,7 +1399,19 @@ class DeviceRunner:
         writer = self._stream_writers[stream]
         t0_mono = int(t0_mono_ns or now_mono_ns())
         t0_wall = int(t0_wall_ns or now_wall_ns())
-        seq = writer.write(arr, t0_mono_ns=t0_mono, t0_wall_ns=t0_wall)
+        if metadata is None:
+            seq = writer.write(
+                arr,
+                t0_mono_ns=t0_mono,
+                t0_wall_ns=t0_wall,
+            )
+        else:
+            seq = writer.write(
+                arr,
+                t0_mono_ns=t0_mono,
+                t0_wall_ns=t0_wall,
+                metadata=metadata,
+            )
         self._stream_last_published_seq[stream] = int(seq)
         desc: dict[str, Any] = {
             "device_id": self.device_id,
@@ -1408,6 +1434,76 @@ class DeviceRunner:
         topic = f"{self.device_id}/chunk_ready".encode()
         payload = {
             "version": 1,
+            "device_id": self.device_id,
+            "stream": stream,
+            "descriptor": desc,
+        }
+        self.pub.send_multipart([topic, json.dumps(payload).encode()])
+        return desc
+
+    def publish_stream_batch(
+        self,
+        stream: str,
+        arr: np.ndarray,
+        *,
+        metadata: np.ndarray | None = None,
+    ) -> dict[str, Any]:
+        if stream not in self._stream_outputs:
+            raise ValueError(f"Unknown stream {stream!r}")
+        out = self._stream_outputs[stream]
+        batch = np.asarray(arr)
+        expected_dtype = out.numpy_dtype()
+        expected_tail = tuple(out.shape)
+        if batch.dtype != expected_dtype:
+            raise ValueError(
+                f"Stream {stream!r} dtype mismatch: got {batch.dtype}, expected {expected_dtype}"
+            )
+        if batch.ndim < 1 or tuple(batch.shape[1:]) != expected_tail:
+            raise ValueError(
+                f"Stream {stream!r} batch shape mismatch: got {batch.shape}, "
+                f"expected (n, {expected_tail})"
+            )
+        count = int(batch.shape[0])
+        if count < 1 or count > out.ring_slots:
+            raise ValueError(
+                f"Stream {stream!r} batch size must be between 1 and {out.ring_slots}"
+            )
+
+        self._ensure_stream_publishers()
+        writer = self._stream_writers[stream]
+        mono = np.asarray([now_mono_ns() for _ in range(count)], dtype=np.uint64)
+        wall = np.asarray([now_wall_ns() for _ in range(count)], dtype=np.uint64)
+        first_seq, last_seq = writer.write_batch(
+            batch,
+            t0_mono_ns=mono,
+            t0_wall_ns=wall,
+            metadata=metadata,
+        )
+        self._stream_last_published_seq[stream] = int(last_seq)
+        desc: dict[str, Any] = {
+            "version": 2,
+            "device_id": self.device_id,
+            "stream": stream,
+            "stream_kind": out.kind,
+            "shm_name": self._stream_shm_names[stream],
+            "layout_version": writer.layout.layout_version,
+            "first_seq": int(first_seq),
+            "seq": int(last_seq),
+            "batch_count": count,
+            "t0_mono_ns": int(mono[-1]),
+            "t0_wall_ns": int(wall[-1]),
+        }
+        context = self._stream_context.get(stream)
+        if context:
+            if "context_id" in context:
+                desc["context_id"] = int(context["context_id"])
+            fields = context.get("context_fields")
+            if isinstance(fields, dict):
+                desc["context_fields"] = fields
+
+        topic = f"{self.device_id}/chunk_ready".encode()
+        payload = {
+            "version": 2,
             "device_id": self.device_id,
             "stream": stream,
             "descriptor": desc,

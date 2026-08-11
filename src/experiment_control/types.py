@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import enum
+import re
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -107,7 +108,9 @@ class StreamOut:
             _ = np.dtype(dtype_text)
             shape = tuple(int(x) for x in self.shape)
             if not shape or any(x <= 0 for x in shape):
-                raise ValueError("Frame StreamOut.shape must be a non-empty positive tuple.")
+                raise ValueError(
+                    "Frame StreamOut.shape must be a non-empty positive tuple."
+                )
             object.__setattr__(self, "dtype", dtype_text)
             object.__setattr__(self, "shape", shape)
             object.__setattr__(self, "fields", ())
@@ -141,6 +144,35 @@ class StreamMeta:
     units: str | None = None
     description: str | None = None
 
+    def __post_init__(self) -> None:
+        name = str(self.name).strip()
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) is None:
+            raise ValueError(
+                "StreamMeta.name must be an ASCII identifier ([A-Za-z_][A-Za-z0-9_]*)."
+            )
+        dtype = np.dtype(str(self.dtype).strip())
+        if (
+            dtype.hasobject
+            or dtype.subdtype is not None
+            or dtype.fields is not None
+            or dtype.itemsize <= 0
+            or dtype.kind not in {"b", "i", "u", "f", "c", "S"}
+        ):
+            raise ValueError(
+                "StreamMeta.dtype must be a fixed-size HDF-compatible scalar "
+                "bool, integer, float, complex, or byte-string dtype."
+            )
+        object.__setattr__(self, "name", name)
+        object.__setattr__(self, "dtype", str(dtype))
+
+
+@dataclass(frozen=True, slots=True)
+class StreamResult:
+    """Stream payload plus scalar metadata aligned to each logical frame."""
+
+    data: Any
+    meta: dict[str, Any] = field(default_factory=dict)
+
 
 @dataclass(frozen=True, slots=True)
 class StreamCall:
@@ -157,6 +189,14 @@ class StreamCall:
             raise ValueError("StreamCall.outputs must be provided (no default).")
         if self.meta is None:
             object.__setattr__(self, "meta", [])
+        names: set[str] = set()
+        reserved = {"data", "seq", "t0_mono_ns", "t0_wall_ns", "context_id"}
+        for item in self.meta or []:
+            if item.name in reserved:
+                raise ValueError(f"Stream metadata name {item.name!r} is reserved.")
+            if item.name in names:
+                raise ValueError(f"Duplicate stream metadata name {item.name!r}.")
+            names.add(item.name)
         if self.period_s is not None:
             period = float(self.period_s)
             if period <= 0:

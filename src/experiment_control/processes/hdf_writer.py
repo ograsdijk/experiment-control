@@ -18,7 +18,11 @@ import numpy as np
 import zmq
 
 from ..capabilities import capabilities_payload, method, param
-from ..contracts.messages import ChunkReadyMessage, RpcActionRequest
+from ..contracts.messages import (
+    ChunkReadyMessage,
+    RpcActionRequest,
+    parse_chunk_sequence_range,
+)
 from ..schemas.measurement import (
     MeasurementSchema,
     measurement_schema_from_json,
@@ -27,7 +31,7 @@ from ..schemas.measurement import (
     normalize_measurement_values,
 )
 from ..shm.shm_ring import ShmRingReader
-from ..types import MemberSpec
+from ..types import MemberSpec, StreamMeta
 from ..utils.cli_args import (
     add_heartbeat_args,
     add_manager_args,
@@ -73,6 +77,20 @@ EventLogMode = Literal["all", "failures_only", "none"]
 EVENT_LOG_MODES: tuple[EventLogMode, ...] = ("all", "failures_only", "none")
 
 
+def _validated_frame_metadata_dtype(raw: Any) -> np.dtype[Any]:
+    dtype = np.dtype(raw)
+    if dtype.fields is None or not dtype.names or dtype.hasobject:
+        raise ValueError("frame metadata must use a fixed-size structured dtype")
+    if dtype.isalignedstruct:
+        raise ValueError("frame metadata dtype must be packed, not aligned")
+    reserved = {"data", "seq", "t0_mono_ns", "t0_wall_ns", "context_id"}
+    for name in dtype.names:
+        if name in reserved:
+            raise ValueError(f"frame metadata name {name!r} is reserved")
+        StreamMeta(name=name, dtype=str(dtype[name]))
+    return dtype
+
+
 @dataclass(frozen=True)
 class _OptionalDeviceActionResult:
     ok: bool
@@ -98,9 +116,6 @@ _STREAM_COUNTER_ATTRS: tuple[str, ...] = (
 
 def _default_filename() -> str:
     return time.strftime("%Y_%m_%d-%H_%M_%S.h5", time.localtime())
-
-
-
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -293,7 +308,9 @@ def _ingest_schema(
                 "units": units,
             }
 
-            can_write = True if write_enabled is None else bool(write_enabled(device_id))
+            can_write = (
+                True if write_enabled is None else bool(write_enabled(device_id))
+            )
             if can_write and device_id not in datasets and signals:
                 datasets[device_id] = _create_device_dataset(
                     telemetry_group,
@@ -447,7 +464,9 @@ class HdfWriter(ManagedProcessBase):
         # state can present processes distinctly from devices.
         self._disabled_processes = self._normalize_device_ids(disabled_processes or [])
         self._known_process_ids: set[str] = set()
-        self._measurement_schema_path = self._normalize_schema_path(measurement_schema_path)
+        self._measurement_schema_path = self._normalize_schema_path(
+            measurement_schema_path
+        )
         self._autostart_writing = self._normalize_autostart_writing(
             autostart_writing,
             schema_configured=self._measurement_schema_path is not None,
@@ -535,7 +554,9 @@ class HdfWriter(ManagedProcessBase):
         self._pending_stream_metadata: dict[tuple[str, str], dict[str, Any]] = {}
         self._stream_sessions: dict[tuple[str, str], int] = {}
         self._stream_active_session: dict[tuple[str, str], int] = {}
-        self._stream_context_by_seq: dict[tuple[str, str], dict[int, tuple[int, float]]] = {}
+        self._stream_context_by_seq: dict[
+            tuple[str, str], dict[int, tuple[int, float]]
+        ] = {}
         self._stream_pending_by_seq: dict[tuple[str, str], dict[int, Json]] = {}
         self._stream_last_written_seq: dict[tuple[str, str], int] = {}
         self._stream_expectations: dict[tuple[str, str], dict[str, Any]] = {}
@@ -981,9 +1002,7 @@ class HdfWriter(ManagedProcessBase):
         return out
 
     @classmethod
-    def _normalize_stream_metadata_dict(
-        cls, raw: Any
-    ) -> dict[str, dict[str, Any]]:
+    def _normalize_stream_metadata_dict(cls, raw: Any) -> dict[str, dict[str, Any]]:
         if not isinstance(raw, dict):
             return {}
         out: dict[str, dict[str, Any]] = {}
@@ -1425,7 +1444,9 @@ class HdfWriter(ManagedProcessBase):
         except Exception:
             self._measurement_schema_version = 1
         try:
-            self._measurement_started_wall_ns = int(group.attrs.get("started_wall_ns", 0))
+            self._measurement_started_wall_ns = int(
+                group.attrs.get("started_wall_ns", 0)
+            )
         except Exception:
             self._measurement_started_wall_ns = None
         ended_raw = group.attrs.get("ended_wall_ns", None)
@@ -1511,9 +1532,7 @@ class HdfWriter(ManagedProcessBase):
                 try:
                     self._dispatch_bg_request(req)
                 except Exception as exc:
-                    self._record_exception(
-                        exc, phase=f"bg.{type(req).__name__}"
-                    )
+                    self._record_exception(exc, phase=f"bg.{type(req).__name__}")
                     self._bump_error(f"bg.{type(req).__name__}.failed")
                     if isinstance(req, _BgRequest):
                         try:
@@ -1529,9 +1548,7 @@ class HdfWriter(ManagedProcessBase):
             self._bg_thread_dead = True
             self._stop_evt.set()
 
-    def _dispatch_bg_request(
-        self, req: "_FlushBatch | _BgRequest"
-    ) -> None:
+    def _dispatch_bg_request(self, req: "_FlushBatch | _BgRequest") -> None:
         if isinstance(req, _FlushBatch):
             self._handle_flush_batch(req)
             return
@@ -1681,7 +1698,9 @@ class HdfWriter(ManagedProcessBase):
         thread = self._bg_thread
         if thread is None or not thread.is_alive() or self._stop_evt.is_set():
             return
-        budget = self._bg_join_timeout_s * 10 if timeout_s is None else max(0.0, timeout_s)
+        budget = (
+            self._bg_join_timeout_s * 10 if timeout_s is None else max(0.0, timeout_s)
+        )
         deadline = time.monotonic() + budget
         # Push the current reservoir; retry briefly if the queue is momentarily
         # full (the bg thread is actively draining it).
@@ -1852,6 +1871,8 @@ class HdfWriter(ManagedProcessBase):
             stream_meta[key] = {
                 "dtype": schema.get("dtype"),
                 "shape": schema.get("shape"),
+                "metadata_dtype": schema.get("metadata_dtype"),
+                "metadata_fields": schema.get("metadata_fields", []),
                 "session": int(self._stream_active_session.get(key, 1)),
             }
 
@@ -2172,9 +2193,7 @@ class HdfWriter(ManagedProcessBase):
         self._context_evicted_pending_overflow = int(
             state["context_evicted_pending_overflow"]
         )
-        self._context_evicted_map_overflow = int(
-            state["context_evicted_map_overflow"]
-        )
+        self._context_evicted_map_overflow = int(state["context_evicted_map_overflow"])
         self._pending = int(state["pending"])
         self._last_flush = float(state["last_flush"])
         self._next_write = float(state["next_write"])
@@ -2350,9 +2369,7 @@ class HdfWriter(ManagedProcessBase):
             self._h5.attrs["acquisition_ok"] = bool(self._acquisition_ok)
             self._h5.attrs["hdf_strict_stream_errors_json"] = errors_json
         if self._measurement_group is not None:
-            self._measurement_group.attrs["acquisition_ok"] = bool(
-                self._acquisition_ok
-            )
+            self._measurement_group.attrs["acquisition_ok"] = bool(self._acquisition_ok)
             self._measurement_group.attrs["hdf_strict_stream_errors_json"] = errors_json
 
     def _record_strict_stream_error(
@@ -2403,9 +2420,7 @@ class HdfWriter(ManagedProcessBase):
             gaps = int(counters.get("seq_gap_total", 0) or 0)
             attach_failures = int(counters.get("attach_failures_total", 0) or 0)
             drain_failures = int(counters.get("drain_failures_total", 0) or 0)
-            payload_failures = int(
-                counters.get("payload_size_failures_total", 0) or 0
-            )
+            payload_failures = int(counters.get("payload_size_failures_total", 0) or 0)
             write_failures = int(counters.get("write_failures_total", 0) or 0)
             expected = int(expectation.get("expected_count", -1))
             if seen <= 0:
@@ -2488,7 +2503,9 @@ class HdfWriter(ManagedProcessBase):
         h5.attrs["dropped_local_messages_total"] = 0
         h5.attrs["dropped_event_messages_total"] = 0
         h5.attrs["disabled_devices_json"] = json.dumps(sorted(self._disabled_devices))
-        h5.attrs["disabled_processes_json"] = json.dumps(sorted(self._disabled_processes))
+        h5.attrs["disabled_processes_json"] = json.dumps(
+            sorted(self._disabled_processes)
+        )
 
         self._telemetry_group = h5.require_group("telemetry")
         self._process_telemetry_group = h5.require_group("process_telemetry")
@@ -2563,7 +2580,9 @@ class HdfWriter(ManagedProcessBase):
 
             configs: list[Json] = []
             if self._latest_device_config:
-                configs = [copy.deepcopy(v) for v in self._latest_device_config.values()]
+                configs = [
+                    copy.deepcopy(v) for v in self._latest_device_config.values()
+                ]
             else:
                 fetched = self._fetch_config_with_backoff(timeout_s=5.0)
                 if fetched is not None:
@@ -2583,7 +2602,14 @@ class HdfWriter(ManagedProcessBase):
         self._next_write = now + write_every_s
 
     def _clear_stream_buffer(self, buf: dict[str, list[Any]]) -> None:
-        for key in ("data", "seq", "t0_mono_ns", "t0_wall_ns", "context_id"):
+        for key in (
+            "data",
+            "seq",
+            "t0_mono_ns",
+            "t0_wall_ns",
+            "context_id",
+            "frame_metadata",
+        ):
             values = buf.get(key)
             if isinstance(values, list):
                 values.clear()
@@ -3284,7 +3310,9 @@ class HdfWriter(ManagedProcessBase):
         if self._telemetry_group is None:
             return False
         if self._mono_cache_active(
-            self._telemetry_schema_absent, device_id, self._telemetry_schema_absent_ttl_s
+            self._telemetry_schema_absent,
+            device_id,
+            self._telemetry_schema_absent_ttl_s,
         ):
             return False
         if self._mono_cache_active(
@@ -3369,7 +3397,9 @@ class HdfWriter(ManagedProcessBase):
             if device_id not in self._datasets:
                 self._telemetry_batch_buffers.pop(device_id, None)
 
-    def _ensure_event_batch_buffer(self, *, dtype: np.dtype[Any]) -> np.ndarray[Any, Any]:
+    def _ensure_event_batch_buffer(
+        self, *, dtype: np.dtype[Any]
+    ) -> np.ndarray[Any, Any]:
         batch = self._event_batch_buffer
         if (
             batch is None
@@ -3604,7 +3634,9 @@ class HdfWriter(ManagedProcessBase):
             method(
                 "hdf.streams.expect",
                 params=[
-                    param("streams", required=True, default=None, annotation="list[dict]"),
+                    param(
+                        "streams", required=True, default=None, annotation="list[dict]"
+                    ),
                     param("context_id", required=False, default=None, annotation="int"),
                     param("strict", required=False, default=True, annotation="bool"),
                 ],
@@ -3613,7 +3645,9 @@ class HdfWriter(ManagedProcessBase):
             method(
                 "hdf.ready_for_streams",
                 params=[
-                    param("streams", required=True, default=None, annotation="list[dict]"),
+                    param(
+                        "streams", required=True, default=None, annotation="list[dict]"
+                    ),
                 ],
                 doc="Report whether HDF writer is ready for stream acquisition.",
             ),
@@ -3659,10 +3693,21 @@ class HdfWriter(ManagedProcessBase):
                     method(
                         "hdf.measurement.note",
                         params=[
-                            param("author", required=True, default=None, annotation="str"),
-                            param("kind", required=False, default="note", annotation="str"),
-                            param("message", required=True, default=None, annotation="str"),
-                            param("payload", required=False, default=None, annotation="dict"),
+                            param(
+                                "author", required=True, default=None, annotation="str"
+                            ),
+                            param(
+                                "kind", required=False, default="note", annotation="str"
+                            ),
+                            param(
+                                "message", required=True, default=None, annotation="str"
+                            ),
+                            param(
+                                "payload",
+                                required=False,
+                                default=None,
+                                annotation="dict",
+                            ),
                         ],
                         doc="Append a measurement note row to /measurement/notes.",
                     ),
@@ -3693,7 +3738,9 @@ class HdfWriter(ManagedProcessBase):
         }
 
     def _rpc_hdf_status(self, req: Json) -> Json:
-        schema_configured, schema_available, schema_error = self._measurement_schema_state()
+        schema_configured, schema_available, schema_error = (
+            self._measurement_schema_state()
+        )
         stream_buffered, stream_buffered_samples, stream_buffered_data_bytes = (
             self._stream_buffer_snapshot()
         )
@@ -3799,7 +3846,8 @@ class HdfWriter(ManagedProcessBase):
             req,
             result={
                 "schema": measurement_schema_to_json(self._measurement_schema),
-                "path": self._measurement_schema_source or self._measurement_schema_path,
+                "path": self._measurement_schema_source
+                or self._measurement_schema_path,
             },
         )
 
@@ -3867,7 +3915,9 @@ class HdfWriter(ManagedProcessBase):
     def _rpc_hdf_devices_toggle(self, req: Json, *, disable: bool) -> Json:
         params = req.get("params", {})
         if not isinstance(params, dict):
-            return self._rpc_error(req, code="invalid_params", message="params must be a dict")
+            return self._rpc_error(
+                req, code="invalid_params", message="params must be a dict"
+            )
         try:
             ids = self._normalize_device_id_list(params.get("device_ids"))
         except Exception as e:
@@ -3943,7 +3993,9 @@ class HdfWriter(ManagedProcessBase):
     def _rpc_hdf_processes_toggle(self, req: Json, *, disable: bool) -> Json:
         params = req.get("params", {})
         if not isinstance(params, dict):
-            return self._rpc_error(req, code="invalid_params", message="params must be a dict")
+            return self._rpc_error(
+                req, code="invalid_params", message="params must be a dict"
+            )
         try:
             ids = self._normalize_device_id_list(params.get("process_ids"))
         except Exception as e:
@@ -4093,7 +4145,9 @@ class HdfWriter(ManagedProcessBase):
         if params is None:
             params = {}
         if not isinstance(params, dict):
-            return self._rpc_error(req, code="invalid_params", message="params must be a dict")
+            return self._rpc_error(
+                req, code="invalid_params", message="params must be a dict"
+            )
         try:
             specs = self._normalize_stream_expect_specs(
                 params.get("streams", []),
@@ -4110,7 +4164,9 @@ class HdfWriter(ManagedProcessBase):
         if params is None:
             params = {}
         if not isinstance(params, dict):
-            return self._rpc_error(req, code="invalid_params", message="params must be a dict")
+            return self._rpc_error(
+                req, code="invalid_params", message="params must be a dict"
+            )
         try:
             context_id_raw = params.get("context_id")
             context_id = int(context_id_raw) if context_id_raw is not None else None
@@ -4159,7 +4215,9 @@ class HdfWriter(ManagedProcessBase):
         if params is None:
             params = {}
         if not isinstance(params, dict):
-            return self._rpc_error(req, code="invalid_params", message="params must be a dict")
+            return self._rpc_error(
+                req, code="invalid_params", message="params must be a dict"
+            )
 
         filename_raw = params.get("filename")
         filename: str | None = None
@@ -4236,7 +4294,9 @@ class HdfWriter(ManagedProcessBase):
         if params is None:
             params = {}
         if not isinstance(params, dict):
-            return self._rpc_error(req, code="invalid_params", message="params must be a dict")
+            return self._rpc_error(
+                req, code="invalid_params", message="params must be a dict"
+            )
         if self._h5 is None:
             return self.rpc_ok(
                 req,
@@ -4264,7 +4324,9 @@ class HdfWriter(ManagedProcessBase):
         if params is None:
             params = {}
         if not isinstance(params, dict):
-            return self._rpc_error(req, code="invalid_params", message="params must be a dict")
+            return self._rpc_error(
+                req, code="invalid_params", message="params must be a dict"
+            )
         if self._h5 is not None:
             return self._rpc_error(
                 req, code="already_writing", message="HDF writer is already writing"
@@ -4350,7 +4412,9 @@ class HdfWriter(ManagedProcessBase):
             request_id_field="request_id",
         )
         if rpc is None:
-            return self._rpc_error(req, code="invalid_request", message="Malformed request")
+            return self._rpc_error(
+                req, code="invalid_request", message="Malformed request"
+            )
         dispatch_req = rpc.as_dispatch_payload(request_id_field="request_id")
         if rpc.action == "process.capabilities":
             return self.rpc_ok(
@@ -4489,27 +4553,40 @@ class HdfWriter(ManagedProcessBase):
             device_id=device_id,
             stream=stream,
             shm_name=chunk.shm_name,
-            initial_seq=chunk.seq,
+            initial_seq=chunk.first_seq if chunk.first_seq is not None else chunk.seq,
         )
         if reader is None:
+            return
+        try:
+            seq_range = parse_chunk_sequence_range(
+                chunk.raw,
+                max_batch_count=reader.layout.slot_count,
+            )
+        except ValueError:
+            self._bump_error("stream.invalid_seq_range")
+            self._bump_stream_counter(
+                key,
+                "invalid_seq_range_total",
+                last_error="chunk range exceeds ring capacity",
+            )
             return
 
         ctx_id = chunk.context_id
         if ctx_id is not None and chunk.context_fields is not None:
             self._record_context(ctx_id, chunk.context_fields)
-        if ctx_id is not None and chunk.seq is not None:
-            seq = int(chunk.seq)
-            self._store_context_for_seq(
-                key=key,
-                seq=seq,
-                context_id=int(ctx_id),
-                now_mono=now_mono,
-            )
-            self._resolve_pending_stream_event(
-                key=key,
-                seq=seq,
-                context_id=int(ctx_id),
-            )
+        if ctx_id is not None and seq_range is not None:
+            for seq in range(seq_range.first_seq, seq_range.final_seq + 1):
+                self._store_context_for_seq(
+                    key=key,
+                    seq=seq,
+                    context_id=int(ctx_id),
+                    now_mono=now_mono,
+                )
+                self._resolve_pending_stream_event(
+                    key=key,
+                    seq=seq,
+                    context_id=int(ctx_id),
+                )
         elif ctx_id is not None:
             self._bump_error("stream.context_seq_missing")
 
@@ -4519,7 +4596,9 @@ class HdfWriter(ManagedProcessBase):
         # persisted state and the gap-detection baseline passed below stay
         # `None` so "unset" can never be mistaken for a real seq-0 baseline.
         last_seq = -1 if last_seq_state is None else int(last_seq_state)
-        events = self._read_chunk_ready_events(key=key, reader=reader, last_seq=last_seq)
+        events = self._read_chunk_ready_events(
+            key=key, reader=reader, last_seq=last_seq
+        )
         if not events:
             self._expire_pending_context(key=key, now_mono=now_mono)
             self._trim_context_map(key=key, now_mono=now_mono)
@@ -4547,7 +4626,9 @@ class HdfWriter(ManagedProcessBase):
         self._stream_pending_by_seq.pop(key, None)
         self._stream_context_by_seq.pop(key, None)
 
-    def _discard_buffered_stream_frames(self, key: tuple[str, str], *, reason: str) -> None:
+    def _discard_buffered_stream_frames(
+        self, key: tuple[str, str], *, reason: str
+    ) -> None:
         """Count and bump `buffer_discarded_total` for any frames buffered
         for `key` right before the caller pops them. Shared by the two
         sites that discard unflushed stream frames outright (ring
@@ -4598,6 +4679,40 @@ class HdfWriter(ManagedProcessBase):
                 last_error="stream attach failed",
             )
             return None
+        schema = self._stream_schema.get(key)
+        if schema is not None:
+            try:
+                expected_raw = schema.get("metadata_dtype")
+                actual_raw = getattr(reader.layout, "metadata_dtype", None)
+                expected = (
+                    None
+                    if expected_raw is None
+                    else _validated_frame_metadata_dtype(expected_raw)
+                )
+                actual = (
+                    None
+                    if actual_raw is None
+                    else _validated_frame_metadata_dtype(actual_raw)
+                )
+            except (TypeError, ValueError):
+                try:
+                    reader.close()
+                except Exception:
+                    self._bump_error("stream.reader_close")
+                self._bump_error("stream.metadata_schema_invalid")
+                return None
+            if expected != actual:
+                try:
+                    reader.close()
+                except Exception:
+                    self._bump_error("stream.reader_close")
+                self._bump_error("stream.metadata_schema_mismatch")
+                self._bump_stream_counter(
+                    key,
+                    "metadata_schema_mismatch_total",
+                    last_error="configured metadata dtype differs from ring layout",
+                )
+                return None
         self._stream_readers[key] = reader
         session = self._next_stream_session(device_id, stream)
         self._stream_sessions[key] = session
@@ -4619,7 +4734,9 @@ class HdfWriter(ManagedProcessBase):
         else:
             self._stream_last_seq[key] = None
         self._stream_dropped_total[key] = 0
-        self._discard_buffered_stream_frames(key, reason="buffer discarded on ring re-attach")
+        self._discard_buffered_stream_frames(
+            key, reason="buffer discarded on ring re-attach"
+        )
         self._stream_buffers.pop(key, None)
         # Intentionally do NOT pop `_stream_schema` here. The config-driven
         # schema (built from `stream_calls` with a real structured dtype) is
@@ -4706,6 +4823,8 @@ class HdfWriter(ManagedProcessBase):
             self._stream_schema[key] = {
                 "dtype": reader.layout.dtype,
                 "shape": reader.layout.shape,
+                "metadata_dtype": getattr(reader.layout, "metadata_dtype", None),
+                "metadata_fields": [],
             }
         self._enforce_pending_context_cap(key=key)
         self._expire_pending_context(key=key, now_mono=now_mono)
@@ -4720,6 +4839,7 @@ class HdfWriter(ManagedProcessBase):
                 "t0_mono_ns": [],
                 "t0_wall_ns": [],
                 "context_id": [],
+                "frame_metadata": [],
             },
         )
 
@@ -4736,6 +4856,7 @@ class HdfWriter(ManagedProcessBase):
         buf["t0_mono_ns"].append(int(event["t0_mono_ns"]))
         buf["t0_wall_ns"].append(int(event["t0_wall_ns"]))
         buf["context_id"].append(int(context_id))
+        buf["frame_metadata"].append(event.get("metadata"))
 
     def _store_context_for_seq(
         self,
@@ -4748,9 +4869,7 @@ class HdfWriter(ManagedProcessBase):
         context_map = self._stream_context_by_seq.setdefault(key, {})
         context_map[int(seq)] = (int(context_id), float(now_mono))
 
-    def _resolve_context_for_seq(
-        self, *, key: tuple[str, str], seq: int
-    ) -> int | None:
+    def _resolve_context_for_seq(self, *, key: tuple[str, str], seq: int) -> int | None:
         context_map = self._stream_context_by_seq.get(key)
         if not context_map:
             return None
@@ -4768,6 +4887,7 @@ class HdfWriter(ManagedProcessBase):
             "payload": ev["payload"],
             "t0_mono_ns": int(ev["t0_mono_ns"]),
             "t0_wall_ns": int(ev["t0_wall_ns"]),
+            "metadata": ev.get("metadata"),
             "first_seen_mono": float(now_mono),
         }
 
@@ -5136,7 +5256,9 @@ class HdfWriter(ManagedProcessBase):
             ds[index] = self._coerce_context_value(name, raw)
 
     def _record_unprojected_context_fields(self, fields: dict[str, Any]) -> None:
-        extra = {str(name) for name in fields if name not in self._context_columns_datasets}
+        extra = {
+            str(name) for name in fields if name not in self._context_columns_datasets
+        }
         if not extra:
             return
         self._unprojected_context_fields.update(extra)
@@ -5263,8 +5385,9 @@ class HdfWriter(ManagedProcessBase):
         t0_mono_list: list[int],
         t0_wall_list: list[int],
         context_list: list[int],
-    ) -> tuple[list[Any], list[int], list[int], list[int], list[int]]:
-        """Reindex the five parallel per-frame buffer lists by `idx_list` in
+        frame_metadata_list: list[Any],
+    ) -> tuple[list[Any], list[int], list[int], list[int], list[int], list[Any]]:
+        """Reindex the parallel per-frame buffer lists by `idx_list` in
         one place, so out-of-order sorting and bad-frame filtering can't
         drift out of sync with each other (or forget a list) as fields are
         added in the future. `context_list` is optional -- kept empty if it
@@ -5275,7 +5398,16 @@ class HdfWriter(ManagedProcessBase):
         t0_wall_list = [t0_wall_list[idx] for idx in idx_list]
         if context_list:
             context_list = [context_list[idx] for idx in idx_list]
-        return data_list, seq_list, t0_mono_list, t0_wall_list, context_list
+        if frame_metadata_list:
+            frame_metadata_list = [frame_metadata_list[idx] for idx in idx_list]
+        return (
+            data_list,
+            seq_list,
+            t0_mono_list,
+            t0_wall_list,
+            context_list,
+            frame_metadata_list,
+        )
 
     def _write_single_stream_buffer(
         self,
@@ -5302,6 +5434,8 @@ class HdfWriter(ManagedProcessBase):
         meta = stream_meta.get(key) if stream_meta else None
         dtype_raw = meta.get("dtype") if meta else None
         shape_raw = meta.get("shape") if meta else None
+        metadata_dtype_raw = meta.get("metadata_dtype") if meta else None
+        metadata_fields = list(meta.get("metadata_fields", [])) if meta else []
         if dtype_raw is None or shape_raw is None:
             schema = self._stream_schema.get(key)
             reader = self._stream_readers.get(key)
@@ -5309,10 +5443,15 @@ class HdfWriter(ManagedProcessBase):
                 dtype_raw = None if schema is None else schema.get("dtype")
             if shape_raw is None:
                 shape_raw = None if schema is None else schema.get("shape")
+            if metadata_dtype_raw is None and schema is not None:
+                metadata_dtype_raw = schema.get("metadata_dtype")
+                metadata_fields = list(schema.get("metadata_fields", []))
             if dtype_raw is None and reader is not None:
                 dtype_raw = reader.layout.dtype
             if shape_raw is None and reader is not None:
                 shape_raw = tuple(reader.layout.shape)
+            if metadata_dtype_raw is None and reader is not None:
+                metadata_dtype_raw = getattr(reader.layout, "metadata_dtype", None)
 
         if dtype_raw is None or shape_raw is None:
             self._bump_stream_counter(
@@ -5331,7 +5470,15 @@ class HdfWriter(ManagedProcessBase):
         else:
             session = self._stream_active_session.get(key, 1)
         datasets = self._ensure_stream_dataset(
-            device_id, stream, dtype_obj, shape, session=session
+            device_id,
+            stream,
+            dtype_obj,
+            shape,
+            session=session,
+            metadata_dtype=(
+                None if metadata_dtype_raw is None else np.dtype(metadata_dtype_raw)
+            ),
+            metadata_fields=metadata_fields,
         )
 
         n = len(data_list)
@@ -5339,12 +5486,24 @@ class HdfWriter(ManagedProcessBase):
         t0_mono_list = list(buf["t0_mono_ns"])
         t0_wall_list = list(buf["t0_wall_ns"])
         context_list = list(buf.get("context_id", []))
+        frame_metadata_list = list(buf.get("frame_metadata", []))
         if n > 1 and any(seq_list[idx] > seq_list[idx + 1] for idx in range(n - 1)):
             order = sorted(range(n), key=lambda idx: seq_list[idx])
-            data_list, seq_list, t0_mono_list, t0_wall_list, context_list = (
-                self._reindex_stream_frame_lists(
-                    order, data_list, seq_list, t0_mono_list, t0_wall_list, context_list
-                )
+            (
+                data_list,
+                seq_list,
+                t0_mono_list,
+                t0_wall_list,
+                context_list,
+                frame_metadata_list,
+            ) = self._reindex_stream_frame_lists(
+                order,
+                data_list,
+                seq_list,
+                t0_mono_list,
+                t0_wall_list,
+                context_list,
+                frame_metadata_list,
             )
         if context_list and len(context_list) != n:
             context_list = [-1] * n
@@ -5360,14 +5519,37 @@ class HdfWriter(ManagedProcessBase):
         shape_obj = tuple(data_ds.shape[1:])
         expected_nbytes = self._stream_expected_nbytes.get(key)
         if expected_nbytes is None:
-            expected_nbytes = int(dtype_obj.itemsize * int(np.prod(shape_obj, dtype=np.int64)))
+            expected_nbytes = int(
+                dtype_obj.itemsize * int(np.prod(shape_obj, dtype=np.int64))
+            )
             self._stream_expected_nbytes[key] = expected_nbytes
-        elif expected_nbytes != int(dtype_obj.itemsize * int(np.prod(shape_obj, dtype=np.int64))):
-            expected_nbytes = int(dtype_obj.itemsize * int(np.prod(shape_obj, dtype=np.int64)))
+        elif expected_nbytes != int(
+            dtype_obj.itemsize * int(np.prod(shape_obj, dtype=np.int64))
+        ):
+            expected_nbytes = int(
+                dtype_obj.itemsize * int(np.prod(shape_obj, dtype=np.int64))
+            )
             self._stream_expected_nbytes[key] = expected_nbytes
         bad_idx = [
-            idx for idx, payload in enumerate(data_list) if len(payload) != expected_nbytes
+            idx
+            for idx, payload in enumerate(data_list)
+            if len(payload) != expected_nbytes
         ]
+        metadata_dtype = (
+            None
+            if metadata_dtype_raw is None
+            else _validated_frame_metadata_dtype(metadata_dtype_raw)
+        )
+        if metadata_dtype is not None:
+            if len(frame_metadata_list) != n:
+                frame_metadata_list = [None] * n
+            bad_idx.extend(
+                idx
+                for idx, payload in enumerate(frame_metadata_list)
+                if not isinstance(payload, (bytes, bytearray))
+                or len(payload) != metadata_dtype.itemsize
+            )
+            bad_idx = sorted(set(bad_idx))
         if bad_idx:
             self._bump_stream_counter(
                 key,
@@ -5386,10 +5568,21 @@ class HdfWriter(ManagedProcessBase):
             # alongside them.
             bad_set = set(bad_idx)
             keep_idx = [idx for idx in range(len(data_list)) if idx not in bad_set]
-            data_list, seq_list, t0_mono_list, t0_wall_list, context_list = (
-                self._reindex_stream_frame_lists(
-                    keep_idx, data_list, seq_list, t0_mono_list, t0_wall_list, context_list
-                )
+            (
+                data_list,
+                seq_list,
+                t0_mono_list,
+                t0_wall_list,
+                context_list,
+                frame_metadata_list,
+            ) = self._reindex_stream_frame_lists(
+                keep_idx,
+                data_list,
+                seq_list,
+                t0_mono_list,
+                t0_wall_list,
+                context_list,
+                frame_metadata_list,
             )
             n = len(data_list)
 
@@ -5405,6 +5598,30 @@ class HdfWriter(ManagedProcessBase):
                 )
 
         old = data_ds.shape[0]
+        metadata_arr: np.ndarray[Any, Any] | None = None
+        metadata_datasets: list[h5py.Dataset] = []
+        if metadata_dtype is not None:
+            metadata_arr = np.empty(n, dtype=metadata_dtype)
+            for idx, payload in enumerate(frame_metadata_list):
+                metadata_arr[idx] = np.frombuffer(
+                    payload,
+                    dtype=metadata_dtype,
+                    count=1,
+                )[0]
+            for name in metadata_dtype.names or ():
+                metadata_ds = datasets.get(f"metadata:{name}")
+                if metadata_ds is None:
+                    raise RuntimeError(f"missing frame metadata dataset {name!r}")
+                if metadata_ds.dtype != metadata_dtype[name]:
+                    raise RuntimeError(
+                        f"frame metadata dataset {name!r} dtype mismatch"
+                    )
+                if metadata_ds.shape != (old,):
+                    raise RuntimeError(
+                        f"frame metadata dataset {name!r} is not aligned with data"
+                    )
+                metadata_datasets.append(metadata_ds)
+
         data_ds.resize((old + n,) + data_ds.shape[1:])
         seq_ds.resize((old + n,))
         t0_mono_ds.resize((old + n,))
@@ -5419,9 +5636,15 @@ class HdfWriter(ManagedProcessBase):
         if context_ds is not None:
             if len(context_list) != n:
                 context_list = [-1] * n
-            context_ds[old : old + n] = np.asarray(
-                context_list, dtype=context_ds.dtype
-            )
+            context_ds[old : old + n] = np.asarray(context_list, dtype=context_ds.dtype)
+        if metadata_dtype is not None and metadata_arr is not None:
+            for name, metadata_ds in zip(
+                metadata_dtype.names or (),
+                metadata_datasets,
+                strict=True,
+            ):
+                metadata_ds.resize((old + n,))
+                metadata_ds[old : old + n] = metadata_arr[name]
 
         dropped = int(self._stream_dropped_total.get(key, 0))
         data_ds.attrs["dropped_total"] = dropped
@@ -5471,10 +5694,31 @@ class HdfWriter(ManagedProcessBase):
         shape: tuple[int, ...],
         *,
         session: int,
+        metadata_dtype: np.dtype[Any] | None = None,
+        metadata_fields: list[dict[str, Any]] | None = None,
     ) -> dict[str, h5py.Dataset]:
+        if metadata_dtype is not None:
+            metadata_dtype = _validated_frame_metadata_dtype(metadata_dtype)
         key = (device_id, stream, session)
         if key in self._stream_datasets:
-            return self._stream_datasets[key]
+            datasets = self._stream_datasets[key]
+            expected_names = (
+                set(metadata_dtype.names or ()) if metadata_dtype is not None else set()
+            )
+            actual_names = {
+                name.removeprefix("metadata:")
+                for name in datasets
+                if name.startswith("metadata:")
+            }
+            if actual_names != expected_names:
+                raise RuntimeError("cached frame metadata datasets do not match schema")
+            if metadata_dtype is not None:
+                for name in metadata_dtype.names or ():
+                    if datasets[f"metadata:{name}"].dtype != metadata_dtype[name]:
+                        raise RuntimeError(
+                            f"cached frame metadata dataset {name!r} dtype mismatch"
+                        )
+            return datasets
         if self._streams_group is None:
             raise RuntimeError("Streams group not initialized")
 
@@ -5531,6 +5775,31 @@ class HdfWriter(ManagedProcessBase):
             compression=DEFAULT_NUMERIC_COMPRESSION,
             shuffle=DEFAULT_NUMERIC_SHUFFLE,
         )
+        metadata_datasets: dict[str, h5py.Dataset] = {}
+        metadata_field_attrs = {
+            str(item.get("name")): item
+            for item in (metadata_fields or [])
+            if isinstance(item, dict) and item.get("name")
+        }
+        if metadata_dtype is not None:
+            for name in metadata_dtype.names or ():
+                field_dtype = metadata_dtype[name]
+                metadata_ds = session_group.create_dataset(
+                    name,
+                    shape=(0,),
+                    maxshape=(None,),
+                    dtype=field_dtype,
+                    chunks=(chunk_n,),
+                    compression=DEFAULT_NUMERIC_COMPRESSION,
+                    shuffle=DEFAULT_NUMERIC_SHUFFLE,
+                )
+                field_attrs = metadata_field_attrs.get(name, {})
+                if field_attrs.get("units") is not None:
+                    metadata_ds.attrs["units"] = field_attrs["units"]
+                if field_attrs.get("description") is not None:
+                    metadata_ds.attrs["description"] = field_attrs["description"]
+                metadata_ds.attrs["aligned_with"] = "data"
+                metadata_datasets[f"metadata:{name}"] = metadata_ds
 
         pending = self._pending_stream_metadata.get((device_id, stream), None)
         if pending:
@@ -5553,6 +5822,7 @@ class HdfWriter(ManagedProcessBase):
             "t0_mono_ns": t0_mono_ds,
             "t0_wall_ns": t0_wall_ds,
             "context_id": context_ds,
+            **metadata_datasets,
         }
         self._stream_datasets[key] = datasets
         return datasets
@@ -5578,7 +5848,9 @@ class HdfWriter(ManagedProcessBase):
             return
 
         yaml_text = msg.get("yaml_text")
-        stream_metadata = self._normalize_stream_metadata_dict(msg.get("stream_metadata"))
+        stream_metadata = self._normalize_stream_metadata_dict(
+            msg.get("stream_metadata")
+        )
         stream_calls = msg.get("stream_calls", [])
         run_meta_calls = msg.get("run_meta_calls", [])
 
@@ -5604,7 +5876,9 @@ class HdfWriter(ManagedProcessBase):
                 dtype=h5py.string_dtype("utf-8"),
             )
             stream_meta_ds[()] = json.dumps(stream_metadata)
-            run_meta_schema: list[Any] = run_meta_calls if isinstance(run_meta_calls, list) else []
+            run_meta_schema: list[Any] = (
+                run_meta_calls if isinstance(run_meta_calls, list) else []
+            )
             run_meta_calls_ds = device_group.require_dataset(
                 "run_meta_calls_json",
                 shape=(),
@@ -5617,6 +5891,17 @@ class HdfWriter(ManagedProcessBase):
             for call in stream_calls:
                 if not isinstance(call, dict):
                     continue
+                metadata_fields = [
+                    dict(item)
+                    for item in (call.get("meta", []) or [])
+                    if isinstance(item, dict)
+                ]
+                metadata_specs = [
+                    (str(item.get("name")), str(item.get("dtype")))
+                    for item in metadata_fields
+                    if item.get("name") and item.get("dtype")
+                ]
+                metadata_dtype = np.dtype(metadata_specs) if metadata_specs else None
                 for out in call.get("outputs", []) or []:
                     if not isinstance(out, dict):
                         continue
@@ -5639,9 +5924,16 @@ class HdfWriter(ManagedProcessBase):
                         shape_raw = out.get("shape", []) or []
                         stream_shape = tuple(int(x) for x in shape_raw)
                     key = (device_id, stream)
-                    self._stream_schema[key] = {"dtype": dtype, "shape": stream_shape}
+                    self._stream_schema[key] = {
+                        "dtype": dtype,
+                        "shape": stream_shape,
+                        "metadata_dtype": metadata_dtype,
+                        "metadata_fields": metadata_fields,
+                    }
                     try:
-                        expected = int(dtype.itemsize * int(np.prod(stream_shape, dtype=np.int64)))
+                        expected = int(
+                            dtype.itemsize * int(np.prod(stream_shape, dtype=np.int64))
+                        )
                         self._stream_expected_nbytes[key] = expected
                     except Exception:
                         self._stream_expected_nbytes.pop(key, None)

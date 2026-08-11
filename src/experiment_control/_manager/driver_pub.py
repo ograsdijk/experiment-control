@@ -6,6 +6,7 @@ from typing import Any
 
 import zmq
 
+from ..contracts.messages import parse_chunk_sequence_range
 from ..utils.zmq_helpers import MAX_DRAIN_PER_TICK, safe_json_loads
 
 Json = dict[str, Any]
@@ -157,11 +158,11 @@ def _ensure_chunk_device_slot(manager: Any, device_id: str) -> dict[str, Any]:
     return cache
 
 
-def _store_chunk_descriptor(manager: Any, *, device_id: str, stream: str, desc: Json) -> None:
+def _store_chunk_descriptor(
+    manager: Any, *, device_id: str, stream: str, desc: Json
+) -> None:
     device_cache = _ensure_chunk_device_slot(manager, device_id)
-    max_streams = _positive_limit(
-        manager, "_chunk_cache_max_streams_per_device", 2048
-    )
+    max_streams = _positive_limit(manager, "_chunk_cache_max_streams_per_device", 2048)
     if stream in device_cache:
         device_cache.pop(stream, None)
     elif len(device_cache) >= max_streams:
@@ -172,7 +173,9 @@ def _store_chunk_descriptor(manager: Any, *, device_id: str, stream: str, desc: 
     device_cache[stream] = desc
 
 
-def _decode_driver_pub_payload(manager: Any, topic: str, payload_b: bytes) -> Json | None:
+def _decode_driver_pub_payload(
+    manager: Any, topic: str, payload_b: bytes
+) -> Json | None:
     msg_any: Any
     try:
         msg_any = safe_json_loads(payload_b)
@@ -375,7 +378,9 @@ def _parse_bundle_timestamp(
         return ts
 
 
-def _require_device_id(manager: Any, *, msg: Json, error_topic: str, noun: str) -> str | None:
+def _require_device_id(
+    manager: Any, *, msg: Json, error_topic: str, noun: str
+) -> str | None:
     device_id_raw = msg.get("device_id")
     if device_id_raw is None:
         _emit_ingest_error(
@@ -400,7 +405,9 @@ def _coerce_signal_quality(
     return quality, quality_raw
 
 
-def _is_bad_quality_value(quality: Any, quality_raw: Any, telemetry_quality_enum: Any) -> bool:
+def _is_bad_quality_value(
+    quality: Any, quality_raw: Any, telemetry_quality_enum: Any
+) -> bool:
     return quality is telemetry_quality_enum.BAD and quality_raw not in {
         telemetry_quality_enum.BAD,
         "BAD",
@@ -549,7 +556,9 @@ def _parse_heartbeat_seq(msg: Json) -> int:
         return -1
 
 
-def _heartbeat_state_invalid(state_raw: Any, *, state_enum: Any, field_present: bool) -> bool:
+def _heartbeat_state_invalid(
+    state_raw: Any, *, state_enum: Any, field_present: bool
+) -> bool:
     state_values = {s.value for s in state_enum}
     if isinstance(state_raw, str):
         return state_raw not in state_values
@@ -704,8 +713,18 @@ def _normalized_chunk_descriptor(msg: Json) -> Json | None:
     except Exception:
         desc["layout_version"] = 1
     _coerce_int_field(desc, "seq")
+    _coerce_int_field(desc, "first_seq")
+    _coerce_int_field(desc, "batch_count")
     _coerce_int_field(desc, "t0_mono_ns")
     _coerce_int_field(desc, "t0_wall_ns")
+    try:
+        seq_range = parse_chunk_sequence_range(desc)
+    except ValueError:
+        return None
+    if seq_range is not None:
+        desc["seq"] = seq_range.final_seq
+        desc["first_seq"] = seq_range.first_seq
+        desc["batch_count"] = seq_range.batch_count
     return desc
 
 
