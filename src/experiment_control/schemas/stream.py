@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..types import StreamCall, StreamField, StreamOut
+from ..types import StreamCall, StreamField, StreamMeta, StreamOut
 from ..utils.config_parsing import (
     ConfigError,
     normalize_list,
@@ -44,6 +44,16 @@ def stream_calls_to_json(calls: list[StreamCall]) -> list[Json]:
 
     payload = calls_to_json(calls, output_to_json=_output_to_json)
     for item, call in zip(payload, calls, strict=True):
+        if call.meta:
+            item["meta"] = [
+                {
+                    "name": meta.name,
+                    "dtype": meta.dtype,
+                    "units": meta.units,
+                    "description": meta.description,
+                }
+                for meta in call.meta
+            ]
         if call.period_s is not None:
             item["period_s"] = float(call.period_s)
     return payload
@@ -56,6 +66,13 @@ def stream_calls_from_json(raw: object) -> list[StreamCall]:
         units = optional_str(f.get("units", None), path=[*path, "units"])
         desc = optional_str(f.get("description", None), path=[*path, "description"])
         return StreamField(name=name, dtype=dtype, units=units, description=desc)
+
+    def _parse_meta(f: Json, path: list[str | int]) -> StreamMeta:
+        name = require_str(f.get("name"), path=[*path, "name"])
+        dtype = require_str(f.get("dtype"), path=[*path, "dtype"])
+        units = optional_str(f.get("units", None), path=[*path, "units"])
+        desc = optional_str(f.get("description", None), path=[*path, "description"])
+        return StreamMeta(name=name, dtype=dtype, units=units, description=desc)
 
     def _parse_output(o: Json, path: list[str | int]) -> StreamOut:
         stream_name = require_str(o.get("stream"), path=[*path, "stream"])
@@ -134,6 +151,13 @@ def stream_calls_from_json(raw: object) -> list[StreamCall]:
                 _parse_output(o, ["stream_calls", i, "outputs", j])
                 for j, o in enumerate(outs)
             ]
+            meta_raw = require_list_of_dicts(
+                c_obj.get("meta", []), path=["stream_calls", i, "meta"]
+            )
+            meta = [
+                _parse_meta(item, ["stream_calls", i, "meta", j])
+                for j, item in enumerate(meta_raw)
+            ]
 
             period_raw = c_obj.get("period_s", None)
             period_s: float | None = None
@@ -150,6 +174,7 @@ def stream_calls_from_json(raw: object) -> list[StreamCall]:
                     method=method,
                     kwargs=kwargs,
                     outputs=outputs,
+                    meta=meta,
                     period_s=period_s,
                 )
             )

@@ -34,6 +34,14 @@ def _as_int_or_none(raw: Any) -> int | None:
         return None
 
 
+def _as_exact_int_or_none(raw: Any) -> int | None:
+    if raw is None or isinstance(raw, bool):
+        return None
+    if isinstance(raw, float) and not raw.is_integer():
+        return None
+    return _as_int_or_none(raw)
+
+
 @dataclass(frozen=True)
 class RpcActionRequest:
     request_id: Any
@@ -102,11 +110,65 @@ class DeviceScopedMessage:
 
 
 @dataclass(frozen=True)
+class ChunkSequenceRange:
+    first_seq: int
+    final_seq: int
+    batch_count: int
+
+
+def parse_chunk_sequence_range(
+    raw: Any,
+    *,
+    max_batch_count: int | None = None,
+) -> ChunkSequenceRange | None:
+    """Validate the inclusive sequence range advertised by a chunk message."""
+    payload = _as_json_object(raw)
+    if payload is None:
+        raise ValueError("chunk payload must be an object")
+    seq = _as_exact_int_or_none(payload.get("seq"))
+    first_seq = _as_exact_int_or_none(payload.get("first_seq"))
+    batch_raw = payload.get("batch_count")
+    batch_count = _as_exact_int_or_none(batch_raw)
+    if payload.get("seq") is not None and seq is None:
+        raise ValueError("chunk seq must be an integer")
+    if payload.get("first_seq") is not None and first_seq is None:
+        raise ValueError("chunk first_seq must be an integer")
+    if batch_raw is not None and batch_count is None:
+        raise ValueError("chunk batch_count must be an integer")
+    if seq is None:
+        if first_seq is not None or batch_count not in (None, 1):
+            raise ValueError("first_seq/batch_count require seq")
+        return None
+    if seq < 1:
+        raise ValueError("chunk seq must be positive")
+    if first_seq is None:
+        first_seq = seq
+        if batch_count not in (None, 1):
+            raise ValueError("legacy single-frame chunks must have batch_count=1")
+        batch_count = 1
+    else:
+        if first_seq < 1 or first_seq > seq:
+            raise ValueError("chunk first_seq must be positive and <= seq")
+        expected = seq - first_seq + 1
+        if batch_count is None or batch_count != expected:
+            raise ValueError("chunk batch_count must equal seq - first_seq + 1")
+    if max_batch_count is not None and batch_count > max(1, int(max_batch_count)):
+        raise ValueError("chunk batch_count exceeds the shared-memory ring capacity")
+    return ChunkSequenceRange(
+        first_seq=int(first_seq),
+        final_seq=int(seq),
+        batch_count=int(batch_count),
+    )
+
+
+@dataclass(frozen=True)
 class ChunkReadyMessage:
     device_id: str
     stream: str
     shm_name: str
     seq: int | None
+    first_seq: int | None
+    batch_count: int
     context_id: int | None
     context_fields: Json | None
     raw: Json
@@ -121,17 +183,21 @@ class ChunkReadyMessage:
         shm_name = _as_non_empty_text(payload.get("shm_name"))
         if device_id is None or stream is None or shm_name is None:
             return None
+        try:
+            seq_range = parse_chunk_sequence_range(payload)
+        except ValueError:
+            return None
         context_fields_raw = payload.get("context_fields")
         context_fields = (
-            dict(context_fields_raw)
-            if isinstance(context_fields_raw, dict)
-            else None
+            dict(context_fields_raw) if isinstance(context_fields_raw, dict) else None
         )
         return cls(
             device_id=device_id,
             stream=stream,
             shm_name=shm_name,
-            seq=_as_int_or_none(payload.get("seq")),
+            seq=None if seq_range is None else seq_range.final_seq,
+            first_seq=None if seq_range is None else seq_range.first_seq,
+            batch_count=1 if seq_range is None else seq_range.batch_count,
             context_id=_as_int_or_none(payload.get("context_id")),
             context_fields=context_fields,
             raw=payload,

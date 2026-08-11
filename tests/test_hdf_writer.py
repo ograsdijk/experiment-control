@@ -41,6 +41,17 @@ from experiment_control.processes.hdf_writer_dtypes import (  # noqa: E402
 from experiment_control.shm.shm_ring import ShmRingWriter  # noqa: E402
 
 
+def test_hdf_frame_metadata_dtype_rejects_reserved_or_incompatible_fields() -> None:
+    invalid = (
+        np.dtype([("seq", "uint64")]),
+        np.dtype([("path/name", "float64")]),
+        np.dtype([("label", "U8")]),
+    )
+    for dtype in invalid:
+        with np.testing.assert_raises(ValueError):
+            hdf_writer_module._validated_frame_metadata_dtype(dtype)  # noqa: SLF001
+
+
 def _as_text(value: object) -> str:
     if isinstance(value, bytes):
         return value.decode("utf-8", errors="replace")
@@ -473,9 +484,7 @@ class HdfWriterStrictStreamTests(unittest.TestCase):
                 writer._rpc_hdf_streams_expect(  # noqa: SLF001
                     {
                         "params": {
-                            "streams": [
-                                {"device_id": "fs740", "stream": "timestamps"}
-                            ],
+                            "streams": [{"device_id": "fs740", "stream": "timestamps"}],
                             "context_id": 3,
                             "strict": True,
                         }
@@ -489,7 +498,9 @@ class HdfWriterStrictStreamTests(unittest.TestCase):
                 self.assertEqual(errors[0]["reason"], "required stream never seen")
                 group = h5["streams/fs740/timestamps"]
                 self.assertEqual(int(group.attrs["chunk_ready_seen_total"]), 0)
-                self.assertIn("required stream never seen", _as_text(group.attrs["last_error"]))
+                self.assertIn(
+                    "required stream never seen", _as_text(group.attrs["last_error"])
+                )
 
     def test_complete_required_stream_remains_acquisition_ok(self) -> None:
         writer = self._make_writer()
@@ -663,7 +674,11 @@ class HdfWriterMeasurementTests(unittest.TestCase):
                 )
 
                 schema_resp = writer._handle_rpc(  # noqa: SLF001
-                    {"request_id": "s1", "type": "hdf.measurement.schema.get", "params": {}}
+                    {
+                        "request_id": "s1",
+                        "type": "hdf.measurement.schema.get",
+                        "params": {},
+                    }
                 )
                 self.assertTrue(bool(schema_resp.get("ok")))
                 result = schema_resp.get("result")
@@ -731,7 +746,9 @@ class HdfWriterMeasurementTests(unittest.TestCase):
                 error_obj = rotate_resp.get("error")
                 assert isinstance(error_obj, dict)
                 self.assertEqual(error_obj.get("code"), "rotate_failed")
-                self.assertIn("measurement_profile is required", str(error_obj.get("message")))
+                self.assertIn(
+                    "measurement_profile is required", str(error_obj.get("message"))
+                )
 
 
 class HdfWriterStorageSafetyTests(unittest.TestCase):
@@ -1006,6 +1023,60 @@ class HdfWriterStreamBufferTests(unittest.TestCase):
                 datasets = writer._stream_datasets[("cam1", "frames", 1)]  # noqa: SLF001
                 self.assertEqual(list(datasets["context_id"][...]), [-1, -1])
 
+    def test_write_stream_buffers_keeps_metadata_aligned_when_sorting(self) -> None:
+        metadata_dtype = np.dtype(
+            [("hardware_frame_id", "uint64"), ("trigger_time", "float64")]
+        )
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            writer = self._make_writer(str(root))
+            with h5py.File(root / "stream_metadata.h5", "w") as h5:
+                measurement_meta = writer._build_measurement_metadata(  # noqa: SLF001
+                    profile_id=None, values=None, require_profile=False
+                )
+                writer._configure_active_file(  # noqa: SLF001
+                    h5,
+                    write_every_s=1.0,
+                    load_manager_state=False,
+                    measurement_meta=measurement_meta,
+                )
+                key = ("cam1", "frames")
+                writer._stream_schema[key] = {  # noqa: SLF001
+                    "dtype": np.dtype("uint16"),
+                    "shape": (1,),
+                    "metadata_dtype": metadata_dtype,
+                    "metadata_fields": [
+                        {"name": "hardware_frame_id", "dtype": "uint64"},
+                        {
+                            "name": "trigger_time",
+                            "dtype": "float64",
+                            "units": "s",
+                        },
+                    ],
+                }
+
+                def encode(frame_id: int, trigger_time: float) -> bytes:
+                    value = np.empty((), dtype=metadata_dtype)
+                    value["hardware_frame_id"] = frame_id
+                    value["trigger_time"] = trigger_time
+                    return value.tobytes()
+
+                writer._stream_buffers[key] = {  # noqa: SLF001
+                    "data": [b"\x02\x00", b"\x01\x00"],
+                    "seq": [2, 1],
+                    "t0_mono_ns": [20, 10],
+                    "t0_wall_ns": [40, 30],
+                    "context_id": [200, 100],
+                    "frame_metadata": [encode(12, 2.0), encode(11, 1.0)],
+                }
+                writer._write_stream_buffers()  # noqa: SLF001
+                group = h5["streams/cam1/frames/session_001"]
+                np.testing.assert_array_equal(group["seq"][:], [1, 2])
+                np.testing.assert_array_equal(group["data"][:, 0], [1, 2])
+                np.testing.assert_array_equal(group["hardware_frame_id"][:], [11, 12])
+                np.testing.assert_array_equal(group["trigger_time"][:], [1.0, 2.0])
+                self.assertEqual(group["trigger_time"].attrs["units"], "s")
+
 
 class HdfWriterStreamSchemaPoisoningTests(unittest.TestCase):
     """Regression tests for the structured-dtype schema poisoning that caused
@@ -1085,7 +1156,8 @@ class HdfWriterStreamSchemaPoisoningTests(unittest.TestCase):
                 ]
                 self.assertEqual(healthy_ds["data"].shape[0], 1)
                 self.assertEqual(
-                    writer._stream_buffers[healthy_key]["data"], []  # noqa: SLF001
+                    writer._stream_buffers[healthy_key]["data"],
+                    [],  # noqa: SLF001
                 )
                 # Poison stream: no rows, failure counted, buffer dropped (not
                 # left to jam the next batch).
@@ -1093,7 +1165,8 @@ class HdfWriterStreamSchemaPoisoningTests(unittest.TestCase):
                 self.assertGreaterEqual(counters["write_failures_total"], 1)
                 self.assertEqual(counters.get("rows_written_total", 0), 0)
                 self.assertEqual(
-                    writer._stream_buffers[poison_key]["data"], []  # noqa: SLF001
+                    writer._stream_buffers[poison_key]["data"],
+                    [],  # noqa: SLF001
                 )
 
     def test_reader_fallback_stores_parseable_structured_dtype(self) -> None:
@@ -1107,9 +1180,7 @@ class HdfWriterStreamSchemaPoisoningTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             writer = self._make_writer(td)
             key = ("fs740", "timestamps")
-            reader = SimpleNamespace(
-                layout=SimpleNamespace(dtype=structured, shape=())
-            )
+            reader = SimpleNamespace(layout=SimpleNamespace(dtype=structured, shape=()))
             events = [
                 {
                     "seq": 1,
@@ -1163,7 +1234,8 @@ class HdfWriterStreamSchemaPoisoningTests(unittest.TestCase):
                 self.assertIsNotNone(reader)
                 self.assertIn(key, writer._stream_schema)  # noqa: SLF001
                 self.assertEqual(
-                    writer._stream_schema[key]["dtype"], structured  # noqa: SLF001
+                    writer._stream_schema[key]["dtype"],
+                    structured,  # noqa: SLF001
                 )
                 if reader is not None:
                     reader.close()
@@ -1306,7 +1378,8 @@ class HdfWriterLossAccountingTests(unittest.TestCase):
             _handle_manager_chunk_ready(writer, malformed)
 
             self.assertGreaterEqual(
-                writer._error_counts.get("stream.chunk_parse_failed", 0), 1  # noqa: SLF001
+                writer._error_counts.get("stream.chunk_parse_failed", 0),
+                1,  # noqa: SLF001
             )
 
     def test_gap_after_no_seq_attach_is_counted(self) -> None:
@@ -1535,7 +1608,9 @@ class HdfWriterLossAccountingTests(unittest.TestCase):
                 self.assertIn("dev-y", writer._telemetry_schema_rpc_error)  # noqa: SLF001
                 self.assertNotIn("dev-y", writer._telemetry_schema_absent)  # noqa: SLF001
 
-    def test_schema_rpc_exception_backoff_is_much_shorter_than_absence_ttl(self) -> None:
+    def test_schema_rpc_exception_backoff_is_much_shorter_than_absence_ttl(
+        self,
+    ) -> None:
         # A single transient RPC failure must recover fast (the short
         # backoff), not be stuck behind the full confirmed-absence TTL.
         with tempfile.TemporaryDirectory() as td:
@@ -1662,6 +1737,67 @@ class HdfWriterContextResolutionTests(unittest.TestCase):
                 ds = writer._stream_datasets[("trace1", "trace", 1)]["context_id"]  # noqa: SLF001
                 self.assertEqual(list(ds[...]), [42])
 
+    def test_batch_range_applies_context_to_every_frame(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            writer = self._make_writer(str(root))
+
+            class _Reader:
+                name = "cntx_batch"
+
+                class layout:  # noqa: N801
+                    dtype = np.dtype("uint16")
+                    shape = (1,)
+                    slot_count = 4
+
+                def read_events(self, last_seq: int) -> list[dict[str, object]]:
+                    return [
+                        {
+                            "seq": seq,
+                            "payload": HdfWriterContextResolutionTests._u16_payload(
+                                seq
+                            ),
+                            "t0_mono_ns": 100 + seq,
+                            "t0_wall_ns": 200 + seq,
+                        }
+                        for seq in range(max(1, last_seq + 1), 4)
+                    ]
+
+                def close(self) -> None:
+                    pass
+
+            with h5py.File(root / "context_batch.h5", "w") as h5:
+                measurement_meta = writer._build_measurement_metadata(  # noqa: SLF001
+                    profile_id=None, values=None, require_profile=False
+                )
+                writer._configure_active_file(  # noqa: SLF001
+                    h5,
+                    write_every_s=1.0,
+                    load_manager_state=False,
+                    measurement_meta=measurement_meta,
+                )
+                with patch(
+                    "experiment_control.processes.hdf_writer.ShmRingReader.attach",
+                    return_value=_Reader(),
+                ):
+                    writer._handle_chunk_ready(  # noqa: SLF001
+                        {
+                            "version": 2,
+                            "device_id": "trace1",
+                            "stream": "trace",
+                            "shm_name": "cntx_batch",
+                            "first_seq": 1,
+                            "seq": 3,
+                            "batch_count": 3,
+                            "context_id": 42,
+                            "context_fields": {"scan": 9.0},
+                        }
+                    )
+                writer._write_stream_buffers()  # noqa: SLF001
+                datasets = writer._stream_datasets[("trace1", "trace", 1)]  # noqa: SLF001
+                self.assertEqual(list(datasets["seq"][:]), [1, 2, 3])
+                self.assertEqual(list(datasets["context_id"][:]), [42, 42, 42])
+
     def test_late_context_resolution(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -1724,6 +1860,7 @@ class HdfWriterContextResolutionTests(unittest.TestCase):
                 class layout:  # noqa: N801
                     dtype = np.dtype("uint16")
                     shape = (1,)
+                    slot_count = 4
 
                 def read_events(self, last_seq: int) -> list[dict[str, object]]:
                     if int(last_seq) >= 1:
@@ -2011,9 +2148,7 @@ class HdfWriterContextColumnTests(unittest.TestCase):
                     {
                         "event": "load_ok",
                         "ok": True,
-                        "payload": {
-                            "context_columns": {"freq_step_index": "int64"}
-                        },
+                        "payload": {"context_columns": {"freq_step_index": "int64"}},
                         "ts": {"t_wall": 1.0, "t_mono": 2.0},
                     }
                 )
@@ -2022,13 +2157,13 @@ class HdfWriterContextColumnTests(unittest.TestCase):
                 self.assertEqual(ds.dtype, np.dtype("int64"))
                 self.assertEqual(list(ds[...]), [3])
                 self.assertEqual(_as_text(ds.attrs["dtype"]), "int64")
-                self.assertEqual(_as_text(h5["context_table/columns"].attrs["source"]), "explicit")
+                self.assertEqual(
+                    _as_text(h5["context_table/columns"].attrs["source"]), "explicit"
+                )
                 self.assertEqual(
                     json.loads(
                         _as_text(
-                            h5["context_table"].attrs[
-                                "unprojected_context_fields_json"
-                            ]
+                            h5["context_table"].attrs["unprojected_context_fields_json"]
                         )
                     ),
                     ["extra"],
@@ -2065,7 +2200,10 @@ class HdfWriterContextColumnTests(unittest.TestCase):
                     ds = h5["context_table/columns/freq_step_index"]
                     self.assertEqual(ds.dtype, np.dtype("int64"))
                     self.assertEqual(list(ds[...]), [4])
-                    self.assertEqual(_as_text(h5["context_table/columns"].attrs["source"]), "explicit")
+                    self.assertEqual(
+                        _as_text(h5["context_table/columns"].attrs["source"]),
+                        "explicit",
+                    )
 
     def test_context_columns_do_not_auto_infer_before_sequence_loaded(self) -> None:
         def fake_rpc(*args: object, **kwargs: object) -> dict[str, object]:
@@ -2117,7 +2255,9 @@ class HdfWriterContextColumnTests(unittest.TestCase):
                     ds = h5["context_table/columns/freq_step_index"]
                     self.assertEqual(ds.dtype, np.dtype("float64"))
                     self.assertEqual(list(ds[...]), [4.0])
-                    self.assertEqual(_as_text(h5["context_table/columns"].attrs["source"]), "auto")
+                    self.assertEqual(
+                        _as_text(h5["context_table/columns"].attrs["source"]), "auto"
+                    )
 
 
 class HdfWriterCompressionTests(unittest.TestCase):
@@ -2169,9 +2309,7 @@ class HdfWriterCompressionTests(unittest.TestCase):
                 assert names is not None
                 self.assertIn("t_wall_recv", names)
                 # Grouped with the other timestamps, ahead of seq + signals.
-                self.assertEqual(
-                    names[:4], ("t_wall", "t_mono", "t_wall_recv", "seq")
-                )
+                self.assertEqual(names[:4], ("t_wall", "t_mono", "t_wall_recv", "seq"))
 
     def test_telemetry_t_wall_recv_written_and_nan_when_absent(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -2348,13 +2486,17 @@ class HdfWriterFixedLengthStringTests(unittest.TestCase):
                                 "seq": 1,
                                 "ts": {"t_wall": 2.0, "t_mono": 2.0},
                                 "signals": {
-                                    "switch_state": {"value": "INVERSE_SAWTOOTH_TOO_LONG"}
+                                    "switch_state": {
+                                        "value": "INVERSE_SAWTOOTH_TOO_LONG"
+                                    }
                                 },
                             },
                         ]
                     )
                 self.assertEqual(int(ds.shape[0]), 2)
-                self.assertEqual(bytes(ds[0]["switch_state"]).decode("utf-8"), "SETTLED")
+                self.assertEqual(
+                    bytes(ds[0]["switch_state"]).decode("utf-8"), "SETTLED"
+                )
                 # Overlong value truncated to 16 bytes.
                 self.assertEqual(
                     bytes(ds[1]["switch_state"]).decode("utf-8"), "INVERSE_SAWTOOTH"
@@ -2379,7 +2521,9 @@ class HdfWriterMetadataConsolidationTests(unittest.TestCase):
             event_log_mode="all",
         )
 
-    def test_configure_active_file_merges_stream_output_attrs_with_stream_metadata(self) -> None:
+    def test_configure_active_file_merges_stream_output_attrs_with_stream_metadata(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             writer = self._make_writer(str(root))
@@ -2390,7 +2534,9 @@ class HdfWriterMetadataConsolidationTests(unittest.TestCase):
                 "is_remote": False,
                 "yaml_text": None,
                 "device_metadata": {"device_type": "dummy_trace"},
-                "stream_metadata": {"trace": {"from_config": "cfg", "shared": "config"}},
+                "stream_metadata": {
+                    "trace": {"from_config": "cfg", "shared": "config"}
+                },
                 "stream_calls": [
                     {
                         "method": "acquire_trace",
@@ -2455,7 +2601,9 @@ class HdfWriterMetadataConsolidationTests(unittest.TestCase):
             self.assertNotIn(("trace1", "device_metadata"), calls)
             self.assertNotIn(("trace1", "stream_metadata"), calls)
 
-    def test_configure_active_file_collects_run_metadata_for_local_devices(self) -> None:
+    def test_configure_active_file_collects_run_metadata_for_local_devices(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             writer = self._make_writer(str(root))
@@ -2827,7 +2975,8 @@ class HdfWriterBgFlushThreadTests(unittest.TestCase):
             self.assertTrue(writer._bg_thread_dead)  # noqa: SLF001
             self.assertTrue(writer._stop_evt.is_set())  # noqa: SLF001
             self.assertEqual(
-                writer._error_counts.get("bg_thread_fatal"), 1  # noqa: SLF001
+                writer._error_counts.get("bg_thread_fatal"),
+                1,  # noqa: SLF001
             )
             self.assertIsNotNone(writer._last_exception)  # noqa: SLF001
         finally:
@@ -2925,7 +3074,8 @@ class HdfWriterFlushBatchOverflowTests(unittest.TestCase):
         self.assertEqual(writer._deferred_flush_batches, 1)  # noqa: SLF001
         self.assertEqual(writer._dropped_flush_batches, 0)  # noqa: SLF001
         self.assertEqual(
-            writer._error_counts.get("bg.flush_batch.deferred"), 1  # noqa: SLF001
+            writer._error_counts.get("bg.flush_batch.deferred"),
+            1,  # noqa: SLF001
         )
         self.assertIsNone(
             writer._error_counts.get("bg.flush_batch.dropped")  # noqa: SLF001
@@ -2968,7 +3118,8 @@ class HdfWriterFlushBatchOverflowTests(unittest.TestCase):
         self.assertFalse(writer._enqueue_flush_batch(force_flush=True))  # noqa: SLF001
         self.assertEqual(writer._deferred_flush_batches, 2)  # noqa: SLF001
         self.assertEqual(
-            writer._error_counts.get("bg.flush_batch.deferred"), 2  # noqa: SLF001
+            writer._error_counts.get("bg.flush_batch.deferred"),
+            2,  # noqa: SLF001
         )
         self.assertEqual(len(published), 1)
 
@@ -3037,7 +3188,8 @@ class HdfWriterFlushBatchDeferTests(unittest.TestCase):
         self.assertEqual(writer._deferred_flush_batches, 1)  # noqa: SLF001
         self.assertEqual(writer._dropped_flush_batches, 0)  # noqa: SLF001
         self.assertEqual(
-            writer._error_counts.get("bg.flush_batch.deferred"), 1  # noqa: SLF001
+            writer._error_counts.get("bg.flush_batch.deferred"),
+            1,  # noqa: SLF001
         )
         self.assertIsNone(  # noqa: SLF001 — `_error_counts` only carries the deferred bucket
             writer._error_counts.get("bg.flush_batch.dropped")
@@ -3199,9 +3351,7 @@ class HdfWriterLosslessHandoffTests(unittest.TestCase):
                 self.assertEqual(len(writer._pending_context_rows), 1)  # noqa: SLF001
                 self.assertEqual(writer._context_table_ds.shape[0], 0)  # noqa: SLF001
                 # Bg write path drains + persists it.
-                _r, _e, _s, _m, context_rows = (
-                    writer._snapshot_main_loop_buffers()  # noqa: SLF001
-                )
+                _r, _e, _s, _m, context_rows = writer._snapshot_main_loop_buffers()  # noqa: SLF001
                 self.assertEqual(len(context_rows), 1)
                 self.assertEqual(writer._pending_context_rows, [])  # noqa: SLF001
                 writer._handle_flush_batch(  # noqa: SLF001
@@ -3209,7 +3359,8 @@ class HdfWriterLosslessHandoffTests(unittest.TestCase):
                 )
                 self.assertEqual(writer._context_table_ds.shape[0], 1)  # noqa: SLF001
                 self.assertEqual(
-                    int(writer._context_table_ds[0]["context_id"]), 7  # noqa: SLF001
+                    int(writer._context_table_ds[0]["context_id"]),
+                    7,  # noqa: SLF001
                 )
 
     def test_stream_handoff_via_snapshot_is_lossless(self) -> None:
@@ -3353,9 +3504,7 @@ class WritingActiveTelemetryTests(unittest.TestCase):
 
         # First pass: schema advertise + telemetry publish; second pass: publish only.
         self.assertEqual(len(calls), 3)
-        self.assertEqual(
-            calls[0]["type"], "manager.process_telemetry.schema.advertise"
-        )
+        self.assertEqual(calls[0]["type"], "manager.process_telemetry.schema.advertise")
         self.assertEqual(calls[1]["type"], "manager.events.publish")
         self.assertEqual(calls[1]["topic"], "manager.process_telemetry_update")
         sig = calls[1]["payload"]["signals"]["writing_active"]
@@ -3763,9 +3912,7 @@ class HdfWriterRunMetadataCaptureTests(unittest.TestCase):
                     def captured() -> bool:
                         with writer._h5_lock:  # noqa: SLF001
                             grp = h5.get("run_metadata")
-                            return bool(
-                                grp is not None and "d0" in grp and "d1" in grp
-                            )
+                            return bool(grp is not None and "d0" in grp and "d1" in grp)
 
                     # ...but the bg thread still captures it shortly after.
                     self.assertTrue(_wait_for(captured, timeout_s=6.0))
@@ -3816,12 +3963,25 @@ class HdfWriterProcessDisableTests(unittest.TestCase):
                 device_map: dict = {}
                 schema = {
                     "processes": [
-                        {"process_id": "p1", "signals": ["x"], "dtypes": ["float64"], "units": [""]},
-                        {"process_id": "p2", "signals": ["y"], "dtypes": ["float64"], "units": [""]},
+                        {
+                            "process_id": "p1",
+                            "signals": ["x"],
+                            "dtypes": ["float64"],
+                            "units": [""],
+                        },
+                        {
+                            "process_id": "p2",
+                            "signals": ["y"],
+                            "dtypes": ["float64"],
+                            "units": [""],
+                        },
                     ]
                 }
                 seen = _ingest_process_schema(
-                    schema, grp, datasets, device_map,
+                    schema,
+                    grp,
+                    datasets,
+                    device_map,
                     write_enabled=lambda pid: pid != "p2",
                 )
                 self.assertEqual(seen, {"p1", "p2"})
@@ -3872,9 +4032,7 @@ class HdfWriterProcessDisableTests(unittest.TestCase):
             )
             self.assertTrue(resp2["ok"])
             self.assertNotIn("spb_microwave", w._disabled_processes)  # noqa: SLF001
-            self.assertIn(
-                "spb_microwave", resp2["result"]["enabled_known_processes"]
-            )
+            self.assertIn("spb_microwave", resp2["result"]["enabled_known_processes"])
 
     def test_processes_toggle_rpc_requires_ids(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -4007,9 +4165,7 @@ class HdfWriterStreamStartSkipsOldRingTests(unittest.TestCase):
                         w._stream_pending_by_seq.get(key, {}).keys()  # noqa: SLF001
                     )
                     buf = w._stream_buffers.get(key, {})  # noqa: SLF001
-                    buffered = set(
-                        buf.get("seq", []) if isinstance(buf, dict) else []
-                    )
+                    buffered = set(buf.get("seq", []) if isinstance(buf, dict) else [])
                     self.assertEqual(pending | buffered, {6})
             finally:
                 ring.close()
@@ -4046,12 +4202,24 @@ class HdfWriterErrorAttributionTests(unittest.TestCase):
                 errors: list = []
                 schema = {
                     "devices": [
-                        {"device_id": "good", "signals": ["v"], "dtypes": ["float64"], "units": [""]},
-                        {"device_id": "bad", "signals": ["v"], "dtypes": ["not_a_dtype"], "units": [""]},
+                        {
+                            "device_id": "good",
+                            "signals": ["v"],
+                            "dtypes": ["float64"],
+                            "units": [""],
+                        },
+                        {
+                            "device_id": "bad",
+                            "signals": ["v"],
+                            "dtypes": ["not_a_dtype"],
+                            "units": [""],
+                        },
                     ]
                 }
                 _ingest_schema(
-                    schema, grp, datasets,
+                    schema,
+                    grp,
+                    datasets,
                     on_error=lambda did, exc: errors.append((did, str(exc))),
                 )
                 self.assertIn("good", datasets)  # good device unaffected
@@ -4067,12 +4235,25 @@ class HdfWriterErrorAttributionTests(unittest.TestCase):
                 errors: list = []
                 schema = {
                     "processes": [
-                        {"process_id": "pgood", "signals": ["v"], "dtypes": ["float64"], "units": [""]},
-                        {"process_id": "pbad", "signals": ["v"], "dtypes": ["nope"], "units": [""]},
+                        {
+                            "process_id": "pgood",
+                            "signals": ["v"],
+                            "dtypes": ["float64"],
+                            "units": [""],
+                        },
+                        {
+                            "process_id": "pbad",
+                            "signals": ["v"],
+                            "dtypes": ["nope"],
+                            "units": [""],
+                        },
                     ]
                 }
                 seen = _ingest_process_schema(
-                    schema, grp, datasets, device_map,
+                    schema,
+                    grp,
+                    datasets,
+                    device_map,
                     on_error=lambda pid, exc: errors.append((pid, str(exc))),
                 )
                 self.assertIn("pgood", datasets)
@@ -4093,14 +4274,29 @@ class HdfWriterErrorAttributionTests(unittest.TestCase):
                     profile_id=None, values=None, require_profile=False
                 )
                 w._configure_active_file(  # noqa: SLF001
-                    h5, write_every_s=1.0, load_manager_state=False, measurement_meta=meta
+                    h5,
+                    write_every_s=1.0,
+                    load_manager_state=False,
+                    measurement_meta=meta,
                 )
                 # Two devices sharing the write path; both datasets pre-created.
                 _ingest_schema(
-                    {"devices": [
-                        {"device_id": "devok", "signals": ["v"], "dtypes": ["float64"], "units": [""]},
-                        {"device_id": "devbad", "signals": ["v"], "dtypes": ["float64"], "units": [""]},
-                    ]},
+                    {
+                        "devices": [
+                            {
+                                "device_id": "devok",
+                                "signals": ["v"],
+                                "dtypes": ["float64"],
+                                "units": [""],
+                            },
+                            {
+                                "device_id": "devbad",
+                                "signals": ["v"],
+                                "dtypes": ["float64"],
+                                "units": [""],
+                            },
+                        ]
+                    },
                     w._telemetry_group,  # noqa: SLF001
                     w._datasets,  # noqa: SLF001
                 )
@@ -4118,7 +4314,11 @@ class HdfWriterErrorAttributionTests(unittest.TestCase):
                     return real(value, dtype_str)
 
                 rows = [
-                    {"device_id": "devbad", "signals": {"v": {"value": "BOOM"}}, "ts": {}},
+                    {
+                        "device_id": "devbad",
+                        "signals": {"v": {"value": "BOOM"}},
+                        "ts": {},
+                    },
                     {"device_id": "devok", "signals": {"v": {"value": 1.0}}, "ts": {}},
                 ]
                 with patch.object(hdf_writer_module, "_convert_value", _flaky):
@@ -4127,12 +4327,11 @@ class HdfWriterErrorAttributionTests(unittest.TestCase):
                 # Good device written despite the bad one; bad one named.
                 self.assertEqual(int(w._datasets["devok"].shape[0]), 1)  # noqa: SLF001
                 self.assertEqual(int(w._datasets["devbad"].shape[0]), 0)  # noqa: SLF001
-                topics = [
-                    kw.get("topic") for kw in published
-                ]
+                topics = [kw.get("topic") for kw in published]
                 self.assertIn("hdf.telemetry_write_error", topics)
                 evt = next(
-                    kw for kw in published
+                    kw
+                    for kw in published
                     if kw.get("topic") == "hdf.telemetry_write_error"
                 )
                 self.assertEqual(evt["payload"]["device_id"], "devbad")

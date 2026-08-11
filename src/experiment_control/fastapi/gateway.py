@@ -14,6 +14,7 @@ from typing import Any
 import numpy as np
 import zmq
 
+from ..contracts.messages import parse_chunk_sequence_range
 from ..shm.shm_ring import ShmRingReader
 from ..utils.zmq_helpers import json_dumps, safe_json_loads
 
@@ -82,7 +83,9 @@ class RouterRpcClient:
         self._inflight_depth = 0
 
     @staticmethod
-    def _error(code: str, message: str, *, details: dict[str, Any] | None = None) -> dict:
+    def _error(
+        code: str, message: str, *, details: dict[str, Any] | None = None
+    ) -> dict:
         err: dict[str, Any] = {"code": code, "message": message}
         if details:
             err["details"] = details
@@ -96,7 +99,9 @@ class RouterRpcClient:
             return
         self._loop = loop
         self._stop.clear()
-        self._thread = threading.Thread(target=self._run, name="router-rpc", daemon=True)
+        self._thread = threading.Thread(
+            target=self._run, name="router-rpc", daemon=True
+        )
         self._thread.start()
 
     def close(self) -> None:
@@ -875,7 +880,9 @@ class StreamFrameHub:
         if (
             context_fields_by_record
             and context_fields_by_record[0]
-            and all(item == context_fields_by_record[0] for item in context_fields_by_record)
+            and all(
+                item == context_fields_by_record[0] for item in context_fields_by_record
+            )
         ):
             out["context_fields"] = dict(context_fields_by_record[0])
         return {"topic": "manager.stream_records", "payload": out}
@@ -911,9 +918,17 @@ class StreamFrameHub:
 
             context_id: int | None = None
             context_fields: dict[str, Any] | None = None
-            msg_seq: int | None = None
+            try:
+                seq_range = parse_chunk_sequence_range(
+                    payload,
+                    max_batch_count=self._context_cache_limit,
+                )
+            except ValueError:
+                self._drop_stream_key(key, reason="error")
+                continue
+            msg_seq = None if seq_range is None else seq_range.final_seq
+            msg_first_seq = None if seq_range is None else seq_range.first_seq
             if isinstance(payload, dict):
-                msg_seq = self._normalize_int(payload.get("seq"))
                 context_id_raw = payload.get("context_id")
                 if context_id_raw is not None:
                     context_id = self._normalize_int(context_id_raw)
@@ -922,19 +937,17 @@ class StreamFrameHub:
                     context_fields = fields
             if msg_seq is not None:
                 bucket = self._context_by_seq.setdefault(key, OrderedDict())
-                seq_key = int(msg_seq)
-                # If the seq already has an entry, drop it first so the
-                # refreshed value lands at the end of the insertion
-                # order. Without this, an out-of-order or replayed seq
-                # would update in place and `popitem(last=False)` would
-                # evict the wrong entry (matches the B3 sibling pattern
-                # in processes/stream_analysis.py).
-                if seq_key in bucket:
-                    del bucket[seq_key]
-                bucket[seq_key] = (
-                    int(context_id) if context_id is not None else None,
-                    dict(context_fields) if context_fields is not None else None,
+                first_seq = (
+                    int(msg_first_seq) if msg_first_seq is not None else int(msg_seq)
                 )
+                for seq_key in range(first_seq, int(msg_seq) + 1):
+                    # Refresh insertion order for replayed/out-of-order seqs.
+                    if seq_key in bucket:
+                        del bucket[seq_key]
+                    bucket[seq_key] = (
+                        int(context_id) if context_id is not None else None,
+                        dict(context_fields) if context_fields is not None else None,
+                    )
                 # O(1) drop-oldest via OrderedDict; insertion order now
                 # tracks lowest-seq even under out-of-order arrival, so
                 # we never accidentally evict a still-needed recent seq.
@@ -954,9 +967,18 @@ class StreamFrameHub:
                     self._drop_stream_key(key, reason="error")
                     continue
                 self._readers[key] = reader
-                self._last_seq[key] = 0
+                initial_seq = msg_first_seq if msg_first_seq is not None else msg_seq
+                self._last_seq[key] = max(0, int(initial_seq or 1) - 1)
                 self._stream_context.pop(key, None)
                 self._context_by_seq.pop(key, None)
+            try:
+                parse_chunk_sequence_range(
+                    payload,
+                    max_batch_count=reader.layout.slot_count,
+                )
+            except ValueError:
+                self._drop_stream_key(key, reason="error")
+                continue
 
             last_seq = int(self._last_seq.get(key, 0))
             try:
@@ -977,7 +999,11 @@ class StreamFrameHub:
             if not stream_events:
                 context_bucket = self._context_by_seq.get(key)
                 if context_bucket is not None:
-                    stale = [seq for seq in context_bucket.keys() if int(seq) <= int(last_seq)]
+                    stale = [
+                        seq
+                        for seq in context_bucket.keys()
+                        if int(seq) <= int(last_seq)
+                    ]
                     for seq in stale:
                         context_bucket.pop(seq, None)
                     if not context_bucket:
@@ -1023,7 +1049,13 @@ class StreamFrameHub:
                     event_context_id is None
                     and event_context_fields is None
                     and msg_seq is not None
-                    and seq_raw == msg_seq
+                    and (
+                        (msg_first_seq is None and seq_raw == msg_seq)
+                        or (
+                            msg_first_seq is not None
+                            and msg_first_seq <= seq_raw <= msg_seq
+                        )
+                    )
                 ):
                     event_context_id = context_id
                     event_context_fields = context_fields
@@ -1069,7 +1101,9 @@ class StreamFrameHub:
                         # walk per frame.
                         with self._lock:
                             self._latest_frame[key] = {
-                                "topic": str(msg.get("topic") or "manager.stream_frame"),
+                                "topic": str(
+                                    msg.get("topic") or "manager.stream_frame"
+                                ),
                                 "payload": dict(payload_obj),
                             }
                     self._loop.call_soon_threadsafe(self._fanout, msg)
@@ -1101,7 +1135,9 @@ class StreamFrameHub:
             self._last_seq[key] = latest_seq
             context_bucket = self._context_by_seq.get(key)
             if context_bucket is not None:
-                stale = [seq for seq in context_bucket.keys() if int(seq) <= int(latest_seq)]
+                stale = [
+                    seq for seq in context_bucket.keys() if int(seq) <= int(latest_seq)
+                ]
                 for seq in stale:
                     context_bucket.pop(seq, None)
                 if not context_bucket:
