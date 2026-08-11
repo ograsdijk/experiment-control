@@ -299,8 +299,12 @@ Notes:
 - `run_meta_calls` is a per-measurement snapshot schema:
   - list of driver method calls + extractors used to build `run_metadata` dicts
   - snapshots are written by HDF writer under `/run_metadata/<device_id>/json`
-  - snapshots are captured at HDF measurement/file start (`hdf.rotate`) for
-    local devices via direct `collect_run_metadata` RPC calls from HDF writer.
+  - snapshots are required at HDF measurement/file start for every enabled
+    local or federated device that declares at least one call
+  - calls run concurrently using the per-device `effective_rpc_timeout_ms`
+    reported by `device.list_status`, plus a fixed transport allowance
+  - start/rotation fails atomically if any declared snapshot is unavailable or
+    invalid; failed rotation leaves the old file active
   - optional `manager.run_metadata` topic events are also ingested by HDF writer
     if another process publishes them.
 
@@ -379,6 +383,8 @@ Notes:
     - dataset `stream_metadata_json` (effective stream metadata JSON)
     - dataset `run_meta_calls_json` (configured run metadata schema JSON)
   - Per-measurement run snapshots are written under `/run_metadata/<device_id>/json`.
+  - The new file is not published as active until all declared run snapshots
+    have been collected and written.
   - Recommended startup policy: do not auto-start `hdf_writer`; start it when you
     are ready to open a new file via `hdf.rotate` with measurement parameters.
 - Sequencer lifecycle and loaded YAML snapshots are written under `/sequencer`.

@@ -2106,6 +2106,7 @@ class Manager(
         hb = handle.last_hb
         return {
             "device_id": device_id,
+            "effective_rpc_timeout_ms": int(self._device_rpc_timeout_ms),
             "registered": (
                 handle.rpc_endpoint is not None and handle.pub_endpoint is not None
             ),

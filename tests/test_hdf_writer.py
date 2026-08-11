@@ -2597,11 +2597,11 @@ class HdfWriterMetadataConsolidationTests(unittest.TestCase):
                 self.assertEqual(pending.get("shared"), "config")
                 self.assertNotIn("from_driver", pending)
 
-            self.assertIn(("trace1", "collect_run_metadata"), calls)
+            self.assertNotIn(("trace1", "collect_run_metadata"), calls)
             self.assertNotIn(("trace1", "device_metadata"), calls)
             self.assertNotIn(("trace1", "stream_metadata"), calls)
 
-    def test_configure_active_file_collects_run_metadata_for_local_devices(
+    def test_configure_active_file_collects_local_and_federated_run_metadata(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -2616,6 +2616,7 @@ class HdfWriterMetadataConsolidationTests(unittest.TestCase):
                 "device_metadata": {"device_type": "dummy_trace"},
                 "stream_metadata": {},
                 "stream_calls": [],
+                "run_meta_calls": [{"method": "get_config_snapshot"}],
             }
             remote_cfg = {
                 "device_id": "remote_trace",
@@ -2625,6 +2626,31 @@ class HdfWriterMetadataConsolidationTests(unittest.TestCase):
                 "device_metadata": {"device_type": "dummy_trace"},
                 "stream_metadata": {},
                 "stream_calls": [],
+                "run_meta_calls": [{"method": "get_config_snapshot"}],
+            }
+            writer._fetch_run_metadata_status_map = lambda: {  # type: ignore[method-assign]  # noqa: SLF001
+                "trace1": {
+                    "device_id": "trace1",
+                    "registered": True,
+                    "rpc_endpoint": "inproc://trace1",
+                    "liveness": "ONLINE",
+                    "device_reachable": True,
+                    "driver_process": {"state": "RUNNING"},
+                    "effective_rpc_timeout_ms": 1000,
+                    "source_kind": "local",
+                    "is_remote": False,
+                },
+                "remote_trace": {
+                    "device_id": "remote_trace",
+                    "registered": True,
+                    "rpc_endpoint": "tcp://peer:6000",
+                    "liveness": "ONLINE",
+                    "device_reachable": True,
+                    "driver_process": {"state": "FEDERATED"},
+                    "effective_rpc_timeout_ms": 4000,
+                    "source_kind": "federated",
+                    "is_remote": True,
+                },
             }
 
             writer._fetch_schema_with_backoff = (  # type: ignore[method-assign]  # noqa: SLF001
@@ -2636,19 +2662,16 @@ class HdfWriterMetadataConsolidationTests(unittest.TestCase):
 
             import experiment_control.processes.hdf_writer as hw
 
-            calls: list[tuple[str, str]] = []
+            calls: list[tuple[str, str, int]] = []
 
             def _fake_call(
                 *, device_id: str, action: str, timeout_ms: int = 1200
             ) -> object:
-                _ = timeout_ms
-                calls.append((device_id, action))
-                if action == "collect_run_metadata" and device_id == "trace1":
-                    return hw._OptionalDeviceActionResult(  # noqa: SLF001
-                        ok=True,
-                        result={"frequency_hz": 12_345.0, "mode": "lock"},
-                    )
-                return hw._OptionalDeviceActionResult(ok=True)  # noqa: SLF001
+                calls.append((device_id, action, timeout_ms))
+                return hw._OptionalDeviceActionResult(  # noqa: SLF001
+                    ok=True,
+                    result={"device": device_id},
+                )
 
             writer._call_optional_device_action_result = _fake_call  # type: ignore[method-assign]  # noqa: SLF001
 
@@ -2670,12 +2693,14 @@ class HdfWriterMetadataConsolidationTests(unittest.TestCase):
                 assert run_meta_group is not None
                 ds = run_meta_group["trace1"]["json"]
                 payload = json.loads(_as_text(ds[()]))
-                self.assertEqual(payload.get("frequency_hz"), 12_345.0)
-                self.assertEqual(payload.get("mode"), "lock")
-                self.assertNotIn("remote_trace", run_meta_group)
+                self.assertEqual(payload.get("device"), "trace1")
+                remote_payload = json.loads(
+                    _as_text(run_meta_group["remote_trace"]["json"][()])
+                )
+                self.assertEqual(remote_payload.get("device"), "remote_trace")
 
-            self.assertIn(("trace1", "collect_run_metadata"), calls)
-            self.assertNotIn(("remote_trace", "collect_run_metadata"), calls)
+            self.assertIn(("trace1", "collect_run_metadata", 1250), calls)
+            self.assertIn(("remote_trace", "collect_run_metadata", 4250), calls)
 
 
 class HdfWriterDeviceMetadataStorageTests(unittest.TestCase):
@@ -3560,28 +3585,24 @@ class WritingActiveTelemetryTests(unittest.TestCase):
 
 
 class HdfWriterRunMetadataCaptureTests(unittest.TestCase):
-    """Regression tests for the file-open stall that silently dropped all
-    telemetry (config + datasets present, 0 telemetry rows, dropped_local=0).
-    Root cause: run-metadata capture ran its slow serial per-device RPCs
-    inline in _configure_active_file, blocking the single SUB-drain loop.
-    Fix: capture runs OFF the main loop (bg thread) with the RPCs parallelized.
-    """
-
-    def _open_writer_file(self, writer: HdfWriter, h5: h5py.File) -> None:
-        meta = writer._build_measurement_metadata(  # noqa: SLF001
-            profile_id=None, values=None, require_profile=False
-        )
-        with writer._h5_lock:  # noqa: SLF001
-            writer._configure_active_file(  # noqa: SLF001
-                h5,
-                write_every_s=1.0,
-                load_manager_state=False,
-                measurement_meta=meta,
-            )
+    """Required file-open snapshots use declared targets and per-device timeouts."""
 
     def test_capture_run_metadata_runs_rpcs_in_parallel(self) -> None:
         writer = _make_bg_test_writer()
-        writer._fetch_run_metadata_status_map = lambda: None  # type: ignore[assignment]  # noqa: SLF001
+        writer._fetch_run_metadata_status_map = lambda: {  # type: ignore[assignment]  # noqa: SLF001
+            f"d{i}": {
+                "device_id": f"d{i}",
+                "registered": True,
+                "rpc_endpoint": f"inproc://d{i}",
+                "liveness": "ONLINE",
+                "device_reachable": True,
+                "driver_process": {"state": "RUNNING"},
+                "effective_rpc_timeout_ms": 1000 + i,
+                "source_kind": "local",
+                "is_remote": False,
+            }
+            for i in range(10)
+        }
         lock = threading.Lock()
         active = [0]
         peak = [0]
@@ -3602,19 +3623,21 @@ class HdfWriterRunMetadataCaptureTests(unittest.TestCase):
             )
 
         writer._call_optional_device_action_result = collect  # type: ignore[assignment]  # noqa: SLF001
-        configs = [{"device_id": f"d{i}"} for i in range(4)]
-        with _temp_dir() as td:
-            with h5py.File(Path(td) / "parallel.h5", "w") as h5:
-                self._open_writer_file(writer, h5)
-                t0 = time.monotonic()
-                writer._capture_run_metadata_for_configs(configs)  # noqa: SLF001
-                elapsed = time.monotonic() - t0
-                self.assertGreater(peak[0], 1, "collect RPCs did not run concurrently")
-                self.assertLess(elapsed, 4 * 0.3 * 0.8, "capture ran serially")
-                self.assertEqual(len(h5["run_metadata"]), 4)
-                self.assertIn("json", h5["run_metadata"]["d0"])
+        configs = [
+            {"device_id": f"d{i}", "run_meta_calls": [{"method": "snapshot"}]}
+            for i in range(10)
+        ]
+        t0 = time.monotonic()
+        results = writer._collect_required_run_metadata(configs)  # noqa: SLF001
+        elapsed = time.monotonic() - t0
+        self.assertEqual(peak[0], 10, "not all collect RPCs ran concurrently")
+        self.assertLess(elapsed, 10 * 0.3 * 0.8, "capture ran serially")
+        self.assertEqual(
+            {device_id for device_id, _ in results},
+            {f"d{i}" for i in range(10)},
+        )
 
-    def test_capture_run_metadata_skips_unavailable_status_targets(self) -> None:
+    def test_capture_run_metadata_rejects_unavailable_status_targets(self) -> None:
         writer = _make_bg_test_writer()
         writer._fetch_run_metadata_status_map = lambda: {  # type: ignore[assignment]  # noqa: SLF001
             "online": {
@@ -3624,6 +3647,7 @@ class HdfWriterRunMetadataCaptureTests(unittest.TestCase):
                 "liveness": "ONLINE",
                 "device_reachable": True,
                 "driver_process": {"state": "RUNNING"},
+                "effective_rpc_timeout_ms": 1000,
                 "source_kind": "local",
                 "is_remote": False,
             },
@@ -3633,6 +3657,7 @@ class HdfWriterRunMetadataCaptureTests(unittest.TestCase):
                 "rpc_endpoint": None,
                 "liveness": "OFFLINE",
                 "driver_process": {"state": "STOPPED"},
+                "effective_rpc_timeout_ms": 1000,
                 "source_kind": "local",
                 "is_remote": False,
             },
@@ -3643,6 +3668,7 @@ class HdfWriterRunMetadataCaptureTests(unittest.TestCase):
                 "liveness": "ONLINE",
                 "device_reachable": True,
                 "driver_process": {"state": "EXITED"},
+                "effective_rpc_timeout_ms": 1000,
                 "source_kind": "local",
                 "is_remote": False,
             },
@@ -3653,8 +3679,20 @@ class HdfWriterRunMetadataCaptureTests(unittest.TestCase):
                 "liveness": "OFFLINE",
                 "device_reachable": False,
                 "driver_process": {"state": "RUNNING"},
+                "effective_rpc_timeout_ms": 1000,
                 "source_kind": "local",
                 "is_remote": False,
+            },
+            "remote": {
+                "device_id": "remote",
+                "registered": True,
+                "rpc_endpoint": "tcp://peer:6000",
+                "liveness": "ONLINE",
+                "device_reachable": True,
+                "driver_process": {"state": "FEDERATED"},
+                "effective_rpc_timeout_ms": 5000,
+                "source_kind": "federated",
+                "is_remote": True,
             },
         }
         calls: list[str] = []
@@ -3675,19 +3713,14 @@ class HdfWriterRunMetadataCaptureTests(unittest.TestCase):
 
         writer._call_optional_device_action_result = collect  # type: ignore[assignment]  # noqa: SLF001
         configs = [
-            {"device_id": "online"},
-            {"device_id": "unregistered"},
-            {"device_id": "stopped"},
-            {"device_id": "offline"},
-            {"device_id": "remote", "source_kind": "federated", "is_remote": True},
+            {"device_id": device_id, "run_meta_calls": [{"method": "snapshot"}]}
+            for device_id in ("online", "unregistered", "stopped", "offline", "remote")
         ]
-        with _temp_dir() as td:
-            with h5py.File(Path(td) / "skip_unavailable.h5", "w") as h5:
-                self._open_writer_file(writer, h5)
-                writer._capture_run_metadata_for_configs(configs)  # noqa: SLF001
-                self.assertEqual(set(h5["run_metadata"].keys()), {"online"})
 
-        self.assertEqual(calls, ["online"])
+        with self.assertRaisesRegex(RuntimeError, "required run metadata unavailable"):
+            writer._collect_required_run_metadata(configs)  # noqa: SLF001
+
+        self.assertEqual(calls, [])
         reasons = {
             item["payload"]["device_id"]: item["payload"]["reason"]
             for item in published
@@ -3696,9 +3729,9 @@ class HdfWriterRunMetadataCaptureTests(unittest.TestCase):
         self.assertEqual(reasons["unregistered"], "no_rpc_endpoint")
         self.assertEqual(reasons["stopped"], "driver_not_running")
         self.assertEqual(reasons["offline"], "device_not_reachable")
-        self.assertEqual(reasons["remote"], "remote_device")
+        self.assertNotIn("remote", reasons)
 
-    def test_capture_run_metadata_device_availability_failure_is_nonfatal(self) -> None:
+    def test_capture_run_metadata_rpc_failure_is_fatal(self) -> None:
         import experiment_control.processes.hdf_writer as hw
 
         writer = _make_bg_test_writer()
@@ -3710,6 +3743,7 @@ class HdfWriterRunMetadataCaptureTests(unittest.TestCase):
                 "liveness": "ONLINE",
                 "device_reachable": True,
                 "driver_process": {"state": "RUNNING"},
+                "effective_rpc_timeout_ms": 1000,
                 "source_kind": "local",
                 "is_remote": False,
             },
@@ -3720,6 +3754,7 @@ class HdfWriterRunMetadataCaptureTests(unittest.TestCase):
                 "liveness": "ONLINE",
                 "device_reachable": True,
                 "driver_process": {"state": "RUNNING"},
+                "effective_rpc_timeout_ms": 3000,
                 "source_kind": "local",
                 "is_remote": False,
             },
@@ -3748,13 +3783,16 @@ class HdfWriterRunMetadataCaptureTests(unittest.TestCase):
                     }
                 )
             )
-            with _temp_dir() as td:
-                with h5py.File(Path(td) / "availability_failure.h5", "w") as h5:
-                    self._open_writer_file(writer, h5)
-                    writer._capture_run_metadata_for_configs(  # noqa: SLF001
-                        [{"device_id": "good"}, {"device_id": "bad"}]
-                    )
-                    self.assertEqual(set(h5["run_metadata"].keys()), {"good"})
+            with self.assertRaisesRegex(RuntimeError, "bad: driver_not_running"):
+                writer._collect_required_run_metadata(  # noqa: SLF001
+                    [
+                        {
+                            "device_id": device_id,
+                            "run_meta_calls": [{"method": "snapshot"}],
+                        }
+                        for device_id in ("good", "bad")
+                    ]
+                )
         finally:
             hw._manager_rpc = orig  # type: ignore[assignment]
 
@@ -3770,61 +3808,69 @@ class HdfWriterRunMetadataCaptureTests(unittest.TestCase):
             any(name.startswith("hdf-runmeta") for name in publish_threads)
         )
 
-    def test_capture_run_metadata_does_not_swallow_hdf_write_errors(self) -> None:
+    def test_capture_run_metadata_rejects_invalid_result(self) -> None:
         import experiment_control.processes.hdf_writer as hw
 
         writer = _make_bg_test_writer()
-        writer._fetch_run_metadata_status_map = lambda: None  # type: ignore[assignment]  # noqa: SLF001
+        writer._fetch_run_metadata_status_map = lambda: {  # type: ignore[assignment]  # noqa: SLF001
+            "d0": {
+                "device_id": "d0",
+                "registered": True,
+                "rpc_endpoint": "inproc://d0",
+                "liveness": "ONLINE",
+                "device_reachable": True,
+                "driver_process": {"state": "RUNNING"},
+                "effective_rpc_timeout_ms": 1000,
+                "source_kind": "local",
+                "is_remote": False,
+            }
+        }
         writer._call_optional_device_action_result = (  # type: ignore[assignment]  # noqa: SLF001
             lambda **kw: hw._OptionalDeviceActionResult(  # noqa: SLF001
                 ok=True,
-                result={"device": kw["device_id"]},
+                result=[kw["device_id"]],
             )
         )
+        with self.assertRaisesRegex(RuntimeError, "d0: invalid_run_metadata"):
+            writer._collect_required_run_metadata(  # noqa: SLF001
+                [{"device_id": "d0", "run_meta_calls": [{"method": "snapshot"}]}]
+            )
 
-        def fail_write(msg: dict) -> None:
-            _ = msg
-            raise RuntimeError("hdf write failed")
-
-        writer._handle_run_metadata_locked = fail_write  # type: ignore[method-assign]  # noqa: SLF001
-        with _temp_dir() as td:
-            with h5py.File(Path(td) / "hard_error.h5", "w") as h5:
-                self._open_writer_file(writer, h5)
-                with self.assertRaisesRegex(RuntimeError, "hdf write failed"):
-                    writer._capture_run_metadata_for_configs([{"device_id": "d0"}])  # noqa: SLF001
-
-    def test_capture_deferred_to_bg_thread(self) -> None:
+    def test_devices_without_run_meta_calls_are_not_targets(self) -> None:
         writer = _make_bg_test_writer()
-        seen: dict[str, str] = {}
-        done = threading.Event()
+        writer._fetch_run_metadata_status_map = (  # type: ignore[method-assign]  # noqa: SLF001
+            lambda: self.fail("status should not be fetched")
+        )
+        self.assertEqual(
+            writer._collect_required_run_metadata([{"device_id": "d0"}]),  # noqa: SLF001
+            [],
+        )
 
-        def rec(configs, *, expected_measurement_id=None) -> None:  # noqa: ANN001
-            seen["thread"] = threading.current_thread().name
-            done.set()
-
-        writer._capture_run_metadata_for_configs = rec  # type: ignore[assignment]  # noqa: SLF001
-        thread = _spawn_bg_thread(writer)
-        try:
-            writer._enqueue_run_metadata_capture([{"device_id": "d0"}])  # noqa: SLF001
-            self.assertTrue(done.wait(2.0))
-            self.assertEqual(seen["thread"], "hdf-bg-flush")
-        finally:
-            writer._stop_evt.set()  # noqa: SLF001
-            writer._bg_queue.put(_BG_SENTINEL)  # noqa: SLF001
-            thread.join(timeout=1.0)
-
-    def test_capture_inline_fallback_when_no_bg_thread(self) -> None:
+    def test_invalid_run_meta_calls_configuration_is_fatal(self) -> None:
         writer = _make_bg_test_writer()
-        seen: dict[str, str] = {}
+        with self.assertRaisesRegex(RuntimeError, "invalid run_meta_calls.*d0"):
+            writer._collect_required_run_metadata(  # noqa: SLF001
+                [{"device_id": "d0", "run_meta_calls": "not-a-list"}]
+            )
 
-        def rec(configs, *, expected_measurement_id=None) -> None:  # noqa: ANN001
-            seen["thread"] = threading.current_thread().name
-
-        writer._capture_run_metadata_for_configs = rec  # type: ignore[assignment]  # noqa: SLF001
-        # No bg thread spawned -> _bg_thread is None -> inline fallback so
-        # metadata is never silently skipped.
-        writer._enqueue_run_metadata_capture([{"device_id": "d0"}])  # noqa: SLF001
-        self.assertEqual(seen["thread"], threading.current_thread().name)
+    def test_missing_effective_timeout_is_fatal(self) -> None:
+        writer = _make_bg_test_writer()
+        writer._fetch_run_metadata_status_map = lambda: {  # type: ignore[method-assign]  # noqa: SLF001
+            "d0": {
+                "device_id": "d0",
+                "registered": True,
+                "rpc_endpoint": "inproc://d0",
+                "liveness": "ONLINE",
+                "device_reachable": True,
+                "driver_process": {"state": "RUNNING"},
+                "source_kind": "local",
+                "is_remote": False,
+            }
+        }
+        with self.assertRaisesRegex(RuntimeError, "invalid_effective_rpc_timeout"):
+            writer._collect_required_run_metadata(  # noqa: SLF001
+                [{"device_id": "d0", "run_meta_calls": [{"method": "snapshot"}]}]
+            )
 
     def test_optional_device_action_accepts_status_ok_envelope(self) -> None:
         """Device commands routed via the manager return the raw driver
@@ -3868,58 +3914,136 @@ class HdfWriterRunMetadataCaptureTests(unittest.TestCase):
         finally:
             hw._manager_rpc = orig  # type: ignore[assignment]
 
-    def test_start_writing_does_not_stall_on_slow_run_metadata(self) -> None:
-        """Load-manager-state file-open must return promptly even when
-        collect_run_metadata is slow — the capture is deferred to the bg
-        thread. This is the direct regression for the telemetry-loss stall."""
+    def test_file_is_not_active_until_required_metadata_succeeds(self) -> None:
         writer = _make_bg_test_writer()
         writer._fetch_schema_with_backoff = lambda **k: None  # type: ignore[assignment]  # noqa: SLF001
         writer._fetch_process_schema_best_effort = lambda: None  # type: ignore[assignment]  # noqa: SLF001
         writer._fetch_config_with_backoff = (  # type: ignore[assignment]  # noqa: SLF001
-            lambda **k: [{"device_id": "d0"}, {"device_id": "d1"}]
+            lambda **k: [
+                {"device_id": device_id, "run_meta_calls": [{"method": "snapshot"}]}
+                for device_id in ("d0", "d1")
+            ]
         )
+        writer._fetch_run_metadata_status_map = lambda: {  # type: ignore[assignment]  # noqa: SLF001
+            device_id: {
+                "device_id": device_id,
+                "registered": True,
+                "rpc_endpoint": f"inproc://{device_id}",
+                "liveness": "ONLINE",
+                "device_reachable": True,
+                "driver_process": {"state": "RUNNING"},
+                "effective_rpc_timeout_ms": 1000,
+                "source_kind": "local",
+                "is_remote": False,
+            }
+            for device_id in ("d0", "d1")
+        }
 
         import experiment_control.processes.hdf_writer as hw
 
+        active_during_call: list[bool] = []
+
         def slow_collect(*, device_id: str, action: str, timeout_ms: int) -> object:
             _ = action, timeout_ms
-            time.sleep(2.0)
+            active_during_call.append(writer._h5 is not None)  # noqa: SLF001
+            time.sleep(0.2)
             return hw._OptionalDeviceActionResult(  # noqa: SLF001
                 ok=True,
                 result={"device": device_id, "sample_rate_hz": 1.0},
             )
 
         writer._call_optional_device_action_result = slow_collect  # type: ignore[assignment]  # noqa: SLF001
-        thread = _spawn_bg_thread(writer)
-        try:
-            with _temp_dir() as td:
-                with h5py.File(Path(td) / "stall.h5", "w") as h5:
-                    meta = writer._build_measurement_metadata(  # noqa: SLF001
-                        profile_id=None, values=None, require_profile=False
+        with _temp_dir() as td:
+            with h5py.File(Path(td) / "required.h5", "w") as h5:
+                meta = writer._build_measurement_metadata(  # noqa: SLF001
+                    profile_id=None, values=None, require_profile=False
+                )
+                t0 = time.monotonic()
+                with writer._h5_lock:  # noqa: SLF001
+                    writer._configure_active_file(  # noqa: SLF001
+                        h5,
+                        write_every_s=1.0,
+                        load_manager_state=True,
+                        measurement_meta=meta,
                     )
-                    t0 = time.monotonic()
-                    with writer._h5_lock:  # noqa: SLF001
-                        writer._configure_active_file(  # noqa: SLF001
-                            h5,
-                            write_every_s=1.0,
-                            load_manager_state=True,
-                            measurement_meta=meta,
-                        )
-                    elapsed = time.monotonic() - t0
-                    # File-open did NOT wait on the 2s collect RPCs.
-                    self.assertLess(elapsed, 1.0)
+                elapsed = time.monotonic() - t0
+                self.assertGreaterEqual(elapsed, 0.18)
+                self.assertEqual(active_during_call, [False, False])
+                self.assertEqual(set(h5["run_metadata"].keys()), {"d0", "d1"})
 
-                    def captured() -> bool:
-                        with writer._h5_lock:  # noqa: SLF001
-                            grp = h5.get("run_metadata")
-                            return bool(grp is not None and "d0" in grp and "d1" in grp)
+    def test_start_failure_removes_partial_file_and_stays_inactive(self) -> None:
+        import experiment_control.processes.hdf_writer as hw
 
-                    # ...but the bg thread still captures it shortly after.
-                    self.assertTrue(_wait_for(captured, timeout_s=6.0))
-        finally:
-            writer._stop_evt.set()  # noqa: SLF001
-            writer._bg_queue.put(_BG_SENTINEL)  # noqa: SLF001
-            thread.join(timeout=2.0)
+        with _temp_dir() as td:
+            writer = _make_bg_test_writer()
+            writer._out_dir = Path(td)  # noqa: SLF001
+            writer._process_id = "hdf_writer"  # noqa: SLF001
+            writer._fetch_config_with_backoff = lambda **k: [  # type: ignore[method-assign]  # noqa: SLF001
+                {"device_id": "d0", "run_meta_calls": [{"method": "snapshot"}]}
+            ]
+            writer._fetch_run_metadata_status_map = lambda: {  # type: ignore[method-assign]  # noqa: SLF001
+                "d0": {
+                    "device_id": "d0",
+                    "registered": True,
+                    "rpc_endpoint": "inproc://d0",
+                    "liveness": "ONLINE",
+                    "device_reachable": True,
+                    "driver_process": {"state": "RUNNING"},
+                    "effective_rpc_timeout_ms": 1000,
+                    "source_kind": "local",
+                    "is_remote": False,
+                }
+            }
+            writer._call_optional_device_action_result = (  # type: ignore[method-assign]  # noqa: SLF001
+                lambda **k: hw._OptionalDeviceActionResult(  # noqa: SLF001
+                    ok=False, reason="driver_not_running"
+                )
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "d0: driver_not_running"):
+                writer._start_writing_file(filename="failed.h5")  # noqa: SLF001
+
+            self.assertIsNone(writer._h5)  # noqa: SLF001
+            self.assertFalse((Path(td) / "failed.h5").exists())
+
+    def test_rotate_failure_keeps_old_file_active(self) -> None:
+        import experiment_control.processes.hdf_writer as hw
+
+        with _temp_dir() as td:
+            writer = _make_bg_test_writer()
+            writer._out_dir = Path(td)  # noqa: SLF001
+            writer._start_writing_file(filename="old.h5")  # noqa: SLF001
+            old_h5 = writer._h5  # noqa: SLF001
+            writer._process_id = "hdf_writer"  # noqa: SLF001
+            writer._fetch_config_with_backoff = lambda **k: [  # type: ignore[method-assign]  # noqa: SLF001
+                {"device_id": "d0", "run_meta_calls": [{"method": "snapshot"}]}
+            ]
+            writer._fetch_run_metadata_status_map = lambda: {  # type: ignore[method-assign]  # noqa: SLF001
+                "d0": {
+                    "device_id": "d0",
+                    "registered": True,
+                    "rpc_endpoint": "inproc://d0",
+                    "liveness": "ONLINE",
+                    "device_reachable": True,
+                    "driver_process": {"state": "RUNNING"},
+                    "effective_rpc_timeout_ms": 1000,
+                    "source_kind": "local",
+                    "is_remote": False,
+                }
+            }
+            writer._call_optional_device_action_result = (  # type: ignore[method-assign]  # noqa: SLF001
+                lambda **k: hw._OptionalDeviceActionResult(  # noqa: SLF001
+                    ok=False, reason="rpc_failed"
+                )
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "d0: rpc_failed"):
+                writer._rotate_file(filename="new.h5")  # noqa: SLF001
+
+            self.assertIs(writer._h5, old_h5)  # noqa: SLF001
+            self.assertTrue(bool(old_h5))
+            self.assertFalse((Path(td) / "new.h5").exists())
+            writer._stop_writing_file()  # noqa: SLF001
 
 
 class HdfWriterProcessDisableTests(unittest.TestCase):

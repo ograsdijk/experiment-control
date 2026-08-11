@@ -109,6 +109,10 @@ Request:
 Response:
 - `{"ok": true, "result": [{"device_id": "hv", "liveness": "ONLINE", "...": "..."}]}`
 
+Each entry includes `effective_rpc_timeout_ms`, the timeout that clients should
+allow for a command to that device. It is the manager device RPC timeout for a
+local device and the owning federation peer's `rpc_timeout_ms` for a mirror.
+
 ### `manager.telemetry.snapshot`
 Request:
 - `{"type": "manager.telemetry.snapshot"}`
@@ -840,8 +844,14 @@ Influx writer (wide mode) also consumes `manager.device_config`:
 
 HDF storage:
 - `/run_metadata/<device_id>/json` (scalar JSON dataset)
-- Captured at HDF measurement/file start (`hdf.rotate`) for local devices via
-  direct `collect_run_metadata` RPC calls from HDF writer.
+- Before HDF measurement/file start completes, every enabled local or federated
+  device with non-empty `run_meta_calls` must return a valid
+  `collect_run_metadata` result.
+- Calls run concurrently. Each call uses that device's
+  `effective_rpc_timeout_ms` plus a fixed transport allowance.
+- A missing/unavailable device, invalid timeout/result, denied federated call,
+  or RPC failure aborts start/rotation; a new partial file is not retained and
+  an existing file remains active after a failed rotation.
 - If any process publishes `manager.run_metadata`, HDF writer also ingests it.
 
 ### `manager.telemetry_stale`
