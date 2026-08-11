@@ -47,7 +47,6 @@ from .hdf_writer_bg import (
     _BG_SENTINEL as _BG_SENTINEL,
     _BgRequest as _BgRequest,
     _BgSentinel as _BgSentinel,
-    _CaptureRunMetadataRequest as _CaptureRunMetadataRequest,
     _CaptureSequencerYamlRequest as _CaptureSequencerYamlRequest,
     _DevicesToggleRequest as _DevicesToggleRequest,
     _FlushBatch as _FlushBatch,
@@ -75,6 +74,7 @@ from .process_base import ManagedProcessBase
 Json = dict[str, Any]
 EventLogMode = Literal["all", "failures_only", "none"]
 EVENT_LOG_MODES: tuple[EventLogMode, ...] = ("all", "failures_only", "none")
+_RUN_METADATA_TRANSPORT_ALLOWANCE_MS = 250
 
 
 def _validated_frame_metadata_dtype(raw: Any) -> np.dtype[Any]:
@@ -1077,11 +1077,6 @@ class HdfWriter(ManagedProcessBase):
         return _OptionalDeviceActionResult(ok=True, result=resp.get("result"))
 
     @staticmethod
-    def _is_remote_config(config: Json) -> bool:
-        source_kind = str(config.get("source_kind", "")).strip().lower()
-        return bool(config.get("is_remote")) or source_kind == "federated"
-
-    @staticmethod
     def _metadata_rpc_failure_reason(resp: Json) -> str:
         error = resp.get("error")
         if isinstance(error, dict):
@@ -1126,24 +1121,26 @@ class HdfWriter(ManagedProcessBase):
         except Exception:
             pass
 
-    def _fetch_run_metadata_status_map(self) -> dict[str, Json] | None:
+    def _fetch_run_metadata_status_map(self) -> dict[str, Json]:
         try:
             resp = _manager_rpc(
                 self._ctx,
                 self._manager_rpc,
                 {"type": "device.list_status"},
-                timeout_ms=min(max(200, int(self._rpc_timeout_ms)), 500),
+                timeout_ms=max(200, int(self._rpc_timeout_ms)),
             )
-        except Exception:
+        except Exception as exc:
             self._bump_error("metadata.status.rpc")
-            return None
+            raise RuntimeError(
+                f"required run metadata status request failed: {exc}"
+            ) from exc
         if not isinstance(resp, dict) or not resp.get("ok", False):
             self._bump_error("metadata.status.rpc")
-            return None
+            raise RuntimeError("required run metadata status request failed")
         result = resp.get("result")
         if not isinstance(result, list):
             self._bump_error("metadata.status.invalid")
-            return None
+            raise RuntimeError("required run metadata status response is invalid")
         statuses: dict[str, Json] = {}
         for item in result:
             if not isinstance(item, dict):
@@ -1156,15 +1153,14 @@ class HdfWriter(ManagedProcessBase):
     @staticmethod
     def _run_metadata_target_ready(status: Json) -> tuple[bool, str | None]:
         source_kind = str(status.get("source_kind") or "").strip().lower()
-        if bool(status.get("is_remote")) or source_kind == "federated":
-            return False, "remote_device"
+        is_remote = bool(status.get("is_remote")) or source_kind == "federated"
         if status.get("registered") is False:
             return False, "no_rpc_endpoint"
         rpc_endpoint = status.get("rpc_endpoint")
         if not isinstance(rpc_endpoint, str) or not rpc_endpoint.strip():
             return False, "no_rpc_endpoint"
         driver_process = status.get("driver_process")
-        if isinstance(driver_process, dict):
+        if not is_remote and isinstance(driver_process, dict):
             driver_state = str(driver_process.get("state") or "").strip().upper()
             if driver_state and driver_state != "RUNNING":
                 return False, "driver_not_running"
@@ -1178,27 +1174,12 @@ class HdfWriter(ManagedProcessBase):
             return False, "status_unavailable"
         return True, None
 
-    def _enqueue_run_metadata_capture(self, configs: list[Json]) -> None:
-        """Hand run-metadata capture to the bg thread so its slow per-device
-        RPCs don't stall the main SUB-drain loop during file-open. Falls back
-        to inline capture when the bg thread can't take it (autostart runs
-        file-open before the bg thread is spawned, or the thread has died),
-        so metadata is never silently skipped."""
-        req = _CaptureRunMetadataRequest(
-            configs=[copy.deepcopy(c) for c in configs],
-            measurement_id=self._measurement_id or "",
-        )
-        if self._bg_thread is None or self._bg_thread_dead:
-            self._capture_run_metadata_for_configs(
-                req.configs, expected_measurement_id=req.measurement_id
-            )
-            return
-        try:
-            self._bg_queue.put_nowait(req)
-        except queue.Full:
-            self._capture_run_metadata_for_configs(
-                req.configs, expected_measurement_id=req.measurement_id
-            )
+    @staticmethod
+    def _run_metadata_timeout_ms(status: Json) -> int:
+        raw = status.get("effective_rpc_timeout_ms")
+        if isinstance(raw, bool) or not isinstance(raw, int) or raw <= 0:
+            raise ValueError("missing or invalid effective_rpc_timeout_ms")
+        return raw + _RUN_METADATA_TRANSPORT_ALLOWANCE_MS
 
     def _enqueue_sequencer_yaml_capture(self, *, process_id: str) -> None:
         req = _CaptureSequencerYamlRequest(
@@ -1219,12 +1200,9 @@ class HdfWriter(ManagedProcessBase):
                 message="loaded_yaml snapshot skipped: background queue full",
             )
 
-    def _capture_run_metadata_for_configs(
-        self,
-        configs: list[Json],
-        *,
-        expected_measurement_id: str | None = None,
-    ) -> None:
+    def _collect_required_run_metadata(
+        self, configs: list[Json]
+    ) -> list[tuple[str, Json]]:
         seen: set[str] = set()
         candidates: list[str] = []
         for config in configs:
@@ -1234,49 +1212,65 @@ class HdfWriter(ManagedProcessBase):
             seen.add(device_id)
             if not self._is_device_enabled(device_id):
                 continue
-            if self._is_remote_config(config):
-                self._report_metadata_target_unavailable(
-                    device_id=device_id,
-                    action="collect_run_metadata",
-                    reason="remote_device",
+            run_meta_calls = config.get("run_meta_calls")
+            if run_meta_calls is None:
+                continue
+            if not isinstance(run_meta_calls, list):
+                raise RuntimeError(
+                    f"invalid run_meta_calls configuration for {device_id}"
                 )
+            if not run_meta_calls:
                 continue
             candidates.append(device_id)
         if not candidates:
-            return
+            return []
 
-        targets: list[str] = []
+        targets: list[tuple[str, int]] = []
+        failures: list[str] = []
         status_by_device = self._fetch_run_metadata_status_map()
         for device_id in candidates:
-            if status_by_device is not None:
-                status = status_by_device.get(device_id)
-                if status is None:
-                    self._report_metadata_target_unavailable(
-                        device_id=device_id,
-                        action="collect_run_metadata",
-                        reason="status_unavailable",
-                    )
-                    continue
-                ready, reason = self._run_metadata_target_ready(status)
-                if not ready:
-                    self._report_metadata_target_unavailable(
-                        device_id=device_id,
-                        action="collect_run_metadata",
-                        reason=reason or "status_unavailable",
-                    )
-                    continue
-            targets.append(device_id)
-        if not targets:
-            return
+            status = status_by_device.get(device_id)
+            if status is None:
+                reason = "status_unavailable"
+                self._report_metadata_target_unavailable(
+                    device_id=device_id,
+                    action="collect_run_metadata",
+                    reason=reason,
+                )
+                failures.append(f"{device_id}: {reason}")
+                continue
+            ready, readiness_reason = self._run_metadata_target_ready(status)
+            if not ready:
+                failure_reason = readiness_reason or "status_unavailable"
+                self._report_metadata_target_unavailable(
+                    device_id=device_id,
+                    action="collect_run_metadata",
+                    reason=failure_reason,
+                )
+                failures.append(f"{device_id}: {failure_reason}")
+                continue
+            try:
+                timeout_ms = self._run_metadata_timeout_ms(status)
+            except ValueError as exc:
+                reason = "invalid_effective_rpc_timeout"
+                self._report_metadata_target_unavailable(
+                    device_id=device_id,
+                    action="collect_run_metadata",
+                    reason=reason,
+                    error=str(exc),
+                )
+                failures.append(f"{device_id}: {reason}")
+                continue
+            targets.append((device_id, timeout_ms))
+        if failures:
+            raise RuntimeError(
+                "required run metadata unavailable: " + "; ".join(failures)
+            )
 
-        timeout_ms = min(max(200, int(self._rpc_timeout_ms)), 1500)
-        # Fan the blocking collect_run_metadata RPCs out in parallel: each
-        # _manager_rpc opens its own DEALER socket on the shared thread-safe
-        # zmq.Context, so this turns N*1.5s serial into ~1.5s. NOTE: this may
-        # run on the bg thread (deferred) or inline (fallback) — the RPCs never
-        # touch h5, so no lock is needed here.
+        # Calls are concurrent, so total preflight time is bounded by the
+        # slowest target's effective device timeout rather than their sum.
         results: list[tuple[str, Json]] = []
-        max_workers = min(8, len(targets))
+        max_workers = len(targets)
         with ThreadPoolExecutor(
             max_workers=max_workers, thread_name_prefix="hdf-runmeta"
         ) as pool:
@@ -1287,7 +1281,7 @@ class HdfWriter(ManagedProcessBase):
                     action="collect_run_metadata",
                     timeout_ms=timeout_ms,
                 ): device_id
-                for device_id in targets
+                for device_id, timeout_ms in targets
             }
             for fut, device_id in futures.items():
                 try:
@@ -1300,6 +1294,7 @@ class HdfWriter(ManagedProcessBase):
                         reason="rpc_exception",
                         error=str(exc),
                     )
+                    failures.append(f"{device_id}: rpc_exception ({exc})")
                     continue
                 if not action_result.ok:
                     self._report_metadata_target_unavailable(
@@ -1308,36 +1303,30 @@ class HdfWriter(ManagedProcessBase):
                         reason=action_result.reason or "rpc_failed",
                         error=action_result.error,
                     )
+                    detail = (
+                        f" ({action_result.error})" if action_result.error else ""
+                    )
+                    failures.append(
+                        f"{device_id}: {action_result.reason or 'rpc_failed'}{detail}"
+                    )
                     continue
                 run_metadata = action_result.result
-                if run_metadata is None:
-                    continue
                 if not isinstance(run_metadata, dict):
                     self._bump_error("run_metadata.invalid")
+                    reason = "invalid_run_metadata"
+                    self._report_metadata_target_unavailable(
+                        device_id=device_id,
+                        action="collect_run_metadata",
+                        reason=reason,
+                    )
+                    failures.append(f"{device_id}: {reason}")
                     continue
                 results.append((device_id, run_metadata))
-        if not results:
-            return
-
-        # h5py is not thread-safe: serialise the writes under _h5_lock. Re-check
-        # the active file first — a stop/rotate between enqueue and now may have
-        # closed or replaced it, in which case this capture is stale.
-        with self._h5_lock:
-            if self._h5 is None:
-                return
-            if (
-                expected_measurement_id is not None
-                and (self._measurement_id or "") != expected_measurement_id
-            ):
-                self._bump_error("run_metadata.stale_skip")
-                return
-            for device_id, run_metadata in results:
-                self._handle_run_metadata_locked(
-                    {
-                        "device_id": device_id,
-                        "run_metadata": run_metadata,
-                    }
-                )
+        if failures:
+            raise RuntimeError(
+                "required run metadata unavailable: " + "; ".join(failures)
+            )
+        return results
 
     def _build_measurement_metadata(
         self,
@@ -1551,13 +1540,6 @@ class HdfWriter(ManagedProcessBase):
     def _dispatch_bg_request(self, req: "_FlushBatch | _BgRequest") -> None:
         if isinstance(req, _FlushBatch):
             self._handle_flush_batch(req)
-            return
-        if isinstance(req, _CaptureRunMetadataRequest):
-            # Slow per-device collect_run_metadata RPCs, run off the main
-            # drain loop so file-open never stalls telemetry draining.
-            self._capture_run_metadata_for_configs(
-                req.configs, expected_measurement_id=req.measurement_id
-            )
             return
         if isinstance(req, _CaptureSequencerYamlRequest):
             # Slow sequencer.loaded_yaml RPC, run off the main drain loop so
@@ -2480,6 +2462,21 @@ class HdfWriter(ManagedProcessBase):
         # since the bg thread isn't running yet, but the lock keeps the
         # contract uniform). The debug assertion catches future regressions.
         self._assert_h5_locked()
+
+        configs: list[Json] = []
+        run_metadata: list[tuple[str, Json]] = []
+        if load_manager_state:
+            fetched = self._fetch_config_with_backoff(timeout_s=5.0)
+            if fetched is None:
+                raise RuntimeError(
+                    "required device configuration unavailable for run metadata"
+                )
+            configs = fetched
+            # This preflight runs before self._h5 is assigned or published.
+            # A file is therefore never visible as active until every device
+            # that declares run_meta_calls has returned a valid snapshot.
+            run_metadata = self._collect_required_run_metadata(configs)
+
         self._h5 = h5
         self._publish_h5_state_cache()
         self._reset_per_file_state()
@@ -2578,15 +2575,6 @@ class HdfWriter(ManagedProcessBase):
                     )
                     self._known_process_ids.update(seen_processes)
 
-            configs: list[Json] = []
-            if self._latest_device_config:
-                configs = [
-                    copy.deepcopy(v) for v in self._latest_device_config.values()
-                ]
-            else:
-                fetched = self._fetch_config_with_backoff(timeout_s=5.0)
-                if fetched is not None:
-                    configs = fetched
             for config in configs:
                 device_id = self._normalize_device_id(config.get("device_id"))
                 if device_id is not None:
@@ -2594,7 +2582,13 @@ class HdfWriter(ManagedProcessBase):
                 # Already under _h5_lock (via _configure_active_file); call the
                 # locked impl directly to avoid a redundant re-acquire.
                 self._handle_device_config_locked(config, cache=False)
-            self._enqueue_run_metadata_capture(configs)
+            for device_id, snapshot in run_metadata:
+                self._handle_run_metadata_locked(
+                    {
+                        "device_id": device_id,
+                        "run_metadata": snapshot,
+                    }
+                )
 
         self._pending = 0
         now = time.monotonic()
@@ -2932,6 +2926,8 @@ class HdfWriter(ManagedProcessBase):
 
         try:
             if self._autostart_writing:
+                h5: h5py.File | None = None
+                path: Path | None = None
                 try:
                     path = self._resolve_output_path(None, use_default_filename=False)
                     self._ensure_output_path_unused(path)
@@ -2962,6 +2958,22 @@ class HdfWriter(ManagedProcessBase):
                     now = time.monotonic()
                     self._last_flush = now
                     self._next_write = now + write_every_s
+                except Exception:
+                    self._bump_error("autostart.configure")
+                    self._h5 = None
+                    self._publish_h5_state_cache()
+                    self._reset_per_file_state()
+                    if h5 is not None:
+                        try:
+                            h5.close()
+                        except Exception:
+                            self._bump_error("autostart.close_new")
+                    if path is not None:
+                        try:
+                            path.unlink(missing_ok=True)
+                        except Exception:
+                            self._bump_error("autostart.unlink_new")
+                    raise
             else:
                 self._h5 = None
                 self._publish_h5_state_cache()

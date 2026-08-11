@@ -116,6 +116,7 @@ class FederationHubCapabilityTests(unittest.TestCase):
                         "peer_id": "lab2",
                         "router_rpc": "tcp://10.0.0.22:6000",
                         "manager_pub": "tcp://10.0.0.22:6001",
+                        "rpc_timeout_ms": 4321,
                         "mirror_devices": [
                             {"local_id": "lab2.psu", "remote_device_id": "psu"}
                         ],
@@ -140,6 +141,7 @@ class FederationHubCapabilityTests(unittest.TestCase):
 
         self.assertEqual(status["driver_process"]["state"], "FEDERATED")
         self.assertEqual(status["driver_process"]["restart_count"], 0)
+        self.assertEqual(status["effective_rpc_timeout_ms"], 4321)
 
     def test_warm_capabilities_on_startup_fetches_remote_capabilities(self) -> None:
         cfg = parse_federation_config(

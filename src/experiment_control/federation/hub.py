@@ -559,6 +559,7 @@ class FederationHub:
 
         return {
             "device_id": mirror.local_id,
+            "effective_rpc_timeout_ms": int(peer_rt.config.rpc_timeout_ms),
             "registered": True,
             "rpc_endpoint": peer_rt.config.router_rpc,
             "pub_endpoint": peer_rt.config.manager_pub,

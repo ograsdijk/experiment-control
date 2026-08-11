@@ -44,6 +44,18 @@ def _build_manager() -> Manager:
 
 
 class ManagerRuntimeMetadataTests(unittest.TestCase):
+    def test_local_status_exposes_effective_device_rpc_timeout(self) -> None:
+        mgr = _build_manager()
+        mgr._device_rpc_timeout_ms = 4321  # type: ignore[attr-defined]
+        mgr._heartbeat_timeout_s = 5.0  # type: ignore[attr-defined]
+        mgr._telemetry_latest = {}  # type: ignore[attr-defined]
+        mgr._telemetry_last_bundle_ts = {}  # type: ignore[attr-defined]
+        mgr._telemetry_last_recv_mono = {}  # type: ignore[attr-defined]
+
+        status = Manager._device_status_snapshot(mgr, "trace1")
+
+        self.assertEqual(status["effective_rpc_timeout_ms"], 4321)
+
     def test_connect_device_does_not_publish_run_metadata(self) -> None:
         mgr = _build_manager()
 
