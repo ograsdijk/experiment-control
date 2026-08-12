@@ -196,6 +196,31 @@ def start_driver(manager: Any, device_id: str) -> None:
     )
     env["EXPERIMENT_CONTROL_MANAGER_PUB"] = manager._external_pub_connect_local
     env["EXPERIMENT_CONTROL_INSTANCE_ID"] = manager._instance_id
+    # Establish the new generation before launching. Lifecycle starts run on a
+    # worker while registration/heartbeat ingestion run on the manager thread;
+    # clearing these after Popen returns could erase the replacement driver's
+    # first heartbeat. Keep the previous values so a spawn failure retains its
+    # diagnostics.
+    previous_heartbeat = (
+        handle.last_hb,
+        handle.last_hb_recv_mono,
+        handle.driver_heartbeat_pid,
+        handle.driver_running_since_mono,
+    )
+    handle.last_hb = None
+    handle.last_hb_recv_mono = None
+    handle.driver_heartbeat_pid = None
+    handle.driver_running_since_mono = None
+    handle.driver_pid = None
+    handle.driver_popen_pid = None
+    handle.driver_process_state = _enum_member(handle.driver_process_state, "STARTING")
+    handle.driver_last_exit_code = None
+    handle.driver_stop_requested_t_mono = None
+    handle.driver_last_error = None
+    handle.driver_last_error_kind = None
+    handle.driver_last_signal_name = None
+    handle.driver_last_failure_pid = None
+    handle.driver_next_restart_t_mono = None
     try:
         handle.process = subprocess.Popen(
             cmd,
@@ -208,6 +233,12 @@ def start_driver(manager: Any, device_id: str) -> None:
             env=env,
         )
     except Exception as exc:
+        (
+            handle.last_hb,
+            handle.last_hb_recv_mono,
+            handle.driver_heartbeat_pid,
+            handle.driver_running_since_mono,
+        ) = previous_heartbeat
         handle.process = None
         handle.driver_pid = None
         handle.driver_popen_pid = None
@@ -232,17 +263,13 @@ def start_driver(manager: Any, device_id: str) -> None:
         target_id=device_id,
     )
     handle.driver_popen_pid = handle.process.pid
-    handle.driver_heartbeat_pid = None
-    handle.driver_pid = handle.driver_popen_pid
-    handle.driver_process_state = _enum_member(handle.driver_process_state, "STARTING")
-    handle.driver_last_exit_code = None
-    handle.driver_stop_requested_t_mono = None
-    # Clear stale failure context before next attempt.
-    handle.driver_last_error = None
-    handle.driver_last_error_kind = None
-    handle.driver_last_signal_name = None
-    handle.driver_last_failure_pid = None
-    handle.driver_next_restart_t_mono = None
+    # A very fast child may have registered and heartbeated while process
+    # adoption ran. Preserve the heartbeat's real pid and the RUNNING state in
+    # that case; otherwise finish the normal STARTING initialization.
+    if handle.driver_heartbeat_pid is None:
+        handle.driver_pid = handle.driver_popen_pid
+    if str(handle.driver_process_state) != "RUNNING":
+        handle.driver_process_state = _enum_member(handle.driver_process_state, "STARTING")
     manager._start_child_log_readers(
         popen=handle.process,
         source_kind="driver",
@@ -251,7 +278,8 @@ def start_driver(manager: Any, device_id: str) -> None:
         process_id=None,
     )
 
-    manager._publish_driver_event("manager.driver.starting", handle)
+    if str(handle.driver_process_state) != "RUNNING":
+        manager._publish_driver_event("manager.driver.starting", handle)
 
 
 def stop_driver(
@@ -984,7 +1012,11 @@ def enforce_device_driver_heartbeat_timeout(
     if str(handle.driver_process_state) != "RUNNING":
         return
     hb = handle.last_hb_recv_mono
-    ref = hb if hb is not None else handle.driver_running_since_mono
+    running_since = handle.driver_running_since_mono
+    heartbeat_from_current_run = hb is not None and (
+        running_since is None or hb >= running_since
+    )
+    ref = hb if heartbeat_from_current_run else running_since
     if ref is None:
         return  # no basis to judge yet
     age = now_mono - ref
@@ -1005,7 +1037,7 @@ def enforce_device_driver_heartbeat_timeout(
     handle.driver_stop_requested_t_mono = now_mono
     handle.driver_last_error_kind = "heartbeat_stale"
     if not handle.driver_last_error:
-        if hb is None:
+        if not heartbeat_from_current_run:
             handle.driver_last_error = (
                 f"driver RUNNING but no heartbeat {age:.1f}s after registering "
                 f"(timeout {timeout_s:.1f}s)"

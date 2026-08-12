@@ -1267,9 +1267,13 @@ class Manager(
             # handle.process); promoting then would wedge the driver at RUNNING
             # with pid=None. Trust a live tracked subprocess, or a fresh
             # heartbeat for externally-started drivers.
-            if handle.process is not None and handle.process.poll() is None:
+            process = handle.process
+            process_alive = process is not None and process.poll() is None
+            manager_launch_in_progress = str(handle.driver_process_state) == "STARTING"
+            if process_alive or manager_launch_in_progress:
                 handle.driver_process_state = ManagedProcessState.RUNNING
-                handle.driver_pid = handle.process.pid
+                if process_alive and process is not None:
+                    handle.driver_pid = process.pid
                 # Anchor for heartbeat-staleness aging (see
                 # enforce_device_driver_heartbeat_timeout).
                 handle.driver_running_since_mono = time.monotonic()
