@@ -26,6 +26,7 @@ from experiment_control._manager.process_supervision import (  # noqa: E402
     enforce_device_driver_stop_timeout,
     driver_is_stopped,
     process_snapshot,
+    start_driver,
     start_process_handle,
     stop_process_handle,
     supervise_device_drivers,
@@ -33,6 +34,7 @@ from experiment_control._manager.process_supervision import (  # noqa: E402
     update_managed_process_exit_state,
     update_device_driver_exit_state,
 )
+from experiment_control.manager import Manager  # noqa: E402
 
 
 def _make_handle() -> SimpleNamespace:
@@ -537,6 +539,136 @@ class RestartStopTimeoutRaceTests(unittest.TestCase):
         self.assertNotEqual(handle.state, "STOPPING")
 
 
+class DeviceDriverHeartbeatGenerationTests(unittest.TestCase):
+    @staticmethod
+    def _handle() -> SimpleNamespace:
+        return SimpleNamespace(
+            spec=SimpleNamespace(),
+            process=None,
+            driver_process_state="FAILED",
+            driver_pid=111,
+            driver_popen_pid=111,
+            driver_heartbeat_pid=111,
+            driver_last_exit_code=1,
+            driver_restart_count=0,
+            driver_last_restart_t_mono=None,
+            driver_last_error="old failure",
+            driver_last_error_kind="nonzero_exit",
+            driver_last_signal_name=None,
+            driver_last_failure_pid=111,
+            driver_stop_requested_t_mono=None,
+            driver_next_restart_t_mono=123.0,
+            driver_running_since_mono=50.0,
+            last_hb=object(),
+            last_hb_recv_mono=60.0,
+        )
+
+    @staticmethod
+    def _manager(handle: SimpleNamespace) -> SimpleNamespace:
+        return SimpleNamespace(
+            _devices={"dev": handle},
+            _external_rpc_bind="tcp://*:6000",
+            _external_pub_connect_local="tcp://127.0.0.1:6001",
+            _instance_id="test-instance",
+            _build_driver_cmd=lambda _spec: ["driver"],
+            _adopt_with_process_guard=mock.Mock(),
+            _start_child_log_readers=mock.Mock(),
+            _publish_driver_event=mock.Mock(),
+            _emit_log=mock.Mock(),
+        )
+
+    def test_successful_start_begins_new_heartbeat_generation(self) -> None:
+        handle = self._handle()
+        manager = self._manager(handle)
+        process = SimpleNamespace(pid=222)
+
+        with mock.patch.object(ps.subprocess, "Popen", return_value=process):
+            start_driver(manager, "dev")
+
+        self.assertIsNone(handle.last_hb)
+        self.assertIsNone(handle.last_hb_recv_mono)
+        self.assertIsNone(handle.driver_heartbeat_pid)
+        self.assertIsNone(handle.driver_running_since_mono)
+        self.assertEqual(handle.driver_pid, 222)
+        self.assertEqual(handle.driver_process_state, "STARTING")
+
+    def test_spawn_failure_preserves_previous_heartbeat_diagnostics(self) -> None:
+        handle = self._handle()
+        manager = self._manager(handle)
+        previous_hb = handle.last_hb
+
+        with mock.patch.object(
+            ps.subprocess, "Popen", side_effect=OSError("spawn failed")
+        ), self.assertRaisesRegex(OSError, "spawn failed"):
+            start_driver(manager, "dev")
+
+        self.assertIs(handle.last_hb, previous_hb)
+        self.assertEqual(handle.last_hb_recv_mono, 60.0)
+        self.assertEqual(handle.driver_heartbeat_pid, 111)
+        self.assertEqual(handle.driver_running_since_mono, 50.0)
+
+    def test_start_does_not_erase_concurrent_registration_and_heartbeat(self) -> None:
+        handle = self._handle()
+        manager = self._manager(handle)
+        current_hb = object()
+
+        def spawn(*_args: object, **_kwargs: object) -> SimpleNamespace:
+            self.assertEqual(handle.driver_process_state, "STARTING")
+            self.assertIsNone(handle.last_hb)
+            handle.driver_process_state = "RUNNING"
+            handle.driver_running_since_mono = 70.0
+            handle.last_hb = current_hb
+            handle.last_hb_recv_mono = 71.0
+            handle.driver_heartbeat_pid = 333
+            handle.driver_pid = 333
+            return SimpleNamespace(pid=222)
+
+        with mock.patch.object(ps.subprocess, "Popen", side_effect=spawn):
+            start_driver(manager, "dev")
+
+        self.assertEqual(handle.driver_process_state, "RUNNING")
+        self.assertIs(handle.last_hb, current_hb)
+        self.assertEqual(handle.last_hb_recv_mono, 71.0)
+        self.assertEqual(handle.driver_heartbeat_pid, 333)
+        self.assertEqual(handle.driver_pid, 333)
+        manager._publish_driver_event.assert_not_called()
+
+    def test_registration_promotes_launch_before_popen_assignment(self) -> None:
+        handle = self._handle()
+        handle.process = None
+        handle.driver_process_state = "STARTING"
+        handle.driver_pid = None
+        handle.rpc_endpoint = None
+        handle.pub_endpoint = None
+        handle.capabilities = None
+        handle.config_published = True
+        manager = object.__new__(Manager)
+        manager._devices = {"dev": handle}  # type: ignore[attr-defined]
+        manager._registry_rep = object()  # type: ignore[attr-defined]
+        manager._sub = mock.Mock()  # type: ignore[attr-defined]
+        manager._heartbeat_timeout_s = 3.0  # type: ignore[attr-defined]
+        manager._auto_connect_on_register = False  # type: ignore[attr-defined]
+        manager._recv_json = mock.Mock(
+            return_value={
+                "type": "register",
+                "device_id": "dev",
+                "rpc_endpoint": "tcp://127.0.0.1:7000",
+                "pub_endpoint": "tcp://127.0.0.1:7001",
+                "capabilities": {},
+            }
+        )  # type: ignore[method-assign]
+        manager._send_json = mock.Mock()  # type: ignore[method-assign]
+        manager._close_device_rpc = mock.Mock()  # type: ignore[method-assign]
+        manager._publish_manager_event = mock.Mock()  # type: ignore[method-assign]
+        manager._publish_driver_event = mock.Mock()  # type: ignore[method-assign]
+
+        Manager._handle_registry(manager)
+
+        self.assertEqual(str(handle.driver_process_state), "RUNNING")
+        self.assertIsNotNone(handle.driver_running_since_mono)
+        manager._send_json.assert_called_once_with(manager._registry_rep, {"ok": True})
+
+
 class DeviceDriverHeartbeatDemotionTests(unittest.TestCase):
     """Driver RUNNING state is heartbeat-authoritative: a stale heartbeat demotes
     to FAILED even when the wrapper process is still alive (poll() can't see the
@@ -638,6 +770,32 @@ class DeviceDriverHeartbeatDemotionTests(unittest.TestCase):
         manager = self._manager()
         enforce_device_driver_heartbeat_timeout(manager, handle, 100.0)
         self.assertEqual(str(handle.driver_process_state), "RUNNING")
+
+    def test_ignores_heartbeat_from_before_current_run(self) -> None:
+        handle = self._handle(
+            process=_FakePopen(),
+            last_hb_recv_mono=80.0,
+            driver_running_since_mono=99.0,
+        )
+        manager = self._manager()
+
+        enforce_device_driver_heartbeat_timeout(manager, handle, 100.0)
+
+        self.assertEqual(str(handle.driver_process_state), "RUNNING")
+
+    def test_heartbeat_after_current_run_is_authoritative(self) -> None:
+        handle = self._handle(
+            process=_FakePopen(),
+            last_hb_recv_mono=96.0,
+            driver_running_since_mono=90.0,
+        )
+        manager = self._manager()
+        g1, g2 = self._no_defer()
+        with g1, g2:
+            enforce_device_driver_heartbeat_timeout(manager, handle, 100.0)
+
+        self.assertEqual(str(handle.driver_process_state), "FAILED")
+        self.assertIn("heartbeat stale", handle.driver_last_error)
 
     def test_no_demote_when_no_reference(self) -> None:
         handle = self._handle(last_hb_recv_mono=None, driver_running_since_mono=None)
