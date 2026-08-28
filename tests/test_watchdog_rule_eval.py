@@ -13,6 +13,7 @@ from experiment_control.processes.watchdog import (
     CommandAction,
     RuleState,
     WatchdogArm,
+    WatchdogConfirmation,
     WatchdogEntry,
     WatchdogProcess,
     WatchdogRule,
@@ -33,11 +34,175 @@ def _default_action() -> CommandAction:
     )
 
 
-def _ok_sample(value: float = 1.0) -> dict[str, object]:
-    return {"value": value, "quality": "OK", "age_s": 0.1}
+def _ok_sample(value: float = 1.0, t_mono_recv: float | None = None) -> dict[str, object]:
+    sample: dict[str, object] = {"value": value, "quality": "OK", "age_s": 0.1}
+    if t_mono_recv is not None:
+        sample["t_mono_recv"] = t_mono_recv
+    return sample
+
+
+def _confirmation_rule(
+    *,
+    telemetry: list[TelemetryBinding],
+    condition: object,
+    confirmation: WatchdogConfirmation,
+    stable_for_s: float = 0.0,
+) -> WatchdogRule:
+    return WatchdogRule(
+        name="confirmed",
+        severity="critical",
+        message=None,
+        telemetry=telemetry,
+        condition=condition,
+        stable_for_s=stable_for_s,
+        cooldown_s=0.0,
+        latch=False,
+        on_unknown="ignore",
+        actions=[_default_action()],
+        confirmation=confirmation,
+    )
 
 
 class WatchdogRuleEvalTests(unittest.TestCase):
+    def test_confirmation_counts_only_distinct_manager_samples(self) -> None:
+        rule = _parse_ruleset(
+            {"watchdog_id": "wd", "rules": [{"name": "r", "inputs": {"telemetry": [{"as": "p", "device": "h", "signal": "p"}]}, "condition": {"gt": ["${p.value}", 1.0]}, "confirmation": {"sample_alias": "p", "consecutive_samples": 3}, "actions": [{"command": {"device_id": "d", "action": "stop"}}]}]}, source="test"
+        ).rules[0]
+        state = RuleState()
+        sample = _ok_sample(2.0, 1.0)
+        def getter(_dev: str, _sig: str) -> dict[str, object]:
+            return sample
+        self.assertFalse(evaluate_watchdog_rule(rule=rule, state=state, telemetry_getter=getter, now_mono=1.0)[0])
+        self.assertFalse(evaluate_watchdog_rule(rule=rule, state=state, telemetry_getter=getter, now_mono=1.1)[0])
+        for marker in (2.0, 3.0):
+            sample = _ok_sample(2.0, marker)
+            triggered, *_ = evaluate_watchdog_rule(rule=rule, state=state, telemetry_getter=getter, now_mono=marker)
+        self.assertTrue(triggered, state.confirmation)
+        self.assertEqual(state.confirmation["p"]["count"], 3)
+
+    def test_multi_source_confirmation_does_not_combine_or_require_sources(self) -> None:
+        rule = _parse_ruleset(
+            {"watchdog_id": "wd", "rules": [{"name": "r", "inputs": {"telemetry": [{"as": "rc", "device": "rc", "signal": "p", "required": False}, {"as": "eql", "device": "eql", "signal": "p", "required": False}]}, "condition": True, "confirmation": {"consecutive_samples": 3, "any": [{"sample_alias": "rc", "condition": {"gt": ["${rc.value}", 1.0]}}, {"sample_alias": "eql", "condition": {"gt": ["${eql.value}", 1.0]}}]}, "actions": [{"command": {"device_id": "d", "action": "stop"}}]}]}, source="test"
+        ).rules[0]
+        state = RuleState()
+        values = {("rc", "p"): _ok_sample(2.0, 1.0), ("eql", "p"): None}
+        def getter(dev: str, sig: str) -> dict[str, object] | None:
+            return values[(dev, sig)]
+        for marker in (1.0, 2.0, 3.0):
+            values[("rc", "p")] = _ok_sample(2.0, marker)
+            triggered, *_ = evaluate_watchdog_rule(rule=rule, state=state, telemetry_getter=getter, now_mono=marker)
+        self.assertTrue(triggered, repr(state.confirmation))
+        self.assertEqual(state.confirmation["rc"]["count"], 3)
+        self.assertEqual(state.confirmation["eql"]["count"], 0)
+
+    def test_confirmation_low_bad_stale_and_missing_reset_streak(self) -> None:
+        binding = TelemetryBinding(alias="p", device_id="h", signal="p", max_age_s=1.0)
+        rule = _confirmation_rule(
+            telemetry=[binding],
+            condition={"gt": ["${p.value}", 1.0]},
+            confirmation=WatchdogConfirmation(("p",), 3, {}),
+        )
+        state = RuleState()
+        sample: dict[str, object] | None = _ok_sample(2.0, 1.0)
+
+        def getter(_dev: str, _sig: str) -> dict[str, object] | None:
+            return sample
+
+        for marker in (1.0, 2.0):
+            sample = _ok_sample(2.0, marker)
+            self.assertFalse(
+                evaluate_watchdog_rule(
+                    rule=rule, state=state, telemetry_getter=getter, now_mono=marker
+                )[0]
+            )
+        sample = _ok_sample(0.5, 3.0)
+        self.assertFalse(evaluate_watchdog_rule(rule=rule, state=state, telemetry_getter=getter, now_mono=3.0)[0])
+        self.assertEqual(state.confirmation["p"]["count"], 0)
+        for bad_sample in (
+            {"value": 2.0, "quality": "BAD", "age_s": 0.1, "t_mono_recv": 4.0},
+            {"value": 2.0, "quality": "OK", "age_s": 2.0, "t_mono_recv": 5.0},
+            None,
+        ):
+            sample = bad_sample
+            self.assertFalse(evaluate_watchdog_rule(rule=rule, state=state, telemetry_getter=getter, now_mono=6.0)[0])
+            self.assertEqual(state.confirmation["p"]["count"], 0)
+
+    def test_any_confirmation_does_not_combine_alternating_highs(self) -> None:
+        telemetry = [
+            TelemetryBinding(alias="a", device_id="a", signal="p", max_age_s=1.0, required=False),
+            TelemetryBinding(alias="b", device_id="b", signal="p", max_age_s=1.0, required=False),
+        ]
+        rule = _confirmation_rule(
+            telemetry=telemetry,
+            condition=True,
+            confirmation=WatchdogConfirmation(
+                ("a", "b"), 3,
+                {"a": {"gt": ["${a.value}", 1.0]}, "b": {"gt": ["${b.value}", 1.0]}},
+            ),
+        )
+        values = {("a", "p"): _ok_sample(0.5, 1.0), ("b", "p"): _ok_sample(0.5, 1.0)}
+
+        def getter(device: str, signal: str) -> dict[str, object]:
+            return values[(device, signal)]
+
+        state = RuleState()
+        for marker, alias in enumerate(("a", "b", "a", "b", "a"), start=1):
+            values[(alias, "p")] = _ok_sample(2.0, float(marker))
+            other = "b" if alias == "a" else "a"
+            values[(other, "p")] = _ok_sample(0.5, float(marker))
+            self.assertFalse(evaluate_watchdog_rule(rule=rule, state=state, telemetry_getter=getter, now_mono=float(marker))[0])
+
+    def test_required_prerequisite_blocks_ready_confirmation(self) -> None:
+        telemetry = [
+            TelemetryBinding(alias="p", device_id="h", signal="p", max_age_s=1.0),
+            TelemetryBinding(alias="on", device_id="t", signal="on", max_age_s=1.0),
+        ]
+        rule = _confirmation_rule(
+            telemetry=telemetry,
+            condition={"eq": ["${on.value}", True]},
+            confirmation=WatchdogConfirmation(("p",), 3, {}),
+        )
+        values: dict[tuple[str, str], dict[str, object] | None] = {
+            ("h", "p"): _ok_sample(2.0, 1.0), ("t", "on"): _ok_sample(False)
+        }
+
+        def getter(device: str, signal: str) -> dict[str, object] | None:
+            return values[(device, signal)]
+
+        state = RuleState()
+        for marker in (1.0, 2.0, 3.0):
+            values[("h", "p")] = _ok_sample(2.0, marker)
+            self.assertFalse(evaluate_watchdog_rule(rule=rule, state=state, telemetry_getter=getter, now_mono=marker)[0])
+        values[("t", "on")] = None
+        values[("h", "p")] = _ok_sample(2.0, 4.0)
+        self.assertFalse(evaluate_watchdog_rule(rule=rule, state=state, telemetry_getter=getter, now_mono=4.0)[0])
+        self.assertEqual(state.confirmation["p"]["count"], 0)
+
+    def test_confirmation_composes_with_stable_for(self) -> None:
+        rule = _confirmation_rule(
+            telemetry=[TelemetryBinding(alias="p", device_id="h", signal="p", max_age_s=1.0)],
+            condition={"gt": ["${p.value}", 1.0]},
+            confirmation=WatchdogConfirmation(("p",), 3, {}),
+            stable_for_s=2.0,
+        )
+        sample = _ok_sample(2.0, 1.0)
+
+        def getter(_device: str, _signal: str) -> dict[str, object]:
+            return sample
+
+        state = RuleState()
+        for now, marker in ((0.0, 1.0), (0.5, 2.0), (1.0, 3.0)):
+            sample = _ok_sample(2.0, marker)
+            self.assertFalse(evaluate_watchdog_rule(rule=rule, state=state, telemetry_getter=getter, now_mono=now)[0])
+        self.assertTrue(evaluate_watchdog_rule(rule=rule, state=state, telemetry_getter=getter, now_mono=2.1)[0])
+
+    def test_confirmation_parser_rejects_bad_count_and_unknown_alias(self) -> None:
+        base = {"name": "r", "inputs": {"telemetry": [{"as": "p", "device": "d", "signal": "s"}]}, "condition": True, "actions": [{"command": {"device_id": "d", "action": "stop"}}]}
+        for confirmation in ({"sample_alias": "p", "consecutive_samples": 0}, {"sample_alias": "missing", "consecutive_samples": 3}):
+            raw = {"watchdog_id": "wd", "rules": [{**base, "confirmation": confirmation}]}
+            with self.assertRaises(ValueError):
+                _parse_ruleset(raw, source="test")
+
     def test_parse_ruleset_includes_source_on_error(self) -> None:
         raw = {
             "watchdog_id": "wd1",

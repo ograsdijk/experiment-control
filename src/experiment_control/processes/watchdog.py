@@ -84,6 +84,15 @@ class WatchdogArm:
 
 
 @dataclass(frozen=True)
+class WatchdogConfirmation:
+    """Distinct manager telemetry samples required before a rule trips."""
+
+    sample_aliases: tuple[str, ...]
+    consecutive_samples: int
+    branch_conditions: dict[str, Any]
+
+
+@dataclass(frozen=True)
 class WatchdogRule:
     name: str
     severity: str
@@ -96,6 +105,7 @@ class WatchdogRule:
     on_unknown: str
     actions: list[CommandAction | ProcessAction]
     arm: WatchdogArm | None = None
+    confirmation: WatchdogConfirmation | None = None
 
 
 @dataclass(frozen=True)
@@ -120,6 +130,9 @@ class RuleState:
     alarm: bool | None = None
     unknown: bool | None = None
     snapshot: Json | None = None
+    # Per-alias state permits an ``any_sample_aliases`` guard to require a
+    # consecutive streak from one source, rather than combining gauges.
+    confirmation: Json | None = None
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -171,6 +184,80 @@ def _parse_watchdog_arm(
         condition=arm.get("condition"),
         disarm_condition=disarm_condition,
         disarm_on_trigger=disarm_on_trigger,
+    )
+
+
+def _parse_watchdog_confirmation(
+    *, rule_raw: dict[str, Any], rule_index: int, telemetry: list[TelemetryBinding]
+) -> WatchdogConfirmation | None:
+    raw = rule_raw.get("confirmation")
+    if raw is None:
+        return None
+    obj = require_dict(raw, path=["rules", rule_index, "confirmation"])
+    any_raw = obj.get("any")
+    aliases: tuple[str, ...]
+    branch_conditions: dict[str, Any]
+    if any_raw is None:
+        sample_alias = require_str(
+            obj.get("sample_alias"),
+            path=["rules", rule_index, "confirmation", "sample_alias"],
+        )
+        aliases = (sample_alias,)
+        branch_conditions = {}
+    else:
+        if "sample_alias" in obj:
+            raise ConfigError(
+                path=f"rules[{rule_index}].confirmation",
+                message="use sample_alias or any, not both",
+            )
+        branches = normalize_list(
+            any_raw, path=["rules", rule_index, "confirmation", "any"]
+        )
+        if not branches or not all(isinstance(branch, dict) for branch in branches):
+            raise ConfigError(
+                path=f"rules[{rule_index}].confirmation.any",
+                message="must be a non-empty list of objects",
+            )
+        aliases_list: list[str] = []
+        branch_conditions = {}
+        for branch_index, branch_raw in enumerate(branches):
+            branch = require_dict(
+                branch_raw, path=["rules", rule_index, "confirmation", "any", branch_index]
+            )
+            alias = require_str(
+                branch.get("sample_alias"),
+                path=["rules", rule_index, "confirmation", "any", branch_index, "sample_alias"],
+            )
+            if "condition" not in branch:
+                raise ConfigError(
+                    path=f"rules[{rule_index}].confirmation.any[{branch_index}].condition",
+                    message="condition is required",
+                )
+            aliases_list.append(alias)
+            branch_conditions[alias] = branch["condition"]
+        aliases = tuple(aliases_list)
+    if len(set(aliases)) != len(aliases):
+        raise ConfigError(
+            path=f"rules[{rule_index}].confirmation",
+            message="sample aliases must be unique",
+        )
+    telemetry_aliases = {binding.alias for binding in telemetry}
+    unknown_aliases = set(aliases) - telemetry_aliases
+    if unknown_aliases:
+        raise ConfigError(
+            path=f"rules[{rule_index}].confirmation",
+            message=f"sample alias is not a telemetry input: {sorted(unknown_aliases)!r}",
+        )
+    consecutive_samples = coerce_int(obj.get("consecutive_samples"), default=0)
+    if consecutive_samples <= 0:
+        raise ConfigError(
+            path=f"rules[{rule_index}].confirmation.consecutive_samples",
+            message="must be a positive integer",
+        )
+    return WatchdogConfirmation(
+        sample_aliases=aliases,
+        consecutive_samples=consecutive_samples,
+        branch_conditions=branch_conditions,
     )
 
 
@@ -291,6 +378,9 @@ def _parse_watchdog_rule(
         default=defaults_on_unknown,
     )
     arm = _parse_watchdog_arm(rule_raw=rule_raw, rule_index=rule_index)
+    confirmation = _parse_watchdog_confirmation(
+        rule_raw=rule_raw, rule_index=rule_index, telemetry=telemetry
+    )
     actions = _parse_watchdog_actions(rule_raw=rule_raw, rule_index=rule_index)
     return WatchdogRule(
         name=name,
@@ -304,6 +394,7 @@ def _parse_watchdog_rule(
         on_unknown=on_unknown,
         actions=actions,
         arm=arm,
+        confirmation=confirmation,
     )
 
 
@@ -477,7 +568,7 @@ def _resolve_watchdog_binding(
     }
     if sample is None:
         entry.update({"value": None, "quality": "MISSING", "age_s": None, "ok": False})
-        return entry, None, True
+        return entry, None, binding.required
 
     age_s = _resolve_watchdog_binding_age_s(sample, now_mono=now_mono)
     quality = sample.get("quality")
@@ -486,12 +577,13 @@ def _resolve_watchdog_binding(
             "value": sample.get("value"),
             "quality": quality,
             "age_s": age_s,
+            "t_mono_recv": sample.get("t_mono_recv"),
         }
     )
     ok = quality == "OK" and age_s is not None and age_s <= binding.max_age_s
     entry["ok"] = ok
     if not ok:
-        return entry, None, True
+        return entry, None, binding.required
     alias_env: Json = to_attrdict(
         {
             "value": sample.get("value"),
@@ -585,6 +677,76 @@ def _watchdog_cooldown_ready(*, rule: WatchdogRule, state: RuleState, now_mono: 
     return (now_mono - state.last_trigger_mono) >= rule.cooldown_s
 
 
+def _reset_watchdog_confirmation(state: RuleState) -> None:
+    if state.confirmation is None:
+        return
+    for progress in state.confirmation.values():
+        progress["count"] = 0
+        progress["evidence"] = []
+
+
+def _watchdog_confirmation_ready(
+    *, rule: WatchdogRule, state: RuleState, snapshot: Json, alarm: bool, env: Json
+) -> bool:
+    confirmation = rule.confirmation
+    if confirmation is None:
+        return True
+    if state.confirmation is None:
+        state.confirmation = {
+            alias: {"count": 0, "last_t_mono_recv": None, "evidence": []}
+            for alias in confirmation.sample_aliases
+        }
+    if not alarm:
+        _reset_watchdog_confirmation(state)
+        return False
+    ready = False
+    for alias in confirmation.sample_aliases:
+        progress = state.confirmation[alias]
+        entry = snapshot.get(alias, {})
+        marker = entry.get("t_mono_recv")
+        # A valid timestamp is the identity of a manager-received sample.
+        # Cached samples (same timestamp) deliberately do not advance.
+        if not entry.get("ok") or marker is None:
+            progress["count"] = 0
+            progress["evidence"] = []
+            progress["last_t_mono_recv"] = marker
+            continue
+        if marker == progress.get("last_t_mono_recv"):
+            ready = ready or int(progress["count"]) >= confirmation.consecutive_samples
+            continue
+        progress["last_t_mono_recv"] = marker
+        branch_alarm: bool = alarm
+        if alias in confirmation.branch_conditions:
+            branch_alarm = _evaluate_watchdog_condition(
+                confirmation.branch_conditions[alias], env, unknown=False
+            )
+        if not branch_alarm:
+            progress["count"] = 0
+            progress["evidence"] = []
+            continue
+        progress["count"] = int(progress["count"]) + 1
+        evidence = list(progress["evidence"])
+        evidence.append(
+            {"t_mono_recv": marker, "value": entry.get("value"), "quality": entry.get("quality")}
+        )
+        progress["evidence"] = evidence[-confirmation.consecutive_samples :]
+        ready = ready or int(progress["count"]) >= confirmation.consecutive_samples
+    return ready
+
+
+def _watchdog_confirmation_alarm(
+    *, rule: WatchdogRule, env: Json, alarm: bool
+) -> bool:
+    """Evaluate each multi-source branch independently of other bindings."""
+    confirmation = rule.confirmation
+    if confirmation is None or not confirmation.branch_conditions:
+        return alarm
+    return alarm and any(
+        _evaluate_watchdog_condition(condition, env, unknown=False)
+        for condition in confirmation.branch_conditions.values()
+    )
+
+
 def evaluate_watchdog_rule(
     *,
     rule: WatchdogRule,
@@ -627,6 +789,7 @@ def evaluate_watchdog_rule(
         unknown=unknown,
         on_condition_error=on_condition_error,
     )
+    alarm = _watchdog_confirmation_alarm(rule=rule, env=env, alarm=alarm)
     state.last_evaluated_mono = now_mono
     state.alarm = alarm
     state.unknown = unknown
@@ -634,16 +797,26 @@ def evaluate_watchdog_rule(
 
     if rule.arm is not None and not state.armed:
         state.stable_since_mono = None
+        _reset_watchdog_confirmation(state)
         return False, alarm, unknown, snapshot
 
     if not alarm:
         state.stable_since_mono = None
+        _watchdog_confirmation_ready(
+            rule=rule, state=state, snapshot=snapshot, alarm=alarm, env=env
+        )
         return False, alarm, unknown, snapshot
 
     if rule.latch and state.latched:
         return False, alarm, unknown, snapshot
 
+    confirmation_ready = _watchdog_confirmation_ready(
+        rule=rule, state=state, snapshot=snapshot, alarm=alarm, env=env
+    )
     if not _watchdog_stable_ready(rule=rule, state=state, now_mono=now_mono):
+        return False, alarm, unknown, snapshot
+
+    if not confirmation_ready:
         return False, alarm, unknown, snapshot
 
     if not _watchdog_cooldown_ready(rule=rule, state=state, now_mono=now_mono):
@@ -671,6 +844,29 @@ def mark_watchdog_triggered(state: RuleState, now_mono: float) -> None:
     tick.
     """
     state.last_trigger_mono = now_mono
+
+
+def _confirmation_status(rule: WatchdogRule, state: RuleState) -> Json | None:
+    confirmation = rule.confirmation
+    if confirmation is None:
+        return None
+    progress = state.confirmation or {}
+    return {
+        "consecutive_samples": confirmation.consecutive_samples,
+        "sample_aliases": list(confirmation.sample_aliases),
+        "any": [
+            {"sample_alias": alias, "condition": condition}
+            for alias, condition in confirmation.branch_conditions.items()
+        ]
+        or None,
+        "progress": {
+            alias: {
+                "count": int(progress.get(alias, {}).get("count", 0)),
+                "evidence": list(progress.get(alias, {}).get("evidence", [])),
+            }
+            for alias in confirmation.sample_aliases
+        },
+    }
 
 
 class WatchdogProcess(ManagedProcessBase):
@@ -803,6 +999,7 @@ class WatchdogProcess(ManagedProcessBase):
                 "latched": rule.latch,
                 "armed": state.armed,
             },
+            "confirmation": _confirmation_status(rule, state),
         }
         self._publish_event("manager.watchdog.triggered", payload)
 
@@ -952,6 +1149,9 @@ class WatchdogProcess(ManagedProcessBase):
                 self._submit_actions(
                     watchdog_id=watchdog_id, rule=rule, key=key
                 )
+                # Keep the completed evidence through the trigger event, then
+                # require a new three-sample streak before any future trip.
+                _reset_watchdog_confirmation(state)
 
     def _submit_actions(
         self, *, watchdog_id: str, rule: WatchdogRule, key: tuple[str, str]
@@ -1039,6 +1239,7 @@ class WatchdogProcess(ManagedProcessBase):
         state.latched = False
         state.armed = False
         state.stable_since_mono = None
+        _reset_watchdog_confirmation(state)
         payload = {
             "process_id": self._process_id,
             "watchdog_id": watchdog_id,
@@ -1106,12 +1307,14 @@ class WatchdogProcess(ManagedProcessBase):
                             "disarm_condition": rule.arm.disarm_condition,
                             "disarm_on_trigger": rule.arm.disarm_on_trigger,
                         },
+                        "confirmation": _confirmation_status(rule, state),
                         "telemetry": [
                             {
                                 "as": binding.alias,
                                 "device_id": binding.device_id,
                                 "signal": binding.signal,
                                 "max_age_s": binding.max_age_s,
+                                "required": binding.required,
                             }
                             for binding in rule.telemetry
                         ],

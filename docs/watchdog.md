@@ -90,6 +90,38 @@ If any required binding is unusable, the rule is **UNKNOWN**.
 
 - `condition` is an **alarm**: if it evaluates `true`, the rule wants to trigger.
 - `stable_for_s` requires the alarm to stay true for a duration before triggering.
+
+### Distinct-sample confirmation
+
+Rules may require consecutive, newly received manager telemetry samples before
+they act. This prevents repeated watchdog ticks over one cached spike from
+counting as separate readings:
+
+```yaml
+confirmation:
+  sample_alias: pressure
+  consecutive_samples: 3
+```
+
+The selected telemetry input must be fresh and `quality: OK`; a new low,
+BAD, missing, stale, or false-condition sample resets its streak. The manager's
+`t_mono_recv` identifies a new sample. `stable_for_s`, arming, latching, and
+cooldown still apply in addition to confirmation. Status and trigger events
+include configured confirmation and its bounded accepted-sample evidence.
+
+For one shared action chain that can be confirmed by any independent source,
+use branch conditions. Each branch keeps its own streak, so readings from
+different gauges never combine and an unavailable gauge does not block another:
+
+```yaml
+confirmation:
+  consecutive_samples: 3
+  any:
+    - sample_alias: p_rc
+      condition: {gt: ["${p_rc.value}", 1.0e-2]}
+    - sample_alias: p_eql
+      condition: {gt: ["${p_eql.value}", 1.0e-2]}
+```
 - `cooldown_s` prevents retriggering too quickly.
 - `latch: true` triggers once until a manual clear.
 
