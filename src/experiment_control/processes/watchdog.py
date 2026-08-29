@@ -778,6 +778,24 @@ def _watchdog_confirmation_alarm(
     )
 
 
+def _watchdog_confirmation_gate(
+    *,
+    rule: WatchdogRule,
+    state: RuleState,
+    snapshot: Json,
+    alarm: bool,
+    unknown: bool,
+    env: Json,
+) -> bool:
+    """Apply confirmation without weakening fail-safe unknown triggers."""
+    if unknown and rule.on_unknown == "trigger":
+        _reset_watchdog_confirmation(state)
+        return True
+    return _watchdog_confirmation_ready(
+        rule=rule, state=state, snapshot=snapshot, alarm=alarm, env=env
+    )
+
+
 def evaluate_watchdog_rule(
     *,
     rule: WatchdogRule,
@@ -845,13 +863,14 @@ def evaluate_watchdog_rule(
     if rule.latch and state.latched:
         return False, alarm, unknown, snapshot
 
-    if unknown and rule.on_unknown == "trigger":
-        _reset_watchdog_confirmation(state)
-        confirmation_ready = True
-    else:
-        confirmation_ready = _watchdog_confirmation_ready(
-            rule=rule, state=state, snapshot=snapshot, alarm=alarm, env=env
-        )
+    confirmation_ready = _watchdog_confirmation_gate(
+        rule=rule,
+        state=state,
+        snapshot=snapshot,
+        alarm=alarm,
+        unknown=unknown,
+        env=env,
+    )
     if not _watchdog_stable_ready(rule=rule, state=state, now_mono=now_mono):
         return False, alarm, unknown, snapshot
 
