@@ -4,7 +4,6 @@
   Card,
   Group,
   Modal,
-  ScrollArea,
   Select,
   Stack,
   Switch,
@@ -12,7 +11,7 @@
   TextInput,
 } from "@mantine/core";
 import { IconRefresh } from "@tabler/icons-react";
-import type { MutableRefObject } from "react";
+import { useMemo, useState, type MutableRefObject } from "react";
 import {
   formatLogTime,
   logEntryKey,
@@ -21,6 +20,7 @@ import {
 import type { DeviceStatus, LogEntry, ProcessStatus } from "../types";
 import { DeviceNameInline } from "./DeviceNameInline";
 import { JsonPreview } from "./JsonPreview";
+import { VirtualizedList } from "./VirtualizedList";
 
 type Props = {
   opened: boolean;
@@ -85,7 +85,13 @@ export function LogsModal({
   onToggleExpanded,
   onCopyMessage,
 }: Props) {
-  const deviceById = new Map(devices.map((device) => [device.device_id, device]));
+  const [payloadOpenByKey, setPayloadOpenByKey] = useState<Record<string, boolean>>(
+    {}
+  );
+  const deviceById = useMemo(
+    () => new Map(devices.map((device) => [device.device_id, device])),
+    [devices]
+  );
   return (
     <Modal
       opened={opened}
@@ -198,14 +204,18 @@ export function LogsModal({
           value={textFilter}
           onChange={(event) => onTextFilterChange(event.currentTarget.value)}
         />
-        <ScrollArea h="55vh" viewportRef={viewportRef}>
-          <Stack gap={6}>
-            {filteredRows.length === 0 && (
-              <Text size="sm" c="dimmed">
-                No log entries match the current filters.
-              </Text>
-            )}
-            {filteredRows.map((entry, idx) => {
+        <VirtualizedList
+          items={filteredRows}
+          getItemKey={logEntryKey}
+          estimateSize={112}
+          height="55vh"
+          viewportRef={viewportRef}
+          empty={
+            <Text size="sm" c="dimmed">
+              No log entries match the current filters.
+            </Text>
+          }
+          renderItem={(entry) => {
               const severity = String(entry.severity ?? "info").toLowerCase();
               const badgeColor =
                 severity === "critical" || severity === "error"
@@ -224,13 +234,13 @@ export function LogsModal({
               const messageLines = fullMessage.split(/\r?\n/);
               const isLongMessage = messageLines.length > 4 || fullMessage.length > 320;
               const expanded = Boolean(expandedByKey[entryKey]);
+              const payloadOpen = Boolean(payloadOpenByKey[entryKey]);
               const visibleMessage =
                 isLongMessage && !expanded
                   ? `${messageLines.slice(0, 4).join("\n")}\n...`
                   : fullMessage;
               return (
                 <Card
-                  key={`${entryKey}:${idx}`}
                   p="xs"
                   radius="sm"
                   style={{ border: "1px solid var(--card-border)" }}
@@ -297,23 +307,37 @@ export function LogsModal({
                       </Group>
                     )}
                     {entry.payload_json && entry.payload_json.length > 0 && (
-                      <details>
+                      <details
+                        open={payloadOpen}
+                        onToggle={(event) => {
+                          const open = event.currentTarget.open;
+                          setPayloadOpenByKey((prev) => ({
+                            ...prev,
+                            [entryKey]: open,
+                          }));
+                        }}
+                      >
                         <summary>
                           <Text span size="xs" c="dimmed">
                             Payload
                           </Text>
                         </summary>
-                        <div style={{ marginTop: 4 }}>
-                          <JsonPreview text={entry.payload_json} colorScheme={colorScheme} />
-                        </div>
+                        {payloadOpen && (
+                          <div style={{ marginTop: 4 }}>
+                            <JsonPreview
+                              text={entry.payload_json}
+                              colorScheme={colorScheme}
+                            />
+                          </div>
+                        )}
                       </details>
                     )}
                   </Stack>
                 </Card>
               );
-            })}
-          </Stack>
-        </ScrollArea>
+            }
+          }
+        />
       </Stack>
     </Modal>
   );

@@ -36,7 +36,7 @@ The web UI lives in `web/react_ui/` (Vite + React + Mantine + TypeScript, tested
 
 ```powershell
 npm install
-npm test            # vitest run (65 tests in 10 files pass as of 2026-06-18)
+npm test            # vitest run (124 tests in 20 files pass as of 2026-08-29)
 npm run typecheck   # tsc --noEmit (clean; do not introduce new errors)
 npm run build       # tsc --noEmit && vite build && compress-dist
 ```

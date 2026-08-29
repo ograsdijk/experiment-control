@@ -6,7 +6,6 @@ import {
   Group,
   Modal,
   NumberInput,
-  ScrollArea,
   SegmentedControl,
   Select,
   Stack,
@@ -21,6 +20,7 @@ import { formatWallTimeSeconds } from "../features/logs/utils";
 import type { DeviceStatus } from "../types";
 import { DeviceNameInline } from "./DeviceNameInline";
 import { JsonPreview } from "./JsonPreview";
+import { VirtualizedList } from "./VirtualizedList";
 
 type CommandHistoryControllerState = ReturnType<typeof useCommandHistoryController>;
 
@@ -47,6 +47,10 @@ function rowErrorMessage(error: Record<string, unknown> | null): string | null {
 }
 
 const PARAM_PREVIEW_LIMIT = 5;
+
+function commandRowKey(row: { id: string | number }): string | number {
+  return row.id;
+}
 
 function formatParamPreviewValue(value: unknown): string {
   if (value == null) {
@@ -321,14 +325,18 @@ export function CommandHistoryModal({
                 controller.setCommandHistoryTextFilter(event.currentTarget.value)
               }
             />
-            <ScrollArea h="55vh" viewportRef={viewportRef}>
-              <Stack gap={6}>
-                {controller.filteredCommandHistoryRows.length === 0 && (
-                  <Text size="sm" c="dimmed">
-                    No command entries match the current filters.
-                  </Text>
-                )}
-                {controller.filteredCommandHistoryRows.map((row) => {
+            <VirtualizedList
+              items={controller.filteredCommandHistoryRows}
+              getItemKey={commandRowKey}
+              estimateSize={118}
+              height="55vh"
+              viewportRef={viewportRef}
+              empty={
+                <Text size="sm" c="dimmed">
+                  No command entries match the current filters.
+                </Text>
+              }
+              renderItem={(row) => {
                   const ok = row.response.ok === true;
                   const errorMessage =
                     row.response.error?.message ?? row.response.error?.code;
@@ -436,9 +444,9 @@ export function CommandHistoryModal({
                       </Stack>
                     </Card>
                   );
-                })}
-              </Stack>
-            </ScrollArea>
+                }
+              }
+            />
           </>
         )}
 
@@ -531,16 +539,19 @@ export function CommandHistoryModal({
             <Text size="xs" c="dimmed">
               Selected for restore: {controller.selectedCommandJournalRows.length}
             </Text>
-            <ScrollArea h="50vh" viewportRef={viewportRef}>
-              <Stack gap={6}>
-                {controller.filteredCommandJournalRows.length === 0 && (
-                  <Text size="sm" c="dimmed">
-                    No command journal entries match the current filters.
-                  </Text>
-                )}
-                {controller.filteredCommandJournalRows.map((row) => (
+            <VirtualizedList
+              items={controller.filteredCommandJournalRows}
+              getItemKey={commandRowKey}
+              estimateSize={136}
+              height="50vh"
+              viewportRef={viewportRef}
+              empty={
+                <Text size="sm" c="dimmed">
+                  No command journal entries match the current filters.
+                </Text>
+              }
+              renderItem={(row) => (
                   <Card
-                    key={row.id}
                     p="xs"
                     radius="sm"
                     style={{ border: "1px solid var(--card-border)" }}
@@ -671,9 +682,8 @@ export function CommandHistoryModal({
                       </Group>
                     </Group>
                   </Card>
-                ))}
-              </Stack>
-            </ScrollArea>
+                )}
+            />
           </>
         )}
 
@@ -737,16 +747,19 @@ export function CommandHistoryModal({
                 {controller.commandRestoreLastReport.skipped}
               </Text>
             )}
-            <ScrollArea h="55vh" viewportRef={viewportRef}>
-              <Stack gap={6}>
-                {controller.commandRestorePreviewRows.length === 0 && (
-                  <Text size="sm" c="dimmed">
-                    Select rows in the Journal tab to build a restore plan.
-                  </Text>
-                )}
-                {controller.commandRestorePreviewRows.map((row) => (
+            <VirtualizedList
+              items={controller.commandRestorePreviewRows}
+              getItemKey={commandRowKey}
+              estimateSize={130}
+              height="55vh"
+              viewportRef={viewportRef}
+              empty={
+                <Text size="sm" c="dimmed">
+                  Select rows in the Journal tab to build a restore plan.
+                </Text>
+              }
+              renderItem={(row) => (
                   <Card
-                    key={row.id}
                     p="xs"
                     radius="sm"
                     style={{ border: "1px solid var(--card-border)" }}
@@ -857,9 +870,8 @@ export function CommandHistoryModal({
                       </Button>
                     </Group>
                   </Card>
-                ))}
-              </Stack>
-            </ScrollArea>
+                )}
+            />
           </>
         )}
       </Stack>

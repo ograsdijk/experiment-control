@@ -6,6 +6,7 @@ import {
   acceptNewLogEntries,
   formatLogTime,
   formatWallTimeSeconds,
+  logEntryKey,
   watchdogToastForLogEntry,
 } from "./utils";
 
@@ -95,6 +96,16 @@ describe("watchdog toast formatting", () => {
 });
 
 describe("log entry deduplication", () => {
+  it("uses content identity independent of display position", () => {
+    const entry: LogEntry = {
+      topic: "manager.log",
+      message: "stable",
+      ts: { t_mono: 42 },
+    };
+
+    expect(logEntryKey(entry)).toBe(logEntryKey({ ...entry }));
+  });
+
   it("returns only entries not already seen", () => {
     const first = {
       topic: "manager.watchdog.triggered",

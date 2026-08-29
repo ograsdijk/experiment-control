@@ -172,6 +172,7 @@ import { deviceSortableId } from "./features/layout/drag_helpers";
 import { useNavResizer } from "./features/layout/useNavResizer";
 import { useUiDragController } from "./features/layout/useUiDragController";
 import { useLogs } from "./features/logs/LogsContext";
+import { useFollowEdgeScroll } from "./features/logs/useFollowEdgeScroll";
 import { ExpandedPlotBody } from "./features/panels/ExpandedPlotBody";
 import { useStreamWorkspacePanelReconciler } from "./features/panels/useStreamWorkspacePanelReconciler";
 import {
@@ -653,7 +654,6 @@ export function App() {
   // logSeenRef + logScrollRef + logRowsBaselineReadyRef +
   // logRowsLastKeyRef now provided by LogsContext (destructured above).
   const commandHistoryScrollRef = useRef<HTMLDivElement | null>(null);
-  const commandHistoryNearBottomRef = useRef(true);
   const commandHistoryBaselineReadyRef = useRef(false);
   const commandHistoryLastIdRef = useRef<string | null>(null);
   // settingsFileInputRef now provided by SettingsContext (destructured above).
@@ -759,6 +759,42 @@ export function App() {
     sendDeviceCommand,
     sendProcessCommand,
   } = commandHistoryController;
+  const logScrollItemKeys = useMemo(
+    () => filteredLogRows.map((entry) => logEntryKey(entry)),
+    [filteredLogRows]
+  );
+  const commandHistoryScrollItemKeys = useMemo(() => {
+    if (commandHistoryMode === "journal") {
+      return filteredCommandJournalRows.map((row) => String(row.id));
+    }
+    if (commandHistoryMode === "restore") {
+      return commandHistoryController.commandRestorePreviewRows.map((row) =>
+        String(row.id)
+      );
+    }
+    return filteredCommandHistoryRows.map((row) => row.id);
+  }, [
+    commandHistoryMode,
+    filteredCommandHistoryRows,
+    filteredCommandJournalRows,
+    commandHistoryController.commandRestorePreviewRows,
+  ]);
+  useFollowEdgeScroll({
+    viewportRef: logScrollRef,
+    opened: logsOpen,
+    enabled: logAutoScroll,
+    newestFirst: logSortNewestFirst,
+    itemKeys: logScrollItemKeys,
+    resetKey: `logs:${logSortNewestFirst}`,
+  });
+  useFollowEdgeScroll({
+    viewportRef: commandHistoryScrollRef,
+    opened: commandHistoryOpen,
+    enabled: commandHistoryAutoScroll && commandHistoryMode !== "restore",
+    newestFirst: commandHistorySortNewestFirst,
+    itemKeys: commandHistoryScrollItemKeys,
+    resetKey: `${commandHistoryMode}:${commandHistorySortNewestFirst}`,
+  });
 
   const {
     capabilitiesByDevice,
@@ -1710,72 +1746,6 @@ export function App() {
       }
     },
   });
-
-  useEffect(() => {
-    if (!logsOpen || !logAutoScroll) {
-      return;
-    }
-    const host = logScrollRef.current;
-    if (!host) {
-      return;
-    }
-    // Newest-first puts new entries at the top; follow that edge.
-    host.scrollTop = logSortNewestFirst ? 0 : host.scrollHeight;
-  }, [filteredLogRows, logsOpen, logAutoScroll, logSortNewestFirst]);
-
-  useEffect(() => {
-    if (!commandHistoryOpen) {
-      commandHistoryNearBottomRef.current = true;
-      return;
-    }
-    const host = commandHistoryScrollRef.current;
-    if (!host) {
-      return;
-    }
-    const thresholdPx = 24;
-    const updateNearBottom = () => {
-      // With newest-first the follow edge is the top; otherwise the bottom.
-      const offset = commandHistorySortNewestFirst
-        ? host.scrollTop
-        : host.scrollHeight - (host.scrollTop + host.clientHeight);
-      commandHistoryNearBottomRef.current = offset <= thresholdPx;
-    };
-    updateNearBottom();
-    host.addEventListener("scroll", updateNearBottom, { passive: true });
-    return () => {
-      host.removeEventListener("scroll", updateNearBottom);
-    };
-  }, [
-    commandHistoryOpen,
-    commandHistoryMode,
-    commandHistorySortNewestFirst,
-    filteredCommandHistoryRows,
-    filteredCommandJournalRows,
-  ]);
-
-  useEffect(() => {
-    if (!commandHistoryOpen || !commandHistoryAutoScroll) {
-      return;
-    }
-    if (commandHistoryMode === "restore") {
-      return;
-    }
-    const host = commandHistoryScrollRef.current;
-    if (!host) {
-      return;
-    }
-    if (!commandHistoryNearBottomRef.current) {
-      return;
-    }
-    host.scrollTop = commandHistorySortNewestFirst ? 0 : host.scrollHeight;
-  }, [
-    filteredCommandHistoryRows,
-    filteredCommandJournalRows,
-    commandHistoryOpen,
-    commandHistoryAutoScroll,
-    commandHistorySortNewestFirst,
-    commandHistoryMode,
-  ]);
 
   // Apply-helpers + buffer/capacity helpers moved to
   // features/panels/applyToPanels.ts in round 14. Bind the refs they

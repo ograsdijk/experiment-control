@@ -724,7 +724,7 @@ export function useCommandHistoryController({
   };
 
   useEffect(() => {
-    if (!commandHistoryOpen) {
+    if (!commandHistoryOpen || commandHistoryMode === "live") {
       return;
     }
     let cancelled = false;
@@ -747,7 +747,7 @@ export function useCommandHistoryController({
       cancelled = true;
       window.clearInterval(interval);
     };
-  }, [commandHistoryOpen, commandJournalLimit]);
+  }, [commandHistoryOpen, commandHistoryMode, commandJournalLimit]);
 
   const appendCommandHistory = (
     entry: Omit<CommandHistoryEntry, "id" | "ts_wall_s">
