@@ -18,6 +18,7 @@ from experiment_control.processes.watchdog import (
     WatchdogProcess,
     WatchdogRule,
     _parse_ruleset,
+    _resolve_watchdog_bindings,
     evaluate_watchdog_rule,
     mark_watchdog_triggered,
 )
@@ -64,6 +65,69 @@ def _confirmation_rule(
 
 
 class WatchdogRuleEvalTests(unittest.TestCase):
+    def test_optional_binding_exposes_ok_without_changing_required_unknown(self) -> None:
+        optional_rule = _confirmation_rule(
+            telemetry=[
+                TelemetryBinding(
+                    alias="p",
+                    device_id="hornet",
+                    signal="pressure",
+                    max_age_s=1.0,
+                    required=False,
+                )
+            ],
+            condition=True,
+            confirmation=WatchdogConfirmation(("p",), 3, {}),
+        )
+        required_rule = _confirmation_rule(
+            telemetry=[
+                TelemetryBinding(
+                    alias="p",
+                    device_id="hornet",
+                    signal="pressure",
+                    max_age_s=1.0,
+                )
+            ],
+            condition=True,
+            confirmation=WatchdogConfirmation(("p",), 3, {}),
+        )
+
+        unavailable_samples = (
+            None,
+            {"value": 2.0, "quality": "BAD", "age_s": 0.1},
+            {"value": 2.0, "quality": "OK", "age_s": 2.0},
+        )
+        for sample in unavailable_samples:
+            with self.subTest(sample=sample):
+                def getter(_dev: str, _sig: str) -> dict[str, object] | None:
+                    return sample
+
+                optional_env, _snapshot, optional_unknown = _resolve_watchdog_bindings(
+                    optional_rule,
+                    telemetry_getter=getter,
+                    now_mono=1.0,
+                )
+                required_env, _snapshot, required_unknown = _resolve_watchdog_bindings(
+                    required_rule,
+                    telemetry_getter=getter,
+                    now_mono=1.0,
+                )
+
+                self.assertFalse(optional_unknown)
+                self.assertFalse(optional_env["p"].ok)
+                self.assertIsNone(optional_env["p"].value)
+                self.assertTrue(required_unknown)
+                self.assertNotIn("p", required_env)
+
+        valid_env, _snapshot, valid_unknown = _resolve_watchdog_bindings(
+            optional_rule,
+            telemetry_getter=lambda _dev, _sig: _ok_sample(2.0, 3.0),
+            now_mono=1.0,
+        )
+        self.assertFalse(valid_unknown)
+        self.assertTrue(valid_env["p"].ok)
+        self.assertEqual(valid_env["p"].value, 2.0)
+
     def test_confirmation_counts_only_distinct_manager_samples(self) -> None:
         rule = _parse_ruleset(
             {"watchdog_id": "wd", "rules": [{"name": "r", "inputs": {"telemetry": [{"as": "p", "device": "h", "signal": "p"}]}, "condition": {"gt": ["${p.value}", 1.0]}, "confirmation": {"sample_alias": "p", "consecutive_samples": 3}, "actions": [{"command": {"device_id": "d", "action": "stop"}}]}]}, source="test"
@@ -249,6 +313,39 @@ class WatchdogRuleEvalTests(unittest.TestCase):
         self.assertIsInstance(state.snapshot, dict)
         self.assertIn("t", snapshot)
         self.assertFalse(bool(snapshot["t"].get("ok")))
+
+    def test_unknown_trigger_bypasses_valid_sample_confirmation(self) -> None:
+        rule = WatchdogRule(
+            name="confirmed_fail_safe",
+            severity="critical",
+            message=None,
+            telemetry=[
+                TelemetryBinding(
+                    alias="t",
+                    device_id="dev1",
+                    signal="temp",
+                    max_age_s=1.0,
+                )
+            ],
+            condition={"gt": ["${t.value}", 10.0]},
+            stable_for_s=0.0,
+            cooldown_s=0.0,
+            latch=False,
+            on_unknown="trigger",
+            actions=[_default_action()],
+            confirmation=WatchdogConfirmation(("t",), 3, {}),
+        )
+
+        triggered, alarm, unknown, _snapshot = evaluate_watchdog_rule(
+            rule=rule,
+            state=RuleState(),
+            telemetry_getter=lambda _dev, _sig: None,
+            now_mono=5.0,
+        )
+
+        self.assertTrue(triggered)
+        self.assertTrue(alarm)
+        self.assertTrue(unknown)
 
     def test_clear_alarm_state_is_recorded_after_evaluation(self) -> None:
         rule = WatchdogRule(

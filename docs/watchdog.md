@@ -72,8 +72,21 @@ For `as: vac_p`, the rule environment provides:
 - `vac_p.quality`
 - `vac_p.device`
 - `vac_p.signal`
+- `vac_p.ok`
 
 Bindings are available to template expressions inside `${...}`.
+
+For a valid binding, `ok` is `true` and `value` contains the sample value. An
+optional binding (`required: false`) remains available when its sample is
+missing, stale, or not `OK`; in that case `ok` is `false` and `value` is
+`null`. Guard optional values before comparing them:
+
+```yaml
+condition:
+  and:
+    - eq: ["${vac_p.ok}", true]
+    - gt: ["${vac_p.value}", 1.0e-6]
+```
 
 ## Unknown telemetry handling
 
@@ -85,6 +98,13 @@ A binding is **usable** only if:
 If any required binding is unusable, the rule is **UNKNOWN**.
 - `on_unknown: ignore` ? alarm = false (stable timer resets)
 - `on_unknown: trigger` ? alarm = true (still subject to stability/cooldown)
+
+`on_unknown: trigger` is fail-safe and bypasses valid-sample confirmation,
+because unavailable telemetry cannot supply confirmable samples.
+
+An unusable optional binding does not make the rule unknown. Its alias has
+`ok: false`, allowing other optional inputs in the same rule to continue
+evaluating independently.
 
 ## Rule evaluation semantics
 

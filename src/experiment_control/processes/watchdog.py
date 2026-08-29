@@ -25,7 +25,6 @@ from ..utils.cli_args import (
     add_process_id_arg,
     add_rpc_timeout_arg,
 )
-from ..utils.responses import is_response_ok
 from ..utils.config_parsing import (
     ConfigError,
     normalize_list,
@@ -34,6 +33,7 @@ from ..utils.config_parsing import (
     require_list_of_dicts,
     require_str,
 )
+from ..utils.responses import is_response_ok
 from ..utils.rpc_dispatch import RpcDispatchRegistry
 from ..utils.value_coercion import coerce_bool, coerce_float, coerce_int
 from ..utils.yaml_helpers import load_yaml_file
@@ -568,6 +568,21 @@ def _resolve_watchdog_binding(
     }
     if sample is None:
         entry.update({"value": None, "quality": "MISSING", "age_s": None, "ok": False})
+        if not binding.required:
+            return (
+                entry,
+                to_attrdict(
+                    {
+                        "value": None,
+                        "age_s": None,
+                        "quality": "MISSING",
+                        "device": binding.device_id,
+                        "signal": binding.signal,
+                        "ok": False,
+                    }
+                ),
+                False,
+            )
         return entry, None, binding.required
 
     age_s = _resolve_watchdog_binding_age_s(sample, now_mono=now_mono)
@@ -583,6 +598,21 @@ def _resolve_watchdog_binding(
     ok = quality == "OK" and age_s is not None and age_s <= binding.max_age_s
     entry["ok"] = ok
     if not ok:
+        if not binding.required:
+            return (
+                entry,
+                to_attrdict(
+                    {
+                        "value": None,
+                        "age_s": age_s,
+                        "quality": quality,
+                        "device": binding.device_id,
+                        "signal": binding.signal,
+                        "ok": False,
+                    }
+                ),
+                False,
+            )
         return entry, None, binding.required
     alias_env: Json = to_attrdict(
         {
@@ -591,6 +621,7 @@ def _resolve_watchdog_binding(
             "quality": quality,
             "device": binding.device_id,
             "signal": binding.signal,
+            "ok": True,
         }
     )
     return entry, alias_env, False
@@ -789,7 +820,11 @@ def evaluate_watchdog_rule(
         unknown=unknown,
         on_condition_error=on_condition_error,
     )
-    alarm = _watchdog_confirmation_alarm(rule=rule, env=env, alarm=alarm)
+    # ``on_unknown: trigger`` is already the fail-safe decision. Branch
+    # conditions and valid-sample confirmation cannot be evaluated while a
+    # required input is unavailable, and must not suppress that decision.
+    if not unknown:
+        alarm = _watchdog_confirmation_alarm(rule=rule, env=env, alarm=alarm)
     state.last_evaluated_mono = now_mono
     state.alarm = alarm
     state.unknown = unknown
@@ -810,9 +845,13 @@ def evaluate_watchdog_rule(
     if rule.latch and state.latched:
         return False, alarm, unknown, snapshot
 
-    confirmation_ready = _watchdog_confirmation_ready(
-        rule=rule, state=state, snapshot=snapshot, alarm=alarm, env=env
-    )
+    if unknown and rule.on_unknown == "trigger":
+        _reset_watchdog_confirmation(state)
+        confirmation_ready = True
+    else:
+        confirmation_ready = _watchdog_confirmation_ready(
+            rule=rule, state=state, snapshot=snapshot, alarm=alarm, env=env
+        )
     if not _watchdog_stable_ready(rule=rule, state=state, now_mono=now_mono):
         return False, alarm, unknown, snapshot
 
