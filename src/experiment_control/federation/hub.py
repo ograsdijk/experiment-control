@@ -69,6 +69,7 @@ class MirroredDeviceRuntime:
     last_liveness_hard_timeout_s: float | None = None
     last_liveness_recv_mono: float | None = None
     last_liveness_age_s: float | None = None
+    last_liveness_heartbeat_pid: int | None = None
     last_error: str | None = None
 
 
@@ -120,6 +121,32 @@ def _mirrored_device_liveness(
             0.0, base_age_s + now_mono - float(liveness_recv_mono)
         )
     effective_age_s = relayed_age_s if relayed_age_s is not None else hb_age_s
+    heartbeat_is_newer = (
+        mirror.last_hb_recv_mono is not None
+        and isinstance(liveness_recv_mono, (int, float))
+        and mirror.last_hb_recv_mono > float(liveness_recv_mono)
+    )
+    payload = mirror.last_hb_payload or {}
+    if heartbeat_is_newer and hb_age_s is not None:
+        heartbeat_pid = payload.get("pid")
+        liveness_heartbeat_pid = getattr(
+            mirror, "last_liveness_heartbeat_pid", None
+        )
+        heartbeat_proves_recovery = relayed != "OFFLINE" or (
+            liveness_heartbeat_pid is not None
+            and heartbeat_pid is not None
+            and heartbeat_pid != liveness_heartbeat_pid
+        )
+        if (
+            heartbeat_proves_recovery
+            and hb_age_s <= peer_rt.config.event_stale_s
+        ):
+            return (
+                "ONLINE"
+                if bool(payload.get("device_reachable", False))
+                else "DISCONNECTED",
+                hb_age_s,
+            )
     if relayed == "STALE":
         hard_timeout_s = mirror.last_liveness_hard_timeout_s
         if (
@@ -135,7 +162,6 @@ def _mirrored_device_liveness(
         return "OFFLINE", hb_age_s
     if relayed in {"ONLINE", "DISCONNECTED"}:
         return relayed, hb_age_s
-    payload = mirror.last_hb_payload or {}
     return (
         "ONLINE" if bool(payload.get("device_reachable", False)) else "DISCONNECTED",
         hb_age_s,
@@ -508,7 +534,15 @@ class FederationHub:
                 self._last_liveness[local_id] = liveness
                 self._manager._publish_manager_event(
                     "manager.liveness",
-                    {"device_id": local_id, "liveness": liveness, "age_s": hb_age_s},
+                    {
+                        "device_id": local_id,
+                        "liveness": liveness,
+                        "age_s": hb_age_s,
+                        "heartbeat_pid": mirror.last_liveness_heartbeat_pid,
+                        "heartbeat_hard_timeout_s": (
+                            mirror.last_liveness_hard_timeout_s
+                        ),
+                    },
                 )
 
     def list_devices_snapshot(self) -> list[Json]:
@@ -1246,6 +1280,10 @@ class FederationHub:
             liveness = str(rewritten.get("liveness") or "").upper()
             if liveness in {"ONLINE", "DISCONNECTED", "STALE", "OFFLINE"}:
                 mirror.last_liveness = liveness
+                # The relayed event has already been published below. Keep the
+                # derived-state cache in sync so check_timeouts() does not emit
+                # an immediate duplicate lacking the owner's generation data.
+                self._last_liveness[local_id] = liveness
             mirror.last_liveness_recv_mono = time.monotonic()
             age_raw = rewritten.get("age_s")
             try:
@@ -1263,6 +1301,15 @@ class FederationHub:
                 )
             except (TypeError, ValueError):
                 mirror.last_liveness_hard_timeout_s = None
+            heartbeat_pid_raw = rewritten.get("heartbeat_pid")
+            try:
+                mirror.last_liveness_heartbeat_pid = (
+                    None
+                    if heartbeat_pid_raw is None
+                    else int(heartbeat_pid_raw)
+                )
+            except (TypeError, ValueError):
+                mirror.last_liveness_heartbeat_pid = None
             self._manager._publish_manager_event(topic, rewritten)
             return
         if topic == "manager.log":

@@ -7,6 +7,7 @@ from unittest import mock
 from experiment_control._manager.device_routing import _route_command
 from experiment_control._manager.models import Liveness
 from experiment_control._manager.process_supervision import (
+    _auto_reconnect_rpc_timeout_ms,
     maybe_restart_device_driver,
     stop_driver,
 )
@@ -43,6 +44,38 @@ class StagedHeartbeatSecondReviewTests(unittest.TestCase):
 
         maybe_restart_device_driver(manager, "dev", handle, 100.0)
         manager.start_driver.assert_not_called()
+
+    def test_explicit_stop_liveness_preserves_heartbeat_generation(self) -> None:
+        handle = SimpleNamespace(
+            process=None,
+            driver_pid=None,
+            driver_heartbeat_pid=123,
+            driver_process_state="FAILED",
+            driver_next_restart_t_mono=None,
+            rpc_endpoint=None,
+            pub_endpoint=None,
+            spec=SimpleNamespace(
+                driver_max_restarts=3,
+                device_id="dev",
+                driver_heartbeat_hard_timeout_s=12.0,
+            ),
+        )
+        manager = SimpleNamespace(
+            _devices={"dev": handle},
+            _heartbeat_timeout_s=3.0,
+            _heartbeat_hard_timeout_s=10.0,
+            _last_liveness={},
+            _publish_manager_event=mock.Mock(),
+            _publish_driver_event=mock.Mock(),
+            _close_device_rpc=mock.Mock(),
+        )
+
+        stop_driver(manager, "dev")
+
+        topic, payload = manager._publish_manager_event.call_args.args
+        self.assertEqual(topic, "manager.liveness")
+        self.assertEqual(payload["heartbeat_pid"], 123)
+        self.assertEqual(payload["heartbeat_hard_timeout_s"], 12.0)
 
     def _capability_manager(self, handle: SimpleNamespace) -> SimpleNamespace:
         return SimpleNamespace(
@@ -203,6 +236,80 @@ class StagedHeartbeatSecondReviewTests(unittest.TestCase):
         liveness, age_s = _mirrored_device_liveness(peer_rt, mirror, 107.0)
         self.assertEqual(liveness, "OFFLINE")
         self.assertEqual(age_s, 10.5)
+
+    def test_federated_fresh_heartbeat_recovers_when_liveness_event_is_lost(self) -> None:
+        peer_rt = SimpleNamespace(config=SimpleNamespace(event_stale_s=3.0))
+        mirror = SimpleNamespace(
+            last_hb_recv_mono=104.0,
+            last_hb_payload={"pid": 11, "device_reachable": True},
+            last_liveness="STALE",
+            last_liveness_hard_timeout_s=10.0,
+            last_liveness_recv_mono=100.0,
+            last_liveness_age_s=3.5,
+            last_liveness_heartbeat_pid=11,
+        )
+
+        liveness, age_s = _mirrored_device_liveness(peer_rt, mirror, 104.1)
+
+        self.assertEqual(liveness, "ONLINE")
+        self.assertAlmostEqual(age_s, 0.1)
+
+    def test_federated_late_heartbeat_cannot_revive_failed_generation(self) -> None:
+        peer_rt = SimpleNamespace(config=SimpleNamespace(event_stale_s=3.0))
+        mirror = SimpleNamespace(
+            last_hb_recv_mono=101.0,
+            last_hb_payload={"pid": 11, "device_reachable": True},
+            last_liveness="OFFLINE",
+            last_liveness_hard_timeout_s=10.0,
+            last_liveness_recv_mono=100.0,
+            last_liveness_age_s=10.0,
+            last_liveness_heartbeat_pid=11,
+        )
+
+        liveness, _age_s = _mirrored_device_liveness(peer_rt, mirror, 101.1)
+
+        self.assertEqual(liveness, "OFFLINE")
+
+    def test_federated_new_generation_heartbeat_recovers_lost_online_event(self) -> None:
+        peer_rt = SimpleNamespace(config=SimpleNamespace(event_stale_s=3.0))
+        mirror = SimpleNamespace(
+            last_hb_recv_mono=101.0,
+            last_hb_payload={"pid": 12, "device_reachable": False},
+            last_liveness="OFFLINE",
+            last_liveness_hard_timeout_s=10.0,
+            last_liveness_recv_mono=100.0,
+            last_liveness_age_s=10.0,
+            last_liveness_heartbeat_pid=11,
+        )
+
+        liveness, age_s = _mirrored_device_liveness(peer_rt, mirror, 101.1)
+
+        self.assertEqual(liveness, "DISCONNECTED")
+        self.assertAlmostEqual(age_s, 0.1)
+
+    def test_auto_reconnect_rpc_is_bounded_by_soft_heartbeat_deadline(self) -> None:
+        manager = SimpleNamespace(
+            _heartbeat_timeout_s=3.0,
+            _device_heartbeat_age_s=lambda _handle, _now: 2.75,
+        )
+
+        timeout_ms = _auto_reconnect_rpc_timeout_ms(
+            manager,
+            SimpleNamespace(),
+            60_000,
+        )
+
+        self.assertGreater(timeout_ms, 0)
+        self.assertLessEqual(timeout_ms, 250)
+
+    def test_auto_reconnect_rpc_stops_after_soft_heartbeat_deadline(self) -> None:
+        manager = SimpleNamespace(
+            _heartbeat_timeout_s=3.0,
+            _device_heartbeat_age_s=lambda _handle, _now: 3.01,
+        )
+
+        with self.assertRaisesRegex(TimeoutError, "heartbeat became stale"):
+            _auto_reconnect_rpc_timeout_ms(manager, SimpleNamespace(), 60_000)
 
     def test_federation_default_relay_includes_liveness(self) -> None:
         self.assertIn("manager.liveness", DEFAULT_FEDERATION_RELAY_TOPICS)

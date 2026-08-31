@@ -2014,6 +2014,9 @@ class Manager(
                         "liveness": liveness,
                         "age_s": age,
                         "driver_process_state": handle.driver_process_state,
+                        "heartbeat_pid": getattr(
+                            handle, "driver_heartbeat_pid", None
+                        ),
                         "heartbeat_hard_timeout_s": float(hard_timeout_s),
                     },
                 )
