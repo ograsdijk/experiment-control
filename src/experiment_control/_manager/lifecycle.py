@@ -320,7 +320,7 @@ class LifecycleMixin(_MixinBase):
         journal = self._command_journal
         if journal is not None:
             _safe_call(lambda: journal.close(timeout_s=2.0))
-        self._close_manager_log_sink_file()
+        self._close_manager_jsonl_sink()
 
         _safe_close_socket(self._registry_rep)
         _safe_close_socket(self._sub)

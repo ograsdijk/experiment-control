@@ -3,15 +3,14 @@ from __future__ import annotations
 import datetime
 import sys
 import time
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any
 
 from ..utils.errors import TRANSIENT_CAPABILITIES_ERROR_CODES
 from ..utils.logging_levels import normalize_log_severity
 
 if TYPE_CHECKING:
-    from typing import TextIO
-
     from ..manager_protocol import ManagerProtocol
+    from ..utils.rotating_jsonl import RotatingJsonlSink
 
     _MixinBase = ManagerProtocol
 else:
@@ -71,11 +70,9 @@ def _sink_line_text(
 def _write_sink_line_impl(
     *,
     stderr_enabled: bool,
-    log_file: "TextIO | None",
-    close_log_file: Callable[[], None],
     line: str,
 ) -> None:
-    """Shared sink-line writer used by both the mixin and the legacy forwarder.
+    """Write one human-readable manager event to stderr when enabled.
 
     Kept as a pure function (no ``manager`` first arg) so the mixin
     method can pass already-narrowed attributes — gives mypy enough
@@ -87,13 +84,6 @@ def _write_sink_line_impl(
             sys.stderr.flush()
         except Exception:
             pass
-    if log_file is not None:
-        try:
-            log_file.write(line + "\n")
-        except Exception:
-            close_log_file()
-
-
 def _event_log_severity(topic: str, payload: Json) -> str | None:
     if topic == "manager.command":
         ok = payload.get("ok")
@@ -265,23 +255,64 @@ class LogEventsMixin(_MixinBase):
     At runtime ``_MixinBase`` is ``object``; only mypy sees
     :class:`ManagerProtocol` as the base, which supplies signatures
     for ``_manager_log_sink_event`` / ``_severity_rank`` /
-    ``_manager_log_sink_is_duplicate`` / ``_close_manager_log_sink_file``
+    ``_manager_log_sink_is_duplicate`` / ``_close_manager_jsonl_sink``
     / ``_emit_log`` (all still on ``Manager`` itself, scheduled to move
     onto ``LogsMixin`` in §8.2.4).
     """
 
     # Owned-state attributes (concrete types declared on Manager).
     _manager_log_stderr_enabled: bool
-    _manager_log_file: "TextIO | None"
+    _manager_log_jsonl_sink: "RotatingJsonlSink | None"
     _manager_log_min_level_rank: int
 
     def _write_sink_line(self, line: str) -> None:
         _write_sink_line_impl(
             stderr_enabled=self._manager_log_stderr_enabled,
-            log_file=self._manager_log_file,
-            close_log_file=self._close_manager_log_sink_file,
             line=line,
         )
+
+    def _write_jsonl_sink_record(
+        self,
+        *,
+        topic: str,
+        payload: Json,
+        severity: str,
+        line_topic: str,
+        source_kind: str,
+        source_id: str | None,
+        message: str,
+    ) -> None:
+        sink = self._manager_log_jsonl_sink
+        if sink is None:
+            return
+        if topic == "manager.log":
+            record = dict(payload)
+            record["timestamp"] = _sink_timestamp_text(payload)
+            record["instance_id"] = getattr(self, "_instance_id", "unknown")
+        else:
+            record = {
+                "version": 1,
+                "timestamp": _sink_timestamp_text(payload),
+                "instance_id": getattr(self, "_instance_id", "unknown"),
+                "severity": severity,
+                "topic": line_topic,
+                "source_kind": source_kind,
+                "source_id": source_id,
+                "message": message,
+                "payload": payload,
+            }
+        try:
+            sink.write(record)
+        except Exception as exc:
+            self._close_manager_jsonl_sink()
+            if self._manager_log_stderr_enabled:
+                try:
+                    sys.stderr.write(
+                        f"[manager][warning] rotating JSONL log write failed: {exc}\n"
+                    )
+                    sys.stderr.flush()
+                except Exception:
+                    pass
 
     def _maybe_emit_manager_log_sink(self, topic: str, payload: Json) -> None:
         try:
@@ -294,8 +325,7 @@ class LogEventsMixin(_MixinBase):
         if self._severity_rank(severity) < min_rank:
             return
         fingerprint = f"{severity}|{line_topic}|{source_kind}|{source_id}|{message}"
-        if self._manager_log_sink_is_duplicate(fingerprint):
-            return
+        is_duplicate = self._manager_log_sink_is_duplicate(fingerprint)
         ts_text = _sink_timestamp_text(payload)
         line = _sink_line_text(
             severity=severity,
@@ -305,7 +335,17 @@ class LogEventsMixin(_MixinBase):
             message=message,
             ts_text=ts_text,
         )
-        self._write_sink_line(line)
+        self._write_jsonl_sink_record(
+            topic=topic,
+            payload=payload,
+            severity=severity,
+            line_topic=line_topic,
+            source_kind=source_kind,
+            source_id=source_id,
+            message=message,
+        )
+        if not is_duplicate:
+            self._write_sink_line(line)
 
     def _maybe_publish_log_event(self, topic: str, payload: Json) -> None:
         severity = _event_log_severity(topic, payload)

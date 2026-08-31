@@ -10,7 +10,7 @@ import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any, Callable, TextIO
+from typing import Any, Callable
 
 import zmq
 
@@ -52,9 +52,6 @@ from ._manager.internal_rpc import (
 # helpers exposed for cross-module use) remain imported.
 from ._manager.logs import normalize_id as shared_normalize_id
 from ._manager.logs import parse_boolish as shared_parse_boolish
-from ._manager.logs import (
-    resolve_manager_log_file_path as shared_resolve_manager_log_file_path,
-)
 from ._manager.logs import (
     resolve_manager_log_min_level as shared_resolve_manager_log_min_level,
 )
@@ -321,7 +318,7 @@ class Manager(
         chunk_cache_max_devices: int = 4096,
         chunk_cache_max_streams_per_device: int = 2048,
         manager_log_stderr: bool | None = None,
-        manager_log_file: str | Path | None = None,
+        manager_log_jsonl: dict[str, Any] | None = None,
         manager_log_min_level: str | None = None,
     ) -> None:
         instance_id_text = str(
@@ -464,14 +461,12 @@ class Manager(
         self._manager_log_min_level_rank = self._severity_rank(
             self._manager_log_min_level
         )
-        self._manager_log_file_path = self._resolve_manager_log_file_path(
-            manager_log_file
-        )
-        self._manager_log_file: TextIO | None = None
+        self._manager_log_jsonl_settings = manager_log_jsonl
+        self._manager_log_jsonl_sink = None
         self._manager_log_sink_recent: dict[str, float] = {}
         self._manager_log_sink_recent_window_s = 0.5
         self._manager_log_sink_recent_max = 256
-        self._open_manager_log_sink_file()
+        self._open_manager_jsonl_sink()
 
         # Latest fast-data descriptor cache: (device_id -> stream_name -> descriptor json)
         self._chunk_cache_max_devices = max(1, int(chunk_cache_max_devices))
@@ -2385,9 +2380,6 @@ class Manager(
 
     def _resolve_manager_log_stderr_enabled(self, raw: Any) -> bool:
         return shared_resolve_manager_log_stderr_enabled(raw)
-
-    def _resolve_manager_log_file_path(self, raw: Any) -> Path | None:
-        return shared_resolve_manager_log_file_path(raw)
 
     def _resolve_manager_log_min_level(self, raw: Any) -> str:
         return shared_resolve_manager_log_min_level(raw)

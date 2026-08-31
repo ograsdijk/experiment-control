@@ -11,11 +11,10 @@ from ..utils.logging_levels import (
     normalize_log_severity,
     severity_rank,
 )
+from ..utils.rotating_jsonl import RotatingJsonlSink
 
 if TYPE_CHECKING:
     from collections import deque
-    from typing import TextIO
-
     from ..manager_protocol import ManagerProtocol
 
     _MixinBase = ManagerProtocol
@@ -46,18 +45,6 @@ def resolve_manager_log_stderr_enabled(raw: Any) -> bool:
     if raw is None:
         return parse_boolish(os.environ.get("MANAGER_LOG_STDERR"), default=True)
     return parse_boolish(raw, default=True)
-
-
-def resolve_manager_log_file_path(raw: Any) -> Path | None:
-    value = raw
-    if value is None:
-        value = os.environ.get("MANAGER_LOG_FILE")
-    if value is None:
-        return None
-    text = str(value).strip()
-    if not text:
-        return None
-    return Path(text).expanduser()
 
 
 def resolve_manager_log_min_level(raw: Any) -> str:
@@ -253,8 +240,7 @@ def log_tail_entry_matches(entry: Json, *, filters: dict[str, Any]) -> bool:
 class LogsMixin(_MixinBase):
     """Mixin providing manager-log emit, sink, and tail helpers.
 
-    Phase 8.2.4: migrated ``open_manager_log_sink_file``,
-    ``close_manager_log_sink_file``, ``manager_log_sink_event``,
+    Phase 8.2.4: migrated manager log sink lifecycle, ``manager_log_sink_event``,
     ``manager_log_sink_is_duplicate``, ``emit_log``,
     ``emit_log_from_payload``, and ``log_tail`` from module-level
     helpers to mixin methods. Also dropped the unused trampoline
@@ -270,8 +256,8 @@ class LogsMixin(_MixinBase):
     """
 
     # Owned-state attributes (concrete types declared on Manager).
-    _manager_log_file_path: "Path | None"
-    _manager_log_file: "TextIO | None"
+    _manager_log_jsonl_settings: "Json | None"
+    _manager_log_jsonl_sink: "RotatingJsonlSink | None"
     _manager_log_stderr_enabled: bool
     _manager_log_sink_recent: dict[str, float]
     _manager_log_sink_recent_window_s: float
@@ -281,31 +267,39 @@ class LogsMixin(_MixinBase):
     # a future caller reaches for list-only ops (slicing, indexing).
     _log_history: "deque[Json]"
 
-    def _open_manager_log_sink_file(self) -> None:
-        path = self._manager_log_file_path
-        if path is None:
+    def _open_manager_jsonl_sink(self) -> None:
+        settings = self._manager_log_jsonl_settings
+        if settings is None:
             return
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            self._manager_log_file = path.open("a", encoding="utf-8", buffering=1)
+            self._manager_log_jsonl_sink = RotatingJsonlSink(
+                directory=Path(str(settings["directory"])),
+                prefix=str(settings.get("prefix", "manager")),
+                max_bytes=int(settings.get("max_bytes", 100 * 1024 * 1024)),
+                max_age_days=settings.get("max_age_days", 30.0),
+                max_total_bytes=settings.get(
+                    "max_total_bytes", 5 * 1024 * 1024 * 1024
+                ),
+            )
         except Exception as exc:
-            self._manager_log_file = None
+            self._manager_log_jsonl_sink = None
             if self._manager_log_stderr_enabled:
                 try:
                     sys.stderr.write(
-                        f"[manager][warning] MANAGER_LOG_FILE open failed: {path} ({exc})\n"
+                        "[manager][warning] rotating JSONL log sink open failed: "
+                        f"{settings.get('directory')} ({exc})\n"
                     )
                     sys.stderr.flush()
                 except Exception:
                     pass
 
-    def _close_manager_log_sink_file(self) -> None:
-        handle = self._manager_log_file
-        self._manager_log_file = None
-        if handle is None:
+    def _close_manager_jsonl_sink(self) -> None:
+        sink = self._manager_log_jsonl_sink
+        self._manager_log_jsonl_sink = None
+        if sink is None:
             return
         try:
-            handle.close()
+            sink.close()
         except Exception:
             pass
 

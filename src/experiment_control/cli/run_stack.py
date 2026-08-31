@@ -317,35 +317,118 @@ def _parse_manager_logging(
     if not isinstance(raw, dict):
         raise ConfigError("manager.logging", "must be a dict")
 
+    enabled = raw.get("enabled", True)
+    if not isinstance(enabled, bool):
+        raise ConfigError("manager.logging.enabled", "must be a bool")
+
     stderr_value = raw.get("stderr")
     if stderr_value is not None and not isinstance(stderr_value, bool):
         raise ConfigError("manager.logging.stderr", "must be a bool")
 
-    file_value = raw.get("file")
-    file_path: Path | None = None
-    if file_value is not None:
-        if not isinstance(file_value, str) or not file_value.strip():
-            raise ConfigError("manager.logging.file", "must be a non-empty string")
-        file_path = Path(file_value.strip()).expanduser()
-        if not file_path.is_absolute():
-            file_path = base_dir / file_path
+    if "file" in raw:
+        raise ConfigError(
+            "manager.logging.file",
+            "is no longer supported; use manager.logging.directory",
+        )
+
+    directory_value = raw.get("directory", "logs")
+    if not isinstance(directory_value, str) or not directory_value.strip():
+        raise ConfigError("manager.logging.directory", "must be a non-empty string")
+    directory = Path(directory_value.strip()).expanduser()
+    if not directory.is_absolute():
+        directory = base_dir / directory
+
+    prefix = str(raw.get("prefix", "manager")).strip()
+    if not prefix or any(char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-" for char in prefix):
+        raise ConfigError(
+            "manager.logging.prefix",
+            "must contain only letters, digits, '.', '_', or '-'",
+        )
 
     min_level_value = raw.get("min_level")
-    min_level: str | None = None
-    if min_level_value is not None:
-        text = str(min_level_value).strip().lower()
-        if not text:
-            raise ConfigError("manager.logging.min_level", "must be a non-empty string")
-        if not is_valid_log_severity(text):
+    if min_level_value is None:
+        min_level_value = os.environ.get("MANAGER_LOG_MIN_LEVEL", "info")
+    text = str(min_level_value).strip().lower()
+    if not text:
+        raise ConfigError("manager.logging.min_level", "must be a non-empty string")
+    if not is_valid_log_severity(text):
+        raise ConfigError(
+            "manager.logging.min_level",
+            f"must be one of: {', '.join(LOG_SEVERITY_NAMES)}",
+        )
+    min_level = normalize_log_severity(text, default="info")
+
+    rotation_raw = raw.get("rotation", {})
+    if not isinstance(rotation_raw, dict):
+        raise ConfigError("manager.logging.rotation", "must be a dict")
+    interval = str(rotation_raw.get("interval", "daily")).strip().lower()
+    if interval != "daily":
+        raise ConfigError("manager.logging.rotation.interval", "must be 'daily'")
+    try:
+        max_bytes = int(rotation_raw.get("max_bytes", 100 * 1024 * 1024))
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ConfigError(
+            "manager.logging.rotation.max_bytes", f"must be an int: {exc}"
+        ) from exc
+    if max_bytes < 1024:
+        raise ConfigError(
+            "manager.logging.rotation.max_bytes", "must be at least 1024"
+        )
+
+    retention_raw = raw.get("retention", {})
+    if not isinstance(retention_raw, dict):
+        raise ConfigError("manager.logging.retention", "must be a dict")
+
+    def optional_positive_number(name: str, default: int) -> float | None:
+        value = retention_raw.get(name, default)
+        if value is None:
+            return None
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError, OverflowError) as exc:
             raise ConfigError(
-                "manager.logging.min_level",
-                f"must be one of: {', '.join(LOG_SEVERITY_NAMES)}",
+                f"manager.logging.retention.{name}",
+                f"must be a number or null: {exc}",
+            ) from exc
+        if parsed <= 0:
+            raise ConfigError(
+                f"manager.logging.retention.{name}", "must be greater than zero"
             )
-        min_level = normalize_log_severity(text, default="error")
+        return parsed
+
+    max_age_days = optional_positive_number("max_age_days", 30)
+    max_total_bytes_raw = retention_raw.get(
+        "max_total_bytes", 5 * 1024 * 1024 * 1024
+    )
+    if max_total_bytes_raw is None:
+        max_total_bytes = None
+    else:
+        try:
+            max_total_bytes = int(max_total_bytes_raw)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ConfigError(
+                "manager.logging.retention.max_total_bytes",
+                f"must be an int or null: {exc}",
+            ) from exc
+        if max_total_bytes < 1024:
+            raise ConfigError(
+                "manager.logging.retention.max_total_bytes",
+                "must be at least 1024",
+            )
 
     return {
         "stderr": stderr_value,
-        "file": file_path.resolve() if file_path is not None else None,
+        "jsonl": (
+            {
+                "directory": directory.resolve(),
+                "prefix": prefix,
+                "max_bytes": max_bytes,
+                "max_age_days": max_age_days,
+                "max_total_bytes": max_total_bytes,
+            }
+            if enabled
+            else None
+        ),
         "min_level": min_level,
     }
 
@@ -788,7 +871,7 @@ def main(argv: list[str] | None = None) -> None:
                     manager_raw.get("chunk_cache_max_streams_per_device", 2048)
                 ),
                 manager_log_stderr=manager_logging["stderr"],
-                manager_log_file=manager_logging["file"],
+                manager_log_jsonl=manager_logging["jsonl"],
                 manager_log_min_level=manager_logging["min_level"],
             )
 

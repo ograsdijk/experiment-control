@@ -25,3 +25,4 @@ web/react_ui/dist/
 .tmp_local/
 .tmp_tests/
 .state/
+logs/

@@ -14,10 +14,12 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from experiment_control.cli.run_stack import (
+    _parse_manager_logging,
     _preflight_instance_cleanup,
     _run_with_tui,
     _wait_for_manager_ready,
 )
+from experiment_control.utils.config_parsing import ConfigError
 from experiment_control.utils.manager_network import resolve_manager_network
 
 
@@ -33,6 +35,13 @@ class _FakeProc:
 
 
 class TuiStartupWaitTests(unittest.TestCase):
+    def test_legacy_manager_log_file_setting_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ConfigError, "manager.logging.directory"):
+            _parse_manager_logging(
+                manager_raw={"logging": {"file": "manager.log"}},
+                base_dir=Path.cwd(),
+            )
+
     def test_main_no_tui_instance_lock_survives_identity_probe_on_windows(self) -> None:
         stack_raw = {
             "instance_id": "vacuum",
@@ -215,6 +224,14 @@ class TuiStartupWaitTests(unittest.TestCase):
         self.assertEqual(captured_kwargs.get("command_journal_flush_interval_ms"), 50)
         self.assertEqual(captured_kwargs.get("command_journal_retention_max_rows"), 20000)
         self.assertEqual(captured_kwargs.get("command_journal_retention_max_age_days"), 7.0)
+        jsonl = captured_kwargs.get("manager_log_jsonl")
+        self.assertIsInstance(jsonl, dict)
+        assert isinstance(jsonl, dict)
+        self.assertEqual(jsonl["directory"], (expected_base / "logs").resolve())
+        self.assertEqual(jsonl["max_bytes"], 100 * 1024 * 1024)
+        self.assertEqual(jsonl["max_age_days"], 30.0)
+        self.assertEqual(jsonl["max_total_bytes"], 5 * 1024 * 1024 * 1024)
+        self.assertEqual(captured_kwargs.get("manager_log_min_level"), "info")
 
     def test_main_no_tui_passes_manager_logging_settings_to_manager(self) -> None:
         stack_raw = {
@@ -222,7 +239,9 @@ class TuiStartupWaitTests(unittest.TestCase):
             "manager": {
                 "logging": {
                     "stderr": False,
-                    "file": ".state/manager_errors.log",
+                    "directory": ".state/logs",
+                    "rotation": {"max_bytes": 2048},
+                    "retention": {"max_age_days": 7, "max_total_bytes": 4096},
                     "min_level": "warning",
                 }
             },
@@ -273,10 +292,13 @@ class TuiStartupWaitTests(unittest.TestCase):
 
         expected_base = Path("dummy_stack.yaml").expanduser().resolve().parent
         self.assertEqual(captured_kwargs.get("manager_log_stderr"), False)
-        self.assertEqual(
-            captured_kwargs.get("manager_log_file"),
-            (expected_base / ".state" / "manager_errors.log").resolve(),
-        )
+        jsonl = captured_kwargs.get("manager_log_jsonl")
+        self.assertIsInstance(jsonl, dict)
+        assert isinstance(jsonl, dict)
+        self.assertEqual(jsonl["directory"], (expected_base / ".state" / "logs").resolve())
+        self.assertEqual(jsonl["max_bytes"], 2048)
+        self.assertEqual(jsonl["max_age_days"], 7.0)
+        self.assertEqual(jsonl["max_total_bytes"], 4096)
         self.assertEqual(captured_kwargs.get("manager_log_min_level"), "warning")
 
     def test_run_with_tui_spawns_child_without_opt_in_flags_by_default(self) -> None:
@@ -327,7 +349,7 @@ class TuiStartupWaitTests(unittest.TestCase):
         with (
             mock.patch.dict(
                 os.environ,
-                {"MANAGER_LOG_STDERR": "1", "MANAGER_LOG_FILE": "C:\\tmp\\manager.log"},
+                {"MANAGER_LOG_STDERR": "1"},
                 clear=False,
             ),
             mock.patch("experiment_control.cli.run_stack.subprocess.Popen") as popen_mock,
@@ -348,7 +370,6 @@ class TuiStartupWaitTests(unittest.TestCase):
         self.assertIsInstance(env, dict)
         assert isinstance(env, dict)
         self.assertEqual(env.get("MANAGER_LOG_STDERR"), "0")
-        self.assertEqual(env.get("MANAGER_LOG_FILE"), "C:\\tmp\\manager.log")
 
     def test_run_with_tui_passes_event_log_and_queue_settings(self) -> None:
         manager_network = resolve_manager_network({})

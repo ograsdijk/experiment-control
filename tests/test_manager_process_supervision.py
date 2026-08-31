@@ -954,7 +954,7 @@ class _ShutdownFakeManager:
     def _flush_stale_supervisor_blocks(self, force: bool = False) -> None:
         pass
 
-    def _close_manager_log_sink_file(self) -> None:
+    def _close_manager_jsonl_sink(self) -> None:
         pass
 
 

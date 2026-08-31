@@ -43,11 +43,10 @@ To serve the React UI from FastAPI:
 - `EXPERIMENT_CONTROL_DEFAULT_PROFILE=<path to profile JSON>` (optional profile served at `/api/ui/default_profile`)
 - `EXPERIMENT_CONTROL_EXTRA_UI_JSON=<json list>` (optional extra instance UIs served at `/instance-ui/{slug}/`)
 
-Manager error sink env knobs:
+Manager stderr sink environment knobs:
 
 - `MANAGER_LOG_STDERR=1|0` (default `1`)
-- `MANAGER_LOG_FILE=<path>` (optional append-only sink)
-- `MANAGER_LOG_MIN_LEVEL=debug|info|warning|error|critical` (default `error`)
+- `MANAGER_LOG_MIN_LEVEL=debug|info|warning|error|critical` (`run_stack` default `info`)
 
 For the Linien example, use the helper that reads endpoints from `stack.yaml`:
 
@@ -123,9 +122,17 @@ manager:
       max_rows: 1000000
       max_age_days: null
   logging:
+    enabled: true
     stderr: null                       # optional bool override for MANAGER_LOG_STDERR
-    file: null                         # optional path override for MANAGER_LOG_FILE
-    min_level: null                    # optional override for MANAGER_LOG_MIN_LEVEL
+    directory: logs                    # resolved relative to stack.yaml
+    prefix: manager
+    min_level: info
+    rotation:
+      interval: daily                  # UTC day boundary
+      max_bytes: 104857600             # additional 100 MiB size boundary
+    retention:
+      max_age_days: 30
+      max_total_bytes: 5368709120      # 5 GiB safety ceiling
 
 devices:
   dirs: [devices]
@@ -199,16 +206,21 @@ Notes:
   addresses (`tcp://127.0.0.1:<port>`) derived from the external ports.
 - `manager.command_journal` is optional and disabled by default. When enabled, command
   execution records are written asynchronously to SQLite.
-- `manager.logging` is optional. If set, these values override `MANAGER_LOG_*` env vars.
+- Rotating JSONL logging is enabled by default for `run_stack`; omit `manager.logging` to
+  use the values shown above, or set `manager.logging.enabled: false` to disable it.
 - In TUI mode, the parent launcher forces child manager `MANAGER_LOG_STDERR=0` to avoid
-  terminal rendering conflicts. File sink remains available via `manager.logging.file`
-  or `MANAGER_LOG_FILE`.
+  terminal rendering conflicts. Rotating JSONL logging remains active and is independent
+  of the TUI and HDF writer.
 - Manager sink writes:
   - `manager.log` events (filtered by `min_level`)
   - `manager.*_error` events (treated as `error` severity)
-- Sink output line format is:
-  - `<utc-iso-timestamp> [<SEVERITY>] <topic> <source_kind[:source_id]> <message>`
-- Rapid duplicate sink lines are de-duplicated in a short window to reduce log spam.
+- Files are named `<prefix>-<UTC-date>-<three-digit-shard>.jsonl`. Each line is one JSON
+  record containing the UTC timestamp, instance id, severity, topic, source, message,
+  and the normalized event payload fields.
+- Files rotate at each UTC day boundary and before a write would exceed `max_bytes`.
+  Retention is enforced at startup and after every rotation by age and total size.
+- Rapid duplicate stderr lines are de-duplicated in a short window to reduce terminal
+  spam; JSONL records are not de-duplicated.
 - Journal scope includes:
   - device commands (`type=command`)
   - process control commands (`manager.processes.start`, `manager.processes.stop`, `manager.processes.restart`)

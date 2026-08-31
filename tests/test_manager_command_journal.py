@@ -1,7 +1,6 @@
 # ruff: noqa: E402
 
 import sys
-import io
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -36,6 +35,14 @@ class _JournalStub:
 
     def append(self, row: dict[str, object]) -> None:
         self.rows.append(dict(row))
+
+
+class _JsonlSinkStub:
+    def __init__(self) -> None:
+        self.records: list[dict[str, object]] = []
+
+    def write(self, record: dict[str, object]) -> None:
+        self.records.append(record)
 
 
 def _build_manager() -> Manager:
@@ -344,9 +351,10 @@ class ManagerCommandSourceTests(unittest.TestCase):
 
     def test_manager_log_sink_honors_min_level_for_manager_log_entries(self) -> None:
         mgr = object.__new__(Manager)
-        sink = io.StringIO()
+        sink = _JsonlSinkStub()
+        mgr._instance_id = "vacuum"  # type: ignore[attr-defined]
         mgr._manager_log_stderr_enabled = False  # type: ignore[attr-defined]
-        mgr._manager_log_file = sink  # type: ignore[attr-defined]
+        mgr._manager_log_jsonl_sink = sink  # type: ignore[attr-defined]
         mgr._manager_log_min_level_rank = Manager._severity_rank("error")  # type: ignore[attr-defined]
         mgr._manager_log_sink_recent = {}  # type: ignore[attr-defined]
         mgr._manager_log_sink_recent_window_s = 0.5  # type: ignore[attr-defined]
@@ -361,7 +369,7 @@ class ManagerCommandSourceTests(unittest.TestCase):
         Manager._maybe_emit_manager_log_sink(  # type: ignore[arg-type]
             mgr, "manager.log", warning_payload
         )
-        self.assertEqual(sink.getvalue(), "")
+        self.assertEqual(sink.records, [])
 
         error_payload = {
             "severity": "error",
@@ -372,14 +380,17 @@ class ManagerCommandSourceTests(unittest.TestCase):
         Manager._maybe_emit_manager_log_sink(  # type: ignore[arg-type]
             mgr, "manager.log", error_payload
         )
-        self.assertIn("ERROR", sink.getvalue())
-        self.assertIn("manager.heartbeat_error", sink.getvalue())
+        self.assertEqual(len(sink.records), 1)
+        self.assertEqual(sink.records[0]["severity"], "error")
+        self.assertEqual(sink.records[0]["topic"], "manager.heartbeat_error")
+        self.assertEqual(sink.records[0]["instance_id"], "vacuum")
 
     def test_manager_log_sink_accepts_manager_error_topics(self) -> None:
         mgr = object.__new__(Manager)
-        sink = io.StringIO()
+        sink = _JsonlSinkStub()
+        mgr._instance_id = "vacuum"  # type: ignore[attr-defined]
         mgr._manager_log_stderr_enabled = False  # type: ignore[attr-defined]
-        mgr._manager_log_file = sink  # type: ignore[attr-defined]
+        mgr._manager_log_jsonl_sink = sink  # type: ignore[attr-defined]
         mgr._manager_log_min_level_rank = Manager._severity_rank("error")  # type: ignore[attr-defined]
         mgr._manager_log_sink_recent = {}  # type: ignore[attr-defined]
         mgr._manager_log_sink_recent_window_s = 0.5  # type: ignore[attr-defined]
@@ -394,9 +405,9 @@ class ManagerCommandSourceTests(unittest.TestCase):
         Manager._maybe_emit_manager_log_sink(  # type: ignore[arg-type]
             mgr, "manager.heartbeat_error", payload
         )
-        text = sink.getvalue()
-        self.assertIn("ERROR", text)
-        self.assertIn("manager.heartbeat_error", text)
+        self.assertEqual(len(sink.records), 1)
+        self.assertEqual(sink.records[0]["severity"], "error")
+        self.assertEqual(sink.records[0]["topic"], "manager.heartbeat_error")
 
 
 if __name__ == "__main__":
