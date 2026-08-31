@@ -84,6 +84,8 @@ def _write_sink_line_impl(
             sys.stderr.flush()
         except Exception:
             pass
+
+
 def _event_log_severity(topic: str, payload: Json) -> str | None:
     if topic == "manager.command":
         ok = payload.get("ok")
@@ -95,8 +97,23 @@ def _event_log_severity(topic: str, payload: Json) -> str | None:
         return None
     if topic == "manager.watchdog.triggered":
         return normalize_log_severity(payload.get("severity"), default="warning")
-    if topic == "manager.watchdog.cleared":
+    if topic in {
+        "manager.watchdog.action_started",
+        "manager.watchdog.action_succeeded",
+        "manager.watchdog.recovered",
+        "manager.watchdog.latch_cleared",
+    }:
         return "info"
+    if topic == "manager.watchdog.action_chain_completed":
+        return "info" if payload.get("success") is True else "error"
+    if topic in {"manager.watchdog.latched", "manager.watchdog.action_retry"}:
+        return "warning"
+    if topic in {
+        "manager.watchdog.action_failed",
+        "manager.watchdog.action_chain_error",
+        "manager.watchdog.rule_error",
+    }:
+        return "error"
     if topic == "manager.loop_stall":
         return "warning"
     if topic == "manager.process.heartbeat_stale_deferred":
@@ -158,6 +175,63 @@ def _command_failure_message(payload: Json) -> str:
     if err_message:
         return f"Command failed: {target} ({err_message})"
     return f"Command failed: {target}"
+
+
+def _watchdog_action_text(payload: Json) -> str:
+    command = payload.get("command")
+    if not isinstance(command, dict):
+        return "unknown action"
+    target = command.get("device_id") or command.get("process_id") or "unknown"
+    action = command.get("action") or "unknown"
+    return f"{target}.{action}"
+
+
+def _watchdog_log_message(topic: str, payload: Json) -> str:
+    watchdog_id = str(payload.get("watchdog_id") or "unknown")
+    rule = str(payload.get("rule") or "unknown")
+    prefix = f"Watchdog {watchdog_id}:{rule}"
+    if topic == "manager.watchdog.triggered":
+        return str(payload.get("message") or f"{prefix} triggered")
+    if topic == "manager.watchdog.latched":
+        return f"{prefix} latched"
+    if topic == "manager.watchdog.recovered":
+        suffix = "; latch remains set" if payload.get("latched") is True else ""
+        return f"{prefix} condition recovered{suffix}"
+    if topic == "manager.watchdog.latch_cleared":
+        return f"{prefix} latch cleared"
+    if topic.startswith("manager.watchdog.action_"):
+        action_text = _watchdog_action_text(payload)
+        attempt = payload.get("attempt")
+        max_attempts = payload.get("max_attempts")
+        attempt_text = (
+            f" attempt {attempt}/{max_attempts}"
+            if attempt is not None and max_attempts is not None
+            else ""
+        )
+        if topic == "manager.watchdog.action_started":
+            return f"{prefix} started {action_text}{attempt_text}"
+        if topic == "manager.watchdog.action_succeeded":
+            return f"{prefix} succeeded {action_text}{attempt_text}"
+        if topic == "manager.watchdog.action_retry":
+            return (
+                f"{prefix} will retry {action_text} after{attempt_text}: "
+                f"{payload.get('error')}"
+            )
+        if topic == "manager.watchdog.action_failed":
+            return f"{prefix} failed {action_text}{attempt_text}: {payload.get('error')}"
+        if topic == "manager.watchdog.action_chain_completed":
+            succeeded = payload.get("succeeded_actions", 0)
+            count = payload.get("action_count", 0)
+            failed = payload.get("failed_actions", 0)
+            return (
+                f"{prefix} action chain completed: {succeeded}/{count} succeeded, "
+                f"{failed} failed"
+            )
+        if topic == "manager.watchdog.action_chain_error":
+            return f"{prefix} action chain error: {payload.get('error')}"
+    if topic == "manager.watchdog.rule_error":
+        return f"{prefix} condition evaluation error: {payload.get('error')}"
+    return str(payload.get("message") or prefix)
 
 
 def _last_tail_message(payload: Json, key: str) -> str:
@@ -355,10 +429,8 @@ class LogEventsMixin(_MixinBase):
         message = payload.get("error") or payload.get("message") or ""
         if topic == "manager.command":
             message = _command_failure_message(payload)
-        elif topic == "manager.watchdog.cleared":
-            watchdog_id = str(payload.get("watchdog_id") or "unknown")
-            rule = str(payload.get("rule") or "unknown")
-            message = f"Watchdog {watchdog_id}:{rule} cleared"
+        elif topic.startswith("manager.watchdog."):
+            message = _watchdog_log_message(topic, payload)
         elif topic.startswith("manager.device.auto_reconnect."):
             message = _auto_reconnect_message(topic, payload)
         elif (

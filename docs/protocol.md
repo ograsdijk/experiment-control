@@ -905,7 +905,7 @@ HDF storage:
 ### `manager.watchdog.action_chain_error`
 - Producer: watchdog process
 - Consumers: logs/observability
-- Payload includes `process_id`, `watchdog_id`, `rule`, and `error` for
+- Payload includes `process_id`, `trip_id`, `watchdog_id`, `rule`, and `error` for
   asynchronous remediation-action failures.
 
 ### `manager.command`
@@ -1008,36 +1008,59 @@ HDF storage:
 - Producer: watchdog (via manager event bus)
 - Consumers: TUI/logs
 - Payload:
-  - `process_id`, `watchdog_id`, `rule`
+  - `process_id`, `trip_id`, `watchdog_id`, `rule`
   - `severity`, `message`
   - `alarm`: true
   - `unknown`: bool
   - `snapshot`: dict
   - `timing`: dict
 
-### `manager.watchdog.action_sent`
+### `manager.watchdog.latched`
 - Producer: watchdog (via manager event bus)
 - Consumers: TUI/logs
 - Payload:
-  - `process_id`, `watchdog_id`, `rule`
-  - `command`: dict
-  - `attempt`, `retries`
+  - `process_id`, `trip_id`, `watchdog_id`, `rule`, `severity`
+  - `alarm`, `unknown`
 
-### `manager.watchdog.action_failed`
+### `manager.watchdog.action_started` / `action_retry` / `action_succeeded` / `action_failed`
 - Producer: watchdog (via manager event bus)
 - Consumers: TUI/logs
-- Payload:
-  - `process_id`, `watchdog_id`, `rule`
+- Shared payload:
+  - `process_id`, `trip_id`, `watchdog_id`, `rule`
   - `command`: dict
-  - `attempt`, `retries`
-  - `error`: any
+  - `action_index`, `action_count`
+  - `attempt`, `max_attempts`
+  - completion events include `duration_ms`
+  - retry/failure events include `error`
+- `action_retry` means another attempt remains; `action_failed` is terminal for
+  that action.
+- For compatibility, each `action_started` event is also published under the
+  deprecated `manager.watchdog.action_sent` topic with its original payload.
+  The alias is not promoted into manager logs.
 
-### `manager.watchdog.cleared`
+### `manager.watchdog.action_chain_completed`
 - Producer: watchdog (via manager event bus)
 - Consumers: TUI/logs
 - Payload:
-  - `process_id`, `watchdog_id`, `rule`
-  - `previous_latched`: bool
+  - `process_id`, `trip_id`, `watchdog_id`, `rule`
+  - `success`, `action_count`, `succeeded_actions`, `failed_actions`
+  - `duration_ms`, `actions`
+
+### `manager.watchdog.recovered`
+- Producer: watchdog (via manager event bus)
+- Consumers: TUI/logs
+- Payload:
+  - `process_id`, `trip_id`, `watchdog_id`, `rule`
+  - `alarm: false`, `unknown`, `latched`, `snapshot`, `condition_evaluation`
+
+### `manager.watchdog.latch_cleared`
+- Producer: watchdog (via manager event bus)
+- Consumers: TUI/logs
+- Emitted only when a latch actually changes from set to clear.
+- Payload includes `process_id`, `trip_id`, `watchdog_id`, `rule`,
+  `previous_latched`, `previous_armed`, `alarm`, and `unknown`.
+- The deprecated `manager.watchdog.cleared` alias remains published with its
+  original payload for compatibility and is not promoted into manager logs.
 
 ### `manager.process.*` / `manager.driver.*`
 - Producer: manager

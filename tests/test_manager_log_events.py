@@ -58,9 +58,9 @@ class ManagerLogEventsTests(unittest.TestCase):
         )
         self.assertEqual(severity, "warning")
 
-    def test_watchdog_cleared_is_info(self) -> None:
+    def test_watchdog_latch_cleared_is_info(self) -> None:
         severity = manager_log_events._event_log_severity(
-            "manager.watchdog.cleared",
+            "manager.watchdog.latch_cleared",
             {"process_id": "watchdog"},
         )
         self.assertEqual(severity, "info")
@@ -69,10 +69,37 @@ class ManagerLogEventsTests(unittest.TestCase):
         for topic in (
             "manager.watchdog.rules_loaded",
             "manager.watchdog.action_sent",
+            "manager.watchdog.cleared",
         ):
             with self.subTest(topic=topic):
                 severity = manager_log_events._event_log_severity(topic, {})
                 self.assertIsNone(severity)
+
+    def test_watchdog_lifecycle_severities(self) -> None:
+        cases = {
+            "manager.watchdog.action_started": "info",
+            "manager.watchdog.action_succeeded": "info",
+            "manager.watchdog.action_retry": "warning",
+            "manager.watchdog.action_failed": "error",
+            "manager.watchdog.latched": "warning",
+            "manager.watchdog.recovered": "info",
+            "manager.watchdog.latch_cleared": "info",
+            "manager.watchdog.rule_error": "error",
+        }
+        for topic, expected in cases.items():
+            with self.subTest(topic=topic):
+                self.assertEqual(
+                    manager_log_events._event_log_severity(topic, {}), expected
+                )
+
+    def test_watchdog_chain_completion_severity_reflects_summary(self) -> None:
+        topic = "manager.watchdog.action_chain_completed"
+        self.assertEqual(
+            manager_log_events._event_log_severity(topic, {"success": True}), "info"
+        )
+        self.assertEqual(
+            manager_log_events._event_log_severity(topic, {"success": False}), "error"
+        )
 
     def test_process_failure_log_message_includes_stderr_and_heartbeat(self) -> None:
         manager = mock.Mock()
@@ -198,7 +225,7 @@ class ManagerLogEventsTests(unittest.TestCase):
             },
         )
 
-    def test_watchdog_cleared_emits_manager_log_entry(self) -> None:
+    def test_watchdog_latch_cleared_emits_manager_log_entry(self) -> None:
         manager = mock.Mock()
         payload = {
             "process_id": "watchdog",
@@ -208,13 +235,13 @@ class ManagerLogEventsTests(unittest.TestCase):
             "previous_armed": True,
         }
         manager_log_events.maybe_publish_log_event(
-            manager, "manager.watchdog.cleared", payload
+            manager, "manager.watchdog.latch_cleared", payload
         )
 
         manager._emit_log.assert_called_once_with(
             severity="info",
-            topic="manager.watchdog.cleared",
-            message="Watchdog vacuum:pressure_high cleared",
+            topic="manager.watchdog.latch_cleared",
+            message="Watchdog vacuum:pressure_high latch cleared",
             source_kind="process",
             source_id="watchdog",
             device_id=None,
@@ -222,6 +249,31 @@ class ManagerLogEventsTests(unittest.TestCase):
             stream="event",
             payload=payload,
         )
+
+    def test_watchdog_action_failure_gets_specific_message(self) -> None:
+        manager = mock.Mock()
+        payload = {
+            "process_id": "watchdog",
+            "trip_id": "trip-1",
+            "watchdog_id": "vacuum",
+            "rule": "pressure_high",
+            "command": {"device_id": "turbo", "action": "stop"},
+            "attempt": 2,
+            "max_attempts": 2,
+            "error": "timeout",
+        }
+
+        manager_log_events.maybe_publish_log_event(
+            manager, "manager.watchdog.action_failed", payload
+        )
+
+        call = manager._emit_log.call_args.kwargs
+        self.assertEqual(call["severity"], "error")
+        self.assertEqual(
+            call["message"],
+            "Watchdog vacuum:pressure_high failed turbo.stop attempt 2/2: timeout",
+        )
+        self.assertEqual(call["payload"]["trip_id"], "trip-1")
 
 
 if __name__ == "__main__":

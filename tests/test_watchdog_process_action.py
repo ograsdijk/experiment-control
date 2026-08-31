@@ -117,6 +117,25 @@ class WatchdogActionDispatchTests(unittest.TestCase):
         proc._publish_event = lambda *_a, **_k: None  # type: ignore[method-assign]
         return proc, sent
 
+    def _make_proc_with_responses(
+        self, responses: list[dict[str, Any] | None]
+    ) -> tuple[WatchdogProcess, list[tuple[str, dict[str, Any]]]]:
+        proc = object.__new__(WatchdogProcess)
+        proc._process_id = "watchdog-test"  # type: ignore[attr-defined]
+        remaining = list(responses)
+        events: list[tuple[str, dict[str, Any]]] = []
+
+        class _FakeManager:
+            def call(self, _req: dict, timeout_ms: int | None = None) -> dict | None:
+                del timeout_ms
+                return remaining.pop(0)
+
+        proc._require_manager = lambda: _FakeManager()  # type: ignore[method-assign]
+        proc._publish_event = (  # type: ignore[method-assign]
+            lambda topic, payload: events.append((topic, dict(payload)))
+        )
+        return proc, events
+
     def test_process_action_dispatches_processes_rpc_envelope(self) -> None:
         proc, sent = self._make_proc()
         rule = _rule_with_actions(
@@ -169,6 +188,83 @@ class WatchdogActionDispatchTests(unittest.TestCase):
                 }
             ],
         )
+
+    def test_successful_action_emits_correlated_lifecycle(self) -> None:
+        proc, events = self._make_proc_with_responses([{"status": "OK"}])
+        rule = _rule_with_actions(
+            [CommandAction("yag", "close_shutter", {}, None, 0)]
+        )
+
+        summary = proc._execute_actions(
+            watchdog_id="wd1", rule=rule, trip_id="trip-123"
+        )
+
+        self.assertEqual(
+            [topic for topic, _payload in events],
+            [
+                "manager.watchdog.action_started",
+                "manager.watchdog.action_sent",
+                "manager.watchdog.action_succeeded",
+                "manager.watchdog.action_chain_completed",
+            ],
+        )
+        self.assertTrue(summary["success"])
+        lifecycle_events = [
+            payload
+            for topic, payload in events
+            if topic != "manager.watchdog.action_sent"
+        ]
+        self.assertTrue(
+            all(payload["trip_id"] == "trip-123" for payload in lifecycle_events)
+        )
+        legacy_payload = next(
+            payload
+            for topic, payload in events
+            if topic == "manager.watchdog.action_sent"
+        )
+        self.assertEqual(legacy_payload["attempt"], 1)
+        self.assertEqual(legacy_payload["retries"], 0)
+        self.assertNotIn("trip_id", legacy_payload)
+
+    def test_retry_failure_is_warning_event_not_terminal_failure(self) -> None:
+        proc, events = self._make_proc_with_responses(
+            [{"ok": False, "error": {"code": "busy"}}, {"status": "OK"}]
+        )
+        rule = _rule_with_actions(
+            [CommandAction("yag", "close_shutter", {}, None, 1)]
+        )
+
+        summary = proc._execute_actions(
+            watchdog_id="wd1", rule=rule, trip_id="trip-retry"
+        )
+
+        topics = [topic for topic, _payload in events]
+        self.assertIn("manager.watchdog.action_retry", topics)
+        self.assertNotIn("manager.watchdog.action_failed", topics)
+        self.assertTrue(summary["success"])
+        retry_payload = next(
+            payload
+            for topic, payload in events
+            if topic == "manager.watchdog.action_retry"
+        )
+        self.assertEqual(retry_payload["attempt"], 1)
+        self.assertEqual(retry_payload["max_attempts"], 2)
+
+    def test_exhausted_action_emits_failure_and_failed_chain_summary(self) -> None:
+        proc, events = self._make_proc_with_responses([None, None])
+        rule = _rule_with_actions(
+            [CommandAction("yag", "close_shutter", {}, None, 1)]
+        )
+
+        summary = proc._execute_actions(
+            watchdog_id="wd1", rule=rule, trip_id="trip-failed"
+        )
+
+        topics = [topic for topic, _payload in events]
+        self.assertEqual(topics.count("manager.watchdog.action_retry"), 1)
+        self.assertEqual(topics.count("manager.watchdog.action_failed"), 1)
+        self.assertFalse(summary["success"])
+        self.assertEqual(summary["failed_actions"], 1)
 
 
 if __name__ == "__main__":

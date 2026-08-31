@@ -9,7 +9,7 @@ export type WatchdogToast = {
 const WATCHDOG_TOPIC_PREFIX = "manager.watchdog.";
 const WATCHDOG_TOAST_EVENTS = new Set([
   "triggered",
-  "cleared",
+  "latch_cleared",
   "rule_error",
   "action_failed",
   "action_chain_error",

@@ -73,24 +73,24 @@ describe("watchdog toast formatting", () => {
 
   it("ignores routine watchdog events", () => {
     expect(
-      watchdogToastForLogEntry({ topic: "manager.watchdog.action_sent" })
+      watchdogToastForLogEntry({ topic: "manager.watchdog.action_started" })
     ).toBeNull();
     expect(
       watchdogToastForLogEntry({ topic: "manager.watchdog.rules_loaded" })
     ).toBeNull();
   });
 
-  it("formats cleared watchdog logs as informational toasts", () => {
+  it("formats cleared watchdog latch logs as informational toasts", () => {
     expect(
       watchdogToastForLogEntry({
-        topic: "manager.watchdog.cleared",
+        topic: "manager.watchdog.latch_cleared",
         severity: "info",
-        message: "Watchdog vacuum:pressure_high cleared",
+        message: "Watchdog vacuum:pressure_high latch cleared",
       })
     ).toEqual({
       color: "blue",
-      title: "Watchdog Cleared",
-      message: "Watchdog vacuum:pressure_high cleared",
+      title: "Watchdog Latch Cleared",
+      message: "Watchdog vacuum:pressure_high latch cleared",
     });
   });
 });
@@ -113,7 +113,7 @@ describe("log entry deduplication", () => {
       ts: { t_mono: 42 },
     };
     const second = {
-      topic: "manager.watchdog.cleared",
+      topic: "manager.watchdog.latch_cleared",
       message: "Pressure normal",
       ts: { t_mono: 43 },
     };

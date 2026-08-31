@@ -658,6 +658,7 @@ class WatchdogRuleEvalTests(unittest.TestCase):
                     "left": 1e-6,
                     "right": 1e-5,
                 },
+                active_trip_id="trip-status",
             )
         }
 
@@ -688,11 +689,13 @@ class WatchdogRuleEvalTests(unittest.TestCase):
         self.assertIn("last_evaluated_age_s", rule)
         self.assertIn("stable_since_age_s", rule)
         self.assertIn("last_trigger_age_s", rule)
+        self.assertIn("active_trip_id", rule)
         self.assertIsNone(rule.get("arm"))
         self.assertTrue(rule.get("armed"))
         self.assertFalse(rule.get("alarm"))
         self.assertFalse(rule.get("unknown"))
         self.assertEqual(rule.get("last_evaluated_mono"), 12.0)
+        self.assertEqual(rule.get("active_trip_id"), "trip-status")
         self.assertEqual(rule.get("snapshot"), {"sys_p": {"value": 1e-6, "ok": True}})
         self.assertEqual(
             rule.get("condition_evaluation"),

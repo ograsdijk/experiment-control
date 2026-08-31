@@ -4,6 +4,7 @@ import argparse
 import operator
 import threading
 import time
+import uuid
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
@@ -231,6 +232,8 @@ class RuleState:
     unknown: bool | None = None
     snapshot: Json | None = None
     condition_evaluation: Json | None = None
+    active_trip_id: str | None = None
+    active_trip_recovered: bool = False
     # Per-alias state permits an ``any_sample_aliases`` guard to require a
     # consecutive streak from one source, rather than combining gauges.
     confirmation: Json | None = None
@@ -1149,9 +1152,11 @@ class WatchdogProcess(ManagedProcessBase):
         unknown: bool,
         snapshot: Json,
         state: RuleState,
+        trip_id: str,
     ) -> None:
         payload = {
             "process_id": self._process_id,
+            "trip_id": trip_id,
             "watchdog_id": watchdog_id,
             "rule": rule.name,
             "severity": rule.severity,
@@ -1170,50 +1175,106 @@ class WatchdogProcess(ManagedProcessBase):
         }
         self._publish_event("manager.watchdog.triggered", payload)
 
-    def _publish_action_sent(
+    def _publish_latched(
         self,
         *,
         watchdog_id: str,
         rule: WatchdogRule,
-        command: Json,
-        attempt: int,
-        retries: int,
+        state: RuleState,
+        trip_id: str,
     ) -> None:
-        payload = {
-            "process_id": self._process_id,
-            "watchdog_id": watchdog_id,
-            "rule": rule.name,
-            "command": command,
-            "attempt": attempt,
-            "retries": retries,
-        }
-        self._publish_event("manager.watchdog.action_sent", payload)
+        self._publish_event(
+            "manager.watchdog.latched",
+            {
+                "process_id": self._process_id,
+                "trip_id": trip_id,
+                "watchdog_id": watchdog_id,
+                "rule": rule.name,
+                "severity": rule.severity,
+                "alarm": state.alarm,
+                "unknown": state.unknown,
+            },
+        )
 
-    def _publish_action_failed(
+    def _publish_recovered(
         self,
         *,
         watchdog_id: str,
         rule: WatchdogRule,
-        command: Json,
-        attempt: int,
-        retries: int,
-        error: Any,
+        state: RuleState,
+        trip_id: str,
     ) -> None:
-        payload = {
+        self._publish_event(
+            "manager.watchdog.recovered",
+            {
+                "process_id": self._process_id,
+                "trip_id": trip_id,
+                "watchdog_id": watchdog_id,
+                "rule": rule.name,
+                "alarm": False,
+                "unknown": state.unknown,
+                "latched": state.latched,
+                "snapshot": state.snapshot,
+                "condition_evaluation": state.condition_evaluation,
+            },
+        )
+
+    def _publish_action_event(
+        self,
+        topic: str,
+        *,
+        trip_id: str,
+        watchdog_id: str,
+        rule: WatchdogRule,
+        command: Json,
+        action_index: int,
+        action_count: int,
+        attempt: int,
+        max_attempts: int,
+        duration_ms: float | None = None,
+        error: Any = None,
+    ) -> None:
+        payload: Json = {
             "process_id": self._process_id,
+            "trip_id": trip_id,
             "watchdog_id": watchdog_id,
             "rule": rule.name,
             "command": command,
+            "action_index": action_index,
+            "action_count": action_count,
             "attempt": attempt,
-            "retries": retries,
-            "error": error,
+            "max_attempts": max_attempts,
         }
-        self._publish_event("manager.watchdog.action_failed", payload)
+        if duration_ms is not None:
+            payload["duration_ms"] = round(max(0.0, duration_ms), 3)
+        if error is not None:
+            payload["error"] = error
+        self._publish_event(topic, payload)
+
+        # Backwards-compatible bus alias. Keep this unpromoted by the
+        # manager log formatter so legacy subscribers continue to work
+        # without duplicating the new action lifecycle in persisted logs.
+        if topic == "manager.watchdog.action_started":
+            self._publish_event(
+                "manager.watchdog.action_sent",
+                {
+                    "process_id": self._process_id,
+                    "watchdog_id": watchdog_id,
+                    "rule": rule.name,
+                    "command": command,
+                    "attempt": attempt,
+                    "retries": max_attempts - 1,
+                },
+            )
 
     def _execute_actions(
-        self, *, watchdog_id: str, rule: WatchdogRule
-    ) -> None:
-        for action in rule.actions:
+        self, *, watchdog_id: str, rule: WatchdogRule, trip_id: str | None = None
+    ) -> Json:
+        trip_id = trip_id or uuid.uuid4().hex
+        chain_started_mono = time.monotonic()
+        action_results: list[Json] = []
+        action_count = len(rule.actions)
+        for action_index, action in enumerate(rule.actions):
             total_attempts = 1 + max(0, int(action.retries))
             # Build the manager request + an event descriptor per action kind.
             # Device commands go straight to the router as a `command`; process
@@ -1245,28 +1306,92 @@ class WatchdogProcess(ManagedProcessBase):
                     "caller_process_id": self._process_id,
                 }
             for attempt in range(1, total_attempts + 1):
-                self._publish_action_sent(
+                self._publish_action_event(
+                    "manager.watchdog.action_started",
+                    trip_id=trip_id,
                     watchdog_id=watchdog_id,
                     rule=rule,
                     command=command_payload,
+                    action_index=action_index,
+                    action_count=action_count,
                     attempt=attempt,
-                    retries=action.retries,
+                    max_attempts=total_attempts,
                 )
                 timeout_ms = None
                 if action.timeout_s is not None:
                     timeout_ms = max(1, int(float(action.timeout_s) * 1000))
+                attempt_started_mono = time.monotonic()
                 resp = self._require_manager().call(req, timeout_ms=timeout_ms)
+                duration_ms = (time.monotonic() - attempt_started_mono) * 1000.0
                 if resp is not None and _resp_ok(resp):
+                    self._publish_action_event(
+                        "manager.watchdog.action_succeeded",
+                        trip_id=trip_id,
+                        watchdog_id=watchdog_id,
+                        rule=rule,
+                        command=command_payload,
+                        action_index=action_index,
+                        action_count=action_count,
+                        attempt=attempt,
+                        max_attempts=total_attempts,
+                        duration_ms=duration_ms,
+                    )
+                    action_results.append(
+                        {
+                            "action_index": action_index,
+                            "command": command_payload,
+                            "ok": True,
+                            "attempts": attempt,
+                        }
+                    )
                     break
                 error = resp if resp is not None else "timeout"
-                self._publish_action_failed(
+                final_attempt = attempt == total_attempts
+                self._publish_action_event(
+                    (
+                        "manager.watchdog.action_failed"
+                        if final_attempt
+                        else "manager.watchdog.action_retry"
+                    ),
+                    trip_id=trip_id,
                     watchdog_id=watchdog_id,
                     rule=rule,
                     command=command_payload,
+                    action_index=action_index,
+                    action_count=action_count,
                     attempt=attempt,
-                    retries=action.retries,
+                    max_attempts=total_attempts,
+                    duration_ms=duration_ms,
                     error=error,
                 )
+                if final_attempt:
+                    action_results.append(
+                        {
+                            "action_index": action_index,
+                            "command": command_payload,
+                            "ok": False,
+                            "attempts": attempt,
+                            "error": error,
+                        }
+                    )
+
+        failed_actions = sum(1 for result in action_results if not result["ok"])
+        summary = {
+            "process_id": self._process_id,
+            "trip_id": trip_id,
+            "watchdog_id": watchdog_id,
+            "rule": rule.name,
+            "success": failed_actions == 0,
+            "action_count": action_count,
+            "succeeded_actions": action_count - failed_actions,
+            "failed_actions": failed_actions,
+            "duration_ms": round(
+                max(0.0, (time.monotonic() - chain_started_mono) * 1000.0), 3
+            ),
+            "actions": action_results,
+        }
+        self._publish_event("manager.watchdog.action_chain_completed", summary)
+        return summary
 
     def _evaluate_rules(self) -> None:
         now_mono = time.monotonic()
@@ -1278,6 +1403,7 @@ class WatchdogProcess(ManagedProcessBase):
             for rule in ruleset.rules:
                 state = self._states[(watchdog_id, rule.name)]
                 key = (watchdog_id, rule.name)
+                previous_latched = state.latched
                 triggered, _alarm, unknown, snapshot = evaluate_watchdog_rule(
                     rule=rule,
                     state=state,
@@ -1287,6 +1413,26 @@ class WatchdogProcess(ManagedProcessBase):
                         watchdog_id=watchdog_id, rule_name=rule.name
                     ),
                 )
+                if (
+                    state.active_trip_id is not None
+                    and not state.active_trip_recovered
+                    and state.alarm is False
+                    and state.unknown is False
+                    and not (
+                        isinstance(state.condition_evaluation, dict)
+                        and state.condition_evaluation.get("error") is not None
+                    )
+                ):
+                    recovered_trip_id = state.active_trip_id
+                    self._publish_recovered(
+                        watchdog_id=watchdog_id,
+                        rule=rule,
+                        state=state,
+                        trip_id=recovered_trip_id,
+                    )
+                    state.active_trip_recovered = True
+                    if not state.latched:
+                        state.active_trip_id = None
                 if not triggered:
                     continue
                 # If a previous action chain for this same rule is still
@@ -1306,26 +1452,48 @@ class WatchdogProcess(ManagedProcessBase):
                 # executed actions (and for action chains that were
                 # never given a chance to run, e.g. mid-shutdown).
                 mark_watchdog_triggered(state, now_mono)
+                trip_id = uuid.uuid4().hex
+                state.active_trip_id = trip_id
+                state.active_trip_recovered = False
                 self._publish_triggered(
                     watchdog_id=watchdog_id,
                     rule=rule,
                     unknown=unknown,
                     snapshot=snapshot,
                     state=state,
+                    trip_id=trip_id,
                 )
+                if not previous_latched and state.latched:
+                    self._publish_latched(
+                        watchdog_id=watchdog_id,
+                        rule=rule,
+                        state=state,
+                        trip_id=trip_id,
+                    )
                 self._submit_actions(
-                    watchdog_id=watchdog_id, rule=rule, key=key
+                    watchdog_id=watchdog_id,
+                    rule=rule,
+                    key=key,
+                    trip_id=trip_id,
                 )
                 # Keep the completed evidence through the trigger event, then
                 # require a new three-sample streak before any future trip.
                 _reset_watchdog_confirmation(state)
 
     def _submit_actions(
-        self, *, watchdog_id: str, rule: WatchdogRule, key: tuple[str, str]
+        self,
+        *,
+        watchdog_id: str,
+        rule: WatchdogRule,
+        key: tuple[str, str],
+        trip_id: str,
     ) -> None:
         try:
             future = self._action_executor.submit(
-                self._execute_actions, watchdog_id=watchdog_id, rule=rule
+                self._execute_actions,
+                watchdog_id=watchdog_id,
+                rule=rule,
+                trip_id=trip_id,
             )
         except RuntimeError:
             # Executor was shut down (e.g. during graceful stop). Drop
@@ -1333,14 +1501,25 @@ class WatchdogProcess(ManagedProcessBase):
             # cleanly if the watchdog comes back online.
             with self._inflight_lock:
                 self._inflight_action_keys.discard(key)
+            self._publish_event(
+                "manager.watchdog.action_chain_error",
+                {
+                    "process_id": self._process_id,
+                    "trip_id": trip_id,
+                    "watchdog_id": watchdog_id,
+                    "rule": rule.name,
+                    "error": "action executor is unavailable",
+                },
+            )
             return
-        def on_done(done_future: Future[None]) -> None:
-            self._on_action_chain_done(done_future, key)
+
+        def on_done(done_future: Future[Json]) -> None:
+            self._on_action_chain_done(done_future, key, trip_id)
 
         future.add_done_callback(on_done)
 
     def _on_action_chain_done(
-        self, future: Future[None], key: tuple[str, str]
+        self, future: Future[Json], key: tuple[str, str], trip_id: str
     ) -> None:
         with self._inflight_lock:
             self._inflight_action_keys.discard(key)
@@ -1356,6 +1535,7 @@ class WatchdogProcess(ManagedProcessBase):
                     "manager.watchdog.action_chain_error",
                     {
                         "process_id": self._process_id,
+                        "trip_id": trip_id,
                         "watchdog_id": key[0],
                         "rule": key[1],
                         "error": repr(exc),
@@ -1397,25 +1577,54 @@ class WatchdogProcess(ManagedProcessBase):
 
         return _callback
 
-    def _clear_rule_state(self, watchdog_id: str, rule_name: str) -> Json:
+    def _clear_rule_state(
+        self, watchdog_id: str, rule_name: str, *, request_id: Any = None
+    ) -> Json:
         state = self._states.get((watchdog_id, rule_name))
         if state is None:
             return {"ok": False, "error": "rule not found"}
         prev_latched = bool(state.latched)
         prev_armed = bool(state.armed)
+        trip_id = state.active_trip_id
         state.latched = False
         state.armed = False
         state.stable_since_mono = None
         _reset_watchdog_confirmation(state)
-        payload = {
-            "process_id": self._process_id,
-            "watchdog_id": watchdog_id,
-            "rule": rule_name,
+        if prev_latched:
+            state.active_trip_id = None
+            state.active_trip_recovered = False
+            payload = {
+                "process_id": self._process_id,
+                "trip_id": trip_id,
+                "watchdog_id": watchdog_id,
+                "rule": rule_name,
+                "previous_latched": prev_latched,
+                "previous_armed": prev_armed,
+                "alarm": state.alarm,
+                "unknown": state.unknown,
+            }
+            if request_id is not None:
+                payload["request_id"] = request_id
+            self._publish_event("manager.watchdog.latch_cleared", payload)
+        # Preserve the original public event contract for existing bus
+        # subscribers. This alias intentionally retains its old payload and
+        # is not promoted into manager logs, avoiding duplicate JSONL lines.
+        self._publish_event(
+            "manager.watchdog.cleared",
+            {
+                "process_id": self._process_id,
+                "watchdog_id": watchdog_id,
+                "rule": rule_name,
+                "previous_latched": prev_latched,
+                "previous_armed": prev_armed,
+            },
+        )
+        return {
+            "ok": True,
+            "changed": prev_latched,
             "previous_latched": prev_latched,
             "previous_armed": prev_armed,
         }
-        self._publish_event("manager.watchdog.cleared", payload)
-        return {"ok": True, "previous_latched": prev_latched, "previous_armed": prev_armed}
 
     def _watchdog_capability_members(self) -> list[MemberSpec]:
         members: list[MemberSpec] = [
@@ -1512,6 +1721,7 @@ class WatchdogProcess(ManagedProcessBase):
                         "last_trigger_age_s": None
                         if state.last_trigger_mono is None
                         else max(0.0, now_mono - state.last_trigger_mono),
+                        "active_trip_id": state.active_trip_id,
                     }
                 )
             watchdogs.append(
@@ -1583,7 +1793,9 @@ class WatchdogProcess(ManagedProcessBase):
         for watchdog_id in self._ruleset_order:
             ruleset = self._watchdog_entries[watchdog_id].ruleset
             for rule in ruleset.rules:
-                result = self._clear_rule_state(watchdog_id, rule.name)
+                result = self._clear_rule_state(
+                    watchdog_id, rule.name, request_id=req_id
+                )
                 if result.get("ok"):
                     cleared.append(
                         {
@@ -1591,6 +1803,7 @@ class WatchdogProcess(ManagedProcessBase):
                             "rule": rule.name,
                             "previous_latched": result.get("previous_latched"),
                             "previous_armed": result.get("previous_armed"),
+                            "changed": result.get("changed"),
                         }
                     )
         return {"request_id": req_id, "ok": True, "result": {"cleared": cleared}}
@@ -1604,7 +1817,9 @@ class WatchdogProcess(ManagedProcessBase):
                 "ok": False,
                 "error": {"code": "unknown_watchdog"},
             }
-        result = self._clear_rule_state(watchdog_id, rule_name)
+        result = self._clear_rule_state(
+            watchdog_id, rule_name, request_id=req_id
+        )
         if not result.get("ok"):
             return {
                 "request_id": req_id,
@@ -1619,6 +1834,7 @@ class WatchdogProcess(ManagedProcessBase):
                 "rule": rule_name,
                 "previous_latched": result.get("previous_latched"),
                 "previous_armed": result.get("previous_armed"),
+                "changed": result.get("changed"),
             },
         }
 
@@ -1648,7 +1864,7 @@ class WatchdogProcess(ManagedProcessBase):
                 },
             }
         w_id, r_name = matches[0]
-        result = self._clear_rule_state(w_id, r_name)
+        result = self._clear_rule_state(w_id, r_name, request_id=req_id)
         return {
             "request_id": req_id,
             "ok": True,
@@ -1657,6 +1873,7 @@ class WatchdogProcess(ManagedProcessBase):
                 "rule": r_name,
                 "previous_latched": result.get("previous_latched"),
                 "previous_armed": result.get("previous_armed"),
+                "changed": result.get("changed"),
             },
         }
 

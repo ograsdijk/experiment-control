@@ -191,9 +191,10 @@ A `process` action wraps the verb in the manager's process-RPC envelope:
 }
 ```
 
-A failed action (e.g. `sequencer.pause` when the sequencer is not running →
-`process_not_running`) is published as `manager.watchdog.action_failed` and does
-**not** block the remaining actions in the rule.
+A failed attempt that still has retries remaining is published as
+`manager.watchdog.action_retry`. Only an exhausted action is published as
+`manager.watchdog.action_failed`; it does **not** block the remaining actions in
+the rule. Successful attempts and the final chain summary are also published.
 
 Retries:
 - `retries: 0` = one attempt
@@ -262,9 +263,24 @@ The watchdog publishes events through the manager event bus:
 
 - `manager.watchdog.rules_loaded`
 - `manager.watchdog.triggered`
-- `manager.watchdog.action_sent`
+- `manager.watchdog.latched`
+- `manager.watchdog.action_started`
+- `manager.watchdog.action_retry`
+- `manager.watchdog.action_succeeded`
 - `manager.watchdog.action_failed`
-- `manager.watchdog.cleared`
+- `manager.watchdog.action_chain_completed`
+- `manager.watchdog.action_chain_error`
+- `manager.watchdog.recovered`
+- `manager.watchdog.latch_cleared`
+- `manager.watchdog.rule_error`
+
+Every new lifecycle event for one remediation run carries the same `trip_id`.
+`recovered` means the monitored condition returned positively known-safe; for
+a latching rule the latch may remain set until a separate `latch_cleared` event.
+
+The former `manager.watchdog.action_sent` and `manager.watchdog.cleared` topics
+remain available as deprecated compatibility aliases. They are not duplicated
+in the manager's persisted logs.
 
 See `protocol.md` for payload fields.
 

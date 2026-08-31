@@ -271,12 +271,15 @@ class WatchdogActionSubmissionTests(unittest.TestCase):
             action_started = threading.Event()
             action_finished = threading.Event()
 
-            def _slow_actions(*, watchdog_id: str, rule: WatchdogRule) -> None:
+            def _slow_actions(
+                *, watchdog_id: str, rule: WatchdogRule, trip_id: str
+            ) -> dict[str, Any]:
                 action_started.set()
                 # Simulate a slow remediation. The tick MUST return
                 # before this completes.
                 time.sleep(0.5)
                 action_finished.set()
+                return {"trip_id": trip_id}
 
             proc._execute_actions = _slow_actions  # type: ignore[method-assign]
 
@@ -313,10 +316,11 @@ class WatchdogActionSubmissionTests(unittest.TestCase):
             call_count = {"n": 0}
 
             def _blocking_actions(
-                *, watchdog_id: str, rule: WatchdogRule
-            ) -> None:
+                *, watchdog_id: str, rule: WatchdogRule, trip_id: str
+            ) -> dict[str, Any]:
                 call_count["n"] += 1
                 release.wait(timeout=5.0)
+                return {"trip_id": trip_id}
 
             proc._execute_actions = _blocking_actions  # type: ignore[method-assign]
 
@@ -366,6 +370,154 @@ class WatchdogActionSubmissionTests(unittest.TestCase):
             )
         finally:
             proc._action_executor.shutdown(wait=True, cancel_futures=False)
+
+
+class WatchdogLifecycleEventTests(unittest.TestCase):
+    def _make_proc(
+        self, *, latch: bool
+    ) -> tuple[WatchdogProcess, dict[str, float], list[tuple[str, dict[str, Any]]]]:
+        proc = object.__new__(WatchdogProcess)
+        proc._process_id = "watchdog-test"
+        proc._inflight_action_keys = set()
+        proc._inflight_lock = threading.Lock()
+        proc._rule_error_last_mono = {}
+        proc._rule_error_period_s = 30.0
+        rule = WatchdogRule(
+            name="pressure_high",
+            severity="warning",
+            message=None,
+            telemetry=[
+                TelemetryBinding(
+                    alias="p", device_id="gauge", signal="pressure", max_age_s=1.0
+                )
+            ],
+            condition={"gt": ["${p.value}", 1.0]},
+            stable_for_s=0.0,
+            cooldown_s=10.0,
+            latch=latch,
+            on_unknown="ignore",
+            actions=[_default_action()],
+        )
+        ruleset = WatchdogRuleset("vacuum", [rule])
+        proc._ruleset_order = ["vacuum"]
+        proc._watchdog_entries = {
+            "vacuum": WatchdogEntry(ruleset=ruleset, enabled=True)
+        }
+        proc._states = {("vacuum", "pressure_high"): RuleState()}
+        sample = {"value": 2.0}
+        proc._manager = SimpleNamespace(
+            get_latest=lambda _device, _signal: _ok_sample(sample["value"])
+        )
+        events: list[tuple[str, dict[str, Any]]] = []
+        proc._publish_event = (  # type: ignore[method-assign]
+            lambda topic, payload: events.append((topic, dict(payload)))
+        )
+        proc._submit_actions = lambda **_kwargs: None  # type: ignore[method-assign]
+        return proc, sample, events
+
+    def test_recovery_uses_same_trip_id_as_trigger(self) -> None:
+        proc, sample, events = self._make_proc(latch=False)
+
+        proc._evaluate_rules()
+        sample["value"] = 0.5
+        proc._evaluate_rules()
+
+        triggered = next(payload for topic, payload in events if topic.endswith("triggered"))
+        recovered = next(payload for topic, payload in events if topic.endswith("recovered"))
+        self.assertEqual(recovered["trip_id"], triggered["trip_id"])
+        self.assertFalse(recovered["latched"])
+        self.assertIsNone(proc._states[("vacuum", "pressure_high")].active_trip_id)
+
+    def test_latch_recovery_and_manual_clear_are_distinct_events(self) -> None:
+        proc, sample, events = self._make_proc(latch=True)
+
+        proc._evaluate_rules()
+        sample["value"] = 0.5
+        proc._evaluate_rules()
+        result = proc._clear_rule_state("vacuum", "pressure_high")
+
+        topics = [topic for topic, _payload in events]
+        self.assertIn("manager.watchdog.latched", topics)
+        self.assertIn("manager.watchdog.recovered", topics)
+        self.assertIn("manager.watchdog.latch_cleared", topics)
+        self.assertIn("manager.watchdog.cleared", topics)
+        trip_ids = {
+            payload["trip_id"]
+            for topic, payload in events
+            if topic
+            in {
+                "manager.watchdog.triggered",
+                "manager.watchdog.latched",
+                "manager.watchdog.recovered",
+                "manager.watchdog.latch_cleared",
+            }
+        }
+        self.assertEqual(len(trip_ids), 1)
+        self.assertTrue(result["changed"])
+
+    def test_clear_unlatched_rule_only_emits_legacy_clear_event(self) -> None:
+        proc, _sample, events = self._make_proc(latch=False)
+
+        result = proc._clear_rule_state("vacuum", "pressure_high")
+
+        self.assertFalse(result["changed"])
+        self.assertEqual(
+            [topic for topic, _payload in events],
+            ["manager.watchdog.cleared"],
+        )
+
+    def test_unknown_state_is_not_reported_as_recovered(self) -> None:
+        proc, sample, events = self._make_proc(latch=False)
+
+        proc._evaluate_rules()
+        trip_id = proc._states[("vacuum", "pressure_high")].active_trip_id
+        proc._manager.get_latest = lambda _device, _signal: None
+        proc._evaluate_rules()
+
+        self.assertNotIn(
+            "manager.watchdog.recovered", [topic for topic, _payload in events]
+        )
+        self.assertEqual(
+            proc._states[("vacuum", "pressure_high")].active_trip_id, trip_id
+        )
+
+        proc._manager.get_latest = (
+            lambda _device, _signal: _ok_sample(sample["value"])
+        )
+        sample["value"] = 0.5
+        proc._evaluate_rules()
+        recovered = [
+            payload
+            for topic, payload in events
+            if topic == "manager.watchdog.recovered"
+        ]
+        self.assertEqual(len(recovered), 1)
+        self.assertEqual(recovered[0]["trip_id"], trip_id)
+
+    def test_condition_error_is_not_reported_as_recovered(self) -> None:
+        proc, sample, events = self._make_proc(latch=False)
+
+        proc._evaluate_rules()
+        trip_id = proc._states[("vacuum", "pressure_high")].active_trip_id
+        sample["value"] = "not-a-number"  # type: ignore[assignment]
+        proc._evaluate_rules()
+
+        self.assertNotIn(
+            "manager.watchdog.recovered", [topic for topic, _payload in events]
+        )
+        self.assertEqual(
+            proc._states[("vacuum", "pressure_high")].active_trip_id, trip_id
+        )
+
+        sample["value"] = 0.5
+        proc._evaluate_rules()
+        recovered = [
+            payload
+            for topic, payload in events
+            if topic == "manager.watchdog.recovered"
+        ]
+        self.assertEqual(len(recovered), 1)
+        self.assertEqual(recovered[0]["trip_id"], trip_id)
 
 
 class WatchdogRuleErrorEventTests(unittest.TestCase):
