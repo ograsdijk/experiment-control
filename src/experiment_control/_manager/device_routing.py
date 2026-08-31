@@ -95,8 +95,43 @@ def _route_command(manager: Any, req: Json) -> Json:
     _, handle, error_resp = _resolve_local_device(manager, req)
     if error_resp is not None:
         return error_resp
-    if manager._driver_is_stopped(handle) or handle.rpc_endpoint is None:
+
+    driver_unavailable = manager._driver_is_stopped(handle) or handle.rpc_endpoint is None
+    capabilities_unavailable = False
+    if action == "capabilities":
+        now_mono = time.monotonic()
+        age_fn = getattr(manager, "_device_heartbeat_age_s", None)
+        if callable(age_fn):
+            heartbeat_age_s = age_fn(handle, now_mono)
+        else:
+            heartbeat_recv = handle.last_hb_recv_mono
+            running_since = getattr(handle, "driver_running_since_mono", None)
+            heartbeat_from_current_run = heartbeat_recv is not None and (
+                running_since is None or heartbeat_recv >= running_since
+            )
+            heartbeat_ref = (
+                heartbeat_recv if heartbeat_from_current_run else running_since
+            )
+            heartbeat_age_s = (
+                None
+                if heartbeat_ref is None
+                else max(0.0, now_mono - float(heartbeat_ref))
+            )
+        heartbeat_stale = (
+            heartbeat_age_s is not None
+            and heartbeat_age_s > manager._heartbeat_timeout_s
+        )
+        capabilities_unavailable = (
+            driver_unavailable
+            or str(handle.driver_process_state) != "RUNNING"
+            or heartbeat_stale
+        )
+    elif driver_unavailable:
         return _rpc_failure("driver_not_running", "driver not running")
+
+    # Interceptors remain authoritative even when a capabilities response will
+    # ultimately be served from the manager cache. This preserves the same ACL,
+    # modification, and provenance contract as the live-RPC path.
     cmd = {"device_id": device_id, "action": action, "params": params}
     ok, new_cmd, err = manager._apply_command_interceptors(
         cmd,
@@ -110,10 +145,57 @@ def _route_command(manager: Any, req: Json) -> Json:
         )
     if new_cmd is None:
         return _rpc_failure("command_blocked", "command blocked")
+
+    target_device_id = str(new_cmd.get("device_id", device_id))
+    target_action = str(new_cmd.get("action", action))
+    target_params = new_cmd.get("params", params)
+    if (
+        capabilities_unavailable
+        and target_device_id == device_id
+        and target_action == "capabilities"
+    ):
+        cached = handle.capabilities
+        if not isinstance(cached, dict):
+            return _rpc_failure(
+                "driver_not_running", "driver not available for capabilities"
+            )
+        result = copy.deepcopy(cached)
+        build_payload = getattr(manager, "_build_manager_command_payload", None)
+        publish_event = getattr(manager, "_publish_manager_event", None)
+        if callable(build_payload) and callable(publish_event):
+            normalize_id = getattr(manager, "_normalize_id", None)
+            caller_process_id_text = (
+                normalize_id(caller_process_id)
+                if callable(normalize_id)
+                else (None if caller_process_id is None else str(caller_process_id))
+            )
+            payload = build_payload(
+                device_id=device_id,
+                action="capabilities",
+                params=target_params,
+                ok=True,
+                status="OK",
+                error=None,
+                result=result,
+                source_kind=source_kind,
+                source_id=source_id,
+                is_remote_target=False,
+                request_id=request_id,
+                caller_process_id=caller_process_id_text,
+            )
+            publish_event("manager.command", payload)
+        return {"status": "OK", "result": result}
+
+    # An interceptor may have rewritten a cached-capabilities request into a
+    # different action. Do not send that rewritten action to this same driver if
+    # it is known unavailable. Rewrites to another device retain normal routing.
+    if target_device_id == device_id and (driver_unavailable or capabilities_unavailable):
+        return _rpc_failure("driver_not_running", "driver not running")
+
     return manager._call_device_rpc(
-        device_id=str(new_cmd.get("device_id", device_id)),
-        action=str(new_cmd.get("action", action)),
-        params=new_cmd.get("params", params),
+        device_id=target_device_id,
+        action=target_action,
+        params=target_params,
         request_id=request_id,
         caller_process_id=caller_process_id,
         source_kind=source_kind,

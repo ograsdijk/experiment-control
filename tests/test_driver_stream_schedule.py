@@ -167,6 +167,27 @@ class DriverStreamScheduleTests(unittest.TestCase):
             runner._stream_last_published_seq["trace"], 2  # type: ignore[attr-defined]
         )
 
+    def test_begin_operation_publishes_operation_breadcrumb_when_pub_ready(self) -> None:
+        runner = self._runner()
+        runner.device_id = "dev1"  # type: ignore[attr-defined]
+        runner._heartbeat_seq = 0  # type: ignore[attr-defined]
+
+        sent: list[bytes] = []
+
+        class _FakePub:
+            def send_multipart(self, frames: list[bytes]) -> None:
+                sent.append(frames[1])
+
+        runner.pub = _FakePub()  # type: ignore[attr-defined]
+
+        DeviceRunner._begin_operation(runner, "telemetry:read_pressure")
+
+        payload = json.loads(sent[0])
+        self.assertEqual(payload["current_operation"], "telemetry:read_pressure")
+        self.assertIsInstance(payload["current_operation_started_mono"], float)
+        DeviceRunner._end_operation(runner)
+        self.assertIsNone(runner._current_operation)  # type: ignore[attr-defined]
+
     def test_heartbeat_includes_missed_ticks_and_published_seq(self) -> None:
         # Heartbeat must carry both new fields so a consumer can turn
         # SHM/PUB losses and blocked-loop skips into checkable invariants.

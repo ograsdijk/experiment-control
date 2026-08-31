@@ -295,6 +295,7 @@ class Manager(
         process_hb_bind_base: str = "tcp://127.0.0.1:6100",
         process_data_bind_base: str = "tcp://127.0.0.1:6200",
         heartbeat_timeout_s: float = 3.0,
+        heartbeat_hard_timeout_s: float = 10.0,
         telemetry_stale_s: float = 10.0,
         device_rpc_timeout_ms: int = 1500,
         interceptor_rpc_timeout_ms: int = 500,
@@ -340,7 +341,14 @@ class Manager(
         )
         sockets.bind_to_manager(self)
 
-        self._heartbeat_timeout_s = heartbeat_timeout_s
+        self._heartbeat_timeout_s = float(heartbeat_timeout_s)
+        self._heartbeat_hard_timeout_s = float(heartbeat_hard_timeout_s)
+        if self._heartbeat_timeout_s <= 0:
+            raise ValueError("heartbeat_timeout_s must be > 0")
+        if self._heartbeat_hard_timeout_s <= self._heartbeat_timeout_s:
+            raise ValueError(
+                "heartbeat_hard_timeout_s must be greater than heartbeat_timeout_s"
+            )
         self._telemetry_stale_s = telemetry_stale_s
         self._device_rpc_timeout_ms = device_rpc_timeout_ms
         self._interceptor_rpc_timeout_ms = int(interceptor_rpc_timeout_ms)
@@ -548,9 +556,19 @@ class Manager(
     # Public API
     # -----------------------------
 
+    def _validate_device_spec(self, spec: DeviceSpec) -> None:
+        hard_timeout_s = spec.driver_heartbeat_hard_timeout_s
+        if hard_timeout_s is not None and hard_timeout_s <= self._heartbeat_timeout_s:
+            raise ValueError(
+                f"Device {spec.device_id!r} driver_heartbeat_hard_timeout_s "
+                f"must be greater than manager heartbeat_timeout_s "
+                f"({self._heartbeat_timeout_s:.3g}s)"
+            )
+
     def add_device(self, spec: DeviceSpec) -> None:
         if spec.device_id in self._devices:
             raise ValueError(f"Duplicate device_id {spec.device_id!r}")
+        self._validate_device_spec(spec)
         self._devices[spec.device_id] = DeviceHandle(spec=spec)
 
     def load_device_spec_from_disk(self, device_id: str) -> DeviceSpec:
@@ -565,6 +583,7 @@ class Manager(
             raise ValueError(
                 f"Reloaded YAML device_id {new_spec.device_id!r} does not match {device_id!r}"
             )
+        self._validate_device_spec(new_spec)
         return new_spec
 
     def reload_device_spec(self, device_id: str) -> DeviceSpec:
@@ -1943,13 +1962,29 @@ class Manager(
     # Timeouts + derived states
     # -----------------------------
 
+    @staticmethod
+    def _device_heartbeat_age_s(
+        handle: DeviceHandle, now_mono: float
+    ) -> float | None:
+        hb = handle.last_hb_recv_mono
+        running_since = handle.driver_running_since_mono
+        heartbeat_from_current_run = hb is not None and (
+            running_since is None or hb >= running_since
+        )
+        ref = hb if heartbeat_from_current_run else running_since
+        if ref is None:
+            return None
+        return max(0.0, now_mono - float(ref))
+
     def _update_device_liveness(self, now_mono: float) -> None:
         for dev_id, handle in self._devices.items():
-            if handle.last_hb_recv_mono is None:
+            age = self._device_heartbeat_age_s(handle, now_mono)
+            if age is None:
                 continue
-            age = now_mono - handle.last_hb_recv_mono
-            if age > self._heartbeat_timeout_s:
+            if str(handle.driver_process_state) != "RUNNING":
                 liveness = Liveness.OFFLINE
+            elif age > self._heartbeat_timeout_s:
+                liveness = Liveness.STALE
             else:
                 hb = handle.last_hb
                 if hb is not None and not hb.device_reachable:
@@ -1959,9 +1994,31 @@ class Manager(
 
             if self._last_liveness.get(dev_id) != liveness:
                 self._last_liveness[dev_id] = liveness
+                spec = getattr(handle, "spec", None)
+                hard_timeout_override = getattr(
+                    spec, "driver_heartbeat_hard_timeout_s", None
+                )
+                hard_timeout_s = (
+                    hard_timeout_override
+                    if hard_timeout_override is not None
+                    else getattr(
+                        self,
+                        "_heartbeat_hard_timeout_s",
+                        self._heartbeat_timeout_s * 3.0,
+                    )
+                )
                 self._publish_manager_event(
                     "manager.liveness",
-                    {"device_id": dev_id, "liveness": liveness, "age_s": age},
+                    {
+                        "device_id": dev_id,
+                        "liveness": liveness,
+                        "age_s": age,
+                        "driver_process_state": handle.driver_process_state,
+                        "heartbeat_pid": getattr(
+                            handle, "driver_heartbeat_pid", None
+                        ),
+                        "heartbeat_hard_timeout_s": float(hard_timeout_s),
+                    },
                 )
 
     def _mark_stale_telemetry(self, now_mono: float) -> None:
@@ -2077,12 +2134,13 @@ class Manager(
             raise KeyError(f"Unknown device_id {device_id!r}")
 
         now_mono = time.monotonic()
-        hb_age_s: float | None = None
+        hb_age_s = self._device_heartbeat_age_s(handle, now_mono)
         liveness = Liveness.OFFLINE
-        if handle.last_hb_recv_mono is not None:
-            hb_age_s = now_mono - handle.last_hb_recv_mono
-            if hb_age_s > self._heartbeat_timeout_s:
+        if hb_age_s is not None:
+            if str(handle.driver_process_state) != "RUNNING":
                 liveness = Liveness.OFFLINE
+            elif hb_age_s > self._heartbeat_timeout_s:
+                liveness = Liveness.STALE
             else:
                 if handle.last_hb is not None and not handle.last_hb.device_reachable:
                     liveness = Liveness.DISCONNECTED

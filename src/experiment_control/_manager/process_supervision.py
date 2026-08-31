@@ -293,6 +293,11 @@ def stop_driver(
     if handle is None:
         raise KeyError(f"Unknown device_id {device_id!r}")
 
+    # An explicit operator Stop is authoritative: cancel any automatic restart
+    # that may have been scheduled by the heartbeat hard-timeout policy.
+    # restart_driver() deliberately installs a new schedule after stop_driver().
+    handle.driver_next_restart_t_mono = None
+
     mark_device_offline(
         manager,
         device_id,
@@ -347,12 +352,31 @@ def mark_device_offline(
     age = manager._heartbeat_timeout_s + 1.0
     handle.last_hb_recv_mono = time.monotonic() - age
     manager._last_liveness[device_id] = offline_state
+    hard_timeout_override = getattr(
+        getattr(handle, "spec", None),
+        "driver_heartbeat_hard_timeout_s",
+        None,
+    )
+    hard_timeout_s = (
+        hard_timeout_override
+        if hard_timeout_override is not None
+        else getattr(
+            manager,
+            "_heartbeat_hard_timeout_s",
+            manager._heartbeat_timeout_s * 3.0,
+        )
+    )
     manager._publish_manager_event(
         "manager.liveness",
         {
             "device_id": device_id,
             "liveness": offline_state,
             "age_s": age,
+            "driver_process_state": getattr(
+                handle, "driver_process_state", None
+            ),
+            "heartbeat_pid": getattr(handle, "driver_heartbeat_pid", None),
+            "heartbeat_hard_timeout_s": float(hard_timeout_s),
         },
     )
 
@@ -993,69 +1017,12 @@ def update_device_driver_exit_state(manager: Any, handle: Any, rc: int) -> None:
 def enforce_device_driver_heartbeat_timeout(
     manager: Any, handle: Any, now_mono: float
 ) -> None:
-    """Heartbeat-authoritative liveness for device drivers.
-
-    A driver's RUNNING state is only as trustworthy as the *heartbeat* — the
-    `handle.process` Popen is a wrapper (uv/python launcher) whose `poll()` can
-    stay None while the real driver died, and a stale-registration race can set
-    RUNNING with no process at all. So instead of stacking `proc.poll()`
-    special-cases, demote RUNNING → FAILED whenever the heartbeat has gone
-    stale, regardless of the wrapper. This subsumes the earlier
-    process-is-None reconcile.
-
-    Only acts on RUNNING (STARTING is left to poll() + registration). Ages
-    against the last heartbeat, or the time the driver went RUNNING if none has
-    arrived yet. Defers during startup grace / a recent manager-loop stall up to
-    a generous hard timeout, mirroring the managed-process supervisor, so a
-    briefly-slow-but-alive driver is never demoted.
-    """
-    if str(handle.driver_process_state) != "RUNNING":
-        return
-    hb = handle.last_hb_recv_mono
-    running_since = handle.driver_running_since_mono
-    heartbeat_from_current_run = hb is not None and (
-        running_since is None or hb >= running_since
+    """Apply staged soft-stale / hard-failure driver heartbeat policy."""
+    from .driver_heartbeat_policy import (
+        enforce_device_driver_heartbeat_timeout as _enforce_staged_policy,
     )
-    ref = hb if heartbeat_from_current_run else running_since
-    if ref is None:
-        return  # no basis to judge yet
-    age = now_mono - ref
-    timeout_s = float(manager._heartbeat_timeout_s)
-    if age <= timeout_s:
-        return
-    hard_timeout_s = timeout_s * max(
-        1.0, float(getattr(manager, "_heartbeat_hard_timeout_multiplier", 3.0))
-    )
-    if age < hard_timeout_s and (
-        _in_startup_grace(manager, now_mono)
-        or _recent_manager_loop_stall(manager, now_mono)
-    ):
-        return  # transient: manager was delayed or driver still booting
 
-    handle.driver_process_state = _enum_member(handle.driver_process_state, "FAILED")
-    handle.driver_running_since_mono = None
-    handle.driver_stop_requested_t_mono = now_mono
-    handle.driver_last_error_kind = "heartbeat_stale"
-    if not handle.driver_last_error:
-        if not heartbeat_from_current_run:
-            handle.driver_last_error = (
-                f"driver RUNNING but no heartbeat {age:.1f}s after registering "
-                f"(timeout {timeout_s:.1f}s)"
-            )
-        else:
-            handle.driver_last_error = (
-                f"driver heartbeat stale ({age:.1f}s > {timeout_s:.1f}s)"
-            )
-    # Terminate a stale wrapper (real driver dead but launcher alive) so a
-    # subsequent restart can respawn cleanly.
-    proc = handle.process
-    if proc is not None:
-        try:
-            if proc.poll() is None:
-                proc.terminate()
-        except Exception:
-            pass
-    manager._publish_driver_event("manager.driver.failed", handle)
+    _enforce_staged_policy(manager, handle, now_mono)
 
 
 def enforce_device_driver_stop_timeout(
@@ -1103,6 +1070,8 @@ def maybe_restart_device_driver(
         handle.driver_next_restart_t_mono is None
         or now_mono < handle.driver_next_restart_t_mono
     ):
+        return
+    if handle.process is not None and handle.process.poll() is None:
         return
     if (
         handle.spec.driver_max_restarts is not None
@@ -1212,6 +1181,17 @@ def _auto_reconnect_should_attempt(
         return False, None, None
     if str(handle.driver_process_state) not in {"RUNNING"}:
         return False, None, None
+    heartbeat_recv = handle.last_hb_recv_mono
+    running_since = handle.driver_running_since_mono
+    heartbeat_from_current_run = heartbeat_recv is not None and (
+        running_since is None or heartbeat_recv >= running_since
+    )
+    heartbeat_ref = heartbeat_recv if heartbeat_from_current_run else running_since
+    if (
+        heartbeat_ref is not None
+        and now_mono - float(heartbeat_ref) > manager._heartbeat_timeout_s
+    ):
+        return False, None, "heartbeat_stale"
     if handle.rpc_endpoint is None:
         return False, None, None
     latest_ts = manager._telemetry_last_bundle_ts.get(device_id)
@@ -1347,15 +1327,25 @@ def _run_auto_reconnect(
         with lock:
             try:
                 try:
+                    disconnect_timeout_ms = _auto_reconnect_rpc_timeout_ms(
+                        manager,
+                        handle,
+                        int(spec.disconnect_timeout_ms),
+                    )
                     manager._call_device_rpc(
                         device_id=device_id,
                         action="disconnect_device",
                         params={},
-                        timeout_ms=int(spec.disconnect_timeout_ms),
+                        timeout_ms=disconnect_timeout_ms,
                     )
                 except Exception:
                     pass
                 connect_timeout_ms = spec.connect_timeout_ms or manager._device_rpc_timeout_ms
+                connect_timeout_ms = _auto_reconnect_rpc_timeout_ms(
+                    manager,
+                    handle,
+                    int(connect_timeout_ms),
+                )
                 resp = manager._call_device_rpc(
                     device_id=device_id,
                     action="connect_device",
@@ -1403,6 +1393,57 @@ def _run_auto_reconnect(
     finally:
         with _auto_reconnect_field_lock(handle):
             handle.auto_reconnect_pending = False
+
+
+def _auto_reconnect_rpc_timeout_ms(
+    manager: Any,
+    handle: Any,
+    configured_timeout_ms: int,
+) -> int:
+    """Bound a reconnect RPC to the remaining fresh-heartbeat window.
+
+    An auto-reconnect worker owns the lifecycle lock for its whole RPC.  The
+    supervisor deliberately skips a device while that lock is held, so letting
+    a reconnect use an arbitrarily long configured timeout could postpone the
+    heartbeat hard watchdog.  Once the heartbeat is stale, another device RPC
+    cannot repair the single blocked driver loop anyway; fail promptly and let
+    supervision take over.
+    """
+    now_mono = time.monotonic()
+    age_fn = getattr(manager, "_device_heartbeat_age_s", None)
+    if callable(age_fn):
+        age_candidate = age_fn(handle, now_mono)
+        age_s = (
+            float(age_candidate)
+            if isinstance(age_candidate, (int, float))
+            else None
+        )
+    else:
+        age_s = None
+    if age_s is None:
+        heartbeat_recv = getattr(handle, "last_hb_recv_mono", None)
+        running_since = getattr(handle, "driver_running_since_mono", None)
+        if not isinstance(heartbeat_recv, (int, float)):
+            heartbeat_recv = None
+        if not isinstance(running_since, (int, float)):
+            running_since = None
+        heartbeat_from_current_run = heartbeat_recv is not None and (
+            running_since is None or heartbeat_recv >= running_since
+        )
+        heartbeat_ref = heartbeat_recv if heartbeat_from_current_run else running_since
+        age_s = (
+            None
+            if heartbeat_ref is None
+            else max(0.0, now_mono - float(heartbeat_ref))
+        )
+    if age_s is None:
+        return max(1, int(configured_timeout_ms))
+
+    remaining_s = float(manager._heartbeat_timeout_s) - float(age_s)
+    if remaining_s <= 0:
+        raise TimeoutError("driver heartbeat became stale during auto-reconnect")
+    remaining_ms = max(1, int(remaining_s * 1000.0))
+    return max(1, min(int(configured_timeout_ms), remaining_ms))
 
 
 def _maybe_auto_reconnect_device(

@@ -260,6 +260,32 @@ def device_spec_from_yaml(path: str | Path) -> DeviceSpec:
         telemetry_period_s = float(raw_obj.get("telemetry_period_s", 1.0))
         heartbeat_period_s = float(raw_obj.get("heartbeat_period_s", 1.0))
         command_poll_period_s = float(raw_obj.get("command_poll_period_s", 0.01))
+        hard_timeout_raw = raw_obj.get("driver_heartbeat_hard_timeout_s")
+        driver_heartbeat_hard_timeout_s = (
+            None if hard_timeout_raw is None else float(hard_timeout_raw)
+        )
+        if (
+            driver_heartbeat_hard_timeout_s is not None
+            and driver_heartbeat_hard_timeout_s <= 0
+        ):
+            raise ConfigError(
+                "driver_heartbeat_hard_timeout_s", "must be > 0 or null"
+            )
+        restart_on_hb_raw = raw_obj.get("driver_restart_on_heartbeat_timeout", False)
+        if not isinstance(restart_on_hb_raw, bool):
+            raise ConfigError(
+                "driver_restart_on_heartbeat_timeout", "must be a bool"
+            )
+        driver_restart_on_heartbeat_timeout = bool(restart_on_hb_raw)
+        driver_restart_backoff_s = float(raw_obj.get("driver_restart_backoff_s", 0.5))
+        if driver_restart_backoff_s < 0:
+            raise ConfigError("driver_restart_backoff_s", "must be >= 0")
+        driver_max_restarts_raw = raw_obj.get("driver_max_restarts")
+        driver_max_restarts = (
+            None if driver_max_restarts_raw is None else int(driver_max_restarts_raw)
+        )
+        if driver_max_restarts is not None and driver_max_restarts < 1:
+            raise ConfigError("driver_max_restarts", "must be >= 1 or null")
     except ConfigError as e:
         raise TypeError(str(e)) from None
 
@@ -280,6 +306,10 @@ def device_spec_from_yaml(path: str | Path) -> DeviceSpec:
         telemetry_period_s=telemetry_period_s,
         heartbeat_period_s=heartbeat_period_s,
         command_poll_period_s=command_poll_period_s,
+        driver_heartbeat_hard_timeout_s=driver_heartbeat_hard_timeout_s,
+        driver_restart_on_heartbeat_timeout=driver_restart_on_heartbeat_timeout,
+        driver_restart_backoff_s=driver_restart_backoff_s,
+        driver_max_restarts=driver_max_restarts,
     )
 
 

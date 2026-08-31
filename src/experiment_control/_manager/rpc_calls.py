@@ -309,6 +309,12 @@ class RpcCallsMixin(_MixinBase):
                 caller_process_id=caller_process_id_text,
             )
             self._publish_manager_event("manager.command", payload)
+            if (
+                _effective_status_ok(resp) is True
+                and action == "capabilities"
+                and isinstance(resp.get("result"), dict)
+            ):
+                handle.capabilities = dict(resp["result"])
             if _effective_status_ok(resp) is True and action.startswith("stream__"):
                 self._ingest_stream_rpc_result(
                     device_id=device_id,

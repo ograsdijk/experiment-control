@@ -133,6 +133,8 @@ class DeviceRunner:
 
         self._telemetry_seq = 0
         self._heartbeat_seq = 0
+        self._current_operation: str | None = None
+        self._current_operation_started_mono: float | None = None
         # Accumulated count of missed scheduled-stream periods (loop fell
         # behind a plan's next_due_s), published in the heartbeat so a
         # blocked loop that skips samples leaves a trace -- previously this
@@ -278,7 +280,12 @@ class DeviceRunner:
                             "error": "Malformed request",
                         }
                     else:
-                        resp = self._handle_rpc_request(req_raw)
+                        action = str(req_raw.get("action", "unknown"))
+                        self._begin_operation(f"rpc:{action}")
+                        try:
+                            resp = self._handle_rpc_request(req_raw)
+                        finally:
+                            self._end_operation()
                     self.rpc.send_json(resp)
 
                 # Heartbeat (PUB)
@@ -524,28 +531,32 @@ class DeviceRunner:
                 continue
 
             try:
-                if plan.func is not None:
-                    ret = plan.func(**plan.kwargs)
-                else:
-                    try:
-                        member = getattr(self._device, cast(str, plan.attr_name))
-                    except AttributeError:
-                        for o in plan.outputs:
-                            out[o.signal] = {
-                                "value": None,
-                                "units": o.units,
-                                "quality": TelemetryQuality.MISSING,
-                                "ts": None,
-                            }
-                        continue
-                    if callable(member):
-                        ret = member(**plan.kwargs)
+                self._begin_operation(f"telemetry:{plan.method}")
+                try:
+                    if plan.func is not None:
+                        ret = plan.func(**plan.kwargs)
                     else:
-                        if plan.kwargs:
-                            raise ValueError(
-                                f"Telemetry property {plan.attr_name!r} does not accept kwargs"
-                            )
-                        ret = member
+                        try:
+                            member = getattr(self._device, cast(str, plan.attr_name))
+                        except AttributeError:
+                            for o in plan.outputs:
+                                out[o.signal] = {
+                                    "value": None,
+                                    "units": o.units,
+                                    "quality": TelemetryQuality.MISSING,
+                                    "ts": None,
+                                }
+                            continue
+                        if callable(member):
+                            ret = member(**plan.kwargs)
+                        else:
+                            if plan.kwargs:
+                                raise ValueError(
+                                    f"Telemetry property {plan.attr_name!r} does not accept kwargs"
+                                )
+                            ret = member
+                finally:
+                    self._end_operation()
                 for o in plan.outputs:
                     try:
                         val = o.extractor(ret)
@@ -1112,6 +1123,19 @@ class DeviceRunner:
     def _now(self) -> Timestamp:
         return Timestamp(t_wall=time.time(), t_mono=time.monotonic())
 
+    def _begin_operation(self, name: str) -> None:
+        self._current_operation = str(name)
+        self._current_operation_started_mono = time.monotonic()
+        # Publish immediately so, if the call wedges, the manager knows which
+        # operation started and the heartbeat age is effectively its duration.
+        # Partial/test runners may not have IPC wired yet; production runners do.
+        if getattr(self, "pub", None) is not None:
+            self._publish_heartbeat(loop_lag_s=None)
+
+    def _end_operation(self) -> None:
+        self._current_operation = None
+        self._current_operation_started_mono = None
+
     def _publish_heartbeat(self, *, loop_lag_s: float | None) -> None:
         self._heartbeat_seq += 1
         ts = self._now()
@@ -1129,6 +1153,10 @@ class DeviceRunner:
             "last_ok_mono": self._last_ok_ts.t_mono if self._last_ok_ts else None,
             "last_error": self._last_error,
             "loop_lag_s": loop_lag_s,
+            "current_operation": getattr(self, "_current_operation", None),
+            "current_operation_started_mono": getattr(
+                self, "_current_operation_started_mono", None
+            ),
             "scheduled_stream_missed_total": self._scheduled_stream_missed_total,
             "stream_last_published_seq": dict(self._stream_last_published_seq),
         }
@@ -1262,7 +1290,11 @@ class DeviceRunner:
             if missed:
                 self._scheduled_stream_missed_total += missed
             try:
-                self._stream_rpc[plan.action_name]()
+                self._begin_operation(f"stream:{plan.action_name}")
+                try:
+                    self._stream_rpc[plan.action_name]()
+                finally:
+                    self._end_operation()
                 ts = self._now()
                 self._device_reachable = True
                 if self._device_state == DeviceState.DISCONNECTED:

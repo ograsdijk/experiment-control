@@ -913,6 +913,15 @@ class ManagerTUI(App):
         if device_id in self._cap_fetch_inflight:
             return
         if not force:
+            status = self._device_status.get(device_id)
+            if status is not None and str(status.liveness or "").upper() in {
+                "STALE",
+                "OFFLINE",
+                "DISCONNECTED",
+            }:
+                if on_done is not None:
+                    on_done(False)
+                return
             t0 = self._cap_cache_mono.get(device_id)
             if t0 is not None and (time.monotonic() - t0) < self._cap_ttl_s:
                 if on_done is not None:

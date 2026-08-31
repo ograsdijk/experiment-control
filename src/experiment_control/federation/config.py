@@ -19,6 +19,7 @@ DEFAULT_FEDERATION_RELAY_TOPICS: tuple[str, ...] = (
     "manager.telemetry_update",
     "manager.process_telemetry_update",
     "manager.heartbeat",
+    "manager.liveness",
     # Process heartbeats give mirrored PROCESSES true liveness (symmetric with
     # device `manager.heartbeat`); without it a mirrored process has no health.
     "manager.process.heartbeat",

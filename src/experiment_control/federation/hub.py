@@ -65,6 +65,11 @@ class MirroredDeviceRuntime:
     capabilities: Json | None = None
     last_hb_payload: Json | None = None
     last_hb_recv_mono: float | None = None
+    last_liveness: str | None = None
+    last_liveness_hard_timeout_s: float | None = None
+    last_liveness_recv_mono: float | None = None
+    last_liveness_age_s: float | None = None
+    last_liveness_heartbeat_pid: int | None = None
     last_error: str | None = None
 
 
@@ -90,6 +95,77 @@ class MirroredProcessRuntime:
     # heartbeat-based liveness (see list_processes_snapshot).
     last_hb_payload: Json | None = None
     last_hb_recv_mono: float | None = None
+
+
+def _mirrored_device_liveness(
+    peer_rt: PeerRuntime,
+    mirror: MirroredDeviceRuntime,
+    now_mono: float,
+) -> tuple[str, float | None]:
+    hb_age_s = (
+        None
+        if mirror.last_hb_recv_mono is None
+        else max(0.0, now_mono - mirror.last_hb_recv_mono)
+    )
+    relayed = str(mirror.last_liveness or "").upper()
+    liveness_recv_mono = getattr(mirror, "last_liveness_recv_mono", None)
+    reported_age_s = getattr(mirror, "last_liveness_age_s", None)
+    relayed_age_s: float | None = None
+    if isinstance(liveness_recv_mono, (int, float)):
+        base_age_s = (
+            float(reported_age_s)
+            if isinstance(reported_age_s, (int, float))
+            else 0.0
+        )
+        relayed_age_s = max(
+            0.0, base_age_s + now_mono - float(liveness_recv_mono)
+        )
+    effective_age_s = relayed_age_s if relayed_age_s is not None else hb_age_s
+    heartbeat_is_newer = (
+        mirror.last_hb_recv_mono is not None
+        and isinstance(liveness_recv_mono, (int, float))
+        and mirror.last_hb_recv_mono > float(liveness_recv_mono)
+    )
+    payload = mirror.last_hb_payload or {}
+    if heartbeat_is_newer and hb_age_s is not None:
+        heartbeat_pid = payload.get("pid")
+        liveness_heartbeat_pid = getattr(
+            mirror, "last_liveness_heartbeat_pid", None
+        )
+        heartbeat_proves_recovery = relayed != "OFFLINE" or (
+            liveness_heartbeat_pid is not None
+            and heartbeat_pid is not None
+            and heartbeat_pid != liveness_heartbeat_pid
+        )
+        if (
+            heartbeat_proves_recovery
+            and hb_age_s <= peer_rt.config.event_stale_s
+        ):
+            return (
+                "ONLINE"
+                if bool(payload.get("device_reachable", False))
+                else "DISCONNECTED",
+                hb_age_s,
+            )
+    if relayed == "STALE":
+        hard_timeout_s = mirror.last_liveness_hard_timeout_s
+        if (
+            hard_timeout_s is None
+            or effective_age_s is None
+            or effective_age_s < float(hard_timeout_s)
+        ):
+            return "STALE", effective_age_s
+        return "OFFLINE", effective_age_s
+    if relayed == "OFFLINE":
+        return "OFFLINE", effective_age_s
+    if hb_age_s is None or hb_age_s > peer_rt.config.event_stale_s:
+        return "OFFLINE", hb_age_s
+    if relayed in {"ONLINE", "DISCONNECTED"}:
+        return relayed, hb_age_s
+    return (
+        "ONLINE" if bool(payload.get("device_reachable", False)) else "DISCONNECTED",
+        hb_age_s,
+    )
 
 
 @dataclass
@@ -451,21 +527,22 @@ class FederationHub:
             peer_rt = self._peers.get(mirror.peer_id)
             if peer_rt is None:
                 continue
-            hb_age_s: float | None = None
-            liveness = "OFFLINE"
-            if mirror.last_hb_recv_mono is not None:
-                hb_age_s = now_mono - mirror.last_hb_recv_mono
-                if hb_age_s <= peer_rt.config.event_stale_s:
-                    payload = mirror.last_hb_payload or {}
-                    if bool(payload.get("device_reachable", False)):
-                        liveness = "ONLINE"
-                    else:
-                        liveness = "DISCONNECTED"
+            liveness, hb_age_s = _mirrored_device_liveness(
+                peer_rt, mirror, now_mono
+            )
             if self._last_liveness.get(local_id) != liveness:
                 self._last_liveness[local_id] = liveness
                 self._manager._publish_manager_event(
                     "manager.liveness",
-                    {"device_id": local_id, "liveness": liveness, "age_s": hb_age_s},
+                    {
+                        "device_id": local_id,
+                        "liveness": liveness,
+                        "age_s": hb_age_s,
+                        "heartbeat_pid": mirror.last_liveness_heartbeat_pid,
+                        "heartbeat_hard_timeout_s": (
+                            mirror.last_liveness_hard_timeout_s
+                        ),
+                    },
                 )
 
     def list_devices_snapshot(self) -> list[Json]:
@@ -538,16 +615,8 @@ class FederationHub:
             raise KeyError(f"Unknown device_id {device_id!r}")
         peer_rt = self._peers[mirror.peer_id]
         now_mono = time.monotonic()
-        hb_age_s: float | None = None
-        liveness = "OFFLINE"
         payload = mirror.last_hb_payload or {}
-        if mirror.last_hb_recv_mono is not None:
-            hb_age_s = now_mono - mirror.last_hb_recv_mono
-            if hb_age_s <= peer_rt.config.event_stale_s:
-                if bool(payload.get("device_reachable", False)):
-                    liveness = "ONLINE"
-                else:
-                    liveness = "DISCONNECTED"
+        liveness, hb_age_s = _mirrored_device_liveness(peer_rt, mirror, now_mono)
 
         telemetry_age_s: float | None = None
         latest_recv_mono = self._manager._telemetry_last_recv_mono.get(mirror.local_id)
@@ -1206,6 +1275,42 @@ class FederationHub:
             mirror.last_hb_payload = dict(rewritten)
             mirror.last_hb_recv_mono = time.monotonic()
             self._manager._ingest_heartbeat(rewritten)
+            return
+        if topic == "manager.liveness":
+            liveness = str(rewritten.get("liveness") or "").upper()
+            if liveness in {"ONLINE", "DISCONNECTED", "STALE", "OFFLINE"}:
+                mirror.last_liveness = liveness
+                # The relayed event has already been published below. Keep the
+                # derived-state cache in sync so check_timeouts() does not emit
+                # an immediate duplicate lacking the owner's generation data.
+                self._last_liveness[local_id] = liveness
+            mirror.last_liveness_recv_mono = time.monotonic()
+            age_raw = rewritten.get("age_s")
+            try:
+                mirror.last_liveness_age_s = (
+                    None if age_raw is None else max(0.0, float(age_raw))
+                )
+            except (TypeError, ValueError):
+                mirror.last_liveness_age_s = None
+            hard_timeout_raw = rewritten.get("heartbeat_hard_timeout_s")
+            try:
+                mirror.last_liveness_hard_timeout_s = (
+                    None
+                    if hard_timeout_raw is None
+                    else float(hard_timeout_raw)
+                )
+            except (TypeError, ValueError):
+                mirror.last_liveness_hard_timeout_s = None
+            heartbeat_pid_raw = rewritten.get("heartbeat_pid")
+            try:
+                mirror.last_liveness_heartbeat_pid = (
+                    None
+                    if heartbeat_pid_raw is None
+                    else int(heartbeat_pid_raw)
+                )
+            except (TypeError, ValueError):
+                mirror.last_liveness_heartbeat_pid = None
+            self._manager._publish_manager_event(topic, rewritten)
             return
         if topic == "manager.log":
             self._manager._emit_log_from_payload(rewritten, default_topic=topic)

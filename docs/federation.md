@@ -100,6 +100,7 @@ For each configured peer:
 Currently relayed topics:
 - `manager.telemetry_update`
 - `manager.heartbeat`
+- `manager.liveness`
 - `manager.log`
 - `manager.command`
 - `manager.command_interceptor.error`
@@ -107,7 +108,8 @@ Currently relayed topics:
 
 Implementation notes:
 - `manager.telemetry_update` is ingested into the hub manager's normal telemetry cache.
-- `manager.heartbeat` is ingested into the hub manager's normal heartbeat/liveness path.
+- `manager.heartbeat` is ingested into the hub manager's normal heartbeat cache.
+- `manager.liveness` preserves the owner's `ONLINE` / `DISCONNECTED` / `STALE` / `OFFLINE` state for mirrored devices, including the owner's hard heartbeat timeout.
 - `manager.log` is re-emitted through the manager log path.
 - Nested device references in interceptor payloads are rewritten, not just top-level `device_id`.
 

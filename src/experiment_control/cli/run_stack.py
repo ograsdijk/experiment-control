@@ -823,6 +823,9 @@ def main(argv: list[str] | None = None) -> None:
                 process_hb_bind_base=manager_network.process_hb_bind_base,
                 process_data_bind_base=manager_network.process_data_bind_base,
                 heartbeat_timeout_s=float(manager_raw.get("heartbeat_timeout_s", 3.0)),
+                heartbeat_hard_timeout_s=float(
+                    manager_raw.get("heartbeat_hard_timeout_s", 10.0)
+                ),
                 telemetry_stale_s=float(manager_raw.get("telemetry_stale_s", 10.0)),
                 device_rpc_timeout_ms=int(manager_raw.get("device_rpc_timeout_ms", 1500)),
                 interceptor_rpc_timeout_ms=int(manager_raw.get("interceptor_rpc_timeout_ms", 500)),

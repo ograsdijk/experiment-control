@@ -662,6 +662,12 @@ def ingest_heartbeat(
         last_ok_mono=msg.get("last_ok_mono"),
         loop_lag_s=msg.get("loop_lag_s"),
         ts=ts,
+        current_operation=(
+            str(msg.get("current_operation"))
+            if msg.get("current_operation") is not None
+            else None
+        ),
+        current_operation_started_mono=msg.get("current_operation_started_mono"),
     )
     _store_heartbeat_on_handle(manager, device_id=device_id, hb=hb)
     manager._publish_manager_event(

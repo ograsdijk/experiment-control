@@ -42,7 +42,8 @@ class AutoReconnectSpec:
 
 
 class Liveness(StrEnum):
-    OFFLINE = "OFFLINE"  # heartbeat stale
+    OFFLINE = "OFFLINE"  # driver process is not running
+    STALE = "STALE"  # driver RUNNING but heartbeat overdue
     DISCONNECTED = "DISCONNECTED"  # heartbeat fresh but device unreachable
     ONLINE = "ONLINE"
 
@@ -69,6 +70,8 @@ class Heartbeat:
     last_ok_mono: float | None
     loop_lag_s: float | None
     ts: Timestamp
+    current_operation: str | None = None
+    current_operation_started_mono: float | None = None
 
 
 @dataclass(frozen=True)
@@ -97,6 +100,8 @@ class DeviceSpec:
     telemetry_period_s: float = 1.0
     heartbeat_period_s: float = 1.0
     command_poll_period_s: float = 0.01
+    driver_heartbeat_hard_timeout_s: float | None = None
+    driver_restart_on_heartbeat_timeout: bool = False
     driver_stop_timeout_s: float = 3.0
     driver_kill_timeout_s: float = 3.0
     driver_restart_backoff_s: float = 0.5
@@ -158,6 +163,9 @@ class DeviceHandle:
     driver_last_failure_pid: int | None = None
     driver_stop_requested_t_mono: float | None = None
     driver_next_restart_t_mono: float | None = None
+    driver_heartbeat_stale_since_mono: float | None = None
+    driver_heartbeat_stale_max_age_s: float | None = None
+    driver_heartbeat_stale_generation: tuple[Any, Any] | None = None
     # Monotonic time the driver entered RUNNING (set on registration). Used to
     # age a never-arrived heartbeat so a driver whose wrapper stays alive but
     # whose real process died is demoted from RUNNING (heartbeat-authoritative
