@@ -34,6 +34,7 @@ type WatchdogButtonSummary = {
   activeAlarmCount: number;
   unknownRuleCount: number;
   pendingRuleCount: number;
+  attentionRuleCount: number;
   label: string;
   tooltip: string;
 };
@@ -367,6 +368,7 @@ export function useWatchdogsController({
     let activeAlarmCount = 0;
     let unknownRuleCount = 0;
     let pendingRuleCount = 0;
+    let attentionRuleCount = 0;
     let hasError = false;
     let hasTrackedWatchdogs = false;
     const errorSources: string[] = [];
@@ -394,37 +396,48 @@ export function useWatchdogsController({
         for (const rule of watchdog.rules ?? []) {
           if (rule.latched) {
             activeLatchCount += 1;
-          } else if (rule.alarm) {
+          }
+          if (rule.alarm) {
             activeAlarmCount += 1;
-          } else if (rule.unknown) {
+          }
+          if (rule.unknown) {
             unknownRuleCount += 1;
-          } else if (rule.last_evaluated_mono == null) {
+          }
+          if (rule.last_evaluated_mono == null) {
             pendingRuleCount += 1;
+          }
+          if (
+            rule.alarm ||
+            rule.latched ||
+            rule.unknown ||
+            rule.last_evaluated_mono == null
+          ) {
+            attentionRuleCount += 1;
           }
         }
       }
     }
 
-    const activeRuleCount =
-      activeLatchCount + activeAlarmCount + unknownRuleCount + pendingRuleCount;
-    const status = hasError ? "error" : activeRuleCount > 0 ? "active" : "idle";
-    const color = status === "error"
+    const status = hasError ? "error" : attentionRuleCount > 0 ? "active" : "idle";
+    const color = status === "error" || activeAlarmCount > 0
       ? "red"
-      : status === "active"
+      : activeLatchCount > 0
         ? "orange"
-        : hasTrackedWatchdogs
-          ? "teal"
-          : "gray";
-    const labelSuffix = activeRuleCount > 0 ? ` (${activeRuleCount})` : "";
+        : unknownRuleCount > 0
+          ? "yellow"
+          : hasTrackedWatchdogs
+            ? "teal"
+            : "gray";
+    const labelSuffix = attentionRuleCount > 0 ? ` (${attentionRuleCount})` : "";
     const tooltip = hasError
       ? `Watchdog issue: ${errorSources[0] ?? "unknown"}`
-      : activeRuleCount > 0
+      : attentionRuleCount > 0
       ? [
+          activeAlarmCount > 0
+            ? `${activeAlarmCount} triggered rule${activeAlarmCount === 1 ? "" : "s"}`
+            : null,
           activeLatchCount > 0
             ? `${activeLatchCount} latched rule${activeLatchCount === 1 ? "" : "s"}`
-            : null,
-          activeAlarmCount > 0
-            ? `${activeAlarmCount} alarm rule${activeAlarmCount === 1 ? "" : "s"}`
             : null,
           unknownRuleCount > 0
             ? `${unknownRuleCount} unknown rule${unknownRuleCount === 1 ? "" : "s"}`
@@ -445,6 +458,7 @@ export function useWatchdogsController({
       activeAlarmCount,
       unknownRuleCount,
       pendingRuleCount,
+      attentionRuleCount,
       label: `Watchdogs${labelSuffix}`,
       tooltip,
     };

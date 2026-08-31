@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import operator
 import threading
 import time
 from collections.abc import Callable
@@ -17,7 +18,7 @@ from ..rules.rules_common import (
     parse_telemetry_bindings,
     parse_version,
 )
-from ..sequencer.eval import eval_condition, to_attrdict
+from ..sequencer.eval import eval_condition, render_templates, to_attrdict
 from ..types import MemberSpec
 from ..utils.cli_args import (
     add_heartbeat_args,
@@ -41,6 +42,17 @@ from .manager_client_helper import ManagerClientHelper
 from .process_base import ManagedProcessBase
 
 Json = dict[str, Any]
+
+
+_TRACE_COMPARATORS: dict[str, Callable[[Any, Any], bool]] = {
+    "eq": operator.eq,
+    "ne": operator.ne,
+    "gt": operator.gt,
+    "ge": operator.ge,
+    "lt": operator.lt,
+    "le": operator.le,
+    "abs_lt": lambda left, right: abs(left) < right,
+}
 
 
 @dataclass(frozen=True)
@@ -74,6 +86,94 @@ def _action_status_payload(action: CommandAction | ProcessAction) -> dict[str, A
     else:
         payload["device_id"] = action.device_id
     return payload
+
+
+def _condition_trace_value(value: Any) -> Any:
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, (list, tuple)):
+        return [_condition_trace_value(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _condition_trace_value(item) for key, item in value.items()}
+    return str(value)
+
+
+def _condition_comparison_trace(
+    operator_name: str, operands: Any, env: Json
+) -> Json:
+    left_raw, right_raw = operands
+    left = render_templates(left_raw, env)
+    right = render_templates(right_raw, env)
+    result = bool(_TRACE_COMPARATORS[operator_name](left, right))
+    return {
+        "kind": "comparison",
+        "operator": operator_name,
+        "result": result,
+        "left": _condition_trace_value(left),
+        "right": _condition_trace_value(right),
+    }
+
+
+def _condition_group_result(operator_name: str, children: list[Json]) -> bool | None:
+    results = [child.get("result") for child in children]
+    if operator_name == "and":
+        if any(result is False for result in results):
+            return False
+        return None if any(result is None for result in results) else True
+    if any(result is True for result in results):
+        return True
+    return None if any(result is None for result in results) else False
+
+
+def _safe_condition_evaluation_trace(condition: Any, env: Json) -> Json:
+    try:
+        return _condition_evaluation_trace(condition, env)
+    except Exception as exc:
+        return {"kind": "error", "result": None, "error": str(exc) or repr(exc)}
+
+
+def _condition_evaluation_trace(condition: Any, env: Json) -> Json:
+    if isinstance(condition, dict):
+        if "always" in condition:
+            resolved = render_templates(condition["always"], env)
+            return {
+                "kind": "always",
+                "result": bool(resolved),
+                "resolved": _condition_trace_value(resolved),
+            }
+        for operator_name in _TRACE_COMPARATORS:
+            if operator_name in condition:
+                return _condition_comparison_trace(
+                    operator_name, condition[operator_name], env
+                )
+        for operator_name in ("and", "or"):
+            if operator_name in condition:
+                children = [
+                    _safe_condition_evaluation_trace(child, env)
+                    for child in condition[operator_name]
+                ]
+                return {
+                    "kind": "group",
+                    "operator": operator_name,
+                    "result": _condition_group_result(operator_name, children),
+                    "children": children,
+                }
+        if "not" in condition:
+            child = _safe_condition_evaluation_trace(condition["not"], env)
+            child_result = child.get("result")
+            return {
+                "kind": "not",
+                "result": None if child_result is None else not bool(child_result),
+                "children": [child],
+            }
+        return {"kind": "value", "result": False, "resolved": condition}
+
+    resolved = render_templates(condition, env)
+    return {
+        "kind": "value",
+        "result": bool(resolved),
+        "resolved": _condition_trace_value(resolved),
+    }
 
 
 @dataclass(frozen=True)
@@ -130,6 +230,7 @@ class RuleState:
     alarm: bool | None = None
     unknown: bool | None = None
     snapshot: Json | None = None
+    condition_evaluation: Json | None = None
     # Per-alias state permits an ``any_sample_aliases`` guard to require a
     # consecutive streak from one source, rather than combining gauges.
     confirmation: Json | None = None
@@ -633,19 +734,26 @@ def _evaluate_watchdog_alarm(
     env: Json,
     unknown: bool,
     on_condition_error: Callable[[BaseException], None] | None = None,
-) -> bool:
+) -> tuple[bool, Json]:
+    condition_evaluation = _safe_condition_evaluation_trace(rule.condition, env)
     if unknown:
-        return rule.on_unknown == "trigger"
+        condition_evaluation["result"] = None
+        condition_evaluation["unknown"] = True
+        return rule.on_unknown == "trigger", condition_evaluation
     try:
-        return bool(eval_condition(rule.condition, env))
+        alarm = bool(eval_condition(rule.condition, env))
+        condition_evaluation["result"] = alarm
+        return alarm, condition_evaluation
     except Exception as e:
+        condition_evaluation["result"] = None
+        condition_evaluation["error"] = str(e) or repr(e)
         if on_condition_error is not None:
             try:
                 on_condition_error(e)
             except Exception:
                 # Diagnostic callback failure must not affect rule eval.
                 pass
-        return False
+        return False, condition_evaluation
 
 
 def _evaluate_watchdog_condition(
@@ -832,7 +940,7 @@ def evaluate_watchdog_rule(
         unknown=unknown,
         on_condition_error=on_condition_error,
     )
-    alarm = _evaluate_watchdog_alarm(
+    alarm, condition_evaluation = _evaluate_watchdog_alarm(
         rule=rule,
         env=env,
         unknown=unknown,
@@ -847,6 +955,7 @@ def evaluate_watchdog_rule(
     state.alarm = alarm
     state.unknown = unknown
     state.snapshot = snapshot
+    state.condition_evaluation = condition_evaluation
 
     if rule.arm is not None and not state.armed:
         state.stable_since_mono = None
@@ -1348,6 +1457,7 @@ class WatchdogProcess(ManagedProcessBase):
 
     def _rpc_watchdog_status(self, req: Json) -> Json:
         watchdogs: list[Json] = []
+        now_mono = time.monotonic()
         for watchdog_id in self._ruleset_order:
             entry = self._watchdog_entries[watchdog_id]
             ruleset = entry.ruleset
@@ -1389,9 +1499,19 @@ class WatchdogProcess(ManagedProcessBase):
                         "alarm": state.alarm,
                         "unknown": state.unknown,
                         "snapshot": state.snapshot,
+                        "condition_evaluation": state.condition_evaluation,
                         "last_evaluated_mono": state.last_evaluated_mono,
+                        "last_evaluated_age_s": None
+                        if state.last_evaluated_mono is None
+                        else max(0.0, now_mono - state.last_evaluated_mono),
                         "stable_since_mono": state.stable_since_mono,
+                        "stable_since_age_s": None
+                        if state.stable_since_mono is None
+                        else max(0.0, now_mono - state.stable_since_mono),
                         "last_trigger_mono": state.last_trigger_mono,
+                        "last_trigger_age_s": None
+                        if state.last_trigger_mono is None
+                        else max(0.0, now_mono - state.last_trigger_mono),
                     }
                 )
             watchdogs.append(

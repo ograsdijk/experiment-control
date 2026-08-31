@@ -313,6 +313,10 @@ class WatchdogRuleEvalTests(unittest.TestCase):
         self.assertIsInstance(state.snapshot, dict)
         self.assertIn("t", snapshot)
         self.assertFalse(bool(snapshot["t"].get("ok")))
+        self.assertEqual(
+            state.condition_evaluation,
+            {"kind": "value", "result": None, "resolved": True, "unknown": True},
+        )
 
     def test_unknown_trigger_bypasses_valid_sample_confirmation(self) -> None:
         rule = WatchdogRule(
@@ -374,6 +378,16 @@ class WatchdogRuleEvalTests(unittest.TestCase):
         self.assertFalse(state.alarm)
         self.assertFalse(state.unknown)
         self.assertEqual(state.snapshot, snapshot)
+        self.assertEqual(
+            state.condition_evaluation,
+            {
+                "kind": "comparison",
+                "operator": "gt",
+                "result": False,
+                "left": 1.0,
+                "right": 10.0,
+            },
+        )
 
     def test_cooldown_suppresses_repeated_triggers(self) -> None:
         rule = WatchdogRule(
@@ -637,6 +651,13 @@ class WatchdogRuleEvalTests(unittest.TestCase):
                 alarm=False,
                 unknown=False,
                 snapshot={"sys_p": {"value": 1e-6, "ok": True}},
+                condition_evaluation={
+                    "kind": "comparison",
+                    "operator": "gt",
+                    "result": False,
+                    "left": 1e-6,
+                    "right": 1e-5,
+                },
             )
         }
 
@@ -662,13 +683,27 @@ class WatchdogRuleEvalTests(unittest.TestCase):
         self.assertIn("alarm", rule)
         self.assertIn("unknown", rule)
         self.assertIn("snapshot", rule)
+        self.assertIn("condition_evaluation", rule)
         self.assertIn("last_evaluated_mono", rule)
+        self.assertIn("last_evaluated_age_s", rule)
+        self.assertIn("stable_since_age_s", rule)
+        self.assertIn("last_trigger_age_s", rule)
         self.assertIsNone(rule.get("arm"))
         self.assertTrue(rule.get("armed"))
         self.assertFalse(rule.get("alarm"))
         self.assertFalse(rule.get("unknown"))
         self.assertEqual(rule.get("last_evaluated_mono"), 12.0)
         self.assertEqual(rule.get("snapshot"), {"sys_p": {"value": 1e-6, "ok": True}})
+        self.assertEqual(
+            rule.get("condition_evaluation"),
+            {
+                "kind": "comparison",
+                "operator": "gt",
+                "result": False,
+                "left": 1e-6,
+                "right": 1e-5,
+            },
+        )
         self.assertEqual(rule.get("condition"), {"gt": ["${sys_p.value}", 1e-5]})
 
 

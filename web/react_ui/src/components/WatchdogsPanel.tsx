@@ -23,22 +23,32 @@ type Props = {
   ) => Promise<unknown> | void;
 };
 
-function formatMonoSeconds(value: number | null | undefined): string {
+function formatDuration(value: number | null | undefined): string {
   if (typeof value !== "number" || !Number.isFinite(value)) {
     return "n/a";
   }
   return `${value.toFixed(2)} s`;
 }
 
-function watchdogRuleState(rule: WatchdogStatus["rules"][number]): {
+function formatAge(value: number | null | undefined): string {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return "n/a";
+  }
+  if (value < 0.05) {
+    return "just now";
+  }
+  return `${value.toFixed(value < 10 ? 1 : 0)} s ago`;
+}
+
+export function watchdogRuleLiveState(rule: WatchdogStatus["rules"][number]): {
   label: string;
   color: string;
 } {
-  if (rule.latched) {
-    return { label: "Latched", color: "orange" };
-  }
   if (rule.alarm) {
-    return { label: "Alarm", color: "red" };
+    return {
+      label: rule.unknown ? "Triggered: input unavailable" : "Triggered now",
+      color: "red",
+    };
   }
   if (rule.unknown) {
     return { label: "Unknown", color: "yellow" };
@@ -46,10 +56,10 @@ function watchdogRuleState(rule: WatchdogStatus["rules"][number]): {
   if (rule.last_evaluated_mono == null) {
     return { label: "Pending", color: "gray" };
   }
-  return { label: "Clear", color: "teal" };
+  return { label: "Safe now", color: "teal" };
 }
 
-function summarizeWatchdogRules(watchdog: WatchdogStatus): {
+export function summarizeWatchdogRules(watchdog: WatchdogStatus): {
   label: string;
   color: string;
 } {
@@ -63,7 +73,8 @@ function summarizeWatchdogRules(watchdog: WatchdogStatus): {
   for (const rule of watchdog.rules) {
     if (rule.latched) {
       latched += 1;
-    } else if (rule.alarm) {
+    }
+    if (rule.alarm) {
       alarm += 1;
     } else if (rule.unknown) {
       unknown += 1;
@@ -71,11 +82,11 @@ function summarizeWatchdogRules(watchdog: WatchdogStatus): {
       pending += 1;
     }
   }
+  if (alarm > 0) {
+    return { label: `${alarm} triggered`, color: "red" };
+  }
   if (latched > 0) {
     return { label: `${latched} latched`, color: "orange" };
-  }
-  if (alarm > 0) {
-    return { label: `${alarm} alarm`, color: "red" };
   }
   if (unknown > 0) {
     return { label: `${unknown} unknown`, color: "yellow" };
@@ -83,7 +94,7 @@ function summarizeWatchdogRules(watchdog: WatchdogStatus): {
   if (pending > 0) {
     return { label: `${pending} pending`, color: "gray" };
   }
-  return { label: "All clear", color: "teal" };
+  return { label: "All safe", color: "teal" };
 }
 
 export function WatchdogsPanel({
@@ -253,15 +264,8 @@ export function WatchdogsPanel({
                                 const clearBusy = Boolean(watchdogBusyByKey[clearBusyKey]);
                                 const latched = Boolean(rule.latched);
                                 const ruleState = watchdog.enabled
-                                  ? watchdogRuleState(rule)
+                                  ? watchdogRuleLiveState(rule)
                                   : { label: "Disabled", color: "gray" };
-                                const severity = String(rule.severity ?? "info").toLowerCase();
-                                const severityColor =
-                                  severity === "critical" || severity === "error"
-                                    ? "red"
-                                    : severity === "warning"
-                                      ? "orange"
-                                      : "gray";
                                 return (
                                   <Card
                                     key={`${processId}:${watchdogId}:${ruleName}`}
@@ -278,25 +282,31 @@ export function WatchdogsPanel({
                                           <Badge variant="light" color={ruleState.color}>
                                             {ruleState.label}
                                           </Badge>
-                                          <Badge variant="light" color={severityColor}>
-                                            {severity}
-                                          </Badge>
+                                          {latched && (
+                                            <Badge variant="light" color="orange">
+                                              Latched · acknowledge
+                                            </Badge>
+                                          )}
                                         </Group>
                                         <Text size="xs" c="dimmed">
-                                          last evaluation:{" "}
-                                          {formatMonoSeconds(rule.last_evaluated_mono)}
+                                          evaluated: {formatAge(rule.last_evaluated_age_s)}
+                                        </Text>
+                                        {rule.stable_since_age_s != null && (
+                                          <Text size="xs" c="dimmed">
+                                            trigger condition active for:{" "}
+                                            {formatDuration(rule.stable_since_age_s)}
+                                          </Text>
+                                        )}
+                                        {rule.last_trigger_age_s != null && (
+                                          <Text size="xs" c="dimmed">
+                                            last triggered: {formatAge(rule.last_trigger_age_s)}
+                                          </Text>
+                                        )}
+                                        <Text size="xs" c="dimmed">
+                                          stable for: {formatDuration(rule.stable_for_s)}
                                         </Text>
                                         <Text size="xs" c="dimmed">
-                                          stable since: {formatMonoSeconds(rule.stable_since_mono)}
-                                        </Text>
-                                        <Text size="xs" c="dimmed">
-                                          last trigger: {formatMonoSeconds(rule.last_trigger_mono)}
-                                        </Text>
-                                        <Text size="xs" c="dimmed">
-                                          stable for: {formatMonoSeconds(rule.stable_for_s)}
-                                        </Text>
-                                        <Text size="xs" c="dimmed">
-                                          cooldown: {formatMonoSeconds(rule.cooldown_s)}
+                                          cooldown: {formatDuration(rule.cooldown_s)}
                                         </Text>
                                         <Text size="xs" c="dimmed">
                                           on unknown: {rule.on_unknown ?? "n/a"}
@@ -312,6 +322,8 @@ export function WatchdogsPanel({
                                         <InterlockConditionView
                                           condition={rule.condition}
                                           telemetry={rule.telemetry}
+                                          evaluation={rule.condition_evaluation}
+                                          resultMode="trigger"
                                         />
                                         {Array.isArray(rule.actions) && rule.actions.length > 0 && (
                                           <Stack gap={2}>

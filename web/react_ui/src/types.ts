@@ -279,9 +279,24 @@ export type WatchdogRuleStatus = {
   alarm?: boolean | null;
   unknown?: boolean | null;
   snapshot?: Record<string, unknown> | null;
+  condition_evaluation?: ConditionEvaluationTrace | null;
   last_evaluated_mono?: number | null;
+  last_evaluated_age_s?: number | null;
   stable_since_mono?: number | null;
+  stable_since_age_s?: number | null;
   last_trigger_mono?: number | null;
+  last_trigger_age_s?: number | null;
+};
+
+export type ConditionEvaluationTrace = {
+  kind: "always" | "comparison" | "group" | "not" | "value" | "error";
+  operator?: "eq" | "ne" | "gt" | "ge" | "lt" | "le" | "abs_lt" | "and" | "or";
+  result?: boolean | null;
+  resolved?: unknown;
+  left?: unknown;
+  right?: unknown;
+  children?: ConditionEvaluationTrace[];
+  error?: string | null;
 };
 
 export type WatchdogStatus = {

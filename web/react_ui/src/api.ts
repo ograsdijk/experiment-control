@@ -1,6 +1,7 @@
 import {
   CommandInterceptorRoute,
   CapabilityMember,
+  ConditionEvaluationTrace,
   DeviceStatus,
   FollowerRuleStatus,
   InterlockInterceptorStatus,
@@ -302,6 +303,45 @@ function normalizeCommandInterceptorRoute(
   };
 }
 
+function normalizeConditionEvaluation(raw: unknown): ConditionEvaluationTrace | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return null;
+  }
+  const obj = raw as Record<string, unknown>;
+  const validKinds = new Set<ConditionEvaluationTrace["kind"]>([
+    "always",
+    "comparison",
+    "group",
+    "not",
+    "value",
+    "error",
+  ]);
+  const kind = asString(obj.kind, "value") as ConditionEvaluationTrace["kind"];
+  if (!validKinds.has(kind)) {
+    return null;
+  }
+  const children = Array.isArray(obj.children)
+    ? obj.children
+        .map((child) => normalizeConditionEvaluation(child))
+        .filter((child): child is ConditionEvaluationTrace => child !== null)
+    : undefined;
+  const result = Object.prototype.hasOwnProperty.call(obj, "result")
+    ? typeof obj.result === "boolean"
+      ? obj.result
+      : null
+    : undefined;
+  return {
+    kind,
+    operator: asString(obj.operator, "") as ConditionEvaluationTrace["operator"],
+    result,
+    resolved: obj.resolved,
+    left: obj.left,
+    right: obj.right,
+    children,
+    error: asString(obj.error, "") || null,
+  };
+}
+
 function normalizeWatchdogStatus(raw: unknown): WatchdogStatus | null {
   if (!raw || typeof raw !== "object") {
     return null;
@@ -386,6 +426,10 @@ function normalizeWatchdogStatus(raw: unknown): WatchdogStatus | null {
         snapshotRaw && typeof snapshotRaw === "object" && !Array.isArray(snapshotRaw)
           ? (snapshotRaw as Record<string, unknown>)
           : null;
+      const ageOrNull = (value: unknown): number | null => {
+        const parsed = asNumber(value, Number.NaN);
+        return Number.isFinite(parsed) ? Math.max(0, parsed) : null;
+      };
       return {
         name: asString(ruleObj.name, ""),
         severity: asString(ruleObj.severity, "info"),
@@ -411,9 +455,15 @@ function normalizeWatchdogStatus(raw: unknown): WatchdogStatus | null {
           ? asBoolean(ruleObj.unknown, false)
           : null,
         snapshot,
+        condition_evaluation: normalizeConditionEvaluation(
+          ruleObj.condition_evaluation
+        ),
         last_evaluated_mono: lastEvaluatedMono,
+        last_evaluated_age_s: ageOrNull(ruleObj.last_evaluated_age_s),
         stable_since_mono: stableSinceMono,
+        stable_since_age_s: ageOrNull(ruleObj.stable_since_age_s),
         last_trigger_mono: lastTriggerMono,
+        last_trigger_age_s: ageOrNull(ruleObj.last_trigger_age_s),
       };
     })
     .filter((rule): rule is NonNullable<typeof rule> => rule !== null);

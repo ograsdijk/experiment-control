@@ -1954,16 +1954,9 @@ export function App() {
     const watchdogError = watchdogsController.watchdogButtonSummary.status === "error";
     const interlockActive = interlockButtonSummary.activeRuleCount > 0;
     const watchdogActive =
-      watchdogsController.watchdogButtonSummary.activeLatchCount +
-        watchdogsController.watchdogButtonSummary.activeAlarmCount +
-        watchdogsController.watchdogButtonSummary.unknownRuleCount +
-        watchdogsController.watchdogButtonSummary.pendingRuleCount >
-      0;
+      watchdogsController.watchdogButtonSummary.attentionRuleCount > 0;
     const watchdogActiveCount =
-      watchdogsController.watchdogButtonSummary.activeLatchCount +
-      watchdogsController.watchdogButtonSummary.activeAlarmCount +
-      watchdogsController.watchdogButtonSummary.unknownRuleCount +
-      watchdogsController.watchdogButtonSummary.pendingRuleCount;
+      watchdogsController.watchdogButtonSummary.attentionRuleCount;
     const totalActive =
       interlockButtonSummary.activeRuleCount +
       watchdogActiveCount;

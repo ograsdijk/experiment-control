@@ -20,6 +20,7 @@ import {
 } from "../features/runtime/helpers";
 import type {
   CommandInterceptorRoute,
+  ConditionEvaluationTrace,
   DeviceStatus,
   FollowerRuleStatus,
   InterlockInterceptorStatus,
@@ -318,11 +319,15 @@ export function InterlockConditionView({
   telemetry,
   commandDeviceId,
   commandAction,
+  evaluation,
+  resultMode = "allow",
 }: {
   condition: unknown;
   telemetry?: ReadonlyArray<ConditionTelemetryBinding>;
   commandDeviceId?: string;
   commandAction?: string;
+  evaluation?: ConditionEvaluationTrace | null;
+  resultMode?: "allow" | "trigger";
 }) {
   const [showRaw, setShowRaw] = useState(false);
   const node = useMemo(() => parseConditionNode(condition), [condition]);
@@ -398,7 +403,77 @@ export function InterlockConditionView({
     return undefined;
   };
 
-  const renderNode = (current: ConditionNode): ReactNode => {
+  const renderEvaluationResult = (
+    currentEvaluation: ConditionEvaluationTrace | null | undefined,
+    group = false
+  ) => {
+    if (!currentEvaluation) {
+      return null;
+    }
+    if (currentEvaluation.result == null) {
+      return (
+        <Badge size="xs" variant="light" color="yellow">
+          Unknown
+        </Badge>
+      );
+    }
+    if (resultMode === "trigger") {
+      return (
+        <Badge
+          size="xs"
+          variant="light"
+          color={currentEvaluation.result ? "red" : "teal"}
+        >
+          {currentEvaluation.result
+            ? group
+              ? "Triggered"
+              : "Met"
+            : group
+              ? "Not triggered"
+              : "Clear"}
+        </Badge>
+      );
+    }
+    return (
+      <Badge
+        size="xs"
+        variant="light"
+        color={currentEvaluation.result ? "teal" : "red"}
+      >
+        {currentEvaluation.result ? "Pass" : "Fail"}
+      </Badge>
+    );
+  };
+
+  const renderResolvedValue = (
+    original: unknown,
+    rendered: string,
+    resolved: unknown,
+    hasResolved: boolean
+  ) => {
+    const resolvedText = formatConditionValue(resolved);
+    const display =
+      hasResolved && resolvedText !== formatConditionValue(original)
+        ? `${rendered} = ${resolvedText}`
+        : rendered;
+    return (
+      <Text
+        size="xs"
+        style={{
+          fontFamily:
+            "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
+          wordBreak: "break-word",
+        }}
+      >
+        {display}
+      </Text>
+    );
+  };
+
+  const renderNode = (
+    current: ConditionNode,
+    currentEvaluation?: ConditionEvaluationTrace | null
+  ): ReactNode => {
     if (current.kind === "always") {
       return (
         <Group gap="xs" wrap="wrap">
@@ -406,6 +481,7 @@ export function InterlockConditionView({
             Always
           </Badge>
           {renderValue(current.value)}
+          {renderEvaluationResult(currentEvaluation)}
         </Group>
       );
     }
@@ -469,36 +545,34 @@ export function InterlockConditionView({
             >
               {simplifiedText}
             </Text>
+            {renderEvaluationResult(currentEvaluation)}
           </Group>
         );
       }
+      const hasResolvedLeft = Boolean(
+        currentEvaluation && Object.prototype.hasOwnProperty.call(currentEvaluation, "left")
+      );
+      const hasResolvedRight = Boolean(
+        currentEvaluation && Object.prototype.hasOwnProperty.call(currentEvaluation, "right")
+      );
       return (
         <Group gap="xs" wrap="wrap">
-          <Text
-            size="xs"
-            c={valueColor(current.left)}
-            style={{
-              fontFamily:
-                "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
-              wordBreak: "break-word",
-            }}
-          >
-            {leftDisplay}
-          </Text>
+          {renderResolvedValue(
+            current.left,
+            leftDisplay,
+            currentEvaluation?.left,
+            hasResolvedLeft
+          )}
           <Badge size="xs" variant="outline" color={colorByOp[current.op]}>
             {symbolByOp[current.op]}
           </Badge>
-          <Text
-            size="xs"
-            c={valueColor(current.right)}
-            style={{
-              fontFamily:
-                "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
-              wordBreak: "break-word",
-            }}
-          >
-            {rightDisplay}
-          </Text>
+          {renderResolvedValue(
+            current.right,
+            rightDisplay,
+            currentEvaluation?.right,
+            hasResolvedRight
+          )}
+          {renderEvaluationResult(currentEvaluation)}
         </Group>
       );
     }
@@ -525,6 +599,7 @@ export function InterlockConditionView({
                 ? "All conditions must pass"
                 : "Any condition can pass"}
             </Text>
+            {renderEvaluationResult(currentEvaluation, true)}
           </Group>
           {current.items.length > 0 ? (
             <Stack gap={3}>
@@ -534,7 +609,7 @@ export function InterlockConditionView({
                     {idx + 1}
                   </Badge>
                   <Stack gap={2} style={{ flex: 1 }}>
-                    {renderNode(item)}
+                    {renderNode(item, currentEvaluation?.children?.[idx])}
                   </Stack>
                 </Group>
               ))}
@@ -554,17 +629,23 @@ export function InterlockConditionView({
             NOT
           </Badge>
           <Stack gap={2} style={{ paddingLeft: "0.25rem" }}>
-            {renderNode(current.item)}
+            {renderNode(current.item, currentEvaluation?.children?.[0])}
           </Stack>
+          {renderEvaluationResult(currentEvaluation)}
         </Stack>
       );
     }
-    return renderValue(current.value);
+    return (
+      <Group gap="xs" wrap="wrap">
+        {renderValue(current.value)}
+        {renderEvaluationResult(currentEvaluation)}
+      </Group>
+    );
   };
 
   return (
     <Stack gap={4}>
-      {renderNode(node)}
+      {renderNode(node, evaluation)}
       <Button
         size="compact-xs"
         variant="subtle"
