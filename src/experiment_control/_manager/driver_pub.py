@@ -432,7 +432,7 @@ def ingest_telemetry(
         return
     recv_mono = time.monotonic()
     recv_wall = time.time()
-    ts = _parse_bundle_timestamp(
+    source_ts = _parse_bundle_timestamp(
         manager,
         msg=msg,
         device_id=device_id,
@@ -440,6 +440,12 @@ def ingest_telemetry(
         error_prefix="telemetry bad ts",
         timestamp_cls=timestamp_cls,
     )
+    # ``_telemetry_latest`` is keyed per signal and its tuple timestamp is
+    # consumed by Manager._mark_stale_telemetry as that signal's freshness
+    # clock. Use this manager's receive clock there: producer monotonic clocks
+    # are not comparable across hosts. Producer timing is preserved separately
+    # on every TelemetrySignal below and in the republished bundle.
+    recv_ts = timestamp_cls(t_wall=recv_wall, t_mono=recv_mono)
     raw_signals = msg.get("signals")
     if not isinstance(raw_signals, dict):
         _emit_ingest_error(
@@ -466,13 +472,17 @@ def ingest_telemetry(
             quality, quality_raw, telemetry_quality_enum
         ):
             bad_signals.append(name)
-        sig_ts = None
+        # Always retain a producer timestamp on the signal. This makes the
+        # first tuple element free to carry the manager-local receive timestamp
+        # without changing snapshot/provenance semantics for signals that did
+        # not provide their own timestamp.
+        sig_ts = source_ts
         if raw_signal.get("ts") is not None:
             try:
                 sig_ts = manager._parse_timestamp(raw_signal["ts"])
             except Exception:
                 bad_signals.append(name)
-                sig_ts = None
+                sig_ts = source_ts
         sig = telemetry_signal_cls(
             value=raw_signal.get("value"),
             units=raw_signal.get("units"),
@@ -484,9 +494,9 @@ def ingest_telemetry(
             manager,
             device_id=device_id,
             signal_name=name,
-            value=(ts, sig),
+            value=(recv_ts, sig),
         )
-    manager._telemetry_last_bundle_ts[device_id] = ts
+    manager._telemetry_last_bundle_ts[device_id] = source_ts
     manager._telemetry_last_recv_mono[device_id] = recv_mono
     _touch_lru(manager._telemetry_device_order, device_id)
     if bad_signals:
@@ -505,8 +515,8 @@ def ingest_telemetry(
         "device_id": device_id,
         "seq": seq,
         "ts": {
-            "t_wall": ts.t_wall,
-            "t_mono": ts.t_mono,
+            "t_wall": source_ts.t_wall,
+            "t_mono": source_ts.t_mono,
             "t_mono_recv": recv_mono,
             # Wall clock of THIS manager when the bundle was ingested. For a
             # federated device this is the consuming host's clock (the bundle is

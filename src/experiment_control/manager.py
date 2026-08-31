@@ -2097,8 +2097,8 @@ class Manager(
         for dev_id, signals in self._telemetry_latest.items():
             stale_names: list[str] = []
             stale_ages: list[float] = []
-            for sig_name, (sig_bundle_ts, sig) in list(signals.items()):
-                age = now_mono - sig_bundle_ts.t_mono
+            for sig_name, (recv_ts, sig) in list(signals.items()):
+                age = now_mono - recv_ts.t_mono
                 if age <= self._telemetry_stale_s:
                     continue
                 if sig.quality in {
@@ -2113,7 +2113,7 @@ class Manager(
                         ts=sig.ts,
                         quality_source="manager",
                     )
-                    signals[sig_name] = (sig_bundle_ts, stale_sig)
+                    signals[sig_name] = (recv_ts, stale_sig)
                     stale_names.append(sig_name)
                     stale_ages.append(age)
 
@@ -2171,13 +2171,15 @@ class Manager(
     def _get_device_telemetry_snapshot(self, device_id: str) -> Json:
         device_cache = self._telemetry_latest.get(device_id, {})
         snap: Json = {}
-        for name, (bundle_ts, sig) in device_cache.items():
-            # Per-signal ts None => use bundle ts (newer spec)
-            ts = sig.ts or bundle_ts
-            t_mono_recv = self._telemetry_last_recv_mono.get(device_id)
-            ts_payload = {"t_wall": ts.t_wall, "t_mono": ts.t_mono}
-            if t_mono_recv is not None:
-                ts_payload["t_mono_recv"] = t_mono_recv
+        for name, (recv_ts, sig) in device_cache.items():
+            # Producer timing stays on the signal; the tuple timestamp is this
+            # manager's per-signal receive time used for freshness.
+            ts = sig.ts or recv_ts
+            ts_payload = {
+                "t_wall": ts.t_wall,
+                "t_mono": ts.t_mono,
+                "t_mono_recv": recv_ts.t_mono,
+            }
             snap[name] = {
                 "value": sig.value,
                 "units": sig.units,
