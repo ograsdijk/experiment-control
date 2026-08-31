@@ -60,7 +60,9 @@ type DeviceCardProps = {
 
 function livenessClass(liveness: string) {
   if (liveness === "ONLINE") return "badge-online";
-  if (liveness === "DISCONNECTED") return "badge-disconnected";
+  if (liveness === "DISCONNECTED" || liveness === "STALE") {
+    return "badge-disconnected";
+  }
   return "badge-offline";
 }
 
@@ -217,8 +219,20 @@ export function DeviceCard({
   };
   const deviceStateUpper = String(device.device_state ?? "").toUpperCase();
   const livenessUpper = String(device.liveness ?? "").toUpperCase();
-  const driverOffline = livenessUpper === "OFFLINE";
-  const healthy = deviceStateUpper === "OK" && livenessUpper === "ONLINE";
+  const driverProcess = (
+    device as DeviceStatus & { driver_process?: { state?: unknown } }
+  ).driver_process;
+  const driverProcessState = String(driverProcess?.state ?? "").toUpperCase();
+  // STALE is a first-class manager liveness state. Trust the backend rather
+  // than inferring it from process state; in particular, STARTING/OFFLINE is a
+  // normal launch state and must not be presented as a blocked driver loop.
+  const effectiveLiveness = livenessUpper;
+  const driverStale = effectiveLiveness === "STALE";
+  const driverOffline = effectiveLiveness === "OFFLINE";
+  const healthy = deviceStateUpper === "OK" && effectiveLiveness === "ONLINE";
+  const livenessLabel = driverStale
+    ? `${driverProcessState || "RUNNING"} / STALE`
+    : effectiveLiveness;
   // Primary connection action. The driver performs a disconnect+reconnect for
   // any non-OK state, so "Recover" and "Connect" call the same handler; the
   // label just reflects whether the device dropped from a live session
@@ -233,6 +247,11 @@ export function DeviceCard({
     // Driver process not reporting — a device-level connect RPC can't reach it;
     // steer the operator to Restart driver instead.
     connectAction = { label: "Connect", color: "gray", onClick: onConnect, disabled: true };
+  } else if (driverStale) {
+    // The driver process still exists but its event loop is blocked. Do not add
+    // another device RPC behind the blocked operation; the dedicated restart
+    // control remains available if the operator wants to intervene manually.
+    connectAction = { label: "Stale", color: "orange", onClick: onConnect, disabled: true };
   } else if (healthy) {
     connectAction = {
       label: "Disconnect",
@@ -263,8 +282,8 @@ export function DeviceCard({
             </Text>
           </Stack>
           <Group gap={6} align="center">
-            <Badge className={livenessClass(device.liveness)} variant="light">
-              {device.liveness}
+            <Badge className={livenessClass(effectiveLiveness)} variant="light">
+              {livenessLabel}
             </Badge>
             <Button
               size="xs"
@@ -526,4 +545,3 @@ export function DeviceCard({
     </Stack>
   );
 }
-

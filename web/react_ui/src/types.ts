@@ -103,7 +103,7 @@ export type LogMessage = {
 
 export type DeviceStatus = {
   device_id: string;
-  liveness: "ONLINE" | "OFFLINE" | "DISCONNECTED" | string;
+  liveness: "ONLINE" | "OFFLINE" | "DISCONNECTED" | "STALE" | string;
   is_remote?: boolean;
   source_kind?: string | null;
   owner_peer_id?: string | null;

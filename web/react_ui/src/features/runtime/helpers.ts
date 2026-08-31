@@ -1,4 +1,4 @@
-﻿import type { CapabilityMember, DeviceStatus, ProcessStatus } from "../../types";
+import type { CapabilityMember, DeviceStatus, ProcessStatus } from "../../types";
 
 export function pinnedCommandKey(deviceId: string, action: string) {
   return `${deviceId}:${action}`;
@@ -25,6 +25,10 @@ export function isDeviceDriverStarted(device: DeviceStatus) {
 }
 
 export function shouldPreloadCapabilities(device: DeviceStatus) {
+  const liveness = String(device.liveness ?? "").toUpperCase();
+  if (["DISCONNECTED", "STALE", "OFFLINE"].includes(liveness)) {
+    return false;
+  }
   if (isDeviceDisconnected(device)) {
     return false;
   }
@@ -59,7 +63,7 @@ export function livenessColor(liveness: string | null | undefined): string {
   if (normalized === "OFFLINE") {
     return "red";
   }
-  if (normalized === "DISCONNECTED") {
+  if (normalized === "DISCONNECTED" || normalized === "STALE") {
     return "yellow";
   }
   return "gray";
