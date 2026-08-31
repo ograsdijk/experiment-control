@@ -196,6 +196,11 @@ def start_driver(manager: Any, device_id: str) -> None:
     )
     env["EXPERIMENT_CONTROL_MANAGER_PUB"] = manager._external_pub_connect_local
     env["EXPERIMENT_CONTROL_INSTANCE_ID"] = manager._instance_id
+    generation = int(getattr(handle, "driver_generation", 0)) + 1
+    handle.driver_generation = generation
+    env["EXPERIMENT_CONTROL_DRIVER_GENERATION"] = str(generation)
+    if bool(getattr(handle, "driver_reconnect_after_restart", False)):
+        handle.driver_reconnect_generation = generation
     # Establish the new generation before launching. Lifecycle starts run on a
     # worker while registration/heartbeat ingestion run on the manager thread;
     # clearing these after Popen returns could erase the replacement driver's
@@ -297,6 +302,9 @@ def stop_driver(
     # that may have been scheduled by the heartbeat hard-timeout policy.
     # restart_driver() deliberately installs a new schedule after stop_driver().
     handle.driver_next_restart_t_mono = None
+    handle.driver_restart_is_automatic = False
+    handle.driver_reconnect_after_restart = False
+    handle.driver_reconnect_generation = None
 
     mark_device_offline(
         manager,
@@ -422,6 +430,9 @@ def restart_driver(
     handle.driver_next_restart_t_mono = (
         time.monotonic() + handle.spec.driver_restart_backoff_s
     )
+    # Operator restarts use the same delayed launch path but do not consume the
+    # automatic heartbeat-recovery crashloop budget.
+    handle.driver_restart_is_automatic = False
     manager._publish_driver_event("manager.driver.restart_scheduled", handle)
 
 
@@ -1073,19 +1084,64 @@ def maybe_restart_device_driver(
         return
     if handle.process is not None and handle.process.poll() is None:
         return
+    automatic = bool(getattr(handle, "driver_restart_is_automatic", False))
     if (
-        handle.spec.driver_max_restarts is not None
+        automatic
+        and handle.spec.driver_max_restarts is not None
         and handle.driver_restart_count >= handle.spec.driver_max_restarts
     ):
         handle.driver_process_state = _enum_member(handle.driver_process_state, "CRASHLOOP")
         handle.driver_next_restart_t_mono = None
+        handle.driver_restart_is_automatic = False
+        handle.driver_reconnect_after_restart = False
+        handle.driver_reconnect_generation = None
         manager._publish_driver_event("manager.driver.crashloop", handle)
         return
-    handle.driver_restart_count += 1
+    if automatic:
+        handle.driver_restart_count += 1
     handle.driver_last_restart_t_mono = now_mono
+    handle.driver_restart_healthy_since_mono = None
     handle.driver_next_restart_t_mono = None
     manager._publish_driver_event("manager.driver.restarting", handle)
     manager.start_driver(device_id)
+
+
+def reset_driver_restart_budget_if_healthy(
+    manager: Any,
+    handle: Any,
+    now_mono: float,
+) -> None:
+    """Reset consecutive automatic failures after a continuously healthy run."""
+    if int(getattr(handle, "driver_restart_count", 0)) <= 0:
+        handle.driver_restart_healthy_since_mono = None
+        return
+    if str(handle.driver_process_state) != "RUNNING":
+        handle.driver_restart_healthy_since_mono = None
+        return
+    hb_recv = getattr(handle, "last_hb_recv_mono", None)
+    running_since = getattr(handle, "driver_running_since_mono", None)
+    heartbeat_fresh = False
+    if hb_recv is not None:
+        heartbeat_recv_mono = float(hb_recv)
+        heartbeat_current = (
+            running_since is None or heartbeat_recv_mono >= float(running_since)
+        )
+        heartbeat_fresh = heartbeat_current and (
+            now_mono - heartbeat_recv_mono <= float(manager._heartbeat_timeout_s)
+        )
+    if not heartbeat_fresh:
+        handle.driver_restart_healthy_since_mono = None
+        return
+    healthy_since = getattr(handle, "driver_restart_healthy_since_mono", None)
+    if healthy_since is None:
+        handle.driver_restart_healthy_since_mono = now_mono
+        return
+    reset_s = float(getattr(handle.spec, "driver_restart_healthy_reset_s", 300.0))
+    if now_mono - float(healthy_since) < reset_s:
+        return
+    handle.driver_restart_count = 0
+    handle.driver_restart_healthy_since_mono = None
+    manager._publish_driver_event("manager.driver.restart_budget_reset", handle)
 
 
 def _auto_reconnect_field_lock(handle: Any) -> threading.Lock:
@@ -1500,6 +1556,7 @@ def supervise_device_drivers(manager: Any, now_mono: float) -> None:
             manager._enforce_device_driver_heartbeat_timeout(handle, now_mono)
             manager._enforce_device_driver_stop_timeout(handle, now_mono)
             manager._maybe_restart_device_driver(device_id, handle, now_mono)
+            reset_driver_restart_budget_if_healthy(manager, handle, now_mono)
         finally:
             lock.release()
         _maybe_auto_reconnect_device(manager, device_id, handle, now_mono)

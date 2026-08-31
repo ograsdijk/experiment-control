@@ -286,6 +286,11 @@ def device_spec_from_yaml(path: str | Path) -> DeviceSpec:
         )
         if driver_max_restarts is not None and driver_max_restarts < 1:
             raise ConfigError("driver_max_restarts", "must be >= 1 or null")
+        driver_restart_healthy_reset_s = float(
+            raw_obj.get("driver_restart_healthy_reset_s", 300.0)
+        )
+        if driver_restart_healthy_reset_s <= 0:
+            raise ConfigError("driver_restart_healthy_reset_s", "must be > 0")
     except ConfigError as e:
         raise TypeError(str(e)) from None
 
@@ -310,6 +315,7 @@ def device_spec_from_yaml(path: str | Path) -> DeviceSpec:
         driver_restart_on_heartbeat_timeout=driver_restart_on_heartbeat_timeout,
         driver_restart_backoff_s=driver_restart_backoff_s,
         driver_max_restarts=driver_max_restarts,
+        driver_restart_healthy_reset_s=driver_restart_healthy_reset_s,
     )
 
 

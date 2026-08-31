@@ -1270,11 +1270,29 @@ class Manager(
                     f"Unknown device_id {reg.device_id!r} (not configured in manager)"
                 )
 
+            current_generation = int(getattr(handle, "driver_generation", 0))
+            if current_generation > 0 and reg.generation != current_generation:
+                # A registration can remain buffered after its process was
+                # terminated. Acknowledge it so the obsolete driver does not
+                # retry, but never let it replace endpoints or trigger recovery
+                # for the current generation.
+                self._send_json(self._registry_rep, {"ok": True})
+                self._publish_manager_event(
+                    "manager.driver_registration_ignored",
+                    {
+                        "device_id": reg.device_id,
+                        "registration_generation": reg.generation,
+                        "current_generation": current_generation,
+                    },
+                )
+                return
+
             if handle.rpc_endpoint != reg.rpc_endpoint:
                 self._close_device_rpc(handle)
             handle.rpc_endpoint = reg.rpc_endpoint
             handle.pub_endpoint = reg.pub_endpoint
             handle.capabilities = reg.capabilities
+            handle.driver_registered_generation = reg.generation
             # Only promote to RUNNING when the driver is actually alive. A
             # `register` message can be a stale buffered message from a process
             # that already exited (and was reaped by the supervisor, clearing
@@ -1339,8 +1357,20 @@ class Manager(
         # TUI's). Dispatch it to the lifecycle executor — the same off-loop path
         # all other device lifecycle ops already use — so the loop stays
         # responsive. Events are marshaled back via _lifecycle_event_queue.
-        if self._auto_connect_on_register:
-            self._dispatch_auto_connect(reg.device_id)
+        recovery_generation = getattr(handle, "driver_reconnect_generation", None)
+        should_recover = bool(
+            getattr(handle, "driver_reconnect_after_restart", False)
+            and recovery_generation is not None
+            and reg.generation == recovery_generation
+            and reg.generation == getattr(handle, "driver_generation", None)
+            and str(handle.driver_process_state) == "RUNNING"
+        )
+        if self._auto_connect_on_register or should_recover:
+            self._dispatch_auto_connect(
+                reg.device_id,
+                expected_generation=(reg.generation if should_recover else None),
+                heartbeat_recovery=should_recover,
+            )
 
     @staticmethod
     def _parse_registration(msg: Json) -> DriverRegistration:
@@ -1350,11 +1380,14 @@ class Manager(
                 f"Registry received non-register message: {msg.get('type')!r}"
             )
         device_id = str(msg["device_id"])
+        generation_raw = msg.get("generation")
+        generation = None if generation_raw is None else int(generation_raw)
         return DriverRegistration(
             device_id=device_id,
             rpc_endpoint=str(msg["rpc_endpoint"]),
             pub_endpoint=str(msg["pub_endpoint"]),
             capabilities=msg.get("capabilities"),
+            generation=generation,
         )
 
     @staticmethod
@@ -1666,20 +1699,57 @@ class Manager(
                 # Socket itself may already be closed in shutdown; drop.
                 pass
 
-    def _dispatch_auto_connect(self, device_id: str) -> None:
+    def _dispatch_auto_connect(
+        self,
+        device_id: str,
+        *,
+        expected_generation: int | None = None,
+        heartbeat_recovery: bool = False,
+    ) -> None:
         """Run auto-connect-on-register off the poll loop, on the lifecycle
         executor (per-device lock), so a slow/absent device's blocking connect
         RPC can't stall the manager loop. Fire-and-forget: no RPC reply, just
         the connect event marshaled back via _lifecycle_event_queue."""
         try:
-            self._lifecycle_executor.submit(self._run_auto_connect, device_id)
+            self._lifecycle_executor.submit(
+                self._run_auto_connect,
+                device_id,
+                expected_generation,
+                heartbeat_recovery,
+            )
         except RuntimeError:
             # Executor shut down during teardown — nothing to do.
             pass
 
-    def _run_auto_connect(self, device_id: str) -> None:
+    def _run_auto_connect(
+        self,
+        device_id: str,
+        expected_generation: int | None = None,
+        heartbeat_recovery: bool = False,
+    ) -> None:
         lock = self._lifecycle_device_locks.setdefault(device_id, threading.Lock())
         with lock:
+            handle = self._devices.get(device_id)
+            if handle is None:
+                return
+            if expected_generation is not None and (
+                getattr(handle, "driver_generation", None) != expected_generation
+                or getattr(handle, "driver_registered_generation", None)
+                != expected_generation
+                or getattr(handle, "driver_reconnect_generation", None)
+                != expected_generation
+            ):
+                return
+            if heartbeat_recovery and not bool(
+                getattr(handle, "driver_reconnect_after_restart", False)
+            ):
+                return
+            if heartbeat_recovery:
+                # Claim this one-shot intent under the lifecycle lock. Stop and
+                # later generations clear/replace it before they can acquire the
+                # same lock, so a delayed task cannot connect the wrong driver.
+                handle.driver_reconnect_after_restart = False
+                handle.driver_reconnect_generation = None
             try:
                 resp = self.connect_device(device_id)
             except Exception as exc:

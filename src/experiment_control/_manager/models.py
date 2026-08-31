@@ -80,6 +80,7 @@ class DriverRegistration:
     rpc_endpoint: str
     pub_endpoint: str
     capabilities: Json | None = None  # optional to send at register-time
+    generation: int | None = None
 
 
 @dataclass
@@ -106,6 +107,7 @@ class DeviceSpec:
     driver_kill_timeout_s: float = 3.0
     driver_restart_backoff_s: float = 0.5
     driver_max_restarts: int | None = None
+    driver_restart_healthy_reset_s: float = 300.0
     config_path: Path | None = None
 
 
@@ -157,6 +159,12 @@ class DeviceHandle:
     driver_last_exit_code: int | None = None
     driver_restart_count: int = 0
     driver_last_restart_t_mono: float | None = None
+    driver_restart_healthy_since_mono: float | None = None
+    driver_restart_is_automatic: bool = False
+    driver_generation: int = 0
+    driver_registered_generation: int | None = None
+    driver_reconnect_after_restart: bool = False
+    driver_reconnect_generation: int | None = None
     driver_last_error: str | None = None
     driver_last_error_kind: str | None = None
     driver_last_signal_name: str | None = None

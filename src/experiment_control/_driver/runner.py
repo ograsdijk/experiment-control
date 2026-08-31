@@ -364,13 +364,16 @@ class DeviceRunner:
             pass
 
     def register_with_manager(self) -> None:
-        msg = {
+        msg: dict[str, Any] = {
             "type": "register",
             "device_id": self.device_id,
             "rpc_endpoint": self.rpc_endpoint,
             "pub_endpoint": self.pub_endpoint,
             "capabilities": self.capabilities(),
         }
+        generation_raw = os.environ.get("EXPERIMENT_CONTROL_DRIVER_GENERATION", "")
+        if generation_raw:
+            msg["generation"] = int(generation_raw)
         last_exc: Exception | None = None
         for attempt in range(1, self._register_retries + 1):
             reg = self.ctx.socket(zmq.REQ)
