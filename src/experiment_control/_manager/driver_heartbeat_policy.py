@@ -253,6 +253,12 @@ def enforce_device_driver_heartbeat_timeout(
             pass
     manager._publish_driver_event("manager.driver.failed", handle)
     if bool(getattr(handle.spec, "driver_restart_on_heartbeat_timeout", False)):
+        last_hb = getattr(handle, "last_hb", None)
+        handle.driver_reconnect_after_restart = bool(
+            last_hb is not None and getattr(last_hb, "device_reachable", False)
+        )
+        handle.driver_reconnect_generation = None
+        handle.driver_restart_is_automatic = True
         handle.driver_next_restart_t_mono = (
             now_mono + float(handle.spec.driver_restart_backoff_s)
         )
