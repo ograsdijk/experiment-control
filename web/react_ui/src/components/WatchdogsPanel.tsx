@@ -3,6 +3,7 @@ import { IconRefresh } from "@tabler/icons-react";
 import { isProcessRpcStateAvailable, processStateColor } from "../features/runtime/helpers";
 import {
   hasActiveWatchdogTrip,
+  isWatchdogRuleConfirming,
   watchdogRuleDetails,
   type DetailedWatchdogRule,
 } from "../features/watchdogs/watchdogStatusApi";
@@ -57,7 +58,12 @@ function snapshotEntry(
 export function hasIncompleteBeamlineTurboState(
   rule: WatchdogStatus["rules"][number]
 ): boolean {
-  if (!isBeamlineTurboRule(rule) || watchdogRuleDetails(rule).armed) {
+  if (
+    !isBeamlineTurboRule(rule) ||
+    watchdogRuleDetails(rule).armed ||
+    rule.unknown ||
+    rule.last_evaluated_mono == null
+  ) {
     return false;
   }
   return BEAMLINE_TURBO_STATE_ALIASES.some(
@@ -131,7 +137,7 @@ export function watchdogRuleLiveState(rule: WatchdogStatus["rules"][number]): {
       ? { label: "DISARMED · TURBO STATE INCOMPLETE", color: "yellow" }
       : { label: "DISARMED", color: "gray" };
   }
-  if (rule.alarm) {
+  if (isWatchdogRuleConfirming(rule)) {
     return details.arm != null
       ? { label: "ARMED · CONFIRMING", color: "orange" }
       : { label: "CONFIRMING", color: "orange" };
@@ -179,7 +185,7 @@ export function summarizeWatchdogRules(watchdog: WatchdogStatus): {
       unknown += 1;
     } else if (rule.last_evaluated_mono == null) {
       pending += 1;
-    } else if (rule.alarm) {
+    } else if (isWatchdogRuleConfirming(rule)) {
       confirming += 1;
     }
   }
@@ -217,13 +223,7 @@ export function beamlineTurboProtectionSummary(
     (rule) => !hasActiveWatchdogTrip(rule) && Boolean(rule.unknown)
   ).length;
   const incompleteArming = turboRules.filter(hasIncompleteBeamlineTurboState).length;
-  const confirming = turboRules.filter(
-    (rule) =>
-      !hasActiveWatchdogTrip(rule) &&
-      !rule.unknown &&
-      Boolean(rule.alarm) &&
-      Boolean(watchdogRuleDetails(rule).armed)
-  ).length;
+  const confirming = turboRules.filter(isWatchdogRuleConfirming).length;
   const armed = turboRules.filter(
     (rule) => !rule.unknown && Boolean(watchdogRuleDetails(rule).armed)
   ).length;
