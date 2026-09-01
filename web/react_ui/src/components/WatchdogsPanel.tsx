@@ -2,6 +2,7 @@ import { Badge, Button, Card, Group, Stack, Switch, Text } from "@mantine/core";
 import { IconRefresh } from "@tabler/icons-react";
 import { isProcessRpcStateAvailable, processStateColor } from "../features/runtime/helpers";
 import {
+  hasActiveWatchdogTrip,
   watchdogRuleDetails,
   type DetailedWatchdogRule,
 } from "../features/watchdogs/watchdogStatusApi";
@@ -36,12 +37,32 @@ const BEAMLINE_TURBO_RULES = new Set([
   "det_pressure_turbos_off",
 ]);
 
+const BEAMLINE_TURBO_STATE_ALIASES = ["rc_on", "eql_on", "det_on", "spb_on"];
+
 function isBeamlineTurboRule(rule: WatchdogStatus["rules"][number]): boolean {
   return BEAMLINE_TURBO_RULES.has(String(rule.name ?? ""));
 }
 
-function hasActiveTrip(rule: WatchdogStatus["rules"][number]): boolean {
-  return Boolean(watchdogRuleDetails(rule).active_trip_id);
+function snapshotEntry(
+  rule: WatchdogStatus["rules"][number],
+  alias: string
+): Record<string, unknown> | null {
+  const entry = rule.snapshot?.[alias];
+  if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+    return null;
+  }
+  return entry as Record<string, unknown>;
+}
+
+export function hasIncompleteBeamlineTurboState(
+  rule: WatchdogStatus["rules"][number]
+): boolean {
+  if (!isBeamlineTurboRule(rule) || watchdogRuleDetails(rule).armed) {
+    return false;
+  }
+  return BEAMLINE_TURBO_STATE_ALIASES.some(
+    (alias) => snapshotEntry(rule, alias)?.ok !== true
+  );
 }
 
 function formatDuration(value: number | null | undefined): string {
@@ -82,11 +103,7 @@ function formatValue(value: unknown): string {
 }
 
 function snapshotValue(rule: WatchdogStatus["rules"][number], alias: string): unknown {
-  const entry = rule.snapshot?.[alias];
-  if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
-    return null;
-  }
-  return (entry as Record<string, unknown>).value;
+  return snapshotEntry(rule, alias)?.value ?? null;
 }
 
 export function watchdogRuleLiveState(rule: WatchdogStatus["rules"][number]): {
@@ -94,11 +111,14 @@ export function watchdogRuleLiveState(rule: WatchdogStatus["rules"][number]): {
   color: string;
 } {
   const details = watchdogRuleDetails(rule);
-  if (details.active_trip_id) {
+  if (hasActiveWatchdogTrip(rule)) {
     return {
       label: rule.unknown ? "TRIGGERED · INPUT UNAVAILABLE" : "TRIGGERED",
       color: "red",
     };
+  }
+  if (rule.latched) {
+    return { label: "RECOVERED · LATCHED", color: "orange" };
   }
   if (rule.unknown) {
     return { label: "UNKNOWN", color: "yellow" };
@@ -107,7 +127,9 @@ export function watchdogRuleLiveState(rule: WatchdogStatus["rules"][number]): {
     return { label: "PENDING", color: "gray" };
   }
   if (details.arm != null && !details.armed) {
-    return { label: "DISARMED", color: "gray" };
+    return hasIncompleteBeamlineTurboState(rule)
+      ? { label: "DISARMED · TURBO STATE INCOMPLETE", color: "yellow" }
+      : { label: "DISARMED", color: "gray" };
   }
   if (rule.alarm) {
     return details.arm != null
@@ -151,7 +173,7 @@ export function summarizeWatchdogRules(watchdog: WatchdogStatus): {
     if (rule.latched) {
       latched += 1;
     }
-    if (hasActiveTrip(rule)) {
+    if (hasActiveWatchdogTrip(rule)) {
       triggered += 1;
     } else if (rule.unknown) {
       unknown += 1;
@@ -190,11 +212,14 @@ export function beamlineTurboProtectionSummary(
   if (!enabled) {
     return { label: "Beamline protection disabled", color: "gray" };
   }
-  const triggered = turboRules.filter(hasActiveTrip).length;
-  const unknown = turboRules.filter((rule) => !hasActiveTrip(rule) && Boolean(rule.unknown)).length;
+  const triggered = turboRules.filter(hasActiveWatchdogTrip).length;
+  const unknown = turboRules.filter(
+    (rule) => !hasActiveWatchdogTrip(rule) && Boolean(rule.unknown)
+  ).length;
+  const incompleteArming = turboRules.filter(hasIncompleteBeamlineTurboState).length;
   const confirming = turboRules.filter(
     (rule) =>
-      !hasActiveTrip(rule) &&
+      !hasActiveWatchdogTrip(rule) &&
       !rule.unknown &&
       Boolean(rule.alarm) &&
       Boolean(watchdogRuleDetails(rule).armed)
@@ -217,10 +242,22 @@ export function beamlineTurboProtectionSummary(
       color: "orange",
     };
   }
-  if (armed === turboRules.length) {
-    return { label: `Beamline protection armed · ${armed}/${turboRules.length}`, color: "teal" };
+  if (incompleteArming > 0) {
+    return {
+      label: `Beamline arming degraded · ${armed}/${turboRules.length} sensors armed`,
+      color: "yellow",
+    };
   }
-  return { label: `Beamline protection arming · ${armed}/${turboRules.length}`, color: "gray" };
+  if (armed === turboRules.length) {
+    return {
+      label: `Beamline protection armed · ${armed}/${turboRules.length}`,
+      color: "teal",
+    };
+  }
+  return {
+    label: `Beamline protection arming · ${armed}/${turboRules.length}`,
+    color: "gray",
+  };
 }
 
 function evaluationBadge(trace: ConditionEvaluationTrace | null | undefined) {
@@ -257,7 +294,12 @@ function ConditionTrace({
   return (
     <Stack gap={2} ml={depth > 0 ? "sm" : 0}>
       <Group gap="xs" wrap="wrap">
-        <Text size="xs" style={{ fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" }}>
+        <Text
+          size="xs"
+          style={{
+            fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
+          }}
+        >
           {label}
         </Text>
         {evaluationBadge(trace)}
@@ -298,7 +340,11 @@ function operationalAction(rule: WatchdogStatus["rules"][number]): string | null
       .filter((action) => action.action === "stop" && action.device_id)
       .map((action) => action.device_id)
   );
-  if (["hipace_rc", "hipace_eql", "hipace_det", "hipace_spb"].every((id) => turboStops.has(id))) {
+  if (
+    ["hipace_rc", "hipace_eql", "hipace_det", "hipace_spb"].every((id) =>
+      turboStops.has(id)
+    )
+  ) {
     return "Action: stop all beamline turbos";
   }
   if (actions.length === 1) {
@@ -337,6 +383,7 @@ function RuleCard({
   const confirmation = confirmationProgress(rule);
   const action = operationalAction(rule);
   const pressure = isBeamlineTurboRule(rule) ? snapshotValue(rule, "p") : null;
+  const turboStateIncomplete = hasIncompleteBeamlineTurboState(rule);
 
   return (
     <Card p={6} radius="sm" style={{ border: "1px solid var(--card-border)" }}>
@@ -364,6 +411,11 @@ function RuleCard({
             <Text size="xs" c="dimmed">evaluated {formatAge(rule.last_evaluated_age_s)}</Text>
           </Group>
 
+          {turboStateIncomplete && (
+            <Text size="xs" c="yellow">
+              One or more turbo-state inputs are unavailable; this rule will not arm until at least one running turbo is positively observed. An already-armed rule is not affected.
+            </Text>
+          )}
           {action && <Text size="xs" fw={500}>{action}</Text>}
           {rule.message && <Text size="xs" c="dimmed">{rule.message}</Text>}
 
@@ -375,7 +427,13 @@ function RuleCard({
               {details.arm != null && (
                 <>
                   <Text size="xs" c="dimmed">Arming condition</Text>
-                  <Text size="xs" style={{ whiteSpace: "pre-wrap", fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" }}>
+                  <Text
+                    size="xs"
+                    style={{
+                      whiteSpace: "pre-wrap",
+                      fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
+                    }}
+                  >
                     {JSON.stringify(details.arm.condition, null, 2)}
                   </Text>
                 </>
@@ -383,7 +441,13 @@ function RuleCard({
               <Text size="xs" c="dimmed">Trip condition evaluation</Text>
               <ConditionTrace trace={rule.condition_evaluation} />
               <Text size="xs" c="dimmed">Raw trip condition</Text>
-              <Text size="xs" style={{ whiteSpace: "pre-wrap", fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" }}>
+              <Text
+                size="xs"
+                style={{
+                  whiteSpace: "pre-wrap",
+                  fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
+                }}
+              >
                 {JSON.stringify(rule.condition, null, 2)}
               </Text>
               <Text size="xs" c="dimmed">
@@ -396,7 +460,10 @@ function RuleCard({
                 <Text
                   key={`${ruleName}:action:${index}`}
                   size="xs"
-                  style={{ fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace", wordBreak: "break-word" }}
+                  style={{
+                    fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
+                    wordBreak: "break-word",
+                  }}
                 >
                   {formatActionSummary(item)}
                 </Text>
@@ -444,7 +511,12 @@ export function WatchdogsPanel({
         const error = watchdogErrorByProcessId[processId];
         const processActive = isProcessRpcStateAvailable(process);
         return (
-          <Card key={processId} radius="md" p="sm" style={{ border: "1px solid var(--card-border)" }}>
+          <Card
+            key={processId}
+            radius="md"
+            p="sm"
+            style={{ border: "1px solid var(--card-border)" }}
+          >
             <Stack gap="xs">
               <Group justify="space-between" align="flex-start">
                 <Stack gap={2}>
@@ -475,15 +547,24 @@ export function WatchdogsPanel({
               {watchdogs.length > 0 ? (
                 <Stack gap={6}>
                   {watchdogs.map((watchdog, watchdogIdx) => {
-                    const watchdogId = String(watchdog.watchdog_id ?? "").trim() || `watchdog_${watchdogIdx}`;
+                    const watchdogId =
+                      String(watchdog.watchdog_id ?? "").trim() || `watchdog_${watchdogIdx}`;
                     const toggleBusyKey = `${processId}:${watchdogId}:toggle`;
                     const toggleBusy = Boolean(watchdogBusyByKey[toggleBusyKey]);
                     const watchdogSummary = summarizeWatchdogRules(watchdog);
-                    const turboSummary = beamlineTurboProtectionSummary(watchdog.rules, watchdog.enabled);
+                    const turboSummary = beamlineTurboProtectionSummary(
+                      watchdog.rules,
+                      watchdog.enabled
+                    );
                     const turboRules = watchdog.rules.filter(isBeamlineTurboRule);
                     const otherRules = watchdog.rules.filter((rule) => !isBeamlineTurboRule(rule));
                     return (
-                      <Card key={`${processId}:${watchdogId}`} p="xs" radius="sm" style={{ border: "1px solid var(--card-border)" }}>
+                      <Card
+                        key={`${processId}:${watchdogId}`}
+                        p="xs"
+                        radius="sm"
+                        style={{ border: "1px solid var(--card-border)" }}
+                      >
                         <Stack gap={6}>
                           <Group justify="space-between" align="flex-start">
                             <Group gap="xs" wrap="wrap">
@@ -498,7 +579,11 @@ export function WatchdogsPanel({
                               checked={Boolean(watchdog.enabled)}
                               disabled={toggleBusy || loading || !watchdogId}
                               onChange={(event) => {
-                                void onToggleWatchdog(processId, watchdogId, event.currentTarget.checked);
+                                void onToggleWatchdog(
+                                  processId,
+                                  watchdogId,
+                                  event.currentTarget.checked
+                                );
                               }}
                             />
                           </Group>
@@ -507,7 +592,11 @@ export function WatchdogsPanel({
                             <Stack gap={4}>
                               <Group gap="xs" wrap="wrap">
                                 <Text size="xs" fw={700}>Beamline turbo protection</Text>
-                                {turboSummary && <Badge variant="light" color={turboSummary.color}>{turboSummary.label}</Badge>}
+                                {turboSummary && (
+                                  <Badge variant="light" color={turboSummary.color}>
+                                    {turboSummary.label}
+                                  </Badge>
+                                )}
                               </Group>
                               <Text size="xs" c="dimmed">
                                 Each Hornet arms independently after pump-down. Any armed Hornet above 1e-2 Torr for 3 fresh samples stops all four beamline turbos.
@@ -530,7 +619,9 @@ export function WatchdogsPanel({
 
                           {otherRules.length > 0 && (
                             <Stack gap={4}>
-                              {turboRules.length > 0 && <Text size="xs" fw={700}>Other protection rules</Text>}
+                              {turboRules.length > 0 && (
+                                <Text size="xs" fw={700}>Other protection rules</Text>
+                              )}
                               {otherRules.map((rule, index) => (
                                 <RuleCard
                                   key={`${processId}:${watchdogId}:${rule.name}`}
@@ -556,7 +647,9 @@ export function WatchdogsPanel({
                   })}
                 </Stack>
               ) : (
-                !loading && !error && <Text size="xs" c="dimmed">No watchdog status available yet.</Text>
+                !loading && !error && (
+                  <Text size="xs" c="dimmed">No watchdog status available yet.</Text>
+                )
               )}
             </Stack>
           </Card>
