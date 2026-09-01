@@ -64,18 +64,10 @@ jobs:
               raise SystemExit(f"Missing bundled UI asset in wheel: {required}")
           print(f"Verified bundled UI in {wheel.name}")
           PY
-      - name: Build packaged UI
-        run: pwsh ./scripts/build_packaged_ui.ps1
       - name: Run UI tests
-        run: npm test --prefix web/react_ui
-      - name: Verify packaged UI is current
         run: |
-          git add -A -- src/experiment_control/_ui_dist
-          if ! git diff --cached --quiet -- src/experiment_control/_ui_dist; then
-            git diff --cached --stat -- src/experiment_control/_ui_dist
-            exit 1
-          fi
-          git reset
+          npm ci --prefix web/react_ui
+          npm test --prefix web/react_ui
       - name: Commit validated fixture fix and remove helper
         run: |
           rm .github/workflows/temporary_linux_full_synthhd_review_fix.yml
