@@ -40,6 +40,10 @@ function isBeamlineTurboRule(rule: WatchdogStatus["rules"][number]): boolean {
   return BEAMLINE_TURBO_RULES.has(String(rule.name ?? ""));
 }
 
+function hasActiveTrip(rule: WatchdogStatus["rules"][number]): boolean {
+  return Boolean(watchdogRuleDetails(rule).active_trip_id);
+}
+
 function formatDuration(value: number | null | undefined): string {
   if (typeof value !== "number" || !Number.isFinite(value)) {
     return "n/a";
@@ -89,7 +93,8 @@ export function watchdogRuleLiveState(rule: WatchdogStatus["rules"][number]): {
   label: string;
   color: string;
 } {
-  if (rule.alarm) {
+  const details = watchdogRuleDetails(rule);
+  if (details.active_trip_id) {
     return {
       label: rule.unknown ? "TRIGGERED · INPUT UNAVAILABLE" : "TRIGGERED",
       color: "red",
@@ -101,11 +106,16 @@ export function watchdogRuleLiveState(rule: WatchdogStatus["rules"][number]): {
   if (rule.last_evaluated_mono == null) {
     return { label: "PENDING", color: "gray" };
   }
-  const details = watchdogRuleDetails(rule);
+  if (details.arm != null && !details.armed) {
+    return { label: "DISARMED", color: "gray" };
+  }
+  if (rule.alarm) {
+    return details.arm != null
+      ? { label: "ARMED · CONFIRMING", color: "orange" }
+      : { label: "CONFIRMING", color: "orange" };
+  }
   if (details.arm != null) {
-    return details.armed
-      ? { label: "ARMED · SAFE", color: "teal" }
-      : { label: "DISARMED", color: "gray" };
+    return { label: "ARMED · SAFE", color: "teal" };
   }
   return { label: "SAFE", color: "teal" };
 }
@@ -134,28 +144,34 @@ export function summarizeWatchdogRules(watchdog: WatchdogStatus): {
   }
   let latched = 0;
   let unknown = 0;
-  let alarm = 0;
+  let triggered = 0;
+  let confirming = 0;
   let pending = 0;
   for (const rule of watchdog.rules) {
     if (rule.latched) {
       latched += 1;
     }
-    if (rule.alarm) {
-      alarm += 1;
+    if (hasActiveTrip(rule)) {
+      triggered += 1;
     } else if (rule.unknown) {
       unknown += 1;
     } else if (rule.last_evaluated_mono == null) {
       pending += 1;
+    } else if (rule.alarm) {
+      confirming += 1;
     }
   }
-  if (alarm > 0) {
-    return { label: `${alarm} triggered`, color: "red" };
+  if (triggered > 0) {
+    return { label: `${triggered} triggered`, color: "red" };
   }
   if (latched > 0) {
     return { label: `${latched} latched`, color: "orange" };
   }
   if (unknown > 0) {
     return { label: `Protection degraded · ${unknown} unavailable`, color: "yellow" };
+  }
+  if (confirming > 0) {
+    return { label: `${confirming} confirming`, color: "orange" };
   }
   if (pending > 0) {
     return { label: `${pending} pending`, color: "gray" };
@@ -164,16 +180,27 @@ export function summarizeWatchdogRules(watchdog: WatchdogStatus): {
 }
 
 export function beamlineTurboProtectionSummary(
-  rules: ReadonlyArray<WatchdogStatus["rules"][number]>
+  rules: ReadonlyArray<WatchdogStatus["rules"][number]>,
+  enabled = true
 ): { label: string; color: string } | null {
   const turboRules = rules.filter(isBeamlineTurboRule);
   if (turboRules.length === 0) {
     return null;
   }
-  const triggered = turboRules.filter((rule) => Boolean(rule.alarm)).length;
-  const unknown = turboRules.filter((rule) => !rule.alarm && Boolean(rule.unknown)).length;
+  if (!enabled) {
+    return { label: "Beamline protection disabled", color: "gray" };
+  }
+  const triggered = turboRules.filter(hasActiveTrip).length;
+  const unknown = turboRules.filter((rule) => !hasActiveTrip(rule) && Boolean(rule.unknown)).length;
+  const confirming = turboRules.filter(
+    (rule) =>
+      !hasActiveTrip(rule) &&
+      !rule.unknown &&
+      Boolean(rule.alarm) &&
+      Boolean(watchdogRuleDetails(rule).armed)
+  ).length;
   const armed = turboRules.filter(
-    (rule) => !rule.alarm && !rule.unknown && Boolean(watchdogRuleDetails(rule).armed)
+    (rule) => !rule.unknown && Boolean(watchdogRuleDetails(rule).armed)
   ).length;
   if (triggered > 0) {
     return { label: "Beamline protection TRIGGERED", color: "red" };
@@ -182,6 +209,12 @@ export function beamlineTurboProtectionSummary(
     return {
       label: `Beamline protection degraded · ${armed}/${turboRules.length} sensors armed`,
       color: "yellow",
+    };
+  }
+  if (confirming > 0) {
+    return {
+      label: `Beamline protection confirming · ${confirming} sensor${confirming === 1 ? "" : "s"}`,
+      color: "orange",
     };
   }
   if (armed === turboRules.length) {
@@ -446,7 +479,7 @@ export function WatchdogsPanel({
                     const toggleBusyKey = `${processId}:${watchdogId}:toggle`;
                     const toggleBusy = Boolean(watchdogBusyByKey[toggleBusyKey]);
                     const watchdogSummary = summarizeWatchdogRules(watchdog);
-                    const turboSummary = beamlineTurboProtectionSummary(watchdog.rules);
+                    const turboSummary = beamlineTurboProtectionSummary(watchdog.rules, watchdog.enabled);
                     const turboRules = watchdog.rules.filter(isBeamlineTurboRule);
                     const otherRules = watchdog.rules.filter((rule) => !isBeamlineTurboRule(rule));
                     return (
