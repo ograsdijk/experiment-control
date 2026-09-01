@@ -266,6 +266,51 @@ class WatchdogActionDispatchTests(unittest.TestCase):
         self.assertFalse(summary["success"])
         self.assertEqual(summary["failed_actions"], 1)
 
+    def test_failed_action_does_not_block_later_shutdown_actions(self) -> None:
+        proc, events = self._make_proc_with_responses(
+            [
+                {"status": "OK"},
+                None,
+                {"status": "OK"},
+                {"status": "OK"},
+            ]
+        )
+        rule = _rule_with_actions(
+            [
+                CommandAction("hipace_rc", "stop", {}, 1.5, 0),
+                CommandAction("hipace_eql", "stop", {}, 1.5, 0),
+                CommandAction("hipace_det", "stop", {}, 1.5, 0),
+                CommandAction("hipace_spb", "stop", {}, 1.5, 0),
+            ]
+        )
+
+        summary = proc._execute_actions(
+            watchdog_id="vacuum-cryo_watchdog",
+            rule=rule,
+            trip_id="trip-partial",
+        )
+
+        started = [
+            payload["command"]["device_id"]
+            for topic, payload in events
+            if topic == "manager.watchdog.action_started"
+        ]
+        self.assertEqual(
+            started,
+            ["hipace_rc", "hipace_eql", "hipace_det", "hipace_spb"],
+        )
+        self.assertFalse(summary["success"])
+        self.assertEqual(summary["action_count"], 4)
+        self.assertEqual(summary["succeeded_actions"], 3)
+        self.assertEqual(summary["failed_actions"], 1)
+        failed = [result for result in summary["actions"] if not result["ok"]]
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(failed[0]["command"]["device_id"], "hipace_eql")
+        self.assertIn(
+            "manager.watchdog.action_chain_completed",
+            [topic for topic, _payload in events],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
