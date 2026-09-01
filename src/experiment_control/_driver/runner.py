@@ -804,6 +804,13 @@ class DeviceRunner:
             or name in {"connect", "disconnect"}
         ):
             return self._rpc_error(req_id, "Invalid member name")
+        if self._members_cache is None:
+            self._refresh_capabilities_cache()
+        spec = (self._members_cache or {}).get(name)
+        if spec is None:
+            return self._rpc_error(req_id, "Unknown member")
+        if not spec.readable:
+            return self._rpc_error(req_id, "Member is not readable")
         try:
             value = getattr(self._device, name)
         except Exception as exc:

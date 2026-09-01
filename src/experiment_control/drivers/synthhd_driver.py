@@ -28,9 +28,7 @@ class SynthHD(_SynthHD):
             "get_temp_compensation_mode",
             "get_lock_status",
             "get_reference_mode",
-            "set_reference_mode",
             "get_reference_frequency",
-            "set_reference_frequency",
         }
     )
 

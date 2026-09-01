@@ -212,6 +212,8 @@ class SynthHDDriverTests(unittest.TestCase):
         self.assertNotIn("reference_mode", advertised)
         self.assertNotIn("trigger", advertised)
         self.assertNotIn("write", advertised)
+        self.assertNotIn("set_reference_mode", advertised)
+        self.assertNotIn("set_reference_frequency", advertised)
 
         runner = object.__new__(DeviceRunner)
         runner._device = driver  # type: ignore[attr-defined]
@@ -221,7 +223,17 @@ class SynthHDDriverTests(unittest.TestCase):
         }
         runner._device_state = DeviceState.OK  # type: ignore[attr-defined]
 
-        for action in ("trigger", "init", "open", "close", "read", "write", "save"):
+        for action in (
+            "trigger",
+            "init",
+            "open",
+            "close",
+            "read",
+            "write",
+            "save",
+            "set_reference_mode",
+            "set_reference_frequency",
+        ):
             with self.subTest(action=action):
                 with self.assertRaisesRegex(NotImplementedError, "not exposed via RPC"):
                     runner.handle_command(action, {})
@@ -230,6 +242,14 @@ class SynthHDDriverTests(unittest.TestCase):
             with self.subTest(name=name):
                 response = runner._rpc_route_set(
                     {"id": name, "params": {"name": name, "value": value}}
+                )
+                self.assertEqual(response["status"], "ERROR")
+                self.assertEqual(response["error"], "Unknown member")
+
+        for name in ("sweep_cont", "reference_mode", "set_reference_mode"):
+            with self.subTest(get_name=name):
+                response = runner._rpc_route_get(
+                    {"id": name, "params": {"name": name}}
                 )
                 self.assertEqual(response["status"], "ERROR")
                 self.assertEqual(response["error"], "Unknown member")
