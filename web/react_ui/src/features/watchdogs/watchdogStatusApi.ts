@@ -32,6 +32,17 @@ export function watchdogRuleDetails(
   return rule as DetailedWatchdogRule;
 }
 
+export function hasActiveWatchdogTrip(
+  rule: WatchdogStatus["rules"][number]
+): boolean {
+  const details = watchdogRuleDetails(rule);
+  // Latched rules intentionally retain active_trip_id after recovery so the
+  // recovery/latch-clear events remain correlated to the original trip. Treat
+  // the id as currently active only while the rule still has a live alarm or
+  // fail-safe unknown condition.
+  return Boolean(details.active_trip_id) && (Boolean(rule.alarm) || Boolean(rule.unknown));
+}
+
 function asString(value: unknown, fallback = ""): string {
   return typeof value === "string" ? value : fallback;
 }
