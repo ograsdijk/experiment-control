@@ -83,6 +83,49 @@ describe("detailed watchdog status normalization", () => {
     expect(watchdog?.rules[0].telemetry?.[0].required).toBe(false);
   });
 
+  it("normalizes the persisted action-chain result", () => {
+    const watchdog = normalizeWatchdogStatusDetailed({
+      watchdog_id: "vacuum-cryo_watchdog",
+      enabled: true,
+      rules: [
+        {
+          name: "eql_pressure_turbos_off",
+          severity: "critical",
+          latched: false,
+          last_action_chain: {
+            trip_id: "trip-partial",
+            state: "completed",
+            success: false,
+            action_count: 4,
+            succeeded_actions: 3,
+            failed_actions: 1,
+            duration_ms: 15.2,
+            actions: [
+              {
+                action_index: 1,
+                command: { device_id: "hipace_eql", action: "stop" },
+                ok: false,
+                attempts: 1,
+                error: "timeout",
+              },
+            ],
+          },
+          telemetry: [],
+          actions: [],
+        },
+      ],
+    });
+
+    const chain = watchdogRuleDetails(watchdog!.rules[0]).last_action_chain;
+    expect(chain?.state).toBe("completed");
+    expect(chain?.success).toBe(false);
+    expect(chain?.succeeded_actions).toBe(3);
+    expect(chain?.failed_actions).toBe(1);
+    expect(chain?.actions[0].command.device_id).toBe("hipace_eql");
+    expect(chain?.actions[0].error).toBe("timeout");
+  });
+
+
   it("distinguishes an active trip from a recovered retained trip id", () => {
     const active = {
       name: "pressure",

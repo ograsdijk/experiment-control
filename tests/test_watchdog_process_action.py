@@ -9,7 +9,9 @@ neon-flow watchdog can pause the sequencer on flow loss.
 from __future__ import annotations
 
 import sys
+import threading
 import unittest
+from concurrent.futures import Future
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +23,7 @@ if str(SRC) not in sys.path:
 from experiment_control.processes.watchdog import (
     CommandAction,
     ProcessAction,
+    RuleState,
     WatchdogProcess,
     WatchdogRule,
     _parse_watchdog_actions,
@@ -310,6 +313,41 @@ class WatchdogActionDispatchTests(unittest.TestCase):
             "manager.watchdog.action_chain_completed",
             [topic for topic, _payload in events],
         )
+
+    def test_completed_action_chain_is_persisted_in_rule_state(self) -> None:
+        proc = object.__new__(WatchdogProcess)
+        key = ("wd1", "r1")
+        proc._states = {key: RuleState(last_action_chain={"trip_id": "trip-1", "state": "running"})}
+        proc._inflight_action_keys = {key}
+        proc._inflight_lock = threading.Lock()
+        proc._publish_event = lambda *_a, **_k: None  # type: ignore[method-assign]
+
+        future: Future[dict] = Future()
+        future.set_result(
+            {
+                "trip_id": "trip-1",
+                "success": False,
+                "action_count": 4,
+                "succeeded_actions": 3,
+                "failed_actions": 1,
+                "duration_ms": 12.5,
+                "actions": [
+                    {"command": {"device_id": "hipace_eql", "action": "stop"}, "ok": False}
+                ],
+            }
+        )
+
+        proc._on_action_chain_done(future, key, "trip-1")
+
+        self.assertNotIn(key, proc._inflight_action_keys)
+        result = proc._states[key].last_action_chain
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result["state"], "completed")
+        self.assertFalse(result["success"])
+        self.assertEqual(result["succeeded_actions"], 3)
+        self.assertEqual(result["failed_actions"], 1)
+
 
 
 if __name__ == "__main__":

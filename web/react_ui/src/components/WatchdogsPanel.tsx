@@ -6,6 +6,7 @@ import {
   isWatchdogRuleConfirming,
   watchdogRuleDetails,
   type DetailedWatchdogRule,
+  type WatchdogActionChainStatus,
 } from "../features/watchdogs/watchdogStatusApi";
 import type {
   ConditionEvaluationTrace,
@@ -162,6 +163,50 @@ export function confirmationProgress(rule: WatchdogStatus["rules"][number]): {
     target: confirmation.consecutive_samples,
   };
 }
+
+function actionCommandTarget(command: Record<string, unknown>): string {
+  const action = typeof command.action === "string" ? command.action : "action";
+  if (typeof command.device_id === "string" && command.device_id) {
+    return `${command.device_id}.${action}`;
+  }
+  if (typeof command.process_id === "string" && command.process_id) {
+    return `${command.process_id}:${action}`;
+  }
+  return action;
+}
+
+export function actionChainPresentation(
+  rule: WatchdogStatus["rules"][number]
+): { label: string; color: string; failedTargets: string[] } | null {
+  const chain: WatchdogActionChainStatus | null | undefined =
+    watchdogRuleDetails(rule).last_action_chain;
+  if (!chain) {
+    return null;
+  }
+  const noun = isBeamlineTurboRule(rule) ? "SHUTDOWN" : "ACTION";
+  if (chain.state === "running") {
+    return { label: `${noun} RUNNING`, color: "blue", failedTargets: [] };
+  }
+  const failedTargets = chain.actions
+    .filter((item) => !item.ok)
+    .map((item) => actionCommandTarget(item.command));
+  if (chain.state === "error") {
+    return { label: `LAST ${noun} ERROR`, color: "red", failedTargets };
+  }
+  if (chain.success) {
+    return {
+      label: `LAST ${noun} ${chain.succeeded_actions}/${chain.action_count} OK`,
+      color: "teal",
+      failedTargets: [],
+    };
+  }
+  return {
+    label: `LAST ${noun} PARTIAL · ${chain.succeeded_actions}/${chain.action_count}`,
+    color: "red",
+    failedTargets,
+  };
+}
+
 
 export function summarizeWatchdogRules(watchdog: WatchdogStatus): {
   label: string;
@@ -384,6 +429,7 @@ function RuleCard({
   const action = operationalAction(rule);
   const pressure = isBeamlineTurboRule(rule) ? snapshotValue(rule, "p") : null;
   const turboStateIncomplete = hasIncompleteBeamlineTurboState(rule);
+  const actionChain = actionChainPresentation(rule);
 
   return (
     <Card p={6} radius="sm" style={{ border: "1px solid var(--card-border)" }}>
@@ -392,6 +438,9 @@ function RuleCard({
           <Group gap="xs" wrap="wrap">
             <Text size="xs" fw={600}>{ruleName}</Text>
             <Badge variant="light" color={ruleState.color}>{ruleState.label}</Badge>
+            {actionChain && (
+              <Badge variant="light" color={actionChain.color}>{actionChain.label}</Badge>
+            )}
             {latched && (
               <Badge variant="light" color="orange">Latched · acknowledge</Badge>
             )}
@@ -414,6 +463,11 @@ function RuleCard({
           {turboStateIncomplete && (
             <Text size="xs" c="yellow">
               One or more turbo-state inputs are unavailable; this rule will not arm until at least one running turbo is positively observed. An already-armed rule is not affected.
+            </Text>
+          )}
+          {actionChain && actionChain.failedTargets.length > 0 && (
+            <Text size="xs" c="red">
+              Failed target{actionChain.failedTargets.length === 1 ? "" : "s"}: {actionChain.failedTargets.join(", ")}
             </Text>
           )}
           {action && <Text size="xs" fw={500}>{action}</Text>}

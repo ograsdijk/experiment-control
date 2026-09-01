@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { WatchdogStatus } from "../types";
 import {
+  actionChainPresentation,
   beamlineTurboProtectionSummary,
   confirmationProgress,
   hasIncompleteBeamlineTurboState,
@@ -247,6 +248,36 @@ describe("watchdog status presentation", () => {
       color: "teal",
     });
   });
+
+  it("retains a partial global shutdown result and identifies the failed turbo", () => {
+    const rule = turboRule("eql_pressure_turbos_off", {
+      armed: true,
+      last_action_chain: {
+        trip_id: "trip-1",
+        state: "completed",
+        success: false,
+        action_count: 4,
+        succeeded_actions: 3,
+        failed_actions: 1,
+        duration_ms: 12.5,
+        actions: [
+          {
+            action_index: 1,
+            command: { device_id: "hipace_eql", action: "stop" },
+            ok: false,
+            attempts: 1,
+          },
+        ],
+      },
+    });
+
+    expect(actionChainPresentation(rule)).toEqual({
+      label: "LAST SHUTDOWN PARTIAL · 3/4",
+      color: "red",
+      failedTargets: ["hipace_eql.stop"],
+    });
+  });
+
 
   it("shows the beamline protection as disabled when the watchdog is disabled", () => {
     const rules = [

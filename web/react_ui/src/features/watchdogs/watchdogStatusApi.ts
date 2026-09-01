@@ -19,11 +19,32 @@ export type WatchdogConfirmationStatus = {
   progress: Record<string, WatchdogConfirmationProgress>;
 };
 
+export type WatchdogActionChainAction = {
+  action_index: number;
+  command: Record<string, unknown>;
+  ok: boolean;
+  attempts: number;
+  error?: unknown;
+};
+
+export type WatchdogActionChainStatus = {
+  trip_id: string | null;
+  state: "running" | "completed" | "error";
+  success: boolean | null;
+  action_count: number;
+  succeeded_actions: number;
+  failed_actions: number;
+  duration_ms: number | null;
+  error?: unknown;
+  actions: WatchdogActionChainAction[];
+};
+
 export type DetailedWatchdogRule = WatchdogStatus["rules"][number] & {
   arm?: WatchdogArmStatus | null;
   armed?: boolean;
   confirmation?: WatchdogConfirmationStatus | null;
   active_trip_id?: string | null;
+  last_action_chain?: WatchdogActionChainStatus | null;
 };
 
 export function watchdogRuleDetails(
@@ -170,6 +191,45 @@ function normalizeConfirmation(raw: unknown): WatchdogConfirmationStatus | null 
   };
 }
 
+function normalizeActionChain(raw: unknown): WatchdogActionChainStatus | null {
+  const obj = asRecord(raw);
+  if (!obj) {
+    return null;
+  }
+  const actions = (Array.isArray(obj.actions) ? obj.actions : [])
+    .map((rawAction) => {
+      const action = asRecord(rawAction);
+      if (!action) {
+        return null;
+      }
+      return {
+        action_index: Math.max(0, Math.trunc(asNumber(action.action_index, 0))),
+        command: asRecord(action.command) ?? {},
+        ok: asBoolean(action.ok, false),
+        attempts: Math.max(0, Math.trunc(asNumber(action.attempts, 0))),
+        error: action.error,
+      } as WatchdogActionChainAction;
+    })
+    .filter((item): item is WatchdogActionChainAction => item !== null);
+  const stateRaw = asString(obj.state, "completed");
+  const state: WatchdogActionChainStatus["state"] =
+    stateRaw === "running" || stateRaw === "error" ? stateRaw : "completed";
+  const success = obj.success == null ? null : asBoolean(obj.success, false);
+  const duration = asNumber(obj.duration_ms, Number.NaN);
+  return {
+    trip_id: asString(obj.trip_id, "") || null,
+    state,
+    success,
+    action_count: Math.max(0, Math.trunc(asNumber(obj.action_count, actions.length))),
+    succeeded_actions: Math.max(0, Math.trunc(asNumber(obj.succeeded_actions, 0))),
+    failed_actions: Math.max(0, Math.trunc(asNumber(obj.failed_actions, 0))),
+    duration_ms: Number.isFinite(duration) ? Math.max(0, duration) : null,
+    error: obj.error,
+    actions,
+  };
+}
+
+
 export function normalizeWatchdogStatusDetailed(raw: unknown): WatchdogStatus | null {
   const obj = asRecord(raw);
   if (!obj) {
@@ -261,6 +321,7 @@ export function normalizeWatchdogStatusDetailed(raw: unknown): WatchdogStatus | 
         armed: asBoolean(ruleObj.armed, false),
         confirmation: normalizeConfirmation(ruleObj.confirmation),
         active_trip_id: asString(ruleObj.active_trip_id, "") || null,
+        last_action_chain: normalizeActionChain(ruleObj.last_action_chain),
       } as DetailedWatchdogRule;
       return rule;
     })

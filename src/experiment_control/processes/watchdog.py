@@ -234,6 +234,9 @@ class RuleState:
     condition_evaluation: Json | None = None
     active_trip_id: str | None = None
     active_trip_recovered: bool = False
+    # Most recent remediation chain. This intentionally survives recovery/latch
+    # clearing so operators can see whether the last safety action fully ran.
+    last_action_chain: Json | None = None
     # Per-alias state permits an ``any_sample_aliases`` guard to require a
     # consecutive streak from one source, rather than combining gauges.
     confirmation: Json | None = None
@@ -1488,6 +1491,16 @@ class WatchdogProcess(ManagedProcessBase):
         key: tuple[str, str],
         trip_id: str,
     ) -> None:
+        state = self._states[key]
+        state.last_action_chain = {
+            "trip_id": trip_id,
+            "state": "running",
+            "success": None,
+            "action_count": len(rule.actions),
+            "succeeded_actions": 0,
+            "failed_actions": 0,
+            "actions": [],
+        }
         try:
             future = self._action_executor.submit(
                 self._execute_actions,
@@ -1496,9 +1509,21 @@ class WatchdogProcess(ManagedProcessBase):
                 trip_id=trip_id,
             )
         except RuntimeError:
-            # Executor was shut down (e.g. during graceful stop). Drop
-            # the in-flight marker so a future tick can re-trigger
-            # cleanly if the watchdog comes back online.
+            # Executor was shut down (e.g. during graceful stop). Persist the
+            # failed submission so status does not misleadingly retain an older
+            # successful action chain.
+            state.last_action_chain = {
+                "trip_id": trip_id,
+                "state": "error",
+                "success": False,
+                "action_count": len(rule.actions),
+                "succeeded_actions": 0,
+                "failed_actions": len(rule.actions),
+                "actions": [],
+                "error": "action executor is unavailable",
+            }
+            # Drop the in-flight marker so a future tick can re-trigger cleanly
+            # if the watchdog comes back online.
             with self._inflight_lock:
                 self._inflight_action_keys.discard(key)
             self._publish_event(
@@ -1521,15 +1546,33 @@ class WatchdogProcess(ManagedProcessBase):
     def _on_action_chain_done(
         self, future: Future[Json], key: tuple[str, str], trip_id: str
     ) -> None:
-        with self._inflight_lock:
-            self._inflight_action_keys.discard(key)
-        # Surface a worker-thread exception that escaped _execute_actions
-        # (it catches per-action failures, so this is an unexpected
-        # internal error path). Publish via the manager event bus so the
-        # supervisor's log captures it.
+        # Keep the rule marked in-flight until its result has been persisted.
+        # Otherwise a new trip can be submitted in the tiny window between
+        # removing the marker and recording the previous completion, allowing
+        # the older callback to overwrite the new chain's "running" state.
+        state = self._states.get(key)
         try:
-            future.result()
+            summary = future.result()
+            if (
+                state is not None
+                and isinstance(state.last_action_chain, dict)
+                and state.last_action_chain.get("trip_id") == trip_id
+            ):
+                state.last_action_chain = {**summary, "state": "completed"}
         except Exception as exc:
+            if (
+                state is not None
+                and isinstance(state.last_action_chain, dict)
+                and state.last_action_chain.get("trip_id") == trip_id
+            ):
+                previous = state.last_action_chain
+                state.last_action_chain = {
+                    **previous,
+                    "state": "error",
+                    "success": False,
+                    "failed_actions": int(previous.get("action_count", 0)),
+                    "error": repr(exc),
+                }
             try:
                 self._publish_event(
                     "manager.watchdog.action_chain_error",
@@ -1543,6 +1586,9 @@ class WatchdogProcess(ManagedProcessBase):
                 )
             except Exception:
                 pass
+        finally:
+            with self._inflight_lock:
+                self._inflight_action_keys.discard(key)
 
     def _make_condition_error_callback(
         self, *, watchdog_id: str, rule_name: str
@@ -1722,6 +1768,7 @@ class WatchdogProcess(ManagedProcessBase):
                         if state.last_trigger_mono is None
                         else max(0.0, now_mono - state.last_trigger_mono),
                         "active_trip_id": state.active_trip_id,
+                        "last_action_chain": state.last_action_chain,
                     }
                 )
             watchdogs.append(
