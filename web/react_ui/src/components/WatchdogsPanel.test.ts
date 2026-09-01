@@ -105,7 +105,7 @@ describe("watchdog status presentation", () => {
     });
   });
 
-  it("shows a high condition before arming as disarmed", () => {
+  it("shows a high condition before arming as disarmed without global confirming attention", () => {
     const rule = watchdog({
       alarm: true,
       unknown: false,
@@ -117,6 +117,10 @@ describe("watchdog status presentation", () => {
     expect(watchdogRuleLiveState(rule)).toEqual({
       label: "DISARMED",
       color: "gray",
+    });
+    expect(summarizeWatchdogRules(watchdog(rule))).toEqual({
+      label: "All safe",
+      color: "teal",
     });
   });
 
@@ -210,6 +214,19 @@ describe("watchdog status presentation", () => {
     expect(beamlineTurboProtectionSummary([rc, eql, det])).toEqual({
       label: "Beamline arming degraded · 2/3 sensors armed",
       color: "yellow",
+    });
+  });
+
+  it("does not call a pending turbo rule degraded before the first evaluation", () => {
+    const rc = turboRule("rc_pressure_turbos_off", {
+      last_evaluated_mono: null,
+      snapshot: null,
+    });
+
+    expect(hasIncompleteBeamlineTurboState(rc)).toBe(false);
+    expect(watchdogRuleLiveState(rc)).toEqual({
+      label: "PENDING",
+      color: "gray",
     });
   });
 
