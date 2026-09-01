@@ -2,7 +2,6 @@ import { notifications } from "@mantine/notifications";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   clearWatchdogLatch,
-  fetchWatchdogStatus,
   setWatchdogEnabled,
 } from "../../api";
 import {
@@ -14,6 +13,7 @@ import type {
   ProcessStatus,
   WatchdogStatus,
 } from "../../types";
+import { fetchDetailedWatchdogStatus } from "./watchdogStatusApi";
 
 type UseWatchdogsControllerArgs = {
   safetyOpen: boolean;
@@ -151,7 +151,7 @@ export function useWatchdogsController({
           });
           return;
         }
-        const watchdogs = await fetchWatchdogStatus(processId);
+        const watchdogs = await fetchDetailedWatchdogStatus(processId);
         setWatchdogStatusByProcessId((prev) => ({
           ...prev,
           [processId]: watchdogs,
