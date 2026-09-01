@@ -15,11 +15,13 @@ from .discovery import (
     _jsonable_default,
     _jsonable_value,
     _member_to_json,
+    _parse_literal_annotation,
     _parse_simple_annotation,
     discover_capabilities,
     discover_capabilities_for_class,
     discover_device_members,
     discover_stream_members,
+    rpc_hidden_members,
 )
 from .loading import Device, import_class
 from .plans import (
@@ -713,6 +715,9 @@ class DeviceRunner:
         if action in {"connect", "disconnect"}:
             raise NotImplementedError(f"Command {action!r} is not allowed via RPC")
 
+        if action in rpc_hidden_members(self._device):
+            raise NotImplementedError(f"Command {action!r} is not exposed via RPC")
+
         if action in self._stream_rpc:
             return self._stream_rpc[action](**params)
 
@@ -1066,6 +1071,18 @@ class DeviceRunner:
             coerced = dict(params)
             for param in spec.params:
                 if param.name in coerced:
+                    literal_values = _parse_literal_annotation(param.annotation)
+                    if literal_values is not None:
+                        value = coerced[param.name]
+                        if not any(
+                            type(value) is type(allowed) and value == allowed
+                            for allowed in literal_values
+                        ):
+                            raise TypeError(
+                                f"Bad parameters for command {action!r}: {param.name} "
+                                f"must be one of {literal_values!r}"
+                            )
+                        continue
                     kind = _parse_simple_annotation(param.annotation)
                     if kind is None:
                         continue
