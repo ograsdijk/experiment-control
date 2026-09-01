@@ -43,6 +43,24 @@ export function hasActiveWatchdogTrip(
   return Boolean(details.active_trip_id) && (Boolean(rule.alarm) || Boolean(rule.unknown));
 }
 
+export function isWatchdogRuleConfirming(
+  rule: WatchdogStatus["rules"][number]
+): boolean {
+  if (
+    !rule.alarm ||
+    rule.unknown ||
+    rule.last_evaluated_mono == null ||
+    hasActiveWatchdogTrip(rule)
+  ) {
+    return false;
+  }
+  const details = watchdogRuleDetails(rule);
+  // An armed rule can be building stable/confirmation evidence. For a rule
+  // with an arm gate, a true raw alarm while DISARMED is expected during
+  // initial pump-down and must not be presented as an imminent trip.
+  return details.arm == null || Boolean(details.armed);
+}
+
 function asString(value: unknown, fallback = ""): string {
   return typeof value === "string" ? value : fallback;
 }
