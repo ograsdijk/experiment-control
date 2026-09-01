@@ -3,6 +3,7 @@ import type { WatchdogStatus } from "../types";
 import {
   beamlineTurboProtectionSummary,
   confirmationProgress,
+  hasIncompleteBeamlineTurboState,
   summarizeWatchdogRules,
   watchdogRuleLiveState,
 } from "./WatchdogsPanel";
@@ -37,6 +38,12 @@ function turboRule(
     last_evaluated_mono: 10,
     arm: { condition: { lt: ["${p.value}", 5e-3] } },
     armed: false,
+    snapshot: {
+      rc_on: { ok: true, value: false },
+      eql_on: { ok: true, value: false },
+      det_on: { ok: true, value: false },
+      spb_on: { ok: true, value: false },
+    },
     ...rule,
   } as DetailedWatchdogRule;
 }
@@ -56,6 +63,25 @@ describe("watchdog status presentation", () => {
     expect(summarizeWatchdogRules(watchdog(rule))).toEqual({
       label: "1 triggered",
       color: "red",
+    });
+  });
+
+  it("shows a recovered retained trip id as latched, not triggered", () => {
+    const rule = watchdog({
+      alarm: false,
+      unknown: false,
+      latched: true,
+      last_evaluated_mono: 10,
+      active_trip_id: "trip-recovered",
+    }).rules[0];
+
+    expect(watchdogRuleLiveState(rule)).toEqual({
+      label: "RECOVERED · LATCHED",
+      color: "orange",
+    });
+    expect(summarizeWatchdogRules(watchdog(rule))).toEqual({
+      label: "1 latched",
+      color: "orange",
     });
   });
 
@@ -161,6 +187,47 @@ describe("watchdog status presentation", () => {
     expect(beamlineTurboProtectionSummary(rules)).toEqual({
       label: "Beamline protection degraded · 2/3 sensors armed",
       color: "yellow",
+    });
+  });
+
+  it("shows incomplete turbo-state telemetry as degraded arming", () => {
+    const rc = turboRule("rc_pressure_turbos_off", {
+      snapshot: {
+        rc_on: { ok: false, value: null },
+        eql_on: { ok: true, value: false },
+        det_on: { ok: true, value: false },
+        spb_on: { ok: true, value: false },
+      },
+    });
+    const eql = turboRule("eql_pressure_turbos_off", { armed: true });
+    const det = turboRule("det_pressure_turbos_off", { armed: true });
+
+    expect(hasIncompleteBeamlineTurboState(rc)).toBe(true);
+    expect(watchdogRuleLiveState(rc)).toEqual({
+      label: "DISARMED · TURBO STATE INCOMPLETE",
+      color: "yellow",
+    });
+    expect(beamlineTurboProtectionSummary([rc, eql, det])).toEqual({
+      label: "Beamline arming degraded · 2/3 sensors armed",
+      color: "yellow",
+    });
+  });
+
+  it("does not degrade an already-armed rule when turbo-state telemetry disappears", () => {
+    const rc = turboRule("rc_pressure_turbos_off", {
+      armed: true,
+      snapshot: {
+        rc_on: { ok: false, value: null },
+        eql_on: { ok: false, value: null },
+        det_on: { ok: false, value: null },
+        spb_on: { ok: false, value: null },
+      },
+    });
+
+    expect(hasIncompleteBeamlineTurboState(rc)).toBe(false);
+    expect(watchdogRuleLiveState(rc)).toEqual({
+      label: "ARMED · SAFE",
+      color: "teal",
     });
   });
 
