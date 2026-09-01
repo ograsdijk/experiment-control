@@ -1324,9 +1324,16 @@ class WatchdogProcess(ManagedProcessBase):
                 if action.timeout_s is not None:
                     timeout_ms = max(1, int(float(action.timeout_s) * 1000))
                 attempt_started_mono = time.monotonic()
-                resp = self._require_manager().call(req, timeout_ms=timeout_ms)
+                call_error: str | None = None
+                try:
+                    resp = self._require_manager().call(req, timeout_ms=timeout_ms)
+                except Exception as exc:
+                    # A transport/client exception from one target must be handled
+                    # like a failed attempt, not abort the remaining safety actions.
+                    resp = None
+                    call_error = repr(exc)
                 duration_ms = (time.monotonic() - attempt_started_mono) * 1000.0
-                if resp is not None and _resp_ok(resp):
+                if call_error is None and resp is not None and _resp_ok(resp):
                     self._publish_action_event(
                         "manager.watchdog.action_succeeded",
                         trip_id=trip_id,
@@ -1348,7 +1355,11 @@ class WatchdogProcess(ManagedProcessBase):
                         }
                     )
                     break
-                error = resp if resp is not None else "timeout"
+                error = (
+                    call_error
+                    if call_error is not None
+                    else (resp if resp is not None else "timeout")
+                )
                 final_attempt = attempt == total_attempts
                 self._publish_action_event(
                     (
