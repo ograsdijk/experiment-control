@@ -1,7 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
+  hasActiveWatchdogTrip,
+  isWatchdogRuleConfirming,
   normalizeWatchdogStatusDetailed,
   watchdogRuleDetails,
+  type DetailedWatchdogRule,
 } from "./watchdogStatusApi";
 
 describe("detailed watchdog status normalization", () => {
@@ -78,5 +81,39 @@ describe("detailed watchdog status normalization", () => {
     });
 
     expect(watchdog?.rules[0].telemetry?.[0].required).toBe(false);
+  });
+
+  it("distinguishes an active trip from a recovered retained trip id", () => {
+    const active = {
+      name: "pressure",
+      alarm: true,
+      unknown: false,
+      active_trip_id: "trip-active",
+    } as DetailedWatchdogRule;
+    const recovered = {
+      name: "pressure",
+      alarm: false,
+      unknown: false,
+      active_trip_id: "trip-recovered",
+    } as DetailedWatchdogRule;
+
+    expect(hasActiveWatchdogTrip(active)).toBe(true);
+    expect(hasActiveWatchdogTrip(recovered)).toBe(false);
+  });
+
+  it("only calls an armed gated alarm confirming", () => {
+    const armed = {
+      name: "pressure",
+      alarm: true,
+      unknown: false,
+      last_evaluated_mono: 10,
+      arm: { condition: {} },
+      armed: true,
+      active_trip_id: null,
+    } as DetailedWatchdogRule;
+    const disarmed = { ...armed, armed: false } as DetailedWatchdogRule;
+
+    expect(isWatchdogRuleConfirming(armed)).toBe(true);
+    expect(isWatchdogRuleConfirming(disarmed)).toBe(false);
   });
 });
