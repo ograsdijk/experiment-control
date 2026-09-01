@@ -659,6 +659,15 @@ class WatchdogRuleEvalTests(unittest.TestCase):
                     "right": 1e-5,
                 },
                 active_trip_id="trip-status",
+                last_action_chain={
+                    "trip_id": "trip-status",
+                    "state": "completed",
+                    "success": False,
+                    "action_count": 4,
+                    "succeeded_actions": 3,
+                    "failed_actions": 1,
+                    "actions": [],
+                },
             )
         }
 
@@ -696,6 +705,18 @@ class WatchdogRuleEvalTests(unittest.TestCase):
         self.assertFalse(rule.get("unknown"))
         self.assertEqual(rule.get("last_evaluated_mono"), 12.0)
         self.assertEqual(rule.get("active_trip_id"), "trip-status")
+        self.assertEqual(
+            rule.get("last_action_chain"),
+            {
+                "trip_id": "trip-status",
+                "state": "completed",
+                "success": False,
+                "action_count": 4,
+                "succeeded_actions": 3,
+                "failed_actions": 1,
+                "actions": [],
+            },
+        )
         self.assertEqual(rule.get("snapshot"), {"sys_p": {"value": 1e-6, "ok": True}})
         self.assertEqual(
             rule.get("condition_evaluation"),

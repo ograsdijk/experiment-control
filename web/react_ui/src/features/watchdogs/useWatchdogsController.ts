@@ -2,7 +2,6 @@ import { notifications } from "@mantine/notifications";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   clearWatchdogLatch,
-  fetchWatchdogStatus,
   setWatchdogEnabled,
 } from "../../api";
 import {
@@ -14,6 +13,12 @@ import type {
   ProcessStatus,
   WatchdogStatus,
 } from "../../types";
+import {
+  fetchDetailedWatchdogStatus,
+  hasActiveWatchdogTrip,
+  hasWatchdogActionFailure,
+  isWatchdogRuleConfirming,
+} from "./watchdogStatusApi";
 
 type UseWatchdogsControllerArgs = {
   safetyOpen: boolean;
@@ -32,6 +37,8 @@ type WatchdogButtonSummary = {
   color: string;
   activeLatchCount: number;
   activeAlarmCount: number;
+  confirmingRuleCount: number;
+  actionFailureRuleCount: number;
   unknownRuleCount: number;
   pendingRuleCount: number;
   attentionRuleCount: number;
@@ -151,7 +158,7 @@ export function useWatchdogsController({
           });
           return;
         }
-        const watchdogs = await fetchWatchdogStatus(processId);
+        const watchdogs = await fetchDetailedWatchdogStatus(processId);
         setWatchdogStatusByProcessId((prev) => ({
           ...prev,
           [processId]: watchdogs,
@@ -366,6 +373,8 @@ export function useWatchdogsController({
 
     let activeLatchCount = 0;
     let activeAlarmCount = 0;
+    let confirmingRuleCount = 0;
+    let actionFailureRuleCount = 0;
     let unknownRuleCount = 0;
     let pendingRuleCount = 0;
     let attentionRuleCount = 0;
@@ -394,23 +403,31 @@ export function useWatchdogsController({
           continue;
         }
         for (const rule of watchdog.rules ?? []) {
+          const activeTrip = hasActiveWatchdogTrip(rule);
+          const confirming = isWatchdogRuleConfirming(rule);
+          const actionFailure = hasWatchdogActionFailure(rule);
           if (rule.latched) {
             activeLatchCount += 1;
           }
-          if (rule.alarm) {
+          if (activeTrip) {
             activeAlarmCount += 1;
-          }
-          if (rule.unknown) {
+          } else if (rule.unknown) {
             unknownRuleCount += 1;
-          }
-          if (rule.last_evaluated_mono == null) {
+          } else if (rule.last_evaluated_mono == null) {
             pendingRuleCount += 1;
+          } else if (confirming) {
+            confirmingRuleCount += 1;
+          }
+          if (actionFailure) {
+            actionFailureRuleCount += 1;
           }
           if (
-            rule.alarm ||
+            activeTrip ||
             rule.latched ||
             rule.unknown ||
-            rule.last_evaluated_mono == null
+            rule.last_evaluated_mono == null ||
+            confirming ||
+            actionFailure
           ) {
             attentionRuleCount += 1;
           }
@@ -425,9 +442,11 @@ export function useWatchdogsController({
         ? "orange"
         : unknownRuleCount > 0
           ? "yellow"
-          : hasTrackedWatchdogs
-            ? "teal"
-            : "gray";
+          : confirmingRuleCount > 0 || actionFailureRuleCount > 0
+            ? "orange"
+            : hasTrackedWatchdogs
+              ? "teal"
+              : "gray";
     const labelSuffix = attentionRuleCount > 0 ? ` (${attentionRuleCount})` : "";
     const tooltip = hasError
       ? `Watchdog issue: ${errorSources[0] ?? "unknown"}`
@@ -440,7 +459,13 @@ export function useWatchdogsController({
             ? `${activeLatchCount} latched rule${activeLatchCount === 1 ? "" : "s"}`
             : null,
           unknownRuleCount > 0
-            ? `${unknownRuleCount} unknown rule${unknownRuleCount === 1 ? "" : "s"}`
+            ? `${unknownRuleCount} unavailable rule${unknownRuleCount === 1 ? "" : "s"}`
+            : null,
+          confirmingRuleCount > 0
+            ? `${confirmingRuleCount} confirming rule${confirmingRuleCount === 1 ? "" : "s"}`
+            : null,
+          actionFailureRuleCount > 0
+            ? `${actionFailureRuleCount} rule${actionFailureRuleCount === 1 ? "" : "s"} with incomplete last action`
             : null,
           pendingRuleCount > 0
             ? `${pendingRuleCount} pending rule${pendingRuleCount === 1 ? "" : "s"}`
@@ -456,6 +481,8 @@ export function useWatchdogsController({
       color,
       activeLatchCount,
       activeAlarmCount,
+      confirmingRuleCount,
+      actionFailureRuleCount,
       unknownRuleCount,
       pendingRuleCount,
       attentionRuleCount,

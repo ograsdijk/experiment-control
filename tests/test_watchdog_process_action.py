@@ -9,7 +9,9 @@ neon-flow watchdog can pause the sequencer on flow loss.
 from __future__ import annotations
 
 import sys
+import threading
 import unittest
+from concurrent.futures import Future
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +23,7 @@ if str(SRC) not in sys.path:
 from experiment_control.processes.watchdog import (
     CommandAction,
     ProcessAction,
+    RuleState,
     WatchdogProcess,
     WatchdogRule,
     _parse_watchdog_actions,
@@ -118,7 +121,7 @@ class WatchdogActionDispatchTests(unittest.TestCase):
         return proc, sent
 
     def _make_proc_with_responses(
-        self, responses: list[dict[str, Any] | None]
+        self, responses: list[dict[str, Any] | None | BaseException]
     ) -> tuple[WatchdogProcess, list[tuple[str, dict[str, Any]]]]:
         proc = object.__new__(WatchdogProcess)
         proc._process_id = "watchdog-test"  # type: ignore[attr-defined]
@@ -128,7 +131,10 @@ class WatchdogActionDispatchTests(unittest.TestCase):
         class _FakeManager:
             def call(self, _req: dict, timeout_ms: int | None = None) -> dict | None:
                 del timeout_ms
-                return remaining.pop(0)
+                response = remaining.pop(0)
+                if isinstance(response, BaseException):
+                    raise response
+                return response
 
         proc._require_manager = lambda: _FakeManager()  # type: ignore[method-assign]
         proc._publish_event = (  # type: ignore[method-assign]
@@ -265,6 +271,126 @@ class WatchdogActionDispatchTests(unittest.TestCase):
         self.assertEqual(topics.count("manager.watchdog.action_failed"), 1)
         self.assertFalse(summary["success"])
         self.assertEqual(summary["failed_actions"], 1)
+
+    def test_failed_action_does_not_block_later_shutdown_actions(self) -> None:
+        proc, events = self._make_proc_with_responses(
+            [
+                {"status": "OK"},
+                None,
+                {"status": "OK"},
+                {"status": "OK"},
+            ]
+        )
+        rule = _rule_with_actions(
+            [
+                CommandAction("hipace_rc", "stop", {}, 1.5, 0),
+                CommandAction("hipace_eql", "stop", {}, 1.5, 0),
+                CommandAction("hipace_det", "stop", {}, 1.5, 0),
+                CommandAction("hipace_spb", "stop", {}, 1.5, 0),
+            ]
+        )
+
+        summary = proc._execute_actions(
+            watchdog_id="vacuum-cryo_watchdog",
+            rule=rule,
+            trip_id="trip-partial",
+        )
+
+        started = [
+            payload["command"]["device_id"]
+            for topic, payload in events
+            if topic == "manager.watchdog.action_started"
+        ]
+        self.assertEqual(
+            started,
+            ["hipace_rc", "hipace_eql", "hipace_det", "hipace_spb"],
+        )
+        self.assertFalse(summary["success"])
+        self.assertEqual(summary["action_count"], 4)
+        self.assertEqual(summary["succeeded_actions"], 3)
+        self.assertEqual(summary["failed_actions"], 1)
+        failed = [result for result in summary["actions"] if not result["ok"]]
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(failed[0]["command"]["device_id"], "hipace_eql")
+        self.assertIn(
+            "manager.watchdog.action_chain_completed",
+            [topic for topic, _payload in events],
+        )
+
+    def test_manager_exception_does_not_block_later_shutdown_actions(self) -> None:
+        proc, events = self._make_proc_with_responses(
+            [
+                {"status": "OK"},
+                RuntimeError("manager socket failed"),
+                {"status": "OK"},
+                {"status": "OK"},
+            ]
+        )
+        rule = _rule_with_actions(
+            [
+                CommandAction("hipace_rc", "stop", {}, 1.5, 0),
+                CommandAction("hipace_eql", "stop", {}, 1.5, 0),
+                CommandAction("hipace_det", "stop", {}, 1.5, 0),
+                CommandAction("hipace_spb", "stop", {}, 1.5, 0),
+            ]
+        )
+
+        summary = proc._execute_actions(
+            watchdog_id="vacuum-cryo_watchdog",
+            rule=rule,
+            trip_id="trip-exception",
+        )
+
+        started = [
+            payload["command"]["device_id"]
+            for topic, payload in events
+            if topic == "manager.watchdog.action_started"
+        ]
+        self.assertEqual(
+            started,
+            ["hipace_rc", "hipace_eql", "hipace_det", "hipace_spb"],
+        )
+        self.assertFalse(summary["success"])
+        self.assertEqual(summary["succeeded_actions"], 3)
+        self.assertEqual(summary["failed_actions"], 1)
+        failed = [result for result in summary["actions"] if not result["ok"]]
+        self.assertEqual(failed[0]["command"]["device_id"], "hipace_eql")
+        self.assertIn("manager socket failed", str(failed[0]["error"]))
+
+    def test_completed_action_chain_is_persisted_in_rule_state(self) -> None:
+        proc = object.__new__(WatchdogProcess)
+        key = ("wd1", "r1")
+        proc._states = {key: RuleState(last_action_chain={"trip_id": "trip-1", "state": "running"})}
+        proc._inflight_action_keys = {key}
+        proc._inflight_lock = threading.Lock()
+        proc._publish_event = lambda *_a, **_k: None  # type: ignore[method-assign]
+
+        future: Future[dict] = Future()
+        future.set_result(
+            {
+                "trip_id": "trip-1",
+                "success": False,
+                "action_count": 4,
+                "succeeded_actions": 3,
+                "failed_actions": 1,
+                "duration_ms": 12.5,
+                "actions": [
+                    {"command": {"device_id": "hipace_eql", "action": "stop"}, "ok": False}
+                ],
+            }
+        )
+
+        proc._on_action_chain_done(future, key, "trip-1")
+
+        self.assertNotIn(key, proc._inflight_action_keys)
+        result = proc._states[key].last_action_chain
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result["state"], "completed")
+        self.assertFalse(result["success"])
+        self.assertEqual(result["succeeded_actions"], 3)
+        self.assertEqual(result["failed_actions"], 1)
+
 
 
 if __name__ == "__main__":
