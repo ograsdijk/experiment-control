@@ -1,0 +1,86 @@
+name: Temporary Linux Full SynthHD Review Fix
+
+on:
+  push:
+    branches:
+      - refactor/synthhd-channel-naming-linux-validate
+
+permissions:
+  contents: write
+
+jobs:
+  patch-and-validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: refactor/synthhd-channel-naming-linux-validate
+          fetch-depth: 0
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - uses: astral-sh/setup-uv@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: web/react_ui/package-lock.json
+      - name: Patch stale MemberSpec test stub
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          path = Path("tests/test_misc_review_followups.py")
+          text = path.read_text()
+          old = 'spec = SimpleNamespace(\n        settable=True, params=[], value_annotation=None, kind="property"\n    )'
+          new = 'spec = SimpleNamespace(\n        readable=True, settable=True, params=[], value_annotation=None, kind="property"\n    )'
+          if text.count(old) != 1:
+              raise SystemExit(f"expected exactly one stale MemberSpec stub, found {text.count(old)}")
+          path.write_text(text.replace(old, new, 1))
+          PY
+      - name: Sync Python dependencies
+        run: uv sync
+      - name: Lint Python
+        run: uv run ruff check src tests examples
+      - name: Complexity guard
+        run: uv run ruff check src/experiment_control/utils/command_interceptors.py src/experiment_control/utils/network_hosts.py src/experiment_control/processes/stream_analysis.py src/experiment_control/processes/influx_writer.py src/experiment_control/sequencer/sequencer.py src/experiment_control/processes/interlock.py src/experiment_control/processes/watchdog.py --select C901
+      - name: Run full Python unit suite
+        run: uv run python -m unittest discover -s tests -p "test_*.py" -q
+      - name: Build package artifacts
+        run: uv build
+      - name: Verify wheel contains bundled UI
+        run: |
+          python - <<'PY'
+          import pathlib
+          import zipfile
+          wheels = sorted(pathlib.Path("dist").glob("*.whl"))
+          if not wheels:
+              raise SystemExit("No wheel found in dist/")
+          wheel = wheels[-1]
+          required = "experiment_control/_ui_dist/index.html"
+          with zipfile.ZipFile(wheel) as zf:
+              names = set(zf.namelist())
+          if required not in names:
+              raise SystemExit(f"Missing bundled UI asset in wheel: {required}")
+          print(f"Verified bundled UI in {wheel.name}")
+          PY
+      - name: Build packaged UI
+        run: pwsh ./scripts/build_packaged_ui.ps1
+      - name: Run UI tests
+        run: npm test --prefix web/react_ui
+      - name: Verify packaged UI is current
+        run: |
+          git add -A -- src/experiment_control/_ui_dist
+          if ! git diff --cached --quiet -- src/experiment_control/_ui_dist; then
+            git diff --cached --stat -- src/experiment_control/_ui_dist
+            exit 1
+          fi
+          git reset
+      - name: Commit validated fixture fix and remove helper
+        run: |
+          rm .github/workflows/temporary_linux_full_synthhd_review_fix.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add tests/test_misc_review_followups.py .github/workflows/temporary_linux_full_synthhd_review_fix.yml
+          git commit -m "Fix readable-member regression fixture"
+          git push origin HEAD:refactor/synthhd-channel-naming-linux-validate
