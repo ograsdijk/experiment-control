@@ -23,6 +23,7 @@ export type DetailedWatchdogRule = WatchdogStatus["rules"][number] & {
   arm?: WatchdogArmStatus | null;
   armed?: boolean;
   confirmation?: WatchdogConfirmationStatus | null;
+  active_trip_id?: string | null;
 };
 
 export function watchdogRuleDetails(
@@ -230,6 +231,7 @@ export function normalizeWatchdogStatusDetailed(raw: unknown): WatchdogStatus | 
         arm: normalizeArm(ruleObj.arm),
         armed: asBoolean(ruleObj.armed, false),
         confirmation: normalizeConfirmation(ruleObj.confirmation),
+        active_trip_id: asString(ruleObj.active_trip_id, "") || null,
       } as DetailedWatchdogRule;
       return rule;
     })
