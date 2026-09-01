@@ -16,6 +16,7 @@ import type {
 import {
   fetchDetailedWatchdogStatus,
   hasActiveWatchdogTrip,
+  isWatchdogRuleConfirming,
 } from "./watchdogStatusApi";
 
 type UseWatchdogsControllerArgs = {
@@ -400,6 +401,7 @@ export function useWatchdogsController({
         }
         for (const rule of watchdog.rules ?? []) {
           const activeTrip = hasActiveWatchdogTrip(rule);
+          const confirming = isWatchdogRuleConfirming(rule);
           if (rule.latched) {
             activeLatchCount += 1;
           }
@@ -409,7 +411,7 @@ export function useWatchdogsController({
             unknownRuleCount += 1;
           } else if (rule.last_evaluated_mono == null) {
             pendingRuleCount += 1;
-          } else if (rule.alarm) {
+          } else if (confirming) {
             confirmingRuleCount += 1;
           }
           if (
@@ -417,7 +419,7 @@ export function useWatchdogsController({
             rule.latched ||
             rule.unknown ||
             rule.last_evaluated_mono == null ||
-            rule.alarm
+            confirming
           ) {
             attentionRuleCount += 1;
           }
