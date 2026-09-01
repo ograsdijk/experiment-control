@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   hasActiveWatchdogTrip,
+  hasWatchdogActionFailure,
   isWatchdogRuleConfirming,
   normalizeWatchdogStatusDetailed,
   watchdogRuleDetails,
@@ -123,6 +124,7 @@ describe("detailed watchdog status normalization", () => {
     expect(chain?.failed_actions).toBe(1);
     expect(chain?.actions[0].command.device_id).toBe("hipace_eql");
     expect(chain?.actions[0].error).toBe("timeout");
+    expect(hasWatchdogActionFailure(watchdog!.rules[0])).toBe(true);
   });
 
 

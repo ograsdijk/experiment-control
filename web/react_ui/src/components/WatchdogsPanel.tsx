@@ -3,6 +3,7 @@ import { IconRefresh } from "@tabler/icons-react";
 import { isProcessRpcStateAvailable, processStateColor } from "../features/runtime/helpers";
 import {
   hasActiveWatchdogTrip,
+  hasWatchdogActionFailure,
   isWatchdogRuleConfirming,
   watchdogRuleDetails,
   type DetailedWatchdogRule,
@@ -219,6 +220,7 @@ export function summarizeWatchdogRules(watchdog: WatchdogStatus): {
   let unknown = 0;
   let triggered = 0;
   let confirming = 0;
+  let actionFailures = 0;
   let pending = 0;
   for (const rule of watchdog.rules) {
     if (rule.latched) {
@@ -233,6 +235,9 @@ export function summarizeWatchdogRules(watchdog: WatchdogStatus): {
     } else if (isWatchdogRuleConfirming(rule)) {
       confirming += 1;
     }
+    if (hasWatchdogActionFailure(rule)) {
+      actionFailures += 1;
+    }
   }
   if (triggered > 0) {
     return { label: `${triggered} triggered`, color: "red" };
@@ -245,6 +250,12 @@ export function summarizeWatchdogRules(watchdog: WatchdogStatus): {
   }
   if (confirming > 0) {
     return { label: `${confirming} confirming`, color: "orange" };
+  }
+  if (actionFailures > 0) {
+    return {
+      label: `Last action incomplete · ${actionFailures}`,
+      color: "orange",
+    };
   }
   if (pending > 0) {
     return { label: `${pending} pending`, color: "gray" };
@@ -269,6 +280,7 @@ export function beamlineTurboProtectionSummary(
   ).length;
   const incompleteArming = turboRules.filter(hasIncompleteBeamlineTurboState).length;
   const confirming = turboRules.filter(isWatchdogRuleConfirming).length;
+  const actionFailures = turboRules.filter(hasWatchdogActionFailure).length;
   const armed = turboRules.filter(
     (rule) => !rule.unknown && Boolean(watchdogRuleDetails(rule).armed)
   ).length;
@@ -291,6 +303,12 @@ export function beamlineTurboProtectionSummary(
     return {
       label: `Beamline arming degraded · ${armed}/${turboRules.length} sensors armed`,
       color: "yellow",
+    };
+  }
+  if (actionFailures > 0) {
+    return {
+      label: `Beamline last shutdown incomplete · ${actionFailures}`,
+      color: "orange",
     };
   }
   if (armed === turboRules.length) {

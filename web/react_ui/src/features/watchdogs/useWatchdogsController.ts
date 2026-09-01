@@ -16,6 +16,7 @@ import type {
 import {
   fetchDetailedWatchdogStatus,
   hasActiveWatchdogTrip,
+  hasWatchdogActionFailure,
   isWatchdogRuleConfirming,
 } from "./watchdogStatusApi";
 
@@ -37,6 +38,7 @@ type WatchdogButtonSummary = {
   activeLatchCount: number;
   activeAlarmCount: number;
   confirmingRuleCount: number;
+  actionFailureRuleCount: number;
   unknownRuleCount: number;
   pendingRuleCount: number;
   attentionRuleCount: number;
@@ -372,6 +374,7 @@ export function useWatchdogsController({
     let activeLatchCount = 0;
     let activeAlarmCount = 0;
     let confirmingRuleCount = 0;
+    let actionFailureRuleCount = 0;
     let unknownRuleCount = 0;
     let pendingRuleCount = 0;
     let attentionRuleCount = 0;
@@ -402,6 +405,7 @@ export function useWatchdogsController({
         for (const rule of watchdog.rules ?? []) {
           const activeTrip = hasActiveWatchdogTrip(rule);
           const confirming = isWatchdogRuleConfirming(rule);
+          const actionFailure = hasWatchdogActionFailure(rule);
           if (rule.latched) {
             activeLatchCount += 1;
           }
@@ -414,12 +418,16 @@ export function useWatchdogsController({
           } else if (confirming) {
             confirmingRuleCount += 1;
           }
+          if (actionFailure) {
+            actionFailureRuleCount += 1;
+          }
           if (
             activeTrip ||
             rule.latched ||
             rule.unknown ||
             rule.last_evaluated_mono == null ||
-            confirming
+            confirming ||
+            actionFailure
           ) {
             attentionRuleCount += 1;
           }
@@ -434,7 +442,7 @@ export function useWatchdogsController({
         ? "orange"
         : unknownRuleCount > 0
           ? "yellow"
-          : confirmingRuleCount > 0
+          : confirmingRuleCount > 0 || actionFailureRuleCount > 0
             ? "orange"
             : hasTrackedWatchdogs
               ? "teal"
@@ -456,6 +464,9 @@ export function useWatchdogsController({
           confirmingRuleCount > 0
             ? `${confirmingRuleCount} confirming rule${confirmingRuleCount === 1 ? "" : "s"}`
             : null,
+          actionFailureRuleCount > 0
+            ? `${actionFailureRuleCount} rule${actionFailureRuleCount === 1 ? "" : "s"} with incomplete last action`
+            : null,
           pendingRuleCount > 0
             ? `${pendingRuleCount} pending rule${pendingRuleCount === 1 ? "" : "s"}`
             : null,
@@ -471,6 +482,7 @@ export function useWatchdogsController({
       activeLatchCount,
       activeAlarmCount,
       confirmingRuleCount,
+      actionFailureRuleCount,
       unknownRuleCount,
       pendingRuleCount,
       attentionRuleCount,

@@ -276,6 +276,18 @@ describe("watchdog status presentation", () => {
       color: "red",
       failedTargets: ["hipace_eql.stop"],
     });
+    expect(summarizeWatchdogRules({
+      watchdog_id: "vacuum_protection",
+      enabled: true,
+      rules: [rule],
+    })).toEqual({
+      label: "Last action incomplete · 1",
+      color: "orange",
+    });
+    expect(beamlineTurboProtectionSummary([rule])).toEqual({
+      label: "Beamline last shutdown incomplete · 1",
+      color: "orange",
+    });
   });
 
 

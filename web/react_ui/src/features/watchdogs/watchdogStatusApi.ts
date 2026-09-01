@@ -64,6 +64,13 @@ export function hasActiveWatchdogTrip(
   return Boolean(details.active_trip_id) && (Boolean(rule.alarm) || Boolean(rule.unknown));
 }
 
+export function hasWatchdogActionFailure(
+  rule: WatchdogStatus["rules"][number]
+): boolean {
+  const chain = watchdogRuleDetails(rule).last_action_chain;
+  return chain != null && chain.state !== "running" && chain.success === false;
+}
+
 export function isWatchdogRuleConfirming(
   rule: WatchdogStatus["rules"][number]
 ): boolean {
