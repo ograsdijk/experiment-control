@@ -15,7 +15,7 @@ import type {
 } from "../../types";
 import {
   fetchDetailedWatchdogStatus,
-  watchdogRuleDetails,
+  hasActiveWatchdogTrip,
 } from "./watchdogStatusApi";
 
 type UseWatchdogsControllerArgs = {
@@ -399,7 +399,7 @@ export function useWatchdogsController({
           continue;
         }
         for (const rule of watchdog.rules ?? []) {
-          const activeTrip = Boolean(watchdogRuleDetails(rule).active_trip_id);
+          const activeTrip = hasActiveWatchdogTrip(rule);
           if (rule.latched) {
             activeLatchCount += 1;
           }
