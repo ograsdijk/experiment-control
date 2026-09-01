@@ -9,11 +9,12 @@ import {
 import type { DetailedWatchdogRule } from "../features/watchdogs/watchdogStatusApi";
 
 function watchdog(
-  rule: Partial<DetailedWatchdogRule>
+  rule: Partial<DetailedWatchdogRule>,
+  enabled = true
 ): WatchdogStatus {
   return {
     watchdog_id: "vacuum_protection",
-    enabled: true,
+    enabled,
     rules: [
       {
         name: "beam_loss_shutdown",
@@ -41,8 +42,12 @@ function turboRule(
 }
 
 describe("watchdog status presentation", () => {
-  it("shows the live trigger independently from a latch", () => {
-    const rule = watchdog({ alarm: true, latched: true }).rules[0];
+  it("shows an actual active trip independently from a latch", () => {
+    const rule = watchdog({
+      alarm: true,
+      latched: true,
+      active_trip_id: "trip-1",
+    }).rules[0];
 
     expect(watchdogRuleLiveState(rule)).toEqual({
       label: "TRIGGERED",
@@ -54,9 +59,29 @@ describe("watchdog status presentation", () => {
     });
   });
 
-  it("shows a handled unarmed rule as disarmed", () => {
+  it("does not call a pre-confirmation alarm triggered", () => {
     const rule = watchdog({
-      alarm: false,
+      alarm: true,
+      unknown: false,
+      last_evaluated_mono: 10,
+      arm: { condition: {} },
+      armed: true,
+      active_trip_id: null,
+    }).rules[0];
+
+    expect(watchdogRuleLiveState(rule)).toEqual({
+      label: "ARMED · CONFIRMING",
+      color: "orange",
+    });
+    expect(summarizeWatchdogRules(watchdog(rule))).toEqual({
+      label: "1 confirming",
+      color: "orange",
+    });
+  });
+
+  it("shows a high condition before arming as disarmed", () => {
+    const rule = watchdog({
+      alarm: true,
       unknown: false,
       last_evaluated_mono: 10,
       arm: { condition: {} },
@@ -84,8 +109,12 @@ describe("watchdog status presentation", () => {
     });
   });
 
-  it("makes fail-safe unknown triggers explicit", () => {
-    const rule = watchdog({ alarm: true, unknown: true }).rules[0];
+  it("makes fail-safe unknown trips explicit", () => {
+    const rule = watchdog({
+      alarm: true,
+      unknown: true,
+      active_trip_id: "trip-unknown",
+    }).rules[0];
 
     expect(watchdogRuleLiveState(rule)).toEqual({
       label: "TRIGGERED · INPUT UNAVAILABLE",
@@ -132,6 +161,19 @@ describe("watchdog status presentation", () => {
     expect(beamlineTurboProtectionSummary(rules)).toEqual({
       label: "Beamline protection degraded · 2/3 sensors armed",
       color: "yellow",
+    });
+  });
+
+  it("shows the beamline protection as disabled when the watchdog is disabled", () => {
+    const rules = [
+      turboRule("rc_pressure_turbos_off", { armed: true }),
+      turboRule("eql_pressure_turbos_off", { armed: true }),
+      turboRule("det_pressure_turbos_off", { armed: true }),
+    ];
+
+    expect(beamlineTurboProtectionSummary(rules, false)).toEqual({
+      label: "Beamline protection disabled",
+      color: "gray",
     });
   });
 });
