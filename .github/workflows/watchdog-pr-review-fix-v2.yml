@@ -21,8 +21,10 @@ jobs:
           node-version: '20'
           cache: npm
           cache-dependency-path: web/react_ui/package-lock.json
-      - name: Apply source patch
-        run: python scripts/tmp_watchdog_review_fix.py
+      - name: Apply source patches
+        run: |
+          python scripts/tmp_watchdog_review_fix.py
+          python scripts/tmp_watchdog_action_exception_fix.py
       - name: Build packaged UI
         shell: pwsh
         run: .\scripts\build_packaged_ui.ps1
@@ -33,6 +35,11 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -- web/react_ui/src/features/watchdogs/watchdogStatusApi.ts web/react_ui/src/features/watchdogs/watchdogStatusApi.test.ts web/react_ui/src/components/WatchdogsPanel.tsx web/react_ui/src/components/WatchdogsPanel.test.ts web/react_ui/src/features/watchdogs/useWatchdogsController.ts src/experiment_control/_ui_dist
-          git commit -m "Surface incomplete watchdog actions in summaries"
+          git add -- src/experiment_control/processes/watchdog.py tests/test_watchdog_process_action.py web/react_ui/src/features/watchdogs/watchdogStatusApi.ts web/react_ui/src/features/watchdogs/watchdogStatusApi.test.ts web/react_ui/src/components/WatchdogsPanel.tsx web/react_ui/src/components/WatchdogsPanel.test.ts web/react_ui/src/features/watchdogs/useWatchdogsController.ts src/experiment_control/_ui_dist
+          $changes = git status --porcelain -- src/experiment_control/processes/watchdog.py tests/test_watchdog_process_action.py web/react_ui/src/features/watchdogs/watchdogStatusApi.ts web/react_ui/src/features/watchdogs/watchdogStatusApi.test.ts web/react_ui/src/components/WatchdogsPanel.tsx web/react_ui/src/components/WatchdogsPanel.test.ts web/react_ui/src/features/watchdogs/useWatchdogsController.ts src/experiment_control/_ui_dist
+          if (-not $changes) {
+            Write-Host "No source/generated changes to commit."
+            exit 0
+          }
+          git commit -m "Keep watchdog shutdown chain running on manager errors"
           git push origin HEAD:watchdog-independent-hornets
