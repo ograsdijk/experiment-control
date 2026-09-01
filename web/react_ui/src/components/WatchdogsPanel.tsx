@@ -208,7 +208,6 @@ export function actionChainPresentation(
   };
 }
 
-
 export function summarizeWatchdogRules(watchdog: WatchdogStatus): {
   label: string;
   color: string;
@@ -472,7 +471,7 @@ function RuleCard({
             )}
             {confirmation && (
               <Text size="xs">
-                High-pressure confirmation: <b>{confirmation.count}/{confirmation.target}</b>
+                Confirmation: <b>{confirmation.count}/{confirmation.target}</b>
               </Text>
             )}
             <Text size="xs" c="dimmed">evaluated {formatAge(rule.last_evaluated_age_s)}</Text>
