@@ -1,12 +1,15 @@
 import { describe, expect, it } from "vitest";
 import type { WatchdogStatus } from "../types";
 import {
+  beamlineTurboProtectionSummary,
+  confirmationProgress,
   summarizeWatchdogRules,
   watchdogRuleLiveState,
 } from "./WatchdogsPanel";
+import type { DetailedWatchdogRule } from "../features/watchdogs/watchdogStatusApi";
 
 function watchdog(
-  rule: Partial<WatchdogStatus["rules"][number]>
+  rule: Partial<DetailedWatchdogRule>
 ): WatchdogStatus {
   return {
     watchdog_id: "vacuum_protection",
@@ -17,9 +20,24 @@ function watchdog(
         severity: "critical",
         latched: false,
         ...rule,
-      },
+      } as DetailedWatchdogRule,
     ],
   };
+}
+
+function turboRule(
+  name: "rc_pressure_turbos_off" | "eql_pressure_turbos_off" | "det_pressure_turbos_off",
+  rule: Partial<DetailedWatchdogRule>
+): DetailedWatchdogRule {
+  return {
+    name,
+    severity: "critical",
+    latched: false,
+    last_evaluated_mono: 10,
+    arm: { condition: { lt: ["${p.value}", 5e-3] } },
+    armed: false,
+    ...rule,
+  } as DetailedWatchdogRule;
 }
 
 describe("watchdog status presentation", () => {
@@ -27,7 +45,7 @@ describe("watchdog status presentation", () => {
     const rule = watchdog({ alarm: true, latched: true }).rules[0];
 
     expect(watchdogRuleLiveState(rule)).toEqual({
-      label: "Triggered now",
+      label: "TRIGGERED",
       color: "red",
     });
     expect(summarizeWatchdogRules(watchdog(rule))).toEqual({
@@ -36,21 +54,33 @@ describe("watchdog status presentation", () => {
     });
   });
 
-  it("shows a handled condition as safe while retaining latch attention", () => {
+  it("shows a handled unarmed rule as disarmed", () => {
     const rule = watchdog({
       alarm: false,
       unknown: false,
-      latched: true,
       last_evaluated_mono: 10,
+      arm: { condition: {} },
+      armed: false,
     }).rules[0];
 
     expect(watchdogRuleLiveState(rule)).toEqual({
-      label: "Safe now",
-      color: "teal",
+      label: "DISARMED",
+      color: "gray",
     });
-    expect(summarizeWatchdogRules(watchdog(rule))).toEqual({
-      label: "1 latched",
-      color: "orange",
+  });
+
+  it("shows an armed rule as armed and safe", () => {
+    const rule = watchdog({
+      alarm: false,
+      unknown: false,
+      last_evaluated_mono: 10,
+      arm: { condition: {} },
+      armed: true,
+    }).rules[0];
+
+    expect(watchdogRuleLiveState(rule)).toEqual({
+      label: "ARMED · SAFE",
+      color: "teal",
     });
   });
 
@@ -58,8 +88,50 @@ describe("watchdog status presentation", () => {
     const rule = watchdog({ alarm: true, unknown: true }).rules[0];
 
     expect(watchdogRuleLiveState(rule)).toEqual({
-      label: "Triggered: input unavailable",
+      label: "TRIGGERED · INPUT UNAVAILABLE",
       color: "red",
+    });
+  });
+
+  it("labels unavailable telemetry as degraded protection", () => {
+    const rule = watchdog({
+      alarm: false,
+      unknown: true,
+      last_evaluated_mono: 10,
+    }).rules[0];
+
+    expect(watchdogRuleLiveState(rule)).toEqual({
+      label: "UNKNOWN",
+      color: "yellow",
+    });
+    expect(summarizeWatchdogRules(watchdog(rule))).toEqual({
+      label: "Protection degraded · 1 unavailable",
+      color: "yellow",
+    });
+  });
+
+  it("reports confirmation progress", () => {
+    const rule = watchdog({
+      confirmation: {
+        consecutive_samples: 3,
+        sample_aliases: ["p"],
+        progress: { p: { count: 2, evidence: [] } },
+      },
+    }).rules[0];
+
+    expect(confirmationProgress(rule)).toEqual({ count: 2, target: 3 });
+  });
+
+  it("keeps beamline protection active when one Hornet is unavailable", () => {
+    const rules = [
+      turboRule("rc_pressure_turbos_off", { unknown: true }),
+      turboRule("eql_pressure_turbos_off", { unknown: false, armed: true }),
+      turboRule("det_pressure_turbos_off", { unknown: false, armed: true }),
+    ];
+
+    expect(beamlineTurboProtectionSummary(rules)).toEqual({
+      label: "Beamline protection degraded · 2/3 sensors armed",
+      color: "yellow",
     });
   });
 });
