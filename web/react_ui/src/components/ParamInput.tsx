@@ -7,12 +7,19 @@ export type ParamInputProps = {
   onChange: (value: string) => void;
 };
 
+const INTEGER_LITERAL_RE = /^(?:typing\.)?literal\[\s*[+-]?\d+(?:\s*,\s*[+-]?\d+)*\s*\]$/i;
+
+export function hasIntegerAnnotation(annotation: string | null | undefined) {
+  const normalized = (annotation ?? "").trim().toLowerCase();
+  return normalized.includes("int") || INTEGER_LITERAL_RE.test(normalized);
+}
+
 export function coerceParamValue(raw: string, param: ParamInputProps["param"]) {
   const annotation = (param.annotation ?? "").toLowerCase();
   const defaultValue = param.default;
   const hasBoolAnnotation = annotation.includes("bool");
   const hasFloatAnnotation = annotation.includes("float");
-  const hasIntAnnotation = annotation.includes("int");
+  const hasIntAnnotation = hasIntegerAnnotation(param.annotation);
   const defaultIsNumber = typeof defaultValue === "number";
   const defaultIsFloat = defaultIsNumber && !Number.isInteger(defaultValue);
   const defaultIsInt = defaultIsNumber && Number.isInteger(defaultValue);
@@ -45,7 +52,7 @@ export function ParamInput({ param, value, onChange }: ParamInputProps) {
     (typeof param.default === "number" && !Number.isInteger(param.default));
   const isInt =
     !isFloat &&
-    (annotation.includes("int") ||
+    (hasIntegerAnnotation(param.annotation) ||
       (typeof param.default === "number" && Number.isInteger(param.default)));
 
   if (isBool) {

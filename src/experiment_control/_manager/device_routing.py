@@ -9,8 +9,13 @@ from ..utils.responses import RpcResponse
 Json = dict[str, Any]
 
 
-def _rpc_failure(code: str, message: str | None = None) -> Json:
-    return RpcResponse.failure(code, message=message).to_dict()
+def _rpc_failure(
+    code: str,
+    message: str | None = None,
+    *,
+    details: Any | None = None,
+) -> Json:
+    return RpcResponse.failure(code, message=message, details=details).to_dict()
 
 
 def route_device_request(manager: Any, rtype: Any, req: Json) -> Json | None:
@@ -139,9 +144,16 @@ def _route_command(manager: Any, req: Json) -> Json:
         caller_process_id=caller_process_id,
     )
     if not ok:
+        message = None
+        details = err if isinstance(err, dict) else None
+        if isinstance(err, dict) and err.get("message") is not None:
+            message = str(err.get("message"))
+        elif err is not None:
+            message = str(err)
         return _rpc_failure(
             "command_interceptor_rejected",
-            None if err is None else str(err),
+            message,
+            details=details,
         )
     if new_cmd is None:
         return _rpc_failure("command_blocked", "command blocked")
