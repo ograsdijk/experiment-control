@@ -40,6 +40,12 @@ function asBoolean(value: unknown, fallback = false): boolean {
 }
 
 function asNumber(value: unknown, fallback = 0): number {
+  if (value === null || value === undefined || value === "") {
+    return fallback;
+  }
+  if (typeof value !== "number" && typeof value !== "string") {
+    return fallback;
+  }
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : fallback;
 }
@@ -51,14 +57,22 @@ function asRecord(value: unknown): Record<string, unknown> | null {
   return value as Record<string, unknown>;
 }
 
+const CONDITION_KINDS = new Set([
+  "always",
+  "comparison",
+  "group",
+  "not",
+  "value",
+  "error",
+]);
+
 function normalizeConditionEvaluation(raw: unknown): ConditionEvaluationTrace | null {
   const obj = asRecord(raw);
   if (!obj) {
     return null;
   }
   const kind = asString(obj.kind, "value") as ConditionEvaluationTrace["kind"];
-  const validKinds = new Set(["always", "comparison", "group", "not", "value", "error"]);
-  if (!validKinds.has(kind)) {
+  if (!CONDITION_KINDS.has(kind)) {
     return null;
   }
   const operatorRaw = asString(obj.operator, "");
@@ -126,7 +140,7 @@ function normalizeConfirmation(raw: unknown): WatchdogConfirmationStatus | null 
   };
 }
 
-function normalizeWatchdogStatusDetailed(raw: unknown): WatchdogStatus | null {
+export function normalizeWatchdogStatusDetailed(raw: unknown): WatchdogStatus | null {
   const obj = asRecord(raw);
   if (!obj) {
     return null;
