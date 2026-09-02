@@ -1,6 +1,6 @@
 [project]
 name = "experiment-control"
-version = "0.2.0"
+version = "0.3.0"
 description = "Experiment control framework with manager orchestration, device drivers, managed processes, TUI, and FastAPI/React UI."
 readme = "README.md"
 authors = [

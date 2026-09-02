@@ -81,7 +81,7 @@ def _runner_with_broken_device() -> DeviceRunner:
     # _refresh_capabilities_cache path (which would hit a different
     # codepath in real use).
     spec = SimpleNamespace(
-        settable=True, params=[], value_annotation=None, kind="property"
+        readable=True, settable=True, params=[], value_annotation=None, kind="property"
     )
     runner._members_cache = {  # type: ignore[attr-defined]
         "good_attr": spec,
