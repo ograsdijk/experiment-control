@@ -401,7 +401,7 @@ Request:
 - `{"type": "follower.rules"}`
 
 Response:
-- `{"ok": true, "result": {"rules": [{"rule_id": "r0", "name": "power_setter_laser_0", "enabled": true, "device_id": "SynthHD", "trigger_action": "set_frequency_channel_0", "trigger_param": "freq_hz", "min_freq_hz": 1.0, "max_freq_hz": 2.0, "csv_path": "...", "effects": [{"device_id": "SynthHD", "action": "set_power_channel_0", "param": "power_dbm"}]}]}}`
+- `{"ok": true, "result": {"rules": [{"rule_id": "r0", "name": "power_setter_laser_ch1", "enabled": true, "device_id": "SynthHD", "trigger_action": "set_frequency", "trigger_param": "freq_hz", "channel": 1, "min_freq_hz": 1.0, "max_freq_hz": 2.0, "csv_path": "...", "effects": [{"device_id": "SynthHD", "action": "set_power", "param": "dbm", "channel": 1}]}]}}`
 
 ### `follower.enable_rule` / `follower.disable_rule`
 Request:

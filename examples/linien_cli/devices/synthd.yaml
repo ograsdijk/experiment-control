@@ -11,39 +11,45 @@ init_kwargs:
   port: COM4
 
 telemetry_calls:
-  - method: get_enable_channel_0
+  - method: get_enable
+    kwargs: {channel: 1}
     outputs:
-      - signal: enable 0
+      - signal: ch1_output_enabled
         kind: scalar
         units: ""
         dtype: bool
-  - method: get_frequency_channel_0
+  - method: get_frequency
+    kwargs: {channel: 1}
     outputs:
-      - signal: frequency 0
+      - signal: ch1_frequency_hz
         kind: scalar
         units: "Hz"
         dtype: float64
-  - method: get_power_channel_0
+  - method: get_power
+    kwargs: {channel: 1}
     outputs:
-      - signal: power 0
+      - signal: ch1_power_dbm
         kind: scalar
         units: "dBm"
         dtype: float64
-  - method: get_enable_channel_1
+  - method: get_enable
+    kwargs: {channel: 2}
     outputs:
-      - signal: enable 1
+      - signal: ch2_output_enabled
         kind: scalar
         units: ""
         dtype: bool
-  - method: get_frequency_channel_1
+  - method: get_frequency
+    kwargs: {channel: 2}
     outputs:
-      - signal: frequency 1
+      - signal: ch2_frequency_hz
         kind: scalar
         units: "Hz"
         dtype: float64
-  - method: get_power_channel_1
+  - method: get_power
+    kwargs: {channel: 2}
     outputs:
-      - signal: power 1
+      - signal: ch2_power_dbm
         kind: scalar
         units: "dBm"
         dtype: float64
