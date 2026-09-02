@@ -25,27 +25,23 @@ type ExtraChannelMap = Map<string, Map<number, { seq: number; values: number[] }
 type BinStatsOverlayMap = Map<string, Map<string, { seq: number; values: number[] }>>;
 type BinStatsFitOverlayMap = Map<string, Map<string, StreamFitCurveSnapshot>>;
 
+function cachedValues(
+  entry: { seq: number; values: number[] } | undefined
+): number[] {
+  return entry && Array.isArray(entry.values) && entry.values.length > 0
+    ? entry.values
+    : [];
+}
+
 export function streamTraceOverlaySeries(
   panel: TracePanel,
   overlayRef: TraceOverlayMap
 ): Array<{ label: string; values: number[] }> {
   const overlayMap = overlayRef.get(panel.id);
-  if (!overlayMap || overlayMap.size <= 0) {
-    return [];
-  }
-  const selected = panel.overlayOutputIds ?? [];
-  const out: Array<{ label: string; values: number[] }> = [];
-  for (const outputId of selected) {
-    const entry = overlayMap.get(outputId);
-    if (!entry || !Array.isArray(entry.values) || entry.values.length <= 0) {
-      continue;
-    }
-    out.push({
-      label: outputId,
-      values: entry.values,
-    });
-  }
-  return out;
+  return (panel.overlayOutputIds ?? []).map((outputId) => ({
+    label: outputId,
+    values: cachedValues(overlayMap?.get(outputId)),
+  }));
 }
 
 /**
@@ -54,6 +50,9 @@ export function streamTraceOverlaySeries(
  * frame (populated by `applyRawStreamFrameToPanels`). Empty for
  * single-channel panels, DAG panels, and waterfalls. Rendered as
  * additional uPlot series via `StreamRawPanel`'s `extraSeries` prop.
+ *
+ * Configured channel slots are preserved even before a frame is cached so
+ * transient data availability cannot change the uPlot series topology.
  */
 export function streamExtraChannelSeries(
   panel: TracePanel,
@@ -63,18 +62,13 @@ export function streamExtraChannelSeries(
     return [];
   }
   const byChannel = extraChannelRef.get(panel.id);
-  if (!byChannel || byChannel.size <= 0) {
-    return [];
-  }
-  const out: Array<{ label: string; values: number[] }> = [];
-  for (const channel of panel.extraChannelIndices ?? []) {
-    const entry = byChannel.get(Math.max(0, Math.trunc(channel)));
-    if (!entry || !Array.isArray(entry.values) || entry.values.length <= 0) {
-      continue;
-    }
-    out.push({ label: `ch ${channel}`, values: entry.values });
-  }
-  return out;
+  return (panel.extraChannelIndices ?? []).map((channel) => {
+    const normalizedChannel = Math.max(0, Math.trunc(channel));
+    return {
+      label: `ch ${channel}`,
+      values: cachedValues(byChannel?.get(normalizedChannel)),
+    };
+  });
 }
 
 export function streamBinStatsOverlaySeries(
@@ -82,19 +76,10 @@ export function streamBinStatsOverlaySeries(
   overlayRef: BinStatsOverlayMap
 ): Array<{ label: string; values: number[] }> {
   const overlayMap = overlayRef.get(panel.id);
-  if (!overlayMap || overlayMap.size <= 0) {
-    return [];
-  }
-  const selected = panel.overlayOutputIds ?? [];
-  const out: Array<{ label: string; values: number[] }> = [];
-  for (const outputId of selected) {
-    const entry = overlayMap.get(outputId);
-    if (!entry || !Array.isArray(entry.values) || entry.values.length <= 0) {
-      continue;
-    }
-    out.push({ label: outputId, values: entry.values });
-  }
-  return out;
+  return (panel.overlayOutputIds ?? []).map((outputId) => ({
+    label: outputId,
+    values: cachedValues(overlayMap?.get(outputId)),
+  }));
 }
 
 export function streamBinStatsFitOverlayCurves(

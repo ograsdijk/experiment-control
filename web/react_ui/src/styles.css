@@ -1,4 +1,4 @@
-:root {
+﻿:root {
   --bg-0: #f7f4ef;
   --bg-1: #efe6d9;
   --ink-0: #1c1a16;
@@ -307,6 +307,7 @@ body::before {
   overflow-y: auto;
   overflow-x: hidden;
   overscroll-behavior: contain;
+  overflow-anchor: none;
 }
 
 .plot-panel {
