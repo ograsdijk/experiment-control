@@ -104,80 +104,101 @@ export function extractTrace(
   };
 }
 
+function normalizeOverlayCount(value: number): number {
+  if (!Number.isFinite(value)) {
+    return 1;
+  }
+  return Math.max(1, Math.trunc(value));
+}
+
 export function buildStreamRawData(
   frames: StreamFrame[],
   overlayCount: number,
   channelIndex: number,
   extraSeries: StreamExtraSeries[] = []
 ): { data: number[][]; labels: string[] } {
+  const traceSlotCount = normalizeOverlayCount(overlayCount);
+  const cleanExtra = extraSeries.map((item) => ({
+    label: String(item.label ?? "").trim() || "overlay",
+    values: item.values.filter((value) => Number.isFinite(value)),
+  }));
+  const emptyResult = () => ({
+    data: [
+      [],
+      ...Array.from({ length: traceSlotCount + cleanExtra.length }, () => [] as number[]),
+    ],
+    labels: [
+      "sample",
+      ...Array.from({ length: traceSlotCount }, () => "trace"),
+      ...cleanExtra.map((item) => item.label),
+    ],
+  });
+
   if (frames.length > 0 && frames[frames.length - 1].truncated) {
     // A flattened prefix of a multidimensional frame can contain complete
-    // and partial channels. Refuse to present it as a valid waveform.
-    return { data: [[], []], labels: ["sample", "trace"] };
-  }
-  if (frames.length === 0) {
-    if (extraSeries.length <= 0) {
-      return { data: [[], []], labels: ["sample", "trace"] };
-    }
-    const nonEmpty = extraSeries
-      .map((item) => ({
-        label: item.label,
-        values: item.values.filter((value) => Number.isFinite(value)),
-      }))
-      .filter((item) => item.values.length > 0);
-    if (nonEmpty.length <= 0) {
-      return { data: [[], []], labels: ["sample", "trace"] };
-    }
-    const minLen = Math.min(...nonEmpty.map((item) => item.values.length));
-    if (!Number.isFinite(minLen) || minLen <= 0) {
-      return { data: [[], []], labels: ["sample", "trace"] };
-    }
-    const x = Array.from({ length: minLen }, (_v, idx) => idx);
-    const ySeries = nonEmpty.map((item) => item.values.slice(-minLen));
-    return {
-      data: [x, ...ySeries],
-      labels: ["sample", ...nonEmpty.map((item) => item.label)],
-    };
-  }
-  const n = Math.max(1, Math.trunc(overlayCount));
-  const selected = frames.slice(-n);
-  const traces = selected.map((frame) => {
-    const extracted = extractTrace(frame, channelIndex);
-    return {
-      seq: frame.seq,
-      y: extracted.y,
-      channelCount: extracted.channelCount,
-    };
-  });
-  const nonEmpty = traces.filter((trace) => trace.y.length > 0);
-  if (nonEmpty.length === 0) {
-    return { data: [[], []], labels: ["sample", "trace"] };
+    // and partial channels. Refuse to present it as a valid waveform while
+    // retaining the configured uPlot series topology.
+    return emptyResult();
   }
 
-  const overlays = nonEmpty.slice(-n);
-  const minLen = Math.min(...overlays.map((trace) => trace.y.length));
-  if (!Number.isFinite(minLen) || minLen <= 0) {
-    return { data: [[], []], labels: ["sample", "trace"] };
+  const selected = frames.slice(-traceSlotCount);
+  const traceSlots: Array<{ seq: number; y: number[]; channelCount: number } | null> = [
+    ...Array.from({ length: Math.max(0, traceSlotCount - selected.length) }, () => null),
+    ...selected.map((frame) => {
+      const extracted = extractTrace(frame, channelIndex);
+      return {
+        seq: frame.seq,
+        y: extracted.y,
+        channelCount: extracted.channelCount,
+      };
+    }),
+  ];
+
+  const traceLengths = traceSlots.flatMap((trace) =>
+    trace && trace.y.length > 0 ? [trace.y.length] : []
+  );
+  const extraLengths = cleanExtra.flatMap((item) =>
+    item.values.length > 0 ? [item.values.length] : []
+  );
+  const candidateLengths = frames.length > 0 ? traceLengths : extraLengths;
+  if (candidateLengths.length <= 0) {
+    return emptyResult();
   }
+  const minLen = Math.min(...candidateLengths);
+  if (!Number.isFinite(minLen) || minLen <= 0) {
+    return emptyResult();
+  }
+
   const x = Array.from({ length: minLen }, (_v, idx) => idx);
-  const ySeries = overlays.map((trace) => trace.y.slice(-minLen));
-  const maxChannelCount = Math.max(...overlays.map((trace) => trace.channelCount ?? 1));
+  const maxChannelCount = Math.max(
+    1,
+    ...traceSlots.map((trace) => trace?.channelCount ?? 1)
+  );
   const prefix =
     maxChannelCount > 1 ? `ch ${Math.max(0, Math.trunc(channelIndex))} ` : "";
-  const labels = overlays.map((trace) => `${prefix}seq ${trace.seq}`);
-  const cleanExtra = extraSeries
-    .map((item) => ({
-      label: String(item.label ?? "").trim() || "overlay",
-      values: item.values.filter((value) => Number.isFinite(value)),
-    }))
-    .filter((item) => item.values.length > 0)
-    .map((item) => ({
-      label: item.label,
-      values: item.values.slice(-minLen),
-    }));
+  const traceLabels = traceSlots.map((trace) =>
+    trace ? `${prefix}seq ${trace.seq}` : `${prefix}trace`
+  );
+  const ySeries = traceSlots.map((trace) => {
+    if (!trace || trace.y.length < minLen) {
+      return new Array(minLen).fill(Number.NaN);
+    }
+    return trace.y.slice(-minLen);
+  });
+  const extraData = cleanExtra.map((item) => {
+    const values = item.values.slice(-minLen);
+    if (values.length === minLen) {
+      return values;
+    }
+    return [
+      ...new Array(Math.max(0, minLen - values.length)).fill(Number.NaN),
+      ...values,
+    ];
+  });
+
   return {
-    data: [x, ...ySeries, ...cleanExtra.map((item) => item.values)],
-    labels: ["sample", ...labels, ...cleanExtra.map((item) => item.label)],
+    data: [x, ...ySeries, ...extraData],
+    labels: ["sample", ...traceLabels, ...cleanExtra.map((item) => item.label)],
   };
 }
 
@@ -256,18 +277,23 @@ export function StreamRawPanel({
     () => buildStreamRawData(frames, overlayCount, channelIndex, extraSeries),
     [frames, overlayCount, channelIndex, extraSeries, tick]
   );
+  const builtDataRef = useRef<uPlot.AlignedData>(built.data as uPlot.AlignedData);
+  builtDataRef.current = built.data as uPlot.AlignedData;
+  const seriesCount = normalizeOverlayCount(overlayCount) + extraSeries.length;
 
   const series = useMemo(() => {
     return [
       { label: "sample" },
-      ...built.labels.slice(1).map((label, idx) => ({
-        label,
+      ...Array.from({ length: seriesCount }, (_value, idx) => ({
+        // The legend is hidden, so keep labels structural rather than tying
+        // the uPlot lifecycle to live sequence numbers.
+        label: `trace ${idx + 1}`,
         stroke: traceColorAt(idx),
         width: 1.6,
         value: (_u: uPlot, v: number | Date | null) => formatNumber(v),
       })),
     ];
-  }, [built.labels, formatNumber]);
+  }, [seriesCount, formatNumber]);
 
   const hasManualY = useMemo(() => {
     if (yScaleMode !== "manual") {
@@ -327,7 +353,7 @@ export function StreamRawPanel({
         },
       ],
     };
-    plotRef.current = new uPlot(opts, built.data as uPlot.AlignedData, hostRef.current);
+    plotRef.current = new uPlot(opts, builtDataRef.current, hostRef.current);
     const resize = new ResizeObserver(() => {
       if (!hostRef.current || !plotRef.current) {
         return;
@@ -345,7 +371,6 @@ export function StreamRawPanel({
     };
   }, [
     series,
-    built.data,
     isDark,
     units,
     formatNumber,
