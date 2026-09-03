@@ -56,14 +56,23 @@ function asFiniteList(raw: unknown): number[] {
   return out;
 }
 
+function asNumberList(raw: unknown): number[] {
+  if (!Array.isArray(raw)) {
+    return [];
+  }
+  return raw.map((item) => Number(item));
+}
+
 function sanitizeSeries(input: StreamBinStatsSeries | null): StreamBinStatsSeries | null {
   if (!input) {
     return null;
   }
   const xBins = asFiniteList(input.xBins);
-  const mean = asFiniteList(input.mean);
-  const std = asFiniteList(input.std);
-  const sem = asFiniteList(input.sem);
+  // Missing values are represented as NaN internally. Preserve their bin
+  // positions so one unavailable uncertainty does not discard the full series.
+  const mean = asNumberList(input.mean);
+  const std = asNumberList(input.std);
+  const sem = asNumberList(input.sem);
   const count = asFiniteList(input.count);
   const n = Math.min(xBins.length, mean.length, std.length, sem.length, count.length);
   if (!Number.isFinite(n) || n <= 0) {

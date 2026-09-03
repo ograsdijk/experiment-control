@@ -220,9 +220,11 @@ export function normalizeHistAggValue(raw: unknown): StreamBinStatsSnapshot | nu
   const semRaw = Array.isArray(payload.sem) ? payload.sem : [];
   const countRaw = Array.isArray(payload.count) ? payload.count : [];
   const xBins = xBinsRaw.map((v) => Number(v));
-  const mean = meanRaw.map((v) => Number(v));
-  const std = stdRaw.map((v) => Number(v));
-  const sem = semRaw.map((v) => Number(v));
+  const optionalNumber = (value: unknown): number =>
+    value === null || value === undefined ? Number.NaN : Number(value);
+  const mean = meanRaw.map(optionalNumber);
+  const std = stdRaw.map(optionalNumber);
+  const sem = semRaw.map(optionalNumber);
   const count = countRaw.map((v) => Number(v));
   const n = Math.min(xBins.length, mean.length, std.length, sem.length, count.length);
   if (!Number.isFinite(n) || n < 0) {
