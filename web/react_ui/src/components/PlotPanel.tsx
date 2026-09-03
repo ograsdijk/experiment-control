@@ -8,7 +8,7 @@ import { colorWithAlpha, traceColorAt } from "../utils/traceColors";
 import { TraceKey } from "../types";
 import {
   perfCount,
-  perfCountForPanel,
+  perfCountScoped,
   perfMeasure,
 } from "../features/performance/perfInstrumentation";
 
@@ -554,7 +554,7 @@ export function PlotPanel({
     }
     const data = perfMeasure("telemetry.data_construction_ms", buildPanelData);
     perfCount("plot.uplot_setData");
-    perfCountForPanel("plot.uplot_setData", panelId);
+    perfCountScoped("plot.uplot_setData", panelId);
     plotRef.current.setData(data as uPlot.AlignedData);
     applyTimeWindow(plotRef.current, data, timeWindowS);
   }, [tick, timeWindowS, buildPanelData, panelId]);

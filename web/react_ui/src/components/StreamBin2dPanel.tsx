@@ -2,7 +2,7 @@
 
 import {
   perfCount,
-  perfCountForPanel,
+  perfCountScoped,
   perfMeasure,
 } from "../features/performance/perfInstrumentation";
 
@@ -327,7 +327,7 @@ export function StreamBin2dPanel({
           hmCtx.putImageData(img, 0, 0);
           ctx.imageSmoothingEnabled = false;
           perfCount("canvas.bin2d_redraws");
-          perfCountForPanel("canvas.redraws", panelId);
+          perfCountScoped("canvas.redraws", panelId);
           ctx.drawImage(hm, left, top, plotW, plotH);
         }
       } else {

@@ -2,7 +2,7 @@
 import type { StreamFrame } from "./StreamRawPanel";
 import {
   perfCount,
-  perfCountForPanel,
+  perfCountScoped,
   perfMeasure,
 } from "../features/performance/perfInstrumentation";
 
@@ -360,7 +360,7 @@ export function StreamWaterfallPanel({
           hmCtx.putImageData(img, 0, 0);
           ctx.imageSmoothingEnabled = false;
           perfCount("canvas.waterfall_redraws");
-          perfCountForPanel("canvas.redraws", panelId);
+          perfCountScoped("canvas.redraws", panelId);
           ctx.drawImage(hm, left, top, plotW, plotH);
         }
       } else {

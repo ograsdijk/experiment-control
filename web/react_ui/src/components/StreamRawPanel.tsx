@@ -5,7 +5,7 @@ import uPlot from "uplot";
 import { traceColorAt } from "../utils/traceColors";
 import {
   perfCount,
-  perfCountForPanel,
+  perfCountScoped,
   perfMeasure,
 } from "../features/performance/perfInstrumentation";
 
@@ -429,7 +429,7 @@ export function StreamRawPanel({
     }
     perfCount("plot.uplot_setData");
     perfCount("plot.raw.uplot_setData");
-    perfCountForPanel("plot.uplot_setData", panelId);
+    perfCountScoped("plot.uplot_setData", panelId);
     plotRef.current.setData(built.data as uPlot.AlignedData);
   }, [tick, built.data, panelId]);
 

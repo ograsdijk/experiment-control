@@ -2,7 +2,7 @@
 import uPlot from "uplot";
 import {
   perfCount,
-  perfCountForPanel,
+  perfCountScoped,
   perfMeasure,
 } from "../features/performance/perfInstrumentation";
 
@@ -608,7 +608,7 @@ export function StreamBinStatsPanel({
     // has been refreshed above. No uPlot reconstruction is needed for live data.
     perfCount("plot.uplot_setData");
     perfCount("plot.bin_stats.uplot_setData");
-    perfCountForPanel("plot.uplot_setData", panelId);
+    perfCountScoped("plot.uplot_setData", panelId);
     plotRef.current.setData(fullData as uPlot.AlignedData);
   }, [tick, fullData, fitOverlayData, panelId]);
 

@@ -31,7 +31,7 @@ import { StreamParamsPanel } from "../../components/StreamParamsPanel";
 import { StreamRawPanel } from "../../components/StreamRawPanel";
 import { StreamWaterfallPanel } from "../../components/StreamWaterfallPanel";
 import { DraggableTraceChip } from "../../components/DraggableTraceChip";
-import { perfCount } from "../performance/perfInstrumentation";
+import { perfCountScoped } from "../performance/perfInstrumentation";
 import { ReorderableCardShell } from "../layout/ReorderableCardShell";
 import {
   isStreamBin2dPanel,
@@ -134,7 +134,7 @@ function PanelCardImpl({
   helpers,
   handlers,
 }: PanelCardProps) {
-  perfCount(`react.PanelCard.${panel.id}.renders`);
+  perfCountScoped("react.PanelCard", panel.id, 1, ".renders");
   const {
     activePanelId,
     setActivePanelId,

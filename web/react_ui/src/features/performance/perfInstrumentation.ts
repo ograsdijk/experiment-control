@@ -24,13 +24,19 @@ export function perfCount(name: string, amount = 1): void {
   counters.set(name, (counters.get(name) ?? 0) + amount);
 }
 
-export function perfCountForPanel(
+export function perfCountScoped(
   name: string,
-  panelId: string | undefined,
-  amount = 1
+  scope: string | undefined,
+  amount = 1,
+  suffix = ""
 ): void {
-  if (!enabled || !panelId) return;
-  perfCount(`${name}.${panelId}`, amount);
+  if (!enabled || !scope) return;
+  perfCount(`${name}.${scope}${suffix}`, amount);
+}
+
+export function perfCountEndpoint(name: string, path: string): void {
+  if (!enabled) return;
+  perfCount(`${name}.${path.split("?")[0]}`);
 }
 
 export function perfMeasure<T>(name: string, operation: () => T): T {

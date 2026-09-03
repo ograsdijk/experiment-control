@@ -1,6 +1,6 @@
 import { useEffect, useRef } from "react";
 
-import { perfCount } from "../performance/perfInstrumentation";
+import { perfCountScoped } from "../performance/perfInstrumentation";
 
 export type AdaptivePollingOptions<T> = {
   enabled: boolean;
@@ -67,13 +67,13 @@ export function useAdaptivePolling<T>({
       }
       if (inFlight) {
         refreshPending = true;
-        perfCount(`poll.overlap_attempts.${endpoint}`);
+        perfCountScoped("poll.overlap_attempts", endpoint);
         return;
       }
       refreshPending = false;
       inFlight = true;
       controller = new AbortController();
-      perfCount(`poll.requests.${endpoint}`);
+      perfCountScoped("poll.requests", endpoint);
       try {
         const next = await pollRef.current(controller.signal);
         if (!cancelled && (!hasValue || !equalityRef.current(previousValue, next))) {

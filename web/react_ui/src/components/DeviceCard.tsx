@@ -35,7 +35,7 @@ import {
 } from "../types";
 import { DeviceNameInline } from "./DeviceNameInline";
 import { copyToClipboard } from "../utils/clipboard";
-import { perfCount } from "../features/performance/perfInstrumentation";
+import { perfCountScoped } from "../features/performance/perfInstrumentation";
 import { useDeviceTelemetry } from "../features/telemetry/TelemetryLatestStore";
 
 type CapabilityParamMeta = NonNullable<CapabilityMember["params"]>[number];
@@ -160,7 +160,7 @@ const DeviceTelemetryBody = memo(function DeviceTelemetryBody({
   deviceId: string;
   onPlot: (signal: string) => void;
 }) {
-  perfCount(`react.DeviceTelemetryBody.${deviceId}.renders`);
+  perfCountScoped("react.DeviceTelemetryBody", deviceId, 1, ".renders");
   const signals = useDeviceTelemetry(deviceId);
   const computedColorScheme = useComputedColorScheme("light");
   const darkTooltipStyles = computedColorScheme === "dark"
@@ -232,7 +232,7 @@ export function DeviceCard({
   onPinnedParamChange,
   onPinnedSend,
 }: DeviceCardProps) {
-  perfCount(`react.DeviceCard.${device.device_id}.renders`);
+  perfCountScoped("react.DeviceCard", device.device_id, 1, ".renders");
   const onPlotRef = useRef(onPlot);
   onPlotRef.current = onPlot;
   const onTelemetryPlot = useCallback(
