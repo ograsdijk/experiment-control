@@ -214,6 +214,7 @@ export function applyRawStreamFrameToPanels(
   }
 ): Set<string> {
   const dirtyPanelIds = new Set<string>();
+  const normalized = extractTrace(frame, subscription.channelIndex);
   const interested =
     deps.rawPanelsBySubscriptionRef.current.get(
       rawStreamSubscriptionKey(subscription)
@@ -273,7 +274,7 @@ export function applyRawStreamFrameToPanels(
         seq: frame.seq,
         // The socket is channel-specific and live frames arrive 1-D, but
         // snapshot frames may be 2-D — extractTrace handles both.
-        values: extractTrace(frame, subscription.channelIndex).y,
+        values: normalized.y,
       });
       dirtyPanelIds.add(panel.id);
       continue;
@@ -301,6 +302,8 @@ export function applyRawStreamFrameToPanels(
       originalShape: frame.originalShape,
       originalPointCount: frame.originalPointCount,
       maxPayloadPoints: frame.maxPayloadPoints,
+      normalizedTrace: normalized.y,
+      normalizedChannelCount: normalized.channelCount,
     });
     const keep = Math.max(MAX_STREAM_FRAME_BUFFER, panel.overlayCount * 4);
     if (currentFrames.length > keep) {
@@ -509,6 +512,8 @@ export function applyStreamAnalysisOutputToPanels(
           originalShape: output.originalShape,
           originalPointCount: output.originalPointCount,
           maxPayloadPoints: output.maxPayloadPoints,
+          normalizedTrace: values,
+          normalizedChannelCount: 1,
         });
         const keep = Math.max(MAX_STREAM_FRAME_BUFFER, panel.overlayCount * 4);
         if (currentFrames.length > keep) {

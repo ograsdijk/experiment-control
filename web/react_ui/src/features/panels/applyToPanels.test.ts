@@ -149,6 +149,7 @@ describe("raw stream reverse index", () => {
     expect([...dirty]).toEqual(["A"]);
     expect(state.streamFramesRef.has("A")).toBe(true);
     expect(state.streamFramesRef.has("B")).toBe(false);
+    expect(state.streamFramesRef.get("A")?.[0].normalizedTrace).toEqual([1, 2, 3]);
   });
 });
 

@@ -3,7 +3,7 @@ import { Alert } from "@mantine/core";
 import { IconAlertTriangle } from "@tabler/icons-react";
 import uPlot from "uplot";
 import { traceColorAt } from "../utils/traceColors";
-import { perfCount } from "../features/performance/perfInstrumentation";
+import { perfCount, perfMeasure } from "../features/performance/perfInstrumentation";
 
 export type StreamFrame = {
   seq: number;
@@ -13,6 +13,8 @@ export type StreamFrame = {
   originalShape?: number[];
   originalPointCount?: number | null;
   maxPayloadPoints?: number | null;
+  normalizedTrace?: number[];
+  normalizedChannelCount?: number;
 };
 
 export type StreamExtraSeries = {
@@ -69,6 +71,12 @@ export function extractTrace(
   frame: StreamFrame,
   channelIndex: number
 ): { y: number[]; channelCount: number } {
+  if (frame.normalizedTrace) {
+    return {
+      y: frame.normalizedTrace,
+      channelCount: Math.max(1, frame.normalizedChannelCount ?? 1),
+    };
+  }
   const shape = Array.isArray(frame.shape) ? frame.shape.map((v) => Number(v)) : [];
   const values = frame.values;
   if (shape.length <= 1) {
@@ -112,6 +120,28 @@ function normalizeOverlayCount(value: number): number {
   return Math.max(1, Math.trunc(value));
 }
 
+const SAMPLE_INDEX_CACHE_LIMIT = 32;
+const sampleIndexCache = new Map<number, number[]>();
+
+export function sampleIndexArray(length: number): number[] {
+  const normalizedLength = Math.max(0, Math.trunc(length));
+  const cached = sampleIndexCache.get(normalizedLength);
+  if (cached) {
+    sampleIndexCache.delete(normalizedLength);
+    sampleIndexCache.set(normalizedLength, cached);
+    return cached;
+  }
+  const values = Array.from({ length: normalizedLength }, (_value, index) => index);
+  if (sampleIndexCache.size >= SAMPLE_INDEX_CACHE_LIMIT) {
+    const oldest = sampleIndexCache.keys().next().value;
+    if (typeof oldest === "number") {
+      sampleIndexCache.delete(oldest);
+    }
+  }
+  sampleIndexCache.set(normalizedLength, values);
+  return values;
+}
+
 export function buildStreamRawData(
   frames: StreamFrame[],
   overlayCount: number,
@@ -121,7 +151,9 @@ export function buildStreamRawData(
   const traceSlotCount = normalizeOverlayCount(overlayCount);
   const cleanExtra = extraSeries.map((item) => ({
     label: String(item.label ?? "").trim() || "overlay",
-    values: item.values.filter((value) => Number.isFinite(value)),
+    values: item.values.every((value) => Number.isFinite(value))
+      ? item.values
+      : item.values.filter((value) => Number.isFinite(value)),
   }));
   const emptyResult = () => ({
     data: [
@@ -170,7 +202,7 @@ export function buildStreamRawData(
     return emptyResult();
   }
 
-  const x = Array.from({ length: minLen }, (_v, idx) => idx);
+  const x = sampleIndexArray(minLen);
   const maxChannelCount = Math.max(
     1,
     ...traceSlots.map((trace) => trace?.channelCount ?? 1)
@@ -184,10 +216,11 @@ export function buildStreamRawData(
     if (!trace || trace.y.length < minLen) {
       return new Array(minLen).fill(Number.NaN);
     }
-    return trace.y.slice(-minLen);
+    return trace.y.length === minLen ? trace.y : trace.y.slice(-minLen);
   });
   const extraData = cleanExtra.map((item) => {
-    const values = item.values.slice(-minLen);
+    const values =
+      item.values.length === minLen ? item.values : item.values.slice(-minLen);
     if (values.length === minLen) {
       return values;
     }
@@ -275,7 +308,10 @@ export function StreamRawPanel({
   }, []);
 
   const built = useMemo(
-    () => buildStreamRawData(frames, overlayCount, channelIndex, extraSeries),
+    () =>
+      perfMeasure("raw_stream.data_construction_ms", () =>
+        buildStreamRawData(frames, overlayCount, channelIndex, extraSeries)
+      ),
     [frames, overlayCount, channelIndex, extraSeries, tick]
   );
   const builtDataRef = useRef<uPlot.AlignedData>(built.data as uPlot.AlignedData);

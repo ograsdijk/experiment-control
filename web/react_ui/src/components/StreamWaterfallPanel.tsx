@@ -57,6 +57,12 @@ function extractTrace(
   frame: StreamFrame,
   channelIndex: number
 ): { y: number[]; channelCount: number } {
+  if (frame.normalizedTrace) {
+    return {
+      y: frame.normalizedTrace,
+      channelCount: Math.max(1, frame.normalizedChannelCount ?? 1),
+    };
+  }
   const shape = Array.isArray(frame.shape) ? frame.shape.map((v) => Number(v)) : [];
   const values = frame.values;
   if (shape.length <= 1) {

@@ -289,6 +289,9 @@ export type StreamFrameSample = {
   originalShape?: number[];
   originalPointCount?: number | null;
   maxPayloadPoints?: number | null;
+  /** Plot-ready channel extracted once when the frame is ingested. */
+  normalizedTrace?: number[];
+  normalizedChannelCount?: number;
 };
 
 export type StreamAnalysisWorkspaceSubscription = {
