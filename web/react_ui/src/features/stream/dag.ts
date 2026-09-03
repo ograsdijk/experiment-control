@@ -1,4 +1,4 @@
-﻿import type {
+import type {
   StreamDagNodeConfig,
   StreamDagOpDef,
   StreamDagOpId,
@@ -153,6 +153,15 @@ export const STREAM_DAG_OPS: Record<StreamDagOpId, StreamDagOpDef> = {
         optional: true,
         placeholder: "optional",
       },
+    ],
+  },
+  "trace.window_mean": {
+    label: "trace.window_mean",
+    inputs: ["trace"],
+    outputKind: "scalar",
+    params: [
+      { name: "start_idx", label: "start_idx", kind: "integer" },
+      { name: "stop_idx", label: "stop_idx", kind: "integer" },
     ],
   },
   "trace.subtract_background": {
@@ -336,6 +345,19 @@ export const STREAM_DAG_OPS: Record<StreamDagOpId, StreamDagOpDef> = {
       { name: "bin_count", label: "bin_count", kind: "integer" },
     ],
   },
+  "hist.divide": {
+    label: "hist.divide",
+    inputs: ["numerator", "denominator"],
+    outputKind: "hist_agg",
+    params: [
+      {
+        name: "require_equal_counts",
+        label: "require_equal_counts",
+        kind: "boolean",
+        optional: true,
+      },
+    ],
+  },
   "aggregate.bin2d_stats": {
     label: "aggregate.bin2d_stats",
     inputs: ["x", "y", "z"],
@@ -374,6 +396,7 @@ export const STREAM_DAG_INPUT_KINDS: Record<
   "trace.rolling_mean": { trace: "trace" },
   "trace.decimate": { trace: "trace" },
   "trace.crop": { trace: "trace" },
+  "trace.window_mean": { trace: "trace" },
   "trace.subtract_background": { trace: "trace" },
   "trace.integrate": { trace: "trace" },
   "trace.scale": { trace: "trace" },
@@ -386,6 +409,7 @@ export const STREAM_DAG_INPUT_KINDS: Record<
   "fit.params": { fit: "fit_1d" },
   "fit.from_hist_agg": { hist: "hist_agg", gate: "scalar" },
   "aggregate.bin_stats": { x: "scalar", y: "scalar", gate: "scalar" },
+  "hist.divide": { numerator: "hist_agg", denominator: "hist_agg" },
   "aggregate.bin2d_stats": { x: "scalar", y: "scalar", z: "scalar", gate: "scalar" },
 };
 

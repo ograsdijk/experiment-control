@@ -869,6 +869,9 @@ OPS: dict[str, OpSpec] = {
     "trace.crop": OpSpec(
         input_types={"trace": "trace"}, output_type="trace", stateful=False
     ),
+    "trace.window_mean": OpSpec(
+        input_types={"trace": "trace"}, output_type="scalar", stateful=False
+    ),
     "trace.scale": OpSpec(
         input_types={"trace": "trace"}, output_type="trace", stateful=False
     ),
@@ -913,6 +916,11 @@ OPS: dict[str, OpSpec] = {
         output_type="hist_agg",
         optional_input_types={"gate": "scalar"},
         stateful=True,
+    ),
+    "hist.divide": OpSpec(
+        input_types={"numerator": "hist_agg", "denominator": "hist_agg"},
+        output_type="hist_agg",
+        stateful=False,
     ),
     "aggregate.bin2d_stats": OpSpec(
         input_types={"x": "scalar", "y": "scalar", "z": "scalar"},
@@ -975,6 +983,10 @@ OP_PARAM_SCHEMAS: dict[str, list[Json]] = {
         {"name": "start_idx", "kind": "integer", "required": False, "default": 0},
         {"name": "stop_idx", "kind": "integer", "required": False},
     ],
+    "trace.window_mean": [
+        {"name": "start_idx", "kind": "integer", "required": True},
+        {"name": "stop_idx", "kind": "integer", "required": True},
+    ],
     "trace.scale": [
         {"name": "factor", "kind": "number", "required": False, "default": 1.0},
     ],
@@ -1030,6 +1042,14 @@ OP_PARAM_SCHEMAS: dict[str, list[Json]] = {
         {"name": "x_min", "kind": "number", "required": False},
         {"name": "x_max", "kind": "number", "required": False},
         {"name": "bin_count", "kind": "integer", "required": True},
+    ],
+    "hist.divide": [
+        {
+            "name": "require_equal_counts",
+            "kind": "boolean",
+            "required": False,
+            "default": False,
+        },
     ],
     "aggregate.bin2d_stats": [
         {
@@ -1262,6 +1282,33 @@ def execute_trace_crop(trace_raw: Any, params: Json) -> np.ndarray | None:
     return trace[start:stop]
 
 
+def _validate_trace_window_mean_params(params: Json) -> tuple[int, int]:
+    start = _normalize_int(params.get("start_idx"))
+    stop = _normalize_int(params.get("stop_idx"))
+    if start is None or stop is None:
+        raise ValueError("trace.window_mean requires start_idx and stop_idx")
+    if start < 0 or stop <= start:
+        raise ValueError("trace.window_mean requires 0 <= start_idx < stop_idx")
+    return int(start), int(stop)
+
+
+def execute_trace_window_mean(trace_raw: Any, params: Json) -> float | None:
+    trace = _coerce_trace(trace_raw)
+    if trace is None:
+        return None
+    start, stop = _validate_trace_window_mean_params(params)
+    n = int(trace.size)
+    start = min(start, n)
+    stop = min(stop, n)
+    if stop <= start:
+        return None
+    window = trace[start:stop]
+    finite = window[np.isfinite(window)]
+    if finite.size <= 0:
+        return None
+    return float(np.mean(finite, dtype=np.float64))
+
+
 def execute_trace_scale(trace_raw: Any, params: Json) -> np.ndarray | None:
     """Multiply a trace by a literal `factor` (default 1.0).
 
@@ -1296,7 +1343,10 @@ def execute_trace_subtract_background(
     window = trace[bg_start:bg_stop]
     if window.size <= 0:
         return trace
-    bg = float(np.mean(window, dtype=np.float64))
+    finite = window[np.isfinite(window)]
+    if finite.size <= 0:
+        return None
+    bg = float(np.mean(finite, dtype=np.float64))
     return trace - bg
 
 
@@ -1428,7 +1478,10 @@ def execute_trace_divide(a_raw: Any, b_raw: Any) -> np.ndarray | None:
         return None
     if int(a.size) != int(b.size):
         return None
-    out = np.zeros_like(a, dtype=np.float64)
+    # Invalid/zero denominator samples must remain invalid. Filling them with
+    # zero can turn a missing normalization sample into a real physical signal
+    # downstream (for example, zero transmission -> apparent 100% absorption).
+    out = np.full_like(a, np.nan, dtype=np.float64)
     mask = np.isfinite(a) & np.isfinite(b) & (b != 0.0)
     out[mask] = a[mask] / b[mask]
     return out
@@ -1449,7 +1502,7 @@ def execute_trace_scalar_math(
         return trace * float(scalar)
     if op == "divide":
         if scalar == 0.0:
-            return np.zeros_like(trace, dtype=np.float64)
+            return None
         return trace / float(scalar)
     return None
 
@@ -1470,6 +1523,324 @@ def execute_scalar_binary(a_raw: Any, b_raw: Any, *, op: str) -> float | None:
             return None
         return float(a / b)
     return None
+
+
+def _hist_float_list(raw: Any, key: str) -> list[float | None] | None:
+    if not isinstance(raw, dict):
+        return None
+    values = raw.get(key)
+    if not isinstance(values, list):
+        return None
+    return [_normalize_float(value) for value in values]
+
+
+def _hist_count_list(raw: Any) -> list[int] | None:
+    if not isinstance(raw, dict):
+        return None
+    values = raw.get("count")
+    if not isinstance(values, list):
+        return None
+    out: list[int] = []
+    for value in values:
+        parsed = _normalize_int(value)
+        if parsed is None or parsed < 0:
+            return None
+        out.append(int(parsed))
+    return out
+
+
+def _hist_x_bins_match(a: list[float | None], b: list[float | None]) -> bool:
+    if len(a) != len(b):
+        return False
+    return all(
+        x_a is not None
+        and x_b is not None
+        and math.isclose(x_a, x_b, rel_tol=1e-12, abs_tol=1e-12)
+        for x_a, x_b in zip(a, b, strict=True)
+    )
+
+
+def _hist_union_x_bins(
+    a: list[float | None], b: list[float | None]
+) -> list[float] | None:
+    if any(value is None for value in (*a, *b)):
+        return None
+    merged = sorted(float(value) for value in (*a, *b) if value is not None)
+    out: list[float] = []
+    for value in merged:
+        if not out or not math.isclose(value, out[-1], rel_tol=1e-12, abs_tol=1e-12):
+            out.append(value)
+    return out
+
+
+def _hist_align_values_to_x_bins(
+    source_x: list[float | None],
+    source_values: list[Any],
+    target_x: list[float],
+    *,
+    missing: Any,
+) -> list[Any] | None:
+    if len(source_x) != len(source_values) or any(value is None for value in source_x):
+        return None
+    out: list[Any] = []
+    source_index = 0
+    for target in target_x:
+        if source_index < len(source_x):
+            source = source_x[source_index]
+            assert source is not None
+            if math.isclose(source, target, rel_tol=1e-12, abs_tol=1e-12):
+                out.append(source_values[source_index])
+                source_index += 1
+                continue
+        out.append(missing)
+    return out if source_index == len(source_x) else None
+
+
+def _hist_ratio_bin_valid(
+    numerator: float | None,
+    denominator: float | None,
+    source_count: int,
+    *,
+    count_mismatch: bool,
+    require_equal_counts: bool,
+) -> bool:
+    return bool(
+        numerator is not None
+        and denominator is not None
+        and denominator != 0.0
+        and source_count > 0
+        and (not require_equal_counts or not count_mismatch)
+    )
+
+
+def _hist_ratio_propagated_uncertainty(
+    numerator: float | None,
+    denominator: float | None,
+    sigma_numerator: float | None,
+    sigma_denominator: float | None,
+    *,
+    valid_ratio: bool,
+) -> float:
+    if (
+        not valid_ratio
+        or numerator is None
+        or denominator is None
+        or denominator == 0.0
+        or sigma_numerator is None
+        or sigma_denominator is None
+    ):
+        return math.nan
+    return math.sqrt(
+        (sigma_numerator / denominator) ** 2
+        + ((numerator * sigma_denominator) / (denominator * denominator)) ** 2
+    )
+
+
+def execute_hist_divide(
+    numerator_raw: Any, denominator_raw: Any, params: Json | None = None
+) -> Json | None:
+    # Divide compatible 1D histogram aggregates by their bin means. Source
+    # counts may differ and are preserved unless strict count matching is
+    # requested. std/sem propagation assumes independent numerator and
+    # denominator inputs.
+    if not isinstance(numerator_raw, dict) or not isinstance(denominator_raw, dict):
+        return None
+    require_equal_counts = _normalize_bool(
+        (params or {}).get("require_equal_counts"), default=False
+    )
+
+    num_x = _hist_float_list(numerator_raw, "x_bins")
+    den_x = _hist_float_list(denominator_raw, "x_bins")
+    num_mean = _hist_float_list(numerator_raw, "mean")
+    den_mean = _hist_float_list(denominator_raw, "mean")
+    num_std = _hist_float_list(numerator_raw, "std")
+    den_std = _hist_float_list(denominator_raw, "std")
+    num_sem = _hist_float_list(numerator_raw, "sem")
+    den_sem = _hist_float_list(denominator_raw, "sem")
+    num_count = _hist_count_list(numerator_raw)
+    den_count = _hist_count_list(denominator_raw)
+
+    arrays = (
+        num_x,
+        den_x,
+        num_mean,
+        den_mean,
+        num_std,
+        den_std,
+        num_sem,
+        den_sem,
+        num_count,
+        den_count,
+    )
+    if any(values is None for values in arrays):
+        return None
+
+    assert num_x is not None and den_x is not None
+    assert num_mean is not None and den_mean is not None
+    assert num_std is not None and den_std is not None
+    assert num_sem is not None and den_sem is not None
+    assert num_count is not None and den_count is not None
+
+    num_size = len(num_x)
+    den_size = len(den_x)
+    if any(
+        len(values) != expected_size
+        for expected_size, series_group in (
+            (num_size, (num_mean, num_std, num_sem, num_count)),
+            (den_size, (den_mean, den_std, den_sem, den_count)),
+        )
+        for values in series_group
+    ):
+        return None
+
+    aligned_auto_bins = False
+    if not _hist_x_bins_match(num_x, den_x):
+        both_auto_range = bool(
+            numerator_raw.get("auto_range", False)
+            and denominator_raw.get("auto_range", False)
+        )
+        if not require_equal_counts or not both_auto_range:
+            return None
+        union_x = _hist_union_x_bins(num_x, den_x)
+        max_bins = min(
+            _normalize_int(numerator_raw.get("max_bin_count")) or len(union_x or []),
+            _normalize_int(denominator_raw.get("max_bin_count")) or len(union_x or []),
+        )
+        if union_x is None or len(union_x) > max_bins:
+            return None
+        aligned = (
+            _hist_align_values_to_x_bins(num_x, num_mean, union_x, missing=None),
+            _hist_align_values_to_x_bins(den_x, den_mean, union_x, missing=None),
+            _hist_align_values_to_x_bins(num_x, num_std, union_x, missing=None),
+            _hist_align_values_to_x_bins(den_x, den_std, union_x, missing=None),
+            _hist_align_values_to_x_bins(num_x, num_sem, union_x, missing=None),
+            _hist_align_values_to_x_bins(den_x, den_sem, union_x, missing=None),
+            _hist_align_values_to_x_bins(num_x, num_count, union_x, missing=0),
+            _hist_align_values_to_x_bins(den_x, den_count, union_x, missing=0),
+        )
+        if any(values is None for values in aligned):
+            return None
+        (
+            num_mean,
+            den_mean,
+            num_std,
+            den_std,
+            num_sem,
+            den_sem,
+            num_count,
+            den_count,
+        ) = aligned
+        num_mean = list(num_mean)  # type: ignore[arg-type]
+        den_mean = list(den_mean)  # type: ignore[arg-type]
+        num_std = list(num_std)  # type: ignore[arg-type]
+        den_std = list(den_std)  # type: ignore[arg-type]
+        num_sem = list(num_sem)  # type: ignore[arg-type]
+        den_sem = list(den_sem)  # type: ignore[arg-type]
+        num_count = list(num_count)  # type: ignore[arg-type]
+        den_count = list(den_count)  # type: ignore[arg-type]
+        num_x = list(union_x)
+        den_x = list(union_x)
+        aligned_auto_bins = True
+
+    size = len(num_x)
+    ratio_mean: list[float] = []
+    ratio_std: list[float] = []
+    ratio_sem: list[float] = []
+    counts: list[int] = []
+    count_mismatch_bin_count = 0
+
+    for index in range(size):
+        numerator = num_mean[index]
+        denominator = den_mean[index]
+        source_count = min(num_count[index], den_count[index])
+        count_mismatch = num_count[index] != den_count[index]
+        count_mismatch_bin_count += int(count_mismatch)
+        valid_ratio = _hist_ratio_bin_valid(
+            numerator,
+            denominator,
+            source_count,
+            count_mismatch=count_mismatch,
+            require_equal_counts=require_equal_counts,
+        )
+        if valid_ratio:
+            ratio_mean.append(float(numerator / denominator))
+            counts.append(source_count)
+        else:
+            ratio_mean.append(math.nan)
+            counts.append(0)
+        ratio_std.append(
+            _hist_ratio_propagated_uncertainty(
+                numerator,
+                denominator,
+                num_std[index],
+                den_std[index],
+                valid_ratio=valid_ratio,
+            )
+        )
+        ratio_sem.append(
+            _hist_ratio_propagated_uncertainty(
+                numerator,
+                denominator,
+                num_sem[index],
+                den_sem[index],
+                valid_ratio=valid_ratio,
+            )
+        )
+
+    out: Json = {
+        "auto_range": bool(
+            numerator_raw.get("auto_range", False)
+            and denominator_raw.get("auto_range", False)
+        ),
+        "x_min": (
+            float(num_x[0])
+            if aligned_auto_bins and num_x
+            else numerator_raw.get("x_min")
+        ),
+        "x_max": (
+            float(num_x[-1])
+            if aligned_auto_bins and num_x
+            else numerator_raw.get("x_max")
+        ),
+        "bin_count": int(
+            min(
+                _normalize_int(numerator_raw.get("bin_count")) or size,
+                _normalize_int(denominator_raw.get("bin_count")) or size,
+            )
+        ),
+        "active_bin_count": int(size),
+        "max_bin_count": int(
+            min(
+                _normalize_int(numerator_raw.get("max_bin_count")) or size,
+                _normalize_int(denominator_raw.get("max_bin_count")) or size,
+            )
+        ),
+        "populated_bin_count": int(
+            sum(
+                1
+                for count, value in zip(counts, ratio_mean, strict=True)
+                if count > 0 and math.isfinite(value)
+            )
+        ),
+        "x_bins": [float(value) for value in num_x],
+        "count": counts,
+        "numerator_count": num_count,
+        "denominator_count": den_count,
+        "require_equal_counts": bool(require_equal_counts),
+        "count_mismatch_bin_count": int(count_mismatch_bin_count),
+        "mean": ratio_mean,
+        "std": ratio_std,
+        "sem": ratio_sem,
+        "dropped_samples": 0,
+        "numerator_dropped_samples": int(
+            _normalize_int(numerator_raw.get("dropped_samples")) or 0
+        ),
+        "denominator_dropped_samples": int(
+            _normalize_int(denominator_raw.get("dropped_samples")) or 0
+        ),
+        "uncertainty_assumption": "independent_inputs",
+    }
+    return _sanitize_json(out)
 
 
 def _parse_threshold_mode(raw: Any) -> str:
@@ -1522,6 +1893,19 @@ def execute_scalar_threshold(
     else:
         return None
     return 1.0 if passed else 0.0
+
+
+def _workspace_node_gate_open(node: NodeSpec, values: dict[str, Any]) -> bool:
+    """Return whether an optional node gate is open.
+
+    An omitted gate means unconditional execution. Once a gate input is wired,
+    however, a missing/invalid upstream value must fail closed rather than being
+    confused with an omitted gate.
+    """
+    gate_source = node.inputs.get("gate")
+    if gate_source is None:
+        return True
+    return _gate_open(values.get(gate_source), default=False)
 
 
 def _node_signature(op: str) -> OpSpec:
@@ -1788,6 +2172,15 @@ def _validate_node_trace_decimate(
     _ = _validate_trace_decimate_params(node.params)
 
 
+def _validate_node_trace_window_mean(
+    *,
+    node: NodeSpec,
+    source_stream_nodes: list[str],
+) -> None:
+    del source_stream_nodes
+    _ = _validate_trace_window_mean_params(node.params)
+
+
 def _validate_node_fit_curve_1d(
     *,
     node: NodeSpec,
@@ -1890,6 +2283,7 @@ _NODE_OP_PARAM_VALIDATORS: dict[str, _NodeValidator] = {
     "record.filter_eq": _validate_node_record_filter_eq,
     "trace.rolling_mean": _validate_node_trace_rolling_mean,
     "trace.decimate": _validate_node_trace_decimate,
+    "trace.window_mean": _validate_node_trace_window_mean,
     "fit.curve_1d": _validate_node_fit_curve_1d,
     "fit.from_hist_agg": _validate_node_fit_from_hist,
     "fit.param": _validate_node_fit_param,
@@ -3427,6 +3821,9 @@ class StreamAnalysisProcess(ManagedProcessBase):
         if op == "trace.crop":
             values[node_id] = execute_trace_crop(src, node.params)
             return True, None
+        if op == "trace.window_mean":
+            values[node_id] = execute_trace_window_mean(src, node.params)
+            return True, None
         if op == "trace.scale":
             values[node_id] = execute_trace_scale(src, node.params)
             return True, None
@@ -3524,12 +3921,12 @@ class StreamAnalysisProcess(ManagedProcessBase):
         if not isinstance(state, FitCurve1DState):
             state = FitCurve1DState.from_params(node.params)
             workspace.node_state[node_id] = state
-        gate_val = values.get(node.inputs["gate"]) if "gate" in node.inputs else None
+        gate_open = _workspace_node_gate_open(node, values)
         return execute_fit_curve_1d(
             state=state,
             x_raw=x_raw,
             y_raw=y_raw,
-            gate_raw=gate_val,
+            gate_raw=1.0 if gate_open else 0.0,
         )
 
     def _execute_workspace_fit_from_hist(
@@ -3557,11 +3954,11 @@ class StreamAnalysisProcess(ManagedProcessBase):
             x_min,
             x_max,
         ) = _validate_fit_from_hist_params(node.params)
-        gate_val = values.get(node.inputs["gate"]) if "gate" in node.inputs else None
+        gate_open = _workspace_node_gate_open(node, values)
         return execute_fit_from_hist_agg(
             state=state,
             hist_raw=hist_val,
-            gate_raw=gate_val,
+            gate_raw=1.0 if gate_open else 0.0,
             y_source=y_source,
             chi2_sigma_source=chi2_sigma_source,
             min_count=min_count,
@@ -3591,6 +3988,13 @@ class StreamAnalysisProcess(ManagedProcessBase):
                 include_hist_outputs=include_hist_outputs,
             )
             return True, None
+        if node.op == "hist.divide":
+            values[node_id] = execute_hist_divide(
+                values.get(node.inputs["numerator"]),
+                values.get(node.inputs["denominator"]),
+                node.params,
+            )
+            return True, None
         if node.op == "aggregate.bin2d_stats":
             values[node_id] = self._execute_workspace_aggregate_bin2d_stats(
                 workspace=workspace,
@@ -3617,10 +4021,9 @@ class StreamAnalysisProcess(ManagedProcessBase):
         if not isinstance(state, BinStatsState):
             state = BinStatsState.from_params(node.params)
             workspace.node_state[node_id] = state
-        gate_val = values.get(node.inputs["gate"]) if "gate" in node.inputs else None
         last_sample = (
             state.update_sample(x_val, y_val)
-            if _gate_open(gate_val, default=True)
+            if _workspace_node_gate_open(node, values)
             else None
         )
         if not include_hist_outputs:
@@ -3643,10 +4046,9 @@ class StreamAnalysisProcess(ManagedProcessBase):
         if not isinstance(state, Bin2DStatsState):
             state = Bin2DStatsState.from_params(node.params)
             workspace.node_state[node_id] = state
-        gate_val = values.get(node.inputs["gate"]) if "gate" in node.inputs else None
         last_sample = (
             state.update_sample(x_val, y_val, z_val)
-            if _gate_open(gate_val, default=True)
+            if _workspace_node_gate_open(node, values)
             else None
         )
         if not include_hist_outputs:
