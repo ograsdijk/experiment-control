@@ -29,6 +29,7 @@ import {
 } from "../types";
 import { DeviceNameInline } from "./DeviceNameInline";
 import { copyToClipboard } from "../utils/clipboard";
+import { perfCount } from "../features/performance/perfInstrumentation";
 
 type CapabilityParamMeta = NonNullable<CapabilityMember["params"]>[number];
 
@@ -147,6 +148,7 @@ export function DeviceCard({
   onPinnedParamChange,
   onPinnedSend,
 }: DeviceCardProps) {
+  perfCount(`react.DeviceCard.${device.device_id}.renders`);
   const computedColorScheme = useComputedColorScheme("light");
   const darkTooltipStyles =
     computedColorScheme === "dark"

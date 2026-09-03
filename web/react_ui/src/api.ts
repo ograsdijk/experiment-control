@@ -15,6 +15,7 @@ import {
   StreamCatalogEntry,
   TelemetrySignal,
 } from "./types";
+import { perfCount } from "./features/performance/perfInstrumentation";
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? "";
 const WS_BASE = import.meta.env.VITE_WS_BASE ?? API_BASE;
@@ -724,11 +725,15 @@ function normalizeStateMachineHistory(raw: unknown): StateMachineHistoryEntry[] 
 }
 
 export async function apiFetch<T>(path: string, init?: RequestInit): Promise<ApiResponse<T>> {
+  perfCount("api.requests");
+  perfCount(`api.requests.${path.split("?")[0]}`);
   const resp = await fetch(`${API_BASE}${path}`, init);
   return resp.json();
 }
 
 async function apiFetchMaybeBinary<T>(path: string): Promise<ApiResponse<T>> {
+  perfCount("api.requests");
+  perfCount(`api.requests.${path.split("?")[0]}`);
   const resp = await fetch(`${API_BASE}${path}`);
   const contentType = resp.headers.get("content-type") ?? "";
   if (!contentType.includes("application/vnd.experiment-control.binary+json")) {

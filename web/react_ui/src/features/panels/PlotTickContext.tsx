@@ -10,6 +10,7 @@ import {
   type ReactNode,
   type SetStateAction,
 } from "react";
+import { perfCount } from "../performance/perfInstrumentation";
 
 /**
  * Narrow context for the plot re-render pulse.
@@ -51,6 +52,7 @@ export function PlotTickProvider({ children }: { children: ReactNode }) {
     const pending = pendingRef.current;
     pendingRef.current = null;
     if (pending !== null) {
+      perfCount("plot.flushes");
       rawSetPlotTick(pending);
     }
   }, []);
@@ -66,6 +68,7 @@ export function PlotTickProvider({ children }: { children: ReactNode }) {
     }
   }, [flushPlotTick]);
   const requestPlotTick = useCallback(() => {
+    perfCount("plot.invalidation_requests");
     setPlotTick((tick) => tick + 1);
   }, [setPlotTick]);
   useEffect(() => {

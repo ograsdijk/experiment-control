@@ -15,6 +15,7 @@ import type {
 import { useLayout } from "../layout/LayoutContext";
 import { PanelCard } from "./PanelCard";
 import { usePanels } from "./PanelsContext";
+import { perfCount } from "../performance/perfInstrumentation";
 
 /**
  * Panel render loop — `<PanelsGrid>` owns the SortableContext wrapper
@@ -116,6 +117,7 @@ export function PanelsGrid({
   helpers,
   handlers,
 }: PanelsGridProps) {
+  perfCount("react.PanelsGrid.renders");
   const { panels } = usePanels();
   const { plotGridStyle, plotGridRef } = useLayout();
 

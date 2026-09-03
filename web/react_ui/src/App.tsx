@@ -206,6 +206,7 @@ import {
 import { useSettings } from "./features/runtime/SettingsContext";
 import { useRuntimeRefreshers } from "./features/runtime/useRuntimeRefreshers";
 import { useUiProfile } from "./features/runtime/useUiProfile";
+import { perfCount } from "./features/performance/perfInstrumentation";
 import { useLogsStream } from "./features/logs/useLogsStream";
 import type {
   PanelKind,
@@ -417,6 +418,7 @@ function isErrorSeverity(severity: unknown): boolean {
 // (round 30 — needed by PanelsGrid as well as remaining App-side uses).
 
 export function App() {
+  perfCount("react.App.renders");
   // Layout / viewport / sidebar-resize state moved to LayoutContext
   // (features/layout/LayoutContext.tsx). Resize event handlers and the
   // window-resize listener stay in App.tsx for now — they're tied to

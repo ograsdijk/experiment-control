@@ -1,5 +1,7 @@
 ﻿import { useEffect, useMemo, useRef } from "react";
 
+import { perfCount, perfMeasure } from "../features/performance/perfInstrumentation";
+
 export type Bin2dReducer = "mean" | "max" | "min" | "count" | "std" | "sem" | "sum";
 
 export type StreamBin2dSeries = {
@@ -227,7 +229,10 @@ export function StreamBin2dPanel({
   const heatmapRef = useRef<HTMLCanvasElement | null>(null);
   const isDark = colorScheme === "dark";
 
-  const grid = useMemo(() => buildGrid(series, reducer), [series, reducer, tick]);
+  const grid = useMemo(
+    () => perfMeasure("bin2d.conversion_ms", () => buildGrid(series, reducer)),
+    [series, reducer, tick]
+  );
 
   const zRange = useMemo(() => {
     const manual =
@@ -315,6 +320,7 @@ export function StreamBin2dPanel({
           }
           hmCtx.putImageData(img, 0, 0);
           ctx.imageSmoothingEnabled = false;
+          perfCount("canvas.bin2d_redraws");
           ctx.drawImage(hm, left, top, plotW, plotH);
         }
       } else {

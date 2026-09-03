@@ -3,6 +3,7 @@ import { Alert } from "@mantine/core";
 import { IconAlertTriangle } from "@tabler/icons-react";
 import uPlot from "uplot";
 import { traceColorAt } from "../utils/traceColors";
+import { perfCount } from "../features/performance/perfInstrumentation";
 
 export type StreamFrame = {
   seq: number;
@@ -384,6 +385,8 @@ export function StreamRawPanel({
     if (!plotRef.current) {
       return;
     }
+    perfCount("plot.uplot_setData");
+    perfCount("plot.raw.uplot_setData");
     plotRef.current.setData(built.data as uPlot.AlignedData);
   }, [tick, built.data]);
 

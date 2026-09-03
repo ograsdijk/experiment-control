@@ -9,6 +9,7 @@ import type {
   StreamTraceDecimator,
 } from "../stream/types";
 import type { StreamAnalysisMessage } from "../../types";
+import { perfCount } from "../performance/perfInstrumentation";
 import {
   isStreamAnalysisRefreshOutputRequested,
   normalizeStreamAnalysisRefreshRequests,
@@ -388,6 +389,7 @@ export function useStreamAnalysisSubscriptions({
       subscriptions: StreamAnalysisWorkspaceSubscription[],
       output: NonNullable<ReturnType<typeof normalizeStreamAnalysisOutputMessage>>
     ) => {
+      perfCount("stream_analysis.messages");
       let updated = false;
       for (const subscription of subscriptions) {
         const traceFilter = buildTraceFilter(subscription);

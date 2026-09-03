@@ -5,6 +5,7 @@ import { buildTelemetrySmoothingOverlays } from "../features/stream/telemetry_sm
 import { RingBuffer } from "../utils/ringBuffer";
 import { colorWithAlpha, traceColorAt } from "../utils/traceColors";
 import { TraceKey } from "../types";
+import { perfCount, perfMeasure } from "../features/performance/perfInstrumentation";
 
 type PlotPanelProps = {
   traces: TraceKey[];
@@ -533,7 +534,8 @@ export function PlotPanel({
     if (!plotRef.current) {
       return;
     }
-    const data = buildPanelData();
+    const data = perfMeasure("telemetry.data_construction_ms", buildPanelData);
+    perfCount("plot.uplot_setData");
     plotRef.current.setData(data as uPlot.AlignedData);
     applyTimeWindow(plotRef.current, data, timeWindowS);
   }, [tick, timeWindowS, buildPanelData]);

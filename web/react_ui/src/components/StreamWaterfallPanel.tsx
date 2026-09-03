@@ -1,5 +1,6 @@
 ﻿import { useEffect, useMemo, useRef } from "react";
 import type { StreamFrame } from "./StreamRawPanel";
+import { perfCount, perfMeasure } from "../features/performance/perfInstrumentation";
 
 type StreamWaterfallPanelProps = {
   frames: StreamFrame[];
@@ -257,7 +258,9 @@ export function StreamWaterfallPanel({
   const isDark = colorScheme === "dark";
 
   const grid = useMemo(
-    () => buildStreamWaterfallGrid(frames, historyRows, channelIndex),
+    () => perfMeasure("waterfall.conversion_ms", () =>
+      buildStreamWaterfallGrid(frames, historyRows, channelIndex)
+    ),
     [frames, historyRows, channelIndex, tick]
   );
 
@@ -344,6 +347,7 @@ export function StreamWaterfallPanel({
           }
           hmCtx.putImageData(img, 0, 0);
           ctx.imageSmoothingEnabled = false;
+          perfCount("canvas.waterfall_redraws");
           ctx.drawImage(hm, left, top, plotW, plotH);
         }
       } else {

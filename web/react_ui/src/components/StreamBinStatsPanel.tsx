@@ -1,5 +1,6 @@
 ﻿import { useEffect, useMemo, useRef } from "react";
 import uPlot from "uplot";
+import { perfCount } from "../features/performance/perfInstrumentation";
 
 export type UncertaintyMode = "std" | "sem";
 
@@ -596,6 +597,8 @@ export function StreamBinStatsPanel({
     }
     // setData redraws the plot, including the fit-overlay plugin after its ref
     // has been refreshed above. No uPlot reconstruction is needed for live data.
+    perfCount("plot.uplot_setData");
+    perfCount("plot.bin_stats.uplot_setData");
     plotRef.current.setData(fullData as uPlot.AlignedData);
   }, [tick, fullData, fitOverlayData]);
 

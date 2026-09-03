@@ -5,6 +5,7 @@ import { normalizeStreamFrameMessage } from "../stream/messages";
 import { decimateTraceValues } from "../stream/utils";
 import type { RawStreamSubscription } from "../stream/types";
 import type { StreamFrameMessage } from "../../types";
+import { perfCount } from "../performance/perfInstrumentation";
 import {
   prepareRawStreamHydration,
   RAW_STREAM_HYDRATION_INVALIDATE_EVENT,
@@ -233,6 +234,7 @@ export function useRawStreamSubscriptions({
       subscriptions: RawStreamSubscription[],
       frame: NonNullable<ReturnType<typeof normalizeStreamFrameMessage>>
     ) => {
+      perfCount("raw_stream.frames");
       let updated = false;
       for (const subscription of subscriptions) {
         if (
