@@ -797,8 +797,8 @@ function attachBinaryValueToPayload(
   payload.values = payload.value;
 }
 
-export async function fetchDevices(): Promise<DeviceStatus[]> {
-  const resp = await apiFetch<DeviceStatus[]>("/api/devices");
+export async function fetchDevices(signal?: AbortSignal): Promise<DeviceStatus[]> {
+  const resp = await apiFetch<DeviceStatus[]>("/api/devices", { signal });
   if (!resp.ok || !resp.result) {
     return [];
   }
@@ -878,8 +878,8 @@ export async function fetchTelemetrySnapshot(): Promise<
   return out;
 }
 
-export async function fetchStreams(): Promise<StreamCatalogEntry[]> {
-  const resp = await apiFetch<StreamCatalogEntry[]>("/api/streams");
+export async function fetchStreams(signal?: AbortSignal): Promise<StreamCatalogEntry[]> {
+  const resp = await apiFetch<StreamCatalogEntry[]>("/api/streams", { signal });
   if (!resp.ok || !resp.result) {
     return [];
   }
@@ -943,8 +943,8 @@ export async function restartDevice(
   });
 }
 
-export async function fetchProcesses(): Promise<ProcessStatus[]> {
-  const resp = await apiFetch<ProcessStatus[]>("/api/processes");
+export async function fetchProcesses(signal?: AbortSignal): Promise<ProcessStatus[]> {
+  const resp = await apiFetch<ProcessStatus[]>("/api/processes", { signal });
   if (!resp.ok || !resp.result) {
     return [];
   }

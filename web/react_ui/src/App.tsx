@@ -209,6 +209,11 @@ import { useSettings } from "./features/runtime/SettingsContext";
 import { useRuntimeRefreshers } from "./features/runtime/useRuntimeRefreshers";
 import { useUiProfile } from "./features/runtime/useUiProfile";
 import { perfCount } from "./features/performance/perfInstrumentation";
+import { useAdaptivePolling } from "./features/polling/useAdaptivePolling";
+import {
+  sameDeviceStatuses,
+  sameStreamCatalog,
+} from "./features/polling/pollEquality";
 import { useLogsStream } from "./features/logs/useLogsStream";
 import type {
   PanelKind,
@@ -1138,21 +1143,14 @@ export function App() {
     }
   };
 
-  useEffect(() => {
-    let alive = true;
-    const load = async () => {
-      const next = await fetchDevices();
-      if (alive) {
-        setDevices(next);
-      }
-    };
-    load();
-    const interval = setInterval(load, 5000);
-    return () => {
-      alive = false;
-      clearInterval(interval);
-    };
-  }, []);
+  useAdaptivePolling({
+    enabled: true,
+    intervalMs: 5000,
+    poll: (signal) => fetchDevices(signal),
+    onValue: setDevices,
+    equality: sameDeviceStatuses,
+    endpoint: "/api/devices",
+  });
 
   useEffect(() => {
     const availableIds = devices.map((device) => device.device_id);
@@ -1186,22 +1184,14 @@ export function App() {
     });
   }, [devices]);
 
-  useEffect(() => {
-    let alive = true;
-    const load = async () => {
-      const next = await refreshStreams();
-      if (!alive) {
-        return;
-      }
-      setStreamCatalog(next);
-    };
-    load();
-    const interval = setInterval(load, 7000);
-    return () => {
-      alive = false;
-      clearInterval(interval);
-    };
-  }, []);
+  useAdaptivePolling({
+    enabled: true,
+    intervalMs: 7000,
+    poll: (signal) => refreshStreams(signal),
+    onValue: setStreamCatalog,
+    equality: sameStreamCatalog,
+    endpoint: "/api/streams",
+  });
 
   useEffect(() => {
     try {

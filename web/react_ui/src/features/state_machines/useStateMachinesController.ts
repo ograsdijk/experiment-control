@@ -6,6 +6,7 @@ import {
   type ApiResponse,
 } from "../../api";
 import { isProcessRpcStateAvailable } from "../runtime/helpers";
+import { useAdaptivePolling } from "../polling/useAdaptivePolling";
 import type {
   CapabilityMember,
   ProcessStatus,
@@ -574,26 +575,13 @@ export function useStateMachinesController({
     [callProcessFn, refreshStateMachineGraph, refreshStateMachineProcess]
   );
 
-  useEffect(() => {
-    if (!stateMachinesOpen) {
-      return;
-    }
-    let alive = true;
-    const load = async () => {
-      if (!alive) {
-        return;
-      }
-      await refreshStateMachinesModalData();
-    };
-    void load();
-    const interval = window.setInterval(() => {
-      void load();
-    }, 1000);
-    return () => {
-      alive = false;
-      window.clearInterval(interval);
-    };
-  }, [stateMachinesOpen, refreshStateMachinesModalData]);
+  useAdaptivePolling({
+    enabled: stateMachinesOpen,
+    intervalMs: 1000,
+    poll: refreshStateMachinesModalData,
+    onValue: () => undefined,
+    endpoint: "/api/state-machines/modal",
+  });
 
   useEffect(() => {
     if (!stateMachinesOpen || !selectedProcessId) {
