@@ -363,6 +363,283 @@ class BinStatsState:
 
 
 @dataclass
+class BinRatioStatsState:
+    auto_range: bool
+    max_bin_count: int
+    x_min: float | None
+    x_max: float | None
+    centers: np.ndarray | None
+    counts: np.ndarray
+    numerator_sums: np.ndarray
+    denominator_sums: np.ndarray
+    numerator_sums_sq: np.ndarray
+    denominator_sums_sq: np.ndarray
+    product_sums: np.ndarray
+    samples_x: list[float]
+    samples_numerator: list[float]
+    samples_denominator: list[float]
+    dropped_samples: int = 0
+    auto_bins_dirty: bool = False
+
+    @classmethod
+    def from_params(cls, params: Json) -> BinRatioStatsState:
+        bin_count = _normalize_int(params.get("bin_count"))
+        if bin_count is None or bin_count <= 0:
+            raise ValueError("aggregate.bin_ratio_stats requires bin_count > 0")
+        auto_range = _normalize_bool(params.get("auto_range"), default=False)
+        array_size = 0 if auto_range else int(bin_count)
+        x_min = None if auto_range else _normalize_float(params.get("x_min"))
+        x_max = None if auto_range else _normalize_float(params.get("x_max"))
+        if not auto_range and (x_min is None or x_max is None or x_max <= x_min):
+            raise ValueError("aggregate.bin_ratio_stats requires x_min < x_max")
+        return cls(
+            auto_range=auto_range,
+            max_bin_count=int(bin_count),
+            x_min=x_min,
+            x_max=x_max,
+            centers=None,
+            counts=np.zeros(array_size, dtype=np.int64),
+            numerator_sums=np.zeros(array_size, dtype=np.float64),
+            denominator_sums=np.zeros(array_size, dtype=np.float64),
+            numerator_sums_sq=np.zeros(array_size, dtype=np.float64),
+            denominator_sums_sq=np.zeros(array_size, dtype=np.float64),
+            product_sums=np.zeros(array_size, dtype=np.float64),
+            samples_x=[],
+            samples_numerator=[],
+            samples_denominator=[],
+        )
+
+    def reset(self) -> None:
+        if self.auto_range:
+            self.x_min = None
+            self.x_max = None
+            self.centers = None
+        for array in self._accumulator_arrays():
+            array.fill(0)
+        if self.auto_range:
+            self._replace_accumulators(0)
+        self.samples_x.clear()
+        self.samples_numerator.clear()
+        self.samples_denominator.clear()
+        self.dropped_samples = 0
+        self.auto_bins_dirty = False
+
+    def _accumulator_arrays(self) -> tuple[np.ndarray, ...]:
+        return (
+            self.counts,
+            self.numerator_sums,
+            self.denominator_sums,
+            self.numerator_sums_sq,
+            self.denominator_sums_sq,
+            self.product_sums,
+        )
+
+    def _replace_accumulators(self, size: int) -> None:
+        self.counts = np.zeros(size, dtype=np.int64)
+        self.numerator_sums = np.zeros(size, dtype=np.float64)
+        self.denominator_sums = np.zeros(size, dtype=np.float64)
+        self.numerator_sums_sq = np.zeros(size, dtype=np.float64)
+        self.denominator_sums_sq = np.zeros(size, dtype=np.float64)
+        self.product_sums = np.zeros(size, dtype=np.float64)
+
+    def update_sample(
+        self, x_raw: Any, numerator_raw: Any, denominator_raw: Any
+    ) -> Json | None:
+        x = _normalize_float(x_raw)
+        numerator = _normalize_float(numerator_raw)
+        denominator = _normalize_float(denominator_raw)
+        if x is None or numerator is None or denominator is None:
+            self.dropped_samples += 1
+            return None
+        if self.auto_range:
+            self.samples_x.append(x)
+            self.samples_numerator.append(numerator)
+            self.samples_denominator.append(denominator)
+            self.auto_bins_dirty = True
+            return {
+                "x": x,
+                "numerator": numerator,
+                "denominator": denominator,
+                "bin_index": None,
+            }
+        idx = self._bin_index_runtime(x)
+        if idx is None:
+            self.dropped_samples += 1
+            return None
+        self._add_to_bin(idx, numerator, denominator)
+        return {
+            "x": x,
+            "numerator": numerator,
+            "denominator": denominator,
+            "bin_index": idx,
+        }
+
+    def _bin_index_runtime(self, x: float) -> int | None:
+        if self.counts.size <= 0 or self.x_min is None or self.x_max is None:
+            return None
+        if x < self.x_min or x > self.x_max:
+            return None
+        if x == self.x_max:
+            return int(self.counts.size) - 1
+        span = self.x_max - self.x_min
+        if span <= 0:
+            return None
+        idx = int(((x - self.x_min) / span) * int(self.counts.size))
+        return idx if 0 <= idx < int(self.counts.size) else None
+
+    def _add_to_bin(self, idx: int, numerator: float, denominator: float) -> None:
+        self.counts[idx] += 1
+        self.numerator_sums[idx] += numerator
+        self.denominator_sums[idx] += denominator
+        self.numerator_sums_sq[idx] += numerator * numerator
+        self.denominator_sums_sq[idx] += denominator * denominator
+        self.product_sums[idx] += numerator * denominator
+
+    def _recompute_auto_bins(self) -> None:
+        if not self.samples_x:
+            self.x_min = None
+            self.x_max = None
+            self.centers = np.zeros(0, dtype=np.float64)
+            self._replace_accumulators(0)
+            return
+        xs = np.asarray(self.samples_x, dtype=np.float64)
+        numerators = np.asarray(self.samples_numerator, dtype=np.float64)
+        denominators = np.asarray(self.samples_denominator, dtype=np.float64)
+        min_x = float(np.min(xs))
+        max_x = float(np.max(xs))
+        grouped: dict[str, tuple[float, list[tuple[float, float]]]] = {}
+        for x, numerator, denominator in zip(
+            self.samples_x,
+            self.samples_numerator,
+            self.samples_denominator,
+            strict=True,
+        ):
+            key = format(x, ".15g")
+            existing = grouped.get(key)
+            if existing is None:
+                grouped[key] = (x, [(numerator, denominator)])
+            else:
+                existing[1].append((numerator, denominator))
+        if len(grouped) <= self.max_bin_count:
+            items = sorted(grouped.values(), key=lambda item: item[0])
+            self.centers = np.asarray([item[0] for item in items], dtype=np.float64)
+            self._replace_accumulators(len(items))
+            for idx, (_, pairs) in enumerate(items):
+                for numerator, denominator in pairs:
+                    self._add_to_bin(idx, numerator, denominator)
+            self.x_min = min_x
+            self.x_max = max_x
+            return
+        active_bins = max(1, min(self.max_bin_count, len(grouped)))
+        min_use = min_x
+        max_use = max_x
+        if not max_use > min_use:
+            eps = max(abs(min_use) * 1e-9, 1e-9)
+            min_use -= eps
+            max_use += eps
+        fraction = np.clip((xs - min_use) / (max_use - min_use), 0.0, 1.0)
+        indices = np.minimum(
+            np.floor(fraction * active_bins).astype(np.int64), active_bins - 1
+        )
+        self.counts = np.bincount(indices, minlength=active_bins).astype(np.int64)
+        self.numerator_sums = np.bincount(
+            indices, weights=numerators, minlength=active_bins
+        )
+        self.denominator_sums = np.bincount(
+            indices, weights=denominators, minlength=active_bins
+        )
+        self.numerator_sums_sq = np.bincount(
+            indices, weights=numerators * numerators, minlength=active_bins
+        )
+        self.denominator_sums_sq = np.bincount(
+            indices, weights=denominators * denominators, minlength=active_bins
+        )
+        self.product_sums = np.bincount(
+            indices, weights=numerators * denominators, minlength=active_bins
+        )
+        edges = np.linspace(min_use, max_use, active_bins + 1, dtype=np.float64)
+        self.centers = (edges[:-1] + edges[1:]) * 0.5
+        self.x_min = min_use
+        self.x_max = max_use
+
+    def payload(self, *, last_sample: Json | None) -> Json:
+        if self.auto_range and self.auto_bins_dirty:
+            self._recompute_auto_bins()
+            self.auto_bins_dirty = False
+        centers = self.centers
+        if (
+            centers is None
+            and self.counts.size
+            and self.x_min is not None
+            and self.x_max is not None
+        ):
+            edges = np.linspace(
+                self.x_min, self.x_max, int(self.counts.size) + 1, dtype=np.float64
+            )
+            centers = (edges[:-1] + edges[1:]) * 0.5
+        if centers is None:
+            centers = np.zeros(0, dtype=np.float64)
+        counts_f = self.counts.astype(np.float64)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            numerator_mean = np.where(
+                self.counts > 0, self.numerator_sums / counts_f, np.nan
+            )
+            denominator_mean = np.where(
+                self.counts > 0, self.denominator_sums / counts_f, np.nan
+            )
+            numerator_var = np.where(
+                self.counts > 0,
+                self.numerator_sums_sq / counts_f - numerator_mean**2,
+                np.nan,
+            )
+            denominator_var = np.where(
+                self.counts > 0,
+                self.denominator_sums_sq / counts_f - denominator_mean**2,
+                np.nan,
+            )
+            covariance = np.where(
+                self.counts > 0,
+                self.product_sums / counts_f - numerator_mean * denominator_mean,
+                np.nan,
+            )
+            numerator_var = np.maximum(numerator_var, 0.0)
+            denominator_var = np.maximum(denominator_var, 0.0)
+            valid = (self.counts > 0) & (denominator_mean != 0.0)
+            ratio_mean = np.where(valid, numerator_mean / denominator_mean, np.nan)
+            ratio_var = (
+                numerator_var / denominator_mean**2
+                + numerator_mean**2 * denominator_var / denominator_mean**4
+                - 2.0 * numerator_mean * covariance / denominator_mean**3
+            )
+            ratio_var = np.where(valid, np.maximum(ratio_var, 0.0), np.nan)
+            ratio_std = np.sqrt(ratio_var)
+            ratio_sem = np.where(self.counts > 1, ratio_std / np.sqrt(counts_f), np.nan)
+        valid_counts = np.where(valid, self.counts, 0)
+        out: Json = {
+            "auto_range": self.auto_range,
+            "x_min": self.x_min,
+            "x_max": self.x_max,
+            "bin_count": self.max_bin_count,
+            "active_bin_count": int(self.counts.size),
+            "max_bin_count": self.max_bin_count,
+            "populated_bin_count": int(np.count_nonzero(valid_counts)),
+            "x_bins": centers.tolist(),
+            "count": valid_counts.tolist(),
+            "mean": ratio_mean.tolist(),
+            "std": ratio_std.tolist(),
+            "sem": ratio_sem.tolist(),
+            "numerator_mean": numerator_mean.tolist(),
+            "denominator_mean": denominator_mean.tolist(),
+            "covariance": covariance.tolist(),
+            "dropped_samples": self.dropped_samples,
+            "uncertainty_assumption": "paired_delta_method",
+        }
+        if last_sample is not None:
+            out["last_sample"] = last_sample
+        return _sanitize_json(out)
+
+
+@dataclass
 class Bin2DStatsState:
     x_auto_range: bool
     y_auto_range: bool
@@ -917,6 +1194,16 @@ OPS: dict[str, OpSpec] = {
         optional_input_types={"gate": "scalar"},
         stateful=True,
     ),
+    "aggregate.bin_ratio_stats": OpSpec(
+        input_types={
+            "x": "scalar",
+            "numerator": "scalar",
+            "denominator": "scalar",
+        },
+        output_type="hist_agg",
+        optional_input_types={"gate": "scalar"},
+        stateful=True,
+    ),
     "hist.divide": OpSpec(
         input_types={"numerator": "hist_agg", "denominator": "hist_agg"},
         output_type="hist_agg",
@@ -1038,6 +1325,12 @@ OP_PARAM_SCHEMAS: dict[str, list[Json]] = {
         {"name": "x_max", "kind": "number", "required": False},
     ],
     "aggregate.bin_stats": [
+        {"name": "auto_range", "kind": "boolean", "required": False, "default": False},
+        {"name": "x_min", "kind": "number", "required": False},
+        {"name": "x_max", "kind": "number", "required": False},
+        {"name": "bin_count", "kind": "integer", "required": True},
+    ],
+    "aggregate.bin_ratio_stats": [
         {"name": "auto_range", "kind": "boolean", "required": False, "default": False},
         {"name": "x_min", "kind": "number", "required": False},
         {"name": "x_max", "kind": "number", "required": False},
@@ -1742,7 +2035,10 @@ def execute_hist_divide(
         den_x = list(union_x)
         aligned_auto_bins = True
 
-    size = len(num_x)
+    x_bins = [float(value) for value in num_x if value is not None]
+    if len(x_bins) != len(num_x):
+        return None
+    size = len(x_bins)
     ratio_mean: list[float] = []
     ratio_std: list[float] = []
     ratio_sem: list[float] = []
@@ -1763,6 +2059,7 @@ def execute_hist_divide(
             require_equal_counts=require_equal_counts,
         )
         if valid_ratio:
+            assert numerator is not None and denominator is not None
             ratio_mean.append(float(numerator / denominator))
             counts.append(source_count)
         else:
@@ -1793,13 +2090,13 @@ def execute_hist_divide(
             and denominator_raw.get("auto_range", False)
         ),
         "x_min": (
-            float(num_x[0])
-            if aligned_auto_bins and num_x
+            x_bins[0]
+            if aligned_auto_bins and x_bins
             else numerator_raw.get("x_min")
         ),
         "x_max": (
-            float(num_x[-1])
-            if aligned_auto_bins and num_x
+            x_bins[-1]
+            if aligned_auto_bins and x_bins
             else numerator_raw.get("x_max")
         ),
         "bin_count": int(
@@ -1822,7 +2119,7 @@ def execute_hist_divide(
                 if count > 0 and math.isfinite(value)
             )
         ),
-        "x_bins": [float(value) for value in num_x],
+        "x_bins": x_bins,
         "count": counts,
         "numerator_count": num_count,
         "denominator_count": den_count,
@@ -2217,6 +2514,15 @@ def _validate_node_aggregate_bin_stats(
     _ = BinStatsState.from_params(node.params)
 
 
+def _validate_node_aggregate_bin_ratio_stats(
+    *,
+    node: NodeSpec,
+    source_stream_nodes: list[str],
+) -> None:
+    del source_stream_nodes
+    _ = BinRatioStatsState.from_params(node.params)
+
+
 def _validate_node_aggregate_bin2d_stats(
     *,
     node: NodeSpec,
@@ -2288,6 +2594,7 @@ _NODE_OP_PARAM_VALIDATORS: dict[str, _NodeValidator] = {
     "fit.from_hist_agg": _validate_node_fit_from_hist,
     "fit.param": _validate_node_fit_param,
     "aggregate.bin_stats": _validate_node_aggregate_bin_stats,
+    "aggregate.bin_ratio_stats": _validate_node_aggregate_bin_ratio_stats,
     "aggregate.bin2d_stats": _validate_node_aggregate_bin2d_stats,
 }
 
@@ -3037,6 +3344,8 @@ class StreamAnalysisProcess(ManagedProcessBase):
     def _workspace_new_stateful_node(node: NodeSpec) -> Any:
         if node.op == "aggregate.bin_stats":
             return BinStatsState.from_params(node.params)
+        if node.op == "aggregate.bin_ratio_stats":
+            return BinRatioStatsState.from_params(node.params)
         if node.op == "aggregate.bin2d_stats":
             return Bin2DStatsState.from_params(node.params)
         if node.op == "trace.rolling_mean":
@@ -3988,6 +4297,15 @@ class StreamAnalysisProcess(ManagedProcessBase):
                 include_hist_outputs=include_hist_outputs,
             )
             return True, None
+        if node.op == "aggregate.bin_ratio_stats":
+            values[node_id] = self._execute_workspace_aggregate_bin_ratio_stats(
+                workspace=workspace,
+                node=node,
+                node_id=node_id,
+                values=values,
+                include_hist_outputs=include_hist_outputs,
+            )
+            return True, None
         if node.op == "hist.divide":
             values[node_id] = execute_hist_divide(
                 values.get(node.inputs["numerator"]),
@@ -4023,6 +4341,32 @@ class StreamAnalysisProcess(ManagedProcessBase):
             workspace.node_state[node_id] = state
         last_sample = (
             state.update_sample(x_val, y_val)
+            if _workspace_node_gate_open(node, values)
+            else None
+        )
+        if not include_hist_outputs:
+            return None
+        return state.payload(last_sample=last_sample)
+
+    def _execute_workspace_aggregate_bin_ratio_stats(
+        self,
+        *,
+        workspace: WorkspaceRuntime,
+        node: NodeSpec,
+        node_id: str,
+        values: dict[str, Any],
+        include_hist_outputs: bool,
+    ) -> Json | None:
+        state = workspace.node_state.get(node_id)
+        if not isinstance(state, BinRatioStatsState):
+            state = BinRatioStatsState.from_params(node.params)
+            workspace.node_state[node_id] = state
+        last_sample = (
+            state.update_sample(
+                values.get(node.inputs["x"]),
+                values.get(node.inputs["numerator"]),
+                values.get(node.inputs["denominator"]),
+            )
             if _workspace_node_gate_open(node, values)
             else None
         )
@@ -4872,6 +5216,9 @@ class StreamAnalysisProcess(ManagedProcessBase):
             if isinstance(state, BinStatsState):
                 state.reset()
                 continue
+            if isinstance(state, BinRatioStatsState):
+                state.reset()
+                continue
             if isinstance(state, Bin2DStatsState):
                 state.reset()
                 continue
@@ -4888,6 +5235,9 @@ class StreamAnalysisProcess(ManagedProcessBase):
     ) -> bool:
         state = workspace.node_state.get(node_id)
         if isinstance(state, BinStatsState):
+            state.reset()
+            return True
+        if isinstance(state, BinRatioStatsState):
             state.reset()
             return True
         if isinstance(state, Bin2DStatsState):

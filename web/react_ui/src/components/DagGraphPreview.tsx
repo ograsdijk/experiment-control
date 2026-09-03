@@ -48,6 +48,7 @@ const DAG_INPUT_PORTS: Record<string, string[]> = {
   "trace.subtract_background": ["trace"],
   "trace.integrate": ["trace"],
   "aggregate.bin_stats": ["x", "y"],
+  "aggregate.bin_ratio_stats": ["x", "numerator", "denominator"],
   "hist.divide": ["numerator", "denominator"],
   "aggregate.bin2d_stats": ["x", "y", "z"],
 };

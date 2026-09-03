@@ -35,6 +35,7 @@ export type StreamDagOpId =
   | "fit.params"
   | "fit.from_hist_agg"
   | "aggregate.bin_stats"
+  | "aggregate.bin_ratio_stats"
   | "hist.divide"
   | "aggregate.bin2d_stats";
 

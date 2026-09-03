@@ -12,8 +12,11 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from experiment_control.processes.stream_analysis import (
+    BinRatioStatsState,
     OPS,
     OP_PARAM_SCHEMAS,
+    StreamAnalysisProcess,
+    WorkspaceRuntime,
     compile_workspace_graph,
     execute_hist_divide,
     execute_scalar_threshold,
@@ -214,6 +217,133 @@ class ExplicitGateTests(unittest.TestCase):
         )
         payload = {item["output_id"]: item["value"] for item in outputs}["hist"]
         self.assertEqual(payload["count"], [])
+
+
+class PairedBinRatioStatsTests(unittest.TestCase):
+    def test_registered(self) -> None:
+        spec = OPS["aggregate.bin_ratio_stats"]
+        self.assertEqual(
+            spec.input_types,
+            {"x": "scalar", "numerator": "scalar", "denominator": "scalar"},
+        )
+        self.assertEqual(spec.output_type, "hist_agg")
+        self.assertTrue(spec.stateful)
+        self.assertIn("aggregate.bin_ratio_stats", OP_PARAM_SCHEMAS)
+
+    def test_perfectly_correlated_inputs_have_zero_ratio_spread(self) -> None:
+        state = BinRatioStatsState.from_params({"auto_range": True, "bin_count": 10})
+        state.update_sample(1.0, 2.0, 1.0)
+        state.update_sample(1.0, 4.0, 2.0)
+        payload = state.payload(last_sample=None)
+        self.assertEqual(payload["mean"], [2.0])
+        self.assertAlmostEqual(payload["covariance"][0], 0.5)
+        self.assertAlmostEqual(payload["std"][0], 0.0)
+        self.assertAlmostEqual(payload["sem"][0], 0.0)
+        self.assertEqual(payload["uncertainty_assumption"], "paired_delta_method")
+
+    def test_covariance_aware_delta_method(self) -> None:
+        numerators = np.asarray([2.0, 5.0, 7.0])
+        denominators = np.asarray([1.0, 2.0, 4.0])
+        state = BinRatioStatsState.from_params(
+            {"auto_range": False, "x_min": 0.0, "x_max": 2.0, "bin_count": 1}
+        )
+        for numerator, denominator in zip(numerators, denominators, strict=True):
+            state.update_sample(1.0, numerator, denominator)
+        payload = state.payload(last_sample=None)
+        mean_n = float(np.mean(numerators))
+        mean_d = float(np.mean(denominators))
+        var_n = float(np.var(numerators))
+        var_d = float(np.var(denominators))
+        covariance = float(np.mean(numerators * denominators) - mean_n * mean_d)
+        expected_var = (
+            var_n / mean_d**2
+            + mean_n**2 * var_d / mean_d**4
+            - 2.0 * mean_n * covariance / mean_d**3
+        )
+        self.assertAlmostEqual(payload["mean"][0], mean_n / mean_d)
+        self.assertAlmostEqual(payload["std"][0], np.sqrt(expected_var))
+        self.assertAlmostEqual(payload["sem"][0], np.sqrt(expected_var / 3.0))
+
+    def test_single_sample_sem_is_unavailable(self) -> None:
+        state = BinRatioStatsState.from_params({"auto_range": True, "bin_count": 10})
+        state.update_sample(1.0, 4.0, 2.0)
+        payload = state.payload(last_sample=None)
+        self.assertEqual(payload["mean"], [2.0])
+        self.assertEqual(payload["count"], [1])
+        self.assertEqual(payload["sem"], [None])
+
+    def test_invalid_pair_is_dropped_together(self) -> None:
+        state = BinRatioStatsState.from_params({"auto_range": True, "bin_count": 10})
+        self.assertIsNone(state.update_sample(1.0, np.nan, 2.0))
+        payload = state.payload(last_sample=None)
+        self.assertEqual(payload["count"], [])
+        self.assertEqual(payload["dropped_samples"], 1)
+
+    def test_reset_clears_paired_samples(self) -> None:
+        state = BinRatioStatsState.from_params({"auto_range": True, "bin_count": 10})
+        state.update_sample(1.0, 4.0, 2.0)
+        state.reset()
+        payload = state.payload(last_sample=None)
+        self.assertEqual(payload["count"], [])
+        self.assertEqual(payload["mean"], [])
+        self.assertEqual(payload["dropped_samples"], 0)
+
+    def test_workspace_executes_paired_ratio_aggregate(self) -> None:
+        config = {
+            "workspace_id": "paired_ratio",
+            "graph": {
+                "nodes": [
+                    {
+                        "node_id": "src",
+                        "op": "source.stream",
+                        "params": {"device_id": "dev", "stream": "trace"},
+                    },
+                    {
+                        "node_id": "x",
+                        "op": "source.context_field",
+                        "params": {"field": "scan_value"},
+                    },
+                    {
+                        "node_id": "numerator",
+                        "op": "trace.window_mean",
+                        "inputs": {"trace": "src"},
+                        "params": {"start_idx": 0, "stop_idx": 2},
+                    },
+                    {
+                        "node_id": "denominator",
+                        "op": "trace.window_mean",
+                        "inputs": {"trace": "src"},
+                        "params": {"start_idx": 2, "stop_idx": 4},
+                    },
+                    {
+                        "node_id": "ratio",
+                        "op": "aggregate.bin_ratio_stats",
+                        "inputs": {
+                            "x": "x",
+                            "numerator": "numerator",
+                            "denominator": "denominator",
+                        },
+                        "params": {"auto_range": True, "bin_count": 10},
+                    },
+                ]
+            },
+            "publish": {"outputs": [{"output_id": "ratio", "node_id": "ratio"}]},
+        }
+        compiled = compile_workspace_graph(config)
+        proc = StreamAnalysisProcess.__new__(StreamAnalysisProcess)
+        proc._max_payload_points = 200_000
+        runtime = WorkspaceRuntime(compiled=compiled, raw_config=config, node_state={})
+        outputs = proc._execute_workspace_event(
+            workspace=runtime,
+            array=np.asarray([4.0, 4.0, 2.0, 2.0]),
+            context_fields={"scan_value": 1.0},
+            event_t_mono_s=0.0,
+            include_hist_outputs=True,
+            include_trace_outputs=False,
+        )
+        ratio = {item["output_id"]: item["value"] for item in outputs}["ratio"]
+        self.assertEqual(ratio["mean"], [2.0])
+        self.assertEqual(ratio["count"], [1])
 
 
 class HistogramDivideTests(unittest.TestCase):
