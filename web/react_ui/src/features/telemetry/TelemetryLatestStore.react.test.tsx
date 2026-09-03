@@ -8,6 +8,7 @@ import type { TelemetryMessage, TelemetrySignal } from "../../types";
 import {
   TelemetryLatestStore,
   useDeviceTelemetry,
+  useDeviceTelemetrySignalNames,
 } from "./TelemetryLatestStore";
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT =
@@ -66,5 +67,30 @@ describe("useDeviceTelemetry", () => {
 
     expect(rendersA).toHaveBeenCalledTimes(2);
     expect(rendersB).toHaveBeenCalledOnce();
+  });
+
+  it("does not rerender a schema subscriber for value-only updates", () => {
+    const store = new TelemetryLatestStore();
+    const renders = vi.fn();
+
+    function SignalNamesView() {
+      useDeviceTelemetrySignalNames("A", true, store);
+      renders();
+      return null;
+    }
+
+    const root = createRoot(document.createElement("div"));
+    mountedRoots.push(root);
+    act(() => root.render(createElement(SignalNamesView)));
+    expect(renders).toHaveBeenCalledOnce();
+
+    act(() => store.applyMessage(message("A", { temperature: signal(1) })));
+    expect(renders).toHaveBeenCalledTimes(2);
+
+    act(() => store.applyMessage(message("A", { temperature: signal(2) })));
+    expect(renders).toHaveBeenCalledTimes(2);
+
+    act(() => store.applyMessage(message("A", { pressure: signal(3) })));
+    expect(renders).toHaveBeenCalledTimes(3);
   });
 });

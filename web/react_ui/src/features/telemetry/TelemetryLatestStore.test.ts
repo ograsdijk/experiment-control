@@ -50,4 +50,49 @@ describe("TelemetryLatestStore", () => {
     expect(listener).toHaveBeenCalledOnce();
     expect(store.getLastReceiptAt()).toBe(99);
   });
+
+  it("keeps a stable sorted signal-name snapshot for value-only updates", () => {
+    const store = new TelemetryLatestStore();
+    const listener = vi.fn();
+    store.hydrate({ A: { pressure: signal(2), temperature: signal(1) } });
+    const names = store.getSignalNamesSnapshot("A");
+    store.subscribeSignalNames("A", listener);
+
+    store.applyMessage(message("A", { temperature: signal(3) }));
+
+    expect(store.getSignalNamesSnapshot("A")).toBe(names);
+    expect(store.getSignalNamesSnapshot("A")).toEqual(["pressure", "temperature"]);
+    expect(listener).not.toHaveBeenCalled();
+  });
+
+  it("notifies signal-name subscribers only when the schema changes or clears", () => {
+    const store = new TelemetryLatestStore();
+    const listener = vi.fn();
+    store.hydrate({ A: { temperature: signal(1) } });
+    store.subscribeSignalNames("A", listener);
+
+    store.applyMessage(message("A", { pressure: signal(2) }));
+
+    expect(listener).toHaveBeenCalledOnce();
+    expect(store.getSignalNamesSnapshot("A")).toEqual(["pressure", "temperature"]);
+
+    store.clear();
+
+    expect(listener).toHaveBeenCalledTimes(2);
+    expect(store.getSignalNamesSnapshot("A")).toEqual([]);
+  });
+
+  it("reports only changed signal names to narrow device subscribers", () => {
+    const store = new TelemetryLatestStore();
+    const listener = vi.fn();
+    store.subscribeDeviceSignalChanges("A", listener);
+
+    store.applyMessage(message("A", { temperature: signal(1), pressure: signal(2) }));
+    store.applyMessage(message("A", { temperature: signal(3) }));
+    store.clear();
+
+    expect(listener).toHaveBeenNthCalledWith(1, ["temperature", "pressure"]);
+    expect(listener).toHaveBeenNthCalledWith(2, ["temperature"]);
+    expect(listener).toHaveBeenNthCalledWith(3, ["temperature", "pressure"]);
+  });
 });

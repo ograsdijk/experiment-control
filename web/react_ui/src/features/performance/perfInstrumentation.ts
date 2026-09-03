@@ -24,6 +24,12 @@ export function perfCount(name: string, amount = 1): void {
   counters.set(name, (counters.get(name) ?? 0) + amount);
 }
 
+/** Records a current-value counter without allocating when instrumentation is off. */
+export function perfSet(name: string, value: number): void {
+  if (!enabled) return;
+  counters.set(name, value);
+}
+
 export function perfCountScoped(
   name: string,
   scope: string | undefined,

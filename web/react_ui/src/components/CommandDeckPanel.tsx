@@ -27,7 +27,7 @@ import {
 } from "@tabler/icons-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { effectiveDeviceMemberParams } from "../features/devices/command_schema";
-import { useDeviceTelemetry } from "../features/telemetry/TelemetryLatestStore";
+import { useDisplayedTelemetrySignal } from "../features/telemetry/DeviceTelemetryPresentationStore";
 import { SortableItem } from "../features/layout/SortableItem";
 import type {
   CapabilityMember,
@@ -108,8 +108,8 @@ function formatTelemetryValue(
 }
 
 function CommandDeckTelemetryValue({ entry }: { entry: CommandDeckTelemetryEntry }) {
-  const signals = useDeviceTelemetry(entry.deviceId);
-  const value = formatTelemetryValue(signals[entry.signal], {
+  const signal = useDisplayedTelemetrySignal(entry.deviceId, entry.signal);
+  const value = formatTelemetryValue(signal, {
     format: entry.format,
     decimals: entry.decimals,
   });
