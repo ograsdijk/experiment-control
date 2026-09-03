@@ -11,7 +11,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from graphlib import TopologicalSorter
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 import numpy as np
 import zmq
@@ -2035,9 +2035,9 @@ def execute_hist_divide(
         den_x = list(union_x)
         aligned_auto_bins = True
 
-    x_bins = [float(value) for value in num_x if value is not None]
-    if len(x_bins) != len(num_x):
-        return None
+    # Both matching paths above reject missing x values; cast records that
+    # invariant for static checking without adding another runtime branch.
+    x_bins = cast(list[float], num_x)
     size = len(x_bins)
     ratio_mean: list[float] = []
     ratio_std: list[float] = []
