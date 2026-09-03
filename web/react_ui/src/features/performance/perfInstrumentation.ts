@@ -24,6 +24,15 @@ export function perfCount(name: string, amount = 1): void {
   counters.set(name, (counters.get(name) ?? 0) + amount);
 }
 
+export function perfCountForPanel(
+  name: string,
+  panelId: string | undefined,
+  amount = 1
+): void {
+  if (!enabled || !panelId) return;
+  perfCount(`${name}.${panelId}`, amount);
+}
+
 export function perfMeasure<T>(name: string, operation: () => T): T {
   if (!enabled) return operation();
   const start = performance.now();

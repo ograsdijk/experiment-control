@@ -793,6 +793,7 @@ function PanelCardImpl({
       {isTelemetryPanel(panel) ? (
         <>
           <PlotPanel
+            panelId={panel.id}
             traces={panel.traces}
             buffers={panelBuffers}
             tick={panelRevision}
@@ -847,6 +848,7 @@ function PanelCardImpl({
         <>
           {isStreamRawPanel(panel) ? (
             <StreamRawPanel
+              panelId={panel.id}
               frames={streamFramesRef.get(panel.id) ?? []}
               overlayCount={
                 panel.sourceMode === "raw" &&
@@ -871,6 +873,7 @@ function PanelCardImpl({
             />
           ) : (
             <StreamWaterfallPanel
+              panelId={panel.id}
               frames={streamFramesRef.get(panel.id) ?? []}
               historyRows={panel.overlayCount}
               channelIndex={panel.sourceMode === "raw" ? panel.channelIndex : 0}
@@ -1038,6 +1041,7 @@ function PanelCardImpl({
       ) : isStreamScalarPanel(panel) ? (
         <>
           <PlotPanel
+            panelId={panel.id}
             traces={[streamScalarTrace(panel)]}
             buffers={panelBuffers}
             tick={panelRevision}
@@ -1111,6 +1115,7 @@ function PanelCardImpl({
       ) : isStreamBinStatsPanel(panel) ? (
         <>
           <StreamBinStatsPanel
+            panelId={panel.id}
             series={binStatsSnapshot?.series ?? null}
             overlaySeries={streamBinStatsOverlaySeries(panel)}
             fitOverlays={streamBinStatsFitOverlayCurves(panel)}
@@ -1206,6 +1211,7 @@ function PanelCardImpl({
       ) : isStreamBin2dPanel(panel) ? (
         <>
           <StreamBin2dPanel
+            panelId={panel.id}
             series={bin2dSnapshot?.series ?? null}
             reducer={panel.reducer}
             tick={panelRevision}

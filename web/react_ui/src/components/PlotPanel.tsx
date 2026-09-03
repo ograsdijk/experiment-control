@@ -6,9 +6,14 @@ import { TelemetryPlotDataCache } from "../features/telemetry/TelemetryPlotDataC
 import { RingBuffer } from "../utils/ringBuffer";
 import { colorWithAlpha, traceColorAt } from "../utils/traceColors";
 import { TraceKey } from "../types";
-import { perfCount, perfMeasure } from "../features/performance/perfInstrumentation";
+import {
+  perfCount,
+  perfCountForPanel,
+  perfMeasure,
+} from "../features/performance/perfInstrumentation";
 
 type PlotPanelProps = {
+  panelId?: string;
   traces: TraceKey[];
   buffers: Map<string, RingBuffer>;
   tick: number;
@@ -199,6 +204,7 @@ function legendNumericValue(
 }
 
 export function PlotPanel({
+  panelId,
   traces,
   buffers,
   tick,
@@ -548,9 +554,10 @@ export function PlotPanel({
     }
     const data = perfMeasure("telemetry.data_construction_ms", buildPanelData);
     perfCount("plot.uplot_setData");
+    perfCountForPanel("plot.uplot_setData", panelId);
     plotRef.current.setData(data as uPlot.AlignedData);
     applyTimeWindow(plotRef.current, data, timeWindowS);
-  }, [tick, timeWindowS, buildPanelData]);
+  }, [tick, timeWindowS, buildPanelData, panelId]);
 
   return <div className="plot-panel" ref={hostRef} />;
 }

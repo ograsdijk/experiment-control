@@ -1,8 +1,13 @@
 ﻿import { useEffect, useMemo, useRef } from "react";
 import type { StreamFrame } from "./StreamRawPanel";
-import { perfCount, perfMeasure } from "../features/performance/perfInstrumentation";
+import {
+  perfCount,
+  perfCountForPanel,
+  perfMeasure,
+} from "../features/performance/perfInstrumentation";
 
 type StreamWaterfallPanelProps = {
+  panelId?: string;
   frames: StreamFrame[];
   historyRows: number;
   channelIndex: number;
@@ -248,6 +253,7 @@ function formatValue(value: number | null): string {
 }
 
 export function StreamWaterfallPanel({
+  panelId,
   frames,
   historyRows,
   channelIndex,
@@ -354,6 +360,7 @@ export function StreamWaterfallPanel({
           hmCtx.putImageData(img, 0, 0);
           ctx.imageSmoothingEnabled = false;
           perfCount("canvas.waterfall_redraws");
+          perfCountForPanel("canvas.redraws", panelId);
           ctx.drawImage(hm, left, top, plotW, plotH);
         }
       } else {
@@ -408,7 +415,7 @@ export function StreamWaterfallPanel({
       resize.disconnect();
       cancelAnimationFrame(raf);
     };
-  }, [grid, zRange, isDark, plotHeight]);
+  }, [grid, zRange, isDark, plotHeight, panelId]);
 
   return (
     <div className="plot-panel" ref={hostRef} style={{ minHeight: plotHeight }}>

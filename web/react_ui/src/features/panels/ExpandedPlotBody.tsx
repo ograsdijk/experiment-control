@@ -109,6 +109,7 @@ export function ExpandedPlotBody({
   if (isTelemetryPanel(panel)) {
     return (
       <PlotPanel
+        panelId={panel.id}
         traces={panel.traces}
         buffers={buffersRef.get(panel.id) ?? new Map()}
         tick={panelRevision}
@@ -129,6 +130,7 @@ export function ExpandedPlotBody({
     if (isStreamRawPanel(panel)) {
       return (
         <StreamRawPanel
+          panelId={panel.id}
           frames={streamFramesRef.get(panel.id) ?? []}
           overlayCount={
             panel.sourceMode === "raw" &&
@@ -156,6 +158,7 @@ export function ExpandedPlotBody({
     }
     return (
       <StreamWaterfallPanel
+        panelId={panel.id}
         frames={streamFramesRef.get(panel.id) ?? []}
         historyRows={panel.overlayCount}
         channelIndex={panel.sourceMode === "raw" ? panel.channelIndex : 0}
@@ -171,6 +174,7 @@ export function ExpandedPlotBody({
   if (isStreamScalarPanel(panel)) {
     return (
       <PlotPanel
+        panelId={panel.id}
         traces={[streamScalarTrace(panel)]}
         buffers={buffersRef.get(panel.id) ?? new Map()}
         tick={panelRevision}
@@ -187,6 +191,7 @@ export function ExpandedPlotBody({
     const streamWorkspace = streamWorkspaces[panel.workspaceId] ?? null;
     return (
       <StreamBinStatsPanel
+        panelId={panel.id}
         series={(streamBinStatsRef.get(panel.id) ?? null)?.series ?? null}
         overlaySeries={streamBinStatsOverlaySeries(panel)}
         fitOverlays={streamBinStatsFitOverlayCurves(panel)}
@@ -208,6 +213,7 @@ export function ExpandedPlotBody({
   if (isStreamBin2dPanel(panel)) {
     return (
       <StreamBin2dPanel
+        panelId={panel.id}
         series={(streamBin2dRef.get(panel.id) ?? null)?.series ?? null}
         reducer={panel.reducer}
         tick={panelRevision}

@@ -20,7 +20,13 @@ import {
   IconRefresh,
   IconTerminal2,
 } from "@tabler/icons-react";
-import type { ReactNode } from "react";
+import {
+  memo,
+  useCallback,
+  useMemo,
+  useRef,
+  type ReactNode,
+} from "react";
 import {
   CapabilityMember,
   DeviceStatus,
@@ -147,7 +153,7 @@ function renderTelemetryValue(value: TelemetrySignal["value"]) {
   return { display: String(value), full: null, numeric: false };
 }
 
-function DeviceTelemetryBody({
+const DeviceTelemetryBody = memo(function DeviceTelemetryBody({
   deviceId,
   onPlot,
 }: {
@@ -160,7 +166,10 @@ function DeviceTelemetryBody({
   const darkTooltipStyles = computedColorScheme === "dark"
     ? { tooltip: { backgroundColor: "var(--mantine-color-dark-6)", color: "var(--mantine-color-gray-0)", border: "1px solid var(--mantine-color-dark-4)" } }
     : undefined;
-  const signalEntries = Object.entries(signals).sort((a, b) => a[0].localeCompare(b[0]));
+  const signalEntries = useMemo(
+    () => Object.entries(signals).sort((a, b) => a[0].localeCompare(b[0])),
+    [signals]
+  );
   const copyTelemetryValue = async (text: string) => {
     const copied = await copyToClipboard(text);
     notifications.show({
@@ -201,7 +210,7 @@ function DeviceTelemetryBody({
       })}
     </Stack>
   );
-}
+});
 
 export function DeviceCard({
   device,
@@ -224,6 +233,12 @@ export function DeviceCard({
   onPinnedSend,
 }: DeviceCardProps) {
   perfCount(`react.DeviceCard.${device.device_id}.renders`);
+  const onPlotRef = useRef(onPlot);
+  onPlotRef.current = onPlot;
+  const onTelemetryPlot = useCallback(
+    (signal: string) => onPlotRef.current(signal),
+    []
+  );
   const effectiveParams = (
     member: CapabilityMember | undefined
   ): CapabilityParamMeta[] => {
@@ -349,7 +364,10 @@ export function DeviceCard({
             </Button>
           </Group>
           {!telemetryCollapsed && (
-            <DeviceTelemetryBody deviceId={device.device_id} onPlot={onPlot} />
+            <DeviceTelemetryBody
+              deviceId={device.device_id}
+              onPlot={onTelemetryPlot}
+            />
           )}
         </Stack>
         {pinnedCommands.length > 0 && (

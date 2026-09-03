@@ -3,7 +3,11 @@ import { Alert } from "@mantine/core";
 import { IconAlertTriangle } from "@tabler/icons-react";
 import uPlot from "uplot";
 import { traceColorAt } from "../utils/traceColors";
-import { perfCount, perfMeasure } from "../features/performance/perfInstrumentation";
+import {
+  perfCount,
+  perfCountForPanel,
+  perfMeasure,
+} from "../features/performance/perfInstrumentation";
 
 export type StreamFrame = {
   seq: number;
@@ -23,6 +27,7 @@ export type StreamExtraSeries = {
 };
 
 type StreamRawPanelProps = {
+  panelId?: string;
   frames: StreamFrame[];
   overlayCount: number;
   channelIndex: number;
@@ -273,6 +278,7 @@ export function computeStreamRawAutoYRange(
 }
 
 export function StreamRawPanel({
+  panelId,
   frames,
   overlayCount,
   channelIndex,
@@ -423,8 +429,9 @@ export function StreamRawPanel({
     }
     perfCount("plot.uplot_setData");
     perfCount("plot.raw.uplot_setData");
+    perfCountForPanel("plot.uplot_setData", panelId);
     plotRef.current.setData(built.data as uPlot.AlignedData);
-  }, [tick, built.data]);
+  }, [tick, built.data, panelId]);
 
   const truncationDetails = truncatedFrame
     ? [
