@@ -148,6 +148,7 @@ import { useProcessCommandController } from "./features/processes/useProcessComm
 import { useProcessLifecycleController } from "./features/processes/useProcessLifecycleController";
 import { useProcessesController } from "./features/processes/useProcessesController";
 import { useTelemetryPipeline } from "./features/telemetry/useTelemetryPipeline";
+import { telemetryLatestStore } from "./features/telemetry/TelemetryLatestStore";
 import { useRawStreamSubscriptions } from "./features/telemetry/useRawStreamSubscriptions";
 import { useStreamAnalysisSubscriptions } from "./features/stream_analysis/useStreamAnalysisSubscriptions";
 import { useTelemetry } from "./features/telemetry/TelemetryContext";
@@ -1603,7 +1604,10 @@ export function App() {
   // Telemetry pipeline (round 33). See features/telemetry/useTelemetryPipeline.ts.
   // Owns the /ws/telemetry connection + per-sample fan-out into panel
   // buffers + the boolean-promotion logic on telemetry traces.
-  const { latestByDevice, wsConnected, telemetryActive } = useTelemetryPipeline();
+  const { wsConnected, telemetryActive } = useTelemetryPipeline();
+  // Imperative snapshot for low-rate configuration surfaces. Live device
+  // telemetry subscribes directly at the device boundary.
+  const latestByDevice = telemetryLatestStore.getLatestByDevice();
 
 
 
@@ -3119,7 +3123,6 @@ export function App() {
                     >
                       <DeviceCard
                         device={device}
-                        signals={latestByDevice[device.device_id]}
                         busy={Boolean(deviceBusyById[device.device_id])}
                         onConnect={() => handleDeviceConnect(device.device_id)}
                         onDisconnect={() => handleDeviceDisconnect(device.device_id)}

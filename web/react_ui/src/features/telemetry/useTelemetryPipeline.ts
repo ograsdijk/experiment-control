@@ -7,9 +7,13 @@ import { usePanels } from "../panels/PanelsContext";
 import { useTelemetry } from "./TelemetryContext";
 import { usePlotTick } from "../panels/PlotTickContext";
 import {
-  useTelemetryStream,
   type LatestSignals,
 } from "./useTelemetryStream";
+import {
+  telemetryLatestStore,
+  useTelemetryConnectionState,
+} from "./TelemetryLatestStore";
+import { useTelemetrySocket } from "./useTelemetrySocket";
 
 /**
  * End-to-end telemetry pipeline: subscribes to `/ws/telemetry` and
@@ -40,7 +44,6 @@ import {
  *     { latestByDevice, wsConnected, telemetryActive }
  */
 export function useTelemetryPipeline(): {
-  latestByDevice: LatestSignals;
   wsConnected: boolean;
   telemetryActive: boolean;
 } {
@@ -167,9 +170,10 @@ export function useTelemetryPipeline(): {
     [buffersRef, panelBuffersByTraceKey, setPanels, requestPlotTick]
   );
 
-  return useTelemetryStream({
+  useTelemetrySocket({
     hydrate: true,
     onHydrate: handleTelemetryHydrate,
     onMessage: handleTelemetryMessage,
   });
+  return useTelemetryConnectionState(telemetryLatestStore);
 }

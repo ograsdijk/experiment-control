@@ -27,6 +27,7 @@ import {
 } from "@tabler/icons-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { effectiveDeviceMemberParams } from "../features/devices/command_schema";
+import { useDeviceTelemetry } from "../features/telemetry/TelemetryLatestStore";
 import { SortableItem } from "../features/layout/SortableItem";
 import type {
   CapabilityMember,
@@ -104,6 +105,21 @@ function formatTelemetryValue(
     return { display: value ? "true" : "false", units, quality };
   }
   return { display: String(value), units, quality };
+}
+
+function CommandDeckTelemetryValue({ entry }: { entry: CommandDeckTelemetryEntry }) {
+  const signals = useDeviceTelemetry(entry.deviceId);
+  const value = formatTelemetryValue(signals[entry.signal], {
+    format: entry.format,
+    decimals: entry.decimals,
+  });
+  return (
+    <div className="command-deck-telemetry-value">
+      <Text size="sm" fw={500}>{value.display}</Text>
+      {value.units ? <Text size="xs" c="dimmed">{value.units}</Text> : null}
+      {value.quality ? <Badge size="xs" variant="light" color="gray">{value.quality}</Badge> : null}
+    </div>
+  );
 }
 
 type Props = {
@@ -754,13 +770,6 @@ export function CommandDeckPanel({
                               }`}
                             >
                               {(() => {
-                                const value = formatTelemetryValue(
-                                  latestSignalsByDevice[entry.deviceId]?.[entry.signal],
-                                  {
-                                    format: entry.format,
-                                    decimals: entry.decimals,
-                                  }
-                                );
                                 const label = String(entry.label ?? "").trim();
                                 return (
                                   <>
@@ -785,21 +794,7 @@ export function CommandDeckPanel({
                                         </Text>
                                       ) : null}
                                     </div>
-                                    <div className="command-deck-telemetry-value">
-                                      <Text size="sm" fw={500}>
-                                        {value.display}
-                                      </Text>
-                                      {value.units ? (
-                                        <Text size="xs" c="dimmed">
-                                          {value.units}
-                                        </Text>
-                                      ) : null}
-                                      {value.quality ? (
-                                        <Badge size="xs" variant="light" color="gray">
-                                          {value.quality}
-                                        </Badge>
-                                      ) : null}
-                                    </div>
+                                    <CommandDeckTelemetryValue entry={entry} />
                                   </>
                                 );
                               })()}

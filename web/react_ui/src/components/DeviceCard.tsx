@@ -30,12 +30,12 @@ import {
 import { DeviceNameInline } from "./DeviceNameInline";
 import { copyToClipboard } from "../utils/clipboard";
 import { perfCount } from "../features/performance/perfInstrumentation";
+import { useDeviceTelemetry } from "../features/telemetry/TelemetryLatestStore";
 
 type CapabilityParamMeta = NonNullable<CapabilityMember["params"]>[number];
 
 type DeviceCardProps = {
   device: DeviceStatus;
-  signals: Record<string, TelemetrySignal> | undefined;
   busy: boolean;
   onConnect: () => void;
   onDisconnect: () => void;
@@ -127,9 +127,84 @@ function DraggableTelemetrySignalRow({
   );
 }
 
+function renderTelemetryValue(value: TelemetrySignal["value"]) {
+  if (value === null || value === undefined) {
+    return { display: "n/a", full: null as string | null, numeric: false };
+  }
+  if (typeof value === "boolean") {
+    return { display: value ? "true" : "false", full: null, numeric: false };
+  }
+  if (typeof value === "number") {
+    if (Number.isNaN(value)) {
+      return { display: "NaN", full: null, numeric: false };
+    }
+    return {
+      display: formatNumericShort(value),
+      full: formatNumericFull(value),
+      numeric: true,
+    };
+  }
+  return { display: String(value), full: null, numeric: false };
+}
+
+function DeviceTelemetryBody({
+  deviceId,
+  onPlot,
+}: {
+  deviceId: string;
+  onPlot: (signal: string) => void;
+}) {
+  perfCount(`react.DeviceTelemetryBody.${deviceId}.renders`);
+  const signals = useDeviceTelemetry(deviceId);
+  const computedColorScheme = useComputedColorScheme("light");
+  const darkTooltipStyles = computedColorScheme === "dark"
+    ? { tooltip: { backgroundColor: "var(--mantine-color-dark-6)", color: "var(--mantine-color-gray-0)", border: "1px solid var(--mantine-color-dark-4)" } }
+    : undefined;
+  const signalEntries = Object.entries(signals).sort((a, b) => a[0].localeCompare(b[0]));
+  const copyTelemetryValue = async (text: string) => {
+    const copied = await copyToClipboard(text);
+    notifications.show({
+      color: copied ? "teal" : "red",
+      title: copied ? "Telemetry value copied" : "Copy failed",
+      message: copied ? text : "Clipboard write failed",
+    });
+  };
+  return (
+    <Stack gap={4}>
+      {signalEntries.length === 0 && <Text size="xs" c="dimmed">No telemetry yet</Text>}
+      {signalEntries.map(([name, sig]) => {
+        const rendered = renderTelemetryValue(sig.value);
+        const fullWithUnits = rendered.numeric && rendered.full
+          ? `${rendered.full}${sig.units ? ` ${sig.units}` : ""}`
+          : null;
+        return (
+          <DraggableTelemetrySignalRow key={name} deviceId={deviceId} signal={name}>
+            <Group justify="space-between" align="center" component="div">
+              <Text size="sm">{name}</Text>
+              <Group gap={6}>
+                {fullWithUnits ? (
+                  <Tooltip label={`${fullWithUnits} (click to copy)`} withArrow styles={darkTooltipStyles}>
+                    <Text size="sm" fw={500} style={{ cursor: "copy" }} onClick={() => void copyTelemetryValue(fullWithUnits)}>
+                      {rendered.display}{sig.units ? ` ${sig.units}` : ""}
+                    </Text>
+                  </Tooltip>
+                ) : (
+                  <Text size="sm" fw={500}>{rendered.display}{sig.units ? ` ${sig.units}` : ""}</Text>
+                )}
+                <ActionIcon size="sm" variant="subtle" onClick={() => onPlot(name)} aria-label={`Plot ${name}`}>
+                  <IconChartLine size={14} />
+                </ActionIcon>
+              </Group>
+            </Group>
+          </DraggableTelemetrySignalRow>
+        );
+      })}
+    </Stack>
+  );
+}
+
 export function DeviceCard({
   device,
-  signals,
   busy,
   onConnect,
   onDisconnect,
@@ -149,17 +224,6 @@ export function DeviceCard({
   onPinnedSend,
 }: DeviceCardProps) {
   perfCount(`react.DeviceCard.${device.device_id}.renders`);
-  const computedColorScheme = useComputedColorScheme("light");
-  const darkTooltipStyles =
-    computedColorScheme === "dark"
-      ? {
-          tooltip: {
-            backgroundColor: "var(--mantine-color-dark-6)",
-            color: "var(--mantine-color-gray-0)",
-            border: "1px solid var(--mantine-color-dark-4)",
-          },
-        }
-      : undefined;
   const effectiveParams = (
     member: CapabilityMember | undefined
   ): CapabilityParamMeta[] => {
@@ -177,47 +241,6 @@ export function DeviceCard({
       ];
     }
     return member.params ?? [];
-  };
-  const signalEntries = Object.entries(signals ?? {}).sort((a, b) =>
-    a[0].localeCompare(b[0])
-  );
-  const renderValue = (value: TelemetrySignal["value"]) => {
-    if (value === null || value === undefined) {
-      return { display: "n/a", full: null as string | null, numeric: false };
-    }
-    if (typeof value === "boolean") {
-      return {
-        display: value ? "true" : "false",
-        full: null as string | null,
-        numeric: false,
-      };
-    }
-    if (typeof value === "number") {
-      if (Number.isNaN(value)) {
-        return { display: "NaN", full: null as string | null, numeric: false };
-      }
-      return {
-        display: formatNumericShort(value),
-        full: formatNumericFull(value),
-        numeric: true,
-      };
-    }
-    return { display: String(value), full: null as string | null, numeric: false };
-  };
-  const copyTelemetryValue = async (text: string) => {
-    if (await copyToClipboard(text)) {
-      notifications.show({
-        color: "teal",
-        title: "Telemetry value copied",
-        message: text,
-      });
-    } else {
-      notifications.show({
-        color: "red",
-        title: "Copy failed",
-        message: "Clipboard write failed",
-      });
-    }
   };
   const deviceStateUpper = String(device.device_state ?? "").toUpperCase();
   const livenessUpper = String(device.liveness ?? "").toUpperCase();
@@ -326,72 +349,7 @@ export function DeviceCard({
             </Button>
           </Group>
           {!telemetryCollapsed && (
-            <Stack gap={4}>
-              {signalEntries.length === 0 && (
-                <Text size="xs" c="dimmed">
-                  No telemetry yet
-                </Text>
-              )}
-              {signalEntries.map(([name, sig]) => (
-                (() => {
-                  const rendered = renderValue(sig.value);
-                  const fullWithUnits =
-                    rendered.numeric && rendered.full
-                      ? `${rendered.full}${sig.units ? ` ${sig.units}` : ""}`
-                      : null;
-                  return (
-                    <DraggableTelemetrySignalRow
-                      key={name}
-                      deviceId={device.device_id}
-                      signal={name}
-                    >
-                      <Group justify="space-between" align="center" component="div">
-                        <Text size="sm">{name}</Text>
-                        <Group gap={6}>
-                          {fullWithUnits ? (
-                            <Tooltip
-                              label={`${fullWithUnits} (click to copy)`}
-                              withArrow
-                              styles={darkTooltipStyles}
-                            >
-                              <Text
-                                size="sm"
-                                fw={500}
-                                style={{ cursor: "copy" }}
-                                onClick={() => {
-                                  void copyTelemetryValue(fullWithUnits);
-                                }}
-                              >
-                                {rendered.display}
-                              </Text>
-                            </Tooltip>
-                          ) : (
-                            <Text size="sm" fw={500}>
-                              {rendered.display}
-                            </Text>
-                          )}
-                          {sig.units && (
-                            <Text size="xs" c="dimmed">
-                              {sig.units}
-                            </Text>
-                          )}
-                          <Tooltip label="Add to plot" withArrow>
-                            <ActionIcon
-                              variant="light"
-                              color="teal"
-                              size="sm"
-                              onClick={() => onPlot(name)}
-                            >
-                              <IconChartLine size={14} />
-                            </ActionIcon>
-                          </Tooltip>
-                        </Group>
-                      </Group>
-                    </DraggableTelemetrySignalRow>
-                  );
-                })()
-              ))}
-            </Stack>
+            <DeviceTelemetryBody deviceId={device.device_id} onPlot={onPlot} />
           )}
         </Stack>
         {pinnedCommands.length > 0 && (
