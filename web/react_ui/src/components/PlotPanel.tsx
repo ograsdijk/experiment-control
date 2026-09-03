@@ -1,7 +1,8 @@
 ﻿import { useEffect, useMemo, useRef } from "react";
 import uPlot from "uplot";
 import type { TelemetrySmoothingMode } from "../features/stream/types";
-import { buildTelemetrySmoothingOverlays } from "../features/stream/telemetry_smoothing";
+import { TelemetrySmoothingCache } from "../features/stream/telemetry_smoothing";
+import { TelemetryPlotDataCache } from "../features/telemetry/TelemetryPlotDataCache";
 import { RingBuffer } from "../utils/ringBuffer";
 import { colorWithAlpha, traceColorAt } from "../utils/traceColors";
 import { TraceKey } from "../types";
@@ -38,23 +39,7 @@ export function buildTelemetryData(
   traces: TraceKey[],
   buffers: Map<string, RingBuffer>
 ) {
-  if (traces.length === 0) {
-    return [[]];
-  }
-  const seriesData = traces.map((trace) => {
-    const key = traceKeyToId(trace);
-    const buffer = buffers.get(key);
-    return buffer ? buffer.toArrays() : [[], []];
-  });
-  const lengths = seriesData.map((pair) => pair[0].length).filter((len) => len > 0);
-  const minLen = lengths.length > 0 ? Math.min(...lengths) : 0;
-  if (!Number.isFinite(minLen) || minLen <= 0) {
-    return [[], ...traces.map(() => [])];
-  }
-  const [time] = seriesData[0];
-  const t = time.slice(-minLen);
-  const values = seriesData.map(([, v]) => v.slice(-minLen));
-  return [t, ...values];
+  return new TelemetryPlotDataCache().update(traces, buffers);
 }
 
 export function computeTelemetryAutoYRange(
@@ -62,35 +47,46 @@ export function computeTelemetryAutoYRange(
   buffers: Map<string, RingBuffer>,
   timeWindowS: number
 ): { min: number; max: number } | null {
-  const data = buildTelemetryData(traces, buffers);
-  if (data.length <= 1) {
+  if (traces.length === 0) {
     return null;
   }
-  const x = data[0];
-  if (!x || x.length === 0) {
-    return null;
-  }
-  let startIdx = 0;
-  if (Number.isFinite(timeWindowS) && timeWindowS > 0) {
-    const latest = x[x.length - 1];
-    if (Number.isFinite(latest)) {
-      const minX = latest - timeWindowS;
-      for (let idx = x.length - 1; idx >= 0; idx -= 1) {
-        if (x[idx] < minX) {
-          startIdx = Math.min(x.length - 1, idx + 1);
-          break;
-        }
-      }
+  const ringBuffers = traces.map((trace) => buffers.get(traceKeyToId(trace)) ?? null);
+  let minLength = Number.POSITIVE_INFINITY;
+  for (const buffer of ringBuffers) {
+    if (buffer && buffer.length > 0) {
+      minLength = Math.min(minLength, buffer.length);
     }
+  }
+  if (
+    !Number.isFinite(minLength) ||
+    minLength <= 0 ||
+    !ringBuffers[0] ||
+    ringBuffers[0].length === 0
+  ) {
+    return null;
+  }
+  const first = ringBuffers[0];
+  const firstStart = first.length - minLength;
+  const latest = first.latest()?.time;
+  let startIdx = 0;
+  if (Number.isFinite(timeWindowS) && timeWindowS > 0 && Number.isFinite(latest)) {
+    const minX = Number(latest) - timeWindowS;
+    first.forEachOrdered((time, _value, index) => {
+      if (time < minX) {
+        startIdx = Math.min(minLength - 1, index - firstStart + 1);
+      }
+    }, firstStart);
   }
   let minY = Number.POSITIVE_INFINITY;
   let maxY = Number.NEGATIVE_INFINITY;
-  for (let si = 1; si < data.length; si += 1) {
-    const series = data[si];
-    for (let i = startIdx; i < series.length; i += 1) {
-      const value = series[i];
+  for (const buffer of ringBuffers) {
+    if (!buffer) {
+      continue;
+    }
+    const bufferStart = buffer.length - minLength + startIdx;
+    buffer.forEachOrdered((_time, value) => {
       if (!Number.isFinite(value)) {
-        continue;
+        return;
       }
       if (value < minY) {
         minY = value;
@@ -98,7 +94,7 @@ export function computeTelemetryAutoYRange(
       if (value > maxY) {
         maxY = value;
       }
-    }
+    }, bufferStart);
   }
   if (!Number.isFinite(minY) || !Number.isFinite(maxY)) {
     return null;
@@ -114,7 +110,8 @@ function applyTelemetryDisplayTransform(
   data: number[][],
   seriesEntries: readonly PanelSeriesEntry[],
   yDisplayMode: "absolute" | "delta",
-  yOffset: number | null
+  yOffset: number | null,
+  targets: number[][] = [[]]
 ): number[][] {
   if (
     yDisplayMode !== "delta" ||
@@ -124,21 +121,23 @@ function applyTelemetryDisplayTransform(
   ) {
     return data;
   }
-  const out: number[][] = [data[0]];
+  targets.length = data.length;
+  targets[0] = data[0];
   for (let si = 1; si < data.length; si += 1) {
     const entry = seriesEntries[si - 1];
     const series = data[si] ?? [];
     if (entry?.trace.valueKind === "boolean") {
-      out.push(series);
+      targets[si] = series;
       continue;
     }
-    out.push(
-      series.map((value) =>
-        Number.isFinite(value) ? value - yOffset : value
-      )
-    );
+    const target = (targets[si] ??= []);
+    target.length = series.length;
+    for (let index = 0; index < series.length; index += 1) {
+      const value = series[index];
+      target[index] = Number.isFinite(value) ? value - yOffset : value;
+    }
   }
-  return out;
+  return targets;
 }
 
 function latestTimestamp(data: number[][]): number | null {
@@ -216,6 +215,10 @@ export function PlotPanel({
 }: PlotPanelProps) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const plotRef = useRef<uPlot | null>(null);
+  const dataCacheRef = useRef(new TelemetryPlotDataCache());
+  const combinedDataRef = useRef<number[][]>([[]]);
+  const smoothingCachesRef = useRef<TelemetrySmoothingCache[]>([]);
+  const displayTargetsRef = useRef<number[][]>([[]]);
   const isDark = colorScheme === "dark";
 
   const formatNumber = useMemo(() => {
@@ -294,38 +297,47 @@ export function PlotPanel({
 
   const buildPanelData = useMemo(
     () => (): number[][] => {
-      const rawData = buildTelemetryData(traces, buffers);
+      const rawData = dataCacheRef.current.update(traces, buffers);
       const time = rawData[0] ?? [];
-      const rawSeries = rawData.slice(1);
-      const combined: number[][] = [time, ...rawSeries];
+      const timeBuffer = traces[0]
+        ? buffers.get(traceKeyToId(traces[0])) ?? null
+        : null;
+      const combined = combinedDataRef.current;
+      combined.length = rawData.length;
+      for (let index = 0; index < rawData.length; index += 1) {
+        combined[index] = rawData[index];
+      }
       if (smoothingModeNormalized !== "none" && time.length > 0 && traces.length > 0) {
-        const overlays = buildTelemetrySmoothingOverlays(
-          time,
-          traces,
-          rawSeries,
-          smoothingModeNormalized,
-          smoothingWindowNormalized
-        );
-        const overlaysByTrace = new Map<number, number[]>(
-          overlays.map((entry) => [entry.traceIndex, entry.values])
-        );
         for (const entry of seriesEntries) {
           if (!entry.isOverlay) {
             continue;
           }
-          const overlay = overlaysByTrace.get(entry.traceIndex);
-          if (overlay && overlay.length === time.length) {
-            combined.push(overlay);
-          } else {
-            combined.push(new Array(time.length).fill(Number.NaN));
-          }
+          const cache = (smoothingCachesRef.current[entry.traceIndex] ??=
+            new TelemetrySmoothingCache());
+          const values = rawData[entry.traceIndex + 1] ?? [];
+          const valueBuffer = buffers.get(traceKeyToId(entry.trace)) ?? null;
+          combined.push(
+            perfMeasure("telemetry.smoothing_ms", () =>
+              cache.update(
+                time,
+                values,
+                smoothingModeNormalized,
+                smoothingWindowNormalized,
+                timeBuffer?.sequence ?? -1,
+                valueBuffer?.sequence ?? -1,
+                timeBuffer?.structuralGeneration ?? -1,
+                valueBuffer?.structuralGeneration ?? -1
+              )
+            )
+          );
         }
       }
       return applyTelemetryDisplayTransform(
         combined,
         seriesEntries,
         yDisplayMode,
-        yOffset
+        yOffset,
+        displayTargetsRef.current
       );
     },
     [
