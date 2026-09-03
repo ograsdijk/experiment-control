@@ -1,0 +1,34 @@
+version: 1
+presets:
+  light:
+    telemetry_devices: 4
+    telemetry_signals: 10
+    telemetry_hz: 5
+    trace_devices: 1
+    trace_channels: 2
+    trace_points: 1024
+    trace_hz: 10
+  baseline:
+    telemetry_devices: 8
+    telemetry_signals: 20
+    telemetry_hz: 10
+    trace_devices: 2
+    trace_channels: 4
+    trace_points: 2048
+    trace_hz: 20
+  heavy:
+    telemetry_devices: 12
+    telemetry_signals: 20
+    telemetry_hz: 10
+    trace_devices: 2
+    trace_channels: 4
+    trace_points: 4096
+    trace_hz: 25
+  stress:
+    telemetry_devices: 16
+    telemetry_signals: 24
+    telemetry_hz: 20
+    trace_devices: 3
+    trace_channels: 4
+    trace_points: 4096
+    trace_hz: 30
