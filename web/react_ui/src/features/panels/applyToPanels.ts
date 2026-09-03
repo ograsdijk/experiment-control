@@ -37,6 +37,10 @@ import {
 } from "../stream/utils";
 import { RingBuffer } from "../../utils/ringBuffer";
 import { extractTrace } from "../../components/StreamRawPanel";
+import {
+  rawStreamSubscriptionKey,
+  rawStreamSubscriptionKeysForPanel,
+} from "../telemetry/rawStreamHydration";
 
 /**
  * Pure (controlled-mutation) helpers that route WS-arriving stream
@@ -49,14 +53,11 @@ import { extractTrace } from "../../components/StreamRawPanel";
  * one of App.tsx's largest blocks (~280 LOC).
  *
  * **Mutation semantics**: each helper writes only to the refs in the
- * provided `deps` object. They return `true` when at least one panel
- * received an update so the caller knows to bump `plotTick` and
- * trigger a re-render.
+ * provided `deps` object. They return the exact panel IDs changed so callers
+ * can coalesce targeted redraws.
  *
- * **Read semantics**: both helpers iterate `deps.panelsRef.current` —
- * the state-mirror ref that PanelsContext keeps in sync with the
- * `panels` state. This avoids capturing a stale snapshot when the
- * helper is called from async callbacks.
+ * **Read semantics**: both helpers route through reverse indexes kept in sync
+ * with panel configuration, avoiding an all-panel scan for each frame.
  */
 
 export const MAX_STREAM_FRAME_BUFFER = 240;
@@ -85,6 +86,7 @@ export interface ApplyHelpersDeps {
   panelsByWorkspaceOutputRef: MutableRefObject<
     Map<string, Map<string, PlotPanelState[]>>
   >;
+  rawPanelsBySubscriptionRef: MutableRefObject<Map<string, PlotPanelState[]>>;
   buffersRef: Map<string, Map<string, RingBuffer>>;
   streamFramesRef: Map<string, StreamFrameSample[]>;
   streamTraceOverlayRef: Map<
@@ -210,9 +212,14 @@ export function applyRawStreamFrameToPanels(
     originalPointCount?: number | null;
     maxPayloadPoints?: number | null;
   }
-): boolean {
-  let updated = false;
-  for (const panel of deps.panelsRef.current) {
+): Set<string> {
+  const dirtyPanelIds = new Set<string>();
+  const normalized = extractTrace(frame, subscription.channelIndex);
+  const interested =
+    deps.rawPanelsBySubscriptionRef.current.get(
+      rawStreamSubscriptionKey(subscription)
+    ) ?? [];
+  for (const panel of interested) {
     if (
       !isStreamTracePanel(panel) ||
       panel.sourceMode !== "raw" ||
@@ -267,9 +274,9 @@ export function applyRawStreamFrameToPanels(
         seq: frame.seq,
         // The socket is channel-specific and live frames arrive 1-D, but
         // snapshot frames may be 2-D — extractTrace handles both.
-        values: extractTrace(frame, subscription.channelIndex).y,
+        values: normalized.y,
       });
-      updated = true;
+      dirtyPanelIds.add(panel.id);
       continue;
     }
     let currentFrames = deps.streamFramesRef.get(panel.id);
@@ -285,7 +292,7 @@ export function applyRawStreamFrameToPanels(
     }
     // PerfD: mutate the frames array in place to avoid the spread+
     // slice double-allocation per WS message. Consumers re-render via
-    // plotTick anyway; their useMemos re-fire on tick changes, not on
+    // a panel revision anyway; their useMemos re-fire on revision changes, not on
     // frames-array identity.
     currentFrames.push({
       seq: frame.seq,
@@ -295,14 +302,16 @@ export function applyRawStreamFrameToPanels(
       originalShape: frame.originalShape,
       originalPointCount: frame.originalPointCount,
       maxPayloadPoints: frame.maxPayloadPoints,
+      normalizedTrace: normalized.y,
+      normalizedChannelCount: normalized.channelCount,
     });
     const keep = Math.max(MAX_STREAM_FRAME_BUFFER, panel.overlayCount * 4);
     if (currentFrames.length > keep) {
       currentFrames.splice(0, currentFrames.length - keep);
     }
-    updated = true;
+    dirtyPanelIds.add(panel.id);
   }
-  return updated;
+  return dirtyPanelIds;
 }
 
 export function applyStreamAnalysisOutputToPanels(
@@ -315,7 +324,7 @@ export function applyStreamAnalysisOutputToPanels(
     traceRollingWindow: number;
     traceAverageMode: StreamTraceAverageMode;
   } | undefined
-): boolean {
+): Set<string> {
   // PerfC: O(matching) loop via reverse index instead of O(N panels).
   // `interested` lists every panel that referenced this exact
   // (workspaceId, outputId) at the last index build (panel add/edit/
@@ -326,9 +335,9 @@ export function applyStreamAnalysisOutputToPanels(
     .get(output.workspaceId)
     ?.get(output.outputId);
   if (!interested || interested.length === 0) {
-    return false;
+    return new Set();
   }
-  let updated = false;
+  const dirtyPanelIds = new Set<string>();
   if (output.kind === "scalar") {
     const scalar = Number(output.value);
     if (Number.isFinite(scalar)) {
@@ -342,7 +351,7 @@ export function applyStreamAnalysisOutputToPanels(
             panelBuffers.set(key, buffer);
           }
           if (pushStreamScalarSample(buffer, output.tWallS, scalar)) {
-            updated = true;
+            dirtyPanelIds.add(panel.id);
           }
           continue;
         }
@@ -350,11 +359,11 @@ export function applyStreamAnalysisOutputToPanels(
           const latest = deps.streamParamsLatestRef.get(panel.id) ?? {};
           latest[output.outputId] = scalar;
           deps.streamParamsLatestRef.set(panel.id, latest);
-          updated = true;
+          dirtyPanelIds.add(panel.id);
         }
       }
     }
-    return updated;
+    return dirtyPanelIds;
   }
   if (output.kind === "params_map") {
     const paramsMap = normalizeFitParamsMapValue(output.value);
@@ -366,10 +375,10 @@ export function applyStreamAnalysisOutputToPanels(
         const latest = deps.streamParamsLatestRef.get(panel.id) ?? {};
         latest[output.outputId] = paramsMap;
         deps.streamParamsLatestRef.set(panel.id, latest);
-        updated = true;
+        dirtyPanelIds.add(panel.id);
       }
     }
-    return updated;
+    return dirtyPanelIds;
   }
   if (output.kind === "hist_agg") {
     const series = normalizeHistAggValue(output.value);
@@ -384,10 +393,10 @@ export function applyStreamAnalysisOutputToPanels(
           continue;
         }
         deps.streamBinStatsRef.set(panel.id, series);
-        updated = true;
+        dirtyPanelIds.add(panel.id);
       }
     }
-    return updated;
+    return dirtyPanelIds;
   }
   if (output.kind === "hist2d") {
     const snapshot = normalizeHist2dValue(output.value);
@@ -397,10 +406,10 @@ export function applyStreamAnalysisOutputToPanels(
           continue;
         }
         deps.streamBin2dRef.set(panel.id, snapshot);
-        updated = true;
+        dirtyPanelIds.add(panel.id);
       }
     }
-    return updated;
+    return dirtyPanelIds;
   }
   if (output.kind === "fit_1d") {
     const fit = normalizeFitCurveValue(output.value);
@@ -420,10 +429,10 @@ export function applyStreamAnalysisOutputToPanels(
           deps.streamBinStatsFitOverlayRef.get(panel.id) ?? new Map();
         perPanel.set(output.outputId, fit);
         deps.streamBinStatsFitOverlayRef.set(panel.id, perPanel);
-        updated = true;
+        dirtyPanelIds.add(panel.id);
       }
     }
-    return updated;
+    return dirtyPanelIds;
   }
   if (output.kind === "trace") {
     const values = normalizeTraceValues(output.value);
@@ -440,7 +449,7 @@ export function applyStreamAnalysisOutputToPanels(
             output.seq ?? (perPanel.get(output.outputId)?.seq ?? 0) + 1;
           perPanel.set(output.outputId, { seq, values });
           deps.streamBinStatsOverlayRef.set(panel.id, perPanel);
-          updated = true;
+          dirtyPanelIds.add(panel.id);
           continue;
         }
         if (
@@ -475,7 +484,7 @@ export function applyStreamAnalysisOutputToPanels(
           const seq = output.seq ?? (perPanel.get(output.outputId)?.seq ?? 0) + 1;
           perPanel.set(output.outputId, { seq, values });
           deps.streamTraceOverlayRef.set(panel.id, perPanel);
-          updated = true;
+          dirtyPanelIds.add(panel.id);
           continue;
         }
         let currentFrames = deps.streamFramesRef.get(panel.id);
@@ -503,15 +512,31 @@ export function applyStreamAnalysisOutputToPanels(
           originalShape: output.originalShape,
           originalPointCount: output.originalPointCount,
           maxPayloadPoints: output.maxPayloadPoints,
+          normalizedTrace: values,
+          normalizedChannelCount: 1,
         });
         const keep = Math.max(MAX_STREAM_FRAME_BUFFER, panel.overlayCount * 4);
         if (currentFrames.length > keep) {
           currentFrames.splice(0, currentFrames.length - keep);
         }
-        updated = true;
+        dirtyPanelIds.add(panel.id);
       }
     }
-    return updated;
+    return dirtyPanelIds;
   }
-  return updated;
+  return dirtyPanelIds;
+}
+
+export function buildRawPanelsBySubscription(
+  panels: PlotPanelState[]
+): Map<string, PlotPanelState[]> {
+  const index = new Map<string, PlotPanelState[]>();
+  for (const panel of panels) {
+    for (const key of rawStreamSubscriptionKeysForPanel(panel)) {
+      const bucket = index.get(key);
+      if (bucket) bucket.push(panel);
+      else index.set(key, [panel]);
+    }
+  }
+  return index;
 }

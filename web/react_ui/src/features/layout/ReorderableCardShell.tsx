@@ -11,6 +11,7 @@ type ReorderableCardShellProps = {
   style?: CSSProperties;
   dataPanelCardId?: string;
   dataDeviceCardId?: string;
+  observeRef?: (node: HTMLElement | null) => void;
 };
 
 export function ReorderableCardShell({
@@ -22,12 +23,16 @@ export function ReorderableCardShell({
   style,
   dataPanelCardId,
   dataDeviceCardId,
+  observeRef,
 }: ReorderableCardShellProps) {
   return (
     <SortableItem id={id} data={data}>
       {({ setNodeRef, attributes, listeners, style: sortableStyle }) => (
         <Card
-          ref={setNodeRef}
+          ref={(node) => {
+            setNodeRef(node);
+            observeRef?.(node);
+          }}
           className={className}
           radius="lg"
           p="md"

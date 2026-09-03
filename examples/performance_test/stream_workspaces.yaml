@@ -1,0 +1,77 @@
+version: 1
+workspaces:
+  - workspace_id: performance-main
+    name: Performance analysis
+    enabled: true
+    graph:
+      nodes:
+        - node_id: source
+          op: source.stream
+          params:
+            device_id: perf_trace_00
+            stream: trace
+            channel_mode: single
+            channel_index: 0
+            channel_indices: "0"
+        - node_id: background
+          op: trace.subtract_background
+          params: {bg_start_idx: 0, bg_stop_idx: 64}
+          inputs: {trace: source}
+        - node_id: decimated
+          op: trace.decimate
+          params: {method: minmax, target_points: 1024}
+          inputs: {trace: background}
+        - node_id: integral
+          op: trace.integrate
+          params: {}
+          inputs: {trace: background}
+        - node_id: x_value
+          op: source.telemetry_nearest
+          params: {device_id: perf_tel_00, signal: float_00, max_dt_s: 2.0}
+        - node_id: y_value
+          op: source.telemetry_nearest
+          params: {device_id: perf_tel_00, signal: float_01, max_dt_s: 2.0}
+        - node_id: bin_stats
+          op: aggregate.bin_stats
+          params: {auto_range: true, x_min: -2, x_max: 12, bin_count: 32}
+          inputs: {x: x_value, y: integral}
+        - node_id: bin2d
+          op: aggregate.bin2d_stats
+          params:
+            x_auto_range: true
+            y_auto_range: true
+            x_min: -2
+            x_max: 12
+            y_min: -2
+            y_max: 12
+            x_bin_count: 24
+            y_bin_count: 24
+          inputs: {x: x_value, y: y_value, z: integral}
+        - node_id: fit
+          op: fit.from_hist_agg
+          params:
+            y_source: mean
+            model: gaussian
+            baseline_mode: constant
+            every_n: 5
+            dense_eval_points: 128
+            chi2_sigma_source: sem
+            min_count: 1
+          inputs: {hist: bin_stats}
+        - node_id: fit_curve
+          op: fit.yhat_dense
+          params: {}
+          inputs: {fit: fit}
+        - node_id: fit_params
+          op: fit.params
+          params: {}
+          inputs: {fit: fit}
+    publish:
+      outputs:
+        - {output_id: trace, node_id: decimated}
+        - {output_id: scalar, node_id: integral}
+        - {output_id: bin_stats, node_id: bin_stats}
+        - {output_id: fit, node_id: fit}
+        - {output_id: fit_curve, node_id: fit_curve}
+        - {output_id: params, node_id: fit_params}
+        - {output_id: bin2d, node_id: bin2d}

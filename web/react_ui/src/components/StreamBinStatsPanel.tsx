@@ -1,5 +1,10 @@
 ﻿import { useEffect, useMemo, useRef } from "react";
 import uPlot from "uplot";
+import {
+  perfCount,
+  perfCountScoped,
+  perfMeasure,
+} from "../features/performance/perfInstrumentation";
 
 export type UncertaintyMode = "std" | "sem";
 
@@ -18,6 +23,7 @@ export type StreamBinStatsFitOverlay = {
 };
 
 type StreamBinStatsPanelProps = {
+  panelId?: string;
   series: StreamBinStatsSeries | null;
   overlaySeries?: Array<{ label: string; values: number[] }>;
   fitOverlays?: StreamBinStatsFitOverlay[];
@@ -270,6 +276,7 @@ export function computeStreamBinStatsAutoYRange(
 }
 
 export function StreamBinStatsPanel({
+  panelId,
   series,
   overlaySeries = [],
   fitOverlays = [],
@@ -308,7 +315,10 @@ export function StreamBinStatsPanel({
   }, []);
 
   const data = useMemo(
-    () => buildBandData(series, uncertaintyMode, uncertaintyScale, xOffset, xScale),
+    () =>
+      perfMeasure("bin_stats.conversion_ms", () =>
+        buildBandData(series, uncertaintyMode, uncertaintyScale, xOffset, xScale)
+      ),
     [series, uncertaintyMode, uncertaintyScale, xOffset, xScale, tick]
   );
   const overlayData = useMemo(
@@ -596,8 +606,11 @@ export function StreamBinStatsPanel({
     }
     // setData redraws the plot, including the fit-overlay plugin after its ref
     // has been refreshed above. No uPlot reconstruction is needed for live data.
+    perfCount("plot.uplot_setData");
+    perfCount("plot.bin_stats.uplot_setData");
+    perfCountScoped("plot.uplot_setData", panelId);
     plotRef.current.setData(fullData as uPlot.AlignedData);
-  }, [tick, fullData, fitOverlayData]);
+  }, [tick, fullData, fitOverlayData, panelId]);
 
   return (
     <div style={{ position: "relative" }}>

@@ -33,7 +33,7 @@ import {
 } from "../telemetry/rawStreamHydration";
 import { useTelemetry } from "../telemetry/TelemetryContext";
 import { usePanels } from "./PanelsContext";
-import { usePlotTick } from "./PlotTickContext";
+import { markPanelDirty, markPanelsDirty } from "./PanelInvalidationStore";
 
 /**
  * Per-panel stream-trace config setters + the buffer-clear utilities.
@@ -77,7 +77,6 @@ export interface StreamPanelHandlersArgs {
 export function useStreamPanelHandlers(args: StreamPanelHandlersArgs) {
   const { streamCatalogByKey, streamAnalysisReadyRef } = args;
   const { panels, setPanels, panelsRef } = usePanels();
-  const { setPlotTick } = usePlotTick();
   const { streamWorkspacesRef } = useStreamAnalysis();
   const {
     buffersRef,
@@ -100,7 +99,7 @@ export function useStreamPanelHandlers(args: StreamPanelHandlersArgs) {
     for (const buffer of panelBuffers.values()) {
       buffer.clear();
     }
-    setPlotTick((tick) => tick + 1);
+    markPanelDirty(panelId);
   };
 
   const clearRawStreamPanelSnapshots = (
@@ -115,7 +114,7 @@ export function useStreamPanelHandlers(args: StreamPanelHandlersArgs) {
       const keys = panel ? rawStreamSubscriptionKeysForPanel(panel) : [];
       dispatchRawStreamHydrationInvalidation(keys);
     }
-    setPlotTick((tick) => tick + 1);
+    markPanelDirty(panelId);
   };
 
   const clearStreamPanelFrames = (panelId: string) => {
@@ -135,6 +134,7 @@ export function useStreamPanelHandlers(args: StreamPanelHandlersArgs) {
               .map((output) => output.outputId)
           )
         : null;
+    const dirtyPanelIds = new Set<string>();
     for (const panel of panelsRef.current) {
       if (!isStreamBinStatsPanel(panel) && !isStreamBin2dPanel(panel)) {
         continue;
@@ -151,8 +151,9 @@ export function useStreamPanelHandlers(args: StreamPanelHandlersArgs) {
       } else {
         streamBin2dRef.delete(panel.id);
       }
+      dirtyPanelIds.add(panel.id);
     }
-    setPlotTick((tick) => tick + 1);
+    markPanelsDirty(dirtyPanelIds);
   };
 
   const clearStreamBinStatsPanel = async (panelId: string) => {
@@ -191,7 +192,7 @@ export function useStreamPanelHandlers(args: StreamPanelHandlersArgs) {
     streamBinStatsRef.delete(panelId);
     streamBinStatsOverlayRef.set(panelId, new Map());
     streamBinStatsFitOverlayRef.set(panelId, new Map());
-    setPlotTick((tick) => tick + 1);
+    markPanelDirty(panelId);
   };
 
   const clearStreamBin2dPanel = async (panelId: string) => {
@@ -228,7 +229,7 @@ export function useStreamPanelHandlers(args: StreamPanelHandlersArgs) {
       }
     }
     streamBin2dRef.delete(panelId);
-    setPlotTick((tick) => tick + 1);
+    markPanelDirty(panelId);
   };
 
   // ---- stream-trace config setters -------------------------------

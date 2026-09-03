@@ -18,7 +18,7 @@ import {
 } from "../stream/utils";
 import { isTelemetryPanel } from "../stream/panel_helpers";
 import { usePanels } from "./PanelsContext";
-import { usePlotTick } from "./PlotTickContext";
+import { markPanelDirty } from "./PanelInvalidationStore";
 
 /**
  * Panel UI / Y-axis / modal-toggle handlers.
@@ -75,7 +75,6 @@ export function usePanelUiHandlers() {
     setStreamParamsOptionsPanelId,
     setStreamBin2dOptionsPanelId,    panels,
   } = usePanels();
-  const { setPlotTick } = usePlotTick();
 
   const setPanelYScaleMode = (panelId: string, mode: YScaleMode) => {
     setPanels((prev) =>
@@ -221,7 +220,7 @@ export function usePanelUiHandlers() {
           : panel
       )
     );
-    setPlotTick((tick) => tick + 1);
+    markPanelDirty(panelId);
   };
 
   const isExpandablePlotPanel = (panel: PlotPanelState) =>

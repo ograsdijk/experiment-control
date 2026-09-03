@@ -37,8 +37,9 @@ import type { PlotPanelState } from "../stream/types";
  * **Scope choices** (mirrors the previous seven Context extractions):
  *
  * - The Provider owns the **state container only**: panels list,
- *   active id, refs, modal-panel-id state, Y-axis editor state,
- *   `plotTick` re-render pulse, and the persistence machinery.
+ *   active id, refs, modal-panel-id state, Y-axis editor state, and the
+ *   persistence machinery. High-rate plot invalidation lives outside React
+ *   context in PanelInvalidationStore.
  * - localStorage rehydration (load) + autosave (write-on-change)
  *   both live here so the panel state has a single owner of its
  *   serialisation.
@@ -49,12 +50,8 @@ import type { PlotPanelState } from "../stream/types";
  * panel state — each instance has its own custom layout. The
  * Provider is upstream-only and downstream-safe.
  *
- * **Re-render hygiene**: `plotTick` and `panels` change on every
- * telemetry write — that's the load-bearing UI pulse. `usePanels()`
- * consumers re-render when either changes. This matches App.tsx's
- * current behaviour (a single big component); the Context split
- * doesn't make it worse. If we later observe measurable regressions,
- * splitting `plotTick` into its own narrow Context is a follow-up.
+ * **Re-render hygiene**: high-rate mutable data and panel revisions are kept
+ * out of this context; consumers rerender only for panel configuration edits.
  */
 
 const DEFAULT_WINDOW_S = 60;
@@ -79,13 +76,6 @@ export interface PanelsContextValue {
   panelsRef: MutableRefObject<PlotPanelState[]>;
   /** Next id counter for newly-created panels. */
   panelIdRef: MutableRefObject<number>;
-
-  // -----------------------------------------------------------------
-  // Plot re-render pulse — bumped by telemetry handlers after
-  // out-of-band buffer pushes so panel components know to refresh.
-  // Moved to features/panels/PlotTickContext.tsx (round 34) so
-  // `usePanels()` consumers don't re-render at the WS-sample rate.
-  // -----------------------------------------------------------------
 
   // -----------------------------------------------------------------
   // Modal-panel-id state — which panel currently has each modal open

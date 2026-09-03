@@ -15,6 +15,10 @@ import {
   StreamCatalogEntry,
   TelemetrySignal,
 } from "./types";
+import {
+  perfCount,
+  perfCountEndpoint,
+} from "./features/performance/perfInstrumentation";
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? "";
 const WS_BASE = import.meta.env.VITE_WS_BASE ?? API_BASE;
@@ -724,11 +728,15 @@ function normalizeStateMachineHistory(raw: unknown): StateMachineHistoryEntry[] 
 }
 
 export async function apiFetch<T>(path: string, init?: RequestInit): Promise<ApiResponse<T>> {
+  perfCount("api.requests");
+  perfCountEndpoint("api.requests", path);
   const resp = await fetch(`${API_BASE}${path}`, init);
   return resp.json();
 }
 
 async function apiFetchMaybeBinary<T>(path: string): Promise<ApiResponse<T>> {
+  perfCount("api.requests");
+  perfCountEndpoint("api.requests", path);
   const resp = await fetch(`${API_BASE}${path}`);
   const contentType = resp.headers.get("content-type") ?? "";
   if (!contentType.includes("application/vnd.experiment-control.binary+json")) {
@@ -792,8 +800,8 @@ function attachBinaryValueToPayload(
   payload.values = payload.value;
 }
 
-export async function fetchDevices(): Promise<DeviceStatus[]> {
-  const resp = await apiFetch<DeviceStatus[]>("/api/devices");
+export async function fetchDevices(signal?: AbortSignal): Promise<DeviceStatus[]> {
+  const resp = await apiFetch<DeviceStatus[]>("/api/devices", { signal });
   if (!resp.ok || !resp.result) {
     return [];
   }
@@ -873,8 +881,8 @@ export async function fetchTelemetrySnapshot(): Promise<
   return out;
 }
 
-export async function fetchStreams(): Promise<StreamCatalogEntry[]> {
-  const resp = await apiFetch<StreamCatalogEntry[]>("/api/streams");
+export async function fetchStreams(signal?: AbortSignal): Promise<StreamCatalogEntry[]> {
+  const resp = await apiFetch<StreamCatalogEntry[]>("/api/streams", { signal });
   if (!resp.ok || !resp.result) {
     return [];
   }
@@ -938,8 +946,8 @@ export async function restartDevice(
   });
 }
 
-export async function fetchProcesses(): Promise<ProcessStatus[]> {
-  const resp = await apiFetch<ProcessStatus[]>("/api/processes");
+export async function fetchProcesses(signal?: AbortSignal): Promise<ProcessStatus[]> {
+  const resp = await apiFetch<ProcessStatus[]>("/api/processes", { signal });
   if (!resp.ok || !resp.result) {
     return [];
   }

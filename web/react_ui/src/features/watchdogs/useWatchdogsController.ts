@@ -8,6 +8,7 @@ import {
   isProcessRpcStateAvailable,
   supportsProcessCapability,
 } from "../runtime/helpers";
+import { useAdaptivePolling } from "../polling/useAdaptivePolling";
 import type {
   CapabilityMember,
   ProcessStatus,
@@ -294,38 +295,19 @@ export function useWatchdogsController({
     [refreshWatchdogProcessStatus]
   );
 
-  useEffect(() => {
-    if (!safetyOpen) {
-      return;
-    }
-    let alive = true;
-    const load = async () => {
-      if (!alive) {
-        return;
-      }
-      await refreshWatchdogsModalData();
-    };
-    void load();
-    const interval = setInterval(() => {
-      void load();
-    }, 5000);
-    return () => {
-      alive = false;
-      clearInterval(interval);
-    };
-  }, [safetyOpen, refreshWatchdogsModalData]);
+  useAdaptivePolling({
+    enabled: safetyOpen,
+    intervalMs: 5000,
+    poll: refreshWatchdogsModalData,
+    onValue: () => undefined,
+    endpoint: "/api/watchdogs/modal",
+  });
 
-  useEffect(() => {
-    let alive = true;
-    const load = async () => {
-      if (!alive) {
-        return;
-      }
-      const nextProcesses = await refreshProcessesRef.current();
-      if (!alive) {
-        return;
-      }
-      for (const process of nextProcesses) {
+  useAdaptivePolling({
+    enabled: !safetyOpen,
+    intervalMs: 10000,
+    poll: async () => {
+      for (const process of processes) {
         if (!isProcessRpcStateAvailable(process)) {
           continue;
         }
@@ -334,24 +316,15 @@ export function useWatchdogsController({
         let effectiveCaps = caps;
         if (effectiveCaps.length === 0) {
           effectiveCaps = await ensureProcessCapabilitiesLoadedRef.current(processId);
-          if (!alive) {
-            return;
-          }
         }
         if (supportsProcessCapability(effectiveCaps, "watchdog.status")) {
           await refreshWatchdogProcessStatus(processId, process);
         }
       }
-    };
-    void load();
-    const interval = setInterval(() => {
-      void load();
-    }, 10000);
-    return () => {
-      alive = false;
-      clearInterval(interval);
-    };
-  }, [refreshWatchdogProcessStatus]);
+    },
+    onValue: () => undefined,
+    endpoint: "/api/watchdogs/summary",
+  });
 
   const watchdogsPanelProcesses = useMemo(() => {
     const byId = new Map<string, ProcessStatus>();
