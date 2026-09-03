@@ -200,6 +200,7 @@ import {
   applyRawStreamFrameToPanels as applyRawStreamFrameToPanelsImpl,
   applyStreamAnalysisOutputToPanels as applyStreamAnalysisOutputToPanelsImpl,
   buildPanelsByWorkspaceOutput,
+  buildRawPanelsBySubscription,
   ensurePanelBuffers as ensurePanelBuffersImpl,
   panelCapacity as panelCapacityImpl,
   type ApplyHelpersDeps,
@@ -337,7 +338,6 @@ import { useSequencerController } from "./features/sequencer/useSequencerControl
 import { RingBuffer } from "./utils/ringBuffer";
 import { colorWithAlpha, traceColorAt } from "./utils/traceColors";
 import { copyToClipboard } from "./utils/clipboard";
-import { usePlotTick } from "./features/panels/PlotTickContext";
 import {
   CommandDeckCommandEntry,
   CommandDeckEntry,
@@ -450,8 +450,8 @@ export function App() {
   } = useLayout();
   // initialPlotState (localStorage rehydration) now lives in
   // PanelsContext (features/panels/PanelsContext.tsx). The panel state,
-  // refs, modal-panel-id state, Y-axis editor state, plotTick, and the
-  // autosave useEffect all moved into the Provider — see the
+  // refs, modal-panel-id state, Y-axis editor state, and autosave useEffect all
+  // moved into the Provider — see the
   // usePanels() destructure below.
   const initialStreamWorkspaceState = useMemo(() => {
     try {
@@ -489,7 +489,7 @@ export function App() {
   const computedColorScheme = useComputedColorScheme("light");
   // Panel state moved to PanelsContext — see the usePanels() destructure
   // below for `panels`, `setPanels`, `activePanelId`, `panelIdRef`,
-  // `panelsRef`, `plotTick`, modal-panel-id state, and Y-axis editor.
+  // `panelsRef`, modal-panel-id state, and Y-axis editor.
   // Stream-analysis (DAQ workspace) state moved to StreamAnalysisContext
   // (features/stream_analysis/StreamAnalysisContext.tsx). The names below
   // are kept identical to the inline declarations they replaced so the
@@ -561,7 +561,6 @@ export function App() {
     panelTitleDraft,
     setPanelTitleDraft,
   } = usePanels();
-  const { plotTick, setPlotTick } = usePlotTick();
   // streamWsConnected + streamAnalysisWsConnected moved out of useState
   // and into useRawStreamSubscriptions / useStreamAnalysisSubscriptions
   // hook returns (round 34). See the hook calls further down.
@@ -1776,9 +1775,18 @@ export function App() {
     [panels]
   );
   panelsByWorkspaceOutputRef.current = panelsByWorkspaceOutputIndex;
+  const rawPanelsBySubscriptionIndex = useMemo(
+    () => buildRawPanelsBySubscription(panels),
+    [panels]
+  );
+  const rawPanelsBySubscriptionRef = useRef<Map<string, PlotPanelState[]>>(
+    new Map()
+  );
+  rawPanelsBySubscriptionRef.current = rawPanelsBySubscriptionIndex;
   const applyDeps: ApplyHelpersDeps = {
     panelsRef,
     panelsByWorkspaceOutputRef,
+    rawPanelsBySubscriptionRef,
     buffersRef,
     streamFramesRef,
     streamTraceOverlayRef,
@@ -2268,21 +2276,15 @@ export function App() {
   // features/telemetry/useRawStreamSubscriptions.ts. Owns the per-
   // subscription snapshot hydration + live-WS plumbing that used to
   // be two inline useEffects in App.tsx.
-  const bumpPlotTick = useCallback(
-    () => setPlotTick((tick) => tick + 1),
-    [setPlotTick]
-  );
   const { wsConnected: streamWsConnected } = useRawStreamSubscriptions({
     activeSubscriptions: activeRawStreamSubscriptions,
     applyFrame: applyRawStreamFrameToPanels,
-    bumpPlotTick,
   });
   const { wsConnected: streamAnalysisWsConnected } =
     useStreamAnalysisSubscriptions({
       activeSubscriptions: activeStreamAnalysisWorkspaceSubscriptions,
       streamAnalysisRpcReady,
       applyOutput: applyStreamAnalysisOutputToPanels,
-      bumpPlotTick,
     });
 
   // Workspace-list management (round 24). See

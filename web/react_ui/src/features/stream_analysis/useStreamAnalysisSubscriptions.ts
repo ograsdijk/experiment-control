@@ -10,6 +10,7 @@ import type {
 } from "../stream/types";
 import type { StreamAnalysisMessage } from "../../types";
 import { perfCount } from "../performance/perfInstrumentation";
+import { markPanelsDirty } from "../panels/PanelInvalidationStore";
 import {
   isStreamAnalysisRefreshOutputRequested,
   normalizeStreamAnalysisRefreshRequests,
@@ -37,7 +38,7 @@ import {
  *    output through `applyOutput` (with a trace-decimation filter
  *    pulled from the subscription metadata when applicable).
  *
- * `bumpPlotTick` fires after batches that produce updates.
+ * Exact changed panel IDs are coalesced after batches that produce updates.
  * `wsConnected` reports whether *any* socket is currently open,
  * falling back to `streamAnalysisRpcReady` when there are no
  * subscriptions (no sockets to maintain means the RPC link is the
@@ -58,8 +59,7 @@ export interface StreamAnalysisSubscriptionsArgs {
   applyOutput: (
     output: NonNullable<ReturnType<typeof normalizeStreamAnalysisOutputMessage>>,
     traceFilter?: StreamAnalysisTraceFilter
-  ) => boolean;
-  bumpPlotTick: () => void;
+  ) => ReadonlySet<string>;
 }
 
 function snapshotKey(target: {
@@ -141,7 +141,6 @@ export function useStreamAnalysisSubscriptions({
   activeSubscriptions,
   streamAnalysisRpcReady,
   applyOutput,
-  bumpPlotTick,
 }: StreamAnalysisSubscriptionsArgs): { wsConnected: boolean } {
   const [wsConnected, setWsConnected] = useState(false);
   const [refreshGeneration, setRefreshGeneration] = useState(0);
@@ -151,8 +150,6 @@ export function useStreamAnalysisSubscriptions({
 
   const applyOutputRef = useRef(applyOutput);
   applyOutputRef.current = applyOutput;
-  const bumpPlotTickRef = useRef(bumpPlotTick);
-  bumpPlotTickRef.current = bumpPlotTick;
 
   useEffect(() => {
     return () => {
@@ -259,7 +256,7 @@ export function useStreamAnalysisSubscriptions({
       return;
     }
     const load = async () => {
-      let updated = false;
+      const dirtyPanelIds = new Set<string>();
       for (const target of pending) {
         try {
           const resp = await fetchStreamWorkspaceSnapshot(target.workspaceId, {
@@ -287,17 +284,15 @@ export function useStreamAnalysisSubscriptions({
             if (normalized === null) {
               continue;
             }
-            if (applyOutputRef.current(normalized)) {
-              updated = true;
+            for (const panelId of applyOutputRef.current(normalized)) {
+              dirtyPanelIds.add(panelId);
             }
           }
         } catch {
           hydratedRef.current.add(target.key);
         }
       }
-      if (!cancelled && updated) {
-        bumpPlotTickRef.current();
-      }
+      if (!cancelled) markPanelsDirty(dirtyPanelIds);
     };
     void load();
     return () => {
@@ -315,7 +310,7 @@ export function useStreamAnalysisSubscriptions({
     pendingRefreshRequestsRef.current = [];
     if (requests.length === 0) return;
     const load = async () => {
-      let updated = false;
+      const dirtyPanelIds = new Set<string>();
       for (const request of requests) {
         try {
           const resp = await fetchStreamWorkspaceSnapshot(request.workspaceId, {
@@ -341,17 +336,18 @@ export function useStreamAnalysisSubscriptions({
                 request,
                 normalized.workspaceId,
                 normalized.outputId
-              ) &&
-              applyOutputRef.current(normalized)
+              )
             ) {
-              updated = true;
+              for (const panelId of applyOutputRef.current(normalized)) {
+                dirtyPanelIds.add(panelId);
+              }
             }
           }
         } catch {
           continue;
         }
       }
-      if (refreshMountedRef.current && updated) bumpPlotTickRef.current();
+      if (refreshMountedRef.current) markPanelsDirty(dirtyPanelIds);
     };
     void load();
   }, [streamAnalysisRpcReady, refreshGeneration]);
@@ -390,7 +386,7 @@ export function useStreamAnalysisSubscriptions({
       output: NonNullable<ReturnType<typeof normalizeStreamAnalysisOutputMessage>>
     ) => {
       perfCount("stream_analysis.messages");
-      let updated = false;
+      const dirtyPanelIds = new Set<string>();
       for (const subscription of subscriptions) {
         const traceFilter = buildTraceFilter(subscription);
         const outputForSubscription =
@@ -404,13 +400,11 @@ export function useStreamAnalysisSubscriptions({
                 ),
               }
             : output;
-        if (applyOutputRef.current(outputForSubscription, traceFilter)) {
-          updated = true;
+        for (const panelId of applyOutputRef.current(outputForSubscription, traceFilter)) {
+          dirtyPanelIds.add(panelId);
         }
       }
-      if (updated) {
-        bumpPlotTickRef.current();
-      }
+      markPanelsDirty(dirtyPanelIds);
     };
 
     const onMessage = (subscriptions: StreamAnalysisWorkspaceSubscription[]) => {

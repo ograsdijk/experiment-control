@@ -1,4 +1,4 @@
-import { memo, useMemo, type CSSProperties } from "react";
+import { memo, useEffect, useMemo, useRef, type CSSProperties } from "react";
 import {
   ActionIcon,
   Badge,
@@ -65,7 +65,11 @@ import { useStreamAnalysis } from "../stream_analysis/StreamAnalysisContext";
 import { useTelemetry } from "../telemetry/TelemetryContext";
 import { colorWithAlpha, traceColorAt } from "../../utils/traceColors";
 import { usePanels } from "./PanelsContext";
-import { usePlotTick } from "./PlotTickContext";
+import {
+  markPanelDirty,
+  panelInvalidationStore,
+  usePanelRevision,
+} from "./PanelInvalidationStore";
 import type {
   PanelsGridHandlers,
   PanelsGridHelpers,
@@ -77,10 +81,8 @@ import type {
  * clear/expand/remove actions.
  *
  * Extracted from `PanelsGrid`'s inline `panels.map(...)` body so each
- * card is its own component. This is the structural part of P9: it
- * doesn't memoize yet, but it sets up the boundary where
- * `React.memo` can later attach to stop the plotTick re-render
- * cascade.
+ * card is its own component. Its memo boundary and panel-scoped revision
+ * subscription prevent unrelated data updates from reaching this card.
  *
  * Most state still flows in as props (helpers / handlers bags + a
  * few cross-cutting flags). Context-derived refs and the color
@@ -147,7 +149,29 @@ function PanelCardImpl({
     yAxisAutoRange,
     panels,
   } = usePanels();
-  const { plotTick, setPlotTick } = usePlotTick();
+  const panelRevision = usePanelRevision(panel.id);
+  const visibilityNodeRef = useRef<HTMLElement | null>(null);
+  useEffect(() => {
+    const node = visibilityNodeRef.current;
+    if (!node || typeof IntersectionObserver === "undefined") return;
+    const observer = new IntersectionObserver(
+      ([entry]) => {
+        const visible = Boolean(entry?.isIntersecting);
+        panelInvalidationStore.setPanelVisible(panel.id, "card", visible);
+        if (visible) markPanelDirty(panel.id);
+      },
+      { rootMargin: "300px 0px" }
+    );
+    observer.observe(node);
+    return () => {
+      observer.disconnect();
+      panelInvalidationStore.removeVisibilitySource(panel.id, "card");
+    };
+  }, [panel.id]);
+  useEffect(() => {
+    const fps = isStreamTracePanel(panel) ? panel.traceMaxFps : 30;
+    panelInvalidationStore.setPanelMaxFps(panel.id, fps);
+  }, [panel]);
   const {
     buffersRef,
     streamFramesRef,
@@ -198,7 +222,7 @@ function PanelCardImpl({
   const isActive = panel.id === activePanelId;
 
   // PerfB: workspace-keyed derivations are memoized so they
-  // skip recomputation on plotTick (which fires at the WS
+  // skip recomputation on panelRevision (which fires for this panel's WS
   // rate). These only depend on the panel and the workspaces
   // map; the panel-kind branches branch the same way each
   // render so the cost is in the workspace lookups +
@@ -300,6 +324,9 @@ function PanelCardImpl({
       data={{ kind: "panel", panelId: panel.id }}
       className="plot-workspace-card"
       dataPanelCardId={panel.id}
+      observeRef={(node) => {
+        visibilityNodeRef.current = node;
+      }}
       dragHandleTitle="Drag from border to reorder panels"
       style={{
         border:
@@ -723,7 +750,7 @@ function PanelCardImpl({
               }
               if (isStreamParamsPanel(panel)) {
                 streamParamsLatestRef.set(panel.id, {});
-                setPlotTick((tick) => tick + 1);
+                markPanelDirty(panel.id);
                 return;
               }
               if (isStreamBinStatsPanel(panel)) {
@@ -768,7 +795,7 @@ function PanelCardImpl({
           <PlotPanel
             traces={panel.traces}
             buffers={panelBuffers}
-            tick={plotTick}
+            tick={panelRevision}
             timeWindowS={panel.timeWindowS}
             colorScheme={computedColorScheme}
             yScaleMode={panel.yScaleMode}
@@ -828,7 +855,7 @@ function PanelCardImpl({
                   : panel.overlayCount
               }
               channelIndex={panel.sourceMode === "raw" ? panel.channelIndex : 0}
-              tick={plotTick}
+              tick={panelRevision}
               colorScheme={computedColorScheme}
               units={panel.stream?.units ?? null}
               extraSeries={
@@ -847,7 +874,7 @@ function PanelCardImpl({
               frames={streamFramesRef.get(panel.id) ?? []}
               historyRows={panel.overlayCount}
               channelIndex={panel.sourceMode === "raw" ? panel.channelIndex : 0}
-              tick={plotTick}
+              tick={panelRevision}
               colorScheme={computedColorScheme}
               zScaleMode={panel.yScaleMode}
               zMin={panel.yMin}
@@ -1013,7 +1040,7 @@ function PanelCardImpl({
           <PlotPanel
             traces={[streamScalarTrace(panel)]}
             buffers={panelBuffers}
-            tick={plotTick}
+            tick={panelRevision}
             timeWindowS={panel.timeWindowS}
             colorScheme={computedColorScheme}
             yScaleMode={panel.yScaleMode}
@@ -1083,17 +1110,17 @@ function PanelCardImpl({
         </>
       ) : isStreamBinStatsPanel(panel) ? (
         <>
-        <StreamBinStatsPanel
-          series={binStatsSnapshot?.series ?? null}
-          overlaySeries={streamBinStatsOverlaySeries(panel)}
-          fitOverlays={streamBinStatsFitOverlayCurves(panel)}
-          xLabel={binStatsXLabel}
-          uncertaintyMode={panel.uncertaintyMode}
-          uncertaintyScale={panel.uncertaintyScale}
-          showBinMarkers={panel.showBinMarkers}
-          xOffset={panel.xOffset}
-          xScale={panel.xScale}
-            tick={plotTick}
+          <StreamBinStatsPanel
+            series={binStatsSnapshot?.series ?? null}
+            overlaySeries={streamBinStatsOverlaySeries(panel)}
+            fitOverlays={streamBinStatsFitOverlayCurves(panel)}
+            xLabel={binStatsXLabel}
+            uncertaintyMode={panel.uncertaintyMode}
+            uncertaintyScale={panel.uncertaintyScale}
+            showBinMarkers={panel.showBinMarkers}
+            xOffset={panel.xOffset}
+            xScale={panel.xScale}
+            tick={panelRevision}
             colorScheme={computedColorScheme}
             yScaleMode={panel.yScaleMode}
             yMin={panel.yMin}
@@ -1181,7 +1208,7 @@ function PanelCardImpl({
           <StreamBin2dPanel
             series={bin2dSnapshot?.series ?? null}
             reducer={panel.reducer}
-            tick={plotTick}
+            tick={panelRevision}
             colorScheme={computedColorScheme}
             zScaleMode={panel.yScaleMode}
             zMin={panel.yMin}
@@ -1263,18 +1290,8 @@ function PanelCardImpl({
 /**
  * Memoized export — skips re-rendering when none of the props change.
  *
- * Caveat: PanelCardImpl still subscribes to PanelsContext +
- * TelemetryContext + StreamAnalysisContext directly via hooks, so any
- * change in those contexts (notably `plotTick`, which fires on every
- * telemetry sample) still re-renders every PanelCard. The memo wrapper
- * only stops re-renders that come from the parent `<PanelsGrid>`
- * re-rendering with unchanged props — which is the dominant case
- * when App.tsx itself re-renders for unrelated reasons (e.g.
- * sequencer ticks, command-deck updates).
- *
- * For a deeper win the parent must memoize the `helpers` and
- * `handlers` bags it passes in, and the per-tick context coupling
- * needs to be narrowed (split `plotTick` into its own context).
- * Those are follow-ups.
+ * Mutable plot data stays in the telemetry/analysis contexts while the
+ * high-frequency notification is panel-scoped. Configuration-context changes
+ * can still rerender cards, but a sample for another panel cannot.
  */
 export const PanelCard = memo(PanelCardImpl);
