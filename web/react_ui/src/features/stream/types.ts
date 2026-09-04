@@ -150,7 +150,20 @@ export type StreamWorkspaceStoreStatus = {
   lastError: string | null;
 };
 
-export type PlotTelemetryPanelState = {
+/**
+ * Optional per-panel card layout overrides.
+ *
+ * Both are absent on panels created before card sizing existed, and on
+ * panels the user has never resized — absent means "follow the grid".
+ * `heightPx` null/undefined leaves the plot height responsive to the
+ * card; a number pins it.
+ */
+export type PanelLayoutState = {
+  heightPx?: number | null;
+  colSpan?: number;
+};
+
+export type PlotTelemetryPanelState = PanelLayoutState & {
   id: string;
   title: string;
   kind: "telemetry";
@@ -166,7 +179,7 @@ export type PlotTelemetryPanelState = {
   smoothingWindowS: number;
 };
 
-export type PlotStreamPanelState = {
+export type PlotStreamPanelState = PanelLayoutState & {
   id: string;
   title: string;
   kind: "stream_raw";
@@ -194,7 +207,7 @@ export type PlotStreamPanelState = {
   yMax: number | null;
 };
 
-export type PlotStreamWaterfallPanelState = {
+export type PlotStreamWaterfallPanelState = PanelLayoutState & {
   id: string;
   title: string;
   kind: "stream_waterfall";
@@ -215,7 +228,7 @@ export type PlotStreamWaterfallPanelState = {
   yMax: number | null;
 };
 
-export type PlotStreamScalarPanelState = {
+export type PlotStreamScalarPanelState = PanelLayoutState & {
   id: string;
   title: string;
   kind: "stream_scalar";
@@ -230,7 +243,7 @@ export type PlotStreamScalarPanelState = {
   yMax: number | null;
 };
 
-export type PlotStreamParamsPanelState = {
+export type PlotStreamParamsPanelState = PanelLayoutState & {
   id: string;
   title: string;
   kind: "stream_params";
@@ -238,7 +251,7 @@ export type PlotStreamParamsPanelState = {
   outputIds: string[];
 };
 
-export type PlotStreamBinStatsPanelState = {
+export type PlotStreamBinStatsPanelState = PanelLayoutState & {
   id: string;
   title: string;
   kind: "stream_bin_stats";
@@ -260,7 +273,7 @@ export type PlotStreamBinStatsPanelState = {
   yMax: number | null;
 };
 
-export type PlotStreamBin2dPanelState = {
+export type PlotStreamBin2dPanelState = PanelLayoutState & {
   id: string;
   title: string;
   kind: "stream_bin2d";

@@ -35,6 +35,11 @@ import {
   ensurePanelBuffers as ensurePanelBuffersImpl,
   panelCapacity as panelCapacityImpl,
 } from "./applyToPanels";
+import {
+  MAX_PANEL_COL_SPAN,
+  MAX_PANEL_HEIGHT_PX,
+  MIN_PANEL_HEIGHT_PX,
+} from "../profile/plot_state";
 import { usePanels } from "./PanelsContext";
 import { markPanelDirty, panelInvalidationStore } from "./PanelInvalidationStore";
 
@@ -92,7 +97,8 @@ export function usePanelLifecycle(args: PanelLifecycleArgs) {
     setPanels,
     activePanelId,
     setActivePanelId,
-    panelIdRef,    plotOptionsPanelId,
+    panelIdRef,
+    plotOptionsPanelId,
     expandedPlotPanelId,
     setExpandedPlotPanelId,
     streamTraceOptionsPanelId,
@@ -285,6 +291,83 @@ export function usePanelLifecycle(args: PanelLifecycleArgs) {
     setActivePanelId(id);
   };
 
+  /**
+   * Copy a panel, keeping every setting, and drop it directly after the
+   * original.
+   *
+   * Only the *configuration* is copied — accumulated data is not. Each
+   * per-panel ref is keyed by panel id, and the buffers/frames a panel
+   * holds are its own history; seeding the copy with a shared reference
+   * would let two cards mutate one buffer. The copy starts empty and
+   * fills from the same live source, exactly as a newly created panel of
+   * that kind does.
+   */
+  const duplicatePanel = (panelId: string) => {
+    const source = panels.find((panel) => panel.id === panelId);
+    if (!source) {
+      return;
+    }
+    panelIdRef.current += 1;
+    const id = `panel-${panelIdRef.current}`;
+    const copy = { ...source, id } as PlotPanelState;
+    if (isTelemetryPanel(copy)) {
+      copy.traces = copy.traces.map((trace) => ({ ...trace }));
+      buffersRef.set(id, new Map());
+    } else if (isStreamScalarPanel(copy)) {
+      buffersRef.set(id, new Map());
+    }
+    setPanels((prev) => {
+      const index = prev.findIndex((panel) => panel.id === panelId);
+      if (index < 0) {
+        return [...prev, copy];
+      }
+      return [...prev.slice(0, index + 1), copy, ...prev.slice(index + 1)];
+    });
+    markPanelDirty(id);
+  };
+
+  /**
+   * Card sizing. Passing `null` for a field clears the override and
+   * returns that axis to the grid default — which is not the same as
+   * writing the default value, since the default is responsive.
+   */
+  const setPanelLayout = (
+    panelId: string,
+    patch: { heightPx?: number | null; colSpan?: number | null }
+  ) => {
+    setPanels((prev) =>
+      prev.map((panel) => {
+        if (panel.id !== panelId) {
+          return panel;
+        }
+        const next = { ...panel };
+        if ("heightPx" in patch) {
+          if (patch.heightPx === null || patch.heightPx === undefined) {
+            delete next.heightPx;
+          } else {
+            next.heightPx = Math.min(
+              MAX_PANEL_HEIGHT_PX,
+              Math.max(MIN_PANEL_HEIGHT_PX, Math.round(patch.heightPx))
+            );
+          }
+        }
+        if ("colSpan" in patch) {
+          const span =
+            patch.colSpan === null || patch.colSpan === undefined
+              ? 1
+              : Math.round(patch.colSpan);
+          if (span > 1) {
+            next.colSpan = Math.min(MAX_PANEL_COL_SPAN, span);
+          } else {
+            delete next.colSpan;
+          }
+        }
+        return next;
+      })
+    );
+    markPanelDirty(panelId);
+  };
+
   const removePanel = (panelId: string) => {
     if (panels.length <= 1) {
       return;
@@ -432,6 +515,8 @@ export function usePanelLifecycle(args: PanelLifecycleArgs) {
 
   return {
     createPanel,
+    duplicatePanel,
+    setPanelLayout,
     removePanel,
     addTraceToPanel,
     removeTraceFromPanel,

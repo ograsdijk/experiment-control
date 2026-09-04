@@ -450,6 +450,130 @@ body::before {
   width: 8px;
 }
 
+/*
+ * Dense cards trade padding for plot area. The drag handles live inside
+ * that padding, so they thin with it — 8px strips under 12px padding
+ * leave 4px of clearance and swallow clicks on the header icons and the
+ * plot edges that sit closest to the border.
+ */
+.reorderable-card-dense .panel-drag-handle-top,
+.reorderable-card-dense .panel-drag-handle-bottom {
+  height: 5px;
+}
+
+.reorderable-card-dense .panel-drag-handle-left,
+.reorderable-card-dense .panel-drag-handle-right {
+  width: 5px;
+}
+
+/* Compact monitoring header: title takes the slack, icons keep their size. */
+.panel-card-header {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-height: 28px;
+  margin-bottom: 6px;
+}
+
+.panel-card-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: default;
+}
+
+.panel-card-header-actions {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+/* One dimmed line under the plot; only rendered when it has something to say. */
+.panel-card-status {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  margin-top: 6px;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--mantine-color-dimmed);
+}
+
+.panel-card-status-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.panel-card-status-dot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 999px;
+  flex: 0 0 auto;
+}
+
+.panel-card-status-warn {
+  color: var(--mantine-color-orange-6);
+}
+
+/* Series legend. Replaces the per-series identity the badge row used to
+ * carry; uPlot's own legend stays off so it can't reflow the canvas. */
+.plot-legend {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 2px 10px;
+  margin-top: 6px;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.plot-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  max-width: 100%;
+  border: none;
+  background: none;
+  padding: 0;
+  font: inherit;
+  color: var(--mantine-color-dimmed);
+  cursor: pointer;
+}
+
+.plot-legend-item:hover .plot-legend-label {
+  text-decoration: underline dotted;
+}
+
+.plot-legend-swatch {
+  flex: 0 0 auto;
+  width: 10px;
+  height: 3px;
+  border-radius: 2px;
+}
+
+.plot-legend-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Empty/unbound state, centred over the plot area it replaces. */
+.plot-empty-state {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  padding: 0 16px;
+  border: 1px dashed var(--card-border);
+  border-radius: 8px;
+}
+
 .pinned-command-segment {
   display: flex;
   align-items: center;

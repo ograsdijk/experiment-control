@@ -35,6 +35,37 @@ import {
   normalizeYScaleMode,
 } from "../stream/utils";
 
+/** Card sizing bounds. A pinned plot below MIN_PANEL_HEIGHT_PX is unreadable;
+ * above MAX it stops being a grid. colSpan is clamped by the grid at render. */
+export const MIN_PANEL_HEIGHT_PX = 160;
+export const MAX_PANEL_HEIGHT_PX = 1200;
+export const MAX_PANEL_COL_SPAN = 4;
+
+/**
+ * Per-panel card layout, absent for every panel saved before card sizing
+ * existed. Absent stays absent — it means "follow the grid", which is not
+ * the same as an explicit height that happens to equal the default.
+ */
+function normalizePanelLayout(raw: {
+  heightPx?: unknown;
+  colSpan?: unknown;
+}): { heightPx?: number | null; colSpan?: number } {
+  const out: { heightPx?: number | null; colSpan?: number } = {};
+  if (typeof raw.heightPx === "number" && Number.isFinite(raw.heightPx)) {
+    out.heightPx = Math.min(
+      MAX_PANEL_HEIGHT_PX,
+      Math.max(MIN_PANEL_HEIGHT_PX, Math.round(raw.heightPx))
+    );
+  }
+  if (typeof raw.colSpan === "number" && Number.isFinite(raw.colSpan)) {
+    const span = Math.round(raw.colSpan);
+    if (span > 1) {
+      out.colSpan = Math.min(MAX_PANEL_COL_SPAN, span);
+    }
+  }
+  return out;
+}
+
 export function normalizePlotState(
   raw: unknown,
   opts?: { defaultWindowS?: number }
@@ -108,6 +139,8 @@ export function normalizePlotState(
       yOffsetValue?: unknown;
       smoothingMode?: unknown;
       smoothingWindowS?: unknown;
+      heightPx?: unknown;
+      colSpan?: unknown;
     };
     const id = typeof panel.id === "string" ? panel.id : "";
     if (!id) {
@@ -117,6 +150,7 @@ export function normalizePlotState(
       typeof panel.title === "string" && panel.title.trim().length > 0
         ? panel.title
         : id;
+    const layout = normalizePanelLayout(panel);
     const kindRaw = String(panel.kind ?? "").trim();
     const kind: PanelKind =
       kindRaw === "stream_raw" ||
@@ -211,6 +245,7 @@ export function normalizePlotState(
       const baseTrace = {
         id,
         title,
+        ...layout,
         sourceMode,
         stream: streamTarget,
         overlayCount,
@@ -290,6 +325,7 @@ export function normalizePlotState(
       panels.push({
         id,
         title,
+        ...layout,
         kind: "stream_scalar",
         workspaceId,
         outputId: outputIdRaw || null,
@@ -317,6 +353,7 @@ export function normalizePlotState(
       panels.push({
         id,
         title,
+        ...layout,
         kind: "stream_params",
         workspaceId,
         outputIds,
@@ -378,6 +415,7 @@ export function normalizePlotState(
       panels.push({
         id,
         title,
+        ...layout,
         kind: "stream_bin_stats",
         workspaceId,
         outputId: outputIdRaw || null,
@@ -431,6 +469,7 @@ export function normalizePlotState(
       panels.push({
         id,
         title,
+        ...layout,
         kind: "stream_bin2d",
         workspaceId,
         outputId: outputIdRaw || null,
@@ -476,6 +515,7 @@ export function normalizePlotState(
     panels.push({
       id,
       title,
+      ...layout,
       kind: "telemetry",
       traces,
       timeWindowS,

@@ -233,3 +233,72 @@ describe("plot_state normalizePlotState telemetry smoothing", () => {
     }
   });
 });
+
+describe("plot_state panel card layout", () => {
+  const panelWith = (extra: Record<string, unknown>) =>
+    normalizePlotState(
+      {
+        panels: [
+          {
+            id: "panel-1",
+            title: "Panel",
+            kind: "telemetry",
+            traces: [],
+            timeWindowS: 30,
+            ...extra,
+          },
+        ],
+        activePanelId: "panel-1",
+      },
+      { defaultWindowS: 60 }
+    ).panels[0];
+
+  it("leaves layout absent for panels saved before card sizing existed", () => {
+    const panel = panelWith({});
+    expect(panel.heightPx).toBeUndefined();
+    expect(panel.colSpan).toBeUndefined();
+  });
+
+  it("clamps a pinned plot height into a usable range", () => {
+    expect(panelWith({ heightPx: 5 }).heightPx).toBe(160);
+    expect(panelWith({ heightPx: 99999 }).heightPx).toBe(1200);
+    expect(panelWith({ heightPx: 380.4 }).heightPx).toBe(380);
+  });
+
+  it("drops a nonsense height rather than pinning one", () => {
+    expect(panelWith({ heightPx: "tall" }).heightPx).toBeUndefined();
+    expect(panelWith({ heightPx: Number.NaN }).heightPx).toBeUndefined();
+  });
+
+  it("keeps colSpan only when it actually spans", () => {
+    expect(panelWith({ colSpan: 1 }).colSpan).toBeUndefined();
+    expect(panelWith({ colSpan: 0 }).colSpan).toBeUndefined();
+    expect(panelWith({ colSpan: 2 }).colSpan).toBe(2);
+    expect(panelWith({ colSpan: 40 }).colSpan).toBe(4);
+  });
+
+  it("round-trips layout through serialize", () => {
+    const state = normalizePlotState(
+      {
+        panels: [
+          {
+            id: "panel-1",
+            title: "Panel",
+            kind: "telemetry",
+            traces: [],
+            timeWindowS: 30,
+            heightPx: 420,
+            colSpan: 2,
+          },
+        ],
+        activePanelId: "panel-1",
+      },
+      { defaultWindowS: 60 }
+    );
+    const round = normalizePlotState(serializePlotState(state), {
+      defaultWindowS: 60,
+    });
+    expect(round.panels[0].heightPx).toBe(420);
+    expect(round.panels[0].colSpan).toBe(2);
+  });
+});

@@ -544,7 +544,8 @@ export function App() {
     activePanelId,
     setActivePanelId,
     panelsRef,
-    panelIdRef,    plotOptionsPanelId,
+    panelIdRef,
+    plotOptionsPanelId,
     setPlotOptionsPanelId,
     expandedPlotPanelId,
     setExpandedPlotPanelId,
@@ -2355,6 +2356,8 @@ export function App() {
   // clearStreamBin2dPanel now provided by useStreamPanelHandlers.
   const {
     createPanel,
+    duplicatePanel,
+    setPanelLayout,
     removePanel,
     addTraceToPanel,
     removeTraceFromPanel,
@@ -2603,6 +2606,8 @@ export function App() {
     commitPanelTitleEdit,
     cancelPanelTitleEdit,
     removePanel,
+    duplicatePanel,
+    setPanelLayout,
     removeTraceFromPanel,
     setPanelTimeWindow,
     openPlotOptions,
@@ -2653,6 +2658,10 @@ export function App() {
       cancelPanelTitleEdit: () =>
         panelHandlersRef.current!.cancelPanelTitleEdit(),
       removePanel: (panelId) => panelHandlersRef.current!.removePanel(panelId),
+      duplicatePanel: (panelId) =>
+        panelHandlersRef.current!.duplicatePanel(panelId),
+      setPanelLayout: (panelId, patch) =>
+        panelHandlersRef.current!.setPanelLayout(panelId, patch),
       removeTraceFromPanel: (panelId, trace) =>
         panelHandlersRef.current!.removeTraceFromPanel(panelId, trace),
       setPanelTimeWindow: (panelId, value) =>

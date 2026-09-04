@@ -59,6 +59,11 @@ export interface PanelsGridHandlers {
   commitPanelTitleEdit: () => void;
   cancelPanelTitleEdit: () => void;
   removePanel: (panelId: string) => void;
+  duplicatePanel: (panelId: string) => void;
+  setPanelLayout: (
+    panelId: string,
+    patch: { heightPx?: number | null; colSpan?: number | null }
+  ) => void;
   removeTraceFromPanel: (
     panelId: string,
     trace: { deviceId: string; signal: string }
