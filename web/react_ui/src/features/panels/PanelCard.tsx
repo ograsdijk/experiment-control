@@ -406,6 +406,11 @@ function PanelCardImpl({
   // Card status: live state only, and only when it says something. The
   // settings popover below carries the same counters unconditionally.
   const statusItems: PanelStatusItem[] = [];
+  // The dot in the header carries the healthy case. A link that is down
+  // says so in words too — it is the one live state worth a row.
+  if (linkConnected === false) {
+    statusItems.push({ text: `${linkLabel} link down`, warn: true });
+  }
   if (isStreamBinStatsPanel(panel)) {
     const active =
       binStatsSnapshot?.populatedBinCount ??
@@ -1163,6 +1168,8 @@ function PanelCardImpl({
         onCommit={commitPanelTitleEdit}
         onCancel={cancelPanelTitleEdit}
         onStartEdit={() => startPanelTitleEdit(panel)}
+        connected={linkConnected}
+        linkLabel={linkLabel}
         settingsSlot={settingsSlot}
         onExpand={
           isExpandablePlotPanel(panel)
@@ -1368,11 +1375,7 @@ function PanelCardImpl({
         onCommitRename={commitSeriesRename}
         onCancelRename={cancelSeriesRename}
       />
-      <PanelStatusLine
-        connected={linkConnected}
-        linkLabel={linkLabel}
-        items={statusItems}
-      />
+      <PanelStatusLine items={statusItems} />
     </ReorderableCardShell>
   );
 }

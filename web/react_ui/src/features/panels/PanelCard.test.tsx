@@ -182,7 +182,8 @@ function renderCard(
   panel: PlotPanelState,
   handlers: PanelsGridHandlers = makeHandlers(),
   activePanelId: string | null = null,
-  helpers: PanelsGridHelpers = makeHelpers()
+  helpers: PanelsGridHelpers = makeHelpers(),
+  cardProps: { streamWsConnected?: boolean; streamAnalysisWsConnected?: boolean } = {}
 ): HTMLElement {
   localStorage.setItem(
     "ecui.plotState",
@@ -220,6 +221,7 @@ function renderCard(
                 yAxisDraftInvalid: false,
                 streamWsConnected: true,
                 streamAnalysisWsConnected: true,
+                ...cardProps,
                 activeUiDrag: null,
                 helpers,
                 handlers,
@@ -580,6 +582,35 @@ describe("PanelCard", () => {
       });
       expect(setPanelSeriesLabel).not.toHaveBeenCalled();
       expect(host.querySelector(".plot-legend-input")).toBeNull();
+    });
+  });
+
+  describe("link indicator", () => {
+    it("puts the dot in the header and leaves no status row when healthy", () => {
+      const host = renderCard(binStatsPanel());
+      const header = host.querySelector(".panel-card-header");
+      expect(header!.querySelector(".panel-card-header-dot")).not.toBeNull();
+      expect(host.querySelector(".panel-card-status")).toBeNull();
+    });
+
+    it("says so in words when the link is down", () => {
+      const host = renderCard(
+        binStatsPanel(),
+        makeHandlers(),
+        null,
+        makeHelpers(),
+        { streamAnalysisWsConnected: false }
+      );
+      const dot = host.querySelector<HTMLElement>(".panel-card-header-dot");
+      expect(dot!.getAttribute("aria-label")).toBe("analysis link disconnected");
+      const status = host.querySelector(".panel-card-status");
+      expect(status).not.toBeNull();
+      expect(status!.textContent).toContain("analysis link down");
+    });
+
+    it("shows no dot for a telemetry panel, which has no link of its own", () => {
+      const host = renderCard(telemetryPanel());
+      expect(host.querySelector(".panel-card-header-dot")).toBeNull();
     });
   });
 });

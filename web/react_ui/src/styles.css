@@ -517,6 +517,12 @@ body::before {
   flex: 0 0 auto;
 }
 
+/* The link dot in the header: same swatch as the status line used, with
+ * a little breathing room before the title. */
+.panel-card-header-dot {
+  margin-right: 2px;
+}
+
 .panel-card-status-warn {
   color: var(--mantine-color-orange-6);
 }

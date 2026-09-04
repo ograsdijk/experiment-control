@@ -24,6 +24,12 @@ type PanelCardHeaderProps = {
   onCommit: () => void;
   onCancel: () => void;
   onStartEdit: () => void;
+  /**
+   * Live link state, shown as a dot before the title. Null for panels
+   * with no link of their own (telemetry), which renders no dot.
+   */
+  connected?: boolean | null;
+  linkLabel?: string;
   /** The settings control, target and dropdown — owned by the card. */
   settingsSlot: ReactNode;
   /** Omitted entirely for panel kinds that cannot be expanded. */
@@ -40,6 +46,11 @@ type PanelCardHeaderProps = {
  * buttons, drag-state badge — is either gone or behind one of these three
  * controls. Renaming is progressive: double-click the title, or use the
  * overflow menu.
+ *
+ * The link dot reads as a status light on the panel's name and costs no
+ * height here, where the row exists regardless. Under the plot it was the
+ * only permanent occupant of its own row, so a healthy card paid a full
+ * line for it.
  */
 function PanelCardHeaderImpl({
   title,
@@ -50,13 +61,32 @@ function PanelCardHeaderImpl({
   onCommit,
   onCancel,
   onStartEdit,
+  connected = null,
+  linkLabel = "link",
   settingsSlot,
   onExpand,
   menuItems,
 }: PanelCardHeaderProps) {
+  const linkDot =
+    connected === null ? null : (
+      <span
+        className="panel-card-status-dot panel-card-header-dot"
+        title={`${linkLabel} link ${connected ? "connected" : "disconnected"}`}
+        aria-label={`${linkLabel} link ${
+          connected ? "connected" : "disconnected"
+        }`}
+        style={{
+          background: connected
+            ? "var(--mantine-color-teal-6)"
+            : "var(--mantine-color-red-6)",
+        }}
+      />
+    );
+
   if (editing) {
     return (
       <div className="panel-card-header" data-no-activate="true">
+        {linkDot}
         <TextInput
           size="xs"
           style={{ flex: "1 1 auto", minWidth: 0 }}
@@ -105,6 +135,7 @@ function PanelCardHeaderImpl({
 
   return (
     <div className="panel-card-header">
+      {linkDot}
       <Text
         fw={600}
         size="sm"
