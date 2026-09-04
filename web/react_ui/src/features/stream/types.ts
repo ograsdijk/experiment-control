@@ -63,6 +63,12 @@ export type StreamDagNodeConfig = {
 export type StreamDagOutputConfig = {
   outputId: string;
   nodeId: string;
+  /**
+   * Human-facing name for this output. Presentation only — `outputId`
+   * stays the stable identity that panels persist and the backend keys
+   * on. Absent means the UI derives a name from the id.
+   */
+  label?: string | null;
 };
 
 export type StreamDagParamField = {
@@ -163,7 +169,26 @@ export type PanelLayoutState = {
   colSpan?: number;
 };
 
-export type PlotTelemetryPanelState = PanelLayoutState & {
+/**
+ * Naming overrides carried by every panel.
+ *
+ * `seriesLabels` renames individual traces in the UI, keyed by the same
+ * identity the legend uses: the DAG `output_id`, `deviceId:signal` for
+ * telemetry, or `ch N` for raw stream channels. Device and telemetry
+ * schemas have no display-name field and none is being added, so this is
+ * where a readable trace name lives.
+ *
+ * `titleAuto` records that the panel title was generated rather than
+ * typed. Only auto titles get rewritten when the bound output changes; a
+ * title restored from a profile has no flag and is therefore treated as
+ * the user's.
+ */
+export type PanelNamingState = PanelLayoutState & {
+  seriesLabels?: Record<string, string>;
+  titleAuto?: boolean;
+};
+
+export type PlotTelemetryPanelState = PanelNamingState & {
   id: string;
   title: string;
   kind: "telemetry";
@@ -179,7 +204,7 @@ export type PlotTelemetryPanelState = PanelLayoutState & {
   smoothingWindowS: number;
 };
 
-export type PlotStreamPanelState = PanelLayoutState & {
+export type PlotStreamPanelState = PanelNamingState & {
   id: string;
   title: string;
   kind: "stream_raw";
@@ -207,7 +232,7 @@ export type PlotStreamPanelState = PanelLayoutState & {
   yMax: number | null;
 };
 
-export type PlotStreamWaterfallPanelState = PanelLayoutState & {
+export type PlotStreamWaterfallPanelState = PanelNamingState & {
   id: string;
   title: string;
   kind: "stream_waterfall";
@@ -228,7 +253,7 @@ export type PlotStreamWaterfallPanelState = PanelLayoutState & {
   yMax: number | null;
 };
 
-export type PlotStreamScalarPanelState = PanelLayoutState & {
+export type PlotStreamScalarPanelState = PanelNamingState & {
   id: string;
   title: string;
   kind: "stream_scalar";
@@ -243,7 +268,7 @@ export type PlotStreamScalarPanelState = PanelLayoutState & {
   yMax: number | null;
 };
 
-export type PlotStreamParamsPanelState = PanelLayoutState & {
+export type PlotStreamParamsPanelState = PanelNamingState & {
   id: string;
   title: string;
   kind: "stream_params";
@@ -251,7 +276,7 @@ export type PlotStreamParamsPanelState = PanelLayoutState & {
   outputIds: string[];
 };
 
-export type PlotStreamBinStatsPanelState = PanelLayoutState & {
+export type PlotStreamBinStatsPanelState = PanelNamingState & {
   id: string;
   title: string;
   kind: "stream_bin_stats";
@@ -273,7 +298,7 @@ export type PlotStreamBinStatsPanelState = PanelLayoutState & {
   yMax: number | null;
 };
 
-export type PlotStreamBin2dPanelState = PanelLayoutState & {
+export type PlotStreamBin2dPanelState = PanelNamingState & {
   id: string;
   title: string;
   kind: "stream_bin2d";

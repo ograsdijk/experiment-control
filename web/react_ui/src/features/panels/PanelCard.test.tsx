@@ -109,6 +109,7 @@ function makeHandlers(
     removePanel: noop,
     duplicatePanel: noop,
     setPanelLayout: noop,
+    setPanelSeriesLabel: noop,
     removeTraceFromPanel: noop,
     setPanelTimeWindow: noop,
     openPlotOptions: noop,
@@ -162,10 +163,26 @@ function decoyPanel(): PlotPanelState {
 const mountedRoots: Array<{ root: ReturnType<typeof createRoot>; host: HTMLElement }> =
   [];
 
+/**
+ * Set an input's value the way a user would: React installs its own
+ * value setter on the element, so assigning `.value` directly leaves the
+ * component's state behind. Going through the prototype setter and then
+ * dispatching `input` is what reaches React's onChange.
+ */
+function setNativeInputValue(input: HTMLInputElement, value: string) {
+  const setter = Object.getOwnPropertyDescriptor(
+    HTMLInputElement.prototype,
+    "value"
+  )?.set;
+  setter?.call(input, value);
+  input.dispatchEvent(new Event("input", { bubbles: true }));
+}
+
 function renderCard(
   panel: PlotPanelState,
   handlers: PanelsGridHandlers = makeHandlers(),
-  activePanelId: string | null = null
+  activePanelId: string | null = null,
+  helpers: PanelsGridHelpers = makeHelpers()
 ): HTMLElement {
   localStorage.setItem(
     "ecui.plotState",
@@ -204,7 +221,7 @@ function renderCard(
                 streamWsConnected: true,
                 streamAnalysisWsConnected: true,
                 activeUiDrag: null,
-                helpers: makeHelpers(),
+                helpers,
                 handlers,
               }),
             })
@@ -470,6 +487,99 @@ describe("PanelCard", () => {
       const host = renderCard(telemetryPanel());
       const card = host.querySelector<HTMLElement>("[data-panel-card-id]");
       expect(card!.style.gridColumn).toBe("");
+    });
+  });
+
+  describe("series names", () => {
+    // One overlay is enough to make the legend render: it only appears
+    // once a card actually draws more than one curve.
+    const overlayHelpers = () => ({
+      ...makeHelpers(),
+      streamBinStatsOverlaySeries: () => [
+        { label: "abs_integral", values: [1, 2] },
+      ],
+    });
+
+    function renderBinStats(
+      panel: PlotPanelState,
+      handlers: PanelsGridHandlers = makeHandlers()
+    ) {
+      return renderCard(panel, handlers, null, overlayHelpers());
+    }
+
+    it("derives a readable name from the output id", () => {
+      const host = renderBinStats(binStatsPanel());
+      const labels = Array.from(
+        host.querySelectorAll(".plot-legend-label")
+      ).map((node) => node.textContent);
+      expect(labels).toContain("Fluorescence integral vs scan");
+      expect(labels).toContain("Absorption integral");
+    });
+
+    it("prefers the panel's own rename", () => {
+      const panel = {
+        ...binStatsPanel(),
+        seriesLabels: { abs_integral: "Reference PD" },
+      } as PlotPanelState;
+      const host = renderBinStats(panel);
+      const labels = Array.from(
+        host.querySelectorAll(".plot-legend-label")
+      ).map((node) => node.textContent);
+      expect(labels).toContain("Reference PD");
+      expect(labels).not.toContain("Absorption integral");
+    });
+
+    it("commits a rename typed into the legend", () => {
+      const setPanelSeriesLabel = vi.fn();
+      const host = renderBinStats(
+        binStatsPanel(),
+        makeHandlers({ setPanelSeriesLabel })
+      );
+      const entry = Array.from(
+        host.querySelectorAll<HTMLElement>("button.plot-legend-item")
+      ).find(
+        (node) => node.textContent === "Absorption integral"
+      );
+      expect(entry).toBeDefined();
+      act(() => {
+        entry!.dispatchEvent(new MouseEvent("dblclick", { bubbles: true }));
+      });
+      const input = host.querySelector<HTMLInputElement>(".plot-legend-input");
+      expect(input).not.toBeNull();
+      act(() => {
+        setNativeInputValue(input!, "Reference PD");
+        input!.dispatchEvent(
+          new KeyboardEvent("keydown", { key: "Enter", bubbles: true })
+        );
+      });
+      expect(setPanelSeriesLabel).toHaveBeenCalledWith(
+        "panel-2",
+        "abs_integral",
+        "Reference PD"
+      );
+    });
+
+    it("discards the draft on Escape", () => {
+      const setPanelSeriesLabel = vi.fn();
+      const host = renderBinStats(
+        binStatsPanel(),
+        makeHandlers({ setPanelSeriesLabel })
+      );
+      const entry = Array.from(
+        host.querySelectorAll<HTMLElement>("button.plot-legend-item")
+      ).find((node) => node.textContent === "Absorption integral");
+      act(() => {
+        entry!.dispatchEvent(new MouseEvent("dblclick", { bubbles: true }));
+      });
+      const input = host.querySelector<HTMLInputElement>(".plot-legend-input");
+      act(() => {
+        setNativeInputValue(input!, "Reference PD");
+        input!.dispatchEvent(
+          new KeyboardEvent("keydown", { key: "Escape", bubbles: true })
+        );
+      });
+      expect(setPanelSeriesLabel).not.toHaveBeenCalled();
+      expect(host.querySelector(".plot-legend-input")).toBeNull();
     });
   });
 });

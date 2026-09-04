@@ -74,6 +74,10 @@ class PublishOutput:
     output_id: str
     node_id: str
     kind: str
+    # Presentation only. `output_id` stays the stable programmatic identity;
+    # `label` is what a human should read in a UI. Absent means the UI falls
+    # back to a name derived from the id.
+    label: str | None = None
 
 
 @dataclass
@@ -1961,8 +1965,15 @@ def _compile_workspace_output_item(
         raise ValueError(
             f"publish.outputs[{idx}].node_id type {kind!r} is not publishable in v1"
         )
+    label_raw = item.get("label")
+    label = str(label_raw).strip() if isinstance(label_raw, str) else None
     seen_output_ids.add(output_id)
-    return PublishOutput(output_id=output_id, node_id=node_id, kind=kind)
+    return PublishOutput(
+        output_id=output_id,
+        node_id=node_id,
+        kind=kind,
+        label=label or None,
+    )
 
 
 def _prune_unreachable_nodes(
@@ -2368,6 +2379,7 @@ class StreamAnalysisProcess(ManagedProcessBase):
                     "output_id": out.output_id,
                     "node_id": out.node_id,
                     "kind": out.kind,
+                    "label": out.label,
                 }
                 for out in c.outputs
             ],

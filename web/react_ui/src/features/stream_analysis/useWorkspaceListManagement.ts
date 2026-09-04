@@ -273,10 +273,15 @@ export function useWorkspaceListManagement() {
     const outputs = (
       Array.isArray(workspace.publishOutputs) ? workspace.publishOutputs : []
     )
-      .map((output) => ({
-        output_id: String(output.outputId ?? "").trim(),
-        node_id: String(output.nodeId ?? "").trim(),
-      }))
+      .map((output) => {
+        const label =
+          typeof output.label === "string" ? output.label.trim() : "";
+        return {
+          output_id: String(output.outputId ?? "").trim(),
+          node_id: String(output.nodeId ?? "").trim(),
+          ...(label ? { label } : {}),
+        };
+      })
       .filter((output) => output.output_id && output.node_id);
 
     return {

@@ -1,5 +1,6 @@
 ﻿import type { UncertaintyMode } from "../../components/StreamBinStatsPanel";
 import type { StreamCatalogEntry } from "../../types";
+import { outputDisplayName } from "./output_labels";
 import {
   defaultInputsForOp,
   defaultParamsForOp,
@@ -151,12 +152,22 @@ export function workspaceOutputOptionsByKind(
     if (nodeKind !== kind) {
       continue;
     }
+    const display = outputDisplayName(workspace, output.outputId);
     out.push({
       value: output.outputId,
-      label: `${output.outputId} <- ${output.nodeId} (${node.op})`,
+      // The explicit label is the point of the exercise, but the id is
+      // what gets persisted, so it stays visible wherever a person is
+      // choosing an output rather than reading a plot.
+      label:
+        display && display !== output.outputId
+          ? `${display} · ${output.outputId}`
+          : output.outputId,
     });
   }
-  return out.sort((a, b) => a.label.localeCompare(b.label));
+  // Sorted by id, not label: `defaultOutputForKind` takes the first entry,
+  // so the order a new panel inherits must not move when someone renames
+  // an output.
+  return out.sort((a, b) => a.value.localeCompare(b.value));
 }
 
 export function workspaceXAxisLabel(

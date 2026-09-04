@@ -1,3 +1,4 @@
+import { autoPanelTitle } from "../stream/output_labels";
 import {
   isStreamBin2dPanel,
   isStreamBinStatsPanel,
@@ -303,9 +304,16 @@ export function useStreamWorkspaceHandlers(args: StreamWorkspaceHandlersArgs) {
       : isStreamBinStatsPanel(panel)
       ? defaultOutputForKind(nextWorkspace, "hist_agg")
       : defaultOutputForKind(nextWorkspace, "hist2d");
+    // An auto title names the bound output, so it follows the output
+    // across a workspace switch. A title the user typed does not.
+    const retitle = (fallback: string) =>
+      panel.titleAuto
+        ? { title: autoPanelTitle(nextWorkspace, nextOutputId, fallback) }
+        : {};
     const updated = isStreamScalarPanel(panel)
       ? ({
           ...panel,
+          ...retitle(panel.title),
           workspaceId: nextWorkspaceId,
           outputId: nextOutputId,
           stream: nextWorkspace.stream,
@@ -331,6 +339,7 @@ export function useStreamWorkspaceHandlers(args: StreamWorkspaceHandlersArgs) {
       : isStreamBinStatsPanel(panel)
       ? ({
           ...panel,
+          ...retitle(panel.title),
           workspaceId: nextWorkspaceId,
           outputId: nextOutputId,
           overlayOutputIds: [],
@@ -342,6 +351,7 @@ export function useStreamWorkspaceHandlers(args: StreamWorkspaceHandlersArgs) {
         } as PlotStreamBinStatsPanelState)
       : ({
           ...panel,
+          ...retitle(panel.title),
           workspaceId: nextWorkspaceId,
           outputId: nextOutputId,
         } as PlotStreamBin2dPanelState);
@@ -384,18 +394,16 @@ export function useStreamWorkspaceHandlers(args: StreamWorkspaceHandlersArgs) {
     ) {
       return;
     }
+    const workspace = streamWorkspacesRef.current[panel.workspaceId] ?? null;
     setPanels((prev) =>
       prev.map((entry) => {
         if (entry.id !== panelId) {
           return entry;
         }
-        if (isStreamScalarPanel(entry)) {
-          return { ...entry, outputId: nextOutputId };
-        }
-        if (isStreamBinStatsPanel(entry)) {
-          return { ...entry, outputId: nextOutputId };
-        }
-        return { ...entry, outputId: nextOutputId };
+        const titlePatch = entry.titleAuto
+          ? { title: autoPanelTitle(workspace, nextOutputId, entry.title) }
+          : {};
+        return { ...entry, ...titlePatch, outputId: nextOutputId };
       })
     );
     if (isStreamScalarPanel(panel)) {

@@ -550,6 +550,17 @@ body::before {
   text-decoration: underline dotted;
 }
 
+.plot-legend-input {
+  min-width: 0;
+  width: 12ch;
+  border: 1px solid var(--mantine-color-default-border);
+  border-radius: 4px;
+  background: var(--mantine-color-body);
+  color: var(--mantine-color-text);
+  font: inherit;
+  padding: 0 4px;
+}
+
 .plot-legend-swatch {
   flex: 0 0 auto;
   width: 10px;

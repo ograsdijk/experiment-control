@@ -111,6 +111,7 @@ export function ExpandedPlotBody({
       <PlotPanel
         panelId={panel.id}
         traces={panel.traces}
+        seriesLabels={panel.seriesLabels}
         buffers={buffersRef.get(panel.id) ?? new Map()}
         tick={panelRevision}
         timeWindowS={panel.timeWindowS}

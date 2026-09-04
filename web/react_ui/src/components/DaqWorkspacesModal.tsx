@@ -24,6 +24,7 @@ import {
   coerceDagParamValue,
   nodeKindFromOp,
 } from "../features/stream/dag";
+import { prettifyOutputId } from "../features/stream/output_labels";
 import {
   dagOutputKindColor,
   inferChannelCountFromShape,
@@ -72,6 +73,7 @@ type Props = {
   onAddOutput: () => void;
   onRemoveOutput: (index: number) => void;
   onSetOutputId: (index: number, outputId: string) => void;
+  onSetOutputLabel: (index: number, label: string) => void;
   onSetOutputNode: (index: number, nodeId: string | null) => void;
   daqPublishableNodeOptions: SelectOption[];
   daqResettableNodeIds: Set<string>;
@@ -114,6 +116,7 @@ export function DaqWorkspacesModal({
   onAddOutput,
   onRemoveOutput,
   onSetOutputId,
+  onSetOutputLabel,
   onSetOutputNode,
   daqPublishableNodeOptions,
   daqResettableNodeIds,
@@ -771,6 +774,16 @@ export function DaqWorkspacesModal({
                             onSetOutputId(index, event.currentTarget.value)
                           }
                           style={{ flex: "1 1 160px" }}
+                        />
+                        <TextInput
+                          label="label"
+                          description="Shown in plots"
+                          placeholder={prettifyOutputId(output.outputId)}
+                          value={output.label ?? ""}
+                          onChange={(event) =>
+                            onSetOutputLabel(index, event.currentTarget.value)
+                          }
+                          style={{ flex: "1 1 200px" }}
                         />
                         <Select
                           label="node_id"

@@ -64,6 +64,11 @@ export interface PanelsGridHandlers {
     panelId: string,
     patch: { heightPx?: number | null; colSpan?: number | null }
   ) => void;
+  setPanelSeriesLabel: (
+    panelId: string,
+    seriesKey: string,
+    label: string
+  ) => void;
   removeTraceFromPanel: (
     panelId: string,
     trace: { deviceId: string; signal: string }

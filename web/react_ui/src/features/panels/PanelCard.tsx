@@ -4,6 +4,7 @@ import {
   useEffect,
   useMemo,
   useRef,
+  useState,
   type PointerEvent as ReactPointerEvent,
 } from "react";
 import {
@@ -65,6 +66,7 @@ import {
   workspaceXAxisLabel,
 } from "../stream/workspace";
 import { MAX_PANEL_HEIGHT_PX, MIN_PANEL_HEIGHT_PX } from "../profile/plot_state";
+import { outputDisplayName } from "../stream/output_labels";
 import { useStreamAnalysis } from "../stream_analysis/StreamAnalysisContext";
 import { useTelemetry } from "../telemetry/TelemetryContext";
 import { colorWithAlpha, traceColorAt } from "../../utils/traceColors";
@@ -112,6 +114,9 @@ function panelSortableId(panelId: string): string {
  */
 const NON_ACTIVATING_SELECTOR =
   "button, input, select, textarea, a, canvas, [role='menu'], [role='dialog'], [data-no-activate]";
+
+/** Shared empty map so an untouched panel keeps a stable identity. */
+const EMPTY_SERIES_LABELS: Record<string, string> = {};
 
 /** Pointer travel beyond this reads as a drag, not a click. */
 const ACTIVATION_DRAG_SLOP_PX = 4;
@@ -236,6 +241,12 @@ function PanelCardImpl({
   const computedColorScheme = useComputedColorScheme("light");
   const isDark = computedColorScheme === "dark";
   const { measureRef, plotHeight } = usePlotAreaHeight(panel.heightPx);
+  // Which legend entry / trace chip is being renamed, and its draft. Local
+  // to the card: unlike the y-axis draft, nothing outside needs to read it.
+  const [renamingSeriesKey, setRenamingSeriesKey] = useState<string | null>(
+    null
+  );
+  const [seriesRenameDraft, setSeriesRenameDraft] = useState("");
 
   const {
     resolveTelemetryPanelOffset,
@@ -253,6 +264,7 @@ function PanelCardImpl({
     removePanel,
     duplicatePanel,
     setPanelLayout,
+    setPanelSeriesLabel,
     removeTraceFromPanel,
     setPanelTimeWindow,
     openPlotOptions,
@@ -1000,22 +1012,41 @@ function PanelCardImpl({
     ? streamBinStatsFitOverlayCurves(panel)
     : [];
 
+  // A trace's name comes from the panel's own override first, then from
+  // the workspace label / derived output name, then from the raw id. The
+  // key is the series identity the overlay helpers already produce
+  // (`output_id` or `ch N`), so a rename survives reordering.
+  const seriesLabels = panel.seriesLabels ?? EMPTY_SERIES_LABELS;
+  const seriesDisplayName = (seriesKey: string): string => {
+    const override = seriesLabels[seriesKey];
+    if (override) {
+      return override;
+    }
+    if (seriesKey.startsWith("ch ")) {
+      return seriesKey;
+    }
+    return outputDisplayName(streamWorkspace, seriesKey) || seriesKey;
+  };
+
   // Colour order mirrors the data order the plot components build:
   // primary series first, then extras/overlays, then fit curves.
   const legendItems: PlotLegendItem[] = [];
   if (isStreamRawPanel(panel) && traceExtraSeries.length > 0) {
+    const primaryKey =
+      panel.sourceMode === "dag"
+        ? panel.outputId ?? "output"
+        : `ch ${panel.channelIndex}`;
     legendItems.push({
-      key: "primary",
-      label:
-        panel.sourceMode === "dag"
-          ? panel.outputId ?? "output"
-          : `ch ${panel.channelIndex}`,
+      key: primaryKey,
+      label: seriesDisplayName(primaryKey),
+      title: primaryKey,
       color: traceColorAt(0),
     });
     traceExtraSeries.forEach((series, idx) => {
       legendItems.push({
-        key: `extra-${series.label}-${idx}`,
-        label: series.label,
+        key: series.label,
+        label: seriesDisplayName(series.label),
+        title: series.label,
         color: traceColorAt(traceOverlayCount + idx),
       });
     });
@@ -1024,22 +1055,30 @@ function PanelCardImpl({
     isStreamBinStatsPanel(panel) &&
     (binStatsOverlays.length > 0 || binStatsFits.length > 0)
   ) {
+    const meanKey = panel.outputId ?? "mean";
     legendItems.push({
-      key: "mean",
-      label: panel.outputId ?? "mean",
+      key: meanKey,
+      label: seriesDisplayName(meanKey),
+      title: meanKey,
       color: binStatsMeanStroke(isDark),
     });
     binStatsOverlays.forEach((series, idx) => {
       legendItems.push({
-        key: `overlay-${series.label}-${idx}`,
-        label: series.label,
+        key: series.label,
+        label: seriesDisplayName(series.label),
+        title: series.label,
         color: BIN_STATS_OVERLAY_COLORS[idx % BIN_STATS_OVERLAY_COLORS.length],
       });
     });
     binStatsFits.forEach((curve, idx) => {
+      // A fit curve is derived from a series that already has its own
+      // legend entry, so it follows that name instead of taking a rename
+      // of its own.
       legendItems.push({
-        key: `fit-${curve.label}-${idx}`,
-        label: `${curve.label} (fit)`,
+        key: `fit:${curve.label}`,
+        label: `${seriesDisplayName(curve.label)} (fit)`,
+        title: `${curve.label} (fit)`,
+        renamable: false,
         color:
           BIN_STATS_FIT_OVERLAY_COLORS[
             idx % BIN_STATS_FIT_OVERLAY_COLORS.length
@@ -1047,6 +1086,22 @@ function PanelCardImpl({
       });
     });
   }
+
+  const startSeriesRename = (seriesKey: string) => {
+    setRenamingSeriesKey(seriesKey);
+    setSeriesRenameDraft(seriesLabels[seriesKey] ?? "");
+  };
+  const commitSeriesRename = () => {
+    if (renamingSeriesKey) {
+      setPanelSeriesLabel(panel.id, renamingSeriesKey, seriesRenameDraft);
+    }
+    setRenamingSeriesKey(null);
+    setSeriesRenameDraft("");
+  };
+  const cancelSeriesRename = () => {
+    setRenamingSeriesKey(null);
+    setSeriesRenameDraft("");
+  };
 
   // --- empty states --------------------------------------------------
   // These used to be dimmed text inside the badge row. With the row gone
@@ -1122,6 +1177,7 @@ function PanelCardImpl({
             <PlotPanel
               panelId={panel.id}
               traces={panel.traces}
+              seriesLabels={panel.seriesLabels}
               buffers={panelBuffers}
               tick={panelRevision}
               timeWindowS={panel.timeWindowS}
@@ -1160,8 +1216,40 @@ function PanelCardImpl({
                       )}`,
                     }}
                   >
-                    {trace.deviceId}.{trace.signal}
-                    {units}
+                    {renamingSeriesKey === traceKeyId(trace) ? (
+                      <input
+                        className="plot-legend-input"
+                        autoFocus
+                        data-no-activate="true"
+                        aria-label={`Rename ${trace.deviceId}.${trace.signal}`}
+                        placeholder={`${trace.deviceId}.${trace.signal}`}
+                        value={seriesRenameDraft}
+                        onChange={(event) =>
+                          setSeriesRenameDraft(event.currentTarget.value)
+                        }
+                        onBlur={commitSeriesRename}
+                        onKeyDown={(event) => {
+                          if (event.key === "Enter") {
+                            event.preventDefault();
+                            commitSeriesRename();
+                          } else if (event.key === "Escape") {
+                            event.preventDefault();
+                            cancelSeriesRename();
+                          }
+                        }}
+                      />
+                    ) : (
+                      <span
+                        title="Double-click to rename"
+                        onDoubleClick={() =>
+                          startSeriesRename(traceKeyId(trace))
+                        }
+                      >
+                        {seriesLabels[traceKeyId(trace)] ??
+                          `${trace.deviceId}.${trace.signal}`}
+                        {units}
+                      </span>
+                    )}
                     <ActionIcon
                       size="sm"
                       variant="subtle"
@@ -1271,7 +1359,15 @@ function PanelCardImpl({
           />
         ) : null}
       </div>
-      <PlotLegend items={legendItems} />
+      <PlotLegend
+        items={legendItems}
+        onRenameSeries={startSeriesRename}
+        editingKey={renamingSeriesKey}
+        editingValue={seriesRenameDraft}
+        onEditingValueChange={setSeriesRenameDraft}
+        onCommitRename={commitSeriesRename}
+        onCancelRename={cancelSeriesRename}
+      />
       <PanelStatusLine
         connected={linkConnected}
         linkLabel={linkLabel}

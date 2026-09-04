@@ -517,9 +517,13 @@ export function cloneDagNodes(nodes: StreamDagNodeConfig[]): StreamDagNodeConfig
 }
 
 export function cloneDagOutputs(outputs: StreamDagOutputConfig[]): StreamDagOutputConfig[] {
+  // Every field must be copied here: this clone feeds the editor draft
+  // and the draft is what gets written back, so a dropped field is a
+  // field silently deleted from the stored workspace on the next save.
   return outputs.map((output) => ({
     outputId: output.outputId,
     nodeId: output.nodeId,
+    ...(output.label ? { label: output.label } : {}),
   }));
 }
 
@@ -584,13 +588,20 @@ export function normalizeDagOutput(raw: unknown): StreamDagOutputConfig | null {
   if (!raw || typeof raw !== "object") {
     return null;
   }
-  const obj = raw as { outputId?: unknown; output_id?: unknown; nodeId?: unknown; node_id?: unknown };
+  const obj = raw as {
+    outputId?: unknown;
+    output_id?: unknown;
+    nodeId?: unknown;
+    node_id?: unknown;
+    label?: unknown;
+  };
   const outputId = String(obj.outputId ?? obj.output_id ?? "").trim();
   const nodeId = String(obj.nodeId ?? obj.node_id ?? "").trim();
   if (!outputId || !nodeId) {
     return null;
   }
-  return { outputId, nodeId };
+  const label = typeof obj.label === "string" ? obj.label.trim() : "";
+  return label ? { outputId, nodeId, label } : { outputId, nodeId };
 }
 
 export function coerceDagParamValue(raw: unknown, kind: StreamDagParamField["kind"]): unknown {

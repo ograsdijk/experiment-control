@@ -2358,6 +2358,7 @@ export function App() {
     createPanel,
     duplicatePanel,
     setPanelLayout,
+    setPanelSeriesLabel,
     removePanel,
     addTraceToPanel,
     removeTraceFromPanel,
@@ -2444,6 +2445,7 @@ export function App() {
     addDaqNode,
     removeDaqNode,
     setDaqOutputId,
+    setDaqOutputLabel,
     setDaqOutputNode,
     addDaqOutput,
     removeDaqOutput,
@@ -2608,6 +2610,7 @@ export function App() {
     removePanel,
     duplicatePanel,
     setPanelLayout,
+    setPanelSeriesLabel,
     removeTraceFromPanel,
     setPanelTimeWindow,
     openPlotOptions,
@@ -2662,6 +2665,8 @@ export function App() {
         panelHandlersRef.current!.duplicatePanel(panelId),
       setPanelLayout: (panelId, patch) =>
         panelHandlersRef.current!.setPanelLayout(panelId, patch),
+      setPanelSeriesLabel: (panelId, seriesKey, label) =>
+        panelHandlersRef.current!.setPanelSeriesLabel(panelId, seriesKey, label),
       removeTraceFromPanel: (panelId, trace) =>
         panelHandlersRef.current!.removeTraceFromPanel(panelId, trace),
       setPanelTimeWindow: (panelId, value) =>
@@ -3572,6 +3577,7 @@ export function App() {
           onAddOutput: addDaqOutput,
           onRemoveOutput: removeDaqOutput,
           onSetOutputId: setDaqOutputId,
+          onSetOutputLabel: setDaqOutputLabel,
           onSetOutputNode: setDaqOutputNode,
           daqPublishableNodeOptions,
           daqResettableNodeIds,

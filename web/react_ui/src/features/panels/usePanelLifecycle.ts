@@ -1,4 +1,5 @@
 import type { LatestSignals } from "../telemetry/useTelemetryStream";
+import { autoPanelTitle } from "../stream/output_labels";
 import {
   isStreamScalarPanel,
   isTelemetryPanel,
@@ -181,14 +182,24 @@ export function usePanelLifecycle(args: PanelLifecycleArgs) {
           ? {
               ...commonTrace,
               kind,
-              title: `Trace ${panelIdRef.current}`,
+              title: autoPanelTitle(
+                workspaceConfig,
+                traceOutputId,
+                `Trace ${panelIdRef.current}`
+              ),
+              titleAuto: true,
               overlayCount: DEFAULT_STREAM_OVERLAY_COUNT,
               extraChannelIndices: [],
             }
           : {
               ...commonTrace,
               kind,
-              title: `Waterfall ${panelIdRef.current}`,
+              title: autoPanelTitle(
+                workspaceConfig,
+                traceOutputId,
+                `Waterfall ${panelIdRef.current}`
+              ),
+              titleAuto: true,
               overlayCount: DEFAULT_WATERFALL_ROWS,
             };
       streamFramesRef.set(id, []);
@@ -198,7 +209,12 @@ export function usePanelLifecycle(args: PanelLifecycleArgs) {
       const integralOutputId = defaultOutputForKind(workspaceConfig, "scalar");
       panel = {
         id,
-        title: `Scalar ${panelIdRef.current}`,
+        title: autoPanelTitle(
+          workspaceConfig,
+          integralOutputId,
+          `Scalar ${panelIdRef.current}`
+        ),
+        titleAuto: true,
         kind: "stream_scalar",
         workspaceId: defaultWorkspaceId ?? id,
         outputId: integralOutputId,
@@ -234,7 +250,12 @@ export function usePanelLifecycle(args: PanelLifecycleArgs) {
       const binOutputId = defaultOutputForKind(workspaceConfig, "hist_agg");
       panel = {
         id,
-        title: `Bin stats ${panelIdRef.current}`,
+        title: autoPanelTitle(
+          workspaceConfig,
+          binOutputId,
+          `Bin stats ${panelIdRef.current}`
+        ),
+        titleAuto: true,
         kind: "stream_bin_stats",
         workspaceId: defaultWorkspaceId ?? id,
         outputId: binOutputId,
@@ -259,7 +280,12 @@ export function usePanelLifecycle(args: PanelLifecycleArgs) {
       const bin2dOutputId = defaultOutputForKind(workspaceConfig, "hist2d");
       panel = {
         id,
-        title: `Bin2D ${panelIdRef.current}`,
+        title: autoPanelTitle(
+          workspaceConfig,
+          bin2dOutputId,
+          `Bin2D ${panelIdRef.current}`
+        ),
+        titleAuto: true,
         kind: "stream_bin2d",
         workspaceId: defaultWorkspaceId ?? id,
         outputId: bin2dOutputId,
@@ -361,6 +387,44 @@ export function usePanelLifecycle(args: PanelLifecycleArgs) {
           } else {
             delete next.colSpan;
           }
+        }
+        return next;
+      })
+    );
+    markPanelDirty(panelId);
+  };
+
+  /**
+   * Rename one trace within a panel. A blank label deletes the override so
+   * the derived name comes back; the whole map is dropped once empty, which
+   * keeps untouched panels byte-identical in the persisted profile.
+   */
+  const setPanelSeriesLabel = (
+    panelId: string,
+    seriesKey: string,
+    label: string
+  ) => {
+    const key = seriesKey.trim();
+    if (!key) {
+      return;
+    }
+    const trimmed = label.trim();
+    setPanels((prev) =>
+      prev.map((panel) => {
+        if (panel.id !== panelId) {
+          return panel;
+        }
+        const next = { ...panel };
+        const labels = { ...(panel.seriesLabels ?? {}) };
+        if (trimmed) {
+          labels[key] = trimmed;
+        } else {
+          delete labels[key];
+        }
+        if (Object.keys(labels).length > 0) {
+          next.seriesLabels = labels;
+        } else {
+          delete next.seriesLabels;
         }
         return next;
       })
@@ -517,6 +581,7 @@ export function usePanelLifecycle(args: PanelLifecycleArgs) {
     createPanel,
     duplicatePanel,
     setPanelLayout,
+    setPanelSeriesLabel,
     removePanel,
     addTraceToPanel,
     removeTraceFromPanel,
