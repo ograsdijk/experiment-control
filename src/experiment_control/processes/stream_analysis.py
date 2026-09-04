@@ -27,6 +27,7 @@ from ..utils.cli_args import (
 )
 from ..utils.rpc_dispatch import RpcDispatchRegistry
 from ..utils.yaml_helpers import load_yaml_file
+from ..utils.yaml_round_trip import dump_yaml_preserving
 from ..utils.zmq_helpers import safe_json_loads
 from .manager_client_helper import ManagerClientHelper
 from .process_base import ManagedProcessBase
@@ -2186,12 +2187,16 @@ class StreamAnalysisProcess(ManagedProcessBase):
         return f"{workspace_id}:{int(revision)}"
 
     @staticmethod
-    def _yaml_dump(payload: Any) -> str:
-        try:
-            import yaml  # type: ignore[import-not-found]
-        except Exception as exc:  # pragma: no cover - dependency error
-            raise RuntimeError(f"PyYAML missing: {exc}") from exc
-        return str(yaml.safe_dump(payload, sort_keys=False))
+    def _yaml_dump(payload: Any, existing_text: str | None = None) -> str:
+        """Serialize the store, keeping the current file's formatting.
+
+        The workspace store is hand-written — comments, blank-line
+        grouping, flow-style output lists — and a save from the UI used
+        to flatten all of it. `dump_yaml_preserving` patches the file
+        that is already there and falls back to a plain dump when it
+        cannot.
+        """
+        return dump_yaml_preserving(payload, existing_text)
 
     def _workspace_store_status_payload(self) -> Json:
         path = self._workspace_store_path
@@ -2350,7 +2355,16 @@ class StreamAnalysisProcess(ManagedProcessBase):
             raise ValueError("workspace_store_path is not configured")
         try:
             payload = self._serialize_workspace_store_payload()
-            text = self._yaml_dump(payload)
+            # Read the file back at save time rather than caching the text
+            # from load: an edit made on disk in between should be patched
+            # onto, not silently reverted to what we last saw.
+            existing_text: str | None = None
+            if path.exists():
+                try:
+                    existing_text = path.read_text(encoding="utf-8")
+                except OSError:
+                    existing_text = None
+            text = self._yaml_dump(payload, existing_text)
             path.parent.mkdir(parents=True, exist_ok=True)
             tmp = path.with_name(f"{path.name}.tmp")
             tmp.write_text(text, encoding="utf-8")
