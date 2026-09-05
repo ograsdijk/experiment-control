@@ -523,6 +523,14 @@ body::before {
   margin-right: 2px;
 }
 
+/* One settings surface per panel means one dropdown holding everything a
+ * panel has — a bin stats card runs past a short viewport. Scroll the
+ * dropdown rather than letting it grow off-screen. */
+.panel-settings-dropdown {
+  max-height: min(70vh, 560px);
+  overflow-y: auto;
+}
+
 .panel-card-status-warn {
   color: var(--mantine-color-orange-6);
 }

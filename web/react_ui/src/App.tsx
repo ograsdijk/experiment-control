@@ -549,14 +549,6 @@ export function App() {
     setPlotOptionsPanelId,
     expandedPlotPanelId,
     setExpandedPlotPanelId,
-    streamTraceOptionsPanelId,
-    setStreamTraceOptionsPanelId,
-    streamBinStatsOptionsPanelId,
-    setStreamBinStatsOptionsPanelId,
-    streamParamsOptionsPanelId,
-    setStreamParamsOptionsPanelId,
-    streamBin2dOptionsPanelId,
-    setStreamBin2dOptionsPanelId,
     yAxisDraftMin,
     setYAxisDraftMin,
     yAxisDraftMax,
@@ -893,24 +885,6 @@ export function App() {
   // call sites in App.tsx don't need touch-ups.
   const {
     expandedPlotPanel,
-    streamTraceOptionsPanel,
-    streamTraceOptionsWorkspace,
-    streamTraceOptionsTraceOutputOptions,
-    streamTraceOptionsOverlayOutputOptions,
-    streamBinStatsOptionsPanel,
-    streamBinStatsOptionsWorkspace,
-    streamBinStatsOptionsOutputOptions,
-    streamBinStatsOptionsTraceOverlayOptions,
-    streamBinStatsOptionsFitOverlayOptions,
-    streamBinStatsOptionsXLabel,
-    streamParamsOptionsPanel,
-    streamParamsOptionsWorkspace,
-    streamParamsOutputOptions,
-    streamBin2dOptionsPanel,
-    streamBin2dOptionsWorkspace,
-    streamBin2dOptionsOutputOptions,
-    streamBin2dOptionsXLabel,
-    streamBin2dOptionsYLabel,
     activeRawStreamSubscriptions,
     activeStreamAnalysisWorkspaceSubscriptions,
   } = usePanelDerivations();
@@ -932,14 +906,6 @@ export function App() {
     isExpandablePlotPanel,
     openExpandedPlot,
     closeExpandedPlot,
-    openStreamTraceOptionsModal,
-    closeStreamTraceOptionsModal,
-    openStreamBinStatsOptionsModal,
-    closeStreamBinStatsOptionsModal,
-    openStreamParamsOptionsModal,
-    closeStreamParamsOptionsModal,
-    openStreamBin2dOptionsModal,
-    closeStreamBin2dOptionsModal,
   } = usePanelUiHandlers();
 
   // Y-axis editor + auto-range handlers (round 16 extraction). See
@@ -2628,10 +2594,26 @@ export function App() {
     setStreamAnalysisPanelWorkspace,
     setStreamAnalysisPanelOutput,
     openExpandedPlot,
-    openStreamTraceOptionsModal,
-    openStreamBin2dOptionsModal,
-    openStreamParamsOptionsModal,
-    openStreamBinStatsOptionsModal,
+    setStreamTracePanelSourceMode,
+    setStreamTracePanelWorkspace,
+    setStreamTracePanelOutput,
+    setStreamTracePanelOverlayOutputs,
+    setStreamPanelTargetFromKey,
+    setStreamPanelChannelIndex,
+    setStreamPanelChannels,
+    setStreamPanelOverlayCount,
+    setStreamPanelRollingWindow,
+    setStreamPanelAverageMode,
+    setStreamPanelTraceDecimator,
+    setStreamPanelTraceMaxPoints,
+    setStreamPanelTraceMaxFps,
+    setStreamParamsPanelOutputs,
+    setStreamBinStatsOverlayOutputs,
+    setStreamBinStatsFitOverlayOutputs,
+    setStreamBinStatsUncertainty,
+    setStreamBinStatsShowBinMarkers,
+    setStreamBinStatsXAxisTransform,
+    setStreamBin2dReducer,
   };
   const stablePanelHelpers = useMemo<PanelsGridHelpers>(
     () => ({
@@ -2706,14 +2688,78 @@ export function App() {
         ),
       openExpandedPlot: (panelId) =>
         panelHandlersRef.current!.openExpandedPlot(panelId),
-      openStreamTraceOptionsModal: (panelId) =>
-        panelHandlersRef.current!.openStreamTraceOptionsModal(panelId),
-      openStreamBin2dOptionsModal: (panelId) =>
-        panelHandlersRef.current!.openStreamBin2dOptionsModal(panelId),
-      openStreamParamsOptionsModal: (panelId) =>
-        panelHandlersRef.current!.openStreamParamsOptionsModal(panelId),
-      openStreamBinStatsOptionsModal: (panelId) =>
-        panelHandlersRef.current!.openStreamBinStatsOptionsModal(panelId),
+      setStreamTracePanelSourceMode: (panelId, mode) =>
+        panelHandlersRef.current!.setStreamTracePanelSourceMode(panelId, mode),
+      setStreamTracePanelWorkspace: (panelId, workspaceId) =>
+        panelHandlersRef.current!.setStreamTracePanelWorkspace(
+          panelId,
+          workspaceId
+        ),
+      setStreamTracePanelOutput: (panelId, outputId) =>
+        panelHandlersRef.current!.setStreamTracePanelOutput(panelId, outputId),
+      setStreamTracePanelOverlayOutputs: (panelId, outputIds) =>
+        panelHandlersRef.current!.setStreamTracePanelOverlayOutputs(
+          panelId,
+          outputIds
+        ),
+      setStreamPanelTargetFromKey: (panelId, targetKey) =>
+        panelHandlersRef.current!.setStreamPanelTargetFromKey(
+          panelId,
+          targetKey
+        ),
+      setStreamPanelChannelIndex: (panelId, value) =>
+        panelHandlersRef.current!.setStreamPanelChannelIndex(panelId, value),
+      setStreamPanelChannels: (panelId, channels) =>
+        panelHandlersRef.current!.setStreamPanelChannels(panelId, channels),
+      setStreamPanelOverlayCount: (panelId, value) =>
+        panelHandlersRef.current!.setStreamPanelOverlayCount(panelId, value),
+      setStreamPanelRollingWindow: (panelId, value) =>
+        panelHandlersRef.current!.setStreamPanelRollingWindow(panelId, value),
+      setStreamPanelAverageMode: (panelId, mode) =>
+        panelHandlersRef.current!.setStreamPanelAverageMode(panelId, mode),
+      setStreamPanelTraceDecimator: (panelId, decimator) =>
+        panelHandlersRef.current!.setStreamPanelTraceDecimator(
+          panelId,
+          decimator
+        ),
+      setStreamPanelTraceMaxPoints: (panelId, value) =>
+        panelHandlersRef.current!.setStreamPanelTraceMaxPoints(panelId, value),
+      setStreamPanelTraceMaxFps: (panelId, value) =>
+        panelHandlersRef.current!.setStreamPanelTraceMaxFps(panelId, value),
+      setStreamParamsPanelOutputs: (panelId, outputIds) =>
+        panelHandlersRef.current!.setStreamParamsPanelOutputs(
+          panelId,
+          outputIds
+        ),
+      setStreamBinStatsOverlayOutputs: (panelId, outputIds) =>
+        panelHandlersRef.current!.setStreamBinStatsOverlayOutputs(
+          panelId,
+          outputIds
+        ),
+      setStreamBinStatsFitOverlayOutputs: (panelId, outputIds) =>
+        panelHandlersRef.current!.setStreamBinStatsFitOverlayOutputs(
+          panelId,
+          outputIds
+        ),
+      setStreamBinStatsUncertainty: (panelId, mode, scale) =>
+        panelHandlersRef.current!.setStreamBinStatsUncertainty(
+          panelId,
+          mode,
+          scale
+        ),
+      setStreamBinStatsShowBinMarkers: (panelId, show) =>
+        panelHandlersRef.current!.setStreamBinStatsShowBinMarkers(
+          panelId,
+          show
+        ),
+      setStreamBinStatsXAxisTransform: (panelId, xOffset, xScale) =>
+        panelHandlersRef.current!.setStreamBinStatsXAxisTransform(
+          panelId,
+          xOffset,
+          xScale
+        ),
+      setStreamBin2dReducer: (panelId, reducer) =>
+        panelHandlersRef.current!.setStreamBin2dReducer(panelId, reducer),
     }),
     []
   );
@@ -3467,6 +3513,7 @@ export function App() {
               <div className="plot-grid-scroll-area">
                 <PanelsGrid
                   streamWorkspaceOptions={streamWorkspaceOptions}
+                  streamTargetOptions={streamTargetOptions}
                   yAxisDraftInvalid={yAxisDraftInvalid}
                   streamWsConnected={streamWsConnected}
                   streamAnalysisWsConnected={streamAnalysisWsConnected}
@@ -3496,52 +3543,6 @@ export function App() {
             />
           ) : null
         }
-        streamTraceOpened={streamTraceOptionsPanel !== null}
-        onCloseStreamTrace={closeStreamTraceOptionsModal}
-        streamTracePanel={streamTraceOptionsPanel}
-        streamTargetOptions={streamTargetOptions}
-        streamWorkspaceOptions={streamWorkspaceOptions}
-        streamTraceOutputOptions={streamTraceOptionsTraceOutputOptions}
-        streamTraceOverlayOutputOptions={streamTraceOptionsOverlayOutputOptions}
-        onSetStreamTraceSourceMode={setStreamTracePanelSourceMode}
-        onSetStreamPanelOverlayCount={setStreamPanelOverlayCount}
-        onSetStreamPanelRollingWindow={setStreamPanelRollingWindow}
-        onSetStreamPanelAverageMode={setStreamPanelAverageMode}
-        onSetStreamPanelTargetFromKey={setStreamPanelTargetFromKey}
-        onSetStreamPanelChannelIndex={setStreamPanelChannelIndex}
-        onSetStreamPanelChannels={setStreamPanelChannels}
-        onSetStreamTraceWorkspace={setStreamTracePanelWorkspace}
-        onSetStreamTraceOutput={setStreamTracePanelOutput}
-        onSetStreamTraceOverlayOutputs={setStreamTracePanelOverlayOutputs}
-        onSetStreamPanelTraceDecimator={setStreamPanelTraceDecimator}
-        onSetStreamPanelTraceMaxPoints={setStreamPanelTraceMaxPoints}
-        onSetStreamPanelTraceMaxFps={setStreamPanelTraceMaxFps}
-        streamBinStatsOpened={streamBinStatsOptionsPanel !== null}
-        onCloseStreamBinStats={closeStreamBinStatsOptionsModal}
-        streamBinStatsPanel={streamBinStatsOptionsPanel}
-        streamBinStatsOutputOptions={streamBinStatsOptionsOutputOptions}
-        streamBinStatsTraceOverlayOptions={streamBinStatsOptionsTraceOverlayOptions}
-        streamBinStatsFitOverlayOptions={streamBinStatsOptionsFitOverlayOptions}
-        streamBinStatsXAxisLabel={streamBinStatsOptionsXLabel}
-        onSetStreamAnalysisPanelWorkspace={setStreamAnalysisPanelWorkspace}
-        onSetStreamAnalysisPanelOutput={setStreamAnalysisPanelOutput}
-        onSetStreamBinStatsOverlayOutputs={setStreamBinStatsOverlayOutputs}
-        onSetStreamBinStatsFitOverlayOutputs={setStreamBinStatsFitOverlayOutputs}
-        onSetStreamBinStatsUncertainty={setStreamBinStatsUncertainty}
-        onSetStreamBinStatsShowBinMarkers={setStreamBinStatsShowBinMarkers}
-        onSetStreamBinStatsXAxisTransform={setStreamBinStatsXAxisTransform}
-        streamParamsOpened={streamParamsOptionsPanel !== null}
-        onCloseStreamParams={closeStreamParamsOptionsModal}
-        streamParamsPanel={streamParamsOptionsPanel}
-        streamParamsOutputOptions={streamParamsOutputOptions}
-        onSetStreamParamsOutputs={setStreamParamsPanelOutputs}
-        streamBin2dOpened={streamBin2dOptionsPanel !== null}
-        onCloseStreamBin2d={closeStreamBin2dOptionsModal}
-        streamBin2dPanel={streamBin2dOptionsPanel}
-        streamBin2dOutputOptions={streamBin2dOptionsOutputOptions}
-        streamBin2dXAxisLabel={streamBin2dOptionsXLabel}
-        streamBin2dYAxisLabel={streamBin2dOptionsYLabel}
-        onSetStreamBin2dReducer={setStreamBin2dReducer}
       />
 
       <WorkspaceCommandLayer

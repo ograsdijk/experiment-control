@@ -75,10 +75,6 @@ export function usePanelDerivations() {
   const {
     panels,
     expandedPlotPanelId,
-    streamTraceOptionsPanelId,
-    streamBinStatsOptionsPanelId,
-    streamParamsOptionsPanelId,
-    streamBin2dOptionsPanelId,
   } = usePanels();
   const { streamWorkspaces } = useStreamAnalysis();
 
@@ -87,147 +83,6 @@ export function usePanelDerivations() {
     () => panels.find((panel) => panel.id === expandedPlotPanelId) ?? null,
     [expandedPlotPanelId, panels]
   );
-
-  // ---- stream trace options ---------------------------------------
-  // No explicit return type — TS infers `PlotStreamPanelState |
-  // PlotStreamWaterfallPanelState | null` from the `isStreamTracePanel`
-  // guard, same as App.tsx had inline.
-  const streamTraceOptionsPanel = useMemo(() => {
-    const panel = panels.find((entry) => entry.id === streamTraceOptionsPanelId) ?? null;
-    if (!panel || !isStreamTracePanel(panel)) {
-      return null;
-    }
-    return panel;
-  }, [panels, streamTraceOptionsPanelId]);
-
-  const streamTraceOptionsWorkspace =
-    useMemo<StreamAnalysisWorkspaceConfig | null>(() => {
-      if (!streamTraceOptionsPanel || streamTraceOptionsPanel.sourceMode !== "dag") {
-        return null;
-      }
-      return streamWorkspaces[streamTraceOptionsPanel.workspaceId] ?? null;
-    }, [streamTraceOptionsPanel, streamWorkspaces]);
-
-  const streamTraceOptionsTraceOutputOptions = useMemo(() => {
-    return workspaceOutputOptionsByKind(streamTraceOptionsWorkspace, "trace");
-  }, [streamTraceOptionsWorkspace]);
-
-  const streamTraceOptionsOverlayOutputOptions = useMemo(() => {
-    const selectedPrimary = String(streamTraceOptionsPanel?.outputId ?? "").trim();
-    return streamTraceOptionsTraceOutputOptions.filter(
-      (option) => option.value !== selectedPrimary
-    );
-  }, [streamTraceOptionsTraceOutputOptions, streamTraceOptionsPanel?.outputId]);
-
-  // ---- stream bin stats options -----------------------------------
-  const streamBinStatsOptionsPanel =
-    useMemo<PlotStreamBinStatsPanelState | null>(() => {
-      const panel = panels.find((entry) => entry.id === streamBinStatsOptionsPanelId) ?? null;
-      if (!panel || !isStreamBinStatsPanel(panel)) {
-        return null;
-      }
-      return panel;
-    }, [panels, streamBinStatsOptionsPanelId]);
-
-  const streamBinStatsOptionsWorkspace =
-    useMemo<StreamAnalysisWorkspaceConfig | null>(() => {
-      if (!streamBinStatsOptionsPanel) {
-        return null;
-      }
-      return streamWorkspaces[streamBinStatsOptionsPanel.workspaceId] ?? null;
-    }, [streamBinStatsOptionsPanel, streamWorkspaces]);
-
-  const streamBinStatsOptionsOutputOptions = useMemo(() => {
-    return workspaceOutputOptionsByKind(streamBinStatsOptionsWorkspace, "hist_agg");
-  }, [streamBinStatsOptionsWorkspace]);
-
-  const streamBinStatsOptionsTraceOverlayOptions = useMemo(() => {
-    return workspaceOutputOptionsByKind(streamBinStatsOptionsWorkspace, "trace");
-  }, [streamBinStatsOptionsWorkspace]);
-
-  const streamBinStatsOptionsFitOverlayOptions = useMemo(() => {
-    return workspaceOutputOptionsByKind(streamBinStatsOptionsWorkspace, "fit_1d");
-  }, [streamBinStatsOptionsWorkspace]);
-
-  const streamBinStatsOptionsXLabel = useMemo(() => {
-    return workspaceXAxisLabel(
-      streamBinStatsOptionsWorkspace,
-      streamBinStatsOptionsPanel?.outputId ?? null
-    );
-  }, [streamBinStatsOptionsWorkspace, streamBinStatsOptionsPanel?.outputId]);
-
-  // ---- stream params options --------------------------------------
-  const streamParamsOptionsPanel =
-    useMemo<PlotStreamParamsPanelState | null>(() => {
-      const panel = panels.find((entry) => entry.id === streamParamsOptionsPanelId) ?? null;
-      if (!panel || !isStreamParamsPanel(panel)) {
-        return null;
-      }
-      return panel;
-    }, [panels, streamParamsOptionsPanelId]);
-
-  const streamParamsOptionsWorkspace =
-    useMemo<StreamAnalysisWorkspaceConfig | null>(() => {
-      if (!streamParamsOptionsPanel) {
-        return null;
-      }
-      return streamWorkspaces[streamParamsOptionsPanel.workspaceId] ?? null;
-    }, [streamParamsOptionsPanel, streamWorkspaces]);
-
-  const streamParamsOutputOptions = useMemo(() => {
-    const scalar = workspaceOutputOptionsByKind(streamParamsOptionsWorkspace, "scalar").map(
-      (item) => ({
-        value: item.value,
-        label: `[scalar] ${item.label}`,
-      })
-    );
-    const paramsMap = workspaceOutputOptionsByKind(
-      streamParamsOptionsWorkspace,
-      "params_map"
-    ).map((item) => ({
-      value: item.value,
-      label: `[fit params] ${item.label}`,
-    }));
-    return [...scalar, ...paramsMap];
-  }, [streamParamsOptionsWorkspace]);
-
-  // ---- stream 2D bins options -------------------------------------
-  const streamBin2dOptionsPanel =
-    useMemo<PlotStreamBin2dPanelState | null>(() => {
-      const panel = panels.find((entry) => entry.id === streamBin2dOptionsPanelId) ?? null;
-      if (!panel || !isStreamBin2dPanel(panel)) {
-        return null;
-      }
-      return panel;
-    }, [panels, streamBin2dOptionsPanelId]);
-
-  const streamBin2dOptionsWorkspace =
-    useMemo<StreamAnalysisWorkspaceConfig | null>(() => {
-      if (!streamBin2dOptionsPanel) {
-        return null;
-      }
-      return streamWorkspaces[streamBin2dOptionsPanel.workspaceId] ?? null;
-    }, [streamBin2dOptionsPanel, streamWorkspaces]);
-
-  const streamBin2dOptionsOutputOptions = useMemo(() => {
-    return workspaceOutputOptionsByKind(streamBin2dOptionsWorkspace, "hist2d");
-  }, [streamBin2dOptionsWorkspace]);
-
-  const streamBin2dOptionsXLabel = useMemo(() => {
-    return workspaceBin2dAxisLabel(
-      streamBin2dOptionsWorkspace,
-      streamBin2dOptionsPanel?.outputId ?? null,
-      "x"
-    );
-  }, [streamBin2dOptionsWorkspace, streamBin2dOptionsPanel?.outputId]);
-
-  const streamBin2dOptionsYLabel = useMemo(() => {
-    return workspaceBin2dAxisLabel(
-      streamBin2dOptionsWorkspace,
-      streamBin2dOptionsPanel?.outputId ?? null,
-      "y"
-    );
-  }, [streamBin2dOptionsWorkspace, streamBin2dOptionsPanel?.outputId]);
 
   // ---- subscription derivations -----------------------------------
   //
@@ -451,24 +306,6 @@ export function usePanelDerivations() {
 
   return {
     expandedPlotPanel,
-    streamTraceOptionsPanel,
-    streamTraceOptionsWorkspace,
-    streamTraceOptionsTraceOutputOptions,
-    streamTraceOptionsOverlayOutputOptions,
-    streamBinStatsOptionsPanel,
-    streamBinStatsOptionsWorkspace,
-    streamBinStatsOptionsOutputOptions,
-    streamBinStatsOptionsTraceOverlayOptions,
-    streamBinStatsOptionsFitOverlayOptions,
-    streamBinStatsOptionsXLabel,
-    streamParamsOptionsPanel,
-    streamParamsOptionsWorkspace,
-    streamParamsOutputOptions,
-    streamBin2dOptionsPanel,
-    streamBin2dOptionsWorkspace,
-    streamBin2dOptionsOutputOptions,
-    streamBin2dOptionsXLabel,
-    streamBin2dOptionsYLabel,
     activeRawStreamSubscriptions,
     activeStreamAnalysisWorkspaceSubscriptions,
   };

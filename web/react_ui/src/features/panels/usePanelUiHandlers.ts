@@ -39,11 +39,6 @@ import { markPanelDirty } from "./PanelInvalidationStore";
  * - Stream-bin2d display: `setStreamBin2dReducer`.
  * - Expand modal toggles: `openExpandedPlot`, `closeExpandedPlot`,
  *   `isExpandablePlotPanel`.
- * - Stream-options modal toggles (4 pairs): `openStreamTraceOptionsModal`,
- *   `closeStreamTraceOptionsModal`, `openStreamBinStatsOptionsModal`,
- *   `closeStreamBinStatsOptionsModal`, `openStreamParamsOptionsModal`,
- *   `closeStreamParamsOptionsModal`, `openStreamBin2dOptionsModal`,
- *   `closeStreamBin2dOptionsModal`.
  *
  * **What's deferred to follow-up rounds**:
  *
@@ -70,10 +65,7 @@ export function usePanelUiHandlers() {
   const {
     setPanels,
     setExpandedPlotPanelId,
-    setStreamTraceOptionsPanelId,
-    setStreamBinStatsOptionsPanelId,
-    setStreamParamsOptionsPanelId,
-    setStreamBin2dOptionsPanelId,    panels,
+    panels,
   } = usePanels();
 
   const setPanelYScaleMode = (panelId: string, mode: YScaleMode) => {
@@ -238,54 +230,6 @@ export function usePanelUiHandlers() {
     setExpandedPlotPanelId(null);
   };
 
-  const openStreamTraceOptionsModal = (panelId: string) => {
-    const panel = panels.find((entry) => entry.id === panelId);
-    if (!panel || !isStreamTracePanel(panel)) {
-      return;
-    }
-    setStreamTraceOptionsPanelId(panelId);
-  };
-
-  const closeStreamTraceOptionsModal = () => {
-    setStreamTraceOptionsPanelId(null);
-  };
-
-  const openStreamBinStatsOptionsModal = (panelId: string) => {
-    const panel = panels.find((entry) => entry.id === panelId);
-    if (!panel || !isStreamBinStatsPanel(panel)) {
-      return;
-    }
-    setStreamBinStatsOptionsPanelId(panelId);
-  };
-
-  const closeStreamBinStatsOptionsModal = () => {
-    setStreamBinStatsOptionsPanelId(null);
-  };
-
-  const openStreamParamsOptionsModal = (panelId: string) => {
-    const panel = panels.find((entry) => entry.id === panelId);
-    if (!panel || !isStreamParamsPanel(panel)) {
-      return;
-    }
-    setStreamParamsOptionsPanelId(panelId);
-  };
-
-  const closeStreamParamsOptionsModal = () => {
-    setStreamParamsOptionsPanelId(null);
-  };
-
-  const openStreamBin2dOptionsModal = (panelId: string) => {
-    const panel = panels.find((entry) => entry.id === panelId);
-    if (!panel || !isStreamBin2dPanel(panel)) {
-      return;
-    }
-    setStreamBin2dOptionsPanelId(panelId);
-  };
-
-  const closeStreamBin2dOptionsModal = () => {
-    setStreamBin2dOptionsPanelId(null);
-  };
-
   return {
     setPanelYScaleMode,
     setPanelManualYRange,
@@ -299,13 +243,5 @@ export function usePanelUiHandlers() {
     isExpandablePlotPanel,
     openExpandedPlot,
     closeExpandedPlot,
-    openStreamTraceOptionsModal,
-    closeStreamTraceOptionsModal,
-    openStreamBinStatsOptionsModal,
-    closeStreamBinStatsOptionsModal,
-    openStreamParamsOptionsModal,
-    closeStreamParamsOptionsModal,
-    openStreamBin2dOptionsModal,
-    closeStreamBin2dOptionsModal,
   };
 }

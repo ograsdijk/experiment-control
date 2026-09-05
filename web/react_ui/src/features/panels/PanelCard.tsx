@@ -9,18 +9,11 @@ import {
 } from "react";
 import {
   ActionIcon,
-  Divider,
   Group,
-  NumberInput,
-  Popover,
-  SegmentedControl,
-  Select,
-  Stack,
   Text,
   useComputedColorScheme,
 } from "@mantine/core";
-import { notifications } from "@mantine/notifications";
-import { IconCheck, IconSettings, IconX } from "@tabler/icons-react";
+import { IconX } from "@tabler/icons-react";
 
 import { PlotPanel } from "../../components/PlotPanel";
 import { PlotLegend, type PlotLegendItem } from "../../components/PlotLegend";
@@ -77,6 +70,11 @@ import {
   usePanelRevision,
 } from "./PanelInvalidationStore";
 import { PanelCardHeader, type PanelMenuItem } from "./PanelCardHeader";
+import {
+  EMPTY_PANEL_SETTINGS_OPTIONS,
+  PanelSettings,
+  type PanelSettingsOptions,
+} from "./PanelSettings";
 import { PanelStatusLine, type PanelStatusItem } from "./PanelStatusLine";
 import { usePlotAreaHeight } from "./usePlotAreaHeight";
 import type {
@@ -91,7 +89,7 @@ import type {
  *
  * The card is monitoring-first: the title and the plot are permanent, and
  * everything that configures the panel lives behind the header's settings
- * control or the per-kind advanced modal it opens. What used to be a row
+ * control — one surface, no second modal behind it. What used to be a row
  * of up to fourteen badges under the plot is split by nature rather than
  * by place — configuration moved into settings, live state stayed on the
  * card, because a climbing dropped-sample count should not need a modal
@@ -155,6 +153,7 @@ function outputKindForPanel(
 export interface PanelCardProps {
   panel: PlotPanelState;
   streamWorkspaceOptions: Array<{ value: string; label: string }>;
+  streamTargetOptions: Array<{ value: string; label: string }>;
   yAxisDraftInvalid: boolean;
   streamWsConnected: boolean;
   streamAnalysisWsConnected: boolean;
@@ -166,6 +165,7 @@ export interface PanelCardProps {
 function PanelCardImpl({
   panel,
   streamWorkspaceOptions,
+  streamTargetOptions,
   yAxisDraftInvalid,
   streamWsConnected,
   streamAnalysisWsConnected,
@@ -263,29 +263,15 @@ function PanelCardImpl({
     cancelPanelTitleEdit,
     removePanel,
     duplicatePanel,
-    setPanelLayout,
     setPanelSeriesLabel,
     removeTraceFromPanel,
-    setPanelTimeWindow,
     openPlotOptions,
     closePlotOptions,
-    applyPlotOptionsAxis,
-    setPlotOptionsAxisMode,
-    setTelemetryYDisplayMode,
-    setTelemetryYOffsetMode,
-    setTelemetrySmoothingMode,
-    setTelemetrySmoothingWindow,
     clearPanelBuffers,
     clearStreamPanelFrames,
     clearStreamBinStatsPanel,
     clearStreamBin2dPanel,
-    setStreamAnalysisPanelWorkspace,
-    setStreamAnalysisPanelOutput,
     openExpandedPlot,
-    openStreamTraceOptionsModal,
-    openStreamBin2dOptionsModal,
-    openStreamParamsOptionsModal,
-    openStreamBinStatsOptionsModal,
   } = handlers;
 
   // The active panel is where a clicked telemetry signal lands, so the
@@ -392,6 +378,60 @@ function PanelCardImpl({
         : telemetryOffsetFull
       : null;
 
+  // --- settings options ----------------------------------------------
+  //
+  // The option lists the settings popover needs are derived from the
+  // workspace, and there are up to four of them per panel. Computing
+  // them for every card on every workspace update is the cost the old
+  // modals avoided by deriving only for the one panel whose modal was
+  // open; the gate keeps that property now that the surface is per card.
+  const settingsOpen = plotOptionsPanelId === panel.id;
+  const settingsOptions = useMemo<PanelSettingsOptions>(() => {
+    if (!settingsOpen) {
+      return EMPTY_PANEL_SETTINGS_OPTIONS;
+    }
+    const ws = streamWorkspace;
+    const traceOptions = workspaceOutputOptionsByKind(ws, "trace");
+    const primary =
+      isStreamTracePanel(panel) && panel.sourceMode === "dag"
+        ? traceOptions
+        : outputOptions;
+    const selectedPrimary =
+      isStreamTracePanel(panel) ? String(panel.outputId ?? "").trim() : "";
+    return {
+      outputOptions: primary,
+      overlayTraceOptions: isStreamTracePanel(panel)
+        ? traceOptions.filter((option) => option.value !== selectedPrimary)
+        : traceOptions,
+      fitOverlayOptions: isStreamBinStatsPanel(panel)
+        ? workspaceOutputOptionsByKind(ws, "fit_1d")
+        : [],
+      paramsOutputOptions: isStreamParamsPanel(panel)
+        ? [
+            ...workspaceOutputOptionsByKind(ws, "scalar").map((item) => ({
+              value: item.value,
+              label: `[scalar] ${item.label}`,
+            })),
+            ...workspaceOutputOptionsByKind(ws, "params_map").map((item) => ({
+              value: item.value,
+              label: `[fit params] ${item.label}`,
+            })),
+          ]
+        : [],
+      binStatsXLabel: binStatsXLabel,
+      bin2dXLabel: bin2dXLabel,
+      bin2dYLabel: bin2dYLabel,
+    };
+  }, [
+    settingsOpen,
+    panel,
+    streamWorkspace,
+    outputOptions,
+    binStatsXLabel,
+    bin2dXLabel,
+    bin2dYLabel,
+  ]);
+
   // --- live link -----------------------------------------------------
   const linkLabel =
     isStreamTracePanel(panel) && panel.sourceMode === "raw"
@@ -431,23 +471,6 @@ function PanelCardImpl({
       statusItems.push({ text: `${dropped} dropped`, warn: true });
     }
   }
-
-  // --- settings ------------------------------------------------------
-  const supportsWorkspaceSelect =
-    isStreamScalarPanel(panel) ||
-    isStreamParamsPanel(panel) ||
-    isStreamBinStatsPanel(panel) ||
-    isStreamBin2dPanel(panel);
-  const supportsOutputSelect = outputKindForPanel(panel) !== null;
-  const advancedOptionsHandler = isStreamTracePanel(panel)
-    ? () => openStreamTraceOptionsModal(panel.id)
-    : isStreamParamsPanel(panel)
-    ? () => openStreamParamsOptionsModal(panel.id)
-    : isStreamBin2dPanel(panel)
-    ? () => openStreamBin2dOptionsModal(panel.id)
-    : isStreamBinStatsPanel(panel)
-    ? () => openStreamBinStatsOptionsModal(panel.id)
-    : null;
 
   const clearPanel = () => {
     if (isTelemetryPanel(panel) || isStreamScalarPanel(panel)) {
@@ -602,369 +625,33 @@ function PanelCardImpl({
   }
 
   const settingsSlot = (
-    <Popover
-      opened={plotOptionsPanelId === panel.id}
-      onChange={(opened) => {
-        if (!opened && plotOptionsPanelId === panel.id) {
+    <PanelSettings
+      panel={panel}
+      opened={settingsOpen}
+      onToggle={() => {
+        if (settingsOpen) {
           closePlotOptions();
+          return;
         }
+        openPlotOptions(panel.id);
       }}
-      position="bottom-end"
-      withArrow
-      shadow="md"
-      withinPortal
-      zIndex={700}
-      width={420}
-    >
-      <Popover.Target>
-        <ActionIcon
-          size="sm"
-          variant="subtle"
-          color="gray"
-          aria-label="Panel settings"
-          title="Settings"
-          onClick={() => {
-            if (plotOptionsPanelId === panel.id) {
-              closePlotOptions();
-              return;
-            }
-            openPlotOptions(panel.id);
-          }}
-        >
-          <IconSettings size={15} />
-        </ActionIcon>
-      </Popover.Target>
-      <Popover.Dropdown>
-        <Stack gap="sm">
-          {supportsWorkspaceSelect ? (
-            <Stack gap={6}>
-              <Text size="xs" fw={600} c="dimmed">
-                Source
-              </Text>
-              <Select
-                size="xs"
-                searchable
-                label="Workspace"
-                placeholder="Select workspace"
-                comboboxProps={{ zIndex: 800 }}
-                data={streamWorkspaceOptions}
-                value={panel.workspaceId}
-                onChange={(value) =>
-                  setStreamAnalysisPanelWorkspace(panel.id, value)
-                }
-              />
-              {supportsOutputSelect ? (
-                <Select
-                  size="xs"
-                  searchable
-                  clearable
-                  label="Output"
-                  placeholder="Select output"
-                  comboboxProps={{ zIndex: 800 }}
-                  data={outputOptions}
-                  value={"outputId" in panel ? panel.outputId : null}
-                  onChange={(value) =>
-                    setStreamAnalysisPanelOutput(panel.id, value)
-                  }
-                />
-              ) : null}
-            </Stack>
-          ) : null}
-
-          {!isStreamParamsPanel(panel) ? (
-            <Stack gap={6}>
-              <Text size="xs" fw={600} c="dimmed">
-                Display
-              </Text>
-              <Group justify="space-between" align="center">
-                <Text size="xs" c="dimmed">
-                  {(isStreamWaterfallPanel(panel) ||
-                    isStreamBin2dPanel(panel)
-                    ? "Z"
-                    : "Y") + " axis"}
-                </Text>
-                <SegmentedControl
-                  size="xs"
-                  value={panel.yScaleMode}
-                  onChange={(value) =>
-                    setPlotOptionsAxisMode(panel, value as YScaleMode)
-                  }
-                  data={[
-                    { value: "auto", label: "Auto" },
-                    { value: "manual", label: "Manual" },
-                  ]}
-                />
-              </Group>
-              {panel.yScaleMode === "manual" ? (
-                <>
-                  <Group grow>
-                    <NumberInput
-                      size="xs"
-                      label="Min"
-                      value={yAxisDraftMin}
-                      onChange={setYAxisDraftMin}
-                    />
-                    <NumberInput
-                      size="xs"
-                      label="Max"
-                      value={yAxisDraftMax}
-                      onChange={setYAxisDraftMax}
-                    />
-                  </Group>
-                  <Group justify="space-between" align="center">
-                    <Text size="xs" c="dimmed">
-                      {yAxisAutoRange
-                        ? `auto: ${yAxisAutoRange.min.toFixed(
-                            4
-                          )} .. ${yAxisAutoRange.max.toFixed(4)}`
-                        : "auto range unavailable"}
-                    </Text>
-                    <ActionIcon
-                      variant="light"
-                      color="teal"
-                      size="sm"
-                      onClick={() => applyPlotOptionsAxis(panel.id)}
-                      disabled={yAxisDraftInvalid}
-                      aria-label="Apply axis range"
-                      title="Apply axis range"
-                    >
-                      <IconCheck size={14} />
-                    </ActionIcon>
-                  </Group>
-                </>
-              ) : (
-                <Text size="xs" c="dimmed">
-                  {yAxisAutoRange
-                    ? `auto: ${yAxisAutoRange.min.toFixed(
-                        4
-                      )} .. ${yAxisAutoRange.max.toFixed(4)}`
-                    : "auto range unavailable"}
-                </Text>
-              )}
-            </Stack>
-          ) : null}
-
-          {isTelemetryPanel(panel) ? (
-            <Stack gap={6}>
-              <Group grow>
-                <NumberInput
-                  size="xs"
-                  label="Window (s)"
-                  min={5}
-                  max={600}
-                  value={panel.timeWindowS}
-                  onChange={(value) =>
-                    setPanelTimeWindow(panel.id, Number(value))
-                  }
-                />
-              </Group>
-              <Group justify="space-between" align="center">
-                <Text size="xs" c="dimmed">
-                  Display
-                </Text>
-                <SegmentedControl
-                  size="xs"
-                  value={panel.yDisplayMode}
-                  data={[
-                    { value: "absolute", label: "Abs" },
-                    { value: "delta", label: "Delta" },
-                  ]}
-                  onChange={(value) => {
-                    const nextMode = value as YDisplayMode;
-                    if (
-                      nextMode === "delta" &&
-                      telemetryNumericTraceCount === 0
-                    ) {
-                      notifications.show({
-                        color: "yellow",
-                        title: "No numeric traces",
-                        message:
-                          "Delta display requires at least one numeric telemetry trace.",
-                      });
-                      return;
-                    }
-                    setTelemetryYDisplayMode(panel.id, nextMode);
-                  }}
-                />
-              </Group>
-              {panel.yDisplayMode === "delta" ? (
-                <>
-                  <Group justify="space-between" align="center">
-                    <Text size="xs" c="dimmed">
-                      Offset
-                    </Text>
-                    <SegmentedControl
-                      size="xs"
-                      value={panel.yOffsetMode}
-                      data={[
-                        { value: "auto", label: "Auto" },
-                        { value: "freeze", label: "Freeze" },
-                      ]}
-                      onChange={(value) => {
-                        const nextMode = value as YOffsetMode;
-                        if (nextMode === "auto") {
-                          setTelemetryYOffsetMode(panel.id, "auto");
-                          return;
-                        }
-                        if (
-                          typeof telemetryOffset !== "number" ||
-                          !Number.isFinite(telemetryOffset)
-                        ) {
-                          notifications.show({
-                            color: "yellow",
-                            title: "Offset unavailable",
-                            message:
-                              "No numeric telemetry samples available to freeze offset yet.",
-                          });
-                          return;
-                        }
-                        setTelemetryYOffsetMode(
-                          panel.id,
-                          "freeze",
-                          telemetryOffset
-                        );
-                      }}
-                    />
-                  </Group>
-                  <Text size="xs" c="dimmed">
-                    offset: {telemetryOffsetLabel}
-                    {telemetryOffsetFullLabel &&
-                    telemetryOffsetFullLabel !== telemetryOffsetLabel
-                      ? ` (${telemetryOffsetFullLabel})`
-                      : ""}
-                  </Text>
-                </>
-              ) : null}
-              <Group justify="space-between" align="center">
-                <Text size="xs" c="dimmed">
-                  Smoothing
-                </Text>
-                <SegmentedControl
-                  size="xs"
-                  value={panel.smoothingMode}
-                  data={[
-                    { value: "none", label: "Off" },
-                    { value: "sma", label: "SMA" },
-                    { value: "ema", label: "EMA" },
-                  ]}
-                  onChange={(value) =>
-                    setTelemetrySmoothingMode(
-                      panel.id,
-                      value as TelemetrySmoothingMode
-                    )
-                  }
-                />
-              </Group>
-              {panel.smoothingMode !== "none" ? (
-                <NumberInput
-                  size="xs"
-                  label="Smoothing window (s)"
-                  min={1}
-                  max={300}
-                  value={panel.smoothingWindowS}
-                  onChange={(value) =>
-                    setTelemetrySmoothingWindow(panel.id, Number(value))
-                  }
-                />
-              ) : null}
-            </Stack>
-          ) : null}
-
-          {isStreamScalarPanel(panel) ? (
-            <NumberInput
-              size="xs"
-              label="Window (s)"
-              min={5}
-              max={600}
-              value={panel.timeWindowS}
-              onChange={(value) => setPanelTimeWindow(panel.id, Number(value))}
-            />
-          ) : null}
-
-          <Divider />
-          <Stack gap={6}>
-            <Text size="xs" fw={600} c="dimmed">
-              Card
-            </Text>
-            <Group grow align="flex-end">
-              <NumberInput
-                size="xs"
-                label="Plot height (px)"
-                description="Empty follows the card"
-                placeholder="auto"
-                min={MIN_PANEL_HEIGHT_PX}
-                max={MAX_PANEL_HEIGHT_PX}
-                value={panel.heightPx ?? ""}
-                onChange={(value) =>
-                  setPanelLayout(panel.id, {
-                    heightPx:
-                      value === "" || value === null ? null : Number(value),
-                  })
-                }
-              />
-              <div>
-                <Text size="xs" c="dimmed" mb={4}>
-                  Width
-                </Text>
-                <SegmentedControl
-                  size="xs"
-                  fullWidth
-                  value={String(panel.colSpan ?? 1)}
-                  data={[
-                    { value: "1", label: "1" },
-                    { value: "2", label: "2" },
-                    { value: "3", label: "3" },
-                  ]}
-                  onChange={(value) =>
-                    setPanelLayout(panel.id, { colSpan: Number(value) })
-                  }
-                />
-              </div>
-            </Group>
-          </Stack>
-
-          {statusDetailRows.length > 0 ? (
-            <>
-              <Divider />
-              <Stack gap={2}>
-                <Text size="xs" fw={600} c="dimmed">
-                  Status
-                </Text>
-                {statusDetailRows.map(([label, value]) => (
-                  <Group
-                    key={label}
-                    justify="space-between"
-                    gap="xs"
-                    wrap="nowrap"
-                  >
-                    <Text size="xs" c="dimmed">
-                      {label}
-                    </Text>
-                    <Text size="xs" style={{ textAlign: "right" }}>
-                      {value}
-                    </Text>
-                  </Group>
-                ))}
-              </Stack>
-            </>
-          ) : null}
-
-          {advancedOptionsHandler ? (
-            <Text
-              size="xs"
-              c="teal"
-              style={{ cursor: "pointer" }}
-              onClick={() => {
-                closePlotOptions();
-                advancedOptionsHandler();
-              }}
-            >
-              Open advanced options…
-            </Text>
-          ) : null}
-        </Stack>
-      </Popover.Dropdown>
-    </Popover>
+      onClose={closePlotOptions}
+      streamWorkspaceOptions={streamWorkspaceOptions}
+      streamTargetOptions={streamTargetOptions}
+      options={settingsOptions}
+      yAxisDraftMin={yAxisDraftMin}
+      yAxisDraftMax={yAxisDraftMax}
+      onYAxisDraftMinChange={setYAxisDraftMin}
+      onYAxisDraftMaxChange={setYAxisDraftMax}
+      yAxisAutoRange={yAxisAutoRange}
+      yAxisDraftInvalid={yAxisDraftInvalid}
+      statusRows={statusDetailRows}
+      telemetryNumericTraceCount={telemetryNumericTraceCount}
+      telemetryOffset={telemetryOffset}
+      telemetryOffsetLabel={telemetryOffsetLabel}
+      telemetryOffsetFullLabel={telemetryOffsetFullLabel}
+      handlers={handlers}
+    />
   );
 
   // --- activation ----------------------------------------------------

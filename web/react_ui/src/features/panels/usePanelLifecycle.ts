@@ -102,14 +102,6 @@ export function usePanelLifecycle(args: PanelLifecycleArgs) {
     plotOptionsPanelId,
     expandedPlotPanelId,
     setExpandedPlotPanelId,
-    streamTraceOptionsPanelId,
-    setStreamTraceOptionsPanelId,
-    streamBinStatsOptionsPanelId,
-    setStreamBinStatsOptionsPanelId,
-    streamBin2dOptionsPanelId,
-    setStreamBin2dOptionsPanelId,
-    streamParamsOptionsPanelId,
-    setStreamParamsOptionsPanelId,
     editingPanelId,
     setEditingPanelId,
     setPanelTitleDraft,
@@ -449,18 +441,6 @@ export function usePanelLifecycle(args: PanelLifecycleArgs) {
     if (editingPanelId === panelId) {
       setEditingPanelId(null);
       setPanelTitleDraft("");
-    }
-    if (streamTraceOptionsPanelId === panelId) {
-      setStreamTraceOptionsPanelId(null);
-    }
-    if (streamBinStatsOptionsPanelId === panelId) {
-      setStreamBinStatsOptionsPanelId(null);
-    }
-    if (streamBin2dOptionsPanelId === panelId) {
-      setStreamBin2dOptionsPanelId(null);
-    }
-    if (streamParamsOptionsPanelId === panelId) {
-      setStreamParamsOptionsPanelId(null);
     }
     if (plotOptionsPanelId === panelId) {
       closePlotOptions();
