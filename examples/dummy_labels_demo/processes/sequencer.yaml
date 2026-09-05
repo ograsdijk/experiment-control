@@ -1,0 +1,12 @@
+﻿version: 1
+process_id: sequencer
+process:
+  file: src/experiment_control/sequencer/sequencer.py
+  class_name: SequencerProcess
+init_kwargs:
+  rpc_timeout_ms: 2000
+  autoload_path: C:/Users/ogras/Documents/GitHub/experiment-control/examples/dummy_labels_demo/sequence_frequency_sweep.yaml
+restart_policy: NEVER
+heartbeat_timeout_s: 3.0
+shutdown_timeout_s: 3.0
+
