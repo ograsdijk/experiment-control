@@ -2317,7 +2317,7 @@ class StreamAnalysisProcess(ManagedProcessBase):
             self._clear_workspaces(mark_dirty=False, publish=False)
             loaded_ids: list[str] = []
             for cfg in configs:
-                runtime = self._put_workspace_from_config(
+                runtime, _reset = self._put_workspace_from_config(
                     cfg,
                     expected_revision=None,
                     mark_dirty=False,
@@ -2499,7 +2499,14 @@ class StreamAnalysisProcess(ManagedProcessBase):
         expected_revision: int | None,
         mark_dirty: bool,
         publish: bool,
-    ) -> WorkspaceRuntime:
+    ) -> tuple[WorkspaceRuntime, list[str]]:
+        """Compile and install a workspace, returning it and the reset nodes.
+
+        The second element lists the stateful nodes whose accumulators did
+        *not* survive this apply. Clients use it to decide which plots to
+        blank: a panel only has to drop its cache when a node behind one of
+        the outputs it consumes appears here.
+        """
         compiled = compile_workspace_graph(config)
         existing = self._workspaces.get(compiled.workspace_id)
         self._validate_workspace_expected_revision(
@@ -2507,24 +2514,40 @@ class StreamAnalysisProcess(ManagedProcessBase):
             existing=existing,
             expected_revision=expected_revision,
         )
-        existing_for_state = self._workspace_reusable_existing(
-            existing=existing,
-            compiled=compiled,
+        dirty_nodes = (
+            self._workspace_dirty_nodes(existing.compiled, compiled)
+            if existing is not None
+            else set(compiled.nodes.keys())
         )
         node_state = self._workspace_reused_node_state(
-            existing=existing_for_state,
+            existing=existing,
             compiled=compiled,
+            dirty_nodes=dirty_nodes,
         )
+        # `runtime.node_state` *is* `node_state`, and
+        # `_workspace_init_stateful_nodes` fills the gaps in place — so
+        # snapshot the carried-over ids before that runs.
+        reused_node_ids = set(node_state)
         runtime = self._workspace_runtime_from_compiled(
             compiled=compiled,
             config=config,
-            existing=existing_for_state,
+            existing=existing,
             node_state=node_state,
         )
         self._workspace_init_stateful_nodes(runtime)
+        reset_node_ids = sorted(
+            node_id for node_id in runtime.node_state if node_id not in reused_node_ids
+        )
 
         self._workspaces[compiled.workspace_id] = runtime
         self._prune_workspace_snapshot_outputs(runtime)
+        # A node that lost its state must not leave a snapshot behind: a
+        # client reconnecting after the apply would hydrate the pre-apply
+        # histogram and show it against post-apply bins.
+        for node_id in reset_node_ids:
+            self._clear_workspace_snapshot_outputs(
+                compiled.workspace_id, node_id=node_id
+            )
         self._rebuild_stream_index()
         self._reconcile_trace_writers()
         if mark_dirty and self._workspace_store_path is not None:
@@ -2533,9 +2556,12 @@ class StreamAnalysisProcess(ManagedProcessBase):
             self._publish_workspace_status(
                 compiled.workspace_id,
                 status="updated",
-                details={"workspace": self._workspace_summary(runtime)},
+                details={
+                    "workspace": self._workspace_summary(runtime),
+                    "state_reset_node_ids": list(reset_node_ids),
+                },
             )
-        return runtime
+        return runtime, reset_node_ids
 
     def _validate_workspace_expected_revision(
         self,
@@ -2562,54 +2588,70 @@ class StreamAnalysisProcess(ManagedProcessBase):
                 current_revision=current_revision,
             )
 
-    def _workspace_reusable_existing(
-        self,
-        *,
-        existing: WorkspaceRuntime | None,
-        compiled: CompiledWorkspace,
-    ) -> WorkspaceRuntime | None:
-        if existing is None:
-            return None
-        if not self._workspace_graph_unchanged(existing.compiled, compiled):
-            return None
-        return existing
-
     @staticmethod
-    def _workspace_graph_unchanged(
+    def _workspace_dirty_nodes(
         old_compiled: CompiledWorkspace,
         new_compiled: CompiledWorkspace,
-    ) -> bool:
-        if set(old_compiled.nodes.keys()) != set(new_compiled.nodes.keys()):
-            return False
-        for node_id, old_node in old_compiled.nodes.items():
-            new_node = new_compiled.nodes.get(node_id)
-            if new_node is None:
-                return False
-            if old_node.op != new_node.op:
-                return False
-            if old_node.params != new_node.params:
-                return False
-            if old_node.inputs != new_node.inputs:
-                return False
-        return True
+    ) -> set[str]:
+        """Nodes whose accumulated state cannot survive into `new_compiled`.
+
+        A stateful node's accumulator only means something relative to the
+        values that fed it, so it stays valid iff the node itself is
+        untouched *and* every upstream ancestor is untouched. Edits
+        downstream (a fit's `every_n`) or off to the side (a new branch off
+        the same source) cannot invalidate it.
+
+        Seeded with the nodes that are new or changed in `op` / `params` /
+        `inputs`, then propagated forward along `new_compiled.order`, which
+        is already topologically sorted — so a single pass reaches every
+        descendant.
+
+        `order` is the *pruned* execution order, not every declared node.
+        That is the right domain: `_workspace_init_stateful_nodes` walks the
+        same list, so a node outside it never holds state to begin with, and
+        every ancestor of an executed node is itself executed.
+        """
+        dirty: set[str] = set()
+        for node_id in new_compiled.order:
+            new_node = new_compiled.nodes[node_id]
+            old_node = old_compiled.nodes.get(node_id)
+            if (
+                old_node is None
+                or old_node.op != new_node.op
+                or old_node.params != new_node.params
+                or old_node.inputs != new_node.inputs
+            ):
+                dirty.add(node_id)
+                continue
+            if any(src in dirty for src in new_node.inputs.values()):
+                dirty.add(node_id)
+        return dirty
 
     @staticmethod
     def _workspace_reused_node_state(
         *,
         existing: WorkspaceRuntime | None,
         compiled: CompiledWorkspace,
+        dirty_nodes: set[str],
     ) -> dict[str, Any]:
         if existing is None:
             return {}
         node_state: dict[str, Any] = {}
         for node_id, state in existing.node_state.items():
+            if node_id in dirty_nodes:
+                continue
             old_node = existing.compiled.nodes.get(node_id)
             new_node = compiled.nodes.get(node_id)
             if old_node is None or new_node is None:
                 continue
+            # `dirty_nodes` already covers these, but this function is the
+            # last gate before a live accumulator is carried over — keep it
+            # self-sufficient rather than trusting the caller's set.
             if old_node.op != new_node.op:
                 continue
             if old_node.params != new_node.params:
+                continue
+            if old_node.inputs != new_node.inputs:
                 continue
             node_state[node_id] = state
         return node_state
@@ -4564,7 +4606,7 @@ class StreamAnalysisProcess(ManagedProcessBase):
                         "message": "expected_revision must be a non-negative integer",
                     },
                 }
-        runtime = self._put_workspace_from_config(
+        runtime, reset_node_ids = self._put_workspace_from_config(
             dict(payload),
             expected_revision=expected_revision,
             mark_dirty=True,
@@ -4575,6 +4617,11 @@ class StreamAnalysisProcess(ManagedProcessBase):
             "result": {
                 "workspace": self._workspace_summary(runtime),
                 "raw": runtime.raw_config,
+                # Stateful nodes that lost their accumulator in this apply.
+                # Not part of the workspace summary: it describes a single
+                # transition, not the workspace, and `workspace.list` would
+                # have nothing meaningful to put here.
+                "state_reset_node_ids": list(reset_node_ids),
             },
         }
 
