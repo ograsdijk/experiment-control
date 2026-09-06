@@ -837,6 +837,73 @@ class TraceRollingMeanState:
         return self.sum_trace / float(denom)
 
 
+@dataclass
+class TraceBlockAverageState:
+    """Non-overlapping average of `block_traces` consecutive traces.
+
+    Distinct from `trace.rolling_mean`, which slides by one trace and so emits
+    a new -- but heavily correlated -- output every frame. Here each input
+    trace contributes to exactly one output, which is what makes consecutive
+    fits statistically independent and their stderrs meaningful.
+
+    Output semantics: the most recently *completed* block average, held until
+    the next block completes, so panels stay steady between blocks and the
+    fit result updates once per block. `None` until the first block is full --
+    a partial average has the wrong noise level to fit.
+    """
+
+    block_traces: int
+    sum_trace: np.ndarray | None
+    count: int
+    last_average: np.ndarray | None
+    blocks_completed: int
+
+    @classmethod
+    def from_params(cls, params: Json) -> TraceBlockAverageState:
+        block = _normalize_int(params.get("block_traces"))
+        if block is None or block <= 0:
+            raise ValueError("trace.block_average requires block_traces > 0")
+        return cls(
+            block_traces=int(block),
+            sum_trace=None,
+            count=0,
+            last_average=None,
+            blocks_completed=0,
+        )
+
+    def reset(self) -> None:
+        self.sum_trace = None
+        self.count = 0
+        self.last_average = None
+        self.blocks_completed = 0
+
+    def update(self, trace_raw: Any) -> np.ndarray | None:
+        trace = _coerce_trace(trace_raw)
+        if trace is None:
+            return self.last_average
+        trace = trace.astype(np.float64, copy=False)
+        if trace.size <= 0:
+            return np.asarray([], dtype=np.float64)
+        if self.block_traces <= 1:
+            self.last_average = trace.astype(np.float64, copy=True)
+            self.blocks_completed += 1
+            return self.last_average
+        if self.sum_trace is None or int(self.sum_trace.size) != int(trace.size):
+            # A shape change means the digitizer was reconfigured; averaging
+            # across it would splice unrelated records together.
+            self.sum_trace = np.zeros(int(trace.size), dtype=np.float64)
+            self.count = 0
+            self.last_average = None
+        self.sum_trace += trace
+        self.count += 1
+        if self.count >= int(self.block_traces):
+            self.last_average = self.sum_trace / float(self.count)
+            self.sum_trace = np.zeros(int(trace.size), dtype=np.float64)
+            self.count = 0
+            self.blocks_completed += 1
+        return self.last_average
+
+
 OPS: dict[str, OpSpec] = {
     "source.stream": OpSpec(input_types={}, output_type="trace", stateful=False),
     "source.records": OpSpec(input_types={}, output_type="record", stateful=False),
@@ -891,6 +958,11 @@ OPS: dict[str, OpSpec] = {
         stateful=False,
     ),
     "trace.rolling_mean": OpSpec(
+        input_types={"trace": "trace"},
+        output_type="trace",
+        stateful=True,
+    ),
+    "trace.block_average": OpSpec(
         input_types={"trace": "trace"},
         output_type="trace",
         stateful=True,
@@ -1025,6 +1097,9 @@ OP_PARAM_SCHEMAS: dict[str, list[Json]] = {
     ],
     "trace.rolling_mean": [
         {"name": "window_traces", "kind": "integer", "required": True, "default": 1},
+    ],
+    "trace.block_average": [
+        {"name": "block_traces", "kind": "integer", "required": True, "default": 1},
     ],
     "trace.decimate": [
         {"name": "method", "kind": "string", "required": False, "default": "minmax"},
@@ -1867,6 +1942,15 @@ def _validate_node_trace_rolling_mean(
     _ = TraceRollingMeanState.from_params(node.params)
 
 
+def _validate_node_trace_block_average(
+    *,
+    node: NodeSpec,
+    source_stream_nodes: list[str],
+) -> None:
+    del source_stream_nodes
+    _ = TraceBlockAverageState.from_params(node.params)
+
+
 def _validate_node_trace_decimate(
     *,
     node: NodeSpec,
@@ -1977,6 +2061,7 @@ _NODE_OP_PARAM_VALIDATORS: dict[str, _NodeValidator] = {
     "record.field": _validate_node_record_field,
     "record.filter_eq": _validate_node_record_filter_eq,
     "trace.rolling_mean": _validate_node_trace_rolling_mean,
+    "trace.block_average": _validate_node_trace_block_average,
     "trace.decimate": _validate_node_trace_decimate,
     "fit.curve_1d": _validate_node_fit_curve_1d,
     "fit.from_hist_agg": _validate_node_fit_from_hist,
@@ -2930,6 +3015,8 @@ class StreamAnalysisProcess(ManagedProcessBase):
             return Bin2DStatsState.from_params(node.params)
         if node.op == "trace.rolling_mean":
             return TraceRollingMeanState.from_params(node.params)
+        if node.op == "trace.block_average":
+            return TraceBlockAverageState.from_params(node.params)
         if node.op in {"fit.curve_1d", "fit.from_hist_agg"}:
             return FitCurve1DState.from_params(node.params)
         return None
@@ -3688,6 +3775,14 @@ class StreamAnalysisProcess(ManagedProcessBase):
                 state = TraceRollingMeanState.from_params(node.params)
                 workspace.node_state[node_id] = state
             values[node_id] = state.update(src)
+            return True, None
+        if op == "trace.block_average":
+            src = values.get(node.inputs["trace"])
+            block_state = workspace.node_state.get(node_id)
+            if not isinstance(block_state, TraceBlockAverageState):
+                block_state = TraceBlockAverageState.from_params(node.params)
+                workspace.node_state[node_id] = block_state
+            values[node_id] = block_state.update(src)
             return True, None
         return self._execute_workspace_node_trace_unary_ops(
             node=node,
@@ -4771,6 +4866,9 @@ class StreamAnalysisProcess(ManagedProcessBase):
             if isinstance(state, TraceRollingMeanState):
                 state.reset()
                 continue
+            if isinstance(state, TraceBlockAverageState):
+                state.reset()
+                continue
             if isinstance(state, FitCurve1DState):
                 state.reset()
                 continue
@@ -4787,6 +4885,9 @@ class StreamAnalysisProcess(ManagedProcessBase):
             state.reset()
             return True
         if isinstance(state, TraceRollingMeanState):
+            state.reset()
+            return True
+        if isinstance(state, TraceBlockAverageState):
             state.reset()
             return True
         if isinstance(state, FitCurve1DState):

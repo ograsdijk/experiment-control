@@ -20,6 +20,7 @@ export type StreamDagOpId =
   | "trace.multiply_scalar"
   | "trace.divide_scalar"
   | "trace.rolling_mean"
+  | "trace.block_average"
   | "trace.decimate"
   | "trace.crop"
   | "trace.subtract_background"

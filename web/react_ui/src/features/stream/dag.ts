@@ -143,6 +143,12 @@ export const STREAM_DAG_OPS: Record<StreamDagOpId, StreamDagOpDef> = {
     outputKind: "trace",
     params: [{ name: "window_traces", label: "window_traces", kind: "integer" }],
   },
+  "trace.block_average": {
+    label: "trace.block_average",
+    inputs: ["trace"],
+    outputKind: "trace",
+    params: [{ name: "block_traces", label: "block_traces", kind: "integer" }],
+  },
   "trace.decimate": {
     label: "trace.decimate",
     inputs: ["trace"],
@@ -380,6 +386,7 @@ export const STREAM_DAG_INPUT_KINDS: Record<
   "trace.multiply_scalar": { trace: "trace", scalar: "scalar" },
   "trace.divide_scalar": { trace: "trace", scalar: "scalar" },
   "trace.rolling_mean": { trace: "trace" },
+  "trace.block_average": { trace: "trace" },
   "trace.decimate": { trace: "trace" },
   "trace.crop": { trace: "trace" },
   "trace.subtract_background": { trace: "trace" },
@@ -434,6 +441,9 @@ export function defaultParamsForOp(op: StreamDagOpId): Record<string, unknown> {
   }
   if (op === "trace.rolling_mean") {
     return { window_traces: 1 };
+  }
+  if (op === "trace.block_average") {
+    return { block_traces: 8 };
   }
   if (op === "trace.decimate") {
     return { method: "minmax", target_points: DEFAULT_TRACE_MAX_POINTS };
