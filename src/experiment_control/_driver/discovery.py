@@ -261,22 +261,6 @@ def _member_to_json(m: MemberSpec) -> dict[str, object]:
     }
 
 
-def rpc_hidden_members(device: object) -> set[str]:
-    """Return public device members explicitly hidden from ordinary RPC.
-
-    Drivers can set ``__experiment_control_rpc_hidden__`` to an iterable of
-    member names. The members remain available to the driver's own lifecycle
-    code; they are only removed from capability discovery and command dispatch.
-    """
-    raw = getattr(device, "__experiment_control_rpc_hidden__", ())
-    if isinstance(raw, str):
-        return {raw}
-    try:
-        return {str(name) for name in raw}
-    except TypeError:
-        return set()
-
-
 def discover_device_members(device: object) -> list[MemberSpec]:
     members: list[MemberSpec] = []
     type_hints: dict[str, object] = {}
@@ -285,13 +269,8 @@ def discover_device_members(device: object) -> list[MemberSpec]:
     except Exception:
         type_hints = {}
 
-    hidden_members = rpc_hidden_members(device)
     for name in dir(device):
-        if (
-            name.startswith("_")
-            or name in {"connect", "disconnect"}
-            or name in hidden_members
-        ):
+        if name.startswith("_") or name in {"connect", "disconnect"}:
             continue
 
         prop: property | None = None

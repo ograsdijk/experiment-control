@@ -80,7 +80,6 @@ windfreak = types.ModuleType("windfreak")
 windfreak.SynthHD = _BaseSynthHD
 sys.modules.setdefault("windfreak", windfreak)
 
-from experiment_control._driver.discovery import rpc_hidden_members
 from experiment_control._driver.runner import DeviceRunner
 from experiment_control.driver import discover_device_members
 from experiment_control.drivers.synthhd_driver import SynthHD
@@ -258,7 +257,6 @@ class SynthHDDriverTests(unittest.TestCase):
 
         self.assertFalse(hasattr(driver, "__experiment_control_rpc_hidden__"))
         self.assertFalse(hasattr(driver, "_RPC_EXPOSED_MEMBERS"))
-        self.assertEqual(rpc_hidden_members(driver), set())
 
         advertised = {member.name for member in discover_device_members(driver)}
 

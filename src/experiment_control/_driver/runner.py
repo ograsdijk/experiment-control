@@ -22,7 +22,6 @@ from .discovery import (
     discover_capabilities_for_class,
     discover_device_members,
     discover_stream_members,
-    rpc_hidden_members,
 )
 from .loading import Device, import_class
 from .plans import (
@@ -723,9 +722,6 @@ class DeviceRunner:
 
         if action in {"connect", "disconnect"}:
             raise NotImplementedError(f"Command {action!r} is not allowed via RPC")
-
-        if action in rpc_hidden_members(self._device):
-            raise NotImplementedError(f"Command {action!r} is not exposed via RPC")
 
         if action in self._stream_rpc:
             return self._stream_rpc[action](**params)
