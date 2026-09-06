@@ -8,7 +8,7 @@ import time
 import uuid
 from collections import OrderedDict, deque
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from graphlib import TopologicalSorter
 from pathlib import Path
 from typing import Any, Protocol
@@ -31,7 +31,15 @@ from ..utils.yaml_round_trip import dump_yaml_preserving
 from ..utils.zmq_helpers import safe_json_loads
 from .manager_client_helper import ManagerClientHelper
 from .process_base import ManagedProcessBase
+from ..stream_axis import (
+    IDENTITY_AXIS,
+    ResolvedStreamAxis,
+    axis_values,
+    resolve_stream_axis,
+)
+from ..schemas.stream import stream_calls_from_json
 from .stream_analysis_fit import (
+    FIT_MODEL_CHOICES,
     FitCurve1DState,
     _coerce_trace,
     _gate_open,
@@ -102,6 +110,27 @@ class WorkspaceRuntime:
     dropped_samples: int = 0
     revision: int = 1
     etag: str = ""
+    # Snapshotted at apply so a workspace's axis cannot change mid-flight.
+    x_axis: ResolvedStreamAxis = IDENTITY_AXIS
+
+
+def _rpc_result_payload(resp: Any) -> Any:
+    """Result payload from either RPC envelope shape, or None on failure.
+
+    Device commands routed through the manager return the raw driver-runner
+    envelope ``{"id", "status": "OK", "result"}``; manager-level calls and
+    manager-level failures use ``{"ok": ..., "error": ...}``. Checking only
+    ``ok`` treats every successful device command as a failure -- the bug
+    documented in ``hdf_writer._call_optional_device_action_result``.
+    """
+    if not isinstance(resp, dict):
+        return None
+    ok = resp.get("ok")
+    if ok is None:
+        ok = str(resp.get("status", "")).upper() == "OK"
+    if not ok:
+        return None
+    return resp.get("result")
 
 
 class WorkspaceRevisionConflict(RuntimeError):
@@ -928,6 +957,31 @@ OPS: dict[str, OpSpec] = {
 }
 
 
+BASELINE_MODE_CHOICES: list[Json] = [
+    {"value": "none", "label": "none"},
+    {"value": "constant", "label": "constant"},
+    {"value": "linear", "label": "linear"},
+]
+
+HIST_Y_SOURCE_CHOICES: list[Json] = [
+    {"value": "mean", "label": "mean"},
+    {"value": "std", "label": "std"},
+    {"value": "sem", "label": "sem"},
+    {"value": "count", "label": "count"},
+]
+
+HIST_SIGMA_SOURCE_CHOICES: list[Json] = [
+    {"value": "sem", "label": "sem"},
+    {"value": "std", "label": "std"},
+    {"value": "none", "label": "none"},
+]
+
+FIT_PARAM_FIELD_CHOICES: list[Json] = [
+    {"value": "value", "label": "value"},
+    {"value": "stderr", "label": "stderr"},
+]
+
+
 OP_PARAM_SCHEMAS: dict[str, list[Json]] = {
     "source.stream": [
         {"name": "device_id", "kind": "string", "required": True},
@@ -988,16 +1042,24 @@ OP_PARAM_SCHEMAS: dict[str, list[Json]] = {
         {"name": "bg_stop_idx", "kind": "integer", "required": True},
     ],
     "fit.curve_1d": [
-        {"name": "model", "kind": "string", "required": False, "default": "gaussian"},
+        {
+            "name": "model",
+            "kind": "string",
+            "required": False,
+            "default": "gaussian",
+            "choices": list(FIT_MODEL_CHOICES),
+        },
         {
             "name": "baseline_mode",
             "kind": "string",
             "required": False,
             "default": "none",
+            "choices": list(BASELINE_MODE_CHOICES),
         },
         {"name": "every_n", "kind": "integer", "required": False, "default": 1},
         {"name": "sigma_y", "kind": "number", "required": False},
         {"name": "dense_eval_points", "kind": "integer", "required": False},
+        {"name": "t0_s", "kind": "number", "required": False, "default": 0.0},
     ],
     "fit.yhat": [],
     "fit.xhat": [],
@@ -1005,26 +1067,47 @@ OP_PARAM_SCHEMAS: dict[str, list[Json]] = {
     "fit.xhat_dense": [],
     "fit.param": [
         {"name": "name", "kind": "string", "required": False, "default": "center"},
-        {"name": "field", "kind": "string", "required": False, "default": "value"},
+        {
+            "name": "field",
+            "kind": "string",
+            "required": False,
+            "default": "value",
+            "choices": list(FIT_PARAM_FIELD_CHOICES),
+        },
     ],
     "fit.params": [],
     "fit.from_hist_agg": [
-        {"name": "y_source", "kind": "string", "required": False, "default": "mean"},
-        {"name": "model", "kind": "string", "required": False, "default": "gaussian"},
+        {
+            "name": "y_source",
+            "kind": "string",
+            "required": False,
+            "default": "mean",
+            "choices": list(HIST_Y_SOURCE_CHOICES),
+        },
+        {
+            "name": "model",
+            "kind": "string",
+            "required": False,
+            "default": "gaussian",
+            "choices": list(FIT_MODEL_CHOICES),
+        },
         {
             "name": "baseline_mode",
             "kind": "string",
             "required": False,
             "default": "none",
+            "choices": list(BASELINE_MODE_CHOICES),
         },
         {"name": "every_n", "kind": "integer", "required": False, "default": 1},
         {"name": "sigma_y", "kind": "number", "required": False},
         {"name": "dense_eval_points", "kind": "integer", "required": False},
+        {"name": "t0_s", "kind": "number", "required": False, "default": 0.0},
         {
             "name": "chi2_sigma_source",
             "kind": "string",
             "required": False,
             "default": "sem",
+            "choices": list(HIST_SIGMA_SOURCE_CHOICES),
         },
         {"name": "min_count", "kind": "integer", "required": False, "default": 1},
         {"name": "x_min", "kind": "number", "required": False},
@@ -2104,6 +2187,14 @@ class StreamAnalysisProcess(ManagedProcessBase):
             process_id=self._process_id,
             subscribe_telemetry=False,
         )
+        # Resolved stream axes, keyed by (device_id, stream). Short-lived so a
+        # digitizer reconfigured mid-run is picked up without a restart; see
+        # also the stream_analysis.stream_axis.refresh RPC.
+        self._stream_axis_cache: dict[
+            tuple[str, str], tuple[ResolvedStreamAxis, float]
+        ] = {}
+        self._stream_axis_ttl_s = 60.0
+        self._axis_rpc_timeout_ms = min(int(rpc_timeout_ms), 1500)
         self._sub = self._manager_helper.open_sub(
             ctx=self._ctx,
             topics=("manager.chunk_ready", "manager.telemetry_update"),
@@ -2386,6 +2477,7 @@ class StreamAnalysisProcess(ManagedProcessBase):
             "revision": int(workspace.revision),
             "etag": str(workspace.etag),
             "stream": {"device_id": c.stream_key[0], "stream": c.stream_key[1]},
+            "x_axis": workspace.x_axis.to_json(),
             "node_count": len(c.nodes),
             "node_output_types": dict(c.node_output_types),
             "outputs": [
@@ -2539,6 +2631,7 @@ class StreamAnalysisProcess(ManagedProcessBase):
             node_id for node_id in runtime.node_state if node_id not in reused_node_ids
         )
 
+        runtime.x_axis = self._resolve_stream_axis(compiled.stream_key)
         self._workspaces[compiled.workspace_id] = runtime
         self._prune_workspace_snapshot_outputs(runtime)
         # A node that lost its state must not leave a snapshot behind: a
@@ -2562,6 +2655,128 @@ class StreamAnalysisProcess(ManagedProcessBase):
                 },
             )
         return runtime, reset_node_ids
+
+    def _declared_stream_axis(self, stream_key: tuple[str, str]) -> Any:
+        """The StreamAxis declared for this stream, or None."""
+        device_id, stream_name = stream_key
+        if self._manager is None:
+            return None
+        resp = self._manager.call(
+            {"type": "device.config.list"},
+            timeout_ms=self._axis_rpc_timeout_ms,
+        )
+        configs = _rpc_result_payload(resp)
+        if not isinstance(configs, list):
+            return None
+        for item in configs:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("device_id") or "").strip() != device_id:
+                continue
+            try:
+                calls = stream_calls_from_json(item.get("stream_calls") or [])
+            except Exception:
+                return None
+            for call in calls:
+                for output in call.outputs or []:
+                    if output.stream == stream_name:
+                        return output.x_axis
+        return None
+
+    def _fetch_run_metadata(self, device_id: str) -> dict[str, Any] | None:
+        """Run metadata for one device, or None if it cannot be collected.
+
+        Uses the same ``collect_run_metadata`` device action as the HDF
+        writer. It is a runner built-in rather than a driver method, and is
+        read-only: it just invokes the device's declared ``run_meta_calls``.
+        """
+        if self._manager is None:
+            return None
+        resp = self._manager.call(
+            {
+                "type": "command",
+                "device_id": device_id,
+                "action": "collect_run_metadata",
+                "params": {},
+            },
+            timeout_ms=self._axis_rpc_timeout_ms,
+        )
+        payload = _rpc_result_payload(resp)
+        if isinstance(payload, dict):
+            inner = payload.get("result")
+            if isinstance(inner, dict):
+                payload = inner
+        return payload if isinstance(payload, dict) else None
+
+    def _resolve_stream_axis(self, stream_key: tuple[str, str]) -> ResolvedStreamAxis:
+        """Resolve a stream's x axis, caching per (device, stream).
+
+        Never raises and never fails an apply: a stream that declares no axis,
+        an offline device, or an unresolvable pointer all degrade to the
+        sample index, with the reason carried on the resolved axis so the UI
+        can surface it.
+        """
+        now = time.monotonic()
+        cached = self._stream_axis_cache.get(stream_key)
+        if cached is not None and cached[1] > now:
+            return cached[0]
+
+        try:
+            declared = self._declared_stream_axis(stream_key)
+        except Exception as exc:
+            resolved = ResolvedStreamAxis(
+                units=None,
+                label=IDENTITY_AXIS.label,
+                increment=1.0,
+                origin=0.0,
+                source="unresolved",
+                error=f"stream config unavailable: {exc}",
+            )
+            self._stream_axis_cache[stream_key] = (
+                resolved,
+                now + self._stream_axis_ttl_s,
+            )
+            return resolved
+
+        if declared is None:
+            self._stream_axis_cache[stream_key] = (
+                IDENTITY_AXIS,
+                now + self._stream_axis_ttl_s,
+            )
+            return IDENTITY_AXIS
+
+        run_metadata: dict[str, Any] | None = None
+        error: str | None = None
+        if declared.metadata_keys():
+            try:
+                run_metadata = self._fetch_run_metadata(stream_key[0])
+            except Exception as exc:
+                run_metadata = None
+                error = f"collect_run_metadata failed: {exc}"
+            if run_metadata is None and error is None:
+                error = "collect_run_metadata returned no run metadata"
+
+        resolved = resolve_stream_axis(declared, run_metadata)
+        if error is not None and resolved.error is None:
+            resolved = replace(resolved, error=error)
+        self._stream_axis_cache[stream_key] = (resolved, now + self._stream_axis_ttl_s)
+        return resolved
+
+    def _refresh_stream_axes(self) -> list[Json]:
+        """Drop cached axes and re-resolve for every live workspace."""
+        self._stream_axis_cache.clear()
+        out: list[Json] = []
+        for workspace in self._workspaces.values():
+            axis = self._resolve_stream_axis(workspace.compiled.stream_key)
+            workspace.x_axis = axis
+            entry: Json = {
+                "workspace_id": workspace.compiled.workspace_id,
+                "device_id": workspace.compiled.stream_key[0],
+                "stream": workspace.compiled.stream_key[1],
+            }
+            entry.update(axis.to_json())
+            out.append(entry)
+        return out
 
     def _validate_workspace_expected_revision(
         self,
@@ -3569,6 +3784,17 @@ class StreamAnalysisProcess(ManagedProcessBase):
         values[node_id] = func(fit_val)
         return True, None
 
+    def _workspace_x_axis(self, workspace: WorkspaceRuntime) -> ResolvedStreamAxis:
+        """The sample axis a fit against ``__sample_index__`` should use.
+
+        Seam for per-frame metadata: when a driver reports the sample period
+        and record start time alongside each frame (see
+        PXIE_PER_FRAME_METADATA_PLAN.md), override the workspace-level axis
+        from the current frame here. Nothing else in the fit path needs to
+        change.
+        """
+        return workspace.x_axis
+
     def _execute_workspace_fit_curve_1d(
         self,
         *,
@@ -3579,12 +3805,12 @@ class StreamAnalysisProcess(ManagedProcessBase):
     ) -> dict[str, Any] | None:
         y_raw = values.get(node.inputs["y"])
         x_input = str(node.inputs.get("x") or "").strip()
+        axis: ResolvedStreamAxis | None = None
         if x_input == SAMPLE_INDEX_INPUT_TOKEN:
+            axis = self._workspace_x_axis(workspace)
             y_trace = _coerce_trace(y_raw)
             x_raw = (
-                np.arange(int(y_trace.size), dtype=np.float64)
-                if y_trace is not None
-                else None
+                axis_values(axis, int(y_trace.size)) if y_trace is not None else None
             )
         else:
             x_raw = values.get(node.inputs["x"])
@@ -3598,6 +3824,7 @@ class StreamAnalysisProcess(ManagedProcessBase):
             x_raw=x_raw,
             y_raw=y_raw,
             gate_raw=gate_val,
+            axis=axis,
         )
 
     def _execute_workspace_fit_from_hist(
@@ -4674,6 +4901,11 @@ class StreamAnalysisProcess(ManagedProcessBase):
                 doc="List available DAG operators.",
             ),
             method(
+                "stream_analysis.stream_axis.refresh",
+                params=None,
+                doc="Re-resolve every workspace's stream x axis from the device.",
+            ),
+            method(
                 "stream_analysis.workspace.list", params=None, doc="List workspaces."
             ),
             method(
@@ -4798,6 +5030,9 @@ class StreamAnalysisProcess(ManagedProcessBase):
 
     def _rpc_stream_analysis_operators(self, req: Json) -> Json:
         return self.rpc_ok(req, result={"operators": operator_catalog_payload()})
+
+    def _rpc_stream_analysis_stream_axis_refresh(self, req: Json) -> Json:
+        return self.rpc_ok(req, result={"axes": self._refresh_stream_axes()})
 
     def _rpc_stream_analysis_workspace_list(self, req: Json) -> Json:
         return self.rpc_ok(
@@ -4959,6 +5194,9 @@ class StreamAnalysisProcess(ManagedProcessBase):
             "process.capabilities": self._rpc_stream_analysis_capabilities,
             "stream_analysis.status": self._rpc_stream_analysis_status,
             "stream_analysis.operators": self._rpc_stream_analysis_operators,
+            "stream_analysis.stream_axis.refresh": (
+                self._rpc_stream_analysis_stream_axis_refresh
+            ),
             "stream_analysis.workspace.list": self._rpc_stream_analysis_workspace_list,
             "stream_analysis.workspace_store.status": self._rpc_stream_analysis_workspace_store_status,
             "stream_analysis.workspace.get": self._rpc_stream_analysis_workspace_get,

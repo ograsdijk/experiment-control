@@ -23,7 +23,9 @@ from pydantic import BaseModel, Field
 
 from ._trace_aggregator import TraceAggregator
 from .gateway import GatewaySettings, RouterRpcClient, StreamFrameHub, TelemetryHub
+from ..schemas.stream import stream_axis_from_json
 from ..shm.shm_ring import ShmRingReader
+from ..stream_axis import IDENTITY_AXIS, resolve_stream_axis
 from ..utils.env import env_bool, env_float, env_int
 from ..utils.errors import TRANSIENT_CAPABILITIES_ERROR_CODES
 from ..utils.zmq_helpers import json_dumps as _orjson_dumps, safe_json_loads
@@ -1158,6 +1160,73 @@ async def telemetry_snapshot() -> dict[str, Any]:
     return await _route_request(payload)
 
 
+_STREAM_AXIS_TTL_S = 60.0
+_STREAM_AXIS_RPC_TIMEOUT_MS = 1500
+
+
+async def _device_run_metadata(device_id: str) -> dict[str, Any] | None:
+    """Cached run metadata for one device, or None when unavailable.
+
+    Only devices declaring an x_axis pointer are ever queried, and a failure
+    degrades the axis rather than the whole listing: this endpoint is polled
+    every few seconds and must not depend on a digitizer being powered on.
+    """
+    cache = getattr(app.state, "stream_axis_cache", None)
+    if cache is None:
+        cache = {}
+        app.state.stream_axis_cache = cache
+    now = time.monotonic()
+    cached = cache.get(device_id)
+    if cached is not None and cached[1] > now:
+        return cached[0]
+
+    metadata: dict[str, Any] | None = None
+    try:
+        resp = await asyncio.wait_for(
+            app.state.router.request(
+                {
+                    "type": "command",
+                    "device_id": device_id,
+                    "action": "collect_run_metadata",
+                    "params": {},
+                }
+            ),
+            timeout=_STREAM_AXIS_RPC_TIMEOUT_MS / 1000.0,
+        )
+    except Exception:
+        resp = None
+    if isinstance(resp, dict):
+        ok = resp.get("ok")
+        if ok is None:
+            ok = str(resp.get("status", "")).upper() == "OK"
+        if ok:
+            result = resp.get("result")
+            if isinstance(result, dict):
+                inner = result.get("result")
+                metadata = inner if isinstance(inner, dict) else result
+    cache[device_id] = (metadata, now + _STREAM_AXIS_TTL_S)
+    return metadata
+
+
+async def _resolve_stream_axis_payload(
+    *, device_id: str, output: dict[str, Any]
+) -> dict[str, Any]:
+    """Resolved axis fields for one stream output."""
+    raw_axis = output.get("x_axis")
+    if not isinstance(raw_axis, dict):
+        return IDENTITY_AXIS.to_json()
+    try:
+        axis = stream_axis_from_json(raw_axis)
+    except Exception:
+        return IDENTITY_AXIS.to_json()
+    if axis is None:
+        return IDENTITY_AXIS.to_json()
+    run_metadata = (
+        await _device_run_metadata(device_id) if axis.metadata_keys() else None
+    )
+    return resolve_stream_axis(axis, run_metadata).to_json()
+
+
 @app.get("/api/streams")
 async def list_streams() -> dict[str, Any]:
     payload = {"type": "device.config.list"}
@@ -1203,18 +1272,22 @@ async def list_streams() -> dict[str, Any]:
                     else []
                 )
                 kind = str(output.get("kind") or "frame")
-                out.append(
-                    {
-                        "device_id": device_id,
-                        "stream": stream,
-                        "kind": kind,
-                        "dtype": str(output.get("dtype") or ""),
-                        "shape": shape,
-                        "fields": output.get("fields") if kind == "records" else [],
-                        "units": output.get("units"),
-                        "description": output.get("description"),
-                    }
+                entry = {
+                    "device_id": device_id,
+                    "stream": stream,
+                    "kind": kind,
+                    "dtype": str(output.get("dtype") or ""),
+                    "shape": shape,
+                    "fields": output.get("fields") if kind == "records" else [],
+                    "units": output.get("units"),
+                    "description": output.get("description"),
+                }
+                entry.update(
+                    await _resolve_stream_axis_payload(
+                        device_id=device_id, output=output
+                    )
                 )
+                out.append(entry)
 
     out.sort(key=lambda item: (str(item.get("device_id")), str(item.get("stream"))))
     return {"ok": True, "result": out}

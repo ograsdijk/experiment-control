@@ -225,6 +225,12 @@ def _make_process() -> StreamAnalysisProcess:
     proc._workspace_store_path = None  # noqa: SLF001
     proc._workspace_store_dirty = False  # noqa: SLF001
     proc.published_status = []
+    # No manager: the axis resolver degrades to the sample index without
+    # attempting any device RPC, which is what an offline unit harness wants.
+    proc._manager = None  # noqa: SLF001
+    proc._stream_axis_cache = {}  # noqa: SLF001
+    proc._stream_axis_ttl_s = 60.0  # noqa: SLF001
+    proc._axis_rpc_timeout_ms = 1500  # noqa: SLF001
     proc._rebuild_stream_index = lambda: None  # noqa: SLF001
     proc._reconcile_trace_writers = lambda: None  # noqa: SLF001
     proc._publish_workspace_status = (  # noqa: SLF001

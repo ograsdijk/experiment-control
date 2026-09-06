@@ -18,6 +18,67 @@ from .common import calls_to_json
 Json = dict[str, Any]
 
 
+def stream_axis_from_json(
+    raw: Any, path: list[str | int] | None = None
+) -> StreamAxis | None:
+    """Parse an ``x_axis`` block. Shared by config parsing and the gateway."""
+    path = list(path) if path is not None else ["x_axis"]
+    if raw is None:
+        return None
+    axis_raw = require_dict(raw, path=path)
+    allowed = {
+        "units",
+        "label",
+        "increment",
+        "increment_from",
+        "rate_from",
+        "origin",
+        "origin_from",
+    }
+    unknown = sorted(set(axis_raw) - allowed)
+    if unknown:
+        raise ConfigError(
+            path=fmt_path(path),
+            message=f"unknown x_axis keys: {', '.join(unknown)}",
+        )
+
+    def _pointer(key: str) -> str | None:
+        value = axis_raw.get(key)
+        if value is None:
+            return None
+        if not isinstance(value, str) or not value.strip():
+            raise ConfigError(
+                path=fmt_path([*path, key]),
+                message="must be a non-empty run-metadata key name",
+            )
+        return value.strip()
+
+    def _num(key: str) -> float | None:
+        value = axis_raw.get(key)
+        if value is None:
+            return None
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ConfigError(
+                path=fmt_path([*path, key]), message="must be a number"
+            )
+        return float(value)
+
+    try:
+        return StreamAxis(
+            units=optional_str(axis_raw.get("units"), path=[*path, "units"]),
+            label=optional_str(axis_raw.get("label"), path=[*path, "label"]),
+            increment=_num("increment"),
+            increment_from=_pointer("increment_from"),
+            rate_from=_pointer("rate_from"),
+            origin=_num("origin"),
+            origin_from=_pointer("origin_from"),
+        )
+    except ConfigError:
+        raise
+    except ValueError as exc:
+        raise ConfigError(path=fmt_path(path), message=str(exc)) from exc
+
+
 def stream_calls_to_json(calls: list[StreamCall]) -> list[Json]:
     def _output_to_json(o: StreamOut) -> Json:
         payload: Json = {
@@ -90,62 +151,6 @@ def stream_calls_from_json(raw: object) -> list[StreamCall]:
         desc = optional_str(f.get("description", None), path=[*path, "description"])
         return StreamMeta(name=name, dtype=dtype, units=units, description=desc)
 
-    def _parse_x_axis(raw: Any, path: list[str | int]) -> StreamAxis | None:
-        if raw is None:
-            return None
-        axis_raw = require_dict(raw, path=path)
-        allowed = {
-            "units",
-            "label",
-            "increment",
-            "increment_from",
-            "rate_from",
-            "origin",
-            "origin_from",
-        }
-        unknown = sorted(set(axis_raw) - allowed)
-        if unknown:
-            raise ConfigError(
-                path=fmt_path(path),
-                message=f"unknown x_axis keys: {', '.join(unknown)}",
-            )
-
-        def _pointer(key: str) -> str | None:
-            value = axis_raw.get(key)
-            if value is None:
-                return None
-            if not isinstance(value, str) or not value.strip():
-                raise ConfigError(
-                    path=fmt_path([*path, key]),
-                    message="must be a non-empty run-metadata key name",
-                )
-            return value.strip()
-
-        def _num(key: str) -> float | None:
-            value = axis_raw.get(key)
-            if value is None:
-                return None
-            if isinstance(value, bool) or not isinstance(value, (int, float)):
-                raise ConfigError(
-                    path=fmt_path([*path, key]), message="must be a number"
-                )
-            return float(value)
-
-        try:
-            return StreamAxis(
-                units=optional_str(axis_raw.get("units"), path=[*path, "units"]),
-                label=optional_str(axis_raw.get("label"), path=[*path, "label"]),
-                increment=_num("increment"),
-                increment_from=_pointer("increment_from"),
-                rate_from=_pointer("rate_from"),
-                origin=_num("origin"),
-                origin_from=_pointer("origin_from"),
-            )
-        except ConfigError:
-            raise
-        except ValueError as exc:
-            raise ConfigError(path=fmt_path(path), message=str(exc)) from exc
-
     def _parse_output(o: Json, path: list[str | int]) -> StreamOut:
         stream_name = require_str(o.get("stream"), path=[*path, "stream"])
         kind = str(o.get("kind", "frame")).strip() or "frame"
@@ -154,7 +159,7 @@ def stream_calls_from_json(raw: object) -> list[StreamCall]:
         desc = optional_str(o.get("description", None), path=[*path, "description"])
         ring_slots = int(o.get("ring_slots", 1024))
         attrs = optional_dict(o.get("attrs", None), path=[*path, "attrs"])
-        x_axis = _parse_x_axis(o.get("x_axis", None), [*path, "x_axis"])
+        x_axis = stream_axis_from_json(o.get("x_axis", None), [*path, "x_axis"])
         if kind == "records":
             if x_axis is not None:
                 raise ConfigError(
