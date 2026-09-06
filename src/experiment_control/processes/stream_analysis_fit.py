@@ -138,7 +138,11 @@ def _model_reciprocal_normal(
     """
     tau = np.asarray(x, dtype=np.float64) - float(t0_s)
     positive = tau > 0.0
-    tau_safe = np.where(positive, tau, 1.0)
+    # Floor away the pole. tau*tau underflows to exactly zero below
+    # ~1e-162, which would turn the division below into 0/0 -> NaN. Any
+    # tau that small sits far inside the exponential's zero region, so
+    # the floor changes no observable value.
+    tau_safe = np.maximum(np.where(positive, tau, 1.0), 1e-150)
     tau0_eff = float(tau0) if abs(float(tau0)) > 1e-18 else 1e-18
     r_eff = max(abs(float(r)), 1e-18)
 
@@ -686,6 +690,12 @@ def execute_fit_curve_1d(
     axis: Any = None,
 ) -> dict[str, Any] | None:
     if not _gate_open(gate_raw, default=True):
+        return state.last_fit
+    if y_raw is None:
+        # No trace this frame -- an upstream node that emits only
+        # periodically, such as trace.block_average before its first
+        # block fills. Nothing was attempted, so this must not count as
+        # a failed fit or advance the every_n phase.
         return state.last_fit
     state.sample_count += 1
     every_n = max(1, int(state.every_n))

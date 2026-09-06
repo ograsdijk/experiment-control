@@ -2279,6 +2279,11 @@ class StreamAnalysisProcess(ManagedProcessBase):
             tuple[str, str], tuple[ResolvedStreamAxis, float]
         ] = {}
         self._stream_axis_ttl_s = 60.0
+        # An axis resolved while the digitizer was off is stuck on the
+        # sample index until something re-resolves it; retry periodically so
+        # powering the device on is enough to recover.
+        self._stream_axis_retry_s = 60.0
+        self._stream_axis_next_retry = 0.0
         self._axis_rpc_timeout_ms = min(int(rpc_timeout_ms), 1500)
         self._sub = self._manager_helper.open_sub(
             ctx=self._ctx,
@@ -2787,7 +2792,11 @@ class StreamAnalysisProcess(ManagedProcessBase):
             timeout_ms=self._axis_rpc_timeout_ms,
         )
         payload = _rpc_result_payload(resp)
-        if isinstance(payload, dict):
+        # The manager may wrap the runner envelope, giving result.result.
+        # Only descend when this level actually looks like an envelope --
+        # run metadata is a flat dict of scalars, but a device could still
+        # declare a key literally named "result".
+        if isinstance(payload, dict) and ("status" in payload or "ok" in payload):
             inner = payload.get("result")
             if isinstance(inner, dict):
                 payload = inner
@@ -3878,6 +3887,30 @@ class StreamAnalysisProcess(ManagedProcessBase):
         fit_val = values.get(node.inputs["fit"])
         values[node_id] = func(fit_val)
         return True, None
+
+    def _retry_unresolved_stream_axes(self) -> None:
+        """Re-resolve axes that failed, e.g. because the device was offline.
+
+        Only workspaces whose axis is still unresolved are retried, so the
+        steady-state cost is zero once every axis has resolved. Runs from the
+        poll loop rather than the frame path, and no more than once per
+        ``_stream_axis_retry_s``.
+        """
+        stale = [
+            workspace
+            for workspace in self._workspaces.values()
+            if workspace.x_axis.source == "unresolved"
+        ]
+        if not stale:
+            return
+        for workspace in stale:
+            key = workspace.compiled.stream_key
+            self._stream_axis_cache.pop(key, None)
+            try:
+                workspace.x_axis = self._resolve_stream_axis(key)
+            except Exception:
+                # Never let a background retry take down the poll loop.
+                continue
 
     def _workspace_x_axis(self, workspace: WorkspaceRuntime) -> ResolvedStreamAxis:
         """The sample axis a fit against ``__sample_index__`` should use.
@@ -5391,6 +5424,10 @@ class StreamAnalysisProcess(ManagedProcessBase):
                 events = self._poll_and_drain(200)
                 if events.get(self._sub) == zmq.POLLIN:
                     self._drain_sub()
+                now = time.monotonic()
+                if now >= self._stream_axis_next_retry:
+                    self._stream_axis_next_retry = now + self._stream_axis_retry_s
+                    self._retry_unresolved_stream_axes()
         finally:
             self.close()
 

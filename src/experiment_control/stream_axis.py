@@ -106,18 +106,18 @@ def _resolve_increment(
 
 def _resolve_origin(
     axis: StreamAxis, run_metadata: Mapping[str, Any]
-) -> tuple[float, str | None]:
+) -> tuple[float, str, str | None]:
     if axis.origin is not None:
-        return float(axis.origin), None
+        return float(axis.origin), "declared", None
     if axis.origin_from is not None:
         origin = _finite(run_metadata.get(axis.origin_from))
         if origin is None:
-            return 0.0, (
+            return 0.0, "unresolved", (
                 f"run metadata key {axis.origin_from!r} missing or not a finite "
                 "number; origin defaulted to 0.0"
             )
-        return origin, None
-    return 0.0, None
+        return origin, "run_metadata", None
+    return 0.0, "declared", None
 
 
 def resolve_stream_axis(
@@ -140,7 +140,12 @@ def resolve_stream_axis(
             error=increment_error,
         )
 
-    origin, origin_error = _resolve_origin(axis, metadata)
+    origin, origin_source, origin_error = _resolve_origin(axis, metadata)
+    # A device readback anywhere in the axis makes the whole axis
+    # device-sourced; reporting "declared" because only the increment was
+    # static would misattribute where the numbers came from.
+    if "run_metadata" in (source, origin_source):
+        source = "run_metadata"
     return ResolvedStreamAxis(
         units=axis.units,
         label=axis.label,

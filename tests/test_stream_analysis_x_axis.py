@@ -236,3 +236,62 @@ class FitAgainstResolvedAxisTests(unittest.TestCase):
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
+
+
+class RetryUnresolvedStreamAxesTests(unittest.TestCase):
+    """An axis resolved while the digitizer was off must recover on its own.
+
+    Otherwise a workspace applied before power-up silently fits in samples
+    rather than seconds for the rest of the session.
+    """
+
+    def _workspace(self, proc: StreamAnalysisProcess, axis) -> object:
+        from types import SimpleNamespace
+
+        workspace = SimpleNamespace(
+            compiled=SimpleNamespace(
+                workspace_id="w1", stream_key=("pxie5171", "waveforms")
+            ),
+            x_axis=axis,
+        )
+        proc._workspaces["w1"] = workspace  # noqa: SLF001
+        return workspace
+
+    def test_an_offline_device_leaves_the_axis_unresolved(self) -> None:
+        proc = _process(_FakeManager(raise_on_command=True))
+        axis = proc._resolve_stream_axis(("pxie5171", "waveforms"))  # noqa: SLF001
+        self.assertEqual(axis.source, "unresolved")
+        self.assertEqual(axis.increment, 1.0)
+
+    def test_retry_recovers_the_axis_once_the_device_answers(self) -> None:
+        manager = _FakeManager(raise_on_command=True)
+        proc = _process(manager)
+        stale = proc._resolve_stream_axis(("pxie5171", "waveforms"))  # noqa: SLF001
+        workspace = self._workspace(proc, stale)
+
+        manager.raise_on_command = False
+        proc._retry_unresolved_stream_axes()  # noqa: SLF001
+
+        self.assertEqual(workspace.x_axis.source, "run_metadata")
+        self.assertAlmostEqual(workspace.x_axis.increment, 1e-5)
+        self.assertAlmostEqual(workspace.x_axis.origin, TRIGGER_DELAY_S)
+
+    def test_retry_ignores_workspaces_whose_axis_already_resolved(self) -> None:
+        manager = _FakeManager()
+        proc = _process(manager)
+        good = proc._resolve_stream_axis(("pxie5171", "waveforms"))  # noqa: SLF001
+        self.assertEqual(good.source, "run_metadata")
+        self._workspace(proc, good)
+
+        before = len(manager.calls)
+        proc._retry_unresolved_stream_axes()  # noqa: SLF001
+        self.assertEqual(len(manager.calls), before, "resolved axes must cost no RPC")
+
+    def test_retry_survives_a_device_that_is_still_offline(self) -> None:
+        manager = _FakeManager(raise_on_command=True)
+        proc = _process(manager)
+        workspace = self._workspace(
+            proc, proc._resolve_stream_axis(("pxie5171", "waveforms"))  # noqa: SLF001
+        )
+        proc._retry_unresolved_stream_axes()  # noqa: SLF001
+        self.assertEqual(workspace.x_axis.source, "unresolved")

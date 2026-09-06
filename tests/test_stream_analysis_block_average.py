@@ -216,3 +216,56 @@ class TestBlockAverageImprovesFitQuality(unittest.TestCase):
         assert params is not None
         self.assertAlmostEqual(params["tau0"] / self.TAU0, 1.0, delta=0.02)
         self.assertAlmostEqual(params["r"] / self.R, 1.0, delta=0.05)
+
+
+class TestFitSkipsFramesWithNoTrace(unittest.TestCase):
+    """A block-averaging node emits nothing until its first block fills. Those
+    frames must not be recorded as failed fits."""
+
+    def _state(self):
+        from experiment_control.processes.stream_analysis_fit import FitCurve1DState
+
+        return FitCurve1DState.from_params(
+            {"model": "gaussian", "baseline_mode": "none", "every_n": 1}
+        )
+
+    def test_a_none_trace_is_not_a_fit_attempt(self) -> None:
+        from experiment_control.processes.stream_analysis_fit import (
+            execute_fit_curve_1d,
+        )
+
+        state = self._state()
+        for _ in range(7):
+            out = execute_fit_curve_1d(
+                state=state, x_raw=None, y_raw=None, gate_raw=None
+            )
+            self.assertIsNone(out)
+        self.assertEqual(state.sample_count, 0)
+
+    def test_a_real_trace_still_fits_on_the_first_frame_after_the_gap(self) -> None:
+        from experiment_control.processes.stream_analysis_fit import (
+            execute_fit_curve_1d,
+        )
+
+        state = self._state()
+        for _ in range(7):
+            execute_fit_curve_1d(state=state, x_raw=None, y_raw=None, gate_raw=None)
+        x = np.linspace(-5.0, 5.0, 256)
+        y = 3.0 * np.exp(-0.5 * (x / 1.2) ** 2)
+        out = execute_fit_curve_1d(state=state, x_raw=x, y_raw=y, gate_raw=None)
+        assert out is not None
+        self.assertAlmostEqual(out["params"]["center"], 0.0, places=3)
+        self.assertEqual(state.sample_count, 1)
+
+
+class TestModelIsFiniteNearThePole(unittest.TestCase):
+    def test_no_nan_for_a_vanishingly_small_tau(self) -> None:
+        from experiment_control.processes.stream_analysis_fit import (
+            _model_reciprocal_normal,
+        )
+
+        x = np.array([1e-300, 1e-200, 1e-162, 1e-30, 1e-5, 2e-3])
+        out = _model_reciprocal_normal(x, 1.0, 2.0e-3, 0.15)
+        self.assertFalse(bool(np.isnan(out).any()))
+        self.assertTrue(bool(np.isfinite(out).all()))
+        self.assertGreater(float(out[-1]), 0.0)

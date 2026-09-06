@@ -132,3 +132,32 @@ class AxisValuesTests(unittest.TestCase):
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
+
+
+class TestAxisSourceAttribution(unittest.TestCase):
+    """`source` tells the UI where the numbers came from; a device readback in
+    either half makes the axis device-sourced."""
+
+    def test_static_increment_with_metadata_origin_is_run_metadata(self) -> None:
+        axis = StreamAxis(units="s", increment=1e-5, origin_from="trigger_delay_s")
+        resolved = resolve_stream_axis(axis, {"trigger_delay_s": 8e-4})
+        self.assertEqual(resolved.source, "run_metadata")
+        self.assertEqual(resolved.origin, 8e-4)
+        self.assertEqual(resolved.increment, 1e-5)
+
+    def test_fully_static_axis_stays_declared(self) -> None:
+        axis = StreamAxis(units="s", increment=1e-5, origin=8e-4)
+        self.assertEqual(resolve_stream_axis(axis, {}).source, "declared")
+
+    def test_metadata_increment_stays_run_metadata_with_static_origin(self) -> None:
+        axis = StreamAxis(units="s", rate_from="sample_rate_hz", origin=0.0)
+        resolved = resolve_stream_axis(axis, {"sample_rate_hz": 1e5})
+        self.assertEqual(resolved.source, "run_metadata")
+
+    def test_a_missing_origin_key_is_reported_not_silently_zeroed(self) -> None:
+        axis = StreamAxis(units="s", rate_from="sample_rate_hz", origin_from="nope")
+        resolved = resolve_stream_axis(axis, {"sample_rate_hz": 1e5})
+        self.assertEqual(resolved.origin, 0.0)
+        self.assertIsNotNone(resolved.error)
+        assert resolved.error is not None
+        self.assertIn("nope", resolved.error)
