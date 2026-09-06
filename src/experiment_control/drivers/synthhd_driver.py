@@ -11,43 +11,17 @@ class SynthHD(_SynthHD):
     upstream Windfreak API is zero-indexed internally, so this wrapper is the
     single conversion boundary: physical CH1/A maps to index 0 and CH2/B maps
     to index 1.
+
+    This wrapper does not restrict its RPC surface. Inherited upstream members
+    stay reachable, deliberately: hiding them was never a safety boundary,
+    because ``apply_command_interceptor_chain`` passes any action with no
+    matching route straight through, and anyone able to send device commands
+    can also stop the interceptor process. Safety belongs in interceptor
+    routes and manager policy, not in a per-driver name list -- which in
+    practice only silently deleted capabilities (see #159).
     """
 
     _VALID_CHANNELS = (1, 2)
-    _RPC_EXPOSED_MEMBERS = frozenset(
-        {
-            "set_frequency",
-            "get_frequency",
-            "set_power",
-            "get_power",
-            "set_enable",
-            "get_enable",
-            "set_phase",
-            "get_phase",
-            "set_temp_compensation_mode",
-            "get_temp_compensation_mode",
-            "get_lock_status",
-            "get_reference_mode",
-            "get_reference_frequency",
-        }
-    )
-
-    @property
-    def __experiment_control_rpc_hidden__(self) -> frozenset[str]:
-        """Hide every public member except the deliberate wrapper RPC API.
-
-        The upstream Windfreak class exposes raw I/O, lifecycle, sweep,
-        modulation, trigger, and mutable runtime attributes as public members.
-        Treat all of that as an implementation detail so a dependency update
-        cannot silently create a new command path around experiment-control
-        interceptors. Explicit wrapper methods above are the only ordinary RPC
-        surface; lifecycle calls still work internally through connect/disconnect.
-        """
-        return frozenset(
-            name
-            for name in dir(self)
-            if not name.startswith("_") and name not in self._RPC_EXPOSED_MEMBERS
-        )
 
     def __init__(self, port: str) -> None:
         self.port = port

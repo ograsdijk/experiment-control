@@ -43,6 +43,15 @@ class _BaseSynthHD:
     def sweep_cont(self, value: bool) -> None:
         self._sweep_cont = bool(value)
 
+    # Read-only diagnostics, mirroring the real windfreak class.
+    @property
+    def temperature(self) -> float:
+        return 42.5
+
+    @property
+    def serial_number(self) -> str:
+        return "SN-0001"
+
     def trigger(self) -> None:
         self.trigger_count += 1
 
@@ -233,18 +242,56 @@ class SynthHDDriverTests(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertFalse(hasattr(driver, name), name)
 
-    def test_only_deliberate_wrapper_members_are_mutable_via_rpc(self) -> None:
+    def test_wrapper_does_not_restrict_its_rpc_surface(self) -> None:
+        """The driver declares no hidden-member list.
+
+        #154 hid every public member outside a hand-maintained allowlist. That
+        was never a safety boundary -- an action with no matching interceptor
+        route passes straight through -- and it silently deleted
+        ``set_reference_mode`` and ``set_reference_frequency`` from the RPC
+        surface by omitting them from the allowlist. The restriction is gone;
+        keep it gone.
+        """
         driver = SynthHD("COM1")
         driver.connect()
 
+        self.assertFalse(hasattr(driver, "__experiment_control_rpc_hidden__"))
+        self.assertFalse(hasattr(driver, "_RPC_EXPOSED_MEMBERS"))
+
         advertised = {member.name for member in discover_device_members(driver)}
-        self.assertEqual(advertised, driver._RPC_EXPOSED_MEMBERS)
-        self.assertNotIn("sweep_cont", advertised)
-        self.assertNotIn("reference_mode", advertised)
-        self.assertNotIn("trigger", advertised)
-        self.assertNotIn("write", advertised)
-        self.assertNotIn("set_reference_mode", advertised)
-        self.assertNotIn("set_reference_frequency", advertised)
+
+        # The wrapper's own deliberate API.
+        for name in (
+            "set_frequency",
+            "get_frequency",
+            "set_power",
+            "get_power",
+            "set_enable",
+            "get_enable",
+            "set_phase",
+            "get_phase",
+            "set_temp_compensation_mode",
+            "get_temp_compensation_mode",
+            "get_lock_status",
+            "get_reference_mode",
+            "get_reference_frequency",
+        ):
+            with self.subTest(wrapper_method=name):
+                self.assertIn(name, advertised)
+
+        # Regression: #154 removed these two by omission.
+        for name in ("set_reference_mode", "set_reference_frequency"):
+            with self.subTest(restored=name):
+                self.assertIn(name, advertised)
+
+        # Inherited upstream members are reachable again, by design.
+        for name in ("temperature", "serial_number", "sweep_cont"):
+            with self.subTest(upstream=name):
+                self.assertIn(name, advertised)
+
+    def test_reference_setters_dispatch_via_rpc(self) -> None:
+        driver = SynthHD("COM1")
+        driver.connect()
 
         runner = object.__new__(DeviceRunner)
         runner._device = driver  # type: ignore[attr-defined]
@@ -254,40 +301,21 @@ class SynthHDDriverTests(unittest.TestCase):
         }
         runner._device_state = DeviceState.OK  # type: ignore[attr-defined]
 
-        for action in (
-            "trigger",
-            "init",
-            "open",
-            "close",
-            "read",
-            "write",
-            "save",
-            "set_reference_mode",
-            "set_reference_frequency",
-        ):
-            with self.subTest(action=action):
-                with self.assertRaisesRegex(NotImplementedError, "not exposed via RPC"):
-                    runner.handle_command(action, {})
+        runner.handle_command("set_reference_mode", {"mode": "external"})
+        self.assertEqual(driver.get_reference_mode(), "external")
 
-        for name, value in (("sweep_cont", True), ("reference_mode", "external")):
-            with self.subTest(name=name):
-                response = runner._rpc_route_set(
-                    {"id": name, "params": {"name": name, "value": value}}
-                )
-                self.assertEqual(response["status"], "ERROR")
-                self.assertEqual(response["error"], "Unknown member")
+        runner.handle_command("set_reference_frequency", {"freq_hz": 10.0e6})
+        self.assertEqual(driver.get_reference_frequency(), 10.0e6)
 
-        for name in ("sweep_cont", "reference_mode", "set_reference_mode"):
-            with self.subTest(get_name=name):
-                response = runner._rpc_route_get(
-                    {"id": name, "params": {"name": name}}
-                )
-                self.assertEqual(response["status"], "ERROR")
-                self.assertEqual(response["error"], "Unknown member")
+    def test_reference_frequency_rejects_non_finite(self) -> None:
+        driver = SynthHD("COM1")
+        driver.connect()
 
-        self.assertFalse(driver.sweep_cont)
-        self.assertEqual(driver.reference_mode, "internal 27mhz")
-        self.assertEqual(driver.trigger_count, 0)
+        for bad in (math.inf, -math.inf, math.nan):
+            with self.subTest(value=bad):
+                with self.assertRaises(ValueError):
+                    driver.set_reference_frequency(bad)
+        self.assertEqual(driver.reference_frequency, 27.0e6)
 
     def test_lock_status_methods(self) -> None:
         driver = SynthHD("COM1")
