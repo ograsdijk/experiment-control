@@ -110,6 +110,11 @@ export type StreamTarget = {
   stream: string;
   units?: string | null;
   shape?: number[];
+  // Sample axis, resolved server-side; see StreamCatalogEntry.
+  xUnits?: string | null;
+  xLabel?: string | null;
+  xIncrement?: number | null;
+  xOrigin?: number | null;
 };
 
 export type StreamAnalysisSettings = {

@@ -11,6 +11,12 @@ type StreamWaterfallPanelProps = {
   frames: StreamFrame[];
   historyRows: number;
   channelIndex: number;
+  // Sample axis, resolved server-side. Labels only: the raster itself is
+  // always drawn one column per sample.
+  xUnits?: string | null;
+  xLabel?: string | null;
+  xIncrement?: number | null;
+  xOrigin?: number | null;
   tick: number;
   colorScheme: "light" | "dark";
   plotHeight?: number;
@@ -257,6 +263,10 @@ export function StreamWaterfallPanel({
   frames,
   historyRows,
   channelIndex,
+  xUnits,
+  xLabel,
+  xIncrement,
+  xOrigin,
   tick,
   colorScheme,
   plotHeight = 340,
@@ -372,12 +382,29 @@ export function StreamWaterfallPanel({
       ctx.fillStyle = fg;
       ctx.font = "12px sans-serif";
       ctx.textAlign = "left";
-      ctx.fillText("0", left, height - 10);
-      const xMaxLabel = String(Math.max(0, grid.cols - 1));
+      const xScale = Number(xIncrement);
+      const xOriginValue = Number(xOrigin ?? 0);
+      const hasXScale =
+        Number.isFinite(xScale) &&
+        xScale !== 0 &&
+        xScale !== 1 &&
+        Number.isFinite(xOriginValue);
+      const lastSample = Math.max(0, grid.cols - 1);
+      const formatX = (sample: number) =>
+        hasXScale
+          ? (xOriginValue + xScale * sample).toPrecision(4)
+          : String(Math.trunc(sample));
+      ctx.fillText(formatX(0), left, height - 10);
       ctx.textAlign = "right";
-      ctx.fillText(xMaxLabel, left + plotW, height - 10);
+      ctx.fillText(formatX(lastSample), left + plotW, height - 10);
       ctx.textAlign = "center";
-      ctx.fillText("sample index", left + plotW * 0.5, height - 10);
+      ctx.fillText(
+        hasXScale
+          ? xLabel || (xUnits ? `time (${xUnits})` : "time")
+          : "sample index",
+        left + plotW * 0.5,
+        height - 10
+      );
 
       ctx.save();
       ctx.translate(15, top + plotH * 0.5);

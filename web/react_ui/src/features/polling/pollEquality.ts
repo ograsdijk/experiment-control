@@ -67,6 +67,11 @@ export function sameStreamCatalog(
     a.dtype === b.dtype &&
     sameOptionalArray(a.shape, b.shape) &&
     a.units === b.units &&
-    a.description === b.description
+    a.description === b.description &&
+    a.x_units === b.x_units &&
+    a.x_label === b.x_label &&
+    a.x_increment === b.x_increment &&
+    a.x_origin === b.x_origin &&
+    a.x_axis_source === b.x_axis_source
   );
 }

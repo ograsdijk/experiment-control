@@ -24,6 +24,7 @@ import {
   coerceDagParamValue,
   nodeKindFromOp,
 } from "../features/stream/dag";
+import { useOperatorCatalog } from "../features/stream/useOperatorCatalog";
 import { prettifyOutputId } from "../features/stream/output_labels";
 import {
   dagOutputKindColor,
@@ -126,6 +127,11 @@ export function DaqWorkspacesModal({
   workspaceStoreBusyAction,
   onApplyWorkspace,
 }: Props) {
+  // Param dropdowns are driven by the backend operator catalog, falling back
+  // to the static table until it resolves. Passing the draft nodes keeps a
+  // value the catalog does not list (an older or newer model name) visible
+  // rather than silently rendering as the first option.
+  const { ops: catalogOps } = useOperatorCatalog(daqDraftNodes);
   const parseChannelIndices = (raw: unknown): string[] => {
     if (Array.isArray(raw)) {
       return raw.map((item) => String(item).trim()).filter((item) => item.length > 0);
@@ -248,7 +254,7 @@ export function DaqWorkspacesModal({
                   </Text>
                 ) : (
                   daqDraftNodes.map((node, index) => {
-                    const spec = STREAM_DAG_OPS[node.op];
+                    const spec = catalogOps[node.op];
                     const isFocused = daqFocusedNodeId === node.nodeId;
                     return (
                       <Card
@@ -691,11 +697,24 @@ export function DaqWorkspacesModal({
                                   const currentValue = String(
                                     node.params[field.name] ?? ""
                                   ).trim();
-                                  const options = field.options;
-                                  const hasCurrent = options.some(
+                                  const declared = field.options;
+                                  const hasCurrent = declared.some(
                                     (option) => option.value === currentValue
                                   );
-                                  const selectedValue = hasCurrent
+                                  // Show an unrecognized saved value rather
+                                  // than falling back to the first option,
+                                  // which would misreport what is running.
+                                  const options =
+                                    hasCurrent || !currentValue
+                                      ? declared
+                                      : [
+                                          ...declared,
+                                          {
+                                            value: currentValue,
+                                            label: `${currentValue} (unknown)`,
+                                          },
+                                        ];
+                                  const selectedValue = currentValue
                                     ? currentValue
                                     : options[0]?.value ?? "";
                                   return (

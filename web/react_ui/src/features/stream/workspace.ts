@@ -296,6 +296,11 @@ export function workspaceStreamFromGraphNodes(
       deviceId,
       stream: streamName,
       units: typeof meta?.units === "string" ? meta.units : undefined,
+      xUnits: typeof meta?.x_units === "string" ? meta.x_units : undefined,
+      xLabel: typeof meta?.x_label === "string" ? meta.x_label : undefined,
+      xIncrement:
+        typeof meta?.x_increment === "number" ? meta.x_increment : undefined,
+      xOrigin: typeof meta?.x_origin === "number" ? meta.x_origin : undefined,
       shape: normalizeShape(meta?.shape),
     },
     channelIndex,
@@ -574,6 +579,10 @@ export function normalizeStreamWorkspaceRecord(
       normalized.stream = {
         ...derived.stream,
         units: normalized.stream?.units ?? derived.stream.units,
+        xUnits: normalized.stream?.xUnits ?? derived.stream.xUnits,
+        xLabel: normalized.stream?.xLabel ?? derived.stream.xLabel,
+        xIncrement: normalized.stream?.xIncrement ?? derived.stream.xIncrement,
+        xOrigin: normalized.stream?.xOrigin ?? derived.stream.xOrigin,
         shape:
           normalized.stream?.shape && normalized.stream.shape.length > 0
             ? normalized.stream.shape

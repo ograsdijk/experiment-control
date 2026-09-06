@@ -295,6 +295,11 @@ export function useStreamPanelHandlers(args: StreamPanelHandlersArgs) {
       deviceId,
       stream,
       units: typeof meta?.units === "string" ? meta.units : undefined,
+      xUnits: typeof meta?.x_units === "string" ? meta.x_units : undefined,
+      xLabel: typeof meta?.x_label === "string" ? meta.x_label : undefined,
+      xIncrement:
+        typeof meta?.x_increment === "number" ? meta.x_increment : undefined,
+      xOrigin: typeof meta?.x_origin === "number" ? meta.x_origin : undefined,
       shape: normalizeShape(meta?.shape),
     });
   };

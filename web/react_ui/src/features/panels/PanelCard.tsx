@@ -972,6 +972,12 @@ function PanelCardImpl({
               colorScheme={computedColorScheme}
               plotHeight={plotHeight}
               units={panel.stream?.units ?? null}
+              xUnits={panel.sourceMode === "raw" ? panel.stream?.xUnits ?? null : null}
+              xLabel={panel.sourceMode === "raw" ? panel.stream?.xLabel ?? null : null}
+              xIncrement={
+                panel.sourceMode === "raw" ? panel.stream?.xIncrement ?? null : null
+              }
+              xOrigin={panel.sourceMode === "raw" ? panel.stream?.xOrigin ?? null : null}
               extraSeries={traceExtraSeries}
               yScaleMode={panel.yScaleMode}
               yMin={panel.yMin}
@@ -986,6 +992,12 @@ function PanelCardImpl({
               tick={panelRevision}
               colorScheme={computedColorScheme}
               plotHeight={plotHeight}
+              xUnits={panel.sourceMode === "raw" ? panel.stream?.xUnits ?? null : null}
+              xLabel={panel.sourceMode === "raw" ? panel.stream?.xLabel ?? null : null}
+              xIncrement={
+                panel.sourceMode === "raw" ? panel.stream?.xIncrement ?? null : null
+              }
+              xOrigin={panel.sourceMode === "raw" ? panel.stream?.xOrigin ?? null : null}
               zScaleMode={panel.yScaleMode}
               zMin={panel.yMin}
               zMax={panel.yMax}

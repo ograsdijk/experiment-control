@@ -23,6 +23,19 @@ export type StreamCatalogEntry = {
   shape?: number[];
   units?: string | null;
   description?: string | null;
+  /**
+   * Sample axis, resolved server-side. `x_axis_source` is "run_metadata" when
+   * it came from a live device readback, "declared" for a static value,
+   * "identity" when the stream declares no axis, and "unresolved" when a
+   * declared axis could not be resolved (the device being off, say) -- in
+   * which case the increment falls back to 1 sample.
+   */
+  x_units?: string | null;
+  x_label?: string | null;
+  x_increment?: number | null;
+  x_origin?: number | null;
+  x_axis_source?: string | null;
+  x_axis_error?: string | null;
 };
 
 export type StreamFramePayload = {
