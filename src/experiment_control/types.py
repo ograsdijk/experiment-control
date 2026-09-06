@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import enum
+import math
 import re
 from dataclasses import dataclass, field
 from typing import Any, Literal
@@ -81,6 +82,69 @@ class StreamField:
         object.__setattr__(self, "dtype", dtype)
 
 
+@dataclass(frozen=True, slots=True)
+class StreamAxis:
+    """Sample-axis description for a frame stream.
+
+    Holds the *units* and, at most, one pointer to the run-metadata key that
+    carries the numeric scale. The number itself is deliberately never declared
+    in YAML: for the PXIe the requested sample rate is quantized by the
+    hardware, so a written-down constant can silently disagree with reality.
+    ``increment`` is only for streams whose spacing is genuinely fixed.
+    """
+
+    units: str | None = None
+    label: str | None = None
+    increment: float | None = None
+    increment_from: str | None = None
+    rate_from: str | None = None
+    origin: float | None = None
+    origin_from: str | None = None
+
+    def __post_init__(self) -> None:
+        for name in ("units", "label", "increment_from", "rate_from", "origin_from"):
+            raw = getattr(self, name)
+            if raw is None:
+                continue
+            text = str(raw).strip()
+            object.__setattr__(self, name, text or None)
+        increment_sources = [
+            name
+            for name in ("increment", "increment_from", "rate_from")
+            if getattr(self, name) is not None
+        ]
+        if len(increment_sources) > 1:
+            raise ValueError(
+                "StreamAxis accepts at most one of increment, increment_from, "
+                f"rate_from; got {sorted(increment_sources)}."
+            )
+        origin_sources = [
+            name for name in ("origin", "origin_from") if getattr(self, name) is not None
+        ]
+        if len(origin_sources) > 1:
+            raise ValueError(
+                "StreamAxis accepts at most one of origin, origin_from."
+            )
+        if self.increment is not None:
+            increment = float(self.increment)
+            if not math.isfinite(increment) or increment == 0.0:
+                raise ValueError("StreamAxis.increment must be finite and non-zero.")
+            object.__setattr__(self, "increment", increment)
+        if self.origin is not None:
+            origin = float(self.origin)
+            if not math.isfinite(origin):
+                raise ValueError("StreamAxis.origin must be finite.")
+            object.__setattr__(self, "origin", origin)
+
+    def metadata_keys(self) -> tuple[str, ...]:
+        """Run-metadata keys this axis needs resolved, in no particular order."""
+        return tuple(
+            key
+            for key in (self.increment_from, self.rate_from, self.origin_from)
+            if key
+        )
+
+
 StreamKind = Literal["frame", "records"]
 
 
@@ -95,6 +159,7 @@ class StreamOut:
     attrs: dict[str, Any] = field(default_factory=dict)
     kind: StreamKind = "frame"
     fields: tuple[StreamField, ...] = ()
+    x_axis: StreamAxis | None = None
 
     def __post_init__(self) -> None:
         kind = str(self.kind or "frame").strip()
@@ -116,6 +181,8 @@ class StreamOut:
             object.__setattr__(self, "fields", ())
             return
 
+        if self.x_axis is not None:
+            raise ValueError("StreamOut.x_axis is only valid for frame streams.")
         fields = tuple(self.fields)
         if not fields:
             raise ValueError("Record StreamOut.fields must be non-empty.")
