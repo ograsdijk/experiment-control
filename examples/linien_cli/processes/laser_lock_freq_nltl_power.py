@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,6 +13,7 @@ import zmq
 from experiment_control.capabilities import capabilities_payload, method, param
 from experiment_control.processes.manager_client_helper import ManagerClientHelper
 from experiment_control.processes.process_base import ManagedProcessBase
+from experiment_control.utils.responses import is_response_ok
 from experiment_control.utils.zmq_helpers import safe_json_loads
 
 Json = dict[str, Any]
@@ -22,6 +24,7 @@ class PowerEffect:
     device_id: str
     action: str
     param: str
+    channel: int | None
 
 
 @dataclass(frozen=True)
@@ -31,6 +34,7 @@ class PowerRule:
     device_id: str
     trigger_action: str
     trigger_param: str
+    channel: int | None
     csv_path: Path
     freq_col: int
     power_col: int
@@ -45,6 +49,11 @@ class PowerRule:
 
 
 class LaserLockFreqNltlPowerFollower(ManagedProcessBase):
+    """Example channel-aware SynthHD frequency guard and NLTL power follower."""
+
+    _RECONCILE_PERIOD_S = 1.0
+    _POWER_TOLERANCE_DBM = 0.01
+
     def __init__(
         self,
         *,
@@ -73,16 +82,18 @@ class LaserLockFreqNltlPowerFollower(ManagedProcessBase):
 
     def _parse_rules(self) -> list[PowerRule]:
         base_dir = Path(__file__).resolve().parent
-        rules: list[PowerRule] = []
+        parsed: list[PowerRule] = []
         for idx, raw in enumerate(self._rules_raw):
             if not isinstance(raw, dict):
                 raise ValueError(f"rules[{idx}] must be a dict")
+
             name = str(raw.get("name") or f"rule_{idx}")
             device_id = _require_str(raw.get("device_id"), "device_id", idx)
             trigger_action = _require_str(
                 raw.get("trigger_action"), "trigger_action", idx
             )
             trigger_param = str(raw.get("trigger_param") or "freq_hz")
+            channel = _coerce_optional_channel(raw.get("channel"), idx, "channel")
             max_step_hz = _coerce_optional_positive_float(
                 raw.get("max_step_hz"), idx, "max_step_hz"
             )
@@ -90,23 +101,18 @@ class LaserLockFreqNltlPowerFollower(ManagedProcessBase):
                 raw.get("current_freq_signal"), idx, "current_freq_signal"
             )
             if max_step_hz is not None and current_freq_signal is None:
-                current_freq_signal = _infer_current_freq_signal(trigger_action)
-            if max_step_hz is not None and current_freq_signal is None:
                 raise ValueError(
-                    "rules[{idx}].current_freq_signal is required when "
-                    "max_step_hz is set".format(idx=idx)
+                    f"rules[{idx}].current_freq_signal is required when max_step_hz is set"
                 )
             telemetry_max_age_s = _coerce_positive_float(
                 raw.get("telemetry_max_age_s", 2.0), idx, "telemetry_max_age_s"
             )
-            csv_path_raw = _require_str(raw.get("csv_path"), "csv_path", idx)
-            csv_path = Path(csv_path_raw)
+
+            csv_path = Path(_require_str(raw.get("csv_path"), "csv_path", idx))
             if not csv_path.is_absolute():
                 csv_path = (base_dir / csv_path).resolve()
-            freq_col_raw = raw.get("freq_col", 0)
-            power_col_raw = raw.get("power_col", 1)
-            freq_col = _coerce_col(freq_col_raw, idx, "freq_col")
-            power_col = _coerce_col(power_col_raw, idx, "power_col")
+            freq_col = _coerce_col(raw.get("freq_col", 0), idx, "freq_col")
+            power_col = _coerce_col(raw.get("power_col", 1), idx, "power_col")
 
             effects_raw = raw.get("effects", [])
             if not isinstance(effects_raw, list):
@@ -115,16 +121,19 @@ class LaserLockFreqNltlPowerFollower(ManagedProcessBase):
             for j, eff_raw in enumerate(effects_raw):
                 if not isinstance(eff_raw, dict):
                     raise ValueError(f"rules[{idx}].effects[{j}] must be a dict")
-                eff_device_id = str(eff_raw.get("device_id") or device_id)
-                action = _require_str(
-                    eff_raw.get("action"), "action", idx, subpath=f"effects[{j}]"
-                )
-                param = str(eff_raw.get("param") or "power_dbm")
                 effects.append(
                     PowerEffect(
-                        device_id=eff_device_id,
-                        action=action,
-                        param=param,
+                        device_id=str(eff_raw.get("device_id") or device_id),
+                        action=_require_str(
+                            eff_raw.get("action"),
+                            "action",
+                            idx,
+                            subpath=f"effects[{j}]",
+                        ),
+                        param=str(eff_raw.get("param") or "power_dbm"),
+                        channel=_coerce_optional_channel(
+                            eff_raw.get("channel"), idx, f"effects[{j}].channel"
+                        ),
                     )
                 )
 
@@ -132,36 +141,35 @@ class LaserLockFreqNltlPowerFollower(ManagedProcessBase):
                 csv_path, freq_col=freq_col, power_col=power_col
             )
             if not freqs:
-                raise ValueError(f"rules[{idx}] CSV has no data: {csv_path}")
-            min_freq_hz = float(freqs[0])
-            max_freq_hz = float(freqs[-1])
+                raise ValueError(f"rules[{idx}] CSV has no finite data: {csv_path}")
 
-            rules.append(
+            parsed.append(
                 PowerRule(
                     rule_id=f"r{idx}",
                     name=name,
                     device_id=device_id,
                     trigger_action=trigger_action,
                     trigger_param=trigger_param,
+                    channel=channel,
                     csv_path=csv_path,
                     freq_col=freq_col,
                     power_col=power_col,
                     effects=effects,
                     freqs_hz=freqs,
                     powers_dbm=powers,
-                    min_freq_hz=min_freq_hz,
-                    max_freq_hz=max_freq_hz,
+                    min_freq_hz=float(freqs[0]),
+                    max_freq_hz=float(freqs[-1]),
                     max_step_hz=max_step_hz,
                     current_freq_signal=current_freq_signal,
                     telemetry_max_age_s=telemetry_max_age_s,
                 )
             )
-        return rules
+        return parsed
 
     def _rule_enabled_state(self, rule_id: str) -> bool:
         return bool(self._rule_enabled.get(rule_id, True))
 
-    def _find_rule(
+    def _find_rules(
         self, device_id: str, action: str, *, enabled_only: bool = False
     ) -> list[PowerRule]:
         return [
@@ -172,6 +180,21 @@ class LaserLockFreqNltlPowerFollower(ManagedProcessBase):
             and (not enabled_only or self._rule_enabled_state(rule.rule_id))
         ]
 
+    @staticmethod
+    def _filter_channel_rules(
+        rules: list[PowerRule], params: dict[str, Any]
+    ) -> tuple[list[PowerRule], str | None]:
+        if not any(rule.channel is not None for rule in rules):
+            return rules, None
+        raw_channel = params.get("channel")
+        if isinstance(raw_channel, bool) or not isinstance(raw_channel, int):
+            return [], "channel must be integer 1 (CH1/A) or 2 (CH2/B)"
+        if raw_channel not in (1, 2):
+            return [], "channel must be integer 1 (CH1/A) or 2 (CH2/B)"
+        return [
+            rule for rule in rules if rule.channel is None or rule.channel == raw_channel
+        ], None
+
     def _rule_status_payload(self, rule: PowerRule) -> Json:
         return {
             "rule_id": rule.rule_id,
@@ -180,6 +203,7 @@ class LaserLockFreqNltlPowerFollower(ManagedProcessBase):
             "device_id": rule.device_id,
             "trigger_action": rule.trigger_action,
             "trigger_param": rule.trigger_param,
+            "channel": rule.channel,
             "min_freq_hz": rule.min_freq_hz,
             "max_freq_hz": rule.max_freq_hz,
             "max_step_hz": rule.max_step_hz,
@@ -188,11 +212,12 @@ class LaserLockFreqNltlPowerFollower(ManagedProcessBase):
             "csv_path": str(rule.csv_path),
             "effects": [
                 {
-                    "device_id": eff.device_id,
-                    "action": eff.action,
-                    "param": eff.param,
+                    "device_id": effect.device_id,
+                    "action": effect.action,
+                    "param": effect.param,
+                    "channel": effect.channel,
                 }
-                for eff in rule.effects
+                for effect in rule.effects
             ],
         }
 
@@ -206,31 +231,34 @@ class LaserLockFreqNltlPowerFollower(ManagedProcessBase):
             if key in seen:
                 continue
             seen.add(key)
-            routes.append(
-                {
-                    "device_id": rule.device_id,
-                    "action": rule.trigger_action,
-                }
-            )
+            routes.append({"device_id": rule.device_id, "action": rule.trigger_action})
         return routes
 
     def _register_routes(self, manager: Any) -> None:
-        payload = {
-            "type": "command_interceptor.register",
-            "process_id": self._process_id,
-            "routes": self._routes_snapshot(),
-            "replace": True,
-        }
-        resp = manager.call(payload, timeout_ms=self._manager_helper.rpc_timeout_ms)
-        if not isinstance(resp, dict) or not resp.get("ok", False):
-            raise RuntimeError(f"failed to register routes: {resp}")
+        response = manager.call(
+            {
+                "type": "manager.interceptors.register",
+                "process_id": self._process_id,
+                "routes": self._routes_snapshot(),
+                "replace": True,
+            },
+            timeout_ms=self._manager_helper.rpc_timeout_ms,
+        )
+        if not isinstance(response, dict) or not response.get("ok", False):
+            raise RuntimeError(f"failed to register routes: {response}")
+
+    def _graceful_stop(self) -> None:
+        try:
+            self._unregister_command_interceptor_routes()
+        finally:
+            super()._graceful_stop()
 
     def run(self) -> None:
         try:
             self._rules = self._parse_rules()
             self._rule_enabled = {rule.rule_id: True for rule in self._rules}
-        except Exception as e:
-            raise RuntimeError(f"invalid rules config: {e}") from e
+        except Exception as exc:
+            raise RuntimeError(f"invalid rules config: {exc}") from exc
 
         self._init_rpc_router()
         self._start_heartbeat_thread(state_provider=lambda: "RUNNING")
@@ -241,8 +269,9 @@ class LaserLockFreqNltlPowerFollower(ManagedProcessBase):
         )
         self._manager = manager
         self._advertise_process_rpc()
-        self._register_routes(manager)
 
+        # Subscribe before making the interceptor route live so a command cannot
+        # be accepted during startup before the follower can observe it.
         sub = self._manager_helper.open_sub(
             ctx=self._ctx,
             topics=["manager.command"],
@@ -250,21 +279,27 @@ class LaserLockFreqNltlPowerFollower(ManagedProcessBase):
         )
         self._command_sub = sub
         self._init_poller(include_rpc=True, include_sub=True, extra=[(sub, zmq.POLLIN)])
+        self._register_routes(manager)
+
+        next_reconcile_mono = time.monotonic()
 
         try:
             while not self._stop_evt.is_set():
                 events = self._poll_and_drain(200)
-                if events.get(sub) != zmq.POLLIN:
-                    continue
-                try:
-                    _topic_b, payload_b = sub.recv_multipart(flags=zmq.NOBLOCK)
-                except Exception:
-                    continue
+                if events.get(sub) == zmq.POLLIN:
+                    try:
+                        _topic_b, payload_b = sub.recv_multipart(flags=zmq.NOBLOCK)
+                    except Exception:
+                        payload_b = None
+                    if payload_b is not None:
+                        payload = safe_json_loads(payload_b)
+                        if isinstance(payload, dict):
+                            self._handle_command(payload, manager)
 
-                payload = safe_json_loads(payload_b)
-                if not isinstance(payload, dict):
-                    continue
-                self._handle_command(payload, manager)
+                now_mono = time.monotonic()
+                if now_mono >= next_reconcile_mono:
+                    self._reconcile_once(manager)
+                    next_reconcile_mono = now_mono + self._RECONCILE_PERIOD_S
         finally:
             try:
                 sub.close(0)
@@ -272,152 +307,63 @@ class LaserLockFreqNltlPowerFollower(ManagedProcessBase):
                 pass
             self.close()
 
-    def _range_reject_response(
+    def _reject(
         self,
         req: Json,
         *,
-        rule: PowerRule,
-        freq_hz: float,
-    ) -> Json:
-        message = (
-            f"Frequency {freq_hz:g} Hz out of range for rule {rule.name!r}: "
-            f"[{rule.min_freq_hz:g}, {rule.max_freq_hz:g}] Hz"
-        )
-        return {
-            "request_id": self._rpc_request_id(req),
-            "ok": True,
-            "allow": False,
-            "interceptor_id": self._process_id,
-            "rule": rule.name,
-            "error": {
-                "code": "FREQ_OUT_OF_RANGE",
-                "message": message,
-                "details": {
-                    "rule": rule.name,
-                    "device_id": rule.device_id,
-                    "trigger_action": rule.trigger_action,
-                    "trigger_param": rule.trigger_param,
-                    "requested_hz": float(freq_hz),
-                    "min_hz": float(rule.min_freq_hz),
-                    "max_hz": float(rule.max_freq_hz),
-                    "csv_path": str(rule.csv_path),
-                },
-            },
-        }
-
-    def _step_reject_response(
-        self,
-        req: Json,
-        *,
-        rule: PowerRule,
-        requested_hz: float,
-        current_hz: float,
-        max_step_hz: float,
-    ) -> Json:
-        step_hz = abs(requested_hz - current_hz)
-        message = (
-            f"Frequency step {step_hz:g} Hz exceeds max {max_step_hz:g} Hz "
-            f"for rule {rule.name!r}"
-        )
-        return {
-            "request_id": self._rpc_request_id(req),
-            "ok": True,
-            "allow": False,
-            "interceptor_id": self._process_id,
-            "rule": rule.name,
-            "error": {
-                "code": "FREQ_STEP_TOO_LARGE",
-                "message": message,
-                "details": {
-                    "rule": rule.name,
-                    "device_id": rule.device_id,
-                    "trigger_action": rule.trigger_action,
-                    "trigger_param": rule.trigger_param,
-                    "requested_hz": float(requested_hz),
-                    "current_hz": float(current_hz),
-                    "step_hz": float(step_hz),
-                    "max_step_hz": float(max_step_hz),
-                    "current_freq_signal": rule.current_freq_signal,
-                },
-            },
-        }
-
-    def _telemetry_reject_response(
-        self,
-        req: Json,
-        *,
-        rule: PowerRule,
+        rule: PowerRule | None,
         code: str,
         message: str,
-        details: Json | None = None,
+        **details: Any,
     ) -> Json:
-        payload_details: Json = {
-            "rule": rule.name,
-            "device_id": rule.device_id,
-            "trigger_action": rule.trigger_action,
-            "trigger_param": rule.trigger_param,
-            "current_freq_signal": rule.current_freq_signal,
-            "telemetry_max_age_s": float(rule.telemetry_max_age_s),
-        }
-        if details:
-            payload_details.update(details)
-        return {
+        payload: Json = {
             "request_id": self._rpc_request_id(req),
             "ok": True,
             "allow": False,
             "interceptor_id": self._process_id,
-            "rule": rule.name,
-            "error": {
-                "code": code,
-                "message": message,
-                "details": payload_details,
-            },
+            "error": {"code": code, "message": message, "details": details},
         }
+        if rule is not None:
+            payload["rule"] = rule.name
+            payload["error"]["details"].update(
+                {
+                    "rule": rule.name,
+                    "device_id": rule.device_id,
+                    "trigger_action": rule.trigger_action,
+                    "trigger_param": rule.trigger_param,
+                    "channel": rule.channel,
+                }
+            )
+        return payload
 
     def _validate_max_step(
         self, req: Json, *, rule: PowerRule, requested_hz: float
     ) -> Json | None:
         if rule.max_step_hz is None:
             return None
-        if self._manager is None:
-            return self._telemetry_reject_response(
+        if self._manager is None or not rule.current_freq_signal:
+            return self._reject(
                 req,
                 rule=rule,
-                code="MANAGER_UNAVAILABLE",
+                code="TELEMETRY_UNAVAILABLE",
                 message="Telemetry cache unavailable for step guard",
             )
-        current_signal = rule.current_freq_signal
-        if not current_signal:
-            return self._telemetry_reject_response(
-                req,
-                rule=rule,
-                code="CONFIG_ERROR",
-                message="current_freq_signal not configured for step guard",
-            )
-        sample = self._manager.get_latest(rule.device_id, current_signal)
-        if sample is None:
-            return self._telemetry_reject_response(
+        sample = self._manager.get_latest(rule.device_id, rule.current_freq_signal)
+        if not isinstance(sample, dict):
+            return self._reject(
                 req,
                 rule=rule,
                 code="TELEMETRY_MISSING",
-                message=(
-                    f"Telemetry missing for {rule.device_id}.{current_signal}"
-                ),
+                message=f"Telemetry missing for {rule.device_id}.{rule.current_freq_signal}",
             )
-
-        quality = str(sample.get("quality", "MISSING"))
-        if quality != "OK":
-            return self._telemetry_reject_response(
+        if str(sample.get("quality", "MISSING")) != "OK":
+            return self._reject(
                 req,
                 rule=rule,
                 code="TELEMETRY_NOT_OK",
-                message=(
-                    f"Telemetry not OK for {rule.device_id}.{current_signal}"
-                ),
-                details={"quality": quality},
+                message=f"Telemetry not OK for {rule.device_id}.{rule.current_freq_signal}",
+                quality=sample.get("quality"),
             )
-
-        age_s: float | None
         try:
             raw_age = sample.get("age_s")
             age_s = float(raw_age) if raw_age is not None else None
@@ -428,44 +374,41 @@ class LaserLockFreqNltlPowerFollower(ManagedProcessBase):
                 age_s = time.monotonic() - float(sample.get("t_mono"))
             except Exception:
                 age_s = None
-        if age_s is None:
-            return self._telemetry_reject_response(
-                req,
-                rule=rule,
-                code="TELEMETRY_MISSING",
-                message=(
-                    f"Telemetry missing timestamp for {rule.device_id}.{current_signal}"
-                ),
-            )
-        if age_s > rule.telemetry_max_age_s:
-            return self._telemetry_reject_response(
+        if age_s is None or not math.isfinite(age_s) or age_s > rule.telemetry_max_age_s:
+            return self._reject(
                 req,
                 rule=rule,
                 code="TELEMETRY_STALE",
-                message=f"Telemetry stale for {rule.device_id}.{current_signal}",
-                details={"age_s": float(age_s)},
+                message=f"Telemetry stale for {rule.device_id}.{rule.current_freq_signal}",
+                age_s=age_s,
             )
-
         try:
             current_hz = float(sample.get("value"))
         except Exception:
-            return self._telemetry_reject_response(
+            current_hz = math.nan
+        if not math.isfinite(current_hz):
+            return self._reject(
                 req,
                 rule=rule,
                 code="TELEMETRY_BAD_VALUE",
                 message=(
-                    f"Telemetry value is not numeric for "
-                    f"{rule.device_id}.{current_signal}"
+                    f"Telemetry value is not finite for "
+                    f"{rule.device_id}.{rule.current_freq_signal}"
                 ),
-                details={"value": sample.get("value")},
+                value=sample.get("value"),
             )
-        if abs(requested_hz - current_hz) > rule.max_step_hz:
-            return self._step_reject_response(
+        step_hz = abs(requested_hz - current_hz)
+        if step_hz > rule.max_step_hz:
+            return self._reject(
                 req,
                 rule=rule,
+                code="FREQ_STEP_TOO_LARGE",
+                message=f"Frequency step {step_hz:g} Hz exceeds max {rule.max_step_hz:g} Hz",
                 requested_hz=requested_hz,
                 current_hz=current_hz,
+                step_hz=step_hz,
                 max_step_hz=rule.max_step_hz,
+                current_freq_signal=rule.current_freq_signal,
             )
         return None
 
@@ -488,34 +431,28 @@ class LaserLockFreqNltlPowerFollower(ManagedProcessBase):
                 ),
                 method(
                     "follower.enable_rule",
-                    params=[
-                        param("rule_id", required=True, default=None, annotation="str")
-                    ],
+                    params=[param("rule_id", required=True, default=None, annotation="str")],
                     doc="Enable a follower rule by rule_id.",
                 ),
                 method(
                     "follower.disable_rule",
-                    params=[
-                        param("rule_id", required=True, default=None, annotation="str")
-                    ],
+                    params=[param("rule_id", required=True, default=None, annotation="str")],
                     doc="Disable a follower rule by rule_id.",
-                )
+                ),
             ]
-            members = self._with_common_capabilities(members)
-            return self.rpc_ok(req, result=capabilities_payload(members))
+            return self.rpc_ok(
+                req, result=capabilities_payload(self._with_common_capabilities(members))
+            )
 
         if rtype == "follower.rules":
-            result = {
-                "rules": [self._rule_status_payload(rule) for rule in self._rules]
-            }
-            return self.rpc_ok(req, result=result)
+            return self.rpc_ok(
+                req, result={"rules": [self._rule_status_payload(rule) for rule in self._rules]}
+            )
 
         if rtype in {"follower.enable_rule", "follower.disable_rule"}:
             rule_id = str(params.get("rule_id", "")).strip()
             if not rule_id:
-                return self.rpc_invalid_params(
-                    req, message="rule_id is required"
-                )
+                return self.rpc_invalid_params(req, message="rule_id is required")
             if not any(rule.rule_id == rule_id for rule in self._rules):
                 return self.rpc_err(req, code="unknown_rule")
             if self._manager is None:
@@ -523,18 +460,14 @@ class LaserLockFreqNltlPowerFollower(ManagedProcessBase):
                     req, code="manager_unavailable", message="Manager not initialized"
                 )
             enabled = rtype == "follower.enable_rule"
-            prev = self._rule_enabled_state(rule_id)
+            previous = self._rule_enabled_state(rule_id)
             self._rule_enabled[rule_id] = enabled
             try:
                 self._register_routes(self._manager)
-            except Exception as e:
-                self._rule_enabled[rule_id] = prev
-                return self.rpc_err(
-                    req, code="route_update_failed", message=str(e)
-                )
-            return self.rpc_ok(
-                req, result={"rule_id": rule_id, "enabled": enabled}
-            )
+            except Exception as exc:
+                self._rule_enabled[rule_id] = previous
+                return self.rpc_err(req, code="route_update_failed", message=str(exc))
+            return self.rpc_ok(req, result={"rule_id": rule_id, "enabled": enabled})
 
         if rtype != "command_interceptor.check":
             return self.rpc_unknown(req)
@@ -544,39 +477,146 @@ class LaserLockFreqNltlPowerFollower(ManagedProcessBase):
             return self.rpc_err(req, code="invalid_command")
         device_id = str(command.get("device_id", ""))
         action = str(command.get("action", ""))
-        params = command.get("params", {})
-        if not device_id or not action or not isinstance(params, dict):
+        cmd_params = command.get("params", {})
+        if not device_id or not action or not isinstance(cmd_params, dict):
             return self.rpc_err(req, code="invalid_command")
 
-        rules = self._find_rule(device_id, action, enabled_only=True)
+        rules = self._find_rules(device_id, action, enabled_only=True)
         if not rules:
-            return {
-                "request_id": self._rpc_request_id(req),
-                "ok": True,
-                "allow": True,
-            }
+            return {"request_id": self._rpc_request_id(req), "ok": True, "allow": True}
+        rules, channel_error = self._filter_channel_rules(rules, cmd_params)
+        if channel_error is not None:
+            return self._reject(
+                req,
+                rule=None,
+                code="INVALID_CHANNEL",
+                message=channel_error,
+                device_id=device_id,
+                action=action,
+                channel=cmd_params.get("channel"),
+            )
 
         for rule in rules:
-            raw_freq = params.get(rule.trigger_param)
+            raw_freq = cmd_params.get(rule.trigger_param)
             if raw_freq is None:
                 continue
             try:
                 freq_hz = float(raw_freq)
             except Exception:
-                continue
+                freq_hz = math.nan
+            if not math.isfinite(freq_hz):
+                return self._reject(
+                    req,
+                    rule=rule,
+                    code="INVALID_FREQUENCY",
+                    message="requested frequency must be finite",
+                    requested=raw_freq,
+                )
             if freq_hz < rule.min_freq_hz or freq_hz > rule.max_freq_hz:
-                return self._range_reject_response(req, rule=rule, freq_hz=freq_hz)
-            step_err = self._validate_max_step(
-                req, rule=rule, requested_hz=freq_hz
-            )
-            if step_err is not None:
-                return step_err
+                return self._reject(
+                    req,
+                    rule=rule,
+                    code="FREQ_OUT_OF_RANGE",
+                    message=(
+                        f"Frequency {freq_hz:g} Hz out of range for rule {rule.name!r}: "
+                        f"[{rule.min_freq_hz:g}, {rule.max_freq_hz:g}] Hz"
+                    ),
+                    requested_hz=freq_hz,
+                    min_hz=rule.min_freq_hz,
+                    max_hz=rule.max_freq_hz,
+                    csv_path=str(rule.csv_path),
+                )
+            step_error = self._validate_max_step(req, rule=rule, requested_hz=freq_hz)
+            if step_error is not None:
+                return step_error
 
-        return {
-            "request_id": self._rpc_request_id(req),
-            "ok": True,
-            "allow": True,
-        }
+        return {"request_id": self._rpc_request_id(req), "ok": True, "allow": True}
+
+    @staticmethod
+    def _fresh_scalar(
+        manager: Any,
+        device_id: str,
+        signal: str,
+        *,
+        max_age_s: float,
+    ) -> float | None:
+        sample = manager.get_latest(device_id, signal)
+        if not isinstance(sample, dict) or str(sample.get("quality", "MISSING")) != "OK":
+            return None
+        try:
+            age_s = float(sample.get("age_s"))
+            value = float(sample.get("value"))
+        except Exception:
+            return None
+        if (
+            not math.isfinite(age_s)
+            or age_s < 0.0
+            or age_s > max_age_s
+            or not math.isfinite(value)
+        ):
+            return None
+        return value
+
+    @staticmethod
+    def _frequency_signal(rule: PowerRule) -> str | None:
+        if rule.current_freq_signal:
+            return rule.current_freq_signal
+        if rule.channel is None:
+            return None
+        return f"ch{rule.channel}_frequency_hz"
+
+    @staticmethod
+    def _power_signal(effect: PowerEffect) -> str | None:
+        if effect.channel is None:
+            return None
+        return f"ch{effect.channel}_power_dbm"
+
+    def _reconcile_once(self, manager: Any) -> None:
+        """Repair frequency-to-power coupling after a lost command event."""
+        for rule in self._rules:
+            if not self._rule_enabled_state(rule.rule_id) or not rule.effects:
+                continue
+            freq_signal = self._frequency_signal(rule)
+            if not freq_signal:
+                continue
+            freq_hz = self._fresh_scalar(
+                manager, rule.device_id, freq_signal, max_age_s=rule.telemetry_max_age_s
+            )
+            if freq_hz is None:
+                continue
+            expected_power = _interp_linear(rule.freqs_hz, rule.powers_dbm, freq_hz)
+            if expected_power is None or not math.isfinite(expected_power):
+                continue
+
+            needs_reconcile = False
+            for effect in rule.effects:
+                power_signal = self._power_signal(effect)
+                if not power_signal:
+                    continue
+                actual_power = self._fresh_scalar(
+                    manager, effect.device_id, power_signal, max_age_s=rule.telemetry_max_age_s
+                )
+                if (
+                    actual_power is None
+                    or abs(actual_power - expected_power) > self._POWER_TOLERANCE_DBM
+                ):
+                    needs_reconcile = True
+                    break
+            if not needs_reconcile:
+                continue
+
+            params: Json = {rule.trigger_param: freq_hz}
+            if rule.channel is not None:
+                params["channel"] = rule.channel
+            self._handle_command(
+                {
+                    "ok": True,
+                    "device_id": rule.device_id,
+                    "action": rule.trigger_action,
+                    "params_json": json.dumps(params),
+                },
+                manager,
+            )
 
     def _handle_command(self, payload: Json, manager: Any) -> None:
         if not payload.get("ok", False):
@@ -585,31 +625,88 @@ class LaserLockFreqNltlPowerFollower(ManagedProcessBase):
         action = payload.get("action")
         if not isinstance(device_id, str) or not isinstance(action, str):
             return
-        rules = self._find_rule(device_id, action, enabled_only=True)
-        if not rules:
-            return
 
         params = _parse_params(payload.get("params_json"))
+        rules = self._find_rules(device_id, action, enabled_only=True)
+        rules, channel_error = self._filter_channel_rules(rules, params)
+        if channel_error is not None:
+            return
+
         for rule in rules:
-            if rule.trigger_param not in params:
+            if rule.trigger_param not in params or not rule.effects:
                 continue
             try:
-                freq_val = float(params[rule.trigger_param])
+                freq_hz = float(params[rule.trigger_param])
             except Exception:
                 continue
-            power_val = _interp_linear(rule.freqs_hz, rule.powers_dbm, freq_val)
-            if power_val is None:
+            if not math.isfinite(freq_hz):
                 continue
-            for eff in rule.effects:
-                cmd = {
+            power_dbm = _interp_linear(rule.freqs_hz, rule.powers_dbm, freq_hz)
+            if power_dbm is None:
+                continue
+            for effect in rule.effects:
+                effect_params: Json = {effect.param: power_dbm}
+                if effect.channel is not None:
+                    effect_params["channel"] = effect.channel
+                command: Json = {
                     "type": "command",
-                    "device_id": eff.device_id,
-                    "action": eff.action,
-                    "params": {eff.param: power_val},
+                    "device_id": effect.device_id,
+                    "action": effect.action,
+                    "params": effect_params,
                 }
                 if self._process_id:
-                    cmd["caller_process_id"] = self._process_id
-                manager.call(cmd, timeout_ms=self._manager_helper.rpc_timeout_ms)
+                    command["caller_process_id"] = self._process_id
+                    command["source_kind"] = "process"
+                    command["source_id"] = self._process_id
+                try:
+                    response = manager.call(
+                        command, timeout_ms=self._manager_helper.rpc_timeout_ms
+                    )
+                except Exception as exc:
+                    self._manager_helper.publish_event(
+                        manager,
+                        topic="manager.log",
+                        payload={
+                            "message": (
+                                f"power follower: {effect.device_id}.{effect.action} "
+                                f"raised: {exc!r}"
+                            ),
+                            "rule": rule.name,
+                            "device_id": effect.device_id,
+                            "action": effect.action,
+                            "param": effect.param,
+                            "power_dbm": float(power_dbm),
+                        },
+                        severity="error",
+                        device_id=effect.device_id,
+                    )
+                    continue
+                if not _response_ok(response):
+                    error = response.get("error") if isinstance(response, dict) else None
+                    self._manager_helper.publish_event(
+                        manager,
+                        topic="manager.log",
+                        payload={
+                            "message": (
+                                f"power follower: {effect.device_id}.{effect.action} "
+                                f"rejected; power={power_dbm:g} dBm not applied"
+                            ),
+                            "rule": rule.name,
+                            "device_id": effect.device_id,
+                            "action": effect.action,
+                            "param": effect.param,
+                            "power_dbm": float(power_dbm),
+                            "error": error,
+                        },
+                        severity="warning",
+                        device_id=effect.device_id,
+                    )
+
+
+def _response_ok(resp: Any) -> bool:
+    if isinstance(resp, dict) and resp.get("allow") is False:
+        return False
+    return is_response_ok(resp)
 
 
 def _parse_params(raw: Any) -> dict[str, Any]:
@@ -631,7 +728,6 @@ def _load_table(
 ) -> tuple[list[float], list[float]]:
     if not path.exists():
         raise FileNotFoundError(f"CSV not found: {path}")
-
     data = np.genfromtxt(path, delimiter=",", dtype=float)
     if data.size == 0:
         return [], []
@@ -641,23 +737,20 @@ def _load_table(
         raise ValueError("CSV missing required columns")
     freqs = data[:, freq_col]
     powers = data[:, power_col]
-    mask = ~np.isnan(freqs) & ~np.isnan(powers)
+    mask = np.isfinite(freqs) & np.isfinite(powers)
     freqs = freqs[mask]
     powers = powers[mask]
     if freqs.size == 0:
         return [], []
     order = np.argsort(freqs)
-    freqs = freqs[order]
-    powers = powers[order]
-    return freqs.tolist(), powers.tolist()
+    return freqs[order].tolist(), powers[order].tolist()
 
 
 def _interp_linear(xs: list[float], ys: list[float], x: float) -> float | None:
-    if not xs:
+    if not xs or not math.isfinite(x) or x < xs[0] or x > xs[-1]:
         return None
-    if x < xs[0] or x > xs[-1]:
-        return None
-    return float(np.interp(x, np.asarray(xs), np.asarray(ys)))
+    value = float(np.interp(x, np.asarray(xs), np.asarray(ys)))
+    return value if math.isfinite(value) else None
 
 
 def _require_str(
@@ -672,19 +765,28 @@ def _require_str(
 
 
 def _coerce_col(raw: Any, rule_idx: int, field: str) -> int:
-    try:
-        return int(raw)
-    except Exception as e:
-        raise ValueError(f"rules[{rule_idx}].{field} must be an int") from e
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        raise ValueError(f"rules[{rule_idx}].{field} must be an int")
+    return raw
+
+
+def _coerce_optional_channel(raw: Any, rule_idx: int, field: str) -> int | None:
+    if raw is None:
+        return None
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw not in (1, 2):
+        raise ValueError(
+            f"rules[{rule_idx}].{field} must be integer 1 (CH1/A) or 2 (CH2/B)"
+        )
+    return raw
 
 
 def _coerce_positive_float(raw: Any, rule_idx: int, field: str) -> float:
     try:
         value = float(raw)
-    except Exception as e:
-        raise ValueError(f"rules[{rule_idx}].{field} must be a float") from e
-    if value <= 0.0:
-        raise ValueError(f"rules[{rule_idx}].{field} must be > 0")
+    except Exception as exc:
+        raise ValueError(f"rules[{rule_idx}].{field} must be a float") from exc
+    if not math.isfinite(value) or value <= 0.0:
+        raise ValueError(f"rules[{rule_idx}].{field} must be finite and > 0")
     return value
 
 
@@ -702,14 +804,3 @@ def _coerce_optional_nonempty_str(raw: Any, rule_idx: int, field: str) -> str | 
     if not isinstance(raw, str) or not raw:
         raise ValueError(f"rules[{rule_idx}].{field} must be a non-empty string")
     return raw
-
-
-def _infer_current_freq_signal(trigger_action: str) -> str | None:
-    suffix = "_channel_"
-    idx = trigger_action.rfind(suffix)
-    if idx < 0:
-        return None
-    chan = trigger_action[idx + len(suffix) :].strip()
-    if not chan.isdigit():
-        return None
-    return f"frequency {chan}"

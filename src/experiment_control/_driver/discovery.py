@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import enum
 import inspect
 import typing
@@ -46,6 +47,30 @@ def _parse_simple_annotation(annotation: str | None) -> str | None:
             if parts == {base, "none"}:
                 return base
     return None
+
+
+def _parse_literal_annotation(annotation: str | None) -> tuple[object, ...] | None:
+    """Parse simple ``Literal[...]`` values without coercing RPC input."""
+    if not annotation:
+        return None
+    text = annotation.strip()
+    bracket = text.find("[")
+    if bracket <= 0 or not text.endswith("]"):
+        return None
+    if text[:bracket].split(".")[-1].lower() != "literal":
+        return None
+    inner = text[bracket + 1 : -1].strip()
+    if not inner:
+        return None
+    try:
+        values = ast.literal_eval(f"({inner},)")
+    except (SyntaxError, ValueError):
+        return None
+    if not isinstance(values, tuple):
+        return None
+    if not all(value is None or isinstance(value, (bool, int, float, str)) for value in values):
+        return None
+    return values
 
 
 def _has_simple_annotation(annotation: str | None) -> bool:
@@ -236,6 +261,22 @@ def _member_to_json(m: MemberSpec) -> dict[str, object]:
     }
 
 
+def rpc_hidden_members(device: object) -> set[str]:
+    """Return public device members explicitly hidden from ordinary RPC.
+
+    Drivers can set ``__experiment_control_rpc_hidden__`` to an iterable of
+    member names. The members remain available to the driver's own lifecycle
+    code; they are only removed from capability discovery and command dispatch.
+    """
+    raw = getattr(device, "__experiment_control_rpc_hidden__", ())
+    if isinstance(raw, str):
+        return {raw}
+    try:
+        return {str(name) for name in raw}
+    except TypeError:
+        return set()
+
+
 def discover_device_members(device: object) -> list[MemberSpec]:
     members: list[MemberSpec] = []
     type_hints: dict[str, object] = {}
@@ -244,8 +285,13 @@ def discover_device_members(device: object) -> list[MemberSpec]:
     except Exception:
         type_hints = {}
 
+    hidden_members = rpc_hidden_members(device)
     for name in dir(device):
-        if name.startswith("_") or name in {"connect", "disconnect"}:
+        if (
+            name.startswith("_")
+            or name in {"connect", "disconnect"}
+            or name in hidden_members
+        ):
             continue
 
         prop: property | None = None
