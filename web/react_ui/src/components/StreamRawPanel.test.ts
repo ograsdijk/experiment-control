@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 
-import { buildStreamRawData } from "./StreamRawPanel";
+import {
+  buildStreamRawData,
+  extractTrace,
+  sampleIndexArray,
+} from "./StreamRawPanel";
 
 describe("buildStreamRawData", () => {
   it("refuses to plot a truncated frame", () => {
@@ -21,5 +25,22 @@ describe("buildStreamRawData", () => {
     );
 
     expect(built.data).toEqual([[], []]);
+  });
+
+  it("reuses ingestion-normalized traces and cached sample indexes", () => {
+    const normalized = [1, 2, 3];
+    const frame = {
+      seq: 5,
+      shape: [3],
+      values: ["unused"],
+      normalizedTrace: normalized,
+      normalizedChannelCount: 4,
+    };
+    expect(extractTrace(frame, 2)).toEqual({ y: normalized, channelCount: 4 });
+    expect(extractTrace(frame, 2).y).toBe(normalized);
+    const built = buildStreamRawData([frame], 1, 2);
+    expect(built.data[0]).toBe(sampleIndexArray(3));
+    expect(built.data[1]).toBe(normalized);
+    expect(sampleIndexArray(3)).toBe(sampleIndexArray(3));
   });
 });

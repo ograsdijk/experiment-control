@@ -4,6 +4,7 @@ import type { ApiResponse } from "../../api";
 import type { CapabilityMember, DeviceStatus, ProcessStatus } from "../../types";
 import { formatApiErrorToastMessage } from "../common/api_error";
 import { normalizeStringList } from "../common/normalize";
+import { useAdaptivePolling } from "../polling/useAdaptivePolling";
 import {
   fileNameFromPath,
   isProcessRpcStateAvailable,
@@ -1164,31 +1165,22 @@ export function useHdfController({
     [hdfSelectableDeviceIds]
   );
 
-  useEffect(() => {
-    if (!hdfWriterProcess) {
-      return;
-    }
-    const processId = hdfWriterProcess.process_id;
-    const state = String(hdfWriterProcess.state ?? "").toUpperCase();
-    if (!["RUNNING", "STARTING", "STOPPING"].includes(state)) {
-      return;
-    }
-    let alive = true;
-    const load = async () => {
-      if (!alive) {
-        return;
-      }
-      await refreshHdfWriterStatus(processId);
-    };
-    void load();
-    const interval = setInterval(() => {
-      void load();
-    }, 5000);
-    return () => {
-      alive = false;
-      clearInterval(interval);
-    };
-  }, [hdfWriterProcess, refreshHdfWriterStatus]);
+  const hdfProcessPollingEnabled =
+    Boolean(hdfWriterProcess) &&
+    ["RUNNING", "STARTING", "STOPPING"].includes(
+      String(hdfWriterProcess?.state ?? "").toUpperCase()
+    );
+  useAdaptivePolling({
+    enabled: hdfProcessPollingEnabled,
+    intervalMs: 5000,
+    poll: async () =>
+      hdfWriterProcess
+        ? refreshHdfWriterStatus(hdfWriterProcess.process_id)
+        : undefined,
+    onValue: () => undefined,
+    endpoint: "/api/processes/hdf/status",
+    restartKey: hdfWriterProcess?.process_id ?? null,
+  });
 
   useEffect(() => {
     if (!hdfWriterProcess && hdfModalOpen) {

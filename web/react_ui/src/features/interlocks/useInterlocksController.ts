@@ -13,6 +13,7 @@ import {
   isProcessRpcStateAvailable,
   supportsProcessCapability,
 } from "../runtime/helpers";
+import { useAdaptivePolling } from "../polling/useAdaptivePolling";
 import type {
   CapabilityMember,
   CommandInterceptorRoute,
@@ -359,38 +360,19 @@ export function useInterlocksController({
     [refreshInterlockProcessStatus]
   );
 
-  useEffect(() => {
-    if (!interlocksOpen) {
-      return;
-    }
-    let alive = true;
-    const load = async () => {
-      if (!alive) {
-        return;
-      }
-      await refreshInterlocksModalData();
-    };
-    void load();
-    const interval = setInterval(() => {
-      void load();
-    }, 5000);
-    return () => {
-      alive = false;
-      clearInterval(interval);
-    };
-  }, [interlocksOpen, refreshInterlocksModalData]);
+  useAdaptivePolling({
+    enabled: interlocksOpen,
+    intervalMs: 5000,
+    poll: refreshInterlocksModalData,
+    onValue: () => undefined,
+    endpoint: "/api/interlocks/modal",
+  });
 
-  useEffect(() => {
-    let alive = true;
-    const load = async () => {
-      if (!alive) {
-        return;
-      }
-      const nextProcesses = await refreshProcessesRef.current();
-      if (!alive) {
-        return;
-      }
-      for (const process of nextProcesses) {
+  useAdaptivePolling({
+    enabled: !interlocksOpen,
+    intervalMs: 10000,
+    poll: async () => {
+      for (const process of processes) {
         if (!isProcessRpcStateAvailable(process)) {
           continue;
         }
@@ -399,9 +381,6 @@ export function useInterlocksController({
         let effectiveCaps = caps;
         if (effectiveCaps.length === 0) {
           effectiveCaps = await ensureProcessCapabilitiesLoadedRef.current(processId);
-          if (!alive) {
-            return;
-          }
         }
         if (
           followerRuleNamespace(effectiveCaps) !== null ||
@@ -410,16 +389,10 @@ export function useInterlocksController({
           await refreshInterlockProcessStatus(processId, process);
         }
       }
-    };
-    void load();
-    const interval = setInterval(() => {
-      void load();
-    }, 10000);
-    return () => {
-      alive = false;
-      clearInterval(interval);
-    };
-  }, [refreshInterlockProcessStatus]);
+    },
+    onValue: () => undefined,
+    endpoint: "/api/interlocks/summary",
+  });
 
   const interlocksPanelProcesses = useMemo(() => {
     const byId = new Map<string, ProcessStatus>();

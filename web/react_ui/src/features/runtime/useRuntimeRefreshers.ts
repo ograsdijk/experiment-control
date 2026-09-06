@@ -13,6 +13,7 @@ import {
 } from "../../api";
 import type { DeviceStatus, StreamCatalogEntry } from "../../types";
 import { useDevicesContext } from "../devices/DevicesContext";
+import { sameDeviceStatuses } from "../polling/pollEquality";
 import { useSettings } from "./SettingsContext";
 
 /**
@@ -50,15 +51,17 @@ export function useRuntimeRefreshers() {
     setInstanceCleanupBusy,
   } = useSettings();
 
-  const refreshDevices = useCallback(async (): Promise<DeviceStatus[]> => {
-    const next = await fetchDevices();
-    setDevices(next);
+  const refreshDevices = useCallback(async (signal?: AbortSignal): Promise<DeviceStatus[]> => {
+    const next = await fetchDevices(signal);
+    setDevices((previous) =>
+      sameDeviceStatuses(previous, next) ? previous : next
+    );
     return next;
   }, [setDevices]);
 
   const refreshStreams = useCallback(
-    async (): Promise<StreamCatalogEntry[]> => {
-      return fetchStreams();
+    async (signal?: AbortSignal): Promise<StreamCatalogEntry[]> => {
+      return fetchStreams(signal);
     },
     []
   );

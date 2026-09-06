@@ -23,6 +23,7 @@ import {
   normalizeCommandJournalStatus,
 } from "./utils";
 import { toPrettyJson } from "../logs/utils";
+import { useAdaptivePolling } from "../polling/useAdaptivePolling";
 
 const DEFAULT_COMMAND_HISTORY_LIMIT = 200;
 const MIN_COMMAND_HISTORY_LIMIT = 20;
@@ -723,31 +724,24 @@ export function useCommandHistoryController({
     ]);
   };
 
+  const commandJournalPollCountRef = useRef(0);
   useEffect(() => {
-    if (!commandHistoryOpen || commandHistoryMode === "live") {
-      return;
-    }
-    let cancelled = false;
-    let ticks = 0;
-    const load = async () => {
-      if (cancelled) {
-        return;
-      }
+    commandJournalPollCountRef.current = 0;
+  }, [commandHistoryOpen, commandHistoryMode, commandJournalLimit]);
+  useAdaptivePolling({
+    enabled: commandHistoryOpen && commandHistoryMode !== "live",
+    intervalMs: 3000,
+    poll: async () => {
       await refreshCommandJournalTail();
-      ticks += 1;
-      if (ticks % 3 === 1) {
+      commandJournalPollCountRef.current += 1;
+      if (commandJournalPollCountRef.current % 3 === 1) {
         await refreshCommandJournalStatus();
       }
-    };
-    void load();
-    const interval = window.setInterval(() => {
-      void load();
-    }, 3000);
-    return () => {
-      cancelled = true;
-      window.clearInterval(interval);
-    };
-  }, [commandHistoryOpen, commandHistoryMode, commandJournalLimit]);
+    },
+    onValue: () => undefined,
+    endpoint: "/api/command-journal",
+    restartKey: commandJournalLimit,
+  });
 
   const appendCommandHistory = (
     entry: Omit<CommandHistoryEntry, "id" | "ts_wall_s">

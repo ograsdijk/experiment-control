@@ -13,7 +13,6 @@ import { DevicesProvider } from "./features/devices/DevicesContext";
 import { LayoutProvider } from "./features/layout/LayoutContext";
 import { LogsProvider } from "./features/logs/LogsContext";
 import { PanelsProvider } from "./features/panels/PanelsContext";
-import { PlotTickProvider } from "./features/panels/PlotTickContext";
 import { SettingsProvider } from "./features/runtime/SettingsContext";
 import { StreamAnalysisProvider } from "./features/stream_analysis/StreamAnalysisContext";
 import { TelemetryProvider } from "./features/telemetry/TelemetryContext";
@@ -37,9 +36,7 @@ ReactDOM.createRoot(document.getElementById("root")!).render(
                 <LogsProvider>
                   <SettingsProvider>
                     <PanelsProvider>
-                      <PlotTickProvider>
-                        <App />
-                      </PlotTickProvider>
+                      <App />
                     </PanelsProvider>
                   </SettingsProvider>
                 </LogsProvider>

@@ -1,7 +1,13 @@
 ﻿import { useEffect, useMemo, useRef } from "react";
 import type { StreamFrame } from "./StreamRawPanel";
+import {
+  perfCount,
+  perfCountScoped,
+  perfMeasure,
+} from "../features/performance/perfInstrumentation";
 
 type StreamWaterfallPanelProps = {
+  panelId?: string;
   frames: StreamFrame[];
   historyRows: number;
   channelIndex: number;
@@ -56,6 +62,12 @@ function extractTrace(
   frame: StreamFrame,
   channelIndex: number
 ): { y: number[]; channelCount: number } {
+  if (frame.normalizedTrace) {
+    return {
+      y: frame.normalizedTrace,
+      channelCount: Math.max(1, frame.normalizedChannelCount ?? 1),
+    };
+  }
   const shape = Array.isArray(frame.shape) ? frame.shape.map((v) => Number(v)) : [];
   const values = frame.values;
   if (shape.length <= 1) {
@@ -241,6 +253,7 @@ function formatValue(value: number | null): string {
 }
 
 export function StreamWaterfallPanel({
+  panelId,
   frames,
   historyRows,
   channelIndex,
@@ -257,7 +270,9 @@ export function StreamWaterfallPanel({
   const isDark = colorScheme === "dark";
 
   const grid = useMemo(
-    () => buildStreamWaterfallGrid(frames, historyRows, channelIndex),
+    () => perfMeasure("waterfall.conversion_ms", () =>
+      buildStreamWaterfallGrid(frames, historyRows, channelIndex)
+    ),
     [frames, historyRows, channelIndex, tick]
   );
 
@@ -344,6 +359,8 @@ export function StreamWaterfallPanel({
           }
           hmCtx.putImageData(img, 0, 0);
           ctx.imageSmoothingEnabled = false;
+          perfCount("canvas.waterfall_redraws");
+          perfCountScoped("canvas.redraws", panelId);
           ctx.drawImage(hm, left, top, plotW, plotH);
         }
       } else {
@@ -398,7 +415,7 @@ export function StreamWaterfallPanel({
       resize.disconnect();
       cancelAnimationFrame(raf);
     };
-  }, [grid, zRange, isDark, plotHeight]);
+  }, [grid, zRange, isDark, plotHeight, panelId]);
 
   return (
     <div className="plot-panel" ref={hostRef} style={{ minHeight: plotHeight }}>

@@ -36,7 +36,7 @@ import {
   panelCapacity as panelCapacityImpl,
 } from "./applyToPanels";
 import { usePanels } from "./PanelsContext";
-import { usePlotTick } from "./PlotTickContext";
+import { markPanelDirty, panelInvalidationStore } from "./PanelInvalidationStore";
 
 const DEFAULT_WINDOW_S = 60;
 
@@ -107,7 +107,6 @@ export function usePanelLifecycle(args: PanelLifecycleArgs) {
     setEditingPanelId,
     setPanelTitleDraft,
   } = usePanels();
-  const { setPlotTick } = usePlotTick();
   const {
     streamWorkspacesRef,
     streamWorkspaceIdRef,
@@ -326,7 +325,7 @@ export function usePanelLifecycle(args: PanelLifecycleArgs) {
     if (activePanelId === panelId && nextActive) {
       setActivePanelId(nextActive.id);
     }
-    setPlotTick((tick) => tick + 1);
+    panelInvalidationStore.removePanel(panelId);
   };
 
   const addTraceToPanel = (
@@ -363,7 +362,7 @@ export function usePanelLifecycle(args: PanelLifecycleArgs) {
     if (!panelBuffers.has(key)) {
       panelBuffers.set(key, new RingBuffer(capacity));
     }
-    setPlotTick((tick) => tick + 1);
+    markPanelDirty(panelId);
   };
 
   const removeTraceFromPanel = (panelId: string, trace: TraceKey) => {
@@ -382,7 +381,7 @@ export function usePanelLifecycle(args: PanelLifecycleArgs) {
     );
     const panelBuffers = buffersRef.get(panelId);
     panelBuffers?.delete(traceKeyId(trace));
-    setPlotTick((tick) => tick + 1);
+    markPanelDirty(panelId);
   };
 
   const setPanelTimeWindow = (panelId: string, value: number) => {
@@ -428,7 +427,7 @@ export function usePanelLifecycle(args: PanelLifecycleArgs) {
         panelBuffers.set(key, new RingBuffer(capacity));
       }
     }
-    setPlotTick((tick) => tick + 1);
+    markPanelDirty(panelId);
   };
 
   return {

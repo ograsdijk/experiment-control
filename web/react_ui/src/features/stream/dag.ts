@@ -1,4 +1,4 @@
-﻿import type {
+import type {
   StreamDagNodeConfig,
   StreamDagOpDef,
   StreamDagOpId,
@@ -153,6 +153,15 @@ export const STREAM_DAG_OPS: Record<StreamDagOpId, StreamDagOpDef> = {
         optional: true,
         placeholder: "optional",
       },
+    ],
+  },
+  "trace.window_mean": {
+    label: "trace.window_mean",
+    inputs: ["trace"],
+    outputKind: "scalar",
+    params: [
+      { name: "start_idx", label: "start_idx", kind: "integer" },
+      { name: "stop_idx", label: "stop_idx", kind: "integer" },
     ],
   },
   "trace.subtract_background": {
@@ -336,6 +345,31 @@ export const STREAM_DAG_OPS: Record<StreamDagOpId, StreamDagOpDef> = {
       { name: "bin_count", label: "bin_count", kind: "integer" },
     ],
   },
+  "aggregate.bin_ratio_stats": {
+    label: "aggregate.bin_ratio_stats",
+    inputs: ["x", "numerator", "denominator"],
+    optionalInputs: ["gate"],
+    outputKind: "hist_agg",
+    params: [
+      { name: "auto_range", label: "auto_range", kind: "boolean" },
+      { name: "x_min", label: "x_min", kind: "number", placeholder: "e.g. 1.958e9" },
+      { name: "x_max", label: "x_max", kind: "number", placeholder: "e.g. 1.962e9" },
+      { name: "bin_count", label: "bin_count", kind: "integer" },
+    ],
+  },
+  "hist.divide": {
+    label: "hist.divide",
+    inputs: ["numerator", "denominator"],
+    outputKind: "hist_agg",
+    params: [
+      {
+        name: "require_equal_counts",
+        label: "require_equal_counts",
+        kind: "boolean",
+        optional: true,
+      },
+    ],
+  },
   "aggregate.bin2d_stats": {
     label: "aggregate.bin2d_stats",
     inputs: ["x", "y", "z"],
@@ -374,6 +408,7 @@ export const STREAM_DAG_INPUT_KINDS: Record<
   "trace.rolling_mean": { trace: "trace" },
   "trace.decimate": { trace: "trace" },
   "trace.crop": { trace: "trace" },
+  "trace.window_mean": { trace: "trace" },
   "trace.subtract_background": { trace: "trace" },
   "trace.integrate": { trace: "trace" },
   "trace.scale": { trace: "trace" },
@@ -386,6 +421,13 @@ export const STREAM_DAG_INPUT_KINDS: Record<
   "fit.params": { fit: "fit_1d" },
   "fit.from_hist_agg": { hist: "hist_agg", gate: "scalar" },
   "aggregate.bin_stats": { x: "scalar", y: "scalar", gate: "scalar" },
+  "aggregate.bin_ratio_stats": {
+    x: "scalar",
+    numerator: "scalar",
+    denominator: "scalar",
+    gate: "scalar",
+  },
+  "hist.divide": { numerator: "hist_agg", denominator: "hist_agg" },
   "aggregate.bin2d_stats": { x: "scalar", y: "scalar", z: "scalar", gate: "scalar" },
 };
 
@@ -453,6 +495,14 @@ export function defaultParamsForOp(op: StreamDagOpId): Record<string, unknown> {
     };
   }
   if (op === "aggregate.bin_stats") {
+    return {
+      auto_range: false,
+      x_min: DEFAULT_BIN_X_MIN,
+      x_max: DEFAULT_BIN_X_MAX,
+      bin_count: DEFAULT_BIN_COUNT,
+    };
+  }
+  if (op === "aggregate.bin_ratio_stats") {
     return {
       auto_range: false,
       x_min: DEFAULT_BIN_X_MIN,

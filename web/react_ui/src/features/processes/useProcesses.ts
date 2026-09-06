@@ -1,6 +1,8 @@
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import { fetchProcesses } from "../../api";
 import type { ProcessStatus } from "../../types";
+import { sameProcessStatuses } from "../polling/pollEquality";
+import { useAdaptivePolling } from "../polling/useAdaptivePolling";
 
 export type UseProcessesOptions = {
   /** Polling period in milliseconds. Defaults to 5000. */
@@ -22,26 +24,15 @@ export function useProcesses(options: UseProcessesOptions = {}): UseProcessesRes
   const { intervalMs = 5000 } = options;
   const [processes, setProcesses] = useState<ProcessStatus[]>([]);
 
-  useEffect(() => {
-    let alive = true;
-    const load = async () => {
-      const next = await fetchProcesses();
-      if (alive) {
-        setProcesses(next);
-      }
-    };
-    void load();
-    if (intervalMs <= 0) {
-      return () => {
-        alive = false;
-      };
-    }
-    const timer = window.setInterval(() => void load(), intervalMs);
-    return () => {
-      alive = false;
-      window.clearInterval(timer);
-    };
-  }, [intervalMs]);
+  useAdaptivePolling({
+    enabled: true,
+    intervalMs,
+    poll: (signal) => fetchProcesses(signal),
+    onValue: setProcesses,
+    equality: sameProcessStatuses,
+    refreshOnVisible: intervalMs > 0,
+    endpoint: "/api/processes",
+  });
 
   const byId = useMemo(() => {
     const out: Record<string, ProcessStatus> = {};

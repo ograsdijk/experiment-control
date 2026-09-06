@@ -25,7 +25,8 @@ import {
   IconTerminal2,
 } from "@tabler/icons-react";
 import type { ExtraUiInfo } from "../api";
-import { useEffect, useMemo, useState, type CSSProperties, type ReactNode } from "react";
+import { useMemo, useState, type CSSProperties, type ReactNode } from "react";
+import { useAdaptivePolling } from "../features/polling/useAdaptivePolling";
 
 type InstanceRuntimeStatus = {
   instance_id: string;
@@ -271,25 +272,14 @@ export function DashboardHeaderBar({
 }: Props) {
   const [instancePopoverOpen, setInstancePopoverOpen] = useState(false);
   const [cleanupPreview, setCleanupPreview] = useState<CleanupSummary | null>(null);
-  useEffect(() => {
-    if (!instancePopoverOpen) {
-      return;
-    }
-    const timer = window.setInterval(() => {
-      if (instanceRuntimeLoading || instanceCleanupBusy) {
-        return;
-      }
-      void onRefreshInstanceRuntimeStatus();
-    }, 3000);
-    return () => {
-      window.clearInterval(timer);
-    };
-  }, [
-    instancePopoverOpen,
-    instanceRuntimeLoading,
-    instanceCleanupBusy,
-    onRefreshInstanceRuntimeStatus,
-  ]);
+  useAdaptivePolling({
+    enabled: instancePopoverOpen && !instanceRuntimeLoading && !instanceCleanupBusy,
+    intervalMs: 3000,
+    poll: async () => onRefreshInstanceRuntimeStatus(),
+    onValue: () => undefined,
+    pollImmediately: false,
+    endpoint: "/api/runtime/status",
+  });
 
   const lockStatus = useMemo(() => {
     const lock =

@@ -9,6 +9,7 @@ import {
 } from "react";
 import type { ApiResponse } from "../../api";
 import type { ProcessStatus } from "../../types";
+import { useAdaptivePolling } from "../polling/useAdaptivePolling";
 import type {
   SequencerAdaptiveStudyStatus,
   SequencerDiagnostic,
@@ -1457,55 +1458,6 @@ export function useSequencerController({
     [sequencerDiagnostics, sequencerLocalDiagnostics]
   );
 
-  useEffect(() => {
-    if (!sequencerProcess) {
-      return;
-    }
-    const processId = sequencerProcess.process_id;
-    const state = String(sequencerProcess.state ?? "").toUpperCase();
-    if (!["RUNNING", "STARTING", "STOPPING"].includes(state)) {
-      return;
-    }
-    let alive = true;
-    let interval: ReturnType<typeof setInterval> | null = null;
-    // The host process can stay RUNNING even after the sequence run itself
-    // has errored out, so gate solely on process state would keep polling
-    // (and the elapsed-time display ticking) forever. Stop once the last
-    // known run state is terminal.
-    const isRunTerminal = () => {
-      const runState = String(
-        sequencerStatusByProcessIdRef.current[processId]?.state ?? ""
-      ).toUpperCase();
-      return ["ERROR", "STOPPED", "IDLE"].includes(runState);
-    };
-    const load = async () => {
-      if (!alive) {
-        return;
-      }
-      await refreshSequencerStatus(processId);
-      if (alive && interval && isRunTerminal()) {
-        clearInterval(interval);
-        interval = null;
-      }
-    };
-    void load();
-    interval = setInterval(() => {
-      void load();
-    }, 1500);
-    return () => {
-      alive = false;
-      if (interval) {
-        clearInterval(interval);
-      }
-    };
-  }, [refreshSequencerStatus, sequencerProcess]);
-
-  useEffect(() => {
-    if (!sequencerProcess && sequencerOpen) {
-      setSequencerOpen(false);
-    }
-  }, [sequencerOpen, sequencerProcess]);
-
   const sequencerStatus = sequencerProcess
     ? sequencerStatusByProcessId[sequencerProcess.process_id]
     : undefined;
@@ -1516,6 +1468,28 @@ export function useSequencerController({
     sequencerProcess?.state ?? "UNKNOWN"
   ).toUpperCase();
   const sequencerRuntimeState = String(sequencerStatus?.state ?? "UNKNOWN").toUpperCase();
+  const sequencerPollingEnabled =
+    Boolean(sequencerProcess) &&
+    ["RUNNING", "STARTING", "STOPPING"].includes(sequencerProcessState) &&
+    !["ERROR", "STOPPED", "IDLE"].includes(sequencerRuntimeState);
+  useAdaptivePolling({
+    enabled: sequencerPollingEnabled,
+    intervalMs: 1500,
+    poll: async () =>
+      sequencerProcess
+        ? refreshSequencerStatus(sequencerProcess.process_id)
+        : undefined,
+    onValue: () => undefined,
+    endpoint: "/api/sequencer/status",
+    restartKey: sequencerProcess?.process_id ?? null,
+  });
+
+  useEffect(() => {
+    if (!sequencerProcess && sequencerOpen) {
+      setSequencerOpen(false);
+    }
+  }, [sequencerOpen, sequencerProcess]);
+
   const sequencerLoaded = sequencerStatus?.loaded === true;
   const sequencerProgress = sequencerStatus?.progress ?? null;
   const sequencerProgressPercent =

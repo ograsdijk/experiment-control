@@ -1,3 +1,4 @@
+import { useEffect } from "react";
 import { useComputedColorScheme } from "@mantine/core";
 
 import { PlotPanel } from "../../components/PlotPanel";
@@ -25,7 +26,11 @@ import { workspaceXAxisLabel } from "../stream/workspace";
 import { useStreamAnalysis } from "../stream_analysis/StreamAnalysisContext";
 import { useTelemetry } from "../telemetry/TelemetryContext";
 import { usePanels } from "./PanelsContext";
-import { usePlotTick } from "./PlotTickContext";
+import {
+  markPanelDirty,
+  panelInvalidationStore,
+  usePanelRevision,
+} from "./PanelInvalidationStore";
 
 /**
  * Expanded-plot modal body — renders a single panel at the larger
@@ -86,7 +91,12 @@ export function ExpandedPlotBody({
   streamBinStatsOverlaySeries,
   streamBinStatsFitOverlayCurves,
 }: ExpandedPlotBodyProps) {
-  const { plotTick } = usePlotTick();
+  const panelRevision = usePanelRevision(panel.id);
+  useEffect(() => {
+    panelInvalidationStore.setPanelVisible(panel.id, "expanded", true);
+    markPanelDirty(panel.id);
+    return () => panelInvalidationStore.removeVisibilitySource(panel.id, "expanded");
+  }, [panel.id]);
   const {
     buffersRef,
     streamFramesRef,
@@ -99,9 +109,10 @@ export function ExpandedPlotBody({
   if (isTelemetryPanel(panel)) {
     return (
       <PlotPanel
+        panelId={panel.id}
         traces={panel.traces}
         buffers={buffersRef.get(panel.id) ?? new Map()}
-        tick={plotTick}
+        tick={panelRevision}
         timeWindowS={panel.timeWindowS}
         colorScheme={computedColorScheme}
         plotHeight={PLOT_HEIGHT}
@@ -119,6 +130,7 @@ export function ExpandedPlotBody({
     if (isStreamRawPanel(panel)) {
       return (
         <StreamRawPanel
+          panelId={panel.id}
           frames={streamFramesRef.get(panel.id) ?? []}
           overlayCount={
             panel.sourceMode === "raw" &&
@@ -127,7 +139,7 @@ export function ExpandedPlotBody({
               : panel.overlayCount
           }
           channelIndex={panel.sourceMode === "raw" ? panel.channelIndex : 0}
-          tick={plotTick}
+          tick={panelRevision}
           colorScheme={computedColorScheme}
           plotHeight={PLOT_HEIGHT}
           units={panel.stream?.units ?? null}
@@ -146,10 +158,11 @@ export function ExpandedPlotBody({
     }
     return (
       <StreamWaterfallPanel
+        panelId={panel.id}
         frames={streamFramesRef.get(panel.id) ?? []}
         historyRows={panel.overlayCount}
         channelIndex={panel.sourceMode === "raw" ? panel.channelIndex : 0}
-        tick={plotTick}
+        tick={panelRevision}
         colorScheme={computedColorScheme}
         plotHeight={PLOT_HEIGHT}
         zScaleMode={panel.yScaleMode}
@@ -161,9 +174,10 @@ export function ExpandedPlotBody({
   if (isStreamScalarPanel(panel)) {
     return (
       <PlotPanel
+        panelId={panel.id}
         traces={[streamScalarTrace(panel)]}
         buffers={buffersRef.get(panel.id) ?? new Map()}
-        tick={plotTick}
+        tick={panelRevision}
         timeWindowS={panel.timeWindowS}
         colorScheme={computedColorScheme}
         plotHeight={PLOT_HEIGHT}
@@ -177,6 +191,7 @@ export function ExpandedPlotBody({
     const streamWorkspace = streamWorkspaces[panel.workspaceId] ?? null;
     return (
       <StreamBinStatsPanel
+        panelId={panel.id}
         series={(streamBinStatsRef.get(panel.id) ?? null)?.series ?? null}
         overlaySeries={streamBinStatsOverlaySeries(panel)}
         fitOverlays={streamBinStatsFitOverlayCurves(panel)}
@@ -186,7 +201,7 @@ export function ExpandedPlotBody({
         showBinMarkers={panel.showBinMarkers}
         xOffset={panel.xOffset}
         xScale={panel.xScale}
-        tick={plotTick}
+        tick={panelRevision}
         colorScheme={computedColorScheme}
         plotHeight={PLOT_HEIGHT}
         yScaleMode={panel.yScaleMode}
@@ -198,9 +213,10 @@ export function ExpandedPlotBody({
   if (isStreamBin2dPanel(panel)) {
     return (
       <StreamBin2dPanel
+        panelId={panel.id}
         series={(streamBin2dRef.get(panel.id) ?? null)?.series ?? null}
         reducer={panel.reducer}
-        tick={plotTick}
+        tick={panelRevision}
         colorScheme={computedColorScheme}
         plotHeight={PLOT_HEIGHT}
         zScaleMode={panel.yScaleMode}

@@ -1,5 +1,10 @@
 ﻿import { useEffect, useMemo, useRef } from "react";
 import uPlot from "uplot";
+import {
+  perfCount,
+  perfCountScoped,
+  perfMeasure,
+} from "../features/performance/perfInstrumentation";
 
 export type UncertaintyMode = "std" | "sem";
 
@@ -18,6 +23,7 @@ export type StreamBinStatsFitOverlay = {
 };
 
 type StreamBinStatsPanelProps = {
+  panelId?: string;
   series: StreamBinStatsSeries | null;
   overlaySeries?: Array<{ label: string; values: number[] }>;
   fitOverlays?: StreamBinStatsFitOverlay[];
@@ -50,14 +56,23 @@ function asFiniteList(raw: unknown): number[] {
   return out;
 }
 
+function asNumberList(raw: unknown): number[] {
+  if (!Array.isArray(raw)) {
+    return [];
+  }
+  return raw.map((item) => Number(item));
+}
+
 function sanitizeSeries(input: StreamBinStatsSeries | null): StreamBinStatsSeries | null {
   if (!input) {
     return null;
   }
   const xBins = asFiniteList(input.xBins);
-  const mean = asFiniteList(input.mean);
-  const std = asFiniteList(input.std);
-  const sem = asFiniteList(input.sem);
+  // Missing values are represented as NaN internally. Preserve their bin
+  // positions so one unavailable uncertainty does not discard the full series.
+  const mean = asNumberList(input.mean);
+  const std = asNumberList(input.std);
+  const sem = asNumberList(input.sem);
   const count = asFiniteList(input.count);
   const n = Math.min(xBins.length, mean.length, std.length, sem.length, count.length);
   if (!Number.isFinite(n) || n <= 0) {
@@ -162,20 +177,18 @@ function buildOverlayData(
   x: number[],
   overlays: Array<{ label: string; values: number[] }>
 ): Array<{ label: string; values: number[] }> {
-  if (x.length <= 0 || overlays.length <= 0) {
+  if (overlays.length <= 0) {
     return [];
   }
   const n = x.length;
-  const out: Array<{ label: string; values: number[] }> = [];
-  for (const overlay of overlays) {
+  return overlays.map((overlay) => {
     const label = String(overlay.label ?? "").trim() || "overlay";
     const values = resampleByIndex(overlay.values, n);
-    if (values.length !== n) {
-      continue;
-    }
-    out.push({ label, values });
-  }
-  return out;
+    return {
+      label,
+      values: values.length === n ? values : new Array(n).fill(Number.NaN),
+    };
+  });
 }
 
 export function buildFitOverlayData(
@@ -272,6 +285,7 @@ export function computeStreamBinStatsAutoYRange(
 }
 
 export function StreamBinStatsPanel({
+  panelId,
   series,
   overlaySeries = [],
   fitOverlays = [],
@@ -310,7 +324,10 @@ export function StreamBinStatsPanel({
   }, []);
 
   const data = useMemo(
-    () => buildBandData(series, uncertaintyMode, uncertaintyScale, xOffset, xScale),
+    () =>
+      perfMeasure("bin_stats.conversion_ms", () =>
+        buildBandData(series, uncertaintyMode, uncertaintyScale, xOffset, xScale)
+      ),
     [series, uncertaintyMode, uncertaintyScale, xOffset, xScale, tick]
   );
   const overlayData = useMemo(
@@ -321,6 +338,19 @@ export function StreamBinStatsPanel({
     () => buildFitOverlayData(fitOverlays, xOffset, xScale),
     [fitOverlays, xOffset, xScale, tick]
   );
+  const fullData = useMemo(
+    () => [
+      data[0],
+      data[1],
+      data[2],
+      data[3],
+      ...overlayData.map((entry) => entry.values),
+    ],
+    [data, overlayData]
+  );
+  const plotDataRef = useRef<uPlot.AlignedData>(fullData as uPlot.AlignedData);
+  plotDataRef.current = fullData as uPlot.AlignedData;
+  const overlaySeriesCount = overlaySeries.length;
   fitOverlayDataRef.current = fitOverlayData;
   overlayLabelsRef.current = overlayData.map((entry) => entry.label);
 
@@ -357,8 +387,10 @@ export function StreamBinStatsPanel({
     const width = hostRef.current.clientWidth || 600;
     const overlayColors = ["#df6bff", "#4dc4ff", "#ff9f43", "#8bc34a", "#ff6b6b"];
     const fitOverlayColors = ["#ff8a5b", "#7ed957", "#d36fff", "#3fc5ff", "#f4c542"];
-    const overlaySeriesDefs = overlayData.map((entry, idx) => ({
-      label: entry.label,
+    const overlaySeriesDefs = Array.from({ length: overlaySeriesCount }, (_value, idx) => ({
+      // Tooltip labels are read from overlayLabelsRef; the hidden uPlot legend
+      // only needs a stable structural label.
+      label: `overlay ${idx + 1}`,
       stroke: overlayColors[idx % overlayColors.length],
       width: 1.6,
       points: { show: false },
@@ -548,14 +580,7 @@ export function StreamBinStatsPanel({
       plugins: [fitOverlayPlugin],
     };
 
-    const fullData = [
-      data[0],
-      data[1],
-      data[2],
-      data[3],
-      ...overlayData.map((entry) => entry.values),
-    ];
-    plotRef.current = new uPlot(opts, fullData as uPlot.AlignedData, hostRef.current);
+    plotRef.current = new uPlot(opts, plotDataRef.current, hostRef.current);
     const resize = new ResizeObserver(() => {
       if (!hostRef.current || !plotRef.current) {
         return;
@@ -573,11 +598,10 @@ export function StreamBinStatsPanel({
       hideTooltip();
     };
   }, [
-    data,
-    overlayData,
     formatNumber,
     hasManualY,
     isDark,
+    overlaySeriesCount,
     plotHeight,
     showBinMarkers,
     xLabel,
@@ -589,14 +613,13 @@ export function StreamBinStatsPanel({
     if (!plotRef.current) {
       return;
     }
-    plotRef.current.setData([
-      data[0],
-      data[1],
-      data[2],
-      data[3],
-      ...overlayData.map((entry) => entry.values),
-    ]);
-  }, [tick, data, overlayData]);
+    // setData redraws the plot, including the fit-overlay plugin after its ref
+    // has been refreshed above. No uPlot reconstruction is needed for live data.
+    perfCount("plot.uplot_setData");
+    perfCount("plot.bin_stats.uplot_setData");
+    perfCountScoped("plot.uplot_setData", panelId);
+    plotRef.current.setData(fullData as uPlot.AlignedData);
+  }, [tick, fullData, fitOverlayData, panelId]);
 
   return (
     <div style={{ position: "relative" }}>
@@ -621,3 +644,5 @@ export function StreamBinStatsPanel({
     </div>
   );
 }
+
+

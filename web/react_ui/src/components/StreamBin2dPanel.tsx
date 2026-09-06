@@ -1,5 +1,11 @@
 ﻿import { useEffect, useMemo, useRef } from "react";
 
+import {
+  perfCount,
+  perfCountScoped,
+  perfMeasure,
+} from "../features/performance/perfInstrumentation";
+
 export type Bin2dReducer = "mean" | "max" | "min" | "count" | "std" | "sem" | "sum";
 
 export type StreamBin2dSeries = {
@@ -15,6 +21,7 @@ export type StreamBin2dSeries = {
 };
 
 type StreamBin2dPanelProps = {
+  panelId?: string;
   series: StreamBin2dSeries | null;
   reducer: Bin2dReducer;
   tick: number;
@@ -213,6 +220,7 @@ export function computeStreamBin2dAutoZRange(
 }
 
 export function StreamBin2dPanel({
+  panelId,
   series,
   reducer,
   tick,
@@ -227,7 +235,10 @@ export function StreamBin2dPanel({
   const heatmapRef = useRef<HTMLCanvasElement | null>(null);
   const isDark = colorScheme === "dark";
 
-  const grid = useMemo(() => buildGrid(series, reducer), [series, reducer, tick]);
+  const grid = useMemo(
+    () => perfMeasure("bin2d.conversion_ms", () => buildGrid(series, reducer)),
+    [series, reducer, tick]
+  );
 
   const zRange = useMemo(() => {
     const manual =
@@ -315,6 +326,8 @@ export function StreamBin2dPanel({
           }
           hmCtx.putImageData(img, 0, 0);
           ctx.imageSmoothingEnabled = false;
+          perfCount("canvas.bin2d_redraws");
+          perfCountScoped("canvas.redraws", panelId);
           ctx.drawImage(hm, left, top, plotW, plotH);
         }
       } else {
@@ -368,7 +381,7 @@ export function StreamBin2dPanel({
       resize.disconnect();
       cancelAnimationFrame(raf);
     };
-  }, [grid, zRange, isDark, plotHeight, reducer]);
+  }, [grid, zRange, isDark, plotHeight, reducer, panelId]);
 
   return (
     <div className="plot-panel" ref={hostRef} style={{ minHeight: plotHeight }}>

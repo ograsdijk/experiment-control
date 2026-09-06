@@ -5,6 +5,8 @@ import { normalizeStreamFrameMessage } from "../stream/messages";
 import { decimateTraceValues } from "../stream/utils";
 import type { RawStreamSubscription } from "../stream/types";
 import type { StreamFrameMessage } from "../../types";
+import { perfCount } from "../performance/perfInstrumentation";
+import { markPanelsDirty } from "../panels/PanelInvalidationStore";
 import {
   prepareRawStreamHydration,
   RAW_STREAM_HYDRATION_INVALIDATE_EVENT,
@@ -33,8 +35,8 @@ import {
  *    `wsConnected` flag reflects whether *any* socket is currently
  *    open.
  *
- * If `applyFrame` reports an update (returns true), the hook calls
- * `bumpPlotTick` so downstream plot panels re-render. When the
+ * `applyFrame` returns the exact changed panel IDs, which the hook coalesces
+ * before targeted invalidation. When the
  * subscription list is empty, `wsConnected` is reported as true (no
  * sockets to maintain → no connection failure to surface).
  *
@@ -42,11 +44,8 @@ import {
  *
  * - `activeSubscriptions` — the App-derived list of raw-stream
  *   subscriptions currently bound to panels.
- * - `applyFrame(subscription, frame) → updated` — call site's
- *   per-subscription frame consumer; returns whether any panel
- *   buffer changed.
- * - `bumpPlotTick()` — called after a batch of frames that produced
- *   updates so the UI redraws.
+ * - `applyFrame(subscription, frame) → panelIds` — call site's
+ *   per-subscription frame consumer; returns the buffers that changed.
  */
 
 export interface RawStreamSubscriptionsArgs {
@@ -54,8 +53,7 @@ export interface RawStreamSubscriptionsArgs {
   applyFrame: (
     subscription: RawStreamSubscription,
     frame: NonNullable<ReturnType<typeof normalizeStreamFrameMessage>>
-  ) => boolean;
-  bumpPlotTick: () => void;
+  ) => ReadonlySet<string>;
 }
 
 function socketGroupKey(subscription: RawStreamSubscription): string {
@@ -79,7 +77,6 @@ function binaryValuesFromFrame(
 export function useRawStreamSubscriptions({
   activeSubscriptions,
   applyFrame,
-  bumpPlotTick,
 }: RawStreamSubscriptionsArgs): { wsConnected: boolean } {
   const [wsConnected, setWsConnected] = useState(true);
   const [hydrationGeneration, setHydrationGeneration] = useState(0);
@@ -90,8 +87,6 @@ export function useRawStreamSubscriptions({
   // them in their dependency arrays.
   const applyFrameRef = useRef(applyFrame);
   applyFrameRef.current = applyFrame;
-  const bumpPlotTickRef = useRef(bumpPlotTick);
-  bumpPlotTickRef.current = bumpPlotTick;
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -158,7 +153,7 @@ export function useRawStreamSubscriptions({
       return;
     }
     const load = async () => {
-      let updated = false;
+      const dirtyPanelIds = new Set<string>();
       for (const subscription of pending) {
         const key = rawStreamSubscriptionKey(subscription);
         try {
@@ -180,16 +175,14 @@ export function useRawStreamSubscriptions({
           if (frame === null) {
             continue;
           }
-          if (applyFrameRef.current(subscription, frame)) {
-            updated = true;
+          for (const panelId of applyFrameRef.current(subscription, frame)) {
+            dirtyPanelIds.add(panelId);
           }
         } catch {
           hydratedRef.current.add(key);
         }
       }
-      if (!cancelled && updated) {
-        bumpPlotTickRef.current();
-      }
+      if (!cancelled) markPanelsDirty(dirtyPanelIds);
     };
     void load();
     return () => {
@@ -233,7 +226,8 @@ export function useRawStreamSubscriptions({
       subscriptions: RawStreamSubscription[],
       frame: NonNullable<ReturnType<typeof normalizeStreamFrameMessage>>
     ) => {
-      let updated = false;
+      perfCount("raw_stream.frames");
+      const dirtyPanelIds = new Set<string>();
       for (const subscription of subscriptions) {
         if (
           frame.deviceId !== subscription.deviceId ||
@@ -249,13 +243,11 @@ export function useRawStreamSubscriptions({
         const frameForSubscription = values
           ? { ...frame, values, shape: [values.length] }
           : frame;
-        if (applyFrameRef.current(subscription, frameForSubscription)) {
-          updated = true;
+        for (const panelId of applyFrameRef.current(subscription, frameForSubscription)) {
+          dirtyPanelIds.add(panelId);
         }
       }
-      if (updated) {
-        bumpPlotTickRef.current();
-      }
+      markPanelsDirty(dirtyPanelIds);
     };
 
     const onMessage = (subscriptions: RawStreamSubscription[]) => {

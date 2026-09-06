@@ -1,0 +1,29 @@
+{
+  "kind":"experiment-control-ui-profile","version":1,"exported_at":"2026-09-02T00:00:00.000Z","layout":{"nav_width":360,"device_panel_collapsed":true,"plot_workspace_columns":"2","device_order":[],"telemetry_collapsed_by_device":{}},
+  "plots":{"plot_state":{"activePanelId":"panel-1","panels":[
+    {"id":"panel-1","title":"Viewport 01","kind":"telemetry","traces":[{"deviceId":"perf_tel_00","signal":"float_00"}],"timeWindowS":300},
+    {"id":"panel-2","title":"Viewport 02","kind":"telemetry","traces":[{"deviceId":"perf_tel_01","signal":"float_01"}],"timeWindowS":300},
+    {"id":"panel-3","title":"Viewport 03","kind":"telemetry","traces":[{"deviceId":"perf_tel_02","signal":"float_02"}],"timeWindowS":300},
+    {"id":"panel-4","title":"Viewport 04","kind":"telemetry","traces":[{"deviceId":"perf_tel_03","signal":"float_03"}],"timeWindowS":300},
+    {"id":"panel-5","title":"Viewport 05","kind":"telemetry","traces":[{"deviceId":"perf_tel_04","signal":"float_04"}],"timeWindowS":300},
+    {"id":"panel-6","title":"Viewport 06","kind":"telemetry","traces":[{"deviceId":"perf_tel_05","signal":"float_05"}],"timeWindowS":300},
+    {"id":"panel-7","title":"Viewport 07","kind":"telemetry","traces":[{"deviceId":"perf_tel_06","signal":"float_06"}],"timeWindowS":300},
+    {"id":"panel-8","title":"Viewport 08","kind":"telemetry","traces":[{"deviceId":"perf_tel_07","signal":"float_07"}],"timeWindowS":300},
+    {"id":"panel-9","title":"Viewport 09","kind":"telemetry","traces":[{"deviceId":"perf_tel_00","signal":"float_08"}],"timeWindowS":300},
+    {"id":"panel-10","title":"Viewport 10","kind":"telemetry","traces":[{"deviceId":"perf_tel_01","signal":"float_09"}],"timeWindowS":300},
+    {"id":"panel-11","title":"Viewport 11","kind":"telemetry","traces":[{"deviceId":"perf_tel_02","signal":"float_10"}],"timeWindowS":300},
+    {"id":"panel-12","title":"Viewport 12","kind":"telemetry","traces":[{"deviceId":"perf_tel_03","signal":"float_11"}],"timeWindowS":300},
+    {"id":"panel-13","title":"Viewport 13","kind":"telemetry","traces":[{"deviceId":"perf_tel_04","signal":"float_12"}],"timeWindowS":300},
+    {"id":"panel-14","title":"Viewport 14","kind":"telemetry","traces":[{"deviceId":"perf_tel_05","signal":"float_13"}],"timeWindowS":300},
+    {"id":"panel-15","title":"Viewport 15","kind":"telemetry","traces":[{"deviceId":"perf_tel_06","signal":"float_14"}],"timeWindowS":300},
+    {"id":"panel-16","title":"Viewport 16","kind":"telemetry","traces":[{"deviceId":"perf_tel_07","signal":"float_15"}],"timeWindowS":300},
+    {"id":"panel-17","title":"Viewport 17","kind":"telemetry","traces":[{"deviceId":"perf_tel_00","signal":"float_03"}],"timeWindowS":300},
+    {"id":"panel-18","title":"Viewport 18","kind":"telemetry","traces":[{"deviceId":"perf_tel_01","signal":"float_04"}],"timeWindowS":300},
+    {"id":"panel-19","title":"Viewport 19","kind":"telemetry","traces":[{"deviceId":"perf_tel_02","signal":"float_05"}],"timeWindowS":300},
+    {"id":"panel-20","title":"Viewport 20","kind":"telemetry","traces":[{"deviceId":"perf_tel_03","signal":"float_06"}],"timeWindowS":300},
+    {"id":"panel-21","title":"Viewport 21","kind":"telemetry","traces":[{"deviceId":"perf_tel_04","signal":"float_07"}],"timeWindowS":300},
+    {"id":"panel-22","title":"Viewport 22","kind":"telemetry","traces":[{"deviceId":"perf_tel_05","signal":"float_08"}],"timeWindowS":300},
+    {"id":"panel-23","title":"Viewport 23","kind":"telemetry","traces":[{"deviceId":"perf_tel_06","signal":"float_09"}],"timeWindowS":300},
+    {"id":"panel-24","title":"Viewport 24","kind":"telemetry","traces":[{"deviceId":"perf_tel_07","signal":"float_10"}],"timeWindowS":300}
+  ]}},"commands":{"pinned_commands":{}},"analysis":{"stream_workspaces":{}}
+}

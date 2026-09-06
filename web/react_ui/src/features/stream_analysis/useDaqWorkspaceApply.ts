@@ -29,7 +29,7 @@ import {
 } from "../stream/workspace";
 import { useTelemetry } from "../telemetry/TelemetryContext";
 import { useStreamAnalysis } from "./StreamAnalysisContext";
-import { usePlotTick } from "../panels/PlotTickContext";
+import { markPanelsDirty } from "../panels/PanelInvalidationStore";
 
 /**
  * `applyDaqWorkspace` — validate the DAQ workspace draft, commit it
@@ -101,7 +101,6 @@ export function useDaqWorkspaceApply(args: DaqWorkspaceApplyArgs) {
     daqDraftEnabled,
   } = useStreamAnalysis();
   const { setPanels } = usePanels();
-  const { setPlotTick } = usePlotTick();
   const {
     streamFramesRef,
     streamTraceOverlayRef,
@@ -228,6 +227,7 @@ export function useDaqWorkspaceApply(args: DaqWorkspaceApplyArgs) {
     const hist2dOutputIds = new Set(
       workspaceOutputOptionsByKind(updated, "hist2d").map((item) => item.value)
     );
+    const dirtyPanelIds = new Set<string>();
     setPanels((prev) =>
       prev.map((panel) => {
         if (
@@ -242,6 +242,7 @@ export function useDaqWorkspaceApply(args: DaqWorkspaceApplyArgs) {
         if (panel.workspaceId !== workspaceId) {
           return panel;
         }
+        dirtyPanelIds.add(panel.id);
         if (isStreamTracePanel(panel)) {
           if (panel.sourceMode !== "dag") {
             return panel;
@@ -323,7 +324,7 @@ export function useDaqWorkspaceApply(args: DaqWorkspaceApplyArgs) {
         };
       })
     );
-    setPlotTick((tick) => tick + 1);
+    markPanelsDirty(dirtyPanelIds);
     void syncStreamAnalysisWorkspace(workspaceId, "stream-workspace-apply");
   };
 

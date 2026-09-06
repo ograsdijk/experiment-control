@@ -4,6 +4,7 @@ import type { ApiResponse } from "../../api";
 import type { CapabilityMember, ProcessStatus } from "../../types";
 import { formatApiErrorToastMessage } from "../common/api_error";
 import { normalizeStringList } from "../common/normalize";
+import { useAdaptivePolling } from "../polling/useAdaptivePolling";
 import {
   isProcessRpcStateAvailable,
   processStateColor,
@@ -447,30 +448,22 @@ export function useInfluxController({
     processCapabilitiesErrorById,
   ]);
 
-  useEffect(() => {
-    if (!influxWriterProcessId) {
-      return;
-    }
-    const state = String(influxWriterProcess?.state ?? "").toUpperCase();
-    if (!["RUNNING", "STARTING", "STOPPING"].includes(state)) {
-      return;
-    }
-    let alive = true;
-    const load = async () => {
-      if (!alive) {
-        return;
-      }
-      await refreshInfluxStatus(influxWriterProcessId);
-    };
-    void load();
-    const interval = setInterval(() => {
-      void load();
-    }, 5000);
-    return () => {
-      alive = false;
-      clearInterval(interval);
-    };
-  }, [influxWriterProcessId, influxWriterProcess?.state, refreshInfluxStatus]);
+  const influxProcessPollingEnabled =
+    Boolean(influxWriterProcessId) &&
+    ["RUNNING", "STARTING", "STOPPING"].includes(
+      String(influxWriterProcess?.state ?? "").toUpperCase()
+    );
+  useAdaptivePolling({
+    enabled: influxProcessPollingEnabled,
+    intervalMs: 5000,
+    poll: async () =>
+      influxWriterProcessId
+        ? refreshInfluxStatus(influxWriterProcessId)
+        : undefined,
+    onValue: () => undefined,
+    endpoint: "/api/processes/influx/status",
+    restartKey: influxWriterProcessId,
+  });
 
   useEffect(() => {
     if (!influxWriterProcess && influxModalOpen) {

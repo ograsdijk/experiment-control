@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { buildWsUrl, fetchTelemetrySnapshot } from "../../api";
 import type { TelemetryMessage, TelemetrySignal } from "../../types";
+import { perfCount } from "../performance/perfInstrumentation";
 
 export type LatestSignals = Record<string, Record<string, TelemetrySignal>>;
 
@@ -130,6 +131,11 @@ export function useTelemetryStream(
         if (deviceFilterRef.current && !deviceFilterRef.current.has(deviceId)) {
           return;
         }
+        perfCount("telemetry.messages");
+        perfCount(
+          "telemetry.signal_values",
+          Object.keys(msg.payload.signals ?? {}).length
+        );
         setWsConnected(true);
         setTelemetryActive(true);
         setLastMessageAt(Date.now());

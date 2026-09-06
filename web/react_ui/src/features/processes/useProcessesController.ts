@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useState } from "react";
 import { fetchProcesses, type ApiResponse } from "../../api";
 import type { CapabilityMember, ProcessStatus } from "../../types";
+import { sameProcessStatuses } from "../polling/pollEquality";
+import { useAdaptivePolling } from "../polling/useAdaptivePolling";
 
 type UseProcessesControllerArgs = {
   callProcessFn: (
@@ -56,7 +58,9 @@ export function useProcessesController({ callProcessFn }: UseProcessesController
 
   const refreshProcesses = useCallback(async () => {
     const next = await fetchProcesses();
-    setProcesses(next);
+    setProcesses((previous) =>
+      sameProcessStatuses(previous, next) ? previous : next
+    );
     return next;
   }, []);
 
@@ -121,23 +125,14 @@ export function useProcessesController({ callProcessFn }: UseProcessesController
     });
   }, []);
 
-  useEffect(() => {
-    let alive = true;
-    const load = async () => {
-      const next = await fetchProcesses();
-      if (alive) {
-        setProcesses(next);
-      }
-    };
-    void load();
-    const interval = setInterval(() => {
-      void load();
-    }, 5000);
-    return () => {
-      alive = false;
-      clearInterval(interval);
-    };
-  }, []);
+  useAdaptivePolling({
+    enabled: true,
+    intervalMs: 5000,
+    poll: (signal) => fetchProcesses(signal),
+    onValue: setProcesses,
+    equality: sameProcessStatuses,
+    endpoint: "/api/processes",
+  });
 
   useEffect(() => {
     if (!processOpen || processes.length === 0) {

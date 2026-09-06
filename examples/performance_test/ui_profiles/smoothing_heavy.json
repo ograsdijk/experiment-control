@@ -1,0 +1,11 @@
+{
+  "kind":"experiment-control-ui-profile","version":1,"exported_at":"2026-09-02T00:00:00.000Z","layout":{"nav_width":360,"device_panel_collapsed":true,"plot_workspace_columns":"3","device_order":[],"telemetry_collapsed_by_device":{}},
+  "plots":{"plot_state":{"activePanelId":"panel-1","panels":[
+    {"id":"panel-1","title":"SMA 1","kind":"telemetry","traces":[{"deviceId":"perf_tel_00","signal":"float_00"},{"deviceId":"perf_tel_01","signal":"float_01"},{"deviceId":"perf_tel_02","signal":"float_02"},{"deviceId":"perf_tel_03","signal":"float_03"}],"timeWindowS":900,"smoothingMode":"sma","smoothingWindowS":30},
+    {"id":"panel-2","title":"EMA 1","kind":"telemetry","traces":[{"deviceId":"perf_tel_04","signal":"float_04"},{"deviceId":"perf_tel_05","signal":"float_05"},{"deviceId":"perf_tel_06","signal":"float_06"},{"deviceId":"perf_tel_07","signal":"float_07"}],"timeWindowS":900,"smoothingMode":"ema","smoothingWindowS":30},
+    {"id":"panel-3","title":"SMA 2","kind":"telemetry","traces":[{"deviceId":"perf_tel_00","signal":"float_08"},{"deviceId":"perf_tel_01","signal":"float_09"},{"deviceId":"perf_tel_02","signal":"float_10"},{"deviceId":"perf_tel_03","signal":"float_11"}],"timeWindowS":900,"smoothingMode":"sma","smoothingWindowS":60},
+    {"id":"panel-4","title":"EMA 2","kind":"telemetry","traces":[{"deviceId":"perf_tel_04","signal":"float_12"},{"deviceId":"perf_tel_05","signal":"float_13"},{"deviceId":"perf_tel_06","signal":"float_14"},{"deviceId":"perf_tel_07","signal":"float_15"}],"timeWindowS":900,"smoothingMode":"ema","smoothingWindowS":60},
+    {"id":"panel-5","title":"SMA 3","kind":"telemetry","traces":[{"deviceId":"perf_tel_00","signal":"float_04"},{"deviceId":"perf_tel_02","signal":"float_06"},{"deviceId":"perf_tel_04","signal":"float_08"},{"deviceId":"perf_tel_06","signal":"float_10"}],"timeWindowS":900,"smoothingMode":"sma","smoothingWindowS":120},
+    {"id":"panel-6","title":"EMA 3","kind":"telemetry","traces":[{"deviceId":"perf_tel_01","signal":"float_05"},{"deviceId":"perf_tel_03","signal":"float_07"},{"deviceId":"perf_tel_05","signal":"float_09"},{"deviceId":"perf_tel_07","signal":"float_11"}],"timeWindowS":900,"smoothingMode":"ema","smoothingWindowS":120}
+  ]}},"commands":{"pinned_commands":{}},"analysis":{"stream_workspaces":{}}
+}

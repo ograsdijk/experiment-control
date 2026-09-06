@@ -1,6 +1,8 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { fetchDevices } from "../../api";
 import type { DeviceStatus } from "../../types";
+import { sameDeviceStatuses } from "../polling/pollEquality";
+import { useAdaptivePolling } from "../polling/useAdaptivePolling";
 
 export type UseDevicesOptions = {
   /** Polling period in milliseconds. Defaults to 5000. */
@@ -15,26 +17,15 @@ export function useDevices(options: UseDevicesOptions = {}): DeviceStatus[] {
   const { intervalMs = 5000 } = options;
   const [devices, setDevices] = useState<DeviceStatus[]>([]);
 
-  useEffect(() => {
-    let alive = true;
-    const load = async () => {
-      const next = await fetchDevices();
-      if (alive) {
-        setDevices(next);
-      }
-    };
-    void load();
-    if (intervalMs <= 0) {
-      return () => {
-        alive = false;
-      };
-    }
-    const timer = window.setInterval(() => void load(), intervalMs);
-    return () => {
-      alive = false;
-      window.clearInterval(timer);
-    };
-  }, [intervalMs]);
+  useAdaptivePolling({
+    enabled: true,
+    intervalMs,
+    poll: (signal) => fetchDevices(signal),
+    onValue: setDevices,
+    equality: sameDeviceStatuses,
+    refreshOnVisible: intervalMs > 0,
+    endpoint: "/api/devices",
+  });
 
   return devices;
 }
