@@ -233,17 +233,55 @@ class FitAgainstResolvedAxisTests(unittest.TestCase):
         # tau0 comes back in samples, not seconds.
         self.assertGreater(result["params"]["tau0"], 1.0)
 
+    def test_declared_but_unresolved_axis_suppresses_the_fit(self) -> None:
+        from experiment_control.processes.stream_analysis_fit import FitCurve1DState
+
+        unresolved = ResolvedStreamAxis(
+            units=None,
+            label="sample index",
+            increment=1.0,
+            origin=0.0,
+            source="unresolved",
+            error="digitizer offline",
+        )
+        workspace = type(
+            "_WS",
+            (),
+            {
+                "x_axis": unresolved,
+                "node_state": {
+                    "fit": FitCurve1DState.from_params(
+                        {"model": "reciprocal_normal"}
+                    )
+                },
+            },
+        )()
+        node = type(
+            "_Node",
+            (),
+            {
+                "inputs": {"x": SAMPLE_INDEX_INPUT_TOKEN, "y": "src"},
+                "params": {"model": "reciprocal_normal"},
+            },
+        )()
+
+        result = StreamAnalysisProcess._execute_workspace_fit_curve_1d(  # noqa: SLF001
+            _process(None),
+            workspace=workspace,
+            node=node,
+            node_id="fit",
+            values={"src": np.ones(N_SAMPLES)},
+        )
+
+        self.assertIsNone(result)
+
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
 
 
-class RetryUnresolvedStreamAxesTests(unittest.TestCase):
-    """An axis resolved while the digitizer was off must recover on its own.
-
-    Otherwise a workspace applied before power-up silently fits in samples
-    rather than seconds for the rest of the session.
-    """
+class RefreshStreamAxesTests(unittest.TestCase):
+    """Active physical axes recover and follow digitizer reconfiguration."""
 
     def _workspace(self, proc: StreamAnalysisProcess, axis) -> object:
         from types import SimpleNamespace
@@ -270,28 +308,54 @@ class RetryUnresolvedStreamAxesTests(unittest.TestCase):
         workspace = self._workspace(proc, stale)
 
         manager.raise_on_command = False
-        proc._retry_unresolved_stream_axes()  # noqa: SLF001
+        proc._refresh_active_stream_axes()  # noqa: SLF001
 
         self.assertEqual(workspace.x_axis.source, "run_metadata")
         self.assertAlmostEqual(workspace.x_axis.increment, 1e-5)
         self.assertAlmostEqual(workspace.x_axis.origin, TRIGGER_DELAY_S)
 
-    def test_retry_ignores_workspaces_whose_axis_already_resolved(self) -> None:
+    def test_refresh_updates_an_already_resolved_axis(self) -> None:
         manager = _FakeManager()
         proc = _process(manager)
         good = proc._resolve_stream_axis(("pxie5171", "waveforms"))  # noqa: SLF001
         self.assertEqual(good.source, "run_metadata")
-        self._workspace(proc, good)
+        workspace = self._workspace(proc, good)
 
-        before = len(manager.calls)
-        proc._retry_unresolved_stream_axes()  # noqa: SLF001
-        self.assertEqual(len(manager.calls), before, "resolved axes must cost no RPC")
+        manager.run_metadata = {
+            "sample_rate_hz": 200_000.0,
+            "trigger_delay_s": 1.2e-3,
+        }
+        proc._refresh_active_stream_axes()  # noqa: SLF001
 
-    def test_retry_survives_a_device_that_is_still_offline(self) -> None:
+        self.assertAlmostEqual(workspace.x_axis.increment, 5e-6)
+        self.assertAlmostEqual(workspace.x_axis.origin, 1.2e-3)
+
+    def test_refresh_ignores_undeclared_identity_axes(self) -> None:
+        manager = _FakeManager()
+        proc = _process(manager)
+        self._workspace(proc, IDENTITY_AXIS)
+
+        proc._refresh_active_stream_axes()  # noqa: SLF001
+
+        self.assertEqual(manager.calls, [])
+
+    def test_refresh_marks_a_previously_resolved_axis_unresolved(self) -> None:
+        manager = _FakeManager()
+        proc = _process(manager)
+        good = proc._resolve_stream_axis(("pxie5171", "waveforms"))  # noqa: SLF001
+        workspace = self._workspace(proc, good)
+
+        manager.raise_on_command = True
+        proc._refresh_active_stream_axes()  # noqa: SLF001
+
+        self.assertEqual(workspace.x_axis.source, "unresolved")
+        self.assertIn("collect_run_metadata failed", workspace.x_axis.error or "")
+
+    def test_refresh_survives_a_device_that_is_still_offline(self) -> None:
         manager = _FakeManager(raise_on_command=True)
         proc = _process(manager)
         workspace = self._workspace(
             proc, proc._resolve_stream_axis(("pxie5171", "waveforms"))  # noqa: SLF001
         )
-        proc._retry_unresolved_stream_axes()  # noqa: SLF001
+        proc._refresh_active_stream_axes()  # noqa: SLF001
         self.assertEqual(workspace.x_axis.source, "unresolved")

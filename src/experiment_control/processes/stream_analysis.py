@@ -2272,18 +2272,16 @@ class StreamAnalysisProcess(ManagedProcessBase):
             process_id=self._process_id,
             subscribe_telemetry=False,
         )
-        # Resolved stream axes, keyed by (device_id, stream). Short-lived so a
-        # digitizer reconfigured mid-run is picked up without a restart; see
-        # also the stream_analysis.stream_axis.refresh RPC.
+        # Resolved stream axes, keyed by (device_id, stream). Active declared
+        # axes are refreshed periodically so digitizer reconfiguration is
+        # picked up without a workspace reapply; see also the
+        # stream_analysis.stream_axis.refresh RPC.
         self._stream_axis_cache: dict[
             tuple[str, str], tuple[ResolvedStreamAxis, float]
         ] = {}
         self._stream_axis_ttl_s = 60.0
-        # An axis resolved while the digitizer was off is stuck on the
-        # sample index until something re-resolves it; retry periodically so
-        # powering the device on is enough to recover.
-        self._stream_axis_retry_s = 60.0
-        self._stream_axis_next_retry = 0.0
+        self._stream_axis_refresh_s = 60.0
+        self._stream_axis_next_refresh = 0.0
         self._axis_rpc_timeout_ms = min(int(rpc_timeout_ms), 1500)
         self._sub = self._manager_helper.open_sub(
             ctx=self._ctx,
@@ -2851,8 +2849,9 @@ class StreamAnalysisProcess(ManagedProcessBase):
                 error = "collect_run_metadata returned no run metadata"
 
         resolved = resolve_stream_axis(declared, run_metadata)
-        if error is not None and resolved.error is None:
-            resolved = replace(resolved, error=error)
+        if error is not None:
+            detail = f"{error}; {resolved.error}" if resolved.error else error
+            resolved = replace(resolved, error=detail)
         self._stream_axis_cache[stream_key] = (resolved, now + self._stream_axis_ttl_s)
         return resolved
 
@@ -3888,29 +3887,34 @@ class StreamAnalysisProcess(ManagedProcessBase):
         values[node_id] = func(fit_val)
         return True, None
 
-    def _retry_unresolved_stream_axes(self) -> None:
-        """Re-resolve axes that failed, e.g. because the device was offline.
+    def _refresh_active_stream_axes(self) -> None:
+        """Re-resolve every active declared axis.
 
-        Only workspaces whose axis is still unresolved are retried, so the
-        steady-state cost is zero once every axis has resolved. Runs from the
-        poll loop rather than the frame path, and no more than once per
-        ``_stream_axis_retry_s``.
+        This both recovers axes that were unavailable during workspace apply
+        and picks up a runtime sample-rate or trigger-delay change. Streams
+        with no axis declaration keep the identity axis and incur no periodic
+        device RPC. Runs from the poll loop, never from the frame path.
         """
-        stale = [
+        active = [
             workspace
             for workspace in self._workspaces.values()
-            if workspace.x_axis.source == "unresolved"
+            if workspace.x_axis.source != "identity"
         ]
-        if not stale:
+        if not active:
             return
-        for workspace in stale:
-            key = workspace.compiled.stream_key
+        keys = {workspace.compiled.stream_key for workspace in active}
+        resolved_by_key: dict[tuple[str, str], ResolvedStreamAxis] = {}
+        for key in keys:
             self._stream_axis_cache.pop(key, None)
             try:
-                workspace.x_axis = self._resolve_stream_axis(key)
+                resolved_by_key[key] = self._resolve_stream_axis(key)
             except Exception:
-                # Never let a background retry take down the poll loop.
+                # Never let a background refresh take down the poll loop.
                 continue
+        for workspace in active:
+            resolved = resolved_by_key.get(workspace.compiled.stream_key)
+            if resolved is not None:
+                workspace.x_axis = resolved
 
     def _workspace_x_axis(self, workspace: WorkspaceRuntime) -> ResolvedStreamAxis:
         """The sample axis a fit against ``__sample_index__`` should use.
@@ -3936,6 +3940,11 @@ class StreamAnalysisProcess(ManagedProcessBase):
         axis: ResolvedStreamAxis | None = None
         if x_input == SAMPLE_INDEX_INPUT_TOKEN:
             axis = self._workspace_x_axis(workspace)
+            if axis.source == "unresolved":
+                # A declared physical axis must never silently change units to
+                # sample indices. No fit is safer than a numerically plausible
+                # result with the wrong coordinate system.
+                return None
             y_trace = _coerce_trace(y_raw)
             x_raw = (
                 axis_values(axis, int(y_trace.size)) if y_trace is not None else None
@@ -5425,9 +5434,11 @@ class StreamAnalysisProcess(ManagedProcessBase):
                 if events.get(self._sub) == zmq.POLLIN:
                     self._drain_sub()
                 now = time.monotonic()
-                if now >= self._stream_axis_next_retry:
-                    self._stream_axis_next_retry = now + self._stream_axis_retry_s
-                    self._retry_unresolved_stream_axes()
+                if now >= self._stream_axis_next_refresh:
+                    self._stream_axis_next_refresh = (
+                        now + self._stream_axis_refresh_s
+                    )
+                    self._refresh_active_stream_axes()
         finally:
             self.close()
 

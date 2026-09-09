@@ -4,11 +4,12 @@ Pure and I/O-free: callers fetch run metadata however they like (the stream
 analysis process and the FastAPI gateway both use the ``collect_run_metadata``
 device action) and hand the mapping in here.
 
-Resolution never raises. A stream that declares no axis, or whose declared
-pointer cannot be resolved, falls back to :data:`IDENTITY_AXIS` — the sample
-index, which is what every consumer used before axes existed — with ``error``
-describing why. Fitting against a sample index is degraded but useful; failing
-a workspace apply because a digitizer is switched off is not.
+Resolution never raises. A stream that declares no axis uses
+:data:`IDENTITY_AXIS` — the sample index, which is what every consumer used
+before axes existed. A declared axis whose metadata cannot be resolved carries
+identity-shaped placeholder coordinates with ``source="unresolved"`` and an
+``error``; consumers that require physical coordinates must not treat those
+placeholders as valid measurements.
 """
 
 from __future__ import annotations
@@ -124,7 +125,7 @@ def resolve_stream_axis(
     axis: StreamAxis | None,
     run_metadata: Mapping[str, Any] | None,
 ) -> ResolvedStreamAxis:
-    """Resolve ``axis`` against ``run_metadata``, degrading to the sample index."""
+    """Resolve ``axis`` without raising, marking failed declarations unresolved."""
     if axis is None:
         return IDENTITY_AXIS
 
