@@ -12,6 +12,7 @@ import { usePanels } from "../panels/PanelsContext";
 import {
   cloneDagNodes,
   cloneDagOutputs,
+  nodeKindFromOp,
   normalizeDagNode,
   normalizeDagOutput,
 } from "../stream/dag";
@@ -21,9 +22,11 @@ import type {
   StreamDagOutputConfig,
 } from "../stream/types";
 import type { StreamCatalogEntry } from "../../types";
+import type { StreamWorkspaceSyncResult } from "./useWorkspaceListManagement";
 import {
   defaultOutputForKind,
   defaultStreamWorkspaceName,
+  workspaceNodeMap,
   workspaceOutputOptionsByKind,
   workspaceStreamFromGraphNodes,
 } from "../stream/workspace";
@@ -71,6 +74,89 @@ import { markPanelsDirty } from "../panels/PanelInvalidationStore";
  *   accumulated history when the workspace's stream/channel change.
  */
 
+/** Where a published output comes from, and what shape it carries. */
+export type OutputBinding = { nodeId: string; kind: string };
+
+export function workspaceOutputBindings(
+  workspace: StreamAnalysisWorkspaceConfig
+): Map<string, OutputBinding> {
+  const nodeById = workspaceNodeMap(workspace);
+  const bindings = new Map<string, OutputBinding>();
+  for (const output of workspace.publishOutputs) {
+    const node = nodeById.get(output.nodeId);
+    const kind = node ? nodeKindFromOp(node.op) : null;
+    if (!kind) continue;
+    bindings.set(output.outputId, { nodeId: output.nodeId, kind });
+  }
+  return bindings;
+}
+
+/**
+ * One cache a panel keeps, and the outputs that fill it.
+ *
+ * Slots are per *cache*, not per panel, because a panel reads several
+ * unrelated outputs into separate stores: a bin-stats card holds its
+ * histogram, its trace overlays and its fit overlays independently.
+ * Resetting the fit must drop the fit overlay and leave the histogram —
+ * a panel-wide decision blanks the whole card whenever any one output it
+ * reads is touched, which is the behaviour this replaced.
+ *
+ * `alwaysReset` opts a slot out of the mechanism. Only the primary trace
+ * frame list needs it: `applyToPanels` *appends* there
+ * (`currentFrames.push`), so a frame emitted between the runtime
+ * committing the new graph and us deciding what to keep would interleave
+ * with pre-apply frames inside the overlay-N window. Every other store
+ * replaces its payload wholesale, so a late arrival simply wins.
+ */
+export type PanelCacheSlot = {
+  slot:
+    | "traceFrames"
+    | "traceOverlay"
+    | "scalar"
+    | "params"
+    | "bin2d"
+    | "binStats"
+    | "binStatsOverlay"
+    | "binStatsFitOverlay";
+  outputIds: string[];
+  alwaysReset?: boolean;
+};
+
+export type PanelCachePlan = PanelCacheSlot[];
+
+/**
+ * Which of a slot's outputs no longer describe what it holds.
+ *
+ * `stateResetNodeIds` is the answer from the runtime to "which
+ * accumulators did this apply throw away" - see
+ * `StreamWorkspaceSyncResult`. `null` means we never got an answer, so
+ * everything is stale, which is what the UI assumed unconditionally
+ * before this existed.
+ *
+ * The per-output granularity matters for the overlay stores, which are
+ * keyed by output id: one dead overlay does not cost the others.
+ */
+export function staleCacheOutputIds(
+  slot: PanelCacheSlot,
+  stateResetNodeIds: string[] | null,
+  previousBindings: Map<string, OutputBinding>,
+  nextBindings: Map<string, OutputBinding>
+): string[] {
+  if (stateResetNodeIds === null || slot.alwaysReset) return [...slot.outputIds];
+  const resetNodes = new Set(stateResetNodeIds);
+  return slot.outputIds.filter((outputId) => {
+    const next = nextBindings.get(outputId);
+    if (!next) return true;
+    const previous = previousBindings.get(outputId);
+    // Repointed at another node, or the node changed shape: whatever the
+    // panel holds was measured against a different quantity.
+    if (!previous) return true;
+    if (previous.nodeId !== next.nodeId) return true;
+    if (previous.kind !== next.kind) return true;
+    return resetNodes.has(next.nodeId);
+  });
+}
+
 export interface DaqWorkspaceApplyArgs {
   streamCatalogByKey: Map<string, StreamCatalogEntry>;
   buildStreamAnalysisWorkspacePayload: (
@@ -79,7 +165,7 @@ export interface DaqWorkspaceApplyArgs {
   syncStreamAnalysisWorkspace: (
     workspaceId: string,
     source: string
-  ) => Promise<void>;
+  ) => Promise<StreamWorkspaceSyncResult>;
   clearPanelBuffers: (panelId: string) => void;
 }
 
@@ -110,6 +196,51 @@ export function useDaqWorkspaceApply(args: DaqWorkspaceApplyArgs) {
     streamBinStatsOverlayRef,
     streamBinStatsFitOverlayRef,
   } = useTelemetry();
+
+  const clearPanelCacheSlot = (
+    panelId: string,
+    slot: PanelCacheSlot["slot"],
+    staleOutputIds: string[]
+  ) => {
+    switch (slot) {
+      case "traceFrames":
+        streamFramesRef.set(panelId, []);
+        return;
+      case "traceOverlay": {
+        const overlays = streamTraceOverlayRef.get(panelId);
+        for (const outputId of staleOutputIds) overlays?.delete(outputId);
+        return;
+      }
+      case "scalar":
+        clearPanelBuffers(panelId);
+        return;
+      case "params": {
+        // Keyed by output id like the overlay maps, so drop only the
+        // entries whose source actually changed.
+        const latest = streamParamsLatestRef.get(panelId);
+        if (latest) {
+          for (const outputId of staleOutputIds) delete latest[outputId];
+        }
+        return;
+      }
+      case "bin2d":
+        streamBin2dRef.delete(panelId);
+        return;
+      case "binStats":
+        streamBinStatsRef.delete(panelId);
+        return;
+      case "binStatsOverlay": {
+        const overlays = streamBinStatsOverlayRef.get(panelId);
+        for (const outputId of staleOutputIds) overlays?.delete(outputId);
+        return;
+      }
+      case "binStatsFitOverlay": {
+        const overlays = streamBinStatsFitOverlayRef.get(panelId);
+        for (const outputId of staleOutputIds) overlays?.delete(outputId);
+        return;
+      }
+    }
+  };
 
   const applyDaqWorkspace = async () => {
     const workspaceId = String(daqWorkspaceId ?? "").trim();
@@ -227,7 +358,14 @@ export function useDaqWorkspaceApply(args: DaqWorkspaceApplyArgs) {
     const hist2dOutputIds = new Set(
       workspaceOutputOptionsByKind(updated, "hist2d").map((item) => item.value)
     );
+    const previousBindings = workspaceOutputBindings(current);
+    const nextBindings = workspaceOutputBindings(updated);
     const dirtyPanelIds = new Set<string>();
+    // Which panels *might* have to drop their caches. That decision needs
+    // the answer from the runtime, which only arrives after the sync
+    // below, so the clearing deliberately does not happen in this updater
+    // - a state updater must not have side effects anyway.
+    const cachePlans = new Map<string, PanelCachePlan>();
     setPanels((prev) =>
       prev.map((panel) => {
         if (
@@ -251,11 +389,17 @@ export function useDaqWorkspaceApply(args: DaqWorkspaceApplyArgs) {
             panel.outputId && traceOutputIds.has(panel.outputId)
               ? panel.outputId
               : defaultOutputForKind(updated, "trace");
-          streamFramesRef.set(panel.id, []);
-          streamTraceOverlayRef.set(panel.id, new Map());
           const overlayOutputIds = (panel.overlayOutputIds ?? []).filter(
             (id) => id !== nextOutputId && traceOutputIds.has(id)
           );
+          cachePlans.set(panel.id, [
+            {
+              slot: "traceFrames",
+              outputIds: [nextOutputId ?? ""],
+              alwaysReset: true,
+            },
+            { slot: "traceOverlay", outputIds: overlayOutputIds },
+          ]);
           return {
             ...panel,
             outputId: nextOutputId,
@@ -269,7 +413,9 @@ export function useDaqWorkspaceApply(args: DaqWorkspaceApplyArgs) {
             panel.outputId && scalarOutputIds.has(panel.outputId)
               ? panel.outputId
               : defaultOutputForKind(updated, "scalar");
-          clearPanelBuffers(panel.id);
+          cachePlans.set(panel.id, [
+            { slot: "scalar", outputIds: [nextOutputId ?? ""] },
+          ]);
           return {
             ...panel,
             outputId: nextOutputId,
@@ -282,7 +428,9 @@ export function useDaqWorkspaceApply(args: DaqWorkspaceApplyArgs) {
           const nextOutputIds = (panel.outputIds ?? []).filter(
             (id) => scalarOutputIds.has(id) || paramsMapOutputIds.has(id)
           );
-          streamParamsLatestRef.set(panel.id, {});
+          cachePlans.set(panel.id, [
+            { slot: "params", outputIds: nextOutputIds },
+          ]);
           return {
             ...panel,
             outputIds: nextOutputIds,
@@ -293,7 +441,9 @@ export function useDaqWorkspaceApply(args: DaqWorkspaceApplyArgs) {
             panel.outputId && hist2dOutputIds.has(panel.outputId)
               ? panel.outputId
               : defaultOutputForKind(updated, "hist2d");
-          streamBin2dRef.delete(panel.id);
+          cachePlans.set(panel.id, [
+            { slot: "bin2d", outputIds: [nextOutputId ?? ""] },
+          ]);
           return {
             ...panel,
             outputId: nextOutputId,
@@ -303,15 +453,19 @@ export function useDaqWorkspaceApply(args: DaqWorkspaceApplyArgs) {
           panel.outputId && histOutputIds.has(panel.outputId)
             ? panel.outputId
             : defaultOutputForKind(updated, "hist_agg");
-        streamBinStatsRef.delete(panel.id);
-        streamBinStatsOverlayRef.set(panel.id, new Map());
-        streamBinStatsFitOverlayRef.set(panel.id, new Map());
         const nextOverlayOutputIds = (panel.overlayOutputIds ?? []).filter(
           (id) => traceOutputIds.has(id)
         );
         const nextFitOverlayOutputIds = (
           panel.fitOverlayOutputIds ?? []
         ).filter((id) => fitOutputIds.has(id));
+        // Three independent stores. Changing the fit must not cost the
+        // histogram, and vice versa.
+        cachePlans.set(panel.id, [
+          { slot: "binStats", outputIds: [nextOutputId ?? ""] },
+          { slot: "binStatsOverlay", outputIds: nextOverlayOutputIds },
+          { slot: "binStatsFitOverlay", outputIds: nextFitOverlayOutputIds },
+        ]);
         return {
           ...panel,
           outputId: nextOutputId,
@@ -325,7 +479,24 @@ export function useDaqWorkspaceApply(args: DaqWorkspaceApplyArgs) {
       })
     );
     markPanelsDirty(dirtyPanelIds);
-    void syncStreamAnalysisWorkspace(workspaceId, "stream-workspace-apply");
+
+    const sync = await syncStreamAnalysisWorkspace(
+      workspaceId,
+      "stream-workspace-apply"
+    );
+    for (const [panelId, plan] of cachePlans) {
+      for (const slot of plan) {
+        const stale = staleCacheOutputIds(
+          slot,
+          sync.stateResetNodeIds,
+          previousBindings,
+          nextBindings
+        );
+        if (stale.length === 0) continue;
+        clearPanelCacheSlot(panelId, slot.slot, stale);
+      }
+    }
+    markPanelsDirty(dirtyPanelIds);
   };
 
   return { applyDaqWorkspace };

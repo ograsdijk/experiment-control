@@ -20,6 +20,7 @@ export type StreamDagOpId =
   | "trace.multiply_scalar"
   | "trace.divide_scalar"
   | "trace.rolling_mean"
+  | "trace.block_average"
   | "trace.decimate"
   | "trace.crop"
   | "trace.window_mean"
@@ -66,6 +67,12 @@ export type StreamDagNodeConfig = {
 export type StreamDagOutputConfig = {
   outputId: string;
   nodeId: string;
+  /**
+   * Human-facing name for this output. Presentation only — `outputId`
+   * stays the stable identity that panels persist and the backend keys
+   * on. Absent means the UI derives a name from the id.
+   */
+  label?: string | null;
 };
 
 export type StreamDagParamField = {
@@ -107,6 +114,11 @@ export type StreamTarget = {
   stream: string;
   units?: string | null;
   shape?: number[];
+  // Sample axis, resolved server-side; see StreamCatalogEntry.
+  xUnits?: string | null;
+  xLabel?: string | null;
+  xIncrement?: number | null;
+  xOrigin?: number | null;
 };
 
 export type StreamAnalysisSettings = {
@@ -153,7 +165,39 @@ export type StreamWorkspaceStoreStatus = {
   lastError: string | null;
 };
 
-export type PlotTelemetryPanelState = {
+/**
+ * Optional per-panel card layout overrides.
+ *
+ * Both are absent on panels created before card sizing existed, and on
+ * panels the user has never resized — absent means "follow the grid".
+ * `heightPx` null/undefined leaves the plot height responsive to the
+ * card; a number pins it.
+ */
+export type PanelLayoutState = {
+  heightPx?: number | null;
+  colSpan?: number;
+};
+
+/**
+ * Naming overrides carried by every panel.
+ *
+ * `seriesLabels` renames individual traces in the UI, keyed by the same
+ * identity the legend uses: the DAG `output_id`, `deviceId:signal` for
+ * telemetry, or `ch N` for raw stream channels. Device and telemetry
+ * schemas have no display-name field and none is being added, so this is
+ * where a readable trace name lives.
+ *
+ * `titleAuto` records that the panel title was generated rather than
+ * typed. Only auto titles get rewritten when the bound output changes; a
+ * title restored from a profile has no flag and is therefore treated as
+ * the user's.
+ */
+export type PanelNamingState = PanelLayoutState & {
+  seriesLabels?: Record<string, string>;
+  titleAuto?: boolean;
+};
+
+export type PlotTelemetryPanelState = PanelNamingState & {
   id: string;
   title: string;
   kind: "telemetry";
@@ -169,7 +213,7 @@ export type PlotTelemetryPanelState = {
   smoothingWindowS: number;
 };
 
-export type PlotStreamPanelState = {
+export type PlotStreamPanelState = PanelNamingState & {
   id: string;
   title: string;
   kind: "stream_raw";
@@ -197,7 +241,7 @@ export type PlotStreamPanelState = {
   yMax: number | null;
 };
 
-export type PlotStreamWaterfallPanelState = {
+export type PlotStreamWaterfallPanelState = PanelNamingState & {
   id: string;
   title: string;
   kind: "stream_waterfall";
@@ -218,7 +262,7 @@ export type PlotStreamWaterfallPanelState = {
   yMax: number | null;
 };
 
-export type PlotStreamScalarPanelState = {
+export type PlotStreamScalarPanelState = PanelNamingState & {
   id: string;
   title: string;
   kind: "stream_scalar";
@@ -233,7 +277,7 @@ export type PlotStreamScalarPanelState = {
   yMax: number | null;
 };
 
-export type PlotStreamParamsPanelState = {
+export type PlotStreamParamsPanelState = PanelNamingState & {
   id: string;
   title: string;
   kind: "stream_params";
@@ -241,7 +285,7 @@ export type PlotStreamParamsPanelState = {
   outputIds: string[];
 };
 
-export type PlotStreamBinStatsPanelState = {
+export type PlotStreamBinStatsPanelState = PanelNamingState & {
   id: string;
   title: string;
   kind: "stream_bin_stats";
@@ -263,7 +307,7 @@ export type PlotStreamBinStatsPanelState = {
   yMax: number | null;
 };
 
-export type PlotStreamBin2dPanelState = {
+export type PlotStreamBin2dPanelState = PanelNamingState & {
   id: string;
   title: string;
   kind: "stream_bin2d";

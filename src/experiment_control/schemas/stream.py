@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..types import StreamCall, StreamField, StreamMeta, StreamOut
+from ..types import StreamAxis, StreamCall, StreamField, StreamMeta, StreamOut
 from ..utils.config_parsing import (
     ConfigError,
+    fmt_path,
     normalize_list,
     optional_dict,
     optional_str,
@@ -17,6 +18,67 @@ from .common import calls_to_json
 Json = dict[str, Any]
 
 
+def stream_axis_from_json(
+    raw: Any, path: list[str | int] | None = None
+) -> StreamAxis | None:
+    """Parse an ``x_axis`` block. Shared by config parsing and the gateway."""
+    path = list(path) if path is not None else ["x_axis"]
+    if raw is None:
+        return None
+    axis_raw = require_dict(raw, path=path)
+    allowed = {
+        "units",
+        "label",
+        "increment",
+        "increment_from",
+        "rate_from",
+        "origin",
+        "origin_from",
+    }
+    unknown = sorted(set(axis_raw) - allowed)
+    if unknown:
+        raise ConfigError(
+            path=fmt_path(path),
+            message=f"unknown x_axis keys: {', '.join(unknown)}",
+        )
+
+    def _pointer(key: str) -> str | None:
+        value = axis_raw.get(key)
+        if value is None:
+            return None
+        if not isinstance(value, str) or not value.strip():
+            raise ConfigError(
+                path=fmt_path([*path, key]),
+                message="must be a non-empty run-metadata key name",
+            )
+        return value.strip()
+
+    def _num(key: str) -> float | None:
+        value = axis_raw.get(key)
+        if value is None:
+            return None
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ConfigError(
+                path=fmt_path([*path, key]), message="must be a number"
+            )
+        return float(value)
+
+    try:
+        return StreamAxis(
+            units=optional_str(axis_raw.get("units"), path=[*path, "units"]),
+            label=optional_str(axis_raw.get("label"), path=[*path, "label"]),
+            increment=_num("increment"),
+            increment_from=_pointer("increment_from"),
+            rate_from=_pointer("rate_from"),
+            origin=_num("origin"),
+            origin_from=_pointer("origin_from"),
+        )
+    except ConfigError:
+        raise
+    except ValueError as exc:
+        raise ConfigError(path=fmt_path(path), message=str(exc)) from exc
+
+
 def stream_calls_to_json(calls: list[StreamCall]) -> list[Json]:
     def _output_to_json(o: StreamOut) -> Json:
         payload: Json = {
@@ -27,6 +89,21 @@ def stream_calls_to_json(calls: list[StreamCall]) -> list[Json]:
             "ring_slots": o.ring_slots,
             "attrs": o.attrs,
         }
+        if o.x_axis is not None:
+            axis_payload = {
+                key: value
+                for key, value in (
+                    ("units", o.x_axis.units),
+                    ("label", o.x_axis.label),
+                    ("increment", o.x_axis.increment),
+                    ("increment_from", o.x_axis.increment_from),
+                    ("rate_from", o.x_axis.rate_from),
+                    ("origin", o.x_axis.origin),
+                    ("origin_from", o.x_axis.origin_from),
+                )
+                if value is not None
+            }
+            payload["x_axis"] = axis_payload
         if o.kind == "records":
             payload["fields"] = [
                 {
@@ -82,7 +159,13 @@ def stream_calls_from_json(raw: object) -> list[StreamCall]:
         desc = optional_str(o.get("description", None), path=[*path, "description"])
         ring_slots = int(o.get("ring_slots", 1024))
         attrs = optional_dict(o.get("attrs", None), path=[*path, "attrs"])
+        x_axis = stream_axis_from_json(o.get("x_axis", None), [*path, "x_axis"])
         if kind == "records":
+            if x_axis is not None:
+                raise ConfigError(
+                    path=fmt_path([*path, "x_axis"]),
+                    message="is only valid for frame streams",
+                )
             fields_raw = require_list_of_dicts(
                 o.get("fields"), path=[*path, "fields"]
             )
@@ -128,6 +211,7 @@ def stream_calls_from_json(raw: object) -> list[StreamCall]:
             description=desc,
             ring_slots=ring_slots,
             attrs=attrs,
+            x_axis=x_axis,
         )
 
     calls_raw = normalize_list(raw, path=["stream_calls"])

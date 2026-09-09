@@ -6,6 +6,30 @@ import {
   perfMeasure,
 } from "../features/performance/perfInstrumentation";
 
+/**
+ * Series palette. Exported so the card legend can colour its entries to
+ * match the plot — the legend is rendered outside the canvas, so it has
+ * no other way to know which stroke belongs to which series.
+ */
+export const BIN_STATS_OVERLAY_COLORS = [
+  "#df6bff",
+  "#4dc4ff",
+  "#ff9f43",
+  "#8bc34a",
+  "#ff6b6b",
+];
+export const BIN_STATS_FIT_OVERLAY_COLORS = [
+  "#ff8a5b",
+  "#7ed957",
+  "#d36fff",
+  "#3fc5ff",
+  "#f4c542",
+];
+
+export function binStatsMeanStroke(isDark: boolean): string {
+  return isDark ? "#86c1ff" : "#1f5bbf";
+}
+
 export type UncertaintyMode = "std" | "sem";
 
 export type StreamBinStatsSeries = {
@@ -381,12 +405,12 @@ export function StreamBinStatsPanel({
     const tickStroke = isDark ? "rgba(255, 255, 255, 0.35)" : "rgba(0, 0, 0, 0.25)";
     const bandFill = isDark ? "rgba(110, 183, 255, 0.22)" : "rgba(34, 108, 216, 0.16)";
     const bandStroke = isDark ? "rgba(110, 183, 255, 0.32)" : "rgba(34, 108, 216, 0.24)";
-    const meanStroke = isDark ? "#86c1ff" : "#1f5bbf";
+    const meanStroke = binStatsMeanStroke(isDark);
     const meanPointFill = isDark ? "#d8ecff" : "#ffffff";
 
     const width = hostRef.current.clientWidth || 600;
-    const overlayColors = ["#df6bff", "#4dc4ff", "#ff9f43", "#8bc34a", "#ff6b6b"];
-    const fitOverlayColors = ["#ff8a5b", "#7ed957", "#d36fff", "#3fc5ff", "#f4c542"];
+    const overlayColors = BIN_STATS_OVERLAY_COLORS;
+    const fitOverlayColors = BIN_STATS_FIT_OVERLAY_COLORS;
     const overlaySeriesDefs = Array.from({ length: overlaySeriesCount }, (_value, idx) => ({
       // Tooltip labels are read from overlayLabelsRef; the hidden uPlot legend
       // only needs a stable structural label.

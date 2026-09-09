@@ -1,5 +1,6 @@
 ﻿import type { UncertaintyMode } from "../../components/StreamBinStatsPanel";
 import type { StreamCatalogEntry } from "../../types";
+import { outputDisplayName } from "./output_labels";
 import {
   defaultInputsForOp,
   defaultParamsForOp,
@@ -151,12 +152,22 @@ export function workspaceOutputOptionsByKind(
     if (nodeKind !== kind) {
       continue;
     }
+    const display = outputDisplayName(workspace, output.outputId);
     out.push({
       value: output.outputId,
-      label: `${output.outputId} <- ${output.nodeId} (${node.op})`,
+      // The explicit label is the point of the exercise, but the id is
+      // what gets persisted, so it stays visible wherever a person is
+      // choosing an output rather than reading a plot.
+      label:
+        display && display !== output.outputId
+          ? `${display} · ${output.outputId}`
+          : output.outputId,
     });
   }
-  return out.sort((a, b) => a.label.localeCompare(b.label));
+  // Sorted by id, not label: `defaultOutputForKind` takes the first entry,
+  // so the order a new panel inherits must not move when someone renames
+  // an output.
+  return out.sort((a, b) => a.value.localeCompare(b.value));
 }
 
 export function workspaceXAxisLabel(
@@ -285,6 +296,11 @@ export function workspaceStreamFromGraphNodes(
       deviceId,
       stream: streamName,
       units: typeof meta?.units === "string" ? meta.units : undefined,
+      xUnits: typeof meta?.x_units === "string" ? meta.x_units : undefined,
+      xLabel: typeof meta?.x_label === "string" ? meta.x_label : undefined,
+      xIncrement:
+        typeof meta?.x_increment === "number" ? meta.x_increment : undefined,
+      xOrigin: typeof meta?.x_origin === "number" ? meta.x_origin : undefined,
       shape: normalizeShape(meta?.shape),
     },
     channelIndex,
@@ -563,6 +579,10 @@ export function normalizeStreamWorkspaceRecord(
       normalized.stream = {
         ...derived.stream,
         units: normalized.stream?.units ?? derived.stream.units,
+        xUnits: normalized.stream?.xUnits ?? derived.stream.xUnits,
+        xLabel: normalized.stream?.xLabel ?? derived.stream.xLabel,
+        xIncrement: normalized.stream?.xIncrement ?? derived.stream.xIncrement,
+        xOrigin: normalized.stream?.xOrigin ?? derived.stream.xOrigin,
         shape:
           normalized.stream?.shape && normalized.stream.shape.length > 0
             ? normalized.stream.shape

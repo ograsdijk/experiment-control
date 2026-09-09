@@ -27,6 +27,8 @@ type PlotPanelProps = {
   yOffset?: number | null;
   smoothingMode?: TelemetrySmoothingMode;
   smoothingWindowS?: number;
+  /** Per-panel trace renames, keyed `deviceId:signal`. */
+  seriesLabels?: Record<string, string>;
 };
 
 type PanelSeriesEntry = {
@@ -218,6 +220,7 @@ export function PlotPanel({
   yOffset = null,
   smoothingMode = "none",
   smoothingWindowS = 5,
+  seriesLabels,
 }: PlotPanelProps) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const plotRef = useRef<uPlot | null>(null);
@@ -278,11 +281,20 @@ export function PlotPanel({
   }, [smoothingModeNormalized, smoothingWindowNormalized]);
 
   const seriesEntries = useMemo<PanelSeriesEntry[]>(() => {
+    // The live legend is the only place a trace names itself, so it takes
+    // the panel's rename when there is one and appends units when the
+    // signal declares them.
+    const nameFor = (trace: TraceKey): string => {
+      const override = seriesLabels?.[traceKeyToId(trace)]?.trim();
+      const base = override || `${trace.deviceId}.${trace.signal}`;
+      const units = typeof trace.units === "string" ? trace.units.trim() : "";
+      return units ? `${base} (${units})` : base;
+    };
     const out: PanelSeriesEntry[] = traces.map((trace, idx) => ({
       trace,
       traceIndex: idx,
       isOverlay: false,
-      label: `${trace.deviceId}.${trace.signal}`,
+      label: nameFor(trace),
     }));
     if (smoothingModeNormalized !== "none" && smoothingLabel) {
       for (let idx = 0; idx < traces.length; idx += 1) {
@@ -294,12 +306,12 @@ export function PlotPanel({
           trace,
           traceIndex: idx,
           isOverlay: true,
-          label: `${trace.deviceId}.${trace.signal} (${smoothingLabel})`,
+          label: `${nameFor(trace)} (${smoothingLabel})`,
         });
       }
     }
     return out;
-  }, [traces, smoothingModeNormalized, smoothingLabel]);
+  }, [traces, smoothingModeNormalized, smoothingLabel, seriesLabels]);
 
   const buildPanelData = useMemo(
     () => (): number[][] => {

@@ -78,20 +78,14 @@ export interface PanelsContextValue {
   panelIdRef: MutableRefObject<number>;
 
   // -----------------------------------------------------------------
-  // Modal-panel-id state — which panel currently has each modal open
+  // Which panel has its settings popover open, and which is expanded.
+  // One settings surface at a time is what makes the y-axis draft
+  // below safe to keep global rather than per panel.
   // -----------------------------------------------------------------
   plotOptionsPanelId: string | null;
   setPlotOptionsPanelId: Dispatch<SetStateAction<string | null>>;
   expandedPlotPanelId: string | null;
   setExpandedPlotPanelId: Dispatch<SetStateAction<string | null>>;
-  streamTraceOptionsPanelId: string | null;
-  setStreamTraceOptionsPanelId: Dispatch<SetStateAction<string | null>>;
-  streamBinStatsOptionsPanelId: string | null;
-  setStreamBinStatsOptionsPanelId: Dispatch<SetStateAction<string | null>>;
-  streamParamsOptionsPanelId: string | null;
-  setStreamParamsOptionsPanelId: Dispatch<SetStateAction<string | null>>;
-  streamBin2dOptionsPanelId: string | null;
-  setStreamBin2dOptionsPanelId: Dispatch<SetStateAction<string | null>>;
 
   // -----------------------------------------------------------------
   // Y-axis manual-range editor (transient draft state, plus the
@@ -151,17 +145,6 @@ export function PanelsProvider({ children }: { children: ReactNode }) {
   const [expandedPlotPanelId, setExpandedPlotPanelId] = useState<string | null>(
     null
   );
-  const [streamTraceOptionsPanelId, setStreamTraceOptionsPanelId] = useState<
-    string | null
-  >(null);
-  const [streamBinStatsOptionsPanelId, setStreamBinStatsOptionsPanelId] =
-    useState<string | null>(null);
-  const [streamParamsOptionsPanelId, setStreamParamsOptionsPanelId] = useState<
-    string | null
-  >(null);
-  const [streamBin2dOptionsPanelId, setStreamBin2dOptionsPanelId] = useState<
-    string | null
-  >(null);
 
   const [yAxisDraftMin, setYAxisDraftMin] = useState<string | number>("");
   const [yAxisDraftMax, setYAxisDraftMax] = useState<string | number>("");
@@ -204,14 +187,6 @@ export function PanelsProvider({ children }: { children: ReactNode }) {
       setPlotOptionsPanelId,
       expandedPlotPanelId,
       setExpandedPlotPanelId,
-      streamTraceOptionsPanelId,
-      setStreamTraceOptionsPanelId,
-      streamBinStatsOptionsPanelId,
-      setStreamBinStatsOptionsPanelId,
-      streamParamsOptionsPanelId,
-      setStreamParamsOptionsPanelId,
-      streamBin2dOptionsPanelId,
-      setStreamBin2dOptionsPanelId,
       yAxisDraftMin,
       setYAxisDraftMin,
       yAxisDraftMax,
@@ -228,10 +203,6 @@ export function PanelsProvider({ children }: { children: ReactNode }) {
       activePanelId,
       plotOptionsPanelId,
       expandedPlotPanelId,
-      streamTraceOptionsPanelId,
-      streamBinStatsOptionsPanelId,
-      streamParamsOptionsPanelId,
-      streamBin2dOptionsPanelId,
       yAxisDraftMin,
       yAxisDraftMax,
       yAxisAutoRange,

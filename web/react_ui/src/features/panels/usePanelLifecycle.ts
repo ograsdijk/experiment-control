@@ -1,4 +1,5 @@
 import type { LatestSignals } from "../telemetry/useTelemetryStream";
+import { autoPanelTitle } from "../stream/output_labels";
 import {
   isStreamScalarPanel,
   isTelemetryPanel,
@@ -35,6 +36,11 @@ import {
   ensurePanelBuffers as ensurePanelBuffersImpl,
   panelCapacity as panelCapacityImpl,
 } from "./applyToPanels";
+import {
+  MAX_PANEL_COL_SPAN,
+  MAX_PANEL_HEIGHT_PX,
+  MIN_PANEL_HEIGHT_PX,
+} from "../profile/plot_state";
 import { usePanels } from "./PanelsContext";
 import { markPanelDirty, panelInvalidationStore } from "./PanelInvalidationStore";
 
@@ -92,17 +98,10 @@ export function usePanelLifecycle(args: PanelLifecycleArgs) {
     setPanels,
     activePanelId,
     setActivePanelId,
-    panelIdRef,    plotOptionsPanelId,
+    panelIdRef,
+    plotOptionsPanelId,
     expandedPlotPanelId,
     setExpandedPlotPanelId,
-    streamTraceOptionsPanelId,
-    setStreamTraceOptionsPanelId,
-    streamBinStatsOptionsPanelId,
-    setStreamBinStatsOptionsPanelId,
-    streamBin2dOptionsPanelId,
-    setStreamBin2dOptionsPanelId,
-    streamParamsOptionsPanelId,
-    setStreamParamsOptionsPanelId,
     editingPanelId,
     setEditingPanelId,
     setPanelTitleDraft,
@@ -175,14 +174,24 @@ export function usePanelLifecycle(args: PanelLifecycleArgs) {
           ? {
               ...commonTrace,
               kind,
-              title: `Trace ${panelIdRef.current}`,
+              title: autoPanelTitle(
+                workspaceConfig,
+                traceOutputId,
+                `Trace ${panelIdRef.current}`
+              ),
+              titleAuto: true,
               overlayCount: DEFAULT_STREAM_OVERLAY_COUNT,
               extraChannelIndices: [],
             }
           : {
               ...commonTrace,
               kind,
-              title: `Waterfall ${panelIdRef.current}`,
+              title: autoPanelTitle(
+                workspaceConfig,
+                traceOutputId,
+                `Waterfall ${panelIdRef.current}`
+              ),
+              titleAuto: true,
               overlayCount: DEFAULT_WATERFALL_ROWS,
             };
       streamFramesRef.set(id, []);
@@ -192,7 +201,12 @@ export function usePanelLifecycle(args: PanelLifecycleArgs) {
       const integralOutputId = defaultOutputForKind(workspaceConfig, "scalar");
       panel = {
         id,
-        title: `Scalar ${panelIdRef.current}`,
+        title: autoPanelTitle(
+          workspaceConfig,
+          integralOutputId,
+          `Scalar ${panelIdRef.current}`
+        ),
+        titleAuto: true,
         kind: "stream_scalar",
         workspaceId: defaultWorkspaceId ?? id,
         outputId: integralOutputId,
@@ -228,7 +242,12 @@ export function usePanelLifecycle(args: PanelLifecycleArgs) {
       const binOutputId = defaultOutputForKind(workspaceConfig, "hist_agg");
       panel = {
         id,
-        title: `Bin stats ${panelIdRef.current}`,
+        title: autoPanelTitle(
+          workspaceConfig,
+          binOutputId,
+          `Bin stats ${panelIdRef.current}`
+        ),
+        titleAuto: true,
         kind: "stream_bin_stats",
         workspaceId: defaultWorkspaceId ?? id,
         outputId: binOutputId,
@@ -253,7 +272,12 @@ export function usePanelLifecycle(args: PanelLifecycleArgs) {
       const bin2dOutputId = defaultOutputForKind(workspaceConfig, "hist2d");
       panel = {
         id,
-        title: `Bin2D ${panelIdRef.current}`,
+        title: autoPanelTitle(
+          workspaceConfig,
+          bin2dOutputId,
+          `Bin2D ${panelIdRef.current}`
+        ),
+        titleAuto: true,
         kind: "stream_bin2d",
         workspaceId: defaultWorkspaceId ?? id,
         outputId: bin2dOutputId,
@@ -285,6 +309,121 @@ export function usePanelLifecycle(args: PanelLifecycleArgs) {
     setActivePanelId(id);
   };
 
+  /**
+   * Copy a panel, keeping every setting, and drop it directly after the
+   * original.
+   *
+   * Only the *configuration* is copied — accumulated data is not. Each
+   * per-panel ref is keyed by panel id, and the buffers/frames a panel
+   * holds are its own history; seeding the copy with a shared reference
+   * would let two cards mutate one buffer. The copy starts empty and
+   * fills from the same live source, exactly as a newly created panel of
+   * that kind does.
+   */
+  const duplicatePanel = (panelId: string) => {
+    const source = panels.find((panel) => panel.id === panelId);
+    if (!source) {
+      return;
+    }
+    panelIdRef.current += 1;
+    const id = `panel-${panelIdRef.current}`;
+    const copy = { ...source, id } as PlotPanelState;
+    if (isTelemetryPanel(copy)) {
+      copy.traces = copy.traces.map((trace) => ({ ...trace }));
+      buffersRef.set(id, new Map());
+    } else if (isStreamScalarPanel(copy)) {
+      buffersRef.set(id, new Map());
+    }
+    setPanels((prev) => {
+      const index = prev.findIndex((panel) => panel.id === panelId);
+      if (index < 0) {
+        return [...prev, copy];
+      }
+      return [...prev.slice(0, index + 1), copy, ...prev.slice(index + 1)];
+    });
+    markPanelDirty(id);
+  };
+
+  /**
+   * Card sizing. Passing `null` for a field clears the override and
+   * returns that axis to the grid default — which is not the same as
+   * writing the default value, since the default is responsive.
+   */
+  const setPanelLayout = (
+    panelId: string,
+    patch: { heightPx?: number | null; colSpan?: number | null }
+  ) => {
+    setPanels((prev) =>
+      prev.map((panel) => {
+        if (panel.id !== panelId) {
+          return panel;
+        }
+        const next = { ...panel };
+        if ("heightPx" in patch) {
+          if (patch.heightPx === null || patch.heightPx === undefined) {
+            delete next.heightPx;
+          } else {
+            next.heightPx = Math.min(
+              MAX_PANEL_HEIGHT_PX,
+              Math.max(MIN_PANEL_HEIGHT_PX, Math.round(patch.heightPx))
+            );
+          }
+        }
+        if ("colSpan" in patch) {
+          const span =
+            patch.colSpan === null || patch.colSpan === undefined
+              ? 1
+              : Math.round(patch.colSpan);
+          if (span > 1) {
+            next.colSpan = Math.min(MAX_PANEL_COL_SPAN, span);
+          } else {
+            delete next.colSpan;
+          }
+        }
+        return next;
+      })
+    );
+    markPanelDirty(panelId);
+  };
+
+  /**
+   * Rename one trace within a panel. A blank label deletes the override so
+   * the derived name comes back; the whole map is dropped once empty, which
+   * keeps untouched panels byte-identical in the persisted profile.
+   */
+  const setPanelSeriesLabel = (
+    panelId: string,
+    seriesKey: string,
+    label: string
+  ) => {
+    const key = seriesKey.trim();
+    if (!key) {
+      return;
+    }
+    const trimmed = label.trim();
+    setPanels((prev) =>
+      prev.map((panel) => {
+        if (panel.id !== panelId) {
+          return panel;
+        }
+        const next = { ...panel };
+        const labels = { ...(panel.seriesLabels ?? {}) };
+        if (trimmed) {
+          labels[key] = trimmed;
+        } else {
+          delete labels[key];
+        }
+        if (Object.keys(labels).length > 0) {
+          next.seriesLabels = labels;
+        } else {
+          delete next.seriesLabels;
+        }
+        return next;
+      })
+    );
+    markPanelDirty(panelId);
+  };
+
   const removePanel = (panelId: string) => {
     if (panels.length <= 1) {
       return;
@@ -302,18 +441,6 @@ export function usePanelLifecycle(args: PanelLifecycleArgs) {
     if (editingPanelId === panelId) {
       setEditingPanelId(null);
       setPanelTitleDraft("");
-    }
-    if (streamTraceOptionsPanelId === panelId) {
-      setStreamTraceOptionsPanelId(null);
-    }
-    if (streamBinStatsOptionsPanelId === panelId) {
-      setStreamBinStatsOptionsPanelId(null);
-    }
-    if (streamBin2dOptionsPanelId === panelId) {
-      setStreamBin2dOptionsPanelId(null);
-    }
-    if (streamParamsOptionsPanelId === panelId) {
-      setStreamParamsOptionsPanelId(null);
     }
     if (plotOptionsPanelId === panelId) {
       closePlotOptions();
@@ -432,6 +559,9 @@ export function usePanelLifecycle(args: PanelLifecycleArgs) {
 
   return {
     createPanel,
+    duplicatePanel,
+    setPanelLayout,
+    setPanelSeriesLabel,
     removePanel,
     addTraceToPanel,
     removeTraceFromPanel,

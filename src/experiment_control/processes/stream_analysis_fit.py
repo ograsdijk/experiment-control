@@ -3,7 +3,8 @@ from __future__ import annotations
 import math
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from functools import partial
+from dataclasses import dataclass, field
 from importlib import import_module
 from typing import Any
 
@@ -61,11 +62,280 @@ def _gate_open(gate_raw: Any, *, default: bool = True) -> bool:
     return bool(gate != 0.0)
 
 
+# ----------------------------- model registry -----------------------------
+#
+# One entry per fittable model. Adding a model here is the only backend change
+# needed: parameter names drive the stderr / reduced-chi2 / params-map plumbing,
+# and OP_PARAM_SCHEMAS serves FIT_MODEL_CHOICES to the UI so no frontend edit is
+# required either.
+
+
+@dataclass(frozen=True)
+class FitModelSpec:
+    """A fittable 1-D model.
+
+    ``core`` takes ``(x, *free_params, **consts)``. Constants are bound with
+    ``functools.partial`` at build time so ``curve_fit`` never sees them.
+    ``initial_guess`` and ``bounds`` receive the same constants as keywords.
+    """
+
+    name: str
+    label: str
+    param_names: tuple[str, ...]
+    core: Callable[..., np.ndarray]
+    initial_guess: Callable[..., np.ndarray]
+    bounds: Callable[..., tuple[list[float], list[float]]] | None = None
+    parse_consts: Callable[[Json], dict[str, float]] = lambda _params: {}
+    const_param_schema: tuple[Json, ...] = ()
+
+
+def _model_gaussian(
+    x: np.ndarray, amp: float, center: float, sigma: float
+) -> np.ndarray:
+    sigma_eff = max(abs(float(sigma)), 1e-18)
+    z = (x - float(center)) / sigma_eff
+    return float(amp) * np.exp(-0.5 * z * z)
+
+
+def _model_lorentzian(
+    x: np.ndarray, amp: float, center: float, gamma: float
+) -> np.ndarray:
+    gamma_eff = max(abs(float(gamma)), 1e-18)
+    d = x - float(center)
+    return float(amp) * (gamma_eff * gamma_eff) / (d * d + gamma_eff * gamma_eff)
+
+
+def _reciprocal_normal_tau_peak(tau0: float, r: float) -> float:
+    """Mode of the reciprocal normal, in tau.
+
+    Exact: the 1/tau^2 Jacobian from v -> t skews the distribution earlier than
+    the nominal flight time, so the peak is at tau0 * 2/(1 + sqrt(1 + 8 r^2)).
+    """
+    r_eff = max(abs(float(r)), 1e-18)
+    return float(tau0) * 2.0 / (1.0 + math.sqrt(1.0 + 8.0 * r_eff * r_eff))
+
+
+def _model_reciprocal_normal(
+    x: np.ndarray,
+    amp: float,
+    tau0: float,
+    r: float,
+    *,
+    t0_s: float = 0.0,
+) -> np.ndarray:
+    """Arrival-time distribution for a Gaussian spread in forward velocity.
+
+    With ``v ~ N(v0, sigma_v)`` and a flight distance ``L``, arrival time is
+    ``t = L/v``. Writing ``tau0 = L/v0`` (the nominal flight time) and
+    ``r = sigma_v/v0`` (the fractional velocity spread), the flight length
+    cancels out entirely, so this model needs no geometry constant. Recover
+    physical units downstream with ``v0 = L/tau0`` and ``sigma_v = r*L/tau0``.
+
+    Normalized to unit height at its own peak, which makes ``amp`` the peak
+    height in the trace's own units and decorrelates it from the shape
+    parameters. ``t0_s`` is a fixed constant, not a fit parameter: it is
+    degenerate against the width.
+    """
+    tau = np.asarray(x, dtype=np.float64) - float(t0_s)
+    positive = tau > 0.0
+    # Floor away the pole. tau*tau underflows to exactly zero below
+    # ~1e-162, which would turn the division below into 0/0 -> NaN. Any
+    # tau that small sits far inside the exponential's zero region, so
+    # the floor changes no observable value.
+    tau_safe = np.maximum(np.where(positive, tau, 1.0), 1e-150)
+    tau0_eff = float(tau0) if abs(float(tau0)) > 1e-18 else 1e-18
+    r_eff = max(abs(float(r)), 1e-18)
+
+    z = (tau0_eff / tau_safe - 1.0) / r_eff
+    shape = np.exp(-0.5 * z * z) / (tau_safe * tau_safe)
+
+    tau_peak = _reciprocal_normal_tau_peak(tau0_eff, r_eff)
+    if not math.isfinite(tau_peak) or tau_peak <= 0.0:
+        return np.zeros_like(tau_safe)
+    z_peak = (tau0_eff / tau_peak - 1.0) / r_eff
+    peak = math.exp(-0.5 * z_peak * z_peak) / (tau_peak * tau_peak)
+    if not math.isfinite(peak) or peak <= 0.0:
+        return np.zeros_like(tau_safe)
+
+    return np.where(positive, float(amp) * shape / peak, 0.0)
+
+
+def _guess_peak_like(x: np.ndarray, y: np.ndarray, *, model: str) -> np.ndarray:
+    """Amplitude / center / width guess for the peak-shaped models.
+
+    Preserved verbatim from the original single-model implementation so that
+    gaussian and lorentzian fits are unchanged across the registry refactor.
+    """
+    x_min = float(np.min(x))
+    x_max = float(np.max(x))
+    span = max(x_max - x_min, 1e-12)
+    y_med = float(np.median(y))
+    y_max = float(np.max(y))
+    y_min = float(np.min(y))
+    amp_guess = y_max - y_med
+    if abs(amp_guess) < 1e-12:
+        amp_guess = y_max - y_min
+    if abs(amp_guess) < 1e-12:
+        amp_guess = float(np.max(np.abs(y))) if y.size > 0 else 1.0
+    if abs(amp_guess) < 1e-12:
+        amp_guess = 1.0
+    center_guess = float(x[int(np.argmax(y))])
+    width_guess = span / 8.0 if model == "gaussian" else span / 10.0
+    width_guess = max(width_guess, 1e-9)
+    return np.asarray([amp_guess, center_guess, width_guess], dtype=np.float64)
+
+
+def _edge_baseline(y: np.ndarray) -> float:
+    """Baseline from the record edges.
+
+    An arrival peak occupies a large fraction of the record, so the median of
+    the whole trace sits inside the pulse. The edges do not.
+    """
+    n = int(y.size)
+    if n < 4:
+        return float(np.median(y))
+    edge = max(1, n // 10)
+    return float(np.median(np.concatenate([y[:edge], y[-edge:]])))
+
+
+def _half_max_width(x: np.ndarray, y: np.ndarray, peak_index: int) -> float | None:
+    """FWHM around ``peak_index`` with linear interpolation of the crossings."""
+    n = int(y.size)
+    if n < 3 or not (0 <= peak_index < n):
+        return None
+    half = 0.5 * float(y[peak_index])
+    if not math.isfinite(half) or half <= 0.0:
+        return None
+
+    def _cross(step: int) -> float | None:
+        i = peak_index
+        while 0 <= i + step < n:
+            nxt = i + step
+            if float(y[nxt]) < half:
+                y_hi = float(y[i])
+                y_lo = float(y[nxt])
+                denom = y_hi - y_lo
+                if abs(denom) < 1e-30:
+                    return float(x[nxt])
+                frac = (y_hi - half) / denom
+                return float(x[i]) + frac * (float(x[nxt]) - float(x[i]))
+            i = nxt
+        return None
+
+    left = _cross(-1)
+    right = _cross(+1)
+    if left is None or right is None:
+        return None
+    width = right - left
+    return width if width > 0.0 else None
+
+
+def _guess_reciprocal_normal(
+    x: np.ndarray, y: np.ndarray, *, t0_s: float = 0.0
+) -> np.ndarray:
+    """Guess ``[amplitude, tau0, r]`` from the trace itself.
+
+    Inverts the exact peak relation ``tau_peak = tau0 * 2/(1 + sqrt(1 + 8r^2))``
+    rather than assuming the peak sits at tau0, which is wrong by 7% at r=0.3.
+    """
+    span = max(float(np.max(x)) - float(np.min(x)), 1e-12)
+    baseline = _edge_baseline(y)
+    y_c = np.asarray(y, dtype=np.float64) - baseline
+
+    # Raw PMT traces are shot-noise dominated; argmax on unsmoothed data lands
+    # on a spike rather than on the pulse.
+    n = int(y_c.size)
+    window = max(1, min(9, n // 32))
+    if window > 1:
+        kernel = np.ones(window, dtype=np.float64) / float(window)
+        y_s = np.convolve(y_c, kernel, mode="same")
+    else:
+        y_s = y_c
+
+    peak_index = int(np.argmax(y_s))
+    amp_guess = float(y_s[peak_index])
+    if not math.isfinite(amp_guess) or amp_guess <= 0.0:
+        amp_guess = float(np.max(np.abs(y_s))) if n else 1.0
+    if not math.isfinite(amp_guess) or amp_guess <= 0.0:
+        amp_guess = 1.0
+
+    tau_peak = float(x[peak_index]) - float(t0_s)
+    if not math.isfinite(tau_peak) or tau_peak <= 0.0:
+        tau_peak = max(span / 4.0, 1e-12)
+
+    fwhm = _half_max_width(x, y_s, peak_index)
+    sigma_tau = (fwhm / 2.354_820_045) if fwhm is not None else span / 8.0
+    r_guess = sigma_tau / tau_peak
+    if not math.isfinite(r_guess):
+        r_guess = 0.1
+    r_guess = min(max(r_guess, 1e-3), 0.9)
+
+    tau0_guess = tau_peak * (1.0 + math.sqrt(1.0 + 8.0 * r_guess * r_guess)) / 2.0
+    return np.asarray([amp_guess, tau0_guess, r_guess], dtype=np.float64)
+
+
+def _bounds_reciprocal_normal(
+    x: np.ndarray, y: np.ndarray, **_consts: float
+) -> tuple[list[float], list[float]]:
+    """Keep tau0 positive and r in a physical range.
+
+    Fixing t0 removes the pole hazard that would otherwise need bounding, so
+    only the two shape parameters are constrained here.
+    """
+    del x, y
+    return ([-np.inf, 1e-12, 1e-4], [np.inf, np.inf, 5.0])
+
+
+def _parse_reciprocal_normal_consts(params: Json) -> dict[str, float]:
+    raw = params.get("t0_s", 0.0)
+    t0_s = _normalize_float(raw if raw is not None else 0.0)
+    if t0_s is None:
+        raise ValueError("fit.curve_1d requires a finite t0_s for reciprocal_normal")
+    return {"t0_s": float(t0_s)}
+
+
+FIT_MODELS: dict[str, FitModelSpec] = {
+    "gaussian": FitModelSpec(
+        name="gaussian",
+        label="gaussian",
+        param_names=("amplitude", "center", "sigma"),
+        core=_model_gaussian,
+        initial_guess=lambda x, y: _guess_peak_like(x, y, model="gaussian"),
+    ),
+    "lorentzian": FitModelSpec(
+        name="lorentzian",
+        label="lorentzian",
+        param_names=("amplitude", "center", "gamma"),
+        core=_model_lorentzian,
+        initial_guess=lambda x, y: _guess_peak_like(x, y, model="lorentzian"),
+    ),
+    "reciprocal_normal": FitModelSpec(
+        name="reciprocal_normal",
+        label="reciprocal normal (beam arrival)",
+        param_names=("amplitude", "tau0", "r"),
+        core=_model_reciprocal_normal,
+        initial_guess=_guess_reciprocal_normal,
+        bounds=_bounds_reciprocal_normal,
+        parse_consts=_parse_reciprocal_normal_consts,
+        const_param_schema=(
+            {"name": "t0_s", "kind": "number", "required": False, "default": 0.0},
+        ),
+    ),
+}
+
+
+FIT_MODEL_CHOICES: list[Json] = [
+    {"value": spec.name, "label": spec.label} for spec in FIT_MODELS.values()
+]
+
+
 def _parse_fit_model(raw: Any) -> str:
     model = str(raw if raw is not None else "gaussian").strip().lower()
-    if model in {"gaussian", "lorentzian"}:
+    if model in FIT_MODELS:
         return model
-    raise ValueError("fit.curve_1d model must be one of gaussian, lorentzian")
+    raise ValueError(
+        "fit.curve_1d model must be one of " + ", ".join(sorted(FIT_MODELS))
+    )
 
 
 def _parse_fit_baseline_mode(raw: Any) -> str:
@@ -101,6 +371,7 @@ class FitCurve1DState:
     every_n: int
     sigma_y: float | None = None
     dense_eval_points: int | None = None
+    model_params: dict[str, float] = field(default_factory=dict)
     sample_count: int = 0
     last_fit: dict[str, Any] | None = None
     last_fit_attempt_ts_mono: float | None = None
@@ -117,6 +388,7 @@ class FitCurve1DState:
             every_n=every_n,
             sigma_y=sigma_y,
             dense_eval_points=dense_eval_points,
+            model_params=FIT_MODELS[model].parse_consts(params),
         )
 
     def reset(self) -> None:
@@ -145,40 +417,26 @@ def _fit_curve_build_models(
     *,
     model: str,
     baseline_mode: str,
+    model_params: dict[str, float] | None = None,
 ) -> tuple[Any, Any, list[str]]:
-    def _model_gaussian(x: np.ndarray, amp: float, center: float, sigma: float) -> np.ndarray:
-        sigma_eff = max(abs(float(sigma)), 1e-18)
-        z = (x - float(center)) / sigma_eff
-        return float(amp) * np.exp(-0.5 * z * z)
-
-    def _model_lorentzian(x: np.ndarray, amp: float, center: float, gamma: float) -> np.ndarray:
-        gamma_eff = max(abs(float(gamma)), 1e-18)
-        d = x - float(center)
-        return float(amp) * (gamma_eff * gamma_eff) / (d * d + gamma_eff * gamma_eff)
-
-    core: Callable[..., np.ndarray]
-    if model == "gaussian":
-        core = _model_gaussian
-        names = ["amplitude", "center", "sigma"]
-    else:
-        core = _model_lorentzian
-        names = ["amplitude", "center", "gamma"]
+    spec = FIT_MODELS[model]
+    consts = dict(model_params or {})
+    core = partial(spec.core, **consts) if consts else spec.core
+    names = list(spec.param_names)
+    n = len(names)
 
     if baseline_mode == "none":
         return core, core, names
 
     if baseline_mode == "constant":
+
         def constant_func(x: np.ndarray, *p: float) -> np.ndarray:
-            return core(x, float(p[0]), float(p[1]), float(p[2])) + float(p[3])
+            return core(x, *p[:n]) + float(p[n])
 
         return constant_func, constant_func, names + ["baseline_const"]
 
     def linear_func(x: np.ndarray, *p: float) -> np.ndarray:
-        return (
-            core(x, float(p[0]), float(p[1]), float(p[2]))
-            + float(p[3])
-            + float(p[4]) * x
-        )
+        return core(x, *p[:n]) + float(p[n]) + float(p[n + 1]) * x
 
     return linear_func, linear_func, names + ["baseline_const", "baseline_slope"]
 
@@ -189,30 +447,52 @@ def _fit_curve_initial_guess(
     y: np.ndarray,
     model: str,
     baseline_mode: str,
+    model_params: dict[str, float] | None = None,
 ) -> np.ndarray:
-    x_min = float(np.min(x))
-    x_max = float(np.max(x))
-    span = max(x_max - x_min, 1e-12)
-    y_med = float(np.median(y))
-    y_max = float(np.max(y))
-    y_min = float(np.min(y))
-    amp_guess = y_max - y_med
-    if abs(amp_guess) < 1e-12:
-        amp_guess = y_max - y_min
-    if abs(amp_guess) < 1e-12:
-        amp_guess = float(np.max(np.abs(y))) if y.size > 0 else 1.0
-    if abs(amp_guess) < 1e-12:
-        amp_guess = 1.0
-    center_guess = float(x[int(np.argmax(y))])
-    width_guess = span / 8.0 if model == "gaussian" else span / 10.0
-    width_guess = max(width_guess, 1e-9)
+    spec = FIT_MODELS[model]
+    core_guess = np.asarray(
+        spec.initial_guess(x, y, **dict(model_params or {})), dtype=np.float64
+    ).reshape(-1)
     if baseline_mode == "none":
-        return np.asarray([amp_guess, center_guess, width_guess], dtype=np.float64)
+        return core_guess
+
+    # The baseline tail is model-independent.
+    span = max(float(np.max(x)) - float(np.min(x)), 1e-12)
+    y_med = float(np.median(y))
     if baseline_mode == "constant":
-        return np.asarray([amp_guess, center_guess, width_guess, y_med], dtype=np.float64)
+        return np.concatenate([core_guess, np.asarray([y_med], dtype=np.float64)])
     slope_guess = (float(y[-1]) - float(y[0])) / span if y.size >= 2 else 0.0
-    return np.asarray(
-        [amp_guess, center_guess, width_guess, y_med, slope_guess], dtype=np.float64
+    return np.concatenate(
+        [core_guess, np.asarray([y_med, slope_guess], dtype=np.float64)]
+    )
+
+
+def _fit_curve_bounds(
+    *,
+    x: np.ndarray,
+    y: np.ndarray,
+    model: str,
+    baseline_mode: str,
+    model_params: dict[str, float] | None = None,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Per-model parameter bounds, or None to leave curve_fit unbounded.
+
+    Models that declare no bounds keep the original unbounded call: passing
+    bounds switches scipy from 'lm' to 'trf', which converges slightly
+    differently, so existing fits must not acquire them implicitly.
+    """
+    spec = FIT_MODELS[model]
+    if spec.bounds is None:
+        return None
+    lower, upper = spec.bounds(x, y, **dict(model_params or {}))
+    lower = list(lower)
+    upper = list(upper)
+    extra = {"none": 0, "constant": 1, "linear": 2}[baseline_mode]
+    lower.extend([-np.inf] * extra)
+    upper.extend([np.inf] * extra)
+    return (
+        np.asarray(lower, dtype=np.float64),
+        np.asarray(upper, dtype=np.float64),
     )
 
 
@@ -317,6 +597,8 @@ def _fit_curve_run(
     sigma_y: float | None = None,
     sigma_trace_raw: Any = None,
     dense_eval_points: int | None = None,
+    model_params: dict[str, float] | None = None,
+    axis: Any = None,
 ) -> dict[str, Any] | None:
     xy = _fit_curve_prepare_xy(x_raw=x_raw, y_raw=y_raw)
     if xy is None:
@@ -328,15 +610,33 @@ def _fit_curve_run(
     fit_func, eval_func, param_names = _fit_curve_build_models(
         model=model,
         baseline_mode=baseline_mode,
+        model_params=model_params,
     )
     p0 = _fit_curve_initial_guess(
         x=x,
         y=y,
         model=model,
         baseline_mode=baseline_mode,
+        model_params=model_params,
+    )
+    bounds = _fit_curve_bounds(
+        x=x,
+        y=y,
+        model=model,
+        baseline_mode=baseline_mode,
+        model_params=model_params,
     )
     try:
-        popt, pcov = curve_fit(fit_func, x, y, p0=p0, maxfev=8000)
+        if bounds is None:
+            popt, pcov = curve_fit(fit_func, x, y, p0=p0, maxfev=8000)
+        else:
+            lower, upper = bounds
+            # curve_fit requires p0 strictly inside the bounds.
+            margin = 1e-12 + 1e-9 * np.abs(p0)
+            p0 = np.clip(p0, lower + margin, upper - margin)
+            popt, pcov = curve_fit(
+                fit_func, x, y, p0=p0, bounds=(lower, upper), maxfev=8000
+            )
     except Exception:
         return None
     yhat = np.asarray(eval_func(x, *popt), dtype=np.float64).reshape(-1)
@@ -362,6 +662,13 @@ def _fit_curve_run(
         params["reduced_chi2"] = reduced_chi2
     params["model"] = model
     params["baseline_mode"] = baseline_mode
+    for const_name, const_value in (model_params or {}).items():
+        params[const_name] = float(const_value)
+    if axis is not None:
+        params["x_units"] = axis.units
+        params["x_increment"] = float(axis.increment)
+        params["x_origin"] = float(axis.origin)
+        params["x_axis_source"] = axis.source
     out: dict[str, Any] = {
         "x": x,
         "yhat": yhat,
@@ -380,8 +687,15 @@ def execute_fit_curve_1d(
     x_raw: Any,
     y_raw: Any,
     gate_raw: Any,
+    axis: Any = None,
 ) -> dict[str, Any] | None:
     if not _gate_open(gate_raw, default=True):
+        return state.last_fit
+    if y_raw is None:
+        # No trace this frame -- an upstream node that emits only
+        # periodically, such as trace.block_average before its first
+        # block fills. Nothing was attempted, so this must not count as
+        # a failed fit or advance the every_n phase.
         return state.last_fit
     state.sample_count += 1
     every_n = max(1, int(state.every_n))
@@ -396,6 +710,8 @@ def execute_fit_curve_1d(
         baseline_mode=state.baseline_mode,
         sigma_y=state.sigma_y,
         dense_eval_points=state.dense_eval_points,
+        model_params=state.model_params,
+        axis=axis,
     )
     if fit_result is not None:
         state.mark_fit_success(fit_result)
@@ -437,8 +753,6 @@ def _normalize_fit_param_name(raw: Any) -> str:
         "x0": "center",
         "sigma": "sigma",
         "gamma": "gamma",
-        "width": "width",
-        "fwhm": "fwhm",
         "baseline": "baseline_const",
         "offset": "baseline_const",
         "slope": "baseline_slope",
@@ -727,6 +1041,7 @@ def execute_fit_from_hist_agg(
         sigma_y=state.sigma_y,
         sigma_trace_raw=sigma_arr,
         dense_eval_points=state.dense_eval_points,
+        model_params=state.model_params,
     )
     if fit_result is not None:
         state.mark_fit_success(fit_result)

@@ -191,6 +191,26 @@ export function useDaqDraftEditors() {
     );
   };
 
+  /**
+   * Display name for an output. Blank clears it rather than storing an
+   * empty string, so the derived name takes over again.
+   */
+  const setDaqOutputLabel = (index: number, label: string) => {
+    const next = label.trim();
+    setDaqDraftOutputs((prev) =>
+      prev.map((output, idx) => {
+        if (idx !== index) {
+          return output;
+        }
+        if (!next) {
+          const { label: _dropped, ...rest } = output;
+          return rest;
+        }
+        return { ...output, label: next };
+      })
+    );
+  };
+
   const setDaqOutputNode = (index: number, nodeId: string | null) => {
     setDaqDraftOutputs((prev) =>
       prev.map((output, idx) =>
@@ -244,6 +264,7 @@ export function useDaqDraftEditors() {
     addDaqNode,
     removeDaqNode,
     setDaqOutputId,
+    setDaqOutputLabel,
     setDaqOutputNode,
     addDaqOutput,
     removeDaqOutput,

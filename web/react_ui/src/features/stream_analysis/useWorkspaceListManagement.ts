@@ -52,6 +52,37 @@ import { useStreamAnalysis } from "./StreamAnalysisContext";
  * (e.g. `applyDaqWorkspace` in App.tsx) can build payloads without
  * re-implementing the serialisation.
  */
+/**
+ * What a workspace put told us about accumulated state on the runtime.
+ *
+ * `stateResetNodeIds` lists the stream_analysis nodes whose accumulators
+ * did *not* survive the apply. A panel only has to drop its cached data
+ * when a node behind one of the outputs it reads appears here — editing a
+ * fit's `every_n`, or attaching a label to an output, leaves every
+ * histogram upstream of it intact.
+ *
+ * `null` means "we could not find out" (the runtime was not ready, the put
+ * failed, or a revision conflict sent us down the reload path). Callers
+ * must treat that as "assume everything reset" — the conservative
+ * behaviour, which is what the UI did unconditionally before.
+ */
+export type StreamWorkspaceSyncResult = {
+  stateResetNodeIds: string[] | null;
+};
+
+const SYNC_RESULT_UNKNOWN: StreamWorkspaceSyncResult = {
+  stateResetNodeIds: null,
+};
+
+function normalizeStateResetNodeIds(raw: unknown): string[] | null {
+  // An older runtime does not send the field at all; without it we cannot
+  // tell a clean apply from a full reset, so fall back to conservative.
+  if (!Array.isArray(raw)) return null;
+  return raw
+    .map((entry) => String(entry ?? "").trim())
+    .filter((entry) => entry.length > 0);
+}
+
 export function useWorkspaceListManagement() {
   const {
     streamAnalysisReadyRef,
@@ -273,10 +304,15 @@ export function useWorkspaceListManagement() {
     const outputs = (
       Array.isArray(workspace.publishOutputs) ? workspace.publishOutputs : []
     )
-      .map((output) => ({
-        output_id: String(output.outputId ?? "").trim(),
-        node_id: String(output.nodeId ?? "").trim(),
-      }))
+      .map((output) => {
+        const label =
+          typeof output.label === "string" ? output.label.trim() : "";
+        return {
+          output_id: String(output.outputId ?? "").trim(),
+          node_id: String(output.nodeId ?? "").trim(),
+          ...(label ? { label } : {}),
+        };
+      })
       .filter((output) => output.output_id && output.node_id);
 
     return {
@@ -291,19 +327,19 @@ export function useWorkspaceListManagement() {
   const syncStreamAnalysisWorkspace = async (
     workspaceId: string,
     source: string
-  ) => {
+  ): Promise<StreamWorkspaceSyncResult> => {
     if (!streamAnalysisReadyRef.current) {
-      return;
+      return SYNC_RESULT_UNKNOWN;
     }
     const workspaceConfig = streamWorkspacesRef.current[workspaceId];
     if (!workspaceConfig) {
       await deleteStreamAnalysisWorkspace(workspaceId, source);
-      return;
+      return SYNC_RESULT_UNKNOWN;
     }
     const workspace = buildStreamAnalysisWorkspacePayload(workspaceConfig);
     if (!workspace) {
       await deleteStreamAnalysisWorkspace(workspaceConfig.workspaceId, source);
-      return;
+      return SYNC_RESULT_UNKNOWN;
     }
     const expectedRevision = Object.prototype.hasOwnProperty.call(
       streamWorkspaceRevisionsRef.current,
@@ -326,7 +362,7 @@ export function useWorkspaceListManagement() {
         message: `${source}: Reloaded latest workspace state.`,
       });
       await loadStreamAnalysisWorkspaces(source, { notifyOnError: false });
-      return;
+      return SYNC_RESULT_UNKNOWN;
     }
     if (!resp.ok) {
       notifications.show({
@@ -334,7 +370,7 @@ export function useWorkspaceListManagement() {
         title: "stream_analysis sync failed",
         message: `${source}: ${resp.error?.message ?? "workspace.put failed"}`,
       });
-      return;
+      return SYNC_RESULT_UNKNOWN;
     }
     const resultObj =
       resp.result && typeof resp.result === "object"
@@ -381,6 +417,11 @@ export function useWorkspaceListManagement() {
       }
     }
     await refreshWorkspaceStoreStatus(source, { notifyOnError: false });
+    return {
+      stateResetNodeIds: normalizeStateResetNodeIds(
+        resultObj.state_reset_node_ids
+      ),
+    };
   };
 
   return {

@@ -8,7 +8,7 @@ import time
 import uuid
 from collections import OrderedDict, deque
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from graphlib import TopologicalSorter
 from pathlib import Path
 from typing import Any, Protocol, cast
@@ -27,10 +27,19 @@ from ..utils.cli_args import (
 )
 from ..utils.rpc_dispatch import RpcDispatchRegistry
 from ..utils.yaml_helpers import load_yaml_file
+from ..utils.yaml_round_trip import dump_yaml_preserving
 from ..utils.zmq_helpers import safe_json_loads
 from .manager_client_helper import ManagerClientHelper
 from .process_base import ManagedProcessBase
+from ..stream_axis import (
+    IDENTITY_AXIS,
+    ResolvedStreamAxis,
+    axis_values,
+    resolve_stream_axis,
+)
+from ..schemas.stream import stream_calls_from_json
 from .stream_analysis_fit import (
+    FIT_MODEL_CHOICES,
     FitCurve1DState,
     _coerce_trace,
     _gate_open,
@@ -74,6 +83,10 @@ class PublishOutput:
     output_id: str
     node_id: str
     kind: str
+    # Presentation only. `output_id` stays the stable programmatic identity;
+    # `label` is what a human should read in a UI. Absent means the UI falls
+    # back to a name derived from the id.
+    label: str | None = None
 
 
 @dataclass
@@ -97,6 +110,27 @@ class WorkspaceRuntime:
     dropped_samples: int = 0
     revision: int = 1
     etag: str = ""
+    # Snapshotted at apply so a workspace's axis cannot change mid-flight.
+    x_axis: ResolvedStreamAxis = IDENTITY_AXIS
+
+
+def _rpc_result_payload(resp: Any) -> Any:
+    """Result payload from either RPC envelope shape, or None on failure.
+
+    Device commands routed through the manager return the raw driver-runner
+    envelope ``{"id", "status": "OK", "result"}``; manager-level calls and
+    manager-level failures use ``{"ok": ..., "error": ...}``. Checking only
+    ``ok`` treats every successful device command as a failure -- the bug
+    documented in ``hdf_writer._call_optional_device_action_result``.
+    """
+    if not isinstance(resp, dict):
+        return None
+    ok = resp.get("ok")
+    if ok is None:
+        ok = str(resp.get("status", "")).upper() == "OK"
+    if not ok:
+        return None
+    return resp.get("result")
 
 
 class WorkspaceRevisionConflict(RuntimeError):
@@ -1080,6 +1114,73 @@ class TraceRollingMeanState:
         return self.sum_trace / float(denom)
 
 
+@dataclass
+class TraceBlockAverageState:
+    """Non-overlapping average of `block_traces` consecutive traces.
+
+    Distinct from `trace.rolling_mean`, which slides by one trace and so emits
+    a new -- but heavily correlated -- output every frame. Here each input
+    trace contributes to exactly one output, which is what makes consecutive
+    fits statistically independent and their stderrs meaningful.
+
+    Output semantics: the most recently *completed* block average, held until
+    the next block completes, so panels stay steady between blocks and the
+    fit result updates once per block. `None` until the first block is full --
+    a partial average has the wrong noise level to fit.
+    """
+
+    block_traces: int
+    sum_trace: np.ndarray | None
+    count: int
+    last_average: np.ndarray | None
+    blocks_completed: int
+
+    @classmethod
+    def from_params(cls, params: Json) -> TraceBlockAverageState:
+        block = _normalize_int(params.get("block_traces"))
+        if block is None or block <= 0:
+            raise ValueError("trace.block_average requires block_traces > 0")
+        return cls(
+            block_traces=int(block),
+            sum_trace=None,
+            count=0,
+            last_average=None,
+            blocks_completed=0,
+        )
+
+    def reset(self) -> None:
+        self.sum_trace = None
+        self.count = 0
+        self.last_average = None
+        self.blocks_completed = 0
+
+    def update(self, trace_raw: Any) -> np.ndarray | None:
+        trace = _coerce_trace(trace_raw)
+        if trace is None:
+            return self.last_average
+        trace = trace.astype(np.float64, copy=False)
+        if trace.size <= 0:
+            return np.asarray([], dtype=np.float64)
+        if self.block_traces <= 1:
+            self.last_average = trace.astype(np.float64, copy=True)
+            self.blocks_completed += 1
+            return self.last_average
+        if self.sum_trace is None or int(self.sum_trace.size) != int(trace.size):
+            # A shape change means the digitizer was reconfigured; averaging
+            # across it would splice unrelated records together.
+            self.sum_trace = np.zeros(int(trace.size), dtype=np.float64)
+            self.count = 0
+            self.last_average = None
+        self.sum_trace += trace
+        self.count += 1
+        if self.count >= int(self.block_traces):
+            self.last_average = self.sum_trace / float(self.count)
+            self.sum_trace = np.zeros(int(trace.size), dtype=np.float64)
+            self.count = 0
+            self.blocks_completed += 1
+        return self.last_average
+
+
 OPS: dict[str, OpSpec] = {
     "source.stream": OpSpec(input_types={}, output_type="trace", stateful=False),
     "source.records": OpSpec(input_types={}, output_type="record", stateful=False),
@@ -1134,6 +1235,11 @@ OPS: dict[str, OpSpec] = {
         stateful=False,
     ),
     "trace.rolling_mean": OpSpec(
+        input_types={"trace": "trace"},
+        output_type="trace",
+        stateful=True,
+    ),
+    "trace.block_average": OpSpec(
         input_types={"trace": "trace"},
         output_type="trace",
         stateful=True,
@@ -1218,6 +1324,31 @@ OPS: dict[str, OpSpec] = {
 }
 
 
+BASELINE_MODE_CHOICES: list[Json] = [
+    {"value": "none", "label": "none"},
+    {"value": "constant", "label": "constant"},
+    {"value": "linear", "label": "linear"},
+]
+
+HIST_Y_SOURCE_CHOICES: list[Json] = [
+    {"value": "mean", "label": "mean"},
+    {"value": "std", "label": "std"},
+    {"value": "sem", "label": "sem"},
+    {"value": "count", "label": "count"},
+]
+
+HIST_SIGMA_SOURCE_CHOICES: list[Json] = [
+    {"value": "sem", "label": "sem"},
+    {"value": "std", "label": "std"},
+    {"value": "none", "label": "none"},
+]
+
+FIT_PARAM_FIELD_CHOICES: list[Json] = [
+    {"value": "value", "label": "value"},
+    {"value": "stderr", "label": "stderr"},
+]
+
+
 OP_PARAM_SCHEMAS: dict[str, list[Json]] = {
     "source.stream": [
         {"name": "device_id", "kind": "string", "required": True},
@@ -1262,6 +1393,9 @@ OP_PARAM_SCHEMAS: dict[str, list[Json]] = {
     "trace.rolling_mean": [
         {"name": "window_traces", "kind": "integer", "required": True, "default": 1},
     ],
+    "trace.block_average": [
+        {"name": "block_traces", "kind": "integer", "required": True, "default": 1},
+    ],
     "trace.decimate": [
         {"name": "method", "kind": "string", "required": False, "default": "minmax"},
         {"name": "target_points", "kind": "integer", "required": True},
@@ -1282,16 +1416,24 @@ OP_PARAM_SCHEMAS: dict[str, list[Json]] = {
         {"name": "bg_stop_idx", "kind": "integer", "required": True},
     ],
     "fit.curve_1d": [
-        {"name": "model", "kind": "string", "required": False, "default": "gaussian"},
+        {
+            "name": "model",
+            "kind": "string",
+            "required": False,
+            "default": "gaussian",
+            "choices": list(FIT_MODEL_CHOICES),
+        },
         {
             "name": "baseline_mode",
             "kind": "string",
             "required": False,
             "default": "none",
+            "choices": list(BASELINE_MODE_CHOICES),
         },
         {"name": "every_n", "kind": "integer", "required": False, "default": 1},
         {"name": "sigma_y", "kind": "number", "required": False},
         {"name": "dense_eval_points", "kind": "integer", "required": False},
+        {"name": "t0_s", "kind": "number", "required": False, "default": 0.0},
     ],
     "fit.yhat": [],
     "fit.xhat": [],
@@ -1299,26 +1441,47 @@ OP_PARAM_SCHEMAS: dict[str, list[Json]] = {
     "fit.xhat_dense": [],
     "fit.param": [
         {"name": "name", "kind": "string", "required": False, "default": "center"},
-        {"name": "field", "kind": "string", "required": False, "default": "value"},
+        {
+            "name": "field",
+            "kind": "string",
+            "required": False,
+            "default": "value",
+            "choices": list(FIT_PARAM_FIELD_CHOICES),
+        },
     ],
     "fit.params": [],
     "fit.from_hist_agg": [
-        {"name": "y_source", "kind": "string", "required": False, "default": "mean"},
-        {"name": "model", "kind": "string", "required": False, "default": "gaussian"},
+        {
+            "name": "y_source",
+            "kind": "string",
+            "required": False,
+            "default": "mean",
+            "choices": list(HIST_Y_SOURCE_CHOICES),
+        },
+        {
+            "name": "model",
+            "kind": "string",
+            "required": False,
+            "default": "gaussian",
+            "choices": list(FIT_MODEL_CHOICES),
+        },
         {
             "name": "baseline_mode",
             "kind": "string",
             "required": False,
             "default": "none",
+            "choices": list(BASELINE_MODE_CHOICES),
         },
         {"name": "every_n", "kind": "integer", "required": False, "default": 1},
         {"name": "sigma_y", "kind": "number", "required": False},
         {"name": "dense_eval_points", "kind": "integer", "required": False},
+        {"name": "t0_s", "kind": "number", "required": False, "default": 0.0},
         {
             "name": "chi2_sigma_source",
             "kind": "string",
             "required": False,
             "default": "sem",
+            "choices": list(HIST_SIGMA_SOURCE_CHOICES),
         },
         {"name": "min_count", "kind": "integer", "required": False, "default": 1},
         {"name": "x_min", "kind": "number", "required": False},
@@ -2460,6 +2623,15 @@ def _validate_node_trace_rolling_mean(
     _ = TraceRollingMeanState.from_params(node.params)
 
 
+def _validate_node_trace_block_average(
+    *,
+    node: NodeSpec,
+    source_stream_nodes: list[str],
+) -> None:
+    del source_stream_nodes
+    _ = TraceBlockAverageState.from_params(node.params)
+
+
 def _validate_node_trace_decimate(
     *,
     node: NodeSpec,
@@ -2588,6 +2760,7 @@ _NODE_OP_PARAM_VALIDATORS: dict[str, _NodeValidator] = {
     "record.field": _validate_node_record_field,
     "record.filter_eq": _validate_node_record_filter_eq,
     "trace.rolling_mean": _validate_node_trace_rolling_mean,
+    "trace.block_average": _validate_node_trace_block_average,
     "trace.decimate": _validate_node_trace_decimate,
     "trace.window_mean": _validate_node_trace_window_mean,
     "fit.curve_1d": _validate_node_fit_curve_1d,
@@ -2662,8 +2835,15 @@ def _compile_workspace_output_item(
         raise ValueError(
             f"publish.outputs[{idx}].node_id type {kind!r} is not publishable in v1"
         )
+    label_raw = item.get("label")
+    label = str(label_raw).strip() if isinstance(label_raw, str) else None
     seen_output_ids.add(output_id)
-    return PublishOutput(output_id=output_id, node_id=node_id, kind=kind)
+    return PublishOutput(
+        output_id=output_id,
+        node_id=node_id,
+        kind=kind,
+        label=label or None,
+    )
 
 
 def _prune_unreachable_nodes(
@@ -2793,6 +2973,17 @@ class StreamAnalysisProcess(ManagedProcessBase):
             process_id=self._process_id,
             subscribe_telemetry=False,
         )
+        # Resolved stream axes, keyed by (device_id, stream). Active declared
+        # axes are refreshed periodically so digitizer reconfiguration is
+        # picked up without a workspace reapply; see also the
+        # stream_analysis.stream_axis.refresh RPC.
+        self._stream_axis_cache: dict[
+            tuple[str, str], tuple[ResolvedStreamAxis, float]
+        ] = {}
+        self._stream_axis_ttl_s = 60.0
+        self._stream_axis_refresh_s = 60.0
+        self._stream_axis_next_refresh = 0.0
+        self._axis_rpc_timeout_ms = min(int(rpc_timeout_ms), 1500)
         self._sub = self._manager_helper.open_sub(
             ctx=self._ctx,
             topics=("manager.chunk_ready", "manager.telemetry_update"),
@@ -2876,12 +3067,16 @@ class StreamAnalysisProcess(ManagedProcessBase):
         return f"{workspace_id}:{int(revision)}"
 
     @staticmethod
-    def _yaml_dump(payload: Any) -> str:
-        try:
-            import yaml  # type: ignore[import-not-found]
-        except Exception as exc:  # pragma: no cover - dependency error
-            raise RuntimeError(f"PyYAML missing: {exc}") from exc
-        return str(yaml.safe_dump(payload, sort_keys=False))
+    def _yaml_dump(payload: Any, existing_text: str | None = None) -> str:
+        """Serialize the store, keeping the current file's formatting.
+
+        The workspace store is hand-written — comments, blank-line
+        grouping, flow-style output lists — and a save from the UI used
+        to flatten all of it. `dump_yaml_preserving` patches the file
+        that is already there and falls back to a plain dump when it
+        cannot.
+        """
+        return dump_yaml_preserving(payload, existing_text)
 
     def _workspace_store_status_payload(self) -> Json:
         path = self._workspace_store_path
@@ -3002,7 +3197,7 @@ class StreamAnalysisProcess(ManagedProcessBase):
             self._clear_workspaces(mark_dirty=False, publish=False)
             loaded_ids: list[str] = []
             for cfg in configs:
-                runtime = self._put_workspace_from_config(
+                runtime, _reset = self._put_workspace_from_config(
                     cfg,
                     expected_revision=None,
                     mark_dirty=False,
@@ -3040,7 +3235,16 @@ class StreamAnalysisProcess(ManagedProcessBase):
             raise ValueError("workspace_store_path is not configured")
         try:
             payload = self._serialize_workspace_store_payload()
-            text = self._yaml_dump(payload)
+            # Read the file back at save time rather than caching the text
+            # from load: an edit made on disk in between should be patched
+            # onto, not silently reverted to what we last saw.
+            existing_text: str | None = None
+            if path.exists():
+                try:
+                    existing_text = path.read_text(encoding="utf-8")
+                except OSError:
+                    existing_text = None
+            text = self._yaml_dump(payload, existing_text)
             path.parent.mkdir(parents=True, exist_ok=True)
             tmp = path.with_name(f"{path.name}.tmp")
             tmp.write_text(text, encoding="utf-8")
@@ -3062,6 +3266,7 @@ class StreamAnalysisProcess(ManagedProcessBase):
             "revision": int(workspace.revision),
             "etag": str(workspace.etag),
             "stream": {"device_id": c.stream_key[0], "stream": c.stream_key[1]},
+            "x_axis": workspace.x_axis.to_json(),
             "node_count": len(c.nodes),
             "node_output_types": dict(c.node_output_types),
             "outputs": [
@@ -3069,6 +3274,7 @@ class StreamAnalysisProcess(ManagedProcessBase):
                     "output_id": out.output_id,
                     "node_id": out.node_id,
                     "kind": out.kind,
+                    "label": out.label,
                 }
                 for out in c.outputs
             ],
@@ -3174,7 +3380,14 @@ class StreamAnalysisProcess(ManagedProcessBase):
         expected_revision: int | None,
         mark_dirty: bool,
         publish: bool,
-    ) -> WorkspaceRuntime:
+    ) -> tuple[WorkspaceRuntime, list[str]]:
+        """Compile and install a workspace, returning it and the reset nodes.
+
+        The second element lists the stateful nodes whose accumulators did
+        *not* survive this apply. Clients use it to decide which plots to
+        blank: a panel only has to drop its cache when a node behind one of
+        the outputs it consumes appears here.
+        """
         compiled = compile_workspace_graph(config)
         existing = self._workspaces.get(compiled.workspace_id)
         self._validate_workspace_expected_revision(
@@ -3182,24 +3395,41 @@ class StreamAnalysisProcess(ManagedProcessBase):
             existing=existing,
             expected_revision=expected_revision,
         )
-        existing_for_state = self._workspace_reusable_existing(
-            existing=existing,
-            compiled=compiled,
+        dirty_nodes = (
+            self._workspace_dirty_nodes(existing.compiled, compiled)
+            if existing is not None
+            else set(compiled.nodes.keys())
         )
         node_state = self._workspace_reused_node_state(
-            existing=existing_for_state,
+            existing=existing,
             compiled=compiled,
+            dirty_nodes=dirty_nodes,
         )
+        # `runtime.node_state` *is* `node_state`, and
+        # `_workspace_init_stateful_nodes` fills the gaps in place — so
+        # snapshot the carried-over ids before that runs.
+        reused_node_ids = set(node_state)
         runtime = self._workspace_runtime_from_compiled(
             compiled=compiled,
             config=config,
-            existing=existing_for_state,
+            existing=existing,
             node_state=node_state,
         )
         self._workspace_init_stateful_nodes(runtime)
+        reset_node_ids = sorted(
+            node_id for node_id in runtime.node_state if node_id not in reused_node_ids
+        )
 
+        runtime.x_axis = self._resolve_stream_axis(compiled.stream_key)
         self._workspaces[compiled.workspace_id] = runtime
         self._prune_workspace_snapshot_outputs(runtime)
+        # A node that lost its state must not leave a snapshot behind: a
+        # client reconnecting after the apply would hydrate the pre-apply
+        # histogram and show it against post-apply bins.
+        for node_id in reset_node_ids:
+            self._clear_workspace_snapshot_outputs(
+                compiled.workspace_id, node_id=node_id
+            )
         self._rebuild_stream_index()
         self._reconcile_trace_writers()
         if mark_dirty and self._workspace_store_path is not None:
@@ -3208,9 +3438,139 @@ class StreamAnalysisProcess(ManagedProcessBase):
             self._publish_workspace_status(
                 compiled.workspace_id,
                 status="updated",
-                details={"workspace": self._workspace_summary(runtime)},
+                details={
+                    "workspace": self._workspace_summary(runtime),
+                    "state_reset_node_ids": list(reset_node_ids),
+                },
             )
-        return runtime
+        return runtime, reset_node_ids
+
+    def _declared_stream_axis(self, stream_key: tuple[str, str]) -> Any:
+        """The StreamAxis declared for this stream, or None."""
+        device_id, stream_name = stream_key
+        if self._manager is None:
+            return None
+        resp = self._manager.call(
+            {"type": "device.config.list"},
+            timeout_ms=self._axis_rpc_timeout_ms,
+        )
+        configs = _rpc_result_payload(resp)
+        if not isinstance(configs, list):
+            return None
+        for item in configs:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("device_id") or "").strip() != device_id:
+                continue
+            try:
+                calls = stream_calls_from_json(item.get("stream_calls") or [])
+            except Exception:
+                return None
+            for call in calls:
+                for output in call.outputs or []:
+                    if output.stream == stream_name:
+                        return output.x_axis
+        return None
+
+    def _fetch_run_metadata(self, device_id: str) -> dict[str, Any] | None:
+        """Run metadata for one device, or None if it cannot be collected.
+
+        Uses the same ``collect_run_metadata`` device action as the HDF
+        writer. It is a runner built-in rather than a driver method, and is
+        read-only: it just invokes the device's declared ``run_meta_calls``.
+        """
+        if self._manager is None:
+            return None
+        resp = self._manager.call(
+            {
+                "type": "command",
+                "device_id": device_id,
+                "action": "collect_run_metadata",
+                "params": {},
+            },
+            timeout_ms=self._axis_rpc_timeout_ms,
+        )
+        payload = _rpc_result_payload(resp)
+        # The manager may wrap the runner envelope, giving result.result.
+        # Only descend when this level actually looks like an envelope --
+        # run metadata is a flat dict of scalars, but a device could still
+        # declare a key literally named "result".
+        if isinstance(payload, dict) and ("status" in payload or "ok" in payload):
+            inner = payload.get("result")
+            if isinstance(inner, dict):
+                payload = inner
+        return payload if isinstance(payload, dict) else None
+
+    def _resolve_stream_axis(self, stream_key: tuple[str, str]) -> ResolvedStreamAxis:
+        """Resolve a stream's x axis, caching per (device, stream).
+
+        Never raises and never fails an apply: a stream that declares no axis,
+        an offline device, or an unresolvable pointer all degrade to the
+        sample index, with the reason carried on the resolved axis so the UI
+        can surface it.
+        """
+        now = time.monotonic()
+        cached = self._stream_axis_cache.get(stream_key)
+        if cached is not None and cached[1] > now:
+            return cached[0]
+
+        try:
+            declared = self._declared_stream_axis(stream_key)
+        except Exception as exc:
+            resolved = ResolvedStreamAxis(
+                units=None,
+                label=IDENTITY_AXIS.label,
+                increment=1.0,
+                origin=0.0,
+                source="unresolved",
+                error=f"stream config unavailable: {exc}",
+            )
+            self._stream_axis_cache[stream_key] = (
+                resolved,
+                now + self._stream_axis_ttl_s,
+            )
+            return resolved
+
+        if declared is None:
+            self._stream_axis_cache[stream_key] = (
+                IDENTITY_AXIS,
+                now + self._stream_axis_ttl_s,
+            )
+            return IDENTITY_AXIS
+
+        run_metadata: dict[str, Any] | None = None
+        error: str | None = None
+        if declared.metadata_keys():
+            try:
+                run_metadata = self._fetch_run_metadata(stream_key[0])
+            except Exception as exc:
+                run_metadata = None
+                error = f"collect_run_metadata failed: {exc}"
+            if run_metadata is None and error is None:
+                error = "collect_run_metadata returned no run metadata"
+
+        resolved = resolve_stream_axis(declared, run_metadata)
+        if error is not None:
+            detail = f"{error}; {resolved.error}" if resolved.error else error
+            resolved = replace(resolved, error=detail)
+        self._stream_axis_cache[stream_key] = (resolved, now + self._stream_axis_ttl_s)
+        return resolved
+
+    def _refresh_stream_axes(self) -> list[Json]:
+        """Drop cached axes and re-resolve for every live workspace."""
+        self._stream_axis_cache.clear()
+        out: list[Json] = []
+        for workspace in self._workspaces.values():
+            axis = self._resolve_stream_axis(workspace.compiled.stream_key)
+            workspace.x_axis = axis
+            entry: Json = {
+                "workspace_id": workspace.compiled.workspace_id,
+                "device_id": workspace.compiled.stream_key[0],
+                "stream": workspace.compiled.stream_key[1],
+            }
+            entry.update(axis.to_json())
+            out.append(entry)
+        return out
 
     def _validate_workspace_expected_revision(
         self,
@@ -3237,54 +3597,70 @@ class StreamAnalysisProcess(ManagedProcessBase):
                 current_revision=current_revision,
             )
 
-    def _workspace_reusable_existing(
-        self,
-        *,
-        existing: WorkspaceRuntime | None,
-        compiled: CompiledWorkspace,
-    ) -> WorkspaceRuntime | None:
-        if existing is None:
-            return None
-        if not self._workspace_graph_unchanged(existing.compiled, compiled):
-            return None
-        return existing
-
     @staticmethod
-    def _workspace_graph_unchanged(
+    def _workspace_dirty_nodes(
         old_compiled: CompiledWorkspace,
         new_compiled: CompiledWorkspace,
-    ) -> bool:
-        if set(old_compiled.nodes.keys()) != set(new_compiled.nodes.keys()):
-            return False
-        for node_id, old_node in old_compiled.nodes.items():
-            new_node = new_compiled.nodes.get(node_id)
-            if new_node is None:
-                return False
-            if old_node.op != new_node.op:
-                return False
-            if old_node.params != new_node.params:
-                return False
-            if old_node.inputs != new_node.inputs:
-                return False
-        return True
+    ) -> set[str]:
+        """Nodes whose accumulated state cannot survive into `new_compiled`.
+
+        A stateful node's accumulator only means something relative to the
+        values that fed it, so it stays valid iff the node itself is
+        untouched *and* every upstream ancestor is untouched. Edits
+        downstream (a fit's `every_n`) or off to the side (a new branch off
+        the same source) cannot invalidate it.
+
+        Seeded with the nodes that are new or changed in `op` / `params` /
+        `inputs`, then propagated forward along `new_compiled.order`, which
+        is already topologically sorted — so a single pass reaches every
+        descendant.
+
+        `order` is the *pruned* execution order, not every declared node.
+        That is the right domain: `_workspace_init_stateful_nodes` walks the
+        same list, so a node outside it never holds state to begin with, and
+        every ancestor of an executed node is itself executed.
+        """
+        dirty: set[str] = set()
+        for node_id in new_compiled.order:
+            new_node = new_compiled.nodes[node_id]
+            old_node = old_compiled.nodes.get(node_id)
+            if (
+                old_node is None
+                or old_node.op != new_node.op
+                or old_node.params != new_node.params
+                or old_node.inputs != new_node.inputs
+            ):
+                dirty.add(node_id)
+                continue
+            if any(src in dirty for src in new_node.inputs.values()):
+                dirty.add(node_id)
+        return dirty
 
     @staticmethod
     def _workspace_reused_node_state(
         *,
         existing: WorkspaceRuntime | None,
         compiled: CompiledWorkspace,
+        dirty_nodes: set[str],
     ) -> dict[str, Any]:
         if existing is None:
             return {}
         node_state: dict[str, Any] = {}
         for node_id, state in existing.node_state.items():
+            if node_id in dirty_nodes:
+                continue
             old_node = existing.compiled.nodes.get(node_id)
             new_node = compiled.nodes.get(node_id)
             if old_node is None or new_node is None:
                 continue
+            # `dirty_nodes` already covers these, but this function is the
+            # last gate before a live accumulator is carried over — keep it
+            # self-sufficient rather than trusting the caller's set.
             if old_node.op != new_node.op:
                 continue
             if old_node.params != new_node.params:
+                continue
+            if old_node.inputs != new_node.inputs:
                 continue
             node_state[node_id] = state
         return node_state
@@ -3350,6 +3726,8 @@ class StreamAnalysisProcess(ManagedProcessBase):
             return Bin2DStatsState.from_params(node.params)
         if node.op == "trace.rolling_mean":
             return TraceRollingMeanState.from_params(node.params)
+        if node.op == "trace.block_average":
+            return TraceBlockAverageState.from_params(node.params)
         if node.op in {"fit.curve_1d", "fit.from_hist_agg"}:
             return FitCurve1DState.from_params(node.params)
         return None
@@ -4109,6 +4487,14 @@ class StreamAnalysisProcess(ManagedProcessBase):
                 workspace.node_state[node_id] = state
             values[node_id] = state.update(src)
             return True, None
+        if op == "trace.block_average":
+            src = values.get(node.inputs["trace"])
+            block_state = workspace.node_state.get(node_id)
+            if not isinstance(block_state, TraceBlockAverageState):
+                block_state = TraceBlockAverageState.from_params(node.params)
+                workspace.node_state[node_id] = block_state
+            values[node_id] = block_state.update(src)
+            return True, None
         return self._execute_workspace_node_trace_unary_ops(
             node=node,
             node_id=node_id,
@@ -4207,6 +4593,46 @@ class StreamAnalysisProcess(ManagedProcessBase):
         values[node_id] = func(fit_val)
         return True, None
 
+    def _refresh_active_stream_axes(self) -> None:
+        """Re-resolve every active declared axis.
+
+        This both recovers axes that were unavailable during workspace apply
+        and picks up a runtime sample-rate or trigger-delay change. Streams
+        with no axis declaration keep the identity axis and incur no periodic
+        device RPC. Runs from the poll loop, never from the frame path.
+        """
+        active = [
+            workspace
+            for workspace in self._workspaces.values()
+            if workspace.x_axis.source != "identity"
+        ]
+        if not active:
+            return
+        keys = {workspace.compiled.stream_key for workspace in active}
+        resolved_by_key: dict[tuple[str, str], ResolvedStreamAxis] = {}
+        for key in keys:
+            self._stream_axis_cache.pop(key, None)
+            try:
+                resolved_by_key[key] = self._resolve_stream_axis(key)
+            except Exception:
+                # Never let a background refresh take down the poll loop.
+                continue
+        for workspace in active:
+            resolved = resolved_by_key.get(workspace.compiled.stream_key)
+            if resolved is not None:
+                workspace.x_axis = resolved
+
+    def _workspace_x_axis(self, workspace: WorkspaceRuntime) -> ResolvedStreamAxis:
+        """The sample axis a fit against ``__sample_index__`` should use.
+
+        Seam for per-frame metadata: when a driver reports the sample period
+        and record start time alongside each frame (see
+        PXIE_PER_FRAME_METADATA_PLAN.md), override the workspace-level axis
+        from the current frame here. Nothing else in the fit path needs to
+        change.
+        """
+        return workspace.x_axis
+
     def _execute_workspace_fit_curve_1d(
         self,
         *,
@@ -4217,12 +4643,17 @@ class StreamAnalysisProcess(ManagedProcessBase):
     ) -> dict[str, Any] | None:
         y_raw = values.get(node.inputs["y"])
         x_input = str(node.inputs.get("x") or "").strip()
+        axis: ResolvedStreamAxis | None = None
         if x_input == SAMPLE_INDEX_INPUT_TOKEN:
+            axis = self._workspace_x_axis(workspace)
+            if axis.source == "unresolved":
+                # A declared physical axis must never silently change units to
+                # sample indices. No fit is safer than a numerically plausible
+                # result with the wrong coordinate system.
+                return None
             y_trace = _coerce_trace(y_raw)
             x_raw = (
-                np.arange(int(y_trace.size), dtype=np.float64)
-                if y_trace is not None
-                else None
+                axis_values(axis, int(y_trace.size)) if y_trace is not None else None
             )
         else:
             x_raw = values.get(node.inputs["x"])
@@ -4236,6 +4667,7 @@ class StreamAnalysisProcess(ManagedProcessBase):
             x_raw=x_raw,
             y_raw=y_raw,
             gate_raw=1.0 if gate_open else 0.0,
+            axis=axis,
         )
 
     def _execute_workspace_fit_from_hist(
@@ -5225,6 +5657,9 @@ class StreamAnalysisProcess(ManagedProcessBase):
             if isinstance(state, TraceRollingMeanState):
                 state.reset()
                 continue
+            if isinstance(state, TraceBlockAverageState):
+                state.reset()
+                continue
             if isinstance(state, FitCurve1DState):
                 state.reset()
                 continue
@@ -5244,6 +5679,9 @@ class StreamAnalysisProcess(ManagedProcessBase):
             state.reset()
             return True
         if isinstance(state, TraceRollingMeanState):
+            state.reset()
+            return True
+        if isinstance(state, TraceBlockAverageState):
             state.reset()
             return True
         if isinstance(state, FitCurve1DState):
@@ -5290,7 +5728,7 @@ class StreamAnalysisProcess(ManagedProcessBase):
                         "message": "expected_revision must be a non-negative integer",
                     },
                 }
-        runtime = self._put_workspace_from_config(
+        runtime, reset_node_ids = self._put_workspace_from_config(
             dict(payload),
             expected_revision=expected_revision,
             mark_dirty=True,
@@ -5301,6 +5739,11 @@ class StreamAnalysisProcess(ManagedProcessBase):
             "result": {
                 "workspace": self._workspace_summary(runtime),
                 "raw": runtime.raw_config,
+                # Stateful nodes that lost their accumulator in this apply.
+                # Not part of the workspace summary: it describes a single
+                # transition, not the workspace, and `workspace.list` would
+                # have nothing meaningful to put here.
+                "state_reset_node_ids": list(reset_node_ids),
             },
         }
 
@@ -5351,6 +5794,11 @@ class StreamAnalysisProcess(ManagedProcessBase):
                 "stream_analysis.operators",
                 params=None,
                 doc="List available DAG operators.",
+            ),
+            method(
+                "stream_analysis.stream_axis.refresh",
+                params=None,
+                doc="Re-resolve every workspace's stream x axis from the device.",
             ),
             method(
                 "stream_analysis.workspace.list", params=None, doc="List workspaces."
@@ -5477,6 +5925,9 @@ class StreamAnalysisProcess(ManagedProcessBase):
 
     def _rpc_stream_analysis_operators(self, req: Json) -> Json:
         return self.rpc_ok(req, result={"operators": operator_catalog_payload()})
+
+    def _rpc_stream_analysis_stream_axis_refresh(self, req: Json) -> Json:
+        return self.rpc_ok(req, result={"axes": self._refresh_stream_axes()})
 
     def _rpc_stream_analysis_workspace_list(self, req: Json) -> Json:
         return self.rpc_ok(
@@ -5638,6 +6089,9 @@ class StreamAnalysisProcess(ManagedProcessBase):
             "process.capabilities": self._rpc_stream_analysis_capabilities,
             "stream_analysis.status": self._rpc_stream_analysis_status,
             "stream_analysis.operators": self._rpc_stream_analysis_operators,
+            "stream_analysis.stream_axis.refresh": (
+                self._rpc_stream_analysis_stream_axis_refresh
+            ),
             "stream_analysis.workspace.list": self._rpc_stream_analysis_workspace_list,
             "stream_analysis.workspace_store.status": self._rpc_stream_analysis_workspace_store_status,
             "stream_analysis.workspace.get": self._rpc_stream_analysis_workspace_get,
@@ -5731,6 +6185,12 @@ class StreamAnalysisProcess(ManagedProcessBase):
                 events = self._poll_and_drain(200)
                 if events.get(self._sub) == zmq.POLLIN:
                     self._drain_sub()
+                now = time.monotonic()
+                if now >= self._stream_axis_next_refresh:
+                    self._stream_axis_next_refresh = (
+                        now + self._stream_axis_refresh_s
+                    )
+                    self._refresh_active_stream_axes()
         finally:
             self.close()
 

@@ -16,6 +16,18 @@ import {
 
 export const SPECIAL_SAMPLE_INDEX_INPUT = "__sample_index__";
 
+/**
+ * Model choices used before the operator catalog resolves, or if it fails.
+ *
+ * The backend registry is the source of truth and is served through
+ * `/api/stream/operators`; see `mergeOpParamChoices`. Keep this list minimal
+ * -- it only has to keep the editor usable while the fetch is in flight.
+ */
+export const FALLBACK_FIT_MODEL_OPTIONS: Array<{ value: string; label: string }> = [
+  { value: "gaussian", label: "gaussian" },
+  { value: "lorentzian", label: "lorentzian" },
+];
+
 export const STREAM_DAG_OPS: Record<StreamDagOpId, StreamDagOpDef> = {
   "source.stream": {
     label: "source.stream",
@@ -131,6 +143,12 @@ export const STREAM_DAG_OPS: Record<StreamDagOpId, StreamDagOpDef> = {
     outputKind: "trace",
     params: [{ name: "window_traces", label: "window_traces", kind: "integer" }],
   },
+  "trace.block_average": {
+    label: "trace.block_average",
+    inputs: ["trace"],
+    outputKind: "trace",
+    params: [{ name: "block_traces", label: "block_traces", kind: "integer" }],
+  },
   "trace.decimate": {
     label: "trace.decimate",
     inputs: ["trace"],
@@ -196,10 +214,7 @@ export const STREAM_DAG_OPS: Record<StreamDagOpId, StreamDagOpDef> = {
         label: "model",
         kind: "string",
         optional: true,
-        options: [
-          { value: "gaussian", label: "gaussian" },
-          { value: "lorentzian", label: "lorentzian" },
-        ],
+        options: FALLBACK_FIT_MODEL_OPTIONS,
       },
       {
         name: "baseline_mode",
@@ -220,6 +235,7 @@ export const STREAM_DAG_OPS: Record<StreamDagOpId, StreamDagOpDef> = {
         kind: "integer",
         optional: true,
       },
+      { name: "t0_s", label: "t0_s", kind: "number", optional: true },
     ],
   },
   "fit.yhat": {
@@ -293,10 +309,7 @@ export const STREAM_DAG_OPS: Record<StreamDagOpId, StreamDagOpDef> = {
         label: "model",
         kind: "string",
         optional: true,
-        options: [
-          { value: "gaussian", label: "gaussian" },
-          { value: "lorentzian", label: "lorentzian" },
-        ],
+        options: FALLBACK_FIT_MODEL_OPTIONS,
       },
       {
         name: "baseline_mode",
@@ -317,6 +330,7 @@ export const STREAM_DAG_OPS: Record<StreamDagOpId, StreamDagOpDef> = {
         kind: "integer",
         optional: true,
       },
+      { name: "t0_s", label: "t0_s", kind: "number", optional: true },
       {
         name: "chi2_sigma_source",
         label: "chi2_sigma_source",
@@ -406,6 +420,7 @@ export const STREAM_DAG_INPUT_KINDS: Record<
   "trace.multiply_scalar": { trace: "trace", scalar: "scalar" },
   "trace.divide_scalar": { trace: "trace", scalar: "scalar" },
   "trace.rolling_mean": { trace: "trace" },
+  "trace.block_average": { trace: "trace" },
   "trace.decimate": { trace: "trace" },
   "trace.crop": { trace: "trace" },
   "trace.window_mean": { trace: "trace" },
@@ -468,6 +483,9 @@ export function defaultParamsForOp(op: StreamDagOpId): Record<string, unknown> {
   }
   if (op === "trace.rolling_mean") {
     return { window_traces: 1 };
+  }
+  if (op === "trace.block_average") {
+    return { block_traces: 8 };
   }
   if (op === "trace.decimate") {
     return { method: "minmax", target_points: DEFAULT_TRACE_MAX_POINTS };
@@ -567,9 +585,13 @@ export function cloneDagNodes(nodes: StreamDagNodeConfig[]): StreamDagNodeConfig
 }
 
 export function cloneDagOutputs(outputs: StreamDagOutputConfig[]): StreamDagOutputConfig[] {
+  // Every field must be copied here: this clone feeds the editor draft
+  // and the draft is what gets written back, so a dropped field is a
+  // field silently deleted from the stored workspace on the next save.
   return outputs.map((output) => ({
     outputId: output.outputId,
     nodeId: output.nodeId,
+    ...(output.label ? { label: output.label } : {}),
   }));
 }
 
@@ -634,13 +656,20 @@ export function normalizeDagOutput(raw: unknown): StreamDagOutputConfig | null {
   if (!raw || typeof raw !== "object") {
     return null;
   }
-  const obj = raw as { outputId?: unknown; output_id?: unknown; nodeId?: unknown; node_id?: unknown };
+  const obj = raw as {
+    outputId?: unknown;
+    output_id?: unknown;
+    nodeId?: unknown;
+    node_id?: unknown;
+    label?: unknown;
+  };
   const outputId = String(obj.outputId ?? obj.output_id ?? "").trim();
   const nodeId = String(obj.nodeId ?? obj.node_id ?? "").trim();
   if (!outputId || !nodeId) {
     return null;
   }
-  return { outputId, nodeId };
+  const label = typeof obj.label === "string" ? obj.label.trim() : "";
+  return label ? { outputId, nodeId, label } : { outputId, nodeId };
 }
 
 export function coerceDagParamValue(raw: unknown, kind: StreamDagParamField["kind"]): unknown {
@@ -669,4 +698,125 @@ export function coerceDagParamValue(raw: unknown, kind: StreamDagParamField["kin
     return text;
   }
   return kind === "integer" ? Math.trunc(value) : value;
+}
+
+
+export type OpParamChoices = Record<string, Record<string, Array<{ value: string; label: string }>>>;
+
+/**
+ * Overlay backend-declared param choices onto the static op table.
+ *
+ * Only the `options` of params the static table already declares are
+ * replaced: no op, param, or field ordering is ever introduced from the
+ * catalog, so a backend that grows an operator cannot reshape the editor
+ * without a matching frontend change.
+ *
+ * `currentValues` maps opId -> the values currently set on nodes of that op.
+ * Any value not present in the incoming choices is appended as a synthetic
+ * option. Without that, a workspace saved with a model this UI has not
+ * heard of would render as the first option -- silently misreporting the
+ * fit that is actually running.
+ */
+export function mergeOpParamChoices(
+  base: Record<StreamDagOpId, StreamDagOpDef>,
+  fetched: OpParamChoices,
+  currentValues?: Record<string, string[]>
+): Record<StreamDagOpId, StreamDagOpDef> {
+  const ops = Object.keys(base) as StreamDagOpId[];
+  let changed = false;
+  const out = {} as Record<StreamDagOpId, StreamDagOpDef>;
+
+  for (const op of ops) {
+    const def = base[op];
+    const fetchedForOp = fetched[op];
+    const currentForOp = currentValues?.[op] ?? [];
+    if (!fetchedForOp && currentForOp.length === 0) {
+      out[op] = def;
+      continue;
+    }
+
+    let opChanged = false;
+    const params = def.params.map((field) => {
+      const incoming = fetchedForOp?.[field.name];
+      const hasStaticOptions = Array.isArray(field.options) && field.options.length > 0;
+      // Never turn a free-text field into a dropdown from catalog data alone.
+      if (!hasStaticOptions) return field;
+
+      const merged = incoming && incoming.length > 0 ? incoming : field.options ?? [];
+      const withCurrent = [...merged];
+      for (const value of currentForOp) {
+        if (!value) continue;
+        if (withCurrent.some((option) => option.value === value)) continue;
+        withCurrent.push({ value, label: `${value} (unknown)` });
+      }
+      const same =
+        withCurrent.length === (field.options?.length ?? 0) &&
+        withCurrent.every(
+          (option, i) =>
+            option.value === field.options?.[i]?.value &&
+            option.label === field.options?.[i]?.label
+        );
+      if (same) return field;
+      opChanged = true;
+      return { ...field, options: withCurrent };
+    });
+
+    if (!opChanged) {
+      out[op] = def;
+      continue;
+    }
+    changed = true;
+    out[op] = { ...def, params };
+  }
+
+  return changed ? out : base;
+}
+
+/** Extract `{opId: [values]}` for the params that render as dropdowns. */
+export function collectNodeParamValues(
+  nodes: Array<{ op: string; params: Record<string, unknown> }>
+): Record<string, string[]> {
+  const out: Record<string, string[]> = {};
+  for (const node of nodes) {
+    const def = (STREAM_DAG_OPS as Record<string, StreamDagOpDef>)[node.op];
+    if (!def) continue;
+    for (const field of def.params) {
+      if (!Array.isArray(field.options) || field.options.length === 0) continue;
+      const raw = node.params?.[field.name];
+      if (typeof raw !== "string" || !raw.trim()) continue;
+      const bucket = (out[node.op] ??= []);
+      if (!bucket.includes(raw.trim())) bucket.push(raw.trim());
+    }
+  }
+  return out;
+}
+
+/** Parse the `/api/stream/operators` payload into a choices map. */
+export function parseOperatorCatalogChoices(operators: unknown): OpParamChoices {
+  const out: OpParamChoices = {};
+  if (!Array.isArray(operators)) return out;
+  for (const entry of operators) {
+    if (!entry || typeof entry !== "object") continue;
+    const op = (entry as { op?: unknown }).op;
+    if (typeof op !== "string" || !op) continue;
+    const params = (entry as { params?: unknown }).params;
+    if (!Array.isArray(params)) continue;
+    for (const param of params) {
+      if (!param || typeof param !== "object") continue;
+      const name = (param as { name?: unknown }).name;
+      const choices = (param as { choices?: unknown }).choices;
+      if (typeof name !== "string" || !name || !Array.isArray(choices)) continue;
+      const parsed: Array<{ value: string; label: string }> = [];
+      for (const choice of choices) {
+        if (!choice || typeof choice !== "object") continue;
+        const value = (choice as { value?: unknown }).value;
+        if (typeof value !== "string" || !value) continue;
+        const label = (choice as { label?: unknown }).label;
+        parsed.push({ value, label: typeof label === "string" && label ? label : value });
+      }
+      if (parsed.length === 0) continue;
+      (out[op] ??= {})[name] = parsed;
+    }
+  }
+  return out;
 }

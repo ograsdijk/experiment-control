@@ -1,5 +1,5 @@
 import { Card } from "@mantine/core";
-import type { CSSProperties, ReactNode } from "react";
+import type { CSSProperties, PointerEvent as ReactPointerEvent, ReactNode } from "react";
 import { SortableItem } from "./SortableItem";
 
 type ReorderableCardShellProps = {
@@ -12,6 +12,15 @@ type ReorderableCardShellProps = {
   dataPanelCardId?: string;
   dataDeviceCardId?: string;
   observeRef?: (node: HTMLElement | null) => void;
+  /**
+   * Denser padding for cards whose content should dominate (plot cards).
+   * Also thins the edge drag handles: they sit *inside* the padding, so
+   * 8px strips under 12px padding would swallow clicks on anything the
+   * content places near an edge.
+   */
+  dense?: boolean;
+  onPointerDownCapture?: (event: ReactPointerEvent<HTMLDivElement>) => void;
+  onPointerUp?: (event: ReactPointerEvent<HTMLDivElement>) => void;
 };
 
 export function ReorderableCardShell({
@@ -24,6 +33,9 @@ export function ReorderableCardShell({
   dataPanelCardId,
   dataDeviceCardId,
   observeRef,
+  dense = false,
+  onPointerDownCapture,
+  onPointerUp,
 }: ReorderableCardShellProps) {
   return (
     <SortableItem id={id} data={data}>
@@ -33,11 +45,13 @@ export function ReorderableCardShell({
             setNodeRef(node);
             observeRef?.(node);
           }}
-          className={className}
+          className={dense ? `${className} reorderable-card-dense` : className}
           radius="lg"
-          p="md"
+          p={dense ? "sm" : "md"}
           data-panel-card-id={dataPanelCardId}
           data-device-card-id={dataDeviceCardId}
+          onPointerDownCapture={onPointerDownCapture}
+          onPointerUp={onPointerUp}
           style={{
             ...style,
             ...sortableStyle,

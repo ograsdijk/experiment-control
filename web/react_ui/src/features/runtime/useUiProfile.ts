@@ -26,6 +26,7 @@ import {
   normalizeStreamWorkspaceRecord,
 } from "../stream/workspace";
 import { useStreamAnalysis } from "../stream_analysis/StreamAnalysisContext";
+import type { StreamWorkspaceSyncResult } from "../stream_analysis/useWorkspaceListManagement";
 
 /**
  * UI profile import / export — the full save / restore path for the
@@ -73,7 +74,7 @@ export interface UiProfileArgs {
   syncStreamAnalysisWorkspace: (
     workspaceId: string,
     source: string
-  ) => Promise<void>;
+  ) => Promise<StreamWorkspaceSyncResult>;
   loadStreamAnalysisWorkspaces: (
     source: string,
     options?: { notifyOnError?: boolean }

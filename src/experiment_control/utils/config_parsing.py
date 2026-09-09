@@ -28,6 +28,11 @@ def _fmt_path(parts: Iterable[str | int]) -> str:
     return "".join(out) if out else "<root>"
 
 
+def fmt_path(parts: Iterable[str | int]) -> str:
+    """Public alias for path formatting, for modules building their own errors."""
+    return _fmt_path(parts)
+
+
 def _err(parts: list[str | int], msg: str) -> ConfigError:
     return ConfigError(path=_fmt_path(parts), message=msg)
 

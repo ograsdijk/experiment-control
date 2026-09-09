@@ -35,6 +35,15 @@ type StreamRawPanelProps = {
   colorScheme: "light" | "dark";
   plotHeight?: number;
   units?: string | null;
+  /**
+   * Sample-axis description. Only the axis label and tick values are
+   * scaled: the plotted x data stays in sample indices, because
+   * decimation, overlays and cursor lookups all index by sample.
+   */
+  xUnits?: string | null;
+  xLabel?: string | null;
+  xIncrement?: number | null;
+  xOrigin?: number | null;
   extraSeries?: StreamExtraSeries[];
   yScaleMode?: "auto" | "manual";
   yMin?: number | null;
@@ -286,6 +295,10 @@ export function StreamRawPanel({
   colorScheme,
   plotHeight = 320,
   units,
+  xUnits,
+  xLabel,
+  xIncrement,
+  xOrigin,
   extraSeries = [],
   yScaleMode = "auto",
   yMin = null,
@@ -363,6 +376,13 @@ export function StreamRawPanel({
     const axisStroke = isDark ? "#e8e2d7" : "#3c372f";
     const gridStroke = isDark ? "rgba(255, 255, 255, 0.12)" : "rgba(0, 0, 0, 0.08)";
     const tickStroke = isDark ? "rgba(255, 255, 255, 0.35)" : "rgba(0, 0, 0, 0.25)";
+    const xScale = Number(xIncrement);
+    const xOriginValue = Number(xOrigin ?? 0);
+    const hasXScale =
+      Number.isFinite(xScale) && xScale !== 0 && xScale !== 1 && Number.isFinite(xOriginValue);
+    const xAxisLabel = hasXScale
+      ? xLabel || (xUnits ? `time (${xUnits})` : "time")
+      : "sample index";
     const width = hostRef.current.clientWidth || 600;
     const opts: uPlot.Options = {
       width,
@@ -381,11 +401,14 @@ export function StreamRawPanel({
       legend: { show: false, live: false },
       axes: [
         {
-          label: "sample index",
+          label: xAxisLabel,
           stroke: axisStroke,
           grid: { stroke: gridStroke },
           ticks: { stroke: tickStroke },
-          values: (_u, vals) => vals.map((v) => String(Math.trunc(Number(v)))),
+          values: (_u, vals) =>
+            hasXScale
+              ? vals.map((v) => formatNumber(xOriginValue + xScale * Number(v)))
+              : vals.map((v) => String(Math.trunc(Number(v)))),
         },
         {
           label: units ?? "",
@@ -416,6 +439,10 @@ export function StreamRawPanel({
     series,
     isDark,
     units,
+    xUnits,
+    xLabel,
+    xIncrement,
+    xOrigin,
     formatNumber,
     hasManualY,
     plotHeight,

@@ -35,6 +35,58 @@ import {
   normalizeYScaleMode,
 } from "../stream/utils";
 
+/** Card sizing bounds. A pinned plot below MIN_PANEL_HEIGHT_PX is unreadable;
+ * above MAX it stops being a grid. colSpan is clamped by the grid at render. */
+export const MIN_PANEL_HEIGHT_PX = 160;
+export const MAX_PANEL_HEIGHT_PX = 1200;
+export const MAX_PANEL_COL_SPAN = 4;
+
+/**
+ * Per-panel card layout, absent for every panel saved before card sizing
+ * existed. Absent stays absent — it means "follow the grid", which is not
+ * the same as an explicit height that happens to equal the default.
+ */
+/** Trace renames, keyed by legend identity. Empty and non-string values are
+ * dropped rather than persisted, so a cleared rename returns to the derived
+ * name instead of pinning an empty string. */
+export function normalizeSeriesLabels(raw: unknown): Record<string, string> {
+  const out: Record<string, string> = {};
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return out;
+  }
+  for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (typeof value !== "string") {
+      continue;
+    }
+    const label = value.trim();
+    const seriesKey = key.trim();
+    if (seriesKey && label) {
+      out[seriesKey] = label;
+    }
+  }
+  return out;
+}
+
+function normalizePanelLayout(raw: {
+  heightPx?: unknown;
+  colSpan?: unknown;
+}): { heightPx?: number | null; colSpan?: number } {
+  const out: { heightPx?: number | null; colSpan?: number } = {};
+  if (typeof raw.heightPx === "number" && Number.isFinite(raw.heightPx)) {
+    out.heightPx = Math.min(
+      MAX_PANEL_HEIGHT_PX,
+      Math.max(MIN_PANEL_HEIGHT_PX, Math.round(raw.heightPx))
+    );
+  }
+  if (typeof raw.colSpan === "number" && Number.isFinite(raw.colSpan)) {
+    const span = Math.round(raw.colSpan);
+    if (span > 1) {
+      out.colSpan = Math.min(MAX_PANEL_COL_SPAN, span);
+    }
+  }
+  return out;
+}
+
 export function normalizePlotState(
   raw: unknown,
   opts?: { defaultWindowS?: number }
@@ -108,6 +160,10 @@ export function normalizePlotState(
       yOffsetValue?: unknown;
       smoothingMode?: unknown;
       smoothingWindowS?: unknown;
+      heightPx?: unknown;
+      colSpan?: unknown;
+      seriesLabels?: unknown;
+      titleAuto?: unknown;
     };
     const id = typeof panel.id === "string" ? panel.id : "";
     if (!id) {
@@ -117,6 +173,18 @@ export function normalizePlotState(
       typeof panel.title === "string" && panel.title.trim().length > 0
         ? panel.title
         : id;
+    const layout = normalizePanelLayout(panel);
+    const seriesLabels = normalizeSeriesLabels(panel.seriesLabels);
+    // No flag means the title predates auto-titling, or was typed: either
+    // way it is the user's and must never be regenerated.
+    const naming: { seriesLabels?: Record<string, string>; titleAuto?: true } =
+      {};
+    if (Object.keys(seriesLabels).length > 0) {
+      naming.seriesLabels = seriesLabels;
+    }
+    if (panel.titleAuto === true) {
+      naming.titleAuto = true;
+    }
     const kindRaw = String(panel.kind ?? "").trim();
     const kind: PanelKind =
       kindRaw === "stream_raw" ||
@@ -211,6 +279,8 @@ export function normalizePlotState(
       const baseTrace = {
         id,
         title,
+        ...layout,
+        ...naming,
         sourceMode,
         stream: streamTarget,
         overlayCount,
@@ -290,6 +360,8 @@ export function normalizePlotState(
       panels.push({
         id,
         title,
+        ...layout,
+        ...naming,
         kind: "stream_scalar",
         workspaceId,
         outputId: outputIdRaw || null,
@@ -317,6 +389,8 @@ export function normalizePlotState(
       panels.push({
         id,
         title,
+        ...layout,
+        ...naming,
         kind: "stream_params",
         workspaceId,
         outputIds,
@@ -378,6 +452,8 @@ export function normalizePlotState(
       panels.push({
         id,
         title,
+        ...layout,
+        ...naming,
         kind: "stream_bin_stats",
         workspaceId,
         outputId: outputIdRaw || null,
@@ -431,6 +507,8 @@ export function normalizePlotState(
       panels.push({
         id,
         title,
+        ...layout,
+        ...naming,
         kind: "stream_bin2d",
         workspaceId,
         outputId: outputIdRaw || null,
@@ -476,6 +554,8 @@ export function normalizePlotState(
     panels.push({
       id,
       title,
+      ...layout,
+      ...naming,
       kind: "telemetry",
       traces,
       timeWindowS,

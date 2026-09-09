@@ -1,0 +1,24 @@
+version: 1
+device_id: freq1
+telemetry_period_s: 0.2
+driver:
+  module: experiment_control.drivers.dummy_frequency_noise_driver
+  class_name: DummyFrequencyNoiseDriver
+init_kwargs:
+  port: 12345
+  initial_frequency_hz: 1000000000.0
+  noise_sigma_hz: 150000.0
+telemetry_calls:
+  - method: read_frequency_setpoint_hz
+    outputs:
+      - signal: frequency_setpoint_hz
+        kind: scalar
+        units: Hz
+        dtype: float64
+  - method: read_frequency_hz
+    outputs:
+      - signal: frequency_hz
+        kind: scalar
+        units: Hz
+        dtype: float64
+

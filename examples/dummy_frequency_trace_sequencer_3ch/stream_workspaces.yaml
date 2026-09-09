@@ -67,6 +67,8 @@ workspaces:
       node_id: integral
     - output_id: bin_stats
       node_id: bin
+    - output_id: fit_1d
+      node_id: node_6
     - output_id: fit_curve
       node_id: fit
     - output_id: out_3

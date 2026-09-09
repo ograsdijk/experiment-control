@@ -7,11 +7,16 @@ import type {
   PlotStreamPanelState,
   PlotStreamWaterfallPanelState,
   PlotTelemetryPanelState,
+  StreamTraceAverageMode,
+  StreamTraceDecimator,
+  StreamTraceSourceMode,
   TelemetrySmoothingMode,
   YDisplayMode,
   YOffsetMode,
   YScaleMode,
 } from "../stream/types";
+import type { Bin2dReducer } from "../../components/StreamBin2dPanel";
+import type { UncertaintyMode } from "../../components/StreamBinStatsPanel";
 import { useLayout } from "../layout/LayoutContext";
 import { PanelCard } from "./PanelCard";
 import { usePanels } from "./PanelsContext";
@@ -21,7 +26,7 @@ import { perfCount } from "../performance/perfInstrumentation";
  * Panel render loop — `<PanelsGrid>` owns the SortableContext wrapper
  * and iterates `panels`, rendering one `<PanelCard>` per entry. Each
  * card owns its own `<ReorderableCardShell>` containing the title
- * bar, plot-options popover, per-kind body, and clear/expand/remove
+ * bar, settings popover, per-kind body, and clear/expand/remove
  * actions.
  *
  * App-side handlers and overlay helpers come in via `helpers` and
@@ -59,6 +64,16 @@ export interface PanelsGridHandlers {
   commitPanelTitleEdit: () => void;
   cancelPanelTitleEdit: () => void;
   removePanel: (panelId: string) => void;
+  duplicatePanel: (panelId: string) => void;
+  setPanelLayout: (
+    panelId: string,
+    patch: { heightPx?: number | null; colSpan?: number | null }
+  ) => void;
+  setPanelSeriesLabel: (
+    panelId: string,
+    seriesKey: string,
+    label: string
+  ) => void;
   removeTraceFromPanel: (
     panelId: string,
     trace: { deviceId: string; signal: string }
@@ -92,14 +107,64 @@ export interface PanelsGridHandlers {
     outputId: string | null
   ) => void;
   openExpandedPlot: (panelId: string) => void;
-  openStreamTraceOptionsModal: (panelId: string) => void;
-  openStreamBin2dOptionsModal: (panelId: string) => void;
-  openStreamParamsOptionsModal: (panelId: string) => void;
-  openStreamBinStatsOptionsModal: (panelId: string) => void;
+  // Settings that used to live in the per-kind advanced-options modals.
+  setStreamTracePanelSourceMode: (
+    panelId: string,
+    mode: StreamTraceSourceMode
+  ) => void;
+  setStreamTracePanelWorkspace: (
+    panelId: string,
+    workspaceId: string | null
+  ) => void;
+  setStreamTracePanelOutput: (panelId: string, outputId: string | null) => void;
+  setStreamTracePanelOverlayOutputs: (
+    panelId: string,
+    outputIds: string[]
+  ) => void;
+  setStreamPanelTargetFromKey: (
+    panelId: string,
+    targetKey: string | null
+  ) => void;
+  setStreamPanelChannelIndex: (panelId: string, value: number) => void;
+  setStreamPanelChannels: (panelId: string, channels: number[]) => void;
+  setStreamPanelOverlayCount: (panelId: string, value: number) => void;
+  setStreamPanelRollingWindow: (panelId: string, value: number) => void;
+  setStreamPanelAverageMode: (
+    panelId: string,
+    mode: StreamTraceAverageMode
+  ) => void;
+  setStreamPanelTraceDecimator: (
+    panelId: string,
+    decimator: StreamTraceDecimator
+  ) => void;
+  setStreamPanelTraceMaxPoints: (panelId: string, value: number) => void;
+  setStreamPanelTraceMaxFps: (panelId: string, value: number) => void;
+  setStreamParamsPanelOutputs: (panelId: string, outputIds: string[]) => void;
+  setStreamBinStatsOverlayOutputs: (
+    panelId: string,
+    outputIds: string[]
+  ) => void;
+  setStreamBinStatsFitOverlayOutputs: (
+    panelId: string,
+    outputIds: string[]
+  ) => void;
+  setStreamBinStatsUncertainty: (
+    panelId: string,
+    mode: UncertaintyMode,
+    scale: number
+  ) => void;
+  setStreamBinStatsShowBinMarkers: (panelId: string, show: boolean) => void;
+  setStreamBinStatsXAxisTransform: (
+    panelId: string,
+    xOffset: number,
+    xScale: number
+  ) => void;
+  setStreamBin2dReducer: (panelId: string, reducer: Bin2dReducer) => void;
 }
 
 export interface PanelsGridProps {
   streamWorkspaceOptions: Array<{ value: string; label: string }>;
+  streamTargetOptions: Array<{ value: string; label: string }>;
   yAxisDraftInvalid: boolean;
   streamWsConnected: boolean;
   streamAnalysisWsConnected: boolean;
@@ -110,6 +175,7 @@ export interface PanelsGridProps {
 
 export function PanelsGrid({
   streamWorkspaceOptions,
+  streamTargetOptions,
   yAxisDraftInvalid,
   streamWsConnected,
   streamAnalysisWsConnected,
@@ -136,6 +202,7 @@ export function PanelsGrid({
             key={panel.id}
             panel={panel}
             streamWorkspaceOptions={streamWorkspaceOptions}
+            streamTargetOptions={streamTargetOptions}
             yAxisDraftInvalid={yAxisDraftInvalid}
             streamWsConnected={streamWsConnected}
             streamAnalysisWsConnected={streamAnalysisWsConnected}
