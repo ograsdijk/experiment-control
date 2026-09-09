@@ -1,4 +1,4 @@
-﻿import type { Bin2dReducer, StreamBin2dSeries } from "../../components/StreamBin2dPanel";
+import type { Bin2dReducer, StreamBin2dSeries } from "../../components/StreamBin2dPanel";
 import type {
   StreamBinStatsSeries,
   UncertaintyMode,
@@ -23,6 +23,7 @@ export type StreamDagOpId =
   | "trace.block_average"
   | "trace.decimate"
   | "trace.crop"
+  | "trace.window_mean"
   | "trace.subtract_background"
   | "trace.integrate"
   | "trace.scale"
@@ -35,6 +36,8 @@ export type StreamDagOpId =
   | "fit.params"
   | "fit.from_hist_agg"
   | "aggregate.bin_stats"
+  | "aggregate.bin_ratio_stats"
+  | "hist.divide"
   | "aggregate.bin2d_stats";
 
 export type StreamDagOutputKind =

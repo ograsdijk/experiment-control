@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import enum
 import inspect
 import typing
@@ -46,6 +47,30 @@ def _parse_simple_annotation(annotation: str | None) -> str | None:
             if parts == {base, "none"}:
                 return base
     return None
+
+
+def _parse_literal_annotation(annotation: str | None) -> tuple[object, ...] | None:
+    """Parse simple ``Literal[...]`` values without coercing RPC input."""
+    if not annotation:
+        return None
+    text = annotation.strip()
+    bracket = text.find("[")
+    if bracket <= 0 or not text.endswith("]"):
+        return None
+    if text[:bracket].split(".")[-1].lower() != "literal":
+        return None
+    inner = text[bracket + 1 : -1].strip()
+    if not inner:
+        return None
+    try:
+        values = ast.literal_eval(f"({inner},)")
+    except (SyntaxError, ValueError):
+        return None
+    if not isinstance(values, tuple):
+        return None
+    if not all(value is None or isinstance(value, (bool, int, float, str)) for value in values):
+        return None
+    return values
 
 
 def _has_simple_annotation(annotation: str | None) -> bool:

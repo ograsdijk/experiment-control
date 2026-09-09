@@ -1,4 +1,4 @@
-﻿import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { ActionIcon, Group, Text } from "@mantine/core";
 import { IconZoomIn, IconZoomOut, IconZoomReset } from "@tabler/icons-react";
 
@@ -44,9 +44,12 @@ const DAG_INPUT_PORTS: Record<string, string[]> = {
   "trace.multiply_scalar": ["trace", "scalar"],
   "trace.divide_scalar": ["trace", "scalar"],
   "trace.crop": ["trace"],
+  "trace.window_mean": ["trace"],
   "trace.subtract_background": ["trace"],
   "trace.integrate": ["trace"],
   "aggregate.bin_stats": ["x", "y"],
+  "aggregate.bin_ratio_stats": ["x", "numerator", "denominator"],
+  "hist.divide": ["numerator", "denominator"],
   "aggregate.bin2d_stats": ["x", "y", "z"],
 };
 
@@ -57,7 +60,7 @@ function nodeColor(op: string): string {
   if (op.startsWith("trace.")) {
     return "#059669";
   }
-  if (op.startsWith("aggregate.")) {
+  if (op.startsWith("aggregate.") || op.startsWith("hist.")) {
     return "#b45309";
   }
   return "#475569";
