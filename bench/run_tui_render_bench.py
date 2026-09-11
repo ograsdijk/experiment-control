@@ -24,7 +24,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import gc
-import queue
 import sys
 import time
 from typing import Any, Callable
@@ -54,6 +53,8 @@ def _make_app() -> ManagerTUI:
     # during on_mount and the snapshot/log-tail paths.
     app._rpc_call = lambda *a, **k: None  # type: ignore[method-assign]
     app._load_manager_log_tail_bootstrap = lambda *a, **k: None  # type: ignore[method-assign]
+    app._rpc_submit = lambda *a, **k: None  # type: ignore[method-assign]
+    app._background_rpc_submit = lambda *a, **k: None  # type: ignore[method-assign]
     return app
 
 
@@ -337,6 +338,29 @@ async def bench_devices_table(rows: list[Row], pilot: Any, app: ManagerTUI) -> N
         await pilot.pause()
 
 
+async def bench_resource_navigator(rows: list[Row], pilot: Any, app: ManagerTUI) -> None:
+    print()
+    print("== render: unified resource navigator (steady-state keyed diff) ==")
+    print(_HEADER)
+    for n in (20, 100):
+        _seed_devices(app, n)
+        app._processes = [
+            {"process_id": f"proc{i:03d}", "state": "RUNNING", "hb_age_s": 0.2}
+            for i in range(max(1, n // 5))
+        ]
+        app._resource_order = []
+        app._render_resources_table()
+        r = _time_sync(
+            "resource_navigator: unchanged keyed diff",
+            f"{n + len(app._processes)} resources",
+            app._render_resources_table,
+            iters=400,
+        )
+        rows.append(r)
+        print(r.fmt())
+        await pilot.pause()
+
+
 async def bench_drain(rows: list[Row], pilot: Any, app: ManagerTUI) -> None:
     print()
     print("== drain: _drain_pub_queue (full cycle, busy mix) ==")
@@ -357,25 +381,19 @@ async def bench_drain(rows: list[Row], pilot: Any, app: ManagerTUI) -> None:
             app._pub_drain_max = batch
             # warmup
             for w in range(3):
-                for msg in _make_pub_batch(
+                for topic, payload in _make_pub_batch(
                     batch, ids, m_signals, offset=-(w + 1) * batch, log_severity=sev
                 ):
-                    try:
-                        app._pub_queue.put_nowait(msg)
-                    except queue.Full:
-                        break
+                    app._enqueue_pub_message(topic, payload)
                 app._drain_pub_queue()
             gc.collect()
             iters = 300
             total = 0.0
             for it in range(iters):
-                for msg in _make_pub_batch(
+                for topic, payload in _make_pub_batch(
                     batch, ids, m_signals, offset=it * batch, log_severity=sev
                 ):
-                    try:
-                        app._pub_queue.put_nowait(msg)
-                    except queue.Full:
-                        break
+                    app._enqueue_pub_message(topic, payload)
                 t0 = time.perf_counter()
                 app._drain_pub_queue()
                 total += time.perf_counter() - t0
@@ -399,6 +417,7 @@ ALL_BENCHES: dict[str, Callable[[list[Row], Any, ManagerTUI], Any]] = {
     "device_inspector": bench_device_inspector,
     "members_table": bench_members_table,
     "devices_table": bench_devices_table,
+    "resource_navigator": bench_resource_navigator,
     "drain": bench_drain,
 }
 

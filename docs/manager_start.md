@@ -178,13 +178,22 @@ Notes:
 - `process_order` is optional. If omitted, `hdf_writer` is started first if present.
 - If `tui.enabled: true`, the stack runner starts a manager subprocess and runs the TUI in the same terminal.
 - When the TUI exits, the runner sends `manager.control.shutdown` and then terminates the manager subprocess.
-- TUI event log memory is bounded by `tui.event_log_max_lines` (oldest lines are trimmed).
+- The TUI uses one alphabetically stable resource navigator for devices and managed processes.
+  Press `/` to search, `u` to show only failures, and `1`/`2`/`3` to switch the selected
+  resource between Overview, Telemetry, and Commands.
+- Lifecycle keys remain context-sensitive (`s` start, `x` stop, `r` restart, `c` connect,
+  `d` disconnect, `v` recover). The selected target and valid actions are also shown above
+  the inspector. Uppercase `S`/`X` retain the bulk start/stop behavior for the selected kind.
+- Errors and the event log live in a collapsed Activity drawer. Press `a` to toggle it;
+  new alerts update the collapsed unread counters without opening the drawer or moving focus.
+- Below 100 columns the TUI shows either the navigator or inspector. Select a resource to
+  enter its inspector and press Escape to return to the navigator.
+- TUI event-log memory is bounded by `tui.event_log_max_lines` (oldest retained lines are trimmed).
 - `tui.event_log_default_hidden_topics` controls which topics start hidden from the TUI event log.
   Hidden topics are still ingested/processed by the TUI; they are simply not appended to the
   on-screen `RichLog` unless enabled from the Topics modal (`p`).
-- Topic toggles in the Topics modal (`p`) control **event-log writes** to `RichLog` for each topic,
-  not just post-render filtering. If a topic is off, new events for that topic are not written to
-  the `RichLog`.
+- Topic toggles in the Topics modal (`p`) control which incoming events enter the retained
+  activity log. Closing the drawer suspends widget rendering, not event retention.
 - Re-enabling a topic later resumes writing only for new incoming events (no historical backfill).
 - Set `tui.event_log_default_hidden_topics: []` to start with all topics enabled, or `null` to use
   built-in defaults.
@@ -193,7 +202,9 @@ Notes:
   `tui.pub_queue_overflow_policy`:
   - `drop_newest`: reject incoming message
   - `drop_oldest`: evict one queued message and keep incoming message
-- Press `l` in the TUI to clear the current on-screen event log buffer.
+- Press `l` in the TUI to clear both the retained and on-screen event-log buffers.
+- High-rate telemetry and heartbeat messages are coalesced to the latest value before rendering;
+  ordered logs, warnings, errors, lifecycle events, and command results are not coalesced.
 - Startup timeouts (registration / process running / online) are logged as warnings; the stack continues.
 - The `device_router` process is started automatically by the manager and is not listed under `processes:`.
 - `external.rpc_port` is the **device_router** front door; `external.pub_port` is manager PUB.

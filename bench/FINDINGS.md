@@ -145,6 +145,23 @@ A genuine new-error drain still pays one errors rebuild per cycle (`warn logs`
 ≈ 5.5 ms at batch 10) — that is real work, not waste; an incremental errors
 render would be the next step if high-rate error storms become a concern.
 
+### Operator-dashboard pass (2026-09-11)
+
+The unified navigator and bounded drain/coalescing path were measured with the
+activity drawer collapsed, which is the normal operating state:
+
+| Path | size | per call |
+|---|---:|---:|
+| unified navigator, unchanged keyed diff | 24 resources | 0.108 ms |
+| unified navigator, unchanged keyed diff | 120 resources | 0.323 ms |
+| drain, warning mix | 500 incoming messages | 4.14 ms |
+| drain, info mix | 500 incoming messages | 0.31 ms |
+
+The 500-message cases remain comfortably inside the 16 ms UI-work budget. The
+subscriber now coalesces superseded telemetry/heartbeat state by resource while
+retaining ordered logs and lifecycle events, and the closed activity drawer no
+longer pays `RichLog` or errors-table rendering cost.
+
 ## Historical headline numbers
 
 These numbers are from the first `--no-alloc` run before the trace/json improvements landed.

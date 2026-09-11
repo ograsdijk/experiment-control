@@ -15,6 +15,7 @@ from collections import deque
 from types import SimpleNamespace
 
 from experiment_control._tui.app import ManagerTUI
+from experiment_control._tui.models import DeviceStatus, ResourceView
 
 
 class _FakeTable:
@@ -192,6 +193,7 @@ class HeadlessRenderContentTests(unittest.IsolatedAsyncioTestCase):
         async with app.run_test(headless=True, size=(120, 50)) as pilot:
             app._stop_event.set()
             app.streaming_enabled = False
+            app._activity_open = True
             await pilot.pause()
 
             errors = app.query_one("#errors_table", DataTable)
@@ -332,6 +334,142 @@ class ProcessesTableFederatedBadgeTests(unittest.TestCase):
         app._has_user_process_selection = False
         app._on_process_cursor_moved(event)
         self.assertEqual(app._selected_process_id, "spb_microwave")
+
+
+class UnifiedResourceModelTests(unittest.TestCase):
+    def test_resource_key_and_search_text_cover_operator_fields(self) -> None:
+        view = ResourceView(
+            kind="device",
+            resource_id="hornet_eql",
+            health="stale",
+            state="RUNNING/CONNECTED",
+            age_s=4.2,
+            error="heartbeat overdue",
+            is_remote=True,
+            owner_peer_id="vacuum-cryo",
+        )
+        self.assertEqual(view.key, "device:hornet_eql")
+        self.assertIn("vacuum-cryo", view.searchable_text)
+        self.assertIn("heartbeat overdue", view.searchable_text)
+
+    def test_health_mapping_keeps_intentional_stops_neutral(self) -> None:
+        status = DeviceStatus(
+            device_id="d1",
+            registered=False,
+            liveness="OFFLINE",
+            hb_age_s=None,
+            telemetry_age_s=None,
+            driver_state=None,
+            device_state="DISCONNECTED",
+            device_reachable=False,
+            last_error=None,
+            driver_proc_state="STOPPED",
+            driver_pid=None,
+            driver_restart_count=0,
+            driver_last_exit_code=None,
+            driver_last_error=None,
+        )
+        self.assertEqual(ManagerTUI._device_health(status), "neutral")
+        status.liveness = "STALE"
+        self.assertEqual(ManagerTUI._device_health(status), "stale")
+        self.assertEqual(ManagerTUI._process_health({"state": "STOPPED"}), "neutral")
+        self.assertEqual(ManagerTUI._process_health({"state": "CRASHLOOP"}), "failed")
+
+
+class PubCoalescingTests(unittest.TestCase):
+    def test_latest_state_coalesces_but_logs_stay_ordered(self) -> None:
+        import queue
+        import threading
+
+        app = object.__new__(ManagerTUI)
+        app._latest_state_messages = {}
+        app._state_lock = threading.Lock()
+        app._coalesced_pub_messages = 0
+        app._pub_queue = queue.Queue(maxsize=10)
+        app._pub_queue_overflow_policy = "drop_newest"
+        app._dropped_pub_messages = 0
+
+        app._enqueue_pub_message(
+            "manager.telemetry_update", {"device_id": "d1", "signals": {"x": 1}}
+        )
+        app._enqueue_pub_message(
+            "manager.telemetry_update", {"device_id": "d1", "signals": {"x": 2}}
+        )
+        app._enqueue_pub_message("manager.log", {"message": "first"})
+        app._enqueue_pub_message("manager.log", {"message": "second"})
+
+        self.assertEqual(len(app._latest_state_messages), 1)
+        latest = app._latest_state_messages[("manager.telemetry_update", "d1")][1]
+        self.assertEqual(latest["signals"]["x"], 2)
+        self.assertEqual(app._coalesced_pub_messages, 1)
+        self.assertEqual(app._pub_queue.get_nowait()[1]["message"], "first")
+        self.assertEqual(app._pub_queue.get_nowait()[1]["message"], "second")
+
+
+class UnifiedResourceHeadlessTests(unittest.IsolatedAsyncioTestCase):
+    async def test_filter_tabs_activity_and_narrow_navigation(self) -> None:
+        from textual.widgets import DataTable, Input, TabbedContent
+
+        app = ManagerTUI(snapshot_period_s=3600.0, rpc_timeout_ms=20)
+        app._rpc_submit = lambda *a, **k: None  # type: ignore[method-assign]
+        app._background_rpc_submit = lambda *a, **k: None  # type: ignore[method-assign]
+        async with app.run_test(headless=True, size=(80, 24)) as pilot:
+            app._stop_event.set()
+            app.streaming_enabled = False
+            app._device_status = {
+                "healthy_dev": DeviceStatus(
+                    device_id="healthy_dev",
+                    registered=True,
+                    liveness="ONLINE",
+                    hb_age_s=0.2,
+                    telemetry_age_s=0.1,
+                    driver_state="RUNNING",
+                    device_state="CONNECTED",
+                    device_reachable=True,
+                    last_error=None,
+                    driver_proc_state="RUNNING",
+                    driver_pid=1,
+                    driver_restart_count=0,
+                    driver_last_exit_code=None,
+                    driver_last_error=None,
+                )
+            }
+            app._processes = [{"process_id": "bad_proc", "state": "FAILED"}]
+            app._render_resources_table()
+            table = app.query_one("#resources_table", DataTable)
+            self.assertEqual(table.row_count, 2)
+
+            app.action_toggle_unhealthy()
+            self.assertEqual(table.row_count, 1)
+            app.action_toggle_unhealthy()
+            search = app.query_one("#resource_filter", Input)
+            search.value = "healthy"
+            await pilot.pause()
+            self.assertEqual(table.row_count, 1)
+
+            app.action_inspector_commands()
+            self.assertEqual(app.query_one("#inspector_tabs", TabbedContent).active, "commands")
+            app._record_error(
+                source="process",
+                id_="bad_proc",
+                topic="manager.log",
+                message="failed",
+                severity="error",
+                fingerprint="bad-proc-failed",
+            )
+            self.assertEqual(app._activity_unread_error, 1)
+            app.action_toggle_activity()
+            self.assertTrue(app._activity_open)
+            self.assertEqual(app._activity_unread_error, 0)
+
+            app._resource_filter = ""
+            search.value = ""
+            await pilot.pause()
+            app._select_resource_key("process:bad_proc")
+            app._narrow_show_inspector = True
+            app._apply_responsive_layout(80)
+            self.assertFalse(app.query_one("#navigator").display)
+            self.assertTrue(app.query_one("#inspector").display)
 
 
 if __name__ == "__main__":

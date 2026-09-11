@@ -132,11 +132,66 @@ class ManagerTuiRpcWorkerTests(unittest.TestCase):
             app._rpc_req_q.put(None)
             t.join(timeout=1.0)
 
+    def test_background_poll_does_not_block_interactive_rpc(self) -> None:
+        app = self._make_worker_app()
+        app._bg_rpc_req_q = queue.Queue()
+        app._bg_rpc_worker_ident = None
+        background_started = threading.Event()
+        release_background = threading.Event()
+
+        def slow_background(_payload):
+            background_started.set()
+            release_background.wait(timeout=2.0)
+            return {"ok": True, "lane": "background"}
+
+        app._background_do_rpc = slow_background  # type: ignore[method-assign]
+        app._do_rpc = lambda payload: {"ok": True, "lane": "interactive"}  # type: ignore[method-assign]
+        interactive = self._start_worker(app)
+        background = threading.Thread(target=app._bg_rpc_worker_loop, daemon=True)
+        background.start()
+        try:
+            app._background_rpc_submit({"type": "device.list_status"})
+            self.assertTrue(background_started.wait(timeout=1.0))
+            got: list = []
+            app._rpc_submit({"type": "device.connect"}, got.append)
+            deadline = time.monotonic() + 0.5
+            while not got and time.monotonic() < deadline:
+                time.sleep(0.005)
+            self.assertEqual(got, [{"ok": True, "lane": "interactive"}])
+        finally:
+            release_background.set()
+            app._rpc_req_q.put(None)
+            app._bg_rpc_req_q.put(None)
+            interactive.join(timeout=1.0)
+            background.join(timeout=1.0)
+
 
 class ManagerTuiRpcTests(unittest.TestCase):
     def _build_app(self, *, rpc_timeout_ms: int = 50) -> ManagerTUI:
         app = ManagerTUI(rpc_timeout_ms=rpc_timeout_ms)
+        self.addCleanup(app._rpc.close, 0)
+        self.addCleanup(app._bg_rpc.close, 0)
         return app
+
+    def test_resource_action_pending_state_clears_on_result(self) -> None:
+        app = object.__new__(ManagerTUI)
+        app._pending_resource_actions = set()
+        refreshes: list[bool] = []
+        callbacks: list = []
+        results: list = []
+        app._refresh_selected_resource_chrome = lambda: refreshes.append(True)  # type: ignore[method-assign]
+        app._rpc_submit = lambda payload, callback=None: callbacks.append(callback)  # type: ignore[method-assign]
+
+        app._submit_resource_action(
+            resource_key="device:d1",
+            payload={"type": "device.connect", "device_id": "d1"},
+            on_result=results.append,
+        )
+        self.assertEqual(app._pending_resource_actions, {"device:d1"})
+        callbacks[0]({"ok": True})
+        self.assertEqual(app._pending_resource_actions, set())
+        self.assertEqual(results, [{"ok": True}])
+        self.assertEqual(len(refreshes), 2)
 
     def test_apply_snapshot_accepts_null_driver_restart_count(self) -> None:
         # _refresh_snapshot now runs the two status RPCs on the RPC worker and
