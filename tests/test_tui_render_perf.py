@@ -390,6 +390,29 @@ class UnifiedResourceModelTests(unittest.TestCase):
         self.assertIsInstance(pushed[0], ResultScreen)
         self.assertIn('\n  "value": [', pushed[0]._result_text)
 
+    def test_mixed_resource_sort_keeps_empty_values_last(self) -> None:
+        app = object.__new__(ManagerTUI)
+        app._resource_sort_column = "connection"
+        app._resource_sort_reverse = False
+        views = [
+            ResourceView("process", "alpha", "healthy", "RUNNING", 1.0, None),
+            ResourceView(
+                "device", "zulu", "healthy", "RUNNING", 2.0, None, "connected"
+            ),
+            ResourceView(
+                "device", "beta", "stale", "RUNNING", 3.0, "late", "stale"
+            ),
+        ]
+        self.assertEqual(
+            [view.resource_id for view in app._sort_resource_views(views)],
+            ["zulu", "beta", "alpha"],
+        )
+        app._resource_sort_reverse = True
+        self.assertEqual(
+            [view.resource_id for view in app._sort_resource_views(views)],
+            ["beta", "zulu", "alpha"],
+        )
+
 
 class ConnectAllTests(unittest.TestCase):
     @staticmethod
@@ -458,7 +481,7 @@ class PubCoalescingTests(unittest.TestCase):
 
 
 class UnifiedResourceHeadlessTests(unittest.IsolatedAsyncioTestCase):
-    async def test_filter_tabs_activity_and_narrow_navigation(self) -> None:
+    async def test_filter_tabs_activity_and_stacked_navigation(self) -> None:
         from textual.widgets import DataTable, Input, TabbedContent
 
         app = ManagerTUI(snapshot_period_s=3600.0, rpc_timeout_ms=20)
@@ -490,12 +513,36 @@ class UnifiedResourceHeadlessTests(unittest.IsolatedAsyncioTestCase):
             table = app.query_one("#resources_table", DataTable)
             self.assertEqual(table.row_count, 2)
             self.assertEqual(
-                str(table.get_row("device:healthy_dev")[2]),
+                [str(row.key.value) for row in table.ordered_rows],
+                ["device:healthy_dev", "process:bad_proc"],
+            )
+            self.assertEqual(
+                str(table.get_cell("device:healthy_dev", "connection")),
                 "● connected",
             )
             app._select_resource_key("device:healthy_dev")
             self.assertFalse(app.query_one("#action_disconnect").disabled)
             self.assertTrue(app.query_one("#action_connect").disabled)
+
+            resource_key = app._resource_column_keys["resource"]
+            resource_column = table.columns[resource_key]
+            app._on_resource_header_selected(
+                DataTable.HeaderSelected(table, resource_key, 1, resource_column.label)
+            )
+            self.assertEqual(app._resource_sort_column, "resource")
+            self.assertFalse(app._resource_sort_reverse)
+            self.assertEqual(
+                [str(row.key.value) for row in table.ordered_rows],
+                ["process:bad_proc", "device:healthy_dev"],
+            )
+            self.assertEqual(app._selected_resource_key, "device:healthy_dev")
+            self.assertEqual(resource_column.label.plain, "resource ▲")
+            app.action_resource_sort_reverse()
+            self.assertEqual(
+                [str(row.key.value) for row in table.ordered_rows],
+                ["device:healthy_dev", "process:bad_proc"],
+            )
+            self.assertEqual(resource_column.label.plain, "resource ▼")
 
             app.action_toggle_unhealthy()
             self.assertEqual(table.row_count, 1)
@@ -526,8 +573,24 @@ class UnifiedResourceHeadlessTests(unittest.IsolatedAsyncioTestCase):
             app._select_resource_key("process:bad_proc")
             app._narrow_show_inspector = True
             app._apply_responsive_layout(80)
-            self.assertFalse(app.query_one("#navigator").display)
+            self.assertTrue(app.query_one("#navigator").display)
             self.assertTrue(app.query_one("#inspector").display)
+            self.assertEqual(app.query_one("#navigator").region.x, 0)
+            self.assertEqual(app.query_one("#inspector").region.x, 0)
+            self.assertLess(
+                app.query_one("#navigator").region.y,
+                app.query_one("#inspector").region.y,
+            )
+
+            app._processes = [
+                {"process_id": f"process_{index:02d}", "state": "RUNNING"}
+                for index in range(30)
+            ]
+            app._resource_order = []
+            app._render_resources_table()
+            await pilot.pause()
+            self.assertLessEqual(app.query_one("#navigator").region.height, 16)
+            self.assertGreater(table.max_scroll_y, 0)
 
 
 if __name__ == "__main__":

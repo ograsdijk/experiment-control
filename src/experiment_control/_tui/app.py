@@ -45,16 +45,35 @@ from .screens import (
 from ..utils.zmq_helpers import json_dumps, safe_json_loads
 
 Json = dict[str, Any]
+ResourceSortColumn = Literal[
+    "kind", "resource", "connection", "health", "runtime", "age_s", "error"
+]
+
+_RESOURCE_COLUMNS: tuple[tuple[ResourceSortColumn, str], ...] = (
+    ("kind", "kind"),
+    ("resource", "resource"),
+    ("connection", "connection"),
+    ("health", "health"),
+    ("runtime", "runtime"),
+    ("age_s", "age_s"),
+    ("error", "error"),
+)
 
 class ManagerTUI(App):
     CSS = """
     #health_summary {height: 1; padding: 0 1; background: $boost;}
-    #main {height: 1fr;}
-    #navigator {width: 42; min-width: 30; border-right: solid $primary;}
+    #main {height: 1fr; layout: vertical;}
+    #navigator {
+        width: 1fr;
+        height: auto;
+        min-height: 7;
+        max-height: 16;
+        border-bottom: solid $primary;
+    }
     #resource_filter {height: 3;}
-    #resources_table {height: 1fr;}
+    #resources_table {height: auto; min-height: 3; max-height: 13;}
     #devices_table, #processes_table, #processes_title {display: none;}
-    #inspector {width: 1fr;}
+    #inspector {width: 1fr; height: 1fr;}
     #selected_resource_title {height: 1; padding: 0 1; text-style: bold;}
     #action_strip {height: 3; padding: 0 1;}
     #action_strip Button {min-width: 10; margin-right: 1;}
@@ -74,9 +93,6 @@ class ManagerTUI(App):
     }
     #activity_drawer {height: 14; display: none; border-top: solid $primary;}
     #activity_drawer.open {display: block;}
-
-    Screen.-narrow #main {layout: vertical;}
-    Screen.-narrow #navigator, Screen.-narrow #inspector {width: 1fr; height: 1fr;}
 
     InvokeMemberScreen, SetMemberScreen, ResultScreen {
         align: center middle;
@@ -149,6 +165,8 @@ class ManagerTUI(App):
         ("l", "clear_log", "Clear log"),
         ("slash", "focus_search", "Search"),
         ("u", "toggle_unhealthy", "Problems"),
+        ("o", "resource_sort_next", "Next sort"),
+        ("O", "resource_sort_reverse", "Reverse sort"),
         ("a", "toggle_activity", "Activity"),
         ("1", "inspector_overview", "Overview"),
         ("2", "inspector_telemetry", "Telemetry"),
@@ -343,6 +361,9 @@ class ManagerTUI(App):
         self._resource_views: dict[str, ResourceView] = {}
         self._resource_rows: dict[str, tuple[str, ...]] = {}
         self._resource_order: list[str] = []
+        self._resource_column_keys: dict[ResourceSortColumn, Any] = {}
+        self._resource_sort_column: ResourceSortColumn = "kind"
+        self._resource_sort_reverse = False
         self._selected_resource_key: str | None = None
         self._pending_resource_actions: set[str] = set()
         self._activity_open = False
@@ -362,7 +383,7 @@ class ManagerTUI(App):
     def compose(self) -> ComposeResult:
         yield Header()
         yield Static("Backend connecting · 0 resources", id="health_summary")
-        with Horizontal(id="main"):
+        with Vertical(id="main"):
             with Vertical(id="navigator"):
                 yield Input(placeholder="Search resources  [/]", id="resource_filter")
                 yield DataTable(id="resources_table")
@@ -466,10 +487,10 @@ class ManagerTUI(App):
 
     def _setup_tables(self) -> None:
         resources = self.query_one("#resources_table", DataTable)
-        resources.add_columns(
-            "kind", "resource", "connection", "health", "runtime", "age_s", "error"
-        )
+        for key, label in _RESOURCE_COLUMNS:
+            self._resource_column_keys[key] = resources.add_column(label, key=key)
         resources.cursor_type = "row"
+        self._update_resource_sort_headers()
 
         devices = self.query_one("#devices_table", DataTable)
         devices.add_columns(
@@ -1410,16 +1431,77 @@ class ManagerTUI(App):
                     else None,
                 )
             )
-        return sorted(views, key=lambda view: (view.resource_id.lower(), view.kind))
+        return views
+
+    @staticmethod
+    def _resource_sort_value(
+        view: ResourceView, column: ResourceSortColumn
+    ) -> str | float | None:
+        if column == "kind":
+            return view.kind
+        if column == "resource":
+            return view.resource_id.casefold()
+        if column == "connection":
+            return view.connection.casefold() if view.connection else None
+        if column == "health":
+            return view.health.casefold()
+        if column == "runtime":
+            return view.state.casefold() if view.state else None
+        if column == "age_s":
+            return view.age_s
+        return view.error.casefold() if view.error else None
+
+    def _sort_resource_views(self, views: list[ResourceView]) -> list[ResourceView]:
+        """Sort mixed resources while keeping empty cells at the end."""
+        column = self._resource_sort_column
+        populated: list[tuple[ResourceView, str | float]] = []
+        empty: list[ResourceView] = []
+        for view in views:
+            value = self._resource_sort_value(view, column)
+            if value is None or value == "":
+                empty.append(view)
+            else:
+                populated.append((view, value))
+
+        # Start from a deterministic resource-name order so equal primary values
+        # do not jump around as live status updates arrive.
+        populated.sort(key=lambda item: (item[0].resource_id.casefold(), item[0].kind))
+        populated.sort(key=lambda item: item[1], reverse=self._resource_sort_reverse)
+        empty.sort(key=lambda view: (view.resource_id.casefold(), view.kind))
+        return [view for view, _ in populated] + empty
+
+    def _update_resource_sort_headers(self) -> None:
+        try:
+            table = self.query_one("#resources_table", DataTable)
+            for key, label in _RESOURCE_COLUMNS:
+                marker = " ▼" if self._resource_sort_reverse else " ▲"
+                table.columns[self._resource_column_keys[key]].label = Text(
+                    f"{label}{marker if key == self._resource_sort_column else ''}"
+                )
+            table.refresh()
+        except Exception:
+            pass
+
+    def _set_resource_sort(self, column: ResourceSortColumn) -> None:
+        if column == self._resource_sort_column:
+            self._resource_sort_reverse = not self._resource_sort_reverse
+        else:
+            self._resource_sort_column = column
+            self._resource_sort_reverse = False
+        self._resource_order = []
+        self._update_resource_sort_headers()
+        self._render_resources_table(preserve_scroll=False)
 
     def _visible_resource_views(self) -> list[ResourceView]:
         query = self._resource_filter.strip().lower()
-        return [
-            view
-            for view in self._collect_resource_views()
-            if (not self._unhealthy_only or view.health in {"failed", "stale"})
-            and (not query or query in view.searchable_text)
-        ]
+        return self._sort_resource_views(
+            [
+                view
+                for view in self._collect_resource_views()
+                if (not self._unhealthy_only or view.health in {"failed", "stale"})
+                and (not query or query in view.searchable_text)
+            ]
+        )
 
     def _update_health_summary(self, all_views: list[ResourceView]) -> None:
         unhealthy = sum(v.health in {"failed", "stale"} for v in all_views)
@@ -1435,21 +1517,33 @@ class ManagerTUI(App):
         except Exception:
             pass
 
-    def _render_resources_table(self) -> None:
+    def _restore_resource_scroll(self, scroll_x: float, scroll_y: float) -> None:
         table = self.query_one("#resources_table", DataTable)
+        table.scroll_x = min(scroll_x, table.max_scroll_x)
+        table.scroll_y = min(scroll_y, table.max_scroll_y)
+        table.scroll_target_x = table.scroll_x
+        table.scroll_target_y = table.scroll_y
+
+    def _render_resources_table(self, *, preserve_scroll: bool = True) -> None:
+        table = self.query_one("#resources_table", DataTable)
+        scroll_x = table.scroll_x
+        scroll_y = table.scroll_y
         all_views = self._collect_resource_views()
         self._resource_views = {view.key: view for view in all_views}
-        views = [
-            view
-            for view in all_views
-            if (not self._unhealthy_only or view.health in {"failed", "stale"})
-            and (
-                not self._resource_filter.strip()
-                or self._resource_filter.strip().lower() in view.searchable_text
-            )
-        ]
+        views = self._sort_resource_views(
+            [
+                view
+                for view in all_views
+                if (not self._unhealthy_only or view.health in {"failed", "stale"})
+                and (
+                    not self._resource_filter.strip()
+                    or self._resource_filter.strip().lower() in view.searchable_text
+                )
+            ]
+        )
         next_order = [view.key for view in views]
-        if next_order != self._resource_order:
+        order_changed = next_order != self._resource_order
+        if order_changed:
             table.clear()
             self._resource_rows.clear()
             for view in views:
@@ -1520,6 +1614,8 @@ class ManagerTUI(App):
                 self._members_source = "process"
         if self._selected_resource_key in next_order:
             table.move_cursor(row=next_order.index(self._selected_resource_key), column=0)
+        if preserve_scroll and order_changed:
+            self.call_after_refresh(self._restore_resource_scroll, scroll_x, scroll_y)
         self._update_health_summary(all_views)
         self._refresh_selected_resource_chrome()
 
@@ -2835,6 +2931,14 @@ class ManagerTUI(App):
 
         self._bg_rpc_req_q.put(_job)
 
+    @on(DataTable.HeaderSelected, "#resources_table")
+    def _on_resource_header_selected(self, event: DataTable.HeaderSelected) -> None:
+        selected_key = self._row_key_str(event.column_key)
+        for column, _label in _RESOURCE_COLUMNS:
+            if column == selected_key:
+                self._set_resource_sort(column)
+                return
+
     @on(DataTable.RowHighlighted, "#resources_table")
     def _on_resource_highlighted(self, event: DataTable.RowHighlighted) -> None:
         self._select_resource_key(self._row_key_str(event.row_key), user=True)
@@ -2899,17 +3003,17 @@ class ManagerTUI(App):
         self._apply_responsive_layout(event.size.width)
 
     def _apply_responsive_layout(self, width: int) -> None:
-        self._narrow_layout = width < 100
+        del width
+        # The navigator now uses the full terminal width above the inspector,
+        # so both regions remain useful even on narrow terminals.
+        self._narrow_layout = False
+        self._narrow_show_inspector = False
         try:
-            self.screen.set_class(self._narrow_layout, "-narrow")
+            self.screen.set_class(False, "-narrow")
             navigator = self.query_one("#navigator", Vertical)
             inspector = self.query_one("#inspector", Vertical)
-            if self._narrow_layout:
-                navigator.display = not self._narrow_show_inspector
-                inspector.display = self._narrow_show_inspector
-            else:
-                navigator.display = True
-                inspector.display = True
+            navigator.display = True
+            inspector.display = True
         except Exception:
             pass
 
@@ -3655,6 +3759,14 @@ class ManagerTUI(App):
         self._unhealthy_only = not self._unhealthy_only
         self._resource_order = []
         self._render_resources_table()
+
+    def action_resource_sort_next(self) -> None:
+        columns = [column for column, _label in _RESOURCE_COLUMNS]
+        current = columns.index(self._resource_sort_column)
+        self._set_resource_sort(columns[(current + 1) % len(columns)])
+
+    def action_resource_sort_reverse(self) -> None:
+        self._set_resource_sort(self._resource_sort_column)
 
     def _set_inspector_tab(self, tab_id: str) -> None:
         try:

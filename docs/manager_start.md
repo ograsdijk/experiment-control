@@ -178,9 +178,14 @@ Notes:
 - `process_order` is optional. If omitted, `hdf_writer` is started first if present.
 - If `tui.enabled: true`, the stack runner starts a manager subprocess and runs the TUI in the same terminal.
 - When the TUI exits, the runner sends `manager.control.shutdown` and then terminates the manager subprocess.
-- The TUI uses one alphabetically stable resource navigator for devices and managed processes.
-  Press `/` to search, `u` to show only failures, and `1`/`2`/`3` to switch the selected
-  resource between Overview, Telemetry, and Commands.
+- The TUI uses one resource navigator for devices and managed processes above the inspector.
+  It spans the terminal width, grows to a capped height, and scrolls internally when the list
+  exceeds that height. Press `/` to search, `u` to show only failures, and `1`/`2`/`3` to
+  switch the selected resource between Overview, Telemetry, and Commands.
+- Click a resource-table header to sort the mixed device/process list by that column; click it
+  again to reverse the order. The active header shows `▲` or `▼`. Press `o` to move to the
+  next sort column and uppercase `O` to reverse it without a mouse. The sort choice lasts for
+  the current TUI session only; empty cells, such as process connection state, remain last.
 - Lifecycle keys remain context-sensitive (`s` start, `x` stop, `r` restart, `c` connect,
   `d` disconnect, `v` recover). The selected target and valid actions are also shown above
   the inspector. The navigator has a separate connection column (`● connected`,
