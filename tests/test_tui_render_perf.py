@@ -16,6 +16,7 @@ from types import SimpleNamespace
 
 from experiment_control._tui.app import ManagerTUI
 from experiment_control._tui.models import DeviceStatus, ResourceView
+from experiment_control._tui.screens import ResultScreen
 
 
 class _FakeTable:
@@ -372,8 +373,58 @@ class UnifiedResourceModelTests(unittest.TestCase):
         self.assertEqual(ManagerTUI._device_health(status), "neutral")
         status.liveness = "STALE"
         self.assertEqual(ManagerTUI._device_health(status), "stale")
+        self.assertEqual(ManagerTUI._device_connection(status), "stale")
+        status.liveness = "DISCONNECTED"
+        self.assertEqual(ManagerTUI._device_connection(status), "disconnected")
         self.assertEqual(ManagerTUI._process_health({"state": "STOPPED"}), "neutral")
         self.assertEqual(ManagerTUI._process_health({"state": "CRASHLOOP"}), "failed")
+
+    def test_non_null_result_opens_pretty_result_screen(self) -> None:
+        app = object.__new__(ManagerTUI)
+        pushed: list = []
+        app.push_screen = pushed.append  # type: ignore[method-assign]
+        app._show_command_result("Result · d1.read", None)
+        self.assertEqual(pushed, [])
+        app._show_command_result("Result · d1.read", {"value": [1, 2]})
+        self.assertEqual(len(pushed), 1)
+        self.assertIsInstance(pushed[0], ResultScreen)
+        self.assertIn('\n  "value": [', pushed[0]._result_text)
+
+
+class ConnectAllTests(unittest.TestCase):
+    @staticmethod
+    def _status(device_id: str, liveness: str, *, remote: bool = False) -> DeviceStatus:
+        return DeviceStatus(
+            device_id=device_id,
+            registered=True,
+            liveness=liveness,
+            hb_age_s=0.2,
+            telemetry_age_s=0.1,
+            driver_state="OK",
+            device_state="DISCONNECTED" if liveness == "DISCONNECTED" else "OK",
+            device_reachable=liveness == "ONLINE",
+            last_error=None,
+            driver_proc_state="RUNNING",
+            driver_pid=None if remote else 1,
+            driver_restart_count=0,
+            driver_last_exit_code=None,
+            driver_last_error=None,
+            is_remote=remote,
+        )
+
+    def test_connect_all_targets_only_eligible_local_devices(self) -> None:
+        app = object.__new__(ManagerTUI)
+        app._device_status = {
+            "eligible": self._status("eligible", "DISCONNECTED"),
+            "connected": self._status("connected", "ONLINE"),
+            "remote": self._status("remote", "DISCONNECTED", remote=True),
+        }
+        calls: list[dict] = []
+        app._run_bulk_rpc_worker = lambda **kwargs: calls.append(kwargs)  # type: ignore[method-assign]
+        app.notify = lambda *args, **kwargs: None  # type: ignore[method-assign]
+        app.action_devices_connect_all()
+        self.assertEqual([item[0] for item in calls[0]["items"]], ["eligible"])
+        self.assertEqual(calls[0]["skipped_count"], 2)
 
 
 class PubCoalescingTests(unittest.TestCase):
@@ -438,6 +489,13 @@ class UnifiedResourceHeadlessTests(unittest.IsolatedAsyncioTestCase):
             app._render_resources_table()
             table = app.query_one("#resources_table", DataTable)
             self.assertEqual(table.row_count, 2)
+            self.assertEqual(
+                str(table.get_row("device:healthy_dev")[2]),
+                "● connected",
+            )
+            app._select_resource_key("device:healthy_dev")
+            self.assertFalse(app.query_one("#action_disconnect").disabled)
+            self.assertTrue(app.query_one("#action_connect").disabled)
 
             app.action_toggle_unhealthy()
             self.assertEqual(table.row_count, 1)

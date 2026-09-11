@@ -183,9 +183,16 @@ Notes:
   resource between Overview, Telemetry, and Commands.
 - Lifecycle keys remain context-sensitive (`s` start, `x` stop, `r` restart, `c` connect,
   `d` disconnect, `v` recover). The selected target and valid actions are also shown above
-  the inspector. Uppercase `S`/`X` retain the bulk start/stop behavior for the selected kind.
-- Errors and the event log live in a collapsed Activity drawer. Press `a` to toggle it;
-  new alerts update the collapsed unread counters without opening the drawer or moving focus.
+  the inspector. The navigator has a separate connection column (`● connected`,
+  `○ disconnected`, `◐ stale`, or `— offline`) so device connectivity is visible without
+  opening the inspector. Uppercase `S`/`X` retain the bulk start/stop behavior for the selected
+  kind. Uppercase `C` connects every eligible local device; already-connected, stopped,
+  offline, and federated devices are skipped.
+- Successful commands with a non-null return value open a scrollable result dialog with
+  formatted JSON. Press Escape, Enter, `q`, or the Close button to dismiss it.
+- Errors and the event log live in a collapsed Activity drawer. Its summary explicitly shows
+  whether `a` opens or closes it; press `a` or click the summary bar to toggle the drawer.
+  New alerts update the collapsed unread counters without opening the drawer or moving focus.
 - Below 100 columns the TUI shows either the navigator or inspector. Select a resource to
   enter its inspector and press Escape to return to the navigator.
 - TUI event-log memory is bounded by `tui.event_log_max_lines` (oldest retained lines are trimmed).

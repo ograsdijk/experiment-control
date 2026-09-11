@@ -37,6 +37,7 @@ class ResourceView:
     state: str
     age_s: float | None
     error: str | None
+    connection: str | None = None
     is_remote: bool = False
     owner_peer_id: str | None = None
 
@@ -53,6 +54,7 @@ class ResourceView:
                 self.resource_id,
                 self.health,
                 self.state,
+                self.connection or "",
                 self.owner_peer_id or "",
                 self.error or "",
             )
