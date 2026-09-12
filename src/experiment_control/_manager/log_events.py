@@ -290,6 +290,8 @@ def _auto_reconnect_message(topic: str, payload: Json) -> str:
         return f"Auto-reconnect {device_id}: escalating to driver restart{suffix}"
     if topic.endswith("degraded"):
         return f"Auto-reconnect {device_id}: degraded-state timer started"
+    if topic.endswith("cancelled"):
+        return f"Auto-reconnect {device_id}: cancelled ({payload.get('reason')}){suffix}"
     if topic.endswith("suppressed"):
         return f"Auto-reconnect {device_id}: suppressed ({payload.get('reason')}){suffix}"
     if topic.endswith("reset"):
