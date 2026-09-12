@@ -482,7 +482,7 @@ class PubCoalescingTests(unittest.TestCase):
 
 class UnifiedResourceHeadlessTests(unittest.IsolatedAsyncioTestCase):
     async def test_filter_tabs_activity_and_stacked_navigation(self) -> None:
-        from textual.widgets import DataTable, Input, TabbedContent
+        from textual.widgets import Button, DataTable, Input, TabbedContent
 
         app = ManagerTUI(snapshot_period_s=3600.0, rpc_timeout_ms=20)
         app._rpc_submit = lambda *a, **k: None  # type: ignore[method-assign]
@@ -523,6 +523,38 @@ class UnifiedResourceHeadlessTests(unittest.IsolatedAsyncioTestCase):
             app._select_resource_key("device:healthy_dev")
             self.assertFalse(app.query_one("#action_disconnect").disabled)
             self.assertTrue(app.query_one("#action_connect").disabled)
+            self.assertEqual(app.query_one("#action_start", Button).label.plain, "Start (s)")
+            self.assertEqual(
+                app.query_one("#action_disconnect", Button).label.plain, "Disconnect (d)"
+            )
+
+            table.focus()
+            await pilot.press("enter")
+            self.assertIs(app.focused, app.query_one("#driver_table", DataTable))
+            await pilot.press("right_square_bracket")
+            await pilot.pause()
+            self.assertEqual(app.query_one("#inspector_tabs", TabbedContent).active, "telemetry")
+            self.assertIs(app.focused, app.query_one("#telemetry_table", DataTable))
+            await pilot.press("left_square_bracket")
+            await pilot.pause()
+            self.assertEqual(app.query_one("#inspector_tabs", TabbedContent).active, "overview")
+            self.assertIs(app.focused, app.query_one("#driver_table", DataTable))
+            await pilot.press("3")
+            await pilot.pause()
+            self.assertEqual(app.query_one("#inspector_tabs", TabbedContent).active, "commands")
+            self.assertIs(app.focused, app.query_one("#members_table", DataTable))
+            await pilot.press("escape")
+            self.assertIs(app.focused, table)
+            await pilot.press("i")
+            self.assertIs(app.focused, app.query_one("#members_table", DataTable))
+            await pilot.press("n")
+            self.assertIs(app.focused, table)
+            search = app.query_one("#resource_filter", Input)
+            search.focus()
+            await pilot.press("right_square_bracket")
+            self.assertEqual(app.query_one("#inspector_tabs", TabbedContent).active, "commands")
+            search.value = ""
+            await pilot.pause()
 
             resource_key = app._resource_column_keys["resource"]
             resource_column = table.columns[resource_key]
@@ -547,7 +579,6 @@ class UnifiedResourceHeadlessTests(unittest.IsolatedAsyncioTestCase):
             app.action_toggle_unhealthy()
             self.assertEqual(table.row_count, 1)
             app.action_toggle_unhealthy()
-            search = app.query_one("#resource_filter", Input)
             search.value = "healthy"
             await pilot.pause()
             self.assertEqual(table.row_count, 1)

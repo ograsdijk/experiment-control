@@ -186,13 +186,19 @@ Notes:
   again to reverse the order. The active header shows `▲` or `▼`. Press `o` to move to the
   next sort column and uppercase `O` to reverse it without a mouse. The sort choice lasts for
   the current TUI session only; empty cells, such as process connection state, remain last.
+- Keyboard navigation follows a drill-in model: select a resource with the arrow keys, press
+  Enter to focus its active inspector view, and press Escape to return to the resource table.
+  Press `n` or `i` to focus the navigator or inspector directly. Inspector tabs are labeled
+  Overview (1), Telemetry (2), and Commands (3); use `1`/`2`/`3` to select directly or `[`/`]`
+  to move between them.
 - Lifecycle keys remain context-sensitive (`s` start, `x` stop, `r` restart, `c` connect,
   `d` disconnect, `v` recover). The selected target and valid actions are also shown above
   the inspector. The navigator has a separate connection column (`● connected`,
   `○ disconnected`, `◐ stale`, or `— offline`) so device connectivity is visible without
   opening the inspector. Uppercase `S`/`X` retain the bulk start/stop behavior for the selected
   kind. Uppercase `C` connects every eligible local device; already-connected, stopped,
-  offline, and federated devices are skipped.
+  offline, and federated devices are skipped. Each action button displays its shortcut in
+  parentheses, for example Start (s) and Disconnect (d).
 - Successful commands with a non-null return value open a scrollable result dialog with
   formatted JSON. Press Escape, Enter, `q`, or the Close button to dismiss it.
 - Errors and the event log live in a collapsed Activity drawer. Its summary explicitly shows

@@ -12,6 +12,7 @@ import zmq
 from rich.text import Text
 from textual import events, on, work
 from textual.app import App, ComposeResult
+from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.driver import Driver
 from textual.reactive import reactive
@@ -58,10 +59,12 @@ _RESOURCE_COLUMNS: tuple[tuple[ResourceSortColumn, str], ...] = (
     ("age_s", "age_s"),
     ("error", "error"),
 )
+_INSPECTOR_TAB_IDS = ("overview", "telemetry", "commands")
 
 class ManagerTUI(App):
     CSS = """
     #health_summary {height: 1; padding: 0 1; background: $boost;}
+    #navigation_help {height: 1; padding: 0 1; color: $text-muted; background: $boost;}
     #main {height: 1fr; layout: vertical;}
     #navigator {
         width: 1fr;
@@ -70,10 +73,12 @@ class ManagerTUI(App):
         max-height: 16;
         border-bottom: solid $primary;
     }
+    #navigator:focus-within {border-bottom: heavy $accent;}
     #resource_filter {height: 3;}
     #resources_table {height: auto; min-height: 3; max-height: 13;}
     #devices_table, #processes_table, #processes_title {display: none;}
     #inspector {width: 1fr; height: 1fr;}
+    #inspector:focus-within {border-top: heavy $accent;}
     #selected_resource_title {height: 1; padding: 0 1; text-style: bold;}
     #action_strip {height: 3; padding: 0 1;}
     #action_strip Button {min-width: 10; margin-right: 1;}
@@ -167,6 +172,10 @@ class ManagerTUI(App):
         ("u", "toggle_unhealthy", "Problems"),
         ("o", "resource_sort_next", "Next sort"),
         ("O", "resource_sort_reverse", "Reverse sort"),
+        Binding("n", "focus_navigator", "Resources", priority=True),
+        Binding("i", "focus_inspector", "Inspector", priority=True),
+        Binding("left_square_bracket", "inspector_previous", "Previous tab", priority=True),
+        Binding("right_square_bracket", "inspector_next", "Next tab", priority=True),
         ("a", "toggle_activity", "Activity"),
         ("1", "inspector_overview", "Overview"),
         ("2", "inspector_telemetry", "Telemetry"),
@@ -185,6 +194,17 @@ class ManagerTUI(App):
     _VALID_PUB_QUEUE_OVERFLOW_POLICIES = frozenset({"drop_newest", "drop_oldest"})
 
     streaming_enabled = reactive(True)
+
+    _GLOBAL_NAV_ACTIONS = frozenset(
+        {"focus_navigator", "focus_inspector", "inspector_previous", "inspector_next"}
+    )
+
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        if action in self._GLOBAL_NAV_ACTIONS and (
+            isinstance(self.screen, ModalScreen) or isinstance(self.focused, Input)
+        ):
+            return False
+        return super().check_action(action, parameters)
 
     def __init__(
         self,
@@ -383,6 +403,10 @@ class ManagerTUI(App):
     def compose(self) -> ComposeResult:
         yield Header()
         yield Static("Backend connecting · 0 resources", id="health_summary")
+        yield Static(
+            Text("Enter: inspector · Esc: resources · [ / ]: tabs · n/i: focus"),
+            id="navigation_help",
+        )
         with Vertical(id="main"):
             with Vertical(id="navigator"):
                 yield Input(placeholder="Search resources  [/]", id="resource_filter")
@@ -395,14 +419,14 @@ class ManagerTUI(App):
             with Vertical(id="inspector"):
                 yield Label("No resource selected", id="selected_resource_title")
                 with Horizontal(id="action_strip"):
-                    yield Button("Start [s]", id="action_start", variant="success")
-                    yield Button("Stop [x]", id="action_stop", variant="error")
-                    yield Button("Restart [r]", id="action_restart")
-                    yield Button("Connect [c]", id="action_connect")
-                    yield Button("Disconnect [d]", id="action_disconnect")
-                    yield Button("Recover [v]", id="action_recover")
+                    yield Button("Start (s)", id="action_start", variant="success")
+                    yield Button("Stop (x)", id="action_stop", variant="error")
+                    yield Button("Restart (r)", id="action_restart")
+                    yield Button("Connect (c)", id="action_connect")
+                    yield Button("Disconnect (d)", id="action_disconnect")
+                    yield Button("Recover (v)", id="action_recover")
                 with TabbedContent(initial="overview", id="inspector_tabs"):
-                    with TabPane("Overview", id="overview"):
+                    with TabPane("Overview (1)", id="overview"):
                         with Vertical(id="overview_tables"):
                             yield Label("Heartbeat", id="heartbeat_title")
                             yield DataTable(id="heartbeat_table")
@@ -410,9 +434,9 @@ class ManagerTUI(App):
                             yield DataTable(id="driver_table")
                             yield Label("Process", id="process_title")
                             yield DataTable(id="process_table")
-                    with TabPane("Telemetry", id="telemetry"):
+                    with TabPane("Telemetry (2)", id="telemetry"):
                         yield DataTable(id="telemetry_table")
-                    with TabPane("Commands", id="commands"):
+                    with TabPane("Commands (3)", id="commands"):
                         yield DataTable(id="members_table")
                         yield Static("Enter: invoke/get | e: set | R: refresh", id="cap_help")
         yield Static(
@@ -2939,6 +2963,14 @@ class ManagerTUI(App):
                 self._set_resource_sort(column)
                 return
 
+    @on(TabbedContent.TabActivated, "#inspector_tabs")
+    def _on_inspector_tab_activated(self, event: TabbedContent.TabActivated) -> None:
+        """Keep keyboard tab navigation in the newly selected content table."""
+        del event
+        inspector = self.query_one("#inspector", Vertical)
+        if inspector.has_focus_within:
+            self.call_later(self._focus_active_inspector)
+
     @on(DataTable.RowHighlighted, "#resources_table")
     def _on_resource_highlighted(self, event: DataTable.RowHighlighted) -> None:
         self._select_resource_key(self._row_key_str(event.row_key), user=True)
@@ -3727,11 +3759,12 @@ class ManagerTUI(App):
         if event.character and event.character.isupper():
             return
         key = event.key
-        if key == "escape" and self._narrow_layout and self._narrow_show_inspector:
-            self._narrow_show_inspector = False
-            self._apply_responsive_layout(self.size.width)
-            self.query_one("#resources_table", DataTable).focus()
-            event.stop()
+        if key == "escape":
+            inspector = self.query_one("#inspector", Vertical)
+            if inspector.has_focus_within:
+                self.action_focus_navigator()
+                event.stop()
+                return
         elif key == "x":
             self.action_driver_stop()
             event.stop()
@@ -3743,12 +3776,24 @@ class ManagerTUI(App):
             if self.focused is resources:
                 if self._selected_resource_key:
                     self._select_resource_key(self._selected_resource_key)
-                    if self._narrow_layout:
-                        self._narrow_show_inspector = True
-                        self._apply_responsive_layout(self.size.width)
+                    self.action_focus_inspector()
                 event.stop()
                 return
-            self.action_member_primary()
+            members = self.query_one("#members_table", DataTable)
+            if self.focused is members:
+                self.action_member_primary()
+                event.stop()
+        elif key == "n":
+            self.action_focus_navigator()
+            event.stop()
+        elif key == "i":
+            self.action_focus_inspector()
+            event.stop()
+        elif key == "left_square_bracket":
+            self.action_inspector_previous()
+            event.stop()
+        elif key == "right_square_bracket":
+            self.action_inspector_next()
             event.stop()
 
     def action_focus_search(self) -> None:
@@ -3768,11 +3813,46 @@ class ManagerTUI(App):
     def action_resource_sort_reverse(self) -> None:
         self._set_resource_sort(self._resource_sort_column)
 
+    def action_focus_navigator(self) -> None:
+        self.query_one("#resources_table", DataTable).focus()
+
+    def _focus_active_inspector(self) -> None:
+        tabs = self.query_one("#inspector_tabs", TabbedContent)
+        target_id = {
+            "overview": "#driver_table",
+            "telemetry": "#telemetry_table",
+            "commands": "#members_table",
+        }.get(tabs.active, "#driver_table")
+        self.query_one(target_id, DataTable).focus()
+
+    def action_focus_inspector(self) -> None:
+        self._focus_active_inspector()
+
     def _set_inspector_tab(self, tab_id: str) -> None:
         try:
+            inspector = self.query_one("#inspector", Vertical)
+            restore_focus = inspector.has_focus_within
             self.query_one("#inspector_tabs", TabbedContent).active = tab_id
+            if tab_id == "commands":
+                self._render_members_table()
+            if restore_focus:
+                self.call_after_refresh(self._focus_active_inspector)
         except Exception:
             pass
+
+    def _cycle_inspector_tab(self, step: int) -> None:
+        tabs = self.query_one("#inspector_tabs", TabbedContent)
+        try:
+            index = _INSPECTOR_TAB_IDS.index(tabs.active)
+        except ValueError:
+            index = 0
+        self._set_inspector_tab(_INSPECTOR_TAB_IDS[(index + step) % len(_INSPECTOR_TAB_IDS)])
+
+    def action_inspector_previous(self) -> None:
+        self._cycle_inspector_tab(-1)
+
+    def action_inspector_next(self) -> None:
+        self._cycle_inspector_tab(1)
 
     def action_inspector_overview(self) -> None:
         self._set_inspector_tab("overview")
@@ -3782,7 +3862,6 @@ class ManagerTUI(App):
 
     def action_inspector_commands(self) -> None:
         self._set_inspector_tab("commands")
-        self._render_members_table()
 
     def _update_activity_summary(self) -> None:
         verb = "close" if self._activity_open else "open"
