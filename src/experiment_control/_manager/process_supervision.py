@@ -1174,6 +1174,17 @@ def _auto_reconnect_status(handle: Any) -> Json:
             "cooldown_s": float(spec.cooldown_s),
             "max_attempts": spec.max_attempts,
             "on_telemetry_stale_s": spec.on_telemetry_stale_s,
+            "on_degraded_s": getattr(spec, "on_degraded_s", None),
+            "restart_driver_after_max_attempts": bool(
+                getattr(spec, "restart_driver_after_max_attempts", False)
+            ),
+            "degraded_since_mono": getattr(
+                handle, "auto_reconnect_degraded_since_mono", None
+            ),
+            "waiting_for_health": bool(
+                getattr(handle, "auto_reconnect_waiting_for_health", False)
+            ),
+            "last_trigger": getattr(handle, "auto_reconnect_last_trigger", None),
             "reset_attempts_after_ok_s": float(spec.reset_attempts_after_ok_s),
         }
 
@@ -1192,6 +1203,7 @@ def _auto_reconnect_reset_if_healthy(
     now_mono: float,
 ) -> None:
     did_reset = False
+    recovered = False
     with _auto_reconnect_field_lock(handle):
         spec = handle.spec.auto_reconnect
         if not spec.enabled or handle.auto_reconnect_attempts <= 0:
@@ -1201,19 +1213,42 @@ def _auto_reconnect_reset_if_healthy(
             handle.auto_reconnect_healthy_since_mono = None
             return
         age_s = now_mono - latest_ts.t_mono
-        threshold = spec.on_telemetry_stale_s
-        if threshold is None or age_s > threshold:
+        freshness_threshold_s = spec.on_telemetry_stale_s
+        if freshness_threshold_s is None:
+            freshness_threshold_s = getattr(spec, "on_degraded_s", None)
+        if freshness_threshold_s is None or age_s > freshness_threshold_s:
             handle.auto_reconnect_healthy_since_mono = None
             return
+        if getattr(spec, "on_degraded_s", None) is not None:
+            hb = getattr(handle, "last_hb", None)
+            if (
+                hb is None
+                or not bool(getattr(hb, "device_reachable", False))
+                or str(getattr(hb, "device_state", "")) != "OK"
+            ):
+                handle.auto_reconnect_healthy_since_mono = None
+                return
+            handle.auto_reconnect_degraded_since_mono = None
         if handle.auto_reconnect_healthy_since_mono is None:
             handle.auto_reconnect_healthy_since_mono = now_mono
-            return
-        if now_mono - handle.auto_reconnect_healthy_since_mono < spec.reset_attempts_after_ok_s:
-            return
-        handle.auto_reconnect_attempts = 0
-        handle.auto_reconnect_suppressed = False
-        handle.auto_reconnect_last_error = None
-        did_reset = True
+            if handle.auto_reconnect_waiting_for_health:
+                handle.auto_reconnect_waiting_for_health = False
+                recovered = True
+        elif (
+            now_mono - handle.auto_reconnect_healthy_since_mono
+            >= spec.reset_attempts_after_ok_s
+        ):
+            handle.auto_reconnect_attempts = 0
+            handle.auto_reconnect_suppressed = False
+            handle.auto_reconnect_last_error = None
+            did_reset = True
+    if recovered:
+        _auto_reconnect_publish(
+            manager,
+            "manager.device.auto_reconnect.recovered",
+            device_id,
+            {"auto_reconnect": _auto_reconnect_status(handle)},
+        )
     if did_reset:
         # _auto_reconnect_status() takes the same lock -- call it only
         # after releasing the `with` block above to avoid a self-deadlock
@@ -1250,14 +1285,49 @@ def _auto_reconnect_should_attempt(
         return False, None, "heartbeat_stale"
     if handle.rpc_endpoint is None:
         return False, None, None
-    latest_ts = manager._telemetry_last_bundle_ts.get(device_id)
-    if latest_ts is None:
-        return False, None, None
-    threshold = spec.on_telemetry_stale_s
-    if threshold is None:
-        return False, None, None
-    age_s = now_mono - latest_ts.t_mono
-    if age_s <= threshold:
+    trigger: str | None = None
+    age_s: float | None = None
+    hb = getattr(handle, "last_hb", None)
+    degraded = bool(
+        hb is not None
+        and (
+            not bool(getattr(hb, "device_reachable", False))
+            or str(getattr(hb, "device_state", "")) == "DEGRADED"
+        )
+    )
+    newly_degraded = False
+    with _auto_reconnect_field_lock(handle):
+        degraded_threshold_s = getattr(spec, "on_degraded_s", None)
+        if degraded and degraded_threshold_s is not None:
+            if handle.auto_reconnect_degraded_since_mono is None:
+                handle.auto_reconnect_degraded_since_mono = now_mono
+                newly_degraded = True
+            age_s = now_mono - float(handle.auto_reconnect_degraded_since_mono)
+            if age_s >= degraded_threshold_s:
+                trigger = "degraded"
+        else:
+            handle.auto_reconnect_degraded_since_mono = None
+    if newly_degraded:
+        _auto_reconnect_publish(
+            manager,
+            "manager.device.auto_reconnect.degraded",
+            device_id,
+            {
+                "threshold_s": degraded_threshold_s,
+                "error": getattr(hb, "last_error", None),
+                "auto_reconnect": _auto_reconnect_status(handle),
+            },
+        )
+
+    telemetry_threshold_s = getattr(spec, "on_telemetry_stale_s", None)
+    if trigger is None and telemetry_threshold_s is not None:
+        latest_ts = manager._telemetry_last_bundle_ts.get(device_id)
+        if latest_ts is not None:
+            telemetry_age_s = now_mono - latest_ts.t_mono
+            if telemetry_age_s > telemetry_threshold_s:
+                trigger = "telemetry_stale"
+                age_s = telemetry_age_s
+    if trigger is None:
         return False, age_s, None
 
     newly_suppressed = False
@@ -1279,7 +1349,15 @@ def _auto_reconnect_should_attempt(
             spec.max_attempts is not None
             and handle.auto_reconnect_attempts >= spec.max_attempts
         )
-        if over_max_attempts and not handle.auto_reconnect_suppressed:
+        will_restart = bool(
+            over_max_attempts
+            and getattr(spec, "restart_driver_after_max_attempts", False)
+        )
+        if (
+            over_max_attempts
+            and not will_restart
+            and not handle.auto_reconnect_suppressed
+        ):
             handle.auto_reconnect_suppressed = True
             newly_suppressed = True
 
@@ -1291,12 +1369,16 @@ def _auto_reconnect_should_attempt(
                 device_id,
                 {
                     "reason": "max_attempts",
-                    "telemetry_age_s": age_s,
+                    "trigger": trigger,
+                    "trigger_age_s": age_s,
                     "auto_reconnect": _auto_reconnect_status(handle),
                 },
             )
+        if will_restart:
+            return False, age_s, "restart_driver"
         return False, age_s, "max_attempts"
-    return True, age_s, None
+    handle.auto_reconnect_last_trigger = trigger
+    return True, age_s, trigger
 
 
 def _auto_reconnect_attempt(
@@ -1305,6 +1387,7 @@ def _auto_reconnect_attempt(
     handle: Any,
     now_mono: float,
     age_s: float,
+    trigger: str = "telemetry_stale",
 ) -> None:
     """Record the attempt (bookkeeping only) and dispatch the blocking
     disconnect+connect I/O to the lifecycle executor under the per-device
@@ -1338,13 +1421,14 @@ def _auto_reconnect_attempt(
         device_id,
         {
             "attempt": attempt,
-            "telemetry_age_s": age_s,
+            "trigger": trigger,
+            "trigger_age_s": age_s,
             "auto_reconnect": _auto_reconnect_status(handle),
         },
     )
     try:
         manager._lifecycle_executor.submit(
-            _run_auto_reconnect, manager, device_id, handle, attempt, age_s
+            _run_auto_reconnect, manager, device_id, handle, attempt, age_s, trigger
         )
     except RuntimeError:
         # Executor was shut down (e.g. manager tearing down between the
@@ -1363,6 +1447,7 @@ def _run_auto_reconnect(
     handle: Any,
     attempt: int,
     age_s: float,
+    trigger: str = "telemetry_stale",
 ) -> None:
     """Worker-thread body: disconnect+connect the device off the manager
     poll loop, under the per-device lifecycle lock so this can't race an
@@ -1424,7 +1509,8 @@ def _run_auto_reconnect(
                     device_id,
                     {
                         "attempt": attempt,
-                        "telemetry_age_s": age_s,
+                        "trigger": trigger,
+                        "trigger_age_s": age_s,
                         "error": str(exc),
                         "auto_reconnect": _auto_reconnect_status(handle),
                     },
@@ -1435,13 +1521,15 @@ def _run_auto_reconnect(
             handle.auto_reconnect_last_success_mono = completion_mono
             handle.auto_reconnect_last_attempt_mono = completion_mono
             handle.auto_reconnect_last_error = None
+            handle.auto_reconnect_waiting_for_health = True
         _auto_reconnect_publish(
             manager,
             "manager.device.auto_reconnect.success",
             device_id,
             {
                 "attempt": attempt,
-                "telemetry_age_s": age_s,
+                "trigger": trigger,
+                "trigger_age_s": age_s,
                 "response": resp,
                 "auto_reconnect": _auto_reconnect_status(handle),
             },
@@ -1509,14 +1597,112 @@ def _maybe_auto_reconnect_device(
     now_mono: float,
 ) -> None:
     _auto_reconnect_reset_if_healthy(manager, device_id, handle, now_mono)
-    should_attempt, age_s, _reason = _auto_reconnect_should_attempt(
+    should_attempt, age_s, reason = _auto_reconnect_should_attempt(
         manager,
         device_id,
         handle,
         now_mono,
     )
     if should_attempt and age_s is not None:
-        _auto_reconnect_attempt(manager, device_id, handle, now_mono, age_s)
+        _auto_reconnect_attempt(
+            manager, device_id, handle, now_mono, age_s, str(reason)
+        )
+    elif reason == "restart_driver" and age_s is not None:
+        _schedule_auto_reconnect_driver_restart(
+            manager,
+            device_id,
+            handle,
+            now_mono,
+            age_s,
+            str(getattr(handle, "auto_reconnect_last_trigger", "degraded")),
+        )
+
+
+def _schedule_auto_reconnect_driver_restart(
+    manager: Any,
+    device_id: str,
+    handle: Any,
+    now_mono: float,
+    trigger_age_s: float,
+    trigger: str,
+) -> None:
+    """Escalate exhausted reconnect attempts to the normal restart budget."""
+    with _auto_reconnect_field_lock(handle):
+        if handle.auto_reconnect_pending:
+            return
+        handle.auto_reconnect_pending = True
+    try:
+        manager._lifecycle_executor.submit(
+            _run_auto_reconnect_driver_restart,
+            manager,
+            device_id,
+            handle,
+            now_mono,
+            trigger_age_s,
+            trigger,
+        )
+    except RuntimeError:
+        with _auto_reconnect_field_lock(handle):
+            handle.auto_reconnect_pending = False
+
+
+def _run_auto_reconnect_driver_restart(
+    manager: Any,
+    device_id: str,
+    handle: Any,
+    now_mono: float,
+    trigger_age_s: float,
+    trigger: str,
+) -> None:
+    lock = manager._lifecycle_device_locks.setdefault(device_id, threading.Lock())
+    try:
+        with lock:
+            if str(handle.driver_process_state) != "RUNNING":
+                return
+            handle.driver_process_state = _enum_member(
+                handle.driver_process_state, "FAILED"
+            )
+            handle.driver_running_since_mono = None
+            handle.driver_stop_requested_t_mono = now_mono
+            handle.driver_last_error_kind = "auto_reconnect_exhausted"
+            handle.driver_last_error = (
+                f"auto-reconnect trigger {trigger!r} remained active for "
+                f"{trigger_age_s:.1f}s after "
+                f"{handle.auto_reconnect_attempts} reconnect attempts"
+            )
+            # Recovery escalation must reconnect the replacement wrapper. In the
+            # degraded case the last heartbeat usually reports unreachable, so the
+            # heartbeat policy's reachability-derived intent would otherwise be false.
+            handle.driver_reconnect_after_restart = True
+            handle.driver_reconnect_generation = None
+            handle.driver_restart_is_automatic = True
+            handle.driver_next_restart_t_mono = (
+                now_mono + float(handle.spec.driver_restart_backoff_s)
+            )
+            handle.auto_reconnect_degraded_since_mono = None
+            proc = handle.process
+            if proc is not None:
+                try:
+                    if proc.poll() is None:
+                        proc.terminate()
+                except Exception:
+                    pass
+            manager._publish_driver_event("manager.driver.failed", handle)
+            manager._publish_driver_event("manager.driver.restart_scheduled", handle)
+            _auto_reconnect_publish(
+                manager,
+                "manager.device.auto_reconnect.escalated",
+                device_id,
+                {
+                    "reason": "max_attempts",
+                    "trigger": trigger,
+                    "trigger_age_s": trigger_age_s,
+                    "auto_reconnect": _auto_reconnect_status(handle),
+                },
+            )
+    finally:
+        with _auto_reconnect_field_lock(handle):
+            handle.auto_reconnect_pending = False
 
 
 def supervise_device_drivers(manager: Any, now_mono: float) -> None:

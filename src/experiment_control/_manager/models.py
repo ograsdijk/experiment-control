@@ -34,6 +34,8 @@ class ConnectCheckSpec:
 class AutoReconnectSpec:
     enabled: bool = False
     on_telemetry_stale_s: float | None = None
+    on_degraded_s: float | None = None
+    restart_driver_after_max_attempts: bool = False
     cooldown_s: float = 30.0
     max_attempts: int | None = 3
     reset_attempts_after_ok_s: float = 120.0
@@ -193,6 +195,9 @@ class DeviceHandle:
     auto_reconnect_last_success_mono: float | None = None
     auto_reconnect_last_error: str | None = None
     auto_reconnect_suppressed: bool = False
+    auto_reconnect_degraded_since_mono: float | None = None
+    auto_reconnect_waiting_for_health: bool = False
+    auto_reconnect_last_trigger: str | None = None
     # True from the moment a reconnect attempt is dispatched to the
     # lifecycle executor until `_run_auto_reconnect` finishes (success or
     # failure). Lets `_auto_reconnect_should_attempt` refuse to dispatch a
