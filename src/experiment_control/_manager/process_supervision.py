@@ -806,6 +806,10 @@ def start_process_handle(
     handle.termination_error = None
     handle.recent_manager_loop_stall = False
     handle.last_manager_loop_stall_duration_s = None
+    handle.last_manager_loop_stall_source = None
+    handle.heartbeat_stall_reconcile_started_mono = None
+    handle.heartbeat_stall_reconcile_deadline_mono = None
+    handle.heartbeat_failure_trigger = None
     if reset_collision_retry:
         handle.startup_collision_retry_done = False
     manager._start_child_log_readers(
@@ -943,6 +947,9 @@ def process_snapshot(manager: Any, handle: Any) -> Json:
         "env": handle.spec.env,
         "heartbeat_period_s": handle.spec.heartbeat_period_s,
         "heartbeat_timeout_s": handle.spec.heartbeat_timeout_s,
+        "heartbeat_hard_timeout_s": getattr(
+            handle.spec, "heartbeat_hard_timeout_s", None
+        ),
         "shutdown_timeout_s": handle.spec.shutdown_timeout_s,
         "restart_policy": handle.spec.restart_policy,
         "restart_backoff_s": handle.spec.restart_backoff_s,
@@ -978,6 +985,14 @@ def process_snapshot(manager: Any, handle: Any) -> Json:
         "termination_error": handle.termination_error,
         "recent_manager_loop_stall": handle.recent_manager_loop_stall,
         "last_manager_loop_stall_duration_s": handle.last_manager_loop_stall_duration_s,
+        "last_manager_loop_stall_source": handle.last_manager_loop_stall_source,
+        "heartbeat_stall_reconcile_started_mono": (
+            handle.heartbeat_stall_reconcile_started_mono
+        ),
+        "heartbeat_stall_reconcile_deadline_mono": (
+            handle.heartbeat_stall_reconcile_deadline_mono
+        ),
+        "heartbeat_failure_trigger": handle.heartbeat_failure_trigger,
         "last_heartbeat_payload": handle.last_heartbeat_payload,
         "tail_stdout": list(handle.supervisor_stdout_tail),
         "tail_stderr": list(handle.supervisor_stderr_tail),
@@ -1922,6 +1937,34 @@ def update_managed_process_exit_state(manager: Any, handle: Any, rc: int) -> boo
     return False
 
 
+def _manager_loop_stall_context(
+    manager: Any, now_mono: float
+) -> tuple[bool, str | None, float | None]:
+    """Return the most immediate manager-delay evidence visible in this pump.
+
+    Completed-pump timing alone is too late for timeout checks made near the
+    end of that same pump. Current-pump elapsed time and the gap before this
+    pump are therefore considered before the most recently recorded stall.
+    """
+    threshold_s = float(getattr(manager, "_manager_loop_stall_warn_s", 1.0))
+    current_start = getattr(manager, "_current_pump_start_mono", None)
+    if current_start is not None:
+        current_pump_age_s = max(0.0, now_mono - float(current_start))
+        if current_pump_age_s > threshold_s:
+            return True, "current_pump", current_pump_age_s
+
+    current_gap_s = getattr(manager, "_current_pump_gap_s", None)
+    if current_gap_s is not None and float(current_gap_s) > threshold_s:
+        return True, "pre_pump_gap", float(current_gap_s)
+
+    last_stall = getattr(manager, "_last_loop_stall_mono", None)
+    recent_s = float(getattr(manager, "_manager_loop_stall_recent_s", 10.0))
+    if last_stall is not None and (now_mono - float(last_stall)) <= recent_s:
+        duration_s = getattr(manager, "_last_loop_stall_duration_s", None)
+        return True, "recent_completed_pump", float(duration_s or 0.0)
+    return False, None, None
+
+
 def _recent_manager_loop_stall(manager: Any, now_mono: float) -> bool:
     last_stall = manager._last_loop_stall_mono
     if last_stall is None:
@@ -2023,6 +2066,10 @@ def enforce_managed_process_heartbeat_timeout(
         handle.heartbeat_stale_strikes = 0
         handle.last_stale_detected_mono = None
         handle.recent_manager_loop_stall = False
+        handle.last_manager_loop_stall_source = None
+        handle.heartbeat_stall_reconcile_started_mono = None
+        handle.heartbeat_stall_reconcile_deadline_mono = None
+        handle.heartbeat_failure_trigger = None
         # Keep the age field fresh during healthy operation so dashboards
         # don't see a stale value left over from the last stale event.
         handle.last_heartbeat_age_s = (
@@ -2031,45 +2078,86 @@ def enforce_managed_process_heartbeat_timeout(
         return
 
     heartbeat_received = handle.last_hb_recv_mono is not None
-    recent_stall = _recent_manager_loop_stall(manager, now_mono)
+    recent_stall, stall_source, stall_duration_s = _manager_loop_stall_context(
+        manager, now_mono
+    )
     in_startup_grace = _in_startup_grace(manager, now_mono)
     startup_grace_hard_s = getattr(manager, "_startup_grace_hard_timeout_s", 30.0)
-    hard_timeout_s = timeout_s * max(1.0, manager._heartbeat_hard_timeout_multiplier)
-    strikes_to_fail = manager._heartbeat_stale_strikes_to_fail
+    configured_hard_timeout_s = getattr(handle.spec, "heartbeat_hard_timeout_s", None)
+    hard_timeout_s = (
+        float(configured_hard_timeout_s)
+        if configured_hard_timeout_s is not None
+        else timeout_s * max(1.0, float(manager._heartbeat_hard_timeout_multiplier))
+    )
+    strikes_to_fail = max(1, int(manager._heartbeat_stale_strikes_to_fail))
+    period_s = max(0.001, float(handle.spec.heartbeat_period_s))
+    handle.last_heartbeat_received = heartbeat_received
+    handle.last_liveness_age_s = float(hb_age)
+    handle.last_heartbeat_age_s = float(hb_age) if heartbeat_received else None
+    handle.recent_manager_loop_stall = recent_stall
+    handle.last_manager_loop_stall_duration_s = stall_duration_s
+    handle.last_manager_loop_stall_source = stall_source
+
+    # A host pause or an in-progress slow pump can make every process look
+    # stale before their heartbeat threads get a chance to run again. Grant
+    # one short reconciliation window for that stale episode, including when
+    # the observed age already exceeds the hard timeout. The deadline is not
+    # renewed by subsequent stalls; only a fresh heartbeat clears it.
+    reconcile_deadline = handle.heartbeat_stall_reconcile_deadline_mono
+    if recent_stall and reconcile_deadline is None:
+        reconcile_multiplier = max(
+            0.0,
+            float(
+                getattr(manager, "_heartbeat_stall_reconcile_period_multiplier", 1.25)
+            ),
+        )
+        handle.heartbeat_stall_reconcile_started_mono = now_mono
+        reconcile_deadline = now_mono + period_s * reconcile_multiplier
+        handle.heartbeat_stall_reconcile_deadline_mono = reconcile_deadline
+    if reconcile_deadline is not None and now_mono < float(reconcile_deadline):
+        manager._publish_manager_event(
+            "manager.process.heartbeat_stale_deferred",
+            {
+                "process_id": handle.spec.process_id,
+                "heartbeat_age_s": float(hb_age),
+                "heartbeat_timeout_s": timeout_s,
+                "heartbeat_hard_timeout_s": hard_timeout_s,
+                "strikes": int(handle.heartbeat_stale_strikes),
+                "strikes_to_fail": strikes_to_fail,
+                "defer_reason": "manager_stall_reconciliation",
+                "recent_manager_loop_stall": recent_stall,
+                "manager_loop_stall_source": stall_source,
+                "manager_loop_stall_duration_s": stall_duration_s,
+                "reconcile_deadline_mono": float(reconcile_deadline),
+                "in_startup_grace": in_startup_grace,
+                "ts": {"t_wall": time.time(), "t_mono": now_mono},
+            },
+        )
+        return
+
     # Rate-limit strikes to one per heartbeat_period_s. The supervision
     # check runs every ~50 ms; without this rate limit, two consecutive
     # checks ~100 ms apart would race past strikes_to_fail=2 even when
     # the process is healthy (e.g. its HB is queued but not yet
     # drained). With the rate limit, strikes accumulate at the rate
     # the process is expected to publish HBs, giving a real margin.
-    period_s = float(handle.spec.heartbeat_period_s)
     last_strike_mono = handle.last_stale_detected_mono
     if last_strike_mono is None or (now_mono - float(last_strike_mono)) >= period_s:
         handle.heartbeat_stale_strikes += 1
         handle.last_stale_detected_mono = now_mono
-    handle.last_heartbeat_received = heartbeat_received
-    handle.last_liveness_age_s = float(hb_age)
-    handle.last_heartbeat_age_s = float(hb_age) if heartbeat_received else None
-    handle.recent_manager_loop_stall = recent_stall
-    handle.last_manager_loop_stall_duration_s = getattr(
-        manager, "_last_loop_stall_duration_s", None
-    )
-
-    # Two reasons to defer rather than fail on a stale heartbeat:
+    # Startup grace and the general strike threshold independently defer a
+    # stale observation. Manager-stall awareness above adds a bounded chance
+    # to ingest a post-pause heartbeat; it does not activate strike semantics.
     #  - startup grace: a slow first heartbeat during/just after startup is
     #    expected (heavy imports); defer and cap strikes so we never fail an
     #    otherwise-healthy process while it is still booting — BUT bounded by
     #    startup_grace_hard_s so a process that crashed on spawn and never
     #    heartbeats is still failed during a long startup.
-    #  - recent manager loop stall: the manager (not the process) was briefly
-    #    delayed; defer until the strike count / hard timeout is reached. This
-    #    keeps a genuinely dead process failing even across a transient stall.
     grace_defer = in_startup_grace and hb_age < startup_grace_hard_s
-    defer = grace_defer or (
-        recent_stall
-        and handle.heartbeat_stale_strikes < strikes_to_fail
-        and hb_age < hard_timeout_s
+    strike_defer = (
+        handle.heartbeat_stale_strikes < strikes_to_fail and hb_age < hard_timeout_s
     )
+    defer = grace_defer or strike_defer
     if defer:
         if grace_defer:
             handle.heartbeat_stale_strikes = min(
@@ -2081,9 +2169,12 @@ def enforce_managed_process_heartbeat_timeout(
                 "process_id": handle.spec.process_id,
                 "heartbeat_age_s": float(hb_age),
                 "heartbeat_timeout_s": timeout_s,
+                "heartbeat_hard_timeout_s": hard_timeout_s,
                 "strikes": int(handle.heartbeat_stale_strikes),
                 "strikes_to_fail": strikes_to_fail,
+                "defer_reason": "startup_grace" if grace_defer else "stale_strikes",
                 "recent_manager_loop_stall": recent_stall,
+                "manager_loop_stall_source": stall_source,
                 "in_startup_grace": in_startup_grace,
                 "last_manager_loop_stall_duration_s": handle.last_manager_loop_stall_duration_s,
                 "ts": {"t_wall": time.time(), "t_mono": now_mono},
@@ -2093,6 +2184,9 @@ def enforce_managed_process_heartbeat_timeout(
 
     handle.state = _enum_member(handle.state, "FAILED")
     handle.last_error_kind = "heartbeat_stale"
+    handle.heartbeat_failure_trigger = (
+        "hard_timeout" if hb_age >= hard_timeout_s else "stale_strikes"
+    )
     handle.last_failure_pid = handle.popen_pid or handle.pid
     if heartbeat_received:
         handle.last_error = f"heartbeat stale ({hb_age:.2f}s > {timeout_s:.2f}s)"

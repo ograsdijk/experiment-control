@@ -419,6 +419,10 @@ class Manager(
         self._last_pump_end_mono: float | None = None
         self._last_pump_duration_s: float | None = None
         self._last_pump_gap_s: float | None = None
+        # Populated before a pump executes so timeout supervision can account
+        # for the pump that is currently delayed, not only completed pumps.
+        self._current_pump_start_mono: float | None = None
+        self._current_pump_gap_s: float | None = None
         self._last_loop_stall_mono: float | None = None
         self._last_loop_stall_duration_s: float | None = None
         # Set while startup_sequence runs (and for a short grace window after).
@@ -439,6 +443,7 @@ class Manager(
         self._manager_loop_stall_recent_s = 10.0
         self._heartbeat_stale_strikes_to_fail = 2
         self._heartbeat_hard_timeout_multiplier = 3.0
+        self._heartbeat_stall_reconcile_period_multiplier = 1.25
         self._last_orphan_cleanup: Json | None = None
         journal = ManagerJournal.start_or_disabled(
             enabled=bool(command_journal_enabled),
@@ -633,6 +638,16 @@ class Manager(
     # -----------------------------
 
     def add_process(self, spec: ProcessSpec) -> None:
+        if spec.heartbeat_period_s <= 0:
+            raise ValueError("heartbeat_period_s must be > 0")
+        if spec.heartbeat_timeout_s <= 0:
+            raise ValueError("heartbeat_timeout_s must be > 0")
+        hard_timeout_s = spec.heartbeat_hard_timeout_s
+        if hard_timeout_s is not None and hard_timeout_s <= spec.heartbeat_timeout_s:
+            raise ValueError(
+                f"Process {spec.process_id!r} heartbeat_hard_timeout_s must be "
+                f"greater than heartbeat_timeout_s ({spec.heartbeat_timeout_s:.3g}s)"
+            )
         shared_add_process(self, spec, handle_cls=ProcessHandle)
 
     def _build_router_spec(self) -> ProcessSpec:
@@ -1195,6 +1210,13 @@ class Manager(
     def _pump_once(self, poll_ms: int = 50) -> None:
         """Run one iteration of the manager poll loop."""
         start_mono = time.monotonic()
+        previous_end_mono = self._last_pump_end_mono
+        self._current_pump_start_mono = start_mono
+        self._current_pump_gap_s = (
+            None
+            if previous_end_mono is None
+            else max(0.0, start_mono - previous_end_mono)
+        )
         try:
             self._drain_supervisor_logs()
 
@@ -1226,7 +1248,11 @@ class Manager(
             # stale `last_hb_recv_mono` even when the process is fine.
             self._check_timeouts()
         finally:
-            self._record_pump_timing(start_mono, time.monotonic())
+            try:
+                self._record_pump_timing(start_mono, time.monotonic())
+            finally:
+                self._current_pump_start_mono = None
+                self._current_pump_gap_s = None
 
     def run_forever(self, poll_ms: int = 50) -> None:
         """
@@ -1406,19 +1432,33 @@ class Manager(
         if not isinstance(restart_policy, RestartPolicy):
             raise TypeError("restart_policy must be a RestartPolicy or string")
 
+        heartbeat_timeout_s = float(raw.get("heartbeat_timeout_s", 3.0))
+        hard_timeout_raw = raw.get("heartbeat_hard_timeout_s")
+        heartbeat_hard_timeout_s = (
+            None if hard_timeout_raw is None else float(hard_timeout_raw)
+        )
+        if (
+            heartbeat_hard_timeout_s is not None
+            and heartbeat_hard_timeout_s <= heartbeat_timeout_s
+        ):
+            raise ValueError(
+                "heartbeat_hard_timeout_s must be greater than heartbeat_timeout_s"
+            )
+
         return ProcessSpec(
             process_id=process_id,
             argv=argv,
             cwd=raw.get("cwd"),
             env=raw.get("env"),
             heartbeat_period_s=float(raw.get("heartbeat_period_s", 1.0)),
-            heartbeat_timeout_s=float(raw.get("heartbeat_timeout_s", 3.0)),
+            heartbeat_timeout_s=heartbeat_timeout_s,
             shutdown_timeout_s=float(raw.get("shutdown_timeout_s", 3.0)),
             restart_policy=restart_policy,
             restart_backoff_s=float(raw.get("restart_backoff_s", 0.5)),
             max_restarts=raw.get("max_restarts"),
             heartbeat_endpoint=raw.get("heartbeat_endpoint"),
             process_data_endpoint=raw.get("process_data_endpoint"),
+            heartbeat_hard_timeout_s=heartbeat_hard_timeout_s,
         )
 
     # -----------------------------
@@ -2562,6 +2602,23 @@ class Manager(
             payload["termination_error"] = handle.termination_error
             payload["recent_manager_loop_stall"] = handle.recent_manager_loop_stall
             payload["last_manager_loop_stall_duration_s"] = handle.last_manager_loop_stall_duration_s
+            payload["last_manager_loop_stall_source"] = (
+                handle.last_manager_loop_stall_source
+            )
+            payload["heartbeat_stall_reconcile_started_mono"] = (
+                handle.heartbeat_stall_reconcile_started_mono
+            )
+            payload["heartbeat_stall_reconcile_deadline_mono"] = (
+                handle.heartbeat_stall_reconcile_deadline_mono
+            )
+            payload["heartbeat_failure_trigger"] = handle.heartbeat_failure_trigger
+            configured_hard_timeout_s = handle.spec.heartbeat_hard_timeout_s
+            payload["heartbeat_hard_timeout_s"] = (
+                configured_hard_timeout_s
+                if configured_hard_timeout_s is not None
+                else handle.spec.heartbeat_timeout_s
+                * self._heartbeat_hard_timeout_multiplier
+            )
             payload["failure_pid"] = failure_pid
             payload["exit_code_hex"] = exit_code_hex(handle.last_exit_code)
             payload["exit_code_description"] = describe_exit_code(handle.last_exit_code)

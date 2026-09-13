@@ -172,6 +172,18 @@ def process_spec_kwargs_from_yaml(
         env = optional_dict(raw_obj.get("env"), path=["env"])
     except ConfigError as e:
         raise TypeError(str(e)) from None
+    heartbeat_timeout_s = float(raw_obj.get("heartbeat_timeout_s", 3.0))
+    hard_timeout_raw = raw_obj.get("heartbeat_hard_timeout_s")
+    heartbeat_hard_timeout_s = (
+        None if hard_timeout_raw is None else float(hard_timeout_raw)
+    )
+    if (
+        heartbeat_hard_timeout_s is not None
+        and heartbeat_hard_timeout_s <= heartbeat_timeout_s
+    ):
+        raise TypeError(
+            "heartbeat_hard_timeout_s must be greater than heartbeat_timeout_s"
+        )
     return {
         "process_id": process_id,
         "argv": argv,
@@ -182,11 +194,12 @@ def process_spec_kwargs_from_yaml(
             if heartbeat_period_s is None
             else heartbeat_period_s
         ),
-        "heartbeat_timeout_s": float(raw_obj.get("heartbeat_timeout_s", 3.0)),
+        "heartbeat_timeout_s": heartbeat_timeout_s,
         "shutdown_timeout_s": float(raw_obj.get("shutdown_timeout_s", 3.0)),
         "restart_policy": restart_policy,
         "restart_backoff_s": float(raw_obj.get("restart_backoff_s", 0.5)),
         "max_restarts": raw_obj.get("max_restarts"),
         "heartbeat_endpoint": raw_obj.get("heartbeat_endpoint"),
         "process_data_endpoint": raw_obj.get("process_data_endpoint"),
+        "heartbeat_hard_timeout_s": heartbeat_hard_timeout_s,
     }

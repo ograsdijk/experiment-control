@@ -23,6 +23,50 @@ def _write(path: Path, text: str) -> None:
 
 
 class ProcessSpecPathResolutionTests(unittest.TestCase):
+    def test_process_heartbeat_hard_timeout_is_parsed(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "process.yaml"
+            _write(
+                path,
+                """
+                process_id: worker
+                argv: [python, -m, worker]
+                heartbeat_timeout_s: 3.0
+                heartbeat_hard_timeout_s: 8.0
+                """,
+            )
+            spec = process_spec_kwargs_from_yaml(
+                path,
+                manager_rpc="tcp://127.0.0.1:6502",
+                manager_pub="tcp://127.0.0.1:6503",
+                restart_policy_enum=RestartPolicy,
+            )
+
+        self.assertEqual(spec["heartbeat_hard_timeout_s"], 8.0)
+
+    def test_process_heartbeat_hard_timeout_must_exceed_soft_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "process.yaml"
+            _write(
+                path,
+                """
+                process_id: worker
+                argv: [python, -m, worker]
+                heartbeat_timeout_s: 3.0
+                heartbeat_hard_timeout_s: 3.0
+                """,
+            )
+            with self.assertRaisesRegex(
+                TypeError,
+                "heartbeat_hard_timeout_s must be greater than heartbeat_timeout_s",
+            ):
+                process_spec_kwargs_from_yaml(
+                    path,
+                    manager_rpc="tcp://127.0.0.1:6502",
+                    manager_pub="tcp://127.0.0.1:6503",
+                    restart_policy_enum=RestartPolicy,
+                )
+
     def test_process_paths_resolve_relative_to_config_dir(self) -> None:
         with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as cwd_td:
             root = Path(td)

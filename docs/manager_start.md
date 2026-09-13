@@ -358,6 +358,7 @@ init_kwargs:
 
 heartbeat_period_s: 1.0
 heartbeat_timeout_s: 3.0
+heartbeat_hard_timeout_s: 9.0  # optional; must be greater than heartbeat_timeout_s
 shutdown_timeout_s: 3.0
 restart_policy: NEVER
 restart_backoff_s: 0.5
@@ -368,6 +369,10 @@ Notes:
 - `process.file` and `process.module` are mutually exclusive.
 - The manager injects `process_id`, `manager_rpc` (router front door), `manager_pub`, and `heartbeat_endpoint` automatically.
 - `heartbeat_period_s` is passed to the process runner if you supply it.
+- `heartbeat_timeout_s` is the soft stale threshold. Staleness normally needs
+  two rate-limited observations before failure. `heartbeat_hard_timeout_s` is
+  an optional absolute ceiling; when omitted, the manager uses three times the
+  soft timeout for backward compatibility.
 - `disabled_devices` is the startup filter only; you can adjust it at runtime via
   HDF process RPC (`hdf.devices.get`, `hdf.devices.enable`, `hdf.devices.disable`,
   `hdf.rotate`).
