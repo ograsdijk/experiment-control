@@ -508,16 +508,18 @@ class FederationHub:
                 )
         return out
 
-    def handle_poll_events(self, events: dict[zmq.Socket, int]) -> None:
+    def handle_poll_events(self, events: dict[zmq.Socket, int]) -> int:
         if not self.enabled:
-            return
+            return 0
+        drained = 0
         for sock, peer_id in list(self._socket_to_peer.items()):
             if events.get(sock) != zmq.POLLIN:
                 continue
             peer_rt = self._peers.get(peer_id)
             if peer_rt is None:
                 continue
-            self._drain_peer_events(peer_rt)
+            drained += self._drain_peer_events(peer_rt)
+        return drained
 
     def check_timeouts(self, now_mono: float) -> None:
         if not self.enabled:
@@ -1220,10 +1222,11 @@ class FederationHub:
             "remote_device_id": mirror.remote_device_id,
         }
 
-    def _drain_peer_events(self, peer_rt: PeerRuntime) -> None:
+    def _drain_peer_events(self, peer_rt: PeerRuntime) -> int:
         sock = peer_rt.sub_sock
         if sock is None:
-            return
+            return 0
+        drained = 0
         while True:
             try:
                 topic_b, payload_b = sock.recv_multipart(flags=zmq.NOBLOCK)
@@ -1232,6 +1235,7 @@ class FederationHub:
             except Exception as e:
                 peer_rt.last_error = str(e)
                 break
+            drained += 1
             topic = topic_b.decode("utf-8", errors="ignore")
             payload = safe_json_loads(payload_b)
             if not isinstance(payload, dict):
@@ -1239,6 +1243,7 @@ class FederationHub:
             peer_rt.last_event_recv_mono = time.monotonic()
             peer_rt.last_error = None
             self._relay_event(peer_rt, topic, payload)
+        return drained
 
     def _relay_event(self, peer_rt: PeerRuntime, topic: str, payload: Json) -> None:
         if topic == "manager.process_telemetry_update":

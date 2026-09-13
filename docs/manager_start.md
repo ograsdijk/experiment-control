@@ -98,6 +98,7 @@ manager:
     heartbeat_base: 6100              # managed-process heartbeat port base
     event_base: 6200                  # managed-process event/data port base
   heartbeat_timeout_s: 3.0
+  slow_pump_threshold_s: 1.0          # detailed manager.pump_slow diagnostics
   telemetry_stale_s: 10.0
   device_rpc_timeout_ms: 1500
   interceptor_rpc_timeout_ms: 500
@@ -199,6 +200,11 @@ Notes:
 - The manager binds its **internal** RPC on `internal_ports.rpc` and the router forwards to it.
 - Router queue knobs (`router_*_queue_max`, `router_inflight_max`) control
   device-router overload behavior and memory ceilings under sustained load.
+- `slow_pump_threshold_s` controls when the manager emits `manager.pump_slow`.
+  Normal pumps only pay for clock reads and inexpensive counters; slow-pump
+  events contain per-phase wall times, process/thread CPU deltas, work counts,
+  queue depths, ZMQ readiness, and drain-cap hits. On platforms without
+  `time.thread_time()`, `thread_cpu_s` is null and process CPU remains available.
 - Telemetry/chunk cache knobs (`telemetry_cache_*`, `chunk_cache_*`) bound
   manager-side key growth for high-cardinality device/signal/stream workloads.
 - `bind_host` controls external bind/listen host and can be wildcard (`0.0.0.0`, `*`, `[::]`).

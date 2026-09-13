@@ -528,8 +528,10 @@ class ProcessSnapshotMemoryTests(unittest.TestCase):
             manager, handle, 5.0
         )
 
+        first_tick = iter([1.0])
         with mock.patch(
-            "experiment_control.manager.time.monotonic", side_effect=[1.0, 5.1]
+            "experiment_control.manager.time.monotonic",
+            side_effect=lambda: next(first_tick, 5.1),
         ):
             manager._pump_once(poll_ms=0)
 

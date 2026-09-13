@@ -259,7 +259,7 @@ def _handle_driver_pub_message(manager: Any, topic: str, msg: Json) -> None:
     )
 
 
-def handle_driver_pub(manager: Any) -> None:
+def handle_driver_pub(manager: Any) -> int:
     # Drain all available driver pub messages per tick. One-per-tick
     # was the prior behaviour and caused a backlog under load (~18
     # devices in vacuum-cryo each pumping telemetry + heartbeats at
@@ -340,8 +340,12 @@ def handle_driver_pub(manager: Any) -> None:
     for topic, msg in [*chunk_messages, *other_messages]:
         _handle_driver_pub_message(manager, topic, msg)
 
+    drained = base_reads + extended_reads
+    record_work = getattr(manager, "_record_current_pump_work_count", None)
+    if callable(record_work):
+        record_work("driver_pub", drained)
     if not cap_hit:
-        return
+        return drained
     # Loop completed without seeing zmq.Again: queue still has data.
     # Surface this (rate-limited) so operators see the backlog instead
     # of silent message lag. Report what was actually drained this tick
@@ -349,7 +353,8 @@ def handle_driver_pub(manager: Any) -> None:
     # just the base constant — the two diverge whenever the extension
     # pass ran.
     _counter_add(manager, "_manager_driver_pub_drain_cap_hit_total")
-    manager._maybe_publish_drain_cap_hit("driver_pub", base_reads + extended_reads)
+    manager._maybe_publish_drain_cap_hit("driver_pub", drained)
+    return drained
 
 
 def _emit_ingest_error(manager: Any, topic: str, payload: Json) -> None:
@@ -800,8 +805,8 @@ class DriverPubMixin:
     a circular reference. The 2-line forwarders on Manager stay.
     """
 
-    def _handle_driver_pub(self) -> None:
-        handle_driver_pub(self)
+    def _handle_driver_pub(self) -> int:
+        return handle_driver_pub(self)
 
     def _ingest_chunk_ready(self, msg: Json) -> None:
         ingest_chunk_ready(self, msg)
