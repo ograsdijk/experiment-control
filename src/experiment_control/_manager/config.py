@@ -153,10 +153,24 @@ def _coerce_auto_reconnect(raw: object) -> AutoReconnectSpec:
 
     stale_raw = obj.get("on_telemetry_stale_s")
     stale_s = None if stale_raw is None else float(stale_raw)
-    if enabled and (stale_s is None or stale_s <= 0):
+    if stale_s is not None and stale_s <= 0:
         raise ConfigError(
             "auto_reconnect.on_telemetry_stale_s",
-            "must be > 0 when enabled",
+            "must be > 0 or null",
+        )
+    degraded_raw = obj.get("on_degraded_s")
+    degraded_s = None if degraded_raw is None else float(degraded_raw)
+    if degraded_s is not None and degraded_s <= 0:
+        raise ConfigError("auto_reconnect.on_degraded_s", "must be > 0 or null")
+    if enabled and stale_s is None and degraded_s is None:
+        raise ConfigError(
+            "auto_reconnect",
+            "requires on_telemetry_stale_s or on_degraded_s when enabled",
+        )
+    restart_raw = obj.get("restart_driver_after_max_attempts", False)
+    if not isinstance(restart_raw, bool):
+        raise ConfigError(
+            "auto_reconnect.restart_driver_after_max_attempts", "must be a bool"
         )
 
     cooldown_s = float(obj.get("cooldown_s", 30.0))
@@ -170,6 +184,11 @@ def _coerce_auto_reconnect(raw: object) -> AutoReconnectSpec:
     max_attempts = None if max_raw is None else int(max_raw)
     if max_attempts is not None and max_attempts < 1:
         raise ConfigError("auto_reconnect.max_attempts", "must be >= 1 or null")
+    if restart_raw and max_attempts is None:
+        raise ConfigError(
+            "auto_reconnect.max_attempts",
+            "must be finite when restart_driver_after_max_attempts is enabled",
+        )
 
     disconnect_timeout_ms = int(obj.get("disconnect_timeout_ms", 1000))
     connect_timeout_raw = obj.get("connect_timeout_ms")
@@ -182,6 +201,8 @@ def _coerce_auto_reconnect(raw: object) -> AutoReconnectSpec:
     return AutoReconnectSpec(
         enabled=enabled,
         on_telemetry_stale_s=stale_s,
+        on_degraded_s=degraded_s,
+        restart_driver_after_max_attempts=bool(restart_raw),
         cooldown_s=cooldown_s,
         max_attempts=max_attempts,
         reset_attempts_after_ok_s=reset_s,

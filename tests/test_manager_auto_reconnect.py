@@ -9,6 +9,7 @@ import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -28,6 +29,8 @@ from experiment_control._manager.process_supervision import (
     _auto_reconnect_should_attempt,
     _maybe_auto_reconnect_device,
     _run_auto_reconnect,
+    _run_auto_reconnect_driver_restart,
+    enforce_device_driver_stop_timeout,
 )
 from experiment_control.types import Timestamp
 
@@ -47,7 +50,8 @@ class ManagerAutoReconnectTests(unittest.TestCase):
                     init_kwargs: {}
                     auto_reconnect:
                       enabled: true
-                      on_telemetry_stale_s: 5.0
+                      on_degraded_s: 30.0
+                      restart_driver_after_max_attempts: true
                       cooldown_s: 30.0
                       max_attempts: 3
                       reset_attempts_after_ok_s: 120.0
@@ -61,9 +65,291 @@ class ManagerAutoReconnectTests(unittest.TestCase):
             spec = device_spec_from_yaml(path)
 
         self.assertTrue(spec.auto_reconnect.enabled)
-        self.assertEqual(spec.auto_reconnect.on_telemetry_stale_s, 5.0)
+        self.assertIsNone(spec.auto_reconnect.on_telemetry_stale_s)
+        self.assertEqual(spec.auto_reconnect.on_degraded_s, 30.0)
+        self.assertTrue(spec.auto_reconnect.restart_driver_after_max_attempts)
         self.assertEqual(spec.auto_reconnect.max_attempts, 3)
         self.assertEqual(spec.auto_reconnect.disconnect_timeout_ms, 1000)
+
+    def test_sustained_degraded_heartbeat_triggers_reconnect(self) -> None:
+        spec = DeviceSpec(
+            device_id="ctc100", device_class_path="driver.py",
+            device_class_name="Driver", device_init_kwargs={}, telemetry_calls=[],
+            auto_reconnect=AutoReconnectSpec(
+                enabled=True, on_degraded_s=30.0, cooldown_s=60.0, max_attempts=2
+            ),
+        )
+        handle = DeviceHandle(spec=spec)
+        handle.driver_process_state = ManagedProcessState.RUNNING
+        handle.driver_running_since_mono = 1.0
+        handle.last_hb_recv_mono = 9.5
+        handle.last_hb = SimpleNamespace(
+            device_reachable=False, device_state="DEGRADED", last_error="serial timeout"
+        )
+        handle.rpc_endpoint = "tcp://127.0.0.1:1"
+        manager = mock.Mock()
+        manager._heartbeat_timeout_s = 3.0
+        manager._telemetry_last_bundle_ts = {}
+
+        should, age, _reason = _auto_reconnect_should_attempt(
+            manager, "ctc100", handle, 10.0
+        )
+        self.assertFalse(should)
+        self.assertEqual(age, 0.0)
+
+        handle.last_hb_recv_mono = 39.5
+        should, age, reason = _auto_reconnect_should_attempt(
+            manager, "ctc100", handle, 40.0
+        )
+        self.assertTrue(should)
+        self.assertEqual(age, 30.0)
+        self.assertEqual(reason, "degraded")
+
+    def test_healthy_heartbeat_clears_degraded_timer(self) -> None:
+        spec = DeviceSpec(
+            device_id="ctc100", device_class_path="driver.py",
+            device_class_name="Driver", device_init_kwargs={}, telemetry_calls=[],
+            auto_reconnect=AutoReconnectSpec(enabled=True, on_degraded_s=30.0),
+        )
+        handle = DeviceHandle(spec=spec)
+        handle.driver_process_state = ManagedProcessState.RUNNING
+        handle.driver_running_since_mono = 1.0
+        handle.last_hb_recv_mono = 9.5
+        handle.last_hb = SimpleNamespace(
+            device_reachable=False, device_state="DEGRADED", last_error=None
+        )
+        handle.rpc_endpoint = "tcp://127.0.0.1:1"
+        manager = mock.Mock()
+        manager._heartbeat_timeout_s = 3.0
+        manager._telemetry_last_bundle_ts = {}
+
+        _auto_reconnect_should_attempt(manager, "ctc100", handle, 10.0)
+        handle.last_hb = SimpleNamespace(device_reachable=True, device_state="OK")
+        handle.last_hb_recv_mono = 19.5
+        _auto_reconnect_should_attempt(manager, "ctc100", handle, 20.0)
+
+        self.assertIsNone(handle.auto_reconnect_degraded_since_mono)
+
+    def test_reconnect_is_verified_by_fresh_healthy_telemetry(self) -> None:
+        spec = DeviceSpec(
+            device_id="ctc100", device_class_path="driver.py",
+            device_class_name="Driver", device_init_kwargs={}, telemetry_calls=[],
+            auto_reconnect=AutoReconnectSpec(
+                enabled=True, on_degraded_s=30.0, reset_attempts_after_ok_s=300.0
+            ),
+        )
+        handle = DeviceHandle(spec=spec)
+        handle.driver_process_state = ManagedProcessState.RUNNING
+        handle.driver_running_since_mono = 1.0
+        handle.last_hb_recv_mono = 99.5
+        handle.last_hb = SimpleNamespace(device_reachable=True, device_state="OK")
+        handle.rpc_endpoint = "tcp://127.0.0.1:1"
+        handle.auto_reconnect_attempts = 1
+        handle.auto_reconnect_waiting_for_health = True
+        handle.auto_reconnect_last_success_mono = 99.0
+        manager = mock.Mock()
+        manager._heartbeat_timeout_s = 3.0
+        manager._telemetry_last_bundle_ts = {
+            "ctc100": Timestamp(t_wall=1.0, t_mono=99.5)
+        }
+        manager._telemetry_last_recv_mono = {"ctc100": 99.5}
+        manager._telemetry_latest = {
+            "ctc100": {
+                "temperature": (
+                    Timestamp(t_wall=1.0, t_mono=99.5),
+                    SimpleNamespace(quality="OK"),
+                )
+            }
+        }
+
+        with mock.patch(
+            "experiment_control._manager.process_supervision.time.monotonic",
+            return_value=100.0,
+        ):
+            _maybe_auto_reconnect_device(manager, "ctc100", handle, 100.0)
+
+        self.assertFalse(handle.auto_reconnect_waiting_for_health)
+        self.assertEqual(handle.auto_reconnect_healthy_since_mono, 100.0)
+        manager._publish_manager_event.assert_called_once_with(
+            "manager.device.auto_reconnect.recovered", mock.ANY
+        )
+
+    def test_exhausted_degraded_reconnects_schedule_automatic_driver_restart(self) -> None:
+        spec = DeviceSpec(
+            device_id="ctc100", device_class_path="driver.py",
+            device_class_name="Driver", device_init_kwargs={}, telemetry_calls=[],
+            auto_reconnect=AutoReconnectSpec(
+                enabled=True, on_degraded_s=30.0, cooldown_s=60.0,
+                max_attempts=2, restart_driver_after_max_attempts=True,
+            ),
+            driver_restart_backoff_s=2.0, driver_max_restarts=3,
+        )
+        handle = DeviceHandle(spec=spec)
+        handle.driver_process_state = ManagedProcessState.RUNNING
+        handle.driver_running_since_mono = 1.0
+        handle.last_hb_recv_mono = 99.5
+        handle.last_hb = SimpleNamespace(
+            device_reachable=False, device_state="DEGRADED", last_error="serial timeout"
+        )
+        handle.rpc_endpoint = "tcp://127.0.0.1:1"
+        handle.auto_reconnect_attempts = 2
+        handle.auto_reconnect_last_attempt_mono = 1.0
+        handle.auto_reconnect_last_trigger = "degraded"
+        handle.auto_reconnect_degraded_since_mono = 1.0
+        handle.process = mock.Mock()
+        handle.process.poll.return_value = None
+        manager = mock.Mock()
+        manager._heartbeat_timeout_s = 3.0
+        manager._devices = {"ctc100": handle}
+        manager._telemetry_last_bundle_ts = {}
+        manager._telemetry_last_recv_mono = {}
+        manager._lifecycle_device_locks = {}
+        manager._lifecycle_executor.submit.side_effect = (
+            lambda fn, *args, **kwargs: fn(*args, **kwargs)
+        )
+
+        with mock.patch(
+            "experiment_control._manager.process_supervision.time.monotonic",
+            return_value=100.0,
+        ):
+            _maybe_auto_reconnect_device(manager, "ctc100", handle, 100.0)
+
+        self.assertEqual(handle.driver_process_state, ManagedProcessState.FAILED)
+        self.assertTrue(handle.driver_restart_is_automatic)
+        self.assertTrue(handle.driver_reconnect_after_restart)
+        self.assertEqual(handle.driver_next_restart_t_mono, 102.0)
+        handle.process.terminate.assert_called_once()
+
+    def test_pre_reconnect_telemetry_does_not_verify_recovery(self) -> None:
+        spec = DeviceSpec(
+            device_id="ctc100", device_class_path="driver.py",
+            device_class_name="Driver", device_init_kwargs={}, telemetry_calls=[],
+            auto_reconnect=AutoReconnectSpec(enabled=True, on_degraded_s=30.0),
+        )
+        handle = DeviceHandle(spec=spec)
+        handle.driver_process_state = ManagedProcessState.RUNNING
+        handle.driver_running_since_mono = 1.0
+        handle.last_hb_recv_mono = 100.5
+        handle.last_hb = SimpleNamespace(device_reachable=True, device_state="OK")
+        handle.rpc_endpoint = "tcp://127.0.0.1:1"
+        handle.auto_reconnect_attempts = 1
+        handle.auto_reconnect_waiting_for_health = True
+        handle.auto_reconnect_last_success_mono = 100.0
+        manager = mock.Mock()
+        manager._heartbeat_timeout_s = 3.0
+        manager._telemetry_last_bundle_ts = {
+            "ctc100": Timestamp(t_wall=1.0, t_mono=99.5)
+        }
+        manager._telemetry_last_recv_mono = {"ctc100": 99.5}
+        manager._telemetry_latest = {
+            "ctc100": {
+                "temperature": (
+                    Timestamp(t_wall=1.0, t_mono=99.5),
+                    SimpleNamespace(quality="OK"),
+                )
+            }
+        }
+
+        _maybe_auto_reconnect_device(manager, "ctc100", handle, 101.0)
+
+        self.assertTrue(handle.auto_reconnect_waiting_for_health)
+        self.assertIsNone(handle.auto_reconnect_healthy_since_mono)
+        manager._publish_manager_event.assert_not_called()
+
+    def test_auto_reconnect_exhaustion_uses_stop_timeout_escalation(self) -> None:
+        handle = SimpleNamespace(
+            driver_process_state="FAILED",
+            driver_last_error_kind="auto_reconnect_exhausted",
+            driver_stop_requested_t_mono=10.0,
+            driver_last_error="degraded",
+            driver_last_failure_pid=None,
+            driver_pid=123,
+            process=mock.Mock(),
+            spec=SimpleNamespace(driver_stop_timeout_s=3.0, driver_kill_timeout_s=3.0),
+        )
+        handle.process.poll.return_value = None
+        manager = SimpleNamespace(_publish_driver_event=mock.Mock())
+
+        enforce_device_driver_stop_timeout(manager, handle, 14.0)
+
+        handle.process.kill.assert_called_once()
+        manager._publish_driver_event.assert_called_once_with(
+            "manager.driver.killing", handle
+        )
+
+    def test_queued_reconnect_is_cancelled_after_driver_generation_changes(self) -> None:
+        spec = DeviceSpec(
+            device_id="ctc100", device_class_path="driver.py",
+            device_class_name="Driver", device_init_kwargs={}, telemetry_calls=[],
+            auto_reconnect=AutoReconnectSpec(enabled=True, on_degraded_s=30.0),
+        )
+        handle = DeviceHandle(spec=spec)
+        handle.driver_process_state = ManagedProcessState.RUNNING
+        handle.driver_generation = 2
+        handle.driver_running_since_mono = 90.0
+        handle.last_hb_recv_mono = 99.5
+        handle.last_hb = SimpleNamespace(
+            device_reachable=False, device_state="DEGRADED"
+        )
+        handle.auto_reconnect_degraded_since_mono = 60.0
+        handle.auto_reconnect_pending = True
+        manager = mock.Mock()
+        manager._devices = {"ctc100": handle}
+        manager._heartbeat_timeout_s = 3.0
+        manager._lifecycle_device_locks = {}
+
+        with mock.patch(
+            "experiment_control._manager.process_supervision.time.monotonic",
+            return_value=100.0,
+        ):
+            _run_auto_reconnect(
+                manager, "ctc100", handle, 1, 40.0, "degraded", 1
+            )
+
+        manager._call_device_rpc.assert_not_called()
+        self.assertFalse(handle.auto_reconnect_pending)
+        manager._publish_manager_event.assert_called_once_with(
+            "manager.device.auto_reconnect.cancelled", mock.ANY
+        )
+
+    def test_queued_restart_is_cancelled_when_degraded_state_recovers(self) -> None:
+        spec = DeviceSpec(
+            device_id="ctc100", device_class_path="driver.py",
+            device_class_name="Driver", device_init_kwargs={}, telemetry_calls=[],
+            auto_reconnect=AutoReconnectSpec(
+                enabled=True, on_degraded_s=30.0, max_attempts=2,
+                restart_driver_after_max_attempts=True,
+            ),
+        )
+        handle = DeviceHandle(spec=spec)
+        handle.driver_process_state = ManagedProcessState.RUNNING
+        handle.driver_generation = 1
+        handle.driver_running_since_mono = 1.0
+        handle.last_hb_recv_mono = 99.5
+        handle.last_hb = SimpleNamespace(device_reachable=True, device_state="OK")
+        handle.auto_reconnect_attempts = 2
+        handle.auto_reconnect_degraded_since_mono = 60.0
+        handle.auto_reconnect_pending = True
+        handle.process = mock.Mock()
+        manager = mock.Mock()
+        manager._devices = {"ctc100": handle}
+        manager._heartbeat_timeout_s = 3.0
+        manager._lifecycle_device_locks = {}
+
+        with mock.patch(
+            "experiment_control._manager.process_supervision.time.monotonic",
+            return_value=100.0,
+        ):
+            _run_auto_reconnect_driver_restart(
+                manager, "ctc100", handle, 40.0, "degraded", 1
+            )
+
+        handle.process.terminate.assert_not_called()
+        self.assertEqual(handle.driver_process_state, ManagedProcessState.RUNNING)
+        self.assertFalse(handle.auto_reconnect_pending)
+        manager._publish_manager_event.assert_called_once_with(
+            "manager.device.auto_reconnect.cancelled", mock.ANY
+        )
 
     def test_auto_reconnect_attempts_disconnect_then_connect_on_stale_telemetry(self) -> None:
         spec = DeviceSpec(

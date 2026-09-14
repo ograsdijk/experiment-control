@@ -266,7 +266,7 @@ def _auto_reconnect_message(topic: str, payload: Json) -> str:
     if isinstance(reconnect, dict):
         max_attempts = reconnect.get("max_attempts")
     attempt = payload.get("attempt")
-    age = payload.get("telemetry_age_s")
+    age = payload.get("trigger_age_s", payload.get("telemetry_age_s"))
     suffix = ""
     if attempt is not None:
         suffix += f" attempt {attempt}"
@@ -274,13 +274,24 @@ def _auto_reconnect_message(topic: str, payload: Json) -> str:
             suffix += f"/{max_attempts}"
     if age is not None:
         try:
-            suffix += f" telemetry_age={float(age):.2f}s"
+            suffix += f" trigger_age={float(age):.2f}s"
         except Exception:
             pass
+    trigger = payload.get("trigger")
+    if trigger:
+        suffix += f" trigger={trigger}"
     if topic.endswith("attempt"):
         return f"Auto-reconnect {device_id}: attempting reconnect{suffix}"
     if topic.endswith("success"):
-        return f"Auto-reconnect {device_id}: reconnect succeeded{suffix}"
+        return f"Auto-reconnect {device_id}: reconnect RPC succeeded{suffix}"
+    if topic.endswith("recovered"):
+        return f"Auto-reconnect {device_id}: device health recovered"
+    if topic.endswith("escalated"):
+        return f"Auto-reconnect {device_id}: escalating to driver restart{suffix}"
+    if topic.endswith("degraded"):
+        return f"Auto-reconnect {device_id}: degraded-state timer started"
+    if topic.endswith("cancelled"):
+        return f"Auto-reconnect {device_id}: cancelled ({payload.get('reason')}){suffix}"
     if topic.endswith("suppressed"):
         return f"Auto-reconnect {device_id}: suppressed ({payload.get('reason')}){suffix}"
     if topic.endswith("reset"):

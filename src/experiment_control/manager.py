@@ -2268,6 +2268,16 @@ class Manager(
                 "last_error": handle.auto_reconnect_last_error,
                 "suppressed": bool(handle.auto_reconnect_suppressed),
                 "on_telemetry_stale_s": handle.spec.auto_reconnect.on_telemetry_stale_s,
+                "on_degraded_s": getattr(
+                    handle.spec.auto_reconnect, "on_degraded_s", None
+                ),
+                "restart_driver_after_max_attempts": bool(
+                    getattr(
+                        handle.spec.auto_reconnect,
+                        "restart_driver_after_max_attempts",
+                        False,
+                    )
+                ),
                 "cooldown_s": handle.spec.auto_reconnect.cooldown_s,
                 "max_attempts": handle.spec.auto_reconnect.max_attempts,
                 "reset_attempts_after_ok_s": handle.spec.auto_reconnect.reset_attempts_after_ok_s,
