@@ -469,7 +469,8 @@ class ProcessLogsMixin(_MixinBase):
         for key in stale:
             self._supervisor_log_threads.pop(key, None)
 
-    def _drain_supervisor_logs(self, *, max_items: int = 250) -> None:
+    def _drain_supervisor_logs(self, *, max_items: int = 250) -> int:
+        drained = 0
         # Snapshot + reset atomically so concurrent reader-thread bumps
         # during the drain aren't lost.
         with self._supervisor_log_dropped_lock:
@@ -491,6 +492,7 @@ class ProcessLogsMixin(_MixinBase):
                 item = self._supervisor_log_queue.get_nowait()
             except queue.Empty:
                 break
+            drained += 1
             if not isinstance(item, dict):
                 continue
             message = str(item.get("message", "") or "")
@@ -522,6 +524,7 @@ class ProcessLogsMixin(_MixinBase):
             self._emit_supervisor_item(item)
         self._flush_stale_supervisor_blocks()
         self._prune_supervisor_log_threads()
+        return drained
 
 
 # --- Backward-compat module-level forwarders -------------------------
@@ -582,5 +585,5 @@ def queue_supervisor_log(manager: Any, item: Json) -> None:
     ProcessLogsMixin._queue_supervisor_log(manager, item)
 
 
-def drain_supervisor_logs(manager: Any, *, max_items: int = 250) -> None:
-    ProcessLogsMixin._drain_supervisor_logs(manager, max_items=max_items)
+def drain_supervisor_logs(manager: Any, *, max_items: int = 250) -> int:
+    return ProcessLogsMixin._drain_supervisor_logs(manager, max_items=max_items)

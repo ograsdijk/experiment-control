@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import os
 import queue
 import subprocess
@@ -177,6 +178,40 @@ from .utils.zmq_helpers import MAX_DRAIN_PER_TICK, json_dumps, safe_json_loads
 
 Json = dict[str, Any]
 
+
+def _read_optional_clock(name: str) -> float | None:
+    clock = getattr(time, name, None)
+    if not callable(clock):
+        return None
+    try:
+        return float(clock())
+    except (OSError, RuntimeError):
+        return None
+
+
+def _clock_delta(start: float | None, end: float | None) -> float | None:
+    if start is None or end is None:
+        return None
+    return max(0.0, end - start)
+
+
+def _queue_depth(value: Any) -> int | None:
+    try:
+        return max(0, int(value.qsize()))
+    except (AttributeError, NotImplementedError, OSError, TypeError, ValueError):
+        return None
+
+
+def _socket_readable(value: Any) -> bool | None:
+    try:
+        return bool(value.getsockopt(zmq.EVENTS) & zmq.POLLIN)
+    except (AttributeError, OSError, TypeError, ValueError, zmq.ZMQError):
+        return None
+
+
+def _work_count(value: Any) -> int:
+    return max(0, int(value)) if isinstance(value, int) else 0
+
 __all__ = [
     "AutoReconnectSpec",
     "CommandInterceptorRoute",
@@ -296,6 +331,7 @@ class Manager(
         process_data_bind_base: str = "tcp://127.0.0.1:6200",
         heartbeat_timeout_s: float = 3.0,
         heartbeat_hard_timeout_s: float = 10.0,
+        slow_pump_threshold_s: float = 1.0,
         telemetry_stale_s: float = 10.0,
         device_rpc_timeout_ms: int = 1500,
         interceptor_rpc_timeout_ms: int = 500,
@@ -349,6 +385,9 @@ class Manager(
             raise ValueError(
                 "heartbeat_hard_timeout_s must be greater than heartbeat_timeout_s"
             )
+        self._slow_pump_threshold_s = float(slow_pump_threshold_s)
+        if not math.isfinite(self._slow_pump_threshold_s) or self._slow_pump_threshold_s <= 0:
+            raise ValueError("slow_pump_threshold_s must be finite and > 0")
         self._telemetry_stale_s = telemetry_stale_s
         self._device_rpc_timeout_ms = device_rpc_timeout_ms
         self._interceptor_rpc_timeout_ms = int(interceptor_rpc_timeout_ms)
@@ -419,6 +458,11 @@ class Manager(
         self._last_pump_end_mono: float | None = None
         self._last_pump_duration_s: float | None = None
         self._last_pump_gap_s: float | None = None
+        # Populated before a pump executes so timeout supervision can account
+        # for the pump that is currently delayed, not only completed pumps.
+        self._current_pump_start_mono: float | None = None
+        self._current_pump_gap_s: float | None = None
+        self._current_pump_work_counts: dict[str, int] | None = None
         self._last_loop_stall_mono: float | None = None
         self._last_loop_stall_duration_s: float | None = None
         # Set while startup_sequence runs (and for a short grace window after).
@@ -435,10 +479,12 @@ class Manager(
         self._startup_grace_s = 10.0
         self._startup_grace_hard_timeout_s = 30.0
         self._loop_stall_count = 0
+        self._slow_pump_count = 0
         self._manager_loop_stall_warn_s = 1.0
         self._manager_loop_stall_recent_s = 10.0
         self._heartbeat_stale_strikes_to_fail = 2
         self._heartbeat_hard_timeout_multiplier = 3.0
+        self._heartbeat_stall_reconcile_period_multiplier = 1.25
         self._last_orphan_cleanup: Json | None = None
         journal = ManagerJournal.start_or_disabled(
             enabled=bool(command_journal_enabled),
@@ -551,6 +597,8 @@ class Manager(
         # (see _maybe_publish_drain_cap_hit) so a sustained backlog does
         # not flood the manager event bus.
         self._last_drain_cap_event_mono: dict[str, float] = {}
+        self._manager_process_hb_drain_cap_hit_total = 0
+        self._manager_process_data_drain_cap_hit_total = 0
 
     # -----------------------------
     # Public API
@@ -633,6 +681,16 @@ class Manager(
     # -----------------------------
 
     def add_process(self, spec: ProcessSpec) -> None:
+        if spec.heartbeat_period_s <= 0:
+            raise ValueError("heartbeat_period_s must be > 0")
+        if spec.heartbeat_timeout_s <= 0:
+            raise ValueError("heartbeat_timeout_s must be > 0")
+        hard_timeout_s = spec.heartbeat_hard_timeout_s
+        if hard_timeout_s is not None and hard_timeout_s <= spec.heartbeat_timeout_s:
+            raise ValueError(
+                f"Process {spec.process_id!r} heartbeat_hard_timeout_s must be "
+                f"greater than heartbeat_timeout_s ({spec.heartbeat_timeout_s:.3g}s)"
+            )
         shared_add_process(self, spec, handle_cls=ProcessHandle)
 
     def _build_router_spec(self) -> ProcessSpec:
@@ -1169,64 +1227,258 @@ class Manager(
     # that resolve to ``ManagedProcessState.RUNNING`` /
     # ``DriverState.OK`` on first use, matching the prior wrapper.
 
-    def _record_pump_timing(self, start_mono: float, end_mono: float) -> None:
+    def _record_current_pump_work_count(self, phase: str, count: int) -> None:
+        counts = self._current_pump_work_counts
+        if counts is not None and phase in counts:
+            counts[phase] += max(0, int(count))
+
+    def _record_pump_timing(
+        self,
+        start_mono: float,
+        end_mono: float,
+        diagnostics: Json | None = None,
+    ) -> None:
         prev_end = self._last_pump_end_mono
         self._last_pump_start_mono = start_mono
         self._last_pump_end_mono = end_mono
         self._last_pump_duration_s = end_mono - start_mono
         self._last_pump_gap_s = None if prev_end is None else start_mono - prev_end
         stall_s = max(self._last_pump_duration_s, self._last_pump_gap_s or 0.0)
-        if stall_s <= self._manager_loop_stall_warn_s:
-            return
-        self._last_loop_stall_mono = end_mono
-        self._last_loop_stall_duration_s = stall_s
-        self._loop_stall_count += 1
-        self._publish_manager_event(
-            "manager.loop_stall",
-            {
-                "duration_s": stall_s,
-                "pump_duration_s": self._last_pump_duration_s,
-                "pump_gap_s": self._last_pump_gap_s,
-                "count": self._loop_stall_count,
-                "ts": {"t_wall": time.time(), "t_mono": end_mono},
-            },
+        if stall_s > self._manager_loop_stall_warn_s:
+            self._last_loop_stall_mono = end_mono
+            self._last_loop_stall_duration_s = stall_s
+            self._loop_stall_count += 1
+            self._publish_manager_event(
+                "manager.loop_stall",
+                {
+                    "duration_s": stall_s,
+                    "pump_duration_s": self._last_pump_duration_s,
+                    "pump_gap_s": self._last_pump_gap_s,
+                    "count": self._loop_stall_count,
+                    "ts": {"t_wall": time.time(), "t_mono": end_mono},
+                },
+            )
+        slow_pump_threshold_s = float(
+            getattr(self, "_slow_pump_threshold_s", 1.0)
         )
+        if (
+            self._last_pump_duration_s <= slow_pump_threshold_s
+            or diagnostics is None
+        ):
+            return
+        self._slow_pump_count = int(getattr(self, "_slow_pump_count", 0)) + 1
+        detail = dict(diagnostics or {})
+        detail.update(
+            {
+                "duration_s": self._last_pump_duration_s,
+                "threshold_s": slow_pump_threshold_s,
+                "pump_gap_s": self._last_pump_gap_s,
+                "count": self._slow_pump_count,
+                "ts": {"t_wall": time.time(), "t_mono": end_mono},
+            }
+        )
+        self._publish_manager_event("manager.pump_slow", detail)
 
     def _pump_once(self, poll_ms: int = 50) -> None:
         """Run one iteration of the manager poll loop."""
         start_mono = time.monotonic()
-        try:
-            self._drain_supervisor_logs()
+        start_process_cpu = _read_optional_clock("process_time")
+        start_thread_cpu = _read_optional_clock("thread_time")
+        phase_names = (
+            "supervisor_logs_pre",
+            "poll",
+            "registry",
+            "driver_pub",
+            "process_hb",
+            "process_data",
+            "federation",
+            "internal_rpc",
+            "supervisor_logs_post",
+            "lifecycle_replies",
+            "lifecycle_events",
+            "check_timeouts",
+        )
+        phase_durations_s = {name: 0.0 for name in phase_names}
+        work_counts = {name: 0 for name in phase_names if name != "poll"}
+        self._current_pump_work_counts = work_counts
+        queue_depths_before = {
+            "supervisor_logs": _queue_depth(getattr(self, "_supervisor_log_queue", None)),
+            "lifecycle_replies": _queue_depth(
+                getattr(self, "_lifecycle_reply_queue", None)
+            ),
+            "lifecycle_events": _queue_depth(
+                getattr(self, "_lifecycle_event_queue", None)
+            ),
+        }
+        driver_cap_hits_before = int(
+            getattr(self, "_manager_driver_pub_drain_cap_hit_total", 0)
+        )
+        process_hb_cap_hits_before = int(
+            getattr(self, "_manager_process_hb_drain_cap_hit_total", 0)
+        )
+        process_data_cap_hits_before = int(
+            getattr(self, "_manager_process_data_drain_cap_hit_total", 0)
+        )
+        events: dict[Any, int] = {}
 
-            events = dict(self._poller.poll(poll_ms))
+        def run_phase(name: str, callback: Callable[[], Any]) -> Any:
+            phase_start = time.monotonic()
+            try:
+                return callback()
+            finally:
+                phase_durations_s[name] += max(
+                    0.0, time.monotonic() - phase_start
+                )
+
+        previous_end_mono = self._last_pump_end_mono
+        self._current_pump_start_mono = start_mono
+        self._current_pump_gap_s = (
+            None
+            if previous_end_mono is None
+            else max(0.0, start_mono - previous_end_mono)
+        )
+        try:
+            work_counts["supervisor_logs_pre"] = _work_count(
+                run_phase("supervisor_logs_pre", self._drain_supervisor_logs)
+            )
+
+            events = dict(run_phase("poll", lambda: self._poller.poll(poll_ms)))
             if events.get(self._registry_rep) == zmq.POLLIN:
-                self._handle_registry()
+                run_phase("registry", self._handle_registry)
+                work_counts["registry"] = 1
 
             if events.get(self._sub) == zmq.POLLIN:
-                self._handle_driver_pub()
+                before = work_counts["driver_pub"]
+                drained = _work_count(run_phase("driver_pub", self._handle_driver_pub))
+                if work_counts["driver_pub"] == before:
+                    work_counts["driver_pub"] += drained
 
             if events.get(self._process_hb_sub) == zmq.POLLIN:
-                self._handle_process_pub()
+                before = work_counts["process_hb"]
+                drained = _work_count(run_phase("process_hb", self._handle_process_pub))
+                if work_counts["process_hb"] == before:
+                    work_counts["process_hb"] += drained
             if events.get(self._process_data_sub) == zmq.POLLIN:
-                self._handle_process_data_pub()
-            self._federation_hub.handle_poll_events(events)
+                before = work_counts["process_data"]
+                drained = _work_count(
+                    run_phase("process_data", self._handle_process_data_pub)
+                )
+                if work_counts["process_data"] == before:
+                    work_counts["process_data"] += drained
+            work_counts["federation"] = _work_count(
+                run_phase(
+                    "federation",
+                    lambda: self._federation_hub.handle_poll_events(events),
+                )
+            )
 
             if events.get(self._internal_rpc) == zmq.POLLIN:
-                self._handle_internal_rpc()
-            self._drain_supervisor_logs()
+                run_phase("internal_rpc", self._handle_internal_rpc)
+                work_counts["internal_rpc"] = 1
+            work_counts["supervisor_logs_post"] = _work_count(
+                run_phase("supervisor_logs_post", self._drain_supervisor_logs)
+            )
             # Drain replies + events produced by lifecycle worker
             # threads since the last tick. Both perform main-thread-only
             # ZMQ sends; the workers themselves never touch sockets.
-            self._drain_lifecycle_replies()
-            self._drain_lifecycle_events()
+            work_counts["lifecycle_replies"] = _work_count(
+                run_phase("lifecycle_replies", self._drain_lifecycle_replies)
+            )
+            work_counts["lifecycle_events"] = _work_count(
+                run_phase("lifecycle_events", self._drain_lifecycle_events)
+            )
             # Check timeouts AFTER draining all SUB sockets. Doing it
             # at the top of the tick (the previous order) means freshly
             # buffered HBs sitting in the SUB queue haven't been
             # ingested yet, so the timeout check would fire against
             # stale `last_hb_recv_mono` even when the process is fine.
-            self._check_timeouts()
+            run_phase("check_timeouts", self._check_timeouts)
+            work_counts["check_timeouts"] = 1
         finally:
-            self._record_pump_timing(start_mono, time.monotonic())
+            try:
+                end_mono = time.monotonic()
+                end_process_cpu = _read_optional_clock("process_time")
+                end_thread_cpu = _read_optional_clock("thread_time")
+                diagnostics: Json | None = None
+                slow_threshold_s = float(
+                    getattr(self, "_slow_pump_threshold_s", 1.0)
+                )
+                if (end_mono - start_mono) > slow_threshold_s:
+                    pump_duration_s = max(0.0, end_mono - start_mono)
+                    phase_total_s = sum(phase_durations_s.values())
+                    diagnostics = {
+                        "phase_durations_s": phase_durations_s,
+                        "phase_total_s": phase_total_s,
+                        "unattributed_wall_s": max(
+                            0.0, pump_duration_s - phase_total_s
+                        ),
+                        "process_cpu_s": _clock_delta(
+                            start_process_cpu, end_process_cpu
+                        ),
+                        "thread_cpu_s": _clock_delta(
+                            start_thread_cpu, end_thread_cpu
+                        ),
+                        "thread_cpu_clock_available": (
+                            start_thread_cpu is not None
+                            and end_thread_cpu is not None
+                        ),
+                        "work_counts": work_counts,
+                        "poll_ready_count": len(events),
+                        "internal_rpc_ready": (
+                            events.get(self._internal_rpc) == zmq.POLLIN
+                        ),
+                        "queue_depths_before": queue_depths_before,
+                        "queue_depths_after": {
+                            "supervisor_logs": _queue_depth(
+                                getattr(self, "_supervisor_log_queue", None)
+                            ),
+                            "lifecycle_replies": _queue_depth(
+                                getattr(self, "_lifecycle_reply_queue", None)
+                            ),
+                            "lifecycle_events": _queue_depth(
+                                getattr(self, "_lifecycle_event_queue", None)
+                            ),
+                        },
+                        "socket_backlog_after": {
+                            "driver_pub": _socket_readable(self._sub),
+                            "process_hb": _socket_readable(self._process_hb_sub),
+                            "process_data": _socket_readable(
+                                self._process_data_sub
+                            ),
+                            "internal_rpc": _socket_readable(self._internal_rpc),
+                        },
+                        "drain_cap_hits": {
+                            "driver_pub": int(
+                                getattr(
+                                    self,
+                                    "_manager_driver_pub_drain_cap_hit_total",
+                                    0,
+                                )
+                            )
+                            > driver_cap_hits_before,
+                            "process_hb": int(
+                                getattr(
+                                    self,
+                                    "_manager_process_hb_drain_cap_hit_total",
+                                    0,
+                                )
+                            )
+                            > process_hb_cap_hits_before,
+                            "process_data": int(
+                                getattr(
+                                    self,
+                                    "_manager_process_data_drain_cap_hit_total",
+                                    0,
+                                )
+                            )
+                            > process_data_cap_hits_before,
+                        },
+                    }
+                self._record_pump_timing(start_mono, end_mono, diagnostics)
+            finally:
+                self._current_pump_start_mono = None
+                self._current_pump_gap_s = None
+                self._current_pump_work_counts = None
 
     def run_forever(self, poll_ms: int = 50) -> None:
         """
@@ -1406,19 +1658,33 @@ class Manager(
         if not isinstance(restart_policy, RestartPolicy):
             raise TypeError("restart_policy must be a RestartPolicy or string")
 
+        heartbeat_timeout_s = float(raw.get("heartbeat_timeout_s", 3.0))
+        hard_timeout_raw = raw.get("heartbeat_hard_timeout_s")
+        heartbeat_hard_timeout_s = (
+            None if hard_timeout_raw is None else float(hard_timeout_raw)
+        )
+        if (
+            heartbeat_hard_timeout_s is not None
+            and heartbeat_hard_timeout_s <= heartbeat_timeout_s
+        ):
+            raise ValueError(
+                "heartbeat_hard_timeout_s must be greater than heartbeat_timeout_s"
+            )
+
         return ProcessSpec(
             process_id=process_id,
             argv=argv,
             cwd=raw.get("cwd"),
             env=raw.get("env"),
             heartbeat_period_s=float(raw.get("heartbeat_period_s", 1.0)),
-            heartbeat_timeout_s=float(raw.get("heartbeat_timeout_s", 3.0)),
+            heartbeat_timeout_s=heartbeat_timeout_s,
             shutdown_timeout_s=float(raw.get("shutdown_timeout_s", 3.0)),
             restart_policy=restart_policy,
             restart_backoff_s=float(raw.get("restart_backoff_s", 0.5)),
             max_restarts=raw.get("max_restarts"),
             heartbeat_endpoint=raw.get("heartbeat_endpoint"),
             process_data_endpoint=raw.get("process_data_endpoint"),
+            heartbeat_hard_timeout_s=heartbeat_hard_timeout_s,
         )
 
     # -----------------------------
@@ -1428,17 +1694,20 @@ class Manager(
     # Phase 8.2.13: ``_handle_driver_pub`` is now provided by
     # ``DriverPubMixin``. MRO resolves it.
 
-    def _handle_process_pub(self) -> None:
+    def _handle_process_pub(self) -> int:
         # Drain all available HBs in one tick so a momentary stall
         # doesn't leave a backlog that drips out at 1-per-tick (which
         # in turn makes the timeout check see "stale" for processes
         # whose HBs are still queued). Cap bounds worst-case tick
         # duration on an avalanche.
+        drained = 0
         for _ in range(MAX_DRAIN_PER_TICK):
             try:
                 topic_b, payload_b = self._process_hb_sub.recv_multipart(zmq.NOBLOCK)
             except zmq.Again:
-                return
+                self._record_current_pump_work_count("process_hb", drained)
+                return drained
+            drained += 1
             topic = self._normalize_topic(topic_b.decode("utf-8", errors="replace"))
             try:
                 msg = safe_json_loads(payload_b)
@@ -1463,16 +1732,24 @@ class Manager(
         # Loop completed full MAX_DRAIN_PER_TICK iterations without zmq.Again:
         # queue still has data. Surface this (rate-limited) so operators see
         # the backlog instead of silent message lag.
+        self._manager_process_hb_drain_cap_hit_total = int(
+            getattr(self, "_manager_process_hb_drain_cap_hit_total", 0)
+        ) + 1
         self._maybe_publish_drain_cap_hit("process_hb", MAX_DRAIN_PER_TICK)
+        self._record_current_pump_work_count("process_hb", drained)
+        return drained
 
-    def _handle_process_data_pub(self) -> None:
+    def _handle_process_data_pub(self) -> int:
         # Drain all available data events per tick. Same rationale as
         # _handle_process_pub.
+        drained = 0
         for _ in range(MAX_DRAIN_PER_TICK):
             try:
                 topic_b, payload_b = self._process_data_sub.recv_multipart(zmq.NOBLOCK)
             except zmq.Again:
-                return
+                self._record_current_pump_work_count("process_data", drained)
+                return drained
+            drained += 1
             topic = self._normalize_topic(topic_b.decode("utf-8", errors="replace"))
             try:
                 msg = safe_json_loads(payload_b)
@@ -1501,7 +1778,12 @@ class Manager(
         # Loop completed full MAX_DRAIN_PER_TICK iterations without zmq.Again:
         # queue still has data. Surface this (rate-limited) so operators see
         # the backlog instead of silent message lag.
+        self._manager_process_data_drain_cap_hit_total = int(
+            getattr(self, "_manager_process_data_drain_cap_hit_total", 0)
+        ) + 1
         self._maybe_publish_drain_cap_hit("process_data", MAX_DRAIN_PER_TICK)
+        self._record_current_pump_work_count("process_data", drained)
+        return drained
 
     def _ingest_telemetry(self, msg: Json) -> None:
         shared_ingest_telemetry(
@@ -1804,24 +2086,28 @@ class Manager(
             resp["request_id"] = rid
         self._lifecycle_reply_queue.put((identity, resp))
 
-    def _drain_lifecycle_replies(self) -> None:
+    def _drain_lifecycle_replies(self) -> int:
+        drained = 0
         while True:
             try:
                 identity, resp = self._lifecycle_reply_queue.get_nowait()
             except queue.Empty:
-                return
+                return drained
+            drained += 1
             try:
                 self._internal_rpc.send_multipart([identity, json_dumps(resp)])
             except Exception:
                 # Socket may be torn down mid-shutdown; drop the reply.
                 pass
 
-    def _drain_lifecycle_events(self) -> None:
+    def _drain_lifecycle_events(self) -> int:
+        drained = 0
         while True:
             try:
                 topic, payload = self._lifecycle_event_queue.get_nowait()
             except queue.Empty:
                 break
+            drained += 1
             try:
                 # Calls into manager_pubsub.publish_manager_event on the
                 # main thread — the off-thread redirect check will see
@@ -1875,6 +2161,7 @@ class Manager(
             except Exception:
                 # Never let observability break the main loop.
                 pass
+        return drained
 
     # Phase 8.2.6: ``_route_internal_request``, ``_ensure_route_registries``
     # are now provided by ``InternalRpcMixin`` via MRO.
@@ -2562,6 +2849,23 @@ class Manager(
             payload["termination_error"] = handle.termination_error
             payload["recent_manager_loop_stall"] = handle.recent_manager_loop_stall
             payload["last_manager_loop_stall_duration_s"] = handle.last_manager_loop_stall_duration_s
+            payload["last_manager_loop_stall_source"] = (
+                handle.last_manager_loop_stall_source
+            )
+            payload["heartbeat_stall_reconcile_started_mono"] = (
+                handle.heartbeat_stall_reconcile_started_mono
+            )
+            payload["heartbeat_stall_reconcile_deadline_mono"] = (
+                handle.heartbeat_stall_reconcile_deadline_mono
+            )
+            payload["heartbeat_failure_trigger"] = handle.heartbeat_failure_trigger
+            configured_hard_timeout_s = handle.spec.heartbeat_hard_timeout_s
+            payload["heartbeat_hard_timeout_s"] = (
+                configured_hard_timeout_s
+                if configured_hard_timeout_s is not None
+                else handle.spec.heartbeat_timeout_s
+                * self._heartbeat_hard_timeout_multiplier
+            )
             payload["failure_pid"] = failure_pid
             payload["exit_code_hex"] = exit_code_hex(handle.last_exit_code)
             payload["exit_code_description"] = describe_exit_code(handle.last_exit_code)

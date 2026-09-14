@@ -241,6 +241,9 @@ class ProcessSpec:
     max_restarts: int | None = None
     heartbeat_endpoint: str | None = None
     process_data_endpoint: str | None = None
+    # Absolute ceiling for heartbeat staleness. ``None`` preserves the
+    # historical manager-wide multiplier fallback.
+    heartbeat_hard_timeout_s: float | None = None
 
 
 @dataclass
@@ -303,6 +306,10 @@ class ProcessHandle:
     termination_error: str | None = None
     recent_manager_loop_stall: bool = False
     last_manager_loop_stall_duration_s: float | None = None
+    last_manager_loop_stall_source: str | None = None
+    heartbeat_stall_reconcile_started_mono: float | None = None
+    heartbeat_stall_reconcile_deadline_mono: float | None = None
+    heartbeat_failure_trigger: str | None = None
     heartbeat_endpoint: str = ""
     process_data_endpoint: str = ""
     stop_requested_t_mono: float | None = None

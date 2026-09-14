@@ -45,6 +45,7 @@ def _make_handle() -> SimpleNamespace:
         env={},
         heartbeat_period_s=1.0,
         heartbeat_timeout_s=3.0,
+        heartbeat_hard_timeout_s=None,
         shutdown_timeout_s=5.0,
         restart_policy="ON_FAILURE",
         restart_backoff_s=1.0,
@@ -79,6 +80,10 @@ def _make_handle() -> SimpleNamespace:
         termination_error=None,
         recent_manager_loop_stall=False,
         last_manager_loop_stall_duration_s=None,
+        last_manager_loop_stall_source=None,
+        heartbeat_stall_reconcile_started_mono=None,
+        heartbeat_stall_reconcile_deadline_mono=None,
+        heartbeat_failure_trigger=None,
         last_heartbeat_payload=None,
         supervisor_stdout_tail=[],
         supervisor_stderr_tail=[],
@@ -98,9 +103,13 @@ def _make_supervision_manager(**overrides: object) -> SimpleNamespace:
         "_handle_process_pub": lambda: None,
         "_last_loop_stall_mono": None,
         "_last_loop_stall_duration_s": 0.0,
+        "_current_pump_start_mono": None,
+        "_current_pump_gap_s": None,
+        "_manager_loop_stall_warn_s": 1.0,
         "_manager_loop_stall_recent_s": 10.0,
         "_heartbeat_stale_strikes_to_fail": 2,
         "_heartbeat_hard_timeout_multiplier": 3.0,
+        "_heartbeat_stall_reconcile_period_multiplier": 1.25,
         "_publish_manager_event": lambda *args, **kwargs: None,
     }
     defaults.update(overrides)
@@ -151,9 +160,11 @@ class ProcessSnapshotMemoryTests(unittest.TestCase):
         enforce_managed_process_heartbeat_timeout(manager, handle, 10.0)
 
         self.assertEqual(handle.state, "RUNNING")
-        self.assertEqual(handle.heartbeat_stale_strikes, 1)
+        self.assertEqual(handle.heartbeat_stale_strikes, 0)
         self.assertFalse(handle.popen.terminated)
         self.assertTrue(handle.recent_manager_loop_stall)
+        self.assertEqual(handle.last_manager_loop_stall_source, "recent_completed_pump")
+        self.assertAlmostEqual(handle.heartbeat_stall_reconcile_deadline_mono, 11.25)
 
     def test_heartbeat_stale_terminates_on_second_strike(self) -> None:
         events: list[tuple[str, object]] = []
@@ -170,6 +181,8 @@ class ProcessSnapshotMemoryTests(unittest.TestCase):
         handle.last_hb_recv_mono = 6.0
         handle.popen = _FakePopen()
         handle.heartbeat_stale_strikes = 1
+        handle.heartbeat_stall_reconcile_started_mono = 8.0
+        handle.heartbeat_stall_reconcile_deadline_mono = 9.25
         # Pretend the first strike was recorded at t=8.5 — > one period
         # (1 s) ago — so the rate limit allows another strike at t=10.
         handle.last_stale_detected_mono = 8.5
@@ -276,15 +289,7 @@ class ProcessSnapshotMemoryTests(unittest.TestCase):
         check would have incremented strikes) even though the process
         is healthy and its HB is sitting in the SUB buffer about to be
         drained — that's the actual vacuum-cryo failure mode."""
-        manager = SimpleNamespace(
-            # Recent stall present, so the deferral can engage and the
-            # strike-counter is what gates termination.
-            _last_loop_stall_mono=9.9,
-            _last_loop_stall_duration_s=2.0,
-            _manager_loop_stall_recent_s=10.0,
-            _heartbeat_stale_strikes_to_fail=2,
-            _heartbeat_hard_timeout_multiplier=3.0,
-            _publish_manager_event=lambda *args, **kwargs: None,
+        manager = _make_supervision_manager(
             _publish_process_event=lambda *args, **kwargs: None,
         )
         handle = _make_handle()
@@ -354,8 +359,187 @@ class ProcessSnapshotMemoryTests(unittest.TestCase):
         enforce_managed_process_heartbeat_timeout(manager, handle, 10.0)
 
         self.assertEqual(events[0][0], "manager.process.heartbeat_refresh_failed")
-        self.assertEqual(handle.heartbeat_stale_strikes, 1)
+        self.assertEqual(handle.heartbeat_stale_strikes, 0)
         self.assertEqual(handle.state, "RUNNING")
+
+    def test_first_stale_strike_defers_without_manager_stall(self) -> None:
+        events: list[tuple[str, object]] = []
+        manager = _make_supervision_manager(
+            _publish_manager_event=lambda topic, payload: events.append((topic, payload)),
+            _publish_process_event=lambda topic, handle: events.append((topic, handle)),
+        )
+        handle = _make_handle()
+        handle.last_hb_recv_mono = 6.0
+        handle.popen = _FakePopen()
+
+        enforce_managed_process_heartbeat_timeout(manager, handle, 10.0)
+
+        self.assertEqual(handle.state, "RUNNING")
+        self.assertEqual(handle.heartbeat_stale_strikes, 1)
+        self.assertFalse(handle.popen.terminated)
+        self.assertEqual(events[-1][1]["defer_reason"], "stale_strikes")
+
+    def test_hard_timeout_fails_on_first_stale_observation(self) -> None:
+        manager = _make_supervision_manager(
+            _publish_process_event=lambda *args, **kwargs: None,
+        )
+        handle = _make_handle()
+        handle.spec.heartbeat_hard_timeout_s = 5.0
+        handle.last_hb_recv_mono = 4.0
+        handle.popen = _FakePopen()
+
+        enforce_managed_process_heartbeat_timeout(manager, handle, 10.0)
+
+        self.assertEqual(handle.state, "FAILED")
+        self.assertEqual(handle.heartbeat_stale_strikes, 1)
+        self.assertEqual(handle.heartbeat_failure_trigger, "hard_timeout")
+
+    def test_current_pump_stall_reconciliation_is_bounded_and_not_renewed(self) -> None:
+        manager = _make_supervision_manager(
+            _current_pump_start_mono=5.0,
+            _publish_process_event=lambda *args, **kwargs: None,
+        )
+        handle = _make_handle()
+        handle.spec.heartbeat_hard_timeout_s = 5.0
+        handle.last_hb_recv_mono = 1.0
+        handle.popen = _FakePopen()
+
+        enforce_managed_process_heartbeat_timeout(manager, handle, 10.0)
+
+        self.assertEqual(handle.state, "RUNNING")
+        self.assertEqual(handle.heartbeat_stale_strikes, 0)
+        self.assertEqual(handle.last_manager_loop_stall_source, "current_pump")
+        deadline = float(handle.heartbeat_stall_reconcile_deadline_mono)
+
+        # The same continuing stall cannot renew its window. Once the original
+        # deadline expires, the hard timeout fails the genuinely silent process.
+        enforce_managed_process_heartbeat_timeout(manager, handle, deadline + 0.01)
+
+        self.assertEqual(handle.state, "FAILED")
+        self.assertEqual(handle.heartbeat_failure_trigger, "hard_timeout")
+        self.assertEqual(handle.heartbeat_stall_reconcile_deadline_mono, deadline)
+
+    def test_current_pump_stall_waits_for_heartbeat_generated_after_decision(
+        self,
+    ) -> None:
+        handle = _make_handle()
+        handle.last_hb_recv_mono = 6.08
+        handle.popen = _FakePopen()
+
+        class _HeartbeatSocket:
+            readable = False
+
+            def poll(self, _timeout: int) -> bool:
+                return self.readable
+
+        heartbeat_socket = _HeartbeatSocket()
+
+        def _drain_heartbeat() -> None:
+            handle.last_hb_recv_mono = 10.01
+
+        manager = _make_supervision_manager(
+            _current_pump_start_mono=6.0,
+            _process_hb_sub=heartbeat_socket,
+            _handle_process_pub=_drain_heartbeat,
+            _publish_process_event=lambda *args, **kwargs: None,
+        )
+
+        # At t=10 the manager has spent four seconds in this pump, and the
+        # replacement heartbeat has not been generated yet. Reconcile instead
+        # of failing the process on this first post-stall decision.
+        enforce_managed_process_heartbeat_timeout(manager, handle, 10.0)
+        self.assertEqual(handle.state, "RUNNING")
+        self.assertEqual(handle.heartbeat_stale_strikes, 0)
+        self.assertIsNotNone(handle.heartbeat_stall_reconcile_deadline_mono)
+
+        # The process heartbeat thread runs immediately after the manager's
+        # decision. The next check drains it and clears the stale episode.
+        heartbeat_socket.readable = True
+        enforce_managed_process_heartbeat_timeout(manager, handle, 10.02)
+
+        self.assertEqual(handle.state, "RUNNING")
+        self.assertEqual(handle.heartbeat_stale_strikes, 0)
+        self.assertIsNone(handle.heartbeat_stall_reconcile_deadline_mono)
+        self.assertFalse(handle.popen.terminated)
+
+    def test_pre_pump_gap_is_available_to_heartbeat_supervision(self) -> None:
+        manager = _make_supervision_manager(
+            _current_pump_start_mono=10.0,
+            _current_pump_gap_s=4.0,
+            _publish_process_event=lambda *args, **kwargs: None,
+        )
+        handle = _make_handle()
+        handle.last_hb_recv_mono = 6.0
+        handle.popen = _FakePopen()
+
+        enforce_managed_process_heartbeat_timeout(manager, handle, 10.1)
+
+        self.assertEqual(handle.state, "RUNNING")
+        self.assertEqual(handle.last_manager_loop_stall_source, "pre_pump_gap")
+        self.assertIsNotNone(handle.heartbeat_stall_reconcile_deadline_mono)
+
+    def test_pump_stall_drains_heartbeat_that_arrived_during_same_pump(self) -> None:
+        handle = _make_handle()
+        handle.last_hb_recv_mono = 1.0
+        handle.popen = _FakePopen()
+
+        class _Poller:
+            def poll(self, _timeout: int) -> dict[object, int]:
+                # The heartbeat was not readable in the pump's original poll.
+                return {}
+
+        class _HeartbeatSocket:
+            def poll(self, _timeout: int) -> bool:
+                # It becomes readable before timeout enforcement refreshes the
+                # queue near the end of this >heartbeat-timeout pump.
+                return True
+
+        manager = object.__new__(Manager)
+        manager._last_pump_end_mono = None
+        manager._last_pump_start_mono = None
+        manager._last_pump_duration_s = None
+        manager._last_pump_gap_s = None
+        manager._last_loop_stall_mono = None
+        manager._last_loop_stall_duration_s = None
+        manager._manager_loop_stall_warn_s = 1.0
+        manager._manager_loop_stall_recent_s = 10.0
+        manager._loop_stall_count = 0
+        manager._heartbeat_stale_strikes_to_fail = 2
+        manager._heartbeat_hard_timeout_multiplier = 3.0
+        manager._heartbeat_stall_reconcile_period_multiplier = 1.25
+        manager._startup_sequence_active = False
+        manager._startup_sequence_complete_mono = None
+        manager._poller = _Poller()
+        manager._registry_rep = object()
+        manager._sub = object()
+        manager._internal_rpc = object()
+        manager._process_hb_sub = _HeartbeatSocket()
+        manager._process_data_sub = object()
+        manager._federation_hub = SimpleNamespace(
+            handle_poll_events=lambda events: None
+        )
+        manager._drain_supervisor_logs = lambda: None
+        manager._drain_lifecycle_replies = lambda: None
+        manager._drain_lifecycle_events = lambda: None
+        manager._handle_process_pub = lambda: setattr(handle, "last_hb_recv_mono", 5.0)
+        manager._publish_manager_event = lambda *args, **kwargs: None
+        manager._publish_process_event = lambda *args, **kwargs: None
+        manager._check_timeouts = lambda: enforce_managed_process_heartbeat_timeout(
+            manager, handle, 5.0
+        )
+
+        first_tick = iter([1.0])
+        with mock.patch(
+            "experiment_control.manager.time.monotonic",
+            side_effect=lambda: next(first_tick, 5.1),
+        ):
+            manager._pump_once(poll_ms=0)
+
+        self.assertEqual(handle.state, "RUNNING")
+        self.assertEqual(handle.heartbeat_stale_strikes, 0)
+        self.assertFalse(handle.popen.terminated)
+        self.assertAlmostEqual(handle.last_hb_recv_mono, 5.0)
+        self.assertAlmostEqual(manager._last_pump_duration_s, 4.1)
 
     def test_heartbeat_refresh_failure_diagnostic_is_rate_limited(self) -> None:
         events: list[tuple[str, object]] = []
@@ -1024,4 +1208,3 @@ class ParallelShutdownCleanupTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

@@ -826,6 +826,9 @@ def main(argv: list[str] | None = None) -> None:
                 heartbeat_hard_timeout_s=float(
                     manager_raw.get("heartbeat_hard_timeout_s", 10.0)
                 ),
+                slow_pump_threshold_s=float(
+                    manager_raw.get("slow_pump_threshold_s", 1.0)
+                ),
                 telemetry_stale_s=float(manager_raw.get("telemetry_stale_s", 10.0)),
                 device_rpc_timeout_ms=int(manager_raw.get("device_rpc_timeout_ms", 1500)),
                 interceptor_rpc_timeout_ms=int(manager_raw.get("interceptor_rpc_timeout_ms", 500)),

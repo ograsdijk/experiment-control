@@ -98,6 +98,7 @@ manager:
     heartbeat_base: 6100              # managed-process heartbeat port base
     event_base: 6200                  # managed-process event/data port base
   heartbeat_timeout_s: 3.0
+  slow_pump_threshold_s: 1.0          # detailed manager.pump_slow diagnostics
   telemetry_stale_s: 10.0
   device_rpc_timeout_ms: 1500
   interceptor_rpc_timeout_ms: 500
@@ -199,6 +200,11 @@ Notes:
 - The manager binds its **internal** RPC on `internal_ports.rpc` and the router forwards to it.
 - Router queue knobs (`router_*_queue_max`, `router_inflight_max`) control
   device-router overload behavior and memory ceilings under sustained load.
+- `slow_pump_threshold_s` controls when the manager emits `manager.pump_slow`.
+  Normal pumps only pay for clock reads and inexpensive counters; slow-pump
+  events contain per-phase wall times, process/thread CPU deltas, work counts,
+  queue depths, ZMQ readiness, and drain-cap hits. On platforms without
+  `time.thread_time()`, `thread_cpu_s` is null and process CPU remains available.
 - Telemetry/chunk cache knobs (`telemetry_cache_*`, `chunk_cache_*`) bound
   manager-side key growth for high-cardinality device/signal/stream workloads.
 - `bind_host` controls external bind/listen host and can be wildcard (`0.0.0.0`, `*`, `[::]`).
@@ -358,6 +364,7 @@ init_kwargs:
 
 heartbeat_period_s: 1.0
 heartbeat_timeout_s: 3.0
+heartbeat_hard_timeout_s: 9.0  # optional; must be greater than heartbeat_timeout_s
 shutdown_timeout_s: 3.0
 restart_policy: NEVER
 restart_backoff_s: 0.5
@@ -368,6 +375,10 @@ Notes:
 - `process.file` and `process.module` are mutually exclusive.
 - The manager injects `process_id`, `manager_rpc` (router front door), `manager_pub`, and `heartbeat_endpoint` automatically.
 - `heartbeat_period_s` is passed to the process runner if you supply it.
+- `heartbeat_timeout_s` is the soft stale threshold. Staleness normally needs
+  two rate-limited observations before failure. `heartbeat_hard_timeout_s` is
+  an optional absolute ceiling; when omitted, the manager uses three times the
+  soft timeout for backward compatibility.
 - `disabled_devices` is the startup filter only; you can adjust it at runtime via
   HDF process RPC (`hdf.devices.get`, `hdf.devices.enable`, `hdf.devices.disable`,
   `hdf.rotate`).
