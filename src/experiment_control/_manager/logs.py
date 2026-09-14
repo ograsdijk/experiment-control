@@ -275,6 +275,9 @@ class LogsMixin(_MixinBase):
             self._manager_log_jsonl_sink = RotatingJsonlSink(
                 directory=Path(str(settings["directory"])),
                 prefix=str(settings.get("prefix", "manager")),
+                legacy_prefixes=tuple(
+                    str(value) for value in settings.get("legacy_prefixes", ())
+                ),
                 max_bytes=int(settings.get("max_bytes", 100 * 1024 * 1024)),
                 max_age_days=settings.get("max_age_days", 30.0),
                 max_total_bytes=settings.get(

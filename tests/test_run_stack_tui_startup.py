@@ -40,6 +40,7 @@ class TuiStartupWaitTests(unittest.TestCase):
             _parse_manager_logging(
                 manager_raw={"logging": {"file": "manager.log"}},
                 base_dir=Path.cwd(),
+                instance_id="vacuum",
             )
 
     def test_main_no_tui_instance_lock_survives_identity_probe_on_windows(self) -> None:
@@ -228,6 +229,8 @@ class TuiStartupWaitTests(unittest.TestCase):
         self.assertIsInstance(jsonl, dict)
         assert isinstance(jsonl, dict)
         self.assertEqual(jsonl["directory"], (expected_base / "logs").resolve())
+        self.assertEqual(jsonl["prefix"], "vacuum-manager")
+        self.assertEqual(jsonl["legacy_prefixes"], ["manager"])
         self.assertEqual(jsonl["max_bytes"], 100 * 1024 * 1024)
         self.assertEqual(jsonl["max_age_days"], 30.0)
         self.assertEqual(jsonl["max_total_bytes"], 5 * 1024 * 1024 * 1024)
@@ -240,6 +243,7 @@ class TuiStartupWaitTests(unittest.TestCase):
                 "logging": {
                     "stderr": False,
                     "directory": ".state/logs",
+                    "prefix": "diagnostics",
                     "rotation": {"max_bytes": 2048},
                     "retention": {"max_age_days": 7, "max_total_bytes": 4096},
                     "min_level": "warning",
@@ -296,10 +300,21 @@ class TuiStartupWaitTests(unittest.TestCase):
         self.assertIsInstance(jsonl, dict)
         assert isinstance(jsonl, dict)
         self.assertEqual(jsonl["directory"], (expected_base / ".state" / "logs").resolve())
+        self.assertEqual(jsonl["prefix"], "vacuum-diagnostics")
+        self.assertEqual(jsonl["legacy_prefixes"], ["diagnostics"])
         self.assertEqual(jsonl["max_bytes"], 2048)
         self.assertEqual(jsonl["max_age_days"], 7.0)
         self.assertEqual(jsonl["max_total_bytes"], 4096)
         self.assertEqual(captured_kwargs.get("manager_log_min_level"), "warning")
+
+    def test_manager_log_prefix_normalizes_instance_id_for_filename(self) -> None:
+        parsed = _parse_manager_logging(
+            manager_raw={},
+            base_dir=Path.cwd(),
+            instance_id="vacuum/cryo α",
+        )
+
+        self.assertEqual(parsed["jsonl"]["prefix"], "vacuum_cryo-manager")
 
     def test_run_with_tui_spawns_child_without_opt_in_flags_by_default(self) -> None:
         manager_network = resolve_manager_network({})

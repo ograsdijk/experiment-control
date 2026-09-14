@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import subprocess
 import sys
 import time
@@ -310,6 +311,7 @@ def _parse_manager_logging(
     *,
     manager_raw: Json,
     base_dir: Path,
+    instance_id: str,
 ) -> Json:
     raw = manager_raw.get("logging")
     if raw is None:
@@ -344,6 +346,12 @@ def _parse_manager_logging(
             "manager.logging.prefix",
             "must contain only letters, digits, '.', '_', or '-'",
         )
+    safe_instance_id = re.sub(
+        r"[^A-Za-z0-9_.-]+", "_", str(instance_id).strip()
+    ).strip("._-")
+    if not safe_instance_id:
+        safe_instance_id = "unknown"
+    effective_prefix = f"{safe_instance_id}-{prefix}"
 
     min_level_value = raw.get("min_level")
     if min_level_value is None:
@@ -421,7 +429,8 @@ def _parse_manager_logging(
         "jsonl": (
             {
                 "directory": directory.resolve(),
-                "prefix": prefix,
+                "prefix": effective_prefix,
+                "legacy_prefixes": [prefix],
                 "max_bytes": max_bytes,
                 "max_age_days": max_age_days,
                 "max_total_bytes": max_total_bytes,
@@ -786,6 +795,7 @@ def main(argv: list[str] | None = None) -> None:
             manager_logging = _parse_manager_logging(
                 manager_raw=manager_raw,
                 base_dir=base_dir,
+                instance_id=instance_id,
             )
             device_paths = _collect_config_paths(
                 raw.get("devices"), base=base_dir, label="devices"
@@ -956,4 +966,3 @@ def main(argv: list[str] | None = None) -> None:
 
 if __name__ == "__main__":
     main()
-

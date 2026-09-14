@@ -11,6 +11,75 @@ from tests._temp_utils import repo_temp_dir
 
 
 class RotatingJsonlSinkTests(unittest.TestCase):
+    def test_restart_appends_to_latest_shard_without_overwriting(self) -> None:
+        with repo_temp_dir("rotating-jsonl-restart") as tmp:
+            with mock.patch.object(
+                RotatingJsonlSink,
+                "_current_utc_day",
+                return_value="2026-09-14",
+            ):
+                first = RotatingJsonlSink(
+                    directory=tmp,
+                    prefix="vacuum-cryo-manager",
+                    max_age_days=None,
+                    max_total_bytes=None,
+                )
+                first.write({"message": "before restart"})
+                first.close()
+
+                second = RotatingJsonlSink(
+                    directory=tmp,
+                    prefix="vacuum-cryo-manager",
+                    max_age_days=None,
+                    max_total_bytes=None,
+                )
+                second.write({"message": "after restart"})
+                second.close()
+
+            path = tmp / "vacuum-cryo-manager-2026-09-14-000.jsonl"
+            records = [
+                json.loads(line)
+                for line in path.read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(
+                [record["message"] for record in records],
+                ["before restart", "after restart"],
+            )
+
+    def test_restart_opens_next_shard_when_latest_is_full(self) -> None:
+        with repo_temp_dir("rotating-jsonl-restart-full") as tmp:
+            with mock.patch.object(
+                RotatingJsonlSink,
+                "_current_utc_day",
+                return_value="2026-09-14",
+            ):
+                first = RotatingJsonlSink(
+                    directory=tmp,
+                    prefix="vacuum-cryo-manager",
+                    max_bytes=80,
+                    max_age_days=None,
+                    max_total_bytes=None,
+                )
+                first.write({"message": "a" * 100})
+                first.close()
+
+                second = RotatingJsonlSink(
+                    directory=tmp,
+                    prefix="vacuum-cryo-manager",
+                    max_bytes=80,
+                    max_age_days=None,
+                    max_total_bytes=None,
+                )
+                second.write({"message": "after restart"})
+                second.close()
+
+            self.assertTrue(
+                (tmp / "vacuum-cryo-manager-2026-09-14-000.jsonl").exists()
+            )
+            self.assertTrue(
+                (tmp / "vacuum-cryo-manager-2026-09-14-001.jsonl").exists()
+            )
+
     def test_rotates_at_utc_day_boundary(self) -> None:
         with repo_temp_dir("rotating-jsonl-day") as tmp:
             with mock.patch.object(
@@ -60,6 +129,24 @@ class RotatingJsonlSinkTests(unittest.TestCase):
 
             sink = RotatingJsonlSink(
                 directory=tmp,
+                max_age_days=1,
+                max_total_bytes=None,
+            )
+            sink.close()
+
+            self.assertFalse(expired.exists())
+
+    def test_retention_includes_legacy_prefixes(self) -> None:
+        with repo_temp_dir("rotating-jsonl-legacy-retention") as tmp:
+            expired = tmp / "manager-2000-01-01-000.jsonl"
+            expired.write_text("{}\n", encoding="utf-8")
+            old = time.time() - 3 * 86_400
+            os.utime(expired, (old, old))
+
+            sink = RotatingJsonlSink(
+                directory=tmp,
+                prefix="vacuum-cryo-manager",
+                legacy_prefixes=("manager",),
                 max_age_days=1,
                 max_total_bytes=None,
             )

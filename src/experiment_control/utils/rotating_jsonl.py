@@ -15,12 +15,18 @@ class RotatingJsonlSink:
         *,
         directory: Path,
         prefix: str = "manager",
+        legacy_prefixes: tuple[str, ...] = (),
         max_bytes: int = 100 * 1024 * 1024,
         max_age_days: float | None = 30.0,
         max_total_bytes: int | None = 5 * 1024 * 1024 * 1024,
     ) -> None:
         self._directory = Path(directory)
         self._prefix = str(prefix).strip() or "manager"
+        self._legacy_prefixes = tuple(
+            str(value).strip()
+            for value in legacy_prefixes
+            if str(value).strip() and str(value).strip() != self._prefix
+        )
         self._max_bytes = max(1, int(max_bytes))
         self._max_age_days = max_age_days
         self._max_total_bytes = max_total_bytes
@@ -62,7 +68,14 @@ class RotatingJsonlSink:
         return datetime.datetime.now(datetime.timezone.utc).date().isoformat()
 
     def _matching_files(self) -> list[Path]:
-        return sorted(self._directory.glob(f"{self._prefix}-*.jsonl"))
+        prefixes = (self._prefix, *self._legacy_prefixes)
+        return sorted(
+            {
+                path
+                for prefix in prefixes
+                for path in self._directory.glob(f"{prefix}-*.jsonl")
+            }
+        )
 
     def _path_for(self, utc_day: str, shard: int) -> Path:
         return self._directory / f"{self._prefix}-{utc_day}-{shard:03d}.jsonl"

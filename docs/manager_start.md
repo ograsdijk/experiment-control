@@ -126,7 +126,7 @@ manager:
     enabled: true
     stderr: null                       # optional bool override for MANAGER_LOG_STDERR
     directory: logs                    # resolved relative to stack.yaml
-    prefix: manager
+    prefix: manager                     # combined with instance_id in filenames
     min_level: info
     rotation:
       interval: daily                  # UTC day boundary
@@ -220,9 +220,12 @@ Notes:
 - Manager sink writes:
   - `manager.log` events (filtered by `min_level`)
   - `manager.*_error` events (treated as `error` severity)
-- Files are named `<prefix>-<UTC-date>-<three-digit-shard>.jsonl`. Each line is one JSON
+- Files are named `<instance_id>-<prefix>-<UTC-date>-<three-digit-shard>.jsonl` (for
+  example, `vacuum-cryo-manager-2026-09-14-000.jsonl`). Each line is one JSON
   record containing the UTC timestamp, instance id, severity, topic, source, message,
   and the normalized event payload fields.
+- `manager.logging.prefix` customizes the component after the instance id; the instance
+  id is always included in the filename.
 - Files rotate at each UTC day boundary and before a write would exceed `max_bytes`.
   Retention is enforced at startup and after every rotation by age and total size.
 - Rapid duplicate stderr lines are de-duplicated in a short window to reduce terminal
