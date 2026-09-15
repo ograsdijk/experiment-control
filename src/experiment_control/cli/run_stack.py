@@ -467,6 +467,44 @@ def _order_processes(
     return ordered
 
 
+def _parse_process_exclude(
+    startup: Json, process_ids: list[str], process_order: list[str] | None
+) -> list[str]:
+    """Validate ``startup.process_exclude``.
+
+    Excluded processes stay registered with the manager; they are only left
+    out of the automatic startup set (and its RUNNING wait).
+    """
+    raw = startup.get("process_exclude")
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ConfigError("startup.process_exclude", "must be a list[str]")
+    excluded: list[str] = []
+    for idx, pid in enumerate(raw):
+        if not isinstance(pid, str) or not pid.strip():
+            raise ConfigError(
+                f"startup.process_exclude[{idx}]", "must be a non-empty string"
+            )
+        if pid in excluded:
+            raise ConfigError(
+                f"startup.process_exclude[{idx}]", f"duplicate process_id {pid!r}"
+            )
+        excluded.append(pid)
+    missing = [pid for pid in excluded if pid not in process_ids]
+    if missing:
+        raise ConfigError(
+            "startup.process_exclude", f"unknown process_id(s): {missing}"
+        )
+    conflicting = [pid for pid in excluded if pid in (process_order or [])]
+    if conflicting:
+        raise ConfigError(
+            "startup.process_exclude",
+            f"process_id(s) also listed in startup.process_order: {conflicting}",
+        )
+    return excluded
+
+
 def _shutdown_manager(manager_rpc: str) -> None:
     ctx = zmq.Context.instance()
     sock = ctx.socket(zmq.DEALER)
@@ -920,15 +958,26 @@ def main(argv: list[str] | None = None) -> None:
             process_order = None
             if process_order_raw is not None:
                 process_order = [str(pid) for pid in process_order_raw]
+            all_process_ids = sorted(seen_processes)
+            process_exclude = _parse_process_exclude(
+                startup, all_process_ids, process_order
+            )
+            auto_start_process_ids = [
+                pid for pid in all_process_ids if pid not in process_exclude
+            ]
 
-            if start_processes and seen_processes:
-                ordered = _order_processes(sorted(seen_processes), process_order)
+            if start_processes and auto_start_process_ids:
+                ordered = _order_processes(auto_start_process_ids, process_order)
                 for pid in ordered:
                     manager.start_process(pid)
 
             wait_processes_running = startup.get("wait_processes_running")
             if wait_processes_running is None:
                 wait_processes_running = start_processes
+            # Without exclusions keep the manager default (wait on all
+            # registered processes); with exclusions, excluded processes are
+            # intentionally stopped and must not stall the RUNNING wait.
+            wait_process_ids = auto_start_process_ids if process_exclude else None
             connect = startup.get("connect", None)
             wait_for_registered = bool(startup.get("wait_for_registered", True))
             wait_for_online = bool(startup.get("wait_for_online", True))
@@ -945,6 +994,7 @@ def main(argv: list[str] | None = None) -> None:
                     start_drivers=start_devices,
                     start_processes=False,
                     wait_processes_running=bool(wait_processes_running),
+                    wait_process_ids=wait_process_ids,
                     connect=connect,
                     wait_for_registered=wait_for_registered,
                     wait_for_online=wait_for_online,

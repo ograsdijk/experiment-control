@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 from concurrent.futures import ThreadPoolExecutor, wait
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any, Callable, Iterable
 
 if TYPE_CHECKING:
     import zmq
@@ -56,10 +56,24 @@ class LifecycleMixin(_MixinBase):
     _process_guard: Any  # ProcessGuardian — opaque to mypy
     _startup_sequence_complete_mono: float | None
 
-    def _not_running_process_ids(self, running_state: Any) -> list[str]:
-        return [
-            pid for pid, h in self._processes.items() if h.state != running_state
-        ]
+    def _not_running_process_ids(
+        self, running_state: Any, process_ids: Iterable[str] | None = None
+    ) -> list[str]:
+        """Return ids not in ``running_state``.
+
+        ``process_ids=None`` checks every registered process; otherwise
+        only the given subset is checked (unknown ids count as not running).
+        """
+        if process_ids is None:
+            return [
+                pid for pid, h in self._processes.items() if h.state != running_state
+            ]
+        not_running: list[str] = []
+        for pid in process_ids:
+            handle = self._processes.get(pid)
+            if handle is None or handle.state != running_state:
+                not_running.append(pid)
+        return not_running
 
     def _missing_registered_devices(self) -> list[str]:
         return [k for k, h in self._devices.items() if h.rpc_endpoint is None]
@@ -92,10 +106,15 @@ class LifecycleMixin(_MixinBase):
         deadline: float,
         poll_ms: int,
         managed_process_running: Any,
+        process_ids: Iterable[str] | None = None,
     ) -> None:
+        if process_ids is not None:
+            process_ids = list(process_ids)
         while True:
             if time.monotonic() > deadline:
-                not_running = self._not_running_process_ids(managed_process_running)
+                not_running = self._not_running_process_ids(
+                    managed_process_running, process_ids
+                )
                 self._emit_log(
                     severity="error",
                     topic="manager.startup.process_timeout",
@@ -109,10 +128,7 @@ class LifecycleMixin(_MixinBase):
                     f"Timed out waiting for processes RUNNING: {not_running}"
                 )
             self._pump_once(poll_ms=poll_ms)
-            all_running = all(
-                h.state == managed_process_running for h in self._processes.values()
-            )
-            if all_running:
+            if not self._not_running_process_ids(managed_process_running, process_ids):
                 return
 
     def _wait_registered(self, *, deadline: float, poll_ms: int) -> None:
@@ -165,6 +181,11 @@ class LifecycleMixin(_MixinBase):
         start_drivers: bool = True,
         start_processes: bool = True,
         wait_processes_running: bool | None = None,
+        # Subset of process ids ``wait_processes_running`` waits on. ``None``
+        # (default) waits on every registered process; callers that
+        # intentionally leave some processes stopped (e.g. run_stack's
+        # ``startup.process_exclude``) pass only the ids they started.
+        wait_process_ids: Iterable[str] | None = None,
         connect: bool | None = None,
         wait_for_registered: bool = True,
         wait_for_online: bool = True,
@@ -202,6 +223,7 @@ class LifecycleMixin(_MixinBase):
                     deadline=deadline,
                     poll_ms=poll_ms,
                     managed_process_running=managed_process_running,
+                    process_ids=wait_process_ids,
                 )
             if start_drivers:
                 self.start_all_drivers()

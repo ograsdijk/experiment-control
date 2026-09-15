@@ -149,6 +149,7 @@ startup:
   start_devices: true
   start_processes: true
   process_order: [hdf_writer]
+  process_exclude: []
   wait_processes_running: true
   connect: null
   wait_for_registered: true
@@ -176,6 +177,18 @@ Notes:
 - `devices.dirs` and `processes.dirs` are searched with `glob` (default `*.yaml`).
 - `files` can list explicit YAML paths in addition to `dirs`.
 - `process_order` is optional. If omitted, `hdf_writer` is started first if present.
+  Listed processes start first in the given order; every other auto-started process is
+  appended in sorted order.
+- `process_exclude` is optional (default `[]`). It lists process ids that are left out of
+  **automatic** startup only:
+  - their process YAMLs are still loaded and registered with the manager, so they appear in
+    TUI/FastAPI process status and can be started manually later (TUI, UI, or
+    `manager.processes.start` / `POST /api/processes/{id}/start`);
+  - `process_order` orders the remaining, non-excluded processes;
+  - `wait_processes_running` waits only for the non-excluded processes, so an intentionally
+    stopped excluded process never causes a startup timeout;
+  - unknown ids, duplicate ids, or an id listed in both `process_exclude` and
+    `process_order` are config errors.
 - If `tui.enabled: true`, the stack runner starts a manager subprocess and runs the TUI in the same terminal.
 - When the TUI exits, the runner sends `manager.control.shutdown` and then terminates the manager subprocess.
 - The TUI uses one resource navigator for devices and managed processes above the inspector.
