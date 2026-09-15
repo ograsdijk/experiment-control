@@ -40,6 +40,7 @@ class ResourceView:
     connection: str | None = None
     is_remote: bool = False
     owner_peer_id: str | None = None
+    search_terms: tuple[str, ...] = ()
 
     @property
     def key(self) -> str:
@@ -55,6 +56,7 @@ class ResourceView:
                 self.health,
                 self.state,
                 self.connection or "",
+                *self.search_terms,
                 self.owner_peer_id or "",
                 self.error or "",
             )

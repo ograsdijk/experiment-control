@@ -280,16 +280,21 @@ class TopicFilterScreen(ModalScreen[dict[str, bool]]):
     CSS = """
     TopicFilterScreen {
         align: center middle;
-        background: $surface 80%;
+        background: $background 88%;
     }
 
     #topic_dialog {
         width: 100;
+        max-width: 92%;
         height: 30;
+        max-height: 85%;
         padding: 1 2;
-        border: round $primary;
+        border: solid $border-visible;
+        border-top: heavy $accent;
         background: $panel;
     }
+
+    #topic_title {height: 1; color: $accent; text-style: bold;}
 
     #topics_table {
         height: 1fr;
@@ -298,6 +303,7 @@ class TopicFilterScreen(ModalScreen[dict[str, bool]]):
     #topic_help {
         height: auto;
         margin-top: 1;
+        color: $text-muted;
     }
     """
 
@@ -321,7 +327,7 @@ class TopicFilterScreen(ModalScreen[dict[str, bool]]):
 
     def compose(self) -> ComposeResult:
         yield Vertical(
-            Label("Topics (toggle show/hide)", id="topic_title"),
+            Label("TOPICS // SHOW / HIDE", id="topic_title"),
             DataTable(id="topics_table"),
             Static(
                 "Enter/Space: toggle | a: all on | n: all off | Esc: close",
@@ -332,7 +338,7 @@ class TopicFilterScreen(ModalScreen[dict[str, bool]]):
 
     def on_mount(self) -> None:
         table = self.query_one("#topics_table", DataTable)
-        table.add_columns("show", "topic", "count")
+        table.add_columns("SHOW", "TOPIC", "COUNT")
         table.cursor_type = "row"
 
         self._refresh_table()

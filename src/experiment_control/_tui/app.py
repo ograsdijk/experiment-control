@@ -17,6 +17,7 @@ from textual.containers import Horizontal, Vertical
 from textual.driver import Driver
 from textual.reactive import reactive
 from textual.screen import ModalScreen
+from textual.widget import Widget
 from textual.widgets import (
     Button,
     DataTable,
@@ -36,12 +37,28 @@ from .helpers import (
     severity_rank_for_tui,
 )
 from .models import DeviceStatus, ResourceView
+from .status_presentation import (
+    format_age,
+    render_health_state,
+    render_link_state,
+    render_run_state,
+    state_name,
+)
 from .screens import (
     ConfirmScreen,
     InvokeMemberScreen,
     ResultScreen,
     SetMemberScreen,
     TopicFilterScreen,
+)
+from .theme import (
+    DIM_TEXT,
+    FAULT_RED,
+    HEALTHY_GREEN,
+    INDUSTRIAL_THEME,
+    MUTED_TEXT,
+    SECONDARY_TEXT,
+    WARNING_ORANGE,
 )
 from ..utils.zmq_helpers import json_dumps, safe_json_loads
 from ..utils.config_redaction import redact_config
@@ -52,36 +69,85 @@ ResourceSortColumn = Literal[
 ]
 
 _RESOURCE_COLUMNS: tuple[tuple[ResourceSortColumn, str], ...] = (
-    ("kind", "kind"),
-    ("resource", "resource"),
-    ("connection", "connection"),
-    ("health", "health"),
-    ("runtime", "runtime"),
-    ("age_s", "age_s"),
-    ("error", "error"),
+    ("kind", "KIND"),
+    ("resource", "RESOURCE"),
+    ("connection", "LINK"),
+    ("health", "HEALTH"),
+    ("runtime", "RUN"),
+    ("age_s", "AGE"),
+    ("error", "ERROR"),
 )
 _INSPECTOR_TAB_IDS = ("overview", "telemetry", "commands", "config")
+_ACTIVITY_TAB_IDS = ("errors", "events")
+
+
+def _add_uppercase_columns(table: DataTable, *keys: str) -> None:
+    """Keep visible table labels industrial and keys stable for cell updates."""
+    for key in keys:
+        table.add_column(key.upper(), key=key)
+
 
 class ManagerTUI(App):
+    TITLE = "EXPERIMENT CONTROL"
+
     CSS = """
-    #health_summary {height: 1; padding: 0 1; background: $boost;}
-    #navigation_help {height: 1; padding: 0 1; color: $text-muted; background: $boost;}
+    Screen {background: $background; color: $foreground;}
+    Header {background: $panel; color: $text-secondary;}
+    Footer {background: $panel; color: $text-muted;}
+
+    #health_summary {
+        height: 1;
+        padding: 0 1;
+        background: $surface;
+    }
+    #navigation_help {
+        height: 1;
+        padding: 0 1;
+        color: $text-muted;
+        background: $background;
+    }
     #main {height: 1fr; layout: vertical;}
     #navigator {
         width: 1fr;
         height: auto;
         min-height: 7;
         max-height: 16;
-        border-bottom: solid $primary;
+        background: $background;
+        border-bottom: solid $border-subtle;
     }
     #navigator:focus-within {border-bottom: heavy $accent;}
-    #resource_filter {height: 3;}
+    #resource_filter {
+        height: 3;
+        padding: 0 1;
+        color: $foreground;
+        background: $surface;
+        border: none;
+        border-bottom: solid $border-subtle;
+    }
+    #resource_filter:focus {
+        background: $surface;
+        background-tint: transparent;
+        border-bottom: heavy $accent;
+    }
+    Input > .input--placeholder {color: $text-disabled;}
+    Input > .input--cursor {background: $accent; color: $background;}
     #resources_table {height: auto; min-height: 3; max-height: 13;}
     #devices_table, #processes_table, #processes_title {display: none;}
-    #inspector {width: 1fr; height: 1fr;}
+    #inspector {width: 1fr; height: 1fr; background: $background;}
     #inspector:focus-within {border-top: heavy $accent;}
-    #selected_resource_title {height: 1; padding: 0 1; text-style: bold;}
-    #action_strip {height: 1; padding: 0 1; overflow-x: auto;}
+    #selected_resource_title {
+        height: 1;
+        padding: 0 1;
+        color: $text-secondary;
+        background: $surface;
+        text-style: bold;
+    }
+    #action_strip {
+        height: 1;
+        padding: 0 1;
+        overflow-x: auto;
+        background: $surface;
+    }
     #action_strip Button {
         width: auto;
         min-width: 0;
@@ -89,40 +155,99 @@ class ManagerTUI(App):
         padding: 0 1;
         margin-right: 0;
         border: none;
+        background: transparent;
+        color: $text-muted;
+        text-style: none;
     }
+    #action_strip Button:hover {background: $selection-background-blurred; color: $foreground;}
+    #action_strip Button:focus {background: $selection-background; color: $accent; text-style: bold;}
+    #action_strip Button:disabled {background: transparent; color: $text-disabled; text-opacity: 1;}
+    #action_strip #action_start {color: $success;}
+    #action_strip #action_stop {color: $error;}
+    #action_strip #action_start:disabled, #action_strip #action_stop:disabled {color: $text-disabled;}
     #inspector_tabs {height: 1fr;}
+    TabbedContent {background: $background;}
+    Tabs {height: 2; background: $surface;}
+    Tab {background: $surface; color: $text-muted; text-style: none;}
+    Tab:hover {background: $surface; color: $text-secondary;}
+    Tab.-active {background: $surface; color: $foreground; text-style: bold;}
+    Tabs:focus Tab.-active {background: $surface; color: $accent; text-style: bold;}
+    Underline > .underline--bar {color: $accent; background: $border-subtle;}
     #overview_tables {height: 1fr;}
-    #status_row {height: 2;}
-    #errors_table {height: 1fr;}
-    #members_table {height: 1fr;}
-    #cap_help {height: auto;}
-    #config_table {height: 1fr;}
-    #telemetry_empty {height: 1; color: $text-muted; display: none;}
-    #event_log {height: 1fr;}
-    #activity_summary {
-        height: 3;
+    #heartbeat_title, #driver_title, #process_title {
+        height: 1;
         padding: 0 1;
-        border: round $primary;
-        background: $boost;
+        color: $text-secondary;
+        background: $surface;
         text-style: bold;
     }
-    #activity_drawer {height: 14; display: none; border-top: solid $primary;}
+    DataTable {background: $background; color: $foreground;}
+    DataTable > .datatable--header {background: $panel; color: $text-secondary; text-style: bold;}
+    DataTable > .datatable--even-row, DataTable > .datatable--odd-row {background: $background;}
+    DataTable > .datatable--cursor {background: $selection-background-blurred; color: $text-secondary; text-style: none;}
+    DataTable:focus {background: $background; background-tint: transparent;}
+    DataTable:focus > .datatable--header {background: $panel; background-tint: transparent;}
+    DataTable:focus > .datatable--cursor {background: $selection-background; color: $foreground; text-style: bold;}
+    DataTable > .datatable--hover {background: $selection-background-blurred;}
+    #status_row {
+        height: 2;
+        padding: 0 1;
+        background: $surface;
+        border-top: solid $border-subtle;
+    }
+    #status_row Static {width: 1fr;}
+    #dropped_status {text-align: center;}
+    #backend_status {text-align: right;}
+    #errors_table {height: 1fr;}
+    #members_table {height: 1fr;}
+    #cap_help {height: auto; padding: 0 1; color: $text-muted;}
+    #config_table {height: 1fr;}
+    #telemetry_empty {height: 1; padding: 0 1; color: $text-muted; display: none;}
+    #event_log {height: 1fr; background: $background; color: $text-secondary;}
+    #activity_summary {
+        height: 2;
+        padding: 0 1;
+        border-top: solid $border-subtle;
+        background: $surface;
+        color: $text-muted;
+    }
+    #activity_summary.has-warning {color: $warning;}
+    #activity_summary.has-error {color: $error; text-style: bold;}
+    #activity_drawer {
+        height: 14;
+        display: none;
+        border-top: solid $border-visible;
+        background: $background;
+    }
     #activity_drawer.open {display: block;}
-
-    InvokeMemberScreen, SetMemberScreen, ResultScreen {
-        align: center middle;
-        background: $surface 80%;
+    #activity_drawer:focus-within {border-top: heavy $accent;}
+    #activity_tabs {height: 1fr; background: $background;}
+    #activity_tabs Tabs {background: $panel;}
+    #activity_tabs Tab {background: $panel; color: $text-muted;}
+    #activity_tabs Tab.-active {background: $panel; color: $foreground;}
+    #activity_tabs Tabs:focus Tab.-active {background: $panel; color: $accent;}
+    #activity_tabs Underline > .underline--bar {
+        color: $accent;
+        background: $border-subtle;
     }
 
-    #invoke_dialog, #set_dialog {
+    InvokeMemberScreen, SetMemberScreen, ResultScreen, ConfirmScreen {
+        align: center middle;
+        background: $background 88%;
+    }
+
+    #invoke_dialog, #set_dialog, #confirm_dialog {
         width: 80;
         height: auto;
         min-height: 0;
         max-height: 70%;
         padding: 1 2;
-        border: round $primary;
+        border: solid $border-visible;
+        border-top: heavy $accent;
         background: $panel;
     }
+
+    #confirm_dialog {width: 60;}
 
     #result_dialog {
         width: 80;
@@ -131,16 +256,23 @@ class ManagerTUI(App):
         min-height: 0;
         max-height: 80%;
         padding: 1 2;
-        border: round $primary;
+        border: solid $border-visible;
+        border-top: heavy $accent;
         background: $panel;
     }
 
-    #result_title {height: 1; text-style: bold;}
+    #invoke_title, #set_title, #result_title {
+        height: 1;
+        color: $accent;
+        text-style: bold;
+    }
     #result_body {
         height: auto;
         min-height: 3;
         max-height: 50vh;
-        border: solid $primary;
+        border: solid $border-subtle;
+        background: $background;
+        color: $foreground;
     }
     #result_close {height: 3; margin-top: 1;}
 
@@ -148,23 +280,30 @@ class ManagerTUI(App):
         height: auto;
     }
 
-    ConfirmScreen {
-        align: center middle;
-        background: $surface 80%;
-    }
-
-    #confirm_dialog {
-        width: 60;
-        height: auto;
-        min-height: 0;
-        max-height: 70%;
-        padding: 1 2;
-        border: round $primary;
-        background: $panel;
-    }
-
     #confirm_dialog > * {
         height: auto;
+    }
+
+    #invoke_dialog Input, #set_dialog Input {
+        background: $background;
+        color: $foreground;
+        border: solid $border-subtle;
+    }
+    #invoke_dialog Input:focus, #set_dialog Input:focus {
+        background: $background;
+        background-tint: transparent;
+        border: solid $accent;
+    }
+
+    #invoke_buttons Button, #set_buttons Button, #confirm_buttons Button, #result_close {
+        border: none;
+        background: $surface;
+        color: $text-secondary;
+    }
+    #invoke_buttons Button:focus, #set_buttons Button:focus,
+    #confirm_buttons Button:focus, #result_close:focus {
+        background: $selection-background;
+        color: $accent;
     }
     """
 
@@ -191,10 +330,18 @@ class ManagerTUI(App):
         ("o", "resource_sort_next", "Next sort"),
         ("O", "resource_sort_reverse", "Reverse sort"),
         Binding(
-            "left_square_bracket", "inspector_previous", "Previous tab", show=False, priority=True
+            "left_square_bracket",
+            "inspector_previous",
+            "Previous tab",
+            show=False,
+            priority=True,
         ),
         Binding(
-            "right_square_bracket", "inspector_next", "Next tab", show=False, priority=True
+            "right_square_bracket",
+            "inspector_next",
+            "Next tab",
+            show=False,
+            priority=True,
         ),
         Binding("a", "toggle_activity", "Activity", show=False),
         Binding("1", "inspector_overview", "Overview", show=False),
@@ -236,13 +383,18 @@ class ManagerTUI(App):
         rpc_timeout_ms: int = 1500,
         snapshot_period_s: float = 2.0,
         event_log_max_lines: int = 10_000,
-        event_log_default_hidden_topics: list[str] | tuple[str, ...] | set[str] | None = None,
+        event_log_default_hidden_topics: list[str]
+        | tuple[str, ...]
+        | set[str]
+        | None = None,
         event_log_manager_min_severity: str = "warning",
         pub_queue_maxsize: int = 10_000,
         pub_queue_overflow_policy: str = "drop_newest",
         driver_class: type[Driver] | None = None,
     ) -> None:
         super().__init__(driver_class=driver_class)
+        self.register_theme(INDUSTRIAL_THEME)
+        self.theme = INDUSTRIAL_THEME.name
         self._manager_rpc = manager_rpc
         self._manager_pub = manager_pub
         self._rpc_timeout_ms = rpc_timeout_ms
@@ -259,7 +411,9 @@ class ManagerTUI(App):
             self._event_log_manager_min_severity
         )
         self._pub_queue_maxsize = max(1, int(pub_queue_maxsize))
-        overflow_policy = str(pub_queue_overflow_policy or "drop_newest").strip().lower()
+        overflow_policy = (
+            str(pub_queue_overflow_policy or "drop_newest").strip().lower()
+        )
         if overflow_policy not in self._VALID_PUB_QUEUE_OVERFLOW_POLICIES:
             overflow_policy = "drop_newest"
         self._pub_queue_overflow_policy = overflow_policy
@@ -342,7 +496,13 @@ class ManagerTUI(App):
         self._toast_cooldown_s = 2.0
         self._toast_repeat_s = 30.0
         self._pub_drain_max = 500
-        self._telemetry_columns_device = ("signal", "value", "units", "quality", "age_s")
+        self._telemetry_columns_device = (
+            "signal",
+            "value",
+            "units",
+            "quality",
+            "age",
+        )
         self._telemetry_columns_process = self._telemetry_columns_device
         self._heartbeat_columns_device = (
             "pid",
@@ -354,7 +514,7 @@ class ManagerTUI(App):
             "last_error",
         )
         self._heartbeat_columns_process = (
-            "hb_age_s",
+            "hb_age",
             "last_hb_t_wall",
             "last_hb_t_mono",
             "endpoint",
@@ -413,6 +573,7 @@ class ManagerTUI(App):
         self._selected_resource_key: str | None = None
         self._pending_resource_actions: set[str] = set()
         self._activity_open = False
+        self._activity_return_focus: Widget | None = None
         self._activity_unread_warning = 0
         self._activity_unread_error = 0
         self._event_lines: deque[str] = deque(maxlen=self._event_log_max_lines)
@@ -427,15 +588,15 @@ class ManagerTUI(App):
         self._narrow_show_inspector = False
 
     def compose(self) -> ComposeResult:
-        yield Header()
-        yield Static("Backend connecting · 0 resources", id="health_summary")
+        yield Header(icon="")
+        yield Static(self._health_summary_text([]), id="health_summary")
         yield Static(
-            Text("Enter: inspector · Esc: resources · [ / ]: tabs"),
+            Text("ENTER inspector · ESC resources · [ / ] tabs"),
             id="navigation_help",
         )
         with Vertical(id="main"):
             with Vertical(id="navigator"):
-                yield Input(placeholder="Search resources  [/]", id="resource_filter")
+                yield Input(placeholder="RESOURCE SEARCH  [/]", id="resource_filter")
                 yield DataTable(id="resources_table")
                 # Kept mounted as compatibility targets for the existing
                 # low-level renderer tests; the operator UI uses resources_table.
@@ -443,45 +604,47 @@ class ManagerTUI(App):
                 yield Label("Processes", id="processes_title")
                 yield DataTable(id="processes_table")
             with Vertical(id="inspector"):
-                yield Label("No resource selected", id="selected_resource_title")
+                yield Label("NO RESOURCE SELECTED", id="selected_resource_title")
                 with Horizontal(id="action_strip"):
-                    yield Button("Start (s)", id="action_start", variant="success")
-                    yield Button("Stop (x)", id="action_stop", variant="error")
-                    yield Button("Restart (r)", id="action_restart")
-                    yield Button("Connect (c)", id="action_connect")
-                    yield Button("Disconnect (d)", id="action_disconnect")
-                    yield Button("Recover (v)", id="action_recover")
+                    yield Button("START (s)", id="action_start", variant="success")
+                    yield Button("STOP (x)", id="action_stop", variant="error")
+                    yield Button("RESTART (r)", id="action_restart")
+                    yield Button("CONNECT (c)", id="action_connect")
+                    yield Button("DISCONNECT (d)", id="action_disconnect")
+                    yield Button("RECOVER (v)", id="action_recover")
                 with TabbedContent(initial="overview", id="inspector_tabs"):
-                    with TabPane("Overview (1)", id="overview"):
+                    with TabPane("OVERVIEW (1)", id="overview"):
                         with Vertical(id="overview_tables"):
-                            yield Label("Heartbeat", id="heartbeat_title")
+                            yield Label("HEARTBEAT", id="heartbeat_title")
                             yield DataTable(id="heartbeat_table")
-                            yield Label("Runtime", id="driver_title")
+                            yield Label("RUNTIME", id="driver_title")
                             yield DataTable(id="driver_table")
-                            yield Label("Process", id="process_title")
+                            yield Label("PROCESS", id="process_title")
                             yield DataTable(id="process_table")
-                    with TabPane("Telemetry (2)", id="telemetry"):
+                    with TabPane("TELEMETRY (2)", id="telemetry"):
                         yield Static("", id="telemetry_empty")
                         yield DataTable(id="telemetry_table")
-                    with TabPane("Commands (3)", id="commands"):
+                    with TabPane("COMMANDS (3)", id="commands"):
                         yield DataTable(id="members_table")
-                        yield Static("Enter: invoke/get | e: set | R: refresh", id="cap_help")
-                    with TabPane("Config (4)", id="config"):
+                        yield Static(
+                            "Enter: invoke/get | e: set | R: refresh", id="cap_help"
+                        )
+                    with TabPane("CONFIG (4)", id="config"):
                         yield DataTable(id="config_table")
         yield Static(
-            "▼ Activity — press a to open · no unread alerts",
+            "▼ ACTIVITY // A OPEN  |  NO UNREAD ALERTS",
             id="activity_summary",
         )
         with Vertical(id="activity_drawer"):
             with TabbedContent(initial="errors", id="activity_tabs"):
-                with TabPane("Errors", id="errors"):
+                with TabPane("ERRORS", id="errors"):
                     yield DataTable(id="errors_table")
-                with TabPane("Event log", id="events"):
+                with TabPane("EVENT LOG", id="events"):
                     yield RichLog(id="event_log", max_lines=self._event_log_max_lines)
         with Horizontal(id="status_row"):
-            yield Static("Streaming: ON (t)", id="streaming_status")
-            yield Static("Dropped: 0", id="dropped_status")
-            yield Static(self._backend_status_text, id="backend_status")
+            yield Static(self._streaming_status_text(), id="streaming_status")
+            yield Static(self._dropped_status_text(), id="dropped_status")
+            yield Static(self._backend_status_renderable(), id="backend_status")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -549,13 +712,14 @@ class ManagerTUI(App):
         self._update_resource_sort_headers()
 
         devices = self.query_one("#devices_table", DataTable)
-        devices.add_columns(
+        _add_uppercase_columns(
+            devices,
             "device_id",
             "liveness",
             "driver_proc",
             "pid",
-            "hb_age_s",
-            "telemetry_age_s",
+            "hb_age",
+            "telemetry_age",
             "driver_state",
             "device_state",
             "last_error",
@@ -563,11 +727,12 @@ class ManagerTUI(App):
         devices.cursor_type = "row"
 
         processes = self.query_one("#processes_table", DataTable)
-        processes.add_columns(
+        _add_uppercase_columns(
+            processes,
             "process_id",
             "state",
             "pid",
-            "hb_age_s",
+            "hb_age",
             "restart_count",
             "last_exit_code",
             "last_error",
@@ -575,26 +740,26 @@ class ManagerTUI(App):
         processes.cursor_type = "row"
 
         telemetry = self.query_one("#telemetry_table", DataTable)
-        telemetry.add_columns(*self._telemetry_columns_device)
+        _add_uppercase_columns(telemetry, *self._telemetry_columns_device)
 
         heartbeat = self.query_one("#heartbeat_table", DataTable)
-        heartbeat.add_columns(*self._heartbeat_columns_device)
+        _add_uppercase_columns(heartbeat, *self._heartbeat_columns_device)
 
         driver = self.query_one("#driver_table", DataTable)
-        driver.add_columns(*self._driver_columns)
+        _add_uppercase_columns(driver, *self._driver_columns)
 
         process = self.query_one("#process_table", DataTable)
-        process.add_columns("field", "value")
+        _add_uppercase_columns(process, "field", "value")
 
         config = self.query_one("#config_table", DataTable)
-        config.add_columns("setting", "value")
+        _add_uppercase_columns(config, "setting", "value")
 
         errors = self.query_one("#errors_table", DataTable)
-        errors.add_columns("time", "sev", "source", "id", "message")
+        _add_uppercase_columns(errors, "time", "sev", "source", "id", "message")
         errors.cursor_type = "row"
 
         members = self.query_one("#members_table", DataTable)
-        members.add_columns("name", "kind", "rw", "type", "source", "doc")
+        _add_uppercase_columns(members, "name", "kind", "rw", "type", "source", "doc")
         members.cursor_type = "row"
 
     def _is_table_focused(self, table: DataTable) -> bool:
@@ -621,16 +786,16 @@ class ManagerTUI(App):
         driver = self.query_one("#driver_table", DataTable)
         if self._members_source == "process":
             telemetry.clear(columns=True)
-            telemetry.add_columns(*self._telemetry_columns_process)
+            _add_uppercase_columns(telemetry, *self._telemetry_columns_process)
             heartbeat.clear(columns=True)
-            heartbeat.add_columns(*self._heartbeat_columns_process)
+            _add_uppercase_columns(heartbeat, *self._heartbeat_columns_process)
         else:
             telemetry.clear(columns=True)
-            telemetry.add_columns(*self._telemetry_columns_device)
+            _add_uppercase_columns(telemetry, *self._telemetry_columns_device)
             heartbeat.clear(columns=True)
-            heartbeat.add_columns(*self._heartbeat_columns_device)
+            _add_uppercase_columns(heartbeat, *self._heartbeat_columns_device)
         driver.clear(columns=True)
-        driver.add_columns(*self._driver_columns)
+        _add_uppercase_columns(driver, *self._driver_columns)
 
     def _restore_members_scroll(self, scroll_x: float, scroll_y: float) -> None:
         table = self.query_one("#members_table", DataTable)
@@ -706,7 +871,10 @@ class ManagerTUI(App):
     def _set_backend_status(self, text: str) -> None:
         # Updates a widget, so must run on the UI thread. The RPC worker calls
         # this during round-trips — marshal back to the UI thread when off it.
-        if self._ui_thread_id is not None and threading.get_ident() != self._ui_thread_id:
+        if (
+            self._ui_thread_id is not None
+            and threading.get_ident() != self._ui_thread_id
+        ):
             try:
                 self.call_from_thread(self._set_backend_status, text)
             except Exception:
@@ -714,11 +882,75 @@ class ManagerTUI(App):
             return
         self._backend_status_text = text
         try:
-            self.query_one("#backend_status", Static).update(text)
+            self.query_one("#backend_status", Static).update(
+                self._backend_status_renderable()
+            )
         except Exception:
             pass
         if hasattr(self, "_resource_views"):
             self._update_health_summary(list(self._resource_views.values()))
+
+    def _backend_status_renderable(self) -> Text:
+        state = self._backend_status_text.partition(":")[2].strip() or "unknown"
+        if state == "connected":
+            style = HEALTHY_GREEN
+        elif state == "unavailable":
+            style = f"bold {FAULT_RED}"
+        elif state in {"connecting", "reconnecting"}:
+            style = WARNING_ORANGE
+        else:
+            style = MUTED_TEXT
+        return Text.assemble(
+            ("BACKEND // ", MUTED_TEXT),
+            (state.upper(), style),
+        )
+
+    def _streaming_status_text(self) -> Text:
+        state = "ACTIVE" if self.streaming_enabled else "INACTIVE"
+        style = HEALTHY_GREEN if self.streaming_enabled else MUTED_TEXT
+        return Text.assemble(
+            ("STREAM // ", MUTED_TEXT), (state, style), (" (t)", DIM_TEXT)
+        )
+
+    def _dropped_status_text(self) -> Text:
+        count = self._dropped_pub_messages
+        style = WARNING_ORANGE if count else SECONDARY_TEXT
+        return Text.assemble(("DROP // ", MUTED_TEXT), (str(count), style))
+
+    def _health_summary_text(self, all_views: list[ResourceView]) -> Text:
+        issue_views = [view for view in all_views if self._resource_has_issue(view)]
+        issues = len(issue_views)
+        healthy = sum(v.health == "healthy" for v in all_views)
+        remote = sum(v.is_remote for v in all_views)
+        text = self._backend_status_renderable()
+        text.append("  |  ", style=DIM_TEXT)
+        text.append("RESOURCES // ", style=MUTED_TEXT)
+        text.append(str(len(all_views)), style=SECONDARY_TEXT)
+        text.append("  |  ", style=DIM_TEXT)
+        text.append("HEALTHY // ", style=MUTED_TEXT)
+        text.append(str(healthy), style=HEALTHY_GREEN if healthy else SECONDARY_TEXT)
+        text.append("  |  ", style=DIM_TEXT)
+        text.append("ISSUES // ", style=MUTED_TEXT)
+        issue_style = (
+            FAULT_RED
+            if any(
+                view.health == "failed"
+                or (
+                    view.is_remote and state_name(view.connection) == "OFFLINE"
+                )
+                for view in issue_views
+            )
+            else WARNING_ORANGE
+            if issue_views
+            else SECONDARY_TEXT
+        )
+        text.append(str(issues), style=issue_style)
+        text.append("  |  ", style=DIM_TEXT)
+        text.append("REMOTE // ", style=MUTED_TEXT)
+        text.append(str(remote), style=SECONDARY_TEXT)
+        if self._unhealthy_only:
+            text.append("  |  ISSUES ONLY", style=WARNING_ORANGE)
+        return text
 
     def _next_request_id(self) -> str:
         self._rpc_seq += 1
@@ -927,7 +1159,8 @@ class ManagerTUI(App):
             if isinstance(raw_mono, (int, float)):
                 t_mono = float(raw_mono)
         if t_mono is not None and (
-            self._last_manager_log_t_mono is None or t_mono > self._last_manager_log_t_mono
+            self._last_manager_log_t_mono is None
+            or t_mono > self._last_manager_log_t_mono
         ):
             self._last_manager_log_t_mono = t_mono
 
@@ -959,7 +1192,9 @@ class ManagerTUI(App):
             render=False,
         )
 
-        if not from_tail and self._severity_rank(severity) >= self._severity_rank("error"):
+        if not from_tail and self._severity_rank(severity) >= self._severity_rank(
+            "error"
+        ):
             toast_message = text.replace("\n", " ").strip()
             if len(toast_message) > 180:
                 toast_message = toast_message[:177] + "..."
@@ -1093,9 +1328,7 @@ class ManagerTUI(App):
 
     def _schedule_process_capabilities_retry(self, process_id: str) -> None:
         current = float(
-            self._proc_cap_retry_delay_s.get(
-                process_id, self._proc_cap_retry_initial_s
-            )
+            self._proc_cap_retry_delay_s.get(process_id, self._proc_cap_retry_initial_s)
         )
         delay = max(self._proc_cap_retry_initial_s, current)
         self._proc_cap_retry_next_mono[process_id] = time.monotonic() + delay
@@ -1107,9 +1340,7 @@ class ManagerTUI(App):
         self._proc_cap_retry_next_mono.pop(process_id, None)
         self._proc_cap_retry_delay_s.pop(process_id, None)
 
-    def _apply_device_capabilities(
-        self, device_id: str, resp: Json | None
-    ) -> bool:
+    def _apply_device_capabilities(self, device_id: str, resp: Json | None) -> bool:
         """Fold a device `capabilities` response into the caches. Runs on the
         UI thread (from the RPC-worker callback). Returns True on success."""
         if not resp or not resp.get("ok"):
@@ -1175,9 +1406,7 @@ class ManagerTUI(App):
                 return member
         return None
 
-    def _apply_process_capabilities(
-        self, process_id: str, resp: Json | None
-    ) -> bool:
+    def _apply_process_capabilities(self, process_id: str, resp: Json | None) -> bool:
         """Fold a process `capabilities` response into the caches. Runs on the
         UI thread (from the RPC-worker callback). Returns True on success."""
         if not resp or not resp.get("ok"):
@@ -1279,9 +1508,7 @@ class ManagerTUI(App):
 
         self._background_rpc_submit({"type": "device.list_status"}, _after_devices)
 
-    def _apply_snapshot(
-        self, resp: Json | None, proc_resp: Json | None
-    ) -> None:
+    def _apply_snapshot(self, resp: Json | None, proc_resp: Json | None) -> None:
         # Runs on the UI thread (RPC-worker callback). Mutates snapshot state
         # and renders — all UI-thread work, serialized with render/actions.
         snapshot_changed = False
@@ -1302,7 +1529,9 @@ class ManagerTUI(App):
                     status = DeviceStatus(
                         device_id=device_id,
                         registered=bool(item.get("registered")),
-                        liveness=str(item.get("liveness")) if item.get("liveness") else None,
+                        liveness=str(item.get("liveness"))
+                        if item.get("liveness")
+                        else None,
                         hb_age_s=item.get("hb_age_s"),
                         telemetry_age_s=item.get("telemetry_age_s"),
                         driver_state=str(item.get("driver_state"))
@@ -1313,7 +1542,9 @@ class ManagerTUI(App):
                         else None,
                         device_reachable=item.get("device_reachable"),
                         last_error=item.get("last_error"),
-                        driver_proc_state=str(proc.get("state")) if proc.get("state") else None,
+                        driver_proc_state=str(proc.get("state"))
+                        if proc.get("state")
+                        else None,
                         driver_pid=proc.get("pid"),
                         driver_restart_count=int(proc.get("restart_count") or 0),
                         driver_last_exit_code=proc.get("last_exit_code"),
@@ -1386,19 +1617,31 @@ class ManagerTUI(App):
 
     @staticmethod
     def _device_health(status: DeviceStatus) -> str:
-        if str(status.driver_proc_state or "").upper() == "FAILED":
+        process_state = state_name(status.driver_proc_state)
+        driver_state = state_name(status.driver_state)
+        device_state = state_name(status.device_state)
+        liveness = state_name(status.liveness)
+        if process_state in {"FAILED", "CRASHLOOP"}:
             return "failed"
-        if str(status.liveness or "").upper() == "STALE":
+        if device_state == "FAULT" or driver_state == "FAULT":
+            return "failed"
+        if liveness == "STALE":
             return "stale"
-        if str(status.driver_proc_state or "").upper() in {"STARTING", "STOPPING"}:
+        if device_state == "DEGRADED" or driver_state == "DEGRADED":
+            return "degraded"
+        if process_state in {"STARTING", "STOPPING"}:
             return "transition"
-        if str(status.liveness or "").upper() == "ONLINE":
+        if liveness == "ONLINE" and device_state == "OK":
             return "healthy"
-        return "neutral"
+        if device_state == "DISCONNECTED" and liveness == "DISCONNECTED":
+            return "neutral"
+        if process_state in {"STOPPED", "EXITED"} or liveness == "OFFLINE":
+            return "neutral"
+        return "unknown"
 
     @staticmethod
     def _process_health(proc: Json) -> str:
-        state = str(proc.get("state", "")).upper()
+        state = state_name(proc.get("state"))
         if state in {"FAILED", "CRASHLOOP"}:
             return "failed"
         if state in {"STARTING", "STOPPING"}:
@@ -1409,7 +1652,7 @@ class ManagerTUI(App):
 
     @staticmethod
     def _device_connection(status: DeviceStatus) -> str:
-        liveness = str(status.liveness or "").upper().rsplit(".", 1)[-1]
+        liveness = state_name(status.liveness)
         if liveness == "ONLINE":
             return "connected"
         if liveness == "DISCONNECTED":
@@ -1418,52 +1661,55 @@ class ManagerTUI(App):
             return "stale"
         if liveness == "OFFLINE":
             return "offline"
-        device_state = str(status.device_state or "").upper().rsplit(".", 1)[-1]
+        device_state = state_name(status.device_state)
         if device_state == "DISCONNECTED":
             return "disconnected"
         return "unknown"
 
     @staticmethod
-    def _connection_cell(connection: str | None) -> Text | str:
-        if connection == "connected":
-            return Text("● connected", style="green")
-        if connection == "disconnected":
-            return Text("○ disconnected", style="dim")
-        if connection in {"stale", "unknown"}:
-            return Text(f"◐ {connection}", style="yellow")
-        if connection == "offline":
-            return Text("— offline", style="dim")
-        return "—"
+    def _device_link(status: DeviceStatus) -> str:
+        """Return the liveness-derived link value used by the navigator."""
+        liveness = state_name(status.liveness)
+        return liveness or "UNKNOWN"
+
+    @staticmethod
+    def _connection_cell(connection: str | None, *, health: str = "neutral") -> Text:
+        return render_link_state(
+            connection,
+            failure_related=(connection or "").casefold() == "offline"
+            and health == "failed",
+        )
 
     @staticmethod
     def _health_cell(health: str) -> Text:
-        styles = {
-            "healthy": "green",
-            "transition": "yellow",
-            "stale": "bold red",
-            "failed": "bold red",
-            "neutral": "dim",
-        }
-        return Text(health, style=styles.get(health, ""))
+        return render_health_state(health)
+
+    @staticmethod
+    def _runtime_cell(state: str) -> Text:
+        return render_run_state(state)
+
+    @staticmethod
+    def _error_cell(message: str) -> Text | str:
+        return Text(message, style=FAULT_RED) if message else ""
 
     def _collect_resource_views(self) -> list[ResourceView]:
         views: list[ResourceView] = []
         for device_id in sorted(self._device_status):
             status = self._device_status[device_id]
-            state_parts = [
-                part
-                for part in (status.driver_proc_state, status.driver_state)
-                if part
-            ]
             views.append(
                 ResourceView(
                     kind="device",
                     resource_id=device_id,
                     health=self._device_health(status),
-                    state="/".join(state_parts),
+                    state=state_name(status.driver_proc_state),
                     age_s=status.hb_age_s,
                     error=status.last_error or status.driver_last_error,
-                    connection=self._device_connection(status),
+                    connection=self._device_link(status),
+                    search_terms=(
+                        state_name(status.liveness),
+                        state_name(status.device_state),
+                        state_name(status.driver_state),
+                    ),
                     is_remote=status.is_remote,
                     owner_peer_id=status.owner_peer_id,
                 )
@@ -1481,10 +1727,17 @@ class ManagerTUI(App):
                     kind="process",
                     resource_id=process_id,
                     health=self._process_health(proc),
-                    state=str(proc.get("state", "")),
+                    state=state_name(proc.get("state")),
                     age_s=float(age) if isinstance(age, (int, float)) else None,
-                    error=str(proc.get("last_error")) if proc.get("last_error") else None,
-                    connection=None,
+                    error=str(proc.get("last_error"))
+                    if proc.get("last_error")
+                    else None,
+                    connection=(
+                        state_name(proc.get("liveness"))
+                        if is_remote and proc.get("liveness")
+                        else None
+                    ),
+                    search_terms=(state_name(proc.get("liveness")),),
                     is_remote=is_remote,
                     owner_peer_id=str(proc.get("owner_peer_id"))
                     if proc.get("owner_peer_id")
@@ -1563,22 +1816,25 @@ class ManagerTUI(App):
             [
                 view
                 for view in self._collect_resource_views()
-                if (not self._unhealthy_only or view.health in {"failed", "stale"})
+                if (
+                    not self._unhealthy_only or self._resource_has_issue(view)
+                )
                 and (not query or query in view.searchable_text)
             ]
         )
 
+    @staticmethod
+    def _resource_has_issue(view: ResourceView) -> bool:
+        """Return whether a resource needs operator attention."""
+        if view.health in {"failed", "stale", "degraded"}:
+            return True
+        return view.is_remote and state_name(view.connection) in {"OFFLINE", "STALE"}
+
     def _update_health_summary(self, all_views: list[ResourceView]) -> None:
-        unhealthy = sum(v.health in {"failed", "stale"} for v in all_views)
-        healthy = sum(v.health == "healthy" for v in all_views)
-        remote = sum(v.is_remote for v in all_views)
-        filter_text = " · problems only" if self._unhealthy_only else ""
-        summary = (
-            f"{self._backend_status_text} · {len(all_views)} resources · "
-            f"{healthy} healthy · {unhealthy} problems · {remote} remote{filter_text}"
-        )
         try:
-            self.query_one("#health_summary", Static).update(summary)
+            self.query_one("#health_summary", Static).update(
+                self._health_summary_text(all_views)
+            )
         except Exception:
             pass
 
@@ -1599,7 +1855,9 @@ class ManagerTUI(App):
             [
                 view
                 for view in all_views
-                if (not self._unhealthy_only or view.health in {"failed", "stale"})
+                if (
+                    not self._unhealthy_only or self._resource_has_issue(view)
+                )
                 and (
                     not self._resource_filter.strip()
                     or self._resource_filter.strip().lower() in view.searchable_text
@@ -1611,7 +1869,9 @@ class ManagerTUI(App):
         # force a rebuild.  When it produces no rows both lists are empty,
         # so also consult the mounted table; otherwise stale rows remain
         # visible after filtering an all-healthy stack to "Problems only".
-        order_changed = next_order != self._resource_order or (not next_order and table.row_count > 0)
+        order_changed = next_order != self._resource_order or (
+            not next_order and table.row_count > 0
+        )
         if order_changed:
             table.clear()
             self._resource_rows.clear()
@@ -1623,15 +1883,17 @@ class ManagerTUI(App):
                     view.connection or "",
                     view.health,
                     view.state,
-                    f"{view.age_s:.1f}" if view.age_s is not None else "",
+                    format_age(view.age_s),
                     (view.error or "")[:40],
                 )
                 table.add_row(
                     row[0],
                     row[1],
-                    self._connection_cell(row[2]),
+                    self._connection_cell(row[2], health=view.health),
                     self._health_cell(row[3]),
-                    *row[4:],
+                    self._runtime_cell(row[4]),
+                    row[5],
+                    self._error_cell(row[6]),
                     key=view.key,
                 )
                 self._resource_rows[view.key] = row
@@ -1654,17 +1916,28 @@ class ManagerTUI(App):
                     view.connection or "",
                     view.health,
                     view.state,
-                    f"{view.age_s:.1f}" if view.age_s is not None else "",
+                    format_age(view.age_s),
                     (view.error or "")[:40],
                 )
                 previous = self._resource_rows.get(view.key)
                 if previous != row:
-                    for index, (column, value) in enumerate(zip(columns, row, strict=True)):
-                        if previous is None or previous[index] != value:
+                    health_changed = previous is None or previous[3] != view.health
+                    for index, (column, value) in enumerate(
+                        zip(columns, row, strict=True)
+                    ):
+                        if (
+                            previous is None
+                            or previous[index] != value
+                            or (column == "connection" and health_changed)
+                        ):
                             if column == "health":
                                 cell: str | Text = self._health_cell(value)
                             elif column == "connection":
-                                cell = self._connection_cell(value)
+                                cell = self._connection_cell(value, health=view.health)
+                            elif column == "runtime":
+                                cell = self._runtime_cell(value)
+                            elif column == "error":
+                                cell = self._error_cell(value)
                             else:
                                 cell = value
                             table.update_cell(view.key, column, cell)
@@ -1682,7 +1955,9 @@ class ManagerTUI(App):
                 self._inspector_mode = "process"
                 self._members_source = "process"
         if self._selected_resource_key in next_order:
-            table.move_cursor(row=next_order.index(self._selected_resource_key), column=0)
+            table.move_cursor(
+                row=next_order.index(self._selected_resource_key), column=0
+            )
         if preserve_scroll and order_changed:
             self.call_after_refresh(self._restore_resource_scroll, scroll_x, scroll_y)
         self._update_health_summary(all_views)
@@ -1703,7 +1978,9 @@ class ManagerTUI(App):
             self._cap_cache_mono.pop(device_id, None)
             self._members_last.pop(device_id, None)
 
-        stale_render_attempts = set(self._dev_cap_render_attempt_mono) - active_device_ids
+        stale_render_attempts = (
+            set(self._dev_cap_render_attempt_mono) - active_device_ids
+        )
         for device_id in stale_render_attempts:
             self._dev_cap_render_attempt_mono.pop(device_id, None)
 
@@ -1719,7 +1996,10 @@ class ManagerTUI(App):
         config_cache = getattr(self, "_config_cache", {})
         config_errors = getattr(self, "_config_errors", {})
         for key in list(config_cache):
-            if key.startswith("device:") and key.split(":", 1)[1] not in active_device_ids:
+            if (
+                key.startswith("device:")
+                and key.split(":", 1)[1] not in active_device_ids
+            ):
                 config_cache.pop(key, None)
                 config_errors.pop(key, None)
 
@@ -1735,7 +2015,9 @@ class ManagerTUI(App):
             self._proc_members_last.pop(process_id, None)
             self._reset_process_capabilities_retry(process_id)
 
-        stale_render_attempts = set(self._proc_cap_render_attempt_mono) - active_process_ids
+        stale_render_attempts = (
+            set(self._proc_cap_render_attempt_mono) - active_process_ids
+        )
         for process_id in stale_render_attempts:
             self._proc_cap_render_attempt_mono.pop(process_id, None)
 
@@ -1751,7 +2033,10 @@ class ManagerTUI(App):
         config_cache = getattr(self, "_config_cache", {})
         config_errors = getattr(self, "_config_errors", {})
         for key in list(config_cache):
-            if key.startswith("process:") and key.split(":", 1)[1] not in active_process_ids:
+            if (
+                key.startswith("process:")
+                and key.split(":", 1)[1] not in active_process_ids
+            ):
                 config_cache.pop(key, None)
                 config_errors.pop(key, None)
 
@@ -1784,8 +2069,8 @@ class ManagerTUI(App):
                 "liveness",
                 "driver_proc",
                 "pid",
-                "hb_age_s",
-                "telemetry_age_s",
+                "hb_age",
+                "telemetry_age",
                 "driver_state",
                 "device_state",
                 "last_error",
@@ -1799,10 +2084,8 @@ class ManagerTUI(App):
                     status.liveness or "",
                     status.driver_proc_state or "",
                     str(status.driver_pid) if status.driver_pid is not None else "",
-                    f"{status.hb_age_s:.1f}" if status.hb_age_s is not None else "",
-                    f"{status.telemetry_age_s:.1f}"
-                    if status.telemetry_age_s is not None
-                    else "",
+                    format_age(status.hb_age_s),
+                    format_age(status.telemetry_age_s),
                     status.driver_state or "",
                     status.device_state or "",
                     (status.last_error or "")[:30],
@@ -1873,7 +2156,7 @@ class ManagerTUI(App):
                 "process_id",
                 "state",
                 "pid",
-                "hb_age_s",
+                "hb_age",
                 "restart_count",
                 "last_exit_code",
                 "last_error",
@@ -1889,11 +2172,13 @@ class ManagerTUI(App):
                 hb_age = ""
                 hb_age_val = proc.get("hb_age_s")
                 if isinstance(hb_age_val, (int, float)):
-                    hb_age = f"{max(0.0, float(hb_age_val)):.1f}"
+                    hb_age = format_age(max(0.0, float(hb_age_val)))
                 else:
                     last_hb_t_mono = proc.get("last_hb_t_mono")
                     if isinstance(last_hb_t_mono, (int, float)):
-                        hb_age = f"{max(0.0, time.monotonic() - float(last_hb_t_mono)):.1f}"
+                        hb_age = format_age(
+                            max(0.0, time.monotonic() - float(last_hb_t_mono))
+                        )
                 row_values = [
                     label,
                     str(proc.get("state", "")),
@@ -2006,7 +2291,7 @@ class ManagerTUI(App):
                     str(entry.get("value")),
                     str(entry.get("units")),
                     str(entry.get("quality")),
-                    f"{age:.1f}" if age is not None else "",
+                    format_age(age),
                 )
 
         heartbeat = self.query_one("#heartbeat_table", DataTable)
@@ -2027,7 +2312,7 @@ class ManagerTUI(App):
         driver = self.query_one("#driver_table", DataTable)
         driver.clear()
         details = self.query_one("#process_table", DataTable)
-        self.query_one("#process_title", Label).update("Connection")
+        self.query_one("#process_title", Label).update("CONNECTION")
         if device_id:
             status = self._device_status.get(device_id)
             if status:
@@ -2043,8 +2328,18 @@ class ManagerTUI(App):
                     ("registered", status.registered),
                     ("reachable", status.device_reachable),
                     ("liveness", status.liveness),
-                    ("heartbeat_age_s", status.hb_age_s),
-                    ("telemetry_age_s", status.telemetry_age_s),
+                    (
+                        "heartbeat_age",
+                        format_age(status.hb_age_s)
+                        if status.hb_age_s is not None
+                        else None,
+                    ),
+                    (
+                        "telemetry_age",
+                        format_age(status.telemetry_age_s)
+                        if status.telemetry_age_s is not None
+                        else None,
+                    ),
                     ("source", "federated" if status.is_remote else "local"),
                     ("owner_peer", status.owner_peer_id),
                 ):
@@ -2060,7 +2355,7 @@ class ManagerTUI(App):
         driver = self.query_one("#driver_table", DataTable)
         driver.clear()
         details = self.query_one("#process_table", DataTable)
-        self.query_one("#process_title", Label).update("Process")
+        self.query_one("#process_title", Label).update("PROCESS")
 
         if not process_id:
             return
@@ -2096,15 +2391,18 @@ class ManagerTUI(App):
         ):
             value = selected.get(key)
             if value not in (None, ""):
-                details.add_row(key, str(value)[:120])
+                display_key = "heartbeat_age" if key == "hb_age_s" else key
+                if key == "hb_age_s" and isinstance(value, (int, float)):
+                    value = format_age(float(value))
+                details.add_row(display_key, str(value)[:120])
 
         hb_age = ""
         last_hb_t_mono = selected.get("last_hb_t_mono")
         hb_age_val = selected.get("hb_age_s")
         if isinstance(hb_age_val, (int, float)):
-            hb_age = f"{max(0.0, float(hb_age_val)):.1f}"
+            hb_age = format_age(max(0.0, float(hb_age_val)))
         elif isinstance(last_hb_t_mono, (int, float)):
-            hb_age = f"{max(0.0, time.monotonic() - float(last_hb_t_mono)):.1f}"
+            hb_age = format_age(max(0.0, time.monotonic() - float(last_hb_t_mono)))
         last_hb_t_wall = selected.get("last_hb_t_wall")
         heartbeat_endpoint = selected.get("heartbeat_endpoint")
         if any(
@@ -2132,7 +2430,7 @@ class ManagerTUI(App):
                 str(entry.get("value")),
                 str(entry.get("units", "")),
                 str(entry.get("quality", "")),
-                f"{age:.1f}" if age is not None else "",
+                format_age(age),
             )
 
     @staticmethod
@@ -2336,7 +2634,9 @@ class ManagerTUI(App):
                 except Exception:
                     time_str = ""
             message = str(entry.get("message", ""))
-            message = message.replace("\r\n", " | ").replace("\n", " | ").replace("\r", " | ")
+            message = (
+                message.replace("\r\n", " | ").replace("\n", " | ").replace("\r", " | ")
+            )
             if len(message) > 220:
                 message = message[:217] + "..."
             severity = str(entry.get("severity", ""))
@@ -2557,7 +2857,12 @@ class ManagerTUI(App):
                         continue
                     device_id = str(device_raw)
                     stream = str(stream_raw)
-                    if device_id and device_id != "None" and stream and stream != "None":
+                    if (
+                        device_id
+                        and device_id != "None"
+                        and stream
+                        and stream != "None"
+                    ):
                         with self._chunk_lock:
                             self._chunk_cache[(device_id, stream)] = (topic, payload)
                     continue
@@ -2748,7 +3053,7 @@ class ManagerTUI(App):
         if errors_dirty and self._activity_open:
             self._render_errors_table()
         dropped = self.query_one("#dropped_status", Static)
-        dropped.update(f"Dropped: {self._dropped_pub_messages}")
+        dropped.update(self._dropped_status_text())
 
         self._render_inspector_if_needed()
         elapsed = time.perf_counter() - slice_started
@@ -2835,18 +3140,14 @@ class ManagerTUI(App):
                 ok_count += 1
                 # Per-item success notification (cheap; Notify is
                 # thread-safe in Textual >= 0.50).
-                self.call_from_thread(
-                    self.notify, f"{label} sent: {item_id}"
-                )
+                self.call_from_thread(self.notify, f"{label} sent: {item_id}")
             else:
                 fail_count += 1
                 if resp is None:
                     err: Any = "timeout"
                 else:
                     err = resp.get("error", "unknown error")
-                err_text = (
-                    json.dumps(err) if isinstance(err, dict) else str(err)
-                )
+                err_text = json.dumps(err) if isinstance(err, dict) else str(err)
                 # Per-item error notification.
                 self.call_from_thread(
                     self.notify,
@@ -3022,12 +3323,47 @@ class ManagerTUI(App):
 
     def _refresh_selected_resource_chrome(self) -> None:
         view = self._resource_views.get(self._selected_resource_key or "")
-        title = "No resource selected"
+        title: Text | str = "NO RESOURCE SELECTED"
         if view is not None:
-            remote = f" · remote:{view.owner_peer_id or 'peer'}" if view.is_remote else ""
+            statuses = (
+                (
+                    "LINK",
+                    self._connection_cell(view.connection, health=view.health),
+                    view.connection.upper() if view.connection else "",
+                ),
+                ("HEALTH", self._health_cell(view.health), view.health.upper()),
+                (
+                    "RUN",
+                    self._runtime_cell(view.state or "unknown"),
+                    (view.state or "unknown").upper(),
+                ),
+            )
+
+            def _build_title(*, compact: bool) -> Text:
+                result = Text.assemble(
+                    (f"{view.kind.upper()} // ", MUTED_TEXT),
+                    (view.resource_id, SECONDARY_TEXT),
+                )
+                for label, indicator, state in statuses:
+                    result.append("  |  ", style=DIM_TEXT)
+                    if not compact:
+                        result.append(f"{label} ", style=DIM_TEXT)
+                    result.append(indicator.plain, style=indicator.style)
+                    if state:
+                        result.append(f" {state}", style=indicator.style)
+                if view.is_remote:
+                    result.append("  |  REMOTE // ", style=DIM_TEXT)
+                    result.append(
+                        (view.owner_peer_id or "peer").upper(), style=SECONDARY_TEXT
+                    )
+                return result
+
+            full_title = _build_title(compact=False)
+            available_width = max(0, self.size.width - 2)
             title = (
-                f"{view.kind.title()} · {view.resource_id} · {view.health}"
-                f" · {view.state or 'unknown'}{remote}"
+                full_title
+                if full_title.cell_len <= available_width
+                else _build_title(compact=True)
             )
         try:
             self.query_one("#selected_resource_title", Label).update(title)
@@ -3376,7 +3712,7 @@ class ManagerTUI(App):
     def action_toggle_streaming(self) -> None:
         self.streaming_enabled = not self.streaming_enabled
         status = self.query_one("#streaming_status", Static)
-        status.update("Streaming: ON (t)" if self.streaming_enabled else "Streaming: OFF (t)")
+        status.update(self._streaming_status_text())
 
     async def action_quit(self) -> None:
         # Send the shutdown RPC from a worker thread so the (blocking) ZMQ
@@ -3461,10 +3797,13 @@ class ManagerTUI(App):
                 params_spec = None
 
             if not params_spec:
+
                 def _after_proc_call(resp: Json | None) -> None:
                     if resp and resp.get("ok"):
                         result = resp.get("result")
-                        text = self._format_result(result) if result is not None else "ok"
+                        text = (
+                            self._format_result(result) if result is not None else "ok"
+                        )
                         self._log_action_result(
                             f"PROC CALL {process_id}.{name} kwargs={{}} -> {text}"
                         )
@@ -3474,7 +3813,9 @@ class ManagerTUI(App):
                         )
                     else:
                         err = resp.get("error", "unknown error") if resp else "timeout"
-                        err_text = json.dumps(err) if isinstance(err, dict) else str(err)
+                        err_text = (
+                            json.dumps(err) if isinstance(err, dict) else str(err)
+                        )
                         self._log_action_result(
                             f"PROC CALL {process_id}.{name} kwargs={{}} -> error {err_text}"
                         )
@@ -3500,7 +3841,9 @@ class ManagerTUI(App):
                 def _after(resp: Json | None) -> None:
                     if resp and resp.get("ok"):
                         result = resp.get("result")
-                        text = self._format_result(result) if result is not None else "ok"
+                        text = (
+                            self._format_result(result) if result is not None else "ok"
+                        )
                         self._log_action_result(
                             f"PROC CALL {process_id}.{name} kwargs={json.dumps(params)} -> {text}"
                         )
@@ -3510,7 +3853,9 @@ class ManagerTUI(App):
                         )
                     else:
                         err = resp.get("error", "unknown error") if resp else "timeout"
-                        err_text = json.dumps(err) if isinstance(err, dict) else str(err)
+                        err_text = (
+                            json.dumps(err) if isinstance(err, dict) else str(err)
+                        )
                         self._log_action_result(
                             f"PROC CALL {process_id}.{name} kwargs={json.dumps(params)} -> error {err_text}"
                         )
@@ -3541,10 +3886,13 @@ class ManagerTUI(App):
                 params_spec = None
 
             if not params_spec:
+
                 def _after_dev_call(resp: Json | None) -> None:
                     if resp and resp.get("ok"):
                         result = resp.get("result")
-                        text = self._format_result(result) if result is not None else "ok"
+                        text = (
+                            self._format_result(result) if result is not None else "ok"
+                        )
                         self._log_action_result(
                             f"CALL {device_id}.{name} kwargs={{}} -> {text}"
                         )
@@ -3577,7 +3925,9 @@ class ManagerTUI(App):
                 def _after(resp: Json | None) -> None:
                     if resp and resp.get("ok"):
                         result = resp.get("result")
-                        text = self._format_result(result) if result is not None else "ok"
+                        text = (
+                            self._format_result(result) if result is not None else "ok"
+                        )
                         self._log_action_result(
                             f"CALL {device_id}.{name} kwargs={json.dumps(params)} -> {text}"
                         )
@@ -3723,6 +4073,7 @@ class ManagerTUI(App):
         ):
             self.notify(f"Connect not available: {device_id}")
             return
+
         def _after(resp: Json | None) -> None:
             self._notify_rpc_result("Device connect", device_id, resp)
             if resp and resp.get("ok"):
@@ -3798,9 +4149,13 @@ class ManagerTUI(App):
         # call_from_thread (which @work + Notify do automatically).
         if self._action_target() == "process":
             items = [
-                (str(proc.get("process_id", "")),
-                 {"type": "manager.processes.start",
-                  "process_id": str(proc.get("process_id", ""))})
+                (
+                    str(proc.get("process_id", "")),
+                    {
+                        "type": "manager.processes.start",
+                        "process_id": str(proc.get("process_id", "")),
+                    },
+                )
                 for proc in self._processes
                 if str(proc.get("process_id", ""))
             ]
@@ -3812,8 +4167,7 @@ class ManagerTUI(App):
             return
 
         items = [
-            (device_id,
-             {"type": "device.driver.start", "device_id": device_id})
+            (device_id, {"type": "device.driver.start", "device_id": device_id})
             for device_id in list(self._device_status)
         ]
         self._run_bulk_rpc_worker(
@@ -3859,15 +4213,16 @@ class ManagerTUI(App):
                     return
                 self._submit_resource_action(
                     resource_key=f"process:{process_id}",
-                    payload={"type": "manager.processes.stop", "process_id": process_id},
+                    payload={
+                        "type": "manager.processes.stop",
+                        "process_id": process_id,
+                    },
                     on_result=lambda resp: self._notify_rpc_result(
                         "Process stop", process_id, resp
                     ),
                 )
 
-            self.push_screen(
-                ConfirmScreen(f"Stop process {process_id}?"), _on_dismiss
-            )
+            self.push_screen(ConfirmScreen(f"Stop process {process_id}?"), _on_dismiss)
             return
 
         device_id = self._selected_device()
@@ -3889,8 +4244,9 @@ class ManagerTUI(App):
                 ),
             )
 
-        self.push_screen(ConfirmScreen(f"Stop driver for {device_id}?"), _on_driver_stop_dismiss)
-
+        self.push_screen(
+            ConfirmScreen(f"Stop driver for {device_id}?"), _on_driver_stop_dismiss
+        )
 
     def action_driver_restart(self) -> None:
         if self._action_target() == "process":
@@ -3913,7 +4269,8 @@ class ManagerTUI(App):
                 )
 
             self.push_screen(
-                ConfirmScreen(f"Restart process {process_id}?"), _on_process_restart_dismiss
+                ConfirmScreen(f"Restart process {process_id}?"),
+                _on_process_restart_dismiss,
             )
             return
 
@@ -3941,7 +4298,10 @@ class ManagerTUI(App):
                 ),
             )
 
-        self.push_screen(ConfirmScreen(f"Restart driver for {device_id}?"), _on_driver_restart_dismiss)
+        self.push_screen(
+            ConfirmScreen(f"Restart driver for {device_id}?"),
+            _on_driver_restart_dismiss,
+        )
 
     async def on_key(self, event: events.Key) -> None:  # type: ignore[override]
         # Work around cases where focused widgets swallow app bindings.
@@ -4039,13 +4399,25 @@ class ManagerTUI(App):
             index = _INSPECTOR_TAB_IDS.index(tabs.active)
         except ValueError:
             index = 0
-        self._set_inspector_tab(_INSPECTOR_TAB_IDS[(index + step) % len(_INSPECTOR_TAB_IDS)])
+        self._set_inspector_tab(
+            _INSPECTOR_TAB_IDS[(index + step) % len(_INSPECTOR_TAB_IDS)]
+        )
 
     def action_inspector_previous(self) -> None:
-        self._cycle_inspector_tab(-1)
+        if self._activity_open and self.query_one(
+            "#activity_drawer", Vertical
+        ).has_focus_within:
+            self._cycle_activity_tab(-1)
+        else:
+            self._cycle_inspector_tab(-1)
 
     def action_inspector_next(self) -> None:
-        self._cycle_inspector_tab(1)
+        if self._activity_open and self.query_one(
+            "#activity_drawer", Vertical
+        ).has_focus_within:
+            self._cycle_activity_tab(1)
+        else:
+            self._cycle_inspector_tab(1)
 
     def action_inspector_overview(self) -> None:
         self._set_inspector_tab("overview")
@@ -4059,19 +4431,46 @@ class ManagerTUI(App):
     def action_inspector_config(self) -> None:
         self._set_inspector_tab("config")
 
+    def _focus_active_activity(self) -> None:
+        tabs = self.query_one("#activity_tabs", TabbedContent)
+        target = "#event_log" if tabs.active == "events" else "#errors_table"
+        self.query_one(target, Widget).focus()
+
+    def _cycle_activity_tab(self, step: int) -> None:
+        tabs = self.query_one("#activity_tabs", TabbedContent)
+        try:
+            index = _ACTIVITY_TAB_IDS.index(tabs.active)
+        except ValueError:
+            index = 0
+        tabs.active = _ACTIVITY_TAB_IDS[(index + step) % len(_ACTIVITY_TAB_IDS)]
+        self._focus_active_activity()
+
     def _update_activity_summary(self) -> None:
-        verb = "close" if self._activity_open else "open"
+        verb = "CLOSE" if self._activity_open else "OPEN"
         arrow = "▲" if self._activity_open else "▼"
+        summary = self.query_one("#activity_summary", Static)
+        summary.set_class(bool(self._activity_unread_warning), "has-warning")
+        summary.set_class(bool(self._activity_unread_error), "has-error")
         if self._activity_unread_error or self._activity_unread_warning:
-            text = (
-                f"{arrow} Activity — press a to {verb} · "
-                f"{self._activity_unread_error} errors · "
-                f"{self._activity_unread_warning} warnings"
+            text = Text.assemble(
+                (f"{arrow} ACTIVITY // A {verb}  |  ", MUTED_TEXT),
+                (
+                    f"ERRORS // {self._activity_unread_error}",
+                    FAULT_RED if self._activity_unread_error else SECONDARY_TEXT,
+                ),
+                ("  |  ", DIM_TEXT),
+                (
+                    f"WARNINGS // {self._activity_unread_warning}",
+                    WARNING_ORANGE if self._activity_unread_warning else SECONDARY_TEXT,
+                ),
             )
         else:
-            text = f"{arrow} Activity — press a to {verb} · no unread alerts"
+            text = Text.assemble(
+                (f"{arrow} ACTIVITY // A {verb}  |  ", MUTED_TEXT),
+                ("NO UNREAD ALERTS", SECONDARY_TEXT),
+            )
         try:
-            self.query_one("#activity_summary", Static).update(text)
+            summary.update(text)
         except Exception:
             pass
 
@@ -4080,6 +4479,7 @@ class ManagerTUI(App):
         drawer = self.query_one("#activity_drawer", Vertical)
         drawer.set_class(self._activity_open, "open")
         if self._activity_open:
+            self._activity_return_focus = self.focused
             self._activity_unread_error = 0
             self._activity_unread_warning = 0
             self._render_errors_table()
@@ -4088,6 +4488,14 @@ class ManagerTUI(App):
             self._activity_hydration_lines = list(self._event_lines)
             self._activity_hydration_index = 0
             self.call_later(self._hydrate_activity_log)
+            self.call_after_refresh(self._focus_active_activity)
+        else:
+            return_focus = self._activity_return_focus
+            self._activity_return_focus = None
+            if return_focus is not None and return_focus.is_mounted:
+                return_focus.focus()
+            else:
+                self.action_focus_navigator()
         self._update_activity_summary()
 
     @on(events.Click, "#activity_summary")
@@ -4098,8 +4506,12 @@ class ManagerTUI(App):
         if not self._activity_open:
             return
         log = self.query_one("#event_log", RichLog)
-        end = min(self._activity_hydration_index + 100, len(self._activity_hydration_lines))
-        for line in self._activity_hydration_lines[self._activity_hydration_index:end]:
+        end = min(
+            self._activity_hydration_index + 100, len(self._activity_hydration_lines)
+        )
+        for line in self._activity_hydration_lines[
+            self._activity_hydration_index : end
+        ]:
             log.write(line)
         self._activity_hydration_index = end
         if end < len(self._activity_hydration_lines):
@@ -4130,13 +4542,18 @@ class ManagerTUI(App):
         # per-item loop runs on a worker thread so the UI stays
         # responsive while N processes/drivers shut down sequentially.
         if self._action_target() == "process":
+
             def _on_processes_stop_all_dismiss(confirmed: bool | None) -> None:
                 if not confirmed:
                     return
                 items = [
-                    (str(proc.get("process_id", "")),
-                     {"type": "manager.processes.stop",
-                      "process_id": str(proc.get("process_id", ""))})
+                    (
+                        str(proc.get("process_id", "")),
+                        {
+                            "type": "manager.processes.stop",
+                            "process_id": str(proc.get("process_id", "")),
+                        },
+                    )
                     for proc in self._processes
                     if str(proc.get("process_id", ""))
                 ]
@@ -4147,15 +4564,16 @@ class ManagerTUI(App):
                     error_log_prefix="PROC STOP",
                 )
 
-            self.push_screen(ConfirmScreen("Stop all processes?"), _on_processes_stop_all_dismiss)
+            self.push_screen(
+                ConfirmScreen("Stop all processes?"), _on_processes_stop_all_dismiss
+            )
             return
 
         def _on_drivers_stop_all_dismiss(confirmed: bool | None) -> None:
             if not confirmed:
                 return
             items = [
-                (device_id,
-                 {"type": "device.driver.stop", "device_id": device_id})
+                (device_id, {"type": "device.driver.stop", "device_id": device_id})
                 for device_id in list(self._device_status)
             ]
             self._run_bulk_rpc_worker(
@@ -4165,7 +4583,9 @@ class ManagerTUI(App):
                 error_log_prefix="DRIVER STOP",
             )
 
-        self.push_screen(ConfirmScreen("Stop all drivers?"), _on_drivers_stop_all_dismiss)
+        self.push_screen(
+            ConfirmScreen("Stop all drivers?"), _on_drivers_stop_all_dismiss
+        )
 
 
 def main() -> None:

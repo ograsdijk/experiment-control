@@ -18,6 +18,12 @@ from types import SimpleNamespace
 from experiment_control._tui.app import ManagerTUI, _RESOURCE_COLUMNS
 from experiment_control._tui.models import DeviceStatus, ResourceView
 from experiment_control._tui.screens import ResultScreen
+from experiment_control._tui.status_presentation import (
+    format_age,
+    render_health_state,
+    render_link_state,
+    render_run_state,
+)
 
 
 class _FakeTable:
@@ -432,6 +438,194 @@ class UnifiedResourceModelTests(unittest.TestCase):
         self.assertIn("vacuum-cryo", view.searchable_text)
         self.assertIn("heartbeat overdue", view.searchable_text)
 
+    def test_compact_status_symbols_and_age_formatting(self) -> None:
+        self.assertEqual(render_link_state("ONLINE").plain, "●")
+        self.assertEqual(render_link_state("DISCONNECTED").plain, "○")
+        self.assertEqual(render_link_state("STALE").plain, "◐")
+        self.assertEqual(render_link_state("OFFLINE").plain, "×")
+        self.assertNotEqual(
+            render_link_state("OFFLINE").style,
+            render_link_state("OFFLINE", failure_related=True).style,
+        )
+        self.assertEqual(render_link_state(None).plain, "—")
+        self.assertEqual(render_link_state("unexpected").plain, "?")
+        self.assertEqual(render_health_state("healthy").plain, "◆")
+        self.assertEqual(render_health_state("degraded").plain, "▲")
+        self.assertEqual(render_health_state("stale").plain, "△")
+        self.assertEqual(render_health_state("failed").plain, "×")
+        self.assertEqual(render_health_state("neutral").plain, "·")
+        self.assertEqual(render_health_state("unknown").plain, "?")
+        self.assertEqual(render_health_state("transition").plain, "◇")
+        self.assertEqual(render_run_state("RUNNING").plain, "▶")
+        self.assertEqual(render_run_state("STARTING").plain, "▷")
+        self.assertEqual(render_run_state("STOPPING").plain, "◼")
+        self.assertEqual(render_run_state("STOPPED").plain, "■")
+        self.assertEqual(render_run_state("EXITED").plain, "□")
+        self.assertEqual(render_run_state("FAILED").plain, "×")
+        self.assertEqual(render_run_state("CRASHLOOP").plain, "↻")
+        self.assertEqual(render_run_state("UNKNOWN").plain, "?")
+        self.assertEqual(render_run_state(None).plain, "?")
+        indicators = (
+            *(render_link_state(state) for state in ("ONLINE", "DISCONNECTED", "STALE", "OFFLINE", None, "unexpected")),
+            *(
+                render_health_state(state)
+                for state in (
+                    "healthy",
+                    "degraded",
+                    "stale",
+                    "failed",
+                    "neutral",
+                    "unknown",
+                    "transition",
+                )
+            ),
+            *(
+                render_run_state(state)
+                for state in (
+                    "RUNNING",
+                    "STARTING",
+                    "STOPPING",
+                    "STOPPED",
+                    "EXITED",
+                    "FAILED",
+                    "CRASHLOOP",
+                    "UNKNOWN",
+                )
+            ),
+        )
+        self.assertTrue(all(indicator.cell_len == 1 for indicator in indicators))
+        self.assertEqual(format_age(0.1), "0.1s")
+        self.assertEqual(format_age(1.4), "1.4s")
+        self.assertEqual(format_age(14.0), "14s")
+        self.assertEqual(format_age(126.0), "2.1m")
+
+    def test_device_health_precedence_and_distinct_link_failure_modes(self) -> None:
+        status = DeviceStatus(
+            device_id="d1", registered=True, liveness="ONLINE", hb_age_s=0.1,
+            telemetry_age_s=0.1, driver_state="OK", device_state="FAULT",
+            device_reachable=True, last_error="device fault", driver_proc_state="RUNNING",
+            driver_pid=1, driver_restart_count=0, driver_last_exit_code=None,
+            driver_last_error=None,
+        )
+        self.assertEqual(ManagerTUI._device_health(status), "failed")
+        status.device_state = "DEGRADED"
+        status.liveness = "DISCONNECTED"
+        self.assertEqual(ManagerTUI._device_health(status), "degraded")
+        status.device_state = "DISCONNECTED"
+        self.assertEqual(ManagerTUI._device_health(status), "neutral")
+        status.liveness = "OFFLINE"
+        status.driver_proc_state = "CRASHLOOP"
+        self.assertEqual(ManagerTUI._device_health(status), "failed")
+        status.driver_proc_state = "RUNNING"
+        status.liveness = "ONLINE"
+        status.device_state = "UNKNOWN"
+        status.driver_state = "OK"
+        self.assertEqual(ManagerTUI._device_health(status), "unknown")
+
+    def test_collected_views_keep_raw_states_searchable_and_federated_linked(self) -> None:
+        app = object.__new__(ManagerTUI)
+        app._device_status = {
+            "pxi": DeviceStatus(
+                device_id="pxi", registered=True, liveness="DISCONNECTED", hb_age_s=0.2,
+                telemetry_age_s=None, driver_state="DEGRADED", device_state="DEGRADED",
+                device_reachable=False, last_error=None, driver_proc_state="RUNNING",
+                driver_pid=1, driver_restart_count=0, driver_last_exit_code=None,
+                driver_last_error=None,
+            )
+        }
+        app._processes = [
+            {"process_id": "local", "state": "RUNNING"},
+            {
+                "process_id": "remote", "state": "FAILED", "is_remote": True,
+                "liveness": "OFFLINE", "source_kind": "federated",
+            },
+        ]
+        views = {view.key: view for view in app._collect_resource_views()}
+        device = views["device:pxi"]
+        self.assertEqual((device.connection, device.health, device.state), ("DISCONNECTED", "degraded", "RUNNING"))
+        self.assertIn("degraded", device.searchable_text)
+        self.assertIn("disconnected", device.searchable_text)
+        self.assertEqual(views["process:local"].connection, None)
+        self.assertEqual(views["process:remote"].connection, "OFFLINE")
+        self.assertEqual(views["process:remote"].health, "failed")
+
+        app._device_status["pxi"].liveness = None
+        self.assertEqual(app._collect_resource_views()[0].connection, "UNKNOWN")
+
+    def test_health_summary_counts_degraded_as_an_issue(self) -> None:
+        app = object.__new__(ManagerTUI)
+        app.backend_connected = True
+        app._backend_status_text = "Backend: connected"
+        app._unhealthy_only = False
+        summary = app._health_summary_text(
+            [ResourceView("device", "pxi", "degraded", "RUNNING", 0.2, None)]
+        )
+        self.assertIn("ISSUES // 1", summary.plain)
+
+    def test_remote_link_loss_is_an_operator_issue(self) -> None:
+        local_disconnected = ResourceView(
+            "device", "local", "neutral", "RUNNING", None, None, "DISCONNECTED"
+        )
+        remote_offline = ResourceView(
+            "process",
+            "remote_offline",
+            "healthy",
+            "RUNNING",
+            None,
+            None,
+            "OFFLINE",
+            is_remote=True,
+        )
+        remote_stale = ResourceView(
+            "process",
+            "remote_stale",
+            "healthy",
+            "RUNNING",
+            None,
+            None,
+            "STALE",
+            is_remote=True,
+        )
+        remote_online = ResourceView(
+            "process",
+            "remote_online",
+            "healthy",
+            "RUNNING",
+            None,
+            None,
+            "ONLINE",
+            is_remote=True,
+        )
+        degraded = ResourceView("device", "degraded", "degraded", "RUNNING", None, None)
+        self.assertFalse(ManagerTUI._resource_has_issue(local_disconnected))
+        self.assertTrue(ManagerTUI._resource_has_issue(remote_offline))
+        self.assertTrue(ManagerTUI._resource_has_issue(remote_stale))
+        self.assertFalse(ManagerTUI._resource_has_issue(remote_online))
+        self.assertTrue(ManagerTUI._resource_has_issue(degraded))
+
+        app = object.__new__(ManagerTUI)
+        app._unhealthy_only = True
+        app._resource_filter = ""
+        app._resource_sort_column = "resource"
+        app._resource_sort_reverse = False
+        app._collect_resource_views = lambda: [  # type: ignore[method-assign]
+            local_disconnected,
+            remote_offline,
+            remote_stale,
+            remote_online,
+            degraded,
+        ]
+        self.assertEqual(
+            [view.resource_id for view in app._visible_resource_views()],
+            ["degraded", "remote_offline", "remote_stale"],
+        )
+        app.backend_connected = True
+        app._backend_status_text = "Backend: connected"
+        summary = app._health_summary_text(
+            [local_disconnected, remote_offline, remote_stale, remote_online, degraded]
+        )
+        self.assertIn("ISSUES // 3", summary.plain)
+
     def test_health_mapping_keeps_intentional_stops_neutral(self) -> None:
         status = DeviceStatus(
             device_id="d1",
@@ -561,7 +755,7 @@ class PubCoalescingTests(unittest.TestCase):
 
 class UnifiedResourceHeadlessTests(unittest.IsolatedAsyncioTestCase):
     async def test_filter_tabs_activity_and_stacked_navigation(self) -> None:
-        from textual.widgets import Button, DataTable, Input, TabbedContent
+        from textual.widgets import Button, DataTable, Input, Label, TabbedContent
 
         app = ManagerTUI(snapshot_period_s=3600.0, rpc_timeout_ms=20)
         app._rpc_submit = lambda *a, **k: None  # type: ignore[method-assign]
@@ -578,8 +772,8 @@ class UnifiedResourceHeadlessTests(unittest.IsolatedAsyncioTestCase):
                     liveness="ONLINE",
                     hb_age_s=0.2,
                     telemetry_age_s=0.1,
-                    driver_state="RUNNING",
-                    device_state="CONNECTED",
+                    driver_state="OK",
+                    device_state="OK",
                     device_reachable=True,
                     last_error=None,
                     driver_proc_state="RUNNING",
@@ -599,20 +793,79 @@ class UnifiedResourceHeadlessTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(
                 str(table.get_cell("device:healthy_dev", "connection")),
-                "● connected",
+                "●",
             )
+            device_headers = [
+                column.label.plain
+                for column in app.query_one("#devices_table", DataTable).columns.values()
+            ]
+            process_headers = [
+                column.label.plain
+                for column in app.query_one("#processes_table", DataTable).columns.values()
+            ]
+            telemetry_headers = [
+                column.label.plain
+                for column in app.query_one("#telemetry_table", DataTable).columns.values()
+            ]
+            self.assertIn("HB_AGE", device_headers)
+            self.assertIn("TELEMETRY_AGE", device_headers)
+            self.assertIn("HB_AGE", process_headers)
+            self.assertIn("AGE", telemetry_headers)
             app._select_resource_key("device:healthy_dev")
+            selected_title = app.query_one("#selected_resource_title", Label).render()
+            self.assertIn("LINK ● ONLINE", selected_title.plain)
+            self.assertIn("HEALTH ◆ HEALTHY", selected_title.plain)
+            self.assertIn("RUN ▶ RUNNING", selected_title.plain)
+
+            original_view = app._resource_views["device:healthy_dev"]
+            app._resource_views["device:healthy_dev"] = ResourceView(
+                kind=original_view.kind,
+                resource_id=original_view.resource_id,
+                health=original_view.health,
+                state=original_view.state,
+                age_s=original_view.age_s,
+                error=original_view.error,
+                connection=original_view.connection,
+                is_remote=True,
+                owner_peer_id="remote-laboratory",
+            )
+            app._refresh_selected_resource_chrome()
+            narrow_title = app.query_one("#selected_resource_title", Label).render()
+            self.assertIn("● ONLINE", narrow_title.plain)
+            self.assertIn("◆ HEALTHY", narrow_title.plain)
+            self.assertIn("▶ RUNNING", narrow_title.plain)
+            self.assertNotIn("LINK ● ONLINE", narrow_title.plain)
+            app._resource_views["device:healthy_dev"] = original_view
+
+            app._select_resource_key("process:bad_proc")
+            process_title = app.query_one("#selected_resource_title", Label).render()
+            self.assertIn("LINK —", process_title.plain)
+            self.assertNotIn("N/A", process_title.plain)
+            app._select_resource_key("device:healthy_dev")
+            app._refresh_selected_resource_chrome()
             overview_details = app.query_one("#process_table", DataTable)
             overview_rows = [
                 tuple(map(str, overview_details.get_row_at(row)))
                 for row in range(overview_details.row_count)
             ]
             self.assertIn(("connection", "connected"), overview_rows)
+            self.assertIn(("heartbeat_age", "0.2s"), overview_rows)
+            self.assertIn(("telemetry_age", "0.1s"), overview_rows)
+            status = app._device_status["healthy_dev"]
+            status.hb_age_s = None
+            status.telemetry_age_s = None
+            app._render_inspector()
+            overview_rows = [
+                tuple(map(str, overview_details.get_row_at(row)))
+                for row in range(overview_details.row_count)
+            ]
+            self.assertNotIn("heartbeat_age", {row[0] for row in overview_rows})
+            self.assertNotIn("telemetry_age", {row[0] for row in overview_rows})
             self.assertFalse(app.query_one("#action_disconnect").disabled)
             self.assertTrue(app.query_one("#action_connect").disabled)
-            self.assertEqual(app.query_one("#action_start", Button).label.plain, "Start (s)")
+            self.assertEqual(app.query_one("#action_start", Button).label.plain, "START (s)")
             self.assertEqual(
-                app.query_one("#action_disconnect", Button).label.plain, "Disconnect (d)"
+                app.query_one("#action_disconnect", Button).label.plain, "DISCONNECT (d)"
             )
             self.assertEqual(app.query_one("#action_strip").region.height, 1)
             self.assertTrue(
@@ -634,7 +887,7 @@ class UnifiedResourceHeadlessTests(unittest.IsolatedAsyncioTestCase):
                     hidden_footer_keys
                 )
             )
-            self.assertEqual(str(app.query_one("#streaming_status").render()), "Streaming: ON (t)")
+            self.assertEqual(str(app.query_one("#streaming_status").render()), "STREAM // ACTIVE (t)")
             inspector_bindings = {
                 binding.key: binding
                 for binding in ManagerTUI.BINDINGS
@@ -711,13 +964,13 @@ class UnifiedResourceHeadlessTests(unittest.IsolatedAsyncioTestCase):
                 ["process:bad_proc", "device:healthy_dev"],
             )
             self.assertEqual(app._selected_resource_key, "device:healthy_dev")
-            self.assertEqual(resource_column.label.plain, "resource ▲")
+            self.assertEqual(resource_column.label.plain, "RESOURCE ▲")
             app.action_resource_sort_reverse()
             self.assertEqual(
                 [str(row.key.value) for row in table.ordered_rows],
                 ["device:healthy_dev", "process:bad_proc"],
             )
-            self.assertEqual(resource_column.label.plain, "resource ▼")
+            self.assertEqual(resource_column.label.plain, "RESOURCE ▼")
             for column_name, label in _RESOURCE_COLUMNS:
                 app._set_resource_sort(column_name)
                 column = table.columns[app._resource_column_keys[column_name]]
@@ -739,9 +992,21 @@ class UnifiedResourceHeadlessTests(unittest.IsolatedAsyncioTestCase):
                 fingerprint="bad-proc-failed",
             )
             self.assertEqual(app._activity_unread_error, 1)
+            focus_before_activity = app.focused
             app.action_toggle_activity()
+            await pilot.pause()
             self.assertTrue(app._activity_open)
             self.assertEqual(app._activity_unread_error, 0)
+            self.assertIs(app.focused, app.query_one("#errors_table", DataTable))
+            await pilot.press("right_square_bracket")
+            self.assertEqual(app.query_one("#activity_tabs", TabbedContent).active, "events")
+            self.assertIs(app.focused, app.query_one("#event_log"))
+            await pilot.press("left_square_bracket")
+            self.assertEqual(app.query_one("#activity_tabs", TabbedContent).active, "errors")
+            self.assertIs(app.focused, app.query_one("#errors_table", DataTable))
+            await pilot.press("a")
+            self.assertFalse(app._activity_open)
+            self.assertIs(app.focused, focus_before_activity)
 
             app._resource_filter = ""
             search.value = ""
