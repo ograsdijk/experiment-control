@@ -2623,7 +2623,7 @@ class ManagerTUI(App):
         self._errors_rendered_rev = self._errors_rev
         table = self.query_one("#errors_table", DataTable)
         table.clear()
-        for entry in reversed(self._errors):
+        for row_index, entry in enumerate(reversed(self._errors)):
             t_wall = entry.get("t_wall")
             time_str = ""
             if isinstance(t_wall, (int, float)):
@@ -2655,7 +2655,11 @@ class ManagerTUI(App):
                 str(entry.get("source", "")),
                 str(entry.get("id", "")),
                 message,
-                key=str(entry.get("fingerprint", "")) or None,
+                # A fingerprint identifies the error *content*, not an individual
+                # displayed occurrence.  Multiple sources may legitimately emit
+                # the same fingerprint, whereas Textual requires table row keys
+                # to be unique.
+                key=f"error-{row_index}",
             )
 
     def _toast_once(

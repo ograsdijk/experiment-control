@@ -38,7 +38,7 @@ class _FakeTable:
         self.rows = []
 
     def add_row(self, *args, **kwargs) -> None:
-        self.rows.append(args)
+        self.rows.append((args, kwargs))
 
 
 def _errors_app() -> ManagerTUI:
@@ -53,6 +53,26 @@ def _errors_app() -> ManagerTUI:
 
 
 class ErrorsTableSkipGuardTests(unittest.TestCase):
+    def test_render_allows_duplicate_error_fingerprints(self) -> None:
+        app = _errors_app()
+        table = _FakeTable()
+        app.query_one = lambda *a, **k: table  # type: ignore[method-assign]
+
+        for device_id in ("d1", "d2"):
+            app._record_error(
+                source="device",
+                id_=device_id,
+                topic="manager.heartbeat",
+                message="FAULT/DISCONNECTED",
+                severity="error",
+                fingerprint="same-fingerprint",
+            )
+
+        self.assertEqual(len(table.rows), 2)
+        self.assertEqual(
+            [row[1]["key"] for row in table.rows], ["error-0", "error-1"]
+        )
+
     def test_render_skips_when_errors_unchanged(self) -> None:
         app = _errors_app()
         table = _FakeTable()
