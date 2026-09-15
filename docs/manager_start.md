@@ -180,8 +180,8 @@ Notes:
 - When the TUI exits, the runner sends `manager.control.shutdown` and then terminates the manager subprocess.
 - The TUI uses one resource navigator for devices and managed processes above the inspector.
   It spans the terminal width, grows to a capped height, and scrolls internally when the list
-  exceeds that height. Press `/` to search, `u` to show only failures, and `1`/`2`/`3` to
-  switch the selected resource between Overview, Telemetry, and Commands.
+  exceeds that height. Press `/` to search, `u` to show only failures, and `1`/`2`/`3`/`4`
+  to switch the selected resource between Overview, Telemetry, Commands, and Config.
 - Click a resource-table header to sort the mixed device/process list by that column; click it
   again to reverse the order. The active header shows `▲` or `▼`. Press `o` to move to the
   next sort column and uppercase `O` to reverse it without a mouse. The sort choice lasts for
@@ -189,8 +189,10 @@ Notes:
 - Keyboard navigation follows a drill-in model: select a resource with the arrow keys, press
   Enter to focus its active inspector view, and press Escape to return to the resource table.
   Press `n` or `i` to focus the navigator or inspector directly. Inspector tabs are labeled
-  Overview (1), Telemetry (2), and Commands (3); use `1`/`2`/`3` to select directly or `[`/`]`
-  to move between them.
+  Overview (1), Telemetry (2), Commands (3), and Config (4); use `1`/`2`/`3`/`4` to select
+  directly or `[`/`]` to move between them. Overview contains runtime and connection state;
+  Telemetry contains only published device or process signals. Config shows structured driver
+  or process launch settings with constructor secrets and environment values redacted.
 - Lifecycle keys remain context-sensitive (`s` start, `x` stop, `r` restart, `c` connect,
   `d` disconnect, `v` recover). The selected target and valid actions are also shown above
   the inspector. The navigator has a separate connection column (`● connected`,

@@ -10,6 +10,7 @@ These cover the correctness guards behind three changes in
 """
 from __future__ import annotations
 
+import time
 import unittest
 from collections import deque
 from types import SimpleNamespace
@@ -292,6 +293,52 @@ class HeadlessRenderContentTests(unittest.IsolatedAsyncioTestCase):
             self.assertLessEqual(dialog.region.height, 32)
             self.assertGreater(body.max_scroll_y, 0)
 
+    async def test_process_telemetry_contains_signals_not_status_config(self) -> None:
+        from textual.widgets import DataTable
+
+        app = ManagerTUI(snapshot_period_s=3600.0, rpc_timeout_ms=20)
+        app._rpc_submit = lambda *a, **k: None  # type: ignore[method-assign]
+        app._background_rpc_submit = lambda *a, **k: None  # type: ignore[method-assign]
+        async with app.run_test(headless=True, size=(120, 40)) as pilot:
+            app._stop_event.set()
+            process = {
+                "process_id": "writer",
+                "state": "RUNNING",
+                "pid": 42,
+                "registered": True,
+                "argv": ["python", "writer.py"],
+                "heartbeat_timeout_s": 3.0,
+            }
+            app._processes = [process]
+            app._process_status_map = {"writer": process}
+            app._enqueue_pub_message(
+                "manager.process_telemetry_update",
+                {
+                    "process_id": "writer",
+                    "signals": {
+                        "writing_active": {
+                            "value": True,
+                            "units": "",
+                            "quality": "ok",
+                            "ts": {"t_mono": time.monotonic()},
+                        }
+                    },
+                },
+            )
+            app._drain_pub_queue()
+            self.assertIn("writer", app._process_telemetry_cache)
+            app._render_resources_table()
+            app._select_resource_key("process:writer")
+            await pilot.pause()
+
+            telemetry = app.query_one("#telemetry_table", DataTable)
+            self.assertEqual(telemetry.row_count, 1)
+            self.assertEqual(str(telemetry.get_row_at(0)[0]), "writing_active")
+            self.assertNotIn("argv", [str(telemetry.get_row_at(0)[0])])
+            details = app.query_one("#process_table", DataTable)
+            detail_fields = [str(details.get_row_at(row)[0]) for row in range(details.row_count)]
+            self.assertIn("registered", detail_fields)
+
 
 class _FakeProcTable:
     """Minimal DataTable stand-in for _render_processes_table."""
@@ -555,6 +602,12 @@ class UnifiedResourceHeadlessTests(unittest.IsolatedAsyncioTestCase):
                 "● connected",
             )
             app._select_resource_key("device:healthy_dev")
+            overview_details = app.query_one("#process_table", DataTable)
+            overview_rows = [
+                tuple(map(str, overview_details.get_row_at(row)))
+                for row in range(overview_details.row_count)
+            ]
+            self.assertIn(("connection", "connected"), overview_rows)
             self.assertFalse(app.query_one("#action_disconnect").disabled)
             self.assertTrue(app.query_one("#action_connect").disabled)
             self.assertEqual(app.query_one("#action_start", Button).label.plain, "Start (s)")
@@ -577,7 +630,9 @@ class UnifiedResourceHeadlessTests(unittest.IsolatedAsyncioTestCase):
             }
             self.assertTrue({"s", "x", "r", "c", "d", "v"}.issubset(hidden_footer_keys))
             self.assertTrue(
-                {"1", "2", "3", "a", "t", "enter", "e", "R"}.issubset(hidden_footer_keys)
+                {"1", "2", "3", "4", "a", "t", "enter", "e", "R"}.issubset(
+                    hidden_footer_keys
+                )
             )
             self.assertEqual(str(app.query_one("#streaming_status").render()), "Streaming: ON (t)")
             inspector_bindings = {
@@ -608,10 +663,23 @@ class UnifiedResourceHeadlessTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             self.assertEqual(app.query_one("#inspector_tabs", TabbedContent).active, "commands")
             self.assertIs(app.focused, app.query_one("#members_table", DataTable))
+            app._config_cache["device:healthy_dev"] = {
+                "driver": {"class_name": "DemoDriver"},
+                "init_kwargs": {"port": "COM4", "password": "*** redacted ***"},
+            }
+            await pilot.press("4")
+            await pilot.pause()
+            self.assertEqual(app.query_one("#inspector_tabs", TabbedContent).active, "config")
+            config = app.query_one("#config_table", DataTable)
+            self.assertIs(app.focused, config)
+            self.assertEqual(config.row_count, 3)
+            config_rows = [tuple(map(str, config.get_row_at(row))) for row in range(3)]
+            self.assertIn(("init_kwargs.port", "COM4"), config_rows)
+            self.assertIn(("init_kwargs.password", "*** redacted ***"), config_rows)
             await pilot.press("escape")
             self.assertIs(app.focused, table)
             await pilot.press("enter")
-            self.assertIs(app.focused, app.query_one("#members_table", DataTable))
+            self.assertIs(app.focused, app.query_one("#config_table", DataTable))
             await pilot.press("escape")
             self.assertIs(app.focused, table)
             await pilot.press("u")
@@ -629,7 +697,7 @@ class UnifiedResourceHeadlessTests(unittest.IsolatedAsyncioTestCase):
             search.focus()
             await pilot.pause()
             self.assertFalse(app.check_action("inspector_next", ()))
-            self.assertEqual(app.query_one("#inspector_tabs", TabbedContent).active, "commands")
+            self.assertEqual(app.query_one("#inspector_tabs", TabbedContent).active, "config")
 
             resource_key = app._resource_column_keys["resource"]
             resource_column = table.columns[resource_key]

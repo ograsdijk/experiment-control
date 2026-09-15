@@ -412,6 +412,7 @@ class ManagerTuiRpcTests(unittest.TestCase):
                 app._default_topic_visibility("manager.process_telemetry_update")
             )
             self.assertFalse(app._default_topic_visibility("manager.process.heartbeat"))
+            self.assertFalse(app._default_topic_visibility("manager.device_config"))
             # Edge-triggered / low-volume topics stay visible by default.
             self.assertTrue(app._default_topic_visibility("manager.log"))
             self.assertTrue(app._default_topic_visibility("manager.liveness"))

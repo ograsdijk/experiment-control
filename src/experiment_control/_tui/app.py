@@ -44,6 +44,7 @@ from .screens import (
     TopicFilterScreen,
 )
 from ..utils.zmq_helpers import json_dumps, safe_json_loads
+from ..utils.config_redaction import redact_config
 
 Json = dict[str, Any]
 ResourceSortColumn = Literal[
@@ -59,7 +60,7 @@ _RESOURCE_COLUMNS: tuple[tuple[ResourceSortColumn, str], ...] = (
     ("age_s", "age_s"),
     ("error", "error"),
 )
-_INSPECTOR_TAB_IDS = ("overview", "telemetry", "commands")
+_INSPECTOR_TAB_IDS = ("overview", "telemetry", "commands", "config")
 
 class ManagerTUI(App):
     CSS = """
@@ -95,6 +96,8 @@ class ManagerTUI(App):
     #errors_table {height: 1fr;}
     #members_table {height: 1fr;}
     #cap_help {height: auto;}
+    #config_table {height: 1fr;}
+    #telemetry_empty {height: 1; color: $text-muted; display: none;}
     #event_log {height: 1fr;}
     #activity_summary {
         height: 3;
@@ -197,6 +200,7 @@ class ManagerTUI(App):
         Binding("1", "inspector_overview", "Overview", show=False),
         Binding("2", "inspector_telemetry", "Telemetry", show=False),
         Binding("3", "inspector_commands", "Commands", show=False),
+        Binding("4", "inspector_config", "Config", show=False),
     ]
 
     _DEFAULT_EVENT_LOG_HIDDEN_TOPICS = frozenset(
@@ -206,6 +210,7 @@ class ManagerTUI(App):
             "manager.chunk_ready",
             "manager.process_telemetry_update",
             "manager.process.heartbeat",
+            "manager.device_config",
         }
     )
     _VALID_PUB_QUEUE_OVERFLOW_POLICIES = frozenset({"drop_newest", "drop_oldest"})
@@ -304,7 +309,11 @@ class ManagerTUI(App):
 
         self._device_status: dict[str, DeviceStatus] = {}
         self._telemetry_cache: dict[str, Json] = {}
+        self._process_telemetry_cache: dict[str, Json] = {}
         self._heartbeat_cache: dict[str, Json] = {}
+        self._config_cache: dict[str, Json] = {}
+        self._config_errors: dict[str, str] = {}
+        self._config_fetch_inflight: set[str] = set()
 
         self._selected_device_id: str | None = None
         self._has_user_selection = False
@@ -334,7 +343,7 @@ class ManagerTUI(App):
         self._toast_repeat_s = 30.0
         self._pub_drain_max = 500
         self._telemetry_columns_device = ("signal", "value", "units", "quality", "age_s")
-        self._telemetry_columns_process = ("field", "value")
+        self._telemetry_columns_process = self._telemetry_columns_device
         self._heartbeat_columns_device = (
             "pid",
             "seq",
@@ -452,10 +461,13 @@ class ManagerTUI(App):
                             yield Label("Process", id="process_title")
                             yield DataTable(id="process_table")
                     with TabPane("Telemetry (2)", id="telemetry"):
+                        yield Static("", id="telemetry_empty")
                         yield DataTable(id="telemetry_table")
                     with TabPane("Commands (3)", id="commands"):
                         yield DataTable(id="members_table")
                         yield Static("Enter: invoke/get | e: set | R: refresh", id="cap_help")
+                    with TabPane("Config (4)", id="config"):
+                        yield DataTable(id="config_table")
         yield Static(
             "▼ Activity — press a to open · no unread alerts",
             id="activity_summary",
@@ -573,6 +585,9 @@ class ManagerTUI(App):
 
         process = self.query_one("#process_table", DataTable)
         process.add_columns("field", "value")
+
+        config = self.query_one("#config_table", DataTable)
+        config.add_columns("setting", "value")
 
         errors = self.query_one("#errors_table", DataTable)
         errors.add_columns("time", "sev", "source", "id", "message")
@@ -1336,6 +1351,7 @@ class ManagerTUI(App):
                         prev_pid = prev_proc.get("pid")
                         next_pid = proc.get("pid")
                         if prev_pid != next_pid:
+                            self._process_telemetry_cache.pop(pid, None)
                             self._proc_cap_cache.pop(pid, None)
                             self._proc_members_last.pop(pid, None)
                             self._proc_cap_render_attempt_mono.pop(pid, None)
@@ -1700,7 +1716,19 @@ class ManagerTUI(App):
         for key in stale_member_fingerprints:
             self._members_rendered_fingerprint.pop(key, None)
 
+        config_cache = getattr(self, "_config_cache", {})
+        config_errors = getattr(self, "_config_errors", {})
+        for key in list(config_cache):
+            if key.startswith("device:") and key.split(":", 1)[1] not in active_device_ids:
+                config_cache.pop(key, None)
+                config_errors.pop(key, None)
+
     def _prune_process_caches(self, *, active_process_ids: set[str]) -> None:
+        process_telemetry = getattr(self, "_process_telemetry_cache", {})
+        stale_telemetry = set(process_telemetry) - active_process_ids
+        for process_id in stale_telemetry:
+            process_telemetry.pop(process_id, None)
+
         stale_proc_caps = set(self._proc_cap_cache) - active_process_ids
         for process_id in stale_proc_caps:
             self._proc_cap_cache.pop(process_id, None)
@@ -1719,6 +1747,13 @@ class ManagerTUI(App):
         ]
         for key in stale_member_fingerprints:
             self._members_rendered_fingerprint.pop(key, None)
+
+        config_cache = getattr(self, "_config_cache", {})
+        config_errors = getattr(self, "_config_errors", {})
+        for key in list(config_cache):
+            if key.startswith("process:") and key.split(":", 1)[1] not in active_process_ids:
+                config_cache.pop(key, None)
+                config_errors.pop(key, None)
 
     def _render_devices_table(self) -> None:
         devices = self.query_one("#devices_table", DataTable)
@@ -1936,14 +1971,20 @@ class ManagerTUI(App):
         self._render_inspector()
 
     def _render_inspector(self) -> None:
+        self.query_one("#process_table", DataTable).clear()
         if self._members_source == "process":
             self._render_process_inspector()
         else:
             self._render_device_inspector()
         self._render_members_table()
-
-        process_table = self.query_one("#process_table", DataTable)
-        process_table.clear()
+        telemetry = self.query_one("#telemetry_table", DataTable)
+        empty = self.query_one("#telemetry_empty", Static)
+        if telemetry.row_count:
+            empty.display = False
+        else:
+            noun = "process" if self._members_source == "process" else "device"
+            empty.update(f"No {noun} telemetry published")
+            empty.display = True
 
     def _render_device_inspector(self) -> None:
         device_id = self._selected_device_id
@@ -1985,6 +2026,8 @@ class ManagerTUI(App):
 
         driver = self.query_one("#driver_table", DataTable)
         driver.clear()
+        details = self.query_one("#process_table", DataTable)
+        self.query_one("#process_title", Label).update("Connection")
         if device_id:
             status = self._device_status.get(device_id)
             if status:
@@ -1995,6 +2038,18 @@ class ManagerTUI(App):
                     str(status.driver_last_exit_code or ""),
                     (status.driver_last_error or "")[:40],
                 )
+                for field, value in (
+                    ("connection", self._device_connection(status)),
+                    ("registered", status.registered),
+                    ("reachable", status.device_reachable),
+                    ("liveness", status.liveness),
+                    ("heartbeat_age_s", status.hb_age_s),
+                    ("telemetry_age_s", status.telemetry_age_s),
+                    ("source", "federated" if status.is_remote else "local"),
+                    ("owner_peer", status.owner_peer_id),
+                ):
+                    if value is not None:
+                        details.add_row(field, str(value))
 
     def _render_process_inspector(self) -> None:
         process_id = self._selected_process_id
@@ -2004,6 +2059,8 @@ class ManagerTUI(App):
         heartbeat.clear()
         driver = self.query_one("#driver_table", DataTable)
         driver.clear()
+        details = self.query_one("#process_table", DataTable)
+        self.query_one("#process_title", Label).update("Process")
 
         if not process_id:
             return
@@ -2023,6 +2080,23 @@ class ManagerTUI(App):
             str(selected.get("last_exit_code", "") or ""),
             str(selected.get("last_error", "") or "")[:40],
         )
+
+        for key in (
+            "registered",
+            "rpc_endpoint",
+            "process_data_endpoint",
+            "popen_pid",
+            "heartbeat_pid",
+            "rss_bytes",
+            "hb_age_s",
+            "last_error_kind",
+            "exit_code_description",
+            "source_kind",
+            "owner_peer_id",
+        ):
+            value = selected.get(key)
+            if value not in (None, ""):
+                details.add_row(key, str(value)[:120])
 
         hb_age = ""
         last_hb_t_mono = selected.get("last_hb_t_mono")
@@ -2044,25 +2118,22 @@ class ManagerTUI(App):
                 str(heartbeat_endpoint or ""),
             )
 
-        primary_keys = {
-            "state",
-            "pid",
-            "restart_count",
-            "last_exit_code",
-            "last_error",
-        }
-        telemetry_keys = ["process_id"] + sorted(
-            [k for k in selected.keys() if k not in primary_keys and k != "process_id"]
-        )
-        for key in telemetry_keys:
-            value = selected.get(key, "")
-            if isinstance(value, (dict, list)):
-                text = json.dumps(value)
-            else:
-                text = str(value)
-            if len(text) > 120:
-                text = text[:117] + "..."
-            telemetry.add_row(key, text)
+        for name, entry in self._process_telemetry_cache.get(process_id, {}).items():
+            if not isinstance(entry, dict):
+                continue
+            ts = entry.get("ts", {})
+            age = None
+            if isinstance(ts, dict) and "t_mono_recv" in ts:
+                age = max(0.0, time.monotonic() - float(ts["t_mono_recv"]))
+            elif isinstance(ts, dict) and "t_mono" in ts:
+                age = max(0.0, time.monotonic() - float(ts["t_mono"]))
+            telemetry.add_row(
+                name,
+                str(entry.get("value")),
+                str(entry.get("units", "")),
+                str(entry.get("quality", "")),
+                f"{age:.1f}" if age is not None else "",
+            )
 
     @staticmethod
     def _members_render_fingerprint(members_render: list[dict[str, Any]]) -> int:
@@ -2588,6 +2659,32 @@ class ManagerTUI(App):
                     self._telemetry_cache[device_id] = signals
                     if device_id == self._selected_device_id:
                         self._mark_inspector_dirty()
+            elif topic == "manager.process_telemetry_update":
+                process_raw = payload.get("process_id")
+                if process_raw is None:
+                    continue
+                process_id = str(process_raw)
+                signals = payload.get("signals", {})
+                if isinstance(signals, dict):
+                    process_cache = self._process_telemetry_cache.setdefault(
+                        process_id, {}
+                    )
+                    process_cache.update(signals)
+                    if process_id == self._selected_process_id:
+                        self._mark_inspector_dirty()
+            elif topic == "manager.device_config":
+                device_id = str(payload.get("device_id", ""))
+                config_key = f"device:{device_id}"
+                display_config = payload.get("display_config")
+                if device_id and isinstance(display_config, dict):
+                    config = redact_config(display_config)
+                    connect_check = payload.get("connect_check")
+                    if isinstance(connect_check, dict):
+                        config["connect_check"] = redact_config(connect_check)
+                    self._config_cache[config_key] = config
+                    self._config_errors.pop(config_key, None)
+                    if config_key == self._selected_resource_key:
+                        self._render_config_table()
             elif topic == "manager.heartbeat":
                 device_raw = payload.get("device_id")
                 if device_raw is None:
@@ -2623,6 +2720,12 @@ class ManagerTUI(App):
                 try:
                     if topic == "manager.log":
                         line = self._format_manager_log_event_line(payload)
+                    elif topic == "manager.device_config":
+                        line = (
+                            "manager.device_config "
+                            f"device_id={payload.get('device_id', '')} "
+                            f"revision={payload.get('metadata_revision', '')}"
+                        )
                     else:
                         try:
                             payload_text = json.dumps(payload)
@@ -2824,6 +2927,78 @@ class ManagerTUI(App):
             return
         self.push_screen(ResultScreen(title, self._format_result_pretty(result)))
 
+    @staticmethod
+    def _flatten_config(value: Any, prefix: str = "") -> list[tuple[str, str]]:
+        rows: list[tuple[str, str]] = []
+        if isinstance(value, dict):
+            for key in sorted(value, key=str):
+                path = f"{prefix}.{key}" if prefix else str(key)
+                rows.extend(ManagerTUI._flatten_config(value[key], path))
+        elif isinstance(value, list):
+            rows.append((prefix, json.dumps(value, ensure_ascii=False, default=str)))
+        elif value is not None:
+            rows.append((prefix, str(value)))
+        return rows
+
+    def _ensure_selected_config(self) -> None:
+        key = self._selected_resource_key
+        if not key or key in self._config_cache or key in self._config_fetch_inflight:
+            return
+        kind, resource_id = key.split(":", 1)
+        if kind == "device":
+            payload = {
+                "type": "device.config.get",
+                "device_id": resource_id,
+                "redact_sensitive": True,
+            }
+        else:
+            payload = {
+                "type": "manager.processes.config.get",
+                "process_id": resource_id,
+            }
+        self._config_fetch_inflight.add(key)
+
+        def _after(resp: Json | None) -> None:
+            self._config_fetch_inflight.discard(key)
+            if resp and resp.get("ok") and isinstance(resp.get("result"), dict):
+                result = redact_config(dict(resp["result"]))
+                result.pop("yaml_text", None)
+                if kind == "device":
+                    result = {
+                        name: result[name]
+                        for name in ("driver", "init_kwargs", "connect_check")
+                        if name in result
+                    }
+                self._config_cache[key] = result
+                self._config_errors.pop(key, None)
+            else:
+                error = resp.get("error") if isinstance(resp, dict) else "unavailable"
+                if isinstance(error, dict):
+                    error = error.get("message") or error.get("code") or "unavailable"
+                self._config_errors[key] = str(error)
+            if self._selected_resource_key == key:
+                self._render_config_table()
+
+        self._background_rpc_submit(payload, _after)
+
+    def _render_config_table(self) -> None:
+        table = self.query_one("#config_table", DataTable)
+        table.clear()
+        key = self._selected_resource_key
+        if not key:
+            return
+        config = self._config_cache.get(key)
+        if config is None:
+            message = self._config_errors.get(key, "Loading configuration...")
+            table.add_row("status", message)
+            return
+        rows = self._flatten_config(config)
+        if not rows:
+            table.add_row("status", "No configuration exposed")
+            return
+        for setting, value in rows:
+            table.add_row(setting, value[:240])
+
     def _select_resource_key(self, key: str, *, user: bool = True) -> None:
         view = self._resource_views.get(key)
         if view is None:
@@ -2840,6 +3015,8 @@ class ManagerTUI(App):
                 self._has_user_process_selection = True
             self._set_inspector_mode("process")
         self._refresh_selected_resource_chrome()
+        self._ensure_selected_config()
+        self._render_config_table()
         self._mark_inspector_dirty()
         self._render_inspector_if_needed(force=True)
 
@@ -3837,6 +4014,7 @@ class ManagerTUI(App):
             "overview": "#driver_table",
             "telemetry": "#telemetry_table",
             "commands": "#members_table",
+            "config": "#config_table",
         }.get(tabs.active, "#driver_table")
         self.query_one(target_id, DataTable).focus()
 
@@ -3849,6 +4027,9 @@ class ManagerTUI(App):
         self.query_one("#inspector_tabs", TabbedContent).active = tab_id
         if tab_id == "commands":
             self._render_members_table()
+        elif tab_id == "config":
+            self._ensure_selected_config()
+            self._render_config_table()
         if restore_focus:
             self._focus_active_inspector()
 
@@ -3874,6 +4055,9 @@ class ManagerTUI(App):
 
     def action_inspector_commands(self) -> None:
         self._set_inspector_tab("commands")
+
+    def action_inspector_config(self) -> None:
+        self._set_inspector_tab("config")
 
     def _update_activity_summary(self) -> None:
         verb = "close" if self._activity_open else "open"
