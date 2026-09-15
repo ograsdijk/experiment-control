@@ -80,8 +80,15 @@ class ManagerTUI(App):
     #inspector {width: 1fr; height: 1fr;}
     #inspector:focus-within {border-top: heavy $accent;}
     #selected_resource_title {height: 1; padding: 0 1; text-style: bold;}
-    #action_strip {height: 3; padding: 0 1;}
-    #action_strip Button {min-width: 10; margin-right: 1;}
+    #action_strip {height: 1; padding: 0 1; overflow-x: auto;}
+    #action_strip Button {
+        width: auto;
+        min-width: 0;
+        height: 1;
+        padding: 0 1;
+        margin-right: 0;
+        border: none;
+    }
     #inspector_tabs {height: 1fr;}
     #overview_tables {height: 1fr;}
     #status_row {height: 2;}
@@ -115,15 +122,23 @@ class ManagerTUI(App):
     }
 
     #result_dialog {
-        width: 90%;
-        height: 80%;
+        width: 80;
+        max-width: 90%;
+        height: auto;
+        min-height: 0;
+        max-height: 80%;
         padding: 1 2;
         border: round $primary;
         background: $panel;
     }
 
     #result_title {height: 1; text-style: bold;}
-    #result_body {height: 1fr; border: solid $primary;}
+    #result_body {
+        height: auto;
+        min-height: 3;
+        max-height: 50vh;
+        border: solid $primary;
+    }
     #result_close {height: 3; margin-top: 1;}
 
     #invoke_dialog > *, #set_dialog > * {
@@ -152,34 +167,36 @@ class ManagerTUI(App):
 
     BINDINGS = [
         ("q", "quit", "Quit"),
-        ("s", "driver_start", "Start selected"),
-        ("x", "driver_stop", "Stop selected"),
-        ("r", "driver_restart", "Restart selected"),
-        ("v", "device_recover", "Recover device"),
-        ("c", "device_connect", "Connect"),
-        ("d", "device_disconnect", "Disconnect"),
+        Binding("s", "driver_start", "Start selected", show=False),
+        Binding("x", "driver_stop", "Stop selected", show=False),
+        Binding("r", "driver_restart", "Restart selected", show=False),
+        Binding("v", "device_recover", "Recover device", show=False),
+        Binding("c", "device_connect", "Connect", show=False),
+        Binding("d", "device_disconnect", "Disconnect", show=False),
         ("S", "drivers_start_all", "Start all"),
         ("X", "drivers_stop_all", "Stop all"),
         ("C", "devices_connect_all", "Connect all"),
-        ("t", "toggle_streaming", "Toggle streaming"),
-        ("enter", "member_primary", "Invoke/Get"),
-        ("e", "member_set", "Set value"),
-        ("R", "capabilities_refresh", "Refresh capabilities"),
+        Binding("t", "toggle_streaming", "Toggle streaming", show=False),
+        Binding("enter", "member_primary", "Invoke/Get", show=False),
+        Binding("e", "member_set", "Set value", show=False),
+        Binding("R", "capabilities_refresh", "Refresh capabilities", show=False),
         ("f5", "reconnect_backend", "Reconnect"),
         ("p", "topics", "Topics"),
         ("l", "clear_log", "Clear log"),
-        ("slash", "focus_search", "Search"),
-        ("u", "toggle_unhealthy", "Problems"),
+        Binding("slash", "focus_search", "Search", show=False),
+        Binding("u", "toggle_unhealthy", "Problems only", priority=True),
         ("o", "resource_sort_next", "Next sort"),
         ("O", "resource_sort_reverse", "Reverse sort"),
-        Binding("n", "focus_navigator", "Resources", priority=True),
-        Binding("i", "focus_inspector", "Inspector", priority=True),
-        Binding("left_square_bracket", "inspector_previous", "Previous tab", priority=True),
-        Binding("right_square_bracket", "inspector_next", "Next tab", priority=True),
-        ("a", "toggle_activity", "Activity"),
-        ("1", "inspector_overview", "Overview"),
-        ("2", "inspector_telemetry", "Telemetry"),
-        ("3", "inspector_commands", "Commands"),
+        Binding(
+            "left_square_bracket", "inspector_previous", "Previous tab", show=False, priority=True
+        ),
+        Binding(
+            "right_square_bracket", "inspector_next", "Next tab", show=False, priority=True
+        ),
+        Binding("a", "toggle_activity", "Activity", show=False),
+        Binding("1", "inspector_overview", "Overview", show=False),
+        Binding("2", "inspector_telemetry", "Telemetry", show=False),
+        Binding("3", "inspector_commands", "Commands", show=False),
     ]
 
     _DEFAULT_EVENT_LOG_HIDDEN_TOPICS = frozenset(
@@ -195,12 +212,12 @@ class ManagerTUI(App):
 
     streaming_enabled = reactive(True)
 
-    _GLOBAL_NAV_ACTIONS = frozenset(
-        {"focus_navigator", "focus_inspector", "inspector_previous", "inspector_next"}
+    _INPUT_BLOCKED_ACTIONS = frozenset(
+        {"inspector_previous", "inspector_next", "toggle_unhealthy"}
     )
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
-        if action in self._GLOBAL_NAV_ACTIONS and (
+        if action in self._INPUT_BLOCKED_ACTIONS and (
             isinstance(self.screen, ModalScreen) or isinstance(self.focused, Input)
         ):
             return False
@@ -404,7 +421,7 @@ class ManagerTUI(App):
         yield Header()
         yield Static("Backend connecting · 0 resources", id="health_summary")
         yield Static(
-            Text("Enter: inspector · Esc: resources · [ / ]: tabs · n/i: focus"),
+            Text("Enter: inspector · Esc: resources · [ / ]: tabs"),
             id="navigation_help",
         )
         with Vertical(id="main"):
@@ -450,7 +467,7 @@ class ManagerTUI(App):
                 with TabPane("Event log", id="events"):
                     yield RichLog(id="event_log", max_lines=self._event_log_max_lines)
         with Horizontal(id="status_row"):
-            yield Static("Streaming: ON", id="streaming_status")
+            yield Static("Streaming: ON (t)", id="streaming_status")
             yield Static("Dropped: 0", id="dropped_status")
             yield Static(self._backend_status_text, id="backend_status")
         yield Footer()
@@ -484,6 +501,9 @@ class ManagerTUI(App):
         self._pub_thread_handle = threading.Thread(target=self._pub_thread, daemon=True)
         self._pub_thread_handle.start()
         self._apply_responsive_layout(self.size.width)
+        # The resource list is the operator's starting point; search is entered
+        # deliberately with `/` rather than taking the initial text focus.
+        self.call_later(self.action_focus_navigator)
 
     def on_unmount(self) -> None:
         self._stop_event.set()
@@ -1499,10 +1519,15 @@ class ManagerTUI(App):
             table = self.query_one("#resources_table", DataTable)
             for key, label in _RESOURCE_COLUMNS:
                 marker = " ▼" if self._resource_sort_reverse else " ▲"
-                table.columns[self._resource_column_keys[key]].label = Text(
+                column = table.columns[self._resource_column_keys[key]]
+                column.label = Text(
                     f"{label}{marker if key == self._resource_sort_column else ''}"
                 )
-            table.refresh()
+                # Textual only measures auto-width columns when cells change.
+                # Reserve enough header space here, otherwise an indicator wider
+                # than every cell is clipped (for example ``kind ▲``).
+                column.content_width = max(column.content_width, column.label.cell_len)
+            table.refresh(layout=True)
         except Exception:
             pass
 
@@ -1566,7 +1591,11 @@ class ManagerTUI(App):
             ]
         )
         next_order = [view.key for view in views]
-        order_changed = next_order != self._resource_order
+        # A filter handler deliberately invalidates ``_resource_order`` to
+        # force a rebuild.  When it produces no rows both lists are empty,
+        # so also consult the mounted table; otherwise stale rows remain
+        # visible after filtering an all-healthy stack to "Problems only".
+        order_changed = next_order != self._resource_order or (not next_order and table.row_count > 0)
         if order_changed:
             table.clear()
             self._resource_rows.clear()
@@ -2963,14 +2992,6 @@ class ManagerTUI(App):
                 self._set_resource_sort(column)
                 return
 
-    @on(TabbedContent.TabActivated, "#inspector_tabs")
-    def _on_inspector_tab_activated(self, event: TabbedContent.TabActivated) -> None:
-        """Keep keyboard tab navigation in the newly selected content table."""
-        del event
-        inspector = self.query_one("#inspector", Vertical)
-        if inspector.has_focus_within:
-            self.call_later(self._focus_active_inspector)
-
     @on(DataTable.RowHighlighted, "#resources_table")
     def _on_resource_highlighted(self, event: DataTable.RowHighlighted) -> None:
         self._select_resource_key(self._row_key_str(event.row_key), user=True)
@@ -3178,7 +3199,7 @@ class ManagerTUI(App):
     def action_toggle_streaming(self) -> None:
         self.streaming_enabled = not self.streaming_enabled
         status = self.query_one("#streaming_status", Static)
-        status.update("Streaming: ON" if self.streaming_enabled else "Streaming: OFF")
+        status.update("Streaming: ON (t)" if self.streaming_enabled else "Streaming: OFF (t)")
 
     async def action_quit(self) -> None:
         # Send the shutdown RPC from a worker thread so the (blocking) ZMQ
@@ -3783,12 +3804,6 @@ class ManagerTUI(App):
             if self.focused is members:
                 self.action_member_primary()
                 event.stop()
-        elif key == "n":
-            self.action_focus_navigator()
-            event.stop()
-        elif key == "i":
-            self.action_focus_inspector()
-            event.stop()
         elif key == "left_square_bracket":
             self.action_inspector_previous()
             event.stop()
@@ -3829,16 +3844,13 @@ class ManagerTUI(App):
         self._focus_active_inspector()
 
     def _set_inspector_tab(self, tab_id: str) -> None:
-        try:
-            inspector = self.query_one("#inspector", Vertical)
-            restore_focus = inspector.has_focus_within
-            self.query_one("#inspector_tabs", TabbedContent).active = tab_id
-            if tab_id == "commands":
-                self._render_members_table()
-            if restore_focus:
-                self.call_after_refresh(self._focus_active_inspector)
-        except Exception:
-            pass
+        inspector = self.query_one("#inspector", Vertical)
+        restore_focus = inspector.has_focus_within
+        self.query_one("#inspector_tabs", TabbedContent).active = tab_id
+        if tab_id == "commands":
+            self._render_members_table()
+        if restore_focus:
+            self._focus_active_inspector()
 
     def _cycle_inspector_tab(self, step: int) -> None:
         tabs = self.query_one("#inspector_tabs", TabbedContent)

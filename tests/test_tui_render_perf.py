@@ -14,7 +14,7 @@ import unittest
 from collections import deque
 from types import SimpleNamespace
 
-from experiment_control._tui.app import ManagerTUI
+from experiment_control._tui.app import ManagerTUI, _RESOURCE_COLUMNS
 from experiment_control._tui.models import DeviceStatus, ResourceView
 from experiment_control._tui.screens import ResultScreen
 
@@ -260,6 +260,38 @@ class HeadlessRenderContentTests(unittest.IsolatedAsyncioTestCase):
             app._render_members_table()
             self.assertEqual(members.row_count, 7)
 
+    async def test_short_result_uses_compact_dialog(self) -> None:
+        app = ManagerTUI(snapshot_period_s=3600.0, rpc_timeout_ms=20)
+        app._rpc_call = lambda *a, **k: None  # type: ignore[method-assign]
+        app._rpc_submit = lambda *a, **k: None  # type: ignore[method-assign]
+        app._drain_pub_queue = lambda: None  # type: ignore[method-assign]
+        async with app.run_test(headless=True, size=(120, 40)) as pilot:
+            app._stop_event.set()
+            app.push_screen(ResultScreen("Result · d1.read", '{"value": 1}'))
+            await pilot.pause()
+
+            dialog = app.screen.query_one("#result_dialog")
+            body = app.screen.query_one("#result_body")
+            self.assertEqual(dialog.region.width, 80)
+            self.assertLess(dialog.region.height, 20)
+            self.assertGreaterEqual(body.region.height, 3)
+
+    async def test_long_result_dialog_stays_capped_and_scrollable(self) -> None:
+        app = ManagerTUI(snapshot_period_s=3600.0, rpc_timeout_ms=20)
+        app._rpc_call = lambda *a, **k: None  # type: ignore[method-assign]
+        app._rpc_submit = lambda *a, **k: None  # type: ignore[method-assign]
+        app._drain_pub_queue = lambda: None  # type: ignore[method-assign]
+        async with app.run_test(headless=True, size=(120, 40)) as pilot:
+            app._stop_event.set()
+            result = "\n".join(f"line {index}" for index in range(100))
+            app.push_screen(ResultScreen("Result · d1.read", result))
+            await pilot.pause()
+
+            dialog = app.screen.query_one("#result_dialog")
+            body = app.screen.query_one("#result_body")
+            self.assertLessEqual(dialog.region.height, 32)
+            self.assertGreater(body.max_scroll_y, 0)
+
 
 class _FakeProcTable:
     """Minimal DataTable stand-in for _render_processes_table."""
@@ -490,6 +522,8 @@ class UnifiedResourceHeadlessTests(unittest.IsolatedAsyncioTestCase):
         async with app.run_test(headless=True, size=(80, 24)) as pilot:
             app._stop_event.set()
             app.streaming_enabled = False
+            await pilot.pause()
+            self.assertIs(app.focused, app.query_one("#resources_table", DataTable))
             app._device_status = {
                 "healthy_dev": DeviceStatus(
                     device_id="healthy_dev",
@@ -527,16 +561,47 @@ class UnifiedResourceHeadlessTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 app.query_one("#action_disconnect", Button).label.plain, "Disconnect (d)"
             )
+            self.assertEqual(app.query_one("#action_strip").region.height, 1)
+            self.assertTrue(
+                all(
+                    button.region.height == 1
+                    for button in app.query("#action_strip Button")
+                )
+            )
+            from textual.binding import Binding
+
+            hidden_footer_keys = {
+                binding.key
+                for binding in ManagerTUI.BINDINGS
+                if isinstance(binding, Binding) and not binding.show
+            }
+            self.assertTrue({"s", "x", "r", "c", "d", "v"}.issubset(hidden_footer_keys))
+            self.assertTrue(
+                {"1", "2", "3", "a", "t", "enter", "e", "R"}.issubset(hidden_footer_keys)
+            )
+            self.assertEqual(str(app.query_one("#streaming_status").render()), "Streaming: ON (t)")
+            inspector_bindings = {
+                binding.key: binding
+                for binding in ManagerTUI.BINDINGS
+                if isinstance(binding, Binding)
+                and binding.key in {"left_square_bracket", "right_square_bracket"}
+            }
+            self.assertEqual(inspector_bindings["right_square_bracket"].action, "inspector_next")
+            self.assertEqual(inspector_bindings["left_square_bracket"].action, "inspector_previous")
+            self.assertTrue(inspector_bindings["right_square_bracket"].priority)
+            self.assertTrue(inspector_bindings["left_square_bracket"].priority)
 
             table.focus()
             await pilot.press("enter")
             self.assertIs(app.focused, app.query_one("#driver_table", DataTable))
-            await pilot.press("right_square_bracket")
+            # Let TabPane.Focused settle before changing away from Overview.
             await pilot.pause()
+            app.action_inspector_next()
+            await pilot.pause(0.01)
             self.assertEqual(app.query_one("#inspector_tabs", TabbedContent).active, "telemetry")
             self.assertIs(app.focused, app.query_one("#telemetry_table", DataTable))
-            await pilot.press("left_square_bracket")
-            await pilot.pause()
+            app.action_inspector_previous()
+            await pilot.pause(0.01)
             self.assertEqual(app.query_one("#inspector_tabs", TabbedContent).active, "overview")
             self.assertIs(app.focused, app.query_one("#driver_table", DataTable))
             await pilot.press("3")
@@ -545,16 +610,26 @@ class UnifiedResourceHeadlessTests(unittest.IsolatedAsyncioTestCase):
             self.assertIs(app.focused, app.query_one("#members_table", DataTable))
             await pilot.press("escape")
             self.assertIs(app.focused, table)
-            await pilot.press("i")
+            await pilot.press("enter")
             self.assertIs(app.focused, app.query_one("#members_table", DataTable))
-            await pilot.press("n")
+            await pilot.press("escape")
             self.assertIs(app.focused, table)
+            await pilot.press("u")
+            self.assertEqual(table.row_count, 1)
+            await pilot.press("u")
+            self.assertEqual(table.row_count, 2)
+            app._processes = [{"process_id": "bad_proc", "state": "RUNNING"}]
+            app._render_resources_table()
+            await pilot.press("u")
+            self.assertEqual(table.row_count, 0)
+            await pilot.press("u")
+            self.assertEqual(table.row_count, 2)
+            app._select_resource_key("device:healthy_dev")
             search = app.query_one("#resource_filter", Input)
             search.focus()
-            await pilot.press("right_square_bracket")
-            self.assertEqual(app.query_one("#inspector_tabs", TabbedContent).active, "commands")
-            search.value = ""
             await pilot.pause()
+            self.assertFalse(app.check_action("inspector_next", ()))
+            self.assertEqual(app.query_one("#inspector_tabs", TabbedContent).active, "commands")
 
             resource_key = app._resource_column_keys["resource"]
             resource_column = table.columns[resource_key]
@@ -575,11 +650,13 @@ class UnifiedResourceHeadlessTests(unittest.IsolatedAsyncioTestCase):
                 ["device:healthy_dev", "process:bad_proc"],
             )
             self.assertEqual(resource_column.label.plain, "resource ▼")
+            for column_name, label in _RESOURCE_COLUMNS:
+                app._set_resource_sort(column_name)
+                column = table.columns[app._resource_column_keys[column_name]]
+                self.assertEqual(column.label.plain, f"{label} ▲")
+                self.assertGreaterEqual(column.content_width, column.label.cell_len)
 
-            app.action_toggle_unhealthy()
-            self.assertEqual(table.row_count, 1)
-            app.action_toggle_unhealthy()
-            search.value = "healthy"
+            search.value = "healthy_dev"
             await pilot.pause()
             self.assertEqual(table.row_count, 1)
 

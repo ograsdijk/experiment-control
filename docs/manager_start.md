@@ -198,7 +198,9 @@ Notes:
   opening the inspector. Uppercase `S`/`X` retain the bulk start/stop behavior for the selected
   kind. Uppercase `C` connects every eligible local device; already-connected, stopped,
   offline, and federated devices are skipped. Each action button displays its shortcut in
-  parentheses, for example Start (s) and Disconnect (d).
+  parentheses, for example Start (s) and Disconnect (d). Those selected-resource shortcuts,
+  along with tab/focus/navigation shortcuts already labeled in the TUI, are intentionally
+  omitted from the Footer; the Footer retains bulk and less-visible global commands.
 - Successful commands with a non-null return value open a scrollable result dialog with
   formatted JSON. Press Escape, Enter, `q`, or the Close button to dismiss it.
 - Errors and the event log live in a collapsed Activity drawer. Its summary explicitly shows
