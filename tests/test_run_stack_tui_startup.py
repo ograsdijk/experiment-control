@@ -14,7 +14,9 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from experiment_control.cli.run_stack import (
+    _parse_args,
     _parse_manager_logging,
+    _parse_tui,
     _preflight_instance_cleanup,
     _run_with_tui,
     _wait_for_manager_ready,
@@ -35,6 +37,18 @@ class _FakeProc:
 
 
 class TuiStartupWaitTests(unittest.TestCase):
+    def test_tui_ascii_only_config_requires_bool(self) -> None:
+        self.assertTrue(_parse_tui({"tui": {"ascii_only": True}})["ascii_only"])
+        self.assertFalse(_parse_tui({"tui": {"ascii_only": False}})["ascii_only"])
+        with self.assertRaisesRegex(ConfigError, "tui.ascii_only"):
+            _parse_tui({"tui": {"ascii_only": "true"}})
+
+    def test_tui_display_mode_flags_are_mutually_exclusive(self) -> None:
+        self.assertTrue(_parse_args(["stack.yaml", "--ascii-only"]).ascii_only)
+        self.assertTrue(_parse_args(["stack.yaml", "--unicode"]).unicode)
+        with self.assertRaises(SystemExit):
+            _parse_args(["stack.yaml", "--ascii-only", "--unicode"])
+
     def test_legacy_manager_log_file_setting_is_rejected(self) -> None:
         with self.assertRaisesRegex(ConfigError, "manager.logging.directory"):
             _parse_manager_logging(
@@ -418,6 +432,7 @@ class TuiStartupWaitTests(unittest.TestCase):
                     "event_log_manager_min_severity": "error",
                     "pub_queue_maxsize": 222,
                     "pub_queue_overflow_policy": "drop_oldest",
+                    "ascii_only": True,
                 },
             )
 
@@ -434,6 +449,7 @@ class TuiStartupWaitTests(unittest.TestCase):
         self.assertEqual(
             captured_kwargs.get("pub_queue_overflow_policy"), "drop_oldest"
         )
+        self.assertTrue(captured_kwargs.get("ascii_only"))
         shutdown_mock.assert_called_once()
         wait_exit_mock.assert_called()
 
@@ -473,6 +489,7 @@ class TuiStartupWaitTests(unittest.TestCase):
             manager_network=manager_network,
             tui_raw={"enabled": True},
             instance_lock=False,
+            ascii_only_override=None,
         )
 
     def test_main_with_tui_windows_allows_lifecycle_flags(self) -> None:

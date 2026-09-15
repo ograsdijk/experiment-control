@@ -514,6 +514,23 @@ class UnifiedResourceModelTests(unittest.TestCase):
             ),
         )
         self.assertTrue(all(indicator.cell_len == 1 for indicator in indicators))
+
+    def test_ascii_status_symbols_and_decorations_are_ascii(self) -> None:
+        self.assertEqual(render_link_state("ONLINE", ascii_only=True).plain, "+")
+        self.assertEqual(render_link_state("DISCONNECTED", ascii_only=True).plain, "-")
+        self.assertEqual(render_link_state("STALE", ascii_only=True).plain, "~")
+        self.assertEqual(render_link_state("OFFLINE", ascii_only=True).plain, "x")
+        self.assertEqual(render_health_state("healthy", ascii_only=True).plain, "+")
+        self.assertEqual(render_health_state("degraded", ascii_only=True).plain, "!")
+        self.assertEqual(render_health_state("transition", ascii_only=True).plain, ">")
+        self.assertEqual(render_run_state("RUNNING", ascii_only=True).plain, "+")
+        self.assertEqual(render_run_state("STOPPING", ascii_only=True).plain, "!")
+        self.assertEqual(render_run_state("CRASHLOOP", ascii_only=True).plain, "x")
+
+        from experiment_control._tui.status_presentation import tui_symbols
+
+        symbols = tui_symbols(ascii_only=True)
+        self.assertTrue(all(ord(char) < 128 for char in "".join(symbols.__dict__.values())))
         self.assertEqual(format_age(0.1), "0.1s")
         self.assertEqual(format_age(1.4), "1.4s")
         self.assertEqual(format_age(14.0), "14s")

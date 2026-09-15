@@ -43,6 +43,7 @@ from .status_presentation import (
     render_link_state,
     render_run_state,
     state_name,
+    tui_symbols,
 )
 from .screens import (
     ConfirmScreen,
@@ -390,6 +391,7 @@ class ManagerTUI(App):
         event_log_manager_min_severity: str = "warning",
         pub_queue_maxsize: int = 10_000,
         pub_queue_overflow_policy: str = "drop_newest",
+        ascii_only: bool = False,
         driver_class: type[Driver] | None = None,
     ) -> None:
         super().__init__(driver_class=driver_class)
@@ -417,6 +419,7 @@ class ManagerTUI(App):
         if overflow_policy not in self._VALID_PUB_QUEUE_OVERFLOW_POLICIES:
             overflow_policy = "drop_newest"
         self._pub_queue_overflow_policy = overflow_policy
+        self._ascii_only = bool(ascii_only)
 
         self._ctx = zmq.Context.instance()
         self._rpc = self._new_rpc_socket()
@@ -591,7 +594,10 @@ class ManagerTUI(App):
         yield Header(icon="")
         yield Static(self._health_summary_text([]), id="health_summary")
         yield Static(
-            Text("ENTER inspector · ESC resources · [ / ] tabs"),
+            Text(
+                f"ENTER inspector {self._symbols.separator} ESC resources "
+                f"{self._symbols.separator} [ / ] tabs"
+            ),
             id="navigation_help",
         )
         with Vertical(id="main"):
@@ -632,7 +638,7 @@ class ManagerTUI(App):
                     with TabPane("CONFIG (4)", id="config"):
                         yield DataTable(id="config_table")
         yield Static(
-            "▼ ACTIVITY // A OPEN  |  NO UNREAD ALERTS",
+            f"{self._symbols.activity_closed} ACTIVITY // A OPEN  |  NO UNREAD ALERTS",
             id="activity_summary",
         )
         with Vertical(id="activity_drawer"):
@@ -1479,11 +1485,14 @@ class ManagerTUI(App):
         key_value = row_key.value if hasattr(row_key, "value") else row_key
         return str(key_value)
 
-    @staticmethod
-    def _device_label(status: DeviceStatus) -> str:
+    def _device_label(self, status: DeviceStatus) -> str:
         if status.is_remote:
-            return f"⇄ {status.device_id}"
+            return f"{self._symbols.remote_prefix} {status.device_id}"
         return status.device_id
+
+    @property
+    def _symbols(self):
+        return tui_symbols(ascii_only=getattr(self, "_ascii_only", False))
 
     def _refresh_snapshot(self) -> None:
         # Interval callback on the UI thread. The two status RPCs are blocking,
@@ -1672,21 +1681,23 @@ class ManagerTUI(App):
         liveness = state_name(status.liveness)
         return liveness or "UNKNOWN"
 
-    @staticmethod
-    def _connection_cell(connection: str | None, *, health: str = "neutral") -> Text:
+    def _connection_cell(self, connection: str | None, *, health: str = "neutral") -> Text:
         return render_link_state(
             connection,
             failure_related=(connection or "").casefold() == "offline"
             and health == "failed",
+            ascii_only=getattr(self, "_ascii_only", False),
         )
 
-    @staticmethod
-    def _health_cell(health: str) -> Text:
-        return render_health_state(health)
+    def _health_cell(self, health: str) -> Text:
+        return render_health_state(
+            health, ascii_only=getattr(self, "_ascii_only", False)
+        )
 
-    @staticmethod
-    def _runtime_cell(state: str) -> Text:
-        return render_run_state(state)
+    def _runtime_cell(self, state: str) -> Text:
+        return render_run_state(
+            state, ascii_only=getattr(self, "_ascii_only", False)
+        )
 
     @staticmethod
     def _error_cell(message: str) -> Text | str:
@@ -1787,7 +1798,11 @@ class ManagerTUI(App):
         try:
             table = self.query_one("#resources_table", DataTable)
             for key, label in _RESOURCE_COLUMNS:
-                marker = " ▼" if self._resource_sort_reverse else " ▲"
+                marker = (
+                    f" {self._symbols.sort_descending}"
+                    if self._resource_sort_reverse
+                    else f" {self._symbols.sort_ascending}"
+                )
                 column = table.columns[self._resource_column_keys[key]]
                 column.label = Text(
                     f"{label}{marker if key == self._resource_sort_column else ''}"
@@ -1876,7 +1891,11 @@ class ManagerTUI(App):
             table.clear()
             self._resource_rows.clear()
             for view in views:
-                label = f"⇄ {view.resource_id}" if view.is_remote else view.resource_id
+                label = (
+                    f"{self._symbols.remote_prefix} {view.resource_id}"
+                    if view.is_remote
+                    else view.resource_id
+                )
                 row = (
                     "dev" if view.kind == "device" else "proc",
                     label,
@@ -1909,7 +1928,11 @@ class ManagerTUI(App):
                 "error",
             )
             for view in views:
-                label = f"⇄ {view.resource_id}" if view.is_remote else view.resource_id
+                label = (
+                    f"{self._symbols.remote_prefix} {view.resource_id}"
+                    if view.is_remote
+                    else view.resource_id
+                )
                 row = (
                     "dev" if view.kind == "device" else "proc",
                     label,
@@ -2168,7 +2191,7 @@ class ManagerTUI(App):
                 )
                 # Display-only ⇄ badge for federated rows; the row KEY stays the
                 # raw process_id so cell updates/removals keep working.
-                label = f"⇄ {pid}" if is_remote else pid
+                label = f"{self._symbols.remote_prefix} {pid}" if is_remote else pid
                 hb_age = ""
                 hb_age_val = proc.get("hb_age_s")
                 if isinstance(hb_age_val, (int, float)):
@@ -3813,7 +3836,7 @@ class ManagerTUI(App):
                         )
                         self.notify(f"Call ok: {process_id}.{name}")
                         self._show_command_result(
-                            f"Result · {process_id}.{name}", result
+                            f"Result {self._symbols.separator} {process_id}.{name}", result
                         )
                     else:
                         err = resp.get("error", "unknown error") if resp else "timeout"
@@ -3853,7 +3876,7 @@ class ManagerTUI(App):
                         )
                         self.notify(f"Call ok: {process_id}.{name}")
                         self._show_command_result(
-                            f"Result · {process_id}.{name}", result
+                            f"Result {self._symbols.separator} {process_id}.{name}", result
                         )
                     else:
                         err = resp.get("error", "unknown error") if resp else "timeout"
@@ -3902,7 +3925,7 @@ class ManagerTUI(App):
                         )
                         self.notify(f"Call ok: {device_id}.{name}")
                         self._show_command_result(
-                            f"Result · {device_id}.{name}", result
+                            f"Result {self._symbols.separator} {device_id}.{name}", result
                         )
                     else:
                         err = resp.get("error", "unknown error") if resp else "timeout"
@@ -3937,7 +3960,7 @@ class ManagerTUI(App):
                         )
                         self.notify(f"Call ok: {device_id}.{name}")
                         self._show_command_result(
-                            f"Result · {device_id}.{name}", result
+                            f"Result {self._symbols.separator} {device_id}.{name}", result
                         )
                     else:
                         err = resp.get("error", "unknown error") if resp else "timeout"
@@ -3965,7 +3988,9 @@ class ManagerTUI(App):
                 text = self._format_result(result)
                 self._log_action_result(f"GET {device_id}.{name} -> {text}")
                 self.notify(f"Get ok: {device_id}.{name}")
-                self._show_command_result(f"Result · {device_id}.{name}", result)
+                self._show_command_result(
+                    f"Result {self._symbols.separator} {device_id}.{name}", result
+                )
             else:
                 err = resp.get("error", "unknown error") if resp else "timeout"
                 self._log_action_result(f"GET {device_id}.{name} -> error {err}")
@@ -4451,7 +4476,11 @@ class ManagerTUI(App):
 
     def _update_activity_summary(self) -> None:
         verb = "CLOSE" if self._activity_open else "OPEN"
-        arrow = "▲" if self._activity_open else "▼"
+        arrow = (
+            self._symbols.activity_open
+            if self._activity_open
+            else self._symbols.activity_closed
+        )
         summary = self.query_one("#activity_summary", Static)
         summary.set_class(bool(self._activity_unread_warning), "has-warning")
         summary.set_class(bool(self._activity_unread_error), "has-error")
