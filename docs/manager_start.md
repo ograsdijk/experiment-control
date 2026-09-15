@@ -159,6 +159,7 @@ startup:
 
 tui:
   enabled: false
+  ascii_only: false                 # ASCII project indicators for limited terminals
   rpc_timeout_ms: 1500
   snapshot_period_s: 2.0
   startup_delay_s: 1.0
@@ -190,6 +191,12 @@ Notes:
   - unknown ids, duplicate ids, or an id listed in both `process_exclude` and
     `process_order` are config errors.
 - If `tui.enabled: true`, the stack runner starts a manager subprocess and runs the TUI in the same terminal.
+- The TUI uses Unicode indicators by default. Set `tui.ascii_only: true` for a
+  persistent ASCII fallback (including Scheduled Task launches). For one launch,
+  pass `--ascii-only` to `experiment_control.cli.run_stack`; `--unicode` forces
+  Unicode for that launch. The two flags are mutually exclusive and override the
+  YAML setting. ASCII mode covers project-owned status/decorative symbols;
+  Textual widget borders remain framework-rendered.
 - When the TUI exits, the runner sends `manager.control.shutdown` and then terminates the manager subprocess.
 - The TUI uses one resource navigator for devices and managed processes above the inspector.
   It spans the terminal width, grows to a capped height, and scrolls internally when the list

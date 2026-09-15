@@ -46,6 +46,17 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser("experiment_control.cli.run_stack")
     p.add_argument("path", help="Path to stack YAML")
     p.add_argument("--no-tui", action="store_true", help=argparse.SUPPRESS)
+    tui_mode = p.add_mutually_exclusive_group()
+    tui_mode.add_argument(
+        "--ascii-only",
+        action="store_true",
+        help="Render project-owned TUI indicators with ASCII characters.",
+    )
+    tui_mode.add_argument(
+        "--unicode",
+        action="store_true",
+        help="Render project-owned TUI indicators with Unicode characters.",
+    )
     p.add_argument(
         "--cleanup-orphans",
         action="store_true",
@@ -193,6 +204,12 @@ def _parse_tui(raw: Json) -> Json:
                 "must be one of: drop_newest, drop_oldest",
             )
         out["pub_queue_overflow_policy"] = overflow_policy_raw
+
+    if "ascii_only" in tui:
+        ascii_only = tui.get("ascii_only")
+        if not isinstance(ascii_only, bool):
+            raise ConfigError("tui.ascii_only", "must be a bool")
+        out["ascii_only"] = ascii_only
 
     return out
 
@@ -695,6 +712,7 @@ def _run_with_tui(
     manager_network: ManagerNetworkConfig,
     tui_raw: Json,
     instance_lock: bool = False,
+    ascii_only_override: bool | None = None,
 ) -> None:
     manager_rpc = manager_network.local_rpc_connect
     manager_pub = manager_network.local_pub_connect
@@ -713,6 +731,11 @@ def _run_with_tui(
     pub_queue_maxsize = int(tui_raw.get("pub_queue_maxsize", 10_000))
     pub_queue_overflow_policy = str(
         tui_raw.get("pub_queue_overflow_policy", "drop_newest")
+    )
+    ascii_only = (
+        bool(tui_raw.get("ascii_only", False))
+        if ascii_only_override is None
+        else ascii_only_override
     )
     probe_timeout_ms = min(500, max(100, rpc_timeout_ms))
 
@@ -753,6 +776,7 @@ def _run_with_tui(
             event_log_manager_min_severity=event_log_manager_min_severity,
             pub_queue_maxsize=pub_queue_maxsize,
             pub_queue_overflow_policy=pub_queue_overflow_policy,
+            ascii_only=ascii_only,
         )
         app.run()
     finally:
@@ -794,6 +818,9 @@ def main(argv: list[str] | None = None) -> None:
                 manager_network=manager_network,
                 tui_raw=tui_raw,
                 instance_lock=bool(ns.instance_lock),
+                ascii_only_override=(
+                    True if ns.ascii_only else False if ns.unicode else None
+                ),
             )
             return
 
