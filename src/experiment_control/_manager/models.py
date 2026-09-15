@@ -244,6 +244,11 @@ class ProcessSpec:
     # Absolute ceiling for heartbeat staleness. ``None`` preserves the
     # historical manager-wide multiplier fallback.
     heartbeat_hard_timeout_s: float | None = None
+    process_class_path: str | None = None
+    process_class_name: str | None = None
+    init_kwargs: dict[str, Any] = field(default_factory=dict)
+    config_path: str | None = None
+    config_yaml_text: str | None = None
 
 
 @dataclass

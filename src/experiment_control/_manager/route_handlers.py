@@ -279,6 +279,60 @@ def route_process_get(manager: Any, req: Json) -> Json:
     return {"ok": True, "result": manager.get_process(process_id)}
 
 
+def route_process_config_get(manager: Any, req: Json) -> Json:
+    from ..utils.config_redaction import REDACTED_VALUE, redact_config
+
+    process_id = str(req.get("process_id", "")).strip()
+    handle = manager._processes.get(process_id)
+    if handle is None:
+        remote = next(
+            (
+                proc
+                for proc in manager._federation_hub.list_processes_snapshot()
+                if str(proc.get("process_id", "")) == process_id
+            ),
+            None,
+        )
+        if remote is not None:
+            return _reply(
+                "process_config_unavailable",
+                message="configuration is not mirrored for federated processes",
+            )
+        return _reply("unknown_process")
+
+    spec = handle.spec
+    if spec.process_class_name:
+        launch: Json = {
+            "kind": "process_class",
+            "file": spec.process_class_path,
+            "class_name": spec.process_class_name,
+        }
+    else:
+        launch = {
+            "kind": "argv",
+            "executable": spec.argv[0] if spec.argv else None,
+            "arguments": REDACTED_VALUE if len(spec.argv) > 1 else [],
+        }
+    result: Json = {
+        "version": 1,
+        "process_id": spec.process_id,
+        "launch": launch,
+        "init_kwargs": spec.init_kwargs,
+        "cwd": spec.cwd,
+        "env": {key: REDACTED_VALUE for key in (spec.env or {})},
+        "heartbeat_period_s": spec.heartbeat_period_s,
+        "heartbeat_timeout_s": spec.heartbeat_timeout_s,
+        "shutdown_timeout_s": spec.shutdown_timeout_s,
+        "restart_policy": str(spec.restart_policy),
+        "restart_backoff_s": spec.restart_backoff_s,
+        "max_restarts": spec.max_restarts,
+        "heartbeat_endpoint": spec.heartbeat_endpoint,
+        "process_data_endpoint": spec.process_data_endpoint,
+        "config_path": spec.config_path,
+    }
+    return {"ok": True, "result": redact_config(result)}
+
+
 def route_process_control(
     manager: Any,
     req: Json,
@@ -811,6 +865,9 @@ class RouteHandlersMixin:
 
     def _route_process_get(self, req: Json) -> Json:
         return route_process_get(self, req)
+
+    def _route_process_config_get(self, req: Json) -> Json:
+        return route_process_config_get(self, req)
 
     def _route_process_control(
         self,

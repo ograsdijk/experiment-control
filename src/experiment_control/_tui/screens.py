@@ -7,7 +7,7 @@ from textual import events
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
-from textual.widgets import Button, DataTable, Input, Label, Static
+from textual.widgets import Button, DataTable, Input, Label, RichLog, Static
 
 
 class ConfirmScreen(ModalScreen[bool]):
@@ -240,6 +240,36 @@ class SetMemberScreen(ModalScreen[object | None]):
             self.dismiss(parsed)
             event.stop()
         elif key == "escape":
+            self.dismiss(None)
+            event.stop()
+
+
+class ResultScreen(ModalScreen[None]):
+    """Scrollable presentation for a successful non-null command result."""
+
+    def __init__(self, title: str, result_text: str) -> None:
+        super().__init__()
+        self._title = title
+        self._result_text = result_text
+
+    def compose(self) -> ComposeResult:
+        yield Vertical(
+            Label(self._title, id="result_title"),
+            RichLog(id="result_body", wrap=True, markup=False),
+            Button("Close", id="result_close", variant="primary"),
+            id="result_dialog",
+        )
+
+    def on_mount(self) -> None:
+        self.query_one("#result_body", RichLog).write(self._result_text)
+        self.query_one("#result_close", Button).focus()
+
+    def on_button_pressed(self, event) -> None:  # type: ignore[override]
+        if getattr(event.button, "id", "") == "result_close":
+            self.dismiss(None)
+
+    def on_key(self, event: events.Key) -> None:  # type: ignore[override]
+        if event.key.lower() in {"escape", "enter", "q"}:
             self.dismiss(None)
             event.stop()
 

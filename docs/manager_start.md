@@ -178,13 +178,44 @@ Notes:
 - `process_order` is optional. If omitted, `hdf_writer` is started first if present.
 - If `tui.enabled: true`, the stack runner starts a manager subprocess and runs the TUI in the same terminal.
 - When the TUI exits, the runner sends `manager.control.shutdown` and then terminates the manager subprocess.
-- TUI event log memory is bounded by `tui.event_log_max_lines` (oldest lines are trimmed).
+- The TUI uses one resource navigator for devices and managed processes above the inspector.
+  It spans the terminal width, grows to a capped height, and scrolls internally when the list
+  exceeds that height. Press `/` to search, `u` to show only failures, and `1`/`2`/`3`/`4`
+  to switch the selected resource between Overview, Telemetry, Commands, and Config.
+- Click a resource-table header to sort the mixed device/process list by that column; click it
+  again to reverse the order. The active header shows `▲` or `▼`. Press `o` to move to the
+  next sort column and uppercase `O` to reverse it without a mouse. The sort choice lasts for
+  the current TUI session only; empty cells, such as process connection state, remain last.
+- Keyboard navigation follows a drill-in model: select a resource with the arrow keys, press
+  Enter to focus its active inspector view, and press Escape to return to the resource table.
+  Press `n` or `i` to focus the navigator or inspector directly. Inspector tabs are labeled
+  Overview (1), Telemetry (2), Commands (3), and Config (4); use `1`/`2`/`3`/`4` to select
+  directly or `[`/`]` to move between them. Overview contains runtime and connection state;
+  Telemetry contains only published device or process signals. Config shows structured driver
+  or process launch settings with constructor secrets and environment values redacted.
+- Lifecycle keys remain context-sensitive (`s` start, `x` stop, `r` restart, `c` connect,
+  `d` disconnect, `v` recover). The selected target and valid actions are also shown above
+  the inspector. The navigator has a separate connection column (`● connected`,
+  `○ disconnected`, `◐ stale`, or `— offline`) so device connectivity is visible without
+  opening the inspector. Uppercase `S`/`X` retain the bulk start/stop behavior for the selected
+  kind. Uppercase `C` connects every eligible local device; already-connected, stopped,
+  offline, and federated devices are skipped. Each action button displays its shortcut in
+  parentheses, for example Start (s) and Disconnect (d). Those selected-resource shortcuts,
+  along with tab/focus/navigation shortcuts already labeled in the TUI, are intentionally
+  omitted from the Footer; the Footer retains bulk and less-visible global commands.
+- Successful commands with a non-null return value open a scrollable result dialog with
+  formatted JSON. Press Escape, Enter, `q`, or the Close button to dismiss it.
+- Errors and the event log live in a collapsed Activity drawer. Its summary explicitly shows
+  whether `a` opens or closes it; press `a` or click the summary bar to toggle the drawer.
+  New alerts update the collapsed unread counters without opening the drawer or moving focus.
+- Below 100 columns the TUI shows either the navigator or inspector. Select a resource to
+  enter its inspector and press Escape to return to the navigator.
+- TUI event-log memory is bounded by `tui.event_log_max_lines` (oldest retained lines are trimmed).
 - `tui.event_log_default_hidden_topics` controls which topics start hidden from the TUI event log.
   Hidden topics are still ingested/processed by the TUI; they are simply not appended to the
   on-screen `RichLog` unless enabled from the Topics modal (`p`).
-- Topic toggles in the Topics modal (`p`) control **event-log writes** to `RichLog` for each topic,
-  not just post-render filtering. If a topic is off, new events for that topic are not written to
-  the `RichLog`.
+- Topic toggles in the Topics modal (`p`) control which incoming events enter the retained
+  activity log. Closing the drawer suspends widget rendering, not event retention.
 - Re-enabling a topic later resumes writing only for new incoming events (no historical backfill).
 - Set `tui.event_log_default_hidden_topics: []` to start with all topics enabled, or `null` to use
   built-in defaults.
@@ -193,7 +224,9 @@ Notes:
   `tui.pub_queue_overflow_policy`:
   - `drop_newest`: reject incoming message
   - `drop_oldest`: evict one queued message and keep incoming message
-- Press `l` in the TUI to clear the current on-screen event log buffer.
+- Press `l` in the TUI to clear both the retained and on-screen event-log buffers.
+- High-rate telemetry and heartbeat messages are coalesced to the latest value before rendering;
+  ordered logs, warnings, errors, lifecycle events, and command results are not coalesced.
 - Startup timeouts (registration / process running / online) are logged as warnings; the stack continues.
 - The `device_router` process is started automatically by the manager and is not listed under `processes:`.
 - `external.rpc_port` is the **device_router** front door; `external.pub_port` is manager PUB.

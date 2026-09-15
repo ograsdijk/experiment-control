@@ -12,35 +12,104 @@ import zmq
 from rich.text import Text
 from textual import events, on, work
 from textual.app import App, ComposeResult
+from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.driver import Driver
 from textual.reactive import reactive
 from textual.screen import ModalScreen
-from textual.widgets import DataTable, Footer, Header, Input, Label, RichLog, Static
+from textual.widgets import (
+    Button,
+    DataTable,
+    Footer,
+    Header,
+    Input,
+    Label,
+    RichLog,
+    Static,
+    TabbedContent,
+    TabPane,
+)
 
 from .helpers import (
     normalize_log_severity_for_tui,
     normalize_topic_set,
     severity_rank_for_tui,
 )
-from .models import DeviceStatus
-from .screens import ConfirmScreen, InvokeMemberScreen, SetMemberScreen, TopicFilterScreen
+from .models import DeviceStatus, ResourceView
+from .screens import (
+    ConfirmScreen,
+    InvokeMemberScreen,
+    ResultScreen,
+    SetMemberScreen,
+    TopicFilterScreen,
+)
 from ..utils.zmq_helpers import json_dumps, safe_json_loads
+from ..utils.config_redaction import redact_config
 
 Json = dict[str, Any]
+ResourceSortColumn = Literal[
+    "kind", "resource", "connection", "health", "runtime", "age_s", "error"
+]
+
+_RESOURCE_COLUMNS: tuple[tuple[ResourceSortColumn, str], ...] = (
+    ("kind", "kind"),
+    ("resource", "resource"),
+    ("connection", "connection"),
+    ("health", "health"),
+    ("runtime", "runtime"),
+    ("age_s", "age_s"),
+    ("error", "error"),
+)
+_INSPECTOR_TAB_IDS = ("overview", "telemetry", "commands", "config")
 
 class ManagerTUI(App):
     CSS = """
-    #main {height: 1fr;}
-    #devices {width: 1fr;}
-    #inspector {width: 1fr;}
+    #health_summary {height: 1; padding: 0 1; background: $boost;}
+    #navigation_help {height: 1; padding: 0 1; color: $text-muted; background: $boost;}
+    #main {height: 1fr; layout: vertical;}
+    #navigator {
+        width: 1fr;
+        height: auto;
+        min-height: 7;
+        max-height: 16;
+        border-bottom: solid $primary;
+    }
+    #navigator:focus-within {border-bottom: heavy $accent;}
+    #resource_filter {height: 3;}
+    #resources_table {height: auto; min-height: 3; max-height: 13;}
+    #devices_table, #processes_table, #processes_title {display: none;}
+    #inspector {width: 1fr; height: 1fr;}
+    #inspector:focus-within {border-top: heavy $accent;}
+    #selected_resource_title {height: 1; padding: 0 1; text-style: bold;}
+    #action_strip {height: 1; padding: 0 1; overflow-x: auto;}
+    #action_strip Button {
+        width: auto;
+        min-width: 0;
+        height: 1;
+        padding: 0 1;
+        margin-right: 0;
+        border: none;
+    }
+    #inspector_tabs {height: 1fr;}
+    #overview_tables {height: 1fr;}
     #status_row {height: 2;}
-    #errors_table {height: 10;}
-    #members_table {height: 14;}
+    #errors_table {height: 1fr;}
+    #members_table {height: 1fr;}
     #cap_help {height: auto;}
-    #event_log {height: 12;}
+    #config_table {height: 1fr;}
+    #telemetry_empty {height: 1; color: $text-muted; display: none;}
+    #event_log {height: 1fr;}
+    #activity_summary {
+        height: 3;
+        padding: 0 1;
+        border: round $primary;
+        background: $boost;
+        text-style: bold;
+    }
+    #activity_drawer {height: 14; display: none; border-top: solid $primary;}
+    #activity_drawer.open {display: block;}
 
-    InvokeMemberScreen, SetMemberScreen {
+    InvokeMemberScreen, SetMemberScreen, ResultScreen {
         align: center middle;
         background: $surface 80%;
     }
@@ -54,6 +123,26 @@ class ManagerTUI(App):
         border: round $primary;
         background: $panel;
     }
+
+    #result_dialog {
+        width: 80;
+        max-width: 90%;
+        height: auto;
+        min-height: 0;
+        max-height: 80%;
+        padding: 1 2;
+        border: round $primary;
+        background: $panel;
+    }
+
+    #result_title {height: 1; text-style: bold;}
+    #result_body {
+        height: auto;
+        min-height: 3;
+        max-height: 50vh;
+        border: solid $primary;
+    }
+    #result_close {height: 3; margin-top: 1;}
 
     #invoke_dialog > *, #set_dialog > * {
         height: auto;
@@ -81,21 +170,37 @@ class ManagerTUI(App):
 
     BINDINGS = [
         ("q", "quit", "Quit"),
-        ("s", "driver_start", "Start selected"),
-        ("x", "driver_stop", "Stop selected"),
-        ("r", "driver_restart", "Restart selected"),
-        ("v", "device_recover", "Recover device"),
-        ("c", "device_connect", "Connect"),
-        ("d", "device_disconnect", "Disconnect"),
+        Binding("s", "driver_start", "Start selected", show=False),
+        Binding("x", "driver_stop", "Stop selected", show=False),
+        Binding("r", "driver_restart", "Restart selected", show=False),
+        Binding("v", "device_recover", "Recover device", show=False),
+        Binding("c", "device_connect", "Connect", show=False),
+        Binding("d", "device_disconnect", "Disconnect", show=False),
         ("S", "drivers_start_all", "Start all"),
         ("X", "drivers_stop_all", "Stop all"),
-        ("t", "toggle_streaming", "Toggle streaming"),
-        ("enter", "member_primary", "Invoke/Get"),
-        ("e", "member_set", "Set value"),
-        ("R", "capabilities_refresh", "Refresh capabilities"),
+        ("C", "devices_connect_all", "Connect all"),
+        Binding("t", "toggle_streaming", "Toggle streaming", show=False),
+        Binding("enter", "member_primary", "Invoke/Get", show=False),
+        Binding("e", "member_set", "Set value", show=False),
+        Binding("R", "capabilities_refresh", "Refresh capabilities", show=False),
         ("f5", "reconnect_backend", "Reconnect"),
         ("p", "topics", "Topics"),
         ("l", "clear_log", "Clear log"),
+        Binding("slash", "focus_search", "Search", show=False),
+        Binding("u", "toggle_unhealthy", "Problems only", priority=True),
+        ("o", "resource_sort_next", "Next sort"),
+        ("O", "resource_sort_reverse", "Reverse sort"),
+        Binding(
+            "left_square_bracket", "inspector_previous", "Previous tab", show=False, priority=True
+        ),
+        Binding(
+            "right_square_bracket", "inspector_next", "Next tab", show=False, priority=True
+        ),
+        Binding("a", "toggle_activity", "Activity", show=False),
+        Binding("1", "inspector_overview", "Overview", show=False),
+        Binding("2", "inspector_telemetry", "Telemetry", show=False),
+        Binding("3", "inspector_commands", "Commands", show=False),
+        Binding("4", "inspector_config", "Config", show=False),
     ]
 
     _DEFAULT_EVENT_LOG_HIDDEN_TOPICS = frozenset(
@@ -105,11 +210,23 @@ class ManagerTUI(App):
             "manager.chunk_ready",
             "manager.process_telemetry_update",
             "manager.process.heartbeat",
+            "manager.device_config",
         }
     )
     _VALID_PUB_QUEUE_OVERFLOW_POLICIES = frozenset({"drop_newest", "drop_oldest"})
 
     streaming_enabled = reactive(True)
+
+    _INPUT_BLOCKED_ACTIONS = frozenset(
+        {"inspector_previous", "inspector_next", "toggle_unhealthy"}
+    )
+
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        if action in self._INPUT_BLOCKED_ACTIONS and (
+            isinstance(self.screen, ModalScreen) or isinstance(self.focused, Input)
+        ):
+            return False
+        return super().check_action(action, parameters)
 
     def __init__(
         self,
@@ -150,6 +267,8 @@ class ManagerTUI(App):
         self._ctx = zmq.Context.instance()
         self._rpc = self._new_rpc_socket()
         self._rpc_seq = 0
+        self._bg_rpc = self._new_rpc_socket()
+        self._bg_rpc_seq = 0
 
         # Single-owner RPC socket: `self._rpc` (a ZMQ DEALER, NOT thread-safe)
         # is touched by exactly ONE thread — the RPC worker started in
@@ -163,6 +282,9 @@ class ManagerTUI(App):
         self._rpc_req_q: queue.Queue[Callable[[], None] | None] = queue.Queue()
         self._rpc_worker_ident: int | None = None
         self._rpc_worker_handle: threading.Thread | None = None
+        self._bg_rpc_req_q: queue.Queue[Callable[[], None] | None] = queue.Queue()
+        self._bg_rpc_worker_ident: int | None = None
+        self._bg_rpc_worker_handle: threading.Thread | None = None
         # Captured in on_mount; used to marshal UI updates that originate off
         # the UI thread (e.g. _set_backend_status from the RPC worker).
         self._ui_thread_id: int | None = None
@@ -187,7 +309,11 @@ class ManagerTUI(App):
 
         self._device_status: dict[str, DeviceStatus] = {}
         self._telemetry_cache: dict[str, Json] = {}
+        self._process_telemetry_cache: dict[str, Json] = {}
         self._heartbeat_cache: dict[str, Json] = {}
+        self._config_cache: dict[str, Json] = {}
+        self._config_errors: dict[str, str] = {}
+        self._config_fetch_inflight: set[str] = set()
 
         self._selected_device_id: str | None = None
         self._has_user_selection = False
@@ -217,7 +343,7 @@ class ManagerTUI(App):
         self._toast_repeat_s = 30.0
         self._pub_drain_max = 500
         self._telemetry_columns_device = ("signal", "value", "units", "quality", "age_s")
-        self._telemetry_columns_process = ("field", "value")
+        self._telemetry_columns_process = self._telemetry_columns_device
         self._heartbeat_columns_device = (
             "pid",
             "seq",
@@ -276,33 +402,86 @@ class ManagerTUI(App):
         # deferred) doesn't introduce a cross-thread race.
         self._error_counts_lock = threading.Lock()
         self._backend_status_text = "Backend: connecting"
+        self._resource_filter = ""
+        self._unhealthy_only = False
+        self._resource_views: dict[str, ResourceView] = {}
+        self._resource_rows: dict[str, tuple[str, ...]] = {}
+        self._resource_order: list[str] = []
+        self._resource_column_keys: dict[ResourceSortColumn, Any] = {}
+        self._resource_sort_column: ResourceSortColumn = "kind"
+        self._resource_sort_reverse = False
+        self._selected_resource_key: str | None = None
+        self._pending_resource_actions: set[str] = set()
+        self._activity_open = False
+        self._activity_unread_warning = 0
+        self._activity_unread_error = 0
+        self._event_lines: deque[str] = deque(maxlen=self._event_log_max_lines)
+        self._activity_hydration_lines: list[str] = []
+        self._activity_hydration_index = 0
+        self._latest_state_messages: dict[tuple[str, str], tuple[str, Json]] = {}
+        self._state_lock = threading.Lock()
+        self._pub_drain_budget_s = 0.014
+        self._max_drain_slice_s = 0.0
+        self._coalesced_pub_messages = 0
+        self._narrow_layout = False
+        self._narrow_show_inspector = False
 
     def compose(self) -> ComposeResult:
         yield Header()
-        with Horizontal(id="main"):
-            with Vertical(id="devices"):
+        yield Static("Backend connecting · 0 resources", id="health_summary")
+        yield Static(
+            Text("Enter: inspector · Esc: resources · [ / ]: tabs"),
+            id="navigation_help",
+        )
+        with Vertical(id="main"):
+            with Vertical(id="navigator"):
+                yield Input(placeholder="Search resources  [/]", id="resource_filter")
+                yield DataTable(id="resources_table")
+                # Kept mounted as compatibility targets for the existing
+                # low-level renderer tests; the operator UI uses resources_table.
                 yield DataTable(id="devices_table")
                 yield Label("Processes", id="processes_title")
                 yield DataTable(id="processes_table")
             with Vertical(id="inspector"):
-                yield Label("Telemetry", id="telemetry_title")
-                yield DataTable(id="telemetry_table")
-                yield Label("Heartbeat", id="heartbeat_title")
-                yield DataTable(id="heartbeat_table")
-                yield Label("Capabilities", id="cap_title")
-                yield DataTable(id="members_table")
-                yield Static("Enter: invoke/get | e: set | R: refresh", id="cap_help")
-                yield Label("Driver process", id="driver_title")
-                yield DataTable(id="driver_table")
-                yield Label("Process", id="process_title")
-                yield DataTable(id="process_table")
-        yield Label("Last errors", id="errors_title")
-        yield DataTable(id="errors_table")
+                yield Label("No resource selected", id="selected_resource_title")
+                with Horizontal(id="action_strip"):
+                    yield Button("Start (s)", id="action_start", variant="success")
+                    yield Button("Stop (x)", id="action_stop", variant="error")
+                    yield Button("Restart (r)", id="action_restart")
+                    yield Button("Connect (c)", id="action_connect")
+                    yield Button("Disconnect (d)", id="action_disconnect")
+                    yield Button("Recover (v)", id="action_recover")
+                with TabbedContent(initial="overview", id="inspector_tabs"):
+                    with TabPane("Overview (1)", id="overview"):
+                        with Vertical(id="overview_tables"):
+                            yield Label("Heartbeat", id="heartbeat_title")
+                            yield DataTable(id="heartbeat_table")
+                            yield Label("Runtime", id="driver_title")
+                            yield DataTable(id="driver_table")
+                            yield Label("Process", id="process_title")
+                            yield DataTable(id="process_table")
+                    with TabPane("Telemetry (2)", id="telemetry"):
+                        yield Static("", id="telemetry_empty")
+                        yield DataTable(id="telemetry_table")
+                    with TabPane("Commands (3)", id="commands"):
+                        yield DataTable(id="members_table")
+                        yield Static("Enter: invoke/get | e: set | R: refresh", id="cap_help")
+                    with TabPane("Config (4)", id="config"):
+                        yield DataTable(id="config_table")
+        yield Static(
+            "▼ Activity — press a to open · no unread alerts",
+            id="activity_summary",
+        )
+        with Vertical(id="activity_drawer"):
+            with TabbedContent(initial="errors", id="activity_tabs"):
+                with TabPane("Errors", id="errors"):
+                    yield DataTable(id="errors_table")
+                with TabPane("Event log", id="events"):
+                    yield RichLog(id="event_log", max_lines=self._event_log_max_lines)
         with Horizontal(id="status_row"):
-            yield Static("Streaming: ON", id="streaming_status")
+            yield Static("Streaming: ON (t)", id="streaming_status")
             yield Static("Dropped: 0", id="dropped_status")
             yield Static(self._backend_status_text, id="backend_status")
-        yield RichLog(id="event_log", max_lines=self._event_log_max_lines)
         yield Footer()
 
     def on_mount(self) -> None:
@@ -314,9 +493,15 @@ class ManagerTUI(App):
             daemon=True,
         )
         self._rpc_worker_handle.start()
+        self._bg_rpc_worker_handle = threading.Thread(
+            target=self._bg_rpc_worker_loop,
+            name="tui-background-rpc-worker",
+            daemon=True,
+        )
+        self._bg_rpc_worker_handle.start()
         self._setup_tables()
         # Bootstrap the log tail off the UI thread (blocking RPC).
-        self._rpc_submit(
+        self._background_rpc_submit(
             {
                 "type": "manager.logs.tail",
                 "params": {"limit": self._log_tail_bootstrap_limit},
@@ -327,15 +512,23 @@ class ManagerTUI(App):
         self.set_interval(0.2, self._drain_pub_queue)
         self._pub_thread_handle = threading.Thread(target=self._pub_thread, daemon=True)
         self._pub_thread_handle.start()
+        self._apply_responsive_layout(self.size.width)
+        # The resource list is the operator's starting point; search is entered
+        # deliberately with `/` rather than taking the initial text focus.
+        self.call_later(self.action_focus_navigator)
 
     def on_unmount(self) -> None:
         self._stop_event.set()
         self._sub_reconnect_event.set()
         # Stop the RPC worker (it owns and closes the socket).
         self._rpc_req_q.put(None)
+        self._bg_rpc_req_q.put(None)
         rpc_thread = self._rpc_worker_handle
         if rpc_thread is not None:
             rpc_thread.join(timeout=1.5)
+        bg_rpc_thread = self._bg_rpc_worker_handle
+        if bg_rpc_thread is not None:
+            bg_rpc_thread.join(timeout=1.5)
         thread = self._pub_thread_handle
         if thread is not None:
             thread.join(timeout=1.5)
@@ -343,8 +536,18 @@ class ManagerTUI(App):
             self._rpc.close(0)
         except Exception:
             pass
+        try:
+            self._bg_rpc.close(0)
+        except Exception:
+            pass
 
     def _setup_tables(self) -> None:
+        resources = self.query_one("#resources_table", DataTable)
+        for key, label in _RESOURCE_COLUMNS:
+            self._resource_column_keys[key] = resources.add_column(label, key=key)
+        resources.cursor_type = "row"
+        self._update_resource_sort_headers()
+
         devices = self.query_one("#devices_table", DataTable)
         devices.add_columns(
             "device_id",
@@ -382,6 +585,9 @@ class ManagerTUI(App):
 
         process = self.query_one("#process_table", DataTable)
         process.add_columns("field", "value")
+
+        config = self.query_one("#config_table", DataTable)
+        config.add_columns("setting", "value")
 
         errors = self.query_one("#errors_table", DataTable)
         errors.add_columns("time", "sev", "source", "id", "message")
@@ -462,6 +668,22 @@ class ManagerTUI(App):
         else:
             self._rpc_req_q.put(self._do_reset_rpc_socket)
 
+    def _do_reset_bg_rpc_socket(self) -> None:
+        try:
+            self._bg_rpc.close(0)
+        except Exception:
+            pass
+        self._bg_rpc = self._new_rpc_socket()
+
+    def _reset_bg_rpc_socket(self) -> None:
+        if (
+            self._bg_rpc_worker_ident is not None
+            and threading.get_ident() == self._bg_rpc_worker_ident
+        ):
+            self._do_reset_bg_rpc_socket()
+        else:
+            self._bg_rpc_req_q.put(self._do_reset_bg_rpc_socket)
+
     def _new_sub_socket(self) -> zmq.Socket:
         sub = self._ctx.socket(zmq.SUB)
         sub.setsockopt(zmq.SUBSCRIBE, b"manager.")
@@ -495,6 +717,8 @@ class ManagerTUI(App):
             self.query_one("#backend_status", Static).update(text)
         except Exception:
             pass
+        if hasattr(self, "_resource_views"):
+            self._update_health_summary(list(self._resource_views.values()))
 
     def _next_request_id(self) -> str:
         self._rpc_seq += 1
@@ -940,7 +1164,9 @@ class ManagerTUI(App):
             if on_done is not None:
                 on_done(ok)
 
-        self._rpc_submit(self._command_payload(device_id, "capabilities", {}), _after)
+        self._background_rpc_submit(
+            self._command_payload(device_id, "capabilities", {}), _after
+        )
 
     def _get_member_spec(self, device_id: str, name: str) -> dict[str, Any] | None:
         members = self._members_last.get(device_id, [])
@@ -1003,8 +1229,11 @@ class ManagerTUI(App):
             if on_done is not None:
                 on_done(ok)
 
-        self._process_rpc_submit(
-            process_id, {"type": "process.capabilities", "params": {}}, _after
+        self._background_rpc_submit(
+            self._process_rpc_payload(
+                process_id, {"type": "process.capabilities", "params": {}}
+            ),
+            _after,
         )
 
     def _get_process_member_spec(
@@ -1038,7 +1267,9 @@ class ManagerTUI(App):
 
         def _after_devices(dev_resp: Json | None) -> None:
             pending["devices"] = dev_resp
-            self._rpc_submit({"type": "manager.processes.list"}, _after_procs)
+            self._background_rpc_submit(
+                {"type": "manager.processes.list"}, _after_procs
+            )
 
         def _after_procs(proc_resp: Json | None) -> None:
             try:
@@ -1046,7 +1277,7 @@ class ManagerTUI(App):
             finally:
                 self._snapshot_refresh_inflight = False
 
-        self._rpc_submit({"type": "device.list_status"}, _after_devices)
+        self._background_rpc_submit({"type": "device.list_status"}, _after_devices)
 
     def _apply_snapshot(
         self, resp: Json | None, proc_resp: Json | None
@@ -1090,6 +1321,9 @@ class ManagerTUI(App):
                         is_remote=bool(item.get("is_remote"))
                         or str(item.get("source_kind", "")).strip().lower()
                         == "federated",
+                        owner_peer_id=str(item.get("owner_peer_id"))
+                        if item.get("owner_peer_id")
+                        else None,
                     )
                     next_status[status.device_id] = status
                     prev = old_status.get(status.device_id)
@@ -1117,6 +1351,7 @@ class ManagerTUI(App):
                         prev_pid = prev_proc.get("pid")
                         next_pid = proc.get("pid")
                         if prev_pid != next_pid:
+                            self._process_telemetry_cache.pop(pid, None)
                             self._proc_cap_cache.pop(pid, None)
                             self._proc_members_last.pop(pid, None)
                             self._proc_cap_render_attempt_mono.pop(pid, None)
@@ -1139,10 +1374,319 @@ class ManagerTUI(App):
                 snapshot_changed = True
 
         if snapshot_changed:
-            self._render_devices_table()
-            self._render_processes_table()
+            if hasattr(self, "_resource_views"):
+                self._render_resources_table()
+            else:
+                # Compatibility for lightweight unit-test harnesses which
+                # construct the app without running its initializer.
+                self._render_devices_table()
+                self._render_processes_table()
             self._mark_inspector_dirty()
             self._render_inspector_if_needed(force=True)
+
+    @staticmethod
+    def _device_health(status: DeviceStatus) -> str:
+        if str(status.driver_proc_state or "").upper() == "FAILED":
+            return "failed"
+        if str(status.liveness or "").upper() == "STALE":
+            return "stale"
+        if str(status.driver_proc_state or "").upper() in {"STARTING", "STOPPING"}:
+            return "transition"
+        if str(status.liveness or "").upper() == "ONLINE":
+            return "healthy"
+        return "neutral"
+
+    @staticmethod
+    def _process_health(proc: Json) -> str:
+        state = str(proc.get("state", "")).upper()
+        if state in {"FAILED", "CRASHLOOP"}:
+            return "failed"
+        if state in {"STARTING", "STOPPING"}:
+            return "transition"
+        if state == "RUNNING":
+            return "healthy"
+        return "neutral"
+
+    @staticmethod
+    def _device_connection(status: DeviceStatus) -> str:
+        liveness = str(status.liveness or "").upper().rsplit(".", 1)[-1]
+        if liveness == "ONLINE":
+            return "connected"
+        if liveness == "DISCONNECTED":
+            return "disconnected"
+        if liveness == "STALE":
+            return "stale"
+        if liveness == "OFFLINE":
+            return "offline"
+        device_state = str(status.device_state or "").upper().rsplit(".", 1)[-1]
+        if device_state == "DISCONNECTED":
+            return "disconnected"
+        return "unknown"
+
+    @staticmethod
+    def _connection_cell(connection: str | None) -> Text | str:
+        if connection == "connected":
+            return Text("● connected", style="green")
+        if connection == "disconnected":
+            return Text("○ disconnected", style="dim")
+        if connection in {"stale", "unknown"}:
+            return Text(f"◐ {connection}", style="yellow")
+        if connection == "offline":
+            return Text("— offline", style="dim")
+        return "—"
+
+    @staticmethod
+    def _health_cell(health: str) -> Text:
+        styles = {
+            "healthy": "green",
+            "transition": "yellow",
+            "stale": "bold red",
+            "failed": "bold red",
+            "neutral": "dim",
+        }
+        return Text(health, style=styles.get(health, ""))
+
+    def _collect_resource_views(self) -> list[ResourceView]:
+        views: list[ResourceView] = []
+        for device_id in sorted(self._device_status):
+            status = self._device_status[device_id]
+            state_parts = [
+                part
+                for part in (status.driver_proc_state, status.driver_state)
+                if part
+            ]
+            views.append(
+                ResourceView(
+                    kind="device",
+                    resource_id=device_id,
+                    health=self._device_health(status),
+                    state="/".join(state_parts),
+                    age_s=status.hb_age_s,
+                    error=status.last_error or status.driver_last_error,
+                    connection=self._device_connection(status),
+                    is_remote=status.is_remote,
+                    owner_peer_id=status.owner_peer_id,
+                )
+            )
+        for proc in self._processes:
+            process_id = str(proc.get("process_id", ""))
+            if not process_id:
+                continue
+            is_remote = bool(proc.get("is_remote")) or (
+                str(proc.get("source_kind", "")).strip().lower() == "federated"
+            )
+            age = proc.get("hb_age_s")
+            views.append(
+                ResourceView(
+                    kind="process",
+                    resource_id=process_id,
+                    health=self._process_health(proc),
+                    state=str(proc.get("state", "")),
+                    age_s=float(age) if isinstance(age, (int, float)) else None,
+                    error=str(proc.get("last_error")) if proc.get("last_error") else None,
+                    connection=None,
+                    is_remote=is_remote,
+                    owner_peer_id=str(proc.get("owner_peer_id"))
+                    if proc.get("owner_peer_id")
+                    else None,
+                )
+            )
+        return views
+
+    @staticmethod
+    def _resource_sort_value(
+        view: ResourceView, column: ResourceSortColumn
+    ) -> str | float | None:
+        if column == "kind":
+            return view.kind
+        if column == "resource":
+            return view.resource_id.casefold()
+        if column == "connection":
+            return view.connection.casefold() if view.connection else None
+        if column == "health":
+            return view.health.casefold()
+        if column == "runtime":
+            return view.state.casefold() if view.state else None
+        if column == "age_s":
+            return view.age_s
+        return view.error.casefold() if view.error else None
+
+    def _sort_resource_views(self, views: list[ResourceView]) -> list[ResourceView]:
+        """Sort mixed resources while keeping empty cells at the end."""
+        column = self._resource_sort_column
+        populated: list[tuple[ResourceView, str | float]] = []
+        empty: list[ResourceView] = []
+        for view in views:
+            value = self._resource_sort_value(view, column)
+            if value is None or value == "":
+                empty.append(view)
+            else:
+                populated.append((view, value))
+
+        # Start from a deterministic resource-name order so equal primary values
+        # do not jump around as live status updates arrive.
+        populated.sort(key=lambda item: (item[0].resource_id.casefold(), item[0].kind))
+        populated.sort(key=lambda item: item[1], reverse=self._resource_sort_reverse)
+        empty.sort(key=lambda view: (view.resource_id.casefold(), view.kind))
+        return [view for view, _ in populated] + empty
+
+    def _update_resource_sort_headers(self) -> None:
+        try:
+            table = self.query_one("#resources_table", DataTable)
+            for key, label in _RESOURCE_COLUMNS:
+                marker = " ▼" if self._resource_sort_reverse else " ▲"
+                column = table.columns[self._resource_column_keys[key]]
+                column.label = Text(
+                    f"{label}{marker if key == self._resource_sort_column else ''}"
+                )
+                # Textual only measures auto-width columns when cells change.
+                # Reserve enough header space here, otherwise an indicator wider
+                # than every cell is clipped (for example ``kind ▲``).
+                column.content_width = max(column.content_width, column.label.cell_len)
+            table.refresh(layout=True)
+        except Exception:
+            pass
+
+    def _set_resource_sort(self, column: ResourceSortColumn) -> None:
+        if column == self._resource_sort_column:
+            self._resource_sort_reverse = not self._resource_sort_reverse
+        else:
+            self._resource_sort_column = column
+            self._resource_sort_reverse = False
+        self._resource_order = []
+        self._update_resource_sort_headers()
+        self._render_resources_table(preserve_scroll=False)
+
+    def _visible_resource_views(self) -> list[ResourceView]:
+        query = self._resource_filter.strip().lower()
+        return self._sort_resource_views(
+            [
+                view
+                for view in self._collect_resource_views()
+                if (not self._unhealthy_only or view.health in {"failed", "stale"})
+                and (not query or query in view.searchable_text)
+            ]
+        )
+
+    def _update_health_summary(self, all_views: list[ResourceView]) -> None:
+        unhealthy = sum(v.health in {"failed", "stale"} for v in all_views)
+        healthy = sum(v.health == "healthy" for v in all_views)
+        remote = sum(v.is_remote for v in all_views)
+        filter_text = " · problems only" if self._unhealthy_only else ""
+        summary = (
+            f"{self._backend_status_text} · {len(all_views)} resources · "
+            f"{healthy} healthy · {unhealthy} problems · {remote} remote{filter_text}"
+        )
+        try:
+            self.query_one("#health_summary", Static).update(summary)
+        except Exception:
+            pass
+
+    def _restore_resource_scroll(self, scroll_x: float, scroll_y: float) -> None:
+        table = self.query_one("#resources_table", DataTable)
+        table.scroll_x = min(scroll_x, table.max_scroll_x)
+        table.scroll_y = min(scroll_y, table.max_scroll_y)
+        table.scroll_target_x = table.scroll_x
+        table.scroll_target_y = table.scroll_y
+
+    def _render_resources_table(self, *, preserve_scroll: bool = True) -> None:
+        table = self.query_one("#resources_table", DataTable)
+        scroll_x = table.scroll_x
+        scroll_y = table.scroll_y
+        all_views = self._collect_resource_views()
+        self._resource_views = {view.key: view for view in all_views}
+        views = self._sort_resource_views(
+            [
+                view
+                for view in all_views
+                if (not self._unhealthy_only or view.health in {"failed", "stale"})
+                and (
+                    not self._resource_filter.strip()
+                    or self._resource_filter.strip().lower() in view.searchable_text
+                )
+            ]
+        )
+        next_order = [view.key for view in views]
+        # A filter handler deliberately invalidates ``_resource_order`` to
+        # force a rebuild.  When it produces no rows both lists are empty,
+        # so also consult the mounted table; otherwise stale rows remain
+        # visible after filtering an all-healthy stack to "Problems only".
+        order_changed = next_order != self._resource_order or (not next_order and table.row_count > 0)
+        if order_changed:
+            table.clear()
+            self._resource_rows.clear()
+            for view in views:
+                label = f"⇄ {view.resource_id}" if view.is_remote else view.resource_id
+                row = (
+                    "dev" if view.kind == "device" else "proc",
+                    label,
+                    view.connection or "",
+                    view.health,
+                    view.state,
+                    f"{view.age_s:.1f}" if view.age_s is not None else "",
+                    (view.error or "")[:40],
+                )
+                table.add_row(
+                    row[0],
+                    row[1],
+                    self._connection_cell(row[2]),
+                    self._health_cell(row[3]),
+                    *row[4:],
+                    key=view.key,
+                )
+                self._resource_rows[view.key] = row
+            self._resource_order = next_order
+        else:
+            columns = (
+                "kind",
+                "resource",
+                "connection",
+                "health",
+                "runtime",
+                "age_s",
+                "error",
+            )
+            for view in views:
+                label = f"⇄ {view.resource_id}" if view.is_remote else view.resource_id
+                row = (
+                    "dev" if view.kind == "device" else "proc",
+                    label,
+                    view.connection or "",
+                    view.health,
+                    view.state,
+                    f"{view.age_s:.1f}" if view.age_s is not None else "",
+                    (view.error or "")[:40],
+                )
+                previous = self._resource_rows.get(view.key)
+                if previous != row:
+                    for index, (column, value) in enumerate(zip(columns, row, strict=True)):
+                        if previous is None or previous[index] != value:
+                            if column == "health":
+                                cell: str | Text = self._health_cell(value)
+                            elif column == "connection":
+                                cell = self._connection_cell(value)
+                            else:
+                                cell = value
+                            table.update_cell(view.key, column, cell)
+                    self._resource_rows[view.key] = row
+
+        if self._selected_resource_key not in next_order:
+            self._selected_resource_key = next_order[0] if next_order else None
+            selected = self._resource_views.get(self._selected_resource_key or "")
+            if selected is not None and selected.kind == "device":
+                self._selected_device_id = selected.resource_id
+                self._inspector_mode = "device"
+                self._members_source = "device"
+            elif selected is not None:
+                self._selected_process_id = selected.resource_id
+                self._inspector_mode = "process"
+                self._members_source = "process"
+        if self._selected_resource_key in next_order:
+            table.move_cursor(row=next_order.index(self._selected_resource_key), column=0)
+        if preserve_scroll and order_changed:
+            self.call_after_refresh(self._restore_resource_scroll, scroll_x, scroll_y)
+        self._update_health_summary(all_views)
+        self._refresh_selected_resource_chrome()
 
     def _prune_device_caches(self, *, active_device_ids: set[str]) -> None:
         stale_telemetry = set(self._telemetry_cache) - active_device_ids
@@ -1172,7 +1716,19 @@ class ManagerTUI(App):
         for key in stale_member_fingerprints:
             self._members_rendered_fingerprint.pop(key, None)
 
+        config_cache = getattr(self, "_config_cache", {})
+        config_errors = getattr(self, "_config_errors", {})
+        for key in list(config_cache):
+            if key.startswith("device:") and key.split(":", 1)[1] not in active_device_ids:
+                config_cache.pop(key, None)
+                config_errors.pop(key, None)
+
     def _prune_process_caches(self, *, active_process_ids: set[str]) -> None:
+        process_telemetry = getattr(self, "_process_telemetry_cache", {})
+        stale_telemetry = set(process_telemetry) - active_process_ids
+        for process_id in stale_telemetry:
+            process_telemetry.pop(process_id, None)
+
         stale_proc_caps = set(self._proc_cap_cache) - active_process_ids
         for process_id in stale_proc_caps:
             self._proc_cap_cache.pop(process_id, None)
@@ -1191,6 +1747,13 @@ class ManagerTUI(App):
         ]
         for key in stale_member_fingerprints:
             self._members_rendered_fingerprint.pop(key, None)
+
+        config_cache = getattr(self, "_config_cache", {})
+        config_errors = getattr(self, "_config_errors", {})
+        for key in list(config_cache):
+            if key.startswith("process:") and key.split(":", 1)[1] not in active_process_ids:
+                config_cache.pop(key, None)
+                config_errors.pop(key, None)
 
     def _render_devices_table(self) -> None:
         devices = self.query_one("#devices_table", DataTable)
@@ -1408,14 +1971,20 @@ class ManagerTUI(App):
         self._render_inspector()
 
     def _render_inspector(self) -> None:
+        self.query_one("#process_table", DataTable).clear()
         if self._members_source == "process":
             self._render_process_inspector()
         else:
             self._render_device_inspector()
         self._render_members_table()
-
-        process_table = self.query_one("#process_table", DataTable)
-        process_table.clear()
+        telemetry = self.query_one("#telemetry_table", DataTable)
+        empty = self.query_one("#telemetry_empty", Static)
+        if telemetry.row_count:
+            empty.display = False
+        else:
+            noun = "process" if self._members_source == "process" else "device"
+            empty.update(f"No {noun} telemetry published")
+            empty.display = True
 
     def _render_device_inspector(self) -> None:
         device_id = self._selected_device_id
@@ -1457,6 +2026,8 @@ class ManagerTUI(App):
 
         driver = self.query_one("#driver_table", DataTable)
         driver.clear()
+        details = self.query_one("#process_table", DataTable)
+        self.query_one("#process_title", Label).update("Connection")
         if device_id:
             status = self._device_status.get(device_id)
             if status:
@@ -1467,6 +2038,18 @@ class ManagerTUI(App):
                     str(status.driver_last_exit_code or ""),
                     (status.driver_last_error or "")[:40],
                 )
+                for field, value in (
+                    ("connection", self._device_connection(status)),
+                    ("registered", status.registered),
+                    ("reachable", status.device_reachable),
+                    ("liveness", status.liveness),
+                    ("heartbeat_age_s", status.hb_age_s),
+                    ("telemetry_age_s", status.telemetry_age_s),
+                    ("source", "federated" if status.is_remote else "local"),
+                    ("owner_peer", status.owner_peer_id),
+                ):
+                    if value is not None:
+                        details.add_row(field, str(value))
 
     def _render_process_inspector(self) -> None:
         process_id = self._selected_process_id
@@ -1476,6 +2059,8 @@ class ManagerTUI(App):
         heartbeat.clear()
         driver = self.query_one("#driver_table", DataTable)
         driver.clear()
+        details = self.query_one("#process_table", DataTable)
+        self.query_one("#process_title", Label).update("Process")
 
         if not process_id:
             return
@@ -1495,6 +2080,23 @@ class ManagerTUI(App):
             str(selected.get("last_exit_code", "") or ""),
             str(selected.get("last_error", "") or "")[:40],
         )
+
+        for key in (
+            "registered",
+            "rpc_endpoint",
+            "process_data_endpoint",
+            "popen_pid",
+            "heartbeat_pid",
+            "rss_bytes",
+            "hb_age_s",
+            "last_error_kind",
+            "exit_code_description",
+            "source_kind",
+            "owner_peer_id",
+        ):
+            value = selected.get(key)
+            if value not in (None, ""):
+                details.add_row(key, str(value)[:120])
 
         hb_age = ""
         last_hb_t_mono = selected.get("last_hb_t_mono")
@@ -1516,25 +2118,22 @@ class ManagerTUI(App):
                 str(heartbeat_endpoint or ""),
             )
 
-        primary_keys = {
-            "state",
-            "pid",
-            "restart_count",
-            "last_exit_code",
-            "last_error",
-        }
-        telemetry_keys = ["process_id"] + sorted(
-            [k for k in selected.keys() if k not in primary_keys and k != "process_id"]
-        )
-        for key in telemetry_keys:
-            value = selected.get(key, "")
-            if isinstance(value, (dict, list)):
-                text = json.dumps(value)
-            else:
-                text = str(value)
-            if len(text) > 120:
-                text = text[:117] + "..."
-            telemetry.add_row(key, text)
+        for name, entry in self._process_telemetry_cache.get(process_id, {}).items():
+            if not isinstance(entry, dict):
+                continue
+            ts = entry.get("ts", {})
+            age = None
+            if isinstance(ts, dict) and "t_mono_recv" in ts:
+                age = max(0.0, time.monotonic() - float(ts["t_mono_recv"]))
+            elif isinstance(ts, dict) and "t_mono" in ts:
+                age = max(0.0, time.monotonic() - float(ts["t_mono"]))
+            telemetry.add_row(
+                name,
+                str(entry.get("value")),
+                str(entry.get("units", "")),
+                str(entry.get("quality", "")),
+                f"{age:.1f}" if age is not None else "",
+            )
 
     @staticmethod
     def _members_render_fingerprint(members_render: list[dict[str, Any]]) -> int:
@@ -1756,6 +2355,7 @@ class ManagerTUI(App):
                 str(entry.get("source", "")),
                 str(entry.get("id", "")),
                 message,
+                key=str(entry.get("fingerprint", "")) or None,
             )
 
     def _toast_once(
@@ -1814,7 +2414,13 @@ class ManagerTUI(App):
             }
         )
         self._errors_rev += 1
-        if render:
+        if hasattr(self, "_activity_open") and not self._activity_open:
+            if severity in {"error", "critical"}:
+                self._activity_unread_error += 1
+            else:
+                self._activity_unread_warning += 1
+            self._update_activity_summary()
+        if render and getattr(self, "_activity_open", True):
             self._render_errors_table()
 
     def _record_action_error(self, *, source: str, id_: str, message: str) -> None:
@@ -1966,6 +2572,18 @@ class ManagerTUI(App):
             self._sub = None
 
     def _enqueue_pub_message(self, topic: str, payload: Json) -> None:
+        if topic in {
+            "manager.telemetry_update",
+            "manager.heartbeat",
+            "manager.process_telemetry_update",
+        }:
+            key = self._state_message_key(topic, payload)
+            if key is not None:
+                with self._state_lock:
+                    if key in self._latest_state_messages:
+                        self._coalesced_pub_messages += 1
+                    self._latest_state_messages[key] = (topic, payload)
+                return
         try:
             self._pub_queue.put_nowait((topic, payload))
             return
@@ -1992,23 +2610,42 @@ class ManagerTUI(App):
 
         self._dropped_pub_messages += 1
 
+    @staticmethod
+    def _state_message_key(topic: str, payload: Json) -> tuple[str, str] | None:
+        resource_id = str(payload.get("device_id") or payload.get("process_id") or "")
+        if not resource_id:
+            return None
+        if topic == "manager.chunk_ready":
+            stream = str(payload.get("stream") or "")
+            return (topic, f"{resource_id}:{stream}")
+        return (topic, resource_id)
+
     def _drain_pub_queue(self) -> None:
         if not self.streaming_enabled:
             return
 
+        slice_started = time.perf_counter()
+        deadline = slice_started + self._pub_drain_budget_s
         log = self.query_one("#event_log", RichLog)
         errors_dirty = False
         with self._chunk_lock:
             cached = list(self._chunk_cache.values())
             self._chunk_cache.clear()
-        for topic, payload in cached:
-            self._enqueue_pub_message(topic, payload)
+        with self._state_lock:
+            latest = list(self._latest_state_messages.values())
+            self._latest_state_messages.clear()
+        pending_state = cached + latest
 
-        for _ in range(self._pub_drain_max):
-            try:
-                topic, payload = self._pub_queue.get_nowait()
-            except queue.Empty:
-                break
+        processed = 0
+        while processed < self._pub_drain_max:
+            if pending_state:
+                topic, payload = pending_state.pop()
+            else:
+                try:
+                    topic, payload = self._pub_queue.get_nowait()
+                except queue.Empty:
+                    break
+            processed += 1
 
             prev_hb: Json | None = None
 
@@ -2022,6 +2659,32 @@ class ManagerTUI(App):
                     self._telemetry_cache[device_id] = signals
                     if device_id == self._selected_device_id:
                         self._mark_inspector_dirty()
+            elif topic == "manager.process_telemetry_update":
+                process_raw = payload.get("process_id")
+                if process_raw is None:
+                    continue
+                process_id = str(process_raw)
+                signals = payload.get("signals", {})
+                if isinstance(signals, dict):
+                    process_cache = self._process_telemetry_cache.setdefault(
+                        process_id, {}
+                    )
+                    process_cache.update(signals)
+                    if process_id == self._selected_process_id:
+                        self._mark_inspector_dirty()
+            elif topic == "manager.device_config":
+                device_id = str(payload.get("device_id", ""))
+                config_key = f"device:{device_id}"
+                display_config = payload.get("display_config")
+                if device_id and isinstance(display_config, dict):
+                    config = redact_config(display_config)
+                    connect_check = payload.get("connect_check")
+                    if isinstance(connect_check, dict):
+                        config["connect_check"] = redact_config(connect_check)
+                    self._config_cache[config_key] = config
+                    self._config_errors.pop(config_key, None)
+                    if config_key == self._selected_resource_key:
+                        self._render_config_table()
             elif topic == "manager.heartbeat":
                 device_raw = payload.get("device_id")
                 if device_raw is None:
@@ -2056,21 +2719,42 @@ class ManagerTUI(App):
             if self._topic_enabled_for_event_log(topic, payload):
                 try:
                     if topic == "manager.log":
-                        log.write(self._format_manager_log_event_line(payload))
+                        line = self._format_manager_log_event_line(payload)
+                    elif topic == "manager.device_config":
+                        line = (
+                            "manager.device_config "
+                            f"device_id={payload.get('device_id', '')} "
+                            f"revision={payload.get('metadata_revision', '')}"
+                        )
                     else:
                         try:
                             payload_text = json.dumps(payload)
                         except Exception:
                             payload_text = str(payload)
-                        log.write(f"{topic} {payload_text[:200]}")
+                        line = f"{topic} {payload_text[:200]}"
+                    self._event_lines.append(line)
+                    if self._activity_open:
+                        log.write(line)
                 except Exception:
                     self._bump_error("log.write")
-        if errors_dirty:
+            if time.perf_counter() >= deadline:
+                break
+        if pending_state:
+            with self._state_lock:
+                for topic, payload in pending_state:
+                    key = self._state_message_key(topic, payload)
+                    if key is not None:
+                        self._latest_state_messages[key] = (topic, payload)
+        if errors_dirty and self._activity_open:
             self._render_errors_table()
         dropped = self.query_one("#dropped_status", Static)
         dropped.update(f"Dropped: {self._dropped_pub_messages}")
 
         self._render_inspector_if_needed()
+        elapsed = time.perf_counter() - slice_started
+        self._max_drain_slice_s = max(self._max_drain_slice_s, elapsed)
+        if not self._pub_queue.empty() or self._latest_state_messages:
+            self.call_later(self._drain_pub_queue)
 
     def _notify_rpc_result(
         self, action: str, device_id: str, resp: Json | None
@@ -2115,6 +2799,7 @@ class ManagerTUI(App):
         label: str,
         summary_label: str,
         error_log_prefix: str | None = None,
+        skipped_count: int = 0,
     ) -> None:
         """Run a sequence of blocking _rpc_calls on a worker thread.
 
@@ -2171,7 +2856,7 @@ class ManagerTUI(App):
                 # Error record (drives the errors-table view).
                 self.call_from_thread(
                     self._record_action_error,
-                    source="device" if label.startswith("Driver") else "process",
+                    source="device" if "device_id" in payload else "process",
                     id_=item_id,
                     message=f"{label} failed: {item_id} ({err_text})",
                 )
@@ -2182,10 +2867,10 @@ class ManagerTUI(App):
                     )
         # Final aggregated summary so operators see the total even if
         # they missed the per-item toasts.
-        self.call_from_thread(
-            self.notify,
-            f"{summary_label}: {ok_count} ok, {fail_count} failed",
-        )
+        summary = f"{summary_label}: {ok_count} ok, {fail_count} failed"
+        if skipped_count:
+            summary += f", {skipped_count} skipped"
+        self.call_from_thread(self.notify, summary)
 
     def _reconnect_backend(self) -> None:
         # Non-blocking. The socket reset and the identity probe are enqueued on
@@ -2194,6 +2879,7 @@ class ManagerTUI(App):
         self._set_backend_status("Backend: reconnecting")
         self._log_action_result("Reconnecting backend...")
         self._reset_rpc_socket()
+        self._reset_bg_rpc_socket()
         self._request_sub_reconnect()
 
         def _after(resp: Json | None) -> None:
@@ -2228,6 +2914,338 @@ class ManagerTUI(App):
             return json.dumps(result)
         except Exception:
             return str(result)
+
+    @staticmethod
+    def _format_result_pretty(result: Any) -> str:
+        try:
+            return json.dumps(result, indent=2, ensure_ascii=False, default=str)
+        except Exception:
+            return str(result)
+
+    def _show_command_result(self, title: str, result: Any) -> None:
+        if result is None:
+            return
+        self.push_screen(ResultScreen(title, self._format_result_pretty(result)))
+
+    @staticmethod
+    def _flatten_config(value: Any, prefix: str = "") -> list[tuple[str, str]]:
+        rows: list[tuple[str, str]] = []
+        if isinstance(value, dict):
+            for key in sorted(value, key=str):
+                path = f"{prefix}.{key}" if prefix else str(key)
+                rows.extend(ManagerTUI._flatten_config(value[key], path))
+        elif isinstance(value, list):
+            rows.append((prefix, json.dumps(value, ensure_ascii=False, default=str)))
+        elif value is not None:
+            rows.append((prefix, str(value)))
+        return rows
+
+    def _ensure_selected_config(self) -> None:
+        key = self._selected_resource_key
+        if not key or key in self._config_cache or key in self._config_fetch_inflight:
+            return
+        kind, resource_id = key.split(":", 1)
+        if kind == "device":
+            payload = {
+                "type": "device.config.get",
+                "device_id": resource_id,
+                "redact_sensitive": True,
+            }
+        else:
+            payload = {
+                "type": "manager.processes.config.get",
+                "process_id": resource_id,
+            }
+        self._config_fetch_inflight.add(key)
+
+        def _after(resp: Json | None) -> None:
+            self._config_fetch_inflight.discard(key)
+            if resp and resp.get("ok") and isinstance(resp.get("result"), dict):
+                result = redact_config(dict(resp["result"]))
+                result.pop("yaml_text", None)
+                if kind == "device":
+                    result = {
+                        name: result[name]
+                        for name in ("driver", "init_kwargs", "connect_check")
+                        if name in result
+                    }
+                self._config_cache[key] = result
+                self._config_errors.pop(key, None)
+            else:
+                error = resp.get("error") if isinstance(resp, dict) else "unavailable"
+                if isinstance(error, dict):
+                    error = error.get("message") or error.get("code") or "unavailable"
+                self._config_errors[key] = str(error)
+            if self._selected_resource_key == key:
+                self._render_config_table()
+
+        self._background_rpc_submit(payload, _after)
+
+    def _render_config_table(self) -> None:
+        table = self.query_one("#config_table", DataTable)
+        table.clear()
+        key = self._selected_resource_key
+        if not key:
+            return
+        config = self._config_cache.get(key)
+        if config is None:
+            message = self._config_errors.get(key, "Loading configuration...")
+            table.add_row("status", message)
+            return
+        rows = self._flatten_config(config)
+        if not rows:
+            table.add_row("status", "No configuration exposed")
+            return
+        for setting, value in rows:
+            table.add_row(setting, value[:240])
+
+    def _select_resource_key(self, key: str, *, user: bool = True) -> None:
+        view = self._resource_views.get(key)
+        if view is None:
+            return
+        self._selected_resource_key = key
+        if view.kind == "device":
+            self._selected_device_id = view.resource_id
+            if user:
+                self._has_user_selection = True
+            self._set_inspector_mode("device")
+        else:
+            self._selected_process_id = view.resource_id
+            if user:
+                self._has_user_process_selection = True
+            self._set_inspector_mode("process")
+        self._refresh_selected_resource_chrome()
+        self._ensure_selected_config()
+        self._render_config_table()
+        self._mark_inspector_dirty()
+        self._render_inspector_if_needed(force=True)
+
+    def _refresh_selected_resource_chrome(self) -> None:
+        view = self._resource_views.get(self._selected_resource_key or "")
+        title = "No resource selected"
+        if view is not None:
+            remote = f" · remote:{view.owner_peer_id or 'peer'}" if view.is_remote else ""
+            title = (
+                f"{view.kind.title()} · {view.resource_id} · {view.health}"
+                f" · {view.state or 'unknown'}{remote}"
+            )
+        try:
+            self.query_one("#selected_resource_title", Label).update(title)
+        except Exception:
+            pass
+
+        enabled_actions: set[str] = set()
+        if view is not None and view.kind == "device":
+            status = self._device_status.get(view.resource_id)
+            enabled_actions = self._device_enabled_actions(status)
+        elif view is not None:
+            proc = self._get_process_record(view.resource_id)
+            if self._status_process_stopped(proc):
+                enabled_actions.add("start")
+            else:
+                enabled_actions.add("stop")
+            if proc is not None:
+                enabled_actions.add("restart")
+
+        pending = bool(
+            self._selected_resource_key
+            and self._selected_resource_key in self._pending_resource_actions
+        )
+        for action in ("start", "stop", "restart", "connect", "disconnect", "recover"):
+            try:
+                self.query_one(f"#action_{action}", Button).disabled = (
+                    action not in enabled_actions or pending
+                )
+            except Exception:
+                pass
+
+    def _device_enabled_actions(self, status: DeviceStatus | None) -> set[str]:
+        if status is None:
+            return set()
+        enabled: set[str] = set()
+        connection = self._device_connection(status)
+        if not status.is_remote:
+            if self._status_driver_stopped(status):
+                enabled.add("start")
+            else:
+                enabled.update({"stop", "restart"})
+        if status.is_remote or not self._status_driver_stopped(status):
+            if connection == "disconnected":
+                enabled.add("connect")
+            elif connection in {"connected", "stale"}:
+                enabled.add("disconnect")
+        if self._device_health(status) in {"failed", "stale"}:
+            enabled.add("recover")
+        return enabled
+
+    def _submit_resource_action(
+        self,
+        *,
+        resource_key: str,
+        payload: Json,
+        on_result: Callable[[Json | None], None] | None = None,
+    ) -> None:
+        if resource_key in self._pending_resource_actions:
+            return
+        self._pending_resource_actions.add(resource_key)
+        self._refresh_selected_resource_chrome()
+
+        def _after(resp: Json | None) -> None:
+            self._pending_resource_actions.discard(resource_key)
+            self._refresh_selected_resource_chrome()
+            if on_result is not None:
+                on_result(resp)
+
+        self._rpc_submit(payload, _after)
+
+    def _bg_rpc_worker_loop(self) -> None:
+        """Own the polling/capability DEALER independently from actions."""
+        self._bg_rpc_worker_ident = threading.get_ident()
+        while True:
+            job = self._bg_rpc_req_q.get()
+            if job is None:
+                break
+            try:
+                job()
+            except Exception:
+                pass
+
+    def _background_do_rpc(self, payload: Json) -> Json | None:
+        try:
+            request = dict(payload)
+            expected_request_id = request.get("request_id")
+            if expected_request_id is None:
+                self._bg_rpc_seq += 1
+                expected_request_id = f"tui-bg-{self._bg_rpc_seq}"
+                request["request_id"] = expected_request_id
+            while self._bg_rpc.poll(0, zmq.POLLIN):
+                _ = self._bg_rpc.recv(zmq.NOBLOCK)
+            self._bg_rpc.send(json_dumps(request))
+            deadline = time.monotonic() + (self._rpc_timeout_ms / 1000.0)
+            while True:
+                remaining_s = deadline - time.monotonic()
+                if remaining_s <= 0:
+                    raise TimeoutError
+                if not self._bg_rpc.poll(
+                    int(max(1.0, remaining_s * 1000.0)), zmq.POLLIN
+                ):
+                    raise TimeoutError
+                raw = self._bg_rpc.recv()
+                resp = safe_json_loads(raw)
+                if not isinstance(resp, dict):
+                    continue
+                if (
+                    resp.get("request_id") is not None
+                    and resp.get("request_id") != expected_request_id
+                ):
+                    continue
+                self._set_backend_status("Backend: connected")
+                return resp
+        except Exception:
+            self._set_backend_status("Backend: unavailable")
+            self._do_reset_bg_rpc_socket()
+            return None
+
+    def _background_rpc_submit(
+        self,
+        payload: Json,
+        on_result: Callable[[Json | None], None] | None = None,
+    ) -> None:
+        def _job() -> None:
+            resp = self._background_do_rpc(payload)
+            if on_result is not None:
+                try:
+                    self.call_from_thread(on_result, resp)
+                except Exception:
+                    pass
+
+        self._bg_rpc_req_q.put(_job)
+
+    @on(DataTable.HeaderSelected, "#resources_table")
+    def _on_resource_header_selected(self, event: DataTable.HeaderSelected) -> None:
+        selected_key = self._row_key_str(event.column_key)
+        for column, _label in _RESOURCE_COLUMNS:
+            if column == selected_key:
+                self._set_resource_sort(column)
+                return
+
+    @on(DataTable.RowHighlighted, "#resources_table")
+    def _on_resource_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        self._select_resource_key(self._row_key_str(event.row_key), user=True)
+
+    @on(DataTable.RowSelected, "#resources_table")
+    def _on_resource_selected(self, event: DataTable.RowSelected) -> None:
+        self._select_resource_key(self._row_key_str(event.row_key), user=True)
+        if self._narrow_layout:
+            self._narrow_show_inspector = True
+            self._apply_responsive_layout(self.size.width)
+
+    @on(Input.Changed, "#resource_filter")
+    def _on_resource_filter_changed(self, event: Input.Changed) -> None:
+        self._resource_filter = event.value
+        self._resource_order = []
+        self._render_resources_table()
+
+    @on(Button.Pressed, "#action_strip Button")
+    def _on_action_button(self, event: Button.Pressed) -> None:
+        action_by_id = {
+            "action_start": self.action_driver_start,
+            "action_stop": self.action_driver_stop,
+            "action_restart": self.action_driver_restart,
+            "action_connect": self.action_device_connect,
+            "action_disconnect": self.action_device_disconnect,
+            "action_recover": self.action_device_recover,
+        }
+        action = action_by_id.get(str(event.button.id))
+        if action is not None:
+            action()
+
+    @on(DataTable.RowSelected, "#errors_table")
+    def _on_error_selected(self, event: DataTable.RowSelected) -> None:
+        table = self.query_one("#errors_table", DataTable)
+        try:
+            row = table.get_row(event.row_key)
+        except Exception:
+            return
+        if len(row) < 4:
+            return
+        source = str(row[2]).lower()
+        resource_id = str(row[3])
+        kind = "process" if source == "process" else "device"
+        key = f"{kind}:{resource_id}"
+        if key not in self._resource_views:
+            return
+        self._resource_filter = ""
+        self._unhealthy_only = False
+        try:
+            self.query_one("#resource_filter", Input).value = ""
+        except Exception:
+            pass
+        self._resource_order = []
+        self._render_resources_table()
+        self._select_resource_key(key)
+        self.action_inspector_overview()
+        if self._narrow_layout:
+            self._narrow_show_inspector = True
+            self._apply_responsive_layout(self.size.width)
+
+    def on_resize(self, event: events.Resize) -> None:
+        self._apply_responsive_layout(event.size.width)
+
+    def _apply_responsive_layout(self, width: int) -> None:
+        del width
+        # The navigator now uses the full terminal width above the inspector,
+        # so both regions remain useful even on narrow terminals.
+        self._narrow_layout = False
+        self._narrow_show_inspector = False
+        try:
+            self.screen.set_class(False, "-narrow")
+            navigator = self.query_one("#navigator", Vertical)
+            inspector = self.query_one("#inspector", Vertical)
+            navigator.display = True
+            inspector.display = True
+        except Exception:
+            pass
 
     @on(DataTable.RowSelected, "#devices_table")
     def _on_device_selected(self, event: DataTable.RowSelected) -> None:
@@ -2358,7 +3376,7 @@ class ManagerTUI(App):
     def action_toggle_streaming(self) -> None:
         self.streaming_enabled = not self.streaming_enabled
         status = self.query_one("#streaming_status", Static)
-        status.update("Streaming: ON" if self.streaming_enabled else "Streaming: OFF")
+        status.update("Streaming: ON (t)" if self.streaming_enabled else "Streaming: OFF (t)")
 
     async def action_quit(self) -> None:
         # Send the shutdown RPC from a worker thread so the (blocking) ZMQ
@@ -2451,6 +3469,9 @@ class ManagerTUI(App):
                             f"PROC CALL {process_id}.{name} kwargs={{}} -> {text}"
                         )
                         self.notify(f"Call ok: {process_id}.{name}")
+                        self._show_command_result(
+                            f"Result · {process_id}.{name}", result
+                        )
                     else:
                         err = resp.get("error", "unknown error") if resp else "timeout"
                         err_text = json.dumps(err) if isinstance(err, dict) else str(err)
@@ -2484,6 +3505,9 @@ class ManagerTUI(App):
                             f"PROC CALL {process_id}.{name} kwargs={json.dumps(params)} -> {text}"
                         )
                         self.notify(f"Call ok: {process_id}.{name}")
+                        self._show_command_result(
+                            f"Result · {process_id}.{name}", result
+                        )
                     else:
                         err = resp.get("error", "unknown error") if resp else "timeout"
                         err_text = json.dumps(err) if isinstance(err, dict) else str(err)
@@ -2525,6 +3549,9 @@ class ManagerTUI(App):
                             f"CALL {device_id}.{name} kwargs={{}} -> {text}"
                         )
                         self.notify(f"Call ok: {device_id}.{name}")
+                        self._show_command_result(
+                            f"Result · {device_id}.{name}", result
+                        )
                     else:
                         err = resp.get("error", "unknown error") if resp else "timeout"
                         self._log_action_result(
@@ -2555,6 +3582,9 @@ class ManagerTUI(App):
                             f"CALL {device_id}.{name} kwargs={json.dumps(params)} -> {text}"
                         )
                         self.notify(f"Call ok: {device_id}.{name}")
+                        self._show_command_result(
+                            f"Result · {device_id}.{name}", result
+                        )
                     else:
                         err = resp.get("error", "unknown error") if resp else "timeout"
                         self._log_action_result(
@@ -2581,6 +3611,7 @@ class ManagerTUI(App):
                 text = self._format_result(result)
                 self._log_action_result(f"GET {device_id}.{name} -> {text}")
                 self.notify(f"Get ok: {device_id}.{name}")
+                self._show_command_result(f"Result · {device_id}.{name}", result)
             else:
                 err = resp.get("error", "unknown error") if resp else "timeout"
                 self._log_action_result(f"GET {device_id}.{name} -> error {err}")
@@ -2675,6 +3706,9 @@ class ManagerTUI(App):
     def action_clear_log(self) -> None:
         log = self.query_one("#event_log", RichLog)
         try:
+            self._event_lines.clear()
+            self._activity_hydration_lines.clear()
+            self._activity_hydration_index = 0
             log.clear()
             self.notify("Event log cleared")
         except Exception:
@@ -2684,21 +3718,44 @@ class ManagerTUI(App):
         device_id = self._selected_device()
         if not device_id:
             return
+        if "connect" not in self._device_enabled_actions(
+            self._device_status.get(device_id)
+        ):
+            self.notify(f"Connect not available: {device_id}")
+            return
         def _after(resp: Json | None) -> None:
             self._notify_rpc_result("Device connect", device_id, resp)
             if resp and resp.get("ok"):
                 self._request_device_capabilities(device_id, force=True)
 
-        self._rpc_submit({"type": "device.connect", "device_id": device_id}, _after)
+        self._submit_resource_action(
+            resource_key=f"device:{device_id}",
+            payload={"type": "device.connect", "device_id": device_id},
+            on_result=_after,
+        )
 
     def action_device_disconnect(self) -> None:
         device_id = self._selected_device()
         if not device_id:
             return
-        self._rpc_submit(
-            {"type": "device.disconnect", "device_id": device_id},
-            lambda resp: self._notify_rpc_result("Device disconnect", device_id, resp),
-        )
+        if "disconnect" not in self._device_enabled_actions(
+            self._device_status.get(device_id)
+        ):
+            self.notify(f"Disconnect not available: {device_id}")
+            return
+
+        def _on_dismiss(confirmed: bool | None) -> None:
+            if not confirmed:
+                return
+            self._submit_resource_action(
+                resource_key=f"device:{device_id}",
+                payload={"type": "device.disconnect", "device_id": device_id},
+                on_result=lambda resp: self._notify_rpc_result(
+                    "Device disconnect", device_id, resp
+                ),
+            )
+
+        self.push_screen(ConfirmScreen(f"Disconnect device {device_id}?"), _on_dismiss)
 
     def action_driver_start(self) -> None:
         if self._action_target() == "process":
@@ -2709,9 +3766,12 @@ class ManagerTUI(App):
             if self._status_process_started(proc):
                 self.notify(f"Process already started: {process_id}")
                 return
-            self._rpc_submit(
-                {"type": "manager.processes.start", "process_id": process_id},
-                lambda resp: self._notify_rpc_result("Process start", process_id, resp),
+            self._submit_resource_action(
+                resource_key=f"process:{process_id}",
+                payload={"type": "manager.processes.start", "process_id": process_id},
+                on_result=lambda resp: self._notify_rpc_result(
+                    "Process start", process_id, resp
+                ),
             )
             return
 
@@ -2719,12 +3779,15 @@ class ManagerTUI(App):
         if not device_id:
             return
         status = self._device_status.get(device_id)
-        if self._status_driver_started(status):
-            self.notify(f"Driver already started: {device_id}")
+        if "start" not in self._device_enabled_actions(status):
+            self.notify(f"Driver start not available: {device_id}")
             return
-        self._rpc_submit(
-            {"type": "device.driver.start", "device_id": device_id},
-            lambda resp: self._notify_rpc_result("Driver start", device_id, resp),
+        self._submit_resource_action(
+            resource_key=f"device:{device_id}",
+            payload={"type": "device.driver.start", "device_id": device_id},
+            on_result=lambda resp: self._notify_rpc_result(
+                "Driver start", device_id, resp
+            ),
         )
 
     def action_drivers_start_all(self) -> None:
@@ -2759,6 +3822,28 @@ class ManagerTUI(App):
             summary_label="Start all drivers",
         )
 
+    def action_devices_connect_all(self) -> None:
+        eligible = [
+            device_id
+            for device_id, status in self._device_status.items()
+            if not status.is_remote
+            and "connect" in self._device_enabled_actions(status)
+        ]
+        skipped = len(self._device_status) - len(eligible)
+        if not eligible:
+            self.notify(f"Connect all: 0 connected, 0 failed, {skipped} skipped")
+            return
+        items = [
+            (device_id, {"type": "device.connect", "device_id": device_id})
+            for device_id in eligible
+        ]
+        self._run_bulk_rpc_worker(
+            items=items,
+            label="Device connect",
+            summary_label="Connect all",
+            skipped_count=skipped,
+        )
+
     def action_driver_stop(self) -> None:
         if self._action_target() == "process":
             process_id = self._selected_process()
@@ -2772,9 +3857,10 @@ class ManagerTUI(App):
             def _on_dismiss(confirmed: bool | None) -> None:
                 if not confirmed:
                     return
-                self._rpc_submit(
-                    {"type": "manager.processes.stop", "process_id": process_id},
-                    lambda resp: self._notify_rpc_result(
+                self._submit_resource_action(
+                    resource_key=f"process:{process_id}",
+                    payload={"type": "manager.processes.stop", "process_id": process_id},
+                    on_result=lambda resp: self._notify_rpc_result(
                         "Process stop", process_id, resp
                     ),
                 )
@@ -2788,16 +3874,19 @@ class ManagerTUI(App):
         if not device_id:
             return
         status = self._device_status.get(device_id)
-        if self._status_driver_stopped(status):
-            self.notify(f"Driver already stopped: {device_id}")
+        if "stop" not in self._device_enabled_actions(status):
+            self.notify(f"Driver stop not available: {device_id}")
             return
 
         def _on_driver_stop_dismiss(confirmed: bool | None) -> None:
             if not confirmed:
                 return
-            self._rpc_submit(
-                {"type": "device.driver.stop", "device_id": device_id},
-                lambda resp: self._notify_rpc_result("Driver stop", device_id, resp),
+            self._submit_resource_action(
+                resource_key=f"device:{device_id}",
+                payload={"type": "device.driver.stop", "device_id": device_id},
+                on_result=lambda resp: self._notify_rpc_result(
+                    "Driver stop", device_id, resp
+                ),
             )
 
         self.push_screen(ConfirmScreen(f"Stop driver for {device_id}?"), _on_driver_stop_dismiss)
@@ -2812,9 +3901,13 @@ class ManagerTUI(App):
             def _on_process_restart_dismiss(confirmed: bool | None) -> None:
                 if not confirmed:
                     return
-                self._rpc_submit(
-                    {"type": "manager.processes.restart", "process_id": process_id},
-                    lambda resp: self._notify_rpc_result(
+                self._submit_resource_action(
+                    resource_key=f"process:{process_id}",
+                    payload={
+                        "type": "manager.processes.restart",
+                        "process_id": process_id,
+                    },
+                    on_result=lambda resp: self._notify_rpc_result(
                         "Process restart", process_id, resp
                     ),
                 )
@@ -2827,17 +3920,25 @@ class ManagerTUI(App):
         device_id = self._selected_device()
         if not device_id:
             return
+        if "restart" not in self._device_enabled_actions(
+            self._device_status.get(device_id)
+        ):
+            self.notify(f"Driver restart not available: {device_id}")
+            return
 
         def _on_driver_restart_dismiss(confirmed: bool | None) -> None:
             if not confirmed:
                 return
-            self._rpc_submit(
-                {
+            self._submit_resource_action(
+                resource_key=f"device:{device_id}",
+                payload={
                     "type": "device.driver.restart",
                     "device_id": device_id,
                     "reload_config": True,
                 },
-                lambda resp: self._notify_rpc_result("Driver restart", device_id, resp),
+                on_result=lambda resp: self._notify_rpc_result(
+                    "Driver restart", device_id, resp
+                ),
             )
 
         self.push_screen(ConfirmScreen(f"Restart driver for {device_id}?"), _on_driver_restart_dismiss)
@@ -2848,29 +3949,179 @@ class ManagerTUI(App):
             event.stop()
             return
         if isinstance(self.focused, Input):
+            if event.key == "escape":
+                self.focused.value = ""
+                self.query_one("#resources_table", DataTable).focus()
+                event.stop()
             return
         if event.character and event.character.isupper():
             return
         key = event.key
-        if key == "x":
+        if key == "escape":
+            inspector = self.query_one("#inspector", Vertical)
+            if inspector.has_focus_within:
+                self.action_focus_navigator()
+                event.stop()
+                return
+        elif key == "x":
             self.action_driver_stop()
             event.stop()
         elif key == "r":
             self.action_driver_restart()
             event.stop()
         elif key == "enter":
-            self.action_member_primary()
+            resources = self.query_one("#resources_table", DataTable)
+            if self.focused is resources:
+                if self._selected_resource_key:
+                    self._select_resource_key(self._selected_resource_key)
+                    self.action_focus_inspector()
+                event.stop()
+                return
+            members = self.query_one("#members_table", DataTable)
+            if self.focused is members:
+                self.action_member_primary()
+                event.stop()
+        elif key == "left_square_bracket":
+            self.action_inspector_previous()
             event.stop()
+        elif key == "right_square_bracket":
+            self.action_inspector_next()
+            event.stop()
+
+    def action_focus_search(self) -> None:
+        search = self.query_one("#resource_filter", Input)
+        search.focus()
+
+    def action_toggle_unhealthy(self) -> None:
+        self._unhealthy_only = not self._unhealthy_only
+        self._resource_order = []
+        self._render_resources_table()
+
+    def action_resource_sort_next(self) -> None:
+        columns = [column for column, _label in _RESOURCE_COLUMNS]
+        current = columns.index(self._resource_sort_column)
+        self._set_resource_sort(columns[(current + 1) % len(columns)])
+
+    def action_resource_sort_reverse(self) -> None:
+        self._set_resource_sort(self._resource_sort_column)
+
+    def action_focus_navigator(self) -> None:
+        self.query_one("#resources_table", DataTable).focus()
+
+    def _focus_active_inspector(self) -> None:
+        tabs = self.query_one("#inspector_tabs", TabbedContent)
+        target_id = {
+            "overview": "#driver_table",
+            "telemetry": "#telemetry_table",
+            "commands": "#members_table",
+            "config": "#config_table",
+        }.get(tabs.active, "#driver_table")
+        self.query_one(target_id, DataTable).focus()
+
+    def action_focus_inspector(self) -> None:
+        self._focus_active_inspector()
+
+    def _set_inspector_tab(self, tab_id: str) -> None:
+        inspector = self.query_one("#inspector", Vertical)
+        restore_focus = inspector.has_focus_within
+        self.query_one("#inspector_tabs", TabbedContent).active = tab_id
+        if tab_id == "commands":
+            self._render_members_table()
+        elif tab_id == "config":
+            self._ensure_selected_config()
+            self._render_config_table()
+        if restore_focus:
+            self._focus_active_inspector()
+
+    def _cycle_inspector_tab(self, step: int) -> None:
+        tabs = self.query_one("#inspector_tabs", TabbedContent)
+        try:
+            index = _INSPECTOR_TAB_IDS.index(tabs.active)
+        except ValueError:
+            index = 0
+        self._set_inspector_tab(_INSPECTOR_TAB_IDS[(index + step) % len(_INSPECTOR_TAB_IDS)])
+
+    def action_inspector_previous(self) -> None:
+        self._cycle_inspector_tab(-1)
+
+    def action_inspector_next(self) -> None:
+        self._cycle_inspector_tab(1)
+
+    def action_inspector_overview(self) -> None:
+        self._set_inspector_tab("overview")
+
+    def action_inspector_telemetry(self) -> None:
+        self._set_inspector_tab("telemetry")
+
+    def action_inspector_commands(self) -> None:
+        self._set_inspector_tab("commands")
+
+    def action_inspector_config(self) -> None:
+        self._set_inspector_tab("config")
+
+    def _update_activity_summary(self) -> None:
+        verb = "close" if self._activity_open else "open"
+        arrow = "▲" if self._activity_open else "▼"
+        if self._activity_unread_error or self._activity_unread_warning:
+            text = (
+                f"{arrow} Activity — press a to {verb} · "
+                f"{self._activity_unread_error} errors · "
+                f"{self._activity_unread_warning} warnings"
+            )
+        else:
+            text = f"{arrow} Activity — press a to {verb} · no unread alerts"
+        try:
+            self.query_one("#activity_summary", Static).update(text)
+        except Exception:
+            pass
+
+    def action_toggle_activity(self) -> None:
+        self._activity_open = not self._activity_open
+        drawer = self.query_one("#activity_drawer", Vertical)
+        drawer.set_class(self._activity_open, "open")
+        if self._activity_open:
+            self._activity_unread_error = 0
+            self._activity_unread_warning = 0
+            self._render_errors_table()
+            log = self.query_one("#event_log", RichLog)
+            log.clear()
+            self._activity_hydration_lines = list(self._event_lines)
+            self._activity_hydration_index = 0
+            self.call_later(self._hydrate_activity_log)
+        self._update_activity_summary()
+
+    @on(events.Click, "#activity_summary")
+    def _on_activity_summary_clicked(self) -> None:
+        self.action_toggle_activity()
+
+    def _hydrate_activity_log(self) -> None:
+        if not self._activity_open:
+            return
+        log = self.query_one("#event_log", RichLog)
+        end = min(self._activity_hydration_index + 100, len(self._activity_hydration_lines))
+        for line in self._activity_hydration_lines[self._activity_hydration_index:end]:
+            log.write(line)
+        self._activity_hydration_index = end
+        if end < len(self._activity_hydration_lines):
+            self.call_later(self._hydrate_activity_log)
 
     def action_device_recover(self) -> None:
         device_id = self._selected_device()
         if not device_id:
             return
+        if "recover" not in self._device_enabled_actions(
+            self._device_status.get(device_id)
+        ):
+            self.notify(f"Recover not available: {device_id}")
+            return
 
         def _on_dismiss(confirmed: bool | None) -> None:
             if not confirmed:
                 return
-            self._rpc_submit({"type": "device.recover", "device_id": device_id})
+            self._submit_resource_action(
+                resource_key=f"device:{device_id}",
+                payload={"type": "device.recover", "device_id": device_id},
+            )
 
         self.push_screen(ConfirmScreen(f"Recover device {device_id}?"), _on_dismiss)
 
