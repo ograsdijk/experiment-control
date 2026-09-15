@@ -113,6 +113,16 @@ Each entry includes `effective_rpc_timeout_ms`, the timeout that clients should
 allow for a command to that device. It is the manager device RPC timeout for a
 local device and the owning federation peer's `rpc_timeout_ms` for a mirror.
 
+### `device.config.get`
+Request:
+- `{"type": "device.config.get", "device_id": "hv", "redact_sensitive": true}`
+
+Response:
+- With `redact_sensitive: true`, the result includes structured `driver` and `init_kwargs`
+  fields, recursively redacts secret-bearing keys, and omits the raw `yaml_text`.
+- Without that flag, the existing full device-config payload is preserved for trusted internal
+  consumers.
+
 ### `manager.telemetry.snapshot`
 Request:
 - `{"type": "manager.telemetry.snapshot"}`
@@ -161,6 +171,17 @@ Request:
 
 Response:
 - `{"ok": true, "result": {"process_id": "sequencer", "state": "RUNNING", "...": "..."}}`
+
+### `manager.processes.config.get`
+Request:
+- `{"type": "manager.processes.config.get", "process_id": "sequencer"}`
+
+Response:
+- `{"ok": true, "result": {"version": 1, "process_id": "sequencer", "launch": {...}, "init_kwargs": {...}, "...": "..."}}`
+- Constructor secrets are recursively redacted. Environment variable names are returned but
+  all environment values are redacted. For explicit command processes, only the executable is
+  returned; arguments are redacted because positional arguments may contain credentials.
+- Federated processes return `process_config_unavailable`; process configuration is not mirrored.
 
 ### `manager.processes.start` / `manager.processes.stop` / `manager.processes.restart`
 Request:
@@ -800,6 +821,8 @@ Response:
   - `telemetry_calls`: list
   - `stream_calls`: list
   - `run_meta_calls`: list
+  - `display_config`: dict containing the driver identity and recursively redacted
+    `init_kwargs` for operator UIs
 
 `stream_calls` entries (per device):
 - `method`: str

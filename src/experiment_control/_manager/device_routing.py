@@ -4,6 +4,7 @@ import copy
 import time
 from typing import Any, Callable
 
+from ..utils.config_redaction import redact_config
 from ..utils.responses import RpcResponse
 
 Json = dict[str, Any]
@@ -348,11 +349,22 @@ def _route_device_config_get(manager: Any, req: Json) -> Json:
     device_id = str(req["device_id"])
     fed_cfg = manager._federation_hub.device_config_get(device_id)
     if fed_cfg is not None:
+        if req.get("redact_sensitive"):
+            fed_cfg = redact_config(copy.deepcopy(fed_cfg))
+            fed_cfg["yaml_text"] = None
+            display_config = fed_cfg.pop("display_config", None)
+            if isinstance(display_config, dict):
+                fed_cfg.update(display_config)
         return {"ok": True, "result": fed_cfg}
     handle = manager._devices.get(device_id)
     if handle is None:
         return _unknown_device_response(device_id)
-    return {"ok": True, "result": manager._device_config_payload(handle)}
+    return {
+        "ok": True,
+        "result": manager._device_config_payload(
+            handle, redact_sensitive=bool(req.get("redact_sensitive"))
+        ),
+    }
 
 
 def _route_device_config_list(manager: Any, req: Json) -> Json:

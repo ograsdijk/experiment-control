@@ -140,6 +140,10 @@ class ProcessSpecPathResolutionTests(unittest.TestCase):
             spec["cwd"],
             str((root / "instances" / "test" / "runner" / "work").resolve()),
         )
+        self.assertEqual(spec["process_class_name"], "SequencerProcess")
+        self.assertEqual(spec["init_kwargs"], init_kwargs)
+        self.assertTrue(str(spec["config_path"]).endswith("sequencer.yaml"))
+        self.assertIn("process_id: sequencer", spec["config_yaml_text"])
 
     def test_absolute_cwd_remains_absolute(self) -> None:
         with tempfile.TemporaryDirectory() as td:

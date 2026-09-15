@@ -45,6 +45,7 @@ class RequestRoutingMixin(_MixinBase):
             handlers={
                 "manager.processes.list": self._route_process_list_status,
                 "manager.processes.get": self._route_process_get,
+                "manager.processes.config.get": self._route_process_config_get,
                 "manager.processes.start": self._route_process_start,
                 "manager.processes.stop": self._route_process_stop,
                 "manager.processes.restart": self._route_process_restart,

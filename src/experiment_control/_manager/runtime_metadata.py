@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any
 from ..schemas.run_meta import run_meta_calls_to_json
 from ..schemas.stream import stream_calls_to_json
 from ..schemas.telemetry import telemetry_calls_to_json
+from ..utils.config_redaction import redact_config
 
 if TYPE_CHECKING:
     from ..manager_protocol import ManagerProtocol
@@ -170,14 +171,16 @@ class RuntimeMetadataMixin(_MixinBase):
         payload: Json = self._device_config_payload(handle)
         self._publish_manager_event("manager.device_config", payload)
 
-    def _device_config_payload(self, handle: Any) -> Json:
+    def _device_config_payload(
+        self, handle: Any, *, redact_sensitive: bool = False
+    ) -> Json:
         yaml_text = handle.spec.config_yaml_text
         if yaml_text is None:
             yaml_text = serialize_spec_yaml(handle.spec)
         device_metadata, stream_metadata = self._effective_metadata_for_device(
             handle.spec.device_id, handle.spec
         )
-        return {
+        payload = {
             "version": 1,
             "device_id": handle.spec.device_id,
             "yaml_text": yaml_text,
@@ -200,4 +203,16 @@ class RuntimeMetadataMixin(_MixinBase):
             "is_remote": False,
             "owner_peer_id": None,
             "remote_device_id": None,
+            "display_config": {
+                "driver": {
+                    "file": str(handle.spec.device_class_path),
+                    "class_name": handle.spec.device_class_name,
+                },
+                "init_kwargs": redact_config(handle.spec.device_init_kwargs),
+            },
         }
+        if redact_sensitive:
+            payload["yaml_text"] = None
+            payload.update(payload.pop("display_config"))
+            return redact_config(payload)
+        return payload

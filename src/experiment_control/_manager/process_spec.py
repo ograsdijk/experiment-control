@@ -138,7 +138,7 @@ def process_spec_kwargs_from_yaml(
 ) -> Json:
     config_path = Path(path).expanduser().resolve()
     config_dir = config_path.parent.parent if config_path.parent.name == "processes" else config_path.parent
-    raw, _ = load_yaml_file(config_path, return_text=True)
+    raw, yaml_text = load_yaml_file(config_path, return_text=True)
     try:
         raw_obj = require_dict(raw, path=[])
         process_id = require_str(raw_obj.get("process_id"), path=["process_id"])
@@ -152,6 +152,11 @@ def process_spec_kwargs_from_yaml(
             for key, value in init_kwargs.items()
         }
         if process_raw is not None:
+            process_obj = require_dict(process_raw, path=["process"])
+            process_class_path = _resolve_process_file(process_obj)
+            process_class_name = require_str(
+                process_obj.get("class_name"), path=["process", "class_name"]
+            )
             argv = _build_process_class_argv(
                 process_raw=process_raw,
                 init_kwargs=init_kwargs,
@@ -160,6 +165,8 @@ def process_spec_kwargs_from_yaml(
                 heartbeat_period_s=heartbeat_period_s,
             )
         else:
+            process_class_path = None
+            process_class_name = None
             argv = _build_explicit_argv(argv_raw)
         restart_policy = _coerce_restart_policy(
             raw_obj.get("restart_policy", restart_policy_enum.NEVER),
@@ -202,4 +209,9 @@ def process_spec_kwargs_from_yaml(
         "heartbeat_endpoint": raw_obj.get("heartbeat_endpoint"),
         "process_data_endpoint": raw_obj.get("process_data_endpoint"),
         "heartbeat_hard_timeout_s": heartbeat_hard_timeout_s,
+        "process_class_path": process_class_path,
+        "process_class_name": process_class_name,
+        "init_kwargs": init_kwargs,
+        "config_path": str(config_path),
+        "config_yaml_text": yaml_text,
     }

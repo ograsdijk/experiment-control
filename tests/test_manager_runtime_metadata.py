@@ -11,6 +11,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from experiment_control.manager import DeviceHandle, DeviceSpec, Manager
+from experiment_control._manager.device_routing import _route_device_config_get
 
 
 class _HubStub:
@@ -19,6 +20,9 @@ class _HubStub:
 
     def is_mirrored_device(self, device_id: str) -> bool:
         return device_id in self._mirrored
+
+    def device_config_get(self, _device_id: str):
+        return None
 
 
 def _build_manager() -> Manager:
@@ -55,6 +59,34 @@ class ManagerRuntimeMetadataTests(unittest.TestCase):
         status = Manager._device_status_snapshot(mgr, "trace1")
 
         self.assertEqual(status["effective_rpc_timeout_ms"], 4321)
+
+    def test_redacted_config_payload_exposes_safe_structured_init_kwargs(self) -> None:
+        mgr = _build_manager()
+        spec = mgr._devices["trace1"].spec  # type: ignore[attr-defined]
+        spec.device_init_kwargs = {
+            "port": "COM4",
+            "auth": {"password": "secret"},
+        }
+
+        payload = Manager._device_config_payload(  # type: ignore[arg-type]
+            mgr,
+            mgr._devices["trace1"],  # type: ignore[attr-defined]
+            redact_sensitive=True,
+        )
+
+        self.assertIsNone(payload["yaml_text"])
+        self.assertEqual(payload["init_kwargs"]["port"], "COM4")
+        self.assertEqual(payload["init_kwargs"]["auth"]["password"], "*** redacted ***")
+
+        response = _route_device_config_get(
+            mgr,
+            {
+                "device_id": "trace1",
+                "redact_sensitive": True,
+            },
+        )
+        self.assertEqual(response["result"]["init_kwargs"]["port"], "COM4")
+        self.assertNotIn("secret", str(response))
 
     def test_connect_device_does_not_publish_run_metadata(self) -> None:
         mgr = _build_manager()

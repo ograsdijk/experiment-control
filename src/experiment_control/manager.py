@@ -1685,6 +1685,11 @@ class Manager(
             heartbeat_endpoint=raw.get("heartbeat_endpoint"),
             process_data_endpoint=raw.get("process_data_endpoint"),
             heartbeat_hard_timeout_s=heartbeat_hard_timeout_s,
+            process_class_path=raw.get("process_class_path"),
+            process_class_name=raw.get("process_class_name"),
+            init_kwargs=dict(raw.get("init_kwargs") or {}),
+            config_path=raw.get("config_path"),
+            config_yaml_text=raw.get("config_yaml_text"),
         )
 
     # -----------------------------
