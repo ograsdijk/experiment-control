@@ -4,7 +4,9 @@ POST /api/gateway/stream-max-payload-points.
 """
 
 import os
+import shutil
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -18,10 +20,12 @@ from experiment_control.fastapi.app import _persist_stream_max_payload_points
 
 class PersistStreamMaxPayloadPointsTests(unittest.TestCase):
     def setUp(self) -> None:
-        import tempfile
-
-        self._tmp = tempfile.TemporaryDirectory()
-        self.instance_root = Path(self._tmp.name)
+        # Use mkdtemp + manual cleanup rather than tempfile.TemporaryDirectory:
+        # test_hdf_writer.py monkeypatches that symbol at module level with no
+        # teardown, and `unittest discover` imports every test module before
+        # running any of them, so the patch is already active here regardless
+        # of file ordering.
+        self.instance_root = Path(tempfile.mkdtemp())
         self._prev_env = os.environ.get("EXPERIMENT_CONTROL_INSTANCE_ROOT")
         os.environ["EXPERIMENT_CONTROL_INSTANCE_ROOT"] = str(self.instance_root)
 
@@ -30,7 +34,7 @@ class PersistStreamMaxPayloadPointsTests(unittest.TestCase):
             os.environ.pop("EXPERIMENT_CONTROL_INSTANCE_ROOT", None)
         else:
             os.environ["EXPERIMENT_CONTROL_INSTANCE_ROOT"] = self._prev_env
-        self._tmp.cleanup()
+        shutil.rmtree(self.instance_root, ignore_errors=True)
 
     def _write_instance_yaml(self, text: str) -> Path:
         path = self.instance_root / "instance.yaml"
