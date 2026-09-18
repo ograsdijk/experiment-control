@@ -42,6 +42,10 @@ class WorkspaceRouteSurfaceTests(unittest.TestCase):
             "(stream_analysis.workspace.merge RPC) and update this assertion.",
         )
 
+    def test_gateway_stream_max_payload_points_route_present(self) -> None:
+        methods = self._methods_for("/api/gateway/stream-max-payload-points")
+        self.assertIn("POST", methods)
+
 
 if __name__ == "__main__":
     unittest.main()
