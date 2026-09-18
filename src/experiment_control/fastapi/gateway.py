@@ -616,6 +616,13 @@ class StreamFrameHub:
             "payload_truncation_count": int(self._payload_truncation_count),
         }
 
+    def set_max_payload_points(self, value: int) -> None:
+        # Read unlocked elsewhere (hub thread and asyncio handlers both
+        # rely on the GIL for plain-int visibility, matching `stats()`
+        # above), so this plain assignment is consistent with the
+        # existing concurrency treatment of this field.
+        self._max_payload_points = max(1, int(value))
+
     def _warn_payload_truncation(
         self,
         *,

@@ -7,6 +7,7 @@ import mimetypes
 import os
 import re
 import sys
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -15,6 +16,7 @@ from typing import Any
 from urllib.parse import SplitResult, urlsplit, urlunsplit
 
 import numpy as np
+import yaml
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, RedirectResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -39,6 +41,7 @@ from ..utils.network_hosts import (
     server_ipv4_candidates as shared_server_ipv4_candidates,
 )
 from ..utils.responses import (
+    RpcResponse,
     ensure_error_shape as _ensure_error_shape,
     normalize_command_response as _normalize_command_response,
 )
@@ -192,6 +195,11 @@ class HdfWritingStartRequest(BaseModel):
     source_id: str | None = None
 
 
+class GatewayStreamPayloadCapRequest(BaseModel):
+    value: int
+    persist: bool = False
+
+
 class InstanceCleanupRequest(BaseModel):
     dry_run: bool = True
     stale_only: bool = True
@@ -260,6 +268,66 @@ def _load_settings() -> GatewaySettings:
             0.0, env_float("EXPERIMENT_CONTROL_STREAM_KEY_TTL_S", 600.0)
         ),
     )
+
+
+def _persist_stream_max_payload_points(value: int) -> None:
+    """Rewrite instance.yaml's fastapi.stream_max_payload_points in place.
+
+    Requires EXPERIMENT_CONTROL_INSTANCE_ROOT (set by the launcher that
+    spawns this process); raises ValueError if it is unavailable, the
+    file has no fastapi mapping, or more than one scalar line matches.
+    """
+    instance_root_raw = os.environ.get("EXPERIMENT_CONTROL_INSTANCE_ROOT", "").strip()
+    if not instance_root_raw:
+        raise ValueError(
+            "EXPERIMENT_CONTROL_INSTANCE_ROOT is not set; cannot locate instance.yaml"
+        )
+    path = Path(instance_root_raw) / "instance.yaml"
+    original = path.read_bytes().decode("utf-8-sig")
+    newline = "\r\n" if "\r\n" in original else "\n"
+    pattern = re.compile(
+        r"^(?P<prefix>\s*stream_max_payload_points:\s*)\d+(?P<suffix>\s*(?:#.*)?)$",
+        re.MULTILINE,
+    )
+    updated, count = pattern.subn(
+        lambda m: f"{m.group('prefix')}{value}{m.group('suffix')}", original
+    )
+    if count > 1:
+        raise ValueError(
+            f"expected at most one scalar stream_max_payload_points, found {count}"
+        )
+    if count == 0:
+        lines = original.splitlines(keepends=True)
+        fastapi_index = next(
+            (i for i, line in enumerate(lines) if line.rstrip("\r\n") == "fastapi:"),
+            None,
+        )
+        if fastapi_index is None:
+            raise ValueError("instance.yaml has no fastapi mapping")
+        insert_at = len(lines)
+        for i in range(fastapi_index + 1, len(lines)):
+            stripped = lines[i].strip()
+            if stripped and not lines[i].startswith((" ", "\t", "#")):
+                insert_at = i
+                break
+        lines.insert(insert_at, f"  stream_max_payload_points: {value}{newline}")
+        updated = "".join(lines)
+    parsed = yaml.safe_load(updated)
+    if not isinstance(parsed, dict):
+        raise ValueError("generated invalid instance.yaml")
+    fd, raw_temp = tempfile.mkstemp(
+        prefix=".instance.yaml.", suffix=".tmp", dir=str(path.parent)
+    )
+    temp_path = Path(raw_temp)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+            handle.write(updated)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
 
 
 async def _route_request(payload: dict[str, Any]) -> dict[str, Any]:
@@ -1444,6 +1512,39 @@ async def hdf_writer_writing_start(
         ),
     }
     return await _route_request(payload)
+
+
+@app.post("/api/gateway/stream-max-payload-points")
+async def gateway_set_stream_max_payload_points(
+    req: GatewayStreamPayloadCapRequest,
+) -> dict[str, Any]:
+    """Live-patch the gateway's per-frame payload cap without a restart.
+
+    In-memory only unless `persist=true`, since instance.yaml is often
+    already the source of truth written by a separate reconfigure step
+    (e.g. changing PXIe sample rate/record length) — persisting here too
+    would be a redundant second writer of the same file/key.
+    """
+    if req.value <= 0:
+        return RpcResponse.failure(
+            "invalid_value", "value must be a positive integer"
+        ).to_dict()
+    stream_hub: StreamFrameHub | None = getattr(app.state, "stream_hub", None)
+    if stream_hub is None:
+        return RpcResponse.failure(
+            "not_ready", "stream hub is not initialized"
+        ).to_dict()
+    stream_hub.set_max_payload_points(req.value)
+    persisted = False
+    if req.persist:
+        try:
+            _persist_stream_max_payload_points(req.value)
+            persisted = True
+        except Exception as exc:
+            return RpcResponse.failure("persist_failed", str(exc)).to_dict()
+    return RpcResponse.success(
+        {"value": int(req.value), "persisted": persisted}
+    ).to_dict()
 
 
 @app.get("/api/processes/{process_id}/cached-call")

@@ -316,6 +316,32 @@ class GatewayLifecycleTests(unittest.TestCase):
         self.assertEqual(payload["_source_shape"], [5, 12])
         self.assertEqual(hub.stats()["payload_truncation_count"], 1)
 
+    def test_set_max_payload_points_applies_live(self) -> None:
+        hub = StreamFrameHub(
+            "tcp://127.0.0.1:1",
+            topics=("manager.chunk_ready",),
+            max_payload_points=20,
+        )
+        self.assertEqual(hub.stats()["max_payload_points"], 20)
+
+        hub.set_max_payload_points(60)
+        self.assertEqual(hub.stats()["max_payload_points"], 60)
+
+        source = np.arange(60, dtype=np.int16).reshape(5, 12)
+        msg = hub._build_stream_frame(  # noqa: SLF001
+            device_id="digitizer",
+            stream="waveforms",
+            reader=_FrameReaderStub(),  # type: ignore[arg-type]
+            event={"seq": 1, "payload": source.tobytes()},
+            context_id=None,
+            context_fields=None,
+        )
+        assert msg is not None
+        self.assertNotIn("truncated", msg["payload"])
+
+        hub.set_max_payload_points(0)
+        self.assertEqual(hub.stats()["max_payload_points"], 1)
+
     def test_stream_frame_hub_prunes_keys_by_capacity(self) -> None:
         hub = StreamFrameHub(
             "tcp://127.0.0.1:1",
