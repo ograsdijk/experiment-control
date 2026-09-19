@@ -634,6 +634,14 @@ class SequencerRuntime:
 
     def request_stop(self) -> None:
         self._stop_requested = True
+        if self._state == "PAUSED":
+            # tick() only runs while _state == "RUNNING", so a stop requested
+            # while paused would otherwise sit unprocessed forever (status
+            # would keep reporting PAUSED). Un-pause so the next tick picks
+            # up the stop request via the normal _check_stop_pause() path.
+            self._mark_pause_ended(time.monotonic())
+            self._pause_requested = False
+            self._state = "RUNNING"
 
     def fail(self, reason: str) -> None:
         if self._state not in {"RUNNING", "PAUSED"}:

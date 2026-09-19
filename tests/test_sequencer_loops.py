@@ -322,6 +322,32 @@ class SequencerLoopTests(unittest.TestCase):
         self.assertEqual(runtime.status()["state"], "STOPPED")
         self.assertEqual(calls, [("dev", "cleanup")])
 
+    def test_stop_requested_while_paused_transitions_to_stopped(self) -> None:
+        calls: list[tuple[str, str]] = []
+        runtime = SequencerRuntime(
+            call_device=lambda d, a, p: calls.append((d, a))
+            or {"ok": True, "result": None},
+            get_telemetry=lambda d, s: None,
+            set_stream_context=lambda *a: None,
+        )
+        runtime.load(
+            parse_sequence(
+                {
+                    "version": 1,
+                    "steps": [{"sleep": 10}],
+                }
+            )
+        )
+        runtime.start()
+        runtime.request_pause()
+        runtime.tick()
+        self.assertEqual(runtime.status()["state"], "PAUSED")
+
+        runtime.request_stop()
+        while runtime.state == "RUNNING":
+            runtime.tick()
+        self.assertEqual(runtime.status()["state"], "STOPPED")
+
     def test_try_finally_runs_on_external_fail(self) -> None:
         calls: list[tuple[str, str]] = []
         runtime = SequencerRuntime(
