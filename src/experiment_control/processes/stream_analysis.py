@@ -1252,6 +1252,12 @@ OPS: dict[str, OpSpec] = {
     "trace.crop": OpSpec(
         input_types={"trace": "trace"}, output_type="trace", stateful=False
     ),
+    "trace.gate": OpSpec(
+        input_types={"trace": "trace"},
+        output_type="trace",
+        optional_input_types={"gate": "scalar"},
+        stateful=False,
+    ),
     "trace.window_mean": OpSpec(
         input_types={"trace": "trace"}, output_type="scalar", stateful=False
     ),
@@ -1736,6 +1742,23 @@ def execute_trace_crop(trace_raw: Any, params: Json) -> np.ndarray | None:
     if stop <= start:
         return np.asarray([], dtype=np.float64)
     return trace[start:stop]
+
+
+def execute_trace_gate(trace_raw: Any, *, gate_open: bool) -> np.ndarray | None:
+    """Pass a trace through only while an upstream gate scalar is open.
+
+    A closed gate yields `None`, which the publish layer treats as "no value
+    this shot" rather than a zeroed/blank trace — so a gated output simply
+    goes quiet for rejected shots instead of publishing a misleading frame.
+    `gate_open` is the already-resolved gate state (see
+    `_workspace_node_gate_open`), which also covers the omitted-gate case.
+    """
+    trace = _coerce_trace(trace_raw)
+    if trace is None:
+        return None
+    if not gate_open:
+        return None
+    return trace
 
 
 def _validate_trace_window_mean_params(params: Json) -> tuple[int, int]:
@@ -4515,6 +4538,11 @@ class StreamAnalysisProcess(ManagedProcessBase):
             return True, None
         if op == "trace.crop":
             values[node_id] = execute_trace_crop(src, node.params)
+            return True, None
+        if op == "trace.gate":
+            values[node_id] = execute_trace_gate(
+                src, gate_open=_workspace_node_gate_open(node, values)
+            )
             return True, None
         if op == "trace.window_mean":
             values[node_id] = execute_trace_window_mean(src, node.params)
