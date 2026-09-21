@@ -1,40 +1,45 @@
+import { YAMLMap, isMap, parseDocument } from "yaml";
 import type { SequencerOutlineMetadataEntry } from "../types";
-import {
-  buildTopLevelMetadataSectionLines,
-  findTopLevelSectionRange,
-  joinLines,
-  splitLines,
-} from "./shared";
+import { cleanEntries, textToNode } from "./yaml_write";
 
 function applyEditedTopLevelMetadataSection(
   yamlText: string,
   key: "vars" | "context_columns",
-  replacement: string[]
+  entries: SequencerOutlineMetadataEntry[]
 ): string {
-  const { lines, hasTrailingNewline } = splitLines(yamlText);
-  const range = findTopLevelSectionRange(lines, key);
-  let nextLines: string[];
-  if (range) {
-    const startIndex = range.startLine - 1;
-    const endIndex = range.endLine - 1;
-    nextLines = [
-      ...lines.slice(0, startIndex),
-      ...replacement,
-      ...lines.slice(endIndex + 1),
-    ];
-  } else {
-    const stepsIndex = lines.findIndex((line) => /^steps:\s*/.test(line.trim()));
-    if (stepsIndex >= 0) {
-      nextLines = [
-        ...lines.slice(0, stepsIndex),
-        ...replacement,
-        ...lines.slice(stepsIndex),
-      ];
-    } else {
-      nextLines = [...lines, ...replacement];
+  const doc = parseDocument(yamlText);
+  if (doc.errors.length > 0 || !isMap(doc.contents)) {
+    return yamlText;
+  }
+  const cleaned = cleanEntries(entries);
+  const currentSection = doc.get(key, true);
+  const section = isMap(currentSection) ? currentSection : new YAMLMap();
+  if (!isMap(currentSection)) {
+    doc.set(key, section);
+  }
+
+  const desiredNames = new Set(cleaned.map((entry) => entry.name));
+  for (const pair of [...section.items]) {
+    const name = pair.key == null ? "" : String(pair.key).trim();
+    if (!desiredNames.has(name)) {
+      section.delete(name);
     }
   }
-  return joinLines(nextLines, hasTrailingNewline);
+  for (const entry of cleaned) {
+    const existing = section.get(entry.name, true);
+    const replacement = textToNode(doc, entry.value);
+    if (
+      existing != null &&
+      JSON.stringify(existing.toJSON()) === JSON.stringify(replacement.toJSON())
+    ) {
+      continue;
+    }
+    section.set(entry.name, replacement);
+  }
+  if (section.items.length === 0) {
+    section.flow = true;
+  }
+  return doc.toString({ lineWidth: 0 });
 }
 
 export function applyEditedVars(
@@ -44,7 +49,7 @@ export function applyEditedVars(
   return applyEditedTopLevelMetadataSection(
     yamlText,
     "vars",
-    buildTopLevelMetadataSectionLines("vars", entries)
+    entries
   );
 }
 
@@ -55,6 +60,6 @@ export function applyEditedContextColumns(
   return applyEditedTopLevelMetadataSection(
     yamlText,
     "context_columns",
-    buildTopLevelMetadataSectionLines("context_columns", entries)
+    entries
   );
 }

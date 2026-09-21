@@ -18,6 +18,7 @@ import type {
   SequencerWaitUntilDetail,
   SequencerWhileDetail,
 } from "./types";
+import { parseDocument } from "yaml";
 import type { Node } from "yaml";
 import {
   childNode,
@@ -39,8 +40,6 @@ import {
 const STEP_CONTAINER_KEYS = new Set(["steps", "do", "then", "else", "finally"]);
 const STEP_ITEM_PATTERN = /^(\s*)-\s*([A-Za-z_][A-Za-z0-9_]*)\s*:(.*)$/;
 const CONTAINER_PATTERN = /^(\s*)([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(?:#.*)?$/;
-const TOP_LEVEL_KEY_PATTERN = /^([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(.*)$/;
-const CHILD_KEY_PATTERN = /^(\s*)([A-Za-z_][A-Za-z0-9_]*)\s*:/;
 const FOR_GENERATOR_KINDS = new Set([
   "range",
   "linspace",
@@ -796,72 +795,34 @@ export function buildSequencerOutlineMetadata(
     return metadata;
   }
 
-  const lines = splitLines(yamlText);
-  let activeSection: "vars" | "context_columns" | null = null;
-  let childIndent: number | null = null;
-
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith("#")) {
-      continue;
-    }
-    const indent = line.match(/^\s*/)?.[0].length ?? 0;
-
-    if (indent === 0) {
-      activeSection = null;
-      childIndent = null;
-
-      const topLevelMatch = trimmed.match(TOP_LEVEL_KEY_PATTERN);
-      if (!topLevelMatch) {
-        continue;
-      }
-      const key = topLevelMatch[1];
-      const remainder = topLevelMatch[2].replace(/\s+#.*$/, "").trim();
-      if (key === "version") {
-        metadata.version = remainder || null;
-        continue;
-      }
-      if (key === "vars" || key === "context_columns") {
-        activeSection = key;
-      }
-      continue;
-    }
-
-    if (!activeSection) {
-      continue;
-    }
-
-    if (childIndent === null) {
-      childIndent = indent;
-    }
-    if (indent < childIndent) {
-      activeSection = null;
-      childIndent = null;
-      continue;
-    }
-    if (indent !== childIndent) {
-      continue;
-    }
-
-    const childMatch = line.match(CHILD_KEY_PATTERN);
-    if (!childMatch) {
-      continue;
-    }
-    const key = childMatch[2];
-    const value = line
-      .slice(line.indexOf(":") + 1)
-      .replace(/\s+#.*$/, "")
-      .trim();
-    const entry: SequencerOutlineMetadataEntry = {
-      name: key,
-      value: value || null,
-    };
-    if (activeSection === "vars") {
-      metadata.vars.push(entry);
-    } else {
-      metadata.contextColumns.push(entry);
-    }
+  let doc;
+  try {
+    doc = parseDocument(yamlText);
+  } catch {
+    return metadata;
   }
+  if (doc.errors.length > 0) {
+    return metadata;
+  }
+
+  metadata.version = leafText(doc.get("version", true), yamlText);
+  const readSection = (key: "vars" | "context_columns") => {
+    const section = doc.get(key, true);
+    if (!isMap(section)) {
+      return [];
+    }
+    const entries: SequencerOutlineMetadataEntry[] = [];
+    for (const pair of section.items) {
+      const name = pair.key == null ? "" : String(pair.key).trim();
+      if (!name) {
+        continue;
+      }
+      entries.push({ name, value: leafText(pair.value, yamlText) });
+    }
+    return entries;
+  };
+  metadata.vars = readSection("vars");
+  metadata.contextColumns = readSection("context_columns");
 
   return metadata;
 }
