@@ -448,6 +448,27 @@ class SequencerProcessAddressingTests(unittest.TestCase):
         self.assertEqual(calls["device"], [("d", "act", {})])
         self.assertEqual(calls["process"], [])
 
+    def test_failed_process_call_reports_rpc_error_before_assign_extraction(self) -> None:
+        rt, _calls = self._runtime()
+        rt._call_process = lambda _pid, _action, _params: {
+            "ok": False,
+            "error": {"code": "unknown_request", "message": "action is unavailable"},
+        }
+
+        rt._execute_call_step(
+            CallStep(
+                device="",
+                action="nltl_ramp.prepare_targets",
+                params={},
+                process="nltl_frequency_ramp",
+                assign={"freq_targets_hz": {"kind": "key", "ref": "targets_hz"}},
+            )
+        )
+
+        self.assertEqual(rt.state, "ERROR")
+        self.assertIn("action is unavailable", str(rt.status().get("error")))
+        self.assertNotIn("freq_targets_hz", rt._env)
+
     def test_call_step_renders_templated_device_and_action(self) -> None:
         rt, calls = self._runtime()
         rt.load(

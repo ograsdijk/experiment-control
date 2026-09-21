@@ -306,6 +306,35 @@ steps:
                 finally:
                     harness.close()
 
+    def test_failed_parallel_call_reports_rpc_error_before_assign_extraction(self) -> None:
+        spec = parse_sequence(
+            yaml.safe_load(
+                """
+version: 1
+steps:
+  - parallel:
+      do:
+        - call: {device: a, action: fail}
+          assign: {value: {kind: key, ref: missing}}
+"""
+            )
+        )
+        parallel = spec.steps[0]
+        operations = parallel_branch_operations(parallel.body[0], {})  # type: ignore[union-attr]
+
+        result = run_parallel_branch(
+            ParallelBranchPlan(index=0, operations=operations, env={}, path="branch[0]"),
+            call_device=lambda _device, _action, _params: {
+                "ok": False,
+                "error": {"code": "failed", "message": "underlying rpc failure"},
+            },
+            call_process=None,
+        )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error, "underlying rpc failure")
+        self.assertNotIn("NoneType", str(result.error))
+
     def test_branch_local_output_can_feed_later_atomic_operation(self) -> None:
         harness = _ParallelHarness(delay_s=0.005)
         try:

@@ -256,6 +256,11 @@ def run_parallel_branch(
                     else:
                         response = call_device(device, action, params)
 
+                    if not response.get("ok", False):
+                        error = response.get("error")
+                        if isinstance(error, dict):
+                            error = error.get("message") or error.get("code") or error
+                        raise RuntimeError(str(error or "request failed"))
                     if step.extract and step.assign:
                         raise ValueError("extract and assign are mutually exclusive")
                     if step.save_as:
@@ -282,11 +287,6 @@ def run_parallel_branch(
                             )
                             env[key] = value
                             outputs[key] = value
-                if not response.get("ok", False):
-                    error = response.get("error")
-                    if isinstance(error, dict):
-                        error = error.get("message") or error.get("code") or error
-                    raise RuntimeError(str(error or "request failed"))
             except Exception as exc:
                 return ParallelBranchResult(
                     index=plan.index,
@@ -1925,6 +1925,8 @@ class SequencerRuntime:
             action=action,
             params=params,
         )
+        if not resp.get("ok", False):
+            return self._fail_step(self._response_error_text(resp))
         if step.save_as:
             self._env[step.save_as] = resp
         if step.extract and step.assign:
@@ -1947,8 +1949,6 @@ class SequencerRuntime:
                     kind=spec.get("kind", "scalar"),
                     ref=spec.get("ref"),
                 )
-        if not resp.get("ok", False):
-            return self._fail_step(self._response_error_text(resp))
         return False
 
     def _normalize_streams(self, streams: Any) -> list[tuple[str, str]]:
