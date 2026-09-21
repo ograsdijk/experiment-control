@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import time
 from collections import deque
 from typing import Any
@@ -54,6 +55,10 @@ _DEFAULT_CONFIG: Json = {
     # fire on a stat estimate built from fewer samples than a full window -
     # a force_jump still bypasses this immediately, same as before.
     "min_dwell_shots": 20,
+    # Authoritative mirror travel envelope (microsteps), enforced below on
+    # every range_spec/axis_limits patch - the UI mirrors this value rather
+    # than owning its own copy, so there is exactly one source of truth.
+    "axis_limits": {"xMin": -12000, "xMax": 12000, "yMin": -12000, "yMax": 12000},
 }
 
 _VISITED_MAX = 2000
@@ -587,6 +592,10 @@ class TargetSpotControllerProcess(StateMachineProcessBase):
         if not isinstance(next_config["range_spec"], dict):
             raise ValueError("range_spec must be a dict")
 
+        axis_limits = self._validate_axis_limits(next_config["axis_limits"])
+        next_config["axis_limits"] = axis_limits
+        self._validate_range_within_axis_limits(next_config["range_spec"], axis_limits)
+
         range_or_strategy_changed = (
             patch.get("range_spec") is not None
             or patch.get("strategy") is not None
@@ -609,3 +618,48 @@ class TargetSpotControllerProcess(StateMachineProcessBase):
             )
         if stat_changed:
             self._stat_tracker.reconfigure(mode=self._config["stat_mode"], window=self._config["stat_window"])
+
+    @staticmethod
+    def _validate_axis_limits(axis_limits: Json) -> Json:
+        if not isinstance(axis_limits, dict):
+            raise ValueError("axis_limits must be a dict")
+        try:
+            x_min = float(axis_limits["xMin"])
+            x_max = float(axis_limits["xMax"])
+            y_min = float(axis_limits["yMin"])
+            y_max = float(axis_limits["yMax"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("axis_limits requires finite xMin/xMax/yMin/yMax") from exc
+        for name, value in (("xMin", x_min), ("xMax", x_max), ("yMin", y_min), ("yMax", y_max)):
+            if not math.isfinite(value):
+                raise ValueError(f"axis_limits.{name} must be finite")
+        if x_min >= x_max:
+            raise ValueError("axis_limits.xMin must be < axis_limits.xMax")
+        if y_min >= y_max:
+            raise ValueError("axis_limits.yMin must be < axis_limits.yMax")
+        return {"xMin": x_min, "xMax": x_max, "yMin": y_min, "yMax": y_max}
+
+    @staticmethod
+    def _validate_range_within_axis_limits(range_spec: Json, axis_limits: Json) -> None:
+        try:
+            center = range_spec["center"]
+            size = range_spec["size"]
+            cx = float(center["x"])
+            cy = float(center["y"])
+            width = float(size["width"])
+            height = float(size["height"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("range_spec.center/size must contain finite x/y/width/height") from exc
+
+        x_lo, x_hi = cx - width / 2, cx + width / 2
+        y_lo, y_hi = cy - height / 2, cy + height / 2
+        if x_lo < axis_limits["xMin"] or x_hi > axis_limits["xMax"]:
+            raise ValueError(
+                f"range_spec x-bounds [{x_lo}, {x_hi}] exceed axis_limits "
+                f"[{axis_limits['xMin']}, {axis_limits['xMax']}]"
+            )
+        if y_lo < axis_limits["yMin"] or y_hi > axis_limits["yMax"]:
+            raise ValueError(
+                f"range_spec y-bounds [{y_lo}, {y_hi}] exceed axis_limits "
+                f"[{axis_limits['yMin']}, {axis_limits['yMax']}]"
+            )
