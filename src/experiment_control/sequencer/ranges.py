@@ -468,11 +468,3 @@ def _generate_core(
         "gen spec must include one of "
         "range/linspace/triangle/centered_triangle/logspace/geomspace/values/scan2d"
     )
-
-
-# Public aliases for callers outside the sequencer package (e.g.
-# TargetSpotControllerProcess) that need to reuse the exact grid/sample logic
-# a `for: {gen: scan2d, sample: ...}` step already uses, without reaching into
-# underscore-prefixed module-private names.
-generate_scan2d_from_spec = _generate_scan2d_from_spec
-apply_sample = _apply_sample
