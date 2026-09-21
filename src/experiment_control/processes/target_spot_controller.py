@@ -44,8 +44,16 @@ _DEFAULT_CONFIG: Json = {
     "threshold": 2.0,
     "coupling_mode": "pause",
     "settle_s": 0.5,
-    "pause_ack_timeout_s": 15.0,
-    "min_dwell_s": 1.0,
+    # Long enough to cover a full acquisition burst (n_traces PXIe frames)
+    # before concluding the sequencer failed to pause - the old 15.0s
+    # default was tight for that.
+    "pause_ack_timeout_s": 30.0,
+    # Shot-count floor, not a wall-clock duration: how many raw abs_integral
+    # samples must have been collected at this spot before a threshold-
+    # triggered jump is allowed. Defaults to stat_window so a jump can never
+    # fire on a stat estimate built from fewer samples than a full window -
+    # a force_jump still bypasses this immediately, same as before.
+    "min_dwell_shots": 20,
 }
 
 _VISITED_MAX = 2000
@@ -151,7 +159,6 @@ class TargetSpotControllerProcess(StateMachineProcessBase):
         self._visited: list[Json] = []
         self._force_requested = False
         self._force_reason: str | None = None
-        self._entered_holding_mono = time.monotonic()
         self._pause_deadline_mono = 0.0
 
         # Raw per-shot samples for the *current* hold, attached to the
@@ -271,7 +278,7 @@ class TargetSpotControllerProcess(StateMachineProcessBase):
 
     def _tick_holding(self, now_mono: float) -> None:
         stat_value = self._stat_tracker.current_value
-        dwell_ok = (now_mono - self._entered_holding_mono) >= float(self._config["min_dwell_s"])
+        dwell_ok = self._stat_tracker.sample_count >= int(self._config["min_dwell_shots"])
         below_threshold = stat_value is not None and stat_value < float(self._config["threshold"])
         should_jump = self._force_requested or (dwell_ok and below_threshold)
         if not should_jump:
@@ -335,7 +342,6 @@ class TargetSpotControllerProcess(StateMachineProcessBase):
             self._request_sequencer_action("sequencer.resume")
 
         self.transition(_STATE_HOLDING, reason="settled")
-        self._entered_holding_mono = time.monotonic()
 
     # ------------------------------------------------------------------
     # Cross-process RPC to the sequencer (same `manager.processes.rpc`
@@ -548,7 +554,6 @@ class TargetSpotControllerProcess(StateMachineProcessBase):
         if rtype == f"{p}.clear_error":
             if self._state == _STATE_ERROR:
                 self.force_transition(_STATE_HOLDING, reason="clear_error")
-                self._entered_holding_mono = time.monotonic()
                 self._set_last_error(None)
             return self.rpc_ok(req, result={"state": self._state})
 
@@ -574,7 +579,9 @@ class TargetSpotControllerProcess(StateMachineProcessBase):
         if stat_window < 1:
             raise ValueError("stat_window must be >= 1")
         threshold = float(next_config["threshold"])
-        min_dwell_s = float(next_config["min_dwell_s"])
+        min_dwell_shots = int(next_config["min_dwell_shots"])
+        if min_dwell_shots < 0:
+            raise ValueError("min_dwell_shots must be >= 0")
         settle_s = float(next_config["settle_s"])
         pause_ack_timeout_s = float(next_config["pause_ack_timeout_s"])
         if not isinstance(next_config["range_spec"], dict):
@@ -589,7 +596,7 @@ class TargetSpotControllerProcess(StateMachineProcessBase):
 
         next_config["stat_window"] = stat_window
         next_config["threshold"] = threshold
-        next_config["min_dwell_s"] = min_dwell_s
+        next_config["min_dwell_shots"] = min_dwell_shots
         next_config["settle_s"] = settle_s
         next_config["pause_ack_timeout_s"] = pause_ack_timeout_s
         self._config = next_config
