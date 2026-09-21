@@ -87,6 +87,40 @@ class AxisLimitsValidationTests(unittest.TestCase):
         )
         self.assertEqual(self.proc._config["axis_limits"]["xMax"], 20000)
 
+    def test_combined_patch_validates_new_range_against_new_limits_atomically(self) -> None:
+        # A single patch that changes range_spec and axis_limits together
+        # must validate the new range against the new limits (not the
+        # pre-patch limits) - a range that only fits the widened limits is
+        # accepted in one call...
+        self.proc._apply_config_patch(
+            {
+                "axis_limits": {"xMin": -20000, "xMax": 20000, "yMin": -20000, "yMax": 20000},
+                "range_spec": {
+                    "center": {"x": 15000, "y": 0},
+                    "size": {"width": 1000, "height": 1000},
+                    "pitch": 25,
+                },
+            }
+        )
+        self.assertEqual(self.proc._config["range_spec"]["center"], {"x": 15000, "y": 0})
+
+        # ...and a combined patch that is still inconsistent (the new range
+        # doesn't fit the new limits either) is rejected, leaving the prior
+        # config untouched.
+        with self.assertRaises(ValueError):
+            self.proc._apply_config_patch(
+                {
+                    "axis_limits": {"xMin": -500, "xMax": 500, "yMin": -500, "yMax": 500},
+                    "range_spec": {
+                        "center": {"x": 15000, "y": 0},
+                        "size": {"width": 1000, "height": 1000},
+                        "pitch": 25,
+                    },
+                }
+            )
+        self.assertEqual(self.proc._config["axis_limits"]["xMax"], 20000)
+        self.assertEqual(self.proc._config["range_spec"]["center"], {"x": 15000, "y": 0})
+
 
 if __name__ == "__main__":
     unittest.main()
