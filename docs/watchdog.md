@@ -15,6 +15,11 @@ Each YAML file is a ruleset (`watchdog_id`).
 ```yaml
 version: 1
 watchdog_id: vacuum_watchdog
+enabled: true   # optional, default true -- load-time starting state for this
+                # ruleset; watchdog.enable/disable/enable_all/disable_all
+                # still control it at runtime after the process is up. Set
+                # false for a ruleset that should start disabled until a
+                # sequence or operator explicitly enables it.
 
 defaults:
   max_age_s: 2.0

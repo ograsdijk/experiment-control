@@ -213,6 +213,7 @@ class WatchdogRule:
 class WatchdogRuleset:
     watchdog_id: str
     rules: list[WatchdogRule]
+    enabled: bool = True
 
 
 @dataclass
@@ -542,6 +543,12 @@ def _parse_ruleset(raw: Any, *, source: str) -> WatchdogRuleset:
     obj = require_dict(raw, path=[])
     parse_version(obj, allow_type=False)
     watchdog_id = require_str(obj.get("watchdog_id"), path=["watchdog_id"])
+    # Load-time default for this ruleset's enabled state. Purely a starting
+    # point for WatchdogEntry.enabled -- runtime RPCs (watchdog.enable/
+    # disable/enable_all/disable_all) still control it after the process is
+    # up, same as a ruleset that omits this key (defaults True, matching
+    # pre-existing behavior for every ruleset that doesn't set it).
+    enabled = coerce_bool(obj.get("enabled"), default=True)
     (
         defaults_max_age,
         defaults_stable,
@@ -561,7 +568,7 @@ def _parse_ruleset(raw: Any, *, source: str) -> WatchdogRuleset:
         defaults_on_unknown=defaults_on_unknown,
         source=source,
     )
-    return WatchdogRuleset(watchdog_id=watchdog_id, rules=rules)
+    return WatchdogRuleset(watchdog_id=watchdog_id, rules=rules, enabled=enabled)
 
 
 def _load_ruleset(path: Path) -> WatchdogRuleset:
@@ -1078,7 +1085,7 @@ class WatchdogProcess(ManagedProcessBase):
             if ruleset.watchdog_id in self._watchdog_entries:
                 raise ValueError(f"Duplicate watchdog_id {ruleset.watchdog_id!r}")
             self._watchdog_entries[ruleset.watchdog_id] = WatchdogEntry(
-                ruleset=ruleset, enabled=True
+                ruleset=ruleset, enabled=ruleset.enabled
             )
             self._ruleset_order.append(ruleset.watchdog_id)
 
