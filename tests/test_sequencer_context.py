@@ -706,5 +706,31 @@ class SequencerProcessSetContextDispatchTests(unittest.TestCase):
         self.assertIn("timed out", str(error))
 
 
+class ContextColumnsPlacementTests(unittest.TestCase):
+    def test_top_level_context_columns_parses(self) -> None:
+        from experiment_control.sequencer.ast import parse_sequence
+
+        spec = parse_sequence(
+            {
+                "version": 1,
+                "context_columns": {"hv_v": "float64"},
+                "steps": [],
+            }
+        )
+        self.assertEqual(spec.context_columns, {"hv_v": "float64"})
+
+    def test_meta_context_columns_is_rejected(self) -> None:
+        from experiment_control.sequencer.ast import parse_sequence
+
+        with self.assertRaises(TypeError):
+            parse_sequence(
+                {
+                    "version": 1,
+                    "meta": {"context_columns": {"hv_v": "float64"}},
+                    "steps": [],
+                }
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
