@@ -275,5 +275,65 @@ class TickBudgetTests(unittest.TestCase):
         self.assertGreater(legacy_delay_ms, adaptive_delay_ms * 10)
 
 
+class AtomicBoundaryTests(unittest.TestCase):
+    def test_repeated_bursts_yield_for_rpc_before_next_trigger(self) -> None:
+        calls: list[str] = []
+        runtime = SequencerRuntime(
+            call_device=lambda d, a, p: calls.append(a) or {"ok": True},
+            get_telemetry=lambda *_: None,
+            set_stream_context=lambda *_: None,
+        )
+        runtime.load(parse_sequence({"version": 1, "steps": [
+            {"repeat": {"times": 2, "do": [{"atomic": {"do": [
+                {"call": {"device": "gate", "action": "trigger"}},
+                {"call": {"device": "scope", "action": "fetch"}},
+            ]}}]}},
+        ]}))
+        runtime.start()
+        runtime.tick()
+        self.assertEqual(calls, ["trigger", "fetch"])
+        # This models a pause RPC delivered while the atomic tick was busy.
+        runtime.request_pause()
+        runtime.tick()
+        self.assertEqual(runtime.state, "PAUSED")
+        self.assertEqual(calls, ["trigger", "fetch"])
+        runtime.resume()
+        runtime.tick()
+        self.assertEqual(calls, ["trigger", "fetch", "trigger", "fetch"])
+        runtime.tick()
+        self.assertEqual(runtime.state, "STOPPED")
+
+    def test_nested_atomic_defers_stop_until_outer_boundary_and_runs_cleanup(self) -> None:
+        calls: list[str] = []
+
+        def call(device: str, action: str, params: dict) -> dict:
+            calls.append(action)
+            if action == "trigger":
+                runtime.request_stop()
+            return {"ok": True}
+
+        runtime = SequencerRuntime(
+            call_device=call, get_telemetry=lambda *_: None,
+            set_stream_context=lambda *_: None,
+        )
+        runtime.load(parse_sequence({"version": 1, "steps": [{"try": {
+            "do": [{"atomic": {"do": [
+                {"call": {"device": "gate", "action": "trigger"}},
+                {"atomic": {"do": [{"call": {"device": "scope", "action": "fetch"}}]}},
+                {"call": {"device": "clock", "action": "timestamp"}},
+            ]}}, {"atomic": {"do": [{"call": {"device": "gate", "action": "next_trigger"}}]}}],
+            "finally": [{"call": {"device": "gate", "action": "disarm"}}],
+        }}]}))
+        runtime.start()
+        runtime.tick()
+        self.assertEqual(calls, ["trigger", "fetch", "timestamp"])
+        for _ in range(10):
+            runtime.tick()
+            if runtime.state != "RUNNING":
+                break
+        self.assertEqual(runtime.state, "STOPPED")
+        self.assertEqual(calls, ["trigger", "fetch", "timestamp", "disarm"])
+
+
 if __name__ == "__main__":
     unittest.main()

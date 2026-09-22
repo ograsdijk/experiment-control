@@ -1345,10 +1345,18 @@ class SequencerRuntime:
                 if frame.index >= len(frame.steps):
                     self._stack.pop()
                     if frame.on_exit:
+                        atomic_depth_before_exit = self._atomic_depth
                         frame.on_exit()
                         if self._state != "RUNNING":
                             return None
                         if self._adaptive_observe_state is not None:
+                            return _NO_STEP_READY
+                        if atomic_depth_before_exit > 0 and self._atomic_depth == 0:
+                            # Yield at the outermost atomic boundary BEFORE
+                            # consuming another step. The RPC loop must receive
+                            # pending pause/stop requests between adjacent or
+                            # repeated bursts, even if no request was visible
+                            # when this tick entered the atomic block.
                             return _NO_STEP_READY
                     continue
                 step = frame.steps[frame.index]
