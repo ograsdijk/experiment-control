@@ -3713,9 +3713,14 @@ class SequencerProcess(ManagedProcessBase):
                 )
                 self._maybe_publish_progress_event()
                 if self._runtime.state == "ERROR" and not self._last_error_sent:
-                    err_message = str(
-                        self._runtime.status().get("error") or "sequencer error"
+                    status = self._runtime.status()
+                    error_detail = status.get("error_detail")
+                    formatted_error = (
+                        error_detail.get("formatted")
+                        if isinstance(error_detail, dict)
+                        else None
                     )
+                    err_message = str(formatted_error or status.get("error") or "sequencer error")
                     self._publish_lifecycle_event(
                         event="error",
                         ok=False,
@@ -3725,6 +3730,10 @@ class SequencerProcess(ManagedProcessBase):
                     self._publish_log(
                         severity="error",
                         message=err_message,
+                        details={
+                            "run_id": status.get("run_id"),
+                            "error_detail": error_detail,
+                        },
                     )
                     self._last_error_sent = True
                 if self._runtime.state in {"IDLE", "RUNNING", "PAUSED", "STOPPED"}:
@@ -3795,7 +3804,12 @@ class SequencerProcess(ManagedProcessBase):
                 continue
             self._runtime.record_analysis_output(payload)
 
-    def _publish_log(self, *, severity: str, message: str) -> None:
+    def _publish_log(
+        self, *, severity: str, message: str, details: Json | None = None
+    ) -> None:
+        log_context: Json = {"process_id": self._process_id}
+        if details:
+            log_context.update(details)
         payload = {
             "version": 1,
             "severity": severity,
@@ -3805,7 +3819,7 @@ class SequencerProcess(ManagedProcessBase):
             "device_id": None,
             "process_id": self._process_id,
             "message": message,
-            "payload_json": json.dumps({"process_id": self._process_id}),
+            "payload_json": json.dumps(log_context),
             "ts": {"t_wall": time.time(), "t_mono": time.monotonic()},
         }
         if self._try_publish_log_payload(payload):
