@@ -562,6 +562,10 @@ export function nodeKindFromOp(op: string): StreamDagOutputKind | null {
   return STREAM_DAG_OPS[op as StreamDagOpId].outputKind;
 }
 
+export function isResettableHistogramAggregateOp(op: StreamDagOpId): boolean {
+  return op === "aggregate.bin_stats" || op === "aggregate.bin_ratio_stats";
+}
+
 export function isPublishableNodeKind(
   kind: StreamDagOutputKind | null
 ): kind is "scalar" | "hist_agg" | "hist2d" | "trace" | "params_map" | "fit_1d" {
