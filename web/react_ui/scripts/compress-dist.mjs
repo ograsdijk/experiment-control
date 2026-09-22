@@ -48,6 +48,9 @@ for await (const path of walk(dist)) {
       },
     }),
   ]);
+  // zlib stamps the host OS into gzip header byte 9. Use the standardized
+  // "unknown" value so committed assets match across Windows and Unix builds.
+  gz[9] = 255;
   await Promise.all([
     writeFile(`${path}.gz`, gz),
     writeFile(`${path}.br`, br),
