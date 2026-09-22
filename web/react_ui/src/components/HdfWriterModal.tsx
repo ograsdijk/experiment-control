@@ -12,7 +12,8 @@
 } from "@mantine/core";
 import { IconRefresh } from "@tabler/icons-react";
 import type { ReactNode } from "react";
-import { processStateColor } from "../features/runtime/helpers";
+import { fileNameFromPath, processStateColor } from "../features/runtime/helpers";
+import { formatHdfPhaseTimings } from "../features/hdf/utils";
 import type {
   HdfWriterStatus,
   MeasurementFieldSchema,
@@ -274,6 +275,26 @@ export function HdfWriterModal({
             {hdfWriterStatus.error}
           </Text>
         )}
+        {hdfWriterStatus?.fileOp && (
+          <Text size="sm" c="yellow">
+            {hdfWriterStatus.fileOp.op === "rotate" ? "Rotating" : "Finalizing"}{" "}
+            {fileNameFromPath(hdfWriterStatus.fileOp.file) ?? "file"}
+            {hdfWriterStatus.fileOp.newFile
+              ? ` → ${fileNameFromPath(hdfWriterStatus.fileOp.newFile)}`
+              : ""}
+            …{" "}
+            {hdfWriterStatus.fileOp.elapsedS !== null
+              ? `${hdfWriterStatus.fileOp.elapsedS.toFixed(0)} s`
+              : ""}
+            . File commands are unavailable until it finishes.
+          </Text>
+        )}
+        {!hdfWriterStatus?.fileOp && hdfWriterStatus?.lastFileOp?.ok === false && (
+          <Text size="sm" c="red">
+            Last {hdfWriterStatus.lastFileOp.op} failed:{" "}
+            {hdfWriterStatus.lastFileOp.errorMessage ?? "unknown error"}
+          </Text>
+        )}
 
         <Card radius="md" p="sm" style={{ border: "1px solid var(--card-border)" }}>
           <Stack gap={8}>
@@ -281,12 +302,18 @@ export function HdfWriterModal({
               <Badge variant="light" color="gray">
                 pending {hdfWriterStatus?.pending ?? "n/a"}
               </Badge>
-              <Badge
-                variant="light"
-                color={hdfWriterStatus?.writingActive ? "teal" : "orange"}
-              >
-                writing {hdfWriterStatus?.writingActive ? "active" : "stopped"}
-              </Badge>
+              {hdfWriterStatus?.fileOp ? (
+                <Badge variant="light" color="yellow">
+                  writing {hdfWriterStatus.fileState}
+                </Badge>
+              ) : (
+                <Badge
+                  variant="light"
+                  color={hdfWriterStatus?.writingActive ? "teal" : "orange"}
+                >
+                  writing {hdfWriterStatus?.writingActive ? "active" : "stopped"}
+                </Badge>
+              )}
               <Badge variant="light" color="gray">
                 dropped {hdfWriterStatus?.dropped ?? "n/a"}
               </Badge>
@@ -345,6 +372,18 @@ export function HdfWriterModal({
             {hdfWriterStatus?.measurementId && (
               <Text size="xs" c="dimmed" style={{ wordBreak: "break-all" }}>
                 measurement_id: {hdfWriterStatus.measurementId}
+              </Text>
+            )}
+            {hdfWriterStatus?.lastFileOp?.ok && (
+              <Text size="xs" c="dimmed" style={{ wordBreak: "break-all" }}>
+                last {hdfWriterStatus.lastFileOp.op}:{" "}
+                {fileNameFromPath(hdfWriterStatus.lastFileOp.file) ?? "file"}
+                {hdfWriterStatus.lastFileOp.durationS !== null
+                  ? ` in ${hdfWriterStatus.lastFileOp.durationS.toFixed(1)} s`
+                  : ""}
+                {Object.keys(hdfWriterStatus.lastFileOp.phaseTimingsS).length > 0
+                  ? ` (${formatHdfPhaseTimings(hdfWriterStatus.lastFileOp.phaseTimingsS)})`
+                  : ""}
               </Text>
             )}
             {hdfMeasurementSchemaDisplayPath && (

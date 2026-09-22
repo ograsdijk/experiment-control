@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import time
 from typing import Any
 
 from ._base import ClientFacadeBase
+from ..errors import RpcResponseError
 from ..types import Json
 
 
@@ -73,10 +75,16 @@ class HdfAPI(ClientFacadeBase):
     def writing_stop(
         self,
         *,
+        wait: bool = False,
+        wait_timeout_s: float = 120.0,
         timeout_ms: int | None = None,
         retries: int | None = None,
     ) -> Any:
-        return self.call("hdf.writing.stop", {}, timeout_ms=timeout_ms, retries=retries)
+        """Stop writing. The writer replies once the stop is accepted and closes
+        the file in the background; ``wait=True`` blocks until it is closed
+        (see `wait_for_file_op`)."""
+        result = self.call("hdf.writing.stop", {}, timeout_ms=timeout_ms, retries=retries)
+        return self._maybe_wait(result, wait=wait, wait_timeout_s=wait_timeout_s)
 
     def rotate(
         self,
@@ -85,9 +93,13 @@ class HdfAPI(ClientFacadeBase):
         disabled_devices: list[str] | None = None,
         measurement_profile: str | None = None,
         measurement_values: Json | None = None,
+        wait: bool = False,
+        wait_timeout_s: float = 120.0,
         timeout_ms: int | None = None,
         retries: int | None = None,
     ) -> Any:
+        """Rotate to a new file. Replies once accepted; the swap finishes in
+        the background. ``wait=True`` blocks until it is done."""
         params: Json = {}
         if filename is not None:
             params["filename"] = str(filename)
@@ -97,7 +109,45 @@ class HdfAPI(ClientFacadeBase):
             params["measurement_profile"] = str(measurement_profile)
         if measurement_values is not None:
             params["measurement_values"] = dict(measurement_values)
-        return self.call("hdf.rotate", params, timeout_ms=timeout_ms, retries=retries)
+        result = self.call("hdf.rotate", params, timeout_ms=timeout_ms, retries=retries)
+        return self._maybe_wait(result, wait=wait, wait_timeout_s=wait_timeout_s)
+
+    def wait_for_file_op(
+        self,
+        *,
+        timeout_s: float = 120.0,
+        poll_interval_s: float = 0.5,
+    ) -> Json | None:
+        """Block until no async stop/rotate is in flight; return its outcome
+        (``hdf.status`` ``last_file_op``). Raises `RpcResponseError` if the op
+        failed and `TimeoutError` if it is still running after ``timeout_s``."""
+        deadline = time.monotonic() + max(0.0, float(timeout_s))
+        while True:
+            status = self.status()
+            # Writers without async file ops report no `file_op` at all.
+            if not isinstance(status, dict) or status.get("file_op") is None:
+                break
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"hdf_writer file op still running after {timeout_s} s: "
+                    f"{status.get('file_op')!r}"
+                )
+            time.sleep(max(0.05, float(poll_interval_s)))
+        outcome = status.get("last_file_op") if isinstance(status, dict) else None
+        if isinstance(outcome, dict) and outcome.get("ok") is False:
+            error = outcome.get("error")
+            error = error if isinstance(error, dict) else {}
+            raise RpcResponseError(
+                code=str(error.get("code") or f"{outcome.get('op')}_failed"),
+                message=str(error.get("message") or "hdf file op failed"),
+                details=outcome,
+            )
+        return outcome if isinstance(outcome, dict) else None
+
+    def _maybe_wait(self, result: Any, *, wait: bool, wait_timeout_s: float) -> Any:
+        if not wait or not isinstance(result, dict) or result.get("accepted") is not True:
+            return result
+        return {**result, "file_op": self.wait_for_file_op(timeout_s=wait_timeout_s)}
 
     def devices_get(
         self,

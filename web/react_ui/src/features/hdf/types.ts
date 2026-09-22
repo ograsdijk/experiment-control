@@ -1,5 +1,31 @@
+/** `closing` / `rotating`: an async hdf.writing.stop / hdf.rotate is still
+ * finishing on the writer's background thread. */
+export type HdfFileState = "idle" | "writing" | "closing" | "rotating";
+
+export type HdfFileOpInFlight = {
+  op: string;
+  file: string | null;
+  newFile: string | null;
+  elapsedS: number | null;
+};
+
+export type HdfFileOpOutcome = {
+  op: string;
+  ok: boolean;
+  file: string | null;
+  newFile: string | null;
+  startedWall: number | null;
+  durationS: number | null;
+  errorMessage: string | null;
+  phaseTimingsS: Record<string, number>;
+  heldDropped: number;
+};
+
 export type HdfWriterStatus = {
   writingActive: boolean;
+  fileState: HdfFileState;
+  fileOp: HdfFileOpInFlight | null;
+  lastFileOp: HdfFileOpOutcome | null;
   autostartWriting: boolean;
   filePath: string | null;
   fileName: string | null;

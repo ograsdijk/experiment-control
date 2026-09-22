@@ -1,6 +1,9 @@
 ﻿import { sameStringArray } from "../common/compare";
 import { normalizeStringList } from "../common/normalize";
 import type {
+  HdfFileOpInFlight,
+  HdfFileOpOutcome,
+  HdfFileState,
   HdfWriterStatus,
   MeasurementFieldSchema,
   MeasurementFieldType,
@@ -160,6 +163,112 @@ export function coerceMeasurementFieldValue(
   return text;
 }
 
+function finiteOrNull(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function nonEmptyStringOrNull(value: unknown): string | null {
+  return typeof value === "string" && value.trim().length > 0 ? value : null;
+}
+
+export function normalizeHdfFileState(raw: unknown, writingActive: boolean): HdfFileState {
+  if (raw === "idle" || raw === "writing" || raw === "closing" || raw === "rotating") {
+    return raw;
+  }
+  // Writers that predate async file ops don't report file_state.
+  return writingActive ? "writing" : "idle";
+}
+
+export function normalizeHdfFileOp(raw: unknown): HdfFileOpInFlight | null {
+  if (!raw || typeof raw !== "object") {
+    return null;
+  }
+  const obj = raw as Record<string, unknown>;
+  const op = nonEmptyStringOrNull(obj.op);
+  if (!op) {
+    return null;
+  }
+  return {
+    op,
+    file: nonEmptyStringOrNull(obj.file),
+    newFile: nonEmptyStringOrNull(obj.new_file),
+    elapsedS: finiteOrNull(obj.elapsed_s),
+  };
+}
+
+export function normalizeHdfFileOpOutcome(raw: unknown): HdfFileOpOutcome | null {
+  if (!raw || typeof raw !== "object") {
+    return null;
+  }
+  const obj = raw as Record<string, unknown>;
+  const op = nonEmptyStringOrNull(obj.op);
+  if (!op) {
+    return null;
+  }
+  const error =
+    obj.error && typeof obj.error === "object"
+      ? (obj.error as Record<string, unknown>)
+      : null;
+  const phaseTimingsS: Record<string, number> = {};
+  if (obj.phase_timings_s && typeof obj.phase_timings_s === "object") {
+    for (const [phase, seconds] of Object.entries(
+      obj.phase_timings_s as Record<string, unknown>
+    )) {
+      const value = finiteOrNull(seconds);
+      if (value !== null) {
+        phaseTimingsS[phase] = value;
+      }
+    }
+  }
+  return {
+    op,
+    ok: obj.ok === true,
+    file: nonEmptyStringOrNull(obj.file),
+    newFile: nonEmptyStringOrNull(obj.new_file),
+    startedWall: finiteOrNull(obj.started_wall),
+    durationS: finiteOrNull(obj.duration_s),
+    errorMessage:
+      nonEmptyStringOrNull(error?.message) ?? nonEmptyStringOrNull(error?.code),
+    phaseTimingsS,
+    heldDropped: Math.max(0, Math.trunc(finiteOrNull(obj.held_dropped) ?? 0)),
+  };
+}
+
+/** Identity of a completed op, used to notice when a new one has finished. */
+export function hdfFileOpOutcomeKey(outcome: HdfFileOpOutcome | null): string | null {
+  if (!outcome) {
+    return null;
+  }
+  return `${outcome.op}:${outcome.startedWall ?? ""}:${outcome.file ?? ""}`;
+}
+
+/** e.g. "close 11.8 s, drain 2.1 s" — the slowest phases first. */
+export function formatHdfPhaseTimings(
+  phaseTimingsS: Record<string, number>,
+  limit = 3
+): string {
+  return Object.entries(phaseTimingsS)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, limit)
+    .map(([phase, seconds]) => `${phase} ${seconds.toFixed(1)} s`)
+    .join(", ");
+}
+
+function sameFileOp(
+  a: HdfFileOpInFlight | null,
+  b: HdfFileOpInFlight | null
+): boolean {
+  if (a === null || b === null) {
+    return a === b;
+  }
+  return (
+    a.op === b.op &&
+    a.file === b.file &&
+    a.newFile === b.newFile &&
+    a.elapsedS === b.elapsedS
+  );
+}
+
 export function sameHdfWriterStatus(
   current: HdfWriterStatus | undefined,
   nextStatus: HdfWriterStatus
@@ -169,6 +278,10 @@ export function sameHdfWriterStatus(
   }
   return (
     current.writingActive === nextStatus.writingActive &&
+    current.fileState === nextStatus.fileState &&
+    sameFileOp(current.fileOp, nextStatus.fileOp) &&
+    hdfFileOpOutcomeKey(current.lastFileOp) ===
+      hdfFileOpOutcomeKey(nextStatus.lastFileOp) &&
     current.autostartWriting === nextStatus.autostartWriting &&
     current.filePath === nextStatus.filePath &&
     current.fileName === nextStatus.fileName &&

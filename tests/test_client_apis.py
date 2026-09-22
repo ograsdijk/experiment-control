@@ -2,6 +2,7 @@
 
 import sys
 import unittest
+import unittest.mock
 from pathlib import Path
 from typing import Any
 
@@ -11,9 +12,11 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from experiment_control.client.apis.device import DeviceAPI, DeviceHandle
+from experiment_control.client.apis.hdf import HdfAPI
 from experiment_control.client.apis.manager import ManagerAPI
 from experiment_control.client.apis.process import ProcessAPI, ProcessHandle
 from experiment_control.client.apis.sequencer import SequencerAPI
+from experiment_control.client.errors import RpcResponseError
 
 
 class _FakeClient:
@@ -99,6 +102,84 @@ class ClientApiTests(unittest.TestCase):
         self.assertEqual(client.calls[1]["payload"]["force"], True)
         self.assertEqual(client.calls[2]["payload"]["process_id"], "proc")
         self.assertEqual(client.calls[3]["payload"]["type"], "manager.processes.restart")
+
+
+class _ScriptedHdfClient:
+    """Replies to hdf RPCs from per-action scripts (last entry repeats)."""
+
+    def __init__(self, replies: dict[str, list[Any]]) -> None:
+        self.replies = replies
+        self.actions: list[str] = []
+
+    def rpc(self, payload: dict[str, Any], **_kwargs: Any) -> Any:
+        action = payload["request"]["type"]
+        self.actions.append(action)
+        script = self.replies[action]
+        return script.pop(0) if len(script) > 1 else script[0]
+
+
+class HdfApiWaitTests(unittest.TestCase):
+    def test_writing_stop_without_wait_returns_accepted_reply(self) -> None:
+        client = _ScriptedHdfClient({"hdf.writing.stop": [{"accepted": True}]})
+        api = HdfAPI(client)  # type: ignore[arg-type]
+        self.assertEqual(api.writing_stop(), {"accepted": True})
+        self.assertEqual(client.actions, ["hdf.writing.stop"])
+
+    def test_writing_stop_wait_polls_until_file_op_done(self) -> None:
+        outcome = {"op": "stop", "ok": True, "file": "a.h5", "duration_s": 3.0}
+        client = _ScriptedHdfClient(
+            {
+                "hdf.writing.stop": [{"accepted": True, "old_file": "a.h5"}],
+                "hdf.status": [
+                    {"file_state": "closing", "file_op": {"op": "stop"}},
+                    {"file_state": "idle", "file_op": None, "last_file_op": outcome},
+                ],
+            }
+        )
+        api = HdfAPI(client)  # type: ignore[arg-type]
+        with unittest.mock.patch("time.sleep"):
+            result = api.writing_stop(wait=True)
+        self.assertEqual(result["file_op"], outcome)
+        self.assertEqual(result["old_file"], "a.h5")
+        self.assertEqual(
+            client.actions, ["hdf.writing.stop", "hdf.status", "hdf.status"]
+        )
+
+    def test_rotate_wait_raises_when_op_failed(self) -> None:
+        client = _ScriptedHdfClient(
+            {
+                "hdf.rotate": [{"accepted": True}],
+                "hdf.status": [
+                    {
+                        "file_op": None,
+                        "last_file_op": {
+                            "op": "rotate",
+                            "ok": False,
+                            "error": {"code": "rotate_failed", "message": "boom"},
+                        },
+                    }
+                ],
+            }
+        )
+        api = HdfAPI(client)  # type: ignore[arg-type]
+        with self.assertRaises(RpcResponseError) as ctx:
+            api.rotate(filename="b.h5", wait=True)
+        self.assertEqual(ctx.exception.code, "rotate_failed")
+
+    def test_wait_times_out(self) -> None:
+        client = _ScriptedHdfClient(
+            {"hdf.status": [{"file_state": "closing", "file_op": {"op": "stop"}}]}
+        )
+        api = HdfAPI(client)  # type: ignore[arg-type]
+        with self.assertRaises(TimeoutError):
+            api.wait_for_file_op(timeout_s=0.0)
+
+    def test_synchronous_reply_skips_wait(self) -> None:
+        # Older writers (or no bg thread) finish inside the RPC: no `accepted`.
+        client = _ScriptedHdfClient({"hdf.writing.stop": [{"old_file": "a.h5"}]})
+        api = HdfAPI(client)  # type: ignore[arg-type]
+        self.assertEqual(api.writing_stop(wait=True), {"old_file": "a.h5"})
+        self.assertEqual(client.actions, ["hdf.writing.stop"])
 
 
 if __name__ == "__main__":

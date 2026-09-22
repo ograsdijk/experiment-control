@@ -18,6 +18,11 @@ import type {
 import {
   coerceMeasurementFieldValue,
   formatFieldDefaultValue,
+  formatHdfPhaseTimings,
+  hdfFileOpOutcomeKey,
+  normalizeHdfFileOp,
+  normalizeHdfFileOpOutcome,
+  normalizeHdfFileState,
   normalizeMeasurementSchema,
   sameHdfWriterStatus,
 } from "./utils";
@@ -99,6 +104,14 @@ export function useHdfController({
   const [hdfStatusLoadingByProcessId, setHdfStatusLoadingByProcessId] =
     useState<Record<string, boolean>>({});
   const hdfMeasurementIdRef = useRef<string | null>(null);
+  // Tracks the last completed async stop/rotate so its outcome is toasted once.
+  // `armed`: an op was started from here or seen in flight, so the next new
+  // outcome is one the operator is waiting for (not a stale one on page load).
+  const hdfFileOpWatchRef = useRef<{
+    processId: string | null;
+    key: string | null;
+    armed: boolean;
+  }>({ processId: null, key: null, armed: false });
   const hdfStatusByProcessIdRef = useRef(hdfStatusByProcessId);
 
   useEffect(() => {
@@ -179,7 +192,12 @@ export function useHdfController({
   const hdfWritingStartBusy = Boolean(hdfCommandBusyByAction["hdf.writing.start"]);
   const hdfWritingStopBusy = Boolean(hdfCommandBusyByAction["hdf.writing.stop"]);
   const hdfMeasurementNoteBusy = Boolean(hdfCommandBusyByAction["hdf.measurement.note"]);
-  const hdfAnyCommandBusy = Object.values(hdfCommandBusyByAction).some(Boolean);
+  // An async stop/rotate still finishing on the writer: the writer rejects
+  // file/filter commands until it is done, so treat the modal as busy.
+  const hdfFileOpActive =
+    hdfWriterStatus?.fileState === "closing" || hdfWriterStatus?.fileState === "rotating";
+  const hdfAnyCommandBusy =
+    hdfFileOpActive || Object.values(hdfCommandBusyByAction).some(Boolean);
   const hdfCommandsBlocked = !hdfWriterProcessId || !hdfRpcAvailable;
   const hdfMeasurementSchemaState = hdfWriterProcessId
     ? hdfMeasurementSchemaByProcessId[hdfWriterProcessId]
@@ -218,9 +236,16 @@ export function useHdfController({
     hdfSupportsMeasurementNote &&
     hdfShowMeasurementUi &&
     (hdfMeasurementSchema?.notes.fields.length ?? 0) > 0;
-  const hdfWriterFileLabel =
+  const hdfWriterBaseFileLabel =
     hdfWriterStatus?.fileName ?? (hdfWriterStatus?.error ? "status unavailable" : "no file");
-  const hdfWriterChipColor = hdfWriterStatus?.writingActive === true ? "teal" : "gray";
+  const hdfWriterFileLabel = hdfFileOpActive
+    ? `${hdfWriterStatus?.fileState ?? "closing"} ${hdfWriterBaseFileLabel}`
+    : hdfWriterBaseFileLabel;
+  const hdfWriterChipColor = hdfFileOpActive
+    ? "yellow"
+    : hdfWriterStatus?.writingActive === true
+      ? "teal"
+      : "gray";
 
   const setHdfStatusLoading = useCallback((processId: string, loading: boolean) => {
     setHdfStatusLoadingByProcessId((prev) => {
@@ -258,6 +283,9 @@ export function useHdfController({
             const current = prev[processId];
             const nextStatus: HdfWriterStatus = {
               writingActive: current?.writingActive ?? false,
+              fileState: current?.fileState ?? "idle",
+              fileOp: current?.fileOp ?? null,
+              lastFileOp: current?.lastFileOp ?? null,
               autostartWriting: current?.autostartWriting ?? false,
               filePath: current?.filePath ?? null,
               fileName: current?.fileName ?? null,
@@ -291,6 +319,9 @@ export function useHdfController({
         }
         const result = resp.result as {
           writing_active?: unknown;
+          file_state?: unknown;
+          file_op?: unknown;
+          last_file_op?: unknown;
           autostart_writing?: unknown;
           file?: unknown;
           pending?: unknown;
@@ -314,6 +345,9 @@ export function useHdfController({
           measurement_schema_error?: unknown;
         };
         const writingActive = result.writing_active === true;
+        const fileState = normalizeHdfFileState(result.file_state, writingActive);
+        const fileOp = normalizeHdfFileOp(result.file_op);
+        const lastFileOp = normalizeHdfFileOpOutcome(result.last_file_op);
         const autostartWriting = result.autostart_writing === true;
         const filePath = typeof result.file === "string" ? result.file : null;
         const pending =
@@ -362,11 +396,12 @@ export function useHdfController({
           Number.isFinite(result.measurement_ended_wall_ns)
             ? Math.trunc(result.measurement_ended_wall_ns)
             : null;
+        // Omitted from the reduced status sent while a stop/rotate finishes.
         const measurementNotesRows =
           typeof result.measurement_notes_rows === "number" &&
           Number.isFinite(result.measurement_notes_rows)
             ? Math.max(0, Math.trunc(result.measurement_notes_rows))
-            : 0;
+            : null;
         const measurementSchemaConfigured = result.measurement_schema_configured === true;
         const measurementSchemaAvailable = result.measurement_schema_available === true;
         const measurementSchemaPath =
@@ -383,6 +418,9 @@ export function useHdfController({
           const current = prev[processId];
           const nextStatus: HdfWriterStatus = {
             writingActive,
+            fileState,
+            fileOp,
+            lastFileOp,
             autostartWriting,
             filePath,
             fileName: fileNameFromPath(filePath),
@@ -400,7 +438,8 @@ export function useHdfController({
             measurementSchemaVersion,
             measurementStartedWallNs,
             measurementEndedWallNs,
-            measurementNotesRows,
+            measurementNotesRows:
+              measurementNotesRows ?? current?.measurementNotesRows ?? 0,
             measurementSchemaConfigured,
             measurementSchemaAvailable,
             measurementSchemaPath,
@@ -418,6 +457,9 @@ export function useHdfController({
           const current = prev[processId];
           const nextStatus: HdfWriterStatus = {
             writingActive: current?.writingActive ?? false,
+            fileState: current?.fileState ?? "idle",
+            fileOp: current?.fileOp ?? null,
+            lastFileOp: current?.lastFileOp ?? null,
             autostartWriting: current?.autostartWriting ?? false,
             filePath: current?.filePath ?? null,
             fileName: current?.fileName ?? null,
@@ -779,11 +821,27 @@ export function useHdfController({
           });
           return false;
         }
-        notifications.show({
-          color: "teal",
-          title: successTitle,
-          message: `${processId}.${action}`,
-        });
+        const result =
+          resp.result && typeof resp.result === "object"
+            ? (resp.result as { accepted?: unknown; old_file?: unknown })
+            : null;
+        if (result?.accepted === true) {
+          // Async stop/rotate: the writer replied before finishing the file.
+          // The completion toast comes from the hdf.status watcher below.
+          hdfFileOpWatchRef.current.armed = true;
+          const oldFile = typeof result.old_file === "string" ? result.old_file : null;
+          notifications.show({
+            color: "yellow",
+            title: `${successTitle}: finalizing…`,
+            message: `${fileNameFromPath(oldFile) ?? processId} is being closed in the background.`,
+          });
+        } else {
+          notifications.show({
+            color: "teal",
+            title: successTitle,
+            message: `${processId}.${action}`,
+          });
+        }
         await refreshHdfWriterStatus(processId);
         if (action === "hdf.rotate") {
           await refreshProcesses();
@@ -1172,7 +1230,8 @@ export function useHdfController({
     );
   useAdaptivePolling({
     enabled: hdfProcessPollingEnabled,
-    intervalMs: 5000,
+    // Poll faster while a stop/rotate finishes so its completion shows promptly.
+    intervalMs: hdfFileOpActive ? 1000 : 5000,
     poll: async () =>
       hdfWriterProcess
         ? refreshHdfWriterStatus(hdfWriterProcess.process_id)
@@ -1181,6 +1240,60 @@ export function useHdfController({
     endpoint: "/api/processes/hdf/status",
     restartKey: hdfWriterProcess?.process_id ?? null,
   });
+
+  useEffect(() => {
+    if (!hdfWriterProcessId || !hdfWriterStatus) {
+      return;
+    }
+    const inFlight =
+      hdfWriterStatus.fileState === "closing" || hdfWriterStatus.fileState === "rotating";
+    const key = hdfFileOpOutcomeKey(hdfWriterStatus.lastFileOp);
+    const watch = hdfFileOpWatchRef.current;
+    if (watch.processId !== hdfWriterProcessId) {
+      hdfFileOpWatchRef.current = { processId: hdfWriterProcessId, key, armed: inFlight };
+      return;
+    }
+    if (inFlight) {
+      watch.armed = true;
+    }
+    if (key === watch.key) {
+      return;
+    }
+    watch.key = key;
+    const outcome = hdfWriterStatus.lastFileOp;
+    if (!watch.armed || !outcome) {
+      return;
+    }
+    watch.armed = inFlight;
+    const duration =
+      outcome.durationS !== null ? ` in ${outcome.durationS.toFixed(1)} s` : "";
+    const phases = formatHdfPhaseTimings(outcome.phaseTimingsS);
+    const dropped =
+      outcome.heldDropped > 0
+        ? ` ${outcome.heldDropped} messages were dropped while finishing.`
+        : "";
+    const fileName = fileNameFromPath(outcome.file) ?? "file";
+    if (!outcome.ok) {
+      notifications.show({
+        color: "red",
+        title: `HDF ${outcome.op} failed`,
+        message: `${fileName}: ${outcome.errorMessage ?? "unknown error"}${dropped}`,
+        autoClose: 15000,
+      });
+      return;
+    }
+    const target =
+      outcome.op === "rotate"
+        ? `${fileName} → ${fileNameFromPath(outcome.newFile) ?? "new file"}`
+        : fileName;
+    notifications.show({
+      color: dropped ? "orange" : "teal",
+      title: outcome.op === "rotate" ? "HDF file rotated" : "HDF file closed",
+      message: `${target}${duration}${phases ? ` (${phases})` : ""}.${dropped}`,
+      autoClose: dropped ? 15000 : undefined,
+    });
+    void refreshDevices();
+  }, [hdfWriterProcessId, hdfWriterStatus, refreshDevices]);
 
   useEffect(() => {
     if (!hdfWriterProcess && hdfModalOpen) {
@@ -1296,6 +1409,7 @@ export function useHdfController({
     hdfWritingStopBusy,
     hdfMeasurementNoteBusy,
     hdfAnyCommandBusy,
+    hdfFileOpActive,
     hdfCommandsBlocked,
     hdfMeasurementSchemaLoading,
     hdfMeasurementSchema,

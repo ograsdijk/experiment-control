@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import queue
+import threading
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 Json = dict[str, Any]
@@ -49,11 +51,42 @@ class _BgRequest:
 
 
 @dataclass
-class _RotateRequest(_BgRequest):
-    filename: str | None = None
+class _FileOpRequest:
+    """A file close/rotate executed on the bg thread instead of the RPC thread.
+
+    Closing a large file can take tens of seconds, far longer than any RPC
+    timeout. The RPC handler validates, queues one of these behind every
+    already-queued `_FlushBatch` (so FIFO order lands them in the old file),
+    and replies immediately. While it is in flight the main loop runs in hold
+    mode: it keeps the SUB socket drained but parks raw messages instead of
+    dispatching them, so the op body has the same exclusive access to
+    per-file state it had when it ran synchronously on the main thread.
+
+    The bg thread fills `outcome` and sets `done`; the main loop then
+    publishes the outcome and replays the held messages.
+    """
+
+    op: str = ""
+    file: str | None = None
+    started_wall: float = 0.0
+    started_mono: float = 0.0
+    submitted: bool = False
+    done: threading.Event = field(default_factory=threading.Event)
+    outcome: Json | None = None
+
+
+@dataclass
+class _StopWritingRequest(_FileOpRequest):
+    op: str = "stop"
+
+
+@dataclass
+class _RotateRequest(_FileOpRequest):
+    op: str = "rotate"
+    new_file: str | None = None
+    path: Path | None = None
     disabled_devices: set[str] | None = None
-    measurement_profile: str | None = None
-    measurement_values: object = None
+    measurement_meta: Json | None = None
 
 
 @dataclass
@@ -62,11 +95,6 @@ class _StartWritingRequest(_BgRequest):
     disabled_devices: set[str] | None = None
     measurement_profile: str | None = None
     measurement_values: object = None
-
-
-@dataclass
-class _StopWritingRequest(_BgRequest):
-    pass
 
 
 @dataclass
