@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { normalizeDagNode } from "./dag";
+import { isResettableHistogramAggregateOp, normalizeDagNode } from "./dag";
 
 describe("normalizeDagNode", () => {
   it("accepts UI draft camelCase node ids", () => {
@@ -17,5 +17,17 @@ describe("normalizeDagNode", () => {
       inputs: { trace: "fluor_src" },
       params: { bg_start_idx: 200, bg_stop_idx: 1200 },
     });
+  });
+});
+
+describe("isResettableHistogramAggregateOp", () => {
+  it("includes regular and ratio histogram aggregators", () => {
+    expect(isResettableHistogramAggregateOp("aggregate.bin_stats")).toBe(true);
+    expect(isResettableHistogramAggregateOp("aggregate.bin_ratio_stats")).toBe(true);
+  });
+
+  it("excludes other DAG operators", () => {
+    expect(isResettableHistogramAggregateOp("aggregate.bin2d_stats")).toBe(false);
+    expect(isResettableHistogramAggregateOp("trace.integrate")).toBe(false);
   });
 });

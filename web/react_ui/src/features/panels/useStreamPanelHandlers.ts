@@ -2,6 +2,7 @@ import type { MutableRefObject } from "react";
 import { notifications } from "@mantine/notifications";
 
 import { resetStreamWorkspace } from "../../api";
+import { isResettableHistogramAggregateOp } from "../stream/dag";
 import {
   isStreamBin2dPanel,
   isStreamBinStatsPanel,
@@ -174,7 +175,7 @@ export function useStreamPanelHandlers(args: StreamPanelHandlersArgs) {
       streamAnalysisReadyRef.current &&
       workspace &&
       node &&
-      node.op === "aggregate.bin_stats"
+      isResettableHistogramAggregateOp(node.op)
     ) {
       const resp = await resetStreamWorkspace(workspace.workspaceId, node.nodeId);
       if (!resp.ok) {
