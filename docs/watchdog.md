@@ -262,6 +262,50 @@ Enable or disable a specific watchdog ruleset.
 {"type": "watchdog.disable_all"}
 ```
 
+## Sequence-scoped gating (`requires.watchdog_ids`)
+
+A sequence that depends on a ruleset that starts disabled (`enabled: false`
+in its YAML — e.g. a per-laser lock watchdog that must not trip for lasers
+the current sequence isn't using) can declare it in the top-level `requires:`
+block:
+
+```yaml
+requires:
+  watchdog_ids: [linien_rotational-cooling_lock_watchdog]
+steps:
+  - call: {device: synthhd_cavity1_1, action: set_frequency, params: {...}}
+```
+
+The sequence parser (`experiment_control.sequencer.ast.parse_sequence`)
+rewrites the sequence body into `watchdog.enable` for each id, the original
+steps, then `watchdog.disable` for each id in a synthetic `try/finally` —
+the same guaranteed-cleanup path (`SequencerRuntime._begin_terminal_unwind`)
+that a hand-written `try:`/`finally:` block relies on, so the watchdog is
+disabled on success, on error, and on abort/cancel alike. `disable` is
+idempotent for an id that was never actually enabled (e.g. because an
+earlier id's enable call failed), so declaring several ids is safe even if
+enabling one of them errors mid-sequence.
+
+This replaces hand-writing the enable/disable calls and the wrapping
+`try:`/`finally:` in every sequence that needs it — write the ids once in
+`requires.watchdog_ids`, not as steps. `watchdog_ids` must be a non-empty
+list of non-empty strings; declare every ruleset the sequence needs,
+including one for hardware it depends on but never calls directly (e.g. a
+laser whose lock must hold for the physics even though the sequence doesn't
+address that laser's driver).
+
+`meta.watchdog_ids` is no longer supported (`meta` is documentation only —
+`name`/`description` — never read by the engine); a sequence that still
+declares it there fails to parse with a `TypeError` pointing at
+`requires.watchdog_ids`. See `docs/sequencer_config.md` for the rest of the
+`requires:` schema, including `requires.hdf_writing`.
+
+Caveat: because this rewrite happens at parse time, the TUI/UI's per-step
+source-line highlighting (`sequencer.source_info`) won't resolve source
+lines for a sequence's real steps when `watchdog_ids` is set, since their
+position in the parsed tree no longer matches their position in the raw
+YAML `steps:` list. Execution and cleanup semantics are unaffected.
+
 ## Events (published by manager)
 
 The watchdog publishes events through the manager event bus:

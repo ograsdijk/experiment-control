@@ -19,25 +19,69 @@ version: 1
 meta: {}            # optional
 vars: {}            # optional
 context_columns: {} # optional (see below)
+requires: {}        # optional (see below)
 steps: []           # required
 ```
 
+`meta` is documentation only (`name`/`description`) -- it is never read by
+the engine. Engine-consumed fields belong at the top level, sibling to
+`meta`/`vars`/`steps`.
+
 ### `context_columns` (optional, explicit schema)
-May appear at top level or under `meta:`. Values must be one of:
-`float64`, `int64`, `bool`.
+Top level only (a sequence with `meta.context_columns` fails to parse).
+Values must be one of: `float64`, `int64`, `bool`.
 
 ```yaml
-meta:
-  context_columns:
-    hv_v: float64
-    freq_hz: float64
-    shot_index: int64
+context_columns:
+  hv_v: float64
+  freq_hz: float64
+  shot_index: int64
 ```
 
 If `context_columns` is not provided, the writer will auto-generate
 columns from the first non-empty `context_fields` it sees. Only scalar
 numeric and bool fields are converted, and all auto columns are stored
 as float64 with missing values set to NaN.
+
+### `requires` (optional -- start-time preconditions)
+Top level only (a sequence with `meta.watchdog_ids` fails to parse). Only
+two keys are recognized; any other key is a parse-time `TypeError`.
+
+```yaml
+requires:
+  watchdog_ids: [linien_rotational-cooling_lock] # optional
+  hdf_writing: true                              # optional, default false
+```
+
+- `watchdog_ids` (`list[str]`, optional): watchdog rulesets this sequence
+  depends on. The parser wraps the sequence body in a synthetic
+  `try:`/`finally:` that enables every id before the body runs and disables
+  every id afterwards (success, error, or abort alike). See
+  `docs/watchdog.md`'s "Sequence-scoped gating" section for the full
+  semantics.
+- `hdf_writing` (`bool`, optional, default `false`): if `true`,
+  `sequencer.start` checks that `hdf_writer` is currently writing
+  (`hdf.status` -> `writing_active`) before the sequence body runs, and
+  fails the start (`runtime.fail(...)`, RPC error code `start_failed`) if
+  it isn't. Use this for a sequence whose HDF recording is
+  operator-controlled -- started manually before running the sequence --
+  instead of a comment reminding the operator.
+
+`sequencer.start` also runs an **automatic, unconditional** device-
+connectivity check -- not a `requires:` field, since the device set a
+sequence needs is already fully derivable from its parsed step tree. Every
+device id referenced by the sequence's steps (rendered against the run's
+final resolved vars) is checked against the manager's `device.list_status`;
+if any resolves to a `liveness` other than `ONLINE`, the start fails the
+same way as a failed `hdf_writing` precondition, naming the offending
+device(s). This runs for every sequence in every instance -- there is
+nothing to opt in or out of.
+
+Both `requires:` preconditions run in the safe window after
+`runtime.start()` resolves final vars and moves to `RUNNING` but before the
+first step tick executes, so a failed precondition aborts cleanly with
+nothing to undo (any `watchdog_ids` enable calls, injected by the transform
+above, have not run yet either).
 
 ## Templates and expressions
 Use `${...}` anywhere a value is accepted.

@@ -431,6 +431,7 @@ class SequencerProcess(ManagedProcessBase):
             poll_parallel=self._poll_parallel,
         )
         self._context_columns: dict[str, str] | None = None
+        self._loaded_sequence_spec: SequenceSpec | None = None
         self._loaded_sequence_source: str | None = None
         self._loaded_sequence_source_kind: str | None = None
         self._loaded_sequence_text: str | None = None
@@ -504,6 +505,7 @@ class SequencerProcess(ManagedProcessBase):
         )
         self._runtime.load(spec, step_source_info=step_source_info)
         self._context_columns = spec.context_columns
+        self._loaded_sequence_spec = spec
         self._loaded_sequence_source = source
         self._loaded_sequence_source_kind = source_kind
         self._loaded_sequence_text = text
@@ -3298,6 +3300,219 @@ class SequencerProcess(ManagedProcessBase):
             req, result={"status": "loaded", "active_sequence_id": sequence_id}
         )
 
+    def _check_devices_connected_walk_steps(
+        self,
+        *,
+        steps: list[Step],
+        env: dict[str, Any],
+        device_ids: set[str],
+    ) -> None:
+        for step in steps:
+            if getattr(step, "disabled", False):
+                continue
+            self._check_devices_connected_walk_step(
+                step=step, env=env, device_ids=device_ids
+            )
+
+    def _check_devices_connected_scan_value(
+        self, *, value: Any, env: dict[str, Any], device_ids: set[str]
+    ) -> None:
+        # Mirrors `_preflight_scan_value_sources_mapping`'s recognition of
+        # embedded `telemetry`/`call` source dicts (used inside wait_until
+        # conditions and adaptive.observe expressions), but -- unlike
+        # preflight -- renders against the final resolved vars (known only
+        # after `runtime.start()`) instead of a simulated preflight env.
+        try:
+            rendered = render_templates(value, env)
+        except Exception:
+            return
+        if isinstance(rendered, list):
+            for item in rendered:
+                self._check_devices_connected_scan_value(
+                    value=item, env=env, device_ids=device_ids
+                )
+            return
+        if not isinstance(rendered, dict):
+            return
+        telemetry_spec = rendered.get("telemetry")
+        if isinstance(telemetry_spec, dict) and not telemetry_spec.get("process"):
+            self._check_devices_connected_add(
+                telemetry_spec.get("device"), env=env, device_ids=device_ids
+            )
+        call_spec = rendered.get("call")
+        if isinstance(call_spec, dict) and not call_spec.get("process"):
+            self._check_devices_connected_add(
+                call_spec.get("device"), env=env, device_ids=device_ids
+            )
+        for nested in rendered.values():
+            self._check_devices_connected_scan_value(
+                value=nested, env=env, device_ids=device_ids
+            )
+
+    def _check_devices_connected_add(
+        self, raw_device: Any, *, env: dict[str, Any], device_ids: set[str]
+    ) -> None:
+        if raw_device is None:
+            return
+        try:
+            rendered = render_templates(raw_device, env)
+        except Exception:
+            return
+        device_id = str(rendered or "").strip()
+        if device_id:
+            device_ids.add(device_id)
+
+    def _dc_walk_call(self, step: CallStep, env: dict[str, Any], device_ids: set[str]) -> None:
+        if not step.process:
+            self._check_devices_connected_add(step.device, env=env, device_ids=device_ids)
+        self._check_devices_connected_scan_value(value=step.params, env=env, device_ids=device_ids)
+
+    def _dc_walk_set(self, step: SetStep, env: dict[str, Any], device_ids: set[str]) -> None:
+        self._check_devices_connected_add(step.device, env=env, device_ids=device_ids)
+        self._check_devices_connected_scan_value(value=step.value, env=env, device_ids=device_ids)
+
+    def _dc_walk_set_context(
+        self, step: SetContextStep, env: dict[str, Any], device_ids: set[str]
+    ) -> None:
+        try:
+            streams = render_templates(step.streams, env)
+        except Exception:
+            streams = step.streams
+        if isinstance(streams, list):
+            for item in streams:
+                if isinstance(item, dict):
+                    self._check_devices_connected_add(
+                        item.get("device"), env=env, device_ids=device_ids
+                    )
+                elif isinstance(item, str):
+                    raw = item.strip()
+                    if "." in raw:
+                        device_ids.add(raw.split(".", 1)[0])
+                    elif "/" in raw:
+                        device_ids.add(raw.split("/", 1)[0])
+        self._check_devices_connected_scan_value(value=step.fields, env=env, device_ids=device_ids)
+
+    def _dc_walk_wait_until(
+        self, step: WaitUntilStep, env: dict[str, Any], device_ids: set[str]
+    ) -> None:
+        self._check_devices_connected_scan_value(value=step.raw, env=env, device_ids=device_ids)
+
+    def _dc_walk_assign(self, step: AssignStep, env: dict[str, Any], device_ids: set[str]) -> None:
+        self._check_devices_connected_scan_value(value=step.values, env=env, device_ids=device_ids)
+
+    def _dc_walk_body_only(self, step: Any, env: dict[str, Any], device_ids: set[str]) -> None:
+        self._check_devices_connected_walk_steps(steps=step.body, env=env, device_ids=device_ids)
+
+    def _dc_walk_if(self, step: IfStep, env: dict[str, Any], device_ids: set[str]) -> None:
+        self._check_devices_connected_scan_value(value=step.condition, env=env, device_ids=device_ids)
+        self._check_devices_connected_walk_steps(steps=step.then_steps, env=env, device_ids=device_ids)
+        self._check_devices_connected_walk_steps(
+            steps=step.else_steps or [], env=env, device_ids=device_ids
+        )
+
+    def _dc_walk_while(self, step: WhileStep, env: dict[str, Any], device_ids: set[str]) -> None:
+        self._check_devices_connected_scan_value(value=step.condition, env=env, device_ids=device_ids)
+        self._check_devices_connected_walk_steps(steps=step.body, env=env, device_ids=device_ids)
+
+    def _dc_walk_try(self, step: TryStep, env: dict[str, Any], device_ids: set[str]) -> None:
+        self._check_devices_connected_walk_steps(steps=step.body, env=env, device_ids=device_ids)
+        self._check_devices_connected_walk_steps(
+            steps=step.finally_steps, env=env, device_ids=device_ids
+        )
+
+    def _dc_walk_adaptive(self, step: AdaptiveStep, env: dict[str, Any], device_ids: set[str]) -> None:
+        self._check_devices_connected_scan_value(value=step.observe, env=env, device_ids=device_ids)
+        self._check_devices_connected_walk_steps(steps=step.body, env=env, device_ids=device_ids)
+
+    # Dispatch table for `_check_devices_connected_walk_step`, replacing a
+    # long isinstance if/elif chain (which tripped the ruff C901 complexity
+    # guard) with O(1) lookup by step type. SleepStep, PauseStep, UseStep are
+    # intentionally absent -- no device references to collect (UseStep
+    # expands into a different SequenceSpec's own step tree, resolved
+    # dynamically by the runtime via `resolve_use`, out of scope for this
+    # static, parse-tree-only check).
+    _DEVICE_CHECK_STEP_HANDLERS: dict[type, Any] = {
+        CallStep: _dc_walk_call,
+        SetStep: _dc_walk_set,
+        SetContextStep: _dc_walk_set_context,
+        WaitUntilStep: _dc_walk_wait_until,
+        AssignStep: _dc_walk_assign,
+        ForStep: _dc_walk_body_only,
+        RepeatStep: _dc_walk_body_only,
+        AtomicStep: _dc_walk_body_only,
+        ParallelStep: _dc_walk_body_only,
+        IfStep: _dc_walk_if,
+        WhileStep: _dc_walk_while,
+        TryStep: _dc_walk_try,
+        AdaptiveStep: _dc_walk_adaptive,
+    }
+
+    def _check_devices_connected_walk_step(
+        self, *, step: Step, env: dict[str, Any], device_ids: set[str]
+    ) -> None:
+        handler = self._DEVICE_CHECK_STEP_HANDLERS.get(type(step))
+        if handler is not None:
+            handler(self, step, env, device_ids)
+
+    def _check_devices_connected(
+        self, spec: SequenceSpec, resolved_vars: dict[str, Any]
+    ) -> list[str]:
+        env = dict(resolved_vars)
+        env["vars"] = to_attrdict(resolved_vars)
+        device_ids: set[str] = set()
+        self._check_devices_connected_walk_steps(
+            steps=spec.steps, env=env, device_ids=device_ids
+        )
+        if not device_ids:
+            return []
+        resp = self._require_manager().call({"type": "device.list_status"})
+        liveness_by_device: dict[str, str] = {}
+        if isinstance(resp, dict):
+            result = resp.get("result")
+            if isinstance(result, list):
+                for item in result:
+                    if not isinstance(item, dict):
+                        continue
+                    device_id = str(item.get("device_id", "")).strip()
+                    if device_id:
+                        liveness_by_device[device_id] = str(item.get("liveness", ""))
+        missing = sorted(
+            device_id
+            for device_id in device_ids
+            if liveness_by_device.get(device_id) != "ONLINE"
+        )
+        return missing
+
+    def _check_start_preconditions(self, req: Json) -> Json | None:
+        # Called from `_rpc_sequencer_start` right after `runtime.start()`
+        # resolves final vars and moves the runtime to RUNNING but before it
+        # executes any step -- the first `tick()` only happens later in this
+        # process's own `run()` loop. That leaves a safe synchronous window,
+        # before any physical action has occurred, to check the two
+        # `requires:` preconditions below. At this point (zero ticks
+        # executed) `runtime.fail()` cleanly aborts to ERROR with no pending
+        # finally/on_exit unwind work -- the injected watchdog.enable calls
+        # (from `_apply_watchdog_gate`) never ran either, so there is
+        # nothing to undo. Returns an rpc_err response if a precondition
+        # failed (runtime.fail() already called), else None.
+        spec = getattr(self, "_loaded_sequence_spec", None)
+        if spec is None:
+            return None
+        if spec.require_hdf_writing:
+            resp = self._call_process("hdf_writer", "hdf.status", {})
+            result = resp.get("result") if isinstance(resp, dict) else None
+            writing_active = bool(result.get("writing_active")) if isinstance(result, dict) else False
+            if not writing_active:
+                reason = "requires.hdf_writing: hdf_writer is not currently writing"
+                self._runtime.fail(reason)
+                return self.rpc_err(req, code="start_failed", message=reason)
+        missing = self._check_devices_connected(spec, self._runtime.status()["vars"])
+        if missing:
+            reason = f"devices not connected: {', '.join(missing)}"
+            self._runtime.fail(reason)
+            return self.rpc_err(req, code="start_failed", message=reason)
+        return None
+
     def _rpc_sequencer_start(self, req: Json) -> Json:
         params = req.get("params", {}) or {}
         if not isinstance(params, dict):
@@ -3336,6 +3551,9 @@ class SequencerProcess(ManagedProcessBase):
             )
             self._last_progress_event_signature = None
             self._last_progress_event_mono = 0.0
+            failure = self._check_start_preconditions(req)
+            if failure is not None:
+                return failure
         except Exception as e:
             self._publish_lifecycle_event(
                 event="start",

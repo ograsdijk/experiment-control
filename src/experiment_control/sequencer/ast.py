@@ -12,6 +12,8 @@ class SequenceSpec:
     vars: dict[str, Any]
     steps: list["Step"]
     context_columns: dict[str, str] | None = None
+    watchdog_ids: list[str] | None = None
+    require_hdf_writing: bool = False
 
 
 @dataclass(frozen=True)
@@ -421,19 +423,89 @@ def iter_use_ids(steps: list[Step]) -> list[str]:
     return out
 
 
+def _normalize_watchdog_ids(raw_ids: Any) -> list[str] | None:
+    if raw_ids is None:
+        return None
+    if not isinstance(raw_ids, list) or not raw_ids or not all(
+        isinstance(item, str) and item.strip() for item in raw_ids
+    ):
+        raise TypeError(
+            "requires.watchdog_ids must be a non-empty list of non-empty strings"
+        )
+    return [str(item) for item in raw_ids]
+
+
+def _apply_watchdog_gate(steps: list[Step], watchdog_ids: list[str] | None) -> list[Step]:
+    # `requires.watchdog_ids` declares watchdog rulesets this sequence depends
+    # on (e.g. the laser-lock watchdog for a laser the sequence needs locked
+    # but never calls directly). Rather than every sequence hand-writing
+    # watchdog.enable/disable calls wrapped in its own try/finally, generate
+    # that wrapping here: enable each id, run the sequence body, and disable
+    # every id in `finally` -- which runs on success, error, and abort alike
+    # (see SequencerRuntime._begin_terminal_unwind/_finish_pending_terminal).
+    # disable is idempotent even for an id that was never actually enabled
+    # (WatchdogProcess._rpc_watchdog_enable_disable just sets entry.enabled),
+    # so disabling all declared ids unconditionally in finally is safe even
+    # if an earlier enable call in the body failed.
+    if watchdog_ids is None:
+        return steps
+
+    def _watchdog_call(action: str, watchdog_id: str) -> CallStep:
+        return CallStep(
+            device="",
+            action=action,
+            params={"watchdog_id": watchdog_id},
+            process="watchdog",
+        )
+
+    enable_steps = [_watchdog_call("watchdog.enable", wid) for wid in watchdog_ids]
+    disable_steps = [_watchdog_call("watchdog.disable", wid) for wid in watchdog_ids]
+    return [TryStep(body=enable_steps + steps, finally_steps=disable_steps)]
+
+
+_REQUIRES_KNOWN_KEYS = {"watchdog_ids", "hdf_writing"}
+
+
 def parse_sequence(raw: Any) -> SequenceSpec:
     obj = _require_dict(raw, name="sequence")
     version = int(obj.get("version", 1))
     meta = obj.get("meta", {}) or {}
     vars_raw = obj.get("vars", {}) or {}
     context_columns_raw = obj.get("context_columns")
-    if context_columns_raw is None and isinstance(meta, dict):
-        context_columns_raw = meta.get("context_columns")
+    requires_raw = obj.get("requires")
     steps = _parse_steps(obj.get("steps", []))
     if not isinstance(meta, dict):
         raise TypeError("meta must be a dict")
+    if isinstance(meta, dict) and "context_columns" in meta:
+        raise TypeError(
+            "meta.context_columns is no longer supported -- move context_columns "
+            "to the top level (sibling to meta/vars/steps). `meta` is documentation "
+            "only (name/description); engine-consumed fields belong at the top level."
+        )
+    if isinstance(meta, dict) and "watchdog_ids" in meta:
+        raise TypeError(
+            "meta.watchdog_ids is no longer supported -- move watchdog_ids to "
+            "requires.watchdog_ids (a new top-level `requires:` key, sibling to "
+            "meta/vars/steps). `meta` is documentation only (name/description); "
+            "engine-consumed fields belong at the top level."
+        )
     if not isinstance(vars_raw, dict):
         raise TypeError("vars must be a dict")
+    watchdog_ids_raw: Any = None
+    require_hdf_writing = False
+    if requires_raw is not None:
+        if not isinstance(requires_raw, dict):
+            raise TypeError("requires must be a dict")
+        unknown_requires = sorted(set(requires_raw) - _REQUIRES_KNOWN_KEYS)
+        if unknown_requires:
+            raise TypeError(
+                "requires has unknown key(s): " + ", ".join(unknown_requires)
+            )
+        watchdog_ids_raw = requires_raw.get("watchdog_ids")
+        hdf_writing_raw = requires_raw.get("hdf_writing", False)
+        if not isinstance(hdf_writing_raw, bool):
+            raise TypeError("requires.hdf_writing must be a bool")
+        require_hdf_writing = hdf_writing_raw
     context_columns = None
     if context_columns_raw is not None:
         if not isinstance(context_columns_raw, dict):
@@ -452,12 +524,16 @@ def parse_sequence(raw: Any) -> SequenceSpec:
         if adaptive_id in seen_ids:
             raise TypeError(f"duplicate adaptive.id {adaptive_id!r}")
         seen_ids.add(adaptive_id)
+    watchdog_ids = _normalize_watchdog_ids(watchdog_ids_raw)
+    steps = _apply_watchdog_gate(steps, watchdog_ids)
     return SequenceSpec(
         version=version,
         meta=meta,
         vars=vars_raw,
         steps=steps,
         context_columns=context_columns,
+        watchdog_ids=watchdog_ids,
+        require_hdf_writing=require_hdf_writing,
     )
 
 
