@@ -74,11 +74,14 @@ class _CaptureSequencerYamlRequest(_BgRequest):
     """Fire-and-forget request to snapshot the loaded sequencer YAML off the
     main drain loop. ``measurement_id`` is a staleness token: if the active
     file changes before the bg worker writes the snapshot, the result is
-    discarded rather than associated with the wrong run.
+    discarded rather than associated with the wrong run. ``run_id`` is the
+    sequencer run id from the triggering ``start`` event (None if absent);
+    the snapshot is linked to it via a ``yaml_snapshot`` sequencer event.
     """
 
     process_id: str = "sequencer"
     measurement_id: str = ""
+    run_id: int | None = None
 
 
 @dataclass

@@ -16,6 +16,7 @@ import yaml
 import zmq
 
 from ..capabilities import capabilities_payload, method, param
+from ..contracts.context_fields import SEQUENCER_RUN_ID_FIELD
 from ..manager_client import ManagerClient
 from ..processes.process_base import ManagedProcessBase
 from ..utils.cli_args import (
@@ -94,6 +95,22 @@ _SET_CONTEXT_DISPATCH_MAX_WORKERS = 16
 # buffer over the per-call deadline for expect + queueing overhead.
 _SET_CONTEXT_DISPATCH_DEADLINE_S = _STREAM_CONTEXT_SET_RETRY_DEADLINE_S + 2.0
 _PARALLEL_MAX_WORKERS = 8
+
+
+def _effective_context_columns(
+    declared: dict[str, str] | None,
+) -> dict[str, str] | None:
+    """Context-column schema advertised to the HDF writer for a loaded spec.
+
+    An explicit schema gains the runtime-injected `sequencer_run_id` column.
+    No schema (None or an empty dict) stays None so the writer keeps
+    inferring columns from the actual context fields.
+    """
+    if not declared:
+        return None
+    effective = dict(declared)
+    effective[SEQUENCER_RUN_ID_FIELD] = "int64"
+    return effective
 
 
 def _nested_step_lists(step: Step) -> tuple[list[Step], ...]:
@@ -435,6 +452,11 @@ class SequencerProcess(ManagedProcessBase):
         self._loaded_sequence_source: str | None = None
         self._loaded_sequence_source_kind: str | None = None
         self._loaded_sequence_text: str | None = None
+        # run_id of the most recent successful start of the currently loaded
+        # text (None until started). Lets the HDF writer tie a captured
+        # loaded_yaml snapshot to the run it belongs to, even if a reload
+        # races the (asynchronous) snapshot capture.
+        self._loaded_sequence_run_id: int | None = None
         self._active_sequence_id: str | None = None
         self._sequence_library_path = (
             str(sequence_library_path).strip() if sequence_library_path else None
@@ -504,11 +526,12 @@ class SequencerProcess(ManagedProcessBase):
             line_map=_build_step_line_map(text),
         )
         self._runtime.load(spec, step_source_info=step_source_info)
-        self._context_columns = spec.context_columns
+        self._context_columns = _effective_context_columns(spec.context_columns)
         self._loaded_sequence_spec = spec
         self._loaded_sequence_source = source
         self._loaded_sequence_source_kind = source_kind
         self._loaded_sequence_text = text
+        self._loaded_sequence_run_id = None
         self._active_sequence_id = active_sequence_id
         self._clear_autoload_error()
         self._last_progress_event_signature = None
@@ -3100,6 +3123,7 @@ class SequencerProcess(ManagedProcessBase):
                 "source_kind": self._loaded_sequence_source_kind,
                 "active_sequence_id": self._active_sequence_id,
                 "text": self._loaded_sequence_text,
+                "run_id": self._loaded_sequence_run_id,
                 "reloadable": reload_kind is not None,
                 "reload_kind": reload_kind,
             },
@@ -3562,13 +3586,15 @@ class SequencerProcess(ManagedProcessBase):
                 message=str(e),
             )
             return self.rpc_err(req, code="start_failed", message=str(e))
+        run_id = self._runtime.status().get("run_id")
+        self._loaded_sequence_run_id = run_id
         self._publish_lifecycle_event(
             event="start",
             ok=True,
             source="rpc",
             message="sequencer started",
             payload={
-                "run_id": self._runtime.status().get("run_id"),
+                "run_id": run_id,
                 "active_sequence_id": self._active_sequence_id,
                 "loaded_source": self._loaded_sequence_source,
                 "context_columns": self._context_columns,

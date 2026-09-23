@@ -38,10 +38,17 @@ context_columns:
   shot_index: int64
 ```
 
-If `context_columns` is not provided, the writer will auto-generate
-columns from the first non-empty `context_fields` it sees. Only scalar
-numeric and bool fields are converted, and all auto columns are stored
-as float64 with missing values set to NaN.
+The effective schema advertised to the HDF writer (`sequencer.status`,
+`load_ok`/`start` lifecycle payloads) always adds `sequencer_run_id: int64`
+to an explicit schema. The YAML itself is stored unchanged. Declaring
+`sequencer_run_id` here is a parse error (it is framework-owned).
+
+If `context_columns` is not provided (or is `{}`), the writer will
+auto-generate columns from the first non-empty `context_fields` it sees
+in each file; the column set and dtypes are then fixed for that file.
+Only scalar numeric and bool fields are converted: bools become `bool`,
+`sequencer_run_id` becomes `int64`, and every other numeric field is
+stored as float64 with missing values set to NaN.
 
 ### `requires` (optional -- start-time preconditions)
 Top level only (a sequence with `meta.watchdog_ids` fails to parse). Only
@@ -431,6 +438,15 @@ Behavior:
 - `context_id` increments on each `set_context`.
 - `context_id` is monotonic for the sequencer process lifetime.
 - `context_id` resets when the sequencer process restarts.
+- Every executed `set_context` automatically carries
+  `sequencer_run_id` (the `run_id` of the current `sequencer.start`; shared
+  by all loops of a `repeat`/`continuous` run). Setting it in `fields` is a
+  parse error. In HDF, stream rows keep only `context_id`; the run id lives
+  on the `/context_table` row (`fields_json` and
+  `/context_table/columns/sequencer_run_id`). Each `/sequencer/yaml`
+  snapshot is linked to its run by a `/sequencer/events` row with
+  `event="yaml_snapshot"`, `yaml_snapshot_id=<snapshot_id>` and
+  `payload_json.run_id`.
 - `context_fields` must be JSON-serializable scalars (float, int, bool, str).
 - Drivers attach `context_id` + `context_fields` to `chunk_ready`.
 - Sequencer applies bounded retry for transient `stream.context.set` failures

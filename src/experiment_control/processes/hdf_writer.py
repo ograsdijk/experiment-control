@@ -18,6 +18,7 @@ import numpy as np
 import zmq
 
 from ..capabilities import capabilities_payload, method, param
+from ..contracts.context_fields import SEQUENCER_RUN_ID_FIELD
 from ..contracts.messages import (
     ChunkReadyMessage,
     RpcActionRequest,
@@ -393,6 +394,29 @@ def _ingest_process_schema(
             if on_error is not None:
                 on_error(process_id, exc)
     return seen
+
+
+def _lifecycle_run_id(msg: Json) -> int | None:
+    payload = msg.get("payload")
+    raw = payload.get("run_id") if isinstance(payload, dict) else None
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        return None
+    return raw
+
+
+def _loaded_yaml_run_id_mismatch(result: Json, expected_run_id: int | None) -> str | None:
+    # A sequencer that predates `loaded_yaml.run_id` omits the key; accept its
+    # snapshot unchecked. Otherwise the loaded text must still be the one that
+    # was started for this run (a reload between start and capture resets it).
+    if expected_run_id is None or "run_id" not in result:
+        return None
+    loaded_run_id = result.get("run_id")
+    if loaded_run_id == expected_run_id:
+        return None
+    return (
+        "loaded_yaml snapshot skipped: loaded sequence belongs to run "
+        f"{loaded_run_id!r}, not started run {expected_run_id}"
+    )
 
 
 class HdfWriter(ManagedProcessBase):
@@ -1181,10 +1205,13 @@ class HdfWriter(ManagedProcessBase):
             raise ValueError("missing or invalid effective_rpc_timeout_ms")
         return raw + _RUN_METADATA_TRANSPORT_ALLOWANCE_MS
 
-    def _enqueue_sequencer_yaml_capture(self, *, process_id: str) -> None:
+    def _enqueue_sequencer_yaml_capture(
+        self, *, process_id: str, run_id: int | None = None
+    ) -> None:
         req = _CaptureSequencerYamlRequest(
             process_id=str(process_id or self._sequencer_process_id),
             measurement_id=self._measurement_id or "",
+            run_id=run_id,
         )
         if self._bg_thread is None or self._bg_thread_dead:
             self._append_sequencer_yaml_capture_failure_locked(
@@ -1547,6 +1574,7 @@ class HdfWriter(ManagedProcessBase):
             _snapshot_id, snapshot_error = self._capture_sequencer_yaml_snapshot(
                 process_id=req.process_id,
                 expected_measurement_id=req.measurement_id,
+                expected_run_id=req.run_id,
             )
             if snapshot_error and "stale measurement" not in snapshot_error:
                 with self._h5_lock:
@@ -3189,11 +3217,41 @@ class HdfWriter(ManagedProcessBase):
             yaml_snapshot_id=-1,
         )
 
+    def _append_yaml_snapshot_event_locked(
+        self,
+        *,
+        process_id: str,
+        snapshot_id: int,
+        run_id: int | None,
+        source: str,
+    ) -> None:
+        # Links /sequencer/yaml[snapshot_id] to the sequencer run it was
+        # captured for (the run's context rows carry the same
+        # `sequencer_run_id`), using the existing event-table columns.
+        payload = {
+            "process_id": process_id,
+            "snapshot_id": int(snapshot_id),
+            "run_id": run_id,
+            "source": source,
+        }
+        self._append_sequencer_event_row(
+            t_wall=time.time(),
+            t_mono=time.monotonic(),
+            process_id=process_id,
+            event="yaml_snapshot",
+            source="hdf_writer",
+            ok=True,
+            message="loaded_yaml snapshot captured",
+            payload_json=json.dumps(payload),
+            yaml_snapshot_id=snapshot_id,
+        )
+
     def _capture_sequencer_yaml_snapshot(
         self,
         *,
         process_id: str | None = None,
         expected_measurement_id: str | None = None,
+        expected_run_id: int | None = None,
     ) -> tuple[int, str | None]:
         process_id_text = str(process_id or self._sequencer_process_id)
         try:
@@ -3227,6 +3285,9 @@ class HdfWriter(ManagedProcessBase):
         text_raw = result.get("text")
         if text_raw is None:
             return -1, "loaded sequence text unavailable"
+        run_id_error = _loaded_yaml_run_id_mismatch(result, expected_run_id)
+        if run_id_error is not None:
+            return -1, run_id_error
         source = str(result.get("source") or "")
         text = str(text_raw)
         with self._h5_lock:
@@ -3251,6 +3312,12 @@ class HdfWriter(ManagedProcessBase):
             self._sequencer_yaml_ds[old] = row[0]
             self._sequencer_yaml_next_id = snapshot_id + 1
             self._pending += 1
+            self._append_yaml_snapshot_event_locked(
+                process_id=process_id_text,
+                snapshot_id=snapshot_id,
+                run_id=expected_run_id,
+                source=source,
+            )
             return snapshot_id, None
 
     def _handle_sequencer_lifecycle(self, msg: Json) -> None:
@@ -3293,7 +3360,10 @@ class HdfWriter(ManagedProcessBase):
             yaml_snapshot_id=yaml_snapshot_id,
         )
         if event == "start" and ok:
-            self._enqueue_sequencer_yaml_capture(process_id=process_id)
+            self._enqueue_sequencer_yaml_capture(
+                process_id=process_id,
+                run_id=_lifecycle_run_id(msg),
+            )
 
     def _drain_socket(self) -> None:
         if self._sub is None or self._buf is None:
@@ -5173,7 +5243,13 @@ class HdfWriter(ManagedProcessBase):
                 spec[str(key)] = "bool"
                 continue
             if isinstance(value, (int, float, np.integer, np.floating)):
-                spec[str(key)] = "float64"
+                # The runtime-injected run id is always an int, so it can be
+                # inferred exactly; other numerics stay float64 because one
+                # sample cannot rule out later non-integer values.
+                if key == SEQUENCER_RUN_ID_FIELD:
+                    spec[str(key)] = "int64"
+                else:
+                    spec[str(key)] = "float64"
         return spec
 
     def _init_context_columns_from_spec(
