@@ -35,7 +35,7 @@ see Error behavior).
 | `ec.devices` | device drivers | `list_status`, `call`, `get`, `set`, `capabilities`, `connect`, `disconnect`, `start`, `restart` |
 | `ec.processes` | managed processes (generic) | `list_status`, `get_status`, `start`, `stop`, `restart`, `call`, `capabilities` |
 | `ec.sequencer` | sequencer process | `load`, `start`, `pause`, `resume`, `stop`, `status`, `validate`, `preflight`, `library_list/reload/load` |
-| `ec.hdf` | hdf_writer process | `status`, `rotate`, `writing_start`, `writing_stop`, `devices_get/enable/disable` |
+| `ec.hdf` | hdf_writer process | `status`, `rotate`, `writing_start`, `writing_stop`, `wait_for_file_op`, `devices_get/enable/disable` |
 | `ec.stream_analysis` | stream_analysis process | `status`, `operators`, `workspace_list/get/put/delete/reset/clear/snapshot/validate`, `workspace_store_status/save/reload` |
 | `ec.influx` | influx_writer process | `status`, `enable`, `disable`, `flush`, `devices_get/enable/disable` |
 | `ec.interlock` | interlock process | `list`, `status`, `load`, `enable/disable`, `enable_rule/disable_rule`, `enable_all/disable_all` |
@@ -79,6 +79,9 @@ with StackClient.from_stack_yaml("stack.yaml") as ec:
     ec.processes.start("hdf_writer")
     ec.wait.process_rpc_ready("hdf_writer", probe_action="hdf.status")
     ec.hdf.rotate(filename="run_001.h5")
+    # Stop and rotate reply once accepted and finish the file in the
+    # background; wait=True blocks until the file is closed (raises on failure).
+    ec.hdf.writing_stop(wait=True)
 ```
 
 ## Interlock commands

@@ -667,9 +667,19 @@ Request:
 - `{"type": "hdf.writing.stop"}`
 
 Response:
-- `{"ok": true, "result": {"already_stopped": false, "old_file": "path/to/file.h5", "disabled_devices": [...], "known_devices": [...], "enabled_known_devices": [...]}}`
-- `{"ok": true, "result": {"already_stopped": true, "old_file": null, "disabled_devices": [...], "known_devices": [...], "enabled_known_devices": [...]}}` (no file was open)
-- `{"ok": false, "error": {"code": "stop_failed", "message": "..."}}`
+- `{"ok": true, "result": {"already_stopped": false, "accepted": true, "old_file": "path/to/file.h5", "file_state": "closing", "disabled_devices": [...], "known_devices": [...], "enabled_known_devices": [...]}}`
+- `{"ok": true, "result": {"already_stopped": true, "old_file": null, "file_state": "idle", "disabled_devices": [...], "known_devices": [...], "enabled_known_devices": [...]}}` (no file was open)
+- `{"ok": false, "error": {"code": "stop_failed", "message": "..."}}` (synchronous path only, see below)
+
+The stop is **asynchronous**: the reply means the stop was accepted, not that
+the file is closed. Closing a large file (final drain, strict-stream
+finalization, flush, close) can take tens of seconds, far longer than any RPC
+timeout, so it runs on the writer's background thread. See
+[Async file operations](#async-file-operations-stop--rotate). A repeated stop
+while the first is still closing returns the same `accepted` reply. If the
+writer has no running background thread (tests, pre-start), the stop completes
+synchronously and the reply has no `accepted` key but includes
+`phase_timings_s`.
 
 ### `hdf.rotate`
 Request:
@@ -678,7 +688,46 @@ Request:
 - If `measurement_schema_path` is configured and successfully loaded in the HDF writer, `measurement_profile` is required.
 
 Response:
-- `{"ok": true, "result": {"old_file": "path/to/old.h5", "new_file": "path/to/new.h5", "measurement_id": "uuid", "measurement_type": "frequency_scan", "unknown": [...], "disabled_devices": [...], "known_devices": [...], "enabled_known_devices": [...]}}`
+- `{"ok": true, "result": {"accepted": true, "old_file": "path/to/old.h5", "new_file": "path/to/new.h5", "measurement_id": "uuid", "measurement_type": "frequency_scan", "file_state": "rotating", "unknown": [...], "disabled_devices": [...], "known_devices": [...], "enabled_known_devices": [...]}}`
+- `{"ok": false, "error": {"code": "file_exists", "message": "..."}}`
+- `{"ok": false, "error": {"code": "rotate_failed", "message": "..."}}` (e.g. missing `measurement_profile`)
+
+When a file is open, the rotate is **asynchronous**. The filename and
+measurement parameters are validated before the reply, so these errors still
+come back directly. Closing the old file and opening the new one then happens
+in the background. Messages that arrive in the meantime are held and replayed
+into the new file. If configuring the new file fails, the old file stays
+active and `last_file_op` reports `ok: false`. When no file is open, `hdf.rotate`
+behaves like `hdf.writing.start` and replies synchronously.
+
+### Async file operations (stop / rotate)
+
+While a stop or rotate is finishing:
+
+- `hdf.status` returns a reduced snapshot with `file_state` set to `"closing"` or
+  `"rotating"` and `file_op: {"op", "file", "new_file"?, "started_wall",
+  "elapsed_s", "held_messages"}`. It omits the fields that read the file
+  itself, such as `stream_buffered` and `measurement_notes_rows`.
+- `writing_active` (in status and in process telemetry) **stays true until the
+  file is actually closed**, so interlocks that gate reconfiguration on it
+  remain in force.
+- Only `hdf.status`, `hdf.writing.stop`, `hdf.measurement.schema.get`,
+  `hdf.devices.get` and `hdf.processes.get` are served. Every other `hdf.*` RPC
+  returns
+  `{"ok": false, "error": {"code": "file_op_in_progress", "message": "...", "retry_after_ms": 1000}}`.
+- The writer keeps draining its SUB socket. Messages are held (bounded by
+  `buffer_max_messages`; overflow drops the oldest and is counted in
+  `held_dropped`) and then replayed.
+
+When the op finishes, `file_state` returns to `"idle"` or `"writing"`. The
+outcome is available as `hdf.status` → `last_file_op` and is also published as
+the `hdf.file_op_done` process event:
+
+- `{"op": "stop"|"rotate", "ok": bool, "file": "old.h5", "new_file"?: "new.h5", "error"?: {"code", "message"}, "started_wall": ..., "duration_s": ..., "phase_timings_s": {"drain": ..., "strict_streams": ..., "flush": ..., "close": ...}, "held_messages": n, "held_dropped": n}`
+
+`hdf.file_op_started` is published when an op is accepted. With the Python
+SDK, `ec.hdf.writing_stop(wait=True)` / `ec.hdf.rotate(..., wait=True)` block
+until the op finishes (see `HdfAPI.wait_for_file_op`).
 
 ### `hdf.measurement.schema.get`
 Request:

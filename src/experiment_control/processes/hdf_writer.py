@@ -50,6 +50,7 @@ from .hdf_writer_bg import (
     _BgSentinel as _BgSentinel,
     _CaptureSequencerYamlRequest as _CaptureSequencerYamlRequest,
     _DevicesToggleRequest as _DevicesToggleRequest,
+    _FileOpRequest as _FileOpRequest,
     _FlushBatch as _FlushBatch,
     _MeasurementNoteRequest as _MeasurementNoteRequest,
     _RotateRequest as _RotateRequest,
@@ -76,6 +77,17 @@ Json = dict[str, Any]
 EventLogMode = Literal["all", "failures_only", "none"]
 EVENT_LOG_MODES: tuple[EventLogMode, ...] = ("all", "failures_only", "none")
 _RUN_METADATA_TRANSPORT_ALLOWANCE_MS = 250
+# RPCs that stay available while an async stop/rotate runs on the bg thread.
+# Everything else returns `file_op_in_progress` (see HdfWriter._handle_rpc).
+_RPCS_ALLOWED_DURING_FILE_OP = frozenset(
+    {
+        "hdf.status",
+        "hdf.writing.stop",
+        "hdf.measurement.schema.get",
+        "hdf.devices.get",
+        "hdf.processes.get",
+    }
+)
 
 
 def _validated_frame_metadata_dtype(raw: Any) -> np.dtype[Any]:
@@ -625,7 +637,9 @@ class HdfWriter(ManagedProcessBase):
         # open/close/rotate and read by status RPC handlers without a lock
         # (single-reference attribute reads are atomic in CPython).
         bg_qsize = max(32, self._flush_every_n // 100)
-        self._bg_queue: "queue.Queue[_FlushBatch | _BgRequest | _BgSentinel]" = (
+        self._bg_queue: (
+            "queue.Queue[_FlushBatch | _BgRequest | _FileOpRequest | _BgSentinel]"
+        ) = (
             queue.Queue(maxsize=bg_qsize)
         )
         self._bg_thread: threading.Thread | None = None
@@ -673,6 +687,18 @@ class HdfWriter(ManagedProcessBase):
         self._reservoir_soft_rows = int(self._buffer_max_messages)
         self._reservoir_hard_rows = int(self._buffer_max_messages) * 4
         self._bg_join_timeout_s = max(0.1, float(bg_join_timeout_s))
+        # Async file ops (stop / rotate). `_file_op` is the in-flight op, owned
+        # by the main thread; while it is set the main loop is in hold mode and
+        # parks raw SUB messages in `_held_messages` (bounded; overflow drops
+        # the oldest and is counted) for replay once the op completes. See
+        # `_FileOpRequest`. `_last_file_op` is the outcome of the most recent
+        # op, reported via hdf.status.
+        self._file_op: _FileOpRequest | None = None
+        self._held_messages: deque[tuple[bytes, bytes]] = deque(
+            maxlen=max(1, int(self._buffer_max_messages))
+        )
+        self._held_dropped = 0
+        self._last_file_op: Json | None = None
         self._active_h5_filename: str | None = None
         self._writing_active = False
         # writing_active is also published as PROCESS telemetry (signal
@@ -1564,9 +1590,14 @@ class HdfWriter(ManagedProcessBase):
             self._bg_thread_dead = True
             self._stop_evt.set()
 
-    def _dispatch_bg_request(self, req: "_FlushBatch | _BgRequest") -> None:
+    def _dispatch_bg_request(
+        self, req: "_FlushBatch | _BgRequest | _FileOpRequest"
+    ) -> None:
         if isinstance(req, _FlushBatch):
             self._handle_flush_batch(req)
+            return
+        if isinstance(req, _FileOpRequest):
+            self._run_file_op(req)
             return
         if isinstance(req, _CaptureSequencerYamlRequest):
             # Slow sequencer.loaded_yaml RPC, run off the main drain loop so
@@ -1594,6 +1625,47 @@ class HdfWriter(ManagedProcessBase):
         raise NotImplementedError(
             f"bg request type not yet handled: {type(req).__name__}"
         )
+
+    def _run_file_op(self, req: _FileOpRequest) -> None:
+        """Execute a stop/rotate on the bg thread and record its outcome.
+
+        Every batch queued before `req` has already been written (FIFO), and
+        the main loop is in hold mode, so the op bodies run exactly as they
+        did synchronously on the main thread — minus the quiesce, which would
+        deadlock here (it waits for this thread to drain the queue).
+        Never raises: the main loop waits on `req.done`.
+        """
+        timings: dict[str, float] = {}
+        outcome: Json = {"op": req.op, "file": req.file, "ok": True}
+        try:
+            if isinstance(req, _RotateRequest):
+                old_file, new_file = self._rotate_file(
+                    filename=None,
+                    path=req.path,
+                    disabled_devices=req.disabled_devices,
+                    measurement_meta=req.measurement_meta,
+                    quiesce=False,
+                    timings=timings,
+                )
+                outcome["file"] = old_file
+                outcome["new_file"] = new_file
+            else:
+                outcome["file"] = self._stop_writing_file(
+                    quiesce=False, timings=timings
+                )
+        except FileExistsError as exc:
+            outcome["ok"] = False
+            outcome["error"] = {"code": "file_exists", "message": str(exc)}
+        except Exception as exc:
+            self._record_exception(exc, phase=f"file_op.{req.op}")
+            outcome["ok"] = False
+            outcome["error"] = {"code": f"{req.op}_failed", "message": str(exc)}
+        finally:
+            outcome["started_wall"] = req.started_wall
+            outcome["duration_s"] = time.monotonic() - req.started_mono
+            outcome["phase_timings_s"] = timings
+            req.outcome = outcome
+            req.done.set()
 
     def _handle_flush_batch(self, batch: "_FlushBatch") -> None:
         # The bg thread runs this under _h5_lock â€” same lock that
@@ -2636,6 +2708,28 @@ class HdfWriter(ManagedProcessBase):
             if isinstance(values, list):
                 values.clear()
 
+    def _prepare_rotate_target(
+        self,
+        *,
+        filename: str | None,
+        measurement_profile: str | None,
+        measurement_values: object,
+    ) -> tuple[Path, Json]:
+        """Resolve + validate the new file's path and measurement metadata.
+
+        Split out of `_rotate_file` so the async RPC path can reject a bad
+        filename or measurement profile in its reply, before queueing the op.
+        """
+        self._out_dir.mkdir(parents=True, exist_ok=True)
+        path = self._resolve_output_path(filename, use_default_filename=True)
+        self._ensure_output_path_unused(path)
+        measurement_meta = self._build_measurement_metadata(
+            profile_id=measurement_profile,
+            values=measurement_values,
+            require_profile=self._measurement_schema is not None,
+        )
+        return path, measurement_meta
+
     def _rotate_file(
         self,
         *,
@@ -2643,6 +2737,10 @@ class HdfWriter(ManagedProcessBase):
         disabled_devices: set[str] | None = None,
         measurement_profile: str | None = None,
         measurement_values: object = None,
+        path: Path | None = None,
+        measurement_meta: Json | None = None,
+        quiesce: bool = True,
+        timings: dict[str, float] | None = None,
     ) -> tuple[str | None, str]:
         # Reassigning `self._h5` and configuring the new file is guarded by
         # `_h5_lock` so the bg flush thread can't observe a half-built file
@@ -2650,6 +2748,10 @@ class HdfWriter(ManagedProcessBase):
         # handle can't race the close. Held across the full setup +
         # old-handle teardown so the swap is atomic from observers'
         # perspective.
+        #
+        # `path` + `measurement_meta` come pre-resolved from
+        # `_prepare_rotate_target` on the async path. `quiesce=False` when
+        # running as a bg-thread file op (FIFO already drained the queue).
         if self._h5 is None:
             new_file = self._start_writing_file(
                 filename=filename,
@@ -2659,9 +2761,20 @@ class HdfWriter(ManagedProcessBase):
             )
             return None, new_file
 
+        phase_t = time.monotonic()
+
+        def _mark(phase: str) -> None:
+            nonlocal phase_t
+            now = time.monotonic()
+            if timings is not None:
+                timings[phase] = now - phase_t
+            phase_t = now
+
         # Drain the reservoir + bg queue into the OLD file before rotating, so
         # no in-flight batch is written to the new file or lost.
-        self._quiesce_bg_writes()
+        if quiesce:
+            self._quiesce_bg_writes()
+            _mark("quiesce")
 
         with self._h5_lock:
             old_file = str(self._h5.filename)
@@ -2672,16 +2785,19 @@ class HdfWriter(ManagedProcessBase):
                 if disabled_devices is not None
                 else set(self._disabled_devices)
             )
-            self._out_dir.mkdir(parents=True, exist_ok=True)
-            path = self._resolve_output_path(filename, use_default_filename=True)
-            self._ensure_output_path_unused(path)
-            measurement_meta = self._build_measurement_metadata(
-                profile_id=measurement_profile,
-                values=measurement_values,
-                require_profile=self._measurement_schema is not None,
-            )
+            if path is None or measurement_meta is None:
+                path, measurement_meta = self._prepare_rotate_target(
+                    filename=filename,
+                    measurement_profile=measurement_profile,
+                    measurement_values=measurement_values,
+                )
+            else:
+                # Re-check: the path was validated when the op was queued.
+                self._ensure_output_path_unused(path)
             self._drain_pending_to_file()
+            _mark("drain")
             self._finalize_strict_streams_locked()
+            _mark("strict_streams")
             old_state = self._snapshot_file_state()
             self._disabled_devices = new_disabled
             self._clear_buffered_for_disabled(new_disabled)
@@ -2711,6 +2827,7 @@ class HdfWriter(ManagedProcessBase):
                 self._restore_file_state(old_state)
                 self._disabled_devices = old_disabled
                 raise
+            _mark("configure_new")
 
             old_h5 = old_state.get("h5")
             if old_h5 is not None and old_h5 is not new_h5:
@@ -2721,10 +2838,12 @@ class HdfWriter(ManagedProcessBase):
                     old_h5.flush()
                 except Exception:
                     self._bump_error("rotate.old_flush")
+                _mark("flush_old")
                 try:
                     old_h5.close()
                 except Exception:
                     self._bump_error("rotate.old_close")
+                _mark("close_old")
 
             return old_file, new_path_str
 
@@ -2794,7 +2913,12 @@ class HdfWriter(ManagedProcessBase):
 
             return file_path_str
 
-    def _stop_writing_file(self) -> str | None:
+    def _stop_writing_file(
+        self,
+        *,
+        quiesce: bool = True,
+        timings: dict[str, float] | None = None,
+    ) -> str | None:
         # The `self._h5 = None` reassignment and the surrounding flush +
         # close are guarded by `_h5_lock` so the bg flush thread can't
         # interleave a write between flush and close, and so observers
@@ -2803,7 +2927,21 @@ class HdfWriter(ManagedProcessBase):
         # Quiesce the bg thread FIRST (outside the lock) so every buffered +
         # in-flight batch lands in this file before it closes — this is the
         # "stop finishes writing the buffer before stopping" guarantee.
-        self._quiesce_bg_writes()
+        # `quiesce=False` when running as a bg-thread file op: FIFO order has
+        # already written every earlier batch, and quiescing from the bg
+        # thread would wait on itself.
+        phase_t = time.monotonic()
+
+        def _mark(phase: str) -> None:
+            nonlocal phase_t
+            now = time.monotonic()
+            if timings is not None:
+                timings[phase] = now - phase_t
+            phase_t = now
+
+        if quiesce:
+            self._quiesce_bg_writes()
+            _mark("quiesce")
         with self._h5_lock:
             h5 = self._h5
             if h5 is None:
@@ -2815,11 +2953,13 @@ class HdfWriter(ManagedProcessBase):
             except Exception as e:
                 self._bump_error("stop_writing.drain")
                 errors.append(f"drain_pending failed: {e}")
+            _mark("drain")
             try:
                 self._finalize_strict_streams_locked()
             except Exception as e:
                 self._bump_error("stop_writing.strict_streams")
                 errors.append(f"strict stream finalization failed: {e}")
+            _mark("strict_streams")
             try:
                 self._mark_active_measurement_ended()
             except Exception as e:
@@ -2830,11 +2970,13 @@ class HdfWriter(ManagedProcessBase):
             except Exception as e:
                 self._bump_error("stop_writing.flush")
                 errors.append(f"flush failed: {e}")
+            _mark("flush")
             try:
                 h5.close()
             except Exception as e:
                 self._bump_error("stop_writing.close")
                 errors.append(f"close failed: {e}")
+            _mark("close")
             self._h5 = None
             self._publish_h5_state_cache()
             self._reset_per_file_state()
@@ -2851,8 +2993,10 @@ class HdfWriter(ManagedProcessBase):
         # directly, not via run()'s finally), push the reservoir through and
         # let it drain. No-op if _stop_evt is already set (run() teardown) —
         # the post-shutdown main-thread drain below is the reliable backstop.
+        # Bounded by bg_join_timeout_s (not the 10x default) so a crash exit
+        # can't hang here far past the manager's shutdown budget.
         try:
-            self._quiesce_bg_writes()
+            self._quiesce_bg_writes(timeout_s=self._bg_join_timeout_s)
         except Exception:
             self._bump_error("close.quiesce")
 
@@ -3071,8 +3215,28 @@ class HdfWriter(ManagedProcessBase):
                         self._next_write - now,
                         self._next_writing_active_publish_mono - now,
                     )
+                    if self._file_op is not None:
+                        # Wake promptly to notice the op finishing.
+                        timeout_s = min(timeout_s, 0.05)
                     timeout_ms = int(max(0.0, timeout_s) * 1000)
                     events = self._poll_and_drain(timeout_ms)
+
+                    if self._file_op is not None:
+                        # Hold mode: a stop/rotate is running on the bg
+                        # thread and owns the per-file state. Keep the SUB
+                        # socket drained, skip housekeeping + batch hand-off
+                        # (the op drains the reservoir itself), and replay
+                        # the held messages once it finishes.
+                        if events.get(sub) == zmq.POLLIN:
+                            self._hold_socket_messages()
+                        self._service_file_op()
+                        now = time.monotonic()
+                        if now >= self._next_writing_active_publish_mono:
+                            self._schedule_writing_active_publish()
+                            self._next_writing_active_publish_mono = (
+                                now + self._writing_active_publish_period_s
+                            )
+                        continue
 
                     if events.get(sub) == zmq.POLLIN:
                         # Drain messages from ZMQ into the in-memory reservoirs.
@@ -3374,15 +3538,152 @@ class HdfWriter(ManagedProcessBase):
                 topic_b, payload_b = self._sub.recv_multipart(flags=zmq.NOBLOCK)
             except zmq.Again:
                 break
+            self._dispatch_sub_message(handlers, topic_b, payload_b)
 
-            topic = topic_b.decode("utf-8", errors="replace")
-            msg = safe_json_loads(payload_b)
-            if not isinstance(msg, dict):
-                continue
-            handler = handlers.get(topic)
-            if handler is None:
-                continue
-            handler(msg)
+    def _dispatch_sub_message(
+        self,
+        handlers: dict[str, Callable[[Json], None]],
+        topic_b: bytes,
+        payload_b: bytes,
+    ) -> None:
+        topic = topic_b.decode("utf-8", errors="replace")
+        msg = safe_json_loads(payload_b)
+        if not isinstance(msg, dict):
+            return
+        handler = handlers.get(topic)
+        if handler is None:
+            return
+        handler(msg)
+
+    # ------------------------------------------------------------------
+    # Async file ops (stop / rotate). See `_FileOpRequest`.
+    # ------------------------------------------------------------------
+
+    def _bg_thread_live(self) -> bool:
+        thread = self._bg_thread
+        return (
+            thread is not None
+            and thread.is_alive()
+            and not self._stop_evt.is_set()
+            and thread is not threading.current_thread()
+        )
+
+    def _file_state(self) -> str:
+        op = self._file_op
+        if op is not None:
+            return "rotating" if op.op == "rotate" else "closing"
+        return "writing" if self._writing_active else "idle"
+
+    def _file_op_payload(self, op: _FileOpRequest) -> Json:
+        payload: Json = {
+            "op": op.op,
+            "file": op.file,
+            "started_wall": op.started_wall,
+            "elapsed_s": time.monotonic() - op.started_mono,
+            "held_messages": len(self._held_messages),
+        }
+        if isinstance(op, _RotateRequest):
+            payload["new_file"] = op.new_file
+        return payload
+
+    def _begin_file_op(self, op: _FileOpRequest) -> None:
+        """Enter hold mode and hand `op` to the bg thread. Main thread only."""
+        op.started_wall = time.time()
+        op.started_mono = time.monotonic()
+        self._file_op = op
+        self._held_dropped = 0
+        self._submit_file_op()
+        try:
+            self._publish_process_event(
+                topic="hdf.file_op_started", payload=self._file_op_payload(op)
+            )
+        except Exception:
+            self._bump_error("file_op.publish_started")
+
+    def _submit_file_op(self) -> None:
+        # The bg queue is bounded; if it is momentarily full the op stays
+        # unsubmitted and the main loop retries every iteration. Hold mode
+        # stops new batches being queued, so a slot always frees up.
+        op = self._file_op
+        if op is None or op.submitted:
+            return
+        try:
+            self._bg_queue.put_nowait(op)
+        except queue.Full:
+            return
+        op.submitted = True
+
+    def _hold_socket_messages(self) -> None:
+        """Hold-mode drain: keep the SUB socket empty (no ZMQ HWM drops) but
+        park raw frames for replay instead of touching per-file state."""
+        if self._sub is None:
+            return
+        held = self._held_messages
+        while True:
+            try:
+                topic_b, payload_b = self._sub.recv_multipart(flags=zmq.NOBLOCK)
+            except zmq.Again:
+                break
+            if held.maxlen is not None and len(held) >= held.maxlen:
+                self._held_dropped += 1
+                self._bump_error("file_op.held_dropped")
+            held.append((topic_b, payload_b))
+
+    def _service_file_op(self) -> None:
+        """Advance the in-flight op from the main loop: submit it if the queue
+        was full, and finish it once the bg thread reports done."""
+        op = self._file_op
+        if op is None:
+            return
+        self._submit_file_op()
+        if not op.done.is_set():
+            thread = self._bg_thread
+            if thread is not None and thread.is_alive():
+                return
+            # The bg thread died with the op pending; the run loop is about
+            # to exit and close() will close the file. Record the failure.
+            op.outcome = {
+                "op": op.op,
+                "file": op.file,
+                "ok": False,
+                "error": {
+                    "code": f"{op.op}_failed",
+                    "message": "bg flush thread is not running",
+                },
+                "started_wall": op.started_wall,
+                "duration_s": time.monotonic() - op.started_mono,
+                "phase_timings_s": {},
+            }
+        self._finish_file_op(op)
+
+    def _finish_file_op(self, op: _FileOpRequest) -> None:
+        outcome = dict(op.outcome or {"op": op.op, "file": op.file, "ok": False})
+        outcome["held_messages"] = len(self._held_messages)
+        outcome["held_dropped"] = int(self._held_dropped)
+        self._last_file_op = outcome
+        self._file_op = None
+        self._schedule_writing_active_publish()
+        self._next_writing_active_publish_mono = (
+            time.monotonic() + self._writing_active_publish_period_s
+        )
+        try:
+            self._publish_process_event(topic="hdf.file_op_done", payload=outcome)
+        except Exception:
+            self._bump_error("file_op.publish_done")
+        # Replay what arrived during the op, as if it had arrived now: after
+        # a rotate it lands in the new file; after a stop it is handled the
+        # same way as any message reaching an idle writer.
+        held = self._held_messages
+        self._held_messages = deque(maxlen=held.maxlen)
+        if self._buf is None:
+            return
+        handlers = self._ensure_topic_handlers()
+        for topic_b, payload_b in held:
+            try:
+                self._dispatch_sub_message(handlers, topic_b, payload_b)
+            except Exception as exc:
+                self._record_exception(exc, phase="file_op.replay")
+                self._bump_error("file_op.replay")
 
     def _ensure_device(self, device_id: str) -> bool:
         if not self._is_device_enabled(device_id):
@@ -3613,15 +3914,37 @@ class HdfWriter(ManagedProcessBase):
     # of truth so any future change to ``rpc_ok`` applies to
     # HdfWriter automatically.
 
-    def _rpc_error(self, req: Json, *, code: str, message: str | None = None) -> Json:
+    def _rpc_error(
+        self,
+        req: Json,
+        *,
+        code: str,
+        message: str | None = None,
+        retry_after_ms: int | None = None,
+    ) -> Json:
         err: Json = {"code": str(code)}
         if message is not None:
             err["message"] = str(message)
+        if retry_after_ms is not None:
+            err["retry_after_ms"] = int(retry_after_ms)
         return {
             "request_id": self._rpc_request_id(req),
             "ok": False,
             "error": err,
         }
+
+    def _file_op_busy_error(self, req: Json) -> Json:
+        op = self._file_op
+        what = "rotate" if isinstance(op, _RotateRequest) else "stop"
+        return self._rpc_error(
+            req,
+            code="file_op_in_progress",
+            message=(
+                f"HDF writer is finishing a {what} of {op.file if op else None!r}; "
+                "retry once hdf.status reports it done"
+            ),
+            retry_after_ms=1000,
+        )
 
     def _hdf_capability_members(self) -> list[MemberSpec]:
         members: list[MemberSpec] = [
@@ -3659,7 +3982,11 @@ class HdfWriter(ManagedProcessBase):
             method(
                 "hdf.writing.stop",
                 params=None,
-                doc="Stop writing and close the active file while keeping process alive.",
+                doc=(
+                    "Stop writing and close the active file while keeping process "
+                    "alive. Returns once accepted; the close finishes in the "
+                    "background (hdf.status file_state/last_file_op)."
+                ),
             ),
             method("hdf.devices.get", params=None, doc="Get HDF device write filter."),
             method(
@@ -3761,7 +4088,11 @@ class HdfWriter(ManagedProcessBase):
                         annotation="dict",
                     ),
                 ],
-                doc="Rotate writer output to a new file.",
+                doc=(
+                    "Rotate writer output to a new file. Returns once accepted; "
+                    "the swap finishes in the background (hdf.status "
+                    "file_state/last_file_op)."
+                ),
             ),
         ]
         if self._measurement_schema_path is not None:
@@ -3819,7 +4150,52 @@ class HdfWriter(ManagedProcessBase):
             "enabled_known_processes": enabled_known,
         }
 
+    def _rpc_hdf_status_during_file_op(self, req: Json, op: _FileOpRequest) -> Json:
+        # Reduced snapshot while the bg thread closes/rotates: it may be
+        # draining the stream reservoirs, mutating per-file maps and closing
+        # the datasets, so only read plain attributes + main-owned deques.
+        schema_configured, schema_available, schema_error = (
+            self._measurement_schema_state()
+        )
+        result: Json = {
+            "file": self._active_h5_filename,
+            "writing_active": bool(self._writing_active),
+            "file_state": self._file_state(),
+            "file_op": self._file_op_payload(op),
+            "last_file_op": self._last_file_op,
+            "held_messages": len(self._held_messages),
+            "held_dropped": int(self._held_dropped),
+            "autostart_writing": bool(self._autostart_writing),
+            "pending": int(self._pending),
+            "dropped": int(self._dropped_local),
+            "dropped_by_topic": dict(self._dropped_local_by_topic),
+            "dropped_events": int(self._dropped_events),
+            "bg_thread": {
+                "alive": self._bg_thread is not None and self._bg_thread.is_alive(),
+                "dead": bool(self._bg_thread_dead),
+                "queue_depth": self._bg_queue.qsize(),
+                "queue_capacity": self._bg_queue.maxsize,
+            },
+            "event_log_mode": str(self._event_log_mode),
+            "measurement_id": self._measurement_id,
+            "measurement_type": self._measurement_type,
+            "measurement_schema_version": self._measurement_schema_version,
+            "measurement_started_wall_ns": self._measurement_started_wall_ns,
+            "measurement_ended_wall_ns": self._measurement_ended_wall_ns,
+            "measurement_schema_configured": bool(schema_configured),
+            "measurement_schema_available": bool(schema_available),
+            "measurement_schema_path": self._measurement_schema_source
+            or self._measurement_schema_path,
+            "measurement_schema_error": schema_error,
+        }
+        result.update(self._hdf_device_filter_state())
+        result.update(self._hdf_process_filter_state())
+        return self.rpc_ok(req, result=result)
+
     def _rpc_hdf_status(self, req: Json) -> Json:
+        op = self._file_op
+        if op is not None:
+            return self._rpc_hdf_status_during_file_op(req, op)
         schema_configured, schema_available, schema_error = (
             self._measurement_schema_state()
         )
@@ -3845,6 +4221,9 @@ class HdfWriter(ManagedProcessBase):
             # bg thread is in the middle of a write.
             "file": self._active_h5_filename,
             "writing_active": bool(self._writing_active),
+            "file_state": self._file_state(),
+            "file_op": None,
+            "last_file_op": self._last_file_op,
             "autostart_writing": bool(self._autostart_writing),
             "pending": int(self._pending),
             "dropped": int(self._dropped_local),
@@ -4347,6 +4726,43 @@ class HdfWriter(ManagedProcessBase):
                 message="measurement_values must be a dict",
             )
 
+        if self._h5 is not None and self._bg_thread_live():
+            # Async: validate now so a bad filename/profile is rejected in the
+            # reply, then close the old file + open the new one on the bg
+            # thread. Messages arriving meanwhile are held and replayed into
+            # the new file. Outcome via hdf.status `last_file_op`.
+            try:
+                path, measurement_meta = self._prepare_rotate_target(
+                    filename=filename,
+                    measurement_profile=measurement_profile,
+                    measurement_values=measurement_values,
+                )
+            except FileExistsError as e:
+                return self._rpc_error(req, code="file_exists", message=str(e))
+            except Exception as e:
+                return self._rpc_error(req, code="rotate_failed", message=str(e))
+            rotate_op = _RotateRequest(
+                file=self._active_h5_filename,
+                new_file=str(path),
+                path=path,
+                disabled_devices=disabled_override,
+                measurement_meta=measurement_meta,
+            )
+            self._begin_file_op(rotate_op)
+            return self.rpc_ok(
+                req,
+                result={
+                    "accepted": True,
+                    "old_file": rotate_op.file,
+                    "new_file": rotate_op.new_file,
+                    "measurement_id": measurement_meta.get("measurement_id"),
+                    "measurement_type": measurement_meta.get("measurement_type"),
+                    "file_state": self._file_state(),
+                    "unknown": unknown,
+                    **self._hdf_device_filter_state(),
+                },
+            )
+
         try:
             old_file, new_file = self._rotate_file(
                 filename=filename,
@@ -4379,17 +4795,52 @@ class HdfWriter(ManagedProcessBase):
             return self._rpc_error(
                 req, code="invalid_params", message="params must be a dict"
             )
+        op = self._file_op
+        if isinstance(op, _StopWritingRequest):
+            # Idempotent: a repeated stop while the first is still closing.
+            return self.rpc_ok(
+                req,
+                result={
+                    "already_stopped": False,
+                    "accepted": True,
+                    "old_file": op.file,
+                    "file_state": self._file_state(),
+                    **self._hdf_device_filter_state(),
+                },
+            )
+        if op is not None:
+            return self._file_op_busy_error(req)
         if self._h5 is None:
             return self.rpc_ok(
                 req,
                 result={
                     "already_stopped": True,
                     "old_file": None,
+                    "file_state": self._file_state(),
                     **self._hdf_device_filter_state(),
                 },
             )
+        if self._bg_thread_live():
+            # Async: close on the bg thread; reply now. Completion is reported
+            # via hdf.status (`file_state`, `last_file_op`) and the
+            # hdf.file_op_done event. writing_active stays true until the file
+            # is actually closed.
+            stop_op = _StopWritingRequest(file=self._active_h5_filename)
+            self._begin_file_op(stop_op)
+            return self.rpc_ok(
+                req,
+                result={
+                    "already_stopped": False,
+                    "accepted": True,
+                    "old_file": stop_op.file,
+                    "file_state": self._file_state(),
+                    **self._hdf_device_filter_state(),
+                },
+            )
+        # No bg thread (tests / pre-start): close synchronously.
+        timings: dict[str, float] = {}
         try:
-            old_file = self._stop_writing_file()
+            old_file = self._stop_writing_file(timings=timings)
         except Exception as e:
             return self._rpc_error(req, code="stop_failed", message=str(e))
         return self.rpc_ok(
@@ -4397,6 +4848,8 @@ class HdfWriter(ManagedProcessBase):
             result={
                 "already_stopped": False,
                 "old_file": old_file,
+                "file_state": self._file_state(),
+                "phase_timings_s": timings,
                 **self._hdf_device_filter_state(),
             },
         )
@@ -4503,6 +4956,16 @@ class HdfWriter(ManagedProcessBase):
                 dispatch_req,
                 result=capabilities_payload(self._hdf_capability_members()),
             )
+
+        if (
+            self._file_op is not None
+            and self._rpc_registry.canonical_action(rpc.action)
+            not in _RPCS_ALLOWED_DURING_FILE_OP
+        ):
+            # These touch the file or per-file state the bg thread owns while
+            # it closes/rotates; taking _h5_lock here would block the main
+            # loop for the whole op.
+            return self._file_op_busy_error(dispatch_req)
 
         dispatched = self._rpc_registry.dispatch(dispatch_req)
         if dispatched is not None:
