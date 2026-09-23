@@ -73,7 +73,7 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v6
         with:
-          node-version: "20"
+          node-version-file: web/react_ui/.nvmrc
           cache: npm
           cache-dependency-path: web/react_ui/package-lock.json
 

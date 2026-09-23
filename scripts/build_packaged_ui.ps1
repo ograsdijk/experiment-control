@@ -9,6 +9,16 @@ if (-not (Test-Path (Join-Path $uiRoot "package.json"))) {
   throw "build_packaged_ui: UI source not found at $uiRoot"
 }
 
+# The committed .gz assets must match CI byte for byte, and deflate output
+# depends on the zlib Node uses. Build only with the pinned official Node
+# (bundled zlib); Homebrew's node links the system zlib and differs.
+$requiredNode = (Get-Content (Join-Path $uiRoot ".nvmrc") -Raw).Trim()
+$actualNode = (node -p "process.versions.node.split('.')[0]").Trim()
+if ($actualNode -ne $requiredNode) {
+  $zlib = (node -p "process.versions.zlib").Trim()
+  throw "build_packaged_ui: official Node $requiredNode required (web/react_ui/.nvmrc), found Node $actualNode (zlib $zlib). The packaged .gz assets would not match CI."
+}
+
 # npm 11+ resolves package.json from the current working directory before
 # honouring --prefix, so running from the repo root fails with ENOENT even
 # though `--prefix web\react_ui` is supplied. Push into the UI source dir
