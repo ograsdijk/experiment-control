@@ -41,6 +41,8 @@ npm run typecheck   # tsc --noEmit (clean; do not introduce new errors)
 npm run build       # tsc --noEmit && vite build && compress-dist
 ```
 
+Build the packaged UI with an **official Node 24** build (active LTS; pinned in `web/react_ui/.nvmrc`, which CI also reads), e.g. via nvm/fnm/volta or nodejs.org. CI's `ui_validate` rebuilds `_ui_dist` and requires it to match byte for byte, including the `.gz` files, and deflate output depends on the zlib Node uses. Official Node 20 and 24 builds (bundled zlib 1.3.x) produce identical `.gz`; Homebrew's `node` links the macOS system zlib (1.2.12) and does not, whatever its version. `build_packaged_ui.ps1` refuses to run on another Node major; `npm test`/`npm run build` work on any version.
+
 ### Deploy model (read before changing the UI)
 
 The FastAPI gateway serves a **packaged** copy of the built UI from `src/experiment_control/_ui_dist`, which is **committed to git** so a plain `pip install` ships the UI without a Node build. Serve precedence (in `fastapi/app.py`: the `EXPERIMENT_CONTROL_SERVE_UI` gate and the env override live in `_resolve_ui_dist_path`; the packaged/dev-fallback selection lives in `_default_ui_dist_path`):
