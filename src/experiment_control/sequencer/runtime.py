@@ -6,6 +6,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from ..contracts.context_fields import SEQUENCER_RUN_ID_FIELD
 from ..driver import extract_value
 from .ast import (
     AdaptiveStep,
@@ -1760,7 +1761,11 @@ class SequencerRuntime:
     def _execute_set_context_step(self, step: SetContextStep) -> bool:
         self._context_id += 1
         ctx_id = self._context_id
-        fields = render_templates(step.fields, self._env_view())
+        fields = dict(render_templates(step.fields, self._env_view()))
+        # Framework-owned provenance, captured now (not at dispatch time) so
+        # both the async and sync paths carry this run's id. Overwrites any
+        # programmatically supplied value; YAML cannot set it (parse error).
+        fields[SEQUENCER_RUN_ID_FIELD] = int(self._run_id)
         try:
             streams = self._normalize_streams(step.streams)
         except Exception as e:

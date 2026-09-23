@@ -413,6 +413,116 @@ class HdfWriterSequencerTests(unittest.TestCase):
                 self.assertEqual(int(writer._sequencer_events_ds.shape[0]), 0)  # noqa: SLF001
 
 
+    def _make_configured_writer(self, h5: h5py.File) -> HdfWriter:
+        writer = HdfWriter(
+            out_dir="data",
+            filename=None,
+            manager_rpc="tcp://127.0.0.1:65531",
+            manager_pub="tcp://127.0.0.1:65532",
+            rpc_timeout_ms=2000,
+            timezone="America/Chicago",
+            rcvhwm=1000,
+            write_every_s=1.0,
+            buffer_max_messages=1000,
+            flush_every_n=10,
+            flush_every_s=1.0,
+            disabled_devices=[],
+            event_log_mode="all",
+        )
+        writer._configure_active_file(  # noqa: SLF001
+            h5,
+            write_every_s=1.0,
+            load_manager_state=False,
+            measurement_meta=writer._build_measurement_metadata(  # noqa: SLF001
+                profile_id=None,
+                values=None,
+                require_profile=False,
+            ),
+        )
+        return writer
+
+    def test_lifecycle_start_passes_run_id_to_yaml_capture(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            with h5py.File(Path(td) / "test.h5", "w") as h5:
+                writer = self._make_configured_writer(h5)
+                writer._bg_thread = threading.Thread()  # noqa: SLF001
+                writer._handle_sequencer_lifecycle(  # noqa: SLF001
+                    {
+                        "process_id": "sequencer",
+                        "event": "start",
+                        "ok": True,
+                        "payload": {"run_id": 3},
+                        "ts": {"t_wall": 1.0, "t_mono": 2.0},
+                    }
+                )
+                req = writer._bg_queue.get_nowait()  # noqa: SLF001
+                self.assertIsInstance(req, _CaptureSequencerYamlRequest)
+                self.assertEqual(req.run_id, 3)
+
+    def test_yaml_capture_links_snapshot_to_run_id(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            with h5py.File(Path(td) / "test.h5", "w") as h5:
+                writer = self._make_configured_writer(h5)
+                req = _CaptureSequencerYamlRequest(
+                    process_id="sequencer",
+                    measurement_id=writer._measurement_id or "",  # noqa: SLF001
+                    run_id=3,
+                )
+                with patch.object(
+                    hdf_writer_module,
+                    "_manager_rpc",
+                    return_value={
+                        "ok": True,
+                        "result": {
+                            "loaded": True,
+                            "text": "steps: []",
+                            "source": "library://test",
+                            "run_id": 3,
+                        },
+                    },
+                ):
+                    writer._dispatch_bg_request(req)  # noqa: SLF001
+
+                assert writer._sequencer_yaml_ds is not None  # noqa: SLF001
+                self.assertEqual(int(writer._sequencer_yaml_ds.shape[0]), 1)  # noqa: SLF001
+                assert writer._sequencer_events_ds is not None  # noqa: SLF001
+                self.assertEqual(int(writer._sequencer_events_ds.shape[0]), 1)  # noqa: SLF001
+                row = writer._sequencer_events_ds[0]  # noqa: SLF001
+                self.assertEqual(_as_text(row["event"]), "yaml_snapshot")
+                self.assertTrue(bool(row["ok"]))
+                self.assertEqual(int(row["yaml_snapshot_id"]), 0)
+                payload = json.loads(_as_text(row["payload_json"]))
+                self.assertEqual(payload["run_id"], 3)
+                self.assertEqual(payload["snapshot_id"], 0)
+
+    def test_yaml_capture_rejects_snapshot_of_a_different_run(self) -> None:
+        # A reload between start and the async capture resets loaded_yaml's
+        # run_id; the stale text must not be recorded against this run.
+        with tempfile.TemporaryDirectory() as td:
+            with h5py.File(Path(td) / "test.h5", "w") as h5:
+                writer = self._make_configured_writer(h5)
+                req = _CaptureSequencerYamlRequest(
+                    process_id="sequencer",
+                    measurement_id=writer._measurement_id or "",  # noqa: SLF001
+                    run_id=3,
+                )
+                with patch.object(
+                    hdf_writer_module,
+                    "_manager_rpc",
+                    return_value={
+                        "ok": True,
+                        "result": {"loaded": True, "text": "steps: []", "run_id": None},
+                    },
+                ):
+                    writer._dispatch_bg_request(req)  # noqa: SLF001
+
+                assert writer._sequencer_yaml_ds is not None  # noqa: SLF001
+                self.assertEqual(int(writer._sequencer_yaml_ds.shape[0]), 0)  # noqa: SLF001
+                assert writer._sequencer_events_ds is not None  # noqa: SLF001
+                row = writer._sequencer_events_ds[0]  # noqa: SLF001
+                self.assertEqual(_as_text(row["event"]), "yaml_snapshot_failed")
+                self.assertIn("not started run 3", _as_text(row["message"]))
+
 class HdfWriterStrictStreamTests(unittest.TestCase):
     @staticmethod
     def _make_writer() -> HdfWriter:
@@ -2259,6 +2369,104 @@ class HdfWriterContextColumnTests(unittest.TestCase):
                         _as_text(h5["context_table/columns"].attrs["source"]), "auto"
                     )
 
+
+    def _write_run_contexts(self, writer: HdfWriter) -> None:
+        writer._write_context_rows_batch(  # noqa: SLF001
+            [
+                {
+                    "context_id": cid,
+                    "fields": {
+                        "freq_hz": 1.5 * cid,
+                        "step": cid,
+                        "flag": bool(cid % 2),
+                        "label": "x",
+                        "sequencer_run_id": run_id,
+                    },
+                    "ts_wall_ns": 11,
+                    "ts_mono_ns": 12,
+                }
+                for cid, run_id in ((0, 1), (1, 1), (2, 2))
+            ]
+        )
+
+    def _assert_run_id_column_matches_fields_json(self, h5: h5py.File) -> None:
+        ds = h5["context_table/columns/sequencer_run_id"]
+        self.assertEqual(ds.dtype, np.dtype("int64"))
+        self.assertEqual(_as_text(ds.attrs["dtype"]), "int64")
+        from_json = [
+            json.loads(_as_text(row["fields_json"]))["sequencer_run_id"]
+            for row in h5["context_table/data"][...]
+        ]
+        self.assertEqual(from_json, [1, 1, 2])
+        self.assertEqual(list(ds[...]), from_json)
+
+    def test_infer_context_columns_types_run_id_as_int64(self) -> None:
+        writer = self._make_writer("data")
+        spec = writer._infer_context_columns_from_fields(  # noqa: SLF001
+            {"freq_hz": 1.0, "step": 3, "flag": True, "label": "x", "sequencer_run_id": 1}
+        )
+        self.assertEqual(
+            spec,
+            {
+                "freq_hz": "float64",
+                "step": "float64",
+                "flag": "bool",
+                "sequencer_run_id": "int64",
+            },
+        )
+
+    def test_auto_inferred_columns_include_run_id_without_explicit_schema(self) -> None:
+        def fake_rpc(*args: object, **kwargs: object) -> dict[str, object]:
+            return {"ok": True, "result": {"loaded": True, "context_columns": None}}
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            writer = self._make_writer(str(root))
+            h5_path = root / "context_auto_run_id.h5"
+            with patch.object(hdf_writer_module, "_manager_rpc", fake_rpc):
+                with h5py.File(h5_path, "w") as h5:
+                    self._configure_writer(writer, h5)
+                    self._write_run_contexts(writer)
+
+                    columns = h5["context_table/columns"]
+                    self.assertEqual(_as_text(columns.attrs["source"]), "auto")
+                    self.assertEqual(
+                        sorted(columns), ["flag", "freq_hz", "sequencer_run_id", "step"]
+                    )
+                    self.assertEqual(columns["freq_hz"].dtype, np.dtype("float64"))
+                    self.assertEqual(columns["step"].dtype, np.dtype("float64"))
+                    self.assertEqual(list(columns["step"][...]), [0.0, 1.0, 2.0])
+                    self.assertEqual(columns["flag"].dtype, np.dtype("uint8"))
+                    self._assert_run_id_column_matches_fields_json(h5)
+
+    def test_explicit_effective_schema_projects_run_id(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            writer = self._make_writer(str(root))
+            h5_path = root / "context_explicit_run_id.h5"
+            with h5py.File(h5_path, "w") as h5:
+                self._configure_writer(writer, h5)
+                writer._handle_sequencer_lifecycle_locked(  # noqa: SLF001
+                    {
+                        "event": "start",
+                        "ok": True,
+                        "payload": {
+                            "run_id": 1,
+                            "context_columns": {
+                                "step": "int64",
+                                "sequencer_run_id": "int64",
+                            },
+                        },
+                        "ts": {"t_wall": 1.0, "t_mono": 2.0},
+                    }
+                )
+                self._write_run_contexts(writer)
+
+                columns = h5["context_table/columns"]
+                self.assertEqual(_as_text(columns.attrs["source"]), "explicit")
+                self.assertEqual(sorted(columns), ["sequencer_run_id", "step"])
+                self.assertEqual(list(columns["step"][...]), [0, 1, 2])
+                self._assert_run_id_column_matches_fields_json(h5)
 
 class HdfWriterCompressionTests(unittest.TestCase):
     def _make_writer(self, out_dir: str) -> HdfWriter:

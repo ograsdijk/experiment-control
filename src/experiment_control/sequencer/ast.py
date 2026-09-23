@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from ..contracts.context_fields import SEQUENCER_RUN_ID_FIELD
 from ..utils.yaml_helpers import load_yaml_text
 
 @dataclass(frozen=True)
@@ -305,6 +306,11 @@ def _parse_step(raw: Any) -> Step:
         fields = sc.get("fields", {}) or {}
         if not isinstance(fields, dict):
             raise TypeError("set_context.fields must be a dict")
+        if SEQUENCER_RUN_ID_FIELD in fields:
+            raise TypeError(
+                f"set_context.fields must not set {SEQUENCER_RUN_ID_FIELD!r}: it is "
+                "reserved and injected automatically by the sequencer runtime"
+            )
         return SetContextStep(streams=sc.get("streams", []), fields=fields, disabled=disabled)
     if "use" in obj:
         raw_use = obj.get("use")
@@ -513,6 +519,11 @@ def parse_sequence(raw: Any) -> SequenceSpec:
         context_columns = {}
         for key, value in context_columns_raw.items():
             name = str(key)
+            if name == SEQUENCER_RUN_ID_FIELD:
+                raise TypeError(
+                    f"context_columns must not declare {SEQUENCER_RUN_ID_FIELD!r}: it "
+                    "is reserved and added automatically (int64) by the sequencer"
+                )
             dtype = str(value).lower()
             if dtype not in {"float64", "int64", "bool"}:
                 raise TypeError(

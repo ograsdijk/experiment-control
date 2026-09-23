@@ -598,13 +598,15 @@ Request:
 
 Response:
 - `{"ok": true, "result": {"run_id": 7, "state": "...", "current_step": "...", "loop_mode": "once" | "repeat" | "continuous", "loops_completed": 2, "loops_target": 5 | null, "vars": {...}, "vars_override": {...}, "env": {...}, "error": null, "loaded": true, "active_sequence_id": "main" | null, "loaded_source": "...", "loaded_source_kind": "rpc" | "library" | "autoload_path" | null, "context_columns": {...} | null, "sequence_library_configured": true | false, "sequence_library_path": "..." | null, "sequence_library_error": "..." | null, "sequence_library_warnings": [...], "progress": {"run_id": 7, "elapsed_s": 12.3, "completed_steps": 42, "total_steps": 100 | null, "percent": 42.0 | null, "eta_s": 16.8 | null, "step_ewma_s": 0.4 | null, "current_step_elapsed_s": 0.2 | null, "loop_mode": "repeat", "loops_completed": 2, "loops_target": 5}}}`
+- `context_columns` (here and in the `load_ok`/`start` lifecycle payloads) is the effective schema: a declared schema plus `sequencer_run_id: "int64"`, or `null` when the sequence declares none (the HDF writer then infers columns).
 
 ### `sequencer.loaded_yaml`
 Request:
 - `{"type": "sequencer.loaded_yaml"}`
 
 Response:
-- `{"ok": true, "result": {"loaded": true, "source": "sequences/main.yaml", "source_kind": "library", "active_sequence_id": "main", "text": "...yaml..."}}`
+- `{"ok": true, "result": {"loaded": true, "source": "sequences/main.yaml", "source_kind": "library", "active_sequence_id": "main", "text": "...yaml...", "run_id": 7 | null}}`
+- `run_id` is the run id of the most recent successful `sequencer.start` of the currently loaded text; `null` until that text is started (loading resets it).
 
 ## HDF writer process RPC (`manager.processes.rpc.request` payload)
 
