@@ -11,6 +11,7 @@ import uuid
 from collections import deque
 from pathlib import Path
 from typing import Any, Callable
+from unittest.mock import patch
 
 import h5py
 import numpy as np
@@ -249,6 +250,63 @@ class HdfWriterAsyncFileOpTests(unittest.TestCase):
             self.assertEqual(int(h5["streams/pxie/waveforms"].attrs["rows_written_total"]), 2)
             self.assertTrue(bool(h5.attrs["acquisition_ok"]))
             self.assertEqual(json.loads(h5.attrs["hdf_strict_stream_errors_json"]), [])
+
+    def _seed_validation_error_and_metadata_failure(self) -> Callable[..., None]:
+        w = self.writer
+        for device, stream, gap in (("pxie", "waveforms", 1), ("fs740", "timestamps", 0)):
+            key = (device, stream)
+            reply = self._rpc("hdf.streams.expect", {
+                "streams": [{"device_id": device, "stream": stream, "expected_count": 1}],
+                "context_id": 7, "strict": True,
+            })
+            self.assertTrue(reply["ok"], reply)
+            w._stream_counters[key].update(  # noqa: SLF001
+                chunk_ready_seen_total=1, rows_written_total=1, seq_gap_total=gap,
+            )
+            w._stream_context_counters[(7, *key)]["rows_written_total"] = 1  # noqa: SLF001
+        persist = w._persist_stream_attrs  # noqa: SLF001
+
+        def fail_timestamps(key: tuple[str, str], **kwargs: Any) -> None:
+            if key == ("fs740", "timestamps"):
+                raise OSError("injected timestamp metadata failure")
+            persist(key, **kwargs)
+
+        return fail_timestamps
+
+    def _assert_validation_failure_saved(self) -> None:
+        expected = [{
+            "device_id": "pxie", "stream": "waveforms",
+            "reason": "required stream has sequence gaps", "context_id": 7,
+            "expected_count": 1, "rows_written": 1,
+        }]
+        with h5py.File(self.first_file, "r") as h5:
+            for group in (h5, h5["measurement"]):
+                self.assertFalse(bool(group.attrs["acquisition_ok"]))
+                self.assertEqual(json.loads(group.attrs["hdf_strict_stream_errors_json"]), expected)
+
+    def test_stop_preserves_validation_summary_when_stream_metadata_fails(self) -> None:
+        fail_timestamps = self._seed_validation_error_and_metadata_failure()
+        self.gate.set()
+        with patch.object(self.writer, "_persist_stream_attrs", side_effect=fail_timestamps):
+            self.assertTrue(self._rpc("hdf.writing.stop")["ok"])
+            self._run_main_loop_until_idle()
+        last = self.writer._last_file_op  # noqa: SLF001
+        assert last is not None
+        self.assertFalse(last["ok"])
+        self.assertEqual(last["error"]["code"], "stop_failed")
+        self.assertIn("injected timestamp metadata failure", last["error"]["message"])
+        self.assertIsNone(self.writer._h5)  # noqa: SLF001
+        self._assert_validation_failure_saved()
+
+    def test_close_preserves_validation_summary_when_stream_metadata_fails(self) -> None:
+        fail_timestamps = self._seed_validation_error_and_metadata_failure()
+        self.gate.set()
+        self.writer._sub = None  # noqa: SLF001
+        with patch.object(self.writer, "_persist_stream_attrs", side_effect=fail_timestamps):
+            self.writer.close()
+        self.assertIsNone(self.writer._h5)  # noqa: SLF001
+        self.assertEqual(self.writer._error_counts["close.strict_streams"], 1)  # noqa: SLF001
+        self._assert_validation_failure_saved()
 
     def test_rotate_lands_gap_messages_in_new_file(self) -> None:
         w = self.writer

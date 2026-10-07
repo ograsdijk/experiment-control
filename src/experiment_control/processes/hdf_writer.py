@@ -2566,11 +2566,14 @@ class HdfWriter(ManagedProcessBase):
                     expected_count=expected if expected >= 0 else None,
                     rows_written=rows,
                 )
+        # Save the validation outcome before per-stream metadata. Stop/close
+        # can still close the file if a later stream update raises, so the
+        # file must not retain its initial acquisition_ok=True in that case.
+        self._persist_acquisition_attrs()
         for key in sorted(strict_keys):
             self._persist_stream_attrs(
                 key, context_ids=sorted(context_ids_by_stream[key])
             )
-        self._persist_acquisition_attrs()
 
     def _configure_active_file(
         self,
