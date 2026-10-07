@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 import h5py
+import numpy as np
 import zmq
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -20,7 +21,7 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from experiment_control.processes.hdf_writer import HdfWriter  # noqa: E402
+from experiment_control.processes.hdf_writer import HdfWriter, _FlushBatch  # noqa: E402
 
 
 class _FakeSub:
@@ -218,6 +219,36 @@ class HdfWriterAsyncFileOpTests(unittest.TestCase):
         # Replayed to the (now idle) writer like any message arriving late.
         self.assertEqual(len(w._held_messages), 0)  # noqa: SLF001
         self.assertEqual(w._last_file_op["held_messages"], 1)  # noqa: SLF001
+
+    def test_stop_validates_waveforms_after_queued_and_reservoir_writes(self) -> None:
+        w = self.writer
+        key = ("pxie", "waveforms")
+        frames = np.arange(16, dtype=np.int16).reshape(2, 2, 4)
+        reply = self._rpc("hdf.streams.expect", {
+            "streams": [{"device_id": "pxie", "stream": "waveforms", "expected_count": 2}],
+            "context_id": 7, "strict": True,
+        })
+        self.assertTrue(reply["ok"], reply)
+        w._stream_schema[key] = {"dtype": "int16", "shape": (2, 4)}  # noqa: SLF001
+        w._stream_counters[key]["chunk_ready_seen_total"] = 2  # noqa: SLF001
+        first = {"data": [frames[0].tobytes()], "seq": [1],
+                 "t0_mono_ns": [1], "t0_wall_ns": [1], "context_id": [7]}
+        second = {"data": [frames[1].tobytes()], "seq": [2],
+                  "t0_mono_ns": [2], "t0_wall_ns": [2], "context_id": [7]}
+        w._stream_buffers[key] = second  # noqa: SLF001
+        w._bg_queue.put(_FlushBatch(  # noqa: SLF001
+            stream_batches={key: first},
+            stream_meta={key: {"dtype": "int16", "shape": (2, 4), "session": 1}},
+        ))
+        self.assertTrue(self._rpc("hdf.writing.stop")["ok"])
+        self.assertTrue(self.op_entered.wait(timeout=5.0))
+        self.gate.set()
+        self._run_main_loop_until_idle()
+        with h5py.File(self.first_file, "r") as h5:
+            np.testing.assert_array_equal(h5["streams/pxie/waveforms/session_001/data"][...], frames)
+            self.assertEqual(int(h5["streams/pxie/waveforms"].attrs["rows_written_total"]), 2)
+            self.assertTrue(bool(h5.attrs["acquisition_ok"]))
+            self.assertEqual(json.loads(h5.attrs["hdf_strict_stream_errors_json"]), [])
 
     def test_rotate_lands_gap_messages_in_new_file(self) -> None:
         w = self.writer

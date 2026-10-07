@@ -2385,7 +2385,9 @@ class HdfWriter(ManagedProcessBase):
         device_id, stream = key
         return self._streams_group.require_group(device_id).require_group(stream)
 
-    def _persist_stream_attrs(self, key: tuple[str, str]) -> None:
+    def _persist_stream_attrs(
+        self, key: tuple[str, str], *, context_ids: list[int] | None = None
+    ) -> None:
         group = self._stream_group_for_key(key)
         if group is None:
             return
@@ -2400,11 +2402,12 @@ class HdfWriter(ManagedProcessBase):
             group.attrs["expected_count"] = int(expectation.get("expected_count", -1))
             group.attrs["strict_required"] = bool(expectation.get("strict", False))
             group.attrs["context_id"] = int(expectation.get("context_id", -1))
-        context_ids = sorted(
-            context_id
-            for context_id, device_id, stream in self._stream_expectations_by_context
-            if (device_id, stream) == key
-        )
+        if context_ids is None:
+            context_ids = sorted(
+                context_id
+                for context_id, device_id, stream in self._stream_expectations_by_context
+                if (device_id, stream) == key
+            )
         if context_ids:
             group.attrs["expected_context_ids_json"] = json.dumps(context_ids)
 
@@ -2459,6 +2462,7 @@ class HdfWriter(ManagedProcessBase):
         key: tuple[str, str],
         reason: str,
         *,
+        error_keys: set[str],
         context_id: int | None = None,
         expected_count: int | None = None,
         rows_written: int | None = None,
@@ -2471,13 +2475,15 @@ class HdfWriter(ManagedProcessBase):
             err["expected_count"] = int(expected_count)
         if rows_written is not None:
             err["rows_written"] = int(rows_written)
-        if err not in self._strict_stream_errors:
+        # The caller seeds this set once per finalization, including errors
+        # from earlier finalizations, so collecting errors stays linear.
+        error_key = json.dumps(err, sort_keys=True)
+        if error_key not in error_keys:
+            error_keys.add(error_key)
             self._strict_stream_errors.append(err)
         self._acquisition_ok = False
         counters = self._stream_counter_state(key)
         counters["last_error"] = reason
-        self._persist_stream_attrs(key)
-        self._persist_acquisition_attrs()
         try:
             self.publish_telemetry({"hdf_strict_stream_error": reason}, quality="bad")
         except Exception:
@@ -2485,13 +2491,23 @@ class HdfWriter(ManagedProcessBase):
 
     def _finalize_strict_streams_locked(self) -> None:
         self._assert_h5_locked()
+        # Validate all contexts before persisting. Rewriting the complete
+        # context/error JSON for every context causes quadratic work and
+        # large allocations in the HDF variable-length string heap.
+        error_keys = {
+            json.dumps(err, sort_keys=True) for err in self._strict_stream_errors
+        }
+        context_ids_by_stream: dict[tuple[str, str], list[int]] = {}
+        strict_keys: set[tuple[str, str]] = set()
         for context_key, expectation in list(
             self._stream_expectations_by_context.items()
         ):
-            if not bool(expectation.get("strict", False)):
-                continue
             context_id, device_id, stream = context_key
             key = (device_id, stream)
+            context_ids_by_stream.setdefault(key, []).append(context_id)
+            if not bool(expectation.get("strict", False)):
+                continue
+            strict_keys.add(key)
             counters = self._stream_counter_state(key)
             seen = int(counters.get("chunk_ready_seen_total", 0) or 0)
             if context_id < 0:
@@ -2509,6 +2525,7 @@ class HdfWriter(ManagedProcessBase):
                 self._record_strict_stream_error(
                     key,
                     "required stream never seen",
+                    error_keys=error_keys,
                     context_id=context_id,
                     expected_count=expected if expected >= 0 else None,
                     rows_written=rows,
@@ -2517,6 +2534,7 @@ class HdfWriter(ManagedProcessBase):
                 self._record_strict_stream_error(
                     key,
                     "required stream seen but no rows written",
+                    error_keys=error_keys,
                     context_id=context_id,
                     expected_count=expected if expected >= 0 else None,
                     rows_written=rows,
@@ -2525,6 +2543,7 @@ class HdfWriter(ManagedProcessBase):
                 self._record_strict_stream_error(
                     key,
                     "required stream wrote fewer rows than expected",
+                    error_keys=error_keys,
                     context_id=context_id,
                     expected_count=expected,
                     rows_written=rows,
@@ -2533,6 +2552,7 @@ class HdfWriter(ManagedProcessBase):
                 self._record_strict_stream_error(
                     key,
                     "required stream has sequence gaps",
+                    error_keys=error_keys,
                     context_id=context_id,
                     expected_count=expected if expected >= 0 else None,
                     rows_written=rows,
@@ -2541,11 +2561,15 @@ class HdfWriter(ManagedProcessBase):
                 self._record_strict_stream_error(
                     key,
                     "required stream had attach, drain, payload, or write failures",
+                    error_keys=error_keys,
                     context_id=context_id,
                     expected_count=expected if expected >= 0 else None,
                     rows_written=rows,
                 )
-            self._persist_stream_attrs(key)
+        for key in sorted(strict_keys):
+            self._persist_stream_attrs(
+                key, context_ids=sorted(context_ids_by_stream[key])
+            )
         self._persist_acquisition_attrs()
 
     def _configure_active_file(

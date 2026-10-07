@@ -585,6 +585,148 @@ class HdfWriterStrictStreamTests(unittest.TestCase):
                 self.assertEqual(int(group.attrs["context_id"]), 7)
                 self.assertEqual(int(group.attrs["rows_written_total"]), 0)
 
+    def test_acquisition_persists_contexts_and_written_counts_before_finalize(self) -> None:
+        writer = self._make_writer()
+        self.addCleanup(writer._ctx.destroy, linger=0)  # noqa: SLF001
+        key = ("pxie", "waveforms")
+        frames = np.arange(16, dtype=np.int16).reshape(2, 2, 4)
+        with tempfile.TemporaryDirectory() as td:
+            with h5py.File(Path(td) / "live.h5", "w") as h5:
+                self._configure(writer, h5)
+                for context_id in (7, 8):
+                    reply = writer._rpc_hdf_streams_expect(  # noqa: SLF001
+                        {
+                            "params": {
+                                "streams": ["pxie.waveforms"],
+                                "context_id": context_id,
+                                "strict": True,
+                            }
+                        }
+                    )
+                    self.assertTrue(reply["ok"], reply)
+                group = h5["streams/pxie/waveforms"]
+                self.assertEqual(json.loads(group.attrs["expected_context_ids_json"]), [7, 8])
+                self.assertEqual(int(group.attrs["rows_written_total"]), 0)
+                with (
+                    writer._h5_lock,
+                    patch.object(  # noqa: SLF001
+                        writer, "_finalize_strict_streams_locked"
+                    ) as finalize,
+                ):
+                    writer._write_stream_buffers_batch(  # noqa: SLF001
+                        {
+                            key: {
+                                "data": [frame.tobytes() for frame in frames],
+                                "seq": [1, 2],
+                                "t0_mono_ns": [1, 2],
+                                "t0_wall_ns": [1, 2],
+                                "context_id": [7, 8],
+                            }
+                        },
+                        stream_meta={key: {"dtype": "int16", "shape": (2, 4), "session": 1}},
+                    )
+                    finalize.assert_not_called()
+                self.assertEqual(int(group.attrs["rows_written_total"]), 2)
+                self.assertEqual(json.loads(group.attrs["expected_context_ids_json"]), [7, 8])
+                np.testing.assert_array_equal(group["session_001/data"][...], frames)
+                self.assertEqual(
+                    writer._stream_context_counters[(7, *key)]["rows_written_total"], 1
+                )  # noqa: SLF001
+                self.assertEqual(
+                    writer._stream_context_counters[(8, *key)]["rows_written_total"], 1
+                )  # noqa: SLF001
+
+    def test_many_contexts_finalize_once_per_stream_without_changing_results(self) -> None:
+        contexts = 1200
+        keys = [("pxie", "waveforms"), ("fs740", "timestamps")]
+        for has_gap in (False, True):
+            with self.subTest(has_gap=has_gap), tempfile.TemporaryDirectory() as td:
+                writer = self._make_writer()
+                self.addCleanup(writer._ctx.destroy, linger=0)  # noqa: SLF001
+                path = Path(td) / "many.h5"
+                with h5py.File(path, "w") as h5:
+                    self._configure(writer, h5)
+                    for key in keys:
+                        writer._stream_counters[key] = {  # noqa: SLF001
+                            "chunk_ready_seen_total": contexts,
+                            "rows_written_total": contexts,
+                            "seq_gap_total": int(has_gap),
+                        }
+                        for context_id in range(contexts):
+                            context_key = (context_id, *key)
+                            writer._stream_expectations_by_context[context_key] = {  # noqa: SLF001
+                                "strict": True,
+                                "expected_count": 1,
+                            }
+                            writer._stream_context_counters[context_key] = {  # noqa: SLF001
+                                "rows_written_total": 1,
+                            }
+                        # Non-strict contexts must remain in the context ID
+                        # metadata, but must not introduce validation errors.
+                        writer._stream_expectations_by_context[(contexts, *key)] = {  # noqa: SLF001
+                            "strict": False,
+                            "expected_count": 100,
+                        }
+                    with (
+                        writer._h5_lock,
+                        patch.object(  # noqa: SLF001
+                            writer,
+                            "_persist_stream_attrs",
+                            wraps=writer._persist_stream_attrs,  # noqa: SLF001
+                        ) as streams,
+                        patch.object(
+                            writer,
+                            "_persist_acquisition_attrs",
+                            wraps=writer._persist_acquisition_attrs,  # noqa: SLF001
+                        ) as acquisition,
+                        patch.object(writer, "publish_telemetry"),
+                    ):
+                        writer._finalize_strict_streams_locked()  # noqa: SLF001
+                        self.assertEqual(streams.call_count, len(keys))
+                        self.assertEqual(acquisition.call_count, 1)
+                        errors = json.loads(h5.attrs["hdf_strict_stream_errors_json"])
+                        self.assertEqual(len(errors), contexts * len(keys) if has_gap else 0)
+                        self.assertEqual(bool(h5.attrs["acquisition_ok"]), not has_gap)
+                        self.assertEqual(
+                            json.loads(
+                                writer._measurement_group.attrs["hdf_strict_stream_errors_json"]
+                            ),  # noqa: SLF001
+                            errors,
+                        )
+                        if has_gap:
+                            self.assertEqual(
+                                errors[0],
+                                {
+                                    "device_id": "pxie",
+                                    "stream": "waveforms",
+                                    "reason": "required stream has sequence gaps",
+                                    "context_id": 0,
+                                    "expected_count": 1,
+                                    "rows_written": 1,
+                                },
+                            )
+                            self.assertEqual(errors[-1]["context_id"], contexts - 1)
+                        for device, stream in keys:
+                            group = h5[f"streams/{device}/{stream}"]
+                            self.assertEqual(int(group.attrs["rows_written_total"]), contexts)
+                            self.assertEqual(
+                                json.loads(group.attrs["expected_context_ids_json"]),
+                                list(range(contexts + 1)),
+                            )
+                        # Retry/finalization at another boundary must retain
+                        # exactly the same errors, not append duplicates.
+                        streams.reset_mock()
+                        acquisition.reset_mock()
+                        writer._finalize_strict_streams_locked()  # noqa: SLF001
+                        self.assertEqual(streams.call_count, len(keys))
+                        self.assertEqual(acquisition.call_count, 1)
+                        self.assertEqual(
+                            json.loads(h5.attrs["hdf_strict_stream_errors_json"]), errors
+                        )
+                # Detect the former repeated variable-length metadata writes
+                # without depending on machine-specific timing thresholds.
+                self.assertLess(path.stat().st_size, 2_000_000)
+
     def test_required_stream_never_seen_marks_acquisition_failed(self) -> None:
         writer = self._make_writer()
         with tempfile.TemporaryDirectory() as td:
