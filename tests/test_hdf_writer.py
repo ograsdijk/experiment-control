@@ -585,6 +585,628 @@ class HdfWriterStrictStreamTests(unittest.TestCase):
                 self.assertEqual(int(group.attrs["context_id"]), 7)
                 self.assertEqual(int(group.attrs["rows_written_total"]), 0)
 
+    def test_acquisition_persists_contexts_and_written_counts_before_finalize(self) -> None:
+        writer = self._make_writer()
+        self.addCleanup(writer._ctx.destroy, linger=0)  # noqa: SLF001
+        key = ("pxie", "waveforms")
+        frames = np.arange(16, dtype=np.int16).reshape(2, 2, 4)
+        with tempfile.TemporaryDirectory() as td:
+            with h5py.File(Path(td) / "live.h5", "w") as h5:
+                self._configure(writer, h5)
+                for context_id in (7, 8):
+                    reply = writer._rpc_hdf_streams_expect(  # noqa: SLF001
+                        {
+                            "params": {
+                                "streams": ["pxie.waveforms"],
+                                "context_id": context_id,
+                                "strict": True,
+                            }
+                        }
+                    )
+                    self.assertTrue(reply["ok"], reply)
+                group = h5["streams/pxie/waveforms"]
+                self.assertNotIn("expected_context_ids_json", group.attrs)
+                np.testing.assert_array_equal(group["expected_context_ids"][...], [7, 8])
+                self.assertEqual(int(group.attrs["rows_written_total"]), 0)
+                with (
+                    writer._h5_lock,
+                    patch.object(  # noqa: SLF001
+                        writer, "_finalize_strict_streams_locked"
+                    ) as finalize,
+                ):
+                    writer._write_stream_buffers_batch(  # noqa: SLF001
+                        {
+                            key: {
+                                "data": [frame.tobytes() for frame in frames],
+                                "seq": [1, 2],
+                                "t0_mono_ns": [1, 2],
+                                "t0_wall_ns": [1, 2],
+                                "context_id": [7, 8],
+                            }
+                        },
+                        stream_meta={key: {"dtype": "int16", "shape": (2, 4), "session": 1}},
+                    )
+                    finalize.assert_not_called()
+                self.assertEqual(int(group.attrs["rows_written_total"]), 2)
+                np.testing.assert_array_equal(group["expected_context_ids"][...], [7, 8])
+                np.testing.assert_array_equal(group["session_001/data"][...], frames)
+                self.assertEqual(
+                    writer._stream_context_counters[(7, *key)]["rows_written_total"], 1
+                )  # noqa: SLF001
+                self.assertEqual(
+                    writer._stream_context_counters[(8, *key)]["rows_written_total"], 1
+                )  # noqa: SLF001
+                writer._stream_counters[key]["chunk_ready_seen_total"] = 2  # noqa: SLF001
+                with writer._h5_lock:  # noqa: SLF001
+                    writer._finalize_strict_streams_locked()  # noqa: SLF001
+                self.assertEqual(
+                    json.loads(group.attrs["expected_context_ids_json"]), [7, 8]
+                )
+
+    def test_many_contexts_finalize_once_per_stream_without_changing_results(self) -> None:
+        contexts = 1200
+        keys = [("pxie", "waveforms"), ("fs740", "timestamps")]
+        for has_gap in (False, True):
+            with self.subTest(has_gap=has_gap), tempfile.TemporaryDirectory() as td:
+                writer = self._make_writer()
+                self.addCleanup(writer._ctx.destroy, linger=0)  # noqa: SLF001
+                path = Path(td) / "many.h5"
+                with h5py.File(path, "w") as h5:
+                    self._configure(writer, h5)
+                    for key in keys:
+                        writer._stream_counters[key] = {  # noqa: SLF001
+                            "chunk_ready_seen_total": contexts,
+                            "rows_written_total": contexts,
+                            "seq_gap_total": int(has_gap),
+                        }
+                        for context_id in range(contexts):
+                            context_key = (context_id, *key)
+                            writer._stream_expectations_by_context[context_key] = {  # noqa: SLF001
+                                "strict": True,
+                                "expected_count": 1,
+                            }
+                            writer._stream_context_counters[context_key] = {  # noqa: SLF001
+                                "rows_written_total": 1,
+                            }
+                        # Non-strict contexts must remain in the context ID
+                        # metadata, but must not introduce validation errors.
+                        writer._stream_expectations_by_context[(contexts, *key)] = {  # noqa: SLF001
+                            "strict": False,
+                            "expected_count": 100,
+                        }
+                    with (
+                        writer._h5_lock,
+                        patch.object(  # noqa: SLF001
+                            writer,
+                            "_persist_stream_attrs",
+                            wraps=writer._persist_stream_attrs,  # noqa: SLF001
+                        ) as streams,
+                        patch.object(
+                            writer,
+                            "_persist_acquisition_attrs",
+                            wraps=writer._persist_acquisition_attrs,  # noqa: SLF001
+                        ) as acquisition,
+                        patch.object(writer, "publish_telemetry"),
+                    ):
+                        writer._finalize_strict_streams_locked()  # noqa: SLF001
+                        self.assertEqual(streams.call_count, len(keys))
+                        self.assertEqual(acquisition.call_count, 1)
+                        errors = json.loads(h5.attrs["hdf_strict_stream_errors_json"])
+                        self.assertEqual(len(errors), contexts * len(keys) if has_gap else 0)
+                        self.assertEqual(bool(h5.attrs["acquisition_ok"]), not has_gap)
+                        self.assertEqual(
+                            json.loads(
+                                writer._measurement_group.attrs["hdf_strict_stream_errors_json"]
+                            ),  # noqa: SLF001
+                            errors,
+                        )
+                        if has_gap:
+                            self.assertEqual(
+                                errors[0],
+                                {
+                                    "device_id": "pxie",
+                                    "stream": "waveforms",
+                                    "reason": "required stream has sequence gaps",
+                                    "context_id": 0,
+                                    "expected_count": 1,
+                                    "rows_written": 1,
+                                },
+                            )
+                            self.assertEqual(errors[-1]["context_id"], contexts - 1)
+                        for device, stream in keys:
+                            group = h5[f"streams/{device}/{stream}"]
+                            self.assertEqual(int(group.attrs["rows_written_total"]), contexts)
+                            self.assertEqual(
+                                json.loads(group.attrs["expected_context_ids_json"]),
+                                list(range(contexts + 1)),
+                            )
+                        # Retry/finalization at another boundary must retain
+                        # exactly the same errors, not append duplicates.
+                        streams.reset_mock()
+                        acquisition.reset_mock()
+                        writer._finalize_strict_streams_locked()  # noqa: SLF001
+                        self.assertEqual(streams.call_count, len(keys))
+                        self.assertEqual(acquisition.call_count, 1)
+                        self.assertEqual(
+                            json.loads(h5.attrs["hdf_strict_stream_errors_json"]), errors
+                        )
+                # Detect the former repeated variable-length metadata writes
+                # without depending on machine-specific timing thresholds.
+                self.assertLess(path.stat().st_size, 2_000_000)
+
+    def test_stream_expect_context_ids_are_live_numeric_and_scale_linearly(self) -> None:
+        contexts = 3168
+        writer = self._make_writer()
+        self.addCleanup(writer._ctx.destroy, linger=0)  # noqa: SLF001
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "many_expectations.h5"
+            with h5py.File(path, "w") as h5:
+                self._configure(writer, h5)
+                for context_id in range(contexts):
+                    reply = writer._rpc_hdf_streams_expect(  # noqa: SLF001
+                        {
+                            "params": {
+                                "streams": ["pxie.waveforms", "fs740.timestamps"],
+                                "context_id": context_id,
+                                "strict": False,
+                            }
+                        }
+                    )
+                    self.assertTrue(reply["ok"], reply)
+                    if context_id % 100 == 99 or context_id == contexts - 1:
+                        batch_start = (context_id // 100) * 100
+                        batch_ids = list(range(batch_start, context_id + 1))
+                        pxie_key = ("pxie", "waveforms")
+                        fs740_key = ("fs740", "timestamps")
+                        buffers = {
+                            pxie_key: {
+                                "data": [
+                                    np.asarray([value], dtype=np.int16).tobytes()
+                                    for value in batch_ids
+                                ],
+                                "seq": [value + 1 for value in batch_ids],
+                                "t0_mono_ns": [value + 1 for value in batch_ids],
+                                "t0_wall_ns": [value + 1 for value in batch_ids],
+                                "context_id": batch_ids,
+                            },
+                            fs740_key: {
+                                "data": [
+                                    np.asarray([value], dtype=np.int64).tobytes()
+                                    for value in batch_ids
+                                ],
+                                "seq": [value + 1 for value in batch_ids],
+                                "t0_mono_ns": [value + 1 for value in batch_ids],
+                                "t0_wall_ns": [value + 1 for value in batch_ids],
+                                "context_id": batch_ids,
+                            },
+                        }
+                        with writer._h5_lock:  # noqa: SLF001
+                            writer._write_stream_buffers_batch(  # noqa: SLF001
+                                buffers,
+                                stream_meta={
+                                    pxie_key: {"dtype": "int16", "shape": (1,), "session": 1},
+                                    fs740_key: {"dtype": "int64", "shape": (1,), "session": 1},
+                                },
+                            )
+                writer._rpc_hdf_streams_expect(  # noqa: SLF001
+                    {
+                        "params": {
+                            "streams": ["pxie.waveforms"],
+                            "context_id": -1,
+                            "strict": False,
+                        }
+                    }
+                )
+                for stream_path in (
+                    "streams/pxie/waveforms",
+                    "streams/fs740/timestamps",
+                ):
+                    group = h5[stream_path]
+                    self.assertNotIn("expected_context_ids_json", group.attrs)
+                    expected_ids = np.arange(contexts)
+                    if stream_path == "streams/pxie/waveforms":
+                        expected_ids = np.append(expected_ids, -1)
+                    np.testing.assert_array_equal(
+                        group["expected_context_ids"][...], expected_ids
+                    )
+                # Repeated declarations update the expectation but do not add
+                # another copy of the same context ID.
+                reply = writer._rpc_hdf_streams_expect(  # noqa: SLF001
+                    {
+                        "params": {
+                            "streams": ["pxie.waveforms"],
+                            "context_id": 4,
+                            "strict": True,
+                            "expected_count": 1,
+                        }
+                    }
+                )
+                self.assertTrue(reply["ok"], reply)
+                np.testing.assert_array_equal(
+                    h5["streams/pxie/waveforms/expected_context_ids"][...],
+                    np.append(np.arange(contexts), -1),
+                )
+                writer._stream_counters[("pxie", "waveforms")][
+                    "chunk_ready_seen_total"
+                ] = 1  # noqa: SLF001
+                writer._stream_context_counters[(4, "pxie", "waveforms")][
+                    "rows_written_total"
+                ] = 1  # noqa: SLF001
+                with writer._h5_lock:  # noqa: SLF001
+                    writer._finalize_strict_streams_locked()  # noqa: SLF001
+                    writer._finalize_strict_streams_locked()  # noqa: SLF001
+                for stream_path in (
+                    "streams/pxie/waveforms",
+                    "streams/fs740/timestamps",
+                ):
+                    group = h5[stream_path]
+                    expected_json_ids = list(range(contexts))
+                    if stream_path == "streams/pxie/waveforms":
+                        expected_json_ids.insert(0, -1)
+                    self.assertEqual(
+                        json.loads(group.attrs["expected_context_ids_json"]),
+                        expected_json_ids,
+                    )
+            self.assertLess(path.stat().st_size, 2_000_000)
+
+    def test_expected_context_id_append_retry_reuses_resized_slot(self) -> None:
+        writer = self._make_writer()
+        self.addCleanup(writer._ctx.destroy, linger=0)  # noqa: SLF001
+        with tempfile.TemporaryDirectory() as td:
+            with h5py.File(Path(td) / "retry.h5", "w") as h5:
+                self._configure(writer, h5)
+                key = ("pxie", "waveforms")
+
+                class ResizeThenFail:
+                    def __init__(self, dataset: h5py.Dataset) -> None:
+                        self.dataset = dataset
+
+                    @property
+                    def shape(self) -> tuple[int, ...]:
+                        return self.dataset.shape
+
+                    def resize(self, shape: tuple[int, ...]) -> None:
+                        self.dataset.resize(shape)
+
+                    def __setitem__(self, index: int, value: int) -> None:
+                        raise OSError("injected failure after resize")
+
+                group = h5.require_group("streams/pxie/waveforms")
+                dataset = group.create_dataset(
+                    "expected_context_ids", shape=(0,), maxshape=(None,),
+                    dtype=np.int64, chunks=(256,)
+                )
+                writer._expected_context_id_datasets[key] = ResizeThenFail(dataset)  # noqa: SLF001
+                writer._expected_context_ids_seen[key] = set()  # noqa: SLF001
+                writer._expected_context_ids_committed[key] = 0  # noqa: SLF001
+                with self.assertRaisesRegex(OSError, "after resize"):
+                    writer._append_expected_context_id(key, 7)  # noqa: SLF001
+                writer._expected_context_id_datasets[key] = dataset  # noqa: SLF001
+                writer._append_expected_context_id(key, 7)  # noqa: SLF001
+                np.testing.assert_array_equal(dataset[...], [7])
+                self.assertEqual(writer._expected_context_ids_committed[key], 1)  # noqa: SLF001
+
+    def test_resize_failure_is_rolled_back_before_same_id_retry(self) -> None:
+        writer = self._make_writer()
+        self.addCleanup(writer._ctx.destroy, linger=0)  # noqa: SLF001
+        with tempfile.TemporaryDirectory() as td:
+            with h5py.File(Path(td) / "resize_retry.h5", "w") as h5:
+                self._configure(writer, h5)
+                key = ("pxie", "waveforms")
+                dataset = h5.require_group("streams/pxie/waveforms").create_dataset(
+                    "expected_context_ids",
+                    shape=(0,),
+                    maxshape=(None,),
+                    dtype=np.int64,
+                    chunks=(256,),
+                )
+
+                class ResizeThenRaise:
+                    def __init__(self, target: h5py.Dataset) -> None:
+                        self.target = target
+                        self.fail_growth = True
+
+                    @property
+                    def shape(self) -> tuple[int, ...]:
+                        return self.target.shape
+
+                    def resize(self, shape: tuple[int, ...]) -> None:
+                        self.target.resize(shape)
+                        if shape[0] and self.fail_growth:
+                            self.fail_growth = False
+                            raise OSError("injected resize failure")
+
+                    def __setitem__(self, index: int, value: int) -> None:
+                        self.target[index] = value
+
+                faulty = ResizeThenRaise(dataset)
+                writer._expected_context_id_datasets[key] = faulty  # noqa: SLF001
+                writer._expected_context_ids_seen[key] = set()  # noqa: SLF001
+                writer._expected_context_ids_committed[key] = 0  # noqa: SLF001
+                with self.assertRaisesRegex(OSError, "resize failure"):
+                    writer._append_expected_context_id(key, 41)  # noqa: SLF001
+                self.assertEqual(dataset.shape, (0,))
+                self.assertIn((41, "pxie", "waveforms"), writer._expected_context_id_append_failures)  # noqa: SLF001
+                writer._append_expected_context_id(key, 41)  # noqa: SLF001
+                np.testing.assert_array_equal(dataset[...], [41])
+                self.assertNotIn((41, "pxie", "waveforms"), writer._expected_context_id_append_failures)  # noqa: SLF001
+
+    def test_rollback_failure_is_reported_and_finalization_retries_cleanup(self) -> None:
+        writer = self._make_writer()
+        self.addCleanup(writer._ctx.destroy, linger=0)  # noqa: SLF001
+        with tempfile.TemporaryDirectory() as td:
+            h5_path = Path(td) / "rollback_failure.h5"
+            with h5py.File(h5_path, "w") as h5:
+                self._configure(writer, h5)
+                key = ("pxie", "waveforms")
+                dataset = h5.require_group("streams/pxie/waveforms").create_dataset(
+                    "expected_context_ids",
+                    shape=(0,),
+                    maxshape=(None,),
+                    dtype=np.int64,
+                    chunks=(256,),
+                )
+
+                class FailGrowthAndFirstRollback:
+                    def __init__(self, target: h5py.Dataset) -> None:
+                        self.target = target
+                        self.rollback_failed = False
+
+                    @property
+                    def shape(self) -> tuple[int, ...]:
+                        return self.target.shape
+
+                    def resize(self, shape: tuple[int, ...]) -> None:
+                        if not shape[0] and self.target.shape[0] and not self.rollback_failed:
+                            self.rollback_failed = True
+                            raise OSError("injected rollback failure")
+                        self.target.resize(shape)
+                        if shape[0]:
+                            raise OSError("injected write extent failure")
+
+                    def __setitem__(self, index: int, value: int) -> None:
+                        self.target[index] = value
+
+                faulty = FailGrowthAndFirstRollback(dataset)
+                writer._expected_context_id_datasets[key] = faulty  # noqa: SLF001
+                writer._expected_context_ids_seen[key] = set()  # noqa: SLF001
+                writer._expected_context_ids_committed[key] = 0  # noqa: SLF001
+                with self.assertRaisesRegex(OSError, "extent failure"):
+                    writer._append_expected_context_id(key, 42)  # noqa: SLF001
+                self.assertEqual(dataset.shape, (1,))
+                self.assertIn("rollback failed", writer._expected_context_id_append_failures[(42, "pxie", "waveforms")])  # noqa: SLF001
+                with writer._h5_lock:  # noqa: SLF001
+                    with self.assertRaisesRegex(RuntimeError, "unresolved expected context ID"):
+                        writer._finalize_strict_streams_locked()  # noqa: SLF001
+                self.assertEqual(dataset.shape, (0,))
+                self.assertFalse(bool(h5.attrs["acquisition_ok"]))
+                errors = json.loads(_as_text(h5.attrs["hdf_strict_stream_errors_json"]))
+                self.assertIn("rollback failed", errors[0]["reason"])
+
+    def test_failed_expected_context_append_invalidates_finalized_file(self) -> None:
+        writer = self._make_writer()
+        self.addCleanup(writer._ctx.destroy, linger=0)  # noqa: SLF001
+        with tempfile.TemporaryDirectory() as td:
+            h5_path = Path(td) / "failed_append.h5"
+            with h5py.File(h5_path, "w") as h5:
+                self._configure(writer, h5)
+                key = ("pxie", "waveforms")
+                group = h5.require_group("streams/pxie/waveforms")
+                dataset = group.create_dataset(
+                    "expected_context_ids",
+                    shape=(0,),
+                    maxshape=(None,),
+                    dtype=np.int64,
+                    chunks=(256,),
+                )
+
+                class WriteThenFail:
+                    def __init__(self, target: h5py.Dataset) -> None:
+                        self.target = target
+                        self.fail = True
+
+                    @property
+                    def shape(self) -> tuple[int, ...]:
+                        return self.target.shape
+
+                    def resize(self, shape: tuple[int, ...]) -> None:
+                        self.target.resize(shape)
+
+                    def __setitem__(self, index: int, value: int) -> None:
+                        self.target[index] = value
+                        if self.fail:
+                            self.fail = False
+                            raise OSError("injected write-then-raise")
+
+                faulty = WriteThenFail(dataset)
+                writer._expected_context_id_datasets[key] = faulty  # noqa: SLF001
+                writer._expected_context_ids_seen[key] = set()  # noqa: SLF001
+                writer._expected_context_ids_committed[key] = 0  # noqa: SLF001
+                with self.assertRaisesRegex(OSError, "write-then-raise"):
+                    writer._rpc_hdf_streams_expect(  # noqa: SLF001
+                        {
+                            "params": {
+                                "streams": ["pxie.waveforms"],
+                                "context_id": 12,
+                                "strict": False,
+                            }
+                        }
+                    )
+
+                # The write did happen before the injected exception, but the
+                # helper truncates it because assignment success is ambiguous.
+                self.assertEqual(dataset.shape, (0,))
+                self.assertNotIn((12, "pxie", "waveforms"), writer._stream_expectations_by_context)  # noqa: SLF001
+                with writer._h5_lock:  # noqa: SLF001
+                    for _ in range(2):
+                        with self.assertRaisesRegex(RuntimeError, "unresolved expected context ID"):
+                            writer._finalize_strict_streams_locked()  # noqa: SLF001
+
+                self.assertFalse(bool(h5.attrs["acquisition_ok"]))
+                self.assertFalse(bool(h5["measurement"].attrs["acquisition_ok"]))
+                errors = json.loads(_as_text(h5.attrs["hdf_strict_stream_errors_json"]))
+                self.assertEqual(len(errors), 1)
+                self.assertEqual(errors[0]["context_id"], 12)
+                self.assertEqual(
+                    errors[0]["reason"],
+                    "failed to persist expected context ID: injected write-then-raise",
+                )
+                self.assertEqual(
+                    json.loads(group.attrs["expected_context_ids_json"]), []
+                )
+                np.testing.assert_array_equal(dataset[...], [])
+                # A later successful retry can repair the audit dataset, but
+                # it does not erase the already finalized acquisition error.
+                writer._rpc_hdf_streams_expect(  # noqa: SLF001
+                    {
+                        "params": {
+                            "streams": ["pxie.waveforms"],
+                            "context_id": 12,
+                            "strict": False,
+                        }
+                    }
+                )
+                with writer._h5_lock:  # noqa: SLF001
+                    writer._finalize_strict_streams_locked()  # noqa: SLF001
+                self.assertFalse(bool(h5.attrs["acquisition_ok"]))
+                np.testing.assert_array_equal(dataset[...], [12])
+            with h5py.File(h5_path, "r") as persisted:
+                self.assertFalse(bool(persisted.attrs["acquisition_ok"]))
+                self.assertFalse(bool(persisted["measurement"].attrs["acquisition_ok"]))
+                np.testing.assert_array_equal(
+                    persisted["streams/pxie/waveforms/expected_context_ids"][...], [12]
+                )
+                self.assertEqual(
+                    json.loads(
+                        persisted["streams/pxie/waveforms"].attrs[
+                            "expected_context_ids_json"
+                        ]
+                    ),
+                    [12],
+                )
+
+    def test_same_id_retry_clears_only_its_pending_append_failure(self) -> None:
+        writer = self._make_writer()
+        self.addCleanup(writer._ctx.destroy, linger=0)  # noqa: SLF001
+        with tempfile.TemporaryDirectory() as td:
+            with h5py.File(Path(td) / "retry_pending.h5", "w") as h5:
+                self._configure(writer, h5)
+                key = ("pxie", "waveforms")
+                dataset = h5.require_group("streams/pxie/waveforms").create_dataset(
+                    "expected_context_ids",
+                    shape=(0,),
+                    maxshape=(None,),
+                    dtype=np.int64,
+                    chunks=(256,),
+                )
+
+                class FailOnce:
+                    def __init__(self, target: h5py.Dataset) -> None:
+                        self.target = target
+                        self.failures = 2
+
+                    @property
+                    def shape(self) -> tuple[int, ...]:
+                        return self.target.shape
+
+                    def resize(self, shape: tuple[int, ...]) -> None:
+                        self.target.resize(shape)
+
+                    def __setitem__(self, index: int, value: int) -> None:
+                        if self.failures:
+                            self.failures -= 1
+                            raise OSError("injected one-time assignment failure")
+                        self.target[index] = value
+
+                faulty = FailOnce(dataset)
+                writer._expected_context_id_datasets[key] = faulty  # noqa: SLF001
+                writer._expected_context_ids_seen[key] = set()  # noqa: SLF001
+                writer._expected_context_ids_committed[key] = 0  # noqa: SLF001
+                request = {
+                    "params": {
+                        "streams": ["pxie.waveforms"],
+                        "context_id": 21,
+                        "strict": False,
+                    }
+                }
+                with self.assertRaisesRegex(OSError, "one-time"):
+                    writer._rpc_hdf_streams_expect(request)  # noqa: SLF001
+                # Retrying a different ID leaves the first unresolved.
+                with self.assertRaisesRegex(OSError, "one-time"):
+                    writer._rpc_hdf_streams_expect(  # noqa: SLF001
+                        {"params": {"streams": ["pxie.waveforms"], "context_id": 22}}
+                    )
+                self.assertIn((21, "pxie", "waveforms"), writer._expected_context_id_append_failures)  # noqa: SLF001
+                self.assertIn((22, "pxie", "waveforms"), writer._expected_context_id_append_failures)  # noqa: SLF001
+                # Once the injected fault has fired, retrying ID 21 commits it
+                # and clears only that ID's pending failure.
+                writer._rpc_hdf_streams_expect(request)  # noqa: SLF001
+                self.assertNotIn((21, "pxie", "waveforms"), writer._expected_context_id_append_failures)  # noqa: SLF001
+                self.assertIn((22, "pxie", "waveforms"), writer._expected_context_id_append_failures)  # noqa: SLF001
+                np.testing.assert_array_equal(dataset[...], [21])
+
+    def test_multiple_stream_expectation_failure_keeps_successful_prefix(self) -> None:
+        writer = self._make_writer()
+        self.addCleanup(writer._ctx.destroy, linger=0)  # noqa: SLF001
+        with tempfile.TemporaryDirectory() as td:
+            with h5py.File(Path(td) / "partial_rpc.h5", "w") as h5:
+                self._configure(writer, h5)
+                failed_key = ("fs740", "timestamps")
+                failed_group = h5.require_group("streams/fs740/timestamps")
+                failed_dataset = failed_group.create_dataset(
+                    "expected_context_ids",
+                    shape=(0,),
+                    maxshape=(None,),
+                    dtype=np.int64,
+                    chunks=(256,),
+                )
+
+                class FailAssignment:
+                    @property
+                    def shape(self) -> tuple[int, ...]:
+                        return failed_dataset.shape
+
+                    def resize(self, shape: tuple[int, ...]) -> None:
+                        failed_dataset.resize(shape)
+
+                    def __setitem__(self, index: int, value: int) -> None:
+                        raise OSError("second stream failed")
+
+                writer._expected_context_id_datasets[failed_key] = FailAssignment()  # noqa: SLF001
+                writer._expected_context_ids_seen[failed_key] = set()  # noqa: SLF001
+                writer._expected_context_ids_committed[failed_key] = 0  # noqa: SLF001
+                with self.assertRaisesRegex(OSError, "second stream failed"):
+                    writer._rpc_hdf_streams_expect(  # noqa: SLF001
+                        {
+                            "params": {
+                                "streams": ["pxie.waveforms", "fs740.timestamps"],
+                                "context_id": 31,
+                                "strict": False,
+                            }
+                        }
+                    )
+                self.assertIn(
+                    (31, "pxie", "waveforms"),
+                    writer._stream_expectations_by_context,  # noqa: SLF001
+                )
+                self.assertNotIn(
+                    (31, "fs740", "timestamps"),
+                    writer._stream_expectations_by_context,  # noqa: SLF001
+                )
+                with writer._h5_lock:  # noqa: SLF001
+                    with self.assertRaisesRegex(RuntimeError, "unresolved expected context ID"):
+                        writer._finalize_strict_streams_locked()  # noqa: SLF001
+                np.testing.assert_array_equal(
+                    h5["streams/pxie/waveforms/expected_context_ids"][...], [31]
+                )
+                self.assertEqual(
+                    json.loads(h5["streams/pxie/waveforms"].attrs["expected_context_ids_json"]),
+                    [31],
+                )
+                self.assertEqual(
+                    json.loads(failed_group.attrs["expected_context_ids_json"]), []
+                )
+
     def test_required_stream_never_seen_marks_acquisition_failed(self) -> None:
         writer = self._make_writer()
         with tempfile.TemporaryDirectory() as td:
