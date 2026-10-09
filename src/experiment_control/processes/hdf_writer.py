@@ -90,6 +90,16 @@ _RPCS_ALLOWED_DURING_FILE_OP = frozenset(
 )
 
 
+def _set_string_attr_if_changed(attrs: h5py.AttributeManager, name: str, value: str) -> None:
+    current = attrs.get(name)
+    if isinstance(current, bytes):
+        current = current.decode("utf-8", errors="replace")
+    elif current is not None:
+        current = str(current)
+    if current != value:
+        attrs[name] = value
+
+
 def _validated_frame_metadata_dtype(raw: Any) -> np.dtype[Any]:
     dtype = np.dtype(raw)
     if dtype.fields is None or not dtype.names or dtype.hasobject:
@@ -598,6 +608,12 @@ class HdfWriter(ManagedProcessBase):
         self._stream_expectations: dict[tuple[str, str], dict[str, Any]] = {}
         self._stream_expectations_by_context: dict[
             tuple[int, str, str], dict[str, Any]
+        ] = {}
+        self._expected_context_id_datasets: dict[tuple[str, str], h5py.Dataset] = {}
+        self._expected_context_ids_seen: dict[tuple[str, str], set[int]] = {}
+        self._expected_context_ids_committed: dict[tuple[str, str], int] = {}
+        self._expected_context_id_append_failures: dict[
+            tuple[int, str, str], str
         ] = {}
         self._stream_counters: dict[tuple[str, str], dict[str, Any]] = {}
         self._stream_context_counters: dict[tuple[int, str, str], dict[str, Any]] = {}
@@ -2199,6 +2215,10 @@ class HdfWriter(ManagedProcessBase):
             "stream_last_written_seq": self._stream_last_written_seq,
             "stream_expectations": self._stream_expectations,
             "stream_expectations_by_context": self._stream_expectations_by_context,
+            "expected_context_id_datasets": self._expected_context_id_datasets,
+            "expected_context_ids_seen": self._expected_context_ids_seen,
+            "expected_context_ids_committed": self._expected_context_ids_committed,
+            "expected_context_id_append_failures": self._expected_context_id_append_failures,
             "stream_counters": self._stream_counters,
             "stream_context_counters": self._stream_context_counters,
             "strict_stream_errors": self._strict_stream_errors,
@@ -2263,6 +2283,16 @@ class HdfWriter(ManagedProcessBase):
         self._stream_expectations_by_context = state.get(
             "stream_expectations_by_context", {}
         )
+        self._expected_context_id_datasets = state.get(
+            "expected_context_id_datasets", {}
+        )
+        self._expected_context_ids_seen = state.get("expected_context_ids_seen", {})
+        self._expected_context_ids_committed = state.get(
+            "expected_context_ids_committed", {}
+        )
+        self._expected_context_id_append_failures = state.get(
+            "expected_context_id_append_failures", {}
+        )
         self._stream_counters = state.get("stream_counters", {})
         self._stream_context_counters = state.get("stream_context_counters", {})
         self._strict_stream_errors = state.get("strict_stream_errors", [])
@@ -2326,6 +2356,10 @@ class HdfWriter(ManagedProcessBase):
         self._stream_last_written_seq = {}
         self._stream_expectations = {}
         self._stream_expectations_by_context = {}
+        self._expected_context_id_datasets = {}
+        self._expected_context_ids_seen = {}
+        self._expected_context_ids_committed = {}
+        self._expected_context_id_append_failures = {}
         self._stream_counters = {}
         self._stream_context_counters = {}
         self._strict_stream_errors = []
@@ -2385,6 +2419,118 @@ class HdfWriter(ManagedProcessBase):
         device_id, stream = key
         return self._streams_group.require_group(device_id).require_group(stream)
 
+    def _append_expected_context_id(
+        self, key: tuple[str, str], context_id: int
+    ) -> None:
+        failure_key = (int(context_id), key[0], key[1])
+        dataset: h5py.Dataset | Any | None = self._expected_context_id_datasets.get(key)
+        committed: int | None = self._expected_context_ids_committed.get(key)
+        try:
+            group = self._stream_group_for_key(key)
+            if group is None:
+                raise RuntimeError("stream group is not initialized")
+            if dataset is None:
+                existing = group.get("expected_context_ids")
+                if existing is None:
+                    dataset = group.create_dataset(
+                        "expected_context_ids",
+                        shape=(0,),
+                        maxshape=(None,),
+                        dtype=np.int64,
+                        chunks=(256,),
+                    )
+                    seen: set[int] = set()
+                    committed = 0
+                elif isinstance(existing, h5py.Dataset):
+                    dataset = existing
+                    seen = {int(value) for value in dataset[...]}
+                    committed = int(dataset.shape[0])
+                else:
+                    raise RuntimeError("expected_context_ids is not a dataset")
+                self._expected_context_id_datasets[key] = dataset
+                self._expected_context_ids_seen[key] = seen
+                self._expected_context_ids_committed[key] = committed
+            seen = self._expected_context_ids_seen.setdefault(key, set())
+            if context_id in seen:
+                self._expected_context_id_append_failures.pop(failure_key, None)
+                return
+            if committed is None:
+                committed = self._expected_context_ids_committed.setdefault(key, 0)
+            if dataset.shape[0] < committed:
+                raise RuntimeError("expected_context_ids is shorter than committed state")
+            if dataset.shape[0] < committed + 1:
+                dataset.resize((committed + 1,))
+            elif dataset.shape[0] > committed + 1:
+                raise RuntimeError("expected_context_ids has an uncommitted extra row")
+            # The committed extent and dedup set move only after assignment
+            # returns. A write-then-raise is rolled back conservatively below.
+            dataset[committed] = np.int64(context_id)
+            self._expected_context_ids_committed[key] = committed + 1
+            seen.add(context_id)
+            self._expected_context_id_append_failures.pop(failure_key, None)
+        except Exception as exc:
+            rollback_error: Exception | None = None
+            if dataset is not None and committed is not None:
+                try:
+                    extent = int(dataset.shape[0])
+                    if extent > committed:
+                        dataset.resize((committed,))
+                    elif extent < committed:
+                        raise RuntimeError(
+                            "expected_context_ids is shorter than committed state"
+                        )
+                except Exception as rollback_exc:
+                    rollback_error = rollback_exc
+            message = str(exc) or type(exc).__name__
+            if rollback_error is not None:
+                message += f"; rollback failed: {rollback_error}"
+            self._expected_context_id_append_failures[failure_key] = message
+            raise
+
+    def _finalize_expected_context_id_append_failures(
+        self, *, error_keys: set[str]
+    ) -> list[str]:
+        """Clean failed append tails and record unresolved expectation failures."""
+        for key, committed in self._expected_context_ids_committed.items():
+            dataset = self._expected_context_id_datasets.get(key)
+            if dataset is None:
+                continue
+            try:
+                extent = int(dataset.shape[0])
+                if extent > committed:
+                    dataset.resize((committed,))
+                elif extent < committed:
+                    raise RuntimeError(
+                        "expected_context_ids is shorter than committed state"
+                    )
+            except Exception as exc:
+                # Attach cleanup trouble to each pending failure for this
+                # stream below; it must not be mistaken for a valid snapshot.
+                for failure_key, message in list(
+                    self._expected_context_id_append_failures.items()
+                ):
+                    context_id, device_id, stream = failure_key
+                    if (device_id, stream) == key:
+                        cleanup_note = f"finalization cleanup failed: {exc}"
+                        if cleanup_note not in message:
+                            self._expected_context_id_append_failures[failure_key] = (
+                                f"{message}; {cleanup_note}"
+                            )
+
+        unresolved: list[str] = []
+        for (context_id, device_id, stream), message in sorted(
+            self._expected_context_id_append_failures.items()
+        ):
+            reason = f"failed to persist expected context ID: {message}"
+            self._record_strict_stream_error(
+                (device_id, stream),
+                reason,
+                error_keys=error_keys,
+                context_id=context_id,
+            )
+            unresolved.append(f"{device_id}.{stream} context {context_id}: {reason}")
+        return unresolved
+
     def _persist_stream_attrs(
         self, key: tuple[str, str], *, context_ids: list[int] | None = None
     ) -> None:
@@ -2397,19 +2543,20 @@ class HdfWriter(ManagedProcessBase):
             group.attrs[attr] = int(counters.get(attr, 0) or 0)
         group.attrs["first_seq"] = int(counters.get("first_seq", -1))
         group.attrs["last_seq"] = int(counters.get("last_seq", -1))
-        group.attrs["last_error"] = str(counters.get("last_error", "") or "")
+        _set_string_attr_if_changed(
+            group.attrs, "last_error", str(counters.get("last_error", "") or "")
+        )
         if expectation:
             group.attrs["expected_count"] = int(expectation.get("expected_count", -1))
             group.attrs["strict_required"] = bool(expectation.get("strict", False))
             group.attrs["context_id"] = int(expectation.get("context_id", -1))
-        if context_ids is None:
-            context_ids = sorted(
-                context_id
-                for context_id, device_id, stream in self._stream_expectations_by_context
-                if (device_id, stream) == key
+        # This JSON snapshot is written only during finalization. During
+        # acquisition, expected IDs are appended to a numeric dataset so HDF5
+        # does not retain every historical version of an ever-growing string.
+        if context_ids is not None:
+            _set_string_attr_if_changed(
+                group.attrs, "expected_context_ids_json", json.dumps(context_ids)
             )
-        if context_ids:
-            group.attrs["expected_context_ids_json"] = json.dumps(context_ids)
 
     def _bump_stream_counter(
         self,
@@ -2452,10 +2599,14 @@ class HdfWriter(ManagedProcessBase):
         errors_json = json.dumps(self._strict_stream_errors)
         if self._h5 is not None:
             self._h5.attrs["acquisition_ok"] = bool(self._acquisition_ok)
-            self._h5.attrs["hdf_strict_stream_errors_json"] = errors_json
+            _set_string_attr_if_changed(
+                self._h5.attrs, "hdf_strict_stream_errors_json", errors_json
+            )
         if self._measurement_group is not None:
             self._measurement_group.attrs["acquisition_ok"] = bool(self._acquisition_ok)
-            self._measurement_group.attrs["hdf_strict_stream_errors_json"] = errors_json
+            _set_string_attr_if_changed(
+                self._measurement_group.attrs, "hdf_strict_stream_errors_json", errors_json
+            )
 
     def _record_strict_stream_error(
         self,
@@ -2498,7 +2649,6 @@ class HdfWriter(ManagedProcessBase):
             json.dumps(err, sort_keys=True) for err in self._strict_stream_errors
         }
         context_ids_by_stream: dict[tuple[str, str], list[int]] = {}
-        strict_keys: set[tuple[str, str]] = set()
         for context_key, expectation in list(
             self._stream_expectations_by_context.items()
         ):
@@ -2507,7 +2657,6 @@ class HdfWriter(ManagedProcessBase):
             context_ids_by_stream.setdefault(key, []).append(context_id)
             if not bool(expectation.get("strict", False)):
                 continue
-            strict_keys.add(key)
             counters = self._stream_counter_state(key)
             seen = int(counters.get("chunk_ready_seen_total", 0) or 0)
             if context_id < 0:
@@ -2566,13 +2715,33 @@ class HdfWriter(ManagedProcessBase):
                     expected_count=expected if expected >= 0 else None,
                     rows_written=rows,
                 )
+        unresolved_append_failures = self._finalize_expected_context_id_append_failures(
+            error_keys=error_keys
+        )
+        for _, device_id, stream in self._expected_context_id_append_failures:
+            context_ids_by_stream.setdefault((device_id, stream), [])
         # Save the validation outcome before per-stream metadata. Stop/close
         # can still close the file if a later stream update raises, so the
         # file must not retain its initial acquisition_ok=True in that case.
         self._persist_acquisition_attrs()
-        for key in sorted(strict_keys):
-            self._persist_stream_attrs(
-                key, context_ids=sorted(context_ids_by_stream[key])
+        try:
+            for key in sorted(context_ids_by_stream):
+                self._persist_stream_attrs(
+                    key, context_ids=sorted(context_ids_by_stream[key])
+                )
+        except Exception:
+            # Do not leave a file marked successful if the finalized context
+            # audit snapshot could not be written. Stop will report the error.
+            self._acquisition_ok = False
+            try:
+                self._persist_acquisition_attrs()
+            except Exception:
+                pass
+            raise
+        if unresolved_append_failures:
+            raise RuntimeError(
+                "unresolved expected context ID append failures: "
+                + "; ".join(unresolved_append_failures)
             )
 
     def _configure_active_file(
@@ -4690,6 +4859,9 @@ class HdfWriter(ManagedProcessBase):
                 key = (str(spec["device_id"]), str(spec["stream"]))
                 context_id = int(spec.get("context_id", -1))
                 context_key = (context_id, key[0], key[1])
+                # Persist the unique ID before updating the in-memory
+                # expectation map so an append failure can be retried safely.
+                self._append_expected_context_id(key, context_id)
                 self._stream_expectations[key] = dict(spec)
                 self._stream_expectations_by_context[context_key] = dict(spec)
                 self._stream_counter_state(key)

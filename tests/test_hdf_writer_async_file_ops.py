@@ -357,6 +357,9 @@ class HdfWriterAsyncFileOpTests(unittest.TestCase):
 
     def test_rotate_failure_keeps_old_file_active(self) -> None:
         w = self.writer
+        key = ("pxie", "waveforms")
+        with w._h5_lock:  # noqa: SLF001
+            w._append_expected_context_id(key, 17)  # noqa: SLF001
 
         def _boom(*_a: Any, **_k: Any) -> None:
             raise RuntimeError("configure exploded")
@@ -374,8 +377,66 @@ class HdfWriterAsyncFileOpTests(unittest.TestCase):
         self.assertIn("configure exploded", last["error"]["message"])
         assert w._h5 is not None  # noqa: SLF001
         self.assertEqual(str(w._h5.filename), self.first_file)  # noqa: SLF001
+        with w._h5_lock:  # noqa: SLF001
+            w._append_expected_context_id(key, 18)  # noqa: SLF001
+            np.testing.assert_array_equal(
+                w._expected_context_id_datasets[key][...], [17, 18]  # noqa: SLF001
+            )
         self.assertFalse((self.tmp / "second.h5").exists())
         self.assertEqual(self._rpc("hdf.status")["result"]["file_state"], "writing")
+
+    def test_rotate_with_unresolved_context_append_failure_keeps_old_file_active(self) -> None:
+        w = self.writer
+        key = ("pxie", "waveforms")
+        with w._h5_lock:  # noqa: SLF001
+            assert w._streams_group is not None  # noqa: SLF001
+            group = w._streams_group.require_group("pxie").require_group("waveforms")  # noqa: SLF001
+            dataset = group.create_dataset(
+                "expected_context_ids",
+                shape=(0,),
+                maxshape=(None,),
+                dtype=np.int64,
+                chunks=(256,),
+            )
+
+            class AssignmentFailure:
+                @property
+                def shape(self) -> tuple[int, ...]:
+                    return dataset.shape
+
+                def resize(self, shape: tuple[int, ...]) -> None:
+                    dataset.resize(shape)
+
+                def __setitem__(self, index: int, value: int) -> None:
+                    raise OSError("injected context append failure")
+
+            w._expected_context_id_datasets[key] = AssignmentFailure()  # noqa: SLF001
+            w._expected_context_ids_seen[key] = set()  # noqa: SLF001
+            w._expected_context_ids_committed[key] = 0  # noqa: SLF001
+            with self.assertRaisesRegex(OSError, "context append failure"):
+                w._append_expected_context_id(key, 53)  # noqa: SLF001
+
+        resp = self._rpc("hdf.rotate", {"filename": "second.h5"})
+        self.assertTrue(resp["ok"])
+        self.assertTrue(self.op_entered.wait(timeout=5.0))
+        self.gate.set()
+        self._run_main_loop_until_idle()
+
+        last = w._last_file_op  # noqa: SLF001
+        assert last is not None
+        self.assertFalse(last["ok"])
+        self.assertEqual(last["op"], "rotate")
+        self.assertEqual(last["error"]["code"], "rotate_failed")
+        self.assertIn("unresolved expected context ID", last["error"]["message"])
+        self.assertEqual(str(w._h5.filename), self.first_file)  # noqa: SLF001
+        self.assertIn((53, "pxie", "waveforms"), w._expected_context_id_append_failures)  # noqa: SLF001
+        self.assertFalse((self.tmp / "second.h5").exists())
+        assert w._h5 is not None  # noqa: SLF001
+        self.assertFalse(bool(w._h5.attrs["acquisition_ok"]))  # noqa: SLF001
+        self.assertEqual(
+            json.loads(w._h5["streams/pxie/waveforms"].attrs["expected_context_ids_json"]),  # noqa: SLF001
+            [],
+        )
 
     def test_held_message_overflow_is_counted(self) -> None:
         w = self.writer

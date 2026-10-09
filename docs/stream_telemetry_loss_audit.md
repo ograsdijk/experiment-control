@@ -39,6 +39,7 @@ device method (e.g. fs740.read_timestamp_record)
                                                     ├─ context resolve / _stream_pending_by_seq (TTL 5 s, cap 10 000)   :4629-4758
                                                     └─ _stream_buffers[key] (unbounded lists; hard cap 4×200k rows)
                                                          └─ _enqueue_flush_batch → bg thread → _write_stream_buffers_batch  :5107
+                                                              ├─ /streams/<dev>/<stream>/expected_context_ids (live expectation IDs)
                                                               └─ /streams/<dev>/<stream>/session_NNN/{data,seq,t0_*,context_id}
 ```
 
@@ -161,7 +162,9 @@ with `rows_written_total==0` ⇒ writer-side (cases 4–5).
   `events_read_total`, `rows_written_total`, `seq_gap_total`,
   `startup_seq_gap`, `attach_failures_total`, `drain_failures_total`,
   `payload_size_failures_total`, `first_seq`, `last_seq`, `last_error`,
-  `expected_count`, `strict_required`, `expected_context_ids_json`.
+  `expected_count`, `strict_required`, and the finalized
+  `expected_context_ids_json` snapshot. The live unique expected IDs are in the
+  signed-int64 `expected_context_ids` dataset at the stream-group level.
 - File/measurement attrs: `acquisition_ok`, `hdf_strict_stream_errors_json`
   (sequencer registers strict=True, so an empty required stream **must**
   appear here if finalize ran — stop/rotate/close paths at
@@ -745,7 +748,19 @@ per-stream attrs. The key attrs are:
 - `expected_count`
 - `strict_required`
 - `context_id`
-- `context_ids_json`
+- `expected_context_ids_json` (sorted final snapshot)
+
+The live unique expected IDs are in the stream-group-level `expected_context_ids`
+dataset (`int64`, first-declaration order, including `-1` when context is unknown).
+If an append fails, the writer keeps the ID unresolved and does not treat it as
+persisted. It tries to remove any uncommitted tail both immediately and during
+finalization. An unresolved failure is recorded in the acquisition diagnostics,
+sets `acquisition_ok` false at the root and `/measurement`, and makes stop or
+rotation report failure. A successful retry of that same ID before finalization
+clears its pending failure; a different ID does not. After finalization has
+marked the acquisition invalid, later retries do not restore validity. This
+covers in-process write failures and retries; it does not claim arbitrary
+process-crash recovery.
 
 The counters are bumped at these boundaries:
 
