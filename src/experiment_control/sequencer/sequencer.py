@@ -536,6 +536,9 @@ class SequencerProcess(ManagedProcessBase):
         self._loaded_sequence_source: str | None = None
         self._loaded_sequence_source_kind: str | None = None
         self._loaded_sequence_text: str | None = None
+        # Increments on every successful load into the runtime (any path), so
+        # a client can tell whether its copy of the loaded text is current.
+        self._loaded_revision: int = 0
         # run_id of the most recent successful start of the currently loaded
         # text (None until started). Lets the HDF writer tie a captured
         # loaded_yaml snapshot to the run it belongs to, even if a reload
@@ -610,6 +613,7 @@ class SequencerProcess(ManagedProcessBase):
             line_map=_build_step_line_map(text, spec),
         )
         self._runtime.load(spec, step_source_info=step_source_info)
+        self._loaded_revision += 1
         self._context_columns = _effective_context_columns(spec.context_columns)
         self._loaded_sequence_spec = spec
         self._loaded_sequence_source = source
@@ -3209,6 +3213,7 @@ class SequencerProcess(ManagedProcessBase):
         result["context_columns"] = self._context_columns
         result["loaded_source"] = self._loaded_sequence_source
         result["loaded_source_kind"] = self._loaded_sequence_source_kind
+        result["loaded_revision"] = self._loaded_revision
         result["active_sequence_id"] = self._active_sequence_id
         result["sequence_library_configured"] = bool(self._sequence_library_path)
         result["sequence_library_path"] = self._sequence_library_path
@@ -3252,6 +3257,7 @@ class SequencerProcess(ManagedProcessBase):
                 "source_kind": self._loaded_sequence_source_kind,
                 "active_sequence_id": self._active_sequence_id,
                 "text": self._loaded_sequence_text,
+                "revision": self._loaded_revision,
                 "run_id": self._loaded_sequence_run_id,
                 "reloadable": reload_kind is not None,
                 "reload_kind": reload_kind,

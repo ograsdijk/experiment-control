@@ -202,6 +202,7 @@ def _build_process() -> tuple[SequencerProcess, list[dict[str, object]]]:
     process._loaded_sequence_source_kind = None
     process._loaded_sequence_text = None
     process._loaded_sequence_run_id = None
+    process._loaded_revision = 0
     process._check_start_preconditions = lambda req: None  # type: ignore[method-assign]
     published: list[dict[str, object]] = []
     process._publish_lifecycle_event = (  # type: ignore[method-assign]
@@ -281,6 +282,39 @@ class LoadedYamlRunIdTests(unittest.TestCase):
         _load_text(process, _EXPLICIT_YAML)
         loaded = process._rpc_sequencer_loaded_yaml({"params": {}})["result"]
         self.assertIsNone(loaded["run_id"])
+
+
+class LoadedRevisionTests(unittest.TestCase):
+    def _revisions(self, process: SequencerProcess) -> tuple[int, int]:
+        status = process._rpc_sequencer_status({"params": {}})["result"]
+        loaded = process._rpc_sequencer_loaded_yaml({"params": {}})["result"]
+        return status["loaded_revision"], loaded["revision"]
+
+    def test_starts_at_zero(self) -> None:
+        process, _published = _build_process()
+        self.assertEqual(self._revisions(process), (0, 0))
+
+    def test_increments_on_text_and_library_loads(self) -> None:
+        process, _published = _build_process()
+        process._rpc_sequencer_load({"params": {"text": _EXPLICIT_YAML}})
+        self.assertEqual(self._revisions(process), (1, 1))
+        # Reloading identical text is still a new load.
+        process._rpc_sequencer_load({"params": {"text": _EXPLICIT_YAML}})
+        self.assertEqual(self._revisions(process), (2, 2))
+        process._set_loaded_sequence(
+            spec=load_sequence_yaml(_NO_SCHEMA_YAML),
+            text=_NO_SCHEMA_YAML,
+            source="main.yaml",
+            source_kind="library",
+            active_sequence_id="main",
+        )
+        self.assertEqual(self._revisions(process), (3, 3))
+
+    def test_failed_load_does_not_increment(self) -> None:
+        process, _published = _build_process()
+        process._rpc_sequencer_load({"params": {"text": _EXPLICIT_YAML}})
+        process._rpc_sequencer_load({"params": {"text": "steps: [oops"}})
+        self.assertEqual(self._revisions(process), (1, 1))
 
 
 if __name__ == "__main__":
