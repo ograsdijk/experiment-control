@@ -80,6 +80,8 @@ export type SequencerDiagnostic = {
   line: number | null;
   column: number | null;
   source: string | null;
+  /** The YAML changed since this was computed; its line may be off. */
+  stale?: boolean;
 };
 
 export type SequencerStepOutlineNode = {

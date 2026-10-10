@@ -39,7 +39,11 @@ import {
 } from "../features/sequencer/utils";
 import type { StreamAnalysisWorkspaceConfig } from "../features/stream/types";
 import { SequencerMetadataPanel } from "../features/sequencer/components/SequencerMetadataPanel";
-import { buildSequencerOutlineMetadata } from "../features/sequencer/outline";
+import {
+  buildSequencerOutlineMetadata,
+  buildSequencerStepOutline,
+} from "../features/sequencer/outline";
+import { stepPathAtLine } from "../features/sequencer/diagnostic_locations";
 import type {
   SequencerAdaptiveStudyStatus,
   SequencerDiagnostic,
@@ -53,7 +57,6 @@ import type { CapabilityMember } from "../types";
 import type { StreamCatalogEntry } from "../types";
 import type { TelemetrySignal } from "../types";
 import { SequencerOutlinePane } from "./SequencerOutlinePane";
-import { YamlPreview } from "./YamlPreview";
 
 const LazySequencerYamlCodeEditor = lazy(
   () => import("../features/sequencer/components/SequencerYamlCodeEditor")
@@ -90,6 +93,8 @@ type Props = {
   totalSteps: number | null;
   completedSteps: number | null;
   loadedSource: string | null;
+  /** What the editor text came from (file name or loaded source). */
+  editorLabel: string | null;
   autoloadError: string | null;
   statusError: string | null;
   modalError: string | null;
@@ -182,6 +187,7 @@ export function SequencerModal({
   totalSteps,
   completedSteps,
   loadedSource,
+  editorLabel,
   autoloadError,
   statusError,
   modalError,
@@ -272,9 +278,26 @@ export function SequencerModal({
     ? libraryEntries.find((entry) => entry.id === selectedSequenceId) ?? null
     : null;
   const errorCount = diagnostics.filter((diag) => diag.severity === "error").length;
+  const warningCount = diagnostics.filter((diag) => diag.severity === "warning").length;
+  const anyStale = diagnostics.some((diag) => diag.stale);
+  const [stepFocus, setStepFocus] = useState<{ line: number; nonce: number } | null>(null);
+  const outline = useMemo(() => {
+    try {
+      return buildSequencerStepOutline(yamlText);
+    } catch {
+      return [];
+    }
+  }, [yamlText]);
 
   const jumpToDiagnostic = (diag: SequencerDiagnostic) => {
     if (diag.line == null) {
+      return;
+    }
+    // Show it on its step when it points at one in the current text;
+    // otherwise (stale, or outside any step) at its line in the YAML.
+    if (!diag.stale && stepPathAtLine(outline, diag.line).length > 0) {
+      setActiveTab("steps");
+      setStepFocus({ line: diag.line, nonce: Date.now() });
       return;
     }
     setActiveTab("yaml");
@@ -327,6 +350,16 @@ export function SequencerModal({
             {yamlDirty && (
               <Badge variant="light" color="yellow">
                 Editor changes not loaded
+              </Badge>
+            )}
+            {errorCount > 0 && (
+              <Badge variant="filled" color="red">
+                {errorCount} error{errorCount === 1 ? "" : "s"}
+              </Badge>
+            )}
+            {warningCount > 0 && (
+              <Badge variant="light" color="yellow">
+                {warningCount} warning{warningCount === 1 ? "" : "s"}
               </Badge>
             )}
             {cleanupActive && (
@@ -482,7 +515,7 @@ export function SequencerModal({
                   <Text size="sm" fw={600}>
                     Sequence
                   </Text>
-                  {(libraryConfigured || libraryOptions.length > 0) && (
+                  {libraryConfigured || libraryOptions.length > 0 ? (
                     <>
                       <Select
                         size="xs"
@@ -530,6 +563,11 @@ export function SequencerModal({
                         </Button>
                       </Group>
                     </>
+                  ) : (
+                    <Text size="xs" c="dimmed">
+                      No sequence library configured for this sequencer
+                      (`sequence_library_path`).
+                    </Text>
                   )}
                   <input
                     ref={fileInputRef}
@@ -556,16 +594,26 @@ export function SequencerModal({
                       Show loaded
                     </Button>
                   </Group>
-                  {loadedSource && (
-                    <Text size="xs" c="dimmed" style={{ wordBreak: "break-all" }}>
-                      Loaded from {loadedSource}
+                  <Stack gap={2}>
+                    <Text size="xs" style={{ wordBreak: "break-all" }}>
+                      <Text span size="xs" c="dimmed">
+                        In editor:{" "}
+                      </Text>
+                      {editorLabel ?? (yamlText.trim() ? "unsaved text" : "empty")}
+                      {yamlDirty ? (
+                        <Text span size="xs" c="yellow">
+                          {" "}
+                          (not loaded)
+                        </Text>
+                      ) : null}
                     </Text>
-                  )}
-                  {loaded && !loadedSource && (
-                    <Text size="xs" c="dimmed">
-                      Loaded sequence source is unavailable.
+                    <Text size="xs" style={{ wordBreak: "break-all" }}>
+                      <Text span size="xs" c="dimmed">
+                        In sequencer:{" "}
+                      </Text>
+                      {loaded ? loadedSource ?? "loaded (source unknown)" : "nothing loaded"}
                     </Text>
-                  )}
+                  </Stack>
                 </Stack>
               </Card>
 
@@ -841,13 +889,23 @@ export function SequencerModal({
                       </Badge>
                     )}
                   </Group>
+                  {anyStale && (
+                    <Text size="xs" c="yellow">
+                      The YAML changed since the last check; dimmed entries
+                      may point at the wrong line. Validate again.
+                    </Text>
+                  )}
                   {diagnostics.length === 0 ? (
                     <Text size="xs" c="dimmed">
                       None yet. Validate + Preflight checks the YAML.
                     </Text>
                   ) : (
                     diagnostics.map((diag, idx) => (
-                      <Stack key={`${diag.source ?? "diag"}:${idx}`} gap={2}>
+                      <Stack
+                        key={`${diag.source ?? "diag"}:${idx}`}
+                        gap={2}
+                        style={{ opacity: diag.stale ? 0.5 : 1 }}
+                      >
                         <Group gap={4} justify="space-between" wrap="nowrap">
                           <Group gap={4} wrap="nowrap">
                             <Badge
@@ -914,6 +972,8 @@ export function SequencerModal({
                 streamWorkspaces={streamWorkspaces}
                 latestSignalsByDevice={latestSignalsByDevice}
                 colorScheme={colorScheme}
+                diagnostics={diagnostics}
+                focusRequest={stepFocus}
               />
             </Tabs.Panel>
             <Tabs.Panel value="vars" pt="sm" style={tabPanelStyle(activeTab === "vars")}>
@@ -943,24 +1003,24 @@ export function SequencerModal({
                   />
                 </Group>
                 <div style={{ flex: 1, minHeight: 0, overflow: "hidden" }}>
-                  {yamlViewMode === "edit" ? (
-                    <Suspense
-                      fallback={
-                        <Text size="xs" c="dimmed">
-                          Loading YAML editor...
-                        </Text>
-                      }
-                    >
-                      <LazySequencerYamlCodeEditor
-                        ref={editorRef}
-                        value={yamlText}
-                        onChange={onYamlTextChange}
-                        colorScheme={colorScheme}
-                      />
-                    </Suspense>
-                  ) : (
-                    <YamlPreview text={yamlText} colorScheme={colorScheme} height="100%" />
-                  )}
+                  {/* Preview is the same editor, read-only, so it shows the
+                      diagnostic marks too. */}
+                  <Suspense
+                    fallback={
+                      <Text size="xs" c="dimmed">
+                        Loading YAML editor...
+                      </Text>
+                    }
+                  >
+                    <LazySequencerYamlCodeEditor
+                      ref={editorRef}
+                      value={yamlText}
+                      onChange={onYamlTextChange}
+                      colorScheme={colorScheme}
+                      diagnostics={diagnostics}
+                      readOnly={yamlViewMode !== "edit"}
+                    />
+                  </Suspense>
                 </div>
               </Stack>
             </Tabs.Panel>

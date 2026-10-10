@@ -389,6 +389,7 @@ export function AppModalsLayer({
         totalSteps={sequencerController.sequencerTotalSteps}
         completedSteps={sequencerController.sequencerCompletedSteps}
         loadedSource={sequencerController.sequencerStatus?.loadedSource ?? null}
+        editorLabel={sequencerController.sequencerEditorLabel}
         autoloadError={sequencerController.sequencerStatus?.autoloadError ?? null}
         statusError={sequencerController.sequencerStatus?.error ?? null}
         modalError={sequencerController.sequencerModalError}

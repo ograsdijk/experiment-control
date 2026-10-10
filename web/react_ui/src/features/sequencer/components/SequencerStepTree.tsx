@@ -1,4 +1,4 @@
-import { ActionIcon, Badge, Button, Card, Group, Menu, ScrollArea, Stack, Text } from "@mantine/core";
+import { ActionIcon, Badge, Button, Card, Group, Menu, ScrollArea, Stack, Text, Tooltip } from "@mantine/core";
 import {
   IconArrowDown,
   IconArrowDownRight,
@@ -17,6 +17,7 @@ import {
   type SequencerChildContainer,
 } from "../editing";
 import { countStepIssues } from "../editor_helpers";
+import type { StepDiagnostics } from "../diagnostic_locations";
 import type { SequencerStepOutlineNode } from "../types";
 
 const STEP_TEMPLATE_OPTIONS: Array<{ kind: BasicSequencerStepTemplate; label: string }> = [
@@ -113,7 +114,55 @@ type OutlineRowProps = {
   siblingInfoById: SiblingInfoMap;
   onMoveUp: (node: SequencerStepOutlineNode) => void;
   onMoveDown: (node: SequencerStepOutlineNode) => void;
+  stepDiagnostics?: StepDiagnostics;
 };
+
+const SEVERITY_COLOR = { error: "red", warning: "yellow", info: "gray" } as const;
+
+function StepDiagnosticBadge({
+  nodeId,
+  collapsed,
+  stepDiagnostics,
+}: {
+  nodeId: string;
+  collapsed: boolean;
+  stepDiagnostics?: StepDiagnostics;
+}) {
+  const own = stepDiagnostics?.byStepId.get(nodeId) ?? [];
+  const inside = stepDiagnostics?.insideById.get(nodeId);
+  if (own.length > 0) {
+    const worst = own.some((d) => d.severity === "error")
+      ? "error"
+      : own.some((d) => d.severity === "warning")
+        ? "warning"
+        : "info";
+    const label = worst === "info" ? "note" : worst;
+    return (
+      <Tooltip
+        multiline
+        w={360}
+        withinPortal
+        zIndex={1000}
+        label={own.map((d) => d.message).join("\n\n")}
+        style={{ whiteSpace: "pre-wrap" }}
+      >
+        <Badge size="xs" variant="filled" color={SEVERITY_COLOR[worst]}>
+          {own.length} {label}
+          {own.length === 1 ? "" : "s"}
+        </Badge>
+      </Tooltip>
+    );
+  }
+  // A collapsed step hides its children's markers: summarize them here.
+  if (inside && collapsed) {
+    return (
+      <Badge size="xs" variant="outline" color={SEVERITY_COLOR[inside.severity]}>
+        {inside.count} inside
+      </Badge>
+    );
+  }
+  return null;
+}
 
 function OutlineRow({
   node,
@@ -130,6 +179,7 @@ function OutlineRow({
   siblingInfoById,
   onMoveUp,
   onMoveDown,
+  stepDiagnostics,
 }: OutlineRowProps) {
   const selected = node.id === selectedId;
   const collapsible = node.children.length > 0;
@@ -194,6 +244,11 @@ function OutlineRow({
                     : node.branchLabel}
                 </Badge>
               ) : null}
+              <StepDiagnosticBadge
+                nodeId={node.id}
+                collapsed={collapsed}
+                stepDiagnostics={stepDiagnostics}
+              />
               {issueCount > 0 ? (
                 <Badge size="xs" variant="light" color="red">
                   {issueCount} issue{issueCount === 1 ? "" : "s"}
@@ -298,6 +353,7 @@ function OutlineRow({
             siblingInfoById={siblingInfoById}
             onMoveUp={onMoveUp}
             onMoveDown={onMoveDown}
+            stepDiagnostics={stepDiagnostics}
           />
         ))}
     </>
@@ -323,6 +379,7 @@ type Props = {
   onMoveUp: (node: SequencerStepOutlineNode) => void;
   onMoveDown: (node: SequencerStepOutlineNode) => void;
   onInsertTopLevel: (kind: BasicSequencerStepTemplate) => void;
+  stepDiagnostics?: StepDiagnostics;
 };
 
 export function SequencerStepTree({
@@ -340,6 +397,7 @@ export function SequencerStepTree({
   onMoveUp,
   onMoveDown,
   onInsertTopLevel,
+  stepDiagnostics,
 }: Props) {
   return (
     <Card
@@ -377,7 +435,7 @@ export function SequencerStepTree({
           No sequencer steps detected yet. Use quick add or load YAML to see a visual outline.
         </Text>
       ) : (
-        <ScrollArea style={{ flex: 1, minHeight: 0 }}>
+        <ScrollArea style={{ flex: 1, minHeight: 0 }} type="auto" offsetScrollbars>
           <Stack gap={6}>
             {outline.map((node) => (
               <OutlineRow
@@ -396,6 +454,7 @@ export function SequencerStepTree({
                 siblingInfoById={siblingInfoById}
                 onMoveUp={onMoveUp}
                 onMoveDown={onMoveDown}
+                stepDiagnostics={stepDiagnostics}
               />
             ))}
           </Stack>

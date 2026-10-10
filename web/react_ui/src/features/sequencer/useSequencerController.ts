@@ -270,12 +270,24 @@ export function useSequencerController({
   const [sequencerYamlViewMode, setSequencerYamlViewMode] = useState<
     "edit" | "preview"
   >("preview");
-  const [sequencerDiagnostics, setSequencerDiagnostics] = useState<
-    SequencerDiagnostic[]
-  >([]);
+  // Validator diagnostics and the YAML text they were computed against
+  // (null when not the editor text, e.g. a library load): line numbers only
+  // point at the right place while the editor still holds that text.
+  const [sequencerDiagnosticsState, setSequencerDiagnosticsState] = useState<{
+    items: SequencerDiagnostic[];
+    text: string | null;
+  }>({ items: [], text: null });
+  const setSequencerDiagnostics = useCallback(
+    (items: SequencerDiagnostic[], text: string | null = null) =>
+      setSequencerDiagnosticsState({ items, text }),
+    []
+  );
   const [sequencerModalError, setSequencerModalError] = useState<string | null>(
     null
   );
+  // What the editor text came from (uploaded file name or loaded source), so
+  // the modal can say which sequence is being edited.
+  const [sequencerEditorLabel, setSequencerEditorLabel] = useState<string | null>(null);
   const [sequencerAdaptiveModes, setSequencerAdaptiveModes] = useState<
     Record<string, AdaptiveStartMode>
   >({});
@@ -706,6 +718,7 @@ export function useSequencerController({
         if (applyToEditor && loaded && text !== null) {
           setSequencerYamlText(text.replace(/\r\n/g, "\n"));
           setSequencerYamlDirty(false);
+          setSequencerEditorLabel(source ?? activeSequenceId ?? "loaded sequence");
         }
         if (!loaded) {
           setSequencerModalError("No sequence is currently loaded in the sequencer.");
@@ -1179,6 +1192,7 @@ export function useSequencerController({
       try {
         const text = (await file.text()).replace(/\r\n/g, "\n");
         setSequencerYamlText(text);
+        setSequencerEditorLabel(file.name);
         setSequencerLoadSource("editor");
         setSequencerYamlDirty(true);
         setSequencerDiagnostics([]);
@@ -1238,7 +1252,7 @@ export function useSequencerController({
       const processDiagnostics = normalizeSequencerDiagnostics(result?.diagnostics);
       const localDiagnostics = buildLocalConditionDiagnostics(sequencerYamlText);
       const diagnostics = mergeDiagnostics(processDiagnostics, localDiagnostics);
-      setSequencerDiagnostics(processDiagnostics);
+      setSequencerDiagnostics(processDiagnostics, sequencerYamlText);
       const errorCount = diagnostics.filter(
         (item) => item.severity === "error"
       ).length;
@@ -1289,7 +1303,10 @@ export function useSequencerController({
         const diagnostics = normalizeSequencerDiagnostics(
           (resp.error as { diagnostics?: unknown } | undefined)?.diagnostics
         );
-        setSequencerDiagnostics(diagnostics);
+        setSequencerDiagnostics(
+          diagnostics,
+          loadSource === "editor" ? sequencerYamlText : null
+        );
         notifications.show({
           color: "red",
           title: "Load failed",
@@ -1457,10 +1474,14 @@ export function useSequencerController({
     () => buildLocalConditionDiagnostics(sequencerYamlText),
     [sequencerYamlText]
   );
-  const sequencerCombinedDiagnostics = useMemo(
-    () => mergeDiagnostics(sequencerDiagnostics, sequencerLocalDiagnostics),
-    [sequencerDiagnostics, sequencerLocalDiagnostics]
-  );
+  const sequencerCombinedDiagnostics = useMemo(() => {
+    const stale = sequencerDiagnosticsState.text !== sequencerYamlText;
+    const validator = sequencerDiagnosticsState.items.map((item) =>
+      stale ? { ...item, stale: true } : item
+    );
+    // Local condition checks are recomputed from the current text: never stale.
+    return mergeDiagnostics(validator, sequencerLocalDiagnostics);
+  }, [sequencerDiagnosticsState, sequencerLocalDiagnostics, sequencerYamlText]);
 
   const sequencerStatus = sequencerProcess
     ? sequencerStatusByProcessId[sequencerProcess.process_id]
@@ -1629,6 +1650,7 @@ export function useSequencerController({
     sequencerYamlViewMode,
     setSequencerYamlViewMode,
     sequencerDiagnostics: sequencerCombinedDiagnostics,
+    sequencerEditorLabel,
     sequencerModalError,
     sequencerAdaptiveModes,
     sequencerAdaptiveClearBusy,

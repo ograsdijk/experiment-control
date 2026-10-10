@@ -1,5 +1,7 @@
 import { yaml } from "@codemirror/lang-yaml";
 import { HighlightStyle, syntaxHighlighting } from "@codemirror/language";
+import { lintGutter, setDiagnostics, type Diagnostic } from "@codemirror/lint";
+import { EditorState, type Text as CmText } from "@codemirror/state";
 import {
   Decoration,
   EditorView,
@@ -11,25 +13,61 @@ import CodeMirror from "@uiw/react-codemirror";
 import { tags } from "@lezer/highlight";
 import {
   forwardRef,
+  useEffect,
   useImperativeHandle,
   useMemo,
   useRef,
+  useState,
   type ForwardedRef,
 } from "react";
-import type { SequencerYamlEditorHandle } from "../types";
+import type { SequencerDiagnostic, SequencerYamlEditorHandle } from "../types";
 import { yamlTokenColor } from "../yaml_colors";
 
 export type SequencerYamlCodeEditorProps = {
   value: string;
   onChange: (value: string) => void;
   colorScheme: "light" | "dark";
+  diagnostics?: ReadonlyArray<SequencerDiagnostic>;
+  /** Read-only view (the YAML tab's Preview) with the same highlighting and marks. */
+  readOnly?: boolean;
 };
 
+/**
+ * Editor marks for diagnostics that point at the current text. Stale ones
+ * (computed for different text) are left out: their lines may be wrong.
+ */
+function toEditorDiagnostics(
+  doc: CmText,
+  diagnostics: ReadonlyArray<SequencerDiagnostic>
+): Diagnostic[] {
+  const out: Diagnostic[] = [];
+  for (const diag of diagnostics) {
+    if (diag.stale || diag.line == null || diag.line < 1 || diag.line > doc.lines) {
+      continue;
+    }
+    const line = doc.line(diag.line);
+    const indent = line.text.length - line.text.trimStart().length;
+    const from =
+      diag.column != null
+        ? Math.min(line.to, line.from + Math.max(0, diag.column - 1))
+        : line.from + indent;
+    out.push({
+      from,
+      to: Math.max(from, line.to),
+      severity: diag.severity,
+      message: diag.message,
+      source: diag.source ?? undefined,
+    });
+  }
+  return out;
+}
+
 function SequencerYamlCodeEditorImpl(
-  { value, onChange, colorScheme }: SequencerYamlCodeEditorProps,
+  { value, onChange, colorScheme, diagnostics = [], readOnly = false }: SequencerYamlCodeEditorProps,
   ref: ForwardedRef<SequencerYamlEditorHandle>
 ) {
   const editorViewRef = useRef<EditorView | null>(null);
+  const [view, setView] = useState<EditorView | null>(null);
   const isDark = colorScheme === "dark";
 
   const templateDecorator = useMemo(
@@ -52,6 +90,9 @@ function SequencerYamlCodeEditorImpl(
   const extensions = useMemo(
     () => [
       yaml(),
+      lintGutter(),
+      EditorState.readOnly.of(readOnly),
+      EditorView.editable.of(!readOnly),
       EditorView.lineWrapping,
       syntaxHighlighting(
         HighlightStyle.define([
@@ -121,6 +162,8 @@ function SequencerYamlCodeEditorImpl(
         ".cm-content": {
           minHeight: "100%",
           lineHeight: "1.5",
+          // theme="none" leaves the caret black, invisible on the dark theme.
+          caretColor: isDark ? "#e9ecef" : "#212529",
         },
         ".cm-ec-template": {
           color: yamlTokenColor("template", colorScheme),
@@ -128,13 +171,23 @@ function SequencerYamlCodeEditorImpl(
         ".cm-ec-number": {
           color: yamlTokenColor("number", colorScheme),
         },
+        ".cm-cursor, .cm-dropCursor": {
+          borderLeftColor: isDark ? "#e9ecef" : "#212529",
+        },
         ".cm-selectionBackground, .cm-content ::selection": {
           background: isDark ? "rgba(116, 192, 252, 0.28)" : "rgba(28, 126, 214, 0.25)",
         },
       }),
     ],
-    [isDark, numberDecorator, templateDecorator]
+    [isDark, numberDecorator, readOnly, templateDecorator]
   );
+
+  useEffect(() => {
+    if (!view) {
+      return;
+    }
+    view.dispatch(setDiagnostics(view.state, toEditorDiagnostics(view.state.doc, diagnostics)));
+  }, [view, diagnostics, value]);
 
   useImperativeHandle(
     ref,
@@ -166,8 +219,9 @@ function SequencerYamlCodeEditorImpl(
         theme="none"
         extensions={extensions}
         onChange={onChange}
-        onCreateEditor={(view) => {
-          editorViewRef.current = view;
+        onCreateEditor={(created) => {
+          editorViewRef.current = created;
+          setView(created);
         }}
         basicSetup={{
           lineNumbers: true,

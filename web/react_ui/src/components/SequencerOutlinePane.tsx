@@ -17,7 +17,14 @@ import {
   type BasicSequencerStepTemplate,
   type SequencerChildContainer,
 } from "../features/sequencer/editing";
-import type { SequencerStepOutlineNode } from "../features/sequencer/types";
+import type {
+  SequencerDiagnostic,
+  SequencerStepOutlineNode,
+} from "../features/sequencer/types";
+import {
+  mapDiagnosticsToSteps,
+  stepPathAtLine,
+} from "../features/sequencer/diagnostic_locations";
 import { SequencerSelectionPanel } from "../features/sequencer/components/SequencerSelectionPanel";
 import { SequencerStepTree } from "../features/sequencer/components/SequencerStepTree";
 import type { StreamAnalysisWorkspaceConfig } from "../features/stream/types";
@@ -33,6 +40,9 @@ type Props = {
   streamWorkspaces: Record<string, StreamAnalysisWorkspaceConfig>;
   latestSignalsByDevice: Record<string, Record<string, TelemetrySignal>>;
   colorScheme: "light" | "dark";
+  diagnostics?: ReadonlyArray<SequencerDiagnostic>;
+  /** Select the step at this line (a new nonce re-triggers the same line). */
+  focusRequest?: { line: number; nonce: number } | null;
 };
 
 function buildSiblingInfoMap(
@@ -67,6 +77,8 @@ export function SequencerOutlinePane({
   streamWorkspaces,
   latestSignalsByDevice,
   colorScheme,
+  diagnostics = [],
+  focusRequest = null,
 }: Props) {
   const parsedOutline = useMemo(() => {
     try {
@@ -89,6 +101,10 @@ export function SequencerOutlinePane({
     [outline]
   );
   const siblingInfoById = useMemo(() => buildSiblingInfoMap(outline), [outline]);
+  const stepDiagnostics = useMemo(
+    () => mapDiagnosticsToSteps(outline, diagnostics),
+    [outline, diagnostics]
+  );
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [collapsedById, setCollapsedById] = useState<Record<string, boolean>>({});
   const [pendingSelection, setPendingSelection] = useState<{
@@ -149,6 +165,27 @@ export function SequencerOutlinePane({
       setCollapsedById(Object.fromEntries(nextEntries));
     }
   }, [flatOutline, collapsedById]);
+
+  useEffect(() => {
+    if (!focusRequest) {
+      return;
+    }
+    const path = stepPathAtLine(outline, focusRequest.line);
+    if (path.length === 0) {
+      return;
+    }
+    // Expand the parents so the step is visible, then select it.
+    setCollapsedById((prev) => {
+      const next = { ...prev };
+      for (const node of path.slice(0, -1)) {
+        next[node.id] = false;
+      }
+      return next;
+    });
+    setSelectedId(path[path.length - 1].id);
+    // Only on a new request, not when the outline re-parses.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focusRequest]);
 
   const selectedStep =
     selectedId === null
@@ -302,6 +339,7 @@ export function SequencerOutlinePane({
           onMoveUp={handleMoveUp}
           onMoveDown={handleMoveDown}
           onInsertTopLevel={handleInsertTopLevel}
+          stepDiagnostics={stepDiagnostics}
         />
         <SequencerSelectionPanel
           selectedStep={selectedStep}
@@ -313,6 +351,9 @@ export function SequencerOutlinePane({
           latestSignalsByDevice={latestSignalsByDevice}
           colorScheme={colorScheme}
           onSelectStep={setSelectedId}
+          stepDiagnostics={
+            selectedId ? stepDiagnostics.byStepId.get(selectedId) ?? [] : []
+          }
         />
       </div>
     </Stack>

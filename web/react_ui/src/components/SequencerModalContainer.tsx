@@ -28,6 +28,7 @@ type Props = {
   totalSteps: number | null;
   completedSteps: number | null;
   loadedSource: string | null;
+  editorLabel: string | null;
   autoloadError: string | null;
   statusError: string | null;
   modalError: string | null;
