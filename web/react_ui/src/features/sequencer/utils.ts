@@ -211,15 +211,22 @@ export function holdSequencerPercent(
   return { key, value };
 }
 
-/** "~12:30 (≈14:52)": remaining time, "~" when the total is approximate. */
-export function formatSequencerEta(progress: SequencerProgress | null): string | null {
+/**
+ * "~12:30 (≈14:52)": remaining time, "~" when the total is approximate. The
+ * finish time is computed on this machine's clock (the sequencer host's
+ * clock may differ); `eta_wall_ts` only says whether one applies (running).
+ */
+export function formatSequencerEta(
+  progress: SequencerProgress | null,
+  nowMs: number = Date.now()
+): string | null {
   if (!progress || progress.etaS === null) {
     return null;
   }
   const prefix = progress.approximate ? "~" : "";
   let finish = "";
   if (progress.etaWallTs !== null && progress.etaS > 0) {
-    const at = new Date(progress.etaWallTs * 1000).toLocaleTimeString([], {
+    const at = new Date(nowMs + progress.etaS * 1000).toLocaleTimeString([], {
       hour: "2-digit",
       minute: "2-digit",
     });

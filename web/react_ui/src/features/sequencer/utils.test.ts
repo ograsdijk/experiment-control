@@ -134,6 +134,14 @@ describe("sequencer status normalization", () => {
     const approx = normalizeSequencerProgress({ eta_s: 125, approximate: true });
     expect(formatSequencerEta(approx)).toBe("~2:05");
     expect(formatSequencerEta(normalizeSequencerProgress({}))).toBeNull();
+    // The finish time uses this machine's clock, not the host's timestamp.
+    const running = normalizeSequencerProgress({ eta_s: 3600, eta_wall_ts: 1 });
+    const nowMs = new Date(2026, 0, 1, 10, 0, 0).getTime();
+    const expected = new Date(nowMs + 3600 * 1000).toLocaleTimeString([], {
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+    expect(formatSequencerEta(running, nowMs)).toBe(`1:00:00 (≈${expected})`);
   });
 
   it("compares new status fields", () => {
