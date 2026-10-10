@@ -37,9 +37,15 @@ export type SequencerProgress = {
   totalSteps: number | null;
   totalStepsKnown: boolean | null;
   estimateReason: string | null;
+  approximate: boolean;
   percent: number | null;
+  timePercent: number | null;
   etaS: number | null;
-  stepEwmaS: number | null;
+  etaWallTs: number | null;
+  scope: "run" | "loop";
+  phase: "run" | "cleanup";
+  cleanupCompletedSteps: number | null;
+  cleanupTotalSteps: number | null;
   currentStepElapsedS: number | null;
   loopMode: string | null;
   loopsCompleted: number | null;
