@@ -327,6 +327,9 @@ _LEAF_STEP_TYPES = (
 # the cached counts.
 _PROGRESS_REWALK_PERIOD_S = 1.0
 _ESTIMATE_RECORDS_CACHE_MAX = 256
+# Loops with more remaining records than this are not walked record by
+# record: a few probe records are walked and, when they agree, scaled up.
+_WALK_EXACT_MAX_RECORDS = 64
 
 
 @dataclass
@@ -1416,11 +1419,9 @@ class SequencerRuntime:
                 if isinstance(frame, _TryFrame) and not frame.finalizing:
                     self._walk_steps(frame.finally_steps, env, work, 1)
             elif isinstance(frame, _ForFrame):
-                for index in range(frame.index, len(frame.records)):
-                    loop_env = self._bind_walk_record(
-                        frame.bind, frame.records[index], index, env
-                    )
-                    self._walk_steps(frame.body, loop_env, work, 1)
+                self._walk_records(
+                    frame.bind, frame.records, frame.index, frame.body, env, work, 1
+                )
             elif isinstance(frame, _RepeatFrame):
                 self._walk_steps(frame.body, env, work, max(0, frame.remaining))
             elif isinstance(frame, _TryFrame):
@@ -1487,9 +1488,7 @@ class SequencerRuntime:
             return
         if isinstance(step, ForStep):
             records = self._estimate_for_records(step, env)
-            for index, record in enumerate(records):
-                loop_env = self._bind_walk_record(step.bind, record, index, env)
-                self._walk_steps(step.body, loop_env, work, mult)
+            self._walk_records(step.bind, records, 0, step.body, env, work, mult)
             return
         if isinstance(step, IfStep):
             self._walk_if(step, env, work, mult)
@@ -1501,6 +1500,43 @@ class SequencerRuntime:
         if isinstance(step, AdaptiveStep):
             raise _EstimateUnknown("adaptive step has unknown trial count")
         raise _EstimateUnknown(f"{step_kind(step)} step could not be estimated")
+
+    def _walk_records(
+        self,
+        bind: dict[str, str],
+        records: list[Any],
+        start: int,
+        body: list[Step],
+        env: dict[str, Any],
+        work: _RemainingWork,
+        mult: int,
+    ) -> None:
+        remaining = len(records) - start
+        if remaining <= 0 or mult <= 0:
+            return
+        if remaining > _WALK_EXACT_MAX_RECORDS:
+            # A full scan2d grid can mean thousands of records per loop and
+            # status() blocks the run loop. Walk the first, middle and last
+            # record; if their bodies count the same, assume all do.
+            probes: list[_RemainingWork] = []
+            for index in (start, start + remaining // 2, len(records) - 1):
+                probe = work.child()
+                loop_env = self._bind_walk_record(bind, records[index], index, env)
+                self._walk_steps(body, loop_env, probe, 1)
+                probes.append(probe)
+            first = probes[0]
+            if all(probe.counts == first.counts for probe in probes[1:]):
+                scale = mult * remaining
+                for key, n in first.counts.items():
+                    work.counts[key] = work.counts.get(key, 0) + n * scale
+                work.steps.update(first.steps)
+                for probe in probes:
+                    if probe.approx_reason is not None:
+                        work.approximate(probe.approx_reason)
+                return
+        for index in range(start, len(records)):
+            loop_env = self._bind_walk_record(bind, records[index], index, env)
+            self._walk_steps(body, loop_env, work, mult)
 
     def _walk_if(
         self, step: IfStep, env: dict[str, Any], work: _RemainingWork, mult: int

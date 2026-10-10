@@ -17,6 +17,7 @@ from experiment_control.sequencer.ast import (
     AssignStep,
     CallStep,
     ForStep,
+    IfStep,
     RepeatStep,
     SequenceSpec,
     SleepStep,
@@ -409,6 +410,53 @@ class SequencerProgressWalkCostTests(unittest.TestCase):
         elapsed_ms = (time.perf_counter() - started) * 1000.0
         self.assertGreater(progress["total_steps"], 5000)
         self.assertLess(elapsed_ms, 50.0)
+
+    def _for_runtime(self, body: list[Any], n: int) -> SequencerRuntime:
+        runtime = SequencerRuntime(
+            call_device=lambda device, action, params: {"ok": True, "result": None},
+            get_telemetry=lambda device, signal: None,
+            set_stream_context=lambda device, stream, ctx, fields: None,
+        )
+        runtime.load(
+            _spec(
+                [
+                    ForStep(
+                        bind={"value": "x"},
+                        in_expr={"gen": {"values": list(range(n))}},
+                        body=body,
+                    )
+                ]
+            )
+        )
+        runtime.start()
+        return runtime
+
+    def test_large_loop_is_scaled_from_probe_records(self) -> None:
+        # A full scan2d grid without `sample:` gives thousands of records per
+        # loop; walking each one on every status() blocked the run loop.
+        runtime = self._for_runtime(
+            [RepeatStep(times=15, body=[CallStep(device="d", action="a", params={})])],
+            20_000,
+        )
+        started = time.perf_counter()
+        progress = runtime.status()["progress"]
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        self.assertEqual(progress["total_steps"], 1 + 20_000 * 16)
+        self.assertLess(elapsed_ms, 50.0)
+
+    def test_large_loop_walks_every_record_when_probes_disagree(self) -> None:
+        # The last record takes the `then` branch, so the probes differ.
+        runtime = self._for_runtime(
+            [
+                IfStep(
+                    condition={"eq": ["${x}", 99]},
+                    then_steps=[AssignStep(values={"hit": 1})],
+                )
+            ],
+            100,
+        )
+        progress = runtime.status()["progress"]
+        self.assertEqual(progress["total_steps"], 1 + 100 + 1)
 
 
 if __name__ == "__main__":
