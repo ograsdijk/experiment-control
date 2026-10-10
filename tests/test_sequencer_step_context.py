@@ -104,6 +104,31 @@ steps:
         self.assertEqual(line_map.get("steps[0].try.do[0]"), 5)
         self.assertEqual(line_map.get("steps[0].try.finally[0]"), 9)
 
+    def test_line_map_follows_the_watchdog_gate_wrapper(self) -> None:
+        # requires.watchdog_ids wraps the sequence in a generated try, so the
+        # spec's paths are shifted; every diagnostic used to resolve to the
+        # same line.
+        text = """
+version: 1
+requires:
+  watchdog_ids: [lock_a, lock_b]
+steps:
+  - call: {device: fs740, action: first}
+  - repeat:
+      times: 2
+      do:
+        - call: {device: fs740, action: inner}
+""".lstrip()
+        spec = load_sequence_yaml(text)
+        line_map = _build_step_line_map(text, spec)
+        self.assertEqual(line_map.get("steps[0].try.do[2]"), 5)
+        self.assertEqual(line_map.get("steps[0].try.do[3]"), 6)
+        self.assertEqual(line_map.get("steps[0].try.do[3].repeat.do[0]"), 9)
+        # The generated watchdog enable/disable steps point at `requires:`.
+        self.assertEqual(line_map.get("steps[0].try.do[0]"), 2)
+        self.assertEqual(line_map.get("steps[0].try.finally[1]"), 2)
+        self.assertNotIn("steps[1]", line_map)
+
     def test_try_finally_cleanup_error_does_not_hide_original_failure(self) -> None:
         runtime = _runtime_for_errors()
         _load_yaml(

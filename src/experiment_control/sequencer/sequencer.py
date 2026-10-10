@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import queue
 import sys
 import threading
@@ -320,9 +321,15 @@ def _walk_step_lines(seq_node: Any, path: str, line_map: dict[str, int]) -> None
                     )
 
 
-def _build_step_line_map(text: str | None) -> dict[str, int]:
+def _build_step_line_map(text: str | None, spec: Any = None) -> dict[str, int]:
     """Map preflight step paths -> 1-based source line, from a line-tracking
-    YAML parse, so reachability diagnostics can point at the offending step."""
+    YAML parse, so reachability diagnostics can point at the offending step.
+
+    Paths follow the parsed spec. With `requires.watchdog_ids` the parser wraps
+    the whole sequence in a generated try (enable each watchdog, the steps,
+    disable in finally), so source `steps[i]` becomes
+    `steps[0].try.do[n + i]`; without remapping every diagnostic resolved to
+    the same line. The generated steps point at the `requires:` line."""
     if not text:
         return {}
     try:
@@ -333,7 +340,33 @@ def _build_step_line_map(text: str | None) -> dict[str, int]:
     steps_node = _yaml_mapping_get(root, "steps") if root is not None else None
     if steps_node is not None:
         _walk_step_lines(steps_node, "steps", line_map)
-    return line_map
+    watchdog_ids = list(getattr(spec, "watchdog_ids", None) or [])
+    if not watchdog_ids:
+        return line_map
+    offset = len(watchdog_ids)
+    remapped: dict[str, int] = {}
+    for key, line in line_map.items():
+        match = re.match(r"^steps\[(\d+)\](.*)$", key)
+        if match is None:
+            continue
+        index = int(match.group(1)) + offset
+        remapped[f"steps[0].try.do[{index}]{match.group(2)}"] = line
+    requires_node = None
+    if isinstance(root, yaml.MappingNode):
+        for key_node, _value in root.value:
+            if isinstance(key_node, yaml.ScalarNode) and key_node.value == "requires":
+                requires_node = key_node
+    gate_line = (
+        int(requires_node.start_mark.line) + 1
+        if requires_node is not None
+        else min(line_map.values(), default=None)
+    )
+    if gate_line is not None:
+        remapped["steps[0]"] = gate_line
+        for index in range(offset):
+            remapped[f"steps[0].try.do[{index}]"] = gate_line
+            remapped[f"steps[0].try.finally[{index}]"] = gate_line
+    return remapped
 
 
 def _normalize_log_severity(raw: Any) -> str:
@@ -532,7 +565,7 @@ class SequencerProcess(ManagedProcessBase):
         step_source_info = build_step_source_info(
             spec,
             source=source,
-            line_map=_build_step_line_map(text),
+            line_map=_build_step_line_map(text, spec),
         )
         self._runtime.load(spec, step_source_info=step_source_info)
         self._context_columns = _effective_context_columns(spec.context_columns)
@@ -2606,7 +2639,7 @@ class SequencerProcess(ManagedProcessBase):
     ) -> list[Json]:
         # Source-line map for diagnostics (best-effort; empty if text is absent
         # or unparseable, in which case diagnostics simply carry no line).
-        self._preflight_line_map = _build_step_line_map(text)
+        self._preflight_line_map = _build_step_line_map(text, spec)
         diagnostics: list[Json] = []
 
         list_devices_resp = self._require_manager().call({"type": "manager.devices.list"})
