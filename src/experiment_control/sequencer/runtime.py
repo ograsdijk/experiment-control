@@ -169,6 +169,23 @@ def _collect_identifiers(value: Any, names: set[str]) -> None:
             _collect_identifiers(item, names)
 
 
+def _build_env_view(env: dict[str, Any], vars_map: dict[str, Any]) -> dict[str, Any]:
+    """Template environment: vars win over assigned and loop-bound names.
+
+    Used for the live run (`self._env`) and for the progress walk's copies,
+    whose private bookkeeping keys are dropped here.
+    """
+    out = {key: value for key, value in env.items() if key not in _WALK_PRIVATE_KEYS}
+    out.update(vars_map)
+    out["vars"] = to_attrdict(vars_map)
+    return out
+
+
+def _serpentine_index(env: dict[str, Any]) -> int | None:
+    raw = env.get("__loop_index")
+    return int(raw) if raw is not None else None
+
+
 def parallel_repeat_count(step: RepeatStep, env: dict[str, Any]) -> int:
     """Render and validate one restricted parallel repeat count."""
     try:
@@ -937,10 +954,7 @@ class SequencerRuntime:
         return False
 
     def _env_view(self) -> dict[str, Any]:
-        env = dict(self._env)
-        env.update(self._vars)
-        env["vars"] = to_attrdict(self._vars)
-        return env
+        return _build_env_view(self._env, self._vars)
 
     def _record_index(self, record: dict[str, Any], fallback: int) -> int:
         raw = record.get("index", fallback)
@@ -949,13 +963,17 @@ class SequencerRuntime:
         except Exception:
             return fallback
 
-    def _assign_bound_record(self, bind: dict[str, str], record: dict[str, Any]) -> None:
+    def _bind_record(
+        self, target: dict[str, Any], bind: dict[str, str], record: Any, index: int
+    ) -> None:
+        """Bind one `for` record into `target`: the live env or a walk copy."""
         if not isinstance(record, dict):
             raise TypeError("for loop items must resolve to records")
-        for source, target in bind.items():
+        for source, name in bind.items():
             if source not in record:
                 raise KeyError(f"loop record is missing bound field {source!r}")
-            self._env[target] = record[source]
+            target[name] = record[source]
+        target["__loop_index"] = self._record_index(record, index)
 
     def _records_from_iterable(self, items: list[Any]) -> list[dict[str, Any]]:
         total = len(items)
@@ -978,10 +996,17 @@ class SequencerRuntime:
             records.append(record)
         return records
 
+    def _condition_holds(self, cond: Any, env_view: dict[str, Any], *, live: bool) -> bool:
+        """Evaluate an if/while/wait_until condition; raises when it can't.
+
+        `live=False` (the progress walk) never samples telemetry or makes
+        calls: a condition that needs them raises instead.
+        """
+        return eval_condition(self._resolve_value(cond, env=env_view, live=live), env_view)
+
     def _eval_condition_safe(self, cond: Any) -> bool:
         try:
-            cond_val = self._resolve_value(cond)
-            return eval_condition(cond_val, self._env_view())
+            return self._condition_holds(cond, self._env_view(), live=True)
         except Exception:
             return False
 
@@ -1604,8 +1629,9 @@ class SequencerRuntime:
         }
         trusted[_WALK_VARS_KEY] = env.get(_WALK_VARS_KEY, self._vars)
         try:
-            view = self._estimate_env_view(trusted)
-            ok: bool | None = eval_condition(render_templates(step.condition, view), view)
+            ok: bool | None = self._condition_holds(
+                step.condition, self._estimate_env_view(trusted), live=False
+            )
         except Exception:
             ok = None
         if ok is not None:
@@ -1626,14 +1652,11 @@ class SequencerRuntime:
         index: int,
         env: dict[str, Any],
     ) -> dict[str, Any]:
-        if not isinstance(record, dict):
-            raise _EstimateUnknown("for loop items could not be estimated")
         loop_env = dict(env)
-        for source, target in bind.items():
-            if source not in record:
-                raise _EstimateUnknown("for loop binding could not be estimated")
-            loop_env[target] = record[source]
-        loop_env["__loop_index"] = self._record_index(record, index)
+        try:
+            self._bind_record(loop_env, bind, record, index)
+        except (TypeError, KeyError) as exc:
+            raise _EstimateUnknown(f"for loop items could not be estimated: {exc}") from exc
         loop_env[_WALK_BOUND_KEY] = (
             env.get(_WALK_BOUND_KEY, frozenset())
             | frozenset(bind.values())
@@ -1654,14 +1677,8 @@ class SequencerRuntime:
         work.sleep_priors[key] = max(0.0, seconds)
 
     def _estimate_env_view(self, env: dict[str, Any]) -> dict[str, Any]:
-        # Same precedence as _env_view(): vars win over assigned/bound names.
         vars_map = env.get(_WALK_VARS_KEY)
-        if vars_map is None:
-            vars_map = self._vars
-        out = {key: value for key, value in env.items() if key not in _WALK_PRIVATE_KEYS}
-        out.update(vars_map)
-        out["vars"] = to_attrdict(vars_map)
-        return out
+        return _build_env_view(env, self._vars if vars_map is None else vars_map)
 
     # Generator kinds whose element count is fixed by `num` alone: the
     # sampled values (center, span, start, stop, ...) can vary without
@@ -1722,24 +1739,14 @@ class SequencerRuntime:
         env_view = self._estimate_env_view(env)
         try:
             rendered = render_templates(step.in_expr, env_view)
+            serpentine_index = _serpentine_index(env)
             key = repr(rendered)
-            serpentine_index: int | None = None
-            if "serpentine" in key:
-                loop_index = env.get("__loop_index")
-                if isinstance(loop_index, int):
-                    serpentine_index = loop_index
-                    key = f"{key}|{loop_index % 2}"
+            if "serpentine" in key and serpentine_index is not None:
+                key = f"{key}|{serpentine_index % 2}"
             cached = self._estimate_records_cache.get(key)
             if cached is not None:
                 return cached
-            if isinstance(rendered, dict) and isinstance(rendered.get("gen"), dict):
-                records = generate_from_gen(
-                    rendered["gen"], env=env_view, serpentine_index=serpentine_index
-                )
-            elif isinstance(rendered, list):
-                records = self._records_from_iterable(rendered)
-            else:
-                records = self._records_from_iterable([rendered])
+            records = self._records_from_rendered(rendered, env_view, serpentine_index)
         except Exception as exc:
             count = self._estimate_gen_count_only(step.in_expr, env)
             if count is None:
@@ -1792,8 +1799,7 @@ class SequencerRuntime:
                     continue
                 record = frame.records[frame.index]
                 frame.index += 1
-                self._assign_bound_record(frame.bind, record)
-                self._env["__loop_index"] = self._record_index(record, frame.index - 1)
+                self._bind_record(self._env, frame.bind, record, frame.index - 1)
                 self._stack.append(_Frame(frame.body))
                 continue
             if isinstance(frame, _RepeatFrame):
@@ -2140,9 +2146,7 @@ class SequencerRuntime:
         return True
 
     def _execute_for_step(self, step: ForStep) -> bool:
-        parent_index = self._env.get("__loop_index")
-        serpentine_index = int(parent_index) if parent_index is not None else None
-        records = self._resolve_iterable(step.in_expr, serpentine_index=serpentine_index)
+        records = self._resolve_iterable(step.in_expr)
         self._stack.append(_ForFrame(dict(step.bind), records, 0, step.body))
         return False
 
@@ -2406,15 +2410,22 @@ class SequencerRuntime:
                         out.append((dev, stream))
         return out
 
-    def _resolve_iterable(
-        self, value: Any, *, serpentine_index: int | None
-    ) -> list[dict[str, Any]]:
+    def _resolve_iterable(self, value: Any) -> list[dict[str, Any]]:
         env = self._env_view()
-        rendered = render_templates(value, env)
+        return self._records_from_rendered(
+            render_templates(value, env), env, _serpentine_index(self._env)
+        )
+
+    def _records_from_rendered(
+        self, rendered: Any, env_view: dict[str, Any], serpentine_index: int | None
+    ) -> list[dict[str, Any]]:
+        """Records of a rendered `for` input (shared by run and estimate)."""
         if isinstance(rendered, dict) and "gen" in rendered:
             gen = rendered["gen"]
             if isinstance(gen, dict):
-                return generate_from_gen(gen, env=env, serpentine_index=serpentine_index)
+                return generate_from_gen(
+                    gen, env=env_view, serpentine_index=serpentine_index
+                )
         if isinstance(rendered, list):
             return self._records_from_iterable(rendered)
         return self._records_from_iterable([rendered])
@@ -3408,8 +3419,13 @@ class SequencerRuntime:
             )
         return resp.get("result")
 
-    def _resolve_value(self, value: Any) -> Any:
-        env = self._env_view()
+    def _resolve_value(
+        self, value: Any, *, env: dict[str, Any] | None = None, live: bool = True
+    ) -> Any:
+        if env is None:
+            env = self._env_view()
+        if not live and isinstance(value, dict) and ("telemetry" in value or "call" in value):
+            raise _EstimateUnknown("value needs live telemetry or a call")
         if isinstance(value, dict) and "telemetry" in value:
             spec = render_templates(value["telemetry"], env)
             if not isinstance(spec, dict):
@@ -3467,9 +3483,11 @@ class SequencerRuntime:
                 )
             return resp.get("result")
         if isinstance(value, dict):
-            return {k: self._resolve_value(v) for k, v in value.items()}
+            return {
+                k: self._resolve_value(v, env=env, live=live) for k, v in value.items()
+            }
         if isinstance(value, list):
-            return [self._resolve_value(v) for v in value]
+            return [self._resolve_value(v, env=env, live=live) for v in value]
         return render_templates(value, env)
 
     def _start_wait_until(self, raw: dict[str, Any]) -> None:

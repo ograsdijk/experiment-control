@@ -468,3 +468,38 @@ class SequencerProgressWalkCostTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SequencerProgressLiveConditionTests(unittest.TestCase):
+    def test_if_on_telemetry_is_estimated_not_sampled(self) -> None:
+        sampled: list[str] = []
+
+        def get_telemetry(device: str, signal: str) -> dict[str, Any]:
+            sampled.append(signal)
+            return {"value": 1.0, "age_s": 0.0}
+
+        runtime = SequencerRuntime(
+            call_device=lambda device, action, params: {"ok": True, "result": None},
+            get_telemetry=get_telemetry,
+            set_stream_context=lambda device, stream, ctx, fields: None,
+        )
+        runtime.load(
+            _spec(
+                [
+                    IfStep(
+                        condition={
+                            "gt": [{"telemetry": {"device": "d", "signal": "s"}}, 0]
+                        },
+                        then_steps=[
+                            AssignStep(values={"a": 1}),
+                            AssignStep(values={"b": 1}),
+                        ],
+                    )
+                ]
+            )
+        )
+        runtime.start()
+        progress = runtime.status()["progress"]
+        self.assertEqual(sampled, [])
+        self.assertEqual(progress["total_steps"], 3)
+        self.assertTrue(progress["approximate"])
