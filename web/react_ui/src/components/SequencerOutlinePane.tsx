@@ -1,5 +1,6 @@
 import { Card, Stack, Text } from "@mantine/core";
 import { useEffect, useMemo, useState } from "react";
+import type { ActiveStep } from "../features/sequencer/active_step";
 import {
   buildSequencerStepOutline,
   flattenSequencerStepOutline,
@@ -43,6 +44,11 @@ type Props = {
   diagnostics?: ReadonlyArray<SequencerDiagnostic>;
   /** Select the step at this line (a new nonce re-triggers the same line). */
   focusRequest?: { line: number; nonce: number } | null;
+  /** The running step in this text (null: none to show). */
+  activeStep?: ActiveStep | null;
+  /** Expand to and scroll to the running step as it changes. */
+  follow?: boolean;
+  onUserScroll?: () => void;
 };
 
 function buildSiblingInfoMap(
@@ -79,6 +85,9 @@ export function SequencerOutlinePane({
   colorScheme,
   diagnostics = [],
   focusRequest = null,
+  activeStep = null,
+  follow = false,
+  onUserScroll,
 }: Props) {
   const parsedOutline = useMemo(() => {
     try {
@@ -186,6 +195,31 @@ export function SequencerOutlinePane({
     // Only on a new request, not when the outline re-parses.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [focusRequest]);
+
+  // With Follow on, open the collapsed parents of the running step when it
+  // changes; with it off the operator's collapse state is left alone.
+  const activeLeafId = activeStep?.leafId ?? null;
+  useEffect(() => {
+    if (!follow || !activeStep) {
+      return;
+    }
+    setCollapsedById((prev) => {
+      if (!activeStep.ancestorIds.some((id) => prev[id])) {
+        return prev;
+      }
+      const next = { ...prev };
+      for (const id of activeStep.ancestorIds) {
+        next[id] = false;
+      }
+      return next;
+    });
+    // Keyed on the leaf, so a later manual collapse sticks until it moves.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [follow, activeLeafId]);
+  const activeAncestorIds = useMemo(
+    () => new Set(activeStep?.ancestorIds ?? []),
+    [activeStep]
+  );
 
   const selectedStep =
     selectedId === null
@@ -340,6 +374,10 @@ export function SequencerOutlinePane({
           onMoveDown={handleMoveDown}
           onInsertTopLevel={handleInsertTopLevel}
           stepDiagnostics={stepDiagnostics}
+          activeLeafId={activeLeafId}
+          activeAncestorIds={activeAncestorIds}
+          follow={follow}
+          onUserScroll={onUserScroll}
         />
         <SequencerSelectionPanel
           selectedStep={selectedStep}

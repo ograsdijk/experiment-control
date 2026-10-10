@@ -24,6 +24,8 @@ export type SequencerStatus = {
   activeSequenceId: string | null;
   contextColumns: Record<string, string> | null;
   loadedSource: string | null;
+  /** Backend load counter; null/absent from an older backend. */
+  loadedRevision?: number | null;
   autoloadError: string | null;
   progress: SequencerProgress | null;
   loadedAdaptiveIds: string[];

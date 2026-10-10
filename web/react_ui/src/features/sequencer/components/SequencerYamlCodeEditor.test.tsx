@@ -4,6 +4,7 @@ import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { SequencerYamlCodeEditor } from "./SequencerYamlCodeEditor";
+import type { ActiveStepRange } from "../active_step_editor";
 import type { SequencerDiagnostic } from "../types";
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -32,7 +33,12 @@ const diag: SequencerDiagnostic = {
   source: "sequencer.preflight",
 };
 
-async function render(diagnostics: SequencerDiagnostic[], readOnly = false) {
+async function render(
+  diagnostics: SequencerDiagnostic[],
+  readOnly = false,
+  activeStep: ActiveStepRange | null = null,
+  onUserScroll?: () => void
+) {
   await act(async () => {
     root.render(
       createElement(SequencerYamlCodeEditor, {
@@ -41,6 +47,8 @@ async function render(diagnostics: SequencerDiagnostic[], readOnly = false) {
         colorScheme: "dark",
         diagnostics,
         readOnly,
+        activeStep,
+        onUserScroll,
       })
     );
   });
@@ -66,5 +74,55 @@ describe("SequencerYamlCodeEditor diagnostics", () => {
   it("does not draw stale diagnostics", async () => {
     await render([{ ...diag, stale: true }]);
     expect(container.querySelectorAll(".cm-lintRange-error").length).toBe(0);
+  });
+});
+
+describe("SequencerYamlCodeEditor active step", () => {
+  const range: ActiveStepRange = {
+    highlight: { from: 3, to: 3 },
+    bars: [{ from: 2, to: 3 }],
+  };
+
+  it("highlights the running lines and marks the gutter", async () => {
+    await render([], false, range);
+    expect(container.querySelectorAll(".cm-ec-active-line").length).toBe(1);
+    expect(container.textContent).toContain("▶");
+    expect(container.querySelectorAll(".cm-ec-active-bar").length).toBe(2);
+  });
+
+  it("clears the highlight when the range goes away", async () => {
+    await render([], false, range);
+    await render([], false, null);
+    expect(container.querySelectorAll(".cm-ec-active-line").length).toBe(0);
+    expect(container.textContent).not.toContain("▶");
+  });
+
+  it("coexists with lint marks", async () => {
+    await render([diag], false, range);
+    expect(container.querySelectorAll(".cm-ec-active-line").length).toBe(1);
+    expect(container.querySelectorAll(".cm-lintRange-error").length).toBeGreaterThan(0);
+  });
+
+  it("reports wheel scrolling as the user's", async () => {
+    let calls = 0;
+    await render([], false, range, () => {
+      calls += 1;
+    });
+    const scroller = container.querySelector(".cm-scroller")!;
+    scroller.dispatchEvent(new Event("wheel"));
+    expect(calls).toBe(1);
+  });
+
+  it("does not report pointer or cursor-key use inside the content", async () => {
+    let calls = 0;
+    await render([], false, range, () => {
+      calls += 1;
+    });
+    const content = container.querySelector(".cm-content")!;
+    content.dispatchEvent(new Event("pointerdown", { bubbles: true }));
+    content.dispatchEvent(new KeyboardEvent("keydown", { key: "Home", bubbles: true }));
+    expect(calls).toBe(0);
+    content.dispatchEvent(new KeyboardEvent("keydown", { key: "PageDown", bubbles: true }));
+    expect(calls).toBe(1);
   });
 });

@@ -1,7 +1,7 @@
 import { yaml } from "@codemirror/lang-yaml";
 import { HighlightStyle, syntaxHighlighting } from "@codemirror/language";
 import { lintGutter, setDiagnostics, type Diagnostic } from "@codemirror/lint";
-import { EditorState, type Text as CmText } from "@codemirror/state";
+import { EditorSelection, EditorState, type Text as CmText } from "@codemirror/state";
 import {
   Decoration,
   EditorView,
@@ -22,6 +22,13 @@ import {
   type ForwardedRef,
 } from "react";
 import type { SequencerDiagnostic, SequencerYamlEditorHandle } from "../types";
+import {
+  activeRangeKey,
+  activeStepExtension,
+  activeStepTheme,
+  setActiveStepRange,
+  type ActiveStepRange,
+} from "../active_step_editor";
 import { yamlTokenColor } from "../yaml_colors";
 
 export type SequencerYamlCodeEditorProps = {
@@ -31,7 +38,15 @@ export type SequencerYamlCodeEditorProps = {
   diagnostics?: ReadonlyArray<SequencerDiagnostic>;
   /** Read-only view (the YAML tab's Preview) with the same highlighting and marks. */
   readOnly?: boolean;
+  /** Lines of the running step to highlight (null: none). */
+  activeStep?: ActiveStepRange | null;
+  /** Scroll the running step into view when it changes. */
+  follow?: boolean;
+  /** The user scrolled the editor themselves (wheel, touch, scrollbar, paging keys). */
+  onUserScroll?: () => void;
 };
+
+const SCROLL_KEYS = new Set(["PageUp", "PageDown"]);
 
 /**
  * Editor marks for diagnostics that point at the current text. Stale ones
@@ -64,7 +79,16 @@ function toEditorDiagnostics(
 }
 
 function SequencerYamlCodeEditorImpl(
-  { value, onChange, colorScheme, diagnostics = [], readOnly = false }: SequencerYamlCodeEditorProps,
+  {
+    value,
+    onChange,
+    colorScheme,
+    diagnostics = [],
+    readOnly = false,
+    activeStep = null,
+    follow = false,
+    onUserScroll,
+  }: SequencerYamlCodeEditorProps,
   ref: ForwardedRef<SequencerYamlEditorHandle>
 ) {
   const editorViewRef = useRef<EditorView | null>(null);
@@ -140,6 +164,8 @@ function SequencerYamlCodeEditorImpl(
         },
         { decorations: (v) => v.decorations }
       ),
+      activeStepExtension(),
+      activeStepTheme(isDark),
       placeholder("Paste or upload sequence YAML"),
       EditorView.theme({
         "&": {
@@ -206,6 +232,66 @@ function SequencerYamlCodeEditorImpl(
     }
     view.dispatch(setDiagnostics(view.state, toEditorDiagnostics(view.state.doc, diagnostics)));
   }, [view, diagnostics, value]);
+
+  // Only dispatch when the range actually changes; the editor is not rebuilt.
+  const activeKey = activeRangeKey(activeStep);
+  const activeRef = useRef(activeStep);
+  activeRef.current = activeStep;
+  useEffect(() => {
+    if (!view) {
+      return;
+    }
+    view.dispatch({ effects: setActiveStepRange.of(activeRef.current) });
+  }, [view, activeKey, extensions]);
+
+  useEffect(() => {
+    const range = activeRef.current;
+    if (!view || !follow || !range) {
+      return;
+    }
+    const lines = view.state.doc.lines;
+    const from = Math.min(Math.max(1, range.highlight.from), lines);
+    const to = Math.min(Math.max(from, range.highlight.to), lines);
+    view.dispatch({
+      effects: EditorView.scrollIntoView(
+        EditorSelection.range(view.state.doc.line(from).from, view.state.doc.line(to).to),
+        { y: "nearest" }
+      ),
+    });
+  }, [view, follow, activeKey]);
+
+  // Our own scrolling emits only scroll events; wheel, touch, a scrollbar
+  // drag and paging keys are the user's.
+  const onUserScrollRef = useRef(onUserScroll);
+  onUserScrollRef.current = onUserScroll;
+  useEffect(() => {
+    if (!view) {
+      return;
+    }
+    const scroller = view.scrollDOM;
+    const notify = () => onUserScrollRef.current?.();
+    const onPointerDown = (event: PointerEvent) => {
+      // Content and gutters are children; a hit on the scroller itself is its scrollbar.
+      if (event.target === scroller) {
+        notify();
+      }
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (SCROLL_KEYS.has(event.key)) {
+        notify();
+      }
+    };
+    scroller.addEventListener("wheel", notify, { passive: true });
+    scroller.addEventListener("touchmove", notify, { passive: true });
+    scroller.addEventListener("pointerdown", onPointerDown);
+    scroller.addEventListener("keydown", onKeyDown);
+    return () => {
+      scroller.removeEventListener("wheel", notify);
+      scroller.removeEventListener("touchmove", notify);
+      scroller.removeEventListener("pointerdown", onPointerDown);
+      scroller.removeEventListener("keydown", onKeyDown);
+    };
+  }, [view]);
 
   useImperativeHandle(
     ref,

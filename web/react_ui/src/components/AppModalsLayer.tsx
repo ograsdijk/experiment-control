@@ -442,6 +442,8 @@ export function AppModalsLayer({
         onLoad={sequencerController.loadSequencerYaml}
         onLoadSelectedLibrary={sequencerController.loadSelectedSequencerLibrary}
         yamlDirty={sequencerController.sequencerYamlDirty}
+        editorStale={sequencerController.sequencerEditorStale}
+        otherSequenceLoaded={sequencerController.sequencerRevisionAction === "notice"}
         reloadSourceBusy={sequencerController.sequencerReloadBusy}
         canReloadSource={sequencerController.sequencerCanReloadSource}
         reloadSourceLabel={sequencerController.sequencerReloadSourceLabel}

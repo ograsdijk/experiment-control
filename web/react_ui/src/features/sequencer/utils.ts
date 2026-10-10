@@ -141,6 +141,7 @@ export function sameSequencerStatus(
       current.loaded === next.loaded &&
       current.activeSequenceId === next.activeSequenceId &&
       current.loadedSource === next.loadedSource &&
+      (current.loadedRevision ?? null) === (next.loadedRevision ?? null) &&
       current.autoloadError === next.autoloadError &&
       JSON.stringify(current.contextColumns) ===
         JSON.stringify(next.contextColumns) &&

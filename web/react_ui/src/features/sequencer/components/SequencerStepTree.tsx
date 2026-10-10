@@ -11,6 +11,7 @@ import {
   IconPlus,
   IconTrash,
 } from "@tabler/icons-react";
+import { useEffect, useRef } from "react";
 import {
   listChildInsertionTargets,
   type BasicSequencerStepTemplate,
@@ -119,6 +120,8 @@ type OutlineRowProps = {
   onMoveUp: (node: SequencerStepOutlineNode) => void;
   onMoveDown: (node: SequencerStepOutlineNode) => void;
   stepDiagnostics?: StepDiagnostics;
+  activeLeafId?: string | null;
+  activeAncestorIds?: ReadonlySet<string>;
 };
 
 const SEVERITY_COLOR = { error: "red", warning: "yellow", info: "gray" } as const;
@@ -200,8 +203,13 @@ function OutlineRow({
   onMoveUp,
   onMoveDown,
   stepDiagnostics,
+  activeLeafId = null,
+  activeAncestorIds,
 }: OutlineRowProps) {
   const selected = node.id === selectedId;
+  const active = node.id === activeLeafId;
+  // The running step is below this one (shown even while it is collapsed).
+  const activeInside = !active && Boolean(activeAncestorIds?.has(node.id));
   const collapsible = node.children.length > 0;
   const collapsed = collapsible ? Boolean(collapsedById[node.id]) : false;
   const childTargets = listChildInsertionTargets(node);
@@ -234,6 +242,7 @@ function OutlineRow({
         </ActionIcon>
         <button
           type="button"
+          data-active-step={active ? "true" : undefined}
           onClick={() => onSelect(node.id)}
           style={{
             display: "block",
@@ -241,7 +250,19 @@ function OutlineRow({
             padding: "8px 10px",
             borderRadius: 8,
             border: selected ? "1px solid var(--mantine-color-blue-5)" : "1px solid var(--card-border)",
-            background: selected ? "rgba(59, 130, 246, 0.08)" : "transparent",
+            // The running step: a green bar and fill, distinct from the blue selection.
+            borderLeft: active
+              ? "4px solid var(--mantine-color-green-6)"
+              : activeInside
+                ? "4px solid rgba(34, 197, 94, 0.45)"
+                : undefined,
+            background: active
+              ? "rgba(34, 197, 94, 0.16)"
+              : activeInside
+                ? "rgba(34, 197, 94, 0.06)"
+                : selected
+                  ? "rgba(59, 130, 246, 0.08)"
+                  : "transparent",
             textAlign: "left",
             cursor: "pointer",
             opacity: node.disabled ? 0.55 : 1,
@@ -252,6 +273,15 @@ function OutlineRow({
               <Badge size="xs" variant="light" color={kindColor(node.kind)}>
                 {node.kind}
               </Badge>
+              {active ? (
+                <Badge size="xs" variant="filled" color="green">
+                  running
+                </Badge>
+              ) : activeInside && collapsed ? (
+                <Badge size="xs" variant="outline" color="green">
+                  running inside
+                </Badge>
+              ) : null}
               {node.disabled ? (
                 <Badge size="xs" variant="outline" color="gray">
                   disabled
@@ -374,6 +404,8 @@ function OutlineRow({
             onMoveUp={onMoveUp}
             onMoveDown={onMoveDown}
             stepDiagnostics={stepDiagnostics}
+            activeLeafId={activeLeafId}
+            activeAncestorIds={activeAncestorIds}
           />
         ))}
     </>
@@ -400,7 +432,15 @@ type Props = {
   onMoveDown: (node: SequencerStepOutlineNode) => void;
   onInsertTopLevel: (kind: BasicSequencerStepTemplate) => void;
   stepDiagnostics?: StepDiagnostics;
+  activeLeafId?: string | null;
+  activeAncestorIds?: ReadonlySet<string>;
+  /** Scroll the running step into view when it changes. */
+  follow?: boolean;
+  /** The user scrolled the list themselves (wheel, touch, scrollbar, paging keys). */
+  onUserScroll?: () => void;
 };
+
+const SCROLL_KEYS = new Set(["PageUp", "PageDown", "Home", "End", "ArrowUp", "ArrowDown"]);
 
 export function SequencerStepTree({
   outline,
@@ -418,7 +458,26 @@ export function SequencerStepTree({
   onMoveDown,
   onInsertTopLevel,
   stepDiagnostics,
+  activeLeafId = null,
+  activeAncestorIds,
+  follow = false,
+  onUserScroll,
 }: Props) {
+  const viewportRef = useRef<HTMLDivElement | null>(null);
+
+  // After a frame, so a parent expanded for the same change is rendered.
+  useEffect(() => {
+    if (!follow || !activeLeafId) {
+      return;
+    }
+    const frame = window.requestAnimationFrame(() => {
+      viewportRef.current
+        ?.querySelector('[data-active-step="true"]')
+        ?.scrollIntoView({ block: "nearest" });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [follow, activeLeafId]);
+
   return (
     <Card
       radius="sm"
@@ -455,7 +514,26 @@ export function SequencerStepTree({
           No sequencer steps detected yet. Use quick add or load YAML to see a visual outline.
         </Text>
       ) : (
-        <ScrollArea style={{ flex: 1, minHeight: 0 }} type="auto" offsetScrollbars>
+        <ScrollArea
+          style={{ flex: 1, minHeight: 0 }}
+          type="auto"
+          offsetScrollbars
+          viewportRef={viewportRef}
+          // scrollIntoView only fires scroll events; these are the user's.
+          onWheel={onUserScroll}
+          onTouchMove={onUserScroll}
+          onPointerDown={(event) => {
+            // The scrollbars are outside the viewport.
+            if (!viewportRef.current?.contains(event.target as Node)) {
+              onUserScroll?.();
+            }
+          }}
+          onKeyDown={(event) => {
+            if (SCROLL_KEYS.has(event.key)) {
+              onUserScroll?.();
+            }
+          }}
+        >
           <Stack gap={6}>
             {outline.map((node) => (
               <OutlineRow
@@ -475,6 +553,8 @@ export function SequencerStepTree({
                 onMoveUp={onMoveUp}
                 onMoveDown={onMoveDown}
                 stepDiagnostics={stepDiagnostics}
+                activeLeafId={activeLeafId}
+                activeAncestorIds={activeAncestorIds}
               />
             ))}
           </Stack>
