@@ -108,6 +108,8 @@ type Props = {
   onLoad: () => Promise<unknown> | void;
   onLoadSelectedLibrary: () => Promise<unknown> | void;
   yamlDirty: boolean;
+  editorStale: boolean;
+  otherSequenceLoaded: boolean;
   reloadSourceBusy: boolean;
   canReloadSource: boolean;
   reloadSourceLabel: string;

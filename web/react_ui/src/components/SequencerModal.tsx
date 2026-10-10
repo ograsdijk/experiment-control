@@ -164,6 +164,10 @@ type Props = {
   onLoad: () => Promise<unknown> | void;
   onLoadSelectedLibrary: () => Promise<unknown> | void;
   yamlDirty: boolean;
+  /** The editor text is from an older load than the sequencer holds. */
+  editorStale: boolean;
+  /** Another load happened while the editor holds unloaded edits. */
+  otherSequenceLoaded: boolean;
   reloadSourceBusy: boolean;
   canReloadSource: boolean;
   reloadSourceLabel: string;
@@ -249,6 +253,8 @@ export function SequencerModal({
   onLoad,
   onLoadSelectedLibrary,
   yamlDirty,
+  editorStale,
+  otherSequenceLoaded,
   reloadSourceBusy,
   canReloadSource,
   reloadSourceLabel,
@@ -296,9 +302,10 @@ export function SequencerModal({
   const [stepFocus, setStepFocus] = useState<{ line: number; nonce: number } | null>(null);
   // Run events point at the loaded sequence's lines: stale while the editor
   // holds other (not yet loaded) text.
+  const textNotLoaded = yamlDirty || editorStale;
   const runDiagnostics = useMemo(
-    () => runEvents.map((event) => runEventToDiagnostic(event, yamlDirty)),
-    [runEvents, yamlDirty]
+    () => runEvents.map((event) => runEventToDiagnostic(event, textNotLoaded)),
+    [runEvents, textNotLoaded]
   );
   const markerDiagnostics = useMemo(
     () => [...diagnostics, ...runDiagnostics],
@@ -322,9 +329,9 @@ export function SequencerModal({
         runtimeState,
         detail: currentStepDetail,
         loadedSource,
-        yamlDirty,
+        yamlDirty: textNotLoaded,
       }),
-    [runtimeState, currentStepDetail, loadedSource, yamlDirty]
+    [runtimeState, currentStepDetail, loadedSource, textNotLoaded]
   );
   const activeStep = useMemo(() => resolveActiveStep(outline, activeLine), [outline, activeLine]);
   const [follow, setFollowState] = useState(readFollowPreference);
@@ -500,6 +507,7 @@ export function SequencerModal({
 
         {/* Current step and messages, only when there is something to say. */}
         {(currentStep ||
+          otherSequenceLoaded ||
           showPause ||
           progress?.approximate ||
           autoloadError ||
@@ -519,6 +527,25 @@ export function SequencerModal({
                       .join(" | ")})`
                   : ""}
               </Text>
+            )}
+            {otherSequenceLoaded && (
+              <Group gap="xs" wrap="nowrap">
+                <Text size="xs" c="yellow">
+                  A different sequence was loaded (by another client); your edits are not
+                  the loaded sequence.
+                </Text>
+                <Button
+                  size="compact-xs"
+                  variant="light"
+                  color="yellow"
+                  loading={loadedYamlBusy}
+                  onClick={() => {
+                    void onShowLoadedYaml();
+                  }}
+                >
+                  Discard edits and load current
+                </Button>
+              </Group>
             )}
             {showPause && pauseInfo && (
               <Text size="sm" c="yellow" fw={500}>
@@ -1024,12 +1051,12 @@ export function SequencerModal({
                     </Text>
                   ) : (
                     [...runEvents].reverse().map((event, idx) => {
-                      const asDiag = runEventToDiagnostic(event, yamlDirty);
+                      const asDiag = runEventToDiagnostic(event, textNotLoaded);
                       return (
                         <Stack
                           key={`run:${runEvents.length - idx}`}
                           gap={2}
-                          style={{ opacity: yamlDirty ? 0.6 : 1 }}
+                          style={{ opacity: textNotLoaded ? 0.6 : 1 }}
                         >
                           <Group gap={4} justify="space-between" wrap="nowrap">
                             <Group gap={4} wrap="nowrap" style={{ minWidth: 0 }}>

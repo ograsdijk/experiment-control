@@ -10,6 +10,7 @@ import {
 import type { ApiResponse } from "../../api";
 import type { ProcessStatus } from "../../types";
 import { useAdaptivePolling } from "../polling/useAdaptivePolling";
+import { editorMatchesLoadedRevision, revisionAction } from "./loaded_revision";
 import { useSequencerRunEvents } from "./useSequencerRunEvents";
 import type {
   SequencerAdaptiveStudyStatus,
@@ -263,6 +264,10 @@ export function useSequencerController({
   const [sequencerLoadedYamlBusy, setSequencerLoadedYamlBusy] = useState(false);
   const [sequencerYamlText, setSequencerYamlText] = useState("");
   const [sequencerYamlDirty, setSequencerYamlDirty] = useState(false);
+  // Backend load revision the editor text was fetched at (null: unknown).
+  const [sequencerEditorRevision, setSequencerEditorRevision] = useState<number | null>(null);
+  const sequencerYamlDirtyRef = useRef(false);
+  sequencerYamlDirtyRef.current = sequencerYamlDirty;
   const [sequencerLoadedYamlInfo, setSequencerLoadedYamlInfo] =
     useState<SequencerLoadedYamlInfo>({
       source: null,
@@ -373,6 +378,7 @@ export function useSequencerController({
               activeSequenceId: current?.activeSequenceId ?? null,
               contextColumns: current?.contextColumns ?? null,
               loadedSource: current?.loadedSource ?? null,
+              loadedRevision: current?.loadedRevision ?? null,
               autoloadError: current?.autoloadError ?? null,
               progress: current?.progress ?? null,
               loadedAdaptiveIds: current?.loadedAdaptiveIds ?? [],
@@ -401,6 +407,7 @@ export function useSequencerController({
           active_sequence_id?: unknown;
           context_columns?: unknown;
           loaded_source?: unknown;
+          loaded_revision?: unknown;
           autoload_error?: unknown;
           progress?: unknown;
           loaded_adaptive_ids?: unknown;
@@ -528,6 +535,7 @@ export function useSequencerController({
                 : null,
             contextColumns,
             loadedSource,
+            loadedRevision: normalizeInt(result.loaded_revision),
             autoloadError,
             progress,
             loadedAdaptiveIds,
@@ -566,6 +574,7 @@ export function useSequencerController({
             activeSequenceId: current?.activeSequenceId ?? null,
             contextColumns: current?.contextColumns ?? null,
             loadedSource: current?.loadedSource ?? null,
+            loadedRevision: current?.loadedRevision ?? null,
             autoloadError: current?.autoloadError ?? null,
             progress: current?.progress ?? null,
             loadedAdaptiveIds: current?.loadedAdaptiveIds ?? [],
@@ -651,9 +660,10 @@ export function useSequencerController({
   const fetchSequencerLoadedYaml = useCallback(
     async (
       processId: string,
-      opts?: { applyToEditor?: boolean; silent?: boolean }
+      opts?: { applyToEditor?: boolean; silent?: boolean; onlyIfClean?: boolean }
     ) => {
       const applyToEditor = opts?.applyToEditor === true;
+      const onlyIfClean = opts?.onlyIfClean === true;
       const silent = opts?.silent === true;
       if (sequencerLoadedYamlBusy) {
         return;
@@ -681,6 +691,7 @@ export function useSequencerController({
           text?: unknown;
           reloadable?: unknown;
           reload_kind?: unknown;
+          revision?: unknown;
         };
         const loaded = result.loaded === true;
         const source =
@@ -723,9 +734,20 @@ export function useSequencerController({
           }
           return { ...prev, [processId]: next };
         });
-        if (applyToEditor && loaded && text !== null) {
+        // A background refetch must not clobber text typed while it was in flight.
+        if (
+          applyToEditor &&
+          loaded &&
+          text !== null &&
+          !(onlyIfClean && sequencerYamlDirtyRef.current)
+        ) {
           setSequencerYamlText(text.replace(/\r\n/g, "\n"));
           setSequencerYamlDirty(false);
+          setSequencerEditorRevision(
+            typeof result.revision === "number" && Number.isFinite(result.revision)
+              ? result.revision
+              : null
+          );
           setSequencerEditorLabel(source ?? activeSequenceId ?? "loaded sequence");
         }
         if (!loaded) {
@@ -1536,6 +1558,42 @@ export function useSequencerController({
   }, [sequencerOpen, sequencerProcess]);
 
   const sequencerLoaded = sequencerStatus?.loaded === true;
+
+  // Someone else (or a reload) loaded a different sequence than the editor
+  // text came from: a clean editor follows it. One attempt per status
+  // revision, so a load with no text cannot loop.
+  const sequencerStatusRevision = sequencerStatus?.loadedRevision ?? null;
+  const sequencerRevisionAction = revisionAction({
+    statusRevision: sequencerStatusRevision,
+    editorRevision: sequencerEditorRevision,
+    loaded: sequencerLoaded,
+    dirty: sequencerYamlDirty,
+  });
+  const sequencerRefetchedRevisionRef = useRef<number | null>(null);
+  useEffect(() => {
+    if (
+      !sequencerOpen ||
+      !sequencerProcess ||
+      sequencerRevisionAction !== "refetch" ||
+      sequencerLoadedYamlBusy ||
+      sequencerRefetchedRevisionRef.current === sequencerStatusRevision
+    ) {
+      return;
+    }
+    sequencerRefetchedRevisionRef.current = sequencerStatusRevision;
+    void fetchSequencerLoadedYaml(sequencerProcess.process_id, {
+      applyToEditor: true,
+      silent: true,
+      onlyIfClean: true,
+    });
+  }, [
+    fetchSequencerLoadedYaml,
+    sequencerLoadedYamlBusy,
+    sequencerOpen,
+    sequencerProcess,
+    sequencerRevisionAction,
+    sequencerStatusRevision,
+  ]);
   const sequencerProgress = sequencerStatus?.progress ?? null;
   const sequencerPercentHoldRef = useRef<SequencerPercentHold | null>(null);
   const sequencerPercentHold = holdSequencerPercent(
@@ -1663,6 +1721,11 @@ export function useSequencerController({
     sequencerLoadBusy,
     sequencerReloadBusy,
     sequencerYamlDirty,
+    sequencerRevisionAction,
+    sequencerEditorStale: !editorMatchesLoadedRevision({
+      statusRevision: sequencerStatusRevision,
+      editorRevision: sequencerEditorRevision,
+    }),
     sequencerCanReloadSource,
     sequencerReloadSourceLabel,
     sequencerLoadedYamlBusy,
