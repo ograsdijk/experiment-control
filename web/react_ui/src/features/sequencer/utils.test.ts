@@ -95,23 +95,37 @@ describe("sequencer status normalization", () => {
     expect(sequencerDisplayPercent(legacy)).toBe(10);
   });
 
-  it("keeps the displayed percent from moving backwards within a run", () => {
-    const at = (runId: number, phase: string, value: number) => {
-      const progress = normalizeSequencerProgress({ run_id: runId, phase });
-      return { progress, value };
+  it("keeps the displayed percent from moving backwards while it measures the same thing", () => {
+    let hold: ReturnType<typeof holdSequencerPercent> = null;
+    const step = (raw: Record<string, unknown>, value: number) => {
+      hold = holdSequencerPercent(hold, normalizeSequencerProgress(raw), value);
+      return hold?.value;
     };
-    let hold = null;
-    const a = at(1, "run", 30);
-    hold = holdSequencerPercent(hold, a.progress, a.value);
-    const b = at(1, "run", 25);
-    hold = holdSequencerPercent(hold, b.progress, b.value);
-    expect(hold?.value).toBe(30);
-    const c = at(1, "cleanup", 5);
-    hold = holdSequencerPercent(hold, c.progress, c.value);
-    expect(hold?.value).toBe(5);
-    const d = at(2, "run", 1);
-    hold = holdSequencerPercent(hold, d.progress, d.value);
-    expect(hold?.value).toBe(1);
+    expect(step({ run_id: 1 }, 30)).toBe(30);
+    // Total grew (another while iteration): hold.
+    expect(step({ run_id: 1 }, 25)).toBe(30);
+    // The ETA appeared: the bar is now time-based and restarts.
+    expect(step({ run_id: 1, time_percent: 5 }, 5)).toBe(5);
+    expect(step({ run_id: 1, time_percent: 4 }, 4)).toBe(5);
+    // Cleanup and a new run restart it too.
+    expect(step({ run_id: 1, time_percent: 1, phase: "cleanup" }, 1)).toBe(1);
+    expect(step({ run_id: 2 }, 0)).toBe(0);
+  });
+
+  it("restarts the bar for each loop of a continuous run", () => {
+    let hold: ReturnType<typeof holdSequencerPercent> = null;
+    const loop = (loopsCompleted: number, value: number) => {
+      const progress = normalizeSequencerProgress({
+        run_id: 1,
+        scope: "loop",
+        loops_completed: loopsCompleted,
+        time_percent: value,
+      });
+      hold = holdSequencerPercent(hold, progress, value);
+      return hold?.value;
+    };
+    expect(loop(0, 99)).toBe(99);
+    expect(loop(1, 3)).toBe(3);
   });
 
   it("formats the ETA with an approximate marker", () => {

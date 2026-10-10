@@ -1542,7 +1542,7 @@ export function useSequencerController({
         ? `${sequencerCompletedSteps ?? 0}/${sequencerTotalSteps}`
         : `${sequencerCompletedSteps ?? 0}`;
     if (sequencerProgressPercent !== null) {
-      const phase = sequencerProgress.phase === "cleanup" ? "Cleanup after stop. " : "";
+      const phase = sequencerProgress.phase === "cleanup" ? "Cleanup. " : "";
       return `${phase}Progress ${sequencerProgressPercent.toFixed(1)}%, steps ${steps}, elapsed ${elapsed}${
         eta !== null ? `, ETA ${eta}` : ""
       }`;

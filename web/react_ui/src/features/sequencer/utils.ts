@@ -173,15 +173,28 @@ export function sequencerDisplayPercent(
 }
 
 export type SequencerPercentHold = {
-  runId: number | null;
-  phase: SequencerProgress["phase"];
+  key: string;
   value: number;
 };
 
 /**
- * Keep the bar from moving backwards within one run and phase: the live
- * total can grow (e.g. a while loop iterating again) and the bar switches
- * from step- to time-based once the ETA appears.
+ * What the displayed percent measures. The hold below restarts whenever this
+ * changes: a new run, the cleanup phase, the next loop of a continuous run
+ * (whose bar shows only the current loop), or the switch from step- to
+ * time-based percent once the ETA appears.
+ */
+function sequencerPercentKey(progress: SequencerProgress): string {
+  return JSON.stringify([
+    progress.runId,
+    progress.phase,
+    progress.timePercent !== null ? "time" : "steps",
+    progress.scope === "loop" ? progress.loopsCompleted : null,
+  ]);
+}
+
+/**
+ * Keep the bar from moving backwards while it measures the same thing: the
+ * live total can grow (e.g. a while loop iterating again).
  */
 export function holdSequencerPercent(
   previous: SequencerPercentHold | null,
@@ -191,15 +204,11 @@ export function holdSequencerPercent(
   if (!progress || value === null) {
     return null;
   }
-  if (
-    previous &&
-    previous.runId === progress.runId &&
-    previous.phase === progress.phase &&
-    value < previous.value
-  ) {
+  const key = sequencerPercentKey(progress);
+  if (previous && previous.key === key && value < previous.value) {
     return previous;
   }
-  return { runId: progress.runId, phase: progress.phase, value };
+  return { key, value };
 }
 
 /** "~12:30 (≈14:52)": remaining time, "~" when the total is approximate. */

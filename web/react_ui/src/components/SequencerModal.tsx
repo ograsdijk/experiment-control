@@ -322,9 +322,9 @@ export function SequencerModal({
                 )}
                 <Text size="xs" c="dimmed">
                   {progress.phase === "cleanup"
-                    ? `Cleanup after stop: ${progress.cleanupCompletedSteps ?? 0}/${
+                    ? `Cleanup: ${progress.cleanupCompletedSteps ?? 0}/${
                         progress.cleanupTotalSteps ?? "?"
-                      } steps | run stopped at ${completedSteps ?? 0}/${totalSteps ?? "?"}`
+                      } steps | run ended at ${completedSteps ?? 0}/${totalSteps ?? "?"}`
                     : totalSteps !== null
                       ? `${progress.scope === "loop" ? "Current loop" : "Progress"}: ${
                           completedSteps ?? 0
