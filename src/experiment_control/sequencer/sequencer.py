@@ -97,6 +97,14 @@ _SET_CONTEXT_DISPATCH_DEADLINE_S = _STREAM_CONTEXT_SET_RETRY_DEADLINE_S + 2.0
 _PARALLEL_MAX_WORKERS = 8
 
 
+def _rounded(value: Any, digits: int) -> Any:
+    # The ETA counts down continuously; round it for the progress-event
+    # change signature so events aren't emitted for sub-second drift.
+    if isinstance(value, float):
+        return round(value, digits)
+    return value
+
+
 def _effective_context_columns(
     declared: dict[str, str] | None,
 ) -> dict[str, str] | None:
@@ -719,7 +727,13 @@ class SequencerProcess(ManagedProcessBase):
             progress.get("percent"),
             progress.get("total_steps_known"),
             progress.get("estimate_reason"),
-            progress.get("eta_s"),
+            progress.get("approximate"),
+            _rounded(progress.get("eta_s"), 0),
+            _rounded(progress.get("time_percent"), 1),
+            progress.get("scope"),
+            progress.get("phase"),
+            progress.get("cleanup_completed_steps"),
+            progress.get("cleanup_total_steps"),
             progress.get("loop_mode"),
             progress.get("loops_completed"),
             progress.get("loops_target"),

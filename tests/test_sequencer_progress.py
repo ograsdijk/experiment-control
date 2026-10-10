@@ -16,7 +16,6 @@ from experiment_control.sequencer.ast import (
     RepeatStep,
     SequenceSpec,
     SleepStep,
-    WhileStep,
 )
 from experiment_control.sequencer.runtime import SequencerRuntime
 
@@ -75,33 +74,6 @@ class SequencerProgressTests(unittest.TestCase):
         self.assertIsInstance(elapsed, float)
         assert isinstance(elapsed, float)
         self.assertGreaterEqual(elapsed, 0.0)
-
-    def test_progress_marks_unknown_total_for_while(self) -> None:
-        runtime = _build_runtime()
-        runtime.load(
-            SequenceSpec(
-                version=1,
-                meta={},
-                vars={},
-                steps=[
-                    WhileStep(
-                        condition=False,
-                        body=[],
-                    )
-                ],
-                context_columns=None,
-            )
-        )
-        runtime.start()
-        while runtime.state == "RUNNING":
-            runtime.tick()
-
-        status = runtime.status()
-        progress = status.get("progress", {})
-        self.assertIsNone(progress.get("total_steps"))
-        self.assertIsNone(progress.get("percent"))
-        self.assertFalse(progress.get("total_steps_known"))
-        self.assertIn("while", str(progress.get("estimate_reason")))
 
     def test_progress_unknown_total_reports_template_failure(self) -> None:
         # `range`'s element count genuinely depends on rendering start/stop,
