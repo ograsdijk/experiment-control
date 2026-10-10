@@ -31,6 +31,7 @@ from .ast import (
 )
 from .eval import eval_condition, render_templates, to_attrdict
 from .progress import StepDurationStats
+from .run_events import RunEventLog
 from .ranges import generate_from_gen
 from .source_info import StepSourceInfo, step_kind, step_summary
 
@@ -349,6 +350,14 @@ def run_parallel_branch(
     return ParallelBranchResult(index=plan.index, ok=True, outputs=outputs)
 
 
+def _pause_info(reason: Any, source: Any, trigger: Any) -> dict[str, Any]:
+    return {
+        "reason": str(reason) if reason not in (None, "") else None,
+        "source": str(source) if source not in (None, "") else None,
+        "trigger": trigger if isinstance(trigger, dict) else None,
+    }
+
+
 class _EstimateUnknown(Exception):
     """Raised by the remaining-work walk when a step count cannot be known."""
 
@@ -499,6 +508,10 @@ class SequencerRuntime:
         self._pending_terminal_error: str | None = None
         self._cleanup_failed = False
         self._cleanup_errors: list[dict[str, Any]] = []
+        self._run_events = RunEventLog()
+        # Who paused and why, while PAUSED (and the pending request before).
+        self._pause_info: dict[str, Any] | None = None
+        self._pause_request_info: dict[str, Any] | None = None
         self._sleep_until: float | None = None
         self._wait_state: _WaitState | None = None
         self._set_context_state: Any = None
@@ -744,18 +757,52 @@ class SequencerRuntime:
         now = time.monotonic()
         self._run_started_mono = now
         self._run_ended_mono = None
+        self._run_events.reset()
+        self._pause_info = None
+        self._pause_request_info = None
         self._state = "RUNNING"
 
-    def request_pause(self) -> None:
+    def request_pause(
+        self,
+        *,
+        reason: str | None = None,
+        source: str | None = None,
+        trigger: Any = None,
+    ) -> None:
+        """Pause at the next interruptible point; `reason`/`source`/`trigger`
+        (e.g. the watchdog rule that tripped) are kept and shown with it."""
+        if self._pause_request_info is None or not self._pause_requested:
+            self._pause_request_info = _pause_info(reason, source, trigger)
         self._pause_requested = True
 
-    def resume(self) -> None:
+    def resume(self, *, source: str | None = None) -> None:
         if self._state == "PAUSED":
-            self._mark_pause_ended(time.monotonic())
+            now = time.monotonic()
+            paused_s = (
+                max(0.0, now - self._paused_started_mono)
+                if self._paused_started_mono is not None
+                else None
+            )
+            self._mark_pause_ended(now)
             self._pause_requested = False
             self._state = "RUNNING"
+            self._record_event(
+                "info",
+                "resume",
+                "Resumed" + (f" after {paused_s:.0f} s" if paused_s is not None else ""),
+                source=source,
+            )
+            self._pause_info = None
+            self._pause_request_info = None
 
-    def request_stop(self) -> None:
+    def request_stop(self, *, reason: str | None = None, source: str | None = None) -> None:
+        if self._state in {"RUNNING", "PAUSED"} and not self._stop_requested:
+            self._record_event(
+                "info",
+                "stop",
+                "Stop requested" + (f": {reason}" if reason else ""),
+                source=source,
+            )
         self._stop_requested = True
         if self._state == "PAUSED":
             # tick() only runs while _state == "RUNNING", so a stop requested
@@ -769,6 +816,7 @@ class SequencerRuntime:
     def fail(self, reason: str) -> None:
         if self._state not in {"RUNNING", "PAUSED"}:
             return
+        self._record_event("error", "external_fault", str(reason or "external fault"))
         now = time.monotonic()
         self._mark_pause_ended(now)
         self._pause_requested = False
@@ -810,6 +858,10 @@ class SequencerRuntime:
             "last_context_id": int(self._context_id),
             "next_context_id": int(self._context_id + 1),
             "progress": self._progress_snapshot(time.monotonic()),
+            "pause": dict(self._pause_info)
+            if self._state == "PAUSED" and self._pause_info
+            else None,
+            "run_events": self._run_events.summary(),
             "loaded_adaptive_ids": self._adaptive_step_ids(),
             "adaptive_studies": self._adaptive_studies_snapshot(),
         }
@@ -1070,6 +1122,7 @@ class SequencerRuntime:
         if self._pause_requested and self._interruptible():
             self._mark_pause_started(time.monotonic())
             self._state = "PAUSED"
+            self._enter_pause(self._pause_request_info or _pause_info(None, None, None))
             return True
         return False
 
@@ -1080,12 +1133,14 @@ class SequencerRuntime:
             return True
         detail = self._make_error_detail(message)
         self._last_error_detail = detail
+        self._record_event("error", "step_failed", message, step=detail.get("step"))
         return self._begin_terminal_unwind("ERROR", message)
 
     def _note_cleanup_failure(self, message: str) -> None:
         self._cleanup_failed = True
         detail = self._make_error_detail(str(message))
         self._cleanup_errors.append(detail)
+        self._record_event("error", "cleanup_failed", str(message), step=detail.get("step"))
         cleanup_message = f"cleanup failed: {message}"
         if self._last_error_detail is not None:
             self._last_error_detail["cleanup_errors"] = list(self._cleanup_errors)
@@ -1192,6 +1247,50 @@ class SequencerRuntime:
         self._loop_started_completed = self._completed_steps
         self._loop_started_elapsed_s = self._elapsed_run_s(time.monotonic())
         self._work_dirty = True
+
+    def run_events(self) -> dict[str, Any]:
+        """All events of the current (or last) run."""
+        return {"run_id": int(self._run_id), **self._run_events.snapshot()}
+
+    def note_external_log(self, *, severity: str, message: str, source: str | None) -> None:
+        """A warning another process logged while this run was going. Tied to
+        the step running at the time, which may not be what caused it."""
+        if self._state not in {"RUNNING", "PAUSED"}:
+            return
+        self._record_event(severity, "log", message, source=source)
+
+    def _record_event(
+        self,
+        severity: str,
+        kind: str,
+        message: str,
+        *,
+        step: Any = None,
+        source: str | None = None,
+        trigger: Any = None,
+    ) -> None:
+        self._run_events.record(
+            severity=severity,
+            kind=kind,
+            message=message,
+            elapsed_s=self._elapsed_run_s(time.monotonic()),
+            step=step if step is not None else self._current_step_detail,
+            source=source,
+            trigger=trigger,
+        )
+
+    def _enter_pause(self, info: dict[str, Any]) -> None:
+        self._pause_info = {**info, "elapsed_s": self._elapsed_run_s(time.monotonic())}
+        self._pause_request_info = None
+        source = info.get("source") or "unknown"
+        reason = info.get("reason")
+        self._record_event(
+            "info" if source in {"operator", "sequence"} else "warning",
+            "pause",
+            f"Paused by {source}" + (f": {reason}" if reason else ""),
+            source=source,
+            trigger=info.get("trigger"),
+        )
 
     def _reset_progress(self) -> None:
         self._completed_steps = 0
@@ -2309,6 +2408,7 @@ class SequencerRuntime:
             self._note_cleanup_failure(str(message))
             return True
         self._last_error_detail = detail
+        self._record_event("error", "step_failed", str(message), step=detail.get("step"))
         if self._begin_terminal_unwind("ERROR", str(message)):
             return True
         self._last_error = str(message)
@@ -2435,10 +2535,11 @@ class SequencerRuntime:
         return True
 
     def _execute_pause_step(self, step: PauseStep) -> bool:
-        del step
+        reason = render_templates(step.reason, self._env_view()) if step.reason else None
         self._pause_requested = True
         self._mark_pause_started(time.monotonic())
         self._state = "PAUSED"
+        self._enter_pause(_pause_info(reason, "sequence", None))
         return True
 
     def _execute_sleep_step(self, step: SleepStep) -> bool:

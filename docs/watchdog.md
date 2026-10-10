@@ -196,6 +196,14 @@ A `process` action wraps the verb in the manager's process-RPC envelope:
 }
 ```
 
+For `sequencer.pause` and `sequencer.stop` the watchdog adds the trip
+context to the params, so the sequencer can show who paused it and why:
+`reason` (the rule's `message`, or "watchdog rule 'name' tripped"),
+`source: watchdog`, and `trigger` (`watchdog_id`, `rule`, `severity`,
+`trip_id`, the same id as the `manager.watchdog.action_*` events). Values set
+in the rule's `params` take precedence, e.g. a pause-specific `reason`. Other
+process actions get their `params` unchanged.
+
 A failed attempt that still has retries remaining is published as
 `manager.watchdog.action_retry`. Only an exhausted action is published as
 `manager.watchdog.action_failed`; it does **not** block the remaining actions in

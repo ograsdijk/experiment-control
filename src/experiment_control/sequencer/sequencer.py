@@ -3063,9 +3063,33 @@ class SequencerProcess(ManagedProcessBase):
                 ],
                 doc="Start the loaded sequence.",
             ),
-            method("sequencer.pause", params=None, doc="Pause sequence execution."),
-            method("sequencer.resume", params=None, doc="Resume sequence execution."),
-            method("sequencer.stop", params=None, doc="Stop sequence execution."),
+            method(
+                "sequencer.pause",
+                params=[
+                    param("reason", required=False, default=None, annotation="str"),
+                    param("source", required=False, default=None, annotation="str"),
+                    param("trigger", required=False, default=None, annotation="dict"),
+                ],
+                doc="Pause sequence execution. reason/source/trigger say who paused and why.",
+            ),
+            method(
+                "sequencer.resume",
+                params=[param("source", required=False, default=None, annotation="str")],
+                doc="Resume sequence execution.",
+            ),
+            method(
+                "sequencer.stop",
+                params=[
+                    param("reason", required=False, default=None, annotation="str"),
+                    param("source", required=False, default=None, annotation="str"),
+                ],
+                doc="Stop sequence execution.",
+            ),
+            method(
+                "sequencer.run_events",
+                params=None,
+                doc="Events of the current or last run (pauses, failures, warnings) with their steps.",
+            ),
             method("sequencer.status", params=None, doc="Get sequencer status."),
             method(
                 "sequencer.library.list",
@@ -3650,9 +3674,20 @@ class SequencerProcess(ManagedProcessBase):
         )
         return self.rpc_ok(req, result={"status": "running"})
 
+    @staticmethod
+    def _control_params(req: Json) -> Json:
+        """Optional `reason`/`source`/`trigger` on pause/resume/stop."""
+        params = req.get("params") or {}
+        return params if isinstance(params, dict) else {}
+
     def _rpc_sequencer_pause(self, req: Json) -> Json:
+        params = self._control_params(req)
         try:
-            self._runtime.request_pause()
+            self._runtime.request_pause(
+                reason=params.get("reason"),
+                source=params.get("source") or "rpc",
+                trigger=params.get("trigger"),
+            )
         except Exception as e:
             self._publish_lifecycle_event(
                 event="pause",
@@ -3670,8 +3705,9 @@ class SequencerProcess(ManagedProcessBase):
         return self.rpc_ok(req, result={"status": "pause_requested"})
 
     def _rpc_sequencer_resume(self, req: Json) -> Json:
+        params = self._control_params(req)
         try:
-            self._runtime.resume()
+            self._runtime.resume(source=params.get("source") or "rpc")
         except Exception as e:
             self._publish_lifecycle_event(
                 event="resume",
@@ -3689,8 +3725,12 @@ class SequencerProcess(ManagedProcessBase):
         return self.rpc_ok(req, result={"status": "running"})
 
     def _rpc_sequencer_stop(self, req: Json) -> Json:
+        params = self._control_params(req)
         try:
-            self._runtime.request_stop()
+            self._runtime.request_stop(
+                reason=params.get("reason"),
+                source=params.get("source") or "rpc",
+            )
         except Exception as e:
             self._publish_lifecycle_event(
                 event="stop",
@@ -3706,6 +3746,9 @@ class SequencerProcess(ManagedProcessBase):
             message="stop requested",
         )
         return self.rpc_ok(req, result={"status": "stop_requested"})
+
+    def _rpc_sequencer_run_events(self, req: Json) -> Json:
+        return self.rpc_ok(req, result=self._runtime.run_events())
 
     def _build_rpc_registry(self) -> RpcDispatchRegistry:
         handlers = {
@@ -3725,6 +3768,7 @@ class SequencerProcess(ManagedProcessBase):
             "sequencer.pause": self._rpc_sequencer_pause,
             "sequencer.resume": self._rpc_sequencer_resume,
             "sequencer.stop": self._rpc_sequencer_stop,
+            "sequencer.run_events": self._rpc_sequencer_run_events,
         }
         return RpcDispatchRegistry(
             handlers=handlers,
@@ -3840,6 +3884,7 @@ class SequencerProcess(ManagedProcessBase):
                 continue
             should_fail, reason = _should_trigger_external_sequencer_fault(payload)
             if not should_fail or not reason:
+                self._note_external_warning(payload)
                 continue
             self._runtime.fail(reason)
             self._publish_lifecycle_event(
@@ -3862,6 +3907,25 @@ class SequencerProcess(ManagedProcessBase):
             )
             self._last_error_sent = True
             break
+
+    def _note_external_warning(self, payload: Json) -> None:
+        """Keep another source's warning/error in the run's event log; it did
+        not stop the run. Our own logs are skipped."""
+        severity = _normalize_log_severity(payload.get("severity"))
+        if severity not in _EXTERNAL_FAULT_SEVERITIES:
+            return
+        source_id = str(payload.get("source_id") or payload.get("process_id") or "").strip()
+        if not source_id or source_id == self._process_id:
+            return
+        source_kind = str(payload.get("source_kind") or "").strip() or "process"
+        message = str(payload.get("message") or payload.get("topic") or "").strip()
+        if not message:
+            return
+        self._runtime.note_external_log(
+            severity="error" if severity == "critical" else severity,
+            message=message,
+            source=f"{source_kind}:{source_id}",
+        )
 
     def _drain_analysis_outputs(self, events: dict[Any, int]) -> None:
         if not (int(events.get(self._analysis_sub, 0)) & zmq.POLLIN):

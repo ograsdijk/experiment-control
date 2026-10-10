@@ -563,11 +563,21 @@ Request:
 - `{"type": "sequencer.start"}`
 - `{"type": "sequencer.start", "params": {"sequence_id": "main", "repeat_count": 5, "continuous": false, "vars_override": {"port": 3}, "adaptive": {"scan_1": {"mode": "warm_start"}}}}`
 - `{"type": "sequencer.pause"}`
-- `{"type": "sequencer.resume"}`
-- `{"type": "sequencer.stop"}`
+- `{"type": "sequencer.pause", "params": {"reason": "Detection 1 lock dropped", "source": "watchdog", "trigger": {"watchdog_id": "linien_detection-1_lock", "rule": "detection-1_lock_fault", "severity": "critical", "trip_id": "..."}}}`
+- `{"type": "sequencer.resume", "params": {"source": "operator"}}`
+- `{"type": "sequencer.stop", "params": {"reason": "...", "source": "operator"}}`
 
 Response:
 - `{"ok": true, "result": {"status": "running" | "pause_requested" | "stop_requested"}}`
+- `reason`, `source` and `trigger` are optional and only describe the request: they are shown with the pause (`status.pause`) and recorded in the run's events. `source` defaults to `"rpc"`; the UI sends `"operator"`, the watchdog `"watchdog"` (see `docs/watchdog.md`), and a `pause:` step pauses with source `"sequence"` and its own `reason`.
+
+### `sequencer.run_events`
+Request:
+- `{"type": "sequencer.run_events"}`
+
+Response:
+- `{"ok": true, "result": {"run_id": 7, "seq": 42, "dropped": 0, "events": [{"severity": "warning", "kind": "pause", "message": "Paused by watchdog: Detection 1 lock dropped", "source": "watchdog", "trigger": {...}, "step": {"kind": "call", "summary": "...", "path": "steps[0].try.do[3]", "line": 92, "branch": null}, "elapsed_s": 81.2, "last_elapsed_s": 81.2, "count": 1}]}}`
+- Events of the current (or last) run, oldest first: `pause`, `resume`, `stop`, `step_failed`, `cleanup_failed`, `external_fault`, and `log` (a warning/error another process logged while the run was going; its `step` is the step running at the time, not necessarily the cause). Consecutive repeats are counted in `count`; at most 200 are kept (`dropped` counts the rest). Cleared when a run starts. `seq` changes whenever the list does; `sequencer.status.run_events.seq` tells pollers when to refetch.
 
 ### `sequencer.library.list`
 Request:
@@ -597,7 +607,8 @@ Request:
 - `{"type": "sequencer.status"}`
 
 Response:
-- `{"ok": true, "result": {"run_id": 7, "state": "...", "current_step": "...", "loop_mode": "once" | "repeat" | "continuous", "loops_completed": 2, "loops_target": 5 | null, "vars": {...}, "vars_override": {...}, "env": {...}, "error": null, "loaded": true, "active_sequence_id": "main" | null, "loaded_source": "...", "loaded_source_kind": "rpc" | "library" | "autoload_path" | null, "context_columns": {...} | null, "sequence_library_configured": true | false, "sequence_library_path": "..." | null, "sequence_library_error": "..." | null, "sequence_library_warnings": [...], "progress": {"run_id": 7, "elapsed_s": 12.3, "completed_steps": 42, "total_steps": 100 | null, "total_steps_known": true, "estimate_reason": "..." | null, "approximate": false, "percent": 42.0 | null, "time_percent": 38.5 | null, "eta_s": 19.6 | null, "eta_wall_ts": 1700000000.0 | null, "scope": "run" | "loop", "phase": "run" | "cleanup", "cleanup_completed_steps": 1 | null, "cleanup_total_steps": 3 | null, "current_step_elapsed_s": 0.2 | null, "loop_mode": "repeat", "loops_completed": 2, "loops_target": 5}}}`
+- `{"ok": true, "result": {"run_id": 7, "state": "...", "current_step": "...", "loop_mode": "once" | "repeat" | "continuous", "loops_completed": 2, "loops_target": 5 | null, "vars": {...}, "vars_override": {...}, "env": {...}, "error": null, "loaded": true, "active_sequence_id": "main" | null, "loaded_source": "...", "loaded_source_kind": "rpc" | "library" | "autoload_path" | null, "context_columns": {...} | null, "sequence_library_configured": true | false, "sequence_library_path": "..." | null, "sequence_library_error": "..." | null, "sequence_library_warnings": [...], "progress": {"run_id": 7, "elapsed_s": 12.3, "completed_steps": 42, "total_steps": 100 | null, "total_steps_known": true, "estimate_reason": "..." | null, "approximate": false, "percent": 42.0 | null, "time_percent": 38.5 | null, "eta_s": 19.6 | null, "eta_wall_ts": 1700000000.0 | null, "scope": "run" | "loop", "phase": "run" | "cleanup", "cleanup_completed_steps": 1 | null, "cleanup_total_steps": 3 | null, "current_step_elapsed_s": 0.2 | null, "loop_mode": "repeat", "loops_completed": 2, "loops_target": 5}, "pause": {"reason": "..." | null, "source": "watchdog" | "operator" | "sequence" | "rpc" | null, "trigger": {...} | null, "elapsed_s": 81.2} | null, "run_events": {"seq": 42, "count": 3, "dropped": 0, "errors": 1, "warnings": 1, "latest": [...]}}}`
+- `pause` is set while PAUSED: who paused and why (see `sequencer.pause`). `run_events` summarizes `sequencer.run_events`; refetch that when `seq` changes.
 - `progress` is re-estimated during the run from the live execution stack (at most once a second), so loops over values assigned earlier in the run get a total once that value exists. Plain `assign` steps are replayed by the estimate; values that come from calls, `wait_until` samples, or an earlier iteration of an enclosing loop are treated as not yet known. `total_steps` is `null` with `estimate_reason` only when it cannot be counted (an unrenderable `for`, an `adaptive` step). `approximate: true` means the count or time rests on such a not-yet-known value or an assumption, described by `estimate_reason`: a `while` loop that will run (or might) is assumed to run once, the current one to end after its current iteration, an `if` that cannot be decided counts its longer branch (by estimated time), and a loop over thousands of items whose body depends on the item may be scaled from the first items walked.
 - `eta_s` sums, over every remaining step execution, that step's mean measured duration (each duration runs from the previous step's finish, so gaps between steps are included). Sleeps use their rendered seconds plus the measured mean overhead of a sleep; other unseen steps fall back to the mean of their kind. It counts down during the in-flight step, is `null` until five steps have finished, and excludes paused time. `time_percent` is `elapsed_s / (elapsed_s + eta_s)` and keeps its last value once a run is stopped; `percent` is step-based. `eta_wall_ts` is the expected wall-clock finish on the sequencer host (`null` unless running).
 - With `repeat_count > 1`, later loops are assumed to match the current one. In continuous mode `scope` is `"loop"` and the counts, percentages and ETA describe the current loop.
