@@ -8,7 +8,6 @@ import {
   Select,
   Stack,
   Text,
-  TextInput,
 } from "@mantine/core";
 import {
   IconChevronDown,
@@ -31,6 +30,7 @@ import {
 } from "../condition_ast";
 import type { SequencerOutlineMetadataEntry } from "../types";
 import { KeyValueChipList } from "./KeyValueChipList";
+import { SeqTextInput } from "./SeqTextInput";
 
 type ConditionTemplate = {
   id: string;
@@ -308,25 +308,25 @@ function ConditionNodeEditor({
 
         {!collapsed && node.kind === "compare" ? (
           <>
-            <TextInput
+            <SeqTextInput
               size="xs"
               label={node.op === "abs_lt" ? "Value expression" : "Left expression"}
               value={node.left}
-              onChange={(event) =>
+              onChange={(value) =>
                 onChange({
                   ...node,
-                  left: event.currentTarget.value,
+                  left: value,
                 })
               }
             />
-            <TextInput
+            <SeqTextInput
               size="xs"
               label={node.op === "abs_lt" ? "Tolerance" : "Right expression"}
               value={node.right}
-              onChange={(event) =>
+              onChange={(value) =>
                 onChange({
                   ...node,
-                  right: event.currentTarget.value,
+                  right: value,
                 })
               }
             />

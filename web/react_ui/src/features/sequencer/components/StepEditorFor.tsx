@@ -9,7 +9,6 @@ import {
   Stack,
   Switch,
   Text,
-  TextInput,
 } from "@mantine/core";
 import { IconChevronDown, IconPlus, IconTrash } from "@tabler/icons-react";
 import { useEffect, useState } from "react";
@@ -45,6 +44,7 @@ import {
 } from "../editor_helpers";
 import type { SequencerOutlineMetadataEntry, SequencerStepOutlineNode } from "../types";
 import { useStepDraftSync } from "../useStepDraftSync";
+import { SeqTextInput } from "./SeqTextInput";
 
 type Props = {
   node: SequencerStepOutlineNode;
@@ -278,16 +278,16 @@ export function ForStepEditor({ node, yamlText, onYamlTextChange }: Props) {
                       comboboxProps={{ withinPortal: false }}
                     />
                   ) : (
-                    <TextInput
+                    <SeqTextInput
                       size="xs"
                       aria-label="Bind source"
                       placeholder="source"
                       variant="unstyled"
                       value={entry.name}
-                      onChange={(event) => {
+                      onChange={(value) => {
                         const next = bind.map((item, itemIndex) =>
                           itemIndex === index
-                            ? { ...item, name: event.currentTarget.value }
+                            ? { ...item, name: value }
                             : item
                         );
                         updateFor(
@@ -303,16 +303,16 @@ export function ForStepEditor({ node, yamlText, onYamlTextChange }: Props) {
                   )}
                   </div>
                   <div className="sequencer-var-segment sequencer-var-value">
-                  <TextInput
+                  <SeqTextInput
                     size="xs"
                     aria-label="Bind target"
                     placeholder="target"
                     variant="unstyled"
                     value={renderValue(entry.value)}
-                    onChange={(event) => {
+                    onChange={(value) => {
                       const next = bind.map((item, itemIndex) =>
                         itemIndex === index
-                          ? { ...item, value: event.currentTarget.value }
+                          ? { ...item, value: value }
                           : item
                       );
                       updateFor(
@@ -400,17 +400,17 @@ export function ForStepEditor({ node, yamlText, onYamlTextChange }: Props) {
         />
         {sourceMode === "direct" ? (
           <>
-            <TextInput
+            <SeqTextInput
               size="xs"
               label="Iterable expression"
               value={directValue}
               error={directValueError ? "Iterable expression is required." : undefined}
-              onChange={(event) =>
+              onChange={(value) =>
                 updateFor(
                   bind,
                   sourceMode,
                   iterableKind,
-                  event.currentTarget.value,
+                  value,
                   [],
                   []
                 )
@@ -491,11 +491,11 @@ export function ForStepEditor({ node, yamlText, onYamlTextChange }: Props) {
                   />
                 </Group>
                 <Group grow align="flex-end">
-                  <TextInput
+                  <SeqTextInput
                     size="xs"
                     label="Seed"
                     value={modifierValue(generatorModifiers, "seed")}
-                    onChange={(event) =>
+                    onChange={(value) =>
                       updateFor(
                         bind,
                         sourceMode,
@@ -504,17 +504,17 @@ export function ForStepEditor({ node, yamlText, onYamlTextChange }: Props) {
                         setModifierValue(
                           generatorModifiers,
                           "seed",
-                          event.currentTarget.value
+                          value
                         ),
                         iterableConfig
                       )
                     }
                   />
-                  <TextInput
+                  <SeqTextInput
                     size="xs"
                     label="Offset"
                     value={modifierValue(generatorModifiers, "offset")}
-                    onChange={(event) =>
+                    onChange={(value) =>
                       updateFor(
                         bind,
                         sourceMode,
@@ -523,7 +523,7 @@ export function ForStepEditor({ node, yamlText, onYamlTextChange }: Props) {
                         setModifierValue(
                           generatorModifiers,
                           "offset",
-                          event.currentTarget.value
+                          value
                         ),
                         iterableConfig
                       )
@@ -540,20 +540,20 @@ export function ForStepEditor({ node, yamlText, onYamlTextChange }: Props) {
             {scalarFieldNames ? (
               <Stack gap={6}>
                 {scalarFieldNames.map((fieldName) => (
-                  <TextInput
+                  <SeqTextInput
                     key={fieldName}
                     size="xs"
                     label={fieldName}
                     value={valueByKey(iterableConfig, fieldName)}
                     error={scalarFieldError(fieldName, valueByKey(iterableConfig, fieldName))}
-                    onChange={(event) =>
+                    onChange={(value) =>
                       updateFor(
                         bind,
                         sourceMode,
                         iterableKind,
                         directValue,
                         generatorModifiers,
-                        setEntryValue(iterableConfig, fieldName, event.currentTarget.value)
+                        setEntryValue(iterableConfig, fieldName, value)
                       )
                     }
                   />
@@ -592,16 +592,16 @@ export function ForStepEditor({ node, yamlText, onYamlTextChange }: Props) {
                     {iterableConfig.map((entry, index) => (
                       <div key={`${entry.name}:${index}`} className="sequencer-var-chip">
                         <div className="sequencer-var-segment sequencer-var-value">
-                          <TextInput
+                          <SeqTextInput
                             size="xs"
                             aria-label="Iterable value"
                             placeholder="value"
                             variant="unstyled"
                             value={renderValue(entry.value)}
-                            onChange={(event) => {
+                            onChange={(value) => {
                               const next = iterableConfig.map((item, itemIndex) =>
                                 itemIndex === index
-                                  ? { ...item, value: event.currentTarget.value }
+                                  ? { ...item, value: value }
                                   : item
                               );
                               updateFor(
@@ -681,69 +681,69 @@ export function ForStepEditor({ node, yamlText, onYamlTextChange }: Props) {
                 {scan2dForm === "shorthand" ? (
                   <>
                     <Group grow align="flex-end">
-                      <TextInput
+                      <SeqTextInput
                         size="xs"
                         label="Center x"
                           value={valueByKey(iterableConfig, "center.x")}
                         error={scalarFieldError("center.x", valueByKey(iterableConfig, "center.x"))}
-                        onChange={(event) =>
+                        onChange={(value) =>
                           updateFor(
                             bind,
                             sourceMode,
                             iterableKind,
                             directValue,
                             generatorModifiers,
-                            setEntryValue(iterableConfig, "center.x", event.currentTarget.value)
+                            setEntryValue(iterableConfig, "center.x", value)
                           )
                         }
                       />
-                      <TextInput
+                      <SeqTextInput
                         size="xs"
                         label="Center y"
                           value={valueByKey(iterableConfig, "center.y")}
                         error={scalarFieldError("center.y", valueByKey(iterableConfig, "center.y"))}
-                        onChange={(event) =>
+                        onChange={(value) =>
                           updateFor(
                             bind,
                             sourceMode,
                             iterableKind,
                             directValue,
                             generatorModifiers,
-                            setEntryValue(iterableConfig, "center.y", event.currentTarget.value)
+                            setEntryValue(iterableConfig, "center.y", value)
                           )
                         }
                       />
                     </Group>
                     <Group grow align="flex-end">
-                      <TextInput
+                      <SeqTextInput
                         size="xs"
                         label="Width"
                         value={valueByKey(iterableConfig, "width")}
                         error={scalarFieldError("width", valueByKey(iterableConfig, "width"))}
-                        onChange={(event) =>
+                        onChange={(value) =>
                           updateFor(
                             bind,
                             sourceMode,
                             iterableKind,
                             directValue,
                             generatorModifiers,
-                            setEntryValue(iterableConfig, "width", event.currentTarget.value)
+                            setEntryValue(iterableConfig, "width", value)
                           )
                         }
                       />
-                      <TextInput
+                      <SeqTextInput
                         size="xs"
                         label="Height"
                         value={valueByKey(iterableConfig, "height")}
                         error={scalarFieldError("height", valueByKey(iterableConfig, "height"))}
-                        onChange={(event) =>
+                        onChange={(value) =>
                           updateFor(
                             bind,
                             sourceMode,
                             iterableKind,
                             directValue,
                             generatorModifiers,
-                            setEntryValue(iterableConfig, "height", event.currentTarget.value)
+                            setEntryValue(iterableConfig, "height", value)
                           )
                         }
                       />
@@ -776,7 +776,7 @@ export function ForStepEditor({ node, yamlText, onYamlTextChange }: Props) {
                       }}
                     />
                     <Group grow align="flex-end">
-                      <TextInput
+                      <SeqTextInput
                         size="xs"
                         label={scan2dResolutionMode === "pitch" ? "Pitch x" : "Steps x"}
                         value={valueByKey(
@@ -790,7 +790,7 @@ export function ForStepEditor({ node, yamlText, onYamlTextChange }: Props) {
                             scan2dResolutionMode === "pitch" ? "pitch.x" : "steps.x"
                           )
                         )}
-                        onChange={(event) =>
+                        onChange={(value) =>
                           updateFor(
                             bind,
                             sourceMode,
@@ -800,12 +800,12 @@ export function ForStepEditor({ node, yamlText, onYamlTextChange }: Props) {
                             setEntryValue(
                               iterableConfig,
                               scan2dResolutionMode === "pitch" ? "pitch.x" : "steps.x",
-                              event.currentTarget.value
+                              value
                             )
                           )
                         }
                       />
-                      <TextInput
+                      <SeqTextInput
                         size="xs"
                         label={scan2dResolutionMode === "pitch" ? "Pitch y" : "Steps y"}
                         value={valueByKey(
@@ -819,7 +819,7 @@ export function ForStepEditor({ node, yamlText, onYamlTextChange }: Props) {
                             scan2dResolutionMode === "pitch" ? "pitch.y" : "steps.y"
                           )
                         )}
-                        onChange={(event) =>
+                        onChange={(value) =>
                           updateFor(
                             bind,
                             sourceMode,
@@ -829,7 +829,7 @@ export function ForStepEditor({ node, yamlText, onYamlTextChange }: Props) {
                             setEntryValue(
                               iterableConfig,
                               scan2dResolutionMode === "pitch" ? "pitch.y" : "steps.y",
-                              event.currentTarget.value
+                              value
                             )
                           )
                         }
@@ -839,14 +839,14 @@ export function ForStepEditor({ node, yamlText, onYamlTextChange }: Props) {
                 ) : (
                   <>
                     <Group grow align="flex-end">
-                      <TextInput size="xs" label="x start" value={valueByKey(iterableConfig, "x.linspace.start")} error={scalarFieldError("x.linspace.start", valueByKey(iterableConfig, "x.linspace.start"))} onChange={(event) => updateFor(bind, sourceMode, iterableKind, directValue, generatorModifiers, setEntryValue(iterableConfig, "x.linspace.start", event.currentTarget.value))} />
-                      <TextInput size="xs" label="x stop" value={valueByKey(iterableConfig, "x.linspace.stop")} error={scalarFieldError("x.linspace.stop", valueByKey(iterableConfig, "x.linspace.stop"))} onChange={(event) => updateFor(bind, sourceMode, iterableKind, directValue, generatorModifiers, setEntryValue(iterableConfig, "x.linspace.stop", event.currentTarget.value))} />
-                      <TextInput size="xs" label="x num" value={valueByKey(iterableConfig, "x.linspace.num")} error={scalarFieldError("x.linspace.num", valueByKey(iterableConfig, "x.linspace.num"))} onChange={(event) => updateFor(bind, sourceMode, iterableKind, directValue, generatorModifiers, setEntryValue(iterableConfig, "x.linspace.num", event.currentTarget.value))} />
+                      <SeqTextInput size="xs" label="x start" value={valueByKey(iterableConfig, "x.linspace.start")} error={scalarFieldError("x.linspace.start", valueByKey(iterableConfig, "x.linspace.start"))} onChange={(value) => updateFor(bind, sourceMode, iterableKind, directValue, generatorModifiers, setEntryValue(iterableConfig, "x.linspace.start", value))} />
+                      <SeqTextInput size="xs" label="x stop" value={valueByKey(iterableConfig, "x.linspace.stop")} error={scalarFieldError("x.linspace.stop", valueByKey(iterableConfig, "x.linspace.stop"))} onChange={(value) => updateFor(bind, sourceMode, iterableKind, directValue, generatorModifiers, setEntryValue(iterableConfig, "x.linspace.stop", value))} />
+                      <SeqTextInput size="xs" label="x num" value={valueByKey(iterableConfig, "x.linspace.num")} error={scalarFieldError("x.linspace.num", valueByKey(iterableConfig, "x.linspace.num"))} onChange={(value) => updateFor(bind, sourceMode, iterableKind, directValue, generatorModifiers, setEntryValue(iterableConfig, "x.linspace.num", value))} />
                     </Group>
                     <Group grow align="flex-end">
-                      <TextInput size="xs" label="y start" value={valueByKey(iterableConfig, "y.linspace.start")} error={scalarFieldError("y.linspace.start", valueByKey(iterableConfig, "y.linspace.start"))} onChange={(event) => updateFor(bind, sourceMode, iterableKind, directValue, generatorModifiers, setEntryValue(iterableConfig, "y.linspace.start", event.currentTarget.value))} />
-                      <TextInput size="xs" label="y stop" value={valueByKey(iterableConfig, "y.linspace.stop")} error={scalarFieldError("y.linspace.stop", valueByKey(iterableConfig, "y.linspace.stop"))} onChange={(event) => updateFor(bind, sourceMode, iterableKind, directValue, generatorModifiers, setEntryValue(iterableConfig, "y.linspace.stop", event.currentTarget.value))} />
-                      <TextInput size="xs" label="y num" value={valueByKey(iterableConfig, "y.linspace.num")} error={scalarFieldError("y.linspace.num", valueByKey(iterableConfig, "y.linspace.num"))} onChange={(event) => updateFor(bind, sourceMode, iterableKind, directValue, generatorModifiers, setEntryValue(iterableConfig, "y.linspace.num", event.currentTarget.value))} />
+                      <SeqTextInput size="xs" label="y start" value={valueByKey(iterableConfig, "y.linspace.start")} error={scalarFieldError("y.linspace.start", valueByKey(iterableConfig, "y.linspace.start"))} onChange={(value) => updateFor(bind, sourceMode, iterableKind, directValue, generatorModifiers, setEntryValue(iterableConfig, "y.linspace.start", value))} />
+                      <SeqTextInput size="xs" label="y stop" value={valueByKey(iterableConfig, "y.linspace.stop")} error={scalarFieldError("y.linspace.stop", valueByKey(iterableConfig, "y.linspace.stop"))} onChange={(value) => updateFor(bind, sourceMode, iterableKind, directValue, generatorModifiers, setEntryValue(iterableConfig, "y.linspace.stop", value))} />
+                      <SeqTextInput size="xs" label="y num" value={valueByKey(iterableConfig, "y.linspace.num")} error={scalarFieldError("y.linspace.num", valueByKey(iterableConfig, "y.linspace.num"))} onChange={(value) => updateFor(bind, sourceMode, iterableKind, directValue, generatorModifiers, setEntryValue(iterableConfig, "y.linspace.num", value))} />
                     </Group>
                   </>
                 )}
@@ -855,7 +855,7 @@ export function ForStepEditor({ node, yamlText, onYamlTextChange }: Props) {
                   <Select size="xs" label="Order" data={SCAN2D_ORDER_OPTIONS.map((option) => ({ value: option.value, label: option.label }))} value={scan2dOrder} allowDeselect={false} searchable={false} comboboxProps={{ withinPortal: false }} onChange={(value) => updateFor(bind, sourceMode, iterableKind, directValue, generatorModifiers, setEntryValue(iterableConfig, "order", value ?? "row_major"))} />
                 </Group>
                 {scan2dPattern === "random" ? (
-                  <TextInput size="xs" label="Seed" value={valueByKey(iterableConfig, "seed")} onChange={(event) => updateFor(bind, sourceMode, iterableKind, directValue, generatorModifiers, event.currentTarget.value.trim() ? setEntryValue(iterableConfig, "seed", event.currentTarget.value) : removeEntry(iterableConfig, "seed"))} />
+                  <SeqTextInput size="xs" label="Seed" value={valueByKey(iterableConfig, "seed")} onChange={(value) => updateFor(bind, sourceMode, iterableKind, directValue, generatorModifiers, value.trim() ? setEntryValue(iterableConfig, "seed", value) : removeEntry(iterableConfig, "seed"))} />
                 ) : null}
                 <Text size="xs" c="dimmed">
                   scan2d uses its own pattern and order; scalar modifiers do not apply.
@@ -880,10 +880,10 @@ export function ForStepEditor({ node, yamlText, onYamlTextChange }: Props) {
                     {iterableConfig.map((entry, index) => (
                       <div key={`${entry.name}:${index}`} className="sequencer-var-chip">
                         <div className="sequencer-var-segment sequencer-var-name">
-                          <TextInput size="xs" aria-label="Iterable config key" placeholder="key" variant="unstyled" value={entry.name} onChange={(event) => { const next = iterableConfig.map((item, itemIndex) => itemIndex === index ? { ...item, name: event.currentTarget.value } : item); updateFor(bind, sourceMode, iterableKind, directValue, generatorModifiers, next); }} />
+                          <SeqTextInput size="xs" aria-label="Iterable config key" placeholder="key" variant="unstyled" value={entry.name} onChange={(value) => { const next = iterableConfig.map((item, itemIndex) => itemIndex === index ? { ...item, name: value } : item); updateFor(bind, sourceMode, iterableKind, directValue, generatorModifiers, next); }} />
                         </div>
                         <div className="sequencer-var-segment sequencer-var-value">
-                          <TextInput size="xs" aria-label="Iterable config value" placeholder="value" variant="unstyled" value={renderValue(entry.value)} onChange={(event) => { const next = iterableConfig.map((item, itemIndex) => itemIndex === index ? { ...item, value: event.currentTarget.value } : item); updateFor(bind, sourceMode, iterableKind, directValue, generatorModifiers, next); }} />
+                          <SeqTextInput size="xs" aria-label="Iterable config value" placeholder="value" variant="unstyled" value={renderValue(entry.value)} onChange={(value) => { const next = iterableConfig.map((item, itemIndex) => itemIndex === index ? { ...item, value: value } : item); updateFor(bind, sourceMode, iterableKind, directValue, generatorModifiers, next); }} />
                         </div>
                         <div className="sequencer-var-segment sequencer-var-remove">
                           <ActionIcon size="sm" variant="subtle" color="red" aria-label="Remove iterable config" onClick={() => { const next = iterableConfig.filter((_, itemIndex) => itemIndex !== index); updateFor(bind, sourceMode, iterableKind, directValue, generatorModifiers, next); }}>

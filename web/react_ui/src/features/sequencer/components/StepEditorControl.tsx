@@ -6,7 +6,6 @@ import {
   Select,
   Stack,
   Text,
-  TextInput,
 } from "@mantine/core";
 import { IconPlus } from "@tabler/icons-react";
 import {
@@ -38,6 +37,7 @@ import type {
   StreamCatalogEntry,
   TelemetrySignal,
 } from "../../../types";
+import { SeqTextInput } from "./SeqTextInput";
 
 type CommonProps = {
   node: SequencerStepOutlineNode;
@@ -205,27 +205,27 @@ export function WaitUntilStepEditor({
   return (
     <Card radius="sm" p="xs" style={cardStyle}>
       <Stack gap={8}>
-        <TextInput
+        <SeqTextInput
           size="xs"
           label="Timeout (s)"
           value={renderValue(detail.timeoutS)}
-          onChange={(event) =>
+          onChange={(value) =>
             updateWaitUntil(
-              event.currentTarget.value,
+              value,
               renderValue(detail.everyS),
               sample,
               condition
             )
           }
         />
-        <TextInput
+        <SeqTextInput
           size="xs"
           label="Polling interval (s)"
           value={renderValue(detail.everyS)}
-          onChange={(event) =>
+          onChange={(value) =>
             updateWaitUntil(
               renderValue(detail.timeoutS),
-              event.currentTarget.value,
+              value,
               sample,
               condition
             )
@@ -290,15 +290,15 @@ export function WaitUntilStepEditor({
                     }
                   />
                 </Group>
-                <TextInput
+                <SeqTextInput
                   size="xs"
                   label="Max age (s)"
                   value={sampleGet(sample, "telemetry.max_age_s")}
-                  onChange={(event) =>
+                  onChange={(value) =>
                     updateWaitUntil(
                       renderValue(detail.timeoutS),
                       renderValue(detail.everyS),
-                      sampleSet(sample, "telemetry.max_age_s", event.currentTarget.value),
+                      sampleSet(sample, "telemetry.max_age_s", value),
                       condition
                     )
                   }
@@ -504,13 +504,13 @@ export function SetStepEditor({
           error={setNameError ? "Field name is required." : undefined}
           onChange={(value) => updateSet(value, renderValue(setDetail.value))}
         />
-        <TextInput
+        <SeqTextInput
           size="xs"
           label="Value"
           value={renderValue(setDetail.value)}
           error={setValueError ? "Value is required." : undefined}
-          onChange={(event) =>
-            updateSet(renderValue(setDetail.name), event.currentTarget.value)
+          onChange={(value) =>
+            updateSet(renderValue(setDetail.name), value)
           }
         />
       </Stack>
@@ -761,14 +761,14 @@ export function SetContextStepEditor({
                                 }
                               />
                             ) : (
-                              <TextInput
+                              <SeqTextInput
                                 size="xs"
                                 aria-label="Stream device"
                                 placeholder="device"
                                 variant="unstyled"
                                 value={entry.device ?? ""}
-                                onChange={(event) =>
-                                  updateStream(index, { device: event.currentTarget.value })
+                                onChange={(value) =>
+                                  updateStream(index, { device: value })
                                 }
                               />
                             )
@@ -790,14 +790,14 @@ export function SetContextStepEditor({
                                 }
                               />
                             ) : (
-                              <TextInput
+                              <SeqTextInput
                                 size="xs"
                                 aria-label="Stream name"
                                 placeholder="stream"
                                 variant="unstyled"
                                 value={entry.stream ?? ""}
-                                onChange={(event) =>
-                                  updateStream(index, { stream: event.currentTarget.value })
+                                onChange={(value) =>
+                                  updateStream(index, { stream: value })
                                 }
                               />
                             )

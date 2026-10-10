@@ -8,7 +8,6 @@ import {
   Select,
   Stack,
   Text,
-  TextInput,
 } from "@mantine/core";
 import { IconPlus, IconTrash } from "@tabler/icons-react";
 import { applyEditedCallStep } from "../editing";
@@ -28,6 +27,7 @@ import type {
   SequencerStepOutlineNode,
 } from "../types";
 import type { CapabilityMember, CapabilityParam } from "../../../types";
+import { SeqTextInput } from "./SeqTextInput";
 
 type Props = {
   node: SequencerStepOutlineNode;
@@ -260,16 +260,16 @@ export function CallStepEditor({
                         }}
                       />
                     ) : (
-                      <TextInput
+                      <SeqTextInput
                         size="xs"
                         aria-label="Param name"
                         placeholder="param"
                         variant="unstyled"
                         value={param.name}
-                        onChange={(event) => {
+                        onChange={(value) => {
                           const next = params.map((entry, entryIndex) =>
                             entryIndex === index
-                              ? { ...entry, name: event.currentTarget.value }
+                              ? { ...entry, name: value }
                               : entry
                           );
                           updateCall(node.callDetail?.action ?? "", next);
@@ -278,16 +278,16 @@ export function CallStepEditor({
                     )}
                   </div>
                   <div className="sequencer-var-segment sequencer-var-value">
-                    <TextInput
+                    <SeqTextInput
                       size="xs"
                       aria-label="Param value"
                       placeholder={getCapabilityParamPlaceholder(paramSpecsByName.get(param.name))}
                       variant="unstyled"
                       value={renderValue(param.value)}
-                      onChange={(event) => {
+                      onChange={(value) => {
                         const next = params.map((entry, entryIndex) =>
                           entryIndex === index
-                            ? { ...entry, value: event.currentTarget.value }
+                            ? { ...entry, value: value }
                             : entry
                         );
                         updateCall(node.callDetail?.action ?? "", next);

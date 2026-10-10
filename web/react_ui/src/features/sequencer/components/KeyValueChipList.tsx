@@ -2,6 +2,7 @@ import { Badge, Button, Group, Select, Stack, Text, TextInput } from "@mantine/c
 import { IconPlus } from "@tabler/icons-react";
 import type { SequencerOutlineMetadataEntry } from "../types";
 import { KeyValueChipRow } from "./KeyValueChipRow";
+import { SeqTextInput } from "./SeqTextInput";
 
 type SelectOption = {
   value: string;
@@ -112,14 +113,14 @@ export function KeyValueChipList({
             <KeyValueChipRow
               key={`entry-${index}`}
               nameControl={
-                <TextInput
+                <SeqTextInput
                   size="xs"
                   aria-label={nameLabel}
                   placeholder="name"
                   variant="unstyled"
                   value={entry.name}
-                  onChange={(event) =>
-                    updateEntry(index, { name: event.currentTarget.value })
+                  onChange={(value) =>
+                    updateEntry(index, { name: value })
                   }
                 />
               }
@@ -152,14 +153,14 @@ export function KeyValueChipList({
                     }}
                   />
                 ) : (
-                  <TextInput
+                  <SeqTextInput
                     size="xs"
                     aria-label={valueLabel}
                     placeholder={valuePlaceholderResolver ? valuePlaceholderResolver(entry) : "value"}
                     variant="unstyled"
                     value={entry.value ?? ""}
-                    onChange={(event) =>
-                      updateEntry(index, { value: event.currentTarget.value })
+                    onChange={(value) =>
+                      updateEntry(index, { value: value })
                     }
                   />
                 )
