@@ -87,6 +87,14 @@ __all__ = [
 ]
 
 
+
+def _json_reply_default(value: Any) -> Any:
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
 class DeviceRunner:
     def __init__(
         self,
@@ -296,7 +304,7 @@ class DeviceRunner:
                             resp = self._handle_rpc_request(req_raw)
                         finally:
                             self._end_operation()
-                    self.rpc.send_json(resp)
+                    self._send_rpc_reply(resp)
 
                 # Heartbeat (PUB)
                 now = time.monotonic()
@@ -738,6 +746,25 @@ class DeviceRunner:
     @staticmethod
     def _rpc_ok(req_id: Any, result: Any) -> dict[str, Any]:
         return {"id": req_id, "status": "OK", "result": result}
+
+    def _send_rpc_reply(self, resp: dict[str, Any]) -> None:
+        """Send an RPC reply; a result JSON can't encode is replied as an error.
+
+        A command returning e.g. a numpy array used to raise inside send_json,
+        in the main loop, and kill the driver process (the caller only saw a
+        timeout). numpy arrays/scalars are sent as lists/numbers; anything else
+        unencodable gets an ERROR reply naming the type.
+        """
+        try:
+            self.rpc.send_json(resp, default=_json_reply_default)
+        except (TypeError, ValueError) as exc:
+            self.rpc.send_json(
+                self._rpc_error(
+                    resp.get("id"),
+                    f"result is not JSON serializable: {exc}",
+                    error_code="result_not_serializable",
+                )
+            )
 
     @staticmethod
     def _rpc_error(
