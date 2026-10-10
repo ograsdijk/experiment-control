@@ -3562,7 +3562,7 @@ class SequencerProcess(ManagedProcessBase):
         if not device_ids:
             return []
         resp = self._require_manager().call({"type": "device.list_status"})
-        liveness_by_device: dict[str, str] = {}
+        status_by_device: dict[str, dict[str, Any]] = {}
         if isinstance(resp, dict):
             result = resp.get("result")
             if isinstance(result, list):
@@ -3571,13 +3571,36 @@ class SequencerProcess(ManagedProcessBase):
                         continue
                     device_id = str(item.get("device_id", "")).strip()
                     if device_id:
-                        liveness_by_device[device_id] = str(item.get("liveness", ""))
-        missing = sorted(
-            device_id
-            for device_id in device_ids
-            if liveness_by_device.get(device_id) != "ONLINE"
-        )
-        return missing
+                        status_by_device[device_id] = item
+        problems: list[str] = []
+        for device_id in sorted(device_ids):
+            item = status_by_device.get(device_id)
+            if item is None:
+                import difflib
+
+                close = difflib.get_close_matches(
+                    device_id, sorted(status_by_device), n=3, cutoff=0.6
+                )
+                hint = (
+                    " (did you mean " + ", ".join(repr(c) for c in close) + "?)"
+                    if close
+                    else ""
+                )
+                problems.append(f"{device_id} (not configured{hint})")
+                continue
+            liveness = str(item.get("liveness", "")) or "UNKNOWN"
+            device_state = str(item.get("device_state", "") or "")
+            if liveness == "ONLINE" and device_state not in {"DEGRADED", "DISCONNECTED"}:
+                continue
+            states = [liveness]
+            if device_state and device_state != liveness:
+                states.append(device_state)
+            text = f"{device_id} (configured but {'/'.join(states)}"
+            last_error = item.get("last_error")
+            if last_error:
+                text += f"; last error: {last_error}"
+            problems.append(text + ")")
+        return problems
 
     def _check_start_preconditions(self, req: Json) -> Json | None:
         # Called from `_rpc_sequencer_start` right after `runtime.start()`
