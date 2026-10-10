@@ -200,6 +200,77 @@ class ConditionFailureTests(unittest.TestCase):
         self.assertIn("max_age_s=1", rt._last_error)
 
 
+class WaitUntilSampleCallTests(unittest.TestCase):
+    def _call_wait(self, **kw: Any) -> dict[str, Any]:
+        return _telemetry_wait(
+            sample={"call": {"process": "ramp", "action": "ramp.status"}}, **kw
+        )
+
+    def test_permanent_call_error_fails_immediately(self) -> None:
+        cases = [
+            {"code": "unknown_process"},
+            {"code": "unknown_request"},
+            {"code": "device_error", "message": "Unknown command 'x'",
+             "details": {"error_code": "unknown_command"}},
+            {"code": "boom", "retryable": False},
+        ]
+        for error in cases:
+            calls: list[float] = []
+
+            def call_process(_p, _a, _params, error=error):
+                calls.append(time.monotonic())
+                return {"ok": False, "error": error}
+
+            rt = _run([self._call_wait(timeout_s=5)], call_process=call_process)
+            self.assertEqual(rt.state, "ERROR", error)
+            self.assertEqual(len(calls), 1, error)
+            self.assertIn("wait_until sample call ramp.ramp.status failed", rt._last_error)
+            self.assertNotIn("timed out", rt._last_error)
+
+    def test_transient_call_error_keeps_polling_and_is_reported(self) -> None:
+        calls: list[float] = []
+
+        def call_process(_p, _a, _params):
+            calls.append(time.monotonic())
+            return {"ok": False, "error": {"code": "process_not_running"}}
+
+        rt = _run([self._call_wait(timeout_s=0.15)], call_process=call_process)
+        self.assertEqual(rt.state, "ERROR")
+        self.assertGreater(len(calls), 1)
+        self.assertIn("wait_until timed out after 0.15s", rt._last_error)
+        self.assertIn(
+            "last sample call failed: call ramp.ramp.status failed: "
+            "process 'ramp' is not running (process_not_running)",
+            rt._last_error,
+        )
+
+    def test_transient_error_then_success(self) -> None:
+        replies = iter(
+            [{"ok": False, "error": {"code": "device_rpc_timeout", "retryable": True}}] * 3
+        )
+
+        def call_process(_p, _a, _params):
+            return next(replies, {"ok": True, "result": 7.0})
+
+        rt = _run([self._call_wait(timeout_s=1)], call_process=call_process)
+        self.assertEqual(rt.state, "STOPPED")
+
+    def test_permanent_call_error_in_condition_fails_immediately(self) -> None:
+        rt = _run(
+            [
+                _telemetry_wait(
+                    timeout_s=5,
+                    condition={
+                        "gt": [{"call": {"process": "ramp", "action": "nope"}}, 1]
+                    },
+                )
+            ],
+            call_process=lambda *_a: {"ok": False, "error": {"code": "unknown_request"}},
+        )
+        self.assertEqual(rt.state, "ERROR")
+        self.assertIn("wait_until condition could not be evaluated", rt._last_error)
+
+
 class FieldAwareConversionTests(unittest.TestCase):
     def test_sleep_not_a_number(self) -> None:
         rt = _run([{"sleep": "soon"}])

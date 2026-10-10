@@ -58,6 +58,24 @@ class CallerErrorTests(unittest.TestCase):
             self.assertIn("freq_hz, unit", resp["error"])
             self._assert_healthy(runner)
 
+    def test_unexpected_parameter_is_named_with_suggestion(self) -> None:
+        runner = _runner()
+        resp = self._call(runner, "set_freq", {"freq": 1.0})
+        self.assertEqual(resp["error_code"], "bad_parameters")
+        self.assertIn("unexpected parameter 'freq' (did you mean 'freq_hz'?)", resp["error"])
+        self.assertIn("accepted parameters: freq_hz, unit", resp["error"])
+        self._assert_healthy(runner)
+
+    def test_missing_parameter_keeps_bind_message(self) -> None:
+        resp = self._call(_runner(), "set_freq", {})
+        self.assertIn("missing a required argument: 'freq_hz'", resp["error"])
+
+    def test_caller_errors_carry_codes(self) -> None:
+        resp = self._call(_runner(), "nope", {})
+        self.assertEqual(resp["error_code"], "unknown_command")
+        resp = self._call(_runner(), "_private", {})
+        self.assertEqual(resp["error_code"], "unknown_command")
+
     def test_type_error_inside_driver_still_demotes(self) -> None:
         runner = _runner()
         resp = self._call(runner, "inner_type_error", {})

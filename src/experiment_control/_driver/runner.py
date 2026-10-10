@@ -1,3 +1,4 @@
+import difflib
 import inspect
 import json
 import math
@@ -743,10 +744,10 @@ class DeviceRunner:
 
     def handle_command(self, action: str, params: dict[str, Any]) -> Any:
         if not isinstance(params, dict):
-            raise TypeError("params must be a dict")
+            raise BadCommandParametersError("params must be a dict")
 
         if action.startswith("_"):
-            raise NotImplementedError(f"Internal class methods not allowed {action!r}")
+            raise UnknownCommandError(f"Internal class methods not allowed {action!r}")
 
         if action in {"connect", "disconnect"}:
             raise NotImplementedError(f"Command {action!r} is not allowed via RPC")
@@ -779,8 +780,27 @@ class DeviceRunner:
                     )
                 ]
                 listing = ", ".join(accepted) if accepted else "(none)"
+                accepts_any = any(
+                    p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+                )
+                # bind() reports the first problem only (often the missing
+                # argument a misspelled one was meant to be): name the
+                # unexpected ones explicitly, with the closest match.
+                unexpected = (
+                    [name for name in params if name not in accepted] if not accepts_any else []
+                )
+                problems = [
+                    f"unexpected parameter {name!r}"
+                    + (
+                        f" (did you mean {match[0]!r}?)"
+                        if (match := difflib.get_close_matches(name, accepted, n=1))
+                        else ""
+                    )
+                    for name in unexpected
+                ]
+                detail = "; ".join(problems) if problems else str(e)
                 raise BadCommandParametersError(
-                    f"Bad parameters for command {action!r}: {e}; "
+                    f"Bad parameters for command {action!r}: {detail}; "
                     f"accepted parameters: {listing}"
                 ) from e
         return func(**params)
@@ -1174,7 +1194,7 @@ class DeviceRunner:
                             type(value) is type(allowed) and value == allowed
                             for allowed in literal_values
                         ):
-                            raise TypeError(
+                            raise BadCommandParametersError(
                                 f"Bad parameters for command {action!r}: {param.name} "
                                 f"must be one of {literal_values!r}"
                             )
@@ -1187,7 +1207,7 @@ class DeviceRunner:
                             coerced[param.name], kind
                         )
                     except Exception as e:
-                        raise TypeError(
+                        raise BadCommandParametersError(
                             f"Bad parameters for command {action!r}: {param.name} ({e})"
                         ) from e
             params = coerced
@@ -1232,6 +1252,10 @@ class DeviceRunner:
             if routed is not None:
                 return routed
             return self._rpc_dispatch_device_command(rpc_req)
+        except UnknownCommandError as e:
+            return self._rpc_error(rpc.request_id, str(e), error_code="unknown_command")
+        except BadCommandParametersError as e:
+            return self._rpc_error(rpc.request_id, str(e), error_code="bad_parameters")
         except Exception as e:
             if not isinstance(e, CommandCallerError):
                 self._last_error = f"command {rpc.action} failed: {e!r}"

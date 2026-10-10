@@ -142,6 +142,44 @@ class _WaitState:
     last_age_s: float | None = None
     telemetry_label: str | None = None
     telemetry_max_age_s: float | None = None
+    last_call_error: str | None = None
+
+
+# Call failures that retrying cannot fix: the target or action does not exist
+# or the parameters are wrong. `retryable: false` on the error says the same.
+_PERMANENT_CALL_ERROR_CODES = frozenset(
+    {
+        "unknown_command",
+        "bad_parameters",
+        "invalid_params",
+        "unknown_device",
+        "unknown_process",
+        "unknown_request",
+    }
+)
+
+
+class _CallFailed(RuntimeError):
+    """A sequencer value `call` that returned `ok: false`."""
+
+    def __init__(self, message: str, error: Any) -> None:
+        super().__init__(message)
+        self.error = error
+
+    @property
+    def permanent(self) -> bool:
+        error = self.error
+        if not isinstance(error, dict):
+            return False
+        if error.get("retryable") is False:
+            return True
+        codes = {error.get("code")}
+        details = error.get("details")
+        if isinstance(details, dict):
+            # Driver replies carry their own code under details (the
+            # envelope code is the generic "device_error").
+            codes.add(details.get("error_code"))
+        return bool(codes & _PERMANENT_CALL_ERROR_CODES)
 
 
 @dataclass(frozen=True)
@@ -1180,6 +1218,14 @@ class SequencerRuntime:
         try:
             return self._condition_holds(cond, self._env_view(), live=True)
         except Exception as exc:
+            if polling and isinstance(exc, _CallFailed):
+                if exc.permanent:
+                    raise ValueError(
+                        f"{kind} condition could not be evaluated: {exc}"
+                    ) from exc
+                if self._wait_state is not None:
+                    self._wait_state.last_call_error = str(exc)
+                return False
             if polling:
                 if isinstance(exc, OperandError):
                     if exc.none_involved:
@@ -3982,9 +4028,10 @@ class SequencerRuntime:
             # the sequencer to ERROR with _last_error set.
             if not resp.get("ok", False):
                 target = call_process or call_device
-                raise RuntimeError(
+                raise _CallFailed(
                     f"call {target}.{action} failed: "
-                    f"{resp.get('error', 'unknown error')!s}"
+                    f"{self._response_error_text(resp, call_process or None)}",
+                    resp.get("error"),
                 )
             extract = call_spec.get("extract")
             if isinstance(extract, dict):
@@ -4101,6 +4148,8 @@ class SequencerRuntime:
             if ws.last_age_s is not None:
                 seen += f" ({ws.last_age_s:.1f}s old)"
             parts.append(seen)
+        if ws.last_call_error:
+            parts.append(f"last sample call failed: {ws.last_call_error}")
         return "; ".join(parts)
 
     def _step_wait_until(self, now: float) -> bool:
@@ -4116,7 +4165,20 @@ class SequencerRuntime:
         if now < ws.next_sample_t:
             return False
 
-        sample = self._resolve_value(ws.sample_spec)
+        try:
+            sample = self._resolve_value(ws.sample_spec)
+        except _CallFailed as exc:
+            # Wrong target/action/parameters will not fix themselves: fail
+            # now. Anything else (timeout, process not running yet) may
+            # clear, so keep polling and report it if the wait times out.
+            if exc.permanent:
+                self._wait_state = None
+                self._fail_step(f"wait_until sample {exc}")
+                return True
+            ws.last_call_error = str(exc)
+            ws.next_sample_t = now + ws.every_s
+            return False
+        ws.last_call_error = None
         ws.last_value = sample
         ws.last_age_s = None
         sample_ts = None
