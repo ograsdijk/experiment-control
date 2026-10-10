@@ -6,7 +6,7 @@ from typing import Any
 import numpy as np
 
 from ..scan_plan import generate_scan2d_records, validate_scan2d_order, validate_scan2d_pattern
-from .eval import render_templates
+from .eval import render_templates, unknown_key_message
 
 
 # Tolerance for the math.ceil rounding in `range` gen's count
@@ -14,6 +14,65 @@ from .eval import render_templates
 # 2.9999999999999996 round down to 3 (not 4). 1e-9 is small enough to
 # never flip a legitimate boundary case.
 _RANGE_STOP_TOL = 1e-9
+
+
+# Generator kinds -> (required fields, optional fields).
+_GENERATOR_FIELDS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
+    "range": (("start", "stop"), ("step",)),
+    "linspace": (("start", "stop", "num"), ()),
+    "logspace": (("start", "stop", "num"), ("base",)),
+    "geomspace": (("start", "stop", "num"), ()),
+    "triangle": (("start", "stop", "num"), ()),
+    "centered_triangle": (("center", "span", "num"), ("dir",)),
+}
+_GENERATOR_KINDS = (*_GENERATOR_FIELDS, "values", "scan2d")
+_GEN_MODIFIER_KEYS = ("offset", "sample", "seed", "serpentine", "shuffle")
+
+
+def _check_generator_fields(kind: str, params: Any) -> dict[str, Any]:
+    """Require the generator's fields and reject unknown ones."""
+    if not isinstance(params, dict):
+        raise TypeError(f"gen.{kind} must be a dict")
+    required, optional = _GENERATOR_FIELDS[kind]
+    allowed = (*required, *optional)
+    for key in params:
+        if key not in allowed:
+            raise ValueError(unknown_key_message(f"gen.{kind}", key, allowed))
+    missing = [name for name in required if name not in params]
+    if missing:
+        raise ValueError(
+            f"gen.{kind} is missing required field(s): {', '.join(missing)}"
+        )
+    return params
+
+
+def validate_gen_keys(gen_spec: Any) -> None:
+    """Static structure check of a `gen` spec (before templates are rendered).
+
+    Rejects unknown/duplicate generator keys, unknown generator fields and
+    missing required fields. Values are not inspected, so templates are fine.
+    """
+    if not isinstance(gen_spec, dict):
+        raise TypeError("gen spec must be a dict")
+    kinds = [key for key in gen_spec if key in _GENERATOR_KINDS]
+    for key in gen_spec:
+        if key not in _GENERATOR_KINDS and key not in _GEN_MODIFIER_KEYS:
+            raise ValueError(
+                unknown_key_message(
+                    "gen spec", key, (*_GENERATOR_KINDS, *_GEN_MODIFIER_KEYS)
+                )
+            )
+    if len(kinds) > 1:
+        raise ValueError(
+            f"gen spec must contain exactly one generator, got: {', '.join(kinds)}"
+        )
+    if not kinds:
+        raise ValueError(
+            "gen spec must include one of " + "/".join(_GENERATOR_KINDS)
+        )
+    kind = kinds[0]
+    if kind in _GENERATOR_FIELDS and isinstance(gen_spec[kind], dict):
+        _check_generator_fields(kind, gen_spec[kind])
 
 
 def _apply_modifiers(
@@ -294,6 +353,7 @@ def _generate_core(
         rendered_scan = render_templates(gen_spec["scan2d"], env)
         return _generate_scan2d_from_spec(rendered_scan)
 
+    validate_gen_keys(gen_spec)
     offset = gen_spec.get("offset")
     shuffle = bool(gen_spec.get("shuffle", False))
     seed = gen_spec.get("seed")
@@ -307,9 +367,9 @@ def _generate_core(
         seed = int(render_templates(seed, env))
 
     if "range" in gen_spec:
-        params = render_templates(gen_spec["range"], env)
-        start = float(params.get("start", 0))
-        stop = float(params.get("stop", 0))
+        params = _check_generator_fields("range", render_templates(gen_spec["range"], env))
+        start = float(params["start"])
+        stop = float(params["stop"])
         step = float(params.get("step", 1))
         if step == 0:
             raise ValueError("range.step must be non-zero")
@@ -348,10 +408,12 @@ def _generate_core(
             )
         )
     if "linspace" in gen_spec:
-        params = render_templates(gen_spec["linspace"], env)
-        start = float(params.get("start", 0))
-        stop = float(params.get("stop", 0))
-        num = int(params.get("num", 1))
+        params = _check_generator_fields(
+            "linspace", render_templates(gen_spec["linspace"], env)
+        )
+        start = float(params["start"])
+        stop = float(params["stop"])
+        num = int(params["num"])
         values = list(np.linspace(start, stop, num))
         return _wrap_scalar_records(
             _apply_modifiers(
@@ -364,10 +426,12 @@ def _generate_core(
             )
         )
     if "triangle" in gen_spec:
-        params = render_templates(gen_spec["triangle"], env)
-        start = float(params.get("start", 0))
-        stop = float(params.get("stop", 0))
-        num = int(params.get("num", 1))
+        params = _check_generator_fields(
+            "triangle", render_templates(gen_spec["triangle"], env)
+        )
+        start = float(params["start"])
+        stop = float(params["stop"])
+        num = int(params["num"])
         if num < 2:
             raise ValueError("triangle.num must be >= 2")
         forward = list(np.linspace(start, stop, num))
@@ -384,10 +448,12 @@ def _generate_core(
             )
         )
     if "centered_triangle" in gen_spec:
-        params = render_templates(gen_spec["centered_triangle"], env)
-        center = float(params.get("center", 0))
-        span = float(params.get("span", 0))
-        num = int(params.get("num", 1))
+        params = _check_generator_fields(
+            "centered_triangle", render_templates(gen_spec["centered_triangle"], env)
+        )
+        center = float(params["center"])
+        span = float(params["span"])
+        num = int(params["num"])
         direction = int(params.get("dir", 1))
         if num < 3:
             raise ValueError("centered_triangle.num must be >= 3")
@@ -416,10 +482,12 @@ def _generate_core(
             )
         )
     if "logspace" in gen_spec:
-        params = render_templates(gen_spec["logspace"], env)
-        start = float(params.get("start", 0))
-        stop = float(params.get("stop", 0))
-        num = int(params.get("num", 1))
+        params = _check_generator_fields(
+            "logspace", render_templates(gen_spec["logspace"], env)
+        )
+        start = float(params["start"])
+        stop = float(params["stop"])
+        num = int(params["num"])
         base = float(params.get("base", 10.0))
         values = list(np.logspace(start, stop, num, base=base))
         return _wrap_scalar_records(
@@ -433,10 +501,12 @@ def _generate_core(
             )
         )
     if "geomspace" in gen_spec:
-        params = render_templates(gen_spec["geomspace"], env)
-        start = float(params.get("start", 1))
-        stop = float(params.get("stop", 1))
-        num = int(params.get("num", 1))
+        params = _check_generator_fields(
+            "geomspace", render_templates(gen_spec["geomspace"], env)
+        )
+        start = float(params["start"])
+        stop = float(params["stop"])
+        num = int(params["num"])
         values = list(np.geomspace(start, stop, num))
         return _wrap_scalar_records(
             _apply_modifiers(

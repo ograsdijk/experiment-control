@@ -5,6 +5,8 @@ from typing import Any
 
 from ..contracts.context_fields import SEQUENCER_RUN_ID_FIELD
 from ..utils.yaml_helpers import load_yaml_text
+from .eval import unknown_key_message
+from .ranges import validate_gen_keys
 
 @dataclass(frozen=True)
 class SequenceSpec:
@@ -163,6 +165,141 @@ Step = (
 )
 
 
+class SequenceParseError(TypeError):
+    """A sequence that does not parse; `path` locates the offending step
+    (e.g. `steps[2].for.do[0]`) so callers can map it to a source line."""
+
+    def __init__(self, message: str, *, path: str | None = None) -> None:
+        super().__init__(message)
+        self.path = path
+
+
+# Step kinds in detection order (a step's kind is the first of these it has).
+_STEP_KINDS = (
+    "call",
+    "set",
+    "sleep",
+    "wait_until",
+    "for",
+    "repeat",
+    "if",
+    "while",
+    "atomic",
+    "pause",
+    "parallel",
+    "try",
+    "assign",
+    "set_context",
+    "use",
+    "adaptive",
+)
+# Keys allowed next to the step kind, besides `disabled`.
+_STEP_EXTRA_KEYS: dict[str, tuple[str, ...]] = {
+    "call": ("save_as", "extract", "assign"),
+}
+# Keys allowed inside the step body when it is a mapping.
+_STEP_INNER_KEYS: dict[str, tuple[str, ...]] = {
+    "call": ("device", "process", "action", "params"),
+    "set": ("device", "name", "value"),
+    "wait_until": (
+        "timeout_s",
+        "every_s",
+        "stable_for_s",
+        "sample",
+        "condition",
+        "reduce",
+    ),
+    "for": ("bind", "in", "do"),
+    "repeat": ("times", "do"),
+    "if": ("condition", "then", "else"),
+    "while": ("condition", "do"),
+    "atomic": ("name", "do"),
+    "pause": ("reason",),
+    "parallel": ("do",),
+    "try": ("do", "finally"),
+    "set_context": ("streams", "fields"),
+    "use": ("id", "args"),
+    "adaptive": (
+        "id",
+        "controller",
+        "space",
+        "bind",
+        "state",
+        "observe",
+        "stopping",
+        "constraints",
+        "do",
+        "fail_on_trial_error",
+    ),
+}
+_REDUCE_KEYS = ("method", "window_s", "max_samples")
+_TOP_LEVEL_KEYS = ("version", "meta", "vars", "context_columns", "requires", "steps")
+
+
+def _check_keys(
+    obj: dict[str, Any],
+    owner: str,
+    allowed: tuple[str, ...],
+    *,
+    misplaced: tuple[str, ...] = (),
+    misplaced_hint: str = "",
+) -> None:
+    for key in obj:
+        if key in allowed:
+            continue
+        hint = misplaced_hint.format(key=key) if key in misplaced else None
+        raise TypeError(unknown_key_message(owner, key, allowed, hint))
+
+
+def _detect_step_kind(obj: dict[str, Any]) -> str:
+    for kind in _STEP_KINDS:
+        if kind in obj:
+            return kind
+    candidates = [str(k) for k in obj if k != "disabled"]
+    if not candidates:
+        raise TypeError(
+            "step has no kind; use one of: " + ", ".join(_STEP_KINDS)
+        )
+    first = candidates[0]
+    import difflib
+
+    close = difflib.get_close_matches(first, _STEP_KINDS, n=1, cutoff=0.5)
+    hint = f" (did you mean {close[0]!r}?)" if close else ""
+    raise TypeError(
+        f"Unknown step kind {first!r}{hint}. Valid step kinds: "
+        + ", ".join(_STEP_KINDS)
+    )
+
+
+def _validate_step_keys(obj: dict[str, Any], kind: str) -> None:
+    extras = _STEP_EXTRA_KEYS.get(kind, ())
+    step_keys = (kind, "disabled", *extras)
+    for key in obj:
+        if key in step_keys:
+            continue
+        hint = None
+        if key in _STEP_KINDS:
+            hint = (
+                f"{key!r} is a step kind of its own and cannot be combined with "
+                f"{kind!r}; put it in a separate step"
+            )
+        raise TypeError(unknown_key_message(f"{kind} step", key, step_keys, hint))
+    inner = _STEP_INNER_KEYS.get(kind)
+    body = obj.get(kind)
+    if inner is not None and isinstance(body, dict):
+        _check_keys(
+            body,
+            kind,
+            inner,
+            misplaced=extras,
+            misplaced_hint=f"{{key!r}} belongs next to {kind!r}, not inside it",
+        )
+    if kind == "wait_until" and isinstance(body, dict):
+        reduce = body.get("reduce")
+        if isinstance(reduce, dict):
+            _check_keys(reduce, "wait_until.reduce", _REDUCE_KEYS)
+
+
 def _require_dict(raw: Any, *, name: str) -> dict[str, Any]:
     if not isinstance(raw, dict):
         raise TypeError(f"{name} must be a dict")
@@ -175,18 +312,28 @@ def _require_list(raw: Any, *, name: str) -> list[Any]:
     return raw
 
 
-def _parse_steps(raw: Any) -> list[Step]:
-    items = _require_list(raw, name="steps")
-    return [_parse_step(item) for item in items]
+def _parse_steps(raw: Any, path: str = "steps") -> list[Step]:
+    items = _require_list(raw, name=path.rsplit(".", 1)[-1])
+    out: list[Step] = []
+    for index, item in enumerate(items):
+        step_path = f"{path}[{index}]"
+        try:
+            out.append(_parse_step(item, step_path))
+        except SequenceParseError:
+            raise
+        except (TypeError, ValueError) as exc:
+            raise SequenceParseError(f"{step_path}: {exc}", path=step_path) from exc
+    return out
 
 
 def _parse_disabled(obj: dict[str, Any]) -> bool:
     return bool(obj.get("disabled", False))
 
 
-def _parse_step(raw: Any) -> Step:
+def _parse_step(raw: Any, path: str = "steps[0]") -> Step:
     obj = _require_dict(raw, name="step")
     disabled = _parse_disabled(obj)
+    _validate_step_keys(obj, _detect_step_kind(obj))
     if "call" in obj:
         call = _require_dict(obj["call"], name="call")
         device = str(call.get("device", ""))
@@ -252,31 +399,37 @@ def _parse_step(raw: Any) -> Step:
         if not bind:
             raise TypeError("for.bind must not be empty")
         in_expr = f.get("in")
-        body = _parse_steps(f.get("do", []))
+        if isinstance(in_expr, dict) and isinstance(in_expr.get("gen"), dict):
+            validate_gen_keys(in_expr["gen"])
+        body = _parse_steps(f.get("do", []), f"{path}.for.do")
         return ForStep(bind=bind, in_expr=in_expr, body=body, disabled=disabled)
     if "repeat" in obj:
         rep = _require_dict(obj["repeat"], name="repeat")
         times = rep.get("times", 1)
-        body = _parse_steps(rep.get("do", []))
+        body = _parse_steps(rep.get("do", []), f"{path}.repeat.do")
         return RepeatStep(times=times, body=body, disabled=disabled)
     if "if" in obj:
         cond = _require_dict(obj["if"], name="if")
         condition = cond.get("condition")
-        then_steps = _parse_steps(cond.get("then", []))
+        then_steps = _parse_steps(cond.get("then", []), f"{path}.if.then")
         else_steps_raw = cond.get("else")
-        else_steps = _parse_steps(else_steps_raw) if else_steps_raw is not None else None
+        else_steps = (
+            _parse_steps(else_steps_raw, f"{path}.if.else")
+            if else_steps_raw is not None
+            else None
+        )
         return IfStep(condition=condition, then_steps=then_steps, else_steps=else_steps, disabled=disabled)
     if "while" in obj:
         w = _require_dict(obj["while"], name="while")
         if "condition" not in w:
             raise TypeError("while.condition is required")
         condition = w.get("condition")
-        body = _parse_steps(w.get("do", []))
+        body = _parse_steps(w.get("do", []), f"{path}.while.do")
         return WhileStep(condition=condition, body=body, disabled=disabled)
     if "atomic" in obj:
         atom = _require_dict(obj["atomic"], name="atomic")
         atomic_name = atom.get("name")
-        body = _parse_steps(atom.get("do", []))
+        body = _parse_steps(atom.get("do", []), f"{path}.atomic.do")
         return AtomicStep(name=str(atomic_name) if atomic_name is not None else None, body=body, disabled=disabled)
     if "pause" in obj:
         pause = obj["pause"]
@@ -287,14 +440,14 @@ def _parse_step(raw: Any) -> Step:
         return PauseStep(reason=str(reason) if reason is not None else None, disabled=disabled)
     if "parallel" in obj:
         par = _require_dict(obj["parallel"], name="parallel")
-        body = _parse_steps(par.get("do", []))
+        body = _parse_steps(par.get("do", []), f"{path}.parallel.do")
         return ParallelStep(body=body, disabled=disabled)
     if "try" in obj:
         tr = _require_dict(obj["try"], name="try")
         if "do" not in tr:
             raise TypeError("try.do is required")
-        body = _parse_steps(tr.get("do", []))
-        finally_steps = _parse_steps(tr.get("finally", []))
+        body = _parse_steps(tr.get("do", []), f"{path}.try.do")
+        finally_steps = _parse_steps(tr.get("finally", []), f"{path}.try.finally")
         return TryStep(body=body, finally_steps=finally_steps, disabled=disabled)
     if "assign" in obj:
         values = obj.get("assign")
@@ -358,7 +511,7 @@ def _parse_step(raw: Any) -> Step:
         constraints = raw_step.get("constraints")
         if constraints is not None and not isinstance(constraints, list):
             raise TypeError("adaptive.constraints must be a list")
-        body = _parse_steps(raw_step.get("do", []))
+        body = _parse_steps(raw_step.get("do", []), f"{path}.adaptive.do")
         if not body:
             raise TypeError("adaptive.do must not be empty")
         return AdaptiveStep(
@@ -375,7 +528,7 @@ def _parse_step(raw: Any) -> Step:
             disabled=disabled,
         )
 
-    raise TypeError(f"Unknown step type: {list(obj.keys())}")
+    raise TypeError(f"Unknown step type: {list(obj.keys())}")  # pragma: no cover
 
 
 def _iter_adaptive_ids(steps: list[Step]) -> list[str]:
@@ -474,6 +627,7 @@ _REQUIRES_KNOWN_KEYS = {"watchdog_ids", "hdf_writing"}
 
 def parse_sequence(raw: Any) -> SequenceSpec:
     obj = _require_dict(raw, name="sequence")
+    _check_keys(obj, "sequence", _TOP_LEVEL_KEYS)
     version = int(obj.get("version", 1))
     meta = obj.get("meta", {}) or {}
     vars_raw = obj.get("vars", {}) or {}

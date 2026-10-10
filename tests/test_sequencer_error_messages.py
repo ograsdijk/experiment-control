@@ -110,7 +110,7 @@ class ConditionFailureTests(unittest.TestCase):
 
     def test_while_with_unknown_name_fails_step(self) -> None:
         rt = _run(
-            [{"while": {"condition": {"lt": ["${nope}", 3]}, "body": [{"sleep": 0}]}}]
+            [{"while": {"condition": {"lt": ["${nope}", 3]}, "do": [{"sleep": 0}]}}]
         )
         self.assertEqual(rt.state, "ERROR")
         self.assertIn("while condition could not be evaluated", rt._last_error)
@@ -207,7 +207,7 @@ class FieldAwareConversionTests(unittest.TestCase):
         self.assertIn("sleep: expected seconds as a number, got 'soon'", rt._last_error)
 
     def test_repeat_times_not_an_int(self) -> None:
-        rt = _run([{"repeat": {"times": "lots", "body": [{"sleep": 0}]}}])
+        rt = _run([{"repeat": {"times": "lots", "do": [{"sleep": 0}]}}])
         self.assertIn("repeat.times must be an integer, got 'lots'", rt._last_error)
 
     def test_wait_until_timeout_not_a_number(self) -> None:

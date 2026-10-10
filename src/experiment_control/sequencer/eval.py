@@ -41,6 +41,19 @@ def unknown_name_message(name: str, candidates: Any) -> str:
     return f"Unknown name {name!r} (did you mean {quoted}?)"
 
 
+def unknown_key_message(owner: str, key: Any, allowed: Any, hint: str | None = None) -> str:
+    """Message for a key that `owner` does not accept, with a close-match hint."""
+    names = sorted(str(a) for a in allowed)
+    text = f"{owner} has unknown key {str(key)!r}"
+    close = difflib.get_close_matches(str(key), names, n=1, cutoff=0.6)
+    if close:
+        text += f" (did you mean {close[0]!r}?)"
+    if hint:
+        text += f"; {hint}"
+    text += f". Valid keys: {', '.join(names)}"
+    return text
+
+
 def _describe_operand(node: ast.AST, value: Any) -> str | None:
     if isinstance(node, ast.Name) and isinstance(value, str):
         shown = value if len(value) <= 40 else value[:37] + "..."
