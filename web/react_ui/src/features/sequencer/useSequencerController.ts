@@ -13,6 +13,7 @@ import { useAdaptivePolling } from "../polling/useAdaptivePolling";
 import type {
   SequencerAdaptiveStudyStatus,
   SequencerDiagnostic,
+  SequencerRunEvent,
   SequencerStatus,
   SequencerYamlEditorHandle,
 } from "./types";
@@ -28,6 +29,9 @@ import {
   normalizeSequencerDiagnostics,
   normalizeSequencerProgress,
   normalizeSequencerStepDetail,
+  normalizeRunEventsSummary,
+  normalizeSequencerPause,
+  normalizeSequencerRunEvents,
   sameSequencerStatus,
   sequencerDisplayPercent,
 } from "./utils";
@@ -288,6 +292,13 @@ export function useSequencerController({
   // What the editor text came from (uploaded file name or loaded source), so
   // the modal can say which sequence is being edited.
   const [sequencerEditorLabel, setSequencerEditorLabel] = useState<string | null>(null);
+  // Events of the current/last run (sequencer.run_events), refetched when the
+  // status summary's seq changes.
+  const [sequencerRunEventsState, setSequencerRunEventsState] = useState<{
+    processId: string | null;
+    seq: number | null;
+    events: SequencerRunEvent[];
+  }>({ processId: null, seq: null, events: [] });
   const [sequencerAdaptiveModes, setSequencerAdaptiveModes] = useState<
     Record<string, AdaptiveStartMode>
   >({});
@@ -401,6 +412,8 @@ export function useSequencerController({
           progress?: unknown;
           loaded_adaptive_ids?: unknown;
           adaptive_studies?: unknown;
+          pause?: unknown;
+          run_events?: unknown;
         };
         const normalizeInt = (value: unknown): number | null => {
           if (typeof value !== "number" || !Number.isFinite(value)) {
@@ -526,6 +539,8 @@ export function useSequencerController({
             progress,
             loadedAdaptiveIds,
             adaptiveStudies,
+            pause: normalizeSequencerPause(result.pause),
+            runEvents: normalizeRunEventsSummary(result.run_events),
           };
           if (sameSequencerStatus(current, nextStatus)) {
             return prev;
@@ -1107,7 +1122,9 @@ export function useSequencerController({
         const resp = await sendProcessCommand(
           processId,
           `sequencer.${action}`,
-          action === "start" ? startParams : {},
+          // Pause/resume/stop from the UI are the operator's: shown with the
+          // pause and in the run's event log.
+          action === "start" ? startParams : { source: "operator" },
           "sequencer-action"
         );
         if (!resp.ok) {
@@ -1474,6 +1491,48 @@ export function useSequencerController({
     () => buildLocalConditionDiagnostics(sequencerYamlText),
     [sequencerYamlText]
   );
+  const sequencerRunEventsProcessId = sequencerProcess?.process_id ?? null;
+  const sequencerRunEventsSeq = sequencerProcess
+    ? sequencerStatusByProcessId[sequencerProcess.process_id]?.runEvents?.seq ?? null
+    : null;
+  useEffect(() => {
+    const processId = sequencerRunEventsProcessId;
+    if (!processId || sequencerRunEventsSeq === null) {
+      return;
+    }
+    if (
+      sequencerRunEventsState.processId === processId &&
+      sequencerRunEventsState.seq === sequencerRunEventsSeq
+    ) {
+      return;
+    }
+    let cancelled = false;
+    void (async () => {
+      const resp = await callProcessFn(processId, "sequencer.run_events", {});
+      if (cancelled || !resp.ok) {
+        return;
+      }
+      setSequencerRunEventsState({
+        processId,
+        seq: sequencerRunEventsSeq,
+        events: normalizeSequencerRunEvents(resp.result),
+      });
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    callProcessFn,
+    sequencerRunEventsProcessId,
+    sequencerRunEventsSeq,
+    sequencerRunEventsState.processId,
+    sequencerRunEventsState.seq,
+  ]);
+  const sequencerRunEvents =
+    sequencerRunEventsState.processId === sequencerRunEventsProcessId
+      ? sequencerRunEventsState.events
+      : [];
+
   const sequencerCombinedDiagnostics = useMemo(() => {
     const stale = sequencerDiagnosticsState.text !== sequencerYamlText;
     const validator = sequencerDiagnosticsState.items.map((item) =>
@@ -1651,6 +1710,7 @@ export function useSequencerController({
     setSequencerYamlViewMode,
     sequencerDiagnostics: sequencerCombinedDiagnostics,
     sequencerEditorLabel,
+    sequencerRunEvents,
     sequencerModalError,
     sequencerAdaptiveModes,
     sequencerAdaptiveClearBusy,

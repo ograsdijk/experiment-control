@@ -3,7 +3,9 @@ import type {
   SequencerAdaptiveStudyStatus,
   SequencerDiagnostic,
   SequencerErrorDetail,
+  SequencerPauseInfo,
   SequencerProgress,
+  SequencerRunEvent,
   SequencerStepDetail,
   SequencerYamlEditorHandle,
 } from "../features/sequencer/types";
@@ -29,6 +31,8 @@ type Props = {
   completedSteps: number | null;
   loadedSource: string | null;
   editorLabel: string | null;
+  pauseInfo: SequencerPauseInfo | null;
+  runEvents: ReadonlyArray<SequencerRunEvent>;
   autoloadError: string | null;
   statusError: string | null;
   modalError: string | null;

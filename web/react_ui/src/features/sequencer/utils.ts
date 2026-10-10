@@ -1,7 +1,11 @@
 ﻿import type {
   SequencerDiagnostic,
   SequencerErrorDetail,
+  SequencerPauseInfo,
+  SequencerPauseTrigger,
   SequencerProgress,
+  SequencerRunEvent,
+  SequencerRunEventsSummary,
   SequencerStatus,
   SequencerStepDetail,
 } from "./types";
@@ -144,8 +148,138 @@ export function sameSequencerStatus(
       JSON.stringify(current.loadedAdaptiveIds) ===
         JSON.stringify(next.loadedAdaptiveIds) &&
       JSON.stringify(current.adaptiveStudies) ===
-        JSON.stringify(next.adaptiveStudies)
+        JSON.stringify(next.adaptiveStudies) &&
+      JSON.stringify(current.pause ?? null) === JSON.stringify(next.pause ?? null) &&
+      JSON.stringify(current.runEvents ?? null) === JSON.stringify(next.runEvents ?? null)
   );
+}
+
+function asRecord(raw: unknown): Record<string, unknown> | null {
+  return raw && typeof raw === "object" && !Array.isArray(raw)
+    ? (raw as Record<string, unknown>)
+    : null;
+}
+
+function finiteNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function normalizePauseTrigger(raw: unknown): SequencerPauseTrigger | null {
+  const obj = asRecord(raw);
+  if (!obj) {
+    return null;
+  }
+  return {
+    watchdogId: normalizeString(obj.watchdog_id),
+    rule: normalizeString(obj.rule),
+    severity: normalizeString(obj.severity),
+    tripId: normalizeString(obj.trip_id),
+  };
+}
+
+export function normalizeSequencerPause(raw: unknown): SequencerPauseInfo | null {
+  const obj = asRecord(raw);
+  if (!obj) {
+    return null;
+  }
+  return {
+    reason: normalizeString(obj.reason),
+    source: normalizeString(obj.source),
+    trigger: normalizePauseTrigger(obj.trigger),
+    elapsedS: finiteNumber(obj.elapsed_s),
+  };
+}
+
+export function normalizeRunEventsSummary(raw: unknown): SequencerRunEventsSummary | null {
+  const obj = asRecord(raw);
+  if (!obj) {
+    return null;
+  }
+  return {
+    seq: normalizeInt(obj.seq) ?? 0,
+    count: normalizeInt(obj.count) ?? 0,
+    dropped: normalizeInt(obj.dropped) ?? 0,
+    errors: normalizeInt(obj.errors) ?? 0,
+    warnings: normalizeInt(obj.warnings) ?? 0,
+  };
+}
+
+export function normalizeSequencerRunEvents(raw: unknown): SequencerRunEvent[] {
+  const list = asRecord(raw)?.events;
+  if (!Array.isArray(list)) {
+    return [];
+  }
+  const out: SequencerRunEvent[] = [];
+  for (const item of list) {
+    const obj = asRecord(item);
+    if (!obj) {
+      continue;
+    }
+    const severity =
+      obj.severity === "error" || obj.severity === "critical"
+        ? "error"
+        : obj.severity === "warning"
+          ? "warning"
+          : "info";
+    const step = asRecord(obj.step);
+    out.push({
+      severity,
+      kind: normalizeString(obj.kind) ?? "event",
+      message: normalizeString(obj.message) ?? "",
+      source: normalizeString(obj.source),
+      step: step
+        ? {
+            kind: normalizeString(step.kind),
+            summary: normalizeString(step.summary),
+            path: normalizeString(step.path),
+            line: normalizeInt(step.line),
+            branch: normalizeString(step.branch),
+          }
+        : null,
+      elapsedS: finiteNumber(obj.elapsed_s) ?? 0,
+      count: normalizeInt(obj.count) ?? 1,
+      trigger: normalizePauseTrigger(obj.trigger),
+    });
+  }
+  return out;
+}
+
+/**
+ * A run event as a diagnostic, so it is drawn on its step and YAML line like
+ * validation results. Its line refers to the loaded sequence: `stale` when
+ * the editor text is not what is loaded.
+ */
+export function runEventToDiagnostic(
+  event: SequencerRunEvent,
+  stale: boolean
+): SequencerDiagnostic {
+  const when = formatDurationCompact(event.elapsedS);
+  const repeats = event.count > 1 ? ` (x${event.count})` : "";
+  const during = event.kind === "log" ? " (logged while this step ran)" : "";
+  return {
+    severity: event.severity,
+    message: `Run ${when}: ${event.message}${repeats}${during}`,
+    line: event.step?.line ?? null,
+    column: null,
+    source: event.source,
+    stale,
+    origin: "run",
+  };
+}
+
+/** "Paused by watchdog linien_detection-1_lock (rule x, critical): reason" */
+export function formatSequencerPause(pause: SequencerPauseInfo): string {
+  const trigger = pause.trigger;
+  const who = trigger?.watchdogId
+    ? `watchdog ${trigger.watchdogId}${
+        trigger.rule || trigger.severity
+          ? ` (${[trigger.rule ? `rule ${trigger.rule}` : null, trigger.severity]
+              .filter(Boolean)
+              .join(", ")})`
+          : ""
+      }`
+    : pause.source ?? "unknown";
+  return `Paused by ${who}${pause.reason ? `: ${pause.reason}` : ""}`;
 }
 
 export function formatDurationCompact(value: number | null | undefined): string {

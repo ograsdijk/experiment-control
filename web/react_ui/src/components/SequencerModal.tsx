@@ -36,6 +36,8 @@ import {
 import {
   formatDurationCompact,
   formatSequencerEta,
+  formatSequencerPause,
+  runEventToDiagnostic,
 } from "../features/sequencer/utils";
 import type { StreamAnalysisWorkspaceConfig } from "../features/stream/types";
 import { SequencerMetadataPanel } from "../features/sequencer/components/SequencerMetadataPanel";
@@ -49,6 +51,8 @@ import type {
   SequencerDiagnostic,
   SequencerErrorDetail,
   SequencerOutlineMetadata,
+  SequencerPauseInfo,
+  SequencerRunEvent,
   SequencerProgress,
   SequencerStepDetail,
   SequencerYamlEditorHandle,
@@ -95,6 +99,10 @@ type Props = {
   loadedSource: string | null;
   /** What the editor text came from (file name or loaded source). */
   editorLabel: string | null;
+  /** Who paused the run and why, while paused. */
+  pauseInfo: SequencerPauseInfo | null;
+  /** Events of the current/last run (pauses, failures, warnings). */
+  runEvents: ReadonlyArray<SequencerRunEvent>;
   autoloadError: string | null;
   statusError: string | null;
   modalError: string | null;
@@ -188,6 +196,8 @@ export function SequencerModal({
   completedSteps,
   loadedSource,
   editorLabel,
+  pauseInfo,
+  runEvents,
   autoloadError,
   statusError,
   modalError,
@@ -281,6 +291,19 @@ export function SequencerModal({
   const warningCount = diagnostics.filter((diag) => diag.severity === "warning").length;
   const anyStale = diagnostics.some((diag) => diag.stale);
   const [stepFocus, setStepFocus] = useState<{ line: number; nonce: number } | null>(null);
+  // Run events point at the loaded sequence's lines: stale while the editor
+  // holds other (not yet loaded) text.
+  const runDiagnostics = useMemo(
+    () => runEvents.map((event) => runEventToDiagnostic(event, yamlDirty)),
+    [runEvents, yamlDirty]
+  );
+  const markerDiagnostics = useMemo(
+    () => [...diagnostics, ...runDiagnostics],
+    [diagnostics, runDiagnostics]
+  );
+  const runErrorCount = runEvents.filter((event) => event.severity === "error").length;
+  const runWarningCount = runEvents.filter((event) => event.severity === "warning").length;
+  const showPause = runtimeState === "PAUSED" && pauseInfo !== null;
   const outline = useMemo(() => {
     try {
       return buildSequencerStepOutline(yamlText);
@@ -450,7 +473,12 @@ export function SequencerModal({
         </Group>
 
         {/* Current step and messages, only when there is something to say. */}
-        {(currentStep || progress?.approximate || autoloadError || statusError || modalError) && (
+        {(currentStep ||
+          showPause ||
+          progress?.approximate ||
+          autoloadError ||
+          statusError ||
+          modalError) && (
           <Stack gap={2} style={{ flexShrink: 0 }}>
             {currentStep && (
               <Text size="xs" c="dimmed" truncate>
@@ -464,6 +492,11 @@ export function SequencerModal({
                       .filter(Boolean)
                       .join(" | ")})`
                   : ""}
+              </Text>
+            )}
+            {showPause && pauseInfo && (
+              <Text size="sm" c="yellow" fw={500}>
+                {formatSequencerPause(pauseInfo)}
               </Text>
             )}
             {progress?.approximate && progress.estimateReason && (
@@ -939,6 +972,83 @@ export function SequencerModal({
                   )}
                 </Stack>
               </Card>
+
+              <Card radius="md" p="sm" style={{ border: "1px solid var(--card-border)" }}>
+                <Stack gap={6}>
+                  <Group gap="xs">
+                    <Text size="sm" fw={600}>
+                      This run
+                    </Text>
+                    {runErrorCount > 0 && (
+                      <Badge size="xs" variant="filled" color="red">
+                        {runErrorCount} error{runErrorCount === 1 ? "" : "s"}
+                      </Badge>
+                    )}
+                    {runWarningCount > 0 && (
+                      <Badge size="xs" variant="light" color="yellow">
+                        {runWarningCount} warning{runWarningCount === 1 ? "" : "s"}
+                      </Badge>
+                    )}
+                  </Group>
+                  {runEvents.length === 0 ? (
+                    <Text size="xs" c="dimmed">
+                      Pauses, failures and warnings of the current run appear here.
+                    </Text>
+                  ) : (
+                    [...runEvents].reverse().map((event, idx) => {
+                      const asDiag = runEventToDiagnostic(event, yamlDirty);
+                      return (
+                        <Stack
+                          key={`run:${runEvents.length - idx}`}
+                          gap={2}
+                          style={{ opacity: yamlDirty ? 0.6 : 1 }}
+                        >
+                          <Group gap={4} justify="space-between" wrap="nowrap">
+                            <Group gap={4} wrap="nowrap" style={{ minWidth: 0 }}>
+                              <Badge
+                                size="xs"
+                                variant="light"
+                                color={
+                                  event.severity === "error"
+                                    ? "red"
+                                    : event.severity === "warning"
+                                      ? "yellow"
+                                      : "gray"
+                                }
+                              >
+                                {event.kind.replace("_", " ")}
+                              </Badge>
+                              <Text size="xs" c="dimmed" truncate>
+                                {formatDurationCompact(event.elapsedS)}
+                                {event.count > 1 ? ` · x${event.count}` : ""}
+                                {event.source ? ` · ${event.source}` : ""}
+                              </Text>
+                            </Group>
+                            {event.step?.line != null && (
+                              <Button
+                                size="compact-xs"
+                                variant="subtle"
+                                color="gray"
+                                onClick={() => jumpToDiagnostic(asDiag)}
+                              >
+                                L{event.step.line}
+                              </Button>
+                            )}
+                          </Group>
+                          <Text size="xs" style={{ whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
+                            {event.message}
+                          </Text>
+                          {event.step?.summary && (
+                            <Text size="xs" c="dimmed" truncate>
+                              at {event.step.summary}
+                            </Text>
+                          )}
+                        </Stack>
+                      );
+                    })
+                  )}
+                </Stack>
+              </Card>
             </Stack>
           </ScrollArea>
 
@@ -972,7 +1082,7 @@ export function SequencerModal({
                 streamWorkspaces={streamWorkspaces}
                 latestSignalsByDevice={latestSignalsByDevice}
                 colorScheme={colorScheme}
-                diagnostics={diagnostics}
+                diagnostics={markerDiagnostics}
                 focusRequest={stepFocus}
               />
             </Tabs.Panel>
@@ -1026,7 +1136,7 @@ export function SequencerModal({
                       value={yamlText}
                       onChange={onYamlTextChange}
                       colorScheme={colorScheme}
-                      diagnostics={diagnostics}
+                      diagnostics={markerDiagnostics}
                       readOnly={yamlViewMode !== "edit"}
                     />
                   </Suspense>
