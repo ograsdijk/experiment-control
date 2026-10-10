@@ -549,5 +549,5 @@ def parse_sequence(raw: Any) -> SequenceSpec:
 
 
 def load_sequence_yaml(text: str) -> SequenceSpec:
-    raw = load_yaml_text(text, source="sequence_yaml")
+    raw = load_yaml_text(text, source="sequence_yaml", yaml12_floats=True)
     return parse_sequence(raw)

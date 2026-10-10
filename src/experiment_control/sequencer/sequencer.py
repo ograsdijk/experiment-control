@@ -833,7 +833,7 @@ class SequencerProcess(ManagedProcessBase):
     ) -> tuple[bool, Any | None, list[Json]]:
         diagnostics: list[Json] = []
         try:
-            raw = load_yaml_text(text, source=source)
+            raw = load_yaml_text(text, source=source, yaml12_floats=True)
         except Exception as e:
             line = getattr(e, "line", None)
             column = getattr(e, "column", None)
