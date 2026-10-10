@@ -2912,7 +2912,18 @@ class SequencerProcess(ManagedProcessBase):
         }
         resp = self._call_process("hdf_writer", "hdf.streams.expect", params)
         if not bool(resp.get("ok", False)):
-            raise RuntimeError(f"hdf.streams.expect failed: {self._device_error_text(resp)}")
+            names = ", ".join(f"{device_id}/{stream}" for device_id, stream in streams)
+            err = resp.get("error")
+            if isinstance(err, dict) and err.get("code") == "hdf_not_writing":
+                raise RuntimeError(
+                    "the HDF writer is not writing a file, so the context for "
+                    f"{names} cannot be recorded; start HDF recording before "
+                    "running the sequence"
+                )
+            raise RuntimeError(
+                f"the HDF writer refused the streams {names} "
+                f"(hdf.streams.expect): {self._device_error_text(resp)}"
+            )
 
     def _begin_set_context(
         self, streams: list[tuple[str, str]], context_id: int, fields: dict[str, Any]

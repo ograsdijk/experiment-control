@@ -55,6 +55,28 @@ class ManagerClientProvenanceTests(unittest.TestCase):
         self.assertEqual(socket.sent["source_kind"], "process")
         self.assertEqual(socket.sent["source_id"], "step_guard")
 
+    def test_process_rpc_backfills_provenance(self) -> None:
+        socket = _Socket()
+        client = ManagerClient(
+            ctx=_Context(socket),
+            manager_rpc="tcp://127.0.0.1:1",
+            manager_pub="tcp://127.0.0.1:2",
+            rpc_timeout_ms=100,
+            process_id="sequencer",
+            subscribe_telemetry=False,
+        )
+        client.call(
+            {
+                "type": "manager.processes.rpc",
+                "process_id": "hdf_writer",
+                "request": {"type": "hdf.status", "params": {}},
+            }
+        )
+
+        self.assertEqual(socket.sent["caller_process_id"], "sequencer")
+        self.assertEqual(socket.sent["source_kind"], "process")
+        self.assertEqual(socket.sent["source_id"], "sequencer")
+
     def test_process_command_preserves_explicit_provenance(self) -> None:
         socket = _Socket()
         client = ManagerClient(

@@ -511,7 +511,9 @@ export function SequencerModal({
             )}
             {statusError && (
               <Text size="xs" c="red">
-                {errorDetail?.formatted ?? statusError}
+                {/* `formatted` already ends in the location; with a step we
+                    append our own, so use the bare message. */}
+                {errorDetail?.step ? errorDetail.message : (errorDetail?.formatted ?? statusError)}
                 {errorDetail?.step
                   ? ` (${[
                       errorDetail.step.line !== null ? `line ${errorDetail.step.line}` : null,
