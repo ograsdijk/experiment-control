@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 import re
 import statistics
@@ -29,7 +30,13 @@ from .ast import (
     WhileStep,
     WaitUntilStep,
 )
-from .eval import eval_condition, render_templates, to_attrdict
+from .eval import (
+    OperandError,
+    TemplateError,
+    eval_condition,
+    render_templates,
+    to_attrdict,
+)
 from .progress import StepDurationStats
 from .run_events import RunEventLog
 from .ranges import generate_from_gen
@@ -131,6 +138,10 @@ class _WaitState:
     samples: list[tuple[float, Any]]
     max_samples: int
     stable_since: float | None = None
+    last_value: Any = None
+    last_age_s: float | None = None
+    telemetry_label: str | None = None
+    telemetry_max_age_s: float | None = None
 
 
 @dataclass(frozen=True)
@@ -196,6 +207,78 @@ def _unmark_stale(env: dict[str, Any], names: set[str] | frozenset[str]) -> None
     stale = env.get(_WALK_STALE_KEY)
     if stale and names:
         env[_WALK_STALE_KEY] = stale - frozenset(names)
+
+
+def _type_label(value: Any) -> str:
+    if value is None:
+        return "None"
+    return type(value).__name__
+
+
+def _as_float(value: Any, what: str) -> float:
+    """float(value) with a field-aware error instead of Python's raw one."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{what}, got {value!r}") from None
+
+
+def _as_int(value: Any, what: str) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{what}, got {value!r}") from None
+
+
+def _describe_condition(cond: Any, limit: int = 200) -> str:
+    try:
+        text = json.dumps(cond, default=str)
+    except Exception:
+        text = str(cond)
+    return text if len(text) <= limit else text[: limit - 3] + "..."
+
+
+def _extract_from_result(result: Any, spec: Any, *, label: str) -> Any:
+    """`extract_value` with messages that name the label and the real problem."""
+    kind = spec.get("kind", "scalar") if isinstance(spec, dict) else "scalar"
+    ref = spec.get("ref") if isinstance(spec, dict) else None
+    if kind == "scalar":
+        return result
+    if kind == "key":
+        if not isinstance(result, dict):
+            raise ValueError(
+                f"{label}: call result is {_article(result)}, "
+                f"not a mapping with key {ref!r}"
+            )
+        if ref not in result:
+            keys = ", ".join(str(k) for k in result) or "(none)"
+            raise ValueError(f"{label}: result has no key {ref!r} (keys: {keys})")
+        return result[ref]
+    if kind == "index":
+        if not isinstance(result, (list, tuple, str)):
+            raise ValueError(
+                f"{label}: call result is {_article(result)}, "
+                f"not a list with index {ref!r}"
+            )
+        try:
+            return result[ref]  # type: ignore[index]
+        except (IndexError, TypeError):
+            raise ValueError(
+                f"{label}: cannot take index {ref!r} of a result with "
+                f"{len(result)} items"
+            ) from None
+    if kind == "attr":
+        if not isinstance(ref, str) or not hasattr(result, ref):
+            raise ValueError(
+                f"{label}: call result ({_type_label(result)}) has no attribute {ref!r}"
+            )
+        return getattr(result, ref)
+    return extract_value(result, kind=kind, ref=ref)
+
+
+def _article(value: Any) -> str:
+    name = _type_label(value)
+    return f"a {name}" if name != "None" else "None"
 
 
 def _serpentine_index(env: dict[str, Any]) -> int | None:
@@ -1085,11 +1168,27 @@ class SequencerRuntime:
         """
         return eval_condition(self._resolve_value(cond, env=env_view, live=live), env_view)
 
-    def _eval_condition_safe(self, cond: Any) -> bool:
+    def _eval_condition(self, cond: Any, kind: str, *, polling: bool = False) -> bool:
+        """Evaluate a live `if`/`while`/`wait_until` condition.
+
+        A condition that cannot be evaluated fails the step with a message
+        naming the step kind. With `polling` (wait_until), failures caused by
+        a missing value (a None sample compared with a number, a failed
+        sample call) count as "not met yet"; template errors (unknown names,
+        syntax errors, operators misused on real values) still fail the step.
+        """
         try:
             return self._condition_holds(cond, self._env_view(), live=True)
-        except Exception:
-            return False
+        except Exception as exc:
+            if polling:
+                if isinstance(exc, OperandError):
+                    if exc.none_involved:
+                        return False
+                elif not isinstance(exc, TemplateError):
+                    return False
+            raise ValueError(
+                f"{kind} condition could not be evaluated: {exc}"
+            ) from exc
 
     def _interruptible(self) -> bool:
         """Whether the run loop may act on stop/pause/tick-budget right now.
@@ -2222,7 +2321,7 @@ class SequencerRuntime:
                     self._stack.append(_Frame(frame.finally_steps, run_during_unwind=True))
                 continue
             if isinstance(frame, _WhileFrame):
-                ok = self._eval_condition_safe(frame.condition)
+                ok = self._eval_condition(frame.condition, "while")
                 if not ok:
                     self._stack.pop()
                     continue
@@ -2356,11 +2455,16 @@ class SequencerRuntime:
         return f"{message} [{'; '.join(parts)}]"
 
     @staticmethod
-    def _response_error_text(resp: dict[str, Any]) -> str:
+    def _response_error_text(resp: dict[str, Any], target: str | None = None) -> str:
         error = resp.get("error")
         if isinstance(error, dict):
             message = error.get("message")
             code = error.get("code")
+            who = f"process {target!r}" if target else "the process"
+            if not message and code == "unknown_process":
+                message = f"{who} is not registered with the manager"
+            elif not message and code == "process_not_running":
+                message = f"{who} is not running"
             if message and code:
                 return f"{message} ({code})"
             if message:
@@ -2543,7 +2647,10 @@ class SequencerRuntime:
         return True
 
     def _execute_sleep_step(self, step: SleepStep) -> bool:
-        seconds = float(render_templates(step.seconds, self._env_view()))
+        seconds = _as_float(
+            render_templates(step.seconds, self._env_view()),
+            "sleep: expected seconds as a number",
+        )
         self._sleep_until = time.monotonic() + seconds
         self._active_sleep_s = max(0.0, seconds)
         return True
@@ -2558,12 +2665,15 @@ class SequencerRuntime:
         return False
 
     def _execute_repeat_step(self, step: RepeatStep) -> bool:
-        times = int(render_templates(step.times, self._env_view()))
+        times = _as_int(
+            render_templates(step.times, self._env_view()),
+            "repeat.times must be an integer",
+        )
         self._stack.append(_RepeatFrame(times, step.body))
         return False
 
     def _execute_if_step(self, step: IfStep) -> bool:
-        ok = self._eval_condition_safe(step.condition)
+        ok = self._eval_condition(step.condition, "if")
         branch = step.then_steps if ok else (step.else_steps or [])
         self._stack.append(_Frame(branch))
         return False
@@ -2774,28 +2884,23 @@ class SequencerRuntime:
             params=params,
         )
         if not resp.get("ok", False):
-            return self._fail_step(self._response_error_text(resp))
+            return self._fail_step(self._response_error_text(resp, process or device))
         if step.save_as:
             self._env[step.save_as] = resp
         if step.extract and step.assign:
             return self._fail_step("extract and assign are mutually exclusive")
         if step.extract:
-            value = extract_value(
-                resp.get("result"),
-                kind=step.extract.get("kind", "scalar"),
-                ref=step.extract.get("ref"),
-            )
             target = step.save_as or "value"
-            self._env[target] = value
+            self._env[target] = _extract_from_result(
+                resp.get("result"), step.extract, label=f"extract {target}"
+            )
         if step.assign:
             result = resp.get("result")
             for key, spec in step.assign.items():
                 if not isinstance(spec, dict):
                     continue
-                self._env[key] = extract_value(
-                    result,
-                    kind=spec.get("kind", "scalar"),
-                    ref=spec.get("ref"),
+                self._env[key] = _extract_from_result(
+                    result, spec, label=f"assign {key}"
                 )
         return False
 
@@ -3883,10 +3988,8 @@ class SequencerRuntime:
                 )
             extract = call_spec.get("extract")
             if isinstance(extract, dict):
-                return extract_value(
-                    resp.get("result"),
-                    kind=extract.get("kind", "scalar"),
-                    ref=extract.get("ref"),
+                return _extract_from_result(
+                    resp.get("result"), extract, label="extract"
                 )
             return resp.get("result")
         if isinstance(value, dict):
@@ -3900,17 +4003,17 @@ class SequencerRuntime:
     def _start_wait_until(self, raw: dict[str, Any]) -> None:
         env = self._env_view()
 
-        def _render_float(value: Any, default: Any) -> float:
+        def _render_float(value: Any, default: Any, name: str) -> float:
             rendered = render_templates(value if value is not None else default, env)
-            return float(rendered)
+            return _as_float(rendered, f"wait_until.{name} must be a number")
 
-        timeout_s = _render_float(raw.get("timeout_s", 0), 0)
+        timeout_s = _render_float(raw.get("timeout_s", 0), 0, "timeout_s")
         # Clamp to a sane minimum: with the dynamic poll timeout (F15), an
         # `every_s` of 0 (or sub-millisecond) would otherwise have the outer
         # process loop busy-poll at ~1000Hz for the whole wait duration —
         # previously impossible since the poll was always fixed at 50ms.
-        every_s = max(_render_float(raw.get("every_s", 0.1), 0.1), _MIN_WAIT_EVERY_S)
-        stable_for_s = _render_float(raw.get("stable_for_s", 0), 0)
+        every_s = max(_render_float(raw.get("every_s", 0.1), 0.1, "every_s"), _MIN_WAIT_EVERY_S)
+        stable_for_s = _render_float(raw.get("stable_for_s", 0), 0, "stable_for_s")
         sample_spec_raw = raw.get("sample", {})
         sample_spec = render_templates(sample_spec_raw, env)
         if not isinstance(sample_spec, dict):
@@ -3972,6 +4075,34 @@ class SequencerRuntime:
             self._fail_step(f"set_context failed: {error}")
         return True
 
+    @staticmethod
+    def _wait_timeout_message(ws: _WaitState) -> str:
+        parts = [
+            f"wait_until timed out after {ws.timeout_s:g}s",
+            f"condition {_describe_condition(ws.condition)} was not met",
+        ]
+        if ws.last_value is None:
+            if ws.telemetry_label and ws.last_age_s is not None:
+                parts.append(
+                    f"latest telemetry for {ws.telemetry_label} is "
+                    f"{ws.last_age_s:.1f}s old (max_age_s={ws.telemetry_max_age_s or 0:g})"
+                )
+            elif ws.telemetry_label:
+                limit = (
+                    f"signal not found or older than max_age_s={ws.telemetry_max_age_s:g}"
+                    if ws.telemetry_max_age_s
+                    else "signal not found"
+                )
+                parts.append(f"no telemetry for {ws.telemetry_label} ({limit})")
+            else:
+                parts.append("no sample was received")
+        else:
+            seen = f"last sample {_describe_condition(ws.last_value, 80)}"
+            if ws.last_age_s is not None:
+                seen += f" ({ws.last_age_s:.1f}s old)"
+            parts.append(seen)
+        return "; ".join(parts)
+
     def _step_wait_until(self, now: float) -> bool:
         if self._check_stop_pause():
             return False
@@ -3980,12 +4111,14 @@ class SequencerRuntime:
             return True
         if ws.timeout_s and (now - ws.start_t) > ws.timeout_s:
             self._wait_state = None
-            self._fail_step("wait_until timeout")
+            self._fail_step(self._wait_timeout_message(ws))
             return True
         if now < ws.next_sample_t:
             return False
 
         sample = self._resolve_value(ws.sample_spec)
+        ws.last_value = sample
+        ws.last_age_s = None
         sample_ts = None
         if isinstance(ws.sample_spec, dict) and "telemetry" in ws.sample_spec:
             spec = ws.sample_spec.get("telemetry", {})
@@ -3994,10 +4127,19 @@ class SequencerRuntime:
                 process = str(spec.get("process", ""))
                 signal = str(spec.get("signal", ""))
                 if (device or process) and signal:
+                    ws.telemetry_label = f"{device or process}.{signal}"
+                    max_age_raw = spec.get("max_age_s")
+                    try:
+                        ws.telemetry_max_age_s = (
+                            float(max_age_raw) if max_age_raw else None
+                        )
+                    except (TypeError, ValueError):
+                        ws.telemetry_max_age_s = None
                     cached = self._dispatch_get_telemetry(
                         device=device, process=process or None, signal=signal
                     )
                     if isinstance(cached, dict):
+                        ws.last_age_s = self._telemetry_sample_age_s(cached)
                         try:
                             t_mono_raw = cached.get("t_mono_recv")
                             if not isinstance(
@@ -4040,7 +4182,7 @@ class SequencerRuntime:
         self._env["samples"] = [v for _, v in ws.samples]
         self._env["sample_reduced"] = reduce_value
 
-        ok = self._eval_condition_safe(ws.condition)
+        ok = self._eval_condition(ws.condition, "wait_until", polling=True)
 
         if ok:
             if ws.stable_for_s:
