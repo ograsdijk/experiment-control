@@ -96,19 +96,40 @@ class SequencerProgressEtaTests(unittest.TestCase):
     def _progress(self, runtime: SequencerRuntime) -> dict[str, Any]:
         return runtime.status()["progress"]
 
-    def test_while_total_is_approximate_and_finishes_at_100(self) -> None:
+    def test_while_with_false_condition_is_counted_exactly(self) -> None:
         runtime = self._runtime()
-        runtime.load(_spec([WhileStep(condition=False, body=[])]))
+        runtime.load(
+            _spec([WhileStep(condition=False, body=[AssignStep(values={"a": 1})])])
+        )
         runtime.start()
-
         progress = self._progress(runtime)
         self.assertEqual(progress["total_steps"], 1)
+        self.assertFalse(progress["approximate"])
+
+    def test_while_on_a_called_value_is_approximate_and_finishes_at_100(self) -> None:
+        runtime = self._runtime()
+        runtime.load(
+            _spec(
+                [
+                    CallStep(
+                        device="d",
+                        action="ready",
+                        params={},
+                        assign={"flag": {"kind": "scalar"}},
+                    ),
+                    WhileStep(condition={"eq": ["${flag}", True]}, body=[]),
+                ]
+            )
+        )
+        runtime.start()
+        progress = self._progress(runtime)
+        self.assertEqual(progress["total_steps"], 2)
         self.assertTrue(progress["approximate"])
         self.assertIn("while", str(progress["estimate_reason"]))
 
         self._run(runtime)
         progress = self._progress(runtime)
-        self.assertEqual(progress["completed_steps"], 1)
+        self.assertEqual(progress["completed_steps"], 2)
         self.assertEqual(progress["percent"], 100.0)
         self.assertEqual(progress["eta_s"], 0.0)
 
@@ -143,7 +164,7 @@ class SequencerProgressEtaTests(unittest.TestCase):
         self.assertEqual(progress["percent"], 100.0)
         self.assertLess(min(t for t in totals if t is not None), 8)
 
-    def test_for_over_assigned_var_becomes_exact_after_assign(self) -> None:
+    def test_for_over_assigned_var_is_exact_from_the_start(self) -> None:
         runtime = self._runtime()
         runtime.load(
             _spec(
@@ -159,17 +180,133 @@ class SequencerProgressEtaTests(unittest.TestCase):
             )
         )
         runtime.start()
-        progress = self._progress(runtime)
-        self.assertIsNone(progress["total_steps"])
-        self.assertIn("targets", str(progress["estimate_reason"]))
-
-        runtime.tick()  # runs the assign, starts the sleep
-        self.clock.t += 0.5
-        self.assertIsNone(self._progress(runtime)["total_steps"])  # throttled
-        self.clock.t += 0.6
+        # The plain assign is replayed by the estimate.
         progress = self._progress(runtime)
         self.assertEqual(progress["total_steps"], 6)
         self.assertFalse(progress["approximate"])
+
+    def test_linspace_around_a_called_center_has_an_exact_count(self) -> None:
+        runtime = self._runtime()
+        runtime.load(
+            _spec(
+                [
+                    CallStep(
+                        device="d",
+                        action="pos",
+                        params={},
+                        assign={"c": {"kind": "scalar"}},
+                    ),
+                    ForStep(
+                        bind={"value": "x"},
+                        in_expr={
+                            "gen": {
+                                "linspace": {"start": "${c}", "stop": 10.0, "num": 5}
+                            }
+                        },
+                        body=[AssignStep(values={"y": "${x}"})],
+                    ),
+                ]
+            )
+        )
+        runtime.start()
+        progress = self._progress(runtime)
+        # The center isn't known until the call runs, but num fixes the count.
+        self.assertEqual(progress["total_steps"], 1 + 1 + 5)
+        self.assertFalse(progress["approximate"])
+
+    def test_repeat_count_assigned_from_the_loop_variable(self) -> None:
+        runtime = self._runtime()
+        runtime.load(
+            _spec(
+                [
+                    ForStep(
+                        bind={"value": "v"},
+                        in_expr=[1, 2, 3],
+                        body=[
+                            AssignStep(values={"n": "${v * 2}"}),
+                            RepeatStep(
+                                times="${n}", body=[AssignStep(values={"a": 1})]
+                            ),
+                        ],
+                    )
+                ]
+            )
+        )
+        runtime.start()
+        # for + 3 x (assign + repeat) + (2 + 4 + 6) assigns
+        progress = self._progress(runtime)
+        self.assertEqual(progress["total_steps"], 1 + 6 + 12)
+        self.assertFalse(progress["approximate"])
+
+    def test_unknown_if_takes_the_longer_branch_in_time(self) -> None:
+        runtime = self._runtime()
+        runtime.load(
+            _spec(
+                [
+                    CallStep(
+                        device="d",
+                        action="ok",
+                        params={},
+                        assign={"ok": {"kind": "scalar"}},
+                    ),
+                    IfStep(
+                        condition={"eq": ["${ok}", True]},
+                        then_steps=[SleepStep(seconds=600.0)],
+                        else_steps=[
+                            CallStep(device="d", action="a", params={}),
+                            CallStep(device="d", action="b", params={}),
+                        ],
+                    ),
+                ]
+            )
+        )
+        runtime.start()
+        progress = self._progress(runtime)
+        self.assertEqual(progress["total_steps"], 3)  # call + if + sleep
+        self.assertTrue(progress["approximate"])
+
+    def test_walk_over_budget_scales_the_rest_of_a_loop(self) -> None:
+        budget = runtime_module._WALK_BUDGET_S
+        runtime_module._WALK_BUDGET_S = -1.0
+        try:
+            runtime = self._runtime()
+            runtime.load(
+                _spec(
+                    [
+                        ForStep(
+                            bind={"value": "t"},
+                            in_expr=list(range(100)),
+                            body=[SleepStep(seconds="${t}")],
+                        )
+                    ]
+                )
+            )
+            runtime.start()
+            progress = self._progress(runtime)
+        finally:
+            runtime_module._WALK_BUDGET_S = budget
+        self.assertEqual(progress["total_steps"], 101)
+        self.assertTrue(progress["approximate"])
+        self.assertIn("estimated from its first", str(progress["estimate_reason"]))
+
+    def test_stop_without_cleanup_keeps_time_percent_and_run_phase(self) -> None:
+        inner = _spec([SleepStep(seconds=10.0), SleepStep(seconds=10.0)])
+        runtime = self._runtime(resolve_use=lambda name: inner)
+        runtime.load(_spec([RepeatStep(times=10, body=[UseStep(sequence_id="inner")])]))
+        runtime.start()
+        while runtime._completed_steps < 12:
+            self._advance(runtime)
+        self.clock.t += 2.0
+        before = self._progress(runtime)
+        self.assertIsNotNone(before["time_percent"])
+        runtime.request_stop()
+        runtime.tick()
+        runtime.tick()
+        self.assertEqual(runtime.state, "STOPPED")
+        after = self._progress(runtime)
+        self.assertEqual(after["phase"], "run")
+        self.assertIsNone(after["cleanup_total_steps"])
+        self.assertAlmostEqual(after["time_percent"], before["time_percent"], places=6)
 
     def test_stop_during_sleep_does_not_leak_into_cleanup(self) -> None:
         cleanup_assign = AssignStep(values={"done": 1})

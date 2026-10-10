@@ -169,16 +169,32 @@ def _collect_identifiers(value: Any, names: set[str]) -> None:
             _collect_identifiers(item, names)
 
 
-def _build_env_view(env: dict[str, Any], vars_map: dict[str, Any]) -> dict[str, Any]:
+def _build_env_view(
+    env: dict[str, Any], vars_map: dict[str, Any], *, walk_copy: bool = False
+) -> dict[str, Any]:
     """Template environment: vars win over assigned and loop-bound names.
 
-    Used for the live run (`self._env`) and for the progress walk's copies,
-    whose private bookkeeping keys are dropped here.
+    Used for the live run (`self._env`) and for the progress walk's copies
+    (`walk_copy=True`), whose private bookkeeping keys are dropped.
     """
-    out = {key: value for key, value in env.items() if key not in _WALK_PRIVATE_KEYS}
+    if walk_copy:
+        out = {key: value for key, value in env.items() if key not in _WALK_PRIVATE_KEYS}
+    else:
+        out = dict(env)
     out.update(vars_map)
     out["vars"] = to_attrdict(vars_map)
     return out
+
+
+def _mark_stale(env: dict[str, Any], names: set[str] | frozenset[str]) -> None:
+    if names:
+        env[_WALK_STALE_KEY] = env.get(_WALK_STALE_KEY, frozenset()) | frozenset(names)
+
+
+def _unmark_stale(env: dict[str, Any], names: set[str] | frozenset[str]) -> None:
+    stale = env.get(_WALK_STALE_KEY)
+    if stale and names:
+        env[_WALK_STALE_KEY] = stale - frozenset(names)
 
 
 def _serpentine_index(env: dict[str, Any]) -> int | None:
@@ -338,10 +354,15 @@ class _EstimateUnknown(Exception):
 
 
 # Private keys in the walker's env: the vars in effect for that part of the
-# walk (a `use` step swaps them) and the names bound by enclosing `for` loops.
+# walk (a `use` step swaps them) and the "stale" names, whose value in the
+# walk's env is not what the run will see when it gets there (assigned by a
+# call or a wait_until, or by an earlier iteration of an enclosing loop).
 _WALK_VARS_KEY = "__walk_vars__"
-_WALK_BOUND_KEY = "__walk_bound__"
-_WALK_PRIVATE_KEYS = (_WALK_VARS_KEY, _WALK_BOUND_KEY)
+_WALK_STALE_KEY = "__walk_stale__"
+_WALK_PRIVATE_KEYS = (_WALK_VARS_KEY, _WALK_STALE_KEY)
+# Time budget for one walk: a loop whose body has to be walked record by
+# record is scaled from the records walked so far once it is used up.
+_WALK_BUDGET_S = 0.02
 _LEAF_STEP_TYPES = (
     CallStep,
     SetStep,
@@ -512,6 +533,10 @@ class SequencerRuntime:
         # id(body) -> (body, names its step counts depend on); see
         # _count_names().
         self._count_names_cache: dict[int, tuple[list[Step], frozenset[str]]] = {}
+        self._assigned_cache: dict[int, tuple[list[Step], dict[str, list[Any]]]] = {}
+        self._walk_deadline = 0.0
+        self._last_time_percent: float | None = None
+        self._cleanup_has_steps = False
         self._loop_started_completed = 0
         self._loop_started_elapsed_s = 0.0
         self._progress_finished = False
@@ -1079,6 +1104,7 @@ class SequencerRuntime:
             return False
         now = time.monotonic()
         self._cleanup_frozen = self._progress_core(now)
+        self._cleanup_has_steps = self._has_finally_work()
         self._abandon_active_step(now)
         self._cleanup_started_completed = self._completed_steps
         self._work_dirty = True
@@ -1094,6 +1120,19 @@ class SequencerRuntime:
         self._current_step = None
         self._current_step_detail = None
         return True
+
+    def _has_finally_work(self) -> bool:
+        """Whether a terminal unwind will run any `finally` steps.
+
+        Other unwind work (atomic/use on_exit callbacks) runs no steps, so a
+        stop with only that is not shown as a cleanup phase.
+        """
+        for frame in self._stack:
+            if isinstance(frame, _TryFrame) and not frame.finalizing and frame.finally_steps:
+                return True
+            if isinstance(frame, _Frame) and frame.run_during_unwind:
+                return True
+        return False
 
     def _has_terminal_unwind_work(self) -> bool:
         for frame in reversed(self._stack):
@@ -1170,6 +1209,9 @@ class SequencerRuntime:
         self._finished_since_walk = {}
         self._estimate_records_cache = {}
         self._count_names_cache = {}
+        self._assigned_cache = {}
+        self._last_time_percent = None
+        self._cleanup_has_steps = False
         self._loop_started_completed = 0
         self._loop_started_elapsed_s = 0.0
         self._progress_finished = False
@@ -1252,14 +1294,20 @@ class SequencerRuntime:
             # Stop/error unwind: run progress stays where it was interrupted;
             # the ETA and cleanup counts describe the remaining cleanup.
             core = dict(self._cleanup_frozen)
-            phase = "cleanup"
-            cleanup_completed = self._completed_steps - self._cleanup_started_completed
+            phase = "run"
+            cleanup_completed = None
             cleanup_total = None
             core["eta_s"] = None
-            if self._pending_terminal_state is None:
+            if not self._cleanup_has_steps:
+                pass
+            elif self._pending_terminal_state is None:
+                phase = "cleanup"
+                cleanup_completed = self._completed_steps - self._cleanup_started_completed
                 cleanup_total = cleanup_completed
                 core["eta_s"] = 0.0
             else:
+                phase = "cleanup"
+                cleanup_completed = self._completed_steps - self._cleanup_started_completed
                 work = self._remaining_work(now)
                 if work is not None:
                     remaining_steps, remaining_s = self._remaining_totals(work, now)
@@ -1347,6 +1395,12 @@ class SequencerRuntime:
             time_percent = 100.0
         elif eta_s is not None and (scope_elapsed_s + eta_s) > 0:
             time_percent = (scope_elapsed_s / (scope_elapsed_s + eta_s)) * 100.0
+        if live:
+            self._last_time_percent = time_percent
+        elif time_percent is None:
+            # Stopped or errored: keep the bar where it was rather than
+            # switching to the (unrelated) step-based percent.
+            time_percent = self._last_time_percent
         return {
             "completed_steps": completed_out,
             "total_steps": total,
@@ -1453,12 +1507,8 @@ class SequencerRuntime:
     def _walk_remaining(self) -> _RemainingWork:
         """Count the step executions still ahead, from the live stack down."""
         work = _RemainingWork(unwind=self._pending_terminal_state is not None)
-        bound: set[str] = {"__loop_index"}
-        for frame in self._stack:
-            if isinstance(frame, _ForFrame):
-                bound.update(frame.bind.values())
+        self._walk_deadline = time.perf_counter() + _WALK_BUDGET_S
         base_env = dict(self._env)
-        base_env[_WALK_BOUND_KEY] = frozenset(bound)
         vars_map = self._vars
         for frame in reversed(self._stack):
             env = dict(base_env)
@@ -1478,7 +1528,9 @@ class SequencerRuntime:
                     frame.bind, frame.records, frame.index, frame.body, env, work, 1
                 )
             elif isinstance(frame, _RepeatFrame):
-                self._walk_steps(frame.body, env, work, max(0, frame.remaining))
+                if frame.remaining > 0:
+                    body_env = self._iteration_env(env, frame.body)
+                    self._walk_steps(frame.body, body_env, work, frame.remaining)
             elif isinstance(frame, _TryFrame):
                 if not frame.finalizing:
                     self._walk_steps(frame.finally_steps, env, work, 1)
@@ -1493,6 +1545,8 @@ class SequencerRuntime:
     def _walk_steps(
         self, steps: list[Step], env: dict[str, Any], work: _RemainingWork, mult: int
     ) -> None:
+        # `env` is updated in place as assigns are replayed, like the run's
+        # single env; callers pass a copy where a scope must not leak.
         if mult <= 0:
             return
         for step in steps:
@@ -1510,10 +1564,18 @@ class SequencerRuntime:
             if isinstance(step, TryStep):
                 self._walk_steps(step.finally_steps, env, work, mult)
             return
+        if isinstance(step, AssignStep):
+            self._replay_assign(step, env)
+            return
         if isinstance(step, SleepStep):
             self._note_sleep_seconds(step, env, work, mult)
             return
         if isinstance(step, _LEAF_STEP_TYPES):
+            # Values from calls, wait_until samples and parallel branches
+            # can't be known ahead of time.
+            outputs = self._assigned_names([step])
+            if outputs:
+                _mark_stale(env, outputs)
             return
         if isinstance(step, AtomicStep):
             self._walk_steps(step.body, env, work, mult)
@@ -1533,28 +1595,82 @@ class SequencerRuntime:
             nested_env = dict(env)
             nested_env[_WALK_VARS_KEY] = merged
             self._walk_steps(spec.steps, nested_env, work, mult)
+            _mark_stale(env, self._assigned_names(spec.steps))
             return
         if isinstance(step, RepeatStep):
+            self._flag_if_stale(step.times, env, work, "repeat count")
             try:
                 times = int(render_templates(step.times, self._estimate_env_view(env)))
             except Exception as exc:
                 raise _EstimateUnknown(f"repeat count could not render: {exc}") from exc
-            self._walk_steps(step.body, env, work, mult * max(0, times))
+            if times > 0:
+                body_env = self._iteration_env(env, step.body)
+                self._walk_steps(step.body, body_env, work, mult * times)
+                _mark_stale(env, self._assigned_names(step.body))
             return
         if isinstance(step, ForStep):
+            stale_input = self._reads_stale(step.in_expr, env)
+            if stale_input and not self._count_fields_fresh(step.in_expr, env):
+                work.approximate("for input depends on values assigned during the run")
             records = self._estimate_for_records(step, env)
-            self._walk_records(step.bind, records, 0, step.body, env, work, mult)
+            self._walk_records(
+                step.bind, records, 0, step.body, env, work, mult, stale_values=stale_input
+            )
+            _mark_stale(env, self._assigned_names(step.body))
             return
         if isinstance(step, IfStep):
             self._walk_if(step, env, work, mult)
             return
         if isinstance(step, WhileStep):
-            work.approximate("while loop assumed to run once")
-            self._walk_steps(step.body, env, work, mult)
+            self._walk_while(step, env, work, mult)
             return
         if isinstance(step, AdaptiveStep):
             raise _EstimateUnknown("adaptive step has unknown trial count")
         raise _EstimateUnknown(f"{step_kind(step)} step could not be estimated")
+
+    def _replay_assign(self, step: AssignStep, env: dict[str, Any]) -> None:
+        """Apply a plain `assign` to the walk's env, as the run will.
+
+        Values that need telemetry or a call, or that read stale names,
+        can't be known ahead of time: those names become stale instead.
+        """
+        for key, value in step.values.items():
+            name = str(key)
+            if self._reads_stale(value, env):
+                _mark_stale(env, {name})
+                continue
+            try:
+                env[name] = self._resolve_value(
+                    value, env=self._estimate_env_view(env), live=False
+                )
+            except Exception:
+                _mark_stale(env, {name})
+                continue
+            _unmark_stale(env, {name})
+
+    def _reads_stale(self, value: Any, env: dict[str, Any]) -> bool:
+        stale = env.get(_WALK_STALE_KEY)
+        if not stale:
+            return False
+        names: set[str] = set()
+        _collect_identifiers(value, names)
+        return bool(names & stale)
+
+    def _flag_if_stale(
+        self, value: Any, env: dict[str, Any], work: _RemainingWork, what: str
+    ) -> None:
+        if self._reads_stale(value, env):
+            work.approximate(f"{what} depends on values assigned during the run")
+
+    def _iteration_env(self, env: dict[str, Any], body: list[Step]) -> dict[str, Any]:
+        """Env for a future iteration of `body`.
+
+        Whatever the body assigns still holds an earlier iteration's value
+        when that iteration starts, so those names are stale until replayed.
+        """
+        body_env = dict(env)
+        _mark_stale(body_env, self._assigned_names(body))
+        return body_env
 
     def _walk_records(
         self,
@@ -1565,23 +1681,47 @@ class SequencerRuntime:
         env: dict[str, Any],
         work: _RemainingWork,
         mult: int,
+        *,
+        stale_values: bool = False,
     ) -> None:
         remaining = len(records) - start
         if remaining <= 0 or mult <= 0:
             return
         bound = frozenset(bind.values()) | {"__loop_index"}
-        if remaining > 1 and not (self._count_names(body) & bound):
+        if remaining > 1 and not (self._count_names(body) & self._dependent_names(body, bound)):
             # No step count or sleep in the body depends on this loop's
-            # variables, so every record runs the same steps: count one and
-            # multiply. A full
-            # scan2d grid has thousands of records and status() blocks the
-            # run loop, so walking each one is not an option.
-            loop_env = self._bind_walk_record(bind, records[start], start, env)
+            # variables (directly or through an assign), so every record runs
+            # the same steps: count one and multiply. A full scan2d grid has
+            # thousands of records and status() blocks the run loop, so
+            # walking each one is not an option.
+            loop_env = self._bind_walk_record(
+                bind, records[start], start, env, body, stale_values=stale_values
+            )
             self._walk_steps(body, loop_env, work, mult * remaining)
             return
+        part = work.child()
+        walked = 0
         for index in range(start, len(records)):
-            loop_env = self._bind_walk_record(bind, records[index], index, env)
-            self._walk_steps(body, loop_env, work, mult)
+            if walked and time.perf_counter() > self._walk_deadline:
+                # Over the walk's time budget: scale the rest from the
+                # records walked so far.
+                scale = (remaining - walked) / walked
+                for key, n in list(part.counts.items()):
+                    part.counts[key] = n + round(n * scale)
+                for key, seconds in list(part.sleep_seconds.items()):
+                    part.sleep_seconds[key] = seconds * (1.0 + scale)
+                for key, n in list(part.sleep_rendered.items()):
+                    part.sleep_rendered[key] = n + round(n * scale)
+                part.approximate(
+                    f"loop of {remaining} items estimated from its first {walked}"
+                )
+                break
+            loop_env = self._bind_walk_record(
+                bind, records[index], index, env, body, stale_values=stale_values
+            )
+            self._walk_steps(body, loop_env, part, mult)
+            walked += 1
+        work.merge(part)
 
     def _count_names(self, steps: list[Step]) -> frozenset[str]:
         """Names referenced by anything in `steps` that decides step counts.
@@ -1647,31 +1787,138 @@ class SequencerRuntime:
                 if not isinstance(step.args, dict) or nested & arg_keys:
                     _collect_identifiers(step.args, names)
 
+    def _assigned_names(self, steps: list[Step]) -> frozenset[str]:
+        """Names that running `steps` can assign (at any depth)."""
+        return frozenset(self._assignments(steps))
+
+    def _assignments(self, steps: list[Step]) -> dict[str, list[Any]]:
+        """Each name `steps` can assign -> the expressions it is computed from."""
+        cached = self._assigned_cache.get(id(steps))
+        if cached is not None and cached[0] is steps:
+            return cached[1]
+        out: dict[str, list[Any]] = {}
+        self._collect_assignments(steps, out, set())
+        self._assigned_cache[id(steps)] = (steps, out)
+        return out
+
+    def _collect_assignments(
+        self, steps: list[Step], out: dict[str, list[Any]], seen_uses: set[str]
+    ) -> None:
+        for step in steps:
+            if getattr(step, "disabled", False):
+                continue
+            if isinstance(step, AssignStep):
+                for key, value in step.values.items():
+                    out.setdefault(str(key), []).append(value)
+            elif isinstance(step, CallStep):
+                for name in parallel_step_output_names(step):
+                    out.setdefault(name, []).append(step.params)
+            elif isinstance(step, WaitUntilStep):
+                for name in ("sample", "samples", "sample_reduced"):
+                    out.setdefault(name, []).append(step.raw)
+            elif isinstance(step, ForStep):
+                for name in step.bind.values():
+                    out.setdefault(str(name), []).append(step.in_expr)
+                out.setdefault("__loop_index", []).append(step.in_expr)
+                self._collect_assignments(step.body, out, seen_uses)
+            elif isinstance(step, IfStep):
+                self._collect_assignments(step.then_steps, out, seen_uses)
+                self._collect_assignments(step.else_steps or [], out, seen_uses)
+            elif isinstance(step, TryStep):
+                self._collect_assignments(step.body, out, seen_uses)
+                self._collect_assignments(step.finally_steps, out, seen_uses)
+            elif isinstance(step, (ParallelStep, AtomicStep, RepeatStep, WhileStep)):
+                self._collect_assignments(step.body, out, seen_uses)
+            elif isinstance(step, AdaptiveStep):
+                self._collect_assignments(step.body, out, seen_uses)
+                for name in step.space or {}:
+                    out.setdefault(str(name), []).append(step.space)
+            elif isinstance(step, UseStep):
+                sequence_name = str(step.sequence_id).strip()
+                if sequence_name in seen_uses:
+                    continue
+                seen_uses.add(sequence_name)
+                try:
+                    spec = self._resolve_use_spec(step.sequence_id)
+                except Exception:
+                    continue
+                self._collect_assignments(spec.steps, out, seen_uses)
+
+    def _dependent_names(self, body: list[Step], bound: frozenset[str]) -> set[str]:
+        """`bound` plus every name the body assigns from it, transitively."""
+        assignments = self._assignments(body)
+        dependent = set(bound)
+        changed = True
+        while changed:
+            changed = False
+            for name, sources in assignments.items():
+                if name in dependent:
+                    continue
+                referenced: set[str] = set()
+                _collect_identifiers(sources, referenced)
+                if referenced & dependent:
+                    dependent.add(name)
+                    changed = True
+        return dependent
+
     def _walk_if(
         self, step: IfStep, env: dict[str, Any], work: _RemainingWork, mult: int
     ) -> None:
-        # Values assigned during the run may still hold a previous
-        # iteration's result, so only trust vars and loop-bound names here.
-        trusted: dict[str, Any] = {
-            key: env[key] for key in env.get(_WALK_BOUND_KEY, ()) if key in env
-        }
-        trusted[_WALK_VARS_KEY] = env.get(_WALK_VARS_KEY, self._vars)
-        try:
-            ok: bool | None = self._condition_holds(
-                step.condition, self._estimate_env_view(trusted), live=False
-            )
-        except Exception:
-            ok = None
+        ok: bool | None = None
+        if not self._reads_stale(step.condition, env):
+            try:
+                ok = self._condition_holds(
+                    step.condition, self._estimate_env_view(env), live=False
+                )
+            except Exception:
+                ok = None
         if ok is not None:
             branch = step.then_steps if ok else (step.else_steps or [])
             self._walk_steps(branch, env, work, mult)
             return
         then_work = work.child()
-        self._walk_steps(step.then_steps, env, then_work, mult)
+        self._walk_steps(step.then_steps, dict(env), then_work, mult)
         else_work = work.child()
-        self._walk_steps(step.else_steps or [], env, else_work, mult)
-        work.merge(then_work if then_work.total >= else_work.total else else_work)
+        self._walk_steps(step.else_steps or [], dict(env), else_work, mult)
+        then_key = (self._work_seconds(then_work), then_work.total)
+        else_key = (self._work_seconds(else_work), else_work.total)
+        work.merge(then_work if then_key >= else_key else else_work)
         work.approximate("if condition depends on run-time values; assumed the longer branch")
+        _mark_stale(
+            env,
+            self._assigned_names(step.then_steps)
+            | self._assigned_names(step.else_steps or []),
+        )
+
+    def _walk_while(
+        self, step: WhileStep, env: dict[str, Any], work: _RemainingWork, mult: int
+    ) -> None:
+        if not self._reads_stale(step.condition, env):
+            try:
+                if not self._condition_holds(
+                    step.condition, self._estimate_env_view(env), live=False
+                ):
+                    return  # skipped: exact
+            except Exception:
+                pass
+        work.approximate("while loop assumed to run once")
+        body_env = self._iteration_env(env, step.body)
+        self._walk_steps(step.body, body_env, work, mult)
+        _mark_stale(env, self._assigned_names(step.body))
+
+    def _work_seconds(self, work: _RemainingWork) -> float:
+        """Rough time of `work`, for choosing between `if` branches."""
+        durations = self._step_durations
+        total = 0.0
+        for key, n in work.counts.items():
+            rendered = work.sleep_rendered.get(key, 0)
+            if rendered:
+                total += work.sleep_seconds[key] + rendered * durations.sleep_overhead_s
+                n -= rendered
+            if n > 0:
+                step = work.steps[key]
+                total += n * (durations.estimate(step, step_kind(step)) or 0.0)
+        return total
 
     def _bind_walk_record(
         self,
@@ -1679,22 +1926,47 @@ class SequencerRuntime:
         record: Any,
         index: int,
         env: dict[str, Any],
+        body: list[Step],
+        *,
+        stale_values: bool = False,
     ) -> dict[str, Any]:
-        loop_env = dict(env)
+        loop_env = self._iteration_env(env, body)
         try:
             self._bind_record(loop_env, bind, record, index)
         except (TypeError, KeyError) as exc:
             raise _EstimateUnknown(f"for loop items could not be estimated: {exc}") from exc
-        loop_env[_WALK_BOUND_KEY] = (
-            env.get(_WALK_BOUND_KEY, frozenset())
-            | frozenset(bind.values())
-            | {"__loop_index"}
-        )
+        if stale_values:
+            # Items rendered from stale inputs carry stale values; only their
+            # number (see _count_fields_fresh) may be trusted.
+            _mark_stale(loop_env, set(bind.values()))
+            _unmark_stale(loop_env, {"__loop_index"})
+        else:
+            _unmark_stale(loop_env, set(bind.values()) | {"__loop_index"})
         return loop_env
+
+    def _count_fields_fresh(self, in_expr: Any, env: dict[str, Any]) -> bool:
+        """Whether a `for` generator's item count avoids stale names.
+
+        For linspace-like generators the count comes from `num` (or
+        `sample.count`) alone: a stale `center` changes the values, not how
+        many there are.
+        """
+        if not isinstance(in_expr, dict) or not isinstance(in_expr.get("gen"), dict):
+            return False
+        gen = in_expr["gen"]
+        sample = gen.get("sample")
+        if isinstance(sample, dict) and "count" in sample:
+            return not self._reads_stale(sample["count"], env)
+        for kind in self._GEN_COUNT_ONLY_KEYS:
+            spec = gen.get(kind)
+            if isinstance(spec, dict) and "num" in spec:
+                return not self._reads_stale(spec["num"], env)
+        return False
 
     def _note_sleep_seconds(
         self, step: SleepStep, env: dict[str, Any], work: _RemainingWork, mult: int
     ) -> None:
+        self._flag_if_stale(step.seconds, env, work, "sleep duration")
         try:
             seconds = float(render_templates(step.seconds, self._estimate_env_view(env)))
         except Exception:
@@ -1705,7 +1977,9 @@ class SequencerRuntime:
 
     def _estimate_env_view(self, env: dict[str, Any]) -> dict[str, Any]:
         vars_map = env.get(_WALK_VARS_KEY)
-        return _build_env_view(env, self._vars if vars_map is None else vars_map)
+        return _build_env_view(
+            env, self._vars if vars_map is None else vars_map, walk_copy=True
+        )
 
     # Generator kinds whose element count is fixed by `num` alone: the
     # sampled values (center, span, start, stop, ...) can vary without
@@ -1767,6 +2041,10 @@ class SequencerRuntime:
         try:
             rendered = render_templates(step.in_expr, env_view)
             serpentine_index = _serpentine_index(env)
+            if not (isinstance(rendered, dict) and "gen" in rendered):
+                # A plain list is cheap to turn into records; keying a cache on
+                # its repr would cost more than it saves.
+                return self._records_from_rendered(rendered, env_view, serpentine_index)
             key = repr(rendered)
             if "serpentine" in key and serpentine_index is not None:
                 key = f"{key}|{serpentine_index % 2}"
