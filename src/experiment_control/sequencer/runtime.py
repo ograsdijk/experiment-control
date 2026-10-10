@@ -366,7 +366,10 @@ class _RemainingWork:
 
     counts: dict[int, int] = field(default_factory=dict)
     steps: dict[int, Step] = field(default_factory=dict)
-    sleep_priors: dict[int, float] = field(default_factory=dict)
+    # Rendered seconds summed over the remaining executions of each sleep
+    # step, and how many executions that sum covers (rendering can fail).
+    sleep_seconds: dict[int, float] = field(default_factory=dict)
+    sleep_rendered: dict[int, int] = field(default_factory=dict)
     approx_reason: str | None = None
     unwind: bool = False
 
@@ -380,16 +383,16 @@ class _RemainingWork:
             self.approx_reason = reason
 
     def child(self) -> "_RemainingWork":
-        return _RemainingWork(
-            sleep_priors=self.sleep_priors,
-            approx_reason=self.approx_reason,
-            unwind=self.unwind,
-        )
+        return _RemainingWork(approx_reason=self.approx_reason, unwind=self.unwind)
 
     def merge(self, other: "_RemainingWork") -> None:
         for key, n in other.counts.items():
             self.counts[key] = self.counts.get(key, 0) + n
         self.steps.update(other.steps)
+        for key, value in other.sleep_seconds.items():
+            self.sleep_seconds[key] = self.sleep_seconds.get(key, 0.0) + value
+        for key, n in other.sleep_rendered.items():
+            self.sleep_rendered[key] = self.sleep_rendered.get(key, 0) + n
         if other.approx_reason is not None:
             self.approximate(other.approx_reason)
 
@@ -493,6 +496,7 @@ class SequencerRuntime:
         self._step_durations = StepDurationStats()
         self._active_step: Step | None = None
         self._active_step_started_elapsed_s: float | None = None
+        self._active_sleep_s: float | None = None
         # Elapsed run time at the previous step's finish; each step's duration
         # is measured from here so gaps between steps are attributed too.
         self._last_step_finished_elapsed_s = 0.0
@@ -1155,6 +1159,7 @@ class SequencerRuntime:
         self._step_durations.clear()
         self._active_step = None
         self._active_step_started_elapsed_s = None
+        self._active_sleep_s = None
         self._last_step_finished_elapsed_s = 0.0
         self._work = None
         self._work_unknown_reason = None
@@ -1211,6 +1216,9 @@ class SequencerRuntime:
         self._active_step_started_elapsed_s = None
         self._completed_steps += 1
         self._step_durations.record(step, step_kind(step), duration_s)
+        if isinstance(step, SleepStep) and self._active_sleep_s is not None:
+            self._step_durations.record_sleep_overhead(duration_s - self._active_sleep_s)
+        self._active_sleep_s = None
         if self._work_skip_active:
             # The cached walk ran while this step was in flight, so it never
             # counted this execution among the remaining work.
@@ -1229,6 +1237,7 @@ class SequencerRuntime:
             return
         self._active_step = None
         self._active_step_started_elapsed_s = None
+        self._active_sleep_s = None
         self._work_skip_active = False
         self._last_step_finished_elapsed_s = self._elapsed_run_s(now)
 
@@ -1376,7 +1385,17 @@ class SequencerRuntime:
                 continue
             steps += n
             step = work.steps[key]
-            est = durations.estimate(step, step_kind(step), work.sleep_priors.get(key))
+            rendered_n = min(n, work.sleep_rendered.get(key, 0))
+            if rendered_n:
+                # A sleep's length is known before it runs: use the rendered
+                # seconds (scaled to the executions still ahead) plus the
+                # measured per-sleep overhead.
+                per_sleep_s = work.sleep_seconds[key] / work.sleep_rendered[key]
+                seconds += rendered_n * (per_sleep_s + durations.sleep_overhead_s)
+                n -= rendered_n
+                if n <= 0:
+                    continue
+            est = durations.estimate(step, step_kind(step))
             if est is None:
                 known = False
             else:
@@ -1496,7 +1515,7 @@ class SequencerRuntime:
                 self._walk_steps(step.finally_steps, env, work, mult)
             return
         if isinstance(step, SleepStep):
-            self._note_sleep_prior(step, env, work)
+            self._note_sleep_seconds(step, env, work, mult)
             return
         if isinstance(step, _LEAF_STEP_TYPES):
             return
@@ -1556,8 +1575,9 @@ class SequencerRuntime:
             return
         bound = frozenset(bind.values()) | {"__loop_index"}
         if remaining > 1 and not (self._count_names(body) & bound):
-            # No step count in the body depends on this loop's variables, so
-            # every record runs the same steps: count one and multiply. A full
+            # No step count or sleep in the body depends on this loop's
+            # variables, so every record runs the same steps: count one and
+            # multiply. A full
             # scan2d grid has thousands of records and status() blocks the
             # run loop, so walking each one is not an option.
             loop_env = self._bind_walk_record(bind, records[start], start, env)
@@ -1571,8 +1591,9 @@ class SequencerRuntime:
         """Names referenced by anything in `steps` that decides step counts.
 
         That is `if`/`while` conditions, `repeat` counts, `for` inputs and
-        `use` args, at any depth (including used sequences). Over-approximates:
-        every identifier-like token in those fields counts.
+        `use` args, at any depth (including used sequences), plus `sleep`
+        durations, which decide time the same way. Over-approximates: every
+        identifier-like token in those fields counts.
         """
         cached = self._count_names_cache.get(id(steps))
         if cached is not None and cached[0] is steps:
@@ -1589,7 +1610,9 @@ class SequencerRuntime:
         for step in steps:
             if getattr(step, "disabled", False):
                 continue
-            if isinstance(step, IfStep):
+            if isinstance(step, SleepStep):
+                _collect_identifiers(step.seconds, names)
+            elif isinstance(step, IfStep):
                 _collect_identifiers(step.condition, names)
                 self._collect_count_names(step.then_steps, names, seen_uses)
                 self._collect_count_names(step.else_steps or [], names, seen_uses)
@@ -1664,17 +1687,16 @@ class SequencerRuntime:
         )
         return loop_env
 
-    def _note_sleep_prior(
-        self, step: SleepStep, env: dict[str, Any], work: _RemainingWork
+    def _note_sleep_seconds(
+        self, step: SleepStep, env: dict[str, Any], work: _RemainingWork, mult: int
     ) -> None:
-        key = id(step)
-        if key in work.sleep_priors:
-            return
         try:
             seconds = float(render_templates(step.seconds, self._estimate_env_view(env)))
         except Exception:
             return
-        work.sleep_priors[key] = max(0.0, seconds)
+        key = id(step)
+        work.sleep_seconds[key] = work.sleep_seconds.get(key, 0.0) + mult * max(0.0, seconds)
+        work.sleep_rendered[key] = work.sleep_rendered.get(key, 0) + mult
 
     def _estimate_env_view(self, env: dict[str, Any]) -> dict[str, Any]:
         vars_map = env.get(_WALK_VARS_KEY)
@@ -2139,6 +2161,7 @@ class SequencerRuntime:
     def _execute_sleep_step(self, step: SleepStep) -> bool:
         seconds = float(render_templates(step.seconds, self._env_view()))
         self._sleep_until = time.monotonic() + seconds
+        self._active_sleep_s = max(0.0, seconds)
         return True
 
     def _execute_wait_until_step(self, step: WaitUntilStep) -> bool:

@@ -52,12 +52,22 @@ class StepDurationStats:
         self._by_kind: dict[str, _RunningMean] = {}
         self._representative = _RunningMean()
         self._overall = _RunningMean()
+        self._sleep_overhead = _RunningMean()
 
     def clear(self) -> None:
         self._by_step.clear()
         self._by_kind.clear()
         self._representative = _RunningMean()
         self._overall = _RunningMean()
+        self._sleep_overhead = _RunningMean()
+
+    def record_sleep_overhead(self, overhead_s: float) -> None:
+        """Measured duration of a sleep minus the seconds it asked for."""
+        self._sleep_overhead.add(max(0.0, float(overhead_s)))
+
+    @property
+    def sleep_overhead_s(self) -> float:
+        return self._sleep_overhead.mean_s if self._sleep_overhead.count else 0.0
 
     def record(self, step: Any, kind: str, duration_s: float) -> None:
         duration_s = max(0.0, float(duration_s))
@@ -71,19 +81,18 @@ class StepDurationStats:
             self._representative.add(duration_s)
         self._overall.add(duration_s)
 
-    def estimate(self, step: Any, kind: str, prior_s: float | None = None) -> float | None:
+    def estimate(self, step: Any, kind: str) -> float | None:
         """Expected duration of one execution of `step`.
 
-        Falls back from the step's own mean to `prior_s` (a rendered `sleep`
-        duration), then to the mean of its kind, then to zero for container
-        and assign steps, then to the mean of all non-sleep steps, then to
-        the overall mean. Returns None only when nothing has been measured.
+        Falls back from the step's own mean to the mean of its kind, then to
+        zero for container and assign steps, then to the mean of all
+        non-sleep steps, then to the overall mean. Returns None only when
+        nothing has been measured. (Sleeps with a rendered duration don't
+        come here: see `sleep_overhead_s`.)
         """
         entry = self._by_step.get(id(step))
         if entry is not None and entry.step is step:
             return entry.mean.mean_s
-        if prior_s is not None:
-            return prior_s
         by_kind = self._by_kind.get(kind)
         if by_kind is not None:
             return by_kind.mean_s

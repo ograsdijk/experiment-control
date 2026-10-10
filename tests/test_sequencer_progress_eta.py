@@ -308,6 +308,32 @@ class SequencerProgressEtaTests(unittest.TestCase):
         self.assertIsNotNone(progress["time_percent"])
         self.assertIsNotNone(progress["eta_wall_ts"])
 
+    def test_sleep_lengths_from_the_loop_variable_are_each_counted(self) -> None:
+        runtime = self._runtime()
+        runtime.load(
+            _spec(
+                [
+                    AssignStep(values={"a": 1}),
+                    ForStep(
+                        bind={"value": "t"},
+                        in_expr=[1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0],
+                        body=[SleepStep(seconds="${t}")],
+                    ),
+                ]
+            )
+        )
+        runtime.start()
+        # Finish the assign, the for step and the 1, 2, 4 s sleeps (the
+        # helper jumps the clock to the end of each sleep), so the ETA gate
+        # is open.
+        while runtime._completed_steps < 5:
+            self._advance(runtime)
+        runtime.tick()  # finishes the 8 s sleep, starts the 16 s one
+        self.clock.t += 4.0  # 4 s into the 16 s sleep; re-walk throttle
+        progress = self._progress(runtime)
+        # 12 s left of the 16 s sleep, then 32 + 64 + 128 s.
+        self.assertAlmostEqual(progress["eta_s"], 12.0 + 224.0, delta=0.5)
+
     def test_repeat_count_projects_future_loops(self) -> None:
         runtime = self._runtime()
         runtime.load(_spec([SleepStep(seconds=1.0)]))
