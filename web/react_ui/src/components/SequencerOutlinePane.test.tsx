@@ -3,7 +3,7 @@
 import { MantineProvider } from "@mantine/core";
 import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { resolveActiveStep } from "../features/sequencer/active_step";
 import { buildSequencerStepOutline } from "../features/sequencer/outline";
 import { SequencerOutlinePane } from "./SequencerOutlinePane";
@@ -24,6 +24,8 @@ const activeStep = resolveActiveStep(buildSequencerStepOutline(YAML), 6);
 
 let container: HTMLDivElement;
 let root: Root;
+// jsdom has no scrollIntoView; Follow calls it from an animation frame.
+const scrollIntoView = vi.fn();
 
 beforeEach(() => {
   (window as unknown as { matchMedia: unknown }).matchMedia ??= () => ({
@@ -38,6 +40,8 @@ beforeEach(() => {
     unobserve() {}
     disconnect() {}
   };
+  scrollIntoView.mockClear();
+  Element.prototype.scrollIntoView = scrollIntoView;
   container = document.createElement("div");
   document.body.appendChild(container);
   root = createRoot(container);
@@ -93,5 +97,9 @@ describe("SequencerOutlinePane active step", () => {
     await render(true);
     expect(rows()[0].getAttribute("aria-label")).toBe("Collapse step");
     expect(container.querySelector('[data-active-step="true"]')).not.toBeNull();
+    await act(async () => {
+      await new Promise((resolve) => window.requestAnimationFrame(() => resolve(null)));
+    });
+    expect(scrollIntoView).toHaveBeenCalledWith({ block: "nearest" });
   });
 });
