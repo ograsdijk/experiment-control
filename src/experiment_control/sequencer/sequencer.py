@@ -321,6 +321,16 @@ def _walk_step_lines(seq_node: Any, path: str, line_map: dict[str, int]) -> None
                     )
 
 
+def _line_for_path(line_map: dict[str, int], path: str) -> int | None:
+    """Line of `path`, or of its closest enclosing step."""
+    best: int | None = None
+    best_len = -1
+    for key, line in line_map.items():
+        if (path == key or path.startswith((f"{key}.", f"{key}["))) and len(key) > best_len:
+            best, best_len = line, len(key)
+    return best
+
+
 def _build_step_line_map(text: str | None, spec: Any = None) -> dict[str, int]:
     """Map preflight step paths -> 1-based source line, from a line-tracking
     YAML parse, so reachability diagnostics can point at the offending step.
@@ -840,7 +850,7 @@ class SequencerProcess(ManagedProcessBase):
             diagnostics.append(
                 {
                     "severity": "error",
-                    "message": str(e),
+                    "message": str(getattr(e, "detail", None) or e),
                     "line": int(line) if isinstance(line, int) else None,
                     "column": int(column) if isinstance(column, int) else None,
                     "source": "yaml",
@@ -851,11 +861,15 @@ class SequencerProcess(ManagedProcessBase):
         try:
             spec = parse_sequence(raw)
         except Exception as e:
+            parse_line: int | None = None
+            step_path = getattr(e, "path", None)
+            if isinstance(step_path, str):
+                parse_line = _line_for_path(_build_step_line_map(text), step_path)
             diagnostics.append(
                 {
                     "severity": "error",
                     "message": str(e),
-                    "line": None,
+                    "line": parse_line,
                     "column": None,
                     "source": "sequencer",
                 }

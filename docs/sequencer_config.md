@@ -27,6 +27,16 @@ steps: []           # required
 the engine. Engine-consumed fields belong at the top level, sibling to
 `meta`/`vars`/`steps`.
 
+Unknown keys are load errors, with a "did you mean" suggestion: at the top
+level, on a step (only the step kind, `disabled` and, for `call`,
+`save_as`/`extract`/`assign` are accepted next to each other), and inside a
+step body (e.g. `assign:` placed inside `call:` instead of beside it). Load
+diagnostics carry the source line of the offending step.
+
+Numbers: sequence files are read with YAML 1.2 float rules, so `2.5e6`, `1e-3`
+and `1.0E9` are numbers (plain PyYAML would read them as strings). Quoted
+values such as `"1.0e9"` stay strings.
+
 ### `context_columns` (optional, explicit schema)
 Top level only (a sequence with `meta.context_columns` fails to parse).
 Values must be one of: `float64`, `int64`, `bool`.
@@ -467,6 +477,12 @@ in:
     serpentine: true
 ```
 
+Required fields are enforced and unknown generator or modifier keys are
+errors: `range` needs `start`/`stop` (`step` defaults to 1);
+`linspace`/`logspace`/`geomspace`/`triangle` need `start`/`stop`/`num`;
+`centered_triangle` needs `center`/`span`/`num`. Modifiers are `offset`,
+`sample`, `seed`, `serpentine`, `shuffle`.
+
 Supported generators (exactly one):
 - `range: {start, stop, step}`
 - `linspace: {start, stop, num}`
@@ -566,6 +582,14 @@ Validation rules used by `sequencer.validate`:
 - Comparison operators require exactly two arguments.
 - `and` / `or` require a list with at least one clause.
 - `and` / `or` with one clause are valid but produce a warning.
+
+At run time, an `if`/`while`/`wait_until` condition that cannot be evaluated
+(unknown name, syntax error, operator misused on real values) fails the step
+with "<kind> condition could not be evaluated: ..." instead of silently being
+false. The one exception is `wait_until`: while its sample is missing or stale
+(`None`), comparisons that need it count as "not met yet" and polling
+continues until `timeout_s`; the timeout error reports the condition, the last
+sample and its age.
 
 `sequencer.validate` is intentionally structural only (YAML + AST + condition DSL).
 For runtime reachability checks (device/action/member/stream/signal references),

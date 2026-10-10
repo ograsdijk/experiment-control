@@ -157,6 +157,9 @@ Request:
 
 Response:
 - `{"ok": true, "result": ...}` or `{"ok": false, "error": {...}}`
+- Routing failures carry a `code` and a human-readable `message` naming the
+  process: `unknown_process` (not registered), `process_not_running`,
+  `process_rpc_not_ready`.
 
 ### `manager.processes.list`
 Request:

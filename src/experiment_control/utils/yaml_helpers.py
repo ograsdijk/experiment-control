@@ -57,6 +57,7 @@ class YamlLoadError(ValueError):
             parts.append(f"line {line}, column {column}")
         parts.append(message)
         super().__init__(": ".join(parts))
+        self.detail = message
         self.source = source
         self.line = line
         self.column = column
@@ -79,8 +80,16 @@ def load_yaml_text(text: str, *, source: str, yaml12_floats: bool = False) -> An
                 line = mark_line + 1
             if isinstance(mark_column, int):
                 column = mark_column + 1
+        problem = getattr(e, "problem", None)
+        context = getattr(e, "context", None)
+        if problem:
+            detail = str(problem)
+            if context:
+                detail += f" ({context})"
+        else:
+            detail = str(e).splitlines()[0] if str(e) else "invalid YAML"
         raise YamlLoadError(
-            str(e),
+            detail,
             source=source,
             line=line,
             column=column,
