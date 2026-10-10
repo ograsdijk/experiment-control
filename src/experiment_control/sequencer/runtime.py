@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import re
 import statistics
 import time
 from dataclasses import dataclass, field
@@ -154,6 +155,18 @@ class ParallelBranchResult:
     outputs: dict[str, Any]
     error: str | None = None
     path: str | None = None
+
+
+def _collect_identifiers(value: Any, names: set[str]) -> None:
+    if isinstance(value, str):
+        names.update(_IDENTIFIER_RE.findall(value))
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            _collect_identifiers(key, names)
+            _collect_identifiers(item, names)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            _collect_identifiers(item, names)
 
 
 def parallel_repeat_count(step: RepeatStep, env: dict[str, Any]) -> int:
@@ -327,9 +340,7 @@ _LEAF_STEP_TYPES = (
 # the cached counts.
 _PROGRESS_REWALK_PERIOD_S = 1.0
 _ESTIMATE_RECORDS_CACHE_MAX = 256
-# Loops with more remaining records than this are not walked record by
-# record: a few probe records are walked and, when they agree, scaled up.
-_WALK_EXACT_MAX_RECORDS = 64
+_IDENTIFIER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
 @dataclass
@@ -477,6 +488,9 @@ class SequencerRuntime:
         self._work_skip_active = False
         self._finished_since_walk: dict[int, int] = {}
         self._estimate_records_cache: dict[str, list[dict[str, Any]]] = {}
+        # id(body) -> (body, names its step counts depend on); see
+        # _count_names().
+        self._count_names_cache: dict[int, tuple[list[Step], frozenset[str]]] = {}
         self._loop_started_completed = 0
         self._loop_started_elapsed_s = 0.0
         self._progress_finished = False
@@ -1125,6 +1139,7 @@ class SequencerRuntime:
         self._work_skip_active = False
         self._finished_since_walk = {}
         self._estimate_records_cache = {}
+        self._count_names_cache = {}
         self._loop_started_completed = 0
         self._loop_started_elapsed_s = 0.0
         self._progress_finished = False
@@ -1514,29 +1529,70 @@ class SequencerRuntime:
         remaining = len(records) - start
         if remaining <= 0 or mult <= 0:
             return
-        if remaining > _WALK_EXACT_MAX_RECORDS:
-            # A full scan2d grid can mean thousands of records per loop and
-            # status() blocks the run loop. Walk the first, middle and last
-            # record; if their bodies count the same, assume all do.
-            probes: list[_RemainingWork] = []
-            for index in (start, start + remaining // 2, len(records) - 1):
-                probe = work.child()
-                loop_env = self._bind_walk_record(bind, records[index], index, env)
-                self._walk_steps(body, loop_env, probe, 1)
-                probes.append(probe)
-            first = probes[0]
-            if all(probe.counts == first.counts for probe in probes[1:]):
-                scale = mult * remaining
-                for key, n in first.counts.items():
-                    work.counts[key] = work.counts.get(key, 0) + n * scale
-                work.steps.update(first.steps)
-                for probe in probes:
-                    if probe.approx_reason is not None:
-                        work.approximate(probe.approx_reason)
-                return
+        bound = frozenset(bind.values()) | {"__loop_index"}
+        if remaining > 1 and not (self._count_names(body) & bound):
+            # No step count in the body depends on this loop's variables, so
+            # every record runs the same steps: count one and multiply. A full
+            # scan2d grid has thousands of records and status() blocks the
+            # run loop, so walking each one is not an option.
+            loop_env = self._bind_walk_record(bind, records[start], start, env)
+            self._walk_steps(body, loop_env, work, mult * remaining)
+            return
         for index in range(start, len(records)):
             loop_env = self._bind_walk_record(bind, records[index], index, env)
             self._walk_steps(body, loop_env, work, mult)
+
+    def _count_names(self, steps: list[Step]) -> frozenset[str]:
+        """Names referenced by anything in `steps` that decides step counts.
+
+        That is `if`/`while` conditions, `repeat` counts, `for` inputs and
+        `use` args, at any depth (including used sequences). Over-approximates:
+        every identifier-like token in those fields counts.
+        """
+        cached = self._count_names_cache.get(id(steps))
+        if cached is not None and cached[0] is steps:
+            return cached[1]
+        names: set[str] = set()
+        self._collect_count_names(steps, names, set())
+        result = frozenset(names)
+        self._count_names_cache[id(steps)] = (steps, result)
+        return result
+
+    def _collect_count_names(
+        self, steps: list[Step], names: set[str], seen_uses: set[str]
+    ) -> None:
+        for step in steps:
+            if getattr(step, "disabled", False):
+                continue
+            if isinstance(step, IfStep):
+                _collect_identifiers(step.condition, names)
+                self._collect_count_names(step.then_steps, names, seen_uses)
+                self._collect_count_names(step.else_steps or [], names, seen_uses)
+            elif isinstance(step, WhileStep):
+                _collect_identifiers(step.condition, names)
+                self._collect_count_names(step.body, names, seen_uses)
+            elif isinstance(step, RepeatStep):
+                _collect_identifiers(step.times, names)
+                self._collect_count_names(step.body, names, seen_uses)
+            elif isinstance(step, ForStep):
+                _collect_identifiers(step.in_expr, names)
+                self._collect_count_names(step.body, names, seen_uses)
+            elif isinstance(step, (AtomicStep, AdaptiveStep)):
+                self._collect_count_names(step.body, names, seen_uses)
+            elif isinstance(step, TryStep):
+                self._collect_count_names(step.body, names, seen_uses)
+                self._collect_count_names(step.finally_steps, names, seen_uses)
+            elif isinstance(step, UseStep):
+                _collect_identifiers(step.args, names)
+                sequence_name = str(step.sequence_id).strip()
+                if sequence_name in seen_uses:
+                    continue
+                seen_uses.add(sequence_name)
+                try:
+                    spec = self._resolve_use_spec(step.sequence_id)
+                except Exception:
+                    continue
+                self._collect_count_names(spec.steps, names, seen_uses)
 
     def _walk_if(
         self, step: IfStep, env: dict[str, Any], work: _RemainingWork, mult: int

@@ -431,7 +431,7 @@ class SequencerProgressWalkCostTests(unittest.TestCase):
         runtime.start()
         return runtime
 
-    def test_large_loop_is_scaled_from_probe_records(self) -> None:
+    def test_large_loop_independent_of_its_variable_is_counted_once(self) -> None:
         # A full scan2d grid without `sample:` gives thousands of records per
         # loop; walking each one on every status() blocked the run loop.
         runtime = self._for_runtime(
@@ -444,19 +444,26 @@ class SequencerProgressWalkCostTests(unittest.TestCase):
         self.assertEqual(progress["total_steps"], 1 + 20_000 * 16)
         self.assertLess(elapsed_ms, 50.0)
 
-    def test_large_loop_walks_every_record_when_probes_disagree(self) -> None:
-        # The last record takes the `then` branch, so the probes differ.
+    def test_loop_whose_counts_use_its_variable_is_counted_per_record(self) -> None:
+        # Only record 57 takes the `then` branch: no sampling would catch it.
         runtime = self._for_runtime(
             [
                 IfStep(
-                    condition={"eq": ["${x}", 99]},
+                    condition={"eq": ["${x}", 57]},
                     then_steps=[AssignStep(values={"hit": 1})],
                 )
             ],
             100,
         )
-        progress = runtime.status()["progress"]
-        self.assertEqual(progress["total_steps"], 1 + 100 + 1)
+        self.assertEqual(runtime.status()["progress"]["total_steps"], 1 + 100 + 1)
+
+    def test_repeat_count_from_loop_variable_is_counted_per_record(self) -> None:
+        runtime = self._for_runtime(
+            [RepeatStep(times="${x}", body=[AssignStep(values={"a": 1})])],
+            5,
+        )
+        # 1 for + 5 repeats + (0 + 1 + 2 + 3 + 4) assigns
+        self.assertEqual(runtime.status()["progress"]["total_steps"], 1 + 5 + 10)
 
 
 if __name__ == "__main__":
