@@ -8,11 +8,23 @@ The editor is block/tree based because sequencer execution is ordered and nested
 
 ## Current Layout
 
-The sequencer modal uses three working areas:
+The sequencer modal has a sidebar and three full-height tabs.
 
-1. Sequence outline (tree)
-2. Step inspector + sequence metadata
-3. Full sequence YAML + diagnostics
+Sidebar (top to bottom):
+
+1. **Sequence**: library picker, load/reload, and the name of the sequence being edited.
+2. **Editor**: load the editor YAML into the sequencer, validate + preflight, and reload the loaded source (discarding edits). A "not loaded" badge shows when the editor differs from the loaded sequence.
+3. **Run overrides** and **Adaptive reuse** (when the sequence has adaptive steps).
+4. **Diagnostics**: validator errors and warnings, grouped by severity; click one to jump to it.
+5. **This run**: events of the current or last run (see below).
+
+Tabs:
+
+- **Steps**: the step tree, with an inspector for the selected step.
+- **Variables**: `vars` and `context_columns`.
+- **YAML**: the full sequence text (CodeMirror edit mode or read-only preview).
+
+Value fields keep a local draft: text is written to the YAML on blur or Enter, and Escape discards it. Edits rewrite only the changed part of a step, so the rest of the YAML keeps its formatting, comments and number spelling.
 
 ## What You Can Edit Visually
 
@@ -55,11 +67,40 @@ This applies to loop and branch bodies, including adaptive `do`.
 
 Full YAML editing uses CodeMirror (edit mode) and a read-only formatted preview mode.
 
-Diagnostics support line/column jump:
+Diagnostics are shown where they are, not only in the sidebar list:
 
-- selecting a diagnostic expands the YAML section if needed
-- switches to edit mode if needed
-- focuses the code editor at the exact offset
+- each step in the Steps tab shows separate error and warning badges for its own lines, and its collapsed parents count what is inside them
+- the YAML editor marks the lines (hover for the message)
+- selecting a diagnostic in the list switches to the right tab and focuses the step or the exact line/column
+
+Diagnostics computed for other text (the editor changed since validating) are marked stale and only listed, since their lines may no longer be right.
+
+## Run Events
+
+The **This run** card lists what happened during the current or last run (`sequencer.run_events`): pauses (who paused and why, e.g. a watchdog rule), resumes, stops, step and cleanup failures, external faults, and warnings or errors other processes logged while the run was going. Each event is tied to the step that was running and is also marked on that step, like a diagnostic. A pause by the watchdog is a warning; a pause by the operator, the sequence or a script is info.
+
+## Running Step Highlight
+
+While a run is going (or paused), the step it is executing is highlighted:
+
+- **YAML tab**: the step's whole block (all its lines) gets a background and a ▶ in the gutter on its first line. Enclosing loops and branches get a thin bar in the gutter along their range. When a container step is itself the current step (e.g. a `for` moving to its next iteration), only its header lines are highlighted.
+- **Steps tab**: the step's row is highlighted and its parents are tinted; a collapsed parent shows "running inside".
+- **Follow** (switch next to the tabs, off by default, remembered per browser): scrolls the running step into view when it changes and expands its collapsed parents. Scrolling the panel yourself (mouse wheel, scrollbar, PageUp/PageDown) turns Follow off.
+
+The highlight follows `sequencer.status` (polled every 1.5 s), so during a fast run of short steps it shows a sample rather than every step. To avoid pointing at the wrong place, nothing is highlighted when:
+
+- the editor text is not the loaded sequence (edited since loading, or another sequence was loaded since)
+- the step belongs to a `use:` sub-sequence (its lines are in another file)
+- the step line is not one the step tree recognizes
+
+## Sequence Loaded Elsewhere
+
+`sequencer.status.loaded_revision` counts loads. When another client loads a sequence while the modal is open:
+
+- if the editor has no unsaved edits, the modal silently fetches the newly loaded YAML
+- if it has edits, they are kept and a notice offers to discard them and show the loaded sequence
+
+Until the editor holds the loaded text, the running step is not highlighted and run events are marked stale.
 
 ## Parsing Resilience
 
@@ -73,7 +114,7 @@ No UI blank-screen behavior is expected from outline parse errors.
 
 ## Known Limits
 
-- Complex YAML constructs outside the supported sequencer patterns may reduce outline fidelity.
+- Complex YAML constructs outside the supported sequencer patterns may reduce outline fidelity. Steps written as bare flow mappings (`- {sleep: 2}`) are not shown in the step tree, so they get no markers or running highlight; write them as `- sleep: 2`.
 - Visual inspector editing is intentionally schema-driven for known step structures; raw YAML remains the fallback for anything unusual.
 
 ## Notes
