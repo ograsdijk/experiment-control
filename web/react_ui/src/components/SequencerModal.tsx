@@ -30,7 +30,10 @@ import {
   processStateColor,
   sequencerRuntimeStateColor,
 } from "../features/runtime/helpers";
-import { formatDurationCompact } from "../features/sequencer/utils";
+import {
+  formatDurationCompact,
+  formatSequencerEta,
+} from "../features/sequencer/utils";
 import type { StreamAnalysisWorkspaceConfig } from "../features/stream/types";
 import type {
   SequencerAdaptiveStudyStatus,
@@ -318,18 +321,31 @@ export function SequencerModal({
                   <Progress value={progressPercent} size="sm" radius="xl" />
                 )}
                 <Text size="xs" c="dimmed">
-                  {totalSteps !== null
-                    ? `Progress: ${completedSteps ?? 0}/${totalSteps} (${(progressPercent ?? 0).toFixed(1)}%)`
-                    : `Completed steps: ${completedSteps ?? 0}${
-                        progress.estimateReason
-                          ? ` | Total unknown: ${progress.estimateReason}`
-                          : ""
-                      }`}
+                  {progress.phase === "cleanup"
+                    ? `Cleanup: ${progress.cleanupCompletedSteps ?? 0}/${
+                        progress.cleanupTotalSteps ?? "?"
+                      } steps | run ended at ${completedSteps ?? 0}/${totalSteps ?? "?"}`
+                    : totalSteps !== null
+                      ? `${progress.scope === "loop" ? "Current loop" : "Progress"}: ${
+                          completedSteps ?? 0
+                        }/${progress.approximate ? "~" : ""}${totalSteps} steps (${(
+                          progressPercent ?? 0
+                        ).toFixed(1)}%${progress.timePercent !== null ? " of time" : ""})`
+                      : `Completed steps: ${completedSteps ?? 0}${
+                          progress.estimateReason
+                            ? ` | Total unknown: ${progress.estimateReason}`
+                            : ""
+                        }`}
                 </Text>
+                {progress.approximate && progress.estimateReason && (
+                  <Text size="xs" c="dimmed">
+                    Estimate: {progress.estimateReason}
+                  </Text>
+                )}
                 <Text size="xs" c="dimmed">
                   Elapsed: {formatDurationCompact(progress.elapsedS)}
                   {progress.etaS !== null
-                    ? `  ETA: ${formatDurationCompact(progress.etaS)}`
+                    ? `  ${progress.phase === "cleanup" ? "Cleanup ETA" : "ETA"}: ${formatSequencerEta(progress)}`
                     : ""}
                 </Text>
                 <Text size="xs" c="dimmed">

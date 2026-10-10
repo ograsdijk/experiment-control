@@ -22,12 +22,16 @@ import {
 } from "./diagnostics_jump";
 import {
   formatDurationCompact,
+  formatSequencerEta,
+  holdSequencerPercent,
   normalizeSequencerErrorDetail,
   normalizeSequencerDiagnostics,
   normalizeSequencerProgress,
   normalizeSequencerStepDetail,
   sameSequencerStatus,
+  sequencerDisplayPercent,
 } from "./utils";
+import type { SequencerPercentHold } from "./utils";
 import {
   buildLocalConditionDiagnostics,
   mergeDiagnostics,
@@ -1492,11 +1496,14 @@ export function useSequencerController({
 
   const sequencerLoaded = sequencerStatus?.loaded === true;
   const sequencerProgress = sequencerStatus?.progress ?? null;
-  const sequencerProgressPercent =
-    typeof sequencerProgress?.percent === "number" &&
-    Number.isFinite(sequencerProgress.percent)
-      ? Math.max(0, Math.min(100, sequencerProgress.percent))
-      : null;
+  const sequencerPercentHoldRef = useRef<SequencerPercentHold | null>(null);
+  const sequencerPercentHold = holdSequencerPercent(
+    sequencerPercentHoldRef.current,
+    sequencerProgress,
+    sequencerDisplayPercent(sequencerProgress)
+  );
+  sequencerPercentHoldRef.current = sequencerPercentHold;
+  const sequencerProgressPercent = sequencerPercentHold?.value ?? null;
   const sequencerCompletedSteps =
     typeof sequencerProgress?.completedSteps === "number" &&
     Number.isFinite(sequencerProgress.completedSteps)
@@ -1513,9 +1520,10 @@ export function useSequencerController({
     }
     const elapsed = formatDurationCompact(sequencerProgress.elapsedS);
     const eta = formatDurationCompact(sequencerProgress.etaS);
+    const approx = sequencerProgress.approximate ? "~" : "";
     if (sequencerProgressPercent !== null) {
-      return ` | ${sequencerProgressPercent.toFixed(1)}% | ${elapsed}${
-        eta !== "n/a" ? ` | ETA ${eta}` : ""
+      return ` | ${approx}${sequencerProgressPercent.toFixed(1)}% | ${elapsed}${
+        eta !== "n/a" ? ` | ETA ${approx}${eta}` : ""
       }`;
     }
     if (elapsed !== "n/a") {
@@ -1528,14 +1536,15 @@ export function useSequencerController({
       return "Open sequencer controls";
     }
     const elapsed = formatDurationCompact(sequencerProgress.elapsedS);
-    const eta = formatDurationCompact(sequencerProgress.etaS);
+    const eta = formatSequencerEta(sequencerProgress);
     const steps =
       sequencerTotalSteps !== null
         ? `${sequencerCompletedSteps ?? 0}/${sequencerTotalSteps}`
         : `${sequencerCompletedSteps ?? 0}`;
     if (sequencerProgressPercent !== null) {
-      return `Progress ${sequencerProgressPercent.toFixed(1)}%, steps ${steps}, elapsed ${elapsed}${
-        eta !== "n/a" ? `, ETA ${eta}` : ""
+      const phase = sequencerProgress.phase === "cleanup" ? "Cleanup. " : "";
+      return `${phase}Progress ${sequencerProgressPercent.toFixed(1)}%, steps ${steps}, elapsed ${elapsed}${
+        eta !== null ? `, ETA ${eta}` : ""
       }`;
     }
     return `Steps ${steps}, elapsed ${elapsed}`;

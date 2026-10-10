@@ -97,6 +97,15 @@ _SET_CONTEXT_DISPATCH_DEADLINE_S = _STREAM_CONTEXT_SET_RETRY_DEADLINE_S + 2.0
 _PARALLEL_MAX_WORKERS = 8
 
 
+def _bucketed(value: Any, step: float) -> Any:
+    # The ETA counts down continuously during sleeps and waits; bucket it
+    # (and the time percent) in the progress-event change signature so a
+    # long sleep doesn't publish an event every throttle period.
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return round(float(value) / step)
+    return value
+
+
 def _effective_context_columns(
     declared: dict[str, str] | None,
 ) -> dict[str, str] | None:
@@ -719,7 +728,13 @@ class SequencerProcess(ManagedProcessBase):
             progress.get("percent"),
             progress.get("total_steps_known"),
             progress.get("estimate_reason"),
-            progress.get("eta_s"),
+            progress.get("approximate"),
+            _bucketed(progress.get("eta_s"), 5.0),
+            _bucketed(progress.get("time_percent"), 1.0),
+            progress.get("scope"),
+            progress.get("phase"),
+            progress.get("cleanup_completed_steps"),
+            progress.get("cleanup_total_steps"),
             progress.get("loop_mode"),
             progress.get("loops_completed"),
             progress.get("loops_target"),

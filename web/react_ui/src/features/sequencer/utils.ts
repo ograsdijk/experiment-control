@@ -86,9 +86,10 @@ export function normalizeSequencerProgress(raw: unknown): SequencerProgress | nu
     }
     return value;
   };
-  const percentRaw = normalizeFloat(obj.percent);
-  const percent =
-    percentRaw === null ? null : Math.max(0, Math.min(100, percentRaw));
+  const normalizePercent = (value: unknown): number | null => {
+    const raw = normalizeFloat(value);
+    return raw === null ? null : Math.max(0, Math.min(100, raw));
+  };
   return {
     runId: normalizeInt(obj.run_id),
     elapsedS: normalizeFloat(obj.elapsed_s),
@@ -97,9 +98,15 @@ export function normalizeSequencerProgress(raw: unknown): SequencerProgress | nu
     totalStepsKnown:
       typeof obj.total_steps_known === "boolean" ? obj.total_steps_known : null,
     estimateReason: normalizeString(obj.estimate_reason),
-    percent,
+    approximate: obj.approximate === true,
+    percent: normalizePercent(obj.percent),
+    timePercent: normalizePercent(obj.time_percent),
     etaS: normalizeFloat(obj.eta_s),
-    stepEwmaS: normalizeFloat(obj.step_ewma_s),
+    etaWallTs: normalizeFloat(obj.eta_wall_ts),
+    scope: obj.scope === "loop" ? "loop" : "run",
+    phase: obj.phase === "cleanup" ? "cleanup" : "run",
+    cleanupCompletedSteps: normalizeInt(obj.cleanup_completed_steps),
+    cleanupTotalSteps: normalizeInt(obj.cleanup_total_steps),
     currentStepElapsedS: normalizeFloat(obj.current_step_elapsed_s),
     loopMode:
       typeof obj.loop_mode === "string" && obj.loop_mode.trim().length > 0
@@ -153,6 +160,79 @@ export function formatDurationCompact(value: number | null | undefined): string 
     return `${hours}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
   }
   return `${minutes}:${String(seconds).padStart(2, "0")}`;
+}
+
+/** Bar value: time-based once the backend has an ETA, else step-based. */
+export function sequencerDisplayPercent(
+  progress: SequencerProgress | null
+): number | null {
+  if (!progress) {
+    return null;
+  }
+  return progress.timePercent ?? progress.percent;
+}
+
+export type SequencerPercentHold = {
+  key: string;
+  value: number;
+};
+
+/**
+ * What the displayed percent measures. The hold below restarts whenever this
+ * changes: a new run, the cleanup phase, the next loop of a continuous run
+ * (whose bar shows only the current loop), or the switch from step- to
+ * time-based percent once the ETA appears.
+ */
+function sequencerPercentKey(progress: SequencerProgress): string {
+  return JSON.stringify([
+    progress.runId,
+    progress.phase,
+    progress.timePercent !== null ? "time" : "steps",
+    progress.scope === "loop" ? progress.loopsCompleted : null,
+  ]);
+}
+
+/**
+ * Keep the bar from moving backwards while it measures the same thing: the
+ * live total can grow (e.g. a while loop iterating again).
+ */
+export function holdSequencerPercent(
+  previous: SequencerPercentHold | null,
+  progress: SequencerProgress | null,
+  value: number | null
+): SequencerPercentHold | null {
+  if (!progress || value === null) {
+    return null;
+  }
+  const key = sequencerPercentKey(progress);
+  if (previous && previous.key === key && value < previous.value) {
+    return previous;
+  }
+  return { key, value };
+}
+
+/**
+ * "~12:30 (≈14:52)": remaining time, "~" when the total is approximate. The
+ * finish time is computed on this machine's clock (the sequencer host's
+ * clock may differ); `eta_wall_ts` only says whether one applies (running).
+ */
+export function formatSequencerEta(
+  progress: SequencerProgress | null,
+  nowMs: number = Date.now()
+): string | null {
+  if (!progress || progress.etaS === null) {
+    return null;
+  }
+  const prefix = progress.approximate ? "~" : "";
+  let finish = "";
+  if (progress.etaWallTs !== null && progress.etaS > 0) {
+    const at = new Date(nowMs + progress.etaS * 1000).toLocaleTimeString([], {
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+    finish = ` (≈${at})`;
+  }
+  return `${prefix}${formatDurationCompact(progress.etaS)}${finish}`;
 }
 
 export function normalizeSequencerDiagnostics(raw: unknown): SequencerDiagnostic[] {
