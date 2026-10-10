@@ -155,18 +155,76 @@ class WatchdogActionDispatchTests(unittest.TestCase):
                 )
             ]
         )
-        proc._execute_actions(watchdog_id="wd1", rule=rule)
+        proc._execute_actions(watchdog_id="wd1", rule=rule, trip_id="trip-1")
         self.assertEqual(
             sent,
             [
                 {
                     "type": "manager.processes.rpc",
                     "process_id": "sequencer",
-                    "request": {"type": "sequencer.pause", "params": {}},
+                    "request": {
+                        "type": "sequencer.pause",
+                        # The watchdog says which rule tripped, so the
+                        # sequencer can show why it paused.
+                        "params": {
+                            "reason": "watchdog rule 'r1' tripped",
+                            "source": "watchdog",
+                            "trigger": {
+                                "watchdog_id": "wd1",
+                                "rule": "r1",
+                                "severity": "critical",
+                                "trip_id": "trip-1",
+                            },
+                        },
+                    },
                     "caller_process_id": "watchdog-test",
                 }
             ],
         )
+
+    def test_rule_message_is_the_pause_reason_and_yaml_params_win(self) -> None:
+        proc, sent = self._make_proc()
+        rule = _rule_with_actions(
+            [
+                ProcessAction(
+                    process_id="sequencer",
+                    action="sequencer.pause",
+                    params={"reason": "custom text"},
+                    timeout_s=None,
+                    retries=0,
+                ),
+                ProcessAction(
+                    process_id="sequencer",
+                    action="sequencer.stop",
+                    params={},
+                    timeout_s=None,
+                    retries=0,
+                ),
+            ]
+        )
+        rule = WatchdogRule(**{**rule.__dict__, "message": "Lock dropped"})
+        proc._execute_actions(watchdog_id="wd1", rule=rule, trip_id="t")
+        pause_params = sent[0]["request"]["params"]
+        stop_params = sent[1]["request"]["params"]
+        self.assertEqual(pause_params["reason"], "custom text")
+        self.assertEqual(pause_params["source"], "watchdog")
+        self.assertEqual(stop_params["reason"], "Lock dropped")
+
+    def test_other_process_actions_get_their_params_unchanged(self) -> None:
+        proc, sent = self._make_proc()
+        rule = _rule_with_actions(
+            [
+                ProcessAction(
+                    process_id="hv_supervisor",
+                    action="hv.ramp_down",
+                    params={"rate_v_s": 50},
+                    timeout_s=None,
+                    retries=0,
+                )
+            ]
+        )
+        proc._execute_actions(watchdog_id="wd1", rule=rule)
+        self.assertEqual(sent[0]["request"]["params"], {"rate_v_s": 50})
 
     def test_command_action_dispatch_unchanged(self) -> None:
         proc, sent = self._make_proc()

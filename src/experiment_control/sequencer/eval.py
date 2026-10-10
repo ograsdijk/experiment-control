@@ -1,12 +1,66 @@
 from __future__ import annotations
 
 import ast
+import difflib
 import re
 from typing import Any, Callable
 
 
 _TEMPLATE_RE = re.compile(r"\$\{([^}]+)\}")
 _MAX_TEMPLATE_DEPTH = 16
+
+
+class TemplateError(ValueError):
+    """A template/expression that cannot be evaluated (unknown name, syntax...)."""
+
+
+class OperandError(TemplateError):
+    """An operator was applied to operands it does not support.
+
+    `none_involved` is True when one of the operands was None, i.e. the
+    expression most likely referenced a value that is not available (yet),
+    such as a telemetry sample that has not arrived.
+    """
+
+    def __init__(self, message: str, *, none_involved: bool = False) -> None:
+        super().__init__(message)
+        self.none_involved = none_involved
+
+
+def suggest_names(name: str, candidates: Any) -> list[str]:
+    """Close matches of `name` among `candidates` (private names skipped)."""
+    pool = [str(c) for c in candidates if not str(c).startswith("_")]
+    return difflib.get_close_matches(name, pool, n=3, cutoff=0.6)
+
+
+def unknown_name_message(name: str, candidates: Any) -> str:
+    close = suggest_names(name, candidates)
+    if not close:
+        return f"Unknown name {name!r}"
+    quoted = ", ".join(repr(c) for c in close)
+    return f"Unknown name {name!r} (did you mean {quoted}?)"
+
+
+def unknown_key_message(owner: str, key: Any, allowed: Any, hint: str | None = None) -> str:
+    """Message for a key that `owner` does not accept, with a close-match hint."""
+    names = sorted(str(a) for a in allowed)
+    text = f"{owner} has unknown key {str(key)!r}"
+    close = difflib.get_close_matches(str(key), names, n=1, cutoff=0.6)
+    if close:
+        text += f" (did you mean {close[0]!r}?)"
+    if hint:
+        text += f"; {hint}"
+    text += f". Valid keys: {', '.join(names)}"
+    return text
+
+
+def _describe_operand(node: ast.AST, value: Any) -> str | None:
+    if isinstance(node, ast.Name) and isinstance(value, str):
+        shown = value if len(value) <= 40 else value[:37] + "..."
+        return f"{node.id} is the string {shown!r}"
+    if isinstance(node, ast.Name) and value is None:
+        return f"{node.id} is None"
+    return None
 
 
 class AttrDict(dict):
@@ -27,8 +81,26 @@ def to_attrdict(obj: Any) -> Any:
     return obj
 
 
+def _operand_error(
+    expr: str,
+    operands: list[tuple[ast.AST, Any]],
+    exc: Exception,
+) -> OperandError:
+    if isinstance(exc, ZeroDivisionError):
+        return OperandError(f"{exc} in ${{{expr}}}")
+    notes = [d for d in (_describe_operand(node, val) for node, val in operands) if d]
+    detail = f": {'; '.join(notes)}" if notes else f" ({exc})"
+    return OperandError(
+        f"unsupported operand types in ${{{expr}}}{detail}",
+        none_involved=any(val is None for _, val in operands),
+    )
+
+
 def _eval_expr(expr: str, env: dict[str, Any]) -> Any:
-    tree = ast.parse(expr, mode="eval")
+    try:
+        tree = ast.parse(expr, mode="eval")
+    except SyntaxError as exc:
+        raise TemplateError(f"Invalid expression ${{{expr}}}: {exc.msg}") from exc
 
     def eval_node(node: ast.AST) -> Any:
         if isinstance(node, ast.Expression):
@@ -38,7 +110,7 @@ def _eval_expr(expr: str, env: dict[str, Any]) -> Any:
         if isinstance(node, ast.Name):
             if node.id in env:
                 return env[node.id]
-            raise ValueError(f"Unknown name {node.id!r}")
+            raise TemplateError(unknown_name_message(node.id, env))
         if isinstance(node, ast.Attribute):
             base = eval_node(node.value)
             if isinstance(base, AttrDict):
@@ -49,30 +121,38 @@ def _eval_expr(expr: str, env: dict[str, Any]) -> Any:
             raise ValueError("Attribute access not allowed")
         if isinstance(node, ast.UnaryOp):
             val = eval_node(node.operand)
-            if isinstance(node.op, ast.UAdd):
-                return +val
-            if isinstance(node.op, ast.USub):
-                return -val
+            try:
+                if isinstance(node.op, ast.UAdd):
+                    return +val
+                if isinstance(node.op, ast.USub):
+                    return -val
+            except TypeError as exc:
+                raise _operand_error(expr, [(node.operand, val)], exc) from exc
             if isinstance(node.op, ast.Not):
                 return not val
             raise ValueError("Unary op not allowed")
         if isinstance(node, ast.BinOp):
             left = eval_node(node.left)
             right = eval_node(node.right)
-            if isinstance(node.op, ast.Add):
-                return left + right
-            if isinstance(node.op, ast.Sub):
-                return left - right
-            if isinstance(node.op, ast.Mult):
-                return left * right
-            if isinstance(node.op, ast.Div):
-                return left / right
-            if isinstance(node.op, ast.FloorDiv):
-                return left // right
-            if isinstance(node.op, ast.Mod):
-                return left % right
-            if isinstance(node.op, ast.Pow):
-                return left**right
+            try:
+                if isinstance(node.op, ast.Add):
+                    return left + right
+                if isinstance(node.op, ast.Sub):
+                    return left - right
+                if isinstance(node.op, ast.Mult):
+                    return left * right
+                if isinstance(node.op, ast.Div):
+                    return left / right
+                if isinstance(node.op, ast.FloorDiv):
+                    return left // right
+                if isinstance(node.op, ast.Mod):
+                    return left % right
+                if isinstance(node.op, ast.Pow):
+                    return left**right
+            except (TypeError, ZeroDivisionError, OverflowError) as exc:
+                raise _operand_error(
+                    expr, [(node.left, left), (node.right, right)], exc
+                ) from exc
             raise ValueError("Binary op not allowed")
         if isinstance(node, ast.BoolOp):
             values = [eval_node(v) for v in node.values]
@@ -86,20 +166,25 @@ def _eval_expr(expr: str, env: dict[str, Any]) -> Any:
             for op, comparator in zip(node.ops, node.comparators, strict=True):
                 right = eval_node(comparator)
                 ok = None
-                if isinstance(op, ast.Eq):
-                    ok = left == right
-                elif isinstance(op, ast.NotEq):
-                    ok = left != right
-                elif isinstance(op, ast.Lt):
-                    ok = left < right
-                elif isinstance(op, ast.LtE):
-                    ok = left <= right
-                elif isinstance(op, ast.Gt):
-                    ok = left > right
-                elif isinstance(op, ast.GtE):
-                    ok = left >= right
-                else:
-                    raise ValueError("Compare op not allowed")
+                try:
+                    if isinstance(op, ast.Eq):
+                        ok = left == right
+                    elif isinstance(op, ast.NotEq):
+                        ok = left != right
+                    elif isinstance(op, ast.Lt):
+                        ok = left < right
+                    elif isinstance(op, ast.LtE):
+                        ok = left <= right
+                    elif isinstance(op, ast.Gt):
+                        ok = left > right
+                    elif isinstance(op, ast.GtE):
+                        ok = left >= right
+                    else:
+                        raise ValueError("Compare op not allowed")
+                except TypeError as exc:
+                    raise _operand_error(
+                        expr, [(node.left, left), (comparator, right)], exc
+                    ) from exc
                 if not ok:
                     return False
                 left = right
@@ -119,7 +204,12 @@ def _eval_expr(expr: str, env: dict[str, Any]) -> Any:
             if func_name not in func_map:
                 raise ValueError(f"Function {func_name!r} not allowed")
             args = [eval_node(arg) for arg in node.args]
-            return func_map[func_name](*args)
+            try:
+                return func_map[func_name](*args)
+            except TypeError as exc:
+                raise _operand_error(
+                    expr, list(zip(node.args, args, strict=True)), exc
+                ) from exc
         if isinstance(node, ast.IfExp):
             return eval_node(node.body) if eval_node(node.test) else eval_node(node.orelse)
         raise ValueError("Unsupported expression")
@@ -165,6 +255,23 @@ def render_templates(value: Any, env: dict[str, Any]) -> Any:
     return _render_templates(value, env, depth=0)
 
 
+def _compare(op: str, a: Any, b: Any) -> bool:
+    try:
+        if op == "gt":
+            return bool(a > b)
+        if op == "ge":
+            return bool(a >= b)
+        if op == "lt":
+            return bool(a < b)
+        return bool(a <= b)
+    except TypeError as exc:
+        symbol = {"gt": ">", "ge": ">=", "lt": "<", "le": "<="}[op]
+        raise OperandError(
+            f"cannot compare {a!r} {symbol} {b!r} ({exc})",
+            none_involved=a is None or b is None,
+        ) from exc
+
+
 def eval_condition(cond: Any, env: dict[str, Any]) -> bool:
     if isinstance(cond, bool):
         return cond
@@ -183,16 +290,16 @@ def eval_condition(cond: Any, env: dict[str, Any]) -> bool:
             return render_templates(a, env) != render_templates(b, env)
         if "gt" in cond:
             a, b = cond["gt"]
-            return render_templates(a, env) > render_templates(b, env)
+            return _compare("gt", render_templates(a, env), render_templates(b, env))
         if "ge" in cond:
             a, b = cond["ge"]
-            return render_templates(a, env) >= render_templates(b, env)
+            return _compare("ge", render_templates(a, env), render_templates(b, env))
         if "lt" in cond:
             a, b = cond["lt"]
-            return render_templates(a, env) < render_templates(b, env)
+            return _compare("lt", render_templates(a, env), render_templates(b, env))
         if "le" in cond:
             a, b = cond["le"]
-            return render_templates(a, env) <= render_templates(b, env)
+            return _compare("le", render_templates(a, env), render_templates(b, env))
         if "and" in cond:
             return all(eval_condition(c, env) for c in cond["and"])
         if "or" in cond:
@@ -201,5 +308,12 @@ def eval_condition(cond: Any, env: dict[str, Any]) -> bool:
             return not eval_condition(cond["not"], env)
         if "abs_lt" in cond:
             a, b = cond["abs_lt"]
-            return abs(render_templates(a, env)) < render_templates(b, env)
+            av = render_templates(a, env)
+            try:
+                av = abs(av)
+            except TypeError as exc:
+                raise OperandError(
+                    f"cannot take abs() of {av!r} ({exc})", none_involved=av is None
+                ) from exc
+            return _compare("lt", av, render_templates(b, env))
     return False

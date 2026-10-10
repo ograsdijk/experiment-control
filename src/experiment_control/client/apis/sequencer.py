@@ -112,14 +112,44 @@ class SequencerAPI(ClientFacadeBase):
             params["adaptive"] = dict(adaptive)
         return self.call("sequencer.start", params, timeout_ms=timeout_ms, retries=retries)
 
-    def pause(self, *, timeout_ms: int | None = None, retries: int | None = None) -> Any:
-        return self.call("sequencer.pause", {}, timeout_ms=timeout_ms, retries=retries)
+    def pause(
+        self,
+        *,
+        reason: str | None = None,
+        source: str = "client",
+        timeout_ms: int | None = None,
+        retries: int | None = None,
+    ) -> Any:
+        """Pause at the next interruptible point; `reason`/`source` are shown
+        with the pause and in the run's event log."""
+        params: Json = {"source": source}
+        if reason is not None:
+            params["reason"] = reason
+        return self.call("sequencer.pause", params, timeout_ms=timeout_ms, retries=retries)
 
-    def resume(self, *, timeout_ms: int | None = None, retries: int | None = None) -> Any:
-        return self.call("sequencer.resume", {}, timeout_ms=timeout_ms, retries=retries)
+    def resume(
+        self,
+        *,
+        source: str = "client",
+        timeout_ms: int | None = None,
+        retries: int | None = None,
+    ) -> Any:
+        return self.call(
+            "sequencer.resume", {"source": source}, timeout_ms=timeout_ms, retries=retries
+        )
 
-    def stop(self, *, timeout_ms: int | None = None, retries: int | None = None) -> Any:
-        return self.call("sequencer.stop", {}, timeout_ms=timeout_ms, retries=retries)
+    def stop(
+        self,
+        *,
+        reason: str | None = None,
+        source: str = "client",
+        timeout_ms: int | None = None,
+        retries: int | None = None,
+    ) -> Any:
+        params: Json = {"source": source}
+        if reason is not None:
+            params["reason"] = reason
+        return self.call("sequencer.stop", params, timeout_ms=timeout_ms, retries=retries)
 
     def library_list(
         self,

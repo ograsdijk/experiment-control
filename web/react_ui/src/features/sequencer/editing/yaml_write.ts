@@ -9,12 +9,46 @@
 // rebuilt the whole step from a flat model and silently dropped anything they
 // did not model.
 import { YAMLMap, YAMLSeq, isMap, isSeq, parseDocument } from "yaml";
-import type { Document, Node } from "yaml";
+import type { Document, Node, ScalarTag, Tags } from "yaml";
 import type { SequencerOutlineMetadataEntry } from "../types";
 import { parseConditionEntries } from "../condition_ast";
 import type { ConditionAst } from "../condition_ast";
 
 type Entry = SequencerOutlineMetadataEntry;
+
+const NUMBER_TAGS = new Set(["tag:yaml.org,2002:int", "tag:yaml.org,2002:float"]);
+
+/**
+ * Number tags that write a number back as it was written (`5e6`, `20.0e+6`,
+ * `0x1F`) while the source text still means the same value; the default
+ * stringifiers normalize them (`5e+6`, `2e+7`, `0x1f`).
+ */
+function keepNumberSource(tags: Tags): Tags {
+  return tags.map((tag) => {
+    const scalar = tag as ScalarTag;
+    if (!NUMBER_TAGS.has(String(scalar.tag)) || typeof scalar.stringify !== "function") {
+      return tag;
+    }
+    const base = scalar.stringify;
+    return {
+      ...scalar,
+      stringify(item, ctx, onComment, onChompKeep) {
+        const source = (item as { source?: unknown }).source;
+        if (
+          typeof source === "string" &&
+          scalar.test?.test(source) &&
+          scalar.resolve(source, () => undefined, {}) === item.value
+        ) {
+          return source;
+        }
+        return base(item, ctx, onComment, onChompKeep);
+      },
+    } as ScalarTag;
+  });
+}
+
+/** Options for every document the editors parse or create. */
+export const YAML_OPTIONS = { customTags: keepNumberSource } as const;
 
 /** Drop entries with blank names and normalize whitespace. */
 export function cleanEntries(entries: ReadonlyArray<Entry>): Entry[] {
@@ -37,7 +71,7 @@ export function textToNode(doc: Document, text: string | null | undefined): Node
   }
   let parsed: Document | null = null;
   try {
-    parsed = parseDocument(trimmed);
+    parsed = parseDocument(trimmed, YAML_OPTIONS);
   } catch {
     parsed = null;
   }
@@ -116,8 +150,10 @@ export function editStep(
   mutate: (doc: Document, item: YAMLMap, kind: string) => void
 ): string {
   let doc: Document;
+  let original: Document;
   try {
-    doc = parseDocument(snippet);
+    doc = parseDocument(snippet, YAML_OPTIONS);
+    original = parseDocument(snippet, YAML_OPTIONS);
   } catch {
     return snippet;
   }
@@ -134,7 +170,100 @@ export function editStep(
   }
   const kind = item.items[0].key == null ? "" : String(item.items[0].key).trim();
   mutate(doc, item as YAMLMap, kind);
-  return doc.toString({ lineWidth: 0 }).replace(/\n+$/, "");
+  const originalItem = isSeq(original.contents) ? original.contents.items[0] : null;
+  if (originalItem != null && sameContent(item as Node, originalItem as Node)) {
+    return snippet;
+  }
+  restoreUnchanged(item as Node, originalItem as Node | null);
+  return doc.toString(STEP_TO_STRING).replace(/\n+$/, "");
+}
+
+/** Serializer options for step snippets: unwrapped lines, `{a: b}` flow maps. */
+export const STEP_TO_STRING = { lineWidth: 0, flowCollectionPadding: false } as const;
+
+function sameContent(a: Node | null | undefined, b: Node | null | undefined): boolean {
+  if (a == null || b == null) {
+    return a == null && b == null;
+  }
+  try {
+    return canonicalJson(a.toJSON()) === canonicalJson(b.toJSON());
+  } catch {
+    return false;
+  }
+}
+
+/** JSON with object keys sorted: key order is formatting, not content. */
+export function canonicalJson(value: unknown): string {
+  return JSON.stringify(value, (_key, item) =>
+    item && typeof item === "object" && !Array.isArray(item)
+      ? Object.fromEntries(Object.entries(item).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)))
+      : item
+  );
+}
+
+/**
+ * Writers rebuild whole sub-trees (`params`, `bind`, `in`, ...) from the form
+ * model. Swap every rebuilt node whose content is unchanged back for the
+ * original, so an edit to one field keeps the rest of the step's formatting
+ * and comments as written.
+ */
+function restoreUnchanged(next: Node, original: Node | null): void {
+  if (original == null) {
+    return;
+  }
+  if (isMap(next) && isMap(original)) {
+    for (const pair of next.items) {
+      const key = pair.key == null ? null : String(pair.key);
+      if (key === null) {
+        continue;
+      }
+      const before = original.get(key, true) as Node | undefined;
+      const after = pair.value as Node | null;
+      if (before == null || after == null) {
+        continue;
+      }
+      if (sameContent(after, before)) {
+        pair.value = before;
+      } else {
+        restoreUnchanged(after, before);
+      }
+    }
+    // Keys the original had keep their original order; new keys follow.
+    const position = new Map(
+      original.items.map((pair, index) => [String(pair.key), index] as const)
+    );
+    const order = (pair: { key: unknown }) =>
+      position.get(String(pair.key)) ?? Number.MAX_SAFE_INTEGER;
+    next.items.sort((a, b) => order(a) - order(b));
+    keepStyle(next as YAMLMap, original as YAMLMap);
+    return;
+  }
+  if (isSeq(next) && isSeq(original)) {
+    next.items.forEach((after, index) => {
+      const before = original.items[index] as Node | undefined;
+      if (before == null || after == null) {
+        return;
+      }
+      if (sameContent(after as Node, before)) {
+        next.items[index] = before;
+      } else {
+        restoreUnchanged(after as Node, before);
+      }
+    });
+    keepStyle(next as YAMLSeq, original as YAMLSeq);
+  }
+}
+
+/**
+ * An edited collection keeps the author's block/flow style. An empty `{}` or
+ * `[]` is a template placeholder, so filling it uses the writer's style.
+ */
+function keepStyle(next: YAMLMap | YAMLSeq, original: YAMLMap | YAMLSeq): void {
+  if (next.items.length === 0) {
+    next.flow = true;
+  } else if (original.items.length > 0) {
+    next.flow = Boolean(original.flow);
+  }
 }
 
 // --- conditions -------------------------------------------------------------

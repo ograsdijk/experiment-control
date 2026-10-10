@@ -129,13 +129,15 @@ class ManagerClient:
         else:
             timeout_ms = int(timeout_ms)
         outbound: Json = payload
-        # Build the outbound envelope. Process-side command callers get
-        # source_kind/source_id stamped here for the manager's command
-        # journal; transport-level request_id is added below for ALL
+        # Build the outbound envelope. Process-side device commands and
+        # process RPCs get source_kind/source_id stamped here, so the
+        # manager's command journal and "Command failed" logs name the
+        # calling process; transport-level request_id is added below for ALL
         # callers so the recv loop can discard stale replies.
         if isinstance(payload, dict):
             needs_command_stamps = (
-                payload.get("type") == "command" and self._process_id
+                payload.get("type") in {"command", "manager.processes.rpc"}
+                and self._process_id
             )
             if needs_command_stamps or "request_id" not in payload:
                 outbound = dict(payload)

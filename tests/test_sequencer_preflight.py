@@ -249,10 +249,7 @@ steps:
       bind: {value: freq_hz}
       in:
         gen:
-          kind: linspace
-          start: 1.0
-          stop: 2.0
-          count: 2
+          linspace: {start: 1.0, stop: 2.0, num: 2}
       do:
         - call:
             device: laser

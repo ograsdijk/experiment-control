@@ -260,7 +260,7 @@ class SequenceLibrary:
             )
 
         text = path.read_text(encoding="utf-8")
-        raw = load_yaml_text(text, source=str(path))
+        raw = load_yaml_text(text, source=str(path), yaml12_floats=True)
         try:
             spec = parse_sequence(raw)
         except Exception as exc:

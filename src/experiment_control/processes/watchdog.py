@@ -74,6 +74,34 @@ class ProcessAction:
     retries: int
 
 
+# Sequencer actions that take a reason: the watchdog says which rule tripped.
+_TRIP_CONTEXT_ACTIONS = frozenset({"sequencer.pause", "sequencer.stop"})
+
+
+def _with_trip_context(
+    action: "ProcessAction", *, watchdog_id: str, rule: "WatchdogRule", trip_id: str
+) -> dict[str, Any]:
+    """Params for a process action, plus the trip context for sequencer
+    pause/stop so the sequencer can show who paused it and why. Values set in
+    the rule's YAML take precedence; other actions get their params as is
+    (they may not accept extra keys)."""
+    params = dict(action.params or {})
+    if action.action not in _TRIP_CONTEXT_ACTIONS:
+        return params
+    params.setdefault("reason", rule.message or f"watchdog rule {rule.name!r} tripped")
+    params.setdefault("source", "watchdog")
+    params.setdefault(
+        "trigger",
+        {
+            "watchdog_id": watchdog_id,
+            "rule": rule.name,
+            "severity": rule.severity,
+            "trip_id": trip_id,
+        },
+    )
+    return params
+
+
 def _action_status_payload(action: CommandAction | ProcessAction) -> dict[str, Any]:
     """Serialize an action for the watchdog status RPC (device vs process)."""
     payload: dict[str, Any] = {
@@ -1291,15 +1319,18 @@ class WatchdogProcess(ManagedProcessBase):
             # actions are wrapped in a `manager.processes.rpc` envelope (same
             # shape used by the client/gateway, e.g. sequencer.pause).
             if isinstance(action, ProcessAction):
+                params = _with_trip_context(
+                    action, watchdog_id=watchdog_id, rule=rule, trip_id=trip_id
+                )
                 command_payload = {
                     "process_id": action.process_id,
                     "action": action.action,
-                    "params": action.params,
+                    "params": params,
                 }
                 req = {
                     "type": "manager.processes.rpc",
                     "process_id": action.process_id,
-                    "request": {"type": action.action, "params": action.params},
+                    "request": {"type": action.action, "params": params},
                     "caller_process_id": self._process_id,
                 }
             else:

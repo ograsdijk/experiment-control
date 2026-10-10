@@ -1,3 +1,4 @@
+import difflib
 import inspect
 import json
 import math
@@ -86,6 +87,35 @@ __all__ = [
     "import_class",
 ]
 
+
+
+class CommandCallerError(Exception):
+    """A command failed because of the caller, not the device."""
+
+
+class UnknownCommandError(CommandCallerError, NotImplementedError):
+    pass
+
+
+class BadCommandParametersError(CommandCallerError, TypeError):
+    pass
+
+
+class CommandNotAllowedError(CommandCallerError, NotImplementedError):
+    """A command that exists but may not be called over RPC."""
+
+
+class _ArrayResultError(TypeError):
+    """A command returned an array; bulk data belongs on a stream, not in RPC."""
+
+
+def _json_reply_default(value: Any) -> Any:
+    # numpy scalars (e.g. a getter returning np.float32) are small: send as numbers.
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        raise _ArrayResultError(f"numpy array of shape {value.shape}")
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
 
 class DeviceRunner:
     def __init__(
@@ -296,7 +326,10 @@ class DeviceRunner:
                             resp = self._handle_rpc_request(req_raw)
                         finally:
                             self._end_operation()
-                    self.rpc.send_json(resp)
+                    self._send_rpc_reply(
+                        resp,
+                        action=req_raw.get("action") if isinstance(req_raw, dict) else None,
+                    )
 
                 # Heartbeat (PUB)
                 now = time.monotonic()
@@ -715,29 +748,104 @@ class DeviceRunner:
 
     def handle_command(self, action: str, params: dict[str, Any]) -> Any:
         if not isinstance(params, dict):
-            raise TypeError("params must be a dict")
+            raise BadCommandParametersError("params must be a dict")
 
         if action.startswith("_"):
-            raise NotImplementedError(f"Internal class methods not allowed {action!r}")
+            raise UnknownCommandError(f"Internal class methods not allowed {action!r}")
 
         if action in {"connect", "disconnect"}:
-            raise NotImplementedError(f"Command {action!r} is not allowed via RPC")
+            raise CommandNotAllowedError(f"Command {action!r} is not allowed via RPC")
 
         if action in self._stream_rpc:
             return self._stream_rpc[action](**params)
 
         func = getattr(self._device, action, None)
         if func is None or not callable(func):
-            raise NotImplementedError(f"Unknown command {action!r}")
+            raise UnknownCommandError(f"Unknown command {action!r}")
 
+        # Bind against the signature first so that only genuine argument
+        # mistakes are reported as caller errors; a TypeError raised inside
+        # the driver body stays a device failure.
         try:
-            return func(**params)
-        except TypeError as e:
-            raise TypeError(f"Bad parameters for command {action!r}: {e}") from e
+            sig = inspect.signature(func)
+        except (TypeError, ValueError):
+            sig = None
+        if sig is not None:
+            try:
+                sig.bind(**params)
+            except TypeError as e:
+                accepted = [
+                    p.name
+                    for p in sig.parameters.values()
+                    if p.kind
+                    in (
+                        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                        inspect.Parameter.KEYWORD_ONLY,
+                    )
+                ]
+                listing = ", ".join(accepted) if accepted else "(none)"
+                accepts_any = any(
+                    p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+                )
+                # bind() reports the first problem only (often the missing
+                # argument a misspelled one was meant to be): name the
+                # unexpected ones explicitly, with the closest match.
+                unexpected = (
+                    [name for name in params if name not in accepted] if not accepts_any else []
+                )
+                problems = [
+                    f"unexpected parameter {name!r}"
+                    + (
+                        f" (did you mean {match[0]!r}?)"
+                        if (match := difflib.get_close_matches(name, accepted, n=1))
+                        else ""
+                    )
+                    for name in unexpected
+                ]
+                detail = "; ".join(problems) if problems else str(e)
+                raise BadCommandParametersError(
+                    f"Bad parameters for command {action!r}: {detail}; "
+                    f"accepted parameters: {listing}"
+                ) from e
+        return func(**params)
 
     @staticmethod
     def _rpc_ok(req_id: Any, result: Any) -> dict[str, Any]:
         return {"id": req_id, "status": "OK", "result": result}
+
+    def _send_rpc_reply(self, resp: dict[str, Any], *, action: Any = None) -> None:
+        """Send an RPC reply; a result JSON can't encode is replied as an error.
+
+        Serializing used to raise inside the main loop and kill the driver
+        process when a command returned e.g. a numpy array (the caller only
+        saw a timeout). numpy scalars are sent as numbers. Arrays are refused
+        rather than converted: bulk data goes through the `stream__<method>`
+        wrapper (shared-memory stream, HDF/plots), not through RPC JSON.
+        """
+        try:
+            self.rpc.send_json(resp, default=_json_reply_default)
+        except _ArrayResultError as exc:
+            stream_action = f"stream__{action}"
+            hint = (
+                f"; use {stream_action!r} to acquire it as stream data"
+                if stream_action in getattr(self, "_stream_rpc", {})
+                else ""
+            )
+            self.rpc.send_json(
+                self._rpc_error(
+                    resp.get("id"),
+                    f"result of {action!r} is a {exc} and is not sent over RPC{hint}",
+                    error_code="result_not_serializable",
+                )
+            )
+        except (TypeError, ValueError) as exc:
+            self.rpc.send_json(
+                self._rpc_error(
+                    resp.get("id"),
+                    f"result of {action!r} is not JSON serializable: {exc}",
+                    error_code="result_not_serializable",
+                )
+            )
 
     @staticmethod
     def _rpc_error(
@@ -1090,7 +1198,7 @@ class DeviceRunner:
                             type(value) is type(allowed) and value == allowed
                             for allowed in literal_values
                         ):
-                            raise TypeError(
+                            raise BadCommandParametersError(
                                 f"Bad parameters for command {action!r}: {param.name} "
                                 f"must be one of {literal_values!r}"
                             )
@@ -1103,13 +1211,17 @@ class DeviceRunner:
                             coerced[param.name], kind
                         )
                     except Exception as e:
-                        raise TypeError(
+                        raise BadCommandParametersError(
                             f"Bad parameters for command {action!r}: {param.name} ({e})"
                         ) from e
             params = coerced
 
         try:
             result = self.handle_command(action, params)
+        except CommandCallerError:
+            # Caller mistake (unknown command / bad arguments): the device
+            # itself is fine, so do not demote it.
+            raise
         except Exception as exc:
             self._mark_device_unreachable(
                 f"command {action!r} failed: {exc!r}"
@@ -1144,8 +1256,15 @@ class DeviceRunner:
             if routed is not None:
                 return routed
             return self._rpc_dispatch_device_command(rpc_req)
+        except UnknownCommandError as e:
+            return self._rpc_error(rpc.request_id, str(e), error_code="unknown_command")
+        except BadCommandParametersError as e:
+            return self._rpc_error(rpc.request_id, str(e), error_code="bad_parameters")
+        except CommandNotAllowedError as e:
+            return self._rpc_error(rpc.request_id, str(e), error_code="command_not_allowed")
         except Exception as e:
-            self._last_error = f"command {rpc.action} failed: {e!r}"
+            if not isinstance(e, CommandCallerError):
+                self._last_error = f"command {rpc.action} failed: {e!r}"
             return {"id": rpc.request_id, "status": "ERROR", "error": str(e)}
 
     # ----------------------------

@@ -28,6 +28,50 @@ export type SequencerStatus = {
   progress: SequencerProgress | null;
   loadedAdaptiveIds: string[];
   adaptiveStudies: Record<string, SequencerAdaptiveStudyStatus>;
+  /** Who paused the run and why, while PAUSED. */
+  pause?: SequencerPauseInfo | null;
+  /** Summary of sequencer.run_events; refetch the list when `seq` changes. */
+  runEvents?: SequencerRunEventsSummary | null;
+};
+
+export type SequencerPauseTrigger = {
+  watchdogId: string | null;
+  rule: string | null;
+  severity: string | null;
+  tripId: string | null;
+};
+
+export type SequencerPauseInfo = {
+  reason: string | null;
+  source: string | null;
+  trigger: SequencerPauseTrigger | null;
+  elapsedS: number | null;
+};
+
+export type SequencerRunEventsSummary = {
+  seq: number;
+  count: number;
+  dropped: number;
+  errors: number;
+  warnings: number;
+};
+
+export type SequencerRunEvent = {
+  severity: "error" | "warning" | "info";
+  /** pause | resume | stop | step_failed | cleanup_failed | external_fault | log */
+  kind: string;
+  message: string;
+  source: string | null;
+  step: {
+    kind: string | null;
+    summary: string | null;
+    path: string | null;
+    line: number | null;
+    branch: string | null;
+  } | null;
+  elapsedS: number;
+  count: number;
+  trigger: SequencerPauseTrigger | null;
 };
 
 export type SequencerProgress = {
@@ -80,6 +124,10 @@ export type SequencerDiagnostic = {
   line: number | null;
   column: number | null;
   source: string | null;
+  /** The YAML changed since this was computed; its line may be off. */
+  stale?: boolean;
+  /** "run": an event from the current/last run rather than a validation result. */
+  origin?: "validation" | "run";
 };
 
 export type SequencerStepOutlineNode = {

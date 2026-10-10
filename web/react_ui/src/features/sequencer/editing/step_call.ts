@@ -28,10 +28,11 @@ export function applyEditedCallStep(
       body.set("device", textToNode(doc, device));
     }
     body.set("action", textToNode(doc, action));
-    body.set(
-      "params",
-      cleanEntries(params).length > 0 ? entriesToMap(doc, params) : emptyMap()
-    );
+    if (cleanEntries(params).length > 0) {
+      body.set("params", entriesToMap(doc, params));
+    } else if (body.has("params")) {
+      body.set("params", emptyMap());
+    }
   });
   return replaceStepSnippet(yamlText, node, out);
 }

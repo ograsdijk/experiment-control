@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import difflib
 import json
+import re
 import queue
 import sys
 import threading
@@ -320,9 +322,25 @@ def _walk_step_lines(seq_node: Any, path: str, line_map: dict[str, int]) -> None
                     )
 
 
-def _build_step_line_map(text: str | None) -> dict[str, int]:
+def _line_for_path(line_map: dict[str, int], path: str) -> int | None:
+    """Line of `path`, or of its closest enclosing step."""
+    best: int | None = None
+    best_len = -1
+    for key, line in line_map.items():
+        if (path == key or path.startswith((f"{key}.", f"{key}["))) and len(key) > best_len:
+            best, best_len = line, len(key)
+    return best
+
+
+def _build_step_line_map(text: str | None, spec: Any = None) -> dict[str, int]:
     """Map preflight step paths -> 1-based source line, from a line-tracking
-    YAML parse, so reachability diagnostics can point at the offending step."""
+    YAML parse, so reachability diagnostics can point at the offending step.
+
+    Paths follow the parsed spec. With `requires.watchdog_ids` the parser wraps
+    the whole sequence in a generated try (enable each watchdog, the steps,
+    disable in finally), so source `steps[i]` becomes
+    `steps[0].try.do[n + i]`; without remapping every diagnostic resolved to
+    the same line. The generated steps point at the `requires:` line."""
     if not text:
         return {}
     try:
@@ -333,7 +351,64 @@ def _build_step_line_map(text: str | None) -> dict[str, int]:
     steps_node = _yaml_mapping_get(root, "steps") if root is not None else None
     if steps_node is not None:
         _walk_step_lines(steps_node, "steps", line_map)
-    return line_map
+    watchdog_ids = list(getattr(spec, "watchdog_ids", None) or [])
+    if not watchdog_ids:
+        return line_map
+    return _remap_for_watchdog_gate(line_map, root, len(watchdog_ids))
+
+
+def _remap_for_watchdog_gate(
+    line_map: dict[str, int], root: Any, offset: int
+) -> dict[str, int]:
+    """Source step paths -> paths inside the generated watchdog-gate try."""
+    remapped: dict[str, int] = {}
+    for key, line in line_map.items():
+        match = re.match(r"^steps\[(\d+)\](.*)$", key)
+        if match is None:
+            continue
+        index = int(match.group(1)) + offset
+        remapped[f"steps[0].try.do[{index}]{match.group(2)}"] = line
+    requires_node = None
+    if isinstance(root, yaml.MappingNode):
+        for key_node, _value in root.value:
+            if isinstance(key_node, yaml.ScalarNode) and key_node.value == "requires":
+                requires_node = key_node
+    gate_line = (
+        int(requires_node.start_mark.line) + 1
+        if requires_node is not None
+        else min(line_map.values(), default=None)
+    )
+    if gate_line is not None:
+        remapped["steps[0]"] = gate_line
+        for index in range(offset):
+            remapped[f"steps[0].try.do[{index}]"] = gate_line
+            remapped[f"steps[0].try.finally[{index}]"] = gate_line
+    return remapped
+
+def _device_start_problem(
+    device_id: str, status_by_device: dict[str, dict[str, Any]]
+) -> str | None:
+    """Why `device_id` blocks a sequence start (unknown id, or its state and
+    last error), or None when it is online."""
+    item = status_by_device.get(device_id)
+    if item is None:
+        close = difflib.get_close_matches(
+            device_id, sorted(status_by_device), n=3, cutoff=0.6
+        )
+        hint = " (did you mean " + ", ".join(repr(c) for c in close) + "?)" if close else ""
+        return f"{device_id} (not configured{hint})"
+    liveness = str(item.get("liveness", "")) or "UNKNOWN"
+    device_state = str(item.get("device_state", "") or "")
+    if liveness == "ONLINE" and device_state not in {"DEGRADED", "DISCONNECTED"}:
+        return None
+    states = [liveness]
+    if device_state and device_state != liveness:
+        states.append(device_state)
+    text = f"{device_id} (configured but {'/'.join(states)}"
+    last_error = item.get("last_error")
+    if last_error:
+        text += f"; last error: {last_error}"
+    return text + ")"
 
 
 def _normalize_log_severity(raw: Any) -> str:
@@ -532,7 +607,7 @@ class SequencerProcess(ManagedProcessBase):
         step_source_info = build_step_source_info(
             spec,
             source=source,
-            line_map=_build_step_line_map(text),
+            line_map=_build_step_line_map(text, spec),
         )
         self._runtime.load(spec, step_source_info=step_source_info)
         self._context_columns = _effective_context_columns(spec.context_columns)
@@ -800,14 +875,14 @@ class SequencerProcess(ManagedProcessBase):
     ) -> tuple[bool, Any | None, list[Json]]:
         diagnostics: list[Json] = []
         try:
-            raw = load_yaml_text(text, source=source)
+            raw = load_yaml_text(text, source=source, yaml12_floats=True)
         except Exception as e:
             line = getattr(e, "line", None)
             column = getattr(e, "column", None)
             diagnostics.append(
                 {
                     "severity": "error",
-                    "message": str(e),
+                    "message": str(getattr(e, "detail", None) or e),
                     "line": int(line) if isinstance(line, int) else None,
                     "column": int(column) if isinstance(column, int) else None,
                     "source": "yaml",
@@ -818,11 +893,15 @@ class SequencerProcess(ManagedProcessBase):
         try:
             spec = parse_sequence(raw)
         except Exception as e:
+            parse_line: int | None = None
+            step_path = getattr(e, "path", None)
+            if isinstance(step_path, str):
+                parse_line = _line_for_path(_build_step_line_map(text), step_path)
             diagnostics.append(
                 {
                     "severity": "error",
                     "message": str(e),
-                    "line": None,
+                    "line": parse_line,
                     "column": None,
                     "source": "sequencer",
                 }
@@ -2606,7 +2685,7 @@ class SequencerProcess(ManagedProcessBase):
     ) -> list[Json]:
         # Source-line map for diagnostics (best-effort; empty if text is absent
         # or unparseable, in which case diagnostics simply carry no line).
-        self._preflight_line_map = _build_step_line_map(text)
+        self._preflight_line_map = _build_step_line_map(text, spec)
         diagnostics: list[Json] = []
 
         list_devices_resp = self._require_manager().call({"type": "manager.devices.list"})
@@ -2865,7 +2944,18 @@ class SequencerProcess(ManagedProcessBase):
         }
         resp = self._call_process("hdf_writer", "hdf.streams.expect", params)
         if not bool(resp.get("ok", False)):
-            raise RuntimeError(f"hdf.streams.expect failed: {self._device_error_text(resp)}")
+            names = ", ".join(f"{device_id}/{stream}" for device_id, stream in streams)
+            err = resp.get("error")
+            if isinstance(err, dict) and err.get("code") == "hdf_not_writing":
+                raise RuntimeError(
+                    "the HDF writer is not writing a file, so the context for "
+                    f"{names} cannot be recorded; start HDF recording before "
+                    "running the sequence"
+                )
+            raise RuntimeError(
+                f"the HDF writer refused the streams {names} "
+                f"(hdf.streams.expect): {self._device_error_text(resp)}"
+            )
 
     def _begin_set_context(
         self, streams: list[tuple[str, str]], context_id: int, fields: dict[str, Any]
@@ -3030,9 +3120,33 @@ class SequencerProcess(ManagedProcessBase):
                 ],
                 doc="Start the loaded sequence.",
             ),
-            method("sequencer.pause", params=None, doc="Pause sequence execution."),
-            method("sequencer.resume", params=None, doc="Resume sequence execution."),
-            method("sequencer.stop", params=None, doc="Stop sequence execution."),
+            method(
+                "sequencer.pause",
+                params=[
+                    param("reason", required=False, default=None, annotation="str"),
+                    param("source", required=False, default=None, annotation="str"),
+                    param("trigger", required=False, default=None, annotation="dict"),
+                ],
+                doc="Pause sequence execution. reason/source/trigger say who paused and why.",
+            ),
+            method(
+                "sequencer.resume",
+                params=[param("source", required=False, default=None, annotation="str")],
+                doc="Resume sequence execution.",
+            ),
+            method(
+                "sequencer.stop",
+                params=[
+                    param("reason", required=False, default=None, annotation="str"),
+                    param("source", required=False, default=None, annotation="str"),
+                ],
+                doc="Stop sequence execution.",
+            ),
+            method(
+                "sequencer.run_events",
+                params=None,
+                doc="Events of the current or last run (pauses, failures, warnings) with their steps.",
+            ),
             method("sequencer.status", params=None, doc="Get sequencer status."),
             method(
                 "sequencer.library.list",
@@ -3505,7 +3619,7 @@ class SequencerProcess(ManagedProcessBase):
         if not device_ids:
             return []
         resp = self._require_manager().call({"type": "device.list_status"})
-        liveness_by_device: dict[str, str] = {}
+        status_by_device: dict[str, dict[str, Any]] = {}
         if isinstance(resp, dict):
             result = resp.get("result")
             if isinstance(result, list):
@@ -3514,13 +3628,12 @@ class SequencerProcess(ManagedProcessBase):
                         continue
                     device_id = str(item.get("device_id", "")).strip()
                     if device_id:
-                        liveness_by_device[device_id] = str(item.get("liveness", ""))
-        missing = sorted(
-            device_id
-            for device_id in device_ids
-            if liveness_by_device.get(device_id) != "ONLINE"
+                        status_by_device[device_id] = item
+        problems = (
+            _device_start_problem(device_id, status_by_device)
+            for device_id in sorted(device_ids)
         )
-        return missing
+        return [problem for problem in problems if problem is not None]
 
     def _check_start_preconditions(self, req: Json) -> Json | None:
         # Called from `_rpc_sequencer_start` right after `runtime.start()`
@@ -3617,9 +3730,20 @@ class SequencerProcess(ManagedProcessBase):
         )
         return self.rpc_ok(req, result={"status": "running"})
 
+    @staticmethod
+    def _control_params(req: Json) -> Json:
+        """Optional `reason`/`source`/`trigger` on pause/resume/stop."""
+        params = req.get("params") or {}
+        return params if isinstance(params, dict) else {}
+
     def _rpc_sequencer_pause(self, req: Json) -> Json:
+        params = self._control_params(req)
         try:
-            self._runtime.request_pause()
+            self._runtime.request_pause(
+                reason=params.get("reason"),
+                source=params.get("source"),
+                trigger=params.get("trigger"),
+            )
         except Exception as e:
             self._publish_lifecycle_event(
                 event="pause",
@@ -3637,8 +3761,9 @@ class SequencerProcess(ManagedProcessBase):
         return self.rpc_ok(req, result={"status": "pause_requested"})
 
     def _rpc_sequencer_resume(self, req: Json) -> Json:
+        params = self._control_params(req)
         try:
-            self._runtime.resume()
+            self._runtime.resume(source=params.get("source"))
         except Exception as e:
             self._publish_lifecycle_event(
                 event="resume",
@@ -3656,8 +3781,12 @@ class SequencerProcess(ManagedProcessBase):
         return self.rpc_ok(req, result={"status": "running"})
 
     def _rpc_sequencer_stop(self, req: Json) -> Json:
+        params = self._control_params(req)
         try:
-            self._runtime.request_stop()
+            self._runtime.request_stop(
+                reason=params.get("reason"),
+                source=params.get("source"),
+            )
         except Exception as e:
             self._publish_lifecycle_event(
                 event="stop",
@@ -3673,6 +3802,9 @@ class SequencerProcess(ManagedProcessBase):
             message="stop requested",
         )
         return self.rpc_ok(req, result={"status": "stop_requested"})
+
+    def _rpc_sequencer_run_events(self, req: Json) -> Json:
+        return self.rpc_ok(req, result=self._runtime.run_events())
 
     def _build_rpc_registry(self) -> RpcDispatchRegistry:
         handlers = {
@@ -3692,6 +3824,7 @@ class SequencerProcess(ManagedProcessBase):
             "sequencer.pause": self._rpc_sequencer_pause,
             "sequencer.resume": self._rpc_sequencer_resume,
             "sequencer.stop": self._rpc_sequencer_stop,
+            "sequencer.run_events": self._rpc_sequencer_run_events,
         }
         return RpcDispatchRegistry(
             handlers=handlers,
@@ -3807,6 +3940,7 @@ class SequencerProcess(ManagedProcessBase):
                 continue
             should_fail, reason = _should_trigger_external_sequencer_fault(payload)
             if not should_fail or not reason:
+                self._note_external_warning(payload)
                 continue
             self._runtime.fail(reason)
             self._publish_lifecycle_event(
@@ -3829,6 +3963,25 @@ class SequencerProcess(ManagedProcessBase):
             )
             self._last_error_sent = True
             break
+
+    def _note_external_warning(self, payload: Json) -> None:
+        """Keep another source's warning/error in the run's event log; it did
+        not stop the run. Our own logs are skipped."""
+        severity = _normalize_log_severity(payload.get("severity"))
+        if severity not in _EXTERNAL_FAULT_SEVERITIES:
+            return
+        source_id = str(payload.get("source_id") or payload.get("process_id") or "").strip()
+        if not source_id or source_id == self._process_id:
+            return
+        source_kind = str(payload.get("source_kind") or "").strip() or "process"
+        message = str(payload.get("message") or payload.get("topic") or "").strip()
+        if not message:
+            return
+        self._runtime.note_external_log(
+            severity="error" if severity == "critical" else severity,
+            message=message,
+            source=f"{source_kind}:{source_id}",
+        )
 
     def _drain_analysis_outputs(self, events: dict[Any, int]) -> None:
         if not (int(events.get(self._analysis_sub, 0)) & zmq.POLLIN):

@@ -5,10 +5,13 @@ import {
   indentSnippet,
   insertLinesAfter,
   joinLines,
+  replaceStepSnippet,
   splitLines,
   type BasicSequencerStepTemplate,
   type SequencerChildContainer,
 } from "./shared";
+import { parseDocument } from "yaml";
+import { editStep } from "./yaml_write";
 
 type ChildInsertionTarget = {
   key: SequencerChildContainer;
@@ -210,29 +213,59 @@ export function toggleStepEnabled(
   yamlText: string,
   node: SequencerStepOutlineNode
 ): string {
+  const textual = toggleStepEnabledText(yamlText, node);
+  if (textual !== null) {
+    return textual;
+  }
+  // Fallback: set/remove `disabled` on the parsed step item.
+  const out = editStep(node.snippet, (_doc, item) => {
+    if (node.disabled) {
+      item.delete("disabled");
+    } else {
+      item.set("disabled", true);
+    }
+  });
+  return replaceStepSnippet(yamlText, node, out);
+}
+
+/**
+ * Add/remove a `disabled: true` line as a minimal text edit, so the rest of
+ * the step keeps its formatting. The line goes after the step's last line,
+ * at the column of the step's key: inserting it right under `- call:` (as
+ * before) split a block step from its body and made the YAML invalid.
+ * Returns null when the edit would not leave valid YAML.
+ */
+function toggleStepEnabledText(
+  yamlText: string,
+  node: SequencerStepOutlineNode
+): string | null {
   const { lines, hasTrailingNewline } = splitLines(yamlText);
   const startIndex = Math.max(0, node.line - 1);
   const endIndex = Math.max(startIndex, node.endLine - 1);
-  const disabledIndent = node.indent + 2;
-  const disabledPattern = new RegExp(`^ {${disabledIndent}}disabled:\\s*true\\s*$`);
-
-  if (node.disabled) {
-    for (let index = startIndex + 1; index <= endIndex; index += 1) {
-      if (disabledPattern.test(lines[index] ?? "")) {
-        const nextLines = [...lines.slice(0, index), ...lines.slice(index + 1)];
-        return joinLines(nextLines, hasTrailingNewline);
-      }
-    }
-    return yamlText;
+  const keyColumn = (lines[startIndex] ?? "").search(/[^\s-]/);
+  if (keyColumn <= node.indent) {
+    return null;
   }
-
-  const insertionLine = `${" ".repeat(disabledIndent)}disabled: true`;
-  const nextLines = [
-    ...lines.slice(0, startIndex + 1),
-    insertionLine,
-    ...lines.slice(startIndex + 1),
-  ];
-  return joinLines(nextLines, hasTrailingNewline);
+  let nextLines: string[];
+  if (node.disabled) {
+    const pattern = new RegExp(`^ {${keyColumn}}disabled:\\s*true\\s*(#.*)?$`);
+    const index = lines.findIndex(
+      (line, i) => i > startIndex && i <= endIndex && pattern.test(line)
+    );
+    if (index < 0) {
+      return null;
+    }
+    nextLines = [...lines.slice(0, index), ...lines.slice(index + 1)];
+  } else {
+    nextLines = [
+      ...lines.slice(0, endIndex + 1),
+      `${" ".repeat(keyColumn)}disabled: true`,
+      ...lines.slice(endIndex + 1),
+    ];
+  }
+  const next = joinLines(nextLines, hasTrailingNewline);
+  const doc = parseDocument(next);
+  return doc.errors.length > 0 ? null : next;
 }
 
 export function deleteStep(

@@ -152,7 +152,7 @@ class ReservedFieldValidationTests(unittest.TestCase):
                 "version: 1\n"
                 "steps:\n"
                 "  - repeat:\n"
-                "      count: 2\n"
+                "      times: 2\n"
                 "      do:\n"
                 "        - set_context:\n"
                 "            streams: [{device: scope, stream: trace}]\n"

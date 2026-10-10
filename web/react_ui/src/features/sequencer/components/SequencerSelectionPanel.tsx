@@ -5,6 +5,7 @@ import { EditableStepInspector } from "../../../components/EditableStepInspector
 import { LoopStepInspector } from "../../../components/LoopStepInspector";
 import { YamlPreview } from "../../../components/YamlPreview";
 import type { StreamAnalysisWorkspaceConfig } from "../../stream/types";
+import type { SequencerDiagnostic } from "../types";
 import type { CapabilityMember } from "../../../types";
 import type { StreamCatalogEntry } from "../../../types";
 import type { TelemetrySignal } from "../../../types";
@@ -20,6 +21,8 @@ type Props = {
   latestSignalsByDevice: Record<string, Record<string, TelemetrySignal>>;
   colorScheme: "light" | "dark";
   onSelectStep: (id: string) => void;
+  /** Validator/condition diagnostics on the selected step's own lines. */
+  stepDiagnostics?: ReadonlyArray<SequencerDiagnostic>;
 };
 
 function kindColor(kind: string): string {
@@ -71,6 +74,7 @@ export function SequencerSelectionPanel({
   latestSignalsByDevice,
   colorScheme,
   onSelectStep,
+  stepDiagnostics = [],
 }: Props) {
   return (
     <Card
@@ -89,7 +93,7 @@ export function SequencerSelectionPanel({
           Select a step to inspect it.
         </Text>
       ) : (
-        <ScrollArea style={{ flex: 1, minHeight: 0 }}>
+        <ScrollArea style={{ flex: 1, minHeight: 0 }} type="auto" offsetScrollbars>
           <Stack gap="sm">
             <Group gap="xs" wrap="wrap">
               <Badge size="sm" variant="light" color={kindColor(selectedStep.kind)}>
@@ -108,6 +112,26 @@ export function SequencerSelectionPanel({
                 </Badge>
               ) : null}
             </Group>
+            {stepDiagnostics.length > 0 && (
+              <Stack gap={4}>
+                {stepDiagnostics.map((diag, index) => (
+                  <Group key={index} gap={6} wrap="nowrap" align="flex-start">
+                    <Badge
+                      size="xs"
+                      variant="light"
+                      color={diag.severity === "error" ? "red" : diag.severity === "warning" ? "yellow" : "gray"}
+                      style={{ flexShrink: 0 }}
+                    >
+                      {diag.severity}
+                    </Badge>
+                    <Text size="xs" style={{ whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
+                      {diag.message}
+                      {diag.line != null ? ` (line ${diag.line})` : ""}
+                    </Text>
+                  </Group>
+                ))}
+              </Stack>
+            )}
             <Text size="sm" fw={600}>
               {selectedStep.summary ?? selectedStep.kind}
             </Text>

@@ -1,8 +1,6 @@
-import { ActionIcon, Card, Group, Stack, Text } from "@mantine/core";
-import { IconChevronDown, IconChevronRight } from "@tabler/icons-react";
+import { Card, Stack, Text } from "@mantine/core";
 import { useEffect, useMemo, useState } from "react";
 import {
-  buildSequencerOutlineMetadata,
   buildSequencerStepOutline,
   flattenSequencerStepOutline,
 } from "../features/sequencer/outline";
@@ -20,10 +18,13 @@ import {
   type SequencerChildContainer,
 } from "../features/sequencer/editing";
 import type {
-  SequencerOutlineMetadata,
+  SequencerDiagnostic,
   SequencerStepOutlineNode,
 } from "../features/sequencer/types";
-import { SequencerMetadataPanel } from "../features/sequencer/components/SequencerMetadataPanel";
+import {
+  mapDiagnosticsToSteps,
+  stepPathAtLine,
+} from "../features/sequencer/diagnostic_locations";
 import { SequencerSelectionPanel } from "../features/sequencer/components/SequencerSelectionPanel";
 import { SequencerStepTree } from "../features/sequencer/components/SequencerStepTree";
 import type { StreamAnalysisWorkspaceConfig } from "../features/stream/types";
@@ -39,6 +40,9 @@ type Props = {
   streamWorkspaces: Record<string, StreamAnalysisWorkspaceConfig>;
   latestSignalsByDevice: Record<string, Record<string, TelemetrySignal>>;
   colorScheme: "light" | "dark";
+  diagnostics?: ReadonlyArray<SequencerDiagnostic>;
+  /** Select the step at this line (a new nonce re-triggers the same line). */
+  focusRequest?: { line: number; nonce: number } | null;
 };
 
 function buildSiblingInfoMap(
@@ -73,29 +77,23 @@ export function SequencerOutlinePane({
   streamWorkspaces,
   latestSignalsByDevice,
   colorScheme,
+  diagnostics = [],
+  focusRequest = null,
 }: Props) {
   const parsedOutline = useMemo(() => {
     try {
       return {
-        metadata: buildSequencerOutlineMetadata(yamlText),
         outline: buildSequencerStepOutline(yamlText),
         error: null as string | null,
       };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      const fallbackMetadata: SequencerOutlineMetadata = {
-        version: null,
-        vars: [],
-        contextColumns: [],
-      };
       return {
-        metadata: fallbackMetadata,
         outline: [] as SequencerStepOutlineNode[],
         error: message,
       };
     }
   }, [yamlText]);
-  const metadata = parsedOutline.metadata;
   const outline = parsedOutline.outline;
   const outlineParseError = parsedOutline.error;
   const flatOutline = useMemo(
@@ -103,10 +101,12 @@ export function SequencerOutlinePane({
     [outline]
   );
   const siblingInfoById = useMemo(() => buildSiblingInfoMap(outline), [outline]);
+  const stepDiagnostics = useMemo(
+    () => mapDiagnosticsToSteps(outline, diagnostics),
+    [outline, diagnostics]
+  );
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [collapsedById, setCollapsedById] = useState<Record<string, boolean>>({});
-  const [outlineCollapsed, setOutlineCollapsed] = useState(false);
-  const [metadataCollapsed, setMetadataCollapsed] = useState(false);
   const [pendingSelection, setPendingSelection] = useState<{
     line: number;
     kind: string | null;
@@ -165,6 +165,27 @@ export function SequencerOutlinePane({
       setCollapsedById(Object.fromEntries(nextEntries));
     }
   }, [flatOutline, collapsedById]);
+
+  useEffect(() => {
+    if (!focusRequest) {
+      return;
+    }
+    const path = stepPathAtLine(outline, focusRequest.line);
+    if (path.length === 0) {
+      return;
+    }
+    // Expand the parents so the step is visible, then select it.
+    setCollapsedById((prev) => {
+      const next = { ...prev };
+      for (const node of path.slice(0, -1)) {
+        next[node.id] = false;
+      }
+      return next;
+    });
+    setSelectedId(path[path.length - 1].id);
+    // Only on a new request, not when the outline re-parses.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focusRequest]);
 
   const selectedStep =
     selectedId === null
@@ -265,126 +286,76 @@ export function SequencerOutlinePane({
   };
 
   return (
-    <Card
-      radius="md"
-      p="sm"
-      style={{
-        border: "1px solid var(--card-border)",
-        display: "flex",
-        flexDirection: "column",
-        flex: outlineCollapsed ? "0 0 auto" : "1 1 auto",
-        width: "100%",
-        minHeight: 0,
-      }}
-    >
-      <Stack
-        gap="sm"
+    <Stack gap="xs" style={{ flex: 1, minHeight: 0 }}>
+      {outlineParseError ? (
+        <Card radius="sm" p="xs" style={{ border: "1px solid var(--card-border)" }}>
+          <Stack gap={4}>
+            <Text size="xs" c="red" fw={600}>
+              Outline parser error
+            </Text>
+            <Text size="xs" c="dimmed">
+              The step view is disabled for this YAML text. You can keep editing
+              in the YAML tab.
+            </Text>
+            <Text
+              size="xs"
+              c="dimmed"
+              style={{
+                fontFamily:
+                  'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace',
+              }}
+            >
+              {outlineParseError}
+            </Text>
+          </Stack>
+        </Card>
+      ) : null}
+      <div
         style={{
-          flex: outlineCollapsed ? "0 0 auto" : "1 1 auto",
+          display: "grid",
+          gridTemplateColumns: "minmax(20rem, 1fr) minmax(0, 1fr)",
+          gap: 12,
+          flex: 1,
           minHeight: 0,
         }}
       >
-        <Group justify="space-between" align="center">
-          <Stack gap={2}>
-            <Text size="sm" fw={600}>
-              Sequence outline
-            </Text>
-            <Text size="xs" c="dimmed">
-              Visual view of the current YAML with step-level editing, insertion,
-              and metadata controls
-            </Text>
-          </Stack>
-          <ActionIcon
-            size="sm"
-            variant="subtle"
-            color="gray"
-            aria-label={outlineCollapsed ? "Expand sequence outline" : "Collapse sequence outline"}
-            onClick={() => setOutlineCollapsed((prev) => !prev)}
-          >
-            {outlineCollapsed ? (
-              <IconChevronRight size={16} />
-            ) : (
-              <IconChevronDown size={16} />
-            )}
-          </ActionIcon>
-        </Group>
-        {!outlineCollapsed && (
-          <>
-            {outlineParseError ? (
-              <Card radius="sm" p="xs" style={{ border: "1px solid var(--card-border)" }}>
-                <Stack gap={4}>
-                  <Text size="xs" c="red" fw={600}>
-                    Outline parser error
-                  </Text>
-                  <Text size="xs" c="dimmed">
-                    Visual outline is temporarily disabled for this YAML text.
-                    You can continue editing in the full YAML editor.
-                  </Text>
-                  <Text
-                    size="xs"
-                    c="dimmed"
-                    style={{
-                      fontFamily:
-                        'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace',
-                    }}
-                  >
-                    {outlineParseError}
-                  </Text>
-                </Stack>
-              </Card>
-            ) : null}
-            <SequencerMetadataPanel
-              metadata={metadata}
-              metadataCollapsed={metadataCollapsed}
-              onToggleCollapsed={() => setMetadataCollapsed((prev) => !prev)}
-              yamlText={yamlText}
-              onYamlTextChange={onYamlTextChange}
-            />
-            <div
-              style={{
-                display: "grid",
-                gridTemplateColumns: "minmax(220px, 0.9fr) minmax(0, 1.1fr)",
-                gap: 12,
-                flex: 1,
-                minHeight: 0,
-              }}
-            >
-              <SequencerStepTree
-                outline={outline}
-                selectedId={selectedId}
-                onSelect={setSelectedId}
-                collapsedById={collapsedById}
-                onToggleCollapse={(id) =>
-                  setCollapsedById((prev) => ({
-                    ...prev,
-                    [id]: !Boolean(prev[id]),
-                  }))
-                }
-                onDuplicate={handleDuplicateStep}
-                onDelete={handleDeleteStep}
-                onToggleEnabled={handleToggleEnabled}
-                onInsertBelow={handleInsertBelow}
-                onInsertChild={handleInsertChild}
-                siblingInfoById={siblingInfoById}
-                onMoveUp={handleMoveUp}
-                onMoveDown={handleMoveDown}
-                onInsertTopLevel={handleInsertTopLevel}
-              />
-              <SequencerSelectionPanel
-                selectedStep={selectedStep}
-                yamlText={yamlText}
-                onYamlTextChange={onYamlTextChange}
-                streamCatalog={streamCatalog}
-                capabilitiesByDevice={capabilitiesByDevice}
-                streamWorkspaces={streamWorkspaces}
-                latestSignalsByDevice={latestSignalsByDevice}
-                colorScheme={colorScheme}
-                onSelectStep={setSelectedId}
-              />
-            </div>
-          </>
-        )}
-      </Stack>
-    </Card>
+        <SequencerStepTree
+          outline={outline}
+          selectedId={selectedId}
+          onSelect={setSelectedId}
+          collapsedById={collapsedById}
+          onToggleCollapse={(id) =>
+            setCollapsedById((prev) => ({
+              ...prev,
+              [id]: !Boolean(prev[id]),
+            }))
+          }
+          onDuplicate={handleDuplicateStep}
+          onDelete={handleDeleteStep}
+          onToggleEnabled={handleToggleEnabled}
+          onInsertBelow={handleInsertBelow}
+          onInsertChild={handleInsertChild}
+          siblingInfoById={siblingInfoById}
+          onMoveUp={handleMoveUp}
+          onMoveDown={handleMoveDown}
+          onInsertTopLevel={handleInsertTopLevel}
+          stepDiagnostics={stepDiagnostics}
+        />
+        <SequencerSelectionPanel
+          selectedStep={selectedStep}
+          yamlText={yamlText}
+          onYamlTextChange={onYamlTextChange}
+          streamCatalog={streamCatalog}
+          capabilitiesByDevice={capabilitiesByDevice}
+          streamWorkspaces={streamWorkspaces}
+          latestSignalsByDevice={latestSignalsByDevice}
+          colorScheme={colorScheme}
+          onSelectStep={setSelectedId}
+          stepDiagnostics={
+            selectedId ? stepDiagnostics.byStepId.get(selectedId) ?? [] : []
+          }
+        />
+      </div>
+    </Stack>
   );
 }

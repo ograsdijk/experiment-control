@@ -269,7 +269,9 @@ class SequencerSetContextRetryTests(unittest.TestCase):
             }
 
         process._call_process = fake_call_process  # type: ignore[attr-defined]
-        with self.assertRaisesRegex(RuntimeError, "hdf.streams.expect failed"):
+        with self.assertRaisesRegex(
+            RuntimeError, r"HDF writer is not writing a file, so the context for scope/trace"
+        ):
             process._expect_streams([("scope", "trace")], 2)  # type: ignore[misc]
 
 

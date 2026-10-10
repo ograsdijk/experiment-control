@@ -5,6 +5,7 @@ import {
 } from "../editing";
 import { renderValue } from "../editor_helpers";
 import type { SequencerStepOutlineNode } from "../types";
+import { SeqTextInput } from "./SeqTextInput";
 
 type CommonProps = {
   node: SequencerStepOutlineNode;
@@ -29,13 +30,13 @@ export function SleepStepEditor({
   return (
     <Card radius="sm" p="xs" style={cardStyle}>
       <Stack gap={8}>
-        <TextInput
+        <SeqTextInput
           size="xs"
           label="Duration"
           value={renderValue(node.sleepDetail.duration)}
-          onChange={(event) =>
+          onChange={(value) =>
             onYamlTextChange(
-              applyEditedSleepStep(yamlText, node, event.currentTarget.value)
+              applyEditedSleepStep(yamlText, node, value)
             )
           }
         />
@@ -56,13 +57,13 @@ export function RepeatStepEditor({
   return (
     <Card radius="sm" p="xs" style={cardStyle}>
       <Stack gap={8}>
-        <TextInput
+        <SeqTextInput
           size="xs"
           label="Times"
           value={renderValue(node.repeatDetail.times)}
-          onChange={(event) =>
+          onChange={(value) =>
             onYamlTextChange(
-              applyEditedRepeatStep(yamlText, node, event.currentTarget.value)
+              applyEditedRepeatStep(yamlText, node, value)
             )
           }
         />

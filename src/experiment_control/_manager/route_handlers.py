@@ -508,9 +508,18 @@ def route_process_rpc(
                 ),
             )
         elif handle is None:
-            resp = _reply("unknown_process")
+            resp = _reply(
+                "unknown_process",
+                message=f"process {process_id!r} is not registered with the manager",
+            )
         elif handle.state not in running_states:
-            resp = _reply("process_not_running")
+            resp = _reply(
+                "process_not_running",
+                message=(
+                    f"process {process_id!r} is not running "
+                    f"(state: {getattr(handle.state, 'value', handle.state)})"
+                ),
+            )
         elif handle.rpc_endpoint is None:
             if process_action == "process.capabilities" and handle.state == starting_state:
                 resp = _reply(
@@ -519,7 +528,10 @@ def route_process_rpc(
                     retry_after_ms=500,
                 )
             else:
-                resp = _reply("process_rpc_not_ready")
+                resp = _reply(
+                    "process_rpc_not_ready",
+                    message=f"process {process_id!r} has not advertised its RPC endpoint yet",
+                )
         else:
             try:
                 resp = manager._call_process_rpc(

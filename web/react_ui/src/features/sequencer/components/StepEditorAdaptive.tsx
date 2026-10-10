@@ -8,7 +8,6 @@ import {
   Select,
   Stack,
   Text,
-  TextInput,
 } from "@mantine/core";
 import { IconChevronDown, IconPlus, IconTrash } from "@tabler/icons-react";
 import { useEffect, useState } from "react";
@@ -55,6 +54,7 @@ import type {
 } from "../../../types";
 import { KeyValueChipList } from "./KeyValueChipList";
 import { KeyValueChipRow } from "./KeyValueChipRow";
+import { SeqTextInput } from "./SeqTextInput";
 
 type Props = {
   node: SequencerStepOutlineNode;
@@ -355,14 +355,14 @@ export function AdaptiveStepEditor({
       <Stack gap="sm">
         <Card radius="sm" p="xs" style={cardStyle}>
           <Stack gap={8}>
-            <TextInput
+            <SeqTextInput
               size="xs"
               label="Study id"
               value={adaptiveId}
               error={adaptiveIdError ? "Study id is required." : undefined}
-              onChange={(event) =>
+              onChange={(value) =>
                 updateAdaptive(
-                  event.currentTarget.value,
+                  value,
                   controllerKind,
                   minLoss,
                   adaptiveSpace,
@@ -394,16 +394,16 @@ export function AdaptiveStepEditor({
               }}
             />
             <Group grow align="flex-end">
-              <TextInput
+              <SeqTextInput
                 size="xs"
                 label="Min loss"
                 value={minLoss}
                 error={minLossError ? "Min loss must be non-negative." : undefined}
-                onChange={(event) =>
+                onChange={(value) =>
                   updateAdaptive(
                     adaptiveId,
                     controllerKind,
-                    event.currentTarget.value,
+                    value,
                     adaptiveSpace,
                     adaptiveBind,
                     adaptiveMetrics,
@@ -414,14 +414,14 @@ export function AdaptiveStepEditor({
                   )
                 }
               />
-              <TextInput
+              <SeqTextInput
                 size="xs"
                 label="Max trials"
                 value={maxTrials}
                 error={
                   maxTrialsError ? "Max trials must be a positive integer." : undefined
                 }
-                onChange={(event) =>
+                onChange={(value) =>
                   updateAdaptive(
                     adaptiveId,
                     controllerKind,
@@ -432,13 +432,13 @@ export function AdaptiveStepEditor({
                     adaptiveAggregate,
                     observeRepeats,
                     score,
-                    event.currentTarget.value
+                    value
                   )
                 }
               />
             </Group>
             <Group grow align="flex-end">
-              <TextInput
+              <SeqTextInput
                 size="xs"
                 label="Observe repeats"
                 value={observeRepeats}
@@ -447,7 +447,7 @@ export function AdaptiveStepEditor({
                     ? "Observe repeats must be a positive integer."
                     : undefined
                 }
-                onChange={(event) =>
+                onChange={(value) =>
                   updateAdaptive(
                     adaptiveId,
                     controllerKind,
@@ -456,18 +456,18 @@ export function AdaptiveStepEditor({
                     adaptiveBind,
                     adaptiveMetrics,
                     adaptiveAggregate,
-                    event.currentTarget.value,
+                    value,
                     score,
                     maxTrials
                   )
                 }
               />
-              <TextInput
+              <SeqTextInput
                 size="xs"
                 label="Score"
                 value={score}
                 error={scoreError ? "Score is required." : undefined}
-                onChange={(event) =>
+                onChange={(value) =>
                   updateAdaptive(
                     adaptiveId,
                     controllerKind,
@@ -477,7 +477,7 @@ export function AdaptiveStepEditor({
                     adaptiveMetrics,
                     adaptiveAggregate,
                     observeRepeats,
-                    event.currentTarget.value,
+                    value,
                     maxTrials
                   )
                 }
@@ -683,7 +683,7 @@ export function AdaptiveStepEditor({
                     <Stack gap={6}>
                       <div className="sequencer-var-chip">
                         <div className="sequencer-var-segment sequencer-var-name">
-                          <TextInput
+                          <SeqTextInput
                             size="xs"
                             aria-label="Parameter name"
                             placeholder="parameter"
@@ -696,10 +696,10 @@ export function AdaptiveStepEditor({
                                   ? "Parameter names must be unique."
                                   : undefined
                             }
-                            onChange={(event) => {
+                            onChange={(value) => {
                               const nextSpace = adaptiveSpace.map((entry, entryIndex) =>
                                 entryIndex === groupIndex
-                                  ? { ...entry, name: event.currentTarget.value }
+                                  ? { ...entry, name: value }
                                   : entry
                               );
                               updateAdaptive(adaptiveId, controllerKind, minLoss, nextSpace, adaptiveBind, adaptiveMetrics, adaptiveAggregate, observeRepeats, score, maxTrials);
@@ -953,7 +953,7 @@ export function AdaptiveStepEditor({
                     >
                       <Stack gap={6}>
                         <Group grow align="flex-end">
-                          <TextInput
+                          <SeqTextInput
                             size="xs"
                             label="Name"
                             value={metric.name}
@@ -964,10 +964,10 @@ export function AdaptiveStepEditor({
                                   ? "Metric names must be unique."
                                   : undefined
                             }
-                            onChange={(event) =>
+                            onChange={(value) =>
                               updateMetric({
                                 ...metric,
-                                name: event.currentTarget.value,
+                                name: value,
                               })
                             }
                           />
@@ -1046,7 +1046,7 @@ export function AdaptiveStepEditor({
                                 }
                               />
                             ) : (
-                              <TextInput
+                              <SeqTextInput
                                 size="xs"
                                 label="Workspace id"
                                 value={selectedWorkspaceId}
@@ -1055,13 +1055,13 @@ export function AdaptiveStepEditor({
                                     ? "Workspace id is required."
                                     : undefined
                                 }
-                                onChange={(event) =>
+                                onChange={(value) =>
                                   updateMetric({
                                     ...metric,
                                     config: setConfigEntry(
                                       metric.config,
                                       "workspace_id",
-                                      event.currentTarget.value
+                                      value
                                     ),
                                   })
                                 }
@@ -1093,7 +1093,7 @@ export function AdaptiveStepEditor({
                                 }
                               />
                             ) : (
-                              <TextInput
+                              <SeqTextInput
                                 size="xs"
                                 label="Output id"
                                 value={selectedOutputId}
@@ -1102,13 +1102,13 @@ export function AdaptiveStepEditor({
                                     ? "Output id is required."
                                     : undefined
                                 }
-                                onChange={(event) =>
+                                onChange={(value) =>
                                   updateMetric({
                                     ...metric,
                                     config: setConfigEntry(
                                       metric.config,
                                       "output_id",
-                                      event.currentTarget.value
+                                      value
                                     ),
                                   })
                                 }
@@ -1254,7 +1254,7 @@ export function AdaptiveStepEditor({
                               }
                             />
                           ) : (
-                            <TextInput
+                            <SeqTextInput
                               key={spec.key}
                               size="xs"
                               label={spec.label}
@@ -1270,13 +1270,13 @@ export function AdaptiveStepEditor({
                                   ? `${spec.label} is required.`
                                   : undefined
                               }
-                              onChange={(event) =>
+                              onChange={(value) =>
                                 updateMetric({
                                   ...metric,
                                   config: setConfigEntry(
                                     metric.config,
                                     spec.key,
-                                    event.currentTarget.value
+                                    value
                                   ),
                                 })
                               }
@@ -1464,7 +1464,7 @@ export function AdaptiveStepEditor({
                         />
                       }
                       valueControl={
-                        <TextInput
+                        <SeqTextInput
                           size="xs"
                           aria-label="Bind target"
                           placeholder="variable"
@@ -1473,10 +1473,10 @@ export function AdaptiveStepEditor({
                           error={
                             isBlank(entry.value) ? "Bind target is required." : undefined
                           }
-                          onChange={(event) => {
+                          onChange={(value) => {
                             const nextBind = adaptiveBind.map((bindEntry, bindIndex) =>
                               bindIndex === entryIndex
-                                ? { ...bindEntry, value: event.currentTarget.value }
+                                ? { ...bindEntry, value: value }
                                 : bindEntry
                             );
                             updateAdaptive(adaptiveId, controllerKind, minLoss, adaptiveSpace, nextBind, adaptiveMetrics, adaptiveAggregate, observeRepeats, score, maxTrials);

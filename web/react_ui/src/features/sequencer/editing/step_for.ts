@@ -1,4 +1,4 @@
-import { YAMLMap, YAMLSeq } from "yaml";
+import { YAMLMap, YAMLSeq, isScalar } from "yaml";
 import type { Document } from "yaml";
 import type { SequencerOutlineMetadataEntry, SequencerStepOutlineNode } from "../types";
 import { replaceStepSnippet } from "./shared";
@@ -73,12 +73,41 @@ export function applyEditedForStep(
   generatorModifiers: SequencerOutlineMetadataEntry[],
   iterableConfig: SequencerOutlineMetadataEntry[]
 ): string {
+  // The form normalizes some inputs (e.g. scan2d `size`/`pitch`), so only
+  // rewrite the parts whose form values actually changed.
+  const before = node.forDetail;
+  const sameJson = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
+  const bindChanged = !before || !sameJson(cleanEntries(before.bind), cleanEntries(bind));
+  const inChanged =
+    !before ||
+    before.sourceMode !== sourceMode ||
+    (sourceMode === "direct"
+      ? (before.directValue ?? "") !== directValue
+      : (before.generatorKind ?? null) !== (generatorKind ?? null) ||
+        !sameJson(before.generatorModifiers, generatorModifiers) ||
+        !sameJson(before.iterableConfig, iterableConfig));
   const out = editStep(node.snippet, (doc, item) => {
     const body = bodyMap(item, "for");
-    body.set(
-      "bind",
-      cleanEntries(bind).length > 0 ? entriesToMap(doc, bind, true) : emptyMap()
-    );
+    if (!bindChanged && !inChanged) {
+      return;
+    }
+    const cleanedBind = cleanEntries(bind);
+    if (
+      cleanedBind.length === 1 &&
+      cleanedBind[0].name === "value" &&
+      isScalar(body.get("bind", true))
+    ) {
+      // Keep the `bind: name` shorthand (same as `{value: name}`).
+      body.set("bind", textToNode(doc, cleanedBind[0].value));
+    } else if (bindChanged) {
+      body.set(
+        "bind",
+        cleanedBind.length > 0 ? entriesToMap(doc, bind, true) : emptyMap()
+      );
+    }
+    if (!inChanged) {
+      return;
+    }
     if (sourceMode === "direct") {
       const value = directValue && directValue.trim() ? directValue : '"${points}"';
       body.set("in", textToNode(doc, value));
