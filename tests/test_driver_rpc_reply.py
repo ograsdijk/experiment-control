@@ -26,36 +26,53 @@ class _FakeRpcSocket:
         self.sent.append(json.loads(json.dumps(obj, **kwargs)))
 
 
-def _runner_with_socket() -> tuple[Any, _FakeRpcSocket]:
+def _runner_with_socket(stream_actions: tuple[str, ...] = ()) -> tuple[Any, _FakeRpcSocket]:
     socket = _FakeRpcSocket()
-    runner = types.SimpleNamespace(rpc=socket, _rpc_error=DeviceRunner._rpc_error)
+    runner = types.SimpleNamespace(
+        rpc=socket,
+        _rpc_error=DeviceRunner._rpc_error,
+        _stream_rpc={name: None for name in stream_actions},
+    )
     return runner, socket
 
 
 class DriverRpcReplyTests(unittest.TestCase):
-    def test_numpy_results_are_sent_as_plain_json(self) -> None:
-        # e.g. a stream method like acquire_trace called as a command.
+    def test_numpy_scalars_are_sent_as_numbers(self) -> None:
         runner, socket = _runner_with_socket()
         DeviceRunner._send_rpc_reply(
             runner,
-            {
-                "id": 1,
-                "status": "OK",
-                "result": {"trace": np.arange(3, dtype=np.int16), "gain": np.float32(2.5)},
-            },
+            {"id": 1, "status": "OK", "result": {"gain": np.float32(2.5), "n": np.int16(3)}},
+            action="read_gain",
         )
-        self.assertEqual(socket.sent, [{"id": 1, "status": "OK", "result": {"trace": [0, 1, 2], "gain": 2.5}}])
+        self.assertEqual(socket.sent, [{"id": 1, "status": "OK", "result": {"gain": 2.5, "n": 3}}])
+
+    def test_array_result_is_refused_with_the_stream_command_hint(self) -> None:
+        # Calling a stream method directly (acquire_trace) returns an array.
+        # It used to kill the driver; bulk data belongs on the stream, so the
+        # reply is an error pointing at stream__acquire_trace, not a JSON list.
+        runner, socket = _runner_with_socket(("stream__acquire_trace",))
+        DeviceRunner._send_rpc_reply(
+            runner,
+            {"id": 2, "status": "OK", "result": np.zeros(5000, dtype=np.int16)},
+            action="acquire_trace",
+        )
+        self.assertEqual(len(socket.sent), 1)
+        reply = socket.sent[0]
+        self.assertEqual(reply["status"], "ERROR")
+        self.assertEqual(reply["error_code"], "result_not_serializable")
+        self.assertIn("(5000,)", reply["error"])
+        self.assertIn("stream__acquire_trace", reply["error"])
 
     def test_unencodable_result_is_an_error_reply_not_a_crash(self) -> None:
-        # This used to raise inside the driver's main loop and kill the driver.
         runner, socket = _runner_with_socket()
-        DeviceRunner._send_rpc_reply(runner, {"id": 7, "status": "OK", "result": object()})
+        DeviceRunner._send_rpc_reply(runner, {"id": 7, "status": "OK", "result": object()}, action="x")
         self.assertEqual(len(socket.sent), 1)
         reply = socket.sent[0]
         self.assertEqual(reply["id"], 7)
         self.assertEqual(reply["status"], "ERROR")
         self.assertEqual(reply["error_code"], "result_not_serializable")
         self.assertIn("object", reply["error"])
+        self.assertNotIn("stream__", reply["error"])
 
 
 if __name__ == "__main__":

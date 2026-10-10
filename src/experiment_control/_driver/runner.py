@@ -88,11 +88,16 @@ __all__ = [
 
 
 
+class _ArrayResultError(TypeError):
+    """A command returned an array; bulk data belongs on a stream, not in RPC."""
+
+
 def _json_reply_default(value: Any) -> Any:
-    if isinstance(value, np.ndarray):
-        return value.tolist()
+    # numpy scalars (e.g. a getter returning np.float32) are small: send as numbers.
     if isinstance(value, np.generic):
         return value.item()
+    if isinstance(value, np.ndarray):
+        raise _ArrayResultError(f"numpy array of shape {value.shape}")
     raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
 
 class DeviceRunner:
@@ -304,7 +309,10 @@ class DeviceRunner:
                             resp = self._handle_rpc_request(req_raw)
                         finally:
                             self._end_operation()
-                    self._send_rpc_reply(resp)
+                    self._send_rpc_reply(
+                        resp,
+                        action=req_raw.get("action") if isinstance(req_raw, dict) else None,
+                    )
 
                 # Heartbeat (PUB)
                 now = time.monotonic()
@@ -747,21 +755,36 @@ class DeviceRunner:
     def _rpc_ok(req_id: Any, result: Any) -> dict[str, Any]:
         return {"id": req_id, "status": "OK", "result": result}
 
-    def _send_rpc_reply(self, resp: dict[str, Any]) -> None:
+    def _send_rpc_reply(self, resp: dict[str, Any], *, action: Any = None) -> None:
         """Send an RPC reply; a result JSON can't encode is replied as an error.
 
-        A command returning e.g. a numpy array used to raise inside send_json,
-        in the main loop, and kill the driver process (the caller only saw a
-        timeout). numpy arrays/scalars are sent as lists/numbers; anything else
-        unencodable gets an ERROR reply naming the type.
+        Serializing used to raise inside the main loop and kill the driver
+        process when a command returned e.g. a numpy array (the caller only
+        saw a timeout). numpy scalars are sent as numbers. Arrays are refused
+        rather than converted: bulk data goes through the `stream__<method>`
+        wrapper (shared-memory stream, HDF/plots), not through RPC JSON.
         """
         try:
             self.rpc.send_json(resp, default=_json_reply_default)
+        except _ArrayResultError as exc:
+            stream_action = f"stream__{action}"
+            hint = (
+                f"; use {stream_action!r} to acquire it as stream data"
+                if stream_action in getattr(self, "_stream_rpc", {})
+                else ""
+            )
+            self.rpc.send_json(
+                self._rpc_error(
+                    resp.get("id"),
+                    f"result of {action!r} is a {exc} and is not sent over RPC{hint}",
+                    error_code="result_not_serializable",
+                )
+            )
         except (TypeError, ValueError) as exc:
             self.rpc.send_json(
                 self._rpc_error(
                     resp.get("id"),
-                    f"result is not JSON serializable: {exc}",
+                    f"result of {action!r} is not JSON serializable: {exc}",
                     error_code="result_not_serializable",
                 )
             )
