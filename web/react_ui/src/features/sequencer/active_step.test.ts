@@ -74,7 +74,7 @@ describe("activeStepLine", () => {
 
 describe("resolveActiveStep", () => {
   it("highlights a leaf's whole block and bars its containers", () => {
-    const active = resolveActiveStep(outline, 8)!;
+    const active = resolveActiveStep(outline, 7)!;
     expect(active.highlight).toEqual({ from: 7, to: 9 });
     expect(active.bars).toEqual([{ from: 4, to: 14 }]);
     expect(active.ancestorIds).toHaveLength(1);
@@ -90,10 +90,10 @@ describe("resolveActiveStep", () => {
   });
 
   it("highlights only the header when the container itself is active", () => {
-    const repeat = resolveActiveStep(outline, 5)!;
+    const repeat = resolveActiveStep(outline, 4)!;
     expect(repeat.highlight).toEqual({ from: 4, to: 6 });
     expect(repeat.bars).toEqual([]);
-    const forStep = resolveActiveStep(outline, 11)!;
+    const forStep = resolveActiveStep(outline, 10)!;
     expect(forStep.highlight).toEqual({ from: 10, to: 13 });
     expect(forStep.bars).toEqual([{ from: 4, to: 14 }]);
   });
@@ -102,6 +102,13 @@ describe("resolveActiveStep", () => {
     const active = resolveActiveStep(outline, 15)!;
     expect(active.highlight).toEqual({ from: 15, to: 15 });
     expect(active.bars).toEqual([]);
+  });
+
+  it("returns null for a line that starts no step", () => {
+    // Lines 8 and 12 are inside a step but start no step.
+    expect(resolveActiveStep(outline, 4)).not.toBeNull();
+    expect(resolveActiveStep(outline, 8)).toBeNull();
+    expect(resolveActiveStep(outline, 12)).toBeNull();
   });
 
   it("returns null outside any step", () => {

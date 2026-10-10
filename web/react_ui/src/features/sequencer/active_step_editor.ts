@@ -98,9 +98,9 @@ const activeField = StateField.define<ActiveFieldValue>({
         return build(tr.state, effect.value);
       }
     }
-    // Lines are of the loaded text; the owner clears the range when the text
-    // is edited, so just stay inside the document meanwhile.
-    return tr.docChanged && value.range ? build(tr.state, value.range) : value;
+    // Lines are of the loaded text: after an edit they no longer apply. The
+    // owner re-applies a range when it is valid again.
+    return tr.docChanged ? EMPTY : value;
   },
   provide: (field) => EditorView.decorations.from(field, (v) => v.decorations),
 });

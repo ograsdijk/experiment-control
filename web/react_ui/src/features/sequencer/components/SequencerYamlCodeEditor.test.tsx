@@ -112,4 +112,17 @@ describe("SequencerYamlCodeEditor active step", () => {
     scroller.dispatchEvent(new Event("wheel"));
     expect(calls).toBe(1);
   });
+
+  it("does not report pointer or cursor-key use inside the content", async () => {
+    let calls = 0;
+    await render([], false, range, () => {
+      calls += 1;
+    });
+    const content = container.querySelector(".cm-content")!;
+    content.dispatchEvent(new Event("pointerdown", { bubbles: true }));
+    content.dispatchEvent(new KeyboardEvent("keydown", { key: "Home", bubbles: true }));
+    expect(calls).toBe(0);
+    content.dispatchEvent(new KeyboardEvent("keydown", { key: "PageDown", bubbles: true }));
+    expect(calls).toBe(1);
+  });
 });

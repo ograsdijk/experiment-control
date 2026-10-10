@@ -69,6 +69,12 @@ export function resolveActiveStep(
     return null;
   }
   const leaf = path[path.length - 1];
+  // The backend line is a step's own first line. A line inside a container
+  // but at no child's start is a step the outline can't see: showing the
+  // container would point at the wrong step.
+  if (leaf.line !== line) {
+    return null;
+  }
   const ancestors = path.slice(0, -1);
   let to = leaf.endLine;
   if (leaf.children.length > 0) {

@@ -46,7 +46,7 @@ export type SequencerYamlCodeEditorProps = {
   onUserScroll?: () => void;
 };
 
-const SCROLL_KEYS = new Set(["PageUp", "PageDown", "Home", "End"]);
+const SCROLL_KEYS = new Set(["PageUp", "PageDown"]);
 
 /**
  * Editor marks for diagnostics that point at the current text. Stale ones
