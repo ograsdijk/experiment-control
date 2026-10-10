@@ -17,7 +17,11 @@ import {
   type SequencerChildContainer,
 } from "../editing";
 import { countStepIssues } from "../editor_helpers";
-import type { StepDiagnostics } from "../diagnostic_locations";
+import {
+  SEVERITY_ORDER,
+  groupBySeverity,
+  type StepDiagnostics,
+} from "../diagnostic_locations";
 import type { SequencerStepOutlineNode } from "../types";
 
 const STEP_TEMPLATE_OPTIONS: Array<{ kind: BasicSequencerStepTemplate; label: string }> = [
@@ -119,6 +123,16 @@ type OutlineRowProps = {
 
 const SEVERITY_COLOR = { error: "red", warning: "yellow", info: "gray" } as const;
 
+const SEVERITY_LABEL = { error: "error", warning: "warning", info: "note" } as const;
+
+function plural(count: number, word: string): string {
+  return `${count} ${word}${count === 1 ? "" : "s"}`;
+}
+
+/**
+ * One badge per severity: counting everything under the worst severity made
+ * 1 error + 1 warning read "2 errors".
+ */
 function StepDiagnosticBadge({
   nodeId,
   collapsed,
@@ -129,36 +143,42 @@ function StepDiagnosticBadge({
   stepDiagnostics?: StepDiagnostics;
 }) {
   const own = stepDiagnostics?.byStepId.get(nodeId) ?? [];
-  const inside = stepDiagnostics?.insideById.get(nodeId);
   if (own.length > 0) {
-    const worst = own.some((d) => d.severity === "error")
-      ? "error"
-      : own.some((d) => d.severity === "warning")
-        ? "warning"
-        : "info";
-    const label = worst === "info" ? "note" : worst;
     return (
-      <Tooltip
-        multiline
-        w={360}
-        withinPortal
-        zIndex={1000}
-        label={own.map((d) => d.message).join("\n\n")}
-        style={{ whiteSpace: "pre-wrap" }}
-      >
-        <Badge size="xs" variant="filled" color={SEVERITY_COLOR[worst]}>
-          {own.length} {label}
-          {own.length === 1 ? "" : "s"}
-        </Badge>
-      </Tooltip>
+      <>
+        {groupBySeverity(own).map(({ severity, items }) => (
+          <Tooltip
+            key={severity}
+            multiline
+            w={360}
+            withinPortal
+            zIndex={1000}
+            label={items.map((d) => d.message).join("\n\n")}
+            style={{ whiteSpace: "pre-wrap" }}
+          >
+            <Badge
+              size="xs"
+              variant={severity === "error" ? "filled" : "light"}
+              color={SEVERITY_COLOR[severity]}
+            >
+              {plural(items.length, SEVERITY_LABEL[severity])}
+            </Badge>
+          </Tooltip>
+        ))}
+      </>
     );
   }
   // A collapsed step hides its children's markers: summarize them here.
+  const inside = stepDiagnostics?.insideById.get(nodeId);
   if (inside && collapsed) {
     return (
-      <Badge size="xs" variant="outline" color={SEVERITY_COLOR[inside.severity]}>
-        {inside.count} inside
-      </Badge>
+      <>
+        {SEVERITY_ORDER.filter((severity) => inside[severity] > 0).map((severity) => (
+          <Badge key={severity} size="xs" variant="outline" color={SEVERITY_COLOR[severity]}>
+            {plural(inside[severity], SEVERITY_LABEL[severity])} inside
+          </Badge>
+        ))}
+      </>
     );
   }
   return null;

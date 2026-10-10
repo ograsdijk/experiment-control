@@ -1,18 +1,5 @@
 import type { SequencerDiagnostic, SequencerStepOutlineNode } from "./types";
 
-const SEVERITY_RANK: Record<SequencerDiagnostic["severity"], number> = {
-  error: 2,
-  warning: 1,
-  info: 0,
-};
-
-export function worseSeverity(
-  a: SequencerDiagnostic["severity"] | null,
-  b: SequencerDiagnostic["severity"]
-): SequencerDiagnostic["severity"] {
-  return a !== null && SEVERITY_RANK[a] >= SEVERITY_RANK[b] ? a : b;
-}
-
 /** Innermost step whose lines contain `line`, with its ancestors (outermost first). */
 export function stepPathAtLine(
   outline: ReadonlyArray<SequencerStepOutlineNode>,
@@ -26,12 +13,30 @@ export function stepPathAtLine(
   return [];
 }
 
+export type SeverityCounts = Record<SequencerDiagnostic["severity"], number>;
+
 export type StepDiagnostics = {
   /** Diagnostics on each step's own lines (not its children's). */
   byStepId: Map<string, SequencerDiagnostic[]>;
-  /** Count and worst severity of diagnostics inside each step, children included. */
-  insideById: Map<string, { count: number; severity: SequencerDiagnostic["severity"] }>;
+  /** Diagnostics inside each step, children included, counted per severity. */
+  insideById: Map<string, SeverityCounts>;
 };
+
+export const SEVERITY_ORDER: ReadonlyArray<SequencerDiagnostic["severity"]> = [
+  "error",
+  "warning",
+  "info",
+];
+
+/** Diagnostics grouped by severity, worst first, skipping empty groups. */
+export function groupBySeverity(
+  diagnostics: ReadonlyArray<SequencerDiagnostic>
+): Array<{ severity: SequencerDiagnostic["severity"]; items: SequencerDiagnostic[] }> {
+  return SEVERITY_ORDER.map((severity) => ({
+    severity,
+    items: diagnostics.filter((diag) => diag.severity === severity),
+  })).filter((group) => group.items.length > 0);
+}
 
 /**
  * Attach diagnostics to the steps they point at. Stale diagnostics (computed
@@ -43,7 +48,7 @@ export function mapDiagnosticsToSteps(
   diagnostics: ReadonlyArray<SequencerDiagnostic>
 ): StepDiagnostics {
   const byStepId = new Map<string, SequencerDiagnostic[]>();
-  const insideById = new Map<string, { count: number; severity: SequencerDiagnostic["severity"] }>();
+  const insideById = new Map<string, SeverityCounts>();
   for (const diag of diagnostics) {
     if (diag.stale || diag.line == null) {
       continue;
@@ -55,11 +60,9 @@ export function mapDiagnosticsToSteps(
     const own = path[path.length - 1];
     byStepId.set(own.id, [...(byStepId.get(own.id) ?? []), diag]);
     for (const node of path) {
-      const prev = insideById.get(node.id);
-      insideById.set(node.id, {
-        count: (prev?.count ?? 0) + 1,
-        severity: worseSeverity(prev?.severity ?? null, diag.severity),
-      });
+      const counts = insideById.get(node.id) ?? { error: 0, warning: 0, info: 0 };
+      counts[diag.severity] += 1;
+      insideById.set(node.id, counts);
     }
   }
   return { byStepId, insideById };

@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { mapDiagnosticsToSteps, stepPathAtLine } from "./diagnostic_locations";
+import {
+  groupBySeverity,
+  mapDiagnosticsToSteps,
+  stepPathAtLine,
+} from "./diagnostic_locations";
 import { buildSequencerStepOutline } from "./outline";
 import type { SequencerDiagnostic } from "./types";
 
@@ -45,8 +49,16 @@ describe("diagnostic locations", () => {
     const call = repeat.children[0];
     expect(byStepId.get(call.id)?.map((d) => d.line)).toEqual([8, 9]);
     expect(byStepId.get(repeat.id)).toBeUndefined();
-    expect(insideById.get(repeat.id)).toEqual({ count: 2, severity: "error" });
-    expect(insideById.get(last.id)).toEqual({ count: 1, severity: "warning" });
+    expect(insideById.get(repeat.id)).toEqual({ error: 1, warning: 1, info: 0 });
+    expect(insideById.get(last.id)).toEqual({ error: 0, warning: 1, info: 0 });
+  });
+
+  it("groups diagnostics by severity, worst first", () => {
+    const groups = groupBySeverity([diag(1, "warning"), diag(2, "error"), diag(3, "warning")]);
+    expect(groups.map((g) => [g.severity, g.items.length])).toEqual([
+      ["error", 1],
+      ["warning", 2],
+    ]);
   });
 
   it("leaves stale and line-less diagnostics out", () => {

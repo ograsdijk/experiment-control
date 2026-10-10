@@ -57,6 +57,12 @@ describe("SequencerYamlCodeEditor diagnostics", () => {
     expect(container.querySelectorAll(".cm-lintRange-error").length).toBeGreaterThan(0);
   });
 
+  it("underlines warnings as warnings", async () => {
+    await render([{ ...diag, severity: "warning" }]);
+    expect(container.querySelectorAll(".cm-lintRange-warning").length).toBeGreaterThan(0);
+    expect(container.querySelectorAll(".cm-lintRange-error").length).toBe(0);
+  });
+
   it("does not draw stale diagnostics", async () => {
     await render([{ ...diag, stale: true }]);
     expect(container.querySelectorAll(".cm-lintRange-error").length).toBe(0);
