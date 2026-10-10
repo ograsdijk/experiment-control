@@ -88,6 +88,18 @@ __all__ = [
 
 
 
+class CommandCallerError(Exception):
+    """A command failed because of the caller, not the device."""
+
+
+class UnknownCommandError(CommandCallerError, NotImplementedError):
+    pass
+
+
+class BadCommandParametersError(CommandCallerError, TypeError):
+    pass
+
+
 class _ArrayResultError(TypeError):
     """A command returned an array; bulk data belongs on a stream, not in RPC."""
 
@@ -744,12 +756,34 @@ class DeviceRunner:
 
         func = getattr(self._device, action, None)
         if func is None or not callable(func):
-            raise NotImplementedError(f"Unknown command {action!r}")
+            raise UnknownCommandError(f"Unknown command {action!r}")
 
+        # Bind against the signature first so that only genuine argument
+        # mistakes are reported as caller errors; a TypeError raised inside
+        # the driver body stays a device failure.
         try:
-            return func(**params)
-        except TypeError as e:
-            raise TypeError(f"Bad parameters for command {action!r}: {e}") from e
+            sig = inspect.signature(func)
+        except (TypeError, ValueError):
+            sig = None
+        if sig is not None:
+            try:
+                sig.bind(**params)
+            except TypeError as e:
+                accepted = [
+                    p.name
+                    for p in sig.parameters.values()
+                    if p.kind
+                    in (
+                        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                        inspect.Parameter.KEYWORD_ONLY,
+                    )
+                ]
+                listing = ", ".join(accepted) if accepted else "(none)"
+                raise BadCommandParametersError(
+                    f"Bad parameters for command {action!r}: {e}; "
+                    f"accepted parameters: {listing}"
+                ) from e
+        return func(**params)
 
     @staticmethod
     def _rpc_ok(req_id: Any, result: Any) -> dict[str, Any]:
@@ -1160,6 +1194,10 @@ class DeviceRunner:
 
         try:
             result = self.handle_command(action, params)
+        except CommandCallerError:
+            # Caller mistake (unknown command / bad arguments): the device
+            # itself is fine, so do not demote it.
+            raise
         except Exception as exc:
             self._mark_device_unreachable(
                 f"command {action!r} failed: {exc!r}"
@@ -1195,7 +1233,8 @@ class DeviceRunner:
                 return routed
             return self._rpc_dispatch_device_command(rpc_req)
         except Exception as e:
-            self._last_error = f"command {rpc.action} failed: {e!r}"
+            if not isinstance(e, CommandCallerError):
+                self._last_error = f"command {rpc.action} failed: {e!r}"
             return {"id": rpc.request_id, "status": "ERROR", "error": str(e)}
 
     # ----------------------------
