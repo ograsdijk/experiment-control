@@ -12,6 +12,7 @@
   Select,
   SegmentedControl,
   Stack,
+  Switch,
   Tabs,
   Text,
   TextInput,
@@ -21,6 +22,7 @@ import { IconChevronDown, IconChevronRight, IconTrash } from "@tabler/icons-reac
 import {
   Suspense,
   lazy,
+  useCallback,
   useEffect,
   useMemo,
   useState,
@@ -60,6 +62,7 @@ import type {
 import type { CapabilityMember } from "../types";
 import type { StreamCatalogEntry } from "../types";
 import type { TelemetrySignal } from "../types";
+import { activeStepLine, resolveActiveStep } from "../features/sequencer/active_step";
 import { SequencerOutlinePane } from "./SequencerOutlinePane";
 
 const LazySequencerYamlCodeEditor = lazy(
@@ -311,6 +314,29 @@ export function SequencerModal({
       return [];
     }
   }, [yamlText]);
+
+  // The running step, only while the editor still holds the loaded text.
+  const activeLine = useMemo(
+    () =>
+      activeStepLine({
+        runtimeState,
+        detail: currentStepDetail,
+        loadedSource,
+        yamlDirty,
+      }),
+    [runtimeState, currentStepDetail, loadedSource, yamlDirty]
+  );
+  const activeStep = useMemo(() => resolveActiveStep(outline, activeLine), [outline, activeLine]);
+  const [follow, setFollowState] = useState(readFollowPreference);
+  const setFollow = useCallback((value: boolean) => {
+    setFollowState(value);
+    try {
+      window.localStorage.setItem(FOLLOW_STORAGE_KEY, value ? "1" : "0");
+    } catch {
+      // Storage can be blocked; the switch still works for this session.
+    }
+  }, []);
+  const stopFollowing = useCallback(() => setFollow(false), [setFollow]);
 
   const jumpToDiagnostic = (diag: SequencerDiagnostic) => {
     if (diag.line == null) {
@@ -1074,6 +1100,14 @@ export function SequencerModal({
                 Variables
               </Tabs.Tab>
               <Tabs.Tab value="yaml">YAML</Tabs.Tab>
+              <Switch
+                size="xs"
+                label="Follow"
+                title="Scroll to the running step as it changes. Scrolling yourself turns this off."
+                checked={follow}
+                onChange={(event) => setFollow(event.currentTarget.checked)}
+                style={{ marginLeft: "auto", alignSelf: "center" }}
+              />
             </Tabs.List>
             <Tabs.Panel value="steps" pt="sm" style={tabPanelStyle(activeTab === "steps")}>
               <SequencerOutlinePane
@@ -1086,6 +1120,9 @@ export function SequencerModal({
                 colorScheme={colorScheme}
                 diagnostics={markerDiagnostics}
                 focusRequest={stepFocus}
+                activeStep={activeStep}
+                follow={follow && activeTab === "steps"}
+                onUserScroll={stopFollowing}
               />
             </Tabs.Panel>
             <Tabs.Panel value="vars" pt="sm" style={tabPanelStyle(activeTab === "vars")}>
@@ -1140,6 +1177,9 @@ export function SequencerModal({
                       colorScheme={colorScheme}
                       diagnostics={markerDiagnostics}
                       readOnly={yamlViewMode !== "edit"}
+                      activeStep={activeStep}
+                      follow={follow && activeTab === "yaml"}
+                      onUserScroll={stopFollowing}
                     />
                   </Suspense>
                 </div>
@@ -1150,6 +1190,16 @@ export function SequencerModal({
       </Stack>
     </Modal>
   );
+}
+
+const FOLLOW_STORAGE_KEY = "experiment-control.sequencer.followActiveStep";
+
+function readFollowPreference(): boolean {
+  try {
+    return window.localStorage.getItem(FOLLOW_STORAGE_KEY) === "1";
+  } catch {
+    return false;
+  }
 }
 
 function tabPanelStyle(active: boolean): CSSProperties {
