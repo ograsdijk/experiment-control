@@ -354,7 +354,13 @@ def _build_step_line_map(text: str | None, spec: Any = None) -> dict[str, int]:
     watchdog_ids = list(getattr(spec, "watchdog_ids", None) or [])
     if not watchdog_ids:
         return line_map
-    offset = len(watchdog_ids)
+    return _remap_for_watchdog_gate(line_map, root, len(watchdog_ids))
+
+
+def _remap_for_watchdog_gate(
+    line_map: dict[str, int], root: Any, offset: int
+) -> dict[str, int]:
+    """Source step paths -> paths inside the generated watchdog-gate try."""
     remapped: dict[str, int] = {}
     for key, line in line_map.items():
         match = re.match(r"^steps\[(\d+)\](.*)$", key)
@@ -378,6 +384,31 @@ def _build_step_line_map(text: str | None, spec: Any = None) -> dict[str, int]:
             remapped[f"steps[0].try.do[{index}]"] = gate_line
             remapped[f"steps[0].try.finally[{index}]"] = gate_line
     return remapped
+
+def _device_start_problem(
+    device_id: str, status_by_device: dict[str, dict[str, Any]]
+) -> str | None:
+    """Why `device_id` blocks a sequence start (unknown id, or its state and
+    last error), or None when it is online."""
+    item = status_by_device.get(device_id)
+    if item is None:
+        close = difflib.get_close_matches(
+            device_id, sorted(status_by_device), n=3, cutoff=0.6
+        )
+        hint = " (did you mean " + ", ".join(repr(c) for c in close) + "?)" if close else ""
+        return f"{device_id} (not configured{hint})"
+    liveness = str(item.get("liveness", "")) or "UNKNOWN"
+    device_state = str(item.get("device_state", "") or "")
+    if liveness == "ONLINE" and device_state not in {"DEGRADED", "DISCONNECTED"}:
+        return None
+    states = [liveness]
+    if device_state and device_state != liveness:
+        states.append(device_state)
+    text = f"{device_id} (configured but {'/'.join(states)}"
+    last_error = item.get("last_error")
+    if last_error:
+        text += f"; last error: {last_error}"
+    return text + ")"
 
 
 def _normalize_log_severity(raw: Any) -> str:
@@ -3598,33 +3629,11 @@ class SequencerProcess(ManagedProcessBase):
                     device_id = str(item.get("device_id", "")).strip()
                     if device_id:
                         status_by_device[device_id] = item
-        problems: list[str] = []
-        for device_id in sorted(device_ids):
-            item = status_by_device.get(device_id)
-            if item is None:
-                close = difflib.get_close_matches(
-                    device_id, sorted(status_by_device), n=3, cutoff=0.6
-                )
-                hint = (
-                    " (did you mean " + ", ".join(repr(c) for c in close) + "?)"
-                    if close
-                    else ""
-                )
-                problems.append(f"{device_id} (not configured{hint})")
-                continue
-            liveness = str(item.get("liveness", "")) or "UNKNOWN"
-            device_state = str(item.get("device_state", "") or "")
-            if liveness == "ONLINE" and device_state not in {"DEGRADED", "DISCONNECTED"}:
-                continue
-            states = [liveness]
-            if device_state and device_state != liveness:
-                states.append(device_state)
-            text = f"{device_id} (configured but {'/'.join(states)}"
-            last_error = item.get("last_error")
-            if last_error:
-                text += f"; last error: {last_error}"
-            problems.append(text + ")")
-        return problems
+        problems = (
+            _device_start_problem(device_id, status_by_device)
+            for device_id in sorted(device_ids)
+        )
+        return [problem for problem in problems if problem is not None]
 
     def _check_start_preconditions(self, req: Json) -> Json | None:
         # Called from `_rpc_sequencer_start` right after `runtime.start()`
