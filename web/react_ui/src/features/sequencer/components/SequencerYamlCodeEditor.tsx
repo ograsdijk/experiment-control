@@ -8,6 +8,7 @@ import {
   MatchDecorator,
   ViewPlugin,
   placeholder,
+  tooltips,
 } from "@codemirror/view";
 import CodeMirror from "@uiw/react-codemirror";
 import { tags } from "@lezer/highlight";
@@ -91,6 +92,9 @@ function SequencerYamlCodeEditorImpl(
     () => [
       yaml(),
       lintGutter(),
+      // Render tooltips on the page body: inside the modal they are clipped
+      // by its overflow and sit under its z-index.
+      tooltips({ parent: document.body }),
       EditorState.readOnly.of(readOnly),
       EditorView.editable.of(!readOnly),
       EditorView.lineWrapping,
@@ -171,6 +175,20 @@ function SequencerYamlCodeEditorImpl(
         ".cm-ec-number": {
           color: yamlTokenColor("number", colorScheme),
         },
+        // Lint tooltips (on document.body) need their own colours and a
+        // z-index above the sequencer modal.
+        ".cm-tooltip": {
+          zIndex: 1000,
+          background: isDark ? "#25262b" : "#ffffff",
+          color: isDark ? "#e9ecef" : "#212529",
+          border: `1px solid ${isDark ? "#373a40" : "#dee2e6"}`,
+          borderRadius: "6px",
+          maxWidth: "36rem",
+        },
+        ".cm-diagnostic": {
+          color: isDark ? "#e9ecef" : "#212529",
+          whiteSpace: "pre-wrap",
+        },
         ".cm-cursor, .cm-dropCursor": {
           borderLeftColor: isDark ? "#e9ecef" : "#212529",
         },
@@ -216,6 +234,10 @@ function SequencerYamlCodeEditorImpl(
       <CodeMirror
         value={value}
         height="100%"
+        // The wrapper must take part in the flex layout, or the editor grows
+        // to the full document height: nothing scrolls, and lines beyond the
+        // first screen (and their diagnostic marks) are never rendered.
+        style={{ flex: 1, minHeight: 0 }}
         theme="none"
         extensions={extensions}
         onChange={onChange}

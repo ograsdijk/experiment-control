@@ -1002,7 +1002,16 @@ export function SequencerModal({
                     ]}
                   />
                 </Group>
-                <div style={{ flex: 1, minHeight: 0, overflow: "hidden" }}>
+                {/* A flex column, so the editor gets a bounded height and scrolls. */}
+                <div
+                  style={{
+                    flex: 1,
+                    minHeight: 0,
+                    overflow: "hidden",
+                    display: "flex",
+                    flexDirection: "column",
+                  }}
+                >
                   {/* Preview is the same editor, read-only, so it shows the
                       diagnostic marks too. */}
                   <Suspense
