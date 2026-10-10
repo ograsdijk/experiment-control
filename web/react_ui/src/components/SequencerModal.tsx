@@ -12,16 +12,19 @@
   Select,
   SegmentedControl,
   Stack,
+  Tabs,
   Text,
-  Textarea,
   TextInput,
+  UnstyledButton,
 } from "@mantine/core";
-import { IconChevronDown, IconChevronRight } from "@tabler/icons-react";
+import { IconChevronDown, IconChevronRight, IconTrash } from "@tabler/icons-react";
 import {
   Suspense,
   lazy,
   useEffect,
+  useMemo,
   useState,
+  type CSSProperties,
   type ChangeEvent,
   type ReactNode,
   type RefObject,
@@ -35,10 +38,13 @@ import {
   formatSequencerEta,
 } from "../features/sequencer/utils";
 import type { StreamAnalysisWorkspaceConfig } from "../features/stream/types";
+import { SequencerMetadataPanel } from "../features/sequencer/components/SequencerMetadataPanel";
+import { buildSequencerOutlineMetadata } from "../features/sequencer/outline";
 import type {
   SequencerAdaptiveStudyStatus,
   SequencerDiagnostic,
   SequencerErrorDetail,
+  SequencerOutlineMetadata,
   SequencerProgress,
   SequencerStepDetail,
   SequencerYamlEditorHandle,
@@ -239,17 +245,24 @@ export function SequencerModal({
   diagnostics,
   onJumpToDiagnostic,
 }: Props) {
-  const [showFullYaml, setShowFullYaml] = useState(false);
-  const [diagnosticsCollapsed, setDiagnosticsCollapsed] = useState(false);
-  const [controlsCollapsed, setControlsCollapsed] = useState(false);
+  const [activeTab, setActiveTab] = useState<"steps" | "vars" | "yaml">("steps");
+  const [overridesOpen, setOverridesOpen] = useState(false);
 
   useEffect(() => {
     if (opened) {
-      setShowFullYaml(false);
-      setDiagnosticsCollapsed(false);
-      setControlsCollapsed(false);
+      setOverridesOpen(overrideRows.length > 0);
     }
+    // Only when the modal opens; later toggles are the operator's.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [opened]);
+
+  const metadata = useMemo<SequencerOutlineMetadata>(() => {
+    try {
+      return buildSequencerOutlineMetadata(yamlText);
+    } catch {
+      return { version: null, vars: [], contextColumns: [] };
+    }
+  }, [yamlText]);
 
   const libraryOptions = libraryEntries.map((entry) => ({
     value: entry.id,
@@ -258,148 +271,123 @@ export function SequencerModal({
   const selectedLibraryEntry = selectedSequenceId
     ? libraryEntries.find((entry) => entry.id === selectedSequenceId) ?? null
     : null;
+  const errorCount = diagnostics.filter((diag) => diag.severity === "error").length;
+
+  const jumpToDiagnostic = (diag: SequencerDiagnostic) => {
+    if (diag.line == null) {
+      return;
+    }
+    setActiveTab("yaml");
+    if (yamlViewMode !== "edit") {
+      onYamlViewModeChange("edit");
+    }
+    window.setTimeout(() => {
+      void onJumpToDiagnostic(diag.line ?? null, diag.column ?? null);
+    }, 0);
+  };
+
+  const progressText = !progress
+    ? null
+    : progress.phase === "cleanup"
+      ? `Cleanup ${progress.cleanupCompletedSteps ?? 0}/${progress.cleanupTotalSteps ?? "?"}`
+      : totalSteps !== null
+        ? `${progress.scope === "loop" ? "Loop " : ""}${completedSteps ?? 0}/${
+            progress.approximate ? "~" : ""
+          }${totalSteps} steps`
+        : `${completedSteps ?? 0} steps`;
+  const etaText = progress?.etaS != null ? formatSequencerEta(progress) : null;
 
   return (
     <Modal
       opened={opened}
       onClose={onClose}
       title="Sequencer"
-      size="clamp(56rem, 92vw, 96rem)"
+      size="calc(100vw - 3rem)"
       centered
       zIndex={440}
+      styles={{
+        // The modal fills the window; its body takes what the header leaves.
+        content: { height: "calc(100dvh - 3rem)", display: "flex", flexDirection: "column" },
+        body: { flex: 1, minHeight: 0, display: "flex", flexDirection: "column", paddingTop: 0 },
+      }}
     >
-      <Stack
-        gap="sm"
-        style={{ height: "clamp(42rem, 88vh, 78rem)", minHeight: 0, overflow: "hidden" }}
-      >
-        <Group justify="space-between" align="flex-start" style={{ flexShrink: 0 }}>
-          <Stack gap={4}>
-            <Group gap="xs" wrap="wrap">
-              <Badge variant="light" color={processStateColor(processState)}>
-                Process {processState}
+      <Stack gap="sm" style={{ flex: 1, minHeight: 0, overflow: "hidden" }}>
+        {/* Status + run: one row. */}
+        <Group justify="space-between" align="center" wrap="nowrap" gap="md" style={{ flexShrink: 0 }}>
+          <Group gap="xs" wrap="wrap" style={{ minWidth: 0 }}>
+            <Badge variant="light" color={processStateColor(processState)}>
+              Process {processState}
+            </Badge>
+            <Badge variant="light" color={sequencerRuntimeStateColor(runtimeState, processState)}>
+              {runtimeState}
+            </Badge>
+            <Badge variant="outline" color={loaded ? "teal" : "gray"}>
+              {loaded ? "Loaded" : "Not loaded"}
+            </Badge>
+            {yamlDirty && (
+              <Badge variant="light" color="yellow">
+                Editor changes not loaded
               </Badge>
-              <Badge
-                variant="light"
-                color={sequencerRuntimeStateColor(runtimeState, processState)}
-              >
-                State {runtimeState}
+            )}
+            {cleanupActive && (
+              <Badge variant="light" color="yellow">
+                cleanup/finally
               </Badge>
-              <Badge variant="outline" color={loaded ? "teal" : "gray"}>
-                {loaded ? "Loaded" : "Not loaded"}
-              </Badge>
-            </Group>
-            {currentStep && (
-              <Stack gap={2}>
-                <Group gap="xs" wrap="wrap">
-                  <Text size="xs" c="dimmed">
-                    Current step: {currentStepDetail?.summary ?? currentStep}
-                  </Text>
-                  {cleanupActive && (
-                    <Badge size="xs" variant="light" color="yellow">
-                      cleanup/finally
-                    </Badge>
-                  )}
-                </Group>
-                {currentStepDetail && (
-                  <Text size="xs" c="dimmed">
-                    {[
-                      currentStepDetail.line !== null
-                        ? `line ${currentStepDetail.line}`
-                        : null,
-                      currentStepDetail.path,
-                      currentStepDetail.branch,
-                    ]
-                      .filter(Boolean)
-                      .join(" | ")}
-                  </Text>
-                )}
-              </Stack>
             )}
-            {progress && (
-              <Stack gap={4}>
-                {progressPercent !== null && (
-                  <Progress value={progressPercent} size="sm" radius="xl" />
-                )}
-                <Text size="xs" c="dimmed">
-                  {progress.phase === "cleanup"
-                    ? `Cleanup: ${progress.cleanupCompletedSteps ?? 0}/${
-                        progress.cleanupTotalSteps ?? "?"
-                      } steps | run ended at ${completedSteps ?? 0}/${totalSteps ?? "?"}`
-                    : totalSteps !== null
-                      ? `${progress.scope === "loop" ? "Current loop" : "Progress"}: ${
-                          completedSteps ?? 0
-                        }/${progress.approximate ? "~" : ""}${totalSteps} steps (${(
-                          progressPercent ?? 0
-                        ).toFixed(1)}%${progress.timePercent !== null ? " of time" : ""})`
-                      : `Completed steps: ${completedSteps ?? 0}${
-                          progress.estimateReason
-                            ? ` | Total unknown: ${progress.estimateReason}`
-                            : ""
-                        }`}
-                </Text>
-                {progress.approximate && progress.estimateReason && (
-                  <Text size="xs" c="dimmed">
-                    Estimate: {progress.estimateReason}
-                  </Text>
-                )}
-                <Text size="xs" c="dimmed">
-                  Elapsed: {formatDurationCompact(progress.elapsedS)}
-                  {progress.etaS !== null
-                    ? `  ${progress.phase === "cleanup" ? "Cleanup ETA" : "ETA"}: ${formatSequencerEta(progress)}`
-                    : ""}
-                </Text>
-                <Text size="xs" c="dimmed">
-                  Run mode: {progress.loopMode ?? "once"}
-                  {progress.loopsTarget !== null
-                    ? ` (${progress.loopsCompleted ?? 0}/${progress.loopsTarget})`
-                    : progress.loopsCompleted !== null
-                      ? ` (${progress.loopsCompleted} completed)`
-                      : ""}
-                </Text>
-              </Stack>
-            )}
-            {loadedSource && (
-              <Text size="xs" c="dimmed">
-                Loaded from: {loadedSource}
+          </Group>
+          {progress && (
+            <Stack gap={2} style={{ flex: 1, minWidth: "12rem", maxWidth: "36rem" }}>
+              {progressPercent !== null && (
+                <Progress value={progressPercent} size="sm" radius="xl" />
+              )}
+              <Text size="xs" c="dimmed" truncate>
+                {[
+                  progressText,
+                  progressPercent !== null
+                    ? `${progressPercent.toFixed(1)}%${progress.timePercent !== null ? " of time" : ""}`
+                    : null,
+                  `elapsed ${formatDurationCompact(progress.elapsedS)}`,
+                  etaText ? `${progress.phase === "cleanup" ? "cleanup " : ""}ETA ${etaText}` : null,
+                  progress.loopsTarget !== null
+                    ? `loop ${Math.min((progress.loopsCompleted ?? 0) + 1, progress.loopsTarget)}/${progress.loopsTarget}`
+                    : progress.loopMode === "continuous"
+                      ? `${progress.loopsCompleted ?? 0} loops done`
+                      : null,
+                ]
+                  .filter(Boolean)
+                  .join(" · ")}
               </Text>
+            </Stack>
+          )}
+          <Group gap="xs" wrap="nowrap" style={{ flexShrink: 0 }}>
+            <SegmentedControl
+              size="xs"
+              value={runMode}
+              onChange={(value) => onRunModeChange(value as "once" | "repeat" | "continuous")}
+              data={[
+                { value: "once", label: "Once" },
+                { value: "repeat", label: "N times" },
+                { value: "continuous", label: "Continuous" },
+              ]}
+            />
+            {runMode === "repeat" && (
+              <NumberInput
+                size="xs"
+                min={1}
+                max={1000000}
+                step={1}
+                value={repeatCount}
+                aria-label="Repeat count"
+                onChange={(value) =>
+                  onRepeatCountChange(
+                    typeof value === "number" && Number.isFinite(value)
+                      ? Math.max(1, Math.trunc(value))
+                      : 1
+                  )
+                }
+                w={80}
+              />
             )}
-            {autoloadError && (
-              <Text size="xs" c="red">
-                Autoload failed: {autoloadError}
-              </Text>
-            )}
-            {loaded && !loadedSource && (
-              <Text size="xs" c="dimmed">
-                Loaded sequence source is unavailable.
-              </Text>
-            )}
-            {statusError && (
-              <Stack gap={2}>
-                <Text size="xs" c="red">
-                  {errorDetail?.formatted ?? statusError}
-                </Text>
-                {errorDetail?.step && (
-                  <Text size="xs" c="dimmed">
-                    {[
-                      errorDetail.step.line !== null
-                        ? `line ${errorDetail.step.line}`
-                        : null,
-                      errorDetail.step.path,
-                      errorDetail.step.branch,
-                    ]
-                      .filter(Boolean)
-                      .join(" | ")}
-                  </Text>
-                )}
-              </Stack>
-            )}
-            {modalError && (
-              <Text size="xs" c="red">
-                {modalError}
-              </Text>
-            )}
-          </Stack>
-          <Group gap="xs">
             <Button
               size="xs"
               variant="light"
@@ -428,301 +416,323 @@ export function SequencerModal({
           </Group>
         </Group>
 
-        <Card
-          radius="md"
-          p="sm"
-          style={{ border: "1px solid var(--card-border)", flexShrink: 0 }}
-        >
-          <Stack gap={8}>
-            <Group justify="space-between" align="center" wrap="wrap">
-                <Text size="sm" fw={600}>
-                Run controls
+        {/* Current step and messages, only when there is something to say. */}
+        {(currentStep || progress?.approximate || autoloadError || statusError || modalError) && (
+          <Stack gap={2} style={{ flexShrink: 0 }}>
+            {currentStep && (
+              <Text size="xs" c="dimmed" truncate>
+                Current step: {currentStepDetail?.summary ?? currentStep}
+                {currentStepDetail
+                  ? ` (${[
+                      currentStepDetail.line !== null ? `line ${currentStepDetail.line}` : null,
+                      currentStepDetail.path,
+                      currentStepDetail.branch,
+                    ]
+                      .filter(Boolean)
+                      .join(" | ")})`
+                  : ""}
               </Text>
-              <Group gap="xs" align="center" wrap="wrap">
-                <Badge size="xs" variant="light">
-                  {runMode}
-                </Badge>
-                {selectedSequenceId && (
-                  <Badge size="xs" variant="outline" color="gray">
-                    {selectedSequenceId}
-                  </Badge>
-                )}
-                {overrideRows.length > 0 && (
-                  <Badge size="xs" variant="light" color="blue">
-                    {overrideRows.length} override{overrideRows.length === 1 ? "" : "s"}
-                  </Badge>
-                )}
-                {yamlDirty && (
-                  <Badge size="xs" variant="light" color="yellow">
-                    Editor changes not loaded
-                  </Badge>
-                )}
-                <ActionIcon
-                  size="sm"
-                  variant="subtle"
-                  color="gray"
-                  aria-label={
-                    controlsCollapsed ? "Expand run controls" : "Collapse run controls"
-                  }
-                  onClick={() => setControlsCollapsed((prev) => !prev)}
-                >
-                  {controlsCollapsed ? (
-                    <IconChevronRight size={16} />
-                  ) : (
-                    <IconChevronDown size={16} />
-                  )}
-                </ActionIcon>
-              </Group>
-            </Group>
-            <Collapse in={!controlsCollapsed}>
-              <Stack gap={8}>
-                {yamlDirty && (
-                  <Text size="xs" c="yellow">
-                    Editor changes are not loaded into the runtime until you press
-                    Load editor YAML.
-                  </Text>
-                )}
-                <Group justify="space-between" align="center" wrap="wrap">
-                  <Text size="sm" fw={600}>
-                    Start mode
-                  </Text>
-                  <Group gap="xs" align="center">
-                <SegmentedControl
-                  size="xs"
-                  value={runMode}
-                  onChange={(value) =>
-                    onRunModeChange(value as "once" | "repeat" | "continuous")
-                  }
-                  data={[
-                    { value: "once", label: "Once" },
-                    { value: "repeat", label: "N times" },
-                    { value: "continuous", label: "Continuous" },
-                  ]}
-                />
-                {runMode === "repeat" && (
-                  <NumberInput
-                    size="xs"
-                    min={1}
-                    max={1000000}
-                    step={1}
-                    value={repeatCount}
-                    onChange={(value) =>
-                      onRepeatCountChange(
-                        typeof value === "number" && Number.isFinite(value)
-                          ? Math.max(1, Math.trunc(value))
-                          : 1
-                      )
-                    }
-                    w={96}
-                  />
-                )}
-              </Group>
-                </Group>
+            )}
+            {progress?.approximate && progress.estimateReason && (
+              <Text size="xs" c="dimmed">
+                Estimate: {progress.estimateReason}
+              </Text>
+            )}
+            {autoloadError && (
+              <Text size="xs" c="red">
+                Autoload failed: {autoloadError}
+              </Text>
+            )}
+            {statusError && (
+              <Text size="xs" c="red">
+                {errorDetail?.formatted ?? statusError}
+                {errorDetail?.step
+                  ? ` (${[
+                      errorDetail.step.line !== null ? `line ${errorDetail.step.line}` : null,
+                      errorDetail.step.path,
+                      errorDetail.step.branch,
+                    ]
+                      .filter(Boolean)
+                      .join(" | ")})`
+                  : ""}
+              </Text>
+            )}
+            {modalError && (
+              <Text size="xs" c="red">
+                {modalError}
+              </Text>
+            )}
+          </Stack>
+        )}
 
-            {(libraryConfigured || libraryOptions.length > 0) && (
-              <Stack gap={6}>
-                <Group justify="space-between" align="center">
+        <div
+          style={{
+            display: "grid",
+            gridTemplateColumns: "minmax(15rem, 18rem) minmax(0, 1fr)",
+            gap: 12,
+            flex: 1,
+            minHeight: 0,
+          }}
+        >
+          {/* Sidebar: source, load/check, overrides, adaptive, diagnostics. */}
+          <ScrollArea style={{ minHeight: 0 }} type="auto" offsetScrollbars>
+            <Stack gap="sm">
+              <Card radius="md" p="sm" style={{ border: "1px solid var(--card-border)" }}>
+                <Stack gap={6}>
                   <Text size="sm" fw={600}>
-                    Sequence library ({libraryEntries.length})
+                    Sequence
                   </Text>
-                  <Group gap="xs">
-                    <Button
-                      size="compact-xs"
-                      variant="subtle"
-                      color="gray"
-                      loading={loadBusy}
-                      disabled={!selectedSequenceId || libraryLoading}
-                      onClick={() => {
-                        void onLoadSelectedLibrary();
-                      }}
-                    >
-                      Load selected library
+                  {(libraryConfigured || libraryOptions.length > 0) && (
+                    <>
+                      <Select
+                        size="xs"
+                        placeholder={`Library (${libraryEntries.length})`}
+                        data={libraryOptions}
+                        value={selectedSequenceId}
+                        onChange={(value) => onSelectedSequenceIdChange(value)}
+                        searchable
+                        clearable
+                        comboboxProps={{ zIndex: 500 }}
+                        disabled={libraryLoading}
+                      />
+                      {selectedLibraryEntry?.description && (
+                        <Text size="xs" c="dimmed" lineClamp={3}>
+                          {selectedLibraryEntry.description}
+                        </Text>
+                      )}
+                      {libraryError && (
+                        <Text size="xs" c="red">
+                          {libraryError}
+                        </Text>
+                      )}
+                      <Group gap="xs" grow>
+                        <Button
+                          size="xs"
+                          variant="light"
+                          loading={loadBusy}
+                          disabled={!selectedSequenceId || libraryLoading}
+                          onClick={() => {
+                            void onLoadSelectedLibrary();
+                          }}
+                        >
+                          Load selected
+                        </Button>
+                        <Button
+                          size="xs"
+                          variant="subtle"
+                          color="gray"
+                          loading={libraryLoading}
+                          onClick={() => {
+                            void onReloadLibrary();
+                          }}
+                        >
+                          Reload list
+                        </Button>
+                      </Group>
+                    </>
+                  )}
+                  <input
+                    ref={fileInputRef}
+                    type="file"
+                    accept=".yaml,.yml,text/yaml,application/x-yaml"
+                    style={{ display: "none" }}
+                    onChange={(event) => {
+                      void onFileInputChange(event);
+                    }}
+                  />
+                  <Group gap="xs" grow>
+                    <Button size="xs" variant="light" onClick={() => fileInputRef.current?.click()}>
+                      Upload YAML
                     </Button>
                     <Button
-                      size="compact-xs"
-                      variant="subtle"
-                      color="gray"
-                      loading={libraryLoading}
+                      size="xs"
+                      variant="light"
+                      loading={loadedYamlBusy}
+                      disabled={!hasSequencerProcess}
                       onClick={() => {
-                        void onReloadLibrary();
+                        void onShowLoadedYaml();
                       }}
                     >
-                      Reload
+                      Show loaded
                     </Button>
                   </Group>
-                </Group>
-                <Select
-                  size="xs"
-                  placeholder="Select sequence id"
-                  data={libraryOptions}
-                  value={selectedSequenceId}
-                  onChange={(value) => onSelectedSequenceIdChange(value)}
-                  searchable
-                  clearable
-                  comboboxProps={{ zIndex: 500 }}
-                  disabled={libraryLoading}
-                />
-                <Text size="xs" c="dimmed">
-                  Selected: {selectedSequenceId ?? "none"}
-                </Text>
-                {selectedLibraryEntry?.description && (
-                  <Text size="xs" c="dimmed">
-                    {selectedLibraryEntry.description}
-                  </Text>
-                )}
-                {libraryError && (
-                  <Text size="xs" c="red">
-                    {libraryError}
-                  </Text>
-                )}
-              </Stack>
-            )}
+                  {loadedSource && (
+                    <Text size="xs" c="dimmed" style={{ wordBreak: "break-all" }}>
+                      Loaded from {loadedSource}
+                    </Text>
+                  )}
+                  {loaded && !loadedSource && (
+                    <Text size="xs" c="dimmed">
+                      Loaded sequence source is unavailable.
+                    </Text>
+                  )}
+                </Stack>
+              </Card>
 
-            <Stack gap={6}>
-              <Group justify="space-between" align="center">
-                <Group gap="xs">
-                  <Text size="sm" fw={600}>
-                    Run overrides
-                  </Text>
-                  <Badge
-                    size="xs"
-                    variant="light"
-                    color={overridesValid ? "teal" : "red"}
-                  >
-                    {overridesValid ? "valid" : "invalid"}
-                  </Badge>
-                </Group>
-                <Group gap="xs">
-                  <Button
-                    size="compact-xs"
-                    variant="subtle"
-                    color="gray"
-                    onClick={onAddOverrideRow}
-                  >
-                    Add
-                  </Button>
-                  <Button
-                    size="compact-xs"
-                    variant="subtle"
-                    color="gray"
-                    onClick={onClearOverrides}
-                    disabled={overrideRows.length === 0}
-                  >
-                    Clear
-                  </Button>
-                </Group>
-              </Group>
-              <Text size="xs" c="dimmed">
-                Applied only to the next Start call (`vars_override`), not saved to YAML.
-              </Text>
-              {overrideVarOptions.length === 0 && (
-                <Text size="xs" c="yellow">
-                  Variable list unavailable. Enter names manually.
-                </Text>
-              )}
-              {overrideRows.length === 0 ? (
-                <Text size="xs" c="dimmed">
-                  No overrides configured.
-                </Text>
-              ) : (
+              <Card radius="md" p="sm" style={{ border: "1px solid var(--card-border)" }}>
                 <Stack gap={6}>
-                  {overrideRows.map((row) => (
-                    <Card
-                      key={row.id}
-                      p="xs"
-                      radius="sm"
-                      style={{ border: "1px solid var(--card-border)" }}
+                  <Group justify="space-between">
+                    <Text size="sm" fw={600}>
+                      Editor
+                    </Text>
+                    {yamlDirty && (
+                      <Badge size="xs" variant="light" color="yellow">
+                        not loaded
+                      </Badge>
+                    )}
+                  </Group>
+                  <Button
+                    size="xs"
+                    loading={loadBusy}
+                    onClick={() => {
+                      void onLoad();
+                    }}
+                  >
+                    Load editor YAML
+                  </Button>
+                  <Stack gap={6}>
+                    <Button
+                      size="xs"
+                      variant="light"
+                      loading={validateBusy}
+                      onClick={() => {
+                        void onValidate();
+                      }}
                     >
-                      <Stack gap={6}>
-                        <Group gap="xs" align="end" wrap="wrap">
-                          {overrideVarOptions.length > 0 ? (
+                      Validate + Preflight
+                    </Button>
+                    <Button
+                      size="xs"
+                      variant="light"
+                      loading={reloadSourceBusy}
+                      disabled={!canReloadSource || loadBusy || actionBusy}
+                      onClick={() => {
+                        void onReloadLoadedSource();
+                      }}
+                    >
+                      {reloadSourceLabel}
+                    </Button>
+                  </Stack>
+                  <Text size="xs" c="dimmed">
+                    Edits apply to the runtime only after Load editor YAML.
+                    Reload discards them and rereads the source.
+                  </Text>
+                </Stack>
+              </Card>
+
+              <Card radius="md" p="sm" style={{ border: "1px solid var(--card-border)" }}>
+                <Stack gap={6}>
+                  <Group justify="space-between" align="center">
+                    <UnstyledButton onClick={() => setOverridesOpen((prev) => !prev)}>
+                      <Group gap={4}>
+                        {overridesOpen ? <IconChevronDown size={14} /> : <IconChevronRight size={14} />}
+                        <Text size="sm" fw={600}>
+                          Run overrides
+                        </Text>
+                        {overrideRows.length > 0 && (
+                          <Badge size="xs" variant="light" color={overridesValid ? "blue" : "red"}>
+                            {overrideRows.length}
+                            {overridesValid ? "" : " invalid"}
+                          </Badge>
+                        )}
+                      </Group>
+                    </UnstyledButton>
+                    <Group gap={4}>
+                      <Button
+                        size="compact-xs"
+                        variant="subtle"
+                        color="gray"
+                        onClick={() => {
+                          onAddOverrideRow();
+                          setOverridesOpen(true);
+                        }}
+                      >
+                        Add
+                      </Button>
+                      <Button
+                        size="compact-xs"
+                        variant="subtle"
+                        color="gray"
+                        onClick={onClearOverrides}
+                        disabled={overrideRows.length === 0}
+                      >
+                        Clear
+                      </Button>
+                    </Group>
+                  </Group>
+                  <Collapse in={overridesOpen}>
+                    <Stack gap={6}>
+                      <Text size="xs" c="dimmed">
+                        Applied to the next Start only (`vars_override`), not saved to YAML.
+                      </Text>
+                      {overrideRows.map((row) => (
+                        <Stack key={row.id} gap={4}>
+                          <Group gap={4} wrap="nowrap" align="flex-end">
+                            {overrideVarOptions.length > 0 ? (
+                              <Select
+                                size="xs"
+                                aria-label="Variable"
+                                placeholder="variable"
+                                data={overrideVarOptions.map((item) => ({ value: item, label: item }))}
+                                value={row.name || null}
+                                onChange={(value) => onUpdateOverrideRow(row.id, { name: value ?? "" })}
+                                searchable
+                                comboboxProps={{ zIndex: 500 }}
+                                style={{ flex: 1, minWidth: 0 }}
+                              />
+                            ) : (
+                              <TextInput
+                                size="xs"
+                                aria-label="Variable"
+                                placeholder="variable"
+                                value={row.name}
+                                onChange={(event) =>
+                                  onUpdateOverrideRow(row.id, { name: event.currentTarget.value })
+                                }
+                                style={{ flex: 1, minWidth: 0 }}
+                              />
+                            )}
                             <Select
                               size="xs"
-                              label="Variable"
-                              data={overrideVarOptions.map((item) => ({
-                                value: item,
-                                label: item,
-                              }))}
-                              value={row.name || null}
+                              aria-label="Type"
+                              data={["number", "bool", "string", "json", "null"]}
+                              value={row.valueType}
                               onChange={(value) =>
-                                onUpdateOverrideRow(row.id, { name: value ?? "" })
-                              }
-                              searchable
-                              w={220}
-                            />
-                          ) : (
-                            <TextInput
-                              size="xs"
-                              label="Variable"
-                              value={row.name}
-                              onChange={(event) =>
                                 onUpdateOverrideRow(row.id, {
-                                  name: event.currentTarget.value,
+                                  valueType:
+                                    (value as SequencerOverrideRow["valueType"] | null) ?? "string",
                                 })
                               }
-                              w={220}
+                              comboboxProps={{ zIndex: 500 }}
+                              w={84}
                             />
-                          )}
-                          <Select
-                            size="xs"
-                            label="Type"
-                            data={[
-                              { value: "number", label: "number" },
-                              { value: "bool", label: "bool" },
-                              { value: "string", label: "string" },
-                              { value: "json", label: "json" },
-                              { value: "null", label: "null" },
-                            ]}
-                            value={row.valueType}
-                            onChange={(value) =>
-                              onUpdateOverrideRow(row.id, {
-                                valueType:
-                                  (value as SequencerOverrideRow["valueType"] | null) ??
-                                  "string",
-                              })
-                            }
-                            w={140}
-                          />
+                            <ActionIcon
+                              size="md"
+                              variant="subtle"
+                              color="red"
+                              aria-label="Remove override"
+                              onClick={() => onRemoveOverrideRow(row.id)}
+                            >
+                              <IconTrash size={14} />
+                            </ActionIcon>
+                          </Group>
                           {row.valueType === "bool" ? (
-                            <Select
+                            <SegmentedControl
                               size="xs"
-                              label="Value"
-                              data={[
-                                { value: "true", label: "true" },
-                                { value: "false", label: "false" },
-                              ]}
-                              value={
-                                row.valueText === "true" || row.valueText === "false"
-                                  ? row.valueText
-                                  : "true"
-                              }
-                              onChange={(value) =>
-                                onUpdateOverrideRow(row.id, {
-                                  valueText: value ?? "true",
-                                })
-                              }
-                              w={140}
+                              value={row.valueText === "false" ? "false" : "true"}
+                              onChange={(value) => onUpdateOverrideRow(row.id, { valueText: value })}
+                              data={["true", "false"]}
                             />
-                          ) : row.valueType === "null" ? (
-                            <Text size="xs" c="dimmed" mt={22}>
-                              Value fixed to null
-                            </Text>
-                          ) : (
+                          ) : row.valueType !== "null" ? (
                             <TextInput
                               size="xs"
-                              label="Value"
+                              aria-label="Value"
                               value={row.valueText}
                               onChange={(event) =>
-                                onUpdateOverrideRow(row.id, {
-                                  valueText: event.currentTarget.value,
-                                })
+                                onUpdateOverrideRow(row.id, { valueText: event.currentTarget.value })
                               }
                               placeholder={
-                                row.valueType === "json"
-                                  ? '{"key": 1}'
-                                  : row.valueType === "number"
-                                    ? "1.23"
-                                    : "text"
+                                row.valueType === "json" ? '{"key": 1}' : row.valueType === "number" ? "1.23" : "text"
                               }
                               styles={{
                                 input:
@@ -730,277 +740,215 @@ export function SequencerModal({
                                     ? { fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace" }
                                     : undefined,
                               }}
-                              w={row.valueType === "json" ? 280 : 200}
                             />
+                          ) : null}
+                          {overrideErrors[row.id] && (
+                            <Text size="xs" c="red">
+                              {overrideErrors[row.id]}
+                            </Text>
                           )}
+                        </Stack>
+                      ))}
+                      {overrideVarOptions.length === 0 && overrideRows.length > 0 && (
+                        <Text size="xs" c="yellow">
+                          Variable list unavailable. Enter names manually.
+                        </Text>
+                      )}
+                      {overrideRows.length > 0 && (
+                        <Text
+                          size="xs"
+                          c="dimmed"
+                          style={{
+                            fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+                            whiteSpace: "pre-wrap",
+                            wordBreak: "break-all",
+                          }}
+                        >
+                          {overridePreview || "{}"}
+                        </Text>
+                      )}
+                    </Stack>
+                  </Collapse>
+                </Stack>
+              </Card>
+
+              {loadedAdaptiveIds.length > 0 && (
+                <Card radius="md" p="sm" style={{ border: "1px solid var(--card-border)" }}>
+                  <Stack gap={6}>
+                    <Text size="sm" fw={600}>
+                      Adaptive reuse
+                    </Text>
+                    <Text size="xs" c="dimmed">
+                      How each adaptive study starts when you press Start.
+                    </Text>
+                    {loadedAdaptiveIds.map((studyId) => {
+                      const status = adaptiveStudies[studyId];
+                      const trialCount = status?.trialCount ?? 0;
+                      const hasSaved = trialCount > 0;
+                      return (
+                        <Stack key={studyId} gap={4}>
+                          <Group justify="space-between" wrap="nowrap">
+                            <Group gap={4} wrap="wrap" style={{ minWidth: 0 }}>
+                              <Text size="xs" fw={600} truncate>
+                                {studyId}
+                              </Text>
+                              <Badge size="xs" variant="light" color={hasSaved ? "teal" : "gray"}>
+                                {hasSaved ? `${trialCount} trial${trialCount === 1 ? "" : "s"}` : "no data"}
+                              </Badge>
+                            </Group>
+                            <Button
+                              size="compact-xs"
+                              variant="subtle"
+                              color="red"
+                              disabled={!hasSaved}
+                              loading={adaptiveClearBusyStudyId === studyId}
+                              onClick={() => {
+                                void onClearAdaptiveStudy(studyId);
+                              }}
+                            >
+                              Clear
+                            </Button>
+                          </Group>
+                          <SegmentedControl
+                            size="xs"
+                            fullWidth
+                            value={adaptiveModes[studyId] ?? "reset"}
+                            onChange={(value) =>
+                              onAdaptiveModeChange(studyId, value as "reset" | "resume" | "warm_start")
+                            }
+                            data={[
+                              { value: "reset", label: "Reset" },
+                              { value: "resume", label: "Resume" },
+                              { value: "warm_start", label: "Warm" },
+                            ]}
+                          />
+                        </Stack>
+                      );
+                    })}
+                  </Stack>
+                </Card>
+              )}
+
+              <Card radius="md" p="sm" style={{ border: "1px solid var(--card-border)" }}>
+                <Stack gap={6}>
+                  <Group gap="xs">
+                    <Text size="sm" fw={600}>
+                      Diagnostics
+                    </Text>
+                    {diagnostics.length > 0 && (
+                      <Badge size="xs" variant="light" color={errorCount > 0 ? "red" : "yellow"}>
+                        {diagnostics.length}
+                      </Badge>
+                    )}
+                  </Group>
+                  {diagnostics.length === 0 ? (
+                    <Text size="xs" c="dimmed">
+                      None yet. Validate + Preflight checks the YAML.
+                    </Text>
+                  ) : (
+                    diagnostics.map((diag, idx) => (
+                      <Stack key={`${diag.source ?? "diag"}:${idx}`} gap={2}>
+                        <Group gap={4} justify="space-between" wrap="nowrap">
+                          <Group gap={4} wrap="nowrap">
+                            <Badge
+                              size="xs"
+                              variant="light"
+                              color={diag.severity === "error" ? "red" : diag.severity === "warning" ? "yellow" : "gray"}
+                            >
+                              {diag.severity}
+                            </Badge>
+                            <Text size="xs" c="dimmed" truncate>
+                              {diag.source ?? "sequencer"}
+                            </Text>
+                          </Group>
                           <Button
                             size="compact-xs"
                             variant="subtle"
-                            color="red"
-                            onClick={() => onRemoveOverrideRow(row.id)}
+                            color="gray"
+                            disabled={diag.line == null}
+                            onClick={() => jumpToDiagnostic(diag)}
                           >
-                            Remove
+                            {diag.line != null
+                              ? `L${diag.line}${diag.column != null ? `:${diag.column}` : ""}`
+                              : "no line"}
                           </Button>
                         </Group>
-                        {overrideErrors[row.id] && (
-                          <Text size="xs" c="red">
-                            {overrideErrors[row.id]}
-                          </Text>
-                        )}
-                      </Stack>
-                    </Card>
-                  ))}
-                </Stack>
-              )}
-              <Textarea
-                size="xs"
-                label="vars_override preview"
-                value={overridePreview || "{}"}
-                readOnly
-                autosize
-                minRows={2}
-                maxRows={6}
-                styles={{
-                  input: {
-                    fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
-                  },
-                }}
-              />
-            </Stack>
-              </Stack>
-            </Collapse>
-          </Stack>
-        </Card>
-
-        {loadedAdaptiveIds.length > 0 && (
-          <Stack gap={6}>
-            <Group justify="space-between" align="center">
-              <Text size="sm" fw={600}>
-                Adaptive reuse
-              </Text>
-              <Text size="xs" c="dimmed">
-                Choose how each adaptive study starts when you press Start.
-              </Text>
-            </Group>
-            {loadedAdaptiveIds.map((studyId) => {
-              const status = adaptiveStudies[studyId];
-              const trialCount = status?.trialCount ?? 0;
-              const hasSaved = trialCount > 0;
-              return (
-                <Card
-                  key={studyId}
-                  p="xs"
-                  radius="sm"
-                  style={{ border: "1px solid var(--card-border)" }}
-                >
-                  <Stack gap={6}>
-                    <Group justify="space-between" align="center" wrap="wrap">
-                      <Group gap="xs" wrap="wrap">
-                        <Text size="sm" fw={600}>
-                          {studyId}
+                        <Text size="xs" style={{ whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
+                          {diag.message}
                         </Text>
-                        <Badge
-                          size="xs"
-                          variant="light"
-                          color={hasSaved ? "teal" : "gray"}
-                        >
-                          {hasSaved ? `${trialCount} saved trial${trialCount === 1 ? "" : "s"}` : "No saved data"}
-                        </Badge>
-                        {status?.controllerKind && (
-                          <Badge size="xs" variant="outline" color="gray">
-                            {status.controllerKind}
-                          </Badge>
-                        )}
-                      </Group>
-                      <Button
-                        size="compact-xs"
-                        variant="subtle"
-                        color="red"
-                        disabled={!hasSaved}
-                        loading={adaptiveClearBusyStudyId === studyId}
-                        onClick={() => {
-                          void onClearAdaptiveStudy(studyId);
-                        }}
-                      >
-                        Clear saved
-                      </Button>
-                    </Group>
-                    <SegmentedControl
-                      size="xs"
-                      fullWidth
-                      value={adaptiveModes[studyId] ?? "reset"}
-                      onChange={(value) =>
-                        onAdaptiveModeChange(
-                          studyId,
-                          value as "reset" | "resume" | "warm_start"
-                        )
-                      }
-                      data={[
-                        { value: "reset", label: "Reset" },
-                        { value: "resume", label: "Resume" },
-                        { value: "warm_start", label: "Warm start" },
-                      ]}
-                    />
-                  </Stack>
-                </Card>
-              );
-            })}
-          </Stack>
-        )}
-
-        <Group justify="space-between" style={{ flexShrink: 0 }}>
-          <Group gap="xs">
-            <input
-              ref={fileInputRef}
-              type="file"
-              accept=".yaml,.yml,text/yaml,application/x-yaml"
-              style={{ display: "none" }}
-              onChange={(event) => {
-                void onFileInputChange(event);
-              }}
-            />
-            <Button
-              size="xs"
-              variant="light"
-              onClick={() => fileInputRef.current?.click()}
-            >
-              Upload YAML
-            </Button>
-            <Text size="xs" c="dimmed">
-              Upload runs checks on demand and does not auto-run.
-            </Text>
-          </Group>
-          <Group gap="xs">
-            <Button
-              size="xs"
-              variant="light"
-              loading={loadedYamlBusy}
-              disabled={!hasSequencerProcess}
-              onClick={() => {
-                void onShowLoadedYaml();
-              }}
-            >
-              Show loaded YAML
-            </Button>
-            <Button
-              size="xs"
-              variant="light"
-              loading={validateBusy}
-              onClick={() => {
-                void onValidate();
-              }}
-            >
-              Validate + Preflight
-            </Button>
-            <Button
-              size="xs"
-              loading={loadBusy}
-              onClick={() => {
-                void onLoad();
-              }}
-            >
-              Load editor YAML
-            </Button>
-            <Button
-              size="xs"
-              variant="light"
-              loading={reloadSourceBusy}
-              disabled={!canReloadSource || loadBusy || actionBusy}
-              onClick={() => {
-                void onReloadLoadedSource();
-              }}
-            >
-              {reloadSourceLabel}
-            </Button>
-          </Group>
-        </Group>
-        <Text size="xs" c="dimmed" style={{ flexShrink: 0 }}>
-          Load editor YAML sends the current editor contents. Reload from source
-          discards editor edits and rereads the selected library/file source.
-        </Text>
-
-        <SequencerOutlinePane
-          yamlText={yamlText}
-          onYamlTextChange={onYamlTextChange}
-          streamCatalog={streamCatalog}
-          capabilitiesByDevice={capabilitiesByDevice}
-          streamWorkspaces={streamWorkspaces}
-          latestSignalsByDevice={latestSignalsByDevice}
-          colorScheme={colorScheme}
-        />
-
-        <Card
-          radius="md"
-          p="sm"
-          style={{
-            border: "1px solid var(--card-border)",
-            flex: showFullYaml
-              ? "1 1 clamp(12rem, 24vh, 18rem)"
-              : "0 0 auto",
-            minHeight: showFullYaml ? "clamp(12rem, 24vh, 18rem)" : 0,
-            overflow: "hidden",
-            display: "flex",
-            flexDirection: "column",
-          }}
-        >
-          <Stack gap={6} style={{ flex: 1, minHeight: 0 }}>
-            <Group justify="space-between" align="center">
-              <Stack gap={2}>
-                <Text size="sm" fw={600}>
-                  Full sequence YAML
-                </Text>
-                <Text size="xs" c="dimmed">
-                  {showFullYaml
-                    ? yamlViewMode === "edit"
-                      ? "Raw editable YAML"
-                      : "Read-only preview with syntax highlighting"
-                    : "Collapsed by default to keep the visual outline readable"}
-                </Text>
-              </Stack>
-              <Group gap="xs" align="center">
-                <SegmentedControl
-                  size="xs"
-                  value={yamlViewMode}
-                  onChange={(value) => onYamlViewModeChange(value as "edit" | "preview")}
-                  data={[
-                    { value: "preview", label: "Preview" },
-                    { value: "edit", label: "Edit" },
-                  ]}
-                />
-                <ActionIcon
-                  size="sm"
-                  variant="subtle"
-                  color="gray"
-                  aria-label={showFullYaml ? "Hide full YAML" : "Show full YAML"}
-                  onClick={() => setShowFullYaml((prev) => !prev)}
-                >
-                  {showFullYaml ? (
-                    <IconChevronDown size={16} />
-                  ) : (
-                    <IconChevronRight size={16} />
+                      </Stack>
+                    ))
                   )}
-                </ActionIcon>
-              </Group>
-            </Group>
+                </Stack>
+              </Card>
+            </Stack>
+          </ScrollArea>
 
-            {showFullYaml &&
-              (yamlViewMode === "edit" ? (
-                <Stack gap={4} style={{ flex: 1, minHeight: 0 }}>
+          {/* Main: steps / variables / YAML, each using the full height. */}
+          <Tabs
+            value={activeTab}
+            onChange={(value) => setActiveTab((value as typeof activeTab) ?? "steps")}
+            keepMounted
+            style={{ display: "flex", flexDirection: "column", minHeight: 0 }}
+          >
+            <Tabs.List>
+              <Tabs.Tab value="steps">Steps</Tabs.Tab>
+              <Tabs.Tab
+                value="vars"
+                rightSection={
+                  <Badge size="xs" variant="light" color="gray">
+                    {metadata.vars.length}
+                  </Badge>
+                }
+              >
+                Variables
+              </Tabs.Tab>
+              <Tabs.Tab value="yaml">YAML</Tabs.Tab>
+            </Tabs.List>
+            <Tabs.Panel value="steps" pt="sm" style={tabPanelStyle(activeTab === "steps")}>
+              <SequencerOutlinePane
+                yamlText={yamlText}
+                onYamlTextChange={onYamlTextChange}
+                streamCatalog={streamCatalog}
+                capabilitiesByDevice={capabilitiesByDevice}
+                streamWorkspaces={streamWorkspaces}
+                latestSignalsByDevice={latestSignalsByDevice}
+                colorScheme={colorScheme}
+              />
+            </Tabs.Panel>
+            <Tabs.Panel value="vars" pt="sm" style={tabPanelStyle(activeTab === "vars")}>
+              <SequencerMetadataPanel
+                metadata={metadata}
+                metadataCollapsed={false}
+                onToggleCollapsed={() => undefined}
+                yamlText={yamlText}
+                onYamlTextChange={onYamlTextChange}
+                fill
+              />
+            </Tabs.Panel>
+            <Tabs.Panel value="yaml" pt="sm" style={tabPanelStyle(activeTab === "yaml")}>
+              <Stack gap={6} style={{ flex: 1, minHeight: 0 }}>
+                <Group justify="space-between">
                   <Text size="xs" c="dimmed">
-                    Sequence YAML
+                    {yamlViewMode === "edit" ? "Raw editable YAML" : "Read-only preview"}
                   </Text>
-                  <div style={{ flex: 1, minHeight: 0 }}>
+                  <SegmentedControl
+                    size="xs"
+                    value={yamlViewMode}
+                    onChange={(value) => onYamlViewModeChange(value as "edit" | "preview")}
+                    data={[
+                      { value: "preview", label: "Preview" },
+                      { value: "edit", label: "Edit" },
+                    ]}
+                  />
+                </Group>
+                <div style={{ flex: 1, minHeight: 0, overflow: "hidden" }}>
+                  {yamlViewMode === "edit" ? (
                     <Suspense
                       fallback={
-                        <Card
-                          radius="sm"
-                          p="xs"
-                          style={{ border: "1px solid var(--card-border)" }}
-                        >
-                          <Text size="xs" c="dimmed">
-                            Loading YAML editor...
-                          </Text>
-                        </Card>
+                        <Text size="xs" c="dimmed">
+                          Loading YAML editor...
+                        </Text>
                       }
                     >
                       <LazySequencerYamlCodeEditor
@@ -1010,129 +958,21 @@ export function SequencerModal({
                         colorScheme={colorScheme}
                       />
                     </Suspense>
-                  </div>
-                </Stack>
-              ) : (
-                <div style={{ flex: 1, minHeight: 0, overflow: "hidden" }}>
-                  <YamlPreview
-                    text={yamlText}
-                    colorScheme={colorScheme}
-                    height="100%"
-                  />
+                  ) : (
+                    <YamlPreview text={yamlText} colorScheme={colorScheme} height="100%" />
+                  )}
                 </div>
-              ))}
-          </Stack>
-        </Card>
-
-        <Card
-          radius="md"
-          p="sm"
-          style={{ border: "1px solid var(--card-border)", flexShrink: 0 }}
-        >
-          <Stack gap={6}>
-            <Group justify="space-between" align="center">
-              <Group gap="xs" wrap="wrap">
-                <Text size="sm" fw={600}>
-                  Diagnostics
-                </Text>
-                <Text size="xs" c="dimmed">
-                  {diagnostics.length} issue{diagnostics.length === 1 ? "" : "s"}
-                </Text>
-              </Group>
-              <ActionIcon
-                size="sm"
-                variant="subtle"
-                color="gray"
-                aria-label={
-                  diagnosticsCollapsed ? "Expand diagnostics" : "Collapse diagnostics"
-                }
-                onClick={() => setDiagnosticsCollapsed((prev) => !prev)}
-              >
-                {diagnosticsCollapsed ? (
-                  <IconChevronRight size={16} />
-                ) : (
-                  <IconChevronDown size={16} />
-                )}
-              </ActionIcon>
-            </Group>
-            {!diagnosticsCollapsed &&
-              (diagnostics.length === 0 ? (
-                <Text size="xs" c="dimmed">
-                  No diagnostics yet. Click Validate + Preflight to check the YAML.
-                </Text>
-              ) : (
-                <ScrollArea h={180}>
-                  <Stack gap={6}>
-                    {diagnostics.map((diag, idx) => {
-                      const badgeColor =
-                        diag.severity === "error"
-                          ? "red"
-                          : diag.severity === "warning"
-                            ? "yellow"
-                            : "gray";
-                      const location =
-                        diag.line != null
-                          ? `L${diag.line}${diag.column != null ? `:C${diag.column}` : ""}`
-                          : "No line";
-                      return (
-                        <Card
-                          key={`${diag.source ?? "diag"}:${idx}`}
-                          p="xs"
-                          radius="sm"
-                          style={{ border: "1px solid var(--card-border)" }}
-                        >
-                          <Stack gap={4}>
-                            <Group justify="space-between" align="flex-start">
-                              <Group gap="xs">
-                                <Badge size="xs" variant="light" color={badgeColor}>
-                                  {diag.severity}
-                                </Badge>
-                                <Text size="xs" c="dimmed">
-                                  {diag.source ?? "sequencer"}
-                                </Text>
-                              </Group>
-                              <Button
-                                size="compact-xs"
-                                variant="subtle"
-                                color="gray"
-                                disabled={diag.line == null}
-                                onClick={() => {
-                                  if (diag.line == null) {
-                                    return;
-                                  }
-                                  if (!showFullYaml) {
-                                    setShowFullYaml(true);
-                                  }
-                                  if (yamlViewMode !== "edit") {
-                                    onYamlViewModeChange("edit");
-                                  }
-                                  window.setTimeout(() => {
-                                    void onJumpToDiagnostic(
-                                      diag.line ?? null,
-                                      diag.column ?? null
-                                    );
-                                  }, 0);
-                                }}
-                              >
-                                {location}
-                              </Button>
-                            </Group>
-                            <Text
-                              size="sm"
-                              style={{ whiteSpace: "pre-wrap", wordBreak: "break-word" }}
-                            >
-                              {diag.message}
-                            </Text>
-                          </Stack>
-                        </Card>
-                      );
-                    })}
-                  </Stack>
-                </ScrollArea>
-              ))}
-          </Stack>
-        </Card>
+              </Stack>
+            </Tabs.Panel>
+          </Tabs>
+        </div>
       </Stack>
     </Modal>
   );
+}
+
+function tabPanelStyle(active: boolean): CSSProperties {
+  return active
+    ? { flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }
+    : { display: "none" };
 }

@@ -14,6 +14,8 @@ type Props = {
   onToggleCollapsed: () => void;
   yamlText: string;
   onYamlTextChange: (value: string) => void;
+  /** Fill the parent (a tab) instead of a capped, collapsible card. */
+  fill?: boolean;
 };
 
 export function SequencerMetadataPanel({
@@ -22,6 +24,7 @@ export function SequencerMetadataPanel({
   onToggleCollapsed,
   yamlText,
   onYamlTextChange,
+  fill = false,
 }: Props) {
   const varsIssueCount = countMetadataNameIssues(metadata.vars);
   const contextIssueCount = countContextColumnIssues(metadata.contextColumns);
@@ -36,7 +39,9 @@ export function SequencerMetadataPanel({
         // height with the step tree (and is bounded by it), so the vars list
         // scrolls within a real, fully-reachable area instead of overflowing
         // and getting clipped by the modal.
-        ...(metadataCollapsed
+        ...(fill
+          ? { flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }
+          : metadataCollapsed
           ? { flexShrink: 0 }
           : {
               // Size to content for short lists, but cap and scroll for long
@@ -51,7 +56,7 @@ export function SequencerMetadataPanel({
             }),
       }}
     >
-      <Stack gap={6} style={metadataCollapsed ? undefined : { flex: 1, minHeight: 0 }}>
+      <Stack gap={6} style={metadataCollapsed && !fill ? undefined : { flex: 1, minHeight: 0 }}>
         <Group justify="space-between" align="center">
           <Group gap="xs" wrap="wrap" align="center">
             <Badge size="xs" variant="light" color="gray">
@@ -61,6 +66,7 @@ export function SequencerMetadataPanel({
               Sequence metadata
             </Text>
           </Group>
+          {!fill && (
           <ActionIcon
             size="sm"
             variant="subtle"
@@ -76,8 +82,9 @@ export function SequencerMetadataPanel({
               <IconChevronDown size={16} />
             )}
           </ActionIcon>
+          )}
         </Group>
-        {!metadataCollapsed && (
+        {(fill || !metadataCollapsed) && (
           <ScrollArea
             style={{ flex: 1, minHeight: 0 }}
             type="auto"
