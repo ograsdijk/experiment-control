@@ -151,6 +151,7 @@ _PERMANENT_CALL_ERROR_CODES = frozenset(
     {
         "unknown_command",
         "bad_parameters",
+        "command_not_allowed",
         "invalid_params",
         "unknown_device",
         "unknown_process",
@@ -1429,8 +1430,11 @@ class SequencerRuntime:
         self._pause_request_info = None
         source = info.get("source") or "unknown"
         reason = info.get("reason")
+        # Automatic pauses (a watchdog rule tripped) are warnings; anyone
+        # else pausing on purpose (operator, sequence, script) is info.
+        automatic = source == "watchdog" or info.get("trigger") is not None
         self._record_event(
-            "info" if source in {"operator", "sequence"} else "warning",
+            "warning" if automatic else "info",
             "pause",
             f"Paused by {source}" + (f": {reason}" if reason else ""),
             source=source,

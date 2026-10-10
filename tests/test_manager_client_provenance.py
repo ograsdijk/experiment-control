@@ -103,5 +103,24 @@ class ManagerClientProvenanceTests(unittest.TestCase):
         self.assertEqual(socket.sent["source_id"], "manual")
 
 
+class SequencerClientSourceTests(unittest.TestCase):
+    def test_pause_stop_resume_send_source_and_reason(self) -> None:
+        from experiment_control.client.apis.sequencer import SequencerAPI
+
+        calls: list[tuple[str, dict]] = []
+        api = object.__new__(SequencerAPI)
+        api.call = lambda action, params, **_kw: calls.append((action, params))  # type: ignore[method-assign]
+        api.pause(reason="calibrate")
+        api.resume()
+        api.stop(source="script")
+        self.assertEqual(
+            calls,
+            [
+                ("sequencer.pause", {"source": "client", "reason": "calibrate"}),
+                ("sequencer.resume", {"source": "client"}),
+                ("sequencer.stop", {"source": "script"}),
+            ],
+        )
+
 if __name__ == "__main__":
     unittest.main()

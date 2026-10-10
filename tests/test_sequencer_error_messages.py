@@ -213,6 +213,8 @@ class WaitUntilSampleCallTests(unittest.TestCase):
             {"code": "device_error", "message": "Unknown command 'x'",
              "details": {"error_code": "unknown_command"}},
             {"code": "boom", "retryable": False},
+            {"code": "device_error", "message": "not allowed",
+             "details": {"error_code": "command_not_allowed"}},
         ]
         for error in cases:
             calls: list[float] = []

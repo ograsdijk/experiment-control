@@ -76,6 +76,14 @@ class CallerErrorTests(unittest.TestCase):
         resp = self._call(_runner(), "_private", {})
         self.assertEqual(resp["error_code"], "unknown_command")
 
+    def test_connect_over_rpc_is_a_caller_error(self) -> None:
+        runner = _runner()
+        for action in ("connect", "disconnect"):
+            resp = self._call(runner, action, {})
+            self.assertEqual(resp["error_code"], "command_not_allowed")
+            self.assertIn("not allowed via RPC", resp["error"])
+            self._assert_healthy(runner)
+
     def test_type_error_inside_driver_still_demotes(self) -> None:
         runner = _runner()
         resp = self._call(runner, "inner_type_error", {})

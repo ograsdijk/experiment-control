@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any
 
@@ -12,7 +13,6 @@ def _import_yaml() -> Any:
     return yaml
 
 
-_YAML12_FLOAT_RE = None
 _YAML12_LOADER: Any = None
 
 
@@ -24,12 +24,10 @@ def _yaml12_loader() -> Any:
     YAML 1.2 parsers (e.g. the web editor's) read them as numbers, so
     sequence files must resolve them the same way.
     """
-    global _YAML12_LOADER, _YAML12_FLOAT_RE
+    global _YAML12_LOADER
     if _YAML12_LOADER is None:
-        import re
-
         yaml = _import_yaml()
-        _YAML12_FLOAT_RE = re.compile(
+        float_re = re.compile(
             r"^[-+]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)[eE][-+]?[0-9]+$"
         )
 
@@ -37,7 +35,7 @@ def _yaml12_loader() -> Any:
             pass
 
         _Yaml12Loader.add_implicit_resolver(
-            "tag:yaml.org,2002:float", _YAML12_FLOAT_RE, list("-+0123456789.")
+            "tag:yaml.org,2002:float", float_re, list("-+0123456789.")
         )
         _YAML12_LOADER = _Yaml12Loader
     return _YAML12_LOADER

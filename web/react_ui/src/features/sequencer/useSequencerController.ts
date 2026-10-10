@@ -10,10 +10,10 @@ import {
 import type { ApiResponse } from "../../api";
 import type { ProcessStatus } from "../../types";
 import { useAdaptivePolling } from "../polling/useAdaptivePolling";
+import { useSequencerRunEvents } from "./useSequencerRunEvents";
 import type {
   SequencerAdaptiveStudyStatus,
   SequencerDiagnostic,
-  SequencerRunEvent,
   SequencerStatus,
   SequencerYamlEditorHandle,
 } from "./types";
@@ -31,7 +31,6 @@ import {
   normalizeSequencerStepDetail,
   normalizeRunEventsSummary,
   normalizeSequencerPause,
-  normalizeSequencerRunEvents,
   sameSequencerStatus,
   sequencerDisplayPercent,
 } from "./utils";
@@ -244,6 +243,7 @@ type UseSequencerControllerArgs = {
   refreshProcesses: () => Promise<ProcessStatus[]>;
 };
 
+
 export function useSequencerController({
   sequencerProcess,
   callProcessFn,
@@ -292,13 +292,6 @@ export function useSequencerController({
   // What the editor text came from (uploaded file name or loaded source), so
   // the modal can say which sequence is being edited.
   const [sequencerEditorLabel, setSequencerEditorLabel] = useState<string | null>(null);
-  // Events of the current/last run (sequencer.run_events), refetched when the
-  // status summary's seq changes.
-  const [sequencerRunEventsState, setSequencerRunEventsState] = useState<{
-    processId: string | null;
-    seq: number | null;
-    events: SequencerRunEvent[];
-  }>({ processId: null, seq: null, events: [] });
   const [sequencerAdaptiveModes, setSequencerAdaptiveModes] = useState<
     Record<string, AdaptiveStartMode>
   >({});
@@ -1495,43 +1488,11 @@ export function useSequencerController({
   const sequencerRunEventsSeq = sequencerProcess
     ? sequencerStatusByProcessId[sequencerProcess.process_id]?.runEvents?.seq ?? null
     : null;
-  useEffect(() => {
-    const processId = sequencerRunEventsProcessId;
-    if (!processId || sequencerRunEventsSeq === null) {
-      return;
-    }
-    if (
-      sequencerRunEventsState.processId === processId &&
-      sequencerRunEventsState.seq === sequencerRunEventsSeq
-    ) {
-      return;
-    }
-    let cancelled = false;
-    void (async () => {
-      const resp = await callProcessFn(processId, "sequencer.run_events", {});
-      if (cancelled || !resp.ok) {
-        return;
-      }
-      setSequencerRunEventsState({
-        processId,
-        seq: sequencerRunEventsSeq,
-        events: normalizeSequencerRunEvents(resp.result),
-      });
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [
-    callProcessFn,
+  const sequencerRunEvents = useSequencerRunEvents(
     sequencerRunEventsProcessId,
     sequencerRunEventsSeq,
-    sequencerRunEventsState.processId,
-    sequencerRunEventsState.seq,
-  ]);
-  const sequencerRunEvents =
-    sequencerRunEventsState.processId === sequencerRunEventsProcessId
-      ? sequencerRunEventsState.events
-      : [];
+    callProcessFn
+  );
 
   const sequencerCombinedDiagnostics = useMemo(() => {
     const stale = sequencerDiagnosticsState.text !== sequencerYamlText;

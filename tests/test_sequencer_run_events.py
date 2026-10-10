@@ -107,6 +107,18 @@ steps:
         self.assertEqual(pause["reason"], "Spot walk exhausted")
         self.assertEqual(_events(runtime)[-1]["severity"], "info")
 
+    def test_deliberate_pauses_are_info_and_missing_source_is_unknown(self) -> None:
+        for source, expected in (("client", "Paused by client: calibrate"), (None, "Paused by unknown: calibrate")):
+            runtime = _runtime()
+            _load(runtime, SLEEPS)
+            runtime.start()
+            runtime.tick()
+            runtime.request_pause(reason="calibrate", source=source)
+            runtime.tick()
+            event = _events(runtime)[-1]
+            self.assertEqual(event["severity"], "info", source)
+            self.assertEqual(event["message"], expected)
+
     def test_failed_step_is_recorded_on_its_line(self) -> None:
         runtime = _runtime(fail_action="broken")
         _load(

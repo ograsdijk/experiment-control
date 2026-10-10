@@ -593,9 +593,9 @@ sample and its age.
 
 A failed `call` in a `wait_until` sample (or condition) is classified. Errors
 that retrying cannot fix fail the step at once: unknown device, process,
-command or action, bad parameters, or an error marked `retryable: false`. Other
-failures, such as an RPC timeout or a process that is not running yet, count as
-"not met yet" and polling continues. If the wait then times out, the error
+command or action, bad parameters, a command not allowed over RPC, or an error
+marked `retryable: false`. Other failures, such as an RPC timeout or a process
+that is not running yet, count as "not met yet" and polling continues. If the wait then times out, the error
 includes "last sample call failed: ...".
 
 `sequencer.validate` is intentionally structural only (YAML + AST + condition DSL).

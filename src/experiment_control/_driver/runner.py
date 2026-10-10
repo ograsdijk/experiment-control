@@ -101,6 +101,10 @@ class BadCommandParametersError(CommandCallerError, TypeError):
     pass
 
 
+class CommandNotAllowedError(CommandCallerError, NotImplementedError):
+    """A command that exists but may not be called over RPC."""
+
+
 class _ArrayResultError(TypeError):
     """A command returned an array; bulk data belongs on a stream, not in RPC."""
 
@@ -750,7 +754,7 @@ class DeviceRunner:
             raise UnknownCommandError(f"Internal class methods not allowed {action!r}")
 
         if action in {"connect", "disconnect"}:
-            raise NotImplementedError(f"Command {action!r} is not allowed via RPC")
+            raise CommandNotAllowedError(f"Command {action!r} is not allowed via RPC")
 
         if action in self._stream_rpc:
             return self._stream_rpc[action](**params)
@@ -1256,6 +1260,8 @@ class DeviceRunner:
             return self._rpc_error(rpc.request_id, str(e), error_code="unknown_command")
         except BadCommandParametersError as e:
             return self._rpc_error(rpc.request_id, str(e), error_code="bad_parameters")
+        except CommandNotAllowedError as e:
+            return self._rpc_error(rpc.request_id, str(e), error_code="command_not_allowed")
         except Exception as e:
             if not isinstance(e, CommandCallerError):
                 self._last_error = f"command {rpc.action} failed: {e!r}"

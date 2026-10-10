@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import difflib
 from dataclasses import dataclass
 from typing import Any
 
@@ -261,8 +262,6 @@ def _detect_step_kind(obj: dict[str, Any]) -> str:
             "step has no kind; use one of: " + ", ".join(_STEP_KINDS)
         )
     first = candidates[0]
-    import difflib
-
     close = difflib.get_close_matches(first, _STEP_KINDS, n=1, cutoff=0.5)
     hint = f" (did you mean {close[0]!r}?)" if close else ""
     raise TypeError(

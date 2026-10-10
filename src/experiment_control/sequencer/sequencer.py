@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import difflib
 import json
 import re
 import queue
@@ -3601,8 +3602,6 @@ class SequencerProcess(ManagedProcessBase):
         for device_id in sorted(device_ids):
             item = status_by_device.get(device_id)
             if item is None:
-                import difflib
-
                 close = difflib.get_close_matches(
                     device_id, sorted(status_by_device), n=3, cutoff=0.6
                 )
@@ -3733,7 +3732,7 @@ class SequencerProcess(ManagedProcessBase):
         try:
             self._runtime.request_pause(
                 reason=params.get("reason"),
-                source=params.get("source") or "rpc",
+                source=params.get("source"),
                 trigger=params.get("trigger"),
             )
         except Exception as e:
@@ -3755,7 +3754,7 @@ class SequencerProcess(ManagedProcessBase):
     def _rpc_sequencer_resume(self, req: Json) -> Json:
         params = self._control_params(req)
         try:
-            self._runtime.resume(source=params.get("source") or "rpc")
+            self._runtime.resume(source=params.get("source"))
         except Exception as e:
             self._publish_lifecycle_event(
                 event="resume",
@@ -3777,7 +3776,7 @@ class SequencerProcess(ManagedProcessBase):
         try:
             self._runtime.request_stop(
                 reason=params.get("reason"),
-                source=params.get("source") or "rpc",
+                source=params.get("source"),
             )
         except Exception as e:
             self._publish_lifecycle_event(
