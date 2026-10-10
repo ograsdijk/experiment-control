@@ -97,11 +97,12 @@ _SET_CONTEXT_DISPATCH_DEADLINE_S = _STREAM_CONTEXT_SET_RETRY_DEADLINE_S + 2.0
 _PARALLEL_MAX_WORKERS = 8
 
 
-def _rounded(value: Any, digits: int) -> Any:
-    # The ETA counts down continuously; round it for the progress-event
-    # change signature so events aren't emitted for sub-second drift.
-    if isinstance(value, float):
-        return round(value, digits)
+def _bucketed(value: Any, step: float) -> Any:
+    # The ETA counts down continuously during sleeps and waits; bucket it
+    # (and the time percent) in the progress-event change signature so a
+    # long sleep doesn't publish an event every throttle period.
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return round(float(value) / step)
     return value
 
 
@@ -728,8 +729,8 @@ class SequencerProcess(ManagedProcessBase):
             progress.get("total_steps_known"),
             progress.get("estimate_reason"),
             progress.get("approximate"),
-            _rounded(progress.get("eta_s"), 0),
-            _rounded(progress.get("time_percent"), 1),
+            _bucketed(progress.get("eta_s"), 5.0),
+            _bucketed(progress.get("time_percent"), 1.0),
             progress.get("scope"),
             progress.get("phase"),
             progress.get("cleanup_completed_steps"),

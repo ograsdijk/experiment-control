@@ -164,6 +164,9 @@ class SequencerProgressEtaTests(unittest.TestCase):
         self.assertIn("targets", str(progress["estimate_reason"]))
 
         runtime.tick()  # runs the assign, starts the sleep
+        self.clock.t += 0.5
+        self.assertIsNone(self._progress(runtime)["total_steps"])  # throttled
+        self.clock.t += 0.6
         progress = self._progress(runtime)
         self.assertEqual(progress["total_steps"], 6)
         self.assertFalse(progress["approximate"])
@@ -333,6 +336,52 @@ class SequencerProgressEtaTests(unittest.TestCase):
         progress = self._progress(runtime)
         # 12 s left of the 16 s sleep, then 32 + 64 + 128 s.
         self.assertAlmostEqual(progress["eta_s"], 12.0 + 224.0, delta=0.5)
+
+    def _use_scan_runtime(
+        self, inner_steps: list[Any]
+    ) -> tuple[SequencerRuntime, list[str]]:
+        resolved: list[str] = []
+        inner = _spec(inner_steps, vars={"x": 0})
+
+        def resolve_use(name: str) -> SequenceSpec:
+            resolved.append(name)
+            return inner
+
+        runtime = self._runtime(resolve_use=resolve_use)
+        runtime.load(
+            _spec(
+                [
+                    ForStep(
+                        bind={"value": "v"},
+                        in_expr={"gen": {"values": list(range(1, 101))}},
+                        body=[UseStep(sequence_id="measure", args={"x": "${v}"})],
+                    )
+                ]
+            )
+        )
+        return runtime, resolved
+
+    def test_use_args_not_affecting_counts_keep_count_once(self) -> None:
+        runtime, resolved = self._use_scan_runtime(
+            [
+                CallStep(device="d", action="set", params={"x": "${vars.x}"}),
+                RepeatStep(
+                    times=3, body=[CallStep(device="d", action="read", params={})]
+                ),
+            ]
+        )
+        runtime.start()
+        # for + 100 x (use + call + repeat + 3 reads)
+        self.assertEqual(self._progress(runtime)["total_steps"], 1 + 100 * 6)
+        self.assertLess(len(resolved), 10)
+
+    def test_use_args_deciding_counts_are_walked_per_record(self) -> None:
+        runtime, _ = self._use_scan_runtime(
+            [RepeatStep(times="${vars.x}", body=[AssignStep(values={"a": 1})])]
+        )
+        runtime.start()
+        # for + 100 x (use + repeat) + (1 + 2 + ... + 100) assigns
+        self.assertEqual(self._progress(runtime)["total_steps"], 1 + 100 * 2 + 5050)
 
     def test_repeat_count_projects_future_loops(self) -> None:
         runtime = self._runtime()

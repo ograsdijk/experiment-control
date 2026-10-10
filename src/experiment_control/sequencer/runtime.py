@@ -1445,10 +1445,6 @@ class SequencerRuntime:
             return True
         if self._completed_steps == self._work_completed_at:
             return False
-        if self._work is None:
-            # Unknown so far (e.g. a `for` over a var not assigned yet): retry
-            # as soon as anything ran, so the bar appears without delay.
-            return True
         return (
             self._work_walked_mono is None
             or (now - self._work_walked_mono) >= _PROGRESS_REWALK_PERIOD_S
@@ -1631,16 +1627,25 @@ class SequencerRuntime:
                 self._collect_count_names(step.body, names, seen_uses)
                 self._collect_count_names(step.finally_steps, names, seen_uses)
             elif isinstance(step, UseStep):
-                _collect_identifiers(step.args, names)
+                # Args become the used sequence's vars. They only matter when
+                # its counts or sleeps refer to them; a measurement sequence
+                # called per scan point with `x: ${value}` usually doesn't.
                 sequence_name = str(step.sequence_id).strip()
                 if sequence_name in seen_uses:
+                    _collect_identifiers(step.args, names)
                     continue
                 seen_uses.add(sequence_name)
                 try:
                     spec = self._resolve_use_spec(step.sequence_id)
                 except Exception:
+                    _collect_identifiers(step.args, names)
                     continue
-                self._collect_count_names(spec.steps, names, seen_uses)
+                nested: set[str] = set()
+                self._collect_count_names(spec.steps, nested, seen_uses)
+                names.update(nested)
+                arg_keys = set(step.args) if isinstance(step.args, dict) else set()
+                if not isinstance(step.args, dict) or nested & arg_keys:
+                    _collect_identifiers(step.args, names)
 
     def _walk_if(
         self, step: IfStep, env: dict[str, Any], work: _RemainingWork, mult: int
