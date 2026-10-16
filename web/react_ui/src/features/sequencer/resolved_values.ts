@@ -67,6 +67,20 @@ export type ValueContext = {
 };
 
 const TEMPLATE_RE = /\$\{([^}]+)\}/g;
+/** Own keys only: a template like `${toString}` must not find Object.prototype. */
+function has(rec: object | null | undefined, key: string): boolean {
+  return rec != null && Object.prototype.hasOwnProperty.call(rec, key);
+}
+
+function own<T>(rec: Record<string, T> | null | undefined, key: string): T | undefined {
+  return rec != null && has(rec, key) ? rec[key] : undefined;
+}
+
+/** A fresh global regexp for `${...}` (shared with the YAML editor). */
+export function templateRegExp(): RegExp {
+  return new RegExp(TEMPLATE_RE.source, "g");
+}
+
 const SIMPLE_REF_RE = /^\s*(?:vars\.)?([A-Za-z_]\w*)\s*$/;
 
 export type TemplateSegment =
@@ -193,9 +207,13 @@ export function formatNumber(value: number): string {
   if (Number.isInteger(value) && abs < 1e6) {
     return String(value);
   }
-  // toPrecision(5) switches to its own exponent form from 1e5 on.
+  // toPrecision(5) switches to its own exponent form from 1e5 on, and for
+  // values that round up to it (99999.7 -> "1.0000e+5"): use ours then.
   if (abs >= 1e-3 && abs < 1e5) {
-    return trimZeros(value.toPrecision(SIG_FIGS));
+    const text = value.toPrecision(SIG_FIGS);
+    if (!text.includes("e")) {
+      return trimZeros(text);
+    }
   }
   let exponent = Math.floor(Math.log10(abs) / 3) * 3;
   let mantissa = value / 10 ** exponent;
@@ -281,11 +299,11 @@ function overrideDetail(name: string, ctx: ValueContext, resolved: ResolvedVars)
   if (resolved.overridden.has(name)) {
     lines.push(`Run override: ${formatFull(resolved.vars[name])}`);
   }
-  if (name in resolved.baseVars) {
+  if (has(resolved.baseVars, name)) {
     lines.push(`Without overrides: ${formatFull(resolved.baseVars[name])}`);
   }
   const next = ctx.nextRunOverrides;
-  if (next && name in next) {
+  if (next && has(next, name)) {
     lines.push(`Next run: ${formatFull(next[name])}`);
   }
   return lines;
@@ -293,13 +311,13 @@ function overrideDetail(name: string, ctx: ValueContext, resolved: ResolvedVars)
 
 function varChip(name: string, ctx: ValueContext, resolved: ResolvedVars): ValueChip {
   const value = resolved.vars[name];
-  const error = resolved.errors[name];
+  const error = own(resolved.errors, name);
   if (error) {
     return { kind: "error", name, value: "error", formula: false, overrideDot: false, detail: [error] };
   }
-  const runtimeNames = resolved.runtimeVars[name];
+  const runtimeNames = own(resolved.runtimeVars, name);
   if (runtimeNames) {
-    const single = runtimeNames.length === 1 ? ctx.runtimeOrigins?.[runtimeNames[0]] : undefined;
+    const single = runtimeNames.length === 1 ? own(ctx.runtimeOrigins, runtimeNames[0]) : undefined;
     return {
       kind: "runtime",
       name,
@@ -315,9 +333,9 @@ function varChip(name: string, ctx: ValueContext, resolved: ResolvedVars): Value
   }
   const overridden = resolved.overridden.has(name);
   const derived = resolved.derived.has(name) && !overridden;
-  const changed = name in resolved.baseVars;
+  const changed = has(resolved.baseVars, name);
   const detail = [`${name} = ${formatFull(value)}`];
-  const formula = resolved.formulas[name];
+  const formula = own(resolved.formulas, name);
   if (derived && formula) {
     detail.push(formulaInner(formula), `= ${formulaInner(substituteFormula(formula, resolved.vars))}`);
   } else if (!overridden) {
@@ -350,7 +368,7 @@ export function resolveTemplatesInText(text: string, ctx: ValueContext): string 
 function originLines(names: string[], ctx: ValueContext): string[] {
   const lines: string[] = [];
   for (const name of names) {
-    const origin = ctx.runtimeOrigins?.[name];
+    const origin = own(ctx.runtimeOrigins, name);
     if (!origin) {
       lines.push(`${name}: set while running`);
       continue;
@@ -366,7 +384,7 @@ function originLines(names: string[], ctx: ValueContext): string[] {
 function runtimeChip(name: string, names: string[], ctx: ValueContext): ValueChip {
   const live = ctx.liveEnv;
   const origins = originLines(names, ctx);
-  if (live && names.length === 1 && names[0] === name && name in live) {
+  if (live && names.length === 1 && names[0] === name && has(live, name)) {
     return {
       kind: "live",
       name,
@@ -376,7 +394,7 @@ function runtimeChip(name: string, names: string[], ctx: ValueContext): ValueChi
       detail: [`${name} = ${formatFull(live[name])} (live)`, ...origins],
     };
   }
-  const single = names.length === 1 ? ctx.runtimeOrigins?.[names[0]] : undefined;
+  const single = names.length === 1 ? own(ctx.runtimeOrigins, names[0]) : undefined;
   return {
     kind: "runtime",
     name,
@@ -396,7 +414,7 @@ export function buildRuntimeOrigins(
   const out: Record<string, RuntimeOrigin> = {};
   const add = (name: string | null | undefined, origin: RuntimeOrigin) => {
     const key = name?.trim();
-    if (key && /^[A-Za-z_]\w*$/.test(key) && !(key in out)) {
+    if (key && /^[A-Za-z_]\w*$/.test(key) && !has(out, key)) {
       out[key] = origin;
     }
   };
@@ -468,7 +486,7 @@ function describeTemplateValue(text: string, inner: string, ctx: ValueContext): 
     return null;
   }
   const ref = simpleTemplateRef(inner);
-  if (ref && ref in resolved.vars) {
+  if (ref && has(resolved.vars, ref)) {
     return varChip(ref, ctx, resolved);
   }
   const name = ref ?? inner.trim();
@@ -495,16 +513,16 @@ function describeTemplateValue(text: string, inner: string, ctx: ValueContext): 
 /** Chip for a var's own line in the `vars` block (only when it adds something). */
 export function describeVarDefinition(name: string, ctx: ValueContext): ValueChip | null {
   const resolved = ctx.resolved;
-  if (!resolved || !(name in resolved.vars)) {
+  if (!resolved || !has(resolved.vars, name)) {
     return null;
   }
   const show =
     resolved.derived.has(name) ||
     resolved.overridden.has(name) ||
-    name in resolved.baseVars ||
-    name in resolved.errors ||
-    name in resolved.runtimeVars ||
-    Boolean(ctx.nextRunOverrides && name in ctx.nextRunOverrides);
+    has(resolved.baseVars, name) ||
+    has(resolved.errors, name) ||
+    has(resolved.runtimeVars, name) ||
+    has(ctx.nextRunOverrides, name);
   return show ? markStale(varChip(name, ctx, resolved), ctx) : null;
 }
 

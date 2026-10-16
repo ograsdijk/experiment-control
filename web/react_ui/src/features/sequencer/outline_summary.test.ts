@@ -69,6 +69,19 @@ describe("step summaries", () => {
     ]);
   });
 
+  it("keeps templates whole and exactly as written in set and assign summaries", () => {
+    const yamlText = [
+      "steps:",
+      "  - set: {device: synth, name: freq, value: '${freq_center_hz - 0.5 * sweep_step_hz * (n_steps - 1)}'}",
+      "  - assign:",
+      "      power:   ${base  *  2}",
+    ].join("\n");
+    expect(summaries(yamlText)).toEqual([
+      "synth.freq = '${freq_center_hz - 0.5 * sweep_step_hz * (n_steps - 1)}'",
+      "power = ${base  *  2}",
+    ]);
+  });
+
   it("leaves the unit of a templated wait_until timeout to the value chip", () => {
     const yamlText = [
       "steps:",

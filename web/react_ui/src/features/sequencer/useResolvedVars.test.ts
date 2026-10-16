@@ -12,6 +12,8 @@ import { RESOLVE_VARS_DEBOUNCE_MS, useResolvedVars } from "./useResolvedVars";
 let container: HTMLDivElement;
 let root: Root;
 let latest: ResolvedVars | null = null;
+/** Every value the hook returned, render by render. */
+let history: Array<ResolvedVars | null> = [];
 
 type Call = (id: string, action: string, params: Record<string, unknown>) => Promise<ApiResponse<unknown>>;
 
@@ -23,6 +25,7 @@ function Probe(props: { call: Call; enabled: boolean; text: string; processId?: 
     yamlText: props.text,
     overrides: {},
   });
+  history.push(latest);
   return null;
 }
 
@@ -49,6 +52,7 @@ beforeEach(() => {
   container = document.createElement("div");
   root = createRoot(container);
   latest = null;
+  history = [];
 });
 
 afterEach(() => {
@@ -75,6 +79,25 @@ describe("useResolvedVars", () => {
     await render({ call, enabled: true, text: "vars: {a: [" });
     expect(latest?.vars).toEqual({ a: 1 });
     expect(latest?.stale).toBe(true);
+  });
+
+  it("drops a reply that arrives after the modal closed", async () => {
+    let resolveCall: (resp: ApiResponse<unknown>) => void = () => undefined;
+    const call = vi.fn<Call>().mockImplementation(
+      () => new Promise<ApiResponse<unknown>>((resolve) => (resolveCall = resolve))
+    );
+    await render({ call, enabled: true, text: "vars: {a: 1}" });
+    await render({ call, enabled: false, text: "vars: {a: 1}" });
+    await act(async () => {
+      resolveCall(OK);
+    });
+    expect(latest).toBeNull();
+    // Reopened: nothing from the old request shows, not even for one render.
+    history = [];
+    call.mockResolvedValue(INVALID);
+    await render({ call, enabled: true, text: "vars: {a: 1}" });
+    expect(history.length).toBeGreaterThan(0);
+    expect(history.every((value) => value === null)).toBe(true);
   });
 
   it("drops the values when the modal closes", async () => {

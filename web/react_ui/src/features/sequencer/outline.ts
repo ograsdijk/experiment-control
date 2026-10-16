@@ -74,9 +74,16 @@ type StepContainerContext = {
   listIndent: number | null;
 };
 
-/** Shortened text, but never cut inside a `${...}`: its value chip needs it whole. */
+/**
+ * Shortened text, but a value with a `${...}` is kept whole and its templates
+ * exactly as written: the value chip needs the template text to match the
+ * expression the backend evaluated.
+ */
 function compactValue(value: string, maxLength: number): string {
-  return value.includes("${") ? value.replace(/\s+/g, " ").trim() : compactText(value, maxLength);
+  if (!value.includes("${")) {
+    return compactText(value, maxLength);
+  }
+  return value.replace(/(\$\{[^}]*\})|\s+/g, (_match, template?: string) => template ?? " ").trim();
 }
 
 function compactText(value: string, maxLength = 96): string {
@@ -398,16 +405,16 @@ function deriveSummary(
   if (kind === "set" && node.setDetail) {
     const { device, name, value } = node.setDetail;
     if (device && name && value) {
-      return `${device}.${name} = ${compactText(value, 56)}`;
+      return `${device}.${name} = ${compactValue(value, 56)}`;
     }
     if (name && value) {
-      return `${name} = ${compactText(value, 56)}`;
+      return `${name} = ${compactValue(value, 56)}`;
     }
   }
   if (kind === "assign" && node.assignDetail) {
     const entry = node.assignDetail.entries[0];
     if (entry && entry.value) {
-      return `${entry.name} = ${compactText(entry.value, 56)}`;
+      return `${entry.name} = ${compactValue(entry.value, 56)}`;
     }
   }
   if (kind === "repeat") {
@@ -421,7 +428,7 @@ function deriveSummary(
     const binds = detail.bind.map((entry) => `${entry.name} -> ${entry.value ?? "n/a"}`);
     const bindSummary = binds.length > 0 ? binds.join(", ") : "bindings";
     if (detail.sourceMode === "direct") {
-      return `${bindSummary} over ${compactText(detail.directValue ?? "expression", 48)}`;
+      return `${bindSummary} over ${compactValue(detail.directValue ?? "expression", 48)}`;
     }
     if (detail.generatorKind) {
       // Scalar generator settings, so their values show: linspace(start: .., stop: .., num: ..).

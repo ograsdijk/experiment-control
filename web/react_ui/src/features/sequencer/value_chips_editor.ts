@@ -17,6 +17,7 @@ import { VALUE_CHIP_COLORS, OVERRIDE_DOT_COLOR } from "./components/ValueChip";
 import {
   describeTemplate,
   describeVarDefinition,
+  templateRegExp,
   type ValueChip,
   type ValueContext,
 } from "./resolved_values";
@@ -83,7 +84,6 @@ class ValueChipWidget extends WidgetType {
   }
 }
 
-const TEMPLATE_RE = /\$\{([^}\n]+)\}/g;
 const TOP_KEY_RE = /^([A-Za-z_][\w-]*)\s*:/;
 const VAR_DEF_RE = /^(\s+)([A-Za-z_]\w*)\s*:/;
 
@@ -132,35 +132,40 @@ function buildDecorations(view: EditorView, defs: Map<number, string>): Decorati
       : null;
   const widgets: { pos: number; deco: Decoration }[] = [];
   for (const { from, to } of view.visibleRanges) {
+    // Var definitions: a chip at the end of the line, instead of template chips.
     let line = doc.lineAt(from);
     for (;;) {
-      if (line.number !== cursorLine) {
-        const defName = defs.get(line.number);
-        if (defName) {
-          const chip = describeVarDefinition(defName, ctx);
-          if (chip) {
-            widgets.push({
-              pos: line.to,
-              deco: Decoration.widget({ widget: new ValueChipWidget(chip, true), side: 1 }),
-            });
-          }
-        } else {
-          for (const match of line.text.matchAll(TEMPLATE_RE)) {
-            const chip = describeTemplate(match[0], match[1], ctx);
-            if (!chip) {
-              continue;
-            }
-            widgets.push({
-              pos: line.from + (match.index ?? 0) + match[0].length,
-              deco: Decoration.widget({ widget: new ValueChipWidget(chip, false), side: 1 }),
-            });
-          }
+      const defName = defs.get(line.number);
+      if (defName && line.number !== cursorLine) {
+        const chip = describeVarDefinition(defName, ctx);
+        if (chip) {
+          widgets.push({
+            pos: line.to,
+            deco: Decoration.widget({ widget: new ValueChipWidget(chip, true), side: 1 }),
+          });
         }
       }
       if (line.to >= to || line.number >= doc.lines) {
         break;
       }
       line = doc.line(line.number + 1);
+    }
+    // Templates, matched on the text itself so one spanning lines is found too.
+    const text = doc.sliceString(from, to);
+    for (const match of text.matchAll(templateRegExp())) {
+      const start = from + (match.index ?? 0);
+      const end = start + match[0].length;
+      const endLine = doc.lineAt(end).number;
+      if (defs.has(doc.lineAt(start).number) || endLine === cursorLine) {
+        continue;
+      }
+      const chip = describeTemplate(match[0], match[1], ctx);
+      if (chip) {
+        widgets.push({
+          pos: end,
+          deco: Decoration.widget({ widget: new ValueChipWidget(chip, false), side: 1 }),
+        });
+      }
     }
   }
   return Decoration.set(

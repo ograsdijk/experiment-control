@@ -61,6 +61,8 @@ describe("formatNumber", () => {
     expect(formatNumber(12_345.67)).toBe("12346");
     expect(formatNumber(123_456.7)).toBe("123.46e3");
     expect(formatNumber(999_999.7)).toBe("1e6");
+    // Rounds up to 1e5 inside toPrecision.
+    expect(formatNumber(99_999.7)).toBe("100e3");
   });
 });
 
@@ -156,6 +158,20 @@ describe("vars that read runtime names", () => {
       "Value known once the step runs.",
     ]);
     expect(describeVarDefinition("label", ctx({ resolved: withLabel }))?.kind).toBe("runtime");
+  });
+});
+
+describe("names that are also Object.prototype keys", () => {
+  it("are looked up as own keys only", () => {
+    const withProto = normalizeResolvedVars({
+      vars: { a: 1 },
+      expressions: { "${toString}": { ok: false, runtime: true, names: ["toString"] } },
+    });
+    expect(describeTemplate("${toString}", "toString", ctx({ resolved: withProto }))).toMatchObject({
+      kind: "runtime",
+      name: "toString",
+    });
+    expect(describeVarDefinition("constructor", ctx({ resolved: withProto }))).toBeNull();
   });
 });
 

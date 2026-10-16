@@ -75,7 +75,11 @@ export function useResolvedVars({
           }
         });
     }, RESOLVE_VARS_DEBOUNCE_MS);
-    return () => window.clearTimeout(timer);
+    return () => {
+      window.clearTimeout(timer);
+      // A reply that arrives after this (newer text, a closed modal) is dropped.
+      requestIdRef.current += 1;
+    };
   }, [callProcessFn, processId, enabled, yamlText, overridesKey, expressions]);
 
   return enabled ? resolved : null;

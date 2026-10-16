@@ -1687,9 +1687,23 @@ export function useSequencerController({
     yamlText: sequencerYamlText,
     overrides: sequencerDisplayOverrides.overrides,
   });
-  // Live loop values only fit the editor while it holds the running sequence.
-  const sequencerLiveEnv =
-    sequencerRunActive && !sequencerYamlDirty ? sequencerStatus?.env ?? null : null;
+  // Live loop values only fit the editor while it holds the running sequence:
+  // unedited, and the revision that is loaded (not one another client loaded since).
+  const sequencerEditorHoldsLoaded =
+    !sequencerYamlDirty &&
+    editorMatchesLoadedRevision({
+      statusRevision: sequencerStatusRevision,
+      editorRevision: sequencerEditorRevision,
+    });
+  const sequencerLiveEnvRaw =
+    sequencerRunActive && sequencerEditorHoldsLoaded ? sequencerStatus?.env ?? null : null;
+  // Same object while the values don't change: every poll replaces the status
+  // (progress), and a new env object would rebuild every value chip.
+  const sequencerLiveEnvKey = JSON.stringify(sequencerLiveEnvRaw);
+  const sequencerLiveEnv = useMemo(
+    () => JSON.parse(sequencerLiveEnvKey) as Record<string, unknown> | null,
+    [sequencerLiveEnvKey]
+  );
   const sequencerValueContext = useMemo<ValueContext>(
     () => ({
       resolved: sequencerResolvedVars,
