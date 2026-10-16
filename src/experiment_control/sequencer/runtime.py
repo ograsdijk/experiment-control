@@ -738,10 +738,6 @@ class SequencerRuntime:
     def is_loaded(self) -> bool:
         return self._spec is not None
 
-    def _resolve_initial_vars(self, raw_vars: dict[str, Any]) -> dict[str, Any]:
-        # Resolve vars against other vars (including nested ${...}) before first tick.
-        return resolve_vars(raw_vars)
-
     @property
     def base_vars(self) -> dict[str, Any]:
         """The loaded sequence's vars as written (before resolving and overrides)."""
@@ -757,7 +753,7 @@ class SequencerRuntime:
             raise RuntimeError("Cannot load while running")
         self._spec = spec
         self._base_vars = dict(spec.vars)
-        self._vars = self._resolve_initial_vars(spec.vars)
+        self._vars = resolve_vars(spec.vars)
         self._env = {}
         self._stack = []
         self._pause_requested = False
@@ -834,7 +830,7 @@ class SequencerRuntime:
 
         merged_vars = dict(self._base_vars)
         merged_vars.update(vars_override_map)
-        self._vars = self._resolve_initial_vars(merged_vars)
+        self._vars = resolve_vars(merged_vars)
         self._vars_override_active = dict(vars_override_map)
 
         self._run_id = self._next_run_id
@@ -3013,7 +3009,7 @@ class SequencerRuntime:
             if not isinstance(rendered_args, dict):
                 raise TypeError("use.args must render to a dict")
             merged.update(rendered_args)
-        return self._resolve_initial_vars(merged)
+        return resolve_vars(merged)
 
     def _create_adaptive_controller(
         self,

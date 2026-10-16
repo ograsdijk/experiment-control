@@ -9,7 +9,10 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
+from experiment_control.processes.process_base import ManagedProcessBase
+from experiment_control.sequencer.eval import ValueTooLargeError, render_templates
 from experiment_control.sequencer.sequencer import SequencerProcess
+from experiment_control.utils.zmq_helpers import safe_json_loads
 from experiment_control.sequencer.var_resolution import (
     evaluate_expressions,
     resolve_vars,
@@ -133,6 +136,60 @@ class ResolveVarsRpcTests(unittest.TestCase):
     def test_invalid_params(self) -> None:
         resp = _resolve({"text": SWEEP_YAML, "expressions": "nope"})
         self.assertFalse(resp.get("ok"))
+
+
+
+class CostLimitTests(unittest.TestCase):
+    def test_huge_results_are_refused_before_computing(self) -> None:
+        for expr in (
+            "${10**10**8}",
+            "${3**13000}",
+            "${(10**3000) * (10**3000)}",
+            "${'x' * 10**10}",
+            "${10**10 * 'x'}",
+        ):
+            with self.subTest(expr=expr), self.assertRaises(ValueTooLargeError):
+                render_templates(expr, {})
+
+    def test_ordinary_arithmetic_still_works(self) -> None:
+        self.assertEqual(render_templates("${2**1000}", {}), 2**1000)
+        self.assertEqual(render_templates("${3 * 'ab'}", {}), "ababab")
+        self.assertEqual(render_templates("${2**-2}", {}), 0.25)
+        self.assertEqual(render_templates("${(-1)**10**9}", {}), 1)
+
+    def test_preview_reports_the_limit_as_an_error(self) -> None:
+        result = _resolve({"text": "vars: {a: 1}", "expressions": ["${10**10**8}"]})["result"]
+        self.assertFalse(result["expressions"]["${10**10**8}"]["ok"])
+        self.assertIn("too large", result["expressions"]["${10**10**8}"]["error"])
+
+
+class _Router:
+    def __init__(self, frames: list[bytes]) -> None:
+        self.frames = frames
+        self.sent: list[list[bytes]] = []
+
+    def recv_multipart(self) -> list[bytes]:
+        return self.frames
+
+    def send_multipart(self, frames: list[bytes]) -> None:
+        self.sent.append(frames)
+
+
+class RpcReplyTests(unittest.TestCase):
+    def test_unserializable_result_still_gets_an_error_reply(self) -> None:
+        proc = object.__new__(ManagedProcessBase)
+        proc._rpc_router = _Router([b"id", b'{"type": "x", "request_id": "r1"}'])
+        proc._handle_rpc = lambda req: {  # type: ignore[method-assign]
+            "request_id": req["request_id"],
+            "ok": True,
+            "result": 10**5000,
+        }
+        proc._drain_rpc()
+        self.assertEqual(len(proc._rpc_router.sent), 1)
+        reply = safe_json_loads(proc._rpc_router.sent[0][1])
+        self.assertEqual(reply["request_id"], "r1")
+        self.assertFalse(reply["ok"])
+        self.assertEqual(reply["error"]["code"], "unserializable_result")
 
 
 if __name__ == "__main__":

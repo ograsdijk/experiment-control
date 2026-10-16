@@ -3861,6 +3861,9 @@ class SequencerProcess(ManagedProcessBase):
         runtime_vars, errors = unresolved_vars(resolved)
         # Values without the overrides, where they differ ("YAML: 20").
         base = resolve_vars(raw_vars) if applied else resolved
+        formulas = {
+            str(k): formula_text(v) for k, v in raw_vars.items() if contains_template(v)
+        }
         return self.rpc_ok(
             req,
             result={
@@ -3868,14 +3871,8 @@ class SequencerProcess(ManagedProcessBase):
                 "base_vars": json_safe(
                     {k: v for k, v in base.items() if resolved.get(k) != v}
                 ),
-                "formulas": {
-                    str(k): formula_text(v)
-                    for k, v in raw_vars.items()
-                    if contains_template(v)
-                },
-                "derived": sorted(
-                    str(k) for k, v in raw_vars.items() if contains_template(v)
-                ),
+                "formulas": formulas,
+                "derived": sorted(formulas),
                 "overridden": sorted(applied),
                 "unknown_overrides": sorted(k for k in override_map if k not in raw_vars),
                 "runtime_vars": runtime_vars,

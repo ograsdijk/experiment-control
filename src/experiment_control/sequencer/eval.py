@@ -2,12 +2,19 @@ from __future__ import annotations
 
 import ast
 import difflib
+import math
 import re
 from typing import Any, Callable
 
 
 _TEMPLATE_RE = re.compile(r"\$\{([^}]+)\}")
 _MAX_TEMPLATE_DEPTH = 16
+# Cost limits: an integer of more digits cannot be turned into text (Python's
+# int-to-str limit) and takes seconds to minutes to compute; repeating a
+# string or list beyond this many items would allocate gigabytes.
+MAX_INT_DIGITS = 4000
+_MAX_INT_BITS = int(MAX_INT_DIGITS * 3.3219280948873626)  # log2(10)
+MAX_REPEAT_ITEMS = 1_000_000
 
 
 class TemplateError(ValueError):
@@ -20,6 +27,10 @@ class UnknownNameError(TemplateError):
     def __init__(self, message: str, *, name: str) -> None:
         super().__init__(message)
         self.name = name
+
+
+class ValueTooLargeError(TemplateError):
+    """An operation whose result would be too large to compute or use."""
 
 
 class OperandError(TemplateError):
@@ -104,6 +115,32 @@ def _operand_error(
     )
 
 
+def _is_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _check_result_size(op: ast.operator, left: Any, right: Any, expr: str) -> None:
+    """Refuse `**` and `*` whose result would be huge, before computing it."""
+    limit: str | None = None
+    if isinstance(op, ast.Pow) and _is_int(left) and _is_int(right) and right > 0:
+        if abs(left) > 1 and math.log2(abs(left)) * right > _MAX_INT_BITS:
+            limit = f"more than {MAX_INT_DIGITS} digits"
+    elif isinstance(op, ast.Mult):
+        if _is_int(left) and _is_int(right):
+            if left.bit_length() + right.bit_length() > _MAX_INT_BITS + 1:
+                limit = f"more than {MAX_INT_DIGITS} digits"
+        else:
+            seq, count = (left, right) if _is_int(right) else (right, left)
+            if (
+                isinstance(seq, (str, list, tuple))
+                and _is_int(count)
+                and len(seq) * count > MAX_REPEAT_ITEMS
+            ):
+                limit = f"more than {MAX_REPEAT_ITEMS:,} items"
+    if limit:
+        raise ValueTooLargeError(f"result of ${{{expr}}} would be too large ({limit})")
+
+
 def _eval_expr(expr: str, env: dict[str, Any]) -> Any:
     try:
         tree = ast.parse(expr, mode="eval")
@@ -142,6 +179,7 @@ def _eval_expr(expr: str, env: dict[str, Any]) -> Any:
         if isinstance(node, ast.BinOp):
             left = eval_node(node.left)
             right = eval_node(node.right)
+            _check_result_size(node.op, left, right, expr)
             try:
                 if isinstance(node.op, ast.Add):
                     return left + right
