@@ -40,6 +40,11 @@ export const VALUE_CHIP_COLORS: Record<
     background: "var(--mantine-color-cyan-light)",
     color: "var(--mantine-color-cyan-light-color)",
   },
+  unknown: {
+    border: "var(--mantine-color-yellow-6)",
+    background: "var(--mantine-color-yellow-light)",
+    color: "var(--mantine-color-yellow-light-color)",
+  },
   live: {
     border: "var(--mantine-color-green-6)",
     background: "var(--mantine-color-green-light)",
@@ -191,7 +196,7 @@ export function ValueHint({ text, unit }: { text: string; unit?: string }) {
       </Text>
     );
   }
-  if (chip.kind === "runtime") {
+  if (chip.kind === "runtime" || chip.kind === "unknown") {
     return (
       <Text size="xs" style={{ color, whiteSpace: "pre-wrap" }}>
         {chip.detail.join("\n")}

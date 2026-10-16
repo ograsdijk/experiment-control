@@ -5,7 +5,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ApiResponse } from "../../api";
 import type { ResolvedVars } from "./resolved_values";
-import { RESOLVE_VARS_DEBOUNCE_MS, useResolvedVars } from "./useResolvedVars";
+import { RESOLVE_VARS_DEBOUNCE_MS, staleReason, useResolvedVars } from "./useResolvedVars";
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -61,14 +61,20 @@ afterEach(() => {
 });
 
 describe("useResolvedVars", () => {
-  it("sends the editor text and its expressions", async () => {
-    const call = vi.fn<Call>().mockResolvedValue(OK);
-    await render({ call, enabled: true, text: "vars: {a: 1}\nsteps:\n  - sleep: ${a}\n" });
+  it("sends the vars block and the expressions as the runtime sees them", async () => {
+    const call = vi.fn<Call>().mockResolvedValue({
+      ok: true,
+      result: { vars: { a: 1 }, expressions: { '${a == "x"}': { ok: true, value: false } } },
+    } as ApiResponse<unknown>);
+    const text = 'vars: {a: 1}\nsteps:\n  - sleep: ${a}\n  - set: {device: d, name: n, value: "${a == \\"x\\"}"}\n';
+    await render({ call, enabled: true, text });
     expect(call).toHaveBeenCalledWith("sequencer", "sequencer.resolve_vars", {
       vars_override: {},
-      expressions: ["${a}"],
-      text: "vars: {a: 1}\nsteps:\n  - sleep: ${a}\n",
+      expressions: ["${a}", '${a == "x"}'],
+      text: "vars: {a: 1}\n",
     });
+    // The result is found under the text as written in the editor too.
+    expect(latest?.expressions['${a == \\"x\\"}']).toEqual({ ok: true, value: false });
     expect(latest?.vars).toEqual({ a: 1 });
     expect(latest?.stale).toBeFalsy();
   });
@@ -78,7 +84,15 @@ describe("useResolvedVars", () => {
     await render({ call, enabled: true, text: "vars: {a: 1}" });
     await render({ call, enabled: true, text: "vars: {a: [" });
     expect(latest?.vars).toEqual({ a: 1 });
-    expect(latest?.stale).toBe(true);
+    expect(latest?.stale).toBe("the YAML doesn't parse right now");
+  });
+
+  it("says why values are stale", () => {
+    expect(staleReason(INVALID)).toBe("the YAML doesn't parse right now");
+    expect(
+      staleReason({ ok: false, error: { code: "not_implemented", message: "unknown action" } } as ApiResponse<unknown>)
+    ).toBe("the sequencer couldn't resolve them (unknown action)");
+    expect(staleReason(null)).toBe("the sequencer can't be reached");
   });
 
   it("drops a reply that arrives after the modal closed", async () => {

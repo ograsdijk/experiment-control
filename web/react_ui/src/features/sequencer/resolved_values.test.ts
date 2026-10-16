@@ -15,7 +15,7 @@ import {
 } from "./resolved_values";
 import { varDefinitionLines } from "./value_chips_editor";
 import { buildSequencerStepOutline } from "./outline";
-import { buildRuntimeOrigins } from "./resolved_values";
+import { buildRuntimeOrigins, decodedTemplates, extractVarsBlock } from "./resolved_values";
 
 const resolved = normalizeResolvedVars({
   vars: {
@@ -177,7 +177,7 @@ describe("names that are also Object.prototype keys", () => {
 
 describe("stale values", () => {
   it("dims chips and says why", () => {
-    const chip = describeTemplate("${settle_s}", "settle_s", ctx({ resolved: { ...resolved!, stale: true } }));
+    const chip = describeTemplate("${settle_s}", "settle_s", ctx({ resolved: { ...resolved!, stale: "the YAML doesn't parse right now" } }));
     expect(chip?.stale).toBe(true);
     expect(chip?.detail[chip.detail.length - 1]).toMatch(/out of date/);
   });
@@ -275,5 +275,74 @@ describe("runtime origins", () => {
       "  over linspace(start: 985.5e6, stop: 0.05, num: 30)",
       "Value known once the step runs.",
     ]);
+  });
+});
+
+describe("extractVarsBlock", () => {
+  it("keeps only the top-level vars block", () => {
+    const text = ["version: 1", "vars:", "  a: 1", "  # note", "", "  b: ${a}", "steps:", "  - sleep: ${a}"].join("\n");
+    expect(extractVarsBlock(text)).toBe(["vars:", "  a: 1", "  # note", "", "  b: ${a}", ""].join("\n"));
+    expect(extractVarsBlock("vars: {a: 1}\nsteps: []\n")).toBe("vars: {a: 1}\n");
+    expect(extractVarsBlock("steps: []\n")).toBe("vars: {}\n");
+  });
+});
+
+describe("decodedTemplates", () => {
+  it("maps templates as written to what the runtime sees", () => {
+    const text = [
+      "steps:",
+      '  - set: {device: d, name: n, value: "${mode == \\"fast\\"}"}',
+      "  - sleep: ${a +",
+      "      b}",
+      "  - sleep: ${plain}",
+    ].join("\n");
+    expect(decodedTemplates(text)).toEqual({
+      '${mode == \\"fast\\"}': '${mode == "fast"}',
+      "${a +\n      b}": "${a + b}",
+    });
+  });
+});
+
+describe("unknown names", () => {
+  const unknownCtx = (names: string[]) =>
+    ctx({
+      resolved: normalizeResolvedVars({
+        vars: { f2: "${freq_hzz * 2}" },
+        runtime_vars: { f2: ["freq_hzz"] },
+        expressions: { "${freq_hzz}": { ok: false, runtime: true, names: ["freq_hzz"] } },
+      }),
+      runtimeOrigins: Object.fromEntries(
+        names.map((name) => [name, { label: "loop", description: "loop variable of for at L2", line: 2, over: null }])
+      ),
+    });
+
+  it("are flagged when no step sets them", () => {
+    expect(describeTemplate("${freq_hzz}", "freq_hzz", unknownCtx([]))).toMatchObject({ kind: "unknown" });
+    expect(describeTemplate("${f2}", "f2", unknownCtx([]))).toMatchObject({ kind: "unknown", formula: true });
+    expect(describeTemplate("${freq_hzz}", "freq_hzz", unknownCtx([]))?.detail[0]).toBe(
+      "freq_hzz: not a var, and no step in this sequence sets it (typo?)"
+    );
+  });
+
+  it("are not flagged when a step sets them", () => {
+    expect(describeTemplate("${freq_hzz}", "freq_hzz", unknownCtx(["freq_hzz"]))).toMatchObject({ kind: "runtime" });
+  });
+
+  it("know the names steps set implicitly", () => {
+    const origins = buildRuntimeOrigins(
+      buildSequencerStepOutline(
+        [
+          "steps:",
+          "  - call: {device: scope, action: read}",
+          "    extract: {kind: scalar}",
+          "  - call: {device: scope, action: read}",
+          "    assign:",
+          "      locked: {kind: key, ref: locked}",
+          "  - wait_until:",
+          "      condition: {always: true}",
+        ].join("\n")
+      )
+    );
+    expect(Object.keys(origins).sort()).toEqual(["locked", "sample", "samples", "value"]);
   });
 });

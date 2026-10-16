@@ -4,6 +4,7 @@
  * evaluates; nothing is evaluated here) and, while running, `status.env`.
  */
 
+import { isScalar, parse, parseDocument, visit } from "yaml";
 import type { SequencerStepOutlineNode } from "./types";
 
 export type ExpressionResult =
@@ -23,11 +24,18 @@ export type ResolvedVars = {
   runtimeVars: Record<string, string[]>;
   errors: Record<string, string>;
   expressions: Record<string, ExpressionResult>;
-  /** The latest request failed (e.g. the YAML doesn't parse): values may be out of date. */
-  stale?: boolean;
+  /** Why the latest request failed (the values may be out of date), or unset. */
+  stale?: string;
 };
 
-export type ValueChipKind = "vars" | "override" | "derived" | "runtime" | "live" | "error";
+export type ValueChipKind =
+  | "vars"
+  | "override"
+  | "derived"
+  | "runtime"
+  | "live"
+  | "unknown"
+  | "error";
 
 export type ValueChip = {
   kind: ValueChipKind;
@@ -317,11 +325,12 @@ function varChip(name: string, ctx: ValueContext, resolved: ResolvedVars): Value
   }
   const runtimeNames = own(resolved.runtimeVars, name);
   if (runtimeNames) {
-    const single = runtimeNames.length === 1 ? own(ctx.runtimeOrigins, runtimeNames[0]) : undefined;
+    const single = runtimeNames.length === 1 ? findOrigin(runtimeNames[0], ctx) : undefined;
+    const unknown = unknownNames(runtimeNames, ctx).length > 0;
     return {
-      kind: "runtime",
+      kind: unknown ? "unknown" : "runtime",
       name,
-      value: single?.label ?? "runtime",
+      value: unknown ? "unknown" : single?.label ?? "runtime",
       formula: true,
       overrideDot: false,
       detail: [
@@ -365,12 +374,37 @@ export function resolveTemplatesInText(text: string, ctx: ValueContext): string 
     .join("");
 }
 
+/** The step that sets a runtime name; `metric_*` entries match adaptive `<metric>_<stat>`. */
+function findOrigin(name: string, ctx: ValueContext): RuntimeOrigin | undefined {
+  const origins = ctx.runtimeOrigins;
+  if (!origins) {
+    return undefined;
+  }
+  const exact = own(origins, name);
+  if (exact) {
+    return exact;
+  }
+  const prefix = Object.keys(origins).find(
+    (key) => key.endsWith("_*") && name.startsWith(key.slice(0, -1))
+  );
+  return prefix ? origins[prefix] : undefined;
+}
+
+/** Names no step sets (only known once the steps are: `runtimeOrigins` given). */
+function unknownNames(names: string[], ctx: ValueContext): string[] {
+  return ctx.runtimeOrigins ? names.filter((name) => !findOrigin(name, ctx)) : [];
+}
+
 function originLines(names: string[], ctx: ValueContext): string[] {
   const lines: string[] = [];
   for (const name of names) {
-    const origin = own(ctx.runtimeOrigins, name);
+    const origin = findOrigin(name, ctx);
     if (!origin) {
-      lines.push(`${name}: set while running`);
+      lines.push(
+        ctx.runtimeOrigins
+          ? `${name}: not a var, and no step in this sequence sets it (typo?)`
+          : `${name}: set while running`
+      );
       continue;
     }
     lines.push(`${name}: ${origin.description}`);
@@ -394,7 +428,10 @@ function runtimeChip(name: string, names: string[], ctx: ValueContext): ValueChi
       detail: [`${name} = ${formatFull(live[name])} (live)`, ...origins],
     };
   }
-  const single = names.length === 1 ? own(ctx.runtimeOrigins, names[0]) : undefined;
+  if (unknownNames(names, ctx).length > 0) {
+    return { kind: "unknown", name, value: "unknown", formula: false, overrideDot: false, detail: origins };
+  }
+  const single = names.length === 1 ? findOrigin(names[0], ctx) : undefined;
   return {
     kind: "runtime",
     name,
@@ -405,7 +442,28 @@ function runtimeChip(name: string, names: string[], ctx: ValueContext): ValueChi
   };
 }
 
-const SAVE_AS_RE = /^\s*save_as:\s*([A-Za-z_]\w*)\s*$/m;
+/** A call step's `save_as`, `extract` and `assign` targets, read from its YAML. */
+function callTargets(snippet: string): string[] {
+  let parsed: unknown;
+  try {
+    parsed = parse(snippet);
+  } catch {
+    return [];
+  }
+  const step = asRecord(Array.isArray(parsed) ? parsed[0] : parsed);
+  if (!step) {
+    return [];
+  }
+  const out: string[] = [];
+  const saveAs = typeof step.save_as === "string" ? step.save_as : null;
+  if (saveAs) {
+    out.push(saveAs);
+  } else if (step.extract != null) {
+    out.push("value");
+  }
+  out.push(...Object.keys(asRecord(step.assign) ?? {}));
+  return out;
+}
 
 /** Names set while running, from the steps that set them (first one wins). */
 export function buildRuntimeOrigins(
@@ -414,7 +472,7 @@ export function buildRuntimeOrigins(
   const out: Record<string, RuntimeOrigin> = {};
   const add = (name: string | null | undefined, origin: RuntimeOrigin) => {
     const key = name?.trim();
-    if (key && /^[A-Za-z_]\w*$/.test(key) && !has(out, key)) {
+    if (key && /^[A-Za-z_]\w*(?:_\*)?$/.test(key) && !has(out, key)) {
       out[key] = origin;
     }
   };
@@ -447,13 +505,27 @@ export function buildRuntimeOrigins(
         over: null,
       });
     }
+    if (node.adaptiveDetail) {
+      const trial = { label: "adaptive", line: node.line, over: null };
+      add("score", { ...trial, description: `trial score of ${at}` });
+      for (const metric of node.adaptiveDetail.metrics) {
+        add(`${metric.name}_*`, { ...trial, description: `metric statistic of ${at}` });
+      }
+    }
+    if (node.kind === "wait_until") {
+      const sample = { label: "sample", line: node.line, over: null };
+      add("sample", { ...sample, description: `latest sample of ${at}` });
+      add("samples", { ...sample, description: `samples of ${at}` });
+    }
     if (node.kind === "call") {
-      add(SAVE_AS_RE.exec(node.snippet)?.[1], {
-        label: "save_as",
-        description: `response saved by ${at}`,
-        line: node.line,
-        over: null,
-      });
+      for (const target of callTargets(node.snippet)) {
+        add(target, {
+          label: "save_as",
+          description: `set from the response of ${at}`,
+          line: node.line,
+          over: null,
+        });
+      }
     }
     node.children.forEach(visit);
   };
@@ -476,7 +548,7 @@ function markStale(chip: ValueChip | null, ctx: ValueContext): ValueChip | null 
   return {
     ...chip,
     stale: true,
-    detail: [...chip.detail, "May be out of date: the YAML doesn't parse right now."],
+    detail: [...chip.detail, `May be out of date: ${ctx.resolved.stale}.`],
   };
 }
 
@@ -546,4 +618,56 @@ export function overridesForDisplay(
     overrides: active,
     nextRun: Object.keys(nextRun).length > 0 ? nextRun : null,
   };
+}
+
+const TOP_LEVEL_KEY_RE = /^[^\s#-][^:]*:/;
+
+/**
+ * The top-level `vars:` block of the YAML text (the only part resolve_vars
+ * reads): parsing just that keeps the request cheap on a long sequence.
+ */
+export function extractVarsBlock(text: string): string {
+  const lines = text.split(/\r?\n/);
+  const start = lines.findIndex((line) => /^vars\s*:/.test(line));
+  if (start < 0) {
+    return "vars: {}\n";
+  }
+  let end = start + 1;
+  while (end < lines.length && !TOP_LEVEL_KEY_RE.test(lines[end])) {
+    end += 1;
+  }
+  return `${lines.slice(start, end).join("\n")}\n`;
+}
+
+/**
+ * Template text as written in the YAML, mapped to the text the runtime sees
+ * after YAML decoding, where they differ: escaped quotes in a double-quoted
+ * string, or a template folded over two lines.
+ */
+export function decodedTemplates(text: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  let doc;
+  try {
+    doc = parseDocument(text);
+  } catch {
+    return out;
+  }
+  visit(doc, {
+    Scalar(_key, node) {
+      if (!isScalar(node) || typeof node.value !== "string" || !node.range) {
+        return;
+      }
+      const raw = text.slice(node.range[0], node.range[1]).match(TEMPLATE_RE) ?? [];
+      const decoded = node.value.match(TEMPLATE_RE) ?? [];
+      if (raw.length !== decoded.length) {
+        return;
+      }
+      raw.forEach((rawTemplate, index) => {
+        if (rawTemplate !== decoded[index] && !has(out, rawTemplate)) {
+          out[rawTemplate] = decoded[index];
+        }
+      });
+    },
+  });
+  return out;
 }

@@ -125,18 +125,13 @@ function buildDecorations(view: EditorView, defs: Map<number, string>): Decorati
     return Decoration.none;
   }
   const doc = view.state.doc;
-  // While typing, the cursor's line has no chips, so they don't jump around.
-  const cursorLine =
-    view.hasFocus && !view.state.readOnly
-      ? doc.lineAt(view.state.selection.main.head).number
-      : null;
   const widgets: { pos: number; deco: Decoration }[] = [];
   for (const { from, to } of view.visibleRanges) {
     // Var definitions: a chip at the end of the line, instead of template chips.
     let line = doc.lineAt(from);
     for (;;) {
       const defName = defs.get(line.number);
-      if (defName && line.number !== cursorLine) {
+      if (defName) {
         const chip = describeVarDefinition(defName, ctx);
         if (chip) {
           widgets.push({
@@ -155,8 +150,7 @@ function buildDecorations(view: EditorView, defs: Map<number, string>): Decorati
     for (const match of text.matchAll(templateRegExp())) {
       const start = from + (match.index ?? 0);
       const end = start + match[0].length;
-      const endLine = doc.lineAt(end).number;
-      if (defs.has(doc.lineAt(start).number) || endLine === cursorLine) {
+      if (defs.has(doc.lineAt(start).number)) {
         continue;
       }
       const chip = describeTemplate(match[0], match[1], ctx);
@@ -193,8 +187,6 @@ const valueChipsPlugin = ViewPlugin.fromClass(
       if (
         update.docChanged ||
         update.viewportChanged ||
-        update.selectionSet ||
-        update.focusChanged ||
         contextChanged
       ) {
         this.decorations = buildDecorations(update.view, this.defs);
@@ -233,6 +225,11 @@ export function valueChipsTheme(): Extension {
     ".cm-ec-value-live, .cm-ec-value-runtime": { fontStyle: "italic" },
     ".cm-ec-value-runtime": { borderStyle: "dashed" },
     ".cm-ec-value-stale": { opacity: "0.5" },
+    // While typing, the cursor's line shows no chips, so they don't jump
+    // around. CodeMirror marks that line; no rebuild on cursor moves.
+    "&.cm-focused .cm-content[contenteditable='true'] .cm-activeLine .cm-ec-value": {
+      display: "none",
+    },
     ".cm-ec-value-fx": {
       fontFamily: "Georgia, serif",
       fontStyle: "italic",
