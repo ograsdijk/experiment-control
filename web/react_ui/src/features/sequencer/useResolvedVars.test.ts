@@ -76,7 +76,7 @@ describe("useResolvedVars", () => {
     // The result is found under the text as written in the editor too.
     expect(latest?.expressions['${a == \\"x\\"}']).toEqual({ ok: true, value: false });
     expect(latest?.vars).toEqual({ a: 1 });
-    expect(latest?.stale).toBeFalsy();
+    expect(latest?.staleReason).toBeFalsy();
   });
 
   it("keeps the last values marked stale while the YAML doesn't parse", async () => {
@@ -84,7 +84,7 @@ describe("useResolvedVars", () => {
     await render({ call, enabled: true, text: "vars: {a: 1}" });
     await render({ call, enabled: true, text: "vars: {a: [" });
     expect(latest?.vars).toEqual({ a: 1 });
-    expect(latest?.stale).toBe("the YAML doesn't parse right now");
+    expect(latest?.staleReason).toBe("the YAML doesn't parse right now");
   });
 
   it("says why values are stale", () => {

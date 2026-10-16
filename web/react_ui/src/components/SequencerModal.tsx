@@ -65,10 +65,8 @@ import type { TelemetrySignal } from "../types";
 import { activeStepLine, resolveActiveStep } from "../features/sequencer/active_step";
 import { SequencerOutlinePane } from "./SequencerOutlinePane";
 import { SequencerValuesContext } from "../features/sequencer/components/ValueChip";
-import {
-  buildRuntimeOrigins,
-  type ValueContext,
-} from "../features/sequencer/resolved_values";
+import type { ValueContext } from "../features/sequencer/resolved_values";
+import { buildRuntimeOrigins } from "../features/sequencer/runtime_origins";
 
 const LazySequencerYamlCodeEditor = lazy(
   () => import("../features/sequencer/components/SequencerYamlCodeEditor")

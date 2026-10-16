@@ -17,11 +17,10 @@ import { VALUE_CHIP_COLORS, OVERRIDE_DOT_COLOR } from "./components/ValueChip";
 import {
   describeTemplate,
   describeVarDefinition,
-  templateRegExp,
-  varsBlockRange,
   type ValueChip,
   type ValueContext,
 } from "./resolved_values";
+import { templateRegExp, varsBlockRange } from "./templates";
 
 export const setValueContext = StateEffect.define<ValueContext | null>();
 

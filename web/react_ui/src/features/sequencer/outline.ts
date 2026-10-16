@@ -363,6 +363,23 @@ function parseRepeatDetail(snippet: string): SequencerRepeatDetail {
   };
 }
 
+/**
+ * What a for loop runs over: the expression, or the generator with its scalar
+ * settings so their values show (`linspace(start: .., stop: .., num: ..)`).
+ */
+export function forSourceText(detail: SequencerForDetail): string | null {
+  if (detail.sourceMode === "direct") {
+    return compactValue(detail.directValue ?? "expression", 48);
+  }
+  if (!detail.generatorKind) {
+    return null;
+  }
+  const config = detail.iterableConfig
+    .filter((entry) => entry.value !== null && !entry.value.includes("\n"))
+    .map((entry) => `${entry.name}: ${compactValue(entry.value ?? "", 40)}`);
+  return `${detail.generatorKind}${config.length > 0 ? `(${config.join(", ")})` : ""}`;
+}
+
 const CALL_PARAMS_SHOWN = 2;
 
 /** `  frequency_hz: ${freq_hz}, n: 3 +2 more` for the first call params. */
@@ -427,18 +444,8 @@ function deriveSummary(
     const detail = node.forDetail;
     const binds = detail.bind.map((entry) => `${entry.name} -> ${entry.value ?? "n/a"}`);
     const bindSummary = binds.length > 0 ? binds.join(", ") : "bindings";
-    if (detail.sourceMode === "direct") {
-      return `${bindSummary} over ${compactValue(detail.directValue ?? "expression", 48)}`;
-    }
-    if (detail.generatorKind) {
-      // Scalar generator settings, so their values show: linspace(start: .., stop: .., num: ..).
-      const config = detail.iterableConfig
-        .filter((entry) => entry.value !== null && !entry.value.includes("\n"))
-        .map((entry) => `${entry.name}: ${compactValue(entry.value ?? "", 40)}`);
-      const args = config.length > 0 ? `(${config.join(", ")})` : "";
-      return `${bindSummary} over ${detail.generatorKind}${args}`;
-    }
-    return bindSummary;
+    const source = forSourceText(detail);
+    return source ? `${bindSummary} over ${source}` : bindSummary;
   }
   if (kind === "adaptive" && node.adaptiveDetail) {
     const detail = node.adaptiveDetail;

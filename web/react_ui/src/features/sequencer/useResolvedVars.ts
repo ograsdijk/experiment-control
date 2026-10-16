@@ -1,17 +1,12 @@
 import { useEffect, useRef, useState } from "react";
 import type { ApiResponse } from "../../api";
-import {
-  decodedTemplates,
-  extractTemplateExpressions,
-  extractVarsBlock,
-  normalizeResolvedVars,
-  type ResolvedVars,
-} from "./resolved_values";
+import { normalizeResolvedVars, type ResolvedVars } from "./resolved_values";
+import { decodedTemplates, extractTemplateExpressions, extractVarsBlock } from "./templates";
 
 export const RESOLVE_VARS_DEBOUNCE_MS = 400;
 
 function markResolvedStale(prev: ResolvedVars | null, reason: string): ResolvedVars | null {
-  return prev ? { ...prev, stale: reason } : prev;
+  return prev ? { ...prev, staleReason: reason } : prev;
 }
 
 /** Why a request failed, for the chips' "may be out of date" line. */

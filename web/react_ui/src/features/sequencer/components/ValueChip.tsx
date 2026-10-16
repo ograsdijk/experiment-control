@@ -2,11 +2,11 @@ import { Text, Tooltip } from "@mantine/core";
 import { createContext, Fragment, useContext, type CSSProperties, type ReactNode } from "react";
 import {
   describeTemplate,
-  splitTemplates,
   type ValueChip as ValueChipModel,
   type ValueChipKind,
   type ValueContext,
 } from "../resolved_values";
+import { splitTemplates } from "../templates";
 
 /** Resolved values for the chips; null when values are hidden or unknown. */
 export const SequencerValuesContext = createContext<ValueContext | null>(null);

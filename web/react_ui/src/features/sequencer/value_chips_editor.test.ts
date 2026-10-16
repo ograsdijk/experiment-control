@@ -1,10 +1,10 @@
 // @vitest-environment jsdom
 
-import { EditorState } from "@codemirror/state";
+import { EditorState, Text } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { afterEach, describe, expect, it } from "vitest";
 import { normalizeResolvedVars, type ValueContext } from "./resolved_values";
-import { setValueContext, valueChipsExtension } from "./value_chips_editor";
+import { setValueContext, valueChipsExtension, varDefinitionLines } from "./value_chips_editor";
 
 let view: EditorView | null = null;
 
@@ -46,5 +46,31 @@ describe("YAML value chips", () => {
       expressions: { "${a * 3}": { ok: true, value: 6 } },
     });
     expect(chipsFor(doc, { resolved, liveEnv: null, nextRunOverrides: null })).toEqual(["ƒ6", "ƒ6"]);
+  });
+});
+
+describe("varDefinitionLines", () => {
+  it("finds the top-level vars entries", () => {
+    const doc = Text.of([
+      "version: 1",
+      "vars:",
+      "  a: 1",
+      "  # note",
+      "  b: ${a * 2}",
+      "  gen_var:",
+      "    gen: {values: [1]}",
+      "steps:",
+      "  - sleep: ${a}",
+    ]);
+    expect(Array.from(varDefinitionLines(doc).entries())).toEqual([
+      [3, "a"],
+      [5, "b"],
+      [6, "gen_var"],
+    ]);
+  });
+
+  it("agrees with the request on where the block ends", () => {
+    const doc = Text.of(["vars:", "  a: 1", "---", "  b: 2", '"steps":', "  c: 3"]);
+    expect(Array.from(varDefinitionLines(doc).entries())).toEqual([[2, "a"]]);
   });
 });
