@@ -4,7 +4,7 @@ import enum
 import math
 import re
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any, Literal, TypeGuard, get_args
 
 import numpy as np
 
@@ -39,6 +39,11 @@ class Timestamp:
 
 
 ExtractorKind = Literal["scalar", "index", "key", "attr"]
+EXTRACTOR_KINDS: tuple[ExtractorKind, ...] = get_args(ExtractorKind)
+
+
+def is_extractor_kind(value: object) -> TypeGuard[ExtractorKind]:
+    return value in EXTRACTOR_KINDS
 
 
 @dataclass(frozen=True, slots=True)

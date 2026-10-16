@@ -53,6 +53,45 @@ class UnknownStepKeyTests(unittest.TestCase):
             "    disabled: true\n"
         )
 
+    def test_unknown_extractor_kind_rejected_at_load(self) -> None:
+        with self.assertRaisesRegex(
+            TypeError,
+            r"extract\.kind must be one of scalar, index, key, attr, got 'kye'",
+        ):
+            _load(
+                "steps:\n"
+                "  - call: {device: d, action: a}\n"
+                "    extract: {kind: kye, ref: x}\n"
+            )
+
+    def test_assign_extractor_kind_rejected_at_load(self) -> None:
+        with self.assertRaisesRegex(TypeError, r"assign\.f\.kind must be one of"):
+            _load(
+                "steps:\n"
+                "  - call: {device: d, action: a}\n"
+                "    assign: {f: {kind: bogus}}\n"
+            )
+
+    def test_extractor_ref_required_at_load(self) -> None:
+        with self.assertRaisesRegex(
+            TypeError, r"extract\.ref is required for kind 'key'"
+        ):
+            _load(
+                "steps:\n"
+                "  - call: {device: d, action: a}\n"
+                "    extract: {kind: key}\n"
+            )
+
+    def test_attr_extractor_ref_must_be_string(self) -> None:
+        with self.assertRaisesRegex(
+            TypeError, r"extract\.ref must be a string for kind 'attr'"
+        ):
+            _load(
+                "steps:\n"
+                "  - call: {device: d, action: a}\n"
+                "    extract: {kind: attr, ref: 3}\n"
+            )
+
     def test_wait_until_unknown_key(self) -> None:
         with self.assertRaisesRegex(TypeError, "did you mean 'timeout_s'"):
             _load("steps:\n  - wait_until: {timeout: 3, condition: true}\n")

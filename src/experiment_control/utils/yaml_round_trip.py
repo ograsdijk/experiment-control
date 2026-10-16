@@ -33,6 +33,8 @@ import io
 import re
 from typing import Any
 
+import yaml
+
 # Keys that identify an item within a list, most specific first. Matching
 # on these is what lets an edit find the node it belongs to instead of
 # rewriting the list positionally and dragging every comment one slot up.
@@ -46,16 +48,10 @@ _DASH_LINE = re.compile(r"^(\s*)-\s")
 
 
 def _plain_dump(payload: Any) -> str:
-    try:
-        import yaml  # type: ignore[import-not-found]
-    except Exception as exc:  # pragma: no cover - dependency error
-        raise RuntimeError(f"PyYAML missing: {exc}") from exc
-    return str(yaml.safe_dump(payload, sort_keys=False))
+    return yaml.safe_dump(payload, sort_keys=False)
 
 
 def _plain_load(text: str) -> Any:
-    import yaml  # type: ignore[import-not-found]
-
     return yaml.safe_load(text)
 
 
@@ -107,19 +103,19 @@ def detect_indent(text: str) -> dict[str, int]:
 def _round_trip_yaml(text: str) -> Any:
     from ruamel.yaml import YAML  # type: ignore[import-not-found]
 
-    yaml = YAML()
-    yaml.preserve_quotes = True
+    rt_yaml = YAML()
+    rt_yaml.preserve_quotes = True
     # Long flow mappings are how these files stay readable; re-wrapping
     # them at 80 columns would be its own kind of destruction.
-    yaml.width = 4096
+    rt_yaml.width = 4096
     indent = detect_indent(text)
-    yaml.indent(
+    rt_yaml.indent(
         mapping=indent["mapping"],
         sequence=indent["sequence"],
         offset=indent["offset"],
     )
-    yaml.explicit_start = text.lstrip().startswith("---")
-    return yaml
+    rt_yaml.explicit_start = text.lstrip().startswith("---")
+    return rt_yaml
 
 
 def _identity_key(existing: Any, payload: list[Any]) -> str | None:
@@ -241,8 +237,8 @@ def dump_yaml_preserving(payload: Any, existing_text: str | None) -> str:
     if not existing_text or not existing_text.strip():
         return _plain_dump(payload)
     try:
-        yaml = _round_trip_yaml(existing_text)
-        document = yaml.load(existing_text)
+        rt_yaml = _round_trip_yaml(existing_text)
+        document = rt_yaml.load(existing_text)
     except Exception:
         return _plain_dump(payload)
     if not isinstance(document, type(payload)):
@@ -250,7 +246,7 @@ def dump_yaml_preserving(payload: Any, existing_text: str | None) -> str:
     try:
         patched = _patch(document, payload)
         buffer = io.StringIO()
-        yaml.dump(patched, buffer)
+        rt_yaml.dump(patched, buffer)
         text = buffer.getvalue()
     except Exception:
         return _plain_dump(payload)
