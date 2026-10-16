@@ -64,6 +64,11 @@ import type { StreamCatalogEntry } from "../types";
 import type { TelemetrySignal } from "../types";
 import { activeStepLine, resolveActiveStep } from "../features/sequencer/active_step";
 import { SequencerOutlinePane } from "./SequencerOutlinePane";
+import { SequencerValuesContext } from "../features/sequencer/components/ValueChip";
+import {
+  buildRuntimeOrigins,
+  type ValueContext,
+} from "../features/sequencer/resolved_values";
 
 const LazySequencerYamlCodeEditor = lazy(
   () => import("../features/sequencer/components/SequencerYamlCodeEditor")
@@ -181,6 +186,8 @@ type Props = {
   latestSignalsByDevice: Record<string, Record<string, TelemetrySignal>>;
   colorScheme: "light" | "dark";
   diagnostics: ReadonlyArray<SequencerDiagnostic>;
+  /** Resolved `${...}` values for the Steps and YAML tabs. */
+  valueContext: ValueContext | null;
   onJumpToDiagnostic: (
     line: number | null,
     column: number | null
@@ -268,6 +275,7 @@ export function SequencerModal({
   latestSignalsByDevice,
   colorScheme,
   diagnostics,
+  valueContext,
   onJumpToDiagnostic,
 }: Props) {
   const [activeTab, setActiveTab] = useState<"steps" | "vars" | "yaml">("steps");
@@ -344,6 +352,20 @@ export function SequencerModal({
     }
   }, []);
   const stopFollowing = useCallback(() => setFollow(false), [setFollow]);
+  const [showValues, setShowValuesState] = useState(readShowValuesPreference);
+  const setShowValues = useCallback((value: boolean) => {
+    setShowValuesState(value);
+    try {
+      window.localStorage.setItem(SHOW_VALUES_STORAGE_KEY, value ? "1" : "0");
+    } catch {
+      // Storage can be blocked; the switch still works for this session.
+    }
+  }, []);
+  const runtimeOrigins = useMemo(() => buildRuntimeOrigins(outline), [outline]);
+  const shownValues = useMemo(
+    () => (showValues && valueContext ? { ...valueContext, runtimeOrigins } : null),
+    [showValues, valueContext, runtimeOrigins]
+  );
 
   const jumpToDiagnostic = (diag: SequencerDiagnostic) => {
     if (diag.line == null) {
@@ -1108,6 +1130,7 @@ export function SequencerModal({
           </ScrollArea>
 
           {/* Main: steps / variables / YAML, each using the full height. */}
+          <SequencerValuesContext.Provider value={shownValues}>
           <Tabs
             value={activeTab}
             onChange={(value) => setActiveTab((value as typeof activeTab) ?? "steps")}
@@ -1129,11 +1152,19 @@ export function SequencerModal({
               <Tabs.Tab value="yaml">YAML</Tabs.Tab>
               <Switch
                 size="xs"
+                label="Values"
+                title="Show the resolved value of each ${...} next to it."
+                checked={showValues}
+                onChange={(event) => setShowValues(event.currentTarget.checked)}
+                style={{ marginLeft: "auto", alignSelf: "center", marginRight: 12 }}
+              />
+              <Switch
+                size="xs"
                 label="Follow"
                 title="Scroll to the running step as it changes. Scrolling yourself turns this off."
                 checked={follow}
                 onChange={(event) => setFollow(event.currentTarget.checked)}
-                style={{ marginLeft: "auto", alignSelf: "center" }}
+                style={{ alignSelf: "center" }}
               />
             </Tabs.List>
             <Tabs.Panel value="steps" pt="sm" style={tabPanelStyle(activeTab === "steps")}>
@@ -1207,12 +1238,14 @@ export function SequencerModal({
                       activeStep={activeStep}
                       follow={follow && activeTab === "yaml"}
                       onUserScroll={stopFollowing}
+                      values={shownValues}
                     />
                   </Suspense>
                 </div>
               </Stack>
             </Tabs.Panel>
           </Tabs>
+          </SequencerValuesContext.Provider>
         </div>
       </Stack>
     </Modal>
@@ -1220,6 +1253,16 @@ export function SequencerModal({
 }
 
 const FOLLOW_STORAGE_KEY = "experiment-control.sequencer.followActiveStep";
+const SHOW_VALUES_STORAGE_KEY = "experiment-control.sequencer.showValues";
+
+/** Values are shown unless turned off in this browser. */
+function readShowValuesPreference(): boolean {
+  try {
+    return window.localStorage.getItem(SHOW_VALUES_STORAGE_KEY) !== "0";
+  } catch {
+    return true;
+  }
+}
 
 function readFollowPreference(): boolean {
   try {

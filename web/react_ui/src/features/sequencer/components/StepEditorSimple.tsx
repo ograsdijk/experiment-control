@@ -33,6 +33,7 @@ export function SleepStepEditor({
         <SeqTextInput
           size="xs"
           label="Duration"
+          valueUnit="s"
           value={renderValue(node.sleepDetail.duration)}
           onChange={(value) =>
             onYamlTextChange(

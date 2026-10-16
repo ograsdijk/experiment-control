@@ -30,6 +30,8 @@ import {
   type ActiveStepRange,
 } from "../active_step_editor";
 import { yamlTokenColor } from "../yaml_colors";
+import type { ValueContext } from "../resolved_values";
+import { setValueContext, valueChipsExtension, valueChipsTheme } from "../value_chips_editor";
 
 export type SequencerYamlCodeEditorProps = {
   value: string;
@@ -44,6 +46,8 @@ export type SequencerYamlCodeEditorProps = {
   follow?: boolean;
   /** The user scrolled the editor themselves (wheel, touch, scrollbar, paging keys). */
   onUserScroll?: () => void;
+  /** Resolved `${...}` values to show after the text (null: none). */
+  values?: ValueContext | null;
 };
 
 const SCROLL_KEYS = new Set(["PageUp", "PageDown"]);
@@ -88,6 +92,7 @@ function SequencerYamlCodeEditorImpl(
     activeStep = null,
     follow = false,
     onUserScroll,
+    values = null,
   }: SequencerYamlCodeEditorProps,
   ref: ForwardedRef<SequencerYamlEditorHandle>
 ) {
@@ -166,6 +171,8 @@ function SequencerYamlCodeEditorImpl(
       ),
       activeStepExtension(),
       activeStepTheme(isDark),
+      valueChipsExtension(),
+      valueChipsTheme(),
       placeholder("Paste or upload sequence YAML"),
       EditorView.theme({
         "&": {
@@ -243,6 +250,14 @@ function SequencerYamlCodeEditorImpl(
     }
     view.dispatch({ effects: setActiveStepRange.of(activeRef.current) });
   }, [view, activeKey, extensions]);
+
+  // Rebuilt extensions start without values: send them again then too.
+  useEffect(() => {
+    if (!view) {
+      return;
+    }
+    view.dispatch({ effects: setValueContext.of(values) });
+  }, [view, values, extensions]);
 
   useEffect(() => {
     const range = activeRef.current;

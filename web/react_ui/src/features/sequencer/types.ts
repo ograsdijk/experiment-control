@@ -34,6 +34,10 @@ export type SequencerStatus = {
   pause?: SequencerPauseInfo | null;
   /** Summary of sequencer.run_events; refetch the list when `seq` changes. */
   runEvents?: SequencerRunEventsSummary | null;
+  /** Overrides the current or last run started with. */
+  varsOverride?: Record<string, unknown> | null;
+  /** Scalar runtime variables (loop variables, assign, extract) of the run. */
+  env?: Record<string, unknown> | null;
 };
 
 export type SequencerPauseTrigger = {

@@ -9,6 +9,7 @@ import type { SequencerDiagnostic } from "../types";
 import type { CapabilityMember } from "../../../types";
 import type { StreamCatalogEntry } from "../../../types";
 import type { TelemetrySignal } from "../../../types";
+import { TextWithValues } from "./ValueChip";
 import type { SequencerStepOutlineNode } from "../types";
 
 type Props = {
@@ -133,7 +134,7 @@ export function SequencerSelectionPanel({
               </Stack>
             )}
             <Text size="sm" fw={600}>
-              {selectedStep.summary ?? selectedStep.kind}
+              <TextWithValues text={selectedStep.summary ?? selectedStep.kind} />
             </Text>
             {isEditableStep(selectedStep) ? (
               <EditableStepInspector
@@ -228,7 +229,7 @@ export function SequencerSelectionPanel({
                             </Text>
                           </Group>
                           <Text size="xs" fw={500} lineClamp={1}>
-                            {child.summary ?? child.kind}
+                            <TextWithValues text={child.summary ?? child.kind} />
                           </Text>
                         </Stack>
                       </button>

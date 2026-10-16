@@ -457,6 +457,7 @@ export function AppModalsLayer({
         latestSignalsByDevice={latestSignalsByDevice}
         colorScheme={colorScheme}
         diagnostics={sequencerController.sequencerDiagnostics}
+        valueContext={sequencerController.sequencerValueContext}
         onJumpToDiagnostic={sequencerController.jumpToSequencerDiagnostic}
         />
       ) : null}

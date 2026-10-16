@@ -351,6 +351,21 @@ function parseRepeatDetail(snippet: string): SequencerRepeatDetail {
   };
 }
 
+const CALL_PARAMS_SHOWN = 2;
+
+/** `  frequency_hz: ${freq_hz}, n: 3 +2 more` for the first call params. */
+function callParamsSummary(params: SequencerOutlineMetadataEntry[]): string {
+  const shown = params
+    .filter((entry) => entry.value !== null && entry.value !== "")
+    .slice(0, CALL_PARAMS_SHOWN)
+    .map((entry) => `${entry.name}: ${compactText(entry.value ?? "", 40)}`);
+  if (shown.length === 0) {
+    return "";
+  }
+  const more = params.length - shown.length;
+  return `  ${shown.join(", ")}${more > 0 ? ` +${more} more` : ""}`;
+}
+
 function deriveSummary(
   node: SequencerStepOutlineNode,
   inlineRemainder: string
@@ -360,10 +375,10 @@ function deriveSummary(
   const inline = compactText(inlineRemainder.replace(/^#.*$/, "").trim());
 
   if (kind === "call" && node.callDetail) {
-    const { device, process, action } = node.callDetail;
+    const { device, process, action, params } = node.callDetail;
     const target = device || process;
     if (target && action) {
-      return `${target}.${action}`;
+      return `${target}.${action}${callParamsSummary(params)}`;
     }
     if (target || action) {
       return target || action;
@@ -404,7 +419,12 @@ function deriveSummary(
       return `${bindSummary} over ${compactText(detail.directValue ?? "expression", 48)}`;
     }
     if (detail.generatorKind) {
-      return `${bindSummary} over ${detail.generatorKind}`;
+      // Scalar generator settings, so their values show: linspace(start: .., stop: .., num: ..).
+      const config = detail.iterableConfig
+        .filter((entry) => entry.value !== null && !entry.value.includes("\n"))
+        .map((entry) => `${entry.name}: ${compactText(entry.value ?? "", 40)}`);
+      const args = config.length > 0 ? `(${config.join(", ")})` : "";
+      return `${bindSummary} over ${detail.generatorKind}${args}`;
     }
     return bindSummary;
   }
@@ -421,7 +441,9 @@ function deriveSummary(
     }
   }
   if (kind === "wait_until" && node.waitUntilDetail?.timeoutS) {
-    return `timeout ${node.waitUntilDetail.timeoutS}s`;
+    const timeout = node.waitUntilDetail.timeoutS;
+    // A template gets its unit from the value chip.
+    return timeout.includes("${") ? `timeout ${timeout}` : `timeout ${timeout}s`;
   }
   if (kind === "if" && node.ifDetail) {
     const parts = [`then ${node.ifDetail.thenCount}`];

@@ -208,6 +208,7 @@ export function WaitUntilStepEditor({
         <SeqTextInput
           size="xs"
           label="Timeout (s)"
+          valueUnit="s"
           value={renderValue(detail.timeoutS)}
           onChange={(value) =>
             updateWaitUntil(
