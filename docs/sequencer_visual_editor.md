@@ -82,8 +82,10 @@ Each `${...}` in the Steps and YAML tabs shows its value next to it, without cha
 - **Plain var:** the name and value, e.g. `freq_settle_s 0.05 s`. Sleep durations and `wait_until` timeouts get `s`.
 - **Run override:** orange, with a dot. The tooltip gives the value without overrides. While a run is going, chips show the overrides it started with, and a sidebar override that differs is listed as "Next run".
 - **Derived var** (written as `${...}` in `vars`): violet with `ƒ`. The tooltip and the step editor show the formula, the formula with values filled in, and the result. A derived var that changes because of an override also gets the orange dot.
-- **Runtime name** (loop variable, loop index, `assign`, `save_as`, adaptive parameter): cyan, labelled `loop`, `index`, `assign`, ... The tooltip says which step sets it and, for a loop, what it runs over. While the editor holds the running sequence, it shows the current value in green instead.
+- **Runtime name** (loop variable, loop index, `assign`, `save_as`, adaptive parameter): cyan, labelled `loop`, `index`, `assign`, ... The tooltip says which step sets it and, for a loop, what it runs over. While the editor holds the running sequence, it shows the current value in green instead. A var built from such a name (`label: run_${i}`) is shown the same way, with `ƒ`.
 - **Error:** red, with the message.
+
+While the YAML doesn't parse, the last values stay but are dimmed and marked as possibly out of date. Closing the modal drops them.
 
 Numbers use about 5 significant figures with an exponent that is a multiple of 3 (`985.5e6`); tooltips show the full value. Lists and generators are summarized (`list[3]`, `linspace ×30`).
 

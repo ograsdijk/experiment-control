@@ -57,6 +57,10 @@ describe("formatNumber", () => {
     expect(formatNumber(2.5e-6)).toBe("2.5e-6");
     expect(formatNumber(-3e7)).toBe("-30e6");
     expect(formatNumber(999_999_999.7)).toBe("1e9");
+    // toPrecision's own exponent form starts at 1e5.
+    expect(formatNumber(12_345.67)).toBe("12346");
+    expect(formatNumber(123_456.7)).toBe("123.46e3");
+    expect(formatNumber(999_999.7)).toBe("1e6");
   });
 });
 
@@ -125,6 +129,41 @@ describe("describeTemplate", () => {
     expect(describeTemplate("${bad / 0}", "bad / 0", ctx())).toMatchObject({ kind: "error" });
     expect(describeTemplate("${unknown}", "unknown", ctx())).toBeNull();
     expect(describeTemplate("${settle_s}", "settle_s", ctx({ resolved: null }))).toBeNull();
+  });
+});
+
+describe("vars that read runtime names", () => {
+  const withLabel = normalizeResolvedVars({
+    vars: { label: "run_${i}" },
+    derived: ["label"],
+    runtime_vars: { label: ["i"] },
+    expressions: {},
+  });
+
+  it("shows them as runtime, with where the name comes from", () => {
+    const chip = describeTemplate(
+      "${label}",
+      "label",
+      ctx({
+        resolved: withLabel,
+        runtimeOrigins: { i: { label: "loop", description: "loop variable of for at L3", line: 3, over: null } },
+      })
+    );
+    expect(chip).toMatchObject({ kind: "runtime", value: "loop", formula: true });
+    expect(chip?.detail).toEqual([
+      'label = "run_${i}"',
+      "i: loop variable of for at L3",
+      "Value known once the step runs.",
+    ]);
+    expect(describeVarDefinition("label", ctx({ resolved: withLabel }))?.kind).toBe("runtime");
+  });
+});
+
+describe("stale values", () => {
+  it("dims chips and says why", () => {
+    const chip = describeTemplate("${settle_s}", "settle_s", ctx({ resolved: { ...resolved!, stale: true } }));
+    expect(chip?.stale).toBe(true);
+    expect(chip?.detail[chip.detail.length - 1]).toMatch(/out of date/);
   });
 });
 

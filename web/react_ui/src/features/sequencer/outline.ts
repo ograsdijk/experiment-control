@@ -74,6 +74,11 @@ type StepContainerContext = {
   listIndent: number | null;
 };
 
+/** Shortened text, but never cut inside a `${...}`: its value chip needs it whole. */
+function compactValue(value: string, maxLength: number): string {
+  return value.includes("${") ? value.replace(/\s+/g, " ").trim() : compactText(value, maxLength);
+}
+
 function compactText(value: string, maxLength = 96): string {
   const compact = value.replace(/\s+/g, " ").trim();
   if (compact.length <= maxLength) {
@@ -355,14 +360,14 @@ const CALL_PARAMS_SHOWN = 2;
 
 /** `  frequency_hz: ${freq_hz}, n: 3 +2 more` for the first call params. */
 function callParamsSummary(params: SequencerOutlineMetadataEntry[]): string {
-  const shown = params
-    .filter((entry) => entry.value !== null && entry.value !== "")
+  const withValue = params.filter((entry) => entry.value !== null && entry.value !== "");
+  const shown = withValue
     .slice(0, CALL_PARAMS_SHOWN)
-    .map((entry) => `${entry.name}: ${compactText(entry.value ?? "", 40)}`);
+    .map((entry) => `${entry.name}: ${compactValue(entry.value ?? "", 40)}`);
   if (shown.length === 0) {
     return "";
   }
-  const more = params.length - shown.length;
+  const more = withValue.length - shown.length;
   return `  ${shown.join(", ")}${more > 0 ? ` +${more} more` : ""}`;
 }
 
@@ -422,7 +427,7 @@ function deriveSummary(
       // Scalar generator settings, so their values show: linspace(start: .., stop: .., num: ..).
       const config = detail.iterableConfig
         .filter((entry) => entry.value !== null && !entry.value.includes("\n"))
-        .map((entry) => `${entry.name}: ${compactText(entry.value ?? "", 40)}`);
+        .map((entry) => `${entry.name}: ${compactValue(entry.value ?? "", 40)}`);
       const args = config.length > 0 ? `(${config.join(", ")})` : "";
       return `${bindSummary} over ${detail.generatorKind}${args}`;
     }

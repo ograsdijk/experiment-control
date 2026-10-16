@@ -8,6 +8,10 @@ import {
 
 export const RESOLVE_VARS_DEBOUNCE_MS = 400;
 
+function markResolvedStale(prev: ResolvedVars | null): ResolvedVars | null {
+  return prev && !prev.stale ? { ...prev, stale: true } : prev;
+}
+
 type CallProcessFn = (
   processId: string,
   action: string,
@@ -17,7 +21,8 @@ type CallProcessFn = (
 /**
  * Resolve the editor's vars (with overrides) and its `${...}` expressions via
  * `sequencer.resolve_vars`, shortly after the text or overrides stop changing.
- * The last good result is kept while the YAML doesn't parse.
+ * While a request fails (the YAML doesn't parse) the last values are kept,
+ * marked stale. They are dropped when the modal closes or the process changes.
  */
 export function useResolvedVars({
   callProcessFn,
@@ -37,6 +42,11 @@ export function useResolvedVars({
   const overridesKey = JSON.stringify(overrides);
   const expressions = useMemo(() => extractTemplateExpressions(yamlText), [yamlText]);
 
+  // A closed modal or another process: the old values belong to other text.
+  useEffect(() => {
+    setResolved(null);
+  }, [enabled, processId]);
+
   useEffect(() => {
     if (!enabled || !processId) {
       return;
@@ -53,16 +63,16 @@ export function useResolvedVars({
       }
       callProcessFn(processId, "sequencer.resolve_vars", params)
         .then((resp) => {
-          if (requestId !== requestIdRef.current || !resp.ok) {
+          if (requestId !== requestIdRef.current) {
             return;
           }
-          const next = normalizeResolvedVars(resp.result);
-          if (next) {
-            setResolved(next);
-          }
+          const next = resp.ok ? normalizeResolvedVars(resp.result) : null;
+          setResolved((prev) => next ?? markResolvedStale(prev));
         })
         .catch(() => {
-          // Keep the last values; an older backend has no resolve_vars.
+          if (requestId === requestIdRef.current) {
+            setResolved(markResolvedStale);
+          }
         });
     }, RESOLVE_VARS_DEBOUNCE_MS);
     return () => window.clearTimeout(timer);

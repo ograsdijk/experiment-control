@@ -45,7 +45,7 @@ class ValueChipWidget extends WidgetType {
 
   private key(): string {
     const { chip } = this;
-    return [chip.kind, chip.value, chip.formula, chip.overrideDot, this.definition, ...chip.detail].join("\u0000");
+    return [chip.kind, chip.value, chip.formula, chip.overrideDot, chip.stale, this.definition, ...chip.detail].join("\u0000");
   }
 
   eq(other: ValueChipWidget): boolean {
@@ -55,7 +55,7 @@ class ValueChipWidget extends WidgetType {
   toDOM(): HTMLElement {
     const { chip } = this;
     const el = document.createElement("span");
-    el.className = `cm-ec-value cm-ec-value-${chip.kind}`;
+    el.className = `cm-ec-value cm-ec-value-${chip.kind}${chip.stale ? " cm-ec-value-stale" : ""}`;
     el.title = chip.detail.join("\n");
     el.setAttribute("aria-label", chip.detail.join(", "));
     if (chip.formula) {
@@ -227,6 +227,7 @@ export function valueChipsTheme(): Extension {
     },
     ".cm-ec-value-live, .cm-ec-value-runtime": { fontStyle: "italic" },
     ".cm-ec-value-runtime": { borderStyle: "dashed" },
+    ".cm-ec-value-stale": { opacity: "0.5" },
     ".cm-ec-value-fx": {
       fontFamily: "Georgia, serif",
       fontStyle: "italic",

@@ -96,9 +96,19 @@ function kindColor(kind: string): string {
   }
 }
 
-/** Unit of the value a step's summary shows (sleep 0.05 s, timeout 5 s). */
-function summaryUnit(kind: string): string | undefined {
-  return kind === "sleep" || kind === "wait_until" ? "s" : undefined;
+/**
+ * Unit of the value a step's summary shows (sleep 0.05 s, timeout 5 s); only
+ * for the duration/timeout summary, not e.g. a wait_until's condition text.
+ */
+export function summaryUnit(node: SequencerStepOutlineNode): string | undefined {
+  const summary = node.summary ?? "";
+  if (node.kind === "sleep" && summary.startsWith("sleep ")) {
+    return "s";
+  }
+  if (node.kind === "wait_until" && summary.startsWith("timeout ")) {
+    return "s";
+  }
+  return undefined;
 }
 
 type SiblingInfoMap = Record<
@@ -321,7 +331,7 @@ function OutlineRow({
               ) : null}
             </Group>
             <Text size="xs" fw={500} lineClamp={3} style={{ lineHeight: 1.7 }}>
-              <TextWithValues text={node.summary ?? node.kind} unit={summaryUnit(node.kind)} />
+              <TextWithValues text={node.summary ?? node.kind} unit={summaryUnit(node)} />
             </Text>
           </Stack>
         </button>

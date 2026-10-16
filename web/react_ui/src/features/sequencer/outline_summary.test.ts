@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { buildSequencerStepOutline } from "./outline";
+import { summaryUnit } from "./components/SequencerStepTree";
 
 function summaries(yamlText: string): Array<string | null> {
   return buildSequencerStepOutline(yamlText).map((node) => node.summary);
@@ -53,6 +54,21 @@ describe("step summaries", () => {
     );
   });
 
+  it("doesn't cut a long template or count empty params", () => {
+    const yamlText = [
+      "steps:",
+      "  - call:",
+      "      device: synth",
+      "      action: sweep",
+      "      params:",
+      "        empty:",
+      "        start_hz: ${freq_center_hz - 0.5 * sweep_step_hz * (n_steps - 1)}",
+    ].join("\n");
+    expect(summaries(yamlText)).toEqual([
+      "synth.sweep  start_hz: ${freq_center_hz - 0.5 * sweep_step_hz * (n_steps - 1)}",
+    ]);
+  });
+
   it("leaves the unit of a templated wait_until timeout to the value chip", () => {
     const yamlText = [
       "steps:",
@@ -64,5 +80,20 @@ describe("step summaries", () => {
       "      timeout_s: 5",
     ].join("\n");
     expect(summaries(yamlText)).toEqual(["timeout ${t_s}", "timeout 5s"]);
+  });
+
+  it("puts seconds only on a sleep duration or wait_until timeout", () => {
+    const nodes = buildSequencerStepOutline(
+      [
+        "steps:",
+        "  - sleep: ${settle_s}",
+        "  - wait_until:",
+        "      condition: {always: true}",
+        "      timeout_s: ${t_s}",
+        "  - wait_until:",
+        "      condition: {gt: ['${power_dbm}', '${threshold}']}",
+      ].join("\n")
+    );
+    expect(nodes.map(summaryUnit)).toEqual(["s", "s", undefined]);
   });
 });

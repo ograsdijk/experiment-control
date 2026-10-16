@@ -83,6 +83,7 @@ export function ValueChip({ chip, unit }: { chip: ValueChipModel; unit?: string 
     verticalAlign: "baseline",
     cursor: "help",
     maxWidth: "100%",
+    opacity: chip.stale ? 0.5 : undefined,
   };
   const showValue = chip.value !== "";
   return (

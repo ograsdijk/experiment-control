@@ -19,8 +19,12 @@ export type ResolvedVars = {
   formulas: Record<string, string>;
   derived: ReadonlySet<string>;
   overridden: ReadonlySet<string>;
+  /** Vars that read names only set while running (`label: run_${i}`), with those names. */
+  runtimeVars: Record<string, string[]>;
   errors: Record<string, string>;
   expressions: Record<string, ExpressionResult>;
+  /** The latest request failed (e.g. the YAML doesn't parse): values may be out of date. */
+  stale?: boolean;
 };
 
 export type ValueChipKind = "vars" | "override" | "derived" | "runtime" | "live" | "error";
@@ -37,6 +41,8 @@ export type ValueChip = {
   overrideDot: boolean;
   /** Tooltip lines. */
   detail: string[];
+  /** Values may be out of date (shown dimmed). */
+  stale?: boolean;
 };
 
 /** Where a name that only exists while running is set. */
@@ -142,6 +148,9 @@ export function normalizeResolvedVars(raw: unknown): ResolvedVars | null {
     formulas: strings(rec.formulas),
     derived: new Set(stringList(rec.derived)),
     overridden: new Set(stringList(rec.overridden)),
+    runtimeVars: Object.fromEntries(
+      Object.entries(asRecord(rec.runtime_vars) ?? {}).map(([key, value]) => [key, stringList(value)])
+    ),
     errors: strings(rec.errors),
     expressions,
   };
@@ -184,7 +193,8 @@ export function formatNumber(value: number): string {
   if (Number.isInteger(value) && abs < 1e6) {
     return String(value);
   }
-  if (abs >= 1e-3 && abs < 1e6) {
+  // toPrecision(5) switches to its own exponent form from 1e5 on.
+  if (abs >= 1e-3 && abs < 1e5) {
     return trimZeros(value.toPrecision(SIG_FIGS));
   }
   let exponent = Math.floor(Math.log10(abs) / 3) * 3;
@@ -286,6 +296,22 @@ function varChip(name: string, ctx: ValueContext, resolved: ResolvedVars): Value
   const error = resolved.errors[name];
   if (error) {
     return { kind: "error", name, value: "error", formula: false, overrideDot: false, detail: [error] };
+  }
+  const runtimeNames = resolved.runtimeVars[name];
+  if (runtimeNames) {
+    const single = runtimeNames.length === 1 ? ctx.runtimeOrigins?.[runtimeNames[0]] : undefined;
+    return {
+      kind: "runtime",
+      name,
+      value: single?.label ?? "runtime",
+      formula: true,
+      overrideDot: false,
+      detail: [
+        `${name} = ${formatFull(resolved.vars[name])}`,
+        ...originLines(runtimeNames, ctx),
+        "Value known once the step runs.",
+      ],
+    };
   }
   const overridden = resolved.overridden.has(name);
   const derived = resolved.derived.has(name) && !overridden;
@@ -422,6 +448,21 @@ export function buildRuntimeOrigins(
  * (values not resolved yet).
  */
 export function describeTemplate(text: string, inner: string, ctx: ValueContext): ValueChip | null {
+  return markStale(describeTemplateValue(text, inner, ctx), ctx);
+}
+
+function markStale(chip: ValueChip | null, ctx: ValueContext): ValueChip | null {
+  if (!chip || !ctx.resolved?.stale || chip.kind === "live") {
+    return chip;
+  }
+  return {
+    ...chip,
+    stale: true,
+    detail: [...chip.detail, "May be out of date: the YAML doesn't parse right now."],
+  };
+}
+
+function describeTemplateValue(text: string, inner: string, ctx: ValueContext): ValueChip | null {
   const resolved = ctx.resolved;
   if (!resolved) {
     return null;
@@ -462,8 +503,9 @@ export function describeVarDefinition(name: string, ctx: ValueContext): ValueChi
     resolved.overridden.has(name) ||
     name in resolved.baseVars ||
     name in resolved.errors ||
+    name in resolved.runtimeVars ||
     Boolean(ctx.nextRunOverrides && name in ctx.nextRunOverrides);
-  return show ? varChip(name, ctx, resolved) : null;
+  return show ? markStale(varChip(name, ctx, resolved), ctx) : null;
 }
 
 /** Runtime overrides apply to the running sequence; sidebar rows wait for the next start. */
