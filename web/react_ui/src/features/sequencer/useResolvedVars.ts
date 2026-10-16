@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { ApiResponse } from "../../api";
 import {
   decodedTemplates,
@@ -72,7 +72,6 @@ export function useResolvedVars({
   const [resolved, setResolved] = useState<ResolvedVars | null>(null);
   const requestIdRef = useRef(0);
   const overridesKey = JSON.stringify(overrides);
-  const request = useMemo(() => expressionRequest(yamlText), [yamlText]);
 
   // A closed modal or another process: the old values belong to other text.
   useEffect(() => {
@@ -85,6 +84,8 @@ export function useResolvedVars({
     }
     const requestId = ++requestIdRef.current;
     const timer = window.setTimeout(() => {
+      // Parsed here, once typing stops, not on every keystroke.
+      const request = expressionRequest(yamlText);
       const params: Record<string, unknown> = {
         vars_override: JSON.parse(overridesKey) as Record<string, unknown>,
         expressions: request.send,
@@ -113,7 +114,7 @@ export function useResolvedVars({
       // A reply that arrives after this (newer text, a closed modal) is dropped.
       requestIdRef.current += 1;
     };
-  }, [callProcessFn, processId, enabled, yamlText, overridesKey, request]);
+  }, [callProcessFn, processId, enabled, yamlText, overridesKey]);
 
   return enabled ? resolved : null;
 }

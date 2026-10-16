@@ -620,23 +620,39 @@ export function overridesForDisplay(
   };
 }
 
-const TOP_LEVEL_KEY_RE = /^[^\s#-][^:]*:/;
+/**
+ * Lines [start, end) of the top-level `vars:` block. It ends at the next line
+ * that starts in the first column (another key, `---`, `...`), except
+ * comments. Shared by the request and the YAML editor, so both agree.
+ */
+export function varsBlockRange(lines: ReadonlyArray<string>): { start: number; end: number } | null {
+  const start = lines.findIndex((line) => /^vars\s*:/.test(line));
+  if (start < 0) {
+    return null;
+  }
+  let end = start + 1;
+  while (end < lines.length && !(/^\S/.test(lines[end]) && !lines[end].startsWith("#"))) {
+    end += 1;
+  }
+  return { start, end };
+}
+
+/** A YAML alias (`*name`): it needs its anchor, which may be outside the block. */
+const YAML_ALIAS_RE = /(?:^|[\s[{,:-])\*[^\s,[\]{}]+/m;
 
 /**
- * The top-level `vars:` block of the YAML text (the only part resolve_vars
- * reads): parsing just that keeps the request cheap on a long sequence.
+ * The part of the YAML text resolve_vars needs: the top-level `vars:` block
+ * (parsing just that keeps the request cheap on a long sequence), or all of
+ * it when the block uses an alias.
  */
 export function extractVarsBlock(text: string): string {
   const lines = text.split(/\r?\n/);
-  const start = lines.findIndex((line) => /^vars\s*:/.test(line));
-  if (start < 0) {
+  const range = varsBlockRange(lines);
+  if (!range) {
     return "vars: {}\n";
   }
-  let end = start + 1;
-  while (end < lines.length && !TOP_LEVEL_KEY_RE.test(lines[end])) {
-    end += 1;
-  }
-  return `${lines.slice(start, end).join("\n")}\n`;
+  const block = `${lines.slice(range.start, range.end).join("\n")}\n`;
+  return YAML_ALIAS_RE.test(block) ? text : block;
 }
 
 /**

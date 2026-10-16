@@ -235,6 +235,11 @@ describe("varDefinitionLines", () => {
       [6, "gen_var"],
     ]);
   });
+
+  it("agrees with the request on where the block ends", () => {
+    const doc = Text.of(["vars:", "  a: 1", "---", "  b: 2", '"steps":', "  c: 3"]);
+    expect(Array.from(varDefinitionLines(doc).entries())).toEqual([[2, "a"]]);
+  });
 });
 
 describe("runtime origins", () => {
@@ -284,6 +289,14 @@ describe("extractVarsBlock", () => {
     expect(extractVarsBlock(text)).toBe(["vars:", "  a: 1", "  # note", "", "  b: ${a}", ""].join("\n"));
     expect(extractVarsBlock("vars: {a: 1}\nsteps: []\n")).toBe("vars: {a: 1}\n");
     expect(extractVarsBlock("steps: []\n")).toBe("vars: {}\n");
+  });
+
+  it("ends at a document marker and sends everything when the vars use an alias", () => {
+    expect(extractVarsBlock("vars:\n  a: 1\n---\nvars:\n  b: 2\n")).toBe("vars:\n  a: 1\n");
+    const withAlias = "defaults: &d {gain: 2}\nvars:\n  cfg: *d\nsteps: []\n";
+    expect(extractVarsBlock(withAlias)).toBe(withAlias);
+    // `*` in an expression is not an alias.
+    expect(extractVarsBlock("vars:\n  a: ${b * 2}\nsteps: []\n")).toBe("vars:\n  a: ${b * 2}\n");
   });
 });
 

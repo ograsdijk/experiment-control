@@ -18,6 +18,7 @@ import {
   describeTemplate,
   describeVarDefinition,
   templateRegExp,
+  varsBlockRange,
   type ValueChip,
   type ValueContext,
 } from "./resolved_values";
@@ -84,35 +85,23 @@ class ValueChipWidget extends WidgetType {
   }
 }
 
-const TOP_KEY_RE = /^([A-Za-z_][\w-]*)\s*:/;
 const VAR_DEF_RE = /^(\s+)([A-Za-z_]\w*)\s*:/;
 
 /** Line numbers (1-based) of the top-level `vars:` block entries, by name. */
 export function varDefinitionLines(doc: CmText): Map<number, string> {
   const out = new Map<number, string>();
-  let inVars = false;
+  const lines = doc.toString().split("\n");
+  const range = varsBlockRange(lines);
+  if (!range) {
+    return out;
+  }
   let entryIndent: number | null = null;
-  for (let n = 1; n <= doc.lines; n += 1) {
-    const text = doc.line(n).text;
-    if (!text.trim() || text.trimStart().startsWith("#")) {
-      continue;
-    }
-    const top = TOP_KEY_RE.exec(text);
-    if (top) {
-      if (inVars) {
-        break;
-      }
-      inVars = top[1] === "vars";
-      continue;
-    }
-    if (!inVars) {
-      continue;
-    }
-    const def = VAR_DEF_RE.exec(text);
+  for (let index = range.start + 1; index < range.end; index += 1) {
+    const def = VAR_DEF_RE.exec(lines[index]);
     if (def) {
       entryIndent ??= def[1].length;
       if (def[1].length === entryIndent) {
-        out.set(n, def[2]);
+        out.set(index + 1, def[2]);
       }
     }
   }

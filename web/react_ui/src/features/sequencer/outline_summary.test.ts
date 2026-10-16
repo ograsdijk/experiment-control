@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 import { buildSequencerStepOutline } from "./outline";
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
 import { summaryUnit } from "./components/SequencerStepTree";
+import { TextWithValues } from "./components/ValueChip";
 
 function summaries(yamlText: string): Array<string | null> {
   return buildSequencerStepOutline(yamlText).map((node) => node.summary);
@@ -108,5 +111,10 @@ describe("step summaries", () => {
       ].join("\n")
     );
     expect(nodes.map(summaryUnit)).toEqual(["s", "s", undefined]);
+  });
+
+  it("keeps the unit in the text when there is no value chip", () => {
+    const html = renderToStaticMarkup(createElement(TextWithValues, { text: "timeout ${t_s}", unit: "s" }));
+    expect(html).toBe("timeout ${t_s} s");
   });
 });

@@ -152,7 +152,7 @@ export function ValueChip({ chip, unit }: { chip: ValueChipModel; unit?: string 
  */
 export function TextWithValues({ text, unit }: { text: string; unit?: string }) {
   const ctx = useSequencerValues();
-  if (!ctx || !text.includes("${")) {
+  if (!text.includes("${")) {
     return <>{text}</>;
   }
   return (
@@ -161,11 +161,12 @@ export function TextWithValues({ text, unit }: { text: string; unit?: string }) 
         if (segment.kind === "text") {
           return <Fragment key={index}>{segment.text}</Fragment>;
         }
-        const chip = describeTemplate(segment.text, segment.inner, ctx);
+        const chip = ctx ? describeTemplate(segment.text, segment.inner, ctx) : null;
+        // Without a chip (values hidden or not resolved yet) the unit stays in the text.
         return chip ? (
           <ValueChip key={index} chip={chip} unit={unit} />
         ) : (
-          <Fragment key={index}>{segment.text}</Fragment>
+          <Fragment key={index}>{unit ? `${segment.text} ${unit}` : segment.text}</Fragment>
         );
       })}
     </>
