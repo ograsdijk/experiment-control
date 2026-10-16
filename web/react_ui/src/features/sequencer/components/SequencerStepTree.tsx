@@ -24,6 +24,7 @@ import {
   type StepDiagnostics,
 } from "../diagnostic_locations";
 import type { SequencerStepOutlineNode } from "../types";
+import { TextWithValues } from "./ValueChip";
 
 const STEP_TEMPLATE_OPTIONS: Array<{ kind: BasicSequencerStepTemplate; label: string }> = [
   { kind: "call", label: "Add call" },
@@ -93,6 +94,21 @@ function kindColor(kind: string): string {
     default:
       return "gray";
   }
+}
+
+/**
+ * Unit of the value a step's summary shows (sleep 0.05 s, timeout 5 s); only
+ * for the duration/timeout summary, not e.g. a wait_until's condition text.
+ */
+export function summaryUnit(node: SequencerStepOutlineNode): string | undefined {
+  const summary = node.summary ?? "";
+  if (node.kind === "sleep" && summary.startsWith("sleep ")) {
+    return "s";
+  }
+  if (node.kind === "wait_until" && summary.startsWith("timeout ")) {
+    return "s";
+  }
+  return undefined;
 }
 
 type SiblingInfoMap = Record<
@@ -314,8 +330,8 @@ function OutlineRow({
                 </Text>
               ) : null}
             </Group>
-            <Text size="xs" fw={500} lineClamp={1}>
-              {node.summary ?? node.kind}
+            <Text size="xs" fw={500} lineClamp={3} style={{ lineHeight: 1.7 }}>
+              <TextWithValues text={node.summary ?? node.kind} unit={summaryUnit(node)} />
             </Text>
           </Stack>
         </button>

@@ -12,6 +12,12 @@ import type { ProcessStatus } from "../../types";
 import { useAdaptivePolling } from "../polling/useAdaptivePolling";
 import { editorMatchesLoadedRevision, revisionAction } from "./loaded_revision";
 import { useSequencerRunEvents } from "./useSequencerRunEvents";
+import { useResolvedVars } from "./useResolvedVars";
+import {
+  overridesForDisplay,
+  scalarEnv,
+  type ValueContext,
+} from "./resolved_values";
 import type {
   SequencerAdaptiveStudyStatus,
   SequencerDiagnostic,
@@ -400,6 +406,8 @@ export function useSequencerController({
           loops_completed?: unknown;
           loops_target?: unknown;
           vars?: unknown;
+          vars_override?: unknown;
+          env?: unknown;
           error?: unknown;
           error_detail?: unknown;
           cleanup_active?: unknown;
@@ -542,6 +550,11 @@ export function useSequencerController({
             adaptiveStudies,
             pause: normalizeSequencerPause(result.pause),
             runEvents: normalizeRunEventsSummary(result.run_events),
+            varsOverride:
+              result.vars_override && typeof result.vars_override === "object"
+                ? (result.vars_override as Record<string, unknown>)
+                : null,
+            env: scalarEnv(result.env),
           };
           if (sameSequencerStatus(current, nextStatus)) {
             return prev;
@@ -1653,6 +1666,52 @@ export function useSequencerController({
     sequencerProgressPercent,
     sequencerTotalSteps,
   ]);
+  // While a run is going, chips show the values it runs with; sidebar
+  // overrides that differ are only for the next start.
+  const sequencerRunActive = ["RUNNING", "STOP_REQUESTED", "PAUSED"].includes(
+    sequencerRuntimeState
+  );
+  const sequencerDisplayOverrides = useMemo(
+    () =>
+      overridesForDisplay(
+        sequencerRunActive,
+        sequencerStatus?.varsOverride ?? null,
+        sequencerOverrideEvaluation.payload
+      ),
+    [sequencerRunActive, sequencerStatus?.varsOverride, sequencerOverrideEvaluation.payload]
+  );
+  const sequencerResolvedVars = useResolvedVars({
+    callProcessFn,
+    processId: sequencerProcess?.process_id ?? null,
+    enabled: sequencerOpen,
+    yamlText: sequencerYamlText,
+    overrides: sequencerDisplayOverrides.overrides,
+  });
+  // Live loop values only fit the editor while it holds the running sequence:
+  // unedited, and the revision that is loaded (not one another client loaded since).
+  const sequencerEditorHoldsLoaded =
+    !sequencerYamlDirty &&
+    editorMatchesLoadedRevision({
+      statusRevision: sequencerStatusRevision,
+      editorRevision: sequencerEditorRevision,
+    });
+  const sequencerLiveEnvRaw =
+    sequencerRunActive && sequencerEditorHoldsLoaded ? sequencerStatus?.env ?? null : null;
+  // Same object while the values don't change: every poll replaces the status
+  // (progress), and a new env object would rebuild every value chip.
+  const sequencerLiveEnvKey = JSON.stringify(sequencerLiveEnvRaw);
+  const sequencerLiveEnv = useMemo(
+    () => JSON.parse(sequencerLiveEnvKey) as Record<string, unknown> | null,
+    [sequencerLiveEnvKey]
+  );
+  const sequencerValueContext = useMemo<ValueContext>(
+    () => ({
+      resolved: sequencerResolvedVars,
+      liveEnv: sequencerLiveEnv,
+      nextRunOverrides: sequencerDisplayOverrides.nextRun,
+    }),
+    [sequencerResolvedVars, sequencerLiveEnv, sequencerDisplayOverrides.nextRun]
+  );
   const sequencerPrimaryAction: "start" | "pause" | "resume" =
     sequencerRuntimeState === "RUNNING" || sequencerRuntimeState === "STOP_REQUESTED"
       ? "pause"
@@ -1733,6 +1792,7 @@ export function useSequencerController({
     sequencerYamlViewMode,
     setSequencerYamlViewMode,
     sequencerDiagnostics: sequencerCombinedDiagnostics,
+    sequencerValueContext,
     sequencerEditorLabel,
     sequencerRunEvents,
     sequencerModalError,

@@ -586,6 +586,18 @@ class ManagedProcessBase:
                     "error": {"code": "rpc_exception", "message": str(e)},
                 }
         try:
-            self._rpc_router.send_multipart([identity, json_dumps(resp)])
+            payload = json_dumps(resp)
+        except Exception as e:
+            # A result that can't be serialized still gets a reply, so the
+            # caller sees an error instead of waiting for its timeout.
+            payload = json_dumps(
+                {
+                    "request_id": resp.get("request_id") if isinstance(resp, dict) else None,
+                    "ok": False,
+                    "error": {"code": "unserializable_result", "message": str(e)},
+                }
+            )
+        try:
+            self._rpc_router.send_multipart([identity, payload])
         except Exception:
             pass

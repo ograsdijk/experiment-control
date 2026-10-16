@@ -74,6 +74,18 @@ type StepContainerContext = {
   listIndent: number | null;
 };
 
+/**
+ * Shortened text, but a value with a `${...}` is kept whole and its templates
+ * exactly as written: the value chip needs the template text to match the
+ * expression the backend evaluated.
+ */
+function compactValue(value: string, maxLength: number): string {
+  if (!value.includes("${")) {
+    return compactText(value, maxLength);
+  }
+  return value.replace(/(\$\{[^}]*\})|\s+/g, (_match, template?: string) => template ?? " ").trim();
+}
+
 function compactText(value: string, maxLength = 96): string {
   const compact = value.replace(/\s+/g, " ").trim();
   if (compact.length <= maxLength) {
@@ -351,6 +363,38 @@ function parseRepeatDetail(snippet: string): SequencerRepeatDetail {
   };
 }
 
+/**
+ * What a for loop runs over: the expression, or the generator with its scalar
+ * settings so their values show (`linspace(start: .., stop: .., num: ..)`).
+ */
+export function forSourceText(detail: SequencerForDetail): string | null {
+  if (detail.sourceMode === "direct") {
+    return compactValue(detail.directValue ?? "expression", 48);
+  }
+  if (!detail.generatorKind) {
+    return null;
+  }
+  const config = detail.iterableConfig
+    .filter((entry) => entry.value !== null && !entry.value.includes("\n"))
+    .map((entry) => `${entry.name}: ${compactValue(entry.value ?? "", 40)}`);
+  return `${detail.generatorKind}${config.length > 0 ? `(${config.join(", ")})` : ""}`;
+}
+
+const CALL_PARAMS_SHOWN = 2;
+
+/** `  frequency_hz: ${freq_hz}, n: 3 +2 more` for the first call params. */
+function callParamsSummary(params: SequencerOutlineMetadataEntry[]): string {
+  const withValue = params.filter((entry) => entry.value !== null && entry.value !== "");
+  const shown = withValue
+    .slice(0, CALL_PARAMS_SHOWN)
+    .map((entry) => `${entry.name}: ${compactValue(entry.value ?? "", 40)}`);
+  if (shown.length === 0) {
+    return "";
+  }
+  const more = withValue.length - shown.length;
+  return `  ${shown.join(", ")}${more > 0 ? ` +${more} more` : ""}`;
+}
+
 function deriveSummary(
   node: SequencerStepOutlineNode,
   inlineRemainder: string
@@ -360,10 +404,10 @@ function deriveSummary(
   const inline = compactText(inlineRemainder.replace(/^#.*$/, "").trim());
 
   if (kind === "call" && node.callDetail) {
-    const { device, process, action } = node.callDetail;
+    const { device, process, action, params } = node.callDetail;
     const target = device || process;
     if (target && action) {
-      return `${target}.${action}`;
+      return `${target}.${action}${callParamsSummary(params)}`;
     }
     if (target || action) {
       return target || action;
@@ -378,16 +422,16 @@ function deriveSummary(
   if (kind === "set" && node.setDetail) {
     const { device, name, value } = node.setDetail;
     if (device && name && value) {
-      return `${device}.${name} = ${compactText(value, 56)}`;
+      return `${device}.${name} = ${compactValue(value, 56)}`;
     }
     if (name && value) {
-      return `${name} = ${compactText(value, 56)}`;
+      return `${name} = ${compactValue(value, 56)}`;
     }
   }
   if (kind === "assign" && node.assignDetail) {
     const entry = node.assignDetail.entries[0];
     if (entry && entry.value) {
-      return `${entry.name} = ${compactText(entry.value, 56)}`;
+      return `${entry.name} = ${compactValue(entry.value, 56)}`;
     }
   }
   if (kind === "repeat") {
@@ -400,13 +444,8 @@ function deriveSummary(
     const detail = node.forDetail;
     const binds = detail.bind.map((entry) => `${entry.name} -> ${entry.value ?? "n/a"}`);
     const bindSummary = binds.length > 0 ? binds.join(", ") : "bindings";
-    if (detail.sourceMode === "direct") {
-      return `${bindSummary} over ${compactText(detail.directValue ?? "expression", 48)}`;
-    }
-    if (detail.generatorKind) {
-      return `${bindSummary} over ${detail.generatorKind}`;
-    }
-    return bindSummary;
+    const source = forSourceText(detail);
+    return source ? `${bindSummary} over ${source}` : bindSummary;
   }
   if (kind === "adaptive" && node.adaptiveDetail) {
     const detail = node.adaptiveDetail;
@@ -421,7 +460,9 @@ function deriveSummary(
     }
   }
   if (kind === "wait_until" && node.waitUntilDetail?.timeoutS) {
-    return `timeout ${node.waitUntilDetail.timeoutS}s`;
+    const timeout = node.waitUntilDetail.timeoutS;
+    // A template gets its unit from the value chip.
+    return timeout.includes("${") ? `timeout ${timeout}` : `timeout ${timeout}s`;
   }
   if (kind === "if" && node.ifDetail) {
     const parts = [`then ${node.ifDetail.thenCount}`];

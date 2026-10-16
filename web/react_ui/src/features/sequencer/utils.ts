@@ -151,7 +151,10 @@ export function sameSequencerStatus(
       JSON.stringify(current.adaptiveStudies) ===
         JSON.stringify(next.adaptiveStudies) &&
       JSON.stringify(current.pause ?? null) === JSON.stringify(next.pause ?? null) &&
-      JSON.stringify(current.runEvents ?? null) === JSON.stringify(next.runEvents ?? null)
+      JSON.stringify(current.runEvents ?? null) === JSON.stringify(next.runEvents ?? null) &&
+      JSON.stringify(current.varsOverride ?? null) ===
+        JSON.stringify(next.varsOverride ?? null) &&
+      JSON.stringify(current.env ?? null) === JSON.stringify(next.env ?? null)
   );
 }
 

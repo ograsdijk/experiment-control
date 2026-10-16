@@ -9,6 +9,7 @@ import type {
   SequencerStepDetail,
   SequencerYamlEditorHandle,
 } from "../features/sequencer/types";
+import type { ValueContext } from "../features/sequencer/resolved_values";
 import type { StreamAnalysisWorkspaceConfig } from "../features/stream/types";
 import type { CapabilityMember } from "../types";
 import type { StreamCatalogEntry } from "../types";
@@ -123,6 +124,7 @@ type Props = {
   latestSignalsByDevice: Record<string, Record<string, TelemetrySignal>>;
   colorScheme: "light" | "dark";
   diagnostics: ReadonlyArray<SequencerDiagnostic>;
+  valueContext: ValueContext | null;
   onJumpToDiagnostic: (
     line: number | null,
     column: number | null

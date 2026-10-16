@@ -75,6 +75,25 @@ Diagnostics are shown where they are, not only in the sidebar list:
 
 Diagnostics computed for other text (the editor changed since validating) are marked stale and only listed, since their lines may no longer be right.
 
+## Resolved Values
+
+Each `${...}` in the Steps and YAML tabs shows its value next to it, without changing the text. The values come from `sequencer.resolve_vars`, which is called shortly after the editor text or the run overrides change.
+
+- **Plain var:** the name and value, e.g. `freq_settle_s 0.05 s`. Sleep durations and `wait_until` timeouts get `s`.
+- **Run override:** orange, with a dot. The tooltip gives the value without overrides. While a run is going, chips show the overrides it started with, and a sidebar override that differs is listed as "Next run".
+- **Derived var** (written as `${...}` in `vars`): violet with `ƒ`. The tooltip and the step editor show the formula, the formula with values filled in, and the result. A derived var that changes because of an override also gets the orange dot.
+- **Runtime name** (loop variable, loop index, `assign`, `save_as`, adaptive parameter): cyan, labelled `loop`, `index`, `assign`, ... The tooltip says which step sets it and, for a loop, what it runs over. While the editor holds the running sequence, it shows the current value in green instead. A var built from such a name (`label: run_${i}`) is shown the same way, with `ƒ`.
+- **Unknown name:** yellow, when a name is neither a var nor set by any step in the sequence (likely a typo). Steps that set names implicitly are known: `wait_until` (`sample`, `samples`), adaptive (`score`, `<metric>_<stat>`) and call `extract`/`assign`.
+- **Error:** red, with the message.
+
+When a request fails (the YAML doesn't parse, or the sequencer doesn't answer), the last values stay but are dimmed, and the tooltip says why they may be out of date. Closing the modal drops them.
+
+Numbers use about 5 significant figures with an exponent that is a multiple of 3 (`985.5e6`); tooltips show the full value. Lists and generators are summarized (`list[3]`, `linspace ×30`).
+
+In the YAML tab, derived and overridden vars are also marked on their line in the `vars` block, and the line with the cursor hides its chips while you type (by CSS on CodeMirror's active line, so moving the cursor rebuilds nothing). The **Values** switch next to **Follow** hides all chips; the choice is kept per browser.
+
+Step rows of `call` steps show their first two params, and `for` steps show their generator settings, so their values are visible too.
+
 ## Run Events
 
 The **This run** card lists what happened during the current or last run (`sequencer.run_events`): pauses (who paused and why, e.g. a watchdog rule), resumes, stops, step and cleanup failures, external faults, and warnings or errors other processes logged while the run was going. Each event is tied to the step that was running and is also marked on that step, like a diagnostic. A pause by the watchdog is a warning; a pause by the operator, the sequence or a script is info.

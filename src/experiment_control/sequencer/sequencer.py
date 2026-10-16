@@ -65,6 +65,14 @@ from .runtime import (
     run_parallel_branch,
 )
 from .source_info import build_step_source_info
+from .var_resolution import (
+    contains_template,
+    evaluate_expressions,
+    formula_text,
+    json_safe,
+    resolve_vars,
+    unresolved_vars,
+)
 
 Json = dict[str, Any]
 _EXTERNAL_FAULT_SEVERITIES = {"warning", "error", "critical"}
@@ -3151,6 +3159,18 @@ class SequencerProcess(ManagedProcessBase):
                 params=None,
                 doc="Events of the current or last run (pauses, failures, warnings) with their steps.",
             ),
+            method(
+                "sequencer.resolve_vars",
+                params=[
+                    param("text", required=False, default=None, annotation="str"),
+                    param("vars_override", required=False, default=None, annotation="dict"),
+                    param("expressions", required=False, default=None, annotation="list"),
+                ],
+                doc=(
+                    "Resolve vars (of the YAML text, or the loaded sequence) with "
+                    "overrides applied, and evaluate template expressions against them."
+                ),
+            ),
             method("sequencer.status", params=None, doc="Get sequencer status."),
             method(
                 "sequencer.library.list",
@@ -3812,6 +3832,57 @@ class SequencerProcess(ManagedProcessBase):
     def _rpc_sequencer_run_events(self, req: Json) -> Json:
         return self.rpc_ok(req, result=self._runtime.run_events())
 
+    def _resolve_vars_source(self, text: Any) -> tuple[dict[str, Any] | None, str | None]:
+        """Raw vars from YAML text (or the loaded sequence), or an error message."""
+        if text is None:
+            return self._runtime.base_vars, None
+        try:
+            raw = load_yaml_text(str(text), source="sequence_yaml", yaml12_floats=True)
+        except Exception as e:
+            return None, str(getattr(e, "detail", None) or e)
+        raw_vars = raw.get("vars") if isinstance(raw, dict) else None
+        return (dict(raw_vars) if isinstance(raw_vars, dict) else {}), None
+
+    def _rpc_sequencer_resolve_vars(self, req: Json) -> Json:
+        params = req.get("params", {}) or {}
+        if not isinstance(params, dict):
+            return self.rpc_invalid_params(req)
+        overrides = params.get("vars_override") or {}
+        expressions = params.get("expressions") or []
+        if not isinstance(overrides, dict) or not isinstance(expressions, list):
+            return self.rpc_invalid_params(req)
+        raw_vars, error = self._resolve_vars_source(params.get("text"))
+        if raw_vars is None:
+            return self.rpc_err(req, code="invalid_yaml", message=str(error))
+        # Keys as sequencer.start reads them.
+        override_map = {str(k).strip(): v for k, v in overrides.items()}
+        applied = {k: v for k, v in override_map.items() if k in raw_vars}
+        resolved = resolve_vars({**raw_vars, **applied})
+        runtime_vars, errors = unresolved_vars(resolved)
+        # Values without the overrides, where they differ ("YAML: 20").
+        base = resolve_vars(raw_vars) if applied else resolved
+        formulas = {
+            str(k): formula_text(v) for k, v in raw_vars.items() if contains_template(v)
+        }
+        return self.rpc_ok(
+            req,
+            result={
+                "vars": json_safe(resolved),
+                "base_vars": json_safe(
+                    {k: v for k, v in base.items() if json_safe(resolved.get(k)) != json_safe(v)}
+                ),
+                "formulas": formulas,
+                "derived": sorted(formulas),
+                "overridden": sorted(applied),
+                "unknown_overrides": sorted(k for k in override_map if k not in raw_vars),
+                "runtime_vars": runtime_vars,
+                "errors": errors,
+                "expressions": evaluate_expressions(
+                    [e for e in expressions if isinstance(e, str)], resolved
+                ),
+            },
+        )
+
     def _build_rpc_registry(self) -> RpcDispatchRegistry:
         handlers = {
             "process.capabilities": self._rpc_sequencer_capabilities,
@@ -3831,6 +3902,7 @@ class SequencerProcess(ManagedProcessBase):
             "sequencer.resume": self._rpc_sequencer_resume,
             "sequencer.stop": self._rpc_sequencer_stop,
             "sequencer.run_events": self._rpc_sequencer_run_events,
+            "sequencer.resolve_vars": self._rpc_sequencer_resolve_vars,
         }
         return RpcDispatchRegistry(
             handlers=handlers,

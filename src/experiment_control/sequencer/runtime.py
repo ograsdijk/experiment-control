@@ -42,6 +42,7 @@ from .progress import StepDurationStats
 from .run_events import RunEventLog
 from .ranges import generate_from_gen
 from .source_info import StepSourceInfo, step_kind, step_summary
+from .var_resolution import resolve_vars
 
 # Floor applied to `wait_until.every_s` (and the poll-timeout floor itself) so
 # a misconfigured sequence (e.g. `every_s: 0`) can't peg the process loop at
@@ -740,27 +741,10 @@ class SequencerRuntime:
     def is_loaded(self) -> bool:
         return self._spec is not None
 
-    def _resolve_initial_vars(self, raw_vars: dict[str, Any]) -> dict[str, Any]:
-        # Resolve vars against other vars (including nested ${...}) before first tick.
-        resolved = dict(raw_vars)
-        if not resolved:
-            return resolved
-        max_passes = max(4, len(resolved) * 4)
-        for _ in range(max_passes):
-            changed = False
-            env = dict(resolved)
-            env["vars"] = to_attrdict(resolved)
-            for key, value in list(resolved.items()):
-                try:
-                    rendered = render_templates(value, env)
-                except Exception:
-                    continue
-                if rendered != value:
-                    resolved[key] = rendered
-                    changed = True
-            if not changed:
-                break
-        return resolved
+    @property
+    def base_vars(self) -> dict[str, Any]:
+        """The loaded sequence's vars as written (before resolving and overrides)."""
+        return dict(self._base_vars)
 
     def load(
         self,
@@ -772,7 +756,7 @@ class SequencerRuntime:
             raise RuntimeError("Cannot load while running")
         self._spec = spec
         self._base_vars = dict(spec.vars)
-        self._vars = self._resolve_initial_vars(spec.vars)
+        self._vars = resolve_vars(spec.vars)
         self._env = {}
         self._stack = []
         self._pause_requested = False
@@ -849,7 +833,7 @@ class SequencerRuntime:
 
         merged_vars = dict(self._base_vars)
         merged_vars.update(vars_override_map)
-        self._vars = self._resolve_initial_vars(merged_vars)
+        self._vars = resolve_vars(merged_vars)
         self._vars_override_active = dict(vars_override_map)
 
         self._run_id = self._next_run_id
@@ -3028,7 +3012,7 @@ class SequencerRuntime:
             if not isinstance(rendered_args, dict):
                 raise TypeError("use.args must render to a dict")
             merged.update(rendered_args)
-        return self._resolve_initial_vars(merged)
+        return resolve_vars(merged)
 
     def _create_adaptive_controller(
         self,
