@@ -588,6 +588,17 @@ Response:
 - `{"ok": true, "result": {"run_id": 7, "seq": 42, "dropped": 0, "events": [{"severity": "warning", "kind": "pause", "message": "Paused by watchdog: Detection 1 lock dropped", "source": "watchdog", "trigger": {...}, "step": {"kind": "call", "summary": "...", "path": "steps[0].try.do[3]", "line": 92, "branch": null}, "elapsed_s": 81.2, "last_elapsed_s": 81.2, "count": 1}]}}`
 - Events of the current (or last) run, oldest first: `pause`, `resume`, `stop`, `step_failed`, `cleanup_failed`, `external_fault`, and `log` (a warning/error another process logged while the run was going; its `step` is the step running at the time, not necessarily the cause). Consecutive repeats are counted in `count`; at most 200 are kept (`dropped` counts the rest). Cleared when a run starts. `seq` changes whenever the list does; `sequencer.status.run_events.seq` tells pollers when to refetch.
 
+### `sequencer.resolve_vars`
+Request:
+- `{"type": "sequencer.resolve_vars", "params": {"text": "<sequence yaml>", "vars_override": {"n_steps": 11}, "expressions": ["${sweep_start_hz}", "${freq_hz * 2}"]}}`
+- All params are optional. Without `text` the loaded sequence's vars are used. Only the top-level `vars` block is read, so the rest of the YAML may be incomplete.
+
+Response:
+- `{"ok": true, "result": {"vars": {"n_steps": 11, "sweep_start_hz": 995000000.0}, "base_vars": {"n_steps": 30, "sweep_start_hz": 985500000.0}, "formulas": {"sweep_start_hz": "${freq_center_hz - 0.5 * sweep_step_hz * (n_steps - 1)}"}, "derived": ["sweep_start_hz"], "overridden": ["n_steps"], "unknown_overrides": [], "errors": {}, "expressions": {"${sweep_start_hz}": {"ok": true, "value": 995000000.0}, "${freq_hz * 2}": {"ok": false, "runtime": true, "names": ["freq_hz"]}}}}`
+- `vars` are resolved the same way as on start (vars referring to other vars, overrides applied). `base_vars` holds the values without overrides for the vars the overrides changed. `derived` vars are written as `${...}`; their text is in `formulas`. `errors` has the message for each var that could not be resolved.
+- Each expression is evaluated against the vars only. One that reads other names (loop variables, `save_as`, `assign`) is `runtime` with those names; any other failure gives `{"ok": false, "error": "..."}`.
+- YAML that does not parse returns `invalid_yaml`. Read-only: nothing is loaded or changed. The UI uses it for the value chips in the Steps and YAML tabs.
+
 ### `sequencer.library.list`
 Request:
 - `{"type": "sequencer.library.list"}`

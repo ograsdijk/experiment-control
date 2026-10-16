@@ -41,6 +41,7 @@ from .progress import StepDurationStats
 from .run_events import RunEventLog
 from .ranges import generate_from_gen
 from .source_info import StepSourceInfo, step_kind, step_summary
+from .var_resolution import resolve_vars
 
 # Floor applied to `wait_until.every_s` (and the poll-timeout floor itself) so
 # a misconfigured sequence (e.g. `every_s: 0`) can't peg the process loop at
@@ -739,25 +740,13 @@ class SequencerRuntime:
 
     def _resolve_initial_vars(self, raw_vars: dict[str, Any]) -> dict[str, Any]:
         # Resolve vars against other vars (including nested ${...}) before first tick.
-        resolved = dict(raw_vars)
-        if not resolved:
-            return resolved
-        max_passes = max(4, len(resolved) * 4)
-        for _ in range(max_passes):
-            changed = False
-            env = dict(resolved)
-            env["vars"] = to_attrdict(resolved)
-            for key, value in list(resolved.items()):
-                try:
-                    rendered = render_templates(value, env)
-                except Exception:
-                    continue
-                if rendered != value:
-                    resolved[key] = rendered
-                    changed = True
-            if not changed:
-                break
+        resolved, _errors = resolve_vars(raw_vars)
         return resolved
+
+    @property
+    def base_vars(self) -> dict[str, Any]:
+        """The loaded sequence's vars as written (before resolving and overrides)."""
+        return dict(self._base_vars)
 
     def load(
         self,
