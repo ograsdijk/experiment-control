@@ -740,8 +740,7 @@ class SequencerRuntime:
 
     def _resolve_initial_vars(self, raw_vars: dict[str, Any]) -> dict[str, Any]:
         # Resolve vars against other vars (including nested ${...}) before first tick.
-        resolved, _errors = resolve_vars(raw_vars)
-        return resolved
+        return resolve_vars(raw_vars)
 
     @property
     def base_vars(self) -> dict[str, Any]:

@@ -14,6 +14,14 @@ class TemplateError(ValueError):
     """A template/expression that cannot be evaluated (unknown name, syntax...)."""
 
 
+class UnknownNameError(TemplateError):
+    """A template read a name that is not defined (yet)."""
+
+    def __init__(self, message: str, *, name: str) -> None:
+        super().__init__(message)
+        self.name = name
+
+
 class OperandError(TemplateError):
     """An operator was applied to operands it does not support.
 
@@ -110,7 +118,7 @@ def _eval_expr(expr: str, env: dict[str, Any]) -> Any:
         if isinstance(node, ast.Name):
             if node.id in env:
                 return env[node.id]
-            raise TemplateError(unknown_name_message(node.id, env))
+            raise UnknownNameError(unknown_name_message(node.id, env), name=node.id)
         if isinstance(node, ast.Attribute):
             base = eval_node(node.value)
             if isinstance(base, AttrDict):

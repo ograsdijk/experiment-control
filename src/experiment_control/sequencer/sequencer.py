@@ -65,7 +65,14 @@ from .runtime import (
     run_parallel_branch,
 )
 from .source_info import build_step_source_info
-from .var_resolution import contains_template, evaluate_expressions, json_safe, resolve_vars
+from .var_resolution import (
+    contains_template,
+    evaluate_expressions,
+    formula_text,
+    json_safe,
+    resolve_vars,
+    unresolved_vars,
+)
 
 Json = dict[str, Any]
 _EXTERNAL_FAULT_SEVERITIES = {"warning", "error", "critical"}
@@ -3847,10 +3854,13 @@ class SequencerProcess(ManagedProcessBase):
         raw_vars, error = self._resolve_vars_source(params.get("text"))
         if raw_vars is None:
             return self.rpc_err(req, code="invalid_yaml", message=str(error))
-        applied = {str(k): v for k, v in overrides.items() if str(k) in raw_vars}
-        resolved, errors = resolve_vars({**raw_vars, **applied})
+        # Keys as sequencer.start reads them.
+        override_map = {str(k).strip(): v for k, v in overrides.items()}
+        applied = {k: v for k, v in override_map.items() if k in raw_vars}
+        resolved = resolve_vars({**raw_vars, **applied})
+        runtime_vars, errors = unresolved_vars(resolved)
         # Values without the overrides, where they differ ("YAML: 20").
-        base, _base_errors = resolve_vars(raw_vars) if applied else (resolved, {})
+        base = resolve_vars(raw_vars) if applied else resolved
         return self.rpc_ok(
             req,
             result={
@@ -3859,17 +3869,16 @@ class SequencerProcess(ManagedProcessBase):
                     {k: v for k, v in base.items() if resolved.get(k) != v}
                 ),
                 "formulas": {
-                    str(k): v
+                    str(k): formula_text(v)
                     for k, v in raw_vars.items()
-                    if isinstance(v, str) and contains_template(v)
+                    if contains_template(v)
                 },
                 "derived": sorted(
                     str(k) for k, v in raw_vars.items() if contains_template(v)
                 ),
                 "overridden": sorted(applied),
-                "unknown_overrides": sorted(
-                    str(k) for k in overrides if str(k) not in raw_vars
-                ),
+                "unknown_overrides": sorted(k for k in override_map if k not in raw_vars),
+                "runtime_vars": runtime_vars,
                 "errors": errors,
                 "expressions": evaluate_expressions(
                     [e for e in expressions if isinstance(e, str)], resolved

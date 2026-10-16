@@ -10,7 +10,11 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from experiment_control.sequencer.sequencer import SequencerProcess
-from experiment_control.sequencer.var_resolution import evaluate_expressions, resolve_vars
+from experiment_control.sequencer.var_resolution import (
+    evaluate_expressions,
+    resolve_vars,
+    unresolved_vars,
+)
 
 SWEEP_YAML = """
 version: 1
@@ -41,14 +45,30 @@ def _resolve(params: dict) -> dict:
 
 class ResolveVarsHelperTests(unittest.TestCase):
     def test_resolves_derived_vars_in_any_order(self) -> None:
-        resolved, errors = resolve_vars({"b": "${a * 2}", "c": "${b + 1}", "a": 3})
+        resolved = resolve_vars({"b": "${a * 2}", "c": "${b + 1}", "a": 3})
         self.assertEqual(resolved, {"b": 6, "c": 7, "a": 3})
-        self.assertEqual(errors, {})
+        self.assertEqual(unresolved_vars(resolved), ({}, {}))
 
-    def test_reports_unresolvable_var(self) -> None:
-        resolved, errors = resolve_vars({"a": "${missing + 1}"})
-        self.assertEqual(resolved["a"], "${missing + 1}")
-        self.assertIn("missing", errors["a"])
+    def test_var_reading_a_runtime_name_is_not_an_error(self) -> None:
+        # `label` is rendered again inside `for i`, where `i` exists.
+        resolved = resolve_vars({"label": "run_${i}", "a": 1})
+        self.assertEqual(resolved["label"], "run_${i}")
+        self.assertEqual(unresolved_vars(resolved), ({"label": ["i"]}, {}))
+
+    def test_reports_broken_var(self) -> None:
+        resolved = resolve_vars({"a": 1, "b": "${a / 0}"})
+        runtime, errors = unresolved_vars(resolved)
+        self.assertEqual(runtime, {})
+        self.assertIn("division", errors["b"])
+
+    def test_unused_branch_does_not_need_its_names(self) -> None:
+        out = evaluate_expressions(
+            ["${a if use_a else i}", "${label}"], {"a": 1, "use_a": True, "label": "run_${i}"}
+        )
+        self.assertEqual(out["${a if use_a else i}"], {"ok": True, "value": 1})
+        self.assertEqual(
+            out["${label}"], {"ok": False, "runtime": True, "names": ["i"]}
+        )
 
     def test_expressions_against_vars_and_runtime_names(self) -> None:
         out = evaluate_expressions(
@@ -70,7 +90,7 @@ class ResolveVarsRpcTests(unittest.TestCase):
         resp = _resolve(
             {
                 "text": SWEEP_YAML,
-                "vars_override": {"n_steps": 11, "nope": 1},
+                "vars_override": {" n_steps": 11, "nope": 1},
                 "expressions": ["${sweep_start_hz}", "${n_traces}"],
             }
         )
@@ -90,11 +110,20 @@ class ResolveVarsRpcTests(unittest.TestCase):
         )
         self.assertEqual(result["unknown_overrides"], ["nope"])
         self.assertEqual(result["errors"], {})
+        self.assertEqual(result["runtime_vars"], {})
         self.assertEqual(
             result["expressions"]["${sweep_start_hz}"],
             {"ok": True, "value": 1e9 - 0.5 * 1e6 * 10},
         )
         self.assertEqual(result["expressions"]["${n_traces}"], {"ok": True, "value": 20})
+
+    def test_list_var_formula_and_runtime_var(self) -> None:
+        text = "vars:\n  a: 1\n  vals: ['${a}', 2]\n  label: run_${i}\n"
+        result = _resolve({"text": text})["result"]
+        self.assertEqual(result["vars"]["vals"], [1, 2])
+        self.assertEqual(result["formulas"]["vals"], '["${a}", 2]')
+        self.assertEqual(result["runtime_vars"], {"label": ["i"]})
+        self.assertEqual(result["errors"], {})
 
     def test_invalid_yaml_is_an_error(self) -> None:
         resp = _resolve({"text": "vars: [unclosed"})

@@ -2,13 +2,11 @@
 
 from __future__ import annotations
 
-import ast
+import json
 import math
 from typing import Any
 
-from .eval import _TEMPLATE_RE, render_templates, to_attrdict
-
-_BUILTIN_FUNCS = frozenset({"abs", "len", "min", "max"})
+from .eval import _TEMPLATE_RE, UnknownNameError, render_templates, to_attrdict
 
 
 def contains_template(value: Any) -> bool:
@@ -27,15 +25,16 @@ def _vars_env(resolved: dict[str, Any]) -> dict[str, Any]:
     return env
 
 
-def resolve_vars(raw_vars: dict[str, Any]) -> tuple[dict[str, Any], dict[str, str]]:
+def resolve_vars(raw_vars: dict[str, Any]) -> dict[str, Any]:
     """Resolve vars against other vars (including nested ${...}).
 
-    Returns the resolved vars and, for each var that is still unresolved,
-    the error from rendering it one last time.
+    A var that cannot be resolved yet keeps its template: it may read a name
+    that only exists while running (a loop variable), and is rendered again
+    in the step that uses it.
     """
     resolved = dict(raw_vars)
     if not resolved:
-        return resolved, {}
+        return resolved
     max_passes = max(4, len(resolved) * 4)
     for _ in range(max_passes):
         changed = False
@@ -50,6 +49,19 @@ def resolve_vars(raw_vars: dict[str, Any]) -> tuple[dict[str, Any], dict[str, st
                 changed = True
         if not changed:
             break
+    return resolved
+
+
+def unresolved_vars(
+    resolved: dict[str, Any],
+) -> tuple[dict[str, list[str]], dict[str, str]]:
+    """Why each var that still holds a template is unresolved.
+
+    Returns the vars that read a name other than a var (set while running,
+    e.g. `label: run_${i}` inside `for i`) with that name, and the error of
+    every other one.
+    """
+    runtime: dict[str, list[str]] = {}
     errors: dict[str, str] = {}
     env = _vars_env(resolved)
     for key, value in resolved.items():
@@ -57,28 +69,14 @@ def resolve_vars(raw_vars: dict[str, Any]) -> tuple[dict[str, Any], dict[str, st
             continue
         try:
             render_templates(value, env)
+        except UnknownNameError as e:
+            if e.name in resolved:
+                errors[str(key)] = str(e)
+            else:
+                runtime[str(key)] = [e.name]
         except Exception as e:
             errors[str(key)] = str(e)
-    return resolved, errors
-
-
-def _expression_names(text: str) -> set[str]:
-    """Names an expression reads, besides the builtin functions and `vars`."""
-    names: set[str] = set()
-    for match in _TEMPLATE_RE.finditer(text):
-        try:
-            tree = ast.parse(match.group(1), mode="eval")
-        except SyntaxError:
-            continue
-        calls = {
-            id(node.func)
-            for node in ast.walk(tree)
-            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-        }
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Name) and id(node) not in calls and node.id != "vars":
-                names.add(node.id)
-    return names
+    return runtime, errors
 
 
 def evaluate_expressions(
@@ -86,30 +84,30 @@ def evaluate_expressions(
 ) -> dict[str, dict[str, Any]]:
     """Evaluate template strings against the resolved vars only.
 
-    An expression that reads names other than vars (loop variables, save_as,
+    An expression that needs a name other than a var (loop variable, save_as,
     assign) has no value before the run: it is reported as `runtime` with
-    those names instead of as an error.
+    that name instead of as an error.
     """
     env = _vars_env(resolved_vars)
     out: dict[str, dict[str, Any]] = {}
     for text in expressions:
         if not isinstance(text, str) or text in out:
             continue
-        runtime_names = sorted(
-            name
-            for name in _expression_names(text)
-            if name not in resolved_vars and name not in _BUILTIN_FUNCS
-        )
-        if runtime_names:
-            out[text] = {"ok": False, "runtime": True, "names": runtime_names}
-            continue
         try:
             value = render_templates(text, env)
+        except UnknownNameError as e:
+            out[text] = {"ok": False, "runtime": True, "names": [e.name]}
+            continue
         except Exception as e:
             out[text] = {"ok": False, "error": str(e)}
             continue
         out[text] = {"ok": True, "value": json_safe(value)}
     return out
+
+
+def formula_text(value: Any) -> str:
+    """A derived var's value as written: the string, or JSON for a list/dict."""
+    return value if isinstance(value, str) else json.dumps(json_safe(value))
 
 
 def json_safe(value: Any) -> Any:
