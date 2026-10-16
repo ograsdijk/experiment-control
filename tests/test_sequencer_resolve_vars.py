@@ -170,6 +170,21 @@ class CostLimitTests(unittest.TestCase):
         self.assertEqual(render_templates("${17 % 5}", {}), 2)
         self.assertEqual(render_templates("f_${a}_${b}", {"a": 1, "b": "x"}), "f_1_x")
 
+    def test_size_counts_what_is_inside_lists(self) -> None:
+        # A million items of a million characters each: small in items, huge as text.
+        raw = {"s": "${'x' * 1000}", "l": ["${s}"], "big": "${l * 1000}"}
+        resolved = resolve_vars(raw)
+        _runtime, errors = unresolved_vars(resolved)
+        self.assertIn("too large", errors["big"])
+        with self.assertRaises(ValueTooLargeError):
+            render_templates("run_${big}", {"big": ["x" * 1000] * 2000})
+
+    def test_cyclic_vars_are_an_error(self) -> None:
+        runtime, errors = unresolved_vars(resolve_vars({"a": "${b}", "b": "${a}", "c": 1}))
+        self.assertEqual(runtime, {})
+        self.assertEqual(sorted(errors), ["a", "b"])
+        self.assertIn("refers back to itself", errors["a"])
+
     def test_text_built_from_templates_is_limited_too(self) -> None:
         # While vars resolve, `v0 + v0` joins the two template strings, and
         # filling those in builds the text without going through `+`.

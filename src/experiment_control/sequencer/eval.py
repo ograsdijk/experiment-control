@@ -10,11 +10,12 @@ from typing import Any, Callable
 _TEMPLATE_RE = re.compile(r"\$\{([^}]+)\}")
 _MAX_TEMPLATE_DEPTH = 16
 # Cost limits: an integer of more digits cannot be turned into text (Python's
-# int-to-str limit) and takes seconds to minutes to compute; repeating a
-# string or list beyond this many items would allocate gigabytes.
+# int-to-str limit) and takes seconds to minutes to compute. A string or list
+# (counting everything in it) beyond MAX_RESULT_SIZE would take gigabytes as
+# text, which status replies and filled-in templates make of every value.
 MAX_INT_DIGITS = 4000
 _MAX_INT_BITS = int(MAX_INT_DIGITS * 3.3219280948873626)  # log2(10)
-MAX_REPEAT_ITEMS = 1_000_000
+MAX_RESULT_SIZE = 1_000_000
 
 
 class TemplateError(ValueError):
@@ -119,12 +120,33 @@ def _is_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
 
 
-_FORMAT_SPEC_RE = re.compile(
-    r"%(?:\([^)]*\))?[-#0 +]*(\*|\d+)?(?:\.(\*|\d+))?[hlL]?[a-zA-Z%]"
-)
+_FORMAT_SPEC_RE = re.compile(r"%(?:\([^)]*\))?[-#0 +]*(\d+)?(?:\.(\d+))?[hlL]?[a-zA-Z%]")
 
 
-def _int_result_too_large(op: ast.operator, left: Any, right: Any) -> bool:
+def text_size(value: Any, limit: int = MAX_RESULT_SIZE) -> int:
+    """About how many characters `value` takes as text, counted up to `limit`.
+
+    Containers count everything in them: a list of a million long strings is
+    small in items but huge as text. Stops counting once past `limit`.
+    """
+    if isinstance(value, str):
+        return len(value)
+    if _is_int(value):
+        return value.bit_length() // 3 + 1
+    if isinstance(value, (list, tuple, dict)):
+        parts = (
+            (p for kv in value.items() for p in kv) if isinstance(value, dict) else iter(value)
+        )
+        total = len(value)
+        for part in parts:
+            total += text_size(part, limit)
+            if total > limit:
+                break
+        return total
+    return 8
+
+
+def _int_result_too_large(op: ast.operator, left: int, right: int) -> bool:
     if isinstance(op, ast.Pow):
         if right <= 0 or abs(left) <= 1:
             return False
@@ -136,28 +158,20 @@ def _int_result_too_large(op: ast.operator, left: Any, right: Any) -> bool:
     return False
 
 
-def _sequence_result_too_large(op: ast.operator, left: Any, right: Any) -> bool:
+def _result_size(op: ast.operator, left: Any, right: Any) -> int:
+    """Text size of a string/list result of `op`, before computing it (0: not one)."""
     sequence = (str, list, tuple)
     if isinstance(op, ast.Mult):
         seq, count = (left, right) if _is_int(right) else (right, left)
-        return isinstance(seq, sequence) and _is_int(count) and len(seq) * count > MAX_REPEAT_ITEMS
-    if isinstance(op, ast.Add):
-        return (
-            isinstance(left, sequence)
-            and isinstance(right, sequence)
-            and len(left) + len(right) > MAX_REPEAT_ITEMS
-        )
+        if isinstance(seq, sequence) and _is_int(count) and count > 0:
+            return text_size(seq) * count
+    if isinstance(op, ast.Add) and isinstance(left, sequence) and isinstance(right, sequence):
+        return text_size(left) + text_size(right)
     if isinstance(op, ast.Mod) and isinstance(left, str):
         # printf-style formatting: a huge width or precision builds a huge string.
-        args = right if isinstance(right, tuple) else (right,)
-        for width, precision in _FORMAT_SPEC_RE.findall(left):
-            for size in (width, precision):
-                if size == "*":
-                    if any(_is_int(a) and a > MAX_REPEAT_ITEMS for a in args):
-                        return True
-                elif size and int(size) > MAX_REPEAT_ITEMS:
-                    return True
-    return False
+        sizes = [int(n) for spec in _FORMAT_SPEC_RE.findall(left) for n in spec if n]
+        return len(left) + text_size(right) + max(sizes, default=0)
+    return 0
 
 
 def _check_result_size(op: ast.operator, left: Any, right: Any, expr: str) -> None:
@@ -166,8 +180,8 @@ def _check_result_size(op: ast.operator, left: Any, right: Any, expr: str) -> No
     if _is_int(left) and _is_int(right):
         if _int_result_too_large(op, left, right):
             limit = f"more than {MAX_INT_DIGITS} digits"
-    elif _sequence_result_too_large(op, left, right):
-        limit = f"more than {MAX_REPEAT_ITEMS:,} items"
+    elif _result_size(op, left, right) > MAX_RESULT_SIZE:
+        limit = f"more than {MAX_RESULT_SIZE:,} characters"
     if limit:
         raise ValueTooLargeError(f"result of ${{{expr}}} would be too large ({limit})")
 
@@ -317,22 +331,49 @@ def _render_templates(value: Any, env: dict[str, Any], *, depth: int) -> Any:
             replacement = _eval_expr(expr, env)
             if isinstance(replacement, str) and _TEMPLATE_RE.search(replacement):
                 replacement = _render_templates(replacement, env, depth=depth + 1)
-            token, text = match.group(0), str(replacement)
-            # Substituting text joins strings without `+`: check the size here too.
-            if len(out) + out.count(token) * (len(text) - len(token)) > MAX_REPEAT_ITEMS:
+            token = match.group(0)
+            # Filling in joins text without `+`: check the size here too, and
+            # before str() of a large value builds its text.
+            if len(out) + out.count(token) * text_size(replacement) > MAX_RESULT_SIZE:
                 raise ValueTooLargeError(
                     f"text with ${{{expr}}} filled in would be too large "
-                    f"(more than {MAX_REPEAT_ITEMS:,} characters)"
+                    f"(more than {MAX_RESULT_SIZE:,} characters)"
                 )
-            out = out.replace(token, text)
+            out = out.replace(token, str(replacement))
         if out != value and _TEMPLATE_RE.search(out) is not None:
             return _render_templates(out, env, depth=depth + 1)
         return out
-    if isinstance(value, list):
-        return [_render_templates(v, env, depth=depth) for v in value]
-    if isinstance(value, dict):
-        return {k: _render_templates(v, env, depth=depth) for k, v in value.items()}
+    if isinstance(value, (list, dict)):
+        return _render_container(value, env, depth=depth)[0]
     return value
+
+
+def _render_container(
+    value: list[Any] | dict[Any, Any], env: dict[str, Any], *, depth: int
+) -> tuple[Any, int]:
+    """Render a list/dict item by item; also return the size of the text it built.
+
+    Items filled in one by one can grow a list of short templates into a huge
+    value, so the text built here is counted and capped. Values taken as they
+    are (a var's list) were capped when they were made and are not counted,
+    so passing one through costs nothing.
+    """
+    built = len(value)
+    items = value.items() if isinstance(value, dict) else enumerate(value)
+    out: dict[Any, Any] = {}
+    for key, item in items:
+        if isinstance(item, (list, dict)):
+            rendered, size = _render_container(item, env, depth=depth)
+        else:
+            rendered = _render_templates(item, env, depth=depth)
+            size = len(rendered) if isinstance(rendered, str) and rendered != item else 0
+        out[key] = rendered
+        built += size
+        if built > MAX_RESULT_SIZE:
+            raise ValueTooLargeError(
+                f"value would be too large once filled in (more than {MAX_RESULT_SIZE:,} characters)"
+            )
+    return (out if isinstance(value, dict) else list(out.values())), built
 
 
 def render_templates(value: Any, env: dict[str, Any]) -> Any:

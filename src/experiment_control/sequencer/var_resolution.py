@@ -59,7 +59,7 @@ def unresolved_vars(
 
     Returns the vars that read a name other than a var (set while running,
     e.g. `label: run_${i}` inside `for i`) with that name, and the error of
-    every other one.
+    every other one, including vars that refer back to themselves.
     """
     runtime: dict[str, list[str]] = {}
     errors: dict[str, str] = {}
@@ -68,7 +68,7 @@ def unresolved_vars(
         if not contains_template(value):
             continue
         try:
-            render_templates(value, env)
+            rendered = render_templates(value, env)
         except UnknownNameError as e:
             if e.name in resolved:
                 errors[str(key)] = str(e)
@@ -76,6 +76,12 @@ def unresolved_vars(
                 runtime[str(key)] = [e.name]
         except Exception as e:
             errors[str(key)] = str(e)
+        else:
+            # Rendering stops at a depth limit without raising: a cycle.
+            if contains_template(rendered):
+                errors[str(key)] = (
+                    f"{key} can't be resolved: it refers back to itself through other vars"
+                )
     return runtime, errors
 
 
