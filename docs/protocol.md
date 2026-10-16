@@ -591,7 +591,7 @@ Response:
 ### `sequencer.resolve_vars`
 Request:
 - `{"type": "sequencer.resolve_vars", "params": {"text": "<sequence yaml>", "vars_override": {"n_steps": 11}, "expressions": ["${sweep_start_hz}", "${freq_hz * 2}"]}}`
-- All params are optional. Without `text` the loaded sequence's vars are used. Only the top-level `vars` block is read, so the rest of the YAML may be incomplete.
+- All params are optional. Without `text` the loaded sequence's vars are used. Only the top-level `vars` block is read, so the rest of the YAML may be incomplete; the UI sends just that block, since parsing a long sequence would hold up the sequencer. Expressions are evaluated as the runtime sees them, after YAML decoding (escapes, folded lines).
 
 Response:
 - `{"ok": true, "result": {"vars": {"n_steps": 11, "sweep_start_hz": 995000000.0}, "base_vars": {"n_steps": 30, "sweep_start_hz": 985500000.0}, "formulas": {"sweep_start_hz": "${freq_center_hz - 0.5 * sweep_step_hz * (n_steps - 1)}"}, "derived": ["sweep_start_hz"], "overridden": ["n_steps"], "unknown_overrides": [], "runtime_vars": {}, "errors": {}, "expressions": {"${sweep_start_hz}": {"ok": true, "value": 995000000.0}, "${freq_hz * 2}": {"ok": false, "runtime": true, "names": ["freq_hz"]}}}}`

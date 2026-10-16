@@ -117,7 +117,7 @@ Allowed names:
 
 Limitations:
 - No imports, no attribute access on plain dicts, no subscripting.
-- `**` and `*` refuse results that would be huge before computing them: integers of more than 4000 digits, and strings or lists repeated to more than 1,000,000 items. The step fails with "result of ... would be too large" instead of the sequencer hanging.
+- Results that would be huge are refused before they are computed: integers of more than 4000 digits (`**`, `*`), and strings or lists of more than 1,000,000 items (`*`, `+`, `%` formatting widths, and text with templates filled in). The step fails with "... would be too large" instead of the sequencer hanging.
 - Use `extract`/`assign` to pull values from device call results.
 
 Examples:

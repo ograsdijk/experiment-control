@@ -128,6 +128,11 @@ class ResolveVarsRpcTests(unittest.TestCase):
         self.assertEqual(result["runtime_vars"], {"label": ["i"]})
         self.assertEqual(result["errors"], {})
 
+    def test_nan_var_is_not_changed_by_overrides(self) -> None:
+        text = "vars:\n  threshold: .nan\n  n: 3\n"
+        result = _resolve({"text": text, "vars_override": {"n": 5}})["result"]
+        self.assertEqual(result["base_vars"], {"n": 3})
+
     def test_invalid_yaml_is_an_error(self) -> None:
         resp = _resolve({"text": "vars: [unclosed"})
         self.assertFalse(resp.get("ok"))
@@ -147,6 +152,10 @@ class CostLimitTests(unittest.TestCase):
             "${(10**3000) * (10**3000)}",
             "${'x' * 10**10}",
             "${10**10 * 'x'}",
+            "${2 ** (10 ** 3999)}",
+            "${'%99999999d' % 1}",
+            "${'%.99999999f' % 1.0}",
+            "${'x' * 1000000 + 'y'}",
         ):
             with self.subTest(expr=expr), self.assertRaises(ValueTooLargeError):
                 render_templates(expr, {})
@@ -156,6 +165,22 @@ class CostLimitTests(unittest.TestCase):
         self.assertEqual(render_templates("${3 * 'ab'}", {}), "ababab")
         self.assertEqual(render_templates("${2**-2}", {}), 0.25)
         self.assertEqual(render_templates("${(-1)**10**9}", {}), 1)
+        self.assertEqual(render_templates("${'%05d' % 7}", {}), "00007")
+        self.assertEqual(render_templates("${'%.3f' % 1.23456}", {}), "1.235")
+        self.assertEqual(render_templates("${17 % 5}", {}), 2)
+        self.assertEqual(render_templates("f_${a}_${b}", {"a": 1, "b": "x"}), "f_1_x")
+
+    def test_text_built_from_templates_is_limited_too(self) -> None:
+        # While vars resolve, `v0 + v0` joins the two template strings, and
+        # filling those in builds the text without going through `+`.
+        raw = {"v0": "${'x' * 1000000}"}
+        for k in range(1, 13):
+            raw[f"v{k}"] = f"${{v{k - 1} + v{k - 1}}}"
+        resolved = resolve_vars(raw)
+        self.assertEqual(len(resolved["v0"]), 1_000_000)
+        runtime, errors = unresolved_vars(resolved)
+        self.assertEqual(runtime, {})
+        self.assertIn("too large", errors["v1"])
 
     def test_preview_reports_the_limit_as_an_error(self) -> None:
         result = _resolve({"text": "vars: {a: 1}", "expressions": ["${10**10**8}"]})["result"]

@@ -3869,7 +3869,7 @@ class SequencerProcess(ManagedProcessBase):
             result={
                 "vars": json_safe(resolved),
                 "base_vars": json_safe(
-                    {k: v for k, v in base.items() if resolved.get(k) != v}
+                    {k: v for k, v in base.items() if json_safe(resolved.get(k)) != json_safe(v)}
                 ),
                 "formulas": formulas,
                 "derived": sorted(formulas),

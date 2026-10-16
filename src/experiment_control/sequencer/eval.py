@@ -119,24 +119,55 @@ def _is_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
 
 
+_FORMAT_SPEC_RE = re.compile(
+    r"%(?:\([^)]*\))?[-#0 +]*(\*|\d+)?(?:\.(\*|\d+))?[hlL]?[a-zA-Z%]"
+)
+
+
+def _int_result_too_large(op: ast.operator, left: Any, right: Any) -> bool:
+    if isinstance(op, ast.Pow):
+        if right <= 0 or abs(left) <= 1:
+            return False
+        # The result has at least `right` bits: check that first, so log2 *
+        # right can't overflow a float for a huge exponent.
+        return right > _MAX_INT_BITS or math.log2(abs(left)) * right > _MAX_INT_BITS
+    if isinstance(op, ast.Mult):
+        return left.bit_length() + right.bit_length() > _MAX_INT_BITS + 1
+    return False
+
+
+def _sequence_result_too_large(op: ast.operator, left: Any, right: Any) -> bool:
+    sequence = (str, list, tuple)
+    if isinstance(op, ast.Mult):
+        seq, count = (left, right) if _is_int(right) else (right, left)
+        return isinstance(seq, sequence) and _is_int(count) and len(seq) * count > MAX_REPEAT_ITEMS
+    if isinstance(op, ast.Add):
+        return (
+            isinstance(left, sequence)
+            and isinstance(right, sequence)
+            and len(left) + len(right) > MAX_REPEAT_ITEMS
+        )
+    if isinstance(op, ast.Mod) and isinstance(left, str):
+        # printf-style formatting: a huge width or precision builds a huge string.
+        args = right if isinstance(right, tuple) else (right,)
+        for width, precision in _FORMAT_SPEC_RE.findall(left):
+            for size in (width, precision):
+                if size == "*":
+                    if any(_is_int(a) and a > MAX_REPEAT_ITEMS for a in args):
+                        return True
+                elif size and int(size) > MAX_REPEAT_ITEMS:
+                    return True
+    return False
+
+
 def _check_result_size(op: ast.operator, left: Any, right: Any, expr: str) -> None:
-    """Refuse `**` and `*` whose result would be huge, before computing it."""
+    """Refuse operations whose result would be huge, before computing them."""
     limit: str | None = None
-    if isinstance(op, ast.Pow) and _is_int(left) and _is_int(right) and right > 0:
-        if abs(left) > 1 and math.log2(abs(left)) * right > _MAX_INT_BITS:
+    if _is_int(left) and _is_int(right):
+        if _int_result_too_large(op, left, right):
             limit = f"more than {MAX_INT_DIGITS} digits"
-    elif isinstance(op, ast.Mult):
-        if _is_int(left) and _is_int(right):
-            if left.bit_length() + right.bit_length() > _MAX_INT_BITS + 1:
-                limit = f"more than {MAX_INT_DIGITS} digits"
-        else:
-            seq, count = (left, right) if _is_int(right) else (right, left)
-            if (
-                isinstance(seq, (str, list, tuple))
-                and _is_int(count)
-                and len(seq) * count > MAX_REPEAT_ITEMS
-            ):
-                limit = f"more than {MAX_REPEAT_ITEMS:,} items"
+    elif _sequence_result_too_large(op, left, right):
+        limit = f"more than {MAX_REPEAT_ITEMS:,} items"
     if limit:
         raise ValueTooLargeError(f"result of ${{{expr}}} would be too large ({limit})")
 
@@ -286,7 +317,14 @@ def _render_templates(value: Any, env: dict[str, Any], *, depth: int) -> Any:
             replacement = _eval_expr(expr, env)
             if isinstance(replacement, str) and _TEMPLATE_RE.search(replacement):
                 replacement = _render_templates(replacement, env, depth=depth + 1)
-            out = out.replace(match.group(0), str(replacement))
+            token, text = match.group(0), str(replacement)
+            # Substituting text joins strings without `+`: check the size here too.
+            if len(out) + out.count(token) * (len(text) - len(token)) > MAX_REPEAT_ITEMS:
+                raise ValueTooLargeError(
+                    f"text with ${{{expr}}} filled in would be too large "
+                    f"(more than {MAX_REPEAT_ITEMS:,} characters)"
+                )
+            out = out.replace(token, text)
         if out != value and _TEMPLATE_RE.search(out) is not None:
             return _render_templates(out, env, depth=depth + 1)
         return out
