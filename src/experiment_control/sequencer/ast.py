@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from ..contracts.context_fields import SEQUENCER_RUN_ID_FIELD
+from ..types import EXTRACTOR_KINDS, is_extractor_kind
 from ..utils.yaml_helpers import load_yaml_text
 from .eval import unknown_key_message
 from .ranges import validate_gen_keys
@@ -354,6 +355,11 @@ def _parse_step(raw: Any, path: str = "steps[0]") -> Step:
             raise TypeError("extract must be a dict")
         if assign is not None and not isinstance(assign, dict):
             raise TypeError("assign must be a dict")
+        if extract is not None:
+            _validate_extractor(extract, "extract")
+        for key, spec in (assign or {}).items():
+            if isinstance(spec, dict):
+                _validate_extractor(spec, f"assign.{key}")
         return CallStep(
             device=device,
             action=action,
@@ -593,6 +599,23 @@ def _normalize_watchdog_ids(raw_ids: Any) -> list[str] | None:
     return [str(item) for item in raw_ids]
 
 
+def _validate_extractor(spec: dict[str, Any], name: str) -> None:
+    # Checked at load so a typo fails before the call runs, not after the
+    # call has already acted on hardware and its result cannot be read.
+    kind = spec.get("kind", "scalar")
+    if not is_extractor_kind(kind):
+        raise TypeError(
+            f"{name}.kind must be one of {', '.join(EXTRACTOR_KINDS)}, got {kind!r}"
+        )
+    if kind == "scalar":
+        return
+    ref = spec.get("ref")
+    if ref is None:
+        raise TypeError(f"{name}.ref is required for kind {kind!r}")
+    if kind == "attr" and not isinstance(ref, str):
+        raise TypeError(f"{name}.ref must be a string for kind 'attr'")
+
+
 def _apply_watchdog_gate(steps: list[Step], watchdog_ids: list[str] | None) -> list[Step]:
     # `requires.watchdog_ids` declares watchdog rulesets this sequence depends
     # on (e.g. the laser-lock watchdog for a laser the sequence needs locked
@@ -616,8 +639,8 @@ def _apply_watchdog_gate(steps: list[Step], watchdog_ids: list[str] | None) -> l
             process="watchdog",
         )
 
-    enable_steps = [_watchdog_call("watchdog.enable", wid) for wid in watchdog_ids]
-    disable_steps = [_watchdog_call("watchdog.disable", wid) for wid in watchdog_ids]
+    enable_steps: list[Step] = [_watchdog_call("watchdog.enable", wid) for wid in watchdog_ids]
+    disable_steps: list[Step] = [_watchdog_call("watchdog.disable", wid) for wid in watchdog_ids]
     return [TryStep(body=enable_steps + steps, finally_steps=disable_steps)]
 
 

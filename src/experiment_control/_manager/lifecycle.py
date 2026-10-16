@@ -17,7 +17,7 @@ else:
     _MixinBase = object
 
 
-def _safe_call(cb: Callable[[], None]) -> None:
+def _safe_call(cb: Callable[[], object]) -> None:
     try:
         cb()
     except Exception:

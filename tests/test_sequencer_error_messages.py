@@ -11,7 +11,10 @@ from experiment_control.sequencer.eval import (
     eval_condition,
     render_templates,
 )
-from experiment_control.sequencer.runtime import SequencerRuntime
+from experiment_control.sequencer.runtime import (
+    SequencerRuntime,
+    _extract_from_result,
+)
 
 
 def _runtime(call=None, telemetry=None, call_process=None) -> SequencerRuntime:
@@ -327,6 +330,22 @@ class FieldAwareConversionTests(unittest.TestCase):
             call=lambda d, a, p: {"ok": True, "result": {"a": 1}},
         )
         self.assertEqual(rt.state, "STOPPED")
+
+    def test_unknown_extractor_kind_names_label(self) -> None:
+        # Load-time validation rejects this first; the runtime guard covers
+        # specs that reach the runtime without going through parse_sequence.
+        with self.assertRaisesRegex(
+            ValueError, r"^extract v: unknown extractor kind 'bogus'$"
+        ):
+            _extract_from_result({"a": 1}, {"kind": "bogus"}, label="extract v")
+
+    def test_extract_attr_success(self) -> None:
+        self.assertEqual(
+            _extract_from_result(
+                1 + 2j, {"kind": "attr", "ref": "imag"}, label="extract v"
+            ),
+            2.0,
+        )
 
 
 class ProcessErrorTextTests(unittest.TestCase):

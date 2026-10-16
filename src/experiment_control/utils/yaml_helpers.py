@@ -4,19 +4,10 @@ import re
 from pathlib import Path
 from typing import Any
 
-
-def _import_yaml() -> Any:
-    try:
-        import yaml  # type: ignore[import-not-found]
-    except Exception as e:  # pragma: no cover - dependency error
-        raise RuntimeError(f"PyYAML missing: {e}") from e
-    return yaml
+import yaml
 
 
-_YAML12_LOADER: Any = None
-
-
-def _yaml12_loader() -> Any:
+class _Yaml12Loader(yaml.SafeLoader):
     """SafeLoader that also reads YAML 1.2 floats such as `2.5e6` and `1e-3`.
 
     PyYAML implements YAML 1.1, which only resolves a float when the exponent
@@ -24,21 +15,13 @@ def _yaml12_loader() -> Any:
     YAML 1.2 parsers (e.g. the web editor's) read them as numbers, so
     sequence files must resolve them the same way.
     """
-    global _YAML12_LOADER
-    if _YAML12_LOADER is None:
-        yaml = _import_yaml()
-        float_re = re.compile(
-            r"^[-+]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)[eE][-+]?[0-9]+$"
-        )
 
-        class _Yaml12Loader(yaml.SafeLoader):  # type: ignore[misc]
-            pass
 
-        _Yaml12Loader.add_implicit_resolver(
-            "tag:yaml.org,2002:float", float_re, list("-+0123456789.")
-        )
-        _YAML12_LOADER = _Yaml12Loader
-    return _YAML12_LOADER
+_Yaml12Loader.add_implicit_resolver(
+    "tag:yaml.org,2002:float",
+    re.compile(r"^[-+]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)[eE][-+]?[0-9]+$"),
+    list("-+0123456789."),
+)
 
 
 class YamlLoadError(ValueError):
@@ -62,10 +45,9 @@ class YamlLoadError(ValueError):
 
 
 def load_yaml_text(text: str, *, source: str, yaml12_floats: bool = False) -> Any:
-    yaml = _import_yaml()
     try:
         if yaml12_floats:
-            return yaml.load(text, Loader=_yaml12_loader())  # noqa: S506 - SafeLoader subclass
+            return yaml.load(text, Loader=_Yaml12Loader)  # noqa: S506 - SafeLoader subclass
         return yaml.safe_load(text)
     except Exception as e:
         line: int | None = None

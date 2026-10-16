@@ -10,6 +10,7 @@ from typing import Any, Callable
 
 from ..contracts.context_fields import SEQUENCER_RUN_ID_FIELD
 from ..driver import extract_value
+from ..types import is_extractor_kind
 from .ast import (
     AdaptiveStep,
     AssignStep,
@@ -312,6 +313,8 @@ def _extract_from_result(result: Any, spec: Any, *, label: str) -> Any:
                 f"{label}: call result ({_type_label(result)}) has no attribute {ref!r}"
             )
         return getattr(result, ref)
+    if not is_extractor_kind(kind):
+        raise ValueError(f"{label}: unknown extractor kind {kind!r}")
     return extract_value(result, kind=kind, ref=ref)
 
 
