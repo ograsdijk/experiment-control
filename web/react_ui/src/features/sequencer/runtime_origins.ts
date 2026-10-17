@@ -24,15 +24,19 @@ export type RuntimeOrigins = Record<string, RuntimeOrigin>;
 
 const NAME_RE = /^[A-Za-z_]\w*(?:_\*)?$/;
 
+/** A step as parsed from its YAML snippet. */
+function parseStep(snippet: string): Record<string, unknown> | null {
+  try {
+    const parsed: unknown = parse(snippet);
+    return asRecord(Array.isArray(parsed) ? parsed[0] : parsed);
+  } catch {
+    return null;
+  }
+}
+
 /** The names a call step sets: `save_as`, `extract` (into `value` without one) and `assign`. */
 function callTargets(snippet: string): Array<{ name: string; label: string }> {
-  let parsed: unknown;
-  try {
-    parsed = parse(snippet);
-  } catch {
-    return [];
-  }
-  const step = asRecord(Array.isArray(parsed) ? parsed[0] : parsed);
+  const step = parseStep(snippet);
   if (!step) {
     return [];
   }

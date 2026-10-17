@@ -19,6 +19,7 @@ import type {
   SequencerWhileDetail,
 } from "./types";
 import { parseDocument } from "yaml";
+import { yamlSourceToDisplay } from "./value_text";
 import type { Node, YAMLMap } from "yaml";
 import {
   childNode,
@@ -75,11 +76,35 @@ type StepContainerContext = {
 };
 
 /**
- * Shortened text, but a value with a `${...}` is kept whole and its templates
- * exactly as written: the value chip needs the template text to match the
+ * A quoted value with a template ("${x}", as sequences usually write them)
+ * without its quotes, so the value chip isn't shown inside them. Without
+ * escapes the quotes are all there is to drop; with escapes it is decoded as
+ * the runtime sees it (the request evaluates decoded templates). Other
+ * quoted values, such as an empty string, stay as written.
+ */
+function unquoteTemplate(source: string): string {
+  const text = source.trim();
+  const quote = text[0];
+  if (
+    (quote !== '"' && quote !== "'") ||
+    text.length < 2 ||
+    text[text.length - 1] !== quote ||
+    !text.includes("${")
+  ) {
+    return source;
+  }
+  const inner = text.slice(1, -1);
+  const plain = quote === '"' ? !/["\\]/.test(inner) : !inner.includes("'");
+  return plain ? inner : yamlSourceToDisplay(text);
+}
+
+/**
+ * Shortened text, but a value with a `${...}` is kept whole, its templates
+ * unshortened: the value chip needs the template text to match an
  * expression the backend evaluated.
  */
-function compactValue(value: string, maxLength: number): string {
+function compactValue(source: string, maxLength: number): string {
+  const value = unquoteTemplate(source);
   if (!value.includes("${")) {
     return compactText(value, maxLength);
   }
@@ -448,7 +473,7 @@ function deriveSummary(
   if (kind === "sleep") {
     const duration = node.sleepDetail?.duration ?? (inline || null);
     if (duration) {
-      return `sleep ${duration}`;
+      return `sleep ${compactValue(duration, 56)}`;
     }
   }
   if (kind === "set" && node.setDetail) {
@@ -470,7 +495,7 @@ function deriveSummary(
   if (kind === "repeat") {
     const times = node.repeatDetail?.times;
     if (times) {
-      return `repeat ${times}${childCount > 0 ? ` (${childCount} step${childCount === 1 ? "" : "s"})` : ""}`;
+      return `repeat ${compactValue(times, 56)}${childCount > 0 ? ` (${childCount} step${childCount === 1 ? "" : "s"})` : ""}`;
     }
   }
   if (kind === "for" && node.forDetail) {
@@ -493,9 +518,14 @@ function deriveSummary(
     }
   }
   if (kind === "wait_until" && node.waitUntilDetail?.timeoutS) {
-    const timeout = node.waitUntilDetail.timeoutS;
+    const timeout = compactValue(node.waitUntilDetail.timeoutS, 56);
     // A template gets its unit from the value chip.
-    return timeout.includes("${") ? `timeout ${timeout}` : `timeout ${timeout}s`;
+    if (timeout.includes("${")) {
+      return `timeout ${timeout}`;
+    }
+    // A quoted number ("10") is seconds too.
+    const seconds = /^(["'])([-+]?[\d.]+(?:e[-+]?\d+)?)\1$/i.exec(timeout)?.[2] ?? timeout;
+    return `timeout ${seconds}s`;
   }
   if (kind === "if" && node.ifDetail) {
     const parts = [`then ${node.ifDetail.thenCount}`];

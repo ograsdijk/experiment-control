@@ -26,7 +26,14 @@ describe("formatShort", () => {
     expect(formatShort([1, 2, 3])).toBe("list[3]");
     expect(formatShort({ gen: { values: [0, 200, 400] } })).toBe("values ×3");
     expect(formatShort({ gen: { linspace: { start: 0, stop: 1, num: 11 } } })).toBe("linspace ×11");
-    expect(formatShort("freq1")).toBe('"freq1"');
+    expect(formatShort("freq1")).toBe("freq1");
+    // Quoted where bare text would read as something else.
+    expect(formatShort("")).toBe('""');
+    expect(formatShort("5")).toBe('"5"');
+    expect(formatShort("true")).toBe('"true"');
+    expect(formatShort("null")).toBe('"null"');
+    expect(formatShort(" ")).toBe('" "');
+    expect(formatShort(" abc")).toBe('" abc"');
     expect(formatShort(true)).toBe("true");
   });
 });
