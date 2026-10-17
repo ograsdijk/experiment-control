@@ -117,7 +117,8 @@ export type PanelCacheSlot = {
     | "bin2d"
     | "binStats"
     | "binStatsOverlay"
-    | "binStatsFitOverlay";
+    | "binStatsFitOverlay"
+    | "binStatsHistOverlay";
   outputIds: string[];
   alwaysReset?: boolean;
 };
@@ -195,6 +196,7 @@ export function useDaqWorkspaceApply(args: DaqWorkspaceApplyArgs) {
     streamBinStatsRef,
     streamBinStatsOverlayRef,
     streamBinStatsFitOverlayRef,
+    streamBinStatsHistOverlayRef,
   } = useTelemetry();
 
   const clearPanelCacheSlot = (
@@ -236,6 +238,11 @@ export function useDaqWorkspaceApply(args: DaqWorkspaceApplyArgs) {
       }
       case "binStatsFitOverlay": {
         const overlays = streamBinStatsFitOverlayRef.get(panelId);
+        for (const outputId of staleOutputIds) overlays?.delete(outputId);
+        return;
+      }
+      case "binStatsHistOverlay": {
+        const overlays = streamBinStatsHistOverlayRef.get(panelId);
         for (const outputId of staleOutputIds) overlays?.delete(outputId);
         return;
       }
@@ -459,18 +466,23 @@ export function useDaqWorkspaceApply(args: DaqWorkspaceApplyArgs) {
         const nextFitOverlayOutputIds = (
           panel.fitOverlayOutputIds ?? []
         ).filter((id) => fitOutputIds.has(id));
-        // Three independent stores. Changing the fit must not cost the
+        const nextHistOverlayOutputIds = (
+          panel.histOverlayOutputIds ?? []
+        ).filter((id) => histOutputIds.has(id) && id !== nextOutputId);
+        // Independent stores. Changing the fit must not cost the
         // histogram, and vice versa.
         cachePlans.set(panel.id, [
           { slot: "binStats", outputIds: [nextOutputId ?? ""] },
           { slot: "binStatsOverlay", outputIds: nextOverlayOutputIds },
           { slot: "binStatsFitOverlay", outputIds: nextFitOverlayOutputIds },
+          { slot: "binStatsHistOverlay", outputIds: nextHistOverlayOutputIds },
         ]);
         return {
           ...panel,
           outputId: nextOutputId,
           overlayOutputIds: nextOverlayOutputIds,
           fitOverlayOutputIds: nextFitOverlayOutputIds,
+          histOverlayOutputIds: nextHistOverlayOutputIds,
           stream: updated.stream,
           channelIndex: updated.channelIndex,
           analysis: updated.analysis,

@@ -133,6 +133,7 @@ export function normalizePlotState(
       outputId?: unknown;
       overlayOutputIds?: unknown;
       fitOverlayOutputIds?: unknown;
+      histOverlayOutputIds?: unknown;
       timeWindowS?: unknown;
       traces?: unknown;
       stream?: unknown;
@@ -449,6 +450,11 @@ export function normalizePlotState(
             .map((value) => String(value ?? "").trim())
             .filter((value) => value.length > 0)
         : [];
+      const histOverlayOutputIds = Array.isArray(panel.histOverlayOutputIds)
+        ? panel.histOverlayOutputIds
+            .map((value) => String(value ?? "").trim())
+            .filter((value) => value.length > 0)
+        : [];
       panels.push({
         id,
         title,
@@ -459,6 +465,7 @@ export function normalizePlotState(
         outputId: outputIdRaw || null,
         overlayOutputIds,
         fitOverlayOutputIds,
+        histOverlayOutputIds,
         stream: streamTarget,
         channelIndex,
         analysis: normalizeStreamAnalysisSettings(panel.analysis),
@@ -646,6 +653,7 @@ export function serializePlotState(
           : null,
         overlayOutputIds: [...panel.overlayOutputIds],
         fitOverlayOutputIds: [...panel.fitOverlayOutputIds],
+        histOverlayOutputIds: [...(panel.histOverlayOutputIds ?? [])],
         analysis: normalizeStreamAnalysisSettings(panel.analysis),
         binStats: normalizeStreamBinStatsSettings(panel.binStats),
       };

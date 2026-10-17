@@ -165,6 +165,10 @@ export function useStreamWorkspacePanelReconciler() {
           const fitOverlayOutputIds = (panel.fitOverlayOutputIds ?? []).filter(
             (id) => validFitOutputIds.has(id)
           );
+          const histOverlayOutputIds = (panel.histOverlayOutputIds ?? []).filter(
+            (id) =>
+              id !== outputId && workspaceOutputKind(workspace, id) === "hist_agg"
+          );
           const outputChanged = panel.outputId !== outputId;
           const overlayChanged = !sameStringArray(
             panel.overlayOutputIds ?? [],
@@ -174,11 +178,26 @@ export function useStreamWorkspacePanelReconciler() {
             panel.fitOverlayOutputIds ?? [],
             fitOverlayOutputIds
           );
-          if (!outputChanged && !overlayChanged && !fitOverlayChanged) {
+          const histOverlayChanged = !sameStringArray(
+            panel.histOverlayOutputIds ?? [],
+            histOverlayOutputIds
+          );
+          if (
+            !outputChanged &&
+            !overlayChanged &&
+            !fitOverlayChanged &&
+            !histOverlayChanged
+          ) {
             return panel;
           }
           changed = true;
-          return { ...panel, outputId, overlayOutputIds, fitOverlayOutputIds };
+          return {
+            ...panel,
+            outputId,
+            overlayOutputIds,
+            fitOverlayOutputIds,
+            histOverlayOutputIds,
+          };
         }
         if (isStreamBin2dPanel(panel)) {
           if (panel.outputId) {

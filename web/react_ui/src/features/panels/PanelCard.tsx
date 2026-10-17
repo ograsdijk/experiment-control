@@ -21,6 +21,7 @@ import {
   BIN_STATS_FIT_OVERLAY_COLORS,
   BIN_STATS_OVERLAY_COLORS,
   StreamBinStatsPanel,
+  binStatsHistOverlayColor,
   binStatsMeanStroke,
 } from "../../components/StreamBinStatsPanel";
 import { StreamBin2dPanel } from "../../components/StreamBin2dPanel";
@@ -254,6 +255,7 @@ function PanelCardImpl({
     streamExtraChannelSeries,
     streamBinStatsOverlaySeries,
     streamBinStatsFitOverlayCurves,
+    streamBinStatsHistOverlaySeries,
     isExpandablePlotPanel,
     copyTextToClipboard,
   } = helpers;
@@ -405,6 +407,11 @@ function PanelCardImpl({
         : traceOptions,
       fitOverlayOptions: isStreamBinStatsPanel(panel)
         ? workspaceOutputOptionsByKind(ws, "fit_1d")
+        : [],
+      histOverlayOptions: isStreamBinStatsPanel(panel)
+        ? workspaceOutputOptionsByKind(ws, "hist_agg").filter(
+            (option) => option.value !== panel.outputId
+          )
         : [],
       paramsOutputOptions: isStreamParamsPanel(panel)
         ? [
@@ -703,6 +710,9 @@ function PanelCardImpl({
   const binStatsFits = isStreamBinStatsPanel(panel)
     ? streamBinStatsFitOverlayCurves(panel)
     : [];
+  const binStatsHistOverlays = isStreamBinStatsPanel(panel)
+    ? streamBinStatsHistOverlaySeries(panel)
+    : [];
 
   // A trace's name comes from the panel's own override first, then from
   // the workspace label / derived output name, then from the raw id. The
@@ -745,7 +755,9 @@ function PanelCardImpl({
   }
   if (
     isStreamBinStatsPanel(panel) &&
-    (binStatsOverlays.length > 0 || binStatsFits.length > 0)
+    (binStatsOverlays.length > 0 ||
+      binStatsFits.length > 0 ||
+      binStatsHistOverlays.length > 0)
   ) {
     const meanKey = panel.outputId ?? "mean";
     legendItems.push({
@@ -760,6 +772,14 @@ function PanelCardImpl({
         label: seriesDisplayName(series.label),
         title: series.label,
         color: BIN_STATS_OVERLAY_COLORS[idx % BIN_STATS_OVERLAY_COLORS.length],
+      });
+    });
+    binStatsHistOverlays.forEach((overlay, idx) => {
+      legendItems.push({
+        key: overlay.label,
+        label: seriesDisplayName(overlay.label),
+        title: overlay.label,
+        color: binStatsHistOverlayColor(idx),
       });
     });
     binStatsFits.forEach((curve, idx) => {
@@ -1036,6 +1056,7 @@ function PanelCardImpl({
               panelId={panel.id}
               series={binStatsSnapshot?.series ?? null}
               overlaySeries={binStatsOverlays}
+              histOverlays={binStatsHistOverlays}
               fitOverlays={binStatsFits}
               xLabel={binStatsXLabel}
               uncertaintyMode={panel.uncertaintyMode}

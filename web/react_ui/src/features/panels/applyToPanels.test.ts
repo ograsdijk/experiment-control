@@ -50,6 +50,7 @@ function deps(panels: PlotPanelState[]): ApplyHelpersDeps {
     streamExtraChannelRef: new Map(),
     streamBinStatsOverlayRef: new Map(),
     streamBinStatsFitOverlayRef: new Map(),
+    streamBinStatsHistOverlayRef: new Map(),
     streamParamsLatestRef: new Map(),
     streamBinStatsRef: new Map(),
     streamBin2dRef: new Map(),
@@ -193,6 +194,7 @@ describe("stream-analysis reverse routing", () => {
       outputId: "hist_out",
       overlayOutputIds: ["overlay_out"],
       fitOverlayOutputIds: ["fit_out"],
+      histOverlayOutputIds: ["hist_overlay_out"],
       stream: null,
       channelIndex: 0,
       analysis,
@@ -238,6 +240,12 @@ describe("stream-analysis reverse routing", () => {
     ["bin", output("overlay_out", "trace", [1, 2])],
     ["bin", output("fit_out", "fit_1d", { x: [0], yhat: [1] })],
     [
+      "bin",
+      output("hist_overlay_out", "hist_agg", {
+        x_bins: [0], mean: [1], std: [0], sem: [0], count: [1],
+      }),
+    ],
+    [
       "bin2d",
       output("hist2d_out", "hist2d", {
         x_bins: [0], y_bins: [0], count: [[1]], sum: [[1]], mean: [[1]],
@@ -248,5 +256,19 @@ describe("stream-analysis reverse routing", () => {
     expect([...applyStreamAnalysisOutputToPanels(deps(panels), message)]).toEqual([
       panelId,
     ]);
+  });
+
+  it("keeps a histogram overlay out of the primary histogram cache", () => {
+    const d = deps(panels);
+    applyStreamAnalysisOutputToPanels(
+      d,
+      output("hist_overlay_out", "hist_agg", {
+        x_bins: [0, 1], mean: [3, 4], std: [0, 0], sem: [0.1, 0.2], count: [2, 2],
+      })
+    );
+    expect(d.streamBinStatsRef.has("bin")).toBe(false);
+    expect(
+      d.streamBinStatsHistOverlayRef.get("bin")?.get("hist_overlay_out")?.series.mean
+    ).toEqual([3, 4]);
   });
 });

@@ -192,6 +192,7 @@ import { usePanelLifecycle } from "./features/panels/usePanelLifecycle";
 import { usePanelTitleEditor } from "./features/panels/usePanelTitleEditor";
 import {
   streamBinStatsFitOverlayCurves as streamBinStatsFitOverlayCurvesImpl,
+  streamBinStatsHistOverlaySeries as streamBinStatsHistOverlaySeriesImpl,
   streamBinStatsOverlaySeries as streamBinStatsOverlaySeriesImpl,
   streamExtraChannelSeries as streamExtraChannelSeriesImpl,
   streamTraceOverlaySeries as streamTraceOverlaySeriesImpl,
@@ -671,6 +672,7 @@ export function App() {
     streamExtraChannelRef,
     streamBinStatsOverlayRef,
     streamBinStatsFitOverlayRef,
+    streamBinStatsHistOverlayRef,
     streamParamsLatestRef,
     streamBinStatsRef,
     streamBin2dRef,
@@ -965,6 +967,7 @@ export function App() {
     setStreamParamsPanelOutputs,
     setStreamBinStatsOverlayOutputs,
     setStreamBinStatsFitOverlayOutputs,
+    setStreamBinStatsHistOverlayOutputs,
   } = useStreamWorkspaceHandlers({
     clearPanelBuffers,
   });
@@ -986,6 +989,9 @@ export function App() {
   const streamBinStatsFitOverlayCurves = (
     panel: Parameters<typeof streamBinStatsFitOverlayCurvesImpl>[0]
   ) => streamBinStatsFitOverlayCurvesImpl(panel, streamBinStatsFitOverlayRef);
+  const streamBinStatsHistOverlaySeries = (
+    panel: Parameters<typeof streamBinStatsHistOverlaySeriesImpl>[0]
+  ) => streamBinStatsHistOverlaySeriesImpl(panel, streamBinStatsHistOverlayRef);
   const hdfWriterProcess = useMemo(
     () => processes.find(isHdfWriterProcess) ?? null,
     [processes]
@@ -1443,6 +1449,11 @@ export function App() {
         streamBinStatsFitOverlayRef.delete(id);
       }
     }
+    for (const id of streamBinStatsHistOverlayRef.keys()) {
+      if (!ids.has(id)) {
+        streamBinStatsHistOverlayRef.delete(id);
+      }
+    }
     for (const id of streamParamsLatestRef.keys()) {
       if (!ids.has(id)) {
         streamParamsLatestRef.delete(id);
@@ -1465,6 +1476,7 @@ export function App() {
         streamExtraChannelRef.delete(panel.id);
         streamBinStatsOverlayRef.delete(panel.id);
         streamBinStatsFitOverlayRef.delete(panel.id);
+        streamBinStatsHistOverlayRef.delete(panel.id);
         streamParamsLatestRef.delete(panel.id);
         streamBinStatsRef.delete(panel.id);
         streamBin2dRef.delete(panel.id);
@@ -1476,6 +1488,7 @@ export function App() {
         streamBin2dRef.delete(panel.id);
         streamBinStatsOverlayRef.delete(panel.id);
         streamBinStatsFitOverlayRef.delete(panel.id);
+        streamBinStatsHistOverlayRef.delete(panel.id);
         streamParamsLatestRef.delete(panel.id);
         buffersRef.delete(panel.id);
         if (!streamFramesRef.has(panel.id)) {
@@ -1498,6 +1511,9 @@ export function App() {
         if (!streamBinStatsFitOverlayRef.has(panel.id)) {
           streamBinStatsFitOverlayRef.set(panel.id, new Map());
         }
+        if (!streamBinStatsHistOverlayRef.has(panel.id)) {
+          streamBinStatsHistOverlayRef.set(panel.id, new Map());
+        }
         streamBin2dRef.delete(panel.id);
       } else if (isStreamParamsPanel(panel)) {
         buffersRef.delete(panel.id);
@@ -1506,6 +1522,7 @@ export function App() {
         streamExtraChannelRef.delete(panel.id);
         streamBinStatsOverlayRef.delete(panel.id);
         streamBinStatsFitOverlayRef.delete(panel.id);
+        streamBinStatsHistOverlayRef.delete(panel.id);
         streamBinStatsRef.delete(panel.id);
         streamBin2dRef.delete(panel.id);
         if (!streamParamsLatestRef.has(panel.id)) {
@@ -1518,6 +1535,7 @@ export function App() {
         streamExtraChannelRef.delete(panel.id);
         streamBinStatsOverlayRef.delete(panel.id);
         streamBinStatsFitOverlayRef.delete(panel.id);
+        streamBinStatsHistOverlayRef.delete(panel.id);
         streamParamsLatestRef.delete(panel.id);
         streamBinStatsRef.delete(panel.id);
       }
@@ -1550,6 +1568,7 @@ export function App() {
     streamExtraChannelRef,
     streamBinStatsOverlayRef,
     streamBinStatsFitOverlayRef,
+    streamBinStatsHistOverlayRef,
     streamParamsLatestRef,
     streamBinStatsRef,
     streamBin2dRef,
@@ -1750,6 +1769,7 @@ export function App() {
     streamExtraChannelRef,
     streamBinStatsOverlayRef,
     streamBinStatsFitOverlayRef,
+    streamBinStatsHistOverlayRef,
     streamParamsLatestRef,
     streamBinStatsRef,
     streamBin2dRef,
@@ -2565,6 +2585,7 @@ export function App() {
     streamExtraChannelSeries,
     streamBinStatsOverlaySeries,
     streamBinStatsFitOverlayCurves,
+    streamBinStatsHistOverlaySeries,
     isExpandablePlotPanel,
     copyTextToClipboard,
   };
@@ -2610,6 +2631,7 @@ export function App() {
     setStreamParamsPanelOutputs,
     setStreamBinStatsOverlayOutputs,
     setStreamBinStatsFitOverlayOutputs,
+    setStreamBinStatsHistOverlayOutputs,
     setStreamBinStatsUncertainty,
     setStreamBinStatsShowBinMarkers,
     setStreamBinStatsXAxisTransform,
@@ -2627,6 +2649,8 @@ export function App() {
         panelHelpersRef.current!.streamBinStatsOverlaySeries(panel),
       streamBinStatsFitOverlayCurves: (panel) =>
         panelHelpersRef.current!.streamBinStatsFitOverlayCurves(panel),
+      streamBinStatsHistOverlaySeries: (panel) =>
+        panelHelpersRef.current!.streamBinStatsHistOverlaySeries(panel),
       isExpandablePlotPanel: (panel) =>
         panelHelpersRef.current!.isExpandablePlotPanel(panel),
       copyTextToClipboard: (label, text) =>
@@ -2738,6 +2762,11 @@ export function App() {
         ),
       setStreamBinStatsFitOverlayOutputs: (panelId, outputIds) =>
         panelHandlersRef.current!.setStreamBinStatsFitOverlayOutputs(
+          panelId,
+          outputIds
+        ),
+      setStreamBinStatsHistOverlayOutputs: (panelId, outputIds) =>
+        panelHandlersRef.current!.setStreamBinStatsHistOverlayOutputs(
           panelId,
           outputIds
         ),
@@ -3540,6 +3569,7 @@ export function App() {
               streamExtraChannelSeries={streamExtraChannelSeries}
               streamBinStatsOverlaySeries={streamBinStatsOverlaySeries}
               streamBinStatsFitOverlayCurves={streamBinStatsFitOverlayCurves}
+              streamBinStatsHistOverlaySeries={streamBinStatsHistOverlaySeries}
             />
           ) : null
         }

@@ -3,7 +3,10 @@ import { useComputedColorScheme } from "@mantine/core";
 
 import { PlotPanel } from "../../components/PlotPanel";
 import { StreamBin2dPanel } from "../../components/StreamBin2dPanel";
-import { StreamBinStatsPanel } from "../../components/StreamBinStatsPanel";
+import {
+  StreamBinStatsPanel,
+  type StreamBinStatsHistOverlay,
+} from "../../components/StreamBinStatsPanel";
 import { StreamRawPanel } from "../../components/StreamRawPanel";
 import { StreamWaterfallPanel } from "../../components/StreamWaterfallPanel";
 import {
@@ -54,8 +57,9 @@ import {
  *   mode.
  * - `streamTraceOverlaySeries` — App-local thin wrapper around the
  *   overlay-helpers module; binds the overlay refs.
- * - `streamBinStatsOverlaySeries` / `streamBinStatsFitOverlayCurves`
- *   — same shape, for the bin-stats panel.
+ * - `streamBinStatsOverlaySeries` / `streamBinStatsFitOverlayCurves` /
+ *   `streamBinStatsHistOverlaySeries` — same shape, for the bin-stats
+ *   panel.
  *
  * Context state (panels tick, buffers/frames/snapshots refs, stream
  * workspaces, color scheme) is pulled directly from the relevant
@@ -79,6 +83,9 @@ export interface ExpandedPlotBodyProps {
   streamBinStatsFitOverlayCurves: (
     panel: PlotStreamBinStatsPanelState
   ) => Array<{ label: string; x: number[]; y: number[] }>;
+  streamBinStatsHistOverlaySeries: (
+    panel: PlotStreamBinStatsPanelState
+  ) => StreamBinStatsHistOverlay[];
 }
 
 const PLOT_HEIGHT = 640;
@@ -90,6 +97,7 @@ export function ExpandedPlotBody({
   streamExtraChannelSeries,
   streamBinStatsOverlaySeries,
   streamBinStatsFitOverlayCurves,
+  streamBinStatsHistOverlaySeries,
 }: ExpandedPlotBodyProps) {
   const panelRevision = usePanelRevision(panel.id);
   useEffect(() => {
@@ -195,6 +203,7 @@ export function ExpandedPlotBody({
         panelId={panel.id}
         series={(streamBinStatsRef.get(panel.id) ?? null)?.series ?? null}
         overlaySeries={streamBinStatsOverlaySeries(panel)}
+        histOverlays={streamBinStatsHistOverlaySeries(panel)}
         fitOverlays={streamBinStatsFitOverlayCurves(panel)}
         xLabel={workspaceXAxisLabel(streamWorkspace, panel.outputId)}
         uncertaintyMode={panel.uncertaintyMode}
