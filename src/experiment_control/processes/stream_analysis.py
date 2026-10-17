@@ -151,6 +151,85 @@ class WorkspaceRevisionConflict(RuntimeError):
         self.current_revision = current_revision
 
 
+class _ScanValueGroups:
+    """Running per-x accumulators for an auto-range histogram.
+
+    Samples are grouped by x (to 15 significant digits) as they arrive,
+    keeping a count and running sums per group, so rebinning at emit time
+    costs O(unique x) instead of O(samples). Within a group the sums are
+    accumulated in arrival order, exactly as summing the raw samples did.
+    """
+
+    __slots__ = ("_width", "_groups", "min_x", "max_x")
+
+    def __init__(self, width: int) -> None:
+        self._width = int(width)
+        # key -> [x, count, sum_0, ..., sum_{width-1}]
+        self._groups: dict[str, list[float]] = {}
+        self.min_x: float | None = None
+        self.max_x: float | None = None
+
+    def __len__(self) -> int:
+        return len(self._groups)
+
+    def clear(self) -> None:
+        self._groups.clear()
+        self.min_x = None
+        self.max_x = None
+
+    def add(self, x: float, values: tuple[float, ...]) -> None:
+        key = format(x, ".15g")
+        group = self._groups.get(key)
+        if group is None:
+            group = [x, 0.0] + [0.0] * self._width
+            self._groups[key] = group
+        group[1] += 1.0
+        for index, value in enumerate(values):
+            group[2 + index] += value
+        if self.min_x is None or x < self.min_x:
+            self.min_x = x
+        if self.max_x is None or x > self.max_x:
+            self.max_x = x
+
+    def sorted_arrays(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Return (x, counts, sums[width, groups]) sorted by x."""
+        rows = sorted(self._groups.values(), key=lambda group: group[0])
+        table = np.asarray(rows, dtype=np.float64).reshape(len(rows), 2 + self._width)
+        return (
+            table[:, 0],
+            table[:, 1].astype(np.int64),
+            np.ascontiguousarray(table[:, 2:].T),
+        )
+
+    def binned(
+        self, max_bin_count: int
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, float, float]:
+        """Re-bin the groups into equal-width bins over the sample range.
+
+        Returns (centers, counts, sums[width, bins], x_min, x_max).
+        """
+        xs, counts, sums = self.sorted_arrays()
+        assert self.min_x is not None and self.max_x is not None
+        active_bins = max(1, min(int(max_bin_count), len(xs)))
+        min_use = self.min_x
+        max_use = self.max_x
+        if not (max_use > min_use):
+            eps = max(abs(min_use) * 1e-9, 1e-9)
+            min_use -= eps
+            max_use += eps
+        frac = np.clip((xs - min_use) / (max_use - min_use), 0.0, 1.0)
+        idx = np.minimum(np.floor(frac * active_bins).astype(np.int64), active_bins - 1)
+        binned_counts = np.bincount(
+            idx, weights=counts.astype(np.float64), minlength=active_bins
+        ).astype(np.int64)
+        binned_sums = np.stack(
+            [np.bincount(idx, weights=row, minlength=active_bins) for row in sums]
+        )
+        edges = np.linspace(min_use, max_use, active_bins + 1, dtype=np.float64)
+        centers = (edges[:-1] + edges[1:]) * 0.5
+        return centers, binned_counts, binned_sums, float(min_use), float(max_use)
+
+
 @dataclass
 class BinStatsState:
     auto_range: bool
@@ -161,8 +240,7 @@ class BinStatsState:
     counts: np.ndarray
     sums: np.ndarray
     sums_sq: np.ndarray
-    samples_x: list[float]
-    samples_y: list[float]
+    groups: _ScanValueGroups = field(default_factory=lambda: _ScanValueGroups(2))
     dropped_samples: int = 0
     auto_bins_dirty: bool = False
 
@@ -182,8 +260,6 @@ class BinStatsState:
                 counts=np.zeros(0, dtype=np.int64),
                 sums=np.zeros(0, dtype=np.float64),
                 sums_sq=np.zeros(0, dtype=np.float64),
-                samples_x=[],
-                samples_y=[],
                 dropped_samples=0,
                 auto_bins_dirty=False,
             )
@@ -200,8 +276,6 @@ class BinStatsState:
             counts=np.zeros(int(bin_count), dtype=np.int64),
             sums=np.zeros(int(bin_count), dtype=np.float64),
             sums_sq=np.zeros(int(bin_count), dtype=np.float64),
-            samples_x=[],
-            samples_y=[],
             dropped_samples=0,
             auto_bins_dirty=False,
         )
@@ -213,8 +287,7 @@ class BinStatsState:
         self.counts.fill(0)
         self.sums.fill(0.0)
         self.sums_sq.fill(0.0)
-        self.samples_x.clear()
-        self.samples_y.clear()
+        self.groups.clear()
         if self.auto_range:
             self.counts = np.zeros(0, dtype=np.int64)
             self.sums = np.zeros(0, dtype=np.float64)
@@ -233,12 +306,12 @@ class BinStatsState:
             self.dropped_samples += 1
             return None
         if self.auto_range:
-            self.samples_x.append(float(x))
-            self.samples_y.append(float(y))
+            y = float(y)
+            self.groups.add(float(x), (y, y * y))
             # For auto-range we avoid re-binning on every sample; defer to emit tick.
             self.auto_bins_dirty = True
             idx = None
-            return {"x": float(x), "y": float(y), "bin_index": idx}
+            return {"x": float(x), "y": y, "bin_index": idx}
 
         idx = self._bin_index_runtime(float(x))
         if idx is None:
@@ -270,7 +343,8 @@ class BinStatsState:
         return idx
 
     def _recompute_auto_bins(self) -> None:
-        if not self.samples_x:
+        groups = self.groups
+        if len(groups) == 0:
             self.x_min = None
             self.x_max = None
             self.centers = np.zeros(0, dtype=np.float64)
@@ -278,61 +352,18 @@ class BinStatsState:
             self.sums = np.zeros(0, dtype=np.float64)
             self.sums_sq = np.zeros(0, dtype=np.float64)
             return
-        xs = np.asarray(self.samples_x, dtype=np.float64)
-        ys = np.asarray(self.samples_y, dtype=np.float64)
-        min_x = float(np.min(xs))
-        max_x = float(np.max(xs))
-        grouped: dict[str, tuple[float, list[float]]] = {}
-        for x_value, y_value in zip(self.samples_x, self.samples_y, strict=False):
-            key = format(float(x_value), ".15g")
-            existing = grouped.get(key)
-            if existing is None:
-                grouped[key] = (float(x_value), [float(y_value)])
-            else:
-                grouped[key][1].append(float(y_value))
-        unique_count = len(grouped)
-        if unique_count <= int(self.max_bin_count):
-            sorted_items = sorted(grouped.values(), key=lambda item: item[0])
-            centers = np.asarray([item[0] for item in sorted_items], dtype=np.float64)
-            counts = np.asarray([len(item[1]) for item in sorted_items], dtype=np.int64)
-            sums = np.asarray(
-                [float(sum(item[1])) for item in sorted_items], dtype=np.float64
+        if len(groups) <= int(self.max_bin_count):
+            centers, counts, sums = groups.sorted_arrays()
+            self.x_min = groups.min_x
+            self.x_max = groups.max_x
+        else:
+            centers, counts, sums, self.x_min, self.x_max = groups.binned(
+                self.max_bin_count
             )
-            sums_sq = np.asarray(
-                [float(sum((v * v) for v in item[1])) for item in sorted_items],
-                dtype=np.float64,
-            )
-            self.centers = centers
-            self.counts = counts
-            self.sums = sums
-            self.sums_sq = sums_sq
-            self.x_min = float(min_x)
-            self.x_max = float(max_x)
-            return
-
-        active_bins = max(1, min(int(self.max_bin_count), int(unique_count)))
-        min_use = min_x
-        max_use = max_x
-        if not (max_use > min_use):
-            eps = max(abs(min_use) * 1e-9, 1e-9)
-            min_use -= eps
-            max_use += eps
-        span = max_use - min_use
-        frac = np.clip((xs - min_use) / span, 0.0, 1.0)
-        idx = np.minimum(np.floor(frac * active_bins).astype(np.int64), active_bins - 1)
-        self.counts = np.bincount(idx, minlength=active_bins).astype(
-            np.int64, copy=False
-        )
-        self.sums = np.bincount(idx, weights=ys, minlength=active_bins).astype(
-            np.float64, copy=False
-        )
-        self.sums_sq = np.bincount(idx, weights=ys * ys, minlength=active_bins).astype(
-            np.float64, copy=False
-        )
-        edges = np.linspace(min_use, max_use, active_bins + 1, dtype=np.float64)
-        self.centers = (edges[:-1] + edges[1:]) * 0.5
-        self.x_min = float(min_use)
-        self.x_max = float(max_use)
+        self.centers = centers
+        self.counts = counts
+        self.sums = sums[0]
+        self.sums_sq = sums[1]
 
     def payload(self, *, last_sample: Json | None) -> Json:
         if self.auto_range and self.auto_bins_dirty:
@@ -409,9 +440,7 @@ class BinRatioStatsState:
     numerator_sums_sq: np.ndarray
     denominator_sums_sq: np.ndarray
     product_sums: np.ndarray
-    samples_x: list[float]
-    samples_numerator: list[float]
-    samples_denominator: list[float]
+    groups: _ScanValueGroups = field(default_factory=lambda: _ScanValueGroups(5))
     dropped_samples: int = 0
     auto_bins_dirty: bool = False
 
@@ -438,9 +467,6 @@ class BinRatioStatsState:
             numerator_sums_sq=np.zeros(array_size, dtype=np.float64),
             denominator_sums_sq=np.zeros(array_size, dtype=np.float64),
             product_sums=np.zeros(array_size, dtype=np.float64),
-            samples_x=[],
-            samples_numerator=[],
-            samples_denominator=[],
         )
 
     def reset(self) -> None:
@@ -452,9 +478,7 @@ class BinRatioStatsState:
             array.fill(0)
         if self.auto_range:
             self._replace_accumulators(0)
-        self.samples_x.clear()
-        self.samples_numerator.clear()
-        self.samples_denominator.clear()
+        self.groups.clear()
         self.dropped_samples = 0
         self.auto_bins_dirty = False
 
@@ -486,9 +510,16 @@ class BinRatioStatsState:
             self.dropped_samples += 1
             return None
         if self.auto_range:
-            self.samples_x.append(x)
-            self.samples_numerator.append(numerator)
-            self.samples_denominator.append(denominator)
+            self.groups.add(
+                x,
+                (
+                    numerator,
+                    denominator,
+                    numerator * numerator,
+                    denominator * denominator,
+                    numerator * denominator,
+                ),
+            )
             self.auto_bins_dirty = True
             return {
                 "x": x,
@@ -530,71 +561,30 @@ class BinRatioStatsState:
         self.product_sums[idx] += numerator * denominator
 
     def _recompute_auto_bins(self) -> None:
-        if not self.samples_x:
+        groups = self.groups
+        if len(groups) == 0:
             self.x_min = None
             self.x_max = None
             self.centers = np.zeros(0, dtype=np.float64)
             self._replace_accumulators(0)
             return
-        xs = np.asarray(self.samples_x, dtype=np.float64)
-        numerators = np.asarray(self.samples_numerator, dtype=np.float64)
-        denominators = np.asarray(self.samples_denominator, dtype=np.float64)
-        min_x = float(np.min(xs))
-        max_x = float(np.max(xs))
-        grouped: dict[str, tuple[float, list[tuple[float, float]]]] = {}
-        for x, numerator, denominator in zip(
-            self.samples_x,
-            self.samples_numerator,
-            self.samples_denominator,
-            strict=True,
-        ):
-            key = format(x, ".15g")
-            existing = grouped.get(key)
-            if existing is None:
-                grouped[key] = (x, [(numerator, denominator)])
-            else:
-                existing[1].append((numerator, denominator))
-        if len(grouped) <= self.max_bin_count:
-            items = sorted(grouped.values(), key=lambda item: item[0])
-            self.centers = np.asarray([item[0] for item in items], dtype=np.float64)
-            self._replace_accumulators(len(items))
-            for idx, (_, pairs) in enumerate(items):
-                for numerator, denominator in pairs:
-                    self._add_to_bin(idx, numerator, denominator)
-            self.x_min = min_x
-            self.x_max = max_x
-            return
-        active_bins = max(1, min(self.max_bin_count, len(grouped)))
-        min_use = min_x
-        max_use = max_x
-        if not max_use > min_use:
-            eps = max(abs(min_use) * 1e-9, 1e-9)
-            min_use -= eps
-            max_use += eps
-        fraction = np.clip((xs - min_use) / (max_use - min_use), 0.0, 1.0)
-        indices = np.minimum(
-            np.floor(fraction * active_bins).astype(np.int64), active_bins - 1
-        )
-        self.counts = np.bincount(indices, minlength=active_bins).astype(np.int64)
-        self.numerator_sums = np.bincount(
-            indices, weights=numerators, minlength=active_bins
-        )
-        self.denominator_sums = np.bincount(
-            indices, weights=denominators, minlength=active_bins
-        )
-        self.numerator_sums_sq = np.bincount(
-            indices, weights=numerators * numerators, minlength=active_bins
-        )
-        self.denominator_sums_sq = np.bincount(
-            indices, weights=denominators * denominators, minlength=active_bins
-        )
-        self.product_sums = np.bincount(
-            indices, weights=numerators * denominators, minlength=active_bins
-        )
-        edges = np.linspace(min_use, max_use, active_bins + 1, dtype=np.float64)
-        self.centers = (edges[:-1] + edges[1:]) * 0.5
-        self.x_min = min_use
-        self.x_max = max_use
+        if len(groups) <= self.max_bin_count:
+            centers, counts, sums = groups.sorted_arrays()
+            self.x_min = groups.min_x
+            self.x_max = groups.max_x
+        else:
+            centers, counts, sums, self.x_min, self.x_max = groups.binned(
+                self.max_bin_count
+            )
+        self.centers = centers
+        self.counts = counts
+        (
+            self.numerator_sums,
+            self.denominator_sums,
+            self.numerator_sums_sq,
+            self.denominator_sums_sq,
+            self.product_sums,
+        ) = (np.array(row) for row in sums)
 
     def payload(self, *, last_sample: Json | None) -> Json:
         if self.auto_range and self.auto_bins_dirty:
