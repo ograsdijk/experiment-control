@@ -51,4 +51,20 @@ describe("buildRuntimeOrigins", () => {
     expect(origins.value.label).toBe("extract");
     expect(origins.locked.label).toBe("assign");
   });
+
+  it("takes the name of an assign whose value is a mapping", () => {
+    const nested = buildRuntimeOrigins(
+      buildSequencerStepOutline(
+        [
+          "steps:",
+          "  - assign:",
+          "      freq_hz:",
+          "        call:",
+          '          device: "${synth_device}"',
+          "          action: get_frequency",
+        ].join("\n")
+      )
+    );
+    expect(Object.keys(nested)).toEqual(["freq_hz"]);
+  });
 });

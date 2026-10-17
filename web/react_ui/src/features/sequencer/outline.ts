@@ -19,6 +19,7 @@ import type {
   SequencerWhileDetail,
 } from "./types";
 import { parseDocument } from "yaml";
+import { yamlSourceToDisplay } from "./value_text";
 import type { Node } from "yaml";
 import {
   childNode,
@@ -79,7 +80,10 @@ type StepContainerContext = {
  * exactly as written: the value chip needs the template text to match the
  * expression the backend evaluated.
  */
-function compactValue(value: string, maxLength: number): string {
+function compactValue(source: string, maxLength: number): string {
+  // Quoted in the YAML ("${x}", as sequences usually write templates): show
+  // it unquoted, as the editor fields do, so the chip isn't inside quotes.
+  const value = yamlSourceToDisplay(source);
   if (!value.includes("${")) {
     return compactText(value, maxLength);
   }
@@ -416,7 +420,7 @@ function deriveSummary(
   if (kind === "sleep") {
     const duration = node.sleepDetail?.duration ?? (inline || null);
     if (duration) {
-      return `sleep ${duration}`;
+      return `sleep ${compactValue(duration, 56)}`;
     }
   }
   if (kind === "set" && node.setDetail) {
@@ -437,7 +441,7 @@ function deriveSummary(
   if (kind === "repeat") {
     const times = node.repeatDetail?.times;
     if (times) {
-      return `repeat ${times}${childCount > 0 ? ` (${childCount} step${childCount === 1 ? "" : "s"})` : ""}`;
+      return `repeat ${compactValue(times, 56)}${childCount > 0 ? ` (${childCount} step${childCount === 1 ? "" : "s"})` : ""}`;
     }
   }
   if (kind === "for" && node.forDetail) {
@@ -460,7 +464,7 @@ function deriveSummary(
     }
   }
   if (kind === "wait_until" && node.waitUntilDetail?.timeoutS) {
-    const timeout = node.waitUntilDetail.timeoutS;
+    const timeout = compactValue(node.waitUntilDetail.timeoutS, 56);
     // A template gets its unit from the value chip.
     return timeout.includes("${") ? `timeout ${timeout}` : `timeout ${timeout}s`;
   }

@@ -74,8 +74,10 @@ export function buildRuntimeOrigins(outline: ReadonlyArray<SequencerStepOutlineN
           : origin("loop", `loop variable of ${at}`, forSourceText(node.forDetail!))
       );
     }
+    // An assign whose value is a mapping (`freq_hz: {call: ...}`) comes as
+    // flattened entries (`freq_hz.call.device`): the name is the first part.
     for (const entry of node.assignDetail?.entries ?? []) {
-      add(entry.name, origin("assign", `set by ${at}`));
+      add(entry.name.split(".")[0], origin("assign", `set by ${at}`));
     }
     if (node.adaptiveDetail) {
       for (const group of node.adaptiveDetail.space) {

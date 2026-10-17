@@ -37,6 +37,14 @@ describe("YAML value chips", () => {
     expect(chipsFor(doc, { resolved, liveEnv: null, nextRunOverrides: null })).toEqual(["ƒ4"]);
   });
 
+  it("puts the chip after the closing quote of a quoted template", () => {
+    const doc = ["vars:", "  a: 2", "steps:", '  - sleep: "${a}"'].join("\n");
+    const resolved = normalizeResolvedVars({ vars: { a: 2 } });
+    expect(chipsFor(doc, { resolved, liveEnv: null, nextRunOverrides: null })).toEqual(["2"]);
+    const line = view!.dom.querySelector(".cm-ec-value")!.closest(".cm-line")!;
+    expect(line.textContent).toBe('  - sleep: "${a}"2');
+  });
+
   it("shows a var definition chip instead of its template chip", () => {
     const doc = ["vars:", "  a: 2", "  b: ${a * 3}", "steps:", "  - sleep: ${b}"].join("\n");
     const resolved = normalizeResolvedVars({

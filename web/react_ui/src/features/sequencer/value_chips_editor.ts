@@ -143,8 +143,11 @@ function buildDecorations(view: EditorView, defs: Map<number, string>): Decorati
       }
       const chip = describeTemplate(match[0], match[1], ctx);
       if (chip) {
+        // A quoted whole value ("${x}"): the chip goes after the closing quote.
+        const quote = doc.sliceString(end, end + 1);
+        const quoted = (quote === '"' || quote === "'") && doc.sliceString(start - 1, start) === quote;
         widgets.push({
-          pos: end,
+          pos: quoted ? end + 1 : end,
           deco: Decoration.widget({ widget: new ValueChipWidget(chip, false), side: 1 }),
         });
       }

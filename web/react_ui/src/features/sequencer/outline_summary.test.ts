@@ -72,6 +72,33 @@ describe("step summaries", () => {
     ]);
   });
 
+  it("shows templates quoted in the YAML without the quotes", () => {
+    // Sequences usually quote every template.
+    const yamlText = [
+      "steps:",
+      '  - sleep: "${freq_settle_s}"',
+      "  - repeat:",
+      '      times: "${n_traces}"',
+      "      do:",
+      "        - sleep: 0.1",
+      "  - wait_until:",
+      "      condition: {always: true}",
+      '      timeout_s: "${pll_timeout_s}"',
+      "  - call:",
+      "      device: synth",
+      "      action: set",
+      "      params:",
+      '        channel: "ch${synthhd_channel}_pll_locked"',
+      '        m: "${mode == \\"fast\\"}"',
+    ].join("\n");
+    expect(summaries(yamlText)).toEqual([
+      "sleep ${freq_settle_s}",
+      "repeat ${n_traces} (1 step)",
+      "timeout ${pll_timeout_s}",
+      'synth.set  channel: ch${synthhd_channel}_pll_locked, m: ${mode == "fast"}',
+    ]);
+  });
+
   it("keeps templates whole and exactly as written in set and assign summaries", () => {
     const yamlText = [
       "steps:",
@@ -80,7 +107,7 @@ describe("step summaries", () => {
       "      power:   ${base  *  2}",
     ].join("\n");
     expect(summaries(yamlText)).toEqual([
-      "synth.freq = '${freq_center_hz - 0.5 * sweep_step_hz * (n_steps - 1)}'",
+      "synth.freq = ${freq_center_hz - 0.5 * sweep_step_hz * (n_steps - 1)}",
       "power = ${base  *  2}",
     ]);
   });

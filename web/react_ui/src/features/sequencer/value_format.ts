@@ -76,7 +76,8 @@ export function formatShort(value: unknown): string {
     return "null";
   }
   if (typeof value === "string") {
-    return value.length > 24 ? `"${value.slice(0, 21)}…"` : `"${value}"`;
+    // Bare, like the YAML; the tooltip shows it quoted. Empty stays visible.
+    return value === "" ? '""' : value.length > 24 ? `${value.slice(0, 23)}…` : value;
   }
   if (Array.isArray(value)) {
     return `list[${value.length}]`;
