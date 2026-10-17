@@ -85,6 +85,46 @@ describe("step summaries", () => {
     ]);
   });
 
+  it("names the top-level variable of a mapping-valued assign", () => {
+    const yamlText = [
+      "steps:",
+      "  - assign:",
+      "      freq_hz:",
+      "        call:",
+      "          device: ${synth_device}",
+      "          action: get_frequency",
+      "          extract: {kind: scalar}",
+      "  - assign:",
+      "      power: {telemetry: {device: pm, signal: power_dbm}}",
+      "  - assign:",
+      "      window: {start: 0, stop: '${t_stop}', opts: {fast: true}}",
+      "      shots: 3",
+      "  - assign:",
+      "      busy: {call: {process: scheduler, action: status}}",
+      "      a: 1",
+      "      b: 2",
+    ].join("\n");
+    expect(summaries(yamlText)).toEqual([
+      "freq_hz = call ${synth_device}.get_frequency",
+      "power = telemetry pm.power_dbm",
+      "window = {start: 0, stop: '${t_stop}', opts: {…}} +1 more",
+      "busy = call scheduler.status +2 more",
+    ]);
+  });
+
+  it("keeps the dotted leaf entries the assign inspector edits", () => {
+    const [node] = buildSequencerStepOutline(
+      ["steps:", "  - assign:", "      freq_hz: {call: {device: synth, action: get_frequency}}"].join("\n")
+    );
+    expect(node.assignDetail?.variables).toEqual([
+      { name: "freq_hz", value: "call synth.get_frequency" },
+    ]);
+    expect(node.assignDetail?.entries).toEqual([
+      { name: "freq_hz.call.device", value: "synth" },
+      { name: "freq_hz.call.action", value: "get_frequency" },
+    ]);
+  });
+
   it("leaves the unit of a templated wait_until timeout to the value chip", () => {
     const yamlText = [
       "steps:",

@@ -13,6 +13,7 @@
 import { isMap, isScalar, isSeq, parseDocument, stringify } from "yaml";
 import type { Document, Node, YAMLMap } from "yaml";
 import type { SequencerOutlineMetadataEntry } from "./types";
+import { entryPathSegment } from "./entry_path";
 import { conditionAstToEntries } from "./condition_ast";
 import type { ConditionAst, ConditionCompareOp } from "./condition_ast";
 
@@ -144,7 +145,7 @@ export function flattenEntries(
     if (!key) {
       continue;
     }
-    const name = prefix ? `${prefix}.${key}` : key;
+    const name = prefix ? `${prefix}.${entryPathSegment(key)}` : entryPathSegment(key);
     const value = pair.value as Node | null;
     if (isMap(value) && value.items.length > 0) {
       out.push(...flattenEntries(value, src, name));
