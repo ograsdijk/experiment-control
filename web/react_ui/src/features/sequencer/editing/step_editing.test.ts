@@ -245,6 +245,36 @@ describe("sequencer editing regressions", () => {
     expect(countStepIssues(reparsed)).toBe(0);
   });
 
+  it("keeps an assign key that contains a dot as one key when edited", () => {
+    const yaml = [
+      "version: 1",
+      "steps:",
+      "  - assign:",
+      "      \"a.b\": 1",
+      "      cfg: {\"x.y\": 2, z: 3}",
+      "",
+    ].join("\n");
+    const assignNode = getNodeByKind(yaml, "assign");
+    expect(assignNode.assignDetail?.entries).toEqual([
+      { name: '"a.b"', value: "1" },
+      { name: 'cfg."x.y"', value: "2" },
+      { name: "cfg.z", value: "3" },
+    ]);
+    expect(countStepIssues(assignNode)).toBe(0);
+    const entries = assignNode.assignDetail!.entries.map((entry) =>
+      entry.name === "cfg.z" ? { ...entry, value: "4" } : entry
+    );
+    const reparsed = getNodeByKind(applyEditedAssignStep(yaml, assignNode, entries), "assign");
+
+    expect(reparsed.assignDetail?.variables).toEqual([
+      { name: "a.b", value: "1" },
+      { name: "cfg", value: "{x.y: 2, z: 4}" },
+    ]);
+    expect(clashingAssignNames([{ name: '"a.b"', value: "1" }, { name: "a", value: "2" }])).toEqual(
+      new Set()
+    );
+  });
+
   it("flags assign names set twice, including a value and a path under it", () => {
     const entry = (name: string) => ({ name, value: "1" });
     expect(

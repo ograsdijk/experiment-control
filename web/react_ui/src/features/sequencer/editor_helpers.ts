@@ -5,6 +5,7 @@ import type {
   SequencerStepOutlineNode,
 } from "./types";
 import type { CapabilityParam } from "../../types";
+import { splitEntryPath } from "./entry_path";
 import {
   ADAPTIVE_BIND_EXTRA_FIELDS,
   SCALAR_FOR_FIELDS,
@@ -73,12 +74,7 @@ export function clashingAssignNames(
   entries: ReadonlyArray<SequencerOutlineMetadataEntry>
 ): Set<string> {
   const paths = entries
-    .map((entry) =>
-      String(entry.name ?? "")
-        .split(".")
-        .map((part) => part.trim())
-        .filter((part) => part.length > 0)
-    )
+    .map((entry) => splitEntryPath(String(entry.name ?? "")))
     .filter((parts) => parts.length > 0);
   const clashes = new Set<string>();
   paths.forEach((path, index) => {
