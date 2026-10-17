@@ -32,6 +32,16 @@ describe("buildRuntimeOrigins", () => {
     expect(origins.resp).toMatchObject({ label: "save_as" });
   });
 
+  it("registers a mapping-valued assign under its top-level name", () => {
+    const origins = buildRuntimeOrigins(
+      buildSequencerStepOutline(
+        ["steps:", "  - assign:", "      freq_hz: {call: {device: synth, action: get_frequency}}"].join("\n")
+      )
+    );
+    expect(Object.keys(origins)).toEqual(["freq_hz"]);
+    expect(origins.freq_hz.label).toBe("assign");
+  });
+
   it("know the names steps set implicitly", () => {
     const origins = buildRuntimeOrigins(
       buildSequencerStepOutline(

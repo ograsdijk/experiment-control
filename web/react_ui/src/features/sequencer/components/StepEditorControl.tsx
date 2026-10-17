@@ -16,7 +16,12 @@ import {
   applyEditedWaitUntilStep,
   applyEditedWhileStep,
 } from "../editing";
-import { duplicateNameSet, renderValue, valueByKey } from "../editor_helpers";
+import {
+  clashingAssignNames,
+  duplicateNameSet,
+  renderValue,
+  valueByKey,
+} from "../editor_helpers";
 import {
   callableActionNames,
   deviceNames,
@@ -528,11 +533,11 @@ export function AssignStepEditor({
     return null;
   }
 
-  const duplicateNames = duplicateNameSet(node.assignDetail.entries);
+  const clashingNames = clashingAssignNames(node.assignDetail.entries);
   const blankNames = node.assignDetail.entries.filter((entry) =>
     renderValue(entry.name).trim().length <= 0
   ).length;
-  const issueCount = duplicateNames.size + blankNames;
+  const issueCount = clashingNames.size + blankNames;
 
   return (
     <Card radius="sm" p="xs" style={cardStyle}>
@@ -552,8 +557,8 @@ export function AssignStepEditor({
           issueCount={issueCount}
           issueText={
             issueCount > 0
-              ? duplicateNames.size > 0
-                ? "Assignment variable names must be unique."
+              ? clashingNames.size > 0
+                ? "Each assignment variable can be set only once."
                 : "Assignment variable names are required."
               : null
           }

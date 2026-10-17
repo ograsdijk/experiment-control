@@ -20,7 +20,7 @@ import type {
 } from "./types";
 import { parseDocument } from "yaml";
 import { yamlSourceToDisplay } from "./value_text";
-import type { Node } from "yaml";
+import type { Node, YAMLMap } from "yaml";
 import {
   childNode,
   conditionEntries,
@@ -211,13 +211,45 @@ function parseSetDetail(snippet: string): SequencerSetDetail {
   };
 }
 
+/** `call scope.read`, `telemetry scope.power` or `{a: 1, b: {…}}` for a mapping value. */
+function mappingValueText(value: YAMLMap, src: string): string {
+  for (const source of ["call", "telemetry"]) {
+    const spec = childNode(value, source);
+    if (isMap(spec)) {
+      const target = scalarField(spec, "device", src) || scalarField(spec, "process", src);
+      const member =
+        source === "call" ? scalarField(spec, "action", src) : scalarField(spec, "signal", src);
+      return `${source} ${target && member ? `${target}.${member}` : target || member || "…"}`;
+    }
+  }
+  const items = value.items.map((pair) => {
+    const item = pair.value as Node | null;
+    const text = isMap(item) ? "{…}" : leafText(item, src) ?? "";
+    return `${String(pair.key ?? "").trim()}: ${text}`;
+  });
+  return `{${items.join(", ")}}`;
+}
+
 function parseAssignDetail(snippet: string): SequencerAssignDetail {
   const step = readStep(snippet);
   const body = step?.body ?? null;
   const src = step?.src ?? snippet;
-  return {
-    entries: isMap(body) ? flattenEntries(body, src) : [],
-  };
+  if (!isMap(body)) {
+    return { entries: [], variables: [] };
+  }
+  const variables: SequencerOutlineMetadataEntry[] = [];
+  for (const pair of body.items) {
+    const name = pair.key == null ? "" : String(pair.key).trim();
+    if (!name) {
+      continue;
+    }
+    const value = pair.value as Node | null;
+    variables.push({
+      name,
+      value: isMap(value) && value.items.length > 0 ? mappingValueText(value, src) : leafText(value, src),
+    });
+  }
+  return { entries: flattenEntries(body, src), variables };
 }
 
 function parseWaitUntilDetail(snippet: string): SequencerWaitUntilDetail {
@@ -454,9 +486,10 @@ function deriveSummary(
     }
   }
   if (kind === "assign" && node.assignDetail) {
-    const entry = node.assignDetail.entries[0];
+    const [entry, ...rest] = node.assignDetail.variables;
     if (entry && entry.value) {
-      return `${entry.name} = ${compactValue(entry.value, 56)}`;
+      const more = rest.length > 0 ? ` +${rest.length} more` : "";
+      return `${entry.name} = ${compactValue(entry.value, 56)}${more}`;
     }
   }
   if (kind === "repeat") {

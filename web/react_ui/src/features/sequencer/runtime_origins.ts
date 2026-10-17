@@ -78,12 +78,8 @@ export function buildRuntimeOrigins(outline: ReadonlyArray<SequencerStepOutlineN
           : origin("loop", `loop variable of ${at}`, forSourceText(node.forDetail!))
       );
     }
-    // The keys from the YAML: the outline flattens a mapping value
-    // (`freq_hz: {call: ...}`) into entries like `freq_hz.call.device`.
-    if (node.kind === "assign") {
-      for (const name of Object.keys(asRecord(parseStep(node.snippet)?.assign) ?? {})) {
-        add(name, origin("assign", `set by ${at}`));
-      }
+    for (const entry of node.assignDetail?.variables ?? []) {
+      add(entry.name, origin("assign", `set by ${at}`));
     }
     if (node.adaptiveDetail) {
       for (const group of node.adaptiveDetail.space) {

@@ -11,6 +11,7 @@
 import { YAMLMap, YAMLSeq, isMap, isSeq, parseDocument } from "yaml";
 import type { Document, Node, ScalarTag, Tags } from "yaml";
 import type { SequencerOutlineMetadataEntry } from "../types";
+import { splitEntryPath } from "../entry_path";
 import { parseConditionEntries } from "../condition_ast";
 import type { ConditionAst } from "../condition_ast";
 
@@ -96,7 +97,7 @@ export function entriesToMap(
 ): YAMLMap {
   const root = new YAMLMap();
   for (const entry of cleanEntries(entries)) {
-    const parts = entry.name.split(".").filter((part) => part.trim().length > 0);
+    const parts = splitEntryPath(entry.name);
     if (parts.length <= 0) {
       continue;
     }
