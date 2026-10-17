@@ -63,6 +63,36 @@ export function duplicateNameSet(
   return duplicates;
 }
 
+/**
+ * Top-level assign names whose dotted entries collide: the same path twice, or
+ * a value and a nested path under it (`x` and `x.call.device`), which the
+ * writer can't both keep. Sibling paths (`x.call.device`, `x.call.action`) are
+ * one nested value, not a clash.
+ */
+export function clashingAssignNames(
+  entries: ReadonlyArray<SequencerOutlineMetadataEntry>
+): Set<string> {
+  const paths = entries
+    .map((entry) =>
+      String(entry.name ?? "")
+        .split(".")
+        .map((part) => part.trim())
+        .filter((part) => part.length > 0)
+    )
+    .filter((parts) => parts.length > 0);
+  const clashes = new Set<string>();
+  paths.forEach((path, index) => {
+    for (const other of paths.slice(index + 1)) {
+      const shorter = path.length <= other.length ? path : other;
+      const longer = shorter === path ? other : path;
+      if (shorter.every((part, i) => part === longer[i])) {
+        clashes.add(path[0]);
+      }
+    }
+  });
+  return clashes;
+}
+
 export function isBlank(value: string | null | undefined): boolean {
   return String(value ?? "").trim().length <= 0;
 }
@@ -566,7 +596,7 @@ function countAssignIssues(node: SequencerStepOutlineNode): number {
   }
   return (
     (node.assignDetail.entries.length <= 0 ? 1 : 0) +
-    duplicateNameSet(node.assignDetail.entries).size +
+    clashingAssignNames(node.assignDetail.entries).size +
     node.assignDetail.entries.filter((entry) => isBlank(entry.name)).length
   );
 }

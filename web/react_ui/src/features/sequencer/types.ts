@@ -199,7 +199,10 @@ export type SequencerSetDetail = {
 };
 
 export type SequencerAssignDetail = {
+  /** Dotted leaf entries (`freq_hz.call.device`), edited by the inspector. */
   entries: SequencerOutlineMetadataEntry[];
+  /** Top-level names, a mapping value shortened (`call scope.get_frequency`). */
+  variables: SequencerOutlineMetadataEntry[];
 };
 
 export type SequencerWaitUntilDetail = {

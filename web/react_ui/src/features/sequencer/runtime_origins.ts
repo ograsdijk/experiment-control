@@ -74,7 +74,7 @@ export function buildRuntimeOrigins(outline: ReadonlyArray<SequencerStepOutlineN
           : origin("loop", `loop variable of ${at}`, forSourceText(node.forDetail!))
       );
     }
-    for (const entry of node.assignDetail?.entries ?? []) {
+    for (const entry of node.assignDetail?.variables ?? []) {
       add(entry.name, origin("assign", `set by ${at}`));
     }
     if (node.adaptiveDetail) {

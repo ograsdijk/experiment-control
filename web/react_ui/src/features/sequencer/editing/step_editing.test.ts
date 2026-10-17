@@ -18,6 +18,7 @@ import {
   buildSequencerStepOutline,
   flattenSequencerStepOutline,
 } from "../outline";
+import { clashingAssignNames, countStepIssues } from "../editor_helpers";
 import type { SequencerStepOutlineNode } from "../types";
 
 function getNodeByKind(
@@ -214,6 +215,46 @@ describe("sequencer editing regressions", () => {
     expect(next).toContain("  - assign: {}");
     expect(reparsedAssign.assignDetail?.entries).toEqual([]);
     expect(next).toContain("  - sleep: 0.1");
+  });
+
+  it("edits a nested assign value and keeps the mapping", () => {
+    const yaml = [
+      "version: 1",
+      "steps:",
+      "  - assign:",
+      "      freq_hz:",
+      "        call:",
+      "          device: synth",
+      "          action: get_frequency",
+      "      shots: 1",
+      "",
+    ].join("\n");
+    const assignNode = getNodeByKind(yaml, "assign");
+    expect(countStepIssues(assignNode)).toBe(0);
+    const entries = assignNode.assignDetail!.entries.map((entry) =>
+      entry.name === "freq_hz.call.device" ? { ...entry, value: "${synth_device}" } : entry
+    );
+    const next = applyEditedAssignStep(yaml, assignNode, entries);
+    const reparsed = getNodeByKind(next, "assign");
+
+    expect(reparsed.assignDetail?.variables).toEqual([
+      { name: "freq_hz", value: "call ${synth_device}.get_frequency" },
+      { name: "shots", value: "1" },
+    ]);
+    expect(reparsed.summary).toBe("freq_hz = call ${synth_device}.get_frequency +1 more");
+    expect(countStepIssues(reparsed)).toBe(0);
+  });
+
+  it("flags assign names set twice, including a value and a path under it", () => {
+    const entry = (name: string) => ({ name, value: "1" });
+    expect(
+      clashingAssignNames([entry("x.call.device"), entry("x.call.action"), entry("y")])
+    ).toEqual(new Set());
+    expect(clashingAssignNames([entry("x.call.device"), entry("x")])).toEqual(new Set(["x"]));
+    expect(clashingAssignNames([entry("y"), entry(" y ")])).toEqual(new Set(["y"]));
+    expect(
+      clashingAssignNames([entry("x.a"), entry("x.a.b"), entry("x.a"), entry("z.a")])
+    ).toEqual(new Set(["x"]));
   });
 
   it("writes set_context streams and fields in structured form", () => {
