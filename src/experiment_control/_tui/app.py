@@ -17,6 +17,7 @@ from textual.containers import Horizontal, Vertical
 from textual.driver import Driver
 from textual.reactive import reactive
 from textual.screen import ModalScreen
+from textual.timer import Timer
 from textual.widget import Widget
 from textual.widgets import (
     Button,
@@ -445,6 +446,10 @@ class ManagerTUI(App):
         # Captured in on_mount; used to marshal UI updates that originate off
         # the UI thread (e.g. _set_backend_status from the RPC worker).
         self._ui_thread_id: int | None = None
+        # Interval timers and the flag gating their callbacks; see _ui_live().
+        self._ui_ready = False
+        self._snapshot_timer: Timer | None = None
+        self._drain_timer: Timer | None = None
         # De-dupe concurrent capability fetches per target so a busy render
         # loop can't enqueue a burst of identical probes.
         self._cap_fetch_inflight: set[str] = set()
@@ -677,8 +682,11 @@ class ManagerTUI(App):
             },
             self._apply_manager_log_tail_bootstrap,
         )
-        self.set_interval(self._snapshot_period_s, self._refresh_snapshot)
-        self.set_interval(0.2, self._drain_pub_queue)
+        self._ui_ready = True
+        self._snapshot_timer = self.set_interval(
+            self._snapshot_period_s, self._refresh_snapshot
+        )
+        self._drain_timer = self.set_interval(0.2, self._drain_pub_queue)
         self._pub_thread_handle = threading.Thread(target=self._pub_thread, daemon=True)
         self._pub_thread_handle.start()
         self._apply_responsive_layout(self.size.width)
@@ -686,7 +694,23 @@ class ManagerTUI(App):
         # deliberately with `/` rather than taking the initial text focus.
         self.call_later(self.action_focus_navigator)
 
+    def _ui_live(self) -> bool:
+        """Whether timer-driven callbacks may touch the composed widgets.
+
+        Textual's ``App._shutdown`` (``run()`` teardown and ``run_test``
+        exit) clears ``_running`` and then prunes the screens, but only stops
+        the App's own timers afterwards. A drain tick (or its ``call_later``
+        follow-up) landing in that window would ``query_one`` widgets that are
+        already gone and raise ``NoMatches``. ``run_test`` never sets
+        ``_exit``, so Textual's own timer guard does not cover it.
+        """
+        return self._ui_ready and self._running and not self._exit
+
     def on_unmount(self) -> None:
+        self._ui_ready = False
+        for timer in (self._snapshot_timer, self._drain_timer):
+            if timer is not None:
+                timer.stop()
         self._stop_event.set()
         self._sub_reconnect_event.set()
         # Stop the RPC worker (it owns and closes the socket).
@@ -1498,7 +1522,7 @@ class ManagerTUI(App):
         # Interval callback on the UI thread. The two status RPCs are blocking,
         # so run them on the RPC worker and apply the results back on the UI
         # thread. Skip if a prior refresh is still in flight (slow backend).
-        if self._snapshot_refresh_inflight:
+        if self._snapshot_refresh_inflight or not self._ui_live():
             return
         self._snapshot_refresh_inflight = True
         pending: dict[str, Json | None] = {}
@@ -1511,7 +1535,9 @@ class ManagerTUI(App):
 
         def _after_procs(proc_resp: Json | None) -> None:
             try:
-                self._apply_snapshot(pending.get("devices"), proc_resp)
+                # The app may have begun tearing down while the RPCs ran.
+                if self._ui_live():
+                    self._apply_snapshot(pending.get("devices"), proc_resp)
             finally:
                 self._snapshot_refresh_inflight = False
 
@@ -2953,7 +2979,7 @@ class ManagerTUI(App):
         return (topic, resource_id)
 
     def _drain_pub_queue(self) -> None:
-        if not self.streaming_enabled:
+        if not self.streaming_enabled or not self._ui_live():
             return
 
         slice_started = time.perf_counter()
