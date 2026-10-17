@@ -301,15 +301,41 @@ export function buildBinStatsPlotData(
   const histBands = histOverlays.map((overlay) =>
     buildBandData(overlay.series, mode, scale, xOffset, xScale)
   );
-  const xs = new Set<number>(primaryBand[0]);
-  for (const band of histBands) {
-    for (const xv of band[0]) {
-      xs.add(xv);
-    }
+  const traceOverlayLabels = traceBuilt.map((entry) => entry.label);
+  const histOverlayLabels = histOverlays.map(
+    (overlay) => String(overlay.label ?? "").trim() || "histogram"
+  );
+  if (histBands.every((band) => band[0].length === 0)) {
+    // No overlay data: the primary's own x is the axis, as before overlays.
+    const n = primaryBand[0].length;
+    const empty = (): PlotColumn => new Array(n).fill(null);
+    return {
+      columns: [
+        ...primaryBand,
+        ...traceBuilt.map((entry) => entry.values),
+        ...histBands.flatMap(() => [empty(), empty(), empty()]),
+      ],
+      traceOverlayLabels,
+      histOverlayLabels,
+    };
   }
-  const unionX = Array.from(xs).sort((a, b) => a - b);
+
+  // Merge x values that agree to float precision, as the backend's
+  // hist.divide does, so the same scan point from two histograms shares
+  // one axis position.
+  const allX = [primaryBand[0], ...histBands.map((band) => band[0])]
+    .flat()
+    .sort((a, b) => a - b);
+  const unionX: number[] = [];
   const position = new Map<number, number>();
-  unionX.forEach((xv, idx) => position.set(xv, idx));
+  for (const xv of allX) {
+    const last = unionX[unionX.length - 1];
+    const tol = Math.max(1e-12, 1e-12 * Math.max(Math.abs(xv), Math.abs(last ?? 0)));
+    if (unionX.length === 0 || Math.abs(xv - last) > tol) {
+      unionX.push(xv);
+    }
+    position.set(xv, unionX.length - 1);
+  }
   const place = (sourceX: number[], values: number[]): PlotColumn => {
     const out: PlotColumn = new Array(unionX.length).fill(null);
     for (let i = 0; i < sourceX.length; i += 1) {
@@ -335,13 +361,7 @@ export function buildBinStatsPlotData(
       place(band[0], band[3])
     );
   }
-  return {
-    columns,
-    traceOverlayLabels: traceBuilt.map((entry) => entry.label),
-    histOverlayLabels: histOverlays.map(
-      (overlay) => String(overlay.label ?? "").trim() || "histogram"
-    ),
-  };
+  return { columns, traceOverlayLabels, histOverlayLabels };
 }
 
 export function computeStreamBinStatsAutoYRange(

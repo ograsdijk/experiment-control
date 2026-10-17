@@ -1512,6 +1512,12 @@ OP_PARAM_SCHEMAS: dict[str, list[Json]] = {
             "required": False,
             "default": False,
         },
+        {
+            "name": "align_auto_bins",
+            "kind": "boolean",
+            "required": False,
+            "default": False,
+        },
     ],
     "aggregate.bin2d_stats": [
         {
@@ -2122,10 +2128,19 @@ def execute_hist_divide(
     # counts may differ and are preserved unless strict count matching is
     # requested. std/sem propagation assumes independent numerator and
     # denominator inputs.
+    #
+    # Two auto-range histograms with different bins (e.g. one scan split by
+    # a shot condition, where one half has a scan point the other has not)
+    # are aligned on the union of their bins when strict counts or
+    # align_auto_bins is requested; a bin present on one side only is left
+    # unpopulated. Otherwise mismatched bins give no result.
     if not isinstance(numerator_raw, dict) or not isinstance(denominator_raw, dict):
         return None
     require_equal_counts = _normalize_bool(
         (params or {}).get("require_equal_counts"), default=False
+    )
+    align_auto_bins = require_equal_counts or _normalize_bool(
+        (params or {}).get("align_auto_bins"), default=False
     )
 
     num_x = _hist_float_list(numerator_raw, "x_bins")
@@ -2178,7 +2193,7 @@ def execute_hist_divide(
             numerator_raw.get("auto_range", False)
             and denominator_raw.get("auto_range", False)
         )
-        if not require_equal_counts or not both_auto_range:
+        if not align_auto_bins or not both_auto_range:
             return None
         union_x = _hist_union_x_bins(num_x, den_x)
         max_bins = min(

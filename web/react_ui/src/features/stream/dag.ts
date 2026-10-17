@@ -382,6 +382,12 @@ export const STREAM_DAG_OPS: Record<StreamDagOpId, StreamDagOpDef> = {
         kind: "boolean",
         optional: true,
       },
+      {
+        name: "align_auto_bins",
+        label: "align_auto_bins",
+        kind: "boolean",
+        optional: true,
+      },
     ],
   },
   "aggregate.bin2d_stats": {

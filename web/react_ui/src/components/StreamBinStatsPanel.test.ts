@@ -130,6 +130,22 @@ describe("stream bin stats histogram overlays", () => {
     ]);
   });
 
+  it("merges scan points that differ only by float rounding", () => {
+    const shifted: StreamBinStatsSeries = {
+      ...closed,
+      xBins: [0.1 + 0.2, 2],
+    };
+    const built = buildBinStatsPlotData(
+      { ...open, xBins: [0.3, 2, 3] },
+      [],
+      [{ label: "closed", series: shifted }],
+      "sem",
+      1
+    );
+    expect(built.columns[0]).toEqual([0.3, 2, 3]);
+    expect(built.columns[6]).toEqual([5, 6, null]);
+  });
+
   it("applies the x transform to overlay bins too", () => {
     const built = buildBinStatsPlotData(
       closed,
