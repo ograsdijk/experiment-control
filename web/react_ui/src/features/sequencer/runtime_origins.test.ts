@@ -67,4 +67,9 @@ describe("buildRuntimeOrigins", () => {
     );
     expect(Object.keys(nested)).toEqual(["freq_hz"]);
   });
+
+  it("takes assign keys as written, dots included", () => {
+    const quoted = buildRuntimeOrigins(buildSequencerStepOutline('steps:\n  - assign:\n      "a.b": 1\n'));
+    expect(Object.keys(quoted)).toEqual([]);
+  });
 });

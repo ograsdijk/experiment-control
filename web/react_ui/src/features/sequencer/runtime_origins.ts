@@ -24,15 +24,19 @@ export type RuntimeOrigins = Record<string, RuntimeOrigin>;
 
 const NAME_RE = /^[A-Za-z_]\w*(?:_\*)?$/;
 
+/** A step as parsed from its YAML snippet. */
+function parseStep(snippet: string): Record<string, unknown> | null {
+  try {
+    const parsed: unknown = parse(snippet);
+    return asRecord(Array.isArray(parsed) ? parsed[0] : parsed);
+  } catch {
+    return null;
+  }
+}
+
 /** The names a call step sets: `save_as`, `extract` (into `value` without one) and `assign`. */
 function callTargets(snippet: string): Array<{ name: string; label: string }> {
-  let parsed: unknown;
-  try {
-    parsed = parse(snippet);
-  } catch {
-    return [];
-  }
-  const step = asRecord(Array.isArray(parsed) ? parsed[0] : parsed);
+  const step = parseStep(snippet);
   if (!step) {
     return [];
   }
@@ -74,10 +78,12 @@ export function buildRuntimeOrigins(outline: ReadonlyArray<SequencerStepOutlineN
           : origin("loop", `loop variable of ${at}`, forSourceText(node.forDetail!))
       );
     }
-    // An assign whose value is a mapping (`freq_hz: {call: ...}`) comes as
-    // flattened entries (`freq_hz.call.device`): the name is the first part.
-    for (const entry of node.assignDetail?.entries ?? []) {
-      add(entry.name.split(".")[0], origin("assign", `set by ${at}`));
+    // The keys from the YAML: the outline flattens a mapping value
+    // (`freq_hz: {call: ...}`) into entries like `freq_hz.call.device`.
+    if (node.kind === "assign") {
+      for (const name of Object.keys(asRecord(parseStep(node.snippet)?.assign) ?? {})) {
+        add(name, origin("assign", `set by ${at}`));
+      }
     }
     if (node.adaptiveDetail) {
       for (const group of node.adaptiveDetail.space) {

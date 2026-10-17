@@ -144,4 +144,20 @@ describe("step summaries", () => {
     const html = renderToStaticMarkup(createElement(TextWithValues, { text: "timeout ${t_s}", unit: "s" }));
     expect(html).toBe("timeout ${t_s} s");
   });
+
+  it("keeps quoted values without a template as written", () => {
+    const yamlText = [
+      "steps:",
+      "  - call:",
+      "      device: synth",
+      "      action: set",
+      "      params:",
+      '        name: ""',
+      '  - sleep: ""',
+      "  - wait_until:",
+      "      condition: {always: true}",
+      '      timeout_s: "10"',
+    ].join("\n");
+    expect(summaries(yamlText)).toEqual(['synth.set  name: ""', 'sleep ""', "timeout 10s"]);
+  });
 });

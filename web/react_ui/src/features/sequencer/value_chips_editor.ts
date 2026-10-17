@@ -143,9 +143,15 @@ function buildDecorations(view: EditorView, defs: Map<number, string>): Decorati
       }
       const chip = describeTemplate(match[0], match[1], ctx);
       if (chip) {
-        // A quoted whole value ("${x}"): the chip goes after the closing quote.
+        // A template that is the whole quoted value ("${x}"): the chip goes
+        // after the closing quote, if that quote ends the value (then comes
+        // the end of the line, a comment, `,`, `}` or `]`).
         const quote = doc.sliceString(end, end + 1);
-        const quoted = (quote === '"' || quote === "'") && doc.sliceString(start - 1, start) === quote;
+        const rest = doc.sliceString(end + 1, doc.lineAt(end).to);
+        const quoted =
+          (quote === '"' || quote === "'") &&
+          doc.sliceString(start - 1, start) === quote &&
+          /^\s*(?:#.*)?$|^\s*[,}\]]/.test(rest);
         widgets.push({
           pos: quoted ? end + 1 : end,
           deco: Decoration.widget({ widget: new ValueChipWidget(chip, false), side: 1 }),

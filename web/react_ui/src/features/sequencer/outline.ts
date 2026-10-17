@@ -76,14 +76,35 @@ type StepContainerContext = {
 };
 
 /**
- * Shortened text, but a value with a `${...}` is kept whole and its templates
- * exactly as written: the value chip needs the template text to match the
+ * A quoted value with a template ("${x}", as sequences usually write them)
+ * without its quotes, so the value chip isn't shown inside them. Without
+ * escapes the quotes are all there is to drop; with escapes it is decoded as
+ * the runtime sees it (the request evaluates decoded templates). Other
+ * quoted values, such as an empty string, stay as written.
+ */
+function unquoteTemplate(source: string): string {
+  const text = source.trim();
+  const quote = text[0];
+  if (
+    (quote !== '"' && quote !== "'") ||
+    text.length < 2 ||
+    text[text.length - 1] !== quote ||
+    !text.includes("${")
+  ) {
+    return source;
+  }
+  const inner = text.slice(1, -1);
+  const plain = quote === '"' ? !/["\\]/.test(inner) : !inner.includes("'");
+  return plain ? inner : yamlSourceToDisplay(text);
+}
+
+/**
+ * Shortened text, but a value with a `${...}` is kept whole, its templates
+ * unshortened: the value chip needs the template text to match an
  * expression the backend evaluated.
  */
 function compactValue(source: string, maxLength: number): string {
-  // Quoted in the YAML ("${x}", as sequences usually write templates): show
-  // it unquoted, as the editor fields do, so the chip isn't inside quotes.
-  const value = yamlSourceToDisplay(source);
+  const value = unquoteTemplate(source);
   if (!value.includes("${")) {
     return compactText(value, maxLength);
   }
@@ -466,7 +487,12 @@ function deriveSummary(
   if (kind === "wait_until" && node.waitUntilDetail?.timeoutS) {
     const timeout = compactValue(node.waitUntilDetail.timeoutS, 56);
     // A template gets its unit from the value chip.
-    return timeout.includes("${") ? `timeout ${timeout}` : `timeout ${timeout}s`;
+    if (timeout.includes("${")) {
+      return `timeout ${timeout}`;
+    }
+    // A quoted number ("10") is seconds too.
+    const seconds = /^(["'])([-+]?[\d.]+(?:e[-+]?\d+)?)\1$/i.exec(timeout)?.[2] ?? timeout;
+    return `timeout ${seconds}s`;
   }
   if (kind === "if" && node.ifDetail) {
     const parts = [`then ${node.ifDetail.thenCount}`];

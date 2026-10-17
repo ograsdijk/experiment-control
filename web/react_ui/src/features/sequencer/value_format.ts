@@ -64,6 +64,10 @@ function generatorSummary(gen: Record<string, unknown>): string | null {
   return typeof num === "number" ? `${kind} ×${num}` : kind;
 }
 
+/** Text YAML would read as a number, boolean or null rather than a string. */
+const BARE_NOT_STRING_RE =
+  /^(?:[-+]?(?:\d[\d_]*(?:\.\d*)?|\.\d+)(?:e[-+]?\d+)?|[-+]?\.?(?:inf|nan)|true|false|yes|no|on|off|null|~)$/i;
+
 /** Short value text for a chip. */
 export function formatShort(value: unknown): string {
   if (typeof value === "number") {
@@ -76,8 +80,11 @@ export function formatShort(value: unknown): string {
     return "null";
   }
   if (typeof value === "string") {
-    // Bare, like the YAML; the tooltip shows it quoted. Empty stays visible.
-    return value === "" ? '""' : value.length > 24 ? `${value.slice(0, 23)}…` : value;
+    // Bare, like the YAML, unless that would read as something else: empty,
+    // padded, or a number, boolean or null ("5" vs 5). The tooltip is quoted.
+    const quoted = value === "" || value !== value.trim() || BARE_NOT_STRING_RE.test(value);
+    const short = value.length > 24 ? `${value.slice(0, 23)}…` : value;
+    return quoted ? `"${short}"` : short;
   }
   if (Array.isArray(value)) {
     return `list[${value.length}]`;
