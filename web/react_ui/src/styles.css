@@ -336,6 +336,28 @@ body::before {
   cursor: pointer;
 }
 
+/* Safety tab: one line per process / ruleset above the rule table. */
+.safety-process-strip {
+  padding: 6px 10px;
+  border-radius: 10px;
+  border: 1px solid var(--card-border);
+  background: var(--card);
+}
+
+.safety-ruleset-line {
+  padding: 2px 10px 2px 28px;
+}
+
+.safety-rule-link {
+  padding: 1px 6px;
+  border-radius: 6px;
+  border: 1px solid var(--card-border);
+}
+
+.safety-rule-link:hover {
+  background: var(--mantine-color-default-hover);
+}
+
 /* Selectable list rows (State Machines list): same highlight as table rows. */
 .resource-list-item {
   display: block;
@@ -359,6 +381,12 @@ body::before {
 .resource-overview-table th,
 .resource-overview-table td {
   white-space: nowrap;
+}
+
+/* Status badges in table cells keep their full label instead of shrinking. */
+.resource-overview-table td .mantine-Badge-root {
+  flex-shrink: 0;
+  max-width: none;
 }
 
 .resource-overview-table td.resource-overview-error-cell {

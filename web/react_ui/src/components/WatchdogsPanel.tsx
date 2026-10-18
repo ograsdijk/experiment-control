@@ -1,6 +1,26 @@
-import { Badge, Button, Card, Group, Stack, Switch, Text } from "@mantine/core";
-import { formatAge as formatHeartbeatAge, processHealth } from "../features/devices/health";
-import { isProcessRpcStateAvailable, processStateColor } from "../features/runtime/helpers";
+import {
+  ActionIcon,
+  Badge,
+  Box,
+  Button,
+  Card,
+  Group,
+  ScrollArea,
+  SimpleGrid,
+  Stack,
+  Table,
+  Text,
+} from "@mantine/core";
+import { IconX } from "@tabler/icons-react";
+import { useMemo, useState, type ReactNode } from "react";
+import { resourceHealthRank } from "../features/devices/health";
+import { useResourceListView } from "../features/devices/useDeviceListView";
+import {
+  buildWatchdogRuleRows,
+  watchdogRuleAdapter,
+  watchdogRuleHealth,
+  type WatchdogRuleRow,
+} from "../features/safety/safetyRows";
 import {
   hasActiveWatchdogTrip,
   hasWatchdogActionFailure,
@@ -15,7 +35,10 @@ import type {
   WatchdogStatus,
 } from "../types";
 import { HealthMark } from "./HealthMark";
-import { RefreshIconButton } from "./RefreshIconButton";
+import { ResourceListToolbar } from "./ResourceListToolbar";
+import { ConfirmDisableSwitch } from "./safety/ConfirmDisableSwitch";
+import { SafetyProcessStrip } from "./safety/SafetyProcessStrip";
+import { useSortableTable, type SortValue } from "./safety/useSortableTable";
 
 type Props = {
   processes: ReadonlyArray<ProcessStatus>;
@@ -417,146 +440,225 @@ function operationalAction(rule: WatchdogStatus["rules"][number]): string | null
   return actions.length > 0 ? `Actions: ${actions.length}` : null;
 }
 
-function RuleCard({
-  processId,
-  watchdogId,
-  watchdogEnabled,
-  rule,
-  ruleIdx,
-  loading,
-  watchdogBusyByKey,
+function DetailField({ label, children }: { label: string; children: ReactNode }) {
+  return (
+    <Stack gap={0}>
+      <Text size="xs" c="dimmed">
+        {label}
+      </Text>
+      <Text size="sm" component="div" style={{ wordBreak: "break-word" }}>
+        {children}
+      </Text>
+    </Stack>
+  );
+}
+
+const MONO = {
+  fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
+  whiteSpace: "pre-wrap",
+  wordBreak: "break-word",
+} as const;
+
+function liveStateFor(row: WatchdogRuleRow) {
+  return row.watchdogEnabled
+    ? watchdogRuleLiveState(row.rule)
+    : { label: "DISABLED", color: "gray" };
+}
+
+function ClearLatchButton({
+  row,
+  busy,
   onClearRuleLatch,
 }: {
-  processId: string;
-  watchdogId: string;
-  watchdogEnabled: boolean;
-  rule: WatchdogStatus["rules"][number];
-  ruleIdx: number;
-  loading: boolean;
-  watchdogBusyByKey: Record<string, boolean>;
+  row: WatchdogRuleRow;
+  busy: boolean;
   onClearRuleLatch: Props["onClearRuleLatch"];
 }) {
-  const ruleName = String(rule.name ?? "").trim() || `rule_${ruleIdx}`;
-  const clearBusyKey = `${processId}:${watchdogId}:${ruleName}:clear`;
-  const clearBusy = Boolean(watchdogBusyByKey[clearBusyKey]);
-  const latched = Boolean(rule.latched);
+  return (
+    <Button
+      size="compact-xs"
+      variant="light"
+      color="orange"
+      loading={busy}
+      disabled={busy}
+      onClick={(event) => {
+        event.stopPropagation();
+        void onClearRuleLatch(row.processId, row.watchdogId, row.ruleName);
+      }}
+    >
+      Clear latch
+    </Button>
+  );
+}
+
+function WatchdogRuleDetail({
+  row,
+  clearBusy,
+  onClearRuleLatch,
+  onClose,
+}: {
+  row: WatchdogRuleRow;
+  clearBusy: boolean;
+  onClearRuleLatch: Props["onClearRuleLatch"];
+  onClose: () => void;
+}) {
+  const rule = row.rule;
   const details: DetailedWatchdogRule = watchdogRuleDetails(rule);
-  const ruleState = watchdogEnabled
-    ? watchdogRuleLiveState(rule)
-    : { label: "DISABLED", color: "gray" };
+  const state = liveStateFor(row);
   const confirmation = confirmationProgress(rule);
   const action = operationalAction(rule);
-  const pressure = isBeamlineTurboRule(rule) ? snapshotValue(rule, "p") : null;
-  const turboStateIncomplete = hasIncompleteBeamlineTurboState(rule);
+  const turbo = isBeamlineTurboRule(rule);
   const actionChain = actionChainPresentation(rule);
-
   return (
-    <Card p={6} radius="sm" style={{ border: "1px solid var(--card-border)" }}>
-      <Group justify="space-between" align="flex-start" wrap="nowrap">
-        <Stack gap={3} style={{ minWidth: 0, flex: 1 }}>
-          <Group gap="xs" wrap="wrap">
-            <Text size="xs" fw={600}>{ruleName}</Text>
-            <Badge variant="light" color={ruleState.color}>{ruleState.label}</Badge>
-            {actionChain && (
-              <Badge variant="light" color={actionChain.color}>{actionChain.label}</Badge>
-            )}
-            {latched && (
-              <Badge variant="light" color="orange">Latched · acknowledge</Badge>
-            )}
+    <Card withBorder radius="lg" p="md">
+      <Stack gap="sm">
+        <Group justify="space-between" wrap="nowrap" align="flex-start">
+          <Stack gap={4} style={{ minWidth: 0 }}>
+            <Group gap={6} wrap="nowrap">
+              <HealthMark health={watchdogRuleHealth(row)} />
+              <Text fw={600} truncate>
+                {row.ruleName}
+              </Text>
+            </Group>
+            <Group gap={6}>
+              <Badge size="sm" variant="light" color={state.color}>
+                {state.label}
+              </Badge>
+              <Badge size="sm" variant="outline" color="gray">
+                {rule.severity}
+              </Badge>
+              {actionChain ? (
+                <Badge size="sm" variant="light" color={actionChain.color}>
+                  {actionChain.label}
+                </Badge>
+              ) : null}
+            </Group>
+          </Stack>
+          <Group gap="xs" wrap="nowrap">
+            {rule.latched ? (
+              <ClearLatchButton row={row} busy={clearBusy} onClearRuleLatch={onClearRuleLatch} />
+            ) : null}
+            <ActionIcon
+              size="sm"
+              variant="subtle"
+              color="gray"
+              aria-label="Close rule details"
+              onClick={onClose}
+            >
+              <IconX size={14} />
+            </ActionIcon>
           </Group>
-
-          <Group gap="md" wrap="wrap">
-            {isBeamlineTurboRule(rule) && (
-              <Text size="xs">
-                Pressure: <b>{formatValue(pressure)} Torr</b>
-              </Text>
-            )}
-            {confirmation && (
-              <Text size="xs">
-                Confirmation: <b>{confirmation.count}/{confirmation.target}</b>
-              </Text>
-            )}
-            <Text size="xs" c="dimmed">evaluated {formatAge(rule.last_evaluated_age_s)}</Text>
-          </Group>
-
-          {turboStateIncomplete && (
-            <Text size="xs" c="yellow">
-              One or more turbo-state inputs are unavailable; this rule will not arm until at least one running turbo is positively observed. An already-armed rule is not affected.
+        </Group>
+        {!row.processActive && row.watchdogEnabled ? (
+          <Text size="xs" c="red">
+            {row.processId} is {row.process.state}: this rule is not being evaluated.
+          </Text>
+        ) : null}
+        {rule.message ? <Text size="sm">{rule.message}</Text> : null}
+        {action ? <DetailField label="Does">{action}</DetailField> : null}
+        {actionChain && actionChain.failedTargets.length > 0 ? (
+          <Text size="xs" c="red">
+            Failed target{actionChain.failedTargets.length === 1 ? "" : "s"}:{" "}
+            {actionChain.failedTargets.join(", ")}
+          </Text>
+        ) : null}
+        {turbo ? (
+          <>
+            <DetailField label="Pressure">
+              {formatValue(snapshotValue(rule, "p"))} Torr
+            </DetailField>
+            <Text size="xs" c="dimmed">
+              Beamline turbo protection: each Hornet arms independently after pump-down. Any
+              armed Hornet above 1e-2 Torr for 3 fresh samples stops all four beamline turbos.
             </Text>
-          )}
-          {actionChain && actionChain.failedTargets.length > 0 && (
-            <Text size="xs" c="red">
-              Failed target{actionChain.failedTargets.length === 1 ? "" : "s"}: {actionChain.failedTargets.join(", ")}
+            {hasIncompleteBeamlineTurboState(rule) ? (
+              <Text size="xs" c="yellow">
+                One or more turbo-state inputs are unavailable; this rule will not arm until at
+                least one running turbo is positively observed. An already-armed rule is not
+                affected.
+              </Text>
+            ) : null}
+          </>
+        ) : null}
+        <SimpleGrid cols={2} spacing="xs" verticalSpacing="xs">
+          <DetailField label="Ruleset">
+            {row.watchdogId} · {row.processId}
+          </DetailField>
+          <DetailField label="Evaluated">{formatAge(rule.last_evaluated_age_s)}</DetailField>
+          <DetailField label="Last triggered">
+            {rule.last_trigger_age_s != null ? formatAge(rule.last_trigger_age_s) : "never"}
+          </DetailField>
+          {confirmation ? (
+            <DetailField label="Confirmation">
+              {confirmation.count}/{confirmation.target}
+            </DetailField>
+          ) : null}
+          <DetailField label="Stable for">{formatDuration(rule.stable_for_s)}</DetailField>
+          <DetailField label="Cooldown">{formatDuration(rule.cooldown_s)}</DetailField>
+          <DetailField label="On unknown">{rule.on_unknown ?? "default"}</DetailField>
+          <DetailField label="Latching">{rule.latch ? "yes" : "no"}</DetailField>
+        </SimpleGrid>
+        <Stack gap={4}>
+          <Text size="xs" c="dimmed">
+            Trip condition evaluation
+          </Text>
+          <ConditionTrace trace={rule.condition_evaluation} />
+        </Stack>
+        {details.arm != null ? (
+          <DetailField label="Arming condition">
+            <Text size="xs" style={MONO} component="div">
+              {JSON.stringify(details.arm.condition, null, 2)}
             </Text>
-          )}
-          {action && <Text size="xs" fw={500}>{action}</Text>}
-          {rule.message && <Text size="xs" c="dimmed">{rule.message}</Text>}
-
-          <details>
-            <summary style={{ cursor: "pointer", fontSize: "var(--mantine-font-size-xs)" }}>
-              Details
-            </summary>
-            <Stack gap={4} mt={4}>
-              {details.arm != null && (
-                <>
-                  <Text size="xs" c="dimmed">Arming condition</Text>
-                  <Text
-                    size="xs"
-                    style={{
-                      whiteSpace: "pre-wrap",
-                      fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
-                    }}
-                  >
-                    {JSON.stringify(details.arm.condition, null, 2)}
-                  </Text>
-                </>
-              )}
-              <Text size="xs" c="dimmed">Trip condition evaluation</Text>
-              <ConditionTrace trace={rule.condition_evaluation} />
-              <Text size="xs" c="dimmed">Raw trip condition</Text>
-              <Text
-                size="xs"
-                style={{
-                  whiteSpace: "pre-wrap",
-                  fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
-                }}
-              >
-                {JSON.stringify(rule.condition, null, 2)}
-              </Text>
-              <Text size="xs" c="dimmed">
-                stable for {formatDuration(rule.stable_for_s)} · cooldown {formatDuration(rule.cooldown_s)} · on unknown {rule.on_unknown ?? "n/a"}
-              </Text>
-              {rule.last_trigger_age_s != null && (
-                <Text size="xs" c="dimmed">last triggered {formatAge(rule.last_trigger_age_s)}</Text>
-              )}
+          </DetailField>
+        ) : null}
+        {(rule.actions ?? []).length > 0 ? (
+          <DetailField label="Actions">
+            <Stack gap={2}>
               {(rule.actions ?? []).map((item, index) => (
-                <Text
-                  key={`${ruleName}:action:${index}`}
-                  size="xs"
-                  style={{
-                    fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
-                    wordBreak: "break-word",
-                  }}
-                >
+                <Text key={`${row.key}:action:${index}`} size="xs" style={MONO}>
                   {formatActionSummary(item)}
                 </Text>
               ))}
             </Stack>
-          </details>
-        </Stack>
-        <Button
-          size="compact-xs"
-          variant="light"
-          color="orange"
-          disabled={clearBusy || loading || !latched}
-          loading={clearBusy}
-          onClick={() => { void onClearRuleLatch(processId, watchdogId, ruleName); }}
-        >
-          Clear latch
-        </Button>
-      </Group>
+          </DetailField>
+        ) : null}
+        <DetailField label="Raw trip condition">
+          <Text size="xs" style={MONO} component="div">
+            {JSON.stringify(rule.condition, null, 2)}
+          </Text>
+        </DetailField>
+      </Stack>
     </Card>
   );
+}
+
+type Column = "state" | "rule" | "ruleset" | "severity" | "evaluated" | "triggered";
+
+const COLUMNS: { key: Column; label: string; detail?: boolean }[] = [
+  { key: "state", label: "State" },
+  { key: "rule", label: "Rule" },
+  // Hidden while a rule is selected: the detail panel shows them instead.
+  { key: "ruleset", label: "Ruleset", detail: true },
+  { key: "severity", label: "Severity", detail: true },
+  { key: "evaluated", label: "Evaluated", detail: true },
+  { key: "triggered", label: "Last triggered", detail: true },
+];
+
+function sortValue(row: WatchdogRuleRow, column: Column): SortValue {
+  switch (column) {
+    case "state":
+      return resourceHealthRank(row, watchdogRuleAdapter);
+    case "rule":
+      return row.ruleName.toLowerCase();
+    case "ruleset":
+      return `${row.processId}/${row.watchdogId}`.toLowerCase();
+    case "severity":
+      return row.rule.severity === "critical" ? 0 : row.rule.severity === "warn" ? 1 : 2;
+    case "evaluated":
+      return row.rule.last_evaluated_age_s ?? null;
+    case "triggered":
+      return row.rule.last_trigger_age_s ?? null;
+  }
 }
 
 export function WatchdogsPanel({
@@ -569,160 +671,208 @@ export function WatchdogsPanel({
   onToggleWatchdog,
   onClearRuleLatch,
 }: Props) {
+  const rows = useMemo(
+    () => buildWatchdogRuleRows(processes, watchdogStatusByProcessId),
+    [processes, watchdogStatusByProcessId]
+  );
+  const view = useResourceListView(rows, watchdogRuleAdapter, {
+    persistKey: "ecui.safety.watchdogs",
+    initialSort: "health",
+  });
+  const { sorted, header } = useSortableTable(view.visible, sortValue);
+  const [selectedKey, setSelectedKey] = useState<string | null>(null);
+  const selectedRow = rows.find((row) => row.key === selectedKey) ?? null;
+  const compact = selectedRow !== null;
+  const showProcessName = processes.length > 1;
+  const clearBusy = (row: WatchdogRuleRow) =>
+    Boolean(watchdogBusyByKey[`${row.processId}:${row.watchdogId}:${row.ruleName}:clear`]) ||
+    Boolean(watchdogLoadingByProcessId[row.processId]);
+
   return (
-    <Stack gap="md">
-      {processes.length === 0 && (
-        <Text size="sm" c="dimmed">No watchdog-capable processes are available.</Text>
-      )}
-      {processes.map((process) => {
-        const processId = process.process_id;
-        const watchdogs = watchdogStatusByProcessId[processId] ?? [];
-        const loading = Boolean(watchdogLoadingByProcessId[processId]);
-        const error = watchdogErrorByProcessId[processId];
-        const processActive = isProcessRpcStateAvailable(process);
-        return (
-          <Card
-            key={processId}
-            radius="md"
-            p="sm"
-            style={{ border: "1px solid var(--card-border)" }}
-          >
-            <Stack gap="xs">
-              <Group justify="space-between" align="flex-start">
-                <Stack gap={2}>
-                  <Group gap="xs" wrap="wrap">
-                    <HealthMark health={processHealth(process)} />
-                    <Text fw={600}>{processId}</Text>
-                    <Badge variant="light" color={processStateColor(process.state)}>{process.state}</Badge>
-                    <Badge variant="outline" color={processActive ? "teal" : "gray"}>
-                      {processActive ? "RPC active" : "RPC inactive"}
-                    </Badge>
-                  </Group>
-                  <Text size="xs" c="dimmed">
-                    pid {process.pid ?? "—"} · hb {formatHeartbeatAge(process.hb_age_s)}
-                  </Text>
-                </Stack>
-                <RefreshIconButton
-                  size="sm"
-                  label={`Refresh ${processId}`}
+    <Stack gap="sm">
+      {processes.length === 0 ? (
+        <Text size="sm" c="dimmed">
+          No watchdog-capable processes are available.
+        </Text>
+      ) : (
+        <Stack gap={6}>
+          {processes.map((process) => {
+            const processId = process.process_id;
+            const watchdogs = watchdogStatusByProcessId[processId] ?? [];
+            const loading = Boolean(watchdogLoadingByProcessId[processId]);
+            return (
+              <Stack key={processId} gap={4}>
+                <SafetyProcessStrip
+                  process={process}
                   loading={loading}
-                  onClick={() => { void onRefreshProcess(processId); }}
+                  error={watchdogErrorByProcessId[processId]}
+                  onRefresh={() => {
+                    void onRefreshProcess(processId);
+                  }}
                 />
-              </Group>
+                {watchdogs.map((watchdog, watchdogIdx) => {
+                  const watchdogId =
+                    String(watchdog.watchdog_id ?? "").trim() || `watchdog_${watchdogIdx}`;
+                  const toggleBusy = Boolean(watchdogBusyByKey[`${processId}:${watchdogId}:toggle`]);
+                  const summary = summarizeWatchdogRules(watchdog);
+                  const turboSummary = beamlineTurboProtectionSummary(
+                    watchdog.rules,
+                    watchdog.enabled
+                  );
+                  return (
+                    <Group
+                      key={`${processId}:${watchdogId}`}
+                      className="safety-ruleset-line"
+                      justify="space-between"
+                      wrap="nowrap"
+                      gap="sm"
+                    >
+                      <Group gap="xs" wrap="wrap" style={{ minWidth: 0 }}>
+                        <Text size="xs" fw={600}>
+                          {watchdogId}
+                        </Text>
+                        <Text size="xs" c="dimmed">
+                          {watchdog.rules.length} rule{watchdog.rules.length === 1 ? "" : "s"}
+                        </Text>
+                        <Badge size="xs" variant="light" color={watchdog.enabled ? summary.color : "gray"}>
+                          {watchdog.enabled ? summary.label : "Disabled"}
+                        </Badge>
+                        {turboSummary ? (
+                          <Badge size="xs" variant="light" color={turboSummary.color}>
+                            {turboSummary.label}
+                          </Badge>
+                        ) : null}
+                      </Group>
+                      <ConfirmDisableSwitch
+                        size="xs"
+                        checked={Boolean(watchdog.enabled)}
+                        disabled={toggleBusy || loading || !watchdogId}
+                        subject={`watchdog "${watchdogId}" (all ${watchdog.rules.length} rules)`}
+                        onChange={(enabled) => {
+                          void onToggleWatchdog(processId, watchdogId, enabled);
+                        }}
+                      />
+                    </Group>
+                  );
+                })}
+                {watchdogs.length === 0 && !loading && !watchdogErrorByProcessId[processId] ? (
+                  <Text size="xs" c="dimmed" pl="md">
+                    No watchdog status available yet.
+                  </Text>
+                ) : null}
+              </Stack>
+            );
+          })}
+        </Stack>
+      )}
 
-              {error && <Text size="xs" c="red">{error}</Text>}
+      <Box style={{ maxWidth: 640 }}>
+        <ResourceListToolbar
+          view={view}
+          noun="rules"
+          healthyLabel="safe"
+          healthyTitle="Evaluated and not triggered"
+          customSortLabel="Default order"
+        />
+      </Box>
 
-              {watchdogs.length > 0 ? (
-                <Stack gap={6}>
-                  {watchdogs.map((watchdog, watchdogIdx) => {
-                    const watchdogId =
-                      String(watchdog.watchdog_id ?? "").trim() || `watchdog_${watchdogIdx}`;
-                    const toggleBusyKey = `${processId}:${watchdogId}:toggle`;
-                    const toggleBusy = Boolean(watchdogBusyByKey[toggleBusyKey]);
-                    const watchdogSummary = summarizeWatchdogRules(watchdog);
-                    const turboSummary = beamlineTurboProtectionSummary(
-                      watchdog.rules,
-                      watchdog.enabled
-                    );
-                    const turboRules = watchdog.rules.filter(isBeamlineTurboRule);
-                    const otherRules = watchdog.rules.filter((rule) => !isBeamlineTurboRule(rule));
-                    return (
-                      <Card
-                        key={`${processId}:${watchdogId}`}
-                        p="xs"
-                        radius="sm"
-                        style={{ border: "1px solid var(--card-border)" }}
-                      >
-                        <Stack gap={6}>
-                          <Group justify="space-between" align="flex-start">
-                            <Group gap="xs" wrap="wrap">
-                              <Text size="sm" fw={600}>{watchdogId}</Text>
-                              <Badge variant="light" color={watchdog.enabled ? "teal" : "gray"}>
-                                {watchdog.enabled ? "Enabled" : "Disabled"}
-                              </Badge>
-                              <Badge variant="outline" color="gray">{watchdog.rules.length} rules</Badge>
-                              <Badge variant="light" color={watchdogSummary.color}>{watchdogSummary.label}</Badge>
-                            </Group>
-                            <Switch
-                              checked={Boolean(watchdog.enabled)}
-                              disabled={toggleBusy || loading || !watchdogId}
-                              onChange={(event) => {
-                                void onToggleWatchdog(
-                                  processId,
-                                  watchdogId,
-                                  event.currentTarget.checked
-                                );
-                              }}
-                            />
-                          </Group>
-
-                          {turboRules.length > 0 && (
-                            <Stack gap={4}>
-                              <Group gap="xs" wrap="wrap">
-                                <Text size="xs" fw={700}>Beamline turbo protection</Text>
-                                {turboSummary && (
-                                  <Badge variant="light" color={turboSummary.color}>
-                                    {turboSummary.label}
-                                  </Badge>
-                                )}
-                              </Group>
-                              <Text size="xs" c="dimmed">
-                                Each Hornet arms independently after pump-down. Any armed Hornet above 1e-2 Torr for 3 fresh samples stops all four beamline turbos.
-                              </Text>
-                              {turboRules.map((rule, index) => (
-                                <RuleCard
-                                  key={`${processId}:${watchdogId}:${rule.name}`}
-                                  processId={processId}
-                                  watchdogId={watchdogId}
-                                  watchdogEnabled={watchdog.enabled}
-                                  rule={rule}
-                                  ruleIdx={index}
-                                  loading={loading}
-                                  watchdogBusyByKey={watchdogBusyByKey}
-                                  onClearRuleLatch={onClearRuleLatch}
-                                />
-                              ))}
-                            </Stack>
-                          )}
-
-                          {otherRules.length > 0 && (
-                            <Stack gap={4}>
-                              {turboRules.length > 0 && (
-                                <Text size="xs" fw={700}>Other protection rules</Text>
-                              )}
-                              {otherRules.map((rule, index) => (
-                                <RuleCard
-                                  key={`${processId}:${watchdogId}:${rule.name}`}
-                                  processId={processId}
-                                  watchdogId={watchdogId}
-                                  watchdogEnabled={watchdog.enabled}
-                                  rule={rule}
-                                  ruleIdx={index + turboRules.length}
-                                  loading={loading}
-                                  watchdogBusyByKey={watchdogBusyByKey}
-                                  onClearRuleLatch={onClearRuleLatch}
-                                />
-                              ))}
-                            </Stack>
-                          )}
-
-                          {watchdog.rules.length === 0 && (
-                            <Text size="xs" c="dimmed">No watchdog rules reported.</Text>
-                          )}
-                        </Stack>
-                      </Card>
-                    );
-                  })}
-                </Stack>
-              ) : (
-                !loading && !error && (
-                  <Text size="xs" c="dimmed">No watchdog status available yet.</Text>
-                )
-              )}
-            </Stack>
-          </Card>
-        );
-      })}
+      <Group gap="md" align="flex-start" wrap="nowrap">
+        <ScrollArea.Autosize
+          style={{ flex: 1, minWidth: 0 }}
+          mah="min(60vh, 40rem)"
+          type="auto"
+          offsetScrollbars
+        >
+          {sorted.length === 0 ? (
+            <Text size="sm" c="dimmed" ta="center" py="lg">
+              {rows.length === 0 ? "No watchdog rules reported." : "No rules match the current filter."}
+            </Text>
+          ) : (
+            <Table
+              className="resource-overview-table"
+              highlightOnHover
+              stickyHeader
+              verticalSpacing={4}
+              fz="xs"
+            >
+              <Table.Thead>
+                <Table.Tr>
+                  {COLUMNS.filter((c) => !compact || !c.detail).map((c) => header(c.key, c.label))}
+                  <Table.Th />
+                </Table.Tr>
+              </Table.Thead>
+              <Table.Tbody>
+                {sorted.map((row) => {
+                  const state = liveStateFor(row);
+                  return (
+                    <Table.Tr
+                      key={row.key}
+                      className={`resource-overview-row${
+                        row.key === selectedKey ? " resource-overview-row-selected" : ""
+                      }`}
+                      onClick={() =>
+                        setSelectedKey((prev) => (prev === row.key ? null : row.key))
+                      }
+                    >
+                      <Table.Td>
+                        <Group gap={6} wrap="nowrap">
+                          <HealthMark health={watchdogRuleHealth(row)} />
+                          <Badge size="xs" variant="light" color={state.color}>
+                            {state.label}
+                          </Badge>
+                        </Group>
+                      </Table.Td>
+                      <Table.Td>
+                        <Text size="xs" fw={600}>
+                          {row.ruleName}
+                        </Text>
+                      </Table.Td>
+                      {compact ? null : (
+                        <>
+                          <Table.Td>
+                            <Text size="xs" c="dimmed">
+                              {showProcessName ? `${row.processId} / ` : ""}
+                              {row.watchdogId}
+                            </Text>
+                          </Table.Td>
+                          <Table.Td>{row.rule.severity}</Table.Td>
+                          <Table.Td>{formatAge(row.rule.last_evaluated_age_s)}</Table.Td>
+                          <Table.Td>
+                            {row.rule.last_trigger_age_s != null
+                              ? formatAge(row.rule.last_trigger_age_s)
+                              : "—"}
+                          </Table.Td>
+                        </>
+                      )}
+                      <Table.Td>
+                        {row.rule.latched ? (
+                          <ClearLatchButton
+                            row={row}
+                            busy={clearBusy(row)}
+                            onClearRuleLatch={onClearRuleLatch}
+                          />
+                        ) : null}
+                      </Table.Td>
+                    </Table.Tr>
+                  );
+                })}
+              </Table.Tbody>
+            </Table>
+          )}
+        </ScrollArea.Autosize>
+        {selectedRow ? (
+          <Box className="resource-overview-detail">
+            <ScrollArea.Autosize mah="min(60vh, 40rem)" type="auto">
+              <WatchdogRuleDetail
+                row={selectedRow}
+                clearBusy={clearBusy(selectedRow)}
+                onClearRuleLatch={onClearRuleLatch}
+                onClose={() => setSelectedKey(null)}
+              />
+            </ScrollArea.Autosize>
+          </Box>
+        ) : null}
+      </Group>
     </Stack>
   );
 }

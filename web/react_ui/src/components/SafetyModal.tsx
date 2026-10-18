@@ -1,5 +1,9 @@
 import { Badge, Modal, Tabs, Tooltip } from "@mantine/core";
-import type { ComponentProps } from "react";
+import { useMemo, useState, type ComponentProps } from "react";
+import {
+  buildWatchdogRuleRows,
+  watchdogRuleNeedsAttention,
+} from "../features/safety/safetyRows";
 import { InterlocksModal } from "./InterlocksModal";
 import { WatchdogsPanel } from "./WatchdogsPanel";
 
@@ -47,6 +51,17 @@ export function SafetyModal({
 }: Props) {
   const interlockCount = interlocks.processes.length;
   const watchdogCount = watchdogs.processes.length;
+  // Open on Watchdogs while a rule is triggered/latched/confirming. Status
+  // arrives after the modal opens, so follow it until the operator picks a tab.
+  const watchdogAttention = useMemo(
+    () =>
+      buildWatchdogRuleRows(watchdogs.processes, watchdogs.watchdogStatusByProcessId).some(
+        watchdogRuleNeedsAttention
+      ),
+    [watchdogs.processes, watchdogs.watchdogStatusByProcessId]
+  );
+  const [chosenTab, setChosenTab] = useState<string | null>(null);
+  const activeTab = chosenTab ?? (watchdogAttention ? "watchdogs" : "interlocks");
   return (
     <Modal
       opened={opened}
@@ -55,7 +70,7 @@ export function SafetyModal({
       size="clamp(56rem, 92vw, 96rem)"
       centered
     >
-      <Tabs defaultValue="interlocks" keepMounted={false}>
+      <Tabs value={activeTab} onChange={setChosenTab} keepMounted={false}>
         <Tabs.List>
           <Tabs.Tab
             value="interlocks"
