@@ -16,6 +16,14 @@ from ..utils.zmq_helpers import json_dumps, poll_and_drain, safe_json_loads
 
 
 class ManagedProcessBase:
+    # Per-bundle sequence number for publish_telemetry (device analogue: the
+    # driver runner's telemetry seq). Bumped even when a publish fails, so a
+    # gap in the recorded seq marks a dropped bundle. Class-level defaults
+    # (shadowed per instance in __init__) keep subclasses/test stubs built
+    # with __new__ working.
+    _process_telemetry_seq: int = 0
+    _process_telemetry_seq_lock: threading.Lock = threading.Lock()
+
     def __init__(
         self,
         *,
@@ -48,6 +56,8 @@ class ManagedProcessBase:
         # Set once the process telemetry schema has been advertised to the
         # manager (lazily, on the first publish_telemetry call).
         self._process_telemetry_schema_advertised = False
+        self._process_telemetry_seq = 0
+        self._process_telemetry_seq_lock = threading.Lock()
 
     @staticmethod
     def _rpc_request_id(req_or_id: dict[str, Any] | Any) -> Any:
@@ -479,6 +489,28 @@ class ManagedProcessBase:
         if manager is None:
             return False
         self._advertise_process_telemetry_schema()
+        payload = self._build_process_telemetry_payload(signals, quality=quality)
+        try:
+            manager.publish_event(
+                topic="manager.process_telemetry_update",
+                payload=payload,
+            )
+            return True
+        except Exception:
+            return False
+
+    def _build_process_telemetry_payload(
+        self,
+        signals: dict[str, Any],
+        *,
+        quality: str = "ok",
+    ) -> dict[str, Any]:
+        """Build one ``manager.process_telemetry_update`` bundle.
+
+        Shared by :meth:`publish_telemetry` and processes that send it over
+        their own transport (hdf_writer's off-loop RPC), so every process
+        bundle carries the same shape and a per-process ``seq``.
+        """
         units_map: dict[str, str] = {}
         for entry in self.process_telemetry_schema() or []:
             name = entry.get("name")
@@ -500,14 +532,10 @@ class ManagedProcessBase:
                     "ts": bundle_ts,
                 }
             out[name] = sig
-        try:
-            manager.publish_event(
-                topic="manager.process_telemetry_update",
-                payload={"version": 1, "signals": out},
-            )
-            return True
-        except Exception:
-            return False
+        with self._process_telemetry_seq_lock:
+            self._process_telemetry_seq += 1
+            seq = self._process_telemetry_seq
+        return {"version": 1, "seq": seq, "signals": out, "ts": bundle_ts}
 
     def _init_poller(
         self,

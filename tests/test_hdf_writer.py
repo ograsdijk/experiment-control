@@ -4346,7 +4346,6 @@ class WritingActiveTelemetryTests(unittest.TestCase):
         proc._writing_active_rpc_timeout_ms = 1000
         proc._writing_active = True
         proc._writing_active_schema_advertised = False
-        proc._process_telemetry_seq = 0
 
         orig = hw._manager_rpc
         hw._manager_rpc = _fake_rpc
@@ -4965,6 +4964,62 @@ class HdfWriterProcessDisableTests(unittest.TestCase):
             handler(msg)
             self.assertEqual(len(w._buf), 1)  # noqa: SLF001
             self.assertEqual(list(w._buf)[0]["device_id"], "spb_microwave")  # noqa: SLF001
+
+    def test_process_telemetry_rows_persist_seq_and_t_wall_recv(self) -> None:
+        # The process path reuses the device row writer, so the producer's
+        # seq and the manager's ts.t_wall_recv must land in the
+        # /process_telemetry/<id> row (they were -1 / NaN when neither was
+        # carried on the process telemetry payload).
+        with tempfile.TemporaryDirectory() as td:
+            w = self._make_writer(td)
+            w._buf = deque(maxlen=1000)  # noqa: SLF001
+            with h5py.File(Path(td) / "proc_rows.h5", "w") as h5:
+                meta = w._build_measurement_metadata(  # noqa: SLF001
+                    profile_id=None, values=None, require_profile=False
+                )
+                with w._h5_lock:  # noqa: SLF001
+                    w._configure_active_file(  # noqa: SLF001
+                        h5,
+                        write_every_s=1.0,
+                        load_manager_state=False,
+                        measurement_meta=meta,
+                    )
+                    assert w._process_telemetry_group is not None  # noqa: SLF001
+                    _ingest_process_schema(
+                        {
+                            "processes": [
+                                {
+                                    "process_id": "spb_microwave",
+                                    "signals": ["lock"],
+                                    "dtypes": ["float64"],
+                                    "units": [""],
+                                }
+                            ]
+                        },
+                        w._process_telemetry_group,  # noqa: SLF001
+                        w._datasets,  # noqa: SLF001
+                        w._device_map,  # noqa: SLF001
+                        write_enabled=lambda _pid: True,
+                    )
+                    handler = w._build_topic_handlers()[  # noqa: SLF001
+                        "manager.process_telemetry_update"
+                    ]
+                    handler(
+                        {
+                            "process_id": "spb_microwave",
+                            "version": 1,
+                            "seq": 7,
+                            "signals": {"lock": {"value": 1.0}},
+                            "ts": {"t_wall": 100.0, "t_mono": 5.0, "t_wall_recv": 100.5},
+                        }
+                    )
+                    w._write_buffered_rows_batch(list(w._buf))  # noqa: SLF001
+                ds = w._datasets["spb_microwave"]  # noqa: SLF001
+                self.assertTrue(ds.name.startswith("/process_telemetry/"))
+                self.assertEqual(int(ds.shape[0]), 1)
+                self.assertEqual(int(ds[0]["seq"]), 7)
+                self.assertAlmostEqual(float(ds[0]["t_wall_recv"]), 100.5)
+                self.assertAlmostEqual(float(ds[0]["lock"]), 1.0)
 
     def test_processes_toggle_rpc(self) -> None:
         with tempfile.TemporaryDirectory() as td:

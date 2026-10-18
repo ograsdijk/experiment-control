@@ -288,6 +288,24 @@ class ProcessFederationHubTests(unittest.TestCase):
         self.assertEqual(payload["source_kind"], "process")
         self.assertEqual(payload["owner_peer_id"], "lab2")
 
+    def test_relay_process_telemetry_keeps_seq_and_producer_ts(self) -> None:
+        # The relay hands the bundle to _publish_manager_event, which re-stamps
+        # this host's receive clock (see test_process_telemetry_stamps); the
+        # producer's seq and timing must reach it unchanged.
+        hub, events = _make_process_hub()
+        hub._relay_process_telemetry(
+            hub._peers["lab2"],
+            {
+                "process_id": "spb_r",
+                "seq": 3,
+                "signals": {"ready": {"value": 1.0}},
+                "ts": {"t_wall": 50.0, "t_mono": 1.0},
+            },
+        )
+        payload = events[0][1]
+        self.assertEqual(payload["seq"], 3)
+        self.assertEqual(payload["ts"], {"t_wall": 50.0, "t_mono": 1.0})
+
     def test_relay_process_telemetry_unknown_id_dropped(self) -> None:
         hub, events = _make_process_hub()
         peer_rt = hub._peers["lab2"]
