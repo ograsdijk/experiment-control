@@ -39,6 +39,7 @@ import { useResourceListView } from "../features/devices/useDeviceListView";
 import { livenessColor, processStateColor } from "../features/runtime/helpers";
 import type { CapabilityMember, ProcessStatus } from "../types";
 import { HealthMark } from "./HealthMark";
+import { RefreshIconButton } from "./RefreshIconButton";
 import { ResourceListToolbar } from "./ResourceListToolbar";
 
 // A mirrored (federated) process action is allowed unless the server annotated it
@@ -385,19 +386,12 @@ export function ProcessesModal({
             customSortLabel="Default order"
           />
         </Box>
-        <Tooltip label="Refresh processes" withArrow>
-          <ActionIcon
-            size={30}
-            variant="light"
-            color="gray"
-            aria-label="Refresh processes"
-            onClick={() => {
-              void onRefresh();
-            }}
-          >
-            <IconRefresh size={16} />
-          </ActionIcon>
-        </Tooltip>
+        <RefreshIconButton
+          label="Refresh processes"
+          onClick={() => {
+            void onRefresh();
+          }}
+        />
       </Group>
       <Group gap="md" align="flex-start" wrap="nowrap">
         <ScrollArea.Autosize

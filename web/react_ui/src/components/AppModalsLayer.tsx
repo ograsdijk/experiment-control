@@ -344,6 +344,8 @@ export function AppModalsLayer({
           onToggleWatchdog: watchdogsController.toggleWatchdog,
           onClearRuleLatch: watchdogsController.clearWatchdogRuleLatch,
         }}
+        interlockSummary={interlocksController.interlockButtonSummary}
+        watchdogSummary={watchdogsController.watchdogButtonSummary}
         />
       ) : null}
 
@@ -351,7 +353,6 @@ export function AppModalsLayer({
         <StateMachinesModal
           opened={stateMachinesController.stateMachinesOpen}
         onClose={() => stateMachinesController.setStateMachinesOpen(false)}
-        summary={stateMachinesController.stateMachineSummary}
         rows={stateMachinesController.stateMachineRows}
         selectedProcessId={stateMachinesController.selectedProcessId}
         onSelectProcess={stateMachinesController.setSelectedProcessId}

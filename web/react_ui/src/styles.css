@@ -336,6 +336,26 @@ body::before {
   cursor: pointer;
 }
 
+/* Selectable list rows (State Machines list): same highlight as table rows. */
+.resource-list-item {
+  display: block;
+  width: 100%;
+  padding: 8px 10px;
+  border-radius: 10px;
+  border: 1px solid var(--card-border);
+  background: var(--card);
+}
+
+.resource-list-item:hover {
+  background: var(--mantine-color-default-hover);
+}
+
+.resource-list-item-selected,
+.resource-list-item-selected:hover {
+  background: var(--mantine-color-indigo-light);
+  border-color: var(--mantine-color-indigo-5);
+}
+
 .resource-overview-table th,
 .resource-overview-table td {
   white-space: nowrap;

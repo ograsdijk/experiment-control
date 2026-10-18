@@ -1,4 +1,4 @@
-import { Badge, Modal, Tabs } from "@mantine/core";
+import { Badge, Modal, Tabs, Tooltip } from "@mantine/core";
 import type { ComponentProps } from "react";
 import { InterlocksModal } from "./InterlocksModal";
 import { WatchdogsPanel } from "./WatchdogsPanel";
@@ -10,14 +10,41 @@ type InterlocksPanelProps = Omit<
 
 type WatchdogsPanelProps = ComponentProps<typeof WatchdogsPanel>;
 
+type TabSummary = { color: string; tooltip: string };
+
 type Props = {
   opened: boolean;
   onClose: () => void;
   interlocks: InterlocksPanelProps;
   watchdogs: WatchdogsPanelProps;
+  /** Same summaries the header's Safety button is coloured from. */
+  interlockSummary?: TabSummary;
+  watchdogSummary?: TabSummary;
 };
 
-export function SafetyModal({ opened, onClose, interlocks, watchdogs }: Props) {
+function TabCount({ count, summary }: { count: number; summary?: TabSummary }) {
+  const badge = (
+    <Badge size="xs" variant="light" color={summary?.color ?? "gray"}>
+      {count}
+    </Badge>
+  );
+  return summary ? (
+    <Tooltip label={summary.tooltip} withArrow>
+      {badge}
+    </Tooltip>
+  ) : (
+    badge
+  );
+}
+
+export function SafetyModal({
+  opened,
+  onClose,
+  interlocks,
+  watchdogs,
+  interlockSummary,
+  watchdogSummary,
+}: Props) {
   const interlockCount = interlocks.processes.length;
   const watchdogCount = watchdogs.processes.length;
   return (
@@ -32,21 +59,13 @@ export function SafetyModal({ opened, onClose, interlocks, watchdogs }: Props) {
         <Tabs.List>
           <Tabs.Tab
             value="interlocks"
-            rightSection={
-              <Badge size="xs" variant="light" color="gray">
-                {interlockCount}
-              </Badge>
-            }
+            rightSection={<TabCount count={interlockCount} summary={interlockSummary} />}
           >
             Interlocks
           </Tabs.Tab>
           <Tabs.Tab
             value="watchdogs"
-            rightSection={
-              <Badge size="xs" variant="light" color="gray">
-                {watchdogCount}
-              </Badge>
-            }
+            rightSection={<TabCount count={watchdogCount} summary={watchdogSummary} />}
           >
             Watchdogs
           </Tabs.Tab>

@@ -9,7 +9,6 @@
   Switch,
   Text,
 } from "@mantine/core";
-import { IconRefresh } from "@tabler/icons-react";
 import { useEffect, useMemo, useState } from "react";
 import type { ReactNode } from "react";
 import {
@@ -27,6 +26,9 @@ import type {
   ProcessStatus,
 } from "../types";
 import { DeviceNameInline } from "./DeviceNameInline";
+import { HealthMark } from "./HealthMark";
+import { RefreshIconButton } from "./RefreshIconButton";
+import { formatAge, processHealth } from "../features/devices/health";
 
 type Props = {
   opened: boolean;
@@ -920,20 +922,13 @@ export function InterlocksModal({
 
   const panel = (
       <Stack gap="md">
-        <Group justify="space-between">
-          <Text size="sm" c="dimmed">
-            Rule controls discovered via process capabilities.
-          </Text>
-          <Button
-            size="xs"
-            variant="light"
-            leftSection={<IconRefresh size={14} />}
+        <Group justify="flex-end">
+          <RefreshIconButton
+            label="Refresh interlocks"
             onClick={() => {
               void onRefresh();
             }}
-          >
-            Refresh
-          </Button>
+          />
         </Group>
         {hasRunningInterlockProcess && (
           <Card
@@ -1222,6 +1217,7 @@ export function InterlocksModal({
                 <Group justify="space-between" align="flex-start">
                   <Stack gap={2}>
                     <Group gap="xs" wrap="wrap">
+                      <HealthMark health={processHealth(process)} />
                       <Text fw={600}>{processId}</Text>
                       <Badge variant="light" color={processStateColor(process.state)}>
                         {process.state}
@@ -1234,23 +1230,17 @@ export function InterlocksModal({
                       </Badge>
                     </Group>
                     <Text size="xs" c="dimmed">
-                      pid {process.pid ?? "n/a"} | hb age{" "}
-                      {process.hb_age_s != null
-                        ? `${process.hb_age_s.toFixed(2)} s`
-                        : "n/a"}
+                      pid {process.pid ?? "—"} · hb {formatAge(process.hb_age_s)}
                     </Text>
                   </Stack>
-                  <Button
-                    size="xs"
-                    variant="light"
+                  <RefreshIconButton
+                    size="sm"
+                    label={`Refresh ${processId}`}
                     loading={loading}
-                    leftSection={<IconRefresh size={14} />}
                     onClick={() => {
                       void onRefreshProcess(processId);
                     }}
-                  >
-                    Refresh process
-                  </Button>
+                  />
                 </Group>
                 {error && (
                   <Text size="xs" c="red">

@@ -1,5 +1,5 @@
 import { Badge, Button, Card, Group, Stack, Switch, Text } from "@mantine/core";
-import { IconRefresh } from "@tabler/icons-react";
+import { formatAge as formatHeartbeatAge, processHealth } from "../features/devices/health";
 import { isProcessRpcStateAvailable, processStateColor } from "../features/runtime/helpers";
 import {
   hasActiveWatchdogTrip,
@@ -14,6 +14,8 @@ import type {
   ProcessStatus,
   WatchdogStatus,
 } from "../types";
+import { HealthMark } from "./HealthMark";
+import { RefreshIconButton } from "./RefreshIconButton";
 
 type Props = {
   processes: ReadonlyArray<ProcessStatus>;
@@ -569,9 +571,6 @@ export function WatchdogsPanel({
 }: Props) {
   return (
     <Stack gap="md">
-      <Text size="sm" c="dimmed">
-        Watchdog rules monitor telemetry and execute safety actions when a rule trips.
-      </Text>
       {processes.length === 0 && (
         <Text size="sm" c="dimmed">No watchdog-capable processes are available.</Text>
       )}
@@ -592,6 +591,7 @@ export function WatchdogsPanel({
               <Group justify="space-between" align="flex-start">
                 <Stack gap={2}>
                   <Group gap="xs" wrap="wrap">
+                    <HealthMark health={processHealth(process)} />
                     <Text fw={600}>{processId}</Text>
                     <Badge variant="light" color={processStateColor(process.state)}>{process.state}</Badge>
                     <Badge variant="outline" color={processActive ? "teal" : "gray"}>
@@ -599,18 +599,15 @@ export function WatchdogsPanel({
                     </Badge>
                   </Group>
                   <Text size="xs" c="dimmed">
-                    pid {process.pid ?? "n/a"} | hb age {process.hb_age_s != null ? `${process.hb_age_s.toFixed(2)} s` : "n/a"}
+                    pid {process.pid ?? "—"} · hb {formatHeartbeatAge(process.hb_age_s)}
                   </Text>
                 </Stack>
-                <Button
-                  size="xs"
-                  variant="light"
+                <RefreshIconButton
+                  size="sm"
+                  label={`Refresh ${processId}`}
                   loading={loading}
-                  leftSection={<IconRefresh size={14} />}
                   onClick={() => { void onRefreshProcess(processId); }}
-                >
-                  Refresh process
-                </Button>
+                />
               </Group>
 
               {error && <Text size="xs" c="red">{error}</Text>}
