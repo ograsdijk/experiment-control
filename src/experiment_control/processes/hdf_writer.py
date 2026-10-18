@@ -721,16 +721,12 @@ class HdfWriter(ManagedProcessBase):
         # "writing_active") so an interlock can gate device reconfig RPCs
         # on whether a run is being recorded. hdf_writer has no persistent
         # ManagerClient, so we publish via the same manager.events.publish
-        # path ManagerClient.publish_telemetry uses (see
+        # path publish_telemetry uses (see
         # _publish_writing_active_telemetry). Periodic so the value stays
         # fresh for the interlock's max_age check; schema advertised once.
         self._next_writing_active_publish_mono: float = 0.0
         self._writing_active_schema_advertised = False
         self._writing_active_publish_period_s = 1.0
-        # Monotone seq stamped on each writing_active publish so a writer
-        # restart mid-run is provable from the file (device telemetry always
-        # has a real seq; process telemetry previously always read as -1).
-        self._process_telemetry_seq = 0
         # The publish does a synchronous manager RPC; run it on a dedicated
         # single-worker executor so a slow/wedged manager can never stall
         # the writer's main loop (which drains sockets + enqueues flushes).
@@ -1881,14 +1877,13 @@ class HdfWriter(ManagedProcessBase):
         being recorded. hdf_writer keeps no persistent ManagerClient, so
         we go through the same ``manager.events.publish`` ->
         ``manager.process_telemetry_update`` path that
-        ``ManagerClient.publish_telemetry`` uses, via the ephemeral
-        ``_manager_rpc`` helper. Quality is the canonical ``"OK"`` so the
+        ``publish_telemetry`` uses (same payload builder and seq), via the
+        ephemeral ``_manager_rpc`` helper. Quality is the canonical ``"OK"`` so the
         interlock resolver's quality check passes. Best-effort: a publish
         failure bumps an error counter but never disrupts writing.
         """
         if not self._process_id:
             return
-        ts = {"t_wall": time.time(), "t_mono": time.monotonic()}
         try:
             if not self._writing_active_schema_advertised:
                 _manager_rpc(
@@ -1902,27 +1897,19 @@ class HdfWriter(ManagedProcessBase):
                     timeout_ms=self._writing_active_rpc_timeout_ms,
                 )
                 self._writing_active_schema_advertised = True
-            self._process_telemetry_seq += 1
+            payload = self._build_process_telemetry_payload(
+                {"writing_active": bool(self._writing_active)}, quality="OK"
+            )
+            # ManagerClient.publish_event would add this; the ephemeral RPC
+            # does not.
+            payload["process_id"] = self._process_id
             _manager_rpc(
                 self._ctx,
                 self._manager_rpc,
                 {
                     "type": "manager.events.publish",
                     "topic": "manager.process_telemetry_update",
-                    "payload": {
-                        "process_id": self._process_id,
-                        "version": 1,
-                        "seq": self._process_telemetry_seq,
-                        "signals": {
-                            "writing_active": {
-                                "value": bool(self._writing_active),
-                                "units": "",
-                                "quality": "OK",
-                                "ts": ts,
-                            }
-                        },
-                        "ts": ts,
-                    },
+                    "payload": payload,
                 },
                 timeout_ms=self._writing_active_rpc_timeout_ms,
             )

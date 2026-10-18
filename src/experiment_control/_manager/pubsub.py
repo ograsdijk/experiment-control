@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import queue
 import threading
+import time
 from typing import TYPE_CHECKING, Any, Callable
 
 from ..utils.zmq_helpers import json_dumps
@@ -44,6 +45,26 @@ _AUDIT_TOPICS: frozenset[str] = frozenset(
 # visible in the next drain.
 _AUDIT_BLOCKING_PUT_TIMEOUT_S: float = 5.0
 
+_PROCESS_TELEMETRY_TOPIC = "manager.process_telemetry_update"
+
+
+def _stamp_process_telemetry_recv(payload: Json) -> Json:
+    """Process-telemetry analogue of the device ingest stamp in driver_pub.
+
+    Adds THIS manager's receive clock to ``ts`` so the HDF writer persists
+    ``t_wall_recv`` for process rows too (``t_wall_recv - t_wall`` =
+    clock_skew + transport_latency). Always overwrites: a bundle relayed by
+    the federation hub must carry the consuming host's receive time, not the
+    owner manager's.
+    """
+    out = dict(payload)
+    ts_raw = out.get("ts")
+    ts = dict(ts_raw) if isinstance(ts_raw, dict) else {}
+    ts["t_mono_recv"] = time.monotonic()
+    ts["t_wall_recv"] = time.time()
+    out["ts"] = ts
+    return out
+
 
 class PubSubMixin(_MixinBase):
     """Mixin providing manager pub-sub event publishing.
@@ -74,6 +95,11 @@ class PubSubMixin(_MixinBase):
     _event_hooks: list[Callable[[str, Json], None]]
 
     def _publish_manager_event(self, topic: str, payload: Json) -> None:
+        # Every process-telemetry path (a local process's
+        # manager.events.publish, a federation relay) ends here, so stamp the
+        # receive clock once, before any worker-thread queueing.
+        if topic == _PROCESS_TELEMETRY_TOPIC:
+            payload = _stamp_process_telemetry_recv(payload)
         # ZMQ sockets aren't thread-safe and several side effects below
         # (_external_pub.send_multipart, log forwarding) also write to
         # main-thread-owned sockets. When called from a lifecycle worker
