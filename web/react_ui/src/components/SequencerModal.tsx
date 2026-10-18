@@ -403,7 +403,6 @@ export function SequencerModal({
       title="Sequencer"
       size="calc(100vw - 3rem)"
       centered
-      zIndex={440}
       styles={{
         // The modal fills the window; its body takes what the header leaves.
         content: { height: "calc(100dvh - 3rem)", display: "flex", flexDirection: "column" },

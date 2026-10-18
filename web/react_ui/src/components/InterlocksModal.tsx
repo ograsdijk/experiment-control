@@ -1539,7 +1539,6 @@ export function InterlocksModal({
       title="Interlocks"
       size="clamp(56rem, 92vw, 96rem)"
       centered
-      zIndex={420}
     >
       {panel}
     </Modal>

@@ -27,7 +27,6 @@ export function SafetyModal({ opened, onClose, interlocks, watchdogs }: Props) {
       title="Safety"
       size="clamp(56rem, 92vw, 96rem)"
       centered
-      zIndex={420}
     >
       <Tabs defaultValue="interlocks" keepMounted={false}>
         <Tabs.List>

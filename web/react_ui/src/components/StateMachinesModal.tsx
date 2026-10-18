@@ -19,6 +19,7 @@ import type {
 } from "../features/state_machines/useStateMachinesController";
 import { processStateColor } from "../features/runtime/helpers";
 import { coerceParamValue, ParamInput } from "./ParamInput";
+import { CHILD_MODAL_Z_INDEX } from "../features/layout/modalLayers";
 
 type Props = {
   opened: boolean;
@@ -995,6 +996,7 @@ export function StateMachinesModal({
         title={`State Graph ${selectedRow?.process.process_id ?? ""}`}
         size="clamp(64rem, 96vw, 120rem)"
         centered
+        zIndex={CHILD_MODAL_Z_INDEX}
       >
         {!selectedRow?.graph || !graph ? (
           <Text size="sm" c="dimmed">No graph metadata reported by this process.</Text>

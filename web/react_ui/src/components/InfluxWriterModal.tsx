@@ -87,7 +87,6 @@ export function InfluxWriterModal({
       title={title}
       size="clamp(56rem, 92vw, 96rem)"
       centered
-      zIndex={450}
     >
       <Stack gap="md">
         <Group justify="space-between" align="flex-start" wrap="wrap">
