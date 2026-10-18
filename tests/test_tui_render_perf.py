@@ -366,6 +366,57 @@ class HeadlessRenderContentTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("registered", detail_fields)
 
 
+class TimerCallbackLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    """Interval callbacks must not query widgets outside the mounted lifetime.
+
+    Textual's shutdown prunes the screens before it stops the App's timers, so
+    a drain or snapshot tick can land after the widgets are gone. These tests
+    run the callbacks at exactly that point instead of hoping a 0.2 s tick
+    happens to fire there (the flaky CI failure: NoMatches '#dropped_status').
+    """
+
+    def _make_app(self) -> ManagerTUI:
+        app = ManagerTUI(snapshot_period_s=3600.0, rpc_timeout_ms=20)
+        app._rpc_submit = lambda *a, **k: None  # type: ignore[method-assign]
+        app._background_rpc_submit = lambda *a, **k: None  # type: ignore[method-assign]
+        return app
+
+    def test_drain_before_mount_is_a_no_op(self) -> None:
+        app = self._make_app()
+        app._enqueue_pub_message("manager.event", {"message": "early"})
+        app._drain_pub_queue()
+
+    async def test_ticks_after_screens_pruned_do_not_raise(self) -> None:
+        app = self._make_app()
+        applied: list[object] = []
+        hook_ran: list[bool] = []
+        close_all = app._close_all
+
+        async def close_all_then_tick() -> None:
+            await close_all()
+            hook_ran.append(True)
+            # Screens and their widgets are gone; App timers are still live.
+            app._enqueue_pub_message("manager.event", {"message": "late"})
+            app._drain_pub_queue()
+            app._refresh_snapshot()
+
+        async with app.run_test(headless=True, size=(120, 40)) as pilot:
+            app._stop_event.set()
+            await pilot.pause()
+            app._apply_snapshot = lambda *a: applied.append(a)  # type: ignore[method-assign]
+            # Deliver snapshot RPC results synchronously, as if the worker
+            # finished while the app was tearing down.
+            app._background_rpc_submit = (  # type: ignore[method-assign]
+                lambda payload, on_result=None: on_result and on_result({"ok": True})
+            )
+            app._close_all = close_all_then_tick  # type: ignore[method-assign]
+        # Guard against Textual no longer calling _close_all on shutdown, which
+        # would leave this test passing without exercising the race.
+        self.assertEqual(hook_ran, [True])
+        self.assertEqual(applied, [])
+        self.assertFalse(app._snapshot_refresh_inflight)
+
+
 class _FakeProcTable:
     """Minimal DataTable stand-in for _render_processes_table."""
 
