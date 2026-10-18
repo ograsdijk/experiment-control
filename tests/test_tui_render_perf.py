@@ -389,10 +389,12 @@ class TimerCallbackLifecycleTests(unittest.IsolatedAsyncioTestCase):
     async def test_ticks_after_screens_pruned_do_not_raise(self) -> None:
         app = self._make_app()
         applied: list[object] = []
+        hook_ran: list[bool] = []
         close_all = app._close_all
 
         async def close_all_then_tick() -> None:
             await close_all()
+            hook_ran.append(True)
             # Screens and their widgets are gone; App timers are still live.
             app._enqueue_pub_message("manager.event", {"message": "late"})
             app._drain_pub_queue()
@@ -408,6 +410,9 @@ class TimerCallbackLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 lambda payload, on_result=None: on_result and on_result({"ok": True})
             )
             app._close_all = close_all_then_tick  # type: ignore[method-assign]
+        # Guard against Textual no longer calling _close_all on shutdown, which
+        # would leave this test passing without exercising the race.
+        self.assertEqual(hook_ran, [True])
         self.assertEqual(applied, [])
         self.assertFalse(app._snapshot_refresh_inflight)
 

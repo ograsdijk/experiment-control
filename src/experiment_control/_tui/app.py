@@ -697,14 +697,20 @@ class ManagerTUI(App):
     def _ui_live(self) -> bool:
         """Whether timer-driven callbacks may touch the composed widgets.
 
-        Textual's ``App._shutdown`` (``run()`` teardown and ``run_test``
-        exit) clears ``_running`` and then prunes the screens, but only stops
-        the App's own timers afterwards. A drain tick (or its ``call_later``
-        follow-up) landing in that window would ``query_one`` widgets that are
-        already gone and raise ``NoMatches``. ``run_test`` never sets
-        ``_exit``, so Textual's own timer guard does not cover it.
+        Textual's shutdown (``run()`` teardown and ``run_test`` exit) marks
+        the app as no longer running (``is_running`` turns false) and then
+        prunes the screens, but only stops the App's own timers afterwards. A
+        drain tick (or its ``call_later`` follow-up) landing in that window
+        would ``query_one`` widgets that are already gone and raise
+        ``NoMatches``. Textual's own timer guard checks only the private exit
+        flag, which ``run_test`` never sets; it is read defensively here so a
+        Textual rename cannot turn every tick into an ``AttributeError``.
         """
-        return self._ui_ready and self._running and not self._exit
+        return (
+            self._ui_ready
+            and self.is_running
+            and not getattr(self, "_exit", False)
+        )
 
     def on_unmount(self) -> None:
         self._ui_ready = False
