@@ -13,6 +13,10 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Every check lives in scripts/ci_check.py; each job runs one `--job` of it.
+# A local `python scripts/ci_check.py --full` therefore runs exactly what CI
+# runs -- add or change checks there, not here.
+
 jobs:
   validate:
     runs-on: windows-latest
@@ -29,39 +33,8 @@ jobs:
       - name: Set up uv
         uses: astral-sh/setup-uv@v7
 
-      - name: Sync Python dependencies
-        run: uv sync
-
-      - name: Lint Python
-        run: uv run ruff check src tests examples
-
-      - name: Complexity guard (incremental)
-        run: uv run ruff check src/experiment_control/utils/command_interceptors.py src/experiment_control/utils/network_hosts.py src/experiment_control/processes/stream_analysis.py src/experiment_control/processes/influx_writer.py src/experiment_control/sequencer/sequencer.py src/experiment_control/processes/interlock.py src/experiment_control/processes/watchdog.py --select C901
-
-      - name: Run Python tests
-        run: uv run python -m unittest discover -s tests -p "test_*.py" -q
-
-      - name: Build package artifacts
-        run: uv build
-
-      - name: Verify wheel contains bundled UI
-        shell: pwsh
-        run: |
-          @'
-          import pathlib
-          import zipfile
-
-          wheels = sorted(pathlib.Path("dist").glob("*.whl"))
-          if not wheels:
-              raise SystemExit("No wheel found in dist/")
-          wheel = wheels[-1]
-          required = "experiment_control/_ui_dist/index.html"
-          with zipfile.ZipFile(wheel) as zf:
-              names = set(zf.namelist())
-          if required not in names:
-              raise SystemExit(f"Missing bundled UI asset in wheel: {required}")
-          print(f"Verified bundled UI in {wheel.name}")
-          '@ | python -
+      - name: Sync, lint, complexity guard, tests, wheel
+        run: python scripts/ci_check.py --job python
 
   ui_validate:
     runs-on: windows-latest
@@ -70,6 +43,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
       - name: Set up Node.js
         uses: actions/setup-node@v6
         with:
@@ -77,23 +55,8 @@ jobs:
           cache: npm
           cache-dependency-path: web/react_ui/package-lock.json
 
-      - name: Build bundled UI assets
-        shell: pwsh
-        run: .\scripts\build_packaged_ui.ps1
-
-      - name: Run UI tests
-        run: npm test --prefix web/react_ui
-
-      - name: Verify packaged UI is up to date
-        shell: pwsh
-        run: |
-          git add -A -- src/experiment_control/_ui_dist
-          $diff = git diff --cached --stat -- src/experiment_control/_ui_dist
-          if ($diff) {
-            Write-Host $diff
-            Write-Host "::error::src/experiment_control/_ui_dist is stale — run .\scripts\build_packaged_ui.ps1 and commit the result."
-            exit 1
-          }
+      - name: Build UI, run UI tests, verify packaged UI is current
+        run: python scripts/ci_check.py --job ui
 
   windows_lifecycle_smoke:
     runs-on: windows-latest
@@ -111,10 +74,5 @@ jobs:
       - name: Set up uv
         uses: astral-sh/setup-uv@v7
 
-      - name: Sync Python dependencies
-        run: uv sync
-
       - name: Run Windows lifecycle smoke test
-        env:
-          EC_ENABLE_WINDOWS_LIFECYCLE_SMOKE: "1"
-        run: uv run python -m unittest -q tests.test_windows_lifecycle_smoke
+        run: python scripts/ci_check.py --job smoke
