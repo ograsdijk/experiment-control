@@ -20,7 +20,6 @@
   SegmentedControl,
   Tooltip,
   useComputedColorScheme,
-  useMantineColorScheme,
 } from "@mantine/core";
 import { DndContext } from "@dnd-kit/core";
 import { SortableContext, rectSortingStrategy } from "@dnd-kit/sortable";
@@ -500,7 +499,6 @@ export function App() {
     setTelemetryCollapsedByDevice,
     deviceGridRef,
   } = useDevicesContext();
-  const { colorScheme, setColorScheme } = useMantineColorScheme();
   const computedColorScheme = useComputedColorScheme("light");
   // Panel state moved to PanelsContext — see the usePanels() destructure
   // below for `panels`, `setPanels`, `activePanelId`, `panelIdRef`,
@@ -3060,7 +3058,7 @@ export function App() {
     >
       <AppShell
         className="app-shell"
-        header={{ height: 72 }}
+        header={{ height: 56 }}
         padding="lg"
       >
         <DashboardHeaderBar
@@ -3152,8 +3150,6 @@ export function App() {
             await refreshSequencerStatus(seqProcess.process_id);
           }
         }}
-        colorScheme={colorScheme}
-        onColorSchemeChange={setColorScheme}
         telemetryBadgeColor={telemetryBadgeColor}
         telemetryBadgeLabel={telemetryBadgeLabel}
         instanceRuntimeStatus={instanceRuntimeStatus}

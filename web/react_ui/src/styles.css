@@ -94,6 +94,116 @@ body::before {
   background: rgba(23, 29, 37, 0.82);
 }
 
+/* One row, never wraps: the header has a fixed height and AppShell offsets
+   the page by exactly that, so wrapping would overlap the content below.
+   Space pressure is absorbed by the run chips (ellipsis) and, when even
+   that is not enough, by icon-only nav buttons (useHeaderCompact). */
+.app-header-row {
+  display: flex;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: 12px;
+  height: 100%;
+  padding: 0 var(--mantine-spacing-lg);
+  min-width: 0;
+}
+
+.app-header-identity {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 2 auto;
+  min-width: 120px;
+}
+
+.app-header-identity .instance-title-trigger {
+  min-width: 0;
+}
+
+.app-header-live-dot {
+  display: inline-block;
+  flex: 0 0 auto;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+}
+
+.app-header-run {
+  display: flex;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: 8px;
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+}
+
+/* Shrink order under pressure: the HDF filename gives way first, then the
+   instance name; the sequencer keeps enough to read its state. */
+.app-header-run-chip,
+.app-header-run-group {
+  flex: 0 1 auto;
+  min-width: 0;
+}
+
+.app-header-run-chip-hdf {
+  flex-shrink: 6;
+  min-width: 64px;
+}
+
+.app-header-run-group {
+  min-width: 170px;
+}
+
+.app-header-run-chip-fixed {
+  flex: 0 0 auto;
+}
+
+.app-header-run-chip .mantine-Button-inner,
+.app-header-run-chip .mantine-Button-label {
+  min-width: 0;
+  overflow: hidden;
+}
+
+/* Block (not flex) so the ellipsis works; auto height lets the button's
+   inner flexbox keep the text vertically centred. */
+.app-header-run-chip .mantine-Button-label {
+  display: block;
+  height: auto;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.app-header-nav {
+  display: flex;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+}
+
+.header-nav-compact {
+  display: none;
+}
+
+/* Toggled by useHeaderCompact when the labelled row would not fit. */
+.app-header-row-compact .header-nav-label {
+  display: none;
+}
+
+.app-header-row-compact .header-nav-compact {
+  display: inline;
+  margin-left: 4px;
+}
+
+.app-header-row-compact .header-nav-btn {
+  padding-inline: 8px;
+}
+
+.app-header-row-compact .header-nav-btn .mantine-Button-section[data-position="left"] {
+  margin-inline-end: 0;
+}
+
 .brand {
   font-family: var(--font-display);
   font-weight: 600;

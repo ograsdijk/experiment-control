@@ -2,9 +2,12 @@
   Button,
   Group,
   Modal,
+  SegmentedControl,
   Stack,
   Text,
   TextInput,
+  useMantineColorScheme,
+  type MantineColorScheme,
 } from "@mantine/core";
 import {
   IconFileText,
@@ -79,6 +82,7 @@ export function SettingsModal({
   telemetryStreamStatus,
 }: Props) {
   const [confirmDefaultsOpen, setConfirmDefaultsOpen] = useState(false);
+  const { colorScheme, setColorScheme } = useMantineColorScheme();
   const [confirmCustomized, setConfirmCustomized] = useState(false);
 
   const openLoadDefaultsConfirm = () => {
@@ -106,6 +110,21 @@ export function SettingsModal({
       centered
     >
       <Stack gap="sm">
+        <Group justify="space-between" align="center">
+          <Text size="sm" fw={600}>
+            Theme
+          </Text>
+          <SegmentedControl
+            size="xs"
+            value={colorScheme}
+            onChange={(value) => setColorScheme(value as MantineColorScheme)}
+            data={[
+              { label: "Light", value: "light" },
+              { label: "Dark", value: "dark" },
+              { label: "Auto", value: "auto" },
+            ]}
+          />
+        </Group>
         <Group justify="space-between" align="flex-start">
           <Stack gap={2}>
             <Text size="sm" c="dimmed">
