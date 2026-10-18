@@ -140,7 +140,6 @@ export function CommandHistoryModal({
       title="Commands & replies"
       size="clamp(56rem, 92vw, 96rem)"
       centered
-      zIndex={435}
     >
       <Stack gap="sm">
         <Group justify="space-between">

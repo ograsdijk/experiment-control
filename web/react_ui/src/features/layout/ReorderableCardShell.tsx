@@ -21,6 +21,8 @@ type ReorderableCardShellProps = {
   dense?: boolean;
   onPointerDownCapture?: (event: ReactPointerEvent<HTMLDivElement>) => void;
   onPointerUp?: (event: ReactPointerEvent<HTMLDivElement>) => void;
+  /** Turn off reordering (e.g. while the list is filtered or re-sorted). */
+  dragDisabled?: boolean;
 };
 
 export function ReorderableCardShell({
@@ -36,9 +38,10 @@ export function ReorderableCardShell({
   dense = false,
   onPointerDownCapture,
   onPointerUp,
+  dragDisabled = false,
 }: ReorderableCardShellProps) {
   return (
-    <SortableItem id={id} data={data}>
+    <SortableItem id={id} data={data} disabled={dragDisabled}>
       {({ setNodeRef, attributes, listeners, style: sortableStyle }) => (
         <Card
           ref={(node) => {
@@ -57,30 +60,34 @@ export function ReorderableCardShell({
             ...sortableStyle,
           }}
         >
-          <div
-            className="panel-drag-handle panel-drag-handle-top"
-            title={dragHandleTitle}
-            {...attributes}
-            {...listeners}
-          />
-          <div
-            className="panel-drag-handle panel-drag-handle-right"
-            title={dragHandleTitle}
-            {...attributes}
-            {...listeners}
-          />
-          <div
-            className="panel-drag-handle panel-drag-handle-bottom"
-            title={dragHandleTitle}
-            {...attributes}
-            {...listeners}
-          />
-          <div
-            className="panel-drag-handle panel-drag-handle-left"
-            title={dragHandleTitle}
-            {...attributes}
-            {...listeners}
-          />
+          {dragDisabled ? null : (
+            <>
+              <div
+                className="panel-drag-handle panel-drag-handle-top"
+                title={dragHandleTitle}
+                {...attributes}
+                {...listeners}
+              />
+              <div
+                className="panel-drag-handle panel-drag-handle-right"
+                title={dragHandleTitle}
+                {...attributes}
+                {...listeners}
+              />
+              <div
+                className="panel-drag-handle panel-drag-handle-bottom"
+                title={dragHandleTitle}
+                {...attributes}
+                {...listeners}
+              />
+              <div
+                className="panel-drag-handle panel-drag-handle-left"
+                title={dragHandleTitle}
+                {...attributes}
+                {...listeners}
+              />
+            </>
+          )}
           {children}
         </Card>
       )}

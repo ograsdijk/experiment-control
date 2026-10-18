@@ -2,9 +2,12 @@
   Button,
   Group,
   Modal,
+  SegmentedControl,
   Stack,
   Text,
   TextInput,
+  useMantineColorScheme,
+  type MantineColorScheme,
 } from "@mantine/core";
 import {
   IconFileText,
@@ -14,6 +17,7 @@ import {
 } from "@tabler/icons-react";
 import { useState, type ChangeEvent, type RefObject } from "react";
 import type { GatewaySettingsInfo } from "../api";
+import { CHILD_MODAL_Z_INDEX } from "../features/layout/modalLayers";
 
 type Props = {
   opened: boolean;
@@ -78,6 +82,7 @@ export function SettingsModal({
   telemetryStreamStatus,
 }: Props) {
   const [confirmDefaultsOpen, setConfirmDefaultsOpen] = useState(false);
+  const { colorScheme, setColorScheme } = useMantineColorScheme();
   const [confirmCustomized, setConfirmCustomized] = useState(false);
 
   const openLoadDefaultsConfirm = () => {
@@ -103,9 +108,23 @@ export function SettingsModal({
       title="Settings"
       size="clamp(42rem, 82vw, 64rem)"
       centered
-      zIndex={425}
     >
       <Stack gap="sm">
+        <Group justify="space-between" align="center">
+          <Text size="sm" fw={600}>
+            Theme
+          </Text>
+          <SegmentedControl
+            size="xs"
+            value={colorScheme}
+            onChange={(value) => setColorScheme(value as MantineColorScheme)}
+            data={[
+              { label: "Light", value: "light" },
+              { label: "Dark", value: "dark" },
+              { label: "Auto", value: "auto" },
+            ]}
+          />
+        </Group>
         <Group justify="space-between" align="flex-start">
           <Stack gap={2}>
             <Text size="sm" c="dimmed">
@@ -173,7 +192,7 @@ export function SettingsModal({
           onClose={() => setConfirmDefaultsOpen(false)}
           title="Load instance default UI profile?"
           centered
-          zIndex={500}
+          zIndex={CHILD_MODAL_Z_INDEX}
           size="md"
         >
           <Stack gap="sm">

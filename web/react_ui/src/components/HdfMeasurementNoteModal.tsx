@@ -10,6 +10,7 @@ import { IconRefresh } from "@tabler/icons-react";
 import type { ReactNode } from "react";
 import { processStateColor } from "../features/runtime/helpers";
 import type { MeasurementFieldSchema } from "../features/hdf/types";
+import { CHILD_MODAL_Z_INDEX } from "../features/layout/modalLayers";
 
 type Props = {
   opened: boolean;
@@ -65,7 +66,7 @@ export function HdfMeasurementNoteModal({
   onAddNote,
 }: Props) {
   return (
-    <Modal opened={opened} onClose={onClose} title={title} size="clamp(42rem, 82vw, 64rem)" centered zIndex={455}>
+    <Modal opened={opened} onClose={onClose} title={title} size="clamp(42rem, 82vw, 64rem)" centered zIndex={CHILD_MODAL_Z_INDEX}>
       <Stack gap="md">
         <Group justify="space-between" align="flex-start" wrap="wrap">
           <Stack gap={2}>

@@ -99,7 +99,6 @@ export function LogsModal({
       title="Logs"
       size="clamp(56rem, 92vw, 96rem)"
       centered
-      zIndex={430}
     >
       <Stack gap="sm">
         <Group justify="space-between">

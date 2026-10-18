@@ -1,4 +1,5 @@
 import {
+  ActionIcon,
   Badge,
   Button,
   Card,
@@ -7,23 +8,34 @@ import {
   ScrollArea,
   Select,
   Stack,
+  Switch,
   Text,
+  Tooltip,
+  UnstyledButton,
 } from "@mantine/core";
 import { useMediaQuery } from "@mantine/hooks";
-import { IconRefresh } from "@tabler/icons-react";
+import { IconArrowsMaximize, IconMinus, IconPlus } from "@tabler/icons-react";
 import { notifications } from "@mantine/notifications";
 import { useEffect, useId, useMemo, useRef, useState } from "react";
-import type {
-  StateMachineProcessRow,
-  StateMachinesSummary,
-} from "../features/state_machines/useStateMachinesController";
+import type { StateMachineProcessRow } from "../features/state_machines/useStateMachinesController";
 import { processStateColor } from "../features/runtime/helpers";
 import { coerceParamValue, ParamInput } from "./ParamInput";
+import { CHILD_MODAL_Z_INDEX } from "../features/layout/modalLayers";
+import { formatAge, stateName } from "../features/devices/health";
+import { useResourceListView } from "../features/devices/useDeviceListView";
+import {
+  stateMachineAdapter,
+  stateMachineErrorText,
+  stateMachineHealth,
+} from "../features/state_machines/stateMachineHealth";
+import { HealthMark } from "./HealthMark";
+import { RefreshIconButton } from "./RefreshIconButton";
+import { ResourceListToolbar } from "./ResourceListToolbar";
+
 
 type Props = {
   opened: boolean;
   onClose: () => void;
-  summary: StateMachinesSummary;
   rows: StateMachineProcessRow[];
   selectedProcessId: string | null;
   onSelectProcess: (processId: string) => void;
@@ -681,7 +693,6 @@ function GraphCanvas({
 export function StateMachinesModal({
   opened,
   onClose,
-  summary,
   rows,
   selectedProcessId,
   onSelectProcess,
@@ -691,7 +702,10 @@ export function StateMachinesModal({
   onExecuteAction,
   colorScheme,
 }: Props) {
-  const compactLayout = useMediaQuery("(max-width: 72em)");
+  const compactLayout = useMediaQuery("(max-width: 56em)");
+  const view = useResourceListView(rows, stateMachineAdapter, {
+    persistKey: "ecui.stateMachinesModal",
+  });
   const selectedRow =
     rows.find((row) => row.process.process_id === selectedProcessId) ?? rows[0] ?? null;
   const [selectedActionName, setSelectedActionName] = useState<string>("");
@@ -732,7 +746,11 @@ export function StateMachinesModal({
       return;
     }
     const existing = actions.some((member) => member.name === selectedActionName);
-    const nextAction = existing ? selectedActionName : String(actions[0].name ?? "");
+    // No default action: Execute runs immediately, so the operator picks it,
+    // and a pick never carries over to a different state machine.
+    const switchedProcess =
+      actionSelectionRef.current.processId !== selectedRow.process.process_id;
+    const nextAction = existing && !switchedProcess ? selectedActionName : "";
     if (nextAction !== selectedActionName) {
       setSelectedActionName(nextAction);
     }
@@ -779,136 +797,196 @@ export function StateMachinesModal({
   }, [selectedRow?.process.process_id]);
 
   return (
-    <Modal opened={opened} onClose={onClose} title="State Machines" size="clamp(56rem, 92vw, 96rem)" centered>
+    <Modal
+      opened={opened}
+      onClose={onClose}
+      title="State Machines"
+      size="clamp(56rem, 92vw, 96rem)"
+      centered
+    >
       <Stack gap="sm">
-        <Group justify="space-between">
-          <Group gap="xs">
-            <Badge variant="light" color="gray">{summary.total} total</Badge>
-            <Badge variant="light" color="teal">{summary.active} active</Badge>
-            <Badge variant="light" color="red">{summary.error} error</Badge>
-            <Badge variant="light" color="yellow">{summary.stale} stale</Badge>
-          </Group>
-          <Button size="xs" variant="light" leftSection={<IconRefresh size={14} />} onClick={() => { void onRefresh(); }}>
-            Refresh
-          </Button>
+        <Group gap="sm" align="flex-start" wrap="nowrap">
+          <div style={{ flex: 1, maxWidth: 640 }}>
+            <ResourceListToolbar
+              view={view}
+              noun="state machines"
+              healthyLabel="ok"
+              customSortLabel="Default order"
+            />
+          </div>
+          <RefreshIconButton
+            label="Refresh state machines"
+            onClick={() => {
+              void onRefresh();
+            }}
+          />
         </Group>
-
         <div
           style={{
             display: "grid",
-            gridTemplateColumns: compactLayout ? "1fr" : "minmax(16rem, 19rem) minmax(0, 1fr)",
-            gap: "var(--mantine-spacing-sm)",
-            alignItems: "stretch",
+            gridTemplateColumns: compactLayout ? "1fr" : "minmax(14rem, 17rem) minmax(0, 1fr)",
+            gap: "var(--mantine-spacing-md)",
+            alignItems: "start",
           }}
         >
-          <Card p="xs" radius="sm" style={{ border: "1px solid var(--card-border)", minWidth: 0 }}>
-            <ScrollArea h={compactLayout ? 220 : 640}>
-              <Stack gap="xs">
-                {rows.length === 0 ? (
-                  <Text size="sm" c="dimmed">No state-machine processes detected.</Text>
-                ) : rows.map((row) => {
-                  const active = selectedRow?.process.process_id === row.process.process_id;
+          <ScrollArea.Autosize mah={compactLayout ? 220 : "min(70vh, 48rem)"} type="auto">
+            {view.visible.length === 0 ? (
+              <Text size="sm" c="dimmed" py="md">
+                {rows.length === 0
+                  ? "No state-machine processes detected."
+                  : "No state machines match the current filter."}
+              </Text>
+            ) : (
+              <Stack gap={4}>
+                {view.visible.map((row) => {
+                  const processId = row.process.process_id;
+                  const selected = selectedRow?.process.process_id === processId;
+                  const procState = stateName(row.process.state);
+                  const error = stateMachineErrorText(row);
                   return (
-                    <Card
-                      key={row.process.process_id}
-                      p="xs"
-                      radius="sm"
-                      withBorder
-                      style={{ cursor: "pointer", borderColor: active ? "var(--mantine-color-teal-5)" : undefined }}
-                      onClick={() => onSelectProcess(row.process.process_id)}
+                    <UnstyledButton
+                      key={processId}
+                      className={`resource-list-item${
+                        selected ? " resource-list-item-selected" : ""
+                      }`}
+                      onClick={() => onSelectProcess(processId)}
+                      aria-pressed={selected}
                     >
-                      <Stack gap={4}>
-                        <Group justify="space-between" gap="xs" wrap="nowrap">
-                          <Text fw={600} size="sm" truncate>{row.process.process_id}</Text>
-                          <Badge size="xs" variant="light" color={processStateColor(row.process.state)}>{row.process.state}</Badge>
+                      <Group justify="space-between" gap="xs" wrap="nowrap">
+                        <Group gap={6} wrap="nowrap" style={{ minWidth: 0 }}>
+                          <HealthMark health={stateMachineHealth(row)} />
+                          <Text size="sm" fw={600} truncate>
+                            {processId}
+                          </Text>
                         </Group>
-                        <Group gap="xs" wrap="wrap">
-                          <Badge size="xs" variant="light" color={stateMachineStateColor(row.status?.state)}>{row.status?.state ?? "n/a"}</Badge>
-                          <Badge size="xs" variant="outline" color={row.stale ? "yellow" : "gray"}>{row.stale ? "stale" : "fresh"}</Badge>
-                        </Group>
-                        <Text size="xs" c="dimmed">hb age {formatDurationSeconds(row.process.hb_age_s)}</Text>
-                      </Stack>
-                    </Card>
+                        <Badge
+                          size="xs"
+                          variant="light"
+                          color={stateMachineStateColor(row.status?.state)}
+                        >
+                          {row.status?.state ?? "n/a"}
+                        </Badge>
+                      </Group>
+                      <Text size="xs" c="dimmed" mt={2}>
+                        {procState && procState !== "RUNNING" ? `${procState} · ` : ""}
+                        {row.stale ? "status stale · " : ""}hb {formatAge(row.process.hb_age_s)}
+                      </Text>
+                      {error ? (
+                        <Text size="xs" c="red" mt={2} lineClamp={1} title={error}>
+                          {error}
+                        </Text>
+                      ) : null}
+                    </UnstyledButton>
                   );
                 })}
               </Stack>
-            </ScrollArea>
-          </Card>
-
-          <Card p="xs" radius="sm" style={{ border: "1px solid var(--card-border)", minWidth: 0 }}>
+            )}
+          </ScrollArea.Autosize>
+          <Card withBorder radius="lg" p="md" style={{ minWidth: 0 }}>
             {!selectedRow ? (
               <Text size="sm" c="dimmed">Select a state-machine process.</Text>
             ) : (
               <Stack gap="sm">
-                <Group justify="space-between" align="center">
-                  <Text fw={600}>{selectedRow.process.process_id}</Text>
-                  <Group gap="xs">
-                    <Button size="xs" variant="light" leftSection={<IconRefresh size={14} />} loading={selectedRow.statusLoading} onClick={() => { void onRefreshProcess(selectedRow.process.process_id); }}>
-                      Status
-                    </Button>
-                    <Button size="xs" variant="light" leftSection={<IconRefresh size={14} />} loading={selectedRow.graphLoading} onClick={() => { void onRefreshGraph(selectedRow.process.process_id); }}>
-                      Graph
-                    </Button>
-                    <Button
-                      size="xs"
-                      variant="light"
-                      disabled={!graph || !selectedRow.graph}
-                      onClick={() => setGraphExpanded(true)}
-                    >
-                      Expand graph
-                    </Button>
+                <Group justify="space-between" align="center" wrap="nowrap">
+                  <Group gap="xs" wrap="wrap" style={{ minWidth: 0 }}>
+                    <Text fw={600} truncate>
+                      {selectedRow.process.process_id}
+                    </Text>
+                    <Badge variant="light" color={stateMachineStateColor(selectedRow.status?.state)}>
+                      {selectedRow.status?.state ?? "n/a"}
+                    </Badge>
+                    {stateName(selectedRow.process.state) !== "RUNNING" ? (
+                      <Badge
+                        variant="outline"
+                        color={processStateColor(selectedRow.process.state)}
+                      >
+                        {selectedRow.process.state}
+                      </Badge>
+                    ) : null}
+                    <Text size="xs" c={selectedRow.stale ? "orange" : "dimmed"}>
+                      status {formatAge(selectedRow.statusAgeS)} old
+                    </Text>
+                  </Group>
+                  <Group gap={6} wrap="nowrap">
+                    <RefreshIconButton
+                      size="sm"
+                      label="Refresh status and graph"
+                      loading={selectedRow.statusLoading || selectedRow.graphLoading}
+                      onClick={() => {
+                        void onRefreshProcess(selectedRow.process.process_id);
+                        void onRefreshGraph(selectedRow.process.process_id);
+                      }}
+                    />
+                    <Tooltip label="Expand graph" withArrow>
+                      <ActionIcon
+                        size={26}
+                        variant="light"
+                        color="gray"
+                        aria-label="Expand graph"
+                        disabled={!graph || !selectedRow.graph}
+                        onClick={() => setGraphExpanded(true)}
+                      >
+                        <IconArrowsMaximize size={14} />
+                      </ActionIcon>
+                    </Tooltip>
                   </Group>
                 </Group>
-                <Group gap="xs" wrap="wrap">
-                  <Badge variant="light" color={stateMachineStateColor(selectedRow.status?.state)}>{selectedRow.status?.state ?? "n/a"}</Badge>
-                  <Badge variant="outline" color={selectedRow.stale ? "yellow" : "gray"}>status age {formatDurationSeconds(selectedRow.statusAgeS)}</Badge>
-                  {selectedRow.status?.last_error ? <Badge variant="light" color="red">{selectedRow.status.last_error}</Badge> : null}
+                {stateMachineErrorText(selectedRow) ? (
+                  <Text size="xs" c="red" style={{ wordBreak: "break-word" }}>
+                    {stateMachineErrorText(selectedRow)}
+                  </Text>
+                ) : null}
+                <Group justify="space-between" gap="xs" wrap="wrap">
+                  <Group gap="md" wrap="wrap">
+                    <Switch
+                      size="xs"
+                      label="Focus current state"
+                      checked={focusCurrentState}
+                      disabled={!activeState}
+                      onChange={(event) => setFocusCurrentState(event.currentTarget.checked)}
+                    />
+                    <Switch
+                      size="xs"
+                      label="Highlight selected action"
+                      checked={highlightSelectedActionPath}
+                      disabled={!selectedActionName}
+                      onChange={(event) =>
+                        setHighlightSelectedActionPath(event.currentTarget.checked)
+                      }
+                    />
+                  </Group>
+                  <Group gap={4} wrap="nowrap">
+                    <ActionIcon
+                      size={26}
+                      variant="light"
+                      color="gray"
+                      aria-label="Zoom out"
+                      onClick={() => setGraphZoom((prev) => clampGraphZoom(prev - GRAPH_ZOOM_STEP))}
+                    >
+                      <IconMinus size={14} />
+                    </ActionIcon>
+                    <Tooltip label="Reset zoom" withArrow>
+                      <UnstyledButton
+                        onClick={() => setGraphZoom(1)}
+                        aria-label="Reset zoom"
+                        style={{ width: 44, textAlign: "center" }}
+                      >
+                        <Text size="xs" c="dimmed">
+                          {Math.round(graphZoom * 100)}%
+                        </Text>
+                      </UnstyledButton>
+                    </Tooltip>
+                    <ActionIcon
+                      size={26}
+                      variant="light"
+                      color="gray"
+                      aria-label="Zoom in"
+                      onClick={() => setGraphZoom((prev) => clampGraphZoom(prev + GRAPH_ZOOM_STEP))}
+                    >
+                      <IconPlus size={14} />
+                    </ActionIcon>
+                  </Group>
                 </Group>
-                <Group gap="xs" wrap="wrap">
-                  <Button
-                    size="xs"
-                    variant="light"
-                    onClick={() => setGraphZoom((prev) => clampGraphZoom(prev - GRAPH_ZOOM_STEP))}
-                  >
-                    -
-                  </Button>
-                  <Button
-                    size="xs"
-                    variant="light"
-                    onClick={() => setGraphZoom(1)}
-                  >
-                    Reset
-                  </Button>
-                  <Button
-                    size="xs"
-                    variant="light"
-                    onClick={() => setGraphZoom((prev) => clampGraphZoom(prev + GRAPH_ZOOM_STEP))}
-                  >
-                    +
-                  </Button>
-                  <Text size="xs" c="dimmed">{Math.round(graphZoom * 100)}%</Text>
-                </Group>
-                <Group gap="xs" wrap="wrap">
-                  <Button
-                    size="xs"
-                    variant={focusCurrentState ? "filled" : "light"}
-                    color={focusCurrentState ? "teal" : "gray"}
-                    disabled={!activeState}
-                    onClick={() => setFocusCurrentState((prev) => !prev)}
-                  >
-                    Focus current state
-                  </Button>
-                  <Button
-                    size="xs"
-                    variant={highlightSelectedActionPath ? "filled" : "light"}
-                    color={highlightSelectedActionPath ? "blue" : "gray"}
-                    disabled={!selectedActionName}
-                    onClick={() => setHighlightSelectedActionPath((prev) => !prev)}
-                  >
-                    Highlight selected action
-                  </Button>
-                </Group>
-
                 {selectedRow.graphError ? <Text size="xs" c="red">{selectedRow.graphError}</Text> : null}
                 {!selectedRow.graph || !graph ? (
                   <Text size="sm" c="dimmed">No graph metadata reported by this process.</Text>
@@ -934,7 +1012,9 @@ export function StateMachinesModal({
                         data={selectedRow.binding.actionMembers.map((m) => ({ value: m.name, label: m.name }))}
                         value={selectedActionName || null}
                         onChange={(value) => setSelectedActionName(String(value ?? ""))}
-                        allowDeselect={false}
+                        placeholder="Choose an action…"
+                        aria-label="State machine action"
+                        clearable
                         searchable
                       />
                       {(selectedAction?.params ?? []).map((param) => (
@@ -950,6 +1030,7 @@ export function StateMachinesModal({
                       <Group justify="flex-end">
                         <Button
                           size="xs"
+                          disabled={!selectedActionName}
                           onClick={async () => {
                             if (!selectedRow || !selectedActionName) {
                               return;
@@ -995,6 +1076,7 @@ export function StateMachinesModal({
         title={`State Graph ${selectedRow?.process.process_id ?? ""}`}
         size="clamp(64rem, 96vw, 120rem)"
         centered
+        zIndex={CHILD_MODAL_Z_INDEX}
       >
         {!selectedRow?.graph || !graph ? (
           <Text size="sm" c="dimmed">No graph metadata reported by this process.</Text>

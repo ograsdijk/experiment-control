@@ -180,7 +180,7 @@ function hasActiveOperation(status: StateMachineStatus | null): boolean {
   );
 }
 
-function statusHasError(
+export function statusHasError(
   process: ProcessStatus,
   status: StateMachineStatus | null,
   statusError: string | null

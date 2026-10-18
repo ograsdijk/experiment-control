@@ -16,13 +16,15 @@ type SortableItemProps = {
   id: string;
   data: Record<string, unknown>;
   children: (args: SortableItemRenderArgs) => ReactNode;
+  disabled?: boolean;
 };
 
-export function SortableItem({ id, data, children }: SortableItemProps) {
+export function SortableItem({ id, data, children, disabled = false }: SortableItemProps) {
   const { attributes, listeners, setNodeRef, transform, transition, isDragging, isOver } =
     useSortable({
       id,
       data,
+      disabled,
     });
   const style: CSSProperties = {
     transform: CSS.Transform.toString(transform),

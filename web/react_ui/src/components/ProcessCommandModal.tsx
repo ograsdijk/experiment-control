@@ -11,6 +11,7 @@ import {
 import { IconPlaylistAdd } from "@tabler/icons-react";
 import { ParamInput } from "./ParamInput";
 import type { CapabilityMember } from "../types";
+import { CHILD_MODAL_Z_INDEX } from "../features/layout/modalLayers";
 
 type CapabilityParam = NonNullable<CapabilityMember["params"]>[number];
 
@@ -58,7 +59,7 @@ export function ProcessCommandModal({
       title={title}
       size="clamp(42rem, 82vw, 64rem)"
       centered
-      zIndex={450}
+      zIndex={CHILD_MODAL_Z_INDEX}
     >
       <Stack gap="md">
         <Group align="flex-end" justify="space-between">

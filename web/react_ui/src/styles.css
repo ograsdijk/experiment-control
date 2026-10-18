@@ -94,6 +94,116 @@ body::before {
   background: rgba(23, 29, 37, 0.82);
 }
 
+/* One row, never wraps: the header has a fixed height and AppShell offsets
+   the page by exactly that, so wrapping would overlap the content below.
+   Space pressure is absorbed by the run chips (ellipsis) and, when even
+   that is not enough, by icon-only nav buttons (useHeaderCompact). */
+.app-header-row {
+  display: flex;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: 12px;
+  height: 100%;
+  padding: 0 var(--mantine-spacing-lg);
+  min-width: 0;
+}
+
+.app-header-identity {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 2 auto;
+  min-width: 120px;
+}
+
+.app-header-identity .instance-title-trigger {
+  min-width: 0;
+}
+
+.app-header-live-dot {
+  display: inline-block;
+  flex: 0 0 auto;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+}
+
+.app-header-run {
+  display: flex;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: 8px;
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+}
+
+/* Shrink order under pressure: the HDF filename gives way first, then the
+   instance name; the sequencer keeps enough to read its state. */
+.app-header-run-chip,
+.app-header-run-group {
+  flex: 0 1 auto;
+  min-width: 0;
+}
+
+.app-header-run-chip-hdf {
+  flex-shrink: 6;
+  min-width: 64px;
+}
+
+.app-header-run-group {
+  min-width: 170px;
+}
+
+.app-header-run-chip-fixed {
+  flex: 0 0 auto;
+}
+
+.app-header-run-chip .mantine-Button-inner,
+.app-header-run-chip .mantine-Button-label {
+  min-width: 0;
+  overflow: hidden;
+}
+
+/* Block (not flex) so the ellipsis works; auto height lets the button's
+   inner flexbox keep the text vertically centred. */
+.app-header-run-chip .mantine-Button-label {
+  display: block;
+  height: auto;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.app-header-nav {
+  display: flex;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+}
+
+.header-nav-compact {
+  display: none;
+}
+
+/* Toggled by useHeaderCompact when the labelled row would not fit. */
+.app-header-row-compact .header-nav-label {
+  display: none;
+}
+
+.app-header-row-compact .header-nav-compact {
+  display: inline;
+  margin-left: 4px;
+}
+
+.app-header-row-compact .header-nav-btn {
+  padding-inline: 8px;
+}
+
+.app-header-row-compact .header-nav-btn .mantine-Button-section[data-position="left"] {
+  margin-inline-end: 0;
+}
+
 .brand {
   font-family: var(--font-display);
   font-weight: 600;
@@ -118,6 +228,219 @@ body::before {
   box-shadow: var(--shadow);
   position: relative;
   overflow: hidden;
+}
+
+/* Health accent on sidebar cards: a coloured left edge, nothing for OK/neutral. */
+.device-card.device-card-health-failed {
+  box-shadow: inset 4px 0 0 var(--mantine-color-red-6), var(--shadow);
+}
+
+.device-card.device-card-health-stale,
+.device-card.device-card-health-degraded {
+  box-shadow: inset 4px 0 0 var(--mantine-color-orange-5), var(--shadow);
+}
+
+.resource-issues-toggle {
+  border-radius: 6px;
+  padding: 1px 6px;
+  margin: -1px -6px;
+}
+
+.resource-issues-toggle:hover {
+  background: var(--mantine-color-default-hover);
+}
+
+.resource-issues-toggle-active {
+  background: var(--mantine-color-orange-light);
+}
+
+.resource-health-mark {
+  display: inline-block;
+  width: 1em;
+  text-align: center;
+  font-weight: 700;
+}
+
+.resource-health-mark-healthy {
+  color: var(--mantine-color-teal-6);
+}
+
+.resource-health-mark-failed {
+  color: var(--mantine-color-red-6);
+}
+
+.resource-health-mark-stale,
+.resource-health-mark-degraded,
+.resource-health-mark-transition {
+  color: var(--mantine-color-orange-6);
+}
+
+.resource-health-mark-neutral,
+.resource-health-mark-unknown {
+  color: var(--mantine-color-dimmed);
+}
+
+.resource-overview-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: 10px;
+  align-items: stretch;
+}
+
+.resource-overview-tile {
+  display: block;
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: var(--card);
+  border: 1px solid var(--card-border);
+  border-left-width: 4px;
+  min-width: 0;
+  transition: border-color 120ms ease, box-shadow 120ms ease;
+}
+
+.resource-overview-tile:hover {
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.12);
+}
+
+.resource-overview-tile-healthy {
+  border-left-color: var(--mantine-color-teal-6);
+}
+
+.resource-overview-tile-failed {
+  border-left-color: var(--mantine-color-red-6);
+  background: color-mix(in srgb, var(--mantine-color-red-6) 7%, var(--card));
+}
+
+.resource-overview-tile-stale,
+.resource-overview-tile-degraded,
+.resource-overview-tile-transition {
+  border-left-color: var(--mantine-color-orange-5);
+}
+
+.resource-overview-tile-issue.resource-overview-tile-stale,
+.resource-overview-tile-issue.resource-overview-tile-degraded,
+.resource-overview-tile-issue.resource-overview-tile-neutral {
+  background: color-mix(in srgb, var(--mantine-color-orange-5) 7%, var(--card));
+}
+
+.resource-overview-tile-issue.resource-overview-tile-neutral {
+  border-left-color: var(--mantine-color-orange-5);
+}
+
+.resource-overview-tile-selected {
+  border-color: var(--mantine-color-indigo-5);
+  box-shadow: 0 0 0 2px var(--mantine-color-indigo-5);
+}
+
+.resource-overview-row {
+  cursor: pointer;
+}
+
+/* Safety tab: one line per process / ruleset above the rule table. */
+.safety-process-strip {
+  padding: 6px 10px;
+  border-radius: 10px;
+  border: 1px solid var(--card-border);
+  background: var(--card);
+}
+
+.safety-ruleset-line {
+  padding: 2px 10px 2px 28px;
+}
+
+.safety-rule-link {
+  padding: 1px 6px;
+  border-radius: 6px;
+  border: 1px solid var(--card-border);
+}
+
+.safety-rule-link:hover {
+  background: var(--mantine-color-default-hover);
+}
+
+/* Watchdog rule card: plain-language status, tinted by severity of state. */
+.watchdog-status-box {
+  padding: 8px 10px;
+  border-radius: 8px;
+  border-left: 3px solid var(--mantine-color-gray-5);
+  background: var(--mantine-color-default-hover);
+}
+
+.watchdog-status-red {
+  border-left-color: var(--mantine-color-red-6);
+  background: var(--mantine-color-red-light);
+}
+
+.watchdog-status-orange {
+  border-left-color: var(--mantine-color-orange-6);
+  background: var(--mantine-color-orange-light);
+}
+
+.watchdog-status-yellow {
+  border-left-color: var(--mantine-color-yellow-6);
+  background: var(--mantine-color-yellow-light);
+}
+
+.watchdog-status-teal {
+  border-left-color: var(--mantine-color-teal-6);
+  background: var(--mantine-color-teal-light);
+}
+
+.watchdog-inputs-table td {
+  white-space: nowrap;
+}
+
+/* Selectable list rows (State Machines list): same highlight as table rows. */
+.resource-list-item {
+  display: block;
+  width: 100%;
+  padding: 8px 10px;
+  border-radius: 10px;
+  border: 1px solid var(--card-border);
+  background: var(--card);
+}
+
+.resource-list-item:hover {
+  background: var(--mantine-color-default-hover);
+}
+
+.resource-list-item-selected,
+.resource-list-item-selected:hover {
+  background: var(--mantine-color-indigo-light);
+  border-color: var(--mantine-color-indigo-5);
+}
+
+.resource-overview-table th,
+.resource-overview-table td {
+  white-space: nowrap;
+}
+
+/* Status badges in table cells keep their full label instead of shrinking. */
+.resource-overview-table td .mantine-Badge-root {
+  flex-shrink: 0;
+  max-width: none;
+}
+
+.resource-overview-table td.resource-overview-error-cell {
+  max-width: 360px;
+}
+
+.resource-overview-row-selected {
+  background: var(--mantine-color-indigo-light);
+}
+
+.resource-overview-th {
+  font-weight: 600;
+  font-size: inherit;
+  white-space: nowrap;
+}
+
+.resource-overview-detail {
+  width: min(420px, 40vw);
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
 }
 
 .device-grid {

@@ -7,25 +7,29 @@ import {
   Group,
   Menu,
   Popover,
-  SegmentedControl,
   Stack,
   Text,
+  Tooltip,
   UnstyledButton,
 } from "@mantine/core";
 import {
   IconChevronDown,
   IconCpu,
   IconDatabase,
+  IconDots,
   IconFileText,
   IconExternalLink,
+  IconLayoutGrid,
   IconPencil,
   IconRefresh,
   IconSettings,
   IconShieldCheck,
+  IconSitemap,
   IconTerminal2,
 } from "@tabler/icons-react";
 import type { ExtraUiInfo } from "../api";
 import { useMemo, useState, type CSSProperties, type ReactNode } from "react";
+import { useHeaderCompact } from "../features/layout/useHeaderCompact";
 import { useAdaptivePolling } from "../features/polling/useAdaptivePolling";
 
 type InstanceRuntimeStatus = {
@@ -168,6 +172,9 @@ type Props = {
   onRunSequencerPrimaryAction: () => Promise<unknown> | void;
   sequencerLoaded: boolean;
   onOpenProcesses: () => Promise<unknown> | void;
+  onOpenDeviceOverview: () => void;
+  deviceIssueCount: number;
+  deviceFailedCount: number;
   stateMachineButtonSummary: {
     color: string;
     tooltip: string;
@@ -191,8 +198,6 @@ type Props = {
   extraUis: ExtraUiInfo[];
   onOpenSettings: () => void;
   onRefreshStatus: () => Promise<unknown> | void;
-  colorScheme: "light" | "dark" | "auto";
-  onColorSchemeChange: (value: "light" | "dark" | "auto") => void;
   telemetryBadgeColor: string;
   telemetryBadgeLabel: string;
   instanceRuntimeStatus: InstanceRuntimeStatus | null;
@@ -203,6 +208,49 @@ type Props = {
   onRunInstanceCleanupDryRun: () => Promise<Record<string, unknown> | null> | null;
   onRunInstanceCleanupApply: () => Promise<Record<string, unknown> | null> | null;
 };
+
+function trailingCount(label: string): string | null {
+  const match = /\((\d+)\)\s*$/.exec(label);
+  return match ? match[1] : null;
+}
+
+/**
+ * Header navigation button. Below the compact breakpoint (see styles.css
+ * `.header-nav-label`) the text label hides and only the icon plus the
+ * optional count remain; the tooltip always carries the full label.
+ */
+function HeaderNavButton({
+  icon,
+  label,
+  compactLabel = null,
+  color,
+  tooltip,
+  onClick,
+}: {
+  icon: ReactNode;
+  label: string;
+  compactLabel?: string | null;
+  color: string;
+  tooltip?: string;
+  onClick: () => void;
+}) {
+  return (
+    <Tooltip label={tooltip ?? label} withArrow openDelay={250}>
+      <Button
+        className="header-nav-btn"
+        size="xs"
+        variant="light"
+        color={color}
+        leftSection={icon}
+        onClick={onClick}
+        aria-label={label}
+      >
+        <span className="header-nav-label">{label}</span>
+        {compactLabel ? <span className="header-nav-compact">{compactLabel}</span> : null}
+      </Button>
+    </Tooltip>
+  );
+}
 
 export function DashboardHeaderBar({
   instanceLabel,
@@ -243,6 +291,9 @@ export function DashboardHeaderBar({
   onRunSequencerPrimaryAction,
   sequencerLoaded,
   onOpenProcesses,
+  onOpenDeviceOverview,
+  deviceIssueCount,
+  deviceFailedCount,
   stateMachineButtonSummary,
   onOpenStateMachines,
   interlockButtonSummary,
@@ -258,8 +309,6 @@ export function DashboardHeaderBar({
   extraUis,
   onOpenSettings,
   onRefreshStatus,
-  colorScheme,
-  onColorSchemeChange,
   telemetryBadgeColor,
   telemetryBadgeLabel,
   instanceRuntimeStatus,
@@ -422,174 +471,212 @@ export function DashboardHeaderBar({
     setCleanupPreview(null);
   };
 
+  const liveTone = telemetryBadgeColor === "red" ? "red" : telemetryBadgeColor;
+  const stateMachineCount = trailingCount(stateMachineButtonSummary.label);
+  const interlockCount = trailingCount(interlockButtonSummary.label);
+  const header = useHeaderCompact(
+    [
+      instanceLabel,
+      showHdfWriter && hdfWriterFileLabel,
+      showInfluxWriter && influxWriterLabel,
+      showHdfNoteChiplet && hdfMeasurementNotesRows,
+      showSequencer && `${sequencerRuntimeState}${sequencerChipSuffix}${sequencerPrimaryLabel}`,
+      deviceIssueCount,
+      stateMachineButtonSummary.label,
+      interlockButtonSummary.label,
+      showDaqUi && daqWorkspaceCount,
+      telemetryBadgeLabel,
+    ].join("|")
+  );
+
   return (
     <AppShell.Header className="app-header">
-      <Group h="100%" px="lg" justify="space-between">
-        <Group gap="sm">
-          <Popover
-            opened={instancePopoverOpen}
-            onChange={(open) => {
-              setInstancePopoverOpen(open);
-              if (open) {
-                void onRefreshInstanceRuntimeStatus();
-              }
-            }}
-            width={360}
-            withArrow
-            shadow="md"
-            position="bottom-start"
-          >
-            <Popover.Target>
-              <UnstyledButton
-                type="button"
-                className="instance-title-trigger"
-                onClick={() => {
-                  setInstancePopoverOpen((open) => !open);
-                }}
-                aria-expanded={instancePopoverOpen}
-                title="Show instance runtime details"
-              >
-                <Group gap={6} wrap="nowrap">
-                  <Text className="brand" size="lg">
-                    {instanceLabel}
-                  </Text>
-                  <IconChevronDown size={14} />
-                </Group>
-              </UnstyledButton>
-            </Popover.Target>
-            <Popover.Dropdown>
-              <Stack gap={6}>
-                <Group justify="space-between" align="center">
-                  <Text size="sm" fw={600}>
-                    Instance runtime
-                  </Text>
-                  <ActionIcon
-                    size="sm"
-                    variant="subtle"
-                    onClick={() => {
-                      void onRefreshInstanceRuntimeStatus();
-                    }}
-                    aria-label="Refresh instance runtime details"
-                  >
-                    <IconRefresh size={14} />
-                  </ActionIcon>
-                </Group>
-                {instanceRuntimeLoading ? (
-                  <Text size="xs" c="dimmed">
-                    Loading runtime status...
-                  </Text>
-                ) : null}
-                {instanceRuntimeError ? (
-                  <Text size="xs" c="red">
-                    {instanceRuntimeError}
-                  </Text>
-                ) : null}
-                <Divider />
-                <Group gap={6} align="center">
-                  <Text size="xs" c="dimmed">
-                    Lock
-                  </Text>
-                  <Badge size="xs" variant="light" color={lockStatus.color}>
-                    {lockStatus.status}
-                  </Badge>
-                </Group>
-                <Text size="xs" c="dimmed">
-                  {lockStatus.help}
+      <div
+        ref={header.rowRef}
+        className={`app-header-row${header.compact ? " app-header-row-compact" : ""}`}
+      >
+        <div ref={header.identityRef} className="app-header-identity">
+        <Popover
+          opened={instancePopoverOpen}
+          onChange={(open) => {
+            setInstancePopoverOpen(open);
+            if (open) {
+              void onRefreshInstanceRuntimeStatus();
+            }
+          }}
+          width={360}
+          withArrow
+          shadow="md"
+          position="bottom-start"
+        >
+          <Popover.Target>
+            <UnstyledButton
+              type="button"
+              className="instance-title-trigger"
+              onClick={() => {
+                setInstancePopoverOpen((open) => !open);
+              }}
+              aria-expanded={instancePopoverOpen}
+              title="Show instance runtime details"
+            >
+              <Group gap={6} wrap="nowrap">
+                <Text className="brand" size="lg" truncate>
+                  {instanceLabel}
                 </Text>
-                {typeof instanceRuntimeStatus?.manager_pid === "number" &&
-                Number.isFinite(instanceRuntimeStatus.manager_pid) ? (
-                  <Text size="xs">
-                    Manager PID: {Math.trunc(instanceRuntimeStatus.manager_pid)}
-                  </Text>
-                ) : null}
-                <Text size="xs">Owner PID: {lockStatus.ownerPid ?? "n/a"}</Text>
+                <IconChevronDown size={14} />
+              </Group>
+            </UnstyledButton>
+          </Popover.Target>
+          <Popover.Dropdown>
+            <Stack gap={6}>
+              <Group justify="space-between" align="center">
+                <Text size="sm" fw={600}>
+                  Instance runtime
+                </Text>
+                <ActionIcon
+                  size="sm"
+                  variant="subtle"
+                  onClick={() => {
+                    void onRefreshInstanceRuntimeStatus();
+                  }}
+                  aria-label="Refresh instance runtime details"
+                >
+                  <IconRefresh size={14} />
+                </ActionIcon>
+              </Group>
+              {instanceRuntimeLoading ? (
+                <Text size="xs" c="dimmed">
+                  Loading runtime status...
+                </Text>
+              ) : null}
+              {instanceRuntimeError ? (
+                <Text size="xs" c="red">
+                  {instanceRuntimeError}
+                </Text>
+              ) : null}
+              <Divider />
+              <Group gap={6} align="center">
+                <Text size="xs" c="dimmed">
+                  Lock
+                </Text>
+                <Badge size="xs" variant="light" color={lockStatus.color}>
+                  {lockStatus.status}
+                </Badge>
+              </Group>
+              <Text size="xs" c="dimmed">
+                {lockStatus.help}
+              </Text>
+              {typeof instanceRuntimeStatus?.manager_pid === "number" &&
+              Number.isFinite(instanceRuntimeStatus.manager_pid) ? (
                 <Text size="xs">
-                  {lockStatus.status === "active" ? "Acquired" : "Last acquired"}:{" "}
-                  {lockAcquiredLabel}
+                  Manager PID: {Math.trunc(instanceRuntimeStatus.manager_pid)}
                 </Text>
-                {lockStatus.managerRpc ? (
-                  <Text size="xs">Manager RPC: {lockStatus.managerRpc}</Text>
-                ) : null}
-                <Divider />
-                <Group justify="space-between" align="center">
-                  <Text size="xs" c="dimmed">
-                    Orphan cleanup
-                  </Text>
-                  <Group gap={6}>
-                    <Button
-                      size="compact-xs"
-                      variant="light"
-                      color="blue"
-                      loading={instanceCleanupBusy}
-                      onClick={() => {
-                        void runCleanupDryRun();
-                      }}
-                    >
-                      Dry-run
-                    </Button>
-                    <Button
-                      size="compact-xs"
-                      variant="light"
-                      color="orange"
-                      loading={instanceCleanupBusy}
-                      onClick={() => {
-                        void runCleanupApply();
-                      }}
-                    >
-                      Execute
-                    </Button>
-                  </Group>
-                </Group>
-                {cleanupPreviewLabel ? (
-                  <>
-                    <Text size="xs">{cleanupPreviewLabel.summary}</Text>
-                    <Text size="xs" c="dimmed">
-                      candidates: {cleanupPreviewLabel.candidates}
-                    </Text>
-                  </>
-                ) : (
-                  <Text size="xs" c="dimmed">
-                    Run dry-run before execute to review candidate PIDs.
-                  </Text>
-                )}
-                <Divider />
+              ) : null}
+              <Text size="xs">Owner PID: {lockStatus.ownerPid ?? "n/a"}</Text>
+              <Text size="xs">
+                {lockStatus.status === "active" ? "Acquired" : "Last acquired"}:{" "}
+                {lockAcquiredLabel}
+              </Text>
+              {lockStatus.managerRpc ? (
+                <Text size="xs">Manager RPC: {lockStatus.managerRpc}</Text>
+              ) : null}
+              <Divider />
+              <Group justify="space-between" align="center">
                 <Text size="xs" c="dimmed">
-                  Last orphan cleanup
+                  Orphan cleanup
                 </Text>
-                {lastCleanup ? (
-                  <>
-                    <Text size="xs">
-                      matched={lastCleanup.matched} terminated={lastCleanup.terminated}{" "}
-                      failed={lastCleanup.failed}
-                      {lastCleanup.dryRun ? " (dry-run)" : ""}
-                    </Text>
-                    {lastCleanup.candidates.length > 0 ? (
-                      <Text size="xs" c="dimmed">
-                        candidates: {lastCleanup.candidates.slice(0, 8).join(", ")}
-                        {lastCleanup.candidates.length > 8 ? ", ..." : ""}
-                      </Text>
-                    ) : null}
-                    {lastCleanup.source ? (
-                      <Text size="xs" c="dimmed">
-                        source: {lastCleanup.source}
-                      </Text>
-                    ) : null}
-                    {cleanupAtLabel ? (
-                      <Text size="xs" c="dimmed">
-                        at: {cleanupAtLabel}
-                      </Text>
-                    ) : null}
-                  </>
-                ) : (
+                <Group gap={6}>
+                  <Button
+                    size="compact-xs"
+                    variant="light"
+                    color="blue"
+                    loading={instanceCleanupBusy}
+                    onClick={() => {
+                      void runCleanupDryRun();
+                    }}
+                  >
+                    Dry-run
+                  </Button>
+                  <Button
+                    size="compact-xs"
+                    variant="light"
+                    color="orange"
+                    loading={instanceCleanupBusy}
+                    onClick={() => {
+                      void runCleanupApply();
+                    }}
+                  >
+                    Execute
+                  </Button>
+                </Group>
+              </Group>
+              {cleanupPreviewLabel ? (
+                <>
+                  <Text size="xs">{cleanupPreviewLabel.summary}</Text>
                   <Text size="xs" c="dimmed">
-                    No cleanup recorded yet.
+                    candidates: {cleanupPreviewLabel.candidates}
                   </Text>
-                )}
-              </Stack>
-            </Popover.Dropdown>
-          </Popover>
+                </>
+              ) : (
+                <Text size="xs" c="dimmed">
+                  Run dry-run before execute to review candidate PIDs.
+                </Text>
+              )}
+              <Divider />
+              <Text size="xs" c="dimmed">
+                Last orphan cleanup
+              </Text>
+              {lastCleanup ? (
+                <>
+                  <Text size="xs">
+                    matched={lastCleanup.matched} terminated={lastCleanup.terminated}{" "}
+                    failed={lastCleanup.failed}
+                    {lastCleanup.dryRun ? " (dry-run)" : ""}
+                  </Text>
+                  {lastCleanup.candidates.length > 0 ? (
+                    <Text size="xs" c="dimmed">
+                      candidates: {lastCleanup.candidates.slice(0, 8).join(", ")}
+                      {lastCleanup.candidates.length > 8 ? ", ..." : ""}
+                    </Text>
+                  ) : null}
+                  {lastCleanup.source ? (
+                    <Text size="xs" c="dimmed">
+                      source: {lastCleanup.source}
+                    </Text>
+                  ) : null}
+                  {cleanupAtLabel ? (
+                    <Text size="xs" c="dimmed">
+                      at: {cleanupAtLabel}
+                    </Text>
+                  ) : null}
+                </>
+              ) : (
+                <Text size="xs" c="dimmed">
+                  No cleanup recorded yet.
+                </Text>
+              )}
+            </Stack>
+          </Popover.Dropdown>
+        </Popover>
+          {liveTone === "red" ? (
+            <Badge size="sm" variant="light" color="red">
+              {telemetryBadgeLabel}
+            </Badge>
+          ) : (
+            <Tooltip label={telemetryBadgeLabel} withArrow>
+              <span
+                className="app-header-live-dot"
+                style={{ background: `var(--mantine-color-${liveTone}-6)` }}
+                aria-label={telemetryBadgeLabel}
+                role="status"
+              />
+            </Tooltip>
+          )}
+        </div>
+        <div ref={header.runRef} className="app-header-run">
           {showHdfWriter && (
             <Button
+              className="app-header-run-chip app-header-run-chip-hdf"
               size="xs"
               variant="light"
               color={hdfWriterChipColor}
@@ -606,6 +693,7 @@ export function DashboardHeaderBar({
           )}
           {showInfluxWriter && (
             <Button
+              className="app-header-run-chip-fixed"
               size="xs"
               variant="light"
               color={influxWriterChipColor}
@@ -621,6 +709,7 @@ export function DashboardHeaderBar({
           )}
           {showHdfNoteChiplet && (
             <Button
+              className="app-header-run-chip-fixed"
               size="xs"
               variant="light"
               color="orange"
@@ -639,8 +728,9 @@ export function DashboardHeaderBar({
             </Button>
           )}
           {showSequencer && (
-            <Button.Group>
+            <Button.Group className="app-header-run-group">
               <Button
+                className="app-header-run-chip"
                 size="xs"
                 variant="light"
                 color={sequencerChipColor}
@@ -655,6 +745,7 @@ export function DashboardHeaderBar({
                 {sequencerChipSuffix}
               </Button>
               <Button
+                className="app-header-run-chip-fixed"
                 size="xs"
                 variant="light"
                 color={sequencerPrimaryAction === "start" ? "teal" : "yellow"}
@@ -674,151 +765,120 @@ export function DashboardHeaderBar({
               </Button>
             </Button.Group>
           )}
-        </Group>
-        <Group gap="xs">
-          <Button
-            size="xs"
-            variant="light"
+        </div>
+        <div ref={header.navRef} className="app-header-nav">
+          <HeaderNavButton
+            icon={<IconLayoutGrid size={14} />}
+            label={deviceIssueCount > 0 ? `Devices (${deviceIssueCount})` : "Devices"}
+            compactLabel={deviceIssueCount > 0 ? String(deviceIssueCount) : null}
+            color={deviceFailedCount > 0 ? "red" : deviceIssueCount > 0 ? "orange" : "gray"}
+            tooltip={
+              deviceIssueCount > 0
+                ? `Device overview (o): ${deviceIssueCount} device${
+                    deviceIssueCount === 1 ? "" : "s"
+                  } need attention`
+                : "Device overview (o)"
+            }
+            onClick={onOpenDeviceOverview}
+          />
+          <HeaderNavButton
+            icon={<IconCpu size={14} />}
+            label="Processes"
             color="gray"
-            leftSection={<IconCpu size={14} />}
             onClick={() => {
               void onOpenProcesses();
             }}
-          >
-            Processes
-          </Button>
-          <Button
-            size="xs"
-            variant="light"
+          />
+          <HeaderNavButton
+            icon={<IconSitemap size={14} />}
+            label={stateMachineButtonSummary.label}
+            compactLabel={stateMachineCount}
             color={stateMachineButtonSummary.color}
-            leftSection={<IconCpu size={14} />}
+            tooltip={`State machines: ${stateMachineButtonSummary.tooltip}`}
             onClick={onOpenStateMachines}
-            title={stateMachineButtonSummary.tooltip}
-          >
-            {stateMachineButtonSummary.label}
-          </Button>
-          <Button
-            size="xs"
-            variant="light"
+          />
+          <HeaderNavButton
+            icon={<IconShieldCheck size={14} />}
+            label={interlockButtonSummary.label}
+            compactLabel={interlockCount}
             color={interlockButtonSummary.color}
-            leftSection={<IconShieldCheck size={14} />}
+            tooltip={interlockButtonSummary.tooltip}
             onClick={onOpenInterlocks}
-            title={interlockButtonSummary.tooltip}
-          >
-            {interlockButtonSummary.label}
-          </Button>
+          />
           {showDaqUi ? (
-            <Button
-              size="xs"
-              variant="light"
+            <HeaderNavButton
+              icon={<IconPencil size={14} />}
+              label={`DAG (${daqWorkspaceCount})`}
+              compactLabel={String(daqWorkspaceCount)}
               color="cyan"
-              leftSection={<IconPencil size={14} />}
+              tooltip="Open shared stream-analysis workspaces"
               onClick={() => {
                 void onOpenDaq();
               }}
-              title="Open shared stream-analysis workspaces"
-            >
-              DAG ({daqWorkspaceCount})
-            </Button>
+            />
           ) : null}
-          <Button
-            size="xs"
-            variant="light"
-            color={commandUnreadError ? "red" : "gray"}
-            leftSection={<IconTerminal2 size={14} />}
-            onClick={onOpenCommandHistory}
-            title="Latest command requests and replies"
-          >
-            Commands ({commandHistoryCount})
-          </Button>
-          <Button
-            size="xs"
-            variant="light"
-            color={logsUnreadError ? "red" : "gray"}
-            leftSection={<IconFileText size={14} />}
-            onClick={onOpenLogs}
-          >
-            Logs
-          </Button>
-          {extraUis.length === 1 ? (
-            <Button
-              component="a"
-              href={extraUis[0].href}
-              target="_blank"
-              rel="noreferrer"
-              size="xs"
+          <Tooltip label={`Command history (${commandHistoryCount})`} withArrow>
+            <ActionIcon
+              size={30}
               variant="light"
-              color="indigo"
-              leftSection={<IconExternalLink size={14} />}
-              title={`Open ${extraUis[0].label}`}
+              color={commandUnreadError ? "red" : "gray"}
+              onClick={onOpenCommandHistory}
+              aria-label="Command history"
             >
-              {extraUis[0].label}
-            </Button>
-          ) : extraUis.length > 1 ? (
-            <Menu shadow="md" width={220} position="bottom-end">
-              <Menu.Target>
-                <Button
-                  size="xs"
-                  variant="light"
-                  color="indigo"
-                  leftSection={<IconExternalLink size={14} />}
-                  rightSection={<IconChevronDown size={12} />}
-                >
-                  Instance UI
-                </Button>
-              </Menu.Target>
-              <Menu.Dropdown>
-                {extraUis.map((item) => (
-                  <Menu.Item
-                    key={item.slug}
-                    component="a"
-                    href={item.href}
-                    target="_blank"
-                    rel="noreferrer"
-                    leftSection={<IconExternalLink size={14} />}
-                  >
-                    {item.label}
-                  </Menu.Item>
-                ))}
-              </Menu.Dropdown>
-            </Menu>
-          ) : null}
-          <Button
-            size="xs"
-            variant="light"
-            color="gray"
-            leftSection={<IconSettings size={14} />}
-            onClick={onOpenSettings}
-          >
-            Settings
-          </Button>
-          <Button
-            size="xs"
-            variant="light"
-            leftSection={<IconRefresh size={14} />}
-            onClick={() => {
-              void onRefreshStatus();
-            }}
-          >
-            Refresh status
-          </Button>
-          <SegmentedControl
-            size="xs"
-            value={colorScheme}
-            onChange={(value) =>
-              onColorSchemeChange(value as "light" | "dark" | "auto")
-            }
-            data={[
-              { label: "Light", value: "light" },
-              { label: "Dark", value: "dark" },
-              { label: "Auto", value: "auto" },
-            ]}
-          />
-          <Badge variant="light" color={telemetryBadgeColor}>
-            {telemetryBadgeLabel}
-          </Badge>
-        </Group>
-      </Group>
+              <IconTerminal2 size={16} />
+            </ActionIcon>
+          </Tooltip>
+          <Tooltip label={logsUnreadError ? "Logs (new errors)" : "Logs"} withArrow>
+            <ActionIcon
+              size={30}
+              variant="light"
+              color={logsUnreadError ? "red" : "gray"}
+              onClick={onOpenLogs}
+              aria-label="Logs"
+            >
+              <IconFileText size={16} />
+            </ActionIcon>
+          </Tooltip>
+          <Menu shadow="md" width={240} position="bottom-end" withArrow>
+            <Menu.Target>
+              <ActionIcon size={30} variant="light" color="gray" aria-label="More">
+                <IconDots size={16} />
+              </ActionIcon>
+            </Menu.Target>
+            <Menu.Dropdown>
+              {extraUis.length > 0 ? (
+                <>
+                  <Menu.Label>Instance UIs</Menu.Label>
+                  {extraUis.map((item) => (
+                    <Menu.Item
+                      key={item.slug}
+                      component="a"
+                      href={item.href}
+                      target="_blank"
+                      rel="noreferrer"
+                      leftSection={<IconExternalLink size={14} />}
+                    >
+                      {item.label}
+                    </Menu.Item>
+                  ))}
+                  <Menu.Divider />
+                </>
+              ) : null}
+              <Menu.Item
+                leftSection={<IconRefresh size={14} />}
+                onClick={() => {
+                  void onRefreshStatus();
+                }}
+              >
+                Refresh status
+              </Menu.Item>
+              <Menu.Item leftSection={<IconSettings size={14} />} onClick={onOpenSettings}>
+                Settings
+              </Menu.Item>
+            </Menu.Dropdown>
+          </Menu>
+        </div>
+      </div>
     </AppShell.Header>
   );
 }
