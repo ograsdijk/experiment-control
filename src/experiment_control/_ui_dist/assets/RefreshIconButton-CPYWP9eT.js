@@ -1,0 +1,1 @@
+import{j as r,ab as e,ad as i,F as n}from"./index-BMC9j8se.js";function d({label:o,onClick:t,loading:a=!1,size:s="md"}){return r.jsx(e,{label:o,withArrow:!0,children:r.jsx(i,{size:s==="md"?30:26,variant:"light",color:"gray","aria-label":o,loading:a,onClick:t,children:r.jsx(n,{size:s==="md"?16:14})})})}export{d as R};
