@@ -4,14 +4,16 @@ import {
   Box,
   Button,
   Card,
+  Collapse,
   Group,
   ScrollArea,
   SimpleGrid,
   Stack,
   Table,
   Text,
+  UnstyledButton,
 } from "@mantine/core";
-import { IconX } from "@tabler/icons-react";
+import { IconChevronDown, IconChevronRight, IconX } from "@tabler/icons-react";
 import { useMemo, useState, type ReactNode } from "react";
 import { resourceHealthRank } from "../features/devices/health";
 import { useResourceListView } from "../features/devices/useDeviceListView";
@@ -21,6 +23,21 @@ import {
   watchdogRuleHealth,
   type WatchdogRuleRow,
 } from "../features/safety/safetyRows";
+import {
+  formatAgo,
+  formatInputAge,
+  formatReading,
+  inputUnavailable,
+  lastActionOutcomes,
+  watchdogInputs,
+  watchdogStatusLine,
+  type BlockingInterlock,
+  type WatchdogInput,
+} from "../features/safety/watchdogNarrative";
+import {
+  InterlockConditionView,
+  type ConditionTelemetryBinding,
+} from "./safety/InterlockConditionView";
 import {
   hasActiveWatchdogTrip,
   hasWatchdogActionFailure,
@@ -57,6 +74,8 @@ type Props = {
     watchdogId: string,
     ruleName: string
   ) => Promise<unknown> | void;
+  /** Jump to the interlock rule that blocked a watchdog action. */
+  onShowInterlockRule?: (blocked: BlockingInterlock) => void;
 };
 
 const BEAMLINE_TURBO_RULES = new Set([
@@ -98,29 +117,11 @@ export function hasIncompleteBeamlineTurboState(
   );
 }
 
-function formatDuration(value: number | null | undefined): string {
-  if (typeof value !== "number" || !Number.isFinite(value)) {
-    return "n/a";
-  }
-  return `${value.toFixed(2)} s`;
-}
-
-function formatAge(value: number | null | undefined): string {
-  if (typeof value !== "number" || !Number.isFinite(value)) {
-    return "n/a";
-  }
-  if (value < 0.05) {
-    return "just now";
-  }
-  return `${value.toFixed(value < 10 ? 1 : 0)} s ago`;
-}
+const formatAge = formatAgo;
 
 function formatValue(value: unknown): string {
   if (typeof value === "number") {
-    if (value !== 0 && (Math.abs(value) < 1e-3 || Math.abs(value) >= 1e4)) {
-      return value.toExponential(3);
-    }
-    return String(value);
+    return formatReading(value);
   }
   if (value == null) {
     return "n/a";
@@ -420,26 +421,6 @@ function formatActionSummary(
   return `${target}(${paramLabel})${timeoutLabel}${retriesLabel}`;
 }
 
-function operationalAction(rule: WatchdogStatus["rules"][number]): string | null {
-  const actions = rule.actions ?? [];
-  const turboStops = new Set(
-    actions
-      .filter((action) => action.action === "stop" && action.device_id)
-      .map((action) => action.device_id)
-  );
-  if (
-    ["hipace_rc", "hipace_eql", "hipace_det", "hipace_spb"].every((id) =>
-      turboStops.has(id)
-    )
-  ) {
-    return "Action: stop all beamline turbos";
-  }
-  if (actions.length === 1) {
-    return `Action: ${formatActionSummary(actions[0])}`;
-  }
-  return actions.length > 0 ? `Actions: ${actions.length}` : null;
-}
-
 function DetailField({ label, children }: { label: string; children: ReactNode }) {
   return (
     <Stack gap={0}>
@@ -491,85 +472,190 @@ function ClearLatchButton({
   );
 }
 
+function formatSettingSeconds(value: number | null | undefined, zeroLabel: string): string {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return "default";
+  }
+  return value === 0 ? zeroLabel : `${formatReading(value)} s`;
+}
+
+function SectionLabel({ children }: { children: ReactNode }) {
+  return (
+    <Text size="xs" c="dimmed" fw={600} tt="uppercase" style={{ letterSpacing: "0.04em" }}>
+      {children}
+    </Text>
+  );
+}
+
+function InputsTable({ inputs }: { inputs: WatchdogInput[] }) {
+  return (
+    <Table verticalSpacing={2} horizontalSpacing={6} fz="xs" className="watchdog-inputs-table">
+      <Table.Tbody>
+        {inputs.map((input) => {
+          const missing = inputUnavailable(input);
+          const tooOld =
+            input.ageS != null && input.maxAgeS != null && input.ageS > input.maxAgeS;
+          return (
+            <Table.Tr key={input.alias}>
+              <Table.Td>
+                <Text size="xs" span c={missing ? "yellow" : undefined}>
+                  {missing ? "△" : "●"}
+                </Text>{" "}
+                <Text size="xs" span fw={500}>
+                  {input.label}
+                </Text>
+              </Table.Td>
+              <Table.Td style={{ fontVariantNumeric: "tabular-nums" }}>
+                {missing ? (
+                  <Text size="xs" span c="yellow">
+                    no data
+                  </Text>
+                ) : typeof input.value === "number" ? (
+                  formatReading(input.value)
+                ) : (
+                  String(input.value)
+                )}
+              </Table.Td>
+              <Table.Td>
+                <Text size="xs" span c={tooOld ? "orange" : "dimmed"}>
+                  {input.ageS != null ? formatInputAge(input.ageS) : "—"}
+                  {input.maxAgeS != null ? ` (max ${input.maxAgeS} s)` : ""}
+                </Text>
+              </Table.Td>
+            </Table.Tr>
+          );
+        })}
+      </Table.Tbody>
+    </Table>
+  );
+}
+
 function WatchdogRuleDetail({
   row,
   clearBusy,
   onClearRuleLatch,
   onClose,
+  onShowInterlockRule,
 }: {
   row: WatchdogRuleRow;
   clearBusy: boolean;
   onClearRuleLatch: Props["onClearRuleLatch"];
   onClose: () => void;
+  onShowInterlockRule?: (blocked: BlockingInterlock) => void;
 }) {
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const rule = row.rule;
   const details: DetailedWatchdogRule = watchdogRuleDetails(rule);
   const state = liveStateFor(row);
+  const status = watchdogStatusLine(row);
+  const inputs = watchdogInputs(rule);
+  const chain = details.last_action_chain;
+  const outcomes = lastActionOutcomes(rule);
   const confirmation = confirmationProgress(rule);
-  const action = operationalAction(rule);
   const turbo = isBeamlineTurboRule(rule);
-  const actionChain = actionChainPresentation(rule);
+  const telemetry = (rule.telemetry ?? []) as ConditionTelemetryBinding[];
+  const interlockLink = (blocked: BlockingInterlock) =>
+    onShowInterlockRule ? (
+      <Button
+        size="compact-xs"
+        variant="subtle"
+        onClick={() => onShowInterlockRule(blocked)}
+      >
+        Show interlock rule
+      </Button>
+    ) : null;
+
   return (
     <Card withBorder radius="lg" p="md">
       <Stack gap="sm">
         <Group justify="space-between" wrap="nowrap" align="flex-start">
-          <Stack gap={4} style={{ minWidth: 0 }}>
+          <Stack gap={2} style={{ minWidth: 0 }}>
             <Group gap={6} wrap="nowrap">
               <HealthMark health={watchdogRuleHealth(row)} />
               <Text fw={600} truncate>
                 {row.ruleName}
               </Text>
             </Group>
-            <Group gap={6}>
-              <Badge size="sm" variant="light" color={state.color}>
-                {state.label}
-              </Badge>
-              <Badge size="sm" variant="outline" color="gray">
-                {rule.severity}
-              </Badge>
-              {actionChain ? (
-                <Badge size="sm" variant="light" color={actionChain.color}>
-                  {actionChain.label}
-                </Badge>
-              ) : null}
-            </Group>
-          </Stack>
-          <Group gap="xs" wrap="nowrap">
-            {rule.latched ? (
-              <ClearLatchButton row={row} busy={clearBusy} onClearRuleLatch={onClearRuleLatch} />
-            ) : null}
-            <ActionIcon
-              size="sm"
-              variant="subtle"
-              color="gray"
-              aria-label="Close rule details"
-              onClick={onClose}
-            >
-              <IconX size={14} />
-            </ActionIcon>
-          </Group>
-        </Group>
-        {!row.processActive && row.watchdogEnabled ? (
-          <Text size="xs" c="red">
-            {row.processId} is {row.process.state}: this rule is not being evaluated.
-          </Text>
-        ) : null}
-        {rule.message ? <Text size="sm">{rule.message}</Text> : null}
-        {action ? <DetailField label="Does">{action}</DetailField> : null}
-        {actionChain && actionChain.failedTargets.length > 0 ? (
-          <Text size="xs" c="red">
-            Failed target{actionChain.failedTargets.length === 1 ? "" : "s"}:{" "}
-            {actionChain.failedTargets.join(", ")}
-          </Text>
-        ) : null}
-        {turbo ? (
-          <>
-            <DetailField label="Pressure">
-              {formatValue(snapshotValue(rule, "p"))} Torr
-            </DetailField>
+            <Badge size="sm" variant="light" color={state.color} style={{ alignSelf: "flex-start" }}>
+              {state.label}
+            </Badge>
             <Text size="xs" c="dimmed">
-              Beamline turbo protection: each Hornet arms independently after pump-down. Any
-              armed Hornet above 1e-2 Torr for 3 fresh samples stops all four beamline turbos.
+              {rule.severity} · {row.watchdogId} · evaluated {formatAge(rule.last_evaluated_age_s)}
+              {rule.last_trigger_age_s != null
+                ? ` · last tripped ${formatAge(rule.last_trigger_age_s)}`
+                : ""}
+            </Text>
+          </Stack>
+          <ActionIcon
+            size="sm"
+            variant="subtle"
+            color="gray"
+            aria-label="Close rule details"
+            onClick={onClose}
+          >
+            <IconX size={14} />
+          </ActionIcon>
+        </Group>
+
+        <div className={`watchdog-status-box watchdog-status-${status.tone}`}>
+          <Text size="sm">{status.text}</Text>
+          {status.actionText ? (
+            <Group gap={6} wrap="wrap" mt={4}>
+              <Text size="sm">{status.actionText}</Text>
+              {status.blockedBy ? interlockLink(status.blockedBy) : null}
+            </Group>
+          ) : null}
+          {rule.latched ? (
+            <Group mt={6}>
+              <ClearLatchButton row={row} busy={clearBusy} onClearRuleLatch={onClearRuleLatch} />
+            </Group>
+          ) : null}
+        </div>
+
+        {rule.message ? (
+          <Text size="xs" c="dimmed">
+            {rule.message}
+          </Text>
+        ) : null}
+
+        {inputs.length > 0 ? (
+          <Stack gap={2}>
+            <SectionLabel>Inputs</SectionLabel>
+            <InputsTable inputs={inputs} />
+          </Stack>
+        ) : null}
+
+        <Stack gap={4}>
+          <SectionLabel>Trips when</SectionLabel>
+          <InterlockConditionView
+            condition={rule.condition}
+            telemetry={telemetry}
+            evaluation={rule.condition_evaluation}
+            resultMode="trigger"
+          />
+          {confirmation ? (
+            <Text size="xs" c="dimmed">
+              Needs {confirmation.target} consecutive samples (now {confirmation.count}).
+            </Text>
+          ) : null}
+        </Stack>
+
+        {details.arm != null ? (
+          <Stack gap={4}>
+            <SectionLabel>Arms when ({details.armed ? "armed" : "disarmed"})</SectionLabel>
+            <InterlockConditionView condition={details.arm.condition} telemetry={telemetry} />
+          </Stack>
+        ) : null}
+
+        {turbo ? (
+          <Stack gap={4}>
+            <SectionLabel>Beamline turbo protection</SectionLabel>
+            <Text size="xs">
+              Pressure: <b>{formatValue(snapshotValue(rule, "p"))} Torr</b>
+            </Text>
+            <Text size="xs" c="dimmed">
+              Each Hornet arms independently after pump-down. Any armed Hornet above 1e-2 Torr
+              for 3 fresh samples stops all four beamline turbos.
             </Text>
             {hasIncompleteBeamlineTurboState(rule) ? (
               <Text size="xs" c="yellow">
@@ -578,55 +664,73 @@ function WatchdogRuleDetail({
                 affected.
               </Text>
             ) : null}
-          </>
+          </Stack>
         ) : null}
-        <SimpleGrid cols={2} spacing="xs" verticalSpacing="xs">
-          <DetailField label="Ruleset">
-            {row.watchdogId} · {row.processId}
-          </DetailField>
-          <DetailField label="Evaluated">{formatAge(rule.last_evaluated_age_s)}</DetailField>
-          <DetailField label="Last triggered">
-            {rule.last_trigger_age_s != null ? formatAge(rule.last_trigger_age_s) : "never"}
-          </DetailField>
-          {confirmation ? (
-            <DetailField label="Confirmation">
-              {confirmation.count}/{confirmation.target}
-            </DetailField>
-          ) : null}
-          <DetailField label="Stable for">{formatDuration(rule.stable_for_s)}</DetailField>
-          <DetailField label="Cooldown">{formatDuration(rule.cooldown_s)}</DetailField>
-          <DetailField label="On unknown">{rule.on_unknown ?? "default"}</DetailField>
-          <DetailField label="Latching">{rule.latch ? "yes" : "no"}</DetailField>
-        </SimpleGrid>
+
         <Stack gap={4}>
-          <Text size="xs" c="dimmed">
-            Trip condition evaluation
-          </Text>
-          <ConditionTrace trace={rule.condition_evaluation} />
-        </Stack>
-        {details.arm != null ? (
-          <DetailField label="Arming condition">
-            <Text size="xs" style={MONO} component="div">
-              {JSON.stringify(details.arm.condition, null, 2)}
+          <SectionLabel>
+            {chain
+              ? `Last action run${chain.duration_ms != null ? ` · ${formatReading(chain.duration_ms)} ms` : ""}`
+              : "Actions on trip"}
+          </SectionLabel>
+          {chain ? (
+            outcomes.map((outcome, index) => (
+              <Stack key={`${row.key}:outcome:${index}`} gap={0}>
+                <Group gap={6} wrap="nowrap">
+                  <Text size="xs" c={outcome.ok ? "teal" : "red"} fw={700}>
+                    {outcome.ok ? "✓" : "✗"}
+                  </Text>
+                  <Text size="xs" style={MONO}>
+                    {outcome.target}
+                  </Text>
+                  <Text size="xs" c="dimmed">
+                    {outcome.attempts} attempt{outcome.attempts === 1 ? "" : "s"}
+                  </Text>
+                </Group>
+                {outcome.message ? (
+                  <Text size="xs" c="red" pl="md">
+                    {outcome.blockedBy
+                      ? `Blocked by interlock rule "${outcome.blockedBy.rule}": ${outcome.message}`
+                      : outcome.message}
+                  </Text>
+                ) : null}
+              </Stack>
+            ))
+          ) : (rule.actions ?? []).length > 0 ? (
+            (rule.actions ?? []).map((item, index) => (
+              <Text key={`${row.key}:action:${index}`} size="xs" style={MONO}>
+                {formatActionSummary(item)}
+              </Text>
+            ))
+          ) : (
+            <Text size="xs" c="dimmed">
+              No actions configured.
             </Text>
-          </DetailField>
-        ) : null}
-        {(rule.actions ?? []).length > 0 ? (
-          <DetailField label="Actions">
-            <Stack gap={2}>
-              {(rule.actions ?? []).map((item, index) => (
-                <Text key={`${row.key}:action:${index}`} size="xs" style={MONO}>
-                  {formatActionSummary(item)}
-                </Text>
-              ))}
-            </Stack>
-          </DetailField>
-        ) : null}
-        <DetailField label="Raw trip condition">
-          <Text size="xs" style={MONO} component="div">
-            {JSON.stringify(rule.condition, null, 2)}
-          </Text>
-        </DetailField>
+          )}
+        </Stack>
+
+        <Stack gap={4}>
+          <UnstyledButton onClick={() => setSettingsOpen((prev) => !prev)} aria-expanded={settingsOpen}>
+            <Group gap={4}>
+              {settingsOpen ? <IconChevronDown size={12} /> : <IconChevronRight size={12} />}
+              <SectionLabel>Settings</SectionLabel>
+            </Group>
+          </UnstyledButton>
+          <Collapse in={settingsOpen}>
+            <SimpleGrid cols={2} spacing="xs" verticalSpacing="xs">
+              <DetailField label="Must hold for">
+                {formatSettingSeconds(rule.stable_for_s, "trips immediately")}
+              </DetailField>
+              <DetailField label="Cooldown">
+                {formatSettingSeconds(rule.cooldown_s, "none")}
+              </DetailField>
+              <DetailField label="On unknown">{rule.on_unknown ?? "ignore"}</DetailField>
+              <DetailField label="Latching">{rule.latch ? "yes" : "no"}</DetailField>
+              <DetailField label="Ruleset">{row.watchdogId}</DetailField>
+              <DetailField label="Process">{row.processId}</DetailField>
+            </SimpleGrid>
+          </Collapse>
+        </Stack>
       </Stack>
     </Card>
   );
@@ -670,6 +774,7 @@ export function WatchdogsPanel({
   onRefreshProcess,
   onToggleWatchdog,
   onClearRuleLatch,
+  onShowInterlockRule,
 }: Props) {
   const rows = useMemo(
     () => buildWatchdogRuleRows(processes, watchdogStatusByProcessId),
@@ -868,6 +973,7 @@ export function WatchdogsPanel({
                 clearBusy={clearBusy(selectedRow)}
                 onClearRuleLatch={onClearRuleLatch}
                 onClose={() => setSelectedKey(null)}
+                onShowInterlockRule={onShowInterlockRule}
               />
             </ScrollArea.Autosize>
           </Box>

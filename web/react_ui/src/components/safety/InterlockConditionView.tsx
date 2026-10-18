@@ -2,6 +2,7 @@ import { Badge, Button, Group, Stack, Text } from "@mantine/core";
 import { useMemo, useState } from "react";
 import type { ReactNode } from "react";
 import type { ConditionEvaluationTrace } from "../../types";
+import { formatReading } from "../../features/safety/watchdogNarrative";
 
 type ConditionNode =
   | { kind: "always"; value: unknown }
@@ -122,11 +123,10 @@ function formatConditionValue(value: unknown): string {
   if (typeof value === "string") {
     return value;
   }
-  if (
-    value === null ||
-    typeof value === "number" ||
-    typeof value === "boolean"
-  ) {
+  if (typeof value === "number") {
+    return formatReading(value);
+  }
+  if (value === null || typeof value === "boolean") {
     return String(value);
   }
   try {
@@ -398,8 +398,9 @@ export function InterlockConditionView({
     hasResolved: boolean
   ) => {
     const resolvedText = formatConditionValue(resolved);
+    // A failed evaluation carries no resolved value: show the plain operand.
     const display =
-      hasResolved && resolvedText !== formatConditionValue(original)
+      hasResolved && resolved !== undefined && resolvedText !== formatConditionValue(original)
         ? `${rendered} = ${resolvedText}`
         : rendered;
     return (

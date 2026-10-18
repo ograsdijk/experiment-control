@@ -358,6 +358,38 @@ body::before {
   background: var(--mantine-color-default-hover);
 }
 
+/* Watchdog rule card: plain-language status, tinted by severity of state. */
+.watchdog-status-box {
+  padding: 8px 10px;
+  border-radius: 8px;
+  border-left: 3px solid var(--mantine-color-gray-5);
+  background: var(--mantine-color-default-hover);
+}
+
+.watchdog-status-red {
+  border-left-color: var(--mantine-color-red-6);
+  background: var(--mantine-color-red-light);
+}
+
+.watchdog-status-orange {
+  border-left-color: var(--mantine-color-orange-6);
+  background: var(--mantine-color-orange-light);
+}
+
+.watchdog-status-yellow {
+  border-left-color: var(--mantine-color-yellow-6);
+  background: var(--mantine-color-yellow-light);
+}
+
+.watchdog-status-teal {
+  border-left-color: var(--mantine-color-teal-6);
+  background: var(--mantine-color-teal-light);
+}
+
+.watchdog-inputs-table td {
+  white-space: nowrap;
+}
+
 /* Selectable list rows (State Machines list): same highlight as table rows. */
 .resource-list-item {
   display: block;

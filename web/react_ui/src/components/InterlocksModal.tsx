@@ -58,6 +58,17 @@ type Props = {
     ruleId: string,
     enabled: boolean
   ) => Promise<unknown> | void;
+  /** Select this rule on mount/change (e.g. from a blocked watchdog action). */
+  focusRule?: InterlockFocus | null;
+};
+
+export type InterlockFocus = {
+  processId: string;
+  interceptorId: string;
+  /** Rule name or rule_id, as reported by an interceptor rejection. */
+  rule: string;
+  /** Bump to re-focus the same rule. */
+  nonce: number;
 };
 
 type Column = "rule" | "ruleset" | "match" | "inputs" | "kind" | "enabled";
@@ -106,6 +117,7 @@ export function InterlocksModal({
   onRefreshProcess,
   onToggleFollowerRule,
   onToggleInterlockRule,
+  focusRule = null,
 }: Props) {
   const deviceById = useMemo(
     () => new Map(devices.map((device) => [device.device_id, device])),
@@ -134,6 +146,25 @@ export function InterlocksModal({
       setSelectedKey(null);
     }
   }, [rows, selectedKey]);
+
+  useEffect(() => {
+    if (!focusRule) {
+      return;
+    }
+    const target = rows.find(
+      (row) =>
+        (!focusRule.processId || row.processId === focusRule.processId) &&
+        (!focusRule.interceptorId || row.scopeId === focusRule.interceptorId) &&
+        (row.name === focusRule.rule || row.ruleId === focusRule.rule)
+    );
+    if (target) {
+      view.setQuery("");
+      view.setIssuesOnly(false);
+      setSelectedKey(target.key);
+    }
+    // Re-run only when a new focus request arrives, not on every poll.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focusRule?.nonce, rows.length]);
 
   const toggleRule = (row: InterlockRuleRow, enabled: boolean) => {
     if (row.follower) {

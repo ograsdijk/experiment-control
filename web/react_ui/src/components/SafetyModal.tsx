@@ -4,7 +4,7 @@ import {
   buildWatchdogRuleRows,
   watchdogRuleNeedsAttention,
 } from "../features/safety/safetyRows";
-import { InterlocksModal } from "./InterlocksModal";
+import { InterlocksModal, type InterlockFocus } from "./InterlocksModal";
 import { WatchdogsPanel } from "./WatchdogsPanel";
 
 type InterlocksPanelProps = Omit<
@@ -61,6 +61,7 @@ export function SafetyModal({
     [watchdogs.processes, watchdogs.watchdogStatusByProcessId]
   );
   const [chosenTab, setChosenTab] = useState<string | null>(null);
+  const [interlockFocus, setInterlockFocus] = useState<InterlockFocus | null>(null);
   const activeTab = chosenTab ?? (watchdogAttention ? "watchdogs" : "interlocks");
   return (
     <Modal
@@ -92,10 +93,17 @@ export function SafetyModal({
             onClose={() => {}}
             panelOnly
             {...interlocks}
+            focusRule={interlockFocus}
           />
         </Tabs.Panel>
         <Tabs.Panel value="watchdogs" pt="sm">
-          <WatchdogsPanel {...watchdogs} />
+          <WatchdogsPanel
+            {...watchdogs}
+            onShowInterlockRule={(blocked) => {
+              setInterlockFocus({ ...blocked, nonce: Date.now() });
+              setChosenTab("interlocks");
+            }}
+          />
         </Tabs.Panel>
       </Tabs>
     </Modal>
