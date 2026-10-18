@@ -1178,6 +1178,13 @@ class InterlockProcess(ManagedProcessBase):
     def _rpc_interlock_check(self, req: Json) -> Json:
         req_id = req.get("request_id")
         command = req.get("command")
+        if command is None:
+            # Generic process calls (e.g. the web UI's dry-run "check a
+            # command") wrap arguments in params; the manager's interceptor
+            # chain sends the command at the top level.
+            params_in = req.get("params")
+            if isinstance(params_in, dict):
+                command = params_in.get("command")
         if not isinstance(command, dict):
             return {
                 "request_id": req_id,

@@ -326,10 +326,12 @@ export function InterlocksModal({
             <ScrollArea.Autosize mah="min(60vh, 40rem)" type="auto">
               <InterlockRuleDetail
                 row={selectedRow}
+                rows={rows}
                 deviceById={deviceById}
                 busy={ruleBusy(selectedRow)}
                 onToggle={toggleRule}
                 onClose={() => setSelectedKey(null)}
+                onSelectRule={selectFromRouting}
               />
             </ScrollArea.Autosize>
           </Box>

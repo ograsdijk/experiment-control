@@ -165,19 +165,15 @@ function rewriteSymbolToken(
   if (!trimmed) {
     return trimmed;
   }
-  if (trimmed === "params") {
-    return `${commandTarget}(params)`;
-  }
-  if (trimmed === "command.params") {
-    return `${commandTarget}(params)`;
+  // Command params read as what the operator asked for: "requested temperature".
+  if (trimmed === "params" || trimmed === "command.params") {
+    return "requested params";
   }
   if (trimmed.startsWith("params.")) {
-    const param = trimmed.slice("params.".length);
-    return `${commandTarget}(${param || "param"})`;
+    return `requested ${trimmed.slice("params.".length) || "param"}`;
   }
   if (trimmed.startsWith("command.params.")) {
-    const param = trimmed.slice("command.params.".length);
-    return `${commandTarget}(${param || "param"})`;
+    return `requested ${trimmed.slice("command.params.".length) || "param"}`;
   }
   if (trimmed === "device_id") {
     return commandDevice;
