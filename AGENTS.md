@@ -2,6 +2,16 @@
 
 ## Build / test commands
 
+**Before pushing, run `python scripts/ci_check.py`.** CI (`.github/workflows/ci.yml`)
+calls this same script, one `--job` per workflow job, so it runs exactly the CI
+commands. The default quick mode does sync, lint, complexity guard and unittest, plus
+the UI build/test/stale-`_ui_dist` check when UI files changed vs `origin/master`.
+`--full` adds the wheel build and the Windows lifecycle smoke test, and always runs
+the UI steps. `--list` shows the steps; `--install-hook` adds an opt-in pre-push hook
+(quick mode). Add or change CI checks in the script, not in the workflow.
+
+The individual commands:
+
 ```powershell
 # Lint (must pass before commit)
 uv run ruff check src tests examples
