@@ -102,6 +102,8 @@ export type PanelSettingsOptions = {
   overlayTraceOptions: SelectOption[];
   /** `fit_1d` outputs offered as overlays (bin stats). */
   fitOverlayOptions: SelectOption[];
+  /** Other `hist_agg` outputs offered as overlays (bin stats). */
+  histOverlayOptions: SelectOption[];
   /** Scalar + fit-params outputs (params panel). */
   paramsOutputOptions: SelectOption[];
   binStatsXLabel: string;
@@ -113,6 +115,7 @@ export const EMPTY_PANEL_SETTINGS_OPTIONS: PanelSettingsOptions = {
   outputOptions: [],
   overlayTraceOptions: [],
   fitOverlayOptions: [],
+  histOverlayOptions: [],
   paramsOutputOptions: [],
   binStatsXLabel: "",
   bin2dXLabel: "",
@@ -206,6 +209,7 @@ export function PanelSettingsBody({
     setStreamParamsPanelOutputs,
     setStreamBinStatsOverlayOutputs,
     setStreamBinStatsFitOverlayOutputs,
+    setStreamBinStatsHistOverlayOutputs,
     setStreamBinStatsUncertainty,
     setStreamBinStatsShowBinMarkers,
     setStreamBinStatsXAxisTransform,
@@ -439,6 +443,20 @@ export function PanelSettingsBody({
         />
         {isStreamBinStatsPanel(panel) ? (
           <>
+            <MultiSelect
+              size="xs"
+              searchable
+              clearable
+              label="Overlay histograms"
+              placeholder="Optional histogram outputs on the same axes"
+              comboboxProps={{ zIndex: 800 }}
+        {...dropdownEvents}
+              data={options.histOverlayOptions}
+              value={panel.histOverlayOutputIds ?? []}
+              onChange={(value) =>
+                setStreamBinStatsHistOverlayOutputs(panel.id, value)
+              }
+            />
             <MultiSelect
               size="xs"
               searchable

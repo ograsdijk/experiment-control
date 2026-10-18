@@ -105,6 +105,10 @@ export interface ApplyHelpersDeps {
     string,
     Map<string, StreamFitCurveSnapshot>
   >;
+  streamBinStatsHistOverlayRef: Map<
+    string,
+    Map<string, StreamBinStatsSnapshot>
+  >;
   streamParamsLatestRef: Map<string, Record<string, StreamParamsOutputValue>>;
   streamBinStatsRef: Map<string, StreamBinStatsSnapshot>;
   streamBin2dRef: Map<string, StreamBin2dSnapshot>;
@@ -158,6 +162,9 @@ export function buildPanelsByWorkspaceOutput(
         add(workspaceId, String(id ?? "").trim(), panel);
       }
       for (const id of panel.fitOverlayOutputIds ?? []) {
+        add(workspaceId, String(id ?? "").trim(), panel);
+      }
+      for (const id of panel.histOverlayOutputIds ?? []) {
         add(workspaceId, String(id ?? "").trim(), panel);
       }
       continue;
@@ -387,9 +394,16 @@ export function applyStreamAnalysisOutputToPanels(
         if (!isStreamBinStatsPanel(panel)) {
           continue;
         }
+        if ((panel.histOverlayOutputIds ?? []).includes(output.outputId)) {
+          const perPanel =
+            deps.streamBinStatsHistOverlayRef.get(panel.id) ?? new Map();
+          perPanel.set(output.outputId, series);
+          deps.streamBinStatsHistOverlayRef.set(panel.id, perPanel);
+          dirtyPanelIds.add(panel.id);
+        }
         if ((panel.outputId ?? "") !== output.outputId) {
-          // Index match was via overlay/fit-overlay; not the primary
-          // bin-stats output, so skip the snapshot replace.
+          // Index match was via an overlay; not the primary bin-stats
+          // output, so skip the snapshot replace.
           continue;
         }
         deps.streamBinStatsRef.set(panel.id, series);

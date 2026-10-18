@@ -86,6 +86,7 @@ export function useStreamPanelHandlers(args: StreamPanelHandlersArgs) {
     streamExtraChannelRef,
     streamBinStatsOverlayRef,
     streamBinStatsFitOverlayRef,
+    streamBinStatsHistOverlayRef,
     streamBinStatsRef,
     streamBin2dRef,
   } = useTelemetry();
@@ -149,6 +150,7 @@ export function useStreamPanelHandlers(args: StreamPanelHandlersArgs) {
       if (isStreamBinStatsPanel(panel)) {
         streamBinStatsRef.delete(panel.id);
         streamBinStatsFitOverlayRef.set(panel.id, new Map());
+        streamBinStatsHistOverlayRef.set(panel.id, new Map());
       } else {
         streamBin2dRef.delete(panel.id);
       }
@@ -193,6 +195,7 @@ export function useStreamPanelHandlers(args: StreamPanelHandlersArgs) {
     streamBinStatsRef.delete(panelId);
     streamBinStatsOverlayRef.set(panelId, new Map());
     streamBinStatsFitOverlayRef.set(panelId, new Map());
+    streamBinStatsHistOverlayRef.set(panelId, new Map());
     markPanelDirty(panelId);
   };
 

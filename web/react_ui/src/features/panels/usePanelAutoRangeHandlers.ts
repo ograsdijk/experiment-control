@@ -26,6 +26,7 @@ import { useTelemetry } from "../telemetry/TelemetryContext";
 import { RingBuffer } from "../../utils/ringBuffer";
 import {
   streamBinStatsFitOverlayCurves,
+  streamBinStatsHistOverlaySeries,
   streamBinStatsOverlaySeries,
   streamExtraChannelSeries,
   streamTraceOverlaySeries,
@@ -89,6 +90,7 @@ export function usePanelAutoRangeHandlers(args: PanelAutoRangeHandlersArgs) {
     streamExtraChannelRef,
     streamBinStatsOverlayRef,
     streamBinStatsFitOverlayRef,
+    streamBinStatsHistOverlayRef,
     streamBinStatsRef,
     streamBin2dRef,
   } = useTelemetry();
@@ -166,7 +168,8 @@ export function usePanelAutoRangeHandlers(args: PanelAutoRangeHandlersArgs) {
           panel.uncertaintyMode,
           panel.uncertaintyScale,
           streamBinStatsOverlaySeries(panel, streamBinStatsOverlayRef),
-          streamBinStatsFitOverlayCurves(panel, streamBinStatsFitOverlayRef)
+          streamBinStatsFitOverlayCurves(panel, streamBinStatsFitOverlayRef),
+          streamBinStatsHistOverlaySeries(panel, streamBinStatsHistOverlayRef)
         )
       );
     }

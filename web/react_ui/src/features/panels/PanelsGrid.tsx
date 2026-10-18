@@ -16,7 +16,10 @@ import type {
   YScaleMode,
 } from "../stream/types";
 import type { Bin2dReducer } from "../../components/StreamBin2dPanel";
-import type { UncertaintyMode } from "../../components/StreamBinStatsPanel";
+import type {
+  StreamBinStatsHistOverlay,
+  UncertaintyMode,
+} from "../../components/StreamBinStatsPanel";
 import { useLayout } from "../layout/LayoutContext";
 import { PanelCard } from "./PanelCard";
 import { usePanels } from "./PanelsContext";
@@ -55,6 +58,9 @@ export interface PanelsGridHelpers {
   streamBinStatsFitOverlayCurves: (
     panel: PlotStreamBinStatsPanelState
   ) => Array<{ label: string; x: number[]; y: number[] }>;
+  streamBinStatsHistOverlaySeries: (
+    panel: PlotStreamBinStatsPanelState
+  ) => StreamBinStatsHistOverlay[];
   isExpandablePlotPanel: (panel: PlotPanelState) => boolean;
   copyTextToClipboard: (label: string, text: string) => Promise<void>;
 }
@@ -145,6 +151,10 @@ export interface PanelsGridHandlers {
     outputIds: string[]
   ) => void;
   setStreamBinStatsFitOverlayOutputs: (
+    panelId: string,
+    outputIds: string[]
+  ) => void;
+  setStreamBinStatsHistOverlayOutputs: (
     panelId: string,
     outputIds: string[]
   ) => void;

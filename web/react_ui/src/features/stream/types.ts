@@ -293,6 +293,12 @@ export type PlotStreamBinStatsPanelState = PanelNamingState & {
   outputId: string | null;
   overlayOutputIds: string[];
   fitOverlayOutputIds: string[];
+  /**
+   * Other `hist_agg` outputs drawn on the same axes as the primary one,
+   * each with its own bins and uncertainty band (e.g. the same scan split
+   * by a shot condition). Optional so panels from older profiles load.
+   */
+  histOverlayOutputIds?: string[];
   stream: StreamTarget | null;
   channelIndex: number;
   analysis: StreamAnalysisSettings;

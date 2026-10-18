@@ -214,6 +214,37 @@ describe("plot_state normalizePlotState telemetry smoothing", () => {
     }
   });
 
+  it("round-trips bin stats histogram overlays and defaults them for old profiles", () => {
+    const state = normalizePlotState({
+      panels: [
+        {
+          id: "panel-1", title: "Open vs closed", kind: "stream_bin_stats",
+          workspaceId: "detection_cu1_shutter", outputId: "ratio_open",
+          overlayOutputIds: [], fitOverlayOutputIds: [],
+          histOverlayOutputIds: ["ratio_closed", " ", 3],
+          stream: null, binStats: {}, uncertaintyMode: "sem",
+          uncertaintyScale: 1, showBinMarkers: false, xOffset: 0, xScale: 1,
+        },
+        {
+          id: "panel-2", title: "Old profile", kind: "stream_bin_stats",
+          workspaceId: "detection_fluorescence", outputId: "bin_stats",
+          overlayOutputIds: [], fitOverlayOutputIds: [], stream: null,
+          binStats: {}, uncertaintyMode: "sem", uncertaintyScale: 1,
+          showBinMarkers: false, xOffset: 0, xScale: 1,
+        },
+      ],
+      activePanelId: "panel-1",
+    });
+
+    const [withOverlay, oldProfile] = normalizePlotState(
+      serializePlotState(state)
+    ).panels;
+    expect(withOverlay.kind === "stream_bin_stats" && withOverlay.histOverlayOutputIds)
+      .toEqual(["ratio_closed", "3"]);
+    expect(oldProfile.kind === "stream_bin_stats" && oldProfile.histOverlayOutputIds)
+      .toEqual([]);
+  });
+
   it("uses identity x-axis transforms for invalid bin stats values", () => {
     const state = normalizePlotState({
       panels: [{

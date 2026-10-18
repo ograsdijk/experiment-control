@@ -82,6 +82,11 @@ type StreamBinStatsFitOverlayMap = Map<
   string,
   Map<string, StreamFitCurveSnapshot>
 >;
+// panelId → overlay output_id → latest histogram for that overlay.
+type StreamBinStatsHistOverlayMap = Map<
+  string,
+  Map<string, StreamBinStatsSnapshot>
+>;
 type StreamParamsLatestMap = Map<string, Record<string, StreamParamsOutputValue>>;
 type StreamBinStatsMap = Map<string, StreamBinStatsSnapshot>;
 type StreamBin2dMap = Map<string, StreamBin2dSnapshot>;
@@ -95,6 +100,7 @@ export interface TelemetryContextValue {
   streamExtraChannelRef: StreamExtraChannelMap;
   streamBinStatsOverlayRef: StreamBinStatsOverlayMap;
   streamBinStatsFitOverlayRef: StreamBinStatsFitOverlayMap;
+  streamBinStatsHistOverlayRef: StreamBinStatsHistOverlayMap;
   streamParamsLatestRef: StreamParamsLatestMap;
   streamBinStatsRef: StreamBinStatsMap;
   streamBin2dRef: StreamBin2dMap;
@@ -131,6 +137,10 @@ export function TelemetryProvider({ children }: { children: ReactNode }) {
     []
   );
   const streamBinStatsFitOverlayRef = useMemo<StreamBinStatsFitOverlayMap>(
+    () => new Map(),
+    []
+  );
+  const streamBinStatsHistOverlayRef = useMemo<StreamBinStatsHistOverlayMap>(
     () => new Map(),
     []
   );
@@ -206,6 +216,7 @@ export function TelemetryProvider({ children }: { children: ReactNode }) {
       streamExtraChannelRef,
       streamBinStatsOverlayRef,
       streamBinStatsFitOverlayRef,
+      streamBinStatsHistOverlayRef,
       streamParamsLatestRef,
       streamBinStatsRef,
       streamBin2dRef,
@@ -220,6 +231,7 @@ export function TelemetryProvider({ children }: { children: ReactNode }) {
       streamExtraChannelRef,
       streamBinStatsOverlayRef,
       streamBinStatsFitOverlayRef,
+      streamBinStatsHistOverlayRef,
       streamParamsLatestRef,
       streamBinStatsRef,
       streamBin2dRef,

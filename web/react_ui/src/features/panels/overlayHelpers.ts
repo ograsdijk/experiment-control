@@ -2,8 +2,10 @@ import type {
   PlotStreamBinStatsPanelState,
   PlotStreamPanelState,
   PlotStreamWaterfallPanelState,
+  StreamBinStatsSnapshot,
   StreamFitCurveSnapshot,
 } from "../stream/types";
+import type { StreamBinStatsHistOverlay } from "../../components/StreamBinStatsPanel";
 
 /**
  * Pure functions that build display-ready overlay series from the
@@ -24,6 +26,7 @@ type TraceOverlayMap = Map<string, Map<string, { seq: number; values: number[] }
 type ExtraChannelMap = Map<string, Map<number, { seq: number; values: number[] }>>;
 type BinStatsOverlayMap = Map<string, Map<string, { seq: number; values: number[] }>>;
 type BinStatsFitOverlayMap = Map<string, Map<string, StreamFitCurveSnapshot>>;
+type BinStatsHistOverlayMap = Map<string, Map<string, StreamBinStatsSnapshot>>;
 
 function cachedValues(
   entry: { seq: number; values: number[] } | undefined
@@ -79,6 +82,22 @@ export function streamBinStatsOverlaySeries(
   return (panel.overlayOutputIds ?? []).map((outputId) => ({
     label: outputId,
     values: cachedValues(overlayMap?.get(outputId)),
+  }));
+}
+
+/**
+ * Histogram overlays for a bin-stats panel, in selection order. A slot is
+ * returned for every selected output, with `series: null` until its first
+ * update, so the plot's series layout and colours stay put.
+ */
+export function streamBinStatsHistOverlaySeries(
+  panel: PlotStreamBinStatsPanelState,
+  overlayRef: BinStatsHistOverlayMap
+): StreamBinStatsHistOverlay[] {
+  const overlayMap = overlayRef.get(panel.id);
+  return (panel.histOverlayOutputIds ?? []).map((outputId) => ({
+    label: outputId,
+    series: overlayMap?.get(outputId)?.series ?? null,
   }));
 }
 

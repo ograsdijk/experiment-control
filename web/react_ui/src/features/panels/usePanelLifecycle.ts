@@ -120,6 +120,7 @@ export function usePanelLifecycle(args: PanelLifecycleArgs) {
     streamExtraChannelRef,
     streamBinStatsOverlayRef,
     streamBinStatsFitOverlayRef,
+    streamBinStatsHistOverlayRef,
     streamParamsLatestRef,
     streamBinStatsRef,
     streamBin2dRef,
@@ -253,6 +254,7 @@ export function usePanelLifecycle(args: PanelLifecycleArgs) {
         outputId: binOutputId,
         overlayOutputIds: [],
         fitOverlayOutputIds: [],
+        histOverlayOutputIds: [],
         stream: workspaceConfig?.stream ?? null,
         channelIndex: workspaceConfig?.channelIndex ?? 0,
         analysis: workspaceConfig?.analysis ?? defaultStreamAnalysisSettings(),
@@ -268,6 +270,7 @@ export function usePanelLifecycle(args: PanelLifecycleArgs) {
       };
       streamBinStatsRef.delete(id);
       streamBinStatsFitOverlayRef.delete(id);
+      streamBinStatsHistOverlayRef.delete(id);
     } else if (kind === "stream_bin2d") {
       const bin2dOutputId = defaultOutputForKind(workspaceConfig, "hist2d");
       panel = {
@@ -435,6 +438,7 @@ export function usePanelLifecycle(args: PanelLifecycleArgs) {
     streamExtraChannelRef.delete(panelId);
     streamBinStatsOverlayRef.delete(panelId);
     streamBinStatsFitOverlayRef.delete(panelId);
+    streamBinStatsHistOverlayRef.delete(panelId);
     streamParamsLatestRef.delete(panelId);
     streamBinStatsRef.delete(panelId);
     streamBin2dRef.delete(panelId);

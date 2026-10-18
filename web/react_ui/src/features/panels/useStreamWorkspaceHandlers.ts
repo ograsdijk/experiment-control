@@ -29,7 +29,8 @@ import { markPanelDirty } from "./PanelInvalidationStore";
  *
  * App.tsx historically defined ~9 of these inline. They mutate
  * panel.workspaceId / panel.outputId / panel.overlayOutputIds /
- * panel.fitOverlayOutputIds and as a side effect clear the relevant
+ * panel.fitOverlayOutputIds / panel.histOverlayOutputIds and as a side
+ * effect clear the relevant
  * per-stream overlay refs so the panel rebuilds its display from the
  * new workspace's data.
  *
@@ -42,9 +43,10 @@ import { markPanelDirty } from "./PanelInvalidationStore";
  *   workspace + output switches:
  *   `setStreamAnalysisPanelWorkspace`, `setStreamAnalysisPanelOutput`.
  * - Stream-params output list: `setStreamParamsPanelOutputs`.
- * - Stream-binstats overlay/fit-overlay output lists:
+ * - Stream-binstats overlay/fit-overlay/histogram-overlay output lists:
  *   `setStreamBinStatsOverlayOutputs`,
- *   `setStreamBinStatsFitOverlayOutputs`.
+ *   `setStreamBinStatsFitOverlayOutputs`,
+ *   `setStreamBinStatsHistOverlayOutputs`.
  *
  * `clearPanelBuffers` is taken as an arg because `setStreamAnalysisPanelWorkspace`
  * and `setStreamAnalysisPanelOutput` call it when switching a scalar
@@ -64,6 +66,7 @@ export function useStreamWorkspaceHandlers(args: StreamWorkspaceHandlersArgs) {
     streamTraceOverlayRef,
     streamBinStatsOverlayRef,
     streamBinStatsFitOverlayRef,
+    streamBinStatsHistOverlayRef,
     streamParamsLatestRef,
     streamBinStatsRef,
     streamBin2dRef,
@@ -344,6 +347,7 @@ export function useStreamWorkspaceHandlers(args: StreamWorkspaceHandlersArgs) {
           outputId: nextOutputId,
           overlayOutputIds: [],
           fitOverlayOutputIds: [],
+          histOverlayOutputIds: [],
           stream: nextWorkspace.stream,
           channelIndex: nextWorkspace.channelIndex,
           analysis: nextWorkspace.analysis,
@@ -367,6 +371,7 @@ export function useStreamWorkspaceHandlers(args: StreamWorkspaceHandlersArgs) {
       streamBinStatsRef.delete(panelId);
       streamBinStatsOverlayRef.set(panelId, new Map());
       streamBinStatsFitOverlayRef.set(panelId, new Map());
+      streamBinStatsHistOverlayRef.set(panelId, new Map());
       markPanelDirty(panelId);
     } else {
       streamBin2dRef.delete(panelId);
@@ -403,7 +408,20 @@ export function useStreamWorkspaceHandlers(args: StreamWorkspaceHandlersArgs) {
         const titlePatch = entry.titleAuto
           ? { title: autoPanelTitle(workspace, nextOutputId, entry.title) }
           : {};
-        return { ...entry, ...titlePatch, outputId: nextOutputId };
+        // The new primary cannot also be drawn as its own overlay.
+        const histOverlayPatch = isStreamBinStatsPanel(entry)
+          ? {
+              histOverlayOutputIds: (entry.histOverlayOutputIds ?? []).filter(
+                (id) => id !== nextOutputId
+              ),
+            }
+          : {};
+        return {
+          ...entry,
+          ...titlePatch,
+          ...histOverlayPatch,
+          outputId: nextOutputId,
+        };
       })
     );
     if (isStreamScalarPanel(panel)) {
@@ -412,6 +430,7 @@ export function useStreamWorkspaceHandlers(args: StreamWorkspaceHandlersArgs) {
       streamBinStatsRef.delete(panelId);
       streamBinStatsOverlayRef.set(panelId, new Map());
       streamBinStatsFitOverlayRef.set(panelId, new Map());
+      streamBinStatsHistOverlayRef.set(panelId, new Map());
       markPanelDirty(panelId);
     } else {
       streamBin2dRef.delete(panelId);
@@ -425,6 +444,7 @@ export function useStreamWorkspaceHandlers(args: StreamWorkspaceHandlersArgs) {
           ? [
               ...(panel.overlayOutputIds ?? []),
               ...(panel.fitOverlayOutputIds ?? []),
+              ...(panel.histOverlayOutputIds ?? []),
             ]
           : []),
       ],
@@ -497,6 +517,28 @@ export function useStreamWorkspaceHandlers(args: StreamWorkspaceHandlersArgs) {
     });
   };
 
+  const setStreamBinStatsHistOverlayOutputs = (
+    panelId: string,
+    outputIds: string[]
+  ) => {
+    const next = outputIds
+      .map((value) => String(value ?? "").trim())
+      .filter((value) => value.length > 0);
+    setPanels((prev) =>
+      prev.map((panel) =>
+        panel.id === panelId && isStreamBinStatsPanel(panel)
+          ? { ...panel, histOverlayOutputIds: next }
+          : panel
+      )
+    );
+    streamBinStatsHistOverlayRef.set(panelId, new Map());
+    markPanelDirty(panelId);
+    dispatchStreamAnalysisHydrationInvalidation({
+      workspaceId: panelWorkspaceId(panelId),
+      outputIds: next,
+    });
+  };
+
   return {
     setStreamTracePanelSourceMode,
     setStreamTracePanelWorkspace,
@@ -507,5 +549,6 @@ export function useStreamWorkspaceHandlers(args: StreamWorkspaceHandlersArgs) {
     setStreamParamsPanelOutputs,
     setStreamBinStatsOverlayOutputs,
     setStreamBinStatsFitOverlayOutputs,
+    setStreamBinStatsHistOverlayOutputs,
   };
 }

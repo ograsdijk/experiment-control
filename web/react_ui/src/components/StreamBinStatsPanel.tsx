@@ -26,6 +26,21 @@ export const BIN_STATS_FIT_OVERLAY_COLORS = [
   "#f4c542",
 ];
 
+// Histogram overlays get their own palette so a "condition A vs B" panel
+// does not reuse the trace-overlay colours. The band is the same colour at
+// low alpha (8-digit hex).
+export const BIN_STATS_HIST_OVERLAY_COLORS = [
+  "#e8590c",
+  "#2f9e44",
+  "#c2255c",
+  "#7048e8",
+  "#0c8599",
+];
+
+export function binStatsHistOverlayColor(idx: number): string {
+  return BIN_STATS_HIST_OVERLAY_COLORS[idx % BIN_STATS_HIST_OVERLAY_COLORS.length];
+}
+
 export function binStatsMeanStroke(isDark: boolean): string {
   return isDark ? "#86c1ff" : "#1f5bbf";
 }
@@ -46,10 +61,21 @@ export type StreamBinStatsFitOverlay = {
   y: number[];
 };
 
+/**
+ * Another histogram drawn on the primary's axes with its own bins and
+ * uncertainty band. `series` is null until the first update arrives; the
+ * slot is kept so the plot topology and colours do not shift.
+ */
+export type StreamBinStatsHistOverlay = {
+  label: string;
+  series: StreamBinStatsSeries | null;
+};
+
 type StreamBinStatsPanelProps = {
   panelId?: string;
   series: StreamBinStatsSeries | null;
   overlaySeries?: Array<{ label: string; values: number[] }>;
+  histOverlays?: StreamBinStatsHistOverlay[];
   fitOverlays?: StreamBinStatsFitOverlay[];
   xLabel: string;
   uncertaintyMode: UncertaintyMode;
@@ -243,38 +269,119 @@ export function buildFitOverlayData(
   return out;
 }
 
+type PlotColumn = Array<number | null>;
+
+export type BinStatsPlotData = {
+  /** uPlot aligned data: x, lower, upper, mean, trace overlays, then
+   * lower/upper/mean per histogram overlay. */
+  columns: PlotColumn[];
+  traceOverlayLabels: string[];
+  histOverlayLabels: string[];
+};
+
+/**
+ * Put the primary histogram, its trace overlays and any histogram
+ * overlays on one x axis. Histograms with different bins (e.g. the same
+ * scan split by a shot condition, where one half has not reached a scan
+ * point yet) are merged onto the sorted union of their x values; a series
+ * is null where it has no bin. Trace overlays stay index-aligned to the
+ * primary's bins, as before.
+ */
+export function buildBinStatsPlotData(
+  primary: StreamBinStatsSeries | null,
+  traceOverlays: Array<{ label: string; values: number[] }>,
+  histOverlays: StreamBinStatsHistOverlay[],
+  mode: UncertaintyMode,
+  scale: number,
+  xOffset = 0,
+  xScale = 1
+): BinStatsPlotData {
+  const primaryBand = buildBandData(primary, mode, scale, xOffset, xScale);
+  const traceBuilt = buildOverlayData(primaryBand[0], traceOverlays);
+  const histBands = histOverlays.map((overlay) =>
+    buildBandData(overlay.series, mode, scale, xOffset, xScale)
+  );
+  const traceOverlayLabels = traceBuilt.map((entry) => entry.label);
+  const histOverlayLabels = histOverlays.map(
+    (overlay) => String(overlay.label ?? "").trim() || "histogram"
+  );
+  if (histBands.every((band) => band[0].length === 0)) {
+    // No overlay data: the primary's own x is the axis, as before overlays.
+    const n = primaryBand[0].length;
+    const empty = (): PlotColumn => new Array(n).fill(null);
+    return {
+      columns: [
+        ...primaryBand,
+        ...traceBuilt.map((entry) => entry.values),
+        ...histBands.flatMap(() => [empty(), empty(), empty()]),
+      ],
+      traceOverlayLabels,
+      histOverlayLabels,
+    };
+  }
+
+  // Merge x values that agree to float precision, as the backend's
+  // hist.divide does, so the same scan point from two histograms shares
+  // one axis position.
+  const allX = [primaryBand[0], ...histBands.map((band) => band[0])]
+    .flat()
+    .sort((a, b) => a - b);
+  const unionX: number[] = [];
+  const position = new Map<number, number>();
+  for (const xv of allX) {
+    const last = unionX[unionX.length - 1];
+    const tol = Math.max(1e-12, 1e-12 * Math.max(Math.abs(xv), Math.abs(last ?? 0)));
+    if (unionX.length === 0 || Math.abs(xv - last) > tol) {
+      unionX.push(xv);
+    }
+    position.set(xv, unionX.length - 1);
+  }
+  const place = (sourceX: number[], values: number[]): PlotColumn => {
+    const out: PlotColumn = new Array(unionX.length).fill(null);
+    for (let i = 0; i < sourceX.length; i += 1) {
+      const idx = position.get(sourceX[i]);
+      const v = values[i];
+      if (idx !== undefined && Number.isFinite(v)) {
+        out[idx] = v;
+      }
+    }
+    return out;
+  };
+  const columns: PlotColumn[] = [
+    unionX,
+    place(primaryBand[0], primaryBand[1]),
+    place(primaryBand[0], primaryBand[2]),
+    place(primaryBand[0], primaryBand[3]),
+    ...traceBuilt.map((entry) => place(primaryBand[0], entry.values)),
+  ];
+  for (const band of histBands) {
+    columns.push(
+      place(band[0], band[1]),
+      place(band[0], band[2]),
+      place(band[0], band[3])
+    );
+  }
+  return { columns, traceOverlayLabels, histOverlayLabels };
+}
+
 export function computeStreamBinStatsAutoYRange(
   input: StreamBinStatsSeries | null,
   mode: UncertaintyMode,
   scale: number,
   overlays: Array<{ label: string; values: number[] }> = [],
-  fitOverlays: StreamBinStatsFitOverlay[] = []
+  fitOverlays: StreamBinStatsFitOverlay[] = [],
+  histOverlays: StreamBinStatsHistOverlay[] = []
 ): { min: number; max: number } | null {
-  const built = buildBandData(input, mode, scale);
-  if (built[0].length <= 0) {
+  const built = buildBinStatsPlotData(input, overlays, histOverlays, mode, scale);
+  if (built.columns[0].length <= 0) {
     return null;
   }
-  const overlayBuilt = buildOverlayData(built[0], overlays);
   const fitOverlayBuilt = buildFitOverlayData(fitOverlays);
   let minY = Number.POSITIVE_INFINITY;
   let maxY = Number.NEGATIVE_INFINITY;
-  for (let si = 1; si < built.length; si += 1) {
-    const series = built[si];
-    for (const value of series) {
-      if (!Number.isFinite(value)) {
-        continue;
-      }
-      if (value < minY) {
-        minY = value;
-      }
-      if (value > maxY) {
-        maxY = value;
-      }
-    }
-  }
-  for (const overlay of overlayBuilt) {
-    for (const value of overlay.values) {
-      if (!Number.isFinite(value)) {
+  for (let si = 1; si < built.columns.length; si += 1) {
+    for (const value of built.columns[si]) {
+      if (value === null || !Number.isFinite(value)) {
         continue;
       }
       if (value < minY) {
@@ -312,6 +419,7 @@ export function StreamBinStatsPanel({
   panelId,
   series,
   overlaySeries = [],
+  histOverlays = [],
   fitOverlays = [],
   xLabel,
   uncertaintyMode,
@@ -330,6 +438,7 @@ export function StreamBinStatsPanel({
   const plotRef = useRef<uPlot | null>(null);
   const fitOverlayDataRef = useRef<StreamBinStatsFitOverlay[]>([]);
   const overlayLabelsRef = useRef<string[]>([]);
+  const histOverlayLabelsRef = useRef<string[]>([]);
   const tooltipRef = useRef<HTMLDivElement | null>(null);
   const isDark = colorScheme === "dark";
 
@@ -347,36 +456,42 @@ export function StreamBinStatsPanel({
     };
   }, []);
 
-  const data = useMemo(
+  const plotData = useMemo(
     () =>
       perfMeasure("bin_stats.conversion_ms", () =>
-        buildBandData(series, uncertaintyMode, uncertaintyScale, xOffset, xScale)
+        buildBinStatsPlotData(
+          series,
+          overlaySeries,
+          histOverlays,
+          uncertaintyMode,
+          uncertaintyScale,
+          xOffset,
+          xScale
+        )
       ),
-    [series, uncertaintyMode, uncertaintyScale, xOffset, xScale, tick]
-  );
-  const overlayData = useMemo(
-    () => buildOverlayData(data[0] ?? [], overlaySeries),
-    [data, overlaySeries, tick]
+    [
+      series,
+      overlaySeries,
+      histOverlays,
+      uncertaintyMode,
+      uncertaintyScale,
+      xOffset,
+      xScale,
+      tick,
+    ]
   );
   const fitOverlayData = useMemo(
     () => buildFitOverlayData(fitOverlays, xOffset, xScale),
     [fitOverlays, xOffset, xScale, tick]
   );
-  const fullData = useMemo(
-    () => [
-      data[0],
-      data[1],
-      data[2],
-      data[3],
-      ...overlayData.map((entry) => entry.values),
-    ],
-    [data, overlayData]
-  );
+  const fullData = plotData.columns;
   const plotDataRef = useRef<uPlot.AlignedData>(fullData as uPlot.AlignedData);
   plotDataRef.current = fullData as uPlot.AlignedData;
   const overlaySeriesCount = overlaySeries.length;
+  const histOverlayCount = histOverlays.length;
   fitOverlayDataRef.current = fitOverlayData;
-  overlayLabelsRef.current = overlayData.map((entry) => entry.label);
+  overlayLabelsRef.current = plotData.traceOverlayLabels;
+  histOverlayLabelsRef.current = plotData.histOverlayLabels;
 
   const hasManualY = useMemo(() => {
     if (yScaleMode !== "manual") {
@@ -420,6 +535,41 @@ export function StreamBinStatsPanel({
       points: { show: false },
       value: (_u: uPlot, v: number | Date | null) => formatNumber(v),
     }));
+    // Each histogram overlay is lower, upper, mean: the same shape as the
+    // primary. spanGaps joins across x values only the other histograms
+    // have.
+    const histOverlayFirstIdx = 4 + overlaySeriesCount;
+    const histOverlaySeriesDefs: uPlot.Series[] = [];
+    const histOverlayBands: uPlot.Band[] = [];
+    for (let idx = 0; idx < histOverlayCount; idx += 1) {
+      const color = binStatsHistOverlayColor(idx);
+      const bandEdge = (): uPlot.Series => ({
+        label: `histogram ${idx + 1} band`,
+        stroke: `${color}55`,
+        width: 1,
+        spanGaps: true,
+        points: { show: false },
+      });
+      histOverlaySeriesDefs.push(bandEdge(), bandEdge(), {
+        label: `histogram ${idx + 1}`,
+        stroke: color,
+        width: 2,
+        spanGaps: true,
+        points: {
+          show: showBinMarkers,
+          size: 6,
+          width: 2,
+          stroke: color,
+          fill: meanPointFill,
+        },
+        value: (_u: uPlot, v: number | Date | null) => formatNumber(v),
+      });
+      const lowerIdx = histOverlayFirstIdx + idx * 3;
+      histOverlayBands.push({
+        series: [lowerIdx + 1, lowerIdx],
+        fill: `${color}29`,
+      });
+    }
     const fitOverlayPlugin: uPlot.Plugin = {
       hooks: {
         draw: [
@@ -488,18 +638,19 @@ export function StreamBinStatsPanel({
       const lowerV = u.data[1]?.[idx];
       const upperV = u.data[2]?.[idx];
       const meanV = u.data[3]?.[idx];
-      if (!Number.isFinite(xv as number) || !Number.isFinite(meanV as number)) {
+      if (!Number.isFinite(xv as number)) {
         hideTooltip();
         return;
       }
-      const lines = [
-        `x: ${formatNumber(xv as number)}`,
-        `mean: ${formatNumber(meanV as number)}`,
-      ];
-      if (Number.isFinite(lowerV as number) && Number.isFinite(upperV as number)) {
-        lines.push(
-          `range: ${formatNumber(lowerV as number)} to ${formatNumber(upperV as number)}`
-        );
+      const lines = [`x: ${formatNumber(xv as number)}`];
+      // The merged x axis can hold points only a histogram overlay has.
+      if (Number.isFinite(meanV as number)) {
+        lines.push(`mean: ${formatNumber(meanV as number)}`);
+        if (Number.isFinite(lowerV as number) && Number.isFinite(upperV as number)) {
+          lines.push(
+            `range: ${formatNumber(lowerV as number)} to ${formatNumber(upperV as number)}`
+          );
+        }
       }
       overlayLabelsRef.current.forEach((label, i) => {
         const v = u.data[4 + i]?.[idx];
@@ -507,6 +658,24 @@ export function StreamBinStatsPanel({
           lines.push(`${label}: ${formatNumber(v as number)}`);
         }
       });
+      const histFirst = 4 + overlayLabelsRef.current.length;
+      histOverlayLabelsRef.current.forEach((label, i) => {
+        const lo = u.data[histFirst + i * 3]?.[idx];
+        const hi = u.data[histFirst + i * 3 + 1]?.[idx];
+        const v = u.data[histFirst + i * 3 + 2]?.[idx];
+        if (!Number.isFinite(v as number)) {
+          return;
+        }
+        const spread =
+          Number.isFinite(lo as number) && Number.isFinite(hi as number)
+            ? ` ± ${formatNumber(((hi as number) - (lo as number)) / 2)}`
+            : "";
+        lines.push(`${label}: ${formatNumber(v as number)}${spread}`);
+      });
+      if (lines.length <= 1) {
+        hideTooltip();
+        return;
+      }
       el.textContent = "";
       lines.forEach((line) => {
         const row = document.createElement("div");
@@ -550,18 +719,21 @@ export function StreamBinStatsPanel({
           label: "lower",
           stroke: bandStroke,
           width: 1,
+          spanGaps: true,
           points: { show: false },
         },
         {
           label: "upper",
           stroke: bandStroke,
           width: 1,
+          spanGaps: true,
           points: { show: false },
         },
         {
           label: "mean",
           stroke: meanStroke,
           width: 2,
+          spanGaps: true,
           points: {
             show: showBinMarkers,
             size: 6,
@@ -572,8 +744,9 @@ export function StreamBinStatsPanel({
           value: (_u: uPlot, v: number | Date | null) => formatNumber(v),
         },
         ...overlaySeriesDefs,
+        ...histOverlaySeriesDefs,
       ],
-      bands: [{ series: [2, 1], fill: bandFill }],
+      bands: [{ series: [2, 1], fill: bandFill }, ...histOverlayBands],
       legend: { show: false, live: false },
       scales: {
         x: { time: false },
@@ -624,6 +797,7 @@ export function StreamBinStatsPanel({
   }, [
     formatNumber,
     hasManualY,
+    histOverlayCount,
     isDark,
     overlaySeriesCount,
     plotHeight,

@@ -177,6 +177,7 @@ function makeHelpers(): PanelsGridHelpers {
     streamExtraChannelSeries: () => [],
     streamBinStatsOverlaySeries: () => [],
     streamBinStatsFitOverlayCurves: () => [],
+    streamBinStatsHistOverlaySeries: () => [],
     isExpandablePlotPanel: () => true,
     copyTextToClipboard: async () => {},
   };
@@ -226,6 +227,7 @@ function makeHandlers(
     setStreamParamsPanelOutputs: noop,
     setStreamBinStatsOverlayOutputs: noop,
     setStreamBinStatsFitOverlayOutputs: noop,
+    setStreamBinStatsHistOverlayOutputs: noop,
     setStreamBinStatsUncertainty: noop,
     setStreamBinStatsShowBinMarkers: noop,
     setStreamBinStatsXAxisTransform: noop,

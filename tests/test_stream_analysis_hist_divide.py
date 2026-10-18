@@ -529,6 +529,43 @@ class HistogramDivideTests(unittest.TestCase):
         )
         self.assertIsNone(execute_hist_divide(numerator, denominator))
 
+    def test_align_auto_bins_aligns_without_strict_counts(self) -> None:
+        numerator = self.hist(
+            x=[1.0, 3.0], mean=[10.0, 30.0], std=[1.0, 1.0], sem=[0.1, 0.1], count=[4, 2]
+        )
+        denominator = self.hist(
+            x=[1.0, 2.0],
+            mean=[2.0, 3.0],
+            std=[0.5, 0.5],
+            sem=[0.2, 0.2],
+            count=[3, 3],
+        )
+        out = execute_hist_divide(numerator, denominator, {"align_auto_bins": True})
+        self.assertIsNotNone(out)
+        assert out is not None
+        self.assertEqual(out["x_bins"], [1.0, 2.0, 3.0])
+        # Unequal counts are allowed; bins on one side only stay empty.
+        self.assertEqual(out["mean"], [5.0, None, None])
+        self.assertEqual(out["count"], [3, 0, 0])
+        self.assertEqual(out["populated_bin_count"], 1)
+        self.assertFalse(out["require_equal_counts"])
+
+    def test_align_auto_bins_needs_auto_range_on_both_sides(self) -> None:
+        numerator = self.hist(
+            x=[1.0], mean=[10.0], std=[1.0], sem=[0.1], count=[1]
+        )
+        numerator["auto_range"] = False
+        denominator = self.hist(
+            x=[1.0, 2.0],
+            mean=[2.0, 3.0],
+            std=[0.5, 0.5],
+            sem=[0.2, 0.2],
+            count=[1, 1],
+        )
+        self.assertIsNone(
+            execute_hist_divide(numerator, denominator, {"align_auto_bins": True})
+        )
+
     def test_zero_denominator_marks_bin_unpopulated(self) -> None:
         numerator = self.hist(
             x=[1.0],
