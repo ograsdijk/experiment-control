@@ -120,6 +120,139 @@ body::before {
   overflow: hidden;
 }
 
+/* Health accent on sidebar cards: a coloured left edge, nothing for OK/neutral. */
+.device-card.device-card-health-failed {
+  box-shadow: inset 4px 0 0 var(--mantine-color-red-6), var(--shadow);
+}
+
+.device-card.device-card-health-stale,
+.device-card.device-card-health-degraded {
+  box-shadow: inset 4px 0 0 var(--mantine-color-orange-5), var(--shadow);
+}
+
+.resource-issues-toggle {
+  border-radius: 6px;
+  padding: 1px 6px;
+  margin: -1px -6px;
+}
+
+.resource-issues-toggle:hover {
+  background: var(--mantine-color-default-hover);
+}
+
+.resource-issues-toggle-active {
+  background: var(--mantine-color-orange-light);
+}
+
+.resource-health-mark {
+  display: inline-block;
+  width: 1em;
+  text-align: center;
+  font-weight: 700;
+}
+
+.resource-health-mark-healthy {
+  color: var(--mantine-color-teal-6);
+}
+
+.resource-health-mark-failed {
+  color: var(--mantine-color-red-6);
+}
+
+.resource-health-mark-stale,
+.resource-health-mark-degraded,
+.resource-health-mark-transition {
+  color: var(--mantine-color-orange-6);
+}
+
+.resource-health-mark-neutral,
+.resource-health-mark-unknown {
+  color: var(--mantine-color-dimmed);
+}
+
+.resource-overview-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: 10px;
+  align-items: stretch;
+}
+
+.resource-overview-tile {
+  display: block;
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: var(--card);
+  border: 1px solid var(--card-border);
+  border-left-width: 4px;
+  min-width: 0;
+  transition: border-color 120ms ease, box-shadow 120ms ease;
+}
+
+.resource-overview-tile:hover {
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.12);
+}
+
+.resource-overview-tile-healthy {
+  border-left-color: var(--mantine-color-teal-6);
+}
+
+.resource-overview-tile-failed {
+  border-left-color: var(--mantine-color-red-6);
+  background: color-mix(in srgb, var(--mantine-color-red-6) 7%, var(--card));
+}
+
+.resource-overview-tile-stale,
+.resource-overview-tile-degraded,
+.resource-overview-tile-transition {
+  border-left-color: var(--mantine-color-orange-5);
+}
+
+.resource-overview-tile-issue.resource-overview-tile-stale,
+.resource-overview-tile-issue.resource-overview-tile-degraded,
+.resource-overview-tile-issue.resource-overview-tile-neutral {
+  background: color-mix(in srgb, var(--mantine-color-orange-5) 7%, var(--card));
+}
+
+.resource-overview-tile-issue.resource-overview-tile-neutral {
+  border-left-color: var(--mantine-color-orange-5);
+}
+
+.resource-overview-tile-selected {
+  border-color: var(--mantine-color-indigo-5);
+  box-shadow: 0 0 0 2px var(--mantine-color-indigo-5);
+}
+
+.resource-overview-row {
+  cursor: pointer;
+}
+
+.resource-overview-table th,
+.resource-overview-table td {
+  white-space: nowrap;
+}
+
+.resource-overview-table td.resource-overview-error-cell {
+  max-width: 360px;
+}
+
+.resource-overview-row-selected {
+  background: var(--mantine-color-indigo-light);
+}
+
+.resource-overview-th {
+  font-weight: 600;
+  font-size: inherit;
+  white-space: nowrap;
+}
+
+.resource-overview-detail {
+  width: min(420px, 40vw);
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
 .device-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));

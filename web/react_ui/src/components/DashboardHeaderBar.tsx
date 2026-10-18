@@ -18,6 +18,7 @@ import {
   IconDatabase,
   IconFileText,
   IconExternalLink,
+  IconLayoutGrid,
   IconPencil,
   IconRefresh,
   IconSettings,
@@ -168,6 +169,9 @@ type Props = {
   onRunSequencerPrimaryAction: () => Promise<unknown> | void;
   sequencerLoaded: boolean;
   onOpenProcesses: () => Promise<unknown> | void;
+  onOpenDeviceOverview: () => void;
+  deviceIssueCount: number;
+  deviceFailedCount: number;
   stateMachineButtonSummary: {
     color: string;
     tooltip: string;
@@ -243,6 +247,9 @@ export function DashboardHeaderBar({
   onRunSequencerPrimaryAction,
   sequencerLoaded,
   onOpenProcesses,
+  onOpenDeviceOverview,
+  deviceIssueCount,
+  deviceFailedCount,
   stateMachineButtonSummary,
   onOpenStateMachines,
   interlockButtonSummary,
@@ -676,6 +683,22 @@ export function DashboardHeaderBar({
           )}
         </Group>
         <Group gap="xs">
+          <Button
+            size="xs"
+            variant="light"
+            color={deviceFailedCount > 0 ? "red" : deviceIssueCount > 0 ? "orange" : "gray"}
+            leftSection={<IconLayoutGrid size={14} />}
+            onClick={onOpenDeviceOverview}
+            title={
+              deviceIssueCount > 0
+                ? `Device overview (o): ${deviceIssueCount} device${
+                    deviceIssueCount === 1 ? "" : "s"
+                  } need attention`
+                : "Device overview (o)"
+            }
+          >
+            {deviceIssueCount > 0 ? `Devices (${deviceIssueCount})` : "Devices"}
+          </Button>
           <Button
             size="xs"
             variant="light"

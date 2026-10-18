@@ -2,6 +2,7 @@
   AppShell,
   ActionIcon,
   Badge,
+  Box,
   Button,
   Card,
   Group,
@@ -17,6 +18,7 @@
   Popover,
   Switch,
   SegmentedControl,
+  Tooltip,
   useComputedColorScheme,
   useMantineColorScheme,
 } from "@mantine/core";
@@ -24,16 +26,19 @@ import { DndContext } from "@dnd-kit/core";
 import { SortableContext, rectSortingStrategy } from "@dnd-kit/sortable";
 import { notifications } from "@mantine/notifications";
 import {
+  IconChartLine,
   IconCheck,
   IconChevronLeft,
   IconChevronRight,
   IconCpu,
+  IconDots,
   IconFileText,
   IconArrowsMaximize,
   IconPlayerPause,
   IconPlayerPlay,
   IconShieldCheck,
   IconSettings,
+  IconLayoutGrid,
   IconPencil,
   IconPlug,
   IconRefresh,
@@ -72,6 +77,8 @@ import { AppModalsLayer } from "./components/AppModalsLayer";
 import { CommandDeckPanel } from "./components/CommandDeckPanel";
 import { DashboardHeaderBar } from "./components/DashboardHeaderBar";
 import { DeviceCard } from "./components/DeviceCard";
+import { ResourceListToolbar, isTypingTarget } from "./components/ResourceListToolbar";
+import { DeviceOverviewModal } from "./components/DeviceOverviewModal";
 import { DeviceNameInline } from "./components/DeviceNameInline";
 import { coerceParamValue } from "./components/ParamInput";
 import { PlotPanel, computeTelemetryAutoYRange } from "./components/PlotPanel";
@@ -159,6 +166,8 @@ import { useWorkspaceStoreActions } from "./features/stream_analysis/useWorkspac
 import { useWorkspaceListManagement } from "./features/stream_analysis/useWorkspaceListManagement";
 import { useDaqWorkspaceApply } from "./features/stream_analysis/useDaqWorkspaceApply";
 import { useDevicesContext } from "./features/devices/DevicesContext";
+import { deviceHealth } from "./features/devices/health";
+import { useDeviceListView } from "./features/devices/useDeviceListView";
 import { useCommands } from "./features/commands/CommandsContext";
 import { useCommandDeckMutations } from "./features/commands/useCommandDeckMutations";
 import { useCommandDeckRunner } from "./features/commands/useCommandDeckRunner";
@@ -1116,9 +1125,29 @@ export function App() {
     }
   };
 
+  const deviceListView = useDeviceListView(orderedDevices);
+  const [deviceOverviewOpened, setDeviceOverviewOpened] = useState(false);
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "o" || event.ctrlKey || event.metaKey || event.altKey) {
+        return;
+      }
+      // Only from the bare dashboard: never while typing or over another modal.
+      if (isTypingTarget(event.target) || document.querySelector('[aria-modal="true"]')) {
+        return;
+      }
+      event.preventDefault();
+      setDeviceOverviewOpened(true);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
+
   useAdaptivePolling({
     enabled: true,
-    intervalMs: 5000,
+    // Faster refresh while the overview is open so heartbeat ages tick visibly.
+    intervalMs: deviceOverviewOpened ? 1500 : 5000,
     poll: (signal) => fetchDevices(signal),
     onValue: setDevices,
     equality: sameDeviceStatuses,
@@ -2923,6 +2952,104 @@ export function App() {
     );
   };
 
+  const renderDeviceCard = (device: DeviceStatus) => (
+    <DeviceCard
+      device={device}
+      busy={Boolean(deviceBusyById[device.device_id])}
+      onConnect={() => handleDeviceConnect(device.device_id)}
+      onDisconnect={() => handleDeviceDisconnect(device.device_id)}
+      onRestart={() => handleDeviceRestart(device.device_id)}
+      onPlot={(signal) => onPlotSignal(device.device_id, signal)}
+      onCommand={() => openCommand(device.device_id)}
+      telemetryCollapsed={Boolean(
+        telemetryCollapsedByDevice[device.device_id]
+      )}
+      onTelemetryToggle={() =>
+        handleDeviceTelemetryToggle(device.device_id)
+      }
+      pinnedCommands={pinnedCommands[device.device_id] ?? []}
+      onPinnedCommand={(action) => openCommand(device.device_id, action)}
+      onAddPinnedToDeck={(action) => {
+        const draftKey = pinnedCommandKey(device.device_id, action);
+        const label =
+          (pinnedCommands[device.device_id] ?? []).find(
+            (entry) => entry.action === action
+          )?.label ?? undefined;
+        addCommandDeckCommandEntry({
+          targetKind: "device",
+          targetId: device.device_id,
+          action,
+          label,
+          paramsDraft: { ...(pinnedParamDrafts[draftKey] ?? {}) },
+        });
+        notifications.show({
+          color: "teal",
+          title: "Added to command deck",
+          message: `${device.device_id}.${action}`,
+        });
+      }}
+      onAddAllPinnedToDeck={() => {
+        const entries = pinnedCommands[device.device_id] ?? [];
+        if (entries.length === 0) {
+          notifications.show({
+            color: "yellow",
+            title: "No pinned commands",
+            message: `${device.device_id} has no pinned commands.`,
+          });
+          return;
+        }
+        for (const entry of entries) {
+          const action = entry.action;
+          const draftKey = pinnedCommandKey(device.device_id, action);
+          addCommandDeckCommandEntry({
+            targetKind: "device",
+            targetId: device.device_id,
+            action,
+            label: entry.label ?? undefined,
+            paramsDraft: { ...(pinnedParamDrafts[draftKey] ?? {}) },
+          });
+        }
+        notifications.show({
+          color: "teal",
+          title: "Added pinned commands to deck",
+          message: `${device.device_id}: ${entries.length} command${
+            entries.length === 1 ? "" : "s"
+          }`,
+        });
+      }}
+      capabilities={capabilitiesByDevice[device.device_id] ?? []}
+      pinnedParamValuesByAction={Object.fromEntries(
+        (pinnedCommands[device.device_id] ?? []).map((entry) => [
+          entry.action,
+          pinnedParamDrafts[
+            pinnedCommandKey(device.device_id, entry.action)
+          ] ?? {},
+        ])
+      )}
+      pinnedBusyByAction={Object.fromEntries(
+        (pinnedCommands[device.device_id] ?? []).map((entry) => [
+          entry.action,
+          Boolean(
+            pinnedBusyByKey[
+              pinnedCommandKey(device.device_id, entry.action)
+            ]
+          ),
+        ])
+      )}
+      onPinnedParamChange={(action, paramName, value) =>
+        handlePinnedParamChange(
+          device.device_id,
+          action,
+          paramName,
+          value
+        )
+      }
+      onPinnedSend={(action) =>
+        handlePinnedCommandSend(device.device_id, action)
+      }
+    />
+  );
+
   return (
     <DndContext
       sensors={dndSensors}
@@ -2976,6 +3103,9 @@ export function App() {
         sequencerPrimaryIcon={sequencerPrimaryIcon}
         onRunSequencerPrimaryAction={() => runSequencerAction(sequencerPrimaryAction)}
         sequencerLoaded={sequencerLoaded}
+        onOpenDeviceOverview={() => setDeviceOverviewOpened(true)}
+        deviceIssueCount={deviceListView.summary.issues}
+        deviceFailedCount={deviceListView.summary.failed}
         onOpenProcesses={async () => {
           setProcessOpen(true);
           await refreshProcesses();
@@ -3090,8 +3220,8 @@ export function App() {
             }${isResizing ? " device-panel-resizing" : ""}`}
             style={{ width: isDevicePanelCollapsed ? 0 : navWidth }}
           >
-            <Group mb="sm" justify="space-between" align="center">
-              <Group gap={8} align="center">
+            <Group mb="sm" justify="space-between" align="center" wrap="nowrap">
+              <Group gap={8} align="center" wrap="nowrap">
                 <SegmentedControl
                   size="xs"
                   value={devicePanelTab}
@@ -3105,45 +3235,61 @@ export function App() {
                 />
                 {devicePanelTab === "devices" ? (
                   <>
-                    <Button
-                      size="compact-xs"
-                      variant="light"
-                      color="indigo"
-                      loading={deviceStartAllBusy}
-                      disabled={disableStartAllButton}
-                      onClick={async () => {
-                        await handleStartAllDevices();
-                      }}
-                    >
-                      Start all
-                    </Button>
-                    <Button
-                      size="compact-xs"
-                      variant="light"
-                      color="teal"
-                      loading={deviceConnectAllBusy}
-                      disabled={disableConnectAllButton}
-                      onClick={async () => {
-                        await handleConnectAllDevices();
-                      }}
-                    >
-                      Connect all
-                    </Button>
-                    {orderedDevices.length > 0 ? (
-                      <Button
-                        size="compact-xs"
-                        variant="subtle"
-                        color="gray"
-                        onClick={handleToggleAllDeviceTelemetry}
-                        title={
-                          anyDeviceTelemetryExpanded
-                            ? "Collapse telemetry on every device"
-                            : "Expand telemetry on every device"
-                        }
+                    <Tooltip label="Device overview (o)" withArrow>
+                      <ActionIcon
+                        size="sm"
+                        variant="light"
+                        color="indigo"
+                        onClick={() => setDeviceOverviewOpened(true)}
+                        aria-label="Open device overview"
                       >
-                        {anyDeviceTelemetryExpanded ? "Hide all" : "Show all"}
-                      </Button>
-                    ) : null}
+                        <IconLayoutGrid size={14} />
+                      </ActionIcon>
+                    </Tooltip>
+                    <Menu shadow="md" width={220} position="bottom-start" withArrow withinPortal>
+                      <Menu.Target>
+                        <ActionIcon
+                          size="sm"
+                          variant="subtle"
+                          color="gray"
+                          aria-label="Device bulk actions"
+                          title="Bulk actions"
+                          loading={deviceStartAllBusy || deviceConnectAllBusy}
+                        >
+                          <IconDots size={16} />
+                        </ActionIcon>
+                      </Menu.Target>
+                      <Menu.Dropdown>
+                        <Menu.Item
+                          leftSection={<IconPlayerPlay size={14} />}
+                          disabled={disableStartAllButton}
+                          onClick={() => {
+                            void handleStartAllDevices();
+                          }}
+                        >
+                          Start all drivers
+                        </Menu.Item>
+                        <Menu.Item
+                          leftSection={<IconPlug size={14} />}
+                          disabled={disableConnectAllButton}
+                          onClick={() => {
+                            void handleConnectAllDevices();
+                          }}
+                        >
+                          Connect all devices
+                        </Menu.Item>
+                        <Menu.Divider />
+                        <Menu.Item
+                          leftSection={<IconChartLine size={14} />}
+                          disabled={orderedDevices.length === 0}
+                          onClick={handleToggleAllDeviceTelemetry}
+                        >
+                          {anyDeviceTelemetryExpanded
+                            ? "Hide telemetry on all cards"
+                            : "Show telemetry on all cards"}
+                        </Menu.Item>
+                      </Menu.Dropdown>
+                    </Menu>
                   </>
                 ) : null}
               </Group>
@@ -3165,138 +3311,78 @@ export function App() {
                 >
                   <IconChevronLeft size={16} />
                 </ActionIcon>
-                {devicePanelTab === "devices" ? (
-                  <IconPlug size={16} />
-                ) : (
-                  <IconTerminal2 size={16} />
-                )}
-                <Text size="xs" c="dimmed">
-                  {devicePanelTab === "devices"
-                    ? connectedDeviceCount
-                    : commandDeck.length}
-                </Text>
+                {devicePanelTab === "deck" ? (
+                  <>
+                    <IconTerminal2 size={16} />
+                    <Text size="xs" c="dimmed">
+                      {commandDeck.length}
+                    </Text>
+                  </>
+                ) : null}
               </Group>
             </Group>
-            <ScrollArea h="calc(100vh - 180px)" type="never">
+            {devicePanelTab === "devices" ? (
+              <Box mb="sm">
+                <ResourceListToolbar
+                  view={deviceListView}
+                  noun="devices"
+                  healthyTitle="Online and OK"
+                  focusHotkey
+                />
+              </Box>
+            ) : null}
+            <ScrollArea
+              h={
+                devicePanelTab === "devices"
+                  ? "calc(100vh - 248px)"
+                  : "calc(100vh - 180px)"
+              }
+              type="never"
+            >
               {devicePanelTab === "devices" ? (
                 <SortableContext
-                  items={orderedDevices.map((device) =>
+                  items={deviceListView.visibleDevices.map((device) =>
                     deviceSortableId(device.device_id)
                   )}
                   strategy={rectSortingStrategy}
                 >
+                {orderedDevices.length > 0 &&
+                deviceListView.visibleDevices.length === 0 ? (
+                  <Stack align="center" gap={6} py="lg">
+                    <Text size="sm" c="dimmed">
+                      No devices match the current filter.
+                    </Text>
+                    <Button
+                      size="compact-xs"
+                      variant="light"
+                      onClick={() => {
+                        deviceListView.setQuery("");
+                        deviceListView.setIssuesOnly(false);
+                      }}
+                    >
+                      Clear filter
+                    </Button>
+                  </Stack>
+                ) : null}
                 <div
                   className="device-grid"
                   ref={deviceGridRef}
                 >
-                  {orderedDevices.map((device, idx) => (
+                  {deviceListView.visibleDevices.map((device, idx) => (
                     <ReorderableCardShell
                       key={device.device_id}
                       id={deviceSortableId(device.device_id)}
                       data={{ kind: "device", deviceId: device.device_id }}
-                      className="device-card"
+                      className={`device-card device-card-health-${deviceHealth(device)}`}
                       dataDeviceCardId={device.device_id}
                       dragHandleTitle="Drag from border to reorder devices"
+                      dragDisabled={deviceListView.filtered}
                       style={{
                         position: "relative",
                         animationDelay: `${idx * 45}ms`,
                       }}
                     >
-                      <DeviceCard
-                        device={device}
-                        busy={Boolean(deviceBusyById[device.device_id])}
-                        onConnect={() => handleDeviceConnect(device.device_id)}
-                        onDisconnect={() => handleDeviceDisconnect(device.device_id)}
-                        onRestart={() => handleDeviceRestart(device.device_id)}
-                        onPlot={(signal) => onPlotSignal(device.device_id, signal)}
-                        onCommand={() => openCommand(device.device_id)}
-                        telemetryCollapsed={Boolean(
-                          telemetryCollapsedByDevice[device.device_id]
-                        )}
-                        onTelemetryToggle={() =>
-                          handleDeviceTelemetryToggle(device.device_id)
-                        }
-                        pinnedCommands={pinnedCommands[device.device_id] ?? []}
-                        onPinnedCommand={(action) => openCommand(device.device_id, action)}
-                        onAddPinnedToDeck={(action) => {
-                          const draftKey = pinnedCommandKey(device.device_id, action);
-                          const label =
-                            (pinnedCommands[device.device_id] ?? []).find(
-                              (entry) => entry.action === action
-                            )?.label ?? undefined;
-                          addCommandDeckCommandEntry({
-                            targetKind: "device",
-                            targetId: device.device_id,
-                            action,
-                            label,
-                            paramsDraft: { ...(pinnedParamDrafts[draftKey] ?? {}) },
-                          });
-                          notifications.show({
-                            color: "teal",
-                            title: "Added to command deck",
-                            message: `${device.device_id}.${action}`,
-                          });
-                        }}
-                        onAddAllPinnedToDeck={() => {
-                          const entries = pinnedCommands[device.device_id] ?? [];
-                          if (entries.length === 0) {
-                            notifications.show({
-                              color: "yellow",
-                              title: "No pinned commands",
-                              message: `${device.device_id} has no pinned commands.`,
-                            });
-                            return;
-                          }
-                          for (const entry of entries) {
-                            const action = entry.action;
-                            const draftKey = pinnedCommandKey(device.device_id, action);
-                            addCommandDeckCommandEntry({
-                              targetKind: "device",
-                              targetId: device.device_id,
-                              action,
-                              label: entry.label ?? undefined,
-                              paramsDraft: { ...(pinnedParamDrafts[draftKey] ?? {}) },
-                            });
-                          }
-                          notifications.show({
-                            color: "teal",
-                            title: "Added pinned commands to deck",
-                            message: `${device.device_id}: ${entries.length} command${
-                              entries.length === 1 ? "" : "s"
-                            }`,
-                          });
-                        }}
-                        capabilities={capabilitiesByDevice[device.device_id] ?? []}
-                        pinnedParamValuesByAction={Object.fromEntries(
-                          (pinnedCommands[device.device_id] ?? []).map((entry) => [
-                            entry.action,
-                            pinnedParamDrafts[
-                              pinnedCommandKey(device.device_id, entry.action)
-                            ] ?? {},
-                          ])
-                        )}
-                        pinnedBusyByAction={Object.fromEntries(
-                          (pinnedCommands[device.device_id] ?? []).map((entry) => [
-                            entry.action,
-                            Boolean(
-                              pinnedBusyByKey[
-                                pinnedCommandKey(device.device_id, entry.action)
-                              ]
-                            ),
-                          ])
-                        )}
-                        onPinnedParamChange={(action, paramName, value) =>
-                          handlePinnedParamChange(
-                            device.device_id,
-                            action,
-                            paramName,
-                            value
-                          )
-                        }
-                        onPinnedSend={(action) =>
-                          handlePinnedCommandSend(device.device_id, action)
-                        }
-                      />
+                      {renderDeviceCard(device)}
                     </ReorderableCardShell>
                   ))}
                 </div>
@@ -3661,6 +3747,12 @@ export function App() {
         }}
       />
 
+      <DeviceOverviewModal
+        opened={deviceOverviewOpened}
+        onClose={() => setDeviceOverviewOpened(false)}
+        devices={orderedDevices}
+        renderDeviceCard={renderDeviceCard}
+      />
       <AppModalsLayer
         hdf={hdfController}
         influx={influxController}
