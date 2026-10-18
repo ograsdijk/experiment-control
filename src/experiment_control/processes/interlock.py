@@ -262,6 +262,18 @@ def _collect_routes(rulesets: list[Ruleset]) -> list[Json]:
     return routes
 
 
+def _check_request_command(req: Json) -> Any:
+    """The command to check: top level when sent by the manager's interceptor
+    chain, inside ``params`` for generic process calls (e.g. the web UI's
+    dry-run "check a command")."""
+    command = req.get("command")
+    if command is None:
+        params_in = req.get("params")
+        if isinstance(params_in, dict):
+            command = params_in.get("command")
+    return command
+
+
 def _rule_matches(rule: Rule, device_id: str, action: str) -> bool:
     if rule.device_id != "*" and rule.device_id != device_id:
         return False
@@ -1177,14 +1189,7 @@ class InterlockProcess(ManagedProcessBase):
 
     def _rpc_interlock_check(self, req: Json) -> Json:
         req_id = req.get("request_id")
-        command = req.get("command")
-        if command is None:
-            # Generic process calls (e.g. the web UI's dry-run "check a
-            # command") wrap arguments in params; the manager's interceptor
-            # chain sends the command at the top level.
-            params_in = req.get("params")
-            if isinstance(params_in, dict):
-                command = params_in.get("command")
+        command = _check_request_command(req)
         if not isinstance(command, dict):
             return {
                 "request_id": req_id,
