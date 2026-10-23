@@ -81,6 +81,21 @@ class StepDurationStats:
             self._representative.add(duration_s)
         self._overall.add(duration_s)
 
+    @property
+    def has_measurements(self) -> bool:
+        return self._overall.count > 0
+
+    def measured(self, step: Any) -> tuple[int, float] | None:
+        """(executions finished, mean seconds) of `step`, None if none yet."""
+        entry = self._by_step.get(id(step))
+        if entry is None or entry.step is not step or not entry.mean.count:
+            return None
+        return entry.mean.count, entry.mean.mean_s
+
+    def run_counts(self) -> dict[int, int]:
+        """Executions finished so far per step (by `id`), for a later diff."""
+        return {key: entry.mean.count for key, entry in self._by_step.items()}
+
     def estimate(self, step: Any, kind: str) -> float | None:
         """Expected duration of one execution of `step`.
 
