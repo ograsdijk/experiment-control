@@ -1228,6 +1228,22 @@ async def telemetry_snapshot() -> dict[str, Any]:
     return await _route_request(payload)
 
 
+@app.get("/api/snapshots/telemetry/{device_id}")
+async def device_telemetry_snapshot(device_id: str) -> dict[str, Any]:
+    """Latest telemetry for one device, shaped like ``devices[device_id]``.
+
+    Pollers that need a single device should use this instead of the full
+    snapshot, which makes the manager serialize every device per request.
+    """
+    resp = await _route_request({"type": "manager.telemetry.get", "device_id": device_id})
+    if not resp.get("ok"):
+        return resp
+    return {
+        "ok": True,
+        "result": {"device_id": device_id, "telemetry": resp.get("telemetry") or {}},
+    }
+
+
 _STREAM_AXIS_TTL_S = 60.0
 _STREAM_AXIS_RPC_TIMEOUT_MS = 1500
 
