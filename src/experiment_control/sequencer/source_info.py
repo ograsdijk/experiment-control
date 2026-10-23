@@ -131,6 +131,38 @@ def step_summary(step: Step) -> str | None:
     return None
 
 
+def step_bodies(step: Step, path: str) -> list[tuple[str, list[Step], str | None]]:
+    """A step's nested step lists: (path, steps, branch label).
+
+    The single source of step paths below a step (`<path>.for.do[...]`,
+    `<path>.if.else[...]`, ...), shared by source info and `sequencer.plan`.
+    A `use` step has none: its sequence is not part of the step's YAML.
+    """
+    if isinstance(step, ForStep):
+        return [(f"{path}.for.do", step.body, None)]
+    if isinstance(step, RepeatStep):
+        return [(f"{path}.repeat.do", step.body, None)]
+    if isinstance(step, IfStep):
+        return [
+            (f"{path}.if.then", step.then_steps, "then"),
+            (f"{path}.if.else", step.else_steps or [], "else"),
+        ]
+    if isinstance(step, WhileStep):
+        return [(f"{path}.while.do", step.body, None)]
+    if isinstance(step, AtomicStep):
+        return [(f"{path}.atomic.do", step.body, None)]
+    if isinstance(step, ParallelStep):
+        return [(f"{path}.parallel.do", step.body, None)]
+    if isinstance(step, TryStep):
+        return [
+            (f"{path}.try.do", step.body, None),
+            (f"{path}.try.finally", step.finally_steps, "finally"),
+        ]
+    if isinstance(step, AdaptiveStep):
+        return [(f"{path}.adaptive.do", step.body, None)]
+    return []
+
+
 def _walk_source_info(
     steps: list[Step],
     *,
@@ -151,27 +183,8 @@ def _walk_source_info(
             summary=step_summary(step),
             branch=branch,
         )
-        if isinstance(step, ForStep):
-            _walk_source_info(step.body, path=f"{step_path}.for.do", source=source, line_map=line_map, out=out)
-        elif isinstance(step, RepeatStep):
-            _walk_source_info(step.body, path=f"{step_path}.repeat.do", source=source, line_map=line_map, out=out)
-        elif isinstance(step, IfStep):
-            _walk_source_info(step.then_steps, path=f"{step_path}.if.then", source=source, line_map=line_map, out=out, branch="then")
-            _walk_source_info(step.else_steps or [], path=f"{step_path}.if.else", source=source, line_map=line_map, out=out, branch="else")
-        elif isinstance(step, WhileStep):
-            _walk_source_info(step.body, path=f"{step_path}.while.do", source=source, line_map=line_map, out=out)
-        elif isinstance(step, AtomicStep):
-            _walk_source_info(step.body, path=f"{step_path}.atomic.do", source=source, line_map=line_map, out=out)
-        elif isinstance(step, ParallelStep):
-            _walk_source_info(step.body, path=f"{step_path}.parallel.do", source=source, line_map=line_map, out=out)
-        elif isinstance(step, TryStep):
-            _walk_source_info(step.body, path=f"{step_path}.try.do", source=source, line_map=line_map, out=out)
-            _walk_source_info(step.finally_steps, path=f"{step_path}.try.finally", source=source, line_map=line_map, out=out, branch="finally")
-        elif isinstance(step, UseStep):
-            # A use step's referenced sequence is not part of this YAML source.
-            continue
-        elif isinstance(step, AdaptiveStep):
-            _walk_source_info(step.body, path=f"{step_path}.adaptive.do", source=source, line_map=line_map, out=out)
+        for body_path, body, body_branch in step_bodies(step, step_path):
+            _walk_source_info(body, path=body_path, source=source, line_map=line_map, out=out, branch=body_branch)
 
 
 def build_step_source_info(

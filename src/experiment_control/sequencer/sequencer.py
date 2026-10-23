@@ -3171,6 +3171,16 @@ class SequencerProcess(ManagedProcessBase):
                     "overrides applied, and evaluate template expressions against them."
                 ),
             ),
+            method(
+                "sequencer.plan",
+                params=[
+                    param("vars_override", required=False, default=None, annotation="dict"),
+                ],
+                doc=(
+                    "How often each step of the loaded sequence runs, with how sure "
+                    "each count is; during a run also runs so far and mean step time."
+                ),
+            ),
             method("sequencer.status", params=None, doc="Get sequencer status."),
             method(
                 "sequencer.library.list",
@@ -3883,6 +3893,20 @@ class SequencerProcess(ManagedProcessBase):
             },
         )
 
+    def _rpc_sequencer_plan(self, req: Json) -> Json:
+        params = req.get("params", {}) or {}
+        if not isinstance(params, dict):
+            return self.rpc_invalid_params(req)
+        overrides = params.get("vars_override") or {}
+        if not isinstance(overrides, dict):
+            return self.rpc_invalid_params(req, message="vars_override must be a dict")
+        if not self._runtime.is_loaded:
+            return self.rpc_err(req, code="not_loaded", message="no sequence loaded")
+        result = self._runtime.plan(vars_override=overrides)
+        result["loaded_source"] = self._loaded_sequence_source
+        result["loaded_revision"] = self._loaded_revision
+        return self.rpc_ok(req, result=json_safe(result))
+
     def _build_rpc_registry(self) -> RpcDispatchRegistry:
         handlers = {
             "process.capabilities": self._rpc_sequencer_capabilities,
@@ -3903,6 +3927,7 @@ class SequencerProcess(ManagedProcessBase):
             "sequencer.stop": self._rpc_sequencer_stop,
             "sequencer.run_events": self._rpc_sequencer_run_events,
             "sequencer.resolve_vars": self._rpc_sequencer_resolve_vars,
+            "sequencer.plan": self._rpc_sequencer_plan,
         }
         return RpcDispatchRegistry(
             handlers=handlers,
