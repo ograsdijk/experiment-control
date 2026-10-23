@@ -3321,8 +3321,13 @@ class StreamAnalysisProcess(ManagedProcessBase):
         include_ts: bool = True,
         severity: str | None = None,
         device_id: str | None = None,
+        payload_is_clean: bool = False,
     ) -> None:
-        safe_payload = _sanitize_json(payload)
+        # Hot-path callers (per-shot outputs) pass payload_is_clean=True when
+        # every value was sanitised at build time; the recursive walk then
+        # only costs time. json_dumps (orjson, OPT_SERIALIZE_NUMPY) also maps
+        # NaN/Inf to null, so this is a belt-and-braces pass for other callers.
+        safe_payload = dict(payload) if payload_is_clean else _sanitize_json(payload)
         if severity is not None and "severity" not in safe_payload:
             safe_payload["severity"] = str(severity)
         if device_id is not None and "device_id" not in safe_payload:
@@ -4957,7 +4962,9 @@ class StreamAnalysisProcess(ManagedProcessBase):
     ) -> tuple[Json, None, bool] | None:
         if not include_hist_outputs or not isinstance(raw_value, dict):
             return None
-        return _sanitize_json(dict(raw_value)), None, False
+        # BinStatsState / BinRatioStatsState / Bin2DStatsState.payload() and
+        # execute_hist_divide already return _sanitize_json'd dicts.
+        return dict(raw_value), None, False
 
     @staticmethod
     def _normalize_workspace_map_output(
@@ -5057,11 +5064,18 @@ class StreamAnalysisProcess(ManagedProcessBase):
             payload["context_id"] = int(context_id)
         if context_fields:
             payload["context_fields"] = _sanitize_json(dict(context_fields))
-        self._remember_latest_output(payload)
+        # Every field is already JSON-clean here: scalar values come from
+        # _normalize_float (finite or dropped), hist/hist2d values are
+        # sanitised by their state's payload() / execute_hist_divide, map
+        # outputs by _normalize_workspace_map_output, context_fields just
+        # above, and the header fields are ints/strs. Skip the two further
+        # recursive walks (snapshot store + publish) on this per-shot path.
+        self._remember_latest_output_clean(payload)
 
         self._publish_manager_event(
             topic="manager.stream_analysis.output",
             payload=payload,
+            payload_is_clean=True,
         )
 
     def _publish_trace_output_update(
