@@ -385,6 +385,9 @@ export function AppModalsLayer({
         editorLabel={sequencerController.sequencerEditorLabel}
         pauseInfo={sequencerController.sequencerStatus?.pause ?? null}
         runEvents={sequencerController.sequencerRunEvents}
+        plan={sequencerController.sequencerPlan}
+        planError={sequencerController.sequencerPlanError}
+        loops={sequencerController.sequencerLoops}
         autoloadError={sequencerController.sequencerStatus?.autoloadError ?? null}
         statusError={sequencerController.sequencerStatus?.error ?? null}
         modalError={sequencerController.sequencerModalError}

@@ -23,6 +23,7 @@ Tabs:
 - **Steps**: the step tree, with an inspector for the selected step.
 - **Variables**: `vars` and `context_columns`.
 - **YAML**: the full sequence text (CodeMirror edit mode or read-only preview).
+- **Timeline**: what the loaded sequence does, as a flame graph that wraps (see below).
 
 Value fields keep a local draft: text is written to the YAML on blur or Enter, and Escape discards it. Edits rewrite only the changed part of a step, so the rest of the YAML keeps its formatting, comments and number spelling.
 
@@ -111,6 +112,18 @@ The highlight follows `sequencer.status` (polled every 1.5 s), so during a fast 
 - the editor text is not the loaded sequence (edited since loading, or another sequence was loaded since)
 - the step belongs to a `use:` sub-sequence (its lines are in another file)
 - the step line is not one the step tree recognizes
+
+## Timeline
+
+The **Timeline** tab draws the loaded sequence as a flame graph: every step is a block, and each loop or other container (`try`, `finally`, `atomic`, an opened `use:`) is a band above the blocks it holds, so nesting reads top to bottom. Blocks wrap onto more lines instead of running off one; a band that goes on to the next line has a dashed end and an arrow, and starts the next line with `↳`. All blocks are the same width, since most step times are unknown before a run. The branches of an `if` and of a `parallel` sit side by side in one block.
+
+The counts come from `sequencer.plan`. Each block shows how often it runs in total (`×660`) and, where it is known, its time: a sleep's length, a `wait_until`'s timeout (`≤ 1:00`), or during and after a run the measured average. A loop's band shows its passes per run and, up to 48 passes, one square per pass. Counts that are not certain are marked: `≈` for approximate (an `if` decided only while running, a `while`), a striped band end for a loop whose passes are only known while running, `×?` where the count is unknown (`adaptive`). A loop over a list a call returns is counted from the list the call was given (`prepare_targets` given `freq_grid_hz`); the line under the summary says so. The summary also gives the total step runs, the time in sleeps, the longest the waits can take, and, once steps have been measured, the expected time at those averages. While idle the counts use the sidebar's run overrides.
+
+The bar above the graph covers the whole run: steps outside any loop make one segment, every outermost loop one segment divided into its passes (labelled by number; the tooltip has the loop's values once the run is in it, in the order a shuffled loop visits them), and `finally` its own segment. Loops inside loops are not divided; the headline names them instead (`freq_hz 6 of 11 · x 3 of 4`).
+
+During a run the running block is outlined, the bands of the loops it is inside are underlined, and blocks already done in the current pass are dimmed; each block shows runs so far against its total. Finished steps before the main loop fold into one block (a finished loop with them); click it to open it again. A `use:` block opens to show the sub-sequence's steps. Clicking any other block opens it in the Steps tab. Once steps have measured times, a bar under the graph splits one pass of the main loop by time.
+
+The timeline describes the loaded sequence, so it is not shown while the editor holds other text.
 
 ## Sequence Loaded Elsewhere
 

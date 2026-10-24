@@ -1,3 +1,5 @@
+import type { SequencerLoopStatus } from "./plan";
+
 export type SequencerAdaptiveStudyStatus = {
   controllerKind: string | null;
   trialCount: number;
@@ -38,6 +40,8 @@ export type SequencerStatus = {
   varsOverride?: Record<string, unknown> | null;
   /** Scalar runtime variables (loop variables, assign, extract) of the run. */
   env?: Record<string, unknown> | null;
+  /** Loops the run is inside, outermost first (`status.loops`). */
+  loops?: SequencerLoopStatus[];
 };
 
 export type SequencerPauseTrigger = {

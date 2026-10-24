@@ -154,7 +154,8 @@ export function sameSequencerStatus(
       JSON.stringify(current.runEvents ?? null) === JSON.stringify(next.runEvents ?? null) &&
       JSON.stringify(current.varsOverride ?? null) ===
         JSON.stringify(next.varsOverride ?? null) &&
-      JSON.stringify(current.env ?? null) === JSON.stringify(next.env ?? null)
+      JSON.stringify(current.env ?? null) === JSON.stringify(next.env ?? null) &&
+      JSON.stringify(current.loops ?? []) === JSON.stringify(next.loops ?? [])
   );
 }
 

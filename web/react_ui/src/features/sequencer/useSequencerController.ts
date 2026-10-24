@@ -13,6 +13,8 @@ import { useAdaptivePolling } from "../polling/useAdaptivePolling";
 import { editorMatchesLoadedRevision, revisionAction } from "./loaded_revision";
 import { useSequencerRunEvents } from "./useSequencerRunEvents";
 import { useResolvedVars } from "./useResolvedVars";
+import { normalizeSequencerLoops } from "./plan";
+import { useSequencerPlan } from "./useSequencerPlan";
 import {
   overridesForDisplay,
   scalarEnv,
@@ -412,6 +414,7 @@ export function useSequencerController({
           vars?: unknown;
           vars_override?: unknown;
           env?: unknown;
+          loops?: unknown;
           error?: unknown;
           error_detail?: unknown;
           cleanup_active?: unknown;
@@ -559,6 +562,7 @@ export function useSequencerController({
                 ? (result.vars_override as Record<string, unknown>)
                 : null,
             env: scalarEnv(result.env),
+            loops: normalizeSequencerLoops(result.loops),
           };
           if (sameSequencerStatus(current, nextStatus)) {
             return prev;
@@ -1721,6 +1725,16 @@ export function useSequencerController({
     }),
     [sequencerResolvedVars, sequencerLiveEnv, sequencerDisplayOverrides.nextRun]
   );
+  const sequencerPlanState = useSequencerPlan({
+    callProcessFn,
+    processId: sequencerProcess?.process_id ?? null,
+    enabled: sequencerOpen && sequencerLoaded,
+    loadedRevision: sequencerStatusRevision,
+    runId: sequencerStatus?.runId ?? null,
+    runtimeState: sequencerRuntimeState,
+    completedSteps: sequencerCompletedSteps,
+    overrides: sequencerOverrideEvaluation.isValid ? sequencerOverrideEvaluation.payload : {},
+  });
   const sequencerPrimaryAction: "start" | "pause" | "resume" =
     sequencerRuntimeState === "RUNNING" || sequencerRuntimeState === "STOP_REQUESTED"
       ? "pause"
@@ -1804,6 +1818,9 @@ export function useSequencerController({
     sequencerValueContext,
     sequencerEditorLabel,
     sequencerRunEvents,
+    sequencerPlan: sequencerPlanState.plan,
+    sequencerPlanError: sequencerPlanState.error,
+    sequencerLoops: sequencerStatus?.loops ?? [],
     sequencerModalError,
     sequencerAdaptiveModes,
     sequencerAdaptiveClearBusy,
