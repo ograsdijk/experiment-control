@@ -4,6 +4,7 @@ import type { LogEntry } from "../../types";
 import { logsReconnectDelayMs } from "./useLogsStream";
 import {
   acceptNewLogEntries,
+  filterLogRows,
   formatLogTime,
   formatWallTimeSeconds,
   logEntryKey,
@@ -132,5 +133,30 @@ describe("logs WebSocket reconnect backoff", () => {
     expect([0, 1, 2, 3, 10].map(logsReconnectDelayMs)).toEqual([
       1000, 2000, 4000, 8000, 30000,
     ]);
+  });
+});
+
+describe("filterLogRows", () => {
+  const rows: LogEntry[] = [
+    { severity: "info", source_kind: "driver", device_id: "a", message: "hello", ts: { t_mono: 1 } },
+    { severity: "error", source_kind: "process", process_id: "p", message: "boom", ts: { t_mono: 2 } },
+    { severity: "error", source_kind: "driver", device_id: "b", message: "Hello again", ts: { t_mono: 3 } },
+  ];
+  const all = {
+    severity: "all",
+    sourceKind: "all",
+    deviceId: "all",
+    processId: "all",
+    text: "",
+    newestFirst: false,
+  };
+
+  it("applies every filter and the sort order without mutating input", () => {
+    expect(filterLogRows(rows, { ...all, severity: "error" })).toHaveLength(2);
+    expect(filterLogRows(rows, { ...all, sourceKind: "driver", text: "HELLO" })).toHaveLength(2);
+    expect(filterLogRows(rows, { ...all, deviceId: "b" })[0].ts?.t_mono).toBe(3);
+    expect(filterLogRows(rows, { ...all, processId: "p" })[0].message).toBe("boom");
+    expect(filterLogRows(rows, { ...all, newestFirst: true }).map((r) => r.ts?.t_mono)).toEqual([3, 2, 1]);
+    expect(rows[0].ts?.t_mono).toBe(1);
   });
 });

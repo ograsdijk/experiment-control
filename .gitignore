@@ -26,3 +26,4 @@ web/react_ui/dist/
 .tmp_tests/
 .state/
 logs/
+!web/react_ui/src/features/logs/

@@ -17,7 +17,7 @@ import type { useStateMachinesController } from "../features/state_machines/useS
 import type { useProcessCommandController } from "../features/processes/useProcessCommandController";
 import type { useProcessesController } from "../features/processes/useProcessesController";
 import type { useSequencerController } from "../features/sequencer/useSequencerController";
-import type { CapabilityMember, DeviceStatus, LogEntry, StreamCatalogEntry } from "../types";
+import type { CapabilityMember, DeviceStatus, StreamCatalogEntry } from "../types";
 import type { TelemetrySignal } from "../types";
 import type { HdfMeasurementNoteModal } from "./HdfMeasurementNoteModal";
 
@@ -118,16 +118,12 @@ type Props = {
   logsOpen: boolean;
   setLogsOpen: Dispatch<SetStateAction<boolean>>;
   logsWsConnected: boolean;
-  filteredLogRows: LogEntry[];
-  logRows: LogEntry[];
   logAutoScroll: boolean;
   setLogAutoScroll: Dispatch<SetStateAction<boolean>>;
   logSortNewestFirst: boolean;
   setLogSortNewestFirst: Dispatch<SetStateAction<boolean>>;
   logLoading: boolean;
   loadLogTail: () => Promise<unknown> | void;
-  logSeenRef: MutableRefObject<Set<string>>;
-  setLogRows: Dispatch<SetStateAction<LogEntry[]>>;
   setExpandedLogByKey: Dispatch<SetStateAction<Record<string, boolean>>>;
   logSeverityFilter: string;
   setLogSeverityFilter: Dispatch<SetStateAction<string>>;
@@ -186,16 +182,12 @@ export function AppModalsLayer({
   logsOpen,
   setLogsOpen,
   logsWsConnected,
-  filteredLogRows,
-  logRows,
   logAutoScroll,
   setLogAutoScroll,
   logSortNewestFirst,
   setLogSortNewestFirst,
   logLoading,
   loadLogTail,
-  logSeenRef,
-  setLogRows,
   setExpandedLogByKey,
   logSeverityFilter,
   setLogSeverityFilter,
@@ -482,16 +474,12 @@ export function AppModalsLayer({
           opened={logsOpen}
         onClose={() => setLogsOpen(false)}
         connected={logsWsConnected}
-        filteredRows={filteredLogRows}
-        totalRows={logRows.length}
         autoScroll={logAutoScroll}
         onAutoScrollChange={setLogAutoScroll}
         sortNewestFirst={logSortNewestFirst}
         onSortNewestFirstChange={setLogSortNewestFirst}
         loading={logLoading}
         loadLogTail={loadLogTail}
-        logSeenRef={logSeenRef}
-        setLogRows={setLogRows}
         setExpandedLogByKey={setExpandedLogByKey}
         severityFilter={logSeverityFilter}
         onSeverityFilterChange={setLogSeverityFilter}

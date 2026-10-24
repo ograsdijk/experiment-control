@@ -5,6 +5,10 @@ import { normalizeStreamFrameMessage } from "../stream/messages";
 import { decimateTraceValues } from "../stream/utils";
 import type { RawStreamSubscription } from "../stream/types";
 import type { StreamFrameMessage } from "../../types";
+import {
+  openReconnectingSocket,
+  type ReconnectingSocket,
+} from "../common/reconnectingSocket";
 import { perfCount } from "../performance/perfInstrumentation";
 import { markPanelsDirty } from "../panels/PanelInvalidationStore";
 import {
@@ -29,11 +33,13 @@ import {
  *    current server-side snapshot is fetched again even if the
  *    subscription key itself did not change.
  *
- * 2. **Live WS** — for each active subscription, open a
- *    `/ws/raw_stream` WebSocket and feed each incoming frame to
- *    `applyFrame`. Tracks open-socket count so the returned
- *    `wsConnected` flag reflects whether *any* socket is currently
- *    open.
+ * 2. **Live WS** — for each socket group (subscriptions sharing the
+ *    same stream parameters), keep a `/ws/raw_stream` WebSocket that
+ *    reconnects with backoff and feeds each frame to `applyFrame`.
+ *    Groups are diffed by key on subscription-set changes, and a
+ *    reconnect invalidates the group's hydration keys so the snapshot
+ *    reloads. `wsConnected` is true only while every expected socket
+ *    is open.
  *
  * `applyFrame` returns the exact changed panel IDs, which the hook coalesces
  * before targeted invalidation. When the
@@ -74,6 +80,65 @@ function binaryValuesFromFrame(
   return new Float64Array(data);
 }
 
+type RawFrame = NonNullable<ReturnType<typeof normalizeStreamFrameMessage>>;
+
+type RawSocketGroup = {
+  url: string;
+  subscriptions: RawStreamSubscription[];
+  socket: ReconnectingSocket;
+};
+
+function rawSocketUrl(subscriptions: RawStreamSubscription[]): string {
+  const subscription = subscriptions[0];
+  const traceMaxPoints = Math.max(
+    ...subscriptions.map((entry) => entry.traceMaxPoints)
+  );
+  const params = new URLSearchParams();
+  params.set("device_id", subscription.deviceId);
+  params.set("stream", subscription.stream);
+  params.set("channel_index", String(subscription.channelIndex));
+  params.set("trace_decimator", subscription.traceDecimator);
+  params.set("trace_max_points", String(traceMaxPoints));
+  params.set("trace_max_fps", String(subscription.traceMaxFps));
+  params.set("rolling_window", String(subscription.rollingWindow));
+  params.set("trace_average_mode", subscription.averageMode);
+  params.set("transport", "binary");
+  return buildWsUrl(`/ws/raw_stream?${params.toString()}`);
+}
+
+function applyFrameToSubscriptions(
+  subscriptions: RawStreamSubscription[],
+  frame: RawFrame,
+  applyFrame: RawStreamSubscriptionsArgs["applyFrame"],
+  acceptFrame: (subscription: RawStreamSubscription, seq: number) => boolean
+) {
+  perfCount("raw_stream.frames");
+  const dirtyPanelIds = new Set<string>();
+  for (const subscription of subscriptions) {
+    if (
+      frame.deviceId !== subscription.deviceId ||
+      frame.stream !== subscription.stream
+    ) {
+      continue;
+    }
+    if (!acceptFrame(subscription, frame.seq)) {
+      continue;
+    }
+    const values = decimateTraceValues(
+      frame.values,
+      subscription.traceDecimator,
+      subscription.traceMaxPoints
+    );
+    const frameForSubscription = values
+      ? { ...frame, values, shape: [values.length] }
+      : frame;
+    for (const panelId of applyFrame(subscription, frameForSubscription)) {
+      dirtyPanelIds.add(panelId);
+    }
+  }
+  markPanelsDirty(dirtyPanelIds);
+}
+
 export function useRawStreamSubscriptions({
   activeSubscriptions,
   applyFrame,
@@ -82,6 +147,25 @@ export function useRawStreamSubscriptions({
   const [hydrationGeneration, setHydrationGeneration] = useState(0);
   const hydratedRef = useRef<Set<string>>(new Set());
   const invalidatedHydrationKeysRef = useRef<Set<string>>(new Set());
+  // Reconnect hydration races the reopened socket, and both may deliver the
+  // same newest frame. Track the last applied seq per subscription key so
+  // that exact repeat is dropped, and skip a reconnect snapshot entirely
+  // once live frames have resumed for that key. Only an exact repeat is
+  // dropped, so a device restart that resets seq still flows.
+  const lastAppliedSeqRef = useRef<Map<string, number>>(new Map());
+  const reconnectHydrationKeysRef = useRef<Set<string>>(new Set());
+  const reconnectInvalidatedKeysRef = useRef<Set<string>>(new Set());
+  const acceptLiveFrame = (subscription: RawStreamSubscription, seq: number) => {
+    const key = rawStreamSubscriptionKey(subscription);
+    if (lastAppliedSeqRef.current.get(key) === seq) {
+      return false;
+    }
+    lastAppliedSeqRef.current.set(key, seq);
+    reconnectHydrationKeysRef.current.delete(key);
+    return true;
+  };
+  const acceptLiveFrameRef = useRef(acceptLiveFrame);
+  acceptLiveFrameRef.current = acceptLiveFrame;
 
   // Stable refs to the callbacks so the effects below don't need
   // them in their dependency arrays.
@@ -149,6 +233,10 @@ export function useRawStreamSubscriptions({
     );
     hydratedRef.current = nextHydratedKeys;
     invalidatedHydrationKeysRef.current.clear();
+    // Keys this round reloads because their socket reconnected (as opposed
+    // to a panel clearing its buffers, which always takes the snapshot).
+    const invalidatedOnReconnect = new Set(reconnectInvalidatedKeysRef.current);
+    reconnectInvalidatedKeysRef.current.clear();
     if (pending.length <= 0) {
       return;
     }
@@ -175,6 +263,16 @@ export function useRawStreamSubscriptions({
           if (frame === null) {
             continue;
           }
+          if (invalidatedOnReconnect.has(key)) {
+            // The key is still pending only if no live frame has arrived
+            // since the socket reopened; once live data flows (or the
+            // snapshot repeats the frame just applied) it is redundant.
+            const noLiveFrameYet = reconnectHydrationKeysRef.current.delete(key);
+            if (!noLiveFrameYet || lastAppliedSeqRef.current.get(key) === frame.seq) {
+              continue;
+            }
+          }
+          lastAppliedSeqRef.current.set(key, frame.seq);
           for (const panelId of applyFrameRef.current(subscription, frame)) {
             dirtyPanelIds.add(panelId);
           }
@@ -193,26 +291,24 @@ export function useRawStreamSubscriptions({
     // its buffers and needs the current server snapshot loaded again.
   }, [subscriptionsKey, hydrationGeneration]);
 
-  // Live WS for each active subscription.
+  // Live sockets persist across subscription-set changes: one per socket
+  // group, diffed by group key so adding or removing a panel only opens or
+  // closes the sockets whose group actually changed.
+  const socketGroupsRef = useRef<Map<string, RawSocketGroup>>(new Map());
+
+  const updateConnected = () => {
+    const groups = socketGroupsRef.current;
+    // Connected only when every expected socket is open (vacuously true
+    // with no subscriptions: nothing to maintain, nothing to surface).
+    setWsConnected([...groups.values()].every((group) => group.socket.isOpen));
+  };
+  const updateConnectedRef = useRef(updateConnected);
+  updateConnectedRef.current = updateConnected;
+
   useEffect(() => {
-    const currentSubscriptions = activeSubscriptionsRef.current;
-    if (currentSubscriptions.length <= 0) {
-      setWsConnected(true);
-      return;
-    }
-    let disposed = false;
-    const sockets = new Map<string, WebSocket>();
-    const openIds = new Set<string>();
-
-    const updateConnected = () => {
-      if (disposed) {
-        return;
-      }
-      setWsConnected(openIds.size > 0);
-    };
-
+    const groups = socketGroupsRef.current;
     const subscriptionsByKey = new Map<string, RawStreamSubscription[]>();
-    for (const subscription of currentSubscriptions) {
+    for (const subscription of activeSubscriptionsRef.current) {
       const key = socketGroupKey(subscription);
       const peers = subscriptionsByKey.get(key);
       if (peers) {
@@ -222,118 +318,109 @@ export function useRawStreamSubscriptions({
       }
     }
 
-    const applyFrameToSubscriptions = (
-      subscriptions: RawStreamSubscription[],
-      frame: NonNullable<ReturnType<typeof normalizeStreamFrameMessage>>
-    ) => {
-      perfCount("raw_stream.frames");
-      const dirtyPanelIds = new Set<string>();
-      for (const subscription of subscriptions) {
-        if (
-          frame.deviceId !== subscription.deviceId ||
-          frame.stream !== subscription.stream
-        ) {
-          continue;
-        }
-        const values = decimateTraceValues(
-          frame.values,
-          subscription.traceDecimator,
-          subscription.traceMaxPoints
-        );
-        const frameForSubscription = values
-          ? { ...frame, values, shape: [values.length] }
-          : frame;
-        for (const panelId of applyFrameRef.current(subscription, frameForSubscription)) {
-          dirtyPanelIds.add(panelId);
-        }
+    for (const [key, group] of groups) {
+      const subscriptions = subscriptionsByKey.get(key);
+      if (!subscriptions || rawSocketUrl(subscriptions) !== group.url) {
+        group.socket.close();
+        groups.delete(key);
+      } else {
+        // Same socket parameters: keep the socket, refresh its consumers.
+        group.subscriptions = subscriptions;
       }
-      markPanelsDirty(dirtyPanelIds);
-    };
-
-    const onMessage = (subscriptions: RawStreamSubscription[]) => {
-      let pendingFrame: NonNullable<ReturnType<typeof normalizeStreamFrameMessage>> | null = null;
-      return (event: MessageEvent<string | ArrayBuffer>) => {
-        try {
-          if (typeof event.data === "string") {
-            const msg = JSON.parse(event.data) as StreamFrameMessage;
-            const frame = normalizeStreamFrameMessage(msg);
-            if (frame === null) {
-              pendingFrame = null;
-              return;
-            }
-            if (frame.encoding === "binary-frame") {
-              pendingFrame = frame;
-              return;
-            }
-            pendingFrame = null;
-            applyFrameToSubscriptions(subscriptions, frame);
-            return;
-          }
-          if (pendingFrame === null) {
-            return;
-          }
-          const values = binaryValuesFromFrame(pendingFrame, event.data);
-          if (values === null) {
-            pendingFrame = null;
-            return;
-          }
-          const frame = { ...pendingFrame, values, shape: [values.length] };
-          pendingFrame = null;
-          applyFrameToSubscriptions(subscriptions, frame);
-        } catch {
-          pendingFrame = null;
-          return;
-        }
-      };
-    };
-
-    for (const [socketKey, subscriptions] of subscriptionsByKey) {
-      const subscription = subscriptions[0];
-      const traceMaxPoints = Math.max(
-        ...subscriptions.map((entry) => entry.traceMaxPoints)
-      );
-      const params = new URLSearchParams();
-      params.set("device_id", subscription.deviceId);
-      params.set("stream", subscription.stream);
-      params.set("channel_index", String(subscription.channelIndex));
-      params.set("trace_decimator", subscription.traceDecimator);
-      params.set("trace_max_points", String(traceMaxPoints));
-      params.set("trace_max_fps", String(subscription.traceMaxFps));
-      params.set("rolling_window", String(subscription.rollingWindow));
-      params.set("trace_average_mode", subscription.averageMode);
-      params.set("transport", "binary");
-      const query = params.toString();
-      const ws = new WebSocket(buildWsUrl(`/ws/raw_stream?${query}`));
-      ws.binaryType = "arraybuffer";
-      ws.onopen = () => {
-        openIds.add(socketKey);
-        updateConnected();
-      };
-      ws.onclose = () => {
-        openIds.delete(socketKey);
-        updateConnected();
-      };
-      ws.onerror = () => {
-        openIds.delete(socketKey);
-        updateConnected();
-      };
-      ws.onmessage = onMessage(subscriptions);
-      sockets.set(socketKey, ws);
     }
 
-    updateConnected();
-    return () => {
-      disposed = true;
-      openIds.clear();
-      setWsConnected(false);
-      for (const ws of sockets.values()) {
-        ws.close();
+    for (const [key, subscriptions] of subscriptionsByKey) {
+      if (groups.has(key)) {
+        continue;
       }
-      sockets.clear();
-    };
+      const url = rawSocketUrl(subscriptions);
+      let pendingFrame: RawFrame | null = null;
+      const group: RawSocketGroup = {
+        url,
+        subscriptions,
+        socket: openReconnectingSocket({
+          url,
+          binaryType: "arraybuffer",
+          onOpen: ({ reconnect }) => {
+            pendingFrame = null;
+            if (reconnect) {
+              // Frames published while the socket was down are gone;
+              // reload the current server-side snapshot for its panels.
+              for (const subscription of group.subscriptions) {
+                const subscriptionKey = rawStreamSubscriptionKey(subscription);
+                invalidatedHydrationKeysRef.current.add(subscriptionKey);
+                reconnectInvalidatedKeysRef.current.add(subscriptionKey);
+                reconnectHydrationKeysRef.current.add(subscriptionKey);
+              }
+              setHydrationGeneration((value) => value + 1);
+            }
+            updateConnectedRef.current();
+          },
+          onClose: () => {
+            pendingFrame = null;
+            updateConnectedRef.current();
+          },
+          onMessage: (event: MessageEvent<string | ArrayBuffer>) => {
+            try {
+              if (typeof event.data === "string") {
+                const msg = JSON.parse(event.data) as StreamFrameMessage;
+                const frame = normalizeStreamFrameMessage(msg);
+                if (frame === null) {
+                  pendingFrame = null;
+                  return;
+                }
+                if (frame.encoding === "binary-frame") {
+                  pendingFrame = frame;
+                  return;
+                }
+                pendingFrame = null;
+                applyFrameToSubscriptions(
+                  group.subscriptions,
+                  frame,
+                  applyFrameRef.current,
+                  acceptLiveFrameRef.current
+                );
+                return;
+              }
+              if (pendingFrame === null) {
+                return;
+              }
+              const values = binaryValuesFromFrame(pendingFrame, event.data);
+              if (values === null) {
+                pendingFrame = null;
+                return;
+              }
+              const frame = { ...pendingFrame, values, shape: [values.length] };
+              pendingFrame = null;
+              applyFrameToSubscriptions(
+                  group.subscriptions,
+                  frame,
+                  applyFrameRef.current,
+                  acceptLiveFrameRef.current
+                );
+            } catch {
+              pendingFrame = null;
+            }
+          },
+        }),
+      };
+      groups.set(key, group);
+    }
+    updateConnectedRef.current();
     // subscriptionsKey only ticks on real set changes; unrelated panel
-    // edits no longer tear down and reopen every socket.
+    // edits leave the live sockets untouched.
   }, [subscriptionsKey]);
+
+  // Close every socket on unmount only; set changes are diffed above.
+  useEffect(() => {
+    const groups = socketGroupsRef.current;
+    return () => {
+      for (const group of groups.values()) {
+        group.socket.close();
+      }
+      groups.clear();
+    };
+  }, []);
 
   return { wsConnected };
 }

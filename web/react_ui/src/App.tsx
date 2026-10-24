@@ -103,7 +103,6 @@ import {
   type Bin2dReducer,
   type StreamBin2dSeries,
 } from "./components/StreamBin2dPanel";
-import { DagGraphPreview } from "./components/DagGraphPreview";
 import { WorkspaceCommandLayer } from "./components/WorkspaceCommandLayer";
 import { useCommandHistoryController } from "./features/commands/useCommandHistoryController";
 import { formatApiErrorToastMessage } from "./features/common/api_error";
@@ -115,8 +114,6 @@ import {
 import { detectGridColumns } from "./features/layout/serpentine";
 import { ReorderableCardShell } from "./features/layout/ReorderableCardShell";
 import {
-  acceptNewLogEntries,
-  logEntryKey,
   normalizeLogEntry,
   toPrettyJson,
   watchdogToastForLogEntry,
@@ -221,6 +218,7 @@ import { perfCount } from "./features/performance/perfInstrumentation";
 import { useAdaptivePolling } from "./features/polling/useAdaptivePolling";
 import {
   sameDeviceStatuses,
+  sameDeviceStatusesCoarse,
   sameStreamCatalog,
 } from "./features/polling/pollEquality";
 import { useLogsStream } from "./features/logs/useLogsStream";
@@ -374,7 +372,6 @@ const DEFAULT_NAV_WIDTH = 360;
 const NAV_MIN_WIDTH = 260;
 const NAV_MAX_WIDTH = 900;
 const PLOT_GRID_MOBILE_BREAKPOINT = 900;
-const MAX_LOG_ROWS = 2000;
 const MAX_STREAM_FRAME_BUFFER = 240;
 const STREAM_ANALYSIS_PROCESS_ID = "stream_analysis";
 type LatestSignals = Record<string, Record<string, TelemetrySignal>>;
@@ -597,12 +594,12 @@ export function App() {
     setInstanceCleanupBusy,
     settingsFileInputRef,
   } = useSettings();
-  // Log viewer state + the filtered-rows derivation moved to LogsContext
-  // (features/logs/LogsContext.tsx). WS subscription stays in App.tsx;
-  // useLogsStream is unchanged for downstream compatibility.
+  // Log viewer state moved to LogsContext (features/logs/LogsContext.tsx).
+  // The live roster lives in its LogRowStore (outside React state) and the
+  // filtered rows are derived inside the Logs modal, so a log line does not
+  // re-render App. WS subscription stays in App.tsx.
   const {
-    logRows,
-    setLogRows,
+    logStore,
     logSeverityFilter,
     setLogSeverityFilter,
     logSourceFilter,
@@ -621,11 +618,7 @@ export function App() {
     setLogLoading,
     expandedLogByKey,
     setExpandedLogByKey,
-    filteredLogRows,
-    logSeenRef,
     logScrollRef,
-    logRowsBaselineReadyRef,
-    logRowsLastKeyRef,
   } = useLogs();
   const [streamCatalog, setStreamCatalog] = useState<StreamCatalogEntry[]>([]);
   // activeUiDrag + setActiveUiDrag moved to useUiDragController (round 31).
@@ -659,8 +652,7 @@ export function App() {
   // plotGridRef + dragColumnsRef now provided by LayoutContext.
   // pinnedParamDrafts + pinnedBusyByKey now provided by CommandsContext
   // (destructured above).
-  // logSeenRef + logScrollRef + logRowsBaselineReadyRef +
-  // logRowsLastKeyRef now provided by LogsContext (destructured above).
+  // logScrollRef now provided by LogsContext (destructured above).
   const commandHistoryScrollRef = useRef<HTMLDivElement | null>(null);
   const commandHistoryBaselineReadyRef = useRef(false);
   const commandHistoryLastIdRef = useRef<string | null>(null);
@@ -719,8 +711,12 @@ export function App() {
     };
   }, []);
 
+  // Safety and State machines show live process heartbeat ages; they are
+  // controlled further down, so mirror their open state into this flag.
+  const [processStatusDetailOpen, setProcessStatusDetailOpen] = useState(false);
   const processesController = useProcessesController({
     callProcessFn: callProcess,
+    exactStatus: processStatusDetailOpen,
   });
 
   const {
@@ -768,10 +764,6 @@ export function App() {
     sendDeviceCommand,
     sendProcessCommand,
   } = commandHistoryController;
-  const logScrollItemKeys = useMemo(
-    () => filteredLogRows.map((entry) => logEntryKey(entry)),
-    [filteredLogRows]
-  );
   const commandHistoryScrollItemKeys = useMemo(() => {
     if (commandHistoryMode === "journal") {
       return filteredCommandJournalRows.map((row) => String(row.id));
@@ -788,14 +780,8 @@ export function App() {
     filteredCommandJournalRows,
     commandHistoryController.commandRestorePreviewRows,
   ]);
-  useFollowEdgeScroll({
-    viewportRef: logScrollRef,
-    opened: logsOpen,
-    enabled: logAutoScroll,
-    newestFirst: logSortNewestFirst,
-    itemKeys: logScrollItemKeys,
-    resetKey: `logs:${logSortNewestFirst}`,
-  });
+  // The Logs modal's follow-edge scroll runs inside LogsModalContainer,
+  // next to the filtered-row subscription it depends on.
   useFollowEdgeScroll({
     viewportRef: commandHistoryScrollRef,
     opened: commandHistoryOpen,
@@ -1025,7 +1011,7 @@ export function App() {
   const showDaqUi = streamAnalysisRpcReady;
   // activeRawStreamSubscriptions + activeStreamAnalysisWorkspaceSubscriptions
   // now live in usePanelDerivations() (destructured above).
-  // filteredLogRows now lives in LogsContext (destructured above).
+  // Filtered log rows are derived in LogsModalContainer (useFilteredLogRows).
   const resolvedApiBase = useMemo(() => {
     const configured = String(import.meta.env.VITE_API_BASE ?? "").trim();
     if (configured) {
@@ -1070,27 +1056,6 @@ export function App() {
   // UI profile import/export is wired below — see the useUiProfile
   // call after setDevicePanelCollapsed is defined (round 29).
 
-  const appendLogEntries = (entries: LogEntry[]): LogEntry[] => {
-    if (entries.length === 0) {
-      return [];
-    }
-    const accepted = acceptNewLogEntries(entries, logSeenRef.current);
-    if (accepted.length === 0) {
-      return [];
-    }
-    setLogRows((prev) => {
-      const next = [...prev, ...accepted];
-      if (next.length <= MAX_LOG_ROWS) {
-        return next;
-      }
-      const trimmed = next.slice(next.length - MAX_LOG_ROWS);
-      const keep = new Set(trimmed.map((entry) => logEntryKey(entry)));
-      logSeenRef.current = keep;
-      return trimmed;
-    });
-    return accepted;
-  };
-
   const loadLogTail = async () => {
     setLogLoading(true);
     try {
@@ -1109,8 +1074,7 @@ export function App() {
       const normalized = rawEntries
         .map((entry) => normalizeLogEntry(entry))
         .filter((entry): entry is LogEntry => entry !== null);
-      logSeenRef.current = new Set(normalized.map((entry) => logEntryKey(entry)));
-      setLogRows(normalized.slice(Math.max(0, normalized.length - MAX_LOG_ROWS)));
+      logStore.replace(normalized);
       setExpandedLogByKey({});
     } catch (error) {
       notifications.show({
@@ -1148,7 +1112,9 @@ export function App() {
     intervalMs: deviceOverviewOpened ? 1500 : 5000,
     poll: (signal) => fetchDevices(signal),
     onValue: setDevices,
-    equality: sameDeviceStatuses,
+    // Coarse age comparison keeps a ticking heartbeat age from re-rendering
+    // App every poll; the overview shows live ages, so it compares exactly.
+    equality: deviceOverviewOpened ? sameDeviceStatuses : sameDeviceStatusesCoarse,
     endpoint: "/api/devices",
   });
 
@@ -1643,28 +1609,6 @@ export function App() {
   }, [commandHistoryRows, commandHistoryOpen]);
 
   useEffect(() => {
-    const currentLastKey =
-      logRows.length > 0 ? logEntryKey(logRows[logRows.length - 1]) : null;
-    const previousLastKey = logRowsLastKeyRef.current;
-    if (!logRowsBaselineReadyRef.current) {
-      logRowsBaselineReadyRef.current = true;
-      logRowsLastKeyRef.current = currentLastKey;
-      return;
-    }
-    if (!logsOpen && currentLastKey !== previousLastKey) {
-      const previousIndex = logRows.findIndex(
-        (entry) => logEntryKey(entry) === previousLastKey
-      );
-      const appended =
-        previousIndex >= 0 ? logRows.slice(previousIndex + 1) : logRows;
-      if (appended.some((entry) => isErrorSeverity(entry.severity))) {
-        setLogsUnreadError(true);
-      }
-    }
-    logRowsLastKeyRef.current = currentLastKey;
-  }, [logRows, logsOpen]);
-
-  useEffect(() => {
     if (commandHistoryOpen) {
       setCommandUnreadError(false);
     }
@@ -1742,15 +1686,24 @@ export function App() {
     document.title = `Experiment Control ${instanceLabel}`;
   }, [instanceLabel]);
 
+  // Live lines arrive in coalesced batches and go straight into the log
+  // store; App itself re-renders only when the unread-error badge flips.
+  const logsOpenRef = useRef(logsOpen);
+  logsOpenRef.current = logsOpen;
   const { wsConnected: logsWsConnected } = useLogsStream({
-    onEntry: (entry) => {
-      const [accepted] = appendLogEntries([entry]);
-      if (!accepted) {
-        return;
+    trackEntries: false,
+    onEntries: (entries) => {
+      const accepted = logStore.append(entries);
+      let sawError = false;
+      for (const entry of accepted) {
+        const toast = watchdogToastForLogEntry(entry);
+        if (toast) {
+          notifications.show(toast);
+        }
+        sawError ||= isErrorSeverity(entry.severity);
       }
-      const toast = watchdogToastForLogEntry(accepted);
-      if (toast) {
-        notifications.show(toast);
+      if (sawError && !logsOpenRef.current) {
+        setLogsUnreadError(true);
       }
     },
   });
@@ -2024,6 +1977,12 @@ export function App() {
     ensureProcessCapabilitiesLoaded,
     callProcessFn: callProcess,
   });
+
+  useEffect(() => {
+    setProcessStatusDetailOpen(
+      interlocksOpen || stateMachinesController.stateMachinesOpen
+    );
+  }, [interlocksOpen, stateMachinesController.stateMachinesOpen]);
 
   const sequencerController = useSequencerController({
     sequencerProcess,
@@ -3791,16 +3750,12 @@ export function App() {
         logsOpen={logsOpen}
         setLogsOpen={setLogsOpen}
         logsWsConnected={logsWsConnected}
-        filteredLogRows={filteredLogRows}
-        logRows={logRows}
         logAutoScroll={logAutoScroll}
         setLogAutoScroll={setLogAutoScroll}
         logSortNewestFirst={logSortNewestFirst}
         setLogSortNewestFirst={setLogSortNewestFirst}
         logLoading={logLoading}
         loadLogTail={loadLogTail}
-        logSeenRef={logSeenRef}
-        setLogRows={setLogRows}
         setExpandedLogByKey={setExpandedLogByKey}
         logSeverityFilter={logSeverityFilter}
         setLogSeverityFilter={setLogSeverityFilter}

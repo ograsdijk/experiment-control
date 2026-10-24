@@ -40,6 +40,17 @@ describe("TelemetryLatestStore", () => {
     expect(store.getDevice("A")).toEqual({ temp: signal(3), pressure: signal(2) });
   });
 
+  it("keeps a timestamped live value over an older or untimestamped snapshot", () => {
+    const store = new TelemetryLatestStore();
+    const at = (value: number, tWall?: number): TelemetrySignal =>
+      tWall === undefined ? { value } : { value, ts: { t_wall: tWall } };
+    store.applyMessage(message("A", { a: at(5, 100), b: at(6, 100), c: at(7, 100) }));
+    store.hydrate({ A: { a: at(1, 50), b: at(2), c: at(3, 200) } });
+    expect(store.getSignal("A", "a")?.value).toBe(5);
+    expect(store.getSignal("A", "b")?.value).toBe(6);
+    expect(store.getSignal("A", "c")?.value).toBe(3);
+  });
+
   it("does not notify connection subscribers for every active message", () => {
     const store = new TelemetryLatestStore();
     const listener = vi.fn();

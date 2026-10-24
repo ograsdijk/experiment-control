@@ -1,4 +1,5 @@
 import type { DeviceStatus, ProcessStatus } from "../../types";
+import { AGE_BUCKET_BOUNDS_S } from "../polling/pollEquality";
 
 /**
  * Derived resource health, mirroring the TUI navigator
@@ -303,6 +304,25 @@ export function formatAge(ageS: number | null | undefined): string {
     return `${ageS.toFixed(0)}s`;
   }
   return `${(ageS / 60).toFixed(1)}m`;
+}
+
+/**
+ * Age label matching the coarse poll buckets (`ageBucket`). Use it where the
+ * age comes from a coarse-compared poll, so the label never shows a precise
+ * value that is no longer being refreshed.
+ */
+export function formatCoarseAge(ageS: number | null | undefined): string {
+  if (ageS === null || ageS === undefined || !Number.isFinite(ageS)) {
+    return "n/a";
+  }
+  let lower = 0;
+  for (const bound of AGE_BUCKET_BOUNDS_S) {
+    if (ageS < bound) {
+      return lower === 0 ? `<${bound} s` : `${lower}–${bound} s`;
+    }
+    lower = bound;
+  }
+  return `${Math.floor(ageS / 60)}+ min`;
 }
 
 export function formatBytes(bytes: number | null | undefined): string {

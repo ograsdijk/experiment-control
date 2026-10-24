@@ -47,6 +47,10 @@ import {
   mergeDiagnostics,
 } from "./validation";
 
+/** sequencer.status refresh while a run is active: modal open vs closed. */
+export const SEQUENCER_STATUS_POLL_OPEN_MS = 1500;
+export const SEQUENCER_STATUS_POLL_CLOSED_MS = 3000;
+
 type SequencerAction = "start" | "pause" | "resume" | "stop";
 type AdaptiveStartMode = "reset" | "resume" | "warm_start";
 type SequencerRunMode = "once" | "repeat" | "continuous";
@@ -1519,7 +1523,10 @@ export function useSequencerController({
     () => buildLocalConditionDiagnostics(sequencerYamlText),
     [sequencerYamlText]
   );
-  const sequencerRunEventsProcessId = sequencerProcess?.process_id ?? null;
+  // Run events are shown only in the Sequencer modal; while it is closed the
+  // hook is idle (a null id) instead of refetching on every status seq.
+  const sequencerRunEventsProcessId =
+    sequencerOpen ? sequencerProcess?.process_id ?? null : null;
   const sequencerRunEventsSeq = sequencerProcess
     ? sequencerStatusByProcessId[sequencerProcess.process_id]?.runEvents?.seq ?? null
     : null;
@@ -1554,7 +1561,9 @@ export function useSequencerController({
     !["ERROR", "STOPPED", "IDLE"].includes(sequencerRuntimeState);
   useAdaptivePolling({
     enabled: sequencerPollingEnabled,
-    intervalMs: 1500,
+    // Closed modal: only the header chip (state, step count, progress fill)
+    // shows status, so a slower refresh is enough.
+    intervalMs: sequencerOpen ? SEQUENCER_STATUS_POLL_OPEN_MS : SEQUENCER_STATUS_POLL_CLOSED_MS,
     poll: async () =>
       sequencerProcess
         ? refreshSequencerStatus(sequencerProcess.process_id)

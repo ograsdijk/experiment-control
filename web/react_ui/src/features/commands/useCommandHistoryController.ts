@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type {
   ApiResponse,
   CommandJournalTailResult,
@@ -34,6 +34,7 @@ const COMMAND_HISTORY_LIMIT_BOUNDS = {
   max: MAX_COMMAND_HISTORY_LIMIT,
 } as const;
 const COMMAND_HISTORY_STORAGE_KEY = "ecui.commandHistory";
+const COMMAND_HISTORY_PERSIST_DEBOUNCE_MS = 1000;
 const COMMAND_HISTORY_LIMIT_STORAGE_KEY = "ecui.commandHistoryLimit";
 const COMMAND_HISTORY_AUTOSCROLL_STORAGE_KEY = "ecui.commandHistoryAutoScroll";
 const COMMAND_HISTORY_SORT_NEWEST_FIRST_STORAGE_KEY =
@@ -532,16 +533,51 @@ export function useCommandHistoryController({
     });
   }, [commandHistoryLimit]);
 
-  useEffect(() => {
+  // Serialising up to the history limit on every command is wasteful during
+  // bursts; persist at most once per COMMAND_HISTORY_PERSIST_DEBOUNCE_MS and
+  // flush the latest rows on pagehide and unmount.
+  const commandHistoryRowsRef = useRef(commandHistoryRows);
+  const commandHistoryDirtyRef = useRef(false);
+  const commandHistoryPersistTimerRef = useRef<ReturnType<
+    typeof setTimeout
+  > | null>(null);
+  const flushCommandHistoryRows = useCallback(() => {
+    if (commandHistoryPersistTimerRef.current !== null) {
+      clearTimeout(commandHistoryPersistTimerRef.current);
+      commandHistoryPersistTimerRef.current = null;
+    }
+    if (!commandHistoryDirtyRef.current) {
+      return;
+    }
+    commandHistoryDirtyRef.current = false;
     try {
       localStorage.setItem(
         COMMAND_HISTORY_STORAGE_KEY,
-        JSON.stringify(commandHistoryRows)
+        JSON.stringify(commandHistoryRowsRef.current)
       );
     } catch {
       // ignore storage errors
     }
-  }, [commandHistoryRows]);
+  }, []);
+
+  useEffect(() => {
+    commandHistoryRowsRef.current = commandHistoryRows;
+    commandHistoryDirtyRef.current = true;
+    if (commandHistoryPersistTimerRef.current === null) {
+      commandHistoryPersistTimerRef.current = setTimeout(
+        flushCommandHistoryRows,
+        COMMAND_HISTORY_PERSIST_DEBOUNCE_MS
+      );
+    }
+  }, [commandHistoryRows, flushCommandHistoryRows]);
+
+  useEffect(() => {
+    window.addEventListener("pagehide", flushCommandHistoryRows);
+    return () => {
+      window.removeEventListener("pagehide", flushCommandHistoryRows);
+      flushCommandHistoryRows();
+    };
+  }, [flushCommandHistoryRows]);
 
   useEffect(() => {
     try {

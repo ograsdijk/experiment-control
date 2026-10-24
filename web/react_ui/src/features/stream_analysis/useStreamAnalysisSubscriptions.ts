@@ -9,6 +9,10 @@ import type {
   StreamTraceDecimator,
 } from "../stream/types";
 import type { StreamAnalysisMessage } from "../../types";
+import {
+  openReconnectingSocket,
+  type ReconnectingSocket,
+} from "../common/reconnectingSocket";
 import { perfCount } from "../performance/perfInstrumentation";
 import { markPanelsDirty } from "../panels/PanelInvalidationStore";
 import {
@@ -33,13 +37,15 @@ import {
  *    subscriptions to the same workspace with different kinds get
  *    fresh snapshots.
  *
- * 2. **Live WS** — for each active subscription, open a
- *    `/ws/stream/{workspaceId}` WebSocket and feed each incoming
- *    output through `applyOutput` (with a trace-decimation filter
- *    pulled from the subscription metadata when applicable).
+ * 2. **Live WS** — for each socket group, keep a
+ *    `/ws/stream/{workspaceId}` WebSocket that reconnects with backoff
+ *    and feeds each incoming output through `applyOutput` (with a
+ *    trace-decimation filter pulled from the subscription metadata when
+ *    applicable). Groups are diffed by key on subscription-set changes;
+ *    a reconnect re-hydrates that workspace's snapshot.
  *
  * Exact changed panel IDs are coalesced after batches that produce updates.
- * `wsConnected` reports whether *any* socket is currently open,
+ * `wsConnected` is true only while every expected socket is open,
  * falling back to `streamAnalysisRpcReady` when there are no
  * subscriptions (no sockets to maintain means the RPC link is the
  * only signal).
@@ -137,6 +143,73 @@ function buildTraceFilter(
   return undefined;
 }
 
+type AnalysisOutput = NonNullable<
+  ReturnType<typeof normalizeStreamAnalysisOutputMessage>
+>;
+
+type WorkspaceSocketGroup = {
+  url: string;
+  subscriptions: StreamAnalysisWorkspaceSubscription[];
+  socket: ReconnectingSocket;
+};
+
+function workspaceSocketUrl(
+  subscriptions: StreamAnalysisWorkspaceSubscription[]
+): string {
+  const subscription = subscriptions[0];
+  const workspaceId = subscription.workspaceId;
+  const kinds = [...new Set(subscriptions.flatMap((entry) => entry.kinds))].sort();
+  const params = new URLSearchParams();
+  if (kinds.length > 0) {
+    params.set("kinds", kinds.join(","));
+  }
+  const traceFilter = buildTraceFilter(subscription);
+  if (traceFilter) {
+    const traceMaxPoints = Math.max(
+      ...subscriptions
+        .map((entry) => buildTraceFilter(entry)?.traceMaxPoints)
+        .filter((value): value is number => typeof value === "number")
+    );
+    params.set("trace_decimator", traceFilter.traceDecimator);
+    params.set("trace_max_points", String(traceMaxPoints));
+    params.set("trace_max_fps", String(traceFilter.traceMaxFps));
+    params.set("rolling_window", String(traceFilter.traceRollingWindow));
+    params.set("trace_average_mode", traceFilter.traceAverageMode);
+    params.set("transport", "binary");
+  }
+  const query = params.toString();
+  return buildWsUrl(
+    `/ws/stream/${encodeURIComponent(workspaceId)}${query ? `?${query}` : ""}`
+  );
+}
+
+function applyOutputToSubscriptions(
+  subscriptions: StreamAnalysisWorkspaceSubscription[],
+  output: AnalysisOutput,
+  applyOutput: StreamAnalysisSubscriptionsArgs["applyOutput"]
+) {
+  perfCount("stream_analysis.messages");
+  const dirtyPanelIds = new Set<string>();
+  for (const subscription of subscriptions) {
+    const traceFilter = buildTraceFilter(subscription);
+    const outputForSubscription =
+      output.kind === "trace" && traceFilter
+        ? {
+            ...output,
+            value: decimateTraceValues(
+              output.value,
+              traceFilter.traceDecimator,
+              traceFilter.traceMaxPoints
+            ),
+          }
+        : output;
+    for (const panelId of applyOutput(outputForSubscription, traceFilter)) {
+      dirtyPanelIds.add(panelId);
+    }
+  }
+  markPanelsDirty(dirtyPanelIds);
+}
+
 export function useStreamAnalysisSubscriptions({
   activeSubscriptions,
   streamAnalysisRpcReady,
@@ -144,7 +217,10 @@ export function useStreamAnalysisSubscriptions({
 }: StreamAnalysisSubscriptionsArgs): { wsConnected: boolean } {
   const [wsConnected, setWsConnected] = useState(false);
   const [refreshGeneration, setRefreshGeneration] = useState(0);
+  const [hydrationGeneration, setHydrationGeneration] = useState(0);
   const hydratedRef = useRef<Set<string>>(new Set());
+  // Workspaces whose socket reconnected: their snapshot is fetched again.
+  const invalidatedWorkspacesRef = useRef<Set<string>>(new Set());
   const pendingRefreshRequestsRef = useRef<StreamAnalysisRefreshRequest[]>([]);
   const refreshMountedRef = useRef(true);
 
@@ -249,6 +325,12 @@ export function useStreamAnalysisSubscriptions({
     hydratedRef.current = new Set(
       [...hydratedRef.current].filter((key) => activeKeys.has(key))
     );
+    for (const target of snapshotTargets) {
+      if (invalidatedWorkspacesRef.current.has(target.workspaceId)) {
+        hydratedRef.current.delete(target.key);
+      }
+    }
+    invalidatedWorkspacesRef.current.clear();
     const pending = snapshotTargets.filter(
       (entry) => !hydratedRef.current.has(entry.key)
     );
@@ -300,7 +382,8 @@ export function useStreamAnalysisSubscriptions({
     };
     // subscriptionsKey only ticks on real set changes; depending on
     // the raw array reference would re-hydrate on unrelated edits.
-  }, [streamAnalysisRpcReady, subscriptionsKey]);
+    // hydrationGeneration ticks when a socket reconnects.
+  }, [streamAnalysisRpcReady, subscriptionsKey, hydrationGeneration]);
 
   // Panel source changes refresh only the newly selected outputs. This
   // intentionally leaves normal hydration keys and live sockets untouched.
@@ -352,26 +435,40 @@ export function useStreamAnalysisSubscriptions({
     void load();
   }, [streamAnalysisRpcReady, refreshGeneration]);
 
-  // Live WS for each active subscription.
+  // Live sockets persist across subscription-set changes: one per socket
+  // group, diffed by group key so adding or removing a panel only opens or
+  // closes the sockets whose group actually changed.
+  const socketGroupsRef = useRef<Map<string, WorkspaceSocketGroup>>(new Map());
+  const socketsRpcReadyRef = useRef(streamAnalysisRpcReady);
+  const rpcReadyRef = useRef(streamAnalysisRpcReady);
+  rpcReadyRef.current = streamAnalysisRpcReady;
+
+  const updateConnected = () => {
+    const groups = socketGroupsRef.current;
+    // No sockets to maintain: the RPC link is the only signal. Otherwise
+    // connected only when every expected socket is open.
+    setWsConnected(
+      groups.size === 0
+        ? rpcReadyRef.current
+        : [...groups.values()].every((group) => group.socket.isOpen)
+    );
+  };
+  const updateConnectedRef = useRef(updateConnected);
+  updateConnectedRef.current = updateConnected;
+
   useEffect(() => {
-    const currentSubscriptions = activeSubscriptionsRef.current;
-    if (currentSubscriptions.length <= 0) {
-      setWsConnected(streamAnalysisRpcReady);
-      return;
-    }
-    let disposed = false;
-    const sockets = new Map<string, WebSocket>();
-    const openIds = new Set<string>();
-
-    const updateConnected = () => {
-      if (disposed) {
-        return;
+    const groups = socketGroupsRef.current;
+    // An RPC readiness change (stream_analysis restarted) recycles every
+    // socket, as the previous teardown-on-change effect did.
+    if (socketsRpcReadyRef.current !== streamAnalysisRpcReady) {
+      socketsRpcReadyRef.current = streamAnalysisRpcReady;
+      for (const group of groups.values()) {
+        group.socket.close();
       }
-      setWsConnected(openIds.size > 0);
-    };
-
+      groups.clear();
+    }
     const subscriptionsByKey = new Map<string, StreamAnalysisWorkspaceSubscription[]>();
-    for (const subscription of currentSubscriptions) {
+    for (const subscription of activeSubscriptionsRef.current) {
       const socketKey = workspaceSocketGroupKey(subscription);
       const peers = subscriptionsByKey.get(socketKey);
       if (peers) {
@@ -381,128 +478,95 @@ export function useStreamAnalysisSubscriptions({
       }
     }
 
-    const applyOutputToSubscriptions = (
-      subscriptions: StreamAnalysisWorkspaceSubscription[],
-      output: NonNullable<ReturnType<typeof normalizeStreamAnalysisOutputMessage>>
-    ) => {
-      perfCount("stream_analysis.messages");
-      const dirtyPanelIds = new Set<string>();
-      for (const subscription of subscriptions) {
-        const traceFilter = buildTraceFilter(subscription);
-        const outputForSubscription =
-          output.kind === "trace" && traceFilter
-            ? {
-                ...output,
-                value: decimateTraceValues(
-                  output.value,
-                  traceFilter.traceDecimator,
-                  traceFilter.traceMaxPoints
-                ),
-              }
-            : output;
-        for (const panelId of applyOutputRef.current(outputForSubscription, traceFilter)) {
-          dirtyPanelIds.add(panelId);
-        }
+    for (const [key, group] of groups) {
+      const subscriptions = subscriptionsByKey.get(key);
+      if (!subscriptions || workspaceSocketUrl(subscriptions) !== group.url) {
+        group.socket.close();
+        groups.delete(key);
+      } else {
+        // Same socket parameters: keep the socket, refresh its consumers.
+        group.subscriptions = subscriptions;
       }
-      markPanelsDirty(dirtyPanelIds);
-    };
-
-    const onMessage = (subscriptions: StreamAnalysisWorkspaceSubscription[]) => {
-      let pendingOutput: NonNullable<ReturnType<typeof normalizeStreamAnalysisOutputMessage>> | null = null;
-      return (event: MessageEvent<string | ArrayBuffer>) => {
-        try {
-          if (typeof event.data === "string") {
-            const msg = JSON.parse(event.data) as StreamAnalysisMessage;
-            const output = normalizeStreamAnalysisOutputMessage(msg);
-            if (output === null) {
-              pendingOutput = null;
-              return;
-            }
-            if (output.encoding === "binary-frame") {
-              pendingOutput = output;
-              return;
-            }
-            pendingOutput = null;
-            applyOutputToSubscriptions(subscriptions, output);
-            return;
-          }
-          if (pendingOutput === null) {
-            return;
-          }
-          const values = binaryValuesFromOutput(pendingOutput, event.data);
-          if (values === null) {
-            pendingOutput = null;
-            return;
-          }
-          const output = { ...pendingOutput, value: values };
-          pendingOutput = null;
-          applyOutputToSubscriptions(subscriptions, output);
-        } catch {
-          pendingOutput = null;
-          return;
-        }
-      };
-    };
-
-    for (const [socketKey, subscriptions] of subscriptionsByKey) {
-      const subscription = subscriptions[0];
-      const workspaceId = subscription.workspaceId;
-      const kinds = [...new Set(subscriptions.flatMap((entry) => entry.kinds))].sort();
-      const params = new URLSearchParams();
-      if (kinds.length > 0) {
-        params.set("kinds", kinds.join(","));
-      }
-      const traceFilter = buildTraceFilter(subscription);
-      if (traceFilter) {
-        const traceMaxPoints = Math.max(
-          ...subscriptions
-            .map((entry) => buildTraceFilter(entry)?.traceMaxPoints)
-            .filter((value): value is number => typeof value === "number")
-        );
-        params.set("trace_decimator", traceFilter.traceDecimator);
-        params.set("trace_max_points", String(traceMaxPoints));
-        params.set("trace_max_fps", String(traceFilter.traceMaxFps));
-        params.set("rolling_window", String(traceFilter.traceRollingWindow));
-        params.set("trace_average_mode", traceFilter.traceAverageMode);
-        params.set("transport", "binary");
-      }
-      const query = params.toString();
-      const ws = new WebSocket(
-        buildWsUrl(
-          `/ws/stream/${encodeURIComponent(workspaceId)}${query ? `?${query}` : ""}`
-        )
-      );
-      ws.binaryType = "arraybuffer";
-      ws.onopen = () => {
-        openIds.add(socketKey);
-        updateConnected();
-      };
-      ws.onclose = () => {
-        openIds.delete(socketKey);
-        updateConnected();
-      };
-      ws.onerror = () => {
-        openIds.delete(socketKey);
-        updateConnected();
-      };
-      ws.onmessage = onMessage(subscriptions);
-      sockets.set(socketKey, ws);
     }
 
-    updateConnected();
-
-    return () => {
-      disposed = true;
-      openIds.clear();
-      setWsConnected(false);
-      for (const ws of sockets.values()) {
-        ws.close();
+    for (const [key, subscriptions] of subscriptionsByKey) {
+      if (groups.has(key)) {
+        continue;
       }
-      sockets.clear();
-    };
+      const url = workspaceSocketUrl(subscriptions);
+      const workspaceId = subscriptions[0].workspaceId;
+      let pendingOutput: AnalysisOutput | null = null;
+      const group: WorkspaceSocketGroup = {
+        url,
+        subscriptions,
+        socket: openReconnectingSocket({
+          url,
+          binaryType: "arraybuffer",
+          onOpen: ({ reconnect }) => {
+            pendingOutput = null;
+            if (reconnect) {
+              // Outputs published while the socket was down are gone;
+              // reload the workspace snapshot.
+              invalidatedWorkspacesRef.current.add(workspaceId);
+              setHydrationGeneration((value) => value + 1);
+            }
+            updateConnectedRef.current();
+          },
+          onClose: () => {
+            pendingOutput = null;
+            updateConnectedRef.current();
+          },
+          onMessage: (event: MessageEvent<string | ArrayBuffer>) => {
+            try {
+              if (typeof event.data === "string") {
+                const msg = JSON.parse(event.data) as StreamAnalysisMessage;
+                const output = normalizeStreamAnalysisOutputMessage(msg);
+                if (output === null) {
+                  pendingOutput = null;
+                  return;
+                }
+                if (output.encoding === "binary-frame") {
+                  pendingOutput = output;
+                  return;
+                }
+                pendingOutput = null;
+                applyOutputToSubscriptions(group.subscriptions, output, applyOutputRef.current);
+                return;
+              }
+              if (pendingOutput === null) {
+                return;
+              }
+              const values = binaryValuesFromOutput(pendingOutput, event.data);
+              if (values === null) {
+                pendingOutput = null;
+                return;
+              }
+              const output = { ...pendingOutput, value: values };
+              pendingOutput = null;
+              applyOutputToSubscriptions(group.subscriptions, output, applyOutputRef.current);
+            } catch {
+              pendingOutput = null;
+            }
+          },
+        }),
+      };
+      groups.set(key, group);
+    }
+    updateConnectedRef.current();
     // subscriptionsKey only ticks on real set changes; unrelated panel
-    // edits no longer tear down and reopen every workspace socket.
+    // edits leave the live sockets untouched.
   }, [subscriptionsKey, streamAnalysisRpcReady]);
+
+  // Close every socket on unmount only; set changes are diffed above.
+  useEffect(() => {
+    const groups = socketGroupsRef.current;
+    return () => {
+      for (const group of groups.values()) {
+        group.socket.close();
+      }
+      groups.clear();
+    };
+  }, []);
 
   return { wsConnected };
 }

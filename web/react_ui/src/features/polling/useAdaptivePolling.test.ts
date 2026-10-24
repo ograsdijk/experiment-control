@@ -4,7 +4,11 @@ import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { useAdaptivePolling, type AdaptivePollingOptions } from "./useAdaptivePolling";
+import {
+  defaultPollTimeoutMs,
+  useAdaptivePolling,
+  type AdaptivePollingOptions,
+} from "./useAdaptivePolling";
 
 function Harness<T>(props: AdaptivePollingOptions<T>) {
   useAdaptivePolling(props);
@@ -119,5 +123,54 @@ describe("useAdaptivePolling", () => {
     act(() => root.unmount());
     expect(observed.signal?.aborted).toBe(true);
     root = createRoot(container);
+  });
+
+  it("aborts a hung poll after the timeout and keeps polling", async () => {
+    const signals: AbortSignal[] = [];
+    const poll = vi
+      .fn<(signal: AbortSignal) => Promise<number>>()
+      .mockImplementationOnce(
+        (signal) =>
+          new Promise((_resolve, reject) => {
+            signals.push(signal);
+            signal.addEventListener("abort", () =>
+              reject(new DOMException("aborted", "AbortError"))
+            );
+          })
+      )
+      .mockResolvedValue(7);
+    const onValue = vi.fn();
+    render({ enabled: true, intervalMs: 1000, timeoutMs: 5000, poll, onValue });
+    await flush();
+    await act(async () => vi.advanceTimersByTime(4999));
+    expect(signals[0].aborted).toBe(false);
+    await act(async () => vi.advanceTimersByTime(1));
+    expect(signals[0].aborted).toBe(true);
+    await flush();
+    await act(async () => vi.advanceTimersByTime(1000));
+    await flush();
+    expect(poll).toHaveBeenCalledTimes(2);
+    expect(onValue).toHaveBeenCalledWith(7);
+  });
+
+  it("releases a hung poll that ignores its abort signal", async () => {
+    const poll = vi
+      .fn<(signal: AbortSignal) => Promise<number>>()
+      .mockImplementationOnce(() => new Promise<number>(() => undefined))
+      .mockResolvedValue(9);
+    const onValue = vi.fn();
+    render({ enabled: true, intervalMs: 1000, timeoutMs: 5000, poll, onValue });
+    await flush();
+    await act(async () => vi.advanceTimersByTime(5000));
+    await flush();
+    await act(async () => vi.advanceTimersByTime(1000));
+    await flush();
+    expect(poll).toHaveBeenCalledTimes(2);
+    expect(onValue).toHaveBeenCalledWith(9);
+  });
+
+  it("defaults the timeout to three intervals, at least 10 s", () => {
+    expect(defaultPollTimeoutMs(1000)).toBe(10000);
+    expect(defaultPollTimeoutMs(5000)).toBe(15000);
   });
 });

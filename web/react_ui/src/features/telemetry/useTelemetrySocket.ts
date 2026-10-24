@@ -2,6 +2,7 @@ import { useEffect, useRef } from "react";
 
 import { buildWsUrl, fetchTelemetrySnapshot } from "../../api";
 import type { TelemetryMessage } from "../../types";
+import { openReconnectingSocket } from "../common/reconnectingSocket";
 import { perfCount } from "../performance/perfInstrumentation";
 import {
   telemetryLatestStore,
@@ -16,6 +17,7 @@ export type UseTelemetrySocketOptions = {
   onHydrate?: (snapshot: LatestSignals) => void;
 };
 
+/** Base reconnect delay; later attempts back off exponentially with jitter. */
 export const TELEMETRY_RECONNECT_DELAY_MS = 1000;
 
 /** Low-level telemetry transport. It never stores message data in React state. */
@@ -25,6 +27,8 @@ export function useTelemetrySocket(options: UseTelemetrySocketOptions = {}): voi
   onMessageRef.current = onMessage;
   const onHydrateRef = useRef(onHydrate);
   onHydrateRef.current = onHydrate;
+  const hydrateRef = useRef(hydrate);
+  hydrateRef.current = hydrate;
 
   useEffect(() => {
     if (!hydrate) return;
@@ -43,25 +47,28 @@ export function useTelemetrySocket(options: UseTelemetrySocketOptions = {}): voi
 
   useEffect(() => {
     let disposed = false;
-    let socket: WebSocket | null = null;
-    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-
-    const connect = () => {
-      if (disposed) return;
-      const nextSocket = new WebSocket(buildWsUrl("/ws/telemetry"));
-      socket = nextSocket;
-      nextSocket.onopen = () => store.setConnection(true, false);
-      nextSocket.onclose = () => {
-        store.setConnection(false, false);
-        if (!disposed && reconnectTimer === null) {
-          reconnectTimer = setTimeout(() => {
-            reconnectTimer = null;
-            connect();
-          }, TELEMETRY_RECONNECT_DELAY_MS);
-        }
-      };
-      nextSocket.onerror = () => undefined;
-      nextSocket.onmessage = (event) => {
+    // Values that changed while the socket was down are not replayed by
+    // the stream; refetch the snapshot after every reconnect. The store's
+    // hydrate keeps any newer live value that arrived meanwhile.
+    const rehydrate = () => {
+      if (!hydrateRef.current) return;
+      void fetchTelemetrySnapshot()
+        .then((snapshot) => {
+          if (disposed) return;
+          store.hydrate(snapshot);
+          onHydrateRef.current?.(snapshot);
+        })
+        .catch(() => undefined);
+    };
+    const socket = openReconnectingSocket({
+      url: buildWsUrl("/ws/telemetry"),
+      backoff: { baseMs: TELEMETRY_RECONNECT_DELAY_MS },
+      onOpen: ({ reconnect }) => {
+        store.setConnection(true, false);
+        if (reconnect) rehydrate();
+      },
+      onClose: () => store.setConnection(false, false),
+      onMessage: (event) => {
         try {
           const message = JSON.parse(event.data) as TelemetryMessage;
           if (!message?.payload?.device_id) return;
@@ -79,14 +86,12 @@ export function useTelemetrySocket(options: UseTelemetrySocketOptions = {}): voi
         } catch {
           // Ignore malformed frames.
         }
-      };
-    };
-
-    connect();
+      },
+    });
     return () => {
       disposed = true;
-      if (reconnectTimer !== null) clearTimeout(reconnectTimer);
-      socket?.close();
+      socket.close();
+      store.setConnection(false, false);
     };
   }, [store]);
 }
