@@ -67,6 +67,8 @@ import { SequencerOutlinePane } from "./SequencerOutlinePane";
 import { SequencerValuesContext } from "../features/sequencer/components/ValueChip";
 import type { ValueContext } from "../features/sequencer/resolved_values";
 import { buildRuntimeOrigins } from "../features/sequencer/runtime_origins";
+import type { SequencerLoopStatus, SequencerPlan } from "../features/sequencer/plan";
+import { SequencerTimelinePane } from "./SequencerTimelinePane";
 
 const LazySequencerYamlCodeEditor = lazy(
   () => import("../features/sequencer/components/SequencerYamlCodeEditor")
@@ -109,6 +111,15 @@ type Props = {
   pauseInfo: SequencerPauseInfo | null;
   /** Events of the current/last run (pauses, failures, warnings). */
   runEvents: ReadonlyArray<SequencerRunEvent>;
+  /** `sequencer.plan` of the loaded sequence, for the Timeline tab. */
+  plan: SequencerPlan | null;
+  planError: string | null;
+  /** The run overrides have errors: the plan uses the last valid ones. */
+  planOverridesInvalid: boolean;
+  /** The Timeline tab is shown or hidden (the plan is fetched only while shown). */
+  onTimelineVisibleChange: (visible: boolean) => void;
+  /** Loops the run is inside (`sequencer.status.loops`). */
+  loops: ReadonlyArray<SequencerLoopStatus>;
   autoloadError: string | null;
   statusError: string | null;
   modalError: string | null;
@@ -210,6 +221,11 @@ export function SequencerModal({
   editorLabel,
   pauseInfo,
   runEvents,
+  plan,
+  planError,
+  planOverridesInvalid,
+  onTimelineVisibleChange,
+  loops,
   autoloadError,
   statusError,
   modalError,
@@ -276,7 +292,11 @@ export function SequencerModal({
   valueContext,
   onJumpToDiagnostic,
 }: Props) {
-  const [activeTab, setActiveTab] = useState<"steps" | "vars" | "yaml">("steps");
+  const [activeTab, setActiveTab] = useState<"steps" | "vars" | "yaml" | "timeline">("steps");
+  useEffect(() => {
+    onTimelineVisibleChange(activeTab === "timeline");
+    return () => onTimelineVisibleChange(false);
+  }, [activeTab, onTimelineVisibleChange]);
   const [overridesOpen, setOverridesOpen] = useState(false);
 
   useEffect(() => {
@@ -1147,6 +1167,7 @@ export function SequencerModal({
                 Variables
               </Tabs.Tab>
               <Tabs.Tab value="yaml">YAML</Tabs.Tab>
+              <Tabs.Tab value="timeline">Timeline</Tabs.Tab>
               <Switch
                 size="xs"
                 label="Values"
@@ -1240,6 +1261,24 @@ export function SequencerModal({
                   </Suspense>
                 </div>
               </Stack>
+            </Tabs.Panel>
+            <Tabs.Panel value="timeline" pt="sm" style={tabPanelStyle(activeTab === "timeline")}>
+              {activeTab === "timeline" ? (
+                <SequencerTimelinePane
+                  outline={outline}
+                  plan={loaded ? plan : null}
+                  planError={planError}
+                  overridesInvalid={planOverridesInvalid}
+                  loops={loops}
+                  runtimeState={runtimeState}
+                  activeStep={activeStep}
+                  textNotLoaded={textNotLoaded}
+                  onOpenStep={(line) => {
+                    setActiveTab("steps");
+                    setStepFocus({ line, nonce: Date.now() });
+                  }}
+                />
+              ) : null}
             </Tabs.Panel>
           </Tabs>
           </SequencerValuesContext.Provider>

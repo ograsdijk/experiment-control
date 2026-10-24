@@ -10,6 +10,7 @@ import type {
   SequencerYamlEditorHandle,
 } from "../features/sequencer/types";
 import type { ValueContext } from "../features/sequencer/resolved_values";
+import type { SequencerLoopStatus, SequencerPlan } from "../features/sequencer/plan";
 import type { StreamAnalysisWorkspaceConfig } from "../features/stream/types";
 import type { CapabilityMember } from "../types";
 import type { StreamCatalogEntry } from "../types";
@@ -34,6 +35,11 @@ type Props = {
   editorLabel: string | null;
   pauseInfo: SequencerPauseInfo | null;
   runEvents: ReadonlyArray<SequencerRunEvent>;
+  plan: SequencerPlan | null;
+  planError: string | null;
+  planOverridesInvalid: boolean;
+  onTimelineVisibleChange: (visible: boolean) => void;
+  loops: ReadonlyArray<SequencerLoopStatus>;
   autoloadError: string | null;
   statusError: string | null;
   modalError: string | null;
