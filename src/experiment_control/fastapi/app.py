@@ -13,7 +13,7 @@ import uuid
 from pathlib import Path
 from collections.abc import Callable
 from typing import Any
-from urllib.parse import SplitResult, urlsplit, urlunsplit
+from urllib.parse import SplitResult, parse_qs, urlsplit, urlunsplit
 
 import numpy as np
 import yaml
@@ -22,9 +22,16 @@ from fastapi.responses import FileResponse, RedirectResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel, Field
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from ._trace_aggregator import TraceAggregator
-from .gateway import GatewaySettings, RouterRpcClient, StreamFrameHub, TelemetryHub
+from .gateway import (
+    GatewaySettings,
+    HubMessage,
+    RouterRpcClient,
+    StreamFrameHub,
+    TelemetryHub,
+)
 from ..schemas.stream import stream_axis_from_json
 from ..shm.shm_ring import ShmRingReader
 from ..stream_axis import IDENTITY_AXIS, resolve_stream_axis
@@ -342,14 +349,16 @@ async def _route_request(payload: dict[str, Any]) -> dict[str, Any]:
     return _ensure_error_shape(await app.state.router.request(payload))
 
 
-def _build_trace_frame_array(
+def _select_frame_trace(
     payload: dict[str, Any],
     *,
     channel_index: int,
-    trace_decimator: str,
-    trace_max_points: int | None,
     pre_decimate: Callable[[np.ndarray], np.ndarray | None] | None = None,
-) -> tuple[dict[str, Any], np.ndarray] | None:
+) -> np.ndarray | None:
+    """Per-frame stage of the trace chain: select the channel and feed the
+    rolling/block aggregator. Cheap relative to decimation, and must run
+    for every frame so averages stay correct even when the frame is never
+    sent (see `_finish_trace_frame`)."""
     private_source = payload.get("_source_values")
     has_full_source = private_source is not None
     shape = _normalize_shape(
@@ -365,10 +374,42 @@ def _build_trace_frame_array(
         return None
     trace = _select_trace_from_array(arr, channel_index)
     if pre_decimate is not None:
-        decimated_trace = pre_decimate(trace)
-        if decimated_trace is None:
-            return None
-        trace = decimated_trace
+        return pre_decimate(trace)
+    return trace
+
+
+def _build_trace_frame_array(
+    payload: dict[str, Any],
+    *,
+    channel_index: int,
+    trace_decimator: str,
+    trace_max_points: int | None,
+    pre_decimate: Callable[[np.ndarray], np.ndarray | None] | None = None,
+) -> tuple[dict[str, Any], np.ndarray] | None:
+    trace = _select_frame_trace(
+        payload, channel_index=channel_index, pre_decimate=pre_decimate
+    )
+    if trace is None:
+        return None
+    return _finish_trace_frame(
+        payload,
+        trace,
+        channel_index=channel_index,
+        trace_decimator=trace_decimator,
+        trace_max_points=trace_max_points,
+    )
+
+
+def _finish_trace_frame(
+    payload: dict[str, Any],
+    trace: np.ndarray,
+    *,
+    channel_index: int,
+    trace_decimator: str,
+    trace_max_points: int | None,
+) -> tuple[dict[str, Any], np.ndarray] | None:
+    """Send-time stage: decimate and build the outgoing payload."""
+    has_full_source = payload.get("_source_values") is not None
     original_size = int(trace.size)
     if trace_max_points is not None:
         trace_values = _decimate_trace_values(
@@ -1001,6 +1042,32 @@ def _resolve_extra_ui_specs() -> list[ExtraUiSpec]:
     return specs
 
 
+class _GZipExceptBinaryMiddleware:
+    """GZip, except for ``transport=binary`` requests.
+
+    Those return raw float64 sample blocks, which barely compress, so
+    gzipping them only spends event-loop CPU on every snapshot poll.
+    """
+
+    def __init__(self, app: ASGIApp, *, minimum_size: int = 500) -> None:
+        self._app = app
+        self._gzip = GZipMiddleware(app, minimum_size=minimum_size)
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "http" and _query_requests_binary(scope):
+            await self._app(scope, receive, send)
+            return
+        await self._gzip(scope, receive, send)
+
+
+def _query_requests_binary(scope: Scope) -> bool:
+    raw = scope.get("query_string") or b""
+    if b"transport" not in raw:
+        return False
+    values = parse_qs(raw.decode("latin-1")).get("transport", [])
+    return any(value.strip().lower() == "binary" for value in values)
+
+
 app = FastAPI(title="Experiment Control Gateway", version="0.1")
 app.add_middleware(
     CORSMiddleware,
@@ -1008,7 +1075,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-app.add_middleware(GZipMiddleware, minimum_size=1024)
+app.add_middleware(_GZipExceptBinaryMiddleware, minimum_size=1024)
 
 _UI_DIST_PATH: Path | None = _resolve_ui_dist_path()
 _DEFAULT_PROFILE_PATH: Path | None = _resolve_default_profile_path()
@@ -1042,7 +1109,9 @@ async def _startup() -> None:
     )
     stream_hub.start(asyncio.get_running_loop())
     stream_analysis_hub = TelemetryHub(
-        settings.manager_pub, topics=settings.stream_analysis_topics
+        settings.manager_pub,
+        topics=settings.stream_analysis_topics,
+        keep_decoded=True,
     )
     stream_analysis_hub.start(asyncio.get_running_loop())
     process_cached_call_targets = _load_process_cached_call_targets()
@@ -1999,24 +2068,41 @@ async def ws_raw_stream(ws: WebSocket) -> None:
         trace_average_mode=trace_average_mode,
     )
 
-    async def _send_or_queue(msg: dict[str, Any]) -> None:
+    async def _send_trace(payload: dict[str, Any], trace: np.ndarray) -> None:
+        built = _finish_trace_frame(
+            payload,
+            trace,
+            channel_index=channel_index,
+            trace_decimator=trace_decimator,
+            trace_max_points=trace_max_points,
+        )
+        if built is None:
+            return
+        out_payload, out_trace = built
+        if binary_transport:
+            out_payload["_binary_values"] = out_trace
+            await _ws_send_binary_trace_frame(
+                ws, {"topic": "manager.stream_frame", "payload": out_payload}
+            )
+            return
+        out_payload["values"] = out_trace.tolist()
+        await _ws_send_json(ws, {"topic": "manager.stream_frame", "payload": out_payload})
+
+    async def _send_or_defer(payload: dict[str, Any], trace: np.ndarray) -> None:
+        # A throttled socket keeps only the newest (payload, trace) pair and
+        # decimates it when due, so frames superseded before their send slot
+        # never pay for decimation or payload construction.
         nonlocal next_send_at
         if trace_interval_s <= 0:
-            if binary_transport:
-                await _ws_send_binary_trace_frame(ws, msg)
-            else:
-                await _ws_send_json(ws, msg)
+            await _send_trace(payload, trace)
             return
         now = time.monotonic()
         if now >= next_send_at:
-            if binary_transport:
-                await _ws_send_binary_trace_frame(ws, msg)
-            else:
-                await _ws_send_json(ws, msg)
-            next_send_at = now + trace_interval_s
             aggregator.pending_msg = None
+            await _send_trace(payload, trace)
+            next_send_at = now + trace_interval_s
             return
-        aggregator.pending_msg = msg
+        aggregator.pending_msg = {"payload": payload, "trace": trace}
 
     await ws.accept()
     # Keep this queue small: each entry can contain large trace payloads.
@@ -2034,17 +2120,14 @@ async def ws_raw_stream(ws: WebSocket) -> None:
                 else:
                     msg = await asyncio.wait_for(q.get(), timeout=timeout_s)
             except asyncio.TimeoutError:
-                pending_msg = aggregator.flush()
-                if pending_msg is None:
+                deferred = aggregator.flush()
+                if deferred is None:
                     continue
                 now = time.monotonic()
                 if now < next_send_at:
-                    aggregator.pending_msg = pending_msg
+                    aggregator.pending_msg = deferred
                     continue
-                if binary_transport:
-                    await _ws_send_binary_trace_frame(ws, pending_msg)
-                else:
-                    await _ws_send_json(ws, pending_msg)
+                await _send_trace(deferred["payload"], deferred["trace"])  # type: ignore[arg-type]
                 next_send_at = now + trace_interval_s
                 continue
 
@@ -2059,30 +2142,14 @@ async def ws_raw_stream(ws: WebSocket) -> None:
             msg_stream = str(payload.get("stream") or "").strip()
             if msg_device_id != device_id or msg_stream != stream:
                 continue
-            out_payload: dict[str, Any] | None
-            if binary_transport:
-                built = _build_trace_frame_array(
-                    payload,
-                    channel_index=channel_index,
-                    trace_decimator=trace_decimator,
-                    trace_max_points=trace_max_points,
-                    pre_decimate=aggregator.add_frame,
-                )
-                if built is None:
-                    continue
-                out_payload, trace = built
-                out_payload["_binary_values"] = trace
-            else:
-                out_payload = _build_trace_frame_payload(
-                    payload,
-                    channel_index=channel_index,
-                    trace_decimator=trace_decimator,
-                    trace_max_points=trace_max_points,
-                    pre_decimate=aggregator.add_frame,
-                )
-                if out_payload is None:
-                    continue
-            await _send_or_queue({"topic": "manager.stream_frame", "payload": out_payload})
+            trace = _select_frame_trace(
+                payload,
+                channel_index=channel_index,
+                pre_decimate=aggregator.add_frame,
+            )
+            if trace is None:
+                continue
+            await _send_or_defer(payload, trace)
     except WebSocketDisconnect:
         pass
     finally:
@@ -2239,11 +2306,48 @@ def _workspace_trace_aggregator(
     return aggregator
 
 
+def _workspace_finalize_trace_msg(
+    state: _WorkspaceTraceWsState,
+    trace_msg: dict[str, Any],
+) -> dict[str, Any]:
+    """Decimate a trace message's deferred ``_raw_trace`` at send time.
+
+    Trace handlers only aggregate; decimation and value encoding happen
+    here, so a throttled output whose pending message is superseded before
+    its send slot never pays for them.
+    """
+    payload = trace_msg.get("payload")
+    if not isinstance(payload, dict) or "_raw_trace" not in payload:
+        return trace_msg
+    out = dict(payload)
+    raw = np.asarray(out.pop("_raw_trace"), dtype=np.float64).reshape(-1)
+    mark_decimated = bool(out.pop("_mark_decimated", False))
+    values: Any = None
+    if state.trace_max_points is not None and int(raw.size) > state.trace_max_points:
+        values = _decimate_trace_values(
+            raw,
+            mode=state.trace_decimator,
+            max_points=state.trace_max_points,
+        )
+        binary = np.asarray(values, dtype=np.float64).reshape(-1)
+        if mark_decimated and int(binary.size) < int(raw.size):
+            out["decimated"] = True
+    else:
+        binary = raw
+    out["point_count"] = int(binary.size)
+    if state.binary_transport:
+        out["_binary_values"] = binary
+    else:
+        out["value"] = values if values is not None else binary.tolist()
+    return {**trace_msg, "payload": out}
+
+
 async def _workspace_send_trace_payload(
     ws: WebSocket,
     state: _WorkspaceTraceWsState,
     trace_msg: dict[str, Any],
 ) -> None:
+    trace_msg = _workspace_finalize_trace_msg(state, trace_msg)
     if state.binary_transport:
         await _ws_send_binary_trace_frame(ws, trace_msg, value_field="value")
     else:
@@ -2300,7 +2404,9 @@ def _workspace_filter_stream_message(
     workspace: str,
     allowed_output_kinds: set[str] | None,
 ) -> tuple[str, dict[str, Any], str] | None:
-    if isinstance(msg, str):
+    if isinstance(msg, HubMessage):
+        msg = msg.msg
+    elif isinstance(msg, str):
         loaded = safe_json_loads(msg.encode("utf-8"))
         if not isinstance(loaded, dict):
             return None
@@ -2370,17 +2476,6 @@ async def _workspace_handle_trace_ready_message(
     )
     if trace_flat is None:
         return True
-    if state.trace_max_points is not None:
-        trace_values = _decimate_trace_values(
-            trace_flat,
-            mode=state.trace_decimator,
-            max_points=state.trace_max_points,
-        )
-        trace_binary = np.asarray(trace_values, dtype=np.float64).reshape(-1)
-    else:
-        trace_binary = trace_flat.astype(np.float64, copy=False).reshape(-1)
-        trace_values = trace_binary.tolist() if not state.binary_transport else None
-    trace_point_count = int(trace_binary.size)
     trace_payload: dict[str, Any] = {
         "version": 1,
         "workspace_id": msg_workspace,
@@ -2394,12 +2489,9 @@ async def _workspace_handle_trace_ready_message(
         "t0_wall_ns": event.get("t0_wall_ns"),
         "channel_index": payload.get("channel_index"),
         "channel_count": payload.get("channel_count"),
-        "point_count": trace_point_count,
+        # No copy needed: read_event returns the slot payload as its own bytes.
+        "_raw_trace": np.asarray(trace_flat, dtype=np.float64),
     }
-    if state.binary_transport:
-        trace_payload["_binary_values"] = trace_binary
-    else:
-        trace_payload["value"] = trace_values
     if bool(payload.get("truncated")):
         trace_payload["truncated"] = True
     if payload.get("context_id") is not None:
@@ -2434,25 +2526,10 @@ async def _workspace_handle_trace_output_message(
         rolled = _workspace_trace_aggregator(state, trace_key).add_frame(points)
         if rolled is None:
             return True
-        if state.trace_max_points is not None:
-            decimated = _decimate_trace_values(
-                rolled,
-                mode=state.trace_decimator,
-                max_points=state.trace_max_points,
-            )
-            trace_binary = np.asarray(decimated, dtype=np.float64).reshape(-1)
-        else:
-            trace_binary = rolled.astype(np.float64, copy=False).reshape(-1)
-            decimated = trace_binary.tolist() if not state.binary_transport else None
         trace_payload = dict(payload)
         trace_payload.pop("value", None)
-        trace_payload["point_count"] = int(trace_binary.size)
-        if state.binary_transport:
-            trace_payload["_binary_values"] = trace_binary
-        else:
-            trace_payload["value"] = decimated
-        if state.trace_max_points is not None and int(trace_binary.size) < int(points.size):
-            trace_payload["decimated"] = True
+        trace_payload["_raw_trace"] = rolled
+        trace_payload["_mark_decimated"] = True
     trace_msg = msg if trace_payload is payload else {**msg, "payload": trace_payload}
     await _workspace_send_trace_message(
         ws=ws,
@@ -2535,7 +2612,11 @@ async def ws_stream_workspace(ws: WebSocket, workspace_id: str) -> None:
                 if handled:
                     continue
 
-            await _ws_send_json(ws, decoded_msg)
+            if isinstance(msg, HubMessage):
+                # Unmodified passthrough: reuse the hub's shared encoding.
+                await ws.send_text(msg.text)
+            else:
+                await _ws_send_json(ws, decoded_msg)
     except WebSocketDisconnect:
         pass
     finally:

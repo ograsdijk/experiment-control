@@ -225,6 +225,57 @@ class GatewayLifecycleTests(unittest.TestCase):
             msg=f"pipelined N={N} took {elapsed_s:.3f}s, expected < {budget_s:.3f}s",
         )
 
+    def test_router_rpc_client_idle_request_is_not_poll_quantized(self) -> None:
+        """An idle worker must wake on submit, not after its 100 ms poll."""
+        ctx = zmq.Context.instance()
+        router_sock = ctx.socket(zmq.ROUTER)
+        router_sock.setsockopt(zmq.LINGER, 0)
+        port = router_sock.bind_to_random_port("tcp://127.0.0.1")
+        stop_evt = threading.Event()
+
+        def server() -> None:
+            poller = zmq.Poller()
+            poller.register(router_sock, zmq.POLLIN)
+            while not stop_evt.is_set():
+                if router_sock not in dict(poller.poll(10)):
+                    continue
+                ident, body = router_sock.recv_multipart()
+                req = safe_json_loads(body) or {}
+                reply = {"ok": True, "request_id": req.get("request_id")}
+                router_sock.send_multipart([ident, json_dumps(reply)])
+
+        srv = threading.Thread(target=server, daemon=True)
+        srv.start()
+        loop = asyncio.new_event_loop()
+        client = RouterRpcClient(f"tcp://127.0.0.1:{port}", timeout_ms=2000)
+        try:
+            client.start(loop)
+
+            async def timed_requests() -> list[float]:
+                await client.request({"type": "warmup"})
+                out: list[float] = []
+                for _ in range(10):
+                    # Let the worker settle into its idle 100 ms poll.
+                    await asyncio.sleep(0.03)
+                    t0 = time.perf_counter()
+                    resp = await client.request({"type": "ping"})
+                    out.append(time.perf_counter() - t0)
+                    self.assertTrue(bool(resp.get("ok")), msg=str(resp))
+                return out
+
+            latencies = loop.run_until_complete(timed_requests())
+        finally:
+            client.close()
+            stop_evt.set()
+            srv.join(timeout=2.0)
+            router_sock.close(0)
+            loop.close()
+
+        latencies.sort()
+        median_s = latencies[len(latencies) // 2]
+        # Without the doorbell the median is ~50-70 ms.
+        self.assertLess(median_s, 0.025, msg=f"latencies={latencies}")
+
     def test_telemetry_hub_restart_is_safe(self) -> None:
         loop = asyncio.new_event_loop()
         hub = TelemetryHub("tcp://127.0.0.1:1", topics=("manager.telemetry_update",))

@@ -9,9 +9,10 @@ import threading
 import uuid
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, NamedTuple
 
 import numpy as np
+import orjson
 import zmq
 
 from ..contracts.messages import parse_chunk_sequence_range
@@ -81,6 +82,14 @@ class RouterRpcClient:
         self._queue_rejected = 0
         self._closed_pending = 0
         self._inflight_depth = 0
+        # inproc doorbell: request() PUSHes an empty frame after enqueuing
+        # so the worker's poll wakes immediately instead of sitting out its
+        # 100 ms timeout (same pattern as DeviceRouter's reply doorbell).
+        # A fresh endpoint per start() so a restarted worker never inherits
+        # a PUSH connected to the previous run's closed PULL.
+        self._wake_endpoint: str | None = None
+        self._wake_push: zmq.Socket | None = None
+        self._wake_push_endpoint: str | None = None
 
     @staticmethod
     def _error(
@@ -99,6 +108,7 @@ class RouterRpcClient:
             return
         self._loop = loop
         self._stop.clear()
+        self._wake_endpoint = f"inproc://router-rpc-wake-{uuid.uuid4().hex}"
         self._thread = threading.Thread(
             target=self._run, name="router-rpc", daemon=True
         )
@@ -106,6 +116,8 @@ class RouterRpcClient:
 
     def close(self) -> None:
         self._stop.set()
+        self._ring_wake()
+        self._close_wake_push()
         drained = 0
         while True:
             try:
@@ -128,6 +140,40 @@ class RouterRpcClient:
             thread.join(timeout=2.0)
             if not thread.is_alive():
                 self._thread = None
+
+    def _ring_wake(self) -> None:
+        # Best-effort: the request is already queued and the worker drains
+        # the queue every loop, so a failed ring only falls back to the
+        # poll-timeout latency, never a lost request. Called on the event
+        # loop thread only, which owns the PUSH socket.
+        endpoint = self._wake_endpoint
+        if endpoint is None:
+            return
+        sock = self._wake_push
+        if sock is None or self._wake_push_endpoint != endpoint:
+            self._close_wake_push()
+            try:
+                sock = self._ctx.socket(zmq.PUSH)
+                sock.setsockopt(zmq.LINGER, 0)
+                sock.connect(endpoint)
+            except Exception:
+                return
+            self._wake_push = sock
+            self._wake_push_endpoint = endpoint
+        try:
+            sock.send(b"", zmq.NOBLOCK)
+        except Exception:
+            pass
+
+    def _close_wake_push(self) -> None:
+        sock = self._wake_push
+        self._wake_push = None
+        self._wake_push_endpoint = None
+        if sock is not None:
+            try:
+                sock.close(0)
+            except Exception:
+                pass
 
     def stats(self) -> dict[str, Any]:
         with self._lock:
@@ -168,6 +214,7 @@ class RouterRpcClient:
                     "queue_max": int(self._queue_max),
                 },
             )
+        self._ring_wake()
         # Worker is the source of truth for timeouts (resolves the
         # future with `gateway_timeout` on expiry). `asyncio.wait_for`
         # here is a belt-and-suspenders safety net in case the worker
@@ -248,12 +295,37 @@ class RouterRpcClient:
                 },
             )
 
+    def _new_poller(self, sock: zmq.Socket, wake: zmq.Socket | None) -> zmq.Poller:
+        poller = zmq.Poller()
+        poller.register(sock, zmq.POLLIN)
+        if wake is not None:
+            poller.register(wake, zmq.POLLIN)
+        return poller
+
+    @staticmethod
+    def _drain_wake(wake: zmq.Socket) -> None:
+        while True:
+            try:
+                wake.recv(zmq.NOBLOCK)
+            except zmq.Again:
+                return
+
     def _run(self) -> None:
         sock = self._ctx.socket(zmq.DEALER)
         sock.setsockopt(zmq.LINGER, 0)
         sock.connect(self._endpoint)
-        poller = zmq.Poller()
-        poller.register(sock, zmq.POLLIN)
+        wake: zmq.Socket | None = None
+        if self._wake_endpoint is not None:
+            try:
+                wake = self._ctx.socket(zmq.PULL)
+                wake.setsockopt(zmq.LINGER, 0)
+                wake.bind(self._wake_endpoint)
+            except Exception:
+                logger.warning("router rpc doorbell unavailable", exc_info=True)
+                if wake is not None:
+                    wake.close(0)
+                wake = None
+        poller = self._new_poller(sock, wake)
         pending: dict[Any, tuple["asyncio.Future[dict]", float]] = {}
 
         while not self._stop.is_set():
@@ -319,9 +391,11 @@ class RouterRpcClient:
                 sock = self._ctx.socket(zmq.DEALER)
                 sock.setsockopt(zmq.LINGER, 0)
                 sock.connect(self._endpoint)
-                poller = zmq.Poller()
-                poller.register(sock, zmq.POLLIN)
+                poller = self._new_poller(sock, wake)
                 continue
+
+            if wake is not None and wake in events:
+                self._drain_wake(wake)
 
             if sock in events:
                 try:
@@ -336,8 +410,7 @@ class RouterRpcClient:
                     sock = self._ctx.socket(zmq.DEALER)
                     sock.setsockopt(zmq.LINGER, 0)
                     sock.connect(self._endpoint)
-                    poller = zmq.Poller()
-                    poller.register(sock, zmq.POLLIN)
+                    poller = self._new_poller(sock, wake)
                     continue
 
             # 3) Time out any expired in-flight requests.
@@ -346,6 +419,8 @@ class RouterRpcClient:
         # Shutdown: fail any still-in-flight callers.
         sock.setsockopt(zmq.LINGER, 0)
         sock.close(0)
+        if wake is not None:
+            wake.close(0)
         for fut, _ in pending.values():
             self._set_future_result(
                 fut,
@@ -358,6 +433,13 @@ class RouterRpcClient:
             self._inflight_depth = 0
 
 
+class HubMessage(NamedTuple):
+    """One decoded hub message plus its shared pre-serialized form."""
+
+    text: str
+    msg: dict[str, Any]
+
+
 class TelemetryHub:
     """ZMQ → WebSocket fan-out hub for simple topic broadcast streams.
 
@@ -366,11 +448,22 @@ class TelemetryHub:
     its background thread and shares the resulting string across every
     subscriber, so N WS clients no longer each pay `json.dumps()` on the
     same payload. WS handlers should consume via `ws.send_text(payload)`.
+
+    With ``keep_decoded=True`` items are `HubMessage` tuples instead, for
+    subscribers that filter on payload fields before forwarding: they read
+    ``.msg`` rather than re-parsing the shared string per connection.
     """
 
-    def __init__(self, endpoint: str, *, topics: tuple[str, ...]) -> None:
+    def __init__(
+        self,
+        endpoint: str,
+        *,
+        topics: tuple[str, ...],
+        keep_decoded: bool = False,
+    ) -> None:
         self._endpoint = endpoint
         self._topics = topics
+        self._keep_decoded = bool(keep_decoded)
         self._ctx = zmq.Context.instance()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -406,7 +499,7 @@ class TelemetryHub:
         with self._lock:
             self._queues.discard(q)
 
-    def _fanout(self, payload: str) -> None:
+    def _fanout(self, payload: str | HubMessage) -> None:
         with self._lock:
             queues = list(self._queues)
         for q in queues:
@@ -436,22 +529,30 @@ class TelemetryHub:
                 topic_b, payload_b = sub.recv_multipart()
             except Exception:
                 continue
-            payload = safe_json_loads(payload_b)
-            payload = _sanitize_json(payload)
             msg = {
                 "topic": topic_b.decode("utf-8"),
-                "payload": payload,
+                "payload": safe_json_loads(payload_b),
             }
             # Serialize once in the hub thread; the resulting str is the
             # exact bytes every subscriber will send over its WebSocket.
             # N subscribers no longer each pay `json.dumps(msg)` per
-            # payload.
+            # payload. orjson already writes NaN/Inf as null, so the
+            # recursive `_sanitize_json` walk is only needed when it
+            # rejects the payload and the stdlib fallback would emit
+            # non-spec NaN literals.
             try:
-                serialized = json_dumps(msg).decode("utf-8")
-            except Exception:
-                continue
+                serialized = orjson.dumps(msg).decode("utf-8")
+            except TypeError:
+                msg["payload"] = _sanitize_json(msg["payload"])
+                try:
+                    serialized = json_dumps(msg).decode("utf-8")
+                except Exception:
+                    continue
+            item: str | HubMessage = (
+                HubMessage(serialized, msg) if self._keep_decoded else serialized
+            )
             if self._loop is not None:
-                self._loop.call_soon_threadsafe(self._fanout, serialized)
+                self._loop.call_soon_threadsafe(self._fanout, item)
         sub.setsockopt(zmq.LINGER, 0)
         sub.close(0)
 
@@ -746,25 +847,7 @@ class StreamFrameHub:
                 shape=shape,
             )
 
-        # Mirrors stream_analysis._build_trace_snapshot_payload: avoid
-        # walking the values list through _sanitize_json on every frame.
-        # `np.isfinite(...).all()` is one vectorised pass; the slow
-        # per-element scrub only triggers when there's real NaN/Inf to
-        # replace. Integer dtypes are always finite so they take the
-        # fast path trivially.
-        values = values_arr.tolist()
-        try:
-            needs_scrub = (
-                values_arr.size > 0
-                and values_arr.dtype.kind in ("f", "c")
-                and not bool(np.isfinite(values_arr).all())
-            )
-        except (TypeError, ValueError):
-            needs_scrub = True
-        if needs_scrub:
-            for i, x in enumerate(values):
-                if isinstance(x, float) and not math.isfinite(x):
-                    values[i] = None
+        values = _json_values(values_arr)
         out: dict[str, Any] = {
             "version": 1,
             "device_id": device_id,
@@ -1161,6 +1244,34 @@ class StreamFrameHub:
 
         sub.setsockopt(zmq.LINGER, 0)
         sub.close(0)
+
+
+def _json_values(arr: np.ndarray) -> np.ndarray | list[Any]:
+    """Stream-frame ``values`` in a form `json_dumps` encodes directly.
+
+    orjson (OPT_SERIALIZE_NUMPY) writes native-endian contiguous numeric
+    arrays straight from the buffer, NaN/Inf as ``null``, producing the same
+    JSON as ``tolist()`` without building a Python float per sample on every
+    frame. Most frames are never JSON-encoded at all (binary and raw-stream
+    consumers read the private arrays), so this also skips that work for
+    them. Other arrays fall back to a scrubbed list.
+    """
+    if arr.dtype.kind in "biuf" and arr.dtype.isnative and arr.flags.c_contiguous:
+        return arr
+    values = arr.tolist()
+    try:
+        needs_scrub = (
+            arr.size > 0
+            and arr.dtype.kind in ("f", "c")
+            and not bool(np.isfinite(arr).all())
+        )
+    except (TypeError, ValueError):
+        needs_scrub = True
+    if needs_scrub:
+        for i, x in enumerate(values):
+            if isinstance(x, float) and not math.isfinite(x):
+                values[i] = None
+    return values
 
 
 def _sanitize_json(value: Any) -> Any:
