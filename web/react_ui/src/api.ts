@@ -889,9 +889,13 @@ export async function fetchStreams(signal?: AbortSignal): Promise<StreamCatalogE
   return resp.result;
 }
 
-export async function fetchCapabilities(deviceId: string): Promise<CapabilityMember[]> {
+export async function fetchCapabilities(
+  deviceId: string,
+  signal?: AbortSignal
+): Promise<CapabilityMember[]> {
   const resp = await apiFetch<{ members?: CapabilityMember[] }>(
-    `/api/devices/${deviceId}/capabilities`
+    `/api/devices/${deviceId}/capabilities`,
+    { signal }
   );
   if (!resp.ok || !resp.result) {
     return [];

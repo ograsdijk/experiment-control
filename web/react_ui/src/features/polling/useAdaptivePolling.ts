@@ -13,7 +13,45 @@ export type AdaptivePollingOptions<T> = {
   pollImmediately?: boolean;
   endpoint?: string;
   restartKey?: unknown;
+  /**
+   * Abort a poll that has not completed after this long. Defaults to
+   * `defaultPollTimeoutMs(intervalMs)`. Without it a hung request would hold
+   * the in-flight guard forever and silently stop this poll.
+   */
+  timeoutMs?: number;
 };
+
+const MIN_POLL_TIMEOUT_MS = 10000;
+
+export function defaultPollTimeoutMs(intervalMs: number): number {
+  return Math.max(intervalMs * 3, MIN_POLL_TIMEOUT_MS);
+}
+
+/**
+ * Settle with `work`, or reject with an AbortError as soon as `signal`
+ * aborts. Many poll callbacks never thread the signal into their fetches, so
+ * aborting alone would not release the in-flight guard on a hung request.
+ */
+export function abortable<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) {
+    void work.catch(() => undefined);
+    return Promise.reject(new DOMException("Poll aborted", "AbortError"));
+  }
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(new DOMException("Poll aborted", "AbortError"));
+    signal.addEventListener("abort", onAbort, { once: true });
+    work.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (error) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      }
+    );
+  });
+}
 
 /** Completion-scheduled polling with visibility, equality, and abort handling. */
 export function useAdaptivePolling<T>({
@@ -27,6 +65,7 @@ export function useAdaptivePolling<T>({
   pollImmediately = true,
   endpoint = "unknown",
   restartKey,
+  timeoutMs,
 }: AdaptivePollingOptions<T>): void {
   const pollRef = useRef(poll);
   const onValueRef = useRef(onValue);
@@ -72,10 +111,18 @@ export function useAdaptivePolling<T>({
       }
       refreshPending = false;
       inFlight = true;
-      controller = new AbortController();
+      const requestController = new AbortController();
+      controller = requestController;
+      const timeoutTimer = setTimeout(
+        () => requestController.abort(),
+        timeoutMs ?? defaultPollTimeoutMs(intervalMs)
+      );
       perfCountScoped("poll.requests", endpoint);
       try {
-        const next = await pollRef.current(controller.signal);
+        const next = await abortable(
+          pollRef.current(requestController.signal),
+          requestController.signal
+        );
         if (!cancelled && (!hasValue || !equalityRef.current(previousValue, next))) {
           previousValue = next;
           hasValue = true;
@@ -86,6 +133,7 @@ export function useAdaptivePolling<T>({
           // Endpoint-specific refreshers retain their existing error presentation.
         }
       } finally {
+        clearTimeout(timeoutTimer);
         inFlight = false;
         controller = null;
         if (cancelled || hidden()) {
@@ -131,5 +179,6 @@ export function useAdaptivePolling<T>({
     pollImmediately,
     refreshOnVisible,
     restartKey,
+    timeoutMs,
   ]);
 }

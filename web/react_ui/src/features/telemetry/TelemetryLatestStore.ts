@@ -112,9 +112,33 @@ export class TelemetryLatestStore {
     return () => this.connectionListeners.delete(listener);
   };
 
+  /**
+   * Merge a REST snapshot. A snapshot can land after live messages (it is
+   * refetched on every reconnect), so a signal already holding a newer
+   * `ts.t_wall` keeps its live value.
+   */
   hydrate(snapshot: LatestSignals): void {
     for (const [deviceId, signals] of Object.entries(snapshot)) {
-      this.mergeDevice(deviceId, signals);
+      const existing = this.devices.get(deviceId);
+      if (!existing) {
+        this.mergeDevice(deviceId, signals);
+        continue;
+      }
+      const fresher: Record<string, TelemetrySignal> = {};
+      for (const [name, signal] of Object.entries(signals)) {
+        const current = existing[name]?.ts?.t_wall;
+        const incoming = signal?.ts?.t_wall;
+        // A timestamped live value beats a snapshot entry that is older or
+        // carries no timestamp to compare against.
+        if (
+          typeof current === "number" &&
+          (typeof incoming !== "number" || current > incoming)
+        ) {
+          continue;
+        }
+        fresher[name] = signal;
+      }
+      this.mergeDevice(deviceId, fresher);
     }
   }
 

@@ -1,7 +1,10 @@
 import { useCallback, useEffect, useState } from "react";
 import { fetchProcesses, type ApiResponse } from "../../api";
 import type { CapabilityMember, ProcessStatus } from "../../types";
-import { sameProcessStatuses } from "../polling/pollEquality";
+import {
+  sameProcessStatuses,
+  sameProcessStatusesCoarse,
+} from "../polling/pollEquality";
 import { useAdaptivePolling } from "../polling/useAdaptivePolling";
 
 type UseProcessesControllerArgs = {
@@ -10,6 +13,13 @@ type UseProcessesControllerArgs = {
     action: string,
     params: Record<string, unknown>
   ) => Promise<ApiResponse<unknown>>;
+  /**
+   * True while a view outside the Processes modal shows live process
+   * heartbeat ages (Safety, State machines). The poll then compares
+   * statuses exactly; otherwise ages/RSS are compared coarsely so a ticking
+   * heartbeat age does not re-render App every poll.
+   */
+  exactStatus?: boolean;
 };
 
 function extractCapabilityMembers(
@@ -44,7 +54,10 @@ function isProcessRpcReady(process: ProcessStatus | undefined): boolean {
   return endpoint.length > 0;
 }
 
-export function useProcessesController({ callProcessFn }: UseProcessesControllerArgs) {
+export function useProcessesController({
+  callProcessFn,
+  exactStatus = false,
+}: UseProcessesControllerArgs) {
   const [processes, setProcesses] = useState<ProcessStatus[]>([]);
   const [processOpen, setProcessOpen] = useState(false);
   const [processBusyById, setProcessBusyById] = useState<
@@ -130,7 +143,8 @@ export function useProcessesController({ callProcessFn }: UseProcessesController
     intervalMs: 5000,
     poll: (signal) => fetchProcesses(signal),
     onValue: setProcesses,
-    equality: sameProcessStatuses,
+    equality:
+      exactStatus || processOpen ? sameProcessStatuses : sameProcessStatusesCoarse,
     endpoint: "/api/processes",
   });
 

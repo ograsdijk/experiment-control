@@ -166,3 +166,47 @@ export function toPrettyJson(value: unknown): string {
     return String(value);
   }
 }
+
+export type LogRowFilters = {
+  severity: string;
+  sourceKind: string;
+  deviceId: string;
+  processId: string;
+  text: string;
+  newestFirst: boolean;
+};
+
+/** Apply the Logs modal filters to rows stored oldest→newest. */
+export function filterLogRows(
+  rows: readonly LogEntry[],
+  filters: LogRowFilters
+): LogEntry[] {
+  const needle = filters.text.trim().toLowerCase();
+  const filtered = rows.filter((entry) => {
+    const severity = String(entry.severity ?? "").toLowerCase();
+    if (filters.severity !== "all" && severity !== filters.severity) {
+      return false;
+    }
+    const sourceKind = String(entry.source_kind ?? "").toLowerCase();
+    if (filters.sourceKind !== "all" && sourceKind !== filters.sourceKind) {
+      return false;
+    }
+    const deviceId = String(entry.device_id ?? "");
+    if (filters.deviceId !== "all" && deviceId !== filters.deviceId) {
+      return false;
+    }
+    const processId = String(entry.process_id ?? "");
+    if (filters.processId !== "all" && processId !== filters.processId) {
+      return false;
+    }
+    if (!needle) {
+      return true;
+    }
+    const haystack = `${entry.topic ?? ""} ${entry.message ?? ""} ${
+      entry.payload_json ?? ""
+    }`.toLowerCase();
+    return haystack.includes(needle);
+  });
+  // Rows are stored oldest→newest; reverse for newest-first display.
+  return filters.newestFirst ? filtered.reverse() : filtered;
+}

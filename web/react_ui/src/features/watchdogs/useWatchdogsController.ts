@@ -8,6 +8,7 @@ import {
   isProcessRpcStateAvailable,
   supportsProcessCapability,
 } from "../runtime/helpers";
+import { mapWithConcurrency } from "../common/concurrency";
 import { useAdaptivePolling } from "../polling/useAdaptivePolling";
 import type {
   CapabilityMember,
@@ -20,6 +21,8 @@ import {
   hasWatchdogActionFailure,
   isWatchdogRuleConfirming,
 } from "./watchdogStatusApi";
+
+const STATUS_POLL_CONCURRENCY = 4;
 
 type UseWatchdogsControllerArgs = {
   safetyOpen: boolean;
@@ -307,10 +310,9 @@ export function useWatchdogsController({
     enabled: !safetyOpen,
     intervalMs: 10000,
     poll: async () => {
-      for (const process of processes) {
-        if (!isProcessRpcStateAvailable(process)) {
-          continue;
-        }
+      // Concurrent (bounded) so one slow process does not delay the rest.
+      const available = processes.filter(isProcessRpcStateAvailable);
+      await mapWithConcurrency(available, STATUS_POLL_CONCURRENCY, async (process) => {
         const processId = process.process_id;
         const caps = capabilitiesByProcessRef.current[processId] ?? [];
         let effectiveCaps = caps;
@@ -320,7 +322,7 @@ export function useWatchdogsController({
         if (supportsProcessCapability(effectiveCaps, "watchdog.status")) {
           await refreshWatchdogProcessStatus(processId, process);
         }
-      }
+      });
     },
     onValue: () => undefined,
     endpoint: "/api/watchdogs/summary",

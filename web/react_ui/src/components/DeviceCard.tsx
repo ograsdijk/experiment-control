@@ -38,6 +38,7 @@ import { perfCountScoped } from "../features/performance/perfInstrumentation";
 import { useDisplayedTelemetrySignal } from "../features/telemetry/DeviceTelemetryPresentationStore";
 import { useDeviceTelemetrySignalNames } from "../features/telemetry/TelemetryLatestStore";
 import { useNearViewport } from "../features/layout/useNearViewport";
+import { formatCoarseAge } from "../features/devices/health";
 
 type CapabilityParamMeta = NonNullable<CapabilityMember["params"]>[number];
 type TelemetryTooltipStyles =
@@ -380,7 +381,7 @@ export function DeviceCard({
               <DeviceNameInline deviceId={device.device_id} device={device} fw={600} />
             </Text>
             <Text size="xs" c="dimmed">
-              hb age {device.hb_age_s?.toFixed(2) ?? "n/a"} s
+              hb age {formatCoarseAge(device.hb_age_s)}
             </Text>
           </Stack>
           <Group gap={6} align="center">

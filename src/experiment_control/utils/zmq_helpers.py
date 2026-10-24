@@ -4,6 +4,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable
 
+import numpy as np
 import orjson
 import zmq
 import zmq.utils.jsonapi
@@ -64,11 +65,30 @@ def json_dumps(payload: Any) -> bytes:
         # Fallback for types orjson refuses (complex numbers,
         # non-string dict keys, custom objects, etc.). NaN/Inf
         # do NOT take this path — orjson encodes them as `null`.
-        return zmq.utils.jsonapi.dumps(payload)
+        return zmq.utils.jsonapi.dumps(payload, default=_json_fallback_default)
+
+
+def _json_fallback_default(value: Any) -> Any:
+    # The stdlib fallback must still encode the numpy values orjson accepts
+    # natively (e.g. stream-frame arrays), or one odd sibling field would
+    # turn a whole message unencodable.
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
 
 
 def json_loads(data: bytes) -> Any:
-    return zmq.utils.jsonapi.loads(data)
+    # orjson parses several times faster than stdlib json, which matters on
+    # the gateway hubs that decode every manager PUB message. It rejects the
+    # non-spec NaN/Infinity literals (still emitted by the stdlib fallback
+    # encoder above) and integers beyond 64 bits, so those fall back to the
+    # stdlib parser with unchanged results.
+    try:
+        return orjson.loads(data)
+    except orjson.JSONDecodeError:
+        return zmq.utils.jsonapi.loads(data)
 
 
 def safe_json_loads(data: bytes) -> Any | None:

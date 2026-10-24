@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { buildWsUrl, fetchLogTail } from "../../api";
 import { normalizeLogEntry } from "./utils";
+import { openReconnectingSocket, reconnectDelayMs } from "../common/reconnectingSocket";
 import type { LogEntry, LogMessage } from "../../types";
 
 export type UseLogsStreamOptions = {
@@ -18,6 +19,18 @@ export type UseLogsStreamOptions = {
    * swallowed so a bad listener can't tear down the socket.
    */
   onEntry?: (entry: LogEntry) => void;
+  /**
+   * Optional callback fired once per coalesced batch (oldest first). Live
+   * lines are buffered for `LOG_BATCH_FLUSH_MS` and reconnect catch-up is
+   * delivered as one batch, so a burst costs one state update.
+   */
+  onEntries?: (entries: LogEntry[]) => void;
+  /**
+   * Keep the in-hook `entries` buffer (default true). Consumers that only
+   * use the callbacks should pass false so a log line does not re-render
+   * the calling component.
+   */
+  trackEntries?: boolean;
 };
 
 export type UseLogsStreamResult = {
@@ -25,22 +38,30 @@ export type UseLogsStreamResult = {
   wsConnected: boolean;
 };
 
+/** Upper bound of the logs socket's reconnect delay (before jitter). */
 export function logsReconnectDelayMs(attempt: number): number {
-  return Math.min(1000 * 2 ** Math.max(0, attempt), 30000);
+  return reconnectDelayMs(attempt, { jitterRatio: 0 });
 }
+
+/** Window over which live log lines are coalesced into one dispatch. */
+export const LOG_BATCH_FLUSH_MS = 50;
 
 /**
  * Subscribe to /ws/logs and accumulate normalized entries (newest first).
  */
 export function useLogsStream(options: UseLogsStreamOptions = {}): UseLogsStreamResult {
-  const { maxEntries = 100, seedLimit, onEntry } = options;
+  const { maxEntries = 100, seedLimit, onEntry, onEntries, trackEntries = true } = options;
   const [entries, setEntries] = useState<LogEntry[]>([]);
   const [wsConnected, setWsConnected] = useState(false);
   const onEntryRef = useRef(onEntry);
   onEntryRef.current = onEntry;
+  const onEntriesRef = useRef(onEntries);
+  onEntriesRef.current = onEntries;
+  const trackEntriesRef = useRef(trackEntries);
+  trackEntriesRef.current = trackEntries;
 
   useEffect(() => {
-    if (!seedLimit || seedLimit <= 0) {
+    if (!trackEntries || !seedLimit || seedLimit <= 0) {
       return;
     }
     let cancelled = false;
@@ -66,25 +87,57 @@ export function useLogsStream(options: UseLogsStreamOptions = {}): UseLogsStream
     return () => {
       cancelled = true;
     };
-  }, [seedLimit, maxEntries]);
+  }, [seedLimit, maxEntries, trackEntries]);
 
   useEffect(() => {
     let disposed = false;
-    let ws: WebSocket | null = null;
-    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-    let reconnectAttempt = 0;
-    let needsCatchUp = false;
+    let pending: LogEntry[] = [];
+    let flushTimer: ReturnType<typeof setTimeout> | null = null;
 
-    const dispatchEntry = (entry: LogEntry) => {
-      setEntries((prev) => [entry, ...prev].slice(0, maxEntries));
+    // Dispatch a batch (oldest first): one setEntries, one onEntries.
+    const dispatchBatch = (batch: LogEntry[]) => {
+      if (disposed || batch.length === 0) {
+        return;
+      }
+      if (trackEntriesRef.current) {
+        const newestFirst = batch.slice(-maxEntries).reverse();
+        setEntries((prev) => [...newestFirst, ...prev].slice(0, maxEntries));
+      }
+      const batchHandler = onEntriesRef.current;
+      if (batchHandler) {
+        try {
+          batchHandler(batch);
+        } catch {
+          // A bad listener must not tear down the socket.
+        }
+      }
       const handler = onEntryRef.current;
       if (!handler) {
         return;
       }
-      try {
-        handler(entry);
-      } catch {
-        return;
+      for (const entry of batch) {
+        try {
+          handler(entry);
+        } catch {
+          continue;
+        }
+      }
+    };
+
+    const flushPending = () => {
+      if (flushTimer !== null) {
+        clearTimeout(flushTimer);
+        flushTimer = null;
+      }
+      const batch = pending;
+      pending = [];
+      dispatchBatch(batch);
+    };
+
+    const enqueueEntry = (entry: LogEntry) => {
+      pending.push(entry);
+      if (flushTimer === null) {
+        flushTimer = setTimeout(flushPending, LOG_BATCH_FLUSH_MS);
       }
     };
 
@@ -96,42 +149,33 @@ export function useLogsStream(options: UseLogsStreamOptions = {}): UseLogsStream
         }
         const raw = resp.result as { entries?: unknown[]; items?: unknown[] };
         const list = raw.entries ?? raw.items ?? [];
-        for (const item of list) {
-          const entry = normalizeLogEntry(item);
-          if (entry) {
-            dispatchEntry(entry);
-          }
+        const batch = list
+          .map((item) => normalizeLogEntry(item))
+          .filter((entry): entry is LogEntry => entry !== null);
+        // Catch-up rows are older than any live lines buffered meanwhile;
+        // deliver both in one chronological batch.
+        if (flushTimer !== null) {
+          clearTimeout(flushTimer);
+          flushTimer = null;
         }
+        const live = pending;
+        pending = [];
+        dispatchBatch([...batch, ...live]);
       } catch {
         return;
       }
     };
 
-    const connect = () => {
-      if (disposed) {
-        return;
-      }
-      ws = new WebSocket(buildWsUrl("/ws/logs"));
-      ws.onopen = () => {
-        reconnectAttempt = 0;
+    const socket = openReconnectingSocket({
+      url: buildWsUrl("/ws/logs"),
+      onOpen: ({ reconnect }) => {
         setWsConnected(true);
-        if (needsCatchUp) {
-          needsCatchUp = false;
+        if (reconnect) {
           void catchUp();
         }
-      };
-      ws.onclose = () => {
-        setWsConnected(false);
-        if (disposed) {
-          return;
-        }
-        needsCatchUp = true;
-        const delay = logsReconnectDelayMs(reconnectAttempt);
-        reconnectAttempt += 1;
-        reconnectTimer = setTimeout(connect, delay);
-      };
-      ws.onerror = () => setWsConnected(false);
-      ws.onmessage = (event) => {
+      },
+      onClose: () => setWsConnected(false),
+      onMessage: (event) => {
         try {
           const msg = JSON.parse(event.data) as LogMessage;
           if (msg.topic !== "manager.log") {
@@ -139,21 +183,19 @@ export function useLogsStream(options: UseLogsStreamOptions = {}): UseLogsStream
           }
           const entry = normalizeLogEntry(msg.payload);
           if (entry) {
-            dispatchEntry(entry);
+            enqueueEntry(entry);
           }
         } catch {
           return;
         }
-      };
-    };
+      },
+    });
 
-    connect();
     return () => {
+      // Deliver lines still waiting in the batch window before teardown.
+      flushPending();
       disposed = true;
-      if (reconnectTimer !== null) {
-        clearTimeout(reconnectTimer);
-      }
-      ws?.close();
+      socket.close();
     };
   }, [maxEntries]);
 
