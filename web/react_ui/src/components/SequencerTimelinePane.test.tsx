@@ -159,6 +159,32 @@ describe("SequencerTimelinePane", () => {
     expect(container.querySelectorAll(".seq-tl-pass.done").length).toBeGreaterThan(0);
   });
 
+  it("keeps a finished loop in the overview after its steps fold", () => {
+    const livePlan = normalizeSequencerPlan({
+      ...PLAN,
+      live: true,
+      steps: PLAN!.steps.map((step) => ({
+        path: step.path,
+        line: step.line,
+        kind: step.kind,
+        count: step.count,
+        iterations: step.iterations,
+        runs_done: step.count,
+        mean_s: 0.25,
+      })),
+    });
+    render({ plan: livePlan, runtimeState: "RUNNING" });
+    expect(container.querySelector(".seq-tl-collapsed")).not.toBeNull();
+    const loopSegment = container.querySelector(".seq-tl-seg-loop");
+    expect(loopSegment).not.toBeNull();
+    expect(loopSegment?.querySelectorAll(".seq-tl-pass.done")).toHaveLength(4);
+  });
+
+  it("says when the counts ignore invalid run overrides", () => {
+    render({ overridesInvalid: true });
+    expect(container.textContent).toContain("counts use the last valid overrides");
+  });
+
   it("says when the editor is not the loaded sequence", () => {
     render({ textNotLoaded: true });
     expect(container.querySelector(".seq-tl-tile")).toBeNull();

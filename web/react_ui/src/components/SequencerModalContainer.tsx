@@ -37,6 +37,8 @@ type Props = {
   runEvents: ReadonlyArray<SequencerRunEvent>;
   plan: SequencerPlan | null;
   planError: string | null;
+  planOverridesInvalid: boolean;
+  onTimelineVisibleChange: (visible: boolean) => void;
   loops: ReadonlyArray<SequencerLoopStatus>;
   autoloadError: string | null;
   statusError: string | null;

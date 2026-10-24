@@ -33,6 +33,8 @@ type Props = {
   outline: readonly SequencerStepOutlineNode[];
   plan: SequencerPlan | null;
   planError: string | null;
+  /** The run overrides have errors: the counts use the last valid ones. */
+  overridesInvalid?: boolean;
   loops: readonly SequencerLoopStatus[];
   runtimeState: string;
   /** The running step in the editor text (null: none to show). */
@@ -187,6 +189,7 @@ export function SequencerTimelinePane({
   outline,
   plan,
   planError,
+  overridesInvalid = false,
   loops,
   runtimeState,
   activeStep,
@@ -241,8 +244,15 @@ export function SequencerTimelinePane({
     () => new Set(live ? activeStep?.ancestorIds ?? [] : []),
     [live, activeStep]
   );
-  const passDone = useMemo(() => doneInPass(blocks, activeId), [blocks, activeId]);
-  const segments = useMemo(() => overviewSegments(blocks, loops, live), [blocks, loops, live]);
+  const passDone = useMemo(
+    () => doneInPass(blocks, activeId, activeAncestors),
+    [blocks, activeId, activeAncestors]
+  );
+  // From the unfolded blocks: a finished loop keeps its segment and passes.
+  const segments = useMemo(
+    () => overviewSegments(allBlocks, loops, live),
+    [allBlocks, loops, live]
+  );
   // The loop the run is in, else the one with the most work (the main scan,
   // not a short setup loop before it).
   const mainLoop = useMemo(() => {
@@ -338,7 +348,12 @@ export function SequencerTimelinePane({
     );
   };
 
-  const renderBlock = (block: TimelineBlock, col: number, depth: number): ReactNode => {
+  const renderBlock = (
+    block: TimelineBlock,
+    col: number,
+    depth: number,
+    width: number
+  ): ReactNode => {
     if (block.type === "collapsed") {
       const rows = BLOCK_ROWS;
       return (
@@ -367,7 +382,7 @@ export function SequencerTimelinePane({
           key={step.id}
           className={`seq-tl-lanes ${stepState(step)}`}
           style={{
-            gridColumn: `${col} / span ${block.width}`,
+            gridColumn: `${col} / span ${width}`,
             gridRow: `${depth + 1} / span ${rows}`,
           }}
         >
@@ -381,18 +396,21 @@ export function SequencerTimelinePane({
             <span className="seq-tl-name">{step.summary}</span>
             <span className="seq-tl-count">{countText(step.plan, live)}</span>
           </button>
-          {lanes.map((lane, index) => (
-            <div key={`${step.id}:${index}`} className="seq-tl-lane">
-              <span className="seq-tl-lane-label" title={lane.label}>
-                {lane.label}
-              </span>
-              {laneLeaves(lane.steps).length ? (
-                laneLeaves(lane.steps).map((leaf) => renderTile(leaf, {}, true))
-              ) : (
-                <span className="seq-tl-lane-empty">nothing</span>
-              )}
-            </div>
-          ))}
+          {lanes.map((lane, index) => {
+            const leaves = laneLeaves(lane.steps);
+            return (
+              <div key={`${step.id}:${index}`} className="seq-tl-lane">
+                <span className="seq-tl-lane-label" title={lane.label}>
+                  {lane.label}
+                </span>
+                {leaves.length ? (
+                  leaves.map((leaf) => renderTile(leaf, {}, true))
+                ) : (
+                  <span className="seq-tl-lane-empty">nothing</span>
+                )}
+              </div>
+            );
+          })}
         </div>
       );
     }
@@ -474,7 +492,12 @@ export function SequencerTimelinePane({
   return (
     <ScrollArea style={{ flex: 1, minHeight: 0 }} type="auto" offsetScrollbars>
       <Stack gap="sm" ref={widthRef}>
-        <PlanSummary plan={plan} planError={planError} live={live} />
+        <PlanSummary
+          plan={plan}
+          planError={planError}
+          overridesInvalid={overridesInvalid}
+          live={live}
+        />
         {activeLoops.length > 0 ? (
           <Group gap="md" wrap="wrap">
             <Text size="sm" fw={600}>
@@ -513,7 +536,9 @@ export function SequencerTimelinePane({
                 }}
               >
                 {line.bands.map((band, index) => renderBand(band, `${lineIndex}:b${index}`))}
-                {line.blocks.map((item) => renderBlock(item.block, item.col, item.depth))}
+                {line.blocks.map((item) =>
+                  renderBlock(item.block, item.col, item.depth, item.width)
+                )}
               </div>
             );
           })}
@@ -530,17 +555,27 @@ export function SequencerTimelinePane({
 function PlanSummary({
   plan,
   planError,
+  overridesInvalid,
   live,
 }: {
   plan: SequencerPlan | null;
   planError: string | null;
+  overridesInvalid: boolean;
   live: boolean;
 }) {
+  const overridesNote = overridesInvalid ? (
+    <Text size="xs" c="yellow">
+      The run overrides have errors: counts use the last valid overrides.
+    </Text>
+  ) : null;
   if (!plan) {
     return (
-      <Text size="xs" c={planError ? "red" : "dimmed"}>
-        {planError ? `Counts unavailable: ${planError}` : "Working out how often each step runs…"}
-      </Text>
+      <Stack gap={4}>
+        <Text size="xs" c={planError ? "red" : "dimmed"}>
+          {planError ? `Counts unavailable: ${planError}` : "Working out how often each step runs…"}
+        </Text>
+        {overridesNote}
+      </Stack>
     );
   }
   const items: { value: string; label: string }[] = [];
@@ -589,6 +624,7 @@ function PlanSummary({
           Counts may be out of date: {planError}
         </Text>
       ) : null}
+      {overridesNote}
     </Stack>
   );
 }

@@ -320,3 +320,72 @@ steps:
     ]);
   });
 });
+
+describe("timeline: if/parallel blocks", () => {
+  const yaml = `version: 1
+steps:
+  - for:
+      bind: {value: f}
+      in: {gen: {values: [1, 2]}}
+      do:
+        - call: {device: a, action: one}
+        - call: {device: b, action: two}
+        - if:
+            condition: true
+            then:
+              - call: {device: c, action: x}
+              - call: {device: c, action: y}
+              - call: {device: c, action: z}
+        - parallel:
+            do:
+              - call: {device: p, action: slow}
+              - call: {device: q, action: fast}
+        - call: {device: d, action: after}
+`;
+  const lines = yaml.split("\n");
+  const lineOfIn = (needle: string): number => lines.findIndex((line) => line.includes(needle)) + 1;
+  const tree = buildSequencerStepOutline(yaml);
+  const ifStep = tree[0].children[2];
+  const plan = normalizeSequencerPlan({
+    live: false,
+    certainty: "exact",
+    steps: [
+      { path: "steps[0]", line: tree[0].line, kind: "for", count: 1, iterations: 2 },
+      { path: "steps[0].for.do[0]", line: lineOfIn("action: one"), kind: "call", count: 2, mean_s: 1 },
+      { path: "steps[0].for.do[1]", line: lineOfIn("action: two"), kind: "call", count: 2, mean_s: 1 },
+      { path: "steps[0].for.do[3]", line: lineOfIn("- parallel:"), kind: "parallel", count: 2 },
+      { path: "steps[0].for.do[3].parallel.do[0]", line: lineOfIn("action: slow"), kind: "call", count: 2, mean_s: 3 },
+      { path: "steps[0].for.do[3].parallel.do[1]", line: lineOfIn("action: fast"), kind: "call", count: 2, mean_s: 1 },
+    ],
+  })!;
+  const steps = buildTimelineSteps(tree, plan, planStepsByLine(plan), new Set());
+
+  it("keeps a wide if block and its band inside a narrow grid", () => {
+    const blocks = timelineBlocks(steps);
+    expect(blocks.find((block) => block.type === "lanes" && block.step.kind === "if")?.width).toBe(3);
+    const wrapped = wrapTimeline(blocks, 2);
+    for (const line of wrapped) {
+      for (const item of line.blocks) {
+        expect(item.col + item.width - 1).toBeLessThanOrEqual(2);
+      }
+      for (const band of line.bands) {
+        expect(band.col1).toBeLessThanOrEqual(3);
+      }
+    }
+  });
+
+  it("dims the steps before an if whose branch is running", () => {
+    const blocks = timelineBlocks(steps);
+    const running = ifStep.children[1].id;
+    const done = doneInPass(blocks, running, new Set([tree[0].id, ifStep.id]));
+    expect(done).toEqual(new Set([tree[0].children[0].id, tree[0].children[1].id]));
+  });
+
+  it("times a parallel block by its slowest branch", () => {
+    const breakdown = passBreakdown(steps[0]);
+    const parallel = breakdown?.parts.find((part) => part.kind === "parallel");
+    // Per pass: 3 s slow branch, not 3 + 1 s.
+    expect(parallel?.seconds).toBe(3);
+    expect(breakdown?.totalS).toBe(5);
+  });
+});

@@ -264,6 +264,7 @@ export function useSequencerController({
   refreshProcesses,
 }: UseSequencerControllerArgs) {
   const [sequencerOpen, setSequencerOpen] = useState(false);
+  const [sequencerTimelineVisible, setSequencerTimelineVisible] = useState(false);
   const [sequencerStatusByProcessId, setSequencerStatusByProcessId] = useState<
     Record<string, SequencerStatus>
   >({});
@@ -1728,12 +1729,14 @@ export function useSequencerController({
   const sequencerPlanState = useSequencerPlan({
     callProcessFn,
     processId: sequencerProcess?.process_id ?? null,
-    enabled: sequencerOpen && sequencerLoaded,
+    // Only the Timeline tab shows the plan.
+    enabled: sequencerOpen && sequencerTimelineVisible && sequencerLoaded,
     loadedRevision: sequencerStatusRevision,
     runId: sequencerStatus?.runId ?? null,
     runtimeState: sequencerRuntimeState,
     completedSteps: sequencerCompletedSteps,
-    overrides: sequencerOverrideEvaluation.isValid ? sequencerOverrideEvaluation.payload : {},
+    overrides: sequencerOverrideEvaluation.payload,
+    overridesValid: sequencerOverrideEvaluation.isValid,
   });
   const sequencerPrimaryAction: "start" | "pause" | "resume" =
     sequencerRuntimeState === "RUNNING" || sequencerRuntimeState === "STOP_REQUESTED"
@@ -1820,6 +1823,8 @@ export function useSequencerController({
     sequencerRunEvents,
     sequencerPlan: sequencerPlanState.plan,
     sequencerPlanError: sequencerPlanState.error,
+    sequencerPlanOverridesInvalid: sequencerPlanState.overridesInvalid,
+    setSequencerTimelineVisible,
     sequencerLoops: sequencerStatus?.loops ?? [],
     sequencerModalError,
     sequencerAdaptiveModes,

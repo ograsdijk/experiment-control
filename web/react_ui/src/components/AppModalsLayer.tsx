@@ -387,6 +387,8 @@ export function AppModalsLayer({
         runEvents={sequencerController.sequencerRunEvents}
         plan={sequencerController.sequencerPlan}
         planError={sequencerController.sequencerPlanError}
+        planOverridesInvalid={sequencerController.sequencerPlanOverridesInvalid}
+        onTimelineVisibleChange={sequencerController.setSequencerTimelineVisible}
         loops={sequencerController.sequencerLoops}
         autoloadError={sequencerController.sequencerStatus?.autoloadError ?? null}
         statusError={sequencerController.sequencerStatus?.error ?? null}

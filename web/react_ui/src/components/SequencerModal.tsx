@@ -114,6 +114,10 @@ type Props = {
   /** `sequencer.plan` of the loaded sequence, for the Timeline tab. */
   plan: SequencerPlan | null;
   planError: string | null;
+  /** The run overrides have errors: the plan uses the last valid ones. */
+  planOverridesInvalid: boolean;
+  /** The Timeline tab is shown or hidden (the plan is fetched only while shown). */
+  onTimelineVisibleChange: (visible: boolean) => void;
   /** Loops the run is inside (`sequencer.status.loops`). */
   loops: ReadonlyArray<SequencerLoopStatus>;
   autoloadError: string | null;
@@ -219,6 +223,8 @@ export function SequencerModal({
   runEvents,
   plan,
   planError,
+  planOverridesInvalid,
+  onTimelineVisibleChange,
   loops,
   autoloadError,
   statusError,
@@ -287,6 +293,10 @@ export function SequencerModal({
   onJumpToDiagnostic,
 }: Props) {
   const [activeTab, setActiveTab] = useState<"steps" | "vars" | "yaml" | "timeline">("steps");
+  useEffect(() => {
+    onTimelineVisibleChange(activeTab === "timeline");
+    return () => onTimelineVisibleChange(false);
+  }, [activeTab, onTimelineVisibleChange]);
   const [overridesOpen, setOverridesOpen] = useState(false);
 
   useEffect(() => {
@@ -1258,6 +1268,7 @@ export function SequencerModal({
                   outline={outline}
                   plan={loaded ? plan : null}
                   planError={planError}
+                  overridesInvalid={planOverridesInvalid}
                   loops={loops}
                   runtimeState={runtimeState}
                   activeStep={activeStep}

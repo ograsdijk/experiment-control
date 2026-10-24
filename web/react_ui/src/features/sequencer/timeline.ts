@@ -427,7 +427,14 @@ export function collapseDoneBlocks(
   return out;
 }
 
-export type PlacedBlock = { block: TimelineBlock; index: number; col: number; depth: number };
+/** `width` is the block's width clamped to the line's columns. */
+export type PlacedBlock = {
+  block: TimelineBlock;
+  index: number;
+  col: number;
+  width: number;
+  depth: number;
+};
 
 export type TimelineBand = {
   step: TimelineStep;
@@ -474,7 +481,7 @@ export function wrapTimeline(blocks: readonly TimelineBlock[], columns: number):
       current = [];
       col = 1;
     }
-    current.push({ block, index, col, depth: block.ancestors.length });
+    current.push({ block, index, col, width, depth: block.ancestors.length });
     col += width;
   });
   if (current.length) {
@@ -500,7 +507,7 @@ function finishLine(
         step: open.step,
         depth,
         col0: open.start.col,
-        col1: open.end.col + Math.max(1, open.end.block.width),
+        col1: open.end.col + Math.max(1, open.end.width),
         continuesFromPrevious: (first.get(open.step) ?? 0) < open.start.index,
         continuesOnNext: (last.get(open.step) ?? 0) > open.end.index,
       });
@@ -543,15 +550,21 @@ export function liveLoopFor(
 
 /**
  * Blocks already done in the pass the run is in: before the running block
- * and inside a loop the running step is also inside (or in no loop).
+ * and inside a loop the running step is also inside (or in no loop). A step
+ * running inside an if/parallel is found by its ancestors: its block is the
+ * if/parallel.
  */
 export function doneInPass(
   blocks: readonly TimelineBlock[],
-  activeId: string | null
+  activeId: string | null,
+  activeAncestorIds: ReadonlySet<string> = new Set()
 ): Set<string> {
   const out = new Set<string>();
   const activeIndex = blocks.findIndex(
-    (block) => block.type !== "collapsed" && block.step.id === activeId
+    (block) =>
+      block.type !== "collapsed" &&
+      (block.step.id === activeId ||
+        (block.type === "lanes" && activeAncestorIds.has(block.step.id)))
   );
   if (activeIndex < 0) {
     return out;
@@ -719,20 +732,32 @@ function stepSeconds(step: TimelineStep): number | null {
   return null;
 }
 
+function sumSeconds(steps: readonly TimelineStep[]): { seconds: number; known: boolean } {
+  let seconds = 0;
+  let known = false;
+  for (const step of steps) {
+    const r = subtreeSeconds(step);
+    seconds += r.seconds;
+    known = known || r.known;
+  }
+  return { seconds, known };
+}
+
 function subtreeSeconds(step: TimelineStep): { seconds: number; known: boolean } {
+  if (step.kind === "parallel" && step.lanes?.length) {
+    // Branches run at the same time: the block takes as long as the slowest.
+    const lanes = step.lanes.map((lane) => sumSeconds(lane.steps));
+    return {
+      seconds: Math.max(...lanes.map((lane) => lane.seconds)),
+      known: lanes.some((lane) => lane.known),
+    };
+  }
   const children = step.lanes ? step.lanes.flatMap((lane) => lane.steps) : step.children;
   if (!children.length || step.kind === "use") {
     const own = stepSeconds(step);
     return { seconds: own ?? 0, known: own !== null };
   }
-  let seconds = 0;
-  let known = false;
-  for (const child of children) {
-    const r = subtreeSeconds(child);
-    seconds += r.seconds;
-    known = known || r.known;
-  }
-  return { seconds, known };
+  return sumSeconds(children);
 }
 
 /**

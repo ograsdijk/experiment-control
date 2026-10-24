@@ -19,13 +19,16 @@ export type SequencerPlanState = {
   plan: SequencerPlan | null;
   /** Why the latest request failed, if it did (the last plan is kept). */
   error: string | null;
+  /** The run overrides have errors: the plan uses the last valid ones. */
+  overridesInvalid: boolean;
 };
 
 /**
  * `sequencer.plan` of the loaded sequence. Fetched when it is (re)loaded, a
  * run starts or ends, or (idle) the run overrides change; during a run every
  * PLAN_LIVE_REFRESH_MS while steps keep finishing, for the counts so far and
- * the measured step times.
+ * the measured step times. While the overrides have errors it keeps asking
+ * with the last valid ones.
  */
 export function useSequencerPlan({
   callProcessFn,
@@ -36,6 +39,7 @@ export function useSequencerPlan({
   runtimeState,
   completedSteps,
   overrides,
+  overridesValid = true,
 }: {
   callProcessFn: CallProcessFn;
   processId: string | null;
@@ -45,15 +49,24 @@ export function useSequencerPlan({
   runtimeState: string;
   completedSteps: number | null;
   overrides: Record<string, unknown>;
+  overridesValid?: boolean;
 }): SequencerPlanState {
-  const [state, setState] = useState<SequencerPlanState & { key: string | null }>({
+  const [state, setState] = useState<{
+    key: string | null;
+    plan: SequencerPlan | null;
+    error: string | null;
+  }>({
     key: null,
     plan: null,
     error: null,
   });
   const requestIdRef = useRef(0);
   const live = LIVE_STATES.has(runtimeState);
-  const overridesKey = live ? "{}" : JSON.stringify(overrides);
+  const validOverridesKeyRef = useRef("{}");
+  if (overridesValid) {
+    validOverridesKeyRef.current = JSON.stringify(overrides);
+  }
+  const overridesKey = live ? "{}" : validOverridesKeyRef.current;
   const scopeKey = `${processId}|${loadedRevision}`;
   const [liveTick, setLiveTick] = useState(0);
   const completedRef = useRef<number | null>(null);
@@ -88,12 +101,13 @@ export function useSequencerPlan({
               return;
             }
             const plan = resp.ok ? normalizeSequencerPlan(resp.result) : null;
+            // A failure keeps the last plan only while it is for this scope.
             setState((prev) =>
               plan
                 ? { key: scopeKey, plan, error: null }
                 : {
-                    key: prev.key,
-                    plan: prev.plan,
+                    key: scopeKey,
+                    plan: prev.key === scopeKey ? prev.plan : null,
                     error:
                       resp.error?.code === "not_loaded"
                         ? null
@@ -103,7 +117,11 @@ export function useSequencerPlan({
           })
           .catch(() => {
             if (requestId === requestIdRef.current) {
-              setState((prev) => ({ ...prev, error: "the sequencer can't be reached" }));
+              setState((prev) => ({
+                key: scopeKey,
+                plan: prev.key === scopeKey ? prev.plan : null,
+                error: "the sequencer can't be reached",
+              }));
             }
           });
       },
@@ -115,8 +133,9 @@ export function useSequencerPlan({
     };
   }, [callProcessFn, processId, enabled, scopeKey, overridesKey, runId, live, liveTick]);
 
+  const overridesInvalid = !live && !overridesValid;
   if (!enabled || state.key !== scopeKey) {
-    return { plan: null, error: null };
+    return { plan: null, error: null, overridesInvalid };
   }
-  return { plan: state.plan, error: state.error };
+  return { plan: state.plan, error: state.error, overridesInvalid };
 }
