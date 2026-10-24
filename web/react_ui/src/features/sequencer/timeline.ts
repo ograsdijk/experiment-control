@@ -41,7 +41,7 @@ export type TimelineStep = {
   detail: string | null;
   disabled: boolean;
   plan: SequencerPlanStep | null;
-  /** Body of a container (for `try`, its steps then a `finally` block). */
+  /** Body of a container (a `try`'s `finally` is a block after the `try`). */
   children: TimelineStep[];
   /** Branches of an `if` (then/else) or `parallel` (one per branch). */
   lanes: { label: string; steps: TimelineStep[] }[] | null;
@@ -153,6 +153,7 @@ export function stepLabels(node: SequencerStepOutlineNode): { name: string; deta
     case "pause":
       return { name: node.pauseDetail?.reason ?? "pause", detail: null };
     case "try":
+      // Set by tryWithFinally.
       return { name: "", detail: null };
     case "use":
       return { name: (node.summary ?? "").replace(/^use\s+/, "") || "use", detail: "sub-sequence" };
@@ -211,7 +212,8 @@ function useSubSteps(plan: SequencerPlan, usePath: string): TimelineStep[] {
     list.push(entry);
     byParent.set(parent, list);
   }
-  const build = (entry: SequencerPlanStep): TimelineStep => {
+  // A step and, after a try, its finally block.
+  const buildAll = (entry: SequencerPlanStep): TimelineStep[] => {
     const kids = byParent.get(entry.path) ?? [];
     const step: TimelineStep = {
       id: `plan:${entry.path}`,
@@ -228,25 +230,66 @@ function useSubSteps(plan: SequencerPlan, usePath: string): TimelineStep[] {
     if (entry.kind === "if") {
       step.lanes = (["then", "else"] as const).map((branch) => ({
         label: branch,
-        steps: kids.filter((kid) => branchOf(kid.path) === branch).map(build),
+        steps: kids.filter((kid) => branchOf(kid.path) === branch).flatMap(buildAll),
       }));
     } else if (entry.kind === "parallel") {
-      step.lanes = kids.map((kid) => ({ label: kid.summary ?? kid.kind, steps: [build(kid)] }));
+      step.lanes = kids.map((kid) => ({ label: kid.summary ?? kid.kind, steps: buildAll(kid) }));
     } else if (entry.kind === "try") {
-      const body = kids.filter((kid) => branchOf(kid.path) === "do").map(build);
-      const fin = kids.filter((kid) => branchOf(kid.path) === "finally").map(build);
-      step.children = fin.length ? [...body, finallyBlock(step.id, fin)] : body;
+      return tryWithFinally(
+        step,
+        kids.filter((kid) => branchOf(kid.path) === "do").flatMap(buildAll),
+        kids.filter((kid) => branchOf(kid.path) === "finally").flatMap(buildAll)
+      );
     } else {
-      step.children = kids.map(build);
+      step.children = kids.flatMap(buildAll);
     }
-    return step;
+    return [step];
   };
-  return (byParent.get(usePath) ?? []).map(build);
+  return (byParent.get(usePath) ?? []).flatMap(buildAll);
+}
+
+/** Label of a `try` band whose `finally` block follows it. */
+export const TRY_FINALLY_LABEL = "finally after";
+/** Label of a `try` with no steps in its body (drawn as a block). */
+export const TRY_EMPTY_LABEL = "empty";
+
+/**
+ * A `try` holding its body, then its `finally` block (if any) at the same
+ * depth. A `try` with an empty body stays as a block of its own, so it can
+ * still show that it is disabled or running. The `finally` block is disabled
+ * with its `try`.
+ */
+function tryWithFinally(step: TimelineStep, body: TimelineStep[], fin: TimelineStep[]): TimelineStep[] {
+  step.children = body;
+  step.summary = !body.length ? TRY_EMPTY_LABEL : fin.length ? TRY_FINALLY_LABEL : "";
+  if (!fin.length) {
+    return [step];
+  }
+  return [step, { ...finallyBlock(step.id, fin), disabled: step.disabled }];
+}
+
+/**
+ * Mark every step inside a disabled step disabled too: the YAML flag is on
+ * the container only, but none of its steps run.
+ */
+function inheritDisabled(steps: readonly TimelineStep[], off = false): void {
+  for (const step of steps) {
+    step.disabled = step.disabled || off;
+    inheritDisabled(step.children, step.disabled);
+    for (const lane of step.lanes ?? []) {
+      inheritDisabled(lane.steps, step.disabled);
+    }
+  }
+}
+
+/** Id of the `finally` block of a `try`. */
+export function finallyBlockId(tryId: string): string {
+  return `${tryId}#finally`;
 }
 
 function finallyBlock(parentId: string, steps: TimelineStep[]): TimelineStep {
   return {
-    id: `${parentId}#finally`,
+    id: finallyBlockId(parentId),
     kind: "finally",
     line: steps[0]?.line ?? null,
     summary: "runs on finish, stop or error",
@@ -259,14 +302,20 @@ function finallyBlock(parentId: string, steps: TimelineStep[]): TimelineStep {
   };
 }
 
-/** The outline as timeline steps, with plan counts where the plan has them. */
+/**
+ * The outline as timeline steps, with plan counts where the plan has them.
+ * A `try`'s `finally` steps follow the `try` as a `finally` block at the same
+ * depth: the cleanup reads as what comes after the work, not part of it.
+ * Steps inside a disabled step are disabled.
+ */
 export function buildTimelineSteps(
   outline: readonly SequencerStepOutlineNode[],
   plan: SequencerPlan | null,
   byLine: Map<number, SequencerPlanStep[]>,
   expandedUses: ReadonlySet<string>
 ): TimelineStep[] {
-  const build = (node: SequencerStepOutlineNode): TimelineStep => {
+  // A step and, after a try, its finally block.
+  const buildAll = (node: SequencerStepOutlineNode): TimelineStep[] => {
     const entry = pickPlan(byLine, node);
     const labels = stepLabels(node);
     const step: TimelineStep = {
@@ -284,24 +333,28 @@ export function buildTimelineSteps(
     if (node.kind === "if") {
       step.lanes = (["then", "else"] as const).map((branch) => ({
         label: branch,
-        steps: node.children.filter((child) => child.branchLabel === branch).map(build),
+        steps: node.children.filter((child) => child.branchLabel === branch).flatMap(buildAll),
       }));
     } else if (node.kind === "parallel") {
-      step.lanes = node.children.map((child) => ({ label: laneLabel(child), steps: [build(child)] }));
+      step.lanes = node.children.map((child) => ({ label: laneLabel(child), steps: buildAll(child) }));
     } else if (node.kind === "try") {
-      const body = node.children.filter((child) => child.branchLabel !== "finally").map(build);
-      const fin = node.children.filter((child) => child.branchLabel === "finally").map(build);
-      step.children = fin.length ? [...body, finallyBlock(step.id, fin)] : body;
+      return tryWithFinally(
+        step,
+        node.children.filter((child) => child.branchLabel !== "finally").flatMap(buildAll),
+        node.children.filter((child) => child.branchLabel === "finally").flatMap(buildAll)
+      );
     } else if (node.kind === "use") {
       if (plan && step.usePath && expandedUses.has(step.id)) {
         step.children = useSubSteps(plan, step.usePath);
       }
     } else {
-      step.children = node.children.map(build);
+      step.children = node.children.flatMap(buildAll);
     }
-    return step;
+    return [step];
   };
-  return outline.map(build);
+  const steps = outline.flatMap(buildAll);
+  inheritDisabled(steps);
+  return steps;
 }
 
 // ---------------------------------------------------------------------------
@@ -533,6 +586,28 @@ function finishLine(
 
 // ---------------------------------------------------------------------------
 // Live state
+
+/**
+ * For every step in the timeline, the ids of the steps it is drawn inside
+ * (containers and if/parallel blocks), outermost first. Read off the built
+ * timeline, so it follows where the builder put each step: a step in a
+ * `try`'s `finally` is inside the `finally` block, not the `try`.
+ */
+export function timelineAncestorIndex(steps: readonly TimelineStep[]): Map<string, string[]> {
+  const out = new Map<string, string[]>();
+  const walk = (items: readonly TimelineStep[], chain: string[]) => {
+    for (const step of items) {
+      out.set(step.id, chain);
+      const inner = [...chain, step.id];
+      walk(step.children, inner);
+      for (const lane of step.lanes ?? []) {
+        walk(lane.steps, inner);
+      }
+    }
+  };
+  walk(steps, []);
+  return out;
+}
 
 /** The live loop entry for a timeline step, by line (or plan path in a use). */
 export function liveLoopFor(
