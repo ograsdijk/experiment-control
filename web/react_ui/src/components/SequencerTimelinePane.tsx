@@ -18,6 +18,7 @@ import {
   LOOP_KINDS,
   overviewSegments,
   passBreakdown,
+  timelineAncestorIndex,
   timelineBlocks,
   wrapTimeline,
   type OverviewSegment,
@@ -240,9 +241,10 @@ export function SequencerTimelinePane({
   );
   const lines = useMemo(() => wrapTimeline(blocks, columns), [blocks, columns]);
   const activeId = live ? activeStep?.leafId ?? null : null;
+  const ancestorIndex = useMemo(() => timelineAncestorIndex(steps), [steps]);
   const activeAncestors = useMemo(
-    () => new Set(live ? activeStep?.ancestorIds ?? [] : []),
-    [live, activeStep]
+    () => new Set(activeId !== null ? ancestorIndex.get(activeId) ?? [] : []),
+    [activeId, ancestorIndex]
   );
   const passDone = useMemo(
     () => doneInPass(blocks, activeId, activeAncestors),
@@ -433,6 +435,7 @@ export function SequencerTimelinePane({
       band.continuesFromPrevious ? "cont-l" : "",
       band.continuesOnNext ? "cont-r" : "",
       isActive ? "is-active" : "",
+      step.disabled ? "is-off" : "",
       step.plan?.iterationsCertainty === "unknown" || step.plan?.iterationsCertainty === "approximate"
         ? "is-open"
         : "",

@@ -4,6 +4,7 @@ import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MantineProvider } from "@mantine/core";
+import { resolveActiveStep } from "../features/sequencer/active_step";
 import { buildSequencerStepOutline } from "../features/sequencer/outline";
 import { normalizeSequencerLoops, normalizeSequencerPlan } from "../features/sequencer/plan";
 import { formatSeconds, SequencerTimelinePane } from "./SequencerTimelinePane";
@@ -183,6 +184,66 @@ describe("SequencerTimelinePane", () => {
   it("says when the counts ignore invalid run overrides", () => {
     render({ overridesInvalid: true });
     expect(container.textContent).toContain("counts use the last valid overrides");
+  });
+
+  it("marks the finally band, not the try band, while the finally runs", () => {
+    const yaml = `version: 1
+steps:
+  - try:
+      do:
+        - call: {device: a, action: one}
+        - call: {device: a, action: two}
+        - call: {device: a, action: three}
+      finally:
+        - call: {device: b, action: off}
+`;
+    const outline = buildSequencerStepOutline(yaml);
+    const plan = normalizeSequencerPlan({
+      live: true,
+      state: "RUNNING",
+      certainty: "exact",
+      steps: [
+        planEntry("steps[0]", 3, "try", 1),
+        { ...planEntry("steps[0].try.do[0]", 5, "call", 1), runs_done: 1 },
+        { ...planEntry("steps[0].try.do[1]", 6, "call", 1), runs_done: 1 },
+        { ...planEntry("steps[0].try.do[2]", 7, "call", 1), runs_done: 1 },
+        planEntry("steps[0].try.finally[0]", 9, "call", 1),
+      ],
+    });
+    render({ outline, plan, runtimeState: "RUNNING", activeStep: resolveActiveStep(outline, 9) });
+    const active = [...container.querySelectorAll(".seq-tl-band.is-active")];
+    expect(active.map((band) => band.querySelector(".seq-tl-band-kind")?.textContent)).toEqual(["finally"]);
+    expect(container.querySelector(".seq-tl-tile.is-running")?.textContent).toContain("b.off");
+    // The finished try body folds into one block; the overview has it done
+    // and the finally segment not yet.
+    expect(container.querySelector(".seq-tl-collapsed")?.textContent).toContain("3 steps");
+    const fill = (selector: string) =>
+      (container.querySelector(`${selector} .seq-tl-pass.done`) as HTMLElement | null)?.style.width;
+    expect(fill(".seq-tl-seg-steps")).toBe("100%");
+    expect(fill(".seq-tl-seg-finally")).toBe("0%");
+  });
+
+  it("outlines a running try with an empty body and greys a disabled one", () => {
+    const yaml = (extra: string) => `version: 1
+steps:
+  - try:
+      do: []
+      finally:
+        - call: {device: b, action: off}
+${extra}`;
+    const plan = normalizeSequencerPlan({
+      live: true,
+      state: "RUNNING",
+      certainty: "exact",
+      steps: [planEntry("steps[0]", 3, "try", 1), planEntry("steps[0].try.finally[0]", 6, "call", 1)],
+    });
+    const outline = buildSequencerStepOutline(yaml(""));
+    render({ outline, plan, runtimeState: "RUNNING", activeStep: resolveActiveStep(outline, 3) });
+    expect(container.querySelector(".seq-tl-tile.is-running .seq-tl-kind")?.textContent).toContain("try");
+
+    render({ outline: buildSequencerStepOutline(yaml("    disabled: true\n")), plan });
+    expect(container.querySelector(".seq-tl-tile.is-off .seq-tl-kind")?.textContent).toBe("try");
+    expect(container.querySelector(".seq-tl-band.is-off .seq-tl-band-kind")?.textContent).toBe("finally");
   });
 
   it("says when the editor is not the loaded sequence", () => {

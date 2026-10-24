@@ -6,9 +6,13 @@ import {
   collapseDoneBlocks,
   doneInPass,
   overviewSegments,
+  finallyBlockId,
   parentPlanPath,
   passBreakdown,
+  timelineAncestorIndex,
   timelineBlocks,
+  TRY_EMPTY_LABEL,
+  TRY_FINALLY_LABEL,
   unwrapTemplate,
   wrapTimeline,
   type TimelineStep,
@@ -112,9 +116,9 @@ describe("timeline layout", () => {
 
   it("matches plan entries to outline steps by line", () => {
     const steps = stepsFor(plan);
-    expect(steps.map((step) => step.kind)).toEqual(["assign", "call", "try"]);
+    expect(steps.map((step) => step.kind)).toEqual(["assign", "call", "try", "finally"]);
     const tryStep = steps[2];
-    expect(tryStep.children.map((child) => child.kind)).toEqual(["use", "call", "sleep", "for", "finally"]);
+    expect(tryStep.children.map((child) => child.kind)).toEqual(["use", "call", "sleep", "for"]);
     const freq = tryStep.children[3];
     expect(freq.plan?.iterations).toBe(11);
     expect(freq.plan?.iterationsCertainty).toBe("inferred");
@@ -132,7 +136,7 @@ describe("timeline layout", () => {
     expect(lines.map((line) => line.blocks.length)).toEqual([6, 5]);
     const tryBands = lines.map((line) => line.bands.find((band) => band.step.kind === "try")!);
     expect(tryBands[0]).toMatchObject({ col0: 3, col1: 7, continuesFromPrevious: false, continuesOnNext: true });
-    expect(tryBands[1]).toMatchObject({ col0: 1, col1: 6, continuesFromPrevious: true, continuesOnNext: false });
+    expect(tryBands[1]).toMatchObject({ col0: 1, col1: 4, continuesFromPrevious: true, continuesOnNext: false });
     // The frequency loop starts on line 1 and ends on line 2.
     const freqBands = lines.map((line) =>
       line.bands.find((band) => band.step.kind === "for" && band.depth === 1)
@@ -140,8 +144,141 @@ describe("timeline layout", () => {
     expect(freqBands[0]).toMatchObject({ col0: 6, col1: 7, continuesOnNext: true });
     expect(freqBands[1]).toMatchObject({ col0: 1, col1: 4, continuesFromPrevious: true });
     expect(lines[1].bandRows).toBe(4);
+    // finally follows the try band at the same depth, not inside it.
     const finallyBand = lines[1].bands.find((band) => band.step.kind === "finally");
-    expect(finallyBand).toMatchObject({ depth: 1, col0: 4, col1: 6 });
+    expect(finallyBand).toMatchObject({ depth: 0, col0: 4, col1: 6, continuesFromPrevious: false });
+    expect(blocks[9].ancestors.map((a) => a.kind)).toEqual(["finally"]);
+  });
+
+  it("labels a try band that has a finally", () => {
+    const steps = stepsFor(plan);
+    expect(steps[2].summary).toBe(TRY_FINALLY_LABEL);
+    expect(steps[3].id).toBe(finallyBlockId(steps[2].id));
+    const bare = buildTimelineSteps(
+      buildSequencerStepOutline(`version: 1
+steps:
+  - try:
+      do:
+        - call: {device: a, action: b}
+`),
+      null,
+      new Map(),
+      new Set()
+    );
+    expect(bare.map((step) => [step.kind, step.summary])).toEqual([["try", ""]]);
+  });
+
+  it("puts a finally after its try inside an opened use: sub-sequence", () => {
+    const yaml = `version: 1
+steps:
+  - use: cleanup_scan
+`;
+    const tree = buildSequencerStepOutline(yaml);
+    const sub = (path: string, kind: string) => ({ path, line: null, use_id: "cleanup_scan", kind, count: 1 });
+    const usePlan = normalizeSequencerPlan({
+      live: false,
+      certainty: "exact",
+      steps: [
+        { path: "steps[0]", line: tree[0].line, kind: "use", count: 1 },
+        sub("steps[0].use.steps[0]", "try"),
+        sub("steps[0].use.steps[0].try.do[0]", "call"),
+        sub("steps[0].use.steps[0].try.finally[0]", "call"),
+      ],
+    })!;
+    const [use] = buildTimelineSteps(tree, usePlan, planStepsByLine(usePlan), new Set([tree[0].id]));
+    expect(use.children.map((child) => [child.kind, child.summary])).toEqual([
+      ["try", TRY_FINALLY_LABEL],
+      ["finally", "runs on finish, stop or error"],
+    ]);
+    expect(use.children[0].children).toHaveLength(1);
+    expect(use.children[1].children).toHaveLength(1);
+  });
+
+  it("labels a use: try without a finally like one in the sequence", () => {
+    const tree = buildSequencerStepOutline(`version: 1
+steps:
+  - use: plain_try
+`);
+    const usePlan = normalizeSequencerPlan({
+      live: false,
+      certainty: "exact",
+      steps: [
+        { path: "steps[0]", line: tree[0].line, kind: "use", count: 1 },
+        { path: "steps[0].use.steps[0]", line: null, use_id: "plain_try", kind: "try", summary: "try", count: 1 },
+        { path: "steps[0].use.steps[0].try.do[0]", line: null, use_id: "plain_try", kind: "call", count: 1 },
+      ],
+    })!;
+    const [use] = buildTimelineSteps(tree, usePlan, planStepsByLine(usePlan), new Set([tree[0].id]));
+    expect(use.children.map((child) => [child.kind, child.summary])).toEqual([["try", ""]]);
+  });
+
+  it("keeps a try with an empty body as a block before its finally", () => {
+    const build = (extra: string) =>
+      buildTimelineSteps(
+        buildSequencerStepOutline(`version: 1
+steps:
+  - try:
+      do: []
+      finally:
+        - call: {device: a, action: off}
+${extra}`),
+        null,
+        new Map(),
+        new Set()
+      );
+    const steps = build("");
+    expect(steps.map((step) => [step.kind, step.summary])).toEqual([
+      ["try", TRY_EMPTY_LABEL],
+      ["finally", "runs on finish, stop or error"],
+    ]);
+    expect(timelineBlocks(steps).map((block) => block.type === "step" && block.step.kind)).toEqual([
+      "try",
+      "call",
+    ]);
+    // A disabled try keeps its flag, and its finally block is disabled too.
+    const off = build("    disabled: true\n");
+    expect(off.map((step) => step.disabled)).toEqual([true, true]);
+  });
+
+  it("disables the steps inside a disabled container", () => {
+    const steps = buildTimelineSteps(
+      buildSequencerStepOutline(`version: 1
+steps:
+  - for:
+      bind: {value: f}
+      in: {gen: {values: [1, 2]}}
+      do:
+        - call: {device: a, action: one}
+        - if:
+            condition: true
+            then:
+              - call: {device: a, action: two}
+    disabled: true
+  - call: {device: b, action: after}
+`),
+      null,
+      new Map(),
+      new Set()
+    );
+    const loop = steps[0];
+    expect([loop.disabled, loop.children[0].disabled, loop.children[1].lanes![0].steps[0].disabled]).toEqual([
+      true,
+      true,
+      true,
+    ]);
+    expect(steps[1].disabled).toBe(false);
+  });
+
+  it("puts a step in a finally inside the finally block, not the try", () => {
+    const steps = stepsFor(plan);
+    const index = timelineAncestorIndex(steps);
+    const tryId = steps[2].id;
+    const disarm = steps[3].children[0];
+    expect(index.get(disarm.id)).toEqual([finallyBlockId(tryId)]);
+    const flush = steps[2].children[1];
+    expect(index.get(flush.id)).toEqual([tryId]);
+    const read = steps[2].children[3].children[2].children[1].children[0];
+    expect(index.get(read.id)?.length).toBe(4);
   });
 
   it("shows the steps of a use: sub-sequence when it is expanded", () => {
