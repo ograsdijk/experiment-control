@@ -19,7 +19,9 @@ and PowerShell 7 (``pwsh``).
 from __future__ import annotations
 
 import argparse
+import gzip
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -131,6 +133,46 @@ def step_ui_tests() -> None:
     _run(["npm", "test"], cwd=ROOT / UI_SOURCE)
 
 
+# Budget for the UI's entry chunk (gzip). The 2026-10 split moved the YAML
+# parser and sequencer editing code into lazy chunks (222 -> 182 KB); raise
+# this deliberately, not to make a regression pass.
+UI_ENTRY_GZIP_BUDGET_BYTES = 200 * 1024
+# A string only the `yaml` package contains; it belongs in a lazy chunk.
+UI_ENTRY_FORBIDDEN_MARKERS = ("YAMLParseError",)
+
+
+def step_ui_bundle_budget() -> None:
+    dist = ROOT / PACKAGED_UI
+    index_html = (dist / "index.html").read_text(encoding="utf-8")
+    # Lab PCs may have no internet: the page must not load anything external.
+    external_urls = re.findall(r"""(?:src|href)=["']((?:https?:)?//[^"']+)""", index_html)
+    if external_urls:
+        raise StepFailed(f"index.html references external URLs: {external_urls}")
+    # Stylesheets can pull in fonts or other CSS too (`@import`, `url()`).
+    for css in sorted((dist / "assets").glob("*.css")):
+        css_urls = re.findall(
+            r"""(?:@import\s+(?:url\()?|url\()\s*["']?((?:https?:)?//[^"')\s]+)""",
+            css.read_text(encoding="utf-8"),
+        )
+        if css_urls:
+            raise StepFailed(f"{css.name} references external URLs: {css_urls}")
+    entry =re.search(r"""<script[^>]+src=["']/?(assets/index-[^"']+\.js)["']""", index_html)
+    if entry is None:
+        raise StepFailed("could not find the entry chunk in index.html")
+    code = (dist / entry.group(1)).read_bytes()
+    gzip_bytes = len(gzip.compress(code, compresslevel=9))
+    print(f"  entry chunk {entry.group(1)}: {len(code) / 1024:.0f} KB, gzip {gzip_bytes / 1024:.0f} KB")
+    if gzip_bytes > UI_ENTRY_GZIP_BUDGET_BYTES:
+        raise StepFailed(
+            f"entry chunk gzip {gzip_bytes / 1024:.0f} KB exceeds the "
+            f"{UI_ENTRY_GZIP_BUDGET_BYTES / 1024:.0f} KB budget"
+        )
+    text = code.decode("utf-8", errors="replace")
+    found = [marker for marker in UI_ENTRY_FORBIDDEN_MARKERS if marker in text]
+    if found:
+        raise StepFailed(f"entry chunk contains code that should load lazily: {found}")
+
+
 def bundle_changes(path: str) -> list[str]:
     """Files under ``path`` whose content differs from HEAD's index, plus new
     untracked files. Compares normalized content (like CI's ``git add`` +
@@ -170,6 +212,7 @@ STEPS: list[Step] = [
     # job "ui" == ci.yml `ui_validate`
     Step("ui-build", "ui", step_ui_build, prerequisite=True, ui=True, detail="build_packaged_ui.ps1"),
     Step("ui-tests", "ui", step_ui_tests, ui=True, detail="npm test (vitest)"),
+    Step("ui-bundle-budget", "ui", step_ui_bundle_budget, ui=True, detail="entry chunk size/content, no external URLs"),
     Step("ui-dist-current", "ui", step_ui_dist_current, ui=True, detail="_ui_dist matches the build"),
     # job "smoke" == ci.yml `windows_lifecycle_smoke`
     Step("lifecycle-smoke", "smoke", step_windows_lifecycle_smoke, quick=False, detail="Windows lifecycle smoke"),

@@ -25,6 +25,7 @@ from pydantic import BaseModel, Field
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from ._trace_aggregator import TraceAggregator
+from ._trace_frame_cache import EncodedTraceFrame, SharedTraceFrameCache
 from .gateway import (
     GatewaySettings,
     HubMessage,
@@ -117,40 +118,145 @@ def _binary_http_multi_response(
     )
 
 
-async def _ws_send_binary_trace_frame(
-    ws: WebSocket,
+def _encode_json_msg(msg: Any) -> EncodedTraceFrame:
+    return EncodedTraceFrame(
+        _orjson_dumps(_strip_private_payload_fields(msg)).decode("utf-8"), None
+    )
+
+
+# float32 is used for a binary trace only when its rounding error (at most
+# |value| * 2**-24) stays below this fraction of the frame's span: far below
+# one plot pixel, while traces riding on a large offset keep float64.
+_FLOAT32_MAX_ERROR_OF_SPAN = 1e-6
+
+
+_FLOAT32_INFO = np.finfo(np.float32)
+
+
+def _float32_is_sufficient(arr: np.ndarray) -> bool:
+    lo = float(arr.min())
+    hi = float(arr.max())
+    peak = max(abs(lo), abs(hi))
+    if peak == 0.0:
+        return True
+    # The relative-error bound only holds for normal float32 numbers: larger
+    # values overflow to inf, and subnormals keep far fewer significant bits.
+    if peak >= float(_FLOAT32_INFO.max):
+        return False
+    nonzero = np.abs(arr[arr != 0.0])
+    if nonzero.size and float(nonzero.min()) < float(_FLOAT32_INFO.tiny):
+        return False
+    span = hi - lo
+    if span <= 0.0:
+        return float(np.float32(lo)) == lo
+    return peak * 2.0**-24 <= span * _FLOAT32_MAX_ERROR_OF_SPAN
+
+
+def _encode_binary_trace_frame(
     msg: dict[str, Any],
     *,
     value_field: str = "values",
-) -> None:
+    allow_float32: bool = False,
+) -> EncodedTraceFrame:
+    """JSON metadata text plus a little-endian float body.
+
+    `allow_float32` is set by clients that sent `dtype=auto`; older clients
+    always receive float64.
+    """
     payload = msg.get("payload")
     if not isinstance(payload, dict):
-        await _ws_send_json(ws, msg)
-        return
+        return _encode_json_msg(msg)
     binary_values = payload.get("_binary_values")
     values = binary_values if binary_values is not None else payload.get(value_field)
     try:
         arr = np.asarray(values, dtype=np.float64).reshape(-1)
     except Exception:
-        await _ws_send_json(ws, msg)
-        return
+        return _encode_json_msg(msg)
     if arr.size <= 0 or not np.isfinite(arr).all():
-        await _ws_send_json(ws, msg)
-        return
+        return _encode_json_msg(msg)
+    if allow_float32 and _float32_is_sufficient(arr):
+        dtype_name, wire = "float32", arr.astype("<f4")
+    else:
+        dtype_name, wire = "float64", arr.astype("<f8", copy=False)
     payload_meta = dict(payload)
     payload_meta.pop(value_field, None)
     payload_meta.pop("_binary_values", None)
     payload_meta.update(
         {
             "encoding": "binary-frame",
-            "dtype": "float64",
+            "dtype": dtype_name,
             "byte_order": "little",
-            "byte_length": int(arr.nbytes),
+            "byte_length": int(wire.nbytes),
             "shape": [int(arr.size)],
         }
     )
-    await _ws_send_json(ws, {"topic": msg.get("topic"), "payload": payload_meta})
-    await ws.send_bytes(arr.astype("<f8", copy=False).tobytes())
+    meta = _encode_json_msg({"topic": msg.get("topic"), "payload": payload_meta})
+    return EncodedTraceFrame(meta.text, wire.tobytes())
+
+
+async def _ws_send_encoded(ws: WebSocket, frame: EncodedTraceFrame) -> None:
+    await ws.send_text(frame.text)
+    if frame.body is not None:
+        await ws.send_bytes(frame.body)
+
+
+async def _ws_send_binary_trace_frame(
+    ws: WebSocket,
+    msg: dict[str, Any],
+    *,
+    value_field: str = "values",
+    allow_float32: bool = False,
+) -> None:
+    await _ws_send_encoded(
+        ws,
+        _encode_binary_trace_frame(
+            msg, value_field=value_field, allow_float32=allow_float32
+        ),
+    )
+
+
+def _parse_compact_dtype(raw: Any) -> bool:
+    """`dtype=auto` lets the gateway send float32 traces when precise enough."""
+    return str(raw or "").strip().lower() == "auto"
+
+
+_TRACE_FRAME_CACHE = SharedTraceFrameCache()
+
+
+def _raw_trace_cache_key(
+    payload: dict[str, Any],
+    *,
+    channel_index: int,
+    trace_decimator: str,
+    trace_max_points: int | None,
+    binary_transport: bool,
+    compact_dtype: bool,
+) -> tuple[Any, ...] | None:
+    """Exact identity of a finished raw-stream frame, or None.
+
+    The frame seq plus its acquisition timestamps name the source frame (a
+    restarted device, whose seq starts over, does not match an old entry);
+    the rest are this socket's encoding parameters. Only valid for sockets
+    whose aggregator passes frames through unchanged.
+    """
+    seq = payload.get("seq")
+    t0_mono_ns = payload.get("t0_mono_ns")
+    t0_wall_ns = payload.get("t0_wall_ns")
+    if not isinstance(seq, int) or (t0_mono_ns is None and t0_wall_ns is None):
+        return None
+    return (
+        "raw",
+        str(payload.get("device_id") or ""),
+        str(payload.get("stream") or ""),
+        seq,
+        t0_mono_ns,
+        t0_wall_ns,
+        channel_index,
+        trace_decimator,
+        trace_max_points,
+        binary_transport,
+        compact_dtype,
+    )
 
 
 @dataclass(frozen=True)
@@ -1095,7 +1201,10 @@ async def _startup() -> None:
     )
     router.start(asyncio.get_running_loop())
     manager_identity = await _fetch_manager_identity(router)
-    telemetry_hub = TelemetryHub(settings.manager_pub, topics=settings.telemetry_topics)
+    # Decoded copies let `/ws/telemetry?device_ids=` filter without re-parsing.
+    telemetry_hub = TelemetryHub(
+        settings.manager_pub, topics=settings.telemetry_topics, keep_decoded=True
+    )
     telemetry_hub.start(asyncio.get_running_loop())
     logs_hub = TelemetryHub(settings.manager_pub, topics=settings.log_topics)
     logs_hub.start(asyncio.get_running_loop())
@@ -1996,17 +2105,34 @@ async def command_journal_tail(
     return await _route_request(payload)
 
 
+def _telemetry_ws_text(item: str | HubMessage, device_filter: set[str] | None) -> str | None:
+    """The shared serialized text to send, or None when filtered out."""
+    if isinstance(item, HubMessage):
+        if device_filter is not None:
+            payload = item.msg.get("payload")
+            device_id = payload.get("device_id") if isinstance(payload, dict) else None
+            if device_id not in device_filter:
+                return None
+        return item.text
+    return item
+
+
 @app.websocket("/ws/telemetry")
 async def ws_telemetry(ws: WebSocket) -> None:
+    # Optional `device_ids=a,b`: instance UIs that show a few devices skip
+    # the rest here instead of parsing every message in the browser.
+    device_ids = _parse_csv_query_list(ws.query_params.get("device_ids"))
+    device_filter = set(device_ids) if device_ids else None
     await ws.accept()
     q = app.state.telemetry_hub.subscribe()
     try:
         while True:
-            # Hub queues pre-serialized JSON strings (see TelemetryHub) so
-            # all N subscribers share the same `json.dumps()` work done
-            # once in the hub's reader thread.
-            payload = await q.get()
-            await ws.send_text(payload)
+            # Hub items carry one pre-serialized JSON string shared by all N
+            # subscribers (see TelemetryHub), so json.dumps() runs once in
+            # the hub's reader thread.
+            text = _telemetry_ws_text(await q.get(), device_filter)
+            if text is not None:
+                await ws.send_text(text)
     except WebSocketDisconnect:
         pass
     finally:
@@ -2061,6 +2187,7 @@ async def ws_raw_stream(ws: WebSocket) -> None:
     trace_average_mode = _parse_trace_average_mode(ws.query_params.get("trace_average_mode"))
     transport = str(ws.query_params.get("transport") or "json").strip().lower()
     binary_transport = transport == "binary"
+    compact_dtype = _parse_compact_dtype(ws.query_params.get("dtype"))
     trace_interval_s = (1.0 / trace_max_fps) if trace_max_fps else 0.0
     next_send_at = 0.0
     aggregator = TraceAggregator(
@@ -2068,7 +2195,7 @@ async def ws_raw_stream(ws: WebSocket) -> None:
         trace_average_mode=trace_average_mode,
     )
 
-    async def _send_trace(payload: dict[str, Any], trace: np.ndarray) -> None:
+    def _encode_trace(payload: dict[str, Any], trace: np.ndarray) -> EncodedTraceFrame | None:
         built = _finish_trace_frame(
             payload,
             trace,
@@ -2077,16 +2204,36 @@ async def ws_raw_stream(ws: WebSocket) -> None:
             trace_max_points=trace_max_points,
         )
         if built is None:
-            return
+            return None
         out_payload, out_trace = built
+        msg = {"topic": "manager.stream_frame", "payload": out_payload}
         if binary_transport:
             out_payload["_binary_values"] = out_trace
-            await _ws_send_binary_trace_frame(
-                ws, {"topic": "manager.stream_frame", "payload": out_payload}
-            )
-            return
+            return _encode_binary_trace_frame(msg, allow_float32=compact_dtype)
         out_payload["values"] = out_trace.tolist()
-        await _ws_send_json(ws, {"topic": "manager.stream_frame", "payload": out_payload})
+        return _encode_json_msg(msg)
+
+    async def _send_trace(payload: dict[str, Any], trace: np.ndarray) -> None:
+        cache_key = (
+            _raw_trace_cache_key(
+                payload,
+                channel_index=channel_index,
+                trace_decimator=trace_decimator,
+                trace_max_points=trace_max_points,
+                binary_transport=binary_transport,
+                compact_dtype=compact_dtype,
+            )
+            if aggregator.rolling_window <= 1
+            else None
+        )
+        frame = _TRACE_FRAME_CACHE.get(cache_key) if cache_key is not None else None
+        if frame is None:
+            frame = _encode_trace(payload, trace)
+            if frame is None:
+                return
+            if cache_key is not None:
+                _TRACE_FRAME_CACHE.put(cache_key, frame)
+        await _ws_send_encoded(ws, frame)
 
     async def _send_or_defer(payload: dict[str, Any], trace: np.ndarray) -> None:
         # A throttled socket keeps only the newest (payload, trace) pair and
@@ -2250,7 +2397,9 @@ class _WorkspaceTraceWsState:
         rolling_window: int,
         trace_average_mode: str,
         binary_transport: bool,
+        compact_dtype: bool = False,
     ) -> None:
+        self.compact_dtype = bool(compact_dtype)
         self.trace_decimator = trace_decimator
         self.trace_max_points = trace_max_points
         self.trace_interval_s = trace_interval_s
@@ -2342,16 +2491,60 @@ def _workspace_finalize_trace_msg(
     return {**trace_msg, "payload": out}
 
 
+def _workspace_trace_cache_key(
+    state: _WorkspaceTraceWsState,
+    trace_msg: dict[str, Any],
+) -> tuple[Any, ...] | None:
+    """Exact identity of a finished workspace trace frame, or None.
+
+    Only pass-through aggregation is shareable; `_mark_decimated` separates
+    the two producers (shm `trace_ready` and inline `output` messages).
+    """
+    if state.rolling_window > 1:
+        return None
+    payload = trace_msg.get("payload")
+    if not isinstance(payload, dict) or "_raw_trace" not in payload:
+        return None
+    seq = payload.get("seq")
+    # The acquisition timestamps keep a restarted producer, whose seq starts
+    # over, from matching an old entry.
+    t0_mono_ns = payload.get("t0_mono_ns")
+    t0_wall_ns = payload.get("t0_wall_ns")
+    if not isinstance(seq, int) or (t0_mono_ns is None and t0_wall_ns is None):
+        return None
+    return (
+        "workspace",
+        str(payload.get("workspace_id") or ""),
+        str(payload.get("output_id") or ""),
+        seq,
+        t0_mono_ns,
+        t0_wall_ns,
+        bool(payload.get("_mark_decimated")),
+        state.trace_decimator,
+        state.trace_max_points,
+        state.binary_transport,
+        state.compact_dtype,
+    )
+
+
 async def _workspace_send_trace_payload(
     ws: WebSocket,
     state: _WorkspaceTraceWsState,
     trace_msg: dict[str, Any],
 ) -> None:
-    trace_msg = _workspace_finalize_trace_msg(state, trace_msg)
-    if state.binary_transport:
-        await _ws_send_binary_trace_frame(ws, trace_msg, value_field="value")
-    else:
-        await _ws_send_json(ws, trace_msg)
+    cache_key = _workspace_trace_cache_key(state, trace_msg)
+    frame = _TRACE_FRAME_CACHE.get(cache_key) if cache_key is not None else None
+    if frame is None:
+        trace_msg = _workspace_finalize_trace_msg(state, trace_msg)
+        if state.binary_transport:
+            frame = _encode_binary_trace_frame(
+                trace_msg, value_field="value", allow_float32=state.compact_dtype
+            )
+        else:
+            frame = _encode_json_msg(trace_msg)
+        if cache_key is not None:
+            _TRACE_FRAME_CACHE.put(cache_key, frame)
+    await _ws_send_encoded(ws, frame)
 
 
 async def _workspace_send_trace_message(
@@ -2565,6 +2758,7 @@ async def ws_stream_workspace(ws: WebSocket, workspace_id: str) -> None:
         rolling_window=rolling_window,
         trace_average_mode=trace_average_mode,
         binary_transport=binary_transport,
+        compact_dtype=_parse_compact_dtype(ws.query_params.get("dtype")),
     )
 
     await ws.accept()

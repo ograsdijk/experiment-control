@@ -31,6 +31,16 @@ deterministic and writes only beneath `.generated/<preset>/`; generated device a
 process YAML is intentionally ignored by Git. Each preset uses a separate group of
 manager ports beginning at 6400, 6420, 6440, or 6460. The gateway defaults to 8088.
 
+Pass `--ui-processes` to `run_performance_test.py` (or `generate_instance.py`) to
+also run a sequencer and an idle HDF writer. That makes the Sequencer and HDF
+modals reachable. The sequencer autoloads a generated ~900-line benchmark
+sequence that only reads device metadata and sleeps. Leave the flag off when
+comparing with earlier measurements, since the extra processes add load.
+
+The gateway launcher disables WebSocket permessage-deflate by default (see
+`apply_gateway_uvicorn_env_defaults`). Set `UVICORN_WS_PER_MESSAGE_DEFLATE=true`
+to measure with compression.
+
 ## Reproducible profiling protocol
 
 1. Use an incognito Chrome window with extensions disabled and a production build.

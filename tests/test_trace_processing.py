@@ -25,6 +25,12 @@ from experiment_control.utils.trace_processing import (
     parse_trace_rolling_window,
     select_trace_from_array,
 )
+from experiment_control.utils.trace_processing import (
+    _decimate_trace_m4,
+    _decimate_trace_m4_loop,
+    _decimate_trace_minmax,
+    _decimate_trace_minmax_loop,
+)
 
 
 class TraceProcessingTests(unittest.TestCase):
@@ -102,6 +108,40 @@ class TraceProcessingTests(unittest.TestCase):
 
         passthrough = {"not": "an-array"}
         self.assertIs(decimate_trace_values(passthrough, mode="stride", max_points=4), passthrough)
+
+    def test_vectorized_m4_and_minmax_match_the_loop_implementations(self) -> None:
+        rng = np.random.default_rng(1234)
+        cases: list[np.ndarray] = [
+            np.zeros(97),
+            np.arange(1000, dtype=np.float64),
+            np.arange(1000, 0, -1, dtype=np.float64),
+        ]
+        for n in (5, 33, 64, 65, 257, 1000, 4096, 10007):
+            cases.append(rng.normal(size=n))
+            # Small integer values create many ties within each bucket.
+            cases.append(rng.integers(-3, 4, size=n).astype(np.float64))
+        for points in cases:
+            for max_points in (1, 2, 3, 4, 5, 7, 8, 63, 64, 100, 512, 2000):
+                if max_points >= points.size:
+                    continue
+                with self.subTest(n=points.size, max_points=max_points):
+                    self.assertEqual(
+                        _decimate_trace_m4(points, max_points),
+                        _decimate_trace_m4_loop(points, max_points),
+                    )
+                    self.assertEqual(
+                        _decimate_trace_minmax(points, max_points),
+                        _decimate_trace_minmax_loop(points, max_points),
+                    )
+
+    def test_vectorized_decimators_fall_back_for_non_finite_input(self) -> None:
+        points = np.array([1.0, np.nan, 3.0, -2.0, np.inf, 0.5, 4.0, 2.0])
+        self.assertEqual(
+            _decimate_trace_m4(points, 4), _decimate_trace_m4_loop(points, 4)
+        )
+        self.assertEqual(
+            _decimate_trace_minmax(points, 4), _decimate_trace_minmax_loop(points, 4)
+        )
 
 
 if __name__ == "__main__":

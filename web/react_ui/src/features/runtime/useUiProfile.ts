@@ -132,8 +132,6 @@ export function useUiProfile(args: UiProfileArgs) {
     streamWorkspaces,
     setStreamWorkspaces,
     streamWorkspacesRef,
-    setStreamWorkspaceRevisions,
-    streamWorkspaceRevisionsRef,
     streamWorkspaceIdRef,
     setDaqWorkspaceId,
     streamAnalysisReadyRef,
@@ -252,8 +250,10 @@ export function useUiProfile(args: UiProfileArgs) {
           : streamWorkspacesRef.current;
       setStreamWorkspaces(importedWorkspaces);
       streamWorkspacesRef.current = importedWorkspaces;
-      setStreamWorkspaceRevisions({});
-      streamWorkspaceRevisionsRef.current = {};
+      // Keep the server revisions we already know: the sync below sends them
+      // as expected_revision. Clearing them made every workspace that already
+      // exists on the server conflict (expected 0), so the import was dropped
+      // and the server copy reloaded.
       streamWorkspaceIdRef.current = nextWorkspaceCounter(importedWorkspaces);
       const firstWorkspaceId =
         Object.keys(importedWorkspaces).sort()[0] ?? null;

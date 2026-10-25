@@ -5,6 +5,7 @@ import {
   perfCountScoped,
   perfMeasure,
 } from "../features/performance/perfInstrumentation";
+import { writeHeatmapPixel } from "../utils/heatmapColormap";
 
 export type Bin2dReducer = "mean" | "max" | "min" | "count" | "std" | "sem" | "sum";
 
@@ -41,49 +42,6 @@ type Grid = {
   yMin: number | null;
   yMax: number | null;
 };
-
-function clamp01(value: number): number {
-  if (!Number.isFinite(value)) {
-    return 0;
-  }
-  if (value <= 0) {
-    return 0;
-  }
-  if (value >= 1) {
-    return 1;
-  }
-  return value;
-}
-
-function lerp(a: number, b: number, t: number): number {
-  return a + (b - a) * t;
-}
-
-function colorAt(tRaw: number): [number, number, number] {
-  const t = clamp01(tRaw);
-  const stops: Array<[number, number, number, number]> = [
-    [0.0, 10, 12, 36],
-    [0.25, 51, 85, 137],
-    [0.5, 28, 170, 156],
-    [0.75, 168, 220, 50],
-    [1.0, 255, 243, 156],
-  ];
-  for (let i = 0; i < stops.length - 1; i += 1) {
-    const a = stops[i];
-    const b = stops[i + 1];
-    if (t < a[0] || t > b[0]) {
-      continue;
-    }
-    const local = (t - a[0]) / Math.max(1e-9, b[0] - a[0]);
-    return [
-      Math.trunc(lerp(a[1], b[1], local)),
-      Math.trunc(lerp(a[2], b[2], local)),
-      Math.trunc(lerp(a[3], b[3], local)),
-    ];
-  }
-  const tail = stops[stops.length - 1];
-  return [tail[1], tail[2], tail[3]];
-}
 
 function formatValue(value: number | null): string {
   if (value === null || !Number.isFinite(value)) {
@@ -316,12 +274,7 @@ export function StreamBin2dPanel({
                 img.data[idx + 3] = 0;
                 continue;
               }
-              const t = clamp01((raw - zRange.min) / span);
-              const [cr, cg, cb] = colorAt(t);
-              img.data[idx] = cr;
-              img.data[idx + 1] = cg;
-              img.data[idx + 2] = cb;
-              img.data[idx + 3] = 255;
+              writeHeatmapPixel(img.data, idx, (raw - zRange.min) / span);
             }
           }
           hmCtx.putImageData(img, 0, 0);

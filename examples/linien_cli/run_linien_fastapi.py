@@ -16,6 +16,7 @@ from experiment_control.utils.manager_network import (
     resolve_manager_network,
 )
 from experiment_control.utils.yaml_helpers import load_yaml_file
+from experiment_control.utils.env import apply_gateway_uvicorn_env_defaults
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -73,7 +74,7 @@ def main(argv: list[str] | None = None) -> int:
     manager_rpc = manager_network.local_rpc_connect
     manager_pub = manager_network.local_pub_connect
 
-    env = dict(os.environ)
+    env = apply_gateway_uvicorn_env_defaults(dict(os.environ))
     env["EXPERIMENT_CONTROL_INSTANCE_ID"] = instance_id
     env["EXPERIMENT_CONTROL_ROUTER_RPC"] = manager_rpc
     env["EXPERIMENT_CONTROL_MANAGER_PUB"] = manager_pub

@@ -48,7 +48,95 @@ def _write_yaml(path: Path, value: object) -> None:
     path.write_text(yaml.safe_dump(value, sort_keys=False), encoding="utf-8")
 
 
-def generate(preset_name: str) -> Path:
+def _benchmark_sequence(telemetry_devices: int, blocks: int = 40) -> dict[str, Any]:
+    """A sequence the size of a real measurement script, for the editor.
+
+    It only reads device metadata and sleeps, so loading it (or running it)
+    changes nothing on the performance devices.
+    """
+    steps: list[dict[str, Any]] = []
+    for block in range(blocks):
+        device = f"perf_tel_{block % max(1, telemetry_devices):02d}"
+        steps.append(
+            {
+                "for": {
+                    "bind": {"value": "level", "index": "level_idx"},
+                    "in": {"gen": {"linspace": {"start": 0.0, "stop": "${max_level}", "num": "${n_levels}"}}},
+                    "do": [
+                        {"call": {"device": device, "action": "device_metadata"}},
+                        {"set_context": {"fields": {"level": "${level}", "block": block}}},
+                        {
+                            "repeat": {
+                                "times": "${n_repeats}",
+                                "do": [{"sleep": "${settle_s}"}],
+                            }
+                        },
+                    ],
+                }
+            }
+        )
+    return {
+        "version": 1,
+        "context_columns": {"level": "float64", "block": "int64"},
+        "vars": {"max_level": 1.0, "n_levels": 3, "n_repeats": 2, "settle_s": 0.01},
+        "steps": steps,
+    }
+
+
+def _write_ui_processes(target: Path, processes_dir: Path, telemetry_devices: int) -> list[str]:
+    """Sequencer (autoloading the benchmark sequence) and an idle HDF writer.
+
+    They make the Sequencer and HDF modals reachable for UI benchmarks; the
+    writer only writes once a run is started from the UI.
+    """
+    # Process paths resolve against the instance directory (the stack root).
+    _write_yaml(target / "sequence_benchmark.yaml", _benchmark_sequence(telemetry_devices))
+    _write_yaml(
+        processes_dir / "sequencer.yaml",
+        {
+            "version": 1,
+            "process_id": "sequencer",
+            "process": {
+                "file": "src/experiment_control/sequencer/sequencer.py",
+                "class_name": "SequencerProcess",
+            },
+            "init_kwargs": {"rpc_timeout_ms": 2000, "autoload_path": "sequence_benchmark.yaml"},
+            "restart_policy": "NEVER",
+            "heartbeat_timeout_s": 3.0,
+            "shutdown_timeout_s": 3.0,
+        },
+    )
+    _write_yaml(
+        processes_dir / "hdf_writer.yaml",
+        {
+            "version": 1,
+            "process_id": "hdf_writer",
+            "process": {
+                "file": "src/experiment_control/processes/hdf_writer.py",
+                "class_name": "HdfWriter",
+            },
+            "init_kwargs": {
+                "out_dir": "data",
+                "filename": None,
+                "timezone": "America/Chicago",
+                "rpc_timeout_ms": 2000,
+                "rcvhwm": 10000,
+                "write_every_s": 1.0,
+                "buffer_max_messages": 200000,
+                "flush_every_n": 200,
+                "flush_every_s": 2.0,
+                "disabled_devices": [],
+                "event_log_mode": "failures_only",
+            },
+            "restart_policy": "NEVER",
+            "heartbeat_timeout_s": 3.0,
+            "shutdown_timeout_s": 3.0,
+        },
+    )
+    return ["sequencer", "hdf_writer"]
+
+
+def generate(preset_name: str, *, ui_processes: bool = False) -> Path:
     presets = _load_presets()
     if preset_name not in presets:
         raise ValueError(f"unknown preset {preset_name!r}; choose from {PRESET_NAMES}")
@@ -145,6 +233,9 @@ def generate(preset_name: str) -> Path:
         workspace_target.relative_to(REPO_ROOT)
     ).replace("\\", "/")
     _write_yaml(processes_dir / "stream_analysis.yaml", process)
+    extra_processes = (
+        _write_ui_processes(target, processes_dir, telemetry_devices) if ui_processes else []
+    )
 
     port_offset = PRESET_NAMES.index(preset_name) * 20
     stack = {
@@ -167,23 +258,32 @@ def generate(preset_name: str) -> Path:
         "startup": {
             "start_devices": True,
             "start_processes": True,
-            "process_order": ["stream_analysis"],
+            "process_order": ["stream_analysis", *extra_processes],
             "wait_for_registered": True,
             "wait_for_online": True,
             "timeout_s": 30.0,
         },
     }
     _write_yaml(target / "stack.yaml", stack)
-    _write_yaml(target / "preset.yaml", {"name": preset_name, **preset})
+    _write_yaml(
+        target / "preset.yaml",
+        {"name": preset_name, **preset, "ui_processes": ui_processes},
+    )
     return target
 
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--preset", choices=PRESET_NAMES, default="baseline")
+    parser.add_argument(
+        "--ui-processes",
+        action="store_true",
+        help="also add a sequencer and an idle HDF writer (Sequencer/HDF modals)",
+    )
     return parser.parse_args()
 
 
 if __name__ == "__main__":
-    result = generate(_parse_args().preset)
+    args = _parse_args()
+    result = generate(args.preset, ui_processes=args.ui_processes)
     print(result)

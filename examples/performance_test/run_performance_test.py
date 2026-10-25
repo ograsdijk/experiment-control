@@ -34,12 +34,18 @@ def _shutdown_manager(manager_rpc: str) -> None:
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--preset", choices=PRESET_NAMES, default="baseline")
+    parser.add_argument(
+        "--ui-processes",
+        action="store_true",
+        help="also run a sequencer and an idle HDF writer (Sequencer/HDF modals)",
+    )
     return parser.parse_args()
 
 
 def main() -> int:
-    preset = _parse_args().preset
-    generated = generate(preset)
+    args = _parse_args()
+    preset = args.preset
+    generated = generate(preset, ui_processes=args.ui_processes)
     stack_path = generated / "stack.yaml"
     raw = require_dict(load_yaml_file(stack_path), path=[])
     manager = resolve_manager_network(optional_dict(raw.get("manager"), path=["manager"]))

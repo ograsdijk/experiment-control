@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import type { ApiResponse } from "../../api";
-import { normalizeResolvedVars, type ResolvedVars } from "./resolved_values";
-import { decodedTemplates, extractTemplateExpressions, extractVarsBlock } from "./templates";
+import type { ResolvedVars } from "./resolved_values";
+import { useSequencerYamlTools, type SequencerYamlTools } from "./useSequencerYamlTools";
 
 export const RESOLVE_VARS_DEBOUNCE_MS = 400;
 
@@ -22,9 +22,9 @@ export function staleReason(resp: ApiResponse<unknown> | null): string {
  * Expressions to evaluate, as the runtime sees them (YAML-decoded), and a
  * function that keys the results by the text as written in the editor.
  */
-function expressionRequest(yamlText: string) {
-  const written = extractTemplateExpressions(yamlText);
-  const decoded = decodedTemplates(yamlText);
+function expressionRequest(tools: SequencerYamlTools, yamlText: string) {
+  const written = tools.extractTemplateExpressions(yamlText);
+  const decoded = tools.decodedTemplates(yamlText);
   const send = Array.from(new Set(written.map((text) => decoded[text] ?? text)));
   const rekey = (resolved: ResolvedVars): ResolvedVars => {
     const expressions = { ...resolved.expressions };
@@ -50,6 +50,7 @@ type CallProcessFn = (
  * `sequencer.resolve_vars`, shortly after the text or overrides stop changing.
  * While a request fails (the YAML doesn't parse) the last values are kept,
  * marked stale. They are dropped when the modal closes or the process changes.
+ * Requests wait for the lazily loaded YAML helpers.
  */
 export function useResolvedVars({
   callProcessFn,
@@ -67,6 +68,7 @@ export function useResolvedVars({
   const [resolved, setResolved] = useState<ResolvedVars | null>(null);
   const requestIdRef = useRef(0);
   const overridesKey = JSON.stringify(overrides);
+  const tools = useSequencerYamlTools(enabled);
 
   // A closed modal or another process: the old values belong to other text.
   useEffect(() => {
@@ -74,13 +76,13 @@ export function useResolvedVars({
   }, [enabled, processId]);
 
   useEffect(() => {
-    if (!enabled || !processId) {
+    if (!enabled || !processId || !tools) {
       return;
     }
     const requestId = ++requestIdRef.current;
     const timer = window.setTimeout(() => {
       // Parsed here, once typing stops, not on every keystroke.
-      const request = expressionRequest(yamlText);
+      const request = expressionRequest(tools, yamlText);
       const params: Record<string, unknown> = {
         vars_override: JSON.parse(overridesKey) as Record<string, unknown>,
         expressions: request.send,
@@ -88,14 +90,14 @@ export function useResolvedVars({
       // Empty editor: the loaded sequence. Otherwise only the vars block,
       // the part that is read: parsing a long sequence blocked the sequencer.
       if (yamlText.trim()) {
-        params.text = extractVarsBlock(yamlText);
+        params.text = tools.extractVarsBlock(yamlText);
       }
       callProcessFn(processId, "sequencer.resolve_vars", params)
         .then((resp) => {
           if (requestId !== requestIdRef.current) {
             return;
           }
-          const next = resp.ok ? normalizeResolvedVars(resp.result) : null;
+          const next = resp.ok ? tools.normalizeResolvedVars(resp.result) : null;
           setResolved((prev) => (next ? request.rekey(next) : markResolvedStale(prev, staleReason(resp))));
         })
         .catch(() => {
@@ -109,7 +111,7 @@ export function useResolvedVars({
       // A reply that arrives after this (newer text, a closed modal) is dropped.
       requestIdRef.current += 1;
     };
-  }, [callProcessFn, processId, enabled, yamlText, overridesKey]);
+  }, [callProcessFn, processId, enabled, tools, yamlText, overridesKey]);
 
   return enabled ? resolved : null;
 }

@@ -10,6 +10,10 @@ import {
   type AdaptivePollingOptions,
 } from "./useAdaptivePolling";
 
+// Scheduled polls wait for one animation frame (see runAfterFrame); fake
+// timers run requestAnimationFrame on a 16 ms clock.
+const FRAME_MS = 16;
+
 function Harness<T>(props: AdaptivePollingOptions<T>) {
   useAdaptivePolling(props);
   return null;
@@ -65,7 +69,7 @@ describe("useAdaptivePolling", () => {
     await flush();
     expect(poll).toHaveBeenCalledTimes(2);
     await flush();
-    await act(async () => vi.advanceTimersByTime(10));
+    await act(async () => vi.advanceTimersByTime(10 + FRAME_MS));
     await flush();
     expect(poll).toHaveBeenCalledTimes(3);
   });
@@ -147,7 +151,7 @@ describe("useAdaptivePolling", () => {
     await act(async () => vi.advanceTimersByTime(1));
     expect(signals[0].aborted).toBe(true);
     await flush();
-    await act(async () => vi.advanceTimersByTime(1000));
+    await act(async () => vi.advanceTimersByTime(1000 + FRAME_MS));
     await flush();
     expect(poll).toHaveBeenCalledTimes(2);
     expect(onValue).toHaveBeenCalledWith(7);
@@ -163,7 +167,7 @@ describe("useAdaptivePolling", () => {
     await flush();
     await act(async () => vi.advanceTimersByTime(5000));
     await flush();
-    await act(async () => vi.advanceTimersByTime(1000));
+    await act(async () => vi.advanceTimersByTime(1000 + FRAME_MS));
     await flush();
     expect(poll).toHaveBeenCalledTimes(2);
     expect(onValue).toHaveBeenCalledWith(9);
@@ -172,5 +176,25 @@ describe("useAdaptivePolling", () => {
   it("defaults the timeout to three intervals, at least 10 s", () => {
     expect(defaultPollTimeoutMs(1000)).toBe(10000);
     expect(defaultPollTimeoutMs(5000)).toBe(15000);
+  });
+
+  it("waits for an animation frame before a scheduled poll (hidden iframes get none)", async () => {
+    const poll = vi.fn().mockResolvedValue(1);
+    const frames: FrameRequestCallback[] = [];
+    const raf = vi
+      .spyOn(window, "requestAnimationFrame")
+      .mockImplementation((callback) => frames.push(callback));
+    render({ enabled: true, intervalMs: 10, poll, onValue: vi.fn() });
+    await flush();
+    expect(poll).toHaveBeenCalledTimes(1);
+    await act(async () => vi.advanceTimersByTime(1000));
+    await flush();
+    // Timers ran, but no frame was delivered: no further poll.
+    expect(poll).toHaveBeenCalledTimes(1);
+    expect(frames).toHaveLength(1);
+    await act(async () => frames.shift()?.(0));
+    await flush();
+    expect(poll).toHaveBeenCalledTimes(2);
+    raf.mockRestore();
   });
 });

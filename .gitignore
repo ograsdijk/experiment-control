@@ -27,3 +27,6 @@ web/react_ui/dist/
 .state/
 logs/
 !web/react_ui/src/features/logs/
+
+# UI benchmark harness output (results, traces, launch logs)
+bench/ui/results/

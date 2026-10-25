@@ -9,6 +9,7 @@ from pathlib import Path
 from experiment_control.utils.config_parsing import optional_dict, require_dict
 from experiment_control.utils.manager_network import resolve_manager_network
 from experiment_control.utils.yaml_helpers import load_yaml_file
+from experiment_control.utils.env import apply_gateway_uvicorn_env_defaults
 
 from generate_instance import GENERATED_ROOT, PRESET_NAMES, generate
 
@@ -37,7 +38,7 @@ def main() -> int:
     stack_path = generated / "stack.yaml"
     raw = require_dict(load_yaml_file(stack_path), path=[])
     manager = resolve_manager_network(optional_dict(raw.get("manager"), path=["manager"]))
-    env = dict(os.environ)
+    env = apply_gateway_uvicorn_env_defaults(dict(os.environ))
     env.update(
         {
             "EXPERIMENT_CONTROL_INSTANCE_ID": str(raw["instance_id"]),

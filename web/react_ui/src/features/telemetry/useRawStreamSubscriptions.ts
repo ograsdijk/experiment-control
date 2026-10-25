@@ -17,6 +17,7 @@ import {
   rawStreamHydrationInvalidationKeys,
   rawStreamSubscriptionKey,
 } from "./rawStreamHydration";
+import { decodeBinaryTraceValues } from "../stream/binaryTrace";
 
 /**
  * Raw-stream WebSocket subscriptions manager.
@@ -70,14 +71,7 @@ function binaryValuesFromFrame(
   frame: NonNullable<ReturnType<typeof normalizeStreamFrameMessage>>,
   data: ArrayBuffer
 ): Float64Array | null {
-  const expectedBytes = Number((frame as { byteLength?: unknown }).byteLength);
-  if (Number.isFinite(expectedBytes) && expectedBytes > 0 && expectedBytes !== data.byteLength) {
-    return null;
-  }
-  if (data.byteLength % Float64Array.BYTES_PER_ELEMENT !== 0) {
-    return null;
-  }
-  return new Float64Array(data);
+  return decodeBinaryTraceValues(data, frame.dtype, frame.byteLength);
 }
 
 type RawFrame = NonNullable<ReturnType<typeof normalizeStreamFrameMessage>>;
@@ -103,6 +97,7 @@ function rawSocketUrl(subscriptions: RawStreamSubscription[]): string {
   params.set("rolling_window", String(subscription.rollingWindow));
   params.set("trace_average_mode", subscription.averageMode);
   params.set("transport", "binary");
+  params.set("dtype", "auto");
   return buildWsUrl(`/ws/raw_stream?${params.toString()}`);
 }
 

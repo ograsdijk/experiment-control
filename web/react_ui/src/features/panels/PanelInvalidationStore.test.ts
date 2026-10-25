@@ -1,14 +1,34 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { PanelInvalidationStore } from "./PanelInvalidationStore";
+import {
+  DEFAULT_PLOT_MAX_FPS,
+  MIN_TIME_SERIES_FPS,
+  PanelInvalidationStore,
+  timeSeriesMaxFps,
+} from "./PanelInvalidationStore";
 
 function harness() {
   const frames: FrameRequestCallback[] = [];
-  const store = new PanelInvalidationStore((callback) => {
-    frames.push(callback);
-    return frames.length;
-  }, () => undefined);
-  return { store, flush: (now = 1000) => frames.shift()?.(now) };
+  const timers: { callback: () => void; delayMs: number }[] = [];
+  const store = new PanelInvalidationStore(
+    (callback) => {
+      frames.push(callback);
+      return frames.length;
+    },
+    () => undefined,
+    (callback, delayMs) => {
+      timers.push({ callback, delayMs });
+      return timers.length;
+    },
+    () => undefined
+  );
+  // A frame at `now`; a pending wake-up timer fires first (as it would before
+  // the frame it was armed for).
+  const flush = (now = 1000) => {
+    timers.splice(0).forEach((timer) => timer.callback());
+    frames.shift()?.(now);
+  };
+  return { store, flush, frames, timers };
 }
 
 describe("PanelInvalidationStore", () => {
@@ -80,5 +100,76 @@ describe("PanelInvalidationStore", () => {
     expect(listener).toHaveBeenCalledOnce();
     flush(1100);
     expect(listener).toHaveBeenCalledTimes(2);
+  });
+
+  it("waits on a timer, not every vsync, while a panel is rate limited", () => {
+    const { store, frames, timers } = harness();
+    const listener = vi.fn();
+    store.subscribe("A", listener);
+    store.setPanelMaxFps("A", 5);
+    store.markPanelDirty("A");
+    frames.shift()?.(1000);
+    store.markPanelDirty("A");
+    frames.shift()?.(1016);
+    // Due at 1200: no frame is re-armed in between, one timer wakes it early.
+    expect(frames).toHaveLength(0);
+    expect(timers).toHaveLength(1);
+    expect(timers[0].delayMs).toBeGreaterThan(170);
+    expect(timers[0].delayMs).toBeLessThan(184);
+    store.markPanelDirty("A");
+    expect(frames).toHaveLength(0);
+    timers.shift()?.callback();
+    frames.shift()?.(1200);
+    expect(listener).toHaveBeenCalledTimes(2);
+  });
+
+  it("still uses the next frame when a panel is due within one frame", () => {
+    const { store, frames, timers } = harness();
+    const listener = vi.fn();
+    store.subscribe("A", listener);
+    store.markPanelDirty("A");
+    frames.shift()?.(1000);
+    store.markPanelDirty("A");
+    frames.shift()?.(1025);
+    expect(timers).toHaveLength(0);
+    expect(frames).toHaveLength(1);
+    frames.shift()?.(1034);
+    expect(listener).toHaveBeenCalledTimes(2);
+  });
+
+  it("cancels a pending wake-up when the page is hidden", () => {
+    const cancelTimeout = vi.fn();
+    const frames: FrameRequestCallback[] = [];
+    const store = new PanelInvalidationStore(
+      (callback) => frames.push(callback),
+      () => undefined,
+      () => 7,
+      cancelTimeout
+    );
+    store.subscribe("A", vi.fn());
+    store.setPanelMaxFps("A", 2);
+    store.markPanelDirty("A");
+    frames.shift()?.(1000);
+    store.markPanelDirty("A");
+    frames.shift()?.(1016);
+    store.setHidden(true);
+    expect(cancelTimeout).toHaveBeenCalledWith(7);
+  });
+});
+
+describe("timeSeriesMaxFps", () => {
+  it("redraws about once per pixel of x-axis advance", () => {
+    expect(timeSeriesMaxFps(1200, 120)).toBe(10);
+    expect(timeSeriesMaxFps(400, 30)).toBe(14);
+  });
+
+  it("clamps slow windows to the floor and fast windows to the default ceiling", () => {
+    expect(timeSeriesMaxFps(400, 120)).toBe(MIN_TIME_SERIES_FPS);
+    expect(timeSeriesMaxFps(800, 5)).toBe(DEFAULT_PLOT_MAX_FPS);
+  });
+
+  it("falls back to the default before the plot has been measured", () => {
+    expect(timeSeriesMaxFps(0, 120)).toBe(DEFAULT_PLOT_MAX_FPS);
+    expect(timeSeriesMaxFps(400, 0)).toBe(DEFAULT_PLOT_MAX_FPS);
   });
 });

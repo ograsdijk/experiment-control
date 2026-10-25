@@ -66,8 +66,11 @@ import { useTelemetry } from "../telemetry/TelemetryContext";
 import { colorWithAlpha, traceColorAt } from "../../utils/traceColors";
 import { usePanels } from "./PanelsContext";
 import {
+  DEFAULT_PLOT_MAX_FPS,
   markPanelDirty,
   panelInvalidationStore,
+  PanelRevisionBoundary,
+  timeSeriesMaxFps,
   usePanelRevision,
 } from "./PanelInvalidationStore";
 import { PanelCardHeader, type PanelMenuItem } from "./PanelCardHeader";
@@ -190,7 +193,6 @@ function PanelCardImpl({
     panels,
     expandedPlotPanelId,
   } = usePanels();
-  const panelRevision = usePanelRevision(panel.id);
   const visibilityNodeRef = useRef<HTMLElement | null>(null);
 
   // While this panel is open in the expanded modal, the modal body
@@ -227,10 +229,6 @@ function PanelCardImpl({
   useEffect(() => {
     applyCardVisibility();
   }, [isExpanded, applyCardVisibility]);
-  useEffect(() => {
-    const fps = isStreamTracePanel(panel) ? panel.traceMaxFps : 30;
-    panelInvalidationStore.setPanelMaxFps(panel.id, fps);
-  }, [panel]);
   const {
     buffersRef,
     streamFramesRef,
@@ -241,7 +239,16 @@ function PanelCardImpl({
   const { streamWorkspaces } = useStreamAnalysis();
   const computedColorScheme = useComputedColorScheme("light");
   const isDark = computedColorScheme === "dark";
-  const { measureRef, plotHeight } = usePlotAreaHeight(panel.heightPx);
+  const { measureRef, plotHeight, plotWidth } = usePlotAreaHeight(panel.heightPx);
+  useEffect(() => {
+    // The expanded modal is much wider than the card, so it keeps the full rate.
+    const fps = isStreamTracePanel(panel)
+      ? panel.traceMaxFps
+      : (isTelemetryPanel(panel) || isStreamScalarPanel(panel)) && !isExpanded
+      ? timeSeriesMaxFps(plotWidth, panel.timeWindowS)
+      : DEFAULT_PLOT_MAX_FPS;
+    panelInvalidationStore.setPanelMaxFps(panel.id, fps);
+  }, [panel, plotWidth, isExpanded]);
   // Which legend entry / trace chip is being renamed, and its draft. Local
   // to the card: unlike the y-axis draft, nothing outside needs to read it.
   const [renamingSeriesKey, setRenamingSeriesKey] = useState<string | null>(
@@ -346,17 +353,19 @@ function PanelCardImpl({
     telemetryOffsetUnit,
   } = workspaceDerivations;
 
-  // Ref-reads + tick-driven derivations stay un-memoized:
-  // they intentionally fetch fresh data on every render so
-  // panels reflect the latest snapshot pushed by the apply
-  // helpers.
-  const panelBuffers = buffersRef.get(panel.id) ?? new Map();
-  const binStatsSnapshot = isStreamBinStatsPanel(panel)
-    ? streamBinStatsRef.get(panel.id) ?? null
-    : null;
-  const bin2dSnapshot = isStreamBin2dPanel(panel)
-    ? streamBin2dRef.get(panel.id) ?? null
-    : null;
+  // Ref-reads stay un-memoized: they fetch the latest snapshot pushed by
+  // the apply helpers each time they run. The revision boundary below runs
+  // them once per data update; the card runs them for the settings popover.
+  const readLiveSnapshots = () => ({
+    panelBuffers: buffersRef.get(panel.id) ?? new Map(),
+    binStatsSnapshot: isStreamBinStatsPanel(panel)
+      ? streamBinStatsRef.get(panel.id) ?? null
+      : null,
+    bin2dSnapshot: isStreamBin2dPanel(panel)
+      ? streamBin2dRef.get(panel.id) ?? null
+      : null,
+  });
+  const { binStatsSnapshot, bin2dSnapshot } = readLiveSnapshots();
   const telemetryOffset = isTelemetryPanel(panel)
     ? resolveTelemetryPanelOffset(panel)
     : null;
@@ -388,6 +397,10 @@ function PanelCardImpl({
   // modals avoided by deriving only for the one panel whose modal was
   // open; the gate keeps that property now that the surface is per card.
   const settingsOpen = plotOptionsPanelId === panel.id;
+  // The card body re-renders per data update inside PanelRevisionBoundary.
+  // The card itself only follows data while its settings popover is open,
+  // because the popover shows live counters (bins, telemetry offset).
+  usePanelRevision(panel.id, settingsOpen);
   const settingsOptions = useMemo<PanelSettingsOptions>(() => {
     if (!settingsOpen) {
       return EMPTY_PANEL_SETTINGS_OPTIONS;
@@ -452,32 +465,38 @@ function PanelCardImpl({
 
   // Card status: live state only, and only when it says something. The
   // settings popover below carries the same counters unconditionally.
-  const statusItems: PanelStatusItem[] = [];
-  // The dot in the header carries the healthy case. A link that is down
-  // says so in words too — it is the one live state worth a row.
-  if (linkConnected === false) {
-    statusItems.push({ text: `${linkLabel} link down`, warn: true });
-  }
-  if (isStreamBinStatsPanel(panel)) {
-    const active =
-      binStatsSnapshot?.populatedBinCount ??
-      binStatsSnapshot?.activeBinCount ??
-      null;
-    const max = binStatsSnapshot?.maxBinCount ?? null;
-    if (active !== null && max !== null && max > 0) {
-      statusItems.push({ text: `${active}/${max} bins` });
+  const buildStatusItems = (
+    binStats: typeof binStatsSnapshot,
+    bin2d: typeof bin2dSnapshot
+  ): PanelStatusItem[] => {
+    const statusItems: PanelStatusItem[] = [];
+    // The dot in the header carries the healthy case. A link that is down
+    // says so in words too — it is the one live state worth a row.
+    if (linkConnected === false) {
+      statusItems.push({ text: `${linkLabel} link down`, warn: true });
     }
-  }
-  if (isStreamBin2dPanel(panel)) {
-    const filled = bin2dSnapshot?.populatedBinCount ?? null;
-    if (filled !== null) {
-      statusItems.push({ text: `${filled} bins filled` });
+    if (isStreamBinStatsPanel(panel)) {
+      const active =
+        binStats?.populatedBinCount ??
+        binStats?.activeBinCount ??
+        null;
+      const max = binStats?.maxBinCount ?? null;
+      if (active !== null && max !== null && max > 0) {
+        statusItems.push({ text: `${active}/${max} bins` });
+      }
     }
-    const dropped = bin2dSnapshot?.droppedSamples ?? 0;
-    if (dropped > 0) {
-      statusItems.push({ text: `${dropped} dropped`, warn: true });
+    if (isStreamBin2dPanel(panel)) {
+      const filled = bin2d?.populatedBinCount ?? null;
+      if (filled !== null) {
+        statusItems.push({ text: `${filled} bins filled` });
+      }
+      const dropped = bin2d?.droppedSamples ?? 0;
+      if (dropped > 0) {
+        statusItems.push({ text: `${dropped} dropped`, warn: true });
+      }
     }
-  }
+    return statusItems;
+  };
 
   const clearPanel = () => {
     if (isTelemetryPanel(panel) || isStreamScalarPanel(panel)) {
@@ -692,28 +711,11 @@ function PanelCardImpl({
   // the flag has to be read through the narrower guard.
   const hasExtraChannels =
     isStreamRawPanel(panel) && (panel.extraChannelIndices?.length ?? 0) > 0;
-  const traceExtraSeries = isStreamTracePanel(panel)
-    ? panel.sourceMode === "dag"
-      ? streamTraceOverlaySeries(panel)
-      : hasExtraChannels
-      ? streamExtraChannelSeries(panel)
-      : []
-    : [];
   const traceOverlayCount = isStreamTracePanel(panel)
     ? panel.sourceMode === "raw" && hasExtraChannels
       ? 1
       : panel.overlayCount
     : 0;
-  const binStatsOverlays = isStreamBinStatsPanel(panel)
-    ? streamBinStatsOverlaySeries(panel)
-    : [];
-  const binStatsFits = isStreamBinStatsPanel(panel)
-    ? streamBinStatsFitOverlayCurves(panel)
-    : [];
-  const binStatsHistOverlays = isStreamBinStatsPanel(panel)
-    ? streamBinStatsHistOverlaySeries(panel)
-    : [];
-
   // A trace's name comes from the panel's own override first, then from
   // the workspace label / derived output name, then from the raw id. The
   // key is the series identity the overlay helpers already produce
@@ -730,74 +732,102 @@ function PanelCardImpl({
     return outputDisplayName(streamWorkspace, seriesKey) || seriesKey;
   };
 
-  // Colour order mirrors the data order the plot components build:
-  // primary series first, then extras/overlays, then fit curves.
-  const legendItems: PlotLegendItem[] = [];
-  if (isStreamRawPanel(panel) && traceExtraSeries.length > 0) {
-    const primaryKey =
-      panel.sourceMode === "dag"
-        ? panel.outputId ?? "output"
-        : `ch ${panel.channelIndex}`;
-    legendItems.push({
-      key: primaryKey,
-      label: seriesDisplayName(primaryKey),
-      title: primaryKey,
-      color: traceColorAt(0),
-    });
-    traceExtraSeries.forEach((series, idx) => {
+  // Live series: the overlay helpers read the latest frames and fits, so
+  // this runs inside the revision boundary, once per data update.
+  const buildLiveSeries = () => {
+    const traceExtraSeries = isStreamTracePanel(panel)
+      ? panel.sourceMode === "dag"
+        ? streamTraceOverlaySeries(panel)
+        : hasExtraChannels
+        ? streamExtraChannelSeries(panel)
+        : []
+      : [];
+    const binStatsOverlays = isStreamBinStatsPanel(panel)
+      ? streamBinStatsOverlaySeries(panel)
+      : [];
+    const binStatsFits = isStreamBinStatsPanel(panel)
+      ? streamBinStatsFitOverlayCurves(panel)
+      : [];
+    const binStatsHistOverlays = isStreamBinStatsPanel(panel)
+      ? streamBinStatsHistOverlaySeries(panel)
+      : [];
+
+    // Colour order mirrors the data order the plot components build:
+    // primary series first, then extras/overlays, then fit curves.
+    const legendItems: PlotLegendItem[] = [];
+    if (isStreamRawPanel(panel) && traceExtraSeries.length > 0) {
+      const primaryKey =
+        panel.sourceMode === "dag"
+          ? panel.outputId ?? "output"
+          : `ch ${panel.channelIndex}`;
       legendItems.push({
-        key: series.label,
-        label: seriesDisplayName(series.label),
-        title: series.label,
-        color: traceColorAt(traceOverlayCount + idx),
+        key: primaryKey,
+        label: seriesDisplayName(primaryKey),
+        title: primaryKey,
+        color: traceColorAt(0),
       });
-    });
-  }
-  if (
-    isStreamBinStatsPanel(panel) &&
-    (binStatsOverlays.length > 0 ||
-      binStatsFits.length > 0 ||
-      binStatsHistOverlays.length > 0)
-  ) {
-    const meanKey = panel.outputId ?? "mean";
-    legendItems.push({
-      key: meanKey,
-      label: seriesDisplayName(meanKey),
-      title: meanKey,
-      color: binStatsMeanStroke(isDark),
-    });
-    binStatsOverlays.forEach((series, idx) => {
+      traceExtraSeries.forEach((series, idx) => {
+        legendItems.push({
+          key: series.label,
+          label: seriesDisplayName(series.label),
+          title: series.label,
+          color: traceColorAt(traceOverlayCount + idx),
+        });
+      });
+    }
+    if (
+      isStreamBinStatsPanel(panel) &&
+      (binStatsOverlays.length > 0 ||
+        binStatsFits.length > 0 ||
+        binStatsHistOverlays.length > 0)
+    ) {
+      const meanKey = panel.outputId ?? "mean";
       legendItems.push({
-        key: series.label,
-        label: seriesDisplayName(series.label),
-        title: series.label,
-        color: BIN_STATS_OVERLAY_COLORS[idx % BIN_STATS_OVERLAY_COLORS.length],
+        key: meanKey,
+        label: seriesDisplayName(meanKey),
+        title: meanKey,
+        color: binStatsMeanStroke(isDark),
       });
-    });
-    binStatsHistOverlays.forEach((overlay, idx) => {
-      legendItems.push({
-        key: overlay.label,
-        label: seriesDisplayName(overlay.label),
-        title: overlay.label,
-        color: binStatsHistOverlayColor(idx),
+      binStatsOverlays.forEach((series, idx) => {
+        legendItems.push({
+          key: series.label,
+          label: seriesDisplayName(series.label),
+          title: series.label,
+          color: BIN_STATS_OVERLAY_COLORS[idx % BIN_STATS_OVERLAY_COLORS.length],
+        });
       });
-    });
-    binStatsFits.forEach((curve, idx) => {
-      // A fit curve is derived from a series that already has its own
-      // legend entry, so it follows that name instead of taking a rename
-      // of its own.
-      legendItems.push({
-        key: `fit:${curve.label}`,
-        label: `${seriesDisplayName(curve.label)} (fit)`,
-        title: `${curve.label} (fit)`,
-        renamable: false,
-        color:
-          BIN_STATS_FIT_OVERLAY_COLORS[
-            idx % BIN_STATS_FIT_OVERLAY_COLORS.length
-          ],
+      binStatsHistOverlays.forEach((overlay, idx) => {
+        legendItems.push({
+          key: overlay.label,
+          label: seriesDisplayName(overlay.label),
+          title: overlay.label,
+          color: binStatsHistOverlayColor(idx),
+        });
       });
-    });
-  }
+      binStatsFits.forEach((curve, idx) => {
+        // A fit curve is derived from a series that already has its own
+        // legend entry, so it follows that name instead of taking a rename
+        // of its own.
+        legendItems.push({
+          key: `fit:${curve.label}`,
+          label: `${seriesDisplayName(curve.label)} (fit)`,
+          title: `${curve.label} (fit)`,
+          renamable: false,
+          color:
+            BIN_STATS_FIT_OVERLAY_COLORS[
+              idx % BIN_STATS_FIT_OVERLAY_COLORS.length
+            ],
+        });
+      });
+    }
+    return {
+      traceExtraSeries,
+      binStatsOverlays,
+      binStatsFits,
+      binStatsHistOverlays,
+      legendItems,
+    };
+  };
 
   const startSeriesRename = (seriesKey: string) => {
     setRenamingSeriesKey(seriesKey);
@@ -885,217 +915,238 @@ function PanelCardImpl({
         }
         menuItems={menuItems}
       />
-      <div ref={measureRef} style={{ width: "100%" }}>
-        {isTelemetryPanel(panel) ? (
-          <>
-            <PlotPanel
-              panelId={panel.id}
-              traces={panel.traces}
-              seriesLabels={panel.seriesLabels}
-              buffers={panelBuffers}
-              tick={panelRevision}
-              timeWindowS={panel.timeWindowS}
-              colorScheme={computedColorScheme}
-              plotHeight={plotHeight}
-              yScaleMode={panel.yScaleMode}
-              yMin={panel.yMin}
-              yMax={panel.yMax}
-              yDisplayMode={panel.yDisplayMode}
-              yOffset={telemetryOffset}
-              smoothingMode={panel.smoothingMode}
-              smoothingWindowS={panel.smoothingWindowS}
-            />
-            <Group gap={6} wrap="wrap" mt={6}>
-              {panel.traces.map((trace, traceIndex) => {
-                const traceColor = traceColorAt(traceIndex);
-                const units =
-                  typeof trace.units === "string" && trace.units.trim()
-                    ? ` (${trace.units.trim()})`
-                    : "";
-                return (
-                  <DraggableTraceChip
-                    key={traceKeyId(trace)}
-                    panelId={panel.id}
-                    trace={trace}
-                    className="trace-chip"
-                    style={{
-                      color: traceColor,
-                      background: colorWithAlpha(
-                        traceColor,
-                        isDark ? 0.22 : 0.14
-                      ),
-                      border: `1px solid ${colorWithAlpha(
-                        traceColor,
-                        isDark ? 0.45 : 0.3
-                      )}`,
+      <PanelRevisionBoundary panelId={panel.id}>
+        {(panelRevision) => {
+          const { panelBuffers, binStatsSnapshot, bin2dSnapshot } =
+            readLiveSnapshots();
+          const liveTelemetryOffset = isTelemetryPanel(panel)
+            ? resolveTelemetryPanelOffset(panel)
+            : null;
+          const {
+            traceExtraSeries,
+            binStatsOverlays,
+            binStatsFits,
+            binStatsHistOverlays,
+            legendItems,
+          } = buildLiveSeries();
+          const statusItems = buildStatusItems(binStatsSnapshot, bin2dSnapshot);
+          return (
+            <>
+              <div ref={measureRef} style={{ width: "100%" }}>
+                {isTelemetryPanel(panel) ? (
+                  <>
+                    <PlotPanel
+                      panelId={panel.id}
+                      traces={panel.traces}
+                      seriesLabels={panel.seriesLabels}
+                      buffers={panelBuffers}
+                      tick={panelRevision}
+                      timeWindowS={panel.timeWindowS}
+                      colorScheme={computedColorScheme}
+                      plotHeight={plotHeight}
+                      yScaleMode={panel.yScaleMode}
+                      yMin={panel.yMin}
+                      yMax={panel.yMax}
+                      yDisplayMode={panel.yDisplayMode}
+                      yOffset={liveTelemetryOffset}
+                      smoothingMode={panel.smoothingMode}
+                      smoothingWindowS={panel.smoothingWindowS}
+                    />
+                    <Group gap={6} wrap="wrap" mt={6}>
+                      {panel.traces.map((trace, traceIndex) => {
+                        const traceColor = traceColorAt(traceIndex);
+                        const units =
+                          typeof trace.units === "string" && trace.units.trim()
+                            ? ` (${trace.units.trim()})`
+                            : "";
+                        return (
+                          <DraggableTraceChip
+                            key={traceKeyId(trace)}
+                            panelId={panel.id}
+                            trace={trace}
+                            className="trace-chip"
+                            style={{
+                              color: traceColor,
+                              background: colorWithAlpha(
+                                traceColor,
+                                isDark ? 0.22 : 0.14
+                              ),
+                              border: `1px solid ${colorWithAlpha(
+                                traceColor,
+                                isDark ? 0.45 : 0.3
+                              )}`,
+                            }}
+                          >
+                            {renamingSeriesKey === traceKeyId(trace) ? (
+                              <input
+                                className="plot-legend-input"
+                                autoFocus
+                                data-no-activate="true"
+                                aria-label={`Rename ${trace.deviceId}.${trace.signal}`}
+                                placeholder={`${trace.deviceId}.${trace.signal}`}
+                                value={seriesRenameDraft}
+                                onChange={(event) =>
+                                  setSeriesRenameDraft(event.currentTarget.value)
+                                }
+                                onBlur={commitSeriesRename}
+                                onKeyDown={(event) => {
+                                  if (event.key === "Enter") {
+                                    event.preventDefault();
+                                    commitSeriesRename();
+                                  } else if (event.key === "Escape") {
+                                    event.preventDefault();
+                                    cancelSeriesRename();
+                                  }
+                                }}
+                              />
+                            ) : (
+                              <span
+                                title="Double-click to rename"
+                                onDoubleClick={() =>
+                                  startSeriesRename(traceKeyId(trace))
+                                }
+                              >
+                                {seriesLabels[traceKeyId(trace)] ??
+                                  `${trace.deviceId}.${trace.signal}`}
+                                {units}
+                              </span>
+                            )}
+                            <ActionIcon
+                              size="sm"
+                              variant="subtle"
+                              color="red"
+                              onClick={() => removeTraceFromPanel(panel.id, trace)}
+                              aria-label={`Remove ${trace.deviceId}.${trace.signal}`}
+                              title="Remove trace"
+                            >
+                              <IconX size={14} />
+                            </ActionIcon>
+                          </DraggableTraceChip>
+                        );
+                      })}
+                    </Group>
+                  </>
+                ) : isStreamTracePanel(panel) ? (
+                  emptyMessage ? (
+                    emptyState
+                  ) : isStreamRawPanel(panel) ? (
+                    <StreamRawPanel
+                      panelId={panel.id}
+                      frames={streamFramesRef.get(panel.id) ?? []}
+                      overlayCount={traceOverlayCount}
+                      channelIndex={panel.sourceMode === "raw" ? panel.channelIndex : 0}
+                      tick={panelRevision}
+                      colorScheme={computedColorScheme}
+                      plotHeight={plotHeight}
+                      units={panel.stream?.units ?? null}
+                      xUnits={panel.sourceMode === "raw" ? panel.stream?.xUnits ?? null : null}
+                      xLabel={panel.sourceMode === "raw" ? panel.stream?.xLabel ?? null : null}
+                      xIncrement={
+                        panel.sourceMode === "raw" ? panel.stream?.xIncrement ?? null : null
+                      }
+                      xOrigin={panel.sourceMode === "raw" ? panel.stream?.xOrigin ?? null : null}
+                      extraSeries={traceExtraSeries}
+                      yScaleMode={panel.yScaleMode}
+                      yMin={panel.yMin}
+                      yMax={panel.yMax}
+                    />
+                  ) : (
+                    <StreamWaterfallPanel
+                      panelId={panel.id}
+                      frames={streamFramesRef.get(panel.id) ?? []}
+                      historyRows={panel.overlayCount}
+                      channelIndex={panel.sourceMode === "raw" ? panel.channelIndex : 0}
+                      tick={panelRevision}
+                      colorScheme={computedColorScheme}
+                      plotHeight={plotHeight}
+                      xUnits={panel.sourceMode === "raw" ? panel.stream?.xUnits ?? null : null}
+                      xLabel={panel.sourceMode === "raw" ? panel.stream?.xLabel ?? null : null}
+                      xIncrement={
+                        panel.sourceMode === "raw" ? panel.stream?.xIncrement ?? null : null
+                      }
+                      xOrigin={panel.sourceMode === "raw" ? panel.stream?.xOrigin ?? null : null}
+                      zScaleMode={panel.yScaleMode}
+                      zMin={panel.yMin}
+                      zMax={panel.yMax}
+                    />
+                  )
+                ) : isStreamScalarPanel(panel) ? (
+                  emptyMessage ? (
+                    emptyState
+                  ) : (
+                    <PlotPanel
+                      panelId={panel.id}
+                      traces={[streamScalarTrace(panel)]}
+                      buffers={panelBuffers}
+                      tick={panelRevision}
+                      timeWindowS={panel.timeWindowS}
+                      colorScheme={computedColorScheme}
+                      plotHeight={plotHeight}
+                      yScaleMode={panel.yScaleMode}
+                      yMin={panel.yMin}
+                      yMax={panel.yMax}
+                    />
+                  )
+                ) : isStreamParamsPanel(panel) ? (
+                  <StreamParamsPanel
+                    valuesByOutputId={streamParamsLatestRef.get(panel.id) ?? {}}
+                    selectedOutputIds={panel.outputIds}
+                    onCopyJson={(payload) => {
+                      void copyTextToClipboard("Params JSON", payload);
                     }}
-                  >
-                    {renamingSeriesKey === traceKeyId(trace) ? (
-                      <input
-                        className="plot-legend-input"
-                        autoFocus
-                        data-no-activate="true"
-                        aria-label={`Rename ${trace.deviceId}.${trace.signal}`}
-                        placeholder={`${trace.deviceId}.${trace.signal}`}
-                        value={seriesRenameDraft}
-                        onChange={(event) =>
-                          setSeriesRenameDraft(event.currentTarget.value)
-                        }
-                        onBlur={commitSeriesRename}
-                        onKeyDown={(event) => {
-                          if (event.key === "Enter") {
-                            event.preventDefault();
-                            commitSeriesRename();
-                          } else if (event.key === "Escape") {
-                            event.preventDefault();
-                            cancelSeriesRename();
-                          }
-                        }}
-                      />
-                    ) : (
-                      <span
-                        title="Double-click to rename"
-                        onDoubleClick={() =>
-                          startSeriesRename(traceKeyId(trace))
-                        }
-                      >
-                        {seriesLabels[traceKeyId(trace)] ??
-                          `${trace.deviceId}.${trace.signal}`}
-                        {units}
-                      </span>
-                    )}
-                    <ActionIcon
-                      size="sm"
-                      variant="subtle"
-                      color="red"
-                      onClick={() => removeTraceFromPanel(panel.id, trace)}
-                      aria-label={`Remove ${trace.deviceId}.${trace.signal}`}
-                      title="Remove trace"
-                    >
-                      <IconX size={14} />
-                    </ActionIcon>
-                  </DraggableTraceChip>
-                );
-              })}
-            </Group>
-          </>
-        ) : isStreamTracePanel(panel) ? (
-          emptyMessage ? (
-            emptyState
-          ) : isStreamRawPanel(panel) ? (
-            <StreamRawPanel
-              panelId={panel.id}
-              frames={streamFramesRef.get(panel.id) ?? []}
-              overlayCount={traceOverlayCount}
-              channelIndex={panel.sourceMode === "raw" ? panel.channelIndex : 0}
-              tick={panelRevision}
-              colorScheme={computedColorScheme}
-              plotHeight={plotHeight}
-              units={panel.stream?.units ?? null}
-              xUnits={panel.sourceMode === "raw" ? panel.stream?.xUnits ?? null : null}
-              xLabel={panel.sourceMode === "raw" ? panel.stream?.xLabel ?? null : null}
-              xIncrement={
-                panel.sourceMode === "raw" ? panel.stream?.xIncrement ?? null : null
-              }
-              xOrigin={panel.sourceMode === "raw" ? panel.stream?.xOrigin ?? null : null}
-              extraSeries={traceExtraSeries}
-              yScaleMode={panel.yScaleMode}
-              yMin={panel.yMin}
-              yMax={panel.yMax}
-            />
-          ) : (
-            <StreamWaterfallPanel
-              panelId={panel.id}
-              frames={streamFramesRef.get(panel.id) ?? []}
-              historyRows={panel.overlayCount}
-              channelIndex={panel.sourceMode === "raw" ? panel.channelIndex : 0}
-              tick={panelRevision}
-              colorScheme={computedColorScheme}
-              plotHeight={plotHeight}
-              xUnits={panel.sourceMode === "raw" ? panel.stream?.xUnits ?? null : null}
-              xLabel={panel.sourceMode === "raw" ? panel.stream?.xLabel ?? null : null}
-              xIncrement={
-                panel.sourceMode === "raw" ? panel.stream?.xIncrement ?? null : null
-              }
-              xOrigin={panel.sourceMode === "raw" ? panel.stream?.xOrigin ?? null : null}
-              zScaleMode={panel.yScaleMode}
-              zMin={panel.yMin}
-              zMax={panel.yMax}
-            />
-          )
-        ) : isStreamScalarPanel(panel) ? (
-          emptyMessage ? (
-            emptyState
-          ) : (
-            <PlotPanel
-              panelId={panel.id}
-              traces={[streamScalarTrace(panel)]}
-              buffers={panelBuffers}
-              tick={panelRevision}
-              timeWindowS={panel.timeWindowS}
-              colorScheme={computedColorScheme}
-              plotHeight={plotHeight}
-              yScaleMode={panel.yScaleMode}
-              yMin={panel.yMin}
-              yMax={panel.yMax}
-            />
-          )
-        ) : isStreamParamsPanel(panel) ? (
-          <StreamParamsPanel
-            valuesByOutputId={streamParamsLatestRef.get(panel.id) ?? {}}
-            selectedOutputIds={panel.outputIds}
-            onCopyJson={(payload) => {
-              void copyTextToClipboard("Params JSON", payload);
-            }}
-          />
-        ) : isStreamBinStatsPanel(panel) ? (
-          emptyMessage ? (
-            emptyState
-          ) : (
-            <StreamBinStatsPanel
-              panelId={panel.id}
-              series={binStatsSnapshot?.series ?? null}
-              overlaySeries={binStatsOverlays}
-              histOverlays={binStatsHistOverlays}
-              fitOverlays={binStatsFits}
-              xLabel={binStatsXLabel}
-              uncertaintyMode={panel.uncertaintyMode}
-              uncertaintyScale={panel.uncertaintyScale}
-              showBinMarkers={panel.showBinMarkers}
-              xOffset={panel.xOffset}
-              xScale={panel.xScale}
-              tick={panelRevision}
-              colorScheme={computedColorScheme}
-              plotHeight={plotHeight}
-              yScaleMode={panel.yScaleMode}
-              yMin={panel.yMin}
-              yMax={panel.yMax}
-            />
-          )
-        ) : isStreamBin2dPanel(panel) ? (
-          <StreamBin2dPanel
-            panelId={panel.id}
-            series={bin2dSnapshot?.series ?? null}
-            reducer={panel.reducer}
-            tick={panelRevision}
-            colorScheme={computedColorScheme}
-            plotHeight={plotHeight}
-            zScaleMode={panel.yScaleMode}
-            zMin={panel.yMin}
-            zMax={panel.yMax}
-          />
-        ) : null}
-      </div>
-      <PlotLegend
-        items={legendItems}
-        onRenameSeries={startSeriesRename}
-        editingKey={renamingSeriesKey}
-        editingValue={seriesRenameDraft}
-        onEditingValueChange={setSeriesRenameDraft}
-        onCommitRename={commitSeriesRename}
-        onCancelRename={cancelSeriesRename}
-      />
-      <PanelStatusLine items={statusItems} />
+                  />
+                ) : isStreamBinStatsPanel(panel) ? (
+                  emptyMessage ? (
+                    emptyState
+                  ) : (
+                    <StreamBinStatsPanel
+                      panelId={panel.id}
+                      series={binStatsSnapshot?.series ?? null}
+                      overlaySeries={binStatsOverlays}
+                      histOverlays={binStatsHistOverlays}
+                      fitOverlays={binStatsFits}
+                      xLabel={binStatsXLabel}
+                      uncertaintyMode={panel.uncertaintyMode}
+                      uncertaintyScale={panel.uncertaintyScale}
+                      showBinMarkers={panel.showBinMarkers}
+                      xOffset={panel.xOffset}
+                      xScale={panel.xScale}
+                      tick={panelRevision}
+                      colorScheme={computedColorScheme}
+                      plotHeight={plotHeight}
+                      yScaleMode={panel.yScaleMode}
+                      yMin={panel.yMin}
+                      yMax={panel.yMax}
+                    />
+                  )
+                ) : isStreamBin2dPanel(panel) ? (
+                  <StreamBin2dPanel
+                    panelId={panel.id}
+                    series={bin2dSnapshot?.series ?? null}
+                    reducer={panel.reducer}
+                    tick={panelRevision}
+                    colorScheme={computedColorScheme}
+                    plotHeight={plotHeight}
+                    zScaleMode={panel.yScaleMode}
+                    zMin={panel.yMin}
+                    zMax={panel.yMax}
+                  />
+                ) : null}
+              </div>
+              <PlotLegend
+                items={legendItems}
+                onRenameSeries={startSeriesRename}
+                editingKey={renamingSeriesKey}
+                editingValue={seriesRenameDraft}
+                onEditingValueChange={setSeriesRenameDraft}
+                onCommitRename={commitSeriesRename}
+                onCancelRename={cancelSeriesRename}
+              />
+              <PanelStatusLine items={statusItems} />
+            </>
+          );
+        }}
+      </PanelRevisionBoundary>
     </ReorderableCardShell>
   );
 }

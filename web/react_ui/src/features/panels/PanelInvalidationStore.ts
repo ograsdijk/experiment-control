@@ -1,12 +1,37 @@
-import { useCallback, useSyncExternalStore } from "react";
+import {
+  Fragment,
+  createElement,
+  useCallback,
+  useSyncExternalStore,
+  type ReactNode,
+} from "react";
 
 import { perfCount } from "../performance/perfInstrumentation";
 
 export const DEFAULT_PLOT_MAX_FPS = 30;
+export const MIN_TIME_SERIES_FPS = 5;
+
+/**
+ * Redraw ceiling for a scrolling time-series plot: about one redraw per pixel
+ * the x axis advances, between MIN_TIME_SERIES_FPS and DEFAULT_PLOT_MAX_FPS.
+ * A 120 s window on a 400 px plot moves ~3 px/s, so redrawing it at the data
+ * rate (often 20-30 Hz) repaints nearly identical frames.
+ */
+export function timeSeriesMaxFps(plotWidthPx: number, timeWindowS: number): number {
+  if (!(plotWidthPx > 0) || !(timeWindowS > 0)) return DEFAULT_PLOT_MAX_FPS;
+  const pxPerSecond = plotWidthPx / timeWindowS;
+  return Math.min(DEFAULT_PLOT_MAX_FPS, Math.max(MIN_TIME_SERIES_FPS, Math.ceil(pxPerSecond)));
+}
 
 type Listener = () => void;
 type ScheduleFrame = (callback: FrameRequestCallback) => number;
 type CancelFrame = (handle: number) => void;
+type ScheduleTimeout = (callback: () => void, delayMs: number) => number;
+type CancelTimeout = (handle: number) => void;
+
+// A rate-limited panel that is due further away than this waits on a timer
+// instead of re-arming requestAnimationFrame every vsync until it is due.
+const FRAME_WAIT_THRESHOLD_MS = 12;
 
 export class PanelInvalidationStore {
   private readonly versions = new Map<string, number>();
@@ -16,13 +41,18 @@ export class PanelInvalidationStore {
   private readonly lastFlushAt = new Map<string, number>();
   private readonly visibility = new Map<string, Map<string, boolean>>();
   private frame: number | null = null;
+  private timer: number | null = null;
   private hidden = false;
 
   constructor(
     private readonly scheduleFrame: ScheduleFrame = (callback) =>
       window.requestAnimationFrame(callback),
     private readonly cancelFrame: CancelFrame = (handle) =>
-      window.cancelAnimationFrame(handle)
+      window.cancelAnimationFrame(handle),
+    private readonly scheduleTimeout: ScheduleTimeout = (callback, delayMs) =>
+      window.setTimeout(callback, delayMs),
+    private readonly cancelTimeout: CancelTimeout = (handle) =>
+      window.clearTimeout(handle)
   ) {}
 
   getRevision = (panelId: string): number => this.versions.get(panelId) ?? 0;
@@ -80,10 +110,11 @@ export class PanelInvalidationStore {
   setHidden(hidden: boolean): void {
     if (this.hidden === hidden) return;
     this.hidden = hidden;
-    if (hidden && this.frame !== null) {
-      this.cancelFrame(this.frame);
+    if (hidden) {
+      if (this.frame !== null) this.cancelFrame(this.frame);
       this.frame = null;
-    } else if (!hidden) {
+      this.clearTimer();
+    } else {
       // Force one catch-up render for mounted, visible representations even
       // when no message arrived during the hidden interval.
       this.markPanelsDirty(
@@ -105,7 +136,13 @@ export class PanelInvalidationStore {
   dispose(): void {
     if (this.frame !== null) this.cancelFrame(this.frame);
     this.frame = null;
+    this.clearTimer();
     this.dirty.clear();
+  }
+
+  private clearTimer(): void {
+    if (this.timer !== null) this.cancelTimeout(this.timer);
+    this.timer = null;
   }
 
   private ensureFrame(): void {
@@ -116,12 +153,18 @@ export class PanelInvalidationStore {
   private flush(now: number): void {
     this.frame = null;
     if (this.hidden) return;
+    this.clearTimer();
     const notified: string[] = [];
+    let nextDueInMs = Number.POSITIVE_INFINITY;
     for (const panelId of [...this.dirty]) {
       if (!this.isVisible(panelId)) continue;
       const interval = 1000 / (this.maxFps.get(panelId) ?? DEFAULT_PLOT_MAX_FPS);
       const previous = this.lastFlushAt.get(panelId) ?? Number.NEGATIVE_INFINITY;
-      if (now - previous + 0.01 < interval) continue;
+      const dueInMs = previous + interval - now;
+      if (dueInMs > 0.01) {
+        nextDueInMs = Math.min(nextDueInMs, dueInMs);
+        continue;
+      }
       this.dirty.delete(panelId);
       this.lastFlushAt.set(panelId, now);
       this.versions.set(panelId, (this.versions.get(panelId) ?? 0) + 1);
@@ -134,7 +177,16 @@ export class PanelInvalidationStore {
         for (const listener of this.listeners.get(panelId) ?? []) listener();
       }
     }
-    if ([...this.dirty].some((panelId) => this.isVisible(panelId))) this.ensureFrame();
+    if (nextDueInMs === Number.POSITIVE_INFINITY) return;
+    if (nextDueInMs <= FRAME_WAIT_THRESHOLD_MS) {
+      this.ensureFrame();
+      return;
+    }
+    // Wake slightly early so the flush still lands on the frame it is due in.
+    this.timer = this.scheduleTimeout(() => {
+      this.timer = null;
+      this.ensureFrame();
+    }, nextDueInMs - FRAME_WAIT_THRESHOLD_MS / 2);
   }
 
   private isVisible(panelId: string): boolean {
@@ -160,14 +212,38 @@ export function markPanelsDirty(panelIds: Iterable<string>): void {
   panelInvalidationStore.markPanelsDirty(panelIds);
 }
 
-export function usePanelRevision(panelId: string): number {
+const NO_SUBSCRIPTION = () => () => undefined;
+
+/**
+ * The panel's data revision. With `enabled` false the component does not
+ * re-render on data updates (it still reads the current revision when it
+ * renders for other reasons).
+ */
+export function usePanelRevision(panelId: string, enabled = true): number {
   const subscribe = useCallback(
     (listener: Listener) => panelInvalidationStore.subscribe(panelId, listener),
     [panelId]
   );
   return useSyncExternalStore(
-    subscribe,
+    enabled ? subscribe : NO_SUBSCRIPTION,
     () => panelInvalidationStore.getRevision(panelId),
     () => panelInvalidationStore.getRevision(panelId)
   );
+}
+
+/**
+ * Re-renders only its render function on each data update of `panelId`, so
+ * a card's header, settings and other chrome stay out of the per-frame path.
+ * The function is the parent's latest closure: configuration comes from the
+ * parent's last render and live data is read from refs when it runs.
+ */
+export function PanelRevisionBoundary({
+  panelId,
+  children,
+}: {
+  panelId: string;
+  children: (revision: number) => ReactNode;
+}) {
+  const revision = usePanelRevision(panelId);
+  return createElement(Fragment, null, children(revision));
 }

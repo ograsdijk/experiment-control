@@ -85,6 +85,11 @@ type Props = {
   onApplyWorkspace: () => Promise<unknown> | void;
 };
 
+// Mantine keeps a Combobox dropdown mounted (and positioned by Floating UI)
+// while closed by default. The editor renders a Select per node parameter,
+// so mount each dropdown only when it opens.
+const DAG_COMBOBOX_PROPS = { zIndex: 500, keepMounted: false } as const;
+
 export function DaqWorkspacesModal({
   opened,
   onClose,
@@ -173,6 +178,7 @@ export function DaqWorkspacesModal({
             onChange={onWorkspaceChange}
             searchable
             flex={1}
+            comboboxProps={DAG_COMBOBOX_PROPS}
           />
           <Button variant="light" onClick={onCreateWorkspace}>
             New workspace
@@ -334,7 +340,7 @@ export function DaqWorkspacesModal({
                               data={STREAM_DAG_OP_OPTIONS}
                               value={node.op}
                               onChange={(value) => onSetNodeOp(index, value)}
-                              comboboxProps={{ zIndex: 500 }}
+                              comboboxProps={DAG_COMBOBOX_PROPS}
                               style={{ flex: "1 1 220px" }}
                             />
                             {node.op === "source.stream" ? (
@@ -366,7 +372,7 @@ export function DaqWorkspacesModal({
                                     String(next ?? "single")
                                   )
                                 }
-                                comboboxProps={{ zIndex: 500 }}
+                                comboboxProps={DAG_COMBOBOX_PROPS}
                                 style={{ flex: "0 0 140px" }}
                               />
                             ) : null}
@@ -495,7 +501,7 @@ export function DaqWorkspacesModal({
                                           onSetNodeParam(index, "stream", "");
                                         }
                                       }}
-                                      comboboxProps={{ zIndex: 500 }}
+                                      comboboxProps={DAG_COMBOBOX_PROPS}
                                       searchable
                                       clearable
                                       style={{ flex: "1 1 180px" }}
@@ -511,7 +517,7 @@ export function DaqWorkspacesModal({
                                           String(next ?? "")
                                         )
                                       }
-                                      comboboxProps={{ zIndex: 500 }}
+                                      comboboxProps={DAG_COMBOBOX_PROPS}
                                       searchable
                                       clearable
                                       disabled={!selectedDevice}
@@ -540,11 +546,12 @@ export function DaqWorkspacesModal({
                                           onSetNodeParam(index, "channel_indices", value);
                                           onSetNodeParam(index, "channel_index", value);
                                         }}
-                                        comboboxProps={{ zIndex: 500 }}
+                                        comboboxProps={DAG_COMBOBOX_PROPS}
                                         style={{ flex: "0 0 180px" }}
                                       />
                                     ) : (
                                       <MultiSelect
+                                        comboboxProps={DAG_COMBOBOX_PROPS}
                                         label="channels"
                                         data={channelOptions}
                                         searchable
@@ -618,7 +625,7 @@ export function DaqWorkspacesModal({
                                     onChange={(value) =>
                                       onSetNodeInput(index, port, value)
                                     }
-                                    comboboxProps={{ zIndex: 500 }}
+                                    comboboxProps={DAG_COMBOBOX_PROPS}
                                     clearable
                                     searchable
                                     nothingFoundMessage="No compatible source nodes"
@@ -730,7 +737,7 @@ export function DaqWorkspacesModal({
                                           String(value ?? options[0]?.value ?? "")
                                         )
                                       }
-                                      comboboxProps={{ zIndex: 500 }}
+                                      comboboxProps={DAG_COMBOBOX_PROPS}
                                       style={{ flex: "1 1 160px" }}
                                     />
                                   );
@@ -809,7 +816,7 @@ export function DaqWorkspacesModal({
                           data={daqPublishableNodeOptions}
                           value={output.nodeId || null}
                           onChange={(value) => onSetOutputNode(index, value)}
-                          comboboxProps={{ zIndex: 500 }}
+                          comboboxProps={DAG_COMBOBOX_PROPS}
                           searchable
                           style={{ flex: "1 1 220px" }}
                         />

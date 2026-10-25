@@ -33,6 +33,7 @@ export function autoPlotHeight(widthPx: number): number {
 export function usePlotAreaHeight(pinnedHeightPx?: number | null): {
   measureRef: (node: HTMLElement | null) => void;
   plotHeight: number;
+  plotWidth: number;
 } {
   const [width, setWidth] = useState(0);
   const nodeRef = useRef<HTMLElement | null>(null);
@@ -60,5 +61,5 @@ export function usePlotAreaHeight(pinnedHeightPx?: number | null): {
       ? pinnedHeightPx
       : autoPlotHeight(width);
 
-  return { measureRef, plotHeight };
+  return { measureRef, plotHeight, plotWidth: width };
 }

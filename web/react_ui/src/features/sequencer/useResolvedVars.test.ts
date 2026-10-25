@@ -2,10 +2,11 @@
 
 import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ApiResponse } from "../../api";
 import type { ResolvedVars } from "./resolved_values";
 import { RESOLVE_VARS_DEBOUNCE_MS, staleReason, useResolvedVars } from "./useResolvedVars";
+import { loadSequencerYamlTools } from "./useSequencerYamlTools";
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -46,6 +47,12 @@ async function render(props: Parameters<typeof Probe>[0]) {
     await vi.advanceTimersByTimeAsync(RESOLVE_VARS_DEBOUNCE_MS + 1);
   });
 }
+
+// Loaded up front, as the open modal has by the time a request goes out; the
+// lazy load itself is covered in useSequencerYamlTools.test.ts.
+beforeAll(async () => {
+  await loadSequencerYamlTools();
+});
 
 beforeEach(() => {
   vi.useFakeTimers();

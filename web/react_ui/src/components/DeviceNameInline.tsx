@@ -1,7 +1,8 @@
-import { Text, Tooltip, useComputedColorScheme } from "@mantine/core";
+import { Text, useComputedColorScheme } from "@mantine/core";
 import { IconTopologyStar3 } from "@tabler/icons-react";
 import type { ReactNode } from "react";
 import type { DeviceStatus } from "../types";
+import { HoverTooltip } from "./HoverTooltip";
 
 type Props = {
   deviceId: string;
@@ -35,7 +36,7 @@ export function DeviceNameInline({
   return (
     <>
       {isRemote ? (
-        <Tooltip label={remoteTooltip} withArrow>
+        <HoverTooltip label={remoteTooltip} withArrow>
           <span
             style={{
               display: "inline-flex",
@@ -47,7 +48,7 @@ export function DeviceNameInline({
           >
             <IconTopologyStar3 size={14} stroke={1.8} />
           </span>
-        </Tooltip>
+        </HoverTooltip>
       ) : null}
       <Text span size={size} fw={fw} c={c}>
         {deviceId}

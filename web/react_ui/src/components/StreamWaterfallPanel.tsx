@@ -5,6 +5,7 @@ import {
   perfCountScoped,
   perfMeasure,
 } from "../features/performance/perfInstrumentation";
+import { writeHeatmapRow } from "../utils/heatmapColormap";
 
 type StreamWaterfallPanelProps = {
   panelId?: string;
@@ -31,7 +32,33 @@ type WaterfallGrid = {
   values: Float32Array;
   seqStart: number | null;
   seqEnd: number | null;
+  /** Frame seq of each row, oldest first. */
+  rowSeqs: number[];
 };
+
+/** Coloured rows from the previous redraw, reusable while the scale holds. */
+export type WaterfallPixelCache = {
+  cols: number;
+  zMin: number;
+  zMax: number;
+  /** Identity of each coloured row: frame seq plus a content fingerprint. */
+  rowKeys: string[];
+  data: Uint8ClampedArray<ArrayBuffer>;
+};
+
+/**
+ * A row's identity for pixel reuse. The seq alone is not enough: the same
+ * seq carries different data after a channel or source switch or a stream
+ * restart, so the key also fingerprints the row's values.
+ */
+function waterfallRowKey(grid: WaterfallGrid, row: number): string {
+  const start = row * grid.cols;
+  let sum = 0;
+  for (let c = 0; c < grid.cols; c += 1) {
+    sum += grid.values[start + c];
+  }
+  return `${grid.rowSeqs[row]}:${sum}:${grid.values[start]}:${grid.values[start + grid.cols - 1]}`;
+}
 
 function asNumber(value: unknown): number | null {
   if (typeof value === "number" && Number.isFinite(value)) {
@@ -121,6 +148,7 @@ export function buildStreamWaterfallGrid(
       values: new Float32Array(0),
       seqStart: null,
       seqEnd: null,
+      rowSeqs: [],
     };
   }
   const keepRows = Math.max(1, Math.trunc(historyRows));
@@ -138,6 +166,7 @@ export function buildStreamWaterfallGrid(
       values: new Float32Array(0),
       seqStart: null,
       seqEnd: null,
+      rowSeqs: [],
     };
   }
 
@@ -150,6 +179,7 @@ export function buildStreamWaterfallGrid(
       values: new Float32Array(0),
       seqStart: null,
       seqEnd: null,
+      rowSeqs: [],
     };
   }
 
@@ -168,6 +198,7 @@ export function buildStreamWaterfallGrid(
     values,
     seqStart: traces[0].seq,
     seqEnd: traces[traces.length - 1].seq,
+    rowSeqs: traces.map((item) => item.seq),
   };
 }
 
@@ -176,7 +207,13 @@ export function computeStreamWaterfallAutoZRange(
   historyRows: number,
   channelIndex: number
 ): { min: number; max: number } | null {
-  const grid = buildStreamWaterfallGrid(frames, historyRows, channelIndex);
+  return waterfallGridZRange(buildStreamWaterfallGrid(frames, historyRows, channelIndex));
+}
+
+/** Auto z range of an already built grid (min/max, padded when flat). */
+export function waterfallGridZRange(
+  grid: WaterfallGrid
+): { min: number; max: number } | null {
   if (grid.values.length <= 0) {
     return null;
   }
@@ -204,47 +241,47 @@ export function computeStreamWaterfallAutoZRange(
   return { min, max };
 }
 
-function clamp01(value: number): number {
-  if (!Number.isFinite(value)) {
-    return 0;
+/**
+ * RGBA pixels for the grid. Rows already coloured at the same z range and
+ * width are copied from `previous` (matched by seq and content, see
+ * waterfallRowKey); only new rows are coloured. With an auto range the scale changes only when a new row sets an
+ * extreme or the row holding one scrolls out, so most redraws colour one row.
+ */
+export function colorWaterfallRows(
+  grid: WaterfallGrid,
+  zMin: number,
+  zMax: number,
+  previous: WaterfallPixelCache | null
+): { cache: WaterfallPixelCache; coloredRows: number } {
+  const rowBytes = grid.cols * 4;
+  const data = new Uint8ClampedArray(grid.rows * rowBytes);
+  const reusable =
+    previous !== null &&
+    previous.cols === grid.cols &&
+    previous.zMin === zMin &&
+    previous.zMax === zMax;
+  const previousRowByKey = new Map<string, number>();
+  if (reusable) {
+    previous.rowKeys.forEach((key, row) => previousRowByKey.set(key, row));
   }
-  if (value <= 0) {
-    return 0;
-  }
-  if (value >= 1) {
-    return 1;
-  }
-  return value;
-}
-
-function lerp(a: number, b: number, t: number): number {
-  return a + (b - a) * t;
-}
-
-function colorAt(tRaw: number): [number, number, number] {
-  const t = clamp01(tRaw);
-  const stops: Array<[number, number, number, number]> = [
-    [0.0, 10, 12, 36],
-    [0.25, 51, 85, 137],
-    [0.5, 28, 170, 156],
-    [0.75, 168, 220, 50],
-    [1.0, 255, 243, 156],
-  ];
-  for (let i = 0; i < stops.length - 1; i += 1) {
-    const a = stops[i];
-    const b = stops[i + 1];
-    if (t < a[0] || t > b[0]) {
+  const rowKeys: string[] = new Array(grid.rows);
+  const span = Math.max(1e-12, zMax - zMin);
+  let coloredRows = 0;
+  for (let r = 0; r < grid.rows; r += 1) {
+    rowKeys[r] = waterfallRowKey(grid, r);
+    const previousRow = previousRowByKey.get(rowKeys[r]);
+    if (reusable && previousRow !== undefined) {
+      const from = previousRow * rowBytes;
+      data.set(previous.data.subarray(from, from + rowBytes), r * rowBytes);
       continue;
     }
-    const local = (t - a[0]) / Math.max(1e-9, b[0] - a[0]);
-    return [
-      Math.trunc(lerp(a[1], b[1], local)),
-      Math.trunc(lerp(a[2], b[2], local)),
-      Math.trunc(lerp(a[3], b[3], local)),
-    ];
+    writeHeatmapRow(data, r * rowBytes, grid.values, r * grid.cols, grid.cols, zMin, span);
+    coloredRows += 1;
   }
-  const tail = stops[stops.length - 1];
-  return [tail[1], tail[2], tail[3]];
+  return {
+    cache: { cols: grid.cols, zMin, zMax, rowKeys, data },
+    coloredRows,
+  };
 }
 
 function formatValue(value: number | null): string {
@@ -277,6 +314,8 @@ export function StreamWaterfallPanel({
   const hostRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const heatmapRef = useRef<HTMLCanvasElement | null>(null);
+  const pixelCacheRef = useRef<WaterfallPixelCache | null>(null);
+  const drawRef = useRef<() => void>(() => undefined);
   const isDark = colorScheme === "dark";
 
   const grid = useMemo(
@@ -297,13 +336,13 @@ export function StreamWaterfallPanel({
     if (manual) {
       return { min: Number(zMin), max: Number(zMax), manual: true };
     }
-    const auto = computeStreamWaterfallAutoZRange(frames, historyRows, channelIndex);
+    const auto = waterfallGridZRange(grid);
     return {
       min: auto?.min ?? 0,
       max: auto?.max ?? 1,
       manual: false,
     };
-  }, [zScaleMode, zMin, zMax, frames, historyRows, channelIndex, tick]);
+  }, [zScaleMode, zMin, zMax, grid]);
 
   useEffect(() => {
     if (!hostRef.current || !canvasRef.current) {
@@ -318,8 +357,11 @@ export function StreamWaterfallPanel({
         const height = Math.max(240, Math.trunc(plotHeight));
       const dpr = Math.max(1, Number(window.devicePixelRatio || 1));
       const canvas = canvasRef.current;
-      canvas.width = Math.max(1, Math.trunc(width * dpr));
-      canvas.height = Math.max(1, Math.trunc(height * dpr));
+      // Assigning a canvas size reallocates and clears it; only do it on change.
+      const pixelWidth = Math.max(1, Math.trunc(width * dpr));
+      const pixelHeight = Math.max(1, Math.trunc(height * dpr));
+      if (canvas.width !== pixelWidth) canvas.width = pixelWidth;
+      if (canvas.height !== pixelHeight) canvas.height = pixelHeight;
       canvas.style.width = `${width}px`;
       canvas.style.height = `${height}px`;
       const ctx = canvas.getContext("2d");
@@ -328,6 +370,7 @@ export function StreamWaterfallPanel({
       }
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
       ctx.clearRect(0, 0, width, height);
+      ctx.textAlign = "left";
 
       const fg = isDark ? "#ebe8e2" : "#2d302d";
       const frameStroke = isDark ? "rgba(235, 232, 226, 0.35)" : "rgba(45, 48, 45, 0.25)";
@@ -349,25 +392,18 @@ export function StreamWaterfallPanel({
           heatmapRef.current = document.createElement("canvas");
         }
         const hm = heatmapRef.current;
-        hm.width = grid.cols;
-        hm.height = grid.rows;
+        if (hm.width !== grid.cols) hm.width = grid.cols;
+        if (hm.height !== grid.rows) hm.height = grid.rows;
         const hmCtx = hm.getContext("2d");
         if (hmCtx) {
-          const img = hmCtx.createImageData(grid.cols, grid.rows);
-          const span = Math.max(1e-12, zRange.max - zRange.min);
-          for (let r = 0; r < grid.rows; r += 1) {
-            for (let c = 0; c < grid.cols; c += 1) {
-              const raw = Number(grid.values[r * grid.cols + c]);
-              const t = clamp01((raw - zRange.min) / span);
-              const [cr, cg, cb] = colorAt(t);
-              const idx = (r * grid.cols + c) * 4;
-              img.data[idx] = cr;
-              img.data[idx + 1] = cg;
-              img.data[idx + 2] = cb;
-              img.data[idx + 3] = 255;
-            }
-          }
-          hmCtx.putImageData(img, 0, 0);
+          const { cache } = colorWaterfallRows(
+            grid,
+            zRange.min,
+            zRange.max,
+            pixelCacheRef.current
+          );
+          pixelCacheRef.current = cache;
+          hmCtx.putImageData(new ImageData(cache.data, grid.cols, grid.rows), 0, 0);
           ctx.imageSmoothingEnabled = false;
           perfCount("canvas.waterfall_redraws");
           perfCountScoped("canvas.redraws", panelId);
@@ -427,22 +463,30 @@ export function StreamWaterfallPanel({
       );
     };
 
-    const schedule = () => {
+    drawRef.current = draw;
+    raf = requestAnimationFrame(draw);
+    return () => {
       cancelAnimationFrame(raf);
-      raf = requestAnimationFrame(draw);
     };
-    schedule();
+  }, [grid, zRange, isDark, plotHeight, panelId]);
 
+  // One observer for the panel's lifetime; it redraws with the latest data.
+  useEffect(() => {
+    const host = hostRef.current;
+    if (!host || typeof ResizeObserver === "undefined") {
+      return;
+    }
+    let raf = 0;
     const resize = new ResizeObserver(() => {
-      schedule();
+      cancelAnimationFrame(raf);
+      raf = requestAnimationFrame(() => drawRef.current());
     });
-    resize.observe(hostRef.current);
-
+    resize.observe(host);
     return () => {
       resize.disconnect();
       cancelAnimationFrame(raf);
     };
-  }, [grid, zRange, isDark, plotHeight, panelId]);
+  }, []);
 
   return (
     <div className="plot-panel" ref={hostRef} style={{ minHeight: plotHeight }}>

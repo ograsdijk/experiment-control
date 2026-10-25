@@ -8,6 +8,8 @@ import {
 } from "./condition_ast";
 import type { SequencerDiagnostic, SequencerStepOutlineNode } from "./types";
 
+export { mergeDiagnostics } from "./diagnostics_merge";
+
 function conditionAnchorLine(node: SequencerStepOutlineNode): number | null {
   const lines = node.snippet.split("\n");
   for (let index = 0; index < lines.length; index += 1) {
@@ -77,27 +79,3 @@ export function buildLocalConditionDiagnostics(
 
   return out;
 }
-
-export function mergeDiagnostics(
-  primary: ReadonlyArray<SequencerDiagnostic>,
-  secondary: ReadonlyArray<SequencerDiagnostic>
-): SequencerDiagnostic[] {
-  const seen = new Set<string>();
-  const out: SequencerDiagnostic[] = [];
-  for (const item of [...primary, ...secondary]) {
-    const key = [
-      item.severity,
-      item.source ?? "",
-      item.line ?? "",
-      item.column ?? "",
-      item.message,
-    ].join("|");
-    if (seen.has(key)) {
-      continue;
-    }
-    seen.add(key);
-    out.push(item);
-  }
-  return out;
-}
-
