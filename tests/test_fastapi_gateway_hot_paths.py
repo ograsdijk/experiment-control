@@ -171,6 +171,167 @@ class WorkspaceTraceDeferralTests(unittest.TestCase):
         self.assertEqual(len(state.pending_trace_msgs), 1)
 
 
+class SharedTraceFrameTests(unittest.TestCase):
+    def setUp(self) -> None:
+        fastapi_app_module._TRACE_FRAME_CACHE.clear()
+
+    @staticmethod
+    def _trace_ready_msg(seq: int, *, t0: int = 1000) -> dict:
+        return {
+            "topic": "manager.stream_analysis.output",
+            "payload": {
+                "workspace_id": "ws1",
+                "output_id": "o",
+                "kind": "trace",
+                "seq": seq,
+                "t0_mono_ns": t0,
+                "_raw_trace": np.sin(np.linspace(0.0, 20.0, 400)),
+            },
+        }
+
+    def _send(self, state: object, msg: dict) -> _WsCapture:
+        ws = _WsCapture()
+        asyncio.run(fastapi_app_module._workspace_send_trace_payload(ws, state, msg))
+        return ws
+
+    def _count_decimations(self) -> tuple[list[int], object]:
+        calls: list[int] = []
+        original = fastapi_app_module._decimate_trace_values
+
+        def counting(values, *, mode, max_points):
+            calls.append(1)
+            return original(values, mode=mode, max_points=max_points)
+
+        fastapi_app_module._decimate_trace_values = counting
+        self.addCleanup(setattr, fastapi_app_module, "_decimate_trace_values", original)
+        return calls, original
+
+    def test_identical_workspace_frames_are_encoded_once_for_all_sockets(self) -> None:
+        calls, _ = self._count_decimations()
+        a = _workspace_state(binary=True, trace_max_points=64)
+        b = _workspace_state(binary=True, trace_max_points=64)
+        # Each socket builds its own payload dict from shared memory.
+        ws_a = self._send(a, self._trace_ready_msg(7))
+        ws_b = self._send(b, self._trace_ready_msg(7))
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(ws_a.text, ws_b.text)
+        self.assertEqual(ws_a.binary, ws_b.binary)
+
+    def test_restarted_producer_with_reused_seq_is_not_served_from_cache(self) -> None:
+        calls, _ = self._count_decimations()
+        state = _workspace_state(binary=True, trace_max_points=64)
+        self._send(state, self._trace_ready_msg(7, t0=1000))
+        self._send(state, self._trace_ready_msg(7, t0=2000))
+        self.assertEqual(len(calls), 2)
+
+    def test_rolling_average_sockets_never_share(self) -> None:
+        state = _workspace_state(binary=True, trace_max_points=64)
+        state.rolling_window = 4
+        key = fastapi_app_module._workspace_trace_cache_key(state, self._trace_ready_msg(7))
+        self.assertIsNone(key)
+
+    def test_different_parameters_get_separate_frames(self) -> None:
+        calls, _ = self._count_decimations()
+        self._send(_workspace_state(binary=True, trace_max_points=64), self._trace_ready_msg(7))
+        self._send(_workspace_state(binary=True, trace_max_points=128), self._trace_ready_msg(7))
+        self.assertEqual(len(calls), 2)
+
+    def test_raw_key_names_the_source_frame_and_socket_parameters(self) -> None:
+        key = fastapi_app_module._raw_trace_cache_key
+        params = dict(
+            channel_index=0,
+            trace_decimator="minmax",
+            trace_max_points=1024,
+            binary_transport=True,
+            compact_dtype=True,
+        )
+        source = np.zeros(4)
+        payload = {"device_id": "d", "stream": "s", "seq": 5, "t0_mono_ns": 100, "_source_values": source}
+        same_frame = dict(payload, _source_values=np.ones(4))
+        self.assertEqual(key(payload, **params), key(same_frame, **params))
+        # The key keeps no reference to the payload's arrays.
+        self.assertFalse(any(part is source for part in key(payload, **params)))
+        # A restarted device reuses seq 5 with a new timestamp.
+        self.assertNotEqual(key(payload, **params), key(dict(payload, t0_mono_ns=999), **params))
+        self.assertNotEqual(key(payload, **params), key(payload, **dict(params, channel_index=1)))
+        # Without a seq or timestamps a frame cannot be shared.
+        self.assertIsNone(key({"device_id": "d", "stream": "s", "seq": 5}, **params))
+        self.assertIsNone(key({"device_id": "d", "stream": "s", "t0_mono_ns": 1}, **params))
+
+    def test_cache_evicts_least_recently_used(self) -> None:
+        cache = fastapi_app_module.SharedTraceFrameCache(maxsize=2)
+        frames = [fastapi_app_module.EncodedTraceFrame(str(i), None) for i in range(3)]
+        cache.put("a", frames[0])
+        cache.put("b", frames[1])
+        cache.get("a")
+        cache.put("c", frames[2])
+        self.assertIsNone(cache.get("b"))
+        self.assertIs(cache.get("a"), frames[0])
+
+
+class CompactTraceDtypeTests(unittest.TestCase):
+    def test_float32_only_when_rounding_is_far_below_the_span(self) -> None:
+        sufficient = fastapi_app_module._float32_is_sufficient
+        self.assertTrue(sufficient(np.sin(np.linspace(0.0, 10.0, 1000))))
+        self.assertTrue(sufficient(np.zeros(8)))
+        self.assertTrue(sufficient(np.full(8, 2.0)))
+        # A trace riding on a large offset would lose visible detail.
+        self.assertFalse(sufficient(1e9 + np.sin(np.linspace(0.0, 10.0, 1000))))
+        self.assertFalse(sufficient(np.full(8, 0.1)))
+        # Outside float32's normal range: overflow to inf, or subnormal.
+        self.assertFalse(sufficient(np.array([0.0, 1e39])))
+        self.assertFalse(sufficient(np.array([-1e39, 1e39])))
+        self.assertFalse(sufficient(np.array([0.0, 1e-40, 2e-40])))
+
+    def test_binary_frame_uses_float32_only_when_allowed(self) -> None:
+        values = np.sin(np.linspace(0.0, 10.0, 256))
+        msg = {"topic": "t", "payload": {"seq": 1, "_binary_values": values}}
+        compact = fastapi_app_module._encode_binary_trace_frame(msg, allow_float32=True)
+        meta = json.loads(compact.text)["payload"]
+        self.assertEqual(meta["dtype"], "float32")
+        self.assertEqual(meta["byte_length"], 256 * 4)
+        decoded = np.frombuffer(compact.body, dtype="<f4")
+        np.testing.assert_allclose(decoded, values, atol=1e-6)
+
+        full = fastapi_app_module._encode_binary_trace_frame(msg)
+        self.assertEqual(json.loads(full.text)["payload"]["dtype"], "float64")
+        np.testing.assert_array_equal(np.frombuffer(full.body, dtype="<f8"), values)
+
+    def test_offset_trace_stays_float64_even_when_allowed(self) -> None:
+        values = 1e9 + np.arange(16, dtype=np.float64)
+        msg = {"topic": "t", "payload": {"seq": 1, "_binary_values": values}}
+        frame = fastapi_app_module._encode_binary_trace_frame(msg, allow_float32=True)
+        self.assertEqual(json.loads(frame.text)["payload"]["dtype"], "float64")
+
+    def test_dtype_query_parsing(self) -> None:
+        self.assertTrue(fastapi_app_module._parse_compact_dtype("auto"))
+        self.assertTrue(fastapi_app_module._parse_compact_dtype(" AUTO "))
+        self.assertFalse(fastapi_app_module._parse_compact_dtype(None))
+        self.assertFalse(fastapi_app_module._parse_compact_dtype("float64"))
+
+
+class TelemetryDeviceFilterTests(unittest.TestCase):
+    @staticmethod
+    def _item(device_id: str) -> HubMessage:
+        msg = {"topic": "manager.telemetry", "payload": {"device_id": device_id, "signals": {}}}
+        return HubMessage(json_dumps(msg).decode("utf-8"), msg)
+
+    def test_unfiltered_socket_gets_every_shared_text(self) -> None:
+        item = self._item("a")
+        self.assertIs(fastapi_app_module._telemetry_ws_text(item, None), item.text)
+
+    def test_filtered_socket_skips_other_devices(self) -> None:
+        only_a = {"a"}
+        self.assertEqual(
+            fastapi_app_module._telemetry_ws_text(self._item("a"), only_a),
+            self._item("a").text,
+        )
+        self.assertIsNone(fastapi_app_module._telemetry_ws_text(self._item("b"), only_a))
+
+    def test_plain_string_items_pass_through(self) -> None:
+        self.assertEqual(fastapi_app_module._telemetry_ws_text("{}", {"a"}), "{}")
+
+
 class GZipBinaryExclusionTests(unittest.TestCase):
     def test_query_requests_binary(self) -> None:
         detect = fastapi_app_module._query_requests_binary

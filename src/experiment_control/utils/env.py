@@ -85,3 +85,19 @@ def env_bool(name: str, default: bool = False) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+# uvicorn reads ``UVICORN_*`` variables for its CLI options. The gateway's
+# WebSocket traffic is mostly binary float traces, which compress poorly:
+# permessage-deflate cost ~38% of gateway CPU with four clients. Launchers
+# apply these with ``setdefault`` so a deployment can still opt back in.
+GATEWAY_UVICORN_ENV_DEFAULTS: dict[str, str] = {
+    "UVICORN_WS_PER_MESSAGE_DEFLATE": "false",
+}
+
+
+def apply_gateway_uvicorn_env_defaults(env: dict[str, str]) -> dict[str, str]:
+    """Fill uvicorn defaults for a gateway subprocess env without overriding."""
+    for name, value in GATEWAY_UVICORN_ENV_DEFAULTS.items():
+        env.setdefault(name, value)
+    return env

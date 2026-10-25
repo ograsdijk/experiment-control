@@ -188,7 +188,55 @@ def _decimate_trace_mean(points: np.ndarray, max_points: int) -> list[float]:
     return out[:max_points]
 
 
+def _bucket_extrema_indices(
+    points: np.ndarray, bucket_count: int
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Vectorized per-bucket (first, argmin, argmax, last) over finite `points`.
+
+    Buckets match `_bucket_ranges` (every bucket is non-empty because callers
+    use `bucket_count <= n`), and ties resolve to the first index like the
+    loop implementations.
+    """
+    n = int(points.size)
+    starts = (np.arange(bucket_count, dtype=np.int64) * n) // bucket_count
+    stops = np.append(starts[1:], n)
+    sizes = stops - starts
+    seg_min = np.minimum.reduceat(points, starts)
+    seg_max = np.maximum.reduceat(points, starts)
+    min_hits = np.flatnonzero(points == np.repeat(seg_min, sizes))
+    max_hits = np.flatnonzero(points == np.repeat(seg_max, sizes))
+    min_i = min_hits[np.searchsorted(min_hits, starts)]
+    max_i = max_hits[np.searchsorted(max_hits, starts)]
+    return starts, min_i, max_i, stops - 1
+
+
 def _decimate_trace_m4(points: np.ndarray, max_points: int) -> list[float]:
+    n = int(points.size)
+    bucket_count = max(1, min(max_points // 4, n))
+    if not np.isfinite(points).all():
+        return _decimate_trace_m4_loop(points, max_points)
+    first_i, min_i, max_i, last_i = _bucket_extrema_indices(points, bucket_count)
+    # Per bucket: the sorted, de-duplicated {first, min, max, last}.
+    idx = np.sort(np.stack([first_i, min_i, max_i, last_i], axis=1), axis=1)
+    keep = np.ones(idx.shape, dtype=bool)
+    keep[:, 1:] = idx[:, 1:] != idx[:, :-1]
+    return points[idx[keep]][:max_points].tolist()
+
+
+def _decimate_trace_minmax(points: np.ndarray, max_points: int) -> list[float]:
+    n = int(points.size)
+    bucket_count = max(1, min(max_points // 2, n))
+    if not np.isfinite(points).all():
+        return _decimate_trace_minmax_loop(points, max_points)
+    _, min_i, max_i, _ = _bucket_extrema_indices(points, bucket_count)
+    # Per bucket: the extrema in index order, once if they coincide.
+    idx = np.stack([np.minimum(min_i, max_i), np.maximum(min_i, max_i)], axis=1)
+    keep = np.ones(idx.shape, dtype=bool)
+    keep[:, 1] = min_i != max_i
+    return points[idx[keep]][:max_points].tolist()
+
+
+def _decimate_trace_m4_loop(points: np.ndarray, max_points: int) -> list[float]:
     n = int(points.size)
     bucket_count = max(1, min(max_points // 4, n))
     out: list[float] = []
@@ -216,7 +264,7 @@ def _decimate_trace_m4(points: np.ndarray, max_points: int) -> list[float]:
     return out[:max_points]
 
 
-def _decimate_trace_minmax(points: np.ndarray, max_points: int) -> list[float]:
+def _decimate_trace_minmax_loop(points: np.ndarray, max_points: int) -> list[float]:
     n = int(points.size)
     bucket_count = max(1, min(max_points // 2, n))
     out: list[float] = []
