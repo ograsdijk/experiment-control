@@ -1,3 +1,6 @@
+// Fonts are bundled, never fetched from an external CDN: lab PCs may have no internet.
+import "@fontsource-variable/ibm-plex-sans";
+import "@fontsource-variable/space-grotesk";
 import "@mantine/core/styles.css";
 import "@mantine/notifications/styles.css";
 import "uplot/dist/uPlot.min.css";
@@ -18,8 +21,8 @@ import { StreamAnalysisProvider } from "./features/stream_analysis/StreamAnalysi
 import { TelemetryProvider } from "./features/telemetry/TelemetryContext";
 
 const theme = createTheme({
-  fontFamily: "IBM Plex Sans, Segoe UI, sans-serif",
-  headings: { fontFamily: "Space Grotesk, Trebuchet MS, sans-serif" },
+  fontFamily: "IBM Plex Sans Variable, Segoe UI, sans-serif",
+  headings: { fontFamily: "Space Grotesk Variable, Trebuchet MS, sans-serif" },
   primaryColor: "teal",
   defaultRadius: "md",
 });

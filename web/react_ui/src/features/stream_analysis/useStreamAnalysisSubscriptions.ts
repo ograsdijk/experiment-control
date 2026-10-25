@@ -22,6 +22,7 @@ import {
   streamAnalysisHydrationInvalidationRequests,
   type StreamAnalysisRefreshRequest,
 } from "./streamAnalysisHydration";
+import { decodeBinaryTraceValues } from "../stream/binaryTrace";
 
 /**
  * Stream-analysis WebSocket subscriptions manager.
@@ -112,13 +113,7 @@ function binaryValuesFromOutput(
   output: NonNullable<ReturnType<typeof normalizeStreamAnalysisOutputMessage>>,
   data: ArrayBuffer
 ): Float64Array | null {
-  if (output.byteLength !== null && output.byteLength !== data.byteLength) {
-    return null;
-  }
-  if (data.byteLength % Float64Array.BYTES_PER_ELEMENT !== 0) {
-    return null;
-  }
-  return new Float64Array(data);
+  return decodeBinaryTraceValues(data, output.dtype, output.byteLength);
 }
 
 function buildTraceFilter(
@@ -176,6 +171,7 @@ function workspaceSocketUrl(
     params.set("rolling_window", String(traceFilter.traceRollingWindow));
     params.set("trace_average_mode", traceFilter.traceAverageMode);
     params.set("transport", "binary");
+    params.set("dtype", "auto");
   }
   const query = params.toString();
   return buildWsUrl(

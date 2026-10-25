@@ -80,6 +80,7 @@ export function useAdaptivePolling<T>({
     }
     let cancelled = false;
     let timeout: ReturnType<typeof setTimeout> | null = null;
+    let frame: number | null = null;
     let controller: AbortController | null = null;
     let inFlight = false;
     let refreshPending = false;
@@ -91,12 +92,31 @@ export function useAdaptivePolling<T>({
         clearTimeout(timeout);
         timeout = null;
       }
+      if (frame !== null) {
+        window.cancelAnimationFrame(frame);
+        frame = null;
+      }
     };
     const hidden = () => pauseWhenHidden && document.hidden;
+    // A hidden iframe (e.g. an instance UI the Control Center keeps mounted
+    // but hidden) still runs timers and reports document.hidden === false,
+    // but gets no animation frames. Waiting for one before each scheduled
+    // poll pauses polling there; it resumes as soon as the frame is shown.
+    const runAfterFrame = () => {
+      timeout = null;
+      if (!pauseWhenHidden || typeof window.requestAnimationFrame !== "function") {
+        void run();
+        return;
+      }
+      frame = window.requestAnimationFrame(() => {
+        frame = null;
+        void run();
+      });
+    };
     const schedule = () => {
       clearTimer();
       if (!cancelled && !hidden() && intervalMs > 0) {
-        timeout = setTimeout(run, intervalMs);
+        timeout = setTimeout(runAfterFrame, intervalMs);
       }
     };
     const run = async () => {

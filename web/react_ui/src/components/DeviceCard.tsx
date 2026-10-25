@@ -7,7 +7,6 @@ import {
   Stack,
   Text,
   TextInput,
-  Tooltip,
   useComputedColorScheme,
 } from "@mantine/core";
 import { useDraggable } from "@dnd-kit/core";
@@ -33,6 +32,7 @@ import {
   TelemetrySignal,
 } from "../types";
 import { DeviceNameInline } from "./DeviceNameInline";
+import { HoverTooltip } from "./HoverTooltip";
 import { copyToClipboard } from "../utils/clipboard";
 import { perfCountScoped } from "../features/performance/perfInstrumentation";
 import { useDisplayedTelemetrySignal } from "../features/telemetry/DeviceTelemetryPresentationStore";
@@ -196,11 +196,11 @@ function DeviceTelemetryValueCell({
     ? `${rendered.full}${signal?.units ? ` ${signal.units}` : ""}`
     : null;
   return fullWithUnits ? (
-    <Tooltip label={`${fullWithUnits} (click to copy)`} withArrow styles={tooltipStyles}>
+    <HoverTooltip label={`${fullWithUnits} (click to copy)`} withArrow styles={tooltipStyles}>
       <Text size="sm" fw={500} style={TELEMETRY_COPY_STYLE} onClick={() => void copyTelemetryValue(fullWithUnits)}>
         {rendered.display}{signal?.units ? ` ${signal.units}` : ""}
       </Text>
-    </Tooltip>
+    </HoverTooltip>
   ) : (
     <Text size="sm" fw={500}>{rendered.display}{signal?.units ? ` ${signal.units}` : ""}</Text>
   );
@@ -397,7 +397,7 @@ export function DeviceCard({
             >
               {connectAction.label}
             </Button>
-            <Tooltip
+            <HoverTooltip
               label={driverOffline ? "Driver offline — restart driver" : "Restart driver"}
               withArrow
             >
@@ -409,7 +409,7 @@ export function DeviceCard({
               >
                 <IconRefresh size={14} />
               </ActionIcon>
-            </Tooltip>
+            </HoverTooltip>
           </Group>
         </Group>
         <Stack gap={4}>
@@ -480,9 +480,9 @@ export function DeviceCard({
                   </Button>
                 );
                 const buttonWithTooltip = showTooltip ? (
-                  <Tooltip key={`${entry.action}:tooltip`} label={entry.action} withArrow>
+                  <HoverTooltip key={`${entry.action}:tooltip`} label={entry.action} withArrow>
                     {commandNameButton}
-                  </Tooltip>
+                  </HoverTooltip>
                 ) : (
                   commandNameButton
                 );
@@ -551,7 +551,7 @@ export function DeviceCard({
                       ))}
                     </div>
                     <div className="pinned-command-segment pinned-command-send">
-                      <Tooltip label="Send command" withArrow>
+                      <HoverTooltip label="Send command" withArrow>
                         <ActionIcon
                           variant="light"
                           color="teal"
@@ -561,7 +561,7 @@ export function DeviceCard({
                         >
                           <IconPlayerPlay size={14} />
                         </ActionIcon>
-                      </Tooltip>
+                      </HoverTooltip>
                     </div>
                   </div>
                 );

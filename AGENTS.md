@@ -5,7 +5,11 @@
 **Before pushing, run `python scripts/ci_check.py`.** CI (`.github/workflows/ci.yml`)
 calls this same script, one `--job` per workflow job, so it runs exactly the CI
 commands. The default quick mode does sync, lint, complexity guard and unittest, plus
-the UI build/test/stale-`_ui_dist` check when UI files changed vs `origin/master`.
+the UI build/test/bundle-budget/stale-`_ui_dist` check when UI files changed vs
+`origin/master`. The bundle budget (`ui-bundle-budget`) caps the entry chunk's
+gzip size, keeps the `yaml` parser out of it, and rejects external URLs in
+`index.html` and the built CSS (fonts are bundled, never fetched); raise the
+budget deliberately, never to make a regression pass.
 `--full` adds the wheel build and the Windows lifecycle smoke test, and always runs
 the UI steps. `--list` shows the steps; `--install-hook` adds an opt-in pre-push hook
 (quick mode). Add or change CI checks in the script, not in the workflow.

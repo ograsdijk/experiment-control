@@ -15,11 +15,8 @@ import { useSequencerRunEvents } from "./useSequencerRunEvents";
 import { useResolvedVars } from "./useResolvedVars";
 import { normalizeSequencerLoops } from "./plan";
 import { useSequencerPlan } from "./useSequencerPlan";
-import {
-  overridesForDisplay,
-  scalarEnv,
-  type ValueContext,
-} from "./resolved_values";
+import type { ValueContext } from "./resolved_values";
+import { overridesForDisplay, scalarEnv } from "./runtime_values";
 import type {
   SequencerAdaptiveStudyStatus,
   SequencerDiagnostic,
@@ -44,10 +41,11 @@ import {
   sequencerDisplayPercent,
 } from "./utils";
 import type { SequencerPercentHold } from "./utils";
+import { mergeDiagnostics } from "./diagnostics_merge";
 import {
-  buildLocalConditionDiagnostics,
-  mergeDiagnostics,
-} from "./validation";
+  loadSequencerYamlTools,
+  useSequencerYamlTools,
+} from "./useSequencerYamlTools";
 
 /** sequencer.status refresh while a run is active: modal open vs closed. */
 export const SEQUENCER_STATUS_POLL_OPEN_MS = 1500;
@@ -1304,6 +1302,7 @@ export function useSequencerController({
             })
           : null;
       const processDiagnostics = normalizeSequencerDiagnostics(result?.diagnostics);
+      const { buildLocalConditionDiagnostics } = await loadSequencerYamlTools();
       const localDiagnostics = buildLocalConditionDiagnostics(sequencerYamlText);
       const diagnostics = mergeDiagnostics(processDiagnostics, localDiagnostics);
       setSequencerDiagnostics(processDiagnostics, sequencerYamlText);
@@ -1524,9 +1523,17 @@ export function useSequencerController({
     []
   );
 
+  // The YAML helpers (and the yaml package) load with the modal, not with the
+  // header: editor text only arrives through the modal.
+  const sequencerYamlTools = useSequencerYamlTools(
+    sequencerOpen || sequencerYamlText !== ""
+  );
   const sequencerLocalDiagnostics = useMemo(
-    () => buildLocalConditionDiagnostics(sequencerYamlText),
-    [sequencerYamlText]
+    () =>
+      sequencerYamlTools
+        ? sequencerYamlTools.buildLocalConditionDiagnostics(sequencerYamlText)
+        : [],
+    [sequencerYamlTools, sequencerYamlText]
   );
   // Run events are shown only in the Sequencer modal; while it is closed the
   // hook is idle (a null id) instead of refetching on every status seq.

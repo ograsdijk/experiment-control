@@ -10,8 +10,8 @@
   --card-border: #e7dfd1;
   --pinned-command-chip-bg: #e8f2ed;
   --shadow: 0 18px 40px rgba(28, 26, 22, 0.12);
-  --font-body: "IBM Plex Sans", "Segoe UI", sans-serif;
-  --font-display: "Space Grotesk", "Trebuchet MS", sans-serif;
+  --font-body: "IBM Plex Sans Variable", "Segoe UI", sans-serif;
+  --font-display: "Space Grotesk Variable", "Trebuchet MS", sans-serif;
 }
 
 [data-mantine-color-scheme="dark"] {
