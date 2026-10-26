@@ -1,12 +1,14 @@
 ﻿import { notifications } from "@mantine/notifications";
 import { useCallback } from "react";
 import { restartProcess, startProcess, stopProcess } from "../../api";
+import { isRemoteProcess } from "../devices/health";
 import { isHdfWriterProcess, isSequencerProcess } from "../runtime/helpers";
 import type { ProcessStatus } from "../../types";
 
 type ProcessAction = "start" | "stop" | "restart";
 
 type UseProcessLifecycleControllerArgs = {
+  processes: ProcessStatus[];
   processBusyById: Record<string, boolean>;
   setProcessBusy: (processId: string, busy: boolean) => void;
   invalidateProcessCapabilities: (processId: string) => void;
@@ -16,6 +18,7 @@ type UseProcessLifecycleControllerArgs = {
 };
 
 export function useProcessLifecycleController({
+  processes,
   processBusyById,
   setProcessBusy,
   invalidateProcessCapabilities,
@@ -25,7 +28,8 @@ export function useProcessLifecycleController({
 }: UseProcessLifecycleControllerArgs) {
   const handleProcessAction = useCallback(
     async (processId: string, action: ProcessAction) => {
-      if (processBusyById[processId]) {
+      const process = processes.find((item) => item.process_id === processId);
+      if (!process || isRemoteProcess(process) || processBusyById[processId]) {
         return;
       }
       setProcessBusy(processId, true);
@@ -77,6 +81,7 @@ export function useProcessLifecycleController({
     [
       invalidateProcessCapabilities,
       processBusyById,
+      processes,
       refreshHdfWriterStatus,
       refreshProcesses,
       refreshSequencerStatus,

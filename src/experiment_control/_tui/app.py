@@ -1337,6 +1337,22 @@ class ManagerTUI(App):
         rpc_endpoint = proc.get("rpc_endpoint")
         return isinstance(rpc_endpoint, str) and bool(rpc_endpoint.strip())
 
+    @staticmethod
+    def _process_is_remote(proc: Json | None) -> bool:
+        if proc is None:
+            return False
+        return (
+            bool(proc.get("is_remote"))
+            or str(proc.get("source_kind", "")).strip().lower() == "federated"
+        )
+
+    def _process_lifecycle_allowed(self, process_id: str) -> bool:
+        proc = self._get_process_record(process_id)
+        if self._process_is_remote(proc):
+            self.notify(f"Process lifecycle is managed by its owner: {process_id}")
+            return False
+        return proc is not None
+
     def _process_capabilities_probe_ready(self, process_id: str) -> bool:
         proc = self._process_status_map.get(process_id)
         if not isinstance(proc, dict):
@@ -1347,10 +1363,7 @@ class ManagerTUI(App):
         # not the local "RUNNING", so gate them on the peer link being live
         # rather than the local state — otherwise their capabilities are never
         # probed and the detail panel stays empty.
-        is_remote = bool(proc.get("is_remote")) or (
-            str(proc.get("source_kind", "") or "").strip().lower() == "federated"
-        )
-        if is_remote:
+        if self._process_is_remote(proc):
             liveness = str(proc.get("liveness", "") or "").strip().upper()
             return liveness in ("", "ONLINE")
         state = str(proc.get("state", "") or "").strip().upper()
@@ -3435,11 +3448,11 @@ class ManagerTUI(App):
             enabled_actions = self._device_enabled_actions(status)
         elif view is not None:
             proc = self._get_process_record(view.resource_id)
-            if self._status_process_stopped(proc):
-                enabled_actions.add("start")
-            else:
-                enabled_actions.add("stop")
-            if proc is not None:
+            if proc is not None and not self._process_is_remote(proc):
+                if self._status_process_stopped(proc):
+                    enabled_actions.add("start")
+                else:
+                    enabled_actions.add("stop")
                 enabled_actions.add("restart")
 
         pending = bool(
@@ -4172,7 +4185,7 @@ class ManagerTUI(App):
     def action_driver_start(self) -> None:
         if self._action_target() == "process":
             process_id = self._selected_process()
-            if not process_id:
+            if not process_id or not self._process_lifecycle_allowed(process_id):
                 return
             proc = self._get_process_record(process_id)
             if self._status_process_started(proc):
@@ -4219,11 +4232,13 @@ class ManagerTUI(App):
                 )
                 for proc in self._processes
                 if str(proc.get("process_id", ""))
+                and not self._process_is_remote(proc)
             ]
             self._run_bulk_rpc_worker(
                 items=items,
                 label="Process start",
                 summary_label="Start all processes",
+                skipped_count=sum(self._process_is_remote(p) for p in self._processes),
             )
             return
 
@@ -4262,7 +4277,7 @@ class ManagerTUI(App):
     def action_driver_stop(self) -> None:
         if self._action_target() == "process":
             process_id = self._selected_process()
-            if not process_id:
+            if not process_id or not self._process_lifecycle_allowed(process_id):
                 return
             proc = self._get_process_record(process_id)
             if self._status_process_stopped(proc):
@@ -4312,7 +4327,7 @@ class ManagerTUI(App):
     def action_driver_restart(self) -> None:
         if self._action_target() == "process":
             process_id = self._selected_process()
-            if not process_id:
+            if not process_id or not self._process_lifecycle_allowed(process_id):
                 return
 
             def _on_process_restart_dismiss(confirmed: bool | None) -> None:
@@ -4621,11 +4636,13 @@ class ManagerTUI(App):
                     )
                     for proc in self._processes
                     if str(proc.get("process_id", ""))
+                    and not self._process_is_remote(proc)
                 ]
                 self._run_bulk_rpc_worker(
                     items=items,
                     label="Process stop",
                     summary_label="Stop all processes",
+                    skipped_count=sum(self._process_is_remote(p) for p in self._processes),
                     error_log_prefix="PROC STOP",
                 )
 

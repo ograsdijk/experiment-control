@@ -2035,6 +2035,7 @@ export function App() {
   } = sequencerController;
 
   const { handleProcessAction } = useProcessLifecycleController({
+    processes,
     processBusyById,
     setProcessBusy,
     invalidateProcessCapabilities,
