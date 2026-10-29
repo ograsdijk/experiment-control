@@ -232,6 +232,68 @@ class SequencerLibraryPayloadTests(unittest.TestCase):
         self.assertEqual(payload["resolved_manifest_path"], str((root / "library.yaml").resolve()))
         self.assertEqual(payload["process_cwd"], str(Path.cwd()))
 
+    def test_library_form_returns_form_and_vars_without_loading(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            _write(
+                root / "seqs" / "scan.yaml",
+                """
+                version: 1
+                vars:
+                  passes: 3
+                form:
+                  sections:
+                    - fields:
+                        - {type: integer, var: passes}
+                steps:
+                  - sleep: 0
+                """,
+            )
+            _write(
+                root / "seqs" / "plain.yaml",
+                """
+                version: 1
+                steps:
+                  - sleep: 0
+                """,
+            )
+            _write(
+                root / "library.yaml",
+                """
+                version: 1
+                autoload_dirs:
+                  - dir: seqs
+                    pattern: "*.yaml"
+                """,
+            )
+            lib = SequenceLibrary(manifest_path=root / "library.yaml")
+            lib.reload()
+            entries = {item["id"]: item for item in lib.list_entries()}
+            self.assertTrue(entries["scan"]["has_form"])
+            self.assertFalse(entries["plain"]["has_form"])
+
+            proc = object.__new__(SequencerProcess)
+            proc._sequence_library = lib
+            proc._active_sequence_id = None
+
+            resp = SequencerProcess._rpc_sequencer_library_form(
+                proc, {"params": {"sequence_id": "scan"}}
+            )
+            self.assertTrue(resp["ok"])
+            self.assertEqual(resp["result"]["vars"], {"passes": 3})
+            self.assertEqual(resp["result"]["form"]["sections"][0]["fields"][0]["var"], "passes")
+            # Reading a form never loads the sequence.
+            self.assertIsNone(proc._active_sequence_id)
+
+            resp = SequencerProcess._rpc_sequencer_library_form(
+                proc, {"params": {"sequence_id": "plain"}}
+            )
+            self.assertEqual(resp["error"]["code"], "no_form")
+            resp = SequencerProcess._rpc_sequencer_library_form(
+                proc, {"params": {"sequence_id": "missing"}}
+            )
+            self.assertEqual(resp["error"]["code"], "unknown_sequence_id")
+
 
 if __name__ == "__main__":
     unittest.main()

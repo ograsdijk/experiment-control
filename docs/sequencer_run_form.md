@@ -1,22 +1,26 @@
 # Sequencer run form (`form:`)
 
-A sequence can describe a form that the Sequencer UI shows as **Run with
-form…**, next to Start. Each field sets one of the sequence's declared `vars`
-for the next start, sent as `vars_override`. Nothing is written to the YAML.
-The engine never reads `form:` while running. It is checked at load
+A sequence can describe a form that the Sequencer UI offers under **Run with
+form…**, next to Start. The menu lists every sequence in the library that has
+a `form:` block, whatever is loaded. Picking one reads its form and vars with
+`sequencer.library.form`, without loading it. **Start scan** calls
+`sequencer.start` with that `sequence_id` and the form's values as
+`vars_override`. The sequencer then loads the sequence in place of the loaded
+one and runs it once. The override rows, adaptive modes and run mode in the
+sidebar belong to the loaded sequence and are not sent.
+
+Each field sets one of the sequence's declared `vars`. Nothing is written to
+the YAML. The engine never reads `form:` while running. It is checked at load
 (`sequencer/run_form.py`), so a field that names an undeclared var fails
-then, rather than becoming a field that silently sets nothing.
+then, rather than becoming a field that silently sets nothing. The library
+listing reports it as `has_form`.
 
 The form is only a way to set vars. What a var does, which devices exist and
 how a value is set, waited for or restored all live in the sequence. The
 start event records `vars_override` and the resolved vars
 (`docs/protocol.md`, `sequencer.lifecycle`), so the HDF file keeps what the
-form chose.
-
-The button is disabled while the editor doesn't match the loaded sequence
-(unloaded edits, or another client loaded a different one), because the form
-would describe text the sequencer has not loaded. A start the sequencer
-rejects leaves the dialog open with its choices.
+form chose. The menu is disabled while a run is active. A start the
+sequencer rejects leaves the dialog open with its choices.
 
 ## Schema
 

@@ -3205,6 +3205,18 @@ class SequencerProcess(ManagedProcessBase):
                 doc="Load a sequence from the configured library by id.",
             ),
             method(
+                "sequencer.library.form",
+                params=[
+                    param(
+                        "sequence_id",
+                        required=True,
+                        default=None,
+                        annotation="str",
+                    )
+                ],
+                doc="A library sequence's run form and vars, without loading it.",
+            ),
+            method(
                 "sequencer.adaptive.status",
                 params=None,
                 doc="Get saved adaptive study state.",
@@ -3446,6 +3458,41 @@ class SequencerProcess(ManagedProcessBase):
                 message=self._sequence_library_error or "sequence library reload failed",
             )
         return self.rpc_ok(req, result=self._library_list_payload())
+
+    def _rpc_sequencer_library_form(self, req: Json) -> Json:
+        """A library sequence's run form and vars, without loading it.
+
+        The UI shows the form for any library sequence; its Start passes the
+        same `sequence_id` to `sequencer.start`, which loads it then."""
+        params = req.get("params", {}) or {}
+        if not isinstance(params, dict):
+            return self.rpc_invalid_params(req)
+        sequence_id = str(params.get("sequence_id", "")).strip()
+        if not sequence_id:
+            return self.rpc_err(req, code="missing_sequence_id")
+        if self._sequence_library is None:
+            return self.rpc_err(
+                req,
+                code="library_not_configured",
+                message="sequencer sequence library is not configured",
+            )
+        try:
+            entry = self._sequence_library.get_entry(sequence_id)
+        except KeyError as e:
+            return self.rpc_err(req, code="unknown_sequence_id", message=str(e))
+        if entry.spec.form is None:
+            return self.rpc_err(
+                req, code="no_form", message=f"sequence {sequence_id!r} has no form"
+            )
+        return self.rpc_ok(
+            req,
+            result={
+                "sequence_id": sequence_id,
+                "label": entry.label,
+                "form": entry.spec.form,
+                "vars": entry.spec.vars,
+            },
+        )
 
     def _rpc_sequencer_library_load(self, req: Json) -> Json:
         params = req.get("params", {}) or {}
@@ -3927,6 +3974,7 @@ class SequencerProcess(ManagedProcessBase):
             "sequencer.library.list": self._rpc_sequencer_library_list,
             "sequencer.library.reload": self._rpc_sequencer_library_reload,
             "sequencer.library.load": self._rpc_sequencer_library_load,
+            "sequencer.library.form": self._rpc_sequencer_library_form,
             "sequencer.start": self._rpc_sequencer_start,
             "sequencer.pause": self._rpc_sequencer_pause,
             "sequencer.resume": self._rpc_sequencer_resume,

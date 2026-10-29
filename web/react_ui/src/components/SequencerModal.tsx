@@ -3,6 +3,7 @@
   Badge,
   Button,
   Group,
+  Menu,
   Modal,
   NumberInput,
   Progress,
@@ -73,7 +74,7 @@ import type { SequencerYamlCodeEditorProps } from "../features/sequencer/compone
 import { SequencerTimelinePane } from "./SequencerTimelinePane";
 import { notifications } from "@mantine/notifications";
 import { SequencerRunFormModal } from "./SequencerRunFormModal";
-import { parseRunForm, type ParsedRunForm } from "../features/sequencer/run_form";
+import type { ParsedRunForm } from "../features/sequencer/run_form";
 import { perfCount } from "../features/performance/perfInstrumentation";
 import { sequencerPageUrl } from "../features/sequencer/pageView";
 
@@ -219,8 +220,11 @@ type Props = {
   adaptiveClearBusyStudyId: string | null;
   onRunAction: (
     action: "start" | "pause" | "resume" | "stop",
-    formOverrides?: Record<string, unknown>
+    formOverrides?: Record<string, unknown>,
+    formSequenceId?: string
   ) => Promise<unknown> | void;
+  /** A library sequence's run form, read without loading it. */
+  onFetchLibraryForm: (sequenceId: string) => Promise<ParsedRunForm>;
   onAdaptiveModeChange: (
     studyId: string,
     mode: "reset" | "resume" | "warm_start"
@@ -331,6 +335,7 @@ export function SequencerModal({
   loadedYamlBusy,
   hasSequencerProcess,
   onShowLoadedYaml,
+  onFetchLibraryForm,
   validateBusy,
   onValidate,
   loadBusy,
@@ -362,9 +367,13 @@ export function SequencerModal({
     return () => onTimelineVisibleChange(false);
   }, [activeTab, onTimelineVisibleChange]);
   const [overridesOpen, setOverridesOpen] = useState(false);
-  // Parsed when the run form opens, not on every keystroke.
-  const [runForm, setRunForm] = useState<ParsedRunForm | null>(null);
-  const hasRunForm = /^form:/m.test(yamlText);
+  // The library sequence whose run form is open; Start loads and runs it.
+  const [runForm, setRunForm] = useState<{
+    sequenceId: string;
+    label: string;
+    parsed: ParsedRunForm;
+  } | null>(null);
+  const formEntries = libraryEntries.filter((entry) => entry.hasForm);
 
   useEffect(() => {
     if (opened) {
@@ -750,36 +759,45 @@ export function SequencerModal({
                 w={80}
               />
             )}
-            {hasRunForm && primaryAction === "start" && (
-              <Tooltip
-                label={
-                  yamlDirty || editorStale || otherSequenceLoaded
-                    ? "The editor doesn't match the loaded sequence: load it first, the form starts the loaded one"
-                    : "Choose this sequence's settings for the next start"
-                }
-                withinPortal
-                zIndex={600}
-              >
-                <Button
-                  size="xs"
-                  variant="light"
-                  color="teal"
-                  disabled={primaryDisabled || yamlDirty || editorStale || otherSequenceLoaded}
-                  onClick={() => {
-                    const parsed = parseRunForm(yamlText);
-                    if (!parsed) {
-                      notifications.show({
-                        color: "red",
-                        title: "Can't open the run form",
-                        message: "The sequence's form: block has no sections it can show.",
-                      });
-                    }
-                    setRunForm(parsed);
-                  }}
-                >
-                  Run with form…
-                </Button>
-              </Tooltip>
+            {formEntries.length > 0 && (
+              <Menu withinPortal zIndex={600} position="bottom-end">
+                <Menu.Target>
+                  <Button
+                    size="xs"
+                    variant="light"
+                    color="teal"
+                    disabled={primaryAction !== "start" || actionBusy}
+                  >
+                    Run with form…
+                  </Button>
+                </Menu.Target>
+                <Menu.Dropdown>
+                  <Menu.Label>Loads the sequence and starts it</Menu.Label>
+                  {formEntries.map((entry) => (
+                    <Menu.Item
+                      key={entry.id}
+                      onClick={() => {
+                        void onFetchLibraryForm(entry.id).then(
+                          (parsed) =>
+                            setRunForm({
+                              sequenceId: entry.id,
+                              label: entry.label ?? entry.id,
+                              parsed,
+                            }),
+                          (error: unknown) =>
+                            notifications.show({
+                              color: "red",
+                              title: "Can't open the run form",
+                              message: error instanceof Error ? error.message : String(error),
+                            })
+                        );
+                      }}
+                    >
+                      {entry.label ?? entry.id}
+                    </Menu.Item>
+                  ))}
+                </Menu.Dropdown>
+              </Menu>
             )}
             <Button
               size="xs"
@@ -810,10 +828,11 @@ export function SequencerModal({
               <SequencerRunFormModal
                 opened
                 onClose={() => setRunForm(null)}
-                parsed={runForm}
+                parsed={runForm.parsed}
+                sequenceLabel={runForm.label}
                 latestSignalsByDevice={latestSignalsByDevice}
                 busy={actionBusy}
-                onStart={(overrides) => onRunAction("start", overrides)}
+                onStart={(overrides) => onRunAction("start", overrides, runForm.sequenceId)}
               />
             )}
           </Group>

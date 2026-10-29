@@ -100,16 +100,28 @@ export function parseRunForm(yamlText: string): ParsedRunForm | null {
   } catch {
     return null;
   }
-  if (!raw || typeof raw !== "object" || !has(raw, "form")) {
+  if (!raw || typeof raw !== "object") {
     return null;
   }
   const doc = raw as Record<string, unknown>;
-  const formRaw = doc.form;
+  return runFormFromParts(doc.form, doc.vars);
+}
+
+/** The form of a `sequencer.library.form` result. */
+export function runFormFromLibraryResult(result: unknown): ParsedRunForm | null {
+  if (!result || typeof result !== "object") {
+    return null;
+  }
+  const rec = result as Record<string, unknown>;
+  return runFormFromParts(rec.form, rec.vars);
+}
+
+function runFormFromParts(formRaw: unknown, varsRaw: unknown): ParsedRunForm | null {
   if (!formRaw || typeof formRaw !== "object") {
     return null;
   }
   const vars =
-    doc.vars && typeof doc.vars === "object" ? (doc.vars as Record<string, unknown>) : {};
+    varsRaw && typeof varsRaw === "object" ? (varsRaw as Record<string, unknown>) : {};
   const form = formRaw as Record<string, unknown>;
   const sections = Array.isArray(form.sections) ? (form.sections as RunFormSection[]) : [];
   if (sections.length === 0) {

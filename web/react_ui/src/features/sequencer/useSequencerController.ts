@@ -66,6 +66,8 @@ type SequencerLibraryEntry = {
   path: string | null;
   source: string | null;
   vars: string[];
+  /** The sequence has a run form (`sequencer.library.form`). */
+  hasForm: boolean;
 };
 type SequencerLoadedYamlInfo = {
   source: string | null;
@@ -215,6 +217,7 @@ export function normalizeSequencerLibraryPayload(
             ? entry.source
             : null,
         vars,
+        hasForm: entry.has_form === true,
       } satisfies SequencerLibraryEntry;
     })
     .filter((item): item is SequencerLibraryEntry => item !== null);
@@ -1117,8 +1120,15 @@ export function useSequencerController({
 
   const runSequencerAction = useCallback(
     // `formOverrides` come from the run form; they win over the override rows.
-    // Resolves true when the sequencer accepted the action.
-    async (action: SequencerAction, formOverrides?: Record<string, unknown>) => {
+    // With `formSequenceId` the start loads that library sequence and runs it
+    // once with only the form's values: the override rows, adaptive modes
+    // and run mode belong to the loaded sequence. Resolves true when the
+    // sequencer accepted the action.
+    async (
+      action: SequencerAction,
+      formOverrides?: Record<string, unknown>,
+      formSequenceId?: string
+    ) => {
       if (!sequencerProcess || sequencerActionBusy) {
         return false;
       }
@@ -1126,7 +1136,7 @@ export function useSequencerController({
       setSequencerActionBusy(true);
       setSequencerModalError(null);
       try {
-        if (action === "start" && !sequencerOverrideEvaluation.isValid) {
+        if (action === "start" && !formSequenceId && !sequencerOverrideEvaluation.isValid) {
           const message = "Fix invalid run overrides before starting.";
           setSequencerModalError(message);
           notifications.show({
@@ -1148,7 +1158,9 @@ export function useSequencerController({
               )
             : undefined;
         const startParams =
-          action === "start"
+          action === "start" && formSequenceId
+            ? { sequence_id: formSequenceId, vars_override: formOverrides ?? {} }
+            : action === "start"
             ? buildSequencerStartParams(
                 sequencerLoadSource,
                 sequencerLibraryConfigured,

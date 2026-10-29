@@ -1,3 +1,5 @@
+import { callProcess } from "../api";
+import { runFormFromLibraryResult } from "../features/sequencer/run_form";
 import { useCallback, type ChangeEvent, type ReactNode, type RefObject } from "react";
 import type {
   SequencerAdaptiveStudyStatus,
@@ -61,6 +63,7 @@ type Props = {
     path: string | null;
     source: string | null;
     vars: string[];
+    hasForm?: boolean;
   }[];
   libraryLoading: boolean;
   libraryError: string | null;
@@ -94,7 +97,8 @@ type Props = {
   adaptiveClearBusyStudyId: string | null;
   onRunAction: (
     action: "start" | "pause" | "resume" | "stop",
-    formOverrides?: Record<string, unknown>
+    formOverrides?: Record<string, unknown>,
+    formSequenceId?: string
   ) => Promise<unknown> | void;
   onAdaptiveModeChange: (
     studyId: string,
@@ -153,11 +157,31 @@ export function SequencerModalContainer({
       applyToEditor: true,
     });
   }, [onShowLoadedYaml, sequencerProcessId]);
+  const fetchLibraryForm = useCallback(
+    async (sequenceId: string) => {
+      if (!sequencerProcessId) {
+        throw new Error("No sequencer process");
+      }
+      const resp = await callProcess(sequencerProcessId, "sequencer.library.form", {
+        sequence_id: sequenceId,
+      });
+      if (!resp.ok) {
+        throw new Error(resp.error?.message ?? resp.error?.code ?? "Could not read the form");
+      }
+      const parsed = runFormFromLibraryResult(resp.result);
+      if (!parsed) {
+        throw new Error("The sequence's form has no sections it can show");
+      }
+      return parsed;
+    },
+    [sequencerProcessId]
+  );
   return (
     <SequencerModal
       {...props}
       hasSequencerProcess={Boolean(sequencerProcessId)}
       onShowLoadedYaml={showLoadedYaml}
+      onFetchLibraryForm={fetchLibraryForm}
     />
   );
 }

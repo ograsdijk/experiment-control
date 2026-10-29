@@ -620,7 +620,7 @@ Request:
 - `{"type": "sequencer.library.list"}`
 
 Response:
-- `{"ok": true, "result": {"configured": true, "manifest_path": "sequences/library.yaml", "description_policy": "warn", "active_sequence_id": "main", "entry_count": 3, "warnings": [], "last_error": null, "entries": [{"id": "main", "path": "sequences/main.yaml", "source": "explicit", "label": "Main", "description": "...", "tags": [], "editable_vars": [], "vars": ["port"], "use_ids": ["fragments.wait"]}]}}`
+- `{"ok": true, "result": {"configured": true, "manifest_path": "sequences/library.yaml", "description_policy": "warn", "active_sequence_id": "main", "entry_count": 3, "warnings": [], "last_error": null, "entries": [{"id": "main", "path": "sequences/main.yaml", "source": "explicit", "label": "Main", "description": "...", "tags": [], "editable_vars": [], "vars": ["port"], "use_ids": ["fragments.wait"], "has_form": false}]}}`
 
 ### `sequencer.library.reload`
 Request:
@@ -629,6 +629,15 @@ Request:
 Response:
 - `{"ok": true, "result": {...same shape as sequencer.library.list...}}`
 - `{"ok": false, "error": {"code": "library_not_configured" | "library_reload_failed", "message": "..."}}`
+
+### `sequencer.library.form`
+Request:
+- `{"type": "sequencer.library.form", "params": {"sequence_id": "scan"}}`
+
+Response:
+- `{"ok": true, "result": {"sequence_id": "scan", "label": "Scan", "form": {...}, "vars": {...}}}`: the entry's `form:` block and `vars` as written, without loading it (`docs/sequencer_run_form.md`).
+- `{"ok": false, "error": {"code": "missing_sequence_id" | "library_not_configured" | "unknown_sequence_id" | "no_form", "message": "..."}}`
+- Read-only. The UI's Forms menu uses it, then starts with `sequencer.start` `sequence_id`, which loads the entry.
 
 ### `sequencer.library.load`
 Request:
