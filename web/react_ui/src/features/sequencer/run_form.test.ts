@@ -8,6 +8,7 @@ import {
   optionsOf,
   otherTargetsFor,
   parseRunForm,
+  runFormFromLibraryResult,
   rangeProblems,
   rangeValues,
   summaryFigures,
@@ -55,6 +56,18 @@ describe("parseRunForm", () => {
     expect(parsed?.form.title).toBe("Scan");
     expect(parsed?.form.sections).toHaveLength(2);
     expect(parsed?.vars.points).toBe(5);
+  });
+
+  it("reads a sequencer.library.form result", () => {
+    const parsed = runFormFromLibraryResult({
+      sequence_id: "scan",
+      form: { sections: [{ fields: [{ type: "integer", var: "passes" }] }] },
+      vars: { passes: 3 },
+    });
+    expect(parsed?.vars.passes).toBe(3);
+    expect(parsed?.form.sections[0].fields[0]).toMatchObject({ var: "passes" });
+    expect(runFormFromLibraryResult({ form: { sections: [] } })).toBeNull();
+    expect(runFormFromLibraryResult(null)).toBeNull();
   });
 
   it("is null without a form or for broken YAML", () => {

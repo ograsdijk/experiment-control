@@ -37,6 +37,7 @@ export type SequencerLibraryEntry = {
   path: string | null;
   source: string | null;
   vars: string[];
+  hasForm?: boolean;
 };
 
 export type SequencerOverrideRow = {

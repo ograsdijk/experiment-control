@@ -42,6 +42,8 @@ type Props = {
   opened: boolean;
   onClose: () => void;
   parsed: ParsedRunForm;
+  /** The library sequence Start loads and runs, when it isn't the loaded one. */
+  sequenceLabel?: string;
   latestSignalsByDevice: Record<string, Record<string, TelemetrySignal>>;
   busy: boolean;
   onStart: (overrides: Record<string, unknown>) => Promise<unknown> | void;
@@ -65,6 +67,7 @@ export function SequencerRunFormModal({
   opened,
   onClose,
   parsed,
+  sequenceLabel,
   latestSignalsByDevice,
   busy,
   onStart,
@@ -114,6 +117,12 @@ export function SequencerRunFormModal({
       zIndex={500}
     >
       <Stack gap="md">
+        {sequenceLabel && (
+          <Text size="xs" c="dimmed">
+            Start loads {sequenceLabel} in place of the loaded sequence and runs it once with
+            these values.
+          </Text>
+        )}
         {form.presets.length > 0 && (
           <Group gap="xs">
             <Text size="sm" c="dimmed">

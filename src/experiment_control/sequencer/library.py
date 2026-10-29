@@ -72,6 +72,8 @@ class SequenceLibraryEntry:
             "editable_vars": list(self.editable_vars),
             "vars": sorted(str(key) for key in self.spec.vars.keys()),
             "use_ids": list(self.use_ids),
+            # The sequence has a run form (`sequencer.library.form`).
+            "has_form": self.spec.form is not None,
         }
 
 

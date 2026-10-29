@@ -167,6 +167,20 @@ class SequencerAPI(ClientFacadeBase):
     ) -> Any:
         return self.call("sequencer.library.reload", {}, timeout_ms=timeout_ms, retries=retries)
 
+    def library_form(
+        self,
+        *,
+        sequence_id: str,
+        timeout_ms: int | None = None,
+        retries: int | None = None,
+    ) -> Any:
+        return self.call(
+            "sequencer.library.form",
+            {"sequence_id": str(sequence_id)},
+            timeout_ms=timeout_ms,
+            retries=retries,
+        )
+
     def library_load(
         self,
         *,
