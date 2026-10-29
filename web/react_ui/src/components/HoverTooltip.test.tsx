@@ -71,43 +71,69 @@ describe("HoverTooltip", () => {
     expect(document.querySelectorAll("[data-portal]")).toHaveLength(0);
   });
 
-  it("closes when the pointer is elsewhere even if the target never saw a mouseout", () => {
+  it("keeps the target's DOM node while opening and closing", () => {
+    // Remounting the target on open let the browser send the mouseout to the
+    // detached node, so onMouseLeave never fired and the tooltip stuck.
+    const onMouseEnter = vi.fn();
+    const onMouseLeave = vi.fn();
+    const childRef = vi.fn();
     act(() =>
       root.render(
         createElement(
           MantineProvider,
           null,
-          createElement(
-            "div",
-            null,
-            createElement(HoverTooltip, {
-              label: "Restart driver",
-              children: createElement("button", null, "R"),
-            }),
-            createElement("span", { id: "elsewhere" }, "x")
-          )
+          createElement(HoverTooltip, {
+            label: "Restart driver",
+            children: createElement(
+              "button",
+              { onMouseEnter, onMouseLeave, ref: childRef },
+              "R"
+            ),
+          })
         )
       )
     );
+    const original = container.querySelector("button")!;
+    expect(childRef).toHaveBeenLastCalledWith(original);
+
     act(() => {
-      container
-        .querySelector("button")!
-        .dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
+      original.dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
+    });
+    expect(document.body.textContent).toContain("Restart driver");
+    expect(container.querySelector("button")).toBe(original);
+
+    act(() => {
+      original.dispatchEvent(
+        new MouseEvent("mouseout", { bubbles: true, relatedTarget: document.body })
+      );
+    });
+    expect(document.body.textContent).not.toContain("Restart driver");
+    expect(container.querySelector("button")).toBe(original);
+    expect(onMouseEnter).toHaveBeenCalledOnce();
+    expect(onMouseLeave).toHaveBeenCalledOnce();
+  });
+
+  it("closes when the pointer leaves the window", () => {
+    act(() =>
+      root.render(
+        createElement(
+          MantineProvider,
+          null,
+          createElement(HoverTooltip, {
+            label: "Restart driver",
+            children: createElement("button", null, "R"),
+          })
+        )
+      )
+    );
+    const button = container.querySelector("button")!;
+    act(() => {
+      button.dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
     });
     expect(document.body.textContent).toContain("Restart driver");
 
-    // Opening remounts the button; the browser's mouseout can go to the old,
-    // detached node, so only the next element's mouseover is seen.
     act(() => {
-      container
-        .querySelector("button")!
-        .dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
-    });
-    expect(document.body.textContent).toContain("Restart driver");
-    act(() => {
-      container
-        .querySelector("#elsewhere")!
-        .dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
+      button.dispatchEvent(new MouseEvent("mouseout", { bubbles: true, relatedTarget: null }));
     });
     expect(document.body.textContent).not.toContain("Restart driver");
   });

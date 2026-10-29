@@ -1,28 +1,42 @@
 import { Tooltip, type TooltipProps } from "@mantine/core";
+import { useMergedRef } from "@mantine/hooks";
 import {
   cloneElement,
-  useEffect,
-  useId,
+  forwardRef,
+  useImperativeHandle,
+  useRef,
   useState,
   type MouseEvent,
   type MouseEventHandler,
   type ReactElement,
+  type Ref,
+  type RefObject,
 } from "react";
 
-type HoverTooltipProps = Omit<TooltipProps, "children" | "opened"> & {
+type HoverTooltipProps = Omit<TooltipProps, "children" | "opened" | "events"> & {
   children: ReactElement;
 };
 
-const TARGET_ATTR = "data-hover-tooltip-target";
-
-function isInsideTarget(node: EventTarget | null, id: string): boolean {
-  for (let el = node instanceof Element ? node : null; el; el = el.parentElement) {
-    if (el.getAttribute(TARGET_ATTR) === id) {
-      return true;
-    }
-  }
-  return false;
-}
+/**
+ * Stands in for the target as the Tooltip's reference: Floating UI accepts a
+ * virtual element, so the tooltip is positioned against the real target
+ * without wrapping (and so remounting) it.
+ */
+const TargetAnchor = forwardRef(function TargetAnchor(
+  { target }: { target: RefObject<Element> },
+  ref
+) {
+  useImperativeHandle(
+    ref,
+    () => ({
+      getBoundingClientRect: () =>
+        target.current?.getBoundingClientRect() ?? new DOMRect(),
+      contextElement: target.current ?? undefined,
+    }),
+    [target]
+  );
+  return null;
+});
 
 /**
  * A Mantine Tooltip that is only mounted while its target is hovered.
@@ -33,43 +47,21 @@ function isInsideTarget(node: EventTarget | null, id: string): boolean {
  * for tooltips repeated per row (device signals, commands, devices). Like
  * Mantine's default, it responds to hover only.
  *
- * Wrapping the target in a Tooltip on hover remounts its DOM node. If the
- * pointer leaves before the new node sees a mouseover, the browser sends the
- * mouseout to the detached node and onMouseLeave never fires, so while open
- * we also close on any document mouseover outside the target.
+ * The Tooltip is rendered next to the target, not around it: wrapping the
+ * target on hover would change its element type and remount its DOM node, so
+ * a pointer that left before the new node saw a mouseover never fired
+ * onMouseLeave and the tooltip stayed open.
  */
 export function HoverTooltip({ children, ...tooltipProps }: HoverTooltipProps) {
   const [hovered, setHovered] = useState(false);
-  const id = useId();
+  const targetRef = useRef<Element>(null);
   const childProps = children.props as {
     onMouseEnter?: MouseEventHandler;
     onMouseLeave?: MouseEventHandler;
   };
-
-  useEffect(() => {
-    if (!hovered) {
-      return;
-    }
-    const onOver = (event: globalThis.MouseEvent) => {
-      if (!isInsideTarget(event.target, id)) {
-        setHovered(false);
-      }
-    };
-    const onOut = (event: globalThis.MouseEvent) => {
-      if (event.relatedTarget === null) {
-        setHovered(false);
-      }
-    };
-    document.addEventListener("mouseover", onOver, true);
-    document.addEventListener("mouseout", onOut, true);
-    return () => {
-      document.removeEventListener("mouseover", onOver, true);
-      document.removeEventListener("mouseout", onOut, true);
-    };
-  }, [hovered, id]);
-
+  const mergedRef = useMergedRef(targetRef, (children as { ref?: Ref<Element> }).ref);
   const target = cloneElement(children, {
-    [TARGET_ATTR]: id,
+    ref: mergedRef,
     onMouseEnter: (event: MouseEvent) => {
       childProps.onMouseEnter?.(event);
       setHovered(true);
@@ -79,12 +71,14 @@ export function HoverTooltip({ children, ...tooltipProps }: HoverTooltipProps) {
       setHovered(false);
     },
   });
-  if (!hovered) {
-    return target;
-  }
   return (
-    <Tooltip {...tooltipProps} opened>
+    <>
       {target}
-    </Tooltip>
+      {hovered ? (
+        <Tooltip {...tooltipProps} opened events={{ hover: false, focus: false, touch: false }}>
+          <TargetAnchor target={targetRef} />
+        </Tooltip>
+      ) : null}
+    </>
   );
 }
