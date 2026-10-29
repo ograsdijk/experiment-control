@@ -31,7 +31,7 @@ import {
   otherTargetsFor,
   rangeProblems,
   rangeValues,
-  totalShots,
+  summaryFigures,
   type ParsedRunForm,
   type RunFormField,
   type RunFormOption,
@@ -50,12 +50,6 @@ type Props = {
 type Values = Record<string, unknown>;
 
 const OTHER_PREFIX = "other:";
-
-const LOCK_LABELS: Record<string, string> = {
-  pll: "PLL lock",
-  pmt_ready: "PMT settled",
-  eql_state: "lens ramp",
-};
 
 function num(value: unknown, fallback = 0): number {
   const n = typeof value === "number" ? value : Number(value);
@@ -108,7 +102,7 @@ export function SequencerRunFormModal({
       : null;
   const problems = rangeField ? rangeProblems(target, scanValues) : [];
   // Summary vars the form doesn't set keep the sequence's own values.
-  const shots = totalShots(form.summary, { ...vars, ...values });
+  const figures = summaryFigures(form.summary, { ...vars, ...values });
   const overrides = useMemo(() => buildRunOverrides(form, values), [form, values]);
 
   return (
@@ -185,8 +179,13 @@ export function SequencerRunFormModal({
         )}
 
         <SimpleGrid cols={3} spacing="xs">
-          <Stat label="Values" value={shots ? String(shots.points) : "–"} />
-          <Stat label="Total shots" value={shots ? shots.shots.toLocaleString() : "–"} />
+          {figures.map((figure) => (
+            <Stat
+              key={figure.label}
+              label={figure.label}
+              value={figure.value === null ? "–" : figure.value.toLocaleString()}
+            />
+          ))}
           <Stat
             label="Start value"
             value={
@@ -497,7 +496,7 @@ function TargetField({
       if (cancelled) {
         return;
       }
-      const found = otherTargetsFor(otherDevice, members);
+      const found = otherTargetsFor(otherDevice, members, field.other_defaults);
       setOtherTargets(found);
       if (pendingOther === otherDevice) {
         // A device without set_/get_ pairs can't be scanned: keep the old target.
@@ -550,7 +549,7 @@ function TargetField({
     ...(otherDevices.length > 0
       ? [
           {
-            group: "Other (no lock wait, raw units)",
+            group: "Other (set_/get_ pairs, raw units)",
             items: otherDevices.map((deviceId) => ({
               value: `${OTHER_PREFIX}${deviceId}`,
               label: deviceId,
@@ -621,11 +620,11 @@ function TargetField({
           </Text>
           {target.kind === "generic" ? (
             <Badge size="xs" color="yellow" variant="light">
-              no lock wait, raw units
+              raw units
             </Badge>
-          ) : target.lock !== "none" ? (
+          ) : typeof target.lock_label === "string" && target.lock_label ? (
             <Badge size="xs" variant="light">
-              waits for {LOCK_LABELS[String(target.lock)] ?? String(target.lock)}
+              waits for {target.lock_label}
             </Badge>
           ) : null}
         </Group>

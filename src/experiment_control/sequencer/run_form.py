@@ -15,7 +15,6 @@ FIELD_TYPES = ("checkbox", "number", "integer", "text", "select", "chips", "targ
 
 _FORM_KEYS = {"title", "presets", "summary", "sections"}
 _SECTION_KEYS = {"title", "toggle", "fields"}
-_SUMMARY_KEYS = {"points", "passes", "bursts", "shots"}
 _COMMON_FIELD_KEYS = {"type", "label", "enabled_by"}
 _FIELD_KEYS: dict[str, set[str]] = {
     "checkbox": {"var"},
@@ -24,7 +23,7 @@ _FIELD_KEYS: dict[str, set[str]] = {
     "text": {"var"},
     "select": {"var", "options", "options_call", "empty_label"},
     "chips": {"var", "options"},
-    "target": {"var", "catalog", "other_exclude"},
+    "target": {"var", "catalog", "other_exclude", "other_defaults"},
     "range": {"target", "relative", "from", "to", "points"},
 }
 _OPTIONS_CALL_KEYS = {"device", "action", "params", "list", "value", "label"}
@@ -70,6 +69,7 @@ def _check_field(field: Any, where: str, vars_map: dict[str, Any]) -> None:
         exclude = obj.get("other_exclude", [])
         if not isinstance(exclude, list) or not all(isinstance(d, str) for d in exclude):
             raise TypeError(f"{where}.other_exclude must be a list of device ids")
+        _require_dict(obj.get("other_defaults", {}), f"{where}.other_defaults")
     if kind == "chips" or (kind == "select" and "options_call" not in obj):
         options = _check_var(obj.get("options"), f"{where}.options", vars_map)
         _check_options(vars_map[options], f"{where}.options ({options})")
@@ -114,9 +114,18 @@ def validate_run_form(raw: Any, vars_map: dict[str, Any]) -> dict[str, Any]:
         _check_keys(preset, where, {"label", "set"})
         for name in _require_dict(preset.get("set"), f"{where}.set"):
             _check_var(name, f"{where}.set", vars_map)
-    if "summary" in form:
-        summary = _require_dict(form["summary"], "form.summary")
-        _check_keys(summary, "form.summary", _SUMMARY_KEYS)
-        for key, name in summary.items():
-            _check_var(name, f"form.summary.{key}", vars_map)
+    summary = form.get("summary", [])
+    if not isinstance(summary, list):
+        raise TypeError("form.summary must be a list of {label, product}")
+    for s_index, item_raw in enumerate(summary):
+        where = f"form.summary[{s_index}]"
+        item = _require_dict(item_raw, where)
+        _check_keys(item, where, {"label", "product"})
+        if not isinstance(item.get("label"), str):
+            raise TypeError(f"{where}.label must be a string")
+        product = item.get("product")
+        if not isinstance(product, list) or not product:
+            raise TypeError(f"{where}.product must be a non-empty list of vars")
+        for name in product:
+            _check_var(name, f"{where}.product", vars_map)
     return form

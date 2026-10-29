@@ -27,12 +27,13 @@ _VALID_FORM = """\
   title: Scan
   presets:
     - {label: Off, set: {enabled: false}}
-  summary: {points: points, passes: passes}
+  summary:
+    - {label: Total, product: [points, passes]}
   sections:
     - title: Target
       toggle: enabled
       fields:
-        - {type: target, var: target, catalog: targets, other_exclude: [mirror]}
+        - {type: target, var: target, catalog: targets, other_exclude: [mirror], other_defaults: {settle_s: 1.0}}
         - {type: range, target: target, relative: relative, from: lo, to: hi, points: points}
         - {type: integer, var: passes, label: Passes, min: 1, enabled_by: enabled}
         - {type: chips, var: channels, options: channel_options}
@@ -81,7 +82,7 @@ class RunFormTests(unittest.TestCase):
             )
         with self.assertRaises(TypeError):
             _load(
-                "  summary: {shots: missing}\n"
+                "  summary: [{label: x, product: [missing]}]\n"
                 "  sections:\n    - fields:\n        - {type: checkbox, var: enabled}\n"
             )
 

@@ -45,7 +45,14 @@ export type RunFormField =
       empty_label?: string;
     })
   | (FieldBase & { type: "chips"; var: string; options: string })
-  | (FieldBase & { type: "target"; var: string; catalog: string; other_exclude?: string[] })
+  | (FieldBase & {
+      type: "target";
+      var: string;
+      catalog: string;
+      other_exclude?: string[];
+      /** Keys added to every Other entry (the sequence's own conventions). */
+      other_defaults?: Record<string, unknown>;
+    })
   | (FieldBase & {
       type: "range";
       target: string;
@@ -60,7 +67,8 @@ export type RunFormSection = { title?: string; toggle?: string; fields: RunFormF
 export type RunForm = {
   title?: string;
   presets: { label: string; set: Record<string, unknown> }[];
-  summary: Partial<Record<"points" | "passes" | "bursts" | "shots", string>>;
+  /** Figures shown under the form: each the product of some vars. */
+  summary: { label: string; product: string[] }[];
   sections: RunFormSection[];
 };
 
@@ -116,10 +124,11 @@ export function parseRunForm(yamlText: string): ParsedRunForm | null {
             (preset) => preset && typeof preset.set === "object"
           )
         : [],
-      summary:
-        form.summary && typeof form.summary === "object"
-          ? (form.summary as RunForm["summary"])
-          : {},
+      summary: Array.isArray(form.summary)
+        ? (form.summary as RunForm["summary"]).filter(
+            (item) => item && typeof item.label === "string" && Array.isArray(item.product)
+          )
+        : [],
       sections: sections.map((section) => ({
         ...section,
         fields: Array.isArray(section.fields) ? section.fields : [],
@@ -221,12 +230,14 @@ export function catalogTargets(value: unknown): ScanTarget[] {
 
 /**
  * "Other" targets of a device without a catalog entry: each `set_X` with a
- * matching `get_X` whose parameters are a value, or a channel and a value.
- * No lock wait, raw units, restored through `get_X`.
+ * matching `get_X` whose parameters are a value, or a channel and a value,
+ * in raw units. `defaults` (the field's `other_defaults`) adds the sequence's
+ * own keys; it never replaces the ones that identify the call.
  */
 export function otherTargetsFor(
   deviceId: string,
-  members: ReadonlyArray<CapabilityMember>
+  members: ReadonlyArray<CapabilityMember>,
+  defaults: Record<string, unknown> = {}
 ): ScanTarget[] {
   const methods = new Map(
     members.filter((member) => member.kind === "method").map((member) => [member.name, member])
@@ -252,6 +263,7 @@ export function otherTargetsFor(
       continue;
     }
     out.push({
+      ...defaults,
       id: `other:${deviceId}:${name}`,
       kind: "generic",
       device: deviceId,
@@ -262,8 +274,6 @@ export function otherTargetsFor(
       value_param: valueParam,
       channel_param: channelParam,
       channel: channelParam ? 1 : null,
-      lock: "none",
-      settle_s: 1.0,
       unit: "",
       display_unit: "",
       display_scale: 1,
@@ -329,20 +339,19 @@ export function rangeProblems(
   return problems;
 }
 
-export function totalShots(
+/** Each summary figure: the product of its vars (null if one isn't a number). */
+export function summaryFigures(
   summary: RunForm["summary"],
   values: Record<string, unknown>
-): { points: number; shots: number } | null {
-  const read = (key: keyof RunForm["summary"]) => {
-    const name = summary[key];
-    const value = name ? Number(values[name]) : 1;
-    return Number.isFinite(value) ? Math.max(0, Math.trunc(value)) : 0;
-  };
-  if (!summary.points) {
-    return null;
-  }
-  const points = read("points");
-  return { points, shots: points * read("passes") * read("bursts") * read("shots") };
+): { label: string; value: number | null }[] {
+  return summary.map(({ label, product }) => {
+    let value: number | null = 1;
+    for (const name of product) {
+      const n = Number(values[name]);
+      value = value !== null && Number.isFinite(n) ? value * n : null;
+    }
+    return { label, value };
+  });
 }
 
 /** Number shown with a sensible number of significant digits. */

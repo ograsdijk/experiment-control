@@ -38,17 +38,17 @@ vi.mock("@mantine/core", async (importOriginal) => {
 });
 
 vi.mock("../api", () => ({
-  callDevice: vi.fn(async () => ({ ok: true, result: { profiles: [{ name: "yag_16hz" }] } })),
+  callDevice: vi.fn(async () => ({ ok: true, result: { profiles: [{ name: "profile_a" }] } })),
   fetchCapabilities: vi.fn(async () => []),
 }));
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
 const TARGET =
-  "{id: rc, device_label: RC SynthHD, param_label: CH1 frequency, kind: synthhd_frequency, " +
-  "device: syn, channel: 1, lock: pll, settle_s: 2, unit: Hz, display_unit: GHz, " +
+  "{id: src, device_label: Source, param_label: CH1 frequency, kind: source_frequency, " +
+  "device: source, channel: 1, lock_label: settled, unit: Hz, display_unit: GHz, " +
   "display_scale: 1.0e+9, offset_unit: MHz, offset_scale: 1.0e+6, min: null, max: null, " +
-  "default_span: 2.0e+6, current: {device: syn, signal: ch1_frequency_hz}}";
+  "default_span: 2.0e+6, current: {device: source, signal: ch1_frequency_hz}}";
 
 const YAML = `
 version: 1
@@ -62,12 +62,14 @@ vars:
   passes: 3
   bursts: 3
   shots: 13
-  neon: true
-  pb_profile: ""
+  heater: true
+  profile: ""
 form:
   title: Quick parameter scan
-  presets: [{label: Laser only, set: {neon: false}}]
-  summary: {points: points, passes: passes, bursts: bursts, shots: shots}
+  presets: [{label: Cold, set: {heater: false}}]
+  summary:
+    - {label: Values, product: [points]}
+    - {label: Total shots, product: [points, passes, bursts, shots]}
   sections:
     - title: Scan target
       fields:
@@ -78,12 +80,12 @@ form:
         - {type: integer, var: passes, label: Passes, min: 1}
     - title: Setup
       fields:
-        - {type: checkbox, var: neon, label: Neon flow}
+        - {type: checkbox, var: heater, label: Heater}
         - type: select
-          var: pb_profile
+          var: profile
           label: Required profile
-          empty_label: Any running profile
-          options_call: {device: pulseblaster, action: list_profiles, list: profiles, value: name}
+          empty_label: Any profile
+          options_call: {device: timer, action: list_profiles, list: profiles, value: name}
 steps:
   - sleep: 0
 `;
@@ -127,7 +129,7 @@ async function render(
           opened: true,
           onClose,
           parsed: parseRunForm(YAML)!,
-          latestSignalsByDevice: { syn: { ch1_frequency_hz: { value: 13.3345e9 } } },
+          latestSignalsByDevice: { source: { ch1_frequency_hz: { value: 13.3345e9 } } },
           busy: false,
           onStart,
         })
@@ -153,12 +155,13 @@ describe("SequencerRunFormModal", () => {
     expect(text).toContain("13.3345 GHz");
     expect(text).toContain("13.3335 → 13.3355 GHz");
     expect(text).toContain((9 * 3 * 3 * 13).toLocaleString());
+    expect(text).toContain("waits for settled");
   });
 
   it("starts with every form var, presets applied", async () => {
     const onStart = vi.fn();
     await render(onStart);
-    await act(async () => button("Laser only").click());
+    await act(async () => button("Cold").click());
     await act(async () => button("Start scan").click());
     expect(onStart).toHaveBeenCalledTimes(1);
     const overrides = onStart.mock.calls[0][0];
@@ -168,10 +171,10 @@ describe("SequencerRunFormModal", () => {
       hi: 1.0e6,
       points: 9,
       passes: 3,
-      neon: false,
-      pb_profile: "",
+      heater: false,
+      profile: "",
     });
-    expect((overrides.target as { id: string }).id).toBe("rc");
+    expect((overrides.target as { id: string }).id).toBe("src");
   });
 
   it("closes only when the start was accepted", async () => {

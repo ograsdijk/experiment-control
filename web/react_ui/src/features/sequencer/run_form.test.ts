@@ -10,15 +10,15 @@ import {
   parseRunForm,
   rangeProblems,
   rangeValues,
-  totalShots,
+  summaryFigures,
   type ScanTarget,
 } from "./run_form";
 
 const YAML = `
 version: 1
 vars:
-  targets: [{id: a, kind: synthhd_frequency, device: syn}]
-  target: {id: a, kind: synthhd_frequency, device: syn}
+  targets: [{id: a, kind: source_frequency, device: syn}]
+  target: {id: a, kind: source_frequency, device: syn}
   relative: true
   lo: -1.0
   hi: 1.0
@@ -26,21 +26,23 @@ vars:
   passes: 3
   bursts: 2
   shots: 10
-  wm_on: true
+  monitor_on: true
   channels: [1, 2]
-  channel_options: [{value: 1, label: RC}, {value: 2}]
+  channel_options: [{value: 1, label: First}, {value: 2}]
   untouched: 7
 form:
   title: Scan
-  presets: [{label: Off, set: {wm_on: false}}]
-  summary: {points: points, passes: passes, bursts: bursts, shots: shots}
+  presets: [{label: Off, set: {monitor_on: false}}]
+  summary:
+    - {label: Values, product: [points]}
+    - {label: Total, product: [points, passes, bursts, shots]}
   sections:
     - title: Target
       fields:
         - {type: target, var: target, catalog: targets}
         - {type: range, target: target, relative: relative, from: lo, to: hi, points: points}
-    - title: Wavemeter
-      toggle: wm_on
+    - title: Monitor
+      toggle: monitor_on
       fields:
         - {type: chips, var: channels, options: channel_options}
 steps:
@@ -65,7 +67,7 @@ describe("overrides", () => {
   it("sends every var the form sets, and only those", () => {
     const parsed = parseRunForm(YAML)!;
     expect(formVarNames(parsed.form).sort()).toEqual(
-      ["channels", "hi", "lo", "points", "relative", "target", "wm_on"].sort()
+      ["channels", "hi", "lo", "points", "relative", "target", "monitor_on"].sort()
     );
     const values = { ...initialFormValues(parsed), lo: -2.0, untouched: 99 };
     const overrides = buildRunOverrides(parsed.form, values);
@@ -74,26 +76,30 @@ describe("overrides", () => {
     expect("untouched" in overrides).toBe(false);
   });
 
-  it("multiplies the summary vars into total shots", () => {
+  it("multiplies each summary figure's vars", () => {
     const parsed = parseRunForm(YAML)!;
-    expect(totalShots(parsed.form.summary, parsed.vars)).toEqual({ points: 5, shots: 300 });
+    expect(summaryFigures(parsed.form.summary, parsed.vars)).toEqual([
+      { label: "Values", value: 5 },
+      { label: "Total", value: 300 },
+    ]);
+    expect(summaryFigures(parsed.form.summary, { points: "x" })[0].value).toBeNull();
   });
 });
 
 describe("options", () => {
   it("labels default to the value", () => {
-    expect(optionsOf([{ value: 1, label: "RC" }, { value: 2 }, "bad"])).toEqual([
-      { value: 1, label: "RC" },
+    expect(optionsOf([{ value: 1, label: "First" }, { value: 2 }, "bad"])).toEqual([
+      { value: 1, label: "First" },
       { value: 2, label: "2" },
     ]);
   });
 
   it("reads an options_call result", () => {
-    const call = { device: "pb", action: "list_profiles", list: "profiles", value: "name" };
-    const result = { profiles: [{ name: "yag_16hz" }, { name: "cu1" }] };
+    const call = { device: "timer", action: "list_profiles", list: "profiles", value: "name" };
+    const result = { profiles: [{ name: "profile_a" }, { name: "profile_b" }] };
     expect(optionsFromCallResult(call, result)).toEqual([
-      { value: "yag_16hz", label: "yag_16hz" },
-      { value: "cu1", label: "cu1" },
+      { value: "profile_a", label: "profile_a" },
+      { value: "profile_b", label: "profile_b" },
     ]);
     expect(optionsFromCallResult(call, null)).toEqual([]);
   });
@@ -143,6 +149,17 @@ describe("otherTargetsFor", () => {
       ["set_level", "value", null],
       ["set_power", "dbm", "channel"],
     ]);
-    expect(targets.every((t) => t.kind === "generic" && t.lock === "none")).toBe(true);
+    expect(targets.every((t) => t.kind === "generic")).toBe(true);
+  });
+
+  it("adds the sequence's defaults without replacing the call's keys", () => {
+    const [target] = otherTargetsFor(
+      "dev",
+      [method("set_level", ["value"]), method("get_level", [])],
+      { settle_s: 0.5, kind: "nope", set_action: "nope" }
+    );
+    expect(target.settle_s).toBe(0.5);
+    expect(target.kind).toBe("generic");
+    expect(target.set_action).toBe("set_level");
   });
 });
