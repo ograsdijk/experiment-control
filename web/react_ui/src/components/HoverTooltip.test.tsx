@@ -70,4 +70,225 @@ describe("HoverTooltip", () => {
     });
     expect(document.querySelectorAll("[data-portal]")).toHaveLength(0);
   });
+
+  it("keeps the target's DOM node while opening and closing", () => {
+    // Remounting the target on open let the browser send the mouseout to the
+    // detached node, so onMouseLeave never fired and the tooltip stuck.
+    const onMouseEnter = vi.fn();
+    const onMouseLeave = vi.fn();
+    const childRef = vi.fn();
+    act(() =>
+      root.render(
+        createElement(
+          MantineProvider,
+          null,
+          createElement(HoverTooltip, {
+            label: "Restart driver",
+            children: createElement(
+              "button",
+              { onMouseEnter, onMouseLeave, ref: childRef },
+              "R"
+            ),
+          })
+        )
+      )
+    );
+    const original = container.querySelector("button")!;
+    expect(childRef).toHaveBeenLastCalledWith(original);
+
+    act(() => {
+      original.dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
+    });
+    expect(document.body.textContent).toContain("Restart driver");
+    expect(container.querySelector("button")).toBe(original);
+
+    act(() => {
+      original.dispatchEvent(
+        new MouseEvent("mouseout", { bubbles: true, relatedTarget: document.body })
+      );
+    });
+    expect(document.body.textContent).not.toContain("Restart driver");
+    expect(container.querySelector("button")).toBe(original);
+    expect(onMouseEnter).toHaveBeenCalledOnce();
+    expect(onMouseLeave).toHaveBeenCalledOnce();
+  });
+
+  it("describes the target by the open tooltip and restores its own aria", () => {
+    act(() =>
+      root.render(
+        createElement(
+          MantineProvider,
+          null,
+          createElement(HoverTooltip, {
+            label: "Send command",
+            children: createElement("button", { "aria-describedby": "hint" }, "S"),
+          })
+        )
+      )
+    );
+    const button = container.querySelector("button")!;
+    act(() => {
+      button.dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
+    });
+    const ids = button.getAttribute("aria-describedby")!.split(" ");
+    expect(ids[0]).toBe("hint");
+    expect(document.getElementById(ids[1])?.textContent).toContain("Send command");
+
+    act(() => {
+      button.dispatchEvent(
+        new MouseEvent("mouseout", { bubbles: true, relatedTarget: document.body })
+      );
+    });
+    expect(button.getAttribute("aria-describedby")).toBe("hint");
+  });
+
+  it("forwards Tooltip-level handlers to the target alongside the child's", () => {
+    const tooltipClick = vi.fn();
+    const childClick = vi.fn();
+    act(() =>
+      root.render(
+        createElement(
+          MantineProvider,
+          null,
+          createElement(HoverTooltip, {
+            label: "Restart driver",
+            onClick: tooltipClick,
+            children: createElement("button", { onClick: childClick }, "R"),
+          })
+        )
+      )
+    );
+    act(() => container.querySelector("button")!.click());
+    expect(tooltipClick).toHaveBeenCalledOnce();
+    expect(childClick).toHaveBeenCalledOnce();
+  });
+
+  it("closes on a mouseover elsewhere when the target sent no mouseout", () => {
+    // Older browsers send no mouse events from a disabled button.
+    act(() =>
+      root.render(
+        createElement(
+          MantineProvider,
+          null,
+          createElement(
+            "div",
+            null,
+            createElement(HoverTooltip, {
+              label: "Restart driver",
+              children: createElement("button", null, createElement("svg")),
+            }),
+            createElement("span", { id: "elsewhere" }, "x")
+          )
+        )
+      )
+    );
+    act(() => {
+      container
+        .querySelector("button")!
+        .dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
+    });
+    act(() => {
+      container.querySelector("svg")!.dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
+    });
+    expect(document.body.textContent).toContain("Restart driver");
+
+    act(() => {
+      container
+        .querySelector("#elsewhere")!
+        .dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
+    });
+    expect(document.body.textContent).not.toContain("Restart driver");
+  });
+
+  it("re-anchors to a replaced target while open", () => {
+    const renderWith = (tag: string) =>
+      act(() =>
+        root.render(
+          createElement(
+            MantineProvider,
+            null,
+            createElement(HoverTooltip, {
+              label: "Restart driver",
+              children: createElement(tag, { className: "target" }, "R"),
+            })
+          )
+        )
+      );
+    renderWith("button");
+    act(() => {
+      container
+        .querySelector(".target")!
+        .dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
+    });
+    renderWith("a");
+    const replaced = container.querySelector(".target")!;
+    expect(replaced.tagName).toBe("A");
+    expect(document.body.textContent).toContain("Restart driver");
+    const id = replaced.getAttribute("aria-describedby");
+    expect(document.getElementById(id!)?.textContent).toContain("Restart driver");
+  });
+
+  it("calls the child's onMouseLeave once when the fallback closes first", () => {
+    const onMouseLeave = vi.fn();
+    act(() =>
+      root.render(
+        createElement(
+          MantineProvider,
+          null,
+          createElement(
+            "div",
+            null,
+            createElement(HoverTooltip, {
+              label: "Restart driver",
+              className: "extra",
+              children: createElement("button", { onMouseLeave, className: "own" }, "R"),
+            }),
+            createElement("span", { id: "elsewhere" }, "x")
+          )
+        )
+      )
+    );
+    const button = container.querySelector("button")!;
+    expect(button.className).toBe("extra own");
+    act(() => {
+      button.dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
+    });
+    act(() => {
+      container
+        .querySelector("#elsewhere")!
+        .dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
+    });
+    expect(document.body.textContent).not.toContain("Restart driver");
+    act(() => {
+      button.dispatchEvent(
+        new MouseEvent("mouseout", { bubbles: true, relatedTarget: document.body })
+      );
+    });
+    expect(onMouseLeave).toHaveBeenCalledOnce();
+  });
+
+  it("closes when the pointer leaves the window", () => {
+    act(() =>
+      root.render(
+        createElement(
+          MantineProvider,
+          null,
+          createElement(HoverTooltip, {
+            label: "Restart driver",
+            children: createElement("button", null, "R"),
+          })
+        )
+      )
+    );
+    const button = container.querySelector("button")!;
+    act(() => {
+      button.dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
+    });
+    expect(document.body.textContent).toContain("Restart driver");
+
+    act(() => {
+      button.dispatchEvent(new MouseEvent("mouseout", { bubbles: true, relatedTarget: null }));
+    });
+    expect(document.body.textContent).not.toContain("Restart driver");
+  });
 });
