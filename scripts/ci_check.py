@@ -12,6 +12,10 @@ Usage (from the repo root, any Python 3.10+; the script is stdlib-only):
     python scripts/ci_check.py --list     # show steps
     python scripts/ci_check.py --install-hook   # opt-in pre-push hook (--quick)
 
+Locally, the selected jobs (python, ui, ...) run side by side and each step's
+output is printed when it ends; ``--serial`` runs them one after another with
+live output. In GitHub Actions each job is its own workflow job.
+
 Requires ``uv`` on PATH; UI steps also need official Node 24 (see AGENTS.md)
 and PowerShell 7 (``pwsh``).
 """
@@ -19,16 +23,20 @@ and PowerShell 7 (``pwsh``).
 from __future__ import annotations
 
 import argparse
+import contextvars
 import gzip
+import io
 import os
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import zipfile
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -75,10 +83,40 @@ def _exe(name: str) -> str:
     return path
 
 
+# Where the running step's output goes: the terminal, or (when jobs run in
+# parallel) a per-step buffer printed whole once the step finishes.
+_STEP_LOG: contextvars.ContextVar[io.StringIO | None] = contextvars.ContextVar(
+    "_STEP_LOG", default=None
+)
+
+
+def _say(text: str) -> None:
+    log = _STEP_LOG.get()
+    if log is None:
+        print(text, flush=True)
+    else:
+        log.write(text + "\n")
+
+
 def _run(cmd: list[str], *, cwd: Path = ROOT, env: dict[str, str] | None = None) -> None:
-    print(f"  $ {' '.join(cmd)}", flush=True)
+    _say(f"  $ {' '.join(cmd)}")
     full_env = {**os.environ, **(env or {})}
-    rc = subprocess.call([_exe(cmd[0]), *cmd[1:]], cwd=cwd, env=full_env)
+    log = _STEP_LOG.get()
+    if log is None:
+        rc = subprocess.call([_exe(cmd[0]), *cmd[1:]], cwd=cwd, env=full_env)
+    else:
+        proc = subprocess.run(
+            [_exe(cmd[0]), *cmd[1:]],
+            cwd=cwd,
+            env=full_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        log.write(proc.stdout)
+        rc = proc.returncode
     if rc != 0:
         raise StepFailed(f"exit code {rc}")
 
@@ -121,7 +159,7 @@ def step_build_and_verify_wheel() -> None:
         with zipfile.ZipFile(wheels[-1]) as zf:
             if required not in set(zf.namelist()):
                 raise StepFailed(f"wheel {wheels[-1].name} is missing bundled UI asset {required}")
-        print(f"  verified bundled UI in {wheels[-1].name}")
+        _say(f"  verified bundled UI in {wheels[-1].name}")
 
 
 def step_ui_build() -> None:
@@ -161,7 +199,7 @@ def step_ui_bundle_budget() -> None:
         raise StepFailed("could not find the entry chunk in index.html")
     code = (dist / entry.group(1)).read_bytes()
     gzip_bytes = len(gzip.compress(code, compresslevel=9))
-    print(f"  entry chunk {entry.group(1)}: {len(code) / 1024:.0f} KB, gzip {gzip_bytes / 1024:.0f} KB")
+    _say(f"  entry chunk {entry.group(1)}: {len(code) / 1024:.0f} KB, gzip {gzip_bytes / 1024:.0f} KB")
     if gzip_bytes > UI_ENTRY_GZIP_BUDGET_BYTES:
         raise StepFailed(
             f"entry chunk gzip {gzip_bytes / 1024:.0f} KB exceeds the "
@@ -186,9 +224,9 @@ def bundle_changes(path: str) -> list[str]:
 def step_ui_dist_current() -> None:
     lines = bundle_changes(PACKAGED_UI)
     if lines:
-        print("\n".join(f"    {line}" for line in lines[:20]))
+        _say("\n".join(f"    {line}" for line in lines[:20]))
         if len(lines) > 20:
-            print(f"    ... and {len(lines) - 20} more")
+            _say(f"    ... and {len(lines) - 20} more")
         raise StepFailed(
             f"{PACKAGED_UI} is stale or uncommitted: run .\\scripts\\build_packaged_ui.ps1 "
             "and commit the result"
@@ -267,6 +305,44 @@ def install_hook() -> int:
     return 0
 
 
+_PRINT_LOCK = threading.Lock()
+
+
+def run_job(steps: list[Step], *, buffered: bool) -> list[tuple[str, str, float]]:
+    """Run steps in order; a failed prerequisite skips the rest of its job.
+
+    With ``buffered``, each step's output is collected and printed whole when
+    the step ends, so jobs running side by side don't interleave lines."""
+    results: list[tuple[str, str, float]] = []
+    skipped_jobs: set[str] = set()
+    for step in steps:
+        if step.job in skipped_jobs:
+            results.append((step.name, "skipped", 0.0))
+            continue
+        header = f"\n==> [{step.job}] {step.name}"
+        if not buffered:
+            print(header, flush=True)
+        log = io.StringIO() if buffered else None
+        token = _STEP_LOG.set(log)
+        t0 = time.monotonic()
+        try:
+            step.run()
+            results.append((step.name, "ok", time.monotonic() - t0))
+        except StepFailed as exc:
+            results.append((step.name, "FAILED", time.monotonic() - t0))
+            msg = f"{step.name}: {exc}"
+            _say(f"::error::{msg}" if IN_GITHUB_ACTIONS else f"  FAILED: {msg}")
+            if step.prerequisite:
+                skipped_jobs.add(step.job)
+        finally:
+            _STEP_LOG.reset(token)
+        if log is not None:
+            _, status, dt = results[-1]
+            with _PRINT_LOCK:
+                print(f"{header} ({status}, {dt:.0f}s)\n{log.getvalue()}", end="", flush=True)
+    return results
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     mode = parser.add_mutually_exclusive_group()
@@ -275,6 +351,7 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument("--job", action="append", choices=JOBS, help="run one CI job's steps (repeatable)")
     parser.add_argument("--list", action="store_true", help="list steps and exit")
     parser.add_argument("--install-hook", action="store_true", help="install an opt-in pre-push hook")
+    parser.add_argument("--serial", action="store_true", help="run jobs one after another, output live")
     args = parser.parse_args(argv)
 
     if args.list:
@@ -286,23 +363,19 @@ def main(argv: list[str] | None = None) -> int:
         return install_hook()
 
     steps = select_steps(args)
-    results: list[tuple[str, str, float]] = []
-    skipped_jobs: set[str] = set()
-    for step in steps:
-        if step.job in skipped_jobs:
-            results.append((step.name, "skipped", 0.0))
-            continue
-        print(f"\n==> [{step.job}] {step.name}", flush=True)
-        t0 = time.monotonic()
-        try:
-            step.run()
-            results.append((step.name, "ok", time.monotonic() - t0))
-        except StepFailed as exc:
-            results.append((step.name, "FAILED", time.monotonic() - t0))
-            msg = f"{step.name}: {exc}"
-            print(f"::error::{msg}" if IN_GITHUB_ACTIONS else f"  FAILED: {msg}", flush=True)
-            if step.prerequisite:
-                skipped_jobs.add(step.job)
+    jobs = list(dict.fromkeys(step.job for step in steps))
+    # Jobs are independent (CI runs them as separate workflow jobs), so a
+    # local run does them side by side. Steps inside a job stay in order.
+    if len(jobs) > 1 and not args.serial and not IN_GITHUB_ACTIONS:
+        print(f"Running jobs in parallel: {', '.join(jobs)} (each step's output when it ends)")
+        with ThreadPoolExecutor(max_workers=len(jobs)) as pool:
+            per_job = pool.map(
+                lambda job: run_job([s for s in steps if s.job == job], buffered=True), jobs
+            )
+            by_name = {name: (status, dt) for job_results in per_job for name, status, dt in job_results}
+        results = [(s.name, *by_name[s.name]) for s in steps]
+    else:
+        results = run_job(steps, buffered=False)
 
     print("\nSummary:")
     for name, status, dt in results:
