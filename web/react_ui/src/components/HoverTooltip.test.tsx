@@ -200,6 +200,73 @@ describe("HoverTooltip", () => {
     expect(document.body.textContent).not.toContain("Restart driver");
   });
 
+  it("re-anchors to a replaced target while open", () => {
+    const renderWith = (tag: string) =>
+      act(() =>
+        root.render(
+          createElement(
+            MantineProvider,
+            null,
+            createElement(HoverTooltip, {
+              label: "Restart driver",
+              children: createElement(tag, { className: "target" }, "R"),
+            })
+          )
+        )
+      );
+    renderWith("button");
+    act(() => {
+      container
+        .querySelector(".target")!
+        .dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
+    });
+    renderWith("a");
+    const replaced = container.querySelector(".target")!;
+    expect(replaced.tagName).toBe("A");
+    expect(document.body.textContent).toContain("Restart driver");
+    const id = replaced.getAttribute("aria-describedby");
+    expect(document.getElementById(id!)?.textContent).toContain("Restart driver");
+  });
+
+  it("calls the child's onMouseLeave once when the fallback closes first", () => {
+    const onMouseLeave = vi.fn();
+    act(() =>
+      root.render(
+        createElement(
+          MantineProvider,
+          null,
+          createElement(
+            "div",
+            null,
+            createElement(HoverTooltip, {
+              label: "Restart driver",
+              className: "extra",
+              children: createElement("button", { onMouseLeave, className: "own" }, "R"),
+            }),
+            createElement("span", { id: "elsewhere" }, "x")
+          )
+        )
+      )
+    );
+    const button = container.querySelector("button")!;
+    expect(button.className).toBe("extra own");
+    act(() => {
+      button.dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
+    });
+    act(() => {
+      container
+        .querySelector("#elsewhere")!
+        .dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
+    });
+    expect(document.body.textContent).not.toContain("Restart driver");
+    act(() => {
+      button.dispatchEvent(
+        new MouseEvent("mouseout", { bubbles: true, relatedTarget: document.body })
+      );
+    });
+    expect(onMouseLeave).toHaveBeenCalledOnce();
+  });
+
   it("closes when the pointer leaves the window", () => {
     act(() =>
       root.render(
