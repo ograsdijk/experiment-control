@@ -98,6 +98,18 @@ class TemplateErrorTests(unittest.TestCase):
             render_templates("${1 / z}", {"z": 0})
         self.assertIn("division by zero", str(ctx.exception))
 
+    def test_templated_dict_key_is_rendered(self) -> None:
+        env = {"name": "freq_hz", "ch": "channel", "v": 2.5}
+        self.assertEqual(
+            render_templates({"${ch}": 1, "${name}": "${v}", "plain": "x"}, env),
+            {"channel": 1, "freq_hz": 2.5, "plain": "x"},
+        )
+
+    def test_templated_key_rendering_to_existing_key_is_rejected(self) -> None:
+        with self.assertRaises(TemplateError) as ctx:
+            render_templates({"channel": 1, "${name}": 2}, {"name": "channel"})
+        self.assertIn("duplicate key 'channel'", str(ctx.exception))
+
 
 class ConditionFailureTests(unittest.TestCase):
     def test_if_with_unknown_name_fails_step(self) -> None:

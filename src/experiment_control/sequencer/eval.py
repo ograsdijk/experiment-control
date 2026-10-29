@@ -362,6 +362,12 @@ def _render_container(
     items = value.items() if isinstance(value, dict) else enumerate(value)
     out: dict[Any, Any] = {}
     for key, item in items:
+        if isinstance(value, dict) and isinstance(key, str) and _TEMPLATE_RE.search(key):
+            # A templated key names a parameter chosen at run time, e.g.
+            # `params: {"${vars.target.value_param}": "${value}"}`.
+            key = str(_render_templates(key, env, depth=depth))
+            if key in out:
+                raise TemplateError(f"templated key renders to duplicate key {key!r}")
         if isinstance(item, (list, dict)):
             rendered, size = _render_container(item, env, depth=depth)
         else:

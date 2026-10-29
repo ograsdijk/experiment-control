@@ -71,6 +71,9 @@ import type { ValueContext } from "../features/sequencer/resolved_values";
 import type { SequencerLoopStatus, SequencerPlan } from "../features/sequencer/plan";
 import type { SequencerYamlCodeEditorProps } from "../features/sequencer/components/SequencerYamlCodeEditor";
 import { SequencerTimelinePane } from "./SequencerTimelinePane";
+import { notifications } from "@mantine/notifications";
+import { SequencerRunFormModal } from "./SequencerRunFormModal";
+import { parseRunForm, type ParsedRunForm } from "../features/sequencer/run_form";
 import { perfCount } from "../features/performance/perfInstrumentation";
 import { sequencerPageUrl } from "../features/sequencer/pageView";
 
@@ -215,7 +218,8 @@ type Props = {
   loadedAdaptiveIds: readonly string[];
   adaptiveClearBusyStudyId: string | null;
   onRunAction: (
-    action: "start" | "pause" | "resume" | "stop"
+    action: "start" | "pause" | "resume" | "stop",
+    formOverrides?: Record<string, unknown>
   ) => Promise<unknown> | void;
   onAdaptiveModeChange: (
     studyId: string,
@@ -358,6 +362,9 @@ export function SequencerModal({
     return () => onTimelineVisibleChange(false);
   }, [activeTab, onTimelineVisibleChange]);
   const [overridesOpen, setOverridesOpen] = useState(false);
+  // Parsed when the run form opens, not on every keystroke.
+  const [runForm, setRunForm] = useState<ParsedRunForm | null>(null);
+  const hasRunForm = /^form:/m.test(yamlText);
 
   useEffect(() => {
     if (opened) {
@@ -743,6 +750,37 @@ export function SequencerModal({
                 w={80}
               />
             )}
+            {hasRunForm && primaryAction === "start" && (
+              <Tooltip
+                label={
+                  yamlDirty || editorStale || otherSequenceLoaded
+                    ? "The editor doesn't match the loaded sequence: load it first, the form starts the loaded one"
+                    : "Choose this sequence's settings for the next start"
+                }
+                withinPortal
+                zIndex={600}
+              >
+                <Button
+                  size="xs"
+                  variant="light"
+                  color="teal"
+                  disabled={primaryDisabled || yamlDirty || editorStale || otherSequenceLoaded}
+                  onClick={() => {
+                    const parsed = parseRunForm(yamlText);
+                    if (!parsed) {
+                      notifications.show({
+                        color: "red",
+                        title: "Can't open the run form",
+                        message: "The sequence's form: block has no sections it can show.",
+                      });
+                    }
+                    setRunForm(parsed);
+                  }}
+                >
+                  Run with form…
+                </Button>
+              </Tooltip>
+            )}
             <Button
               size="xs"
               variant="light"
@@ -768,6 +806,16 @@ export function SequencerModal({
             >
               Stop
             </Button>
+            {runForm && (
+              <SequencerRunFormModal
+                opened
+                onClose={() => setRunForm(null)}
+                parsed={runForm}
+                latestSignalsByDevice={latestSignalsByDevice}
+                busy={actionBusy}
+                onStart={(overrides) => onRunAction("start", overrides)}
+              />
+            )}
           </Group>
         </Group>
 
