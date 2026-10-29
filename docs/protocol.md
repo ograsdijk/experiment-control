@@ -1081,6 +1081,14 @@ HDF storage:
   - `message`: str
   - `payload`: dict (optional)
   - `ts`: {`t_wall`, `t_mono`}
+- A successful `start` carries `payload` = {`run_id`, `active_sequence_id`,
+  `loaded_source`, `context_columns`, `vars_override`, `vars`}: the
+  overrides passed to `sequencer.start` and the vars the run starts with,
+  overrides applied and resolved against each other. A var that reads a name
+  only defined while running (a loop variable, an `assign`) keeps its
+  `${...}` text. The HDF writer stores this payload in its sequencer events,
+  so a run's overrides are on record alongside the YAML snapshot (which has
+  only the vars as written). A file opened after the run started has neither.
 
 ### `sequencer.progress`
 - Producer: sequencer (via manager event bus)

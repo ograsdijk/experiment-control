@@ -459,6 +459,34 @@ class HdfWriterSequencerTests(unittest.TestCase):
                 self.assertIsInstance(req, _CaptureSequencerYamlRequest)
                 self.assertEqual(req.run_id, 3)
 
+    def test_lifecycle_start_records_vars_override_and_vars(self) -> None:
+        # The YAML snapshot has only the vars as written; the start event row
+        # is where a run's overrides and effective vars are on record.
+        with tempfile.TemporaryDirectory() as td:
+            with h5py.File(Path(td) / "test.h5", "w") as h5:
+                writer = self._make_configured_writer(h5)
+                writer._bg_thread = threading.Thread()  # noqa: SLF001
+                writer._handle_sequencer_lifecycle(  # noqa: SLF001
+                    {
+                        "process_id": "sequencer",
+                        "event": "start",
+                        "ok": True,
+                        "payload": {
+                            "run_id": 3,
+                            "vars_override": {"n_traces": 3},
+                            "vars": {"n_traces": 3, "total_traces": 6},
+                        },
+                        "ts": {"t_wall": 1.0, "t_mono": 2.0},
+                    }
+                )
+
+                assert writer._sequencer_events_ds is not None  # noqa: SLF001
+                row = writer._sequencer_events_ds[0]  # noqa: SLF001
+                self.assertEqual(_as_text(row["event"]), "start")
+                payload = json.loads(_as_text(row["payload_json"]))["payload"]
+                self.assertEqual(payload["vars_override"], {"n_traces": 3})
+                self.assertEqual(payload["vars"], {"n_traces": 3, "total_traces": 6})
+
     def test_yaml_capture_links_snapshot_to_run_id(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             with h5py.File(Path(td) / "test.h5", "w") as h5:
