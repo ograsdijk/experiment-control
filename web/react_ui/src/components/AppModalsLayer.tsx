@@ -1,9 +1,9 @@
+import { IconPlayerPause, IconPlayerPlay } from "@tabler/icons-react";
 import { lazy, Suspense } from "react";
 import type {
   ComponentProps,
   Dispatch,
   MutableRefObject,
-  ReactNode,
   SetStateAction,
 } from "react";
 import type { GatewaySettingsInfo } from "../api";
@@ -16,7 +16,8 @@ import type { useWatchdogsController } from "../features/watchdogs/useWatchdogsC
 import type { useStateMachinesController } from "../features/state_machines/useStateMachinesController";
 import type { useProcessCommandController } from "../features/processes/useProcessCommandController";
 import type { useProcessesController } from "../features/processes/useProcessesController";
-import type { useSequencerController } from "../features/sequencer/useSequencerController";
+import { useSequencerContext } from "../features/sequencer/SequencerContext";
+import type { SequencerAdaptiveStudyStatus } from "../features/sequencer/types";
 import type { CapabilityMember, DeviceStatus, StreamCatalogEntry } from "../types";
 import type { TelemetrySignal } from "../types";
 import type { HdfMeasurementNoteModal } from "./HdfMeasurementNoteModal";
@@ -71,7 +72,6 @@ type ProcessCommandControllerState = ReturnType<typeof useProcessCommandControll
 type InterlocksControllerState = ReturnType<typeof useInterlocksController>;
 type WatchdogsControllerState = ReturnType<typeof useWatchdogsController>;
 type StateMachinesControllerState = ReturnType<typeof useStateMachinesController>;
-type SequencerControllerState = ReturnType<typeof useSequencerController>;
 type CommandHistoryControllerState = ReturnType<typeof useCommandHistoryController>;
 
 type Props = {
@@ -108,8 +108,6 @@ type Props = {
   interlocksController: InterlocksControllerState;
   watchdogsController: WatchdogsControllerState;
   stateMachinesController: StateMachinesControllerState;
-  sequencerController: SequencerControllerState;
-  sequencerPrimaryIcon: ReactNode;
   sequencerProcessId: string | null;
   colorScheme: "light" | "dark";
   commandHistoryController: CommandHistoryControllerState;
@@ -172,8 +170,6 @@ export function AppModalsLayer({
   interlocksController,
   watchdogsController,
   stateMachinesController,
-  sequencerController,
-  sequencerPrimaryIcon,
   sequencerProcessId,
   colorScheme,
   commandHistoryController,
@@ -364,101 +360,14 @@ export function AppModalsLayer({
         />
       ) : null}
 
-      {sequencerController.sequencerOpen ? (
-        <SequencerModalContainer
-          opened={sequencerController.sequencerOpen}
-        onClose={() => sequencerController.setSequencerOpen(false)}
-        processState={sequencerController.sequencerProcessState}
-        runtimeState={sequencerController.sequencerRuntimeState}
-        loaded={sequencerController.sequencerLoaded}
-        currentStep={sequencerController.sequencerStatus?.currentStep ?? null}
-        currentStepDetail={
-          sequencerController.sequencerStatus?.currentStepDetail ?? null
-        }
-        errorDetail={sequencerController.sequencerStatus?.errorDetail ?? null}
-        cleanupActive={sequencerController.sequencerStatus?.cleanupActive ?? null}
-        progress={sequencerController.sequencerProgress}
-        progressPercent={sequencerController.sequencerProgressPercent}
-        totalSteps={sequencerController.sequencerTotalSteps}
-        completedSteps={sequencerController.sequencerCompletedSteps}
-        loadedSource={sequencerController.sequencerStatus?.loadedSource ?? null}
-        editorLabel={sequencerController.sequencerEditorLabel}
-        pauseInfo={sequencerController.sequencerStatus?.pause ?? null}
-        runEvents={sequencerController.sequencerRunEvents}
-        plan={sequencerController.sequencerPlan}
-        planError={sequencerController.sequencerPlanError}
-        planOverridesInvalid={sequencerController.sequencerPlanOverridesInvalid}
-        onTimelineVisibleChange={sequencerController.setSequencerTimelineVisible}
-        loops={sequencerController.sequencerLoops}
-        autoloadError={sequencerController.sequencerStatus?.autoloadError ?? null}
-        statusError={sequencerController.sequencerStatus?.error ?? null}
-        modalError={sequencerController.sequencerModalError}
-        primaryIcon={sequencerPrimaryIcon}
-        primaryAction={sequencerController.sequencerPrimaryAction}
-        primaryLabel={sequencerController.sequencerPrimaryLabel}
-        primaryDisabled={sequencerController.sequencerPrimaryDisabled}
-        actionBusy={sequencerController.sequencerActionBusy}
-        runMode={sequencerController.sequencerRunMode}
-        repeatCount={sequencerController.sequencerRepeatCount}
-        onRunModeChange={sequencerController.setSequencerRunMode}
-        onRepeatCountChange={sequencerController.setSequencerRepeatCount}
-        libraryConfigured={sequencerController.sequencerLibraryConfigured}
-        libraryEntries={sequencerController.sequencerLibraryEntries}
-        libraryLoading={sequencerController.sequencerLibraryLoading}
-        libraryError={sequencerController.sequencerLibraryError}
-        selectedSequenceId={sequencerController.sequencerSelectedSequenceId}
-        onSelectedSequenceIdChange={
-          sequencerController.setSequencerSelectedSequenceIdForUi
-        }
-        onReloadLibrary={sequencerController.reloadSequencerLibrary}
-        overrideRows={sequencerController.sequencerOverrideRows}
-        overrideVarOptions={sequencerController.sequencerOverrideVarOptions}
-        overrideErrors={sequencerController.sequencerOverrideErrors}
-        overridePreview={sequencerController.sequencerOverridePreview}
-        overridesValid={sequencerController.sequencerOverridesValid}
-        onAddOverrideRow={sequencerController.addSequencerOverrideRow}
-        onRemoveOverrideRow={sequencerController.removeSequencerOverrideRow}
-        onUpdateOverrideRow={sequencerController.updateSequencerOverrideRow}
-        onClearOverrides={sequencerController.clearSequencerOverrides}
-        adaptiveModes={sequencerController.sequencerAdaptiveModes}
-        adaptiveStudies={sequencerController.sequencerStatus?.adaptiveStudies ?? {}}
-        loadedAdaptiveIds={sequencerController.sequencerStatus?.loadedAdaptiveIds ?? []}
-        adaptiveClearBusyStudyId={sequencerController.sequencerAdaptiveClearBusy}
-        onRunAction={sequencerController.runSequencerAction}
-        onAdaptiveModeChange={sequencerController.setAdaptiveMode}
-        onClearAdaptiveStudy={sequencerController.clearAdaptiveStudy}
-        fileInputRef={sequencerController.sequencerFileInputRef}
-        onFileInputChange={sequencerController.handleSequencerFileInput}
-        yamlViewMode={sequencerController.sequencerYamlViewMode}
-        onYamlViewModeChange={sequencerController.setSequencerYamlViewMode}
-        loadedYamlBusy={sequencerController.sequencerLoadedYamlBusy}
+      <SequencerModalSlot
         sequencerProcessId={sequencerProcessId}
-        onShowLoadedYaml={sequencerController.fetchSequencerLoadedYaml}
-        validateBusy={sequencerController.sequencerValidateBusy}
-        onValidate={sequencerController.validateSequencerYaml}
-        loadBusy={sequencerController.sequencerLoadBusy}
-        onLoad={sequencerController.loadSequencerYaml}
-        onLoadSelectedLibrary={sequencerController.loadSelectedSequencerLibrary}
-        yamlDirty={sequencerController.sequencerYamlDirty}
-        editorStale={sequencerController.sequencerEditorStale}
-        otherSequenceLoaded={sequencerController.sequencerRevisionAction === "notice"}
-        reloadSourceBusy={sequencerController.sequencerReloadBusy}
-        canReloadSource={sequencerController.sequencerCanReloadSource}
-        reloadSourceLabel={sequencerController.sequencerReloadSourceLabel}
-        onReloadLoadedSource={sequencerController.reloadSequencerLoadedSource}
-        editorRef={sequencerController.sequencerEditorRef}
-        yamlText={sequencerController.sequencerYamlText}
-        onYamlTextChange={sequencerController.onSequencerYamlTextChange}
         streamCatalog={streamCatalog}
         capabilitiesByDevice={capabilitiesByDevice}
         streamWorkspaces={streamWorkspaces}
         latestSignalsByDevice={latestSignalsByDevice}
         colorScheme={colorScheme}
-        diagnostics={sequencerController.sequencerDiagnostics}
-        valueContext={sequencerController.sequencerValueContext}
-        onJumpToDiagnostic={sequencerController.jumpToSequencerDiagnostic}
-        />
-      ) : null}
+      />
 
       {commandHistoryController.commandHistoryOpen ? (
         <CommandHistoryModalContainer
@@ -505,5 +414,137 @@ export function AppModalsLayer({
         />
       ) : null}
     </Suspense>
+  );
+}
+
+// Shared empty defaults: a new {} or [] per render would re-render the memoized sidebar.
+const NO_ADAPTIVE_STUDIES: Record<string, SequencerAdaptiveStudyStatus> = {};
+const NO_ADAPTIVE_IDS: readonly string[] = [];
+
+export type SequencerModalSlotProps = {
+  sequencerProcessId: string | null;
+  streamCatalog: StreamCatalogEntry[];
+  capabilitiesByDevice: Record<string, CapabilityMember[]>;
+  streamWorkspaces: Record<string, StreamAnalysisWorkspaceConfig>;
+  latestSignalsByDevice: Record<string, Record<string, TelemetrySignal>>;
+  colorScheme: "light" | "dark";
+  /** Render as the `?view=sequencer` page: always shown, nothing to close. */
+  page?: boolean;
+};
+
+const NOOP = () => undefined;
+// Shared elements: a new one per render would re-render the memoized modal body.
+const PAUSE_ICON = <IconPlayerPause size={14} />;
+const PLAY_ICON = <IconPlayerPlay size={14} />;
+
+/** Reads the sequencer context itself: its changes re-render only the modal. */
+export function SequencerModalSlot({
+  sequencerProcessId,
+  streamCatalog,
+  capabilitiesByDevice,
+  streamWorkspaces,
+  latestSignalsByDevice,
+  colorScheme,
+  page = false,
+}: SequencerModalSlotProps) {
+  const sequencerController = useSequencerContext();
+  if (!sequencerController.sequencerOpen) {
+    return null;
+  }
+  return (
+        <SequencerModalContainer
+          opened={sequencerController.sequencerOpen}
+        page={page}
+        onClose={page ? NOOP : () => sequencerController.setSequencerOpen(false)}
+        processState={sequencerController.sequencerProcessState}
+        runtimeState={sequencerController.sequencerRuntimeState}
+        loaded={sequencerController.sequencerLoaded}
+        currentStep={sequencerController.sequencerStatus?.currentStep ?? null}
+        currentStepDetail={
+          sequencerController.sequencerStatus?.currentStepDetail ?? null
+        }
+        errorDetail={sequencerController.sequencerStatus?.errorDetail ?? null}
+        cleanupActive={sequencerController.sequencerStatus?.cleanupActive ?? null}
+        progress={sequencerController.sequencerProgress}
+        progressPercent={sequencerController.sequencerProgressPercent}
+        totalSteps={sequencerController.sequencerTotalSteps}
+        completedSteps={sequencerController.sequencerCompletedSteps}
+        loadedSource={sequencerController.sequencerStatus?.loadedSource ?? null}
+        editorLabel={sequencerController.sequencerEditorLabel}
+        pauseInfo={sequencerController.sequencerStatus?.pause ?? null}
+        runEvents={sequencerController.sequencerRunEvents}
+        plan={sequencerController.sequencerPlan}
+        planError={sequencerController.sequencerPlanError}
+        planOverridesInvalid={sequencerController.sequencerPlanOverridesInvalid}
+        onTimelineVisibleChange={sequencerController.setSequencerTimelineVisible}
+        loops={sequencerController.sequencerLoops}
+        autoloadError={sequencerController.sequencerStatus?.autoloadError ?? null}
+        statusError={sequencerController.sequencerStatus?.error ?? null}
+        modalError={sequencerController.sequencerModalError}
+        primaryIcon={sequencerController.sequencerPrimaryAction === "pause" ? PAUSE_ICON : PLAY_ICON}
+        primaryAction={sequencerController.sequencerPrimaryAction}
+        primaryLabel={sequencerController.sequencerPrimaryLabel}
+        primaryDisabled={sequencerController.sequencerPrimaryDisabled}
+        actionBusy={sequencerController.sequencerActionBusy}
+        runMode={sequencerController.sequencerRunMode}
+        repeatCount={sequencerController.sequencerRepeatCount}
+        onRunModeChange={sequencerController.setSequencerRunMode}
+        onRepeatCountChange={sequencerController.setSequencerRepeatCount}
+        libraryConfigured={sequencerController.sequencerLibraryConfigured}
+        libraryEntries={sequencerController.sequencerLibraryEntries}
+        libraryLoading={sequencerController.sequencerLibraryLoading}
+        libraryError={sequencerController.sequencerLibraryError}
+        selectedSequenceId={sequencerController.sequencerSelectedSequenceId}
+        onSelectedSequenceIdChange={
+          sequencerController.setSequencerSelectedSequenceIdForUi
+        }
+        onReloadLibrary={sequencerController.reloadSequencerLibrary}
+        overrideRows={sequencerController.sequencerOverrideRows}
+        overrideVarOptions={sequencerController.sequencerOverrideVarOptions}
+        overrideErrors={sequencerController.sequencerOverrideErrors}
+        overridePreview={sequencerController.sequencerOverridePreview}
+        overridesValid={sequencerController.sequencerOverridesValid}
+        onAddOverrideRow={sequencerController.addSequencerOverrideRow}
+        onRemoveOverrideRow={sequencerController.removeSequencerOverrideRow}
+        onUpdateOverrideRow={sequencerController.updateSequencerOverrideRow}
+        onClearOverrides={sequencerController.clearSequencerOverrides}
+        adaptiveModes={sequencerController.sequencerAdaptiveModes}
+        adaptiveStudies={sequencerController.sequencerStatus?.adaptiveStudies ?? NO_ADAPTIVE_STUDIES}
+        loadedAdaptiveIds={sequencerController.sequencerStatus?.loadedAdaptiveIds ?? NO_ADAPTIVE_IDS}
+        adaptiveClearBusyStudyId={sequencerController.sequencerAdaptiveClearBusy}
+        onRunAction={sequencerController.runSequencerAction}
+        onAdaptiveModeChange={sequencerController.setAdaptiveMode}
+        onClearAdaptiveStudy={sequencerController.clearAdaptiveStudy}
+        fileInputRef={sequencerController.sequencerFileInputRef}
+        onFileInputChange={sequencerController.handleSequencerFileInput}
+        yamlViewMode={sequencerController.sequencerYamlViewMode}
+        onYamlViewModeChange={sequencerController.setSequencerYamlViewMode}
+        loadedYamlBusy={sequencerController.sequencerLoadedYamlBusy}
+        sequencerProcessId={sequencerProcessId}
+        onShowLoadedYaml={sequencerController.fetchSequencerLoadedYaml}
+        validateBusy={sequencerController.sequencerValidateBusy}
+        onValidate={sequencerController.validateSequencerYaml}
+        loadBusy={sequencerController.sequencerLoadBusy}
+        onLoad={sequencerController.loadSequencerYaml}
+        onLoadSelectedLibrary={sequencerController.loadSelectedSequencerLibrary}
+        yamlDirty={sequencerController.sequencerYamlDirty}
+        editorStale={sequencerController.sequencerEditorStale}
+        otherSequenceLoaded={sequencerController.sequencerRevisionAction === "notice"}
+        reloadSourceBusy={sequencerController.sequencerReloadBusy}
+        canReloadSource={sequencerController.sequencerCanReloadSource}
+        reloadSourceLabel={sequencerController.sequencerReloadSourceLabel}
+        onReloadLoadedSource={sequencerController.reloadSequencerLoadedSource}
+        editorRef={sequencerController.sequencerEditorRef}
+        yamlText={sequencerController.sequencerYamlText}
+        onYamlTextChange={sequencerController.onSequencerYamlTextChange}
+        streamCatalog={streamCatalog}
+        capabilitiesByDevice={capabilitiesByDevice}
+        streamWorkspaces={streamWorkspaces}
+        latestSignalsByDevice={latestSignalsByDevice}
+        colorScheme={colorScheme}
+        diagnostics={sequencerController.sequencerDiagnostics}
+        valueContext={sequencerController.sequencerValueContext}
+        onJumpToDiagnostic={sequencerController.jumpToSequencerDiagnostic}
+        />
   );
 }

@@ -50,10 +50,16 @@ export function buildLocalConditionDiagnostics(
   if (!yamlText.trim()) {
     return [];
   }
-  const outline = flattenSequencerStepOutline(buildSequencerStepOutline(yamlText));
+  return localConditionDiagnostics(buildSequencerStepOutline(yamlText));
+}
+
+/** The local condition checks for an outline that is already built. */
+export function localConditionDiagnostics(
+  outline: SequencerStepOutlineNode[]
+): SequencerDiagnostic[] {
   const out: SequencerDiagnostic[] = [];
 
-  for (const node of outline) {
+  for (const node of flattenSequencerStepOutline(outline)) {
     const data = conditionEntriesForNode(node);
     if (!data) {
       continue;

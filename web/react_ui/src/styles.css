@@ -1281,3 +1281,14 @@ body::before {
 .seq-tl-passbar { display: flex; gap: 2px; height: 18px; border-radius: 3px; overflow: hidden; }
 .seq-tl-passpart { min-width: 3px; background: var(--tl-fg); opacity: 0.75; }
 .seq-tl-swatch { display: inline-block; width: 12px; height: 12px; border-radius: 3px; background: var(--tl-bg); border: 1px solid var(--tl-bd); }
+
+/* `?view=sequencer`: the Sequencer modal's content as the whole page. */
+.sequencer-page {
+  height: 100dvh;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  padding: 1rem 1.5rem;
+  box-sizing: border-box;
+  overflow: hidden;
+}

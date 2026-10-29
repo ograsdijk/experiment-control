@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import type { ApiResponse } from "../../api";
 import type { ResolvedVars } from "./resolved_values";
+import { parseInWorker } from "./parse_worker_client";
 import { useSequencerYamlTools, type SequencerYamlTools } from "./useSequencerYamlTools";
 
 export const RESOLVE_VARS_DEBOUNCE_MS = 400;
@@ -22,9 +23,10 @@ export function staleReason(resp: ApiResponse<unknown> | null): string {
  * Expressions to evaluate, as the runtime sees them (YAML-decoded), and a
  * function that keys the results by the text as written in the editor.
  */
-function expressionRequest(tools: SequencerYamlTools, yamlText: string) {
+async function expressionRequest(tools: SequencerYamlTools, yamlText: string) {
   const written = tools.extractTemplateExpressions(yamlText);
-  const decoded = tools.decodedTemplates(yamlText);
+  // The YAML-decoded templates need a full parse: done in the parse worker.
+  const decoded = await parseInWorker("templates", yamlText);
   const send = Array.from(new Set(written.map((text) => decoded[text] ?? text)));
   const rekey = (resolved: ResolvedVars): ResolvedVars => {
     const expressions = { ...resolved.expressions };
@@ -80,9 +82,18 @@ export function useResolvedVars({
       return;
     }
     const requestId = ++requestIdRef.current;
-    const timer = window.setTimeout(() => {
-      // Parsed here, once typing stops, not on every keystroke.
-      const request = expressionRequest(tools, yamlText);
+    const timer = window.setTimeout(async () => {
+      // Parsed once typing stops, not on every keystroke.
+      let request: Awaited<ReturnType<typeof expressionRequest>>;
+      try {
+        request = await expressionRequest(tools, yamlText);
+      } catch {
+        // Superseded by a newer request, or the parse failed.
+        return;
+      }
+      if (requestId !== requestIdRef.current) {
+        return;
+      }
       const params: Record<string, unknown> = {
         vars_override: JSON.parse(overridesKey) as Record<string, unknown>,
         expressions: request.send,

@@ -11,3 +11,4 @@ export {
   extractVarsBlock,
 } from "./templates";
 export { buildLocalConditionDiagnostics } from "./validation";
+export { parseSequencerOutline } from "./outline_parse";

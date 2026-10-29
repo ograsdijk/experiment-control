@@ -10,6 +10,8 @@ The editor is block/tree based because sequencer execution is ordered and nested
 
 The sequencer modal has a sidebar and three full-height tabs.
 
+The same Sequencer also opens as a page of its own: the icon next to the modal's title opens the dashboard URL with `?view=sequencer` in a new tab. That page shows only the Sequencer, with no dashboard rendering behind it, so it stays responsive on a slow PC. Each tab or window has its own editor text; only what is loaded into the sequencer process is shared.
+
 Sidebar (top to bottom):
 
 1. **Sequence**: library picker, load/reload, and the name of the sequence being edited.

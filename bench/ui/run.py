@@ -27,7 +27,7 @@ from .stack import REPO_ROOT, PerfStack
 
 Json = dict[str, Any]
 RESULTS_DIR = REPO_ROOT / "bench" / "ui" / "results"
-SCENARIOS = ["steady", "load", "interactions", "soak", "clients"]
+SCENARIOS = ["steady", "load", "interactions", "sequencer", "sequencer_page", "soak", "clients"]
 
 
 def _git(*args: str) -> str:
@@ -88,7 +88,7 @@ async def _run(args: argparse.Namespace) -> Json:
     label = f"{stamp}-{args.scenario}-{args.preset}-{args.profile or 'noprofile'}"
     if args.cpu_throttle > 1:
         label += f"-x{args.cpu_throttle:g}"
-    if args.scenario in ("steady", "interactions", "soak") and args.device_panel == "collapsed":
+    if args.scenario in ("steady", "interactions", "sequencer", "sequencer_page", "soak") and args.device_panel == "collapsed":
         label += "-collapsed"
     if args.scenario == "load":
         label += f"-{args.cache}" + (f"-ext{args.external}" if args.external != "allow" else "")
@@ -139,6 +139,10 @@ async def _run(args: argparse.Namespace) -> Json:
             if args.scenario == "interactions":
                 return await sc.scenario_interactions(
                     page, warmup_s=args.warmup, repeats=args.interaction_repeats
+                )
+            if args.scenario in ("sequencer", "sequencer_page"):
+                return await sc.scenario_sequencer(
+                    page, warmup_s=args.warmup, page_view=args.scenario == "sequencer_page"
                 )
             if args.scenario == "soak":
                 cycles = args.profile_cycles.split(",") if args.profile_cycles else []

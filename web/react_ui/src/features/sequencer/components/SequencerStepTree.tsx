@@ -11,7 +11,18 @@ import {
   IconPlus,
   IconTrash,
 } from "@tabler/icons-react";
-import { useEffect, useRef } from "react";
+import {
+  createContext,
+  memo,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+  type RefObject,
+} from "react";
+import { useNearViewport } from "../../layout/useNearViewport";
 import {
   listChildInsertionTargets,
   type BasicSequencerStepTemplate,
@@ -119,7 +130,6 @@ type SiblingInfoMap = Record<
 type OutlineRowProps = {
   node: SequencerStepOutlineNode;
   depth: number;
-  selectedId: string | null;
   onSelect: (id: string) => void;
   collapsedById: Record<string, boolean>;
   onToggleCollapse: (id: string) => void;
@@ -136,9 +146,22 @@ type OutlineRowProps = {
   onMoveUp: (node: SequencerStepOutlineNode) => void;
   onMoveDown: (node: SequencerStepOutlineNode) => void;
   stepDiagnostics?: StepDiagnostics;
-  activeLeafId?: string | null;
-  activeAncestorIds?: ReadonlySet<string>;
+  /**
+   * The selected and running steps, given only to the rows on their path
+   * (null / empty elsewhere): a change re-renders those rows, not the tree.
+   */
+  selectedId: string | null;
+  selectedAncestorIds: ReadonlySet<string>;
+  activeLeafId: string | null;
+  activeAncestorIds: ReadonlySet<string>;
 };
+
+const NO_IDS: ReadonlySet<string> = new Set();
+
+/** The id when it is this node or below it, else null. */
+function idOnPath(id: string | null, nodeId: string, ancestorIds: ReadonlySet<string>): string | null {
+  return id !== null && (id === nodeId || ancestorIds.has(nodeId)) ? id : null;
+}
 
 const SEVERITY_COLOR = { error: "red", warning: "yellow", info: "gray" } as const;
 
@@ -203,10 +226,80 @@ function StepDiagnosticBadge({
   return null;
 }
 
-function OutlineRow({
+/** The step list's scroll viewport: rows build their buttons near it. */
+const StepListViewportContext = createContext<RefObject<HTMLDivElement | null> | null>(null);
+
+// Rows this far beyond the list's visible part already have their buttons,
+// so wheel scrolling does not show rows without them.
+const ROW_BUTTONS_MARGIN = "400px 0px";
+
+/** Holds a row's place while its buttons are not built: the width of `count` small icons. */
+function RowActionsPlaceholder({ count }: { count: number }) {
+  return (
+    <div
+      aria-hidden
+      style={{
+        flexShrink: 0,
+        width: `calc(${count} * 1.375rem * var(--mantine-scale) + ${(count - 1) * 4}px)`,
+      }}
+    />
+  );
+}
+
+/**
+ * A row's insert menu, built on its first click. Mantine sets a menu up as
+ * it mounts, open or not, and every row has one or two.
+ */
+function LazyMenu({
+  label,
+  icon,
+  items,
+}: {
+  label: string;
+  icon: ReactNode;
+  items: () => ReactNode;
+}) {
+  const [opened, setOpened] = useState(false);
+  const [built, setBuilt] = useState(false);
+  const button = (onClick?: () => void) => (
+    <ActionIcon
+      size="sm"
+      variant="subtle"
+      color="gray"
+      aria-label={label}
+      aria-haspopup="menu"
+      onClick={onClick}
+    >
+      {icon}
+    </ActionIcon>
+  );
+  if (!built) {
+    return button(() => {
+      setBuilt(true);
+      setOpened(true);
+    });
+  }
+  return (
+    <Menu
+      opened={opened}
+      onChange={setOpened}
+      withinPortal
+      position="bottom-end"
+      withArrow
+      shadow="md"
+      zIndex={1000}
+    >
+      <Menu.Target>{button()}</Menu.Target>
+      <Menu.Dropdown>{items()}</Menu.Dropdown>
+    </Menu>
+  );
+}
+
+const OutlineRow = memo(function OutlineRow({
   node,
   depth,
   selectedId,
+  selectedAncestorIds,
   onSelect,
   collapsedById,
   onToggleCollapse,
@@ -219,22 +312,36 @@ function OutlineRow({
   onMoveUp,
   onMoveDown,
   stepDiagnostics,
-  activeLeafId = null,
+  activeLeafId,
   activeAncestorIds,
 }: OutlineRowProps) {
   const selected = node.id === selectedId;
   const active = node.id === activeLeafId;
   // The running step is below this one (shown even while it is collapsed).
-  const activeInside = !active && Boolean(activeAncestorIds?.has(node.id));
+  const activeInside = !active && activeAncestorIds.has(node.id);
   const collapsible = node.children.length > 0;
   const collapsed = collapsible ? Boolean(collapsedById[node.id]) : false;
   const childTargets = listChildInsertionTargets(node);
   const siblingInfo = siblingInfoById[node.id] ?? { prev: null, next: null };
   const issueCount = countStepIssues(node);
+  // Only rows in or near the list's visible part build their buttons: they
+  // are most of what a row costs to build. Measured before paint too: step
+  // ids follow position, so inserting or deleting a step remounts the rows
+  // after it, which would otherwise show no buttons for a frame.
+  const rowRef = useRef<HTMLDivElement | null>(null);
+  const viewportRef = useContext(StepListViewportContext);
+  const buttonsShown = useNearViewport(
+    rowRef,
+    ROW_BUTTONS_MARGIN,
+    viewportRef ?? undefined,
+    true
+  );
+  const buttonCount = childTargets.length > 0 ? 7 : 6;
 
   return (
     <>
       <div
+        ref={rowRef}
         style={{
           display: "flex",
           alignItems: "stretch",
@@ -335,6 +442,9 @@ function OutlineRow({
             </Text>
           </Stack>
         </button>
+        {!buttonsShown ? (
+          <RowActionsPlaceholder count={buttonCount} />
+        ) : (
         <Group gap={4} wrap="nowrap" style={{ alignSelf: "center", flexShrink: 0 }}>
           <ActionIcon size="sm" variant="subtle" color="gray" aria-label="Move step up" disabled={!siblingInfo.prev} onClick={(event) => { event.stopPropagation(); onMoveUp(node); }}>
             <IconArrowUp size={14} />
@@ -342,29 +452,23 @@ function OutlineRow({
           <ActionIcon size="sm" variant="subtle" color="gray" aria-label="Move step down" disabled={!siblingInfo.next} onClick={(event) => { event.stopPropagation(); onMoveDown(node); }}>
             <IconArrowDown size={14} />
           </ActionIcon>
-          <Menu withinPortal position="bottom-end" withArrow shadow="md" zIndex={1000}>
-            <Menu.Target>
-              <ActionIcon size="sm" variant="subtle" color="gray" aria-label="Insert step below">
-                <IconPlus size={14} />
-              </ActionIcon>
-            </Menu.Target>
-            <Menu.Dropdown>
-              {STEP_TEMPLATE_OPTIONS.map((option) => (
+          <LazyMenu
+            label="Insert step below"
+            icon={<IconPlus size={14} />}
+            items={() =>
+              STEP_TEMPLATE_OPTIONS.map((option) => (
                 <Menu.Item key={`below-${option.kind}`} onClick={() => onInsertBelow(node, option.kind)}>
                   {insertLabel(option.kind, "below")}
                 </Menu.Item>
-              ))}
-            </Menu.Dropdown>
-          </Menu>
+              ))
+            }
+          />
           {childTargets.length > 0 ? (
-            <Menu withinPortal position="bottom-end" withArrow shadow="md" zIndex={1000}>
-              <Menu.Target>
-                <ActionIcon size="sm" variant="subtle" color="gray" aria-label="Insert child step">
-                  <IconArrowDownRight size={14} />
-                </ActionIcon>
-              </Menu.Target>
-              <Menu.Dropdown>
-                {childTargets.map((target) => (
+            <LazyMenu
+              label="Insert child step"
+              icon={<IconArrowDownRight size={14} />}
+              items={() =>
+                childTargets.map((target) => (
                   <Menu key={target.key} withinPortal={false} trigger="hover" position="right-start" shadow="md">
                     <Menu.Target>
                       <Menu.Item>{`Insert into ${target.label}`}</Menu.Item>
@@ -380,9 +484,9 @@ function OutlineRow({
                       ))}
                     </Menu.Dropdown>
                   </Menu>
-                ))}
-              </Menu.Dropdown>
-            </Menu>
+                ))
+              }
+            />
           ) : null}
           <ActionIcon
             size="sm"
@@ -400,6 +504,7 @@ function OutlineRow({
             <IconTrash size={14} />
           </ActionIcon>
         </Group>
+        )}
       </div>
       {!collapsed &&
         node.children.map((child) => (
@@ -407,7 +512,8 @@ function OutlineRow({
             key={child.id}
             node={child}
             depth={depth + 1}
-            selectedId={selectedId}
+            selectedId={idOnPath(selectedId, child.id, selectedAncestorIds)}
+            selectedAncestorIds={selectedId === null ? NO_IDS : selectedAncestorIds}
             onSelect={onSelect}
             collapsedById={collapsedById}
             onToggleCollapse={onToggleCollapse}
@@ -420,13 +526,13 @@ function OutlineRow({
             onMoveUp={onMoveUp}
             onMoveDown={onMoveDown}
             stepDiagnostics={stepDiagnostics}
-            activeLeafId={activeLeafId}
-            activeAncestorIds={activeAncestorIds}
+            activeLeafId={idOnPath(activeLeafId, child.id, activeAncestorIds)}
+            activeAncestorIds={activeLeafId === null ? NO_IDS : activeAncestorIds}
           />
         ))}
     </>
   );
-}
+});
 
 type Props = {
   outline: SequencerStepOutlineNode[];
@@ -480,6 +586,27 @@ export function SequencerStepTree({
   onUserScroll,
 }: Props) {
   const viewportRef = useRef<HTMLDivElement | null>(null);
+  const ancestorIds = activeAncestorIds ?? NO_IDS;
+  const parentById = useMemo(() => {
+    const out = new Map<string, string>();
+    const visit = (nodes: SequencerStepOutlineNode[], parentId: string | null) => {
+      for (const node of nodes) {
+        if (parentId !== null) {
+          out.set(node.id, parentId);
+        }
+        visit(node.children, node.id);
+      }
+    };
+    visit(outline, null);
+    return out;
+  }, [outline]);
+  const selectedAncestorIds = useMemo(() => {
+    const out = new Set<string>();
+    for (let id = selectedId ? parentById.get(selectedId) : undefined; id; id = parentById.get(id)) {
+      out.add(id);
+    }
+    return out;
+  }, [parentById, selectedId]);
 
   // After a frame, so a parent expanded for the same change is rendered.
   useEffect(() => {
@@ -550,13 +677,15 @@ export function SequencerStepTree({
             }
           }}
         >
+          <StepListViewportContext.Provider value={viewportRef}>
           <Stack gap={6}>
             {outline.map((node) => (
               <OutlineRow
                 key={node.id}
                 node={node}
                 depth={0}
-                selectedId={selectedId}
+                selectedId={idOnPath(selectedId, node.id, selectedAncestorIds)}
+                selectedAncestorIds={selectedId === null ? NO_IDS : selectedAncestorIds}
                 onSelect={onSelect}
                 collapsedById={collapsedById}
                 onToggleCollapse={onToggleCollapse}
@@ -569,11 +698,12 @@ export function SequencerStepTree({
                 onMoveUp={onMoveUp}
                 onMoveDown={onMoveDown}
                 stepDiagnostics={stepDiagnostics}
-                activeLeafId={activeLeafId}
-                activeAncestorIds={activeAncestorIds}
+                activeLeafId={idOnPath(activeLeafId, node.id, ancestorIds)}
+                activeAncestorIds={activeLeafId === null ? NO_IDS : ancestorIds}
               />
             ))}
           </Stack>
+          </StepListViewportContext.Provider>
         </ScrollArea>
       )}
     </Card>

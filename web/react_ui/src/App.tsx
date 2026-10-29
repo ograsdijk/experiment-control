@@ -33,7 +33,6 @@ import {
   IconDots,
   IconFileText,
   IconArrowsMaximize,
-  IconPlayerPause,
   IconPlayerPlay,
   IconShieldCheck,
   IconSettings,
@@ -73,6 +72,8 @@ import {
   type ExtraUiInfo,
 } from "./api";
 import { AppModalsLayer } from "./components/AppModalsLayer";
+import { SequencerPage } from "./components/SequencerPage";
+import { isSequencerPageView } from "./features/sequencer/pageView";
 import { CommandDeckPanel } from "./components/CommandDeckPanel";
 import { DashboardHeaderBar } from "./components/DashboardHeaderBar";
 import { DeviceCard } from "./components/DeviceCard";
@@ -326,7 +327,6 @@ import {
   isSequencerProcess,
   pinnedCommandKey,
   processStateColor,
-  sequencerRuntimeStateColor,
   supportsProcessCapability,
 } from "./features/runtime/helpers";
 import {
@@ -346,9 +346,12 @@ import {
   workspaceOutputOptionsByKind,
   workspaceXAxisLabel,
 } from "./features/stream/workspace";
-import { useSequencerController } from "./features/sequencer/useSequencerController";
+import {
+  SequencerProvider,
+  type SequencerApi,
+} from "./features/sequencer/SequencerContext";
 import { RingBuffer } from "./utils/ringBuffer";
-import { colorWithAlpha, traceColorAt } from "./utils/traceColors";
+import { traceColorAt } from "./utils/traceColors";
 import { copyToClipboard } from "./utils/clipboard";
 import {
   CommandDeckCommandEntry,
@@ -428,6 +431,9 @@ function isErrorSeverity(severity: unknown): boolean {
 
 // DraggableTraceChip moved to components/DraggableTraceChip.tsx
 // (round 30 — needed by PanelsGrid as well as remaining App-side uses).
+
+// Read once: the page view is chosen by the URL it was opened with.
+const SEQUENCER_PAGE_VIEW = isSequencerPageView();
 
 export function App() {
   perfCount("react.App.renders");
@@ -1683,6 +1689,9 @@ export function App() {
   }, []);
 
   useEffect(() => {
+    if (SEQUENCER_PAGE_VIEW) {
+      return; // The Sequencer page names its own tab.
+    }
     document.title = `Experiment Control ${instanceLabel}`;
   }, [instanceLabel]);
 
@@ -1984,55 +1993,14 @@ export function App() {
     );
   }, [interlocksOpen, stateMachinesController.stateMachinesOpen]);
 
-  const sequencerController = useSequencerController({
-    sequencerProcess,
-    callProcessFn: callProcess,
-    sendProcessCommand,
-    refreshProcesses,
-  });
-
-  const {
-    sequencerOpen,
-    setSequencerOpen,
-    sequencerStatus,
-    sequencerStatusLoading,
-    sequencerProcessState,
-    sequencerRuntimeState,
-    sequencerLoaded,
-    sequencerProgress,
-    sequencerProgressPercent,
-    sequencerCompletedSteps,
-    sequencerTotalSteps,
-    sequencerChipSuffix,
-    sequencerChipTooltip,
-    sequencerPrimaryAction,
-    sequencerPrimaryLabel,
-    sequencerPrimaryDisabled,
-    sequencerActionBusy,
-    sequencerValidateBusy,
-    sequencerLoadBusy,
-    sequencerLoadedYamlBusy,
-    sequencerYamlText,
-    sequencerYamlViewMode,
-    setSequencerYamlViewMode,
-    sequencerDiagnostics,
-    sequencerModalError,
-    sequencerAdaptiveModes,
-    sequencerAdaptiveClearBusy,
-    sequencerEditorRef,
-    sequencerFileInputRef,
-    onSequencerYamlTextChange,
-    refreshSequencerStatus,
-    fetchSequencerLoadedYaml,
-    openSequencerModal,
-    runSequencerAction,
-    setAdaptiveMode,
-    clearAdaptiveStudy,
-    jumpToSequencerDiagnostic,
-    handleSequencerFileInput,
-    validateSequencerYaml,
-    loadSequencerYaml,
-  } = sequencerController;
+  // The sequencer controller lives in SequencerProvider (below), so editor
+  // keystrokes and status polls do not re-render the dashboard. App only
+  // needs to ask it for a status refresh.
+  const sequencerApiRef = useRef<SequencerApi | null>(null);
+  const refreshSequencerStatus = useCallback(
+    async (processId: string) => sequencerApiRef.current?.refreshSequencerStatus(processId),
+    []
+  );
 
   const { handleProcessAction } = useProcessLifecycleController({
     processes,
@@ -2467,35 +2435,6 @@ export function App() {
       addTraceToPanel(target.id, deviceId, signal);
     },
     [panels, activePanelId, addTraceToPanel]
-  );
-
-  const sequencerChipProgressStyle = (() => {
-    const isRunning =
-      sequencerRuntimeState === "RUNNING" ||
-      sequencerRuntimeState === "STOP_REQUESTED";
-    if (!isRunning || sequencerProgressPercent === null) {
-      return undefined;
-    }
-    const pct = Math.max(0, Math.min(100, sequencerProgressPercent));
-    const fill =
-      computedColorScheme === "dark"
-        ? colorWithAlpha("#12b886", 0.52)
-        : colorWithAlpha("#12b886", 0.30);
-    return {
-      backgroundImage: `linear-gradient(90deg, ${fill} 0%, ${fill} ${pct}%, transparent ${pct}%, transparent 100%)`,
-      backgroundRepeat: "no-repeat",
-      transition: "background-image 120ms linear",
-    };
-  })();
-  const sequencerPrimaryIcon =
-    sequencerPrimaryAction === "pause" ? (
-      <IconPlayerPause size={14} />
-    ) : (
-      <IconPlayerPlay size={14} />
-    );
-  const sequencerChipColor = sequencerRuntimeStateColor(
-    sequencerRuntimeState,
-    sequencerProcessState
   );
 
   const resolvePanelGridColumns = useCallback((): number => {
@@ -3008,7 +2947,38 @@ export function App() {
     />
   );
 
+  if (SEQUENCER_PAGE_VIEW) {
+    return (
+      <SequencerProvider
+        sequencerProcess={sequencerProcess}
+        callProcessFn={callProcess}
+        sendProcessCommand={sendProcessCommand}
+        refreshProcesses={refreshProcesses}
+        colorScheme={computedColorScheme}
+        apiRef={sequencerApiRef}
+      >
+        <SequencerPage
+          instanceLabel={instanceLabel}
+          sequencerProcessId={sequencerProcess?.process_id ?? null}
+          streamCatalog={streamCatalog}
+          capabilitiesByDevice={capabilitiesByDevice}
+          streamWorkspaces={streamWorkspaces}
+          latestSignalsByDevice={latestByDevice}
+          colorScheme={computedColorScheme}
+        />
+      </SequencerProvider>
+    );
+  }
+
   return (
+    <SequencerProvider
+      sequencerProcess={sequencerProcess}
+      callProcessFn={callProcess}
+      sendProcessCommand={sendProcessCommand}
+      refreshProcesses={refreshProcesses}
+      colorScheme={computedColorScheme}
+      apiRef={sequencerApiRef}
+    >
     <DndContext
       sensors={dndSensors}
       onDragStart={handleUiDragStart}
@@ -3046,21 +3016,6 @@ export function App() {
         influxWriterTitle={influxWriterStatus?.error ?? "Open Influx writer status"}
         influxWriterLabel={influxChipLabel}
         showSequencer={Boolean(sequencerProcess)}
-        sequencerChipColor={sequencerChipColor}
-        sequencerStatusLoading={sequencerStatusLoading}
-        onOpenSequencer={openSequencerModal}
-        sequencerStatusError={sequencerStatus?.error ?? null}
-        sequencerChipTooltip={sequencerChipTooltip}
-        sequencerRuntimeState={sequencerRuntimeState}
-        sequencerChipSuffix={sequencerChipSuffix}
-        sequencerChipProgressStyle={sequencerChipProgressStyle}
-        sequencerPrimaryAction={sequencerPrimaryAction}
-        sequencerPrimaryLabel={sequencerPrimaryLabel}
-        sequencerPrimaryDisabled={sequencerPrimaryDisabled}
-        sequencerActionBusy={sequencerActionBusy}
-        sequencerPrimaryIcon={sequencerPrimaryIcon}
-        onRunSequencerPrimaryAction={() => runSequencerAction(sequencerPrimaryAction)}
-        sequencerLoaded={sequencerLoaded}
         onOpenDeviceOverview={() => setDeviceOverviewOpened(true)}
         deviceIssueCount={deviceListView.summary.issues}
         deviceFailedCount={deviceListView.summary.failed}
@@ -3741,8 +3696,6 @@ export function App() {
         interlocksController={interlocksController}
         watchdogsController={watchdogsController}
         stateMachinesController={stateMachinesController}
-        sequencerController={sequencerController}
-        sequencerPrimaryIcon={sequencerPrimaryIcon}
         sequencerProcessId={sequencerProcess?.process_id ?? null}
         colorScheme={computedColorScheme}
         commandHistoryController={commandHistoryController}
@@ -3774,6 +3727,7 @@ export function App() {
         />
       </AppShell>
     </DndContext>
+    </SequencerProvider>
   );
 }
 

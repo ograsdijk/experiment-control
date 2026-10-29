@@ -14,6 +14,7 @@ import CodeMirror from "@uiw/react-codemirror";
 import { tags } from "@lezer/highlight";
 import {
   forwardRef,
+  useCallback,
   useEffect,
   useImperativeHandle,
   useMemo,
@@ -51,6 +52,16 @@ export type SequencerYamlCodeEditorProps = {
 };
 
 const SCROLL_KEYS = new Set(["PageUp", "PageDown"]);
+
+// One object for the module: react-codemirror reconfigures the whole editor
+// (every extension, a full re-parse) whenever this prop changes identity.
+const BASIC_SETUP = {
+  lineNumbers: true,
+  highlightActiveLine: true,
+  highlightActiveLineGutter: true,
+  foldGutter: true,
+  indentOnInput: true,
+};
 
 /**
  * Editor marks for diagnostics that point at the current text. Stale ones
@@ -233,12 +244,38 @@ function SequencerYamlCodeEditorImpl(
     [isDark, numberDecorator, readOnly, templateDecorator]
   );
 
+  // Marks are set again when the diagnostics change, the text is replaced
+  // (a load) or the extensions are rebuilt (they start without marks), not on
+  // every keystroke: the editor moves the existing marks with the user's edits.
+  const diagnosticsKey = JSON.stringify(diagnostics);
+  const diagnosticsRef = useRef(diagnostics);
+  diagnosticsRef.current = diagnostics;
+  const typedValueRef = useRef<string | null>(null);
+  const appliedRef = useRef<{ key: string; extensions: unknown } | null>(null);
+  const handleChange = useCallback(
+    (next: string) => {
+      typedValueRef.current = next;
+      onChange(next);
+    },
+    [onChange]
+  );
   useEffect(() => {
     if (!view) {
       return;
     }
-    view.dispatch(setDiagnostics(view.state, toEditorDiagnostics(view.state.doc, diagnostics)));
-  }, [view, diagnostics, value]);
+    const applied = appliedRef.current;
+    if (
+      applied?.key === diagnosticsKey &&
+      applied.extensions === extensions &&
+      value === typedValueRef.current
+    ) {
+      return;
+    }
+    appliedRef.current = { key: diagnosticsKey, extensions };
+    view.dispatch(
+      setDiagnostics(view.state, toEditorDiagnostics(view.state.doc, diagnosticsRef.current))
+    );
+  }, [view, diagnosticsKey, value, extensions]);
 
   // Only dispatch when the range actually changes; the editor is not rebuilt.
   const activeKey = activeRangeKey(activeStep);
@@ -341,18 +378,12 @@ function SequencerYamlCodeEditorImpl(
         style={{ flex: 1, minHeight: 0 }}
         theme="none"
         extensions={extensions}
-        onChange={onChange}
+        onChange={handleChange}
         onCreateEditor={(created) => {
           editorViewRef.current = created;
           setView(created);
         }}
-        basicSetup={{
-          lineNumbers: true,
-          highlightActiveLine: true,
-          highlightActiveLineGutter: true,
-          foldGutter: true,
-          indentOnInput: true,
-        }}
+        basicSetup={BASIC_SETUP}
       />
     </div>
   );

@@ -34,7 +34,8 @@ manager ports beginning at 6400, 6420, 6440, or 6460. The gateway defaults to 80
 Pass `--ui-processes` to `run_performance_test.py` (or `generate_instance.py`) to
 also run a sequencer and an idle HDF writer. That makes the Sequencer and HDF
 modals reachable. The sequencer autoloads a generated ~900-line benchmark
-sequence that only reads device metadata and sleeps. Leave the flag off when
+sequence that only reads device metadata and sleeps, and has a library of 24
+smaller ones (`sequences/bench_scan_*.yaml`) for searching and switching files. Leave the flag off when
 comparing with earlier measurements, since the extra processes add load.
 
 The gateway launcher disables WebSocket permessage-deflate by default (see

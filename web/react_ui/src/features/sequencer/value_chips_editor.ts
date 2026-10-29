@@ -107,6 +107,22 @@ export function varDefinitionLines(doc: CmText): Map<number, string> {
   return out;
 }
 
+// Chips by template text, per value context: a keystroke rebuilds the
+// decorations but describes each template only once per context.
+const templateChipCache = new WeakMap<ValueContext, Map<string, ValueChip | null>>();
+
+function cachedTemplateChip(text: string, inner: string, ctx: ValueContext): ValueChip | null {
+  let chips = templateChipCache.get(ctx);
+  if (!chips) {
+    chips = new Map();
+    templateChipCache.set(ctx, chips);
+  }
+  if (!chips.has(text)) {
+    chips.set(text, describeTemplate(text, inner, ctx));
+  }
+  return chips.get(text) ?? null;
+}
+
 function buildDecorations(view: EditorView, defs: Map<number, string>): DecorationSet {
   const ctx = view.state.field(valueContextField);
   if (!ctx?.resolved) {
@@ -141,7 +157,7 @@ function buildDecorations(view: EditorView, defs: Map<number, string>): Decorati
       if (defs.has(doc.lineAt(start).number)) {
         continue;
       }
-      const chip = describeTemplate(match[0], match[1], ctx);
+      const chip = cachedTemplateChip(match[0], match[1], ctx);
       if (chip) {
         // A template that is the whole quoted value ("${x}"): the chip goes
         // after the closing quote, if that quote ends the value (then comes

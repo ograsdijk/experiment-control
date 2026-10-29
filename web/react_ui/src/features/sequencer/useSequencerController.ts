@@ -42,10 +42,7 @@ import {
 } from "./utils";
 import type { SequencerPercentHold } from "./utils";
 import { mergeDiagnostics } from "./diagnostics_merge";
-import {
-  loadSequencerYamlTools,
-  useSequencerYamlTools,
-} from "./useSequencerYamlTools";
+import { loadSequencerYamlTools } from "./useSequencerYamlTools";
 
 /** sequencer.status refresh while a run is active: modal open vs closed. */
 export const SEQUENCER_STATUS_POLL_OPEN_MS = 1500;
@@ -275,6 +272,10 @@ export function useSequencerController({
   const [sequencerLoadedYamlBusy, setSequencerLoadedYamlBusy] = useState(false);
   const [sequencerYamlText, setSequencerYamlText] = useState("");
   const [sequencerYamlDirty, setSequencerYamlDirty] = useState(false);
+  // The editor text for callbacks: reading it here keeps them stable while
+  // the operator types, so memoized parts of the modal do not re-render.
+  const sequencerYamlTextRef = useRef(sequencerYamlText);
+  sequencerYamlTextRef.current = sequencerYamlText;
   // Backend load revision the editor text was fetched at (null: unknown).
   const [sequencerEditorRevision, setSequencerEditorRevision] = useState<number | null>(null);
   const sequencerYamlDirtyRef = useRef(false);
@@ -810,12 +811,14 @@ export function useSequencerController({
     setSequencerOpen(true);
     setSequencerYamlViewMode("preview");
     setSequencerModalError(null);
-    await refreshSequencerStatus(sequencerProcess.process_id);
-    await fetchSequencerLoadedYaml(sequencerProcess.process_id, {
-      applyToEditor: true,
-      silent: true,
-    });
-    await refreshSequencerLibrary(sequencerProcess.process_id, { silent: true });
+    await Promise.all([
+      refreshSequencerStatus(sequencerProcess.process_id),
+      fetchSequencerLoadedYaml(sequencerProcess.process_id, {
+        applyToEditor: true,
+        silent: true,
+      }),
+      refreshSequencerLibrary(sequencerProcess.process_id, { silent: true }),
+    ]);
   }, [
     fetchSequencerLoadedYaml,
     refreshSequencerLibrary,
@@ -1206,7 +1209,7 @@ export function useSequencerController({
   const jumpToSequencerDiagnostic = useCallback(
     (line: number | null, column: number | null) => {
       const jumpPlan = computeSequencerDiagnosticJumpPlan(
-        sequencerYamlText,
+        sequencerYamlTextRef.current,
         sequencerYamlViewMode,
         line,
         column
@@ -1232,7 +1235,7 @@ export function useSequencerController({
       }
       focusEditorAtLine();
     },
-    [sequencerYamlText, sequencerYamlViewMode]
+    [sequencerYamlViewMode]
   );
 
   const handleSequencerFileInput = useCallback(
@@ -1271,6 +1274,8 @@ export function useSequencerController({
     if (!sequencerProcess || sequencerValidateBusy) {
       return;
     }
+    // The text that is checked: the diagnostics belong to it, not to later edits.
+    const text = sequencerYamlTextRef.current;
     setSequencerValidateBusy(true);
     setSequencerModalError(null);
     try {
@@ -1278,7 +1283,7 @@ export function useSequencerController({
         sequencerProcess.process_id,
         "sequencer.preflight",
         {
-          text: sequencerYamlText,
+          text,
         },
         "sequencer-preflight"
       );
@@ -1303,9 +1308,9 @@ export function useSequencerController({
           : null;
       const processDiagnostics = normalizeSequencerDiagnostics(result?.diagnostics);
       const { buildLocalConditionDiagnostics } = await loadSequencerYamlTools();
-      const localDiagnostics = buildLocalConditionDiagnostics(sequencerYamlText);
+      const localDiagnostics = buildLocalConditionDiagnostics(text);
       const diagnostics = mergeDiagnostics(processDiagnostics, localDiagnostics);
-      setSequencerDiagnostics(processDiagnostics, sequencerYamlText);
+      setSequencerDiagnostics(processDiagnostics, text);
       const errorCount = diagnostics.filter(
         (item) => item.severity === "error"
       ).length;
@@ -1329,20 +1334,20 @@ export function useSequencerController({
     sendProcessCommand,
     sequencerProcess,
     sequencerValidateBusy,
-    sequencerYamlText,
   ]);
 
   const loadSequencerYamlFrom = useCallback(async (loadSource: SequencerLoadSource) => {
     if (!sequencerProcess || sequencerLoadBusy) {
       return;
     }
+    const text = sequencerYamlTextRef.current;
     setSequencerLoadBusy(true);
     setSequencerModalError(null);
     try {
       const loadRequest = buildSequencerLoadRequest(
         loadSource,
         sequencerSelectedSequenceId,
-        sequencerYamlText
+        text
       );
       const resp = await sendProcessCommand(
         sequencerProcess.process_id,
@@ -1358,7 +1363,7 @@ export function useSequencerController({
         );
         setSequencerDiagnostics(
           diagnostics,
-          loadSource === "editor" ? sequencerYamlText : null
+          loadSource === "editor" ? text : null
         );
         notifications.show({
           color: "red",
@@ -1376,12 +1381,16 @@ export function useSequencerController({
       setSequencerLoadSource(
         loadRequest.action === "sequencer.library.load" ? "library" : "editor"
       );
-      await refreshSequencerStatus(sequencerProcess.process_id);
-      await fetchSequencerLoadedYaml(sequencerProcess.process_id, {
-        applyToEditor: true,
-        silent: true,
-      });
-      await refreshProcesses();
+      // Independent reads: together, not one after the other.
+      await Promise.all([
+        refreshSequencerStatus(sequencerProcess.process_id),
+        fetchSequencerLoadedYaml(sequencerProcess.process_id, {
+          applyToEditor: true,
+          silent: true,
+        }),
+      ]);
+      // The process list only feeds the dashboard: the load is done without it.
+      void Promise.resolve(refreshProcesses()).catch(() => undefined);
     } finally {
       setSequencerLoadBusy(false);
     }
@@ -1393,7 +1402,6 @@ export function useSequencerController({
     sequencerLoadBusy,
     sequencerProcess,
     sequencerSelectedSequenceId,
-    sequencerYamlText,
   ]);
 
   const loadSequencerYaml = useCallback(
@@ -1523,18 +1531,6 @@ export function useSequencerController({
     []
   );
 
-  // The YAML helpers (and the yaml package) load with the modal, not with the
-  // header: editor text only arrives through the modal.
-  const sequencerYamlTools = useSequencerYamlTools(
-    sequencerOpen || sequencerYamlText !== ""
-  );
-  const sequencerLocalDiagnostics = useMemo(
-    () =>
-      sequencerYamlTools
-        ? sequencerYamlTools.buildLocalConditionDiagnostics(sequencerYamlText)
-        : [],
-    [sequencerYamlTools, sequencerYamlText]
-  );
   // Run events are shown only in the Sequencer modal; while it is closed the
   // hook is idle (a null id) instead of refetching on every status seq.
   const sequencerRunEventsProcessId =
@@ -1548,14 +1544,16 @@ export function useSequencerController({
     callProcessFn
   );
 
-  const sequencerCombinedDiagnostics = useMemo(() => {
-    const stale = sequencerDiagnosticsState.text !== sequencerYamlText;
-    const validator = sequencerDiagnosticsState.items.map((item) =>
-      stale ? { ...item, stale: true } : item
-    );
-    // Local condition checks are recomputed from the current text: never stale.
-    return mergeDiagnostics(validator, sequencerLocalDiagnostics);
-  }, [sequencerDiagnosticsState, sequencerLocalDiagnostics, sequencerYamlText]);
+  // Validator diagnostics, marked stale once the text changes. The modal adds
+  // the local condition checks from its own (deferred) parse of the text.
+  const sequencerValidatorStale = sequencerDiagnosticsState.text !== sequencerYamlText;
+  const sequencerValidatorDiagnostics = useMemo(
+    () =>
+      sequencerDiagnosticsState.items.map((item) =>
+        sequencerValidatorStale ? { ...item, stale: true } : item
+      ),
+    [sequencerDiagnosticsState, sequencerValidatorStale]
+  );
 
   const sequencerStatus = sequencerProcess
     ? sequencerStatusByProcessId[sequencerProcess.process_id]
@@ -1824,7 +1822,7 @@ export function useSequencerController({
     sequencerYamlText,
     sequencerYamlViewMode,
     setSequencerYamlViewMode,
-    sequencerDiagnostics: sequencerCombinedDiagnostics,
+    sequencerDiagnostics: sequencerValidatorDiagnostics,
     sequencerValueContext,
     sequencerEditorLabel,
     sequencerRunEvents,
