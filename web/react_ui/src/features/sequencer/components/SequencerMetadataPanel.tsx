@@ -1,5 +1,6 @@
 import { ActionIcon, Badge, Card, Group, ScrollArea, Stack, Text } from "@mantine/core";
 import { IconChevronDown, IconChevronRight } from "@tabler/icons-react";
+import { memo } from "react";
 import { applyEditedContextColumns, applyEditedVars } from "../editing";
 import {
   countContextColumnIssues,
@@ -12,17 +13,19 @@ type Props = {
   metadata: SequencerOutlineMetadata;
   metadataCollapsed: boolean;
   onToggleCollapsed: () => void;
-  yamlText: string;
+  /** The editor's current text, read when an edit is applied. */
+  getYamlText: () => string;
   onYamlTextChange: (value: string) => void;
   /** Fill the parent (a tab) instead of a capped, collapsible card. */
   fill?: boolean;
 };
 
-export function SequencerMetadataPanel({
+/** Memoized: it reads the text only to apply an edit, so typing does not re-render it. */
+export const SequencerMetadataPanel = memo(function SequencerMetadataPanel({
   metadata,
   metadataCollapsed,
   onToggleCollapsed,
-  yamlText,
+  getYamlText,
   onYamlTextChange,
   fill = false,
 }: Props) {
@@ -103,7 +106,7 @@ export function SequencerMetadataPanel({
               issueText={
                 varsIssueCount > 0 ? "Variable names must be unique and non-empty." : null
               }
-              onChange={(entries) => onYamlTextChange(applyEditedVars(yamlText, entries))}
+              onChange={(entries) => onYamlTextChange(applyEditedVars(getYamlText(), entries))}
             />
             <SequencerVarsEditor
               title="Context columns"
@@ -127,7 +130,7 @@ export function SequencerMetadataPanel({
                   : null
               }
               onChange={(entries) =>
-                onYamlTextChange(applyEditedContextColumns(yamlText, entries))
+                onYamlTextChange(applyEditedContextColumns(getYamlText(), entries))
               }
             />
             </div>
@@ -136,4 +139,4 @@ export function SequencerMetadataPanel({
       </Stack>
     </Card>
   );
-}
+});

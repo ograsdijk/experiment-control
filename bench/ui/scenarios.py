@@ -515,6 +515,7 @@ async def _type_measured(page: Page, text: str) -> Json:
 
 async def _focus_editor_mid_line(page: Page) -> None:
     """Put the caret at the end of a line in the middle of the visible YAML."""
+    await page.wait_for(f"!!{CM_CONTENT}", timeout=10)
     pos = await page.evaluate(
         f"""(() => {{ const lines = [...{CM_CONTENT}.querySelectorAll('.cm-line')];
         const r = lines[Math.floor(lines.length / 2)].getBoundingClientRect();

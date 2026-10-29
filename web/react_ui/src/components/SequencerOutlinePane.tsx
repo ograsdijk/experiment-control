@@ -1,5 +1,5 @@
 import { Card, Stack, Text } from "@mantine/core";
-import { useEffect, useMemo, useState } from "react";
+import { memo, useEffect, useMemo, useState } from "react";
 import type { ActiveStep } from "../features/sequencer/active_step";
 import { flattenSequencerStepOutline } from "../features/sequencer/outline";
 import type { ParsedSequencerOutline } from "../features/sequencer/useSequencerOutline";
@@ -32,8 +32,9 @@ import type { StreamCatalogEntry } from "../types";
 import type { TelemetrySignal } from "../types";
 
 type Props = {
-  yamlText: string;
-  /** The modal's shared (deferred) parse of `yamlText`. */
+  /** The editor's current text, read when an edit is applied. */
+  getYamlText: () => string;
+  /** The modal's shared (deferred) parse of the editor text. */
   parsedOutline: ParsedSequencerOutline;
   onYamlTextChange: (value: string) => void;
   streamCatalog: StreamCatalogEntry[];
@@ -75,8 +76,12 @@ function buildSiblingInfoMap(
   return out;
 }
 
-export function SequencerOutlinePane({
-  yamlText,
+/**
+ * Memoized: it renders from the deferred parse, so typing in the YAML editor
+ * re-renders it once per parse rather than on every keystroke.
+ */
+export const SequencerOutlinePane = memo(function SequencerOutlinePane({
+  getYamlText,
   parsedOutline,
   onYamlTextChange: onYamlTextChangeProp,
   streamCatalog,
@@ -91,11 +96,12 @@ export function SequencerOutlinePane({
   onUserScroll,
 }: Props) {
   // Step edits use the outline's line ranges, which only fit the text they
-  // were parsed from. Right after a change the parse can trail the text for a
-  // render; an edit made in that window is dropped rather than misapplied.
-  const outlineCurrent = parsedOutline.text === yamlText;
+  // were parsed from: edits apply to that text. Right after a change the parse
+  // can trail the editor; an edit made in that window is dropped rather than
+  // applied at stale lines.
+  const yamlText = parsedOutline.text;
   const onYamlTextChange = (value: string) => {
-    if (outlineCurrent) {
+    if (getYamlText() === yamlText) {
       onYamlTextChangeProp(value);
     }
   };
@@ -392,4 +398,4 @@ export function SequencerOutlinePane({
       </div>
     </Stack>
   );
-}
+});

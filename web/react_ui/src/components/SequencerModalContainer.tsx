@@ -1,4 +1,4 @@
-import type { ChangeEvent, ReactNode, RefObject } from "react";
+import { useCallback, type ChangeEvent, type ReactNode, type RefObject } from "react";
 import type {
   SequencerAdaptiveStudyStatus,
   SequencerDiagnostic,
@@ -142,18 +142,20 @@ export function SequencerModalContainer({
   onShowLoadedYaml,
   ...props
 }: Props) {
+  // Stable, so the memoized sidebar does not re-render on every keystroke.
+  const showLoadedYaml = useCallback(async () => {
+    if (!sequencerProcessId) {
+      return;
+    }
+    await onShowLoadedYaml(sequencerProcessId, {
+      applyToEditor: true,
+    });
+  }, [onShowLoadedYaml, sequencerProcessId]);
   return (
     <SequencerModal
       {...props}
       hasSequencerProcess={Boolean(sequencerProcessId)}
-      onShowLoadedYaml={async () => {
-        if (!sequencerProcessId) {
-          return;
-        }
-        await onShowLoadedYaml(sequencerProcessId, {
-          applyToEditor: true,
-        });
-      }}
+      onShowLoadedYaml={showLoadedYaml}
     />
   );
 }

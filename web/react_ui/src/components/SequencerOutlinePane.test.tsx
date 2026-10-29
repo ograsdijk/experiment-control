@@ -60,7 +60,7 @@ async function render(follow: boolean, withActive = true) {
         MantineProvider,
         null,
         createElement(SequencerOutlinePane, {
-          yamlText: YAML,
+          getYamlText: () => YAML,
           parsedOutline: parseSequencerOutline(YAML),
           onYamlTextChange: () => undefined,
           streamCatalog: [],

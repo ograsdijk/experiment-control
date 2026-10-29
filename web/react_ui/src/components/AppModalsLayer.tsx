@@ -17,6 +17,7 @@ import type { useStateMachinesController } from "../features/state_machines/useS
 import type { useProcessCommandController } from "../features/processes/useProcessCommandController";
 import type { useProcessesController } from "../features/processes/useProcessesController";
 import { useSequencerContext } from "../features/sequencer/SequencerContext";
+import type { SequencerAdaptiveStudyStatus } from "../features/sequencer/types";
 import type { CapabilityMember, DeviceStatus, StreamCatalogEntry } from "../types";
 import type { TelemetrySignal } from "../types";
 import type { HdfMeasurementNoteModal } from "./HdfMeasurementNoteModal";
@@ -416,6 +417,10 @@ export function AppModalsLayer({
   );
 }
 
+// Shared empty defaults: a new {} or [] per render would re-render the memoized sidebar.
+const NO_ADAPTIVE_STUDIES: Record<string, SequencerAdaptiveStudyStatus> = {};
+const NO_ADAPTIVE_IDS: readonly string[] = [];
+
 type SequencerModalSlotProps = {
   sequencerProcessId: string | null;
   streamCatalog: StreamCatalogEntry[];
@@ -501,8 +506,8 @@ function SequencerModalSlot({
         onUpdateOverrideRow={sequencerController.updateSequencerOverrideRow}
         onClearOverrides={sequencerController.clearSequencerOverrides}
         adaptiveModes={sequencerController.sequencerAdaptiveModes}
-        adaptiveStudies={sequencerController.sequencerStatus?.adaptiveStudies ?? {}}
-        loadedAdaptiveIds={sequencerController.sequencerStatus?.loadedAdaptiveIds ?? []}
+        adaptiveStudies={sequencerController.sequencerStatus?.adaptiveStudies ?? NO_ADAPTIVE_STUDIES}
+        loadedAdaptiveIds={sequencerController.sequencerStatus?.loadedAdaptiveIds ?? NO_ADAPTIVE_IDS}
         adaptiveClearBusyStudyId={sequencerController.sequencerAdaptiveClearBusy}
         onRunAction={sequencerController.runSequencerAction}
         onAdaptiveModeChange={sequencerController.setAdaptiveMode}
