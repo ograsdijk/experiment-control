@@ -9,6 +9,7 @@ from ..types import EXTRACTOR_KINDS, is_extractor_kind
 from ..utils.yaml_helpers import load_yaml_text
 from .eval import unknown_key_message
 from .ranges import validate_gen_keys
+from .run_form import validate_run_form
 
 @dataclass(frozen=True)
 class SequenceSpec:
@@ -19,6 +20,8 @@ class SequenceSpec:
     context_columns: dict[str, str] | None = None
     watchdog_ids: list[str] | None = None
     require_hdf_writing: bool = False
+    # The Sequencer UI's run form; never read while running (run_form.py).
+    form: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -235,7 +238,7 @@ _STEP_INNER_KEYS: dict[str, tuple[str, ...]] = {
     ),
 }
 _REDUCE_KEYS = ("method", "window_s", "max_samples")
-_TOP_LEVEL_KEYS = ("version", "meta", "vars", "context_columns", "requires", "steps")
+_TOP_LEVEL_KEYS = ("version", "meta", "vars", "context_columns", "requires", "form", "steps")
 
 
 def _check_keys(
@@ -713,6 +716,8 @@ def parse_sequence(raw: Any) -> SequenceSpec:
         seen_ids.add(adaptive_id)
     watchdog_ids = _normalize_watchdog_ids(watchdog_ids_raw)
     steps = _apply_watchdog_gate(steps, watchdog_ids)
+    form_raw = obj.get("form")
+    form = validate_run_form(form_raw, vars_raw) if form_raw is not None else None
     return SequenceSpec(
         version=version,
         meta=meta,
@@ -721,6 +726,7 @@ def parse_sequence(raw: Any) -> SequenceSpec:
         context_columns=context_columns,
         watchdog_ids=watchdog_ids,
         require_hdf_writing=require_hdf_writing,
+        form=form,
     )
 
 

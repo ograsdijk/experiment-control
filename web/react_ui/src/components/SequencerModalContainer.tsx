@@ -93,7 +93,8 @@ type Props = {
   loadedAdaptiveIds: readonly string[];
   adaptiveClearBusyStudyId: string | null;
   onRunAction: (
-    action: "start" | "pause" | "resume" | "stop"
+    action: "start" | "pause" | "resume" | "stop",
+    formOverrides?: Record<string, unknown>
   ) => Promise<unknown> | void;
   onAdaptiveModeChange: (
     studyId: string,

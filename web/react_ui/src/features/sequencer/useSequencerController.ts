@@ -1116,9 +1116,11 @@ export function useSequencerController({
   }, [sequencerOverrideRows, sequencerOverrideVarOptions]);
 
   const runSequencerAction = useCallback(
-    async (action: SequencerAction) => {
+    // `formOverrides` come from the run form; they win over the override rows.
+    // Resolves true when the sequencer accepted the action.
+    async (action: SequencerAction, formOverrides?: Record<string, unknown>) => {
       if (!sequencerProcess || sequencerActionBusy) {
-        return;
+        return false;
       }
       const processId = sequencerProcess.process_id;
       setSequencerActionBusy(true);
@@ -1132,7 +1134,7 @@ export function useSequencerController({
             title: "Invalid run overrides",
             message,
           });
-          return;
+          return false;
         }
         const loadedAdaptiveIds =
           sequencerStatusByProcessIdRef.current[processId]?.loadedAdaptiveIds ?? [];
@@ -1154,7 +1156,7 @@ export function useSequencerController({
                 adaptiveParams,
                 sequencerRunMode,
                 sequencerRepeatCount,
-                sequencerOverrideEvaluation.payload
+                { ...sequencerOverrideEvaluation.payload, ...formOverrides }
               )
             : {};
         const resp = await sendProcessCommand(
@@ -1173,7 +1175,7 @@ export function useSequencerController({
             title: `Sequencer ${action} failed`,
             message,
           });
-          return;
+          return false;
         }
         notifications.show({
           color: "teal",
@@ -1185,6 +1187,7 @@ export function useSequencerController({
           await refreshSequencerLibrary(processId, { silent: true });
         }
         await refreshProcesses();
+        return true;
       } finally {
         setSequencerActionBusy(false);
       }

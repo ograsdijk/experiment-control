@@ -20,6 +20,7 @@ meta: {}            # optional
 vars: {}            # optional
 context_columns: {} # optional (see below)
 requires: {}        # optional (see below)
+form: {}            # optional: the UI's run form (docs/sequencer_run_form.md)
 steps: []           # required
 ```
 
@@ -161,7 +162,9 @@ Notes:
 - Use exactly one of `device` or `process`.
 - `device`, `process`, `action`, and `params` are rendered as templates at runtime,
   so generic sequences can use targets such as `device: ${synth_device}` and
-  `action: ${set_frequency_action}`.
+  `action: ${set_frequency_action}`. Parameter names may be templates too
+  (`params: {"${vars.target.value_param}": "${value}"}`); a name that renders
+  to one already in the same mapping is an error.
 - `save_as` stores the full response envelope in a variable.
 - `extract` and `assign` are mutually exclusive.
 - `extract` pulls a single value from `resp.result`.
