@@ -13,6 +13,15 @@ budget deliberately, never to make a regression pass.
 `--full` adds the wheel build and the Windows lifecycle smoke test, and always runs
 the UI steps. `--list` shows the steps; `--install-hook` adds an opt-in pre-push hook
 (quick mode). Add or change CI checks in the script, not in the workflow.
+Locally the selected jobs (python, ui) run side by side, each step's output printed
+when it ends; a UI-touching quick run takes about 1.5 min. `--serial` runs them one
+after another with live output, e.g. to rule out CPU contention when a
+timing-sensitive test fails.
+
+UI tests run under jsdom with `web/react_ui/src/test_setup.ts`. It answers
+Floating UI's top-layer checks (`:modal`, `:popover-open`) directly, because
+jsdom's selector engine took ~80 s per open Mantine Tooltip/Select/Popover on
+them. Keep it if you touch the vitest config.
 
 The individual commands:
 

@@ -7,36 +7,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { parseRunForm } from "../features/sequencer/run_form";
 import { SequencerRunFormModal } from "./SequencerRunFormModal";
 
-// Mantine's Select takes ~30 s to render under jsdom (its floating combobox);
-// a native select keeps the test fast and still shows the chosen label.
-vi.mock("@mantine/core", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("@mantine/core")>();
-  const { createElement: h } = await import("react");
-  type Item = { value: string; label: string };
-  type Group = { group: string; items: Item[] };
-  return {
-    ...actual,
-    Select: (props: {
-      label?: string;
-      data: (Item | Group)[];
-      value: string | null;
-      onChange: (value: string | null) => void;
-    }) => {
-      const items = props.data.flatMap((item) => ("items" in item ? item.items : [item]));
-      return h(
-        "label",
-        null,
-        props.label,
-        h(
-          "select",
-          { value: props.value ?? "", onChange: (e: { target: { value: string } }) => props.onChange(e.target.value) },
-          items.map((item) => h("option", { key: item.value, value: item.value }, item.label))
-        )
-      );
-    },
-  };
-});
-
 vi.mock("../api", () => ({
   callDevice: vi.fn(async () => ({ ok: true, result: { profiles: [{ name: "profile_a" }] } })),
   fetchCapabilities: vi.fn(async () => []),
