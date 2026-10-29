@@ -317,5 +317,39 @@ class LoadedRevisionTests(unittest.TestCase):
         self.assertEqual(self._revisions(process), (1, 1))
 
 
+_VARS_YAML = (
+    "version: 1\n"
+    "vars:\n"
+    "  n_traces: 10\n"
+    "  total_traces: \"${n_traces * 2}\"\n"
+    "steps:\n"
+    "  - sleep: 0\n"
+)
+
+
+class StartEventVarsTests(unittest.TestCase):
+    """The start event records overrides, which the YAML snapshot lacks."""
+
+    def _start_payload(self, params: dict[str, object]) -> dict[str, object]:
+        process, published = _build_process()
+        _load_text(process, _VARS_YAML)
+        self.assertTrue(process._rpc_sequencer_start({"params": params})["ok"])
+        start_events = [e for e in published if e["event"] == "start"]
+        self.assertEqual(len(start_events), 1)
+        payload = start_events[0]["payload"]
+        assert isinstance(payload, dict)
+        return payload
+
+    def test_start_event_records_overrides_and_resolved_vars(self) -> None:
+        payload = self._start_payload({"vars_override": {"n_traces": 3}})
+        self.assertEqual(payload["vars_override"], {"n_traces": 3})
+        self.assertEqual(payload["vars"], {"n_traces": 3, "total_traces": 6})
+
+    def test_start_event_without_overrides_records_yaml_vars(self) -> None:
+        payload = self._start_payload({})
+        self.assertEqual(payload["vars_override"], {})
+        self.assertEqual(payload["vars"], {"n_traces": 10, "total_traces": 20})
+
+
 if __name__ == "__main__":
     unittest.main()

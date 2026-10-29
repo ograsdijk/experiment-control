@@ -3750,8 +3750,12 @@ class SequencerProcess(ManagedProcessBase):
                 message=str(e),
             )
             return self.rpc_err(req, code="start_failed", message=str(e))
-        run_id = self._runtime.status().get("run_id")
+        run_status = self._runtime.status()
+        run_id = run_status.get("run_id")
         self._loaded_sequence_run_id = run_id
+        # The HDF writer stores this payload with the run. `vars_override` is
+        # applied at start and is not in the loaded YAML it snapshots, so the
+        # overrides and the vars they produced are recorded here.
         self._publish_lifecycle_event(
             event="start",
             ok=True,
@@ -3762,6 +3766,8 @@ class SequencerProcess(ManagedProcessBase):
                 "active_sequence_id": self._active_sequence_id,
                 "loaded_source": self._loaded_sequence_source,
                 "context_columns": self._context_columns,
+                "vars_override": run_status.get("vars_override") or {},
+                "vars": run_status.get("vars") or {},
             },
         )
         return self.rpc_ok(req, result={"status": "running"})
