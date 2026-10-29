@@ -43,16 +43,13 @@ import {
 } from "../features/sequencer/utils";
 import type { StreamAnalysisWorkspaceConfig } from "../features/stream/types";
 import { SequencerMetadataPanel } from "../features/sequencer/components/SequencerMetadataPanel";
-import {
-  buildSequencerOutlineMetadata,
-  buildSequencerStepOutline,
-} from "../features/sequencer/outline";
+import { mergeDiagnostics } from "../features/sequencer/diagnostics_merge";
+import { useSequencerOutline } from "../features/sequencer/useSequencerOutline";
 import { stepPathAtLine } from "../features/sequencer/diagnostic_locations";
 import type {
   SequencerAdaptiveStudyStatus,
   SequencerDiagnostic,
   SequencerErrorDetail,
-  SequencerOutlineMetadata,
   SequencerPauseInfo,
   SequencerRunEvent,
   SequencerProgress,
@@ -194,6 +191,7 @@ type Props = {
   streamWorkspaces: Record<string, StreamAnalysisWorkspaceConfig>;
   latestSignalsByDevice: Record<string, Record<string, TelemetrySignal>>;
   colorScheme: "light" | "dark";
+  /** Validator diagnostics; the local condition checks are added here. */
   diagnostics: ReadonlyArray<SequencerDiagnostic>;
   /** Resolved `${...}` values for the Steps and YAML tabs. */
   valueContext: ValueContext | null;
@@ -288,7 +286,7 @@ export function SequencerModal({
   streamWorkspaces,
   latestSignalsByDevice,
   colorScheme,
-  diagnostics,
+  diagnostics: validatorDiagnostics,
   valueContext,
   onJumpToDiagnostic,
 }: Props) {
@@ -307,13 +305,14 @@ export function SequencerModal({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [opened]);
 
-  const metadata = useMemo<SequencerOutlineMetadata>(() => {
-    try {
-      return buildSequencerOutlineMetadata(yamlText);
-    } catch {
-      return { version: null, vars: [], contextColumns: [] };
-    }
-  }, [yamlText]);
+  // One deferred parse feeds the outline, the vars tab and the local checks.
+  const parsedOutline = useSequencerOutline(yamlText);
+  const metadata = parsedOutline.metadata;
+  const outline = parsedOutline.outline;
+  const diagnostics = useMemo(
+    () => mergeDiagnostics(validatorDiagnostics, parsedOutline.localDiagnostics),
+    [validatorDiagnostics, parsedOutline.localDiagnostics]
+  );
 
   const libraryOptions = libraryEntries.map((entry) => ({
     value: entry.id,
@@ -340,13 +339,6 @@ export function SequencerModal({
   const runErrorCount = runEvents.filter((event) => event.severity === "error").length;
   const runWarningCount = runEvents.filter((event) => event.severity === "warning").length;
   const showPause = runtimeState === "PAUSED" && pauseInfo !== null;
-  const outline = useMemo(() => {
-    try {
-      return buildSequencerStepOutline(yamlText);
-    } catch {
-      return [];
-    }
-  }, [yamlText]);
 
   // The running step, only while the editor still holds the loaded text.
   const activeLine = useMemo(
@@ -1188,6 +1180,7 @@ export function SequencerModal({
             <Tabs.Panel value="steps" pt="sm" style={tabPanelStyle(activeTab === "steps")}>
               <SequencerOutlinePane
                 yamlText={yamlText}
+                parsedOutline={parsedOutline}
                 onYamlTextChange={onYamlTextChange}
                 streamCatalog={streamCatalog}
                 capabilitiesByDevice={capabilitiesByDevice}

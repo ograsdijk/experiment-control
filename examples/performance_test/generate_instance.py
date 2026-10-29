@@ -12,6 +12,7 @@ EXAMPLE_DIR = Path(__file__).resolve().parent
 REPO_ROOT = EXAMPLE_DIR.parents[1]
 GENERATED_ROOT = EXAMPLE_DIR / ".generated"
 PRESET_NAMES = ("light", "baseline", "heavy", "stress")
+LIBRARY_SEQUENCES = 24
 
 
 def _load_presets() -> dict[str, dict[str, Any]]:
@@ -77,6 +78,7 @@ def _benchmark_sequence(telemetry_devices: int, blocks: int = 40) -> dict[str, A
         )
     return {
         "version": 1,
+        "meta": {"description": f"Benchmark sequence, {blocks} sweep blocks."},
         "context_columns": {"level": "float64", "block": "int64"},
         "vars": {"max_level": 1.0, "n_levels": 3, "n_repeats": 2, "settle_s": 0.01},
         "steps": steps,
@@ -91,6 +93,19 @@ def _write_ui_processes(target: Path, processes_dir: Path, telemetry_devices: in
     """
     # Process paths resolve against the instance directory (the stack root).
     _write_yaml(target / "sequence_benchmark.yaml", _benchmark_sequence(telemetry_devices))
+    # A library of smaller sequences, for searching and switching files in the modal.
+    sequences_dir = target / "sequences"
+    sequences_dir.mkdir()
+    for index in range(LIBRARY_SEQUENCES):
+        blocks = 10 + (index * 7) % 31
+        _write_yaml(
+            sequences_dir / f"bench_scan_{index:02d}.yaml",
+            _benchmark_sequence(telemetry_devices, blocks=blocks),
+        )
+    _write_yaml(
+        target / "sequence_library.yaml",
+        {"version": 1, "autoload_dirs": [{"dir": "sequences", "pattern": "*.yaml"}]},
+    )
     _write_yaml(
         processes_dir / "sequencer.yaml",
         {
@@ -100,7 +115,11 @@ def _write_ui_processes(target: Path, processes_dir: Path, telemetry_devices: in
                 "file": "src/experiment_control/sequencer/sequencer.py",
                 "class_name": "SequencerProcess",
             },
-            "init_kwargs": {"rpc_timeout_ms": 2000, "autoload_path": "sequence_benchmark.yaml"},
+            "init_kwargs": {
+                "rpc_timeout_ms": 2000,
+                "autoload_path": "sequence_benchmark.yaml",
+                "sequence_library_path": "sequence_library.yaml",
+            },
             "restart_policy": "NEVER",
             "heartbeat_timeout_s": 3.0,
             "shutdown_timeout_s": 3.0,

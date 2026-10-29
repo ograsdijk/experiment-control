@@ -1,9 +1,9 @@
+import { IconPlayerPause, IconPlayerPlay } from "@tabler/icons-react";
 import { lazy, Suspense } from "react";
 import type {
   ComponentProps,
   Dispatch,
   MutableRefObject,
-  ReactNode,
   SetStateAction,
 } from "react";
 import type { GatewaySettingsInfo } from "../api";
@@ -16,7 +16,7 @@ import type { useWatchdogsController } from "../features/watchdogs/useWatchdogsC
 import type { useStateMachinesController } from "../features/state_machines/useStateMachinesController";
 import type { useProcessCommandController } from "../features/processes/useProcessCommandController";
 import type { useProcessesController } from "../features/processes/useProcessesController";
-import type { useSequencerController } from "../features/sequencer/useSequencerController";
+import { useSequencerContext } from "../features/sequencer/SequencerContext";
 import type { CapabilityMember, DeviceStatus, StreamCatalogEntry } from "../types";
 import type { TelemetrySignal } from "../types";
 import type { HdfMeasurementNoteModal } from "./HdfMeasurementNoteModal";
@@ -71,7 +71,6 @@ type ProcessCommandControllerState = ReturnType<typeof useProcessCommandControll
 type InterlocksControllerState = ReturnType<typeof useInterlocksController>;
 type WatchdogsControllerState = ReturnType<typeof useWatchdogsController>;
 type StateMachinesControllerState = ReturnType<typeof useStateMachinesController>;
-type SequencerControllerState = ReturnType<typeof useSequencerController>;
 type CommandHistoryControllerState = ReturnType<typeof useCommandHistoryController>;
 
 type Props = {
@@ -108,8 +107,6 @@ type Props = {
   interlocksController: InterlocksControllerState;
   watchdogsController: WatchdogsControllerState;
   stateMachinesController: StateMachinesControllerState;
-  sequencerController: SequencerControllerState;
-  sequencerPrimaryIcon: ReactNode;
   sequencerProcessId: string | null;
   colorScheme: "light" | "dark";
   commandHistoryController: CommandHistoryControllerState;
@@ -172,8 +169,6 @@ export function AppModalsLayer({
   interlocksController,
   watchdogsController,
   stateMachinesController,
-  sequencerController,
-  sequencerPrimaryIcon,
   sequencerProcessId,
   colorScheme,
   commandHistoryController,
@@ -364,7 +359,86 @@ export function AppModalsLayer({
         />
       ) : null}
 
-      {sequencerController.sequencerOpen ? (
+      <SequencerModalSlot
+        sequencerProcessId={sequencerProcessId}
+        streamCatalog={streamCatalog}
+        capabilitiesByDevice={capabilitiesByDevice}
+        streamWorkspaces={streamWorkspaces}
+        latestSignalsByDevice={latestSignalsByDevice}
+        colorScheme={colorScheme}
+      />
+
+      {commandHistoryController.commandHistoryOpen ? (
+        <CommandHistoryModalContainer
+          opened={commandHistoryController.commandHistoryOpen}
+        onClose={() => commandHistoryController.setCommandHistoryOpen(false)}
+        controller={commandHistoryController}
+        devices={devices}
+        colorScheme={colorScheme}
+        viewportRef={commandHistoryScrollRef}
+        onCopyJson={(label, payload) => {
+          void copyJsonToClipboard(label, payload);
+        }}
+        />
+      ) : null}
+
+      {logsOpen ? (
+        <LogsModalContainer
+          opened={logsOpen}
+        onClose={() => setLogsOpen(false)}
+        connected={logsWsConnected}
+        autoScroll={logAutoScroll}
+        onAutoScrollChange={setLogAutoScroll}
+        sortNewestFirst={logSortNewestFirst}
+        onSortNewestFirstChange={setLogSortNewestFirst}
+        loading={logLoading}
+        loadLogTail={loadLogTail}
+        setExpandedLogByKey={setExpandedLogByKey}
+        severityFilter={logSeverityFilter}
+        onSeverityFilterChange={setLogSeverityFilter}
+        sourceFilter={logSourceFilter}
+        onSourceFilterChange={setLogSourceFilter}
+        deviceFilter={logDeviceFilter}
+        onDeviceFilterChange={setLogDeviceFilter}
+        processFilter={logProcessFilter}
+        onProcessFilterChange={setLogProcessFilter}
+        textFilter={logTextFilter}
+        onTextFilterChange={setLogTextFilter}
+        colorScheme={colorScheme}
+        devices={devices}
+        processes={processesController.processes}
+        viewportRef={logScrollRef}
+        expandedByKey={expandedLogByKey}
+        copyTextToClipboard={copyTextToClipboard}
+        />
+      ) : null}
+    </Suspense>
+  );
+}
+
+type SequencerModalSlotProps = {
+  sequencerProcessId: string | null;
+  streamCatalog: StreamCatalogEntry[];
+  capabilitiesByDevice: Record<string, CapabilityMember[]>;
+  streamWorkspaces: Record<string, StreamAnalysisWorkspaceConfig>;
+  latestSignalsByDevice: Record<string, Record<string, TelemetrySignal>>;
+  colorScheme: "light" | "dark";
+};
+
+/** Reads the sequencer context itself: its changes re-render only the modal. */
+function SequencerModalSlot({
+  sequencerProcessId,
+  streamCatalog,
+  capabilitiesByDevice,
+  streamWorkspaces,
+  latestSignalsByDevice,
+  colorScheme,
+}: SequencerModalSlotProps) {
+  const sequencerController = useSequencerContext();
+  if (!sequencerController.sequencerOpen) {
+    return null;
+  }
+  return (
         <SequencerModalContainer
           opened={sequencerController.sequencerOpen}
         onClose={() => sequencerController.setSequencerOpen(false)}
@@ -393,7 +467,13 @@ export function AppModalsLayer({
         autoloadError={sequencerController.sequencerStatus?.autoloadError ?? null}
         statusError={sequencerController.sequencerStatus?.error ?? null}
         modalError={sequencerController.sequencerModalError}
-        primaryIcon={sequencerPrimaryIcon}
+        primaryIcon={
+          sequencerController.sequencerPrimaryAction === "pause" ? (
+            <IconPlayerPause size={14} />
+          ) : (
+            <IconPlayerPlay size={14} />
+          )
+        }
         primaryAction={sequencerController.sequencerPrimaryAction}
         primaryLabel={sequencerController.sequencerPrimaryLabel}
         primaryDisabled={sequencerController.sequencerPrimaryDisabled}
@@ -458,52 +538,5 @@ export function AppModalsLayer({
         valueContext={sequencerController.sequencerValueContext}
         onJumpToDiagnostic={sequencerController.jumpToSequencerDiagnostic}
         />
-      ) : null}
-
-      {commandHistoryController.commandHistoryOpen ? (
-        <CommandHistoryModalContainer
-          opened={commandHistoryController.commandHistoryOpen}
-        onClose={() => commandHistoryController.setCommandHistoryOpen(false)}
-        controller={commandHistoryController}
-        devices={devices}
-        colorScheme={colorScheme}
-        viewportRef={commandHistoryScrollRef}
-        onCopyJson={(label, payload) => {
-          void copyJsonToClipboard(label, payload);
-        }}
-        />
-      ) : null}
-
-      {logsOpen ? (
-        <LogsModalContainer
-          opened={logsOpen}
-        onClose={() => setLogsOpen(false)}
-        connected={logsWsConnected}
-        autoScroll={logAutoScroll}
-        onAutoScrollChange={setLogAutoScroll}
-        sortNewestFirst={logSortNewestFirst}
-        onSortNewestFirstChange={setLogSortNewestFirst}
-        loading={logLoading}
-        loadLogTail={loadLogTail}
-        setExpandedLogByKey={setExpandedLogByKey}
-        severityFilter={logSeverityFilter}
-        onSeverityFilterChange={setLogSeverityFilter}
-        sourceFilter={logSourceFilter}
-        onSourceFilterChange={setLogSourceFilter}
-        deviceFilter={logDeviceFilter}
-        onDeviceFilterChange={setLogDeviceFilter}
-        processFilter={logProcessFilter}
-        onProcessFilterChange={setLogProcessFilter}
-        textFilter={logTextFilter}
-        onTextFilterChange={setLogTextFilter}
-        colorScheme={colorScheme}
-        devices={devices}
-        processes={processesController.processes}
-        viewportRef={logScrollRef}
-        expandedByKey={expandedLogByKey}
-        copyTextToClipboard={copyTextToClipboard}
-        />
-      ) : null}
-    </Suspense>
   );
 }

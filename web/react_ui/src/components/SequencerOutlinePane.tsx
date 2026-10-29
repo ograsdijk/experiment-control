@@ -1,10 +1,8 @@
 import { Card, Stack, Text } from "@mantine/core";
 import { useEffect, useMemo, useState } from "react";
 import type { ActiveStep } from "../features/sequencer/active_step";
-import {
-  buildSequencerStepOutline,
-  flattenSequencerStepOutline,
-} from "../features/sequencer/outline";
+import { flattenSequencerStepOutline } from "../features/sequencer/outline";
+import type { ParsedSequencerOutline } from "../features/sequencer/useSequencerOutline";
 import {
   deleteStep,
   duplicateStep,
@@ -35,6 +33,8 @@ import type { TelemetrySignal } from "../types";
 
 type Props = {
   yamlText: string;
+  /** The modal's shared (deferred) parse of `yamlText`. */
+  parsedOutline: ParsedSequencerOutline;
   onYamlTextChange: (value: string) => void;
   streamCatalog: StreamCatalogEntry[];
   capabilitiesByDevice: Record<string, CapabilityMember[]>;
@@ -77,7 +77,8 @@ function buildSiblingInfoMap(
 
 export function SequencerOutlinePane({
   yamlText,
-  onYamlTextChange,
+  parsedOutline,
+  onYamlTextChange: onYamlTextChangeProp,
   streamCatalog,
   capabilitiesByDevice,
   streamWorkspaces,
@@ -89,20 +90,15 @@ export function SequencerOutlinePane({
   follow = false,
   onUserScroll,
 }: Props) {
-  const parsedOutline = useMemo(() => {
-    try {
-      return {
-        outline: buildSequencerStepOutline(yamlText),
-        error: null as string | null,
-      };
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      return {
-        outline: [] as SequencerStepOutlineNode[],
-        error: message,
-      };
+  // Step edits use the outline's line ranges, which only fit the text they
+  // were parsed from. Right after a change the parse can trail the text for a
+  // render; an edit made in that window is dropped rather than misapplied.
+  const outlineCurrent = parsedOutline.text === yamlText;
+  const onYamlTextChange = (value: string) => {
+    if (outlineCurrent) {
+      onYamlTextChangeProp(value);
     }
-  }, [yamlText]);
+  };
   const outline = parsedOutline.outline;
   const outlineParseError = parsedOutline.error;
   const flatOutline = useMemo(

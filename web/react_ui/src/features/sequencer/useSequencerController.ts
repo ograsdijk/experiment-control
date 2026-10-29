@@ -42,10 +42,7 @@ import {
 } from "./utils";
 import type { SequencerPercentHold } from "./utils";
 import { mergeDiagnostics } from "./diagnostics_merge";
-import {
-  loadSequencerYamlTools,
-  useSequencerYamlTools,
-} from "./useSequencerYamlTools";
+import { loadSequencerYamlTools } from "./useSequencerYamlTools";
 
 /** sequencer.status refresh while a run is active: modal open vs closed. */
 export const SEQUENCER_STATUS_POLL_OPEN_MS = 1500;
@@ -1523,18 +1520,6 @@ export function useSequencerController({
     []
   );
 
-  // The YAML helpers (and the yaml package) load with the modal, not with the
-  // header: editor text only arrives through the modal.
-  const sequencerYamlTools = useSequencerYamlTools(
-    sequencerOpen || sequencerYamlText !== ""
-  );
-  const sequencerLocalDiagnostics = useMemo(
-    () =>
-      sequencerYamlTools
-        ? sequencerYamlTools.buildLocalConditionDiagnostics(sequencerYamlText)
-        : [],
-    [sequencerYamlTools, sequencerYamlText]
-  );
   // Run events are shown only in the Sequencer modal; while it is closed the
   // hook is idle (a null id) instead of refetching on every status seq.
   const sequencerRunEventsProcessId =
@@ -1548,14 +1533,16 @@ export function useSequencerController({
     callProcessFn
   );
 
-  const sequencerCombinedDiagnostics = useMemo(() => {
-    const stale = sequencerDiagnosticsState.text !== sequencerYamlText;
-    const validator = sequencerDiagnosticsState.items.map((item) =>
-      stale ? { ...item, stale: true } : item
-    );
-    // Local condition checks are recomputed from the current text: never stale.
-    return mergeDiagnostics(validator, sequencerLocalDiagnostics);
-  }, [sequencerDiagnosticsState, sequencerLocalDiagnostics, sequencerYamlText]);
+  // Validator diagnostics, marked stale once the text changes. The modal adds
+  // the local condition checks from its own (deferred) parse of the text.
+  const sequencerValidatorStale = sequencerDiagnosticsState.text !== sequencerYamlText;
+  const sequencerValidatorDiagnostics = useMemo(
+    () =>
+      sequencerDiagnosticsState.items.map((item) =>
+        sequencerValidatorStale ? { ...item, stale: true } : item
+      ),
+    [sequencerDiagnosticsState, sequencerValidatorStale]
+  );
 
   const sequencerStatus = sequencerProcess
     ? sequencerStatusByProcessId[sequencerProcess.process_id]
@@ -1824,7 +1811,7 @@ export function useSequencerController({
     sequencerYamlText,
     sequencerYamlViewMode,
     setSequencerYamlViewMode,
-    sequencerDiagnostics: sequencerCombinedDiagnostics,
+    sequencerDiagnostics: sequencerValidatorDiagnostics,
     sequencerValueContext,
     sequencerEditorLabel,
     sequencerRunEvents,

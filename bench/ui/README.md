@@ -35,6 +35,7 @@ path.
 | `steady` | Renderer CPU (`ProcessTime`), main-thread busy, script, style/layout, heap, DOM nodes, listeners, long animation frames, `?perf=1` counters (renders, `setData`, requests/s), gateway and stack CPU | `--warmup`, `--duration`, `--device-panel open\|collapsed`, `--network` (HTTP/WS traffic per endpoint), `--trace` (gzipped Chrome trace) |
 | `load` | DOMContentLoaded, FCP, LCP, first telemetry, first plot `setData`, requests and bytes, long frames during startup | `--cache cold\|warm`, `--external allow\|fail\|hang` (emulate no internet: non-gateway requests fail fast or hang for 20 s) |
 | `interactions` | For each header modal: click → content mounted / settled / closed, Event Timing duration (INP-like), long frames; device-panel toggle; plot-area wheel scroll frame pacing. All under live telemetry. The first open includes lazy-chunk loading. | `--interaction-repeats` |
+| `sequencer` | Sequencer modal with the ~900-line benchmark sequence in the YAML editor (edit mode): long frames while idle (status polls only), per-keystroke Event Timing while typing in the editor and in the library search, and Load selected → new text in the editor. Needs `--ui-processes`. | `--warmup`, `--cpu-throttle` (4 approximates a slower lab PC) |
 | `soak` | Heap / DOM nodes / listeners / uPlot instances after forced GC: before and after modal churn, before and after profile churn, then a steady trend per hour | `--duration`, `--sample-every`, `--modal-cycles`, `--profile-cycles a,b,...` |
 | `clients` | Gateway and stack CPU, plus per-client renderer CPU, as concurrent clients increase (each in its own window so none is hidden) | `--clients 1,2,4,8` |
 
@@ -68,7 +69,11 @@ runs: Chrome windows open and close, and background load skews the CPU numbers.
   Frames, Event Timing and paint entries without scheduling per-frame work.
   Frame counting only runs during the scroll interaction.
 - Percentages are relative to one core, so renderer CPU can exceed 100%.
-- The Sequencer and HDF modals, and typing in the sequence editor
-  (`sequencer_typing`), are measured only with `--launch --ui-processes`. That
-  flag adds a sequencer and an idle HDF writer to the performance instance.
-  Without it, those entries report `skipped`.
+- The Sequencer and HDF modals, typing in the sequence editor
+  (`sequencer_typing`) and the `sequencer` scenario are measured only with
+  `--launch --ui-processes`. That flag adds a sequencer (with a small sequence
+  library) and an idle HDF writer to the performance instance. Without it,
+  those entries report `skipped`.
+- Typing is measured in the editor's edit mode with the loaded sequence shown.
+  Event Timing reports only events of 16 ms or more, so a keystroke without an
+  entry counts as 0 in the percentiles.

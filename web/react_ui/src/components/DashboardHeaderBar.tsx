@@ -21,6 +21,8 @@ import {
   IconExternalLink,
   IconLayoutGrid,
   IconPencil,
+  IconPlayerPause,
+  IconPlayerPlay,
   IconRefresh,
   IconSettings,
   IconShieldCheck,
@@ -28,8 +30,9 @@ import {
   IconTerminal2,
 } from "@tabler/icons-react";
 import type { ExtraUiInfo } from "../api";
-import { useMemo, useState, type CSSProperties, type ReactNode } from "react";
+import { useMemo, useState, type ReactNode } from "react";
 import { useHeaderCompact } from "../features/layout/useHeaderCompact";
+import { useSequencerHeader } from "../features/sequencer/SequencerContext";
 import { useAdaptivePolling } from "../features/polling/useAdaptivePolling";
 
 type InstanceRuntimeStatus = {
@@ -156,21 +159,6 @@ type Props = {
   influxWriterTitle: string;
   influxWriterLabel: string;
   showSequencer: boolean;
-  sequencerChipColor: string;
-  sequencerStatusLoading: boolean;
-  onOpenSequencer: () => Promise<unknown> | void;
-  sequencerStatusError: string | null;
-  sequencerChipTooltip: string;
-  sequencerRuntimeState: string;
-  sequencerChipSuffix: string;
-  sequencerChipProgressStyle: CSSProperties | undefined;
-  sequencerPrimaryAction: "start" | "pause" | "resume";
-  sequencerPrimaryLabel: string;
-  sequencerPrimaryDisabled: boolean;
-  sequencerActionBusy: boolean;
-  sequencerPrimaryIcon: ReactNode;
-  onRunSequencerPrimaryAction: () => Promise<unknown> | void;
-  sequencerLoaded: boolean;
   onOpenProcesses: () => Promise<unknown> | void;
   onOpenDeviceOverview: () => void;
   deviceIssueCount: number;
@@ -275,21 +263,6 @@ export function DashboardHeaderBar({
   influxWriterTitle,
   influxWriterLabel,
   showSequencer,
-  sequencerChipColor,
-  sequencerStatusLoading,
-  onOpenSequencer,
-  sequencerStatusError,
-  sequencerChipTooltip,
-  sequencerRuntimeState,
-  sequencerChipSuffix,
-  sequencerChipProgressStyle,
-  sequencerPrimaryAction,
-  sequencerPrimaryLabel,
-  sequencerPrimaryDisabled,
-  sequencerActionBusy,
-  sequencerPrimaryIcon,
-  onRunSequencerPrimaryAction,
-  sequencerLoaded,
   onOpenProcesses,
   onOpenDeviceOverview,
   deviceIssueCount,
@@ -471,6 +444,7 @@ export function DashboardHeaderBar({
     setCleanupPreview(null);
   };
 
+  const sequencer = useSequencerHeader();
   const liveTone = telemetryBadgeColor === "red" ? "red" : telemetryBadgeColor;
   const stateMachineCount = trailingCount(stateMachineButtonSummary.label);
   const interlockCount = trailingCount(interlockButtonSummary.label);
@@ -480,7 +454,7 @@ export function DashboardHeaderBar({
       showHdfWriter && hdfWriterFileLabel,
       showInfluxWriter && influxWriterLabel,
       showHdfNoteChiplet && hdfMeasurementNotesRows,
-      showSequencer && `${sequencerRuntimeState}${sequencerChipSuffix}${sequencerPrimaryLabel}`,
+      showSequencer && `${sequencer.runtimeState}${sequencer.chipSuffix}${sequencer.primaryLabel}`,
       deviceIssueCount,
       stateMachineButtonSummary.label,
       interlockButtonSummary.label,
@@ -733,35 +707,41 @@ export function DashboardHeaderBar({
                 className="app-header-run-chip"
                 size="xs"
                 variant="light"
-                color={sequencerChipColor}
-                loading={sequencerStatusLoading}
+                color={sequencer.chipColor}
+                loading={sequencer.statusLoading}
                 onClick={() => {
-                  void onOpenSequencer();
+                  void sequencer.openSequencer();
                 }}
-                title={sequencerStatusError ?? sequencerChipTooltip}
-                style={sequencerChipProgressStyle}
+                title={sequencer.statusError ?? sequencer.chipTooltip}
+                style={sequencer.chipProgressStyle}
               >
-                Sequencer {sequencerRuntimeState}
-                {sequencerChipSuffix}
+                Sequencer {sequencer.runtimeState}
+                {sequencer.chipSuffix}
               </Button>
               <Button
                 className="app-header-run-chip-fixed"
                 size="xs"
                 variant="light"
-                color={sequencerPrimaryAction === "start" ? "teal" : "yellow"}
-                leftSection={sequencerPrimaryIcon}
-                disabled={sequencerPrimaryDisabled}
-                loading={sequencerActionBusy}
+                color={sequencer.primaryAction === "start" ? "teal" : "yellow"}
+                leftSection={
+                  sequencer.primaryAction === "pause" ? (
+                    <IconPlayerPause size={14} />
+                  ) : (
+                    <IconPlayerPlay size={14} />
+                  )
+                }
+                disabled={sequencer.primaryDisabled}
+                loading={sequencer.actionBusy}
                 onClick={() => {
-                  void onRunSequencerPrimaryAction();
+                  void sequencer.runPrimaryAction();
                 }}
                 title={
-                  sequencerPrimaryAction === "start" && !sequencerLoaded
+                  sequencer.primaryAction === "start" && !sequencer.loaded
                     ? "Load a sequence before starting"
                     : undefined
                 }
               >
-                {sequencerPrimaryLabel}
+                {sequencer.primaryLabel}
               </Button>
             </Button.Group>
           )}

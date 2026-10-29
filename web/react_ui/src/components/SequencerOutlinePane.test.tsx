@@ -6,6 +6,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { resolveActiveStep } from "../features/sequencer/active_step";
 import { buildSequencerStepOutline } from "../features/sequencer/outline";
+import { parseSequencerOutline } from "../features/sequencer/useSequencerOutline";
 import { SequencerOutlinePane } from "./SequencerOutlinePane";
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -60,6 +61,7 @@ async function render(follow: boolean, withActive = true) {
         null,
         createElement(SequencerOutlinePane, {
           yamlText: YAML,
+          parsedOutline: parseSequencerOutline(YAML),
           onYamlTextChange: () => undefined,
           streamCatalog: [],
           capabilitiesByDevice: {},
