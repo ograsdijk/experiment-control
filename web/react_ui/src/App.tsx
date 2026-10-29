@@ -72,6 +72,8 @@ import {
   type ExtraUiInfo,
 } from "./api";
 import { AppModalsLayer } from "./components/AppModalsLayer";
+import { SequencerPage } from "./components/SequencerPage";
+import { isSequencerPageView } from "./features/sequencer/pageView";
 import { CommandDeckPanel } from "./components/CommandDeckPanel";
 import { DashboardHeaderBar } from "./components/DashboardHeaderBar";
 import { DeviceCard } from "./components/DeviceCard";
@@ -429,6 +431,9 @@ function isErrorSeverity(severity: unknown): boolean {
 
 // DraggableTraceChip moved to components/DraggableTraceChip.tsx
 // (round 30 — needed by PanelsGrid as well as remaining App-side uses).
+
+// Read once: the page view is chosen by the URL it was opened with.
+const SEQUENCER_PAGE_VIEW = isSequencerPageView();
 
 export function App() {
   perfCount("react.App.renders");
@@ -1684,6 +1689,9 @@ export function App() {
   }, []);
 
   useEffect(() => {
+    if (SEQUENCER_PAGE_VIEW) {
+      return; // The Sequencer page names its own tab.
+    }
     document.title = `Experiment Control ${instanceLabel}`;
   }, [instanceLabel]);
 
@@ -2938,6 +2946,29 @@ export function App() {
       }
     />
   );
+
+  if (SEQUENCER_PAGE_VIEW) {
+    return (
+      <SequencerProvider
+        sequencerProcess={sequencerProcess}
+        callProcessFn={callProcess}
+        sendProcessCommand={sendProcessCommand}
+        refreshProcesses={refreshProcesses}
+        colorScheme={computedColorScheme}
+        apiRef={sequencerApiRef}
+      >
+        <SequencerPage
+          instanceLabel={instanceLabel}
+          sequencerProcessId={sequencerProcess?.process_id ?? null}
+          streamCatalog={streamCatalog}
+          capabilitiesByDevice={capabilitiesByDevice}
+          streamWorkspaces={streamWorkspaces}
+          latestSignalsByDevice={latestByDevice}
+          colorScheme={computedColorScheme}
+        />
+      </SequencerProvider>
+    );
+  }
 
   return (
     <SequencerProvider

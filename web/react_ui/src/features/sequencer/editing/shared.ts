@@ -200,6 +200,49 @@ export function buildTemplateSnippet(kind: BasicSequencerStepTemplate): string {
   }
 }
 
+/**
+ * The list under the key on `lines[keyIndex]`: the column of its items and
+ * the index just past its block (trailing blank lines included). YAML lets
+ * the items sit in the key's own column (`do:` then `- sleep: 1`, as PyYAML
+ * writes lists); otherwise they are indented, two spaces for an empty list.
+ */
+export function keyListBlock(
+  lines: string[],
+  keyIndex: number,
+  keyIndent: number
+): { itemIndent: number; endIndex: number } {
+  const isListItem = (line: string) => /^\s*-(?:\s|$)/.test(line);
+  let itemIndent = keyIndent + 2;
+  for (let index = keyIndex + 1; index < lines.length; index += 1) {
+    const line = lines[index] ?? "";
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) {
+      continue;
+    }
+    const indent = line.match(/^\s*/)?.[0].length ?? 0;
+    if (isListItem(line) && indent >= keyIndent) {
+      itemIndent = indent;
+    }
+    break;
+  }
+
+  let endIndex = keyIndex + 1;
+  for (let index = keyIndex + 1; index < lines.length; index += 1) {
+    const line = lines[index] ?? "";
+    if (!line.trim()) {
+      endIndex = index + 1;
+      continue;
+    }
+    const indent = line.match(/^\s*/)?.[0].length ?? 0;
+    const ownItem = itemIndent === keyIndent && indent === keyIndent && isListItem(line);
+    if (indent <= keyIndent && !ownItem) {
+      break;
+    }
+    endIndex = index + 1;
+  }
+  return { itemIndent, endIndex };
+}
+
 export function findContainerInsertion(
   snippet: string,
   containerKey: SequencerChildContainer
@@ -223,21 +266,8 @@ export function findContainerInsertion(
     return null;
   }
 
-  let insertLineIndex = containerIndex + 1;
-  for (let index = containerIndex + 1; index < lines.length; index += 1) {
-    const line = lines[index] ?? "";
-    if (!line.trim()) {
-      insertLineIndex = index + 1;
-      continue;
-    }
-    const indent = line.match(/^\s*/)?.[0].length ?? 0;
-    if (indent <= containerIndent) {
-      break;
-    }
-    insertLineIndex = index + 1;
-  }
-
-  return { insertLineIndex, childIndent: containerIndent + 2 };
+  const block = keyListBlock(lines, containerIndex, containerIndent);
+  return { insertLineIndex: block.endIndex, childIndent: block.itemIndent };
 }
 
 export function findTopLevelSectionRange(

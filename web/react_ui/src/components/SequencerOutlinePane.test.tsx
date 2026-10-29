@@ -1,12 +1,13 @@
 // @vitest-environment jsdom
 
 import { MantineProvider } from "@mantine/core";
+import { notifications } from "@mantine/notifications";
 import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { resolveActiveStep } from "../features/sequencer/active_step";
 import { buildSequencerStepOutline } from "../features/sequencer/outline";
-import { parseSequencerOutline } from "../features/sequencer/useSequencerOutline";
+import { parseSequencerOutline } from "../features/sequencer/outline_parse";
 import { SequencerOutlinePane } from "./SequencerOutlinePane";
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -53,16 +54,20 @@ afterEach(() => {
   container.remove();
 });
 
-async function render(follow: boolean, withActive = true) {
+async function render(
+  follow: boolean,
+  withActive = true,
+  edit: { currentText?: string; onYamlTextChange?: (value: string) => void } = {}
+) {
   await act(async () => {
     root.render(
       createElement(
         MantineProvider,
         null,
         createElement(SequencerOutlinePane, {
-          getYamlText: () => YAML,
+          getYamlText: () => edit.currentText ?? YAML,
           parsedOutline: parseSequencerOutline(YAML),
-          onYamlTextChange: () => undefined,
+          onYamlTextChange: edit.onYamlTextChange ?? (() => undefined),
           streamCatalog: [],
           capabilitiesByDevice: {},
           streamWorkspaces: {},
@@ -103,5 +108,33 @@ describe("SequencerOutlinePane active step", () => {
       await new Promise((resolve) => window.requestAnimationFrame(() => resolve(null)));
     });
     expect(scrollIntoView).toHaveBeenCalledWith({ block: "nearest" });
+  });
+});
+
+describe("SequencerOutlinePane edits", () => {
+  const deleteFirstStep = () =>
+    act(async () => {
+      (container.querySelector('[aria-label="Delete step"]') as HTMLElement).click();
+    });
+
+  it("applies an edit made on the current text", async () => {
+    const onYamlTextChange = vi.fn();
+    await render(false, false, { onYamlTextChange });
+    await deleteFirstStep();
+    expect(onYamlTextChange).toHaveBeenCalledOnce();
+  });
+
+  it("refuses an edit made on a stale outline, and says so", async () => {
+    const onYamlTextChange = vi.fn();
+    const show = vi.spyOn(notifications, "show").mockImplementation(() => "");
+    try {
+      await render(false, false, { currentText: `${YAML}# typed since
+`, onYamlTextChange });
+      await deleteFirstStep();
+      expect(onYamlTextChange).not.toHaveBeenCalled();
+      expect(show).toHaveBeenCalledWith(expect.objectContaining({ title: "Steps were still updating" }));
+    } finally {
+      show.mockRestore();
+    }
   });
 });

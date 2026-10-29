@@ -1,4 +1,5 @@
 ﻿import {
+  ActionIcon,
   Badge,
   Button,
   Group,
@@ -10,15 +11,21 @@
   Switch,
   Tabs,
   Text,
+  Title,
+  Tooltip,
 } from "@mantine/core";
+import { IconExternalLink } from "@tabler/icons-react";
 import {
   Suspense,
   lazy,
   useCallback,
+  useContext,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
+  useSyncExternalStore,
   type CSSProperties,
   type ChangeEvent,
   type ReactNode,
@@ -61,19 +68,88 @@ import {
 } from "./SequencerSidebar";
 import { SequencerValuesContext } from "../features/sequencer/components/ValueChip";
 import type { ValueContext } from "../features/sequencer/resolved_values";
-import { buildRuntimeOrigins } from "../features/sequencer/runtime_origins";
 import type { SequencerLoopStatus, SequencerPlan } from "../features/sequencer/plan";
+import type { SequencerYamlCodeEditorProps } from "../features/sequencer/components/SequencerYamlCodeEditor";
 import { SequencerTimelinePane } from "./SequencerTimelinePane";
+import { perfCount } from "../features/performance/perfInstrumentation";
+import { sequencerPageUrl } from "../features/sequencer/pageView";
 
 const NOOP = () => undefined;
+
+/**
+ * A hidden tab keeps what it last rendered: its subtree, and the values
+ * context it reads, hold still until the tab is shown again, instead of
+ * re-rendering for status polls, diagnostics and value updates nobody sees.
+ * Component state and effects inside keep working.
+ */
+function FrozenWhileHidden({ active, children }: { active: boolean; children: ReactNode }) {
+  const values = useContext(SequencerValuesContext);
+  const shown = useRef({ children, values });
+  if (active) {
+    shown.current = { children, values };
+  }
+  return (
+    <SequencerValuesContext.Provider value={shown.current.values}>
+      {shown.current.children}
+    </SequencerValuesContext.Provider>
+  );
+}
 
 const LazySequencerYamlCodeEditor = lazy(
   () => import("../features/sequencer/components/SequencerYamlCodeEditor")
 );
 
+/**
+ * The editor text as a subscription. The tabs are memoized and do not take
+ * the text, so a keystroke re-renders only the editor that reads it: a
+ * re-render of the tabs would make React search every (frozen) step row
+ * for readers of Mantine's tabs context.
+ */
+type TextSource = { get: () => string; subscribe: (listener: () => void) => () => void };
+
+function useTextSource(text: string): TextSource {
+  const [source] = useState(() => {
+    let current = text;
+    const listeners = new Set<() => void>();
+    return {
+      get: () => current,
+      subscribe: (listener: () => void) => {
+        listeners.add(listener);
+        return () => {
+          listeners.delete(listener);
+        };
+      },
+      set: (next: string) => {
+        if (next !== current) {
+          current = next;
+          listeners.forEach((listener) => listener());
+        }
+      },
+    };
+  });
+  useLayoutEffect(() => {
+    source.set(text);
+  }, [source, text]);
+  return source;
+}
+
+function YamlEditorWithText({
+  textSource,
+  editorRef,
+  ...props
+}: Omit<SequencerYamlCodeEditorProps, "value"> & {
+  textSource: TextSource;
+  editorRef: RefObject<SequencerYamlEditorHandle>;
+}) {
+  const value = useSyncExternalStore(textSource.subscribe, textSource.get);
+  return <LazySequencerYamlCodeEditor ref={editorRef} {...props} value={value} />;
+}
+
 type Props = {
   opened: boolean;
   onClose: () => void;
+  /** Fill the window as the `?view=sequencer` page instead of a modal. */
+  page?: boolean;
   processState: string;
   runtimeState: string;
   loaded: boolean;
@@ -188,6 +264,7 @@ type Props = {
 export function SequencerModal({
   opened,
   onClose,
+  page = false,
   processState,
   runtimeState,
   loaded,
@@ -274,6 +351,7 @@ export function SequencerModal({
   valueContext,
   onJumpToDiagnostic,
 }: Props) {
+  perfCount("react.SequencerModal.renders");
   const [activeTab, setActiveTab] = useState<"steps" | "vars" | "yaml" | "timeline">("steps");
   useEffect(() => {
     onTimelineVisibleChange(activeTab === "timeline");
@@ -290,7 +368,15 @@ export function SequencerModal({
   }, [opened]);
 
   // One deferred parse feeds the outline, the vars tab and the local checks.
-  const parsedOutline = useSequencerOutline(yamlText);
+  const [parsedOutline, parseOutlineNow] = useSequencerOutline(yamlText);
+  // An edit from the Steps or Variables tab: its outline is built at once.
+  const onOutlineEdit = useCallback(
+    (value: string) => {
+      onYamlTextChange(value);
+      parseOutlineNow(value);
+    },
+    [onYamlTextChange, parseOutlineNow]
+  );
   // The memoized tabs read the text only to apply an edit.
   const yamlTextRef = useRef(yamlText);
   yamlTextRef.current = yamlText;
@@ -350,7 +436,7 @@ export function SequencerModal({
       // Storage can be blocked; the switch still works for this session.
     }
   }, []);
-  const runtimeOrigins = useMemo(() => buildRuntimeOrigins(outline), [outline]);
+  const runtimeOrigins = parsedOutline.runtimeOrigins;
   const shownValues = useMemo(
     () => (showValues && valueContext ? { ...valueContext, runtimeOrigins } : null),
     [showValues, valueContext, runtimeOrigins]
@@ -387,19 +473,189 @@ export function SequencerModal({
         : `${completedSteps ?? 0} steps`;
   const etaText = progress?.etaS != null ? formatSequencerEta(progress) : null;
 
-  return (
-    <Modal
-      opened={opened}
-      onClose={onClose}
-      title="Sequencer"
-      size="calc(100vw - 3rem)"
-      centered
-      styles={{
-        // The modal fills the window; its body takes what the header leaves.
-        content: { height: "calc(100dvh - 3rem)", display: "flex", flexDirection: "column" },
-        body: { flex: 1, minHeight: 0, display: "flex", flexDirection: "column", paddingTop: 0 },
-      }}
-    >
+  const textSource = useTextSource(yamlText);
+  const tabs = useMemo(
+    () => (
+          <SequencerValuesContext.Provider value={shownValues}>
+          <Tabs
+            value={activeTab}
+            onChange={(value) => setActiveTab((value as typeof activeTab) ?? "steps")}
+            keepMounted
+            style={{ display: "flex", flexDirection: "column", minHeight: 0 }}
+          >
+            <Tabs.List>
+              <Tabs.Tab value="steps">Steps</Tabs.Tab>
+              <Tabs.Tab
+                value="vars"
+                rightSection={
+                  <Badge size="xs" variant="light" color="gray">
+                    {metadata.vars.length}
+                  </Badge>
+                }
+              >
+                Variables
+              </Tabs.Tab>
+              <Tabs.Tab value="yaml">YAML</Tabs.Tab>
+              <Tabs.Tab value="timeline">Timeline</Tabs.Tab>
+              <Switch
+                size="xs"
+                label="Values"
+                title="Show the resolved value of each ${...} next to it."
+                checked={showValues}
+                onChange={(event) => setShowValues(event.currentTarget.checked)}
+                style={{ marginLeft: "auto", alignSelf: "center", marginRight: 12 }}
+              />
+              <Switch
+                size="xs"
+                label="Follow"
+                title="Scroll to the running step as it changes. Scrolling yourself turns this off."
+                checked={follow}
+                onChange={(event) => setFollow(event.currentTarget.checked)}
+                style={{ alignSelf: "center" }}
+              />
+            </Tabs.List>
+            <Tabs.Panel value="steps" pt="sm" style={tabPanelStyle(activeTab === "steps")}>
+              <FrozenWhileHidden active={activeTab === "steps"}>
+              <SequencerOutlinePane
+                getYamlText={getYamlText}
+                parsedOutline={parsedOutline}
+                onYamlTextChange={onOutlineEdit}
+                streamCatalog={streamCatalog}
+                capabilitiesByDevice={capabilitiesByDevice}
+                streamWorkspaces={streamWorkspaces}
+                latestSignalsByDevice={latestSignalsByDevice}
+                colorScheme={colorScheme}
+                diagnostics={markerDiagnostics}
+                focusRequest={stepFocus}
+                activeStep={activeStep}
+                follow={follow && activeTab === "steps"}
+                onUserScroll={stopFollowing}
+              />
+              </FrozenWhileHidden>
+            </Tabs.Panel>
+            <Tabs.Panel value="vars" pt="sm" style={tabPanelStyle(activeTab === "vars")}>
+              <FrozenWhileHidden active={activeTab === "vars"}>
+              <SequencerMetadataPanel
+                metadata={metadata}
+                metadataCollapsed={false}
+                onToggleCollapsed={NOOP}
+                getYamlText={getYamlText}
+                onYamlTextChange={onOutlineEdit}
+                fill
+              />
+              </FrozenWhileHidden>
+            </Tabs.Panel>
+            <Tabs.Panel value="yaml" pt="sm" style={tabPanelStyle(activeTab === "yaml")}>
+              <Stack gap={6} style={{ flex: 1, minHeight: 0 }}>
+                <Group justify="space-between">
+                  <Text size="xs" c="dimmed">
+                    {yamlViewMode === "edit" ? "Raw editable YAML" : "Read-only preview"}
+                  </Text>
+                  <SegmentedControl
+                    size="xs"
+                    value={yamlViewMode}
+                    onChange={(value) => onYamlViewModeChange(value as "edit" | "preview")}
+                    data={[
+                      { value: "preview", label: "Preview" },
+                      { value: "edit", label: "Edit" },
+                    ]}
+                  />
+                </Group>
+                {/* A flex column, so the editor gets a bounded height and scrolls. */}
+                <div
+                  style={{
+                    flex: 1,
+                    minHeight: 0,
+                    overflow: "hidden",
+                    display: "flex",
+                    flexDirection: "column",
+                  }}
+                >
+                  {/* Preview is the same editor, read-only, so it shows the
+                      diagnostic marks too. */}
+                  <Suspense
+                    fallback={
+                      <Text size="xs" c="dimmed">
+                        Loading YAML editor...
+                      </Text>
+                    }
+                  >
+                    <YamlEditorWithText
+                      editorRef={editorRef}
+                      textSource={textSource}
+                      onChange={onYamlTextChange}
+                      colorScheme={colorScheme}
+                      diagnostics={markerDiagnostics}
+                      readOnly={yamlViewMode !== "edit"}
+                      activeStep={activeStep}
+                      follow={follow && activeTab === "yaml"}
+                      onUserScroll={stopFollowing}
+                      values={shownValues}
+                    />
+                  </Suspense>
+                </div>
+              </Stack>
+            </Tabs.Panel>
+            <Tabs.Panel value="timeline" pt="sm" style={tabPanelStyle(activeTab === "timeline")}>
+              {activeTab === "timeline" ? (
+                <SequencerTimelinePane
+                  outline={outline}
+                  plan={loaded ? plan : null}
+                  planError={planError}
+                  overridesInvalid={planOverridesInvalid}
+                  loops={loops}
+                  runtimeState={runtimeState}
+                  activeStep={activeStep}
+                  textNotLoaded={textNotLoaded}
+                  onOpenStep={(line) => {
+                    setActiveTab("steps");
+                    setStepFocus({ line, nonce: Date.now() });
+                  }}
+                />
+              ) : null}
+            </Tabs.Panel>
+          </Tabs>
+          </SequencerValuesContext.Provider>
+    ),
+    [
+      activeTab,
+      metadata,
+      showValues,
+      setShowValues,
+      follow,
+      setFollow,
+      getYamlText,
+      parsedOutline,
+      onYamlTextChange,
+      onOutlineEdit,
+      streamCatalog,
+      capabilitiesByDevice,
+      streamWorkspaces,
+      latestSignalsByDevice,
+      colorScheme,
+      markerDiagnostics,
+      stepFocus,
+      activeStep,
+      stopFollowing,
+      yamlViewMode,
+      onYamlViewModeChange,
+      editorRef,
+      textSource,
+      shownValues,
+      outline,
+      loaded,
+      plan,
+      planError,
+      planOverridesInvalid,
+      loops,
+      runtimeState,
+      textNotLoaded,
+    ]
+  );
+
+  // Memoized like the tabs: a keystroke changes none of this.
+  const body = useMemo(
+    () => (
       <Stack gap="sm" style={{ flex: 1, minHeight: 0, overflow: "hidden" }}>
         {/* Status + run: one row. */}
         <Group justify="space-between" align="center" wrap="nowrap" gap="md" style={{ flexShrink: 0 }}>
@@ -658,144 +914,135 @@ export function SequencerModal({
           />
 
           {/* Main: steps / variables / YAML, each using the full height. */}
-          <SequencerValuesContext.Provider value={shownValues}>
-          <Tabs
-            value={activeTab}
-            onChange={(value) => setActiveTab((value as typeof activeTab) ?? "steps")}
-            keepMounted
-            style={{ display: "flex", flexDirection: "column", minHeight: 0 }}
-          >
-            <Tabs.List>
-              <Tabs.Tab value="steps">Steps</Tabs.Tab>
-              <Tabs.Tab
-                value="vars"
-                rightSection={
-                  <Badge size="xs" variant="light" color="gray">
-                    {metadata.vars.length}
-                  </Badge>
-                }
-              >
-                Variables
-              </Tabs.Tab>
-              <Tabs.Tab value="yaml">YAML</Tabs.Tab>
-              <Tabs.Tab value="timeline">Timeline</Tabs.Tab>
-              <Switch
-                size="xs"
-                label="Values"
-                title="Show the resolved value of each ${...} next to it."
-                checked={showValues}
-                onChange={(event) => setShowValues(event.currentTarget.checked)}
-                style={{ marginLeft: "auto", alignSelf: "center", marginRight: 12 }}
-              />
-              <Switch
-                size="xs"
-                label="Follow"
-                title="Scroll to the running step as it changes. Scrolling yourself turns this off."
-                checked={follow}
-                onChange={(event) => setFollow(event.currentTarget.checked)}
-                style={{ alignSelf: "center" }}
-              />
-            </Tabs.List>
-            <Tabs.Panel value="steps" pt="sm" style={tabPanelStyle(activeTab === "steps")}>
-              <SequencerOutlinePane
-                getYamlText={getYamlText}
-                parsedOutline={parsedOutline}
-                onYamlTextChange={onYamlTextChange}
-                streamCatalog={streamCatalog}
-                capabilitiesByDevice={capabilitiesByDevice}
-                streamWorkspaces={streamWorkspaces}
-                latestSignalsByDevice={latestSignalsByDevice}
-                colorScheme={colorScheme}
-                diagnostics={markerDiagnostics}
-                focusRequest={stepFocus}
-                activeStep={activeStep}
-                follow={follow && activeTab === "steps"}
-                onUserScroll={stopFollowing}
-              />
-            </Tabs.Panel>
-            <Tabs.Panel value="vars" pt="sm" style={tabPanelStyle(activeTab === "vars")}>
-              <SequencerMetadataPanel
-                metadata={metadata}
-                metadataCollapsed={false}
-                onToggleCollapsed={NOOP}
-                getYamlText={getYamlText}
-                onYamlTextChange={onYamlTextChange}
-                fill
-              />
-            </Tabs.Panel>
-            <Tabs.Panel value="yaml" pt="sm" style={tabPanelStyle(activeTab === "yaml")}>
-              <Stack gap={6} style={{ flex: 1, minHeight: 0 }}>
-                <Group justify="space-between">
-                  <Text size="xs" c="dimmed">
-                    {yamlViewMode === "edit" ? "Raw editable YAML" : "Read-only preview"}
-                  </Text>
-                  <SegmentedControl
-                    size="xs"
-                    value={yamlViewMode}
-                    onChange={(value) => onYamlViewModeChange(value as "edit" | "preview")}
-                    data={[
-                      { value: "preview", label: "Preview" },
-                      { value: "edit", label: "Edit" },
-                    ]}
-                  />
-                </Group>
-                {/* A flex column, so the editor gets a bounded height and scrolls. */}
-                <div
-                  style={{
-                    flex: 1,
-                    minHeight: 0,
-                    overflow: "hidden",
-                    display: "flex",
-                    flexDirection: "column",
-                  }}
-                >
-                  {/* Preview is the same editor, read-only, so it shows the
-                      diagnostic marks too. */}
-                  <Suspense
-                    fallback={
-                      <Text size="xs" c="dimmed">
-                        Loading YAML editor...
-                      </Text>
-                    }
-                  >
-                    <LazySequencerYamlCodeEditor
-                      ref={editorRef}
-                      value={yamlText}
-                      onChange={onYamlTextChange}
-                      colorScheme={colorScheme}
-                      diagnostics={markerDiagnostics}
-                      readOnly={yamlViewMode !== "edit"}
-                      activeStep={activeStep}
-                      follow={follow && activeTab === "yaml"}
-                      onUserScroll={stopFollowing}
-                      values={shownValues}
-                    />
-                  </Suspense>
-                </div>
-              </Stack>
-            </Tabs.Panel>
-            <Tabs.Panel value="timeline" pt="sm" style={tabPanelStyle(activeTab === "timeline")}>
-              {activeTab === "timeline" ? (
-                <SequencerTimelinePane
-                  outline={outline}
-                  plan={loaded ? plan : null}
-                  planError={planError}
-                  overridesInvalid={planOverridesInvalid}
-                  loops={loops}
-                  runtimeState={runtimeState}
-                  activeStep={activeStep}
-                  textNotLoaded={textNotLoaded}
-                  onOpenStep={(line) => {
-                    setActiveTab("steps");
-                    setStepFocus({ line, nonce: Date.now() });
-                  }}
-                />
-              ) : null}
-            </Tabs.Panel>
-          </Tabs>
-          </SequencerValuesContext.Provider>
+          {tabs}
         </div>
       </Stack>
+    ),
+    [
+      actionBusy,
+      adaptiveClearBusyStudyId,
+      adaptiveModes,
+      adaptiveStudies,
+      autoloadError,
+      canReloadSource,
+      cleanupActive,
+      currentStep,
+      currentStepDetail,
+      diagnostics,
+      editorEmpty,
+      editorLabel,
+      errorCount,
+      errorDetail,
+      etaText,
+      fileInputRef,
+      hasSequencerProcess,
+      jumpToDiagnostic,
+      libraryConfigured,
+      libraryEntries,
+      libraryError,
+      libraryLoading,
+      loadBusy,
+      loaded,
+      loadedAdaptiveIds,
+      loadedSource,
+      loadedYamlBusy,
+      loops,
+      modalError,
+      onAdaptiveModeChange,
+      onAddOverrideRow,
+      onClearAdaptiveStudy,
+      onClearOverrides,
+      onFileInputChange,
+      onJumpToDiagnostic,
+      onLoad,
+      onLoadSelectedLibrary,
+      onReloadLibrary,
+      onReloadLoadedSource,
+      onRemoveOverrideRow,
+      onRepeatCountChange,
+      onRunAction,
+      onRunModeChange,
+      onSelectedSequenceIdChange,
+      onShowLoadedYaml,
+      onUpdateOverrideRow,
+      onValidate,
+      otherSequenceLoaded,
+      outline,
+      overrideErrors,
+      overridePreview,
+      overrideRows,
+      overrideVarOptions,
+      overridesOpen,
+      overridesValid,
+      pauseInfo,
+      primaryAction,
+      primaryDisabled,
+      primaryIcon,
+      primaryLabel,
+      processState,
+      progress,
+      progressPercent,
+      progressText,
+      reloadSourceBusy,
+      reloadSourceLabel,
+      repeatCount,
+      runEvents,
+      runMode,
+      runtimeState,
+      selectedSequenceId,
+      showPause,
+      statusError,
+      tabs,
+      textNotLoaded,
+      validateBusy,
+      warningCount,
+      yamlDirty,
+    ]
+  );
+
+  if (page) {
+    return (
+      <div className="sequencer-page">
+        <Title order={4} style={{ flexShrink: 0 }}>
+          Sequencer
+        </Title>
+        {body}
+      </div>
+    );
+  }
+
+  return (
+    <Modal
+      opened={opened}
+      onClose={onClose}
+      title={
+        <Group gap={6} wrap="nowrap">
+          Sequencer
+          <Tooltip label="Open in a new tab" withinPortal zIndex={600}>
+            <ActionIcon
+              component="a"
+              href={sequencerPageUrl()}
+              target="_blank"
+              rel="noopener"
+              variant="subtle"
+              color="gray"
+              size="sm"
+              aria-label="Open the Sequencer in a new tab"
+            >
+              <IconExternalLink size={14} />
+            </ActionIcon>
+          </Tooltip>
+        </Group>
+      }
+      size="calc(100vw - 3rem)"
+      centered
+      styles={{
+        // The modal fills the window; its body takes what the header leaves.
+        content: { height: "calc(100dvh - 3rem)", display: "flex", flexDirection: "column" },
+        body: { flex: 1, minHeight: 0, display: "flex", flexDirection: "column", paddingTop: 0 },
+      }}
+    >
+      {body}
     </Modal>
   );
 }

@@ -2,6 +2,7 @@ import type { SequencerStepOutlineNode } from "../types";
 import {
   buildTemplateSnippet,
   findContainerInsertion,
+  keyListBlock,
   indentSnippet,
   insertLinesAfter,
   joinLines,
@@ -117,7 +118,6 @@ export function insertStepAtTopLevel(
   kind: BasicSequencerStepTemplate
 ): string {
   const { lines, hasTrailingNewline } = splitLines(yamlText);
-  const snippet = indentSnippet(buildTemplateSnippet(kind), 2);
   const stepsIndex = lines.findIndex((line) => {
     const match = line.match(/^(\s*)steps:\s*(.*)$/);
     if (!match) {
@@ -135,25 +135,16 @@ export function insertStepAtTopLevel(
       lines[stepsIndex] = "steps:";
     }
 
-    let insertIndex = stepsIndex + 1;
-    for (let index = stepsIndex + 1; index < lines.length; index += 1) {
-      const line = lines[index] ?? "";
-      if (!line.trim()) {
-        insertIndex = index + 1;
-        continue;
-      }
-      const indent = line.match(/^\s*/)?.[0].length ?? 0;
-      if (indent === 0) {
-        break;
-      }
-      insertIndex = index + 1;
-    }
+    // Match the existing items' column (they may sit in the `steps:` column).
+    const block = keyListBlock(lines, stepsIndex, 0);
+    const snippet = indentSnippet(buildTemplateSnippet(kind), block.itemIndent);
     return joinLines(
-      [...lines.slice(0, insertIndex), ...snippet, ...lines.slice(insertIndex)],
+      [...lines.slice(0, block.endIndex), ...snippet, ...lines.slice(block.endIndex)],
       hasTrailingNewline
     );
   }
 
+  const snippet = indentSnippet(buildTemplateSnippet(kind), 2);
   const nextLines = [...lines];
   if (nextLines.length > 0 && nextLines[nextLines.length - 1]?.trim().length > 0) {
     nextLines.push("");

@@ -610,10 +610,16 @@ function buildFlatStepNodes(lines: string[]): FlatStepNode[] {
     }
 
     const indent = line.match(/^\s*/)?.[0].length ?? 0;
-    while (
-      containerStack.length > 0 &&
-      indent <= containerStack[containerStack.length - 1].baseIndent
-    ) {
+    // YAML lets a key's list sit in the key's own column (`steps:` then
+    // `- for:`, as PyYAML writes it): such an item still belongs to the key.
+    const listItem = /^\s*-(?:\s|$)/.test(line);
+    while (containerStack.length > 0) {
+      const top = containerStack[containerStack.length - 1];
+      const ownUnindentedItem =
+        listItem && indent === top.baseIndent && (top.listIndent ?? indent) === indent;
+      if (indent > top.baseIndent || ownUnindentedItem) {
+        break;
+      }
       containerStack.pop();
     }
 
@@ -636,7 +642,7 @@ function buildFlatStepNodes(lines: string[]): FlatStepNode[] {
     }
 
     const currentContainer = containerStack[containerStack.length - 1];
-    if (indent <= currentContainer.baseIndent) {
+    if (indent < currentContainer.baseIndent) {
       continue;
     }
     if (currentContainer.listIndent === null) {

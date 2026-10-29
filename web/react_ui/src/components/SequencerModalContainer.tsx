@@ -20,6 +20,7 @@ import { SequencerModal } from "./SequencerModal";
 type Props = {
   opened: boolean;
   onClose: () => void;
+  page?: boolean;
   processState: string;
   runtimeState: string;
   loaded: boolean;

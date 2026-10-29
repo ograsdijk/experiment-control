@@ -421,23 +421,31 @@ export function AppModalsLayer({
 const NO_ADAPTIVE_STUDIES: Record<string, SequencerAdaptiveStudyStatus> = {};
 const NO_ADAPTIVE_IDS: readonly string[] = [];
 
-type SequencerModalSlotProps = {
+export type SequencerModalSlotProps = {
   sequencerProcessId: string | null;
   streamCatalog: StreamCatalogEntry[];
   capabilitiesByDevice: Record<string, CapabilityMember[]>;
   streamWorkspaces: Record<string, StreamAnalysisWorkspaceConfig>;
   latestSignalsByDevice: Record<string, Record<string, TelemetrySignal>>;
   colorScheme: "light" | "dark";
+  /** Render as the `?view=sequencer` page: always shown, nothing to close. */
+  page?: boolean;
 };
 
+const NOOP = () => undefined;
+// Shared elements: a new one per render would re-render the memoized modal body.
+const PAUSE_ICON = <IconPlayerPause size={14} />;
+const PLAY_ICON = <IconPlayerPlay size={14} />;
+
 /** Reads the sequencer context itself: its changes re-render only the modal. */
-function SequencerModalSlot({
+export function SequencerModalSlot({
   sequencerProcessId,
   streamCatalog,
   capabilitiesByDevice,
   streamWorkspaces,
   latestSignalsByDevice,
   colorScheme,
+  page = false,
 }: SequencerModalSlotProps) {
   const sequencerController = useSequencerContext();
   if (!sequencerController.sequencerOpen) {
@@ -446,7 +454,8 @@ function SequencerModalSlot({
   return (
         <SequencerModalContainer
           opened={sequencerController.sequencerOpen}
-        onClose={() => sequencerController.setSequencerOpen(false)}
+        page={page}
+        onClose={page ? NOOP : () => sequencerController.setSequencerOpen(false)}
         processState={sequencerController.sequencerProcessState}
         runtimeState={sequencerController.sequencerRuntimeState}
         loaded={sequencerController.sequencerLoaded}
@@ -472,13 +481,7 @@ function SequencerModalSlot({
         autoloadError={sequencerController.sequencerStatus?.autoloadError ?? null}
         statusError={sequencerController.sequencerStatus?.error ?? null}
         modalError={sequencerController.sequencerModalError}
-        primaryIcon={
-          sequencerController.sequencerPrimaryAction === "pause" ? (
-            <IconPlayerPause size={14} />
-          ) : (
-            <IconPlayerPlay size={14} />
-          )
-        }
+        primaryIcon={sequencerController.sequencerPrimaryAction === "pause" ? PAUSE_ICON : PLAY_ICON}
         primaryAction={sequencerController.sequencerPrimaryAction}
         primaryLabel={sequencerController.sequencerPrimaryLabel}
         primaryDisabled={sequencerController.sequencerPrimaryDisabled}

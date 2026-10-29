@@ -1,5 +1,6 @@
 import { Card, Stack, Text } from "@mantine/core";
-import { memo, useEffect, useMemo, useState } from "react";
+import { notifications } from "@mantine/notifications";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 import type { ActiveStep } from "../features/sequencer/active_step";
 import { flattenSequencerStepOutline } from "../features/sequencer/outline";
 import type { ParsedSequencerOutline } from "../features/sequencer/useSequencerOutline";
@@ -30,6 +31,7 @@ import type { StreamAnalysisWorkspaceConfig } from "../features/stream/types";
 import type { CapabilityMember } from "../types";
 import type { StreamCatalogEntry } from "../types";
 import type { TelemetrySignal } from "../types";
+import { perfCount } from "../features/performance/perfInstrumentation";
 
 type Props = {
   /** The editor's current text, read when an edit is applied. */
@@ -95,15 +97,23 @@ export const SequencerOutlinePane = memo(function SequencerOutlinePane({
   follow = false,
   onUserScroll,
 }: Props) {
+  perfCount("react.SequencerOutlinePane.renders");
   // Step edits use the outline's line ranges, which only fit the text they
-  // were parsed from: edits apply to that text. Right after a change the parse
-  // can trail the editor; an edit made in that window is dropped rather than
-  // applied at stale lines.
+  // were parsed from: edits apply to that text. An edit made here updates the
+  // outline at once, but right after typing in the YAML editor the parse can
+  // still trail it; an edit made in that window is refused, never applied at
+  // stale lines, and says so.
   const yamlText = parsedOutline.text;
   const onYamlTextChange = (value: string) => {
     if (getYamlText() === yamlText) {
       onYamlTextChangeProp(value);
+      return;
     }
+    notifications.show({
+      color: "yellow",
+      title: "Steps were still updating",
+      message: "That edit was not applied. Try it again.",
+    });
   };
   const outline = parsedOutline.outline;
   const outlineParseError = parsedOutline.error;
@@ -311,6 +321,42 @@ export const SequencerOutlinePane = memo(function SequencerOutlinePane({
     onYamlTextChange(moveStepDown(yamlText, node, nextSibling));
   };
 
+  // The memoized rows get handlers that keep their identity across renders
+  // and call the latest implementation (which reads the current text).
+  const latestHandlers = {
+    duplicate: handleDuplicateStep,
+    delete: handleDeleteStep,
+    toggleEnabled: handleToggleEnabled,
+    insertBelow: handleInsertBelow,
+    insertChild: handleInsertChild,
+    moveUp: handleMoveUp,
+    moveDown: handleMoveDown,
+  };
+  const handlersRef = useRef(latestHandlers);
+  handlersRef.current = latestHandlers;
+  const rowHandlers = useMemo(
+    () => ({
+      onDuplicate: (node: SequencerStepOutlineNode) => handlersRef.current.duplicate(node),
+      onDelete: (node: SequencerStepOutlineNode) => handlersRef.current.delete(node),
+      onToggleEnabled: (node: SequencerStepOutlineNode) => handlersRef.current.toggleEnabled(node),
+      onInsertBelow: (node: SequencerStepOutlineNode, kind: BasicSequencerStepTemplate) =>
+        handlersRef.current.insertBelow(node, kind),
+      onInsertChild: (
+        node: SequencerStepOutlineNode,
+        kind: BasicSequencerStepTemplate,
+        containerKey: SequencerChildContainer
+      ) => handlersRef.current.insertChild(node, kind, containerKey),
+      onMoveUp: (node: SequencerStepOutlineNode) => handlersRef.current.moveUp(node),
+      onMoveDown: (node: SequencerStepOutlineNode) => handlersRef.current.moveDown(node),
+      onToggleCollapse: (id: string) =>
+        setCollapsedById((prev) => ({
+          ...prev,
+          [id]: !Boolean(prev[id]),
+        })),
+    }),
+    []
+  );
+
   const handleInsertTopLevel = (kind: BasicSequencerStepTemplate) => {
     const fallbackLine = outline.length > 0 ? outline[outline.length - 1]?.endLine ?? 1 : 1;
     setPendingSelection({
@@ -360,20 +406,15 @@ export const SequencerOutlinePane = memo(function SequencerOutlinePane({
           selectedId={selectedId}
           onSelect={setSelectedId}
           collapsedById={collapsedById}
-          onToggleCollapse={(id) =>
-            setCollapsedById((prev) => ({
-              ...prev,
-              [id]: !Boolean(prev[id]),
-            }))
-          }
-          onDuplicate={handleDuplicateStep}
-          onDelete={handleDeleteStep}
-          onToggleEnabled={handleToggleEnabled}
-          onInsertBelow={handleInsertBelow}
-          onInsertChild={handleInsertChild}
+          onToggleCollapse={rowHandlers.onToggleCollapse}
+          onDuplicate={rowHandlers.onDuplicate}
+          onDelete={rowHandlers.onDelete}
+          onToggleEnabled={rowHandlers.onToggleEnabled}
+          onInsertBelow={rowHandlers.onInsertBelow}
+          onInsertChild={rowHandlers.onInsertChild}
           siblingInfoById={siblingInfoById}
-          onMoveUp={handleMoveUp}
-          onMoveDown={handleMoveDown}
+          onMoveUp={rowHandlers.onMoveUp}
+          onMoveDown={rowHandlers.onMoveDown}
           onInsertTopLevel={handleInsertTopLevel}
           stepDiagnostics={stepDiagnostics}
           activeLeafId={activeLeafId}

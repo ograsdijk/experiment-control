@@ -1,7 +1,10 @@
 import {
   createContext,
   useContext,
+  useLayoutEffect,
   useMemo,
+  useState,
+  useSyncExternalStore,
   type CSSProperties,
   type MutableRefObject,
   type ReactNode,
@@ -35,7 +38,39 @@ export type SequencerApi = {
   refreshSequencerStatus: SequencerController["refreshSequencerStatus"];
 };
 
-const SequencerControllerContext = createContext<SequencerController | null>(null);
+/**
+ * The controller changes with every keystroke. Handing it down as a context
+ * value would make React search the whole tree below the provider (all of
+ * the dashboard, and every step row) for readers on each change, memo or
+ * not. The context holds this store instead, which never changes; only the
+ * components that subscribe re-render.
+ */
+type ControllerStore = {
+  get: () => SequencerController;
+  subscribe: (listener: () => void) => () => void;
+  publish: (controller: SequencerController) => void;
+};
+
+function createControllerStore(initial: SequencerController): ControllerStore {
+  let current = initial;
+  const listeners = new Set<() => void>();
+  return {
+    get: () => current,
+    subscribe: (listener) => {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    },
+    publish: (controller) => {
+      if (controller === current) {
+        return;
+      }
+      current = controller;
+      listeners.forEach((listener) => listener());
+    },
+  };
+}
+
+const SequencerControllerContext = createContext<ControllerStore | null>(null);
 const SequencerHeaderContext = createContext<SequencerHeaderSummary | null>(null);
 
 type ProviderProps = Parameters<typeof useSequencerController>[0] & {
@@ -73,6 +108,11 @@ function chipProgressStyle(
 export function SequencerProvider({ colorScheme, apiRef, children, ...deps }: ProviderProps) {
   const controller = useSequencerController(deps);
   apiRef.current = { refreshSequencerStatus: controller.refreshSequencerStatus };
+  const [store] = useState(() => createControllerStore(controller));
+  // After commit, so subscribers never see a controller React then discards.
+  useLayoutEffect(() => {
+    store.publish(controller);
+  });
 
   const {
     sequencerProcessState,
@@ -132,18 +172,18 @@ export function SequencerProvider({ colorScheme, apiRef, children, ...deps }: Pr
   );
 
   return (
-    <SequencerControllerContext.Provider value={controller}>
+    <SequencerControllerContext.Provider value={store}>
       <SequencerHeaderContext.Provider value={header}>{children}</SequencerHeaderContext.Provider>
     </SequencerControllerContext.Provider>
   );
 }
 
 export function useSequencerContext(): SequencerController {
-  const value = useContext(SequencerControllerContext);
-  if (!value) {
+  const store = useContext(SequencerControllerContext);
+  if (!store) {
     throw new Error("useSequencerContext must be used inside SequencerProvider");
   }
-  return value;
+  return useSyncExternalStore(store.subscribe, store.get);
 }
 
 export function useSequencerHeader(): SequencerHeaderSummary {

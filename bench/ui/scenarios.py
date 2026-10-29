@@ -482,13 +482,59 @@ def _keystroke_summary(events: list[Json], keystrokes: int) -> Json:
     }
 
 
-async def _open_sequencer_editor(page: Page) -> str | None:
-    """Open the Sequencer on its YAML tab in edit mode, with the loaded sequence shown."""
+async def _open_sequencer_editor(page: Page, timing: Json | None = None) -> str | None:
+    """Open the Sequencer on its YAML tab in edit mode, with the loaded sequence shown.
+
+    `timing`, when given, receives click → modal settled and click → loaded
+    sequence in the (still hidden) YAML editor, plus long frames meanwhile.
+    """
     if not await page.evaluate("!!window.__ECB__.locate('Sequencer')"):
         return "no sequencer"
     await close_all_modals(page)
+    since = await page.evaluate("performance.now()")
     await click_label(page, "Sequencer")
-    await page.evaluate("window.__ECB__.waitUntil('window.__ECB__.modalState().settled')")
+    settled = await page.evaluate("window.__ECB__.waitUntil('window.__ECB__.modalState().settled')")
+    loaded_expr = json.dumps(f"!!{CM_CONTENT} && {CM_CONTENT}.textContent.length > 500")
+    loaded = await page.evaluate(f"window.__ECB__.waitUntil({loaded_expr}, 20000)")
+    if timing is not None:
+        await asyncio.sleep(0.5)
+        loaf = await page.evaluate(f"window.__ECB__.loafSummary({since})")
+        timing.update(
+            {
+                "click_to_settled_ms": settled["sinceInput"],
+                "click_to_text_ms": None if loaded["timedOut"] else loaded["sinceInput"],
+                "long_frame_max_ms": loaf["maxMs"],
+                "long_frame_blocking_ms": loaf["blockingMs"],
+            }
+        )
+    return await _show_yaml_editor(page)
+
+
+async def _open_sequencer_page(page: Page, timing: Json) -> str | None:
+    """Load the dashboard as the `?view=sequencer` page and show its YAML
+    editor. `timing` receives navigation start → loaded sequence in the
+    (still hidden) YAML editor, plus long frames meanwhile."""
+    origin = await page.evaluate("location.origin")
+    await page.navigate(f"{origin}/?perf=1&view=sequencer")
+    await page.wait_for("!!window.__EC_PERF__ && !!window.__ECB__", timeout=60)
+    loaded_expr = json.dumps(f"!!{CM_CONTENT} && {CM_CONTENT}.textContent.length > 500")
+    loaded = await page.evaluate(f"window.__ECB__.waitUntil({loaded_expr}, 30000)")
+    if loaded["timedOut"]:
+        return "page did not show the sequence"
+    await asyncio.sleep(0.5)
+    loaf = await page.evaluate("window.__ECB__.loafSummary(0)")
+    timing.update(
+        {
+            "navigation_to_text_ms": loaded["at"],
+            "long_frame_max_ms": loaf["maxMs"],
+            "long_frame_blocking_ms": loaf["blockingMs"],
+        }
+    )
+    return await _show_yaml_editor(page)
+
+
+async def _show_yaml_editor(page: Page) -> str | None:
+    """Switch the open Sequencer to its YAML tab in edit mode."""
     await click_label(page, "YAML", "[role=tab]")
     try:
         await page.wait_for(f"!!{CM_CONTENT} && {CM_CONTENT}.textContent.length > 500", timeout=15)
@@ -536,13 +582,105 @@ async def _sequencer_typing(page: Page, text: str = " # typed by the UI benchmar
     return out
 
 
-async def scenario_sequencer(page: Page, *, warmup_s: float, idle_s: float = 10.0) -> Json:
-    """Sequencer modal with a ~900-line sequence: idle, typing, library search and switch."""
+class ProcessCallTap:
+    """Per-action timing of process RPCs (`POST /api/processes/<id>/call`) via CDP Network.
+
+    `server_ms` is request sent → response headers (gateway + process time);
+    `total_ms` adds the body download and the wait for the page to take it.
+    """
+
+    def __init__(self, page: Page) -> None:
+        self.page = page
+        self.pending: dict[str, tuple[str, float]] = {}
+        self.server: dict[str, float] = {}
+        self.calls: list[Json] = []
+        self._handlers = {
+            "Network.requestWillBeSent": self._request,
+            "Network.responseReceived": self._response,
+            "Network.loadingFinished": self._finished,
+        }
+
+    def _request(self, p: Json) -> None:
+        req = p["request"]
+        if req.get("method") != "POST" or not req["url"].split("?", 1)[0].endswith("/call"):
+            return
+        try:
+            action = json.loads(req.get("postData") or "{}").get("action", "?")
+        except ValueError:
+            action = "?"
+        self.pending[p["requestId"]] = (str(action), float(p["timestamp"]))
+
+    def _response(self, p: Json) -> None:
+        timing = p["response"].get("timing")
+        if p["requestId"] in self.pending and timing:
+            self.server[p["requestId"]] = timing["receiveHeadersEnd"] - timing["sendStart"]
+
+    def _finished(self, p: Json) -> None:
+        entry = self.pending.pop(p["requestId"], None)
+        if entry:
+            action, started = entry
+            self.calls.append(
+                {
+                    "action": action,
+                    "server_ms": self.server.pop(p["requestId"], None),
+                    "total_ms": (float(p["timestamp"]) - started) * 1000,
+                }
+            )
+
+    async def start(self) -> None:
+        for method, handler in self._handlers.items():
+            self.page.on(method, handler)
+        await self.page.send("Network.enable")
+
+    async def stop(self) -> Json:
+        await self.page.send("Network.disable")
+        for method, handler in self._handlers.items():
+            self.page.off(method, handler)
+        out: Json = {}
+        for action in sorted({c["action"] for c in self.calls}):
+            rows = [c for c in self.calls if c["action"] == action]
+            server = [c["server_ms"] for c in rows if c["server_ms"] is not None]
+            out[action] = {
+                "count": len(rows),
+                "server_ms_median": statistics.median(server) if server else None,
+                "server_ms_max": max(server) if server else None,
+                "total_ms_median": statistics.median(c["total_ms"] for c in rows),
+            }
+        return out
+
+
+async def scenario_sequencer(
+    page: Page, *, warmup_s: float, idle_s: float = 10.0, page_view: bool = False
+) -> Json:
+    """Sequencer modal with a ~900-line sequence: first open, idle, typing,
+    validate, library search and switch, and the sequencer RPCs behind them.
+    With `page_view`, the same on the `?view=sequencer` page, where no
+    dashboard renders behind the Sequencer."""
     await asyncio.sleep(warmup_s)
-    skipped = await _open_sequencer_editor(page)
+    tap = ProcessCallTap(page)
+    await tap.start()
+    open_timing: Json = {}
+    if page_view:
+        skipped = await _open_sequencer_page(page, open_timing)
+    else:
+        skipped = await _open_sequencer_editor(page, open_timing)
     if skipped:
+        await tap.stop()
         return {"skipped": skipped}
-    out: Json = {}
+    out: Json = {"first_open": open_timing}
+
+    # Let the opening work finish (outline, values, run events) so the idle
+    # window holds only polls and telemetry: no long frame for one second.
+    quiet_since = await page.evaluate("performance.now()")
+    for _ in range(40):
+        await asyncio.sleep(0.25)
+        last = await page.evaluate(
+            f"Math.max({quiet_since}, ...window.__ECB__.state.loaf.map((e) => e.start + e.dur))"
+        )
+        now = await page.evaluate("performance.now()")
+        if now - last >= 1000:
+            break
+    open_timing["quiet_after_text_ms"] = last - quiet_since
 
     # Idle with the modal open: only status polls and telemetry run.
     since = await page.evaluate("performance.now()")
@@ -561,8 +699,26 @@ async def scenario_sequencer(page: Page, *, warmup_s: float, idle_s: float = 10.
     await _focus_editor_mid_line(page)
     out["editor_typing"] = await _type_measured(page, " # typed by the UI benchmark" * 2)
 
+    # Validate + Preflight on the edited text → its result notification.
+    await dismiss_notifications(page)
+    since = await page.evaluate("performance.now()")
+    await click_label(page, "Validate + Preflight")
+    done = json.dumps(
+        "[...document.querySelectorAll('.mantine-Notification-root')]"
+        ".some((n) => /Sequence (checks passed|has issues)|Validate \\+ preflight failed/.test(n.textContent))"
+    )
+    res = await page.evaluate(f"window.__ECB__.waitUntil({done}, 30000)")
+    loaf = await page.evaluate(f"window.__ECB__.loafSummary({since})")
+    out["validate"] = {
+        "click_to_result_ms": None if res["timedOut"] else res["sinceInput"],
+        "long_frame_max_ms": loaf["maxMs"],
+        "long_frame_blocking_ms": loaf["blockingMs"],
+    }
+    await dismiss_notifications(page)
+
     if not await page.evaluate(f"!!{LIBRARY_INPUT}"):
         out["library"] = {"skipped": "no sequence library"}
+        out["process_calls"] = await tap.stop()
         await close_all_modals(page)
         return out
     pos = await page.evaluate(
@@ -590,6 +746,7 @@ async def scenario_sequencer(page: Page, *, warmup_s: float, idle_s: float = 10.
         "long_frame_max_ms": loaf["maxMs"],
         "long_frame_blocking_ms": loaf["blockingMs"],
     }
+    out["process_calls"] = await tap.stop()
     await close_all_modals(page)
     return out
 

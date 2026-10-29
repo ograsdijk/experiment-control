@@ -28,6 +28,7 @@ import type {
   SequencerRunEvent,
 } from "../features/sequencer/types";
 import { formatDurationCompact, runEventToDiagnostic } from "../features/sequencer/utils";
+import { perfCount } from "../features/performance/perfInstrumentation";
 
 export type SequencerLibraryEntry = {
   id: string;
@@ -156,6 +157,7 @@ export const SequencerSidebar = memo(function SequencerSidebar({
   textNotLoaded,
   onJumpToDiagnostic: jumpToDiagnostic,
 }: Props) {
+  perfCount("react.SequencerSidebar.renders");
   const libraryOptions = useMemo(
     () =>
       libraryEntries.map((entry) => ({

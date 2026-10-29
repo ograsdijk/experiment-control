@@ -45,8 +45,18 @@ def _telemetry_outputs(signal_count: int) -> list[dict[str, Any]]:
     return outputs
 
 
+class _IndentedListDumper(yaml.SafeDumper):
+    """Indents list items under their key (`steps:` / `  - for:`), as hand-written
+    sequences do; PyYAML's default puts them in the key's column."""
+
+    def increase_indent(self, flow: bool = False, indentless: bool = False) -> None:
+        super().increase_indent(flow, False)
+
+
 def _write_yaml(path: Path, value: object) -> None:
-    path.write_text(yaml.safe_dump(value, sort_keys=False), encoding="utf-8")
+    path.write_text(
+        yaml.dump(value, Dumper=_IndentedListDumper, sort_keys=False), encoding="utf-8"
+    )
 
 
 def _benchmark_sequence(telemetry_devices: int, blocks: int = 40) -> dict[str, Any]:

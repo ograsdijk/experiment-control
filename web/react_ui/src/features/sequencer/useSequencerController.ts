@@ -811,12 +811,14 @@ export function useSequencerController({
     setSequencerOpen(true);
     setSequencerYamlViewMode("preview");
     setSequencerModalError(null);
-    await refreshSequencerStatus(sequencerProcess.process_id);
-    await fetchSequencerLoadedYaml(sequencerProcess.process_id, {
-      applyToEditor: true,
-      silent: true,
-    });
-    await refreshSequencerLibrary(sequencerProcess.process_id, { silent: true });
+    await Promise.all([
+      refreshSequencerStatus(sequencerProcess.process_id),
+      fetchSequencerLoadedYaml(sequencerProcess.process_id, {
+        applyToEditor: true,
+        silent: true,
+      }),
+      refreshSequencerLibrary(sequencerProcess.process_id, { silent: true }),
+    ]);
   }, [
     fetchSequencerLoadedYaml,
     refreshSequencerLibrary,
@@ -1379,12 +1381,16 @@ export function useSequencerController({
       setSequencerLoadSource(
         loadRequest.action === "sequencer.library.load" ? "library" : "editor"
       );
-      await refreshSequencerStatus(sequencerProcess.process_id);
-      await fetchSequencerLoadedYaml(sequencerProcess.process_id, {
-        applyToEditor: true,
-        silent: true,
-      });
-      await refreshProcesses();
+      // Independent reads: together, not one after the other.
+      await Promise.all([
+        refreshSequencerStatus(sequencerProcess.process_id),
+        fetchSequencerLoadedYaml(sequencerProcess.process_id, {
+          applyToEditor: true,
+          silent: true,
+        }),
+      ]);
+      // The process list only feeds the dashboard: the load is done without it.
+      void Promise.resolve(refreshProcesses()).catch(() => undefined);
     } finally {
       setSequencerLoadBusy(false);
     }
