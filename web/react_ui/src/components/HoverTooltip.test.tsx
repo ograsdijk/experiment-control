@@ -70,4 +70,45 @@ describe("HoverTooltip", () => {
     });
     expect(document.querySelectorAll("[data-portal]")).toHaveLength(0);
   });
+
+  it("closes when the pointer is elsewhere even if the target never saw a mouseout", () => {
+    act(() =>
+      root.render(
+        createElement(
+          MantineProvider,
+          null,
+          createElement(
+            "div",
+            null,
+            createElement(HoverTooltip, {
+              label: "Restart driver",
+              children: createElement("button", null, "R"),
+            }),
+            createElement("span", { id: "elsewhere" }, "x")
+          )
+        )
+      )
+    );
+    act(() => {
+      container
+        .querySelector("button")!
+        .dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
+    });
+    expect(document.body.textContent).toContain("Restart driver");
+
+    // Opening remounts the button; the browser's mouseout can go to the old,
+    // detached node, so only the next element's mouseover is seen.
+    act(() => {
+      container
+        .querySelector("button")!
+        .dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
+    });
+    expect(document.body.textContent).toContain("Restart driver");
+    act(() => {
+      container
+        .querySelector("#elsewhere")!
+        .dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
+    });
+    expect(document.body.textContent).not.toContain("Restart driver");
+  });
 });
