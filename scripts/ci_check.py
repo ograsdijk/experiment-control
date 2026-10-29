@@ -362,6 +362,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.install_hook:
         return install_hook()
 
+    # Buffered step output is re-printed here; a console or redirected file in
+    # a legacy code page (cp1252) can't encode every character tools print.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(errors="replace")
     steps = select_steps(args)
     jobs = list(dict.fromkeys(step.job for step in steps))
     # Jobs are independent (CI runs them as separate workflow jobs), so a
