@@ -130,6 +130,20 @@ class RunFormTests(unittest.TestCase):
                 _load("  sections:\n" + section + field)
             self.assertIn(message, str(ctx.exception))
 
+    def test_one_target_and_one_range_that_moves_it(self) -> None:
+        target = "        - {type: target, var: target, catalog: targets}\n"
+        range_ = "        - {type: range, target: %s, relative: relative, from: lo, to: hi, points: points}\n"
+        cases = {
+            target + target: "more than one target field",
+            target + range_ % "target" + range_ % "target": "more than one range field",
+            range_ % "target": "must name the form's target field var",
+            target + range_ % "park": "range field's target 'park'",
+        }
+        for fields, message in cases.items():
+            with self.assertRaises(TypeError) as ctx:
+                _load("  sections:\n    - fields:\n" + fields)
+            self.assertIn(message, str(ctx.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

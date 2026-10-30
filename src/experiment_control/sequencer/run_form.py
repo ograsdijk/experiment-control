@@ -107,6 +107,8 @@ def validate_run_form(raw: Any, vars_map: dict[str, Any]) -> dict[str, Any]:
     sections = form.get("sections")
     if not isinstance(sections, list) or not sections:
         raise TypeError("form.sections must be a non-empty list")
+    targets: list[str] = []
+    ranges: list[str] = []
     for s_index, section_raw in enumerate(sections):
         where = f"form.sections[{s_index}]"
         section = _require_dict(section_raw, where)
@@ -125,6 +127,19 @@ def validate_run_form(raw: Any, vars_map: dict[str, Any]) -> dict[str, Any]:
             raise TypeError(f"{where}.fields must be a non-empty list")
         for f_index, field in enumerate(fields):
             _check_field(field, f"{where}.fields[{f_index}]", vars_map)
+            if field["type"] == "target":
+                targets.append(field["var"])
+            elif field["type"] == "range":
+                ranges.append(field["target"])
+    # The dialog has one scan target and at most one range, which moves it.
+    if len(targets) > 1:
+        raise TypeError("form has more than one target field")
+    if len(ranges) > 1:
+        raise TypeError("form has more than one range field")
+    if ranges and ranges[0] not in targets:
+        raise TypeError(
+            f"form range field's target {ranges[0]!r} must name the form's target field var"
+        )
     for p_index, preset_raw in enumerate(form.get("presets", []) or []):
         where = f"form.presets[{p_index}]"
         preset = _require_dict(preset_raw, where)

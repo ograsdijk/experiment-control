@@ -225,13 +225,29 @@ export function targetSetValues(
   return out;
 }
 
-/** Apply `sets` and `includes`: what the chosen target fixes always wins. */
+/**
+ * Apply `sets` and `includes`: what the chosen target fixes always wins.
+ * With `previous`, a newly chosen target that leaves a `sets` var free puts
+ * it back to the sequence's own value, not the last target's.
+ */
 export function settleFormValues(
   form: RunForm,
   vars: Record<string, unknown>,
-  values: Record<string, unknown>
+  values: Record<string, unknown>,
+  previous?: Record<string, unknown>
 ): Record<string, unknown> {
-  const out = { ...values, ...targetSetValues(form, values) };
+  const out = { ...values };
+  if (previous) {
+    for (const field of formFields(form)) {
+      if (field.type !== "target" || !field.sets || targetId(values[field.var]) === targetId(previous[field.var])) {
+        continue;
+      }
+      for (const name of Object.keys(field.sets)) {
+        out[name] = vars[name];
+      }
+    }
+  }
+  Object.assign(out, targetSetValues(form, values));
   for (const field of formFields(form)) {
     if (field.type !== "chips" || !field.includes) {
       continue;
@@ -249,6 +265,10 @@ export function settleFormValues(
     );
   }
   return out;
+}
+
+function targetId(value: unknown): unknown {
+  return value && typeof value === "object" ? (value as Record<string, unknown>).id : undefined;
 }
 
 export type SectionBlock =
@@ -471,4 +491,15 @@ export function formatNumber(value: number, digits = 9): string {
     return "–";
   }
   return Number(value.toPrecision(digits)).toString();
+}
+
+/** A target's display scale (1 when missing, zero or not a number). */
+export function displayScale(target: ScanTarget | null): number {
+  const scale = Number(target?.display_scale);
+  return Number.isFinite(scale) && scale !== 0 ? scale : 1;
+}
+
+/** A base-unit value of the target, in its display unit. */
+export function formatTargetValue(value: number, target: ScanTarget): string {
+  return `${formatNumber(value / displayScale(target))} ${target.display_unit ?? ""}`.trim();
 }

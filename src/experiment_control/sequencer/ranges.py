@@ -364,7 +364,9 @@ def _generate_core(
         offset_val = float(render_templates(offset, env))
 
     if seed is not None:
-        seed = int(render_templates(seed, env))
+        # A template may render to null: a fresh draw, as with no seed.
+        rendered_seed = render_templates(seed, env)
+        seed = int(rendered_seed) if rendered_seed is not None else None
 
     if "range" in gen_spec:
         params = _check_generator_fields("range", render_templates(gen_spec["range"], env))

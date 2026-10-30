@@ -46,6 +46,21 @@ class SequencerRangeGeneratorTests(unittest.TestCase):
         self.assertEqual(a, b)
         self.assertEqual(len(a), 8)
 
+    def test_seed_template_rendering_null_is_a_fresh_draw(self) -> None:
+        spec = {
+            "linspace": {"start": 0.0, "stop": 19.0, "num": 20},
+            "shuffle": True,
+            "seed": "${s}",
+        }
+        seeded = generate_from_gen(spec, env={"s": 5})
+        self.assertEqual(seeded, generate_from_gen(spec, env={"s": 5}))
+        draws = {
+            tuple(r["value"] for r in generate_from_gen(spec, env={"s": None}))
+            for _ in range(5)
+        }
+        # Five fresh shuffles of 20 values are practically never all equal.
+        self.assertGreater(len(draws), 1)
+
     def test_triangle_num_must_be_at_least_two(self) -> None:
         with self.assertRaises(ValueError):
             generate_from_gen({"triangle": {"start": 0, "stop": 1, "num": 1}}, env={})

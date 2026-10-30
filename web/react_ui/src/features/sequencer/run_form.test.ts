@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   buildRunOverrides,
+  formatTargetValue,
   formVarNames,
   initialFormValues,
   linspace,
@@ -207,6 +208,24 @@ describe("target sets and chip includes", () => {
     const values = { target: { id: "x", wm: null }, park: 16, cycle: [1] };
     expect(targetSetValues(form, values)).toEqual({});
     expect(settleFormValues(form, vars, values)).toMatchObject({ park: 16, cycle: [1, 16] });
+  });
+
+  it("puts the var back to the sequence's value when a new target leaves it free", () => {
+    const seqVars = { ...vars, park: 16 };
+    const prev = { target: { id: "d1", wm: 5 }, park: 5, cycle: [1, 5, 16] };
+    const next = settleFormValues(form, seqVars, { ...prev, target: { id: "rc", wm: null } }, prev);
+    expect(next.park).toBe(16);
+    // An edit that keeps the target keeps a value the user chose.
+    const chosen = { target: { id: "rc", wm: null }, park: 2, cycle: [1, 2] };
+    expect(settleFormValues(form, seqVars, { ...chosen, cycle: [2] }, chosen).park).toBe(2);
+  });
+});
+
+describe("formatTargetValue", () => {
+  it("shows the value in the display unit, ignoring a zero scale", () => {
+    const target = { display_scale: 1e9, display_unit: "GHz" } as unknown as ScanTarget;
+    expect(formatTargetValue(13.3e9, target)).toBe("13.3 GHz");
+    expect(formatTargetValue(5, { ...target, display_scale: 0 })).toBe("5 GHz");
   });
 });
 
