@@ -31,10 +31,14 @@ import {
   otherTargetsFor,
   rangeProblems,
   rangeValues,
+  sectionBlocks,
+  settleFormValues,
   summaryFigures,
+  targetSetValues,
   type ParsedRunForm,
   type RunFormField,
   type RunFormOption,
+  type RunFormSection,
   type ScanTarget,
 } from "../features/sequencer/run_form";
 
@@ -81,8 +85,15 @@ export function SequencerRunFormModal({
     }
   }, [opened, parsed]);
 
-  const set = (patch: Values) => setValues((prev) => ({ ...prev, ...patch }));
+  const set = (patch: Values) =>
+    setValues((prev) => settleFormValues(form, vars, { ...prev, ...patch }));
   const enabled = (field: RunFormField) => !field.enabled_by || values[field.enabled_by] === true;
+  // Vars the chosen target sets: shown, but not editable.
+  const locked = new Set(Object.keys(targetSetValues(form, values)));
+  const blocks = sectionBlocks(form.sections);
+  const twoColumns = blocks.some(
+    (block) => "left" in block && block.left.length > 0 && block.right.length > 0
+  );
 
   const targetField = form.sections
     .flatMap((section) => section.fields)
@@ -108,12 +119,66 @@ export function SequencerRunFormModal({
   const figures = summaryFigures(form.summary, { ...vars, ...values });
   const overrides = useMemo(() => buildRunOverrides(form, values), [form, values]);
 
+  const fieldProps = (field: RunFormField, sectionOn: boolean): FieldProps => ({
+    field,
+    values,
+    vars,
+    disabled: !sectionOn || !enabled(field),
+    locked: "var" in field && locked.has(field.var),
+    onChange: set,
+    latestSignalsByDevice,
+    target,
+    origin,
+    scanValues,
+    rangeField: rangeField ?? null,
+  });
+  const renderSection = (section: RunFormSection, key: string | number) => {
+    const sectionOn = !section.toggle || values[section.toggle] === true;
+    return (
+      <Paper key={key} withBorder p="sm" radius="md">
+        <Group justify="space-between" mb="xs">
+          <Text fw={500} size="sm">
+            {section.title}
+          </Text>
+          {section.toggle && (
+            <Checkbox
+              size="xs"
+              label="Enabled"
+              checked={values[section.toggle] === true}
+              onChange={(event) => set({ [section.toggle as string]: event.currentTarget.checked })}
+            />
+          )}
+        </Group>
+        <Stack gap="xs" style={{ opacity: sectionOn ? 1 : 0.45 }}>
+          {fieldRuns(section.fields).map((run, runIndex) =>
+            run.kind === "single" ? (
+              <FormField key={runIndex} {...fieldProps(run.fields[0], sectionOn)} />
+            ) : run.kind === "numbers" ? (
+              // Number boxes side by side, up to three a row.
+              <SimpleGrid key={runIndex} cols={Math.min(run.fields.length, 3)} spacing="xs">
+                {run.fields.map((field, i) => (
+                  <FormField key={i} {...fieldProps(field, sectionOn)} />
+                ))}
+              </SimpleGrid>
+            ) : (
+              <Group key={runIndex} gap="md" style={{ rowGap: 6 }}>
+                {run.fields.map((field, i) => (
+                  <FormField key={i} {...fieldProps(field, sectionOn)} />
+                ))}
+              </Group>
+            )
+          )}
+        </Stack>
+      </Paper>
+    );
+  };
+
   return (
     <Modal
       opened={opened}
       onClose={onClose}
       title={form.title ?? "Run with form"}
-      size="lg"
+      size={twoColumns ? "min(1180px, 96vw)" : "lg"}
       zIndex={500}
     >
       <Stack gap="md">
@@ -141,45 +206,21 @@ export function SequencerRunFormModal({
           </Group>
         )}
 
-        {form.sections.map((section, index) => {
-          const sectionOn = !section.toggle || values[section.toggle] === true;
-          return (
-            <Paper key={section.title ?? index} withBorder p="sm" radius="md">
-              <Group justify="space-between" mb="xs">
-                <Text fw={500} size="sm">
-                  {section.title}
-                </Text>
-                {section.toggle && (
-                  <Checkbox
-                    size="xs"
-                    label="Enabled"
-                    checked={values[section.toggle] === true}
-                    onChange={(event) =>
-                      set({ [section.toggle as string]: event.currentTarget.checked })
-                    }
-                  />
-                )}
-              </Group>
-              <Stack gap="xs" style={{ opacity: sectionOn ? 1 : 0.45 }}>
-                {section.fields.map((field, fieldIndex) => (
-                  <FormField
-                    key={fieldIndex}
-                    field={field}
-                    values={values}
-                    vars={vars}
-                    disabled={!sectionOn || !enabled(field)}
-                    onChange={set}
-                    latestSignalsByDevice={latestSignalsByDevice}
-                    target={target}
-                    origin={origin}
-                    scanValues={scanValues}
-                    rangeField={rangeField ?? null}
-                  />
+        {blocks.map((block, index) =>
+          "wide" in block ? (
+            renderSection(block.wide, index)
+          ) : (
+            <SimpleGrid key={index} cols={{ base: 1, md: twoColumns ? 2 : 1 }} spacing="md">
+              {[block.left, block.right]
+                .filter((column) => column.length > 0)
+                .map((column, side) => (
+                  <Stack key={side} gap="md">
+                    {column.map((section, row) => renderSection(section, `${index}-${side}-${row}`))}
+                  </Stack>
                 ))}
-              </Stack>
-            </Paper>
-          );
-        })}
+            </SimpleGrid>
+          )
+        )}
 
         {problems.length > 0 && (
           <Alert color="red" variant="light" p="xs">
@@ -300,11 +341,35 @@ function useLiveValue(
   return current?.abs ? Math.abs(fromTelemetry) : fromTelemetry;
 }
 
+type FieldRun = { kind: "single" | "numbers" | "checks"; fields: RunFormField[] };
+
+/** Consecutive number boxes share a row; consecutive checkboxes wrap side by side. */
+function fieldRuns(fields: RunFormField[]): FieldRun[] {
+  const runs: FieldRun[] = [];
+  for (const field of fields) {
+    const kind =
+      field.type === "number" || field.type === "integer"
+        ? "numbers"
+        : field.type === "checkbox"
+          ? "checks"
+          : "single";
+    const last = runs[runs.length - 1];
+    if (kind !== "single" && last?.kind === kind) {
+      last.fields.push(field);
+    } else {
+      runs.push({ kind, fields: [field] });
+    }
+  }
+  return runs;
+}
+
 type FieldProps = {
   field: RunFormField;
   values: Values;
   vars: Record<string, unknown>;
   disabled: boolean;
+  /** Set by the chosen target (`sets`): shown, not editable. */
+  locked: boolean;
   onChange: (patch: Values) => void;
   latestSignalsByDevice: Record<string, Record<string, TelemetrySignal>>;
   target: ScanTarget | null;
@@ -314,8 +379,11 @@ type FieldProps = {
   rangeField: Extract<RunFormField, { type: "range" }> | null;
 };
 
+const LOCKED_NOTE = "Set by the scan target";
+
 function FormField(props: FieldProps) {
-  const { field, values, disabled, onChange } = props;
+  const { field, values, onChange, locked } = props;
+  const disabled = props.disabled || locked;
   switch (field.type) {
     case "checkbox":
       return (
@@ -343,7 +411,7 @@ function FormField(props: FieldProps) {
             const n = num(value, num(values[field.var]));
             onChange({ [field.var]: field.type === "integer" ? Math.trunc(n) : n });
           }}
-          maw={220}
+          description={locked ? LOCKED_NOTE : undefined}
         />
       );
     case "text":
@@ -354,13 +422,14 @@ function FormField(props: FieldProps) {
           disabled={disabled}
           value={String(values[field.var] ?? "")}
           onChange={(event) => onChange({ [field.var]: event.currentTarget.value })}
+          description={locked ? LOCKED_NOTE : undefined}
           maw={320}
         />
       );
     case "select":
-      return <SelectField {...props} field={field} />;
+      return <SelectField {...props} disabled={disabled} field={field} />;
     case "chips":
-      return <ChipsField {...props} field={field} />;
+      return <ChipsField {...props} disabled={disabled} field={field} />;
     case "target":
       return <TargetField {...props} field={field} />;
     case "range":
@@ -375,6 +444,7 @@ function SelectField({
   values,
   vars,
   disabled,
+  locked,
   onChange,
 }: FieldProps & { field: Extract<RunFormField, { type: "select" }> }) {
   const [called, setCalled] = useState<RunFormOption[] | null>(null);
@@ -412,6 +482,7 @@ function SelectField({
       allowDeselect={false}
       comboboxProps={{ zIndex: 600 }}
       onChange={(value) => value !== null && onChange({ [field.var]: JSON.parse(value) })}
+      description={locked ? LOCKED_NOTE : undefined}
       maw={320}
     />
   );
@@ -427,6 +498,8 @@ function ChipsField({
   const options = optionsOf(vars[field.options]);
   const selected = Array.isArray(values[field.var]) ? (values[field.var] as unknown[]) : [];
   const keys = selected.map(optionKey);
+  // The `includes` var's value stays chosen.
+  const required = field.includes ? optionKey(values[field.includes]) : null;
   return (
     <Stack gap={4}>
       <Group gap={6}>
@@ -451,7 +524,12 @@ function ChipsField({
       >
         <Group gap={6}>
           {options.map((option) => (
-            <Chip key={optionKey(option.value)} value={optionKey(option.value)} size="xs" disabled={disabled}>
+            <Chip
+              key={optionKey(option.value)}
+              value={optionKey(option.value)}
+              size="xs"
+              disabled={disabled || optionKey(option.value) === required}
+            >
               {option.label}
             </Chip>
           ))}
@@ -570,7 +648,7 @@ function TargetField({
 
   return (
     <Stack gap="xs">
-      <SimpleGrid cols={2} spacing="xs">
+      <SimpleGrid cols={{ base: 1, sm: 3 }} spacing="xs">
         <Select
           size="xs"
           label="Device"
@@ -602,6 +680,29 @@ function TargetField({
           comboboxProps={{ zIndex: 600 }}
           onChange={(value) => choose(parameters.find((entry) => entry.id === value))}
         />
+        {target && (
+          <Stack gap={2} justify="flex-end">
+            <Text size="xs" c="dimmed">
+              Current
+            </Text>
+            <Group gap="xs" wrap="nowrap">
+              <Text size="sm" ff="monospace">
+                {origin === null
+                  ? "unknown"
+                  : `${formatNumber(origin / num(target.display_scale, 1))} ${target.display_unit}`}
+              </Text>
+              {target.kind === "generic" ? (
+                <Badge size="xs" color="yellow" variant="light">
+                  raw units
+                </Badge>
+              ) : typeof target.lock_label === "string" && target.lock_label ? (
+                <Badge size="xs" variant="light">
+                  waits for {target.lock_label}
+                </Badge>
+              ) : null}
+            </Group>
+          </Stack>
+        )}
       </SimpleGrid>
       {target?.kind === "generic" && typeof target.channel_param === "string" && (
         <NumberInput
@@ -616,27 +717,6 @@ function TargetField({
           }
           maw={120}
         />
-      )}
-      {target && (
-        <Group gap="xs">
-          <Text size="xs" c="dimmed">
-            Current
-          </Text>
-          <Text size="sm" ff="monospace">
-            {origin === null
-              ? "unknown"
-              : `${formatNumber(origin / num(target.display_scale, 1))} ${target.display_unit}`}
-          </Text>
-          {target.kind === "generic" ? (
-            <Badge size="xs" color="yellow" variant="light">
-              raw units
-            </Badge>
-          ) : typeof target.lock_label === "string" && target.lock_label ? (
-            <Badge size="xs" variant="light">
-              waits for {target.lock_label}
-            </Badge>
-          ) : null}
-        </Group>
       )}
     </Stack>
   );

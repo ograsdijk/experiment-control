@@ -17,6 +17,7 @@ vars:
   lo: -1.0
   hi: 1.0
   points: 5
+  park: 1
 form:
 {form}
 steps:
@@ -32,12 +33,17 @@ _VALID_FORM = """\
   sections:
     - title: Target
       toggle: enabled
+      wide: true
       fields:
-        - {type: target, var: target, catalog: targets, other_exclude: [mirror], other_defaults: {settle_s: 1.0}}
+        - {type: target, var: target, catalog: targets, other_exclude: [mirror], other_defaults: {settle_s: 1.0}, sets: {park: channel}}
         - {type: range, target: target, relative: relative, from: lo, to: hi, points: points}
         - {type: integer, var: passes, label: Passes, min: 1, enabled_by: enabled}
-        - {type: chips, var: channels, options: channel_options}
+        - {type: chips, var: channels, options: channel_options, includes: park}
         - {type: select, var: passes, options_call: {device: dev, action: list}}
+    - title: Park
+      column: right
+      fields:
+        - {type: select, var: park, options: channel_options}
 """
 
 
@@ -51,6 +57,7 @@ class RunFormTests(unittest.TestCase):
         assert spec.form is not None
         self.assertEqual(spec.form["title"], "Scan")
         self.assertEqual(len(spec.form["sections"][0]["fields"]), 5)
+        self.assertEqual(spec.form["sections"][1]["column"], "right")
 
     def test_sequence_without_form_has_none(self) -> None:
         spec = load_sequence_yaml("version: 1\nsteps:\n  - sleep: 0\n")
@@ -91,6 +98,38 @@ class RunFormTests(unittest.TestCase):
             _load("  sections:\n    - fields:\n        - {type: target, var: target, catalog: passes}\n")
         self.assertIn("must be a list of targets", str(ctx.exception))
 
+    def test_target_sets_and_chips_includes_name_declared_vars(self) -> None:
+        cases = {
+            "sets: {missing: channel}": "'missing', which is not declared in vars",
+            "sets: {park: 3}": "sets.park must name a target key",
+        }
+        for sets, message in cases.items():
+            with self.assertRaises(TypeError) as ctx:
+                _load(
+                    "  sections:\n    - fields:\n"
+                    f"        - {{type: target, var: target, catalog: targets, {sets}}}\n"
+                )
+            self.assertIn(message, str(ctx.exception))
+        with self.assertRaises(TypeError) as ctx:
+            _load(
+                "  sections:\n    - fields:\n"
+                "        - {type: chips, var: channels, options: channel_options, includes: nope}\n"
+            )
+        self.assertIn("includes names 'nope'", str(ctx.exception))
+
+    def test_section_layout_keys_are_checked(self) -> None:
+        field = "      fields:\n        - {type: checkbox, var: enabled}\n"
+        cases = {
+            "    - column: middle\n": "column must be one of left, right",
+            "    - wide: 1\n": "wide must be true or false",
+            "    - wide: true\n      column: left\n": "sets both wide and column",
+        }
+        for section, message in cases.items():
+            with self.assertRaises(TypeError) as ctx:
+                _load("  sections:\n" + section + field)
+            self.assertIn(message, str(ctx.exception))
+
 
 if __name__ == "__main__":
     unittest.main()
+

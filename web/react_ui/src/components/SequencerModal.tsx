@@ -824,17 +824,6 @@ export function SequencerModal({
             >
               Stop
             </Button>
-            {runForm && (
-              <SequencerRunFormModal
-                opened
-                onClose={() => setRunForm(null)}
-                parsed={runForm.parsed}
-                sequenceLabel={runForm.label}
-                latestSignalsByDevice={latestSignalsByDevice}
-                busy={actionBusy}
-                onStart={(overrides) => onRunAction("start", overrides, runForm.sequenceId)}
-              />
-            )}
           </Group>
         </Group>
 
@@ -1002,6 +991,7 @@ export function SequencerModal({
       errorDetail,
       etaText,
       fileInputRef,
+      formEntries,
       hasSequencerProcess,
       jumpToDiagnostic,
       libraryConfigured,
@@ -1019,6 +1009,7 @@ export function SequencerModal({
       onAddOverrideRow,
       onClearAdaptiveStudy,
       onClearOverrides,
+      onFetchLibraryForm,
       onFileInputChange,
       onJumpToDiagnostic,
       onLoad,
@@ -1066,6 +1057,18 @@ export function SequencerModal({
       yamlDirty,
     ]
   );
+  // Outside `body`: it follows live telemetry, which must not re-render the body.
+  const runFormModal = runForm && (
+    <SequencerRunFormModal
+      opened
+      onClose={() => setRunForm(null)}
+      parsed={runForm.parsed}
+      sequenceLabel={runForm.label}
+      latestSignalsByDevice={latestSignalsByDevice}
+      busy={actionBusy}
+      onStart={(overrides) => onRunAction("start", overrides, runForm.sequenceId)}
+    />
+  );
 
   if (page) {
     return (
@@ -1074,6 +1077,7 @@ export function SequencerModal({
           Sequencer
         </Title>
         {body}
+        {runFormModal}
       </div>
     );
   }
@@ -1110,6 +1114,7 @@ export function SequencerModal({
       }}
     >
       {body}
+      {runFormModal}
     </Modal>
   );
 }
