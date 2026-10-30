@@ -44,7 +44,13 @@ export type RunFormField =
       options_call?: RunFormOptionsCall;
       empty_label?: string;
     })
-  | (FieldBase & { type: "chips"; var: string; options: string })
+  | (FieldBase & {
+      type: "chips";
+      var: string;
+      options: string;
+      /** A var whose value is always one of the chosen chips. */
+      includes?: string;
+    })
   | (FieldBase & {
       type: "target";
       var: string;
@@ -52,6 +58,8 @@ export type RunFormField =
       other_exclude?: string[];
       /** Keys added to every Other entry (the sequence's own conventions). */
       other_defaults?: Record<string, unknown>;
+      /** Form var -> target key: the chosen target sets (and locks) that var. */
+      sets?: Record<string, string>;
     })
   | (FieldBase & {
       type: "range";
@@ -62,7 +70,15 @@ export type RunFormField =
       points: string;
     });
 
-export type RunFormSection = { title?: string; toggle?: string; fields: RunFormField[] };
+export type RunFormSection = {
+  title?: string;
+  toggle?: string;
+  /** Spans both columns of the dialog. */
+  wide?: boolean;
+  /** The column a section sits in; sections without one alternate. */
+  column?: "left" | "right";
+  fields: RunFormField[];
+};
 
 export type RunForm = {
   title?: string;
@@ -169,13 +185,94 @@ export function formVarNames(form: RunForm): string[] {
   return [...names];
 }
 
-/** The dialog's starting values: the sequence's own vars. */
+/** The dialog's starting values: the sequence's own vars, settled. */
 export function initialFormValues(parsed: ParsedRunForm): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   for (const name of formVarNames(parsed.form)) {
     out[name] = parsed.vars[name];
   }
+  return settleFormValues(parsed.form, parsed.vars, out);
+}
+
+function formFields(form: RunForm): RunFormField[] {
+  return form.sections.flatMap((section) => section.fields);
+}
+
+/** The vars the chosen targets set (`sets`), and their values. */
+export function targetSetValues(
+  form: RunForm,
+  values: Record<string, unknown>
+): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const field of formFields(form)) {
+    if (field.type !== "target" || !field.sets) {
+      continue;
+    }
+    const target = values[field.var];
+    if (!target || typeof target !== "object") {
+      continue;
+    }
+    for (const [name, key] of Object.entries(field.sets)) {
+      const value = (target as Record<string, unknown>)[key];
+      // A target without the key (or with null) leaves the var to the user.
+      if (value !== null && value !== undefined) {
+        out[name] = value;
+      }
+    }
+  }
   return out;
+}
+
+/** Apply `sets` and `includes`: what the chosen target fixes always wins. */
+export function settleFormValues(
+  form: RunForm,
+  vars: Record<string, unknown>,
+  values: Record<string, unknown>
+): Record<string, unknown> {
+  const out = { ...values, ...targetSetValues(form, values) };
+  for (const field of formFields(form)) {
+    if (field.type !== "chips" || !field.includes) {
+      continue;
+    }
+    const required = out[field.includes];
+    const chosen = Array.isArray(out[field.var]) ? (out[field.var] as unknown[]) : [];
+    const key = JSON.stringify(required);
+    if (required === null || required === undefined || chosen.some((v) => JSON.stringify(v) === key)) {
+      continue;
+    }
+    // Keep the options' order, as the chips do.
+    const order = optionsOf(vars[field.options]).map((option) => JSON.stringify(option.value));
+    out[field.var] = [...chosen, required].sort(
+      (a, b) => order.indexOf(JSON.stringify(a)) - order.indexOf(JSON.stringify(b))
+    );
+  }
+  return out;
+}
+
+export type SectionBlock =
+  | { wide: RunFormSection }
+  | { left: RunFormSection[]; right: RunFormSection[] };
+
+/** Wide sections on their own; the ones between them in two columns. */
+export function sectionBlocks(sections: RunFormSection[]): SectionBlock[] {
+  const blocks: SectionBlock[] = [];
+  let columns: { left: RunFormSection[]; right: RunFormSection[] } | null = null;
+  let unplaced = 0;
+  for (const section of sections) {
+    if (section.wide) {
+      blocks.push({ wide: section });
+      columns = null;
+      continue;
+    }
+    if (!columns) {
+      columns = { left: [], right: [] };
+      unplaced = 0;
+      blocks.push(columns);
+    }
+    const column = section.column ?? (unplaced++ % 2 === 0 ? "left" : "right");
+    columns[column].push(section);
+  }
+  return blocks;
 }
 
 export function buildRunOverrides(

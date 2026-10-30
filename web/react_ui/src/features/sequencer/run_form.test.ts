@@ -11,7 +11,11 @@ import {
   runFormFromLibraryResult,
   rangeProblems,
   rangeValues,
+  sectionBlocks,
+  settleFormValues,
   summaryFigures,
+  targetSetValues,
+  type RunForm,
   type ScanTarget,
 } from "./run_form";
 
@@ -174,5 +178,54 @@ describe("otherTargetsFor", () => {
     expect(target.settle_s).toBe(0.5);
     expect(target.kind).toBe("generic");
     expect(target.set_action).toBe("set_level");
+  });
+});
+
+describe("target sets and chip includes", () => {
+  const form: RunForm = {
+    presets: [],
+    summary: [],
+    sections: [
+      {
+        fields: [
+          { type: "target", var: "target", catalog: "targets", sets: { park: "wm" } },
+          { type: "chips", var: "cycle", options: "channels", includes: "park" },
+          { type: "select", var: "park", options: "channels" },
+        ],
+      },
+    ],
+  };
+  const vars = { channels: [1, 2, 5, 16].map((value) => ({ value, label: String(value) })) };
+
+  it("sets the var from the chosen target and adds it to the chips in order", () => {
+    const values = { target: { id: "d1", wm: 5 }, park: 16, cycle: [1, 16] };
+    expect(targetSetValues(form, values)).toEqual({ park: 5 });
+    expect(settleFormValues(form, vars, values)).toMatchObject({ park: 5, cycle: [1, 5, 16] });
+  });
+
+  it("leaves the var to the user when the target has no value for it", () => {
+    const values = { target: { id: "x", wm: null }, park: 16, cycle: [1] };
+    expect(targetSetValues(form, values)).toEqual({});
+    expect(settleFormValues(form, vars, values)).toMatchObject({ park: 16, cycle: [1, 16] });
+  });
+});
+
+describe("sectionBlocks", () => {
+  it("puts wide sections on their own and alternates the rest unless placed", () => {
+    const s = (title: string, extra: object = {}) => ({ title, fields: [], ...extra });
+    const blocks = sectionBlocks([
+      s("target", { wide: true }),
+      s("a"),
+      s("b"),
+      s("c", { column: "left" }),
+      s("d"),
+    ]);
+    const titles = (list: { title?: string }[]) => list.map((x) => x.title);
+    expect(
+      blocks.map((b) => ("wide" in b ? ["wide", b.wide.title] : [titles(b.left), titles(b.right)]))
+    ).toEqual([
+      ["wide", "target"],
+      [["a", "c", "d"], ["b"]],
+    ]);
   });
 });

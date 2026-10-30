@@ -147,6 +147,56 @@ describe("SequencerRunFormModal", () => {
     expect((overrides.target as { id: string }).id).toBe("src");
   });
 
+  it("lets the target set the park channel and keeps it among the chips", async () => {
+    const parsed = parseRunForm(`
+version: 1
+vars:
+  targets:
+    - {id: a, device_label: Laser, param_label: A, kind: k, device: d, wm: 5, current: null}
+    - {id: b, device_label: Laser, param_label: B, kind: k, device: d, wm: null, current: null}
+  target: {id: a, device_label: Laser, param_label: A, kind: k, device: d, wm: 5, current: null}
+  cycle: [1]
+  park: 16
+  channels: [{value: 1, label: One}, {value: 5, label: Five}, {value: 16, label: Sixteen}]
+form:
+  sections:
+    - wide: true
+      fields:
+        - {type: target, var: target, catalog: targets, sets: {park: wm}}
+    - fields:
+        - {type: chips, var: cycle, options: channels, includes: park}
+    - fields:
+        - {type: select, var: park, options: channels, label: Park}
+steps:
+  - sleep: 0
+`)!;
+    const onStart = vi.fn();
+    await act(async () => {
+      root.render(
+        createElement(
+          MantineProvider,
+          { env: "test" },
+          createElement(SequencerRunFormModal, {
+            opened: true,
+            onClose: () => undefined,
+            parsed,
+            latestSignalsByDevice: {},
+            busy: false,
+            onStart,
+          })
+        )
+      );
+    });
+    const text = document.body.textContent ?? "";
+    expect(text).toContain("Set by the scan target");
+    // Chip values are the options' JSON.
+    const five = document.querySelector<HTMLInputElement>('input[type=checkbox][value="5"]');
+    expect(five?.checked).toBe(true);
+    expect(five?.disabled).toBe(true);
+    await act(async () => button("Start scan").click());
+    expect(onStart.mock.calls[0][0]).toMatchObject({ park: 5, cycle: [1, 5] });
+  });
+
   it("closes only when the start was accepted", async () => {
     const onClose = vi.fn();
     await render(async () => false, onClose);

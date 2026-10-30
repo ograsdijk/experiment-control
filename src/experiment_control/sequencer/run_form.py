@@ -14,7 +14,8 @@ from typing import Any
 FIELD_TYPES = ("checkbox", "number", "integer", "text", "select", "chips", "target", "range")
 
 _FORM_KEYS = {"title", "presets", "summary", "sections"}
-_SECTION_KEYS = {"title", "toggle", "fields"}
+_SECTION_KEYS = {"title", "toggle", "fields", "wide", "column"}
+SECTION_COLUMNS = ("left", "right")
 _COMMON_FIELD_KEYS = {"type", "label", "enabled_by"}
 _FIELD_KEYS: dict[str, set[str]] = {
     "checkbox": {"var"},
@@ -22,8 +23,8 @@ _FIELD_KEYS: dict[str, set[str]] = {
     "integer": {"var", "min", "max", "unit"},
     "text": {"var"},
     "select": {"var", "options", "options_call", "empty_label"},
-    "chips": {"var", "options"},
-    "target": {"var", "catalog", "other_exclude", "other_defaults"},
+    "chips": {"var", "options", "includes"},
+    "target": {"var", "catalog", "other_exclude", "other_defaults", "sets"},
     "range": {"target", "relative", "from", "to", "points"},
 }
 _OPTIONS_CALL_KEYS = {"device", "action", "params", "list", "value", "label"}
@@ -70,6 +71,13 @@ def _check_field(field: Any, where: str, vars_map: dict[str, Any]) -> None:
         if not isinstance(exclude, list) or not all(isinstance(d, str) for d in exclude):
             raise TypeError(f"{where}.other_exclude must be a list of device ids")
         _require_dict(obj.get("other_defaults", {}), f"{where}.other_defaults")
+        sets = _require_dict(obj.get("sets", {}), f"{where}.sets")
+        for name, key in sets.items():
+            _check_var(name, f"{where}.sets", vars_map)
+            if not isinstance(key, str) or not key.strip():
+                raise TypeError(f"{where}.sets.{name} must name a target key")
+    if kind == "chips" and "includes" in obj:
+        _check_var(obj["includes"], f"{where}.includes", vars_map)
     if kind == "chips" or (kind == "select" and "options_call" not in obj):
         options = _check_var(obj.get("options"), f"{where}.options", vars_map)
         _check_options(vars_map[options], f"{where}.options ({options})")
@@ -103,6 +111,13 @@ def validate_run_form(raw: Any, vars_map: dict[str, Any]) -> dict[str, Any]:
         _check_keys(section, where, _SECTION_KEYS)
         if "toggle" in section:
             _check_var(section["toggle"], f"{where}.toggle", vars_map)
+        if "wide" in section and not isinstance(section["wide"], bool):
+            raise TypeError(f"{where}.wide must be true or false")
+        if "column" in section:
+            if section["column"] not in SECTION_COLUMNS:
+                raise TypeError(f"{where}.column must be one of {', '.join(SECTION_COLUMNS)}")
+            if section.get("wide") is True:
+                raise TypeError(f"{where} sets both wide and column")
         fields = section.get("fields")
         if not isinstance(fields, list) or not fields:
             raise TypeError(f"{where}.fields must be a non-empty list")

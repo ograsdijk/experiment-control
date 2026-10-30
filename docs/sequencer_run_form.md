@@ -36,12 +36,25 @@ form:
   sections:                             # required, non-empty
     - title: Monitor
       toggle: monitor_enabled           # optional: a bool var shown as the section's switch
+      column: right                     # optional: left or right (see Layout)
       fields:                           # required, non-empty
         - {type: chips, var: monitor_channels, options: monitor_channel_options, label: Channels}
 ```
 
 Each `summary` figure is the product of its vars. A var the form doesn't set
 uses the sequence's own value.
+
+### Layout
+
+Sections sit in two columns that stack independently, so a short section
+leaves no gap beside a tall one. Sections without `column` alternate left,
+right, left, … in order. `wide: true` puts a section across both
+columns (it can't also set `column`); the sections between two wide ones
+form their own pair of columns. A form with only one column, or a narrow
+window, gets a single column.
+
+Inside a section, consecutive `number`/`integer` fields share a row (up to
+three) and consecutive checkboxes wrap side by side.
 
 ### Field types
 
@@ -55,8 +68,8 @@ is disabled while that var is false).
 | `integer` | `var`, `min`, `max`, `unit` | an int |
 | `text` | `var` | a string |
 | `select` | `var`, and `options` or `options_call`, `empty_label` | one option's value |
-| `chips` | `var`, `options` | a list of option values, in the options' order |
-| `target` | `var`, `catalog`, `other_exclude`, `other_defaults` | the chosen catalog entry (a dict) |
+| `chips` | `var`, `options`, `includes` | a list of option values, in the options' order |
+| `target` | `var`, `catalog`, `other_exclude`, `other_defaults`, `sets` | the chosen catalog entry (a dict) |
 | `range` | `target`, `relative`, `from`, `to`, `points` | those four vars |
 
 `options` names a var holding a list of `{value, label}` (`label` defaults
@@ -69,6 +82,9 @@ options_call: {device: timer, action: list_profiles, list: profiles, value: name
 `list` is the result key holding the list (the result itself when absent), and
 `value` and `label` are the item keys (the item itself when absent).
 `empty_label` adds a first option whose value is `""`.
+
+`includes` names a var whose value is always among the chosen chips: its chip
+is ticked and can't be unticked.
 
 ### `target` and `range`
 
@@ -111,3 +127,17 @@ relative, absolute values otherwise) and `points`. Choosing a new target
 resets its range to ±`default_span`/2 around the current value. The sequence
 generates the values itself, e.g.
 `gen: {linspace: {start: "${origin + range_from}", stop: "${origin + range_to}", num: "${range_points}"}}`.
+
+`sets` maps form vars to keys of the chosen target: when the target has a
+non-null value for the key, the var takes it and its field is locked ("Set by
+the scan target"). A target without the key, or with `null`, leaves the var
+to the user. Combined with `includes`, a target can fix a channel and keep it
+among a list of channels:
+
+```yaml
+- {type: target, var: scan_target, catalog: scan_targets, sets: {park_channel: wavemeter_channel}}
+- {type: chips, var: cycle_channels, options: channel_options, includes: park_channel}
+```
+
+The form only sets the overrides; a sequence that must not run without the
+target's value enforces it itself.
