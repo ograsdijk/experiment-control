@@ -10,10 +10,12 @@ These cover the correctness guards behind three changes in
 """
 from __future__ import annotations
 
+import socket
 import time
 import unittest
 from collections import deque
 from types import SimpleNamespace
+from typing import Any
 
 from experiment_control._tui.app import ManagerTUI, _RESOURCE_COLUMNS
 from experiment_control._tui.models import DeviceStatus, ResourceView
@@ -24,6 +26,21 @@ from experiment_control._tui.status_presentation import (
     render_link_state,
     render_run_state,
 )
+
+
+def _unused_endpoint() -> str:
+    """A local TCP endpoint nothing listens on, so a running stack can't leak in."""
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return f"tcp://127.0.0.1:{probe.getsockname()[1]}"
+
+
+def _isolated_tui(**kwargs: Any) -> ManagerTUI:
+    # The defaults are the live manager's ports: a stack running on this
+    # machine would feed its errors and replies into the test.
+    return ManagerTUI(
+        manager_rpc=_unused_endpoint(), manager_pub=_unused_endpoint(), **kwargs
+    )
 
 
 class _FakeTable:
@@ -213,7 +230,7 @@ class HeadlessRenderContentTests(unittest.IsolatedAsyncioTestCase):
     async def test_errors_and_members_render_content(self) -> None:
         from textual.widgets import DataTable
 
-        app = ManagerTUI(snapshot_period_s=3600.0, rpc_timeout_ms=20)
+        app = _isolated_tui(snapshot_period_s=3600.0, rpc_timeout_ms=20)
         app._rpc_call = lambda *a, **k: None  # type: ignore[method-assign]
         # RPC now flows through the single-owner worker; stub the submit path so
         # the headless render test doesn't do real socket round-trips on mount.
@@ -288,7 +305,7 @@ class HeadlessRenderContentTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(members.row_count, 7)
 
     async def test_short_result_uses_compact_dialog(self) -> None:
-        app = ManagerTUI(snapshot_period_s=3600.0, rpc_timeout_ms=20)
+        app = _isolated_tui(snapshot_period_s=3600.0, rpc_timeout_ms=20)
         app._rpc_call = lambda *a, **k: None  # type: ignore[method-assign]
         app._rpc_submit = lambda *a, **k: None  # type: ignore[method-assign]
         app._drain_pub_queue = lambda: None  # type: ignore[method-assign]
@@ -304,7 +321,7 @@ class HeadlessRenderContentTests(unittest.IsolatedAsyncioTestCase):
             self.assertGreaterEqual(body.region.height, 3)
 
     async def test_long_result_dialog_stays_capped_and_scrollable(self) -> None:
-        app = ManagerTUI(snapshot_period_s=3600.0, rpc_timeout_ms=20)
+        app = _isolated_tui(snapshot_period_s=3600.0, rpc_timeout_ms=20)
         app._rpc_call = lambda *a, **k: None  # type: ignore[method-assign]
         app._rpc_submit = lambda *a, **k: None  # type: ignore[method-assign]
         app._drain_pub_queue = lambda: None  # type: ignore[method-assign]
@@ -322,7 +339,7 @@ class HeadlessRenderContentTests(unittest.IsolatedAsyncioTestCase):
     async def test_process_telemetry_contains_signals_not_status_config(self) -> None:
         from textual.widgets import DataTable
 
-        app = ManagerTUI(snapshot_period_s=3600.0, rpc_timeout_ms=20)
+        app = _isolated_tui(snapshot_period_s=3600.0, rpc_timeout_ms=20)
         app._rpc_submit = lambda *a, **k: None  # type: ignore[method-assign]
         app._background_rpc_submit = lambda *a, **k: None  # type: ignore[method-assign]
         async with app.run_test(headless=True, size=(120, 40)) as pilot:
@@ -376,7 +393,7 @@ class TimerCallbackLifecycleTests(unittest.IsolatedAsyncioTestCase):
     """
 
     def _make_app(self) -> ManagerTUI:
-        app = ManagerTUI(snapshot_period_s=3600.0, rpc_timeout_ms=20)
+        app = _isolated_tui(snapshot_period_s=3600.0, rpc_timeout_ms=20)
         app._rpc_submit = lambda *a, **k: None  # type: ignore[method-assign]
         app._background_rpc_submit = lambda *a, **k: None  # type: ignore[method-assign]
         return app
@@ -845,7 +862,7 @@ class UnifiedResourceHeadlessTests(unittest.IsolatedAsyncioTestCase):
     async def test_filter_tabs_activity_and_stacked_navigation(self) -> None:
         from textual.widgets import Button, DataTable, Input, Label, TabbedContent
 
-        app = ManagerTUI(snapshot_period_s=3600.0, rpc_timeout_ms=20)
+        app = _isolated_tui(snapshot_period_s=3600.0, rpc_timeout_ms=20)
         app._rpc_submit = lambda *a, **k: None  # type: ignore[method-assign]
         app._background_rpc_submit = lambda *a, **k: None  # type: ignore[method-assign]
         async with app.run_test(headless=True, size=(80, 24)) as pilot:
