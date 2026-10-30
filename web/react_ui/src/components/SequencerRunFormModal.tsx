@@ -559,9 +559,12 @@ function TargetField({
     catalog.flatMap((entry) => [entry.device, entry.current?.device ?? ""])
   );
   const exclude = new Set(field.other_exclude ?? []);
-  const otherDevices = Object.keys(latestSignalsByDevice)
-    .filter((deviceId) => !catalogDevices.has(deviceId) && !exclude.has(deviceId))
-    .sort();
+  const otherDevices =
+    field.other === false
+      ? []
+      : Object.keys(latestSignalsByDevice)
+          .filter((deviceId) => !catalogDevices.has(deviceId) && !exclude.has(deviceId))
+          .sort();
 
   // An Other device chosen in the Device dropdown, before its parameters load.
   const [pendingOther, setPendingOther] = useState<string | null>(null);
@@ -704,6 +707,11 @@ function TargetField({
           </Stack>
         )}
       </SimpleGrid>
+      {target && typeof target.move_label === "string" && target.move_label && (
+        <Text size="xs" c="dimmed">
+          Moves: {target.move_label}
+        </Text>
+      )}
       {target?.kind === "generic" && typeof target.channel_param === "string" && (
         <NumberInput
           size="xs"

@@ -16,7 +16,8 @@ vi.mock("../api", () => ({
 
 const TARGET =
   "{id: src, device_label: Source, param_label: CH1 frequency, kind: source_frequency, " +
-  "device: source, channel: 1, lock_label: settled, unit: Hz, display_unit: GHz, " +
+  "device: source, channel: 1, lock_label: settled, move_label: ramps in 1 MHz steps, " +
+  "unit: Hz, display_unit: GHz, " +
   "display_scale: 1.0e+9, offset_unit: MHz, offset_scale: 1.0e+6, min: null, max: null, " +
   "default_span: 2.0e+6, current: {device: source, signal: ch1_frequency_hz}}";
 
@@ -76,6 +77,8 @@ beforeEach(() => {
     unobserve() {}
     disconnect() {}
   };
+  // jsdom has no layout; an open Combobox scrolls its selected option.
+  Element.prototype.scrollIntoView ??= () => undefined;
   container = document.createElement("div");
   document.body.appendChild(container);
   root = createRoot(container);
@@ -126,6 +129,7 @@ describe("SequencerRunFormModal", () => {
     expect(text).toContain("13.3335 → 13.3355 GHz");
     expect(text).toContain((9 * 3 * 3 * 13).toLocaleString());
     expect(text).toContain("waits for settled");
+    expect(text).toContain("Moves: ramps in 1 MHz steps");
   });
 
   it("starts with every form var, presets applied", async () => {
@@ -195,6 +199,37 @@ steps:
     expect(five?.disabled).toBe(true);
     await act(async () => button("Start scan").click());
     expect(onStart.mock.calls[0][0]).toMatchObject({ park: 5, cycle: [1, 5] });
+  });
+
+  it.each([
+    [true, ""],
+    [false, ", other: false"],
+  ])("offers devices outside the catalog under Other: %s", async (offered, option) => {
+    const parsed = parseRunForm(YAML.replace("catalog: targets}", `catalog: targets${option}}`))!;
+    await act(async () => {
+      root.render(
+        createElement(
+          MantineProvider,
+          { env: "test" },
+          createElement(SequencerRunFormModal, {
+            opened: true,
+            onClose: () => undefined,
+            parsed,
+            latestSignalsByDevice: {
+              source: { ch1_frequency_hz: { value: 13.3345e9 } },
+              stray: { level: { value: 1 } },
+            } as never,
+            busy: false,
+            onStart: () => undefined,
+          })
+        )
+      );
+    });
+    const device = [...document.querySelectorAll("input")].find((el) => el.value === "Source");
+    await act(async () => device!.click());
+    const options = [...document.querySelectorAll("[role=option]")].map((el) => el.textContent);
+    expect(options).toContain("Source");
+    expect(options.includes("stray")).toBe(offered);
   });
 
   it("closes only when the start was accepted", async () => {

@@ -55,6 +55,8 @@ export type RunFormField =
       type: "target";
       var: string;
       catalog: string;
+      /** Offer devices outside the catalog under "Other" (default true). */
+      other?: boolean;
       other_exclude?: string[];
       /** Keys added to every Other entry (the sequence's own conventions). */
       other_defaults?: Record<string, unknown>;

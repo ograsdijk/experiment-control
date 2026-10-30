@@ -102,6 +102,7 @@ class RunFormTests(unittest.TestCase):
         cases = {
             "sets: {missing: channel}": "'missing', which is not declared in vars",
             "sets: {park: 3}": "sets.park must name a target key",
+            "other: maybe": "other must be true or false",
         }
         for sets, message in cases.items():
             with self.assertRaises(TypeError) as ctx:

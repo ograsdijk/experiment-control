@@ -69,7 +69,7 @@ is disabled while that var is false).
 | `text` | `var` | a string |
 | `select` | `var`, and `options` or `options_call`, `empty_label` | one option's value |
 | `chips` | `var`, `options`, `includes` | a list of option values, in the options' order |
-| `target` | `var`, `catalog`, `other_exclude`, `other_defaults`, `sets` | the chosen catalog entry (a dict) |
+| `target` | `var`, `catalog`, `other`, `other_exclude`, `other_defaults`, `sets` | the chosen catalog entry (a dict) |
 | `range` | `target`, `relative`, `from`, `to`, `points` | those four vars |
 
 `options` names a var holding a list of `{value, label}` (`label` defaults
@@ -94,6 +94,8 @@ an entry. Every other key is the sequence's own, passed through unchanged:
 - `id`, `device_label` (the Device dropdown), `param_label` (the Parameter
   dropdown), `device`
 - `lock_label` (optional): shown as "waits for …" next to the live value
+- `move_label` (optional): how the sequence moves this target (e.g. a ramp
+  and its step), shown as "Moves: …" under the target
 - `unit` (the base unit the vars use), `display_unit`/`display_scale` and
   `offset_unit`/`offset_scale` (base units per display unit, for absolute
   values and for offsets)
@@ -106,7 +108,8 @@ an entry. Every other key is the sequence's own, passed through unchanged:
 A catalog device with no telemetry is listed as "(no telemetry)".
 
 Devices with telemetry that no catalog entry uses, minus `other_exclude`,
-are offered under **Other**. Their parameters are each `set_X` that has a
+are offered under **Other**, unless the field sets `other: false` (only the
+catalog is offered then). Their parameters are each `set_X` that has a
 matching `get_X` and takes either a value, or `channel` and a value. An
 Other target is sent as an entry with `kind: generic`, `device`,
 `set_action`, `get_action`, `value_param`, `channel_param` (`null` when there
