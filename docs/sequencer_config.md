@@ -320,6 +320,9 @@ Notes:
 - There is no `except`; the original failure still fails the run.
 - `pause` does not run `finally`; resuming continues the protected body.
 - Cleanup failures set the run to `ERROR` and preserve the original error context.
+- `finally` runs in full, control flow included (`if`, `for`, `repeat`, `while`,
+  nested `try`), whether the body succeeded, failed or was stopped. A cleanup
+  step that fails is recorded and the remaining cleanup still runs.
 
 ### `use`
 Run another sequence from the configured sequence library.

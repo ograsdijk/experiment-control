@@ -383,6 +383,80 @@ class SequencerLoopTests(unittest.TestCase):
         self.assertEqual(status["error"], "external fault test")
         self.assertEqual(calls, [("dev", "cleanup")])
 
+    def _run_cleanup_case(self, failing: set[str], *, stop: bool = False) -> tuple[dict, list[str]]:
+        """A finally with an if branch, a for loop, a nested try and a plain step."""
+        calls: list[str] = []
+
+        def call_device(device: str, action: str, params: dict[str, object]):
+            calls.append(action)
+            if action in failing:
+                return {"ok": False, "error": f"{action} failed"}
+            return {"ok": True, "result": None}
+
+        def call(action: str) -> dict:
+            return {"call": {"device": "dev", "action": action}}
+
+        runtime = SequencerRuntime(
+            call_device=call_device,
+            get_telemetry=lambda d, s: None,
+            set_stream_context=lambda *a: None,
+        )
+        runtime.load(
+            parse_sequence(
+                {
+                    "version": 1,
+                    "steps": [
+                        {
+                            "try": {
+                                "do": [call("body"), {"sleep": 10} if stop else call("more")],
+                                "finally": [
+                                    {"if": {"condition": True, "then": [call("if_1"), call("if_2")]}},
+                                    {"for": {"bind": "x", "in": [1, 2], "do": [call("loop")]}},
+                                    {"try": {"do": [call("inner")], "finally": [call("inner_finally")]}},
+                                    call("last"),
+                                ],
+                            }
+                        }
+                    ],
+                }
+            )
+        )
+        runtime.start()
+        if stop:
+            runtime.tick()
+            runtime.tick()
+            runtime.request_stop()
+        while runtime.state == "RUNNING":
+            runtime.tick()
+        return runtime.status(), calls
+
+    CLEANUP = ["if_1", "if_2", "loop", "loop", "inner", "inner_finally", "last"]
+
+    def test_finally_control_flow_runs_after_a_body_failure(self) -> None:
+        # Regression: if/for/try inside finally were discarded on error, so
+        # conditional cleanup (disarm, restore, release) never ran.
+        status, calls = self._run_cleanup_case({"body"})
+        self.assertEqual(status["state"], "ERROR")
+        self.assertEqual(status["error"], "body failed")
+        self.assertEqual(calls, ["body", *self.CLEANUP])
+
+    def test_finally_control_flow_runs_after_a_stop(self) -> None:
+        status, calls = self._run_cleanup_case(set(), stop=True)
+        self.assertEqual(status["state"], "STOPPED")
+        self.assertEqual(calls, ["body", *self.CLEANUP])
+
+    def test_finally_continues_after_one_of_its_own_steps_fails(self) -> None:
+        # Without a body error the failing cleanup step must not drop the rest.
+        status, calls = self._run_cleanup_case({"if_1"})
+        self.assertEqual(status["state"], "ERROR")
+        self.assertEqual(status["error"], "if_1 failed")
+        self.assertEqual(calls, ["body", "more", *self.CLEANUP])
+        # After a body error, a failing cleanup step is recorded alongside it.
+        status, calls = self._run_cleanup_case({"body", "inner"})
+        self.assertIn("body failed", str(status["error"]))
+        self.assertIn("inner failed", str(status["error"]))
+        self.assertEqual(calls, ["body", *self.CLEANUP])
+
     def test_try_finally_cleanup_failure_preserves_original_error(self) -> None:
         calls: list[tuple[str, str]] = []
 

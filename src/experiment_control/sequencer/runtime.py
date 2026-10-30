@@ -1929,6 +1929,10 @@ class SequencerRuntime:
         for frame in reversed(self._stack):
             if isinstance(frame, _Frame) and frame.on_exit is not None:
                 return True
+            # A `finally` body already running (a step in it failed): the rest
+            # of the cleanup still runs.
+            if isinstance(frame, _Frame) and frame.run_during_unwind:
+                return True
             if isinstance(frame, _TryFrame) and not frame.finalizing and frame.finally_steps:
                 return True
         return False
@@ -3136,8 +3140,15 @@ class SequencerRuntime:
     def _next_step(self) -> StepResult:
         if self._pending_terminal_state is not None:
             return self._next_terminal_unwind_step()
+        return self._next_step_above(0)
 
-        while self._stack:
+    def _next_step_above(self, base: int) -> StepResult:
+        """The next step from the frames at stack index `base` and above.
+
+        Returns None once those frames are done; frames below `base` are left
+        alone (the terminal unwind decides what happens to them).
+        """
+        while len(self._stack) > base:
             frame = self._stack[-1]
             if isinstance(frame, _Frame):
                 if frame.index >= len(frame.steps):
@@ -3223,6 +3234,17 @@ class SequencerRuntime:
 
     def _next_terminal_unwind_step(self) -> StepResult:
         while self._stack:
+            # Frames above the innermost running `finally` body were pushed by
+            # its own steps (an if branch, a for loop, a nested try): they are
+            # part of the cleanup and run normally. Without this they were
+            # discarded like the interrupted body, so an error skipped every
+            # if/for inside `finally`.
+            floor = self._innermost_unwind_body()
+            if floor is not None and floor < len(self._stack) - 1:
+                step = self._next_step_above(floor + 1)
+                if step is not None:
+                    return step
+                continue
             frame = self._stack[-1]
             if isinstance(frame, _Frame):
                 if frame.run_during_unwind:
@@ -3257,6 +3279,14 @@ class SequencerRuntime:
                     self._stack.append(_Frame(frame.finally_steps, run_during_unwind=True))
                 continue
             self._stack.pop()
+        return None
+
+    def _innermost_unwind_body(self) -> int | None:
+        """Stack index of the topmost frame that runs during unwind, if any."""
+        for index in range(len(self._stack) - 1, -1, -1):
+            frame = self._stack[index]
+            if isinstance(frame, _Frame) and frame.run_during_unwind:
+                return index
         return None
 
     def _execute_step(self, step: Step) -> bool:
