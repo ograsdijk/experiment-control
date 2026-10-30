@@ -16,7 +16,8 @@ vi.mock("../api", () => ({
 
 const TARGET =
   "{id: src, device_label: Source, param_label: CH1 frequency, kind: source_frequency, " +
-  "device: source, channel: 1, lock_label: settled, unit: Hz, display_unit: GHz, " +
+  "device: source, channel: 1, lock_label: settled, move_label: ramps in 1 MHz steps, " +
+  "unit: Hz, display_unit: GHz, " +
   "display_scale: 1.0e+9, offset_unit: MHz, offset_scale: 1.0e+6, min: null, max: null, " +
   "default_span: 2.0e+6, current: {device: source, signal: ch1_frequency_hz}}";
 
@@ -126,6 +127,7 @@ describe("SequencerRunFormModal", () => {
     expect(text).toContain("13.3335 → 13.3355 GHz");
     expect(text).toContain((9 * 3 * 3 * 13).toLocaleString());
     expect(text).toContain("waits for settled");
+    expect(text).toContain("Moves: ramps in 1 MHz steps");
   });
 
   it("starts with every form var, presets applied", async () => {

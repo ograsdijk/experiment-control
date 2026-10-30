@@ -704,6 +704,11 @@ function TargetField({
           </Stack>
         )}
       </SimpleGrid>
+      {target && typeof target.move_label === "string" && target.move_label && (
+        <Text size="xs" c="dimmed">
+          Moves: {target.move_label}
+        </Text>
+      )}
       {target?.kind === "generic" && typeof target.channel_param === "string" && (
         <NumberInput
           size="xs"

@@ -94,6 +94,8 @@ an entry. Every other key is the sequence's own, passed through unchanged:
 - `id`, `device_label` (the Device dropdown), `param_label` (the Parameter
   dropdown), `device`
 - `lock_label` (optional): shown as "waits for …" next to the live value
+- `move_label` (optional): how the sequence moves this target (e.g. a ramp
+  and its step), shown as "Moves: …" under the target
 - `unit` (the base unit the vars use), `display_unit`/`display_scale` and
   `offset_unit`/`offset_scale` (base units per display unit, for absolute
   values and for offsets)
