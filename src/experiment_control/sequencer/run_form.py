@@ -24,7 +24,7 @@ _FIELD_KEYS: dict[str, set[str]] = {
     "text": {"var"},
     "select": {"var", "options", "options_call", "empty_label"},
     "chips": {"var", "options", "includes"},
-    "target": {"var", "catalog", "other_exclude", "other_defaults", "sets"},
+    "target": {"var", "catalog", "other", "other_exclude", "other_defaults", "sets"},
     "range": {"target", "relative", "from", "to", "points"},
 }
 _OPTIONS_CALL_KEYS = {"device", "action", "params", "list", "value", "label"}
@@ -67,6 +67,8 @@ def _check_field(field: Any, where: str, vars_map: dict[str, Any]) -> None:
         catalog = _check_var(obj.get("catalog"), f"{where}.catalog", vars_map)
         if not isinstance(vars_map[catalog], list):
             raise TypeError(f"{where}.catalog {catalog!r} must be a list of targets")
+        if not isinstance(obj.get("other", True), bool):
+            raise TypeError(f"{where}.other must be true or false")
         exclude = obj.get("other_exclude", [])
         if not isinstance(exclude, list) or not all(isinstance(d, str) for d in exclude):
             raise TypeError(f"{where}.other_exclude must be a list of device ids")

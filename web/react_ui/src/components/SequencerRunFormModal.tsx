@@ -559,9 +559,12 @@ function TargetField({
     catalog.flatMap((entry) => [entry.device, entry.current?.device ?? ""])
   );
   const exclude = new Set(field.other_exclude ?? []);
-  const otherDevices = Object.keys(latestSignalsByDevice)
-    .filter((deviceId) => !catalogDevices.has(deviceId) && !exclude.has(deviceId))
-    .sort();
+  const otherDevices =
+    field.other === false
+      ? []
+      : Object.keys(latestSignalsByDevice)
+          .filter((deviceId) => !catalogDevices.has(deviceId) && !exclude.has(deviceId))
+          .sort();
 
   // An Other device chosen in the Device dropdown, before its parameters load.
   const [pendingOther, setPendingOther] = useState<string | null>(null);
