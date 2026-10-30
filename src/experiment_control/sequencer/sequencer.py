@@ -644,6 +644,38 @@ class SequencerProcess(ManagedProcessBase):
             active_sequence_id=entry.sequence_id,
         )
 
+    def _loaded_sequence_snapshot(self) -> dict[str, Any] | None:
+        if self._loaded_sequence_spec is None or self._loaded_sequence_text is None:
+            return None
+        return {
+            "spec": self._loaded_sequence_spec,
+            "text": self._loaded_sequence_text,
+            "source": self._loaded_sequence_source or "",
+            "source_kind": self._loaded_sequence_source_kind or "",
+            "active_sequence_id": self._active_sequence_id,
+            "run_id": self._loaded_sequence_run_id,
+        }
+
+    def _restore_loaded_sequence(self, snapshot: dict[str, Any] | None) -> None:
+        if snapshot is None:
+            return
+        try:
+            self._set_loaded_sequence(
+                spec=snapshot["spec"],
+                text=snapshot["text"],
+                source=snapshot["source"],
+                source_kind=snapshot["source_kind"],
+                active_sequence_id=snapshot["active_sequence_id"],
+            )
+        except Exception as e:
+            # The start's own error is what the caller gets.
+            self._publish_log(
+                severity="error",
+                message=f"sequencer could not restore the previously loaded sequence: {e}",
+            )
+            return
+        self._loaded_sequence_run_id = snapshot["run_id"]
+
     def _load_sequence_library(self, *, initial: bool = False) -> bool:
         if not self._sequence_library_path:
             self._sequence_library = None
@@ -3752,6 +3784,9 @@ class SequencerProcess(ManagedProcessBase):
         params = req.get("params", {}) or {}
         if not isinstance(params, dict):
             return self.rpc_invalid_params(req)
+        # A start with `sequence_id` loads that sequence first; if the start
+        # then fails, the sequence loaded before it is put back.
+        previous: dict[str, Any] | None = None
         try:
             adaptive = params.get("adaptive")
             adaptive_overrides = adaptive if isinstance(adaptive, dict) else None
@@ -3765,6 +3800,7 @@ class SequencerProcess(ManagedProcessBase):
                         "sequencer.start sequence_id requires configured sequence library"
                     )
                 entry = self._sequence_library.get_entry(sequence_id_text)
+                previous = self._loaded_sequence_snapshot()
                 self._set_loaded_sequence_from_library_entry(entry)
             repeat_count = params.get("repeat_count")
             continuous_raw = params.get("continuous", False)
@@ -3788,8 +3824,10 @@ class SequencerProcess(ManagedProcessBase):
             self._last_progress_event_mono = 0.0
             failure = self._check_start_preconditions(req)
             if failure is not None:
+                self._restore_loaded_sequence(previous)
                 return failure
         except Exception as e:
+            self._restore_loaded_sequence(previous)
             self._publish_lifecycle_event(
                 event="start",
                 ok=False,

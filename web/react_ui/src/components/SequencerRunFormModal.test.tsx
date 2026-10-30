@@ -12,6 +12,9 @@ vi.mock("../api", () => ({
   fetchCapabilities: vi.fn(async () => []),
 }));
 
+const showNotification = vi.hoisted(() => vi.fn());
+vi.mock("@mantine/notifications", () => ({ notifications: { show: showNotification } }));
+
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
 const TARGET =
@@ -89,9 +92,13 @@ afterEach(() => {
   container.remove();
 });
 
+const LIVE = { source: { ch1_frequency_hz: { value: 13.3345e9 } } };
+
 async function render(
   onStart: (overrides: Record<string, unknown>) => Promise<unknown> | void,
-  onClose: () => void = () => undefined
+  onClose: () => void = () => undefined,
+  signals: Record<string, Record<string, { value: number }>> = LIVE,
+  yaml: string = YAML
 ) {
   await act(async () => {
     root.render(
@@ -101,8 +108,8 @@ async function render(
         createElement(SequencerRunFormModal, {
           opened: true,
           onClose,
-          parsed: parseRunForm(YAML)!,
-          latestSignalsByDevice: { source: { ch1_frequency_hz: { value: 13.3345e9 } } },
+          parsed: parseRunForm(yaml)!,
+          latestSignalsByDevice: signals as never,
           busy: false,
           onStart,
         })
@@ -240,5 +247,52 @@ steps:
     await render(async () => true, onClose);
     await act(async () => button("Start scan").click());
     expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports a start that throws and stays open", async () => {
+    const onClose = vi.fn();
+    showNotification.mockClear();
+    await render(async () => Promise.reject(new Error("network down")), onClose);
+    await act(async () => button("Start scan").click());
+    expect(onClose).not.toHaveBeenCalled();
+    expect(showNotification).toHaveBeenCalledWith(
+      expect.objectContaining({ title: "Sequencer start failed", message: "network down" })
+    );
+  });
+
+  it("without the current value, keeps offsets relative and says limits are unchecked", async () => {
+    const onStart = vi.fn();
+    await render(onStart, undefined, {}, YAML.split("min: null").join("min: 0.0"));
+    const absolute = [...document.querySelectorAll("input[type=radio]")].find(
+      (el) => (el as HTMLInputElement).value === "abs"
+    ) as HTMLInputElement;
+    expect(absolute.disabled).toBe(true);
+    const text = document.body.textContent ?? "";
+    expect(text).toContain("Absolute needs the current value");
+    expect(text).toContain("can't be checked against the target's limits");
+    await act(async () => absolute.click());
+    await act(async () => button("Start scan").click());
+    expect(onStart.mock.calls[0][0]).toMatchObject({ relative: true, lo: -1.0e6, hi: 1.0e6 });
+  });
+
+  it("doesn't write 0 while a number box is empty", async () => {
+    const onStart = vi.fn();
+    await render(onStart);
+    const passes = [...document.querySelectorAll("input")].find(
+      (el) => el.closest(".mantine-InputWrapper-root")?.textContent?.includes("Passes")
+    ) as HTMLInputElement;
+    const setValue = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!;
+    await act(async () => {
+      setValue.call(passes, "");
+      passes.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    expect(passes.value).toBe("");
+    await act(async () => {
+      passes.focus();
+      passes.blur();
+    });
+    expect(passes.value).toBe("3");
+    await act(async () => button("Start scan").click());
+    expect(onStart.mock.calls[0][0]).toMatchObject({ passes: 3 });
   });
 });

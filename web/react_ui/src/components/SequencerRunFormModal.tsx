@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useState } from "react";
 import {
   Alert,
   Badge,
@@ -10,6 +10,7 @@ import {
   Group,
   Modal,
   NumberInput,
+  type NumberInputProps,
   Paper,
   SegmentedControl,
   Select,
@@ -24,7 +25,9 @@ import type { TelemetrySignal } from "../types";
 import {
   buildRunOverrides,
   catalogTargets,
+  displayScale,
   formatNumber,
+  formatTargetValue,
   initialFormValues,
   optionsFromCallResult,
   optionsOf,
@@ -85,8 +88,22 @@ export function SequencerRunFormModal({
     }
   }, [opened, parsed]);
 
-  const set = (patch: Values) =>
-    setValues((prev) => settleFormValues(form, vars, { ...prev, ...patch }));
+  // Stable, so memoized fields skip renders that change nothing they show.
+  const set = useCallback(
+    (patch: Values) =>
+      setValues((prev) => settleFormValues(form, vars, { ...prev, ...patch }, prev)),
+    [form, vars]
+  );
+  // Devices with telemetry, as a set that only changes when the list does:
+  // the fields never see the telemetry itself.
+  const liveKey = Object.keys(latestSignalsByDevice)
+    .filter((deviceId) => Object.keys(latestSignalsByDevice[deviceId] ?? {}).length > 0)
+    .sort()
+    .join("\n");
+  const liveDevices = useMemo(
+    () => new Set(liveKey ? liveKey.split("\n") : []),
+    [liveKey]
+  );
   const enabled = (field: RunFormField) => !field.enabled_by || values[field.enabled_by] === true;
   // Vars the chosen target sets: shown, but not editable.
   const locked = new Set(Object.keys(targetSetValues(form, values)));
@@ -104,17 +121,21 @@ export function SequencerRunFormModal({
   const target = (targetField ? values[targetField.var] : null) as ScanTarget | null;
 
   const origin = useLiveValue(target, latestSignalsByDevice);
-  const scanValues =
-    rangeField && target
-      ? rangeValues(
-          values[rangeField.relative] === true,
-          num(values[rangeField.from]),
-          num(values[rangeField.to]),
-          num(values[rangeField.points], 1),
-          origin
-        )
-      : null;
+  const relative = rangeField ? values[rangeField.relative] === true : false;
+  const from = rangeField ? num(values[rangeField.from]) : 0;
+  const to = rangeField ? num(values[rangeField.to]) : 0;
+  const points = rangeField ? num(values[rangeField.points], 1) : 1;
+  const scanValues = useMemo(
+    () => (rangeField && target ? rangeValues(relative, from, to, points, origin) : null),
+    [rangeField, target, relative, from, to, points, origin]
+  );
   const problems = rangeField ? rangeProblems(target, scanValues) : [];
+  // Min/max apply to absolute values: unknown until the start value is.
+  const unchecked =
+    rangeField &&
+    target &&
+    scanValues === null &&
+    (typeof target.min === "number" || typeof target.max === "number");
   // Summary vars the form doesn't set keep the sequence's own values.
   const figures = summaryFigures(form.summary, { ...vars, ...values });
   const overrides = useMemo(() => buildRunOverrides(form, values), [form, values]);
@@ -126,7 +147,7 @@ export function SequencerRunFormModal({
     disabled: !sectionOn || !enabled(field),
     locked: "var" in field && locked.has(field.var),
     onChange: set,
-    latestSignalsByDevice,
+    liveDevices,
     target,
     origin,
     scanValues,
@@ -227,6 +248,12 @@ export function SequencerRunFormModal({
             {problems.join(". ")}.
           </Alert>
         )}
+        {unchecked && (
+          <Alert color="yellow" variant="light" p="xs">
+            The range can&apos;t be checked against the target&apos;s limits until the scan reads
+            its start value.
+          </Alert>
+        )}
 
         <SimpleGrid cols={3} spacing="xs">
           {figures.map((figure) => (
@@ -239,9 +266,7 @@ export function SequencerRunFormModal({
           <Stat
             label="Start value"
             value={
-              origin === null || !target
-                ? "read at start"
-                : `${formatNumber(origin / (num(target.display_scale, 1) || 1))} ${target.display_unit}`
+              origin === null || !target ? "read at start" : formatTargetValue(origin, target)
             }
           />
         </SimpleGrid>
@@ -261,7 +286,18 @@ export function SequencerRunFormModal({
               disabled={problems.length > 0}
               onClick={async () => {
                 // A failed start keeps the dialog, and its choices, open.
-                if ((await onStart(overrides)) === true) {
+                let started: unknown;
+                try {
+                  started = await onStart(overrides);
+                } catch (error) {
+                  notifications.show({
+                    color: "red",
+                    title: "Sequencer start failed",
+                    message: error instanceof Error ? error.message : String(error),
+                  });
+                  return;
+                }
+                if (started === true) {
                   onClose();
                 }
               }}
@@ -320,12 +356,19 @@ function useLiveValue(
     if (typeof target.channel_param === "string") {
       params[target.channel_param] = target.channel;
     }
-    void callDevice(target.device, target.get_action, params).then((resp) => {
-      if (!cancelled) {
-        const value = Number(resp.ok ? resp.result : NaN);
-        setCalled({ id: targetId, value: Number.isFinite(value) ? value : null });
+    void callDevice(target.device, target.get_action, params).then(
+      (resp) => {
+        if (!cancelled) {
+          const value = Number(resp.ok ? resp.result : NaN);
+          setCalled({ id: targetId, value: Number.isFinite(value) ? value : null });
+        }
+      },
+      () => {
+        if (!cancelled) {
+          setCalled({ id: targetId, value: null });
+        }
       }
-    });
+    );
     return () => {
       cancelled = true;
     };
@@ -371,7 +414,8 @@ type FieldProps = {
   /** Set by the chosen target (`sets`): shown, not editable. */
   locked: boolean;
   onChange: (patch: Values) => void;
-  latestSignalsByDevice: Record<string, Record<string, TelemetrySignal>>;
+  /** Devices that have telemetry. */
+  liveDevices: ReadonlySet<string>;
   target: ScanTarget | null;
   origin: number | null;
   scanValues: number[] | null;
@@ -381,7 +425,39 @@ type FieldProps = {
 
 const LOCKED_NOTE = "Set by the scan target";
 
-function FormField(props: FieldProps) {
+type NumberBoxProps = Omit<NumberInputProps, "value" | "onChange"> & {
+  value: number;
+  onValue: (value: number) => void;
+};
+
+/**
+ * A NumberInput that writes only numbers: while the box is empty or half
+ * typed ("-", "1e") it keeps the text and changes nothing; leaving it
+ * empty shows the last value again.
+ */
+function NumberBox({ value, onValue, onBlur, ...rest }: NumberBoxProps) {
+  const [draft, setDraft] = useState<string | null>(null);
+  return (
+    <NumberInput
+      {...rest}
+      value={draft ?? value}
+      onChange={(next) => {
+        if (typeof next === "number" && Number.isFinite(next)) {
+          setDraft(null);
+          onValue(next);
+        } else {
+          setDraft(String(next));
+        }
+      }}
+      onBlur={(event) => {
+        setDraft(null);
+        onBlur?.(event);
+      }}
+    />
+  );
+}
+
+const FormField = memo(function FormField(props: FieldProps) {
   const { field, values, onChange, locked } = props;
   const disabled = props.disabled || locked;
   switch (field.type) {
@@ -398,7 +474,7 @@ function FormField(props: FieldProps) {
     case "number":
     case "integer":
       return (
-        <NumberInput
+        <NumberBox
           size="xs"
           label={field.unit ? `${field.label ?? field.var} (${field.unit})` : field.label ?? field.var}
           disabled={disabled}
@@ -407,10 +483,7 @@ function FormField(props: FieldProps) {
           step={field.type === "integer" ? 1 : field.step}
           allowDecimal={field.type !== "integer"}
           value={num(values[field.var])}
-          onChange={(value) => {
-            const n = num(value, num(values[field.var]));
-            onChange({ [field.var]: field.type === "integer" ? Math.trunc(n) : n });
-          }}
+          onValue={(n) => onChange({ [field.var]: field.type === "integer" ? Math.trunc(n) : n })}
           description={locked ? LOCKED_NOTE : undefined}
         />
       );
@@ -437,7 +510,7 @@ function FormField(props: FieldProps) {
     default:
       return null;
   }
-}
+});
 
 function SelectField({
   field,
@@ -448,17 +521,30 @@ function SelectField({
   onChange,
 }: FieldProps & { field: Extract<RunFormField, { type: "select" }> }) {
   const [called, setCalled] = useState<RunFormOption[] | null>(null);
+  const [callFailed, setCallFailed] = useState(false);
   const call = field.options_call;
   useEffect(() => {
     if (!call) {
       return;
     }
     let cancelled = false;
-    void callDevice(call.device, call.action, call.params ?? {}).then((resp) => {
+    const fail = () => {
       if (!cancelled) {
-        setCalled(resp.ok ? optionsFromCallResult(call, resp.result) : []);
+        setCalled([]);
+        setCallFailed(true);
       }
-    });
+    };
+    void callDevice(call.device, call.action, call.params ?? {}).then((resp) => {
+      if (cancelled) {
+        return;
+      }
+      if (resp.ok) {
+        setCalled(optionsFromCallResult(call, resp.result));
+        setCallFailed(false);
+      } else {
+        fail();
+      }
+    }, fail);
     return () => {
       cancelled = true;
     };
@@ -482,7 +568,7 @@ function SelectField({
       allowDeselect={false}
       comboboxProps={{ zIndex: 600 }}
       onChange={(value) => value !== null && onChange({ [field.var]: JSON.parse(value) })}
-      description={locked ? LOCKED_NOTE : undefined}
+      description={locked ? LOCKED_NOTE : callFailed ? "Couldn't load the options" : undefined}
       maw={320}
     />
   );
@@ -545,7 +631,7 @@ function TargetField({
   vars,
   disabled,
   onChange,
-  latestSignalsByDevice,
+  liveDevices,
   target,
   origin,
   rangeField,
@@ -553,8 +639,7 @@ function TargetField({
   const catalog = useMemo(() => catalogTargets(vars[field.catalog]), [vars, field.catalog]);
   const [otherTargets, setOtherTargets] = useState<ScanTarget[]>([]);
   const deviceLabels = [...new Set(catalog.map((entry) => entry.device_label))];
-  const hasTelemetry = (deviceId: string | undefined) =>
-    Boolean(deviceId && Object.keys(latestSignalsByDevice[deviceId] ?? {}).length > 0);
+  const hasTelemetry = (deviceId: string | undefined) => Boolean(deviceId && liveDevices.has(deviceId));
   const catalogDevices = new Set(
     catalog.flatMap((entry) => [entry.device, entry.current?.device ?? ""])
   );
@@ -562,7 +647,7 @@ function TargetField({
   const otherDevices =
     field.other === false
       ? []
-      : Object.keys(latestSignalsByDevice)
+      : [...liveDevices]
           .filter((deviceId) => !catalogDevices.has(deviceId) && !exclude.has(deviceId))
           .sort();
 
@@ -582,26 +667,41 @@ function TargetField({
       return;
     }
     let cancelled = false;
-    void fetchCapabilities(otherDevice).then((members) => {
-      if (cancelled) {
-        return;
-      }
-      const found = otherTargetsFor(otherDevice, members, field.other_defaults);
-      setOtherTargets(found);
-      if (pendingOther === otherDevice) {
-        // A device without set_/get_ pairs can't be scanned: keep the old target.
-        setPendingOther(null);
-        if (found.length > 0) {
-          choose(found[0]);
-        } else {
-          notifications.show({
-            color: "yellow",
-            title: `${otherDevice} has nothing to scan`,
-            message: "It has no set_X action with a matching get_X.",
-          });
+    void fetchCapabilities(otherDevice).then(
+      (members) => {
+        if (cancelled) {
+          return;
         }
+        const found = otherTargetsFor(otherDevice, members, field.other_defaults);
+        setOtherTargets(found);
+        if (pendingOther === otherDevice) {
+          // A device without set_/get_ pairs can't be scanned: keep the old target.
+          setPendingOther(null);
+          if (found.length > 0) {
+            choose(found[0]);
+          } else {
+            notifications.show({
+              color: "yellow",
+              title: `${otherDevice} has nothing to scan`,
+              message: "It has no set_X action with a matching get_X.",
+            });
+          }
+        }
+      },
+      (error: unknown) => {
+        if (cancelled) {
+          return;
+        }
+        // Back to the target Start would still send.
+        setOtherTargets([]);
+        setPendingOther(null);
+        notifications.show({
+          color: "red",
+          title: `Couldn't read ${otherDevice}'s actions`,
+          message: error instanceof Error ? error.message : String(error),
+        });
       }
-    });
+    );
     return () => {
       cancelled = true;
     };
@@ -690,9 +790,7 @@ function TargetField({
             </Text>
             <Group gap="xs" wrap="nowrap">
               <Text size="sm" ff="monospace">
-                {origin === null
-                  ? "unknown"
-                  : `${formatNumber(origin / num(target.display_scale, 1))} ${target.display_unit}`}
+                {origin === null ? "unknown" : formatTargetValue(origin, target)}
               </Text>
               {target.kind === "generic" ? (
                 <Badge size="xs" color="yellow" variant="light">
@@ -713,16 +811,14 @@ function TargetField({
         </Text>
       )}
       {target?.kind === "generic" && typeof target.channel_param === "string" && (
-        <NumberInput
+        <NumberBox
           size="xs"
           label="Channel"
           disabled={disabled}
           value={num(target.channel, 1)}
           step={1}
           allowDecimal={false}
-          onChange={(value) =>
-            onChange({ [field.var]: { ...target, channel: Math.trunc(num(value, 1)) } })
-          }
+          onValue={(value) => onChange({ [field.var]: { ...target, channel: Math.trunc(value) } })}
           maw={120}
         />
       )}
@@ -742,10 +838,15 @@ function RangeField({
   const relative = values[field.relative] === true;
   const from = num(values[field.from]);
   const to = num(values[field.to]);
-  // Start symmetric only when the sequence's range already is.
-  const [symmetric, setSymmetric] = useState(
-    () => Math.abs(from + to) <= Math.abs(to - from) * 1e-9
-  );
+  const isSymmetric = Math.abs(from + to) <= Math.abs(to - from) * 1e-9;
+  // Start symmetric only when the range already is; a new target's range is.
+  const [symmetric, setSymmetric] = useState(isSymmetric);
+  const targetKey = target?.id ?? null;
+  useEffect(() => {
+    setSymmetric(isSymmetric);
+    // Only when the target changes, not on every edit of the range.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [targetKey]);
   const scale = num(relative ? target?.offset_scale : target?.display_scale, 1) || 1;
   const unit = (relative ? target?.offset_unit : target?.display_unit) ?? "";
   const show = (base: number) => Number(formatNumber(base / scale));
@@ -754,19 +855,23 @@ function RangeField({
     if (nextRelative === relative) {
       return;
     }
-    // Keep the same absolute endpoints when the start value is known.
     if (origin !== null) {
+      // Keep the same absolute endpoints.
       const shift = nextRelative ? -origin : origin;
       onChange({ [field.relative]: nextRelative, [field.from]: from + shift, [field.to]: to + shift });
-    } else {
-      onChange({ [field.relative]: nextRelative });
+    } else if (nextRelative) {
+      // Absolute endpoints can't become offsets without the start value:
+      // start from the target's default span instead.
+      const half = num(target?.default_span, 1) / 2;
+      onChange({ [field.relative]: true, [field.from]: -half, [field.to]: half });
     }
+    // Offsets can't become absolute values without it: that option is disabled.
   };
 
   const first = scanValues?.length ? Math.min(...scanValues) : null;
   const last = scanValues?.length ? Math.max(...scanValues) : null;
   const points = Math.max(1, Math.trunc(num(values[field.points], 1)));
-  const displayScale = num(target?.display_scale, 1) || 1;
+  const valueScale = displayScale(target);
   const offsetScale = num(target?.offset_scale, 1) || 1;
   return (
     <Stack gap="xs">
@@ -777,10 +882,20 @@ function RangeField({
           value={relative ? "rel" : "abs"}
           onChange={(value) => switchMode(value === "rel")}
           data={[
-            { value: "abs", label: "Absolute range" },
+            {
+              value: "abs",
+              label: "Absolute range",
+              // Converting offsets needs the start value.
+              disabled: relative && origin === null,
+            },
             { value: "rel", label: "From current setpoint" },
           ]}
         />
+        {relative && origin === null && (
+          <Text size="xs" c="dimmed">
+            Absolute needs the current value
+          </Text>
+        )}
         {relative && (
           <Checkbox
             size="xs"
@@ -800,35 +915,35 @@ function RangeField({
       </Group>
       <SimpleGrid cols={3} spacing="xs">
         {relative && symmetric ? (
-          <NumberInput
+          <NumberBox
             size="xs"
             label={`± span (${unit})`}
             disabled={disabled}
             value={show((to - from) / 2)}
-            onChange={(value) => {
-              const half = Math.abs(num(value)) * scale;
+            onValue={(value) => {
+              const half = Math.abs(value) * scale;
               onChange({ [field.from]: -half, [field.to]: half });
             }}
           />
         ) : (
           <>
-            <NumberInput
+            <NumberBox
               size="xs"
               label={`${relative ? "Offset from" : "Start"} (${unit})`}
               disabled={disabled}
               value={show(from)}
-              onChange={(value) => onChange({ [field.from]: num(value) * scale })}
+              onValue={(value) => onChange({ [field.from]: value * scale })}
             />
-            <NumberInput
+            <NumberBox
               size="xs"
               label={`${relative ? "Offset to" : "Stop"} (${unit})`}
               disabled={disabled}
               value={show(to)}
-              onChange={(value) => onChange({ [field.to]: num(value) * scale })}
+              onValue={(value) => onChange({ [field.to]: value * scale })}
             />
           </>
         )}
-        <NumberInput
+        <NumberBox
           size="xs"
           label="Points"
           disabled={disabled}
@@ -836,12 +951,12 @@ function RangeField({
           step={1}
           allowDecimal={false}
           value={points}
-          onChange={(value) => onChange({ [field.points]: Math.max(1, Math.trunc(num(value, 1))) })}
+          onValue={(value) => onChange({ [field.points]: Math.max(1, Math.trunc(value)) })}
         />
       </SimpleGrid>
       <Text size="xs" c="dimmed" ff="monospace">
         {first !== null && last !== null
-          ? `${formatNumber(first / displayScale)} → ${formatNumber(last / displayScale)} ${
+          ? `${formatNumber(first / valueScale)} → ${formatNumber(last / valueScale)} ${
               target?.display_unit ?? ""
             } · step ${
               points > 1 ? formatNumber((last - first) / (points - 1) / offsetScale, 6) : "–"

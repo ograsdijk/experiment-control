@@ -295,5 +295,83 @@ class SequencerLibraryPayloadTests(unittest.TestCase):
             self.assertEqual(resp["error"]["code"], "unknown_sequence_id")
 
 
+class SequencerStartFromLibraryTests(unittest.TestCase):
+    """`sequencer.start` with `sequence_id` (the run form's Start)."""
+
+    def _process(self, root: Path) -> SequencerProcess:
+        from experiment_control.sequencer.ast import parse_sequence
+        from tests.test_sequencer_requires_preconditions import _build_process, _FakeManager
+
+        _write(
+            root / "seqs" / "scan.yaml",
+            """
+            version: 1
+            vars:
+              passes: 3
+            steps:
+              - call: {device: scan_dev, action: go, params: {}}
+            """,
+        )
+        _write(
+            root / "library.yaml",
+            """
+            version: 1
+            autoload_dirs:
+              - dir: seqs
+                pattern: "*.yaml"
+            """,
+        )
+        lib = SequenceLibrary(manifest_path=root / "library.yaml")
+        lib.reload()
+        loaded_text = "version: 1\nsteps:\n  - sleep: 0\n"
+        proc = _build_process(
+            spec=parse_sequence({"version": 1, "steps": [{"sleep": 0}]}),
+            manager=_FakeManager(device_liveness={"scan_dev": "ONLINE"}),
+        )
+        proc._sequence_library = lib
+        proc._loaded_sequence_text = loaded_text
+        proc._loaded_sequence_source_kind = "text"
+        proc._loaded_revision = 0
+        proc._loaded_sequence_run_id = 7
+        proc._publish_log = lambda **kwargs: None
+        return proc
+
+    def test_failed_start_puts_the_previous_sequence_back(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            proc = self._process(Path(td))
+            previous_spec = proc._loaded_sequence_spec
+
+            # A bad override fails inside runtime.start.
+            resp = SequencerProcess._rpc_sequencer_start(
+                proc, {"params": {"sequence_id": "scan", "vars_override": {"nope": 1}}}
+            )
+            self.assertFalse(resp["ok"])
+            self.assertIs(proc._loaded_sequence_spec, previous_spec)
+            self.assertIsNone(proc._active_sequence_id)
+            self.assertEqual(proc._loaded_sequence_source, "test.yaml")
+            self.assertEqual(proc._loaded_sequence_run_id, 7)
+
+            # A device that isn't connected fails the start's preconditions.
+            proc._manager._device_liveness = {}
+            resp = SequencerProcess._rpc_sequencer_start(
+                proc, {"params": {"sequence_id": "scan"}}
+            )
+            self.assertFalse(resp["ok"])
+            self.assertIn("devices not connected", resp["error"]["message"])
+            self.assertIs(proc._loaded_sequence_spec, previous_spec)
+            self.assertIsNone(proc._active_sequence_id)
+            self.assertEqual(proc._runtime.status()["state"], "IDLE")
+
+    def test_successful_start_keeps_the_library_sequence(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            proc = self._process(Path(td))
+            resp = SequencerProcess._rpc_sequencer_start(
+                proc, {"params": {"sequence_id": "scan", "vars_override": {"passes": 1}}}
+            )
+            self.assertTrue(resp["ok"])
+            self.assertEqual(proc._active_sequence_id, "scan")
+            self.assertEqual(proc._runtime.status()["vars"]["passes"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()

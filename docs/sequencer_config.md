@@ -502,7 +502,8 @@ Supported generators (exactly one):
 
 Modifiers:
 - `offset`
-- `shuffle` + `seed`
+- `shuffle` + `seed` (a `seed` that renders to null, e.g. `"${s}"` with
+  `s: null`, is a fresh draw each time, as with no seed)
 - `serpentine` (alternates direction based on parent loop index)
 
 ### `sample`

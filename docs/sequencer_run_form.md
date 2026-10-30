@@ -20,7 +20,8 @@ how a value is set, waited for or restored all live in the sequence. The
 start event records `vars_override` and the resolved vars
 (`docs/protocol.md`, `sequencer.lifecycle`), so the HDF file keeps what the
 form chose. The menu is disabled while a run is active. A start the
-sequencer rejects leaves the dialog open with its choices.
+sequencer rejects leaves the dialog open with its choices, and the sequence
+that was loaded before it is loaded again.
 
 ## Schema
 
@@ -100,7 +101,9 @@ an entry. Every other key is the sequence's own, passed through unchanged:
   `offset_unit`/`offset_scale` (base units per display unit, for absolute
   values and for offsets)
 - `min`/`max` (base units, `null` = none; out-of-range values keep Start
-  disabled) and `default_span`
+  disabled) and `default_span`. A relative range can only be checked once
+  the current value is known; until then the form says so, and the sequence
+  checks the range against its start value itself.
 - `current: {device, signal, abs}`: the telemetry signal shown as the live
   value (`abs: true` shows its magnitude). It is also the centre of the
   range preview in relative mode. The sequence reads its own start value.
@@ -125,16 +128,23 @@ parameter names (`docs/sequencer_config.md`, `call`):
     params: {"${vars.target.value_param}": "${value}"}
 ```
 
+A form has at most one `target` field and at most one `range`, whose
+`target` names that field's var.
+
 `range` sets `relative` (bool), `from`/`to` (base units: offsets when
 relative, absolute values otherwise) and `points`. Choosing a new target
-resets its range to ±`default_span`/2 around the current value. The sequence
+resets its range to ±`default_span`/2 around the current value. Switching
+between absolute and relative keeps the same absolute endpoints, which needs
+the current value: without it, relative → absolute is disabled and absolute
+→ relative starts from ±`default_span`/2. The sequence
 generates the values itself, e.g.
 `gen: {linspace: {start: "${origin + range_from}", stop: "${origin + range_to}", num: "${range_points}"}}`.
 
 `sets` maps form vars to keys of the chosen target: when the target has a
 non-null value for the key, the var takes it and its field is locked ("Set by
 the scan target"). A target without the key, or with `null`, leaves the var
-to the user. Combined with `includes`, a target can fix a channel and keep it
+to the user, starting from the sequence's own value whenever the target
+changes (not the last target's). Combined with `includes`, a target can fix a channel and keep it
 among a list of channels:
 
 ```yaml
