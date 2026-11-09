@@ -1529,6 +1529,36 @@ class HdfWriterStorageSafetyTests(unittest.TestCase):
             event_log_mode="all",
         )
 
+    def test_output_filename_extensions(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            writer = self._make_writer(td)
+            cases = {
+                "run": "run.h5",
+                "run.h5": "run.h5",
+                "run.hdf": "run.hdf",
+                "run.hdf5": "run.hdf5",
+                "run.H5": "run.H5",
+                "run.custom": "run.custom",
+                "dir.with.dots/run": "dir.with.dots/run.h5",
+                "nested/run.hdf": "nested/run.hdf",
+                "  run  ": "run.h5",
+            }
+            for supplied, expected in cases.items():
+                for configured in (False, True):
+                    with self.subTest(filename=supplied, configured=configured):
+                        writer._filename = supplied if configured else None  # noqa: SLF001
+                        actual = writer._resolve_output_path(  # noqa: SLF001
+                            None if configured else supplied,
+                            use_default_filename=False,
+                        )
+                        self.assertEqual(actual, Path(td) / expected)
+
+            with patch.object(hdf_writer_module, "_default_filename", return_value="default.h5"):
+                self.assertEqual(
+                    writer._resolve_output_path(None, use_default_filename=True),  # noqa: SLF001
+                    Path(td) / "default.h5",
+                )
+
     def test_rotate_rejects_existing_filename(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -1551,7 +1581,7 @@ class HdfWriterStorageSafetyTests(unittest.TestCase):
                     {
                         "request_id": "r1",
                         "type": "hdf.rotate",
-                        "params": {"filename": target_path.name},
+                        "params": {"filename": target_path.stem},
                     }
                 )
                 self.assertFalse(bool(resp.get("ok")))
@@ -1569,7 +1599,7 @@ class HdfWriterStorageSafetyTests(unittest.TestCase):
 
             with self.assertRaises(FileExistsError):
                 writer._start_writing_file(  # noqa: SLF001
-                    filename=target_path.name,
+                    filename=target_path.stem,
                     disabled_devices=None,
                     measurement_profile=None,
                     measurement_values=None,

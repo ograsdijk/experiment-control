@@ -715,6 +715,7 @@ Response:
 Request:
 - `{"type": "hdf.writing.start", "params": {"filename": "run.h5", "disabled_devices": ["dev2"], "measurement_profile": "frequency_scan", "measurement_values": {"measurement_name": "scan-A", "seed1_power_dbm": -5.2}}}`
 - All params are optional.
+- Filenames without an extension get `.h5` appended (`run` becomes `run.h5`). Existing extensions are preserved, including `.h5`, `.hdf`, and `.hdf5`. This also applies to the writer's configured filename; generated filenames already end in `.h5`.
 - If `measurement_schema_path` is configured and successfully loaded in the HDF writer, `measurement_profile` is required.
 
 Response:
@@ -747,6 +748,7 @@ synchronously and the reply has no `accepted` key but includes
 Request:
 - `{"type": "hdf.rotate", "params": {"filename": "next_run.h5", "disabled_devices": ["dev2"], "measurement_profile": "frequency_scan", "measurement_values": {"measurement_name": "scan-A", "seed1_power_dbm": -5.2}}}`
 - `filename`, `disabled_devices`, `measurement_profile`, and `measurement_values` are optional.
+- Filenames without an extension get `.h5` appended; existing extensions are preserved, as for `hdf.writing.start`.
 - If `measurement_schema_path` is configured and successfully loaded in the HDF writer, `measurement_profile` is required.
 
 Response:

@@ -144,7 +144,11 @@ def _default_filename() -> str:
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser("experiment_control hdf writer")
     p.add_argument("--out-dir", default="data")
-    p.add_argument("--filename", default=None)
+    p.add_argument(
+        "--filename",
+        default=None,
+        help="Output filename; appends .h5 if no extension is supplied.",
+    )
     add_manager_args(p)
     p.add_argument("--timezone", default="America/Chicago")
     add_process_id_arg(p, default=None)
@@ -981,7 +985,10 @@ class HdfWriter(ManagedProcessBase):
                 name = raw
         if name is None:
             name = _default_filename()
-        return self._out_dir / name
+        path = Path(name)
+        if not path.suffix:
+            path = path.with_name(path.name + ".h5")
+        return self._out_dir / path
 
     def _ensure_output_path_unused(self, path: Path) -> None:
         if path.exists():
@@ -4160,7 +4167,10 @@ class HdfWriter(ManagedProcessBase):
                         annotation="dict",
                     ),
                 ],
-                doc="Start writing to a new file when currently inactive.",
+                doc=(
+                    "Start writing to a new file when currently inactive. "
+                    "Filenames without an extension get .h5; existing extensions are preserved."
+                ),
             ),
             method(
                 "hdf.writing.stop",
@@ -4274,7 +4284,8 @@ class HdfWriter(ManagedProcessBase):
                 doc=(
                     "Rotate writer output to a new file. Returns once accepted; "
                     "the swap finishes in the background (hdf.status "
-                    "file_state/last_file_op)."
+                    "file_state/last_file_op). Filenames without an extension get .h5; "
+                    "existing extensions are preserved."
                 ),
             ),
         ]
